@@ -1,6 +1,29 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.2.0
+
+- **Invertibility.** `Query::Injective` and `Query::Bijective` prove that an expression is an
+  injective (bijective) function of one of its subexpressions, through a chain of layers: `~ -
+  bswap bitrev`, `+ - ^` and rotations by anything, multiplication by a value proved odd,
+  extensions and `concat`, extension outputs that declare it, and triangular maps `v ^ g(v)`,
+  `v ± g(v)` decided from per-bit dependencies (the xorshift involution of murmur-style mixers,
+  xorshift steps, T-functions). `Phase::Invert` uses them at `==` and `!=` only: `f(x) == f(y)`
+  becomes `x == y`, `f(x) == c` becomes `x == f⁻¹(c)` or a constant when `c` has no preimage,
+  and zero or-trees are solved leaf by leaf. Unlike the other passes it commits like a rule,
+  whether or not the operands are shared. The book has a new chapter, *Invertibility*.
+- **Facts.** A right shift by a value's own top bits is bounded (`a >>u (a >>u k)` is below
+  `2^k`): the data-dependent xorshift of murmur-style mixers changes only its low bits.
+- **Extension operations.** `ExtOp::invertible` and `ExtOp::invert` declare that an output is
+  injective or bijective in one argument and give its inverse (default: nothing declared); the
+  registration self-test checks both.
+- **Behavior changes.** `Strategy::standard()` and `Strategy::deobfuscate()` run
+  `Phase::Invert` after `Casts`, before `Compares`, so results change wherever they contain an
+  equality through an invertible map (`x + 7 == y + 7` is now `x == y`). It costs 1.5 % to 2.6 %
+  more instructions on the `simplify/standard` benchmarks; fact benchmarks are unchanged.
+- **Tooling.** The nightly z3 proof of the built-in rules runs one solver per core, widest
+  obligations first (423 s to 60 s on 20 cores).
+
+## 0.1.0
 
 The first release.
 
@@ -30,17 +53,7 @@ The first release.
   `Strategy::standard()`: fact folding, rules, and the linear, xor, bitwise, compares, casts and
   demanded-bits passes. Caller-owned budgets and allowances, admission caps, deadlines, a memo of
   final results, telemetry, observers, host hooks, and postconditions on every rewrite. Passes
-  commit only when the DAG gets strictly smaller (the invert pass, like a rule, when the
-  termination order decreases).
-- **Invertibility.** `Query::Injective` and `Query::Bijective` prove that an expression is an
-  injective (bijective) function of one of its subexpressions, through a chain of layers: `~ -
-  bswap bitrev`, `+ - ^` and rotations by anything, multiplication by a value proved odd,
-  extensions and `concat`, extension outputs declaring `ExtOp::invertible`/`ExtOp::invert`, and
-  triangular maps `v ^ g(v)`, `v ± g(v)` decided from per-bit dependencies (the xorshift
-  involution of murmur-style mixers, xorshift steps, T-functions). `Phase::Invert` (in both
-  built-in strategies) uses them at `==` and `!=` only: `f(x) == f(y)` becomes `x == y`,
-  `f(x) == c` becomes `x == f⁻¹(c)` or a constant, and zero or-trees are solved leaf by leaf.
-  Facts bound a right shift by a value's own top bits (`a >>u (a >>u k)` is below `2^k`).
+  commit only when the DAG gets strictly smaller.
 - **Deobfuscation.** `Strategy::deobfuscate()` adds the linear-MBA pass (linear combinations of
   bitwise functions of up to six atoms, from their corner signature) and the shuffle pass (bit
   provenance of values assembled from slices).

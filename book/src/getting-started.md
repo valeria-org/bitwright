@@ -4,7 +4,7 @@ Add bitwright to `Cargo.toml`:
 
 ```toml
 [dependencies]
-bitwright = "0.1"
+bitwright = "0.2"
 ```
 
 ## Values

@@ -23,7 +23,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "bitwright"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitwright-ref",
  "cobra-mba",
@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "bitwright-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitwright",
  "libc",
@@ -40,14 +40,14 @@ dependencies = [
 
 [[package]]
 name = "bitwright-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitwright",
 ]
 
 [[package]]
 name = "bitwright-ref"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "bytemuck"
