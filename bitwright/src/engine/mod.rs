@@ -15,7 +15,7 @@
 
 pub(crate) mod budget;
 mod dispatch;
-mod pass;
+pub(crate) mod pass;
 mod stats;
 #[cfg(test)]
 pub(crate) mod tests;

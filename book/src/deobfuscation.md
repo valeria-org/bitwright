@@ -101,6 +101,33 @@ assert_eq!(cx.display(out.roots[0].expr).to_string(), "(x & y) + (x << 1) + y");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+`NormalFormSolver` is bitwright's own solver beyond linear MBA. It reads bitwise functions
+exactly at every width, one truth table per *bit class* (the positions every constant read by a
+bitwise operator treats alike), so constants inside bitwise operators are no obstacle:
+`(x ^ 0x10) + 2·(x & 0x10)` is `x + 0x10`, and `3·(x & 0x55) + 3·(x & 0xaa)` is `3·(x & 0xff)`.
+Subterms it cannot see through become atoms. Every answer is certified against its input before
+it is returned, and the evidence gate checks it again.
+
+```rust
+use std::sync::Arc;
+use bitwright::engine::{Engine, Strategy};
+use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::{Context, ParseOptions, Width};
+
+let config = MbaConfig::default()
+    .with_trust(MbaTrust::default().with_backend_certificates(false));
+let engine = Engine::builder()
+    .builtin()
+    .strategy(Strategy::deobfuscate().with_mba(config))
+    .mba_solver(Arc::new(NormalFormSolver::default()))
+    .build()?;
+let mut cx = Context::new();
+let e = cx.parse("3 * (x & 0x55) + 3 * (x & 0xaa)", &ParseOptions::width(Width::W32))?;
+let out = engine.simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "(x & 255) * 3");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 With feature `cobra`, `CobraSolver` asks the `cobra-mba` crate, which proves its answers with
 Lean certificates by default. `ThreadedSolver` wraps any solver with a hard wall-clock deadline
 per question (a late answer is abandoned and never cached). Trusting backend certificates means

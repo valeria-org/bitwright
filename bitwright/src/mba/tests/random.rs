@@ -530,10 +530,38 @@ pub(crate) fn every_point(vars: &[Width]) -> Vec<Vec<BitVec>> {
 /// Whether `a` and `b` agree at every input (by the batched evaluator, itself checked against
 /// the reference).
 pub(crate) fn equal_everywhere(a: &MbaExpr, b: &MbaExpr) -> bool {
-    let pts = every_point(a.vars());
     let (pa, pb) = (
         Program::new(a, false).unwrap(),
         Program::new(b, false).unwrap(),
     );
-    pa.eval_points(&pts) == pb.eval_points(&pts)
+    if pa.widest().max(pb.widest()) > 64 {
+        let pts = every_point(a.vars());
+        return pa.eval_points(&pts) == pb.eval_points(&pts);
+    }
+    let vars = a.vars();
+    let bits: u32 = vars.iter().map(|w| u32::from(w.bits())).sum();
+    assert!(bits <= 20, "{bits} bits");
+    let total = 1u64 << bits;
+    let (mut ra, mut rb): (Vec<Vec<u64>>, Vec<Vec<u64>>) = (Vec::new(), Vec::new());
+    let mut start = 0;
+    while start < total {
+        let n = (total - start).min(BLOCK as u64) as usize;
+        let mut shift = 0;
+        let cols: Vec<Vec<u64>> = vars
+            .iter()
+            .map(|w| {
+                let s = shift;
+                shift += u32::from(w.bits());
+                let mask = (1u64 << w.bits()) - 1;
+                (start..start + n as u64).map(|c| (c >> s) & mask).collect()
+            })
+            .collect();
+        pa.run(&mut ra, &cols, n);
+        pb.run(&mut rb, &cols, n);
+        if ra[pa.root()][..n] != rb[pb.root()][..n] {
+            return false;
+        }
+        start += n as u64;
+    }
+    true
 }

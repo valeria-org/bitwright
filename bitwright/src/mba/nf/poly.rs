@@ -1,0 +1,474 @@
+//! Polynomials over masked conjunctions, with coefficients in Z/2^W.
+//!
+//! A *symbol* `(S, c)` stands for `AND_S & M_c`: the conjunction of the atoms in `S`, restricted
+//! to the positions of bit class `c`. Products of symbols are multiplied out formally; the
+//! result is exact (expanding and collecting are ring operations), though not canonical,
+//! because symbols are related (see [`Poly::reduce`] for the reductions that are cheap and
+//! exact).
+
+// Products, division and the falling-factorial reduction serve the polynomial normal form
+// (products of non-constants), which the next milestone switches on.
+#![allow(dead_code)]
+
+use std::collections::BTreeMap;
+
+use super::classes::Classes;
+use crate::facts::known::low_mask;
+use crate::ops::{BinOp, UnOp};
+use crate::{BitVec, Width};
+
+/// A masked conjunction `AND_set & M_class` (`set` a mask over atom ids, never empty).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Sym {
+    pub(crate) set: u64,
+    pub(crate) class: u16,
+}
+
+/// A product of symbols: ascending symbols with positive exponents. Empty for the constant.
+pub(crate) type Mono = Vec<(Sym, u32)>;
+
+/// The total degree of a monomial.
+pub(crate) fn degree(m: &Mono) -> u32 {
+    m.iter().map(|&(_, e)| e).sum()
+}
+
+/// The product of two monomials.
+pub(crate) fn mono_mul(a: &Mono, b: &Mono) -> Mono {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        match (a.get(i), b.get(j)) {
+            (Some(x), Some(y)) if x.0 == y.0 => {
+                out.push((x.0, x.1 + y.1));
+                i += 1;
+                j += 1;
+            }
+            (Some(x), Some(y)) if x.0 < y.0 => {
+                out.push(*x);
+                i += 1;
+            }
+            (Some(x), None) => {
+                out.push(*x);
+                i += 1;
+            }
+            (_, Some(y)) => {
+                out.push(*y);
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+/// `a / b` when `b` divides `a` exponent-wise.
+pub(crate) fn mono_div(a: &Mono, b: &Mono) -> Option<Mono> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut j = 0;
+    for &(s, e) in a {
+        if let Some(&(t, f)) = b.get(j)
+            && t == s
+        {
+            j += 1;
+            if f > e {
+                return None;
+            }
+            if f < e {
+                out.push((s, e - f));
+            }
+            continue;
+        }
+        if b.get(j).is_some_and(|&(t, _)| t < s) {
+            return None;
+        }
+        out.push((s, e));
+    }
+    (j == b.len()).then_some(out)
+}
+
+/// The graded lexicographic order (a monomial order: compatible with multiplication).
+pub(crate) fn grlex(a: &Mono, b: &Mono) -> core::cmp::Ordering {
+    degree(a).cmp(&degree(b)).then_with(|| {
+        let (mut i, mut j) = (0, 0);
+        loop {
+            match (a.get(i), b.get(j)) {
+                (None, None) => return core::cmp::Ordering::Equal,
+                (Some(_), None) => return core::cmp::Ordering::Greater,
+                (None, Some(_)) => return core::cmp::Ordering::Less,
+                (Some(x), Some(y)) => {
+                    if x.0 != y.0 {
+                        // A smaller symbol present in only one side makes that side larger.
+                        return if x.0 < y.0 {
+                            core::cmp::Ordering::Greater
+                        } else {
+                            core::cmp::Ordering::Less
+                        };
+                    }
+                    if x.1 != y.1 {
+                        return x.1.cmp(&y.1);
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    })
+}
+
+/// A polynomial: monomials with nonzero coefficients (the empty monomial is the constant).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Poly {
+    w: Width,
+    terms: BTreeMap<Mono, BitVec>,
+}
+
+fn add(a: &BitVec, b: &BitVec) -> BitVec {
+    BitVec::bin_unchecked(BinOp::Add, a, b)
+}
+
+fn mul(a: &BitVec, b: &BitVec) -> BitVec {
+    BitVec::bin_unchecked(BinOp::Mul, a, b)
+}
+
+/// `v₂(n!)` (Legendre).
+fn v2_factorial(n: u32) -> u32 {
+    n - n.count_ones()
+}
+
+/// The representative of `c` mod 2^m in `(−2^(m−1), 2^(m−1)]` (as a W-bit value; `m ≥ W`
+/// leaves `c` as it is, `m = 0` gives 0).
+pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
+    let w = c.width();
+    if m >= u32::from(w.bits()) {
+        return *c;
+    }
+    if m == 0 {
+        return BitVec::zero(w);
+    }
+    let t = crate::facts::known::bv_and(c, &low_mask(w, m));
+    let half = crate::facts::known::bv_shl(&BitVec::one(w), m - 1);
+    if BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &half, &t) {
+        // t − 2^m, mod 2^W.
+        let full = crate::facts::known::bv_shl(&BitVec::one(w), m);
+        BitVec::bin_unchecked(BinOp::Sub, &t, &full)
+    } else {
+        t
+    }
+}
+
+/// The signed Stirling numbers of the first kind `s(e, j)`, `j = 0..=e`, mod 2^W:
+/// `(x)_e = Σ_j s(e, j)·x^j`.
+fn stirling1(e: u32, w: Width) -> Vec<BitVec> {
+    let mut row = vec![BitVec::one(w)];
+    for n in 0..e {
+        // s(n+1, k) = s(n, k−1) − n·s(n, k).
+        let nn = BitVec::wrapping_from_u64(w, u64::from(n));
+        let mut next = vec![BitVec::zero(w); row.len() + 1];
+        for (k, s) in row.iter().enumerate() {
+            next[k + 1] = add(&next[k + 1], s);
+            next[k] = BitVec::bin_unchecked(BinOp::Sub, &next[k], &mul(&nn, s));
+        }
+        row = next;
+    }
+    row
+}
+
+impl Poly {
+    pub(crate) fn zero(w: Width) -> Poly {
+        Poly {
+            w,
+            terms: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn constant(v: BitVec) -> Poly {
+        let mut p = Poly::zero(v.width());
+        p.add_term(Vec::new(), &v);
+        p
+    }
+
+    /// One monomial.
+    pub(crate) fn term(w: Width, m: Mono, c: &BitVec) -> Poly {
+        let mut p = Poly::zero(w);
+        p.add_term(m, c);
+        p
+    }
+
+    /// A symbol, coefficient 1.
+    pub(crate) fn sym(w: Width, s: Sym) -> Poly {
+        Poly::term(w, vec![(s, 1)], &BitVec::one(w))
+    }
+
+    pub(crate) fn width(&self) -> Width {
+        self.w
+    }
+
+    pub(crate) fn terms(&self) -> &BTreeMap<Mono, BitVec> {
+        &self.terms
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.terms.len()
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// The constant term.
+    pub(crate) fn konst(&self) -> BitVec {
+        self.terms
+            .get(&Vec::new())
+            .copied()
+            .unwrap_or(BitVec::zero(self.w))
+    }
+
+    /// The constant, if that is all it is.
+    pub(crate) fn as_const(&self) -> Option<BitVec> {
+        match self.terms.len() {
+            0 => Some(BitVec::zero(self.w)),
+            1 => self.terms.get(&Vec::new()).copied(),
+            _ => None,
+        }
+    }
+
+    /// The largest total degree (0 for a constant).
+    pub(crate) fn degree(&self) -> u32 {
+        self.terms.keys().map(degree).max().unwrap_or(0)
+    }
+
+    /// The atoms it mentions.
+    pub(crate) fn atoms(&self) -> u64 {
+        self.terms
+            .keys()
+            .flat_map(|m| m.iter())
+            .fold(0, |acc, (s, _)| acc | s.set)
+    }
+
+    /// The terms whose degree satisfies `keep`.
+    pub(crate) fn part(&self, keep: impl Fn(u32) -> bool) -> Poly {
+        Poly {
+            w: self.w,
+            terms: self
+                .terms
+                .iter()
+                .filter(|(m, _)| keep(degree(m)))
+                .map(|(m, c)| (m.clone(), *c))
+                .collect(),
+        }
+    }
+
+    /// Adds `c·m`.
+    pub(crate) fn add_term(&mut self, m: Mono, c: &BitVec) {
+        if c.is_zero() {
+            return;
+        }
+        match self.terms.entry(m) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(*c);
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                let s = add(o.get(), c);
+                if s.is_zero() {
+                    o.remove();
+                } else {
+                    *o.get_mut() = s;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn add(&self, o: &Poly) -> Poly {
+        let (mut big, small) = if self.len() >= o.len() {
+            (self.clone(), o)
+        } else {
+            (o.clone(), self)
+        };
+        for (m, c) in &small.terms {
+            big.add_term(m.clone(), c);
+        }
+        big
+    }
+
+    pub(crate) fn scale(&self, k: &BitVec) -> Poly {
+        let mut out = Poly::zero(self.w);
+        for (m, c) in &self.terms {
+            out.add_term(m.clone(), &mul(c, k));
+        }
+        out
+    }
+
+    pub(crate) fn neg(&self) -> Poly {
+        self.scale(&BitVec::ones(self.w))
+    }
+
+    pub(crate) fn sub(&self, o: &Poly) -> Poly {
+        self.add(&o.neg())
+    }
+
+    /// The product (`self.len() · o.len()` monomial products; size it first).
+    pub(crate) fn mul(&self, o: &Poly) -> Poly {
+        let mut out = Poly::zero(self.w);
+        for (m, c) in &self.terms {
+            for (n, d) in &o.terms {
+                out.add_term(mono_mul(m, n), &mul(c, d));
+            }
+        }
+        out
+    }
+
+    /// The monomial of the largest term in graded lexicographic order, and its coefficient.
+    pub(crate) fn leading(&self) -> Option<(&Mono, &BitVec)> {
+        self.terms.iter().max_by(|a, b| grlex(a.0, b.0))
+    }
+
+    /// `self / f` when `f` divides it exactly and `f`'s leading coefficient is odd (a unit), by
+    /// the division algorithm in graded lexicographic order, which then always finds the
+    /// quotient. Each step costs `f.len()`; at most `steps` steps.
+    pub(crate) fn div_exact(&self, f: &Poly, steps: usize) -> Option<Poly> {
+        let (lm, lc) = f.leading()?;
+        if !lc.bit(0).unwrap_or(false) {
+            return None;
+        }
+        let inv = odd_inverse(lc);
+        let mut rest = self.clone();
+        let mut q = Poly::zero(self.w);
+        for _ in 0..steps {
+            let Some((m, c)) = rest.leading().map(|(m, c)| (m.clone(), *c)) else {
+                return Some(q);
+            };
+            let qm = mono_div(&m, lm)?;
+            let qc = mul(&c, &inv);
+            q.add_term(qm.clone(), &qc);
+            let t = Poly::term(self.w, qm, &qc);
+            rest = rest.sub(&t.mul(f));
+        }
+        None
+    }
+
+    /// Exact, cheap reductions, applied in place:
+    ///
+    /// - a symbol of a one-position class `{j}` takes only the values 0 and `2^j`, so
+    ///   `m^e = 2^{j(e−1)}·m`;
+    /// - a monomial with symbols of classes starting at `τ` is a multiple of `2^τ` (the sum over
+    ///   its factors), so its coefficient matters only mod `2^(W−τ)`;
+    /// - `(x)_κ = Π (x_i)_{κ_i}` is a multiple of `κ! = Π κ_i!` for any integers, so
+    ///   `2^(W − v₂(κ!))·(x)_κ = 0`: from the highest degree down, each coefficient is brought
+    ///   into `(−2^(m−1), 2^(m−1)]` for the larger of the two moduli, the falling-factorial
+    ///   one moving the difference into lower monomials.
+    ///
+    /// Both hold whatever values the symbols take, so treating symbols as independent is
+    /// sound. For a polynomial in independent atoms (no bitwise operator) the result is
+    /// canonical: equal polynomial functions reduce to the same terms.
+    pub(crate) fn reduce(&mut self, classes: &Classes) {
+        let w = self.w;
+        let bits = u32::from(w.bits());
+        // One-position classes.
+        if (0..classes.len()).any(|c| classes.single(c).is_some()) {
+            let old = std::mem::take(&mut self.terms);
+            for (m, c) in old {
+                let mut k = c;
+                let mut out: Mono = Vec::with_capacity(m.len());
+                for (s, e) in m {
+                    match classes.single(usize::from(s.class)) {
+                        Some(j) if e > 1 => {
+                            let sh = u32::from(j).saturating_mul(e - 1).min(bits);
+                            k = crate::facts::known::bv_shl(&k, sh);
+                            out.push((s, 1));
+                        }
+                        _ => out.push((s, e)),
+                    }
+                }
+                self.add_term(out, &k);
+            }
+        }
+        let top = self.degree();
+        for d in (0..=top).rev() {
+            let monos: Vec<Mono> = self
+                .terms
+                .keys()
+                .filter(|m| degree(m) == d)
+                .cloned()
+                .collect();
+            for m in monos {
+                let Some(c) = self.terms.get(&m).copied() else {
+                    continue;
+                };
+                let tau: u32 = m
+                    .iter()
+                    .map(|&(s, e)| u32::from(classes.low(usize::from(s.class))).saturating_mul(e))
+                    .fold(0u32, u32::saturating_add);
+                if tau >= bits {
+                    self.terms.remove(&m);
+                    continue;
+                }
+                let m1 = bits - tau;
+                let v: u32 = m.iter().map(|&(_, e)| v2_factorial(e)).sum();
+                let m2 = bits.saturating_sub(v);
+                if m1 <= m2 {
+                    let r = signed_rep(&c, m1);
+                    self.set(&m, r);
+                    continue;
+                }
+                let r = signed_rep(&c, m2);
+                self.set(&m, r);
+                // Move c − r (a multiple of 2^m2) times the lower terms of (x)_κ.
+                let moved = BitVec::bin_unchecked(BinOp::Sub, &c, &r);
+                if moved.is_zero() {
+                    continue;
+                }
+                let rows: Vec<Vec<BitVec>> = m.iter().map(|&(_, e)| stirling1(e, w)).collect();
+                let mut idx: Vec<u32> = m.iter().map(|_| 1).collect();
+                loop {
+                    let is_top = idx.iter().zip(&m).all(|(&j, &(_, e))| j == e);
+                    if !is_top {
+                        let mut coef = BitVec::un_unchecked(UnOp::Neg, &moved);
+                        let mut mono: Mono = Vec::with_capacity(m.len());
+                        for (k, &(s, _)) in m.iter().enumerate() {
+                            coef = mul(&coef, &rows[k][idx[k] as usize]);
+                            mono.push((s, idx[k]));
+                        }
+                        self.add_term(mono, &coef);
+                    }
+                    // Next index vector, each in 1..=e.
+                    let mut k = 0;
+                    loop {
+                        if k == idx.len() {
+                            break;
+                        }
+                        if idx[k] < m[k].1 {
+                            idx[k] += 1;
+                            break;
+                        }
+                        idx[k] = 1;
+                        k += 1;
+                    }
+                    if k == idx.len() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn set(&mut self, m: &Mono, c: BitVec) {
+        if c.is_zero() {
+            self.terms.remove(m);
+        } else {
+            self.terms.insert(m.clone(), c);
+        }
+    }
+}
+
+/// The inverse of an odd value mod 2^W (Newton's iteration).
+pub(crate) fn odd_inverse(a: &BitVec) -> BitVec {
+    let w = a.width();
+    let two = BitVec::wrapping_from_u64(w, 2);
+    let mut x = *a; // correct to 3 bits for odd a
+    for _ in 0..10 {
+        // x = x·(2 − a·x)
+        let ax = mul(a, &x);
+        x = mul(&x, &BitVec::bin_unchecked(BinOp::Sub, &two, &ax));
+    }
+    x
+}

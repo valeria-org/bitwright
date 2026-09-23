@@ -1,7 +1,7 @@
 //! Normal-form passes (design §8): each is a deterministic function from a node (whose operands
 //! are already normal) to a candidate replacement, committed only when it is strictly smaller.
 
-pub(super) mod bitwise;
+pub(crate) mod bitwise;
 pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;

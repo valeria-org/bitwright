@@ -1047,6 +1047,8 @@ pub mod mba {
     pub trait MbaCacheStore: Send + Sync { fn get(&self, k: &CacheKey) -> Option<CacheEntry>;
                                            fn put(&self, k: &CacheKey, e: &CacheEntry); }
     pub struct SignatureSolver;   // native, complete for linear MBA
+    pub struct NormalFormSolver;  // native normal forms: linear, semi-linear, polynomial MBA, atoms
+    pub struct NativeProver;      // bitwright's own certificates as an EquivalenceProver
     pub struct MemoryCache;       // bounded, oldest evicted first
     pub struct NoCache;
     pub struct MbaConfig { pub limits: MbaLimits, pub trust: MbaTrust, pub budget: MbaBudget }
@@ -1111,6 +1113,42 @@ pub mod mba {
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
   (corner-invisible products, terms nonzero only when three different positions are set,
   point functions) are never proved at any width.
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v1;…` with its options).
+  One pass over the question, operands first, gives every node the normal form of the smallest
+  fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
+  through. The first version takes one width (nodes of other widths only below casts, which are
+  atoms rendered as they are).
+  - *Bit classes.* The constants read by `& | ^` partition the positions: `j ~ j'` when every
+    such constant has the same bit at both (0 and all-ones never split). Inside a class every
+    bitwise subterm is one Boolean function, so a bitwise function of atoms is a **truth table
+    per class** (at most 12 atoms each), combined bit-parallel.
+  - *Masked conjunctions.* Möbius over a class's table writes the function as
+    `Σ_T a_T·(AND_T & M_c)` exactly at every width (`AND_∅ & M_c = M_c`). A linear combination
+    of bitwise functions is a polynomial of degree 1 over the symbols `m_{c,S} = AND_S & M_c`;
+    `m_{c,S}` is a multiple of `2^τ_c` (`τ_c` the class's lowest position), so its coefficient
+    matters modulo `2^(W−τ_c)`, and reduced there (signed) the form is canonical: two class
+    corners per class and atom set determine it.
+  - *Recognition.* A degree-≤1 form is a bitwise function exactly when, in every class, the
+    constant's bits there are all 0 or all 1 (`k_c`) and `k_c + Σ_{∅≠S⊆p} γ_{c,S}` is 0 or 1
+    modulo `2^(W−τ_c)` at every corner `p`; that is the table.
+  - *Rendering.* Candidates are built into one builder with local interning and costed by the
+    nodes their root reaches; the cheapest wins (then by an operator-weighted size, then by
+    structure), and only if it is strictly smaller than the input (else `NoSimpler`). A
+    degree-≤1 form renders as a bitwise function when it is one (the minimum-form table for at
+    most three atoms, the algebraic normal form, `((g ^ A) | B) & ~C` over classes whose tables
+    are `g`, `¬g`, all-ones and zero, or the or of masked groups), and otherwise over *groups of
+    classes* whose coefficient vectors can be chosen equal (each only defined modulo its
+    class's precision): per group the cheaper of the masked conjunction form and the masked
+    indicator form `b·M + Σ_{v≠b} (v − b)·(g_v & M)` over the distinct corner values `v`. A mask
+    covering every position disappears. Sums put positive coefficients first, powers of two as
+    shifts, and choose each sign so a constant already needed is reused.
+  - *Self-check.* The chosen answer is certified against the input (§ Certificates) within the
+    solver's remaining budget: `Claim::Proved` when a certificate ran, `Claim::Sampled` when
+    none fit but the refutation sample agrees (the gate then decides on its own evidence).
+    Budget exhaustion before an answer is `Exhausted`; every decline is counted
+    (`NfStats`: fragments reached, atoms, candidates, certificates, declines by reason).
+  - On linear MBA it is never costlier than `SignatureSolver` (tested on random linear MBA at
+    widths 1 to 128: its conjunction form is one of the candidates, emitted more tightly).
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
   lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
   records its options and `max_vars`). Only results accepted by the gate under the key's trust

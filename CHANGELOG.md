@@ -9,6 +9,12 @@
   checks are `mba::NativeProver`. The always-on refutation sample now includes the constants
   of both sides and their neighbours, and single bit positions. Evaluation is batched (256
   points per block). `MbaStats::certificates` counts what decided.
+- **Native MBA solver.** `mba::NormalFormSolver` (with `NfOptions`, `NfStats`) simplifies
+  linear and semi-linear MBA from exact normal forms at full width: bitwise functions as truth
+  tables per bit class (constants inside bitwise operators included), linear combinations of
+  masked conjunctions reduced to a canonical form, and the cheapest of several renderings
+  (minimum forms, masked groups, indicator and conjunction forms). It certifies every answer
+  itself and is never costlier than `SignatureSolver` on linear MBA. Not the default solver.
 - **Behavior changes.** With the MBA service, answers that needed a trusted backend certificate
   are now accepted on bitwright's own proof where one applies (with `backend_certificates`
   off, more answers are accepted); answers wrong at a constant of either side are refuted

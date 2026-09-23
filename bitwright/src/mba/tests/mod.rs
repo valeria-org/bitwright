@@ -3,6 +3,7 @@
 
 mod batch;
 mod certify;
+mod nf;
 pub(crate) mod random;
 
 use super::*;

@@ -63,6 +63,22 @@ fn engines() -> Vec<(&'static str, Engine)> {
                     .unwrap(),
             ));
         }
+        // The native normal-form solver, on bitwright's own evidence only.
+        v.push((
+            "mba-nf",
+            Engine::builder()
+                .builtin()
+                .strategy(
+                    Strategy::deobfuscate().with_mba(
+                        MbaConfig::default()
+                            .with_trust(MbaTrust::default().with_backend_certificates(false)),
+                    ),
+                )
+                .mba_solver(Arc::new(bitwright::mba::NormalFormSolver::default()))
+                .mba_cache(Arc::new(MemoryCache::new(1024)))
+                .build()
+                .unwrap(),
+        ));
     }
     v
 }

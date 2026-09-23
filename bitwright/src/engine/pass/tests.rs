@@ -1431,6 +1431,41 @@ mod mba_service {
         assert!(changed > 50, "{changed}");
     }
 
+    #[test]
+    fn normal_form_solver_through_the_engine_is_sound() {
+        let solver = Arc::new(crate::mba::NormalFormSolver::default());
+        let no_trust = MbaTrust {
+            backend_certificates: false,
+            sampled: false,
+        };
+        let eng = mba_engine(solver.clone(), no_trust);
+        let mut g = generator(0x9f5b);
+        let mut rng = Rng(7);
+        let mut changed = 0;
+        for i in 0..800 {
+            let mut cx = Context::new();
+            let w = if i % 10 == 0 {
+                64
+            } else {
+                1 + g.rng.below(6) as u16
+            };
+            let e = if i % 3 == 0 {
+                g.expr(&mut cx, w.min(6), 4).0
+            } else {
+                linear_mba_expr(&mut g, &mut cx, w)
+            };
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+            changed += u64::from(out.roots[0].changed);
+            // Everything it answered was proved by the gate's own certificates.
+            assert_eq!(out.stats.mba.proof_unknown, 0);
+        }
+        assert!(changed > 50, "{changed}");
+        let s = solver.stats();
+        assert_eq!(s.declined_internal, 0);
+        assert!(s.simplified > 50, "{s:?}");
+    }
+
     /// Answers `x ⊕ ... ` wrongly but claims a certificate.
     struct Liar;
     impl MbaSolver for Liar {

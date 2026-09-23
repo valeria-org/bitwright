@@ -31,6 +31,7 @@ pub(crate) mod certify;
 mod cobra;
 mod expr;
 mod lower;
+mod nf;
 mod solve;
 mod threaded;
 
@@ -38,6 +39,7 @@ pub use crate::engine::CertStats;
 pub use certify::NativeProver;
 #[cfg(feature = "cobra")]
 pub use cobra::{CobraOptions, CobraSolver};
+pub use nf::{NfOptions, NfStats, NormalFormSolver};
 pub use threaded::ThreadedSolver;
 
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};

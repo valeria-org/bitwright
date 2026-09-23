@@ -44,6 +44,12 @@ use crate::{BitVec, Width};
 /// The most points one test evaluates, whatever the budget.
 pub(crate) const MAX_POINTS: u64 = 1 << 24;
 
+/// The most effort one test may take, whatever the budget: points × nodes × the cost of a lane
+/// (1 up to 64 bits, 2 up to 128, 8 above). A larger test is not run and is a stable decline, so
+/// whether a node is final never depends on the budget; a test within this cap but over what
+/// is left of the budget leaves the node non-final.
+pub(crate) const MAX_EFFORT: u64 = 1 << 25;
+
 /// Exhaustive evaluation is a test up to this many variable bits.
 pub(crate) const EXHAUSTIVE_BITS: u32 = 20;
 
@@ -177,7 +183,7 @@ fn apply(n: &MNode, a: Option<&BitVec>, b: Option<&BitVec>) -> Option<BitVec> {
 }
 
 /// Per node: its value when it does not depend on any variable.
-fn constants(nodes: &[MNode]) -> Vec<Option<BitVec>> {
+pub(crate) fn constants(nodes: &[MNode]) -> Vec<Option<BitVec>> {
     let mut cst: Vec<Option<BitVec>> = Vec::with_capacity(nodes.len());
     for n in nodes {
         let k = n.op.arity();
@@ -647,16 +653,23 @@ fn run<M: Meter>(
     let (Some(pa), Some(pb)) = (Program::new(a, false), Program::new(b, false)) else {
         return Ok(Run::TooBig);
     };
-    if plan.points > MAX_POINTS {
+    let kind = Kind::of(pa.widest().max(pb.widest()));
+    let per = (pa.len() + pb.len()) as u64;
+    let lane = match kind {
+        Kind::N64 => 1,
+        Kind::N128 => 2,
+        Kind::Wide => 8,
+    };
+    if plan.points > MAX_POINTS || plan.points.saturating_mul(per).saturating_mul(lane) > MAX_EFFORT
+    {
         return Ok(Run::TooBig);
     }
-    let per = (pa.len() + pb.len()) as u64;
     if plan.points.saturating_mul(per) > meter.left() {
         report.over_budget = true;
         return Ok(Run::OverBudget);
     }
     let width = a.width().map_or(1, |w| w.bits());
-    match Kind::of(pa.widest().max(pb.widest())) {
+    match kind {
         Kind::N64 => run_in::<u64, M>(meter, a, &pa, &pb, plan, width, report),
         Kind::N128 => run_in::<u128, M>(meter, a, &pa, &pb, plan, width, report),
         Kind::Wide => run_in::<Wide, M>(meter, a, &pa, &pb, plan, width, report),
