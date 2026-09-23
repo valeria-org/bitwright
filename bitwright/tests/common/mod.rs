@@ -1256,3 +1256,64 @@ pub fn ext_context(registry: &Arc<Registry>) -> Context {
 pub fn test_context(config: ContextConfig) -> Context {
     Context::with_registry(config, registry())
 }
+
+// ----- SMT solvers -----------------------------------------------------------------------------
+
+/// An SMT solver the suites run exported scripts through, when it is on `PATH`.
+#[derive(Copy, Clone, Debug)]
+pub enum Solver {
+    Z3,
+    Bitwuzla,
+}
+
+impl Solver {
+    pub const ALL: [Solver; 2] = [Solver::Z3, Solver::Bitwuzla];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Solver::Z3 => "z3",
+            Solver::Bitwuzla => "bitwuzla",
+        }
+    }
+
+    /// The solver's output for `script` read from stdin, with `limit_ms` per `check-sat` (after
+    /// which it answers `unknown`); its stderr is appended when it fails. `None` if it cannot be
+    /// started.
+    pub fn run(self, script: &str, limit_ms: Option<u32>) -> Option<String> {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(self.name());
+        match self {
+            Solver::Z3 => {
+                cmd.args(["-in", "-smt2"]);
+                cmd.args(limit_ms.map(|ms| format!("-t:{ms}")));
+            }
+            Solver::Bitwuzla => {
+                cmd.args(limit_ms.map(|ms| format!("--time-limit-per={ms}")));
+            }
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(script.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() {
+            s.push('\n');
+            s.push_str(String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Some(s)
+    }
+
+    /// Whether the solver can be started; prints a note when it cannot.
+    pub fn available(self) -> bool {
+        let ok = self.run("(check-sat)", None).is_some();
+        if !ok {
+            eprintln!("{} is not on PATH; skipped", self.name());
+        }
+        ok
+    }
+}

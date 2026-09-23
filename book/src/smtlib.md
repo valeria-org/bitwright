@@ -75,6 +75,22 @@ assert!(script.contains("(declare-const |x| (_ BitVec 256))"));
 # Ok::<(), String>(())
 ```
 
-From the command line, `bitwright smt rules.bwr | z3 -in` prints one answer per obligation; every
-answer must be `unsat`. bitwright's own nightly tests prove every built-in rule with z3 at widths
-up to 512.
+From the command line, `bitwright smt rules.bwr | z3 -in` (or `| bitwuzla`) prints one answer
+per obligation; every answer must be `unsat`.
+
+## Solvers
+
+bitwright never runs a solver itself. Its nightly tests run every kind of script it writes
+through both z3 and bitwuzla: exported expressions evaluated at random points, every built-in
+rule proved at widths up to 512, simplification results proved equal to their inputs (with
+extension calls as uninterpreted functions), and rewrites proved under the constraints they rely
+on. Both read a script from standard input:
+
+```text
+bitwright smt rules.bwr | z3 -in
+bitwright smt rules.bwr | bitwuzla
+```
+
+On the widest obligations (shifts and division at 256 bits) each gives up on a few, not always
+the same ones. A per-query time limit is `-t:<ms>` for z3 and `--time-limit-per=<ms>` for
+bitwuzla; either answers `unknown` when it runs out.

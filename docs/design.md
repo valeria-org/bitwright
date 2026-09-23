@@ -453,7 +453,7 @@ impl Context {
   overlay key does not: the key is dropped instead). Validation: every backward transfer is sound exhaustively at
   W ≤ 3 and sampled at 4..6; end to end, facts, proofs, orderings and infeasibility are checked
   against every satisfying assignment; engine results are checked equal to their inputs wherever
-  the constraints they rely on hold, exhaustively, and by z3 at widths up to 64.
+  the constraints they rely on hold, exhaustively, and by z3 and bitwuzla at widths up to 64.
 - **Public transfers.** `Facts::apply_un/apply_bin/apply_cmp`, `zext/sext/extract/concat/select`
   and `KnownBits::apply_un/apply_bin` expose the transfer functions (width-checked), so a host can
   compose facts for its own operations.
@@ -828,7 +828,7 @@ soundness are verified separately (§5 has its own suite).
 | sampled | the widths `7, 8, 9, 12, 16, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 192, 255, 256, 257, 384, 511, 512` (as admitted) × 64 boundary-biased points (0, 1, −1, smin, smax, powers of two, short values) from a fixed seed; half of the points are *steered* toward the guard (a `proves(y == e)` sets `y` from `e`, `zero_bits` clears the mask, `is_pow2` picks a power of two, …) |
 | fired | per tier, how many checked cases satisfied the guard |
 | complete | every admitted width assignment was covered exhaustively |
-| SMT (feature `smtlib`) | `smtlib::rule_obligation(rule, widths)`: the negated obligation at an admitted width assignment, translated from the rule IR itself (not through the builder, whose folding would stand between the rule and the proof); `unsat` from any SMT-LIB 2.6 solver proves the rule there. Fact predicates read as the value statements they make (`zero_bits(x, m)` is `x & m = 0`). bitwright never runs a solver, so this is not recorded in the ledger; the nightly suite proves every built-in rule with z3 at up to 8 admitted assignments with widths up to 512 |
+| SMT (feature `smtlib`) | `smtlib::rule_obligation(rule, widths)`: the negated obligation at an admitted width assignment, translated from the rule IR itself (not through the builder, whose folding would stand between the rule and the proof); `unsat` from any SMT-LIB 2.6 solver proves the rule there. Fact predicates read as the value statements they make (`zero_bits(x, m)` is `x & m = 0`). bitwright never runs a solver, so this is not recorded in the ledger; the nightly suite proves every built-in rule with z3 and with bitwuzla at up to 8 admitted assignments with widths up to 512 |
 
 The verdict is `Sound` only when there is no counterexample, the guard held in the exhaustive
 tier, and either the check is complete or the guard also held in the sampled tier; otherwise it is
@@ -1212,8 +1212,8 @@ casts, compares), each with new admission tests.
    included); at boundary-biased random points at 23 widths straddling every limb edge (150 samples
    per width per pull request, 20,000 nightly); and at every width 1..=512. The generator produces
    values with random significant lengths so multi-limb divisions of every shape occur. Nightly:
-   random terms exported to SMT-LIB and evaluated by z3, and every built-in rule's obligation
-   proved by z3 at widths up to 512 (feature `smtlib`).
+   random terms exported to SMT-LIB and evaluated by z3 and bitwuzla, and every built-in rule's
+   obligation proved by each of them at widths up to 512 (feature `smtlib`).
 2. **Construction.** Every stored node is canonical and a fixed point of the builder;
    child-before-parent holds; padding is canonical; the **construction table** (every operator over
    every operand shape — symbols, special constants, and the composites the rules look through — at

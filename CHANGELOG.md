@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **SMT-LIB.** bitwuzla is a tested solver alongside z3: the nightly SMT suites (evaluation of
+  exported expressions, the built-in rule proofs up to 512 bits, simplifications with extension
+  calls, rewrites under the constraints they rely on) run once per solver, and CI installs
+  bitwuzla 0.9.1. No exported script needed to change. The book's SMT-LIB chapter has a new
+  section, *Solvers*.
+
 ## 0.2.0
 
 - **Invertibility.** `Query::Injective` and `Query::Bijective` prove that an expression is an
