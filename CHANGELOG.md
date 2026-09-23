@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 - **Performance.** Charging work against a budget compares only the counter charged: every
   counter recorded after the fact is capped beforehand, so no other can be over (debug builds
