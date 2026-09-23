@@ -73,7 +73,7 @@ bitwright/                       workspace; edition 2024; rust-version 1.88; Pol
 │  ├─ src/check/                 soundness checker, evidence, ledger (feature "check")
 │  ├─ src/engine/                Engine, Strategy/Phase, Run/Outcome, budgets, dispatch net, memo, stats
 │  ├─ src/passes/                linear, xor, bitwise, compares, casts, demanded, linear_mba, shuffle, fact_fold
-│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits (feature "mba"); cobra.rs ("cobra")
+│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits, certificates, batched evaluator, nf/ (normal-form solver) (feature "mba"); cobra.rs ("cobra")
 │  └─ src/eqsat/                 e-graph, admission, schedule, extraction (feature "eqsat")
 ├─ bitwright-ref/                independent bit-serial reference evaluator (publish = false)
 ├─ bitwright-cli/                `bitwright check | lint | smt | catalog | explain | simplify` (published after 0.1)
@@ -95,7 +95,7 @@ Features other than `check` arrive with their milestones.
 |-|-|-|
 | `check` | yes | `bitwright::check`: the rule soundness checker, evidence and ledgers |
 | `smtlib` | no | SMT-LIB export of expressions and rule obligations; import of a QF_BV subset |
-| `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate, solver/prover/cache traits, `SignatureSolver`, `MemoryCache`, `Phase::Mba` |
+| `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate and its certificates, solver/prover/cache traits, `SignatureSolver`, `NormalFormSolver`, `NativeProver`, `MemoryCache`, `Phase::Mba` |
 | `cobra` | no | `mba` plus `CobraSolver` (the `cobra-mba` 0.4 backend) |
 | `eqsat` | no | `bitwright::eqsat`: the bounded equality-saturation search service and its built-in equations |
 | `deobf` | no | GF(2) linear-map normal form (mixer inversion is in the core: §8.1) |
@@ -1214,6 +1214,10 @@ pub mod mba {
     questions): none answered more expensively; end to end the results have 9,517 nodes
     against 10,360 (smaller on 542 inputs, larger on 2, where later passes reach a
     four-term form from the signature solver's unchanged input).
+  - It is not the default solver. `docs/proposals/mba-defaults.md` proposes it, with backend
+    certificates not trusted, as the MBA service's defaults, with a corpus diff
+    (`bitwright-bench --corpus-diff`): much smaller results on MBA, at a time cost that is
+    largest on code that is not obfuscated.
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
   lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
   records its options and `max_vars`). Only results accepted by the gate under the key's trust

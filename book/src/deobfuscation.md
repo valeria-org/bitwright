@@ -45,12 +45,14 @@ the answer only through an evidence gate:
 1. the answer must have the input's variables and width and agree with it at 64 points
    (always): zero, all ones, one, the signed minimum, the constants of both sides and their
    neighbours, single bit positions, and seeded random values;
-2. then evidence, in order: bitwright's own certificates (below), a configured
+2. lifted back into the context, it must make the DAG smaller (checked before any proof, so
+   an answer that would be rejected anyway is not proved);
+3. then evidence, in order: bitwright's own certificates (below), a configured
    `EquivalenceProver`, the backend's own `Proved` or `Certified` claim if
    `MbaTrust::backend_certificates` is set (the default), or agreement at the sampled points
    if `MbaTrust::sampled` is set (off by default);
-3. the answer lifted back into the context must agree with the original, make the DAG smaller,
-   and pass the usual postconditions and host veto.
+4. the lifted answer must agree with the original at seeded values of its symbols, and pass
+   the usual postconditions and host veto.
 
 bitwright's certificates are finite evaluation tests, each complete for its fragment:
 
@@ -112,7 +114,9 @@ Subterms it cannot see through become atoms: arithmetic under a bitwise operator
 secretly a bitwise function), right shifts and casts. Atoms with equal normal forms are one atom,
 so `((x ^ y) + 2·(x & y)) & z` is `(x + y) & z` and `((x + y) & z) + ((x + y) & ~z)` is `x + y`.
 Every answer is certified against its input before it is returned, and the evidence gate checks
-it again.
+it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
+certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
+for a later call with more budget. It is not the default solver: pass it to `mba_solver`.
 
 ```rust
 use std::sync::Arc;
@@ -137,5 +141,6 @@ assert_eq!(cx.display(out.expr).to_string(), "(x & 255) * 3");
 With feature `cobra`, `CobraSolver` asks the `cobra-mba` crate, which proves its answers with
 Lean certificates by default. `ThreadedSolver` wraps any solver with a hard wall-clock deadline
 per question (a late answer is abandoned and never cached). Trusting backend certificates means
-trusting the backend: a host that needs independent evidence turns `backend_certificates` off
-and supplies an `EquivalenceProver`.
+trusting the backend: a host that needs independent evidence turns `backend_certificates` off.
+Answers are then accepted only on bitwright's own certificates, which cover the fragments above,
+or on the proof of an `EquivalenceProver` the host supplies for the rest.

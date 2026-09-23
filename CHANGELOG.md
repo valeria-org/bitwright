@@ -19,7 +19,9 @@
   outside these fragments are atoms keyed by their own normal forms (arithmetic that is
   secretly bitwise is read as bitwise), each rendered once from its cheapest form. It certifies
   every answer itself, is never costlier than `SignatureSolver` on linear MBA, and answers are
-  a fixed point (solving an answer again finds nothing smaller). Not the default solver.
+  a fixed point (solving an answer again finds nothing smaller). Its work, rendering included,
+  is bounded by the solver budget. Not the default solver; `docs/proposals/mba-defaults.md`
+  proposes it (and backend certificates untrusted) as the default, with a corpus diff.
 - **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
   solver that returns true is also asked about fragments without bitwise operators in which
   two non-constants are multiplied, and fragments rooted at a constant left shift.

@@ -60,7 +60,8 @@ fn main() -> Result<(), bitwright::Error> {
   a hash comparison becomes a plain one.
 - **A rule language (`.bwr`)** for your own rewrites, with a mandatory soundness check
   (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
-- **Optional services**: MBA simplification with pluggable solvers, a bounded
+- **Optional services**: MBA simplification (a native solver for linear, semi-linear and
+  polynomial MBA, pluggable backends, and answers bitwright proves itself), a bounded
   equality-saturation search, and SMT-LIB export and import, so any SMT solver can prove a rule
   at any width.
 
@@ -77,7 +78,7 @@ features:
 |-|-|-|
 | `check` | yes | the rule soundness checker, evidence and proof ledgers |
 | `smtlib` | no | SMT-LIB export and import, rule obligations for any SMT solver |
-| `mba` | no | the MBA service: lowering, solver and prover traits, the evidence gate |
+| `mba` | no | the MBA service: lowering, the native normal-form solver, solver and prover traits, the evidence gate and its certificates |
 | `cobra` | no | `mba` plus a backend over the `cobra-mba` crate |
 | `eqsat` | no | a bounded equality-saturation search for alternative expressions |
 
