@@ -108,3 +108,14 @@ markdown: per corpus the result sizes, how many results change and in which dire
 each configuration took (wall time, for orientation only), the MBA service's answers and
 refusals, and examples of changed results. It is the evidence for a change of defaults, which
 changes behavior; see `docs/proposals/`.
+
+## Comparing with other engines
+
+`bitwright-bench` measures bitwright against itself. [`compare/`](../compare/README.md)
+measures it against other symbolic engines on public MBA datasets (CoBRA's collection, about
+76,000 expressions): egg with bitwright's equations and with MBA identities, CoBRA (the C++ tool
+and its Rust port), Triton (through LLVM, and its synthesis), Z3, Bitwuzla, cvc5, claripy and
+Miasm. Every answer is checked against its input and sized in bitwright's canonical form, so
+all engines are scored the same way: how often each reaches the dataset's ground truth, how
+fast, and with how much heap. It is its own Cargo workspace and needs the other engines
+installed; its README has the setup.
