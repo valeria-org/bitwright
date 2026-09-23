@@ -84,6 +84,8 @@ pub struct MbaStats {
     pub too_wide: u64,
     /// See `too_many_vars`.
     pub too_small: u64,
+    /// bitwright's own certificates, run on every answer (see [`CertStats`]).
+    pub certificates: CertStats,
 }
 
 impl MbaStats {
@@ -97,6 +99,69 @@ impl MbaStats {
             Refusal::TooSmall => self.too_small += 1,
             _ => self.unsupported += 1,
         }
+    }
+}
+
+/// Counters of the native certificates, by the test that decided.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CertStats {
+    /// Questions asked.
+    pub calls: u64,
+    /// Proved.
+    pub proved: u64,
+    /// Refuted (with a concrete counterexample).
+    pub refuted: u64,
+    /// Not decided.
+    pub unknown: u64,
+    /// Decided by the corner signature.
+    pub signature: u64,
+    /// Decided at single bit positions.
+    pub single_bit: u64,
+    /// Decided at points with at most `d` set positions.
+    pub sparse: u64,
+    /// Decided on the pure-polynomial grid.
+    pub grid: u64,
+    /// Decided exhaustively.
+    pub exhaustive: u64,
+    /// Decided over abstracted atoms.
+    pub compositional: u64,
+    /// Points evaluated.
+    pub points: u64,
+    /// Tests skipped for lack of budget.
+    pub over_budget: u64,
+    /// Internal inconsistencies (never expected).
+    pub internal: u64,
+}
+
+impl CertStats {
+    /// Adds a report.
+    #[cfg(feature = "mba")]
+    pub(crate) fn record(&mut self, r: &crate::mba::certify::Report) {
+        use crate::mba::Verdict;
+        use crate::mba::certify::Cert;
+        self.calls += 1;
+        match r.verdict {
+            Verdict::Proved => self.proved += 1,
+            Verdict::Refuted => self.refuted += 1,
+            Verdict::Unknown => self.unknown += 1,
+        }
+        if r.verdict != Verdict::Unknown {
+            match r.cert {
+                Some(Cert::Signature) => self.signature += 1,
+                Some(Cert::SingleBit) => self.single_bit += 1,
+                Some(Cert::Sparse) => self.sparse += 1,
+                Some(Cert::Grid) => self.grid += 1,
+                Some(Cert::Exhaustive) => self.exhaustive += 1,
+                None => {}
+            }
+            if r.compositional {
+                self.compositional += 1;
+            }
+        }
+        self.points += r.points;
+        self.over_budget += u64::from(r.over_budget);
+        self.internal += r.internal;
     }
 }
 

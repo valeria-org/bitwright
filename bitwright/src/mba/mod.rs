@@ -25,6 +25,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod batch;
+pub(crate) mod certify;
 #[cfg(feature = "cobra")]
 mod cobra;
 mod expr;
@@ -32,6 +34,8 @@ mod lower;
 mod solve;
 mod threaded;
 
+pub use crate::engine::CertStats;
+pub use certify::NativeProver;
 #[cfg(feature = "cobra")]
 pub use cobra::{CobraOptions, CobraSolver};
 pub use threaded::ThreadedSolver;
@@ -39,7 +43,6 @@ pub use threaded::ThreadedSolver;
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
 pub(crate) use lower::{lift_id, lower_id};
-pub(crate) use solve::mobius;
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
     MemoryCache, NoCache, SignatureSolver, Verdict,

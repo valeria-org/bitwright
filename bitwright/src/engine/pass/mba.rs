@@ -1,21 +1,18 @@
 //! The MBA phase: lowering, the solver, the evidence gate, lifting (see [`crate::mba`]).
 
 use super::{Fin, PassKind, Runner, Step, Stop, discard, finish};
-use crate::BitVec;
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::hash::combine;
+use crate::mba::certify;
 use crate::mba::{
     CacheEntry, CacheKey, Claim, LOWERING_VERSION, MbaAnswer, MbaConfig, MbaExpr, Refusal, Verdict,
-    lift_id, lower_id, mobius,
+    lift_id, lower_id,
 };
 
-/// Exhaustive evaluation is exact evidence up to this many variable bits.
-const EXHAUSTIVE_BITS: u32 = 20;
-
 /// Points for the always-on refutation check and for trusted sampling.
-const SAMPLE_POINTS: u32 = 64;
+const SAMPLE_POINTS: u32 = certify::SAMPLE_POINTS as u32;
 
 fn mixed_op(op: OpCode) -> bool {
     matches!(
@@ -31,31 +28,6 @@ fn mixed_op(op: OpCode) -> bool {
     )
 }
 
-fn values(m: &MbaExpr, seed: u64, k: u32) -> Vec<BitVec> {
-    let mut x = seed ^ u64::from(k).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    m.vars()
-        .iter()
-        .map(|&w| match k {
-            0 => BitVec::zero(w),
-            1 => BitVec::ones(w),
-            2 => BitVec::one(w),
-            3 => BitVec::smin(w),
-            _ => {
-                let limbs: Vec<u64> = (0..8)
-                    .map(|_| {
-                        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                        let mut z = x;
-                        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                        z ^ (z >> 31)
-                    })
-                    .collect();
-                BitVec::wrapping_from_limbs(w, &limbs)
-            }
-        })
-        .collect()
-}
-
 /// Charges `evals` evaluations of both sides (their node counts) as pass work.
 fn charge(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, evals: u64) -> Result<(), Stop> {
     let per = (a.nodes().len() + b.nodes().len()) as u64;
@@ -64,59 +36,40 @@ fn charge(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, evals: u64) -> Resul
         .map_err(Stop::Exhausted)
 }
 
-/// Whether `a` and `b` agree at `SAMPLE_POINTS` seeded points.
+/// Whether `a` and `b` agree at the refutation sample: zero, all-ones, one and the signed
+/// minimum, the constants of both sides and their neighbours, single bit positions, and seeded
+/// random points (see [`certify::sample_points`]). A filter, never evidence on its own.
 fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<bool, Stop> {
     charge(r, a, b, u64::from(SAMPLE_POINTS))?;
-    let seed = a.key()[0];
-    Ok((0..SAMPLE_POINTS).all(|k| {
-        let v = values(a, seed, k);
-        a.eval(&v) == b.eval(&v)
-    }))
+    let points = certify::sample_points(a.vars(), &[a, b], a.key()[0]);
+    Ok(certify::refute(a, b, &points).is_none())
 }
 
-/// Exact evidence that `a == b`, if bitwright can establish it itself. The evaluations are
-/// charged as pass work, a block at a time, so a budget or deadline can stop them.
-fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<bool, Stop> {
-    if a.vars() != b.vars() {
-        return Ok(false);
+/// Pass work as a certificate's meter.
+struct Gate<'x, 'r, 'a>(&'x mut Runner<'r, 'a>);
+
+impl certify::Meter for Gate<'_, '_, '_> {
+    type Err = Stop;
+    fn left(&self) -> u64 {
+        self.0.meter.left().pass_work
     }
-    // Both linear MBA: equal signatures mean equal expressions.
-    if a.is_linear() && b.is_linear() && a.vars().len() <= 12 {
-        charge(r, a, b, 1u64 << a.vars().len())?;
-        if let (Some(sa), Some(sb)) = (a.corners(), b.corners()) {
-            return Ok(mobius(&sa) == mobius(&sb));
-        }
+    fn charge(&mut self, units: u64) -> Result<(), Stop> {
+        self.0
+            .meter
+            .charge(Counter::PassWork, units)
+            .map_err(Stop::Exhausted)
     }
-    // Small inputs: every assignment.
-    let bits: u32 = a.vars().iter().map(|w| u32::from(w.bits())).sum();
-    if bits <= EXHAUSTIVE_BITS {
-        let vars = a.vars().to_vec();
-        const BLOCK: u64 = 4096;
-        let total = 1u64 << bits;
-        let mut start = 0u64;
-        while start < total {
-            let end = (start + BLOCK).min(total);
-            charge(r, a, b, end - start)?;
-            let ok = (start..end).all(|case| {
-                let mut rest = case;
-                let v: Vec<BitVec> = vars
-                    .iter()
-                    .map(|&w| {
-                        let x = BitVec::wrapping_from_u64(w, rest);
-                        rest >>= w.bits();
-                        x
-                    })
-                    .collect();
-                a.eval(&v) == b.eval(&v)
-            });
-            if !ok {
-                return Ok(false);
-            }
-            start = end;
-        }
-        return Ok(true);
-    }
-    Ok(false)
+}
+
+/// bitwright's own exact evidence about `a == b`: the cheapest certificate that applies (the
+/// corner signature, single bit positions, sparse points for degree `d`, the pure-polynomial
+/// grid, exhaustive evaluation), over abstracted atoms when a side leaves the polynomial
+/// fragment. Charged as pass work, a block at a time, so a budget or deadline can stop it; a
+/// certificate larger than what is left is not started (reported as over budget).
+fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
+    let report = certify::prove(a, b, &mut Gate(r))?;
+    count(r).certificates.record(&report);
+    Ok(report)
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::MbaStats {
@@ -188,7 +141,12 @@ pub(super) fn step(
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    let proved = exact(r, &m, &expr)?
+                    let own = exact(r, &m, &expr)?;
+                    if own.verdict == Verdict::Refuted {
+                        count(r).refuted += 1;
+                        return Ok(Step::Normal(Fin::FINAL));
+                    }
+                    let proved = own.verdict == Verdict::Proved
                         || inner.mba.prover.as_ref().is_some_and(|p| {
                             p.prove_equal(&m, &expr, &cfg.budget) == Verdict::Proved
                         })
@@ -196,7 +154,14 @@ pub(super) fn step(
                         || cfg.trust.sampled;
                     if !proved {
                         count(r).proof_unknown += 1;
-                        return Ok(Step::Normal(Fin::FINAL));
+                        // A certificate skipped for lack of budget might decide with more:
+                        // not final.
+                        let fin = if own.over_budget {
+                            Fin::capped(Exhausted::PassWork)
+                        } else {
+                            Fin::FINAL
+                        };
+                        return Ok(Step::Normal(fin));
                     }
                     inner
                         .mba

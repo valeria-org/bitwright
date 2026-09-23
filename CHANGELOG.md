@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **MBA evidence.** The evidence gate proves answers itself beyond linear MBA: polynomial MBA
+  of degree `d` at the points where the set bits of all variables lie in at most `d`
+  positions, polynomials on a small grid, and expressions with right shifts, casts or
+  arithmetic under bitwise operators through atoms paired between the two sides. The same
+  checks are `mba::NativeProver`. The always-on refutation sample now includes the constants
+  of both sides and their neighbours, and single bit positions. Evaluation is batched (256
+  points per block). `MbaStats::certificates` counts what decided.
+- **Behavior changes.** With the MBA service, answers that needed a trusted backend certificate
+  are now accepted on bitwright's own proof where one applies (with `backend_certificates`
+  off, more answers are accepted); answers wrong at a constant of either side are refuted
+  earlier. A certificate that does not fit the remaining pass work leaves the node non-final.
+
 ## 0.3.1
 
 - **Memory and cache.** A `BitVec` takes 72 bytes whatever its width, so the tables holding a

@@ -27,7 +27,8 @@ use core::fmt;
 
 pub use budget::{Admission, Allowance, Budget, Cap, Clock, Deadline, Exhausted};
 pub use stats::{
-    By, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus, RuleCounts, Stats,
+    By, CertStats, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus, RuleCounts,
+    Stats,
 };
 
 use budget::{Counter, Meter};

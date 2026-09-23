@@ -1060,20 +1060,57 @@ pub mod mba {
   fragment is `+ − * neg & | ^ ~`, constant shifts below the width, extensions and truncation;
   anything else is an atom (a variable of the `MbaExpr`). Only mixed fragments (arithmetic and
   bitwise) within `MbaLimits` (variables, nodes, width, a minimum size) are asked about.
-- **Gate.** An answer must have the input's variables and width, agree with the input at 64 seeded
-  points (a refutation check that always runs), and carry exact evidence, in this order: equal
-  linear-MBA signatures when both sides are linear MBA (complete; `~c` counts as uniform only when
-  `c` is 0 or all-ones), exhaustive evaluation when the
-  variables total at most 20 bits, a configured `EquivalenceProver`'s proof, the backend's `Proved`
-  or `Certified` claim if `trust.backend_certificates` (the default), or agreement at the sampled
-  points only if `trust.sampled`. The lifted result must then agree with the original expression at
-  seeded symbol values (this checks lowering and lifting, which no proof about the lowered form
-  can), make the DAG smaller (§8), and pass the postconditions and the host veto (§6.4).
-  **Trusting backend certificates means trusting the backend**: an answer wrong at a point no
-  sample reaches is caught only when bitwright's own evidence applies; hosts that need
-  independence set `backend_certificates: false` and supply a prover. The gate's own evaluations
-  (sampling, signatures, exhaustive evaluation in blocks) are charged to `Budget::pass_work`, so a
-  budget or deadline can stop them; an answer refuted after lifting leaves no live nodes behind.
+- **Gate.** An answer must have the input's variables and width, agree with the input at 64
+  points (a refutation check that always runs: zero, all-ones, one and the signed minimum, the
+  constants of both sides with their neighbours `c ± 1`, `−c`, `~c`, points whose set bits lie
+  at one position, and seeded random points), and carry exact evidence, in this order:
+  bitwright's own certificates (below), a configured `EquivalenceProver`'s proof, the
+  backend's `Proved` or `Certified` claim if `trust.backend_certificates` (the default), or
+  agreement at the sampled points only if `trust.sampled`. The lifted result must then agree
+  with the original expression at seeded symbol values (this checks lowering and lifting,
+  which no proof about the lowered form can), make the DAG smaller (§8), and pass the
+  postconditions and the host veto (§6.4). **Trusting backend certificates means trusting the
+  backend**: an answer wrong at a point no sample reaches is caught only when bitwright's own
+  evidence applies; hosts that need independence set `backend_certificates: false`. The
+  gate's own evaluations (sampling and certificates, in blocks of 256 points on a compiled,
+  batched evaluator) are charged to `Budget::pass_work`, so a budget or deadline can stop
+  them; a certificate larger than what is left is not started, and the node stays non-final
+  (more budget may prove it). An answer refuted after lifting leaves no live nodes behind.
+- **Certificates** (`mba::certify`, also `NativeProver`). Each is a finite evaluation test,
+  complete for its fragment, sized before it runs; the cheapest that applies is run.
+  - *Signature*: linear MBA with only 0 and all-ones constants inside bitwise parts is
+    determined by its 2^t corner values.
+  - *Sparse points*: a **polynomial MBA** is built with `+ − · neg ~ <<k` and constants over
+    bitwise functions of the variables (`& | ^ ~` of variables and constants); its syntactic
+    degree `d` is the most bitwise factors in a product (a variable counts 1, a constant 0).
+    Writing each variable as `Σ_j 2^j·x[j]` makes the difference of two sides an integer
+    polynomial in the input bits (reduction mod 2^W is a ring homomorphism, so carries need no
+    care); after `b² = b` it is multilinear and each monomial touches at most `d` bit
+    positions, one per factor. Multilinear representations over a commutative ring are unique
+    and Möbius inversion recovers each coefficient from points supported inside its monomial,
+    so the sides are equal iff they agree wherever the set bits of all variables together lie
+    in at most `d` positions: `Σ_{k≤d} C(W,k)·(2^t − 1)^k` points (99,233 for `W = 64`, three
+    variables, `d = 2`). Degree 1 is the semi-linear test (`1 + W·(2^t − 1)` points).
+  - *Grid*: without `& | ^`, two polynomials of degree `≤ d_i` in variable `i` are equal iff
+    they agree on `Π_i {0..d_i}` (forward differences give `α!·h_α` for the falling-factorial
+    coefficients, and `(x)_k` is a multiple of `k!`).
+  - *Exhaustive*: when the variables total at most 20 bits.
+  - *Compositional*: when a side leaves the polynomial fragment, right shifts, casts and
+    arithmetic read by a bitwise operator become **atoms**. Both sides are merged into one
+    hash-consed DAG (commutative operands ordered), every node is evaluated at the refutation
+    sample, and atoms are put in classes of nodes proved equal: by structure, by congruence
+    (`f(a) = f(b)` when `a` and `b` are), and by comparing their definitions' skeletons with a
+    test above (operands first, among nodes that agree at the sample). The roots' skeletons,
+    with one variable per class (the variable itself when a class contains one), are then
+    compared by a direct test; an identity over independent atoms holds for any values of
+    them. Skeletons that differ only prove nothing (`Unknown`); `Refuted` always comes with a
+    real input where the sides differ. Every class is cross-checked against the sample; a
+    disagreement would be a bug and declines.
+
+  The degree-`d` test was derived for this design and is confirmed by exhaustive tests at
+  `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
+  (corner-invisible products, terms nonzero only when three different positions are set,
+  point functions) are never proved at any width.
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
   lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
   records its options and `max_vars`). Only results accepted by the gate under the key's trust

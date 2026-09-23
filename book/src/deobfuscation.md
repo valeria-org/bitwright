@@ -42,15 +42,33 @@ Nonlinear MBA (products of bitwise terms, for example) needs a solver. The MBA s
 fragment of an expression into a small standalone `MbaExpr`, asks an `MbaSolver`, and publishes
 the answer only through an evidence gate:
 
-1. the answer must have the input's variables and width and agree with it at 64 seeded points
-   (always);
-2. then evidence, in order: bitwright's own exact evidence (equal linear signatures, or
-   evaluation at every point when the variables total at most 20 bits), a configured
+1. the answer must have the input's variables and width and agree with it at 64 points
+   (always): zero, all ones, one, the signed minimum, the constants of both sides and their
+   neighbours, single bit positions, and seeded random values;
+2. then evidence, in order: bitwright's own certificates (below), a configured
    `EquivalenceProver`, the backend's own `Proved` or `Certified` claim if
-   `MbaTrust::backend_certificates` is set (the default), or agreement at the sampled points if
-   `MbaTrust::sampled` is set (off by default);
+   `MbaTrust::backend_certificates` is set (the default), or agreement at the sampled points
+   if `MbaTrust::sampled` is set (off by default);
 3. the answer lifted back into the context must agree with the original, make the DAG smaller,
    and pass the usual postconditions and host veto.
+
+bitwright's certificates are finite evaluation tests, each complete for its fragment:
+
+- **linear MBA** (only 0 and all-ones constants inside bitwise parts): the values at the
+  corners where every variable is 0 or all ones;
+- **polynomial MBA** (sums of products of bitwise functions, any constants): the points where
+  the set bits of all variables together lie in at most `d` bit positions, `d` the most bitwise
+  factors in one product. For `(x & y)·(x | y) + (x & ~y)·(~x & y) = x·y` at 64 bits that is
+  18,337 points;
+- **polynomials** without bitwise operators: a small grid, `{0, 1, 2}` per variable for degree 2;
+- every assignment when the variables total at most 20 bits;
+- anything else through **atoms**: right shifts, casts and arithmetic under a bitwise operator
+  are abstracted, paired between the two sides when they are provably equal, and the two
+  skeletons are compared by one of the tests above.
+
+A test is sized before it runs and charged to the pass-work budget; one that does not fit is not
+started, and the node is asked again by a later call with more budget. `NativeProver` offers the
+same checks to hosts that use the MBA module directly.
 
 Answers are cached (keyed by the lowered input, the solver's and prover's ids, the trust
 setting and the lowering version) in an `MbaCacheStore` you provide; `MemoryCache` is a bounded
