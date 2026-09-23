@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - **Invertibility.** A layer may span several nodes: a *region* between a node and a node every
   varying path goes through, proved injective by a pivot analysis (per bit, the input bits it
