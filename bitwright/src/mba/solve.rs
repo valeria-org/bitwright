@@ -66,6 +66,13 @@ pub trait MbaSolver: Send + Sync {
     fn id(&self) -> &str;
     /// Simplifies `p`.
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer;
+    /// Whether `Phase::Mba` should also ask about polynomials: fragments without bitwise
+    /// operators in which two non-constants are multiplied, and fragments rooted at a constant
+    /// left shift. By default only mixed fragments (arithmetic and bitwise operators) rooted at
+    /// `+ − · neg & | ^ ~` are asked about.
+    fn polynomial_fragments(&self) -> bool {
+        false
+    }
 }
 
 /// The outcome of an equivalence proof attempt.

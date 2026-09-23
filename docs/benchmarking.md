@@ -8,6 +8,7 @@ cargo run --release -p bitwright-bench -- --list            # what is measured
 cargo run --release -p bitwright-bench                      # everything, 7 samples each
 cargo run --release -p bitwright-bench -- facts simplify    # names containing "facts" or "simplify"
 cargo run --release -p bitwright-bench -- --quick           # a tenth of the iterations, 3 samples
+cargo run --release -p bitwright-bench -- --corpus-diff     # results under proposed MBA defaults
 ```
 
 ## What is measured, and why instructions
@@ -77,9 +78,33 @@ the test suite passes on both commits.
 | `expr/*` | Building a 1000-node random DAG in a fresh context (hash-consing and canonicalization), evaluating and substituting it, parsing and displaying expressions, and creating an empty `Context`. |
 | `facts/*` | Facts of every node of a fresh DAG (`cold`), a cached query (`warm`), proofs, and a fresh three-node context per query (`tiny-context`, the shape of a consumer that builds one context per instruction). |
 | `constraints/*` | Assuming 40 predicates (orderings and masks), and facts under 40 assumptions. |
-| `simplify/*` | The standard strategy on random DAGs, the deobfuscation strategy with the native MBA solver on linear MBA, and one simplification in a fresh context. |
+| `simplify/*` | The standard strategy on random DAGs; the deobfuscation strategy with the MBA service, bitwright's own evidence only: `mba` (the signature solver) and `mba-native` (the normal-form solver) on linear MBA, `mba-nonlinear` (normal-form) and `mba-nonlinear-sig` (signature) on nonlinear MBA; and one simplification in a fresh context. |
 | `service/*` | Building an engine (rule compilation), equality saturation, SMT-LIB export and import. |
 
 Workloads are generated from fixed seeds (`bitwright-bench/src/workload.rs`), so every run
-measures the same expressions. Setup that is not part of what a benchmark measures is excluded,
-for example building the DAG whose facts are measured. It runs with the counters paused.
+measures the same expressions. The nonlinear MBA corpus is generated in the repository too
+(`nonlinear_mba_corpus`): small targets (products, sums, bitwise functions) rewritten by MBA
+identities at random, plus terms equal to zero that only nonlinear reasoning cancels. No
+third-party dataset is vendored.
+
+Some benchmarks print a note under their row: what the measured work achieved and what it
+declined, from one run outside the measurement. For the MBA rows it is the DAG size before and
+after, the MBA service's answers (simplified, rejected as not smaller, no simpler, unsupported,
+exhausted, unproved, refuted, refused as too small or with too many variables), and the proofs
+bitwright ran itself, by test, with the points they evaluated. Declines are reported next to
+successes: a faster row that simplifies less is not an improvement.
+
+Setup that is not part of what a benchmark measures is excluded, for example building the DAG
+whose facts are measured. It runs with the counters paused.
+
+## Corpus diff
+
+`--corpus-diff` measures no instructions. It runs the deobfuscation strategy with the MBA
+service on generated corpora (200 linear MBA inputs, 200 nonlinear MBA inputs and 200 random
+DAGs, each at 8 and 64 bits) under three configurations: the current defaults (the signature
+solver, backend certificates trusted), the same solver with bitwright's own evidence only, and
+the proposed defaults (the normal-form solver, bitwright's own evidence only). It prints
+markdown: per corpus the result sizes, how many results change and in which direction, the time
+each configuration took (wall time, for orientation only), the MBA service's answers and
+refusals, and examples of changed results. It is the evidence for a change of defaults, which
+changes behavior; see `docs/proposals/`.

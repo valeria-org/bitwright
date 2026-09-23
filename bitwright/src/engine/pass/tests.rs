@@ -1431,6 +1431,41 @@ mod mba_service {
         assert!(changed > 50, "{changed}");
     }
 
+    #[test]
+    fn normal_form_solver_through_the_engine_is_sound() {
+        let solver = Arc::new(crate::mba::NormalFormSolver::default());
+        let no_trust = MbaTrust {
+            backend_certificates: false,
+            sampled: false,
+        };
+        let eng = mba_engine(solver.clone(), no_trust);
+        let mut g = generator(0x9f5b);
+        let mut rng = Rng(7);
+        let mut changed = 0;
+        for i in 0..800 {
+            let mut cx = Context::new();
+            let w = if i % 10 == 0 {
+                64
+            } else {
+                1 + g.rng.below(6) as u16
+            };
+            let e = if i % 3 == 0 {
+                g.expr(&mut cx, w.min(6), 4).0
+            } else {
+                linear_mba_expr(&mut g, &mut cx, w)
+            };
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+            changed += u64::from(out.roots[0].changed);
+            // Everything it answered was proved by the gate's own certificates.
+            assert_eq!(out.stats.mba.proof_unknown, 0);
+        }
+        assert!(changed > 50, "{changed}");
+        let s = solver.stats();
+        assert_eq!(s.declined_internal, 0);
+        assert!(s.simplified > 50, "{s:?}");
+    }
+
     /// Answers `x ⊕ ... ` wrongly but claims a certificate.
     struct Liar;
     impl MbaSolver for Liar {
@@ -1447,7 +1482,8 @@ mod mba_service {
         }
     }
 
-    /// Right except at one point no sample reaches: `x + y + [x == K]`.
+    /// Right except at one input no sample reaches: `x + y + [x·K₁ = K₂]`, true only at
+    /// `x = K₂·K₁⁻¹`, a value that is not a constant of either side (nor a neighbour of one).
     struct Subtle;
     impl MbaSolver for Subtle {
         fn id(&self) -> &str {
@@ -1458,23 +1494,27 @@ mod mba_service {
                 return MbaAnswer::Unsupported("two variables only".into());
             }
             let w = p.width().unwrap();
+            let c = |m: &mut MbaExpr, v: u64| {
+                m.push(MOp::Const(crate::BitVec::wrapping_from_u64(w, v)), &[])
+                    .unwrap()
+            };
             let mut m = MbaExpr::new(p.vars().to_vec());
             let x = m.push(MOp::Var(0), &[]).unwrap();
             let y = m.push(MOp::Var(1), &[]).unwrap();
             let s = m.push(MOp::Add, &[x, y]).unwrap();
-            let k = m
-                .push(
-                    MOp::Const(crate::BitVec::wrapping_from_u64(w, 0x1234_5678_9abc_def1)),
-                    &[],
-                )
-                .unwrap();
-            let d = m.push(MOp::Xor, &[x, k]).unwrap();
+            let k1 = c(&mut m, 0x9e37_79b9_7f4a_7c15);
+            let k2 = c(
+                &mut m,
+                0x9e37_79b9_7f4a_7c15u64.wrapping_mul(0x1234_5678_9abc_def1),
+            );
+            let xk = m.push(MOp::Mul, &[x, k1]).unwrap();
+            let d = m.push(MOp::Xor, &[xk, k2]).unwrap();
             let nd = m.push(MOp::Neg, &[d]).unwrap();
             let o = m.push(MOp::Or, &[d, nd]).unwrap();
             let nz = m.push(MOp::LShr(w.bits() - 1), &[o]).unwrap();
-            let one = m.push(MOp::Const(crate::BitVec::one(w)), &[]).unwrap();
-            let is_k = m.push(MOp::Sub, &[one, nz]).unwrap();
-            m.push(MOp::Add, &[s, is_k]).unwrap();
+            let one = c(&mut m, 1);
+            let hit = m.push(MOp::Sub, &[one, nz]).unwrap();
+            m.push(MOp::Add, &[s, hit]).unwrap();
             MbaAnswer::Simplified {
                 expr: m,
                 claim: Claim::Certified,
@@ -1489,6 +1529,9 @@ mod mba_service {
             "test.unproven"
         }
         fn solve(&self, p: &MbaExpr, _: &MbaBudget) -> MbaAnswer {
+            if p.vars().len() != 2 {
+                return MbaAnswer::Unsupported("two variables only".into());
+            }
             let mut m = MbaExpr::new(p.vars().to_vec());
             let x = m.push(MOp::Var(0), &[]).unwrap();
             let y = m.push(MOp::Var(1), &[]).unwrap();
@@ -1500,10 +1543,15 @@ mod mba_service {
         }
     }
 
-    /// `x + y`, spelled with a degree-2 MBA identity (`x·y = (x&y)(x|y) + (x&~y)(~x&y)`), so
-    /// neither the linear signature nor exhaustive evaluation (128 variable bits) can prove it.
+    /// `x + y`, spelled with a degree-2 MBA identity (`x·y = (x&y)(x|y) + (x&~y)(~x&y)`): the
+    /// linear signature and exhaustive evaluation (128 variable bits) cannot prove it, the
+    /// degree-2 certificate can.
     const NONLINEAR: &str =
         "(x ^ y) + 2 * (x & y) + x * y - (x & y) * (x | y) - (x & ~y) * (~x & y)";
+
+    /// `x + y`, through a relation between `x >> 1` and `x` that no native certificate sees (a
+    /// right shift is an atom, independent of `x`).
+    const NOT_NATIVE: &str = "(x >>u 1) * 2 + (x & 1) + y";
 
     fn run(eng: &Engine, src: &str) -> (Context, crate::engine::Outcome, Expr) {
         let mut cx = Context::new();
@@ -1531,13 +1579,17 @@ mod mba_service {
         let wrong = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_ne!(out.roots[0].expr, wrong);
         assert!(out.stats.mba.proof_unknown > 0);
-        // A right but unproven answer: rejected by default, accepted when sampling is trusted,
-        // and accepted by default when a prover proves it.
-        // (Where it is exactly provable, as at the linear subterm `(x ^ y) + 2 * (x & y)`, the
-        // answer is taken; the whole, which needs the degree-2 identity, is not.)
+        // A right answer bitwright can prove itself is taken without any trust: here by the
+        // degree-2 certificate.
+        let (mut cx, out, _) = run(&mba_engine(Arc::new(Unproven), no_trust), NONLINEAR);
+        let want = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
+        assert_eq!(out.roots[0].expr, want);
+        assert!(out.stats.mba.certificates.sparse > 0);
+        // A right but unproven answer no native certificate reaches: rejected by default,
+        // accepted when sampling is trusted, and accepted by default when a prover proves it.
         let (mut cx, out, _) = run(
             &mba_engine(Arc::new(Unproven), MbaTrust::default()),
-            NONLINEAR,
+            NOT_NATIVE,
         );
         let want = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_ne!(out.roots[0].expr, want);
@@ -1546,7 +1598,7 @@ mod mba_service {
             sampled: true,
             ..MbaTrust::default()
         };
-        let (mut cx, out, _) = run(&mba_engine(Arc::new(Unproven), sampled), NONLINEAR);
+        let (mut cx, out, _) = run(&mba_engine(Arc::new(Unproven), sampled), NOT_NATIVE);
         let want = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_eq!(out.roots[0].expr, want);
         struct Yes;
@@ -1565,7 +1617,7 @@ mod mba_service {
             .mba_prover(Arc::new(Yes))
             .build()
             .unwrap();
-        let (mut cx, out, _) = run(&eng, NONLINEAR);
+        let (mut cx, out, _) = run(&eng, NOT_NATIVE);
         let want = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_eq!(out.roots[0].expr, want);
     }
@@ -1714,18 +1766,22 @@ mod mba_service {
 
     #[test]
     fn exact_evidence_is_charged_and_budgeted() {
-        // At W = 8 the two variables have 16 bits: `Unproven`'s right answer is proved by
-        // evaluating all 2^16 points, and that work is charged.
+        // At W = 8 the two variables have 16 bits: `Unproven`'s right answer, outside the
+        // polynomial fragment, is proved by evaluating all 2^16 points, and that work is
+        // charged.
         let eng = mba_engine(Arc::new(Unproven), MbaTrust::default());
         let o = ParseOptions::width(Width::W8);
         let mut cx = Context::new();
-        let e = cx.parse(NONLINEAR, &o).unwrap();
+        let e = cx.parse(NOT_NATIVE, &o).unwrap();
         let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
         assert_eq!(out.roots[0].expr, cx.parse("x + y", &o).unwrap());
         assert!(out.stats.pass_work >= 1 << 16, "{}", out.stats.pass_work);
-        // A pass-work budget stops it.
+        assert_eq!(out.stats.mba.certificates.exhaustive, 1);
+        assert_eq!(out.stats.mba.certificates.points, 1 << 16);
+        // A pass-work budget stops it: the certificate is not started, and the node is not
+        // final (more budget may prove it).
         let mut cx = Context::new();
-        let e = cx.parse(NONLINEAR, &o).unwrap();
+        let e = cx.parse(NOT_NATIVE, &o).unwrap();
         let out = eng
             .run(
                 &mut cx,

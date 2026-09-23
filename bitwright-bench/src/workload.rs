@@ -185,3 +185,149 @@ pub fn mba_corpus(seed: u64, count: usize) -> Vec<String> {
     }
     out
 }
+
+/// An expression tree for the nonlinear corpus.
+#[derive(Clone, Debug)]
+enum T {
+    V(&'static str),
+    C(String),
+    Bin(&'static str, Box<T>, Box<T>),
+    Not(Box<T>),
+}
+
+impl T {
+    fn bin(op: &'static str, a: T, b: T) -> T {
+        T::Bin(op, Box::new(a), Box::new(b))
+    }
+
+    fn text(&self) -> String {
+        match self {
+            T::V(v) => (*v).to_string(),
+            T::C(c) => c.clone(),
+            T::Bin(op, a, b) => format!("({} {op} {})", a.text(), b.text()),
+            T::Not(a) => format!("~{}", a.text()),
+        }
+    }
+}
+
+/// Rewrites `e` with MBA identities at random nodes (each exact for all operands):
+/// `a + b = (a ^ b) + 2(a & b) = (a | b) + (a & b)`, `a − b = a + ~b + 1`,
+/// `a·b = (a & b)(a | b) + (a & ~b)(~a & b)`, `a ^ b = (a | b) − (a & b)`,
+/// `a & b = (a | b) − (a ^ b)`, `a | b = (a ^ b) + (a & b)`.
+fn obfuscate(rng: &mut Rng, e: &T, depth: u32) -> T {
+    let T::Bin(op, a, b) = e else {
+        return e.clone();
+    };
+    let (a, b) = if depth > 0 {
+        (obfuscate(rng, a, depth - 1), obfuscate(rng, b, depth - 1))
+    } else {
+        ((**a).clone(), (**b).clone())
+    };
+    if depth == 0 || rng.below(3) == 0 {
+        return T::bin(op, a, b);
+    }
+    let two = || T::C("2".into());
+    match *op {
+        "+" if rng.below(2) == 0 => T::bin(
+            "+",
+            T::bin("^", a.clone(), b.clone()),
+            T::bin("*", two(), T::bin("&", a, b)),
+        ),
+        "+" => T::bin("+", T::bin("|", a.clone(), b.clone()), T::bin("&", a, b)),
+        "-" => T::bin("+", T::bin("+", a, T::Not(Box::new(b))), T::C("1".into())),
+        "*" => T::bin(
+            "+",
+            T::bin(
+                "*",
+                T::bin("&", a.clone(), b.clone()),
+                T::bin("|", a.clone(), b.clone()),
+            ),
+            T::bin(
+                "*",
+                T::bin("&", a.clone(), T::Not(Box::new(b.clone()))),
+                T::bin("&", T::Not(Box::new(a)), b),
+            ),
+        ),
+        "^" => T::bin("-", T::bin("|", a.clone(), b.clone()), T::bin("&", a, b)),
+        "&" => T::bin("-", T::bin("|", a.clone(), b.clone()), T::bin("^", a, b)),
+        "|" => T::bin("+", T::bin("^", a.clone(), b.clone()), T::bin("&", a, b)),
+        _ => T::bin(op, a, b),
+    }
+}
+
+/// Nonlinear mixed boolean-arithmetic expressions over `x`, `y`, `z` at `bits` bits, in the
+/// text syntax: a small target (products, sums, bitwise functions) rewritten by MBA identities,
+/// plus terms equal to zero that only nonlinear reasoning cancels (`2^(W−1)·(u² + u)`,
+/// `u·v − (u & v)(u | v) − (u & ~v)(~u & v)`, and `((u + v) & w) + ((u + v) & ~w) − (u + v)`).
+pub fn nonlinear_mba_corpus(seed: u64, count: usize, bits: u16) -> Vec<String> {
+    let v = |n: &'static str| T::V(n);
+    let targets = [
+        T::bin("*", v("x"), v("y")),
+        T::bin("+", T::bin("*", v("x"), v("y")), v("z")),
+        T::bin("*", T::bin("+", v("x"), v("y")), v("z")),
+        T::bin("-", T::bin("*", v("x"), v("x")), v("y")),
+        T::bin("+", v("x"), v("y")),
+        T::bin("^", T::bin("*", v("x"), v("z")), v("y")),
+        T::bin(
+            "*",
+            T::bin("&", v("x"), v("y")),
+            T::bin("|", v("x"), v("z")),
+        ),
+        T::bin("-", v("x"), T::bin("*", v("y"), v("z"))),
+    ];
+    let half = format!("{:#x}", BitVec::smin(width(bits)))
+        .split(':')
+        .next()
+        .unwrap_or("0")
+        .to_string();
+    let vars = ["x", "y", "z"];
+    let mut rng = Rng::new(seed);
+    (0..count)
+        .map(|_| {
+            let target = &targets[rng.below(targets.len() as u64) as usize];
+            let mut e = obfuscate(&mut rng, target, 2);
+            for _ in 0..1 + rng.below(2) {
+                let (u, w) = (T::V(rng.pick(&vars)), T::V(rng.pick(&vars)));
+                let zero = match rng.below(3) {
+                    0 => T::bin(
+                        "*",
+                        T::C(half.clone()),
+                        T::bin("+", T::bin("*", u.clone(), u.clone()), u),
+                    ),
+                    1 => T::bin(
+                        "-",
+                        T::bin(
+                            "-",
+                            T::bin("*", u.clone(), w.clone()),
+                            T::bin(
+                                "*",
+                                T::bin("&", u.clone(), w.clone()),
+                                T::bin("|", u.clone(), w.clone()),
+                            ),
+                        ),
+                        T::bin(
+                            "*",
+                            T::bin("&", u.clone(), T::Not(Box::new(w.clone()))),
+                            T::bin("&", T::Not(Box::new(u)), w),
+                        ),
+                    ),
+                    _ => {
+                        let s = T::bin("+", u, w);
+                        let c = T::V(rng.pick(&vars));
+                        T::bin(
+                            "-",
+                            T::bin(
+                                "+",
+                                T::bin("&", s.clone(), c.clone()),
+                                T::bin("&", s.clone(), T::Not(Box::new(c))),
+                            ),
+                            s,
+                        )
+                    }
+                };
+                e = T::bin("+", e, zero);
+            }
+            e.text()
+        })
+        .collect()
+}

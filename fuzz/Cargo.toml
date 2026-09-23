@@ -14,7 +14,7 @@ members = ["."]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-bitwright = { path = "../bitwright", features = ["check", "smtlib"] }
+bitwright = { path = "../bitwright", features = ["check", "smtlib", "mba"] }
 
 [profile.release]
 debug = 1
@@ -52,6 +52,13 @@ bench = false
 [[bin]]
 name = "constrain_dag"
 path = "fuzz_targets/constrain_dag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mba_solve"
+path = "fuzz_targets/mba_solve.rs"
 test = false
 doc = false
 bench = false

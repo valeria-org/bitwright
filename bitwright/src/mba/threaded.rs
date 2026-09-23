@@ -61,6 +61,10 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
         &self.id
     }
 
+    fn polynomial_fragments(&self) -> bool {
+        self.inner.polynomial_fragments()
+    }
+
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
         const RUNNING: u8 = 0;
         const DONE: u8 = 1;

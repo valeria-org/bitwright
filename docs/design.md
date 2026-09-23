@@ -73,7 +73,7 @@ bitwright/                       workspace; edition 2024; rust-version 1.88; Pol
 │  ├─ src/check/                 soundness checker, evidence, ledger (feature "check")
 │  ├─ src/engine/                Engine, Strategy/Phase, Run/Outcome, budgets, dispatch net, memo, stats
 │  ├─ src/passes/                linear, xor, bitwise, compares, casts, demanded, linear_mba, shuffle, fact_fold
-│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits (feature "mba"); cobra.rs ("cobra")
+│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits, certificates, batched evaluator, nf/ (normal-form solver) (feature "mba"); cobra.rs ("cobra")
 │  └─ src/eqsat/                 e-graph, admission, schedule, extraction (feature "eqsat")
 ├─ bitwright-ref/                independent bit-serial reference evaluator (publish = false)
 ├─ bitwright-cli/                `bitwright check | lint | smt | catalog | explain | simplify` (published after 0.1)
@@ -95,7 +95,7 @@ Features other than `check` arrive with their milestones.
 |-|-|-|
 | `check` | yes | `bitwright::check`: the rule soundness checker, evidence and ledgers |
 | `smtlib` | no | SMT-LIB export of expressions and rule obligations; import of a QF_BV subset |
-| `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate, solver/prover/cache traits, `SignatureSolver`, `MemoryCache`, `Phase::Mba` |
+| `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate and its certificates, solver/prover/cache traits, `SignatureSolver`, `NormalFormSolver`, `NativeProver`, `MemoryCache`, `Phase::Mba` |
 | `cobra` | no | `mba` plus `CobraSolver` (the `cobra-mba` 0.4 backend) |
 | `eqsat` | no | `bitwright::eqsat`: the bounded equality-saturation search service and its built-in equations |
 | `deobf` | no | GF(2) linear-map normal form (mixer inversion is in the core: §8.1) |
@@ -1047,6 +1047,8 @@ pub mod mba {
     pub trait MbaCacheStore: Send + Sync { fn get(&self, k: &CacheKey) -> Option<CacheEntry>;
                                            fn put(&self, k: &CacheKey, e: &CacheEntry); }
     pub struct SignatureSolver;   // native, complete for linear MBA
+    pub struct NormalFormSolver;  // native normal forms: linear, semi-linear, polynomial MBA, atoms
+    pub struct NativeProver;      // bitwright's own certificates as an EquivalenceProver
     pub struct MemoryCache;       // bounded, oldest evicted first
     pub struct NoCache;
     pub struct MbaConfig { pub limits: MbaLimits, pub trust: MbaTrust, pub budget: MbaBudget }
@@ -1060,20 +1062,162 @@ pub mod mba {
   fragment is `+ − * neg & | ^ ~`, constant shifts below the width, extensions and truncation;
   anything else is an atom (a variable of the `MbaExpr`). Only mixed fragments (arithmetic and
   bitwise) within `MbaLimits` (variables, nodes, width, a minimum size) are asked about.
-- **Gate.** An answer must have the input's variables and width, agree with the input at 64 seeded
-  points (a refutation check that always runs), and carry exact evidence, in this order: equal
-  linear-MBA signatures when both sides are linear MBA (complete; `~c` counts as uniform only when
-  `c` is 0 or all-ones), exhaustive evaluation when the
-  variables total at most 20 bits, a configured `EquivalenceProver`'s proof, the backend's `Proved`
-  or `Certified` claim if `trust.backend_certificates` (the default), or agreement at the sampled
-  points only if `trust.sampled`. The lifted result must then agree with the original expression at
-  seeded symbol values (this checks lowering and lifting, which no proof about the lowered form
-  can), make the DAG smaller (§8), and pass the postconditions and the host veto (§6.4).
-  **Trusting backend certificates means trusting the backend**: an answer wrong at a point no
-  sample reaches is caught only when bitwright's own evidence applies; hosts that need
-  independence set `backend_certificates: false` and supply a prover. The gate's own evaluations
-  (sampling, signatures, exhaustive evaluation in blocks) are charged to `Budget::pass_work`, so a
-  budget or deadline can stop them; an answer refuted after lifting leaves no live nodes behind.
+- **Gate.** An answer must have the input's variables and width, agree with the input at 64
+  points (a refutation check that always runs: zero, all-ones, one and the signed minimum, the
+  constants of both sides with their neighbours `c ± 1`, `−c`, `~c`, points whose set bits lie
+  at one position, and seeded random points), make the DAG smaller once lifted (§8; checked
+  before any proof, so an answer that would be rejected for cost is not proved), and carry
+  exact evidence, in this order: bitwright's own certificates (below), a configured
+  `EquivalenceProver`'s proof, the backend's `Proved` or `Certified` claim if
+  `trust.backend_certificates` (the default), or agreement at the sampled points only if
+  `trust.sampled`. The lifted result must then agree with the original expression at seeded
+  symbol values (this checks lowering and lifting, which no proof about the lowered form
+  can), and pass the postconditions and the host veto (§6.4). **Trusting backend
+  certificates means trusting the backend**: an answer wrong at a point no sample reaches is
+  caught only when bitwright's own evidence applies; hosts that need independence set
+  `backend_certificates: false`. The gate's own evaluations (sampling and certificates, in
+  blocks of 256 points on a compiled, batched evaluator) are charged to `Budget::pass_work`,
+  so a budget or deadline can stop them; a certificate larger than what is left is not
+  started, and the node stays non-final (more budget may prove it). An answer refuted after
+  lifting, or rejected for cost, leaves no live nodes behind.
+- **Certificates** (`mba::certify`, also `NativeProver`). Each is a finite evaluation test,
+  complete for its fragment, sized before it runs; the cheapest that applies is run.
+  - *Signature*: linear MBA with only 0 and all-ones constants inside bitwise parts is
+    determined by its 2^t corner values.
+  - *Sparse points*: a **polynomial MBA** is built with `+ − · neg ~ <<k` and constants over
+    bitwise functions of the variables (`& | ^ ~` of variables and constants); its syntactic
+    degree `d` is the most bitwise factors in a product (a variable counts 1, a constant 0).
+    Writing each variable as `Σ_j 2^j·x[j]` makes the difference of two sides an integer
+    polynomial in the input bits (reduction mod 2^W is a ring homomorphism, so carries need no
+    care); after `b² = b` it is multilinear and each monomial touches at most `d` bit
+    positions, one per factor. Multilinear representations over a commutative ring are unique
+    and Möbius inversion recovers each coefficient from points supported inside its monomial,
+    so the sides are equal iff they agree wherever the set bits of all variables together lie
+    in at most `d` positions: `Σ_{k≤d} C(W,k)·(2^t − 1)^k` points (99,233 for `W = 64`, three
+    variables, `d = 2`). Degree 1 is the semi-linear test (`1 + W·(2^t − 1)` points).
+  - *Grid*: without `& | ^`, two polynomials of degree `≤ d_i` in variable `i` are equal iff
+    they agree on `Π_i {0..d_i}` (forward differences give `α!·h_α` for the falling-factorial
+    coefficients, and `(x)_k` is a multiple of `k!`).
+  - *Exhaustive*: when the variables total at most 20 bits.
+  - *Compositional*: when a side leaves the polynomial fragment, right shifts, casts and
+    arithmetic read by a bitwise operator become **atoms**. Both sides are merged into one
+    hash-consed DAG (commutative operands ordered), every node is evaluated at the refutation
+    sample, and atoms are put in classes of nodes proved equal: by structure, by congruence
+    (`f(a) = f(b)` when `a` and `b` are), and by comparing their definitions' skeletons with a
+    test above (operands first, among nodes that agree at the sample). The roots' skeletons,
+    with one variable per class (the variable itself when a class contains one), are then
+    compared by a direct test; an identity over independent atoms holds for any values of
+    them. Skeletons that differ only prove nothing (`Unknown`); `Refuted` always comes with a
+    real input where the sides differ. Every class is cross-checked against the sample; a
+    disagreement would be a bug and declines. Atoms are paired by evaluation and proof only,
+    never by the solver's normal forms: definitions with equal normal forms agree at the
+    sample and are then proved equal like any others, so the gate's soundness does not depend
+    on the normal-form code.
+
+  The degree-`d` test was derived for this design and is confirmed by exhaustive tests at
+  `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
+  (corner-invisible products, terms nonzero only when three different positions are set,
+  point functions) are never proved at any width.
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v1;…` with its options).
+  One pass over the question, operands first, gives every node the normal form of the smallest
+  fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
+  through. The first version takes one width (nodes of other widths only below casts, which are
+  atoms rendered as they are).
+  - *Bit classes.* The constants read by `& | ^` partition the positions: `j ~ j'` when every
+    such constant has the same bit at both (0 and all-ones never split). Inside a class every
+    bitwise subterm is one Boolean function, so a bitwise function of atoms is a **truth table
+    per class** (at most 12 atoms each), combined bit-parallel.
+  - *Masked conjunctions.* Möbius over a class's table writes the function as
+    `Σ_T a_T·(AND_T & M_c)` exactly at every width (`AND_∅ & M_c = M_c`). A linear combination
+    of bitwise functions is a polynomial of degree 1 over the symbols `m_{c,S} = AND_S & M_c`;
+    `m_{c,S}` is a multiple of `2^τ_c` (`τ_c` the class's lowest position), so its coefficient
+    matters modulo `2^(W−τ_c)`, and reduced there (signed) the form is canonical: two class
+    corners per class and atom set determine it.
+  - *Recognition.* A degree-≤1 form is a bitwise function exactly when, in every class, the
+    constant's bits there are all 0 or all 1 (`k_c`) and `k_c + Σ_{∅≠S⊆p} γ_{c,S}` is 0 or 1
+    modulo `2^(W−τ_c)` at every corner `p`; that is the table.
+  - *Atoms.* Arithmetic read by a bitwise operator is first tested for being a bitwise
+    function (so `((x ^ y) + 2·(x & y) − y) & z` is `x & z`); otherwise it is an atom keyed by
+    its reduced normal form over lower atoms, so equal definitions share one atom
+    (`((x ^ y) + 2·(x & y)) & z` is `(x + y) & z`, and `((x + y) & z) + ((x + y) & ~z)` is
+    `x + y`). A right shift is an atom keyed by its amount and its operand's normal form (so
+    `(s >> 3) + ((x + y) >> 3)` with `s` equal to `x + y` is `2·((x + y) >> 3)`). Casts, sums
+    or products over the size limits, and bitwise functions read arithmetically whose
+    polynomial would have more than `max_terms` monomials are atoms kept as they are. Every atom is rendered
+    once, lower atoms first, from its own cheapest form (the input subterm as it is among the
+    candidates), and shared by everything that uses it. Relations between atoms (between
+    `x >> 1` and `x`) are not seen: that loses completeness, never soundness.
+  - *Polynomials.* A product of two non-constants multiplies the operands' forms out
+    (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
+    `max_degree` the product is an atom). Symbols are treated as independent variables, which
+    is exact, and the form is reduced by exact rules that hold for any values of them: a
+    monomial whose factors' classes start at `τ` (summed) is a multiple of `2^τ`, so its
+    coefficient matters modulo `2^(W−τ)`; `(x)_κ = Π(x_i)_{κ_i}` is a multiple of `κ!`, so
+    `2^(W−v₂(κ!))·(x)_κ = 0`, and from the highest degree down each coefficient is brought into
+    `(−2^(m−1), 2^(m−1)]` for the larger modulus, the falling-factorial one moving the
+    difference into lower monomials (so `2^(W−1)·(x² + x)` is 0, and `−x²` stays `−x²`); a
+    symbol of a one-position class `{j}` has `m^e = 2^{j(e−1)}·m`. For polynomials in
+    independent atoms (no bitwise operator) the result is canonical. Relations between
+    symbols (`2^(W−1)·(AND_S·AND_T − AND_{S∪T}) = 0`) are not rules: the terms whose
+    coefficients are divisible by `2^(W−v₂(d!))` (`d` the degree; every univariate null
+    polynomial of degree `d` has such coefficients) are tried as a null part, whole and then
+    grouped by the atoms they mention, and dropped only when a certificate proves the part
+    zero.
+  - *Unmasking.* With several classes, products expand per class. Before rendering, each
+    shape (a monomial with classes erased), highest degree first, becomes one unmasked term
+    `c·Π AND_S^e` when subtracting `c` times its full expansion over the classes (`c` read
+    from class 0, which has every precision) leaves no term of that shape (checked with the
+    same exact reductions; the one-position rule applies only after this step).
+  - *Rendering.* Candidates are built into one builder with local interning and costed by the
+    nodes their root reaches, a shift's amount counted as the constant node it is once lifted;
+    the cheapest wins (then by an operator-weighted size, then by structure), and only if it
+    is strictly smaller than the input (else `NoSimpler`). A degree-≤1 form renders as a
+    bitwise function when it is one (the minimum-form table for at most three atoms, the
+    algebraic normal form, `((g ^ A) | B) & ~C` over classes whose tables are `g`, `¬g`,
+    all-ones and zero, or the or of masked groups), and otherwise over *groups of classes*
+    whose coefficient vectors can be chosen equal (each only defined modulo its class's
+    precision), also after taking out each atom set's widest-class coefficient as an unmasked
+    term: per group the masked conjunction form, the masked indicator forms
+    `b·M + Σ_{v≠b} (v − b)·(g_v & M)` over the distinct corner values `v` (every base `b`), and
+    `c·(g & M)` plus an affine rest for every bitwise function `g` of at most three atoms whose
+    conjunction coefficients `c` scales to the group's (solved 2-adically). With one group
+    every rendering is a candidate (constants merged); with several each group's is chosen in
+    turn for the cheapest whole. Every decomposition also comes with complements traded for
+    the constant (`c·~h = −c·h − c` and back). Sums put positive coefficients first, powers of
+    two as shifts, and choose each sign so a constant already needed is reused. Higher
+    degrees render as the linear part's cheapest decomposition plus the nonlinear part
+    monomial by monomial (powers by squaring), or factored: by a symbol common to all its
+    monomials, or by exact division (in graded lexicographic order, the divisor's leading
+    coefficient odd, which then always finds the quotient) by the normal form of an operand of
+    one of the input's products, recursively for the quotient; and the whole form as such a
+    product. Rendering is repeated with the factors the best candidate multiplies until none
+    is new, and the answer is normalized again (its own constants may give coarser classes)
+    until that renders nothing smaller: solving an answer again gives `NoSimpler`.
+  - *Self-check.* The chosen answer is certified against the input (§ Certificates) within the
+    solver's remaining budget: `Claim::Proved` when a certificate ran, `Claim::Sampled` when
+    none fit but the refutation sample agrees (the gate then decides on its own evidence).
+    Budget exhaustion before an answer is `Exhausted`; every decline is counted
+    (`NfStats`: fragments reached, atoms, candidates, null parts, certificates, declines by
+    reason). Steps count nodes, table words and monomial products; rendering work (terms and
+    table entries visited, four per term operation of a division, each division also bounded
+    by its dividend's size); and one per 32 node evaluations of a certificate. Rendering
+    stops generating candidates when the budget runs out, and the answer is then
+    `Exhausted`: a question's time is bounded by its budget (about 40 to 60 ns per step on
+    the benchmark machine, so tens of milliseconds at the default `2^20`).
+  - It asks to see polynomials too (`MbaSolver::polynomial_fragments`, default false):
+    `Phase::Mba` then also asks about fragments without bitwise operators in which two
+    non-constants are multiplied, and about fragments rooted at a constant left shift (the
+    arena spells `2^k·t` as `t << k`).
+  - On linear MBA it is never costlier than `SignatureSolver`: its conjunction form is one of
+    the candidates, emitted more tightly. Measured on every question the deobfuscation
+    strategy asks on 1,200 linear MBA inputs in the benchmark corpus's shape (4,275
+    questions): none answered more expensively; end to end the results have 9,517 nodes
+    against 10,360 (smaller on 542 inputs, larger on 2, where later passes reach a
+    four-term form from the signature solver's unchanged input).
+  - It is not the default solver. `docs/proposals/mba-defaults.md` proposes it, with backend
+    certificates not trusted, as the MBA service's defaults, with a corpus diff
+    (`bitwright-bench --corpus-diff`): much smaller results on MBA, at a time cost that is
+    largest on code that is not obfuscated.
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
   lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
   records its options and `max_vars`). Only results accepted by the gate under the key's trust

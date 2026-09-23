@@ -1,4 +1,10 @@
-//! MBA module tests: the expression type, lowering and lifting, the signature solver, caches.
+//! MBA module tests: the expression type, lowering and lifting, the signature solver, caches;
+//! the batched evaluator and the certificates in their own modules.
+
+mod batch;
+mod certify;
+mod nf;
+pub(crate) mod random;
 
 use super::*;
 use crate::testutil::{Gen, Rng};

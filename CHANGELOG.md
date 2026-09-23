@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+- **MBA evidence.** The evidence gate proves answers itself beyond linear MBA: polynomial MBA
+  of degree `d` at the points where the set bits of all variables lie in at most `d`
+  positions, polynomials on a small grid, and expressions with right shifts, casts or
+  arithmetic under bitwise operators through atoms paired between the two sides. The same
+  checks are `mba::NativeProver`. The always-on refutation sample now includes the constants
+  of both sides and their neighbours, and single bit positions. Evaluation is batched (256
+  points per block). `MbaStats::certificates` counts what decided.
+- **Native MBA solver.** `mba::NormalFormSolver` (with `NfOptions`, `NfStats`) simplifies
+  linear, semi-linear and polynomial MBA from exact normal forms at full width: bitwise
+  functions as truth tables per bit class (constants inside bitwise operators included),
+  polynomials over masked conjunctions with exact reductions (coefficient precision, the
+  falling-factorial null polynomials, one-position classes) and null parts dropped only when a
+  certificate proves them zero, and the cheapest of many renderings (minimum forms, masked
+  groups, indicator, conjunction and single-function forms, factored products). Subterms
+  outside these fragments are atoms keyed by their own normal forms (arithmetic that is
+  secretly bitwise is read as bitwise), each rendered once from its cheapest form. It certifies
+  every answer itself, is never costlier than `SignatureSolver` on linear MBA, and answers are
+  a fixed point (solving an answer again finds nothing smaller). Its work, rendering included,
+  is bounded by the solver budget. Not the default solver; `docs/proposals/mba-defaults.md`
+  proposes it (and backend certificates untrusted) as the default, with a corpus diff.
+- **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
+  solver that returns true is also asked about fragments without bitwise operators in which
+  two non-constants are multiplied, and fragments rooted at a constant left shift.
+- **Benchmarks.** `simplify/mba-native`, `simplify/mba-nonlinear` and
+  `simplify/mba-nonlinear-sig` measure the MBA service with each solver on linear and nonlinear
+  MBA (the nonlinear corpus is generated in the repository). The MBA rows print what the work
+  achieved and declined under their numbers. `bitwright-bench --corpus-diff` compares the
+  current MBA defaults with a proposed configuration on generated corpora.
+- **Behavior changes.** With the MBA service, answers that needed a trusted backend certificate
+  are now accepted on bitwright's own proof where one applies (with `backend_certificates`
+  off, more answers are accepted); answers wrong at a constant of either side are refuted
+  earlier. A certificate that does not fit the remaining pass work leaves the node non-final.
+  The gate checks that an answer would make the DAG smaller before proving it, so
+  `MbaStats::not_smaller` also counts answers rejected for cost before any proof.
+
 ## 0.3.1
 
 - **Memory and cache.** A `BitVec` takes 72 bytes whatever its width, so the tables holding a
