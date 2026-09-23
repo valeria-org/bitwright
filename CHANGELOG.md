@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **SMT-LIB.** `smtlib::import` checks the whole script's syntax, then reads and evaluates one
+  command at a time instead of building the script's syntax tree first (tokens are borrowed,
+  not copied): memory follows the largest command, not the script. The nightly 200,000-step
+  chain's 1.9 GB script needed about 40 GB to import, and the test was killed; the whole test
+  now peaks at 4.4 GB. `service/smt-import` is 36 % faster.
+- **Behavior changes.** None: every result is the same.
+
 ## 0.3.0
 
 - **Invertibility.** A layer may span several nodes: a *region* between a node and a node every

@@ -365,8 +365,11 @@ key has exactly one width per context; asking for another width is `Error::Symbo
   `smtlib::import(cx, script)` reads a QF_BV subset: `declare-const`, `declare-fun` and
   `define-fun` without parameters, `assert`, `let`, `ite`, `=`, `distinct`, the Boolean core, every
   QF_BV operator and its extensions (`bvsmod` expanded); Booleans become 1-bit expressions. It
-  reads the S-expressions with an explicit stack and evaluates terms recursively within the same
-  512-level nesting cap, refuses widths outside 1..=512, and returns an error, never a panic, for
+  checks the whole script's syntax first (a syntax error leaves the context untouched), then reads
+  one top-level command at a time, its tokens borrowed from the script, and evaluates it before
+  reading the next, so memory follows the largest command, not the script. It reads with an
+  explicit stack and evaluates terms recursively within the same 512-level nesting cap, refuses
+  widths outside 1..=512, and returns an error, never a panic, for
   anything else. Symbols named after SMT-LIB's reserved words and theory symbols (`and`, `true`,
   `_`, `bvadd`, …) are exported as `sym!id`, never as `|name|`, which would redefine them. An exported script imports back to the
   same function over the same symbol keys.

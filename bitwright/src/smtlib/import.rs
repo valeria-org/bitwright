@@ -46,197 +46,231 @@ impl Import {
 /// Anything else is an error. Symbol names `#k` and `$k` (decimal `k`) read as integer and
 /// fresh keys, so an [`export`](super::export)ed script reads back to the same symbols.
 pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
-    let sx = read(script)?;
+    // A syntax error anywhere fails the import before any command runs.
+    check(script)?;
     let mut st = State {
         cx,
-        sx: &sx,
         globals: HashMap::new(),
         scope: Vec::new(),
         out: Import::default(),
     };
-    for &top in &sx.top {
-        st.command(top)?;
+    // Then one top-level form at a time: memory is bounded by the largest command, not by the
+    // script.
+    let mut sx = Sx::default();
+    let mut pos = 0;
+    while let Some(top) = sx.read(script, &mut pos)? {
+        st.command(&sx, top)?;
     }
     Ok(st.out)
 }
 
 // ----- the reader ----------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-enum Tok {
+/// A token of a form: a symbol or literal borrowed from the script, or a list.
+#[derive(Copy, Clone, Debug)]
+enum Tok<'s> {
     /// A symbol or keyword, bars removed.
-    Sym(String),
+    Sym(&'s str),
     /// A numeral, `#b`/`#x` literal, or string.
-    Lit(String),
-    List(Vec<u32>),
+    Lit(&'s str),
+    /// A list, whose elements are `kids[start..end]`.
+    List(u32, u32),
 }
 
-struct Sx {
-    nodes: Vec<(Tok, usize, usize)>,
-    top: Vec<u32>,
+/// A lexeme: a parenthesis or an atom.
+enum Lex<'s> {
+    Open,
+    Close,
+    Atom(Tok<'s>),
 }
 
 fn syntax(message: &str, start: usize, end: usize) -> Error {
     Error::Syntax(SyntaxError::new(message, start, end))
 }
 
-fn read(src: &str) -> Result<Sx, Error> {
+/// The lexeme at or after `*i`, skipping blanks and comments, with its span; `None` at the end.
+fn lex<'s>(src: &'s str, i: &mut usize) -> Result<Option<(Lex<'s>, usize, usize)>, Error> {
     let b = src.as_bytes();
-    let mut nodes: Vec<(Tok, usize, usize)> = Vec::new();
-    let mut top = Vec::new();
-    // Open lists: their start offsets and children.
-    let mut open: Vec<(usize, Vec<u32>)> = Vec::new();
-    let mut i = 0;
-    let push = |nodes: &mut Vec<(Tok, usize, usize)>,
-                open: &mut Vec<(usize, Vec<u32>)>,
-                top: &mut Vec<u32>,
-                t: (Tok, usize, usize)| {
-        let id = nodes.len() as u32;
-        nodes.push(t);
-        match open.last_mut() {
-            Some((_, kids)) => kids.push(id),
-            None => top.push(id),
-        }
-    };
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+    while *i < b.len() {
+        let start = *i;
+        match b[start] {
+            b' ' | b'\t' | b'\r' | b'\n' => *i += 1,
             b';' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
+                while *i < b.len() && b[*i] != b'\n' {
+                    *i += 1;
                 }
             }
             b'(' => {
-                if open.len() >= MAX_DEPTH {
-                    return Err(syntax("nested too deeply", i, i + 1));
-                }
-                open.push((i, Vec::new()));
-                i += 1;
+                *i += 1;
+                return Ok(Some((Lex::Open, start, *i)));
             }
             b')' => {
-                let Some((start, kids)) = open.pop() else {
-                    return Err(syntax("unbalanced ')'", i, i + 1));
-                };
-                i += 1;
-                push(&mut nodes, &mut open, &mut top, (Tok::List(kids), start, i));
+                *i += 1;
+                return Ok(Some((Lex::Close, start, *i)));
             }
             b'|' => {
-                let start = i;
-                i += 1;
-                while i < b.len() && b[i] != b'|' {
-                    if b[i] == b'\\' {
-                        return Err(syntax("'\\' in a quoted symbol", i, i + 1));
+                *i += 1;
+                while *i < b.len() && b[*i] != b'|' {
+                    if b[*i] == b'\\' {
+                        return Err(syntax("'\\' in a quoted symbol", *i, *i + 1));
                     }
-                    i += 1;
+                    *i += 1;
                 }
-                if i >= b.len() {
-                    return Err(syntax("unterminated quoted symbol", start, i));
+                if *i >= b.len() {
+                    return Err(syntax("unterminated quoted symbol", start, *i));
                 }
-                i += 1;
-                let name = src[start + 1..i - 1].to_string();
-                push(&mut nodes, &mut open, &mut top, (Tok::Sym(name), start, i));
+                *i += 1;
+                let name = &src[start + 1..*i - 1];
+                return Ok(Some((Lex::Atom(Tok::Sym(name)), start, *i)));
             }
             b'"' => {
-                let start = i;
-                i += 1;
+                *i += 1;
                 loop {
-                    if i >= b.len() {
-                        return Err(syntax("unterminated string", start, i));
+                    if *i >= b.len() {
+                        return Err(syntax("unterminated string", start, *i));
                     }
-                    if b[i] == b'"' {
-                        if b.get(i + 1) == Some(&b'"') {
-                            i += 2;
+                    if b[*i] == b'"' {
+                        if b.get(*i + 1) == Some(&b'"') {
+                            *i += 2;
                             continue;
                         }
-                        i += 1;
+                        *i += 1;
                         break;
                     }
-                    i += 1;
+                    *i += 1;
                 }
-                let s = src[start..i].to_string();
-                push(&mut nodes, &mut open, &mut top, (Tok::Lit(s), start, i));
+                return Ok(Some((Lex::Atom(Tok::Lit(&src[start..*i])), start, *i)));
             }
             _ => {
-                let start = i;
-                while i < b.len()
+                while *i < b.len()
                     && !matches!(
-                        b[i],
+                        b[*i],
                         b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b';' | b'|' | b'"'
                     )
                 {
-                    i += 1;
+                    *i += 1;
                 }
-                let s = &src[start..i];
+                let s = &src[start..*i];
                 let tok = if s.starts_with('#') || s.as_bytes()[0].is_ascii_digit() {
-                    Tok::Lit(s.to_string())
+                    Tok::Lit(s)
                 } else {
-                    Tok::Sym(s.to_string())
+                    Tok::Sym(s)
                 };
-                push(&mut nodes, &mut open, &mut top, (tok, start, i));
+                return Ok(Some((Lex::Atom(tok), start, *i)));
             }
         }
     }
-    if let Some((start, _)) = open.last() {
-        return Err(syntax("unbalanced '('", *start, b.len()));
-    }
-    Ok(Sx { nodes, top })
+    Ok(None)
 }
 
-// ----- terms ---------------------------------------------------------------------------------
-
-/// A term's value: a bit-vector, or a Boolean as a 1-bit expression.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Val {
-    Bv(Expr),
-    Bool(Expr),
-}
-
-impl Val {
-    fn expr(self) -> Expr {
-        match self {
-            Val::Bv(e) | Val::Bool(e) => e,
+/// Checks the syntax of the whole script (balance, depth, quoted symbols and strings) without
+/// building anything.
+fn check(src: &str) -> Result<(), Error> {
+    // The start of every open list.
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while let Some((lexeme, start, end)) = lex(src, &mut i)? {
+        match lexeme {
+            Lex::Open => {
+                if open.len() >= MAX_DEPTH {
+                    return Err(syntax("nested too deeply", start, end));
+                }
+                open.push(start);
+            }
+            Lex::Close => {
+                if open.pop().is_none() {
+                    return Err(syntax("unbalanced ')'", start, end));
+                }
+            }
+            Lex::Atom(_) => {}
         }
     }
+    match open.last() {
+        Some(&start) => Err(syntax("unbalanced '('", start, src.len())),
+        None => Ok(()),
+    }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Sort {
-    Bool,
-    Bv(Width),
+/// One top-level form: its tokens with their spans in the script. The buffers are reused from
+/// one form to the next.
+#[derive(Default)]
+struct Sx<'s> {
+    nodes: Vec<(Tok<'s>, usize, usize)>,
+    /// The elements of every list, each list's contiguous.
+    kids: Vec<u32>,
+    /// While reading: the elements of the open lists read so far.
+    stack: Vec<u32>,
+    /// While reading: each open list's start, and where its elements begin in `stack`.
+    open: Vec<(usize, usize)>,
 }
 
-struct State<'a, 's> {
-    cx: &'a mut Context,
-    sx: &'s Sx,
-    globals: HashMap<String, Val>,
-    /// `let` bindings, innermost last.
-    scope: Vec<(String, Val)>,
-    out: Import,
-}
+impl<'s> Sx<'s> {
+    /// Reads the form at or after `*pos`, replacing the previous one: its root, or `None` at the
+    /// end of the script.
+    fn read(&mut self, src: &'s str, pos: &mut usize) -> Result<Option<u32>, Error> {
+        self.nodes.clear();
+        self.kids.clear();
+        self.stack.clear();
+        self.open.clear();
+        while let Some((lexeme, start, end)) = lex(src, pos)? {
+            let node = match lexeme {
+                Lex::Open => {
+                    if self.open.len() >= MAX_DEPTH {
+                        return Err(syntax("nested too deeply", start, end));
+                    }
+                    self.open.push((start, self.stack.len()));
+                    continue;
+                }
+                Lex::Close => {
+                    let Some((list_start, base)) = self.open.pop() else {
+                        return Err(syntax("unbalanced ')'", start, end));
+                    };
+                    let first = self.kids.len() as u32;
+                    self.kids.extend_from_slice(&self.stack[base..]);
+                    self.stack.truncate(base);
+                    (Tok::List(first, self.kids.len() as u32), list_start, end)
+                }
+                Lex::Atom(tok) => (tok, start, end),
+            };
+            let id = self.nodes.len() as u32;
+            self.nodes.push(node);
+            if self.open.is_empty() {
+                return Ok(Some(id));
+            }
+            self.stack.push(id);
+        }
+        match self.open.last() {
+            Some(&(start, _)) => Err(syntax("unbalanced '('", start, src.len())),
+            None => Ok(None),
+        }
+    }
 
-impl State<'_, '_> {
-    fn tok(&self, id: u32) -> &Tok {
-        &self.sx.nodes[id as usize].0
+    fn tok(&self, id: u32) -> Tok<'s> {
+        self.nodes[id as usize].0
     }
 
     fn err(&self, id: u32, message: &str) -> Error {
-        let (_, s, e) = self.sx.nodes[id as usize];
+        let (_, s, e) = self.nodes[id as usize];
         syntax(message, s, e)
     }
 
     fn list(&self, id: u32) -> Option<&[u32]> {
         match self.tok(id) {
-            Tok::List(k) => Some(k),
+            Tok::List(a, b) => Some(&self.kids[a as usize..b as usize]),
             _ => None,
         }
     }
 
-    fn sym(&self, id: u32) -> Option<&str> {
+    fn sym(&self, id: u32) -> Option<&'s str> {
         match self.tok(id) {
             Tok::Sym(s) => Some(s),
             _ => None,
         }
+    }
+
+    fn name(&self, id: u32) -> Result<&'s str, Error> {
+        self.sym(id)
+            .ok_or_else(|| self.err(id, "expected a symbol"))
     }
 
     fn numeral(&self, id: u32) -> Result<u32, Error> {
@@ -269,45 +303,78 @@ impl State<'_, '_> {
         }
         Err(self.err(id, "unsupported sort (Bool or (_ BitVec n))"))
     }
+}
 
-    fn command(&mut self, id: u32) -> Result<(), Error> {
-        let Some(k) = self.list(id) else {
-            return Err(self.err(id, "expected a command"));
+// ----- terms ---------------------------------------------------------------------------------
+
+/// A term's value: a bit-vector, or a Boolean as a 1-bit expression.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Val {
+    Bv(Expr),
+    Bool(Expr),
+}
+
+impl Val {
+    fn expr(self) -> Expr {
+        match self {
+            Val::Bv(e) | Val::Bool(e) => e,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Sort {
+    Bool,
+    Bv(Width),
+}
+
+struct State<'a, 's> {
+    cx: &'a mut Context,
+    /// Declared and defined names.
+    globals: HashMap<&'s str, Val>,
+    /// `let` bindings, innermost last.
+    scope: Vec<(&'s str, Val)>,
+    out: Import,
+}
+
+impl<'s> State<'_, 's> {
+    fn command(&mut self, sx: &Sx<'s>, id: u32) -> Result<(), Error> {
+        let Some(k) = sx.list(id) else {
+            return Err(sx.err(id, "expected a command"));
         };
         let Some((&head, args)) = k.split_first() else {
-            return Err(self.err(id, "empty command"));
+            return Err(sx.err(id, "empty command"));
         };
-        let args = args.to_vec();
-        match self.sym(head) {
+        match sx.sym(head) {
             Some(
                 "set-logic" | "set-info" | "set-option" | "check-sat" | "get-model" | "get-value"
                 | "exit" | "echo",
             ) => Ok(()),
-            Some("declare-const") if args.len() == 2 => self.declare(args[0], args[1]),
+            Some("declare-const") if args.len() == 2 => self.declare(sx, args[0], args[1]),
             Some("declare-fun") if args.len() == 3 => {
-                if self.list(args[1]).is_none_or(|p| !p.is_empty()) {
+                if sx.list(args[1]).is_none_or(|p| !p.is_empty()) {
                     return Err(Error::Unsupported(
                         "declare-fun with parameters (uninterpreted functions)".into(),
                     ));
                 }
-                self.declare(args[0], args[2])
+                self.declare(sx, args[0], args[2])
             }
             Some("define-fun") if args.len() == 4 => {
-                if self.list(args[1]).is_none_or(|p| !p.is_empty()) {
+                if sx.list(args[1]).is_none_or(|p| !p.is_empty()) {
                     return Err(Error::Unsupported("define-fun with parameters".into()));
                 }
-                let name = self.name(args[0])?;
-                let sort = self.sort(args[2])?;
-                let v = self.term(args[3])?;
-                self.check_sort(args[3], v, sort)?;
-                self.bind_global(args[0], name.clone(), v)?;
-                self.out.definitions.push((name, v.expr()));
+                let name = sx.name(args[0])?;
+                let sort = sx.sort(args[2])?;
+                let v = self.term(sx, args[3])?;
+                self.check_sort(sx, args[3], v, sort)?;
+                self.bind_global(sx, args[0], name, v)?;
+                self.out.definitions.push((name.to_string(), v.expr()));
                 Ok(())
             }
             Some("assert") if args.len() == 1 => {
-                let v = self.term(args[0])?;
+                let v = self.term(sx, args[0])?;
                 let Val::Bool(e) = v else {
-                    return Err(self.err(args[0], "an assertion must be Boolean"));
+                    return Err(sx.err(args[0], "an assertion must be Boolean"));
                 };
                 self.out.assertions.push(e);
                 Ok(())
@@ -315,39 +382,33 @@ impl State<'_, '_> {
             Some(c) => Err(Error::Unsupported(format!(
                 "the command {c} (or its arity)"
             ))),
-            None => Err(self.err(head, "expected a command name")),
+            None => Err(sx.err(head, "expected a command name")),
         }
     }
 
-    fn name(&self, id: u32) -> Result<String, Error> {
-        self.sym(id)
-            .map(str::to_string)
-            .ok_or_else(|| self.err(id, "expected a symbol"))
-    }
-
-    fn bind_global(&mut self, id: u32, name: String, v: Val) -> Result<(), Error> {
-        if self.globals.contains_key(&name) {
-            return Err(self.err(id, "already declared"));
+    fn bind_global(&mut self, sx: &Sx<'s>, id: u32, name: &'s str, v: Val) -> Result<(), Error> {
+        if self.globals.contains_key(name) {
+            return Err(sx.err(id, "already declared"));
         }
         self.globals.insert(name, v);
         Ok(())
     }
 
-    fn declare(&mut self, name_id: u32, sort_id: u32) -> Result<(), Error> {
-        let name = self.name(name_id)?;
-        let sort = self.sort(sort_id)?;
-        let key = key_of(&name);
+    fn declare(&mut self, sx: &Sx<'s>, name_id: u32, sort_id: u32) -> Result<(), Error> {
+        let name = sx.name(name_id)?;
+        let sort = sx.sort(sort_id)?;
+        let key = key_of(name);
         let (w, wrap): (Width, fn(Expr) -> Val) = match sort {
             Sort::Bool => (Width::W1, Val::Bool),
             Sort::Bv(w) => (w, Val::Bv),
         };
         let e = self.cx.symbol(key, w)?;
-        self.bind_global(name_id, name.clone(), wrap(e))?;
-        self.out.symbols.push((name, e));
+        self.bind_global(sx, name_id, name, wrap(e))?;
+        self.out.symbols.push((name.to_string(), e));
         Ok(())
     }
 
-    fn check_sort(&self, id: u32, v: Val, sort: Sort) -> Result<(), Error> {
+    fn check_sort(&self, sx: &Sx<'s>, id: u32, v: Val, sort: Sort) -> Result<(), Error> {
         let ok = match (v, sort) {
             (Val::Bool(_), Sort::Bool) => true,
             (Val::Bv(e), Sort::Bv(w)) => self.cx.width(e)? == w,
@@ -356,7 +417,7 @@ impl State<'_, '_> {
         if ok {
             Ok(())
         } else {
-            Err(self.err(id, "the term does not have the declared sort"))
+            Err(sx.err(id, "the term does not have the declared sort"))
         }
     }
 
@@ -364,102 +425,101 @@ impl State<'_, '_> {
         self.scope
             .iter()
             .rev()
-            .find(|(n, _)| n == name)
+            .find(|(n, _)| *n == name)
             .map(|&(_, v)| v)
             .or_else(|| self.globals.get(name).copied())
     }
 
-    fn bv(&self, id: u32, v: Val) -> Result<Expr, Error> {
+    fn bv(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<Expr, Error> {
         match v {
             Val::Bv(e) => Ok(e),
-            Val::Bool(_) => Err(self.err(id, "expected a bit-vector")),
+            Val::Bool(_) => Err(sx.err(id, "expected a bit-vector")),
         }
     }
 
-    fn boolean(&self, id: u32, v: Val) -> Result<Expr, Error> {
+    fn boolean(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<Expr, Error> {
         match v {
             Val::Bool(e) => Ok(e),
-            Val::Bv(_) => Err(self.err(id, "expected a Boolean")),
+            Val::Bv(_) => Err(sx.err(id, "expected a Boolean")),
         }
     }
 
-    fn term(&mut self, id: u32) -> Result<Val, Error> {
-        match self.tok(id).clone() {
-            Tok::Lit(s) => self.literal(id, &s),
-            Tok::Sym(s) => match s.as_str() {
+    fn term(&mut self, sx: &Sx<'s>, id: u32) -> Result<Val, Error> {
+        match sx.tok(id) {
+            Tok::Lit(s) => self.literal(sx, id, s),
+            Tok::Sym(s) => match s {
                 "true" => Ok(Val::Bool(self.cx.bool(true)?)),
                 "false" => Ok(Val::Bool(self.cx.bool(false)?)),
                 _ => self
-                    .lookup(&s)
-                    .ok_or_else(|| self.err(id, "undeclared symbol")),
+                    .lookup(s)
+                    .ok_or_else(|| sx.err(id, "undeclared symbol")),
             },
-            Tok::List(k) => {
+            Tok::List(first, end) => {
+                let k = &sx.kids[first as usize..end as usize];
                 let Some((&head, args)) = k.split_first() else {
-                    return Err(self.err(id, "empty term"));
+                    return Err(sx.err(id, "empty term"));
                 };
-                if let Some(h) = self.list(head) {
+                if let Some(h) = sx.list(head) {
                     // An indexed operator applied: `((_ extract i j) t)`.
-                    let h = h.to_vec();
-                    return self.indexed(id, &h, args);
+                    return self.indexed(sx, id, h, args);
                 }
-                match self.sym(head) {
-                    Some("_") => self.indexed_constant(id, args),
-                    Some("let") => self.let_(id, args),
+                match sx.sym(head) {
+                    Some("_") => self.indexed_constant(sx, id, args),
+                    Some("let") => self.let_(sx, id, args),
                     Some(op) => {
-                        let op = op.to_string();
                         let mut vals = Vec::with_capacity(args.len());
                         for &a in args {
-                            vals.push((a, self.term(a)?));
+                            vals.push((a, self.term(sx, a)?));
                         }
-                        self.apply(id, &op, &vals)
+                        self.apply(sx, id, op, &vals)
                     }
-                    None => Err(self.err(head, "expected an operator")),
+                    None => Err(sx.err(head, "expected an operator")),
                 }
             }
         }
     }
 
-    fn let_(&mut self, id: u32, args: &[u32]) -> Result<Val, Error> {
+    fn let_(&mut self, sx: &Sx<'s>, id: u32, args: &[u32]) -> Result<Val, Error> {
         let [binds, body] = args else {
-            return Err(self.err(id, "let takes bindings and a body"));
+            return Err(sx.err(id, "let takes bindings and a body"));
         };
-        let Some(bs) = self.list(*binds).map(<[u32]>::to_vec) else {
-            return Err(self.err(*binds, "expected let bindings"));
+        let Some(bs) = sx.list(*binds) else {
+            return Err(sx.err(*binds, "expected let bindings"));
         };
         // Parallel: every binding is evaluated in the outer scope.
         let mut new = Vec::with_capacity(bs.len());
-        for b in bs {
-            match self.list(b) {
+        for &b in bs {
+            match sx.list(b) {
                 Some(&[n, t]) => {
-                    let name = self.name(n)?;
-                    let v = self.term(t)?;
+                    let name = sx.name(n)?;
+                    let v = self.term(sx, t)?;
                     new.push((name, v));
                 }
-                _ => return Err(self.err(b, "expected (name term)")),
+                _ => return Err(sx.err(b, "expected (name term)")),
             }
         }
         let depth = self.scope.len();
         self.scope.extend(new);
-        let r = self.term(*body);
+        let r = self.term(sx, *body);
         self.scope.truncate(depth);
         r
     }
 
-    fn literal(&mut self, id: u32, s: &str) -> Result<Val, Error> {
+    fn literal(&mut self, sx: &Sx<'s>, id: u32, s: &str) -> Result<Val, Error> {
         let (bits_per, digits) = if let Some(d) = s.strip_prefix("#b") {
             (1u32, d)
         } else if let Some(d) = s.strip_prefix("#x") {
             (4, d)
         } else {
-            return Err(self.err(id, "bare numerals are not bit-vectors (use (_ bvN n))"));
+            return Err(sx.err(id, "bare numerals are not bit-vectors (use (_ bvN n))"));
         };
         let n = (digits.len() as u32).saturating_mul(bits_per);
-        let w = self.width(id, n)?;
+        let w = sx.width(id, n)?;
         let mut limbs = vec![0u64; (n as usize).div_ceil(64)];
         for (k, ch) in digits.bytes().rev().enumerate() {
             let d = (ch as char)
                 .to_digit(1 << bits_per)
-                .ok_or_else(|| self.err(id, "bad digit"))?;
+                .ok_or_else(|| sx.err(id, "bad digit"))?;
             let bit = k * bits_per as usize;
             limbs[bit / 64] |= u64::from(d) << (bit % 64);
         }
@@ -469,18 +529,18 @@ impl State<'_, '_> {
     }
 
     /// `(_ bvN n)`.
-    fn indexed_constant(&mut self, id: u32, args: &[u32]) -> Result<Val, Error> {
+    fn indexed_constant(&mut self, sx: &Sx<'s>, id: u32, args: &[u32]) -> Result<Val, Error> {
         let [v, n] = args else {
-            return Err(self.err(id, "expected (_ bvN n)"));
+            return Err(sx.err(id, "expected (_ bvN n)"));
         };
-        let Some(dec) = self.sym(*v).and_then(|s| s.strip_prefix("bv")) else {
-            return Err(self.err(*v, "expected bvN"));
+        let Some(dec) = sx.sym(*v).and_then(|s| s.strip_prefix("bv")) else {
+            return Err(sx.err(*v, "expected bvN"));
         };
         if dec.is_empty() || !dec.bytes().all(|c| c.is_ascii_digit()) {
-            return Err(self.err(*v, "expected bvN"));
+            return Err(sx.err(*v, "expected bvN"));
         }
-        let nn = self.numeral(*n)?;
-        let w = self.width(*n, nn)?;
+        let nn = sx.numeral(*n)?;
+        let w = sx.width(*n, nn)?;
         // Decimal into limbs, refusing a value that does not fit.
         let mut limbs = vec![0u64; usize::from(w.bits()).div_ceil(64) + 1];
         for d in dec.bytes() {
@@ -491,7 +551,7 @@ impl State<'_, '_> {
                 carry = x >> 64;
             }
             if carry != 0 {
-                return Err(self.err(*v, "value does not fit the width"));
+                return Err(sx.err(*v, "value does not fit the width"));
             }
         }
         let bits = usize::from(w.bits());
@@ -506,7 +566,7 @@ impl State<'_, '_> {
             }
         });
         if !fits {
-            return Err(self.err(*v, "value does not fit the width"));
+            return Err(sx.err(*v, "value does not fit the width"));
         }
         Ok(Val::Bv(
             self.cx.constant(&BitVec::wrapping_from_limbs(w, &limbs))?,
@@ -514,37 +574,37 @@ impl State<'_, '_> {
     }
 
     /// `((_ op i …) t …)`.
-    fn indexed(&mut self, id: u32, head: &[u32], args: &[u32]) -> Result<Val, Error> {
+    fn indexed(&mut self, sx: &Sx<'s>, id: u32, head: &[u32], args: &[u32]) -> Result<Val, Error> {
         let Some((&u, idx)) = head.split_first() else {
-            return Err(self.err(id, "expected an indexed operator"));
+            return Err(sx.err(id, "expected an indexed operator"));
         };
-        if self.sym(u) != Some("_") || idx.is_empty() {
-            return Err(self.err(id, "expected an indexed operator"));
+        if sx.sym(u) != Some("_") || idx.is_empty() {
+            return Err(sx.err(id, "expected an indexed operator"));
         }
-        let op = self.name(idx[0])?;
+        let op = sx.name(idx[0])?;
         let nums: Vec<u32> = idx[1..]
             .iter()
-            .map(|&i| self.numeral(i))
+            .map(|&i| sx.numeral(i))
             .collect::<Result<_, _>>()?;
         let [a] = args else {
-            return Err(self.err(id, "an indexed operator takes one operand"));
+            return Err(sx.err(id, "an indexed operator takes one operand"));
         };
-        let v = self.term(*a)?;
-        let x = self.bv(*a, v)?;
+        let v = self.term(sx, *a)?;
+        let x = self.bv(sx, *a, v)?;
         let w = u32::from(self.cx.width(x)?.bits());
-        let e = match (op.as_str(), nums.as_slice()) {
+        let e = match (op, nums.as_slice()) {
             ("extract", &[hi, lo]) => {
                 if lo > hi || hi >= w {
-                    return Err(self.err(id, "extract out of range"));
+                    return Err(sx.err(id, "extract out of range"));
                 }
-                let len = self.width(id, hi - lo + 1)?;
+                let len = sx.width(id, hi - lo + 1)?;
                 self.cx.extract(x, lo as u16, len)?
             }
             ("zero_extend" | "sign_extend", &[k]) => {
                 if k == 0 {
                     x
                 } else {
-                    let to = self.width(id, w.saturating_add(k))?;
+                    let to = sx.width(id, w.saturating_add(k))?;
                     if op == "zero_extend" {
                         self.cx.zext(x, to)?
                     } else {
@@ -554,9 +614,9 @@ impl State<'_, '_> {
             }
             ("repeat", &[k]) => {
                 if k == 0 {
-                    return Err(self.err(id, "repeat 0"));
+                    return Err(sx.err(id, "repeat 0"));
                 }
-                self.width(id, w.saturating_mul(k))?;
+                sx.width(id, w.saturating_mul(k))?;
                 let mut acc = x;
                 for _ in 1..k {
                     acc = self.cx.concat(acc, x)?;
@@ -578,13 +638,13 @@ impl State<'_, '_> {
         Ok(Val::Bv(e))
     }
 
-    fn apply(&mut self, id: u32, op: &str, args: &[(u32, Val)]) -> Result<Val, Error> {
+    fn apply(&mut self, sx: &Sx<'s>, id: u32, op: &str, args: &[(u32, Val)]) -> Result<Val, Error> {
         let n = args.len();
         let arity = |ok: bool| {
             if ok {
                 Ok(())
             } else {
-                Err(self.err(id, "wrong number of operands"))
+                Err(sx.err(id, "wrong number of operands"))
             }
         };
         // Operators over bit-vectors.
@@ -606,9 +666,9 @@ impl State<'_, '_> {
         };
         if let Some((b, left_assoc)) = bin {
             arity(n == 2 || (left_assoc && n > 2))?;
-            let mut acc = self.bv(args[0].0, args[0].1)?;
+            let mut acc = self.bv(sx, args[0].0, args[0].1)?;
             for &(a, v) in &args[1..] {
-                let x = self.bv(a, v)?;
+                let x = self.bv(sx, a, v)?;
                 acc = self.cx.bin(b, acc, x)?;
             }
             return Ok(Val::Bv(acc));
@@ -627,23 +687,23 @@ impl State<'_, '_> {
         if let Some(c) = cmp {
             arity(n == 2)?;
             let (a, b) = (
-                self.bv(args[0].0, args[0].1)?,
-                self.bv(args[1].0, args[1].1)?,
+                self.bv(sx, args[0].0, args[0].1)?,
+                self.bv(sx, args[1].0, args[1].1)?,
             );
             return Ok(Val::Bool(self.cx.cmp(c, a, b)?));
         }
         match op {
             "bvnot" | "bvneg" => {
                 arity(n == 1)?;
-                let a = self.bv(args[0].0, args[0].1)?;
+                let a = self.bv(sx, args[0].0, args[0].1)?;
                 let u = if op == "bvnot" { UnOp::Not } else { UnOp::Neg };
                 Ok(Val::Bv(self.cx.un(u, a)?))
             }
             "bvnand" | "bvnor" | "bvxnor" => {
                 arity(n == 2)?;
                 let (a, b) = (
-                    self.bv(args[0].0, args[0].1)?,
-                    self.bv(args[1].0, args[1].1)?,
+                    self.bv(sx, args[0].0, args[0].1)?,
+                    self.bv(sx, args[1].0, args[1].1)?,
                 );
                 let inner = match op {
                     "bvnand" => BinOp::And,
@@ -656,31 +716,31 @@ impl State<'_, '_> {
             "bvcomp" => {
                 arity(n == 2)?;
                 let (a, b) = (
-                    self.bv(args[0].0, args[0].1)?,
-                    self.bv(args[1].0, args[1].1)?,
+                    self.bv(sx, args[0].0, args[0].1)?,
+                    self.bv(sx, args[1].0, args[1].1)?,
                 );
                 Ok(Val::Bv(self.cx.cmp(CmpOpExt::Eq, a, b)?))
             }
             "bvsmod" => {
                 arity(n == 2)?;
                 let (s, t) = (
-                    self.bv(args[0].0, args[0].1)?,
-                    self.bv(args[1].0, args[1].1)?,
+                    self.bv(sx, args[0].0, args[0].1)?,
+                    self.bv(sx, args[1].0, args[1].1)?,
                 );
                 Ok(Val::Bv(smod(self.cx, s, t)?))
             }
             "concat" => {
                 arity(n >= 2)?;
-                let mut acc = self.bv(args[0].0, args[0].1)?;
+                let mut acc = self.bv(sx, args[0].0, args[0].1)?;
                 for &(a, v) in &args[1..] {
-                    let x = self.bv(a, v)?;
+                    let x = self.bv(sx, a, v)?;
                     acc = self.cx.concat(acc, x)?;
                 }
                 Ok(Val::Bv(acc))
             }
             "not" => {
                 arity(n == 1)?;
-                let a = self.boolean(args[0].0, args[0].1)?;
+                let a = self.boolean(sx, args[0].0, args[0].1)?;
                 Ok(Val::Bool(self.cx.un(UnOp::Not, a)?))
             }
             "and" | "or" | "xor" => {
@@ -690,9 +750,9 @@ impl State<'_, '_> {
                     "or" => BinOp::Or,
                     _ => BinOp::Xor,
                 };
-                let mut acc = self.boolean(args[0].0, args[0].1)?;
+                let mut acc = self.boolean(sx, args[0].0, args[0].1)?;
                 for &(a, v) in &args[1..] {
-                    let x = self.boolean(a, v)?;
+                    let x = self.boolean(sx, a, v)?;
                     acc = self.cx.bin(b, acc, x)?;
                 }
                 Ok(Val::Bool(acc))
@@ -700,9 +760,9 @@ impl State<'_, '_> {
             "=>" => {
                 // Right-associative: `a => (b => c)`.
                 arity(n >= 2)?;
-                let mut acc = self.boolean(args[n - 1].0, args[n - 1].1)?;
+                let mut acc = self.boolean(sx, args[n - 1].0, args[n - 1].1)?;
                 for &(a, v) in args[..n - 1].iter().rev() {
-                    let x = self.boolean(a, v)?;
+                    let x = self.boolean(sx, a, v)?;
                     let nx = self.cx.un(UnOp::Not, x)?;
                     acc = self.cx.bin(BinOp::Or, nx, acc)?;
                 }
@@ -712,7 +772,7 @@ impl State<'_, '_> {
                 arity(n >= 2)?;
                 let kind = |v: Val| matches!(v, Val::Bool(_));
                 if args.iter().any(|&(_, v)| kind(v) != kind(args[0].1)) {
-                    return Err(self.err(id, "operands of different sorts"));
+                    return Err(sx.err(id, "operands of different sorts"));
                 }
                 let mut pairs = Vec::new();
                 if op == "=" {
@@ -737,16 +797,16 @@ impl State<'_, '_> {
                     });
                 }
                 acc.map(Val::Bool)
-                    .ok_or_else(|| self.err(id, "wrong number of operands"))
+                    .ok_or_else(|| sx.err(id, "wrong number of operands"))
             }
             "ite" => {
                 arity(n == 3)?;
-                let c = self.boolean(args[0].0, args[0].1)?;
+                let c = self.boolean(sx, args[0].0, args[0].1)?;
                 let (t, f) = (args[1].1, args[2].1);
                 match (t, f) {
                     (Val::Bv(a), Val::Bv(b)) => Ok(Val::Bv(self.cx.select(c, a, b)?)),
                     (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(self.cx.select(c, a, b)?)),
-                    _ => Err(self.err(id, "ite arms of different sorts")),
+                    _ => Err(sx.err(id, "ite arms of different sorts")),
                 }
             }
             _ => Err(Error::Unsupported(format!("the operator {op}"))),
