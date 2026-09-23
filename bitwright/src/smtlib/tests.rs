@@ -497,12 +497,16 @@ fn obligations_state_what_the_checker_evaluates() {
 }
 
 /// Every built-in rule proved by z3 at widths up to 512, and the unsound ones refuted. Needs z3
-/// on `PATH`; skipped (with a note) when it is not installed.
+/// on `PATH`; skipped (with a note) when it is not installed. The obligations are independent,
+/// so they are solved by one z3 process per available core, and the answers are read back in
+/// order: the report does not depend on scheduling.
 #[test]
 #[ignore = "needs z3 on PATH; minutes"]
 fn z3_proves_the_built_in_rules() {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let solve = |script: &str| -> Option<String> {
         let mut child = Command::new("z3")
             .args(["-in", "-smt2", "-T:60"])
@@ -518,32 +522,58 @@ fn z3_proves_the_built_in_rules() {
         eprintln!("z3 is not on PATH; skipped");
         return;
     }
+    // The built-in rules must be proved and the unsound ones refuted; the coverage rules are
+    // neither. Every obligation first, then all of them solved at once.
+    let mut rules = Vec::new();
+    let mut jobs: Vec<(Vec<u16>, String)> = Vec::new();
+    for (k, program) in programs().iter().enumerate().take(3) {
+        for rule in program.rules() {
+            let start = jobs.len();
+            for ws in assignments(rule, 8) {
+                let script = rule_obligation(rule, &ws).unwrap();
+                jobs.push((ws, script));
+            }
+            rules.push((rule.name.clone(), k == 2, start..jobs.len()));
+        }
+    }
+    // One z3 process per core, widest obligations (the slow ones) first, so that none of them
+    // starts last and stretches the run; each answer lands in its obligation's slot.
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(jobs[i].0.iter().max().copied()));
+    let next = AtomicUsize::new(0);
+    let answers: Vec<OnceLock<Option<String>>> = jobs.iter().map(|_| OnceLock::new()).collect();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..workers.min(jobs.len()) {
+            s.spawn(|| {
+                while let Some(&i) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let _ = answers[i].set(solve(&jobs[i].1));
+                }
+            });
+        }
+    });
     let mut failures = Vec::new();
     // A solver that gives up (wide division and shifts bit-blast to large circuits) proves
     // nothing but refutes nothing either: tolerated above 64 bits, and only rarely.
     let mut gave_up = Vec::new();
     let mut proved = 0;
-    // The built-in rules must be proved and the unsound ones refuted; the coverage rules are
-    // neither.
-    for (k, program) in programs().iter().enumerate().take(3) {
-        for rule in program.rules() {
-            let unsound = k == 2;
-            let mut refuted = false;
-            for ws in assignments(rule, 8) {
-                let answer = solve(&rule_obligation(rule, &ws).unwrap()).unwrap();
-                match (answer.as_str(), unsound) {
-                    ("unsat", false) => proved += 1,
-                    ("sat", true) => refuted = true,
-                    ("unsat", true) => {}
-                    ("unknown" | "timeout", _) if ws.iter().any(|&w| w > 64) => {
-                        gave_up.push(format!("{} {ws:?}", rule.name));
-                    }
-                    (a, _) => failures.push(format!("{} {ws:?}: {a}", rule.name)),
+    for (name, unsound, range) in &rules {
+        let mut refuted = false;
+        for i in range.clone() {
+            let ws = &jobs[i].0;
+            let answer = answers[i].get().cloned().flatten().unwrap();
+            match (answer.as_str(), *unsound) {
+                ("unsat", false) => proved += 1,
+                ("sat", true) => refuted = true,
+                ("unsat", true) => {}
+                ("unknown" | "timeout", _) if ws.iter().any(|&w| w > 64) => {
+                    gave_up.push(format!("{name} {ws:?}"));
                 }
+                (a, _) => failures.push(format!("{name} {ws:?}: {a}")),
             }
-            if unsound && !refuted {
-                failures.push(format!("{}: never refuted", rule.name));
-            }
+        }
+        if *unsound && !refuted {
+            failures.push(format!("{name}: never refuted"));
         }
     }
     eprintln!(
