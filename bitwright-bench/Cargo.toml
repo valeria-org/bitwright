@@ -1,0 +1,24 @@
+[package]
+name = "bitwright-bench"
+description = "Benchmarks for bitwright, measured in retired instructions and thread CPU time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bitwright = { path = "../bitwright", features = ["mba", "eqsat", "smtlib"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Not the workspace lints: reading hardware counters needs `unsafe` (one module, `counter`).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,1 @@
+(declare-const x (_ BitVec 8))(declare-const p Bool)(define-fun a () (_ BitVec 8) (let ((t (bvadd x #x01))) (ite p (bvsmod t x) ((_ rotate_left 3) t))))

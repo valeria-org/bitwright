@@ -1,0 +1,57 @@
+[package]
+name = "bitwright-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "PolyForm-Noncommercial-1.0.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: libFuzzer needs nightly and sanitizer flags the main workspace never uses.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bitwright = { path = "../bitwright", features = ["check", "smtlib"] }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+debug-assertions = true
+
+[[bin]]
+name = "parse_expr"
+path = "fuzz_targets/parse_expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compile_rules"
+path = "fuzz_targets/compile_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smt_import"
+path = "fuzz_targets/smt_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "simplify_dag"
+path = "fuzz_targets/simplify_dag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "constrain_dag"
+path = "fuzz_targets/constrain_dag.rs"
+test = false
+doc = false
+bench = false

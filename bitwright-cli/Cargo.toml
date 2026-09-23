@@ -1,0 +1,21 @@
+[package]
+name = "bitwright-cli"
+description = "Command-line tools for bitwright: check, lint, prove and catalog rule files; simplify expressions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Published after bitwright 0.1.
+publish = false
+
+[[bin]]
+name = "bitwright"
+path = "src/main.rs"
+
+[dependencies]
+bitwright = { path = "../bitwright", features = ["check", "smtlib"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,167 @@
+bitwright 1;
+
+// The built-in local rules. Every rule is checked by `bitwright::check` (exhaustively at small
+// widths, sampled up to 512 bits) and recorded in `core.bwr.proof`. Algebra that a normal form
+// decides (linear forms, truth tables, comparison lattices) belongs in a pass, not here.
+
+group core.bitwise {
+    /// Absorption.
+    #[example("(q | p) & p" => "p")]
+    rule and_absorb_or<W>(x: W, y: W) { x & (x | y) => x }
+
+    /// Absorption.
+    #[example("(q & p) | p" => "p")]
+    rule or_absorb_and<W>(x: W, y: W) { x | (x & y) => x }
+
+    /// Complement.
+    #[example("p & ~p" => "0:8")]
+    rule and_not_self<W>(x: W) { x & ~x => 0 }
+
+    /// Complement.
+    #[example("p | ~p" => "255:8")]
+    rule or_not_self<W>(x: W) { x | ~x => ones }
+
+    /// Complement.
+    #[example("p ^ ~p" => "255:8")]
+    rule xor_not_self<W>(x: W) { x ^ ~x => ones }
+
+    /// The and and the or of two values differ exactly in their xor.
+    #[example("(p & q) ^ (p | q)" => "p ^ q")]
+    rule xor_and_or<W>(x: W, y: W) { (x & y) ^ (x | y) => x ^ y }
+
+    /// A mask that keeps every bit the value may have set.
+    #[example("(q & 15) & 0x3f" => "q & 15")]
+    rule and_mask_redundant<W>(x: W, c: const W) { x & c => x if zero_bits(x, ~c) }
+
+    /// A mask that keeps none of the bits the value may have set.
+    #[example("(q & 0xf0) & 15" => "0:8")]
+    rule and_mask_disjoint<W>(x: W, c: const W) { x & c => 0 if zero_bits(x, c) }
+
+    /// Setting bits that are already set.
+    #[example("(q | 0x81) | 1" => "q | 0x81")]
+    rule or_known_ones<W>(x: W, c: const W) { x | c => x if one_bits(x, c) }
+}
+
+group core.arith {
+    /// And plus or is plus.
+    #[example("(p & q) + (p | q)" => "p + q")]
+    identity add_and_or<W>(x: W, y: W) { (x & y) + (x | y) <=> x + y }
+
+    /// Xor plus twice the and is plus. (Twice is written as the shift `mul_pow2` makes of it:
+    /// patterns are written in normal form, or bottom-up rewriting never reaches them.)
+    #[example("(p ^ q) + ((p & q) << 1)" => "p + q")]
+    identity add_xor_and<W>(x: W, y: W) { (x ^ y) + ((x & y) << 1) <=> x + y }
+
+    /// Xor plus and is or (the two parts share no bits).
+    #[example("(p ^ q) + (p & q)" => "p | q")]
+    rule or_from_xor_and<W>(x: W, y: W) { (x ^ y) + (x & y) => x | y }
+
+    /// Removing the common bits.
+    #[example("p - (p & q)" => "p & ~q")]
+    rule sub_and<W>(x: W, y: W) { x - (x & y) => x & ~y }
+
+    /// `-~x = x + 1`.
+    #[example("-(~p)" => "p + 1")]
+    rule neg_not<W>(x: W) { -(~x) => x + 1 }
+
+    /// `~-x = x - 1`.
+    #[example("~(-p)" => "p - 1")]
+    rule not_neg<W>(x: W) { ~(-x) => x - 1 }
+
+    /// An add without carries is an or.
+    #[example("(p & 0xf0) + (q & 15)" => "(p & 0xf0) | (q & 15)")]
+    rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }
+
+    /// Multiplying by a power of two is a shift.
+    #[example("p * 8" => "p << 3")]
+    rule mul_pow2<W>(x: W, c: const W) { x * c => x << k if is_pow2(c) let k: W = ctz(c) }
+
+    /// Unsigned division by a power of two is a shift.
+    #[example("udiv(p, 16)" => "p >>u 4")]
+    rule udiv_pow2<W>(x: W, c: const W) { udiv(x, c) => x >>u k if is_pow2(c) let k: W = ctz(c) }
+
+    /// Unsigned remainder by a power of two is a mask.
+    #[example("urem(p, 16)" => "p & 15")]
+    rule urem_pow2<W>(x: W, c: const W) { urem(x, c) => x & m if is_pow2(c) let m: W = c - 1 }
+}
+
+group core.compare {
+    /// A zero difference is equality.
+    #[example("p - q == 0" => "p == q")]
+    rule eq_sub_zero<W>(a: W, b: W) { (a - b) == 0 => a == b }
+
+    /// A zero xor is equality.
+    #[example("(p ^ q) == 0" => "p == q")]
+    rule eq_xor_zero<W>(a: W, b: W) { (a ^ b) == 0 => a == b }
+
+    /// Below one is zero.
+    #[example("p <u 1" => "p == 0")]
+    rule ult_one<W>(x: W) { x <u 1 => x == 0 }
+
+    /// A value cannot equal two provably different values.
+    #[example("(p == 1) & (p == 2)" => "0:1")]
+    rule eq_eq_distinct<W>(a: W, b: W, c: W) { (a == b) & (a == c) => false if proves(b != c) }
+
+    /// Unsigned comparison of zero-extended values is the narrow comparison.
+    #[example("zext<16>(p) <u zext<16>(q)" => "p <u q")]
+    rule ult_zext<W, U>(a: W, b: W) where W < U { zext<U>(a) <u zext<U>(b) => a <u b }
+
+    /// Signed comparison of sign-extended values is the narrow comparison.
+    #[example("sext<16>(p) <s sext<16>(q)" => "p <s q")]
+    rule slt_sext<W, U>(a: W, b: W) where W < U { sext<U>(a) <s sext<U>(b) => a <s b }
+
+    /// Equality of extended values is equality.
+    #[example("zext<16>(p) == zext<16>(q)" => "p == q")]
+    rule eq_zext<W, U>(a: W, b: W) where W < U { zext<U>(a) == zext<U>(b) => a == b }
+}
+
+group core.casts {
+    /// Truncate, then zero-extend back: a mask.
+    #[example("zext<8>(trunc<4>(p))" => "p & 15")]
+    rule zext_trunc<W, N>(x: W) where N < W { zext<W>(trunc<N>(x)) => x & lowmask(N) }
+
+    /// Sign extension spelled as "value | (sign word << W)". Needs `U <= 2W` to be exact.
+    #[example("zext<16>(p) | (zext<16>(p >>s 7) << 8)" => "sext<16>(p)")]
+    rule sext_from_sign_word<W, U>(a: W) where W < U, U <= 2 * W {
+        zext<U>(a) | (zext<U>(a >>s (W - 1)) << W) => sext<U>(a)
+    }
+
+    /// The low bits of a zero extension's operand.
+    #[example("trunc<8>(zext<16>(p) & zext<16>(q))" => "p & q")]
+    rule trunc_and_zext<W, U>(a: W, b: W) where W < U {
+        trunc<W>(zext<U>(a) & zext<U>(b)) => a & b
+    }
+}
+
+group core.shift {
+    /// Two left shifts by constants that do not overflow the width.
+    #[example("(p << 2) << 3" => "p << 5")]
+    rule shl_shl<W>(x: W, a: const W, b: const W) {
+        (x << a) << b => x << k
+        if (a <u W) && (b <u W) && (a + b <u W)
+        let k: W = a + b
+    }
+
+    /// Two logical right shifts by constants that do not overflow the width.
+    #[example("(p >>u 2) >>u 3" => "p >>u 5")]
+    rule lshr_lshr<W>(x: W, a: const W, b: const W) {
+        (x >>u a) >>u b => x >>u k
+        if (a <u W) && (b <u W) && (a + b <u W)
+        let k: W = a + b
+    }
+
+    /// Shifting right then left by the same amount clears the low bits.
+    #[example("(p >>u 3) << 3" => "p & 0xf8")]
+    rule lshr_shl<W>(x: W, c: const W) {
+        (x >>u c) << c => x & m
+        if c <u W
+        let m: W = ones << c
+    }
+
+    /// Two rotations by constants.
+    #[example("rotl(rotl(p, 3), 7)" => "rotl(p, 2)")]
+    rule rotl_rotl<W>(x: W, a: const W, b: const W) {
+        rotl(rotl(x, a), b) => rotl(x, k)
+        let k: W = urem(urem(a, W) + urem(b, W), W)
+    }
+}

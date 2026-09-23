@@ -1,0 +1,9 @@
+[book]
+title = "bitwright"
+description = "Hash-consed fixed-width bit-vector expressions: exact evaluation, bit-level facts, and verified simplification."
+authors = ["binsnake"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/valeria-org/bitwright"

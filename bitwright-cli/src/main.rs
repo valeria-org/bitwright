@@ -1,0 +1,531 @@
+//! `bitwright`: check, lint, prove and catalog rule files; simplify expressions.
+
+use std::fmt::Write as _;
+use std::process::ExitCode;
+
+use bitwright::check::{CheckConfig, Verdict, check_program};
+use bitwright::engine::{Engine, Run, Strategy};
+use bitwright::rules::{Ledger, Level, Rule, RuleKind, RuleProgram, builtin_sources, explain};
+use bitwright::{Assumptions, Context, ParseOptions, Reliance, Width, smtlib};
+
+const USAGE: &str = "\
+usage: bitwright <command> [options]
+
+commands:
+  check <file.bwr> [--thorough] [--ledger <out>] [--against <ledger>]
+        check every rule's soundness and examples; exit 1 unless every rule is sound and every
+        example holds. `--ledger` writes the proof ledger; `--against` compares with an
+        existing one.
+  lint <file.bwr>
+        compile and print every diagnostic; exit 1 on errors.
+  smt <file.bwr> [--rule <group::name>] [--widths <w,...>]
+        print each rule's soundness obligation as SMT-LIB 2.6, separated by (reset), for
+        example `bitwright smt rules.bwr | z3 -in`: every answer must be `unsat`. --widths
+        gives one width per width variable of the rules; without it, every admitted assignment
+        of 8, 32 and 64 (or, for a rule admitted at none of those, three other admitted ones).
+        A rule with no obligation prints a SKIPPED line a solver echoes, and exits 1.
+  catalog [<file.bwr>]
+        a Markdown catalog of the rules (the built-in rules without a file).
+  explain <code>
+        what a diagnostic code means, e.g. `bitwright explain BW0302`.
+  simplify <expr> [--width <n>] [--deobfuscate] [--assume <predicate>]...
+        simplify an expression (symbols default to --width, 64 if not given), assuming each
+        1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
+
+`--` ends the options: `bitwright simplify -- '-x + x'`.
+";
+
+/// Why a command did not succeed.
+enum Fail {
+    /// An error, with its exit code (1 for a failed lint, 2 for bad usage or input), for stderr.
+    Err(u8, String),
+    /// A complete report whose result is a failure (exit 1), for stdout like a passing one.
+    Report(String),
+}
+
+fn usage(msg: impl Into<String>) -> Fail {
+    Fail::Err(2, format!("{}\n\n{USAGE}", msg.into()))
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
+        }
+        Err(Fail::Report(out)) => {
+            print!("{out}");
+            ExitCode::from(1)
+        }
+        Err(Fail::Err(code, msg)) => {
+            eprint!("{msg}");
+            if !msg.ends_with('\n') {
+                eprintln!();
+            }
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Splits `args` into positionals and `--flag [value]` options; `flags` lists the options that
+/// take no value.
+struct Args {
+    pos: Vec<String>,
+    opts: Vec<(String, Option<String>)>,
+}
+
+impl Args {
+    fn parse(args: &[String], known: &[&str], flags: &[&str]) -> Result<Args, Fail> {
+        let mut pos = Vec::new();
+        let mut opts = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == "--" {
+                pos.extend(it.by_ref().cloned());
+                break;
+            }
+            if let Some(name) = a.strip_prefix("--") {
+                if !known.contains(&name) {
+                    return Err(usage(format!("unknown option --{name}")));
+                }
+                if flags.contains(&name) {
+                    opts.push((name.to_string(), None));
+                } else {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| usage(format!("--{name} needs a value")))?;
+                    opts.push((name.to_string(), Some(v.clone())));
+                }
+            } else {
+                pos.push(a.clone());
+            }
+        }
+        Ok(Args { pos, opts })
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.opts.iter().any(|(n, _)| n == name)
+    }
+
+    fn value(&self, name: &str) -> Option<&str> {
+        self.opts
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, v)| v.as_deref())
+    }
+
+    fn values<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s str> + 's {
+        self.opts
+            .iter()
+            .filter(move |(n, _)| n == name)
+            .filter_map(|(_, v)| v.as_deref())
+    }
+
+    fn one(&self, what: &str) -> Result<&str, Fail> {
+        match self.pos.as_slice() {
+            [p] => Ok(p),
+            [] => Err(usage(format!("missing {what}"))),
+            _ => Err(usage(format!("expected one {what}"))),
+        }
+    }
+}
+
+fn run(args: &[String]) -> Result<String, Fail> {
+    let Some((cmd, rest)) = args.split_first() else {
+        return Err(usage("missing command"));
+    };
+    match cmd.as_str() {
+        "check" => check(rest),
+        "lint" => lint(rest),
+        "smt" => smt(rest),
+        "catalog" => catalog(rest),
+        "explain" => {
+            let a = Args::parse(rest, &[], &[])?;
+            let code = a.one("diagnostic code")?;
+            explain(code)
+                .map(|e| format!("{}: {e}\n", code.to_ascii_uppercase()))
+                .ok_or_else(|| Fail::Err(2, format!("unknown diagnostic code {code}")))
+        }
+        "simplify" => simplify(rest),
+        "help" | "--help" | "-h" => Ok(USAGE.to_string()),
+        other => Err(usage(format!("unknown command {other}"))),
+    }
+}
+
+fn read(path: &str) -> Result<String, Fail> {
+    std::fs::read_to_string(path).map_err(|e| Fail::Err(2, format!("{path}: {e}")))
+}
+
+/// Compiles `src`; on errors, every diagnostic rendered.
+fn compile(path: &str, src: &str) -> Result<RuleProgram, Fail> {
+    RuleProgram::compile(src).map_err(|e| Fail::Err(2, e.render(path, src)))
+}
+
+fn check(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["thorough", "ledger", "against"], &["thorough"])?;
+    let path = a.one("rule file")?;
+    let src = read(path)?;
+    let program = compile(path, &src)?;
+    let cfg = if a.flag("thorough") {
+        CheckConfig::thorough()
+    } else {
+        CheckConfig::default()
+    };
+    let checks = check_program(&program, &cfg);
+    let mut out = String::new();
+    let (mut sound, mut unsound, mut inconclusive, mut bad_examples) = (0, 0, 0, 0);
+    for c in &checks {
+        let e = &c.evidence;
+        match &c.verdict {
+            Verdict::Sound => {
+                sound += 1;
+                writeln!(
+                    out,
+                    "sound         {}  ({} exhaustive cases to W = {}{}, {} sampled; guard held {} times)",
+                    c.name,
+                    e.exhaustive_cases,
+                    e.exhaustive_max_width,
+                    if e.complete { ", complete" } else { "" },
+                    e.sampled_cases,
+                    e.guard_true_cases()
+                )
+                .ok();
+            }
+            Verdict::Unsound(cx) => {
+                unsound += 1;
+                writeln!(out, "UNSOUND       {}  {cx}", c.name).ok();
+            }
+            Verdict::Inconclusive(why) => {
+                inconclusive += 1;
+                writeln!(out, "inconclusive  {}  ({why})", c.name).ok();
+            }
+            _ => {
+                inconclusive += 1;
+                writeln!(out, "inconclusive  {}  (an unknown verdict)", c.name).ok();
+            }
+        }
+        for f in &c.examples {
+            bad_examples += 1;
+            writeln!(out, "  example: {f}").ok();
+        }
+    }
+    writeln!(
+        out,
+        "\n{sound} sound, {unsound} unsound, {inconclusive} inconclusive, {bad_examples} failed examples"
+    )
+    .ok();
+    let ledger = Ledger::from_checks(&checks);
+    if let Some(p) = a.value("ledger") {
+        std::fs::write(p, ledger.render()).map_err(|e| Fail::Err(2, format!("{p}: {e}")))?;
+        writeln!(out, "wrote {p}").ok();
+    }
+    let mut ok = unsound == 0 && inconclusive == 0 && bad_examples == 0;
+    if let Some(p) = a.value("against") {
+        let old = Ledger::parse(&read(p)?).map_err(|e| Fail::Err(2, format!("{p}: {e}")))?;
+        let diff = old.diff(&ledger);
+        if diff.is_empty() {
+            writeln!(out, "{p} is up to date").ok();
+        } else {
+            ok = false;
+            writeln!(out, "{p} differs:").ok();
+            for d in diff {
+                writeln!(out, "  {d}").ok();
+            }
+        }
+    }
+    if ok { Ok(out) } else { Err(Fail::Report(out)) }
+}
+
+fn lint(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &[], &[])?;
+    let path = a.one("rule file")?;
+    let src = read(path)?;
+    // A program with errors fails the lint.
+    let program = compile(path, &src).map_err(|f| match f {
+        Fail::Err(_, m) => Fail::Err(1, m),
+        r => r,
+    })?;
+    let mut out = String::new();
+    for d in program.diagnostics() {
+        out.push_str(&d.render(path, &src));
+    }
+    let warnings = program
+        .diagnostics()
+        .iter()
+        .filter(|d| d.level == Level::Warning)
+        .count();
+    let notes = program.diagnostics().len() - warnings;
+    writeln!(
+        out,
+        "{}: {} rules, {warnings} warnings, {notes} notes",
+        path,
+        program.rules().len()
+    )
+    .ok();
+    Ok(out)
+}
+
+/// Every assignment of `domain` to the rule's width variables that the rule admits, in order,
+/// at most `cap` of them.
+fn admitted_over(rule: &Rule, domain: &[u16], cap: usize) -> Vec<Vec<u16>> {
+    let n = rule.width_vars.len();
+    let mut out = Vec::new();
+    let mut idx = vec![0usize; n];
+    loop {
+        let ws: Vec<u16> = idx.iter().map(|&i| domain[i]).collect();
+        if rule.admits(&ws) {
+            out.push(ws);
+            if out.len() >= cap {
+                return out;
+            }
+        }
+        let mut k = 0;
+        loop {
+            if k == n {
+                return out;
+            }
+            idx[k] += 1;
+            if idx[k] < domain.len() {
+                break;
+            }
+            idx[k] = 0;
+            k += 1;
+        }
+    }
+}
+
+/// The width assignments to prove `rule` at: the given one, or every admitted assignment of
+/// 8, 32 and 64, or (for a rule admitted at none of those) the first three admitted ones over
+/// widths 1..=16 and a few wide ones.
+fn assignments(rule: &Rule, given: Option<&[u16]>) -> Vec<Vec<u16>> {
+    if let Some(g) = given {
+        return if rule.admits(g) {
+            vec![g.to_vec()]
+        } else {
+            vec![]
+        };
+    }
+    let usual = admitted_over(rule, &[8, 32, 64], usize::MAX);
+    if !usual.is_empty() {
+        return usual;
+    }
+    let mut domain: Vec<u16> = (1..=16).collect();
+    domain.extend([24, 32, 48, 64, 128, 256, 512]);
+    admitted_over(rule, &domain, 3)
+}
+
+fn smt(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["rule", "widths"], &[])?;
+    let path = a.one("rule file")?;
+    let src = read(path)?;
+    let program = compile(path, &src)?;
+    let widths: Option<Vec<u16>> = a
+        .value("widths")
+        .map(|w| {
+            w.split(',')
+                .map(|x| x.trim().parse::<u16>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| usage(format!("bad --widths {w}")))
+        })
+        .transpose()?;
+    let rules: Vec<&Rule> = match a.value("rule") {
+        Some(name) => vec![
+            program
+                .rule(name)
+                .ok_or_else(|| Fail::Err(2, format!("no rule {name} in {path}")))?,
+        ],
+        None => program.rules().iter().collect(),
+    };
+    if let Some(ws) = &widths {
+        // One width per width variable, each 1..=512.
+        if ws.iter().any(|&w| w == 0 || w > 512) {
+            return Err(usage("--widths are 1..=512"));
+        }
+        if let Some(r) = rules.iter().find(|r| r.width_vars.len() != ws.len()) {
+            return Err(usage(format!(
+                "--widths gives {} widths, but {} has {} width variables ({}); \
+                 select rules with --rule",
+                ws.len(),
+                r.name,
+                r.width_vars.len(),
+                r.width_vars.join(", ")
+            )));
+        }
+    }
+    let mut out = String::new();
+    let mut count = 0;
+    let mut skipped = Vec::new();
+    for rule in rules {
+        let ws = assignments(rule, widths.as_deref());
+        if ws.is_empty() {
+            // A solver echoes this instead of answering, so a pipeline that expects only
+            // `unsat` sees it.
+            writeln!(
+                out,
+                "(echo \"SKIPPED {}: not admitted at these widths\")\n(reset)",
+                rule.name
+            )
+            .ok();
+            skipped.push(rule.name.clone());
+        }
+        for w in ws {
+            let script =
+                smtlib::rule_obligation(rule, &w).map_err(|e| Fail::Err(2, e.to_string()))?;
+            out.push_str(&script);
+            out.push_str("\n(reset)\n");
+            count += 1;
+        }
+    }
+    writeln!(out, "; {count} obligations").ok();
+    if skipped.is_empty() {
+        Ok(out)
+    } else {
+        writeln!(out, "; {} rules skipped", skipped.len()).ok();
+        Err(Fail::Report(out))
+    }
+}
+
+fn catalog(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &[], &[])?;
+    let files: Vec<(String, String)> = match a.pos.as_slice() {
+        [] => builtin_sources()
+            .iter()
+            .map(|(n, s, _)| (n.to_string(), s.to_string()))
+            .collect(),
+        [p] => vec![(p.clone(), read(p)?)],
+        _ => return Err(usage("expected at most one rule file")),
+    };
+    let mut out = String::from(
+        "# Rule catalog\n\n<!-- Generated by `bitwright catalog`; do not edit. -->\n\n",
+    );
+    if a.pos.is_empty() {
+        out.push_str(
+            "The built-in rules: `core.bwr`, the local rules the engine links by default, and \
+             `eqsat.bwr`, the equations of the equality-saturation search. Every rule is \
+             checked (and recorded in the file's proof ledger) and every example holds.\n\n",
+        );
+    }
+    for (path, src) in &files {
+        let program = compile(path, src)?;
+        writeln!(out, "## `{path}`\n").ok();
+        for g in program.groups() {
+            writeln!(out, "### {}\n", g.name).ok();
+            for &i in &g.rules {
+                let r = &program.rules()[i];
+                let short = r.name.rsplit("::").next().unwrap_or(&r.name);
+                let kind = match (r.kind, r.is_directed()) {
+                    (RuleKind::Rewrite, _) => "rule",
+                    (RuleKind::Identity, true) => "identity (directed and search)",
+                    (RuleKind::Identity, false) => "identity (search only)",
+                    _ => "equation",
+                };
+                writeln!(out, "#### `{short}` — {kind}\n").ok();
+                for line in r.doc.lines() {
+                    writeln!(out, "{}", line.trim()).ok();
+                }
+                if !r.doc.is_empty() {
+                    out.push('\n');
+                }
+                let text = src.get(r.span.0..r.span.1).unwrap_or("");
+                // The rule's own text, without its doc comment and attributes.
+                let body: Vec<&str> = text
+                    .lines()
+                    .map(str::trim_end)
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        !t.starts_with("///") && !t.starts_with("#[")
+                    })
+                    .collect();
+                writeln!(out, "```text\n{}\n```\n", dedent(&body)).ok();
+                for (i, o) in &r.examples {
+                    writeln!(out, "- `{i}` → `{o}`").ok();
+                }
+                if !r.examples.is_empty() {
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn dedent(lines: &[&str]) -> String {
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|l| l.get(indent..).unwrap_or(l.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn simplify(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["width", "deobfuscate", "assume"], &["deobfuscate"])?;
+    let src = a.one("expression")?;
+    let w: u16 = match a.value("width") {
+        Some(w) => w.parse().map_err(|_| usage(format!("bad --width {w}")))?,
+        None => 64,
+    };
+    let width = Width::new(w).map_err(|_| usage("the width must be 1..=512"))?;
+    let mut cx = Context::new();
+    let o = ParseOptions::width(width);
+    let e = cx
+        .parse(src, &o)
+        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let mut assumptions = Assumptions::new();
+    for p in a.values("assume") {
+        let p = cx
+            .parse(p, &o)
+            .map_err(|e| Fail::Err(2, format!("--assume {p}: {e}")))?;
+        assumptions
+            .assume_true(&mut cx, p)
+            .map_err(|e| Fail::Err(2, format!("--assume: {e} (a predicate is 1 bit wide)")))?;
+    }
+    if let Some(c) = assumptions.conflict() {
+        return Err(Fail::Err(
+            1,
+            format!(
+                "the assumptions contradict each other ({})",
+                constraint_ids(c)
+            ),
+        ));
+    }
+    let strategy = if a.flag("deobfuscate") {
+        Strategy::deobfuscate()
+    } else {
+        Strategy::standard()
+    };
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(strategy)
+        .build()
+        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let out = engine
+        .run(&mut cx, &[e], Run::default().with_assumptions(&assumptions))
+        .map_err(|e| Fail::Err(2, format!("{e}")))?
+        .roots[0];
+    let mut text = format!("{}", cx.display(out.expr));
+    if !out.relies_on.is_none() {
+        text.push_str(&format!(
+            "    # relies on {}",
+            constraint_ids(out.relies_on)
+        ));
+    }
+    Ok(format!("{text}\n"))
+}
+
+/// The indices of the `--assume` options (from 0) a reliance names.
+fn constraint_ids(r: Reliance) -> String {
+    let (ids, rest) = r.indices();
+    let mut ids: Vec<String> = ids.map(|i| i.to_string()).collect();
+    if rest {
+        ids.push("63 and later".into());
+    }
+    ids.join(", ")
+}

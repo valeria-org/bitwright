@@ -1,0 +1,106 @@
+bitwright 1;
+
+// Identities for the equality-saturation search service (`bitwright::eqsat`). They are
+// unconditional equations in the conservative fragment (`+ - * & | ^ neg ~`, one width), used in
+// both directions by the search; the directed engine never runs them. Every identity is checked by
+// `bitwright::check` and recorded in `eqsat.bwr.proof`.
+
+group eqsat.assoc {
+    #[example("(p + q) + r" => "p + (q + r)")]
+    identity add_assoc<W>(x: W, y: W, z: W) { (x + y) + z <=> x + (y + z) }
+
+    #[example("(p * q) * r" => "p * (q * r)")]
+    identity mul_assoc<W>(x: W, y: W, z: W) { (x * y) * z <=> x * (y * z) }
+
+    #[example("(p & q) & r" => "p & (q & r)")]
+    identity and_assoc<W>(x: W, y: W, z: W) { (x & y) & z <=> x & (y & z) }
+
+    #[example("(p | q) | r" => "p | (q | r)")]
+    identity or_assoc<W>(x: W, y: W, z: W) { (x | y) | z <=> x | (y | z) }
+
+    #[example("(p ^ q) ^ r" => "p ^ (q ^ r)")]
+    identity xor_assoc<W>(x: W, y: W, z: W) { (x ^ y) ^ z <=> x ^ (y ^ z) }
+}
+
+// Distributivity, one group per operator pair: together, `and_or` and `or_and` rewrite each
+// other's results without end, so a search that uses both never saturates.
+group eqsat.distrib {
+    #[example("p * (q + r)" => "p * q + p * r")]
+    identity mul_add<W>(x: W, y: W, z: W) { x * (y + z) <=> x * y + x * z }
+}
+
+group eqsat.distrib_and {
+    #[example("p & (q | r)" => "(p & q) | (p & r)")]
+    identity and_or<W>(x: W, y: W, z: W) { x & (y | z) <=> (x & y) | (x & z) }
+
+    #[example("p & (q ^ r)" => "(p & q) ^ (p & r)")]
+    identity and_xor<W>(x: W, y: W, z: W) { x & (y ^ z) <=> (x & y) ^ (x & z) }
+}
+
+group eqsat.distrib_or {
+    #[example("p | (q & r)" => "(p | q) & (p | r)")]
+    identity or_and<W>(x: W, y: W, z: W) { x | (y & z) <=> (x | y) & (x | z) }
+}
+
+group eqsat.negation {
+    #[example("~(p & q)" => "~p | ~q")]
+    identity de_morgan_and<W>(x: W, y: W) { ~(x & y) <=> ~x | ~y }
+
+    #[example("~(p | q)" => "~p & ~q")]
+    identity de_morgan_or<W>(x: W, y: W) { ~(x | y) <=> ~x & ~y }
+
+    #[example("-(p + q)" => "-p + -q")]
+    identity neg_add<W>(x: W, y: W) { -(x + y) <=> -x + -y }
+
+    #[example("-(p * q)" => "-p * q")]
+    identity neg_mul<W>(x: W, y: W) { -(x * y) <=> -x * y }
+
+    #[example("~(p ^ q)" => "~p ^ q")]
+    identity not_xor<W>(x: W, y: W) { ~(x ^ y) <=> ~x ^ y }
+}
+
+// No MBA group: identities such as `x ^ y <=> (x | y) - (x & y)` produce, in both directions,
+// terms the others match again, so a search over them never saturates, and publication requires
+// saturation. Linear MBA belongs to the `LinearMba` pass and the MBA service.
+
+// Cancellations, used in their authored direction only (a rule's right side may drop variables,
+// so it cannot be read backwards). Inside the e-graph nothing canonicalizes, so these do what
+// the builder does at construction.
+group eqsat.cancel {
+    #[example("(p + q) - q" => "p")]
+    rule add_sub<W>(x: W, y: W) { (x + y) - y => x }
+
+    #[example("(p - q) + q" => "p")]
+    rule sub_add<W>(x: W, y: W) { (x - y) + y => x }
+
+    #[example("(p ^ q) ^ q" => "p")]
+    rule xor_xor<W>(x: W, y: W) { (x ^ y) ^ y => x }
+
+    // (Folded by the builder at construction, so no arena example can fire; needed inside
+    // the e-graph, where nothing canonicalizes.)
+    #[allow(BW0402, BW0407)]
+    rule neg_neg<W>(x: W) { -(-x) => x }
+
+    // (Folded by the builder at construction, so no arena example can fire; needed inside
+    // the e-graph, where nothing canonicalizes.)
+    #[allow(BW0402, BW0407)]
+    rule not_not<W>(x: W) { ~(~x) => x }
+
+    #[example("p + -p" => "0")]
+    rule add_neg<W>(x: W) { x + -x => 0 }
+
+    // (Folded by the builder at construction, so no arena example can fire; needed inside
+    // the e-graph, where nothing canonicalizes.)
+    #[allow(BW0402, BW0407)]
+    rule mul_one<W>(x: W) { x * 1 => x }
+
+    // (Folded by the builder at construction, so no arena example can fire; needed inside
+    // the e-graph, where nothing canonicalizes.)
+    #[allow(BW0402, BW0407)]
+    rule mul_zero<W>(x: W) { x * 0 => 0 }
+
+    // (Folded by the builder at construction, so no arena example can fire; needed inside
+    // the e-graph, where nothing canonicalizes.)
+    #[allow(BW0402, BW0407)]
+    rule add_zero<W>(x: W) { x + 0 => x }
+}

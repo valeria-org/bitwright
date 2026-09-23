@@ -1,0 +1,13 @@
+[package]
+name = "bitwright-ref"
+description = "Independent bit-serial reference evaluator for bitwright's operator semantics (test oracle)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true

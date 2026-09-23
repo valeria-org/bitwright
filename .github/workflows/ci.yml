@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly: long-running suites
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      # The published crate ships the license and its Required Notice: keep the copy identical.
+      - run: cmp LICENSE bitwright/LICENSE
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p bitwright --no-default-features --all-targets -- -D warnings
+      - run: cargo clippy -p bitwright --all-features --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test -p bitwright --all-features
+      - run: cargo test -p bitwright-cli
+      # The benchmarks still run (a smoke run: hosted runners have no hardware counters).
+      - run: cargo run --release -p bitwright-bench -- --quick --samples 1
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --workspace --all-targets
+
+  nightly-deep:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y z3
+      - run: cargo test --workspace --release -- --ignored --skip write_corpus_ledger
+      - run: cargo test -p bitwright --release --all-features -- --ignored --skip write_corpus_ledger
+
+  # The book's examples run as doctests in the test job; this builds the pages.
+  book:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install mdbook --locked --version ^0.5
+      - run: mdbook build book
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+        working-directory: fuzz
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_expr, compile_rules, smt_import, simplify_dag, constrain_dag]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: >-
+          cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }}
+          -- -max_total_time=600 -rss_limit_mb=2048 -timeout=10
+        working-directory: fuzz
+
+  # Against the latest release tag; before the first release there is no baseline.
+  semver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - id: base
+        run: echo "tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+      - if: steps.base.outputs.tag == ''
+        run: echo "::notice::no release tag yet; semver checks start at the first release"
+      - if: steps.base.outputs.tag != ''
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: bitwright
+          baseline-rev: ${{ steps.base.outputs.tag }}

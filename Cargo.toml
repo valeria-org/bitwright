@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ref"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/valeria-org/bitwright"
+authors = ["binsnake"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The reference evaluator is bit-serial; keep test suites fast in every profile.
+[profile.dev.package.bitwright-ref]
+opt-level = 3
+[profile.test.package.bitwright-ref]
+opt-level = 3
+# The exhaustive suites evaluate millions of expressions. Optimize lightly while keeping
+# debug assertions and overflow checks on: users build in debug, so tests must too.
+[profile.dev.package.bitwright]
+opt-level = 1

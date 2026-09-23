@@ -1,0 +1,1 @@
+let %0 = x * y; %0 + %0 >>s 2 == popcnt(clz(x))

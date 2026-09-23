@@ -1,0 +1,16 @@
+; core.bitwise::and_mask_redundant at W = 8
+(set-logic QF_BV)
+(declare-const |x| (_ BitVec 8))
+(declare-const |c| (_ BitVec 8))
+(define-fun bw!0 () (_ BitVec 8) |x|)
+(define-fun bw!1 () (_ BitVec 8) |c|)
+(define-fun bw!2 () (_ BitVec 8) (bvand bw!0 bw!1))
+(define-fun bw!3 () (_ BitVec 8) |x|)
+(define-fun bw!4 () (_ BitVec 8) |x|)
+(define-fun bw!5 () (_ BitVec 8) |c|)
+(define-fun bw!6 () (_ BitVec 8) (bvnot bw!5))
+(define-fun bw!7 () Bool (= (bvand bw!4 bw!6) (_ bv0 8)))
+(assert bw!7)
+(assert (not (= bw!2 bw!3)))
+(check-sat)
+

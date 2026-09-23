@@ -1,0 +1,41 @@
+[package]
+name = "bitwright"
+description = "Hash-consed fixed-width bit-vector expressions: exact evaluation, bit-level facts, and verified simplification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../README.md"
+# Integration tests need the unpublished reference evaluator (`bitwright-ref`).
+exclude = ["tests/"]
+keywords = ["bitvector", "smt", "simplification", "deobfuscation", "symbolic"]
+categories = ["mathematics", "compilers", "algorithms"]
+
+[package.metadata.docs.rs]
+# Document the optional services (MBA, cobra backend, equality saturation, SMT-LIB) too.
+all-features = true
+
+[dependencies]
+hashbrown = { version = "0.17", default-features = false }
+cobra = { package = "cobra-mba", version = "0.4", optional = true }
+
+[features]
+default = ["check"]
+## The rule soundness checker (`bitwright::check`).
+check = []
+## The MBA service (`bitwright::mba`, `Phase::Mba`) with the native signature solver.
+mba = []
+## The equality-saturation search service (`bitwright::eqsat`), default off.
+eqsat = []
+## SMT-LIB 2.6 export of expressions and rule obligations, and import of a QF_BV subset.
+smtlib = []
+## The cobra 0.4 backend for the MBA service (`bitwright::mba::CobraSolver`).
+cobra = ["mba", "dep:cobra"]
+
+[dev-dependencies]
+bitwright-ref = { path = "../bitwright-ref" }
+
+[lints]
+workspace = true
