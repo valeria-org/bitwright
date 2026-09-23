@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - **MBA evidence.** The evidence gate proves answers itself beyond linear MBA: polynomial MBA
   of degree `d` at the points where the set bits of all variables lie in at most `d`
