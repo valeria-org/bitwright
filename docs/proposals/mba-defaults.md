@@ -27,17 +27,17 @@ benchmark corpus), nonlinear MBA (`nonlinear_mba_corpus`: products, sums and bit
 rewritten by MBA identities, plus terms equal to zero that only nonlinear reasoning cancels)
 and random 40-node DAGs over four symbols, 200 inputs each, at 8 and 64 bits. It compares
 three configurations: the current defaults, trust off alone, and both changes (proposed).
-Sizes are the DAG nodes of the results. Times are wall time on one machine, for orientation
-only.
+Sizes are the DAG nodes of the results. Cost is user-space instructions retired, which does
+not move with other load; wall time on one machine is for orientation only.
 
-| corpus | nodes before | current | trust off only | proposed | changed | smaller | larger | time current | time proposed |
+| corpus | nodes before | current | trust off only | proposed | changed | smaller | larger | instructions current | instructions proposed |
 |-|-|-|-|-|-|-|-|-|-|
-| linear MBA, 8 bits | 3927 | 1794 | 1794 (0 changed) | 1645 | 104 | 93 | 0 | 31 ms | 72 ms |
-| nonlinear MBA, 8 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 18 ms | 103 ms |
-| linear MBA, 64 bits | 3927 | 1794 | 1794 (0 changed) | 1645 | 104 | 93 | 0 | 28 ms | 72 ms |
-| nonlinear MBA, 64 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 18 ms | 215 ms |
-| random DAGs, 8 bits | 10693 | 9146 | 9146 (0 changed) | 9088 | 28 | 27 | 1 | 113 ms | 5822 ms |
-| random DAGs, 64 bits | 10992 | 9513 | 9513 (0 changed) | 9481 | 27 | 25 | 1 | 116 ms | 5801 ms |
+| linear MBA, 8 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.36 G (31 ms) | 1.07 G (84 ms) |
+| nonlinear MBA, 8 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.22 G (16 ms) | 0.40 G (28 ms) |
+| linear MBA, 64 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.35 G (26 ms) | 0.89 G (69 ms) |
+| nonlinear MBA, 64 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.22 G (16 ms) | 2.54 G (94 ms) |
+| random DAGs, 8 bits | 10693 | 9146 | 9146 (0 changed) | 9087 | 29 | 28 | 1 | 1.31 G (103 ms) | 57.6 G (4.0 s) |
+| random DAGs, 64 bits | 10992 | 9513 | 9513 (0 changed) | 9480 | 28 | 26 | 1 | 1.34 G (106 ms) | 58.3 G (3.8 s) |
 
 What the MBA service answered (per corpus, summed over its questions; `unproved` answers were
 refused for lack of accepted evidence, `too small` fragments were not asked about):
@@ -45,38 +45,33 @@ refused for lack of accepted evidence, `too small` fragments were not asked abou
 | corpus | configuration | calls | simplified | not smaller | no simpler | unsupported | exhausted | unproved | refuted |
 |-|-|-|-|-|-|-|-|-|-|
 | linear MBA, 64 bits | current | 669 | 8 | 0 | 340 | 321 | 0 | 0 | 0 |
-| linear MBA, 64 bits | proposed | 817 | 155 | 53 | 609 | 0 | 0 | 0 | 0 |
+| linear MBA, 64 bits | proposed | 823 | 157 | 57 | 609 | 0 | 0 | 0 | 0 |
 | nonlinear MBA, 64 bits | current | 742 | 0 | 0 | 0 | 742 | 0 | 0 | 0 |
 | nonlinear MBA, 64 bits | proposed | 780 | 257 | 2 | 521 | 0 | 0 | 0 | 0 |
 | random DAGs, 64 bits | current | 4895 | 1 | 4 | 77 | 4813 | 0 | 0 | 0 |
-| random DAGs, 64 bits | proposed | 6341 | 37 | 458 | 5285 | 541 | 8 | 12 | 0 |
+| random DAGs, 64 bits | proposed | 6373 | 38 | 502 | 5272 | 541 | 8 | 12 | 0 |
 
 The 8-bit rows are alike (the full report prints them all); trust off alone answered exactly
 as the current defaults on every corpus.
 
-Time per question of the normal-form solver (the solver is 97 % of the proposed
-configuration's time on random DAGs):
-
-| corpus | questions | median | 90th percentile | 99th percentile | slowest |
-|-|-|-|-|-|-|
-| linear MBA, 64 bits | 817 | 36 µs | 88 µs | 104 µs | 121 µs |
-| nonlinear MBA, 64 bits | 780 | 137 µs | 240 µs | 1.1 ms | 1.2 ms |
-| random DAGs, 8 bits | 6552 | 0.40 ms | 2.2 ms | 5.5 ms | 69 ms |
-| random DAGs, 64 bits | 6341 | 0.35 ms | 2.3 ms | 5.7 ms | 17 ms |
-
-Benchmarks (instructions per iteration of 20 expressions, bitwright's own evidence only in
-every row):
+Benchmarks (instructions per iteration of 20 expressions, a fresh engine each iteration,
+bitwright's own evidence only in every row):
 
 | row | instructions | nodes before → after |
 |-|-|-|
-| `simplify/mba/64` (signature solver, linear MBA) | 26.5 M | 125 → 93 |
-| `simplify/mba-native/64` (normal-form solver, linear MBA) | 108.5 M | 125 → 84 |
-| `simplify/mba-nonlinear-sig/64` (signature solver, nonlinear MBA) | 13.5 M | 141 → 73 |
-| `simplify/mba-nonlinear/64` (normal-form solver, nonlinear MBA) | 430.1 M | 141 → 34 |
+| `simplify/mba/64` (signature solver, linear MBA) | 25.6 M | 125 → 93 |
+| `simplify/mba-native/64` (normal-form solver, linear MBA) | 100.5 M | 125 → 84 |
+| `simplify/mba-nonlinear-sig/64` (signature solver, nonlinear MBA) | 12.9 M | 141 → 73 |
+| `simplify/mba-nonlinear/64` (normal-form solver, nonlinear MBA) | 238.4 M | 141 → 34 |
+
+Since the first version of this proposal the solver remembers answers (about 30 % fewer
+instructions on random DAGs, half to three quarters fewer on nonlinear MBA) and looks small
+normal forms up in a synthesis table (linear MBA results 1,645 → 1,635 nodes, for about 4 %
+more instructions on random DAGs).
 
 ## Reading the numbers
 
-- **Results.** On linear MBA the results shrink by 8 % (104 of 200 change; 93 get smaller,
+- **Results.** On linear MBA the results shrink by 9 % (109 of 200 change; 98 get smaller,
   11 are re-rendered at the same size, none grows). On nonlinear MBA they shrink by 62 %: the
   signature solver declines every question there, the normal-form solver simplifies a third of
   them. On random DAGs, which are not obfuscated, they shrink by 0.3 % to 0.6 %, and one input
@@ -88,16 +83,18 @@ every row):
 - **Trust.** With the signature solver, turning backend certificates off changes nothing on
   these corpora: the gate proves every answer it gives with its own certificates. Every answer
   the proposed configuration accepted was proved by bitwright itself; nothing was refuted.
-- **Time.** The proposed configuration takes 2.3 to 2.6 times as long on linear MBA, 6 to 12
-  times as long on nonlinear MBA, and about 50 times as long on random DAGs: 29 ms per
-  40-node DAG instead of 0.6 ms. Random code is the worst case. Its fragments have many atoms
-  and bit classes, so their normal forms are large, and they rarely simplify (37 of 6341
-  questions). The signature solver declines almost all of them at once.
+- **Cost.** The proposed configuration takes 2.5 to 3 times the instructions on linear MBA
+  (the 8-bit corpus, run first, also pays the synthesis table's one-time build), 1.8 times on
+  nonlinear MBA at 8 bits and 11.5 times at 64 bits (degree-2 certificates grow with the
+  width), and 44 times on random DAGs: about 20 ms per 40-node DAG instead of 0.5 ms here.
+  Random code is the worst case. Its fragments have many atoms and bit classes, so their
+  normal forms are large, and they rarely simplify (38 of 6373 questions). The signature
+  solver declines almost all of them at once.
 
 ## Costs and risks
 
 - **Time.** The solver's work per question is bounded by its budget (`MbaConfig::budget`,
-  `2^20` steps by default, about 40 to 60 ns per step here), and `Budget::mba_calls` bounds
+  `2^20` steps by default, at most about 40 to 60 ns per step here), and `Budget::mba_calls` bounds
   the number of questions. A host that runs the MBA service over large amounts of code that is
   not obfuscated, and cares about time more than size, keeps the signature solver or lowers
   the budget.
@@ -105,6 +102,11 @@ every row):
   bitwright's certificates prove them. The others are refused and counted as unproved. This is
   not measured here: this work keeps other simplifiers out of its evaluation. Hosts that accept
   cobra's own certificates set `backend_certificates` back to true.
+- **Sampled answers.** A synthesized form that no certificate can decide (three atoms at
+  degree 2 and 512 bits, say) is returned only as `Claim::Sampled`, after the refutation
+  sample; it is the solver's only answer that is not exact by construction. With trust off
+  and sampling off (both proposed or already the default) the gate accepts it only on its own
+  certificate; a host that turns sampling on accepts it on the sample.
 - **Caches.** Keys include the solver id and the trust setting. Stored answers from the old
   defaults are not reused under the new ones, and a persistent store refills. No invalidation
   is needed.

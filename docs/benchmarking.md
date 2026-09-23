@@ -87,6 +87,9 @@ measures the same expressions. The nonlinear MBA corpus is generated in the repo
 identities at random, plus terms equal to zero that only nonlinear reasoning cancels. No
 third-party dataset is vendored.
 
+The MBA rows build a fresh engine for every iteration, outside the measurement: a solver that
+remembers answers would otherwise answer every iteration after the first from memory.
+
 Some benchmarks print a note under their row: what the measured work achieved and what it
 declined, from one run outside the measurement. For the MBA rows it is the DAG size before and
 after, the MBA service's answers (simplified, rejected as not smaller, no simpler, unsupported,

@@ -353,9 +353,10 @@ fn simplify(v: &mut Vec<Bench>) {
             };
             v.push(
                 Bench::new(format!("{group}/{bits}"), 10, "20 exprs", move |b| {
-                    let engine = engine();
                     let texts = texts();
                     let o = ParseOptions::width(workload::width(bits));
+                    // A fresh engine per iteration: a solver that remembers answers would
+                    // otherwise answer every iteration after the first from memory.
                     b.iter_batched(
                         || {
                             let mut cx = Context::new();
@@ -363,12 +364,14 @@ fn simplify(v: &mut Vec<Bench>) {
                                 .iter()
                                 .map(|t| cx.parse(t, &o).expect("MBA parses"))
                                 .collect();
-                            (cx, roots)
+                            (engine(), cx, roots)
                         },
-                        |(mut cx, roots)| {
-                            engine
+                        |(engine, mut cx, roots)| {
+                            let out = engine
                                 .run(&mut cx, &roots, Default::default())
-                                .expect("simplify")
+                                .expect("simplify");
+                            // Dropped outside the measurement, as it was built.
+                            (engine, out)
                         },
                     );
                 })

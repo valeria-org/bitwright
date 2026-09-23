@@ -26,8 +26,10 @@
   default), by question and budget: the engine asks some questions again as the expression
   around them changes, and a remembered answer is the one solving again would give. Rendering
   also renders each form once per product depth, charging the same work on reuse. Results are
-  unchanged; on the corpus diff the solver takes a third less time on random DAGs, and half to
-  three quarters less on nonlinear MBA.
+  unchanged; on the corpus diff the proposed configuration takes about 30 % fewer instructions
+  on random DAGs, and half to three quarters fewer on nonlinear MBA. The MBA benchmark rows now
+  build a fresh engine per iteration, so no iteration is answered from an earlier one's
+  memory.
 - **Synthesis.** `NormalFormSolver` looks a normal form over at most three atoms up in a table
   of the smallest expressions (up to seven nodes over `+ − · & | ^ ~`, negation and the
   constant 1), keyed by their values at 24 fixed probe points and built once per process. A

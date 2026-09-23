@@ -1210,7 +1210,8 @@ pub mod mba {
     collision is a miss), and rendering keeps each form's renderings per product depth with
     the work they cost, charged again on reuse. Neither changes an answer or where the budget
     runs out (tested with the memo off, on, and forgetting constantly). On the corpus diff
-    they take a third off the solver's time on random DAGs, and more on nonlinear MBA.
+    they take about 30 % off the proposed configuration's instructions on random DAGs, and
+    half to three quarters on nonlinear MBA.
   - *Synthesis* (`NfOptions::synthesis`, on by default). A table holds the smallest
     expressions of up to seven nodes over the atoms `a`, `b`, `c` and the constant 1 with
     `+ − · & | ^ ~` and negation, one per vector of values at 24 fixed probe points (the eight
