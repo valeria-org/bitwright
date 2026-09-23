@@ -431,17 +431,22 @@ impl<'a> Meter<'a> {
 
     /// Charges `n` units of `c` for work about to be done, or refuses (charging nothing) when
     /// the limit cannot cover them. Reads the deadline when due.
+    ///
+    /// Every counter stays within its limit (work recorded when done is capped beforehand; see
+    /// [`Meter`]), so only `c` needs comparing: this runs once per unit of pass work.
+    #[inline]
     pub(crate) fn charge(&mut self, c: Counter, n: u64) -> Result<(), Exhausted> {
-        self.tick()?;
-        // A counter recorded after the fact may already be over: then nothing is charged.
-        self.check()?;
+        if self.deadline.is_some() || self.expired {
+            self.tick()?;
+        }
+        debug_assert_eq!(self.over(), None, "a counter was recorded past its limit");
         let spent = c.slot(&mut self.spent);
         let after = spent.saturating_add(n);
         if after > c.of(&self.limit) {
             return Err(c.exhausted());
         }
         *spent = after;
-        self.check()
+        Ok(())
     }
 
     /// Charges one node visit.
@@ -495,13 +500,19 @@ mod tests {
         let mut m = Meter::new(limit, None);
         assert_eq!(m.charge(Counter::EqsatNodes, 1), Err(Exhausted::EqsatNodes));
         assert_eq!(m.spent, Budget::ZERO);
-        // Another counter already over (recorded after the fact): refused, nothing charged.
+    }
+
+    /// Work recorded when done is capped beforehand, so no counter is ever past its limit; a
+    /// debug build catches a violation at the next charge.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a counter was recorded past its limit")]
+    fn a_counter_past_its_limit_is_caught_in_debug_builds() {
         let mut limit = Budget::UNLIMITED;
         limit.fact_work = 5;
         let mut m = Meter::new(limit, None);
         m.spent.fact_work = 10;
-        assert_eq!(m.charge(Counter::MbaCalls, 1), Err(Exhausted::FactWork));
-        assert_eq!(m.spent.mba_calls, 0);
+        let _ = m.charge(Counter::MbaCalls, 1);
     }
 
     #[test]

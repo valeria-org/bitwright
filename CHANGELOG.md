@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Performance.** Charging work against a budget compares only the counter charged: every
+  counter recorded after the fact is capped beforehand, so no other can be over (debug builds
+  assert it). In instructions: `simplify/standard` −12.8 %, `simplify/mba` −8.1 %,
+  `service/eqsat/32` −9 %, `simplify/tiny-context/64` −5.6 %, the normal-form solver's rows
+  about −2 %; the others are unchanged.
 - **Fixes.** A fact query under assumptions spent its cap on the overlay and again on each
   operand whose base facts it computed, so a call could spend more fact work than its budget.
   The overlay and the base facts now share the query's cap, and a query the cap stops answers
