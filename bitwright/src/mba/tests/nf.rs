@@ -12,7 +12,8 @@ use crate::mba::{
 };
 use crate::{BitVec, Width};
 
-/// The nodes an expression's root uses, counting equal subterms once.
+/// The nodes an expression's root uses, counting equal subterms once and a shift's amount as
+/// the constant node it is once lifted (shared with an equal constant).
 fn cost(m: &MbaExpr) -> usize {
     use std::collections::HashMap;
     let mut live = vec![false; m.nodes().len()];
@@ -46,6 +47,26 @@ fn cost(m: &MbaExpr) -> usize {
         });
         canon.push(c);
     }
+    let mut consts: Vec<BitVec> = m
+        .nodes()
+        .iter()
+        .zip(&live)
+        .filter_map(|(n, &l)| match n.op {
+            MOp::Const(v) if l => Some(v),
+            _ => None,
+        })
+        .collect();
+    for (n, &l) in m.nodes().iter().zip(&live) {
+        if let MOp::Shl(k) | MOp::LShr(k) = n.op
+            && l
+        {
+            let v = BitVec::wrapping_from_u64(n.width, u64::from(k));
+            if !consts.contains(&v) {
+                consts.push(v);
+                count += 1;
+            }
+        }
+    }
     count
 }
 
@@ -56,7 +77,10 @@ fn normal_forms_and_candidates_equal_the_input_exhaustively() {
         let width = Width::new(w).unwrap();
         let t = if w <= 4 { 3 } else { 2 };
         let vars = vec![width; t as usize];
-        for (fi, frag) in [Frag::Linear, Frag::SemiLinear].into_iter().enumerate() {
+        for (fi, frag) in [Frag::Linear, Frag::SemiLinear, Frag::Poly, Frag::PurePoly]
+            .into_iter()
+            .enumerate()
+        {
             let mut g = Gen::new(0x9f00 + u64::from(w) * 8 + fi as u64, width, t);
             for _ in 0..40 {
                 let e = g.expr(frag, 3);
@@ -86,7 +110,10 @@ fn answers_are_equal_smaller_and_proved() {
         let width = Width::new(w).unwrap();
         let t = if w <= 4 { 3 } else { 2 };
         let vars = vec![width; t as usize];
-        for (fi, frag) in [Frag::Linear, Frag::SemiLinear].into_iter().enumerate() {
+        for (fi, frag) in [Frag::Linear, Frag::SemiLinear, Frag::Poly, Frag::PurePoly]
+            .into_iter()
+            .enumerate()
+        {
             let mut g = Gen::new(0x5a00 + u64::from(w) * 8 + fi as u64, width, t);
             for _ in 0..40 {
                 let e = g.expr(frag, 3);
@@ -110,10 +137,10 @@ fn answers_are_equal_smaller_and_proved() {
             }
         }
     }
-    assert!(simplified > 200, "{simplified}");
+    assert!(simplified > 400, "{simplified}");
     let s = solver.stats();
     assert_eq!(s.declined_internal, 0);
-    assert!(s.linear > 0 && s.semilinear > 0 && s.candidates > 0);
+    assert!(s.linear > 0 && s.semilinear > 0 && s.polynomial > 0 && s.candidates > 0);
 }
 
 /// Solves `e`, checks the answer (by a certificate) and that it is no larger than `want`.
@@ -125,9 +152,26 @@ fn solves_to(e: &T, want: &T, vars: &[Width]) -> MbaExpr {
     else {
         panic!("not simplified: {e:?}");
     };
-    assert_eq!(claim, Claim::Proved, "{e:?}");
     let r = certify::prove(&m, &expr, &mut Steps::new(1 << 26)).unwrap();
-    assert_eq!(r.verdict, Verdict::Proved, "{e:?} -> {expr:?}");
+    if claim == Claim::Sampled {
+        // Only when no certificate is within the effort cap (wide, nonlinear): then the sample
+        // agrees, and more points do too.
+        assert!(
+            r.verdict == Verdict::Unknown && !r.over_budget,
+            "{e:?}: {r:?}"
+        );
+        let mut rng = crate::testutil::Rng(7);
+        for _ in 0..2000 {
+            let p: Vec<BitVec> = vars
+                .iter()
+                .map(|&w| BitVec::wrapping_from_limbs(w, &[rng.next(), rng.next(), rng.next()]))
+                .collect();
+            assert_eq!(m.eval(&p), expr.eval(&p), "{e:?}");
+        }
+    } else {
+        assert_eq!(claim, Claim::Proved, "{e:?}");
+        assert_eq!(r.verdict, Verdict::Proved, "{e:?} -> {expr:?}");
+    }
     assert!(
         cost(&expr) <= cost(&want),
         "{e:?}\n  gave {expr:?}\n  want {want:?}"
@@ -189,6 +233,130 @@ fn the_linear_and_semi_linear_catalog() {
         if w == 8 {
             // The mask covers every position and disappears.
             assert_eq!(cost(&e), cost(&mul(k(width, 3), x.clone()).expr(&vars)));
+        }
+    }
+}
+
+#[test]
+fn the_polynomial_catalog() {
+    for w in [8u16, 16, 32, 64, 128, 512] {
+        let width = Width::new(w).unwrap();
+        let vars = [width, width];
+        let (x, y) = (V(0), V(1));
+        // (x & y)(x | y) + (x & ~y)(~x & y) = x·y: every product cancels but one.
+        let e = add(
+            mul(and(x.clone(), y.clone()), or(x.clone(), y.clone())),
+            mul(
+                and(x.clone(), not(y.clone())),
+                and(not(x.clone()), y.clone()),
+            ),
+        );
+        solves_to(&e, &mul(x.clone(), y.clone()), &vars);
+        // 2^(W−1)·(x² + x) = 0: x(x + 1) is even.
+        let half = C(BitVec::smin(width));
+        solves_to(
+            &mul(half.clone(), add(mul(x.clone(), x.clone()), x.clone())),
+            &k(width, 0),
+            &vars,
+        );
+        // (x + 1)² − x² − 2x = 1.
+        let x1 = add(x.clone(), k(width, 1));
+        solves_to(
+            &sub(
+                sub(mul(x1.clone(), x1), mul(x.clone(), x.clone())),
+                mul(k(width, 2), x.clone()),
+            ),
+            &k(width, 1),
+            &vars,
+        );
+        // −x² stays −x², not (2^(W−1) − 1)·x² + 2^(W−1)·x.
+        let m = sub(k(width, 0), mul(x.clone(), x.clone())).expr(&vars);
+        let (naive, _) = inspect(&m, &NfOptions::default()).unwrap();
+        assert!(cost(&naive) <= 3 + 1, "{naive:?}");
+        // A product of bitwise terms comes out factored: x·(x&y) + y·(x&y) − (x&y)² is
+        // (x | y)·(x & y).
+        let a = and(x.clone(), y.clone());
+        solves_to(
+            &sub(
+                add(mul(x.clone(), a.clone()), mul(y.clone(), a.clone())),
+                mul(a.clone(), a.clone()),
+            ),
+            &mul(or(x.clone(), y.clone()), a),
+            &vars,
+        );
+    }
+}
+
+#[test]
+fn null_parts_are_dropped_only_when_proved_zero() {
+    // 2^(W−1)·((x & y)·(y & z) − (x & y & z)) is zero (the low bit of a product of
+    // conjunctions is the conjunction of the low bits), but not by the reductions, which treat
+    // symbols as independent: a certificate proves it, and it goes.
+    for w in [8u16, 16, 64] {
+        let width = Width::new(w).unwrap();
+        let vars = [width; 3];
+        let (x, y, z) = (V(0), V(1), V(2));
+        let null = mul(
+            C(BitVec::smin(width)),
+            sub(
+                mul(and(x.clone(), y.clone()), and(y.clone(), z.clone())),
+                and(and(x.clone(), y.clone()), z.clone()),
+            ),
+        );
+        let solver = NormalFormSolver::default();
+        let e = add(x.clone(), null.clone());
+        let m = e.expr(&vars);
+        let MbaAnswer::Simplified { expr, claim } = solver.solve(&m, &MbaBudget::default()) else {
+            panic!("w={w}: not simplified");
+        };
+        assert_eq!(claim, Claim::Proved);
+        assert_eq!(cost(&expr), 1, "w={w}: {expr:?}");
+        assert_eq!(solver.stats().null_parts, 1);
+        // Almost null (2^(W−2)): kept.
+        let near = mul(
+            C(BitVec::wrapping_from_u64(width, 1 << (w - 2).min(63))),
+            sub(
+                mul(and(x.clone(), y.clone()), and(y.clone(), z.clone())),
+                and(and(x.clone(), y.clone()), z.clone()),
+            ),
+        );
+        let m = add(x.clone(), near).expr(&vars);
+        if let MbaAnswer::Simplified { expr, .. } = solver.solve(&m, &MbaBudget::default()) {
+            let r = certify::prove(&m, &expr, &mut Steps::new(1 << 26)).unwrap();
+            assert_eq!(r.verdict, Verdict::Proved);
+            assert!(cost(&expr) > 1);
+        }
+    }
+}
+
+#[test]
+fn polynomial_negatives_are_left_alone() {
+    let solver = NormalFormSolver::default();
+    for w in [8u16, 64] {
+        let width = Width::new(w).unwrap();
+        let vars = [width, width, width];
+        let (x, y, z) = (V(0), V(1), V(2));
+        for e in [
+            // x·y − (x & y) is not 0.
+            sub(mul(x.clone(), y.clone()), and(x.clone(), y.clone())),
+            // Neither is (x & ~y)·(~x & y).
+            mul(
+                and(x.clone(), not(y.clone())),
+                and(not(x.clone()), y.clone()),
+            ),
+            // z must stay: z² − z is not 0.
+            sub(add(x.clone(), mul(z.clone(), z.clone())), z.clone()),
+        ] {
+            let m = e.expr(&vars);
+            match solver.solve(&m, &MbaBudget::default()) {
+                MbaAnswer::NoSimpler => {}
+                MbaAnswer::Simplified { expr, .. } => {
+                    // Only ever a provably equal, smaller form.
+                    let r = certify::prove(&m, &expr, &mut Steps::new(1 << 26)).unwrap();
+                    assert_eq!(r.verdict, Verdict::Proved, "{e:?} -> {expr:?}");
+                }
+                other => panic!("{e:?}: {other:?}"),
+            }
         }
     }
 }

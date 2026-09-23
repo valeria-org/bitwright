@@ -24,6 +24,23 @@ use super::solve::{Claim, MbaAnswer, MbaBudget, MbaSolver, Verdict};
 use crate::engine::CertStats;
 use crate::{BitVec, Width};
 
+/// Certificate work is counted in steps of this many node evaluations (see
+/// [`NormalFormSolver`]).
+const EVALS_PER_STEP: u64 = 32;
+
+/// The largest expansion over classes tried when turning masked symbols back into unmasked
+/// ones.
+const DECLASS_LIMIT: usize = 4096;
+
+/// Runs [`certify::check`] within `work` and charges what it spent.
+fn certify_within(a: &MbaExpr, b: &MbaExpr, work: &mut Steps) -> certify::Report {
+    use certify::Meter;
+    let report = certify::check(a, b, work.left.saturating_mul(EVALS_PER_STEP));
+    let spent = report.work.div_ceil(EVALS_PER_STEP).min(work.left);
+    let _ = work.charge(spent);
+    report
+}
+
 /// What the normal-form solver takes on. Every limit is checked before the work it bounds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -32,17 +49,20 @@ pub struct NfOptions {
     pub max_atoms: u32,
     /// The most bit classes (distinct bit patterns of the constants read bitwise).
     pub max_classes: u32,
-    /// The most monomials in one normal form.
+    /// The most monomials in one normal form (a larger sum or product is an atom).
     pub max_terms: u32,
+    /// The highest degree of a normal form (a product of higher degree is an atom).
+    pub max_degree: u32,
 }
 
 impl Default for NfOptions {
-    /// 16 atoms, 16 classes, 4096 monomials.
+    /// 16 atoms, 16 classes, 4096 monomials, degree 16.
     fn default() -> Self {
         NfOptions {
             max_atoms: 16,
             max_classes: 16,
             max_terms: 4096,
+            max_degree: 16,
         }
     }
 }
@@ -51,6 +71,7 @@ setters!(NfOptions {
     with_max_atoms: max_atoms: u32,
     with_max_classes: max_classes: u32,
     with_max_terms: max_terms: u32,
+    with_max_degree: max_degree: u32,
 });
 
 /// What the normal-form solver has done (telemetry; never affects answers).
@@ -91,18 +112,23 @@ pub struct NfStats {
     pub declined_atoms: u64,
     /// Declined: over `max_classes`.
     pub declined_classes: u64,
-    /// Declined: over `max_terms`, or a bitwise function of too many atoms.
+    /// Sums, products or bitwise functions made atoms: over `max_terms` or `max_degree`, or a
+    /// bitwise function of more than 12 atoms.
     pub declined_terms: u64,
+    /// Null parts of normal forms dropped, each proved zero by a certificate.
+    pub null_parts: u64,
     /// Declined: a candidate the self-check refuted (a bug; never expected).
     pub declined_internal: u64,
 }
 
-/// The native solver for linear, semi-linear and (with milestone 3) polynomial MBA, from
-/// exact normal forms at full width; other subterms are atoms. Every answer is certified
+/// The native solver for linear, semi-linear and polynomial MBA, from exact normal forms at
+/// full width; other subterms are atoms. Every answer is certified
 /// against its input by bitwright's own certificates before it is returned (`Claim::Proved`),
 /// or, when the certificate is over the budget, checked at the refutation sample
 /// (`Claim::Sampled`, which the evidence gate re-checks). Work is counted in
-/// [`MbaBudget::steps`]; answers are deterministic.
+/// [`MbaBudget::steps`]: one step per node visited, table word combined, monomial product or
+/// candidate node, and one per 32 node evaluations of a certificate. Answers are
+/// deterministic.
 ///
 /// ```
 /// use bitwright::mba::{MOp, MbaAnswer, MbaBudget, MbaExpr, MbaSolver, NormalFormSolver};
@@ -142,8 +168,8 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v1;atoms={};classes={};terms={}",
-            opts.max_atoms, opts.max_classes, opts.max_terms
+            "bitwright.nf.v1;atoms={};classes={};terms={};degree={}",
+            opts.max_atoms, opts.max_classes, opts.max_terms, opts.max_degree
         );
         NormalFormSolver {
             opts,
@@ -172,6 +198,11 @@ impl NormalFormSolver {
 impl MbaSolver for NormalFormSolver {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Yes: polynomials are normal forms too.
+    fn polynomial_fragments(&self) -> bool {
+        true
     }
 
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
@@ -231,6 +262,7 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.declined_atoms += t.declined_atoms;
     s.declined_classes += t.declined_classes;
     s.declined_terms += t.declined_terms;
+    s.null_parts += t.null_parts;
     s.declined_internal += t.declined_internal;
 }
 
@@ -272,6 +304,8 @@ struct Pass<'p> {
     atoms: Vec<Def>,
     /// Abstracted subterms, by the representative of their node.
     atom_of: HashMap<u32, u32>,
+    /// Normal forms of the operands of products: factors worth trying when rendering.
+    factors: Vec<Poly>,
 }
 
 fn solve(p: &MbaExpr, opts: &NfOptions, budget: &MbaBudget, tally: &mut NfStats) -> MbaAnswer {
@@ -339,11 +373,22 @@ impl Pass<'_> {
             }
             Form::Poly(p) => p,
         };
-        if p.len() > self.opts.max_terms as usize {
-            tally.declined_terms += 1;
-            return Err(Decline::Unsupported("too many terms"));
-        }
         Ok(p)
+    }
+
+    /// Remembers the normal form of a product's operand: rendering tries it as a factor.
+    fn note_factor(&mut self, f: &Poly) {
+        if f.degree() >= 1 && f.len() <= 64 && self.factors.len() < 16 && !self.factors.contains(f)
+        {
+            self.factors.push(f.clone());
+        }
+    }
+
+    /// Node `i` as an atom (a sum or product too large to keep multiplied out).
+    fn opaque(&mut self, i: u32, tally: &mut NfStats) -> Result<Option<Form>, Decline> {
+        tally.declined_terms += 1;
+        let at = self.atom(i, Def::Verbatim(i), tally)?;
+        Ok(Some(Form::Bits(Bits::atom(self.classes.len(), at))))
     }
 
     /// The normal form of live node `i` from its operands' forms.
@@ -392,11 +437,15 @@ impl Pass<'_> {
             MOp::Add | MOp::Sub => {
                 let (x, y) = (self.poly(a, tally)?, self.poly(b, tally)?);
                 self.charge((x.len() + y.len()) as u64)?;
-                Form::Poly(if n.op == MOp::Add {
+                let r = if n.op == MOp::Add {
                     x.add(&y)
                 } else {
                     x.sub(&y)
-                })
+                };
+                if r.len() > self.opts.max_terms as usize {
+                    return self.opaque(i, tally);
+                }
+                Form::Poly(r)
             }
             MOp::Neg => Form::Poly(self.poly(a, tally)?.neg()),
             MOp::Shl(k) => {
@@ -408,8 +457,22 @@ impl Pass<'_> {
                 (Some(k), _) => Form::Poly(self.poly(b, tally)?.scale(&k)),
                 (_, Some(k)) => Form::Poly(self.poly(a, tally)?.scale(&k)),
                 _ => {
-                    let at = self.atom(i, Def::Verbatim(i), tally)?;
-                    Form::Bits(Bits::atom(self.classes.len(), at))
+                    let (x, y) = (self.poly(a, tally)?, self.poly(b, tally)?);
+                    let size = (x.len() as u64).saturating_mul(y.len() as u64);
+                    let max = u64::from(self.opts.max_terms);
+                    if size > max.saturating_mul(4)
+                        || x.degree() + y.degree() > self.opts.max_degree
+                    {
+                        return self.opaque(i, tally);
+                    }
+                    self.charge(size)?;
+                    self.note_factor(&x);
+                    self.note_factor(&y);
+                    let prod = x.mul(&y);
+                    if prod.len() as u64 > max {
+                        return self.opaque(i, tally);
+                    }
+                    Form::Poly(prod)
                 }
             },
             MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
@@ -462,6 +525,28 @@ fn canonical(p: &MbaExpr, live: &[bool]) -> (Vec<u32>, u32) {
         });
         canon.push(c);
     }
+    // A shift's amount is a constant node once lifted (shared with an equal constant): count
+    // it as the candidates' costs do.
+    let mut consts: Vec<BitVec> = p
+        .nodes()
+        .iter()
+        .zip(live)
+        .filter_map(|(n, &l)| match n.op {
+            MOp::Const(v) if l => Some(v),
+            _ => None,
+        })
+        .collect();
+    for (n, &l) in p.nodes().iter().zip(live) {
+        if let MOp::Shl(k) | MOp::LShr(k) = n.op
+            && l
+        {
+            let v = BitVec::wrapping_from_u64(n.width, u64::from(k));
+            if !consts.contains(&v) {
+                consts.push(v);
+                distinct += 1;
+            }
+        }
+    }
     (canon, distinct)
 }
 
@@ -505,6 +590,7 @@ struct Normal {
     classes: Classes,
     nf: Poly,
     atom_exprs: Vec<MbaExpr>,
+    factors: Vec<Poly>,
     input_cost: u32,
     work: Steps,
 }
@@ -564,6 +650,7 @@ fn normalize(
         forms: vec![None; nodes.len()],
         atoms: (0..p.vars().len() as u32).map(Def::Var).collect(),
         atom_of: HashMap::new(),
+        factors: Vec::new(),
     };
     for (i, &is_live) in live.iter().enumerate() {
         if !is_live {
@@ -576,7 +663,9 @@ fn normalize(
     let root = nodes.len() as u32 - 1;
     let mut nf = pass.poly(root, tally)?;
     pass.charge(nf.len() as u64 * u64::from(nf.degree() + 1))?;
-    nf.reduce(&pass.classes);
+    // The exact reductions; the one-position rule comes after unmasking (below), which it
+    // would otherwise hide from.
+    nf.reduce_core(&pass.classes);
     // Telemetry: the fragment reached.
     if pass.atoms.len() > p.vars().len() {
         tally.abstracted += 1;
@@ -604,19 +693,151 @@ fn normalize(
         };
         atom_exprs.push(e);
     }
+    let mut work = pass.work;
+    if nf.degree() >= 2 {
+        prune_null(p, &mut nf, &pass.classes, &atom_exprs, &mut work, tally)?;
+    }
+    // Unmasked symbols wherever the classes allow, for rendering (the same function).
+    {
+        use certify::Meter;
+        let n = pass.classes.len() as u64;
+        work.charge((nf.len() as u64).saturating_mul(n * n))
+            .map_err(|()| Decline::Exhausted)?;
+    }
+    let finish = |f: &Poly| {
+        let mut f = f.clone();
+        f.reduce_core(&pass.classes);
+        let mut f = f.declass(&pass.classes, DECLASS_LIMIT);
+        f.single_positions(&pass.classes);
+        f.reduce_core(&pass.classes);
+        f
+    };
+    let nf = finish(&nf);
+    let factors = pass.factors.iter().map(finish).collect();
     Ok(Normal {
         w,
         classes: pass.classes,
         nf,
         atom_exprs,
+        factors,
         input_cost,
-        work: pass.work,
+        work,
     })
 }
 
+/// Drops null parts the reductions miss. Every null polynomial of degree at most `d` in one
+/// variable has coefficients divisible by `2^(W − v₂(d!))`; the terms of `nf` whose coefficients
+/// are are tried as one part, then grouped by the atoms they mention, and a part is dropped
+/// only when a certificate proves it zero.
+fn prune_null(
+    p: &MbaExpr,
+    nf: &mut Poly,
+    classes: &Classes,
+    atom_exprs: &[MbaExpr],
+    work: &mut Steps,
+    tally: &mut NfStats,
+) -> Result<(), Decline> {
+    let w = nf.width();
+    let d = nf.degree();
+    let v = d - d.count_ones();
+    let t = u32::from(w.bits()).saturating_sub(v);
+    let divisible = |c: &BitVec| crate::facts::known::trailing_zeros(c) >= t;
+    let cand: Vec<(poly::Mono, BitVec)> = nf
+        .terms()
+        .iter()
+        .filter(|(m, c)| !m.is_empty() && divisible(c))
+        .map(|(m, c)| (m.clone(), *c))
+        .collect();
+    if !cand.iter().any(|(m, _)| poly::degree(m) >= 2) {
+        return Ok(());
+    }
+    // The whole candidate first, then groups by the atoms their monomials mention.
+    let mut groups: Vec<Vec<(poly::Mono, BitVec)>> = vec![cand.clone()];
+    let mut by_atoms: std::collections::BTreeMap<u64, Vec<(poly::Mono, BitVec)>> =
+        std::collections::BTreeMap::new();
+    for (m, c) in &cand {
+        let atoms = m.iter().fold(0u64, |a, (s, _)| a | s.set);
+        by_atoms.entry(atoms).or_default().push((m.clone(), *c));
+    }
+    if by_atoms.len() > 1 {
+        groups.extend(by_atoms.into_values());
+    }
+    let mut zero = MbaExpr::new(p.vars().to_vec());
+    zero.push(MOp::Const(BitVec::zero(w)), &[])
+        .map_err(|_| Decline::Unsupported("internal: zero"))?;
+    for g in groups {
+        let present = g.iter().all(|(m, c)| nf.terms().get(m) == Some(c));
+        if !present || !g.iter().any(|(m, _)| poly::degree(m) >= 2) {
+            continue;
+        }
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs);
+        let mut sum = render::Sum::default();
+        for (m, c) in &g {
+            let Some(t) = r.mono(m) else {
+                return Ok(());
+            };
+            sum.terms.push((t, *c));
+        }
+        let root = r.sum(&sum);
+        let Some(e) = r.b.finish(root) else {
+            return Ok(());
+        };
+        let report = certify_within(&e, &zero, work);
+        tally.certificates.record(&report);
+        if report.verdict == Verdict::Proved {
+            for (m, c) in &g {
+                nf.add_term(m.clone(), &BitVec::un_unchecked(crate::ops::UnOp::Neg, c));
+            }
+            tally.null_parts += 1;
+        }
+    }
+    Ok(())
+}
+
 /// The candidates for a normal form, rendered into `r`.
-fn candidates(r: &mut Render<'_>, nf: &Poly) -> Vec<u32> {
-    r.linear(nf)
+fn candidates(r: &mut Render<'_>, nf: &Poly, factors: &[Poly]) -> Vec<u32> {
+    r.poly(nf, factors, 0)
+}
+
+/// The cheapest rendering of `n`: rendered, then again with the factors the best candidate
+/// multiplies, until none is new (a few rounds), so the answer is as good as the factors its
+/// own products offer.
+fn best_rendering(
+    p: &MbaExpr,
+    n: &Normal,
+    work: &mut Steps,
+    tally: &mut NfStats,
+) -> Result<Option<(render::Cost, MbaExpr)>, Decline> {
+    use certify::Meter;
+    let mut factors = n.factors.clone();
+    let mut best: Option<(render::Cost, MbaExpr)> = None;
+    for _ in 0..3 {
+        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs);
+        let cands = candidates(&mut r, &n.nf, &factors);
+        work.charge(r.built.saturating_mul(16).max(1))
+            .map_err(|()| Decline::Exhausted)?;
+        tally.candidates += r.built;
+        let Some(b) = r.best(&cands) else {
+            break;
+        };
+        let cost = r.b.cost(b);
+        if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+            let Some(e) = r.b.finish(b) else {
+                return Err(Decline::Unsupported("internal: rendering"));
+            };
+            best = Some((cost, e));
+        }
+        let more: Vec<Poly> = r
+            .factors_of(b)
+            .into_iter()
+            .filter(|f| !factors.contains(f))
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        factors.extend(more);
+    }
+    Ok(best)
 }
 
 fn run(
@@ -625,35 +846,46 @@ fn run(
     budget: &MbaBudget,
     tally: &mut NfStats,
 ) -> Result<MbaAnswer, Decline> {
-    let Normal {
-        w,
-        classes,
-        nf,
-        atom_exprs,
-        input_cost,
-        mut work,
-    } = normalize(p, opts, budget, tally)?;
-    let mut r = Render::new(p.vars().to_vec(), w, &classes, &atom_exprs);
-    let cands = candidates(&mut r, &nf);
-    {
-        use certify::Meter;
-        work.charge(r.built.saturating_mul(16))
-            .map_err(|()| Decline::Exhausted)?;
-    }
-    tally.candidates += r.built;
-    let Some(best) = r.best(&cands) else {
+    let n = normalize(p, opts, budget, tally)?;
+    let input_cost = n.input_cost;
+    let mut work = Steps::new(n.work.left);
+    let Some((mut cost, mut answer)) = best_rendering(p, &n, &mut work, tally)? else {
         return Ok(MbaAnswer::NoSimpler);
     };
-    let (nodes_best, _) = r.b.cost(best);
-    if nodes_best >= input_cost {
+    if cost.0 >= input_cost {
         return Ok(MbaAnswer::NoSimpler);
     }
-    let Some(answer) = r.b.finish(best) else {
-        return Err(Decline::Unsupported("internal: rendering"));
-    };
+    // A fixed point: the answer, normalized again (its own constants may give coarser bit
+    // classes, its own products other factors), until that renders nothing smaller. Solving
+    // the answer again then finds nothing smaller either.
+    for _ in 0..3 {
+        let mut scratch = NfStats::default();
+        let again = normalize(
+            &answer,
+            opts,
+            &MbaBudget::default().with_steps(work.left),
+            &mut scratch,
+        )
+        .and_then(|m| {
+            let mut w2 = Steps::new(m.work.left);
+            let r = best_rendering(&answer, &m, &mut w2, &mut scratch);
+            let spent = work.left - w2.left.min(work.left);
+            work = Steps::new(work.left - spent);
+            r
+        });
+        tally.candidates += scratch.candidates;
+        match again {
+            Ok(Some((c, e))) if c < cost => {
+                cost = c;
+                answer = e;
+            }
+            Err(Decline::Exhausted) => return Err(Decline::Exhausted),
+            _ => break,
+        }
+    }
     // The self-check: the answer against the input, by a certificate (within what is left),
     // else at the refutation sample only.
-    let report = certify::check(p, &answer, work.left);
+    let report = certify_within(p, &answer, &mut work);
     tally.certificates.record(&report);
     match report.verdict {
         Verdict::Proved => Ok(MbaAnswer::Simplified {
@@ -708,7 +940,7 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
     }
     let naive = r.sum(&sum);
     let naive = r.b.finish(naive)?;
-    let cands = candidates(&mut r, &n.nf);
+    let cands = candidates(&mut r, &n.nf, &n.factors);
     let cands: Option<Vec<MbaExpr>> = cands.iter().map(|&c| r.b.finish(c)).collect();
     Some((naive, cands?))
 }

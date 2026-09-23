@@ -10,11 +10,17 @@
   of both sides and their neighbours, and single bit positions. Evaluation is batched (256
   points per block). `MbaStats::certificates` counts what decided.
 - **Native MBA solver.** `mba::NormalFormSolver` (with `NfOptions`, `NfStats`) simplifies
-  linear and semi-linear MBA from exact normal forms at full width: bitwise functions as truth
-  tables per bit class (constants inside bitwise operators included), linear combinations of
-  masked conjunctions reduced to a canonical form, and the cheapest of several renderings
-  (minimum forms, masked groups, indicator and conjunction forms). It certifies every answer
-  itself and is never costlier than `SignatureSolver` on linear MBA. Not the default solver.
+  linear, semi-linear and polynomial MBA from exact normal forms at full width: bitwise
+  functions as truth tables per bit class (constants inside bitwise operators included),
+  polynomials over masked conjunctions with exact reductions (coefficient precision, the
+  falling-factorial null polynomials, one-position classes) and null parts dropped only when a
+  certificate proves them zero, and the cheapest of many renderings (minimum forms, masked
+  groups, indicator, conjunction and single-function forms, factored products). It certifies
+  every answer itself, is never costlier than `SignatureSolver` on linear MBA, and answers are
+  a fixed point (solving an answer again finds nothing smaller). Not the default solver.
+- **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
+  solver that returns true is also asked about fragments without bitwise operators in which
+  two non-constants are multiplied, and fragments rooted at a constant left shift.
 - **Behavior changes.** With the MBA service, answers that needed a trusted backend certificate
   are now accepted on bitwright's own proof where one applies (with `backend_certificates`
   off, more answers are accepted); answers wrong at a constant of either side are refuted

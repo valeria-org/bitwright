@@ -105,6 +105,9 @@ assert_eq!(cx.display(out.roots[0].expr).to_string(), "(x & y) + (x << 1) + y");
 exactly at every width, one truth table per *bit class* (the positions every constant read by a
 bitwise operator treats alike), so constants inside bitwise operators are no obstacle:
 `(x ^ 0x10) + 2·(x & 0x10)` is `x + 0x10`, and `3·(x & 0x55) + 3·(x & 0xaa)` is `3·(x & 0xff)`.
+Products of bitwise terms are multiplied out symbolically, so they cancel exactly:
+`(x & y)·(x | y) + (x & ~y)·(~x & y)` is `x·y`, `2^63·(x·x + x)` is 0 at 64 bits, and a sum that
+is a product comes out as one (`x·(x & y) + y·(x & y) − (x & y)²` is `(x | y)·(x & y)`).
 Subterms it cannot see through become atoms. Every answer is certified against its input before
 it is returned, and the evidence gate checks it again.
 

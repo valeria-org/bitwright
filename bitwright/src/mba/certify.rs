@@ -134,6 +134,8 @@ pub(crate) struct Report {
     pub(crate) internal: u64,
     /// For `Refuted`: an input where the sides differ (one value per variable).
     pub(crate) counterexample: Option<Vec<BitVec>>,
+    /// Node evaluations spent (by [`check`]).
+    pub(crate) work: u64,
 }
 
 impl Report {
@@ -146,6 +148,7 @@ impl Report {
             over_budget: false,
             internal: 0,
             counterexample: None,
+            work: 0,
         }
     }
 }
@@ -1479,7 +1482,8 @@ impl super::EquivalenceProver for NativeProver {
     }
 }
 
-/// The refutation sample, then [`prove`], under a budget of `steps` node evaluations.
+/// The refutation sample, then [`prove`], under a budget of `steps` node evaluations (the
+/// report says how many it spent).
 pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
     let mut meter = Steps::new(steps);
     let mut report = Report::new();
@@ -1492,13 +1496,15 @@ pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
         return report;
     }
     report.points += SAMPLE_POINTS as u64;
+    report.work = meter.spent;
     let seed = crate::hash::combine(a.key()[0], b.key()[1]);
     let points = sample_points(a.vars(), &[a, b], seed);
-    if refute(a, b, &points).is_some() {
+    if let Some(p) = refute(a, b, &points) {
         report.verdict = Verdict::Refuted;
+        report.counterexample = Some(p);
         return report;
     }
-    match prove(a, b, &mut meter) {
+    let mut r = match prove(a, b, &mut meter) {
         Ok(mut r) => {
             r.points += report.points;
             r
@@ -1507,5 +1513,7 @@ pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
             report.over_budget = true;
             report
         }
-    }
+    };
+    r.work = meter.spent;
+    r
 }

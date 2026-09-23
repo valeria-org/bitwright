@@ -3,16 +3,12 @@
 //! A *symbol* `(S, c)` stands for `AND_S & M_c`: the conjunction of the atoms in `S`, restricted
 //! to the positions of bit class `c`. Products of symbols are multiplied out formally; the
 //! result is exact (expanding and collecting are ring operations), though not canonical,
-//! because symbols are related (see [`Poly::reduce`] for the reductions that are cheap and
+//! because symbols are related (see [`Poly::reduce_core`] for the reductions that are cheap and
 //! exact).
-
-// Products, division and the falling-factorial reduction serve the polynomial normal form
-// (products of non-constants), which the next milestone switches on.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
-use super::classes::Classes;
+use super::classes::{Classes, FULL};
 use crate::facts::known::low_mask;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
@@ -223,15 +219,6 @@ impl Poly {
             .unwrap_or(BitVec::zero(self.w))
     }
 
-    /// The constant, if that is all it is.
-    pub(crate) fn as_const(&self) -> Option<BitVec> {
-        match self.terms.len() {
-            0 => Some(BitVec::zero(self.w)),
-            1 => self.terms.get(&Vec::new()).copied(),
-            _ => None,
-        }
-    }
-
     /// The largest total degree (0 for a constant).
     pub(crate) fn degree(&self) -> u32 {
         self.terms.keys().map(degree).max().unwrap_or(0)
@@ -346,24 +333,10 @@ impl Poly {
         None
     }
 
-    /// Exact, cheap reductions, applied in place:
-    ///
-    /// - a symbol of a one-position class `{j}` takes only the values 0 and `2^j`, so
-    ///   `m^e = 2^{j(e−1)}·m`;
-    /// - a monomial with symbols of classes starting at `τ` is a multiple of `2^τ` (the sum over
-    ///   its factors), so its coefficient matters only mod `2^(W−τ)`;
-    /// - `(x)_κ = Π (x_i)_{κ_i}` is a multiple of `κ! = Π κ_i!` for any integers, so
-    ///   `2^(W − v₂(κ!))·(x)_κ = 0`: from the highest degree down, each coefficient is brought
-    ///   into `(−2^(m−1), 2^(m−1)]` for the larger of the two moduli, the falling-factorial
-    ///   one moving the difference into lower monomials.
-    ///
-    /// Both hold whatever values the symbols take, so treating symbols as independent is
-    /// sound. For a polynomial in independent atoms (no bitwise operator) the result is
-    /// canonical: equal polynomial functions reduce to the same terms.
-    pub(crate) fn reduce(&mut self, classes: &Classes) {
-        let w = self.w;
-        let bits = u32::from(w.bits());
-        // One-position classes.
+    /// The one-position rule: a symbol of a class with the single position `j` takes only the
+    /// values 0 and `2^j`, so `m^e = 2^{j(e−1)}·m`.
+    pub(crate) fn single_positions(&mut self, classes: &Classes) {
+        let bits = u32::from(self.w.bits());
         if (0..classes.len()).any(|c| classes.single(c).is_some()) {
             let old = std::mem::take(&mut self.terms);
             for (m, c) in old {
@@ -382,6 +355,24 @@ impl Poly {
                 self.add_term(out, &k);
             }
         }
+    }
+
+    /// Exact, cheap reductions, applied in place (also
+    /// [`single_positions`](Self::single_positions)):
+    ///
+    /// - a monomial with symbols of classes starting at `τ` is a multiple of `2^τ` (the sum over
+    ///   its factors), so its coefficient matters only mod `2^(W−τ)`;
+    /// - `(x)_κ = Π (x_i)_{κ_i}` is a multiple of `κ! = Π κ_i!` for any integers, so
+    ///   `2^(W − v₂(κ!))·(x)_κ = 0`: from the highest degree down, each coefficient is brought
+    ///   into `(−2^(m−1), 2^(m−1)]` for the larger of the two moduli, the falling-factorial
+    ///   one moving the difference into lower monomials.
+    ///
+    /// Both hold whatever values the symbols take, so treating symbols as independent is
+    /// sound. For a polynomial in independent atoms (no bitwise operator) the result is
+    /// canonical: equal polynomial functions reduce to the same terms.
+    pub(crate) fn reduce_core(&mut self, classes: &Classes) {
+        let w = self.w;
+        let bits = u32::from(w.bits());
         let top = self.degree();
         for d in (0..=top).rev() {
             let monos: Vec<Mono> = self
@@ -449,6 +440,105 @@ impl Poly {
                 }
             }
         }
+    }
+
+    /// Each unmasked symbol replaced by its masked symbols: `AND_S = Σ_c AND_S & M_c`.
+    pub(crate) fn expand_full(&self, classes: &Classes) -> Poly {
+        let w = self.w;
+        if !self
+            .terms
+            .keys()
+            .any(|m| m.iter().any(|(s, _)| s.class == FULL))
+        {
+            return self.clone();
+        }
+        let mut out = Poly::zero(w);
+        for (m, c) in &self.terms {
+            let kept: Mono = m.iter().copied().filter(|(s, _)| s.class != FULL).collect();
+            let mut t = Poly::term(w, kept, c);
+            for &(s, e) in m.iter().filter(|(s, _)| s.class == FULL) {
+                let mut sum = Poly::zero(w);
+                for k in 0..classes.len() {
+                    sum = sum.add(&Poly::sym(
+                        w,
+                        Sym {
+                            set: s.set,
+                            class: k as u16,
+                        },
+                    ));
+                }
+                for _ in 0..e {
+                    t = t.mul(&sum);
+                }
+            }
+            out = out.add(&t);
+        }
+        out
+    }
+
+    /// The same function with unmasked symbols wherever the classes allow: for each shape (a
+    /// monomial with its classes erased), highest degree first, when subtracting `c` times the
+    /// full expansion of the unmasked monomial (`c` its coefficient with every factor in class 0,
+    /// which has every precision) leaves no term of that shape (modulo precision), the shape
+    /// becomes that one unmasked term. Expansions over `limit` monomials are not tried.
+    pub(crate) fn declass(&self, classes: &Classes, limit: usize) -> Poly {
+        let w = self.w;
+        if classes.len() <= 1 {
+            return self.clone();
+        }
+        let shape = |m: &Mono| -> Vec<(u64, u32)> {
+            let mut v: Vec<(u64, u32)> = Vec::new();
+            for &(s, e) in m {
+                match v.iter_mut().find(|(set, _)| *set == s.set) {
+                    Some(x) => x.1 += e,
+                    None => v.push((s.set, e)),
+                }
+            }
+            v.sort_unstable();
+            v
+        };
+        let mut shapes: Vec<Vec<(u64, u32)>> = self
+            .terms
+            .keys()
+            .filter(|m| !m.is_empty() && m.iter().all(|(s, _)| s.class != FULL))
+            .map(shape)
+            .collect();
+        shapes.sort_by(|a, b| {
+            let da: u32 = a.iter().map(|x| x.1).sum();
+            let db: u32 = b.iter().map(|x| x.1).sum();
+            db.cmp(&da).then_with(|| a.cmp(b))
+        });
+        shapes.dedup();
+        let mut rest = self.clone();
+        let mut full = Poly::zero(w);
+        for sh in shapes {
+            let size = sh.iter().fold(1usize, |acc, &(_, e)| {
+                acc.saturating_mul(classes.len().saturating_pow(e))
+            });
+            if size > limit {
+                continue;
+            }
+            let rep: Mono = sh
+                .iter()
+                .map(|&(set, e)| (Sym { set, class: 0 }, e))
+                .collect();
+            let Some(c) = rest.terms.get(&rep).copied() else {
+                continue;
+            };
+            let unmasked: Mono = sh
+                .iter()
+                .map(|&(set, e)| (Sym { set, class: FULL }, e))
+                .collect();
+            let expansion = Poly::term(w, unmasked.clone(), &c).expand_full(classes);
+            let mut trial = rest.sub(&expansion);
+            trial.reduce_core(classes);
+            if trial.terms.keys().any(|m| !m.is_empty() && shape(m) == sh) {
+                continue;
+            }
+            rest = trial;
+            full.add_term(unmasked, &c);
+        }
+        full.add(&rest)
     }
 
     fn set(&mut self, m: &Mono, c: BitVec) {

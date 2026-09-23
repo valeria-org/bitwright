@@ -8,10 +8,16 @@
 
 use crate::{BitVec, Width};
 
+/// The class of an unmasked symbol: every position (`AND_S` itself, the sum of its masked
+/// symbols over all classes).
+pub(crate) const FULL: u16 = u16::MAX;
+
 /// The partition of the positions of a width into classes, ordered by lowest position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Classes {
     width: Width,
+    /// All-ones (the mask of [`FULL`]).
+    ones: BitVec,
     /// Per class: its positions.
     masks: Vec<BitVec>,
     /// Per class: its lowest position (`τ_c`).
@@ -66,6 +72,7 @@ impl Classes {
             .collect();
         Some(Classes {
             width,
+            ones: BitVec::ones(width),
             masks,
             low: members.iter().map(|ps| ps[0]).collect(),
             single: members
@@ -84,19 +91,22 @@ impl Classes {
         self.masks.len()
     }
 
-    /// The positions of class `c`.
+    /// The positions of class `c` (all of them for [`FULL`]).
     pub(crate) fn mask(&self, c: usize) -> &BitVec {
-        &self.masks[c]
+        self.masks.get(c).unwrap_or(&self.ones)
     }
 
     /// The lowest position of class `c`: its symbols are multiples of `2^low`.
     pub(crate) fn low(&self, c: usize) -> u16 {
-        self.low[c]
+        self.low.get(c).copied().unwrap_or(0)
     }
 
     /// The only position of class `c`, if it has one (then `m² = 2^j·m` for its symbols).
     pub(crate) fn single(&self, c: usize) -> Option<u16> {
-        self.single[c]
+        match self.single.get(c) {
+            Some(s) => *s,
+            None => (self.width.bits() == 1).then_some(0),
+        }
     }
 
     /// The bit constant `v` has throughout class `c`: `None` when it differs inside the class.

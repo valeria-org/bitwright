@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use super::bits::{self, Bits, anf, mobius, table8};
-use super::classes::Classes;
+use super::classes::{Classes, FULL};
 use super::poly::{Mono, Poly, Sym};
 use crate::engine::pass::bitwise::{T, min_forms};
 use crate::facts::known::{bv_and, bv_not, bv_or, count_ones, trailing_zeros};
@@ -191,7 +191,7 @@ impl Builder {
     }
 
     /// The nodes `root` uses, operands first.
-    fn reach(&self, root: u32) -> Vec<u32> {
+    pub(crate) fn reach(&self, root: u32) -> Vec<u32> {
         let mut seen = vec![false; self.nodes.len()];
         let mut out = Vec::new();
         let mut stack = vec![(root, false)];
@@ -213,11 +213,30 @@ impl Builder {
         out
     }
 
-    /// The cost of the candidate rooted at `root`.
+    /// The cost of the candidate rooted at `root`: its nodes, counting a shift's amount as the
+    /// constant node it is once lifted (shared with an equal constant), then operator weight.
     pub(crate) fn cost(&self, root: u32) -> Cost {
         let r = self.reach(root);
         let weight: u32 = r.iter().map(|&i| weight(&self.nodes[i as usize].op)).sum();
-        (r.len() as u32, weight)
+        let mut consts: Vec<BitVec> = r
+            .iter()
+            .filter_map(|&i| match self.nodes[i as usize].op {
+                MOp::Const(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let mut amounts = 0u32;
+        for &i in &r {
+            let n = self.nodes[i as usize];
+            if let MOp::Shl(k) | MOp::LShr(k) = n.op {
+                let v = BitVec::wrapping_from_u64(n.w, u64::from(k));
+                if !consts.contains(&v) {
+                    consts.push(v);
+                    amounts += 1;
+                }
+            }
+        }
+        (r.len() as u32 + amounts, weight)
     }
 
     /// The candidate rooted at `root` as an expression.
@@ -276,6 +295,8 @@ pub(crate) struct Render<'a> {
     w: Width,
     /// Candidates built (telemetry).
     pub(crate) built: u64,
+    /// Per product node built from normal forms: the factor and quotient it multiplies.
+    products: HashMap<u32, (Poly, Poly)>,
 }
 
 /// A linear combination to emit: terms and a constant.
@@ -299,7 +320,24 @@ impl<'a> Render<'a> {
             atom_nodes: vec![None; atom_exprs.len()],
             w,
             built: 0,
+            products: HashMap::new(),
         }
+    }
+
+    /// The factors and quotients of the products the candidate at `root` uses (to try as
+    /// factors in a next round).
+    pub(crate) fn factors_of(&self, root: u32) -> Vec<Poly> {
+        let mut out: Vec<Poly> = Vec::new();
+        for n in self.b.reach(root) {
+            if let Some((f, q)) = self.products.get(&n) {
+                for x in [f, q] {
+                    if x.degree() >= 1 && !out.contains(x) {
+                        out.push(x.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Atom `a`'s node.
@@ -337,7 +375,6 @@ impl<'a> Render<'a> {
     }
 
     /// A symbol.
-    #[cfg_attr(not(test), allow(dead_code))] // products arrive with the polynomial form
     pub(crate) fn sym(&mut self, s: Sym) -> Option<u32> {
         let x = self.conj(s.set)?;
         let mask = *self.classes.mask(usize::from(s.class));
@@ -666,20 +703,147 @@ impl<'a> Render<'a> {
 
     // ----- linear combinations -------------------------------------------------------------
 
-    /// Renderings of `konst + Σ γ·m` (degree at most 1): as a bitwise function when it is one,
-    /// and as combinations over groups of classes whose coefficients can be chosen equal.
+    /// Renderings of `konst + Σ γ·m` (degree at most 1).
     pub(crate) fn linear(&mut self, p: &Poly) -> Vec<u32> {
+        let sums = self.linear_sums(p);
+        sums.iter().map(|s| self.sum(s)).collect()
+    }
+
+    /// Decompositions of `konst + Σ γ·m` (degree at most 1) into sums: as a bitwise function
+    /// when it is one, and as combinations over groups of classes whose coefficients can be
+    /// chosen equal (also after taking out, per atom set, the coefficient of its widest class
+    /// as an unmasked term).
+    pub(crate) fn linear_sums(&mut self, p: &Poly) -> Vec<Sum> {
+        let w = self.w;
+        let mut out: Vec<Sum> = Vec::new();
+        if let Some(f) = Bits::from_linear(&p.expand_full(self.classes), self.classes) {
+            for n in self.bits(&f) {
+                out.push(Sum {
+                    terms: vec![(n, BitVec::one(w))],
+                    konst: None,
+                });
+            }
+        }
+        out.extend(self.grouped(p));
+        let n = self.classes.len();
+        if n > 1
+            && p.terms()
+                .keys()
+                .any(|m| m.iter().any(|(s, _)| s.class != FULL))
+        {
+            // Per atom set, the coefficient of its widest class becomes an unmasked term; the
+            // other classes keep their differences.
+            let mut widest: BTreeMap<u64, (u32, BitVec)> = BTreeMap::new();
+            for (m, c) in p.terms() {
+                if let Some(&(s, _)) = m.first()
+                    && s.class != FULL
+                {
+                    let size = count_ones(self.classes.mask(usize::from(s.class)));
+                    let e = widest.entry(s.set).or_insert((0, BitVec::zero(w)));
+                    if size > e.0 {
+                        *e = (size, *c);
+                    }
+                }
+            }
+            // Classes a set has no term in have coefficient 0: those count too.
+            for (&set, e) in widest.iter_mut() {
+                let covered: u32 = p
+                    .terms()
+                    .keys()
+                    .filter_map(|m| m.first())
+                    .filter(|(s, _)| s.set == set && s.class != FULL)
+                    .map(|(s, _)| count_ones(self.classes.mask(usize::from(s.class))))
+                    .sum();
+                let missing = u32::from(w.bits()) - covered.min(u32::from(w.bits()));
+                if missing > e.0 {
+                    *e = (missing, BitVec::zero(w));
+                }
+            }
+            let mut q = p.clone();
+            for (&set, (_, base)) in &widest {
+                if base.is_zero() {
+                    continue;
+                }
+                q.add_term(vec![(Sym { set, class: FULL }, 1)], base);
+                let nb = BitVec::un_unchecked(UnOp::Neg, base);
+                for c in 0..n {
+                    q.add_term(
+                        vec![(
+                            Sym {
+                                set,
+                                class: c as u16,
+                            },
+                            1,
+                        )],
+                        &nb,
+                    );
+                }
+            }
+            if q != *p {
+                out.extend(self.grouped(&q));
+            }
+        }
+        // `c·~h = −c·h − c`, and back: a complement traded for a constant.
+        let variants: Vec<Sum> = out.iter().flat_map(|s| self.complements(s)).collect();
+        out.extend(variants);
+        self.built += out.len() as u64;
+        out
+    }
+
+    /// Variants of `s` with complements traded for the constant: every term `c·~h` as
+    /// `−c·h` (the constant takes `−c`), and a term `d·h` whose coefficient is the constant as
+    /// `−d·~h` (the constant goes).
+    fn complements(&mut self, s: &Sum) -> Vec<Sum> {
         let w = self.w;
         let mut out = Vec::new();
-        if let Some(f) = Bits::from_linear(p, self.classes) {
-            out.extend(self.bits(&f));
+        let mut k = s.konst.unwrap_or(BitVec::zero(w));
+        let mut changed = false;
+        let mut terms = Vec::with_capacity(s.terms.len());
+        for &(t, c) in &s.terms {
+            let n = self.b.nodes[t as usize];
+            if n.op == MOp::Not {
+                terms.push((n.args[0], BitVec::un_unchecked(UnOp::Neg, &c)));
+                k = BitVec::bin_unchecked(BinOp::Sub, &k, &c);
+                changed = true;
+            } else {
+                terms.push((t, c));
+            }
         }
-        // Per class: coefficients by atom set.
+        if changed {
+            out.push(Sum {
+                terms,
+                konst: Some(k),
+            });
+        }
+        if let Some(k) = s.konst
+            && !k.is_zero()
+            && let Some(i) = s.terms.iter().position(|(_, c)| *c == k)
+        {
+            let mut terms = s.terms.clone();
+            let (t, c) = terms[i];
+            let nt = self.b.un(MOp::Not, t);
+            terms[i] = (nt, BitVec::un_unchecked(UnOp::Neg, &c));
+            out.push(Sum { terms, konst: None });
+        }
+        out
+    }
+
+    /// The decompositions of a degree-≤1 form over groups of classes: unmasked terms are one
+    /// group, and classes whose coefficients agree (each modulo its own precision) with the
+    /// group's most precise member are another. With one group every rendering of it is
+    /// offered; with several, each group's rendering is chosen in turn for the cheapest whole.
+    fn grouped(&mut self, p: &Poly) -> Vec<Sum> {
+        let w = self.w;
         let n = self.classes.len();
-        let mut coef: Vec<BTreeMap<u64, BitVec>> = vec![BTreeMap::new(); n];
+        let mut coef: Vec<BTreeMap<u64, BitVec>> = vec![BTreeMap::new(); n + 1];
         for (m, c) in p.terms() {
             if let Some(&(s, _)) = m.first() {
-                coef[usize::from(s.class)].insert(s.set, *c);
+                let k = if s.class == FULL {
+                    n
+                } else {
+                    usize::from(s.class)
+                };
+                coef[k].insert(s.set, *c);
             }
         }
         let prec = |c: usize| u32::from(w.bits()) - u32::from(self.classes.low(c));
@@ -687,8 +851,6 @@ impl<'a> Render<'a> {
             let lm = crate::facts::known::low_mask(w, m);
             bv_and(a, &lm) == bv_and(b, &lm)
         };
-        // Groups: classes whose coefficients agree (each modulo its own precision) with the
-        // group's most precise member, whose coefficients the group uses.
         let mut groups: Vec<Vec<usize>> = Vec::new();
         for c in 0..n {
             if coef[c].values().all(|k| same(k, &BitVec::zero(w), prec(c))) {
@@ -722,11 +884,14 @@ impl<'a> Render<'a> {
                 groups.push(vec![c]);
             }
         }
-        // Each group: the cheapest of its masked conjunction and indicator forms.
-        let mut total = Sum {
-            terms: Vec::new(),
-            konst: Some(p.konst()),
-        };
+        let mut options: Vec<Vec<Sum>> = Vec::new();
+        if !coef[n].is_empty() {
+            let ones = BitVec::ones(w);
+            match self.group(&coef[n], &ones) {
+                Some(o) => options.push(o),
+                None => return Vec::new(),
+            }
+        }
         for g in &groups {
             let rep = *g
                 .iter()
@@ -735,28 +900,156 @@ impl<'a> Render<'a> {
             let mask = g
                 .iter()
                 .fold(BitVec::zero(w), |m, &c| bv_or(&m, self.classes.mask(c)));
-            let Some(part) = self.group(&coef[rep], &mask) else {
-                return out;
-            };
-            total.terms.extend(part.terms);
-            if let Some(k) = part.konst {
-                total.konst = Some(BitVec::bin_unchecked(
-                    BinOp::Add,
-                    &total.konst.unwrap_or(BitVec::zero(w)),
-                    &k,
-                ));
+            match self.group(&coef[rep], &mask) {
+                Some(o) => options.push(o),
+                None => return Vec::new(),
             }
         }
-        out.push(self.sum(&total));
-        self.built += 1;
+        let konst = p.konst();
+        let total = |options: &[Vec<Sum>], choice: &[usize]| -> Sum {
+            let mut t = Sum {
+                terms: Vec::new(),
+                konst: Some(konst),
+            };
+            for (g, &k) in choice.iter().enumerate() {
+                let part = &options[g][k];
+                t.terms.extend(part.terms.iter().copied());
+                if let Some(c) = part.konst {
+                    t.konst = Some(BitVec::bin_unchecked(
+                        BinOp::Add,
+                        &t.konst.unwrap_or(BitVec::zero(w)),
+                        &c,
+                    ));
+                }
+            }
+            t
+        };
+        match options.len() {
+            0 => vec![total(&options, &[])],
+            1 => (0..options[0].len())
+                .map(|k| total(&options, &[k]))
+                .collect(),
+            _ => {
+                let mut choice = vec![0usize; options.len()];
+                for g in 0..options.len() {
+                    let mut best: Option<(Cost, usize)> = None;
+                    for k in 0..options[g].len() {
+                        choice[g] = k;
+                        let root = self.sum(&total(&options, &choice));
+                        let cost = self.b.cost(root);
+                        if best.is_none_or(|(c, _)| cost < c) {
+                            best = Some((cost, k));
+                        }
+                    }
+                    choice[g] = best.map_or(0, |(_, k)| k);
+                }
+                vec![total(&options, &choice)]
+            }
+        }
+    }
+
+    /// The cheapest of `sums`, each costed on its own.
+    fn cheapest(&mut self, sums: Vec<Sum>) -> Option<Sum> {
+        let mut best: Option<(Cost, Sum)> = None;
+        for s in sums {
+            let root = self.sum(&s);
+            let cost = self.b.cost(root);
+            if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+                best = Some((cost, s));
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+
+    /// Renderings of a normal form of any degree: the linear part's cheapest decomposition plus
+    /// the nonlinear part monomial by monomial, or factored by a symbol common to all its
+    /// monomials or by a factor of the input's products it is exactly divisible by; and the
+    /// whole as a product of such a factor and its quotient.
+    pub(crate) fn poly(&mut self, p: &Poly, factors: &[Poly], depth: u32) -> Vec<u32> {
+        const MAX_DEPTH: u32 = 2;
+        if p.degree() <= 1 {
+            return self.linear(p);
+        }
+        let w = self.w;
+        let one = BitVec::one(w);
+        let lin = p.part(|d| d <= 1);
+        let nl = p.part(|d| d >= 2);
+        let lin_sum = if lin.is_zero() {
+            Sum::default()
+        } else {
+            let sums = self.linear_sums(&lin);
+            match self.cheapest(sums) {
+                Some(s) => s,
+                None => return Vec::new(),
+            }
+        };
+        let steps = 4 * p.len() + 16;
+        let mut parts: Vec<Sum> = Vec::new();
+        let mut naive = Sum::default();
+        for (m, c) in nl.terms() {
+            match self.mono(m) {
+                Some(t) => naive.terms.push((t, *c)),
+                None => return Vec::new(),
+            }
+        }
+        parts.push(naive);
+        if depth < MAX_DEPTH {
+            let mut fs: Vec<Poly> = if depth == 0 {
+                factors.to_vec()
+            } else {
+                Vec::new()
+            };
+            fs.extend(common_symbols(&nl).into_iter().map(|s| Poly::sym(w, s)));
+            for f in &fs {
+                if let Some(q) = nl.div_exact(f, steps)
+                    && let Some(x) = self.product(f, &q, factors, depth)
+                {
+                    parts.push(Sum {
+                        terms: vec![(x, one)],
+                        konst: None,
+                    });
+                }
+            }
+        }
+        let mut out: Vec<u32> = parts
+            .iter()
+            .map(|n| {
+                let mut s = lin_sum.clone();
+                s.terms.extend(n.terms.iter().copied());
+                self.sum(&s)
+            })
+            .collect();
+        if depth < MAX_DEPTH {
+            for f in factors {
+                if let Some(q) = p.div_exact(f, steps)
+                    && let Some(x) = self.product(f, &q, factors, depth)
+                {
+                    out.push(x);
+                }
+            }
+        }
+        self.built += out.len() as u64;
         out
     }
 
-    /// The cheapest rendering of `Σ_S γ_S·(AND_S & mask)` as terms of a sum: the masked
-    /// conjunctions, or `b·mask + Σ_{v≠b} (v − b)·(g_v & mask)` over the distinct values `v` of
+    /// `f·q`, each rendered at its cheapest.
+    fn product(&mut self, f: &Poly, q: &Poly, factors: &[Poly], depth: u32) -> Option<u32> {
+        let a = self.poly(f, factors, depth + 1);
+        let a = self.best(&a)?;
+        let b = self.poly(q, factors, depth + 1);
+        let b = self.best(&b)?;
+        let x = self.b.bin(MOp::Mul, a, b);
+        self.products
+            .entry(x)
+            .or_insert_with(|| (f.clone(), q.clone()));
+        Some(x)
+    }
+
+    /// The renderings of `Σ_S γ_S·(AND_S & mask)` as terms of a sum: the masked conjunctions,
+    /// and `b·mask + Σ_{v≠b} (v − b)·(g_v & mask)` over the distinct values `v` of
     /// `Σ_{∅≠S⊆p} γ_S` at the corners `p` (at most three atoms), `g_v` the minimum form of the
     /// corners with value `v`.
-    fn group(&mut self, coef: &BTreeMap<u64, BitVec>, mask: &BitVec) -> Option<Sum> {
+    fn group(&mut self, coef: &BTreeMap<u64, BitVec>, mask: &BitVec) -> Option<Vec<Sum>> {
         let w = self.w;
         let mut options: Vec<Sum> = Vec::new();
         // Masked conjunctions.
@@ -815,21 +1108,125 @@ impl<'a> Render<'a> {
                 }
                 options.push(sum);
             }
+            options.extend(self.affine_plus(coef, mask, &support, &atoms));
         }
-        // The cheapest, costed on its own.
-        let mut best: Option<(Cost, Sum)> = None;
-        for o in options {
-            let root = self.sum(&o);
-            let cost = self.b.cost(root);
-            if best.as_ref().is_none_or(|(c, _)| cost < *c) {
-                best = Some((cost, o));
+        Some(options)
+    }
+
+    /// `c·(g & mask)` plus an affine rest, for every bitwise function `g` of the (at most three)
+    /// atoms whose conjunction coefficients of two or more atoms, times some `c`, are the
+    /// group's: `Σ_S γ_S·(AND_S & M) = c·(g & M) − c·a_∅·M + Σ_i (γ_i − c·a_i)·(x_i & M)` with
+    /// `g = Σ_S a_S·AND_S` (Möbius over its table). `c` is solved from the equation with the
+    /// fewest factors of two in `a_S`, each solution checked against all of them.
+    fn affine_plus(
+        &mut self,
+        coef: &BTreeMap<u64, BitVec>,
+        mask: &BitVec,
+        support: &[u32],
+        atoms: &[u32],
+    ) -> Vec<Sum> {
+        let w = self.w;
+        let s = support.len();
+        if s < 2 {
+            return Vec::new();
+        }
+        // The group's coefficients by subset of support positions.
+        let mut d = vec![BitVec::zero(w); 1 << s];
+        for (&set, k) in coef {
+            let q = support
+                .iter()
+                .enumerate()
+                .filter(|&(_, &a)| set >> a & 1 == 1)
+                .fold(0usize, |q, (j, _)| q | 1 << j);
+            d[q] = *k;
+        }
+        if (0..1usize << s).all(|q| q.count_ones() < 2 || d[q].is_zero()) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for tt in 0..1u32 << (1 << s) {
+            let table = [u64::from(tt)];
+            let a = mobius(&table, s);
+            let wide: Vec<usize> = (0..1usize << s).filter(|q| q.count_ones() >= 2).collect();
+            let Some(&pivot) = wide
+                .iter()
+                .filter(|&&q| a[q] != 0)
+                .min_by_key(|&&q| (a[q].trailing_zeros(), q))
+            else {
+                continue;
+            };
+            let aq = BitVec::wrapping_from_i128(w, i128::from(a[pivot]));
+            let v = a[pivot].trailing_zeros();
+            if crate::facts::known::trailing_zeros(&d[pivot]) < v {
+                continue;
             }
+            // c = (d / 2^v)·u⁻¹ mod 2^(W−v), u the odd part of a.
+            let u = crate::facts::known::bv_lshr(&aq, v);
+            let dv = crate::facts::known::bv_lshr(&d[pivot], v);
+            let c0 = BitVec::bin_unchecked(BinOp::Mul, &dv, &super::poly::odd_inverse(&u));
+            let step =
+                crate::facts::known::bv_shl(&BitVec::one(w), u32::from(w.bits()).saturating_sub(v));
+            let mut chosen: Option<BitVec> = None;
+            for j in 0..1u64 << v.min(3) {
+                let c = BitVec::bin_unchecked(
+                    BinOp::Add,
+                    &c0,
+                    &BitVec::bin_unchecked(BinOp::Mul, &step, &BitVec::wrapping_from_u64(w, j)),
+                );
+                let fits = wide.iter().all(|&q| {
+                    BitVec::bin_unchecked(
+                        BinOp::Mul,
+                        &c,
+                        &BitVec::wrapping_from_i128(w, i128::from(a[q])),
+                    ) == d[q]
+                });
+                if fits {
+                    chosen = Some(c);
+                    break;
+                }
+            }
+            let Some(c) = chosen else {
+                continue;
+            };
+            let Some(g) = self.min_form(tt as u8 | if s == 2 { (tt as u8) << 4 } else { 0 }, atoms)
+            else {
+                continue;
+            };
+            let gm = self.masked(g, mask);
+            let a0 = BitVec::wrapping_from_i128(w, i128::from(a[0]));
+            let mut sum = Sum {
+                terms: vec![(gm, c)],
+                konst: Some(BitVec::un_unchecked(
+                    UnOp::Neg,
+                    &BitVec::bin_unchecked(
+                        BinOp::Mul,
+                        &BitVec::bin_unchecked(BinOp::Mul, &c, &a0),
+                        mask,
+                    ),
+                )),
+            };
+            for (j, &x) in atoms.iter().enumerate() {
+                let q = 1usize << j;
+                let r = BitVec::bin_unchecked(
+                    BinOp::Sub,
+                    &d[q],
+                    &BitVec::bin_unchecked(
+                        BinOp::Mul,
+                        &c,
+                        &BitVec::wrapping_from_i128(w, i128::from(a[q])),
+                    ),
+                );
+                if !r.is_zero() {
+                    let xm = self.masked(x, mask);
+                    sum.terms.push((xm, r));
+                }
+            }
+            out.push(sum);
         }
-        best.map(|(_, s)| s)
+        out
     }
 
     /// A monomial: the product of its symbols' powers (square and multiply).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mono(&mut self, m: &Mono) -> Option<u32> {
         let mut acc: Option<u32> = None;
         for &(s, e) in m {
@@ -843,7 +1240,6 @@ impl<'a> Render<'a> {
         Some(acc.unwrap_or_else(|| self.b.konst(&BitVec::one(self.w))))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn power(&mut self, x: u32, e: u32) -> u32 {
         let mut result: Option<u32> = None;
         let mut base = x;
@@ -863,4 +1259,17 @@ impl<'a> Render<'a> {
         }
         result.unwrap_or(x)
     }
+}
+
+/// The symbols every monomial of `p` contains.
+fn common_symbols(p: &Poly) -> Vec<Sym> {
+    let mut it = p.terms().keys();
+    let Some(first) = it.next() else {
+        return Vec::new();
+    };
+    let mut common: Vec<Sym> = first.iter().map(|&(s, _)| s).collect();
+    for m in it {
+        common.retain(|s| m.iter().any(|&(t, _)| t == *s));
+    }
+    common
 }

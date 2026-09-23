@@ -83,7 +83,11 @@ pub(super) fn step(
     cfg: &MbaConfig,
     n: u32,
 ) -> Result<Step, Stop> {
-    if !mixed_op(cx.node(n).op) {
+    // A solver that takes polynomials is also asked at constant left shifts (the arena spells
+    // `2^k·t` as `t << k`).
+    let poly = r.inner.mba.solver.polynomial_fragments();
+    let op = cx.node(n).op;
+    if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
     let (m, bindings) = match lower_id(cx, n, &cfg.limits) {
@@ -94,7 +98,9 @@ pub(super) fn step(
         }
     };
     let shape = m.shape();
-    if !shape.mixed {
+    // Mixed fragments, and polynomials (a product of two non-constants) for a solver that asks
+    // for them.
+    if !shape.mixed && !(shape.degree >= 2 && poly) {
         return Ok(Step::Normal(Fin::FINAL));
     }
     if shape.nodes < cfg.limits.min_nodes {

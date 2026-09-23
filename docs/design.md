@@ -1131,24 +1131,69 @@ pub mod mba {
   - *Recognition.* A degree-≤1 form is a bitwise function exactly when, in every class, the
     constant's bits there are all 0 or all 1 (`k_c`) and `k_c + Σ_{∅≠S⊆p} γ_{c,S}` is 0 or 1
     modulo `2^(W−τ_c)` at every corner `p`; that is the table.
+  - *Polynomials.* A product of two non-constants multiplies the operands' forms out
+    (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
+    `max_degree` the product is an atom). Symbols are treated as independent variables, which
+    is exact, and the form is reduced by exact rules that hold for any values of them: a
+    monomial whose factors' classes start at `τ` (summed) is a multiple of `2^τ`, so its
+    coefficient matters modulo `2^(W−τ)`; `(x)_κ = Π(x_i)_{κ_i}` is a multiple of `κ!`, so
+    `2^(W−v₂(κ!))·(x)_κ = 0`, and from the highest degree down each coefficient is brought into
+    `(−2^(m−1), 2^(m−1)]` for the larger modulus, the falling-factorial one moving the
+    difference into lower monomials (so `2^(W−1)·(x² + x)` is 0, and `−x²` stays `−x²`); a
+    symbol of a one-position class `{j}` has `m^e = 2^{j(e−1)}·m`. For polynomials in
+    independent atoms (no bitwise operator) the result is canonical. Relations between
+    symbols (`2^(W−1)·(AND_S·AND_T − AND_{S∪T}) = 0`) are not rules: the terms whose
+    coefficients are divisible by `2^(W−v₂(d!))` (`d` the degree; every univariate null
+    polynomial of degree `d` has such coefficients) are tried as a null part, whole and then
+    grouped by the atoms they mention, and dropped only when a certificate proves the part
+    zero.
+  - *Unmasking.* With several classes, products expand per class. Before rendering, each
+    shape (a monomial with classes erased), highest degree first, becomes one unmasked term
+    `c·Π AND_S^e` when subtracting `c` times its full expansion over the classes (`c` read
+    from class 0, which has every precision) leaves no term of that shape (checked with the
+    same exact reductions; the one-position rule applies only after this step).
   - *Rendering.* Candidates are built into one builder with local interning and costed by the
-    nodes their root reaches; the cheapest wins (then by an operator-weighted size, then by
-    structure), and only if it is strictly smaller than the input (else `NoSimpler`). A
-    degree-≤1 form renders as a bitwise function when it is one (the minimum-form table for at
-    most three atoms, the algebraic normal form, `((g ^ A) | B) & ~C` over classes whose tables
-    are `g`, `¬g`, all-ones and zero, or the or of masked groups), and otherwise over *groups of
-    classes* whose coefficient vectors can be chosen equal (each only defined modulo its
-    class's precision): per group the cheaper of the masked conjunction form and the masked
-    indicator form `b·M + Σ_{v≠b} (v − b)·(g_v & M)` over the distinct corner values `v`. A mask
-    covering every position disappears. Sums put positive coefficients first, powers of two as
-    shifts, and choose each sign so a constant already needed is reused.
+    nodes their root reaches, a shift's amount counted as the constant node it is once lifted;
+    the cheapest wins (then by an operator-weighted size, then by structure), and only if it
+    is strictly smaller than the input (else `NoSimpler`). A degree-≤1 form renders as a
+    bitwise function when it is one (the minimum-form table for at most three atoms, the
+    algebraic normal form, `((g ^ A) | B) & ~C` over classes whose tables are `g`, `¬g`,
+    all-ones and zero, or the or of masked groups), and otherwise over *groups of classes*
+    whose coefficient vectors can be chosen equal (each only defined modulo its class's
+    precision), also after taking out each atom set's widest-class coefficient as an unmasked
+    term: per group the masked conjunction form, the masked indicator forms
+    `b·M + Σ_{v≠b} (v − b)·(g_v & M)` over the distinct corner values `v` (every base `b`), and
+    `c·(g & M)` plus an affine rest for every bitwise function `g` of at most three atoms whose
+    conjunction coefficients `c` scales to the group's (solved 2-adically). With one group
+    every rendering is a candidate (constants merged); with several each group's is chosen in
+    turn for the cheapest whole. Every decomposition also comes with complements traded for
+    the constant (`c·~h = −c·h − c` and back). Sums put positive coefficients first, powers of
+    two as shifts, and choose each sign so a constant already needed is reused. Higher
+    degrees render as the linear part's cheapest decomposition plus the nonlinear part
+    monomial by monomial (powers by squaring), or factored: by a symbol common to all its
+    monomials, or by exact division (in graded lexicographic order, the divisor's leading
+    coefficient odd, which then always finds the quotient) by the normal form of an operand of
+    one of the input's products, recursively for the quotient; and the whole form as such a
+    product. Rendering is repeated with the factors the best candidate multiplies until none
+    is new, and the answer is normalized again (its own constants may give coarser classes)
+    until that renders nothing smaller: solving an answer again gives `NoSimpler`.
   - *Self-check.* The chosen answer is certified against the input (§ Certificates) within the
     solver's remaining budget: `Claim::Proved` when a certificate ran, `Claim::Sampled` when
     none fit but the refutation sample agrees (the gate then decides on its own evidence).
     Budget exhaustion before an answer is `Exhausted`; every decline is counted
-    (`NfStats`: fragments reached, atoms, candidates, certificates, declines by reason).
-  - On linear MBA it is never costlier than `SignatureSolver` (tested on random linear MBA at
-    widths 1 to 128: its conjunction form is one of the candidates, emitted more tightly).
+    (`NfStats`: fragments reached, atoms, candidates, null parts, certificates, declines by
+    reason). Steps count nodes, table words, monomial products and candidate nodes, and one
+    per 32 node evaluations of a certificate.
+  - It asks to see polynomials too (`MbaSolver::polynomial_fragments`, default false):
+    `Phase::Mba` then also asks about fragments without bitwise operators in which two
+    non-constants are multiplied, and about fragments rooted at a constant left shift (the
+    arena spells `2^k·t` as `t << k`).
+  - On linear MBA it is never costlier than `SignatureSolver`: its conjunction form is one of
+    the candidates, emitted more tightly. Measured on every question the deobfuscation
+    strategy asks on 1,200 linear MBA inputs in the benchmark corpus's shape (4,275
+    questions): none answered more expensively; end to end the results have 9,517 nodes
+    against 10,360 (smaller on 542 inputs, larger on 2, where later passes reach a
+    four-term form from the signature solver's unchanged input).
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
   lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
   records its options and `max_vars`). Only results accepted by the gate under the key's trust
