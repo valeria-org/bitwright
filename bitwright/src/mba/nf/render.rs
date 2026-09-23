@@ -303,6 +303,11 @@ pub(crate) struct Render<'a> {
     /// operations), and the most it may spend: past it, no more candidates are generated.
     pub(crate) work: u64,
     limit: u64,
+    /// [`poly`](Self::poly)'s renderings by form and depth, with the work and candidates they
+    /// cost, charged again on reuse (so the budget runs out where it would have), and the
+    /// factors they were rendered with.
+    memo: HashMap<(Poly, u32), (Vec<u32>, u64, u64)>,
+    memo_factors: Vec<Poly>,
 }
 
 /// Steps per term operation of exact division (a map update with a monomial key).
@@ -333,6 +338,8 @@ impl<'a> Render<'a> {
             products: HashMap::new(),
             work: 0,
             limit,
+            memo: HashMap::new(),
+            memo_factors: Vec::new(),
         }
     }
 
@@ -1017,6 +1024,29 @@ impl<'a> Render<'a> {
     /// monomials or by a factor of the input's products it is exactly divisible by; and the
     /// whole as a product of such a factor and its quotient.
     pub(crate) fn poly(&mut self, p: &Poly, factors: &[Poly], depth: u32) -> Vec<u32> {
+        // Products render their factor for every quotient: each form once per depth. Deeper
+        // calls pass the factors they were given.
+        if depth == 0 && self.memo_factors.as_slice() != factors {
+            self.memo.clear();
+            self.memo_factors = factors.to_vec();
+        }
+        let key = (p.clone(), depth);
+        if let Some((out, work, built)) = self.memo.get(&key) {
+            let (out, work, built) = (out.clone(), *work, *built);
+            self.spend(work);
+            self.built += built;
+            return out;
+        }
+        let (work, built) = (self.work, self.built);
+        let out = self.render_poly(p, factors, depth);
+        if !self.exhausted() {
+            let spent = (self.work - work, self.built - built);
+            self.memo.insert(key, (out.clone(), spent.0, spent.1));
+        }
+        out
+    }
+
+    fn render_poly(&mut self, p: &Poly, factors: &[Poly], depth: u32) -> Vec<u32> {
         const MAX_DEPTH: u32 = 2;
         if p.degree() <= 1 {
             return self.linear(p);

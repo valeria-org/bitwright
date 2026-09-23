@@ -11,7 +11,7 @@ mod classes;
 mod poly;
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use self::bits::{BitOp, Bits};
@@ -54,16 +54,21 @@ pub struct NfOptions {
     pub max_terms: u32,
     /// The highest degree of a normal form (a product of higher degree is an atom).
     pub max_degree: u32,
+    /// The most questions whose answers the solver remembers (0: none). The engine asks the
+    /// same question again as the expression around it changes; a remembered answer is the
+    /// one solving again would give, so this changes time, never answers.
+    pub memo: u32,
 }
 
 impl Default for NfOptions {
-    /// 16 atoms, 16 classes, 1024 monomials, degree 16.
+    /// 16 atoms, 16 classes, 1024 monomials, degree 16; 1024 answers remembered.
     fn default() -> Self {
         NfOptions {
             max_atoms: 16,
             max_classes: 16,
             max_terms: 1024,
             max_degree: 16,
+            memo: 1024,
         }
     }
 }
@@ -73,6 +78,7 @@ setters!(NfOptions {
     with_max_classes: max_classes: u32,
     with_max_terms: max_terms: u32,
     with_max_degree: max_degree: u32,
+    with_memo: memo: u32,
 });
 
 /// What the normal-form solver has done (telemetry; never affects answers).
@@ -120,6 +126,9 @@ pub struct NfStats {
     pub null_parts: u64,
     /// Declined: a candidate the self-check refuted (a bug; never expected).
     pub declined_internal: u64,
+    /// Questions answered from the memo (see [`NfOptions::memo`]); also counted by their
+    /// answer above, but not in the work counters.
+    pub memo_hits: u64,
 }
 
 /// The native solver for linear, semi-linear and polynomial MBA, from exact normal forms at
@@ -157,6 +166,40 @@ pub struct NormalFormSolver {
     opts: NfOptions,
     id: String,
     stats: Mutex<NfStats>,
+    memo: Mutex<Memo>,
+}
+
+/// A remembered question: its content hash and budget.
+type MemoKey = ([u64; 2], u64);
+
+/// Answers by question and budget, oldest forgotten first. An entry keeps its question, which
+/// must equal the one asked (a hash collision is a miss, never someone else's answer).
+#[derive(Debug, Default)]
+struct Memo {
+    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer)>,
+    order: VecDeque<MemoKey>,
+}
+
+impl Memo {
+    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<MbaAnswer> {
+        let (q, a) = self.answers.get(key)?;
+        (q == p).then(|| a.clone())
+    }
+
+    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer) {
+        if capacity == 0 {
+            return;
+        }
+        if self.answers.insert(key, (p.clone(), a.clone())).is_none() {
+            self.order.push_back(key);
+        }
+        while self.answers.len() > capacity {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            self.answers.remove(&old);
+        }
+    }
 }
 
 impl Default for NormalFormSolver {
@@ -176,6 +219,7 @@ impl NormalFormSolver {
             opts,
             id,
             stats: Mutex::new(NfStats::default()),
+            memo: Mutex::new(Memo::default()),
         }
     }
 
@@ -211,7 +255,21 @@ impl MbaSolver for NormalFormSolver {
             calls: 1,
             ..NfStats::default()
         };
-        let answer = solve(p, &self.opts, budget, &mut tally);
+        let key = (p.key(), budget.steps);
+        let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p));
+        let answer = match remembered {
+            Some(a) => {
+                tally.memo_hits += 1;
+                a
+            }
+            None => {
+                let a = solve(p, &self.opts, budget, &mut tally);
+                if let Ok(mut m) = self.memo.lock() {
+                    m.put(self.opts.memo as usize, key, p, &a);
+                }
+                a
+            }
+        };
         match &answer {
             MbaAnswer::Simplified { claim, .. } => {
                 tally.simplified += 1;
@@ -265,6 +323,7 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.declined_terms += t.declined_terms;
     s.null_parts += t.null_parts;
     s.declined_internal += t.declined_internal;
+    s.memo_hits += t.memo_hits;
 }
 
 /// Why a question was declined.

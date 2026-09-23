@@ -22,6 +22,12 @@
   a fixed point (solving an answer again finds nothing smaller). Its work, rendering included,
   is bounded by the solver budget. Not the default solver; `docs/proposals/mba-defaults.md`
   proposes it (and backend certificates untrusted) as the default, with a corpus diff.
+- **Memo.** `NormalFormSolver` remembers its last answers (`NfOptions::memo`, 1,024 by
+  default), by question and budget: the engine asks some questions again as the expression
+  around them changes, and a remembered answer is the one solving again would give. Rendering
+  also renders each form once per product depth, charging the same work on reuse. Results are
+  unchanged; on the corpus diff the solver takes a third less time on random DAGs, and half to
+  three quarters less on nonlinear MBA.
 - **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
   solver that returns true is also asked about fragments without bitwise operators in which
   two non-constants are multiplied, and fragments rooted at a constant left shift.

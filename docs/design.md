@@ -1204,6 +1204,13 @@ pub mod mba {
     stops generating candidates when the budget runs out, and the answer is then
     `Exhausted`: a question's time is bounded by its budget (about 40 to 60 ns per step on
     the benchmark machine, so tens of milliseconds at the default `2^20`).
+  - *Memo.* The engine asks about nested fragments bottom-up, and asks some again as the DAG
+    around them changes. The solver remembers its last `NfOptions::memo` answers (1,024 by
+    default) by question and budget, keeping each question to compare on use (a hash
+    collision is a miss), and rendering keeps each form's renderings per product depth with
+    the work they cost, charged again on reuse. Neither changes an answer or where the budget
+    runs out (tested with the memo off, on, and forgetting constantly). On the corpus diff
+    they take a third off the solver's time on random DAGs, and more on nonlinear MBA.
   - It asks to see polynomials too (`MbaSolver::polynomial_fragments`, default false):
     `Phase::Mba` then also asks about fragments without bitwise operators in which two
     non-constants are multiplied, and about fragments rooted at a constant left shift (the

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bitwright::engine::{Budget, Engine, Run, Strategy};
 use bitwright::mba::{
-    Claim, MNode, MOp, MbaAnswer, MbaBudget, MbaConfig, MbaExpr, MbaSolver, MbaTrust,
+    Claim, MNode, MOp, MbaAnswer, MbaBudget, MbaConfig, MbaExpr, MbaSolver, MbaTrust, NfOptions,
     NormalFormSolver, SignatureSolver,
 };
 use bitwright::{BitVec, Bounded, Context, Expr, ParseOptions, SymbolKey, Width};
@@ -581,6 +581,89 @@ fn results_are_deterministic_and_independent_of_construction_order() {
         }
         assert!(shown.windows(2).all(|p| p[0] == p[1]), "{shown:?}");
     }
+}
+
+/// A solver that records every question and its answer.
+struct Recording {
+    inner: NormalFormSolver,
+    asked: std::sync::Mutex<Vec<(MbaExpr, MbaBudget, MbaAnswer)>>,
+}
+
+impl MbaSolver for Recording {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn polynomial_fragments(&self) -> bool {
+        true
+    }
+    fn solve(&self, p: &MbaExpr, b: &MbaBudget) -> MbaAnswer {
+        let a = self.inner.solve(p, b);
+        self.asked.lock().unwrap().push((p.clone(), *b, a.clone()));
+        a
+    }
+}
+
+#[test]
+fn the_memo_changes_nothing() {
+    // Memo off, the default one, and one so small it forgets all the time: the same results
+    // through the engine, question by question, at any budget.
+    let solvers = || {
+        [0u32, 1024, 2].map(|memo| {
+            Arc::new(Recording {
+                inner: NormalFormSolver::new(NfOptions::default().with_memo(memo)),
+                asked: Default::default(),
+            })
+        })
+    };
+    let recorders = solvers();
+    let engines: Vec<Engine> = recorders
+        .iter()
+        .map(|r| engine(r.clone() as Arc<dyn MbaSolver>))
+        .collect();
+    let o = ParseOptions::width(Width::W64);
+    let corpus = linear_corpus(0x3e30, 60).into_iter().chain([
+        "(x & y)*(x | y) + (x & ~y)*(~x & y) + ((x + y) & z) + ((x + y) & ~z)".to_string(),
+        "x*(x & y) + y*(x & y) - (x & y)*(x & y) + (x ^ 0x10) + 2*(x & 0x10)".to_string(),
+        "((x ^ y) + 2*(x & y)) & z | ((x >>u 3) + (y >>u 3)) ^ (x * y + z)".to_string(),
+    ]);
+    for src in corpus {
+        let outs: Vec<String> = engines
+            .iter()
+            .map(|eng| {
+                let mut cx = Context::new();
+                let e = cx.parse(&src, &o).unwrap();
+                let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+                format!("{} {:?}", cx.display(out.roots[0].expr), out.stats.mba)
+            })
+            .collect();
+        assert!(outs.windows(2).all(|p| p[0] == p[1]), "{src}: {outs:#?}");
+    }
+    let asked: Vec<_> = recorders
+        .iter()
+        .map(|r| r.asked.lock().unwrap().clone())
+        .collect();
+    assert!(asked.windows(2).all(|p| p[0] == p[1]));
+    // Every question again, and at smaller budgets, against fresh solvers and the used ones.
+    let fresh = solvers();
+    let mut hits = 0;
+    for (p, b, a) in &asked[0] {
+        for steps in [b.steps, 1 << 12, 300] {
+            let budget = MbaBudget::default().with_steps(steps);
+            let want = if steps == b.steps {
+                a.clone()
+            } else {
+                fresh[0].solve(p, &budget)
+            };
+            for s in fresh.iter().chain(&recorders) {
+                assert_eq!(s.solve(p, &budget), want, "{p:?} at {steps}");
+            }
+        }
+        hits += 1;
+    }
+    assert!(hits > 50, "{hits}");
+    let used = recorders[1].inner.stats();
+    assert!(used.memo_hits > 0, "{used:?}");
+    assert_eq!(recorders[0].inner.stats().memo_hits, 0);
 }
 
 #[test]

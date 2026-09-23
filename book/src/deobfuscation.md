@@ -116,7 +116,9 @@ so `((x ^ y) + 2·(x & y)) & z` is `(x + y) & z` and `((x + y) & z) + ((x + y) &
 Every answer is certified against its input before it is returned, and the evidence gate checks
 it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
 certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
-for a later call with more budget. It is not the default solver: pass it to `mba_solver`.
+for a later call with more budget. It remembers its recent answers (`NfOptions::memo`), which
+saves time when the engine asks again and never changes an answer. It is not the default
+solver: pass it to `mba_solver`.
 
 ```rust
 use std::sync::Arc;
