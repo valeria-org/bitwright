@@ -9,9 +9,12 @@ use crate::hash::IdMap;
 use super::bits::{self, Bits, anf, mobius, table8};
 use super::classes::{Classes, FULL};
 use super::poly::{Mono, Poly, Sym};
+use super::synth;
 use crate::engine::pass::bitwise::{T, min_forms};
 use crate::facts::known::{bv_and, bv_not, bv_or, count_ones, trailing_zeros};
+use crate::mba::certify;
 use crate::mba::expr::{MNode, MOp, MbaExpr};
+use crate::mba::solve::Verdict;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
@@ -308,10 +311,31 @@ pub(crate) struct Render<'a> {
     /// factors they were rendered with.
     memo: HashMap<(Poly, u32), (Vec<u32>, u64, u64)>,
     memo_factors: Vec<Poly>,
+    /// What synthesis did.
+    pub(crate) synth: SynthTally,
 }
 
 /// Steps per term operation of exact division (a map update with a monomial key).
 const DIVISION_STEP: u64 = 4;
+
+/// A table hit for a normal form (see [`Render::synthesize`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Hit {
+    /// Proved equal to the normal form, the atoms taken as independent variables.
+    Exact(u32),
+    /// Neither proved nor refuted (no certificate fits): at most a sampled answer.
+    Unproved(u32),
+}
+
+/// What synthesis did (telemetry).
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct SynthTally {
+    pub(crate) lookups: u64,
+    pub(crate) hits: u64,
+    pub(crate) proved: u64,
+    pub(crate) refuted: u64,
+    pub(crate) unproved: u64,
+}
 
 /// A linear combination to emit: terms and a constant.
 #[derive(Clone, Debug, Default)]
@@ -340,6 +364,7 @@ impl<'a> Render<'a> {
             limit,
             memo: HashMap::new(),
             memo_factors: Vec::new(),
+            synth: SynthTally::default(),
         }
     }
 
@@ -1119,6 +1144,119 @@ impl<'a> Render<'a> {
         }
         self.built += out.len() as u64;
         out
+    }
+
+    /// The synthesis table's smallest expression with `nf`'s values at the probes, when `nf`
+    /// mentions one to three atoms and that expression costs less than `bar`. It is exact only
+    /// once a certificate proves it equal to `nf` with the atoms as independent variables (then
+    /// also for their actual values); a refuted one is dropped.
+    pub(crate) fn synthesize(&mut self, nf: &Poly, bar: Option<Cost>) -> Option<Hit> {
+        let mask = nf.atoms();
+        let k = mask.count_ones() as usize;
+        if k == 0 || k > 3 {
+            return None;
+        }
+        let ids: Vec<u32> = (0..64u32).filter(|&a| mask >> a & 1 == 1).collect();
+        if !self.spend((synth::PROBES * nf.len()) as u64) {
+            return None;
+        }
+        self.synth.lookups += 1;
+        let w = self.w;
+        // The values at the probes, atom `ids[j]` taking coordinate `j`: truncated at narrower
+        // widths, the low 64 bits at wider ones (where the table is read by those too).
+        let mask = u64::MAX >> 64u16.saturating_sub(w.bits());
+        let mut point = vec![0u64; ids[k - 1] as usize + 1];
+        let mut values = [0u64; synth::PROBES];
+        for (i, slot) in values.iter_mut().enumerate() {
+            let p = synth::probe(i);
+            for (j, &a) in ids.iter().enumerate() {
+                point[a as usize] = p[j] & mask;
+            }
+            *slot = nf.eval_low(self.classes, &point)? & mask;
+        }
+        let table = synth::table();
+        let i = table.lookup(w.bits(), &values)?;
+        let node = self.table_node(table, i, &ids)?;
+        if bar.is_some_and(|b| self.b.cost(node) >= b) {
+            return None;
+        }
+        self.synth.hits += 1;
+        let skeleton = self.skeleton(nf, &ids)?;
+        let hit = table.expr(i, w, k)?;
+        let effort = self
+            .limit
+            .saturating_sub(self.work)
+            .saturating_mul(super::EVALS_PER_STEP);
+        let report = certify::check(&skeleton, &hit, effort);
+        self.spend(report.work.div_ceil(super::EVALS_PER_STEP).max(1));
+        match report.verdict {
+            Verdict::Proved => {
+                self.synth.proved += 1;
+                Some(Hit::Exact(node))
+            }
+            Verdict::Refuted => {
+                self.synth.refuted += 1;
+                None
+            }
+            _ => {
+                self.synth.unproved += 1;
+                Some(Hit::Unproved(node))
+            }
+        }
+    }
+
+    /// Table entry `i` in this builder, variable `j` being atom `ids[j]`.
+    fn table_node(&mut self, t: &synth::Table, i: u32, ids: &[u32]) -> Option<u32> {
+        let mut node: HashMap<u32, u32> = HashMap::new();
+        for j in t.needed(i) {
+            let e = t.entry(j);
+            let args: Option<Vec<u32>> = e.args[..e.op.arity()]
+                .iter()
+                .map(|a| node.get(a).copied())
+                .collect();
+            let args = args?;
+            let x = match e.op {
+                synth::Op::Var(v) => self.atom(*ids.get(usize::from(v))?)?,
+                synth::Op::One => self.b.konst(&BitVec::one(self.w)),
+                op if args.len() == 1 => self.b.un(op.mop()?, args[0]),
+                op => self.b.bin(op.mop()?, args[0], *args.get(1)?),
+            };
+            node.insert(j, x);
+        }
+        node.get(&i).copied()
+    }
+
+    /// `nf` over `ids.len()` fresh variables, variable `j` standing for atom `ids[j]`, as the
+    /// sum of its monomials.
+    fn skeleton(&self, nf: &Poly, ids: &[u32]) -> Option<MbaExpr> {
+        let w = self.w;
+        let k = ids.len();
+        let mut map: Vec<u32> = (0..64).collect();
+        for (j, &a) in ids.iter().enumerate() {
+            map[a as usize] = j as u32;
+        }
+        let nf = nf.rename_atoms(&map);
+        let vars: Option<Vec<MbaExpr>> = (0..k as u32)
+            .map(|j| {
+                let mut m = MbaExpr::new(vec![w; k]);
+                m.push(MOp::Var(j), &[]).ok()?;
+                Some(m)
+            })
+            .collect();
+        let vars = vars?;
+        let mut r = Render::new(vec![w; k], w, self.classes, &vars, u64::MAX);
+        let mut sum = Sum {
+            terms: Vec::new(),
+            konst: Some(nf.konst()),
+        };
+        for (m, c) in nf.terms() {
+            if !m.is_empty() {
+                let t = r.mono(m)?;
+                sum.terms.push((t, *c));
+            }
+        }
+        let root = r.sum(&sum);
+        r.b.finish(root)
     }
 
     /// `f·q`, each rendered at its cheapest.

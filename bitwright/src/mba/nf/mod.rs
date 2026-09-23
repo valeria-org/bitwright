@@ -10,6 +10,7 @@ mod bits;
 mod classes;
 mod poly;
 mod render;
+mod synth;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -58,10 +59,15 @@ pub struct NfOptions {
     /// same question again as the expression around it changes; a remembered answer is the
     /// one solving again would give, so this changes time, never answers.
     pub memo: u32,
+    /// Bounded enumerative synthesis: a normal form over at most three atoms is also looked up
+    /// in a table of the smallest expressions (up to seven nodes) by its values at fixed probe
+    /// points. A hit is a candidate once a certificate proves it equal; one no certificate can
+    /// decide is at most a sampled answer (`Claim::Sampled`).
+    pub synthesis: bool,
 }
 
 impl Default for NfOptions {
-    /// 16 atoms, 16 classes, 1024 monomials, degree 16; 1024 answers remembered.
+    /// 16 atoms, 16 classes, 1024 monomials, degree 16; 1024 answers remembered; synthesis on.
     fn default() -> Self {
         NfOptions {
             max_atoms: 16,
@@ -69,6 +75,7 @@ impl Default for NfOptions {
             max_terms: 1024,
             max_degree: 16,
             memo: 1024,
+            synthesis: true,
         }
     }
 }
@@ -79,6 +86,7 @@ setters!(NfOptions {
     with_max_terms: max_terms: u32,
     with_max_degree: max_degree: u32,
     with_memo: memo: u32,
+    with_synthesis: synthesis: bool,
 });
 
 /// What the normal-form solver has done (telemetry; never affects answers).
@@ -129,16 +137,30 @@ pub struct NfStats {
     /// Questions answered from the memo (see [`NfOptions::memo`]); also counted by their
     /// answer above, but not in the work counters.
     pub memo_hits: u64,
+    /// Synthesis (see [`NfOptions::synthesis`]): normal forms looked up...
+    pub synth_lookups: u64,
+    /// ...hits cheaper than every other candidate...
+    pub synth_hits: u64,
+    /// ...of which proved equal by a certificate...
+    pub synth_proved: u64,
+    /// ...refuted (values that agree at the probes only)...
+    pub synth_refuted: u64,
+    /// ...or undecided (no certificate fits)...
+    pub synth_unproved: u64,
+    /// ...and answers returned on an undecided hit, checked at the refutation sample only.
+    pub synth_sampled: u64,
 }
 
 /// The native solver for linear, semi-linear and polynomial MBA, from exact normal forms at
-/// full width; other subterms are atoms. Every answer is certified
-/// against its input by bitwright's own certificates before it is returned (`Claim::Proved`),
-/// or, when the certificate is over the budget, checked at the refutation sample
-/// (`Claim::Sampled`, which the evidence gate re-checks). Work is counted in
-/// [`MbaBudget::steps`]: one step per node visited, table word combined, monomial product or
-/// candidate node, and one per 32 node evaluations of a certificate. Answers are
-/// deterministic.
+/// full width; other subterms are atoms. A normal form over at most three atoms is also
+/// looked up in a table of small expressions ([`NfOptions::synthesis`]). Every answer is
+/// certified against its input by bitwright's own certificates before it is returned
+/// (`Claim::Proved`), or, when no certificate fits, checked at the refutation sample
+/// (`Claim::Sampled`, which the evidence gate re-checks): exact by construction, except a
+/// table hit no certificate could decide. Work is counted in [`MbaBudget::steps`]: one step
+/// per node visited, table word combined, monomial product, term or table entry rendered, and
+/// one per 32 node evaluations of a certificate. Answers are deterministic; recent ones are
+/// remembered ([`NfOptions::memo`]).
 ///
 /// ```
 /// use bitwright::mba::{MOp, MbaAnswer, MbaBudget, MbaExpr, MbaSolver, NormalFormSolver};
@@ -212,8 +234,12 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v1;atoms={};classes={};terms={};degree={}",
-            opts.max_atoms, opts.max_classes, opts.max_terms, opts.max_degree
+            "bitwright.nf.v1;atoms={};classes={};terms={};degree={};synth={}",
+            opts.max_atoms,
+            opts.max_classes,
+            opts.max_terms,
+            opts.max_degree,
+            if opts.synthesis { synth::MAX_SIZE } else { 0 }
         );
         NormalFormSolver {
             opts,
@@ -324,6 +350,21 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.null_parts += t.null_parts;
     s.declined_internal += t.declined_internal;
     s.memo_hits += t.memo_hits;
+    s.synth_lookups += t.synth_lookups;
+    s.synth_hits += t.synth_hits;
+    s.synth_proved += t.synth_proved;
+    s.synth_refuted += t.synth_refuted;
+    s.synth_unproved += t.synth_unproved;
+    s.synth_sampled += t.synth_sampled;
+}
+
+/// Adds a rendering's synthesis counts.
+fn add_synth(s: &mut NfStats, t: &render::SynthTally) {
+    s.synth_lookups += t.lookups;
+    s.synth_hits += t.hits;
+    s.synth_proved += t.proved;
+    s.synth_refuted += t.refuted;
+    s.synth_unproved += t.unproved;
 }
 
 /// Why a question was declined.
@@ -725,6 +766,7 @@ struct Normal {
     factors: Vec<Poly>,
     input_cost: u32,
     work: Steps,
+    synthesis: bool,
 }
 
 fn normalize(
@@ -849,6 +891,13 @@ fn normalize(
                 {
                     cands.push(root);
                 }
+                if opts.synthesis {
+                    let bar = r.best(&cands).map(|b| r.b.cost(b));
+                    if let Some(render::Hit::Exact(x)) = r.synthesize(&form, bar) {
+                        cands.push(x);
+                    }
+                    add_synth(tally, &r.synth);
+                }
                 {
                     use certify::Meter;
                     work.charge(r.work.max(1))
@@ -888,6 +937,7 @@ fn normalize(
         factors,
         input_cost,
         work,
+        synthesis: opts.synthesis,
     })
 }
 
@@ -965,6 +1015,13 @@ fn candidates(r: &mut Render<'_>, nf: &Poly, factors: &[Poly]) -> Vec<u32> {
     r.poly(nf, factors, 0)
 }
 
+/// A normal form's cheapest rendering, and a cheaper synthesized one no certificate decided.
+#[derive(Default)]
+struct Rendered {
+    exact: Option<(render::Cost, MbaExpr)>,
+    unproved: Option<(render::Cost, MbaExpr)>,
+}
+
 /// The cheapest rendering of `n`: rendered, then again with the factors the best candidate
 /// multiplies, until none is new (a few rounds), so the answer is as good as the factors its
 /// own products offer. Rendering cut short by the budget is [`Decline::Exhausted`]: what it
@@ -974,13 +1031,26 @@ fn best_rendering(
     n: &Normal,
     work: &mut Steps,
     tally: &mut NfStats,
-) -> Result<Option<(render::Cost, MbaExpr)>, Decline> {
+) -> Result<Rendered, Decline> {
     use certify::Meter;
     let mut factors = n.factors.clone();
     let mut best: Option<(render::Cost, MbaExpr)> = None;
-    for _ in 0..3 {
+    let mut unproved = None;
+    for round in 0..3 {
         let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left);
-        let cands = candidates(&mut r, &n.nf, &factors);
+        let mut cands = candidates(&mut r, &n.nf, &factors);
+        // Synthesis does not depend on the factors: the first round is enough.
+        if round == 0 && n.synthesis {
+            let bar = r.best(&cands).map(|b| r.b.cost(b));
+            match r.synthesize(&n.nf, bar) {
+                Some(render::Hit::Exact(x)) => cands.push(x),
+                Some(render::Hit::Unproved(x)) => {
+                    unproved = r.b.finish(x).map(|e| (r.b.cost(x), e));
+                }
+                None => {}
+            }
+            add_synth(tally, &r.synth);
+        }
         tally.candidates += r.built;
         if r.exhausted() {
             return Err(Decline::Exhausted);
@@ -1007,7 +1077,12 @@ fn best_rendering(
         }
         factors.extend(more);
     }
-    Ok(best)
+    // Undecided hits count only where they beat every exact rendering.
+    let unproved = unproved.filter(|(c, _)| best.as_ref().is_none_or(|(b, _)| c < b));
+    Ok(Rendered {
+        exact: best,
+        unproved,
+    })
 }
 
 fn run(
@@ -1019,40 +1094,72 @@ fn run(
     let n = normalize(p, opts, budget, tally)?;
     let input_cost = n.input_cost;
     let mut work = Steps::new(n.work.left);
-    let Some((mut cost, mut answer)) = best_rendering(p, &n, &mut work, tally)? else {
-        return Ok(MbaAnswer::NoSimpler);
-    };
-    if cost.0 >= input_cost {
-        return Ok(MbaAnswer::NoSimpler);
-    }
-    // A fixed point: the answer, normalized again (its own constants may give coarser bit
-    // classes, its own products other factors), until that renders nothing smaller. Solving
-    // the answer again then finds nothing smaller either.
-    for _ in 0..3 {
-        let mut scratch = NfStats::default();
-        let again = normalize(
-            &answer,
-            opts,
-            &MbaBudget::default().with_steps(work.left),
-            &mut scratch,
-        )
-        .and_then(|m| {
-            let mut w2 = Steps::new(m.work.left);
-            let r = best_rendering(&answer, &m, &mut w2, &mut scratch);
-            let spent = work.left - w2.left.min(work.left);
-            work = Steps::new(work.left - spent);
-            r
-        });
-        tally.candidates += scratch.candidates;
-        match again {
-            Ok(Some((c, e))) if c < cost => {
-                cost = c;
-                answer = e;
+    let rendered = best_rendering(p, &n, &mut work, tally)?;
+    let mut exact = rendered.exact.filter(|(c, _)| c.0 < input_cost);
+    if let Some((mut cost, mut answer)) = exact.take() {
+        // A fixed point: the answer, normalized again (its own constants may give coarser bit
+        // classes, its own products other factors), until that renders nothing smaller.
+        // Solving the answer again then finds nothing smaller either.
+        for _ in 0..3 {
+            let mut scratch = NfStats::default();
+            let again = normalize(
+                &answer,
+                opts,
+                &MbaBudget::default().with_steps(work.left),
+                &mut scratch,
+            )
+            .and_then(|m| {
+                let mut w2 = Steps::new(m.work.left);
+                let r = best_rendering(&answer, &m, &mut w2, &mut scratch);
+                let spent = work.left - w2.left.min(work.left);
+                work = Steps::new(work.left - spent);
+                r
+            });
+            tally.candidates += scratch.candidates;
+            match again.map(|r| r.exact) {
+                Ok(Some((c, e))) if c < cost => {
+                    cost = c;
+                    answer = e;
+                }
+                Err(Decline::Exhausted) => return Err(Decline::Exhausted),
+                _ => break,
             }
-            Err(Decline::Exhausted) => return Err(Decline::Exhausted),
-            _ => break,
+        }
+        exact = Some((cost, answer));
+    }
+    // A synthesized form no certificate decided, cheaper than every exact answer: only with a
+    // certificate against the input, else on the refutation sample as a sampled answer.
+    if let Some((c, hit)) = rendered.unproved
+        && c.0 < input_cost
+        && exact.as_ref().is_none_or(|(e, _)| c < *e)
+    {
+        let report = certify_within(p, &hit, &mut work);
+        tally.certificates.record(&report);
+        match report.verdict {
+            Verdict::Proved => {
+                return Ok(MbaAnswer::Simplified {
+                    expr: hit,
+                    claim: Claim::Proved,
+                });
+            }
+            Verdict::Refuted => tally.synth_refuted += 1,
+            _ => {
+                let seed = crate::hash::combine(p.key()[0], hit.key()[1]);
+                let points = certify::sample_points(p.vars(), &[p, &hit], seed);
+                if certify::refute(p, &hit, &points).is_none() {
+                    tally.synth_sampled += 1;
+                    return Ok(MbaAnswer::Simplified {
+                        expr: hit,
+                        claim: Claim::Sampled,
+                    });
+                }
+                tally.synth_refuted += 1;
+            }
         }
     }
+    let Some((_, answer)) = exact else {
+        return Ok(MbaAnswer::NoSimpler);
+    };
     // The self-check: the answer against the input, by a certificate (within what is left),
     // else at the refutation sample only.
     let report = certify_within(p, &answer, &mut work);

@@ -11,6 +11,7 @@ use bitwright::engine::{Engine, MbaStats, Strategy};
 use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{Bounded, Context, Expr, ParseOptions, PrintOptions};
 
+use crate::counter::Counters;
 use crate::workload::{self, Dag};
 
 /// An input, built into a fresh context.
@@ -23,6 +24,8 @@ struct Results {
     sizes: Vec<u32>,
     before: u64,
     nanos: u128,
+    /// User-space instructions retired, where counters are available.
+    instructions: Option<u64>,
     mba: MbaStats,
 }
 
@@ -58,11 +61,13 @@ fn add(total: &mut MbaStats, s: &MbaStats) {
 
 /// Runs `eng` on each input (built by `build` in a fresh context).
 fn run(eng: &Engine, inputs: &[Input]) -> Results {
+    let mut counters = Counters::open();
     let mut r = Results {
         texts: Vec::new(),
         sizes: Vec::new(),
         before: 0,
         nanos: 0,
+        instructions: counters.counts_instructions().then_some(0),
         mba: MbaStats::default(),
     };
     for build in inputs {
@@ -70,10 +75,13 @@ fn run(eng: &Engine, inputs: &[Input]) -> Results {
         let e = build(&mut cx);
         r.before += u64::from(size(&mut cx, e));
         let t = Instant::now();
+        let start = counters.start();
         let out = eng
             .run(&mut cx, &[e], Default::default())
             .expect("simplify");
+        let reading = counters.stop(start);
         r.nanos += t.elapsed().as_nanos();
+        r.instructions = r.instructions.zip(reading.instructions).map(|(a, b)| a + b);
         let x = out.roots[0].expr;
         r.sizes.push(size(&mut cx, x));
         r.texts.push(
@@ -93,6 +101,15 @@ fn parsed(texts: Vec<String>, bits: u16) -> Vec<Input> {
             Box::new(move |cx: &mut Context| cx.parse(&t, &o).expect("corpus parses")) as Input
         })
         .collect()
+}
+
+/// Instructions (the measure that does not move with other load) and wall time.
+fn cost(r: &Results) -> String {
+    let ms = r.nanos as f64 / 1e6;
+    match r.instructions {
+        Some(n) => format!("{:.2} G instr ({ms:.0} ms)", n as f64 / 1e9),
+        None => format!("{ms:.1} ms"),
+    }
 }
 
 /// Prints the report.
@@ -137,7 +154,7 @@ pub fn report() {
         corpora.push((format!("random DAGs, {bits} bits"), dags));
     }
     println!(
-        "| corpus | inputs | nodes before | current | trust off only | proposed | changed | smaller | larger | time current | time proposed |"
+        "| corpus | inputs | nodes before | current | trust off only | proposed | changed | smaller | larger | cost current | cost proposed |"
     );
     println!("|-|-|-|-|-|-|-|-|-|-|-|");
     let mut examples: Vec<String> = Vec::new();
@@ -165,14 +182,14 @@ pub fn report() {
             .filter(|&i| a.texts[i] != t.texts[i])
             .count();
         println!(
-            "| {name} | {} | {} | {} | {} ({trust_changed} changed) | {} | {changed} | {smaller} | {larger} | {:.1} ms | {:.1} ms |",
+            "| {name} | {} | {} | {} | {} ({trust_changed} changed) | {} | {changed} | {smaller} | {larger} | {} | {} |",
             inputs.len(),
             a.before,
             total(&a),
             total(&t),
             total(&b),
-            a.nanos as f64 / 1e6,
-            b.nanos as f64 / 1e6,
+            cost(&a),
+            cost(&b),
         );
         answers.push((name.clone(), [a.mba, t.mba, b.mba]));
     }

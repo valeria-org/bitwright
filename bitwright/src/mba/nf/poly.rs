@@ -249,6 +249,57 @@ impl Poly {
             .fold(0, |acc, (s, _)| acc | s.set)
     }
 
+    /// The low 64 bits of the value where atom `i` has low 64 bits `atoms[i]` (`None` if it
+    /// mentions an atom beyond them). A sum of products of masked conjunctions carries nothing
+    /// downward, so they depend on nothing else; at narrower widths, truncate.
+    pub(crate) fn eval_low(&self, classes: &Classes, atoms: &[u64]) -> Option<u64> {
+        let mut total = 0u64;
+        for (m, c) in &self.terms {
+            let mut prod = c.limbs()[0];
+            for &(s, e) in m {
+                let mut v = classes.mask(usize::from(s.class)).limbs()[0];
+                let mut set = s.set;
+                while set != 0 {
+                    v &= *atoms.get(set.trailing_zeros() as usize)?;
+                    set &= set - 1;
+                }
+                prod = prod.wrapping_mul(v.wrapping_pow(e));
+            }
+            total = total.wrapping_add(prod);
+        }
+        Some(total)
+    }
+
+    /// The same polynomial with atom `i` renamed `map[i]` (a bijection on the atoms it
+    /// mentions).
+    pub(crate) fn rename_atoms(&self, map: &[u32]) -> Poly {
+        let mut out = Poly::zero(self.w);
+        for (m, c) in &self.terms {
+            let mut n: Mono = m
+                .iter()
+                .map(|&(s, e)| {
+                    let mut set = 0u64;
+                    let mut old = s.set;
+                    while old != 0 {
+                        let a = old.trailing_zeros() as usize;
+                        set |= 1 << map.get(a).copied().unwrap_or(a as u32);
+                        old &= old - 1;
+                    }
+                    (
+                        Sym {
+                            set,
+                            class: s.class,
+                        },
+                        e,
+                    )
+                })
+                .collect();
+            n.sort_unstable_by_key(|x| x.0);
+            out.add_term(n, c);
+        }
+        out
+    }
+
     /// The terms whose degree satisfies `keep`.
     pub(crate) fn part(&self, keep: impl Fn(u32) -> bool) -> Poly {
         Poly {

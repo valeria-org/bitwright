@@ -1,13 +1,15 @@
-//! The native MBA solver and prover on arbitrary byte-encoded `MbaExpr`s: no panic; every
-//! `Simplified` answer has the input's variables and width and agrees with it at sampled
-//! points (so the evidence gate either proves it or refuses it for lack of proof, never for a
-//! refutation); the prover never refutes an answer, and never proves a pair that differs at a
-//! sampled point.
+//! The native MBA solver and prover on arbitrary byte-encoded `MbaExpr`s: no panic; without
+//! synthesis every `Simplified` answer is exact by construction, so it has the input's
+//! variables and width and agrees with it at sampled points (the evidence gate either proves
+//! it or refuses it for lack of proof, never for a refutation), and the prover never refutes
+//! it. With synthesis, a `Proved` answer is held to the same; a `Sampled` one may be a table
+//! hit no certificate could decide, so only its shape is checked. The prover never proves a
+//! pair that differs at a sampled point.
 #![no_main]
 
 use bitwright::mba::{
-    EquivalenceProver, MOp, MbaAnswer, MbaBudget, MbaExpr, MbaSolver, NativeProver,
-    NormalFormSolver, Verdict,
+    Claim, EquivalenceProver, MOp, MbaAnswer, MbaBudget, MbaExpr, MbaSolver, NativeProver,
+    NfOptions, NormalFormSolver, Verdict,
 };
 use bitwright::{BitVec, Width};
 use libfuzzer_sys::fuzz_target;
@@ -128,14 +130,20 @@ fuzz_target!(|data: &[u8]| {
     };
     let budget = MbaBudget::default().with_steps(1 << (10 + b.byte() % 12));
     let prover = NativeProver::default();
-    if let MbaAnswer::Simplified { expr, .. } = NormalFormSolver::default().solve(&m, &budget) {
-        assert_eq!(expr.vars(), m.vars());
-        assert_eq!(expr.width(), m.width());
-        for k in 0..32 {
-            let p = point(m.vars(), k);
-            assert_eq!(m.eval(&p), expr.eval(&p), "{m:?}\n{expr:?}");
+    for synthesis in [false, true] {
+        let solver = NormalFormSolver::new(NfOptions::default().with_synthesis(synthesis));
+        if let MbaAnswer::Simplified { expr, claim } = solver.solve(&m, &budget) {
+            assert_eq!(expr.vars(), m.vars());
+            assert_eq!(expr.width(), m.width());
+            if synthesis && claim == Claim::Sampled {
+                continue;
+            }
+            for k in 0..32 {
+                let p = point(m.vars(), k);
+                assert_eq!(m.eval(&p), expr.eval(&p), "{m:?}\n{expr:?}");
+            }
+            assert_ne!(prover.prove_equal(&m, &expr, &budget), Verdict::Refuted);
         }
-        assert_ne!(prover.prove_equal(&m, &expr, &budget), Verdict::Refuted);
     }
     // The prover against a copy with one more term: never proved when a point differs.
     let mut other = m.clone();

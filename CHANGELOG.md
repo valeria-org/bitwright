@@ -28,6 +28,12 @@
   also renders each form once per product depth, charging the same work on reuse. Results are
   unchanged; on the corpus diff the solver takes a third less time on random DAGs, and half to
   three quarters less on nonlinear MBA.
+- **Synthesis.** `NormalFormSolver` looks a normal form over at most three atoms up in a table
+  of the smallest expressions (up to seven nodes over `+ − · & | ^ ~`, negation and the
+  constant 1), keyed by their values at 24 fixed probe points and built once per process. A
+  hit is used when a certificate proves it (`x·y + x + y + 1` is `~x·~y`); one no certificate
+  can decide is at most a sampled answer. `NfOptions::synthesis` (on by default, part of the
+  solver id); `NfStats::synth_*` count lookups, hits and their outcomes.
 - **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
   solver that returns true is also asked about fragments without bitwise operators in which
   two non-constants are multiplied, and fragments rooted at a constant left shift.

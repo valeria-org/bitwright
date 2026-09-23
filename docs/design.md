@@ -1211,6 +1211,25 @@ pub mod mba {
     the work they cost, charged again on reuse. Neither changes an answer or where the budget
     runs out (tested with the memo off, on, and forgetting constantly). On the corpus diff
     they take a third off the solver's time on random DAGs, and more on nonlinear MBA.
+  - *Synthesis* (`NfOptions::synthesis`, on by default). A table holds the smallest
+    expressions of up to seven nodes over the atoms `a`, `b`, `c` and the constant 1 with
+    `+ − · & | ^ ~` and negation, one per vector of values at 24 fixed probe points (the eight
+    corners of 0 and all-ones, four small points, twelve seeded random ones); among equal
+    sizes it keeps the one with the fewest distinct subexpressions. It is built once per
+    process at 64 bits (28,828 entries, about 17 ms). These operators carry nothing downward,
+    so narrower widths read it by truncated values and wider ones by their low 64 bits. A
+    normal form over one to three atoms is evaluated at the probes (in 64-bit arithmetic,
+    exact for the low bits), looked up, and a hit cheaper than every other candidate is
+    certified against the normal form with the atoms as independent variables. Proved, it is
+    a candidate like any other; refuted, it is dropped; undecided (no certificate fits, as for
+    three atoms at degree 2 and 512 bits), it can be the answer only as `Claim::Sampled`,
+    after a certificate against the input also fails to decide and the refutation sample
+    agrees. This is the only way the solver returns an answer that is not exact by
+    construction; the gate with backend certificates off refuses it unless its own certificate
+    proves it. So `x·y + x + y + 1` is `~x·~y`, `x·y − x − y + 1` is `(1 − x)·(1 − y)`, and
+    `x² + 2xy + y²` is `(x + y)²`. On the corpus diff it shrinks linear MBA results further
+    (1,645 to 1,635 nodes) for about 4 % more instructions on random DAGs; on small corpora
+    the one-time table build dominates.
   - It asks to see polynomials too (`MbaSolver::polynomial_fragments`, default false):
     `Phase::Mba` then also asks about fragments without bitwise operators in which two
     non-constants are multiplied, and about fragments rooted at a constant left shift (the

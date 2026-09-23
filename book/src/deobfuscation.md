@@ -113,8 +113,12 @@ is a product comes out as one (`x·(x & y) + y·(x & y) − (x & y)²` is `(x | 
 Subterms it cannot see through become atoms: arithmetic under a bitwise operator (unless it is
 secretly a bitwise function), right shifts and casts. Atoms with equal normal forms are one atom,
 so `((x ^ y) + 2·(x & y)) & z` is `(x + y) & z` and `((x + y) & z) + ((x + y) & ~z)` is `x + y`.
-Every answer is certified against its input before it is returned, and the evidence gate checks
-it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
+A normal form over at most three atoms is also looked up in a precomputed table of the
+smallest expressions, so products the input has multiplied out come back: `x·y + x + y + 1` is
+`~x·~y`, and `x² + 2·x·y + y²` is `(x + y)²`. A form from the table is used only when a
+certificate proves it; one that no certificate can decide is returned, if at all, as a
+sampled answer (`NfOptions::synthesis` turns the table off). Every answer is certified against
+its input before it is returned, and the evidence gate checks it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
 certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
 for a later call with more budget. It remembers its recent answers (`NfOptions::memo`), which
 saves time when the engine asks again and never changes an answer. It is not the default

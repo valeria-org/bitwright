@@ -104,9 +104,9 @@ service on generated corpora (200 linear MBA inputs, 200 nonlinear MBA inputs an
 DAGs, each at 8 and 64 bits) under three configurations: the current defaults (the signature
 solver, backend certificates trusted), the same solver with bitwright's own evidence only, and
 the proposed defaults (the normal-form solver, bitwright's own evidence only). It prints
-markdown: per corpus the result sizes, how many results change and in which direction, the time
-each configuration took (wall time, for orientation only), the MBA service's answers and
-refusals, and examples of changed results. It is the evidence for a change of defaults, which
+markdown: per corpus the result sizes, how many results change and in which direction, the
+user-space instructions each configuration took (and its wall time, for orientation only), the
+MBA service's answers and refusals, and examples of changed results. It is the evidence for a change of defaults, which
 changes behavior; see `docs/proposals/`.
 
 ## Comparing with other engines

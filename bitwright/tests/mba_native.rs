@@ -153,6 +153,17 @@ fn the_polynomial_catalog() {
 }
 
 #[test]
+fn the_synthesis_catalog() {
+    // Products the input has only multiplied out, found in the synthesis table. The gate's
+    // degree-2 certificates over two variables fit up to 128 bits here.
+    const UP_TO_128: [u16; 5] = [8, 16, 32, 64, 128];
+    catalog("x*y + x + y + 1", "~x * ~y", &UP_TO_128);
+    catalog("x*y - x - y + 1", "(1 - x)*(1 - y)", &UP_TO_128);
+    catalog("x*x + 2*x*y + y*y", "(x + y)*(x + y)", &UP_TO_128);
+    catalog("x*y + x*z + y + z", "(x + 1)*(y + z)", &[8, 16, 32, 64]);
+}
+
+#[test]
 fn the_abstraction_catalog() {
     catalog("((x + y) & z) + ((x + y) & ~z)", "x + y", &WIDTHS);
     catalog("((x ^ y) + 2*(x & y)) & z", "(x + y) & z", &WIDTHS);

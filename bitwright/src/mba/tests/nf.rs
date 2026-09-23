@@ -444,6 +444,108 @@ fn never_costlier_than_the_signature_solver_on_linear_mba() {
 }
 
 #[test]
+fn synthesis_finds_products_the_input_multiplied_out() {
+    // The renderer factors by common symbols and by the input's own factors; these have
+    // neither, and the table has them. Pure polynomials are proved at any width (the grid);
+    // the mixed one over three atoms is past every certificate's cap at 512 bits, so there it
+    // is a sampled answer (which `solves_to` checks at 2000 more points).
+    let one = |w| k(w, 1);
+    for bits in [6u16, 8, 64, 512] {
+        let w = Width::new(bits).unwrap();
+        let two = [w, w];
+        let three = [w, w, w];
+        let (x, y, z) = (V(0), V(1), V(2));
+        solves_to(
+            &add(
+                add(add(mul(x.clone(), y.clone()), x.clone()), y.clone()),
+                one(w),
+            ),
+            &mul(not(x.clone()), not(y.clone())),
+            &two,
+        );
+        solves_to(
+            &add(
+                sub(sub(mul(x.clone(), y.clone()), x.clone()), y.clone()),
+                one(w),
+            ),
+            &mul(sub(one(w), x.clone()), sub(one(w), y.clone())),
+            &two,
+        );
+        solves_to(
+            &add(
+                add(
+                    mul(x.clone(), x.clone()),
+                    mul(k(w, 2), mul(x.clone(), y.clone())),
+                ),
+                mul(y.clone(), y.clone()),
+            ),
+            &mul(add(x.clone(), y.clone()), add(x.clone(), y.clone())),
+            &two,
+        );
+        solves_to(
+            &add(
+                add(
+                    add(mul(x.clone(), y.clone()), mul(x.clone(), z.clone())),
+                    y.clone(),
+                ),
+                z.clone(),
+            ),
+            &mul(add(x.clone(), one(w)), add(y.clone(), z.clone())),
+            &three,
+        );
+        // (x ^ y)·(x | z), multiplied out: x ^ y = x + y − 2(x & y), x | z = x + z − (x & z).
+        let a = [
+            (1, x.clone()),
+            (1, y.clone()),
+            (-2, and(x.clone(), y.clone())),
+        ];
+        let b = [
+            (1, x.clone()),
+            (1, z.clone()),
+            (-1, and(x.clone(), z.clone())),
+        ];
+        let mut e: Option<T> = None;
+        for (ca, ta) in &a {
+            for (cb, tb) in &b {
+                let t = mul(k(w, ca * cb), mul(ta.clone(), tb.clone()));
+                e = Some(match e {
+                    None => t,
+                    Some(s) => add(s, t),
+                });
+            }
+        }
+        let e = e.unwrap();
+        solves_to(
+            &e,
+            &mul(xor(x.clone(), y.clone()), or(x.clone(), z.clone())),
+            &three,
+        );
+        let solver = NormalFormSolver::default();
+        let MbaAnswer::Simplified { claim, .. } =
+            solver.solve(&e.expr(&three), &MbaBudget::default())
+        else {
+            panic!("{bits}");
+        };
+        let s = solver.stats();
+        if bits > 64 {
+            assert_eq!(claim, Claim::Sampled);
+            assert!(s.synth_unproved > 0 && s.synth_sampled > 0, "{s:?}");
+        } else {
+            assert_eq!(claim, Claim::Proved);
+            assert!(s.synth_proved > 0 && s.synth_sampled == 0, "{s:?}");
+        }
+    }
+    // Off, the table is not asked.
+    let w = Width::W64;
+    let (x, y) = (V(0), V(1));
+    let e = add(add(add(mul(x.clone(), y.clone()), x), y), one(w)).expr(&[w, w]);
+    let off = NormalFormSolver::new(NfOptions::default().with_synthesis(false));
+    let _ = off.solve(&e, &MbaBudget::default());
+    assert_eq!(off.stats().synth_lookups, 0);
+    assert!(off.id().ends_with("synth=0"), "{}", off.id());
+}
+
+#[test]
 fn the_solver_declines_what_it_does_not_take_and_counts_it() {
     let w = Width::W8;
     let solver = NormalFormSolver::new(NfOptions::default().with_max_classes(2));
