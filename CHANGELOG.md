@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Fixes.** A fact query under assumptions spent its cap on the overlay and again on each
+  operand whose base facts it computed, so a call could spend more fact work than its budget.
+  The overlay and the base facts now share the query's cap, and a query the cap stops answers
+  `top` (as documented) and caches nothing. Results change only for calls that run out of fact
+  work under assumptions.
+
 ## 0.4.0
 
 - **MBA evidence.** The evidence gate proves answers itself beyond linear MBA: polynomial MBA

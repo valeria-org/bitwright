@@ -1165,16 +1165,22 @@ impl Context {
         if let Some(f) = overlay.get(root, self.width_of(root)) {
             return Ok(f);
         }
-        let base = |cx: &mut Context, i: u32| {
-            let f = cx
-                .compute_facts_cap(i, cap)
-                .unwrap_or_else(|| Facts::top(cx.width_of(i)));
-            (f, Reliance::NONE)
+        // The overlay's transfers and the base facts they need share the one cap. A base query
+        // the cap stops has counted itself in `capped`; the query then answers `top` and
+        // caches nothing, so no later query reads a fact weakened by this one's cap.
+        let work0 = self.facts.work;
+        let left = move |cx: &Context| {
+            cap.saturating_sub(u32::try_from(cx.facts.work - work0).unwrap_or(u32::MAX))
         };
+        let base = move |cx: &mut Context, i: u32| {
+            let l = left(cx);
+            cx.compute_facts_cap(i, l).map(|f| (f, Reliance::NONE))
+        };
+        let top = move |cx: &Context| (Facts::top(cx.width_of(root)), Reliance::NONE);
         // Only nodes at or above the lowest assumed index can depend on an assumption
         // (children always have lower indices), so the walk stops below it.
         if env.is_empty() || root < env.min {
-            return Ok(base(self, root));
+            return Ok(base(self, root).unwrap_or_else(|| top(self)));
         }
         let min = env.min;
         // Post-order of the part not in the overlay yet. Every node the walk finishes goes into
@@ -1199,34 +1205,34 @@ impl Context {
                 order.push(i);
             }
         }
-        let cap = cap as usize;
-        let mut work = 0usize;
         for &i in &order {
             let n = self.node(i);
             let ordering = n.op.as_cmp().and_then(|_| env.relation(n.a, n.b));
-            // Operands below `min` depend on no assumption: base facts.
-            let kid = |cx: &mut Context, overlay: &FactMap, c: u32| {
-                overlay
-                    .get(c, cx.width_of(c))
-                    .unwrap_or_else(|| base(cx, c))
-            };
             let mut kids = [(Facts::top(Width::W1), Reliance::NONE); 3];
             for (k, c) in n.children().enumerate() {
-                kids[k] = kid(self, overlay, c);
+                // Operands below `min` depend on no assumption: base facts.
+                kids[k] = match overlay.get(c, self.width_of(c)) {
+                    Some(f) => f,
+                    None => match base(self, c) {
+                        Some(f) => f,
+                        None => return Ok(top(self)),
+                    },
+                };
             }
             let tainted = env.assumed.contains_key(&i)
                 || ordering.is_some()
                 || kids[..n.op.arity()].iter().any(|(_, r)| !r.is_none());
             if !tainted {
-                let f = base(self, i);
+                let Some(f) = base(self, i) else {
+                    return Ok(top(self));
+                };
                 overlay.insert(i, f);
                 continue;
             }
-            if work >= cap {
+            if left(self) == 0 {
                 self.facts.capped += 1;
-                return Ok((Facts::top(self.width_of(root)), Reliance::NONE));
+                return Ok(top(self));
             }
-            work += 1;
             self.facts.work += 1;
             let mut rel = Reliance::NONE;
             for (_, r) in &kids[..n.op.arity()] {
@@ -1251,9 +1257,10 @@ impl Context {
             }
             overlay.insert(i, (f, rel));
         }
-        Ok(overlay
-            .get(root, self.width_of(root))
-            .unwrap_or_else(|| base(self, root)))
+        Ok(match overlay.get(root, self.width_of(root)) {
+            Some(f) => f,
+            None => base(self, root).unwrap_or_else(|| top(self)),
+        })
     }
 
     /// Answers a question from facts. Every `True`/`False` is proved; `Unknown` otherwise.
