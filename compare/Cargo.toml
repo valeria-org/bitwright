@@ -1,0 +1,28 @@
+[package]
+name = "bitwright-compare"
+description = "Compares bitwright's simplification with other tools on public MBA datasets."
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "PolyForm-Noncommercial-1.0.0"
+
+# Its own workspace: it enables the `cobra` feature, which the main workspace's builds and
+# tests should not pick up through feature unification, and it is run by hand, not in CI.
+[workspace]
+members = ["."]
+
+[dependencies]
+bitwright = { path = "../bitwright", features = ["mba", "cobra", "smtlib", "eqsat"] }
+cobra = { package = "cobra-mba", version = "0.4" }
+egg = "0.11"
+
+[profile.release]
+debug = 1
+
+# Not the main workspace's lints: counting heap use needs `unsafe` (one module, `heap`).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

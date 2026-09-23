@@ -135,9 +135,10 @@ mdbook serve book                                                       # the bo
 cargo run --release -p bitwright-bench                                  # benchmarks, in instructions retired
 ```
 
-Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`), and
+Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`),
 [`docs/benchmarking.md`](docs/benchmarking.md) explains how to compare a change against its
-baseline.
+baseline, and [`compare/`](compare) compares bitwright with other symbolic engines (egg, CoBRA,
+Triton, SMT solvers) on public MBA datasets.
 
 ## License
 

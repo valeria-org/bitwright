@@ -36,6 +36,12 @@
   earlier. A certificate that does not fit the remaining pass work leaves the node non-final.
   The gate checks that an answer would make the DAG smaller before proving it, so
   `MbaStats::not_smaller` also counts answers rejected for cost before any proof.
+- **Tooling.** `compare/` compares bitwright with other symbolic engines on CoBRA's collection
+  of public MBA datasets (about 76,000 expressions): egg (with bitwright's equations, and with
+  MBA identities), CoBRA (the C++ tool through a batch driver, and its Rust port), Triton
+  (through LLVM, and its synthesis), Z3, Bitwuzla, cvc5, claripy and Miasm. Every answer is
+  checked at 64 points against its input and sized in bitwright's canonical form. It is its own
+  Cargo workspace, run by hand; the datasets (mostly GPL-3.0) are fetched, not included.
 
 ## 0.3.1
 
