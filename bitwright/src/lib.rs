@@ -99,9 +99,11 @@ pub mod smtlib;
 #[cfg(test)]
 mod testutil;
 
-/// The book's examples (`book/src`), compiled and run as doctests.
+/// The README's and the book's examples (`book/src`), compiled and run as doctests.
 #[cfg(doctest)]
 mod book {
+    #[doc = include_str!("../../README.md")]
+    struct Readme;
     #[doc = include_str!("../../book/src/getting-started.md")]
     struct GettingStarted;
     #[doc = include_str!("../../book/src/semantics.md")]

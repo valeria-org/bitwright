@@ -7,3 +7,6 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/valeria-org/bitwright"
+edit-url-template = "https://github.com/valeria-org/bitwright/edit/main/book/{path}"
+# Where GitHub Pages serves it; the 404 page needs it for its links.
+site-url = "/bitwright/"

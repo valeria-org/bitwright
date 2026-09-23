@@ -1,70 +1,142 @@
 # bitwright
 
+[![CI](https://github.com/valeria-org/bitwright/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/valeria-org/bitwright/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/bitwright.svg)](https://crates.io/crates/bitwright)
+[![docs.rs](https://img.shields.io/docsrs/bitwright)](https://docs.rs/bitwright)
+[![book](https://img.shields.io/badge/book-read%20online-blue)](https://valeria-org.github.io/bitwright/)
+[![MSRV](https://img.shields.io/badge/rustc-1.88+-orange.svg)](#stability)
+
 Hash-consed fixed-width bit-vector expressions for Rust: exact evaluation, bit-level facts, and
 verified simplification.
 
-bitwright is for tools that reason about machine integers, such as binary analyzers,
-deobfuscators, decompilers and lifters. It aims to simplify such expressions with predictable
-cost and without guessing.
+bitwright is for tools that reason about machine integers: binary analyzers, deobfuscators,
+decompilers and lifters. It simplifies their expressions with predictable cost and without
+guessing: a rewrite preserves the value of the expression at every input, or it does not happen.
 
-- **Exact values** of 1 to 512 bits. Every operator has total SMT-LIB QF_BV semantics, including
-  division by zero.
-- **A hash-consed expression arena** with canonicalization at construction. It is owned by a
-  context, and there is no global state.
-- **Bit-level facts**: known bits, unsigned and signed ranges, and tri-state proofs.
-- **A directed simplifier** built from normal-form passes and a small rule corpus. Termination is
-  guaranteed by construction, and budgets are caller-owned.
+```rust
+use bitwright::engine::Engine;
+use bitwright::{Context, ParseOptions, Width};
+
+fn main() -> Result<(), bitwright::Error> {
+    let engine = Engine::standard();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    for (input, simplified) in [
+        // Arithmetic and boolean masking cancel.
+        ("(x & y) + (x | y)", "x + y"),
+        ("((x ^ 0x5a) + 3 - 3) ^ 0x5a", "x"),
+        // Multiplying by an odd constant is a bijection: equal products, equal inputs.
+        ("x * 0x87c37b91114253d5 == y * 0x87c37b91114253d5", "x == y"),
+        // A comparison through a keyed hash mixer becomes a comparison of its input.
+        (
+            "let m = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f; \
+             (m ^ ((m >>u 32) >>u (m >>u 60))) * 0xd3220fb78e33751f == 0",
+            "x == 0xd3220fb78e33751f",
+        ),
+    ] {
+        let e = cx.parse(input, &o)?;
+        let out = engine.simplify(&mut cx, e)?;
+        assert_eq!(cx.display(out.expr).to_string(), simplified);
+    }
+    Ok(())
+}
+```
+
+## What it gives you
+
+- **Exact values** of 1 to 512 bits. Every operator has total SMT-LIB QF_BV semantics, division
+  by zero included, checked against an independent bit-serial reference evaluator.
+- **A hash-consed expression arena** with canonicalization at construction, owned by a context.
+  There is no global state, and the same input gives the same output on every run.
+- **Bit-level facts**: known bits, unsigned and signed ranges, tri-state proofs, and
+  constraints you assume (a path condition, an invariant), with the ones each result relies on
+  reported back.
+- **A directed simplifier** built from normal-form passes (linear arithmetic, xor forms, truth
+  tables, comparison lattices, casts, demanded bits, linear MBA, bit shuffles) and a small rule
+  corpus. Termination is guaranteed by construction, and every run is bounded by budgets you
+  choose.
 - **Invertibility**: proofs that an expression is an injective or bijective function of a
-  subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so a
-  hash comparison becomes a plain one.
-- **A rule language (`.bwr`)** with a mandatory, machine-checked soundness gate.
+  subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so
+  a hash comparison becomes a plain one.
+- **A rule language (`.bwr`)** for your own rewrites, with a mandatory soundness check
+  (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
 - **Optional services**: MBA simplification with pluggable solvers, a bounded
-  equality-saturation search, and SMT-LIB export and import (rule obligations included, so any
-  SMT solver can prove a rule at any width).
+  equality-saturation search, and SMT-LIB export and import, so any SMT solver can prove a rule
+  at any width.
+
+## Installation
+
+```sh
+cargo add bitwright
+```
+
+bitwright needs Rust 1.88 or later. Its only required dependency is `hashbrown`. Optional
+features:
+
+| Feature | Default | Adds |
+|-|-|-|
+| `check` | yes | the rule soundness checker, evidence and proof ledgers |
+| `smtlib` | no | SMT-LIB export and import, rule obligations for any SMT solver |
+| `mba` | no | the MBA service: lowering, solver and prover traits, the evidence gate |
+| `cobra` | no | `mba` plus a backend over the `cobra-mba` crate |
+| `eqsat` | no | a bounded equality-saturation search for alternative expressions |
 
 ## Documentation
 
-The book in [`book/`](book) (`mdbook serve book`) is the guide: getting started, semantics,
-facts, simplifying, writing and checking rules, deobfuscation, equality saturation, SMT-LIB, the
-command line, and the built-in rule catalog. Every example in it runs as a test. The design
-reference is [`docs/design.md`](docs/design.md).
+**[The bitwright book](https://valeria-org.github.io/bitwright/)** is the guide. Every example
+in it is compiled and run as a test. It reads fine on GitHub too:
 
-## Benchmarks
+| Part | Chapters |
+|-|-|
+| Basics | [Introduction](book/src/introduction.md) · [Getting started](book/src/getting-started.md) · [Semantics](book/src/semantics.md) |
+| Reasoning | [Facts and proofs](book/src/facts.md) · [Constraints](book/src/constraints.md) · [Extension operations](book/src/extensions.md) |
+| Simplifying | [Simplifying](book/src/simplifying.md) · [Deobfuscation and MBA](book/src/deobfuscation.md) · [Invertibility](book/src/invertibility.md) |
+| Rules | [Writing rules](book/src/rules.md) · [Checking rules](book/src/checking.md) · [Rule catalog](book/src/catalog.md) |
+| Services | [Equality saturation](book/src/eqsat.md) · [SMT-LIB](book/src/smtlib.md) · [The command line](book/src/cli.md) |
+| Contracts | [Stability](book/src/stability.md) |
 
-`cargo run --release -p bitwright-bench` measures values, expressions, facts, constraints, the
-simplifier and the services in instructions retired (hardware counters) and CPU time, so results
-stay comparable on a busy machine; `--save` and `--compare` check a change against its baseline.
-See [`docs/benchmarking.md`](docs/benchmarking.md).
+- **[API reference](https://docs.rs/bitwright)** on docs.rs, for the latest release.
+- **[Design reference](docs/design.md)**: the principles, semantics and contracts, and how each
+  part is validated.
+- **[Changelog](CHANGELOG.md)**.
 
 ## Command line
 
-`bitwright-cli` builds a `bitwright` binary for rule authors:
+The `bitwright` binary checks, lints and proves rule files, and simplifies expressions:
 
-```text
-bitwright check rules.bwr --ledger rules.bwr.proof   # soundness verdicts and the proof ledger
-bitwright lint rules.bwr                             # every diagnostic, rendered
-bitwright smt rules.bwr | z3 -in                     # prove every rule at 8, 32 and 64 bits
-bitwright catalog > RULES.md                         # the built-in rules as Markdown
-bitwright explain BW0302                             # what a diagnostic means
-bitwright simplify '(x ^ y) + 2 * (x & y)' --deobfuscate
+```sh
+cargo install --git https://github.com/valeria-org/bitwright bitwright-cli
 ```
 
-## Status
+```text
+bitwright check rules.bwr --ledger rules.bwr.proof      # soundness verdicts and the proof ledger
+bitwright lint rules.bwr                                # every diagnostic, rendered
+bitwright smt rules.bwr | z3 -in                        # prove every rule at 8, 32 and 64 bits
+bitwright catalog > RULES.md                            # the built-in rules as Markdown
+bitwright explain BW0302                                # what a diagnostic means
+bitwright simplify '(x | y) - (x & y)' --deobfuscate    # x ^ y
+bitwright simplify 'x * k == y * k' --assume '(k & 1) == 1'   # x == y, relying on the assumption
+```
 
-Early development. The design is in [`docs/design.md`](docs/design.md), and the milestone plan is
-in §13 of that document. Implemented so far:
+## Stability
 
-| Milestone | Scope | State |
-|-|-|-|
-| M0 | `Width`, `BitVec` with every operator, independent reference evaluator | done |
-| M1 | expression arena, canonicalization, text syntax | done |
-| M2 | known bits, ranges, tri-state proofs, assumptions | done |
-| M3 | rule language, soundness checker, seed rule corpus | done |
-| M4 | simplification engine: budgets, memo, dispatch, telemetry | done |
-| M5 | normal-form passes: fact folding, linear, xor, bitwise, compares, casts, demanded bits | done |
-| M6 | deobfuscation: linear-MBA and shuffle passes, the MBA service (features `mba`, `cobra`) | done |
-| M7 | equality-saturation search service (feature `eqsat`, default off) | done |
-| M8 | SMT-LIB export, import and rule obligations (feature `smtlib`); CLI, book, catalog, fuzzing, semver job | done |
+bitwright is 0.x. A minor release may change the API and simplification results, and lists
+every change of results under *Behavior changes* in the [changelog](CHANGELOG.md); a patch
+release changes results only to fix unsoundness. The minimum supported Rust version is 1.88.
+See the [stability chapter](book/src/stability.md) for the full contract.
+
+## Development
+
+```sh
+cargo test --workspace                                                  # every test, book examples included
+cargo test --workspace --release -- --ignored --skip write_corpus_ledger    # the long suites (z3 on PATH for the SMT proofs)
+mdbook serve book                                                       # the book at http://localhost:3000
+cargo run --release -p bitwright-bench                                  # benchmarks, in instructions retired
+```
+
+Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`), and
+[`docs/benchmarking.md`](docs/benchmarking.md) explains how to compare a change against its
+baseline.
 
 ## License
 
