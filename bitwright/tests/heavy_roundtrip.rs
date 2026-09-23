@@ -3,7 +3,8 @@
 //! constants, casts at limb boundaries and extension calls (`@name[k](…)`); a truncated print
 //! never parses into a different expression; the derived constructors' names parse to the
 //! builder's nodes. With feature `smtlib`: export then import preserves meaning up to 512 bits,
-//! and (when z3 is on `PATH`) z3 proves simplification results equivalent to their inputs.
+//! and z3 and bitwuzla (each when it is on `PATH`) prove simplification results equivalent to
+//! their inputs.
 //!
 //! The library's unit tests round-trip random trees up to 8 bits; the SMT-LIB ones up to 130.
 
@@ -15,7 +16,7 @@ use common::{
 };
 
 #[cfg(feature = "smtlib")]
-use common::Canonical;
+use common::{Canonical, Solver};
 
 fn unbounded() -> PrintOptions {
     PrintOptions::default()
@@ -365,33 +366,15 @@ fn smtlib_export_then_import_keeps_meaning_heavy() {
     smt_round_trip(Size::Heavy);
 }
 
-/// Runs z3 on a script; `None` if z3 cannot be started.
+/// A solver proves the simplifier's results equivalent to their inputs (`unsat`), up to 512
+/// bits. A timeout or `unknown` is inconclusive and counted; `sat` is a counterexample, unless
+/// the query has extension calls (uninterpreted functions, whose models need not be real).
+/// Skipped, with a note, when the solver is not on `PATH`.
 #[cfg(feature = "smtlib")]
-fn z3(script: &str) -> Option<String> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("z3")
-        .args(["-in", "-smt2", "-t:5000"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// z3 proves the simplifier's results equivalent to their inputs (`unsat`), up to 512 bits.
-/// A timeout or `unknown` is inconclusive and counted; `sat` is a counterexample, unless the
-/// query has extension calls (uninterpreted functions, whose models need not be real). Skipped,
-/// with a note, when z3 is not on `PATH`.
-#[cfg(feature = "smtlib")]
-fn z3_simplifications(size: Size) {
+fn solver_simplifications(solver: Solver, size: Size) {
     use bitwright::engine::{Engine, Strategy};
     use bitwright::smtlib::equivalence_query;
-    if z3("(check-sat)").is_none() {
-        eprintln!("z3 is not on PATH; skipped");
+    if !solver.available() {
         return;
     }
     let deobfuscate = Engine::builder()
@@ -434,23 +417,29 @@ fn z3_simplifications(size: Size) {
             ));
         }
     }
-    let out = z3(&format!("(set-logic ALL)\n{script}")).unwrap();
+    let out = solver
+        .run(&format!("(set-logic ALL)\n{script}"), Some(5000))
+        .unwrap();
     let answers: Vec<&str> = out.lines().filter(|l| !l.starts_with('(')).collect();
-    assert_eq!(answers.len(), cases.len(), "{out}");
+    assert_eq!(answers.len(), cases.len(), "{}: {out}", solver.name());
     for (a, (case, uninterpreted)) in answers.iter().zip(&cases) {
         match *a {
             "unsat" => proved += 1,
             // With extension calls as uninterpreted functions, a model may rest on values the
             // real operation never takes (the reference suites check those results).
             "sat" if *uninterpreted => inconclusive += 1,
-            "sat" => panic!("z3 found a counterexample: {case}"),
+            "sat" => panic!("{} found a counterexample: {case}", solver.name()),
             _ => inconclusive += 1,
         }
     }
-    eprintln!("z3: {proved} proved, {inconclusive} inconclusive");
+    eprintln!(
+        "{}: {proved} proved, {inconclusive} inconclusive",
+        solver.name()
+    );
     assert!(
         proved * 2 > cases.len(),
-        "z3 proved only {proved} of {}",
+        "{} proved only {proved} of {}",
+        solver.name(),
         cases.len()
     );
 }
@@ -458,12 +447,25 @@ fn z3_simplifications(size: Size) {
 #[cfg(feature = "smtlib")]
 #[test]
 fn z3_proves_simplifications_smoke() {
-    z3_simplifications(Size::Smoke);
+    solver_simplifications(Solver::Z3, Size::Smoke);
+}
+
+#[cfg(feature = "smtlib")]
+#[test]
+fn bitwuzla_proves_simplifications_smoke() {
+    solver_simplifications(Solver::Bitwuzla, Size::Smoke);
 }
 
 #[cfg(feature = "smtlib")]
 #[test]
 #[ignore = "heavy: run with --release -- --ignored (needs z3 on PATH; skipped without it)"]
 fn z3_proves_simplifications_heavy() {
-    z3_simplifications(Size::Heavy);
+    solver_simplifications(Solver::Z3, Size::Heavy);
+}
+
+#[cfg(feature = "smtlib")]
+#[test]
+#[ignore = "heavy: run with --release -- --ignored (needs bitwuzla on PATH; skipped without it)"]
+fn bitwuzla_proves_simplifications_heavy() {
+    solver_simplifications(Solver::Bitwuzla, Size::Heavy);
 }

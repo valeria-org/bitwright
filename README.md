@@ -111,7 +111,7 @@ cargo install --git https://github.com/valeria-org/bitwright bitwright-cli
 ```text
 bitwright check rules.bwr --ledger rules.bwr.proof      # soundness verdicts and the proof ledger
 bitwright lint rules.bwr                                # every diagnostic, rendered
-bitwright smt rules.bwr | z3 -in                        # prove every rule at 8, 32 and 64 bits
+bitwright smt rules.bwr | z3 -in                        # prove every rule at 8, 32 and 64 bits (or `| bitwuzla`)
 bitwright catalog > RULES.md                            # the built-in rules as Markdown
 bitwright explain BW0302                                # what a diagnostic means
 bitwright simplify '(x | y) - (x & y)' --deobfuscate    # x ^ y
@@ -129,7 +129,7 @@ See the [stability chapter](book/src/stability.md) for the full contract.
 
 ```sh
 cargo test --workspace                                                  # every test, book examples included
-cargo test --workspace --release -- --ignored --skip write_corpus_ledger    # the long suites (z3 on PATH for the SMT proofs)
+cargo test --workspace --release -- --ignored --skip write_corpus_ledger    # the long suites (z3 and bitwuzla on PATH for the SMT proofs)
 mdbook serve book                                                       # the book at http://localhost:3000
 cargo run --release -p bitwright-bench                                  # benchmarks, in instructions retired
 ```

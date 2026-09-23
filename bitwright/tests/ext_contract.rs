@@ -1,10 +1,14 @@
 //! Contracts of extension operations: the defects an independent review found, fixed.
 
+mod common;
+
 use std::sync::Arc;
 
 use bitwright::engine::{Engine, Run};
 use bitwright::ext::{ExtOp, ExtSig, ExtTraits, Registry};
 use bitwright::{BinOp, BitVec, CmpOpExt, Context, ContextConfig, KnownBits, ParseOptions, Width};
+#[cfg(feature = "smtlib")]
+use common::Solver;
 
 fn bin(op: BinOp, a: &BitVec, b: &BitVec) -> BitVec {
     BitVec::apply_bin(op, a, b).unwrap()
@@ -560,7 +564,7 @@ fn a_host_smtlib_term_must_be_one_expression() {
 }
 
 /// With uninterpreted functions, the script declares a logic that has them, and a solver
-/// accepts it (checked with z3 when it is on PATH).
+/// accepts it (checked with z3 and bitwuzla, each when it is on PATH).
 #[cfg(feature = "smtlib")]
 #[test]
 fn equivalence_queries_with_calls_declare_uninterpreted_functions() {
@@ -575,26 +579,11 @@ fn equivalence_queries_with_calls_declare_uninterpreted_functions() {
     assert!(q.starts_with("(set-logic QF_UFBV)\n"), "{q}");
     let plain = bitwright::smtlib::equivalence_query(&mut cx, b, b).unwrap();
     assert!(plain.starts_with("(set-logic QF_BV)\n"));
-    if let Some(out) = z3(&q) {
-        assert!(!out.contains("error"), "{out}");
+    for solver in Solver::ALL {
+        if let Some(out) = solver.run(&q, None) {
+            assert!(!out.contains("error"), "{}: {out}", solver.name());
+        }
     }
-}
-
-/// z3's answer to `script`, if z3 is on PATH.
-#[cfg(feature = "smtlib")]
-fn z3(script: &str) -> Option<String> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("z3")
-        .args(["-in", "-smt2"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// A symbol spelled like an exported function name is renamed, not confused with it.
@@ -619,8 +608,10 @@ fn exported_function_names_cannot_collide_with_symbols() {
         0,
         "{q}"
     );
-    if let Some(out) = z3(&q) {
-        assert!(!out.contains("error"), "{out}");
+    for solver in Solver::ALL {
+        if let Some(out) = solver.run(&q, None) {
+            assert!(!out.contains("error"), "{}: {out}", solver.name());
+        }
     }
 }
 

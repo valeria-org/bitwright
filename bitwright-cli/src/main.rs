@@ -20,9 +20,10 @@ commands:
         compile and print every diagnostic; exit 1 on errors.
   smt <file.bwr> [--rule <group::name>] [--widths <w,...>]
         print each rule's soundness obligation as SMT-LIB 2.6, separated by (reset), for
-        example `bitwright smt rules.bwr | z3 -in`: every answer must be `unsat`. --widths
-        gives one width per width variable of the rules; without it, every admitted assignment
-        of 8, 32 and 64 (or, for a rule admitted at none of those, three other admitted ones).
+        example `bitwright smt rules.bwr | z3 -in` or `| bitwuzla`: every answer must be
+        `unsat`. --widths gives one width per width variable of the rules; without it, every
+        admitted assignment of 8, 32 and 64 (or, for a rule admitted at none of those, three
+        other admitted ones).
         A rule with no obligation prints a SKIPPED line a solver echoes, and exits 1.
   catalog [<file.bwr>]
         a Markdown catalog of the rules (the built-in rules without a file).

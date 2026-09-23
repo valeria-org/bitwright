@@ -46,7 +46,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y z3
+      - run: sudo apt-get update && sudo apt-get install -y z3 libgmp10
+      # The SMT suites run once per solver: every script must be accepted by both.
+      - run: |
+          curl -sSfL -o bitwuzla.zip https://github.com/bitwuzla/bitwuzla/releases/download/0.9.1/Bitwuzla-Linux-x86_64-static.zip
+          unzip -q bitwuzla.zip -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/Bitwuzla-Linux-x86_64-static/bin" >> "$GITHUB_PATH"
+          rm bitwuzla.zip
       - run: cargo test --workspace --release -- --ignored --skip write_corpus_ledger
       - run: cargo test -p bitwright --release --all-features -- --ignored --skip write_corpus_ledger
 

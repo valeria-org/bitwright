@@ -321,26 +321,70 @@ fn equivalence_queries_are_well_formed() {
     assert!(equivalence_query(&mut cx, a, narrow).is_err());
 }
 
-/// z3 on `PATH` evaluates exported expressions exactly as bitwright does. Needs z3; skipped
-/// (with a note) when it is not installed.
-#[test]
-#[ignore = "needs z3 on PATH"]
-fn z3_agrees_with_the_evaluator() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let run = |script: &str| -> Option<String> {
-        let mut child = Command::new("z3")
-            .args(["-in", "-smt2"])
+// ----- solvers ----------------------------------------------------------------------------------
+
+/// An SMT solver the ignored suites run exported scripts through, when it is on `PATH`. Each
+/// suite runs once per solver, so an export that only one of them accepts fails.
+#[derive(Copy, Clone, Debug)]
+enum Solver {
+    Z3,
+    Bitwuzla,
+}
+
+impl Solver {
+    fn name(self) -> &'static str {
+        match self {
+            Solver::Z3 => "z3",
+            Solver::Bitwuzla => "bitwuzla",
+        }
+    }
+
+    /// The solver's output for `script` read from stdin, with `limit_ms` per `check-sat` (after
+    /// which it answers `unknown`); its stderr is appended when it fails. `None` if it cannot be
+    /// started.
+    fn run(self, script: &str, limit_ms: Option<u32>) -> Option<String> {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut cmd = Command::new(self.name());
+        match (self, limit_ms) {
+            (Solver::Z3, l) => {
+                cmd.args(["-in", "-smt2"]);
+                cmd.args(l.map(|ms| format!("-t:{ms}")));
+            }
+            (Solver::Bitwuzla, l) => {
+                cmd.args(l.map(|ms| format!("--time-limit-per={ms}")));
+            }
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .ok()?;
         child.stdin.take()?.write_all(script.as_bytes()).ok()?;
         let out = child.wait_with_output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    if run("(check-sat)").is_none() {
-        eprintln!("z3 is not on PATH; skipped");
+        let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() {
+            s.push('\n');
+            s.push_str(String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Some(s)
+    }
+
+    /// Whether the solver can be started; prints a note when it cannot.
+    fn available(self) -> bool {
+        let ok = self.run("(check-sat)", None).is_some();
+        if !ok {
+            eprintln!("{} is not on PATH; skipped", self.name());
+        }
+        ok
+    }
+}
+
+/// A solver evaluates exported expressions exactly as bitwright does. Skipped (with a note) for
+/// a solver that is not installed.
+fn solver_agrees_with_the_evaluator(solver: Solver) {
+    if !solver.available() {
         return;
     }
     let mut rng = Rng(0x23);
@@ -372,12 +416,26 @@ fn z3_agrees_with_the_evaluator() {
         ));
         expected += 1;
     }
-    let out = run(&format!("(set-logic QF_BV)\n{script}")).unwrap();
+    let out = solver
+        .run(&format!("(set-logic QF_BV)\n{script}"), None)
+        .unwrap();
     let answers: Vec<&str> = out.lines().collect();
-    assert_eq!(answers.len(), expected, "{out}");
+    assert_eq!(answers.len(), expected, "{}: {out}", solver.name());
     for (k, a) in answers.iter().enumerate() {
-        assert_eq!(*a, "unsat", "case {k}");
+        assert_eq!(*a, "unsat", "{}: case {k}", solver.name());
     }
+}
+
+#[test]
+#[ignore = "needs z3 on PATH"]
+fn z3_agrees_with_the_evaluator() {
+    solver_agrees_with_the_evaluator(Solver::Z3);
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH"]
+fn bitwuzla_agrees_with_the_evaluator() {
+    solver_agrees_with_the_evaluator(Solver::Bitwuzla);
 }
 
 // ----- rule obligations -------------------------------------------------------------------------
@@ -496,30 +554,14 @@ fn obligations_state_what_the_checker_evaluates() {
     assert!(rule_obligation(r, &[8, 8]).is_err());
 }
 
-/// Every built-in rule proved by z3 at widths up to 512, and the unsound ones refuted. Needs z3
-/// on `PATH`; skipped (with a note) when it is not installed. The obligations are independent,
-/// so they are solved by one z3 process per available core, and the answers are read back in
-/// order: the report does not depend on scheduling.
-#[test]
-#[ignore = "needs z3 on PATH; minutes"]
-fn z3_proves_the_built_in_rules() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
+/// Every built-in rule proved by a solver at widths up to 512, and the unsound ones refuted.
+/// Skipped (with a note) for a solver that is not installed. The obligations are independent,
+/// so they are solved by one solver process per available core, and the answers are read back
+/// in order: the report does not depend on scheduling.
+fn solver_proves_the_built_in_rules(solver: Solver) {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let solve = |script: &str| -> Option<String> {
-        let mut child = Command::new("z3")
-            .args(["-in", "-smt2", "-T:60"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .ok()?;
-        child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-        let out = child.wait_with_output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    if solve("(check-sat)").is_none() {
-        eprintln!("z3 is not on PATH; skipped");
+    if !solver.available() {
         return;
     }
     // The built-in rules must be proved and the unsound ones refuted; the coverage rules are
@@ -536,7 +578,7 @@ fn z3_proves_the_built_in_rules() {
             rules.push((rule.name.clone(), k == 2, start..jobs.len()));
         }
     }
-    // One z3 process per core, widest obligations (the slow ones) first, so that none of them
+    // One solver process per core, widest obligations (the slow ones) first, so that none of them
     // starts last and stretches the run; each answer lands in its obligation's slot.
     let mut order: Vec<usize> = (0..jobs.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(jobs[i].0.iter().max().copied()));
@@ -547,7 +589,7 @@ fn z3_proves_the_built_in_rules() {
         for _ in 0..workers.min(jobs.len()) {
             s.spawn(|| {
                 while let Some(&i) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let _ = answers[i].set(solve(&jobs[i].1));
+                    let _ = answers[i].set(solver.run(&jobs[i].1, Some(60_000)));
                 }
             });
         }
@@ -566,7 +608,7 @@ fn z3_proves_the_built_in_rules() {
                 ("unsat", false) => proved += 1,
                 ("sat", true) => refuted = true,
                 ("unsat", true) => {}
-                ("unknown" | "timeout", _) if ws.iter().any(|&w| w > 64) => {
+                ("unknown", _) if ws.iter().any(|&w| w > 64) => {
                     gave_up.push(format!("{name} {ws:?}"));
                 }
                 (a, _) => failures.push(format!("{name} {ws:?}: {a}")),
@@ -577,11 +619,28 @@ fn z3_proves_the_built_in_rules() {
         }
     }
     eprintln!(
-        "{proved} obligations proved; z3 gave up on {}: {gave_up:?}",
+        "{proved} obligations proved; {} gave up on {}: {gave_up:?}",
+        solver.name(),
         gave_up.len()
     );
-    assert!(failures.is_empty(), "{failures:#?}");
-    assert!(gave_up.len() * 50 < proved, "{gave_up:#?}");
+    assert!(failures.is_empty(), "{}: {failures:#?}", solver.name());
+    assert!(
+        gave_up.len() * 50 < proved,
+        "{}: {gave_up:#?}",
+        solver.name()
+    );
+}
+
+#[test]
+#[ignore = "needs z3 on PATH; minutes"]
+fn z3_proves_the_built_in_rules() {
+    solver_proves_the_built_in_rules(Solver::Z3);
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH; minutes"]
+fn bitwuzla_proves_the_built_in_rules() {
+    solver_proves_the_built_in_rules(Solver::Bitwuzla);
 }
 
 // ----- regressions from the M8 review ------------------------------------------------------------
@@ -628,21 +687,11 @@ fn wide_expansions_stay_small() {
     assert!(smt.len() < 400_000, "{}", smt.len());
 }
 
-/// z3 answers `unsat` for a true equality over symbols named after SMT-LIB built-ins.
-#[test]
-#[ignore = "needs z3 on PATH"]
-fn z3_proves_equalities_over_reserved_names() {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new("z3")
-        .args(["-in", "-smt2"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-    else {
-        eprintln!("z3 is not on PATH; skipped");
+/// A solver answers `unsat` for a true equality over symbols named after SMT-LIB built-ins.
+fn solver_proves_equalities_over_reserved_names(solver: Solver) {
+    if !solver.available() {
         return;
-    };
+    }
     let mut script = String::new();
     for name in ["and", "true", "false", "_"] {
         let mut cx = Context::new();
@@ -653,15 +702,25 @@ fn z3_proves_equalities_over_reserved_names() {
         script.push_str(&equivalence_query(&mut cx, e, x).unwrap());
         script.push_str("(reset)\n");
     }
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    let out = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.lines().collect::<Vec<_>>(), ["unsat"; 4], "{out}");
+    let out = solver.run(&script, None).unwrap();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        ["unsat"; 4],
+        "{}: {out}",
+        solver.name()
+    );
+}
+
+#[test]
+#[ignore = "needs z3 on PATH"]
+fn z3_proves_equalities_over_reserved_names() {
+    solver_proves_equalities_over_reserved_names(Solver::Z3);
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH"]
+fn bitwuzla_proves_equalities_over_reserved_names() {
+    solver_proves_equalities_over_reserved_names(Solver::Bitwuzla);
 }
 
 #[test]
@@ -694,27 +753,11 @@ fn equivalence_under_constraints_asserts_exactly_the_relied_on_ones() {
     assert!(q.ends_with("(assert (not (= root0 root1)))\n(check-sat)\n"));
 }
 
-/// Every rewrite made under random constraints is proved by z3 under the constraints it relies
-/// on. Needs z3; skipped (with a note) when it is not installed.
-#[test]
-#[ignore = "needs z3 on PATH"]
-fn z3_proves_rewrites_under_the_constraints_they_rely_on() {
+/// Every rewrite made under random constraints is proved by a solver under the constraints it
+/// relies on. Skipped (with a note) for a solver that is not installed.
+fn solver_proves_rewrites_under_the_constraints_they_rely_on(solver: Solver) {
     use crate::Assumptions;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let run = |script: &str| -> Option<String> {
-        let mut child = Command::new("z3")
-            .args(["-in", "-smt2"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .ok()?;
-        child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-        let out = child.wait_with_output().ok()?;
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    if run("(check-sat)").is_none() {
-        eprintln!("z3 is not on PATH; skipped");
+    if !solver.available() {
         return;
     }
     let engine = crate::engine::Engine::standard();
@@ -758,17 +801,33 @@ fn z3_proves_rewrites_under_the_constraints_they_rely_on() {
             script.push_str("(pop 1)\n");
             // Without the constraints, count how many genuinely needed them.
             let q = equivalence_query(&mut cx, *e, r.expr).unwrap();
-            if run(&q).as_deref() == Some("sat") {
+            if solver.run(&q, None).as_deref() == Some("sat") {
                 needed += 1;
             }
         }
     }
-    let out = run(&script).unwrap();
+    let out = solver.run(&script, None).unwrap();
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), relied, "{out}");
-    assert!(lines.iter().all(|l| *l == "unsat"), "{out}");
+    assert_eq!(lines.len(), relied, "{}: {out}", solver.name());
+    assert!(
+        lines.iter().all(|l| *l == "unsat"),
+        "{}: {out}",
+        solver.name()
+    );
     assert!(
         relied > 60 && needed > 40,
         "relied {relied}, needed {needed}"
     );
+}
+
+#[test]
+#[ignore = "needs z3 on PATH"]
+fn z3_proves_rewrites_under_the_constraints_they_rely_on() {
+    solver_proves_rewrites_under_the_constraints_they_rely_on(Solver::Z3);
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH"]
+fn bitwuzla_proves_rewrites_under_the_constraints_they_rely_on() {
+    solver_proves_rewrites_under_the_constraints_they_rely_on(Solver::Bitwuzla);
 }

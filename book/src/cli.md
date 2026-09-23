@@ -19,7 +19,7 @@ A typical workflow for a rule file:
 ```text
 bitwright lint my.bwr
 bitwright check my.bwr --ledger my.bwr.proof
-bitwright smt my.bwr | z3 -in | sort | uniq -c      # every line should be `unsat`
+bitwright smt my.bwr | z3 -in | sort | uniq -c      # every line should be `unsat` (or `| bitwuzla`)
 ```
 
 and in continuous integration:
