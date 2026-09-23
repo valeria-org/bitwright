@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - **Memory and cache.** A `BitVec` takes 72 bytes whatever its width, so the tables holding a
   value per node now pack widths up to 64 into words. Base facts are six words per node (a
