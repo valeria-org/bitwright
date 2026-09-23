@@ -212,7 +212,7 @@ fn triangular_layers_are_bijections_and_solve_exactly() {
                 cx.display(n)
             );
         }
-        if matches!(layer.map, Map::Tri(_)) {
+        if matches!(layer.map, Map::Region(_)) {
             accepted += 1;
         }
     }
@@ -620,6 +620,292 @@ fn primitive_layers_cancel_exactly() {
         let ni = cx.id(n).unwrap();
         if cx.const_val(ni).is_none() {
             assert!(solve_layer(&mut cx, &mut plain(), ni).unwrap().is_none());
+        }
+    }
+}
+
+/// `compact` from a pointer encoding, scaled to 8 bits (split at bit 5): the low bits are
+/// `(x ^ l) + (k - l + d)`, the high bits `(x >> 5) - ((x >> 4) & h)` plus the carry of the low
+/// half. Injective in `x` for every parameter value.
+fn compact8(x: &str, k: &str, l: &str, c: &str, d: &str, h: &str, shift: u8) -> String {
+    format!(
+        "(((({x} >>u 5) - (({x} >>u {s}) & {h}) \
+           + zext<8>(((({x} ^ {l}) + ({k} - {l} + {c})) & 31) <u {k}) - 1) << 5) \
+         | ((({x} ^ {l}) + ({k} - {l} + {d})) & 31))",
+        s = 5 - shift
+    )
+}
+
+#[test]
+fn block_triangular_maps_are_recovered() {
+    let o = crate::ParseOptions::width(width(8));
+    let mut cx = Context::new();
+    let x = cx.parse("x", &o).unwrap();
+    let f = cx
+        .parse(&compact8("x", "k", "l", "c", "d", "h", 1), &o)
+        .unwrap();
+    assert_eq!(
+        cx.prove(Query::Bijective { e: f, of: x }).unwrap(),
+        Truth::True
+    );
+    // The claim, at random parameter values: all 256 inputs have distinct images.
+    let mut rng = Rng(0xc0_4ac7);
+    for _ in 0..64 {
+        let p: Vec<u64> = (0..5).map(|_| rng.below(256)).collect();
+        let env = |xv: u64| {
+            [
+                ("x", val(8, xv)),
+                ("k", val(8, p[0])),
+                ("l", val(8, p[1])),
+                ("c", val(8, p[2])),
+                ("d", val(8, p[3])),
+                ("h", val(8, p[4])),
+            ]
+        };
+        let mut seen: Vec<BitVec> = (0..256).map(|xv| eval(&mut cx, f, &env(xv))).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 256, "{p:?}");
+    }
+    // Without the shift, bit `i` reads bit `i`: not claimed, and not injective.
+    let g = cx
+        .parse(&compact8("x", "k", "l", "c", "d", "h", 0), &o)
+        .unwrap();
+    assert_ne!(
+        cx.prove(Query::Injective { e: g, of: x }).unwrap(),
+        Truth::True
+    );
+    // Solved at every constant, exactly (parameters fixed).
+    let fc = cx
+        .parse(
+            &compact8("x", "0x9c", "0x35", "0x0e", "0xf1", "0x16", 1),
+            &o,
+        )
+        .unwrap();
+    let fi = cx.id(fc).unwrap();
+    let image: Vec<BitVec> = (0..256)
+        .map(|xv| eval(&mut cx, fc, &[("x", val(8, xv))]))
+        .collect();
+    for cv in 0..256u64 {
+        let c = val(8, cv);
+        let want: Vec<u64> = (0..256).filter(|&xv| image[xv as usize] == c).collect();
+        match solve_eq(&mut cx, &mut plain(), fi, &c).unwrap() {
+            Some(Solved::Eq(v, s)) => {
+                assert_eq!(cx.handle(v), x);
+                assert_eq!(want, vec![s.to_u64().unwrap()], "{cv:#x}");
+            }
+            Some(Solved::Const(false)) => assert!(want.is_empty(), "{cv:#x}"),
+            other => panic!("{cv:#x}: {other:?}"),
+        }
+    }
+    // Cancelled with the same parameters; with another `h`, not.
+    for (hy, cancels) in [("h", true), ("h2", false)] {
+        let a = cx
+            .parse(&compact8("x", "k", "l", "c", "d", "h", 1), &o)
+            .unwrap();
+        let b = cx
+            .parse(&compact8("y", "k", "l", "c", "d", hy, 1), &o)
+            .unwrap();
+        let (ia, ib) = (cx.id(a).unwrap(), cx.id(b).unwrap());
+        let got = cancel_layer(&mut cx, &mut plain(), ia, ib).unwrap();
+        assert_eq!(got.is_some(), cancels, "{hy}");
+        if let Some((p, q)) = got {
+            assert_eq!(
+                (cx.handle(p), cx.handle(q)),
+                (x, cx.parse("y", &o).unwrap())
+            );
+        }
+    }
+}
+
+/// Random maps of `x` built from pieces that keep a pivot, joined into blocks, with decoys that
+/// do not (`x & p`, `f(x) ^ x`, a variable shift, a lossy half).
+fn block_expr(rng: &mut Rng, cx: &mut Context, x: Expr, p: Expr, w: u16, depth: u32) -> Expr {
+    let wd = width(w);
+    let k = |cx: &mut Context, v: u64| cx.constant_u64(wd, v & ((1 << w) - 1)).unwrap();
+    if depth == 0 {
+        return match rng.below(6) {
+            0 => x,
+            1 => cx.bin(BinOp::Xor, x, p).unwrap(),
+            2 => {
+                let c = k(cx, rng.next());
+                cx.bin(BinOp::Add, x, c).unwrap()
+            }
+            3 => {
+                let c = k(cx, rng.next() | 1);
+                cx.bin(BinOp::Mul, x, c).unwrap()
+            }
+            4 => cx.bin(BinOp::Sub, p, x).unwrap(),
+            _ => cx.un(UnOp::Not, x).unwrap(),
+        };
+    }
+    let d = depth - 1;
+    let s = 1 + rng.below(u64::from(w.max(2) - 1)) as u16;
+    match rng.below(10) {
+        // Two halves: the low `s` bits of one map, the rest from another (disjoint `|`).
+        0..=2 if w > 1 => {
+            let lo = block_expr(rng, cx, x, p, w, d);
+            let hi = block_expr(rng, cx, x, p, w, d);
+            let m = k(cx, (1 << s) - 1);
+            let lo = cx.bin(BinOp::And, lo, m).unwrap();
+            let sc = k(cx, u64::from(s));
+            let hi = cx.bin(BinOp::Shl, hi, sc).unwrap();
+            let hi = if rng.chance(1, 2) {
+                // Carry from the low half into the high half.
+                let t = cx.cmp(CmpOp::Ult, lo, p).unwrap();
+                let t = cx.zext(t, wd).unwrap();
+                let t = cx.bin(BinOp::Shl, t, sc).unwrap();
+                cx.bin(BinOp::Add, hi, t).unwrap()
+            } else {
+                hi
+            };
+            cx.bin(BinOp::Or, hi, lo).unwrap()
+        }
+        3 if w > 1 => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            let b = block_expr(rng, cx, x, p, w, d);
+            let h = cx.extract(a, s, width(w - s)).unwrap();
+            let l = cx.extract(b, 0, width(s)).unwrap();
+            cx.concat(h, l).unwrap()
+        }
+        4 => {
+            // An xorshift or add-shift step.
+            let a = block_expr(rng, cx, x, p, w, d);
+            let sc = k(cx, u64::from(s));
+            let op = [BinOp::LShr, BinOp::Shl][rng.below(2) as usize];
+            let t = cx.bin(op, a, sc).unwrap();
+            let t = if rng.chance(1, 2) {
+                cx.bin(BinOp::And, t, p).unwrap()
+            } else {
+                t
+            };
+            let join = [BinOp::Xor, BinOp::Add, BinOp::Sub][rng.below(3) as usize];
+            cx.bin(join, a, t).unwrap()
+        }
+        5 => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            let b = block_expr(rng, cx, x, p, w, d);
+            let z = k(cx, 0);
+            let c = cx.cmp(CmpOp::Eq, p, z).unwrap();
+            cx.select(c, a, b).unwrap()
+        }
+        6 => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            let r = k(cx, rng.below(u64::from(w)));
+            cx.bin(BinOp::RotL, a, r).unwrap()
+        }
+        // Decoys.
+        7 => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            cx.bin(BinOp::And, a, p).unwrap()
+        }
+        8 => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            let t = cx.bin(BinOp::LShr, a, p).unwrap();
+            cx.bin(BinOp::Xor, a, t).unwrap()
+        }
+        _ => {
+            let a = block_expr(rng, cx, x, p, w, d);
+            let b = block_expr(rng, cx, x, p, w, d);
+            cx.bin(BinOp::Xor, a, b).unwrap()
+        }
+    }
+}
+
+#[test]
+fn regions_are_injective_and_solve_exactly() {
+    let mut rng = Rng(0x7a1a_0006);
+    let (mut proved, mut solved) = (0, 0);
+    for i in 0..2500 {
+        let w = 2 + (i % 5) as u16;
+        let mut cx = Context::new();
+        let (x, p) = (
+            cx.symbol("x", width(w)).unwrap(),
+            cx.symbol("p", width(w)).unwrap(),
+        );
+        let depth = 1 + rng.below(3) as u32;
+        let e = block_expr(&mut rng, &mut cx, x, p, w, depth);
+        let t = cx.prove(Query::Injective { e, of: x }).unwrap();
+        if t == Truth::True {
+            proved += 1;
+            // Injective at every value of `p`.
+            for pv in 0..1u64 << w {
+                let mut seen: Vec<BitVec> = (0..1u64 << w)
+                    .map(|xv| eval(&mut cx, e, &[("x", val(w, xv)), ("p", val(w, pv))]))
+                    .collect();
+                seen.sort();
+                seen.dedup();
+                assert_eq!(seen.len(), 1 << w, "{} at p={pv}", cx.display(e));
+            }
+        }
+        // With `p` fixed, solving at every constant is exact.
+        let pv = rng.below(1 << w);
+        let pc = cx.constant_u64(width(w), pv).unwrap();
+        let ec = cx.substitute(&[e], &[(p, pc)]).unwrap()[0];
+        let ei = cx.id(ec).unwrap();
+        let image: Vec<BitVec> = (0..1u64 << w)
+            .map(|xv| eval(&mut cx, ec, &[("x", val(w, xv))]))
+            .collect();
+        for cv in 0..1u64 << w {
+            let c = val(w, cv);
+            let got = solve_eq(&mut cx, &mut plain(), ei, &c).unwrap();
+            let want: Vec<u64> = (0..1u64 << w)
+                .filter(|&xv| image[xv as usize] == c)
+                .collect();
+            match got {
+                None => {}
+                Some(Solved::Const(false)) => {
+                    assert!(want.is_empty(), "{} == {cv}", cx.display(ec));
+                    solved += 1;
+                }
+                Some(Solved::Eq(v, s)) => {
+                    // `v == s` must hold exactly where `ec == c` does.
+                    let vh = cx.handle(v);
+                    for xv in 0..1u64 << w {
+                        let lhs = image[xv as usize] == c;
+                        let rhs = eval(&mut cx, vh, &[("x", val(w, xv))]) == s;
+                        assert_eq!(lhs, rhs, "{} == {cv} at x={xv}", cx.display(ec));
+                    }
+                    solved += 1;
+                }
+                Some(Solved::Const(true)) => panic!("{} == {cv} claimed always", cx.display(ec)),
+            }
+        }
+    }
+    assert!(proved > 300, "{proved} proved");
+    assert!(solved > 2000, "{solved} solved");
+}
+
+/// A rotation count wider than 64 bits is reduced modulo the width exactly, not saturated:
+/// counts from `2^64` up, or from just below it, rotate by 0 at some `y`, where
+/// `x ^ (rot(x, count) & m)` is `x & !m`, so it is no layer over `x`.
+#[test]
+fn wide_rotation_counts_are_not_saturated() {
+    let mut cx = Context::new();
+    let o = crate::ParseOptions::width(Width::W128);
+    let x = cx.parse("x", &o).unwrap();
+    for (count, y, m) in [
+        // `[2^64, 2^128)`: both bounds saturate.
+        (
+            "y | 0x10000000000000000",
+            0,
+            "0x7fffffffffffffffffffffffffffffff",
+        ),
+        // `[2^64 - 3, 2^64 + 4]`: the high bound saturates.
+        (
+            "0xfffffffffffffffd + (y & 7)",
+            3,
+            "0x1fffffffffffffffffffffffffffffff",
+        ),
+    ] {
+        for rot in ["rotl", "rotr"] {
+            let src = format!("x ^ ({rot}(x, {count}) & {m})");
+            let e = cx.parse(&src, &o).unwrap();
+            let at =
+                |cx: &mut Context, xv: u64| eval(cx, e, &[("x", val(128, xv)), ("y", val(128, y))]);
+            assert_eq!(at(&mut cx, 0), at(&mut cx, 1), "{src} collides at y = {y}");
+            let t = cx.prove(Query::Injective { e, of: x }).unwrap();
+            assert_ne!(t, Truth::True, "{src}");
         }
     }
 }

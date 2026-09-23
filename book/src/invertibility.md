@@ -62,7 +62,7 @@ one node that is an injective function of one operand when every other operand (
 | `v * k` with `k` proved odd (a constant, or known bits, or an assumption) | bijective |
 | `zext(v)`, `sext(v)`, `concat(v, k)`, `concat(k, v)` | injective |
 | an extension output declared invertible in an argument | as declared |
-| `v ^ g(v)`, `v + g(v)`, `v - g(v)`, `g(v) - v`, when triangular (below) | bijective |
+| several nodes whose value determines the inner value bit by bit (below) | injective |
 
 Composing layers keeps injectivity, so a chain of them is injective in its innermost value.
 Cancelling needs the parameters to be the same on both sides (the same subexpressions): a map
@@ -71,24 +71,27 @@ needs them to be constants, so the preimage is one.
 
 A node combining two values that *both* depend on the inner one is not a layer in general,
 even when each is a bijection: `f(x) ^ x`, `f_a(x) ^ f_b(x)` and `f_a(x) | f_b(x)` all
-collide. The one exception is the triangular form.
+collide. The exception is a map that gives the inner value back bit by bit.
 
-## Triangular maps
+## Maps recovered bit by bit
 
-In `v ^ g(v)`, `v + g(v)` or `v - g(v)`, the analysis computes, for every bit `i` of `g`, the
-bits of `v` it can depend on: bitwise operators bit by bit, arithmetic from the bits below,
-shifts and rotations re-indexed (by a variable count, over the count's range), and nothing for
-the bits the facts pin. Those facts are computed with `v` unknown, so the answer holds for
-every value of `v`, not just the ones it takes in context. Then:
+Over the nodes between a node and its inner value, the analysis tracks for every bit which
+bits of the inner value it can depend on (bitwise operators bit by bit, arithmetic from the bits
+below, shifts, rotations and casts re-indexed, nothing for bits the facts pin), and which of
+those *flip* it whatever the others are: its pivots. Bit `k` of `x + c` is flipped by `x_k`,
+because a carry only comes from below; bit `k` of `x ^ (x >> 4)` is flipped by `x_k` and by
+`x_(k+4)`. The map is injective when every bit of the inner value can be recovered: it is the
+one dependency of some output bit not recovered yet, and a pivot of it. Those facts are computed
+with the inner value unknown, so the answer holds for every value, not only the ones it takes in
+context.
 
-- `v ^ g(v)` is a bijection when no bit depends on itself through `g`, directly or through
-  other bits (the dependencies are acyclic): `v` is recovered in dependency order. This covers
-  xorshift steps like `x ^ (x << 13)`, and the mixer's `S`, whose low half reads only the high
-  half, which it leaves alone.
-- `v ± g(v)` is a bijection when every bit of `g` depends only on lower bits of `v`: carries
-  run upward only, so `v` is recovered from bit 0 up.
+That covers xorshift steps like `x ^ (x << 13)`; the mixer's `S`, whose low half reads only the
+high half, which it leaves alone; T-functions, where bit `i` reads only lower bits; and block
+maps, such as a pointer encoding whose low bits are a bijection of the pointer's low bits and
+whose high bits, once those are known, are one of its high bits:
 
 ```rust
+use bitwright::engine::Engine;
 use bitwright::{Context, ParseOptions, Query, Truth, Width};
 
 let mut cx = Context::new();
@@ -103,8 +106,34 @@ assert_eq!(cx.prove(Query::Injective { e: t0, of: u })?, Truth::Unknown);
 // Independent of `u`, or narrower than it: disproved.
 let y = cx.parse("y * 3", &o)?;
 assert_eq!(cx.prove(Query::Injective { e: y, of: u })?, Truth::False);
+
+// A pointer encoding: 42 low bits, then 22 high bits corrected by the low half's carry.
+let compact = |x: &str, [k, l, c, d, h]: [&str; 5]| {
+    format!(
+        "let dec = {x} ^ {l}; \
+         let carry = zext<64>({k} >u ((dec + ({k} - {l} + {c})) & 0x3ffffffffff)); \
+         let high = ({x} >>u 42) - (({x} >>u 41) & {h}) + carry - 1; \
+         (high << 42) | ((dec + ({k} - {l} + {d})) & 0x3ffffffffff)"
+    )
+};
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W64);
+let x = cx.parse("x", &o)?;
+let e = cx.parse(&compact("x", ["k", "l", "c", "d", "h"]), &o)?;
+assert_eq!(cx.prove(Query::Bijective { e, of: x })?, Truth::True);
+// So a comparison with an encoded pointer is a comparison with the pointer.
+let params = ["0x1234567890abcdef", "0x0f0f0f0f0f0f0f0f", "0x11", "0x22", "0x3ffff"];
+let e = cx.parse(&format!("{} == 0x1234567812345678", compact("x", params)), &o)?;
+let out = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x == 0x1dcbac019f989879");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+For a node combining two varying values, the analysis tries the nearest node every varying path
+goes through as the inner value first, then deeper ones: the mixer's `S((x ^ k) * k)` is proved
+over `(x ^ k) * k`, since the multiplication mixes every bit of `x` below. To cancel
+`f(a) == f(b)`, the two sides are first matched as one function of a pair of different
+subterms, as deep as their structure allows.
 
 `Query::Injective { e, of }` and `Query::Bijective { e, of }` answer the question for any
 subexpression `of`, with every value that does not depend on it held fixed. Like every proof,
@@ -114,8 +143,8 @@ simple witness (`e` does not depend on `of`, or is narrower than it). Under
 answer reports the constraints it relied on: `x * k` is a bijection of `x` wherever `k & 1 == 1`
 is assumed.
 
-The analysis looks at no more than 256 nodes of `g`, and at inner values of at most 128 bits;
-larger layers are simply not recognized. Maps that are bijective for reasons it does not
+The analysis looks at no more than 256 nodes at a time, and at inner values of at most 128
+bits; larger layers are simply not recognized. Maps that are bijective for reasons it does not
 model, such as a GF(2)-linear map with cyclic dependencies (`x ^ rotl(x, 5) ^ rotl(x, 9)` at
 32 bits), are not recognized either.
 

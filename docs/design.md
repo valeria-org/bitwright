@@ -955,30 +955,43 @@ that is injective in one operand when the others (its *parameters*) are fixed:
 | `v * k`, `k` proved odd (constant, known bit 0, or assumed) | bijective | `c · k⁻¹` (Newton's iteration) |
 | `zext(v)`, `sext(v)`, `concat(v, k)`, `concat(k, v)` | injective | the part of `c`, if `c` is an image |
 | extension output declared `Invertible::{Injective, Bijective}` in an argument | as declared | `ExtOp::invert`, checked by evaluation |
-| `v ^ g(v)`, `v + g(v)`, `v - g(v)`, `g(v) - v`, triangular | bijective | solved bit by bit, checked by evaluation |
+| a region of nodes over a hole, recovered bit by bit (below) | injective (bijective at one width) | recovered bit by bit, checked by evaluation |
 
 A chain of layers is injective (bijective when every layer is); nothing else is claimed. A node
-whose two operands both depend on the inner value is a layer only in the **triangular** form:
-`g` must be a function of `v` and parameters, and `D_i`, the bits of `v` that bit `i` of `g` can
-depend on, is computed per operator over `g`'s region (at most 256 nodes; `v` at most 128 bits):
-bitwise operators bit by bit, `+ - * neg` from every lower bit, constant shifts and rotations
-re-indexed, variable ones over the count's range plus the count's own dependencies, casts
-re-indexed, everything else from every bit of every operand; a bit the facts pin depends on
-nothing. The facts are computed afresh over the region with `v` unknown (the context's facts of
-`v` would describe only the values it takes in context), parameters keeping their facts. By
-induction over the region, two values of `v` that agree on `D_i` give equal bit `i` of `g`. Then
-`v ^ g(v)` is bijective when the graph `i → D_i` is acyclic (equal images force equal bits level
-by level in topological order; the preimage is recovered the same way, one evaluation of `g` per
-level), and `v ± g(v)`, `g(v) − v` when every `D_i` lies below `i` (bit `i` of the result is bit
-`i` of `v` flipped by lower bits only; recovered from bit 0 up, one evaluation per bit). This
-admits the xorshift involution `h ^ ((h >>u 32) >>u (h >>u 60))`, xorshift steps and T-functions
-such as `u - (((u << 1) | b) & h)`, and refuses by construction `f(x) ^ x`, `f_a(x) ^ f_b(x)`,
-`f_a(x) | f_b(x)` and `u - ((u | b) & h)`.
+whose operands both depend on the inner value is a layer only as a **region**: the nodes between it
+and a *hole* (a node every varying path from it goes through), at most 256 of them, the hole at most
+128 bits, over which a **pivot analysis** proves injectivity. For every bit `k` of every node it
+computes `D_k`, the hole bits the bit can depend on, and its *pivots* `P_k ⊆ D_k`, the hole bits `j`
+with bit `k = hole_j ⊕ φ(D_k \ {j})`: bitwise operators bit by bit (`^` keeps the pivots of each
+operand that the other does not read; `&`, `|` pass an operand's bit where the other is known 1,
+resp. 0), `+ − neg` from every lower bit (keeping the pivots no carry reads), a product with a
+non-varying factor whose low `t` bits are known zero and bit `t` known one as the other factor's
+carry chain moved up by `t`, constant shifts, rotations, casts and `concat` re-indexed, variable
+shifts and rotations over every count their range allows (a rotation's counts reduced modulo the
+width from their full values, never saturated) plus the count's own dependencies (no pivots), a
+select by a non-varying condition keeping the pivots both arms share, everything else from every bit
+of every operand; a bit the facts pin depends on nothing. The facts are computed afresh over the
+region with the hole unknown (the context's facts of the hole would describe only the values it
+takes in context), parameters keeping their facts. By induction over the region, two values of the
+hole that agree on `D_k` give equal bit `k`, and one pivot changed alone flips it. The region is
+injective when every hole bit is *recovered*: it is the only unrecovered dependency of some output
+bit, and a pivot of it; equal images then force equal hole bits in recovery order, and a preimage is
+recovered the same way, one evaluation of the region per level, then checked (a value that does not
+check proves that no preimage exists). The criterion is monotone, so the closure finds every
+recoverable bit. Candidate holes are the dominators of the varying leaves, nearest first (at most
+8): one large region is not compositional (a product mixes every lower bit, so `S((x ^ k) · k)` is
+proved over `(x ^ k) · k`, not over `x`). This admits the xorshift involution `h ^ ((h >>u 32) >>u
+(h >>u 60))`, xorshift steps, T-functions such as `u - (((u << 1) | b) & h)`, and block-triangular
+maps such as the pointer encoding `compact` (low bits a bijection of the low bits; high bits, given
+those, one of the high bits), and refuses by construction `f(x) ^ x`, `f_a(x) ^ f_b(x)`, `f_a(x) |
+f_b(x)` and `u - ((u | b) & h)`.
 
 **The pass** acts only on `==` and `!=` (a bijection preserves no ordering): both sides the same
-layer over different inner values with the same parameters (the same nodes; for a triangular
-layer, `g₁` and `g₂` matched as one function of `v₁` and `v₂`, commutative operands in either
-order, under a step cap) become a comparison of the inner values, repeatedly; a side against a
+layer over different inner values with the same parameters (the same nodes; for a region, the
+sides anti-unified as one function of a pair of different subterms, as deep as their structure
+allows, commutative operands in either order, under a step cap, and the region taken over the
+nearest dominator of that pair on side one that the analysis accepts) become a comparison of the
+inner values, repeatedly; a side against a
 constant is solved through every layer whose parameters are constants, down to `x op f⁻¹(c)`, or
 a truth value when `c` has no preimage; `a₁ | … | aₙ == 0` and `a₁ & … & aₙ == ones` are solved
 leaf by leaf and intersected (one value equal to two constants is false), and kept only when the
@@ -1226,13 +1239,18 @@ casts, compares), each with new admission tests.
    ledger freshness, examples fire, every corpus application decreases the ground order, lints clean.
 5. **Passes.** Each pass's obligation test is exhaustive at W ≤ 6 over its fragment's generators; the
    comparison lattice and range emitter exhaustive at W ≤ 8; the bitwise table at W = 1 (complete).
-   Invertibility: every triangular layer the analysis accepts is checked to be a bijection, and
-   every preimage the unique one, over all values at W ≤ 6 (also for inner values with narrow
-   facts); every cancellation, primitive or triangular, against every assignment of both inner
-   values and a parameter at W ≤ 4, including near misses (`g₂` not quite `g₁` over `v₂`); every
+   Invertibility: every region the analysis accepts is checked to be injective, and every
+   preimage (or its absence) exact, over all values at W ≤ 6, for `v ⊙ g(v)` forms (also for
+   inner values with narrow facts) and for random block maps (disjoint joins of transformed
+   halves, `concat` of extracts, carries through comparisons, selects, and non-injective decoys);
+   an 8-bit `compact` with symbolic parameters is proved and checked at 64 parameter values;
+   every cancellation, primitive or by region, against every assignment of both inner values and
+   a parameter at W ≤ 4, including near misses (`g₂` not quite `g₁` over `v₂`); every
    `Injective` answer, `True` and `False`, against every assignment. Planted analysis bugs (a
-   dropped carry, a self-dependency allowed, a count's range ignored, a one-sided hole, an even
-   multiplier, facts of `v` from context) are each caught.
+   dropped carry, a pivot kept across `^` from a read bit, an even multiplier, a factor's low
+   zeros miscounted, a select by a varying condition, two open bits recovered at once, a count's
+   range ignored, an unchecked preimage, facts of the hole from context, a non-dominating hole)
+   are each caught.
 6. **Engine properties** over random DAGs with sharing (explicit seeds, biased to MBA, casts and
    compares): value preservation against the reference; idempotence of `Completed`; determinism
    across runs and construction orders; budget safety (every budget from 0 upward: no panic, sound

@@ -973,7 +973,7 @@ fn count_at_least(c: &BitVec, w: u16) -> bool {
 }
 
 /// `c mod w` for a shift or rotate count.
-fn count_mod(c: &BitVec, w: u16) -> u64 {
+pub(crate) fn count_mod(c: &BitVec, w: u16) -> u64 {
     let mut rem: u128 = 0;
     for &l in c.limbs().iter().rev() {
         rem = ((rem << 64) | u128::from(l)) % u128::from(w);

@@ -549,3 +549,85 @@ fn finite_domain_facts_as_rules() {
         }
     }
 }
+
+/// The pointer encoding's `compact` (a block-triangular map: the low 42 bits are a bijection of
+/// the low bits, and the high 22 bits, given those, one of the high bits), with its parameters
+/// substituted into the text.
+fn compact(p: &str, x: &str, [k, l, c, d, h]: [&str; 5]) -> String {
+    format!(
+        "let {p}dec = {x} ^ {l}; \
+         let {p}carry = zext<64>({k} >u (({p}dec + ({k} - {l} + {c})) & 0x3ffffffffff)); \
+         let {p}high = ({x} >>u 42) - (({x} >>u 41) & {h}) + {p}carry - 1; \
+         ({p}high << 42) | (({p}dec + ({k} - {l} + {d})) & 0x3ffffffffff)"
+    )
+}
+
+/// The same map as found in the binary, with the add spelled as MBA (`original`).
+fn original(x: &str, [k, l, c, d, h]: [&str; 5]) -> String {
+    format!(
+        "let core = ({k} + {x}) - 2 * ({x} & {l}); \
+         let carry = zext<64>({k} >u ((core + {c}) & 0x3ffffffffff)); \
+         let high = ((((({x} >>u 42) - (({x} >>u 41) & {h})) & 0xffffffff) + carry) & 0xffffffff) \
+                    + 0xffffffff; \
+         ((high & 0xffffffff) << 42) | ((core + {d}) & 0x3ffffffffff)"
+    )
+}
+
+#[test]
+fn pointer_encodings_are_block_triangular() {
+    let o = ParseOptions::width(Width::W64);
+    let params = ["k", "l", "c", "d", "h"];
+    let mut cx = Context::new();
+    let x = sym(&mut cx, "x");
+    // Injective in `x` for every value of the parameters, in either spelling.
+    for src in [compact("", "x", params), original("x", params)] {
+        let e = cx.parse(&src, &o).unwrap();
+        assert_eq!(
+            cx.prove(Query::Bijective { e, of: x }).unwrap(),
+            Truth::True
+        );
+    }
+    // So two encodings with the same parameters are equal only for equal pointers ...
+    let split = |s: String| {
+        let at = s.rfind("; ").unwrap() + 2;
+        (s[..at].to_string(), s[at..].to_string())
+    };
+    let (pa, ea) = split(compact("a", "x", params));
+    let (pb, eb) = split(compact("b", "y", params));
+    let e = cx.parse(&format!("{pa}{pb}({ea}) == ({eb})"), &o).unwrap();
+    let y = sym(&mut cx, "y");
+    assert_eq!(simplify(&mut cx, e), cx.cmp(CmpOpExt::Eq, x, y).unwrap());
+    // ... but not across parameters (Lean: `different_h_counterexample`).
+    let zero_h1 = ["0", "0", "0", "0", "1"];
+    let zero_h0 = ["0", "0", "0", "0", "0"];
+    let (pa, ea) = split(compact("a", "x", zero_h1));
+    let (pb, eb) = split(compact("b", "y", zero_h0));
+    let e = cx.parse(&format!("{pa}{pb}({ea}) == ({eb})"), &o).unwrap();
+    let r = simplify(&mut cx, e);
+    assert_ne!(r, cx.cmp(CmpOpExt::Eq, x, y).unwrap());
+    assert!(
+        at(
+            &mut cx,
+            r,
+            &[("x", 0x600_0000_0000), ("y", 0x200_0000_0000)]
+        )
+        .bit(0)
+        .unwrap()
+    );
+    // Solved at a constant: Lean's `pointerInverse` of 0x1234567812345678 under these
+    // parameters is 0x1dcbac019f989879.
+    let fixed = [
+        "0x1234567890abcdef",
+        "0x0f0f0f0f0f0f0f0f",
+        "0x11",
+        "0x22",
+        "0x3ffff",
+    ];
+    let (p, e) = split(compact("", "x", fixed));
+    let e = cx
+        .parse(&format!("{p}({e}) == 0x1234567812345678"), &o)
+        .unwrap();
+    let pre = k(&mut cx, 0x1dcb_ac01_9f98_9879);
+    let want = cx.cmp(CmpOpExt::Eq, x, pre).unwrap();
+    assert_eq!(simplify(&mut cx, e), want);
+}

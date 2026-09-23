@@ -2,11 +2,28 @@
 
 ## Unreleased
 
+- **Invertibility.** A layer may span several nodes: a *region* between a node and a node every
+  varying path goes through, proved injective by a pivot analysis (per bit, the input bits it
+  reads and those that flip it on their own; injective when every input bit can be recovered
+  from an output bit in turn). This subsumes the triangular maps of 0.2.0 and adds
+  block-triangular ones, such as a pointer encoding whose low bits are a bijection of the
+  pointer's low bits and whose high bits, given those, are one of its high bits; solving at a
+  constant also proves when there is no preimage. Two sides of an equality are anti-unified to
+  find the pair of subterms they differ in. A product by a factor with known low zero bits keeps
+  the other factor's structure (moved up), so `2 * (x & l)` no longer blocks the analysis.
 - **SMT-LIB.** bitwuzla is a tested solver alongside z3: the nightly SMT suites (evaluation of
   exported expressions, the built-in rule proofs up to 512 bits, simplifications with extension
   calls, rewrites under the constraints they rely on) run once per solver, and CI installs
   bitwuzla 0.9.1. No exported script needed to change. The book's SMT-LIB chapter has a new
   section, *Solvers*.
+- **Behavior changes.** More equalities are cancelled or solved by `Phase::Invert` (both
+  built-in strategies): those through such regions.
+- **Fixes.** Soundness: the invertibility analysis saturated rotation counts to 64 bits, so at
+  widths over 64 a rotation by a variable count at or above `2^64` was modeled as a single
+  rotation, and a map that is not injective could be accepted. At 128 bits, 0.2.0 turned
+  `x ^ (rotl(x, y | 2^64) & m) == z ^ (rotl(z, y | 2^64) & m)` into `x == z`, which is wrong at
+  `y = 0`, where the sides are `x & ~m` and `z & ~m`. Counts are now reduced modulo the width
+  exactly.
 
 ## 0.2.0
 

@@ -7,6 +7,7 @@
 //! `build.rs` and `docs/design.md` §4.3).
 
 mod build;
+pub(crate) use build::count_mod;
 pub use build::traps;
 mod eval;
 mod node;
