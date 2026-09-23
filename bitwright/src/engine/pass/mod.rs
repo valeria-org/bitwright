@@ -5,6 +5,7 @@ pub(super) mod bitwise;
 pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;
+pub(super) mod forms;
 pub(super) mod invert;
 pub(super) mod linear;
 pub(super) mod linear_mba;

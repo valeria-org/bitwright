@@ -15,8 +15,8 @@
 use core::fmt;
 use std::sync::Arc;
 
-use super::Facts;
 use super::backward::{backward, holding};
+use super::{FactMap, Facts};
 use crate::error::Error;
 use crate::expr::{Context, Expr};
 use crate::hash::IdMap;
@@ -321,7 +321,7 @@ impl Assumptions {
         store.seeds.push((e, facts));
         if store.infeasible.is_none() {
             let mut p = Propagation {
-                overlay: IdMap::default(),
+                overlay: FactMap::default(),
                 changed: Vec::new(),
                 steps: STEPS,
                 store,
@@ -457,7 +457,7 @@ impl Env {
 struct Propagation<'p> {
     /// Facts under the assumptions so far (the part above a change is dropped whenever one
     /// happens).
-    overlay: IdMap<u32, (Facts, Reliance)>,
+    overlay: FactMap,
     /// Nodes whose facts or orderings changed since the last sweep.
     changed: Vec<u32>,
     steps: u32,
@@ -542,7 +542,7 @@ impl Propagation<'_> {
     /// Drops the cached facts that can depend on node `n`: those of `n` and above (operands
     /// always have lower indices than their users).
     fn invalidate_from(&mut self, n: u32) {
-        self.overlay.retain(|&k, _| k < n);
+        self.overlay.retain_below(n);
     }
 
     /// Queues what `n`'s operands must satisfy given `r` about `n`, and records an assumed

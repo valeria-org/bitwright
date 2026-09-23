@@ -26,6 +26,16 @@ pub(crate) struct Form {
     fin: Fin,
 }
 
+impl super::forms::Parts for Form {
+    fn parts(&self) -> (&BitVec, &[(u32, BitVec)], Fin) {
+        (&self.konst, &self.terms, self.fin)
+    }
+
+    fn from_parts(konst: BitVec, terms: Vec<(u32, BitVec)>, fin: Fin) -> Form {
+        Form { konst, terms, fin }
+    }
+}
+
 impl Form {
     fn atom(n: u32, w: crate::Width) -> Form {
         Form {
@@ -108,7 +118,7 @@ fn xor_op(op: OpCode) -> bool {
 fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.xor.contains_key(&i) {
+        if r.xor.contains(i) {
             continue;
         }
         let node = cx.node(i);
@@ -119,7 +129,7 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
         if !expanded {
             stack.push((i, true));
             for c in node.children() {
-                if !r.xor.contains_key(&c) {
+                if !r.xor.contains(c) {
                     stack.push((c, false));
                 }
             }
@@ -138,13 +148,14 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
         };
         r.xor.insert(i, f);
     }
-    Ok(r.xor[&root].clone())
+    Ok(r.xor.get(root).expect("the root's form was just computed"))
 }
 
 fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
-    let get = |r: &Runner<'_, '_>, j: u32| r.xor[&j].clone();
+    let get =
+        |r: &Runner<'_, '_>, j: u32| r.xor.get(j).expect("operands' forms are computed first");
     Ok(match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),

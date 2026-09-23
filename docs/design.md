@@ -286,7 +286,14 @@ pub struct Expr { index: u32, tag: NonZeroU32 }     // tag: unique per context g
 
 Constants of ≤ 128 bits live in a `u128` pool; wider constants in a limb pool. Extension arguments live in
 an argument pool. About 32 bytes per node plus the interner slot. Facts, memo and pass products are
-separate dense side tables, allocated lazily.
+separate side tables, allocated lazily. A `BitVec` takes 72 bytes whatever its width (a `Facts`,
+six of them, 432), so the tables that hold a value per node pack widths up to 64 into words: base
+facts are six words per node (the known bits and both ranges' bounds) in computation order, found
+through a slot per node index; facts under assumptions and the linear and xor passes' forms are
+packed the same way; the rewrite memo keeps result nodes in pages of 512 node indices per phase,
+with the constraints a result relied on apart (there are none without assumptions). Wider values
+are kept whole. At 520k nodes this is a ninth of the memory for facts and a fifth for a
+simplification, which also takes a sixth of the last-level cache misses.
 
 **Interning.** `hashbrown::HashTable<u32>` keyed by `shash`; full node equality is checked on every
 hit; hits are free against the node budget. The hash seed changes table layout only, never results.

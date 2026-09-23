@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Memory and cache.** A `BitVec` takes 72 bytes whatever its width, so the tables holding a
+  value per node now pack widths up to 64 into words. Base facts are six words per node (a
+  `Facts` is 432 bytes) in a table indexed by node instead of a hash map; facts under
+  assumptions and the linear and xor passes' forms are packed the same way; the rewrite memo
+  keeps result nodes in pages of node indices. On a 520k-node expression, facts take a ninth of
+  the memory (231 MB to 25 MB); a simplification takes a fifth (421 MB to 78 MB) and 37 % fewer
+  cycles, with a third of the L1 misses and a sixth of the last-level ones. On the benchmark
+  suite, in instructions: `simplify/standard` −4.7 %, `simplify/mba` −3.4 %, facts −1.3 % to
+  −11.5 %; `constraints/assume` +1.4 %, and creating an empty `Context` +38 instructions.
 - **SMT-LIB.** `smtlib::import` checks the whole script's syntax, then reads and evaluates one
   command at a time instead of building the script's syntax tree first (tokens are borrowed,
   not copied): memory follows the largest command, not the script. The nightly 200,000-step

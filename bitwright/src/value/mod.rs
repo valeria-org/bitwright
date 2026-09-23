@@ -105,6 +105,16 @@ impl BitVec {
         BitVec { width, limbs }
     }
 
+    /// `x`, which must already fit in `width` bits (so `width` is at most 64 or `x` is small):
+    /// [`Self::wrapping_from_u64`] without the masking, for values read back from storage.
+    #[inline]
+    pub(crate) fn from_canonical_u64(width: Width, x: u64) -> Self {
+        debug_assert!(width.bits() >= 64 || x >> width.bits() == 0);
+        let mut limbs = [0; wide::MAX_LIMBS];
+        limbs[0] = x;
+        BitVec { width, limbs }
+    }
+
     #[inline]
     fn from_u128_masked(width: Width, v: u128) -> Self {
         let mut limbs = [0; MAX_LIMBS];

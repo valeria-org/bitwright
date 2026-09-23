@@ -675,7 +675,71 @@ pub struct Outcome {
 pub(crate) struct Memo {
     epoch: u128,
     assumptions: Option<Assumptions>,
-    phases: Vec<IdMap<u32, (u32, Reliance)>>,
+    phases: Vec<PhaseMemo>,
+}
+
+/// One phase's final results: the result node of every node visited, and the constraints a
+/// result relied on, where it relied on any (only under assumptions).
+#[derive(Clone, Debug, Default)]
+struct PhaseMemo {
+    result: NodeTable,
+    rel: IdMap<u32, Reliance>,
+}
+
+impl PhaseMemo {
+    fn get(&self, n: u32) -> Option<(u32, Reliance)> {
+        let r = self.result.get(n)?;
+        Some((r, self.rel.get(&n).copied().unwrap_or(Reliance::NONE)))
+    }
+
+    fn contains(&self, n: u32) -> bool {
+        self.result.get(n).is_some()
+    }
+
+    fn insert(&mut self, n: u32, r: u32, rel: Reliance) {
+        self.result.insert(n, r);
+        if rel.is_none() {
+            self.rel.remove(&n);
+        } else {
+            self.rel.insert(n, rel);
+        }
+    }
+}
+
+/// A node index per node index, in pages of consecutive indices allocated on first write:
+/// a lookup is two array reads, nodes built together share a page, and nodes never written cost
+/// nothing beyond their page's pointer.
+#[derive(Clone, Default)]
+struct NodeTable {
+    /// Page `p` holds the values of nodes `p * PAGE ..`, each plus one (0: none).
+    pages: Vec<Option<Box<[u32; PAGE]>>>,
+}
+
+const PAGE: usize = 512;
+
+impl NodeTable {
+    fn get(&self, n: u32) -> Option<u32> {
+        let n = n as usize;
+        let page = self.pages.get(n / PAGE)?.as_ref()?;
+        page[n % PAGE].checked_sub(1)
+    }
+
+    fn insert(&mut self, n: u32, v: u32) {
+        let n = n as usize;
+        if n / PAGE >= self.pages.len() {
+            self.pages.resize_with(n / PAGE + 1, || None);
+        }
+        let page = self.pages[n / PAGE].get_or_insert_with(|| Box::new([0; PAGE]));
+        // Node indices are below `u32::MAX` (the arena holds at most `u32::MAX` nodes).
+        page[n % PAGE] = v + 1;
+    }
+}
+
+impl fmt::Debug for NodeTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pages = self.pages.iter().filter(|p| p.is_some()).count();
+        write!(f, "NodeTable({pages} pages)")
+    }
 }
 
 impl Memo {
@@ -690,7 +754,7 @@ impl Memo {
         if !same {
             self.epoch = epoch;
             self.assumptions = assumptions.cloned();
-            self.phases = (0..phases).map(|_| IdMap::default()).collect();
+            self.phases = (0..phases).map(|_| PhaseMemo::default()).collect();
         }
     }
 }
@@ -797,11 +861,11 @@ struct Runner<'r, 'a> {
     /// Sampled verification: the values of every node evaluated so far at each point.
     samples: IdMap<u32, Box<[BitVec]>>,
     /// The linear pass's forms, per node.
-    linear: IdMap<u32, pass::linear::Form>,
+    linear: pass::forms::FormCache<pass::linear::Form>,
     /// The bitwise pass's truth tables, per node.
     bitwise: IdMap<u32, pass::bitwise::Info>,
     /// The xor pass's forms, per node.
-    xor: IdMap<u32, pass::xor::Form>,
+    xor: pass::forms::FormCache<pass::xor::Form>,
     /// The compares pass's descriptions, per node.
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
@@ -834,7 +898,7 @@ impl Runner<'_, '_> {
 
     /// The result for `n` in `phase`, and whether it is final.
     fn lookup(&self, cx: &Context, phase: usize, n: u32) -> Option<(u32, Fin)> {
-        if let Some(&(r, rel)) = cx.memo.phases[phase].get(&n) {
+        if let Some((r, rel)) = cx.memo.phases[phase].get(n) {
             return Some((r, Fin::relying(rel)));
         }
         self.partial[phase].get(&n).copied()
@@ -842,7 +906,7 @@ impl Runner<'_, '_> {
 
     fn set(&mut self, cx: &mut Context, phase: usize, n: u32, r: u32, fin: Fin) {
         if fin.done {
-            cx.memo.phases[phase].insert(n, (r, fin.rel));
+            cx.memo.phases[phase].insert(n, r, fin.rel);
         } else {
             self.partial[phase].insert(n, (r, fin));
         }
@@ -917,7 +981,7 @@ impl Runner<'_, '_> {
                 }
                 Frame::Visit(n) => {
                     if self.lookup(cx, phase, n).is_some() {
-                        if cx.memo.phases[phase].contains_key(&n) {
+                        if cx.memo.phases[phase].contains(n) {
                             self.stats.memo_hits += 1;
                         }
                         stack.pop();
@@ -1349,9 +1413,9 @@ impl Engine {
             partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
             cands: Vec::new(),
             samples: IdMap::default(),
-            linear: IdMap::default(),
+            linear: Default::default(),
             bitwise: IdMap::default(),
-            xor: IdMap::default(),
+            xor: Default::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),
             quarantined_passes: Vec::new(),

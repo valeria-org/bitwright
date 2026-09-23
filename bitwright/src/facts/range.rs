@@ -55,6 +55,12 @@ impl URange {
         (lo.width() == hi.width() && ule(&lo, &hi)).then_some(URange { lo, hi })
     }
 
+    /// `[lo, hi]` from bounds known to form a range (taken from one).
+    pub(crate) fn from_bounds(lo: BitVec, hi: BitVec) -> Self {
+        debug_assert!(lo.width() == hi.width() && ule(&lo, &hi));
+        URange { lo, hi }
+    }
+
     /// The lower bound.
     pub fn lo(&self) -> BitVec {
         self.lo
@@ -132,6 +138,12 @@ impl SRange {
     /// `[lo, hi]`, if the widths match and `lo <=s hi`.
     pub fn new(lo: BitVec, hi: BitVec) -> Option<Self> {
         (lo.width() == hi.width() && sle(&lo, &hi)).then_some(SRange { lo, hi })
+    }
+
+    /// `[lo, hi]` from bounds known to form a range (taken from one).
+    pub(crate) fn from_bounds(lo: BitVec, hi: BitVec) -> Self {
+        debug_assert!(lo.width() == hi.width() && sle(&lo, &hi));
+        SRange { lo, hi }
     }
 
     /// The lower bound.

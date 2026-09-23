@@ -467,12 +467,159 @@ struct Pending {
     pos: usize,
 }
 
+/// Facts of width up to 64 as six words: the known zero and one bits and both ranges' bounds.
+fn to_words(f: &Facts) -> [u64; 6] {
+    let w = |v: BitVec| v.limbs()[0];
+    [
+        w(f.known.known_zero()),
+        w(f.known.known_one()),
+        w(f.urange.lo()),
+        w(f.urange.hi()),
+        w(f.srange.lo()),
+        w(f.srange.hi()),
+    ]
+}
+
+/// The facts of width `w` (at most 64) from their six words.
+fn from_words(w: Width, x: &[u64; 6]) -> Facts {
+    let v = |x: u64| BitVec::from_canonical_u64(w, x);
+    Facts {
+        known: KnownBits::from_masks(v(x[0]), v(x[1])),
+        urange: URange::from_bounds(v(x[2]), v(x[3])),
+        srange: SRange::from_bounds(v(x[4]), v(x[5])),
+    }
+}
+
+/// Facts stored compactly: six words up to 64 bits, whole beyond.
+#[derive(Clone, Debug)]
+enum Packed {
+    Narrow([u64; 6]),
+    Wide(Box<Facts>),
+}
+
+impl Packed {
+    fn new(f: &Facts) -> Packed {
+        if f.width().bits() <= 64 {
+            Packed::Narrow(to_words(f))
+        } else {
+            Packed::Wide(Box::new(*f))
+        }
+    }
+
+    /// The facts, of width `w`.
+    fn get(&self, w: Width) -> Facts {
+        match self {
+            Packed::Narrow(x) => from_words(w, x),
+            Packed::Wide(f) => **f,
+        }
+    }
+}
+
+/// Facts and the constraints they rely on per node, packed: the overlays of facts under
+/// assumptions.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FactMap(IdMap<u32, (Packed, Reliance)>);
+
+impl FactMap {
+    /// The entry of node `i`, of width `w`.
+    pub(crate) fn get(&self, i: u32, w: Width) -> Option<(Facts, Reliance)> {
+        self.0.get(&i).map(|(p, r)| (p.get(w), *r))
+    }
+
+    pub(crate) fn contains_key(&self, i: u32) -> bool {
+        self.0.contains_key(&i)
+    }
+
+    pub(crate) fn insert(&mut self, i: u32, (f, r): (Facts, Reliance)) {
+        self.0.insert(i, (Packed::new(&f), r));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Drops the entries of nodes `n` and above.
+    pub(crate) fn retain_below(&mut self, n: u32) {
+        self.0.retain(|&k, _| k < n);
+    }
+}
+
+/// Base facts per node, stored compactly: facts of width up to 64 bits as six words (the known
+/// zero and one bits and both ranges' bounds) instead of six 512-bit values, wider ones whole.
+/// Entries are appended in the order they are computed (bottom-up), and found through a slot per
+/// node index, so a query walks both tables mostly in order.
+#[derive(Clone, Debug, Default)]
+struct BaseFacts {
+    /// Per node index: 0 if not cached, else `1 + k` for entry `k` of `narrow` (nodes of width up
+    /// to 64) or of `wide`.
+    slot: Vec<u32>,
+    narrow: Vec<[u64; 6]>,
+    wide: Vec<Facts>,
+}
+
+impl BaseFacts {
+    fn contains(&self, i: u32) -> bool {
+        self.slot.get(i as usize).is_some_and(|&s| s != 0)
+    }
+
+    /// The facts of node `i`, of width `w`.
+    fn get(&self, i: u32, w: Width) -> Option<Facts> {
+        let k = (*self.slot.get(i as usize)?).checked_sub(1)? as usize;
+        if w.bits() > 64 {
+            return Some(self.wide[k]);
+        }
+        Some(from_words(w, &self.narrow[k]))
+    }
+
+    fn insert(&mut self, i: u32, f: Facts) {
+        let i = i as usize;
+        if i >= self.slot.len() {
+            self.slot.resize(i + 1, 0);
+        }
+        let narrow = f.width().bits() <= 64;
+        let at = self.slot[i].checked_sub(1).map(|k| k as usize);
+        if !narrow {
+            match at {
+                Some(k) => self.wide[k] = f,
+                None => {
+                    self.wide.push(f);
+                    self.slot[i] = self.wide.len() as u32;
+                }
+            }
+            return;
+        }
+        let x = to_words(&f);
+        match at {
+            Some(k) => self.narrow[k] = x,
+            None => {
+                self.narrow.push(x);
+                self.slot[i] = self.narrow.len() as u32;
+            }
+        }
+    }
+
+    /// Makes room for the nodes below `len` and `more` new entries, so a query grows the tables
+    /// once instead of step by step.
+    fn reserve(&mut self, len: usize, more: usize) {
+        if self.slot.len() < len {
+            self.slot.resize(len, 0);
+        }
+        self.narrow.reserve(more);
+    }
+
+    fn clear(&mut self) {
+        self.slot.clear();
+        self.narrow.clear();
+        self.wide.clear();
+    }
+}
+
 /// The per-context fact cache: base facts per node, one overlay for the most recent
 /// assumption set (keyed by an exact copy of it), and the resumable capped computation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FactCache {
-    base: IdMap<u32, Facts>,
-    overlay: IdMap<u32, (Facts, Reliance)>,
+    base: BaseFacts,
+    overlay: FactMap,
     overlay_key: Option<Assumptions>,
     pending: Option<Pending>,
     /// Transfer functions run so far (never reset; the engine charges differences).
@@ -743,8 +890,8 @@ impl Context {
             _ => return None,
         };
         let w2 = self.width_of(i);
-        let fa = self.facts.base.get(&lo.a)?;
-        let fb = self.facts.base.get(&lo.b)?;
+        let fa = self.cached_facts(lo.a)?;
+        let fb = self.cached_facts(lo.b)?;
         let mul = |x: &BitVec, y: &BitVec| BitVec::bin_unchecked(crate::BinOp::Mul, x, y);
         if signed {
             let ext = |v: BitVec| v.sext(w2).ok();
@@ -793,7 +940,7 @@ impl Context {
             if (k as usize) < n.op.arity() {
                 top.1 += 1;
                 let c = [n.a, n.b, n.c][k as usize];
-                if !self.facts.base.contains_key(&c) && !self.marks.test_and_set(c) {
+                if !self.facts.base.contains(c) && !self.marks.test_and_set(c) {
                     stack.push((c, 0));
                 }
             } else {
@@ -814,8 +961,8 @@ impl Context {
 
     /// [`Self::compute_facts`] with at most `cap` transfers (and at most the context's cap).
     fn compute_facts_cap(&mut self, root: u32, cap: u32) -> Option<Facts> {
-        if let Some(f) = self.facts.base.get(&root) {
-            return Some(*f);
+        if let Some(f) = self.cached_facts(root) {
+            return Some(f);
         }
         let cap = cap.min(self.config().fact_work.max(1));
         if cap == 0 {
@@ -831,23 +978,35 @@ impl Context {
                 pos: 0,
             },
         };
+        let len = self.len();
+        self.facts
+            .base
+            .reserve(len, pending.order.len() - pending.pos);
         let mut done = 0usize;
         while pending.pos < pending.order.len() {
             let i = pending.order[pending.pos];
-            if !self.facts.base.contains_key(&i) {
+            if !self.facts.base.contains(i) {
                 if done >= cap {
                     self.facts.pending = Some(pending);
                     self.facts.capped += 1;
                     return None;
                 }
-                let f = self.transfer_node(i, |c| self.facts.base[&c]);
+                let f = self.transfer_node(i, |c| {
+                    self.cached_facts(c)
+                        .expect("operands' facts are computed first")
+                });
                 self.facts.base.insert(i, f);
                 done += 1;
                 self.facts.work += 1;
             }
             pending.pos += 1;
         }
-        self.facts.base.get(&root).copied()
+        self.cached_facts(root)
+    }
+
+    /// The cached base facts of node `i`.
+    fn cached_facts(&self, i: u32) -> Option<Facts> {
+        self.facts.base.get(i, self.width_of(i))
     }
 
     /// Facts about `e`. If the per-query work cap (`ContextConfig::fact_work`) is reached,
@@ -995,7 +1154,7 @@ impl Context {
     pub(crate) fn overlay_facts(
         &mut self,
         env: &Env,
-        overlay: &mut IdMap<u32, (Facts, Reliance)>,
+        overlay: &mut FactMap,
         root: u32,
         cap: u32,
     ) -> Result<(Facts, Reliance), Reliance> {
@@ -1003,8 +1162,8 @@ impl Context {
             return Err(rel);
         }
         let cap = cap.min(self.config().fact_work.max(1));
-        if let Some(f) = overlay.get(&root) {
-            return Ok(*f);
+        if let Some(f) = overlay.get(root, self.width_of(root)) {
+            return Ok(f);
         }
         let base = |cx: &mut Context, i: u32| {
             let f = cx
@@ -1031,7 +1190,7 @@ impl Context {
             if (k as usize) < n.op.arity() {
                 top.1 += 1;
                 let c = [n.a, n.b, n.c][k as usize];
-                if c >= min && !overlay.contains_key(&c) && !self.marks.test_and_set(c) {
+                if c >= min && !overlay.contains_key(c) && !self.marks.test_and_set(c) {
                     self.facts.walked += 1;
                     stack.push((c, 0));
                 }
@@ -1046,8 +1205,10 @@ impl Context {
             let n = self.node(i);
             let ordering = n.op.as_cmp().and_then(|_| env.relation(n.a, n.b));
             // Operands below `min` depend on no assumption: base facts.
-            let kid = |cx: &mut Context, overlay: &IdMap<u32, (Facts, Reliance)>, c: u32| {
-                overlay.get(&c).copied().unwrap_or_else(|| base(cx, c))
+            let kid = |cx: &mut Context, overlay: &FactMap, c: u32| {
+                overlay
+                    .get(c, cx.width_of(c))
+                    .unwrap_or_else(|| base(cx, c))
             };
             let mut kids = [(Facts::top(Width::W1), Reliance::NONE); 3];
             for (k, c) in n.children().enumerate() {
@@ -1091,8 +1252,7 @@ impl Context {
             overlay.insert(i, (f, rel));
         }
         Ok(overlay
-            .get(&root)
-            .copied()
+            .get(root, self.width_of(root))
             .unwrap_or_else(|| base(self, root)))
     }
 
