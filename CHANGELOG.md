@@ -23,10 +23,17 @@
 - **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a
   solver that returns true is also asked about fragments without bitwise operators in which
   two non-constants are multiplied, and fragments rooted at a constant left shift.
+- **Benchmarks.** `simplify/mba-native`, `simplify/mba-nonlinear` and
+  `simplify/mba-nonlinear-sig` measure the MBA service with each solver on linear and nonlinear
+  MBA (the nonlinear corpus is generated in the repository). The MBA rows print what the work
+  achieved and declined under their numbers. `bitwright-bench --corpus-diff` compares the
+  current MBA defaults with a proposed configuration on generated corpora.
 - **Behavior changes.** With the MBA service, answers that needed a trusted backend certificate
   are now accepted on bitwright's own proof where one applies (with `backend_certificates`
   off, more answers are accepted); answers wrong at a constant of either side are refuted
   earlier. A certificate that does not fit the remaining pass work leaves the node non-final.
+  The gate checks that an answer would make the DAG smaller before proving it, so
+  `MbaStats::not_smaller` also counts answers rejected for cost before any proof.
 
 ## 0.3.1
 

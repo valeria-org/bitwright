@@ -30,7 +30,7 @@ const EVALS_PER_STEP: u64 = 32;
 
 /// The largest expansion over classes tried when turning masked symbols back into unmasked
 /// ones.
-const DECLASS_LIMIT: usize = 4096;
+const DECLASS_LIMIT: usize = 256;
 
 /// Runs [`certify::check`] within `work` and charges what it spent.
 fn certify_within(a: &MbaExpr, b: &MbaExpr, work: &mut Steps) -> certify::Report {
@@ -49,19 +49,20 @@ pub struct NfOptions {
     pub max_atoms: u32,
     /// The most bit classes (distinct bit patterns of the constants read bitwise).
     pub max_classes: u32,
-    /// The most monomials in one normal form (a larger sum or product is an atom).
+    /// The most monomials in one normal form (a larger sum, product, or bitwise function read
+    /// arithmetically is an atom).
     pub max_terms: u32,
     /// The highest degree of a normal form (a product of higher degree is an atom).
     pub max_degree: u32,
 }
 
 impl Default for NfOptions {
-    /// 16 atoms, 16 classes, 4096 monomials, degree 16.
+    /// 16 atoms, 16 classes, 1024 monomials, degree 16.
     fn default() -> Self {
         NfOptions {
             max_atoms: 16,
             max_classes: 16,
-            max_terms: 4096,
+            max_terms: 1024,
             max_degree: 16,
         }
     }
@@ -421,7 +422,15 @@ impl Pass<'_> {
             Form::Const(v) => Poly::constant(v),
             Form::Bits(b) => {
                 self.charge((b.tables.len() as u64) << b.support.len())?;
-                b.to_poly(&self.classes)
+                let p = b.to_poly(&self.classes);
+                if p.len() > self.opts.max_terms as usize {
+                    // Too many monomials to take part in arithmetic: an atom.
+                    tally.declined_terms += 1;
+                    let a = self.verbatim_atom(i, tally)?;
+                    Bits::atom(self.classes.len(), a).to_poly(&self.classes)
+                } else {
+                    p
+                }
             }
             Form::Poly(p) => p,
         };
@@ -768,7 +777,13 @@ fn normalize(
             Def::Verbatim(i) => verbatim(p, i).ok_or_else(internal)?,
             Def::Form(i) | Def::Shift(_, i) => {
                 let form = finish(pass.atom_nf[a].as_ref().ok_or_else(internal)?);
-                let mut r = Render::new(p.vars().to_vec(), w, &pass.classes, &atom_exprs[..a]);
+                let mut r = Render::new(
+                    p.vars().to_vec(),
+                    w,
+                    &pass.classes,
+                    &atom_exprs[..a],
+                    work.left,
+                );
                 let mut cands = candidates(&mut r, &form, &factors);
                 if let Some(v) = verbatim(p, i)
                     && let Some(root) = r.b.import(&v)
@@ -777,7 +792,7 @@ fn normalize(
                 }
                 {
                     use certify::Meter;
-                    work.charge(r.built.saturating_mul(16).max(1))
+                    work.charge(r.work.max(1))
                         .map_err(|()| Decline::Exhausted)?;
                 }
                 tally.candidates += r.built;
@@ -862,7 +877,7 @@ fn prune_null(
         if !present || !g.iter().any(|(m, _)| poly::degree(m) >= 2) {
             continue;
         }
-        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs);
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
         let mut sum = render::Sum::default();
         for (m, c) in &g {
             let Some(t) = r.mono(m) else {
@@ -893,7 +908,8 @@ fn candidates(r: &mut Render<'_>, nf: &Poly, factors: &[Poly]) -> Vec<u32> {
 
 /// The cheapest rendering of `n`: rendered, then again with the factors the best candidate
 /// multiplies, until none is new (a few rounds), so the answer is as good as the factors its
-/// own products offer.
+/// own products offer. Rendering cut short by the budget is [`Decline::Exhausted`]: what it
+/// found need not be the cheapest, and nothing is left to certify it.
 fn best_rendering(
     p: &MbaExpr,
     n: &Normal,
@@ -904,11 +920,14 @@ fn best_rendering(
     let mut factors = n.factors.clone();
     let mut best: Option<(render::Cost, MbaExpr)> = None;
     for _ in 0..3 {
-        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs);
+        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left);
         let cands = candidates(&mut r, &n.nf, &factors);
-        work.charge(r.built.saturating_mul(16).max(1))
-            .map_err(|()| Decline::Exhausted)?;
         tally.candidates += r.built;
+        if r.exhausted() {
+            return Err(Decline::Exhausted);
+        }
+        work.charge(r.work.max(1))
+            .map_err(|()| Decline::Exhausted)?;
         let Some(b) = r.best(&cands) else {
             break;
         };
@@ -1019,7 +1038,7 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
         &mut tally,
     )
     .ok()?;
-    let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs);
+    let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, u64::MAX);
     let mut sum = render::Sum {
         terms: Vec::new(),
         konst: Some(n.nf.konst()),

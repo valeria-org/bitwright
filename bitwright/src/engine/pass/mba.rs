@@ -1,6 +1,6 @@
 //! The MBA phase: lowering, the solver, the evidence gate, lifting (see [`crate::mba`]).
 
-use super::{Fin, PassKind, Runner, Step, Stop, discard, finish};
+use super::{Fin, PassKind, Runner, Step, Stop, discard, finish, shrinks};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -124,14 +124,15 @@ pub(super) fn step(
         combine(kh, LOWERING_VERSION),
         combine(kh ^ 0x6361_6368, m.key()[1]),
     ]);
-    let (cand, verified) = match inner.mba.cache.get(&key) {
+    // The answer, and where it was lifted if it already was.
+    let (cand, lifted) = match inner.mba.cache.get(&key) {
         Some(CacheEntry::NoSimpler) => {
             count(r).cache_hits += 1;
             return Ok(Step::Normal(Fin::FINAL));
         }
         Some(CacheEntry::Simplified(e)) if e.vars() == m.vars() => {
             count(r).cache_hits += 1;
-            (e, true)
+            (e, None)
         }
         _ => {
             r.meter.charge(Counter::MbaCalls, 1)?;
@@ -147,9 +148,23 @@ pub(super) fn step(
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
+                    // Cheap before expensive: an answer that would not make the DAG smaller is
+                    // not worth proving (every check is still required to commit one).
+                    let before = cx.len() as u32;
+                    let e = r.build(cx, |cx| lift_id(cx, &expr, &bindings))?;
+                    if e == n {
+                        return Ok(Step::Normal(Fin::FINAL));
+                    }
+                    if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
+                        count(r).not_smaller += 1;
+                        r.stats.passes.entry("mba").or_default().rejected_cost += 1;
+                        discard(r, cx, before);
+                        return Ok(Step::Normal(fin));
+                    }
                     let own = exact(r, &m, &expr)?;
                     if own.verdict == Verdict::Refuted {
                         count(r).refuted += 1;
+                        discard(r, cx, before);
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     let proved = own.verdict == Verdict::Proved
@@ -160,6 +175,7 @@ pub(super) fn step(
                         || cfg.trust.sampled;
                     if !proved {
                         count(r).proof_unknown += 1;
+                        discard(r, cx, before);
                         // A certificate skipped for lack of budget might decide with more:
                         // not final.
                         let fin = if own.over_budget {
@@ -173,7 +189,7 @@ pub(super) fn step(
                         .mba
                         .cache
                         .put(&key, &CacheEntry::Simplified(expr.clone()));
-                    (expr, false)
+                    (expr, Some((e, before)))
                 }
                 MbaAnswer::NoSimpler => {
                     count(r).no_simpler += 1;
@@ -192,9 +208,13 @@ pub(super) fn step(
             }
         }
     };
-    let _ = verified;
-    let before = cx.len() as u32;
-    let e = r.build(cx, |cx| lift_id(cx, &cand, &bindings))?;
+    let (e, before) = match lifted {
+        Some(x) => x,
+        None => {
+            let before = cx.len() as u32;
+            (r.build(cx, |cx| lift_id(cx, &cand, &bindings))?, before)
+        }
+    };
     // The lifted result must agree with the original term (checks lowering and lifting).
     if e != n {
         r.sample(cx, n)?;

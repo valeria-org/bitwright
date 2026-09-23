@@ -74,7 +74,8 @@ pub struct MbaStats {
     pub refuted: u64,
     /// Answers without accepted evidence.
     pub proof_unknown: u64,
-    /// Accepted answers that would not make the DAG smaller.
+    /// Answers that would not make the DAG smaller (checked before they are proved, and again
+    /// when committing).
     pub not_smaller: u64,
     /// Inputs refused before asking: too many variables, too large, too wide, too small.
     pub too_many_vars: u64,

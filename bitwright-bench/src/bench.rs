@@ -13,6 +13,8 @@ pub struct Bench {
     /// What one iteration does, for the report ("call", "1024 ops", ...).
     pub unit: &'static str,
     body: Box<dyn Fn(&mut Bencher<'_>)>,
+    /// What the work achieved and declined, computed once outside any measurement.
+    note: Option<Box<dyn Fn() -> String>>,
 }
 
 impl std::fmt::Debug for Bench {
@@ -36,7 +38,20 @@ impl Bench {
             iters,
             unit,
             body: Box::new(body),
+            note: None,
         }
+    }
+
+    /// Adds a note: what the benchmarked work achieves and declines (successes, refusals,
+    /// sizes), reported next to its costs. Computed once, never measured.
+    pub fn with_note(mut self, note: impl Fn() -> String + 'static) -> Bench {
+        self.note = Some(Box::new(note));
+        self
+    }
+
+    /// The note, if any.
+    pub fn note(&self) -> Option<String> {
+        self.note.as_ref().map(|f| f())
     }
 }
 

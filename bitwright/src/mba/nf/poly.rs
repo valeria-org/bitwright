@@ -7,6 +7,7 @@
 //! exact).
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use super::classes::{Classes, FULL};
 use crate::facts::known::low_mask;
@@ -109,6 +110,22 @@ pub(crate) fn grlex(a: &Mono, b: &Mono) -> core::cmp::Ordering {
             }
         }
     })
+}
+
+/// A monomial ordered by [`grlex`], for the division algorithm.
+#[derive(Clone, PartialEq, Eq)]
+struct Graded(Mono);
+
+impl Ord for Graded {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        grlex(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for Graded {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// A polynomial: monomials with nonzero coefficients (the empty monomial is the constant).
@@ -311,26 +328,62 @@ impl Poly {
 
     /// `self / f` when `f` divides it exactly and `f`'s leading coefficient is odd (a unit), by
     /// the division algorithm in graded lexicographic order, which then always finds the
-    /// quotient. Each step costs `f.len()`; at most `steps` steps.
-    pub(crate) fn div_exact(&self, f: &Poly, steps: usize) -> Option<Poly> {
-        let (lm, lc) = f.leading()?;
+    /// quotient: each step cancels the remainder's leading term and adds only smaller ones (a
+    /// monomial order is compatible with multiplication).
+    ///
+    /// Work, in term operations, is charged to `budget`: `self.len()` to start, then
+    /// `f.len()` per quotient term; `Err` when it runs out. `Ok(None)`: not divisible so.
+    pub(crate) fn div_exact(&self, f: &Poly, budget: &mut u64) -> Result<Option<Poly>, ()> {
+        let Some((lm, lc)) = f.leading() else {
+            return Ok(None);
+        };
         if !lc.bit(0).unwrap_or(false) {
-            return None;
+            return Ok(None);
+        }
+        *budget = budget.checked_sub(self.len() as u64).ok_or(())?;
+        let Some((top, _)) = self.leading() else {
+            return Ok(Some(Poly::zero(self.w)));
+        };
+        // Most attempts end here: the leading monomial is not a multiple of `f`'s.
+        if mono_div(top, lm).is_none() {
+            return Ok(None);
         }
         let inv = odd_inverse(lc);
-        let mut rest = self.clone();
+        let tail: Vec<(&Mono, &BitVec)> = f.terms.iter().filter(|(m, _)| *m != lm).collect();
+        let mut rest: BTreeMap<Graded, BitVec> = self
+            .terms
+            .iter()
+            .map(|(m, c)| (Graded(m.clone()), *c))
+            .collect();
         let mut q = Poly::zero(self.w);
-        for _ in 0..steps {
-            let Some((m, c)) = rest.leading().map(|(m, c)| (m.clone(), *c)) else {
-                return Some(q);
+        while let Some((Graded(m), c)) = rest.pop_last() {
+            *budget = budget.checked_sub(f.len() as u64).ok_or(())?;
+            let Some(qm) = mono_div(&m, lm) else {
+                return Ok(None);
             };
-            let qm = mono_div(&m, lm)?;
             let qc = mul(&c, &inv);
-            q.add_term(qm.clone(), &qc);
-            let t = Poly::term(self.w, qm, &qc);
-            rest = rest.sub(&t.mul(f));
+            for &(n, d) in &tail {
+                let v = mul(&qc, d);
+                if v.is_zero() {
+                    continue;
+                }
+                match rest.entry(Graded(mono_mul(&qm, n))) {
+                    Entry::Occupied(mut e) => {
+                        let r = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        if r.is_zero() {
+                            e.remove();
+                        } else {
+                            *e.get_mut() = r;
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                    }
+                }
+            }
+            q.add_term(qm, &qc);
         }
-        None
+        Ok(Some(q))
     }
 
     /// The one-position rule: a symbol of a class with the single position `j` takes only the
@@ -454,24 +507,28 @@ impl Poly {
         }
         let mut out = Poly::zero(w);
         for (m, c) in &self.terms {
+            // The monomials of the expansion, built factor by factor.
             let kept: Mono = m.iter().copied().filter(|(s, _)| s.class != FULL).collect();
-            let mut t = Poly::term(w, kept, c);
+            let mut terms: Vec<(Mono, BitVec)> = vec![(kept, *c)];
             for &(s, e) in m.iter().filter(|(s, _)| s.class == FULL) {
-                let mut sum = Poly::zero(w);
-                for k in 0..classes.len() {
-                    sum = sum.add(&Poly::sym(
-                        w,
-                        Sym {
-                            set: s.set,
-                            class: k as u16,
-                        },
-                    ));
-                }
                 for _ in 0..e {
-                    t = t.mul(&sum);
+                    let mut next: Vec<(Mono, BitVec)> =
+                        Vec::with_capacity(terms.len() * classes.len());
+                    for (t, k) in &terms {
+                        for cl in 0..classes.len() {
+                            let sym = Sym {
+                                set: s.set,
+                                class: cl as u16,
+                            };
+                            next.push((mono_mul(t, &vec![(sym, 1)]), *k));
+                        }
+                    }
+                    terms = next;
                 }
             }
-            out = out.add(&t);
+            for (t, k) in terms {
+                out.add_term(t, &k);
+            }
         }
         out
     }
@@ -497,6 +554,12 @@ impl Poly {
             v.sort_unstable();
             v
         };
+        // Every monomial by its shape, including those the loop below adds (some may have
+        // cancelled since: the part of a shape is what is still present).
+        let mut by_shape: BTreeMap<Vec<(u64, u32)>, Vec<Mono>> = BTreeMap::new();
+        for m in self.terms.keys().filter(|m| !m.is_empty()) {
+            by_shape.entry(shape(m)).or_default().push(m.clone());
+        }
         let mut shapes: Vec<Vec<(u64, u32)>> = self
             .terms
             .keys()
@@ -529,13 +592,32 @@ impl Poly {
                 .iter()
                 .map(|&(set, e)| (Sym { set, class: FULL }, e))
                 .collect();
+            // Only the shape's own terms change: reduce their difference with the expansion
+            // (exact reductions of a part are identities of the whole).
             let expansion = Poly::term(w, unmasked.clone(), &c).expand_full(classes);
-            let mut trial = rest.sub(&expansion);
-            trial.reduce_core(classes);
-            if trial.terms.keys().any(|m| !m.is_empty() && shape(m) == sh) {
+            let part = Poly {
+                w,
+                terms: by_shape
+                    .get(&sh)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| rest.terms.get(m).map(|c| (m.clone(), *c)))
+                    .collect(),
+            };
+            let mut diff = part.sub(&expansion);
+            diff.reduce_core(classes);
+            if diff.terms.keys().any(|m| !m.is_empty() && shape(m) == sh) {
                 continue;
             }
-            rest = trial;
+            for m in part.terms.keys() {
+                rest.terms.remove(m);
+            }
+            for (m, c) in &diff.terms {
+                if !m.is_empty() {
+                    by_shape.entry(shape(m)).or_default().push(m.clone());
+                }
+                rest.add_term(m.clone(), c);
+            }
             full.add_term(unmasked, &c);
         }
         full.add(&rest)
@@ -561,4 +643,63 @@ pub(crate) fn odd_inverse(a: &BitVec) -> BitVec {
         x = mul(&x, &BitVec::bin_unchecked(BinOp::Sub, &two, &ax));
     }
     x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A polynomial of up to `n` terms over three symbols, degree at most 3, from `seed`.
+    fn random(w: Width, seed: &mut u64, n: usize) -> Poly {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *seed >> 33
+        };
+        let mut p = Poly::zero(w);
+        for _ in 0..n {
+            let mut m: Mono = Vec::new();
+            for set in 1..4u64 {
+                let e = (next() % 3) as u32;
+                if e > 0 && degree(&m) + e <= 3 {
+                    m.push((Sym { set, class: 0 }, e));
+                }
+            }
+            p.add_term(m, &BitVec::wrapping_from_u64(w, next()));
+        }
+        p
+    }
+
+    #[test]
+    fn exact_division_finds_the_quotient_and_nothing_else() {
+        let mut seed = 7;
+        for w in [Width::W8, Width::W64, Width::new(100).unwrap()] {
+            for _ in 0..200 {
+                let mut f = random(w, &mut seed, 4);
+                let q = random(w, &mut seed, 6);
+                let Some((lm, lc)) = f.leading().map(|(m, c)| (m.clone(), *c)) else {
+                    continue;
+                };
+                // An odd leading coefficient: the quotient is unique and found.
+                if !lc.bit(0).unwrap_or(false) {
+                    f.add_term(lm, &BitVec::one(w));
+                }
+                let p = f.mul(&q);
+                let mut budget = u64::MAX;
+                assert_eq!(p.div_exact(&f, &mut budget), Ok(Some(q.clone())));
+                // Too little budget: refused, not answered.
+                if !p.is_zero() {
+                    let mut none = p.len() as u64 - 1;
+                    assert_eq!(p.div_exact(&f, &mut none), Err(()));
+                }
+                // Whatever it answers is exact.
+                let r = p.add(&random(w, &mut seed, 2));
+                let mut budget = u64::MAX;
+                if let Ok(Some(q2)) = r.div_exact(&f, &mut budget) {
+                    assert_eq!(f.mul(&q2), r);
+                }
+            }
+        }
+    }
 }

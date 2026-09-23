@@ -13,9 +13,11 @@
 //!   --threshold PCT   smallest change reported as one (default 1 for instructions, 5 for CPU time)
 //!   --metric M        compare `instructions` (default when available) or `cpu`
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
+//!   --corpus-diff     print how the proposed MBA defaults change results (no measurement)
 //! ```
 
 mod bench;
+mod corpus_diff;
 mod counter;
 mod suites;
 mod workload;
@@ -35,6 +37,7 @@ struct Options {
     threshold: Option<f64>,
     metric: Option<Metric>,
     fail_on_regression: bool,
+    corpus_diff: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,7 @@ fn parse_args() -> Result<Options, String> {
         threshold: None,
         metric: None,
         fail_on_regression: false,
+        corpus_diff: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -86,6 +90,7 @@ fn parse_args() -> Result<Options, String> {
                 })
             }
             "--fail-on-regression" => o.fail_on_regression = true,
+            "--corpus-diff" => o.corpus_diff = true,
             // `cargo bench` passes this; accept it so the binary works as a bench target too.
             "--bench" => {}
             f if f.starts_with("--") => return Err(format!("unknown option `{f}`")),
@@ -103,6 +108,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if opts.corpus_diff {
+        corpus_diff::report();
+        return ExitCode::SUCCESS;
+    }
     let benches: Vec<_> = suites::all()
         .into_iter()
         .filter(|b| opts.filters.is_empty() || opts.filters.iter().any(|f| b.name.contains(f)))
@@ -182,6 +191,9 @@ fn main() -> ExitCode {
             regressions += usize::from(slower);
         }
         println!("{line}");
+        if let Some(note) = b.note() {
+            println!("{:32}{note}", "");
+        }
         summaries.push(s);
     }
     if let Some(path) = &opts.save {

@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::hash::IdMap;
+
 use super::bits::{self, Bits, anf, mobius, table8};
 use super::classes::{Classes, FULL};
 use super::poly::{Mono, Poly, Sym};
@@ -25,7 +27,7 @@ struct BNode {
 pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
-    memo: HashMap<BNode, u32>,
+    memo: IdMap<BNode, u32>,
 }
 
 /// A candidate's cost: nodes, then operator weight.
@@ -48,7 +50,7 @@ impl Builder {
         Builder {
             vars,
             nodes: Vec::new(),
-            memo: HashMap::new(),
+            memo: IdMap::default(),
         }
     }
 
@@ -297,7 +299,14 @@ pub(crate) struct Render<'a> {
     pub(crate) built: u64,
     /// Per product node built from normal forms: the factor and quotient it multiplies.
     products: HashMap<u32, (Poly, Poly)>,
+    /// Work spent, in the solver's steps (terms and table entries visited, division term
+    /// operations), and the most it may spend: past it, no more candidates are generated.
+    pub(crate) work: u64,
+    limit: u64,
 }
+
+/// Steps per term operation of exact division (a map update with a monomial key).
+const DIVISION_STEP: u64 = 4;
 
 /// A linear combination to emit: terms and a constant.
 #[derive(Clone, Debug, Default)]
@@ -312,6 +321,7 @@ impl<'a> Render<'a> {
         w: Width,
         classes: &'a Classes,
         atom_exprs: &'a [MbaExpr],
+        limit: u64,
     ) -> Render<'a> {
         Render {
             b: Builder::new(vars),
@@ -321,6 +331,39 @@ impl<'a> Render<'a> {
             w,
             built: 0,
             products: HashMap::new(),
+            work: 0,
+            limit,
+        }
+    }
+
+    /// Spends `n` steps; false once past the limit (then callers stop generating candidates).
+    fn spend(&mut self, n: u64) -> bool {
+        self.work = self.work.saturating_add(n);
+        self.work <= self.limit
+    }
+
+    /// Whether candidate generation was cut short by the limit.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.work > self.limit
+    }
+
+    /// `p / f` if exact, charged to the meter; at most `(4·|p| + 16)·|f|` term operations.
+    fn divide(&mut self, p: &Poly, f: &Poly) -> Option<Poly> {
+        let cap = (4 * p.len() as u64 + 16) * f.len() as u64 + p.len() as u64;
+        let room = self.limit.saturating_sub(self.work) / DIVISION_STEP;
+        let start = cap.min(room);
+        let mut left = start;
+        let q = p.div_exact(f, &mut left);
+        self.spend((start - left) * DIVISION_STEP + 1);
+        match q {
+            Ok(q) => q,
+            Err(()) => {
+                if room < cap {
+                    // Stopped by the limit rather than by the division's own bound.
+                    self.work = self.limit.saturating_add(1);
+                }
+                None
+            }
         }
     }
 
@@ -399,6 +442,7 @@ impl<'a> Render<'a> {
     /// shifts, the constant last.
     pub(crate) fn sum(&mut self, s: &Sum) -> u32 {
         let w = self.w;
+        self.spend(4 * s.terms.len() as u64 + 1);
         let mut acc: Option<u32> = None;
         type Terms = Vec<(u32, BitVec)>;
         let (pos, neg): (Terms, Terms) = s
@@ -497,6 +541,9 @@ impl<'a> Render<'a> {
         let w = self.w;
         let s = support.len();
         let mut out = Vec::new();
+        if !self.spend(4u64 << s) {
+            return out;
+        }
         if s == 0 {
             let v = if t[0] & 1 == 1 {
                 BitVec::ones(w)
@@ -608,6 +655,9 @@ impl<'a> Render<'a> {
     pub(crate) fn bits(&mut self, f: &Bits) -> Vec<u32> {
         let w = self.w;
         let s = f.support.len();
+        if !self.spend((f.tables.len() as u64) << s) {
+            return Vec::new();
+        }
         if f.uniform() {
             return self.uniform(&f.tables[0], &f.support);
         }
@@ -716,6 +766,9 @@ impl<'a> Render<'a> {
     pub(crate) fn linear_sums(&mut self, p: &Poly) -> Vec<Sum> {
         let w = self.w;
         let mut out: Vec<Sum> = Vec::new();
+        if !self.spend(p.len() as u64 * self.classes.len() as u64) {
+            return out;
+        }
         if let Some(f) = Bits::from_linear(&p.expand_full(self.classes), self.classes) {
             for n in self.bits(&f) {
                 out.push(Sum {
@@ -734,11 +787,13 @@ impl<'a> Render<'a> {
             // Per atom set, the coefficient of its widest class becomes an unmasked term; the
             // other classes keep their differences.
             let mut widest: BTreeMap<u64, (u32, BitVec)> = BTreeMap::new();
+            let mut covered: BTreeMap<u64, u32> = BTreeMap::new();
             for (m, c) in p.terms() {
                 if let Some(&(s, _)) = m.first()
                     && s.class != FULL
                 {
                     let size = count_ones(self.classes.mask(usize::from(s.class)));
+                    *covered.entry(s.set).or_default() += size;
                     let e = widest.entry(s.set).or_insert((0, BitVec::zero(w)));
                     if size > e.0 {
                         *e = (size, *c);
@@ -747,13 +802,7 @@ impl<'a> Render<'a> {
             }
             // Classes a set has no term in have coefficient 0: those count too.
             for (&set, e) in widest.iter_mut() {
-                let covered: u32 = p
-                    .terms()
-                    .keys()
-                    .filter_map(|m| m.first())
-                    .filter(|(s, _)| s.set == set && s.class != FULL)
-                    .map(|(s, _)| count_ones(self.classes.mask(usize::from(s.class))))
-                    .sum();
+                let covered = covered.get(&set).copied().unwrap_or(0);
                 let missing = u32::from(w.bits()) - covered.min(u32::from(w.bits()));
                 if missing > e.0 {
                     *e = (missing, BitVec::zero(w));
@@ -863,10 +912,9 @@ impl<'a> Render<'a> {
                     .chain(core::iter::once(&c))
                     .max_by_key(|&&x| (prec(x), core::cmp::Reverse(x)))
                     .unwrap_or(&c);
+                let z = BitVec::zero(w);
                 let fits = g.iter().chain(core::iter::once(&c)).all(|&x| {
-                    let keys: Vec<&u64> = coef[x].keys().chain(coef[rep].keys()).collect();
-                    keys.into_iter().all(|k| {
-                        let z = BitVec::zero(w);
+                    coef[x].keys().chain(coef[rep].keys()).all(|k| {
                         same(
                             coef[x].get(k).unwrap_or(&z),
                             coef[rep].get(k).unwrap_or(&z),
@@ -932,6 +980,9 @@ impl<'a> Render<'a> {
             _ => {
                 let mut choice = vec![0usize; options.len()];
                 for g in 0..options.len() {
+                    if options[g].len() < 2 {
+                        continue;
+                    }
                     let mut best: Option<(Cost, usize)> = None;
                     for k in 0..options[g].len() {
                         choice[g] = k;
@@ -983,9 +1034,11 @@ impl<'a> Render<'a> {
                 None => return Vec::new(),
             }
         };
-        let steps = 4 * p.len() + 16;
         let mut parts: Vec<Sum> = Vec::new();
         let mut naive = Sum::default();
+        if !self.spend(nl.len() as u64 * u64::from(nl.degree())) {
+            return Vec::new();
+        }
         for (m, c) in nl.terms() {
             match self.mono(m) {
                 Some(t) => naive.terms.push((t, *c)),
@@ -1001,7 +1054,10 @@ impl<'a> Render<'a> {
             };
             fs.extend(common_symbols(&nl).into_iter().map(|s| Poly::sym(w, s)));
             for f in &fs {
-                if let Some(q) = nl.div_exact(f, steps)
+                if self.exhausted() {
+                    break;
+                }
+                if let Some(q) = self.divide(&nl, f)
                     && let Some(x) = self.product(f, &q, factors, depth)
                 {
                     parts.push(Sum {
@@ -1021,7 +1077,10 @@ impl<'a> Render<'a> {
             .collect();
         if depth < MAX_DEPTH {
             for f in factors {
-                if let Some(q) = p.div_exact(f, steps)
+                if self.exhausted() {
+                    break;
+                }
+                if let Some(q) = self.divide(p, f)
                     && let Some(x) = self.product(f, &q, factors, depth)
                 {
                     out.push(x);
@@ -1051,6 +1110,9 @@ impl<'a> Render<'a> {
     /// corners with value `v`.
     fn group(&mut self, coef: &BTreeMap<u64, BitVec>, mask: &BitVec) -> Option<Vec<Sum>> {
         let w = self.w;
+        if !self.spend(coef.len() as u64 * 8) {
+            return None;
+        }
         let mut options: Vec<Sum> = Vec::new();
         // Masked conjunctions.
         let mut conj = Sum::default();
@@ -1127,7 +1189,7 @@ impl<'a> Render<'a> {
     ) -> Vec<Sum> {
         let w = self.w;
         let s = support.len();
-        if s < 2 {
+        if !(2..=3).contains(&s) {
             return Vec::new();
         }
         // The group's coefficients by subset of support positions.
@@ -1140,14 +1202,30 @@ impl<'a> Render<'a> {
                 .fold(0usize, |q, (j, _)| q | 1 << j);
             d[q] = *k;
         }
-        if (0..1usize << s).all(|q| q.count_ones() < 2 || d[q].is_zero()) {
+        if (0..1usize << s).all(|q| q.count_ones() < 2 || d[q].is_zero())
+            || !self.spend(1u64 << ((1 << s) + s))
+        {
             return Vec::new();
         }
         let mut out = Vec::new();
+        // Per Möbius coefficient (a small integer): the inverse of its odd part, computed once.
+        let mut inverses: Vec<(i64, BitVec)> = Vec::new();
+        let wide: Vec<usize> = (0..1usize << s).filter(|q| q.count_ones() >= 2).collect();
+        // `c·a_q = d_q` needs `a_q ≠ 0` wherever `d_q ≠ 0`: most tables fail that already.
+        let needed = wide
+            .iter()
+            .filter(|&&q| !d[q].is_zero())
+            .fold(0u32, |m, &q| m | 1 << q);
         for tt in 0..1u32 << (1 << s) {
             let table = [u64::from(tt)];
             let a = mobius(&table, s);
-            let wide: Vec<usize> = (0..1usize << s).filter(|q| q.count_ones() >= 2).collect();
+            let present = wide
+                .iter()
+                .filter(|&&q| a[q] != 0)
+                .fold(0u32, |m, &q| m | 1 << q);
+            if needed & !present != 0 {
+                continue;
+            }
             let Some(&pivot) = wide
                 .iter()
                 .filter(|&&q| a[q] != 0)
@@ -1161,9 +1239,17 @@ impl<'a> Render<'a> {
                 continue;
             }
             // c = (d / 2^v)·u⁻¹ mod 2^(W−v), u the odd part of a.
-            let u = crate::facts::known::bv_lshr(&aq, v);
+            let inv = match inverses.iter().find(|(k, _)| *k == a[pivot]) {
+                Some((_, x)) => *x,
+                None => {
+                    let u = crate::facts::known::bv_lshr(&aq, v);
+                    let x = super::poly::odd_inverse(&u);
+                    inverses.push((a[pivot], x));
+                    x
+                }
+            };
             let dv = crate::facts::known::bv_lshr(&d[pivot], v);
-            let c0 = BitVec::bin_unchecked(BinOp::Mul, &dv, &super::poly::odd_inverse(&u));
+            let c0 = BitVec::bin_unchecked(BinOp::Mul, &dv, &inv);
             let step =
                 crate::facts::known::bv_shl(&BitVec::one(w), u32::from(w.bits()).saturating_sub(v));
             let mut chosen: Option<BitVec> = None;

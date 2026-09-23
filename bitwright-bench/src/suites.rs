@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use bitwright::engine::{Engine, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
-use bitwright::mba::{MbaConfig, MbaTrust, SignatureSolver};
+use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{
     Assumptions, BinOp, BitVec, CmpOpExt, Context, Expr, ParseOptions, Query, SymbolKey, Width,
 };
@@ -284,8 +284,9 @@ fn constraints(v: &mut Vec<Bench>) {
     ));
 }
 
-/// The simplifier: the standard strategy on random DAGs, the deobfuscation strategy with the
-/// native MBA solver on linear MBA, and a fresh tiny context per call.
+/// The simplifier: the standard strategy on random DAGs, the deobfuscation strategy with the MBA
+/// service (the signature and the normal-form solvers, on linear and nonlinear MBA), and a
+/// fresh tiny context per call.
 fn simplify(v: &mut Vec<Bench>) {
     for &bits in &[8u16, 32, 64] {
         v.push(Bench::new(
@@ -320,39 +321,103 @@ fn simplify(v: &mut Vec<Bench>) {
             },
         ));
     }
-    for &bits in &[8u16, 64] {
-        v.push(Bench::new(
-            format!("simplify/mba/{bits}"),
-            10,
-            "20 exprs",
-            move |b| {
+    // The MBA service on linear MBA (the benchmark corpus) with the signature solver and the
+    // native one, and on nonlinear MBA with both; each with bitwright's own evidence only.
+    type Solver = fn() -> Arc<dyn MbaSolver>;
+    let signature: Solver = || Arc::new(SignatureSolver);
+    let native: Solver = || Arc::new(NormalFormSolver::default());
+    let rows: [(&str, Solver, bool, &[u16]); 4] = [
+        ("simplify/mba", signature, false, &[8, 64]),
+        ("simplify/mba-native", native, false, &[8, 64]),
+        ("simplify/mba-nonlinear", native, true, &[8, 64]),
+        ("simplify/mba-nonlinear-sig", signature, true, &[64]),
+    ];
+    for (group, solver, nonlinear, widths) in rows {
+        for &bits in widths {
+            let texts = move || {
+                if nonlinear {
+                    workload::nonlinear_mba_corpus(23, 20, bits)
+                } else {
+                    workload::mba_corpus(11, 20)
+                }
+            };
+            let engine = move || {
                 let config = MbaConfig::default()
                     .with_trust(MbaTrust::default().with_backend_certificates(false));
-                let engine = Engine::builder()
+                Engine::builder()
                     .builtin()
                     .strategy(Strategy::deobfuscate().with_mba(config))
-                    .mba_solver(Arc::new(SignatureSolver))
+                    .mba_solver(solver())
                     .build()
-                    .expect("engine");
-                let texts = workload::mba_corpus(11, 20);
-                let o = ParseOptions::width(workload::width(bits));
-                b.iter_batched(
-                    || {
-                        let mut cx = Context::new();
-                        let roots: Vec<Expr> = texts
-                            .iter()
-                            .map(|t| cx.parse(t, &o).expect("MBA parses"))
-                            .collect();
-                        (cx, roots)
-                    },
-                    |(mut cx, roots)| {
-                        engine
-                            .run(&mut cx, &roots, Default::default())
-                            .expect("simplify")
-                    },
-                );
-            },
-        ));
+                    .expect("engine")
+            };
+            v.push(
+                Bench::new(format!("{group}/{bits}"), 10, "20 exprs", move |b| {
+                    let engine = engine();
+                    let texts = texts();
+                    let o = ParseOptions::width(workload::width(bits));
+                    b.iter_batched(
+                        || {
+                            let mut cx = Context::new();
+                            let roots: Vec<Expr> = texts
+                                .iter()
+                                .map(|t| cx.parse(t, &o).expect("MBA parses"))
+                                .collect();
+                            (cx, roots)
+                        },
+                        |(mut cx, roots)| {
+                            engine
+                                .run(&mut cx, &roots, Default::default())
+                                .expect("simplify")
+                        },
+                    );
+                })
+                .with_note(move || {
+                    let engine = engine();
+                    let o = ParseOptions::width(workload::width(bits));
+                    let mut cx = Context::new();
+                    let roots: Vec<Expr> = texts()
+                        .iter()
+                        .map(|t| cx.parse(t, &o).expect("MBA parses"))
+                        .collect();
+                    let size = |cx: &mut Context, r: &[Expr]| match cx.dag_size(r, u32::MAX) {
+                        Ok(bitwright::Bounded::Exact(n)) => n,
+                        _ => 0,
+                    };
+                    let before = size(&mut cx, &roots);
+                    let out = engine
+                        .run(&mut cx, &roots, Default::default())
+                        .expect("simplify");
+                    let after: Vec<Expr> = out.roots.iter().map(|r| r.expr).collect();
+                    let after = size(&mut cx, &after);
+                    let m = &out.stats.mba;
+                    let c = &m.certificates;
+                    format!(
+                        "nodes {before} -> {after}; mba: {} simplified, {} not smaller, {} no \
+                         simpler, {} unsupported, {} exhausted, {} unproved, {} refuted, {} too \
+                         small, {} too many vars; proofs {} ({} signature, {} single-bit, {} \
+                         sparse, {} grid, {} exhaustive, {} over atoms), {} points",
+                        m.simplified,
+                        m.not_smaller,
+                        m.no_simpler,
+                        m.unsupported,
+                        m.exhausted,
+                        m.proof_unknown,
+                        m.refuted,
+                        m.too_small,
+                        m.too_many_vars,
+                        c.proved,
+                        c.signature,
+                        c.single_bit,
+                        c.sparse,
+                        c.grid,
+                        c.exhaustive,
+                        c.compositional,
+                        c.points
+                    )
+                }),
+            );
+        }
     }
     v.push(Bench::new(
         "simplify/tiny-context/64",

@@ -1065,19 +1065,21 @@ pub mod mba {
 - **Gate.** An answer must have the input's variables and width, agree with the input at 64
   points (a refutation check that always runs: zero, all-ones, one and the signed minimum, the
   constants of both sides with their neighbours `c ± 1`, `−c`, `~c`, points whose set bits lie
-  at one position, and seeded random points), and carry exact evidence, in this order:
-  bitwright's own certificates (below), a configured `EquivalenceProver`'s proof, the
-  backend's `Proved` or `Certified` claim if `trust.backend_certificates` (the default), or
-  agreement at the sampled points only if `trust.sampled`. The lifted result must then agree
-  with the original expression at seeded symbol values (this checks lowering and lifting,
-  which no proof about the lowered form can), make the DAG smaller (§8), and pass the
-  postconditions and the host veto (§6.4). **Trusting backend certificates means trusting the
-  backend**: an answer wrong at a point no sample reaches is caught only when bitwright's own
-  evidence applies; hosts that need independence set `backend_certificates: false`. The
-  gate's own evaluations (sampling and certificates, in blocks of 256 points on a compiled,
-  batched evaluator) are charged to `Budget::pass_work`, so a budget or deadline can stop
-  them; a certificate larger than what is left is not started, and the node stays non-final
-  (more budget may prove it). An answer refuted after lifting leaves no live nodes behind.
+  at one position, and seeded random points), make the DAG smaller once lifted (§8; checked
+  before any proof, so an answer that would be rejected for cost is not proved), and carry
+  exact evidence, in this order: bitwright's own certificates (below), a configured
+  `EquivalenceProver`'s proof, the backend's `Proved` or `Certified` claim if
+  `trust.backend_certificates` (the default), or agreement at the sampled points only if
+  `trust.sampled`. The lifted result must then agree with the original expression at seeded
+  symbol values (this checks lowering and lifting, which no proof about the lowered form
+  can), and pass the postconditions and the host veto (§6.4). **Trusting backend
+  certificates means trusting the backend**: an answer wrong at a point no sample reaches is
+  caught only when bitwright's own evidence applies; hosts that need independence set
+  `backend_certificates: false`. The gate's own evaluations (sampling and certificates, in
+  blocks of 256 points on a compiled, batched evaluator) are charged to `Budget::pass_work`,
+  so a budget or deadline can stop them; a certificate larger than what is left is not
+  started, and the node stays non-final (more budget may prove it). An answer refuted after
+  lifting, or rejected for cost, leaves no live nodes behind.
 - **Certificates** (`mba::certify`, also `NativeProver`). Each is a finite evaluation test,
   complete for its fragment, sized before it runs; the cheapest that applies is run.
   - *Signature*: linear MBA with only 0 and all-ones constants inside bitwise parts is
@@ -1139,8 +1141,9 @@ pub mod mba {
     its reduced normal form over lower atoms, so equal definitions share one atom
     (`((x ^ y) + 2·(x & y)) & z` is `(x + y) & z`, and `((x + y) & z) + ((x + y) & ~z)` is
     `x + y`). A right shift is an atom keyed by its amount and its operand's normal form (so
-    `(s >> 3) + ((x + y) >> 3)` with `s` equal to `x + y` is `2·((x + y) >> 3)`). Casts, and
-    sums or products over the size limits, are atoms kept as they are. Every atom is rendered
+    `(s >> 3) + ((x + y) >> 3)` with `s` equal to `x + y` is `2·((x + y) >> 3)`). Casts, sums
+    or products over the size limits, and bitwise functions read arithmetically whose
+    polynomial would have more than `max_terms` monomials are atoms kept as they are. Every atom is rendered
     once, lower atoms first, from its own cheapest form (the input subterm as it is among the
     candidates), and shared by everything that uses it. Relations between atoms (between
     `x >> 1` and `x`) are not seen: that loses completeness, never soundness.
@@ -1195,8 +1198,12 @@ pub mod mba {
     none fit but the refutation sample agrees (the gate then decides on its own evidence).
     Budget exhaustion before an answer is `Exhausted`; every decline is counted
     (`NfStats`: fragments reached, atoms, candidates, null parts, certificates, declines by
-    reason). Steps count nodes, table words, monomial products and candidate nodes, and one
-    per 32 node evaluations of a certificate.
+    reason). Steps count nodes, table words and monomial products; rendering work (terms and
+    table entries visited, four per term operation of a division, each division also bounded
+    by its dividend's size); and one per 32 node evaluations of a certificate. Rendering
+    stops generating candidates when the budget runs out, and the answer is then
+    `Exhausted`: a question's time is bounded by its budget (about 40 to 60 ns per step on
+    the benchmark machine, so tens of milliseconds at the default `2^20`).
   - It asks to see polynomials too (`MbaSolver::polynomial_fragments`, default false):
     `Phase::Mba` then also asks about fragments without bitwise operators in which two
     non-constants are multiplied, and about fragments rooted at a constant left shift (the

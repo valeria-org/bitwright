@@ -535,16 +535,15 @@ impl Points {
         masks: &[L::M],
     ) -> usize {
         for c in cols.iter_mut() {
-            c.clear();
+            if c.len() != BLOCK {
+                c.clear();
+                c.resize(BLOCK, L::default());
+            }
         }
         let mut n = 0;
-        while n < BLOCK && !self.done {
-            for (v, col) in cols.iter_mut().enumerate() {
-                let _ = v;
-                col.push(L::default());
-            }
-            match self.cert {
-                Cert::Signature => {
+        match self.cert {
+            Cert::Signature => {
+                while n < BLOCK && !self.done {
                     for (j, &v) in used.iter().enumerate() {
                         cols[v][n] = if self.next >> j & 1 == 1 {
                             L::not(L::default(), masks[v])
@@ -554,8 +553,11 @@ impl Points {
                     }
                     self.next += 1;
                     self.done = self.next >= self.total;
+                    n += 1;
                 }
-                Cert::Exhaustive => {
+            }
+            Cert::Exhaustive => {
+                while n < BLOCK && !self.done {
                     let mut rest = self.next;
                     for &v in used {
                         let bits = vars[v].bits();
@@ -565,8 +567,11 @@ impl Points {
                     }
                     self.next += 1;
                     self.done = self.next >= self.total;
+                    n += 1;
                 }
-                Cert::Grid => {
+            }
+            Cert::Grid => {
+                while n < BLOCK && !self.done {
                     for (j, &v) in used.iter().enumerate() {
                         cols[v][n] = L::small(self.ctr[j], masks[v]);
                     }
@@ -579,8 +584,11 @@ impl Points {
                         }
                         self.ctr[j] = 0;
                     }
+                    n += 1;
                 }
-                Cert::SingleBit | Cert::Sparse => {
+            }
+            Cert::SingleBit | Cert::Sparse => {
+                while n < BLOCK && !self.done {
                     for (j, &v) in used.iter().enumerate() {
                         let mut x = L::default();
                         for (s, &pos) in self.combo.iter().enumerate() {
@@ -591,9 +599,9 @@ impl Points {
                         cols[v][n] = x;
                     }
                     self.advance_sparse();
+                    n += 1;
                 }
             }
-            n += 1;
         }
         n
     }

@@ -363,6 +363,39 @@ pub(super) fn worth_building(
     }))
 }
 
+/// Whether replacing `n` by `e` (already built) makes the DAG strictly smaller: `e` needs fewer
+/// nodes than replacing `n` frees. `Err(fin)` when it does not, with what that contributes to
+/// the node's finality: a rejection that only sharing caused may flip once other users of the
+/// region are simplified away later in the walk, so it is not final and a later round decides
+/// again.
+pub(super) fn shrinks(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Result<(), Fin>, Stop> {
+    let mut sorted = atoms.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let order = region(r, cx, n, &sorted)?;
+    r.meter.check()?;
+    let set: IdMap<u32, ()> = order.iter().map(|&i| (i, ())).collect();
+    let Some((new, kept)) = needed(r, cx, e, &sorted, &set)? else {
+        return Ok(Err(Fin::FINAL));
+    };
+    let freed = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), true)?;
+    if new >= freed {
+        let alone = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), false)?;
+        return Ok(Err(if new < alone {
+            Fin::PROVISIONAL
+        } else {
+            Fin::FINAL
+        }));
+    }
+    Ok(Ok(()))
+}
+
 /// Commits `e` (built from arena index `before` on) for `n` when it makes the DAG strictly
 /// smaller (it needs fewer nodes than replacing `n` frees) and passes the postconditions and
 /// the host veto.
@@ -382,33 +415,11 @@ pub(super) fn finish(
         r.stats.passes.entry(name).or_default().noop += 1;
         return Ok(Step::Normal(fin));
     }
-    let mut sorted = atoms.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let reject = |r: &mut Runner<'_, '_>, cx: &Context| {
+    if let Err(more) = shrinks(r, cx, n, e, atoms)? {
+        // A rejection that only sharing caused is not final (see `shrinks`).
         r.stats.passes.entry(name).or_default().rejected_cost += 1;
         discard(r, cx, before);
-        Ok(Step::Normal(fin))
-    };
-    let order = region(r, cx, n, &sorted)?;
-    r.meter.check()?;
-    let set: IdMap<u32, ()> = order.iter().map(|&i| (i, ())).collect();
-    let Some((new, kept)) = needed(r, cx, e, &sorted, &set)? else {
-        return reject(r, cx);
-    };
-    let freed = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), true)?;
-    if new >= freed {
-        // A rejection that only sharing caused may flip once other users of the region are
-        // simplified away later in the walk: not final, so a later round decides again.
-        let alone = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), false)?;
-        let fin = if new < alone {
-            fin.and(Fin::PROVISIONAL)
-        } else {
-            fin
-        };
-        r.stats.passes.entry(name).or_default().rejected_cost += 1;
-        discard(r, cx, before);
-        return Ok(Step::Normal(fin));
+        return Ok(Step::Normal(fin.and(more)));
     }
     match r.accept(cx, By::Pass(name), true, n, e, fin.rel)? {
         Accept::Yes => {
