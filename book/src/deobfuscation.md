@@ -108,8 +108,11 @@ bitwise operator treats alike), so constants inside bitwise operators are no obs
 Products of bitwise terms are multiplied out symbolically, so they cancel exactly:
 `(x & y)·(x | y) + (x & ~y)·(~x & y)` is `x·y`, `2^63·(x·x + x)` is 0 at 64 bits, and a sum that
 is a product comes out as one (`x·(x & y) + y·(x & y) − (x & y)²` is `(x | y)·(x & y)`).
-Subterms it cannot see through become atoms. Every answer is certified against its input before
-it is returned, and the evidence gate checks it again.
+Subterms it cannot see through become atoms: arithmetic under a bitwise operator (unless it is
+secretly a bitwise function), right shifts and casts. Atoms with equal normal forms are one atom,
+so `((x ^ y) + 2·(x & y)) & z` is `(x + y) & z` and `((x + y) & z) + ((x + y) & ~z)` is `x + y`.
+Every answer is certified against its input before it is returned, and the evidence gate checks
+it again.
 
 ```rust
 use std::sync::Arc;

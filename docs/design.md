@@ -1107,7 +1107,10 @@ pub mod mba {
     compared by a direct test; an identity over independent atoms holds for any values of
     them. Skeletons that differ only prove nothing (`Unknown`); `Refuted` always comes with a
     real input where the sides differ. Every class is cross-checked against the sample; a
-    disagreement would be a bug and declines.
+    disagreement would be a bug and declines. Atoms are paired by evaluation and proof only,
+    never by the solver's normal forms: definitions with equal normal forms agree at the
+    sample and are then proved equal like any others, so the gate's soundness does not depend
+    on the normal-form code.
 
   The degree-`d` test was derived for this design and is confirmed by exhaustive tests at
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
@@ -1131,6 +1134,16 @@ pub mod mba {
   - *Recognition.* A degree-≤1 form is a bitwise function exactly when, in every class, the
     constant's bits there are all 0 or all 1 (`k_c`) and `k_c + Σ_{∅≠S⊆p} γ_{c,S}` is 0 or 1
     modulo `2^(W−τ_c)` at every corner `p`; that is the table.
+  - *Atoms.* Arithmetic read by a bitwise operator is first tested for being a bitwise
+    function (so `((x ^ y) + 2·(x & y) − y) & z` is `x & z`); otherwise it is an atom keyed by
+    its reduced normal form over lower atoms, so equal definitions share one atom
+    (`((x ^ y) + 2·(x & y)) & z` is `(x + y) & z`, and `((x + y) & z) + ((x + y) & ~z)` is
+    `x + y`). A right shift is an atom keyed by its amount and its operand's normal form (so
+    `(s >> 3) + ((x + y) >> 3)` with `s` equal to `x + y` is `2·((x + y) >> 3)`). Casts, and
+    sums or products over the size limits, are atoms kept as they are. Every atom is rendered
+    once, lower atoms first, from its own cheapest form (the input subterm as it is among the
+    candidates), and shared by everything that uses it. Relations between atoms (between
+    `x >> 1` and `x`) are not seen: that loses completeness, never soundness.
   - *Polynomials.* A product of two non-constants multiplies the operands' forms out
     (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
     `max_degree` the product is an atom). Symbols are treated as independent variables, which

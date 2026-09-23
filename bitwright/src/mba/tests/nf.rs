@@ -77,9 +77,15 @@ fn normal_forms_and_candidates_equal_the_input_exhaustively() {
         let width = Width::new(w).unwrap();
         let t = if w <= 4 { 3 } else { 2 };
         let vars = vec![width; t as usize];
-        for (fi, frag) in [Frag::Linear, Frag::SemiLinear, Frag::Poly, Frag::PurePoly]
-            .into_iter()
-            .enumerate()
+        for (fi, frag) in [
+            Frag::Linear,
+            Frag::SemiLinear,
+            Frag::Poly,
+            Frag::PurePoly,
+            Frag::Any,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut g = Gen::new(0x9f00 + u64::from(w) * 8 + fi as u64, width, t);
             for _ in 0..40 {
@@ -110,9 +116,15 @@ fn answers_are_equal_smaller_and_proved() {
         let width = Width::new(w).unwrap();
         let t = if w <= 4 { 3 } else { 2 };
         let vars = vec![width; t as usize];
-        for (fi, frag) in [Frag::Linear, Frag::SemiLinear, Frag::Poly, Frag::PurePoly]
-            .into_iter()
-            .enumerate()
+        for (fi, frag) in [
+            Frag::Linear,
+            Frag::SemiLinear,
+            Frag::Poly,
+            Frag::PurePoly,
+            Frag::Any,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mut g = Gen::new(0x5a00 + u64::from(w) * 8 + fi as u64, width, t);
             for _ in 0..40 {
@@ -122,7 +134,11 @@ fn answers_are_equal_smaller_and_proved() {
                     MbaAnswer::Simplified { expr, claim } => {
                         assert!(equal_everywhere(&m, &expr), "{e:?}\n{expr:?}");
                         assert!(cost(&expr) < cost(&m), "{e:?}\n{expr:?}");
-                        assert_eq!(claim, Claim::Proved);
+                        // Over abstracted atoms a proof may be out of reach (atoms related in
+                        // ways a skeleton cannot see): then only the sample vouches.
+                        if frag != Frag::Any {
+                            assert_eq!(claim, Claim::Proved);
+                        }
                         simplified += 1;
                         // Idempotent: the answer is already as simple.
                         assert_eq!(
@@ -141,6 +157,7 @@ fn answers_are_equal_smaller_and_proved() {
     let s = solver.stats();
     assert_eq!(s.declined_internal, 0);
     assert!(s.linear > 0 && s.semilinear > 0 && s.polynomial > 0 && s.candidates > 0);
+    assert!(s.abstracted > 0 && s.atoms > 0);
 }
 
 /// Solves `e`, checks the answer (by a certificate) and that it is no larger than `want`.
@@ -282,6 +299,42 @@ fn the_polynomial_catalog() {
                 mul(a.clone(), a.clone()),
             ),
             &mul(or(x.clone(), y.clone()), a),
+            &vars,
+        );
+    }
+}
+
+#[test]
+fn the_abstraction_catalog() {
+    for w in [8u16, 16, 32, 64, 128, 512] {
+        let width = Width::new(w).unwrap();
+        let vars = [width, width, width];
+        let (x, y, z) = (V(0), V(1), V(2));
+        let sum = || {
+            add(
+                xor(x.clone(), y.clone()),
+                mul(k(width, 2), and(x.clone(), y.clone())),
+            )
+        };
+        // An arithmetic atom that vanishes: (a & z) + (a & ~z) = a.
+        let a = add(x.clone(), y.clone());
+        solves_to(
+            &add(and(a.clone(), z.clone()), and(a.clone(), not(z.clone()))),
+            &a,
+            &vars,
+        );
+        // An atom rendered from its own normal form.
+        solves_to(&and(sum(), z.clone()), &and(a.clone(), z.clone()), &vars);
+        // Arithmetic that is secretly bitwise: (x ^ y) + 2(x & y) − y is x.
+        solves_to(
+            &and(sub(sum(), y.clone()), z.clone()),
+            &and(x.clone(), z.clone()),
+            &vars,
+        );
+        // Two shifts of equal operands are one atom: (s >> 3) + ((x + y) >> 3) = 2((x + y) >> 3).
+        solves_to(
+            &add(un(MOp::LShr(3), sum()), un(MOp::LShr(3), a.clone())),
+            &un(MOp::Shl(1), un(MOp::LShr(3), a.clone())),
             &vars,
         );
     }

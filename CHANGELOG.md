@@ -15,7 +15,9 @@
   polynomials over masked conjunctions with exact reductions (coefficient precision, the
   falling-factorial null polynomials, one-position classes) and null parts dropped only when a
   certificate proves them zero, and the cheapest of many renderings (minimum forms, masked
-  groups, indicator, conjunction and single-function forms, factored products). It certifies
+  groups, indicator, conjunction and single-function forms, factored products). Subterms
+  outside these fragments are atoms keyed by their own normal forms (arithmetic that is
+  secretly bitwise is read as bitwise), each rendered once from its cheapest form. It certifies
   every answer itself, is never costlier than `SignatureSolver` on linear MBA, and answers are
   a fixed point (solving an answer again finds nothing smaller). Not the default solver.
 - **MBA solvers may see polynomials.** `MbaSolver::polynomial_fragments` (default false): a

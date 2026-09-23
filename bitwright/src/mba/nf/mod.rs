@@ -288,6 +288,21 @@ enum Def {
     Var(u32),
     /// The input subterm as it is.
     Verbatim(u32),
+    /// An input subterm (arithmetic read by a bitwise operator), rendered from its normal form.
+    Form(u32),
+    /// `a >> k` of an input subterm `a`, rendered from `a`'s normal form.
+    Shift(u16, u32),
+}
+
+/// What identifies an atom: equal keys are equal functions of the variables.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum AtomKey {
+    /// A subterm kept as it is, by its structural representative.
+    Node(u32),
+    /// A subterm by its (reduced) normal form over lower atoms.
+    Form(Poly),
+    /// `a >> k` by `k` and `a`'s normal form.
+    Shift(u16, Poly),
 }
 
 /// The state of one question.
@@ -302,8 +317,10 @@ struct Pass<'p> {
     canon: Vec<u32>,
     forms: Vec<Option<Form>>,
     atoms: Vec<Def>,
-    /// Abstracted subterms, by the representative of their node.
-    atom_of: HashMap<u32, u32>,
+    /// Per atom: the normal form it is rendered from (for `Def::Form` and `Def::Shift`).
+    atom_nf: Vec<Option<Poly>>,
+    /// Atoms by what identifies them.
+    atom_of: HashMap<AtomKey, u32>,
     /// Normal forms of the operands of products: factors worth trying when rendering.
     factors: Vec<Poly>,
 }
@@ -322,9 +339,14 @@ impl Pass<'_> {
         self.work.charge(units).map_err(|()| Decline::Exhausted)
     }
 
-    /// The atom standing for input node `i` (created on first use).
-    fn atom(&mut self, i: u32, def: Def, tally: &mut NfStats) -> Result<u32, Decline> {
-        let key = self.canon[i as usize];
+    /// The atom with this key (created on first use).
+    fn atom(
+        &mut self,
+        key: AtomKey,
+        def: Def,
+        nf: Option<Poly>,
+        tally: &mut NfStats,
+    ) -> Result<u32, Decline> {
         if let Some(&a) = self.atom_of.get(&key) {
             return Ok(a);
         }
@@ -333,10 +355,27 @@ impl Pass<'_> {
             return Err(Decline::Unsupported("too many atoms"));
         }
         self.atoms.push(def);
+        self.atom_nf.push(nf);
         tally.atoms += 1;
         let a = self.atoms.len() as u32 - 1;
         self.atom_of.insert(key, a);
         Ok(a)
+    }
+
+    /// Input node `i` as an atom kept as it is.
+    fn verbatim_atom(&mut self, i: u32, tally: &mut NfStats) -> Result<u32, Decline> {
+        let key = AtomKey::Node(self.canon[i as usize]);
+        self.atom(key, Def::Verbatim(i), None, tally)
+    }
+
+    /// A normal form reduced for use as an atom's key (equal functions of lower atoms tend
+    /// to get equal keys; unequal ones never do, the reductions being exact).
+    fn key_form(&self, p: &Poly) -> Poly {
+        let mut k = p.clone();
+        k.reduce_core(&self.classes);
+        k.single_positions(&self.classes);
+        k.reduce_core(&self.classes);
+        k
     }
 
     /// Node `i` read by a bitwise operator: its bitwise function (an atom when it is not one).
@@ -349,8 +388,21 @@ impl Pass<'_> {
                     .ok_or(Decline::Unsupported("a constant splits a bit class"))
             }
             Some(Form::Bits(f)) => Ok(f),
-            _ => {
-                let a = self.atom(i, Def::Verbatim(i), tally)?;
+            Some(Form::Poly(p)) => {
+                // Arithmetic that is secretly a bitwise function is read as one; otherwise it
+                // is an atom, identified by its normal form.
+                let key = self.key_form(&p);
+                if key.degree() <= 1 {
+                    self.charge((key.len() as u64) << key.atoms().count_ones().min(12))?;
+                    if let Some(f) = Bits::from_linear(&key, &self.classes) {
+                        return Ok(f);
+                    }
+                }
+                let a = self.atom(AtomKey::Form(key.clone()), Def::Form(i), Some(key), tally)?;
+                Ok(Bits::atom(n, a))
+            }
+            None => {
+                let a = self.verbatim_atom(i, tally)?;
                 Ok(Bits::atom(n, a))
             }
         }
@@ -361,7 +413,7 @@ impl Pass<'_> {
         let f = match self.forms[i as usize].clone() {
             Some(f) => f,
             None => {
-                let a = self.atom(i, Def::Verbatim(i), tally)?;
+                let a = self.verbatim_atom(i, tally)?;
                 Form::Bits(Bits::atom(self.classes.len(), a))
             }
         };
@@ -387,7 +439,7 @@ impl Pass<'_> {
     /// Node `i` as an atom (a sum or product too large to keep multiplied out).
     fn opaque(&mut self, i: u32, tally: &mut NfStats) -> Result<Option<Form>, Decline> {
         tally.declined_terms += 1;
-        let at = self.atom(i, Def::Verbatim(i), tally)?;
+        let at = self.verbatim_atom(i, tally)?;
         Ok(Some(Form::Bits(Bits::atom(self.classes.len(), at))))
     }
 
@@ -422,7 +474,7 @@ impl Pass<'_> {
                     Some(f) => Form::Bits(f),
                     None => {
                         // A bitwise function of too many atoms: an atom itself.
-                        let at = self.atom(i, Def::Verbatim(i), tally)?;
+                        let at = self.verbatim_atom(i, tally)?;
                         Form::Bits(Bits::atom(self.classes.len(), at))
                     }
                 }
@@ -475,8 +527,20 @@ impl Pass<'_> {
                     Form::Poly(prod)
                 }
             },
-            MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
-                let at = self.atom(i, Def::Verbatim(i), tally)?;
+            MOp::LShr(k) => {
+                // A right shift: an atom, identified by the amount and its operand's form.
+                let x = self.poly(a, tally)?;
+                let key = self.key_form(&x);
+                let at = self.atom(
+                    AtomKey::Shift(k, key.clone()),
+                    Def::Shift(k, a),
+                    Some(key),
+                    tally,
+                )?;
+                Form::Bits(Bits::atom(self.classes.len(), at))
+            }
+            MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
+                let at = self.verbatim_atom(i, tally)?;
                 Form::Bits(Bits::atom(self.classes.len(), at))
             }
         }))
@@ -649,6 +713,7 @@ fn normalize(
         canon,
         forms: vec![None; nodes.len()],
         atoms: (0..p.vars().len() as u32).map(Def::Var).collect(),
+        atom_nf: vec![None; p.vars().len()],
         atom_of: HashMap::new(),
         factors: Vec::new(),
     };
@@ -677,33 +742,8 @@ fn normalize(
     } else {
         tally.linear += 1;
     }
-    // The atoms' renderings.
-    let mut atom_exprs: Vec<MbaExpr> = Vec::with_capacity(pass.atoms.len());
-    for def in &pass.atoms {
-        let e = match def {
-            Def::Var(v) => {
-                let mut m = MbaExpr::new(p.vars().to_vec());
-                m.push(MOp::Var(*v), &[])
-                    .map_err(|_| Decline::Unsupported("internal: variable"))?;
-                m
-            }
-            Def::Verbatim(i) => {
-                verbatim(p, *i).ok_or(Decline::Unsupported("internal: verbatim atom"))?
-            }
-        };
-        atom_exprs.push(e);
-    }
-    let mut work = pass.work;
-    if nf.degree() >= 2 {
-        prune_null(p, &mut nf, &pass.classes, &atom_exprs, &mut work, tally)?;
-    }
-    // Unmasked symbols wherever the classes allow, for rendering (the same function).
-    {
-        use certify::Meter;
-        let n = pass.classes.len() as u64;
-        work.charge((nf.len() as u64).saturating_mul(n * n))
-            .map_err(|()| Decline::Exhausted)?;
-    }
+    // Normal forms as rendered: unmasked symbols wherever the classes allow (the same
+    // function), then the one-position rule.
     let finish = |f: &Poly| {
         let mut f = f.clone();
         f.reduce_core(&pass.classes);
@@ -712,8 +752,60 @@ fn normalize(
         f.reduce_core(&pass.classes);
         f
     };
+    let factors: Vec<Poly> = pass.factors.iter().map(finish).collect();
+    let mut work = pass.work;
+    // The atoms' renderings, lower atoms first: each once, from its own cheapest form (the
+    // subterm as it is among the candidates).
+    let mut atom_exprs: Vec<MbaExpr> = Vec::with_capacity(pass.atoms.len());
+    for (a, def) in pass.atoms.iter().enumerate() {
+        let internal = || Decline::Unsupported("internal: atom rendering");
+        let e = match *def {
+            Def::Var(v) => {
+                let mut m = MbaExpr::new(p.vars().to_vec());
+                m.push(MOp::Var(v), &[]).map_err(|_| internal())?;
+                m
+            }
+            Def::Verbatim(i) => verbatim(p, i).ok_or_else(internal)?,
+            Def::Form(i) | Def::Shift(_, i) => {
+                let form = finish(pass.atom_nf[a].as_ref().ok_or_else(internal)?);
+                let mut r = Render::new(p.vars().to_vec(), w, &pass.classes, &atom_exprs[..a]);
+                let mut cands = candidates(&mut r, &form, &factors);
+                if let Some(v) = verbatim(p, i)
+                    && let Some(root) = r.b.import(&v)
+                {
+                    cands.push(root);
+                }
+                {
+                    use certify::Meter;
+                    work.charge(r.built.saturating_mul(16).max(1))
+                        .map_err(|()| Decline::Exhausted)?;
+                }
+                tally.candidates += r.built;
+                let best = r.best(&cands).ok_or_else(internal)?;
+                let body = r.b.finish(best).ok_or_else(internal)?;
+                match *def {
+                    Def::Shift(k, _) => {
+                        let mut b = Builder::new(p.vars().to_vec());
+                        let x = b.import(&body).ok_or_else(internal)?;
+                        let y = b.un(MOp::LShr(k), x);
+                        b.finish(y).ok_or_else(internal)?
+                    }
+                    _ => body,
+                }
+            }
+        };
+        atom_exprs.push(e);
+    }
+    if nf.degree() >= 2 {
+        prune_null(p, &mut nf, &pass.classes, &atom_exprs, &mut work, tally)?;
+    }
+    {
+        use certify::Meter;
+        let n = pass.classes.len() as u64;
+        work.charge((nf.len() as u64).saturating_mul(n * n))
+            .map_err(|()| Decline::Exhausted)?;
+    }
     let nf = finish(&nf);
-    let factors = pass.factors.iter().map(finish).collect();
     Ok(Normal {
         w,
         classes: pass.classes,
