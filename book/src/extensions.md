@@ -11,12 +11,15 @@ An operation provides:
 - `eval`: the exact values;
 - optionally `known_bits`, for facts;
 - optionally `expand`: the same operation built from bitwright's own operators;
-- optionally `smtlib`: a term for solvers.
+- optionally `smtlib`: a term for solvers;
+- optionally `invertible` and `invert`: which outputs are injective or bijective in which
+  argument, and the inverse at a value (see [Invertibility](invertibility.md)).
 
 Registration runs a self-test at the argument widths the signature accepts, mixed widths
 included, up to 512 bits. It checks that `eval` is deterministic and returns the declared widths,
-that a commutative operation really is, and that `known_bits` and `expand` agree with `eval`. The
-test samples inputs, so it catches most broken operations, not all of them.
+that a commutative operation really is, that `known_bits` and `expand` agree with `eval`, and
+that `invert` undoes `eval` wherever invertibility is declared. The test samples inputs, so it
+catches most broken operations, not all of them.
 
 ```rust
 use std::sync::Arc;
@@ -63,7 +66,8 @@ assert!(v[0].is_zero() && v[1].is_ones());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The simplifier treats an extension node as an atom: no rule or pass looks inside it. It still
+The simplifier treats an extension node as an atom: no rule or pass looks inside it (an
+invertibility declaration is the one thing it uses, at equalities). It still
 simplifies the arguments and rebuilds the call, unless the operation's `traits()` mark it
 `opaque`. Facts come from `known_bits`, and are exact when every argument is known. Constraints
 work through extension nodes like any other. With feature `smtlib`, an operation without an

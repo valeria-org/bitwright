@@ -11,8 +11,14 @@
 //!
 //! Operations are collected into an immutable [`Registry`] before a context uses it
 //! ([`Context::with_registry`](crate::Context::with_registry)). Registering one runs a contract
-//! self-test: declared widths, determinism, known-bits soundness against `eval`, and
-//! `expand ≡ eval`, at a battery of widths.
+//! self-test: declared widths, determinism, known-bits soundness against `eval`,
+//! `expand ≡ eval`, and invertibility declarations against `invert`, at a battery of widths.
+//!
+//! An output that is injective or bijective in one argument (the others fixed) can say so
+//! ([`ExtOp::invertible`], [`ExtOp::invert`]): the simplifier then cancels the call on both
+//! sides of an equality and solves it at a constant, and [`Query::Injective`] sees through it.
+//!
+//! [`Query::Injective`]: crate::Query::Injective
 //!
 //! An operation that must not be merged with another call on the same arguments (an
 //! occurrence), takes a fresh symbol as one of its arguments.
@@ -127,6 +133,21 @@ setters!(ExtTraits {
     with_opaque: opaque: bool,
 });
 
+/// How an output of an extension operation depends on one argument when the others are fixed
+/// (see [`ExtOp::invertible`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Invertible {
+    /// Nothing is claimed.
+    #[default]
+    No,
+    /// Distinct values of the argument give distinct values of the output.
+    Injective,
+    /// Injective, and every value of the output is reached (the output and the argument have
+    /// one width).
+    Bijective,
+}
+
 /// A host-defined operation. Every method must be deterministic; `eval` must be total.
 pub trait ExtOp: Send + Sync + 'static {
     /// A namespaced name: `acme.avgu`. Letters, digits, `_` and `.`, starting with a letter.
@@ -164,6 +185,24 @@ pub trait ExtOp: Send + Sync + 'static {
     /// Properties the builder and simplifier may use.
     fn traits(&self) -> ExtTraits {
         ExtTraits::default()
+    }
+
+    /// Whether output `output` is an injective (or bijective) function of argument `arg` when
+    /// every other argument is fixed at any value inside its known bits in `args` (`args[arg]`
+    /// is always unknown). A declaration lets the simplifier cancel the call on both sides of
+    /// `==` and `!=` (`op(k, x) == op(k, y)` becomes `x == y`) and solve it at a constant
+    /// through [`invert`](Self::invert); it must hold for *every* such value. The self-test
+    /// checks it against `invert` and `eval` at sampled points.
+    fn invertible(&self, _output: u8, _arg: u8, _args: &[KnownBits]) -> Invertible {
+        Invertible::No
+    }
+
+    /// For an output declared [`invertible`](Self::invertible) in `arg`: the value of argument
+    /// `arg` at which output `output` equals `value`, the other arguments as in `args` (whose
+    /// entry `arg` is to be ignored), or `None` if there is none (never for a bijection).
+    /// Answers are checked by evaluation before they are used.
+    fn invert(&self, _output: u8, _arg: u8, _args: &[BitVec], _value: &BitVec) -> Option<BitVec> {
+        None
     }
 }
 
@@ -470,13 +509,80 @@ fn width_tuples() -> Vec<Vec<u16>> {
     out
 }
 
+/// Checks the invertibility declarations at one sample: for every output and argument
+/// declared invertible under the known bits `kb` of the other arguments, `invert` recovers the
+/// argument from the output (at a completion of `kb` with the argument random), and for a
+/// bijection also finds an argument for a random output value.
+fn check_invertible(
+    op: &dyn ExtOp,
+    sig: &ExtSig,
+    widths: &[Width],
+    args: &[BitVec],
+    kb: &[KnownBits],
+    rng: &mut Rng,
+) -> Result<(), String> {
+    use crate::facts::known::{bv_and, bv_not, bv_or};
+    for k in 0..sig.len() {
+        for a in 0..widths.len() {
+            let mut fixed = kb.to_vec();
+            fixed[a] = KnownBits::unknown(widths[a]);
+            let decl = op.invertible(k as u8, a as u8, &fixed);
+            if decl == Invertible::No {
+                continue;
+            }
+            if decl == Invertible::Bijective && sig.width(k) != Some(widths[a]) {
+                return Err(format!(
+                    "declared bijective in argument {a}, but output {k} has another width"
+                ));
+            }
+            // A completion of the fixed arguments' known bits; the argument itself random.
+            let inst: Vec<BitVec> = args
+                .iter()
+                .zip(&fixed)
+                .map(|(v, f)| {
+                    let r = rng.value(v.width());
+                    bv_or(&bv_and(v, &f.known()), &bv_and(&r, &bv_not(&f.known())))
+                })
+                .collect();
+            let y = run_eval(op, &inst)?[k];
+            if op.invert(k as u8, a as u8, &inst, &y).as_ref() != Some(&inst[a]) {
+                return Err(format!(
+                    "declared invertible, but invert does not recover argument {a} from output \
+                     {k}"
+                ));
+            }
+            if decl == Invertible::Bijective {
+                let target = rng.value(widths[a]);
+                let found = op.invert(k as u8, a as u8, &inst, &target);
+                let mut hit = inst.clone();
+                match found {
+                    Some(v) if v.width() == widths[a] => hit[a] = v,
+                    _ => {
+                        return Err(format!(
+                            "declared bijective, but invert finds no argument {a} for a value \
+                             of output {k}"
+                        ));
+                    }
+                }
+                if run_eval(op, &hit)?[k] != target {
+                    return Err(format!(
+                        "invert's argument {a} does not give the value asked of output {k}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The most argument-width tuples the self-test exercises (the first accepted, in the order of
 /// [`width_tuples`], which starts from single and equal widths).
 const TESTED_TUPLES: usize = 64;
 
 /// The contract self-test (see the module docs): at every argument-width tuple the signature
 /// accepts (up to [`TESTED_TUPLES`] of them), declared output widths, determinism, known-bits
-/// soundness against `eval`, a commutative operation's symmetry, and `expand ≡ eval`.
+/// soundness against `eval`, a commutative operation's symmetry, invertibility declarations
+/// against `invert`, and `expand ≡ eval`.
 fn self_test(op: &dyn ExtOp) -> Result<(), String> {
     use crate::facts::known::{bv_and, bv_not};
     let mut rng = Rng(0x5e1f_7e57 ^ u64::from(op.revision()));
@@ -545,6 +651,7 @@ fn self_test(op: &dyn ExtOp) -> Result<(), String> {
                     }
                 }
             }
+            check_invertible(op, &sig, &widths, &args, &kb, &mut rng).map_err(|e| e + &at())?;
         }
         // expand ≡ eval.
         let mut cx = Context::new();

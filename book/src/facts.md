@@ -43,6 +43,9 @@ assert_eq!(cx.prove(Query::IsZero(y))?, Truth::Unknown); // y may or may not be 
 # Ok::<(), bitwright::Error>(())
 ```
 
+`Query::Injective` and `Query::Bijective` ask whether an expression is an invertible function
+of one of its subexpressions; see [Invertibility](invertibility.md).
+
 ## Assumptions
 
 Facts about a path (after a branch, for example) are given as `Assumptions`. They never change

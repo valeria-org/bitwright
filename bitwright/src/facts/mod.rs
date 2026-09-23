@@ -423,6 +423,28 @@ pub enum Query<'q> {
     },
     /// The facts pin the value to one constant.
     IsConstant(Expr),
+    /// `e` is an injective function of its subexpression `of`: with every value that does not
+    /// depend on `of` held fixed, distinct values put in place of `of` give distinct values of
+    /// `e`. Proved through a chain of invertible layers from `of` up to `e` (operators
+    /// injective in one operand with the others fixed, such as `x ^ k`, `x * k` for odd `k`,
+    /// rotations, `zext`, declared extension operations, and triangular maps such as
+    /// `h ^ ((h >>u 32) >>u (h >>u 60))`); `False` when `e` does not depend on `of` or is
+    /// narrower than it.
+    Injective {
+        /// The expression.
+        e: Expr,
+        /// The subexpression it is read as a function of.
+        of: Expr,
+    },
+    /// `e` is a bijective function of its subexpression `of`: injective (see
+    /// [`Query::Injective`]), of the same width. `False` when `e` does not depend on `of` or
+    /// their widths differ.
+    Bijective {
+        /// The expression.
+        e: Expr,
+        /// The subexpression it is read as a function of.
+        of: Expr,
+    },
 }
 
 /// An answer from [`Context::prove_under`]: the truth value, and the constraints it relies on
@@ -511,6 +533,17 @@ impl Context {
         }
     }
 
+    /// The facts of node `i` from the given operand facts alone: [`Self::transfer_at`] without
+    /// the refinements that read other nodes' cached facts. For facts computed over a region
+    /// whose operands stand for other values than their own (an unknown input, say).
+    pub(crate) fn transfer_local(&self, i: u32, args: &[&Facts]) -> Facts {
+        let op = self.top_of(i);
+        if self.node(i).op == OpCode::Concat {
+            return transfer(&op, args);
+        }
+        self.transfer_at(i, &op, args)
+    }
+
     /// Runs the transfer function of node `i` over facts of its children taken from `get`.
     fn transfer_node(&self, i: u32, get: impl Fn(u32) -> Facts) -> Facts {
         let op = self.top_of(i);
@@ -541,6 +574,13 @@ impl Context {
             let f = transfer(op, args);
             return self
                 .wide_product_bound(i)
+                .and_then(|g| f.meet(&g))
+                .unwrap_or(f);
+        }
+        if n.op == OpCode::LShr {
+            let f = transfer(op, args);
+            return self
+                .self_shift_bound(i, args)
                 .and_then(|g| f.meet(&g))
                 .unwrap_or(f);
         }
@@ -607,6 +647,85 @@ impl Context {
             }
             _ => None,
         }
+    }
+
+    /// A right shift of a value by its own top bits, `a >>u (a >>u k)` (the count spelled
+    /// `b >>u m` with `a = b >>u j`, `j <= m`, or `a = b`), as in xorshift-multiply mixers
+    /// (`h ^ ((h >>u 32) >>u (h >>u 60))`). When the count is `t`, `a` lies in
+    /// `[t << k, ((t + 1) << k) - 1]`, so the result is below `2^k` at every `t` (for
+    /// `2^t >= t + 1`), where the count's range alone allows the whole of `a`'s.
+    fn self_shift_bound(&self, i: u32, args: &[&Facts]) -> Option<Facts> {
+        let n = self.node(i);
+        let w = self.width_of(i);
+        let wb = u64::from(w.bits());
+        let s = self.node(n.b);
+        if s.op != OpCode::LShr {
+            return None;
+        }
+        let m = self.const_val(s.b)?.to_u64()?;
+        let j = if n.a == s.a {
+            0
+        } else {
+            let a = self.node(n.a);
+            if a.op != OpCode::LShr || a.a != s.a {
+                return None;
+            }
+            self.const_val(a.b)?.to_u64()?
+        };
+        if j > m || m >= wb {
+            return None;
+        }
+        // The count is `a >>u k`.
+        let k = u32::try_from(m - j).ok()?;
+        let (fa, fs) = (args[0], args[1]);
+        let (slo, shi) = (fs.urange.lo().to_u64()?, fs.urange.hi().to_u64()?);
+        let shl = |v: &BitVec| known::bv_shl(v, k);
+        let mut hull: Option<(BitVec, BitVec)> = None;
+        let mut widen = |lo: BitVec, hi: BitVec| {
+            hull = Some(match hull {
+                None => (lo, hi),
+                Some((l, h)) => (
+                    if ult(&lo, &l) { lo } else { l },
+                    if ult(&h, &hi) { hi } else { h },
+                ),
+            });
+        };
+        for t in slo..=shi.min(wb - 1) {
+            let tv = BitVec::wrapping_from_u64(w, t);
+            let first = shl(&tv);
+            if known::bv_lshr(&first, k) != tv {
+                // No value of `a` has these top bits.
+                break;
+            }
+            let next = known::bv_add(&tv, &BitVec::one(w));
+            let past = shl(&next);
+            let last = if next.is_zero() || known::bv_lshr(&past, k) != next {
+                BitVec::ones(w)
+            } else {
+                known::bv_add(&past, &BitVec::ones(w))
+            };
+            let lo = if ult(&first, &fa.urange.lo()) {
+                fa.urange.lo()
+            } else {
+                first
+            };
+            let hi = if ult(&fa.urange.hi(), &last) {
+                fa.urange.hi()
+            } else {
+                last
+            };
+            if ult(&hi, &lo) {
+                continue;
+            }
+            let t = u32::try_from(t).ok()?;
+            widen(known::bv_lshr(&lo, t), known::bv_lshr(&hi, t));
+        }
+        if shi >= wb {
+            // A count of at least W shifts everything out.
+            widen(BitVec::zero(w), BitVec::zero(w));
+        }
+        let (lo, hi) = hull?;
+        Facts::new(KnownBits::unknown(w), URange::new(lo, hi)?, SRange::full(w))
     }
 
     /// `concat(umulhi(a, b), a * b)` is the full unsigned product of `a` and `b` (and with
@@ -1042,11 +1161,20 @@ impl Context {
                 same(self.width(e)?, mask.width())?;
                 vec![e]
             }
+            Query::Injective { e, of } | Query::Bijective { e, of } => {
+                self.width(e)?;
+                self.width(of)?;
+                vec![e, of]
+            }
         })
     }
 
     fn prove_inner(&mut self, q: Query<'_>, a: Option<&Assumptions>) -> Result<Proof, Error> {
         let exprs = self.validate_query(&q)?;
+        if let Query::Injective { e, of } | Query::Bijective { e, of } = q {
+            let onto = matches!(q, Query::Bijective { .. });
+            return crate::invert::prove(self, e, of, onto, a);
+        }
         let proof = |truth: Truth, relies_on: Reliance| Proof {
             truth,
             relies_on: if truth == Truth::Unknown {
@@ -1180,6 +1308,8 @@ impl Context {
                     }
                 }
             }
+            // Answered above.
+            Query::Injective { .. } | Query::Bijective { .. } => Truth::Unknown,
             Query::FitsSigned { bits, .. } => {
                 if bits == 0 {
                     Truth::False

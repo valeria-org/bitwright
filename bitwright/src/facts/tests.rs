@@ -1615,3 +1615,52 @@ fn widening_products_bound_their_range() {
     // The product of [2, 15] and [4, 7] is at least 8 (the halves alone say 0).
     assert_eq!(cx.facts(wu).unwrap().urange().lo().to_u64(), Some(8));
 }
+
+#[test]
+fn self_shifts_bound_their_range() {
+    // `(b >>u j) >>u (b >>u m)` and `a >>u (a >>u k)` at every width to 7, every `j <= m`,
+    // with the base narrowed by masks and offsets so the shifted value's range varies too:
+    // every value lies in the facts.
+    for w in 1..=7u16 {
+        let o = crate::ParseOptions::width(width(w));
+        let mut cx = Context::new();
+        let wm = (1u64 << w) - 1;
+        let bases = [
+            "x".to_string(),
+            format!("x & {}", 0x55 & wm),
+            format!("x | {}", 1u64 << (w - 1)),
+            format!("(x & {}) + 1", wm >> 1),
+        ];
+        for base in &bases {
+            for j in 0..w {
+                for m in j..w {
+                    let src = format!("let b = {base}; (b >>u {j}) >>u (b >>u {m})");
+                    let e = cx.parse(&src, &o).unwrap();
+                    let src2 = format!("let a = {base} >>u {j}; a >>u (a >>u {})", m - j);
+                    let e2 = cx.parse(&src2, &o).unwrap();
+                    for e in [e, e2] {
+                        let f = cx.facts(e).unwrap();
+                        for v in 0..=wm {
+                            let env: HashMap<SymbolKey, BitVec> =
+                                [(SymbolKey::from("x"), BitVec::wrapping_from_u64(width(w), v))]
+                                    .into_iter()
+                                    .collect();
+                            let r = cx.eval(&[e], &env).unwrap()[0];
+                            assert!(f.contains(&r), "{}: {r} not in {f:?}", cx.display(e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The mixer's data-dependent shift changes only bits 0 to 27 (the count's range alone
+    // allows 32 bits), and exactly those: bit 27 can be set.
+    let mut cx = Context::new();
+    let o = crate::ParseOptions::width(width(64));
+    let g = cx.parse("(h >>u 32) >>u (h >>u 60)", &o).unwrap();
+    let f = cx.facts(g).unwrap();
+    assert_eq!(f.urange().hi().to_u64(), Some((1 << 28) - 1));
+    let h = BitVec::wrapping_from_u64(width(64), 0x0fff_ffff_ffff_ffff);
+    let env: HashMap<SymbolKey, BitVec> = [(SymbolKey::from("h"), h)].into_iter().collect();
+    assert_eq!(cx.eval(&[g], &env).unwrap()[0].to_u64(), Some(0x0fff_ffff));
+}

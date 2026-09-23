@@ -16,8 +16,10 @@
 //! - [`rules`]: the `.bwr` rule language and its compiler; `check` (feature `check`, default):
 //!   the soundness checker and proof ledgers.
 //! - [`engine`]: the simplifier: proven rules and normal-form passes (linear, xor, bitwise,
-//!   comparisons, casts, demanded bits, and for deobfuscation linear MBA and bit shuffles),
-//!   applied bottom-up under caller-owned budgets, with a memo, telemetry and host hooks.
+//!   comparisons, casts, demanded bits, equalities through invertible maps, and for
+//!   deobfuscation linear MBA and bit shuffles), applied bottom-up under caller-owned budgets,
+//!   with a memo, telemetry and host hooks. [`Query::Injective`] and [`Query::Bijective`] ask
+//!   whether an expression is an invertible function of one of its subexpressions.
 //! - [`ext`]: host-defined extension operations (multi-output, total), registered in a
 //!   [`Registry`](ext::Registry) and built with [`Context::ext`].
 //! - `mba` (feature `mba`): the MBA service with an evidence gate, and `cobra` for the
@@ -87,6 +89,7 @@ mod expr;
 pub mod ext;
 mod facts;
 mod hash;
+mod invert;
 #[cfg(feature = "mba")]
 pub mod mba;
 mod ops;
@@ -120,6 +123,8 @@ mod book {
     #[cfg(feature = "mba")]
     #[doc = include_str!("../../book/src/deobfuscation.md")]
     struct Deobfuscation;
+    #[doc = include_str!("../../book/src/invertibility.md")]
+    struct Invertibility;
     #[cfg(feature = "eqsat")]
     #[doc = include_str!("../../book/src/eqsat.md")]
     struct Eqsat;

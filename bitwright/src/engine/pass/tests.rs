@@ -4,7 +4,9 @@
 use crate::engine::tests::{equivalent, generator};
 use crate::engine::{Budget, End, Engine, Hooks, Phase, Run, Strategy, Verify};
 use crate::testutil::{Gen, Rng};
-use crate::{BinOp, Context, Expr, ParseOptions, UnOp, Width};
+use crate::{
+    Assumptions, BinOp, BitVec, CmpOpExt, Context, Expr, FnEnv, ParseOptions, UnOp, Width,
+};
 
 /// An engine running `phases` with the default verification: the tests' own equivalence
 /// checks are the oracle (strict verification would reject a wrong rewrite before any test
@@ -2011,4 +2013,356 @@ fn linear_mba_emits_conjunctions_for_any_number_of_atoms() {
         changed += u32::from(out.changed);
     }
     assert!(changed > 300, "{changed}");
+}
+
+// ----- the invert pass --------------------------------------------------------------------------
+
+/// A random chain of layers over `x`: invertible ones (with constant or symbol parameters, and
+/// triangular `v ⊙ g(v)`) and non-invertible ones (masks, shifts, feeding `x` back in).
+fn layered(g: &mut Gen, cx: &mut Context, x: Expr, w: u16, depth: u32) -> Expr {
+    let wd = Width::new(w).unwrap();
+    let mut e = x;
+    for _ in 0..depth {
+        let k = if g.rng.chance(1, 4) {
+            cx.symbol("p", wd).unwrap()
+        } else {
+            let v = g.constant(w);
+            cx.constant(&v).unwrap()
+        };
+        let sh = cx.constant_u64(wd, 1 + g.rng.below(u64::from(w))).unwrap();
+        e = match g.rng.below(12) {
+            0 => cx.bin(BinOp::Add, e, k).unwrap(),
+            1 => cx.bin(BinOp::Xor, e, k).unwrap(),
+            2 => cx.bin(BinOp::Mul, e, k).unwrap(),
+            3 => cx.bin(BinOp::Sub, k, e).unwrap(),
+            4 => cx.bin(BinOp::RotL, e, k).unwrap(),
+            5 => cx
+                .un(
+                    [UnOp::Not, UnOp::Neg, UnOp::BitRev][g.rng.below(3) as usize],
+                    e,
+                )
+                .unwrap(),
+            6 => {
+                let t = cx.bin(BinOp::LShr, e, sh).unwrap();
+                cx.bin(BinOp::Xor, e, t).unwrap()
+            }
+            7 => {
+                let t = cx.bin(BinOp::Shl, e, sh).unwrap();
+                let t = cx.bin(BinOp::And, t, k).unwrap();
+                cx.bin(BinOp::Sub, e, t).unwrap()
+            }
+            8 => {
+                // The mixer's involution, scaled to the width.
+                let a = cx.constant_u64(wd, u64::from(w / 2)).unwrap();
+                let b = cx.constant_u64(wd, u64::from(w - w / 4 - 1)).unwrap();
+                let (s1, s2) = (
+                    cx.bin(BinOp::LShr, e, a).unwrap(),
+                    cx.bin(BinOp::LShr, e, b).unwrap(),
+                );
+                let t = cx.bin(BinOp::LShr, s1, s2).unwrap();
+                cx.bin(BinOp::Xor, e, t).unwrap()
+            }
+            9 => cx.bin(BinOp::And, e, k).unwrap(),
+            10 => cx.bin(BinOp::LShr, e, sh).unwrap(),
+            _ => cx.bin(BinOp::Xor, e, x).unwrap(),
+        };
+    }
+    e
+}
+
+#[test]
+fn invert_is_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Invert]);
+    let std = Engine::standard();
+    // Strict verification samples every rewrite and checks both sides' facts meet.
+    let strict = Engine::builder()
+        .builtin()
+        .strategy(Strategy::standard())
+        .verify(Verify::strict())
+        .build()
+        .unwrap();
+    let mut g = generator(0x1a7e_0001);
+    let mut rng = Rng(11);
+    let mut changed = 0;
+    for i in 0..1500 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            [16, 64, 128, 257][g.rng.below(4) as usize]
+        } else {
+            1 + g.rng.below(4) as u16
+        };
+        let wd = Width::new(w).unwrap();
+        let (x, y) = (cx.symbol("x", wd).unwrap(), cx.symbol("y", wd).unwrap());
+        let depth = 1 + g.rng.below(4) as u32;
+        let f = layered(&mut g, &mut cx, x, w, depth);
+        // Sometimes widened by an injective map that is not onto: then a constant may have no
+        // preimage at all.
+        let widen = match g.rng.below(8) {
+            _ if w >= 256 => None,
+            0 => Some((0, w + 1 + g.rng.below(3) as u16)),
+            1 => Some((1, w + 1 + g.rng.below(3) as u16)),
+            2 => Some((2, w + 1 + g.rng.below(3) as u16)),
+            _ => None,
+        };
+        let lo = widen.map(|(_, w2)| g.constant(w2 - w));
+        let wide = |cx: &mut Context, e: Expr| -> Expr {
+            let Some((how, w2)) = widen else {
+                return e;
+            };
+            let wd2 = Width::new(w2).unwrap();
+            match how {
+                0 => cx.zext(e, wd2).unwrap(),
+                1 => cx.sext(e, wd2).unwrap(),
+                _ => {
+                    let k = cx.constant(&lo.unwrap()).unwrap();
+                    cx.concat(e, k).unwrap()
+                }
+            }
+        };
+        let fw = wide(&mut cx, f);
+        let wc = cx.width(fw).unwrap();
+        let op = [CmpOpExt::Eq, CmpOpExt::Ne, CmpOpExt::Ult][g.rng.below(3) as usize];
+        let e = match i % 5 {
+            // Against a constant: often an actual value of the chain, so it is solvable.
+            0 | 1 => {
+                let c = if g.rng.chance(1, 2) {
+                    let xv = g.constant(w);
+                    let env = FnEnv(|k: &crate::SymbolKey, _| {
+                        Some(if *k == crate::SymbolKey::from("x") {
+                            xv
+                        } else {
+                            BitVec::zero(wd)
+                        })
+                    });
+                    cx.eval(&[fw], &env).unwrap()[0]
+                } else {
+                    g.constant(wc.bits())
+                };
+                let c = cx.constant(&c).unwrap();
+                cx.cmp(op, fw, c).unwrap()
+            }
+            // The same chain over another value, or a different one.
+            2 => {
+                let fy = cx.substitute(&[fw], &[(x, y)]).unwrap()[0];
+                cx.cmp(op, fw, fy).unwrap()
+            }
+            3 => {
+                let depth = 1 + g.rng.below(3) as u32;
+                let h = layered(&mut g, &mut cx, y, w, depth);
+                let h = wide(&mut cx, h);
+                cx.cmp(op, fw, h).unwrap()
+            }
+            // Or-trees against zero, over one value or two.
+            _ => {
+                let other = if g.rng.chance(1, 2) { x } else { y };
+                let depth = 1 + g.rng.below(3) as u32;
+                let h = layered(&mut g, &mut cx, other, w, depth);
+                let h = wide(&mut cx, h);
+                let o = cx.bin(BinOp::Or, fw, h).unwrap();
+                let z = cx.constant(&BitVec::zero(wc)).unwrap();
+                cx.cmp(op, o, z).unwrap()
+            }
+        };
+        for engine in [&eng, &std, &strict] {
+            let out = engine.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0];
+            assert_eq!(r.end, End::Completed);
+            assert_eq!(out.stats.rejected, 0, "{}", cx.display(e));
+            assert!(
+                equivalent(&mut cx, e, r.expr, &mut rng),
+                "{} vs {}",
+                cx.display(e),
+                cx.display(r.expr)
+            );
+            changed += u64::from(r.changed);
+            cx.memo.clear();
+            let again = engine.run(&mut cx, &[r.expr], Run::default()).unwrap();
+            assert!(
+                !again.roots[0].changed,
+                "not idempotent: {} -> {}",
+                cx.display(r.expr),
+                cx.display(again.roots[0].expr)
+            );
+        }
+    }
+    assert!(changed > 800, "{changed}");
+}
+
+/// Checks `src` simplifies to `want` (both parsed at `w` bits) under `eng`.
+fn check_to(eng: &Engine, src: &str, want: &str, w: u16) {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(w).unwrap());
+    let e = cx.parse(src, &o).unwrap();
+    let out = eng.simplify(&mut cx, e).unwrap();
+    let want = cx
+        .parse(want, &ParseOptions::width(cx.width(e).unwrap()))
+        .unwrap();
+    assert_eq!(out.expr, want, "{src} gave {}", cx.display(out.expr));
+}
+
+#[test]
+fn invert_fixtures() {
+    let eng = Engine::standard();
+    // Cancelling one layer on both sides, repeatedly.
+    check_to(&eng, "x + 7 == y + 7", "x == y", 8);
+    check_to(&eng, "(x ^ z) * 3 != (y ^ z) * 3", "x != y", 8);
+    check_to(&eng, "rotl(x, z) == rotl(y, z)", "x == y", 8);
+    check_to(&eng, "z - x == z - y", "x == y", 8);
+    check_to(&eng, "zext<16>(x) == zext<16>(y)", "x == y", 8);
+    // ... never through a map that is not injective.
+    check_to(&eng, "x * 6 == y * 6", "x * 6 == y * 6", 8);
+    check_to(&eng, "(x & z) == (y & z)", "(x & z) == (y & z)", 8);
+    check_to(
+        &eng,
+        "(x ^ z) * w == (y ^ z) * w",
+        "(x ^ z) * w == (y ^ z) * w",
+        8,
+    );
+    // Moving a constant across: 5 * 3⁻¹ = 5 * 171 = 0x57 (mod 2^8).
+    check_to(&eng, "x * 3 == 5", "x == 0x57", 8);
+    check_to(&eng, "rotl(x, 3) != 5", "x != 0xa0", 8);
+    check_to(&eng, "~(x - 9) == 0", "x == 8", 8);
+    // A triangular map: the high nibble first, then the low one.
+    check_to(&eng, "(x ^ (x >>u 4)) == 0x5a", "x == 0x5f", 8);
+    check_to(&eng, "(x ^ (x >>u 4)) == (y ^ (y >>u 4))", "x == y", 8);
+    // No preimage at all.
+    check_to(&eng, "zext<16>(x) == 0x1ff", "false", 8);
+    check_to(&eng, "concat(x, 1:4) == 0x12:12", "false", 8);
+    check_to(&eng, "concat(x, 2:4) != 0x12:12", "x != 1", 8);
+    // Zero or-trees are solved leaf by leaf.
+    check_to(&eng, "((x ^ 1) | (x ^ 2)) == 0", "false", 8);
+    check_to(
+        &eng,
+        "((x + 1) | (y * 3)) == 0",
+        "(x == 0xff) & (y == 0)",
+        8,
+    );
+    check_to(
+        &eng,
+        "((x + 1) | (y * 3)) != 0",
+        "(x != 0xff) | (y != 0)",
+        8,
+    );
+    // Orderings are left alone.
+    check_to(&eng, "x + 7 <u y + 7", "x + 7 <u y + 7", 8);
+    check_to(&eng, "x * 3 <u 5", "x * 3 <u 5", 8);
+    // The pass alone (fact folding would decide some of these first): no preimage.
+    let only = engine(vec![Phase::Invert]);
+    check_to(&only, "zext<16>(x + 1) != 0x1ff", "true", 8);
+    check_to(&only, "sext<16>(x ^ 3) == 0x80", "false", 8);
+    check_to(&only, "sext<16>(x ^ 3) == 0xff80", "x == 0x83", 8);
+    check_to(&only, "(concat(x, 1:4) | y:12) == 0", "false", 8);
+    check_to(&only, "(concat(x, 1:4) | y:12) != 0", "true", 8);
+    check_to(
+        &only,
+        "(zext<16>(x) | concat(y, 0:8)) == 0",
+        "(x == 0) & (y == 0)",
+        8,
+    );
+    // `zext<16>(x)` is never `0xffff`; `sext<16>(x)` is, at one value.
+    check_to(
+        &only,
+        "(zext<16>(x) & concat(y, 0xff:8)) == 0xffff",
+        "false",
+        8,
+    );
+    check_to(
+        &only,
+        "(sext<16>(x) & concat(y, 0xff:8)) == 0xffff",
+        "(x == 0xff) & (y == 0xff)",
+        8,
+    );
+}
+
+#[test]
+fn invert_commits_like_a_rule_through_sharing() {
+    // The hash stays live as another root; its comparison is solved anyway.
+    let eng = Engine::standard();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let h = cx
+        .parse(
+            "let m = (x ^ 0x1234) * 0x87c37b91114253d5; m ^ (m >>u 29)",
+            &o,
+        )
+        .unwrap();
+    let c = cx.constant_u64(Width::W64, 0xfeed).unwrap();
+    let e = cx.cmp(CmpOpExt::Eq, h, c).unwrap();
+    let out = eng.run(&mut cx, &[h, e], Run::default()).unwrap();
+    assert!(!out.roots[0].changed);
+    let r = out.roots[1].expr;
+    let crate::View::Cmp(crate::CmpOp::Eq, a, k) = cx.view(r).unwrap() else {
+        panic!("{}", cx.display(r));
+    };
+    assert_eq!(cx.display(a).to_string(), "x");
+    // And the constant is the preimage.
+    let v = cx.as_const(k).unwrap().unwrap();
+    let env = FnEnv(|_: &crate::SymbolKey, _| Some(v));
+    assert_eq!(cx.eval(&[h], &env).unwrap()[0].to_u64(), Some(0xfeed));
+}
+
+#[test]
+fn invert_relies_on_the_constraints_it_uses() {
+    let eng = Engine::standard();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W32);
+    let e = cx.parse("x * k == y * k", &o).unwrap();
+    // `k` is not known to be odd: nothing to cancel.
+    assert!(!eng.simplify(&mut cx, e).unwrap().changed);
+    let odd = cx.parse("(k & 1) == 1", &o).unwrap();
+    let other = cx.parse("x <u 100", &o).unwrap();
+    let mut a = Assumptions::new();
+    let u = a.assume_true(&mut cx, other).unwrap();
+    let id = a.assume_true(&mut cx, odd).unwrap();
+    let out = eng
+        .run(&mut cx, &[e], Run::default().with_assumptions(&a))
+        .unwrap()
+        .roots[0];
+    assert_eq!(cx.display(out.expr).to_string(), "x == y");
+    assert!(
+        out.relies_on.may_use(id) && !out.relies_on.may_use(u),
+        "{:?}",
+        out.relies_on
+    );
+    // So does the proof query.
+    let (x, p) = (cx.parse("x", &o).unwrap(), cx.parse("x * k", &o).unwrap());
+    let q = crate::Query::Bijective { e: p, of: x };
+    assert_eq!(cx.prove(q).unwrap(), crate::Truth::Unknown);
+    let proof = cx.prove_under(q, &a).unwrap();
+    assert_eq!(proof.truth, crate::Truth::True);
+    assert!(proof.relies_on.may_use(id) && !proof.relies_on.may_use(u));
+}
+
+#[test]
+fn invert_obeys_budgets_and_the_host_veto() {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let src = "let m = (x ^ 0x1234) * 0x87c37b91114253d5; \
+               let s = m ^ ((m >>u 32) >>u (m >>u 60)); s * 0x87c37b91114253d5 == 0x42";
+    let e = cx.parse(src, &o).unwrap();
+    let eng = engine(vec![Phase::Invert]);
+    // Every budget from nothing up: a sound result, never a panic.
+    let mut rng = Rng(5);
+    let mut done = false;
+    for work in (0..3000).step_by(61) {
+        cx.memo.clear();
+        let run = Run::default().with_per_call(Budget::default().with_pass_work(work));
+        let r = eng.run(&mut cx, &[e], run).unwrap().roots[0];
+        assert!(equivalent(&mut cx, e, r.expr, &mut rng));
+        done |= r.end == End::Completed && r.changed;
+    }
+    assert!(done);
+    // The host can refuse the rewrite.
+    struct No;
+    impl Hooks for No {
+        fn admit(&self, _: &Context, _: Expr, _: Expr, by: crate::engine::By<'_>) -> bool {
+            !matches!(by, crate::engine::By::Pass("invert"))
+        }
+    }
+    cx.memo.clear();
+    let r = eng
+        .run(&mut cx, &[e], Run::default().with_hooks(&No))
+        .unwrap();
+    assert!(!r.roots[0].changed);
+    assert!(r.stats.hook_vetoes > 0);
 }

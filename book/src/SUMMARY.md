@@ -11,6 +11,7 @@
 - [Writing rules](rules.md)
 - [Checking rules](checking.md)
 - [Deobfuscation and MBA](deobfuscation.md)
+- [Invertibility](invertibility.md)
 - [Equality saturation](eqsat.md)
 - [SMT-LIB](smtlib.md)
 - [The command line](cli.md)

@@ -23,13 +23,17 @@ assert!(out.changed);
 ## Strategies
 
 `Strategy::standard()` is fact folding, the built-in rules, the normal-form passes (linear
-arithmetic, xor forms, casts, comparisons, bitwise truth tables, demanded bits) and the rules
-again. `Strategy::deobfuscate()` adds the linear-MBA and bit-shuffle passes (see
-[Deobfuscation and MBA](deobfuscation.md)). You can build your own from `Phase`s.
+arithmetic, xor forms, casts, equalities through invertible maps, comparisons, bitwise truth
+tables, demanded bits) and the rules again. `Strategy::deobfuscate()` adds the linear-MBA and
+bit-shuffle passes (see [Deobfuscation and MBA](deobfuscation.md)). You can build your own from
+`Phase`s.
 
 Each pass commits a rewrite only if it makes the expression DAG strictly smaller, counted over
 everything the call keeps alive, so shared subexpressions are never duplicated to "simplify"
-one user. Equal-size rewrites are never made, which is why passes and rules cannot fight.
+one user. Equal-size rewrites are never made, which is why passes and rules cannot fight. The
+one exception is `Phase::Invert` (see [Invertibility](invertibility.md)): like a rule, it
+replaces a comparison by one of proper subterms of its operands, so it commits even when those
+operands stay alive for other users.
 
 ## Budgets, allowances and deadlines
 

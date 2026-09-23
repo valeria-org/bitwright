@@ -81,6 +81,12 @@ pub enum Phase {
     /// extracts, `concat`, `bswap`, and disjoint `| ^ +`) become the source, a rotation, a byte
     /// swap, or a `concat` of slices when that is smaller.
     Shuffle,
+    /// Equalities through invertible maps: `f(x) == f(y)` becomes `x == y` and `f(x) == c`
+    /// becomes `x == f⁻¹(c)` (or a constant, when `c` has no preimage) for every layer `f`
+    /// proved injective with its other operands fixed, and `a | b == 0` is solved leaf by leaf.
+    /// Orderings are left alone. Like a rule, it commits whether or not the operands are
+    /// shared (see `bitwright::Query::Injective` for what counts as a layer).
+    Invert,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -111,8 +117,8 @@ impl Strategy {
     }
 
     /// The built-in strategy: fact folding, the built-in rules, the normal-form passes, and the
-    /// rules again, for up to 4 rounds: `[FactFold, Local(core), Linear, Xor, Casts, Compares,
-    /// Bitwise, Demanded, Local(core)]`.
+    /// rules again, for up to 4 rounds: `[FactFold, Local(core), Linear, Xor, Casts, Invert,
+    /// Compares, Bitwise, Demanded, Local(core)]`.
     pub fn standard() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -130,6 +136,7 @@ impl Strategy {
                 Phase::Linear,
                 Phase::Xor,
                 Phase::Casts,
+                Phase::Invert,
                 Phase::Compares,
                 Phase::Bitwise,
                 Phase::Demanded,
@@ -139,8 +146,8 @@ impl Strategy {
     }
 
     /// The standard strategy plus the deobfuscation passes (linear MBA and bit shuffles):
-    /// `[FactFold, Local(core), Linear, Xor, Casts, Compares, Bitwise, LinearMba, Shuffle,
-    /// Demanded, Local(core)]`, up to 4 rounds.
+    /// `[FactFold, Local(core), Linear, Xor, Casts, Invert, Compares, Bitwise, LinearMba,
+    /// Shuffle, Demanded, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -158,6 +165,7 @@ impl Strategy {
                 Phase::Linear,
                 Phase::Xor,
                 Phase::Casts,
+                Phase::Invert,
                 Phase::Compares,
                 Phase::Bitwise,
                 Phase::LinearMba,
@@ -525,6 +533,10 @@ impl EngineBuilder {
                 Phase::Shuffle => {
                     id = combine(id, 10);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Shuffle));
+                }
+                Phase::Invert => {
+                    id = combine(id, 12);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Invert));
                 }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {

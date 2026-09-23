@@ -5,6 +5,7 @@ pub(super) mod bitwise;
 pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;
+pub(super) mod invert;
 pub(super) mod linear;
 pub(super) mod linear_mba;
 #[cfg(feature = "mba")]
@@ -33,6 +34,7 @@ pub(crate) enum PassKind {
     Demanded,
     LinearMba,
     Shuffle,
+    Invert,
     /// The MBA service (the configuration lives in the phase).
     #[cfg_attr(not(feature = "mba"), allow(dead_code))]
     Mba,
@@ -50,6 +52,7 @@ impl PassKind {
             PassKind::Demanded => "demanded",
             PassKind::LinearMba => "linear_mba",
             PassKind::Shuffle => "shuffle",
+            PassKind::Invert => "invert",
             PassKind::Mba => "mba",
         }
     }
@@ -74,6 +77,7 @@ pub(super) fn step(
         PassKind::Demanded => demanded::step(r, cx, n),
         PassKind::LinearMba => linear_mba::step(r, cx, n),
         PassKind::Shuffle => shuffle::step(r, cx, n),
+        PassKind::Invert => invert::step(r, cx, n),
         // Dispatched with its configuration by the engine.
         PassKind::Mba => Ok(Step::Normal(Fin::FINAL)),
     }

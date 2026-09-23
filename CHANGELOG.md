@@ -30,7 +30,17 @@ The first release.
   `Strategy::standard()`: fact folding, rules, and the linear, xor, bitwise, compares, casts and
   demanded-bits passes. Caller-owned budgets and allowances, admission caps, deadlines, a memo of
   final results, telemetry, observers, host hooks, and postconditions on every rewrite. Passes
-  commit only when the DAG gets strictly smaller.
+  commit only when the DAG gets strictly smaller (the invert pass, like a rule, when the
+  termination order decreases).
+- **Invertibility.** `Query::Injective` and `Query::Bijective` prove that an expression is an
+  injective (bijective) function of one of its subexpressions, through a chain of layers: `~ -
+  bswap bitrev`, `+ - ^` and rotations by anything, multiplication by a value proved odd,
+  extensions and `concat`, extension outputs declaring `ExtOp::invertible`/`ExtOp::invert`, and
+  triangular maps `v ^ g(v)`, `v ± g(v)` decided from per-bit dependencies (the xorshift
+  involution of murmur-style mixers, xorshift steps, T-functions). `Phase::Invert` (in both
+  built-in strategies) uses them at `==` and `!=` only: `f(x) == f(y)` becomes `x == y`,
+  `f(x) == c` becomes `x == f⁻¹(c)` or a constant, and zero or-trees are solved leaf by leaf.
+  Facts bound a right shift by a value's own top bits (`a >>u (a >>u k)` is below `2^k`).
 - **Deobfuscation.** `Strategy::deobfuscate()` adds the linear-MBA pass (linear combinations of
   bitwise functions of up to six atoms, from their corner signature) and the shuffle pass (bit
   provenance of values assembled from slices).

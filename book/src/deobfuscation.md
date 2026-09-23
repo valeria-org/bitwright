@@ -2,7 +2,9 @@
 
 Obfuscators hide simple operations behind *mixed boolean-arithmetic* (MBA) identities, such as
 `x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back.
-`Strategy::deobfuscate()` adds two passes to the standard strategy for these:
+`Strategy::deobfuscate()` adds two passes to the standard strategy for these (hash
+comparisons through invertible mixers are handled by the standard strategy; see
+[Invertibility](invertibility.md)):
 
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature

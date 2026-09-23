@@ -14,6 +14,9 @@ cost and without guessing.
 - **Bit-level facts**: known bits, unsigned and signed ranges, and tri-state proofs.
 - **A directed simplifier** built from normal-form passes and a small rule corpus. Termination is
   guaranteed by construction, and budgets are caller-owned.
+- **Invertibility**: proofs that an expression is an injective or bijective function of a
+  subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so a
+  hash comparison becomes a plain one.
 - **A rule language (`.bwr`)** with a mandatory, machine-checked soundness gate.
 - **Optional services**: MBA simplification with pluggable solvers, a bounded
   equality-saturation search, and SMT-LIB export and import (rule obligations included, so any

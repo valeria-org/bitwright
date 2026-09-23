@@ -98,7 +98,7 @@ Features other than `check` arrive with their milestones.
 | `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate, solver/prover/cache traits, `SignatureSolver`, `MemoryCache`, `Phase::Mba` |
 | `cobra` | no | `mba` plus `CobraSolver` (the `cobra-mba` 0.4 backend) |
 | `eqsat` | no | `bitwright::eqsat`: the bounded equality-saturation search service and its built-in equations |
-| `deobf` | no | GF(2) linear-map normal form, mixer recognizer and inverter |
+| `deobf` | no | GF(2) linear-map normal form (mixer inversion is in the core: §8.1) |
 | `serde` | no | serialization of configs, stats, values, facts |
 
 **Dependencies.** One required dependency: `hashbrown` (no default features) for `HashTable<u32>`
@@ -184,6 +184,8 @@ pub trait ExtOp: Send + Sync + 'static {
     fn expand(&self, _cx: &mut Context, _args: &[Expr]) -> Option<Result<Vec<Expr>, Error>> { None }
     fn smtlib(&self, _output: u8, _args: &[&str], _widths: &[Width]) -> Option<String> { None }
     fn traits(&self) -> ExtTraits { ExtTraits::default() }      // commutative, opaque
+    fn invertible(&self, _output: u8, _arg: u8, _args: &[KnownBits]) -> Invertible { Invertible::No }
+    fn invert(&self, _output: u8, _arg: u8, _args: &[BitVec], _value: &BitVec) -> Option<BitVec> { None }
 }
 ```
 
@@ -194,7 +196,10 @@ pub trait ExtOp: Send + Sync + 'static {
   (every width for one argument, every pair for two, every triple with two equal for three, so
   mixed widths such as a value and a count are covered): declared output widths, determinism (two
   calls), a commutative operation's symmetry, known-bits soundness against `eval` on random
-  partial-knowledge inputs, and `expand ≡ eval`. An operation no tuple is accepted for is refused.
+  partial-knowledge inputs, `expand ≡ eval`, and every invertibility declaration (`invert`
+  recovers the argument from the output at a completion of the other arguments' known bits, and
+  for a bijection finds an argument for a random output value). An operation no tuple is
+  accepted for is refused.
   The self-test samples: an operation that breaks its contract only elsewhere is not caught.
   `ext::check` runs it alone, and `register_unchecked` skips it, for a host that registers the
   same operations in many registries (one per arena) and checks them once in its own tests.
@@ -384,6 +389,7 @@ pub enum Truth { True, False, Unknown }
     Cmp(CmpOpExt, Expr, Expr), InURange { .. }, InSRange { .. }, Aligned { e: Expr, log2: u16 },
     MaskRedundant { e: Expr, mask: &'q BitVec }, FitsUnsigned { e: Expr, bits: u16 },
     FitsSigned { e: Expr, bits: u16 }, IsConstant(Expr),
+    Injective { e: Expr, of: Expr }, Bijective { e: Expr, of: Expr },   // §8.1
 }
 impl Context {
     pub fn facts(&mut self, e: Expr) -> Result<Facts, Error>;             // cap reached → top (sound)
@@ -408,7 +414,12 @@ impl Context {
   zeros from ranges; division and remainder by constants and by ranges; shifts and rotates by constant
   and by symbolic counts (bounded by the count's range); counts; byte and bit permutations;
   pdep/pext; casts; select (join); compares decided from bits and ranges; extension ops through their
-  declared transfer, width-validated.
+  declared transfer, width-validated. Three refinements read the node's structure as well as its
+  operands' facts: a select between the operands of its own comparison (a minimum or maximum), a
+  `concat` of a high product and its low product (the wide product), and a right shift by the
+  value's own top bits, `a >>u (a >>u k)` (when the count is `t`, `a < (t + 1)·2^k`, so the
+  result is below `2^k` wherever `2^t ≥ t + 1`: the data-dependent xorshift of murmur-style
+  mixers changes only its low `k` bits).
 - **Proofs** are tri-state and fail closed; `Unknown` is always legal. `Eq(a, b)` is `True` iff the
   handles are equal, `False` iff the facts conflict.
 - **Constraints** (`Assumptions`, consumer-defined): facts about expressions
@@ -510,6 +521,7 @@ pub enum Decline { AdmissionCap(Cap) }        // Unsupported(..) arrives with ex
 pub enum Phase {
     Local { groups: Vec<String> },   // directed rules of these groups, bottom-up fixpoint
     FactFold, Linear, Xor, Bitwise, Compares, Casts, Demanded, LinearMba, Shuffle,  // passes (§8)
+    Invert,                          // equalities through invertible maps (§8.1)
     // M6: Mba(MbaConfig); later: Raise (display idioms, last phase only)
 }
 pub struct Strategy { pub name: Cow<'static, str>, pub phases: Vec<Phase>, pub max_rounds: u8 }
@@ -914,18 +926,81 @@ Added in M6 (in `Strategy::deobfuscate()`):
 | `LinearMba` | Linear combinations of bitwise functions of ≤ 6 atoms. The operands of `& \| ^` are read as bitwise: only `& \| ^ ~`, atoms, and 0 or all-ones constants may appear there, so a linear term or a non-uniform mask under a bitwise operator is an atom, and so is a node read both ways. Atoms are ordered canonically (by structure, not node index), so the result does not depend on construction order. Every bitwise function is an integer combination of conjunctions (`AND_∅ = −1`), bit by bit and so exactly in Z/2^W, so the values at the 2^t corners where every atom is 0 or all-ones determine the expression. A Möbius transform gives the conjunction coefficients; the emission is the cheapest of the affine form (when no conjunction of two or more atoms remains), the conjunction form `c + Σ k_S·AND_S` itself (any number of atoms), and `u₀ + Σ (u₀ − uₖ)·gₖ` over the distinct corner values, `gₖ` a minimum-form bitwise function (≤ 3 atoms). Only mixed regions (linear and bitwise operators) are considered. |
 | `Shuffle` | Values of ≤ 128 bits assembled from bit slices: every output bit is traced to a constant or to one bit of a source through `&` with a constant, `\|` (with constant-one bits), `^`/`+` of pieces whose traced bits do not overlap, constant shifts and rotations, extensions, `extract`, `concat` and `bswap`. A fully traced value is re-emitted as the source, a rotation, a byte swap, or a `concat` of slices and constant runs. |
 
-Feature `deobf` (GF(2) linear maps over rotations/shifts/xors, mixer recognition and inversion,
-`inverse_odd`) is unchanged in scope.
+Feature `deobf` keeps one planned item: a GF(2) linear-map normal form over rotations, shifts and
+xors (which would also decide invertibility of maps with cyclic bit dependencies, such as
+`x ^ rotl(x, a) ^ rotl(x, b)`). Mixer recognition and inversion, and the odd inverse, are in the
+core (§8.1).
 
 **Pipeline order is part of the contract:** `Strategy::deobfuscate()` is the standard pipeline with
 `LinearMba` and `Shuffle` after `Bitwise`. `Strategy::standard()` is `[FactFold, Local(core), Linear,
-Xor, Casts, Compares, Bitwise, Demanded, Local(core)]` for up to 4 rounds. Measured on a 700k-node
+Xor, Casts, Invert, Compares, Bitwise, Demanded, Local(core)]` for up to 4 rounds (`Invert` before
+`Compares`, so comparisons it solves are combined in the same round). Measured on a 700k-node
 random chain of mixed bitwise and additive steps: 2.9 s in release, linear in size; other shapes
 differ, and a deep DAG can exhaust the default visit budget before the later phases run.
 
 **Corpus.** Local rules are written fresh, carry evidence and an example, and are added only when a
 measurement (a firing census on a real corpus, or a missing-simplification report) shows a need the
 passes do not cover; the seed corpus is 33 rules.
+
+### 8.1 Invertibility (`Phase::Invert`, `Query::Injective`, `Query::Bijective`)
+
+Hash comparisons are equalities through chains of invertible maps. An expression is read as a
+chain of **layers** from a subexpression (the *inner* value) up to its root; a layer is one node
+that is injective in one operand when the others (its *parameters*) are fixed:
+
+| Layer | Kind | Preimage of a constant `c` |
+|-|-|-|
+| `~v`, `-v`, `bswap(v)`, `bitrev(v)` | bijective | the same operator of `c` |
+| `v + k`, `v - k`, `k - v`, `v ^ k`, `rotl(v, k)`, `rotr(v, k)`, any `k` | bijective | the inverse operation |
+| `v * k`, `k` proved odd (constant, known bit 0, or assumed) | bijective | `c · k⁻¹` (Newton's iteration) |
+| `zext(v)`, `sext(v)`, `concat(v, k)`, `concat(k, v)` | injective | the part of `c`, if `c` is an image |
+| extension output declared `Invertible::{Injective, Bijective}` in an argument | as declared | `ExtOp::invert`, checked by evaluation |
+| `v ^ g(v)`, `v + g(v)`, `v - g(v)`, `g(v) - v`, triangular | bijective | solved bit by bit, checked by evaluation |
+
+A chain of layers is injective (bijective when every layer is); nothing else is claimed. A node
+whose two operands both depend on the inner value is a layer only in the **triangular** form:
+`g` must be a function of `v` and parameters, and `D_i`, the bits of `v` that bit `i` of `g` can
+depend on, is computed per operator over `g`'s region (at most 256 nodes; `v` at most 128 bits):
+bitwise operators bit by bit, `+ - * neg` from every lower bit, constant shifts and rotations
+re-indexed, variable ones over the count's range plus the count's own dependencies, casts
+re-indexed, everything else from every bit of every operand; a bit the facts pin depends on
+nothing. The facts are computed afresh over the region with `v` unknown (the context's facts of
+`v` would describe only the values it takes in context), parameters keeping their facts. By
+induction over the region, two values of `v` that agree on `D_i` give equal bit `i` of `g`. Then
+`v ^ g(v)` is bijective when the graph `i → D_i` is acyclic (equal images force equal bits level
+by level in topological order; the preimage is recovered the same way, one evaluation of `g` per
+level), and `v ± g(v)`, `g(v) − v` when every `D_i` lies below `i` (bit `i` of the result is bit
+`i` of `v` flipped by lower bits only; recovered from bit 0 up, one evaluation per bit). This
+admits the xorshift involution `h ^ ((h >>u 32) >>u (h >>u 60))`, xorshift steps and T-functions
+such as `u - (((u << 1) | b) & h)`, and refuses by construction `f(x) ^ x`, `f_a(x) ^ f_b(x)`,
+`f_a(x) | f_b(x)` and `u - ((u | b) & h)`.
+
+**The pass** acts only on `==` and `!=` (a bijection preserves no ordering): both sides the same
+layer over different inner values with the same parameters (the same nodes; for a triangular
+layer, `g₁` and `g₂` matched as one function of `v₁` and `v₂`, commutative operands in either
+order, under a step cap) become a comparison of the inner values, repeatedly; a side against a
+constant is solved through every layer whose parameters are constants, down to `x op f⁻¹(c)`, or
+a truth value when `c` has no preimage; `a₁ | … | aₙ == 0` and `a₁ & … & aₙ == ones` are solved
+leaf by leaf and intersected (one value equal to two constants is false), and kept only when the
+result is a smaller tree. Every rewrite replaces a comparison by one of proper subterms of its
+operands and constants, or by a constant: like a rule it strictly decreases the termination
+order, so the pass commits it whether or not the operands stay live for other users (the DAG
+grows by at most the new comparison and constant), under the usual postconditions and host
+veto. Facts about parameters come under the run's assumptions and fact budget, and the result
+relies on the constraints they used. Analysis work is charged to `pass_work`. Measured against
+the previous pipeline: +1.5 % to +2.6 % instructions on the `simplify/standard` benchmarks (one
+more walk per round over DAGs with few comparisons), no change to fact benchmarks.
+
+**Queries.** `Query::Injective { e, of }` (`Bijective`) is `True` when the chain from `e` down to
+`of` is proved, reading `e` as a function of a value put in place of `of` with every value not
+depending on `of` fixed; `False` when `e` does not depend on `of`, or is narrower (for
+`Bijective`, of another width); `Unknown` otherwise. Under assumptions, facts about parameters are
+read under them and reported as reliance.
+
+**Facts proved elsewhere.** A finite-domain fact (say, proved by exhausting 2³² inputs) is a rule
+guarded by a fact predicate that proves the domain (`if proves(x <=u 0xffffffff)`). The checker
+cannot decide it (`Inconclusive`), so it is linked with `unproven_program`: the host vouches for
+it, and gets sampled verification.
 
 ---
 
@@ -1151,6 +1226,13 @@ casts, compares), each with new admission tests.
    ledger freshness, examples fire, every corpus application decreases the ground order, lints clean.
 5. **Passes.** Each pass's obligation test is exhaustive at W ≤ 6 over its fragment's generators; the
    comparison lattice and range emitter exhaustive at W ≤ 8; the bitwise table at W = 1 (complete).
+   Invertibility: every triangular layer the analysis accepts is checked to be a bijection, and
+   every preimage the unique one, over all values at W ≤ 6 (also for inner values with narrow
+   facts); every cancellation, primitive or triangular, against every assignment of both inner
+   values and a parameter at W ≤ 4, including near misses (`g₂` not quite `g₁` over `v₂`); every
+   `Injective` answer, `True` and `False`, against every assignment. Planted analysis bugs (a
+   dropped carry, a self-dependency allowed, a count's range ignored, a one-sided hole, an even
+   multiplier, facts of `v` from context) are each caught.
 6. **Engine properties** over random DAGs with sharing (explicit seeds, biased to MBA, casts and
    compares): value preservation against the reference; idempotence of `Completed`; determinism
    across runs and construction orders; budget safety (every budget from 0 upward: no panic, sound

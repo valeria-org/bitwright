@@ -1,0 +1,14 @@
+bitwright 1;
+
+group eos.facts32 {
+    /// Fact 0 of a table proved by exhausting every 32-bit input (not checkable here: the
+    /// checker finds it inconclusive, so the host vouches for it): below 2^32,
+    /// `F_A(x) ^ F_B(x)` is the salt only at `x = 0`, where `F_K(x) = S((x ^ K) * K) * K`.
+    rule fact00<W>(x: W) where W == 64 {
+        ((((x ^ 0xcd9063b653a0c1b1) * 0xcd9063b653a0c1b1) ^ ((((x ^ 0xcd9063b653a0c1b1) * 0xcd9063b653a0c1b1) >>u 32) >>u (((x ^ 0xcd9063b653a0c1b1) * 0xcd9063b653a0c1b1) >>u 60))) * 0xcd9063b653a0c1b1)
+        ^ ((((x ^ 0xd215910fabd51aeb) * 0xd215910fabd51aeb) ^ ((((x ^ 0xd215910fabd51aeb) * 0xd215910fabd51aeb) >>u 32) >>u (((x ^ 0xd215910fabd51aeb) * 0xd215910fabd51aeb) >>u 60))) * 0xd215910fabd51aeb)
+        == 0xd734e14a2ead11b5
+        => x == 0
+        if proves(x <=u 0xffffffff)
+    }
+}
