@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 - **MBA evidence.** When the other tests leave an equality open, the certificates read a
   bitwise operation with a constant as arithmetic where the constant reads only bits of the
