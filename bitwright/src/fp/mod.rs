@@ -78,6 +78,20 @@ macro_rules! frames {
     };
 }
 
+/// [`frames!`] for the operations whose intermediates stay within `p + 4` bits (sums,
+/// comparisons, rounding to an integral value): `u64` for every format of at most 64 bits.
+macro_rules! frames_short {
+    ($fmt:expr, $S:ident => $body:expr) => {
+        if $fmt.width().bits() <= 64 && $fmt.sb() <= 60 {
+            #[allow(dead_code)]
+            type $S = u64;
+            $body
+        } else {
+            frames!($fmt, $S => $body)
+        }
+    };
+}
+
 /// A binary floating-point format: `eb` exponent bits and `sb` significand bits, the hidden bit
 /// included, so a value is `eb + sb` bits wide. `2 ≤ eb ≤ 31`, `sb ≥ 2`, `eb + sb ≤ 512`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -186,7 +200,7 @@ impl FpFormat {
     /// `a + b`.
     pub fn add(self, rm: RoundingMode, a: &BitVec, b: &BitVec) -> Result<BitVec, WidthError> {
         self.bin(a, b, |f, x, y| {
-            frames!(f, S => {
+            frames_short!(f, S => {
                 let r = soft::add::<S>(&f.fmt(), rm, load(x), load(y));
                 store(f.width(), r)
             })
@@ -196,7 +210,7 @@ impl FpFormat {
     /// `a − b`, which is `a + neg(b)`.
     pub fn sub(self, rm: RoundingMode, a: &BitVec, b: &BitVec) -> Result<BitVec, WidthError> {
         self.bin(a, b, |f, x, y| {
-            frames!(f, S => {
+            frames_short!(f, S => {
                 let r = soft::sub::<S>(&f.fmt(), rm, load(x), load(y));
                 store(f.width(), r)
             })
@@ -259,7 +273,7 @@ impl FpFormat {
     /// `a` rounded to an integral value by `rm`.
     pub fn round_to_integral(self, rm: RoundingMode, a: &BitVec) -> Result<BitVec, WidthError> {
         self.check(a)?;
-        Ok(frames!(self, S => {
+        Ok(frames_short!(self, S => {
             store(self.width(), soft::round_to_integral::<S>(&self.fmt(), rm, load(a)))
         }))
     }
@@ -267,7 +281,7 @@ impl FpFormat {
     /// IEEE 754-2019 minimumNumber: the smaller operand (`−0 < +0`), a NaN operand ignored.
     pub fn min(self, a: &BitVec, b: &BitVec) -> Result<BitVec, WidthError> {
         self.bin(a, b, |f, x, y| {
-            frames!(f, S => {
+            frames_short!(f, S => {
                 store(f.width(), soft::min::<S>(&f.fmt(), load(x), load(y)))
             })
         })
@@ -276,7 +290,7 @@ impl FpFormat {
     /// IEEE 754-2019 maximumNumber: the larger operand (`−0 < +0`), a NaN operand ignored.
     pub fn max(self, a: &BitVec, b: &BitVec) -> Result<BitVec, WidthError> {
         self.bin(a, b, |f, x, y| {
-            frames!(f, S => {
+            frames_short!(f, S => {
                 store(f.width(), soft::max::<S>(&f.fmt(), load(x), load(y)))
             })
         })
@@ -307,7 +321,7 @@ impl FpFormat {
     pub fn compare(self, a: &BitVec, b: &BitVec) -> Result<Option<Ordering>, WidthError> {
         self.check(a)?;
         self.check(b)?;
-        Ok(frames!(self, S => soft::compare::<S>(&self.fmt(), load(a), load(b))))
+        Ok(frames_short!(self, S => soft::compare::<S>(&self.fmt(), load(a), load(b))))
     }
 
     /// Whether the comparison `op` holds (false when either operand is a NaN).
@@ -350,6 +364,12 @@ impl FpFormat {
     pub fn convert(self, to: FpFormat, rm: RoundingMode, a: &BitVec) -> Result<BitVec, WidthError> {
         self.check(a)?;
         let (from_f, to_f) = (self.fmt(), to.fmt());
+        if self.width().bits() <= 64 && to.width().bits() <= 64 && self.sb().max(to.sb()) <= 60 {
+            return Ok(store(
+                to.width(),
+                soft::convert::<u64>(&from_f, &to_f, rm, load(a)),
+            ));
+        }
         Ok(frames_for!(self.sb().max(to.sb()), S => {
             store(to.width(), soft::convert::<S>(&from_f, &to_f, rm, load(a)))
         }))
