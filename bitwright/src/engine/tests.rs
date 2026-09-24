@@ -15,7 +15,7 @@ fn net(engine: &Engine) -> &DispatchNet {
         .phases
         .iter()
         .find_map(|p| match p {
-            PhaseImpl::Local(n) => Some(n),
+            PhaseImpl::Local(n) => Some(&**n),
             _ => None,
         })
         .unwrap()
@@ -27,7 +27,7 @@ fn rules_only() -> Strategy {
         "rules",
         vec![Phase::Local {
             groups: builtin()
-                .0
+                .program
                 .groups()
                 .iter()
                 .map(|g| g.name.clone())
@@ -108,16 +108,16 @@ fn assert_normal(engine: &Engine, cx: &mut Context, e: Expr) {
     let order = cx.post_order(&[e]).unwrap();
     for n in order {
         let id = cx.id(n).unwrap();
-        for l in &engine.inner.rules {
-            if !l.rule.decreasing {
+        for rule in engine.inner.rules.iter() {
+            if !rule.decreasing {
                 continue;
             }
-            if let Some(r) = crate::rules::apply::try_apply(cx, &l.rule, id)
+            if let Some(r) = crate::rules::apply::try_apply(cx, rule, id)
                 && r != id
             {
                 panic!(
                     "{}: `{}` is not normal (rewrites to `{}`)",
-                    l.rule.name,
+                    rule.name,
                     cx.display(n),
                     cx.display(cx.handle(r))
                 );
@@ -129,13 +129,7 @@ fn assert_normal(engine: &Engine, cx: &mut Context, e: Expr) {
 /// A random instance of a random directed rule's pattern at a small admitted width, its
 /// parameters replaced by random subexpressions, combined with a random expression.
 fn redex_rich(engine: &Engine, g: &mut Gen, cx: &mut Context) -> Expr {
-    let rules: Vec<&Rule> = engine
-        .inner
-        .rules
-        .iter()
-        .map(|l| &l.rule)
-        .filter(|r| r.decreasing)
-        .collect();
+    let rules: Vec<&Rule> = engine.inner.rules.iter().filter(|r| r.decreasing).collect();
     loop {
         let rule = rules[g.rng.below(rules.len() as u64) as usize];
         let widths: Vec<Vec<u16>> = crate::rules::width_assignments(rule)
@@ -228,7 +222,7 @@ fn every_rule_fires_inside_larger_expressions() {
     let engine = strict_rules();
     let mut census = RuleCensus::default();
     let mut rng = Rng(11);
-    for rule in engine.inner.rules.iter().map(|l| &l.rule) {
+    for rule in engine.inner.rules.iter() {
         for (input, _) in &rule.examples {
             let mut cx = Context::new();
             let o = ParseOptions::width(Width::W8);
@@ -252,7 +246,7 @@ fn every_rule_fires_inside_larger_expressions() {
             assert_normal(&engine, &mut cx, r);
         }
     }
-    for rule in engine.inner.rules.iter().map(|l| &l.rule) {
+    for rule in engine.inner.rules.iter() {
         let c = census.rules.get(&rule.name).copied().unwrap_or_default();
         assert!(
             c.applied > 0,
@@ -274,16 +268,16 @@ fn dispatch_is_a_pure_prefilter() {
         for n in cx.post_order(&[e]).unwrap() {
             let id = cx.id(n).unwrap();
             let cands: Vec<u32> = net(&engine).candidates(&cx, id).collect();
-            for (ri, l) in engine.inner.rules.iter().enumerate() {
-                if !l.rule.decreasing {
+            for (ri, rule) in engine.inner.rules.iter().enumerate() {
+                if !rule.decreasing {
                     continue;
                 }
-                if crate::rules::matcher::match_rule(&cx, &l.rule, id).is_some() {
+                if crate::rules::matcher::match_rule(&cx, rule, id).is_some() {
                     matched += 1;
                     assert!(
                         cands.contains(&(ri as u32)),
                         "{} matches `{}` but was filtered out",
-                        l.rule.name,
+                        rule.name,
                         cx.display(n)
                     );
                 }
@@ -585,6 +579,47 @@ fn census_agrees_with_stats() {
 }
 
 #[test]
+fn builtin_engines_share_rules_and_nets() {
+    let nets = |e: &Engine| -> Vec<Arc<DispatchNet>> {
+        e.inner
+            .phases
+            .iter()
+            .filter_map(|p| match p {
+                PhaseImpl::Local(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let build = || {
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::standard())
+            .build()
+            .unwrap()
+    };
+    let (a, b) = (build(), build());
+    assert!(Arc::ptr_eq(&a.inner.rules, &b.inner.rules));
+    assert!(Arc::ptr_eq(&a.inner.proven, &b.inner.proven));
+    assert!(a.inner.proven.iter().all(|&p| p));
+    let (na, nb) = (nets(&a), nets(&b));
+    assert_eq!(na.len(), 2);
+    assert!(na.iter().chain(&nb).all(|n| Arc::ptr_eq(n, &na[0])));
+    // A strategy over fewer groups gets a net of its own.
+    let bits = Engine::builder()
+        .builtin()
+        .strategy(Strategy::new(
+            "bits",
+            vec![Phase::Local {
+                groups: vec!["core.bitwise".into()],
+            }],
+        ))
+        .build()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&nets(&bits)[0], &na[0]));
+    assert_eq!(a.inner.id, build().inner.id);
+}
+
+#[test]
 fn linking_requires_proof_unless_allowed() {
     let src = "bitwright 1;\ngroup x.g {\n#[allow(BW0407)]\nrule wrong<W>(x: W, y: W) { (x & y) | (x ^ y) => x }\n}\n";
     let p = RuleProgram::compile(src).unwrap();
@@ -607,8 +642,8 @@ fn linking_requires_proof_unless_allowed() {
     assert_eq!(out.stats.quarantined, 1);
     // A ledger for another rule does not vouch for this one.
     let q = RuleProgram::compile(src).unwrap();
-    let (_, ledger) = builtin();
-    assert!(Engine::builder().program(q, ledger).build().is_err());
+    let ledger = Ledger::parse(crate::rules::corpus::CORE_LEDGER).unwrap();
+    assert!(Engine::builder().program(q, &ledger).build().is_err());
     // Unknown groups are errors.
     assert!(matches!(
         Engine::builder()
@@ -862,22 +897,22 @@ fn dispatch_is_a_pure_prefilter_for_every_pattern_kind() {
         for n in cx.post_order(&[e]).unwrap() {
             let id = cx.id(n).unwrap();
             let cands: Vec<u32> = net(&engine).candidates(&cx, id).collect();
-            for (ri, l) in engine.inner.rules.iter().enumerate() {
-                if crate::rules::matcher::match_rule(&cx, &l.rule, id).is_some() {
+            for (ri, rule) in engine.inner.rules.iter().enumerate() {
+                if crate::rules::matcher::match_rule(&cx, rule, id).is_some() {
                     matched[ri] += 1;
                     assert!(
                         cands.contains(&(ri as u32)),
                         "{} matches `{}` but was filtered out",
-                        l.rule.name,
+                        rule.name,
                         cx.display(n)
                     );
                 }
             }
         }
     }
-    for (l, m) in engine.inner.rules.iter().zip(&matched) {
-        if l.rule.decreasing {
-            assert!(*m > 0, "{} never matched", l.rule.name);
+    for (rule, m) in engine.inner.rules.iter().zip(&matched) {
+        if rule.decreasing {
+            assert!(*m > 0, "{} never matched", rule.name);
         }
     }
 }

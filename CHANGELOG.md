@@ -36,8 +36,15 @@
   (`qsynth_ea` line 469, 6 to 7 nodes against a ground truth of 8, through
   `sum_from_double_or_xor`; OSES line 6, listed in two files, 58 to 67 against an input of
   76, through `complementary_shift_rotate`). `simplify/standard` costs 1.2 % more instructions
-  and the MBA rows between 1.5 % more and 8.4 % less; building an engine costs 7.95 M
-  instructions instead of 1.47 M (0.5 ms), for 172 rules instead of 37.
+  and the MBA rows between 1.5 % more and 8.4 % less.
+- **Building an engine** that links the built-in corpus costs 91 k instructions (6 µs) instead
+  of 7.96 M (0.55 ms; 1.47 M in 0.6.0, with 37 rules instead of 172), so a host can build one
+  per context. Compiling the corpus and checking it against its ledger already happened once
+  per process; what remained was copying: each engine copied the rules three times, looked
+  each one up in a copy of the ledger, and built the same dispatch net twice. Now the rules of a
+  program, the rules the built-in ledger vouches for, and the built-in dispatch net are shared by
+  every engine (phases with the same rules share one net). Cloning a `RuleProgram` no longer
+  copies its rules. Results do not change.
 - **Tooling.** The scheduled CI jobs pass again. `nightly-deep` never finished: Ubuntu's z3
   4.8.12 overruns its 5-second limit on a 512-bit `pext` (exported as 512 shifts by a counted
   amount) and was still on it when the runner shut down two hours later. The job now installs

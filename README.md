@@ -85,7 +85,7 @@ so they are what to compare a change by ([how the suite measures](docs/benchmark
 | Simplifying in a fresh three-node context | 4.6 µs | 77,600 |
 | Deobfuscating a linear MBA expression (native solver) | 0.37 ms | 4.9 M |
 | Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 0.46 ms | 11.8 M |
-| Building an engine (compiling the rule corpus) | 76 µs | 1.5 M |
+| Building an engine (linking the built-in rules) | 76 µs | 1.5 M |
 | SMT-LIB export / import, per node | 0.28 / 0.56 µs | 7,540 / 13,330 |
 
 On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 84

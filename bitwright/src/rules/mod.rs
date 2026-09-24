@@ -27,6 +27,8 @@ mod ledger;
 pub(crate) mod matcher;
 pub(crate) mod order;
 
+use std::sync::Arc;
+
 pub use compile::CompileLimits;
 pub use diag::{CompileError, Diagnostic, Level, explain};
 pub use ir::{
@@ -63,7 +65,8 @@ setters!(CompileOptions {
 #[derive(Clone, Debug)]
 pub struct RuleProgram {
     groups: Vec<Group>,
-    rules: Vec<Rule>,
+    /// Shared: engines link a program without copying its rules.
+    rules: Arc<[Rule]>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -78,13 +81,18 @@ impl RuleProgram {
         let (groups, rules, diagnostics) = compile::compile(src, &opts.limits)?;
         Ok(RuleProgram {
             groups,
-            rules,
+            rules: rules.into(),
             diagnostics,
         })
     }
 
     /// Every rule, in source order.
     pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// Every rule, shared.
+    pub(crate) fn shared_rules(&self) -> &Arc<[Rule]> {
         &self.rules
     }
 

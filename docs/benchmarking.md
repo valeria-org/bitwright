@@ -79,7 +79,7 @@ the test suite passes on both commits.
 | `facts/*` | Facts of every node of a fresh DAG (`cold`), a cached query (`warm`), proofs, and a fresh three-node context per query (`tiny-context`, the shape of a consumer that builds one context per instruction). |
 | `constraints/*` | Assuming 40 predicates (orderings and masks), and facts under 40 assumptions. |
 | `simplify/*` | The standard strategy on random DAGs; the deobfuscation strategy with the MBA service, bitwright's own evidence only: `mba` (the signature solver) and `mba-native` (the normal-form solver) on linear MBA, `mba-nonlinear` (normal-form) and `mba-nonlinear-sig` (signature) on nonlinear MBA; and one simplification in a fresh context. |
-| `service/*` | Building an engine (rule compilation), equality saturation, SMT-LIB export and import. |
+| `service/*` | Building an engine (linking the built-in rules, compiled once per process), equality saturation, SMT-LIB export and import. |
 
 Workloads are generated from fixed seeds (`bitwright-bench/src/workload.rs`), so every run
 measures the same expressions. The nonlinear MBA corpus is generated in the repository too
