@@ -156,6 +156,7 @@ fn node(out: &mut String, rule: &Rule, n: NodeId, widths: &[u16]) -> Result<Stri
                 args: &args,
                 arg_w: &arg_w,
                 lo,
+                fp: None,
             },
         )
     };

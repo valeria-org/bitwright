@@ -303,6 +303,34 @@ impl Printer<'_> {
                     }
                     parts.push(Step::Text(")"));
                 }
+                op if crate::fp::node::Kind::of(op).is_some() => {
+                    // `fp.<op>[.<mode>]<format>(operands)`: the format fixes the operands'
+                    // widths, except an integer operand's, whose literal carries its width.
+                    prec = P_ATOM;
+                    let d = cx.fp_desc(i);
+                    let int_operand = d.is_some_and(|d| {
+                        matches!(
+                            d.kind(),
+                            crate::fp::node::Kind::FromS | crate::fp::node::Kind::FromU
+                        )
+                    });
+                    let name =
+                        d.map_or_else(|| "?".to_string(), |d| crate::fp::syntax::call_name(&d));
+                    parts.push(Step::Owned(format!("{name}(")));
+                    let kids: Vec<u32> = n.children().collect();
+                    for (k, c) in kids.iter().enumerate() {
+                        if k > 0 {
+                            parts.push(Step::Text(", "));
+                        }
+                        let ctx = if int_operand {
+                            LitCtx::Annotate
+                        } else {
+                            LitCtx::Inferred
+                        };
+                        parts.push(Step::Node(*c, 0, ctx));
+                    }
+                    parts.push(Step::Text(")"));
+                }
                 op => {
                     // Function-call forms.
                     prec = P_ATOM;

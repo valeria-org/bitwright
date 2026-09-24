@@ -156,12 +156,17 @@ pub(crate) struct App<'a> {
     pub(crate) arg_w: &'a [u16],
     /// `Extract`'s low bit.
     pub(crate) lo: u32,
+    /// A floating-point node's operation.
+    pub(crate) fp: Option<crate::fp::node::Desc>,
 }
 
 /// The SMT-LIB term for `op` applied as `app` describes. Operators without a QF_BV counterpart
 /// are expanded, through helper definitions written to `out` (flat, however wide). Comparisons
 /// give a 1-bit vector. `Const` and `Sym` are the caller's.
 pub(crate) fn term(out: &mut String, op: OpCode, app: &App<'_>) -> Result<String, Error> {
+    if let Some(d) = &app.fp {
+        return super::fp::term(out, d, app);
+    }
     let (w, ww, tag) = (app.w, u32::from(app.w), app.tag);
     let arg = |k: usize| -> Result<&str, Error> {
         app.args
@@ -538,6 +543,7 @@ pub(crate) fn emit(cx: &mut Context, roots: &[Expr]) -> Result<String, Error> {
                         args: &args,
                         arg_w: &arg_w,
                         lo,
+                        fp: cx.fp_desc(i),
                     },
                 )?
             }

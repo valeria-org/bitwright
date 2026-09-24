@@ -123,6 +123,10 @@ pub(crate) const RULE_WORDS: &[&str] = &[
 ];
 
 /// Whether a name is a keyword or function name (so cannot be a bare symbol or `let` name).
+/// Every name that starts with `fp.` is reserved for the floating-point operations.
 pub(crate) fn is_reserved(s: &str) -> bool {
-    matches!(s, "let" | "true" | "false") || FUNCTIONS.contains(&s) || RULE_WORDS.contains(&s)
+    matches!(s, "let" | "true" | "false")
+        || FUNCTIONS.contains(&s)
+        || RULE_WORDS.contains(&s)
+        || s.starts_with("fp.")
 }

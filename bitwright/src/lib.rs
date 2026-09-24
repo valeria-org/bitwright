@@ -89,6 +89,7 @@ mod error;
 mod expr;
 pub mod ext;
 mod facts;
+pub mod fp;
 mod hash;
 mod invert;
 #[cfg(feature = "mba")]
@@ -149,6 +150,7 @@ pub use expr::{
 pub use facts::{
     Assumptions, ConstraintId, Facts, KnownBits, Proof, Query, Reliance, SRange, Truth, URange,
 };
+pub use fp::{FpFormat, RoundingMode};
 pub use ops::{BinOp, CmpOp, CmpOpExt, UnOp};
 pub use text::{ParseOptions, PrintOptions};
 pub use value::{BitVec, Width};

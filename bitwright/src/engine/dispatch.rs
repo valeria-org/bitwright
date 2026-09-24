@@ -7,7 +7,7 @@ use crate::rules::matcher::is_closed;
 use crate::rules::{NodeId, ParamKind, RNode, Rule};
 
 /// Operators as a bit set.
-type Mask = u64;
+type Mask = u128;
 
 const ALL: Mask = !0;
 
@@ -15,8 +15,8 @@ const fn bit(op: OpCode) -> Mask {
     1 << (op as u8)
 }
 
-// Every opcode (the extension ones last) must fit the mask.
-const _: () = assert!((OpCode::Ext3o7 as u8) < Mask::BITS as u8);
+// Every opcode (the floating-point ones last) must fit the mask.
+const _: () = assert!((OpCode::FToU as u8) < Mask::BITS as u8);
 
 struct Entry {
     rule: u32,
@@ -114,7 +114,7 @@ impl DispatchNet {
             }
             k
         };
-        // Extension nodes (past the built-in opcodes) have no rules.
+        // Extension and floating-point nodes (past `Select`) have no rules yet.
         let entries = self.by_op.get(node.op as usize).map_or(&[][..], |v| &v[..]);
         entries.iter().filter_map(move |e| {
             let fits = |order: [usize; 3]| {

@@ -25,6 +25,7 @@
 //! ```
 
 mod export;
+mod fp;
 mod import;
 mod obligation;
 #[cfg(test)]
@@ -96,11 +97,14 @@ pub fn equivalence_query_under(
 /// SMT-LIB definition were declared as uninterpreted functions. (Then `unsat` still proves
 /// equality, but `sat` may be an artefact of the uninterpreted function, not a counterexample.)
 fn logic(body: &str) -> String {
-    if body.contains("(declare-fun ") {
-        String::from("(set-logic QF_UFBV)\n")
-    } else {
-        String::from("(set-logic QF_BV)\n")
-    }
+    let uf = body.contains("(declare-fun ");
+    let fp = body.contains("(_ to_fp ");
+    String::from(match (uf, fp) {
+        (false, false) => "(set-logic QF_BV)\n",
+        (true, false) => "(set-logic QF_UFBV)\n",
+        (false, true) => "(set-logic QF_BVFP)\n",
+        (true, true) => "(set-logic ALL)\n",
+    })
 }
 
 /// `(assert …)` lines stating that `term` satisfies `f`.

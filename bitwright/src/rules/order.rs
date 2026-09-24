@@ -66,6 +66,24 @@ pub(crate) fn op_rank(op: OpCode) -> u8 {
         OpCode::Sext => 67,
         OpCode::Extract => 68,
         OpCode::Concat => 69,
+        // Floating point: above the bit-vector operators, `Mul > Add` as for integers.
+        OpCode::FAdd => 70,
+        OpCode::FMul => 71,
+        OpCode::FFma => 72,
+        OpCode::FDiv => 73,
+        OpCode::FSqrt => 74,
+        OpCode::FRem => 75,
+        OpCode::FRound => 76,
+        OpCode::FMin => 77,
+        OpCode::FMax => 78,
+        OpCode::FEq => 79,
+        OpCode::FLt => 80,
+        OpCode::FLe => 81,
+        OpCode::FConvert => 82,
+        OpCode::FFromS => 83,
+        OpCode::FFromU => 84,
+        OpCode::FToS => 85,
+        OpCode::FToU => 86,
         // Extension outputs: opaque to rules, ranked above everything built in. Listed one by
         // one, so a new built-in opcode must be given its own rank.
         OpCode::Ext1o0
@@ -91,7 +109,7 @@ pub(crate) fn op_rank(op: OpCode) -> u8 {
         | OpCode::Ext3o4
         | OpCode::Ext3o5
         | OpCode::Ext3o6
-        | OpCode::Ext3o7 => 70,
+        | OpCode::Ext3o7 => 100,
     }
 }
 
@@ -108,6 +126,11 @@ fn op_commutative(op: OpCode) -> bool {
             | OpCode::Xor
             | OpCode::Eq
             | OpCode::Ne
+            | OpCode::FAdd
+            | OpCode::FMul
+            | OpCode::FMin
+            | OpCode::FMax
+            | OpCode::FEq
     )
 }
 

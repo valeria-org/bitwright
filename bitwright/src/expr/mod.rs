@@ -10,6 +10,7 @@ mod build;
 pub(crate) use build::count_mod;
 pub use build::traps;
 mod eval;
+mod fp;
 mod node;
 mod symbols;
 #[cfg(test)]
@@ -187,6 +188,16 @@ pub enum View {
         then: Expr,
         /// The value when the condition is 0.
         els: Expr,
+    },
+    /// A floating-point operation (see [`fp`](crate::fp)).
+    Fp {
+        /// The operation.
+        op: crate::fp::FpOp,
+        /// The format of its floating-point operands (for a conversion from an integer, of
+        /// its result).
+        format: crate::fp::FpFormat,
+        /// The operands.
+        args: crate::fp::FpArgs,
     },
     /// Output `output` of an extension call (see [`ext`](crate::ext)).
     Ext {
@@ -538,6 +549,13 @@ impl Context {
             let op = self.registry.as_deref().map_or(0, |r| r.hash_at(n.aux));
             h = combine(h, op);
         }
+        if crate::fp::node::Kind::of(n.op).is_some() {
+            // The rounding mode and format; a conversion's target exponent width too.
+            h = combine(h, u64::from(n.aux));
+            if n.op == OpCode::FConvert {
+                h = combine(h, u64::from(n.b));
+            }
+        }
         match n.op {
             OpCode::Extract => {
                 h = combine(h, u64::from(n.b));
@@ -783,11 +801,25 @@ impl Context {
                     View::Bin(b, h(n.a), h(n.b))
                 } else if let Some(c) = op.as_cmp() {
                     View::Cmp(c, h(n.a), h(n.b))
+                } else if let Some(d) = self.fp_desc(i) {
+                    let arity = d.kind().arity();
+                    View::Fp {
+                        op: d.op,
+                        format: d.format,
+                        args: crate::fp::FpArgs::new(&[h(n.a), h(n.b), h(n.c)][..arity]),
+                    }
                 } else {
                     unreachable!("every opcode is covered")
                 }
             }
         }
+    }
+
+    /// The operation of a floating-point node.
+    pub(crate) fn fp_desc(&self, i: u32) -> Option<crate::fp::node::Desc> {
+        let n = self.node(i);
+        crate::fp::node::Kind::of(n.op)?;
+        crate::fp::node::Desc::decode(&n, self.wid(n.a))
     }
 
     /// The expression's direct operands, in order.

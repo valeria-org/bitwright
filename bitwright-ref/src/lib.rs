@@ -10,8 +10,14 @@
 //! Invalid inputs (width mismatches, out-of-range widths or bit positions) panic with a message;
 //! valid inputs never panic. The only partial operation is [`UnOp::Bswap`], which [`un`] reports
 //! as `None` when the width is not a multiple of 8.
+//!
+//! The [`fp`] module is the floating-point oracle: IEEE 754 binary formats evaluated by exact
+//! rational arithmetic on its own big naturals and the contract's rounding definition, for
+//! exponent fields up to 15 bits.
 
 #![forbid(unsafe_code)]
+
+pub mod fp;
 
 /// Largest width a caller may construct. Double-width products of 512-bit operands need 1024.
 const MAX_WIDTH: u16 = 1024;

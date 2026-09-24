@@ -51,6 +51,13 @@ pub enum WidthError {
         /// The condition width.
         bits: u16,
     },
+    /// A floating-point format outside `2 ≤ eb ≤ 31`, `sb ≥ 2`, `eb + sb ≤ 512`.
+    FpFormat {
+        /// Exponent bits.
+        eb: u32,
+        /// Significand bits, the hidden bit included.
+        sb: u32,
+    },
 }
 
 impl fmt::Display for WidthError {
@@ -77,6 +84,10 @@ impl fmt::Display for WidthError {
             Self::ConditionWidth { bits } => {
                 write!(f, "select condition must be 1 bit wide, got {bits}")
             }
+            Self::FpFormat { eb, sb } => write!(
+                f,
+                "floating-point format ({eb}, {sb}) is outside 2 <= eb <= 31, sb >= 2, eb + sb <= 512"
+            ),
         }
     }
 }

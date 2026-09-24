@@ -80,6 +80,8 @@ enum Kind {
     Derived(Derived, usize, usize),
     /// Output `k` of an extension operation on 1 to 3 arguments.
     Ext(crate::ext::ExtId, u8, Vec<usize>),
+    /// A floating-point operation.
+    Fp(crate::fp::syntax::Call, Vec<usize>),
 }
 
 struct PNode {
@@ -448,6 +450,9 @@ impl<'a> Parser<'a> {
                 Ok(self.node(Kind::Ext(op, k, args), (span.0, end)))
             }
             Tok::Ident(name) => {
+                if name.starts_with("fp.") {
+                    return self.fp_call(&name, span);
+                }
                 if name == "true" || name == "false" {
                     let n = self.node(Kind::Bool(name == "true"), span);
                     self.fix(n, 1, span)?;
@@ -530,6 +535,32 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::RParen, "`)`")?;
         Ok(out)
+    }
+
+    /// `fp.<op>[.<mode>]<format>(operands)`; the format fixes the operands' and the result's
+    /// widths.
+    fn fp_call(&mut self, name: &str, start: (usize, usize)) -> PResult<usize> {
+        self.enter()?;
+        let err = |m: String| SyntaxError::new(&m, start.0, start.1);
+        let parsed = crate::fp::syntax::parse_name(name).map_err(err)?;
+        let g = if parsed.generics() > 0 {
+            self.generics(parsed.generics())?
+        } else {
+            Vec::new()
+        };
+        let call = parsed.finish(&g).map_err(err)?;
+        let args = self.args(call.base.arity())?;
+        let sp = (start.0, self.toks[self.pos.saturating_sub(1)].end);
+        if let Some(w) = call.operand_width() {
+            for &a in &args {
+                self.fix(a, w, sp)?;
+            }
+        }
+        let result = call.result_width();
+        let n = self.node(Kind::Fp(call, args), sp);
+        self.fix(n, result, sp)?;
+        self.depth -= 1;
+        Ok(n)
     }
 
     fn call(&mut self, name: &str, start: (usize, usize)) -> PResult<usize> {
@@ -759,7 +790,7 @@ fn operands(k: &Kind) -> Vec<usize> {
             vec![*a, *b]
         }
         Kind::Select(a, b, c) => vec![*a, *b, *c],
-        Kind::Ext(_, _, args) => args.clone(),
+        Kind::Ext(_, _, args) | Kind::Fp(_, args) => args.clone(),
     }
 }
 
@@ -993,6 +1024,10 @@ impl Context {
                 Kind::Ext(op, k, args) => {
                     let args: Vec<Expr> = args.iter().map(|&a| at(a)).collect();
                     self.ext_output(*op, usize::from(*k), &args)
+                }
+                Kind::Fp(call, args) => {
+                    let args: Vec<Expr> = args.iter().map(|&a| at(a)).collect();
+                    self.build_fp_call(call, &args)
                 }
                 Kind::Derived(d, a, b) => {
                     let (a, b) = (at(*a), at(*b));

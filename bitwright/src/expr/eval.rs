@@ -109,6 +109,9 @@ impl Context {
                     BitVec::bin_unchecked(b, &get(n.a), &get(n.b))
                 } else if let Some(c) = op.as_cmp() {
                     BitVec::from_bool(BitVec::cmp_unchecked(c, &get(n.a), &get(n.b)))
+                } else if let Some(d) = self.fp_desc(i) {
+                    let args: Vec<BitVec> = n.children().map(&get).collect();
+                    crate::fp::eval(&d, &args)
                 } else {
                     unreachable!("every opcode is covered")
                 }

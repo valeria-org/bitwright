@@ -576,6 +576,8 @@ impl Context {
                     self.c_bin(bo, a, b)
                 } else if let Some(co) = op.as_cmp() {
                     self.c_cmp(co, a, b)
+                } else if let Some(d) = self.fp_desc(i) {
+                    self.c_fp(d, &[a, b, c][..d.kind().arity()])
                 } else {
                     unreachable!("every opcode is covered")
                 }

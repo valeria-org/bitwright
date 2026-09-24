@@ -471,6 +471,137 @@ fn bitwuzla_agrees_with_the_evaluator() {
     solver_agrees_with_the_evaluator(Solver::Bitwuzla);
 }
 
+/// Every floating-point operation, under every rounding mode, on random operands of each format:
+/// the solver's FloatingPoint theory computes exactly bitwright's result (so `unsat` for any
+/// other).
+fn solver_agrees_with_floating_point(solver: Solver, formats: &[crate::fp::FpFormat]) {
+    use crate::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
+    if !solver.available() {
+        return;
+    }
+    let mut rng = Rng(0x24);
+    let mut script = String::new();
+    let mut expected = 0;
+    for &f in formats {
+        for round in 0..6 {
+            let mut cx = Context::new();
+            let w = f.width();
+            let (a, b, c) = (
+                cx.symbol("a", w).unwrap(),
+                cx.symbol("b", w).unwrap(),
+                cx.symbol("c", w).unwrap(),
+            );
+            let i = cx.symbol("i", Width::new(24).unwrap()).unwrap();
+            let rm = RoundingMode::ALL[round % 5];
+            let other = if f == FpFormat::F32 {
+                FpFormat::F64
+            } else {
+                FpFormat::F32
+            };
+            let mut exprs = vec![
+                cx.fp(FpOp::Add(rm), f, &[a, b]).unwrap(),
+                cx.fp_sub(f, rm, a, b).unwrap(),
+                cx.fp(FpOp::Mul(rm), f, &[a, b]).unwrap(),
+                cx.fp(FpOp::Div(rm), f, &[a, b]).unwrap(),
+                cx.fp(FpOp::Fma(rm), f, &[a, b, c]).unwrap(),
+                cx.fp(FpOp::Sqrt(rm), f, &[a]).unwrap(),
+                cx.fp(FpOp::RoundToIntegral(rm), f, &[a]).unwrap(),
+                cx.fp(FpOp::Rem, f, &[a, b]).unwrap(),
+                cx.fp(FpOp::Min, f, &[a, b]).unwrap(),
+                cx.fp(FpOp::Max, f, &[a, b]).unwrap(),
+                cx.fp(FpOp::Convert { to: other, rm }, f, &[a]).unwrap(),
+                cx.fp(FpOp::FromSInt(rm), f, &[i]).unwrap(),
+                cx.fp(FpOp::FromUInt(rm), f, &[i]).unwrap(),
+                cx.fp(FpOp::ToSInt(rm, Width::W16), f, &[a]).unwrap(),
+                cx.fp(FpOp::ToUInt(rm, Width::W8), f, &[a]).unwrap(),
+                cx.fp(FpOp::ToSInt(rm, Width::W64), f, &[a]).unwrap(),
+            ];
+            for op in [FpCmpOp::Eq, FpCmpOp::Lt, FpCmpOp::Le] {
+                exprs.push(cx.fp_cmp(f, op, a, b).unwrap());
+            }
+            for t in [FpTest::Nan, FpTest::Subnormal, FpTest::Negative] {
+                exprs.push(cx.fp_test(f, t, a).unwrap());
+            }
+            for _ in 0..12 {
+                let env: Vec<(SymbolKey, BitVec)> = vec![
+                    (SymbolKey::from("a"), crate::fp::tests::sample(&mut rng, f)),
+                    (SymbolKey::from("b"), crate::fp::tests::sample(&mut rng, f)),
+                    (SymbolKey::from("c"), crate::fp::tests::sample(&mut rng, f)),
+                    (
+                        SymbolKey::from("i"),
+                        BitVec::wrapping_from_u64(
+                            Width::new(24).unwrap(),
+                            rng.next() >> rng.below(40),
+                        ),
+                    ),
+                ];
+                for &e in &exprs {
+                    let want = cx.eval(&[e], &env[..]).unwrap()[0];
+                    script.push_str("(push 1)\n");
+                    script.push_str(&export(&mut cx, &[e]).unwrap());
+                    for id in cx.symbols_in(&[e]).unwrap() {
+                        let key = cx.symbol_key(id).unwrap().clone();
+                        let name = export::symbol_name(&key, id.index());
+                        let v = env.iter().find(|(k, _)| *k == key).unwrap().1;
+                        script.push_str(&format!("(assert (= {name} {}))\n", export::literal(&v)));
+                    }
+                    script.push_str(&format!(
+                        "(assert (not (= root0 {})))\n(check-sat)\n(pop 1)\n",
+                        export::literal(&want)
+                    ));
+                    expected += 1;
+                }
+            }
+        }
+    }
+    let out = solver
+        .run(&format!("(set-logic ALL)\n{script}"), None)
+        .unwrap();
+    let answers: Vec<&str> = out.lines().collect();
+    assert_eq!(answers.len(), expected, "{}: {out}", solver.name());
+    let wrong: Vec<usize> = (0..expected).filter(|&k| answers[k] != "unsat").collect();
+    assert!(
+        wrong.is_empty(),
+        "{}: cases {wrong:?} are not unsat",
+        solver.name()
+    );
+}
+
+#[test]
+#[ignore = "needs z3 on PATH"]
+fn z3_agrees_with_floating_point() {
+    use crate::fp::FpFormat;
+    let f = |eb, sb| FpFormat::new(eb, sb).unwrap();
+    // Not the tiniest formats, where z3 5.1.0 is wrong and bitwright agrees with the independent
+    // reference on every input: its fma at precision 3 or less (in (3, 3), fma(0.375, 2^-4, +0)
+    // gives 0.125, not +0), and its roundToIntegral with a 2-bit exponent (in (2, 2),
+    // roundToIntegral(RNE, 0.5) gives 1.0, not +0).
+    solver_agrees_with_floating_point(
+        Solver::Z3,
+        &[
+            f(3, 4),
+            f(4, 4),
+            FpFormat::F16,
+            FpFormat::BF16,
+            FpFormat::F32,
+            FpFormat::F64,
+            FpFormat::X87,
+            FpFormat::F128,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH"]
+fn bitwuzla_agrees_with_floating_point() {
+    use crate::fp::FpFormat;
+    // Bitwuzla's release builds take the four standard formats only.
+    solver_agrees_with_floating_point(
+        Solver::Bitwuzla,
+        &[FpFormat::F16, FpFormat::F32, FpFormat::F64, FpFormat::F128],
+    );
+}
+
 // ----- rule obligations -------------------------------------------------------------------------
 
 use crate::rules::RuleProgram;

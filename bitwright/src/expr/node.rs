@@ -72,6 +72,26 @@ pub(crate) enum OpCode {
     Ext3o5,
     Ext3o6,
     Ext3o7,
+    // Floating point (see `fp::node`): `aux` = rounding mode << 5 | the format's exponent width;
+    // `FConvert` keeps the target's exponent width in `b`. Appended after the extension
+    // opcodes, so every earlier discriminant (and so hash and order) is unchanged.
+    FAdd,
+    FMul,
+    FDiv,
+    FFma,
+    FSqrt,
+    FRem,
+    FRound,
+    FMin,
+    FMax,
+    FEq,
+    FLt,
+    FLe,
+    FConvert,
+    FFromS,
+    FFromU,
+    FToS,
+    FToU,
 }
 
 /// The extension opcodes, by `(arity - 1) * 8 + output`.
@@ -115,7 +135,7 @@ impl OpCode {
     /// The arity and output of an extension opcode.
     pub(crate) const fn as_ext(self) -> Option<(usize, usize)> {
         let (first, code) = (OpCode::Ext1o0 as u8, self as u8);
-        if code < first {
+        if code < first || code > OpCode::Ext3o7 as u8 {
             return None;
         }
         let i = (code - first) as usize;
@@ -234,9 +254,10 @@ impl OpCode {
             | OpCode::Sext
             | OpCode::Extract => 1,
             OpCode::Select => 3,
-            op => match op.as_ext() {
-                Some((arity, _)) => arity,
-                None => 2,
+            op => match (op.as_ext(), crate::fp::node::Kind::of(op)) {
+                (Some((arity, _)), _) => arity,
+                (_, Some(k)) => k.arity(),
+                _ => 2,
             },
         }
     }
@@ -253,6 +274,8 @@ impl OpCode {
 /// - binary, compare, `Concat`: `a`, `b` (`Concat`: `a` = high part).
 /// - `Select`: `a` = condition, `b` = then, `c` = else.
 /// - extension output: `a`, `b`, `c` = the arguments; `aux` = the operation's registry index.
+/// - floating point: `a`, `b`, `c` = the operands; `aux` = rounding mode << 5 | exponent width;
+///   `FConvert`: `b` = the target's exponent width.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Node {
     pub(crate) op: OpCode,

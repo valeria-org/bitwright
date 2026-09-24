@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bitwright::engine::{Engine, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
+use bitwright::fp::{FpFormat, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{
     Assumptions, BinOp, BitVec, CmpOpExt, Context, Expr, ParseOptions, Query, SymbolKey, Width,
@@ -17,6 +18,7 @@ use crate::workload::{self, Dag, Rng};
 pub fn all() -> Vec<Bench> {
     let mut v = Vec::new();
     values(&mut v);
+    floats(&mut v);
     exprs(&mut v);
     facts(&mut v);
     constraints(&mut v);
@@ -45,6 +47,59 @@ fn values(v: &mut Vec<Bench>) {
                     acc
                 });
             }));
+        }
+    }
+}
+
+/// Exact floating-point arithmetic on random encodings (mostly normal numbers): 1024 operations
+/// per iteration. `rtz` rows round toward zero, the others to nearest even.
+fn floats(v: &mut Vec<Bench>) {
+    type Op = fn(FpFormat, &BitVec, &BitVec) -> BitVec;
+    let ops: [(&str, Op); 7] = [
+        ("add", |f, x, y| {
+            f.add(RoundingMode::Rne, x, y).expect("same widths")
+        }),
+        ("add.rtz", |f, x, y| {
+            f.add(RoundingMode::Rtz, x, y).expect("same widths")
+        }),
+        ("mul", |f, x, y| {
+            f.mul(RoundingMode::Rne, x, y).expect("same widths")
+        }),
+        ("div", |f, x, y| {
+            f.div(RoundingMode::Rne, x, y).expect("same widths")
+        }),
+        ("sqrt", |f, x, _| {
+            f.sqrt(RoundingMode::Rne, x).expect("same widths")
+        }),
+        ("fma", |f, x, y| {
+            f.fma(RoundingMode::Rne, x, y, x).expect("same widths")
+        }),
+        ("to-f32", |f, x, _| {
+            f.convert(FpFormat::F32, RoundingMode::Rne, x)
+                .expect("same widths")
+        }),
+    ];
+    for (format, bits) in [
+        (FpFormat::F32, 32u64),
+        (FpFormat::F64, 64),
+        (FpFormat::F128, 128),
+    ] {
+        for (name, op) in ops {
+            v.push(Bench::new(
+                format!("fp/{name}/{bits}"),
+                200,
+                "1024 ops",
+                move |b| {
+                    let pairs = workload::value_pairs(bits, format.width(), 1024);
+                    b.iter(|| {
+                        let mut acc = 0u64;
+                        for (x, y) in &pairs {
+                            acc ^= op(format, black_box(x), black_box(y)).limbs()[0];
+                        }
+                        acc
+                    });
+                },
+            ));
         }
     }
 }
