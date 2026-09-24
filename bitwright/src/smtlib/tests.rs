@@ -602,6 +602,148 @@ fn bitwuzla_agrees_with_floating_point() {
     );
 }
 
+// ----- floating point ----------------------------------------------------------------------------
+
+/// Every floating-point operation of `f` on the symbols `a`, `b`, `c`, `i` (20 bits).
+fn float_ops(cx: &mut Context, f: crate::fp::FpFormat) -> Vec<Expr> {
+    use crate::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
+    let w = f.width();
+    let (a, b, c) = (
+        cx.symbol("a", w).unwrap(),
+        cx.symbol("b", w).unwrap(),
+        cx.symbol("c", w).unwrap(),
+    );
+    let i = cx.symbol("i", Width::new(20).unwrap()).unwrap();
+    let other = if f == FpFormat::F32 {
+        FpFormat::F64
+    } else {
+        FpFormat::F32
+    };
+    let mut v = Vec::new();
+    for rm in [RoundingMode::Rne, RoundingMode::Rtn] {
+        v.push(cx.fp(FpOp::Add(rm), f, &[a, b]).unwrap());
+        v.push(cx.fp_sub(f, rm, a, b).unwrap());
+        v.push(cx.fp(FpOp::Mul(rm), f, &[a, b]).unwrap());
+        v.push(cx.fp(FpOp::Div(rm), f, &[a, b]).unwrap());
+        v.push(cx.fp(FpOp::Fma(rm), f, &[a, b, c]).unwrap());
+        v.push(cx.fp(FpOp::Sqrt(rm), f, &[a]).unwrap());
+        v.push(cx.fp(FpOp::RoundToIntegral(rm), f, &[a]).unwrap());
+        v.push(cx.fp(FpOp::Convert { to: other, rm }, f, &[a]).unwrap());
+        v.push(cx.fp(FpOp::FromSInt(rm), f, &[i]).unwrap());
+        v.push(cx.fp(FpOp::FromUInt(rm), f, &[i]).unwrap());
+        v.push(cx.fp(FpOp::ToSInt(rm, Width::W16), f, &[a]).unwrap());
+        v.push(cx.fp(FpOp::ToUInt(rm, Width::W8), f, &[a]).unwrap());
+    }
+    for op in [FpOp::Rem, FpOp::Min, FpOp::Max] {
+        v.push(cx.fp(op, f, &[a, b]).unwrap());
+    }
+    for op in [FpCmpOp::Eq, FpCmpOp::Lt, FpCmpOp::Ge] {
+        v.push(cx.fp_cmp(f, op, a, b).unwrap());
+    }
+    v.push(cx.fp_test(f, FpTest::Subnormal, a).unwrap());
+    v
+}
+
+#[test]
+fn floating_point_exports_read_back_as_the_same_functions() {
+    use crate::fp::FpFormat;
+    let mut rng = Rng(0x25);
+    for f in [
+        FpFormat::F32,
+        FpFormat::F16,
+        FpFormat::new(4, 5).unwrap(),
+        FpFormat::X87,
+    ] {
+        let mut cx = Context::new();
+        let exprs = float_ops(&mut cx, f);
+        for &e in &exprs {
+            let script = export(&mut cx, &[e]).unwrap();
+            let mut other = Context::new();
+            let back = import(&mut other, &script)
+                .unwrap_or_else(|err| panic!("{err}\n{script}"))
+                .definition("root0")
+                .unwrap();
+            // The operations that round are read back as the very same node.
+            if matches!(cx.view(e).unwrap(), crate::View::Fp { .. }) {
+                let (t1, t2) = (cx.display(e).to_string(), other.display(back).to_string());
+                let is_minmax_or_int = t1.starts_with("fp.min")
+                    || t1.starts_with("fp.max")
+                    || t1.starts_with("fp.to_");
+                if !is_minmax_or_int {
+                    assert_eq!(t1, t2, "{script}");
+                }
+            }
+            for _ in 0..40 {
+                let env: Vec<(SymbolKey, BitVec)> = vec![
+                    (SymbolKey::from("a"), crate::fp::tests::sample(&mut rng, f)),
+                    (SymbolKey::from("b"), crate::fp::tests::sample(&mut rng, f)),
+                    (SymbolKey::from("c"), crate::fp::tests::sample(&mut rng, f)),
+                    (
+                        SymbolKey::from("i"),
+                        BitVec::wrapping_from_u64(Width::new(20).unwrap(), rng.next()),
+                    ),
+                ];
+                let want = cx.eval(&[e], &env[..]).unwrap()[0];
+                let got = other.eval(&[back], &env[..]).unwrap()[0];
+                assert_eq!(got, want, "{} at {env:?}", cx.display(e));
+            }
+        }
+    }
+}
+
+#[test]
+fn floating_point_scripts_import() {
+    let script = "
+        (set-logic QF_BVFP)
+        (declare-const x Float32)
+        (declare-const y (_ FloatingPoint 8 24))
+        (define-fun tenth () Float32 ((_ to_fp 8 24) RNE 0.1))
+        (define-fun third () Float64 ((_ to_fp 11 53) RTZ (/ 1 3)))
+        (define-fun neg () Float32 ((_ to_fp 8 24) RNE (- 2.5)))
+        (define-fun one () Float32 (fp #b0 #x7f #b00000000000000000000000))
+        (define-fun s () Float32 (fp.add roundNearestTiesToEven x tenth))
+        (define-fun chain () Bool (fp.lt (_ -oo 8 24) x y (_ +oo 8 24)))
+        (define-fun nan_eq () Bool (= (_ NaN 8 24) ((_ to_fp 8 24) #x7f800001)))
+        (define-fun zeros () Bool (= (_ +zero 8 24) (_ -zero 8 24)))
+        (define-fun bits () (_ BitVec 32) (fp.to_ieee_bv (fp.mul RTP one tenth)))
+        (define-fun wide () Float64 ((_ to_fp 11 53) RNE x))
+        (define-fun back () (_ BitVec 8) ((_ fp.to_sbv 8) RTZ neg))
+        (assert (fp.isNormal s))
+        (check-sat)
+    ";
+    let mut cx = Context::new();
+    let im = import(&mut cx, script).unwrap();
+    let c = |name: &str| cx.as_const(im.definition(name).unwrap()).unwrap();
+    assert_eq!(c("tenth").unwrap().to_f32(), Some(0.1f32));
+    assert_eq!(
+        c("third").unwrap().to_f64(),
+        Some(f64::from_bits((1.0f64 / 3.0).to_bits()))
+    );
+    assert_eq!(c("neg").unwrap().to_f32(), Some(-2.5));
+    assert_eq!(c("one").unwrap().to_f32(), Some(1.0));
+    // NaNs are one value for `=`; +0 and −0 are two.
+    assert_eq!(c("nan_eq").unwrap(), BitVec::from_bool(true));
+    assert_eq!(c("zeros").unwrap(), BitVec::from_bool(false));
+    assert_eq!(
+        c("bits").unwrap().to_u64(),
+        Some(u64::from((0.1f32).to_bits()))
+    );
+    assert_eq!(c("back").unwrap().to_u64(), Some(0xfe)); // −2.5 toward zero: −2
+    let env = [
+        (SymbolKey::from("x"), BitVec::from_f32(1.0)),
+        (SymbolKey::from("y"), BitVec::from_f32(2.0)),
+    ];
+    let mut v = |name: &str| cx.eval(&[im.definition(name).unwrap()], &env[..]).unwrap()[0];
+    assert_eq!(v("s").to_f32(), Some(1.0f32 + 0.1f32));
+    assert_eq!(v("chain"), BitVec::from_bool(true));
+    assert_eq!(v("wide").to_f64(), Some(1.0));
+    assert_eq!(im.assertions.len(), 1);
+    // Rounding-mode variables are not supported (the modes are constants).
+    let mut cx = Context::new();
+    let err = import(&mut cx, "(declare-const m RoundingMode)").unwrap_err();
+    assert!(err.to_string().contains("rounding-mode"), "{err}");
+}
+
 // ----- rule obligations -------------------------------------------------------------------------
 
 use crate::rules::RuleProgram;

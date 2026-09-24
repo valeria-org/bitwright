@@ -1,11 +1,15 @@
-//! SMT-LIB 2.6 (QF_BV) export and import (feature `smtlib`).
+//! SMT-LIB 2.6 (QF_BV, and QF_BVFP for floating point) export and import (feature `smtlib`).
 //!
 //! bitwright's semantics are SMT-LIB's (total division, shifts past the width), so every
 //! expression has an exact QF_BV counterpart: operators map directly, and the ones QF_BV lacks
 //! (population count, leading and trailing zeros, byte swap, bit reverse, `pdep`, `pext`, the high
-//! half of a product, rotations by a symbolic count) are expanded. Any SMT-LIB 2.6 solver can
-//! then evaluate an expression, check an equivalence, or prove a rule at any widths
-//! ([`rule_obligation`]). [`import`] reads a QF_BV subset back.
+//! half of a product, rotations by a symbolic count) are expanded. Floating-point operations use
+//! the FloatingPoint theory, a result's bits declared and pinned by one assertion (SMT-LIB has
+//! no standard `fp.to_ieee_bv`), and what SMT-LIB leaves open written out as bitwright defines
+//! it (the canonical NaN, `−0 < +0` in `min`/`max`, saturating conversions to integers). Any
+//! SMT-LIB 2.6 solver can then evaluate an expression, check an equivalence, or prove a rule at
+//! any widths ([`rule_obligation`]). [`import`] reads a QF_BV subset back, and QF_BVFP terms
+//! over floats.
 //!
 //! ```
 //! use bitwright::{Context, ParseOptions, Width};

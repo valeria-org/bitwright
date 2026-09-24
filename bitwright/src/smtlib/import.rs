@@ -1,9 +1,10 @@
-//! SMT-LIB 2.6 import of a QF_BV subset.
+//! SMT-LIB 2.6 import of a QF_BV subset, and of floating-point (QF_BVFP) terms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::expr::{Context, Expr};
+use crate::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use crate::ops::{BinOp, CmpOpExt, UnOp};
 use crate::text::SyntaxError;
 use crate::{BitVec, SymbolKey, Width};
@@ -43,6 +44,18 @@ impl Import {
 /// `distinct`, the core Boolean operators, and every operator of the QF_BV theory and its
 /// extensions (`bvnand`, `bvnor`, `bvxnor`, `bvcomp`, `bvsmod`, the `u`/`s` comparisons,
 /// `repeat`, `rotate_left`, `rotate_right`, `zero_extend`, `sign_extend`, `extract`).
+///
+/// Floats: the sorts `(_ FloatingPoint eb sb)`, `Float16`, `Float32`, `Float64`, `Float128`
+/// (a float constant is a symbol of `eb + sb` bits holding its encoding) and `RoundingMode`
+/// (its five constants, by either name; rounding-mode variables are refused); `(fp s e m)`,
+/// `(_ +zero eb sb)`, `-zero`, `+oo`, `-oo`, `NaN`; every operator of the FloatingPoint
+/// theory, the comparisons chainable; `to_fp` from bits, a float, a signed integer or a real
+/// constant (a numeral, a decimal, `(- r)`, `(/ n m)`), `to_fp_unsigned`, `fp.to_ubv` and
+/// `fp.to_sbv` (saturating, as bitwright defines them), and z3's `fp.to_ieee_bv` (a NaN as the
+/// canonical one). `=` on floats treats every NaN as one value. What SMT-LIB leaves open
+/// (the zero `fp.min` of `+0` and `−0` returns, conversions out of range) takes bitwright's
+/// definitions.
+///
 /// Anything else is an error. Symbol names `#k` and `$k` (decimal `k`) read as integer and
 /// fresh keys, so an [`export`](super::export)ed script reads back to the same symbols.
 pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
@@ -52,6 +65,7 @@ pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
         cx,
         globals: HashMap::new(),
         scope: Vec::new(),
+        used: HashSet::new(),
         out: Import::default(),
     };
     // Then one top-level form at a time: memory is bounded by the largest command, not by the
@@ -290,8 +304,24 @@ impl<'s> Sx<'s> {
     }
 
     fn sort(&self, id: u32) -> Result<Sort, Error> {
-        if self.sym(id) == Some("Bool") {
-            return Ok(Sort::Bool);
+        match self.sym(id) {
+            Some("Bool") => return Ok(Sort::Bool),
+            Some("RoundingMode") => return Ok(Sort::Rm),
+            Some("Float16") => return Ok(Sort::Fp(FpFormat::F16)),
+            Some("Float32") => return Ok(Sort::Fp(FpFormat::F32)),
+            Some("Float64") => return Ok(Sort::Fp(FpFormat::F64)),
+            Some("Float128") => return Ok(Sort::Fp(FpFormat::F128)),
+            _ => {}
+        }
+        if let Some(k) = self.list(id)
+            && k.len() == 4
+            && self.sym(k[0]) == Some("_")
+            && self.sym(k[1]) == Some("FloatingPoint")
+        {
+            let (eb, sb) = (self.numeral(k[2])?, self.numeral(k[3])?);
+            return FpFormat::new(eb, sb)
+                .map(Sort::Fp)
+                .map_err(|e| self.err(id, &e.to_string()));
         }
         if let Some(k) = self.list(id)
             && k.len() == 3
@@ -301,23 +331,31 @@ impl<'s> Sx<'s> {
             let n = self.numeral(k[2])?;
             return Ok(Sort::Bv(self.width(k[2], n)?));
         }
-        Err(self.err(id, "unsupported sort (Bool or (_ BitVec n))"))
+        Err(self.err(
+            id,
+            "unsupported sort (Bool, (_ BitVec n), a FloatingPoint sort or RoundingMode)",
+        ))
     }
 }
 
 // ----- terms ---------------------------------------------------------------------------------
 
-/// A term's value: a bit-vector, or a Boolean as a 1-bit expression.
+/// A term's value: a bit-vector, a Boolean as a 1-bit expression, a float as its encoding in its
+/// format, or a rounding mode (constants only).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Val {
     Bv(Expr),
     Bool(Expr),
+    Fp(Expr, FpFormat),
+    Rm(RoundingMode),
 }
 
 impl Val {
-    fn expr(self) -> Expr {
+    /// The expression of a value that has one (a rounding mode has none).
+    fn expr(self) -> Option<Expr> {
         match self {
-            Val::Bv(e) | Val::Bool(e) => e,
+            Val::Bv(e) | Val::Bool(e) | Val::Fp(e, _) => Some(e),
+            Val::Rm(_) => None,
         }
     }
 }
@@ -326,6 +364,8 @@ impl Val {
 enum Sort {
     Bool,
     Bv(Width),
+    Fp(FpFormat),
+    Rm,
 }
 
 struct State<'a, 's> {
@@ -334,6 +374,8 @@ struct State<'a, 's> {
     globals: HashMap<&'s str, Val>,
     /// `let` bindings, innermost last.
     scope: Vec<(&'s str, Val)>,
+    /// Global names read by a term so far.
+    used: HashSet<&'s str>,
     out: Import,
 }
 
@@ -368,10 +410,15 @@ impl<'s> State<'_, 's> {
                 let v = self.term(sx, args[3])?;
                 self.check_sort(sx, args[3], v, sort)?;
                 self.bind_global(sx, args[0], name, v)?;
-                self.out.definitions.push((name.to_string(), v.expr()));
+                if let Some(e) = v.expr() {
+                    self.out.definitions.push((name.to_string(), e));
+                }
                 Ok(())
             }
             Some("assert") if args.len() == 1 => {
+                if self.float_bits(sx, args[0])? {
+                    return Ok(());
+                }
                 let v = self.term(sx, args[0])?;
                 let Val::Bool(e) = v else {
                     return Err(sx.err(args[0], "an assertion must be Boolean"));
@@ -398,20 +445,32 @@ impl<'s> State<'_, 's> {
         let name = sx.name(name_id)?;
         let sort = sx.sort(sort_id)?;
         let key = key_of(name);
-        let (w, wrap): (Width, fn(Expr) -> Val) = match sort {
-            Sort::Bool => (Width::W1, Val::Bool),
-            Sort::Bv(w) => (w, Val::Bv),
+        let w = match sort {
+            Sort::Bool => Width::W1,
+            Sort::Bv(w) => w,
+            Sort::Fp(f) => f.width(),
+            Sort::Rm => {
+                return Err(Error::Unsupported(
+                    "rounding-mode variables (bitwright's rounding modes are constants)".into(),
+                ));
+            }
         };
         let e = self.cx.symbol(key, w)?;
-        self.bind_global(sx, name_id, name, wrap(e))?;
+        let v = match sort {
+            Sort::Bool => Val::Bool(e),
+            Sort::Fp(f) => Val::Fp(e, f),
+            _ => Val::Bv(e),
+        };
+        self.bind_global(sx, name_id, name, v)?;
         self.out.symbols.push((name.to_string(), e));
         Ok(())
     }
 
     fn check_sort(&self, sx: &Sx<'s>, id: u32, v: Val, sort: Sort) -> Result<(), Error> {
         let ok = match (v, sort) {
-            (Val::Bool(_), Sort::Bool) => true,
+            (Val::Bool(_), Sort::Bool) | (Val::Rm(_), Sort::Rm) => true,
             (Val::Bv(e), Sort::Bv(w)) => self.cx.width(e)? == w,
+            (Val::Fp(_, f), Sort::Fp(g)) => f == g,
             _ => false,
         };
         if ok {
@@ -433,14 +492,14 @@ impl<'s> State<'_, 's> {
     fn bv(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<Expr, Error> {
         match v {
             Val::Bv(e) => Ok(e),
-            Val::Bool(_) => Err(sx.err(id, "expected a bit-vector")),
+            _ => Err(sx.err(id, "expected a bit-vector")),
         }
     }
 
     fn boolean(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<Expr, Error> {
         match v {
             Val::Bool(e) => Ok(e),
-            Val::Bv(_) => Err(sx.err(id, "expected a Boolean")),
+            _ => Err(sx.err(id, "expected a Boolean")),
         }
     }
 
@@ -450,9 +509,15 @@ impl<'s> State<'_, 's> {
             Tok::Sym(s) => match s {
                 "true" => Ok(Val::Bool(self.cx.bool(true)?)),
                 "false" => Ok(Val::Bool(self.cx.bool(false)?)),
-                _ => self
-                    .lookup(s)
-                    .ok_or_else(|| sx.err(id, "undeclared symbol")),
+                _ => {
+                    if let Some(v) = self.lookup(s) {
+                        self.used.insert(s);
+                        return Ok(v);
+                    }
+                    rounding_mode(s)
+                        .map(Val::Rm)
+                        .ok_or_else(|| sx.err(id, "undeclared symbol"))
+                }
             },
             Tok::List(first, end) => {
                 let k = &sx.kids[first as usize..end as usize];
@@ -528,8 +593,20 @@ impl<'s> State<'_, 's> {
         ))
     }
 
-    /// `(_ bvN n)`.
+    /// `(_ bvN n)`, or a float's special value `(_ +zero eb sb)` (`-zero`, `+oo`, `-oo`, `NaN`).
     fn indexed_constant(&mut self, sx: &Sx<'s>, id: u32, args: &[u32]) -> Result<Val, Error> {
+        if let [v, eb, sb] = args {
+            let f = self.format(sx, id, *eb, *sb)?;
+            let value = match sx.sym(*v) {
+                Some("+zero") => f.zero(false),
+                Some("-zero") => f.zero(true),
+                Some("+oo") => f.inf(false),
+                Some("-oo") => f.inf(true),
+                Some("NaN") => f.nan(),
+                _ => return Err(sx.err(*v, "expected +zero, -zero, +oo, -oo or NaN")),
+            };
+            return Ok(Val::Fp(self.cx.constant(&value)?, f));
+        }
         let [v, n] = args else {
             return Err(sx.err(id, "expected (_ bvN n)"));
         };
@@ -586,6 +663,9 @@ impl<'s> State<'_, 's> {
             .iter()
             .map(|&i| sx.numeral(i))
             .collect::<Result<_, _>>()?;
+        if matches!(op, "to_fp" | "to_fp_unsigned" | "fp.to_ubv" | "fp.to_sbv") {
+            return self.indexed_float(sx, id, op, &nums, args);
+        }
         let [a] = args else {
             return Err(sx.err(id, "an indexed operator takes one operand"));
         };
@@ -647,6 +727,9 @@ impl<'s> State<'_, 's> {
                 Err(sx.err(id, "wrong number of operands"))
             }
         };
+        if op.starts_with("fp") && (op == "fp" || op.starts_with("fp.")) {
+            return self.apply_float(sx, id, op, args);
+        }
         // Operators over bit-vectors.
         let bin = match op {
             "bvadd" => Some((BinOp::Add, true)),
@@ -770,9 +853,26 @@ impl<'s> State<'_, 's> {
             }
             "=" | "distinct" => {
                 arity(n >= 2)?;
-                let kind = |v: Val| matches!(v, Val::Bool(_));
+                let kind = |v: Val| match v {
+                    Val::Bool(_) => 0,
+                    Val::Bv(_) => 1,
+                    Val::Fp(..) => 2,
+                    Val::Rm(_) => 3,
+                };
                 if args.iter().any(|&(_, v)| kind(v) != kind(args[0].1)) {
                     return Err(sx.err(id, "operands of different sorts"));
+                }
+                if let Val::Fp(_, f) = args[0].1 {
+                    return self.float_equality(sx, id, op, f, args);
+                }
+                if let Val::Rm(_) = args[0].1 {
+                    let all_same = args.iter().all(|&(_, v)| v == args[0].1);
+                    let distinct = (0..n).all(|i| (i + 1..n).all(|j| args[i].1 != args[j].1));
+                    return Ok(Val::Bool(self.cx.bool(if op == "=" {
+                        all_same
+                    } else {
+                        distinct
+                    })?));
                 }
                 let mut pairs = Vec::new();
                 if op == "=" {
@@ -789,7 +889,9 @@ impl<'s> State<'_, 's> {
                 };
                 let mut acc: Option<Expr> = None;
                 for (i, j) in pairs {
-                    let (a, b) = (args[i].1.expr(), args[j].1.expr());
+                    let (Some(a), Some(b)) = (args[i].1.expr(), args[j].1.expr()) else {
+                        return Err(sx.err(id, "operands without a value"));
+                    };
                     let t = self.cx.cmp(c, a, b)?;
                     acc = Some(match acc {
                         Some(x) => self.cx.bin(BinOp::And, x, t)?,
@@ -806,11 +908,415 @@ impl<'s> State<'_, 's> {
                 match (t, f) {
                     (Val::Bv(a), Val::Bv(b)) => Ok(Val::Bv(self.cx.select(c, a, b)?)),
                     (Val::Bool(a), Val::Bool(b)) => Ok(Val::Bool(self.cx.select(c, a, b)?)),
+                    (Val::Fp(a, fa), Val::Fp(b, fb)) if fa == fb => {
+                        Ok(Val::Fp(self.cx.select(c, a, b)?, fa))
+                    }
+                    (Val::Rm(_), Val::Rm(_)) => Err(Error::Unsupported(
+                        "a rounding mode chosen by a condition".into(),
+                    )),
                     _ => Err(sx.err(id, "ite arms of different sorts")),
                 }
             }
             _ => Err(Error::Unsupported(format!("the operator {op}"))),
         }
+    }
+}
+
+// ----- floating point ------------------------------------------------------------------------
+
+/// A rounding mode by one of SMT-LIB's names for it.
+fn rounding_mode(s: &str) -> Option<RoundingMode> {
+    Some(match s {
+        "RNE" | "roundNearestTiesToEven" => RoundingMode::Rne,
+        "RNA" | "roundNearestTiesToAway" => RoundingMode::Rna,
+        "RTP" | "roundTowardPositive" => RoundingMode::Rtp,
+        "RTN" | "roundTowardNegative" => RoundingMode::Rtn,
+        "RTZ" | "roundTowardZero" => RoundingMode::Rtz,
+        _ => return None,
+    })
+}
+
+/// Whether two forms are the same text (up to blanks and comments).
+fn same(sx: &Sx<'_>, a: u32, b: u32) -> bool {
+    match (sx.tok(a), sx.tok(b)) {
+        (Tok::Sym(x), Tok::Sym(y)) | (Tok::Lit(x), Tok::Lit(y)) => x == y,
+        (Tok::List(..), Tok::List(..)) => match (sx.list(a), sx.list(b)) {
+            (Some(ka), Some(kb)) => {
+                ka.len() == kb.len() && ka.iter().zip(kb).all(|(&x, &y)| same(sx, x, y))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Little-endian limbs of a decimal digit string (at most 1,280 bits).
+fn decimal_limbs(digits: &str) -> Option<Vec<u64>> {
+    let mut limbs = vec![0u64; 21];
+    for d in digits.bytes() {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        let mut carry = u128::from(d - b'0');
+        for l in &mut limbs {
+            let x = u128::from(*l) * 10 + carry;
+            *l = x as u64;
+            carry = x >> 64;
+        }
+        if carry != 0 || limbs[20] != 0 {
+            return None;
+        }
+    }
+    limbs.truncate(20);
+    Some(limbs)
+}
+
+/// A real constant as `(negative, numerator, denominator)`: a numeral, a decimal, `(- r)`, or
+/// `(/ n m)` of numerals.
+fn real_value(sx: &Sx<'_>, id: u32) -> Option<(bool, Vec<u64>, Vec<u64>)> {
+    match sx.tok(id) {
+        Tok::Lit(s) => {
+            let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+            if int.is_empty() || !int.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let num = decimal_limbs(&format!("{int}{frac}"))?;
+            let den = decimal_limbs(&format!("1{}", "0".repeat(frac.len())))?;
+            Some((false, num, den))
+        }
+        Tok::List(..) => {
+            let k = sx.list(id)?;
+            match (sx.sym(*k.first()?), k.len()) {
+                (Some("-"), 2) => {
+                    let (neg, n, d) = real_value(sx, k[1])?;
+                    Some((!neg, n, d))
+                }
+                (Some("/"), 3) => {
+                    let (na, a, one_a) = real_value(sx, k[1])?;
+                    let (nb, b, one_b) = real_value(sx, k[2])?;
+                    // Numerals only (a denominator of 1).
+                    let is_one = |v: &[u64]| v[0] == 1 && v[1..].iter().all(|&l| l == 0);
+                    if !is_one(&one_a) || !is_one(&one_b) {
+                        return None;
+                    }
+                    Some((na != nb, a, b))
+                }
+                _ => None,
+            }
+        }
+        Tok::Sym(_) => None,
+    }
+}
+
+impl<'s> State<'_, 's> {
+    fn format(&self, sx: &Sx<'s>, id: u32, eb: u32, sb: u32) -> Result<FpFormat, Error> {
+        let (eb, sb) = (sx.numeral(eb)?, sx.numeral(sb)?);
+        FpFormat::new(eb, sb).map_err(|e| sx.err(id, &e.to_string()))
+    }
+
+    fn rm(&mut self, sx: &Sx<'s>, id: u32) -> Result<RoundingMode, Error> {
+        match self.term(sx, id)? {
+            Val::Rm(m) => Ok(m),
+            _ => Err(sx.err(id, "expected a rounding mode")),
+        }
+    }
+
+    fn float(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<(Expr, FpFormat), Error> {
+        match v {
+            Val::Fp(e, f) => Ok((e, f)),
+            _ => Err(sx.err(id, "expected a float")),
+        }
+    }
+
+    /// The floats of `args`, which must share one format.
+    fn floats(&self, sx: &Sx<'s>, args: &[(u32, Val)]) -> Result<(Vec<Expr>, FpFormat), Error> {
+        let mut out = Vec::with_capacity(args.len());
+        let mut format = None;
+        for &(a, v) in args {
+            let (e, f) = self.float(sx, a, v)?;
+            if format.is_some_and(|g| g != f) {
+                return Err(sx.err(a, "floats of different formats"));
+            }
+            format = Some(f);
+            out.push(e);
+        }
+        let f = format.ok_or_else(|| Error::Unsupported("no operands".into()))?;
+        Ok((out, f))
+    }
+
+    /// `((_ to_fp eb sb) …)` (from bits, a float, a signed integer or a real constant),
+    /// `((_ to_fp_unsigned eb sb) rm x)`, `((_ fp.to_ubv m) rm x)` and `((_ fp.to_sbv m) rm x)`.
+    fn indexed_float(
+        &mut self,
+        sx: &Sx<'s>,
+        id: u32,
+        op: &str,
+        nums: &[u32],
+        args: &[u32],
+    ) -> Result<Val, Error> {
+        let fmt = |eb: u32, sb: u32| FpFormat::new(eb, sb).map_err(|e| sx.err(id, &e.to_string()));
+        match (op, nums, args) {
+            ("to_fp", &[eb, sb], &[x]) => {
+                let f = fmt(eb, sb)?;
+                let v = self.term(sx, x)?;
+                let e = self.bv(sx, x, v)?;
+                if self.cx.width(e)? != f.width() {
+                    return Err(sx.err(x, "the bit-vector is not the format's width"));
+                }
+                Ok(Val::Fp(e, f))
+            }
+            ("to_fp" | "to_fp_unsigned", &[eb, sb], &[m, x]) => {
+                let f = fmt(eb, sb)?;
+                let rm = self.rm(sx, m)?;
+                if op == "to_fp"
+                    && let Some((negative, num, den)) = real_value(sx, x)
+                {
+                    let v = f.round_rational(rm, negative, &num, &den).ok_or_else(|| {
+                        Error::Unsupported("a real constant too large to round exactly".into())
+                    })?;
+                    return Ok(Val::Fp(self.cx.constant(&v)?, f));
+                }
+                let v = self.term(sx, x)?;
+                let e = match (op, v) {
+                    ("to_fp", Val::Fp(e, from)) => {
+                        self.cx.fp(FpOp::Convert { to: f, rm }, from, &[e])?
+                    }
+                    ("to_fp", Val::Bv(e)) => self.cx.fp(FpOp::FromSInt(rm), f, &[e])?,
+                    ("to_fp_unsigned", Val::Bv(e)) => self.cx.fp(FpOp::FromUInt(rm), f, &[e])?,
+                    _ => return Err(sx.err(x, "expected a float, a bit-vector or a real")),
+                };
+                Ok(Val::Fp(e, f))
+            }
+            ("fp.to_ubv" | "fp.to_sbv", &[m], &[r, x]) => {
+                let w = sx.width(id, m)?;
+                let rm = self.rm(sx, r)?;
+                let v = self.term(sx, x)?;
+                let (e, f) = self.float(sx, x, v)?;
+                let op = if op == "fp.to_sbv" {
+                    FpOp::ToSInt(rm, w)
+                } else {
+                    FpOp::ToUInt(rm, w)
+                };
+                Ok(Val::Bv(self.cx.fp(op, f, &[e])?))
+            }
+            _ => Err(sx.err(id, "wrong operands of a floating-point conversion")),
+        }
+    }
+
+    /// The FloatingPoint theory's operators (and z3's `fp.to_ieee_bv`).
+    fn apply_float(
+        &mut self,
+        sx: &Sx<'s>,
+        id: u32,
+        op: &str,
+        args: &[(u32, Val)],
+    ) -> Result<Val, Error> {
+        let wrong = || sx.err(id, "wrong operands");
+        if op == "fp" {
+            let [(a0, v0), (a1, v1), (a2, v2)] = args else {
+                return Err(wrong());
+            };
+            let (s, e, m) = (
+                self.bv(sx, *a0, *v0)?,
+                self.bv(sx, *a1, *v1)?,
+                self.bv(sx, *a2, *v2)?,
+            );
+            let (ws, we, wm) = (
+                self.cx.width(s)?.bits(),
+                self.cx.width(e)?.bits(),
+                self.cx.width(m)?.bits(),
+            );
+            if ws != 1 {
+                return Err(sx.err(*a0, "the sign is 1 bit"));
+            }
+            let f = FpFormat::new(u32::from(we), u32::from(wm) + 1)
+                .map_err(|er| sx.err(id, &er.to_string()))?;
+            let se = self.cx.concat(s, e)?;
+            return Ok(Val::Fp(self.cx.concat(se, m)?, f));
+        }
+        let rounding = matches!(
+            op,
+            "fp.add" | "fp.sub" | "fp.mul" | "fp.div" | "fp.fma" | "fp.sqrt" | "fp.roundToIntegral"
+        );
+        let (rm, rest) = if rounding {
+            let Some((&(r, v), rest)) = args.split_first() else {
+                return Err(wrong());
+            };
+            match v {
+                Val::Rm(m) => (m, rest),
+                _ => return Err(sx.err(r, "expected a rounding mode")),
+            }
+        } else {
+            (RoundingMode::Rne, args)
+        };
+        let (xs, f) = self.floats(sx, rest)?;
+        let n = xs.len();
+        let float = |cx: &mut Context, o: FpOp, xs: &[Expr]| cx.fp(o, f, xs).map(|e| Val::Fp(e, f));
+        match (op, n) {
+            ("fp.abs", 1) => Ok(Val::Fp(self.cx.fp_abs(f, xs[0])?, f)),
+            ("fp.neg", 1) => Ok(Val::Fp(self.cx.fp_neg(f, xs[0])?, f)),
+            ("fp.add", 2) => float(self.cx, FpOp::Add(rm), &xs),
+            ("fp.sub", 2) => Ok(Val::Fp(self.cx.fp_sub(f, rm, xs[0], xs[1])?, f)),
+            ("fp.mul", 2) => float(self.cx, FpOp::Mul(rm), &xs),
+            ("fp.div", 2) => float(self.cx, FpOp::Div(rm), &xs),
+            ("fp.fma", 3) => float(self.cx, FpOp::Fma(rm), &xs),
+            ("fp.sqrt", 1) => float(self.cx, FpOp::Sqrt(rm), &xs),
+            ("fp.roundToIntegral", 1) => float(self.cx, FpOp::RoundToIntegral(rm), &xs),
+            ("fp.rem", 2) => float(self.cx, FpOp::Rem, &xs),
+            // SMT-LIB leaves the zero of min(+0, −0) open: bitwright's −0 < +0 is one choice.
+            ("fp.min", 2) => float(self.cx, FpOp::Min, &xs),
+            ("fp.max", 2) => float(self.cx, FpOp::Max, &xs),
+            ("fp.leq" | "fp.lt" | "fp.geq" | "fp.gt" | "fp.eq", 2..) => {
+                // Chainable: every adjacent pair.
+                let c = match op {
+                    "fp.leq" => FpCmpOp::Le,
+                    "fp.lt" => FpCmpOp::Lt,
+                    "fp.geq" => FpCmpOp::Ge,
+                    "fp.gt" => FpCmpOp::Gt,
+                    _ => FpCmpOp::Eq,
+                };
+                let mut acc: Option<Expr> = None;
+                for pair in xs.windows(2) {
+                    let t = self.cx.fp_cmp(f, c, pair[0], pair[1])?;
+                    acc = Some(match acc {
+                        Some(a) => self.cx.bin(BinOp::And, a, t)?,
+                        None => t,
+                    });
+                }
+                acc.map(Val::Bool).ok_or_else(wrong)
+            }
+            (
+                "fp.isNormal" | "fp.isSubnormal" | "fp.isZero" | "fp.isInfinite" | "fp.isNaN"
+                | "fp.isNegative" | "fp.isPositive",
+                1,
+            ) => {
+                let t = match op {
+                    "fp.isNormal" => FpTest::Normal,
+                    "fp.isSubnormal" => FpTest::Subnormal,
+                    "fp.isZero" => FpTest::Zero,
+                    "fp.isInfinite" => FpTest::Infinite,
+                    "fp.isNaN" => FpTest::Nan,
+                    "fp.isNegative" => FpTest::Negative,
+                    _ => FpTest::Positive,
+                };
+                Ok(Val::Bool(self.cx.fp_test(f, t, xs[0])?))
+            }
+            ("fp.to_ieee_bv", 1) => {
+                // Every NaN reads as the canonical one.
+                let nan = self.cx.fp_test(f, FpTest::Nan, xs[0])?;
+                let canonical = self.cx.constant(&f.nan())?;
+                Ok(Val::Bv(self.cx.select(nan, canonical, xs[0])?))
+            }
+            _ => Err(Error::Unsupported(format!(
+                "the floating-point operator {op} with {n} operand(s)"
+            ))),
+        }
+    }
+
+    /// SMT-LIB's `=` and `distinct` on floats: equal values, all NaNs being one value.
+    fn float_equality(
+        &mut self,
+        sx: &Sx<'s>,
+        id: u32,
+        op: &str,
+        f: FpFormat,
+        args: &[(u32, Val)],
+    ) -> Result<Val, Error> {
+        let (xs, g) = self.floats(sx, args)?;
+        if g != f {
+            return Err(sx.err(id, "floats of different formats"));
+        }
+        let n = xs.len();
+        let pairs: Vec<(usize, usize)> = if op == "=" {
+            (1..n).map(|k| (k - 1, k)).collect()
+        } else {
+            (0..n)
+                .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+                .collect()
+        };
+        let mut acc: Option<Expr> = None;
+        for (i, j) in pairs {
+            let same_bits = self.cx.cmp(CmpOpExt::Eq, xs[i], xs[j])?;
+            let na = self.cx.fp_test(f, FpTest::Nan, xs[i])?;
+            let nb = self.cx.fp_test(f, FpTest::Nan, xs[j])?;
+            let both_nan = self.cx.bin(BinOp::And, na, nb)?;
+            let equal = self.cx.bin(BinOp::Or, same_bits, both_nan)?;
+            let t = if op == "=" {
+                equal
+            } else {
+                self.cx.un(UnOp::Not, equal)?
+            };
+            acc = Some(match acc {
+                Some(a) => self.cx.bin(BinOp::And, a, t)?,
+                None => t,
+            });
+        }
+        acc.map(Val::Bool)
+            .ok_or_else(|| sx.err(id, "wrong number of operands"))
+    }
+
+    /// The exporter's naming of a float result's bits,
+    /// `(ite (fp.isNaN T) (= c NAN) (= ((_ to_fp eb sb) c) T))` with `c` a declared bit-vector
+    /// constant no term has read yet: read as the definition of `c` (the bits of `T`, a NaN as
+    /// `NAN`), so an exported script reads back to its expressions. Returns whether it was one.
+    fn float_bits(&mut self, sx: &Sx<'s>, id: u32) -> Result<bool, Error> {
+        let Some(&[ite, cond, then, els]) = sx.list(id) else {
+            return Ok(false);
+        };
+        let (Some(&[isnan, t1]), Some(&[eq1, c1, nan]), Some(&[eq2, conv, t2])) =
+            (sx.list(cond), sx.list(then), sx.list(els))
+        else {
+            return Ok(false);
+        };
+        if sx.sym(ite) != Some("ite")
+            || sx.sym(isnan) != Some("fp.isNaN")
+            || sx.sym(eq1) != Some("=")
+            || sx.sym(eq2) != Some("=")
+            || !same(sx, t1, t2)
+        {
+            return Ok(false);
+        }
+        let Some(name) = sx.sym(c1) else {
+            return Ok(false);
+        };
+        let Some(&[head, c2]) = sx.list(conv) else {
+            return Ok(false);
+        };
+        let Some(&[u, to_fp, _, _]) = sx.list(head) else {
+            return Ok(false);
+        };
+        if sx.sym(u) != Some("_") || sx.sym(to_fp) != Some("to_fp") || sx.sym(c2) != Some(name) {
+            return Ok(false);
+        }
+        let Some(&Val::Bv(symbol)) = self.globals.get(name) else {
+            return Ok(false);
+        };
+        if self.used.contains(name) || self.scope.iter().any(|(n, _)| *n == name) {
+            return Ok(false);
+        }
+        let Val::Fp(e, f) = self.term(sx, t1)? else {
+            return Ok(false);
+        };
+        let nan_v = self.term(sx, nan)?;
+        let Val::Bv(nan_e) = nan_v else {
+            return Ok(false);
+        };
+        if self.cx.width(symbol)? != f.width() || self.cx.width(nan_e)? != f.width() {
+            return Ok(false);
+        }
+        // A floating-point operation's NaN is already the canonical one.
+        let canonical = self.cx.as_const(nan_e)? == Some(f.nan())
+            && (self.cx.as_const(e)?.is_some()
+                || matches!(self.cx.view(e)?, crate::View::Fp { .. }));
+        let bits = if canonical {
+            e
+        } else {
+            let t = self.cx.fp_test(f, FpTest::Nan, e)?;
+            self.cx.select(t, nan_e, e)?
+        };
+        self.globals.insert(name, Val::Bv(bits));
+        self.out.symbols.retain(|(n, _)| n != name);
+        Ok(true)
     }
 }
 

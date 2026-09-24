@@ -392,6 +392,46 @@ impl FpFormat {
         })
     }
 
+    /// The rational `(−1)^negative · num / den` (little-endian limbs, `den ≠ 0`) rounded to this
+    /// format; `+0` for zero. `None` when the numbers are too large to divide exactly (more than
+    /// about 1,000 bits between them).
+    pub(crate) fn round_rational(
+        self,
+        rm: RoundingMode,
+        negative: bool,
+        num: &[u64],
+        den: &[u64],
+    ) -> Option<BitVec> {
+        let (n, d) = (Wide::from_limbs(num), Wide::from_limbs(den));
+        if d.is_zero() {
+            return None;
+        }
+        if n.is_zero() {
+            return Some(self.zero(false));
+        }
+        // Scale so the quotient has p + 3 bits (at least p + 2), the rest a sticky remainder.
+        let k = i64::from(self.sb() + 3) - (i64::from(n.bits()) - i64::from(d.bits()));
+        let capacity = 1_200;
+        let (q, r) = if k >= 0 {
+            if i64::from(n.bits()) + k > capacity {
+                return None;
+            }
+            n.shl(k as u32).divrem(d)
+        } else {
+            if i64::from(d.bits()) - k > capacity {
+                return None;
+            }
+            n.divrem(d.shl((-k) as u32))
+        };
+        let mut l = [0u64; 20];
+        q.write_limbs(&mut l);
+        let f = self.fmt();
+        Some(frames!(self, S => {
+            let r = soft::round::<S>(&f, rm, negative, S::from_limbs(&l), -k, !r.is_zero());
+            store(self.width(), r)
+        }))
+    }
+
     /// `a` rounded to an integer by `rm` and saturated to a signed `width`-bit integer; a NaN
     /// converts to 0.
     pub fn to_sint(self, rm: RoundingMode, a: &BitVec, width: Width) -> Result<BitVec, WidthError> {
