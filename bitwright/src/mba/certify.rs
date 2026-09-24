@@ -80,7 +80,7 @@ const SPLIT_EFFORT: u64 = MAX_EFFORT;
 
 /// Work charged per node for reading known bits as arithmetic (a transfer of facts costs about
 /// as much as evaluating a node at this many points).
-const LOWER_COST: u64 = 64;
+pub(crate) const LOWER_COST: u64 = 64;
 
 /// Work accounting for a certificate: units are node evaluations (one per node per point).
 pub(crate) trait Meter {
@@ -968,7 +968,7 @@ fn prove_at<M: Meter>(
 
 /// Whether `m` has a bitwise operation with exactly one constant operand (see
 /// [`lower_known_bits`]).
-fn lowerable(m: &MbaExpr) -> bool {
+pub(crate) fn lowerable(m: &MbaExpr) -> bool {
     let nodes = m.nodes();
     let konst = |i: u32| {
         nodes

@@ -387,7 +387,7 @@ fn known_low_bits_and_atom_reuse() {
             &add(x.clone(), or(x4.clone(), p.clone())),
         );
         let s = solver.stats();
-        assert!(s.known_bits >= 6 && s.reused >= 1, "{s:?}");
+        assert!(s.known_bits + s.lowered >= 6 && s.reused >= 1, "{s:?}");
         assert_eq!(s.proved, s.calls, "{s:?}");
     }
 }
@@ -431,8 +431,40 @@ fn known_bits_and_reuse_are_exact_exhaustively() {
         checked > 2000 && lowered > 100 && simplified > 200,
         "{checked} {lowered} {simplified}"
     );
-    assert!(s.known_bits > 150 && s.reused > 30, "{s:?}");
+    assert!(s.known_bits + s.lowered > 150 && s.reused > 30, "{s:?}");
     assert_eq!(s.declined_internal, 0);
+}
+
+#[test]
+fn high_powers_fold_before_the_degree_cap() {
+    // At 8 bits every power from x^10 on is a polynomial of lower degree, so a product over the
+    // degree cap is multiplied out after the exact reductions instead of becoming an atom:
+    // 128·x^17·(x + 1) is 0 (x^17·(x + 1) is even).
+    let w = Width::W8;
+    let vars = [w];
+    let x = V(0);
+    let mut p = x.clone();
+    for _ in 1..17 {
+        p = mul(p, x.clone());
+    }
+    solves_to(
+        &mul(mul(k(w, 128), p.clone()), add(x.clone(), k(w, 1))),
+        &k(w, 0),
+        &vars,
+    );
+    // At 64 bits x^17 stays of degree 17: over the cap, an atom, and the question is declined
+    // as no simpler, not answered wrongly.
+    let w = Width::W64;
+    let vars = [w];
+    let mut p = x.clone();
+    for _ in 1..17 {
+        p = mul(p, x.clone());
+    }
+    let m = mul(p, add(x.clone(), k(w, 1))).expr(&vars);
+    assert!(matches!(
+        NormalFormSolver::default().solve(&m, &MbaBudget::default()),
+        MbaAnswer::NoSimpler | MbaAnswer::Simplified { .. }
+    ));
 }
 
 #[test]

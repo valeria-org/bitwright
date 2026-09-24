@@ -197,6 +197,72 @@ fn the_known_bits_and_reuse_catalog() {
     );
 }
 
+#[test]
+fn the_involution_catalog() {
+    // An xor mask applied twice cancels, and the survivor `t | 3` comes back as itself.
+    catalog(
+        "((((x + y) & z) | 3) ^ (((x*z) | (y & 85)) + w)) ^ (((x*z) | (y & 85)) + w)",
+        "((x + y) & z) | 3",
+        &WIDTHS,
+    );
+}
+
+/// `(x − 1)^100` at 8 bits, expanded into its 101 terms over the powers `p_k = p_(k−1)·x`.
+fn expansion_of_x_minus_1_to_the_100() -> String {
+    // Binomial coefficients mod 256, row by row.
+    let mut row = vec![1u64];
+    for _ in 0..100 {
+        let mut next = vec![1u64; row.len() + 1];
+        for k in 1..row.len() {
+            next[k] = (row[k - 1] + row[k]) % 256;
+        }
+        row = next;
+    }
+    let mut src = String::from("let p1 = x; ");
+    for k in 2..=100 {
+        src += &format!("let p{k} = p{} * x; ", k - 1);
+    }
+    // (x − 1)^100 = Σ C(100, k)·x^k·(−1)^(100−k).
+    let coef = |k: usize| {
+        let c = row[k];
+        if (100 - k) % 2 == 1 {
+            (256 - c) % 256
+        } else {
+            c
+        }
+    };
+    src += &format!("{}", coef(0));
+    for k in 1..=100 {
+        src += &format!(" + {} * p{k}", coef(k));
+    }
+    src
+}
+
+#[test]
+fn a_long_polynomial_expansion_shrinks() {
+    // At 8 bits every power from x^10 on is a polynomial of lower degree, and the expansion's
+    // `+ 1` becomes `| 1` on the way (its low bit is known): both used to stop the solver. And
+    // a remembered answer rebuilt what the MBA phase had just rewritten, over and over, until
+    // the budget ran out (without the walk's cycle cut this still ends by budget, unchanged).
+    let src = expansion_of_x_minus_1_to_the_100();
+    let o = ParseOptions::width(Width::W8);
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let original = cx.parse("let a = x - 1; let b = a * a; let c = b * b; let d = c * c; let e = d * d; let f = e * e; let g = f * f; g * f * c", &o).unwrap();
+    assert_equivalent(&mut cx, e, original, "the expansion");
+    let before = dag_size(&mut cx, e);
+    let out = native().run(&mut cx, &[e], Run::default()).unwrap();
+    let r = out.roots[0].expr;
+    assert_equivalent(&mut cx, e, r, "the expansion");
+    let after = dag_size(&mut cx, r);
+    assert_eq!(out.roots[0].end, bitwright::engine::End::Completed);
+    assert!(
+        before == 333 && after <= 30,
+        "{before} -> {after}: {}",
+        cx.display(r)
+    );
+}
+
 /// `x + [x = K]`, spelled `x + (~((x ^ K) | -(x ^ K)) >>u (W−1))`, for a random `K`.
 fn point_function(w: u16, rng: &mut Rng) -> (String, BitVec) {
     let width = Width::new(w).unwrap();

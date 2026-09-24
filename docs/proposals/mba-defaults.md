@@ -32,12 +32,12 @@ not move with other load; wall time on one machine is for orientation only.
 
 | corpus | nodes before | current | trust off only | proposed | changed | smaller | larger | instructions current | instructions proposed |
 |-|-|-|-|-|-|-|-|-|-|
-| linear MBA, 8 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.33 G (26 ms) | 1.03 G (83 ms) |
-| nonlinear MBA, 8 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.20 G (15 ms) | 0.38 G (27 ms) |
-| linear MBA, 64 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.32 G (25 ms) | 0.86 G (69 ms) |
-| nonlinear MBA, 64 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.21 G (15 ms) | 2.51 G (93 ms) |
-| random DAGs, 8 bits | 10693 | 9146 | 9146 (0 changed) | 9085 | 31 | 30 | 1 | 1.24 G (102 ms) | 59.8 G (4.3 s) |
-| random DAGs, 64 bits | 10992 | 9513 | 9513 (0 changed) | 9478 | 30 | 28 | 1 | 1.26 G (103 ms) | 60.2 G (4.0 s) |
+| linear MBA, 8 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.34 G (27 ms) | 1.03 G (84 ms) |
+| nonlinear MBA, 8 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.21 G (16 ms) | 0.38 G (28 ms) |
+| linear MBA, 64 bits | 3927 | 1794 | 1794 (0 changed) | 1635 | 109 | 98 | 0 | 0.32 G (25 ms) | 0.86 G (70 ms) |
+| nonlinear MBA, 64 bits | 4105 | 2621 | 2621 (0 changed) | 1005 | 159 | 159 | 0 | 0.21 G (16 ms) | 2.51 G (95 ms) |
+| random DAGs, 8 bits | 10693 | 9142 | 9142 (0 changed) | 9084 | 31 | 30 | 1 | 1.23 G (103 ms) | 60.2 G (4.4 s) |
+| random DAGs, 64 bits | 10992 | 9511 | 9511 (0 changed) | 9477 | 31 | 28 | 2 | 1.26 G (105 ms) | 60.6 G (4.1 s) |
 
 What the MBA service answered (per corpus, summed over its questions; `unproved` answers were
 refused for lack of accepted evidence, `too small` fragments were not asked about):
@@ -49,7 +49,7 @@ refused for lack of accepted evidence, `too small` fragments were not asked abou
 | nonlinear MBA, 64 bits | current | 742 | 0 | 0 | 0 | 742 | 0 | 0 | 0 |
 | nonlinear MBA, 64 bits | proposed | 780 | 257 | 2 | 521 | 0 | 0 | 0 | 0 |
 | random DAGs, 64 bits | current | 4895 | 1 | 4 | 77 | 4813 | 0 | 0 | 0 |
-| random DAGs, 64 bits | proposed | 6493 | 40 | 554 | 5319 | 560 | 8 | 12 | 0 |
+| random DAGs, 64 bits | proposed | 6495 | 41 | 560 | 5312 | 562 | 8 | 12 | 0 |
 
 The 8-bit rows are alike (the full report prints them all); trust off alone answered exactly
 as the current defaults on every corpus.
@@ -59,40 +59,44 @@ bitwright's own evidence only in every row):
 
 | row | instructions | nodes before → after |
 |-|-|-|
-| `simplify/mba/64` (signature solver, linear MBA) | 23.5 M | 125 → 93 |
-| `simplify/mba-native/64` (normal-form solver, linear MBA) | 97.3 M | 125 → 84 |
+| `simplify/mba/64` (signature solver, linear MBA) | 23.6 M | 125 → 93 |
+| `simplify/mba-native/64` (normal-form solver, linear MBA) | 97.5 M | 125 → 84 |
 | `simplify/mba-nonlinear-sig/64` (signature solver, nonlinear MBA) | 11.7 M | 141 → 73 |
-| `simplify/mba-nonlinear/64` (normal-form solver, nonlinear MBA) | 236.6 M | 141 → 34 |
+| `simplify/mba-nonlinear/64` (normal-form solver, nonlinear MBA) | 236.4 M | 141 → 34 |
 
 Since the first version of this proposal the solver remembers answers (about 30 % fewer
 instructions on random DAGs, half to three quarters fewer on nonlinear MBA) and looks small
 normal forms up in a synthesis table (linear MBA results 1,645 → 1,635 nodes, for about 4 %
 more instructions on random DAGs). It also reads bitwise operations with constants that read
-known low bits as arithmetic and reuses atoms whose definitions appear arithmetically, and
-the certificates split variables into cases over a few bits (random DAG results 9,087 →
-9,085 and 9,480 → 9,478 nodes, for about 4 % more instructions there; the MBA corpora are
-unchanged).
+known low bits as arithmetic, reuses atoms whose definitions appear arithmetically, and
+folds high powers before its degree cap; the certificates split variables into cases over a
+few bits; and the engine keeps `x | c` as itself and cuts rewrite cycles. With these (0.5.0),
+random DAG results shrink from 9,087 to 9,084 and from 9,480 to 9,477 nodes under the
+proposed configuration, for about 4.5 % more instructions there, and from 9,146 to 9,142 and
+from 9,513 to 9,511 under the current one, at the same cost; the MBA corpora are unchanged.
 
 ## Reading the numbers
 
 - **Results.** On linear MBA the results shrink by 9 % (109 of 200 change; 98 get smaller,
   11 are re-rendered at the same size, none grows). On nonlinear MBA they shrink by 62 %: the
   signature solver declines every question there, the normal-form solver simplifies a third of
-  them. On random DAGs, which are not obfuscated, they shrink by 0.4 % to 0.7 %, and one input
-  per width grows.
-- **The larger result** (31 → 33 nodes, the same input at both widths). The solver answers a
-  fragment containing `(u·c)·c` with `u·(c·c)`, which is smaller where it is asked; elsewhere
-  the DAG keeps `u·c`, and the two no longer share it. Every rewrite is checked to make the
-  DAG smaller when it is made, so this is a local optimum, not an unchecked step.
+  them. On random DAGs, which are not obfuscated, they shrink by 0.4 % to 0.6 %, and one input
+  grows at 8 bits, two at 64 bits.
+- **The larger results** (31 → 33 nodes, the same input at both widths, and 52 → 53 at 64
+  bits). The solver answers a fragment containing `(u·c)·c` with `u·(c·c)`, which is smaller
+  where it is asked; elsewhere the DAG keeps `u·c`, and the two no longer share it. The
+  second comes from reading a fragment's known bits first, which gives an answer smaller
+  where it is asked and a node larger in the whole. Every rewrite is checked to make the DAG
+  smaller when it is made, so these are local optima, not unchecked steps.
 - **Trust.** With the signature solver, turning backend certificates off changes nothing on
   these corpora: the gate proves every answer it gives with its own certificates. Every answer
   the proposed configuration accepted was proved by bitwright itself; nothing was refuted.
-- **Cost.** The proposed configuration takes 2.7 to 3.1 times the instructions on linear MBA
-  (the 8-bit corpus, run first, also pays the synthesis table's one-time build), 1.9 times on
+- **Cost.** The proposed configuration takes 2.7 to 3 times the instructions on linear MBA
+  (the 8-bit corpus, run first, also pays the synthesis table's one-time build), 1.8 times on
   nonlinear MBA at 8 bits and 12 times at 64 bits (degree-2 certificates grow with the
-  width), and 48 times on random DAGs: about 21 ms per 40-node DAG instead of 0.5 ms here.
-  Random code is the worst case. Its fragments have many atoms and bit classes, so their
-  normal forms are large, and they rarely simplify (40 of 6493 questions). The signature
+  width), and 48 to 49 times on random DAGs: about 21 ms per 40-node DAG instead of 0.5 ms
+  here. Random code is the worst case. Its fragments have many atoms and bit classes, so their
+  normal forms are large, and they rarely simplify (41 of 6495 questions). The signature
   solver declines almost all of them at once.
 
 ## Costs and risks

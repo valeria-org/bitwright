@@ -21,13 +21,41 @@
   2026) that the solver missed now reach their original size. The solver's id
   is `bitwright.nf.v2` and `NativeProver`'s `bitwright.native.v2`, so cached answers are not
   reused.
+- **Passes.** The xor pass emits a constant that misses every mask as `| k`, each mask widened
+  by it, when that leaves a mask out: `x | c`, which it reads as `(x & ~c) ⊕ c`, comes back as
+  itself (it came back as `(x & ~c) ^ c`, one node larger, after an xor mask cancelled). The
+  shuffle pass re-emits one source in place with constant bits as `(s & ~zeros) | ones`, not
+  as a `concat` of slices (`((x >>u 2) << 2) | 3` is `x | 3`).
+- **Normal-form solver.** A product over `NfOptions::max_degree` is an atom only when its
+  degree stays over the cap after the exact reductions, which fold high powers into lower
+  degrees at narrow widths (at 8 bits every power from `x^10` on). The question is first read
+  with the certificates' known-bits reading when that leaves fewer bit classes, so a constant
+  such as the `1` in `x·−100 | 1` (the core rules' spelling of `x·−100 + 1`) no longer splits
+  them; `NfStats::lowered` counts such questions. The 101-term expansion of `(x − 1)^100` at 8 bits
+  from the REcon talk now shrinks from 333 to 24 nodes under the defaults (the solver alone on
+  the whole expansion gives 25).
+- **Fixes.** A rewrite cycle in the engine's walk: a pass's result for a node is reused wherever
+  the node appears, though the pass measured its decrease with the sharing where it ran, so a
+  remembered result could rebuild a node a pass had just rewritten away, which the pass then
+  rewrote again, until a budget stopped the call (the MBA phase did this 10,534 times on one
+  node of the expansion above, with no net change). The walk now cuts such cycles in favor of
+  the rewrite: in a pass's phase a node is not rebuilt into one a pass rewrote it from in the
+  same call, and no node into one whose result is still being worked out;
+  `Stats::cycles_cut` counts them.
 - **Performance.** Recognizing a normal form as a bitwise function computed its atoms once per
-  possible atom; now once. `simplify/mba-native` −1.2 % instructions; on the corpus diff the
-  proposed configuration takes about 4 % more on random DAGs for the new rules, and the same on
-  MBA corpora.
+  possible atom; now once. `simplify/mba-native` −0.5 to −0.8 % instructions and
+  `simplify/mba-nonlinear` −0.2 to −1.1 %, the other rows unchanged; on the corpus diff the
+  proposed configuration takes about 4.5 % more on random DAGs for the new rules, and the
+  same on MBA corpora.
 - **Behavior changes.** With the MBA service and backend certificates off, answers the gate
   could not prove before may now be proved and accepted. `NormalFormSolver` answers change as
-  above (results equal or smaller on every corpus measured).
+  above. The xor and shuffle passes run in the built-in strategies, so default results change
+  too: on the corpus diff's random DAGs the default configuration's results shrink from 9,146
+  to 9,142 nodes at 8 bits and from 9,513 to 9,511 at 64 bits, at the same cost; the MBA
+  corpora are unchanged. Under the proposed configuration (the normal-form solver, own
+  evidence only) random DAGs shrink from 9,087 to 9,084 and from 9,480 to 9,477 nodes, one
+  input growing by a node at 64 bits. A call that used to end on a rewrite cycle (by budget,
+  or alternating between rounds) now completes on the rewrite's form.
 
 ## 0.4.1
 

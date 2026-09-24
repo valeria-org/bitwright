@@ -4,9 +4,10 @@
 //! bit of a *source* (an atom): through `&` with a constant, `|`, `^` and `+` of pieces whose
 //! traced bits do not overlap (so no carry and no cancellation can occur), shifts and rotations
 //! by constants, zero and sign extension, `extract`, `concat` and `bswap`. When every bit is
-//! traced, the node is re-emitted as the source itself, a rotation, a byte swap, or a `concat`
-//! of slices and constant runs, and replaced when that is smaller. Limb recompositions,
-//! shifted-and-masked byte shuffles and identity round trips collapse this way.
+//! traced, the node is re-emitted as the source itself, a rotation, a byte swap, one source in
+//! place with constant bits (`(s & ~zeros) | ones`), or a `concat` of slices and constant runs,
+//! and replaced when that is smaller. Limb recompositions, shifted-and-masked byte shuffles and
+//! identity round trips collapse this way.
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish};
 use crate::BitVec;
@@ -293,6 +294,42 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Optio
         if w.is_multiple_of(8) && (0..wu).all(|i| j(i) == (wu / 8 - 1 - i / 8) * 8 + i % 8) {
             return r.build(cx, |cx| cx.c_un(UnOp::Bswap, s)).map(Some);
         }
+    }
+    // One source in place with some bits constant: `(s & ~zeros) | ones`, smaller than any
+    // concat of its runs.
+    if let Some(Prov::Bit(s, _)) = bits.iter().find(|p| matches!(p, Prov::Bit(..)))
+        && cx.node(*s).width == w
+        && bits
+            .iter()
+            .enumerate()
+            .all(|(i, p)| !matches!(p, Prov::Bit(t, j) if t != s || usize::from(*j) != i))
+    {
+        let s = *s;
+        let mask = |v: Prov| {
+            bits.iter().enumerate().filter(|&(_, p)| *p == v).fold(
+                BitVec::zero(width),
+                |m, (i, _)| {
+                    let bit = crate::facts::known::bv_shl(&BitVec::one(width), i as u32);
+                    crate::facts::known::bv_or(&m, &bit)
+                },
+            )
+        };
+        let (zeros, ones) = (mask(Prov::Zero), mask(Prov::One));
+        r.meter.charge(Counter::PassWork, u64::from(w))?;
+        return r
+            .build(cx, |cx| {
+                let mut x = s;
+                if !zeros.is_zero() {
+                    let c = cx.mk_const(&crate::facts::known::bv_not(&zeros))?;
+                    x = cx.c_bin(BinOp::And, x, c)?;
+                }
+                if !ones.is_zero() {
+                    let c = cx.mk_const(&ones)?;
+                    x = cx.c_bin(BinOp::Or, x, c)?;
+                }
+                Ok(x)
+            })
+            .map(Some);
     }
     // A concat of the runs, high first.
     let mut acc: Option<u32> = None;

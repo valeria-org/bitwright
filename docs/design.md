@@ -626,7 +626,19 @@ final.
   decreases the whole term: the system terminates, and a template can never rebuild an ancestor that
   is still being reduced.
 - Passes commit only when the DAG gets strictly smaller (§8), so the rules' order and the passes'
-  size decrease together bound every chain of changes; rounds are capped by `max_rounds`.
+  size decrease together bound every chain of changes made at one node; rounds are capped by
+  `max_rounds`.
+- A pass's decrease is measured in the DAG at hand, with its sharing, but its result for a node
+  is remembered and reused wherever the node appears. A remembered result can therefore rebuild
+  a node that a pass has just rewritten away: seen with the MBA phase, where a sub-product's
+  answer (smaller alone) rebuilt its parent's previous form, whose answer (smaller where the
+  sub-product's operand was shared) held the sub-product again, 10,534 times until the budget
+  stopped it. The walk cuts such cycles in favor of the rewrite, not final: in a pass's phase a
+  node is not rebuilt over its operands' results into one a pass rewrote it from in the same
+  call, in any phase not into one whose own result is still being worked out, and a node
+  rewritten into such a one takes it (`Stats::cycles_cut` counts them). So the call settles on
+  the rewrite's form in the round that made it. Rules' phases rebuild freely: their rewrites
+  decrease the order above and cannot cycle.
 - Rule terms are compared as the builder stores them (closed and constant-only subterms are one
   constant, comparisons in stored form, commutative operands as a multiset; §7.3), so
   construction canonicalization of a template does not undo the decrease. This is tested: every
@@ -923,7 +935,7 @@ counts `{calls, noop, changed, rejected_cost, rejected, atomized}` per pass.
 |-|-|
 | `FactFold` | A node whose facts pin one value becomes that constant, subject to `Hooks::fold_known`. |
 | `Linear` | `c + Σ kᵢ·aᵢ` over Z/2^W through `+ − neg`, `~a = −a − 1`, multiplication by a constant, left shifts by a constant, and `\|`/`^` of operands the facts prove disjoint. Coefficients are `BitVec`s, so every width to 512 works; at most 64 terms. Emitted with atoms in canonical order, positive coefficients first, power-of-two coefficients as shifts, the constant last. Cancels additive masking. |
-| `Xor` | `k ⊕ ⊕ᵢ (aᵢ & mᵢ)` over GF(2)^W through `^`, `~x = x ⊕ ones`, `&`/`\|` with a constant (`x \| c = (x & ~c) ⊕ c`), and disjoint `\|`. At most 64 terms. Cancels boolean masking over any number of atoms. |
+| `Xor` | `k ⊕ ⊕ᵢ (aᵢ & mᵢ)` over GF(2)^W through `^`, `~x = x ⊕ ones`, `&`/`\|` with a constant (`x \| c = (x & ~c) ⊕ c`), and disjoint `\|`. At most 64 terms. Cancels boolean masking over any number of atoms. A constant that misses every mask is emitted as `\| k`, each mask widened by `k`, when that leaves a mask out (so `x \| c` comes back as itself, after a cancellation too). |
 | `Bitwise` | A pure bitwise function of ≤ 3 atoms (plus 0/ones) has an 8-bit truth table, exact at every width; it is replaced by the minimum-size form from a table of all 256 functions, found by a breadth-first search over expression sizes (computed once, verified exhaustively by the tests). Variables follow the atoms' canonical order; atoms the table ignores are pruned. 4 atoms via NPN classes is a later option. |
 | `Compares` | Boolean combinations of comparisons. For one operand pair: the five relations {EQ, (LTu,LTs), (LTu,GTs), (GTu,LTs), (GTu,GTs)}, each predicate a set, `& \| ^ ~` set operations, emitted when the set is one predicate, true or false (at W = 1 only three relations occur). For one operand against constants: exact unsigned interval sets (signed comparisons split at the sign boundary, at most 8 intervals), emitted as a comparison or the wrapped range check `x − lo <=u hi − lo`. Checked exhaustively at W ≤ 6. |
 | `Casts` | An extract/trunc is pushed through `+ − * neg` (low bits), `& \| ^ ~` and `select` (any bits), constant shifts, extensions, `concat` and nested extracts (re-indexing, becoming 0, or extending the remaining part); the whole bounded narrowing is compared with the original region. |
@@ -934,7 +946,7 @@ Added in M6 (in `Strategy::deobfuscate()`):
 | Pass | Fragment and algorithm |
 |-|-|
 | `LinearMba` | Linear combinations of bitwise functions of ≤ 6 atoms. The operands of `& \| ^` are read as bitwise: only `& \| ^ ~`, atoms, and 0 or all-ones constants may appear there, so a linear term or a non-uniform mask under a bitwise operator is an atom, and so is a node read both ways. Atoms are ordered canonically (by structure, not node index), so the result does not depend on construction order. Every bitwise function is an integer combination of conjunctions (`AND_∅ = −1`), bit by bit and so exactly in Z/2^W, so the values at the 2^t corners where every atom is 0 or all-ones determine the expression. A Möbius transform gives the conjunction coefficients; the emission is the cheapest of the affine form (when no conjunction of two or more atoms remains), the conjunction form `c + Σ k_S·AND_S` itself (any number of atoms), and `u₀ + Σ (u₀ − uₖ)·gₖ` over the distinct corner values, `gₖ` a minimum-form bitwise function (≤ 3 atoms). Only mixed regions (linear and bitwise operators) are considered. |
-| `Shuffle` | Values of ≤ 128 bits assembled from bit slices: every output bit is traced to a constant or to one bit of a source through `&` with a constant, `\|` (with constant-one bits), `^`/`+` of pieces whose traced bits do not overlap, constant shifts and rotations, extensions, `extract`, `concat` and `bswap`. A fully traced value is re-emitted as the source, a rotation, a byte swap, or a `concat` of slices and constant runs. |
+| `Shuffle` | Values of ≤ 128 bits assembled from bit slices: every output bit is traced to a constant or to one bit of a source through `&` with a constant, `\|` (with constant-one bits), `^`/`+` of pieces whose traced bits do not overlap, constant shifts and rotations, extensions, `extract`, `concat` and `bswap`. A fully traced value is re-emitted as the source, a rotation, a byte swap, one source in place with constant bits (`(s & ~zeros) \| ones`), or a `concat` of slices and constant runs. |
 
 Feature `deobf` keeps one planned item: a GF(2) linear-map normal form over rotations, shifts and
 xors (which would also decide invertibility of maps with cyclic bit dependencies, such as
@@ -1175,7 +1187,11 @@ pub mod mba {
     constant that reads only those bits, and is all zeros or all ones above them, is
     arithmetic again, with no atom: setting, clearing or flipping known bits adds a
     constant, and above them the result is the polynomial, its complement, zeros or ones (so
-    `−2·(x & 1) | 1` is `1 − 2·(x & 1)`, and `(x + y)·(−2·(z & 1) | 1)²` is `x + y`).
+    `−2·(x & 1) | 1` is `1 − 2·(x & 1)`, and `(x + y)·(−2·(z & 1) | 1)²` is `x + y`). The
+    question itself is first read so wherever the facts know the bits (as the certificates read
+    it), when that leaves fewer bit classes: `x·−100 | 1`, which the core rules make of
+    `x·−100 + 1`, stays a polynomial in `x`. Answers are still measured against the question
+    as asked.
   - *Atom reuse.* An atom's definition (arithmetic read by a bitwise operator) may also
     appear arithmetically: in `p + x + (x ^ 4) − ((x ^ 4) & p)` the normal form holds `p`'s
     terms beside the atom `p`. When a normal form of at most 64 terms contains `c` times an
@@ -1186,7 +1202,9 @@ pub mod mba {
     input's factors), the cheapest winning: here `x + ((x ^ 4) | p)`, sharing `p`.
   - *Polynomials.* A product of two non-constants multiplies the operands' forms out
     (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
-    `max_degree` the product is an atom). Symbols are treated as independent variables, which
+    `max_degree` the product is an atom, the degree taken after the exact reductions below,
+    which fold high powers into lower degrees at narrow widths: at 8 bits no power from `x^10`
+    on survives). Symbols are treated as independent variables, which
     is exact, and the form is reduced by exact rules that hold for any values of them: a
     monomial whose factors' classes start at `τ` (summed) is a multiple of `2^τ`, so its
     coefficient matters modulo `2^(W−τ)`; `(x)_κ = Π(x_i)_{κ_i}` is a multiple of `κ!`, so

@@ -616,6 +616,12 @@ fn xor_cancels_boolean_masking() {
     same("((a ^ m) ^ (b ^ m)) ^ ((c + d) ^ (a ^ b))", "c + d");
     // Overlapping or is not an xor.
     same("(x | y) ^ y", "(x | y) ^ y");
+    // `x | c` is read as `(x & ~c) ^ c` and comes back as itself, after a cancellation too;
+    // a constant that misses every mask widens them (here x's mask to all-ones).
+    same("x | 3", "x | 3");
+    same("((x | 3) ^ v) ^ v", "x | 3");
+    same("(((x | 3) ^ (y & 0xf0)) ^ v) ^ v", "(x ^ (y & 0xf3)) | 3");
+    same("(x & 0xf0) ^ 1", "(x & 0xf0) ^ 1");
 }
 
 // ----- compares -----------------------------------------------------------------------------------
@@ -1340,6 +1346,11 @@ fn shuffle_fixtures() {
     );
     // Overlapping pieces are not traced.
     same("(x << 1) | x", "(x << 1) | x", 8);
+    // One source in place with constant bits: a mask and an or, not a concat.
+    same("((x >>u 2) << 2) | 3", "x | 3", 8);
+    same("((x >>u 4) << 4) | 5", "(x & 0xf0) | 5", 8);
+    same("(x & 0xf0) | 0x0f", "x | 0x0f", 8);
+    same("(x & -4) ^ 3", "x | 3", 8);
 }
 
 #[test]
@@ -1404,6 +1415,56 @@ mod mba_service {
             .mba_solver(solver)
             .build()
             .unwrap()
+    }
+
+    /// Answers the questions it was scripted with (by content), and no others.
+    struct Scripted(Vec<(MbaExpr, MbaExpr)>);
+
+    impl MbaSolver for Scripted {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+        fn solve(&self, p: &MbaExpr, _: &MbaBudget) -> MbaAnswer {
+            match self.0.iter().find(|(q, _)| q == p) {
+                Some((_, a)) => MbaAnswer::Simplified {
+                    expr: a.clone(),
+                    claim: Claim::Proved,
+                },
+                None => MbaAnswer::NoSimpler,
+            }
+        }
+    }
+
+    #[test]
+    fn a_rewrite_cycle_is_cut() {
+        // `c = (x & 1)·(x & -2)` alone is smaller as `(x & 1)·(x ^ 1)`, and the context remembers
+        // that; next to `(x & -2)²`, which keeps `x & -2` alive, it is the other way round. So the
+        // answer for the sum brings back `c`, whose remembered answer rebuilds the sum, which is
+        // still being worked out.
+        let o = ParseOptions::width(Width::W8);
+        let mut cx = Context::new();
+        let n = cx
+            .parse("((x & 1) * (x ^ 1)) + ((x & -2) * (x & -2))", &o)
+            .unwrap();
+        let r = cx
+            .parse("((x & 1) * (x & -2)) + ((x & -2) * (x & -2))", &o)
+            .unwrap();
+        let c = cx.parse("(x & 1) * (x & -2)", &o).unwrap();
+        let c1 = cx.parse("(x & 1) * (x ^ 1)", &o).unwrap();
+        let lim = crate::mba::MbaLimits::default().with_min_nodes(0);
+        let q = |cx: &Context, e: Expr| crate::mba::lower(cx, e, &lim).unwrap().0;
+        let script = vec![(q(&cx, n), q(&cx, r)), (q(&cx, c), q(&cx, c1))];
+        let eng = mba_engine(Arc::new(Scripted(script)), MbaTrust::default());
+        let alone = eng.run(&mut cx, &[c], Run::default()).unwrap();
+        assert_eq!(alone.roots[0].expr, c1);
+        let out = eng.run(&mut cx, &[n], Run::default()).unwrap();
+        assert_eq!(out.roots[0].end, End::Completed);
+        assert!(out.stats.cycles_cut >= 1, "{:?}", out.stats);
+        // Settled in the first round (the second only confirms it): the rewrite is made once.
+        assert_eq!((out.stats.rounds, out.stats.mba.simplified), (2, 1));
+        assert_eq!(out.roots[0].expr, r, "{}", cx.display(out.roots[0].expr));
+        let mut rng = Rng(3);
+        assert!(equivalent(&mut cx, n, out.roots[0].expr, &mut rng));
     }
 
     #[test]

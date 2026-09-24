@@ -136,8 +136,12 @@ pub struct NfStats {
     pub declined_terms: u64,
     /// Null parts of normal forms dropped, each proved zero by a certificate.
     pub null_parts: u64,
-    /// Bitwise operations with a constant read as arithmetic: the constant reads only low bits
-    /// of the other operand that are known (`−2·(x & 1) | 1` is `1 − 2·(x & 1)`).
+    /// Questions whose bitwise operations with constants on bits the facts know were read as
+    /// arithmetic before the normal form (`x·−100 | 1` as `x·−100 + 1`)...
+    pub lowered: u64,
+    /// ...and bitwise operations with a constant read so inside it: the constant reads only low
+    /// bits of the other operand's polynomial that are known (`−2·(x & 1) | 1` is
+    /// `1 − 2·(x & 1)`).
     pub known_bits: u64,
     /// Normal forms also rendered with an atom standing for its definition where that appears
     /// arithmetically (`p + (y & p)` shares `p`).
@@ -360,6 +364,7 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.declined_classes += t.declined_classes;
     s.declined_terms += t.declined_terms;
     s.null_parts += t.null_parts;
+    s.lowered += t.lowered;
     s.known_bits += t.known_bits;
     s.reused += t.reused;
     s.declined_internal += t.declined_internal;
@@ -648,12 +653,19 @@ impl Pass<'_> {
                 (Some(k), _) => Form::Poly(self.poly(b, tally)?.scale(&k)),
                 (_, Some(k)) => Form::Poly(self.poly(a, tally)?.scale(&k)),
                 _ => {
-                    let (x, y) = (self.poly(a, tally)?, self.poly(b, tally)?);
+                    let (mut x, mut y) = (self.poly(a, tally)?, self.poly(b, tally)?);
+                    let cap = self.opts.max_degree;
+                    // Over the degree cap, the exact reductions first: high powers fold into
+                    // lower degrees (at 8 bits every power from x^10 on), so a product is an
+                    // atom only when its degree stays over the cap.
+                    if x.degree() + y.degree() > cap {
+                        self.charge(((x.len() + y.len()) as u64) * u64::from(cap))?;
+                        x.reduce_core(&self.classes);
+                        y.reduce_core(&self.classes);
+                    }
                     let size = (x.len() as u64).saturating_mul(y.len() as u64);
                     let max = u64::from(self.opts.max_terms);
-                    if size > max.saturating_mul(4)
-                        || x.degree() + y.degree() > self.opts.max_degree
-                    {
+                    if size > max.saturating_mul(4) || x.degree() + y.degree() > cap {
                         return self.opaque(i, tally);
                     }
                     self.charge(size)?;
@@ -684,6 +696,26 @@ impl Pass<'_> {
             }
         }))
     }
+}
+
+/// The constants read by bitwise operators among the live nodes of width `w`: they define the
+/// bit classes.
+fn class_constants(p: &MbaExpr, live: &[bool], cst: &[Option<BitVec>], w: Width) -> Vec<BitVec> {
+    let mut consts: Vec<BitVec> = Vec::new();
+    for (i, n) in p.nodes().iter().enumerate() {
+        if live[i]
+            && n.width == w
+            && cst[i].is_none()
+            && matches!(n.op, MOp::And | MOp::Or | MOp::Xor)
+        {
+            for &k in &n.args[..2] {
+                if let Some(v) = cst[k as usize] {
+                    consts.push(v);
+                }
+            }
+        }
+    }
+    consts
 }
 
 /// See [`Pass::key_form`].
@@ -855,14 +887,26 @@ struct Normal {
 }
 
 fn normalize(
-    p: &MbaExpr,
+    input: &MbaExpr,
     opts: &NfOptions,
     budget: &MbaBudget,
     tally: &mut NfStats,
 ) -> Result<Normal, Decline> {
-    let Some(w) = p.width() else {
+    let Some(w) = input.width() else {
         return Err(Decline::Unsupported("empty"));
     };
+    // Bitwise operations with constants that read only bits the facts know are read as
+    // arithmetic first (as the certificates read them) where that leaves fewer bit classes:
+    // `x·−100 | 1` is `x·−100 + 1`, a polynomial in `x`. (With as many classes, the question
+    // stays as asked: its own spelling is often the better start.)
+    let classes_of = |m: &MbaExpr| {
+        let live = live(m);
+        let consts = class_constants(m, &live, &certify::constants(m.nodes()), w);
+        Classes::new(w, &consts, opts.max_classes as usize).map_or(usize::MAX, |c| c.len())
+    };
+    let lowered = certify::lower_known_bits(input).filter(|l| classes_of(l) < classes_of(input));
+    tally.lowered += u64::from(lowered.is_some());
+    let p = lowered.as_ref().unwrap_or(input);
     let nodes = p.nodes();
     let live = live(p);
     let cst = certify::constants(nodes);
@@ -875,29 +919,27 @@ fn normalize(
     let mut work = Steps::new(budget.steps);
     {
         use certify::Meter;
-        work.charge(nodes.len() as u64)
+        // A node visit each, and the facts of the reading above (a transfer of facts costs
+        // about as much as evaluating a node at `LOWER_COST` points).
+        let facts = if certify::lowerable(input) {
+            input.nodes().len() as u64 * certify::LOWER_COST / EVALS_PER_STEP
+        } else {
+            0
+        };
+        work.charge(nodes.len() as u64 + facts)
             .map_err(|()| Decline::Exhausted)?;
     }
-    // Constants read by bitwise operators define the bit classes.
-    let mut consts: Vec<BitVec> = Vec::new();
-    for (i, n) in nodes.iter().enumerate() {
-        if live[i]
-            && n.width == w
-            && cst[i].is_none()
-            && matches!(n.op, MOp::And | MOp::Or | MOp::Xor)
-        {
-            for &k in &n.args[..2] {
-                if let Some(v) = cst[k as usize] {
-                    consts.push(v);
-                }
-            }
-        }
-    }
+    let consts = class_constants(p, &live, &cst, w);
     let Some(classes) = Classes::new(w, &consts, opts.max_classes as usize) else {
         tally.declined_classes += 1;
         return Err(Decline::Unsupported("too many bit classes"));
     };
-    let (canon, input_cost) = canonical(p, &live);
+    let (canon, cost) = canonical(p, &live);
+    // Answers are measured against the question as asked.
+    let input_cost = match lowered {
+        Some(_) => canonical(input, &self::live(input)).1,
+        None => cost,
+    };
     let mut pass = Pass {
         p,
         w,

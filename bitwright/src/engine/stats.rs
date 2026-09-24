@@ -32,6 +32,11 @@ pub struct Stats {
     pub hook_vetoes: u64,
     /// Applications rejected by a postcondition (width, verification, tripwire, termination).
     pub rejected: u64,
+    /// Rewrite cycles cut, in favor of the rewrite: a node not rebuilt over its operands'
+    /// results into one a pass rewrote it from in this call (in a pass's phase), or into one
+    /// whose result was still being worked out; or rewritten into the latter without visiting
+    /// it again.
+    pub cycles_cut: u64,
     /// Rules quarantined for the rest of the call after a postcondition failure.
     pub quarantined: u64,
     /// Nodes created.

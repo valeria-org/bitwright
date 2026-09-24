@@ -198,8 +198,27 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
     })
 }
 
+/// Whether `form` is emitted as `(⊕ (aᵢ & (mᵢ | k))) | k`: its constant `k` misses every mask
+/// (the terms are 0 where `k` is 1, so or and xor agree), and some mask covers everything `k`
+/// does not, so that term needs no mask (`x | c`, read as `(x & ~c) ⊕ c`, comes back as itself).
+fn or_form(form: &Form) -> bool {
+    let k = &form.konst;
+    !k.is_zero()
+        && form.terms.iter().all(|(_, m)| bv_and(m, k).is_zero())
+        && form
+            .terms
+            .iter()
+            .any(|(_, m)| crate::facts::known::bv_or(m, k).is_ones())
+}
+
 fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, Stop> {
+    let or = or_form(form);
     let mut terms = form.terms.clone();
+    if or {
+        for (_, m) in terms.iter_mut() {
+            *m = crate::facts::known::bv_or(m, &form.konst);
+        }
+    }
     terms.sort_by(|a, b| cx.order(a.0, b.0));
     let mut acc: Option<u32> = None;
     for (a, m) in &terms {
@@ -223,6 +242,10 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, St
     match acc {
         None => r.build(cx, |cx| cx.mk_const(&k)),
         Some(x) if k.is_zero() => Ok(x),
+        Some(x) if or => r.build(cx, |cx| {
+            let c = cx.mk_const(&k)?;
+            cx.c_bin(BinOp::Or, x, c)
+        }),
         Some(x) if k.is_ones() => r.build(cx, |cx| cx.c_un(UnOp::Not, x)),
         Some(x) => r.build(cx, |cx| {
             let c = cx.mk_const(&k)?;
@@ -243,10 +266,22 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     let mut atoms: Vec<u32> = form.terms.iter().map(|t| t.0).collect();
     atoms.sort_unstable();
-    // Upper bound (it follows `emit`): a constant and an and per partial mask, an xor per
-    // extra term, and the constant (a `~` for all-ones, a constant and an xor otherwise).
+    // Upper bound (it follows `emit`): a constant and an and per partial mask (masks covering
+    // the constant in the or form), an xor per extra term, and the constant (a `~` for
+    // all-ones, a constant and an xor or an or otherwise).
     let t = form.terms.len() as u32;
-    let masked = form.terms.iter().filter(|t| !t.1.is_ones()).count() as u32;
+    let or = or_form(&form);
+    let masked = form
+        .terms
+        .iter()
+        .filter(|(_, m)| {
+            !if or {
+                crate::facts::known::bv_or(m, &form.konst).is_ones()
+            } else {
+                m.is_ones()
+            }
+        })
+        .count() as u32;
     let konst = if t == 0 {
         1
     } else if form.konst.is_zero() {

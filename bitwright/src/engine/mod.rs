@@ -888,6 +888,9 @@ struct Runner<'r, 'a> {
     active: usize,
     /// Nodes whose edges `uses` currently counts.
     counted: IdMap<u32, ()>,
+    /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
+    /// rebuilt, over its operands' results, into one a pass rewrote it from (see `local`).
+    rewritten: IdMap<(u32, u32), ()>,
 }
 
 impl Runner<'_, '_> {
@@ -970,10 +973,26 @@ impl Runner<'_, '_> {
             }
         }
         let mut stack = vec![Frame::Visit(root)];
+        // Rewrites are accepted where they are made, but results are remembered and reused
+        // anywhere: a pass's decision depends on sharing, so an operand's remembered result can
+        // rebuild the very node its parent was rewritten from, which the pass rewrites again,
+        // and so on. Such cycles are cut in favor of the rewrite, not final: a node is not
+        // rebuilt into one a pass rewrote it from in this call (`rewritten`), nor into one whose
+        // result waits on it (`pending`: a `Finish` on the stack); a node rewritten into a
+        // waiting one takes it. Rules strictly decrease an order, so their phases never cycle
+        // and keep no such records.
+        let mut pending: IdMap<u32, u32> = IdMap::default();
+        let local = matches!(self.inner.phases[phase], PhaseImpl::Local(_));
         while let Some(top) = stack.last() {
             match *top {
                 Frame::Finish(n, t, own) => {
                     stack.pop();
+                    if let Some(k) = pending.get_mut(&n) {
+                        *k -= 1;
+                        if *k == 0 {
+                            pending.remove(&n);
+                        }
+                    }
                     let (r, fin) = self.lookup(cx, phase, t).unwrap_or((t, Fin::PROVISIONAL));
                     if r != n {
                         self.retire(cx, n);
@@ -1024,7 +1043,18 @@ impl Runner<'_, '_> {
                     }
                     if changed {
                         let n1 = self.build(cx, |cx| cx.rebuild(n, kids))?;
+                        if n1 != n
+                            && (pending.contains_key(&n1)
+                                || (!local && self.rewritten.contains_key(&(n1, n))))
+                        {
+                            self.stats.cycles_cut += 1;
+                            self.set(cx, phase, n, n, own.and(Fin::PROVISIONAL));
+                            continue;
+                        }
                         if n1 != n {
+                            if !local {
+                                *pending.entry(n).or_default() += 1;
+                            }
                             stack.push(Frame::Finish(n, n1, own));
                             stack.push(Frame::Visit(n1));
                             continue;
@@ -1037,7 +1067,18 @@ impl Runner<'_, '_> {
                         PhaseImpl::Mba(cfg) => pass::mba_step(self, cx, cfg, n)?,
                     };
                     match step {
+                        Step::To(r, fin) if pending.contains_key(&r) => {
+                            // `r` waits on `n`: take the rewrite (accepted as smaller where it
+                            // was made) without visiting `r` again, so both settle on `r`.
+                            self.stats.cycles_cut += 1;
+                            self.retire(cx, n);
+                            self.set(cx, phase, n, r, own.and(fin).and(Fin::PROVISIONAL));
+                        }
                         Step::To(r, fin) => {
+                            if !local {
+                                self.rewritten.insert((n, r), ());
+                                *pending.entry(n).or_default() += 1;
+                            }
                             stack.push(Frame::Finish(n, r, own.and(fin)));
                             stack.push(Frame::Visit(r));
                         }
@@ -1046,6 +1087,7 @@ impl Runner<'_, '_> {
                 }
             }
         }
+        debug_assert!(pending.is_empty(), "a walk ended with results pending");
         Ok(self
             .lookup(cx, phase, root)
             .unwrap_or((root, Fin::PROVISIONAL)))
@@ -1433,6 +1475,7 @@ impl Engine {
             },
             active: 0,
             counted: IdMap::default(),
+            rewritten: IdMap::default(),
         };
         let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
         let mut failure: Option<Error> = None;
