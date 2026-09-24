@@ -32,6 +32,8 @@ pub(crate) enum TOp {
     },
     Concat,
     Select,
+    /// A floating-point operation.
+    Fp(crate::fp::node::Desc),
 }
 
 fn small(w: Width, v: u64) -> BitVec {
@@ -279,6 +281,101 @@ fn unary(op: UnOp, a: &Facts) -> Facts {
     }
 }
 
+/// The members of `x` between the encodings `lo` and `hi` (unsigned, within one sign half), as
+/// their least and greatest, if any.
+pub(super) fn span(
+    x: &Facts,
+    lo: &BitVec,
+    hi: &BitVec,
+    negative_half: bool,
+) -> Option<(BitVec, BitVec)> {
+    let w = x.width();
+    let (u, s) = (x.urange, x.srange);
+    let mut lo = if ult(lo, &u.lo()) { u.lo() } else { *lo };
+    let mut hi = if ult(&u.hi(), hi) { u.hi() } else { *hi };
+    // The signed range, restricted to this half, in unsigned terms.
+    let zero = BitVec::zero(w);
+    let (slo, shi) = if negative_half {
+        if !slt(&s.lo(), &zero) {
+            return None;
+        }
+        let top = if slt(&s.hi(), &zero) {
+            s.hi()
+        } else {
+            BitVec::ones(w)
+        };
+        (s.lo(), top)
+    } else {
+        if slt(&s.hi(), &zero) {
+            return None;
+        }
+        let bottom = if slt(&s.lo(), &zero) { zero } else { s.lo() };
+        (bottom, s.hi())
+    };
+    if ult(&lo, &slo) {
+        lo = slo;
+    }
+    if ult(&shi, &hi) {
+        hi = shi;
+    }
+    if ult(&hi, &lo) {
+        return None;
+    }
+    let k = &x.known;
+    let lo = k.next_member(&lo)?;
+    let hi = k.prev_member(&hi)?;
+    (!ult(&hi, &lo)).then_some((lo, hi))
+}
+
+/// `x ^ smin` and `x & smax` (and the same with the constant first), exactly: flipping the top
+/// bit maps unsigned order onto signed order and back, so the ranges trade places; clearing it
+/// keeps the non-negative half and moves the negative half down. (A float's negation and
+/// absolute value.)
+fn top_bit(op: BinOp, a: &Facts, b: &Facts) -> Option<Facts> {
+    let w = a.width();
+    if w.bits() == 1 {
+        return None;
+    }
+    let (x, c) = match (a.as_constant(), b.as_constant()) {
+        (_, Some(c)) => (a, c),
+        (Some(c), _) => (b, c),
+        _ => return None,
+    };
+    let (smin, smax) = (BitVec::smin(w), BitVec::smax(w));
+    let (kz, ko) = (x.known.known_zero(), x.known.known_one());
+    match op {
+        BinOp::Xor if c == smin => {
+            let flip = |v: &BitVec| bv_xor(v, &smin);
+            let known = KnownBits::from_masks(
+                bv_or(&bv_and(&kz, &smax), &bv_and(&ko, &smin)),
+                bv_or(&bv_and(&ko, &smax), &bv_and(&kz, &smin)),
+            );
+            let u = URange::new(flip(&x.srange.lo()), flip(&x.srange.hi()))?;
+            let s = SRange::new(flip(&x.urange.lo()), flip(&x.urange.hi()))?;
+            Facts::reduce(known, u, s)
+        }
+        BinOp::And if c == smax => {
+            let zero = BitVec::zero(w);
+            let below = |v: &BitVec| bv_and(v, &smax);
+            let pos = span(x, &zero, &smax, false);
+            let neg = span(x, &smin, &BitVec::ones(w), true).map(|(l, h)| (below(&l), below(&h)));
+            let (lo, hi) = match (pos, neg) {
+                (Some((pl, ph)), Some((nl, nh))) => (
+                    if ult(&pl, &nl) { pl } else { nl },
+                    if ult(&ph, &nh) { nh } else { ph },
+                ),
+                (Some(p), None) | (None, Some(p)) => p,
+                (None, None) => return None,
+            };
+            let known = KnownBits::from_masks(bv_or(&kz, &smin), bv_and(&ko, &smax));
+            let u = URange::new(lo, hi)?;
+            let s = SRange::new(lo, hi)?;
+            Facts::reduce(known, u, s)
+        }
+        _ => None,
+    }
+}
+
 fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     let w = a.width();
     let top = Facts::top(w);
@@ -292,6 +389,11 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
             .or(Some(u32::MAX))
     });
     let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or(top);
+    if matches!(op, BinOp::Xor | BinOp::And)
+        && let Some(f) = top_bit(op, a, b)
+    {
+        return f;
+    }
     match op {
         BinOp::Add | BinOp::Sub => {
             let known = if op == BinOp::Add {
@@ -927,5 +1029,6 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
                 None => t.hull(f),
             }
         }
+        TOp::Fp(d) => super::fp::transfer(&d, args),
     }
 }

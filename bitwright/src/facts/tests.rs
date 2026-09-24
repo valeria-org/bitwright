@@ -127,6 +127,7 @@ fn eval_top(op: &TOp, args: &[BitVec]) -> BitVec {
         TOp::Concat => BitVec::concat(&args[0], &args[1]).unwrap(),
         TOp::Select => BitVec::select(&args[0], &args[1], &args[2]).unwrap(),
         TOp::Const(v) => v,
+        TOp::Fp(d) => crate::fp::eval(&d, args),
         TOp::Top(_) => unreachable!(),
     }
 }
@@ -1931,4 +1932,69 @@ fn self_shifts_bound_their_range() {
     let h = BitVec::wrapping_from_u64(width(64), 0x0fff_ffff_ffff_ffff);
     let env: HashMap<SymbolKey, BitVec> = [(SymbolKey::from("h"), h)].into_iter().collect();
     assert_eq!(cx.eval(&[g], &env).unwrap()[0].to_u64(), Some(0x0fff_ffff));
+}
+
+// ----- floating point ----------------------------------------------------------------------------
+
+/// Every floating-point transfer is sound on tiny formats: structured and random operand facts,
+/// every member evaluated.
+#[test]
+fn floating_point_transfers_are_sound() {
+    use crate::fp::node::Desc;
+    use crate::fp::{FpFormat, FpOp, RoundingMode};
+    let mut rng = Rng(0xf10a_7001);
+    for (eb, sb) in [(2, 2), (2, 3), (3, 2), (3, 3), (2, 4), (4, 2)] {
+        let f = FpFormat::new(eb, sb).unwrap();
+        let w = f.width().bits();
+        let st = states(&mut rng, w, 60);
+        let other = FpFormat::new(if eb == 2 { 3 } else { 2 }, 3).unwrap();
+        let pick = |rng: &mut Rng| &st[rng.below(st.len() as u64) as usize];
+        for rm in RoundingMode::ALL {
+            let unary = [
+                FpOp::Sqrt(rm),
+                FpOp::RoundToIntegral(rm),
+                FpOp::Convert { to: other, rm },
+                FpOp::ToSInt(rm, width(3)),
+                FpOp::ToUInt(rm, width(4)),
+            ];
+            for op in unary {
+                let d = Desc { op, format: f };
+                for a in &st {
+                    check_sound(&TOp::Fp(d), &[a]);
+                }
+            }
+            for op in [FpOp::FromSInt(rm), FpOp::FromUInt(rm)] {
+                let d = Desc { op, format: f };
+                for a in &states(&mut rng, 5, 20) {
+                    check_sound(&TOp::Fp(d), &[a]);
+                }
+            }
+            let binary = [
+                FpOp::Add(rm),
+                FpOp::Mul(rm),
+                FpOp::Div(rm),
+                FpOp::Rem,
+                FpOp::Min,
+                FpOp::Max,
+                FpOp::Eq,
+                FpOp::Lt,
+                FpOp::Le,
+            ];
+            for op in binary {
+                let d = Desc { op, format: f };
+                for _ in 0..150 {
+                    let (a, b) = (pick(&mut rng), pick(&mut rng));
+                    check_sound(&TOp::Fp(d), &[a, b]);
+                }
+            }
+            let d = Desc {
+                op: FpOp::Fma(rm),
+                format: f,
+            };
+            for _ in 0..50 {
+                let (a, b, c) = (pick(&mut rng), pick(&mut rng), pick(&mut rng));
+                check_sound(&TOp::Fp(d), &[a, b, c]);
+            }
+        }
+    }
 }

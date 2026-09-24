@@ -8,6 +8,7 @@
 
 mod backward;
 mod constraint;
+mod fp;
 pub(crate) mod known;
 mod narrow;
 mod range;
@@ -713,6 +714,8 @@ impl Context {
                     TOp::Bin(b)
                 } else if let Some(c) = op.as_cmp() {
                     TOp::Cmp(c)
+                } else if let Some(d) = self.fp_desc(i) {
+                    TOp::Fp(d)
                 } else {
                     TOp::Top(w)
                 }

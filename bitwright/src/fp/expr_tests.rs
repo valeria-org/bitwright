@@ -447,3 +447,57 @@ fn the_engine_keeps_floating_point_expressions_equal() {
         }
     }
 }
+
+/// What facts decide about floating-point results, so the engine folds the question.
+#[test]
+fn facts_decide_floating_point_questions() {
+    use crate::engine::Engine;
+    let f = FpFormat::F64;
+    let rne = RoundingMode::Rne;
+    let mut cx = Context::new();
+    let x32 = cx.symbol("x32", Width::W32).unwrap();
+    let x8 = cx.symbol("x8", Width::W8).unwrap();
+    let (a16, b16) = (
+        cx.symbol("a16", Width::W16).unwrap(),
+        cx.symbol("b16", Width::W16).unwrap(),
+    );
+    let y = cx.symbol("y", Width::W64).unwrap();
+    let from32 = cx.fp(FpOp::FromSInt(rne), f, &[x32]).unwrap();
+    let from8 = cx.fp(FpOp::FromUInt(rne), f, &[x8]).unwrap();
+    let fa = cx.fp(FpOp::FromSInt(rne), f, &[a16]).unwrap();
+    let fb = cx.fp(FpOp::FromSInt(rne), f, &[b16]).unwrap();
+    let c256 = cx.constant(&BitVec::from_f64(256.0)).unwrap();
+    let mut cases: Vec<(Expr, bool)> = vec![
+        (cx.fp_test(f, FpTest::Nan, from32).unwrap(), false),
+        (cx.fp_test(f, FpTest::Infinite, from32).unwrap(), false),
+        (cx.fp_cmp(f, FpCmpOp::Lt, from8, c256).unwrap(), true),
+        (cx.fp_cmp(f, FpCmpOp::Ge, from8, c256).unwrap(), false),
+    ];
+    let abs = cx.fp_abs(f, y).unwrap();
+    cases.push((cx.fp_test(f, FpTest::Negative, abs).unwrap(), false));
+    let root = cx.fp(FpOp::Sqrt(rne), f, &[from8]).unwrap();
+    cases.push((cx.fp_test(f, FpTest::Nan, root).unwrap(), false));
+    let prod = cx.fp(FpOp::Mul(rne), f, &[fa, fb]).unwrap();
+    cases.push((cx.fp_test(f, FpTest::Nan, prod).unwrap(), false));
+    cases.push((cx.fp_test(f, FpTest::Infinite, prod).unwrap(), false));
+    let neg = cx.fp_neg(f, from8).unwrap();
+    cases.push((cx.fp_test(f, FpTest::Positive, neg).unwrap(), false));
+    let back = cx
+        .fp(FpOp::ToSInt(RoundingMode::Rtz, Width::W32), f, &[fa])
+        .unwrap();
+    let limit = cx
+        .constant(&BitVec::from_u64(Width::W32, 40_000).unwrap())
+        .unwrap();
+    cases.push((cx.cmp(crate::CmpOp::Slt, back, limit).unwrap(), true));
+    let engine = Engine::standard();
+    for (e, want) in cases {
+        let text = cx.display(e).to_string();
+        let out = engine.simplify(&mut cx, e).unwrap().expr;
+        assert_eq!(
+            cx.as_const(out).unwrap(),
+            Some(BitVec::from_bool(want)),
+            "{text} simplified to {}",
+            cx.display(out)
+        );
+    }
+}
