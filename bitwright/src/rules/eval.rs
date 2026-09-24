@@ -87,6 +87,42 @@ pub(crate) fn literal(l: &Literal, w: Width, widths: &[u16]) -> Option<BitVec> {
     }
 }
 
+/// Whether [`literal`] has a value at width `w` (the same answer, without building it).
+fn literal_fits(l: &Literal, w: Width, widths: &[u16]) -> bool {
+    let wb = i64::from(w.bits());
+    match l {
+        Literal::Int { limbs, negative } => {
+            // The magnitude's bit length, and whether it is a power of two.
+            let top = limbs.iter().rposition(|&x| x != 0);
+            let Some(t) = top else {
+                return true;
+            };
+            let len = 64 * t as i64 + 64 - i64::from(limbs[t].leading_zeros());
+            if !*negative {
+                return len <= wb;
+            }
+            // Down to the signed minimum: below 2^(w-1), or exactly it.
+            let pow2 = limbs[t].is_power_of_two() && limbs[..t].iter().all(|&x| x == 0);
+            len < wb || (len == wb && pow2)
+        }
+        Literal::Ones | Literal::SMin | Literal::SMax => true,
+        Literal::LowMask(k) => (0..=wb).contains(&k.eval(widths)),
+        Literal::Bit(k) => (0..wb).contains(&k.eval(widths)),
+        Literal::Width(e) => {
+            let v = e.eval(widths);
+            v >= 0 && (wb >= 63 || v < 1i64 << wb)
+        }
+        Literal::Float { eb, .. } => {
+            let eb = eb.eval(widths);
+            u32::try_from(eb).is_ok_and(|eb| {
+                u32::from(w.bits())
+                    .checked_sub(eb)
+                    .is_some_and(|sb| FpFormat::new(eb, sb).is_ok())
+            })
+        }
+    }
+}
+
 /// The encoding of a floating-point constant in format `f`.
 pub(crate) fn float_value(v: FloatLit, f: FpFormat) -> BitVec {
     let w = f.width();
@@ -167,7 +203,19 @@ pub(crate) fn well_formed(
     widths: &[u16],
     strict: bool,
 ) -> Result<(), NodeId> {
-    let mut stack = vec![root];
+    well_formed_with(rule, root, widths, strict, &mut Vec::new())
+}
+
+/// [`well_formed`] with a stack to reuse (the compiler asks it at every width).
+pub(crate) fn well_formed_with(
+    rule: &Rule,
+    root: NodeId,
+    widths: &[u16],
+    strict: bool,
+    stack: &mut Vec<NodeId>,
+) -> Result<(), NodeId> {
+    stack.clear();
+    stack.push(root);
     while let Some(n) = stack.pop() {
         let node = &rule.nodes[n as usize];
         let w = match &rule.sorts[n as usize] {
@@ -176,7 +224,9 @@ pub(crate) fn well_formed(
         };
         match node {
             RNode::Lit(l) => {
-                literal(l, w.ok_or(n)?, widths).ok_or(n)?;
+                if !literal_fits(l, w.ok_or(n)?, widths) {
+                    return Err(n);
+                }
             }
             RNode::Un(UnOp::Bswap, _) if !w.ok_or(n)?.bits().is_multiple_of(8) => return Err(n),
             RNode::Zext(a) | RNode::Sext(a) => {
@@ -200,7 +250,7 @@ pub(crate) fn well_formed(
             }
             _ => {}
         }
-        stack.extend(super::compile::children(node));
+        super::compile::push_children(node, stack);
     }
     Ok(())
 }
@@ -210,6 +260,14 @@ pub(crate) fn well_formed(
 /// The matcher, the checker and compile-time validation all use this one definition, so a
 /// rule is only ever applied at assignments of the kind the checker checks.
 pub(crate) fn admitted(rule: &Rule, widths: &[u16]) -> bool {
+    if let Some(bits) = &rule.admitted_widths {
+        let i = match widths {
+            [] if rule.width_vars.is_empty() => 0,
+            [w] if rule.width_vars.len() == 1 => usize::from(*w),
+            _ => return false,
+        };
+        return i <= usize::from(Width::MAX_BITS) && (bits[i / 64] >> (i % 64)) & 1 == 1;
+    }
     let n = rule.width_vars.len();
     if widths.len() != n + rule.modes.len()
         || widths[..n].iter().any(|&w| w == 0 || w > Width::MAX_BITS)
@@ -313,4 +371,79 @@ pub(crate) fn eval_lets(rule: &Rule, widths: &[u16], params: &[BitVec]) -> Vec<O
         out.push(v);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::ir::WExpr;
+
+    #[test]
+    fn literal_fits_agrees_with_literal() {
+        let mut lits = vec![
+            Literal::Ones,
+            Literal::SMin,
+            Literal::SMax,
+            Literal::Float {
+                value: FloatLit::One,
+                eb: WExpr::var(0),
+            },
+        ];
+        for k in [-1, 0, 1, 2, 7, 8, 9, 63, 64, 65, 511, 512, 513] {
+            lits.push(Literal::LowMask(WExpr::konst(k)));
+            lits.push(Literal::Bit(WExpr::konst(k)));
+            lits.push(Literal::Width(WExpr::konst(k)));
+        }
+        lits.push(Literal::Width(WExpr::konst(1 << 40)));
+        // Magnitudes around every power of two up to 512 bits, both signs.
+        for bits in 0..=513u32 {
+            for delta in [-1i64, 0, 1] {
+                let mut limbs = vec![0u64; 9];
+                if bits < 576 {
+                    limbs[(bits / 64) as usize] |= 1 << (bits % 64);
+                }
+                // limbs + delta, as a multi-limb number (wrapping at 0).
+                let mut v = limbs.clone();
+                if delta == 1 {
+                    for x in v.iter_mut() {
+                        *x = x.wrapping_add(1);
+                        if *x != 0 {
+                            break;
+                        }
+                    }
+                } else if delta == -1 {
+                    for x in v.iter_mut() {
+                        let (r, borrow) = x.overflowing_sub(1);
+                        *x = r;
+                        if !borrow {
+                            break;
+                        }
+                    }
+                }
+                v.truncate(8);
+                if limbs[8] != 0 && delta >= 0 {
+                    continue;
+                }
+                for negative in [false, true] {
+                    lits.push(Literal::Int {
+                        limbs: v.clone(),
+                        negative,
+                    });
+                }
+            }
+        }
+        for l in &lits {
+            for w in (1..=130).chain([192, 255, 256, 257, 511, 512]) {
+                let width = Width::new(w).unwrap();
+                for eb in [0u16, 2, 5, 8, 11, 31, 32] {
+                    let widths = [eb];
+                    assert_eq!(
+                        literal_fits(l, width, &widths),
+                        literal(l, width, &widths).is_some(),
+                        "{l:?} at {w} (eb {eb})"
+                    );
+                }
+            }
+        }
+    }
 }

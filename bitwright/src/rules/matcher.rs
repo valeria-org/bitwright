@@ -359,7 +359,7 @@ pub(crate) fn is_closed(rule: &Rule, n: NodeId) -> bool {
     while let Some(k) = stack.pop() {
         match &rule.nodes[k as usize] {
             RNode::Param(_) | RNode::Let(_) => return false,
-            other => stack.extend(super::compile::children(other)),
+            other => super::compile::push_children(other, &mut stack),
         }
     }
     true
@@ -478,16 +478,21 @@ pub(crate) fn build_pattern(
 /// builder always rewrites (a constant on the left of `+`, `x - c`, `ugt`, …) never fires.
 pub(crate) fn pattern_reachable(rule: &Rule) -> bool {
     use crate::BitVec;
-    let assignments = super::compile::width_assignments(rule);
-    let matchable: Vec<&Vec<u16>> = assignments.iter().filter(|ws| admitted(rule, ws)).collect();
-    // Prefer small-but-not-tiny widths, then a few others.
-    let mut picks: Vec<&Vec<u16>> = matchable
-        .iter()
-        .copied()
-        .filter(|ws| ws.iter().all(|&w| (4..=16).contains(&w)))
-        .take(3)
-        .collect();
-    picks.extend(matchable.iter().copied().take(2));
+    // Prefer small-but-not-tiny widths, then the first few others.
+    let (mut small, mut first): (Vec<Vec<u16>>, Vec<Vec<u16>>) = (Vec::new(), Vec::new());
+    super::compile::for_each_assignment(rule, |ws| {
+        if admitted(rule, ws) {
+            let widths = &ws[..rule.width_vars.len()];
+            if small.len() < 3 && widths.iter().all(|&w| (4..=16).contains(&w)) {
+                small.push(ws.to_vec());
+            }
+            if first.len() < 2 {
+                first.push(ws.to_vec());
+            }
+        }
+        small.len() < 3
+    });
+    let picks = small.iter().chain(&first);
     let mut seed = 0x51ed_u64;
     for ws in picks {
         let Some(pw): Option<Vec<Width>> = rule

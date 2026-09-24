@@ -939,21 +939,24 @@ struct Runner<'r, 'a> {
     shuffle: IdMap<u32, pass::shuffle::Bits>,
     /// Passes quarantined for the call after a postcondition failure.
     quarantined_passes: Vec<pass::PassKind>,
+    /// The passes' commit rule's scratch.
+    scratch: pass::Scratch,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, per phase run,
-    /// computed on first need.
-    uses: Option<IdMap<u32, u32>>,
+    /// computed on first need (`uses_on`).
+    uses: pass::Counts,
+    uses_on: bool,
     /// Arena nodes whose edges `uses` already counts.
     uses_upto: u32,
     /// The arena length when the current phase run began.
     phase_start: u32,
     /// Nodes replaced (or built and discarded) in the current phase run: not parents.
-    dead: IdMap<u32, ()>,
+    dead: pass::Marks,
     /// The current version of every distinct root of the call (for use counts).
     live_roots: Vec<u32>,
     /// Which entry of `live_roots` is being processed.
     active: usize,
     /// Nodes whose edges `uses` currently counts.
-    counted: IdMap<u32, ()>,
+    counted: pass::Marks,
     /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
     /// rebuilt, over its operands' results, into one a pass rewrote it from (see `local`).
     rewritten: IdMap<(u32, u32), ()>,
@@ -1018,26 +1021,23 @@ impl Runner<'_, '_> {
         let mut stack = vec![n];
         let mut orphans: Vec<u32> = Vec::new();
         while let Some(n) = stack.pop() {
-            if self.dead.insert(n, ()).is_some() {
+            if !self.dead.insert(n) {
                 continue;
             }
-            if self.counted.remove(&n).is_none() {
+            if !self.counted.remove(n) {
                 continue;
             }
-            let Some(uses) = self.uses.as_mut() else {
+            if !self.uses_on {
                 continue;
-            };
+            }
             orphans.clear();
             for c in cx.node(n).children() {
-                if let Some(u) = uses.get_mut(&c) {
-                    *u = u.saturating_sub(1);
-                    if *u == 0 {
-                        orphans.push(c);
-                    }
+                if self.uses.dec(c) == Some(0) {
+                    orphans.push(c);
                 }
             }
             for &c in &orphans {
-                if self.counted.contains_key(&c) && !self.live_roots.contains(&c) {
+                if self.counted.contains(c) && !self.live_roots.contains(&c) {
                     stack.push(c);
                 }
             }
@@ -1074,7 +1074,7 @@ impl Runner<'_, '_> {
         if !matches!(self.inner.phases[phase], PhaseImpl::Local(_)) {
             // A pass's decisions depend on sharing, which the previous phase or round may have
             // changed: start afresh (final results stay memoized).
-            self.uses = None;
+            self.uses_on = false;
             self.counted.clear();
             self.dead.clear();
             self.partial[phase].clear();
@@ -1609,10 +1609,12 @@ impl Engine {
             compares: IdMap::default(),
             shuffle: IdMap::default(),
             quarantined_passes: Vec::new(),
-            uses: None,
+            scratch: pass::Scratch::default(),
+            uses: pass::Counts::default(),
+            uses_on: false,
             uses_upto: 0,
             phase_start: 0,
-            dead: IdMap::default(),
+            dead: pass::Marks::default(),
             live_roots: {
                 let mut seen: IdMap<u32, ()> = IdMap::default();
                 ids.iter()
@@ -1621,7 +1623,7 @@ impl Engine {
                     .collect()
             },
             active: 0,
-            counted: IdMap::default(),
+            counted: pass::Marks::default(),
             rewritten: IdMap::default(),
             chain_parent: IdMap::default(),
             asks: IdMap::default(),

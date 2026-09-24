@@ -1471,9 +1471,15 @@ fn finish_rule(
         examples: f.examples,
         doc: f.doc,
         span: f.span,
+        admitted_widths: None,
     };
     static_checks(&rule, &b.spans, f.name_span)?;
-    let cost = (rule.nodes.len() as u64).saturating_mul(width_assignments(&rule).len() as u64);
+    let mut assignments = 0u64;
+    for_each_assignment(&rule, |_| {
+        assignments += 1;
+        true
+    });
+    let cost = (rule.nodes.len() as u64).saturating_mul(assignments);
     *work = work.saturating_add(cost.saturating_mul(2));
     if *work > limits.max_work {
         return Err(Diagnostic::error(
@@ -1483,7 +1489,7 @@ fn finish_rule(
             f.span,
         ));
     }
-    validate_widths(&rule, &b.spans)?;
+    rule.admitted_widths = validate_widths(&rule, &b.spans)?;
     rule.decreasing = kbo_greater(&rule, rule.lhs, rule.rhs);
     rule.id = rule_id(&rule);
     Ok(rule)
@@ -1493,33 +1499,37 @@ fn walk(rule: &Rule, root: NodeId, mut f: impl FnMut(NodeId)) {
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         f(n);
-        stack.extend(children(&rule.nodes[n as usize]));
+        push_children(&rule.nodes[n as usize], &mut stack);
     }
 }
 
 pub(crate) fn children(n: &RNode) -> Vec<NodeId> {
+    let mut v = Vec::new();
+    push_children(n, &mut v);
+    v
+}
+
+/// Pushes the operands of `n` onto `out` (the walkers' stacks), in order.
+pub(crate) fn push_children(n: &RNode, out: &mut Vec<NodeId>) {
     match *n {
-        RNode::Param(_) | RNode::Let(_) | RNode::Lit(_) => vec![],
+        RNode::Param(_) | RNode::Let(_) | RNode::Lit(_) => {}
         RNode::Un(_, a)
         | RNode::Zext(a)
         | RNode::Sext(a)
         | RNode::Extract(_, a)
-        | RNode::Not(a) => {
-            vec![a]
-        }
-        RNode::ConstP(_, a) => vec![a],
+        | RNode::Not(a)
+        | RNode::ConstP(_, a) => out.push(a),
         RNode::Bin(_, a, b)
         | RNode::Cmp(_, a, b)
         | RNode::Concat(a, b)
         | RNode::And(a, b)
-        | RNode::Or(a, b) => vec![a, b],
-        RNode::Select(a, b, c) => vec![a, b, c],
+        | RNode::Or(a, b) => out.extend([a, b]),
+        RNode::Select(a, b, c) => out.extend([a, b, c]),
         RNode::Fact(_, a, m) => {
-            let mut v = vec![a];
-            v.extend(m);
-            v
+            out.push(a);
+            out.extend(m);
         }
-        RNode::Fp(ref f) => f.args.clone(),
+        RNode::Fp(ref f) => out.extend_from_slice(&f.args),
     }
 }
 
@@ -1948,7 +1958,7 @@ fn rule_id(rule: &Rule) -> RuleId {
                     sort(&mut feed, n);
                 }
             }
-            stack.extend(children(node));
+            push_children(node, &mut stack);
         }
     }
     RuleId(hs)
@@ -2180,20 +2190,46 @@ fn width_domain(vars: usize) -> Vec<u16> {
 
 /// The width assignments of the rule's variables over [`width_domain`] that satisfy the
 /// constraints, each with every assignment of its rounding-mode variables after the widths.
+#[cfg_attr(not(feature = "check"), allow(dead_code))] // the checker's
 pub(crate) fn width_assignments(rule: &Rule) -> Vec<Vec<u16>> {
-    let n = rule.width_vars.len();
-    let domain = width_domain(n);
     let mut out = Vec::new();
+    for_each_assignment(rule, |ws| {
+        out.push(ws.to_vec());
+        true
+    });
+    out
+}
+
+/// Calls `f` on each of [`width_assignments`] in turn, without collecting them, until it
+/// returns `false`.
+pub(crate) fn for_each_assignment(rule: &Rule, mut f: impl FnMut(&[u16]) -> bool) {
+    let n = rule.width_vars.len();
+    let m = rule.modes.len();
+    let domain = width_domain(n);
     let mut idx = vec![0usize; n];
+    let mut cur: Vec<u16> = vec![0; n + m];
     loop {
-        let cur: Vec<u16> = idx.iter().map(|&i| domain[i]).collect();
+        for (c, &i) in cur.iter_mut().zip(&idx) {
+            *c = domain[i];
+        }
         if rule.constraints.iter().all(|c| c.holds(&cur)) {
-            out.extend(with_modes(rule, cur));
+            // Every mode assignment, as a number in base 5.
+            let modes = (RoundingMode::ALL.len() as u32).pow(m as u32);
+            for k in 0..modes {
+                let mut k = k;
+                for slot in &mut cur[n..] {
+                    *slot = (k % RoundingMode::ALL.len() as u32) as u16;
+                    k /= RoundingMode::ALL.len() as u32;
+                }
+                if !f(&cur) {
+                    return;
+                }
+            }
         }
         let mut k = 0;
         loop {
             if k == n {
-                return out;
+                return;
             }
             if idx[k] + 1 < domain.len() {
                 idx[k] += 1;
@@ -2206,6 +2242,7 @@ pub(crate) fn width_assignments(rule: &Rule) -> Vec<Vec<u16>> {
 }
 
 /// `widths` followed by each assignment of the rule's rounding-mode variables.
+#[cfg_attr(not(feature = "check"), allow(dead_code))] // the checker's
 pub(crate) fn with_modes(rule: &Rule, widths: Vec<u16>) -> Vec<Vec<u16>> {
     let mut out = vec![widths];
     for _ in &rule.modes {
@@ -2225,26 +2262,39 @@ pub(crate) fn with_modes(rule: &Rule, widths: Vec<u16>) -> Vec<Vec<u16>> {
 
 /// Checks that wherever the pattern can match, the template, guard and lets are well typed
 /// (every width in range, extensions widen, extracts fit, literals are representable).
-fn validate_widths(rule: &Rule, spans: &[(usize, usize)]) -> R<()> {
-    use super::eval::well_formed;
+///
+/// For a rule with at most one width variable and no rounding-mode variable, also the
+/// assignments at which it applies (see `Rule::admitted_widths`): the domain is every width.
+fn validate_widths(rule: &Rule, spans: &[(usize, usize)]) -> R<Option<Box<[u64; 9]>>> {
+    use super::eval::well_formed_with;
+    let mut stack = Vec::new();
+    let mut well_formed =
+        |root, ws: &[u16], strict| well_formed_with(rule, root, ws, strict, &mut stack);
     let mut matchable = 0usize;
-    for ws in width_assignments(rule) {
-        if well_formed(rule, rule.lhs, &ws, true).is_err() {
-            continue;
+    let mut admitted =
+        (rule.width_vars.len() <= 1 && rule.modes.is_empty()).then(|| Box::new([0u64; 9]));
+    let mut parts = vec![rule.rhs];
+    parts.extend(rule.guard);
+    parts.extend(rule.lets.iter().map(|l| l.value));
+    let mut failure = None;
+    for_each_assignment(rule, |ws| {
+        if well_formed(rule.lhs, ws, true).is_err() {
+            return true;
         }
         matchable += 1;
-        let mut parts = vec![rule.rhs];
-        parts.extend(rule.guard);
-        parts.extend(rule.lets.iter().map(|l| l.value));
-        for p in parts {
-            if let Err(bad) = well_formed(rule, p, &ws, false) {
+        if let Some(bits) = admitted.as_mut() {
+            let i = usize::from(ws.first().copied().unwrap_or(0));
+            bits[i / 64] |= 1 << (i % 64);
+        }
+        for &p in &parts {
+            if let Err(bad) = well_formed(p, ws, false) {
                 let inst: Vec<String> = rule
                     .width_vars
                     .iter()
-                    .zip(&ws)
+                    .zip(ws)
                     .map(|(n, w)| format!("{n} = {w}"))
                     .collect();
-                return Err(Diagnostic::error(
+                failure = Some(Diagnostic::error(
                     "BW0107",
                     format!(
                         "ill-typed where the pattern matches ({}); add a `where` constraint",
@@ -2252,8 +2302,13 @@ fn validate_widths(rule: &Rule, spans: &[(usize, usize)]) -> R<()> {
                     ),
                     spans[bad as usize],
                 ));
+                return false;
             }
         }
+        true
+    });
+    if let Some(d) = failure {
+        return Err(d);
     }
     if matchable == 0 {
         return Err(Diagnostic::error(
@@ -2262,5 +2317,5 @@ fn validate_widths(rule: &Rule, spans: &[(usize, usize)]) -> R<()> {
             spans[rule.lhs as usize],
         ));
     }
-    Ok(())
+    Ok(admitted)
 }

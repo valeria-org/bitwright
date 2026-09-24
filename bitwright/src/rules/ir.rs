@@ -462,6 +462,10 @@ pub struct Rule {
     pub doc: String,
     /// Byte span of the rule in its source.
     pub span: (usize, usize),
+    /// [`Rule::admits`] at every width, for a rule with at most one width variable and no
+    /// rounding-mode variable (bit `w`, bit 0 for no variable): computed with the compiler's
+    /// validation, so the matcher answers it with one load.
+    pub(crate) admitted_widths: Option<Box<[u64; 9]>>,
 }
 
 impl Rule {

@@ -23,12 +23,19 @@
   z3.
 - **Facts.** Flipping or clearing the top bit (`x ^ smin`, `x & smax`) keeps the ranges exactly:
   the unsigned and signed ranges trade places, or the negative half moves down.
-- **Performance.** Floating point costs integer work nothing, and some of it got faster: a
-  node's arity is one table load, the top-bit fact transfers are turned away on a known top bit
-  before they build anything, a format packs into 16 bits, and SMT-LIB import reads indexed
-  operators without allocating. Against 0.8.0 (instructions): `expr/build` −3 %, `expr/eval` −8
-  %, `expr/substitute` −7 %, `simplify/standard` −1.3 %, `facts/cold` −0.8 %,
-  `service/smt-import` −1.3 %.
+- **Performance.** Simplifying takes half the instructions it did. The passes' commit rule
+  (does a candidate make the DAG smaller?) built hash sets and maps on every call and rebuilt the
+  use counts of the whole DAG in one at every phase; they are now dense arrays the runner keeps
+  and empties in constant time, with the same answers. Compiling rules (the built-in ones once
+  per process: the command line's start) validates their widths without allocating and keeps
+  where a one-width rule applies, so the matcher checks it with one load: `bitwright simplify`
+  starts in 14 ms instead of 53. Floating point costs integer work nothing: a node's arity is
+  one table load, the top-bit fact transfers are turned away on a known top bit before they
+  build anything, a format packs into 16 bits, and SMT-LIB import reads indexed operators
+  without allocating. Against 0.8.0 (instructions): `simplify/standard` −51 %, `simplify/mba`
+  −32 %, `simplify/mba-nonlinear-sig` −28 %, `simplify/mba-native` −10 %, `expr/build` −3 %,
+  `expr/eval` −8 %, `expr/substitute` −7 %, `facts/cold` −0.8 %, `service/smt-import` −1.2 %;
+  none is slower.
 - **Comparisons through functions, and of floats.** The compares pass combines comparisons of
   different terms when one is a function of the other it can invert on intervals (`x + k`,
   `k − x`, `−x`, `~x`, `x ^ smin`, `x & (2^j − 1)`, `x | smin`, extensions): so

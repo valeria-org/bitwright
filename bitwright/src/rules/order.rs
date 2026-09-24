@@ -162,7 +162,7 @@ fn constant(rule: &Rule, n: NodeId) -> bool {
             RNode::Param(i) if rule.params[usize::from(*i)].kind != ParamKind::Const => {
                 return false;
             }
-            other => stack.extend(super::compile::children(other)),
+            other => super::compile::push_children(other, &mut stack),
         }
     }
     true

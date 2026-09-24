@@ -21,7 +21,153 @@ use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::facts::{Facts, Reliance};
-use crate::hash::IdMap;
+
+/// A set of node indices emptied in constant time (by a new epoch; a stamp of 0 is never
+/// current): the engine's per-node scratch, kept by the runner and reused instead of hash sets.
+/// It grows to any index it is given.
+pub(crate) struct Marks {
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl Default for Marks {
+    fn default() -> Self {
+        Marks {
+            stamp: Vec::new(),
+            epoch: 1,
+        }
+    }
+}
+
+impl Marks {
+    /// Empties the set, sized for indices below `len`.
+    pub(crate) fn begin(&mut self, len: usize) {
+        if self.stamp.len() < len {
+            self.stamp.resize(len, 0);
+        }
+        self.clear();
+    }
+
+    /// Empties the set.
+    pub(crate) fn clear(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Adds `i`: whether it was not in the set.
+    #[inline]
+    pub(crate) fn insert(&mut self, i: u32) -> bool {
+        let i = i as usize;
+        if i >= self.stamp.len() {
+            self.stamp.resize(i + 1, 0);
+        }
+        let fresh = self.stamp[i] != self.epoch;
+        self.stamp[i] = self.epoch;
+        fresh
+    }
+
+    /// Removes `i`: whether it was in the set.
+    #[inline]
+    pub(crate) fn remove(&mut self, i: u32) -> bool {
+        match self.stamp.get_mut(i as usize) {
+            Some(s) if *s == self.epoch => {
+                *s = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, i: u32) -> bool {
+        self.stamp.get(i as usize) == Some(&self.epoch)
+    }
+}
+
+/// Counts per node index, emptied in constant time like [`Marks`]; an index not counted since
+/// then has none (which is not a count of 0).
+pub(crate) struct Counts {
+    stamp: Vec<u32>,
+    val: Vec<u32>,
+    epoch: u32,
+}
+
+impl Default for Counts {
+    fn default() -> Self {
+        Counts {
+            stamp: Vec::new(),
+            val: Vec::new(),
+            epoch: 1,
+        }
+    }
+}
+
+impl Counts {
+    /// Empties the counts, sized for indices below `len`.
+    pub(crate) fn begin(&mut self, len: usize) {
+        if self.stamp.len() < len {
+            self.stamp.resize(len, 0);
+            self.val.resize(len, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: u32) -> Option<u32> {
+        let i = i as usize;
+        (self.stamp.get(i) == Some(&self.epoch)).then(|| self.val[i])
+    }
+
+    /// Counts one more for `i`.
+    #[inline]
+    pub(crate) fn add(&mut self, i: u32) {
+        let i = i as usize;
+        if i >= self.stamp.len() {
+            self.stamp.resize(i + 1, 0);
+            self.val.resize(i + 1, 0);
+        }
+        if self.stamp[i] != self.epoch {
+            self.stamp[i] = self.epoch;
+            self.val[i] = 0;
+        }
+        self.val[i] += 1;
+    }
+
+    /// Counts one less for `i` (not below 0), if it has a count: the count left.
+    #[inline]
+    pub(crate) fn dec(&mut self, i: u32) -> Option<u32> {
+        let i = i as usize;
+        if self.stamp.get(i) != Some(&self.epoch) {
+            return None;
+        }
+        self.val[i] = self.val[i].saturating_sub(1);
+        Some(self.val[i])
+    }
+}
+
+/// The commit rule's scratch (see [`shrinks`]).
+#[derive(Default)]
+pub(crate) struct Scratch {
+    /// The region of the node being replaced.
+    region: Marks,
+    /// Nodes a candidate needs, visited.
+    seen: Marks,
+    /// Region nodes the candidate reuses.
+    kept: Marks,
+    /// Uses from nodes that stop being used.
+    dying: Counts,
+    /// Uses from inside the region.
+    local: Counts,
+    queue: std::collections::VecDeque<u32>,
+    stack: Vec<u32>,
+}
 
 /// A normal-form pass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -217,26 +363,26 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// up to date as nodes are created (counted) and replaced (uncounted, see `Runner::retire`). A
 /// node a counted node uses is counted too, so one replaced and then used again is live again.
 fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
-    if r.uses.is_none() {
-        let mut uses: IdMap<u32, u32> = IdMap::default();
-        let mut seen: IdMap<u32, ()> = IdMap::default();
+    if !r.uses_on {
+        r.uses.begin(cx.len());
+        r.scratch.seen.begin(cx.len());
         let mut stack: Vec<u32> = r.live_roots.clone();
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() || r.dead.contains_key(&i) {
+            if !r.scratch.seen.insert(i) || r.dead.contains(i) {
                 continue;
             }
             if let Err(e) = r.meter.charge(Counter::PassWork, 1) {
-                // Nothing counted yet (`uses` is still unset): keep `counted` consistent.
+                // Nothing counted yet (`uses` is still off): keep `counted` consistent.
                 r.counted.clear();
                 return Err(e.into());
             }
             for c in cx.node(i).children() {
-                *uses.entry(c).or_default() += 1;
+                r.uses.add(c);
                 stack.push(c);
             }
-            r.counted.insert(i, ());
+            r.counted.insert(i);
         }
-        r.uses = Some(uses);
+        r.uses_on = true;
         r.uses_upto = r.phase_start;
     }
     let len = cx.len() as u32;
@@ -244,20 +390,18 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     r.meter.charge(Counter::PassWork, u64::from(len - from))?;
     let mut stack: Vec<u32> = (from..len)
         .rev()
-        .filter(|i| !r.dead.contains_key(i) && !r.counted.contains_key(i))
+        .filter(|&i| !r.dead.contains(i) && !r.counted.contains(i))
         .collect();
     while let Some(i) = stack.pop() {
-        if r.counted.insert(i, ()).is_some() {
+        if !r.counted.insert(i) {
             continue;
         }
-        r.dead.remove(&i);
+        r.dead.remove(i);
         r.meter.charge(Counter::PassWork, 1)?;
-        if let Some(uses) = r.uses.as_mut() {
-            for c in cx.node(i).children() {
-                *uses.entry(c).or_default() += 1;
-                if !r.counted.contains_key(&c) {
-                    stack.push(c);
-                }
+        for c in cx.node(i).children() {
+            r.uses.add(c);
+            if !r.counted.contains(c) {
+                stack.push(c);
             }
         }
     }
@@ -268,12 +412,15 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
 /// The region of `n`: the nodes reachable from it without entering `atoms` (sorted), at most
 /// [`REGION_CAP`] of them (the ones nearest `n`), in descending index order. Operands always
 /// have lower indices than their users, so this order lists every user before its operands.
+/// Also leaves the region as `r.scratch.region`.
 fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result<Vec<u32>, Stop> {
-    let mut seen: IdMap<u32, ()> = IdMap::default();
-    let mut queue = std::collections::VecDeque::from([n]);
+    let sc = &mut r.scratch;
+    sc.region.begin(cx.len());
+    sc.queue.clear();
+    sc.queue.push_back(n);
     let mut out: Vec<u32> = Vec::new();
-    while let Some(i) = queue.pop_front() {
-        if seen.insert(i, ()).is_some() {
+    while let Some(i) = sc.queue.pop_front() {
+        if !sc.region.insert(i) {
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
@@ -283,7 +430,7 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
         }
         for c in cx.node(i).children() {
             if atoms.binary_search(&c).is_err() {
-                queue.push_back(c);
+                sc.queue.push_back(c);
             }
         }
     }
@@ -298,41 +445,46 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
 ///
 /// With `shared = false`, uses from outside the region are ignored: the count a context-free
 /// decision would make, used to tell whether a rejection depended on sharing.
+///
+/// `order` is the region `region` left in `r.scratch.region`; with `kept`, the nodes in
+/// `r.scratch.kept` stay.
 fn dying_in(
     r: &mut Runner<'_, '_>,
     cx: &Context,
     n: u32,
     order: &[u32],
-    kept: &IdMap<u32, ()>,
+    kept: bool,
     limit: u32,
     shared: bool,
 ) -> Result<u32, Stop> {
-    let in_region: IdMap<u32, ()> = order.iter().map(|&i| (i, ())).collect();
-    let local_uses: IdMap<u32, u32>;
-    let uses = if shared {
+    if shared {
         refresh_uses(r, cx)?;
-        r.uses.as_ref()
-    } else {
-        let mut u: IdMap<u32, u32> = IdMap::default();
+    }
+    let sc = &mut r.scratch;
+    if !shared {
+        sc.local.begin(cx.len());
         for &i in order {
             for c in cx.node(i).children() {
-                if in_region.contains_key(&c) {
-                    *u.entry(c).or_default() += 1;
+                if sc.region.contains(c) {
+                    sc.local.add(c);
                 }
             }
         }
-        local_uses = u;
-        Some(&local_uses)
+    }
+    let uses = |sc: &Scratch, i: u32| {
+        if shared {
+            r.uses.get(i)
+        } else {
+            sc.local.get(i)
+        }
     };
-    let mut from_dying: IdMap<u32, u32> = IdMap::default();
+    sc.dying.begin(cx.len());
     let mut count = 0u32;
     for &i in order {
-        if kept.contains_key(&i) {
+        if kept && sc.kept.contains(i) {
             continue;
         }
-        let dies = i == n
-            || from_dying.get(&i).copied().unwrap_or(0)
-                >= uses.and_then(|u| u.get(&i).copied()).unwrap_or(u32::MAX);
+        let dies = i == n || sc.dying.get(i).unwrap_or(0) >= uses(sc, i).unwrap_or(u32::MAX);
         if !dies {
             continue;
         }
@@ -341,39 +493,37 @@ fn dying_in(
             return Ok(count);
         }
         for c in cx.node(i).children() {
-            if in_region.contains_key(&c) {
-                *from_dying.entry(c).or_default() += 1;
+            if sc.region.contains(c) {
+                sc.dying.add(c);
             }
         }
     }
     Ok(count)
 }
 
-/// A candidate's cost: the nodes it needs, and the region nodes it reuses.
-type Needed = (u32, IdMap<u32, ()>);
-
-/// The nodes candidate `e` needs that are neither atoms nor in `region` (the region of the
-/// node it replaces), and the region nodes it reuses; `None` if more than [`REGION_CAP`].
-/// Counted against the structure, not the arena, so the decision never depends on which nodes
-/// happen to exist already.
+/// The nodes candidate `e` needs that are neither atoms nor in the region (`r.scratch.region`,
+/// of the node it replaces), leaving the region nodes it reuses in `r.scratch.kept`; `None` if
+/// more than [`REGION_CAP`]. Counted against the structure, not the arena, so the decision never
+/// depends on which nodes happen to exist already.
 fn needed(
     r: &mut Runner<'_, '_>,
     cx: &Context,
     e: u32,
     atoms: &[u32],
-    region: &IdMap<u32, ()>,
-) -> Result<Option<Needed>, Stop> {
-    let mut seen: IdMap<u32, ()> = IdMap::default();
-    let mut kept: IdMap<u32, ()> = IdMap::default();
+) -> Result<Option<u32>, Stop> {
+    let sc = &mut r.scratch;
+    sc.seen.begin(cx.len());
+    sc.kept.begin(cx.len());
+    sc.stack.clear();
+    sc.stack.push(e);
     let mut new = 0u32;
-    let mut stack = vec![e];
-    while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() || atoms.binary_search(&i).is_ok() {
+    while let Some(i) = sc.stack.pop() {
+        if !sc.seen.insert(i) || atoms.binary_search(&i).is_ok() {
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        if region.contains_key(&i) {
-            kept.insert(i, ());
+        if sc.region.contains(i) {
+            sc.kept.insert(i);
             continue;
         }
         new += 1;
@@ -381,10 +531,10 @@ fn needed(
             r.meter.check()?;
             return Ok(None);
         }
-        stack.extend(cx.node(i).children());
+        sc.stack.extend(cx.node(i).children());
     }
     r.meter.check()?;
-    Ok(Some((new, kept)))
+    Ok(Some(new))
 }
 
 /// The most nodes the commit rule examines on either side.
@@ -406,11 +556,10 @@ pub(super) fn worth_building(
     sorted.dedup();
     let order = region(r, cx, n, &sorted)?;
     r.meter.check()?;
-    let none = IdMap::default();
-    if dying_in(r, cx, n, &order, &none, estimate.saturating_add(1), true)? > estimate {
+    if dying_in(r, cx, n, &order, false, estimate.saturating_add(1), true)? > estimate {
         return Ok(None);
     }
-    let alone = dying_in(r, cx, n, &order, &none, estimate.saturating_add(1), false)?;
+    let alone = dying_in(r, cx, n, &order, false, estimate.saturating_add(1), false)?;
     Ok(Some(if alone > estimate {
         Fin::PROVISIONAL
     } else {
@@ -440,13 +589,12 @@ pub(super) fn shrinks(
     sorted.dedup();
     let order = region(r, cx, n, &sorted)?;
     r.meter.check()?;
-    let set: IdMap<u32, ()> = order.iter().map(|&i| (i, ())).collect();
-    let Some((new, kept)) = needed(r, cx, e, &sorted, &set)? else {
+    let Some(new) = needed(r, cx, e, &sorted)? else {
         return Ok(Err(Fin::FINAL));
     };
-    let freed = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), true)?;
+    let freed = dying_in(r, cx, n, &order, true, new.saturating_add(1), true)?;
     if new >= freed {
-        let alone = dying_in(r, cx, n, &order, &kept, new.saturating_add(1), false)?;
+        let alone = dying_in(r, cx, n, &order, true, new.saturating_add(1), false)?;
         return Ok(Err(if new < alone {
             Fin::PROVISIONAL
         } else {
