@@ -399,7 +399,7 @@ fn simplify(v: &mut Vec<Bench>) {
                         "nodes {before} -> {after}; mba: {} simplified, {} not smaller, {} no \
                          simpler, {} unsupported, {} exhausted, {} unproved, {} refuted, {} too \
                          small, {} too many vars; proofs {} ({} signature, {} single-bit, {} \
-                         sparse, {} grid, {} exhaustive, {} over atoms), {} points",
+                         sparse, {} grid, {} exhaustive, {} over atoms, {} by cases), {} points",
                         m.simplified,
                         m.not_smaller,
                         m.no_simpler,
@@ -416,6 +416,7 @@ fn simplify(v: &mut Vec<Bench>) {
                         c.grid,
                         c.exhaustive,
                         c.compositional,
+                        c.split,
                         c.points
                     )
                 }),

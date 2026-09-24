@@ -28,6 +28,12 @@
 //!   independent variables: an identity for independent atoms holds for any values of them.
 //!   A skeleton that differs proves nothing (the atoms may be dependent): the answer is
 //!   unknown, never refuted.
+//! - **Known bits.** When those leave the question open, `x op k` (`op` bitwise, `k` a
+//!   constant) is read as arithmetic wherever the known bits of `x` cover the bits `k` is 1
+//!   at, or those it is 0 at: equal functions, so a verdict on them is one on the question.
+//! - **Cases.** Then a variable is split over a few of its bits: those both sides read it
+//!   through narrow masks at, or the low bits bitwise operations with constants read. The cases
+//!   cover every input, and each is proved on its own.
 //!
 //! Every test is sized before it runs and charged a block at a time; one over the budget is
 //! not run. `Refuted` always comes with a concrete input where the two sides differ.
@@ -61,6 +67,20 @@ pub(crate) const SAMPLE_POINTS: usize = 64;
 
 /// The most proof attempts per atom when atoms are paired by their definitions.
 const PAIR_TRIES: usize = 4;
+
+/// The most bits of one variable a split enumerates (at most `2^SPLIT_BITS` cases).
+const SPLIT_BITS: u32 = 4;
+
+/// How deep splits nest (each one on another variable).
+const SPLIT_DEPTH: u32 = 2;
+
+/// The most work (node evaluations) one split spends on cases before it declines; like
+/// [`MAX_EFFORT`], a decline that does not depend on the budget.
+const SPLIT_EFFORT: u64 = MAX_EFFORT;
+
+/// Work charged per node for reading known bits as arithmetic (a transfer of facts costs about
+/// as much as evaluating a node at this many points).
+const LOWER_COST: u64 = 64;
 
 /// Work accounting for a certificate: units are node evaluations (one per node per point).
 pub(crate) trait Meter {
@@ -125,6 +145,11 @@ pub(crate) struct Report {
     pub(crate) cert: Option<Cert>,
     /// Atoms were abstracted.
     pub(crate) compositional: bool,
+    /// Decided case by case over a few bits of one variable.
+    pub(crate) split: bool,
+    /// Decided after bitwise operations with constants that read only known bits were read
+    /// as arithmetic.
+    pub(crate) known_bits: bool,
     /// Points evaluated, over every test run.
     pub(crate) points: u64,
     /// A test was skipped for lack of budget (more budget might decide).
@@ -144,6 +169,8 @@ impl Report {
             verdict: Verdict::Unknown,
             cert: None,
             compositional: false,
+            split: false,
+            known_bits: false,
             points: 0,
             over_budget: false,
             internal: 0,
@@ -851,11 +878,24 @@ pub(crate) fn refute(a: &MbaExpr, b: &MbaExpr, points: &[Vec<BitVec>]) -> Option
 
 // ----- the certificate -------------------------------------------------------------------------
 
-/// Decides `a == b` (on every input) if one of the tests applies within the budget. `Refuted`
-/// only with a concrete input where they differ; `Unknown` when no test applies, a test is
-/// over the budget, or only skeletons over abstracted atoms were found to differ. Expressions
-/// over different variables or of different widths are not compared (`Unknown`).
+/// Decides `a == b` (on every input) if one of the tests applies within the budget: the
+/// cheapest direct test, else over abstracted atoms, else with known bits read as arithmetic,
+/// else case by case. `Refuted` only with a concrete input where they differ; `Unknown` when
+/// no test applies, a test is over the budget, or only skeletons over abstracted atoms were
+/// found to differ. Expressions over different variables or of different widths are not
+/// compared (`Unknown`).
 pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result<Report, M::Err> {
+    prove_at(a, b, meter, 0, false)
+}
+
+/// [`prove`] within `depth` splits; `lowered`: known bits were already read as arithmetic.
+fn prove_at<M: Meter>(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    meter: &mut M,
+    depth: u32,
+    lowered: bool,
+) -> Result<Report, M::Err> {
     let mut report = Report::new();
     if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
         return Ok(report);
@@ -867,6 +907,8 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     let (Some(pa), Some(pb)) = (profile(a), profile(b)) else {
         return Ok(report);
     };
+    // Abstraction never makes a polynomial test smaller; only a non-polynomial side needs it.
+    let mut compose = true;
     if let Some(p) = plan(a, &pa, &pb) {
         match run(meter, a, b, &p, &mut report)? {
             Run::Equal => {
@@ -880,17 +922,437 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
                 report.counterexample = Some(point);
                 return Ok(report);
             }
-            Run::OverBudget | Run::TooBig => {
-                // Abstraction never makes a polynomial test smaller; only a non-polynomial
-                // side needs it.
-                if pa.poly && pb.poly {
-                    return Ok(report);
+            Run::OverBudget | Run::TooBig => compose = !(pa.poly && pb.poly),
+        }
+    }
+    if compose {
+        Compose::new(a, b).prove(meter, &mut report)?;
+    }
+    // Undecided for lack of budget: more budget may decide it directly; nothing more is spent.
+    if report.verdict != Verdict::Unknown || report.over_budget {
+        return Ok(report);
+    }
+    // The same question with known bits read as arithmetic (equal functions, so a verdict on
+    // them is one on `a` and `b`, at the same points); it splits too.
+    if !lowered && (lowerable(a) || lowerable(b)) {
+        let units = (a.nodes().len() + b.nodes().len()) as u64 * LOWER_COST;
+        if units > meter.left() {
+            report.over_budget = true;
+            return Ok(report);
+        }
+        meter.charge(units)?;
+        let (la, lb) = (lower_known_bits(a), lower_known_bits(b));
+        if la.is_some() || lb.is_some() {
+            let la = la.unwrap_or_else(|| a.clone());
+            let lb = lb.unwrap_or_else(|| b.clone());
+            let sub = prove_at(&la, &lb, meter, depth, true)?;
+            report.points += sub.points;
+            report.over_budget |= sub.over_budget;
+            report.internal += sub.internal;
+            if sub.verdict != Verdict::Unknown {
+                report.verdict = sub.verdict;
+                report.cert = sub.cert;
+                report.compositional = sub.compositional;
+                report.split = sub.split;
+                report.known_bits = true;
+                report.counterexample = sub.counterexample;
+            }
+            return Ok(report);
+        }
+    }
+    if depth < SPLIT_DEPTH {
+        split(a, b, meter, depth, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// Whether `m` has a bitwise operation with exactly one constant operand (see
+/// [`lower_known_bits`]).
+fn lowerable(m: &MbaExpr) -> bool {
+    let nodes = m.nodes();
+    let konst = |i: u32| {
+        nodes
+            .get(i as usize)
+            .is_some_and(|n| matches!(n.op, MOp::Const(_)))
+    };
+    nodes.iter().any(|n| {
+        matches!(n.op, MOp::And | MOp::Or | MOp::Xor) && konst(n.args[0]) != konst(n.args[1])
+    })
+}
+
+/// `m` with every `x op k` (`op` bitwise, `k` a constant) read as arithmetic where the bits of
+/// `x` that are known (by the transfer functions of [`Facts`](crate::Facts)) cover the bits `k`
+/// is 1 at, or those it is 0 at. With `z` and `o` the known-zero and known-one bits of `x`:
+///
+/// - `k` inside the known bits: `x & k = k & o`, `x | k = x + (k & z)`,
+///   `x ^ k = x + (k & z) − (k & o)`;
+/// - `~k` inside them: `x & k = x − (~k & o)`, `x | k = k | o`,
+///   `x ^ k = (~k & o) − (~k & z) − 1 − x` (that is, `~x ^ ~k`).
+///
+/// `None` when there is none.
+pub(crate) fn lower_known_bits(m: &MbaExpr) -> Option<MbaExpr> {
+    use crate::Facts;
+    use crate::facts::known::{bv_and, bv_not, bv_or};
+    let nodes = m.nodes();
+    let cst = constants(nodes);
+    let candidate = |n: &MNode| {
+        matches!(n.op, MOp::And | MOp::Or | MOp::Xor)
+            && cst[n.args[0] as usize].is_some() != cst[n.args[1] as usize].is_some()
+    };
+    if !nodes.iter().any(candidate) {
+        return None;
+    }
+    let mut facts: Vec<Facts> = Vec::with_capacity(nodes.len());
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for n in nodes {
+        let fa = |k: usize| facts.get(n.args[k] as usize).copied();
+        let f = match n.op {
+            MOp::Const(v) => Some(Facts::constant(&v)),
+            MOp::Var(_) => Some(Facts::top(n.width)),
+            MOp::Add | MOp::Sub | MOp::Mul | MOp::And | MOp::Or | MOp::Xor => {
+                let op = match n.op {
+                    MOp::Add => BinOp::Add,
+                    MOp::Sub => BinOp::Sub,
+                    MOp::Mul => BinOp::Mul,
+                    MOp::And => BinOp::And,
+                    MOp::Or => BinOp::Or,
+                    _ => BinOp::Xor,
+                };
+                Facts::apply_bin(op, &fa(0)?, &fa(1)?).ok()
+            }
+            MOp::Neg => Facts::apply_un(UnOp::Neg, &fa(0)?).ok(),
+            MOp::Not => Facts::apply_un(UnOp::Not, &fa(0)?).ok(),
+            MOp::Shl(k) | MOp::LShr(k) => {
+                let op = if matches!(n.op, MOp::Shl(_)) {
+                    BinOp::Shl
+                } else {
+                    BinOp::LShr
+                };
+                let amount = Facts::constant(&BitVec::wrapping_from_u64(n.width, u64::from(k)));
+                Facts::apply_bin(op, &fa(0)?, &amount).ok()
+            }
+            MOp::Zext => fa(0)?.zext(n.width).ok(),
+            MOp::Sext => fa(0)?.sext(n.width).ok(),
+            MOp::Trunc => fa(0)?.extract(0, n.width).ok(),
+        }?;
+        let args: Vec<u32> = n.args[..n.op.arity()]
+            .iter()
+            .map(|&x| map[x as usize])
+            .collect();
+        // The rewrite: `c` alone, `x + c`, or `c − x`.
+        let mut rewrite: Option<(Option<bool>, BitVec, u32)> = None;
+        if candidate(n) {
+            let (x, k) = match cst[n.args[0] as usize] {
+                Some(k) => (1, k),
+                None => (0, cst[n.args[1] as usize]?),
+            };
+            let kb = facts[n.args[x] as usize].known();
+            let (z, o) = (kb.known_zero(), kb.known_one());
+            let unknown = bv_not(&kb.known());
+            let nk = bv_not(&k);
+            let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
+            let one = BitVec::one(n.width);
+            if bv_and(&k, &unknown).is_zero() {
+                rewrite = Some(match n.op {
+                    MOp::And => (None, bv_and(&k, &o), args[x]),
+                    MOp::Or => (Some(true), bv_and(&k, &z), args[x]),
+                    _ => (Some(true), sub(&bv_and(&k, &z), &bv_and(&k, &o)), args[x]),
+                });
+            } else if bv_and(&nk, &unknown).is_zero() {
+                rewrite = Some(match n.op {
+                    MOp::And => (
+                        Some(true),
+                        sub(&BitVec::zero(n.width), &bv_and(&nk, &o)),
+                        args[x],
+                    ),
+                    MOp::Or => (None, bv_or(&k, &o), args[x]),
+                    _ => (
+                        Some(false),
+                        sub(&sub(&bv_and(&nk, &o), &bv_and(&nk, &z)), &one),
+                        args[x],
+                    ),
+                });
+            }
+        }
+        let r = match rewrite {
+            Some((form, c, x)) => {
+                changed = true;
+                let c = out.push(MOp::Const(c), &[]).ok()?;
+                match form {
+                    None => c,
+                    Some(true) => out.push(MOp::Add, &[x, c]).ok()?,
+                    Some(false) => out.push(MOp::Sub, &[c, x]).ok()?,
+                }
+            }
+            None => match n.op {
+                MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(n.op, args[0], n.width).ok()?,
+                op => out.push(op, &args).ok()?,
+            },
+        };
+        facts.push(f);
+        map.push(r);
+    }
+    changed.then_some(out)
+}
+
+/// A variable both sides read only as `v & M` (constant masks `M`, at most [`SPLIT_BITS`]
+/// bits together), and those bits: the sides depend on nothing else of it.
+fn narrow_var(a: &MbaExpr, b: &MbaExpr) -> Option<(u32, Vec<u32>)> {
+    let nv = a.vars().len();
+    let mut masks: Vec<Option<BitVec>> = vec![None; nv];
+    let mut wide = vec![false; nv];
+    for m in [a, b] {
+        let nodes = m.nodes();
+        let live = live(m);
+        let cst = constants(nodes);
+        if let Some(MOp::Var(v)) = m.root().map(|r| nodes[r as usize].op) {
+            *wide.get_mut(v as usize)? = true;
+        }
+        for (i, n) in nodes.iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            let args = &n.args[..n.op.arity()];
+            for (k, &arg) in args.iter().enumerate() {
+                let MOp::Var(v) = nodes[arg as usize].op else {
+                    continue;
+                };
+                let mask = match n.op {
+                    MOp::And => cst[args[1 - k] as usize],
+                    _ => None,
+                };
+                let (Some(slot), Some(flag)) =
+                    (masks.get_mut(v as usize), wide.get_mut(v as usize))
+                else {
+                    return None;
+                };
+                match mask {
+                    Some(c) => {
+                        *slot = Some(match slot {
+                            Some(x) => BitVec::bin_unchecked(BinOp::Or, x, &c),
+                            None => c,
+                        })
+                    }
+                    None => *flag = true,
                 }
             }
         }
     }
-    Compose::new(a, b).prove(meter, &mut report)?;
-    Ok(report)
+    (0..nv)
+        .filter_map(|v| {
+            let mask = masks[v].filter(|_| !wide[v])?;
+            let bits: Vec<u32> = (0..mask.width().bits())
+                .filter(|&j| mask.bit(j).unwrap_or(false))
+                .map(u32::from)
+                .collect();
+            (bits.len() as u32 <= SPLIT_BITS).then_some((v as u32, bits))
+        })
+        .min_by_key(|(_, bits)| bits.len())
+}
+
+/// A variable whose low `j` bits (`1 ≤ j ≤` [`SPLIT_BITS`], `j` below its width) are all
+/// that bitwise operations with constants read of arithmetic over it: `t op k` with `t` built
+/// from variables and constants by `+ − · neg <<`, whose low `j` bits depend only on theirs, and
+/// `k` all zeros or all ones above bit `j`. Once those bits are known, so are the bits `k`
+/// reads (see [`lower_known_bits`]). The variable with the fewest, and that many.
+fn low_var(a: &MbaExpr, b: &MbaExpr) -> Option<(u32, u32)> {
+    use crate::facts::known::{bv_not, leading_zeros};
+    let nv = a.vars().len();
+    let mut need: Vec<u32> = vec![0; nv];
+    for m in [a, b] {
+        let nodes = m.nodes();
+        let live = live(m);
+        let cst = constants(nodes);
+        // Per node: the variables it is arithmetic over (`None` when it reads one otherwise).
+        let mut arith: Vec<Option<u64>> = Vec::with_capacity(nodes.len());
+        for (i, n) in nodes.iter().enumerate() {
+            let args = &n.args[..n.op.arity()];
+            let vars = match n.op {
+                _ if cst[i].is_some() => Some(0),
+                MOp::Var(x) if x < 64 => Some(1u64 << x),
+                MOp::Add | MOp::Sub | MOp::Mul | MOp::Neg | MOp::Shl(_) => args
+                    .iter()
+                    .try_fold(0u64, |acc, &x| Some(acc | arith[x as usize]?)),
+                _ => None,
+            };
+            arith.push(vars);
+        }
+        for (i, n) in nodes.iter().enumerate() {
+            if !live[i] || !matches!(n.op, MOp::And | MOp::Or | MOp::Xor) {
+                continue;
+            }
+            let (x, k) = match (cst[n.args[0] as usize], cst[n.args[1] as usize]) {
+                (None, Some(k)) => (n.args[0], k),
+                (Some(k), None) => (n.args[1], k),
+                _ => continue,
+            };
+            let bits = u32::from(k.width().bits());
+            let len = |c: &BitVec| bits - leading_zeros(c);
+            let j = len(&k).min(len(&bv_not(&k)));
+            if j == 0 || j > SPLIT_BITS || j >= bits {
+                continue;
+            }
+            let Some(mut set) = arith[x as usize] else {
+                continue;
+            };
+            while set != 0 {
+                let v = set.trailing_zeros() as usize;
+                if let Some(nj) = need.get_mut(v) {
+                    *nj = (*nj).max(j);
+                }
+                set &= set - 1;
+            }
+        }
+    }
+    (0..nv)
+        .filter(|&v| need[v] > 0)
+        .min_by_key(|&v| (need[v], v))
+        .map(|v| (v as u32, need[v]))
+}
+
+/// How a split replaces its variable in one case.
+#[derive(Copy, Clone, Debug)]
+enum Case {
+    /// By a constant.
+    Value(BitVec),
+    /// By `(v << j) + b`: onto the values whose low `j` bits are `b`, as `v` ranges over all.
+    Low(u16, BitVec),
+}
+
+impl Case {
+    /// The variable's value in this case where the specialized sides take `x`.
+    fn value(&self, x: &BitVec) -> BitVec {
+        match *self {
+            Case::Value(c) => c,
+            Case::Low(j, b) => BitVec::bin_unchecked(
+                BinOp::Add,
+                &crate::facts::known::bv_shl(x, u32::from(j)),
+                &b,
+            ),
+        }
+    }
+}
+
+/// The variable to split on and its cases: one both sides read only through masks of a few
+/// bits (each assignment of those bits), else one whose low bits are what bitwise operations
+/// with constants read ([`low_var`]; each value of them).
+fn cases(a: &MbaExpr, b: &MbaExpr) -> Option<(u32, Vec<Case>)> {
+    if let Some((v, bits)) = narrow_var(a, b) {
+        let w = *a.vars().get(v as usize)?;
+        let cases = (0..1u64 << bits.len())
+            .map(|case| {
+                let mut value = BitVec::zero(w);
+                for (j, &pos) in bits.iter().enumerate() {
+                    if case >> j & 1 == 1 {
+                        let one = crate::facts::known::bv_shl(&BitVec::one(w), pos);
+                        value = BitVec::bin_unchecked(BinOp::Or, &value, &one);
+                    }
+                }
+                Case::Value(value)
+            })
+            .collect();
+        return Some((v, cases));
+    }
+    let (v, j) = low_var(a, b)?;
+    let w = *a.vars().get(v as usize)?;
+    let cases = (0..1u64 << j)
+        .map(|low| Case::Low(j as u16, BitVec::wrapping_from_u64(w, low)))
+        .collect();
+    Some((v, cases))
+}
+
+/// `m` with variable `v` replaced as `case` says (the variables unchanged).
+fn specialize(m: &MbaExpr, v: u32, case: &Case) -> Option<MbaExpr> {
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
+    for n in m.nodes() {
+        let args: Vec<u32> = n.args[..n.op.arity()]
+            .iter()
+            .map(|&x| map.get(x as usize).copied())
+            .collect::<Option<_>>()?;
+        let r = match (n.op, case) {
+            (MOp::Var(x), Case::Value(c)) if x == v => out.push(MOp::Const(*c), &[]),
+            (MOp::Var(x), Case::Low(j, b)) if x == v => {
+                let x = out.push(n.op, &[]).ok()?;
+                let hi = out.push(MOp::Shl(*j), &[x]).ok()?;
+                let lo = out.push(MOp::Const(*b), &[]).ok()?;
+                out.push(MOp::Add, &[hi, lo])
+            }
+            (MOp::Zext | MOp::Sext | MOp::Trunc, _) => out.push_cast(n.op, args[0], n.width),
+            (op, _) => out.push(op, &args),
+        };
+        map.push(r.ok()?);
+    }
+    Some(out)
+}
+
+/// [`split`] alone, at the top (for tests: the cases, whatever the direct tests would say).
+#[cfg(test)]
+pub(crate) fn by_cases(a: &MbaExpr, b: &MbaExpr) -> Report {
+    let mut report = Report::new();
+    let _ = split(a, b, &mut Steps::new(u64::MAX), 0, &mut report);
+    report
+}
+
+/// Decides `a == b` case by case over a few bits of one variable ([`cases`]): when both read
+/// it only through masks, each assignment of the masked bits is a case (the variable replaced
+/// by that constant, which folds away); when bitwise operations with constants read only its
+/// low bits, each value of those is a case (the variable replaced by `(v << j) + b`, which
+/// makes those operations read known bits). Each case is proved on its own; the cases cover
+/// every input. Proved when every case is; refuted by a case's counterexample (the variable
+/// set to its value in that case). Declines (unknown) when a case is undecided or the cases
+/// spend more than [`SPLIT_EFFORT`].
+fn split<M: Meter>(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    meter: &mut M,
+    depth: u32,
+    report: &mut Report,
+) -> Result<(), M::Err> {
+    let Some((v, cases)) = cases(a, b) else {
+        return Ok(());
+    };
+    let mut last = None;
+    let mut spent = 0u64;
+    for case in &cases {
+        if spent > SPLIT_EFFORT {
+            return Ok(());
+        }
+        let (Some(sa), Some(sb)) = (specialize(a, v, case), specialize(b, v, case)) else {
+            return Ok(());
+        };
+        let before = meter.left();
+        let sub = prove_at(&sa, &sb, meter, depth + 1, false)?;
+        spent = spent.saturating_add(before.saturating_sub(meter.left()));
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+        report.compositional |= sub.compositional;
+        report.known_bits |= sub.known_bits;
+        match sub.verdict {
+            Verdict::Proved => last = sub.cert.or(last),
+            Verdict::Refuted => {
+                let Some(mut point) = sub.counterexample else {
+                    return Ok(());
+                };
+                if let Some(x) = point.get_mut(v as usize) {
+                    *x = case.value(x);
+                }
+                report.verdict = Verdict::Refuted;
+                report.cert = sub.cert;
+                report.split = true;
+                report.counterexample = Some(point);
+                return Ok(());
+            }
+            Verdict::Unknown => return Ok(()),
+        }
+    }
+    report.verdict = Verdict::Proved;
+    report.cert = last;
+    report.split = true;
+    Ok(())
 }
 
 /// A skeleton comparison: its verdict, if a test ran, and for `Refuted` the input.

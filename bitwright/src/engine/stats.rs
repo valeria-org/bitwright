@@ -127,6 +127,12 @@ pub struct CertStats {
     pub exhaustive: u64,
     /// Decided over abstracted atoms.
     pub compositional: u64,
+    /// Decided case by case over a few bits of one variable: bits it is read through a narrow
+    /// mask at (`x & 1`), or low bits that bitwise operations with constants read (`x ^ 1`).
+    pub split: u64,
+    /// Decided after bitwise operations with constants that read only known bits were read as
+    /// arithmetic (`−2·(x & 1) | 1` as `−2·(x & 1) + 1`).
+    pub known_bits: u64,
     /// Points evaluated.
     pub points: u64,
     /// Tests skipped for lack of budget.
@@ -158,6 +164,12 @@ impl CertStats {
             }
             if r.compositional {
                 self.compositional += 1;
+            }
+            if r.split {
+                self.split += 1;
+            }
+            if r.known_bits {
+                self.known_bits += 1;
             }
         }
         self.points += r.points;

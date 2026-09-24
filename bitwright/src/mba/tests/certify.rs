@@ -395,3 +395,155 @@ fn the_sample_uses_constants_and_single_positions() {
             .any(|p| p[0] == BitVec::wrapping_from_u64(w, 1 << 31) && p[1].is_zero())
     );
 }
+
+/// `m` with every use of variable `v` replaced by `v & mask`.
+fn mask_var(m: &MbaExpr, v: u32, mask: BitVec) -> MbaExpr {
+    wrap_var(m, v, MOp::And, mask)
+}
+
+/// `m` with every use of variable `v` replaced by `v op k`.
+fn wrap_var(m: &MbaExpr, v: u32, op: MOp, k: BitVec) -> MbaExpr {
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::new();
+    for n in m.nodes() {
+        let args: Vec<u32> = n.args[..n.op.arity()]
+            .iter()
+            .map(|&x| map[x as usize])
+            .collect();
+        let r = match n.op {
+            MOp::Var(x) if x == v => {
+                let a = out.push(n.op, &[]).unwrap();
+                let c = out.push(MOp::Const(k), &[]).unwrap();
+                out.push(op, &[a, c]).unwrap()
+            }
+            MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(n.op, args[0], n.width).unwrap(),
+            op => out.push(op, &args).unwrap(),
+        };
+        map.push(r);
+    }
+    out
+}
+
+#[test]
+fn a_variable_read_through_a_narrow_mask_is_split_into_cases() {
+    let w = Width::W64;
+    let vars = [w; 5];
+    let (x1, x2, x3, x4, x5) = (V(0), V(1), V(2), V(3), V(4));
+    // 1 − 2·(x & 1) is ±1, so its square is 1; no test on the whole decides it (x3 & 1 is an
+    // atom that abstraction frees from being a bit).
+    let sign = |x: T| add(k(w, 1), mul(and(x, k(w, 1)), k(w, -2)));
+    let sign_or = |x: T| or(mul(and(x, k(w, 1)), k(w, -2)), k(w, 1));
+    let sum = add(x1.clone(), x2.clone());
+    let cases = [
+        mul(mul(sum.clone(), sign(x3.clone())), sign(x3.clone())),
+        mul(mul(sum.clone(), sign_or(x3.clone())), sign_or(x3.clone())),
+    ];
+    for a in &cases {
+        let r = check(&a.expr(&vars), &sum.expr(&vars), true);
+        assert_eq!(r.verdict, Verdict::Proved, "{a:?}: {r:?}");
+        assert!(r.split, "{a:?}");
+    }
+    // Two variables, one split inside the other.
+    let a = add(
+        mul(mul(sum.clone(), sign(x3.clone())), sign(x3.clone())),
+        mul(
+            mul(add(x5.clone(), k(w, 3)), sign(x4.clone())),
+            sign(x4.clone()),
+        ),
+    );
+    let b = add(sum.clone(), add(x5.clone(), k(w, 3)));
+    let r = check(&a.expr(&vars), &b.expr(&vars), true);
+    assert_eq!((r.verdict, r.split), (Verdict::Proved, true), "{r:?}");
+    // Wrong: refuted with the variable set to the case that differs (x3 odd).
+    let a = mul(sum.clone(), sign(x3.clone())).expr(&vars);
+    let r = check(&a, &sum.expr(&vars), false);
+    assert_eq!(r.verdict, Verdict::Refuted, "{r:?}");
+    // Read whole, but through `x3 ^ 1` only at its low bit: split on that bit, x3 standing for
+    // (x3 << 1) + b. (x3 ^ 1) − x3 is 1 − 2·(x3 & 1).
+    let flip = || sub(xor(x3.clone(), k(w, 1)), x3.clone());
+    let a = mul(mul(sum.clone(), flip()), flip());
+    let r = check(&a.expr(&vars), &sum.expr(&vars), true);
+    assert_eq!((r.verdict, r.split), (Verdict::Proved, true), "{r:?}");
+    let r = check(
+        &mul(sum.clone(), flip()).expr(&vars),
+        &sum.expr(&vars),
+        false,
+    );
+    assert_eq!(r.verdict, Verdict::Refuted, "{r:?}");
+    // Also read whole: split on its low bit instead (`x3 & 1` reads only that).
+    let a = add(
+        mul(mul(sum.clone(), sign(x3.clone())), sign(x3.clone())),
+        x3.clone(),
+    );
+    let b = add(sum.clone(), x3.clone());
+    let r = certify::by_cases(&a.expr(&vars), &b.expr(&vars));
+    assert_eq!((r.verdict, r.split), (Verdict::Proved, true), "{r:?}");
+    // No bitwise operation with a constant: nothing to split on.
+    let a = mul(and(x1.clone(), x2.clone()), x3.clone());
+    let b = mul(x3.clone(), and(x2.clone(), x1.clone()));
+    assert!(!certify::by_cases(&a.expr(&vars), &b.expr(&vars)).split);
+    // The prover counts it.
+    let p = NativeProver::default();
+    let (a, b) = (cases[0].expr(&vars), sum.expr(&vars));
+    assert_eq!(
+        p.prove_equal(&a, &b, &MbaBudget::default()),
+        Verdict::Proved
+    );
+    assert_eq!(p.stats().split, 1);
+}
+
+#[test]
+fn splits_agree_with_exhaustive_truth() {
+    let (mut proved, mut refuted, mut split) = (0, 0, 0);
+    for w in 2..=6u16 {
+        let width = Width::new(w).unwrap();
+        let t = if w <= 4 { 3 } else { 2 };
+        let masks: Vec<BitVec> = [1u64, 0b101, 1 << (w - 1), 0b1111]
+            .iter()
+            .map(|&m| BitVec::wrapping_from_u64(width, m))
+            .collect();
+        for (i, (a, b)) in pairs(Frag::Any, w, t, 0x5b17_0000 + u64::from(w), 60)
+            .into_iter()
+            .enumerate()
+        {
+            let mask = masks[i % masks.len()];
+            let (ma, mb) = (mask_var(&a, 0, mask), mask_var(&b, 0, mask));
+            let other = masks[(i / masks.len()) % masks.len()];
+            let flip = BitVec::wrapping_from_i128(width, [1, 3, -2, 5][i % 4]);
+            for (x, y) in [
+                (ma.clone(), mb.clone()),
+                (mask_var(&ma, 1, other), mask_var(&mb, 1, other)),
+                (ma.clone(), b.clone()),
+                (
+                    wrap_var(&a, 0, MOp::Xor, flip),
+                    wrap_var(&b, 0, MOp::Xor, flip),
+                ),
+                (
+                    wrap_var(&a, 1, MOp::Or, flip),
+                    wrap_var(&b, 1, MOp::Or, flip),
+                ),
+            ] {
+                let truth = equal_everywhere(&x, &y);
+                let r = certify::by_cases(&x, &y);
+                match r.verdict {
+                    Verdict::Proved => {
+                        assert!(truth, "split proved an unequal pair:\n{x:?}\n{y:?}");
+                        proved += 1;
+                    }
+                    Verdict::Refuted => {
+                        assert!(!truth, "split refuted an equal pair:\n{x:?}\n{y:?}");
+                        let p = r.counterexample.clone().expect("a counterexample");
+                        assert_ne!(x.eval(&p), y.eval(&p), "not a counterexample: {p:?}");
+                        refuted += 1;
+                    }
+                    Verdict::Unknown => {}
+                }
+                split += u32::from(r.split);
+                assert_eq!(r.internal, 0);
+            }
+        }
+    }
+    // Every decided pair was decided by cases.
+    assert_eq!(split, proved + refuted);
+    assert!(proved > 100 && refuted > 100, "{proved} {refuted}");
+}
