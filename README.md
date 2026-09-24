@@ -65,6 +65,33 @@ fn main() -> Result<(), bitwright::Error> {
   equality-saturation search, and SMT-LIB export and import, so any SMT solver can prove a rule
   at any width.
 
+## Performance
+
+Measured on bitwright 0.5.0 with `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one
+performance core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's
+CPU time. Instructions retired are the suite's main metric: they don't move with machine load,
+so they are what to compare a change by ([how the suite measures](docs/benchmarking.md)).
+
+| Operation | CPU time | Instructions |
+|-|-|-|
+| A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 157 to 169 |
+| A 512-bit multiplication / division | 29 ns / 1.3 µs | 831 / 38,457 |
+| Building a node (hash-consing and canonicalization) | 49 ns | 1,020 |
+| Evaluating a node | 29 ns | 482 |
+| The facts of a node, computed (known bits and ranges) | 0.41 to 0.53 µs | 5,610 to 6,780 |
+| A cached fact query | 28 ns | 378 |
+| Parsing a 60-node expression | 16 µs | 270,000 |
+| Simplifying a random 40-node expression | 0.37 ms | 5.5 M |
+| Simplifying in a fresh three-node context | 4.6 µs | 77,600 |
+| Deobfuscating a linear MBA expression (native solver) | 0.37 ms | 4.9 M |
+| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 0.46 ms | 11.8 M |
+| Building an engine (compiling the rule corpus) | 76 µs | 1.5 M |
+| SMT-LIB export / import, per node | 0.28 / 0.56 µs | 7,540 / 13,330 |
+
+On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 84
+nodes and 20 nonlinear ones from 141 to 34 (the signature solver: 93 and 73). bitwright proves
+every answer itself.
+
 ## Installation
 
 ```sh
