@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Floating-point guards.** Rules can ask the facts about a float: `fp.not_nan<E, S>(x)`,
+  `fp.finite<E, S>(x)` and `fp.nonzero<E, S>(x)` are fact predicates (`FactPred::FpNotNan`,
+  `FpFinite`, `FpNonZero`, the format's infinity as their second operand), true only when
+  proven. So identities that hold only on ordinary numbers are rules: `x · 1 = x` if `x` is
+  not a NaN, `x / x = 1` if it is finite and nonzero. The checker, the SMT obligations and the
+  engine (from the operand's facts, read as floats) answer them.
+
 ## 0.9.0
 
 - **Floating point.** IEEE 754 binary floating point on bit-vectors holding interchange

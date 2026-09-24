@@ -239,6 +239,18 @@ fn node(out: &mut String, rule: &Rule, n: NodeId, widths: &[u16]) -> Result<Stri
                     let m = arg(*m)?;
                     format!("(= (bvand {} {m}) {m})", name(*x))
                 }
+                FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
+                    let w = bvw(*x)?;
+                    let smax = literal(&crate::BitVec::smax(
+                        crate::Width::new(w).map_err(|e| Error::Contract(e.to_string()))?,
+                    ));
+                    let mag = format!("(bvand {} {smax})", name(*x));
+                    match p {
+                        FactPred::FpNotNan => format!("(bvule {mag} {})", arg(*m)?),
+                        FactPred::FpFinite => format!("(bvult {mag} {})", arg(*m)?),
+                        _ => format!("(not (= {mag} {}))", zero(w)),
+                    }
+                }
             }
         }
         RNode::ConstP(p, a) => {

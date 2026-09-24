@@ -285,6 +285,18 @@ fn may(f: FpFormat, x: &Floats, t: crate::fp::FpTest) -> bool {
     }
 }
 
+/// Whether an encoding of `f` with facts `x` may be a NaN, an infinity, a zero: what a rule's
+/// floating-point guard predicates ask (each "no" a proof).
+pub(crate) fn may_be(f: FpFormat, x: &Facts) -> (bool, bool, bool) {
+    use crate::fp::FpTest;
+    let d = decode(f, x);
+    (
+        d.nan,
+        may(f, &d, FpTest::Infinite),
+        may(f, &d, FpTest::Zero),
+    )
+}
+
 /// The facts of a floating-point operation's result.
 pub(crate) fn transfer(d: &Desc, args: &[&Facts]) -> Facts {
     use crate::fp::FpTest;

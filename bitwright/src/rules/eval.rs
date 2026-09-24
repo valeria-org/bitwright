@@ -7,7 +7,7 @@ use super::ir::{
 use crate::facts::known::{bv_and, count_ones, low_mask};
 use crate::fp::node::Desc;
 use crate::fp::{FpFormat, FpKind, FpOp, RoundingMode};
-use crate::ops::{BinOp, UnOp};
+use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::{BitVec, Width};
 
 /// A value of a rule node.
@@ -330,6 +330,15 @@ pub(crate) fn eval(
                 FactPred::OneBits => {
                     let mv = bv((*m)?)?;
                     bv_and(&xv?, &mv) == mv
+                }
+                FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
+                    let (x, inf) = (xv?, bv((*m)?)?);
+                    let mag = bv_and(&x, &BitVec::smax(x.width()));
+                    match p {
+                        FactPred::FpNotNan => BitVec::cmp_unchecked(CmpOp::Ule, &mag, &inf),
+                        FactPred::FpFinite => BitVec::cmp_unchecked(CmpOp::Ult, &mag, &inf),
+                        _ => !mag.is_zero(),
+                    }
                 }
             })
         }

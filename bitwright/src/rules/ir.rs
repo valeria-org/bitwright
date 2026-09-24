@@ -318,6 +318,13 @@ pub enum FactPred {
     Disjoint,
     /// `proves(a op b)`: the comparison holds.
     Proves,
+    /// `fp.not_nan(x)`: the float `x` is not a NaN. The second operand is the format's +∞
+    /// (a [`Literal::Float`]), which names the format: `x & smax <=u ∞`.
+    FpNotNan,
+    /// `fp.finite(x)`: `x` is neither a NaN nor an infinity: `x & smax <u ∞`.
+    FpFinite,
+    /// `fp.nonzero(x)`: `x` is not a zero of either sign: `x & smax != 0`.
+    FpNonZero,
 }
 
 /// Predicates on constants, decided exactly.

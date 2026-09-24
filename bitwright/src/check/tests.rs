@@ -1123,3 +1123,70 @@ fn floating_point_rules_are_validated() {
         assert!(codes(&e).contains(&code), "{body}: {:?}", codes(&e));
     }
 }
+
+#[test]
+fn floating_point_guards_are_checked_and_answered_by_facts() {
+    // The value identities hold where the guard says the operand is an ordinary number.
+    for body in [
+        "rule mul_one<E, S>(x: E + S, r: rm) { \
+            fp.mul.r<E, S>(x, fp.one<E, S>) => x if fp.not_nan<E, S>(x) }",
+        "rule add_nzero<E, S>(x: E + S) { \
+            fp.add.rne<E, S>(x, fp.nzero<E, S>) => x if fp.not_nan<E, S>(x) }",
+        "rule add_nzero_any<E, S>(x: E + S, r: rm) { \
+            fp.add.r<E, S>(x, fp.nzero<E, S>) => x if fp.not_nan<E, S>(x) && fp.nonzero<E, S>(x) }",
+        "rule div_self<E, S>(x: E + S, r: rm) { \
+            fp.div.r<E, S>(x, x) => fp.one<E, S> if fp.finite<E, S>(x) && fp.nonzero<E, S>(x) }",
+        "rule eq_self<E, S>(x: E + S) { fp.eq<E, S>(x, x) => true if fp.not_nan<E, S>(x) }",
+    ] {
+        let c = check_fp(body);
+        assert!(c.is_sound(), "{body}\n{:?}\n{}", c.verdict, c.evidence);
+    }
+    for (body, why) in [
+        (
+            "rule mul_one<E, S>(x: E + S, r: rm) { \
+                fp.mul.r<E, S>(x, fp.one<E, S>) => x if fp.nonzero<E, S>(x) }",
+            "a NaN is not a zero",
+        ),
+        (
+            "rule add_nzero<E, S>(x: E + S, r: rm) { \
+                fp.add.r<E, S>(x, fp.nzero<E, S>) => x if fp.not_nan<E, S>(x) }",
+            "+0 + -0 is -0 toward -inf",
+        ),
+        (
+            "rule div_self<E, S>(x: E + S, r: rm) { \
+                fp.div.r<E, S>(x, x) => fp.one<E, S> if fp.finite<E, S>(x) }",
+            "0 / 0 is a NaN",
+        ),
+    ] {
+        match check_fp(body).verdict {
+            Verdict::Unsound(_) => {}
+            v => panic!("{why}: expected a counterexample for\n{body}\ngot {v:?}"),
+        }
+    }
+    // A fact predicate cannot be negated.
+    let e = compile_err(
+        "rule t<E, S>(x: E + S, r: rm) { \
+            fp.mul.r<E, S>(x, fp.one<E, S>) => x if !fp.not_nan<E, S>(x) }",
+    );
+    assert!(codes(&e).contains(&"BW0106"), "{:?}", codes(&e));
+    // Applied only where the facts prove the guard: an integer converted to a float is never
+    // a NaN, a free float may be one.
+    let p = program(
+        "#[allow(BW0407)]
+        rule mul_one<E, S>(x: E + S, r: rm) {
+            fp.mul.r<E, S>(x, fp.one<E, S>) => x if fp.not_nan<E, S>(x)
+        }",
+    );
+    let (cx, _, out) = apply_to(
+        &p,
+        "mul_one",
+        "fp.mul.rtz.f64(fp.from_sbv.rne.f64(i:32), 0x3ff0000000000000)",
+        64,
+    );
+    assert_eq!(
+        cx.display(out.unwrap()).to_string(),
+        "fp.from_sbv.rne.f64(i)"
+    );
+    let (_, _, out) = apply_to(&p, "mul_one", "fp.mul.rne.f64(x, 0x3ff0000000000000)", 64);
+    assert!(out.is_none());
+}

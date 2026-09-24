@@ -45,8 +45,10 @@ width. A literal that does not fit at some admitted width is a compile error, ne
 
 - *fact predicates*, true only when the facts prove them: `zero_bits(x, m)` (every bit of the
   mask `m` is zero in `x`), `one_bits(x, m)`, `nonzero(x)`, `disjoint(x, y)` (no bit is one in
-  both), and `proves(a op b)` for a comparison of parameters, literals and `let`s. Fact
-  predicates cannot be negated: the facts can only prove, never refute.
+  both), and `proves(a op b)` for a comparison of parameters, literals and `let`s; on a
+  float of a format, `fp.not_nan<E, S>(x)`, `fp.finite<E, S>(x)` (neither a NaN nor an
+  infinity) and `fp.nonzero<E, S>(x)` (not a zero of either sign). Fact predicates cannot be
+  negated: the facts can only prove, never refute.
 - *constant predicates* on `const` parameters: `is_pow2`, `is_lowmask`, `is_shifted_mask`.
 - *pure conditions*: comparisons and arithmetic over `const` parameters, literals and `let`s.
 
@@ -94,6 +96,19 @@ builder makes from other operators (`fp.neg`, `fp.abs`, `fp.copysign`, `fp.sub`,
 of them matches what it builds. They have no floating-point node of their own, so a pattern
 whose format is generic must also contain an operation that is one (it binds `E` apart from
 `S`), or name its format. x87's load and store are not available in rules.
+
+The fact predicates on floats let a rule use an identity that holds only on ordinary numbers:
+`x · 1` is `x` except for a NaN operand (whose payload the product drops), so
+
+```text
+rule mul_one<E, S>(x: E + S, r: rm) {
+    fp.mul.r<E, S>(x, fp.one<E, S>) => x
+    if fp.not_nan<E, S>(x)
+}
+```
+
+rewrites `fp.mul.rtz.f64(fp.from_sbv.rne.f64(i), 1.0)`, whose operand the facts know is no NaN,
+and leaves `x · 1.0` of an unknown `x` alone.
 
 ```rust
 use bitwright::check::{CheckConfig, Verdict, check_program};

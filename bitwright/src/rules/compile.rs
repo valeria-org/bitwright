@@ -868,6 +868,45 @@ impl Parser<'_> {
             b.fix(n, SV::Bv(w), sp)?;
             return Ok(n);
         }
+        if let Some(pred) = match op {
+            "not_nan" => Some(FactPred::FpNotNan),
+            "finite" => Some(FactPred::FpFinite),
+            "nonzero" => Some(FactPred::FpNonZero),
+            _ => None,
+        } {
+            // A guard predicate on a float, true only when the facts prove it.
+            let rest: Vec<&str> = parts.collect();
+            let (eb, sb) = match rest.as_slice() {
+                [] => {
+                    let g = self.generics(b, 2)?;
+                    (g[0].clone(), g[1].clone())
+                }
+                [f] => {
+                    let f = FpFormat::from_name(f).ok_or_else(|| {
+                        bad(format!(
+                            "`{f}` is not a format name (f16, bf16, f32, f64, f128, f256)"
+                        ))
+                    })?;
+                    (konst(f.eb()), konst(f.sb()))
+                }
+                _ => return Err(bad(format!("`fp.{op}` takes one format"))),
+            };
+            let x = self.args(b, depth, 1)?[0];
+            let sp = span(self);
+            let fw = eb.add(&sb, 1).ok_or_else(|| too_big(sp))?;
+            b.fix(x, SV::Bv(fw.clone()), sp)?;
+            let inf = b.node(
+                RNode::Lit(Literal::Float {
+                    value: FloatLit::Inf,
+                    eb,
+                }),
+                sp,
+            )?;
+            b.fix(inf, SV::Bv(fw), sp)?;
+            let n = b.node(RNode::Fact(pred, x, Some(inf)), sp)?;
+            b.fix(n, SV::Bool, sp)?;
+            return Ok(n);
+        }
         let (base, rm_word, named) = crate::fp::syntax::split_name(name).map_err(bad)?;
         let rounding = match rm_word {
             None => None,

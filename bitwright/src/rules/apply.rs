@@ -3,7 +3,7 @@
 //! against.
 
 use super::eval::{eval, literal, width_of};
-use super::ir::{FactPred, NodeId, ParamKind, RNode, Rule};
+use super::ir::{FactPred, Literal, NodeId, ParamKind, RNode, Rule};
 use super::matcher::{Bindings, Match};
 use crate::expr::Context;
 use crate::facts::known::bv_and;
@@ -193,6 +193,21 @@ fn holds(
                 FactPred::Disjoint => {
                     let fy = operand_facts(env, cx, rule, b, (*m)?, widths, consts, lets)?;
                     bv_and(&fx.known().maybe_one(), &fy.known().maybe_one()).is_zero()
+                }
+                FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
+                    // The format: the infinity literal's exponent width, and `x`'s width.
+                    let RNode::Lit(Literal::Float { eb, .. }) = &rule.nodes[(*m)? as usize] else {
+                        return None;
+                    };
+                    let eb = u32::try_from(eb.eval(widths)).ok()?;
+                    let w = u32::from(fx.width().bits());
+                    let f = crate::fp::FpFormat::new(eb, w.checked_sub(eb)?).ok()?;
+                    let (nan, inf, zero) = crate::facts::fp_may_be(f, &fx);
+                    match p {
+                        FactPred::FpNotNan => !nan,
+                        FactPred::FpFinite => !nan && !inf,
+                        _ => !zero,
+                    }
                 }
                 FactPred::Proves => {
                     let RNode::Cmp(op, l, r) = &rule.nodes[*x as usize] else {

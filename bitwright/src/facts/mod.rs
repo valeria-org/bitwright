@@ -29,6 +29,7 @@ use crate::expr::{Context, Expr, OpCode};
 use crate::hash::IdMap;
 use crate::ops::{CmpOp, CmpOpExt, UnOp};
 use crate::{BitVec, Width};
+pub(crate) use fp::may_be as fp_may_be;
 use range::{sle, slt, ule, ult};
 pub(crate) use transfer::decide as decide_cmp;
 use transfer::{TOp, decide, transfer};

@@ -965,6 +965,14 @@ group fp {
         fp.to_sbv.q<E, S, W>(fp.round.r<E, S>(x)) => fp.to_sbv.r<E, S, W>(x)
     }
     #[allow(BW0407)]
+    rule mul_one_number<E, S>(x: E + S, r: rm) {
+        fp.mul.r<E, S>(x, fp.one<E, S>) => x if fp.not_nan<E, S>(x)
+    }
+    #[allow(BW0407)]
+    rule div_self<E, S>(x: E + S, r: rm) {
+        fp.div.r<E, S>(x, x) => fp.one<E, S> if fp.finite<E, S>(x) && fp.nonzero<E, S>(x)
+    }
+    #[allow(BW0407)]
     rule mul_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
 }
 ";

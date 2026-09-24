@@ -476,6 +476,24 @@ fn steer(rule: &Rule, widths: &[u16], params: &mut [BitVec], rng: &mut Rng) {
                             &params[i],
                             &BitVec::un_unchecked(crate::ops::UnOp::Not, &m),
                         ),
+                        // Below the infinity: clear the exponent's top bit.
+                        (FactPred::FpNotNan | FactPred::FpFinite, _) if w.bits() >= 2 => {
+                            BitVec::bin_unchecked(
+                                BinOp::And,
+                                &params[i],
+                                &BitVec::un_unchecked(
+                                    crate::ops::UnOp::Not,
+                                    &BitVec::bin_unchecked(
+                                        BinOp::Shl,
+                                        &BitVec::one(w),
+                                        &BitVec::wrapping_from_u64(w, u64::from(w.bits() - 2)),
+                                    ),
+                                ),
+                            )
+                        }
+                        (FactPred::FpNonZero, _) => {
+                            BitVec::bin_unchecked(BinOp::Or, &params[i], &BitVec::one(w))
+                        }
                         (FactPred::OneBits, Some(m)) if m.width() == w => {
                             BitVec::bin_unchecked(BinOp::Or, &params[i], &m)
                         }
