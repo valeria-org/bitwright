@@ -151,7 +151,7 @@ for a later call with more budget. It remembers its recent answers (`NfOptions::
 saves time when the engine asks again and never changes an answer. It is not the library's
 default solver: pass it to `mba_solver` (the command line's `simplify` uses it, on bitwright's
 own evidence only). Of the 76,080 expressions of CoBRA's MBA datasets, it brings every one
-whose ground truth agrees with its input (75,737) to the ground truth's size or less, 22,644
+whose ground truth agrees with its input (75,737) to the ground truth's size or less, 22,677
 smaller; CoBRA itself reaches 85.0 % of them. See `compare/` in the repository.
 
 ```rust

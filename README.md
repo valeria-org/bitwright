@@ -72,46 +72,55 @@ fn main() -> Result<(), bitwright::Error> {
 
 ## Performance
 
-bitwright 0.8.0 against other tools, each on what it is built for, on one performance core of
-an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every answer is read into bitwright, sized in DAG
-nodes of its canonical form (a shared subterm counts once) and checked against its input; no
-tool gave a wrong answer. [`compare/`](compare/README.md) reproduces the tables, and
+bitwright 0.9.0, with the changes since (see the changelog), against other tools, each on what
+it is built for, on one performance core of an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every
+answer is read into bitwright, sized in DAG nodes of its canonical form (a shared subterm counts
+once) and checked against its input; no tool gave a wrong answer.
+[`compare/`](compare/README.md) reproduces the tables, and
 [docs/benchmarking.md](docs/benchmarking.md#reference-numbers) has bitwright's own costs per
 operation.
 
-**Bit-vector simplification, against z3 and Bitwuzla.** Random DAGs, 200 of each, over the
+**Simplification, against z3 and Bitwuzla.** Random DAGs, 200 of each, over the
 operators SMT-LIB has natively: arithmetic, bitwise operations, shifts, comparisons under
 `ite`, truncations extended back, and in one row division, remainder and shifts by variable
 amounts. Each tool starts from the same SMT-LIB text and is timed in process from it to its
 answer, parsing included: bitwright's `Engine::standard()`, z3 5.1.0's `simplify` and Bitwuzla
 0.9.1's `simplify_term`, with default settings. Nodes after simplification (the 200 summed) and
-the median time per DAG:
+the median time per DAG. The floating-point rows are random DAGs of 40 operations over six
+float atoms in SMT-LIB's FloatingPoint theory, with only what SMT-LIB specifies (arithmetic,
+fused multiply-adds, roots, remainders, rounding to integral values, sign operations, format
+round trips, choices on comparisons and tests); their answers are compared as SMT-LIB values:
 
 | Random DAGs | Before | bitwright | z3 | Bitwuzla |
 |-|-:|-:|-:|-:|
-| 40 nodes, 8 bits | 10,895 | **9,268**, 0.21 ms | 63,134, 0.43 ms | 14,981, 0.16 ms |
-| 40 nodes, 64 bits | 11,092 | **9,562**, 0.22 ms | 568,936, 2.3 ms | 15,331, 0.17 ms |
-| 40 nodes, 64 bits, with division and variable shifts | 10,988 | **9,476**, 0.20 ms | 410,571, 1.6 ms | 16,005, 0.17 ms |
-| 400 nodes, 64 bits | 59,852 | **52,831**, 2.5 ms | 3,691,595, 13 ms | 90,233, 0.67 ms |
+| 40 nodes, 8 bits | 10,895 | **9,268**, 0.16 ms | 63,134, 0.44 ms | 14,981, 0.16 ms |
+| 40 nodes, 64 bits | 11,092 | **9,562**, 0.17 ms | 568,936, 2.3 ms | 15,331, 0.17 ms |
+| 40 nodes, 64 bits, with division and variable shifts | 10,988 | **9,476**, 0.16 ms | 410,571, 1.6 ms | 16,005, 0.17 ms |
+| 400 nodes, 64 bits | 59,852 | **52,831**, 1.8 ms | 3,691,595, 13 ms | 90,233, 0.67 ms |
+| 40 floats, binary32 | 10,677 | **10,297**, 0.09 ms | 10,698, 0.20 ms | 11,650, 0.14 ms |
+| 40 floats, binary64 | 10,686 | **10,306**, 0.09 ms | 10,707, 0.20 ms | 11,659, 0.14 ms |
 
-bitwright's answer is the smallest of the three for 799 of the 800 DAGs. The solvers are built
-to decide satisfiability, which bitwright does not do, and they simplify toward that, not toward
-small expressions: z3 splits bitwise operations with constants into slices of bits, and
-Bitwuzla writes `|` and `−` with `&`, `~` and `+`, so their answers are almost always larger
-than the input. Bitwuzla is faster: about 1.2 to 1.3 times on 40 nodes and 3.7 times on 400.
+bitwright's answer is the smallest of the three for 799 of the 800 bit-vector DAGs and 392 of
+the 400 floating-point ones. The solvers are built to decide satisfiability, which bitwright
+does not do, and they simplify toward that, not toward small expressions: z3 splits bitwise
+operations with constants into slices of bits, and Bitwuzla writes `|` and `−` with `&`, `~`
+and `+`, so their answers are almost always larger than the input. On 40 bit-vector nodes
+bitwright and Bitwuzla take the same time; on 400, Bitwuzla is 2.7 times faster. On floats
+bitwright is the fastest.
 
-**Bit-vector identities, against z3 and Bitwuzla.** 580 identities in six sets, written from
-textbook mathematics rather than from any tool's rules ([`compare/facts/`](compare/facts)):
+**Identities, against z3 and Bitwuzla.** 651 identities in seven sets, written from textbook
+mathematics and IEEE 754 rather than from any tool's rules ([`compare/facts/`](compare/facts)):
 bit-vector algebra (Boolean algebra, ring arithmetic, two's complement, shifts, rotations,
-extraction and extension, division, comparisons, if-then-else, known bits), number theory
-modulo 2^w, the unsigned and signed orders, bit slices, bit tricks and canonical forms; not
-mixed boolean-arithmetic ones (those are CoBRA's datasets below). Each runs at 8 and 64 bits,
-over plain variables and over compound terms (2,320 cases), from its unsimplified side, and is
-solved when the answer is no larger than the simpler side. bitwright runs as the library's
-`Engine::standard()` and as the command line's `simplify` (the MBA service and its normal-form
-solver on top). z3 and Bitwuzla prove every identity at 8 bits, and at 64 bits all but three
-(quotient times divisor plus remainder, unsigned and signed, and `(~x)² − x² = 2x + 1`), which
-neither finishes in ten minutes.
+extraction and extension, division, comparisons, if-then-else, known bits), number theory modulo
+2^w, the unsigned and signed orders, bit slices, bit tricks, canonical forms and floating point
+(sign operations, classification, comparisons, arithmetic, rounding, conversions); not mixed
+boolean-arithmetic ones (those are CoBRA's datasets below). Each runs at 8 and 64 bits (floating
+point in binary32 and binary64), over plain variables and over compound terms (2,604 cases),
+from its unsimplified side, and is solved when the answer is no larger than the simpler side.
+bitwright runs as the library's `Engine::standard()` and as the command line's `simplify` (the
+MBA service and its normal-form solver on top). z3 and Bitwuzla prove every identity at 8 bits,
+and at 64 bits all but three (quotient times divisor plus remainder, unsigned and signed, and
+`(~x)² − x² = 2x + 1`), which neither finishes in ten minutes.
 
 | Fact set | Cases | bitwright | bitwright `simplify` | z3 | Bitwuzla |
 |-|-:|-:|-:|-:|-:|
@@ -121,14 +130,17 @@ neither finishes in ten minutes.
 | Bit slices | 132 | 68 | **98** | 84 | 58 |
 | Bit tricks | 140 | 48 | **80** | 31 | 15 |
 | Canonical forms | 100 | 64 | 72 | **84** | 42 |
-| All | 2,320 | 1,578 (68 %) | **1,770 (76 %)** | 1,109 (48 %) | 871 (38 %) |
+| Floating point | 284 | **260** | **260** | 180 | 208 |
+| All | 2,604 | 1,838 (71 %) | **2,030 (78 %)** | 1,289 (50 %) | 1,079 (41 %) |
 
-On these small expressions bitwright is also the fastest, with a median of 11 µs per case (14 µs
-as `simplify`) against 69 µs for Bitwuzla and 98 µs for z3. `versus-smt --facts` prints
+On these small expressions bitwright is also the fastest, with a median of 10 µs per case (13 µs
+as `simplify`) against 71 µs for Bitwuzla and 98 µs for z3. `versus-smt --facts` prints
 every group and what each tool misses. bitwright's gaps are minimum and maximum written with
 `ite` (it does not see that `ite(x <u y, x, y)` and `ite(y <u x, y, x)` are one function), order
 relations (transitivity, `x & y <=u y`), bit tests through masks, concatenation, if-then-else,
-and the parity of products.
+and the parity of products. In floating point it leaves the six identities that hold only on
+values, not on bit patterns (a NaN operand's payload is lost on one side), which Bitwuzla,
+whose floats have one NaN, uses in eight cases.
 
 **MBA, against CoBRA.** The MBA datasets [CoBRA](https://github.com/trailofbits/CoBRA)
 collects: 76,080 expressions (SiMBA, GAMBA, NeuReduce, MBA-Obfuscator, MBA-Solver, QSynth,
@@ -138,7 +150,7 @@ text to the answer, parsing included.
 
 | Tool | Solved | The ground truth exactly | Median | 95th percentile |
 |-|-:|-:|-:|-:|
-| bitwright, `NormalFormSolver` | **75,737 (100 %)** | **49,852** | **0.30 ms** | **4.3 ms** |
+| bitwright, `NormalFormSolver` | **75,737 (100 %)** | **49,852** | **0.26 ms** | **4.1 ms** |
 | CoBRA (C++, af44b8a) | 64,396 (85.0 %) | 47,797 | 1.4 ms | 171 ms |
 
 bitwright proves each of its answers itself; this is the configuration the command line's

@@ -102,25 +102,31 @@ whose facts are measured. It runs with the counters paused.
 
 ## Reference numbers
 
-bitwright 0.8.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
+bitwright 0.9.0 with the unreleased changes (the floating-point rules and the MBA certificates'
+point generation), `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
 core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's CPU time;
 instructions are the median.
 
 | Operation | CPU time | Instructions |
 |-|-|-|
-| A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 157 to 169 |
-| A 512-bit multiplication / division | 31 ns / 1.3 µs | 831 / 38,458 |
-| Building a node (hash-consing and canonicalization) | 48 ns | 1,024 |
-| Evaluating a node | 29 ns | 482 |
-| The facts of a node, computed (known bits and ranges) | 0.21 to 0.24 µs up to 128 bits, 0.45 µs at 512 | 2,630 to 3,010 up to 128 bits, 8,050 at 512 |
-| A cached fact query | 33 ns | 379 |
-| Parsing a 60-node expression | 16 µs | 270,000 |
-| Simplifying a random 40-node expression | 0.35 ms | 5.2 M |
-| Simplifying in a fresh three-node context | 3.9 µs | 71,300 |
-| Deobfuscating a linear MBA expression (native solver) | 0.38 ms | 4.9 M |
-| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 1.3 ms | 36 M |
-| Building an engine (linking the built-in rules) | 5.8 µs | 90,300 |
-| SMT-LIB export / import, per node | 0.26 / 0.55 µs | 7,550 / 13,340 |
+| A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 149 to 161 |
+| A 512-bit multiplication / division | 30 ns / 1.3 µs | 823 / 38,450 |
+| A binary32 operation (add, mul, div, sqrt, fma) | 17 to 21 ns | 325 to 459 |
+| A binary64 operation (add, mul, div, sqrt, fma) | 18 to 30 ns | 406 to 635 |
+| A binary128 operation (add, mul, div, sqrt, fma) | 56 to 193 ns | 1,470 to 3,400 |
+| Building a node (hash-consing and canonicalization) | 49 ns | 993 |
+| Evaluating a node / a floating-point node | 28 ns / 47 ns | 442 / 777 |
+| The facts of a node, computed (known bits and ranges) | 0.21 to 0.23 µs up to 128 bits, 0.46 µs at 512 | 2,600 to 2,980 up to 128 bits, 8,030 at 512 |
+| The facts of a floating-point node, computed | 0.19 µs | 3,160 |
+| A cached fact query | 28 ns | 379 |
+| Parsing a 60-node expression | 16 µs | 273,000 |
+| Simplifying a random 40-node expression | 0.16 ms | 2.5 M |
+| Simplifying a random 40-node floating-point expression | 40 µs | 721,000 |
+| Simplifying in a fresh three-node context | 3.8 µs | 67,700 |
+| Deobfuscating a linear MBA expression (native solver) | 0.36 ms | 4.4 M |
+| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 0.68 ms | 17 M |
+| Building an engine (linking the built-in rules) | 6.2 µs | 95,700 |
+| SMT-LIB export / import, per node | 0.28 / 0.55 µs | 7,550 / 13,180 |
 
 On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 83
 nodes and 20 nonlinear ones from 141 to 25 (the signature solver: 92 and 71).
@@ -147,7 +153,8 @@ Miasm. Every answer is checked against its input and sized in bitwright's canoni
 all engines are scored the same way: how often each reaches the dataset's ground truth, how
 fast, and with how much heap. Its `versus-smt` compares bitwright's simplifier with the
 simplifiers of z3 and Bitwuzla, through their C APIs, on random bit-vector DAGs over the
-operators SMT-LIB has natively and on 580 identities in six fact sets (`compare/facts/`:
-bit-vector algebra, number theory, orders, slices, bit tricks, canonical forms). It is its own Cargo workspace and needs the other engines
+operators SMT-LIB has natively and on random floating-point DAGs, and on 651 identities in
+seven fact sets (`compare/facts/`: bit-vector algebra, number theory, orders, slices, bit
+tricks, canonical forms, floating point). It is its own Cargo workspace and needs the other engines
 installed; its README has the setup. The top-level README reports both comparisons
 ([Performance](../README.md#performance)).
