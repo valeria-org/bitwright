@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - **Nonlinear MBA from the command line.** `bitwright simplify` deobfuscates by default: the
   rules, the normal-form passes and the MBA service with `NormalFormSolver`, every answer proved
