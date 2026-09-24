@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **MBA evidence.** When the other tests leave an equality open, the certificates read a
+  bitwise operation with a constant as arithmetic where the constant reads only bits of the
+  other operand that are known (`−2·(x & 1) | 1` is `−2·(x & 1) + 1`; known bits from the
+  facts' transfer functions), and then split a variable into cases over a few of its bits (at
+  most 16 cases, two variables deep): the bits it is read through a narrow mask at (`x & 1`),
+  or the low bits that bitwise operations with constants read (`x ^ 1`, the variable standing
+  for `(x << 1) + b`). Each case is proved on its own; a refutation in one case is a real
+  counterexample. `CertStats::split` and `CertStats::known_bits` count them.
+- **Native MBA solver.** A bitwise operation with a constant that reads only known low bits of
+  a polynomial is arithmetic again, with no atom (`(x + y)·(−2·(z & 1) | 1)²` is `x + y`). An
+  atom whose whole definition also appears arithmetically is reused there
+  (`p + x + (x ^ 4) − ((x ^ 4) & p)` is `x + ((x ^ 4) | p)`). Two renderings span bit
+  classes: a bitwise function with inputs complemented per class (`(x ^ 4) | p`), and unmasked
+  atoms plus one bitwise function (`x + (x ^ 4)` for `2·(x & ~4) + 4`). `NfStats::known_bits`
+  and `NfStats::reused` count them. The two examples of Arnau Gàmez i Montolio's talk "Mixed
+  Boolean-Arithmetic Obfuscation: What We Build, What We Break, and What We Can't" (REcon
+  2026) that the solver missed now reach their original size. The solver's id
+  is `bitwright.nf.v2` and `NativeProver`'s `bitwright.native.v2`, so cached answers are not
+  reused.
+- **Performance.** Recognizing a normal form as a bitwise function computed its atoms once per
+  possible atom; now once. `simplify/mba-native` −1.2 % instructions; on the corpus diff the
+  proposed configuration takes about 4 % more on random DAGs for the new rules, and the same on
+  MBA corpora.
+- **Behavior changes.** With the MBA service and backend certificates off, answers the gate
+  could not prove before may now be proved and accepted. `NormalFormSolver` answers change as
+  above (results equal or smaller on every corpus measured).
+
 ## 0.4.1
 
 - **Performance.** Charging work against a budget compares only the counter charged: every

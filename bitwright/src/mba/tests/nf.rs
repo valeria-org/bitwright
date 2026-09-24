@@ -341,6 +341,101 @@ fn the_abstraction_catalog() {
 }
 
 #[test]
+fn known_low_bits_and_atom_reuse() {
+    for w in [8u16, 16, 64, 128, 512] {
+        let width = Width::new(w).unwrap();
+        let vars = [width; 3];
+        let (x, y, z) = (V(0), V(1), V(2));
+        let c = |v: i128| k(width, v);
+        let solver = NormalFormSolver::default();
+        let proved = |e: &T, want: &T| {
+            let m = e.expr(&vars);
+            let a = solver.solve(&m, &MbaBudget::default().with_steps(1 << 26));
+            assert!(
+                matches!(
+                    a,
+                    MbaAnswer::Simplified {
+                        claim: Claim::Proved,
+                        ..
+                    }
+                ),
+                "{e:?}: {a:?}"
+            );
+            solves_to(e, want, &vars)
+        };
+        // −2·(z & 1) has a known low bit (0), so `| 1` sets it: 1 − 2·(z & 1), whose square
+        // is 1.
+        let sign = || or(mul(and(z.clone(), c(1)), c(-2)), c(1));
+        let sum = add(x.clone(), y.clone());
+        proved(&sign(), &sub(c(1), mul(and(z.clone(), c(1)), c(2))));
+        proved(&mul(mul(sum.clone(), sign()), sign()), &sum);
+        // The same with the constant clearing and flipping known bits.
+        let even = || mul(y.clone(), c(4));
+        proved(&and(even(), c(3)), &c(0));
+        proved(&xor(add(even(), c(1)), c(3)), &add(even(), c(2)));
+        proved(&and(add(even(), c(1)), c(-2)), &even());
+        proved(&xor(even(), c(-4)), &not(add(even(), c(3))));
+        // The polynomial inside a bitwise operation also appears outside it:
+        // p + x + (x ^ 4) − ((x ^ 4) & p) is x + ((x ^ 4) | p).
+        let p = add(mul(c(10), y.clone()), c(5));
+        let x4 = xor(x.clone(), c(4));
+        proved(
+            &sub(
+                add(add(p.clone(), x.clone()), x4.clone()),
+                and(x4.clone(), p.clone()),
+            ),
+            &add(x.clone(), or(x4.clone(), p.clone())),
+        );
+        let s = solver.stats();
+        assert!(s.known_bits >= 6 && s.reused >= 1, "{s:?}");
+        assert_eq!(s.proved, s.calls, "{s:?}");
+    }
+}
+
+#[test]
+fn known_bits_and_reuse_are_exact_exhaustively() {
+    let solver = NormalFormSolver::default();
+    let (mut checked, mut lowered, mut simplified) = (0, 0, 0);
+    for w in 1..=6u16 {
+        let width = Width::new(w).unwrap();
+        let t = if w <= 4 { 3 } else { 2 };
+        let vars = vec![width; t as usize];
+        let mut g = Gen::new(0x6b17_0000 + u64::from(w), width, t);
+        for _ in 0..60 {
+            let e = g.known_bits();
+            let m = e.expr(&vars);
+            if let Some(l) = certify::lower_known_bits(&m) {
+                assert!(equal_everywhere(&m, &l), "lowered {e:?}:\n{l:?}");
+                lowered += 1;
+            }
+            let Some((naive, cands)) = inspect(&m, &NfOptions::default()) else {
+                continue;
+            };
+            assert!(
+                equal_everywhere(&m, &naive),
+                "normal form of {e:?}:\n{naive:?}"
+            );
+            for c in &cands {
+                assert!(equal_everywhere(&m, c), "candidate of {e:?}:\n{c:?}");
+            }
+            checked += 1 + cands.len();
+            if let MbaAnswer::Simplified { expr, .. } = solver.solve(&m, &MbaBudget::default()) {
+                assert!(equal_everywhere(&m, &expr), "{e:?}\n{expr:?}");
+                assert!(cost(&expr) < cost(&m), "{e:?}\n{expr:?}");
+                simplified += 1;
+            }
+        }
+    }
+    let s = solver.stats();
+    assert!(
+        checked > 2000 && lowered > 100 && simplified > 200,
+        "{checked} {lowered} {simplified}"
+    );
+    assert!(s.known_bits > 150 && s.reused > 30, "{s:?}");
+    assert_eq!(s.declined_internal, 0);
+}
+
+#[test]
 fn null_parts_are_dropped_only_when_proved_zero() {
     // 2^(W−1)·((x & y)·(y & z) − (x & y & z)) is zero (the low bit of a product of
     // conjunctions is the conjunction of the low bits), but not by the reductions, which treat

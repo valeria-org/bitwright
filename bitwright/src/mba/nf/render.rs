@@ -738,7 +738,7 @@ impl<'a> Render<'a> {
             .filter(|(t, _)| !full(t) && !empty(t))
             .map(|(t, _)| t.clone())
             .collect();
-        for g in bases {
+        for g in &bases {
             let ng: Vec<u64> = {
                 let mut n: Vec<u64> = g.iter().map(|x| !x).collect();
                 if s < 6 {
@@ -749,7 +749,7 @@ impl<'a> Render<'a> {
             let (mut a, mut b, mut c) = (BitVec::zero(w), BitVec::zero(w), BitVec::zero(w));
             let mut fits = true;
             for (t, m) in &groups {
-                if *t == g {
+                if t == g {
                 } else if *t == ng {
                     a = bv_or(&a, m);
                 } else if full(t) {
@@ -763,7 +763,7 @@ impl<'a> Render<'a> {
             if !fits {
                 continue;
             }
-            let Some(mut x) = self.best_uniform(&g, &f.support) else {
+            let Some(mut x) = self.best_uniform(g, &f.support) else {
                 continue;
             };
             if !a.is_zero() {
@@ -778,6 +778,68 @@ impl<'a> Render<'a> {
                 x = self.masked(x, &bv_not(&c));
             }
             out.push(x);
+        }
+        // g(x₁ ^ A₁, …) ^ O for a base table g of at most three atoms, when every class's table
+        // is g with some inputs complemented, and maybe its output: `Aᵢ` the classes that
+        // complement input `i`, `O` those that complement the output.
+        if s <= 3 {
+            let entries = 1usize << s;
+            let all = (1u64 << entries) - 1;
+            for g in &bases {
+                let g0 = g[0] & all;
+                let mut flips = vec![BitVec::zero(w); s];
+                let mut o = BitVec::zero(w);
+                let mut fits = true;
+                for (t, m) in &groups {
+                    let t0 = t[0] & all;
+                    let hit =
+                        (0..entries)
+                            .flat_map(|f| [(f, false), (f, true)])
+                            .find(|&(f, neg)| {
+                                let x = flip_inputs(g0, s, f);
+                                (if neg { !x & all } else { x }) == t0
+                            });
+                    let Some((f, neg)) = hit else {
+                        fits = false;
+                        break;
+                    };
+                    for (j, a) in flips.iter_mut().enumerate() {
+                        if f >> j & 1 == 1 {
+                            *a = bv_or(a, m);
+                        }
+                    }
+                    if neg {
+                        o = bv_or(&o, m);
+                    }
+                }
+                // Without complemented inputs this is the form above.
+                if !fits || flips.iter().all(BitVec::is_zero) {
+                    continue;
+                }
+                let Some(tt) = table8(g, s) else {
+                    continue;
+                };
+                let mut ins = Vec::with_capacity(s);
+                for (&a, k) in f.support.iter().zip(&flips) {
+                    let Some(x) = self.atom(a) else {
+                        return out;
+                    };
+                    ins.push(if k.is_zero() {
+                        x
+                    } else {
+                        let k = self.b.konst(k);
+                        self.b.bin(MOp::Xor, x, k)
+                    });
+                }
+                let Some(mut x) = self.min_form(tt, &ins) else {
+                    continue;
+                };
+                if !o.is_zero() {
+                    let k = self.b.konst(&o);
+                    x = self.b.bin(MOp::Xor, x, k);
+                }
+                out.push(x);
+            }
         }
         self.built += out.len() as u64;
         out
@@ -864,11 +926,220 @@ impl<'a> Render<'a> {
                 out.extend(self.grouped(&q));
             }
         }
+        if n > 1
+            && let Some(s) = self.affine_bits(p)
+        {
+            out.push(s);
+        }
         // `c·~h = −c·h − c`, and back: a complement traded for a constant.
         let variants: Vec<Sum> = out.iter().flat_map(|s| self.complements(s)).collect();
         out.extend(variants);
         self.built += out.len() as u64;
         out
+    }
+
+    /// The cheapest decomposition `Σ βᵢ·xᵢ ± g (+ k)` of a degree-≤1 form, `g` one bitwise
+    /// function (a table per class) and the `xᵢ` unmasked atoms. The coefficient of a single
+    /// atom in a bitwise function is −1, 0 or 1 in every class, so `βᵢ` is within one of the
+    /// atom's coefficient in each class (modulo that class's precision): a few choices per
+    /// atom, for at most three atoms with such terms. Each choice is checked on the tables'
+    /// corner sums before anything is built. For example `2·(x & ~4) + (p & ~4) −
+    /// (x & p & ~4) + (x & p & 4) + 4` is `x + ((x ^ 4) | p)`.
+    fn affine_bits(&mut self, p: &Poly) -> Option<Sum> {
+        let w = self.w;
+        let n = self.classes.len();
+        let single = |m: &Mono| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() == 1);
+        if p.atoms().count_ones() > 5
+            || !p.terms().keys().any(single)
+            || !self.spend(p.len() as u64 * n as u64)
+        {
+            return None;
+        }
+        let q = p.expand_full(self.classes);
+        let prec = |c: usize| u32::from(w.bits()) - u32::from(self.classes.low(c));
+        let atoms = q.atoms();
+        let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
+        let s = support.len();
+        if s == 0 || s > 5 {
+            return None;
+        }
+        let entries = 1usize << s;
+        let index = |set: u64| {
+            support
+                .iter()
+                .enumerate()
+                .filter(|&(_, &a)| set >> a & 1 == 1)
+                .fold(0usize, |q, (j, _)| q | 1 << j)
+        };
+        // Per class, the coefficient of each conjunction (by subset of the support). One of
+        // `k ≥ 2` atoms keeps its coefficient, which in a bitwise function is at most
+        // `2^(k−1)` in size (an alternating sum of `2^k` table entries): else none fits.
+        let mut gamma = vec![vec![BitVec::zero(w); entries]; n];
+        for (m, c) in q.terms() {
+            let sym = match m.as_slice() {
+                [] => continue,
+                [(sym, 1)] => sym,
+                _ => return None,
+            };
+            let class = usize::from(sym.class);
+            let k = sym.set.count_ones();
+            if k >= 2 {
+                let v = super::poly::signed_rep(c, prec(class)).to_i128();
+                if v.is_none_or(|v| v.abs() > 1i128 << (k - 1).min(64)) {
+                    return None;
+                }
+            }
+            *gamma.get_mut(class)?.get_mut(index(sym.set))? = *c;
+        }
+        let singles: Vec<usize> = (0..s)
+            .filter(|&j| gamma.iter().any(|g| !g[1 << j].is_zero()))
+            .collect();
+        if singles.is_empty()
+            || singles.len() > 3
+            || !self.spend(27 * 4 * (n * entries) as u64 + q.len() as u64)
+        {
+            return None;
+        }
+        let top = (0..n)
+            .max_by_key(|&c| (prec(c), core::cmp::Reverse(c)))
+            .unwrap_or(0);
+        let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
+        let add = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Add, a, b);
+        let low = |c: usize| crate::facts::known::low_mask(w, prec(c));
+        // `v ∈ {−1, 0, 1}`, and `v ∈ {0, 1}`, modulo class `c`'s precision.
+        let within_one = |v: &BitVec, c: usize| {
+            let v = bv_and(v, &low(c));
+            v.is_zero() || v == BitVec::one(w) || v == low(c)
+        };
+        let bit = |v: &BitVec, c: usize| {
+            let v = bv_and(v, &low(c));
+            v.is_zero() || v == BitVec::one(w)
+        };
+        let mut choices: Vec<(usize, Vec<BitVec>)> = Vec::new();
+        for &j in &singles {
+            let mut betas: Vec<BitVec> = Vec::new();
+            for d in [0i128, -1, 1] {
+                let b = sub(&gamma[top][1 << j], &BitVec::wrapping_from_i128(w, d));
+                let b = super::poly::signed_rep(&b, prec(top));
+                if (0..n).all(|c| within_one(&sub(&gamma[c][1 << j], &b), c)) && !betas.contains(&b)
+                {
+                    betas.push(b);
+                }
+            }
+            if betas.is_empty() {
+                return None;
+            }
+            choices.push((j, betas));
+        }
+        // Per class and corner: the sum of the coefficients of the conjunctions inside it.
+        let mut corner = gamma;
+        for t in corner.iter_mut() {
+            for b in 0..s {
+                for p in 0..entries {
+                    if p >> b & 1 == 1 {
+                        t[p] = add(&t[p], &t[p ^ 1 << b]);
+                    }
+                }
+            }
+        }
+        // Per class: the constant's bit there, for the form and for its negation.
+        let konst = q.konst();
+        let class_bit = |v: &BitVec, c: usize| {
+            self.classes
+                .bit(v, c)
+                .map(|b| if b { BitVec::one(w) } else { BitVec::zero(w) })
+        };
+        let neg_konst = BitVec::un_unchecked(UnOp::Neg, &konst);
+        let kbits: [Vec<Option<BitVec>>; 2] = [
+            (0..n).map(|c| class_bit(&konst, c)).collect(),
+            (0..n).map(|c| class_bit(&neg_konst, c)).collect(),
+        ];
+        let combos: usize = choices.iter().map(|(_, b)| b.len()).product();
+        let mut out = Vec::new();
+        for mut i in 0..combos {
+            let mut beta = vec![BitVec::zero(w); s];
+            for (j, betas) in &choices {
+                beta[*j] = betas[i % betas.len()];
+                i /= betas.len();
+            }
+            if beta.iter().all(BitVec::is_zero) {
+                // The whole is a bitwise function: already a decomposition.
+                continue;
+            }
+            let mut bsum = vec![BitVec::zero(w); entries];
+            for p in 1..entries {
+                bsum[p] = add(&bsum[p & (p - 1)], &beta[p.trailing_zeros() as usize]);
+            }
+            for with_konst in [true, false] {
+                if !with_konst && konst.is_zero() {
+                    continue;
+                }
+                for (sign, kb) in [(BitVec::one(w), &kbits[0]), (BitVec::ones(w), &kbits[1])] {
+                    // The table of `±(form − Σ βᵢ·xᵢ)` in each class: its constant's bit plus
+                    // the corner sums, each 0 or 1.
+                    let fits = (0..n).all(|c| {
+                        let k0 = if with_konst {
+                            kb[c]
+                        } else {
+                            Some(BitVec::zero(w))
+                        };
+                        let Some(k0) = k0 else {
+                            return false;
+                        };
+                        (0..entries).all(|p| {
+                            let d = BitVec::bin_unchecked(
+                                BinOp::Mul,
+                                &sign,
+                                &sub(&corner[c][p], &bsum[p]),
+                            );
+                            bit(&add(&k0, &d), c)
+                        })
+                    });
+                    if !fits {
+                        continue;
+                    }
+                    let mut rest = q.clone();
+                    let mut terms = Vec::new();
+                    for (j, b) in beta.iter().enumerate() {
+                        if b.is_zero() {
+                            continue;
+                        }
+                        let nb = BitVec::un_unchecked(UnOp::Neg, b);
+                        let set = 1u64 << support[j];
+                        for c in 0..n {
+                            rest.add_term(
+                                vec![(
+                                    Sym {
+                                        set,
+                                        class: c as u16,
+                                    },
+                                    1,
+                                )],
+                                &nb,
+                            );
+                        }
+                        terms.push((self.atom(support[j])?, *b));
+                    }
+                    if !with_konst {
+                        rest.add_term(Vec::new(), &neg_konst);
+                    }
+                    let form = if sign.is_ones() { rest.neg() } else { rest };
+                    let Some(f) = Bits::from_linear(&form, self.classes) else {
+                        continue;
+                    };
+                    let renderings = self.bits(&f);
+                    let Some(g) = self.best(&renderings) else {
+                        continue;
+                    };
+                    terms.push((g, sign));
+                    out.push(Sum {
+                        terms,
+                        konst: (!with_konst).then_some(konst),
+                    });
+                }
+            }
+        }
+        self.cheapest(out)
     }
 
     /// Variants of `s` with complements traded for the constant: every term `c·~h` as
@@ -1513,6 +1784,14 @@ impl<'a> Render<'a> {
         }
         result.unwrap_or(x)
     }
+}
+
+/// Table `t` of `s` inputs with the inputs in `f` complemented: entry `p` is `t`'s entry
+/// `p ^ f`.
+fn flip_inputs(t: u64, s: usize, f: usize) -> u64 {
+    (0..1usize << s)
+        .filter(|&p| t >> (p ^ f) & 1 == 1)
+        .fold(0, |acc, p| acc | 1 << p)
 }
 
 /// The symbols every monomial of `p` contains.

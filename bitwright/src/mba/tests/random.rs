@@ -335,6 +335,48 @@ impl Gen {
         }
     }
 
+    /// Arithmetic whose low bits are known under a bitwise operator with a constant (such as
+    /// `−2·(x & 1) | 1`), and polynomials that appear both inside and outside a bitwise
+    /// operator (such as `p + x − (x & p)`, which is `x | p`).
+    pub(crate) fn known_bits(&mut self) -> T {
+        let w = self.w;
+        let bits = u32::from(w.bits());
+        // `c·2^j·e + k`: its low j bits are k's.
+        let j = (1 + self.rng.below(3) as u32).min(bits);
+        let e = match self.rng.below(3) {
+            0 => self.var(),
+            1 => self.bitwise(1, false),
+            _ => mul(self.var(), self.var()),
+        };
+        let scale = BitVec::wrapping_from_u64(w, (self.rng.next() | 1) << j);
+        let p = add(mul(C(scale), e), self.konst(false));
+        let low = crate::facts::known::low_mask(w, j);
+        let r = BitVec::wrapping_from_limbs(w, &[self.rng.next(), self.rng.next()]);
+        let k = match self.rng.below(3) {
+            0 => crate::facts::known::bv_and(&r, &low),
+            1 => crate::facts::known::bv_or(&r, &crate::facts::known::bv_not(&low)),
+            _ => r,
+        };
+        let op = self.pick(&[MOp::And, MOp::Or, MOp::Xor]);
+        let a = bin(op, p.clone(), C(k));
+        match self.rng.below(5) {
+            0 => a,
+            1 => mul(a.clone(), a),
+            2 => {
+                // `p + x − (x & p) = x | p`, `p + x − 2(x & p) = x ^ p`.
+                let x = self.bitwise(1, false);
+                let c = C(BitVec::wrapping_from_u64(w, 1 + self.rng.below(2)));
+                sub(add(p.clone(), x.clone()), mul(c, and(x, p)))
+            }
+            3 => {
+                let x = self.var();
+                let op = self.pick(&[MOp::And, MOp::Or, MOp::Xor]);
+                add(add(p.clone(), bin(op, x, p)), self.var())
+            }
+            _ => add(a, self.expr(Frag::SemiLinear, 1)),
+        }
+    }
+
     /// An equal expression: MBA identities applied at random nodes. Identities that would put
     /// arithmetic under a bitwise operator are used only on bitwise operands unless `any`.
     pub(crate) fn rewrite(&mut self, e: &T, any: bool) -> T {

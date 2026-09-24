@@ -226,7 +226,8 @@ impl Bits {
             return None;
         }
         let w = classes.width();
-        let mut support: Vec<u32> = (0..64).filter(|&a| p.atoms() >> a & 1 == 1).collect();
+        let atoms = p.atoms();
+        let mut support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
         support.sort_unstable();
         if support.len() > MAX_SUPPORT {
             return None;

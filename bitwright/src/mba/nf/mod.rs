@@ -33,6 +33,10 @@ const EVALS_PER_STEP: u64 = 32;
 /// ones.
 const DECLASS_LIMIT: usize = 256;
 
+/// The most terms of a normal form in which atoms are looked for as their definitions
+/// (larger ones are rendered as they are).
+const REUSE_TERMS: usize = 64;
+
 /// Runs [`certify::check`] within `work` and charges what it spent.
 fn certify_within(a: &MbaExpr, b: &MbaExpr, work: &mut Steps) -> certify::Report {
     use certify::Meter;
@@ -132,6 +136,12 @@ pub struct NfStats {
     pub declined_terms: u64,
     /// Null parts of normal forms dropped, each proved zero by a certificate.
     pub null_parts: u64,
+    /// Bitwise operations with a constant read as arithmetic: the constant reads only low bits
+    /// of the other operand that are known (`−2·(x & 1) | 1` is `1 − 2·(x & 1)`).
+    pub known_bits: u64,
+    /// Normal forms also rendered with an atom standing for its definition where that appears
+    /// arithmetically (`p + (y & p)` shares `p`).
+    pub reused: u64,
     /// Declined: a candidate the self-check refuted (a bug; never expected).
     pub declined_internal: u64,
     /// Questions answered from the memo (see [`NfOptions::memo`]); also counted by their
@@ -234,7 +244,7 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v1;atoms={};classes={};terms={};degree={};synth={}",
+            "bitwright.nf.v2;atoms={};classes={};terms={};degree={};synth={}",
             opts.max_atoms,
             opts.max_classes,
             opts.max_terms,
@@ -340,6 +350,8 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     c.grid += d.grid;
     c.exhaustive += d.exhaustive;
     c.compositional += d.compositional;
+    c.split += d.split;
+    c.known_bits += d.known_bits;
     c.points += d.points;
     c.over_budget += d.over_budget;
     c.internal += d.internal;
@@ -348,6 +360,8 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.declined_classes += t.declined_classes;
     s.declined_terms += t.declined_terms;
     s.null_parts += t.null_parts;
+    s.known_bits += t.known_bits;
+    s.reused += t.reused;
     s.declined_internal += t.declined_internal;
     s.memo_hits += t.memo_hits;
     s.synth_lookups += t.synth_lookups;
@@ -472,11 +486,7 @@ impl Pass<'_> {
     /// A normal form reduced for use as an atom's key (equal functions of lower atoms tend
     /// to get equal keys; unequal ones never do, the reductions being exact).
     fn key_form(&self, p: &Poly) -> Poly {
-        let mut k = p.clone();
-        k.reduce_core(&self.classes);
-        k.single_positions(&self.classes);
-        k.reduce_core(&self.classes);
-        k
+        key_form(p, &self.classes)
     }
 
     /// Node `i` read by a bitwise operator: its bitwise function (an atom when it is not one).
@@ -552,6 +562,22 @@ impl Pass<'_> {
         Ok(Some(Form::Bits(Bits::atom(self.classes.len(), at))))
     }
 
+    /// `a op b` (`op` bitwise) as arithmetic when one operand is a constant that reads only
+    /// known low bits of the other's polynomial (see [`known_bits`]).
+    fn known_bits(&mut self, op: MOp, a: u32, b: u32) -> Result<Option<Form>, Decline> {
+        let (x, k) = match (self.cst[a as usize], self.cst[b as usize]) {
+            (None, Some(k)) => (a, k),
+            (Some(k), None) => (b, k),
+            _ => return Ok(None),
+        };
+        let Some(Form::Poly(p)) = &self.forms[x as usize] else {
+            return Ok(None);
+        };
+        let p = p.clone();
+        self.charge(p.len() as u64)?;
+        Ok(known_bits(op, &p, &self.classes, &k).map(Form::Poly))
+    }
+
     /// The normal form of live node `i` from its operands' forms.
     fn visit(&mut self, i: u32, tally: &mut NfStats) -> Result<Option<Form>, Decline> {
         let n = self.p.nodes()[i as usize];
@@ -572,6 +598,10 @@ impl Pass<'_> {
                 Form::Bits(Bits::atom(self.classes.len(), v))
             }
             MOp::And | MOp::Or | MOp::Xor => {
+                if let Some(f) = self.known_bits(n.op, a, b)? {
+                    tally.known_bits += 1;
+                    return Ok(Some(f));
+                }
                 let (x, y) = (self.bitwise(a, tally)?, self.bitwise(b, tally)?);
                 self.charge((x.tables.len() as u64) << (x.support.len() + y.support.len()))?;
                 let op = match n.op {
@@ -653,6 +683,58 @@ impl Pass<'_> {
                 Form::Bits(Bits::atom(self.classes.len(), at))
             }
         }))
+    }
+}
+
+/// See [`Pass::key_form`].
+fn key_form(p: &Poly, classes: &Classes) -> Poly {
+    let mut k = p.clone();
+    k.reduce_core(classes);
+    k.single_positions(classes);
+    k.reduce_core(classes);
+    k
+}
+
+/// `p op k` (`op` bitwise, `k` a constant) as a polynomial, when `k` reads only low bits of
+/// `p` that are known (every non-constant monomial is a multiple of `2^j`, so the low `j` bits
+/// are the constant term's) and is all zeros or all ones above them. Setting, clearing or
+/// flipping known bits adds a constant; above them the result is `p`, `~p`, zeros or ones. For
+/// example `−2·(x & 1) | 1` is `1 − 2·(x & 1)`.
+fn known_bits(op: MOp, p: &Poly, classes: &Classes, k: &BitVec) -> Option<Poly> {
+    use crate::facts::known::{bv_and, bv_not, bv_or};
+    let w = p.width();
+    let j = p.known_low_bits(classes);
+    if j == 0 {
+        return None;
+    }
+    let low = crate::facts::known::low_mask(w, j);
+    // The known bits, and `k` inside and above them.
+    let r = bv_and(&p.konst(), &low);
+    let kl = bv_and(k, &low);
+    let above = bv_and(k, &bv_not(&low));
+    // `q + add − sub`.
+    let shift =
+        |q: &Poly, add: BitVec, sub: BitVec| q.add(&Poly::constant(add)).sub(&Poly::constant(sub));
+    let zero = BitVec::zero(w);
+    if above.is_zero() {
+        Some(match op {
+            MOp::And => Poly::constant(bv_and(&r, &kl)),
+            MOp::Or => shift(p, bv_and(&kl, &bv_not(&r)), zero),
+            _ => shift(p, bv_and(&kl, &bv_not(&r)), bv_and(&kl, &r)),
+        })
+    } else if above == bv_not(&low) {
+        Some(match op {
+            MOp::And => shift(p, zero, bv_and(&r, &bv_not(&kl))),
+            MOp::Or => Poly::constant(bv_or(k, &r)),
+            _ => {
+                // `p ^ k = ~p ^ (low & ~k)`, and the known bits of `~p` are `~r`.
+                let not_p = Poly::constant(BitVec::ones(w)).sub(p);
+                let c = bv_and(&low, &bv_not(&kl));
+                shift(&not_p, bv_and(&c, &r), bv_and(&c, &bv_not(&r)))
+            }
+        })
+    } else {
+        None
     }
 }
 
@@ -762,6 +844,9 @@ struct Normal {
     w: Width,
     classes: Classes,
     nf: Poly,
+    /// The same function with atoms standing for their definitions where these appear
+    /// arithmetically (rendered too; the cheapest wins).
+    alts: Vec<Poly>,
     atom_exprs: Vec<MbaExpr>,
     factors: Vec<Poly>,
     input_cost: u32,
@@ -928,11 +1013,51 @@ fn normalize(
         work.charge((nf.len() as u64).saturating_mul(n * n))
             .map_err(|()| Decline::Exhausted)?;
     }
+    // Atom reuse: where the definition of an atom (arithmetic read by a bitwise operator)
+    // also appears arithmetically, a multiple of it becomes the atom, which the rendering then
+    // shares with the bitwise uses. Greedy over the atoms, while the finished form does not
+    // grow.
+    let mut alt: Option<Poly> = None;
+    let mut alt_len: Option<usize> = None;
+    let mut reused = false;
+    for (a, def) in pass.atoms.iter().enumerate() {
+        let (Def::Form(_), Some(d)) = (def, pass.atom_nf[a].as_ref()) else {
+            continue;
+        };
+        if nf.len() > REUSE_TERMS {
+            break;
+        }
+        // Below degree 2 the form is its own key form: a quick look first.
+        let base = alt.as_ref().unwrap_or(&nf);
+        if base.degree() <= 1 && d.pivot().is_none_or(|(m, _)| !base.terms().contains_key(m)) {
+            continue;
+        }
+        let cur = alt.get_or_insert_with(|| key_form(&nf, &pass.classes));
+        {
+            use certify::Meter;
+            work.charge((d.len() + cur.len()) as u64 * 4)
+                .map_err(|()| Decline::Exhausted)?;
+        }
+        if let Some(s) = cur.substitute(a as u32, d) {
+            let base = *alt_len.get_or_insert_with(|| finish(cur).len());
+            let len = finish(&s).len();
+            if len <= base {
+                (*cur, alt_len, reused) = (s, Some(len), true);
+            }
+        }
+    }
+    let alts = match alt {
+        Some(alt) if reused => vec![finish(&alt)],
+        _ => Vec::new(),
+    };
     let nf = finish(&nf);
+    let alts: Vec<Poly> = alts.into_iter().filter(|a| *a != nf).collect();
+    tally.reused += u64::from(!alts.is_empty());
     Ok(Normal {
         w,
         classes: pass.classes,
         nf,
+        alts,
         atom_exprs,
         factors,
         input_cost,
@@ -1039,6 +1164,12 @@ fn best_rendering(
     for round in 0..3 {
         let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left);
         let mut cands = candidates(&mut r, &n.nf, &factors);
+        // The forms with atoms reused: once, with the input's factors.
+        if round == 0 {
+            for alt in &n.alts {
+                cands.extend(candidates(&mut r, alt, &factors));
+            }
+        }
         // Synthesis does not depend on the factors: the first round is enough.
         if round == 0 && n.synthesis {
             let bar = r.best(&cands).map(|b| r.b.cost(b));
@@ -1193,7 +1324,7 @@ fn run(
 }
 
 /// For tests: the normal form of `p` rendered term by term (each monomial with its
-/// coefficient), and every candidate rendering.
+/// coefficient), and every candidate rendering (also of the forms with atoms reused).
 #[cfg(test)]
 pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<MbaExpr>)> {
     let mut tally = NfStats::default();
@@ -1217,7 +1348,10 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
     }
     let naive = r.sum(&sum);
     let naive = r.b.finish(naive)?;
-    let cands = candidates(&mut r, &n.nf, &n.factors);
+    let mut cands = candidates(&mut r, &n.nf, &n.factors);
+    for alt in &n.alts {
+        cands.extend(candidates(&mut r, alt, &n.factors));
+    }
     let cands: Option<Vec<MbaExpr>> = cands.iter().map(|&c| r.b.finish(c)).collect();
     Some((naive, cands?))
 }

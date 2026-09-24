@@ -1113,12 +1113,34 @@ pub mod mba {
     never by the solver's normal forms: definitions with equal normal forms agree at the
     sample and are then proved equal like any others, so the gate's soundness does not depend
     on the normal-form code.
+  - *Known bits*: when the tests above leave the question undecided (and none was skipped
+    for lack of budget), `x op k` (`op` bitwise, `k` a constant) is read as arithmetic
+    wherever the bits of `x` that are known cover the bits `k` is 1 at, or those it is 0 at
+    (known by the transfer functions of `facts`, whose soundness is tested exhaustively on
+    their own; charged as evaluating each node at 64 points). With `z` and `o` the known-zero and
+    known-one bits of `x`: `x & k = k & o`, `x | k = x + (k & z)`, `x ^ k = x + (k & z) −
+    (k & o)` in the first case, and `x & k = x − (~k & o)`, `x | k = k | o`,
+    `x ^ k = (~k & o) − (~k & z) − 1 − x` in the second. The rewritten sides are equal
+    functions, so a verdict on them is one on the question, at the same points (so
+    `−2·(x & 1) | 1` meets `1 − 2·(x & 1)` as a polynomial).
+  - *Cases*: then a variable is split into cases over a few of its bits (at most four, so 16
+    cases; nested at most two deep, on different variables; a split that spends more than
+    the test cap across its cases declines). When both sides read it only as `v & M` for
+    constant masks, they depend only on the bits of the masks, and each assignment of those
+    is a case with the variable replaced by that constant, which folds away (so
+    `(x + y)·(1 − 2·(z & 1))²` is two polynomial questions). Otherwise, when bitwise
+    operations with constants read only the low `j` bits of arithmetic over it (`t op k` with
+    `t` built by `+ − · neg <<`, `k` all zeros or all ones above bit `j`), each value `b` of
+    those bits is a case with the variable replaced by `(v << j) + b`, which covers exactly
+    the values with those low bits as `v` ranges over all, and makes those operations read
+    known bits. Each case is proved on its own; the cases cover every input. A refutation in
+    one case is a real counterexample: the variable is set to its value in that case.
 
   The degree-`d` test was derived for this design and is confirmed by exhaustive tests at
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
   (corner-invisible products, terms nonzero only when three different positions are set,
   point functions) are never proved at any width.
-- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v1;…` with its options).
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v2;…` with its options).
   One pass over the question, operands first, gives every node the normal form of the smallest
   fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
   through. The first version takes one width (nodes of other widths only below casts, which are
@@ -1147,6 +1169,21 @@ pub mod mba {
     once, lower atoms first, from its own cheapest form (the input subterm as it is among the
     candidates), and shared by everything that uses it. Relations between atoms (between
     `x >> 1` and `x`) are not seen: that loses completeness, never soundness.
+  - *Known low bits.* Every non-constant monomial of a polynomial is a multiple of `2^j`
+    (its coefficient's trailing zeros plus `τ·e` per factor `m^e` of a class starting at
+    `τ`), so its low `j` bits are the constant term's. A bitwise operation of it with a
+    constant that reads only those bits, and is all zeros or all ones above them, is
+    arithmetic again, with no atom: setting, clearing or flipping known bits adds a
+    constant, and above them the result is the polynomial, its complement, zeros or ones (so
+    `−2·(x & 1) | 1` is `1 − 2·(x & 1)`, and `(x + y)·(−2·(z & 1) | 1)²` is `x + y`).
+  - *Atom reuse.* An atom's definition (arithmetic read by a bitwise operator) may also
+    appear arithmetically: in `p + x + (x ^ 4) − ((x ^ 4) & p)` the normal form holds `p`'s
+    terms beside the atom `p`. When a normal form of at most 64 terms contains `c` times an
+    atom's whole definition (`c` solved 2-adically from the definition's term with the fewest
+    factors of two, then checked on every other term), replacing it by `c` times the atom is
+    the same function. Atoms are taken lower first, each substitution kept while the finished
+    form does not grow, and the result is rendered beside the normal form (once, with the
+    input's factors), the cheapest winning: here `x + ((x ^ 4) | p)`, sharing `p`.
   - *Polynomials.* A product of two non-constants multiplies the operands' forms out
     (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
     `max_degree` the product is an atom). Symbols are treated as independent variables, which
@@ -1192,7 +1229,17 @@ pub mod mba {
     one of the input's products, recursively for the quotient; and the whole form as such a
     product. Rendering is repeated with the factors the best candidate multiplies until none
     is new, and the answer is normalized again (its own constants may give coarser classes)
-    until that renders nothing smaller: solving an answer again gives `NoSimpler`.
+    until that renders nothing smaller: solving an answer again gives `NoSimpler`. Two
+    renderings span classes: `g(x₁ ^ A₁, …) ^ O` for a table `g` of at most three atoms when
+    every class's table is `g` with some inputs complemented, and maybe its output (`Aᵢ` the
+    classes complementing input `i`, `O` those complementing the output; so
+    `(x ^ 4) | p`), and `Σ βᵢ·xᵢ ± g (+ k)` over unmasked atoms and one bitwise function
+    `g`: a bitwise function's coefficient of a single atom is −1, 0 or 1 in every class, so
+    each `βᵢ` is within one of the atom's coefficient in every class (at most three atoms
+    with terms of their own, three choices each, at most five atoms in all). A conjunction of
+    `k ≥ 2` atoms keeps its coefficient, which a bitwise function bounds by `2^(k−1)`; each
+    choice is checked on the tables' corner sums before anything is built, and only the
+    cheapest decomposition is kept.
   - *Self-check.* The chosen answer is certified against the input (§ Certificates) within the
     solver's remaining budget: `Claim::Proved` when a certificate ran, `Claim::Sampled` when
     none fit but the refutation sample agrees (the gate then decides on its own evidence).

@@ -300,6 +300,74 @@ impl Poly {
         out
     }
 
+    /// How many low bits of the value are known: every monomial but the constant is a
+    /// multiple of `2^k` (its coefficient's trailing zeros, plus `τ·e` for each factor `m^e` of
+    /// a class whose lowest position is `τ`), so the low `k` bits are the constant term's.
+    pub(crate) fn known_low_bits(&self, classes: &Classes) -> u32 {
+        let bits = u32::from(self.w.bits());
+        self.terms
+            .iter()
+            .filter(|(m, _)| !m.is_empty())
+            .map(|(m, c)| {
+                m.iter()
+                    .fold(crate::facts::known::trailing_zeros(c), |k, &(s, e)| {
+                        let low = u32::from(classes.low(usize::from(s.class)));
+                        k.saturating_add(low.saturating_mul(e))
+                    })
+            })
+            .min()
+            .unwrap_or(bits)
+            .min(bits)
+    }
+
+    /// The same function with atom `a`, whose value is `def` (a polynomial in other atoms),
+    /// standing for a multiple of its definition: `self − c·def + c·a`, when `self` contains
+    /// `c·def`'s every non-constant term. `c` is solved from the term of `def` with the fewest
+    /// factors of two (`c·d ≡ n` for its coefficients `d` in `def` and `n` in `self`, unique
+    /// modulo `2^(W − v₂(d))`, which then fixes `c·d'` for every other term). `None` otherwise,
+    /// or when `def` mentions `a` or is a constant.
+    pub(crate) fn substitute(&self, a: u32, def: &Poly) -> Option<Poly> {
+        use crate::facts::known::{bv_lshr, trailing_zeros};
+        let bits = u32::from(self.w.bits());
+        if a >= 64 || def.atoms() >> a & 1 == 1 || def.w != self.w {
+            return None;
+        }
+        let tail = || def.terms.iter().filter(|(m, _)| !m.is_empty());
+        let (pm, d) = def.pivot()?;
+        let n = self.terms.get(pm)?;
+        let v = trailing_zeros(d);
+        if trailing_zeros(n) < v {
+            return None;
+        }
+        // The representative nearest zero.
+        let c = mul(&bv_lshr(n, v), &odd_inverse(&bv_lshr(d, v)));
+        let c = signed_rep(&c, bits - v);
+        if !tail().all(|(m, d)| self.terms.get(m) == Some(&mul(&c, d))) {
+            return None;
+        }
+        let mut out = self.sub(&def.scale(&c));
+        out.add_term(
+            vec![(
+                Sym {
+                    set: 1 << a,
+                    class: FULL,
+                },
+                1,
+            )],
+            &c,
+        );
+        Some(out)
+    }
+
+    /// The non-constant term with the fewest factors of two in its coefficient (the first of
+    /// them).
+    pub(crate) fn pivot(&self) -> Option<(&Mono, &BitVec)> {
+        self.terms
+            .iter()
+            .filter(|(m, _)| !m.is_empty())
+            .min_by_key(|(_, c)| crate::facts::known::trailing_zeros(c))
+    }
+
     /// The terms whose degree satisfies `keep`.
     pub(crate) fn part(&self, keep: impl Fn(u32) -> bool) -> Poly {
         Poly {

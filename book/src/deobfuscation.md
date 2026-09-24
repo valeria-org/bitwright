@@ -66,7 +66,12 @@ bitwright's certificates are finite evaluation tests, each complete for its frag
 - every assignment when the variables total at most 20 bits;
 - anything else through **atoms**: right shifts, casts and arithmetic under a bitwise operator
   are abstracted, paired between the two sides when they are provably equal, and the two
-  skeletons are compared by one of the tests above.
+  skeletons are compared by one of the tests above;
+- when those leave the question open, a bitwise operation with a constant that reads only
+  **known bits** of its other operand is read as arithmetic (`−2·(x & 1) | 1` is
+  `−2·(x & 1) + 1`, the low bit being known to be 0), and a variable is split into **cases**
+  over a few of its bits: the bits it is read through a narrow mask at (`x & 1`), or the low
+  bits bitwise operations with constants read (`x ^ 1`), each case proved on its own.
 
 A test is sized before it runs and charged to the pass-work budget; one that does not fit is not
 started, and the node is asked again by a later call with more budget. `NativeProver` offers the
@@ -113,6 +118,10 @@ is a product comes out as one (`x·(x & y) + y·(x & y) − (x & y)²` is `(x | 
 Subterms it cannot see through become atoms: arithmetic under a bitwise operator (unless it is
 secretly a bitwise function), right shifts and casts. Atoms with equal normal forms are one atom,
 so `((x ^ y) + 2·(x & y)) & z` is `(x + y) & z` and `((x + y) & z) + ((x + y) & ~z)` is `x + y`.
+A bitwise operation with a constant that reads only low bits of a polynomial that are known is
+arithmetic again, so `(x + y)·(−2·(z & 1) | 1)²` is `x + y`; and an atom's definition that also
+appears outside it is replaced by the atom, so `p + x + (x ^ 4) − ((x ^ 4) & p)`, with `p` any
+polynomial, is `x + ((x ^ 4) | p)`.
 A normal form over at most three atoms is also looked up in a precomputed table of the
 smallest expressions, so products the input has multiplied out come back: `x·y + x + y + 1` is
 `~x·~y`, and `x² + 2·x·y + y²` is `(x + y)²`. A form from the table is used only when a

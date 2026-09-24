@@ -169,6 +169,34 @@ fn the_abstraction_catalog() {
     catalog("((x ^ y) + 2*(x & y)) & z", "(x + y) & z", &WIDTHS);
 }
 
+#[test]
+fn the_known_bits_and_reuse_catalog() {
+    // A polynomial inside a bitwise operation that also appears outside it.
+    catalog(
+        "10*y + 5 + x + (x ^ 4) - ((x ^ 4) & (10*y + 5))",
+        "x + ((x ^ 4) | (10*y + 5))",
+        &WIDTHS,
+    );
+    // Known low bits: −2·(z & 1) has a zero low bit, so `1 + t` and `t | 1` are one value,
+    // ±1, whose square is 1.
+    catalog(
+        "(x + y)*(1 + (z & 1)*-2)*(1 + (z & 1)*-2)",
+        "x + y",
+        &WIDTHS,
+    );
+    catalog(
+        "(x + y)*((z & 1)*-2 | 1)*((z & 1)*-2 | 1)",
+        "x + y",
+        &WIDTHS,
+    );
+    catalog(
+        "(((x + y)*(1 + (z & 1)*-2)) ^ ((w + 3)*(1 + (v & 1)*-2)) ^ ((w + 3)*(1 + (v & 1)*-2)))\
+         *(1 + (z & 1)*-2)",
+        "x + y",
+        &WIDTHS,
+    );
+}
+
 /// `x + [x = K]`, spelled `x + (~((x ^ K) | -(x ^ K)) >>u (W−1))`, for a random `K`.
 fn point_function(w: u16, rng: &mut Rng) -> (String, BitVec) {
     let width = Width::new(w).unwrap();
