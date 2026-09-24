@@ -1,0 +1,69 @@
+# Arithmetic modulo 2^w: parity, powers of two, odd numbers and their inverses, squares and
+# small powers, polynomial identities, divisibility by powers of two. Format: bitvector.txt.
+
+## Parity
+double-is-even: (bvand (bvadd x x) [1]) ==> [0]
+sum-of-evens-is-even: (bvand (bvadd (bvmul x [2]) (bvmul y [2])) [1]) ==> [0]
+even-times-anything: (bvand (bvmul (bvmul x [2]) y) [1]) ==> [0]
+odd-times-odd: (bvand (bvmul (bvor x [1]) (bvor y [1])) [1]) ==> [1]
+odd-plus-odd: (bvand (bvadd (bvor x [1]) (bvor y [1])) [1]) ==> [0]
+odd-plus-even: (bvand (bvadd (bvor x [1]) (bvmul y [2])) [1]) ==> [1]
+square-plus-self-is-even: (bvand (bvadd (bvmul x x) x) [1]) ==> [0]
+three-consecutive-product-is-even: (bvand (bvmul (bvmul x (bvadd x [1])) (bvadd x [2])) [1]) ==> [0]
+parity-of-square: (bvand (bvmul x x) [1]) ==> (bvand x [1])
+parity-of-cube: (bvand (bvmul (bvmul x x) x) [1]) ==> (bvand x [1])
+low-bit-of-sum [1]: (bvxor ((_ extract 0 0) x) ((_ extract 0 0) y)) ==> ((_ extract 0 0) (bvadd x y))
+low-bit-of-product [1]: (bvand ((_ extract 0 0) x) ((_ extract 0 0) y)) ==> ((_ extract 0 0) (bvmul x y))
+low-bit-of-difference [1]: ((_ extract 0 0) (bvsub (bvadd x y) (bvmul y [2]))) ==> ((_ extract 0 0) (bvadd x y))
+
+## Powers of two
+top-power-times-two: (bvmul (bvmul x [smin]) [2]) ==> [0]
+top-power-times-odd: (bvmul (bvor x [1]) [smin]) ==> [smin]
+top-power-times-even: (bvmul (bvmul x [2]) [smin]) ==> [0]
+top-powers-multiplied: (bvmul (bvmul x [smin]) (bvmul y [smin])) ==> [0]
+half-width-shifts-multiplied: (bvmul (bvshl x [h]) (bvshl y [h])) ==> [0]
+shifts-multiplied: (bvmul (bvshl x [2]) (bvshl y [3])) ==> (bvshl (bvmul x y) [5])
+top-power-added-twice: (bvadd (bvadd x [smin]) [smin]) ==> x
+minus-one-squared: (bvmul (bvmul x [ones]) [ones]) ==> x
+negation-times-minus-one: (bvmul (bvneg x) [ones]) ==> x
+
+## Odd numbers and their inverses
+inverse-of-7: (bvmul (bvmul x [7]) [inv(7)]) ==> x
+inverse-of-a-hash-constant: (bvmul (bvmul x [0x5bd1e995]) [inv(0x5bd1e995)]) ==> x
+inverse-first: (bvmul (bvmul x [inv(3)]) [3]) ==> x
+solve-by-inverse [bool]: (= (bvmul x [inv(3)]) [5]) ==> (= x [15])
+solve-affine [bool]: (= (bvadd (bvmul x [3]) [1]) [10]) ==> (= x [3])
+odd-square-mod-8: (bvand (bvmul (bvor x [1]) (bvor x [1])) [7]) ==> [1]
+odd-fourth-power-mod-16: (bvand (bvmul (bvmul (bvor x [1]) (bvor x [1])) (bvmul (bvor x [1]) (bvor x [1]))) [15]) ==> [1]
+evens-around-odd-mod-8: (bvand (bvmul (bvsub (bvor x [1]) [1]) (bvadd (bvor x [1]) [1])) [7]) ==> [0]
+odd-product-is-not-even [bool]: (= (bvmul (bvor x [1]) (bvor y [1])) (bvmul z [2])) ==> false
+square-is-not-3-mod-4 [bool]: (= (bvand (bvmul x x) [3]) [3]) ==> false
+square-is-not-5-mod-8 [bool]: (= (bvand (bvmul x x) [7]) [5]) ==> false
+
+## Squares and products
+square-of-negation: (bvmul (bvneg x) (bvneg x)) ==> (bvmul x x)
+square-of-complement: (bvsub (bvmul (bvnot x) (bvnot x)) (bvmul x x)) ==> (bvadd (bvmul x [2]) [1])
+square-minus-product: (bvsub (bvmul x x) (bvmul x y)) ==> (bvmul x (bvsub x y))
+difference-of-squares [bool]: (= (bvmul (bvadd x y) (bvsub x y)) (bvsub (bvmul x x) (bvmul y y))) ==> true
+square-of-difference: (bvsub (bvmul (bvsub x y) (bvsub x y)) (bvadd (bvmul x x) (bvmul y y))) ==> (bvmul (bvmul x y) [-2])
+cube-of-negation: (bvadd (bvmul (bvmul (bvneg x) (bvneg x)) (bvneg x)) (bvmul (bvmul x x) x)) ==> [0]
+product-minus-square: (bvsub (bvmul x (bvadd x [1])) (bvmul x x)) ==> x
+
+## Polynomial identities
+successor-squared: (bvsub (bvsub (bvmul (bvadd x [1]) (bvadd x [1])) (bvmul x x)) (bvadd x x)) ==> [1]
+successor-cubed: (bvsub (bvmul (bvmul (bvadd x [1]) (bvadd x [1])) (bvadd x [1])) (bvadd (bvmul (bvmul x x) x) (bvadd (bvmul (bvmul x x) [3]) (bvadd (bvmul x [3]) [1])))) ==> [0]
+product-of-sums: (bvsub (bvmul (bvadd x y) (bvadd x z)) (bvadd (bvmul x x) (bvadd (bvmul x z) (bvadd (bvmul y x) (bvmul y z))))) ==> [0]
+distribute-over-three: (bvsub (bvmul x (bvadd y (bvadd z [1]))) (bvadd (bvmul x y) (bvadd (bvmul x z) x))) ==> [0]
+horner-form: (bvsub (bvadd (bvmul (bvadd (bvmul x [3]) [2]) x) [1]) (bvadd (bvmul (bvmul x x) [3]) (bvadd (bvmul x [2]) [1]))) ==> [0]
+square-is-symmetric [bool]: (= (bvmul (bvadd x y) (bvadd x y)) (bvmul (bvadd y x) (bvadd y x))) ==> true
+sum-of-cubes [bool]: (= (bvadd (bvmul (bvmul x x) x) (bvmul (bvmul y y) y)) (bvmul (bvadd x y) (bvadd (bvsub (bvmul x x) (bvmul x y)) (bvmul y y)))) ==> true
+pronic-times-top-power: (bvmul (bvadd (bvmul x x) x) [smin]) ==> [0]
+four-consecutive-times-high-power: (bvmul (bvmul (bvmul x (bvadd x [1])) (bvmul (bvadd x [2]) (bvadd x [3]))) [smin >> 2]) ==> [0]
+
+## Divisibility by powers of two
+multiple-of-8-low-bits: (bvand (bvmul x [8]) [7]) ==> [0]
+sum-of-multiples-of-4: (bvand (bvadd (bvmul x [4]) (bvmul y [12])) [3]) ==> [0]
+align-down-twice: (bvand (bvand x [-8]) [-4]) ==> (bvand x [-8])
+aligned-plus-alignment: (bvand (bvadd (bvand x [-8]) [8]) [7]) ==> [0]
+round-up-is-aligned: (bvand (bvand (bvadd x [7]) [-8]) [7]) ==> [0]
+product-of-shifted: (bvand (bvmul (bvshl x [2]) (bvshl y [1])) [7]) ==> [0]

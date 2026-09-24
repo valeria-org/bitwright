@@ -142,17 +142,30 @@ answers, and the median and 95th-percentile time. With `VERSUS_SMT_DUMP=DIR`, ev
 script, each solver's answer as printed and each answer as bitwright reads it are written to
 `DIR`.
 
-**Identities.** `versus-smt --facts` runs the identities of
-[`facts/bitvector.txt`](facts/bitvector.txt) instead: 377 identities of bit-vector algebra in
-15 groups, written from textbook mathematics (the file's header gives the format), without
-mixed boolean-arithmetic ones. Each runs at 8 and 64 bits, over the atoms `x`, `y`, `z` and over
-compound terms (`x = a·b`, `y = c | d`, `z = e − f`), with `p` a comparison: 1,508 cases. Every
+**Identities.** `versus-smt --facts` runs the fact sets of [`facts/`](facts) instead: 580
+identities, written from textbook mathematics, without mixed boolean-arithmetic ones.
+[`bitvector.txt`](facts/bitvector.txt) (377, in 15 groups: Boolean algebra, ring arithmetic,
+two's complement, shifts, rotations, extraction and extension, division, comparisons,
+if-then-else, known bits; its header gives the format) is the algebra;
+[`number-theory.txt`](facts/number-theory.txt) (parity, powers of two, odd numbers and their
+inverses, squares, polynomial identities, divisibility), [`order.txt`](facts/order.txt) (order
+laws, bounds, minimum and maximum, monotone operations), [`slices.txt`](facts/slices.txt)
+(extraction through operations, concatenation, repetition, fields),
+[`bit-tricks.txt`](facts/bit-tricks.txt) (lowest set bit, bit tests, sign extension, rotations
+from slices, selection through masks) and [`canonical.txt`](facts/canonical.txt) (reordered
+operands, gathered constants) add one area each. Each identity runs at 8 and 64 bits, over the
+atoms `x`, `y`, `z` and over compound terms (`x = a·b`, `y = c | d`, `z = e − f`), with `p` a
+comparison: 2,320 cases. Every
 tool starts from the unsimplified side as SMT-LIB text, so none gets a head start from another's
 reading of it. A case is solved when the answer is no larger than the simpler side, and exact
 when it is that side (both in bitwright's canonical form). The two sides of every case are
 checked equal at the 64 points first; a case that fails is reported and left out. It prints one
-row per group, and the cases a tool leaves unsolved go to standard error as `unsolved TOOL
-CASE`.
+row per set and one per group, and the cases a tool leaves unsolved go to standard error as
+`unsolved TOOL SET.CASE`.
+
+`--deobfuscate` runs bitwright as `bitwright simplify` does, for either input: the
+deobfuscation strategy with the MBA service and `NormalFormSolver` on bitwright's own evidence,
+instead of `Engine::standard()`.
 
 `--proofs DIR` times nothing: it writes, per case, bitwright's answer against its input as
 `CASE.smt2`, and with `--facts` the identity itself as `CASE.fact.smt2`, for any SMT solver to

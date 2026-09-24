@@ -12,7 +12,9 @@
 //! [`POINTS`] points: all zeros, all ones, one, the sign bit, then random values.
 //!
 //! Needs the feature `native-smt`, with `Z3_DIR` and `BITWUZLA_DIR` set (see the README).
-//! `versus-smt [CASES]` runs CASES inputs per corpus (200 by default). `versus-smt --facts` runs
+//! `versus-smt [CASES]` runs CASES inputs per corpus (200 by default). With `--deobfuscate`,
+//! bitwright runs as `bitwright simplify` does: the deobfuscation strategy with the MBA service
+//! and the normal-form solver, on its own evidence. `versus-smt --facts` runs
 //! the identities of `facts/bitvector.txt` instead, at 8 and 64 bits, over atoms and over
 //! compound terms; a case is solved when the answer is no larger than the identity's simpler
 //! side. With `--proofs DIR`, no tool is timed: each input's claim that bitwright's answer
@@ -27,7 +29,8 @@ use std::ffi::{CStr, CString, c_char, c_uint, c_void};
 use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
-use bitwright::engine::Engine;
+use bitwright::engine::{Engine, Strategy};
+use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::smtlib::import;
 use bitwright::{BinOp, BitVec, Bounded, CmpOp, Context, Expr, SymbolKey, UnOp, Width};
 
@@ -528,13 +531,28 @@ fn run(
     }
 }
 
-// ----- the fact set ------------------------------------------------------------------------------
+// ----- the fact sets -----------------------------------------------------------------------------
 
-/// One identity of `facts/bitvector.txt`: `lhs` equals the simpler `rhs`.
+/// The fact sets, `facts/NAME.txt`: bit-vector algebra first, then one set per area.
+const FACT_SETS: [(&str, &str); 6] = [
+    ("bitvector", include_str!("../../facts/bitvector.txt")),
+    (
+        "number-theory",
+        include_str!("../../facts/number-theory.txt"),
+    ),
+    ("order", include_str!("../../facts/order.txt")),
+    ("slices", include_str!("../../facts/slices.txt")),
+    ("bit-tricks", include_str!("../../facts/bit-tricks.txt")),
+    ("canonical", include_str!("../../facts/canonical.txt")),
+];
+
+/// One identity of a fact set: `lhs` equals the simpler `rhs`.
 struct Fact {
+    set: &'static str,
     category: String,
     name: String,
-    /// The root's sort when it is not the base width: `2w`, `h`, `bool` or a number of bits.
+    /// The root's sort when it is not the base width: `bool`, `2w`, or a width expression
+    /// (`h`, `w-3`, a number of bits).
     sort: Option<String>,
     lhs: String,
     rhs: String,
@@ -548,32 +566,32 @@ struct Truth {
 
 fn facts() -> Result<Vec<Fact>, String> {
     let mut out = Vec::new();
-    let mut category = String::new();
-    for (i, line) in include_str!("../../facts/bitvector.txt")
-        .lines()
-        .enumerate()
-    {
-        if let Some(c) = line.strip_prefix("## ") {
-            category = c.to_string();
-            continue;
+    for (set, text) in FACT_SETS {
+        let mut category = String::new();
+        for (i, line) in text.lines().enumerate() {
+            if let Some(c) = line.strip_prefix("## ") {
+                category = c.to_string();
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let bad = || format!("facts/{set}.txt:{}: {line}", i + 1);
+            let (head, body) = line.split_once(": ").ok_or_else(bad)?;
+            let (lhs, rhs) = body.split_once(" ==> ").ok_or_else(bad)?;
+            let (name, sort) = match head.split_once(" [") {
+                Some((n, s)) => (n, Some(s.strip_suffix(']').ok_or_else(bad)?.to_string())),
+                None => (head, None),
+            };
+            out.push(Fact {
+                set,
+                category: category.clone(),
+                name: name.to_string(),
+                sort,
+                lhs: lhs.trim().to_string(),
+                rhs: rhs.trim().to_string(),
+            });
         }
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let bad = || format!("facts/bitvector.txt:{}: {line}", i + 1);
-        let (head, body) = line.split_once(": ").ok_or_else(bad)?;
-        let (lhs, rhs) = body.split_once(" ==> ").ok_or_else(bad)?;
-        let (name, sort) = match head.split_once(" [") {
-            Some((n, s)) => (n, Some(s.strip_suffix(']').ok_or_else(bad)?.to_string())),
-            None => (head, None),
-        };
-        out.push(Fact {
-            category: category.clone(),
-            name: name.to_string(),
-            sort,
-            lhs: lhs.trim().to_string(),
-            rhs: rhs.trim().to_string(),
-        });
     }
     Ok(out)
 }
@@ -784,13 +802,13 @@ impl Calc {
 /// the fact's right side, the ground truth.
 fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), String> {
     let width = match f.sort.as_deref() {
-        None | Some("w") => w,
-        Some("2w") => 2 * w,
-        Some("h") => w / 2,
+        None => w,
         Some("bool") => 1,
-        Some(s) => s
-            .parse()
-            .map_err(|_| format!("{}: unknown sort `{s}`", f.name))?,
+        Some("2w") => 2 * w,
+        Some(s) => Calc::eval(s, w, 128)
+            .ok()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("{}: unknown sort `{s}`", f.name))?,
     };
     let (mut lhs, mut rhs) = (instantiate(&f.lhs, w)?, instantiate(&f.rhs, w)?);
     if f.sort.as_deref() == Some("bool") {
@@ -819,9 +837,10 @@ fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), Stri
     Ok((text, Truth { sort, rhs }))
 }
 
-/// One category's results in `--facts`.
+/// One group's (or set's) results in `--facts`.
 #[derive(Default)]
 struct Row {
+    set: String,
     category: String,
     facts: usize,
     cases: usize,
@@ -840,8 +859,12 @@ fn run_facts(engine: &Engine, proofs: Option<&str>) {
     let mut micros: [Vec<f64>; 3] = Default::default();
     let (mut wrong, mut failed, mut invalid) = ([0usize; 3], [0usize; 3], 0);
     for (k, f) in facts.iter().enumerate() {
-        if rows.last().is_none_or(|r| r.category != f.category) {
+        if rows
+            .last()
+            .is_none_or(|r| r.set != f.set || r.category != f.category)
+        {
             rows.push(Row {
+                set: f.set.to_string(),
                 category: f.category.clone(),
                 ..Row::default()
             });
@@ -851,7 +874,8 @@ fn run_facts(engine: &Engine, proofs: Option<&str>) {
             .into_iter()
             .enumerate()
         {
-            let case = format!("{}-{w}{}", f.name, if compound { "-compound" } else { "" });
+            let variant = if compound { "-compound" } else { "" };
+            let case = format!("{}.{}-{w}{variant}", f.set, f.name);
             let seed = 0xfac7_0000 + 4 * k as u64 + j as u64;
             let read = fact_script(f, w, compound).and_then(|(script, truth)| {
                 let mut m = Measured::read(&script, "root0")?;
@@ -913,28 +937,51 @@ fn run_facts(engine: &Engine, proofs: Option<&str>) {
         println!("{} facts, {invalid} invalid cases", facts.len());
         return;
     }
-    println!(
-        "| identities | facts | cases | bitwright | z3 | Bitwuzla | bitwright exact | z3 exact | Bitwuzla exact |"
-    );
-    println!("|-|-:|-:|-:|-:|-:|-:|-:|-:|");
-    let mut total = Row {
-        category: "**all**".to_string(),
-        ..Row::default()
-    };
+    // Per set, then per group within the sets.
+    let mut sets: Vec<Row> = Vec::new();
     for row in &rows {
-        total.facts += row.facts;
-        total.cases += row.cases;
+        if sets.last().is_none_or(|s| s.set != row.set) {
+            sets.push(Row {
+                set: row.set.clone(),
+                category: "all".to_string(),
+                ..Row::default()
+            });
+        }
+        let set = sets.last_mut().expect("a set");
+        set.facts += row.facts;
+        set.cases += row.cases;
         for t in 0..3 {
-            total.solved[t] += row.solved[t];
-            total.exact[t] += row.exact[t];
+            set.solved[t] += row.solved[t];
+            set.exact[t] += row.exact[t];
         }
     }
-    for r in rows.iter().chain([&total]) {
+    let mut total = Row {
+        set: "**all**".to_string(),
+        ..Row::default()
+    };
+    for set in &sets {
+        total.facts += set.facts;
+        total.cases += set.cases;
+        for t in 0..3 {
+            total.solved[t] += set.solved[t];
+            total.exact[t] += set.exact[t];
+        }
+    }
+    let header = "| facts | cases | bitwright | z3 | Bitwuzla | bitwright exact | z3 exact | Bitwuzla exact |";
+    let line = |r: &Row| {
         let (s, e) = (r.solved, r.exact);
-        println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-            r.category, r.facts, r.cases, s[0], s[1], s[2], e[0], e[1], e[2]
-        );
+        format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.facts, r.cases, s[0], s[1], s[2], e[0], e[1], e[2]
+        )
+    };
+    println!("| set {header}\n|-|-:|-:|-:|-:|-:|-:|-:|-:|");
+    for r in sets.iter().chain([&total]) {
+        println!("| {} {}", r.set, line(r));
+    }
+    println!("\n| set | group {header}\n|-|-|-:|-:|-:|-:|-:|-:|-:|-:|");
+    for r in &rows {
+        println!("| {} | {} {}", r.set, r.category, line(r));
     }
     for (t, us) in micros.iter_mut().enumerate() {
         us.sort_by(f64::total_cmp);
@@ -972,10 +1019,26 @@ fn main() {
         .iter()
         .position(|a| a == "--facts")
         .map(|i| args.remove(i));
+    let deobfuscate = args
+        .iter()
+        .position(|a| a == "--deobfuscate")
+        .map(|i| args.remove(i));
     let cases: u64 = args
         .first()
         .map_or(200, |a| a.parse().expect("CASES is a number"));
-    let engine = Engine::standard();
+    let engine = if deobfuscate.is_some() {
+        // As `bitwright simplify` runs: the MBA service with the normal-form solver, on
+        // bitwright's own evidence.
+        let trust = MbaTrust::default().with_backend_certificates(false);
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust)))
+            .mba_solver(std::sync::Arc::new(NormalFormSolver::default()))
+            .build()
+            .expect("the engine builds")
+    } else {
+        Engine::standard()
+    };
     if facts.is_some() {
         run_facts(&engine, proofs.as_deref());
         return;

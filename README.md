@@ -95,39 +95,35 @@ small expressions: z3 splits bitwise operations with constants into slices of bi
 Bitwuzla writes `|` and `−` with `&`, `~` and `+`, so their answers are almost always larger
 than the input. Bitwuzla is faster: about 1.4 times on 40 nodes and 4 times on 400.
 
-**Bit-vector identities, against z3 and Bitwuzla.** 377 identities of bit-vector algebra,
-written from textbook mathematics rather than from any tool's rules
-([`compare/facts/bitvector.txt`](compare/facts/bitvector.txt)): Boolean algebra, ring
-arithmetic, two's complement, shifts, rotations, extraction and extension, division,
-comparisons, if-then-else and known bits (not mixed boolean-arithmetic ones: those are CoBRA's
-datasets below). Each runs at 8 and 64 bits, over plain variables and over compound terms, from
-its unsimplified side, and is solved when the answer is no larger than the simpler side. z3 and
-Bitwuzla prove every identity at 8 bits, and at 64 bits all but quotient times divisor plus
-remainder (unsigned and signed), which neither finishes in ten minutes.
+**Bit-vector identities, against z3 and Bitwuzla.** 580 identities in six sets, written from
+textbook mathematics rather than from any tool's rules ([`compare/facts/`](compare/facts)):
+bit-vector algebra (Boolean algebra, ring arithmetic, two's complement, shifts, rotations,
+extraction and extension, division, comparisons, if-then-else, known bits), number theory
+modulo 2^w, the unsigned and signed orders, bit slices, bit tricks and canonical forms; not
+mixed boolean-arithmetic ones (those are CoBRA's datasets below). Each runs at 8 and 64 bits,
+over plain variables and over compound terms (2,320 cases), from its unsimplified side, and is
+solved when the answer is no larger than the simpler side. bitwright runs as the library's
+`Engine::standard()` and as the command line's `simplify` (the MBA service and its normal-form
+solver on top). z3 and Bitwuzla prove every identity at 8 bits, and at 64 bits all but three
+(quotient times divisor plus remainder, unsigned and signed, and `(~x)² − x² = 2x + 1`), which
+neither finishes in ten minutes.
 
-| Identities | Cases | bitwright | z3 | Bitwuzla |
-|-|-:|-:|-:|-:|
-| Bitwise identities | 84 | **84** | **84** | **84** |
-| Absorption and redundancy | 124 | **120** | 32 | 42 |
-| De Morgan and complements | 40 | **40** | 20 | 12 |
-| Distributivity and factoring | 28 | **14** | 0 | 0 |
-| Bitwise constants | 56 | **56** | 22 | 28 |
-| Arithmetic identities | 124 | **124** | 78 | 50 |
-| Multiplication | 80 | **52** | **52** | 32 |
-| Two's complement | 44 | **44** | 4 | 22 |
-| Shifts by constants | 168 | **104** | 82 | 60 |
-| Rotations by constants | 56 | **36** | 12 | 12 |
-| Extraction, concatenation and extension | 148 | **112** | 102 | 76 |
-| Division and remainder | 120 | **84** | 72 | 62 |
-| Comparisons | 284 | **236** | 164 | 122 |
-| If-then-else | 92 | **24** | 20 | 22 |
-| Known bits | 60 | **44** | 36 | 12 |
-| All | 1,508 | **1,174 (78 %)** | 780 (52 %) | 636 (42 %) |
+| Fact set | Cases | bitwright | bitwright `simplify` | z3 | Bitwuzla |
+|-|-:|-:|-:|-:|-:|
+| Bit-vector algebra | 1,508 | 1,174 | **1,244** | 780 | 636 |
+| Number theory | 220 | 116 | **168** | 94 | 68 |
+| Orders | 220 | **108** | **108** | 36 | 52 |
+| Bit slices | 132 | 68 | **98** | 84 | 58 |
+| Bit tricks | 140 | 48 | **80** | 31 | 15 |
+| Canonical forms | 100 | 64 | 72 | **84** | 42 |
+| All | 2,320 | 1,578 (68 %) | **1,770 (76 %)** | 1,109 (48 %) | 871 (38 %) |
 
-On these small expressions bitwright is also the fastest, with a median of 11 µs per case
-against 70 µs for Bitwuzla and 173 µs for z3. `versus-smt --facts` lists what each tool misses;
-bitwright's gaps are mostly if-then-else (it leaves `ite(x == y, x, y)` as it is, not `y`),
-distributivity, shifts and rotations.
+On these small expressions bitwright is also the fastest, with a median of 13 µs per case (16 µs
+as `simplify`) against 72 µs for Bitwuzla and about 140 µs for z3. `versus-smt --facts` prints
+every group and what each tool misses. bitwright's gaps are minimum and maximum written with
+`ite` (it does not see that `ite(x <u y, x, y)` and `ite(y <u x, y, x)` are one function), order
+relations (transitivity, `x & y <=u y`), bit tests through masks, concatenation, if-then-else,
+and the parity of products.
 
 **MBA, against CoBRA.** The MBA datasets [CoBRA](https://github.com/trailofbits/CoBRA)
 collects: 76,080 expressions (SiMBA, GAMBA, NeuReduce, MBA-Obfuscator, MBA-Solver, QSynth,

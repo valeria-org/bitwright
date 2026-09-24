@@ -30,12 +30,13 @@
   z3's `simplify` and Bitwuzla's `simplify_term` in process, through their C APIs, from the
   same SMT-LIB text, on random DAGs over the operators SMT-LIB has natively, and reads every
   answer back into bitwright to size and check it.
-- **Identities.** `compare/facts/bitvector.txt` holds 377 identities of bit-vector algebra
-  (Boolean algebra, ring arithmetic, two's complement, shifts, rotations, extraction and
-  extension, division, comparisons, if-then-else, known bits), written from textbook
-  mathematics; `versus-smt --facts` runs them at 8 and 64 bits over atoms and compound terms.
-  bitwright solves 1,174 of the 1,508 cases, z3 780 and Bitwuzla 636, and it is the fastest of
-  the three on them (median 11 µs, Bitwuzla 70, z3 173). The README reports them by group.
+- **Identities.** `compare/facts/` holds 580 identities in six sets, written from textbook
+  mathematics: bit-vector algebra (377: Boolean algebra, ring arithmetic, two's complement,
+  shifts, rotations, extraction and extension, division, comparisons, if-then-else, known
+  bits), number theory modulo 2^w, the unsigned and signed orders, bit slices, bit tricks and
+  canonical forms. `versus-smt --facts` runs them at 8 and 64 bits over atoms and compound
+  terms (2,320 cases): `Engine::standard()` solves 1,578, bitwright as `simplify` runs it
+  (`--deobfuscate`) 1,770, z3 1,109 and Bitwuzla 871. The README reports them by set.
   `--proofs DIR` writes each case's identity and bitwright's answer as SMT-LIB obligations.
 
 ## 0.7.0

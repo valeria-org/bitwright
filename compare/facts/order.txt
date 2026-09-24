@@ -1,0 +1,65 @@
+# The unsigned and signed orders: their laws, bounds, the lattice of minimum and maximum
+# (written with ite), and operations that preserve them. Format: bitvector.txt.
+
+## Order laws
+ult-transitive [bool]: (and (bvult x y) (bvult y z) (bvule z x)) ==> false
+ule-transitive [bool]: (and (bvule x y) (bvule y z) (bvult z x)) ==> false
+slt-transitive [bool]: (and (bvslt x y) (bvslt y z) (bvsle z x)) ==> false
+sle-transitive [bool]: (and (bvsle x y) (bvsle y z) (bvslt z x)) ==> false
+ult-asymmetric [bool]: (and (bvult x y) (bvult y x)) ==> false
+slt-asymmetric [bool]: (and (bvslt x y) (bvslt y x)) ==> false
+ult-trichotomy [bool]: (or (bvult x y) (= x y) (bvult y x)) ==> true
+slt-trichotomy [bool]: (or (bvslt x y) (= x y) (bvslt y x)) ==> true
+ule-total [bool]: (or (bvule x y) (bvule y x)) ==> true
+sle-total [bool]: (or (bvsle x y) (bvsle y x)) ==> true
+ult-excludes-eq [bool]: (and (bvult x y) (= x y)) ==> false
+neither-below [bool]: (and (not (bvult x y)) (not (bvult y x))) ==> (= x y)
+ult-implies-ule [bool]: (or (not (bvult x y)) (bvule x y)) ==> true
+ult-implies-distinct [bool]: (or (not (bvult x y)) (distinct x y)) ==> true
+slt-implies-sle [bool]: (or (not (bvslt x y)) (bvsle x y)) ==> true
+
+## Bounds
+smin-is-least [bool]: (bvsle [smin] x) ==> true
+ones-is-greatest [bool]: (bvuge [ones] x) ==> true
+and-below-operand [bool]: (bvule (bvand x y) y) ==> true
+or-above-operand [bool]: (bvuge (bvor x y) y) ==> true
+and-not-above [bool]: (bvult x (bvand x y)) ==> false
+or-above-and [bool]: (bvuge (bvor x y) (bvand x y)) ==> true
+remainder-below-divisor [bool]: (bvule (bvurem x y) (bvsub y [1])) ==> true
+quotient-at-most-dividend [bool]: (bvule (bvudiv x [3]) x) ==> true
+longer-shift-smaller [bool]: (bvule (bvlshr x [3]) (bvlshr x [1])) ==> true
+shifted-below-bound [bool]: (bvult (bvlshr x [3]) [ones >> 2]) ==> true
+masked-at-most-mask [bool]: (bvule (bvand x [255]) [255]) ==> true
+zero-extended-below-bound [bool]: (bvult ((_ zero_extend {w}) x) [(1 << w) @2w]) ==> true
+zero-extended-not-negative [bool]: (bvslt ((_ zero_extend {w}) x) [0@2w]) ==> false
+sign-extended-at-most [bool]: (bvsle ((_ sign_extend {w}) x) [(1 << (w - 1)) - 1 @2w]) ==> true
+sign-extended-at-least [bool]: (bvsle [-(1 << (w - 1)) @2w] ((_ sign_extend {w}) x)) ==> true
+signed-increment-grows [bool]: (bvslt x (bvadd x [1])) ==> (distinct x [smax])
+halves-sum-no-overflow [bool]: (bvult (bvadd (bvlshr x [1]) (bvlshr y [1])) (bvlshr x [1])) ==> false
+
+## Minimum and maximum
+min-commutes [bool]: (= (ite (bvult x y) x y) (ite (bvult y x) y x)) ==> true
+max-commutes [bool]: (= (ite (bvult x y) y x) (ite (bvult y x) x y)) ==> true
+min-below-both [bool]: (and (bvule (ite (bvult x y) x y) x) (bvule (ite (bvult x y) x y) y)) ==> true
+max-above-both [bool]: (and (bvuge (ite (bvult x y) y x) x) (bvuge (ite (bvult x y) y x) y)) ==> true
+min-absorbs-max: (ite (bvult x (ite (bvult x y) y x)) x (ite (bvult x y) y x)) ==> x
+max-absorbs-min: (ite (bvult x (ite (bvult x y) x y)) (ite (bvult x y) x y) x) ==> x
+min-with-zero: (ite (bvult x [0]) x [0]) ==> [0]
+max-with-zero: (ite (bvult x [0]) [0] x) ==> x
+min-with-ones: (ite (bvult x [ones]) x [ones]) ==> x
+max-with-ones: (ite (bvult x [ones]) [ones] x) ==> [ones]
+min-associates [bool]: (= (ite (bvult x (ite (bvult y z) y z)) x (ite (bvult y z) y z)) (ite (bvult (ite (bvult x y) x y) z) (ite (bvult x y) x y) z)) ==> true
+min-plus-max [bool]: (= (bvadd (ite (bvult x y) x y) (ite (bvult x y) y x)) (bvadd x y)) ==> true
+min-at-most-max [bool]: (bvule (ite (bvult x y) x y) (ite (bvult x y) y x)) ==> true
+signed-min-commutes [bool]: (= (ite (bvslt x y) x y) (ite (bvslt y x) y x)) ==> true
+signed-min-absorbs-max: (ite (bvslt x (ite (bvslt x y) y x)) x (ite (bvslt x y) y x)) ==> x
+signed-min-with-smin: (ite (bvslt x [smin]) x [smin]) ==> [smin]
+signed-max-with-smax: (ite (bvslt x [smax]) [smax] x) ==> [smax]
+
+## Monotone operations
+lshr-keeps-order [bool]: (or (not (bvule x y)) (bvule (bvlshr x [2]) (bvlshr y [2]))) ==> true
+udiv-keeps-order [bool]: (or (not (bvule x y)) (bvule (bvudiv x [3]) (bvudiv y [3]))) ==> true
+zero-extend-keeps-order [bool]: (or (not (bvult x y)) (bvult ((_ zero_extend {w}) x) ((_ zero_extend {w}) y))) ==> true
+ashr-keeps-signed-order [bool]: (or (not (bvsle x y)) (bvsle (bvashr x [2]) (bvashr y [2]))) ==> true
+sign-extend-keeps-signed-order [bool]: (or (not (bvslt x y)) (bvslt ((_ sign_extend {w}) x) ((_ sign_extend {w}) y))) ==> true
+not-reverses-order [bool]: (or (not (bvult x y)) (bvult (bvnot y) (bvnot x))) ==> true

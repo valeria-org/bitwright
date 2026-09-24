@@ -1,0 +1,43 @@
+# Bit slices as a lifter meets them: extraction through operations, concatenation, repetition
+# and extension, and fields written into and read out of a word. Format: bitvector.txt.
+
+## Extraction through operations
+high-half-of-and [h]: (bvand ((_ extract {w-1} {h}) x) ((_ extract {w-1} {h}) y)) ==> ((_ extract {w-1} {h}) (bvand x y))
+high-half-of-or [h]: (bvor ((_ extract {w-1} {h}) x) ((_ extract {w-1} {h}) y)) ==> ((_ extract {w-1} {h}) (bvor x y))
+high-half-of-xor [h]: (bvxor ((_ extract {w-1} {h}) x) ((_ extract {w-1} {h}) y)) ==> ((_ extract {w-1} {h}) (bvxor x y))
+high-bits-of-shl [w-3]: ((_ extract {w-1} 3) (bvshl x [3])) ==> ((_ extract {w-4} 0) x)
+low-bits-of-lshr [w-3]: ((_ extract {w-4} 0) (bvlshr x [3])) ==> ((_ extract {w-1} 3) x)
+top-bit-of-ashr [1]: ((_ extract {w-1} {w-1}) (bvashr x [3])) ==> ((_ extract {w-1} {w-1}) x)
+low-bits-of-rotation [3]: ((_ extract 2 0) ((_ rotate_left 3) x)) ==> ((_ extract {w-1} {w-3}) x)
+bit-of-or-with-it [1]: ((_ extract 0 0) (bvor x [1])) ==> [1@1]
+bit-of-and-without-it [1]: ((_ extract 3 3) (bvand x [-9])) ==> [0@1]
+low-bits-of-sum-with-high-constant [3]: ((_ extract 2 0) (bvadd x [-8])) ==> ((_ extract 2 0) x)
+
+## Concatenation
+concat-associates [bool]: (= (concat (concat x y) z) (concat x (concat y z))) ==> true
+concat-shifted-left [2w]: (bvshl (concat x y) [w@2w]) ==> (concat y [0])
+concat-shifted-right [2w]: (bvlshr (concat x y) [w@2w]) ==> ((_ zero_extend {w}) x)
+concat-shifted-arithmetic [2w]: (bvashr (concat x y) [w@2w]) ==> ((_ sign_extend {w}) x)
+concat-high-mask [2w]: (bvand (concat x y) [ones << w @2w]) ==> (concat x [0])
+concat-of-disjoint-or [2w]: (bvor (concat x [0]) (concat [0] y)) ==> (concat x y)
+concat-of-disjoint-add [2w]: (bvadd (concat x [0]) ((_ zero_extend {w}) y)) ==> (concat x y)
+concat-xor-common-low [2w]: (bvxor (concat x y) (concat z y)) ==> (concat (bvxor x z) [0])
+concat-and-halves [2w]: (bvand (concat x y) (concat z y)) ==> (concat (bvand x z) y)
+concat-eq-common-low [bool]: (= (concat x y) (concat z y)) ==> (= x z)
+
+## Repetition and extension
+repeat-once: ((_ repeat 1) x) ==> x
+zero-extend-by-nothing: ((_ zero_extend 0) x) ==> x
+sign-extend-by-nothing: ((_ sign_extend 0) x) ==> x
+sign-extend-as-repeated-sign [2w]: (concat ((_ repeat {w}) ((_ extract {w-1} {w-1}) x)) x) ==> ((_ sign_extend {w}) x)
+high-of-sign-extend: ((_ extract {2*w-1} {w}) ((_ sign_extend {w}) x)) ==> (bvashr x [w-1])
+low-of-repeat: ((_ extract {w-1} 0) ((_ repeat 2) x)) ==> x
+high-of-repeat: ((_ extract {2*w-1} {w}) ((_ repeat 2) x)) ==> x
+
+## Fields
+insert-low-read-low [h]: ((_ extract {h-1} 0) (bvor (bvand x [ones << h]) ((_ zero_extend {h}) ((_ extract {h-1} 0) y)))) ==> ((_ extract {h-1} 0) y)
+insert-low-read-high [h]: ((_ extract {w-1} {h}) (bvor (bvand x [ones << h]) ((_ zero_extend {h}) ((_ extract {h-1} 0) y)))) ==> ((_ extract {w-1} {h}) x)
+halves-rebuilt: (bvor (bvshl ((_ zero_extend {h}) ((_ extract {w-1} {h}) x)) [h]) ((_ zero_extend {h}) ((_ extract {h-1} 0) x))) ==> x
+field-shifted-up-and-back [h]: ((_ extract {h-1} 0) (bvlshr (bvshl x [h]) [h])) ==> ((_ extract {h-1} 0) x)
+field-set-then-read [h]: ((_ extract {w-1} {h}) (bvor x [ones << h])) ==> [ones@h]
+high-field-of-shifted-low [h]: ((_ extract {w-1} {h}) (bvshl ((_ zero_extend {h}) ((_ extract {h-1} 0) x)) [h])) ==> ((_ extract {h-1} 0) x)

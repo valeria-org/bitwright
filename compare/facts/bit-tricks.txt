@@ -1,0 +1,48 @@
+# Bit tricks in the manner of Hacker's Delight (the ones with a simpler equal form): the lowest
+# set bit, bit tests, sign extension and negation idioms, rotations assembled from slices, and
+# branchless selection through masks. Format: bitvector.txt.
+
+## Lowest set bit
+isolate-by-clearing: (bvxor x (bvand x (bvsub x [1]))) ==> (bvand x (bvneg x))
+isolate-by-complement: (bvand x (bvnot (bvsub x [1]))) ==> (bvand x (bvneg x))
+cleared-and-isolated: (bvor (bvand x (bvsub x [1])) (bvand x (bvneg x))) ==> x
+isolated-and-cleared-disjoint: (bvand (bvand x (bvneg x)) (bvand x (bvsub x [1]))) ==> [0]
+isolated-is-own-lowest: (bvand (bvand x (bvneg x)) (bvneg (bvand x (bvneg x)))) ==> (bvand x (bvneg x))
+isolated-at-most [bool]: (bvule (bvand x (bvneg x)) x) ==> true
+power-of-two-is-single-bit [bool]: (= (bvand (bvshl [1] (bvand y [7])) (bvsub (bvshl [1] (bvand y [7])) [1])) [0]) ==> true
+
+## Bit tests
+bit-by-shift [bool]: (= (bvand (bvlshr x [3]) [1]) [1]) ==> (= ((_ extract 3 3) x) [1@1])
+bit-by-mask [bool]: (distinct (bvand x [8]) [0]) ==> (= ((_ extract 3 3) x) [1@1])
+bit-clear-by-mask [bool]: (= (bvand x [8]) [0]) ==> (= ((_ extract 3 3) x) [0@1])
+sign-by-mask [bool]: (distinct (bvand x [smin]) [0]) ==> (bvslt x [0])
+sign-by-shift [bool]: (distinct (bvlshr x [w-1]) [0]) ==> (bvslt x [0])
+sign-by-arithmetic-shift [bool]: (= (bvashr x [w-1]) [ones]) ==> (bvslt x [0])
+nonnegative-by-arithmetic-shift [bool]: (= (bvashr x [w-1]) [0]) ==> (bvsle [0] x)
+
+## Sign extension and negation
+sign-extend-byte-by-xor: (bvsub (bvxor (bvand x [255]) [128]) [128]) ==> ((_ sign_extend {w-8}) ((_ extract 7 0) x))
+sign-extend-byte-by-shifts: (bvashr (bvshl x [w-8]) [w-8]) ==> ((_ sign_extend {w-8}) ((_ extract 7 0) x))
+zero-extend-byte-by-shifts: (bvlshr (bvshl x [w-8]) [w-8]) ==> (bvand x [255])
+sign-extend-half-by-shifts: (bvashr (bvshl x [h]) [h]) ==> ((_ sign_extend {h}) ((_ extract {h-1} 0) x))
+conditional-negate: (bvsub (bvxor x (ite p [ones] [0])) (ite p [ones] [0])) ==> (ite p (bvneg x) x)
+conditional-negate-by-bit: (bvsub (bvxor x (bvneg (ite p [1] [0]))) (bvneg (ite p [1] [0]))) ==> (ite p (bvneg x) x)
+sign-mask-xor-twice: (bvxor (bvxor x (bvashr y [w-1])) (bvashr y [w-1])) ==> x
+
+## Rotations from slices
+rotate-left-from-slices: (concat ((_ extract {w-4} 0) x) ((_ extract {w-1} {w-3}) x)) ==> ((_ rotate_left 3) x)
+rotate-right-from-slices: (concat ((_ extract 2 0) x) ((_ extract {w-1} 3) x)) ==> ((_ rotate_right 3) x)
+swap-halves: (concat ((_ extract {h-1} 0) x) ((_ extract {w-1} {h}) x)) ==> ((_ rotate_left {h}) x)
+swap-halves-twice: (concat ((_ extract {h-1} 0) (concat ((_ extract {h-1} 0) x) ((_ extract {w-1} {h}) x))) ((_ extract {w-1} {h}) (concat ((_ extract {h-1} 0) x) ((_ extract {w-1} {h}) x)))) ==> x
+rotate-left-one: (bvor (bvshl x [1]) (bvlshr x [w-1])) ==> ((_ rotate_left 1) x)
+rotate-right-one: (bvor (bvlshr x [1]) (bvshl x [w-1])) ==> ((_ rotate_right 1) x)
+
+## Selection through masks
+max-through-mask: (bvxor x (bvand (bvxor x y) (bvneg (ite (bvult x y) [1] [0])))) ==> (ite (bvult x y) y x)
+select-through-xor-mask: (bvxor y (bvand (bvxor x y) (ite p [ones] [0]))) ==> (ite p x y)
+select-through-or-mask: (bvor (bvand x (ite p [ones] [0])) (bvand y (bvnot (ite p [ones] [0])))) ==> (ite p x y)
+keep-through-mask: (bvand x (ite p [ones] [0])) ==> (ite p x [0])
+set-through-mask: (bvor x (ite p [ones] [0])) ==> (ite p [ones] x)
+flip-through-mask: (bvxor x (ite p [ones] [0])) ==> (ite p (bvnot x) x)
+keep-through-bit: (bvmul x (ite p [1] [0])) ==> (ite p x [0])
+signed-min-through-mask: (bvxor y (bvand (bvxor x y) (bvneg (ite (bvslt x y) [1] [0])))) ==> (ite (bvslt x y) x y)

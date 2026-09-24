@@ -1,0 +1,32 @@
+# Canonical forms: one function written with its operands in other orders or groupings, or its
+# constants in other places. A tool that normalizes sees these by comparing forms. Format:
+# bitvector.txt.
+
+## Commutativity and associativity
+add-reordered [bool]: (= (bvadd x (bvadd y z)) (bvadd (bvadd z y) x)) ==> true
+mul-reordered [bool]: (= (bvmul x (bvmul y z)) (bvmul (bvmul z x) y)) ==> true
+and-reordered [bool]: (= (bvand x (bvand y z)) (bvand (bvand z y) x)) ==> true
+or-reordered [bool]: (= (bvor x (bvor y z)) (bvor (bvor y z) x)) ==> true
+xor-reordered [bool]: (= (bvxor x (bvxor y z)) (bvxor (bvxor z x) y)) ==> true
+add-sub-reordered [bool]: (= (bvsub (bvadd x y) z) (bvadd (bvsub x z) y)) ==> true
+sub-sub-reordered [bool]: (= (bvsub (bvsub x y) z) (bvsub (bvsub x z) y)) ==> true
+eq-symmetric [bool]: (= (= x y) (= y x)) ==> true
+distinct-symmetric [bool]: (= (distinct x y) (distinct y x)) ==> true
+sum-minus-reordered-sum: (bvsub (bvadd (bvadd x y) z) (bvadd z (bvadd x y))) ==> [0]
+product-minus-reordered-product: (bvsub (bvmul (bvmul x y) z) (bvmul z (bvmul y x))) ==> [0]
+xor-with-reordered-xor: (bvxor (bvxor x (bvxor y z)) (bvxor (bvxor z y) x)) ==> [0]
+and-with-reordered-and: (bvand (bvand x y) (bvand y x)) ==> (bvand x y)
+or-with-reordered-or: (bvor (bvor x y) (bvor y x)) ==> (bvor x y)
+sum-of-swapped-products: (bvsub (bvadd (bvmul x y) (bvmul z x)) (bvadd (bvmul x z) (bvmul y x))) ==> [0]
+
+## Constants gathered
+add-constants-apart: (bvadd (bvadd x [3]) (bvadd y [4])) ==> (bvadd (bvadd x y) [7])
+sub-constants-apart: (bvsub (bvadd x [10]) (bvadd y [4])) ==> (bvadd (bvsub x y) [6])
+mul-constants-apart: (bvmul (bvmul x [3]) (bvmul y [5])) ==> (bvmul (bvmul x y) [15])
+and-constants-apart: (bvand (bvand x [12]) (bvand y [10])) ==> (bvand (bvand x y) [8])
+or-constants-apart: (bvor (bvor x [12]) (bvor y [3])) ==> (bvor (bvor x y) [15])
+xor-constants-apart: (bvxor (bvxor x [12]) (bvxor y [10])) ==> (bvxor (bvxor x y) [6])
+constant-through-two-negations: (bvneg (bvneg (bvadd x [5]))) ==> (bvadd x [5])
+constant-minus-difference: (bvsub [5] (bvsub [3] x)) ==> (bvadd x [2])
+constants-on-both-sides-add [bool]: (= (bvadd x [3]) (bvadd y [5])) ==> (= x (bvadd y [2]))
+constants-on-both-sides-xor [bool]: (= (bvxor x [3]) (bvxor y [5])) ==> (= x (bvxor y [6]))

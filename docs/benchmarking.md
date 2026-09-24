@@ -147,7 +147,7 @@ Miasm. Every answer is checked against its input and sized in bitwright's canoni
 all engines are scored the same way: how often each reaches the dataset's ground truth, how
 fast, and with how much heap. Its `versus-smt` compares bitwright's simplifier with the
 simplifiers of z3 and Bitwuzla, through their C APIs, on random bit-vector DAGs over the
-operators SMT-LIB has natively and on 377 identities of bit-vector algebra
-(`compare/facts/bitvector.txt`). It is its own Cargo workspace and needs the other engines
+operators SMT-LIB has natively and on 580 identities in six fact sets (`compare/facts/`:
+bit-vector algebra, number theory, orders, slices, bit tricks, canonical forms). It is its own Cargo workspace and needs the other engines
 installed; its README has the setup. The top-level README reports both comparisons
 ([Performance](../README.md#performance)).

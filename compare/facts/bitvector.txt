@@ -5,8 +5,9 @@
 # that trade sums of bitwise functions for other expressions (mixed boolean-arithmetic) are left
 # out, since the MBA comparison is on CoBRA's datasets.
 #
-# `[sort]` is the root's sort when it is not the base width: `bool`, `2w`, `h` (half) or a
-# number of bits.
+# `[sort]` is the root's sort when it is not the base width: `bool`, `2w`, or a width written
+# like the indices below (`h`, `w-3`, `1`). The other sets in this directory (number theory,
+# orders, slices, bit tricks, canonical forms) use the same format.
 # `{E}` is an integer (an index); `[E]` a constant of the base width, `[E@2w]`, `[E@h]`, `[E@1]`
 # one of another width. E is evaluated modulo 2^width: numbers, `w` and `h` (the base and half
 # widths), `ones`, `smin`, `smax` (of the constant's width), `inv(K)` (the inverse of an odd K),
