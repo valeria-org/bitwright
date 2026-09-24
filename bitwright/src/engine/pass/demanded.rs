@@ -8,7 +8,7 @@
 //! simplified region replaces the node only when it is strictly smaller.
 
 use crate::engine::budget::Counter;
-use std::collections::HashMap;
+use crate::hash::IdMap;
 
 use super::{Fin, PassKind, Runner, Step, Stop, facts, finish};
 use crate::BitVec;
@@ -19,8 +19,22 @@ use crate::ops::{BinOp, UnOp};
 /// The most nodes one simplification visits.
 const MAX_VISITS: u32 = 256;
 
+/// A node and a demanded mask: hashed by the mask's active limbs only (one for 64 bits), not
+/// all eight a `BitVec` stores.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key(u32, BitVec);
+
+impl core::hash::Hash for Key {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        h.write_u32(self.0);
+        for &l in self.1.limbs() {
+            h.write_u64(l);
+        }
+    }
+}
+
 struct Demand {
-    memo: HashMap<(u32, BitVec), u32>,
+    memo: IdMap<Key, u32>,
     stops: Vec<u32>,
     visits: u32,
     fin: Fin,
@@ -52,7 +66,7 @@ fn simplify(
     if m.is_zero() {
         return r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)));
     }
-    if let Some(&v) = st.memo.get(&(x, *m)) {
+    if let Some(&v) = st.memo.get(&Key(x, *m)) {
         return Ok(v);
     }
     st.visits += 1;
@@ -65,7 +79,7 @@ fn simplify(
     };
     if st.visits > MAX_VISITS || cx.const_val(x).is_some() {
         let v = stop(st)?;
-        st.memo.insert((x, *m), v);
+        st.memo.insert(Key(x, *m), v);
         return Ok(v);
     }
     // Known demanded bits make the operand a constant.
@@ -81,7 +95,7 @@ fn simplify(
             st.fin = st.fin.and(fin);
             let v = bv_and(&k.known_one(), m);
             let c = r.build(cx, |cx| cx.mk_const(&v))?;
-            st.memo.insert((x, *m), c);
+            st.memo.insert(Key(x, *m), c);
             return Ok(c);
         }
     }
@@ -185,7 +199,7 @@ fn simplify(
         }
         _ => stop(st)?,
     };
-    st.memo.insert((x, *m), v);
+    st.memo.insert(Key(x, *m), v);
     Ok(v)
 }
 
@@ -236,7 +250,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     let before = cx.len() as u32;
     let mut st = Demand {
-        memo: HashMap::new(),
+        memo: IdMap::default(),
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
