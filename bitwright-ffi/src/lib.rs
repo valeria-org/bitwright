@@ -17,6 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use bw::check::{CheckConfig, Verdict, check_program};
 use bw::engine::{Budget, End, Engine, Exhausted, Run, Strategy};
+use bw::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::rules::{Ledger, RuleProgram};
 use bw::{
@@ -123,6 +124,39 @@ const KIND_EXTRACT: c_int = 7;
 const KIND_CONCAT: c_int = 8;
 const KIND_SELECT: c_int = 9;
 const KIND_EXT: c_int = 10;
+const KIND_FP: c_int = 11;
+
+const ROUNDINGS: [RoundingMode; 5] = [
+    RoundingMode::Rne,
+    RoundingMode::Rna,
+    RoundingMode::Rtp,
+    RoundingMode::Rtn,
+    RoundingMode::Rtz,
+];
+
+/// `bw_fpop`: the operations, by their names in the text syntax (`fp.add`, ...).
+const FPOPS: [&str; 17] = [
+    "add", "mul", "div", "fma", "sqrt", "rem", "round", "min", "max", "eq", "lt", "le", "convert",
+    "from_sbv", "from_ubv", "to_sbv", "to_ubv",
+];
+
+const FPCMPS: [FpCmpOp; 5] = [
+    FpCmpOp::Eq,
+    FpCmpOp::Lt,
+    FpCmpOp::Le,
+    FpCmpOp::Gt,
+    FpCmpOp::Ge,
+];
+
+const FPTESTS: [FpTest; 7] = [
+    FpTest::Nan,
+    FpTest::Infinite,
+    FpTest::Zero,
+    FpTest::Subnormal,
+    FpTest::Normal,
+    FpTest::Negative,
+    FpTest::Positive,
+];
 
 const PRESET_STANDARD: c_int = 0;
 const PRESET_DEOBFUSCATE: c_int = 1;
@@ -143,6 +177,18 @@ fn table<T: Copy>(t: &[T], code: c_int, what: &str) -> Res<T> {
 
 fn code_of<T: PartialEq>(t: &[T], v: &T) -> c_int {
     t.iter().position(|x| x == v).map_or(-1, |i| i as c_int)
+}
+
+/// The code of `v` in `t`; a value without one (added to the library after this table) is
+/// `BW_ERR_UNSUPPORTED`.
+fn known_code<T: PartialEq + core::fmt::Debug>(t: &[T], v: &T) -> Res<c_int> {
+    match code_of(t, v) {
+        -1 => Err(Fail(
+            BW_ERR_UNSUPPORTED,
+            format!("{v:?} has no code in bitwright.h"),
+        )),
+        c => Ok(c),
+    }
 }
 
 // ----- errors ---------------------------------------------------------------------------------
@@ -760,6 +806,10 @@ fn node(cx: &Context, e: Expr) -> Res<BwNode> {
             kids(&mut n, KIND_EXT, args.as_slice());
             n.lo = u16::from(output);
         }
+        View::Fp { op, args, .. } => {
+            kids(&mut n, KIND_FP, args.as_slice());
+            n.op = fp_code(op)?;
+        }
         other => return Err(Fail(BW_ERR_UNSUPPORTED, format!("node {other:?}"))),
     }
     Ok(n)
@@ -844,6 +894,274 @@ pub unsafe extern "C" fn bw_dag_size(cx: *mut BwContext, e: u64, out: *mut u32) 
         let n = match cx.dag_size(&[expr(e)?], u32::MAX - 1)? {
             Bounded::Exact(n) | Bounded::AtLeast(n) => n,
             _ => u32::MAX,
+        };
+        unsafe { out.set(n) };
+        Ok(())
+    })
+}
+
+// ----- floating point -------------------------------------------------------------------------
+
+/// `bw_fp_format`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BwFpFormat {
+    eb: u32,
+    sb: u32,
+}
+
+/// The format `f` describes, if it is valid (`BW_ERR_WIDTH` otherwise).
+fn fp_format(f: BwFpFormat) -> Res<FpFormat> {
+    Ok(FpFormat::new(f.eb, f.sb)?)
+}
+
+fn c_format(f: FpFormat) -> BwFpFormat {
+    BwFpFormat {
+        eb: f.eb(),
+        sb: f.sb(),
+    }
+}
+
+const NO_FORMAT: BwFpFormat = BwFpFormat { eb: 0, sb: 0 };
+
+/// The operation named `name` (of `FPOPS`) with its attributes; each attribute is read only by
+/// the operations that have it.
+fn fp_op(name: &str, rm: c_int, to: BwFpFormat, int_width: u16) -> Res<FpOp> {
+    let rm = || table(&ROUNDINGS, rm, "rounding mode");
+    Ok(match name {
+        "add" => FpOp::Add(rm()?),
+        "mul" => FpOp::Mul(rm()?),
+        "div" => FpOp::Div(rm()?),
+        "fma" => FpOp::Fma(rm()?),
+        "sqrt" => FpOp::Sqrt(rm()?),
+        "rem" => FpOp::Rem,
+        "round" => FpOp::RoundToIntegral(rm()?),
+        "min" => FpOp::Min,
+        "max" => FpOp::Max,
+        "eq" => FpOp::Eq,
+        "lt" => FpOp::Lt,
+        "le" => FpOp::Le,
+        "convert" => FpOp::Convert {
+            to: fp_format(to)?,
+            rm: rm()?,
+        },
+        "from_sbv" => FpOp::FromSInt(rm()?),
+        "from_ubv" => FpOp::FromUInt(rm()?),
+        "to_sbv" => FpOp::ToSInt(rm()?, width(int_width)?),
+        "to_ubv" => FpOp::ToUInt(rm()?, width(int_width)?),
+        other => unreachable!("`{other}` is not in FPOPS"),
+    })
+}
+
+/// The `bw_fpop` of an operation.
+fn fp_code(op: FpOp) -> Res<c_int> {
+    let name = match op {
+        FpOp::Add(_) => "add",
+        FpOp::Mul(_) => "mul",
+        FpOp::Div(_) => "div",
+        FpOp::Fma(_) => "fma",
+        FpOp::Sqrt(_) => "sqrt",
+        FpOp::Rem => "rem",
+        FpOp::RoundToIntegral(_) => "round",
+        FpOp::Min => "min",
+        FpOp::Max => "max",
+        FpOp::Eq => "eq",
+        FpOp::Lt => "lt",
+        FpOp::Le => "le",
+        FpOp::Convert { .. } => "convert",
+        FpOp::FromSInt(_) => "from_sbv",
+        FpOp::FromUInt(_) => "from_ubv",
+        FpOp::ToSInt(..) => "to_sbv",
+        FpOp::ToUInt(..) => "to_ubv",
+        other => {
+            return Err(Fail(
+                BW_ERR_UNSUPPORTED,
+                format!("floating-point operation {other:?}"),
+            ));
+        }
+    };
+    known_code(&FPOPS, &name)
+}
+
+/// # Safety
+/// As `bw_symbol`; `args` holds `n` handles.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // bitwright.h's signature
+pub unsafe extern "C" fn bw_fp(
+    cx: *mut BwContext,
+    op: c_int,
+    rm: c_int,
+    format: BwFpFormat,
+    args: *const u64,
+    n: usize,
+    to: BwFpFormat,
+    int_width: u16,
+    out: *mut u64,
+) -> c_int {
+    unsafe {
+        build(cx, out, |cx| {
+            let name = table(&FPOPS, op, "floating-point operation")?;
+            let op = fp_op(name, rm, to, int_width)?;
+            let format = fp_format(format)?;
+            let args = exprs(slice(args, n, "args")?)?;
+            if args.len() != op.arity() {
+                return Err(invalid(format!(
+                    "`fp.{name}` takes {} operands, not {n}",
+                    op.arity()
+                )));
+            }
+            Ok(cx.fp(op, format, &args)?)
+        })
+    }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_sub(
+    cx: *mut BwContext,
+    rm: c_int,
+    format: BwFpFormat,
+    a: u64,
+    b: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe {
+        build(cx, out, |cx| {
+            let rm = table(&ROUNDINGS, rm, "rounding mode")?;
+            Ok(cx.fp_sub(fp_format(format)?, rm, expr(a)?, expr(b)?)?)
+        })
+    }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_neg(
+    cx: *mut BwContext,
+    format: BwFpFormat,
+    a: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe { build(cx, out, |cx| Ok(cx.fp_neg(fp_format(format)?, expr(a)?)?)) }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_abs(
+    cx: *mut BwContext,
+    format: BwFpFormat,
+    a: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe { build(cx, out, |cx| Ok(cx.fp_abs(fp_format(format)?, expr(a)?)?)) }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_copysign(
+    cx: *mut BwContext,
+    format: BwFpFormat,
+    a: u64,
+    b: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe {
+        build(cx, out, |cx| {
+            Ok(cx.fp_copysign(fp_format(format)?, expr(a)?, expr(b)?)?)
+        })
+    }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_cmp(
+    cx: *mut BwContext,
+    op: c_int,
+    format: BwFpFormat,
+    a: u64,
+    b: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe {
+        build(cx, out, |cx| {
+            let op = table(&FPCMPS, op, "floating-point comparison")?;
+            Ok(cx.fp_cmp(fp_format(format)?, op, expr(a)?, expr(b)?)?)
+        })
+    }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_test(
+    cx: *mut BwContext,
+    test: c_int,
+    format: BwFpFormat,
+    a: u64,
+    out: *mut u64,
+) -> c_int {
+    unsafe {
+        build(cx, out, |cx| {
+            let t = table(&FPTESTS, test, "floating-point test")?;
+            Ok(cx.fp_test(fp_format(format)?, t, expr(a)?)?)
+        })
+    }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_x87_load(cx: *mut BwContext, a: u64, out: *mut u64) -> c_int {
+    unsafe { build(cx, out, |cx| Ok(cx.x87_load(expr(a)?)?)) }
+}
+
+/// # Safety
+/// As `bw_symbol`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_x87_store(cx: *mut BwContext, a: u64, out: *mut u64) -> c_int {
+    unsafe { build(cx, out, |cx| Ok(cx.x87_store(expr(a)?)?)) }
+}
+
+/// `bw_fp_node`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BwFpNode {
+    op: c_int,
+    rm: c_int,
+    format: BwFpFormat,
+    to: BwFpFormat,
+    int_width: u16,
+}
+
+/// # Safety
+/// As `bw_node_of`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_fp_node_of(cx: *const BwContext, e: u64, out: *mut BwFpNode) -> c_int {
+    run(|| {
+        let cx = &unsafe { get(cx, "cx") }?.cx;
+        let out = Out::new(out, "out")?;
+        let View::Fp { op, format, .. } = cx.view(expr(e)?)? else {
+            return Err(invalid("not a floating-point node"));
+        };
+        let (to, int_width) = match op {
+            FpOp::Convert { to, .. } => (c_format(to), 0),
+            FpOp::ToSInt(_, w) | FpOp::ToUInt(_, w) => (NO_FORMAT, w.bits()),
+            _ => (NO_FORMAT, 0),
+        };
+        let rm = match op.rounding_mode() {
+            Some(rm) => known_code(&ROUNDINGS, &rm)?,
+            None => -1,
+        };
+        let n = BwFpNode {
+            op: fp_code(op)?,
+            rm,
+            format: c_format(format),
+            to,
+            int_width,
         };
         unsafe { out.set(n) };
         Ok(())

@@ -48,6 +48,14 @@ int main() {
     std::cout << "x + y has " << n.children.size() << " children: " << n.children[0] << ", "
               << n.children[1] << "\n";
 
+    // Floating point on the bit-vectors that hold the encodings: 0.1 + 0.2 in binary32, to
+    // nearest and toward zero.
+    bw::Expr p = cx.symbol("p", 32), q = cx.symbol("q", 32);
+    bw::Value tenth(32, 0x3dcccccd), fifth(32, 0x3e4ccccd);
+    bw::Expr near = p.fadd(q, bw::F32), down = p.fadd(q, bw::F32, bw::Rounding::Rtz);
+    std::cout << near << " at 0.1, 0.2: " << cx.eval(near, {{p, tenth}, {q, fifth}})
+              << ", toward zero " << cx.eval(down, {{p, tenth}, {q, fifth}}) << "\n";
+
     // Errors are exceptions.
     try {
         cx.parse("x +");

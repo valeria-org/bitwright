@@ -1,5 +1,6 @@
 """Tests of the Python bindings: `pip install ./bitwright-py pytest && pytest bitwright-py/tests`."""
 
+import struct
 import threading
 
 import pytest
@@ -274,6 +275,240 @@ def test_python_code_run_by_an_operation_may_use_the_context(cx):
     assert w.eval(w=Wide(2**299)) == 2**299
     assert (w ^ Wide(2**299)).eval(w=0) == 2**299
     assert cx.symbol(Key(), 8).name == "#7"
+    o = cx.symbol("o", 256)
+    assert o.fadd(Wide(2**255), bw.F256).fmul(o, bw.F256).width == 256
+
+
+# ----- floating point ----------------------------------------------------------------------------
+
+
+def f16(v: float) -> int:
+    """The binary16 encoding of `v`."""
+    return int(struct.unpack("<H", struct.pack("<e", v))[0])
+
+
+def f32(v: float) -> int:
+    """The binary32 encoding of `v`."""
+    return int(struct.unpack("<I", struct.pack("<f", v))[0])
+
+
+def f64(v: float) -> int:
+    """The binary64 encoding of `v`."""
+    return int(struct.unpack("<Q", struct.pack("<d", v))[0])
+
+
+def test_float_formats():
+    assert bw.FpFormat(8, 24) == bw.F32 and bw.F32 != bw.F64 and bw.F32 != (8, 24)
+    assert hash(bw.FpFormat(8, 24)) == hash(bw.F32)
+    assert len({bw.F16, bw.BF16, bw.FpFormat(5, 11)}) == 2
+    assert repr(bw.F32) == "FpFormat(8, 24)"
+    named = [
+        (bw.F16, "f16", 5, 11),
+        (bw.BF16, "bf16", 8, 8),
+        (bw.F32, "f32", 8, 24),
+        (bw.F64, "f64", 11, 53),
+        (bw.F128, "f128", 15, 113),
+        (bw.F256, "f256", 19, 237),
+        (bw.X87, None, 15, 64),
+    ]
+    for f, name, eb, sb in named:
+        assert (f.name, f.eb, f.sb, f.width) == (name, eb, sb, eb + sb)
+    assert bw.FpFormat(3, 4).name is None and bw.FpFormat(2, 510).width == 512
+    for eb, sb in [(1, 8), (32, 8), (8, 1), (11, 502), (8, 2**32 - 1)]:
+        with pytest.raises(bw.WidthError, match="floating-point format"):
+            bw.FpFormat(eb, sb)
+
+
+def test_float_operations_are_the_text_syntax(cx):
+    a, b, c = cx.symbols("a b c", 32)
+    d, i, x = cx.symbol("d", 64), cx.symbol("i", 16), cx.symbol("x", 80)
+    tiny = bw.FpFormat(3, 4)
+    cases = [
+        (a.fadd(b, bw.F32), "fp.add.rne.f32(a, b)"),
+        (a.fsub(b, bw.F32, "rtz"), "fp.sub.rtz.f32(a, b)"),
+        (a.fmul(b, bw.F32, rm="rtp"), "fp.mul.rtp.f32(a, b)"),
+        (a.fdiv(b, bw.F32, "rtn"), "fp.div.rtn.f32(a, b)"),
+        (a.ffma(b, c, bw.F32, "rna"), "fp.fma.rna.f32(a, b, c)"),
+        (a.fsqrt(bw.F32), "fp.sqrt.rne.f32(a)"),
+        (a.frem(b, bw.F32), "fp.rem.f32(a, b)"),
+        (a.fround(bw.F32, "rtz"), "fp.round.rtz.f32(a)"),
+        (a.fmin(b, bw.F32), "fp.min.f32(a, b)"),
+        (a.fmax(b, bw.F32), "fp.max.f32(a, b)"),
+        (a.feq(b, bw.F32), "fp.eq.f32(a, b)"),
+        (a.flt(b, bw.F32), "fp.lt.f32(a, b)"),
+        (a.fle(b, bw.F32), "fp.le.f32(a, b)"),
+        (a.fgt(b, bw.F32), "fp.gt.f32(a, b)"),
+        (a.fge(b, bw.F32), "fp.ge.f32(a, b)"),
+        (a.fneg(bw.F32), "fp.neg.f32(a)"),
+        (a.fabs(bw.F32), "fp.abs.f32(a)"),
+        (a.fcopysign(b, bw.F32), "fp.copysign.f32(a, b)"),
+        (a.fisnan(bw.F32), "fp.isnan.f32(a)"),
+        (a.fisinf(bw.F32), "fp.isinf.f32(a)"),
+        (a.fiszero(bw.F32), "fp.iszero.f32(a)"),
+        (a.fissubnormal(bw.F32), "fp.issubnormal.f32(a)"),
+        (a.fisnormal(bw.F32), "fp.isnormal.f32(a)"),
+        (a.fisneg(bw.F32), "fp.isneg.f32(a)"),
+        (a.fispos(bw.F32), "fp.ispos.f32(a)"),
+        (a.fconvert(bw.F64, bw.F32), "fp.convert.rne.f32.f64(a)"),
+        (d.fconvert(tiny, bw.F64, "rtz"), "fp.convert.rtz<11, 53, 3, 4>(d)"),
+        (i.to_float(bw.F64), "fp.from_sbv.rne.f64(i)"),
+        (i.to_float(bw.F16, "rtp", signed=False), "fp.from_ubv.rtp.f16(i)"),
+        (d.to_int(32, bw.F64, "rtz"), "fp.to_sbv.rtz.f64<32>(d)"),
+        (d.to_int(8, bw.F64, signed=False), "fp.to_ubv.rne.f64<8>(d)"),
+        (x.x87_load(), "fp.x87_load(x)"),
+        (x.x87_load().x87_store(), "fp.x87_store(fp.x87_load(x))"),
+    ]
+    for e, text in cases:
+        assert e == cx.parse(text), text
+    assert str(a.fadd(b, bw.F32, "rtz")) == "fp.add.rtz.f32(a, b)"
+    assert str(d.to_int(32, bw.F64, "rtz")) == "fp.to_sbv.rtz.f64<32>(d)"
+    # The sign operations and the tests are bit-vector operators.
+    assert str(a.fneg(bw.F32)) == "a ^ 0x80000000"
+    assert str(a.fabs(bw.F32)) == "a & 0x7fffffff"
+    # An int operand is an encoding: a constant of the width.
+    assert str(a.fmul(0x40400000, bw.F32)) == "fp.mul.rne.f32(a, 0x40400000)"
+
+
+def test_float_evaluation(cx):
+    a, b = cx.symbols("a b", 32)
+    near, down = a.fadd(b, bw.F32), a.fadd(b, bw.F32, "rtz")
+    # 0.1 + 0.2 in binary32: the exact sum lies 3/4 of the way to the next value up, so to
+    # nearest it rounds up (to 0.3f), toward zero one unit in the last place lower.
+    assert near.eval(a=f32(0.1), b=f32(0.2)) == f32(0.3) == 0x3E99999A
+    assert down.eval(a=f32(0.1), b=f32(0.2)) == f32(0.3) - 1
+    # Operations on constants fold, exactly.
+    tenth = cx.const(f32(0.1), 32)
+    fifth = tenth.fadd(tenth, bw.F32)
+    assert fifth.kind == "const" and fifth.value == f32(0.2)
+    # A NaN result is the canonical NaN, equal to nothing.
+    d = cx.symbol("d", 64)
+    root = d.fsqrt(bw.F64)
+    assert root.eval(d=f64(-1.0)) == 0x7FF8000000000000
+    assert root.feq(root, bw.F64).eval(d=f64(-1.0)) == 0
+    assert root.feq(root, bw.F64).eval(d=f64(4.0)) == 1
+    # Conversions to integers saturate, and a NaN converts to 0.
+    to_i32 = d.to_int(32, bw.F64, "rtz")
+    assert to_i32.eval(d=f64(1e10)) == 0x7FFFFFFF
+    assert to_i32.eval(d=f64(-2.9)) == 2**32 - 2
+    assert to_i32.eval(d=f64(float("nan"))) == 0
+    # binary16 has 11 bits of precision: 2049 rounds to 2048, or up to 2050.
+    i = cx.symbol("i", 16)
+    assert i.to_float(bw.F16, signed=False).eval(i=2049) == f16(2048.0)
+    assert i.to_float(bw.F16, "rtp", signed=False).eval(i=2049) == f16(2050.0)
+    # Any format: binary64 widens to binary128 exactly, and back.
+    wide = d.fconvert(bw.F128, bw.F64)
+    assert wide.eval(d=f64(0.1)) == 0x3FFB999999999999A000000000000000
+    assert wide.fconvert(bw.F64, bw.F128).eval(d=f64(0.1)) == f64(0.1)
+    # x87: a load and a store give an encoding back; an unnormal loads as the NaN.
+    x = cx.symbol("x", 80)
+    one = 0x3FFF << 64 | 1 << 63
+    assert x.x87_load().x87_store().eval(x=one) == one
+    assert x.x87_load().eval(x=0x3FFF << 64) == 0x3FFFC000000000000000
+
+
+def test_float_inspection(cx):
+    a, b = cx.symbols("a b", 32)
+    e = a.fmul(b, bw.F32, "rtz")
+    assert (e.kind, e.op, e.format, e.rounding, e.to_format) == ("fp", "mul", bw.F32, "rtz", None)
+    assert e.children == [a, b] and e.width == 32 and e.lo is None
+    gt = a.fgt(b, bw.F32)
+    assert (gt.kind, gt.op, gt.rounding, gt.width) == ("fp", "lt", None, 1)
+    assert gt.children == [b, a]  # stored as `lt` with the operands swapped
+    cv = a.fconvert(bw.F16, bw.F32, "rna")
+    assert (cv.op, cv.format, cv.to_format, cv.rounding, cv.width) == (
+        "convert",
+        bw.F32,
+        bw.F16,
+        "rna",
+        16,
+    )
+    i = cx.symbol("i", 16)
+    fl = i.to_float(bw.F64, signed=False)
+    assert (fl.op, fl.format, fl.children, fl.width) == ("from_ubv", bw.F64, [i], 64)
+    to = a.to_int(8, bw.F32, "rtz")
+    assert (to.op, to.format, to.rounding, to.width) == ("to_sbv", bw.F32, "rtz", 8)
+    ops = [
+        a.fadd(b, bw.F32),
+        a.fmul(b, bw.F32),
+        a.fdiv(b, bw.F32),
+        a.ffma(b, b, bw.F32),
+        a.fsqrt(bw.F32),
+        a.frem(b, bw.F32),
+        a.fround(bw.F32),
+        a.fmin(b, bw.F32),
+        a.fmax(b, bw.F32),
+        a.feq(b, bw.F32),
+        a.flt(b, bw.F32),
+        a.fle(b, bw.F32),
+        a.fconvert(bw.F64, bw.F32),
+        i.to_float(bw.F32),
+        i.to_float(bw.F32, signed=False),
+        a.to_int(8, bw.F32),
+        a.to_int(8, bw.F32, signed=False),
+    ]
+    names = "add mul div fma sqrt rem round min max eq lt le convert from_sbv from_ubv to_sbv to_ubv"
+    assert [e.op for e in ops] == names.split()
+    assert all(e.kind == "fp" for e in ops)
+    assert [e.rounding is None for e in ops[5:12]] == [True, False, True, True, True, True, True]
+    # Operations built from bit-vector operators, and other nodes, have no format.
+    assert a.fneg(bw.F32).kind == "binary" and a.fneg(bw.F32).format is None
+    assert a.fisnan(bw.F32).kind == "compare" and a.fisnan(bw.F32).rounding is None
+    assert (a.format, a.to_format, a.rounding) == (None, None, None)
+
+
+def test_float_facts_and_proofs(cx):
+    i, j = cx.symbols("i j", 16)
+    product = i.to_float(bw.F64).fmul(j.to_float(bw.F64), bw.F64)
+    # An integer converted to a float is never a NaN, nor a product of two of them.
+    assert product.fisnan(bw.F64).prove() is False
+    assert str(product.fisnan(bw.F64).simplify()) == "0:1"
+    # A byte converted to a float and back to 16 bits is below 256.
+    b = cx.symbol("b", 8)
+    back = b.to_float(bw.F64, signed=False).to_int(16, bw.F64, "rtz", signed=False)
+    assert back.facts().umax == 255
+    # The square root of a value known to be +0 to +inf is not a NaN.
+    x = cx.symbol("x", 32)
+    positive = bw.Assumptions(x.ule(0x7F800000))
+    isnan = x.fsqrt(bw.F32).fisnan(bw.F32)
+    assert isnan.prove() is None
+    assert isnan.prove(positive) is False
+    out = bw.Engine().run([isnan], assumptions=positive)[0]
+    assert str(out.expr) == "0:1" and out.relies_on == (0,)
+
+
+def test_float_smtlib_round_trip(cx):
+    a, b = cx.symbols("a b", 32)
+    e = a.fadd(b, bw.F32, "rtz").fmul(a, bw.F32)
+    script = cx.to_smtlib(e)
+    assert "(fp.add RTZ ((_ to_fp 8 24)" in script
+    back = bw.Context().from_smtlib(script).definitions["root0"]
+    assert str(back) == str(e) == "fp.mul.rne.f32(fp.add.rtz.f32(a, b), a)"
+
+
+def test_float_errors(cx):
+    a, h = cx.symbol("a", 32), cx.symbol("h", 16)
+    with pytest.raises(bw.WidthError, match="widths differ"):
+        a.fadd(h, bw.F32)
+    with pytest.raises(bw.WidthError):
+        a.fadd(a, bw.F64)
+    with pytest.raises(bw.WidthError):
+        h.fneg(bw.F32)
+    with pytest.raises(bw.WidthError):
+        h.fisnan(bw.F32)
+    with pytest.raises(bw.WidthError):
+        a.fconvert(bw.F64, bw.F16)
+    with pytest.raises(bw.WidthError):
+        a.x87_load()
+    with pytest.raises(bw.WidthError):
+        a.to_int(0, bw.F32)
+    with pytest.raises(ValueError, match="rounding mode"):
+        a.fadd(a, bw.F32, "up")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        a.fadd(a, "f32")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        a.fadd(1.5, bw.F32)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        a.fadd(2**32, bw.F32)
 
 
 def test_threads_share_engines_and_contexts():

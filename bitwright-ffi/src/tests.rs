@@ -95,14 +95,17 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
             "`{name}` is not declared in bitwright.h"
         );
     }
-    // Every function the header declares is exported (the inline value helpers aside).
-    for decl in header.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '(')) {
-        if let Some(name) = decl.strip_suffix('(')
-            && name.starts_with("bw_")
-            && !name.starts_with("bw_value_")
-        {
+    // Every function the header declares (or calls) is exported, the inline helpers aside.
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    for (at, _) in header.match_indices("bw_") {
+        if header[..at].ends_with(ident) {
+            continue;
+        }
+        let name: String = header[at..].chars().take_while(|&c| ident(c)).collect();
+        let inline = name.starts_with("bw_value_") || name == "bw_fp_format_of";
+        if header[at + name.len()..].starts_with('(') && !inline {
             assert!(
-                exported.contains(&name),
+                exported.contains(&name.as_str()),
                 "`{name}` is declared but not exported"
             );
         }
@@ -142,6 +145,43 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
     for (i, l) in limits.iter().enumerate() {
         assert_eq!(value_of(&format!("BW_LIMIT_{l}")), i);
     }
+    for (i, rm) in ROUNDINGS.iter().enumerate() {
+        assert_eq!(value_of(&format!("BW_{}", rm.name().to_uppercase())), i);
+    }
+    for (i, op) in FPOPS.iter().enumerate() {
+        assert_eq!(value_of(&format!("BW_FP_{}", op.to_uppercase())), i);
+    }
+    for (i, op) in FPCMPS.iter().enumerate() {
+        assert_eq!(value_of(&format!("BW_FPCMP_{op:?}").to_uppercase()), i);
+    }
+    // (The tests' codes are checked against their semantics in `floating_point_values`.)
+    let tests = [
+        "ISNAN",
+        "ISINF",
+        "ISZERO",
+        "ISSUBNORMAL",
+        "ISNORMAL",
+        "ISNEG",
+        "ISPOS",
+    ];
+    assert_eq!(tests.len(), FPTESTS.len());
+    for (i, t) in tests.iter().enumerate() {
+        assert_eq!(value_of(&format!("BW_FP_{t}")), i);
+    }
+    // The named formats.
+    let named = FpFormat::NAMED.into_iter().chain([(FpFormat::X87, "x87")]);
+    for (f, name) in named {
+        let def = format!("#define BW_{} bw_fp_format_of(", name.to_uppercase());
+        let at = header.find(&def).expect(&def) + def.len();
+        let args: Vec<u32> = header[at..]
+            .split(')')
+            .next()
+            .unwrap()
+            .split(", ")
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert_eq!(args, [f.eb(), f.sb()], "{name}");
+    }
     for (name, code) in [
         ("BW_ERR_WIDTH", BW_ERR_WIDTH),
         ("BW_ERR_VALUE", BW_ERR_VALUE),
@@ -173,6 +213,7 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
         ("BW_KIND_CONCAT", KIND_CONCAT),
         ("BW_KIND_SELECT", KIND_SELECT),
         ("BW_KIND_EXT", KIND_EXT),
+        ("BW_KIND_FP", KIND_FP),
         ("BW_PRESET_STANDARD", PRESET_STANDARD),
         ("BW_PRESET_DEOBFUSCATE", PRESET_DEOBFUSCATE),
         ("BW_SMT_SYMBOLS", SMT_SYMBOLS),
@@ -722,4 +763,462 @@ fn engines_are_shared_between_threads() {
         assert_eq!(t.join().unwrap(), format!("x + {i}").replace("x + 0", "x"));
     }
     unsafe { bw_engine_free(engine as *mut BwEngine) };
+}
+
+// ----- floating point -------------------------------------------------------------------------
+
+fn rm(m: RoundingMode) -> c_int {
+    code_of(&ROUNDINGS, &m)
+}
+
+fn f32_value(v: f32) -> BwValue {
+    val(32, u64::from(v.to_bits()))
+}
+
+fn f64_value(v: f64) -> BwValue {
+    val(64, v.to_bits())
+}
+
+impl Cx {
+    /// `bw_fp`, which must succeed.
+    fn fp(&self, op: &str, rm: c_int, f: FpFormat, args: &[u64], to: FpFormat, w: u16) -> u64 {
+        let mut e = 0;
+        let (f, to) = (c_format(f), c_format(to));
+        let code = code_of(&FPOPS, &op);
+        let st = unsafe {
+            bw_fp(
+                self.0,
+                code,
+                rm,
+                f,
+                args.as_ptr(),
+                args.len(),
+                to,
+                w,
+                &mut e,
+            )
+        };
+        assert_eq!(st, BW_OK, "fp.{op}: {}", last_error());
+        e
+    }
+
+    fn eval(&self, e: u64, env: &[(u64, BwValue)]) -> BwValue {
+        let (syms, vals): (Vec<u64>, Vec<BwValue>) = env.iter().copied().unzip();
+        let mut out = val(1, 0);
+        let st = unsafe { bw_eval(self.0, e, syms.as_ptr(), vals.as_ptr(), env.len(), &mut out) };
+        assert_eq!(st, BW_OK, "{}", last_error());
+        out
+    }
+
+    fn node(&self, e: u64) -> BwNode {
+        let mut n = BwNode {
+            kind: -9,
+            op: -9,
+            width: 0,
+            lo: 9,
+            n_children: 0,
+            children: [0; 3],
+        };
+        assert_eq!(
+            unsafe { bw_node_of(self.0, e, &mut n) },
+            BW_OK,
+            "{}",
+            last_error()
+        );
+        n
+    }
+
+    fn fp_node(&self, e: u64) -> BwFpNode {
+        let mut n = BwFpNode {
+            op: -9,
+            rm: -9,
+            format: c_format(FpFormat::F256),
+            to: c_format(FpFormat::F256),
+            int_width: 9,
+        };
+        let st = unsafe { bw_fp_node_of(self.0, e, &mut n) };
+        assert_eq!(st, BW_OK, "{}", last_error());
+        n
+    }
+}
+
+/// An operation, its mode, its format, its operands, and the text syntax of the node.
+type FpCase<'a> = (&'a str, Option<RoundingMode>, FpFormat, &'a [u64], &'a str);
+
+/// Every operation of `bw_fpop`, built with `bw_fp`: the node the text syntax gives, and
+/// inspected back.
+#[test]
+fn floating_point_nodes() {
+    use RoundingMode::*;
+    let cx = Cx::new();
+    let (a, b, c) = (cx.sym("a", 32), cx.sym("b", 32), cx.sym("c", 32));
+    let (d, e) = (cx.sym("d", 64), cx.sym("e", 64));
+    let (h, i) = (cx.sym("h", 16), cx.sym("i", 16));
+    let (s, t, tiny) = (cx.sym("s", 7), cx.sym("t", 7), FpFormat::new(3, 4).unwrap());
+    let (f16, bf16, f32, f64) = (FpFormat::F16, FpFormat::BF16, FpFormat::F32, FpFormat::F64);
+    // Conversions to another format are to binary64 and to an integer to 32 bits; the other
+    // operations ignore both.
+    let (to, w) = (f64, 32);
+    let cases: [FpCase; 18] = [
+        ("add", Some(Rne), f32, &[a, b], "fp.add.rne.f32(a, b)"),
+        ("mul", Some(Rtz), f32, &[a, b], "fp.mul.rtz.f32(a, b)"),
+        ("div", Some(Rtp), f64, &[d, e], "fp.div.rtp.f64(d, e)"),
+        ("fma", Some(Rtn), f32, &[a, b, c], "fp.fma.rtn.f32(a, b, c)"),
+        ("sqrt", Some(Rna), f16, &[h], "fp.sqrt.rna.f16(h)"),
+        ("rem", None, f64, &[d, e], "fp.rem.f64(d, e)"),
+        ("round", Some(Rtz), bf16, &[h], "fp.round.rtz.bf16(h)"),
+        ("min", None, f32, &[a, b], "fp.min.f32(a, b)"),
+        ("max", None, f32, &[a, b], "fp.max.f32(a, b)"),
+        ("eq", None, f32, &[a, b], "fp.eq.f32(a, b)"),
+        ("lt", None, f32, &[a, b], "fp.lt.f32(a, b)"),
+        ("le", None, f64, &[e, d], "fp.le.f64(e, d)"),
+        ("convert", Some(Rne), f32, &[a], "fp.convert.rne.f32.f64(a)"),
+        ("add", Some(Rna), tiny, &[s, t], "fp.add.rna<3, 4>(s, t)"),
+        ("from_sbv", Some(Rne), f64, &[i], "fp.from_sbv.rne.f64(i)"),
+        ("from_ubv", Some(Rtn), f16, &[a], "fp.from_ubv.rtn.f16(a)"),
+        ("to_sbv", Some(Rtz), f64, &[d], "fp.to_sbv.rtz.f64<32>(d)"),
+        ("to_ubv", Some(Rne), f32, &[a], "fp.to_ubv.rne.f32<32>(a)"),
+    ];
+    for (op, mode, format, args, text) in cases {
+        // An operation without a rounding mode ignores the one given.
+        let e = cx.fp(op, mode.map_or(99, rm), format, args, to, w);
+        assert_eq!(cx.print(e), text);
+        assert_eq!(e, cx.parse(text, 0), "{text}");
+        let n = cx.node(e);
+        let mut width = 0;
+        assert_eq!(unsafe { bw_width(cx.0, e, &mut width) }, BW_OK);
+        let code = code_of(&FPOPS, &op);
+        assert_eq!((n.kind, n.op, n.width, n.lo), (KIND_FP, code, width, 0));
+        assert_eq!(&n.children[..n.n_children as usize], args, "{text}");
+        let f = cx.fp_node(e);
+        assert_eq!(f.op, n.op);
+        assert_eq!(f.rm, mode.map_or(-1, rm), "{text}");
+        assert_eq!(f.format, c_format(format));
+        let want = match op {
+            "convert" => (c_format(to), 0),
+            "to_sbv" | "to_ubv" => (NO_FORMAT, w),
+            _ => (NO_FORMAT, 0),
+        };
+        assert_eq!((f.to, f.int_width), want, "{text}");
+    }
+    // The other builders make bit-vector operators, or nodes of `bw_fpop`.
+    let (f, mut out) = (c_format(f32), 0);
+    unsafe {
+        assert_eq!(bw_fp_sub(cx.0, rm(Rtp), f, a, b, &mut out), BW_OK);
+        assert_eq!(out, cx.parse("fp.sub.rtp.f32(a, b)", 0));
+        assert!(cx.print(out).starts_with("fp.add.rtp.f32("));
+        assert_eq!(bw_fp_neg(cx.0, f, a, &mut out), BW_OK);
+        assert_eq!(cx.print(out), "a ^ 0x80000000");
+        assert_eq!(cx.node(out).kind, KIND_BINARY);
+        assert_eq!(bw_fp_abs(cx.0, f, a, &mut out), BW_OK);
+        assert_eq!(cx.print(out), "a & 0x7fffffff");
+        assert_eq!(bw_fp_copysign(cx.0, f, a, b, &mut out), BW_OK);
+        assert_eq!(out, cx.parse("fp.copysign.f32(a, b)", 0));
+        // `gt` and `ge` are `lt` and `le` swapped.
+        for (op, text) in [
+            (FpCmpOp::Eq, "fp.eq.f32(a, b)"),
+            (FpCmpOp::Lt, "fp.lt.f32(a, b)"),
+            (FpCmpOp::Le, "fp.le.f32(a, b)"),
+            (FpCmpOp::Gt, "fp.lt.f32(b, a)"),
+            (FpCmpOp::Ge, "fp.le.f32(b, a)"),
+        ] {
+            let code = code_of(&FPCMPS, &op);
+            assert_eq!(bw_fp_cmp(cx.0, code, f, a, b, &mut out), BW_OK);
+            assert_eq!(cx.print(out), text);
+        }
+        for (t, name) in FPTESTS.iter().zip([
+            "isnan",
+            "isinf",
+            "iszero",
+            "issubnormal",
+            "isnormal",
+            "isneg",
+            "ispos",
+        ]) {
+            let code = code_of(&FPTESTS, t);
+            assert_eq!(bw_fp_test(cx.0, code, f, a, &mut out), BW_OK);
+            assert_eq!(out, cx.parse(&format!("fp.{name}.f32(a)"), 0), "{name}");
+            assert_eq!(cx.node(out).kind, KIND_COMPARE);
+        }
+        let x = cx.sym("x", 80);
+        assert_eq!(bw_x87_load(cx.0, x, &mut out), BW_OK);
+        assert_eq!(out, cx.parse("fp.x87_load(x)", 0));
+        let v = cx.sym("v", 79);
+        assert_eq!(bw_x87_store(cx.0, v, &mut out), BW_OK);
+        assert_eq!(out, cx.parse("fp.x87_store(v)", 0));
+        // Only floating-point nodes have a `bw_fp_node`.
+        let mut n = cx.fp_node(cx.fp("add", 0, f32, &[a, b], f32, 0));
+        assert_eq!(bw_fp_node_of(cx.0, a, &mut n), BW_ERR_INVALID_ARGUMENT);
+        assert!(last_error().contains("floating-point"), "{}", last_error());
+        assert_eq!(n.op, 0);
+    }
+}
+
+/// Values: the semantics of bitwright's book, through `bw_eval` and folding.
+#[test]
+fn floating_point_values() {
+    use RoundingMode::*;
+    let cx = Cx::new();
+    let (a, b) = (cx.sym("a", 32), cx.sym("b", 32));
+    let f32 = FpFormat::F32;
+    // 0.1 + 0.2 in binary32: the exact sum is 3/4 of the way to the next value up, so to nearest
+    // it rounds up (to 0.3f), toward zero one unit in the last place lower.
+    let env = [(a, f32_value(0.1)), (b, f32_value(0.2))];
+    let near = cx.fp("add", rm(Rne), f32, &[a, b], f32, 0);
+    let down = cx.fp("add", rm(Rtz), f32, &[a, b], f32, 0);
+    let sum = 0.1f32 + 0.2f32;
+    assert_eq!(cx.eval(near, &env).limbs[0], u64::from(sum.to_bits()));
+    assert_eq!(sum, 0.3f32);
+    assert_eq!(cx.eval(down, &env).limbs[0], u64::from(sum.to_bits() - 1));
+    // Operations on constants fold, exactly.
+    let tenth = cx.konst(32, u64::from(0.1f32.to_bits()));
+    let fifth = cx.fp("add", rm(Rne), f32, &[tenth, tenth], f32, 0);
+    let mut v = val(1, 0);
+    unsafe {
+        assert_eq!(bw_const_value(cx.0, fifth, &mut v), BW_OK);
+    }
+    assert_eq!(v.limbs[0], u64::from(0.2f32.to_bits()));
+    // A NaN result is the canonical one; the comparisons are false on it.
+    let d = cx.sym("d", 64);
+    let root = cx.fp("sqrt", rm(Rne), FpFormat::F64, &[d], f32, 0);
+    let nan = cx.eval(root, &[(d, f64_value(-1.0))]);
+    assert_eq!(nan.limbs[0], 0x7ff8_0000_0000_0000);
+    let eq = cx.fp("eq", 0, FpFormat::F64, &[d, root], f32, 0);
+    assert_eq!(cx.eval(eq, &[(d, f64_value(-1.0))]).limbs[0], 0);
+    // Conversions to integers saturate, and a NaN converts to 0.
+    let to_i32 = cx.fp("to_sbv", rm(Rtz), FpFormat::F64, &[d], f32, 32);
+    assert_eq!(
+        cx.eval(to_i32, &[(d, f64_value(1e10))]).limbs[0],
+        0x7fff_ffff
+    );
+    assert_eq!(
+        cx.eval(to_i32, &[(d, f64_value(-2.9))]).limbs[0],
+        0xffff_fffe
+    );
+    assert_eq!(cx.eval(to_i32, &[(d, f64_value(f64::NAN))]).limbs[0], 0);
+    // binary16 has 11 bits of precision: 2049 rounds to 2048 or 2050.
+    let i = cx.sym("i", 16);
+    let half = |m| cx.fp("from_ubv", rm(m), FpFormat::F16, &[i], f32, 0);
+    let at = |e| cx.eval(e, &[(i, val(16, 2049))]).limbs[0];
+    assert_eq!(at(half(Rne)), 0x6800); // 2048
+    assert_eq!(at(half(Rtp)), 0x6801); // 2050
+    // Each test on sample values, against the library's value-level tests.
+    let samples = [
+        0.0f32,
+        -0.0,
+        1.5,
+        -2.0,
+        f32::MIN_POSITIVE / 4.0,
+        -f32::MIN_POSITIVE / 2.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        -f32::NAN,
+    ];
+    for (code, &t) in FPTESTS.iter().enumerate() {
+        let mut e = 0;
+        let st = unsafe { bw_fp_test(cx.0, code as c_int, c_format(f32), a, &mut e) };
+        assert_eq!(st, BW_OK);
+        for x in samples {
+            let want = f32.test(t, &BitVec::from_f32(x)).unwrap();
+            let got = cx.eval(e, &[(a, f32_value(x))]).limbs[0];
+            assert_eq!(got, u64::from(want), "{t:?} of {x}");
+        }
+    }
+    // x87: a store and a load give the value back; an unnormal loads as the NaN.
+    let x = cx.sym("x", 80);
+    let (mut load, mut store) = (0, 0);
+    unsafe {
+        assert_eq!(bw_x87_load(cx.0, x, &mut load), BW_OK);
+        assert_eq!(bw_x87_store(cx.0, load, &mut store), BW_OK);
+    }
+    let one = {
+        let mut limbs = [0; 8];
+        limbs[0] = 1 << 63; // the integer bit
+        limbs[1] = 0x3fff; // the biased exponent of 1.0
+        BwValue { width: 80, limbs }
+    };
+    let back = cx.eval(store, &[(x, one)]);
+    assert_eq!((back.width, back.limbs), (80, one.limbs));
+    let mut unnormal = one;
+    unnormal.limbs[0] = 0;
+    let nan = FpFormat::X87.nan();
+    assert_eq!(&cx.eval(load, &[(x, unnormal)]).limbs[..2], nan.limbs());
+}
+
+/// Facts, proofs and simplification see through floating-point operations.
+#[test]
+fn floating_point_facts_and_proofs() {
+    use RoundingMode::*;
+    let cx = Cx::new();
+    let f64 = FpFormat::F64;
+    let (i, j, b) = (cx.sym("i", 16), cx.sym("j", 16), cx.sym("b", 8));
+    let fi = cx.fp("from_sbv", rm(Rne), f64, &[i], f64, 0);
+    let fj = cx.fp("from_sbv", rm(Rne), f64, &[j], f64, 0);
+    let product = cx.fp("mul", rm(Rne), f64, &[fi, fj], f64, 0);
+    let mut isnan = 0;
+    let mut p = BwProof {
+        truth: -1,
+        relies_on: 7,
+    };
+    unsafe {
+        assert_eq!(
+            bw_fp_test(cx.0, 0, c_format(f64), product, &mut isnan),
+            BW_OK
+        );
+        // An integer converted to a float is never a NaN, nor a product of two of them.
+        assert_eq!(bw_prove(cx.0, isnan, null(), &mut p), BW_OK);
+        assert_eq!((p.truth, p.relies_on), (0, 0));
+        let engine = bw_engine_new(PRESET_STANDARD);
+        let mut s = 0;
+        assert_eq!(bw_simplify(engine, cx.0, isnan, &mut s), BW_OK);
+        assert_eq!(cx.print(s), "0:1");
+        bw_engine_free(engine);
+    }
+    // A byte converted to a float, and back to 16 bits, is below 256.
+    let fb = cx.fp("from_ubv", rm(Rne), f64, &[b], f64, 0);
+    let back = cx.fp("to_ubv", rm(Rtz), f64, &[fb], f64, 16);
+    let mut f = BwFacts {
+        known_zero: val(1, 0),
+        known_one: val(1, 0),
+        umin: val(1, 0),
+        umax: val(1, 0),
+        ustride: 7,
+        smin: val(1, 0),
+        smax: val(1, 0),
+        relies_on: 7,
+    };
+    unsafe {
+        assert_eq!(bw_facts_of(cx.0, back, null(), &mut f), BW_OK);
+    }
+    assert_eq!(f.umax.width, 16);
+    assert!(f.umax.limbs[0] < 256, "{:#x}", f.umax.limbs[0]);
+    // SMT-LIB: exported to the FloatingPoint theory, and read back.
+    let (p, q) = (cx.sym("p", 32), cx.sym("q", 32));
+    let sum = cx.fp("add", rm(Rtz), FpFormat::F32, &[p, q], f64, 0);
+    let mut s = null_mut();
+    let mut imp = null_mut();
+    let other = Cx::new();
+    unsafe {
+        assert_eq!(bw_smtlib_export(cx.0, &sum, 1, &mut s), BW_OK);
+        let script = take(s);
+        assert!(script.contains("(fp.add RTZ ((_ to_fp 8 24)"), "{script}");
+        let st = bw_smtlib_import(other.0, cstr(&script).as_ptr(), &mut imp);
+        assert_eq!(st, BW_OK, "{}", last_error());
+        let n = bw_smt_import_count(imp, SMT_DEFINITIONS);
+        let root = (0..n).find_map(|i| {
+            let (mut d, mut name) = (0, null());
+            assert_eq!(
+                bw_smt_import_get(imp, SMT_DEFINITIONS, i, &mut d, &mut name),
+                BW_OK
+            );
+            (CStr::from_ptr(name).to_str().unwrap() == "root0").then_some(d)
+        });
+        assert_eq!(other.print(root.unwrap()), "fp.add.rtz.f32(p, q)");
+        bw_smt_import_free(imp);
+    }
+}
+
+#[test]
+fn floating_point_errors() {
+    let cx = Cx::new();
+    let (a, b, h) = (cx.sym("a", 32), cx.sym("b", 32), cx.sym("h", 16));
+    let f32 = c_format(FpFormat::F32);
+    let add = code_of(&FPOPS, &"add");
+    let mut e = 42;
+    unsafe {
+        let fp = |op, rm, f, args: &[u64], to, w, out: &mut u64| {
+            bw_fp(cx.0, op, rm, f, args.as_ptr(), args.len(), to, w, out)
+        };
+        // Formats outside 2 <= eb <= 31, sb >= 2, eb + sb <= 512.
+        for (eb, sb) in [(1, 8), (32, 8), (8, 1), (11, 502), (0, 0), (8, u32::MAX)] {
+            let bad = BwFpFormat { eb, sb };
+            assert_eq!(fp(add, 0, bad, &[a, b], f32, 0, &mut e), BW_ERR_WIDTH);
+            assert!(
+                last_error().contains("floating-point format"),
+                "{}",
+                last_error()
+            );
+            assert_eq!(bw_fp_neg(cx.0, bad, a, &mut e), BW_ERR_WIDTH);
+            assert_eq!(bw_fp_test(cx.0, 0, bad, a, &mut e), BW_ERR_WIDTH);
+            // `to` is read by conversions only.
+            let convert = code_of(&FPOPS, &"convert");
+            assert_eq!(fp(convert, 0, f32, &[a], bad, 0, &mut e), BW_ERR_WIDTH);
+        }
+        assert_eq!(e, 42);
+        // Operands of another width.
+        assert_eq!(fp(add, 0, f32, &[a, h], f32, 0, &mut e), BW_ERR_WIDTH);
+        assert!(last_error().contains("widths differ"), "{}", last_error());
+        let f64 = c_format(FpFormat::F64);
+        assert_eq!(fp(add, 0, f64, &[a, b], f32, 0, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_sub(cx.0, 0, f32, a, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_neg(cx.0, f32, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_abs(cx.0, f32, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_copysign(cx.0, f32, a, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_cmp(cx.0, 0, f32, a, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_fp_test(cx.0, 0, f32, h, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_x87_load(cx.0, a, &mut e), BW_ERR_WIDTH);
+        assert_eq!(bw_x87_store(cx.0, a, &mut e), BW_ERR_WIDTH);
+        // Integer widths outside 1..=512.
+        let to_sbv = code_of(&FPOPS, &"to_sbv");
+        assert_eq!(fp(to_sbv, 0, f32, &[a], f32, 0, &mut e), BW_ERR_WIDTH);
+        assert_eq!(fp(to_sbv, 0, f32, &[a], f32, 513, &mut e), BW_ERR_WIDTH);
+        // The number of operands.
+        assert_eq!(
+            fp(add, 0, f32, &[a], f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert!(
+            last_error().contains("takes 2 operands"),
+            "{}",
+            last_error()
+        );
+        let fma = code_of(&FPOPS, &"fma");
+        assert_eq!(
+            fp(fma, 0, f32, &[a, b], f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            bw_fp(cx.0, add, 0, f32, null(), 2, f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        // Unknown codes: the operation, a rounding mode (read only where there is one), the
+        // comparison, the test.
+        assert_eq!(
+            fp(17, 0, f32, &[a, b], f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            fp(-1, 0, f32, &[a, b], f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            fp(add, 5, f32, &[a, b], f32, 0, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert!(last_error().contains("rounding mode"), "{}", last_error());
+        assert_eq!(
+            bw_fp_sub(cx.0, -1, f32, a, b, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            bw_fp_cmp(cx.0, 5, f32, a, b, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(bw_fp_test(cx.0, 7, f32, a, &mut e), BW_ERR_INVALID_ARGUMENT);
+        assert_eq!(e, 42);
+        let rem = code_of(&FPOPS, &"rem");
+        assert_eq!(fp(rem, -7, f32, &[a, b], f32, 0, &mut e), BW_OK);
+        // NULL pointers, foreign handles.
+        assert_eq!(
+            bw_fp_neg(null_mut(), f32, a, &mut e),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(bw_fp_neg(cx.0, f32, a, null_mut()), BW_ERR_INVALID_ARGUMENT);
+        let other = Cx::new();
+        assert_eq!(bw_fp_abs(other.0, f32, a, &mut e), BW_ERR_FOREIGN_EXPR);
+        assert_eq!(bw_fp_node_of(cx.0, e, null_mut()), BW_ERR_INVALID_ARGUMENT);
+        let mut n = other.fp_node(other.parse("fp.max.f32(p, q)", 32));
+        assert_eq!(bw_fp_node_of(cx.0, 0, &mut n), BW_ERR_FOREIGN_EXPR);
+    }
 }

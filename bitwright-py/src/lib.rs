@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 
 use bitwright::check::{CheckConfig, Verdict, check_program};
 use bitwright::engine::{Budget, End, Engine, Run, Strategy};
+use bitwright::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::rules::{Ledger, RuleProgram};
 use bitwright::{
@@ -176,6 +177,96 @@ fn truth(t: Truth) -> Option<bool> {
     }
 }
 
+// ----- floating point ------------------------------------------------------------------------
+
+/// A binary floating-point format: `eb` exponent bits and `sb` significand bits, the hidden bit
+/// included, so an encoding is `eb + sb` bits wide. `2 <= eb <= 31`, `sb >= 2`, `eb + sb <= 512`.
+#[pyclass(
+    frozen,
+    eq,
+    hash,
+    from_py_object,
+    name = "FpFormat",
+    module = "bitwright"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PyFpFormat {
+    f: FpFormat,
+}
+
+#[pymethods]
+impl PyFpFormat {
+    /// The format `(eb, sb)`; raises `WidthError` unless `2 <= eb <= 31`, `sb >= 2` and
+    /// `eb + sb <= 512`.
+    #[new]
+    fn new(eb: u32, sb: u32) -> PyResult<Self> {
+        FpFormat::new(eb, sb)
+            .map(|f| PyFpFormat { f })
+            .map_err(|e| WidthError::new_err(e.to_string()))
+    }
+
+    /// Exponent bits.
+    #[getter]
+    fn eb(&self) -> u32 {
+        self.f.eb()
+    }
+
+    /// Significand bits, the hidden bit included (the precision).
+    #[getter]
+    fn sb(&self) -> u32 {
+        self.f.sb()
+    }
+
+    /// The width of an encoding: `eb + sb`.
+    #[getter]
+    fn width(&self) -> u16 {
+        self.f.width().bits()
+    }
+
+    /// The name of a standard format in the text syntax (`"f32"`, ...), else None.
+    #[getter]
+    fn name(&self) -> Option<&'static str> {
+        self.f.name()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FpFormat({}, {})", self.f.eb(), self.f.sb())
+    }
+}
+
+/// A rounding mode by its name in the text syntax.
+fn rounding(rm: &str) -> PyResult<RoundingMode> {
+    RoundingMode::from_name(rm).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown rounding mode {rm:?} (\"rne\", \"rna\", \"rtp\", \"rtn\" or \"rtz\")"
+        ))
+    })
+}
+
+/// The name of a floating-point operation in the text syntax (`fp.add`, ...).
+fn fp_name(op: FpOp) -> Option<&'static str> {
+    Some(match op {
+        FpOp::Add(_) => "add",
+        FpOp::Mul(_) => "mul",
+        FpOp::Div(_) => "div",
+        FpOp::Fma(_) => "fma",
+        FpOp::Sqrt(_) => "sqrt",
+        FpOp::Rem => "rem",
+        FpOp::RoundToIntegral(_) => "round",
+        FpOp::Min => "min",
+        FpOp::Max => "max",
+        FpOp::Eq => "eq",
+        FpOp::Lt => "lt",
+        FpOp::Le => "le",
+        FpOp::Convert { .. } => "convert",
+        FpOp::FromSInt(_) => "from_sbv",
+        FpOp::FromUInt(_) => "from_ubv",
+        FpOp::ToSInt(..) => "to_sbv",
+        FpOp::ToUInt(..) => "to_ubv",
+        _ => return None,
+    })
+}
+
 // ----- contexts ------------------------------------------------------------------------------
 
 /// A hash-consed expression arena. Every expression belongs to one context; structurally equal
@@ -320,15 +411,16 @@ impl PyContext {
         wrap(slf, &c, e)
     }
 
-    /// The expressions as an SMT-LIB 2.6 QF_BV script: the symbols declared and the `K`-th
-    /// expression defined as `rootK`.
+    /// The expressions as an SMT-LIB 2.6 QF_BV script (QF_BVFP with floating point): the
+    /// symbols declared and the `K`-th expression defined as `rootK`.
     #[pyo3(signature = (*exprs))]
     fn to_smtlib(&self, py: Python<'_>, exprs: Vec<PyRef<'_, PyExpr>>) -> PyResult<String> {
         let roots: Vec<Expr> = exprs.iter().map(|e| e.e).collect();
         bitwright::smtlib::export(&mut self.lock(py), &roots).or_raise()
     }
 
-    /// Reads an SMT-LIB QF_BV script into this context.
+    /// Reads an SMT-LIB QF_BV script, floating-point (QF_BVFP) terms included, into this
+    /// context.
     fn from_smtlib(slf: &Bound<'_, Self>, script: &str) -> PyResult<SmtScript> {
         let py = slf.py();
         let (symbols, definitions, assertions) = {
@@ -445,6 +537,36 @@ impl PyExpr {
         self.build(py, |c| c.un(op, self.e))
     }
 
+    /// The floating-point operation `op` of `fmt` on this expression and `others`.
+    fn fp(
+        &self,
+        py: Python<'_>,
+        op: FpOp,
+        fmt: PyFpFormat,
+        others: &[&Operand<'_>],
+    ) -> PyResult<PyExpr> {
+        let mut args = vec![self.e];
+        for o in others {
+            args.push(self.operand(py, o)?);
+        }
+        self.build(py, |c| c.fp(op, fmt.f, &args))
+    }
+
+    fn fcmp(
+        &self,
+        py: Python<'_>,
+        op: FpCmpOp,
+        o: &Operand<'_>,
+        fmt: PyFpFormat,
+    ) -> PyResult<PyExpr> {
+        let b = self.operand(py, o)?;
+        self.build(py, |c| c.fp_cmp(fmt.f, op, self.e, b))
+    }
+
+    fn ftest(&self, py: Python<'_>, t: FpTest, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.build(py, |c| c.fp_test(fmt.f, t, self.e))
+    }
+
     /// Symbol values for `eval` from `env` and `kwargs`, whose keys are names or symbol
     /// expressions: the keys are read, then their widths (locked), then the values.
     fn env(
@@ -519,7 +641,7 @@ impl PyExpr {
     }
 
     /// The node's kind: `"const"`, `"symbol"`, `"unary"`, `"binary"`, `"compare"`, `"zext"`,
-    /// `"sext"`, `"extract"`, `"concat"`, `"select"` or `"ext"`.
+    /// `"sext"`, `"extract"`, `"concat"`, `"select"`, `"ext"` or `"fp"`.
     #[getter]
     fn kind(&self, py: Python<'_>) -> PyResult<&'static str> {
         let c = self.cx.bind(py).get().lock(py);
@@ -535,11 +657,13 @@ impl PyExpr {
             View::Concat { .. } => "concat",
             View::Select { .. } => "select",
             View::Ext { .. } => "ext",
+            View::Fp { .. } => "fp",
             _ => "other",
         })
     }
 
-    /// The operator of a unary, binary or comparison node (`"add"`, `"ult"`, ...), else None.
+    /// The operator of a unary, binary, comparison or floating-point node (`"add"`, `"ult"`,
+    /// `"sqrt"`, ...: a floating-point operation as the text syntax names it), else None.
     #[getter]
     fn op(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let c = self.cx.bind(py).get().lock(py);
@@ -547,6 +671,43 @@ impl PyExpr {
             View::Un(op, _) => Some(op.name().to_string()),
             View::Bin(op, ..) => Some(op.name().to_string()),
             View::Cmp(op, ..) => Some(format!("{op:?}").to_lowercase()),
+            View::Fp { op, .. } => fp_name(op).map(str::to_string),
+            _ => None,
+        })
+    }
+
+    /// The format of a floating-point node's operands (for `"from_sbv"` and `"from_ubv"`, of its
+    /// result), else None.
+    #[getter]
+    fn format(&self, py: Python<'_>) -> PyResult<Option<PyFpFormat>> {
+        let c = self.cx.bind(py).get().lock(py);
+        Ok(match c.view(self.e).or_raise()? {
+            View::Fp { format, .. } => Some(PyFpFormat { f: format }),
+            _ => None,
+        })
+    }
+
+    /// The result's format of a conversion between formats (`"convert"`), else None.
+    #[getter]
+    fn to_format(&self, py: Python<'_>) -> PyResult<Option<PyFpFormat>> {
+        let c = self.cx.bind(py).get().lock(py);
+        Ok(match c.view(self.e).or_raise()? {
+            View::Fp {
+                op: FpOp::Convert { to, .. },
+                ..
+            } => Some(PyFpFormat { f: to }),
+            _ => None,
+        })
+    }
+
+    /// The rounding mode of a floating-point node (`"rne"`, `"rna"`, `"rtp"`, `"rtn"` or
+    /// `"rtz"`), else None (also for the operations without one: `"rem"`, `"min"`, `"max"` and
+    /// the comparisons).
+    #[getter]
+    fn rounding(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
+        let c = self.cx.bind(py).get().lock(py);
+        Ok(match c.view(self.e).or_raise()? {
+            View::Fp { op, .. } => op.rounding_mode().map(RoundingMode::name),
             _ => None,
         })
     }
@@ -877,6 +1038,194 @@ impl PyExpr {
         };
         let (t, f) = (as_width(&then)?, as_width(&els)?);
         self.build(py, |c| c.select(self.e, t, f))
+    }
+
+    // Floating point (the book's chapter specifies it): this expression and the other operands
+    // hold encodings of the format `fmt` (an int operand is one, a constant of this width), and
+    // a result is rounded by `rm`: "rne" (to nearest, ties to even), "rna" (to nearest, ties
+    // away from zero), "rtp" (toward +inf), "rtn" (toward -inf) or "rtz" (toward zero).
+
+    /// `self + o`.
+    #[pyo3(signature = (o, fmt, rm = "rne"))]
+    fn fadd(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Add(rounding(rm)?), fmt, &[&o])
+    }
+    /// `self - o`, built as `self + fneg(o)`.
+    #[pyo3(signature = (o, fmt, rm = "rne"))]
+    fn fsub(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        let rm = rounding(rm)?;
+        let b = self.operand(py, &o)?;
+        self.build(py, |c| c.fp_sub(fmt.f, rm, self.e, b))
+    }
+    /// `self * o`.
+    #[pyo3(signature = (o, fmt, rm = "rne"))]
+    fn fmul(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Mul(rounding(rm)?), fmt, &[&o])
+    }
+    /// `self / o`.
+    #[pyo3(signature = (o, fmt, rm = "rne"))]
+    fn fdiv(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Div(rounding(rm)?), fmt, &[&o])
+    }
+    /// `self * b + c`, rounded once.
+    #[pyo3(signature = (b, c, fmt, rm = "rne"))]
+    fn ffma(
+        &self,
+        py: Python<'_>,
+        b: Operand<'_>,
+        c: Operand<'_>,
+        fmt: PyFpFormat,
+        rm: &str,
+    ) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Fma(rounding(rm)?), fmt, &[&b, &c])
+    }
+    /// The square root.
+    #[pyo3(signature = (fmt, rm = "rne"))]
+    fn fsqrt(&self, py: Python<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Sqrt(rounding(rm)?), fmt, &[])
+    }
+    /// The IEEE remainder `self - n * o`, `n` the integer nearest `self / o` (exact).
+    fn frem(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Rem, fmt, &[&o])
+    }
+    /// Rounded to an integral value.
+    #[pyo3(signature = (fmt, rm = "rne"))]
+    fn fround(&self, py: Python<'_>, fmt: PyFpFormat, rm: &str) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::RoundToIntegral(rounding(rm)?), fmt, &[])
+    }
+    /// minimumNumber: the smaller operand, a NaN operand ignored, `-0 < +0`.
+    fn fmin(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Min, fmt, &[&o])
+    }
+    /// maximumNumber: the larger operand, a NaN operand ignored, `-0 < +0`.
+    fn fmax(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fp(py, FpOp::Max, fmt, &[&o])
+    }
+
+    // Floating-point comparisons, 1 bit: false when an operand is a NaN; +0 equals -0.
+
+    fn feq(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fcmp(py, FpCmpOp::Eq, &o, fmt)
+    }
+    fn flt(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fcmp(py, FpCmpOp::Lt, &o, fmt)
+    }
+    fn fle(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fcmp(py, FpCmpOp::Le, &o, fmt)
+    }
+    fn fgt(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fcmp(py, FpCmpOp::Gt, &o, fmt)
+    }
+    fn fge(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.fcmp(py, FpCmpOp::Ge, &o, fmt)
+    }
+
+    // Sign operations, bit-vector operators that change the sign bit only (a NaN's too).
+
+    /// The sign bit flipped: `self ^ sign`.
+    fn fneg(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.build(py, |c| c.fp_neg(fmt.f, self.e))
+    }
+    /// The sign bit cleared: `self & ~sign`.
+    fn fabs(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.build(py, |c| c.fp_abs(fmt.f, self.e))
+    }
+    /// With the sign bit of `o`.
+    fn fcopysign(&self, py: Python<'_>, o: Operand<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        let b = self.operand(py, &o)?;
+        self.build(py, |c| c.fp_copysign(fmt.f, self.e, b))
+    }
+
+    // Classification tests, 1 bit: each one unsigned comparison of the encoding.
+
+    /// Any NaN.
+    fn fisnan(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Nan, fmt)
+    }
+    /// An infinity.
+    fn fisinf(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Infinite, fmt)
+    }
+    /// A zero.
+    fn fiszero(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Zero, fmt)
+    }
+    /// Nonzero, with the minimum exponent field.
+    fn fissubnormal(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Subnormal, fmt)
+    }
+    /// Finite, nonzero and not subnormal.
+    fn fisnormal(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Normal, fmt)
+    }
+    /// The sign bit set, and not a NaN.
+    fn fisneg(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Negative, fmt)
+    }
+    /// The sign bit clear, and not a NaN.
+    fn fispos(&self, py: Python<'_>, fmt: PyFpFormat) -> PyResult<PyExpr> {
+        self.ftest(py, FpTest::Positive, fmt)
+    }
+
+    // Conversions.
+
+    /// This value of format `fmt` converted to the format `to`.
+    #[pyo3(signature = (to, fmt, rm = "rne"))]
+    fn fconvert(
+        &self,
+        py: Python<'_>,
+        to: PyFpFormat,
+        fmt: PyFpFormat,
+        rm: &str,
+    ) -> PyResult<PyExpr> {
+        let rm = rounding(rm)?;
+        self.fp(py, FpOp::Convert { to: to.f, rm }, fmt, &[])
+    }
+    /// This integer, signed (or unsigned, with `signed=False`), rounded to the format `fmt`.
+    #[pyo3(signature = (fmt, rm = "rne", *, signed = true))]
+    fn to_float(
+        &self,
+        py: Python<'_>,
+        fmt: PyFpFormat,
+        rm: &str,
+        signed: bool,
+    ) -> PyResult<PyExpr> {
+        let rm = rounding(rm)?;
+        let op = if signed {
+            FpOp::FromSInt(rm)
+        } else {
+            FpOp::FromUInt(rm)
+        };
+        self.fp(py, op, fmt, &[])
+    }
+    /// This value of format `fmt` rounded to an integer of `width` bits, signed (or unsigned,
+    /// with `signed=False`), and saturated to its range; a NaN gives 0.
+    #[pyo3(signature = (width, fmt, rm = "rne", *, signed = true))]
+    fn to_int(
+        &self,
+        py: Python<'_>,
+        width: u16,
+        fmt: PyFpFormat,
+        rm: &str,
+        signed: bool,
+    ) -> PyResult<PyExpr> {
+        let (rm, w) = (rounding(rm)?, self::width(width)?);
+        let op = if signed {
+            FpOp::ToSInt(rm, w)
+        } else {
+            FpOp::ToUInt(rm, w)
+        };
+        self.fp(py, op, fmt, &[])
+    }
+    /// x87's 80-bit extended-precision encoding as a value of `X87` (79 bits): a
+    /// pseudo-denormal is the value it stands for; an unnormal, a pseudo-infinity or a
+    /// pseudo-NaN loads as the NaN.
+    fn x87_load(&self, py: Python<'_>) -> PyResult<PyExpr> {
+        self.build(py, |c| c.x87_load(self.e))
+    }
+    /// A value of `X87` (79 bits) as x87's 80-bit encoding.
+    fn x87_store(&self, py: Python<'_>) -> PyResult<PyExpr> {
+        self.build(py, |c| c.x87_store(self.e))
     }
 
     // Evaluating, substituting, reasoning.
@@ -1545,6 +1894,11 @@ fn _bitwright(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Facts>()?;
     m.add_class::<Outcome>()?;
     m.add_class::<SmtScript>()?;
+    m.add_class::<PyFpFormat>()?;
+    let named = FpFormat::NAMED.into_iter().chain([(FpFormat::X87, "x87")]);
+    for (f, name) in named {
+        m.add(name.to_uppercase(), PyFpFormat { f })?;
+    }
     m.add("BitwrightError", py.get_type::<BitwrightError>())?;
     m.add("WidthError", py.get_type::<WidthError>())?;
     m.add("ParseError", py.get_type::<ParseError>())?;

@@ -12,6 +12,7 @@ simplified: x + y
 f(100) = 45
 known zero 0x0e, known one 0x01, range [1, 241] by 16
 a <u 16 proves a & 0xf0 == 0: yes (relies on 0x1)
+fp.add.rne.f32(p, q) at 0.1, 0.2: 0x3e99999a, toward zero 0x3e999999
 error 9: expected an expression (at bytes 3..3)
 ";
 
@@ -24,6 +25,7 @@ x + y
 known zero 0xe:8, range [0x1:8, 0xf1:8] by 16
 b <u 16 proves (b & 0xf0) == 0: yes
 x + y has 2 children: x, y
+fp.add.rne.f32(p, q) at 0.1, 0.2: 0x3e99999a:32, toward zero 0x3e999999:32
 error 9: expected an expression (at bytes 3..3)
 ";
 

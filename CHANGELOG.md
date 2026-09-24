@@ -40,6 +40,11 @@
   of either is a set: x86's `ucomiss` flags combined for `ja`, `jae`, `jb`, `jbe` come back as
   one comparison, `fp.lt(x, y) & fp.lt(y, x)` is false. A set is emitted as one integer or
   float comparison (or a negated one) when that is smaller.
+- **Bindings.** Floating point in C, C++ and Python: formats (`bw_fp_format`, `FpFormat`, the
+  named ones), rounding modes, every operation, comparison and test, x87's load and store, and
+  the inspection of floating-point nodes (`BW_KIND_FP`, `bw_fp_node_of`, `fp_node()`, and
+  `format`, `to_format`, `rounding` in Python). The book's chapter "C, C++ and Python" has a
+  section with an example in each language.
 - **Behavior changes.** Results change where comparisons of related terms decide together: on a
   generated corpus of 4,000 combinations of comparisons, 214 results are smaller and none is
   larger; generated random DAGs and the integer identity sets of `compare/facts/` give the same

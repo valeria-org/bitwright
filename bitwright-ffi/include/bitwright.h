@@ -270,7 +270,8 @@ typedef enum bw_kind {
     BW_KIND_EXTRACT = 7, /* bits [lo, lo + width) of children[0] */
     BW_KIND_CONCAT = 8,  /* children[0] high, children[1] low */
     BW_KIND_SELECT = 9,  /* children[0] ? children[1] : children[2] */
-    BW_KIND_EXT = 10     /* output `lo` of a host extension operation */
+    BW_KIND_EXT = 10,    /* output `lo` of a host extension operation */
+    BW_KIND_FP = 11      /* op is a bw_fpop, the children its operands; see bw_fp_node_of */
 } bw_kind;
 
 /* One node. Unused children are BW_NULL_EXPR; `op` is -1 when the kind has none. */
@@ -296,6 +297,149 @@ bw_status bw_symbol_name(const bw_context *cx, bw_expr e, char **out);
 
 /* The number of distinct nodes under `e`, `e` included. */
 bw_status bw_dag_size(bw_context *cx, bw_expr e, uint32_t *out);
+
+/* ----- floating point ---------------------------------------------------------------------- */
+
+/* IEEE 754 binary arithmetic on bit-vectors that hold interchange encodings, in any format and
+ * under every rounding mode, exactly (the book's chapter on floating point specifies it): results
+ * are correctly rounded; a NaN result is the format's canonical quiet NaN; min and max are IEEE
+ * 754-2019 minimumNumber and maximumNumber; conversions to integers saturate, a NaN giving 0.
+ * Operations on constants fold, and bw_eval evaluates them, the same on every host. */
+
+/* A format: `eb` exponent bits and `sb` significand bits, the hidden bit included (SMT-LIB's
+ * convention), so an encoding is `eb + sb` bits wide. Valid when 2 <= eb <= 31, sb >= 2 and
+ * eb + sb <= 512; a function given another fails with BW_ERR_WIDTH. */
+typedef struct bw_fp_format {
+    uint32_t eb;
+    uint32_t sb;
+} bw_fp_format;
+
+/* The format (eb, sb), as it is: the functions that take a format check it. */
+static inline bw_fp_format bw_fp_format_of(uint32_t eb, uint32_t sb) {
+    bw_fp_format f;
+    f.eb = eb;
+    f.sb = sb;
+    return f;
+}
+
+/* The named formats. BW_X87 holds the values of x87 extended precision (79 bits); bw_x87_load and
+ * bw_x87_store convert from and to x87's 80-bit memory encoding. */
+#define BW_F16 bw_fp_format_of(5, 11)    /* binary16 */
+#define BW_BF16 bw_fp_format_of(8, 8)    /* bfloat16 */
+#define BW_F32 bw_fp_format_of(8, 24)    /* binary32 */
+#define BW_F64 bw_fp_format_of(11, 53)   /* binary64 */
+#define BW_F128 bw_fp_format_of(15, 113) /* binary128 */
+#define BW_F256 bw_fp_format_of(19, 237) /* binary256 */
+#define BW_X87 bw_fp_format_of(15, 64)   /* x87 extended precision, as values */
+
+/* Rounding modes (IEEE 754 section 4.3), named as in SMT-LIB and the text syntax. */
+typedef enum bw_rounding {
+    BW_RNE = 0, /* to nearest, ties to even */
+    BW_RNA = 1, /* to nearest, ties away from zero */
+    BW_RTP = 2, /* toward +infinity */
+    BW_RTN = 3, /* toward -infinity */
+    BW_RTZ = 4  /* toward zero */
+} bw_rounding;
+
+/* The operations of floating-point nodes, named as in the text syntax (`fp.add.rne.f32(a, b)`).
+ * Operands and results are encodings of the node's format unless noted. */
+typedef enum bw_fpop {
+    BW_FP_ADD = 0,       /* a + b */
+    BW_FP_MUL = 1,       /* a * b */
+    BW_FP_DIV = 2,       /* a / b */
+    BW_FP_FMA = 3,       /* a * b + c, rounded once */
+    BW_FP_SQRT = 4,      /* square root */
+    BW_FP_REM = 5,       /* IEEE remainder a - n * b, n the integer nearest a / b (exact) */
+    BW_FP_ROUND = 6,     /* rounding to an integral value */
+    BW_FP_MIN = 7,       /* minimumNumber: a NaN operand ignored, -0 < +0 */
+    BW_FP_MAX = 8,       /* maximumNumber */
+    BW_FP_EQ = 9,        /* a == b, 1 bit: false with a NaN, true for +0 and -0 */
+    BW_FP_LT = 10,       /* a < b, 1 bit */
+    BW_FP_LE = 11,       /* a <= b, 1 bit */
+    BW_FP_CONVERT = 12,  /* to another format */
+    BW_FP_FROM_SBV = 13, /* from a signed integer of any width */
+    BW_FP_FROM_UBV = 14, /* from an unsigned integer of any width */
+    BW_FP_TO_SBV = 15,   /* to a signed integer, saturating (a NaN gives 0) */
+    BW_FP_TO_UBV = 16    /* to an unsigned integer, saturating (a NaN gives 0) */
+} bw_fpop;
+
+/* Comparisons for bw_fp_cmp, 1 bit, false when an operand is a NaN. GT and GE are built as LT and
+ * LE with the operands swapped. */
+typedef enum bw_fpcmp {
+    BW_FPCMP_EQ = 0,
+    BW_FPCMP_LT = 1,
+    BW_FPCMP_LE = 2,
+    BW_FPCMP_GT = 3,
+    BW_FPCMP_GE = 4
+} bw_fpcmp;
+
+/* Classification tests for bw_fp_test, 1 bit. */
+typedef enum bw_fptest {
+    BW_FP_ISNAN = 0,       /* any NaN */
+    BW_FP_ISINF = 1,       /* an infinity */
+    BW_FP_ISZERO = 2,      /* a zero */
+    BW_FP_ISSUBNORMAL = 3, /* nonzero, with the minimum exponent field */
+    BW_FP_ISNORMAL = 4,    /* finite, nonzero and not subnormal */
+    BW_FP_ISNEG = 5,       /* the sign bit set, and not a NaN */
+    BW_FP_ISPOS = 6        /* the sign bit clear, and not a NaN */
+} bw_fptest;
+
+/* The operation `op` of `format` on the `n` operands `args`: 3 for BW_FP_FMA, 2 for the binary
+ * operations and the comparisons, 1 for the others (BW_ERR_INVALID_ARGUMENT otherwise). The
+ * operands are `format`'s width (BW_ERR_WIDTH otherwise), except the integer of BW_FP_FROM_SBV and
+ * BW_FP_FROM_UBV: any width, `format` being the result's. `rm` is the rounding mode, ignored by
+ * the operations without one (REM, MIN, MAX, EQ, LT, LE); `to` is the result's format for
+ * BW_FP_CONVERT and `width` the result's width for BW_FP_TO_SBV and BW_FP_TO_UBV, each ignored
+ * by the other operations. */
+bw_status bw_fp(bw_context *cx, int op /* bw_fpop */, int rm /* bw_rounding */,
+                bw_fp_format format, const bw_expr *args, size_t n, bw_fp_format to,
+                uint16_t width, bw_expr *out);
+
+/* The other operations are built as the text syntax builds them, from those nodes and from
+ * bit-vector operators (and print as such), so every pass sees through them. */
+
+/* `a - b`, built as `a + neg(b)` (the same function, bit for bit). */
+bw_status bw_fp_sub(bw_context *cx, int rm /* bw_rounding */, bw_fp_format format, bw_expr a,
+                    bw_expr b, bw_expr *out);
+
+/* `a` with its sign bit flipped (a NaN too): `a ^ sign`. */
+bw_status bw_fp_neg(bw_context *cx, bw_fp_format format, bw_expr a, bw_expr *out);
+
+/* `a` with its sign bit cleared (a NaN too): `a & ~sign`. */
+bw_status bw_fp_abs(bw_context *cx, bw_fp_format format, bw_expr a, bw_expr *out);
+
+/* `a` with the sign bit of `b`: `(a & ~sign) | (b & sign)`. */
+bw_status bw_fp_copysign(bw_context *cx, bw_fp_format format, bw_expr a, bw_expr b,
+                         bw_expr *out);
+
+/* The comparison `a op b`, 1 bit: a BW_FP_EQ, BW_FP_LT or BW_FP_LE node. */
+bw_status bw_fp_cmp(bw_context *cx, int op /* bw_fpcmp */, bw_fp_format format, bw_expr a,
+                    bw_expr b, bw_expr *out);
+
+/* A classification test, 1 bit: one unsigned comparison of the encoding. */
+bw_status bw_fp_test(bw_context *cx, int test /* bw_fptest */, bw_fp_format format, bw_expr a,
+                     bw_expr *out);
+
+/* An 80-bit x87 extended-precision encoding as a value of BW_X87 (79 bits), read as x87 reads it:
+ * a pseudo-denormal is the normal value it stands for; an unnormal, a pseudo-infinity or a
+ * pseudo-NaN is invalid and loads as the NaN. Built from extracts, concatenations and selects. */
+bw_status bw_x87_load(bw_context *cx, bw_expr a, bw_expr *out);
+
+/* A value of BW_X87 (79 bits) as its 80-bit x87 encoding, the explicit integer bit set exactly
+ * when the exponent field is not zero. */
+bw_status bw_x87_store(bw_context *cx, bw_expr a, bw_expr *out);
+
+/* The operation of a floating-point node (BW_KIND_FP). */
+typedef struct bw_fp_node {
+    int op;              /* bw_fpop */
+    int rm;              /* bw_rounding; -1 for the operations without one */
+    bw_fp_format format; /* of the floating-point operands (the result's, from an integer) */
+    bw_fp_format to;     /* BW_FP_CONVERT: the result's format; otherwise {0, 0} */
+    uint16_t int_width;  /* BW_FP_TO_SBV, BW_FP_TO_UBV: the integer's width; otherwise 0 */
+} bw_fp_node;
+
+/* The operation of a floating-point node (BW_ERR_INVALID_ARGUMENT for any other node). */
+bw_status bw_fp_node_of(const bw_context *cx, bw_expr e, bw_fp_node *out);
 
 /* ----- evaluating and substituting --------------------------------------------------------- */
 
@@ -460,7 +604,8 @@ bw_status bw_engine_run(const bw_engine *engine, bw_context *cx, const bw_expr *
 
 /* ----- SMT-LIB ----------------------------------------------------------------------------- */
 
-/* A QF_BV script declaring the roots' symbols and defining the K-th root as `rootK`. */
+/* A QF_BV script (QF_BVFP with floating-point operations) declaring the roots' symbols and
+ * defining the K-th root as `rootK`. */
 bw_status bw_smtlib_export(bw_context *cx, const bw_expr *roots, size_t n, char **out);
 
 typedef struct bw_smt_import bw_smt_import;
@@ -471,7 +616,7 @@ typedef enum bw_smt_part {
     BW_SMT_ASSERTIONS = 2   /* asserted formulas, as 1-bit expressions (no names) */
 } bw_smt_part;
 
-/* Reads a QF_BV script into `cx`. */
+/* Reads a QF_BV script, floating-point (QF_BVFP) terms included, into `cx`. */
 bw_status bw_smtlib_import(bw_context *cx, const char *script, bw_smt_import **out);
 void bw_smt_import_free(bw_smt_import *imp);
 

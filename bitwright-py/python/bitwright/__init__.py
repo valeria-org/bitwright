@@ -13,6 +13,13 @@ The guide is the bitwright book: https://valeria-org.github.io/bitwright/
 """
 
 from ._bitwright import (
+    BF16,
+    F16,
+    F32,
+    F64,
+    F128,
+    F256,
+    X87,
     Assumptions,
     BitwrightError,
     Budget,
@@ -20,6 +27,7 @@ from ._bitwright import (
     Engine,
     Expr,
     Facts,
+    FpFormat,
     Outcome,
     ParseError,
     RuleError,
@@ -31,6 +39,13 @@ from ._bitwright import (
 )
 
 __all__ = [
+    "BF16",
+    "F16",
+    "F32",
+    "F64",
+    "F128",
+    "F256",
+    "X87",
     "Assumptions",
     "BitwrightError",
     "Budget",
@@ -38,6 +53,7 @@ __all__ = [
     "Engine",
     "Expr",
     "Facts",
+    "FpFormat",
     "Outcome",
     "ParseError",
     "RuleError",

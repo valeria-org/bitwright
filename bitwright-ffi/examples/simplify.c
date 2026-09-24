@@ -78,6 +78,23 @@ int main(void) {
     printf("a <u 16 proves a & 0xf0 == 0: %s (relies on 0x%" PRIx64 ")\n",
            proof.truth == BW_TRUE ? "yes" : "no", proof.relies_on);
 
+    /* Floating point: 0.1 + 0.2 in binary32 (0x3dcccccd and 0x3e4ccccd), to nearest and toward
+     * zero. The last two arguments of bw_fp are for conversions; a sum ignores them. */
+    bw_expr pq[2], near, down;
+    bw_value tenths[2], sum;
+    CHECK(bw_symbol(cx, "p", 32, &pq[0]));
+    CHECK(bw_symbol(cx, "q", 32, &pq[1]));
+    CHECK(bw_fp(cx, BW_FP_ADD, BW_RNE, BW_F32, pq, 2, BW_F32, 0, &near));
+    CHECK(bw_fp(cx, BW_FP_ADD, BW_RTZ, BW_F32, pq, 2, BW_F32, 0, &down));
+    tenths[0] = bw_value_u64(32, 0x3dcccccd);
+    tenths[1] = bw_value_u64(32, 0x3e4ccccd);
+    CHECK(bw_print(cx, near, 0, &text));
+    CHECK(bw_eval(cx, near, pq, tenths, 2, &sum));
+    printf("%s at 0.1, 0.2: 0x%08" PRIx64, text, sum.limbs[0]);
+    bw_string_free(text);
+    CHECK(bw_eval(cx, down, pq, tenths, 2, &sum));
+    printf(", toward zero 0x%08" PRIx64 "\n", sum.limbs[0]);
+
     /* Errors are status codes with a message. */
     bw_expr bad;
     bw_status st = bw_parse(cx, "x +", 8, &bad);

@@ -13,11 +13,20 @@
 // 1-bit expression are the methods `eq`, `ne`, `ult`, `ule`, `ugt`, `uge`, `slt`, `sle`, `sgt`
 // and `sge`. `>>` is the logical shift (`ashr` is the arithmetic one). An integer operand is a
 // constant of the other operand's width.
+//
+// Floating-point operations are methods named after the text syntax's (`fadd`, `fsqrt`, `feq`,
+// `fisnan`, `to_float`, ...) that take the operands' format (`bitwright::F32`, any `FpFormat`) and
+// a rounding mode (default `Rounding::Rne`):
+//
+//     auto a = cx.symbol("a", 32), b = cx.symbol("b", 32);
+//     auto sum = a.fadd(b, bitwright::F32, bitwright::Rounding::Rtz);
+//     std::cout << sum << "\n"; // fp.add.rtz.f32(a, b)
 #ifndef BITWRIGHT_HPP
 #define BITWRIGHT_HPP
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -126,6 +135,7 @@ enum class Kind : int {
     Concat = BW_KIND_CONCAT,
     Select = BW_KIND_SELECT,
     Ext = BW_KIND_EXT,
+    Fp = BW_KIND_FP,
 };
 
 enum class Truth : int { False = BW_FALSE, True = BW_TRUE, Unknown = BW_UNKNOWN };
@@ -211,14 +221,103 @@ inline std::ostream &operator<<(std::ostream &os, const Value &v) {
     return os << v.hex() << ":" << v.width();
 }
 
+// ----- floating point ------------------------------------------------------------------------
+
+// A binary floating-point format: `eb` exponent bits and `sb` significand bits, the hidden bit
+// included, so an encoding is `eb + sb` bits wide. Valid when 2 <= eb <= 31, sb >= 2 and
+// eb + sb <= 512 (checked where it is used: `BW_ERR_WIDTH`).
+struct FpFormat : bw_fp_format {
+    constexpr FpFormat() : bw_fp_format{0, 0} {}
+    constexpr FpFormat(uint32_t exponent_bits, uint32_t significand_bits)
+        : bw_fp_format{exponent_bits, significand_bits} {}
+    constexpr FpFormat(const bw_fp_format &f) : bw_fp_format(f) {}
+
+    // The width of an encoding.
+    constexpr uint16_t width() const { return static_cast<uint16_t>(eb + sb); }
+
+    friend constexpr bool operator==(const FpFormat &a, const FpFormat &b) {
+        return a.eb == b.eb && a.sb == b.sb;
+    }
+    friend constexpr bool operator!=(const FpFormat &a, const FpFormat &b) { return !(a == b); }
+};
+
+inline constexpr FpFormat F16{5, 11};    // binary16
+inline constexpr FpFormat BF16{8, 8};    // bfloat16
+inline constexpr FpFormat F32{8, 24};    // binary32
+inline constexpr FpFormat F64{11, 53};   // binary64
+inline constexpr FpFormat F128{15, 113}; // binary128
+inline constexpr FpFormat F256{19, 237}; // binary256
+// The values of x87 extended precision (79 bits); `x87_load` and `x87_store` convert from and to
+// its 80-bit memory encoding.
+inline constexpr FpFormat X87{15, 64};
+
+enum class Rounding : int {
+    Rne = BW_RNE, // to nearest, ties to even
+    Rna = BW_RNA, // to nearest, ties away from zero
+    Rtp = BW_RTP, // toward +infinity
+    Rtn = BW_RTN, // toward -infinity
+    Rtz = BW_RTZ, // toward zero
+};
+
+// The operations of floating-point nodes (`bw_fpop`).
+enum class FpOp : int {
+    Add = BW_FP_ADD,
+    Mul = BW_FP_MUL,
+    Div = BW_FP_DIV,
+    Fma = BW_FP_FMA,
+    Sqrt = BW_FP_SQRT,
+    Rem = BW_FP_REM,
+    Round = BW_FP_ROUND,
+    Min = BW_FP_MIN,
+    Max = BW_FP_MAX,
+    Eq = BW_FP_EQ,
+    Lt = BW_FP_LT,
+    Le = BW_FP_LE,
+    Convert = BW_FP_CONVERT,
+    FromSbv = BW_FP_FROM_SBV,
+    FromUbv = BW_FP_FROM_UBV,
+    ToSbv = BW_FP_TO_SBV,
+    ToUbv = BW_FP_TO_UBV,
+};
+
+// Comparisons, false when an operand is a NaN.
+enum class FpCmp : int {
+    Eq = BW_FPCMP_EQ,
+    Lt = BW_FPCMP_LT,
+    Le = BW_FPCMP_LE,
+    Gt = BW_FPCMP_GT,
+    Ge = BW_FPCMP_GE,
+};
+
+// Classification tests.
+enum class FpTest : int {
+    IsNan = BW_FP_ISNAN,
+    IsInf = BW_FP_ISINF,
+    IsZero = BW_FP_ISZERO,
+    IsSubnormal = BW_FP_ISSUBNORMAL,
+    IsNormal = BW_FP_ISNORMAL,
+    IsNeg = BW_FP_ISNEG,
+    IsPos = BW_FP_ISPOS,
+};
+
+// The operation of a floating-point node (Kind::Fp).
+struct FpNode {
+    FpOp op;
+    std::optional<Rounding> rm;        // none for Rem, Min, Max and the comparisons
+    FpFormat format;                   // of the operands (the result's, from an integer)
+    std::optional<FpFormat> to;        // FpOp::Convert: the result's format
+    std::optional<uint16_t> int_width; // FpOp::ToSbv, FpOp::ToUbv: the integer's width
+};
+
 // ----- expressions ---------------------------------------------------------------------------
 
 class Expr;
 
-// One node: its kind, operator (for unary, binary and comparison nodes), width, and children.
+// One node: its kind, operator (for unary, binary, comparison and floating-point nodes), width,
+// and children.
 struct Node {
     Kind kind;
-    int op;      // UnOp, BinOp or CmpOp by kind; -1 otherwise
+    int op;      // UnOp, BinOp, CmpOp or FpOp by kind; -1 otherwise
     uint16_t lo; // first bit of an extract; output of an extension call
     uint16_t width;
     std::vector<Expr> children;
@@ -333,6 +432,104 @@ class Expr {
     // This 1-bit condition selecting `then` or `els`.
     Expr select(Expr then, Expr els) const { return make(bw_select, e_, then.e_, els.e_); }
 
+    // Floating point (the book's chapter specifies it): this expression and the other operands
+    // hold encodings of the format `f`, and a result is rounded by `rm`.
+
+    Expr fadd(Expr b, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Add, rm, f, {e_, b.e_});
+    }
+    // Built as `this + fneg(b)`.
+    Expr fsub(Expr b, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return make(bw_fp_sub, static_cast<int>(rm), f, e_, b.e_);
+    }
+    Expr fmul(Expr b, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Mul, rm, f, {e_, b.e_});
+    }
+    Expr fdiv(Expr b, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Div, rm, f, {e_, b.e_});
+    }
+    // `this * b + c`, rounded once.
+    Expr ffma(Expr b, Expr c, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Fma, rm, f, {e_, b.e_, c.e_});
+    }
+    Expr fsqrt(FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Sqrt, rm, f, {e_});
+    }
+    // The IEEE remainder `this - n * b`, `n` the integer nearest `this / b` (exact).
+    Expr frem(Expr b, FpFormat f) const { return fp_op(FpOp::Rem, Rounding::Rne, f, {e_, b.e_}); }
+    // Rounding to an integral value.
+    Expr fround(FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Round, rm, f, {e_});
+    }
+    // minimumNumber and maximumNumber: a NaN operand is ignored, and -0 < +0.
+    Expr fmin(Expr b, FpFormat f) const { return fp_op(FpOp::Min, Rounding::Rne, f, {e_, b.e_}); }
+    Expr fmax(Expr b, FpFormat f) const { return fp_op(FpOp::Max, Rounding::Rne, f, {e_, b.e_}); }
+
+    // Comparisons, 1 bit: false when an operand is a NaN, and +0 equals -0.
+    Expr fcmp(FpCmp op, Expr b, FpFormat f) const {
+        return make(bw_fp_cmp, static_cast<int>(op), f, e_, b.e_);
+    }
+    Expr feq(Expr b, FpFormat f) const { return fcmp(FpCmp::Eq, b, f); }
+    Expr flt(Expr b, FpFormat f) const { return fcmp(FpCmp::Lt, b, f); }
+    Expr fle(Expr b, FpFormat f) const { return fcmp(FpCmp::Le, b, f); }
+    Expr fgt(Expr b, FpFormat f) const { return fcmp(FpCmp::Gt, b, f); }
+    Expr fge(Expr b, FpFormat f) const { return fcmp(FpCmp::Ge, b, f); }
+
+    // The sign bit flipped, cleared, or taken from `b` (a NaN's too): bit-vector operators.
+    Expr fneg(FpFormat f) const { return make(bw_fp_neg, f, e_); }
+    Expr fabs(FpFormat f) const { return make(bw_fp_abs, f, e_); }
+    Expr fcopysign(Expr b, FpFormat f) const { return make(bw_fp_copysign, f, e_, b.e_); }
+
+    // Classification tests, 1 bit.
+    Expr ftest(FpTest t, FpFormat f) const {
+        return make(bw_fp_test, static_cast<int>(t), f, e_);
+    }
+    Expr fisnan(FpFormat f) const { return ftest(FpTest::IsNan, f); }
+    Expr fisinf(FpFormat f) const { return ftest(FpTest::IsInf, f); }
+    Expr fiszero(FpFormat f) const { return ftest(FpTest::IsZero, f); }
+    Expr fissubnormal(FpFormat f) const { return ftest(FpTest::IsSubnormal, f); }
+    Expr fisnormal(FpFormat f) const { return ftest(FpTest::IsNormal, f); }
+    Expr fisneg(FpFormat f) const { return ftest(FpTest::IsNeg, f); }
+    Expr fispos(FpFormat f) const { return ftest(FpTest::IsPos, f); }
+
+    // This value of format `f` converted to the format `to`.
+    Expr fconvert(FpFormat to, FpFormat f, Rounding rm = Rounding::Rne) const {
+        return fp_op(FpOp::Convert, rm, f, {e_}, to);
+    }
+    // This integer, signed or unsigned, rounded to the format `f`.
+    Expr to_float(FpFormat f, Rounding rm = Rounding::Rne, bool is_signed = true) const {
+        return fp_op(is_signed ? FpOp::FromSbv : FpOp::FromUbv, rm, f, {e_});
+    }
+    // This value of format `f` rounded to an integer of `w` bits, signed or unsigned, and
+    // saturated to its range (a NaN gives 0).
+    Expr to_int(uint16_t w, FpFormat f, Rounding rm = Rounding::Rne, bool is_signed = true) const {
+        return fp_op(is_signed ? FpOp::ToSbv : FpOp::ToUbv, rm, f, {e_}, FpFormat(), w);
+    }
+    // x87's 80-bit encoding as a value of X87 (79 bits), and back.
+    Expr x87_load() const { return make(bw_x87_load, e_); }
+    Expr x87_store() const { return make(bw_x87_store, e_); }
+
+    // The operation of a floating-point node.
+    std::optional<FpNode> fp_node() const {
+        if (kind() != Kind::Fp) {
+            return std::nullopt;
+        }
+        bw_fp_node n;
+        detail::check(bw_fp_node_of(cx_, e_, &n));
+        FpNode r{static_cast<FpOp>(n.op), std::nullopt, FpFormat(n.format), std::nullopt,
+                 std::nullopt};
+        if (n.rm >= 0) {
+            r.rm = static_cast<Rounding>(n.rm);
+        }
+        if (r.op == FpOp::Convert) {
+            r.to = FpFormat(n.to);
+        }
+        if (r.op == FpOp::ToSbv || r.op == FpOp::ToUbv) {
+            r.int_width = n.int_width;
+        }
+        return r;
+    }
+
     // Handle identity: equal handles are equal expressions.
     friend bool operator==(Expr a, Expr b) { return a.cx_ == b.cx_ && a.e_ == b.e_; }
     friend bool operator!=(Expr a, Expr b) { return !(a == b); }
@@ -344,11 +541,36 @@ class Expr {
         return Expr(cx_, out);
     }
 
+    Expr fp_op(FpOp op, Rounding rm, FpFormat f, std::initializer_list<bw_expr> args,
+               FpFormat to = FpFormat(), uint16_t int_width = 0) const {
+        return make(bw_fp, static_cast<int>(op), static_cast<int>(rm), f, args.begin(),
+                    args.size(), to, int_width);
+    }
+
     bw_context *cx_ = nullptr;
     bw_expr e_ = BW_NULL_EXPR;
 };
 
 inline std::ostream &operator<<(std::ostream &os, Expr e) { return os << e.str(); }
+
+// The floating-point operation `op` of format `f` on `args`, operands of one context (see
+// `bw_fp`): `rm` is its rounding mode, `to` the result's format for FpOp::Convert, `int_width` the
+// result's width for FpOp::ToSbv and FpOp::ToUbv; the operations without them ignore them.
+inline Expr fp(FpOp op, FpFormat f, const std::vector<Expr> &args, Rounding rm = Rounding::Rne,
+               FpFormat to = FpFormat(), uint16_t int_width = 0) {
+    if (args.empty()) {
+        throw Error(BW_ERR_INVALID_ARGUMENT, "a floating-point operation needs operands");
+    }
+    std::vector<bw_expr> raw;
+    for (Expr e : args) {
+        raw.push_back(e.raw());
+    }
+    bw_context *cx = args[0].context();
+    bw_expr out = BW_NULL_EXPR;
+    detail::check(bw_fp(cx, static_cast<int>(op), static_cast<int>(rm), f, raw.data(), raw.size(),
+                        to, int_width, &out));
+    return Expr(cx, out);
+}
 
 #define BITWRIGHT_BINARY_OPERATOR(sym, op)                                                         \
     inline Expr operator sym(Expr a, Expr b) { return a.bin(BinOp::op, b); }                       \
@@ -516,7 +738,7 @@ class Context {
         return make(bw_substitute, e.raw(), from.data(), to.data(), map.size());
     }
 
-    // A QF_BV script defining the K-th expression as `rootK`.
+    // A QF_BV script (QF_BVFP with floating point) defining the K-th expression as `rootK`.
     std::string to_smtlib(const std::vector<Expr> &roots) {
         std::vector<bw_expr> r;
         for (Expr e : roots) {
@@ -527,7 +749,7 @@ class Context {
         return detail::take(s);
     }
 
-    // Reads a QF_BV script into this context.
+    // Reads a QF_BV script, floating-point (QF_BVFP) terms included, into this context.
     SmtScript from_smtlib(const std::string &script) {
         bw_smt_import *imp = nullptr;
         detail::check(bw_smtlib_import(cx_, script.c_str(), &imp));

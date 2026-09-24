@@ -4,6 +4,13 @@ from typing import Literal, TypeAlias, final
 __version__: str
 __all__ = [
     "__version__",
+    "BF16",
+    "F16",
+    "F32",
+    "F64",
+    "F128",
+    "F256",
+    "X87",
     "Assumptions",
     "BitwrightError",
     "Budget",
@@ -11,6 +18,7 @@ __all__ = [
     "Engine",
     "Expr",
     "Facts",
+    "FpFormat",
     "Outcome",
     "ParseError",
     "RuleError",
@@ -35,8 +43,48 @@ class RuleError(BitwrightError):
 
 _Kind: TypeAlias = Literal[
     "const", "symbol", "unary", "binary", "compare", "zext", "sext", "extract", "concat",
-    "select", "ext",
+    "select", "ext", "fp",
 ]
+
+_Rounding: TypeAlias = Literal["rne", "rna", "rtp", "rtn", "rtz"]
+
+@final
+class FpFormat:
+    """A binary floating-point format: `eb` exponent bits and `sb` significand bits, the hidden
+    bit included, so an encoding is `eb + sb` bits wide. Immutable and hashable."""
+
+    def __new__(cls, eb: int, sb: int) -> FpFormat:
+        """Raises `WidthError` unless `2 <= eb <= 31`, `sb >= 2` and `eb + sb <= 512`."""
+    @property
+    def eb(self) -> int:
+        """Exponent bits."""
+    @property
+    def sb(self) -> int:
+        """Significand bits, the hidden bit included (the precision)."""
+    @property
+    def width(self) -> int:
+        """The width of an encoding: `eb + sb`."""
+    @property
+    def name(self) -> str | None:
+        """The name of a standard format in the text syntax (`"f32"`, ...)."""
+    def __eq__(self, other: object, /) -> bool: ...
+    def __ne__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+F16: FpFormat
+"""IEEE binary16, `(5, 11)`."""
+BF16: FpFormat
+"""bfloat16, `(8, 8)`."""
+F32: FpFormat
+"""IEEE binary32, `(8, 24)`."""
+F64: FpFormat
+"""IEEE binary64, `(11, 53)`."""
+F128: FpFormat
+"""IEEE binary128, `(15, 113)`."""
+F256: FpFormat
+"""IEEE binary256, `(19, 237)`."""
+X87: FpFormat
+"""The values of x87 extended precision, `(15, 64)` (79 bits); see `Expr.x87_load`."""
 
 @final
 class Context:
@@ -60,9 +108,11 @@ class Context:
     def parse(self, text: str, width: int | None = None) -> Expr:
         """Parses expression text; `width` types what cannot be inferred."""
     def to_smtlib(self, *exprs: Expr) -> str:
-        """An SMT-LIB 2.6 QF_BV script defining the K-th expression as `rootK`."""
+        """An SMT-LIB 2.6 QF_BV script (QF_BVFP with floating point) defining the K-th
+        expression as `rootK`."""
     def from_smtlib(self, script: str) -> SmtScript:
-        """Reads an SMT-LIB QF_BV script into this context."""
+        """Reads an SMT-LIB QF_BV script, floating-point (QF_BVFP) terms included, into this
+        context."""
 
 @final
 class SmtScript:
@@ -88,7 +138,8 @@ class Expr:
     def kind(self) -> _Kind: ...
     @property
     def op(self) -> str | None:
-        """The operator of a unary, binary or comparison node (`"add"`, `"ult"`, ...)."""
+        """The operator of a unary, binary, comparison or floating-point node (`"add"`, `"ult"`,
+        `"sqrt"`, ...)."""
     @property
     def children(self) -> list[Expr]: ...
     @property
@@ -103,6 +154,15 @@ class Expr:
     @property
     def lo(self) -> int | None:
         """The first bit of an extract."""
+    @property
+    def format(self) -> FpFormat | None:
+        """The format of a floating-point node's operands (of its result, from an integer)."""
+    @property
+    def to_format(self) -> FpFormat | None:
+        """The result's format of a conversion between formats (`"convert"`)."""
+    @property
+    def rounding(self) -> _Rounding | None:
+        """The rounding mode of a floating-point node that has one."""
     def dag_size(self) -> int: ...
     def to_string(self, *, lets: bool = True, symbol_widths: bool = False) -> str: ...
     def __hash__(self) -> int: ...
@@ -174,6 +234,51 @@ class Expr:
         """This expression in the high bits, then each of `lows`."""
     def select(self, then: _Operand, els: _Operand) -> Expr:
         """`then` where this 1-bit condition holds, else `els`."""
+    # Floating point: this expression and the operands hold encodings of `fmt` (an int operand
+    # is one), and a result is rounded by `rm`.
+    def fadd(self, o: _Operand, fmt: FpFormat, rm: _Rounding = "rne") -> Expr: ...
+    def fsub(self, o: _Operand, fmt: FpFormat, rm: _Rounding = "rne") -> Expr: ...
+    def fmul(self, o: _Operand, fmt: FpFormat, rm: _Rounding = "rne") -> Expr: ...
+    def fdiv(self, o: _Operand, fmt: FpFormat, rm: _Rounding = "rne") -> Expr: ...
+    def ffma(self, b: _Operand, c: _Operand, fmt: FpFormat, rm: _Rounding = "rne") -> Expr:
+        """`self * b + c`, rounded once."""
+    def fsqrt(self, fmt: FpFormat, rm: _Rounding = "rne") -> Expr: ...
+    def frem(self, o: _Operand, fmt: FpFormat) -> Expr:
+        """The IEEE remainder (exact)."""
+    def fround(self, fmt: FpFormat, rm: _Rounding = "rne") -> Expr:
+        """Rounded to an integral value."""
+    def fmin(self, o: _Operand, fmt: FpFormat) -> Expr:
+        """minimumNumber: a NaN operand ignored, `-0 < +0`."""
+    def fmax(self, o: _Operand, fmt: FpFormat) -> Expr:
+        """maximumNumber: a NaN operand ignored, `-0 < +0`."""
+    def feq(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def flt(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def fle(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def fgt(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def fge(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def fneg(self, fmt: FpFormat) -> Expr: ...
+    def fabs(self, fmt: FpFormat) -> Expr: ...
+    def fcopysign(self, o: _Operand, fmt: FpFormat) -> Expr: ...
+    def fisnan(self, fmt: FpFormat) -> Expr: ...
+    def fisinf(self, fmt: FpFormat) -> Expr: ...
+    def fiszero(self, fmt: FpFormat) -> Expr: ...
+    def fissubnormal(self, fmt: FpFormat) -> Expr: ...
+    def fisnormal(self, fmt: FpFormat) -> Expr: ...
+    def fisneg(self, fmt: FpFormat) -> Expr: ...
+    def fispos(self, fmt: FpFormat) -> Expr: ...
+    def fconvert(self, to: FpFormat, fmt: FpFormat, rm: _Rounding = "rne") -> Expr:
+        """This value of format `fmt` converted to the format `to`."""
+    def to_float(self, fmt: FpFormat, rm: _Rounding = "rne", *, signed: bool = True) -> Expr:
+        """This integer rounded to the format `fmt`."""
+    def to_int(
+        self, width: int, fmt: FpFormat, rm: _Rounding = "rne", *, signed: bool = True
+    ) -> Expr:
+        """This value of format `fmt` rounded to a `width`-bit integer, saturating (a NaN gives
+        0)."""
+    def x87_load(self) -> Expr:
+        """x87's 80-bit encoding as a value of `X87`."""
+    def x87_store(self) -> Expr:
+        """A value of `X87` as x87's 80-bit encoding."""
     def eval(self, env: Mapping[str | int | Expr, int] | None = None, /, **kwargs: int) -> int:
         """The value (unsigned) with symbols bound by name or by symbol expression."""
     def substitute(self, mapping: Mapping[Expr, _Operand]) -> Expr:

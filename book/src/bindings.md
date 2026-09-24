@@ -4,6 +4,8 @@ bitwright can be used from C, C++ and Python. The bindings cover what a host nee
 expressions to bitwright and read the results back:
 
 - building, parsing, printing and inspecting expressions, at any width from 1 to 512 bits;
+- IEEE 754 [floating point](floating-point.md) in any format and under every rounding mode, on
+  the bit-vectors that hold the encodings;
 - evaluation and substitution;
 - facts (known bits, and ranges with a stride) and tri-state proofs, including invertibility,
   under assumptions, with the assumptions each answer relies on;
@@ -237,3 +239,154 @@ int main() {
 the other comparison methods build 1-bit expressions. `>>` is the logical shift. An `Expr` refers
 to its `Context` without owning it, so the context must outlive it; `Engine` is cheap to copy and
 thread-safe.
+
+## Floating point
+
+The three bindings build, print, inspect and evaluate the operations of the
+[chapter on floating point](floating-point.md). A floating-point value is a bit-vector holding
+an IEEE 754 encoding, so operands and results are bit patterns of the format's width: `eb + sb`
+bits for the format `(eb, sb)`, with `eb` exponent bits and `sb` significand bits, the hidden
+bit included. The named formats are `F16`, `BF16`, `F32`, `F64`, `F128`, `F256` and `X87` (in C
+`BW_F32` and so on, and `bw_fp_format_of(eb, sb)` for any other); the rounding modes are `rne`,
+`rna`, `rtp`, `rtn` and `rtz`, `rne` by default in Python and C++. Operations have the names of
+the text syntax: in Python and C++ they are methods (`fadd`, `fsqrt`, `feq`, `fisnan`,
+`fconvert`, `to_float`, `to_int`, ...); in C, `bw_fp` builds the node of a `bw_fpop`, and
+`bw_fp_sub`, `bw_fp_neg`, `bw_fp_abs`, `bw_fp_copysign`, `bw_fp_cmp`, `bw_fp_test`,
+`bw_x87_load` and `bw_x87_store` build the other operations as the text syntax does, from those
+nodes and bit-vector operators. A node of an operation has the kind `fp` (`BW_KIND_FP`) and its
+operation as `op`; its format and rounding mode are `format` and `rounding` in Python,
+`fp_node()` in C++ and `bw_fp_node_of` in C.
+
+```python
+import struct
+
+import bitwright as bw
+
+
+def f32(v: float) -> int:
+    """The binary32 encoding of `v`."""
+    return int(struct.unpack("<I", struct.pack("<f", v))[0])
+
+
+cx = bw.Context()
+a, b = cx.symbols("a b", 32)
+
+# Methods named after the text syntax's operations take the format and a rounding mode.
+s = a.fadd(b, bw.F32)
+assert str(s) == "fp.add.rne.f32(a, b)"
+assert (s.kind, s.op, s.format, s.rounding) == ("fp", "add", bw.F32, "rne")
+
+# 0.1 + 0.2 in binary32: to nearest it rounds up, toward zero one unit in the last place lower.
+assert s.eval(a=f32(0.1), b=f32(0.2)) == f32(0.3) == 0x3E99999A
+assert a.fadd(b, bw.F32, rm="rtz").eval(a=f32(0.1), b=f32(0.2)) == 0x3E999999
+
+# Integers of any width convert to any format and back, saturating.
+i = cx.symbol("i", 16)
+x = i.to_float(bw.F64)  # signed; `signed=False` reads `i` as unsigned
+assert x.to_int(8, bw.F64, rm="rtz").eval(i=1000) == 0x7F
+
+# Facts see through floating point: a product of converted integers is never a NaN.
+nan = x.fmul(x, bw.F64).fisnan(bw.F64)
+assert nan.prove() is False
+assert str(nan.simplify()) == "0:1"
+```
+
+```c
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bitwright.h"
+
+static void check(bw_status s) {
+    if (s != BW_OK) {
+        fprintf(stderr, "bitwright error %d: %s\n", s, bw_last_error());
+        exit(1);
+    }
+}
+
+int main(void) {
+    bw_context *cx = bw_context_new();
+    bw_expr ab[2], s, t, h;
+    bw_value v[2], r;
+    bw_fp_node n;
+    bw_status st;
+    char *text;
+
+    /* fp.add.rtz.f32(a, b): the operation, its rounding mode and format, the operands, and the
+     * target format and integer width that only conversions read. */
+    check(bw_symbol(cx, "a", 32, &ab[0]));
+    check(bw_symbol(cx, "b", 32, &ab[1]));
+    check(bw_fp(cx, BW_FP_ADD, BW_RTZ, BW_F32, ab, 2, BW_F32, 0, &s));
+    check(bw_print(cx, s, 0, &text));
+    assert(strcmp(text, "fp.add.rtz.f32(a, b)") == 0);
+    bw_string_free(text);
+
+    /* 0.1 + 0.2 in binary32, toward zero. */
+    v[0] = bw_value_u64(32, 0x3dcccccd);
+    v[1] = bw_value_u64(32, 0x3e4ccccd);
+    check(bw_eval(cx, s, ab, v, 2, &r));
+    assert(r.limbs[0] == 0x3e999999);
+
+    /* Inspecting the node. */
+    check(bw_fp_node_of(cx, s, &n));
+    assert(n.op == BW_FP_ADD && n.rm == BW_RTZ && n.format.eb == 8 && n.format.sb == 24);
+
+    /* To a 16-bit signed integer, saturating: 1e10 gives 0x7fff. */
+    check(bw_fp(cx, BW_FP_TO_SBV, BW_RTZ, BW_F32, ab, 1, BW_F32, 16, &t));
+    v[0] = bw_value_u64(32, 0x501502f9);
+    check(bw_eval(cx, t, ab, v, 1, &r));
+    assert(r.width == 16 && r.limbs[0] == 0x7fff);
+
+    /* Errors: a format outside 2 <= eb <= 31, sb >= 2, eb + sb <= 512, an operand of another
+     * width. */
+    st = bw_fp_neg(cx, bw_fp_format_of(1, 9), ab[0], &t);
+    assert(st == BW_ERR_WIDTH);
+    check(bw_symbol(cx, "h", 16, &h));
+    st = bw_fp_test(cx, BW_FP_ISNAN, BW_F32, h, &t);
+    assert(st == BW_ERR_WIDTH);
+
+    bw_context_free(cx);
+    return 0;
+}
+```
+
+```cpp
+#include <cassert>
+
+#include "bitwright.hpp"
+
+namespace bw = bitwright;
+
+int main() {
+    bw::Context cx;
+    bw::Expr a = cx.symbol("a", 32), b = cx.symbol("b", 32);
+
+    // 0.1 + 0.2 in binary32, to nearest and toward zero.
+    bw::Expr near = a.fadd(b, bw::F32), down = a.fadd(b, bw::F32, bw::Rounding::Rtz);
+    assert(near.str() == "fp.add.rne.f32(a, b)");
+    bw::Value tenth(32, 0x3dcccccd), fifth(32, 0x3e4ccccd);
+    assert(cx.eval(near, {{a, tenth}, {b, fifth}}) == bw::Value(32, 0x3e99999a));
+    assert(cx.eval(down, {{a, tenth}, {b, fifth}}) == bw::Value(32, 0x3e999999));
+
+    // Inspecting a node, and building it again with the generic `fp`.
+    bw::FpNode n = *down.fp_node();
+    assert(down.kind() == bw::Kind::Fp && n.op == bw::FpOp::Add && n.format == bw::F32);
+    assert(n.rm == bw::Rounding::Rtz && !n.to && !n.int_width);
+    assert(bw::fp(n.op, n.format, down.children(), *n.rm) == down);
+
+    // Facts: an integer converted to a float is never a NaN.
+    bw::Expr i = cx.symbol("i", 16);
+    assert(bw::prove(i.to_float(bw::F64).fisnan(bw::F64)).truth == bw::Truth::False);
+
+    // Errors are exceptions: an operand of another width.
+    try {
+        a.fadd(i, bw::F32);
+        assert(false);
+    } catch (const bw::Error &e) {
+        assert(e.status() == BW_ERR_WIDTH);
+    }
+    return 0;
+}
+```
