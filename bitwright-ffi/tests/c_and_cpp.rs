@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const C_EXPECTED: &str = "\
 simplified: x + y
@@ -30,14 +31,38 @@ fn manifest() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Where cargo put `libbitwright` for this test: `deps/`, next to the test (`cargo build`
-/// copies it up one level, `cargo test` does not).
+/// Where `libbitwright` is, built for this test: `cargo test` builds no library it cannot link
+/// into a test, and this one has no rlib, so the test asks the cargo running it for the
+/// current one (once), into the same target directory and profile. Cargo writes it to
+/// `deps/`, next to the test.
 fn lib_dir() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().to_path_buf();
-    let lib = dir.join(format!("libbitwright{}", std::env::consts::DLL_SUFFIX));
-    assert!(lib.exists(), "no {}", lib.display());
-    dir
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            let deps = exe.parent().unwrap();
+            let profile_dir = deps.parent().unwrap();
+            let profile = match profile_dir.file_name().unwrap().to_str().unwrap() {
+                "debug" => "dev",
+                name => name,
+            };
+            run(Command::new(env!("CARGO"))
+                .current_dir(manifest())
+                .args([
+                    "build",
+                    "--quiet",
+                    "-p",
+                    "bitwright-ffi",
+                    "--profile",
+                    profile,
+                ])
+                .arg("--target-dir")
+                .arg(profile_dir.parent().unwrap()));
+            let lib = deps.join(format!("libbitwright{}", std::env::consts::DLL_SUFFIX));
+            assert!(lib.exists(), "no {}", lib.display());
+            deps.to_path_buf()
+        })
+        .clone()
 }
 
 fn compiler(var: &str, default: &str) -> String {
