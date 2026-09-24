@@ -549,7 +549,7 @@ impl Context {
             let op = self.registry.as_deref().map_or(0, |r| r.hash_at(n.aux));
             h = combine(h, op);
         }
-        if crate::fp::node::Kind::of(n.op).is_some() {
+        if n.op.is_fp() {
             // The rounding mode and format; a conversion's target exponent width too.
             h = combine(h, u64::from(n.aux));
             if n.op == OpCode::FConvert {

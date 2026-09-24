@@ -1,6 +1,6 @@
 //! SMT-LIB 2.6 import of a QF_BV subset, and of floating-point (QF_BVFP) terms.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::expr::{Context, Expr};
@@ -65,7 +65,6 @@ pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
         cx,
         globals: HashMap::new(),
         scope: Vec::new(),
-        used: HashSet::new(),
         out: Import::default(),
     };
     // Then one top-level form at a time: memory is bounded by the largest command, not by the
@@ -370,12 +369,10 @@ enum Sort {
 
 struct State<'a, 's> {
     cx: &'a mut Context,
-    /// Declared and defined names.
-    globals: HashMap<&'s str, Val>,
+    /// Declared and defined names, and whether a term has read each so far.
+    globals: HashMap<&'s str, (Val, bool)>,
     /// `let` bindings, innermost last.
     scope: Vec<(&'s str, Val)>,
-    /// Global names read by a term so far.
-    used: HashSet<&'s str>,
     out: Import,
 }
 
@@ -437,7 +434,7 @@ impl<'s> State<'_, 's> {
         if self.globals.contains_key(name) {
             return Err(sx.err(id, "already declared"));
         }
-        self.globals.insert(name, v);
+        self.globals.insert(name, (v, false));
         Ok(())
     }
 
@@ -480,13 +477,14 @@ impl<'s> State<'_, 's> {
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<Val> {
-        self.scope
-            .iter()
-            .rev()
-            .find(|(n, _)| *n == name)
-            .map(|&(_, v)| v)
-            .or_else(|| self.globals.get(name).copied())
+    /// The value of a name a term reads, marking a global as read.
+    fn lookup(&mut self, name: &str) -> Option<Val> {
+        if let Some(&(_, v)) = self.scope.iter().rev().find(|(n, _)| *n == name) {
+            return Some(v);
+        }
+        let (v, read) = self.globals.get_mut(name)?;
+        *read = true;
+        Some(*v)
     }
 
     fn bv(&self, sx: &Sx<'s>, id: u32, v: Val) -> Result<Expr, Error> {
@@ -511,7 +509,6 @@ impl<'s> State<'_, 's> {
                 "false" => Ok(Val::Bool(self.cx.bool(false)?)),
                 _ => {
                     if let Some(v) = self.lookup(s) {
-                        self.used.insert(s);
                         return Ok(v);
                     }
                     rounding_mode(s)
@@ -659,12 +656,17 @@ impl<'s> State<'_, 's> {
             return Err(sx.err(id, "expected an indexed operator"));
         }
         let op = sx.name(idx[0])?;
-        let nums: Vec<u32> = idx[1..]
-            .iter()
-            .map(|&i| sx.numeral(i))
-            .collect::<Result<_, _>>()?;
+        // No indexed operator takes more than two indices.
+        let mut buf = [0u32; 2];
+        let Some(nums) = buf.get_mut(..idx.len() - 1) else {
+            return Err(sx.err(id, "too many indices"));
+        };
+        for (n, &i) in nums.iter_mut().zip(&idx[1..]) {
+            *n = sx.numeral(i)?;
+        }
+        let nums = &*nums;
         if matches!(op, "to_fp" | "to_fp_unsigned" | "fp.to_ubv" | "fp.to_sbv") {
-            return self.indexed_float(sx, id, op, &nums, args);
+            return self.indexed_float(sx, id, op, nums, args);
         }
         let [a] = args else {
             return Err(sx.err(id, "an indexed operator takes one operand"));
@@ -672,7 +674,7 @@ impl<'s> State<'_, 's> {
         let v = self.term(sx, *a)?;
         let x = self.bv(sx, *a, v)?;
         let w = u32::from(self.cx.width(x)?.bits());
-        let e = match (op, nums.as_slice()) {
+        let e = match (op, nums) {
             ("extract", &[hi, lo]) => {
                 if lo > hi || hi >= w {
                     return Err(sx.err(id, "extract out of range"));
@@ -1288,10 +1290,10 @@ impl<'s> State<'_, 's> {
         if sx.sym(u) != Some("_") || sx.sym(to_fp) != Some("to_fp") || sx.sym(c2) != Some(name) {
             return Ok(false);
         }
-        let Some(&Val::Bv(symbol)) = self.globals.get(name) else {
+        let Some(&(Val::Bv(symbol), read)) = self.globals.get(name) else {
             return Ok(false);
         };
-        if self.used.contains(name) || self.scope.iter().any(|(n, _)| *n == name) {
+        if read || self.scope.iter().any(|(n, _)| *n == name) {
             return Ok(false);
         }
         let Val::Fp(e, f) = self.term(sx, t1)? else {
@@ -1314,7 +1316,7 @@ impl<'s> State<'_, 's> {
             let t = self.cx.fp_test(f, FpTest::Nan, e)?;
             self.cx.select(t, nan_e, e)?
         };
-        self.globals.insert(name, Val::Bv(bits));
+        self.globals.insert(name, (Val::Bv(bits), false));
         self.out.symbols.retain(|(n, _)| n != name);
         Ok(true)
     }

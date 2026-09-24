@@ -80,8 +80,9 @@ enum Kind {
     Derived(Derived, usize, usize),
     /// Output `k` of an extension operation on 1 to 3 arguments.
     Ext(crate::ext::ExtId, u8, Vec<usize>),
-    /// A floating-point operation.
-    Fp(crate::fp::syntax::Call, Vec<usize>),
+    /// A floating-point operation and its operands (boxed: every other node would pay for
+    /// its size).
+    Fp(Box<(crate::fp::syntax::Call, Vec<usize>)>),
 }
 
 struct PNode {
@@ -557,7 +558,7 @@ impl<'a> Parser<'a> {
             }
         }
         let result = call.result_width();
-        let n = self.node(Kind::Fp(call, args), sp);
+        let n = self.node(Kind::Fp(Box::new((call, args))), sp);
         self.fix(n, result, sp)?;
         self.depth -= 1;
         Ok(n)
@@ -790,7 +791,8 @@ fn operands(k: &Kind) -> Vec<usize> {
             vec![*a, *b]
         }
         Kind::Select(a, b, c) => vec![*a, *b, *c],
-        Kind::Ext(_, _, args) | Kind::Fp(_, args) => args.clone(),
+        Kind::Ext(_, _, args) => args.clone(),
+        Kind::Fp(call) => call.1.clone(),
     }
 }
 
@@ -1025,9 +1027,9 @@ impl Context {
                     let args: Vec<Expr> = args.iter().map(|&a| at(a)).collect();
                     self.ext_output(*op, usize::from(*k), &args)
                 }
-                Kind::Fp(call, args) => {
-                    let args: Vec<Expr> = args.iter().map(|&a| at(a)).collect();
-                    self.build_fp_call(call, &args)
+                Kind::Fp(call) => {
+                    let args: Vec<Expr> = call.1.iter().map(|&a| at(a)).collect();
+                    self.build_fp_call(&call.0, &args)
                 }
                 Kind::Derived(d, a, b) => {
                     let (a, b) = (at(*a), at(*b));

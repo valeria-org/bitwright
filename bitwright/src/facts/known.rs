@@ -132,6 +132,17 @@ impl KnownBits {
         bv_not(&self.zero)
     }
 
+    /// The top bit, if it is known (without copying a mask).
+    pub(crate) fn msb(&self) -> Option<bool> {
+        if self.one.msb() {
+            Some(true)
+        } else if self.zero.msb() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// The value, if every bit is known.
     pub fn as_constant(&self) -> Option<BitVec> {
         self.known().is_ones().then_some(self.one)

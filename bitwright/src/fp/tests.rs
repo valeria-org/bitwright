@@ -584,6 +584,9 @@ fn formats_are_validated() {
     assert!(FpFormat::new(5, 1).is_err());
     assert!(FpFormat::new(31, 481).is_ok());
     assert!(FpFormat::new(31, 482).is_err());
+    // No overflow on the way to the answer.
+    assert!(FpFormat::new(8, u32::MAX).is_err());
+    assert!(FpFormat::new(u32::MAX, 24).is_err());
     assert_eq!(FpFormat::F32.name(), Some("f32"));
     assert_eq!(FpFormat::from_name("bf16"), Some(FpFormat::BF16));
     assert_eq!(format!("{:?}", FpFormat::X87), "fp<15, 64>");

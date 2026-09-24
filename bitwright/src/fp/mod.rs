@@ -96,26 +96,34 @@ macro_rules! frames_short {
 /// included, so a value is `eb + sb` bits wide. `2 ≤ eb ≤ 31`, `sb ≥ 2`, `eb + sb ≤ 512`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FpFormat {
-    eb: u8,
-    sb: u16,
+    /// `eb << 9 | sb`: `eb ≤ 31` and `sb ≤ 510` fit in 16 bits, which keeps every value that
+    /// carries a format (a node's operation, an imported term) small. Ordered by `eb`, then `sb`.
+    packed: u16,
 }
 
 impl FpFormat {
     /// IEEE binary16 (half precision): `(5, 11)`.
-    pub const F16: FpFormat = FpFormat { eb: 5, sb: 11 };
+    pub const F16: FpFormat = FpFormat::pack(5, 11);
     /// bfloat16: `(8, 8)`.
-    pub const BF16: FpFormat = FpFormat { eb: 8, sb: 8 };
+    pub const BF16: FpFormat = FpFormat::pack(8, 8);
     /// IEEE binary32 (single precision): `(8, 24)`.
-    pub const F32: FpFormat = FpFormat { eb: 8, sb: 24 };
+    pub const F32: FpFormat = FpFormat::pack(8, 24);
     /// IEEE binary64 (double precision): `(11, 53)`.
-    pub const F64: FpFormat = FpFormat { eb: 11, sb: 53 };
+    pub const F64: FpFormat = FpFormat::pack(11, 53);
     /// IEEE binary128 (quadruple precision): `(15, 113)`.
-    pub const F128: FpFormat = FpFormat { eb: 15, sb: 113 };
+    pub const F128: FpFormat = FpFormat::pack(15, 113);
     /// IEEE binary256 (octuple precision): `(19, 237)`.
-    pub const F256: FpFormat = FpFormat { eb: 19, sb: 237 };
+    pub const F256: FpFormat = FpFormat::pack(19, 237);
     /// The values of x87 extended precision, `(15, 64)`, 79 bits wide; see [`x87_load`] and
     /// [`x87_store`] for its 80-bit memory encoding.
-    pub const X87: FpFormat = FpFormat { eb: 15, sb: 64 };
+    pub const X87: FpFormat = FpFormat::pack(15, 64);
+
+    /// A valid `(eb, sb)`, packed.
+    const fn pack(eb: u32, sb: u32) -> FpFormat {
+        FpFormat {
+            packed: (eb << 9 | sb) as u16,
+        }
+    }
 
     /// The named formats, with the names the text syntax uses for them.
     pub const NAMED: [(FpFormat, &'static str); 6] = [
@@ -129,28 +137,26 @@ impl FpFormat {
 
     /// The format `(eb, sb)`, if `2 ≤ eb ≤ 31`, `sb ≥ 2` and `eb + sb ≤ 512`.
     pub const fn new(eb: u32, sb: u32) -> Result<FpFormat, WidthError> {
-        if eb < 2 || eb > 31 || sb < 2 || eb + sb > Width::MAX_BITS as u32 {
+        // `eb ≤ 31` first, so the bound on `sb` cannot overflow.
+        if eb < 2 || eb > 31 || sb < 2 || sb > Width::MAX_BITS as u32 - eb {
             return Err(WidthError::FpFormat { eb, sb });
         }
-        Ok(FpFormat {
-            eb: eb as u8,
-            sb: sb as u16,
-        })
+        Ok(FpFormat::pack(eb, sb))
     }
 
     /// Exponent bits.
     pub const fn eb(self) -> u32 {
-        self.eb as u32
+        (self.packed >> 9) as u32
     }
 
     /// Significand bits, the hidden bit included (the precision).
     pub const fn sb(self) -> u32 {
-        self.sb as u32
+        (self.packed & 0x1ff) as u32
     }
 
     /// The width of an encoding: `eb + sb`.
     pub fn width(self) -> Width {
-        Width::new(self.eb as u16 + self.sb).expect("a valid format fits in 512 bits")
+        Width::new((self.eb() + self.sb()) as u16).expect("a valid format fits in 512 bits")
     }
 
     /// The name of a standard format (`"f32"`, …), if it has one.
@@ -523,7 +529,7 @@ impl fmt::Debug for FpFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name() {
             Some(n) => write!(f, "{n}"),
-            None => write!(f, "fp<{}, {}>", self.eb, self.sb),
+            None => write!(f, "fp<{}, {}>", self.eb(), self.sb()),
         }
     }
 }

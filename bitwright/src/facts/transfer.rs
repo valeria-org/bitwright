@@ -331,20 +331,45 @@ pub(super) fn span(
 /// bit maps unsigned order onto signed order and back, so the ranges trade places; clearing it
 /// keeps the non-negative half and moves the negative half down. (A float's negation and
 /// absolute value.)
-fn top_bit(op: BinOp, a: &Facts, b: &Facts) -> Option<Facts> {
+///
+/// `bc` is `b`'s value if it is a constant. Most operations are neither, so they are turned
+/// away on the known top bit an operand needs before anything is built.
+fn top_bit(op: BinOp, a: &Facts, b: &Facts, bc: Option<&BitVec>) -> Option<Facts> {
     let w = a.width();
     if w.bits() == 1 {
         return None;
     }
-    let (x, c) = match (a.as_constant(), b.as_constant()) {
-        (_, Some(c)) => (a, c),
-        (Some(c), _) => (b, c),
-        _ => return None,
+    // smin has its top bit set, smax clear.
+    let top = op == BinOp::Xor;
+    let (x, c) = if b.known.msb() == Some(top)
+        && let Some(c) = bc
+    {
+        (a, *c)
+    } else if a.known.msb() == Some(top)
+        && let Some(c) = a.known.as_constant()
+    {
+        (b, c)
+    } else {
+        return None;
     };
+    if c != if top {
+        BitVec::smin(w)
+    } else {
+        BitVec::smax(w)
+    } {
+        return None;
+    }
+    top_bit_exact(top, x)
+}
+
+/// `x ^ smin` (`flip`) or `x & smax`, out of line so that the common transfers stay compact.
+#[inline(never)]
+fn top_bit_exact(flip: bool, x: &Facts) -> Option<Facts> {
+    let w = x.width();
     let (smin, smax) = (BitVec::smin(w), BitVec::smax(w));
     let (kz, ko) = (x.known.known_zero(), x.known.known_one());
-    match op {
-        BinOp::Xor if c == smin => {
+    match flip {
+        true => {
             let flip = |v: &BitVec| bv_xor(v, &smin);
             let known = KnownBits::from_masks(
                 bv_or(&bv_and(&kz, &smax), &bv_and(&ko, &smin)),
@@ -354,7 +379,7 @@ fn top_bit(op: BinOp, a: &Facts, b: &Facts) -> Option<Facts> {
             let s = SRange::new(flip(&x.urange.lo()), flip(&x.urange.hi()))?;
             Facts::reduce(known, u, s)
         }
-        BinOp::And if c == smax => {
+        false => {
             let zero = BitVec::zero(w);
             let below = |v: &BitVec| bv_and(v, &smax);
             let pos = span(x, &zero, &smax, false);
@@ -372,7 +397,6 @@ fn top_bit(op: BinOp, a: &Facts, b: &Facts) -> Option<Facts> {
             let s = SRange::new(lo, hi)?;
             Facts::reduce(known, u, s)
         }
-        _ => None,
     }
 }
 
@@ -382,15 +406,15 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     let full_u = URange::full(w);
     let full_s = SRange::full(w);
     let bin = |x: &BitVec, y: &BitVec| BitVec::bin_unchecked(op, x, y);
+    let bc = b.known.as_constant();
     // An exactly known count is handled precisely for every shift and rotate.
-    let count = b.known.as_constant().and_then(|c| {
+    let count = bc.as_ref().map(|c| {
         c.to_u64()
-            .map(|v| v.min(u64::from(u32::MAX)) as u32)
-            .or(Some(u32::MAX))
+            .map_or(u32::MAX, |v| v.min(u64::from(u32::MAX)) as u32)
     });
     let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or(top);
     if matches!(op, BinOp::Xor | BinOp::And)
-        && let Some(f) = top_bit(op, a, b)
+        && let Some(f) = top_bit(op, a, b, bc.as_ref())
     {
         return f;
     }

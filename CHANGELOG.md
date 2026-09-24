@@ -23,6 +23,12 @@
   z3.
 - **Facts.** Flipping or clearing the top bit (`x ^ smin`, `x & smax`) keeps the ranges exactly:
   the unsigned and signed ranges trade places, or the negative half moves down.
+- **Performance.** Floating point costs integer work nothing, and some of it got faster: a
+  node's arity is one table load, the top-bit fact transfers are turned away on a known top bit
+  before they build anything, a format packs into 16 bits, and SMT-LIB import reads indexed
+  operators without allocating. Against 0.8.0 (instructions): `expr/build` −3 %, `expr/eval` −8
+  %, `expr/substitute` −7 %, `simplify/standard` −1.3 %, `facts/cold` −0.8 %,
+  `service/smt-import` −1.3 %.
 
 ## 0.8.0
 

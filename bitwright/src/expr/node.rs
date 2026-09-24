@@ -239,8 +239,96 @@ impl OpCode {
         })
     }
 
-    /// Number of child nodes.
+    /// Every opcode, in discriminant order (a new opcode is appended to both).
+    pub(crate) const ALL: [OpCode; 80] = [
+        OpCode::Const,
+        OpCode::Sym,
+        OpCode::Not,
+        OpCode::Neg,
+        OpCode::Popcnt,
+        OpCode::Clz,
+        OpCode::Ctz,
+        OpCode::Bswap,
+        OpCode::BitRev,
+        OpCode::Add,
+        OpCode::Sub,
+        OpCode::Mul,
+        OpCode::UMulHi,
+        OpCode::SMulHi,
+        OpCode::UDiv,
+        OpCode::URem,
+        OpCode::SDiv,
+        OpCode::SRem,
+        OpCode::And,
+        OpCode::Or,
+        OpCode::Xor,
+        OpCode::Shl,
+        OpCode::LShr,
+        OpCode::AShr,
+        OpCode::RotL,
+        OpCode::RotR,
+        OpCode::Pdep,
+        OpCode::Pext,
+        OpCode::Eq,
+        OpCode::Ne,
+        OpCode::Ult,
+        OpCode::Ule,
+        OpCode::Slt,
+        OpCode::Sle,
+        OpCode::Zext,
+        OpCode::Sext,
+        OpCode::Extract,
+        OpCode::Concat,
+        OpCode::Select,
+        OpCode::Ext1o0,
+        OpCode::Ext1o1,
+        OpCode::Ext1o2,
+        OpCode::Ext1o3,
+        OpCode::Ext1o4,
+        OpCode::Ext1o5,
+        OpCode::Ext1o6,
+        OpCode::Ext1o7,
+        OpCode::Ext2o0,
+        OpCode::Ext2o1,
+        OpCode::Ext2o2,
+        OpCode::Ext2o3,
+        OpCode::Ext2o4,
+        OpCode::Ext2o5,
+        OpCode::Ext2o6,
+        OpCode::Ext2o7,
+        OpCode::Ext3o0,
+        OpCode::Ext3o1,
+        OpCode::Ext3o2,
+        OpCode::Ext3o3,
+        OpCode::Ext3o4,
+        OpCode::Ext3o5,
+        OpCode::Ext3o6,
+        OpCode::Ext3o7,
+        OpCode::FAdd,
+        OpCode::FMul,
+        OpCode::FDiv,
+        OpCode::FFma,
+        OpCode::FSqrt,
+        OpCode::FRem,
+        OpCode::FRound,
+        OpCode::FMin,
+        OpCode::FMax,
+        OpCode::FEq,
+        OpCode::FLt,
+        OpCode::FLe,
+        OpCode::FConvert,
+        OpCode::FFromS,
+        OpCode::FFromU,
+        OpCode::FToS,
+        OpCode::FToU,
+    ];
+
+    /// Number of child nodes: one load (`children` asks it of every node it walks).
     pub(crate) const fn arity(self) -> usize {
+        ARITY[self as usize] as usize
+    }
+
+    const fn arity_of(self) -> usize {
         match self {
             OpCode::Const | OpCode::Sym => 0,
             OpCode::Not
@@ -254,14 +342,37 @@ impl OpCode {
             | OpCode::Sext
             | OpCode::Extract => 1,
             OpCode::Select => 3,
-            op => match (op.as_ext(), crate::fp::node::Kind::of(op)) {
-                (Some((arity, _)), _) => arity,
-                (_, Some(k)) => k.arity(),
-                _ => 2,
+            op if op.is_fp() => match crate::fp::node::Kind::of(op) {
+                Some(k) => k.arity(),
+                None => 2,
+            },
+            op => match op.as_ext() {
+                Some((arity, _)) => arity,
+                None => 2,
             },
         }
     }
+
+    /// Whether this is a floating-point opcode: those come after every other.
+    pub(crate) const fn is_fp(self) -> bool {
+        self as u8 > OpCode::Ext3o7 as u8
+    }
 }
+
+/// `OpCode::arity` by discriminant.
+const ARITY: [u8; OpCode::ALL.len()] = {
+    let mut t = [0u8; OpCode::ALL.len()];
+    let mut i = 0;
+    while i < t.len() {
+        assert!(
+            OpCode::ALL[i] as usize == i,
+            "OpCode::ALL is in discriminant order"
+        );
+        t[i] = OpCode::ALL[i].arity_of() as u8;
+        i += 1;
+    }
+    t
+};
 
 /// One stored node: 16 bytes.
 ///
