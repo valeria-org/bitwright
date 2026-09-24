@@ -36,7 +36,8 @@ int main() {
     // Facts, and proofs under assumptions.
     bw::Expr b = cx.symbol("b", 8);
     bw::Facts f = bw::facts((b & 0xf0) | 1);
-    std::cout << "known zero " << f.known_zero << ", range [" << f.umin << ", " << f.umax << "]\n";
+    std::cout << "known zero " << f.known_zero << ", range [" << f.umin << ", " << f.umax
+              << "] by " << f.ustride << "\n";
     bw::Assumptions as;
     as.assume(b.ult(b.constant(16)));
     std::cout << "b <u 16 proves (b & 0xf0) == 0: "

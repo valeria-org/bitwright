@@ -62,9 +62,9 @@ int main(void) {
     CHECK(bw_bin(cx, BW_OR, masked, one, &g));
     CHECK(bw_facts_of(cx, g, NULL, &facts));
     printf("known zero 0x%02" PRIx64 ", known one 0x%02" PRIx64 ", range [%" PRIu64
-           ", %" PRIu64 "]\n",
+           ", %" PRIu64 "] by %" PRIu64 "\n",
            facts.known_zero.limbs[0], facts.known_one.limbs[0], facts.umin.limbs[0],
-           facts.umax.limbs[0]);
+           facts.umax.limbs[0], facts.ustride);
 
     /* Under the assumption a <u 16, a & 0xf0 is 0. */
     bw_assumptions *assumptions = bw_assumptions_new();

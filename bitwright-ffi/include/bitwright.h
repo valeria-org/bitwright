@@ -332,6 +332,8 @@ typedef struct bw_facts {
     bw_value known_zero; /* bits known to be 0 */
     bw_value known_one;  /* bits known to be 1 */
     bw_value umin, umax; /* unsigned bounds */
+    uint64_t ustride;    /* the unsigned values are among umin, umin + ustride, ..., umax
+                            (0 when umin == umax, 1 for every value between) */
     bw_value smin, smax; /* signed bounds */
     uint64_t relies_on;  /* the assumptions used */
 } bw_facts;

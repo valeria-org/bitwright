@@ -460,6 +460,7 @@ fn facts_proofs_and_assumptions() {
         known_one: val(1, 0),
         umin: val(1, 0),
         umax: val(1, 0),
+        ustride: 7,
         smin: val(1, 0),
         smax: val(1, 0),
         relies_on: 7,
@@ -472,7 +473,7 @@ fn facts_proofs_and_assumptions() {
         assert_eq!(bw_facts_of(cx.0, g, null(), &mut f), BW_OK);
         assert_eq!(f.known_zero.limbs[0], 0x0e);
         assert_eq!(f.known_one.limbs[0], 0x01);
-        assert_eq!((f.umin.limbs[0], f.umax.limbs[0]), (1, 0xf1));
+        assert_eq!((f.umin.limbs[0], f.umax.limbs[0], f.ustride), (1, 0xf1, 16));
         assert_eq!(f.relies_on, 0);
 
         let a = bw_assumptions_new();

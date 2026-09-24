@@ -941,6 +941,7 @@ impl PyExpr {
             known_one: to_int(py, &k.known_one())?.unbind(),
             umin: to_int(py, &u.lo())?.unbind(),
             umax: to_int(py, &u.hi())?.unbind(),
+            ustride: u.stride(),
             smin: to_signed_int(py, &s.lo())?.unbind(),
             smax: to_signed_int(py, &s.hi())?.unbind(),
             constant: f
@@ -1026,6 +1027,10 @@ struct Facts {
     /// The unsigned upper bound.
     #[pyo3(get)]
     umax: Py<PyAny>,
+    /// The unsigned values are among `umin`, `umin + ustride`, ..., `umax` (0 when
+    /// `umin == umax`, 1 for every value between).
+    #[pyo3(get)]
+    ustride: u64,
     /// The signed lower bound.
     #[pyo3(get)]
     smin: Py<PyAny>,
@@ -1050,12 +1055,13 @@ impl Facts {
                 .map_or_else(|_| s(v), |h| h.to_string())
         };
         format!(
-            "<bitwright.Facts {} bits: known zero {}, known one {}, unsigned [{}, {}], signed [{}, {}]>",
+            "<bitwright.Facts {} bits: known zero {}, known one {}, unsigned [{}, {}] by {}, signed [{}, {}]>",
             self.width,
             hex(&self.known_zero),
             hex(&self.known_one),
             s(&self.umin),
             s(&self.umax),
+            self.ustride,
             s(&self.smin),
             s(&self.smax)
         )

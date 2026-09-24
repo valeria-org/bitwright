@@ -166,8 +166,10 @@ def test_facts_proofs_and_assumptions(cx):
     b = cx.symbol("b", 8)
     f = ((b & 0xF0) | 1).facts()
     assert (f.known_zero, f.known_one, f.umin, f.umax) == (0x0E, 0x01, 1, 0xF1)
+    assert f.ustride == 16  # 1, 17, 33, ..., 241: the low four bits are known
     assert f.smin < 0 and f.constant is None and f.relies_on == ()
-    assert "known zero 0xe" in repr(f)
+    assert "known zero 0xe" in repr(f) and "[1, 241] by 16" in repr(f)
+    assert cx.const(5, 8).facts().ustride == 0
     a = bw.Assumptions()
     assert a.assume(b.ult(16)) == 0
     assert len(a) == 1

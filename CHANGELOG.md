@@ -27,7 +27,9 @@
   runs on one or two machine words up to 128 bits (checked against the general code), so facts
   take about half the instructions they did: `facts/cold` −47 to −54 % at 8 to 128 bits,
   `facts/prove/64` −53 %, `constraints/facts-under/64` −45 %, `simplify/standard` −5.5 %;
-  512-bit facts cost 18 % more. Cached facts are seven words instead of six.
+  512-bit facts cost 18 % more. Cached facts are seven words instead of six. The bindings
+  report the stride: `ustride` in C's `bw_facts` (after `umax`), C++'s `Facts` and Python's
+  `Facts`.
 - **Behavior changes.** Results change where a stride decides a comparison, a remainder or a
   mask that known bits and plain ranges left open. On the generated corpora of `--corpus-diff`
   and on the identity sets of `compare/facts/` the results are the same as before.

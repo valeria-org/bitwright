@@ -196,6 +196,7 @@ class Facts:
     known_one: int
     umin: int
     umax: int
+    ustride: int
     smin: int
     smax: int
     constant: int | None

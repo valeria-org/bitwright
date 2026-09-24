@@ -5,8 +5,8 @@ expressions to bitwright and read the results back:
 
 - building, parsing, printing and inspecting expressions, at any width from 1 to 512 bits;
 - evaluation and substitution;
-- facts (known bits and ranges) and tri-state proofs, including invertibility, under
-  assumptions, with the assumptions each answer relies on;
+- facts (known bits, and ranges with a stride) and tri-state proofs, including invertibility,
+  under assumptions, with the assumptions each answer relies on;
 - simplification with the standard engine or the deobfuscation engine (the command line's
   `simplify`: the MBA service with the native solver, on bitwright's own evidence), with budgets,
   and with rule files of your own, linked with their proof ledgers;
@@ -49,6 +49,7 @@ assert (w + 1).eval(w=2**256 - 1) == 0
 b = cx.symbol("b", 8)
 f = ((b & 0xF0) | 1).facts()
 assert (f.known_zero, f.known_one, f.umin, f.umax) == (0x0E, 0x01, 1, 0xF1)
+assert f.ustride == 16  # the values are 1, 17, 33, ..., 241
 small = bw.Assumptions(b.ult(16))
 assert (b & 0xF0).eq(0).prove() is None  # not decided
 assert (b & 0xF0).eq(0).prove(small) is True
@@ -204,7 +205,8 @@ int main() {
 
     // Facts, and proofs under assumptions.
     bw::Expr b = cx.symbol("b", 8);
-    assert(bw::facts((b & 0xf0) | 1).known_zero == bw::Value(8, 0x0e));
+    bw::Facts f = bw::facts((b & 0xf0) | 1);
+    assert(f.known_zero == bw::Value(8, 0x0e) && f.ustride == 16);
     bw::Assumptions small;
     small.assume(b.ult(b.constant(16)));
     assert(bw::prove((b & 0xf0).eq(b.constant(0)), &small));

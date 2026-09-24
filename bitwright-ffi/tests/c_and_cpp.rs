@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 const C_EXPECTED: &str = "\
 simplified: x + y
 f(100) = 45
-known zero 0x0e, known one 0x01, range [1, 241]
+known zero 0x0e, known one 0x01, range [1, 241] by 16
 a <u 16 proves a & 0xf0 == 0: yes (relies on 0x1)
 error 9: expected an expression (at bytes 3..3)
 ";
@@ -21,7 +21,7 @@ x
 x == 0xd3220fb78e33751f
 x + y
 (2^64)^2 + 1 mod 2^128 = 0x1:128
-known zero 0xe:8, range [0x1:8, 0xf1:8]
+known zero 0xe:8, range [0x1:8, 0xf1:8] by 16
 b <u 16 proves (b & 0xf0) == 0: yes
 x + y has 2 children: x, y
 error 9: expected an expression (at bytes 3..3)

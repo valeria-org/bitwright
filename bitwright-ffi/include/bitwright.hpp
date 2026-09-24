@@ -397,6 +397,7 @@ inline const bw_assumptions *raw_of(const Assumptions *a) { return a ? a->raw() 
 struct Facts {
     Value known_zero, known_one;
     Value umin, umax;
+    uint64_t ustride; // the unsigned values are among umin, umin + ustride, ..., umax
     Value smin, smax; // two's-complement bit patterns
     uint64_t relies_on;
 };
@@ -411,8 +412,8 @@ inline Facts facts(Expr e, const Assumptions *a = nullptr) {
     bw_facts f;
     detail::check(bw_facts_of(e.context(), e.raw(), raw_of(a), &f));
     return Facts{Value(f.known_zero), Value(f.known_one), Value(f.umin),
-                 Value(f.umax),       Value(f.smin),      Value(f.smax),
-                 f.relies_on};
+                 Value(f.umax),       f.ustride,          Value(f.smin),
+                 Value(f.smax),       f.relies_on};
 }
 
 namespace detail {
