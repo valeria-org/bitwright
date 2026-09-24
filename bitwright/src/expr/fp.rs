@@ -7,6 +7,9 @@
 //! of the encoding (`isNaN(x)` is `|x| >u ∞`), `sub` is `add` of the negation, `gt` and `ge`
 //! are `lt` and `le` with the operands swapped, and x87's load and store are extracts,
 //! concatenations and selects.
+//!
+//! Construction applies exact identities (`fp_identity`): bit for bit on every encoding, and
+//! never adding a node.
 
 use super::{Context, Expr, Node};
 use crate::error::{Error, WidthError};
@@ -61,6 +64,9 @@ impl Context {
         if let Some(vals) = consts {
             return self.mk_const(&crate::fp::eval(&d, &vals));
         }
+        if let Some(i) = self.fp_identity(d, &kids[..args.len()])? {
+            return Ok(i);
+        }
         let (aux, attr) = d.encode();
         let mut n = Node::new(kind.opcode(), d.width(), kids[0], kids[1], kids[2]);
         n.aux = aux;
@@ -68,6 +74,71 @@ impl Context {
             n.b = attr;
         }
         self.mk(n)
+    }
+
+    /// The operand of a floating-point negation (`x ^ sign`) of format `f`.
+    fn fneg_of(&self, f: FpFormat, i: u32) -> Option<u32> {
+        let n = self.node(i);
+        (n.op == super::OpCode::Xor && self.const_val(n.b) == Some(sign_mask(f))).then_some(n.a)
+    }
+
+    /// Whether node `i` is the constant `v` of format `f`.
+    fn fp_is(&self, i: u32, v: &BitVec) -> bool {
+        self.const_val(i).as_ref() == Some(v)
+    }
+
+    /// Exact identities, bit for bit on every encoding (so a NaN operand gives the canonical NaN
+    /// on both sides, and zeros keep their signs), none of which adds a node:
+    /// `fma(x, 1, y) = x + y`; `fma(x, y, −0) = x · y` except toward −∞ (where `+0 + −0` is
+    /// `−0`); `x · 2 = x + x`; `(−a) · (−b) = a · b` and likewise for `/`; negation reverses
+    /// the order (`−a < −b` is `b < a`, `−a = −b` is `a = b`); `x < x` is false; rounding to
+    /// an integral value twice is rounding once; a signed conversion of a zero or sign extension
+    /// converts the operand itself.
+    fn fp_identity(&mut self, d: Desc, k: &[u32]) -> Result<Option<u32>, Error> {
+        let f = d.format;
+        let one = f.from_uint(RoundingMode::Rne, &BitVec::one(Width::W8));
+        let two = f.from_uint(RoundingMode::Rne, &BitVec::wrapping_from_u64(Width::W8, 2));
+        let with = |op| Desc { op, format: f };
+        let r = match d.op {
+            FpOp::Fma(rm) if self.fp_is(k[1], &one) => {
+                Some(self.c_fp(with(FpOp::Add(rm)), &[k[0], k[2]])?)
+            }
+            FpOp::Fma(rm) if rm != RoundingMode::Rtn && self.fp_is(k[2], &f.zero(true)) => {
+                Some(self.c_fp(with(FpOp::Mul(rm)), &[k[0], k[1]])?)
+            }
+            FpOp::Mul(rm) if self.fp_is(k[1], &two) => {
+                Some(self.c_fp(with(FpOp::Add(rm)), &[k[0], k[0]])?)
+            }
+            FpOp::Mul(_) | FpOp::Div(_) => match (self.fneg_of(f, k[0]), self.fneg_of(f, k[1])) {
+                (Some(a), Some(b)) => Some(self.c_fp(d, &[a, b])?),
+                _ => None,
+            },
+            FpOp::Lt if k[0] == k[1] => Some(self.mk_const(&BitVec::from_bool(false))?),
+            FpOp::Lt | FpOp::Le | FpOp::Eq => {
+                match (self.fneg_of(f, k[0]), self.fneg_of(f, k[1])) {
+                    (Some(a), Some(b)) if d.op == FpOp::Eq => Some(self.c_fp(d, &[a, b])?),
+                    (Some(a), Some(b)) => Some(self.c_fp(d, &[b, a])?),
+                    _ => None,
+                }
+            }
+            // Only in one format: binary16 and bfloat16 are both 16 bits.
+            FpOp::RoundToIntegral(_)
+                if self.node(k[0]).op == super::OpCode::FRound
+                    && self.fp_desc(k[0]).is_some_and(|inner| inner.format == f) =>
+            {
+                Some(k[0])
+            }
+            FpOp::FromSInt(rm) | FpOp::FromUInt(rm) => {
+                let n = self.node(k[0]);
+                match (d.op, n.op) {
+                    (_, super::OpCode::Zext) => Some(self.c_fp(with(FpOp::FromUInt(rm)), &[n.a])?),
+                    (FpOp::FromSInt(_), super::OpCode::Sext) => Some(self.c_fp(d, &[n.a])?),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(r)
     }
 
     fn c_fneg(&mut self, f: FpFormat, a: u32) -> Result<u32, Error> {

@@ -501,3 +501,166 @@ fn facts_decide_floating_point_questions() {
         );
     }
 }
+
+/// The construction-time identities are exact: every shape they rewrite, built from symbols,
+/// evaluates like the operation it came from, on every input of tiny formats, in every mode.
+#[test]
+fn construction_identities_are_exact() {
+    for f in [
+        FpFormat::new(2, 3).unwrap(),
+        FpFormat::new(3, 3).unwrap(),
+        FpFormat::new(3, 2).unwrap(),
+    ] {
+        let w = f.width();
+        let n = 1u64 << w.bits();
+        let one = f.from_uint(RoundingMode::Rne, &BitVec::one(Width::W8));
+        let two = f.from_uint(RoundingMode::Rne, &BitVec::wrapping_from_u64(Width::W8, 2));
+        for rm in RoundingMode::ALL {
+            let mut cx = Context::new();
+            let (x, y) = (cx.symbol("x", w).unwrap(), cx.symbol("y", w).unwrap());
+            let i = cx.symbol("i", Width::new(3).unwrap()).unwrap();
+            let c1 = cx.constant(&one).unwrap();
+            let c2 = cx.constant(&two).unwrap();
+            let nz = cx.constant(&f.zero(true)).unwrap();
+            let (nx, ny) = (cx.fp_neg(f, x).unwrap(), cx.fp_neg(f, y).unwrap());
+            let i5 = cx.zext(i, Width::new(5).unwrap()).unwrap();
+            let s5 = cx.sext(i, Width::new(5).unwrap()).unwrap();
+            let rti = cx
+                .fp(FpOp::RoundToIntegral(RoundingMode::Rtz), f, &[x])
+                .unwrap();
+            // (expression, its meaning from the operand values)
+            type Meaning = Box<dyn Fn(&[BitVec]) -> BitVec>;
+            let neg = move |b: BitVec| f.neg(&b).unwrap();
+            let cases: Vec<(Expr, Meaning)> = vec![
+                (
+                    cx.fp(FpOp::Fma(rm), f, &[x, c1, y]).unwrap(),
+                    Box::new(move |a| f.fma(rm, &a[0], &one, &a[1]).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Fma(rm), f, &[c1, x, y]).unwrap(),
+                    Box::new(move |a| f.fma(rm, &one, &a[0], &a[1]).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Fma(rm), f, &[x, y, nz]).unwrap(),
+                    Box::new(move |a| f.fma(rm, &a[0], &a[1], &f.zero(true)).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Mul(rm), f, &[x, c2]).unwrap(),
+                    Box::new(move |a| f.mul(rm, &a[0], &two).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Mul(rm), f, &[nx, ny]).unwrap(),
+                    Box::new(move |a| f.mul(rm, &neg(a[0]), &neg(a[1])).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Div(rm), f, &[nx, ny]).unwrap(),
+                    Box::new(move |a| f.div(rm, &neg(a[0]), &neg(a[1])).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Lt, f, &[nx, ny]).unwrap(),
+                    Box::new(move |a| {
+                        BitVec::from_bool(f.cmp(FpCmpOp::Lt, &neg(a[0]), &neg(a[1])).unwrap())
+                    }),
+                ),
+                (
+                    cx.fp(FpOp::Le, f, &[nx, ny]).unwrap(),
+                    Box::new(move |a| {
+                        BitVec::from_bool(f.cmp(FpCmpOp::Le, &neg(a[0]), &neg(a[1])).unwrap())
+                    }),
+                ),
+                (
+                    cx.fp(FpOp::Eq, f, &[nx, ny]).unwrap(),
+                    Box::new(move |a| {
+                        BitVec::from_bool(f.cmp(FpCmpOp::Eq, &neg(a[0]), &neg(a[1])).unwrap())
+                    }),
+                ),
+                (
+                    cx.fp(FpOp::Lt, f, &[x, x]).unwrap(),
+                    Box::new(move |a| BitVec::from_bool(f.cmp(FpCmpOp::Lt, &a[0], &a[0]).unwrap())),
+                ),
+                (
+                    cx.fp(FpOp::RoundToIntegral(rm), f, &[rti]).unwrap(),
+                    Box::new(move |a| {
+                        let inner = f.round_to_integral(RoundingMode::Rtz, &a[0]).unwrap();
+                        f.round_to_integral(rm, &inner).unwrap()
+                    }),
+                ),
+                (
+                    cx.fp(FpOp::FromSInt(rm), f, &[i5]).unwrap(),
+                    Box::new(move |a| f.from_sint(rm, &a[3].zext(Width::new(5).unwrap()).unwrap())),
+                ),
+                (
+                    cx.fp(FpOp::FromUInt(rm), f, &[i5]).unwrap(),
+                    Box::new(move |a| f.from_uint(rm, &a[3].zext(Width::new(5).unwrap()).unwrap())),
+                ),
+                (
+                    cx.fp(FpOp::FromSInt(rm), f, &[s5]).unwrap(),
+                    Box::new(move |a| f.from_sint(rm, &a[3].sext(Width::new(5).unwrap()).unwrap())),
+                ),
+            ];
+            for xv in 0..n {
+                for yv in 0..n {
+                    let vals = [
+                        BitVec::wrapping_from_u64(w, xv),
+                        BitVec::wrapping_from_u64(w, yv),
+                        BitVec::zero(w),
+                        BitVec::wrapping_from_u64(Width::new(3).unwrap(), xv),
+                    ];
+                    let env = [
+                        (SymbolKey::from("x"), vals[0]),
+                        (SymbolKey::from("y"), vals[1]),
+                        (SymbolKey::from("i"), vals[3]),
+                    ];
+                    for (e, meaning) in &cases {
+                        assert_eq!(
+                            cx.eval(&[*e], &env[..]).unwrap()[0],
+                            meaning(&vals),
+                            "{f:?} {rm:?} {} at {vals:?}",
+                            cx.display(*e)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn construction_identities_fire() {
+    let mut cx = Context::new();
+    let o = ParseOptions::default();
+    for (src, want) in [
+        ("fp.fma.rtp.f32(x, 0x3f800000, y)", "fp.add.rtp.f32(x, y)"),
+        ("fp.fma.rne.f32(x, y, 0x80000000)", "fp.mul.rne.f32(x, y)"),
+        ("fp.mul.rtz.f32(x, 0x40000000)", "fp.add.rtz.f32(x, x)"),
+        (
+            "fp.mul.rne.f32(fp.neg.f32(x), fp.neg.f32(y))",
+            "fp.mul.rne.f32(x, y)",
+        ),
+        ("fp.lt.f32(fp.neg.f32(x), fp.neg.f32(y))", "fp.lt.f32(y, x)"),
+        ("fp.lt.f32(x, x)", "0:1"),
+        (
+            "fp.round.rne.f32(fp.round.rtz.f32(x))",
+            "fp.round.rtz.f32(x)",
+        ),
+        (
+            "fp.from_sbv.rne.f32(zext<32>(b:8))",
+            "fp.from_ubv.rne.f32(b)",
+        ),
+    ] {
+        let e = cx.parse(src, &o).unwrap();
+        assert_eq!(cx.display(e).to_string(), want, "{src}");
+    }
+    // Not toward −∞: there +0 + −0 is −0, not the product's +0.
+    let e = cx.parse("fp.fma.rtn.f32(x, y, 0x80000000)", &o).unwrap();
+    assert!(cx.display(e).to_string().starts_with("fp.fma"));
+    // Not across formats of one width.
+    let e = cx
+        .parse("fp.round.rne.bf16(fp.round.rtz.f16(h))", &o)
+        .unwrap();
+    assert!(
+        cx.display(e)
+            .to_string()
+            .starts_with("fp.round.rne.bf16(fp.round")
+    );
+}
