@@ -153,6 +153,14 @@ impl Context {
                 if self.is_ones(b) {
                     return Ok(a);
                 }
+                // A shifted bit test has a smaller exact extraction form.
+                if self.is_one(b) && self.node(a).op == OpCode::LShr {
+                    let shift = self.node(a);
+                    if self.const_val(shift.b).is_some() {
+                        let bit = self.c_extract(a, 0, 1)?;
+                        return self.c_zext(bit, w);
+                    }
+                }
             }
             BinOp::Or => {
                 if self.is_ones(b) || a == b {
@@ -367,6 +375,18 @@ impl Context {
         let inner_w = |cx: &Self| cx.wid(n.a);
         match n.op {
             OpCode::Extract => return self.c_extract(n.a, n.b as u16 + lo, len),
+            OpCode::LShr => {
+                if let Some(count) = self.const_val(n.b) {
+                    let count = count.to_u64().unwrap_or(u64::MAX);
+                    if count >= u64::from(w) || u64::from(lo) + count >= u64::from(w) {
+                        return self.c_zero(len);
+                    }
+                    let first = lo + count as u16;
+                    let available = (w - first).min(len);
+                    let part = self.c_extract(n.a, first, available)?;
+                    return self.c_zext(part, len);
+                }
+            }
             OpCode::Zext => {
                 let iw = inner_w(self);
                 if lo + len <= iw {
@@ -413,6 +433,12 @@ impl Context {
             return self.c_zext(lo, total);
         }
         let (nh, nl) = (self.node(hi), self.node(lo));
+        if nh.op == OpCode::Concat
+            && let (Some(left), Some(right)) = (self.const_val(nh.b), self.const_val(lo))
+        {
+            let tail = self.mk_const(&BitVec::concat(&left, &right)?)?;
+            return self.c_concat(nh.a, tail);
+        }
         if nh.op == OpCode::Extract
             && nl.op == OpCode::Extract
             && nh.a == nl.a

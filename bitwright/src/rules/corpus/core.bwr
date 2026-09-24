@@ -422,3 +422,165 @@ group core.recovery_select_ones {
     #[example("sext<8>(p <s 255) + select(255 <=s p, p, 0)" => "smax(p, 255)")]
     rule smax_ones_add<W>(x: W) where 1 < W { sext<W>(x <s ones) + select(ones <=s x, x, 0) => smax(x, ones) }
 }
+
+// Remaining Valeria rules: guards are retained as facts, never erased.
+group core.guarded_recovery {
+    #[example("-((p & 252) | 1) <s -((q & 252) | 1)" => "((q & 252) | 1) <s ((p & 252) | 1)")]
+    rule slt_neg_pair<W>(x: W, y: W) {
+        -x <s -y => y <s x if proves(x != bit(W - 1)) && proves(y != bit(W - 1))
+    }
+    #[example("-((p & 252) | 1) <=s -((q & 252) | 1)" => "((q & 252) | 1) <=s ((p & 252) | 1)")]
+    rule sle_neg_pair<W>(x: W, y: W) {
+        -x <=s -y => y <=s x if proves(x != bit(W - 1)) && proves(y != bit(W - 1))
+    }
+    #[example("select(p != 0, p, 0)" => "p")]
+    rule select_nonzero_value<W>(x: W) { select(x != 0, x, 0) => x }
+    #[example("-p:1" => "p:1")]
+    rule negate_boolean(x: 1) { -x => x }
+    #[example("p:1 + 1:1" => "~p:1")]
+    rule increment_boolean(x: 1) { x + 1 => ~x }
+    #[example("((p & 1) + 255) & q" => "select(trunc<1>(p & 1), 0, q)")]
+    rule boolean_mask_clear<W>(x: W, y: W) where 1 < W {
+        (x + ones) & y => select(trunc<1>(x), 0, y) if zero_bits(x, ~1)
+    }
+    #[example("(p >>u 3) | (p << 5)" => "rotr(p, 3)")]
+    rule complementary_shift_rotate<W>(x: W, a: const W, b: const W) {
+        (x >>u a) | (x << b) => rotr(x, a)
+        if (a <u W) && (b <u W) && (a + b == W)
+    }
+    #[example("(p & 2) >>u 1" => "(p >>u 1) & 1")]
+    rule lshr_mask_constant<W>(x: W, m: const W, k: const W) {
+        (x & m) >>u k => (x >>u k) & shifted let shifted: W = m >>u k
+    }
+    #[example("zext<16>(p) ^ 255:16" => "zext<16>(~p)")]
+    rule xor_zext_lowmask<W, U>(x: W) where W < U {
+        zext<U>(x) ^ lowmask(W) => zext<U>(~x)
+    }
+    #[example("(p & 254) ^ 1" => "p | 1")]
+    rule xor_complement_mask<W>(x: W, m: const W, n: const W) {
+        (x & n) ^ m => x | m if n == ~m
+    }
+    #[example("((p | 3) & 15) + 255" => "(p & 12) | 2")]
+    rule mask_or_add_constant<W>(x: W, c: const W, m: const W, d: const W) {
+        ((x | c) & m) + d => (x & kept) | k
+        if (((c & m) + d) & (m & ~c)) == 0
+        let kept: W = m & ~c
+        let k: W = (c & m) + d
+    }
+    #[example("-(p & 1) & q" => "select(trunc<1>(p), q, 0)")]
+    rule boolean_lowbit_mask_keep<W>(x: W, y: W) where 1 < W {
+        -(x & 1) & y => select(trunc<1>(x), y, 0)
+    }
+    #[example("-zext<8>(p:1) & q" => "select(p:1, q, 0)")]
+    rule boolean_zext_mask_keep<W>(x: 1, y: W) where 1 < W {
+        -zext<W>(x) & y => select(x, y, 0)
+    }
+    #[example("(p & 240) + ((p & 15) + q)" => "p + q")]
+    rule split_mask_add<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) + c) => x + c if (m | n) == ones && (m & n) == 0
+    }
+    #[example("(p & 240) + ((p & 15) - q)" => "p - q")]
+    rule split_mask_sub<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) - c) => x - c if (m | n) == ones && (m & n) == 0
+    }
+    #[example("(p & 15) | (((p >>u 4) + q) << 4)" => "p + (q << 4)")]
+    rule recombine_shifted_field_or<W>(x: W, a: W, m: const W, k: const W) {
+        (x & m) | (((x >>u k) + a) << k) => (x & keep) + (a << k)
+        if (k <=u W) && (m & (ones << k)) == 0
+        let keep: W = (ones << k) | m
+    }
+    #[example("(p & 15) + (((p >>u 4) + q) << 4)" => "p + (q << 4)")]
+    rule recombine_shifted_field_add<W>(x: W, a: W, m: const W, k: const W) {
+        (x & m) + (((x >>u k) + a) << k) => (x & keep) + (a << k)
+        if (k <=u W) && (m & (ones << k)) == 0
+        let keep: W = (ones << k) | m
+    }
+}
+
+group core.guarded_recovery_canonical {
+    #[example("-((p & 252) | 1) <s 0" => "0 <s ((p & 252) | 1)")]
+    rule slt_neg_zero<W>(x: W) { -x <s 0 => 0 <s x if proves(x != bit(W - 1)) }
+    #[example("0 <s -((p & 252) | 1)" => "((p & 252) | 1) <s 0")]
+    rule slt_zero_neg<W>(x: W) { 0 <s -x => x <s 0 if proves(x != bit(W - 1)) }
+    #[example("-((p & 252) | 1) <=s 0" => "0 <=s ((p & 252) | 1)")]
+    rule sle_neg_zero<W>(x: W) { -x <=s 0 => 0 <=s x if proves(x != bit(W - 1)) }
+    #[example("0 <=s -((p & 252) | 1)" => "((p & 252) | 1) <=s 0")]
+    rule sle_zero_neg<W>(x: W) { 0 <=s -x => x <=s 0 if proves(x != bit(W - 1)) }
+    #[example("(p & 240) + ((p & 15) | 128)" => "p + 128")]
+    rule split_mask_or_add<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) | c) => x + c
+        if (m | n) == ones && (m & n) == 0 && zero_bits(c, n)
+    }
+    #[example("(p & 15) | ((((p >>u 4) & 7) + q) << 4)" => "(p & 127) + (q << 4)")]
+    rule recombine_masked_field_or<W>(x: W, a: W, m: const W, s: const W, k: const W) {
+        (x & m) | ((((x >>u k) & s) + a) << k) => (x & keep) + (a << k)
+        if (k <=u W) && (m & (ones << k)) == 0
+        let keep: W = (s << k) | m
+    }
+    #[example("(p & 15) + ((((p >>u 4) & 7) + q) << 4)" => "(p & 127) + (q << 4)")]
+    rule recombine_masked_field_add<W>(x: W, a: W, m: const W, s: const W, k: const W) {
+        (x & m) + ((((x >>u k) & s) + a) << k) => (x & keep) + (a << k)
+        if (k <=u W) && (m & (ones << k)) == 0
+        let keep: W = (s << k) | m
+    }
+}
+
+group core.guarded_recovery_shuffle {
+    #[example("concat(trunc<4>(zext<8>(extract<4,3>(p)) + q), trunc<4>(p))" => "(p & 127) + (q << 4)")]
+    rule recombine_extracted_field<N, K, M>(x: N + K, a: N + K) where M <= N, N + K <= 512 {
+        concat(trunc<N>(zext<N + K>(extract<K, M>(x)) + a), trunc<K>(x))
+        => (x & lowmask(K + M)) + (a << K)
+    }
+}
+
+group core.guarded_recovery_layout {
+    #[example("(((p >>u 4) & 8) + q) << 4" => "(p & 128) + (q << 4)")]
+    rule shifted_masked_add<W>(x: W, a: W, s: const W, k: const W) {
+        (((x >>u k) & s) + a) << k => (x & keep) + (a << k)
+        let keep: W = s << k
+    }
+    #[example("(((p >>u 4) + q) << 4) | 15" => "(p | 15) + (q << 4)")]
+    rule recombine_low_constant<W>(x: W, a: W, c: const W, k: const W) {
+        (((x >>u k) + a) << k) | c => (x | c) + (a << k)
+        if (k <=u W) && c == ones >>u (W - k)
+    }
+    #[example("(p & 14) | ((p & 240) + (q << 4))" => "(p & 254) + (q << 4)")]
+    rule split_or_masked_sum<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) | ((x & n) + c) => (x & keep) + c
+        if (n & prefix) == 0 && zero_bits(c, prefix)
+        let prefix: W = ones >>u clz(m)
+        let keep: W = m | n
+    }
+    #[example("concat(extract<7,1>(p), 112:7) + 16" => "(p & 128) + 128")]
+    rule add_constant_to_concat<H, L>(x: H + L, c: const L, d: const H + L) where H + L <= 512 {
+        concat(extract<L,H>(x), c) + d => (x & ~lowmask(L)) + k
+        let k: H + L = zext<H + L>(c) + d
+    }
+    #[example("(p | 1) << 1" => "(p << 1) | 2")]
+    rule shl_or_constant<W>(x: W, c: const W, k: const W) {
+        (x | c) << k => (x << k) | shifted let shifted: W = c << k
+    }
+}
+
+group core.guarded_recovery_mba_normalized {
+    #[example("((p << 1) | 2) - (p + 1)" => "p ^ 1")]
+    rule xor_from_distributed_double_or<W>(x: W, c: const W, k: const W) {
+        ((x << 1) | k) - (x + c) => x ^ c if k == c << 1
+    }
+    #[example("((p << 1) | 2) - (p ^ 1)" => "p + 1")]
+    rule sum_from_distributed_double_or<W>(x: W, c: const W, k: const W) {
+        ((x << 1) | k) - (x ^ c) => x + c if k == c << 1
+    }
+    #[example("(p << 1) - (p ^ 128)" => "p + 128")]
+    rule sum_from_vanishing_double_mask<W>(x: W, c: const W) {
+        (x << 1) - (x ^ c) => x + c if (c << 1) == 0
+    }
+}
+
+group core.guarded_recovery_concat {
+    #[example("(q << 4) + concat(extract<4,4>(p), 15:4)" => "concat(trunc<4>(q) + extract<4,4>(p), 15:4)")]
+    rule add_aligned_to_concat<H, L>(a: H + L, x: H + L, c: const L) where H + L <= 512 {
+        (a << L) + concat(extract<L,H>(x), c)
+        => concat(trunc<H>(a) + extract<L,H>(x), c)
+    }
+}

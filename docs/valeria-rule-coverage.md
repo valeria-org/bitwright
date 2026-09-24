@@ -1,5 +1,74 @@
 # Valeria rule coverage
 
+## Complete guarded follow-up
+
+The follow-up accounts for the remaining 98 source rules. `--complete` adds
+constructive known-bit witnesses, one-bit and 33–128-bit widths, independent
+shift counts, exact aliases for equality guards, and nonzero truthiness for
+Valeria's binary `If`/`Select`. Unsupported legacy SAR and partial division
+remain explicit refusals. Every source rule now has admitted probes; a complete
+inventory with a zero-case rule fails instead of silently claiming coverage.
+
+Thirty-four additional built-in rules and three construction canonicalizations
+close the newly measured gaps. Rules already handled by Bitwright are not
+duplicated. Negation comparisons retain the `INT_MIN` exclusion, Boolean-mask
+rules retain their 0/1 premise, and masked field rewrites retain their carry and
+width conditions. The complete corpus contains **28,134 cases from all 3,010
+rules**, not an exhaustive enumeration of every rule's possible bindings.
+
+The paired baseline for this follow-up is `c19a5c0` (the first 77 ports). The
+input TSV and evaluator are the same on both sides; full-width refutation
+samples now exercise bits above 64 and check simplified outputs as well.
+
+| Measure | Standard before | Standard after | Deobfuscate before | Deobfuscate after |
+|-|-|-|-|-|
+| Same normalized form as reference | 22,654 | 23,599 | 22,779 | 23,639 |
+| Different form, no larger than reference | 4,608 | 4,535 | 4,599 | 4,495 |
+| Output larger than reference | 872 | 0 | 756 | 0 |
+| Sum of output expression tree sizes | 67,422 | 63,352 | 66,851 | 63,155 |
+| Refuted references / outputs / parse errors | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+No individual output grew relative to its baseline. The complete TSV SHA-256 is
+`c4b811afb9974f0d78c6b6f1954f71a08b7dfb5467d78a0c0e4a634c98ae3d1b`.
+
+### A source defect found by the audit
+
+The original Valeria `universal.r0181` / `r0182` guards treated a written shift
+of W−1 as an effective sign-bit shift. At W=33–63, Valeria masks that count with
+31. Reconstruction from W=32 into U=33–63 also masks its left shift of 32 to
+zero. Additionally, legacy SAR is modeled only through 64 bits with a
+same-width count. These invalid cases must not be ported as identities.
+
+The consuming Valeria change tightens both guards, adds a regression that fails
+before the fix, and regenerates its VRL, legacy pack and production VMDL pack.
+For reproducing the audit from the original source revision, apply
+`tools/fixtures/valeria-sign-guards.patch` to the **typed rule sources** in that
+Valeria checkout. This fixture is sufficient for the audit; it is not the full
+runtime fix. Both sides of the paired measurement use the corrected corpus.
+
+```sh
+python tools/valeria_rule_cases.py --rules ../valeria/crates/engine/valeria-symex/rules-src --complete --output complete.tsv --inventory complete.json
+cargo run --release -p bitwright --example valeria_rule_audit < complete.tsv > standard.tsv
+cargo run --release -p bitwright --example valeria_rule_audit -- --deobfuscate < complete.tsv > deobfuscate.tsv
+python -m unittest discover -s tools -p test_valeria_rule_cases.py
+cargo test --release -p bitwright --test remaining_rules --test recovery_rules
+cargo test --release -p bitwright --lib check::tests::corpus_
+cargo test --release -p bitwright --lib expr::tests::construction_table_is_sound
+```
+
+The corpus checker now covers 148 rules. The follow-up tests cover all 34 new
+examples, rejected unguarded signed-negation cancellation, and extraction /
+concatenation against the independent bit-serial evaluator, including clipped
+slices, huge counts and 512-bit boundaries. Six Python tests pin the audit's
+guard, mask, truthiness and partial-operation contracts. Valeria's four sign
+reconstruction tests and four production-artifact tests pass under `rapid`.
+
+These remain exhaustive small-width and sampled wide-width checks, not universal
+SMT proofs. All source rules have exercised witnesses; this does not prove a
+wholesale runtime migration or justify deleting the legacy evaluator.
+
+## Initial portable pass
+
 The default simplifier missed carry/borrow comparisons, BMI2 cancellation and
 support-mask identities, truncation factoring, and some canonical arithmetic,
 shift and conditional min/max forms. Seventy-seven local rules close the measured

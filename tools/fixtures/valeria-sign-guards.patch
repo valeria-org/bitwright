@@ -1,0 +1,22 @@
+diff --git a/crates/engine/valeria-symex/rules-src/core/universal.vrl b/crates/engine/valeria-symex/rules-src/core/universal.vrl
+index a50c15cdd..2da965df3 100644
+--- a/crates/engine/valeria-symex/rules-src/core/universal.vrl
++++ b/crates/engine/valeria-symex/rules-src/core/universal.vrl
+@@ -2541,7 +2541,7 @@ rule legacy/universal.r0181<W:1..512> {
+   priority 181;
+   phase canonical;
+   match neg(shr($a: bv<W>, $u: bv<_> constant));
+-  replace iff(guard_and(meta_ge(bcnt($a), 1), meta_eq(value($u), meta_sub(bcnt($a), 1))), sar($a, $u));
++  replace iff(guard_and(guard_and(guard_and(meta_ge(bcnt($a), 1), meta_eq(value($u), meta_sub(bcnt($a), 1))), guard_or(guard_and(meta_ge(bcnt($a), 1), meta_le(bcnt($a), 32)), meta_eq(bcnt($a), 64))), meta_eq(bcnt($a), bcnt($u))), sar($a, $u));
+   proof legacy-unclassified;
+   lowering ir;
+   totality potential-invalid;
+@@ -2555,7 +2555,7 @@ rule legacy/universal.r0182<W:1..512> {
+   priority 182;
+   phase canonical;
+   match or(ucast($a: bv<W>, $u: bv<_> constant), shl(ucast(sar($a, $v: bv<_> constant), $u), $c: bv<_>));
+-  replace iff(guard_and(guard_and(guard_and(guard_and(meta_ge(bcnt($a), 1), meta_eq(value($v), meta_sub(bcnt($a), 1))), meta_eq(value($c), bcnt($a))), meta_gt(value($u), bcnt($a))), meta_le(value($u), meta_add(bcnt($a), bcnt($a)))), cast($a, $u));
++  replace iff(guard_and(guard_and(guard_and(guard_and(guard_and(guard_and(guard_and(guard_and(meta_ge(bcnt($a), 1), meta_eq(value($v), meta_sub(bcnt($a), 1))), meta_eq(value($c), bcnt($a))), meta_gt(value($u), bcnt($a))), meta_le(value($u), meta_add(bcnt($a), bcnt($a)))), guard_or(guard_and(meta_ge(bcnt($a), 1), meta_le(bcnt($a), 32)), meta_eq(bcnt($a), 64))), meta_eq(bcnt($a), bcnt($v))), meta_le(value($u), 128)), guard_or(meta_le(bcnt($a), 31), guard_or(guard_and(meta_eq(bcnt($a), 32), meta_eq(value($u), 64)), meta_eq(bcnt($a), 64)))), cast($a, $u));
+   proof legacy-unclassified;
+   lowering ir;
+   totality potential-invalid;
