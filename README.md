@@ -68,7 +68,7 @@ fn main() -> Result<(), bitwright::Error> {
 
 ## Performance
 
-bitwright 0.7.0 against other tools, each on what it is built for, on one performance core of
+bitwright 0.8.0 against other tools, each on what it is built for, on one performance core of
 an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every answer is read into bitwright, sized in DAG
 nodes of its canonical form (a shared subterm counts once) and checked against its input; no
 tool gave a wrong answer. [`compare/`](compare/README.md) reproduces the tables, and
@@ -85,16 +85,16 @@ the median time per DAG:
 
 | Random DAGs | Before | bitwright | z3 | Bitwuzla |
 |-|-:|-:|-:|-:|
-| 40 nodes, 8 bits | 10,895 | **9,268**, 0.26 ms | 63,134, 0.54 ms | 14,981, 0.17 ms |
-| 40 nodes, 64 bits | 11,092 | **9,562**, 0.25 ms | 568,936, 2.6 ms | 15,331, 0.17 ms |
-| 40 nodes, 64 bits, with division and variable shifts | 10,988 | **9,476**, 0.25 ms | 410,571, 2.0 ms | 16,005, 0.18 ms |
-| 400 nodes, 64 bits | 59,852 | **52,831**, 2.9 ms | 3,691,595, 14 ms | 90,233, 0.69 ms |
+| 40 nodes, 8 bits | 10,895 | **9,268**, 0.21 ms | 63,134, 0.43 ms | 14,981, 0.16 ms |
+| 40 nodes, 64 bits | 11,092 | **9,562**, 0.22 ms | 568,936, 2.3 ms | 15,331, 0.17 ms |
+| 40 nodes, 64 bits, with division and variable shifts | 10,988 | **9,476**, 0.20 ms | 410,571, 1.6 ms | 16,005, 0.17 ms |
+| 400 nodes, 64 bits | 59,852 | **52,831**, 2.5 ms | 3,691,595, 13 ms | 90,233, 0.67 ms |
 
 bitwright's answer is the smallest of the three for 799 of the 800 DAGs. The solvers are built
 to decide satisfiability, which bitwright does not do, and they simplify toward that, not toward
 small expressions: z3 splits bitwise operations with constants into slices of bits, and
 Bitwuzla writes `|` and `−` with `&`, `~` and `+`, so their answers are almost always larger
-than the input. Bitwuzla is faster: about 1.4 times on 40 nodes and 4 times on 400.
+than the input. Bitwuzla is faster: about 1.2 to 1.3 times on 40 nodes and 3.7 times on 400.
 
 **Bit-vector identities, against z3 and Bitwuzla.** 580 identities in six sets, written from
 textbook mathematics rather than from any tool's rules ([`compare/facts/`](compare/facts)):
@@ -119,8 +119,8 @@ neither finishes in ten minutes.
 | Canonical forms | 100 | 64 | 72 | **84** | 42 |
 | All | 2,320 | 1,578 (68 %) | **1,770 (76 %)** | 1,109 (48 %) | 871 (38 %) |
 
-On these small expressions bitwright is also the fastest, with a median of 13 µs per case (16 µs
-as `simplify`) against 72 µs for Bitwuzla and about 140 µs for z3. `versus-smt --facts` prints
+On these small expressions bitwright is also the fastest, with a median of 11 µs per case (14 µs
+as `simplify`) against 69 µs for Bitwuzla and 98 µs for z3. `versus-smt --facts` prints
 every group and what each tool misses. bitwright's gaps are minimum and maximum written with
 `ite` (it does not see that `ite(x <u y, x, y)` and `ite(y <u x, y, x)` are one function), order
 relations (transitivity, `x & y <=u y`), bit tests through masks, concatenation, if-then-else,
@@ -134,7 +134,7 @@ text to the answer, parsing included.
 
 | Tool | Solved | The ground truth exactly | Median | 95th percentile |
 |-|-:|-:|-:|-:|
-| bitwright, `NormalFormSolver` | **75,737 (100 %)** | **49,852** | **0.31 ms** | **4.5 ms** |
+| bitwright, `NormalFormSolver` | **75,737 (100 %)** | **49,852** | **0.30 ms** | **4.3 ms** |
 | CoBRA (C++, af44b8a) | 64,396 (85.0 %) | 47,797 | 1.4 ms | 171 ms |
 
 bitwright proves each of its answers itself; this is the configuration the command line's

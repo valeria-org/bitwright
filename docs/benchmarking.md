@@ -102,25 +102,25 @@ whose facts are measured. It runs with the counters paused.
 
 ## Reference numbers
 
-bitwright 0.7.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
+bitwright 0.8.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
 core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's CPU time;
 instructions are the median.
 
 | Operation | CPU time | Instructions |
 |-|-|-|
 | A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 157 to 169 |
-| A 512-bit multiplication / division | 30 ns / 1.4 µs | 831 / 38,458 |
-| Building a node (hash-consing and canonicalization) | 50 ns | 1,024 |
-| Evaluating a node | 30 ns | 482 |
-| The facts of a node, computed (known bits and ranges) | 0.42 to 0.54 µs | 5,630 to 6,840 |
-| A cached fact query | 28 ns | 378 |
-| Parsing a 60-node expression | 17 µs | 270,000 |
-| Simplifying a random 40-node expression | 0.37 ms | 5.5 M |
-| Simplifying in a fresh three-node context | 4.7 µs | 78,400 |
-| Deobfuscating a linear MBA expression (native solver) | 0.40 ms | 4.9 M |
+| A 512-bit multiplication / division | 31 ns / 1.3 µs | 831 / 38,458 |
+| Building a node (hash-consing and canonicalization) | 48 ns | 1,024 |
+| Evaluating a node | 29 ns | 482 |
+| The facts of a node, computed (known bits and ranges) | 0.21 to 0.24 µs up to 128 bits, 0.45 µs at 512 | 2,630 to 3,010 up to 128 bits, 8,050 at 512 |
+| A cached fact query | 33 ns | 379 |
+| Parsing a 60-node expression | 16 µs | 270,000 |
+| Simplifying a random 40-node expression | 0.35 ms | 5.2 M |
+| Simplifying in a fresh three-node context | 3.9 µs | 71,300 |
+| Deobfuscating a linear MBA expression (native solver) | 0.38 ms | 4.9 M |
 | Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 1.3 ms | 36 M |
-| Building an engine (linking the built-in rules) | 5.8 µs | 90,600 |
-| SMT-LIB export / import, per node | 0.28 / 0.57 µs | 7,560 / 13,330 |
+| Building an engine (linking the built-in rules) | 5.8 µs | 90,300 |
+| SMT-LIB export / import, per node | 0.26 / 0.55 µs | 7,550 / 13,340 |
 
 On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 83
 nodes and 20 nonlinear ones from 141 to 25 (the signature solver: 92 and 71).
