@@ -123,7 +123,7 @@ impl Strategy {
     pub fn standard() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
-                .0
+                .program
                 .groups()
                 .iter()
                 .map(|g| g.name.clone())
@@ -152,7 +152,7 @@ impl Strategy {
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
-                .0
+                .program
                 .groups()
                 .iter()
                 .map(|g| g.name.clone())
@@ -287,15 +287,9 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-/// A linked rule.
-struct Linked {
-    rule: Rule,
-    proven: bool,
-}
-
 /// A phase as the engine runs it.
 enum PhaseImpl {
-    Local(DispatchNet),
+    Local(Arc<DispatchNet>),
     Pass(pass::PassKind),
     #[cfg(feature = "mba")]
     Mba(crate::mba::MbaConfig),
@@ -322,7 +316,10 @@ impl Default for MbaService {
 }
 
 struct Inner {
-    rules: Vec<Linked>,
+    /// Every linked rule, in link order.
+    rules: Arc<[Rule]>,
+    /// Whether each rule is vouched for by its program's ledger.
+    proven: Arc<[bool]>,
     strategy: Strategy,
     phases: Vec<PhaseImpl>,
     #[cfg(feature = "mba")]
@@ -349,7 +346,8 @@ impl fmt::Debug for Engine {
 /// Builds an [`Engine`].
 #[derive(Default)]
 pub struct EngineBuilder {
-    programs: Vec<(RuleProgram, Option<Ledger>)>,
+    /// Each program with the rules its ledger vouches for (`None`: linked without a ledger).
+    programs: Vec<(RuleProgram, Option<Arc<[bool]>>)>,
     strategy: Option<Strategy>,
     verify: Verify,
     allow_unproven: bool,
@@ -365,30 +363,65 @@ impl fmt::Debug for EngineBuilder {
     }
 }
 
-/// The built-in corpus, compiled once. An immutable cache: it never influences a result.
-fn builtin() -> &'static (RuleProgram, Ledger) {
-    static BUILTIN: OnceLock<(RuleProgram, Ledger)> = OnceLock::new();
+/// The built-in corpus, compiled, checked against its ledger and indexed once. An immutable
+/// cache: it never influences a result.
+struct Builtin {
+    program: RuleProgram,
+    /// The rules the ledger vouches for.
+    proven: Arc<[bool]>,
+    /// The rule order and dispatch net of a `Local` phase over every group in source order (the
+    /// rule phases of the built-in strategies).
+    core: (Vec<u32>, Arc<DispatchNet>),
+}
+
+static BUILTIN: OnceLock<Builtin> = OnceLock::new();
+
+fn builtin() -> &'static Builtin {
     BUILTIN.get_or_init(|| {
         let program = RuleProgram::compile(crate::rules::corpus::CORE)
             .unwrap_or_else(|e| panic!("the built-in corpus does not compile: {e}"));
         let ledger = Ledger::parse(crate::rules::corpus::CORE_LEDGER)
             .unwrap_or_else(|e| panic!("the built-in ledger does not parse: {e}"));
-        (program, ledger)
+        let proven = vouched(&program, &ledger);
+        let rules = program.rules();
+        let order: Vec<u32> = program
+            .groups()
+            .iter()
+            .flat_map(|g| g.rules.iter().map(|&r| r as u32))
+            .filter(|&r| rules[r as usize].decreasing)
+            .collect();
+        let net = Arc::new(DispatchNet::new(rules, &order));
+        Builtin {
+            program,
+            proven,
+            core: (order, net),
+        }
     })
+}
+
+/// The rules of `program` that `ledger` vouches for.
+fn vouched(program: &RuleProgram, ledger: &Ledger) -> Arc<[bool]> {
+    program
+        .rules()
+        .iter()
+        .map(|r| ledger.vouches_for(&r.name, r.id))
+        .collect()
 }
 
 impl EngineBuilder {
     /// Links the built-in corpus.
     pub fn builtin(mut self) -> Self {
-        let (p, l) = builtin();
-        self.programs.push((p.clone(), Some(l.clone())));
+        let b = builtin();
+        self.programs
+            .push((b.program.clone(), Some(b.proven.clone())));
         self
     }
 
     /// Links a program; each rule must be vouched for by `ledger` (see
     /// [`allow_unproven`](Self::allow_unproven)).
     pub fn program(mut self, program: RuleProgram, ledger: &Ledger) -> Self {
-        self.programs.push((program, Some(ledger.clone())));
+        let proven = vouched(&program, ledger);
+        self.programs.push((program, Some(proven)));
         self
     }
 
@@ -440,23 +473,19 @@ impl EngineBuilder {
 
     /// Links everything.
     pub fn build(self) -> Result<Engine, BuildError> {
-        let mut rules: Vec<Linked> = Vec::new();
         let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
-        for (program, ledger) in &self.programs {
-            let base = rules.len() as u32;
-            for rule in program.rules() {
-                let proven = ledger
-                    .as_ref()
-                    .is_some_and(|l| l.vouches_for(&rule.name, rule.id));
-                if !proven && !self.allow_unproven {
+        let mut base = 0u32;
+        for (program, proven) in &self.programs {
+            if !self.allow_unproven {
+                let unproven = match proven {
+                    Some(p) => p.iter().position(|&x| !x),
+                    None => (!program.rules().is_empty()).then_some(0),
+                };
+                if let Some(i) = unproven {
                     return Err(BuildError::Unproven {
-                        rule: rule.name.clone(),
+                        rule: program.rules()[i].name.clone(),
                     });
                 }
-                rules.push(Linked {
-                    rule: rule.clone(),
-                    proven,
-                });
             }
             for g in program.groups() {
                 if groups.iter().any(|(n, _)| *n == g.name) {
@@ -467,6 +496,35 @@ impl EngineBuilder {
                     g.rules.iter().map(|&i| base + i as u32).collect(),
                 ));
             }
+            base += program.rules().len() as u32;
+        }
+        // A single program's rules are shared, not copied.
+        let (rules, proven): (Arc<[Rule]>, Arc<[bool]>) = match &self.programs[..] {
+            [(p, proven)] => (
+                p.shared_rules().clone(),
+                proven
+                    .clone()
+                    .unwrap_or_else(|| vec![false; p.rules().len()].into()),
+            ),
+            ps => (
+                ps.iter()
+                    .flat_map(|(p, _)| p.rules().iter().cloned())
+                    .collect(),
+                ps.iter()
+                    .flat_map(|(p, proven)| match proven {
+                        Some(v) => v.to_vec(),
+                        None => vec![false; p.rules().len()],
+                    })
+                    .collect(),
+            ),
+        };
+        // Phases over the same rules in the same order share one dispatch net, and so do engines
+        // that link only the built-in corpus.
+        let mut nets: Vec<(Vec<u32>, Arc<DispatchNet>)> = Vec::new();
+        if let Some(b) = BUILTIN.get()
+            && Arc::ptr_eq(&rules, b.program.shared_rules())
+        {
+            nets.push(b.core.clone());
         }
         let strategy = self.strategy.unwrap_or_else(|| {
             Strategy::new(
@@ -476,7 +534,6 @@ impl EngineBuilder {
                 }],
             )
         });
-        let plain: Vec<Rule> = rules.iter().map(|l| l.rule.clone()).collect();
         let mut phases = Vec::new();
         let mut id = combine(0x656e_6769_6e65, u64::from(strategy.max_rounds));
         for phase in &strategy.phases {
@@ -489,15 +546,23 @@ impl EngineBuilder {
                         };
                         // Only directed rules: an identity that does not decrease the order
                         // belongs to the search service.
-                        order.extend(rs.iter().copied().filter(|&r| plain[r as usize].decreasing));
+                        order.extend(rs.iter().copied().filter(|&r| rules[r as usize].decreasing));
                     }
                     id = combine(id, 1);
                     for &r in &order {
-                        let rid = plain[r as usize].id.0;
+                        let rid = rules[r as usize].id.0;
                         id = combine(combine(id, rid[0]), rid[1]);
-                        id = combine(id, u64::from(rules[r as usize].proven));
+                        id = combine(id, u64::from(proven[r as usize]));
                     }
-                    phases.push(PhaseImpl::Local(DispatchNet::new(&plain, &order)));
+                    let net = match nets.iter().find(|(o, _)| *o == order) {
+                        Some((_, net)) => net.clone(),
+                        None => {
+                            let net = Arc::new(DispatchNet::new(&rules, &order));
+                            nets.push((order, net.clone()));
+                            net
+                        }
+                    };
+                    phases.push(PhaseImpl::Local(net));
                 }
                 Phase::FactFold => {
                     id = combine(id, 2);
@@ -572,6 +637,7 @@ impl EngineBuilder {
         Ok(Engine {
             inner: Arc::new(Inner {
                 rules,
+                proven,
                 strategy,
                 phases,
                 #[cfg(feature = "mba")]
@@ -1193,8 +1259,7 @@ impl Runner<'_, '_> {
         let inner = self.inner;
         let mut fin = Fin::FINAL;
         for &ri in cands {
-            let linked = &inner.rules[ri as usize];
-            let rule = &linked.rule;
+            let rule = &inner.rules[ri as usize];
             if self.quarantined[ri as usize] {
                 // Skipped only for this call: the result is not final.
                 fin = fin.and(Fin::PROVISIONAL);
@@ -1258,7 +1323,7 @@ impl Runner<'_, '_> {
                 self.emit(Event::NoChange { rule });
                 continue;
             }
-            match self.accept(cx, By::Rule(rule), linked.proven, n, r, env.rel)? {
+            match self.accept(cx, By::Rule(rule), inner.proven[ri as usize], n, r, env.rel)? {
                 Accept::Yes => return Ok(Step::To(r, fin.and(Fin::relying(env.rel)))),
                 Accept::Vetoed => continue,
                 Accept::Rejected(reason) => {

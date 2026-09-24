@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- **Signed comparisons from flags.** The conditions a lifter computes from the flags of a
+  subtraction (x86 `cmp`, AArch64 `subs`) simplify to the comparison they test: SF != OF is
+  `a <s b`, SF == OF is `b <=s a`, and with ZF, `a <=s b` and `b <s a`. That holds in the
+  spellings lifters use (sign tests, `ssub_overflow`, sign-bit extracts, sign bits shifted
+  down, OF as a conjunction of sign tests) and for a constant operand on either side, at every
+  width: `(a - b <s 0) != ssub_overflow(a, b)` is `a <s b`. The group `core.sign` merges sign
+  tests (`(x <s 0) != (y <s 0)` is `(x ^ y) <s 0`, likewise for `^`, `==`, `&`, `|`, sign-bit
+  extracts and shifts) and reads SF xor OF; `core.compare::ne_xor_zero` and the ported
+  `ne_sub_zero` make `a - b != 0` into `a != b`, so the unsigned `hi` condition is `b <u a`.
+- **Comparisons.** Complementing reverses the order, signed and unsigned: `~x <s ~y` is
+  `y <s x`, and against a constant `5 <u ~x` is `x <u 250` (8 bits). Bits set in both
+  operands outside their masks do not decide a comparison (`((x & m) | c) <s ((y & m) | c)`
+  is `(x & m) <s (y & m)` when `m & c` is 0), nor the sign. `-(x | 1)` is `~x` when `x` is
+  even, and `~x & y` is `y` when they share no bits.
+- **Rules ported from Valeria** (PR #4): 94 rules in the `core.recovery_*` and
+  `core.guarded_recovery_*` groups: MBA-style sums of `&`, `|`, `^`, carry and borrow
+  comparisons, BMI2 `pdep`/`pext` cancellations, truncated arithmetic, shifts, min/max spelled
+  with selects, field recombination, masks and guarded negation. Building a concatenation
+  folds adjacent constants. The port's audit (`tools/valeria_rule_cases.py`, the example
+  `valeria_rule_audit`, `docs/valeria-rule-coverage.md`) instantiates all 3,010 rules of
+  Valeria's corpus as 28,134 cases: outputs larger than the rule's own reference fall from
+  1,551 to 168 (standard) and from 1,427 to 110 (deobfuscate), and none is larger than
+  0.6.0's. Rules that grew shared DAGs (a rule does not see an operand's other users) or
+  reshaped MBA questions, and the port's extraction of constant shifts, were left out; the
+  coverage document lists them.
+- Every one of the 172 built-in rules is checked by `bitwright::check`, and z3 and bitwuzla
+  prove every width the nightly proof exports up to 64 bits.
+- **Behavior changes.** Results change wherever they contain a pattern of the new rules.
+  Measured against 0.6.0: the generated corpora of `--corpus-diff` are no larger anywhere
+  (linear MBA 1,673 to 1,672 nodes, random DAGs 9,094 to 9,087 at 8 bits and 9,466 to 9,463 at
+  64); CoBRA's datasets are all still solved (`bw-nf`), with 47 answers smaller and 3 larger
+  (`qsynth_ea` line 469, 6 to 7 nodes against a ground truth of 8, through
+  `sum_from_double_or_xor`; OSES line 6, listed in two files, 58 to 67 against an input of
+  76, through `complementary_shift_rotate`). `simplify/standard` costs 1.2 % more instructions
+  and the MBA rows between 1.5 % more and 8.4 % less.
+- **Building an engine** that links the built-in corpus costs 91 k instructions (6 µs) instead
+  of 7.96 M (0.55 ms; 1.47 M in 0.6.0, with 37 rules instead of 172), so a host can build one
+  per context. Compiling the corpus and checking it against its ledger already happened once
+  per process; what remained was copying: each engine copied the rules three times, looked
+  each one up in a copy of the ledger, and built the same dispatch net twice. Now the rules of a
+  program, the rules the built-in ledger vouches for, and the built-in dispatch net are shared by
+  every engine (phases with the same rules share one net). Cloning a `RuleProgram` no longer
+  copies its rules. Results do not change.
 - **Tooling.** The scheduled CI jobs pass again. `nightly-deep` never finished: Ubuntu's z3
   4.8.12 overruns its 5-second limit on a 512-bit `pext` (exported as 512 shifts by a counted
   amount) and was still on it when the runner shut down two hours later. The job now installs
