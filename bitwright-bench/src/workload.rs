@@ -331,3 +331,72 @@ pub fn nonlinear_mba_corpus(seed: u64, count: usize, bits: u16) -> Vec<String> {
         })
         .collect()
 }
+
+/// Builds a random DAG of floating-point operations of format `f` in `cx`: sums, products,
+/// quotients, fused multiply-adds, roots, rounding, minima and maxima (mostly to nearest even),
+/// comparisons choosing between operands, negations and absolute values, and round trips through
+/// integers, over 6 symbols and a few constants.
+pub fn fp_dag(cx: &mut Context, seed: u64, f: bitwright::fp::FpFormat, nodes: usize) -> Expr {
+    use bitwright::fp::{FpCmpOp, FpOp, RoundingMode};
+    let mut rng = Rng::new(seed);
+    let w = f.width();
+    let mut pool: Vec<Expr> = (0..6)
+        .map(|i| cx.symbol(SymbolKey::U64(i), w).expect("symbol"))
+        .collect();
+    for k in 1..=3u64 {
+        let c = f.from_uint(
+            RoundingMode::Rne,
+            &BitVec::wrapping_from_u64(Width::W8, k * 3),
+        );
+        pool.push(cx.constant(&c).expect("constant"));
+    }
+    let operand = |rng: &mut Rng, pool: &[Expr]| -> Expr {
+        let n = pool.len() as u64;
+        if rng.below(4) == 0 {
+            pool[rng.below(n) as usize]
+        } else {
+            pool[(n - 1 - rng.below(n.min(8))) as usize]
+        }
+    };
+    let int_w = width(32.min(w.bits()));
+    for _ in 0..nodes {
+        let (a, b, c) = (
+            operand(&mut rng, &pool),
+            operand(&mut rng, &pool),
+            operand(&mut rng, &pool),
+        );
+        let rm = if rng.below(4) == 0 {
+            rng.pick(&RoundingMode::ALL)
+        } else {
+            RoundingMode::Rne
+        };
+        let e = match rng.below(16) {
+            0..=3 => cx.fp(FpOp::Add(rm), f, &[a, b]),
+            4 => cx.fp_sub(f, rm, a, b),
+            5..=7 => cx.fp(FpOp::Mul(rm), f, &[a, b]),
+            8 => cx.fp(FpOp::Div(rm), f, &[a, b]),
+            9 => cx.fp(FpOp::Fma(rm), f, &[a, b, c]),
+            10 => cx.fp(FpOp::Sqrt(rm), f, &[a]),
+            11 => cx.fp(FpOp::RoundToIntegral(rm), f, &[a]),
+            12 => cx.fp(rng.pick(&[FpOp::Min, FpOp::Max]), f, &[a, b]),
+            13 => {
+                let op = rng.pick(&[FpCmpOp::Lt, FpCmpOp::Le, FpCmpOp::Eq]);
+                let t = cx.fp_cmp(f, op, a, b).expect("comparison");
+                cx.select(t, b, c)
+            }
+            14 => {
+                let n = cx.fp_neg(f, a).expect("negation");
+                cx.fp_abs(f, n)
+            }
+            _ => {
+                let i = cx
+                    .fp(FpOp::ToSInt(RoundingMode::Rtz, int_w), f, &[a])
+                    .expect("to int");
+                cx.fp(FpOp::FromSInt(rm), f, &[i])
+            }
+        }
+        .expect("a floating-point operation of the format");
+        pool.push(e);
+    }
+    *pool.last().expect("a root")
+}

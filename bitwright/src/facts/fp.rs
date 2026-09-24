@@ -42,8 +42,77 @@ fn sub(a: &BitVec, b: &BitVec) -> BitVec {
     BitVec::bin_unchecked(crate::BinOp::Sub, a, b)
 }
 
+/// The members of facts packed as words (up to 64 bits: known zeros, known ones, unsigned
+/// bounds, stride, signed bounds) between `lo` and `hi`, within one sign half: [`span`] on a
+/// machine word.
+fn span_word(x: &[u64; 7], mask: u64, lo: u64, hi: u64, negative_half: bool) -> Option<(u64, u64)> {
+    let sign = (mask >> 1) + 1;
+    let (kz, ko, ulo, uhi, slo, shi) = (x[0], x[1], x[2], x[3], x[5], x[6]);
+    let (slo_neg, shi_neg) = (slo & sign != 0, shi & sign != 0);
+    let (sl, sh) = if negative_half {
+        if !slo_neg {
+            return None;
+        }
+        (slo, if shi_neg { shi } else { mask })
+    } else {
+        if shi_neg {
+            return None;
+        }
+        (if slo_neg { 0 } else { slo }, shi)
+    };
+    let lo = lo.max(ulo).max(sl);
+    let hi = hi.min(uhi).min(sh);
+    if hi < lo {
+        return None;
+    }
+    let lo = super::narrow::next_member(lo, kz, ko, mask)?;
+    let hi = super::narrow::prev_member(hi, kz, ko, mask)?;
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// [`decode`] for formats of at most 64 bits.
+fn decode_word(f: FpFormat, x: &Facts) -> Floats {
+    let w = f.width();
+    let bits = u32::from(w.bits());
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let sign = (mask >> 1) + 1;
+    let inf = (u64::MAX >> (64 - f.eb())) << (f.sb() - 1);
+    let words = super::to_words(x);
+    // Nothing known (a symbol): every float.
+    if words[0] | words[1] == 0
+        && words[2] == 0
+        && words[3] == mask
+        && words[5] == sign
+        && words[6] == mask >> 1
+    {
+        return Floats {
+            nan: true,
+            range: everything(f),
+        };
+    }
+    let pos = span_word(&words, mask, 0, inf, false);
+    let neg = span_word(&words, mask, sign, sign | inf, true);
+    let nan = span_word(&words, mask, inf + 1, sign - 1, false).is_some()
+        || span_word(&words, mask, (sign | inf) + 1, mask, true).is_some();
+    let v = |u: u64| BitVec::from_canonical_u64(w, u);
+    let range = match (neg, pos) {
+        (Some((_, nhi)), Some((_, phi))) => Some((v(nhi), v(phi))),
+        (Some((nlo, nhi)), None) => Some((v(nhi), v(nlo))),
+        (None, Some((plo, phi))) => Some((v(plo), v(phi))),
+        (None, None) => None,
+    };
+    Floats { nan, range }
+}
+
 /// The floats an encoding's facts allow.
 fn decode(f: FpFormat, x: &Facts) -> Floats {
+    if f.width().bits() <= 64 {
+        return decode_word(f, x);
+    }
     let w = f.width();
     let s = sign(w);
     let inf = f.inf(false);
@@ -62,8 +131,60 @@ fn decode(f: FpFormat, x: &Facts) -> Floats {
     Floats { nan, range }
 }
 
+/// [`encode`] for formats of at most 64 bits.
+fn encode_word(f: FpFormat, x: Floats) -> Facts {
+    let w = f.width();
+    let bits = u32::from(w.bits());
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let sign = (mask >> 1) + 1;
+    let word = |v: &BitVec| v.limbs()[0];
+    // Unsigned and signed hulls of the parts (a part is within one sign half).
+    let (mut ulo, mut uhi, mut slo, mut shi) = (u64::MAX, 0u64, u64::MAX, 0u64);
+    let mut add = |lo: u64, hi: u64| {
+        ulo = ulo.min(lo);
+        uhi = uhi.max(hi);
+        // Signed order is unsigned order with the sign bit flipped.
+        slo = slo.min(lo ^ sign);
+        shi = shi.max(hi ^ sign);
+    };
+    if x.nan {
+        let n = word(&f.nan());
+        add(n, n);
+    }
+    if let Some((lo, hi)) = x.range {
+        let (l, h) = (word(&lo), word(&hi));
+        let (l_neg, h_neg) = (l & sign != 0, h & sign != 0);
+        let magnitude = |v: u64| v & !sign & mask;
+        if l_neg {
+            add(if h_neg { h } else { sign }, l);
+        }
+        if !h_neg {
+            add(if l_neg { 0 } else { l }, h);
+        }
+        // Strictly across 0 (negative least, positive greatest, neither a zero): both zeros.
+        if l_neg && !h_neg && magnitude(l) != 0 && magnitude(h) != 0 {
+            add(sign, sign);
+            add(0, 0);
+        }
+    }
+    if ulo > uhi {
+        return Facts::top(w);
+    }
+    let v = |u: u64| BitVec::from_canonical_u64(w, u);
+    let u = URange::new(v(ulo), v(uhi)).unwrap_or(URange::full(w));
+    let s = SRange::new(v(slo ^ sign), v(shi ^ sign)).unwrap_or(SRange::full(w));
+    Facts::reduce(KnownBits::unknown(w), u, s).unwrap_or_else(|| Facts::top(w))
+}
+
 /// The facts of an encoding holding one of `x`'s floats (both zeros where the range crosses 0).
 fn encode(f: FpFormat, x: Floats) -> Facts {
+    if f.width().bits() <= 64 {
+        return encode_word(f, x);
+    }
     let w = f.width();
     let s = sign(w);
     let mut parts: Vec<(BitVec, BitVec)> = Vec::new();

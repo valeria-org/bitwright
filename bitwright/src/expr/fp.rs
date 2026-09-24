@@ -96,8 +96,28 @@ impl Context {
     /// converts the operand itself.
     fn fp_identity(&mut self, d: Desc, k: &[u32]) -> Result<Option<u32>, Error> {
         let f = d.format;
-        let one = f.from_uint(RoundingMode::Rne, &BitVec::one(Width::W8));
-        let two = f.from_uint(RoundingMode::Rne, &BitVec::wrapping_from_u64(Width::W8, 2));
+        if !matches!(
+            d.op,
+            FpOp::Fma(_)
+                | FpOp::Mul(_)
+                | FpOp::Div(_)
+                | FpOp::Lt
+                | FpOp::Le
+                | FpOp::Eq
+                | FpOp::RoundToIntegral(_)
+                | FpOp::FromSInt(_)
+                | FpOp::FromUInt(_)
+        ) {
+            return Ok(None);
+        }
+        // 1 and 2: the exponent field at the bias (and one above), the significand 0.
+        let power = |k: u64| {
+            let w = f.width();
+            let e = BitVec::wrapping_from_u64(w, (1u64 << (f.eb() - 1)) - 1 + k);
+            let shift = BitVec::wrapping_from_u64(w, u64::from(f.sb() - 1));
+            BitVec::bin_unchecked(BinOp::Shl, &e, &shift)
+        };
+        let (one, two) = (power(0), power(1));
         let with = |op| Desc { op, format: f };
         let r = match d.op {
             FpOp::Fma(rm) if self.fp_is(k[1], &one) => {

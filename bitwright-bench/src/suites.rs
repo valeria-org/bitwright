@@ -19,6 +19,7 @@ pub fn all() -> Vec<Bench> {
     let mut v = Vec::new();
     values(&mut v);
     floats(&mut v);
+    float_exprs(&mut v);
     exprs(&mut v);
     facts(&mut v);
     constraints(&mut v);
@@ -101,6 +102,64 @@ fn floats(v: &mut Vec<Bench>) {
                 },
             ));
         }
+    }
+}
+
+/// Floating-point expressions: evaluating a 1000-node DAG, its facts in a fresh context, and
+/// simplifying 20 small DAGs.
+fn float_exprs(v: &mut Vec<Bench>) {
+    for (format, bits) in [(FpFormat::F32, 32u64), (FpFormat::F64, 64)] {
+        v.push(Bench::new(
+            format!("fp/eval-dag/{bits}"),
+            40,
+            "1000 nodes",
+            move |b| {
+                let mut cx = Context::new();
+                let root = workload::fp_dag(&mut cx, 11, format, 1000);
+                let mut rng = workload::Rng::new(bits);
+                let env: Vec<(SymbolKey, BitVec)> = (0..6)
+                    .map(|i| (SymbolKey::U64(i), workload::value(&mut rng, format.width())))
+                    .collect();
+                b.iter(|| cx.eval(&[root], env.as_slice()).expect("eval"));
+            },
+        ));
+        v.push(Bench::new(
+            format!("fp/facts/{bits}"),
+            40,
+            "1000 nodes",
+            move |b| {
+                b.iter_batched(
+                    || {
+                        let mut cx = Context::new();
+                        let root = workload::fp_dag(&mut cx, 12, format, 1000);
+                        (cx, root)
+                    },
+                    |(mut cx, root)| cx.facts(root).expect("facts"),
+                );
+            },
+        ));
+        v.push(Bench::new(
+            format!("fp/simplify/{bits}"),
+            10,
+            "20 exprs",
+            move |b| {
+                let engine = Engine::standard();
+                b.iter_batched(
+                    || {
+                        let mut cx = Context::new();
+                        let roots: Vec<Expr> = (0..20)
+                            .map(|i| workload::fp_dag(&mut cx, 400 + i, format, 40))
+                            .collect();
+                        (cx, roots)
+                    },
+                    |(mut cx, roots)| {
+                        engine
+                            .run(&mut cx, &roots, Default::default())
+                            .expect("simplify")
+                    },
+                );
+            },
+        ));
     }
 }
 

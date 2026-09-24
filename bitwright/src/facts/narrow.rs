@@ -102,7 +102,7 @@ fn below<T: Word>(i: u32) -> T {
 }
 
 /// The smallest value `>= lo` with no bit of `kz` and every bit of `ko`, if there is one.
-fn next_member<T: Word>(lo: T, kz: T, ko: T, mask: T) -> Option<T> {
+pub(super) fn next_member<T: Word>(lo: T, kz: T, ko: T, mask: T) -> Option<T> {
     let bad = (lo & kz) | (!lo & ko);
     if bad == T::ZERO {
         return Some(lo);
@@ -117,7 +117,7 @@ fn next_member<T: Word>(lo: T, kz: T, ko: T, mask: T) -> Option<T> {
 }
 
 /// The largest value `<= hi` with no bit of `kz` and every bit of `ko`, if there is one.
-fn prev_member<T: Word>(hi: T, kz: T, ko: T, mask: T) -> Option<T> {
+pub(super) fn prev_member<T: Word>(hi: T, kz: T, ko: T, mask: T) -> Option<T> {
     let bad = (hi & kz) | (!hi & ko);
     if bad == T::ZERO {
         return Some(hi);
