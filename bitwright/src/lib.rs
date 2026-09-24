@@ -9,10 +9,11 @@
 //! - [`Context`]: a hash-consed expression arena with construction-time canonicalization,
 //!   symbols, O(1) structural metadata, iterative traversal, evaluation and substitution, and a
 //!   text syntax ([`Context::parse`], [`Context::display`]).
-//! - [`Facts`]: known bits and unsigned/signed ranges per node (a reduced product), computed
-//!   lazily and iteratively under a work cap, and tri-state proofs ([`Context::prove`]), also
-//!   under consumer-defined constraints ([`Assumptions`]: facts and 1-bit predicates, propagated
-//!   to operands, with the constraints each result relies on reported as a [`Reliance`]).
+//! - [`Facts`]: known bits, an unsigned strided interval and a signed range per node (a reduced
+//!   product), computed lazily and iteratively under a work cap, and tri-state proofs
+//!   ([`Context::prove`]), also under consumer-defined constraints ([`Assumptions`]: facts and
+//!   1-bit predicates, propagated to operands, with the constraints each result relies on
+//!   reported as a [`Reliance`]).
 //! - [`rules`]: the `.bwr` rule language and its compiler; `check` (feature `check`, default):
 //!   the soundness checker and proof ledgers.
 //! - [`engine`]: the simplifier: proven rules and normal-form passes (linear, xor, bitwise,

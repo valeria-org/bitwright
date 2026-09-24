@@ -25,7 +25,7 @@ fn facts_of_set(vals: &[BitVec]) -> Facts {
 }
 
 /// Input fact states at width `w`: every known-bits pattern, facts of random subsets, and
-/// random unsigned and signed intervals.
+/// random unsigned (strided) and signed intervals.
 fn states(rng: &mut Rng, w: u16, random: usize) -> Vec<Facts> {
     let vals = all_values(w);
     let mut out = Vec::new();
@@ -51,7 +51,7 @@ fn states(rng: &mut Rng, w: u16, random: usize) -> Vec<Facts> {
         }
     }
     for _ in 0..random {
-        match rng.below(3) {
+        match rng.below(4) {
             0 => {
                 let subset: Vec<BitVec> =
                     vals.iter().filter(|_| rng.chance(1, 3)).copied().collect();
@@ -67,6 +67,14 @@ fn states(rng: &mut Rng, w: u16, random: usize) -> Vec<Facts> {
                     BitVec::wrapping_from_u64(width(w), hi),
                 )
                 .unwrap();
+                if let Some(f) =
+                    Facts::reduce(KnownBits::unknown(width(w)), u, SRange::full(width(w)))
+                {
+                    out.push(f);
+                }
+            }
+            2 => {
+                let u = random_strided(rng, w);
                 if let Some(f) =
                     Facts::reduce(KnownBits::unknown(width(w)), u, SRange::full(width(w)))
                 {
@@ -89,6 +97,16 @@ fn states(rng: &mut Rng, w: u16, random: usize) -> Vec<Facts> {
         }
     }
     out
+}
+
+/// A random strided interval of `w` bits.
+fn random_strided(rng: &mut Rng, w: u16) -> URange {
+    let n = 1u64 << w;
+    let lo = rng.below(n);
+    let stride = 1 + rng.below(n - lo);
+    let hi = lo + stride * rng.below((n - 1 - lo) / stride + 1);
+    let v = |x: u64| BitVec::wrapping_from_u64(width(w), x);
+    URange::strided(v(lo), v(hi), stride).unwrap()
 }
 
 fn members(f: &Facts) -> Vec<BitVec> {
@@ -270,12 +288,7 @@ fn reduced_product_keeps_every_common_member() {
         for _ in 0..400 {
             let st = states(&mut rng, w, 3);
             let k = st[rng.below(st.len() as u64) as usize].known;
-            let (a, b) = (rng.below(1 << w), rng.below(1 << w));
-            let u = URange::new(
-                BitVec::wrapping_from_u64(ww, a.min(b)),
-                BitVec::wrapping_from_u64(ww, a.max(b)),
-            )
-            .unwrap();
+            let u = random_strided(&mut rng, w);
             let (c, d) = (
                 BitVec::wrapping_from_u64(ww, rng.below(1 << w)),
                 BitVec::wrapping_from_u64(ww, rng.below(1 << w)),
@@ -300,6 +313,261 @@ fn reduced_product_keeps_every_common_member() {
             }
         }
     }
+}
+
+/// Every strided interval of `w` bits.
+fn all_strided(w: u16) -> Vec<URange> {
+    let n = 1u64 << w;
+    let v = |x: u64| BitVec::wrapping_from_u64(width(w), x);
+    let mut out = Vec::new();
+    for lo in 0..n {
+        out.push(URange::constant(&v(lo)));
+        for hi in lo + 1..n {
+            for s in (1..=hi - lo).filter(|s| (hi - lo) % s == 0) {
+                out.push(URange::strided(v(lo), v(hi), s).unwrap());
+            }
+        }
+    }
+    out
+}
+
+fn set_of(u: &URange) -> Vec<u64> {
+    let w = u.width().bits();
+    (0..1u64 << w)
+        .filter(|&x| u.contains(&BitVec::wrapping_from_u64(width(w), x)))
+        .collect()
+}
+
+#[test]
+fn narrow_reduction_matches_the_wide_one() {
+    let mut rng = Rng(0xfac7_0006);
+    for &w in &[
+        1u16, 2, 3, 5, 8, 13, 16, 31, 32, 33, 63, 64, 65, 96, 127, 128,
+    ] {
+        let ww = width(w);
+        let val = |rng: &mut Rng| {
+            let limbs = match rng.below(4) {
+                0 => [rng.below(16), 0],
+                1 => [!rng.below(16), !0],
+                _ => [rng.next(), rng.next()],
+            };
+            BitVec::wrapping_from_limbs(ww, &limbs)
+        };
+        for _ in 0..3000 {
+            // Known bits: a few random positions known.
+            let (mut z, mut o) = (0u128, 0u128);
+            for _ in 0..rng.below(u64::from(w) + 1) {
+                let b = 1u128 << rng.below(u64::from(w));
+                if rng.chance(1, 2) {
+                    z |= b;
+                } else {
+                    o |= b;
+                }
+            }
+            let o = o & !z;
+            let k = KnownBits::new(
+                BitVec::wrapping_from_u128(ww, z),
+                BitVec::wrapping_from_u128(ww, o),
+            )
+            .unwrap();
+            let (a, b) = (val(&mut rng), val(&mut rng));
+            let (lo, hi) = if ule(&a, &b) { (a, b) } else { (b, a) };
+            let span = BitVec::bin_unchecked(BinOp::Sub, &hi, &lo);
+            let stride = match rng.below(3) {
+                0 => 1,
+                _ => {
+                    let s = 1 + rng.below(12);
+                    if range::rem(&span, s) == 0 { s } else { 1 }
+                }
+            };
+            let u = URange::strided(lo, hi, stride).unwrap();
+            let (c, d) = (val(&mut rng), val(&mut rng));
+            let s = if sle(&c, &d) {
+                SRange::new(c, d)
+            } else {
+                SRange::new(d, c)
+            }
+            .unwrap();
+            assert_eq!(
+                Facts::reduce(k, u, s),
+                Facts::reduce_wide(k, u, s),
+                "{k:?} {u:?} {s:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn strided_intervals_are_their_sets() {
+    let mut rng = Rng(0xfac7_0005);
+    for w in 1..=4u16 {
+        let all = all_strided(w);
+        for a in &all {
+            // The members are lo, lo + stride, ..., hi.
+            let (lo, hi, s) = (
+                a.lo().to_u64().unwrap(),
+                a.hi().to_u64().unwrap(),
+                a.stride(),
+            );
+            let want: Vec<u64> = if s == 0 {
+                vec![lo]
+            } else {
+                (lo..=hi).step_by(s as usize).collect()
+            };
+            let ma = set_of(a);
+            assert_eq!(ma, want, "{a:?}");
+            // Residue classes: exactly the members in the class.
+            for m in 1..=(1u64 << w) {
+                let r = rng.below(m);
+                let got = a.meet_class(r, m).map(|u| set_of(&u)).unwrap_or_default();
+                let want: Vec<u64> = ma.iter().copied().filter(|x| x % m == r).collect();
+                assert_eq!(got, want, "{a:?} class {r} mod {m}");
+            }
+            for _ in 0..if w <= 3 { all.len() } else { 60 } {
+                let b = &all[rng.below(all.len() as u64) as usize];
+                let mb = set_of(b);
+                // The meet is exactly the intersection (the moduli are small).
+                let common: Vec<u64> = ma.iter().copied().filter(|x| mb.contains(x)).collect();
+                let got = a.meet(b).map(|u| set_of(&u)).unwrap_or_default();
+                assert_eq!(got, common, "{a:?} meet {b:?}");
+                // The hull contains both, and `within` is inclusion.
+                let hull = set_of(&a.hull(b));
+                assert!(
+                    ma.iter().chain(&mb).all(|x| hull.contains(x)),
+                    "{a:?} hull {b:?}"
+                );
+                assert_eq!(
+                    a.within(b),
+                    ma.iter().all(|x| mb.contains(x)),
+                    "{a:?} within {b:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn known_bits_find_their_nearest_members() {
+    for w in 1..=5u16 {
+        let vals = all_values(w);
+        for code in 0..3u64.pow(u32::from(w)) {
+            let (mut z, mut o, mut c) = (0u64, 0u64, code);
+            for b in 0..w {
+                match c % 3 {
+                    0 => z |= 1 << b,
+                    1 => o |= 1 << b,
+                    _ => {}
+                }
+                c /= 3;
+            }
+            let v = |x: u64| BitVec::wrapping_from_u64(width(w), x);
+            let k = KnownBits::new(v(z), v(o)).unwrap();
+            for x in &vals {
+                let next = vals.iter().find(|y| ule(x, y) && k.contains(y)).copied();
+                let prev = vals
+                    .iter()
+                    .rev()
+                    .find(|y| ule(y, x) && k.contains(y))
+                    .copied();
+                assert_eq!(k.next_member(x), next, "{k:?} next from {x}");
+                assert_eq!(k.prev_member(x), prev, "{k:?} prev from {x}");
+            }
+        }
+    }
+}
+
+#[test]
+fn strides_and_known_bits_tighten_each_other() {
+    let w = Width::W8;
+    let v = |x: u64| BitVec::wrapping_from_u64(w, x);
+    let u = |f: &Facts| {
+        (
+            f.urange.lo().to_u64().unwrap(),
+            f.urange.hi().to_u64().unwrap(),
+            f.urange.stride(),
+        )
+    };
+    let odd = KnownBits::new(v(0), v(1)).unwrap();
+    // Known bits move the ends to values they allow: the odd values in [4, 10] are 5, 7, 9.
+    let f = Facts::new(odd, URange::new(v(4), v(10)).unwrap(), SRange::full(w)).unwrap();
+    assert_eq!(u(&f), (5, 9, 2));
+    // Signed ends too: the odd values in [-4, 4] are -3 to 3.
+    let f = Facts::new(odd, URange::full(w), SRange::new(v(0xfc), v(4)).unwrap()).unwrap();
+    assert_eq!((f.srange.lo(), f.srange.hi()), (v(0xfd), v(3)));
+    // A stride's factor of two is known low bits: 3, 7, 11, 15 end in 11.
+    let f = Facts::new(
+        KnownBits::unknown(w),
+        URange::strided(v(3), v(15), 4).unwrap(),
+        SRange::full(w),
+    )
+    .unwrap();
+    assert_eq!(
+        (f.known.bit(0), f.known.bit(1), f.known.bit(2)),
+        (Some(true), Some(true), None)
+    );
+    // Known low bits and a stride combine: 1 mod 4 and 0 mod 3 is 9 mod 12.
+    let low01 = KnownBits::new(v(2), v(1)).unwrap();
+    let f = Facts::new(
+        low01,
+        URange::strided(v(0), v(99), 3).unwrap(),
+        SRange::full(w),
+    )
+    .unwrap();
+    assert_eq!(u(&f), (9, 93, 12));
+    // No odd value is a multiple of 2.
+    assert!(
+        Facts::new(
+            odd,
+            URange::strided(v(0), v(8), 2).unwrap(),
+            SRange::full(w)
+        )
+        .is_none()
+    );
+    // One value is every bit.
+    let f = Facts::new(
+        KnownBits::unknown(w),
+        URange::strided(v(6), v(12), 6).unwrap(),
+        SRange::new(v(10), v(20)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(f.as_constant(), Some(v(12)));
+
+    // Through expressions: strides decide what bounds cannot.
+    let mut cx = Context::new();
+    let w = Width::W32;
+    let p = |cx: &mut Context, src: &str| cx.parse(src, &crate::ParseOptions::width(w)).unwrap();
+    let e = p(&mut cx, "(x & 7) * 3");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 21, 3));
+    // Cached facts keep their stride.
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 21, 3));
+    let e = p(&mut cx, "(x & 3) * 3 + 1 == 5");
+    assert_eq!(cx.exact(e).unwrap(), Some(BitVec::from_bool(false)));
+    let e = p(&mut cx, "udiv((x & 7) * 6, 3)");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 14, 2));
+    let e = p(&mut cx, "urem((x & 7) * 6 + 1, 3)");
+    assert_eq!(cx.exact(e).unwrap(), Some(BitVec::one(w)));
+    let e = p(&mut cx, "select(x <u 5, 3, 9) == 5");
+    assert_eq!(cx.exact(e).unwrap(), Some(BitVec::from_bool(false)));
+    let e = p(&mut cx, "zext<64>((x & 3) * 5)");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 15, 5));
+    let e = p(&mut cx, "concat(trunc<4>(x) & 2, trunc<4>(y) & 4)");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 36, 4));
+    let e = p(&mut cx, "((x & 7) * 3) << 2");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 84, 12));
+    let e = p(&mut cx, "((x & 7) * 12) >>u 2");
+    assert_eq!(u(&cx.facts(e).unwrap()), (0, 21, 3));
+    let e = p(&mut cx, "~((x & 7) * 3)");
+    assert_eq!(cx.facts(e).unwrap().urange.stride(), 3);
+    let e = p(&mut cx, "(x & 3) * 5 + 2");
+    let mut vs: Vec<u64> = cx
+        .enumerate_values(e, 8)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|v| v.to_u64().unwrap())
+        .collect();
+    vs.sort_unstable();
+    assert_eq!(vs, vec![2, 7, 12, 17]);
 }
 
 // ----- context-level facts and proofs ---------------------------------------------------------

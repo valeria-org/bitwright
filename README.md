@@ -48,7 +48,8 @@ fn main() -> Result<(), bitwright::Error> {
   by zero included, checked against an independent bit-serial reference evaluator.
 - **A hash-consed expression arena** with canonicalization at construction, owned by a context.
   There is no global state, and the same input gives the same output on every run.
-- **Bit-level facts**: known bits, unsigned and signed ranges, tri-state proofs, and
+- **Bit-level facts**: known bits, an unsigned strided interval (the values `lo`, `lo + stride`,
+  …, `hi`) and a signed range, each tightening the others, tri-state proofs, and
   constraints you assume (a path condition, an invariant), with the ones each result relies on
   reported back.
 - **A directed simplifier** built from normal-form passes (linear arithmetic, xor forms, truth

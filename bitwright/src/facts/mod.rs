@@ -9,6 +9,7 @@
 mod backward;
 mod constraint;
 pub(crate) mod known;
+mod narrow;
 mod range;
 #[cfg(test)]
 mod tests;
@@ -31,8 +32,12 @@ use range::{sle, slt, ule, ult};
 pub(crate) use transfer::decide as decide_cmp;
 use transfer::{TOp, decide, transfer};
 
-/// What is known about the values of a `W`-bit expression: known bits, and an unsigned and a
-/// signed interval. All three are kept consistent with each other (a reduced product).
+/// What is known about the values of a `W`-bit expression: known bits, an unsigned strided
+/// interval (the values `lo, lo + stride, …, hi`) and a signed interval. The three are kept
+/// consistent with each other (a reduced product): known bits snap the intervals' ends to the
+/// nearest values they allow and give the strided interval their known low bits as a residue
+/// class; the intervals give the known bits their bounds' common high bits, and the stride its
+/// factor of two as known low bits. A value is possible only if every component allows it.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Facts {
     pub(crate) known: KnownBits,
@@ -44,10 +49,11 @@ impl fmt::Debug for Facts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Facts({:?}, u[{}, {}], s[{}, {}])",
+            "Facts({:?}, u[{}, {}] by {}, s[{}, {}])",
             self.known,
             self.urange.lo(),
             self.urange.hi(),
+            self.urange.stride(),
             self.srange.lo(),
             self.srange.hi()
         )
@@ -87,7 +93,7 @@ impl Facts {
         self.known
     }
 
-    /// The unsigned interval.
+    /// The unsigned strided interval.
     pub fn urange(&self) -> URange {
         self.urange
     }
@@ -143,8 +149,7 @@ impl Facts {
         let bits = |a: &BitVec, b: &BitVec| known::bv_and(a, &known::bv_not(b)).is_zero();
         bits(&ok.known_zero(), &k.known_zero())
             && bits(&ok.known_one(), &k.known_one())
-            && ule(&o.urange.lo(), &self.urange.lo())
-            && ule(&self.urange.hi(), &o.urange.hi())
+            && self.urange.within(&o.urange)
             && sle(&o.srange.lo(), &self.srange.lo())
             && sle(&self.srange.hi(), &o.srange.hi())
     }
@@ -175,15 +180,48 @@ impl Facts {
 
     /// The reduced product: tightens each component with the others. `None` if the
     /// components are contradictory (no value satisfies all three).
-    pub(crate) fn reduce(mut k: KnownBits, mut u: URange, mut s: SRange) -> Option<Facts> {
+    pub(crate) fn reduce(k: KnownBits, u: URange, s: SRange) -> Option<Facts> {
+        match k.width().bits() {
+            ..=64 => narrow::reduce::<u64>(&k, &u, &s),
+            65..=128 => narrow::reduce::<u128>(&k, &u, &s),
+            _ => Facts::reduce_wide(k, u, s),
+        }
+    }
+
+    /// `reduce` at any width, on `BitVec`s.
+    pub(crate) fn reduce_wide(mut k: KnownBits, mut u: URange, mut s: SRange) -> Option<Facts> {
         let w = k.width();
-        for round in 0..2 {
+        let sign = BitVec::smin(w);
+        let flip = |v: &BitVec| known::bv_xor(v, &sign);
+        for _ in 0..3 {
             let before = (k, u, s);
-            // Known bits bound both ranges.
-            u = u.meet(&URange::new(k.umin(), k.umax())?)?;
-            s = s.meet(&SRange::new(k.smin(), k.smax())?)?;
-            // An unsigned range fixes its bounds' common high bits.
+            // Known bits move each unsigned end to the nearest value they allow, and their known
+            // low bits are a residue class of the stride. (With no bit known, nothing moves.)
+            if !k.known().is_zero() {
+                u = u.meet(&URange::new(
+                    k.next_member(&u.lo())?,
+                    k.prev_member(&u.hi())?,
+                )?)?;
+                let t = k.known_low_prefix().min(63);
+                if t > 0 {
+                    let m = 1u64 << t;
+                    u = u.meet_class(k.known_one().limbs()[0] & (m - 1), m)?;
+                }
+                // Likewise for the signed ends (signed order is unsigned order with the sign
+                // bit flipped).
+                let ks = k.sign_flipped();
+                s = s.meet(&SRange::new(
+                    flip(&ks.next_member(&flip(&s.lo()))?),
+                    flip(&ks.prev_member(&flip(&s.hi()))?),
+                )?)?;
+            }
+            // The unsigned values fix their bounds' common high bits, and a stride with the
+            // factor 2^a their low a bits.
             k = k.meet(&prefix_bits(&u.lo(), &u.hi()))?;
+            let a = u.stride().trailing_zeros();
+            if u.stride() >= 2 && a > 0 {
+                k = k.meet(&KnownBits::low_bits_of(&u.lo(), a))?;
+            }
             // A signed range on one side of zero orders like an unsigned one.
             let zero = BitVec::zero(w);
             let non_negative = sle(&zero, &s.lo());
@@ -197,9 +235,8 @@ impl Facts {
             if ule(&u.hi(), &smax) || ult(&smax, &u.lo()) {
                 s = s.meet(&SRange::new(u.lo(), u.hi())?)?;
             }
-            // A round that changed nothing is a fixed point; the second round only helps when
-            // the first tightened something.
-            if round == 0 && before == (k, u, s) {
+            // A round that changed nothing is a fixed point.
+            if before == (k, u, s) {
                 break;
             }
         }
@@ -467,33 +504,35 @@ struct Pending {
     pos: usize,
 }
 
-/// Facts of width up to 64 as six words: the known zero and one bits and both ranges' bounds.
-fn to_words(f: &Facts) -> [u64; 6] {
+/// Facts of width up to 64 as seven words: the known zero and one bits, the unsigned bounds and
+/// stride, and the signed bounds.
+fn to_words(f: &Facts) -> [u64; 7] {
     let w = |v: BitVec| v.limbs()[0];
     [
         w(f.known.known_zero()),
         w(f.known.known_one()),
         w(f.urange.lo()),
         w(f.urange.hi()),
+        f.urange.stride(),
         w(f.srange.lo()),
         w(f.srange.hi()),
     ]
 }
 
-/// The facts of width `w` (at most 64) from their six words.
-fn from_words(w: Width, x: &[u64; 6]) -> Facts {
+/// The facts of width `w` (at most 64) from their seven words.
+fn from_words(w: Width, x: &[u64; 7]) -> Facts {
     let v = |x: u64| BitVec::from_canonical_u64(w, x);
     Facts {
         known: KnownBits::from_masks(v(x[0]), v(x[1])),
-        urange: URange::from_bounds(v(x[2]), v(x[3])),
-        srange: SRange::from_bounds(v(x[4]), v(x[5])),
+        urange: URange::from_raw(v(x[2]), v(x[3]), x[4]),
+        srange: SRange::from_bounds(v(x[5]), v(x[6])),
     }
 }
 
-/// Facts stored compactly: six words up to 64 bits, whole beyond.
+/// Facts stored compactly: seven words up to 64 bits, whole beyond.
 #[derive(Clone, Debug)]
 enum Packed {
-    Narrow([u64; 6]),
+    Narrow([u64; 7]),
     Wide(Box<Facts>),
 }
 
@@ -544,8 +583,9 @@ impl FactMap {
     }
 }
 
-/// Base facts per node, stored compactly: facts of width up to 64 bits as six words (the known
-/// zero and one bits and both ranges' bounds) instead of six 512-bit values, wider ones whole.
+/// Base facts per node, stored compactly: facts of width up to 64 bits as seven words (the known
+/// zero and one bits, the ranges' bounds and the stride) instead of 512-bit values, wider ones
+/// whole.
 /// Entries are appended in the order they are computed (bottom-up), and found through a slot per
 /// node index, so a query walks both tables mostly in order.
 #[derive(Clone, Debug, Default)]
@@ -553,7 +593,7 @@ struct BaseFacts {
     /// Per node index: 0 if not cached, else `1 + k` for entry `k` of `narrow` (nodes of width up
     /// to 64) or of `wide`.
     slot: Vec<u32>,
-    narrow: Vec<[u64; 6]>,
+    narrow: Vec<[u64; 7]>,
     wide: Vec<Facts>,
 }
 
@@ -1047,10 +1087,12 @@ impl Context {
         let limit = u64::from(limit.min(1 << 20));
         // From the unsigned range when it is narrow.
         let span = BitVec::bin_unchecked(crate::BinOp::Sub, &f.urange.hi(), &f.urange.lo());
-        if span.to_u64().is_some_and(|d| d < limit) {
+        let stride = f.urange.stride().max(1);
+        if span.to_u64().is_some_and(|d| d / stride < limit) {
             let mut out = Vec::new();
             let mut v = f.urange.lo();
-            let one = BitVec::one(f.width());
+            // Members only: the stride steps from one to the next.
+            let step = BitVec::wrapping_from_u64(f.width(), stride);
             loop {
                 if f.contains(&v) {
                     out.push(v);
@@ -1058,7 +1100,7 @@ impl Context {
                 if v == f.urange.hi() {
                     break;
                 }
-                v = BitVec::bin_unchecked(crate::BinOp::Add, &v, &one);
+                v = BitVec::bin_unchecked(crate::BinOp::Add, &v, &step);
             }
             return Ok(Some(out));
         }

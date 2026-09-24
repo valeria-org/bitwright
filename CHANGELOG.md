@@ -14,6 +14,25 @@
   guide, and its examples run as tests. `Expr::to_bits` and `Expr::from_bits` give a handle as
   one integer, for hosts that keep handles outside Rust; a context rejects bits it did not
   create, as it rejects any foreign handle.
+- **Strided value sets.** A node's unsigned interval is a strided interval, the values `lo`,
+  `lo + stride`, …, `hi` (`URange::stride`, `URange::strided`), and known bits and the intervals
+  tighten each other both ways: known bits move each end of both intervals to the nearest value
+  they allow (the odd values in `[4, 10]` are 5, 7 and 9) and give the stride their known low
+  bits as a residue class (1 mod 4 and a stride of 3 make 9 mod 12), and the intervals give the
+  known bits their bounds' common high bits and the stride's factor of two as low bits (3, 7, 11,
+  15 all end in `11`). Strides follow arithmetic where it is exact: sums, differences, products,
+  shifts, division and remainder by a constant, complements, negations, extensions,
+  concatenations and selects. So `(x & 31) * 12 == 100` is false, and `urem((x & 31) * 12, 3)`
+  and `urem((x & 7) * 6 + 1, 3)` are 0 and 1, which bitwright left as they were. The reduction
+  runs on one or two machine words up to 128 bits (checked against the general code), so facts
+  take about half the instructions they did: `facts/cold` −47 to −54 % at 8 to 128 bits,
+  `facts/prove/64` −53 %, `constraints/facts-under/64` −45 %, `simplify/standard` −5.5 %;
+  512-bit facts cost 18 % more. Cached facts are seven words instead of six.
+- **Behavior changes.** Results change where a stride decides a comparison, a remainder or a
+  mask that known bits and plain ranges left open. On the generated corpora of `--corpus-diff`
+  and on the identity sets of `compare/facts/` the results are the same as before.
+  `URange::contains`, `meet` and `join` respect the stride; `URange::new` is still a plain
+  interval (stride 1).
 - **Removed.** The `cobra` feature and its backend over the `cobra-mba` crate (`CobraSolver`,
   `CobraOptions`). bitwright's own `NormalFormSolver` answers, on its own evidence, every
   expression of CoBRA's datasets that CoBRA does. A host that wants another backend implements

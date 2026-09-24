@@ -11,7 +11,7 @@ use super::known::{
     KnownBits, bv_add, bv_and, bv_lshr, bv_not, bv_or, bv_shl, bv_xor, count_ones, high_mask,
     leading_zeros, low_mask, trailing_zeros,
 };
-use super::range::{SRange, URange, sle, slt, ule, ult};
+use super::range::{SRange, URange, gcd, rem, sle, slt, ule, ult};
 use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::{BitVec, Width};
 
@@ -36,6 +36,48 @@ pub(crate) enum TOp {
 
 fn small(w: Width, v: u64) -> BitVec {
     BitVec::wrapping_from_u64(w, v)
+}
+
+// ----- strides ---------------------------------------------------------------------------------
+
+/// A stride dividing `g` that fits in 64 bits: `g` itself, or its largest power of two that fits.
+fn fit(g: u128) -> u64 {
+    u64::try_from(g).unwrap_or(1 << g.trailing_zeros().min(63))
+}
+
+fn gcd128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// A stride of `stride · 2^c` (0 stays 0).
+fn stride_shl(stride: u64, c: u32) -> u64 {
+    if stride == 0 {
+        0
+    } else if c < 64 && u128::from(stride) << c <= u128::from(u64::MAX) {
+        stride << c
+    } else {
+        1 << (stride.trailing_zeros() + c).min(63)
+    }
+}
+
+/// `2^c mod m` (`m >= 1`).
+fn pow2_mod(c: u32, m: u64) -> u64 {
+    let m = u128::from(m);
+    let mut r = 1 % m;
+    for _ in 0..c {
+        r = (r * 2) % m;
+    }
+    r as u64
+}
+
+/// `[lo, hi]` by `stride`, or the plain interval if that is not a strided interval.
+fn strided(lo: BitVec, hi: BitVec, stride: u64, full: URange) -> URange {
+    URange::strided(lo, hi, stride)
+        .or_else(|| URange::new(lo, hi))
+        .unwrap_or(full)
 }
 
 /// The facts of a value in `[lo, hi]` (unsigned), with known bits from the common prefix.
@@ -161,7 +203,12 @@ fn unary(op: UnOp, a: &Facts) -> Facts {
     let wb = u64::from(w.bits());
     match op {
         UnOp::Not => {
-            let u = URange::new(bv_not(&a.urange.hi()), bv_not(&a.urange.lo()));
+            // ~x = ones − x: the order reverses, the spacing stays.
+            let u = URange::strided(
+                bv_not(&a.urange.hi()),
+                bv_not(&a.urange.lo()),
+                a.urange.stride(),
+            );
             let s = SRange::new(bv_not(&a.srange.hi()), bv_not(&a.srange.lo()));
             Facts::reduce(
                 kb_not(&a.known),
@@ -180,7 +227,13 @@ fn unary(op: UnOp, a: &Facts) -> Facts {
             let u = if a.urange.lo().is_zero() && a.urange.hi().is_zero() {
                 URange::constant(&BitVec::zero(w))
             } else if !a.urange.lo().is_zero() {
-                URange::new(neg(&a.urange.hi()), neg(&a.urange.lo())).unwrap_or(URange::full(w))
+                // −x = 2^W − x for x ≠ 0: the order reverses, the spacing stays.
+                strided(
+                    neg(&a.urange.hi()),
+                    neg(&a.urange.lo()),
+                    a.urange.stride(),
+                    URange::full(w),
+                )
             } else {
                 URange::full(w)
             };
@@ -247,15 +300,22 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 kb_add_carry(&a.known, &kb_not(&b.known), true)
             };
             let (au, bu, as_, bs) = (a.urange, b.urange, a.srange, b.srange);
+            // Without wrap-around, a sum or difference of members steps by the strides' gcd.
+            let stride = gcd(au.stride(), bu.stride());
             let u = if op == BinOp::Add {
                 let hi = bin(&au.hi(), &bu.hi());
                 if ule(&au.hi(), &hi) {
-                    URange::new(bin(&au.lo(), &bu.lo()), hi).unwrap_or(full_u)
+                    strided(bin(&au.lo(), &bu.lo()), hi, stride, full_u)
                 } else {
                     full_u
                 }
             } else if ule(&bu.hi(), &au.lo()) {
-                URange::new(bin(&au.lo(), &bu.hi()), bin(&au.hi(), &bu.lo())).unwrap_or(full_u)
+                strided(
+                    bin(&au.lo(), &bu.hi()),
+                    bin(&au.hi(), &bu.lo()),
+                    stride,
+                    full_u,
+                )
             } else {
                 full_u
             };
@@ -280,7 +340,21 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
             let known = kb_mul(&a.known, &b.known);
             let (au, bu) = (a.urange, b.urange);
             let u = if BitVec::bin_unchecked(BinOp::UMulHi, &au.hi(), &bu.hi()).is_zero() {
-                URange::new(bin(&au.lo(), &bu.lo()), bin(&au.hi(), &bu.hi())).unwrap_or(full_u)
+                // (la + i·sa)(lb + j·sb) − la·lb is a multiple of gcd(la·sb, lb·sa, sa·sb).
+                let (sa, sb) = (u128::from(au.stride()), u128::from(bu.stride()));
+                let stride = match (au.lo().to_u64(), bu.lo().to_u64()) {
+                    (Some(la), Some(lb)) => fit(gcd128(
+                        gcd128(u128::from(la) * sb, u128::from(lb) * sa),
+                        sa * sb,
+                    )),
+                    _ => 1,
+                };
+                strided(
+                    bin(&au.lo(), &bu.lo()),
+                    bin(&au.hi(), &bu.hi()),
+                    stride,
+                    full_u,
+                )
             } else {
                 full_u
             };
@@ -304,6 +378,15 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 bin(&au.hi(), &bu.lo())
             };
             let mut f = from_urange(lo, hi);
+            // Members spaced by a multiple of the divisor divide to members spaced by the
+            // quotient: (lo + i·s) / d = lo / d + i·(s / d) when d divides s.
+            if let Some(d) = b.known.as_constant().and_then(|d| d.to_u64())
+                && d > 0
+                && au.stride().is_multiple_of(d)
+                && let Some(u) = URange::strided(lo, hi, au.stride() / d)
+            {
+                f = f.meet_urange(&u).unwrap_or(f);
+            }
             // Division by a known power of two is a right shift.
             if let Some(c) = b.known.as_constant()
                 && count_ones(&c) == 1
@@ -324,6 +407,15 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 }
             }
             let mut f = from_urange(BitVec::zero(w), hi);
+            // Every remainder by d is congruent to `lo` modulo gcd(stride, d).
+            if let Some(d) = b.known.as_constant().and_then(|d| d.to_u64())
+                && d > 0
+            {
+                let g = gcd(au.stride(), d);
+                if let Some(u) = f.urange.meet_class(rem(&au.lo(), g), g) {
+                    f = f.meet_urange(&u).unwrap_or(f);
+                }
+            }
             if let Some(c) = b.known.as_constant()
                 && count_ones(&c) == 1
             {
@@ -514,10 +606,20 @@ fn shift_ranges(op: BinOp, a: &Facts, c: u32) -> (URange, SRange) {
     let cc = small(w, u64::from(c.min(wb - 1)));
     let sh = |v: &BitVec| BitVec::bin_unchecked(op, v, &cc);
     match op {
-        BinOp::LShr => (
-            URange::new(sh(&a.urange.lo()), sh(&a.urange.hi())).unwrap_or(fu),
-            fs,
-        ),
+        BinOp::LShr => {
+            // Members spaced by a multiple of 2^c keep their low c bits, so they shift apart
+            // evenly.
+            let s = a.urange.stride();
+            let stride = if s != 0 && s.trailing_zeros() >= c {
+                s >> c
+            } else {
+                1
+            };
+            (
+                strided(sh(&a.urange.lo()), sh(&a.urange.hi()), stride, fu),
+                fs,
+            )
+        }
         BinOp::AShr => (
             fu,
             SRange::new(sh(&a.srange.lo()), sh(&a.srange.hi())).unwrap_or(fs),
@@ -526,7 +628,8 @@ fn shift_ranges(op: BinOp, a: &Facts, c: u32) -> (URange, SRange) {
             // Monotone while the largest value does not lose bits.
             let hi = sh(&a.urange.hi());
             if bv_lshr(&hi, c) == a.urange.hi() {
-                (URange::new(sh(&a.urange.lo()), hi).unwrap_or(fu), fs)
+                let stride = stride_shl(a.urange.stride(), c);
+                (strided(sh(&a.urange.lo()), hi, stride, fu), fs)
             } else {
                 (fu, fs)
             }
@@ -760,7 +863,12 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
                 ),
                 z(&a.known.known_one()),
             );
-            let u = URange::new(z(&a.urange.lo()), z(&a.urange.hi())).unwrap_or(URange::full(to));
+            let u = strided(
+                z(&a.urange.lo()),
+                z(&a.urange.hi()),
+                a.urange.stride(),
+                URange::full(to),
+            );
             let s = SRange::new(u.lo(), u.hi()).unwrap_or(SRange::full(to));
             Facts::reduce(known, u, s).unwrap_or_else(|| Facts::top(to))
         }
@@ -779,7 +887,8 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
             // A low truncation of a value that already fits keeps its range.
             if lo == 0
                 && bv_lshr(&a.urange.hi(), u32::from(width.bits())).is_zero()
-                && let Some(u) = URange::new(x(&a.urange.lo()), x(&a.urange.hi()))
+                && let Some(u) =
+                    URange::strided(x(&a.urange.lo()), x(&a.urange.hi()), a.urange.stride())
             {
                 f = f.meet_urange(&u).unwrap_or(f);
             }
@@ -797,7 +906,16 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
                 return Facts::top(Width::W1);
             };
             let w = z.width();
-            let u = URange::new(lo, hi).unwrap_or(URange::full(w));
+            // hi·2^L + lo steps by gcd(stride_hi·2^L, stride_lo).
+            let (sh, sl) = (h.urange.stride(), l.urange.stride());
+            let lw = u32::from(l.width().bits());
+            let stride = if sl == 0 {
+                stride_shl(sh, lw)
+            } else {
+                let shifted = u128::from(sh % sl) * u128::from(pow2_mod(lw, sl));
+                gcd(sl, (shifted % u128::from(sl)) as u64)
+            };
+            let u = strided(lo, hi, stride, URange::full(w));
             Facts::reduce(KnownBits::from_masks(z, o), u, SRange::full(w))
                 .unwrap_or_else(|| Facts::top(w))
         }

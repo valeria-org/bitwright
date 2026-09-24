@@ -233,6 +233,78 @@ impl KnownBits {
         trailing_zeros(&self.unknown_mask())
     }
 
+    /// The smallest consistent value `>=u lo`, if there is one.
+    pub(crate) fn next_member(&self, lo: &BitVec) -> Option<BitVec> {
+        let w = self.width();
+        let wb = u32::from(w.bits());
+        // Where `lo` disagrees with the knowledge; the highest such bit decides.
+        let bad = bv_or(&bv_and(lo, &self.zero), &bv_and(&bv_not(lo), &self.one));
+        if bad.is_zero() {
+            return Some(*lo);
+        }
+        let i = wb - 1 - leading_zeros(&bad);
+        // `lo`'s bits above `p`, the bit `p` set, and the least consistent bits below `p`.
+        let raise = |p: u32| {
+            let above = bv_and(lo, &high_mask(w, wb - 1 - p));
+            let below = bv_and(&self.one, &low_mask(w, p));
+            bv_or(&bv_or(&above, &bv_shl(&BitVec::one(w), p)), &below)
+        };
+        if lo.bit(i as u16) == Some(false) {
+            // A bit that must be 1: set it.
+            return Some(raise(i));
+        }
+        // A bit that must be 0: the value has to grow above it, at the lowest free bit that
+        // `lo` leaves clear.
+        let free = bv_not(&self.known());
+        let room = bv_and(&bv_and(&bv_not(lo), &free), &high_mask(w, wb - 1 - i));
+        (!room.is_zero()).then(|| raise(trailing_zeros(&room)))
+    }
+
+    /// The largest consistent value `<=u hi`, if there is one.
+    pub(crate) fn prev_member(&self, hi: &BitVec) -> Option<BitVec> {
+        let w = self.width();
+        let wb = u32::from(w.bits());
+        let bad = bv_or(&bv_and(hi, &self.zero), &bv_and(&bv_not(hi), &self.one));
+        if bad.is_zero() {
+            return Some(*hi);
+        }
+        let i = wb - 1 - leading_zeros(&bad);
+        // `hi`'s bits above `p`, the bit `p` clear, and the greatest consistent bits below `p`.
+        let lower = |p: u32| {
+            let above = bv_and(hi, &high_mask(w, wb - 1 - p));
+            bv_or(&above, &bv_and(&bv_not(&self.zero), &low_mask(w, p)))
+        };
+        if hi.bit(i as u16) == Some(true) {
+            // A bit that must be 0: clear it.
+            return Some(lower(i));
+        }
+        // A bit that must be 1: the value has to shrink above it, at the lowest free bit that
+        // `hi` sets.
+        let free = bv_not(&self.known());
+        let room = bv_and(&bv_and(hi, &free), &high_mask(w, wb - 1 - i));
+        (!room.is_zero()).then(|| lower(trailing_zeros(&room)))
+    }
+
+    /// The same knowledge with the sign bit's value flipped: `v` is consistent with `self`
+    /// exactly when `v ^ smin` is consistent with the result (signed order read as unsigned).
+    pub(crate) fn sign_flipped(&self) -> KnownBits {
+        let sign = BitVec::smin(self.width());
+        let keep = bv_not(&sign);
+        KnownBits {
+            zero: bv_or(&bv_and(&self.zero, &keep), &bv_and(&self.one, &sign)),
+            one: bv_or(&bv_and(&self.one, &keep), &bv_and(&self.zero, &sign)),
+        }
+    }
+
+    /// The low `k` bits of `v`, known.
+    pub(crate) fn low_bits_of(v: &BitVec, k: u32) -> KnownBits {
+        let m = low_mask(v.width(), k);
+        KnownBits {
+            zero: bv_and(&bv_not(v), &m),
+            one: bv_and(v, &m),
+        }
+    }
+
     /// Enumerates every consistent value if there are at most `2^max_unknown_bits` (and at
     /// most 2^20 in any case).
     pub fn enumerate(&self, max_unknown_bits: u32) -> Option<Vec<BitVec>> {

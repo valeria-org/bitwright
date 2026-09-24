@@ -8,7 +8,7 @@ bitwright is a Rust library for **fixed-width bit-vector expressions**. It provi
 
 - an exact bit-vector value type, 1..=512 bits;
 - a hash-consed, context-owned expression arena with construction-time canonicalization;
-- bit-level facts (known bits, unsigned and signed ranges) and tri-state proofs;
+- bit-level facts (known bits, an unsigned strided interval, a signed range) and tri-state proofs;
 - a directed simplifier built from normal-form passes plus a small rule corpus;
 - a rule language (`.bwr`) with a mandatory, machine-checked soundness gate;
 - optional services, off by default: MBA (mixed boolean-arithmetic) simplification with pluggable
@@ -286,8 +286,9 @@ pub struct Expr { index: u32, tag: NonZeroU32 }     // tag: unique per context g
 Constants of ≤ 128 bits live in a `u128` pool; wider constants in a limb pool. Extension arguments live in
 an argument pool. About 32 bytes per node plus the interner slot. Facts, memo and pass products are
 separate side tables, allocated lazily. A `BitVec` takes 72 bytes whatever its width (a `Facts`,
-six of them, 432), so the tables that hold a value per node pack widths up to 64 into words: base
-facts are six words per node (the known bits and both ranges' bounds) in computation order, found
+six of them and a stride, 440), so the tables that hold a value per node pack widths up to 64 into
+words: base facts are seven words per node (the known bits, both ranges' bounds and the stride) in
+computation order, found
 through a slot per node index; facts under assumptions and the linear and xor passes' forms are
 packed the same way; the rewrite memo keeps result nodes in pages of 512 node indices per phase,
 with the constraints a result relied on apart (there are none without assumptions). Wider values
@@ -386,7 +387,8 @@ key has exactly one width per context; asking for another width is `Error::Symbo
 
 ```rust
 pub struct KnownBits { width: Width, zero: [u64; 8], one: [u64; 8] }   // zero & one == 0
-pub struct URange { lo: BitVec, hi: BitVec }                            // non-wrapping, lo ≤ hi
+pub struct URange { lo: BitVec, hi: BitVec, stride: u64 }               // lo, lo + stride, …, hi; no wrap
+                                                                         // (stride 0 iff lo = hi, else it divides hi − lo)
 pub struct SRange { lo: BitVec, hi: BitVec }                            // signed order
 pub struct Facts { /* private: known, urange, srange — always mutually reduced */ }
 impl Facts { pub fn new(k: KnownBits, u: URange, s: SRange) -> Option<Facts>;   // width-checked
@@ -417,7 +419,21 @@ impl Context {
   A node is cached only when its transfer completed; reaching the cap answers a sound `top`, and the
   next query for the same expression resumes from a saved post-order, so total work stays linear.
 - **Fact queries never allocate arena nodes.** The fact engine borrows the arena immutably.
-- **Reduced product.** After every transfer, known bits refine ranges and ranges refine known bits.
+- **Reduced product.** After every transfer, known bits refine the intervals and the intervals refine
+  known bits, until nothing changes (at most three rounds). Known bits move each end of both
+  intervals to the nearest value they allow (the odd values in `[4, 10]` are `[5, 9]` by 2), and their
+  known low bits are a residue class that the stride's class is intersected with (Chinese remainder
+  theorem: 1 mod 4 and 0 mod 3 make 9 mod 12); the intervals give the known bits their bounds' common
+  high bits, and the stride's factor `2^a` the low `a` bits. An interval on one side of the sign
+  boundary is both an unsigned and a signed one. The steps run on one or two machine words up to 128
+  bits (the same results as the `BitVec` code, which a test checks), which made the facts about twice
+  as fast there as the range-only product before strides; 512-bit facts cost 18 % more.
+- **Strides** follow arithmetic where it is exact: sums and differences step by the operands' gcd,
+  products by `gcd(lo_a·s_b, lo_b·s_a, s_a·s_b)`, left shifts by `s·2^c`, right shifts and divisions by
+  a constant that divides the stride by the quotient; a remainder by `d` keeps the class modulo
+  `gcd(s, d)`; complements, negations, extensions and low extractions keep the stride, a select
+  joins (`gcd` of both strides and the distance of their lower bounds), a concatenation steps by
+  `gcd(s_hi·2^L, s_lo)`. Strides are 64-bit; one that does not fit is replaced by a divisor that does.
 - **Transfers** for every kind, each exhaustively tested at W ≤ 4 over all known-bit input states and
   sampled above: carry-propagating add/sub; multiply low bits and trailing zeros; multiply-high leading
   zeros from ranges; division and remainder by constants and by ranges; shifts and rotates by constant
