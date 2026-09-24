@@ -29,6 +29,21 @@
   operators without allocating. Against 0.8.0 (instructions): `expr/build` −3 %, `expr/eval` −8
   %, `expr/substitute` −7 %, `simplify/standard` −1.3 %, `facts/cold` −0.8 %,
   `service/smt-import` −1.3 %.
+- **Comparisons through functions, and of floats.** The compares pass combines comparisons of
+  different terms when one is a function of the other it can invert on intervals (`x + k`,
+  `k − x`, `−x`, `~x`, `x ^ smin`, `x & (2^j − 1)`, `x | smin`, extensions): so
+  `(x - 4 <=u 5) | (x == 10)` is `x - 4 <=u 6`, and the floating-point classification tests,
+  which compare `x & ~sign` or `x ^ sign`, combine on `x` (`fp.iszero(x) & fp.isnormal(x)` is
+  false, the five classes cover every encoding). A floating-point comparison with a constant is
+  a set of encodings and joins them, and two floats stand in one of six relations (equal, less,
+  greater, unordered by either or both), of which every comparison of the two and the NaN test
+  of either is a set: x86's `ucomiss` flags combined for `ja`, `jae`, `jb`, `jbe` come back as
+  one comparison, `fp.lt(x, y) & fp.lt(y, x)` is false. A set is emitted as one integer or
+  float comparison (or a negated one) when that is smaller.
+- **Behavior changes.** Results change where comparisons of related terms decide together: on a
+  generated corpus of 4,000 combinations of comparisons, 214 results are smaller and none is
+  larger; generated random DAGs and the integer identity sets of `compare/facts/` give the same
+  results as 0.8.0.
 
 ## 0.8.0
 

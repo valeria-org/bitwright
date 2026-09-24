@@ -6,6 +6,7 @@ use crate::engine::{Budget, End, Engine, Hooks, Phase, Run, Strategy, Verify};
 use crate::testutil::{Gen, Rng};
 use crate::{
     Assumptions, BinOp, BitVec, CmpOpExt, Context, Expr, FnEnv, ParseOptions, UnOp, Width,
+    fp::FpFormat,
 };
 
 /// An engine running `phases` with the default verification: the tests' own equivalence
@@ -738,6 +739,294 @@ fn compares_fixtures() {
     same("(x <u y) ^ (x <s y)", "x != y", 1);
     // Different pairs are left alone.
     same("(x <u y) & (x <u z)", "(x <u y) & (x <u z)", 8);
+    // Comparisons of functions of x combine on x.
+    same("(x - 4 <=u 5) | (x == 10)", "x - 4 <=u 6", 8);
+    same("(x + 3 <u 5) & (x == 1)", "x == 1", 8);
+    same("((x & 0x7f) == 0) & (x <u 0x80)", "x == 0", 8);
+    same("(~x <u 10) | (x <u 10)", "x - 246 <=u 19", 8);
+    same("((x ^ 0x80) <u 0x10) | (x - 0x90 <u 0x10)", "x <=s 0x9f", 8);
+    same("(-x == 3) & (x == 5)", "false", 8);
+    same("((x | 0x80) == 0x85) ^ (x == 5)", "x == 0x85", 8);
+    same("(x + 1 == 0) | (x + 1 == 1)", "x - 255 <=u 1", 8);
+}
+
+/// Comparisons of `x`, of functions of it that the pass sees through, and of extensions of a
+/// narrower `v`, combined.
+fn peeled_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
+    use crate::CmpOpExt;
+    let width = Width::new(w).unwrap();
+    if depth == 0 || g.rng.chance(1, 4) {
+        let x = cx.symbol("x", width).unwrap();
+        let k = g.constant(w);
+        let k = cx.constant(&k).unwrap();
+        let low = BitVec::wrapping_from_u64(width, (1 << g.rng.below(u64::from(w.min(63)))) - 1);
+        let low = cx.constant(&low).unwrap();
+        let smin = cx.constant(&BitVec::smin(width)).unwrap();
+        let v = || Width::new(w - 1).unwrap();
+        let t = match g.rng.below(11) {
+            0 => x,
+            1 => cx.bin(BinOp::Add, x, k).unwrap(),
+            2 => cx.bin(BinOp::Sub, k, x).unwrap(),
+            3 => cx.un(UnOp::Neg, x).unwrap(),
+            4 => cx.un(UnOp::Not, x).unwrap(),
+            5 => cx.bin(BinOp::Xor, x, smin).unwrap(),
+            6 => cx.bin(BinOp::And, x, low).unwrap(),
+            7 => cx.bin(BinOp::Or, x, smin).unwrap(),
+            8 if w > 1 => {
+                let v = cx.symbol("v", v()).unwrap();
+                cx.zext(v, width).unwrap()
+            }
+            9 if w > 1 => {
+                let v = cx.symbol("v", v()).unwrap();
+                cx.sext(v, width).unwrap()
+            }
+            _ => {
+                let s = cx.bin(BinOp::Sub, x, k).unwrap();
+                cx.bin(BinOp::And, s, low).unwrap()
+            }
+        };
+        let op = CmpOpExt::ALL[g.rng.below(10) as usize];
+        let c = g.constant(w);
+        let c = cx.constant(&c).unwrap();
+        return if g.rng.chance(1, 2) {
+            cx.cmp(op, t, c).unwrap()
+        } else {
+            cx.cmp(op, c, t).unwrap()
+        };
+    }
+    let d = depth - 1;
+    match g.rng.below(4) {
+        0 => {
+            let x = peeled_expr(g, cx, w, d);
+            cx.un(UnOp::Not, x).unwrap()
+        }
+        k => {
+            let x = peeled_expr(g, cx, w, d);
+            let y = peeled_expr(g, cx, w, d);
+            cx.bin([BinOp::And, BinOp::Or, BinOp::Xor][(k - 1) as usize], x, y)
+                .unwrap()
+        }
+    }
+}
+
+#[test]
+fn compares_through_functions_is_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0xc0_3f);
+    let mut rng = Rng(45);
+    let mut changed = 0;
+    for i in 0..3000 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            [8, 32, 64, 128][g.rng.below(4) as usize]
+        } else {
+            2 + g.rng.below(6) as u16
+        };
+        let e = peeled_expr(&mut g, &mut cx, w, 3);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {} to {}",
+            cx.display(r.expr),
+            cx.display(again.roots[0].expr)
+        );
+    }
+    assert!(changed > 600, "{changed}");
+}
+
+/// A random boolean combination of float comparisons (of `x`, `y` and constants), float tests
+/// and integer comparisons of `x`, in format `f`.
+fn float_compare_expr(g: &mut Gen, cx: &mut Context, f: FpFormat, depth: u32) -> Expr {
+    use crate::fp::{FpCmpOp, FpTest};
+    let w = f.width();
+    if depth == 0 || g.rng.chance(1, 4) {
+        let operand = |g: &mut Gen, cx: &mut Context| match g.rng.below(5) {
+            0 | 1 => cx.symbol("x", w).unwrap(),
+            2 => cx.symbol("y", w).unwrap(),
+            _ => {
+                let v = match g.rng.below(6) {
+                    0 => f.zero(g.rng.chance(1, 2)),
+                    1 => f.inf(g.rng.chance(1, 2)),
+                    2 => f.nan(),
+                    _ => g.constant(w.bits()),
+                };
+                cx.constant(&v).unwrap()
+            }
+        };
+        return match g.rng.below(6) {
+            0..=2 => {
+                let op = [
+                    FpCmpOp::Eq,
+                    FpCmpOp::Lt,
+                    FpCmpOp::Le,
+                    FpCmpOp::Gt,
+                    FpCmpOp::Ge,
+                ][g.rng.below(5) as usize];
+                let a = operand(g, cx);
+                let b = operand(g, cx);
+                cx.fp_cmp(f, op, a, b).unwrap()
+            }
+            3 | 4 => {
+                let t = [
+                    FpTest::Nan,
+                    FpTest::Infinite,
+                    FpTest::Zero,
+                    FpTest::Subnormal,
+                    FpTest::Normal,
+                    FpTest::Negative,
+                    FpTest::Positive,
+                ][g.rng.below(7) as usize];
+                let a = if g.rng.chance(3, 4) { "x" } else { "y" };
+                let a = cx.symbol(a, w).unwrap();
+                cx.fp_test(f, t, a).unwrap()
+            }
+            _ => {
+                let op = CmpOpExt::ALL[g.rng.below(10) as usize];
+                let x = cx.symbol("x", w).unwrap();
+                let c = g.constant(w.bits());
+                let c = cx.constant(&c).unwrap();
+                cx.cmp(op, x, c).unwrap()
+            }
+        };
+    }
+    let d = depth - 1;
+    match g.rng.below(4) {
+        0 => {
+            let x = float_compare_expr(g, cx, f, d);
+            cx.un(UnOp::Not, x).unwrap()
+        }
+        k => {
+            let x = float_compare_expr(g, cx, f, d);
+            let y = float_compare_expr(g, cx, f, d);
+            cx.bin([BinOp::And, BinOp::Or, BinOp::Xor][(k - 1) as usize], x, y)
+                .unwrap()
+        }
+    }
+}
+
+#[test]
+fn compares_of_floats_is_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0xf1_0a7);
+    let mut rng = Rng(46);
+    let formats = [
+        (2, 2),
+        (2, 3),
+        (3, 2),
+        (2, 4),
+        (3, 3),
+        (4, 2),
+        (3, 4),
+        (5, 2),
+    ];
+    let mut changed = 0;
+    for i in 0..4000 {
+        let mut cx = Context::new();
+        let f = if i % 10 == 0 {
+            [FpFormat::F16, FpFormat::BF16, FpFormat::F32][g.rng.below(3) as usize]
+        } else {
+            let (eb, sb) = formats[g.rng.below(formats.len() as u64) as usize];
+            FpFormat::new(eb, sb).unwrap()
+        };
+        let e = float_compare_expr(&mut g, &mut cx, f, 3);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "{f:?}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {} to {}",
+            cx.display(r.expr),
+            cx.display(again.roots[0].expr)
+        );
+    }
+    assert!(changed > 800, "{changed}");
+}
+
+#[test]
+fn compares_of_floats_fixtures() {
+    let eng = engine(vec![Phase::Compares]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W32);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    // The classes and the signs cover every encoding; a zero is not normal.
+    same(
+        "fp.isnan.f32(x) | fp.isinf.f32(x) | fp.iszero.f32(x) | fp.isnormal.f32(x) \
+         | fp.issubnormal.f32(x)",
+        "true",
+    );
+    same(
+        "fp.isnan.f32(x) | fp.isneg.f32(x) | fp.ispos.f32(x)",
+        "true",
+    );
+    same("fp.iszero.f32(x) & fp.isnormal.f32(x)", "false");
+    same(
+        "fp.iszero.f32(x) | fp.issubnormal.f32(x)",
+        "x & 0x7fffffff <=u 0x7fffff",
+    );
+    same("fp.isnan.f32(x) | fp.isneg.f32(x)", "0x7f800001 <=u x");
+    // Two floats.
+    same("fp.lt.f32(x, y) & fp.lt.f32(y, x)", "false");
+    same("fp.lt.f32(x, y) | fp.eq.f32(x, y)", "fp.le.f32(x, y)");
+    same("fp.le.f32(x, y) & fp.ge.f32(x, y)", "fp.eq.f32(x, y)");
+    same("~fp.lt.f32(x, y) & ~fp.eq.f32(x, y)", "~fp.le.f32(x, y)");
+    // x86's flags after `ucomiss x, y`: ZF, PF, CF are equal, unordered, less, each or
+    // unordered; `ja`, `jae`, `jb`, `jbe` test them.
+    let unordered = "(fp.isnan.f32(x) | fp.isnan.f32(y))";
+    let cf = format!("(fp.lt.f32(x, y) | {unordered})");
+    let zf = format!("(fp.eq.f32(x, y) | {unordered})");
+    same(&format!("~{cf} & ~{zf}"), "fp.lt.f32(y, x)");
+    same(&format!("~{cf}"), "fp.le.f32(y, x)");
+    same(&cf, "~fp.le.f32(y, x)");
+    same(&format!("{cf} | {zf}"), "~fp.lt.f32(y, x)");
+    // A float against constants: 1.0 is 0x3f800000.
+    same(
+        "fp.lt.f32(x, 0x3f800000) | fp.eq.f32(x, 0x3f800000)",
+        "fp.le.f32(x, 0x3f800000)",
+    );
+    same(
+        "fp.isnan.f32(x) | fp.le.f32(x, 0x3f800000)",
+        "~fp.lt.f32(0x3f800000, x)",
+    );
+    same(
+        "fp.lt.f32(x, 0x3f800000) & ~fp.isnan.f32(x)",
+        "fp.lt.f32(x, 0x3f800000)",
+    );
+    same(
+        "fp.le.f32(x, 0x3f7fffff) & ~fp.isnan.f32(x)",
+        "fp.lt.f32(x, 0x3f800000)",
+    );
+    same("fp.lt.f32(x, 0) | fp.iszero.f32(x)", "fp.le.f32(x, 0)");
+    same("fp.lt.f32(0, x) | fp.iszero.f32(x)", "fp.le.f32(0, x)");
+    same(
+        "fp.lt.f32(x, 0x3f800000) & fp.lt.f32(0x40000000, x)",
+        "false",
+    );
+    same("fp.isinf.f32(x) & fp.lt.f32(x, 0)", "x == 0xff800000");
 }
 
 // ----- casts --------------------------------------------------------------------------------------
