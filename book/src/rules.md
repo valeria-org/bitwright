@@ -89,8 +89,8 @@ format (`fp.mul.rne.f32(x, y)`) needs no width variables. A rounding-mode parame
 (`fp.mul.r<E, S>(…)`), and the template can use it. A rule has at most two.
 
 Constants are written `fp.zero`, `fp.nzero` (−0), `fp.inf`, `fp.ninf`, `fp.nan`, `fp.one`,
-`fp.none` (−1), `fp.two`, `fp.half`, `fp.min_normal`, `fp.min_subnormal` and `fp.max` (the
-largest finite value), each with its format: `fp.one<E, S>`, `fp.inf.f64`. The operations the
+`fp.none` (−1), `fp.two`, `fp.half`, `fp.min_normal`, `fp.min_subnormal` and `fp.max_finite`
+(the largest finite value), each with its format: `fp.one<E, S>`, `fp.inf.f64`. The operations the
 builder makes from other operators (`fp.neg`, `fp.abs`, `fp.copysign`, `fp.sub`, `fp.gt`,
 `fp.ge` and the tests `fp.isnan` …) are written out as the builder writes them, so a pattern
 of them matches what it builds. They have no floating-point node of their own, so a pattern

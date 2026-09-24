@@ -2017,7 +2017,7 @@ fn float_lit(name: &str) -> Option<FloatLit> {
         "half" => FloatLit::Half,
         "min_normal" => FloatLit::MinNormal,
         "min_subnormal" => FloatLit::MinSubnormal,
-        "max" => FloatLit::MaxFinite,
+        "max_finite" => FloatLit::MaxFinite,
         _ => return None,
     })
 }

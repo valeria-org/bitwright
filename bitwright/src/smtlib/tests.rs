@@ -794,12 +794,40 @@ fn programs() -> Vec<RuleProgram> {
 /// Width assignments to check: admitted, every width in a fixed set, at most `cap` of them.
 fn assignments(rule: &crate::rules::Rule, cap: usize) -> Vec<Vec<u16>> {
     const SET: &[u16] = &[1, 2, 3, 4, 5, 7, 8, 13, 16, 32, 33, 64, 65, 128, 256, 512];
+    let n = rule.width_vars.len();
+    // A floating-point rule over (E, S): the standard formats (the ones Bitwuzla has), and a
+    // small one.
+    let float = n == 2
+        && rule
+            .nodes
+            .iter()
+            .any(|node| matches!(node, crate::rules::RNode::Fp(_)));
+    let formats: &[[u16; 2]] = &[[5, 11], [8, 24], [11, 53], [15, 113], [3, 4]];
     let all: Vec<Vec<u16>> = crate::rules::compile::width_assignments(rule)
         .into_iter()
-        .filter(|ws| ws.iter().all(|w| SET.contains(w)) && rule.admits(ws))
+        .filter(|ws| {
+            let widths = &ws[..n];
+            let chosen = if float {
+                formats.iter().any(|f| widths == f)
+            } else {
+                widths.iter().all(|w| SET.contains(w))
+            };
+            chosen && rule.admits(ws)
+        })
         .collect();
     let stride = all.len().div_ceil(cap).max(1);
     all.into_iter().step_by(stride).collect()
+}
+
+/// Whether an obligation's floating-point formats are all ones Bitwuzla has (binary16, 32, 64
+/// and 128, without its experimental formats).
+fn bitwuzla_formats(script: &str) -> bool {
+    script.match_indices("(_ to_fp ").all(|(i, _)| {
+        let rest = &script[i + 9..];
+        ["5 11)", "8 24)", "11 53)", "15 113)"]
+            .iter()
+            .any(|f| rest.starts_with(f))
+    })
 }
 
 #[test]
@@ -895,7 +923,14 @@ fn solver_proves_the_built_in_rules(solver: Solver) {
         for _ in 0..workers.min(jobs.len()) {
             s.spawn(|| {
                 while let Some(&i) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let _ = answers[i].set(solver.run(&jobs[i].1, Some(60_000)));
+                    // A format Bitwuzla does not have proves nothing either way.
+                    let answer =
+                        if matches!(solver, Solver::Bitwuzla) && !bitwuzla_formats(&jobs[i].1) {
+                            Some("skipped".to_string())
+                        } else {
+                            solver.run(&jobs[i].1, Some(60_000))
+                        };
+                    let _ = answers[i].set(answer);
                 }
             });
         }
@@ -911,6 +946,7 @@ fn solver_proves_the_built_in_rules(solver: Solver) {
             let ws = &jobs[i].0;
             let answer = answers[i].get().cloned().flatten().unwrap();
             match (answer.as_str(), *unsound) {
+                ("skipped", _) => {}
                 ("unsat", false) => proved += 1,
                 ("sat", true) => refuted = true,
                 ("unsat", true) => {}

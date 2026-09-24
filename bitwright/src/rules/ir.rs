@@ -267,7 +267,7 @@ pub enum FloatLit {
     MinNormal,
     /// `fp.min_subnormal`: the smallest positive value.
     MinSubnormal,
-    /// `fp.max`: the largest finite value.
+    /// `fp.max_finite`: the largest finite value.
     MaxFinite,
 }
 

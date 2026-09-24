@@ -1740,6 +1740,126 @@ rule add_aligned_to_concat<H, L>(a: H + L, x: H + L, c: const L) where H + L <= 
 
 - `(q << 4) + concat(extract<4,4>(p), 15:4)` → `concat(trunc<4>(q) + extract<4,4>(p), 15:4)`
 
+### core.float
+
+#### `div_pow2` — rule
+
+Dividing by a power of two is multiplying by its reciprocal when that is a normal
+number: the two are the same real number, rounded once in the same mode, so every result
+(a NaN, an infinity, the sign of a zero, an underflow) is the same. Not by ½: the
+builder writes `x · 2` as `x + x`, which is not smaller.
+
+```text
+rule div_pow2<E, S>(x: E + S, c: const E + S, r: rm) {
+        fp.div.r<E, S>(x, c) => fp.mul.r<E, S>(x, k)
+        if (c & lowmask(S - 1)) == 0 && (c & smax_lit) != 0 && (c & smax_lit) <u fp.inf<E, S>
+            && m >=u fp.min_normal<E, S> && m != fp.two<E, S>
+        let m: E + S = fp.one<E, S> + fp.one<E, S> - (c & smax_lit)
+        let k: E + S = (c & smin_lit) | m
+    }
+```
+
+- `fp.div.rne.f32(p:32, 0x40800000)` → `fp.mul.rne.f32(p:32, 0x3e800000)`
+
+#### `mul_one` — rule
+
+`x · 1` is `x` for every number.
+
+```text
+rule mul_one<E, S>(x: E + S, r: rm) {
+        fp.mul.r<E, S>(x, fp.one<E, S>) => x if fp.not_nan<E, S>(x)
+    }
+```
+
+- `fp.mul.rne.f64(fp.from_sbv.rne.f64(i:32), 0x3ff0000000000000)` → `fp.from_sbv.rne.f64(i:32)`
+
+#### `mul_neg_one` — rule
+
+`x · −1` is `−x` for every number.
+
+```text
+rule mul_neg_one<E, S>(x: E + S, r: rm) {
+        fp.mul.r<E, S>(x, fp.none<E, S>) => fp.neg<E, S>(x) if fp.not_nan<E, S>(x)
+    }
+```
+
+- `fp.mul.rtz.f64(fp.from_sbv.rne.f64(i:32), 0xbff0000000000000)` → `fp.from_sbv.rne.f64(i:32) ^ 0x8000000000000000`
+
+#### `add_zero` — rule
+
+Adding +0 to a nonzero number changes nothing, in every mode.
+
+```text
+rule add_zero<E, S>(x: E + S, r: rm) {
+        fp.add.r<E, S>(x, fp.zero<E, S>) => x if fp.not_nan<E, S>(x) && fp.nonzero<E, S>(x)
+    }
+```
+
+- `fp.add.rtp.f32(fp.from_ubv.rne.f32(i:8 | 1), 0)` → `fp.from_ubv.rne.f32(i:8 | 1)`
+
+#### `add_neg_zero` — rule
+
+Adding −0 to a nonzero number changes nothing, in every mode.
+
+```text
+rule add_neg_zero<E, S>(x: E + S, r: rm) {
+        fp.add.r<E, S>(x, fp.nzero<E, S>) => x if fp.not_nan<E, S>(x) && fp.nonzero<E, S>(x)
+    }
+```
+
+- `fp.add.rtn.f32(fp.from_ubv.rne.f32(i:8 | 1), 0x80000000)` → `fp.from_ubv.rne.f32(i:8 | 1)`
+
+#### `add_neg_zero_rne` — rule
+
+To nearest even, adding −0 changes no number, a zero included (−0 + −0 is −0,
++0 + −0 is +0): `x − 0` is `x`.
+
+```text
+rule add_neg_zero_rne<E, S>(x: E + S) {
+        fp.add.rne<E, S>(x, fp.nzero<E, S>) => x if fp.not_nan<E, S>(x)
+    }
+```
+
+- `fp.sub.rne.f64(fp.from_sbv.rne.f64(i:32), 0)` → `fp.from_sbv.rne.f64(i:32)`
+
+#### `eq_self` — rule
+
+A number equals itself (a NaN does not).
+
+```text
+rule eq_self<E, S>(x: E + S) { fp.eq<E, S>(x, x) => true if fp.not_nan<E, S>(x) }
+```
+
+- `fp.eq.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `true`
+
+#### `le_self` — rule
+
+A number is at most itself.
+
+```text
+rule le_self<E, S>(x: E + S) { fp.le<E, S>(x, x) => true if fp.not_nan<E, S>(x) }
+```
+
+- `fp.le.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `true`
+
+#### `min_self` — rule
+
+A number is its own minimum and maximum.
+
+```text
+rule min_self<E, S>(x: E + S) { fp.min<E, S>(x, x) => x if fp.not_nan<E, S>(x) }
+```
+
+- `fp.min.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `fp.from_sbv.rne.f64(i:32)`
+
+#### `max_self` — rule
+
+```text
+rule max_self<E, S>(x: E + S) { fp.max<E, S>(x, x) => x if fp.not_nan<E, S>(x) }
+```
+
+- `fp.max.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `fp.from_sbv.rne.f64(i:32)`
+
 ## `eqsat.bwr`
 
 ### eqsat.assoc

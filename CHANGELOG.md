@@ -8,6 +8,13 @@
   proven. So identities that hold only on ordinary numbers are rules: `x · 1 = x` if `x` is
   not a NaN, `x / x = 1` if it is finite and nonzero. The checker, the SMT obligations and the
   engine (from the operand's facts, read as floats) answer them.
+- **Built-in floating-point rules.** A new group, `core.float`: division by a power of two is
+  multiplication by its reciprocal (exactly: the same real number, rounded once, so every
+  result is the same bit pattern), and on operands the facts show are numbers `x · 1` is `x`,
+  `x · −1` is `−x`, adding a zero to a nonzero number or `−0` to anything (to nearest even)
+  changes nothing, and `x == x`, `x <= x`, `min(x, x)`, `max(x, x)` fold. The rule catalog
+  lists them. The rule constant `fp.max` is `fp.max_finite`, as `fp.max` is the operation.
+- **Behavior changes.** Floating-point results change where the new rules apply.
 
 ## 0.9.0
 
