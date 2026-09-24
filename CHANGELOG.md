@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - **Floating-point guards.** Rules can ask the facts about a float: `fp.not_nan<E, S>(x)`,
   `fp.finite<E, S>(x)` and `fp.nonzero<E, S>(x)` are fact predicates (`FactPred::FpNotNan`,

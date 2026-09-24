@@ -86,7 +86,7 @@ const char *bw_last_error(void);
 /* The library's ABI version (`BW_ABI_VERSION` of the header it was built with). */
 uint32_t bw_abi_version(void);
 
-/* The bitwright version, e.g. "0.9.0". Static storage. */
+/* The bitwright version, e.g. "0.10.0". Static storage. */
 const char *bw_version(void);
 
 /* Releases a string returned by the library. Accepts NULL. */
