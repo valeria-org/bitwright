@@ -374,6 +374,21 @@ fn stale_and_foreign_handles_are_rejected() {
 }
 
 #[test]
+fn handle_bits_round_trip_and_forgeries_are_rejected() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W8).unwrap();
+    let e = cx.not(x).unwrap();
+    assert_ne!(e.to_bits(), 0);
+    assert_eq!(Expr::from_bits(e.to_bits()), Some(e));
+    assert_eq!(Expr::from_bits(0), None);
+    // Past the end of the arena, and with another tag.
+    let past = Expr::from_bits(e.to_bits() + 1).unwrap();
+    assert_eq!(cx.width(past), Err(Error::ForeignExpr));
+    let other = Expr::from_bits(e.to_bits() ^ 1 << 40).unwrap();
+    assert_eq!(cx.width(other), Err(Error::ForeignExpr));
+}
+
+#[test]
 fn symbols_have_one_width() {
     let mut cx = Context::new();
     let x = cx.symbol(7u64, Width::W8).unwrap();

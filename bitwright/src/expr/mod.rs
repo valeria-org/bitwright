@@ -51,6 +51,24 @@ impl Expr {
     pub fn index(self) -> u32 {
         self.index
     }
+
+    /// The handle as one integer, never 0, for hosts that keep handles outside Rust (the C and
+    /// Python bindings). [`Expr::from_bits`] reads it back.
+    #[inline]
+    pub fn to_bits(self) -> u64 {
+        u64::from(self.tag.get()) << 32 | u64::from(self.index)
+    }
+
+    /// The handle [`Expr::to_bits`] gave, or `None` for 0. Any other integer reads as a handle:
+    /// a context rejects one it did not create ([`Error::ForeignExpr`] or
+    /// [`Error::StaleExpr`]), like any other foreign handle.
+    #[inline]
+    pub fn from_bits(bits: u64) -> Option<Expr> {
+        Some(Expr {
+            index: bits as u32,
+            tag: NonZeroU32::new((bits >> 32) as u32)?,
+        })
+    }
 }
 
 impl fmt::Debug for Expr {

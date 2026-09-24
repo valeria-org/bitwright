@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ref"]
+members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ffi", "bitwright-ref"]
 
 [workspace.package]
 version = "0.7.0"
