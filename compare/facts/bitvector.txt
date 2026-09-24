@@ -1,0 +1,420 @@
+# Bit-vector identities for `versus-smt --facts`: each line is `name [sort]: LHS ==> RHS`, where
+# RHS is a simpler term equal to LHS for every value of the variables, at every width the set
+# is run at (8 and 64 bits). The terms are SMT-LIB 2.6 QF_BV over x, y, z (the base width) and p
+# (a Boolean). Written from textbook bit-vector algebra, not from any tool's rules; identities
+# that trade sums of bitwise functions for other expressions (mixed boolean-arithmetic) are left
+# out, since the MBA comparison is on CoBRA's datasets.
+#
+# `[sort]` is the root's sort when it is not the base width: `bool`, `2w`, `h` (half) or a
+# number of bits.
+# `{E}` is an integer (an index); `[E]` a constant of the base width, `[E@2w]`, `[E@h]`, `[E@1]`
+# one of another width. E is evaluated modulo 2^width: numbers, `w` and `h` (the base and half
+# widths), `ones`, `smin`, `smax` (of the constant's width), `inv(K)` (the inverse of an odd K),
+# `+ - * << >> & | ^ ~` and parentheses.
+
+## Bitwise identities
+and-self: (bvand x x) ==> x
+and-zero: (bvand x [0]) ==> [0]
+and-ones: (bvand x [ones]) ==> x
+and-not-self: (bvand x (bvnot x)) ==> [0]
+or-self: (bvor x x) ==> x
+or-zero: (bvor x [0]) ==> x
+or-ones: (bvor x [ones]) ==> [ones]
+or-not-self: (bvor x (bvnot x)) ==> [ones]
+xor-self: (bvxor x x) ==> [0]
+xor-zero: (bvxor x [0]) ==> x
+xor-ones: (bvxor x [ones]) ==> (bvnot x)
+xor-not-self: (bvxor x (bvnot x)) ==> [ones]
+not-not: (bvnot (bvnot x)) ==> x
+nand-self: (bvnand x x) ==> (bvnot x)
+nor-self: (bvnor x x) ==> (bvnot x)
+xnor-self: (bvxnor x x) ==> [ones]
+xnor-zero: (bvxnor x [0]) ==> (bvnot x)
+xnor-not-self: (bvxnor x (bvnot x)) ==> [0]
+nand-ones: (bvnand x [ones]) ==> (bvnot x)
+nor-zero: (bvnor x [0]) ==> (bvnot x)
+comp-self [1]: (bvcomp x x) ==> [1@1]
+
+## Bitwise absorption and redundancy
+and-absorbs-or: (bvand x (bvor x y)) ==> x
+or-absorbs-and: (bvor x (bvand x y)) ==> x
+and-repeated: (bvand (bvand x y) x) ==> (bvand x y)
+or-repeated: (bvor (bvor x y) x) ==> (bvor x y)
+xor-cancels: (bvxor (bvxor x y) x) ==> y
+xor-cancels-right: (bvxor x (bvxor y x)) ==> y
+xor-cancels-deep: (bvxor (bvxor x (bvxor y z)) (bvxor z x)) ==> y
+and-or-not: (bvand x (bvor (bvnot x) y)) ==> (bvand x y)
+or-and-not: (bvor x (bvand (bvnot x) y)) ==> (bvor x y)
+and-contradiction: (bvand (bvand x y) (bvnot x)) ==> [0]
+or-tautology: (bvor (bvor x y) (bvnot x)) ==> [ones]
+or-both-polarities: (bvand (bvor x y) (bvor x (bvnot y))) ==> x
+and-both-polarities: (bvor (bvand x y) (bvand x (bvnot y))) ==> x
+xor-of-and-or: (bvxor (bvand x y) (bvor x y)) ==> (bvxor x y)
+or-of-xor-and: (bvor (bvxor x y) (bvand x y)) ==> (bvor x y)
+xor-of-or-xor: (bvxor (bvor x y) (bvxor x y)) ==> (bvand x y)
+xor-of-xor-and: (bvxor (bvxor x y) (bvand x y)) ==> (bvor x y)
+or-without-and: (bvand (bvor x y) (bvnot (bvand x y))) ==> (bvxor x y)
+xor-as-and-or: (bvor (bvand x (bvnot y)) (bvand (bvnot x) y)) ==> (bvxor x y)
+xnor-as-and-or: (bvor (bvand x y) (bvand (bvnot x) (bvnot y))) ==> (bvnot (bvxor x y))
+or-xor-right: (bvxor (bvor x y) y) ==> (bvand x (bvnot y))
+and-xor-right: (bvxor (bvand x y) y) ==> (bvand (bvnot x) y)
+and-xor-left: (bvxor (bvand x y) x) ==> (bvand x (bvnot y))
+xor-and-left: (bvand (bvxor x y) x) ==> (bvand x (bvnot y))
+xor-or-left: (bvor (bvxor x y) x) ==> (bvor x y)
+and-not-or: (bvor (bvand x (bvnot y)) y) ==> (bvor x y)
+and-not-and: (bvand (bvand x (bvnot y)) y) ==> [0]
+xor-not-both: (bvxor (bvnot x) (bvnot y)) ==> (bvxor x y)
+select-same: (bvor (bvand x y) (bvand (bvnot x) y)) ==> y
+and-chain-repeat: (bvand x (bvand y (bvand z x))) ==> (bvand x (bvand y z))
+or-chain-repeat: (bvor x (bvor y (bvor z x))) ==> (bvor x (bvor y z))
+
+## De Morgan and complements
+de-morgan-and: (bvor (bvnot x) (bvnot y)) ==> (bvnot (bvand x y))
+de-morgan-or: (bvand (bvnot x) (bvnot y)) ==> (bvnot (bvor x y))
+not-nand: (bvnot (bvnand x y)) ==> (bvand x y)
+not-nor: (bvnot (bvnor x y)) ==> (bvor x y)
+not-xnor: (bvnot (bvxnor x y)) ==> (bvxor x y)
+not-of-and-of-nots: (bvnot (bvand (bvnot x) (bvnot y))) ==> (bvor x y)
+not-of-or-of-nots: (bvnot (bvor (bvnot x) (bvnot y))) ==> (bvand x y)
+nand-of-nots: (bvnand (bvnot x) (bvnot y)) ==> (bvor x y)
+nor-of-nots: (bvnor (bvnot x) (bvnot y)) ==> (bvand x y)
+xnor-of-not: (bvxnor (bvnot x) y) ==> (bvxor x y)
+
+## Distributivity and factoring
+and-over-or: (bvor (bvand x y) (bvand x z)) ==> (bvand x (bvor y z))
+or-over-and: (bvand (bvor x y) (bvor x z)) ==> (bvor x (bvand y z))
+and-over-xor: (bvxor (bvand x y) (bvand x z)) ==> (bvand x (bvxor y z))
+consensus-or: (bvor (bvor (bvand x y) (bvand (bvnot x) z)) (bvand y z)) ==> (bvor (bvand x y) (bvand (bvnot x) z))
+consensus-and: (bvand (bvand (bvor x y) (bvor (bvnot x) z)) (bvor y z)) ==> (bvand (bvor x y) (bvor (bvnot x) z))
+and-over-or-right: (bvor (bvand y x) (bvand z x)) ==> (bvand x (bvor y z))
+or-over-and-right: (bvand (bvor y x) (bvor z x)) ==> (bvor x (bvand y z))
+
+## Bitwise constants
+and-and-constants: (bvand (bvand x [12]) [10]) ==> (bvand x [8])
+or-or-constants: (bvor (bvor x [12]) [10]) ==> (bvor x [14])
+xor-xor-constants: (bvxor (bvxor x [12]) [10]) ==> (bvxor x [6])
+and-of-or-constant: (bvand (bvor x [12]) [12]) ==> [12]
+or-of-and-constant: (bvor (bvand x [12]) [12]) ==> [12]
+and-disjoint-constants: (bvand (bvand x [12]) [3]) ==> [0]
+and-mask-after-or: (bvand (bvor x [3]) [-4]) ==> (bvand x [-4])
+or-mask-after-and: (bvor (bvand x [-4]) [3]) ==> (bvor x [3])
+xor-constant-of-not: (bvxor (bvnot x) [5]) ==> (bvxor x [-6])
+not-of-xor-constant: (bvnot (bvxor x [5])) ==> (bvxor x [-6])
+and-of-not-constant: (bvand (bvnot (bvor x [3])) [3]) ==> [0]
+or-of-and-complement: (bvor (bvand x [15]) (bvand x [-16])) ==> x
+xor-of-and-complement: (bvxor (bvand x [15]) (bvand x [-16])) ==> x
+and-of-xor-constant-mask: (bvand (bvxor x [-16]) [15]) ==> (bvand x [15])
+
+## Arithmetic identities
+add-zero: (bvadd x [0]) ==> x
+sub-zero: (bvsub x [0]) ==> x
+sub-self: (bvsub x x) ==> [0]
+zero-minus: (bvsub [0] x) ==> (bvneg x)
+add-negation: (bvadd x (bvneg x)) ==> [0]
+neg-neg: (bvneg (bvneg x)) ==> x
+mul-zero: (bvmul x [0]) ==> [0]
+mul-one: (bvmul x [1]) ==> x
+mul-minus-one: (bvmul x [-1]) ==> (bvneg x)
+add-then-sub: (bvsub (bvadd x y) y) ==> x
+sub-then-add: (bvadd (bvsub x y) y) ==> x
+add-then-sub-left: (bvsub (bvadd x y) x) ==> y
+sub-of-sub: (bvsub x (bvsub x y)) ==> y
+add-common-term: (bvsub (bvadd x y) (bvadd x z)) ==> (bvsub y z)
+sub-common-term: (bvsub (bvsub x y) (bvsub x z)) ==> (bvsub z y)
+neg-of-sub: (bvneg (bvsub x y)) ==> (bvsub y x)
+neg-plus: (bvadd (bvneg x) y) ==> (bvsub y x)
+plus-neg: (bvadd x (bvneg y)) ==> (bvsub x y)
+minus-neg: (bvsub x (bvneg y)) ==> (bvadd x y)
+neg-plus-neg: (bvadd (bvneg x) (bvneg y)) ==> (bvneg (bvadd x y))
+add-commutes: (bvsub (bvadd x y) (bvadd y x)) ==> [0]
+add-associates: (bvsub (bvadd x (bvadd y z)) (bvadd z (bvadd y x))) ==> [0]
+add-constants: (bvadd (bvadd x [5]) [7]) ==> (bvadd x [12])
+sub-constants: (bvsub (bvsub x [5]) [7]) ==> (bvsub x [12])
+add-sub-constant: (bvsub (bvadd x [5]) [5]) ==> x
+sub-add-constants: (bvadd (bvsub x [9]) [4]) ==> (bvsub x [5])
+constant-minus-twice: (bvsub [7] (bvsub [7] x)) ==> x
+constants-cancel: (bvsub (bvadd x [3]) (bvadd y [3])) ==> (bvsub x y)
+neg-of-sum-constant: (bvneg (bvadd x [5])) ==> (bvsub [-5] x)
+sub-from-sum: (bvsub (bvadd x (bvadd y z)) (bvadd x y)) ==> z
+add-sub-mix: (bvadd (bvsub x y) (bvsub y z)) ==> (bvsub x z)
+
+## Multiplication
+mul-constants: (bvmul (bvmul x [3]) [5]) ==> (bvmul x [15])
+mul-over-sum: (bvadd (bvmul x y) (bvmul x z)) ==> (bvmul x (bvadd y z))
+mul-over-difference: (bvsub (bvmul x y) (bvmul x z)) ==> (bvmul x (bvsub y z))
+mul-plus-self: (bvadd (bvmul x y) x) ==> (bvmul x (bvadd y [1]))
+mul-constant-sum: (bvadd (bvmul x [3]) (bvmul x [5])) ==> (bvmul x [8])
+mul-constant-difference: (bvsub (bvmul x [7]) (bvmul x [6])) ==> x
+mul-successor: (bvsub (bvmul (bvadd x [1]) y) y) ==> (bvmul x y)
+mul-commutes: (bvsub (bvmul x y) (bvmul y x)) ==> [0]
+mul-associates: (bvsub (bvmul (bvmul x y) z) (bvmul x (bvmul y z))) ==> [0]
+mul-negations: (bvmul (bvneg x) (bvneg y)) ==> (bvmul x y)
+mul-negation-cancels: (bvadd (bvmul (bvneg x) y) (bvmul x y)) ==> [0]
+shifts-sum: (bvadd (bvshl x [2]) (bvshl x [1])) ==> (bvmul x [6])
+triple: (bvadd x (bvadd x x)) ==> (bvmul x [3])
+double-minus-self: (bvsub (bvmul x [2]) x) ==> x
+mul-by-inverse-3: (bvmul (bvmul x [3]) [inv(3)]) ==> x
+mul-by-inverse-5: (bvmul (bvmul x [5]) [inv(5)]) ==> x
+square-of-sum: (bvsub (bvmul (bvadd x y) (bvadd x y)) (bvadd (bvmul x x) (bvmul y y))) ==> (bvmul (bvmul x y) [2])
+mul-pow2-minus-shift: (bvsub (bvmul x [4]) (bvshl x [2])) ==> [0]
+mul-shifted-constant: (bvmul (bvshl x [2]) [4]) ==> (bvshl x [4])
+mul-distributes-constant: (bvsub (bvmul (bvadd x [1]) [3]) [3]) ==> (bvmul x [3])
+
+## Two's complement
+not-plus-one: (bvadd (bvnot x) [1]) ==> (bvneg x)
+neg-minus-one: (bvsub (bvneg x) [1]) ==> (bvnot x)
+not-of-decrement: (bvnot (bvsub x [1])) ==> (bvneg x)
+not-of-neg: (bvnot (bvneg x)) ==> (bvsub x [1])
+neg-of-not: (bvneg (bvnot x)) ==> (bvadd x [1])
+plus-own-complement: (bvadd x (bvnot x)) ==> [ones]
+sub-by-complement: (bvadd (bvadd x (bvnot y)) [1]) ==> (bvsub x y)
+complements-difference: (bvsub (bvnot x) (bvnot y)) ==> (bvsub y x)
+complements-sum: (bvadd (bvnot x) (bvnot y)) ==> (bvsub [-2] (bvadd x y))
+neg-by-xor-ones: (bvadd (bvxor x [ones]) [1]) ==> (bvneg x)
+not-plus-self-plus-one: (bvadd (bvadd x (bvnot x)) [1]) ==> [0]
+
+## Shifts by constants
+shl-zero: (bvshl x [0]) ==> x
+lshr-zero: (bvlshr x [0]) ==> x
+ashr-zero: (bvashr x [0]) ==> x
+shl-width: (bvshl x [w]) ==> [0]
+lshr-width: (bvlshr x [w]) ==> [0]
+ashr-width: (bvashr x [w]) ==> (bvashr x [w-1])
+zero-shl: (bvshl [0] y) ==> [0]
+zero-lshr: (bvlshr [0] y) ==> [0]
+zero-ashr: (bvashr [0] y) ==> [0]
+ones-ashr: (bvashr [ones] y) ==> [ones]
+shl-shl: (bvshl (bvshl x [2]) [3]) ==> (bvshl x [5])
+lshr-lshr: (bvlshr (bvlshr x [2]) [3]) ==> (bvlshr x [5])
+ashr-ashr: (bvashr (bvashr x [2]) [3]) ==> (bvashr x [5])
+shl-shl-past-width: (bvshl (bvshl x [h]) [h]) ==> [0]
+lshr-lshr-past-width: (bvlshr (bvlshr x [h]) [h]) ==> [0]
+ashr-ashr-past-width: (bvashr (bvashr x [h]) [h]) ==> (bvashr x [w-1])
+shl-then-lshr: (bvlshr (bvshl x [3]) [3]) ==> (bvand x [ones >> 3])
+lshr-then-shl: (bvshl (bvlshr x [3]) [3]) ==> (bvand x [-8])
+shl-over-and: (bvand (bvshl x [3]) (bvshl y [3])) ==> (bvshl (bvand x y) [3])
+shl-over-or: (bvor (bvshl x [3]) (bvshl y [3])) ==> (bvshl (bvor x y) [3])
+shl-over-xor: (bvxor (bvshl x [3]) (bvshl y [3])) ==> (bvshl (bvxor x y) [3])
+lshr-over-and: (bvand (bvlshr x [3]) (bvlshr y [3])) ==> (bvlshr (bvand x y) [3])
+lshr-over-or: (bvor (bvlshr x [3]) (bvlshr y [3])) ==> (bvlshr (bvor x y) [3])
+lshr-over-xor: (bvxor (bvlshr x [3]) (bvlshr y [3])) ==> (bvlshr (bvxor x y) [3])
+ashr-over-and: (bvand (bvashr x [3]) (bvashr y [3])) ==> (bvashr (bvand x y) [3])
+ashr-over-or: (bvor (bvashr x [3]) (bvashr y [3])) ==> (bvashr (bvor x y) [3])
+ashr-over-xor: (bvxor (bvashr x [3]) (bvashr y [3])) ==> (bvashr (bvxor x y) [3])
+shl-over-add: (bvadd (bvshl x [3]) (bvshl y [3])) ==> (bvshl (bvadd x y) [3])
+shl-over-sub: (bvsub (bvshl x [3]) (bvshl y [3])) ==> (bvshl (bvsub x y) [3])
+ashr-of-not: (bvnot (bvashr (bvnot x) [3])) ==> (bvashr x [3])
+sign-bit-negated: (bvneg (bvlshr x [w-1])) ==> (bvashr x [w-1])
+sign-mask-low-bit: (bvand (bvashr x [w-1]) [1]) ==> (bvlshr x [w-1])
+sign-mask-negated: (bvneg (bvashr x [w-1])) ==> (bvlshr x [w-1])
+sign-of-sign-mask: (bvlshr (bvashr x [w-1]) [w-1]) ==> (bvlshr x [w-1])
+lshr-of-low-bits: (bvlshr (bvand x [7]) [3]) ==> [0]
+shl-of-top-bit: (bvshl (bvand x [smin]) [1]) ==> [0]
+low-bits-of-shl: (bvand (bvshl x [3]) [7]) ==> [0]
+high-bits-of-lshr: (bvand (bvlshr x [3]) [ones << (w-3)]) ==> [0]
+mul-then-lshr: (bvlshr (bvmul x [8]) [3]) ==> (bvand x [ones >> 3])
+shl-past-width-variable: (bvshl x (bvor y [w])) ==> [0]
+lshr-past-width-variable: (bvlshr x (bvor y [w])) ==> [0]
+ashr-past-width-variable: (bvashr x (bvor y [w])) ==> (bvashr x [w-1])
+
+## Rotations by constants
+rotl-zero: ((_ rotate_left 0) x) ==> x
+rotl-width: ((_ rotate_left {w}) x) ==> x
+rotl-rotl: ((_ rotate_left 3) ((_ rotate_left 2) x)) ==> ((_ rotate_left 5) x)
+rotr-rotl: ((_ rotate_right 3) ((_ rotate_left 3) x)) ==> x
+rotr-rotr: ((_ rotate_right 1) ((_ rotate_right 2) x)) ==> ((_ rotate_right 3) x)
+rotl-half-twice: ((_ rotate_left {h}) ((_ rotate_left {h}) x)) ==> x
+rotl-from-shifts: (bvor (bvshl x [3]) (bvlshr x [w-3])) ==> ((_ rotate_left 3) x)
+rotr-from-shifts: (bvor (bvlshr x [3]) (bvshl x [w-3])) ==> ((_ rotate_right 3) x)
+rotl-from-shifts-xor: (bvxor (bvshl x [5]) (bvlshr x [w-5])) ==> ((_ rotate_left 5) x)
+rotl-from-shifts-add: (bvadd (bvshl x [5]) (bvlshr x [w-5])) ==> ((_ rotate_left 5) x)
+rotl-of-not: (bvnot ((_ rotate_left 3) (bvnot x))) ==> ((_ rotate_left 3) x)
+rotl-over-xor: (bvxor ((_ rotate_left 3) x) ((_ rotate_left 3) y)) ==> ((_ rotate_left 3) (bvxor x y))
+rotl-over-and: (bvand ((_ rotate_left 3) x) ((_ rotate_left 3) y)) ==> ((_ rotate_left 3) (bvand x y))
+rotl-over-or: (bvor ((_ rotate_left 3) x) ((_ rotate_left 3) y)) ==> ((_ rotate_left 3) (bvor x y))
+
+## Extraction, concatenation and extension
+extract-whole: ((_ extract {w-1} 0) x) ==> x
+extract-of-extract [3]: ((_ extract 3 1) ((_ extract {h+2} 2) x)) ==> ((_ extract 5 3) x)
+low-of-concat: ((_ extract {w-1} 0) (concat y x)) ==> x
+high-of-concat: ((_ extract {2*w-1} {w}) (concat y x)) ==> y
+concat-of-halves: (concat ((_ extract {w-1} {h}) x) ((_ extract {h-1} 0) x)) ==> x
+concat-of-three-slices: (concat ((_ extract {w-1} {h}) x) (concat ((_ extract {h-1} 2) x) ((_ extract 1 0) x))) ==> x
+low-of-zero-extend: ((_ extract {w-1} 0) ((_ zero_extend {w}) x)) ==> x
+low-of-sign-extend: ((_ extract {w-1} 0) ((_ sign_extend {w}) x)) ==> x
+high-of-zero-extend [w]: ((_ extract {2*w-1} {w}) ((_ zero_extend {w}) x)) ==> [0]
+zero-extend-twice [2w]: ((_ zero_extend {h}) ((_ zero_extend {h}) x)) ==> ((_ zero_extend {w}) x)
+sign-extend-twice [2w]: ((_ sign_extend {h}) ((_ sign_extend {h}) x)) ==> ((_ sign_extend {w}) x)
+sign-extend-of-zero-extend [2w]: ((_ sign_extend {h}) ((_ zero_extend {h}) x)) ==> ((_ zero_extend {w}) x)
+concat-zero-is-extend [2w]: (concat [0] x) ==> ((_ zero_extend {w}) x)
+zero-extend-shifted-out [2w]: (bvlshr ((_ zero_extend {w}) x) [w@2w]) ==> [0@2w]
+zero-extend-masked [2w]: (bvand ((_ zero_extend {w}) x) [(1 << w) - 1 @2w]) ==> ((_ zero_extend {w}) x)
+halves-joined-or [2w]: (bvor (bvshl ((_ zero_extend {w}) x) [w@2w]) ((_ zero_extend {w}) y)) ==> (concat x y)
+halves-joined-add [2w]: (bvadd (bvshl ((_ zero_extend {w}) x) [w@2w]) ((_ zero_extend {w}) y)) ==> (concat x y)
+high-of-shifted-extend: ((_ extract {2*w-1} {w}) (bvshl ((_ zero_extend {w}) x) [w@2w])) ==> x
+low-of-shifted-concat: ((_ extract {w-1} 0) (bvlshr (concat x y) [w@2w])) ==> x
+low-concat-masked [2w]: (bvand (concat x y) [(1 << w) - 1 @2w]) ==> ((_ zero_extend {w}) y)
+truncated-sum [h]: (bvadd ((_ extract {h-1} 0) x) ((_ extract {h-1} 0) y)) ==> ((_ extract {h-1} 0) (bvadd x y))
+truncated-difference [h]: (bvsub ((_ extract {h-1} 0) x) ((_ extract {h-1} 0) y)) ==> ((_ extract {h-1} 0) (bvsub x y))
+truncated-product [h]: (bvmul ((_ extract {h-1} 0) x) ((_ extract {h-1} 0) y)) ==> ((_ extract {h-1} 0) (bvmul x y))
+truncated-and [h]: (bvand ((_ extract {h-1} 0) x) ((_ extract {h-1} 0) y)) ==> ((_ extract {h-1} 0) (bvand x y))
+truncated-xor [h]: (bvxor ((_ extract {h-1} 0) x) ((_ extract {h-1} 0) y)) ==> ((_ extract {h-1} 0) (bvxor x y))
+low-of-wide-product: ((_ extract {w-1} 0) (bvmul ((_ zero_extend {w}) x) ((_ zero_extend {w}) y))) ==> (bvmul x y)
+low-of-wide-sum: ((_ extract {w-1} 0) (bvadd ((_ sign_extend {w}) x) ((_ sign_extend {w}) y))) ==> (bvadd x y)
+zero-extend-over-and [2w]: (bvand ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> ((_ zero_extend {w}) (bvand x y))
+zero-extend-over-or [2w]: (bvor ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> ((_ zero_extend {w}) (bvor x y))
+zero-extend-over-xor [2w]: (bvxor ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> ((_ zero_extend {w}) (bvxor x y))
+sign-extend-over-and [2w]: (bvand ((_ sign_extend {w}) x) ((_ sign_extend {w}) y)) ==> ((_ sign_extend {w}) (bvand x y))
+sign-extend-over-xor [2w]: (bvxor ((_ sign_extend {w}) x) ((_ sign_extend {w}) y)) ==> ((_ sign_extend {w}) (bvxor x y))
+bit-0-of-shl [1]: ((_ extract 0 0) (bvshl x [1])) ==> [0@1]
+bit-0-of-double [1]: ((_ extract 0 0) (bvmul x [2])) ==> [0@1]
+top-bit-of-lshr [1]: ((_ extract {w-1} {w-1}) (bvlshr x [1])) ==> [0@1]
+low-half-of-high-mask [h]: ((_ extract {h-1} 0) (bvand x [ones << h])) ==> [0@h]
+low-half-of-high-set [h]: ((_ extract {h-1} 0) (bvor x [ones << h])) ==> ((_ extract {h-1} 0) x)
+
+## Division and remainder
+udiv-one: (bvudiv x [1]) ==> x
+urem-one: (bvurem x [1]) ==> [0]
+sdiv-one: (bvsdiv x [1]) ==> x
+srem-one: (bvsrem x [1]) ==> [0]
+smod-one: (bvsmod x [1]) ==> [0]
+udiv-zero: (bvudiv x [0]) ==> [ones]
+urem-zero: (bvurem x [0]) ==> x
+srem-zero: (bvsrem x [0]) ==> x
+smod-zero: (bvsmod x [0]) ==> x
+urem-self: (bvurem x x) ==> [0]
+srem-self: (bvsrem x x) ==> [0]
+zero-urem: (bvurem [0] x) ==> [0]
+sdiv-minus-one: (bvsdiv x [-1]) ==> (bvneg x)
+srem-minus-one: (bvsrem x [-1]) ==> [0]
+udiv-pow2: (bvudiv x [8]) ==> (bvlshr x [3])
+urem-pow2: (bvurem x [8]) ==> (bvand x [7])
+unsigned-division-identity: (bvadd (bvmul (bvudiv x y) y) (bvurem x y)) ==> x
+signed-division-identity: (bvadd (bvmul (bvsdiv x y) y) (bvsrem x y)) ==> x
+urem-twice: (bvurem (bvurem x y) y) ==> (bvurem x y)
+minus-remainder-pow2: (bvsub x (bvurem x [8])) ==> (bvand x [-8])
+udiv-of-shl: (bvudiv (bvshl x [3]) [8]) ==> (bvand x [ones >> 3])
+urem-of-low-bits: (bvurem (bvand x [7]) [8]) ==> (bvand x [7])
+udiv-of-low-bits: (bvudiv (bvand x [7]) [8]) ==> [0]
+urem-of-multiple: (bvurem (bvmul x [8]) [8]) ==> [0]
+urem-drops-multiple: (bvurem (bvadd x (bvmul y [8])) [8]) ==> (bvand x [7])
+sdiv-of-nonnegative: (bvsdiv (bvlshr x [1]) [8]) ==> (bvlshr x [4])
+double-then-halve: (bvudiv (bvmul x [2]) [2]) ==> (bvand x [smax])
+urem-at-most-dividend [bool]: (bvule (bvurem x y) x) ==> true
+urem-below-divisor [bool]: (bvult (bvurem x [8]) [8]) ==> true
+udiv-at-most-dividend [bool]: (bvule (bvudiv x [2]) x) ==> true
+
+## Comparisons
+eq-self [bool]: (= x x) ==> true
+distinct-self [bool]: (distinct x x) ==> false
+ult-self [bool]: (bvult x x) ==> false
+ule-self [bool]: (bvule x x) ==> true
+slt-self [bool]: (bvslt x x) ==> false
+sle-self [bool]: (bvsle x x) ==> true
+ult-zero [bool]: (bvult x [0]) ==> false
+uge-zero [bool]: (bvuge x [0]) ==> true
+ule-max [bool]: (bvule x [ones]) ==> true
+ugt-max [bool]: (bvugt x [ones]) ==> false
+slt-min [bool]: (bvslt x [smin]) ==> false
+sle-max [bool]: (bvsle x [smax]) ==> true
+not-ult [bool]: (not (bvult x y)) ==> (bvule y x)
+not-ule [bool]: (not (bvule x y)) ==> (bvult y x)
+not-slt [bool]: (not (bvslt x y)) ==> (bvsle y x)
+not-sle [bool]: (not (bvsle x y)) ==> (bvslt y x)
+eq-plus-constant [bool]: (= (bvadd x [5]) (bvadd y [5])) ==> (= x y)
+eq-xor-constant [bool]: (= (bvxor x [5]) (bvxor y [5])) ==> (= x y)
+eq-complements [bool]: (= (bvnot x) (bvnot y)) ==> (= x y)
+eq-negations [bool]: (= (bvneg x) (bvneg y)) ==> (= x y)
+eq-difference-zero [bool]: (= (bvsub x y) [0]) ==> (= x y)
+eq-xor-zero [bool]: (= (bvxor x y) [0]) ==> (= x y)
+eq-times-odd [bool]: (= (bvmul x [3]) (bvmul y [3])) ==> (= x y)
+eq-common-addend [bool]: (= (bvadd x y) (bvadd x z)) ==> (= y z)
+eq-solve-add [bool]: (= (bvadd x [5]) [12]) ==> (= x [7])
+eq-solve-xor [bool]: (= (bvxor x [5]) [12]) ==> (= x [9])
+eq-solve-not [bool]: (= (bvnot x) [5]) ==> (= x [-6])
+eq-solve-neg [bool]: (= (bvneg x) [0]) ==> (= x [0])
+eq-solve-odd-product [bool]: (= (bvmul x [3]) [9]) ==> (= x [3])
+eq-and-impossible [bool]: (= (bvand x [12]) [3]) ==> false
+eq-or-impossible [bool]: (= (bvor x [12]) [3]) ==> false
+eq-odd-zero-impossible [bool]: (= (bvor x [1]) [0]) ==> false
+eq-shl-odd-impossible [bool]: (= (bvshl x [1]) [1]) ==> false
+eq-even-odd-impossible [bool]: (= (bvmul x [2]) [1]) ==> false
+eq-square-two-impossible [bool]: (= (bvmul x x) [2]) ==> false
+eq-extension-impossible [bool]: (= ((_ zero_extend {w}) x) [(1 << w) + 1 @2w]) ==> false
+ult-complements [bool]: (bvult (bvnot x) (bvnot y)) ==> (bvult y x)
+slt-complements [bool]: (bvslt (bvnot x) (bvnot y)) ==> (bvslt y x)
+ult-sign-flipped [bool]: (bvult (bvxor x [smin]) (bvxor y [smin])) ==> (bvslt x y)
+slt-sign-flipped [bool]: (bvslt (bvxor x [smin]) (bvxor y [smin])) ==> (bvult x y)
+ult-offset-by-smin [bool]: (bvult (bvadd x [smin]) (bvadd y [smin])) ==> (bvslt x y)
+and-at-most [bool]: (bvule (bvand x y) x) ==> true
+or-at-least [bool]: (bvule x (bvor x y)) ==> true
+lshr-at-most [bool]: (bvule (bvlshr x [1]) x) ==> true
+zero-extended-ult [bool]: (bvult ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> (bvult x y)
+zero-extended-slt [bool]: (bvslt ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> (bvult x y)
+sign-extended-slt [bool]: (bvslt ((_ sign_extend {w}) x) ((_ sign_extend {w}) y)) ==> (bvslt x y)
+zero-extended-eq [bool]: (= ((_ zero_extend {w}) x) ((_ zero_extend {w}) y)) ==> (= x y)
+sign-extended-eq [bool]: (= ((_ sign_extend {w}) x) ((_ sign_extend {w}) y)) ==> (= x y)
+concat-eq [bool]: (= (concat x y) (concat x z)) ==> (= y z)
+sign-bit-set [bool]: (= (bvlshr x [w-1]) [1]) ==> (bvslt x [0])
+sign-bit-clear [bool]: (= (bvlshr x [w-1]) [0]) ==> (bvsle [0] x)
+sign-bit-extracted [bool]: (= ((_ extract {w-1} {w-1}) x) [1@1]) ==> (bvslt x [0])
+increment-overflows [bool]: (bvult (bvadd x [1]) x) ==> (= x [ones])
+increment-grows [bool]: (bvult x (bvadd x [1])) ==> (distinct x [ones])
+decrement-shrinks [bool]: (bvult (bvsub x [1]) x) ==> (distinct x [0])
+signed-increment-overflows [bool]: (bvslt (bvadd x [1]) x) ==> (= x [smax])
+masked-below-bound [bool]: (bvult (bvand x [7]) [8]) ==> true
+top-set-negative [bool]: (bvslt (bvor x [smin]) [0]) ==> true
+halved-below-smin [bool]: (bvult (bvlshr x [1]) [smin]) ==> true
+top-cleared-nonnegative [bool]: (bvsle [0] (bvand x [smax])) ==> true
+and-same [bool]: (and (bvult x y) (bvult x y)) ==> (bvult x y)
+ult-or-uge [bool]: (or (bvult x y) (bvule y x)) ==> true
+ult-and-uge [bool]: (and (bvult x y) (bvule y x)) ==> false
+ult-or-eq [bool]: (or (bvult x y) (= x y)) ==> (bvule x y)
+slt-or-eq [bool]: (or (bvslt x y) (= x y)) ==> (bvsle x y)
+ule-and-distinct [bool]: (and (bvule x y) (distinct x y)) ==> (bvult x y)
+ule-antisymmetric [bool]: (and (bvule x y) (bvule y x)) ==> (= x y)
+sle-antisymmetric [bool]: (and (bvsle x y) (bvsle y x)) ==> (= x y)
+ult-xor-uge [bool]: (xor (bvult x y) (bvule y x)) ==> true
+not-distinct [bool]: (not (distinct x y)) ==> (= x y)
+
+## If-then-else
+ite-same: (ite p x x) ==> x
+ite-true: (ite true x y) ==> x
+ite-false: (ite false x y) ==> y
+ite-eq-picks-else: (ite (= x y) x y) ==> y
+ite-eq-picks-then: (ite (= x y) y x) ==> x
+ite-not: (ite (not p) x y) ==> (ite p y x)
+ite-nested-then: (ite p (ite p x y) z) ==> (ite p x z)
+ite-nested-else: (ite p x (ite p y z)) ==> (ite p x z)
+ite-zero-guard: (ite (= x [0]) [0] x) ==> x
+ite-zero-guard-else: (ite (= x [0]) x [0]) ==> [0]
+ite-constant-guard: (ite (= x [5]) [5] x) ==> x
+ite-common-addend: (ite p (bvadd x z) (bvadd y z)) ==> (bvadd (ite p x y) z)
+ite-common-xor: (ite p (bvxor x z) (bvxor y z)) ==> (bvxor (ite p x y) z)
+ite-common-not: (ite p (bvnot x) (bvnot y)) ==> (bvnot (ite p x y))
+ite-sign-mask: (ite (bvslt x [0]) [ones] [0]) ==> (bvashr x [w-1])
+ite-sign-bit: (ite (bvslt x [0]) [1] [0]) ==> (bvlshr x [w-1])
+ite-known-zero: (ite (= x [0]) (bvadd x y) y) ==> y
+ite-known-equal: (ite (= x y) (bvsub x y) [0]) ==> [0]
+ite-known-value: (ite (= x [5]) (bvadd x [1]) [6]) ==> [6]
+branchless-select: (bvor (bvand x (bvneg (ite p [1] [0]))) (bvand y (bvsub (ite p [1] [0]) [1]))) ==> (ite p x y)
+branchless-min: (bvxor y (bvand (bvxor x y) (bvneg (ite (bvult x y) [1] [0])))) ==> (ite (bvult x y) x y)
+mask-from-bool: (bvneg (ite p [1] [0])) ==> (ite p [ones] [0])
+inverted-mask-from-bool: (bvsub (ite p [1] [0]) [1]) ==> (ite p [0] [ones])
+
+## Known bits
+masked-sum-bounded: (bvand (bvadd (bvand x [15]) (bvand y [15])) [-32]) ==> [0]
+masked-product-bounded: (bvand (bvmul (bvand x [3]) (bvand y [3])) [-16]) ==> [0]
+odd-low-bit: (bvand (bvor x [1]) [1]) ==> [1]
+even-low-bit: (bvand (bvmul x [2]) [1]) ==> [0]
+odd-square-low-bit: (bvand (bvmul (bvor x [1]) (bvor x [1])) [1]) ==> [1]
+square-bit-1: (bvand (bvmul x x) [2]) ==> [0]
+consecutive-product-even: (bvand (bvmul x (bvadd x [1])) [1]) ==> [0]
+filled-low-bits: (bvand (bvor (bvshl x [4]) [15]) [15]) ==> [15]
+lowest-set-bit-is-power: (bvand (bvand x (bvneg x)) (bvsub (bvand x (bvneg x)) [1])) ==> [0]
+sign-mask-and-sign-bit: (bvand (bvashr x [w-1]) (bvlshr x [w-1])) ==> (bvlshr x [w-1])
+set-top-then-sign: (bvlshr (bvor x [smin]) [w-1]) ==> [1]
+cleared-top-then-sign: (bvashr (bvand x [smax]) [w-1]) ==> [0]
+shifted-in-zeros: (bvand (bvlshr x [1]) [smin]) ==> [0]
+aligned-sum-low-bits: (bvand (bvadd (bvshl x [3]) (bvshl y [3])) [7]) ==> [0]
+difference-of-evens: (bvand (bvsub (bvmul x [2]) (bvmul y [2])) [1]) ==> [0]

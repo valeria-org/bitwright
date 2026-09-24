@@ -70,7 +70,7 @@ fn main() -> Result<(), bitwright::Error> {
 bitwright 0.7.0 against other tools, each on what it is built for, on one performance core of
 an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every answer is read into bitwright, sized in DAG
 nodes of its canonical form (a shared subterm counts once) and checked against its input; no
-tool gave a wrong answer. [`compare/`](compare/README.md) reproduces both tables, and
+tool gave a wrong answer. [`compare/`](compare/README.md) reproduces the tables, and
 [docs/benchmarking.md](docs/benchmarking.md#reference-numbers) has bitwright's own costs per
 operation.
 
@@ -94,6 +94,40 @@ to decide satisfiability, which bitwright does not do, and they simplify toward 
 small expressions: z3 splits bitwise operations with constants into slices of bits, and
 Bitwuzla writes `|` and `−` with `&`, `~` and `+`, so their answers are almost always larger
 than the input. Bitwuzla is faster: about 1.4 times on 40 nodes and 4 times on 400.
+
+**Bit-vector identities, against z3 and Bitwuzla.** 377 identities of bit-vector algebra,
+written from textbook mathematics rather than from any tool's rules
+([`compare/facts/bitvector.txt`](compare/facts/bitvector.txt)): Boolean algebra, ring
+arithmetic, two's complement, shifts, rotations, extraction and extension, division,
+comparisons, if-then-else and known bits (not mixed boolean-arithmetic ones: those are CoBRA's
+datasets below). Each runs at 8 and 64 bits, over plain variables and over compound terms, from
+its unsimplified side, and is solved when the answer is no larger than the simpler side. z3 and
+Bitwuzla prove every identity at 8 bits, and at 64 bits all but quotient times divisor plus
+remainder (unsigned and signed), which neither finishes in ten minutes.
+
+| Identities | Cases | bitwright | z3 | Bitwuzla |
+|-|-:|-:|-:|-:|
+| Bitwise identities | 84 | **84** | **84** | **84** |
+| Absorption and redundancy | 124 | **120** | 32 | 42 |
+| De Morgan and complements | 40 | **40** | 20 | 12 |
+| Distributivity and factoring | 28 | **14** | 0 | 0 |
+| Bitwise constants | 56 | **56** | 22 | 28 |
+| Arithmetic identities | 124 | **124** | 78 | 50 |
+| Multiplication | 80 | **52** | **52** | 32 |
+| Two's complement | 44 | **44** | 4 | 22 |
+| Shifts by constants | 168 | **104** | 82 | 60 |
+| Rotations by constants | 56 | **36** | 12 | 12 |
+| Extraction, concatenation and extension | 148 | **112** | 102 | 76 |
+| Division and remainder | 120 | **84** | 72 | 62 |
+| Comparisons | 284 | **236** | 164 | 122 |
+| If-then-else | 92 | **24** | 20 | 22 |
+| Known bits | 60 | **44** | 36 | 12 |
+| All | 1,508 | **1,174 (78 %)** | 780 (52 %) | 636 (42 %) |
+
+On these small expressions bitwright is also the fastest, with a median of 11 µs per case
+against 70 µs for Bitwuzla and 173 µs for z3. `versus-smt --facts` lists what each tool misses;
+bitwright's gaps are mostly if-then-else (it leaves `ite(x == y, x, y)` as it is, not `y`),
+distributivity, shifts and rotations.
 
 **MBA, against CoBRA.** The MBA datasets [CoBRA](https://github.com/trailofbits/CoBRA)
 collects: 76,080 expressions (SiMBA, GAMBA, NeuReduce, MBA-Obfuscator, MBA-Solver, QSynth,

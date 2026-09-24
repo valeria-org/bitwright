@@ -12,7 +12,12 @@
 //! [`POINTS`] points: all zeros, all ones, one, the sign bit, then random values.
 //!
 //! Needs the feature `native-smt`, with `Z3_DIR` and `BITWUZLA_DIR` set (see the README).
-//! `versus-smt [CASES]` runs CASES inputs per corpus (200 by default).
+//! `versus-smt [CASES]` runs CASES inputs per corpus (200 by default). `versus-smt --facts` runs
+//! the identities of `facts/bitvector.txt` instead, at 8 and 64 bits, over atoms and over
+//! compound terms; a case is solved when the answer is no larger than the identity's simpler
+//! side. With `--proofs DIR`, no tool is timed: each input's claim that bitwright's answer
+//! equals it (and, for `--facts`, the identity itself) is written as an SMT-LIB script for any
+//! solver to prove (`unsat`).
 
 // Calls into z3's and Bitwuzla's C APIs.
 #![allow(unsafe_code)]
@@ -241,7 +246,23 @@ impl Measured {
 
     /// Whether the answer equals the input at every point.
     fn agrees(&mut self, seed: u64) -> bool {
-        let Ok(ids) = self.cx.symbols_in(&[self.input, self.answer]) else {
+        self.equal_at(self.input, self.answer, seed)
+    }
+
+    /// A fact's simpler side, read into this context over the script's symbols.
+    fn truth(&mut self, script: &str, truth: &Truth) -> Result<Expr, String> {
+        let text = format!(
+            "{script}(define-fun bw_truth () {} {})\n",
+            truth.sort, truth.rhs
+        );
+        let read = import(&mut self.cx, &text).map_err(|e| format!("truth not read: {e}"))?;
+        read.definition("bw_truth")
+            .ok_or_else(|| "no truth".to_string())
+    }
+
+    /// Whether `a` and `b` are equal at every point.
+    fn equal_at(&mut self, a: Expr, b: Expr, seed: u64) -> bool {
+        let Ok(ids) = self.cx.symbols_in(&[a, b]) else {
             return false;
         };
         let symbols: Vec<(SymbolKey, Width)> = ids
@@ -263,7 +284,7 @@ impl Measured {
                     (k.clone(), v)
                 })
                 .collect();
-            let v = self.cx.eval(&[self.input, self.answer], &env);
+            let v = self.cx.eval(&[a, b], &env);
             v.is_ok_and(|v| v[0] == v[1])
         })
     }
@@ -280,6 +301,47 @@ fn root_width(script: &str) -> Result<u16, String> {
     digits[..end]
         .parse()
         .map_err(|_| "bad root0 width".to_string())
+}
+
+/// The claim that bitwright's answer equals `root0` of `script`, for any SMT solver: the script
+/// as it is (so the solver reads the input itself), the answer beside it under names of its
+/// own, and their difference asserted. `unsat` proves the answer.
+fn obligation(script: &str, m: &mut Measured) -> Result<String, String> {
+    let answer = bitwright::smtlib::export(&mut m.cx, &[m.answer]).map_err(|e| e.to_string())?;
+    let mut text = script.to_string();
+    for line in answer.lines() {
+        // The script declares every symbol the answer can use.
+        if !line.starts_with("(declare-const") && !line.starts_with("(set-logic") {
+            text.push_str(&prefixed(line, "bw_"));
+            text.push('\n');
+        }
+    }
+    text.push_str("(assert (not (= root0 bw_root0)))\n(check-sat)\n");
+    Ok(text)
+}
+
+/// `line` with the exporter's own names (`n…`, `root…` and the helpers named after them)
+/// prefixed; quoted symbols, literals and operators as they are.
+fn prefixed(line: &str, prefix: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        let len = if c == '|' {
+            rest[1..].find('|').map_or(rest.len(), |j| j + 2)
+        } else if c.is_ascii_alphabetic() {
+            let word = rest.find([' ', '(', ')', '|']).unwrap_or(rest.len());
+            let own = rest.strip_prefix("root").or_else(|| rest.strip_prefix('n'));
+            if own.is_some_and(|r| r.starts_with(|d: char| d.is_ascii_digit())) {
+                out.push_str(prefix);
+            }
+            word
+        } else {
+            c.len_utf8()
+        };
+        out.push_str(&rest[..len]);
+        rest = &rest[len..];
+    }
+    out
 }
 
 // ----- inputs ------------------------------------------------------------------------------------
@@ -409,15 +471,22 @@ const TOOLS: [&str; 3] = ["bitwright", "z3", "Bitwuzla"];
 /// One tool's result on one case.
 #[derive(Clone, Copy)]
 enum Outcome {
-    Answer { size: u32, micros: f64 },
+    Answer { size: u32, micros: f64, exact: bool },
     Wrong,
     Failed,
 }
 
-/// The fastest of [`RUNS`] runs of one tool on one case, its answer measured and checked.
-/// With `VERSUS_SMT_DUMP=DIR`, the script, each solver's answer as it printed it, and each
-/// answer as bitwright reads it go to `DIR/CASE-TOOL.txt`.
-fn run(engine: &Engine, tool: usize, script: &str, case: &str, seed: u64) -> Outcome {
+/// The fastest of [`RUNS`] runs of one tool on one case, its answer measured and checked (and
+/// compared with `truth`, if given). With `VERSUS_SMT_DUMP=DIR`, the script, each solver's
+/// answer as it printed it, and each answer as bitwright reads it go to `DIR/CASE-TOOL.txt`.
+fn run(
+    engine: &Engine,
+    tool: usize,
+    script: &str,
+    case: &str,
+    seed: u64,
+    truth: Option<&Truth>,
+) -> Outcome {
     let mut best = Duration::MAX;
     let mut last = None;
     for _ in 0..RUNS {
@@ -451,9 +520,437 @@ fn run(engine: &Engine, tool: usize, script: &str, case: &str, seed: u64) -> Out
         return Outcome::Wrong;
     }
     let size = m.size(m.answer);
+    let exact = truth.is_some_and(|t| m.truth(script, t).is_ok_and(|e| e == m.answer));
     Outcome::Answer {
         size,
         micros: best.as_secs_f64() * 1e6,
+        exact,
+    }
+}
+
+// ----- the fact set ------------------------------------------------------------------------------
+
+/// One identity of `facts/bitvector.txt`: `lhs` equals the simpler `rhs`.
+struct Fact {
+    category: String,
+    name: String,
+    /// The root's sort when it is not the base width: `2w`, `h`, `bool` or a number of bits.
+    sort: Option<String>,
+    lhs: String,
+    rhs: String,
+}
+
+/// A fact's simpler side, the ground truth: `rhs`, of sort `sort`, over the script's variables.
+struct Truth {
+    sort: String,
+    rhs: String,
+}
+
+fn facts() -> Result<Vec<Fact>, String> {
+    let mut out = Vec::new();
+    let mut category = String::new();
+    for (i, line) in include_str!("../../facts/bitvector.txt")
+        .lines()
+        .enumerate()
+    {
+        if let Some(c) = line.strip_prefix("## ") {
+            category = c.to_string();
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || format!("facts/bitvector.txt:{}: {line}", i + 1);
+        let (head, body) = line.split_once(": ").ok_or_else(bad)?;
+        let (lhs, rhs) = body.split_once(" ==> ").ok_or_else(bad)?;
+        let (name, sort) = match head.split_once(" [") {
+            Some((n, s)) => (n, Some(s.strip_suffix(']').ok_or_else(bad)?.to_string())),
+            None => (head, None),
+        };
+        out.push(Fact {
+            category: category.clone(),
+            name: name.to_string(),
+            sort,
+            lhs: lhs.trim().to_string(),
+            rhs: rhs.trim().to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// `text` with the fact set's placeholders filled in for base width `w`: `{E}` becomes the
+/// integer E, `[E]` (or `[E@S]`, S one of `w`, `2w`, `h`, `1`) a constant of that width.
+fn instantiate(text: &str, w: u32) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(['{', '[']) {
+        out.push_str(&rest[..i]);
+        let close = if rest[i..].starts_with('{') { '}' } else { ']' };
+        let end = i + rest[i..].find(close).ok_or("an unclosed placeholder")?;
+        let inner = &rest[i + 1..end];
+        if close == '}' {
+            out.push_str(&Calc::eval(inner, w, 128)?.to_string());
+        } else {
+            let (e, n) = match inner.rsplit_once('@') {
+                Some((e, s)) => match s.trim() {
+                    "w" => (e, w),
+                    "2w" => (e, 2 * w),
+                    "h" => (e, w / 2),
+                    "1" => (e, 1),
+                    s => return Err(format!("unknown width `{s}`")),
+                },
+                None => (inner, w),
+            };
+            out.push_str(&format!("(_ bv{} {n})", Calc::eval(e, w, n)?));
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Num(u128),
+    Id(String),
+    Op(&'static str),
+    Open,
+    Close,
+}
+
+/// A placeholder's integer expression, evaluated modulo 2^`n` (every operation is reduced, so
+/// `>>` is logical and `~` complements `n` bits).
+struct Calc {
+    tokens: Vec<Tok>,
+    at: usize,
+    w: u32,
+    n: u32,
+}
+
+impl Calc {
+    fn eval(text: &str, w: u32, n: u32) -> Result<u128, String> {
+        let mut c = Calc {
+            tokens: Calc::tokens(text)?,
+            at: 0,
+            w,
+            n,
+        };
+        let v = c.binary(0)?;
+        if c.at != c.tokens.len() {
+            return Err(format!("trailing input in `{text}`"));
+        }
+        Ok(v)
+    }
+
+    fn tokens(text: &str) -> Result<Vec<Tok>, String> {
+        let mut out = Vec::new();
+        let mut rest = text.trim_start();
+        while let Some(c) = rest.chars().next() {
+            let word = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            let (tok, len) = match c {
+                '0'..='9' => {
+                    let lit = &rest[..word];
+                    let v = match lit.strip_prefix("0x") {
+                        Some(hex) => u128::from_str_radix(hex, 16),
+                        None => lit.parse(),
+                    };
+                    (
+                        Tok::Num(v.map_err(|_| format!("bad number `{lit}`"))?),
+                        word,
+                    )
+                }
+                'a'..='z' => (Tok::Id(rest[..word].to_string()), word),
+                '(' => (Tok::Open, 1),
+                ')' => (Tok::Close, 1),
+                _ => {
+                    let op = ["<<", ">>", "+", "-", "*", "&", "|", "^", "~"]
+                        .into_iter()
+                        .find(|op| rest.starts_with(op))
+                        .ok_or_else(|| format!("unexpected `{c}` in `{text}`"))?;
+                    (Tok::Op(op), op.len())
+                }
+            };
+            out.push(tok);
+            rest = rest[len..].trim_start();
+        }
+        Ok(out)
+    }
+
+    fn mask(&self, v: u128) -> u128 {
+        if self.n >= 128 {
+            v
+        } else {
+            v & ((1 << self.n) - 1)
+        }
+    }
+
+    fn binary(&mut self, level: usize) -> Result<u128, String> {
+        const LEVELS: [&[&str]; 6] = [&["|"], &["^"], &["&"], &["<<", ">>"], &["+", "-"], &["*"]];
+        if level == LEVELS.len() {
+            return self.unary();
+        }
+        let mut v = self.binary(level + 1)?;
+        while let Some(Tok::Op(op)) = self.tokens.get(self.at) {
+            let op = *op;
+            if !LEVELS[level].contains(&op) {
+                break;
+            }
+            self.at += 1;
+            let r = self.binary(level + 1)?;
+            v = self.mask(match op {
+                "|" => v | r,
+                "^" => v ^ r,
+                "&" => v & r,
+                "<<" => v.checked_shl(u32::try_from(r).unwrap_or(128)).unwrap_or(0),
+                ">>" => v.checked_shr(u32::try_from(r).unwrap_or(128)).unwrap_or(0),
+                "+" => v.wrapping_add(r),
+                "-" => v.wrapping_sub(r),
+                _ => v.wrapping_mul(r),
+            });
+        }
+        Ok(v)
+    }
+
+    fn unary(&mut self) -> Result<u128, String> {
+        match self.tokens.get(self.at) {
+            Some(Tok::Op("-")) => {
+                self.at += 1;
+                let v = self.unary()?;
+                Ok(self.mask(v.wrapping_neg()))
+            }
+            Some(Tok::Op("~")) => {
+                self.at += 1;
+                let v = self.unary()?;
+                Ok(self.mask(!v))
+            }
+            _ => self.atom(),
+        }
+    }
+
+    fn atom(&mut self) -> Result<u128, String> {
+        let tok = self
+            .tokens
+            .get(self.at)
+            .cloned()
+            .ok_or("an expression ends early")?;
+        self.at += 1;
+        match tok {
+            Tok::Num(v) => Ok(self.mask(v)),
+            Tok::Open => {
+                let v = self.binary(0)?;
+                self.expect(Tok::Close)?;
+                Ok(v)
+            }
+            Tok::Id(name) => match name.as_str() {
+                "w" => Ok(u128::from(self.w)),
+                "h" => Ok(u128::from(self.w / 2)),
+                "ones" => Ok(self.mask(u128::MAX)),
+                "smin" => Ok(1 << (self.n - 1)),
+                "smax" => Ok((1 << (self.n - 1)) - 1),
+                "inv" => {
+                    self.expect(Tok::Open)?;
+                    let k = self.binary(0)?;
+                    self.expect(Tok::Close)?;
+                    if k % 2 == 0 {
+                        return Err(format!("inv({k}): not odd"));
+                    }
+                    // Newton's iteration doubles the correct low bits: 3, 6, ..., 192.
+                    let mut x = k;
+                    for _ in 0..7 {
+                        x = x.wrapping_mul(2u128.wrapping_sub(k.wrapping_mul(x)));
+                    }
+                    Ok(self.mask(x))
+                }
+                _ => Err(format!("unknown name `{name}`")),
+            },
+            t => Err(format!("unexpected {t:?}")),
+        }
+    }
+
+    fn expect(&mut self, t: Tok) -> Result<(), String> {
+        if self.tokens.get(self.at) == Some(&t) {
+            self.at += 1;
+            Ok(())
+        } else {
+            Err(format!("expected {t:?}"))
+        }
+    }
+}
+
+/// The script for one fact at base width `w`: the variables x, y, z (atoms, or with
+/// `compound` terms over fresh atoms), p a comparison, and `root0` the fact's left side; and
+/// the fact's right side, the ground truth.
+fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), String> {
+    let width = match f.sort.as_deref() {
+        None | Some("w") => w,
+        Some("2w") => 2 * w,
+        Some("h") => w / 2,
+        Some("bool") => 1,
+        Some(s) => s
+            .parse()
+            .map_err(|_| format!("{}: unknown sort `{s}`", f.name))?,
+    };
+    let (mut lhs, mut rhs) = (instantiate(&f.lhs, w)?, instantiate(&f.rhs, w)?);
+    if f.sort.as_deref() == Some("bool") {
+        lhs = format!("(ite {lhs} #b1 #b0)");
+        rhs = format!("(ite {rhs} #b1 #b0)");
+    }
+    let bv = format!("(_ BitVec {w})");
+    let mut text = String::from("(set-logic QF_BV)\n");
+    let atoms: &[&str] = if compound {
+        &["a", "b", "c", "d", "e", "f", "u", "v"]
+    } else {
+        &["x", "y", "z", "u", "v"]
+    };
+    for a in atoms {
+        text.push_str(&format!("(declare-const {a} {bv})\n"));
+    }
+    if compound {
+        text.push_str(&format!(
+            "(define-fun x () {bv} (bvmul a b))\n(define-fun y () {bv} (bvor c d))\n\
+             (define-fun z () {bv} (bvsub e f))\n"
+        ));
+    }
+    text.push_str("(define-fun p () Bool (bvult u v))\n");
+    let sort = format!("(_ BitVec {width})");
+    text.push_str(&format!("(define-fun root0 () {sort} {lhs})\n"));
+    Ok((text, Truth { sort, rhs }))
+}
+
+/// One category's results in `--facts`.
+#[derive(Default)]
+struct Row {
+    category: String,
+    facts: usize,
+    cases: usize,
+    /// Per tool: answers no larger than the simpler side, and the simpler side itself.
+    solved: [usize; 3],
+    exact: [usize; 3],
+}
+
+/// `--facts`: every identity at 8 and 64 bits, over atoms and over compound terms, through the
+/// three tools. One markdown row per category: the cases, and per tool how many it solves (its
+/// answer no larger than the simpler side) and how many exactly (the simpler side itself).
+/// Unsolved cases go to standard error.
+fn run_facts(engine: &Engine, proofs: Option<&str>) {
+    let facts = facts().expect("the fact set parses");
+    let mut rows: Vec<Row> = Vec::new();
+    let mut micros: [Vec<f64>; 3] = Default::default();
+    let (mut wrong, mut failed, mut invalid) = ([0usize; 3], [0usize; 3], 0);
+    for (k, f) in facts.iter().enumerate() {
+        if rows.last().is_none_or(|r| r.category != f.category) {
+            rows.push(Row {
+                category: f.category.clone(),
+                ..Row::default()
+            });
+        }
+        rows.last_mut().expect("a row").facts += 1;
+        for (j, (w, compound)) in [(8u32, false), (8, true), (64, false), (64, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let case = format!("{}-{w}{}", f.name, if compound { "-compound" } else { "" });
+            let seed = 0xfac7_0000 + 4 * k as u64 + j as u64;
+            let read = fact_script(f, w, compound).and_then(|(script, truth)| {
+                let mut m = Measured::read(&script, "root0")?;
+                let t = m.truth(&script, &truth)?;
+                Ok((script, truth, m, t))
+            });
+            let (script, truth, mut m, t) = match read {
+                Ok(read) => read,
+                Err(e) => {
+                    eprintln!("invalid\t{case}: {e}");
+                    invalid += 1;
+                    continue;
+                }
+            };
+            if !m.equal_at(m.input, t, seed) {
+                eprintln!("invalid\t{case}: the two sides differ");
+                invalid += 1;
+                continue;
+            }
+            let truth_size = m.size(t);
+            if let Some(dir) = proofs {
+                let dir = std::path::Path::new(dir);
+                let (mut b, _) = bitwright(engine, &script).expect("bitwright answers");
+                let claim = obligation(&script, &mut b).expect("the answer exports");
+                std::fs::write(dir.join(format!("{case}.smt2")), claim).expect("a writable DIR");
+                let fact = format!(
+                    "{script}(define-fun bw_truth () {} {})\n(assert (not (= root0 bw_truth)))\n\
+                     (check-sat)\n",
+                    truth.sort, truth.rhs
+                );
+                std::fs::write(dir.join(format!("{case}.fact.smt2")), fact)
+                    .expect("a writable DIR");
+                continue;
+            }
+            let row = rows.last_mut().expect("a row");
+            row.cases += 1;
+            for tool in 0..3 {
+                match run(engine, tool, &script, &case, seed, Some(&truth)) {
+                    Outcome::Answer {
+                        size,
+                        micros: us,
+                        exact,
+                    } => {
+                        if size <= truth_size {
+                            row.solved[tool] += 1;
+                        } else {
+                            eprintln!("unsolved\t{}\t{case}", TOOLS[tool]);
+                        }
+                        row.exact[tool] += usize::from(exact);
+                        micros[tool].push(us);
+                    }
+                    Outcome::Wrong => wrong[tool] += 1,
+                    Outcome::Failed => failed[tool] += 1,
+                }
+            }
+        }
+    }
+    if proofs.is_some() {
+        println!("{} facts, {invalid} invalid cases", facts.len());
+        return;
+    }
+    println!(
+        "| identities | facts | cases | bitwright | z3 | Bitwuzla | bitwright exact | z3 exact | Bitwuzla exact |"
+    );
+    println!("|-|-:|-:|-:|-:|-:|-:|-:|-:|");
+    let mut total = Row {
+        category: "**all**".to_string(),
+        ..Row::default()
+    };
+    for row in &rows {
+        total.facts += row.facts;
+        total.cases += row.cases;
+        for t in 0..3 {
+            total.solved[t] += row.solved[t];
+            total.exact[t] += row.exact[t];
+        }
+    }
+    for r in rows.iter().chain([&total]) {
+        let (s, e) = (r.solved, r.exact);
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.category, r.facts, r.cases, s[0], s[1], s[2], e[0], e[1], e[2]
+        );
+    }
+    for (t, us) in micros.iter_mut().enumerate() {
+        us.sort_by(f64::total_cmp);
+        if !us.is_empty() {
+            println!(
+                "{}: median {:.1} µs, p95 {:.1} µs; wrong {}, failed {}",
+                TOOLS[t],
+                percentile(us, 50),
+                percentile(us, 95),
+                wrong[t],
+                failed[t]
+            );
+        }
+    }
+    if invalid > 0 {
+        println!("{invalid} cases whose two sides differ (left out)");
     }
 }
 
@@ -462,10 +959,27 @@ fn percentile(sorted: &[f64], p: usize) -> f64 {
 }
 
 fn main() {
-    let cases: u64 = std::env::args()
-        .nth(1)
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let proofs = match args.iter().position(|a| a == "--proofs") {
+        Some(i) => {
+            let dir = args.get(i + 1).expect("--proofs DIR").clone();
+            args.drain(i..i + 2);
+            Some(dir)
+        }
+        None => None,
+    };
+    let facts = args
+        .iter()
+        .position(|a| a == "--facts")
+        .map(|i| args.remove(i));
+    let cases: u64 = args
+        .first()
         .map_or(200, |a| a.parse().expect("CASES is a number"));
     let engine = Engine::standard();
+    if facts.is_some() {
+        run_facts(&engine, proofs.as_deref());
+        return;
+    }
     let corpora = [
         ("40 nodes, 8 bits", 8u16, 40usize, false),
         ("40 nodes, 64 bits", 64, 40, false),
@@ -477,10 +991,12 @@ fn main() {
         ),
         ("400 nodes, 64 bits", 64, 400, false),
     ];
-    println!(
-        "| corpus | tool | nodes before | nodes after | smaller | smallest | wrong | failed | median µs | p95 µs |"
-    );
-    println!("|-|-|-|-|-|-|-|-|-|-|");
+    if proofs.is_none() {
+        println!(
+            "| corpus | tool | nodes before | nodes after | smaller | smallest | wrong | failed | median µs | p95 µs |"
+        );
+        println!("|-|-|-|-|-|-|-|-|-|-|");
+    }
     for (name, bits, nodes, heavy) in corpora {
         let w = Width::new(bits).expect("width");
         let mut before = 0u64;
@@ -494,7 +1010,18 @@ fn main() {
             before += u64::from(n);
             sizes_before.push(n);
             let case = format!("{bits}-{nodes}{}-{seed:x}", if heavy { "h" } else { "" });
-            results.push([0, 1, 2].map(|t| run(&engine, t, &script, &case, seed)));
+            if let Some(dir) = &proofs {
+                let (mut m, _) = bitwright(&engine, &script).expect("bitwright answers");
+                let text = obligation(&script, &mut m).expect("the answer exports");
+                let path = std::path::Path::new(dir).join(format!("{case}.smt2"));
+                std::fs::write(path, text).expect("--proofs names a writable directory");
+                continue;
+            }
+            results.push([0, 1, 2].map(|t| run(&engine, t, &script, &case, seed, None)));
+        }
+        if let Some(dir) = &proofs {
+            println!("{name}: {cases} obligations in {dir}");
+            continue;
         }
         for (t, tool) in TOOLS.iter().enumerate() {
             let (mut after, mut smaller, mut smallest, mut wrong, mut failed) = (0u64, 0, 0, 0, 0);
@@ -508,7 +1035,9 @@ fn main() {
                     })
                     .min();
                 match outcomes[t] {
-                    Outcome::Answer { size, micros: us } => {
+                    Outcome::Answer {
+                        size, micros: us, ..
+                    } => {
                         after += u64::from(size);
                         smaller += usize::from(size < sizes_before[case]);
                         smallest += usize::from(Some(size) == best);

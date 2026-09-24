@@ -3,8 +3,9 @@
 Compares bitwright with other symbolic engines on public mixed Boolean-arithmetic (MBA)
 datasets: how much of each expression they simplify, how fast, and with how much memory; and,
 with [`versus-smt`](#versus-smt-the-smt-solvers-simplifiers), with the simplifiers of z3 and
-Bitwuzla on random bit-vector expressions. It is not part of the main workspace (it enables the
-`cobra` feature, which the workspace's own builds should not pick up) and not run in CI.
+Bitwuzla on random bit-vector expressions and on identities of bit-vector algebra. It is not
+part of the main workspace (it enables the `cobra` feature, which the workspace's own builds
+should not pick up) and not run in CI.
 
 | Tool | What runs |
 |-|-|
@@ -141,3 +142,20 @@ their input and how many are the smallest of the three (ties count for each), wr
 answers, and the median and 95th-percentile time. With `VERSUS_SMT_DUMP=DIR`, every case's
 script, each solver's answer as printed and each answer as bitwright reads it are written to
 `DIR`.
+
+**Identities.** `versus-smt --facts` runs the identities of
+[`facts/bitvector.txt`](facts/bitvector.txt) instead: 377 identities of bit-vector algebra in
+15 groups, written from textbook mathematics (the file's header gives the format), without
+mixed boolean-arithmetic ones. Each runs at 8 and 64 bits, over the atoms `x`, `y`, `z` and over
+compound terms (`x = a·b`, `y = c | d`, `z = e − f`), with `p` a comparison: 1,508 cases. Every
+tool starts from the unsimplified side as SMT-LIB text, so none gets a head start from another's
+reading of it. A case is solved when the answer is no larger than the simpler side, and exact
+when it is that side (both in bitwright's canonical form). The two sides of every case are
+checked equal at the 64 points first; a case that fails is reported and left out. It prints one
+row per group, and the cases a tool leaves unsolved go to standard error as `unsolved TOOL
+CASE`.
+
+`--proofs DIR` times nothing: it writes, per case, bitwright's answer against its input as
+`CASE.smt2`, and with `--facts` the identity itself as `CASE.fact.smt2`, for any SMT solver to
+prove (`unsat`). The obligation reads the input from the original text, so it checks the whole
+path from the text to the answer, bitwright's reading of the text included.
