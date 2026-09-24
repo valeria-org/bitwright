@@ -16,6 +16,14 @@ bitwright = { path = "../bitwright", features = ["mba", "cobra", "smtlib", "eqsa
 cobra = { package = "cobra-mba", version = "0.4" }
 egg = "0.11"
 
+[features]
+# `versus-smt`, linked against z3 and Bitwuzla releases (`Z3_DIR`, `BITWUZLA_DIR`; see the README).
+native-smt = []
+
+[[bin]]
+name = "versus-smt"
+required-features = ["native-smt"]
+
 [profile.release]
 debug = 1
 

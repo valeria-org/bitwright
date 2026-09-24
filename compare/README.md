@@ -1,9 +1,10 @@
 # bitwright-compare
 
 Compares bitwright with other symbolic engines on public mixed Boolean-arithmetic (MBA)
-datasets: how much of each expression they simplify, how fast, and with how much memory. It is
-not part of the main workspace (it enables the `cobra` feature, which the workspace's own builds
-should not pick up) and not run in CI.
+datasets: how much of each expression they simplify, how fast, and with how much memory; and,
+with [`versus-smt`](#versus-smt-the-smt-solvers-simplifiers), with the simplifiers of z3 and
+Bitwuzla on random bit-vector expressions. It is not part of the main workspace (it enables the
+`cobra` feature, which the workspace's own builds should not pick up) and not run in CI.
 
 | Tool | What runs |
 |-|-|
@@ -102,3 +103,41 @@ A ground truth that disagrees with its input is reported on standard error. How 
 its answers differs (bitwright commits only rewrites it can justify, CoBRA checks at sampled
 points, `cobra-cert` requires a Lean certificate, the others rewrite by construction); the
 `wrong` column checks every answer independently.
+
+## `versus-smt`: the SMT solvers' simplifiers
+
+`versus-smt` compares bitwright's simplifier (`Engine::standard()`) with z3's `simplify` and
+Bitwuzla's `simplify_term`, called in process through their C APIs with default settings. The
+inputs are random DAGs shaped like `bitwright-bench`'s (4 symbols; 40 or 400 operator nodes; 8
+or 64 bits), built only from operators SMT-LIB's QF_BV has natively: arithmetic, bitwise
+operations, shifts, comparisons under `ite`, truncations extended back, and in one corpus
+division, remainder and shifts by variable amounts. So no tool reads a lowered form of an
+operator another tool has as one node (bitwright exports rotations, population counts or
+byte swaps as several SMT-LIB operations).
+
+Every tool starts from the same SMT-LIB script, bitwright's export of the DAG, and is timed from
+that text to its answer, parsing included, in a context made before the clock starts; a case's
+time is the fastest of five runs. Answers are read back into bitwright, sized in DAG nodes of
+its canonical form like the MBA harness does, and checked against the input at 64 points (all
+zeros, all ones, one, the sign bit, then random values). z3 prints division by a divisor it has
+shown or guarded to be nonzero as `bvudiv_i` and the like; those are read as the plain operators
+(the points, zero included, would catch a difference).
+
+It links against the releases the nightly CI tests with (z3 5.1.0, Bitwuzla 0.9.1), unpacked
+anywhere, for example under `work/`:
+
+```sh
+curl -sSfLO https://github.com/Z3Prover/z3/releases/download/z3-5.1.0/z3-5.1.0-x64-glibc-2.39.zip
+curl -sSfLO https://github.com/bitwuzla/bitwuzla/releases/download/0.9.1/Bitwuzla-Linux-x86_64-static.zip
+unzip -q -d work z3-5.1.0-x64-glibc-2.39.zip && unzip -q -d work Bitwuzla-Linux-x86_64-static.zip
+Z3_DIR=$PWD/work/z3-5.1.0-x64-glibc-2.39 BITWUZLA_DIR=$PWD/work/Bitwuzla-Linux-x86_64-static \
+  cargo run --release --features native-smt --bin versus-smt -- 200
+```
+
+Bitwuzla's static libraries need GMP and MPFR (`libgmp.so.10`, `libmpfr.so.6`) and the C++
+runtime. The argument is the number of DAGs per corpus (200 by default). It prints one markdown
+row per corpus and tool: the nodes before and after (summed), how many answers are smaller than
+their input and how many are the smallest of the three (ties count for each), wrong and failed
+answers, and the median and 95th-percentile time. With `VERSUS_SMT_DUMP=DIR`, every case's
+script, each solver's answer as printed and each answer as bitwright reads it are written to
+`DIR`.

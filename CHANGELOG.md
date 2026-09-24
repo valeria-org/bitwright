@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **README.** The Performance section compares bitwright with other tools, each on what it is
+  built for: with the simplifiers of z3 5.1.0 and Bitwuzla 0.9.1 on random bit-vector DAGs
+  (bitwright's answer is the smallest for 799 of 800; Bitwuzla is faster), and with CoBRA on
+  CoBRA's MBA datasets (all 75,737 expressions with a ground truth solved, against 64,396). The
+  table of bitwright's costs per operation moved to `docs/benchmarking.md`, measured again on
+  0.7.0.
+- **Tooling.** `compare/`'s `versus-smt` (feature `native-smt`) runs bitwright's simplifier,
+  z3's `simplify` and Bitwuzla's `simplify_term` in process, through their C APIs, from the
+  same SMT-LIB text, on random DAGs over the operators SMT-LIB has natively, and reads every
+  answer back into bitwright to size and check it.
+
 ## 0.7.0
 
 - **Signed comparisons from flags.** The conditions a lifter computes from the flags of a

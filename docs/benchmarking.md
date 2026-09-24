@@ -100,6 +100,31 @@ successes: a faster row that simplifies less is not an improvement.
 Setup that is not part of what a benchmark measures is excluded, for example building the DAG
 whose facts are measured. It runs with the counters paused.
 
+## Reference numbers
+
+bitwright 0.7.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
+core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's CPU time;
+instructions are the median.
+
+| Operation | CPU time | Instructions |
+|-|-|-|
+| A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 157 to 169 |
+| A 512-bit multiplication / division | 30 ns / 1.4 µs | 831 / 38,458 |
+| Building a node (hash-consing and canonicalization) | 50 ns | 1,024 |
+| Evaluating a node | 30 ns | 482 |
+| The facts of a node, computed (known bits and ranges) | 0.42 to 0.54 µs | 5,630 to 6,840 |
+| A cached fact query | 28 ns | 378 |
+| Parsing a 60-node expression | 17 µs | 270,000 |
+| Simplifying a random 40-node expression | 0.37 ms | 5.5 M |
+| Simplifying in a fresh three-node context | 4.7 µs | 78,400 |
+| Deobfuscating a linear MBA expression (native solver) | 0.40 ms | 4.9 M |
+| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 1.3 ms | 36 M |
+| Building an engine (linking the built-in rules) | 5.8 µs | 90,600 |
+| SMT-LIB export / import, per node | 0.28 / 0.57 µs | 7,560 / 13,330 |
+
+On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 83
+nodes and 20 nonlinear ones from 141 to 25 (the signature solver: 92 and 71).
+
 ## Corpus diff
 
 `--corpus-diff` measures no instructions. It runs the deobfuscation strategy with the MBA
@@ -120,5 +145,8 @@ measures it against other symbolic engines on public MBA datasets (CoBRA's colle
 and its Rust port), Triton (through LLVM, and its synthesis), Z3, Bitwuzla, cvc5, claripy and
 Miasm. Every answer is checked against its input and sized in bitwright's canonical form, so
 all engines are scored the same way: how often each reaches the dataset's ground truth, how
-fast, and with how much heap. It is its own Cargo workspace and needs the other engines
-installed; its README has the setup.
+fast, and with how much heap. Its `versus-smt` compares bitwright's simplifier with the
+simplifiers of z3 and Bitwuzla, through their C APIs, on random bit-vector DAGs over the
+operators SMT-LIB has natively. It is its own Cargo workspace and needs the other engines
+installed; its README has the setup. The top-level README reports both comparisons
+([Performance](../README.md#performance)).
