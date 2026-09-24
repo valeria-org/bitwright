@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Tooling.** The scheduled CI jobs pass again. `nightly-deep` never finished: Ubuntu's z3
+  4.8.12 overruns its 5-second limit on a 512-bit `pext` (exported as 512 shifts by a counted
+  amount) and was still on it when the runner shut down two hours later. The job now installs
+  z3 5.1.0 from its release, as it does bitwuzla 0.9.1, and stops after an hour; the solver
+  harnesses kill a solver that runs past twice its limit (the query counts as inconclusive),
+  and each simplification query gets a solver of its own (17 s instead of 47 s). The fuzz jobs
+  stopped at once on the missing `corpus/<target>` directory: they create it, keep the corpus
+  between runs in the Actions cache, upload a crash's input, and fuzz five minutes per target
+  instead of ten, stopping after ten. `workflow_dispatch` runs the scheduled jobs on demand.
+
 ## 0.6.0
 
 - **Nonlinear MBA from the command line.** `bitwright simplify` deobfuscates by default: the

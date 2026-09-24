@@ -340,11 +340,21 @@ impl Solver {
     }
 
     /// The solver's output for `script` read from stdin, with `limit_ms` per `check-sat` (after
-    /// which it answers `unknown`); its stderr is appended when it fails. `None` if it cannot be
-    /// started.
+    /// which it answers `unknown`); its stderr is appended when it fails. A solver does not
+    /// always stop at its own limit (z3 4.8 runs for hours on some 512-bit queries), so with a
+    /// limit it is also killed after twice that per `check-sat` and ten seconds more; its output
+    /// then ends with `timeout`. `None` if it cannot be started.
     fn run(self, script: &str, limit_ms: Option<u32>) -> Option<String> {
-        use std::io::Write as _;
+        use std::io::{Read, Write as _};
         use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = r.read_to_end(&mut b);
+                b
+            })
+        }
         let mut cmd = Command::new(self.name());
         match (self, limit_ms) {
             (Solver::Z3, l) => {
@@ -355,18 +365,41 @@ impl Solver {
                 cmd.args(l.map(|ms| format!("--time-limit-per={ms}")));
             }
         }
+        let checks = script.matches("(check-sat)").count() as u64;
+        let deadline = limit_ms
+            .map(|ms| Instant::now() + Duration::from_millis(2 * u64::from(ms) * checks + 10_000));
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .ok()?;
-        child.stdin.take()?.write_all(script.as_bytes()).ok()?;
-        let out = child.wait_with_output().ok()?;
-        let mut s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !out.status.success() {
-            s.push('\n');
-            s.push_str(String::from_utf8_lossy(&out.stderr).trim());
+        // Fed and drained on their own threads, so the deadline is watched while it works.
+        let mut stdin = child.stdin.take()?;
+        let script = script.to_owned();
+        let feed = std::thread::spawn(move || stdin.write_all(script.as_bytes()));
+        let (out, err) = (drain(child.stdout.take()?), drain(child.stderr.take()?));
+        let status = loop {
+            if let Some(status) = child.try_wait().ok()? {
+                break Some(status);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let _ = feed.join();
+        let out = out.join().ok()?;
+        let mut s = String::from_utf8_lossy(&out).trim().to_string();
+        match status {
+            Some(status) if status.success() => {}
+            Some(_) => {
+                s.push('\n');
+                s.push_str(String::from_utf8_lossy(&err.join().ok()?).trim());
+            }
+            None => s = format!("{s}\ntimeout").trim_start().to_string(),
         }
         Some(s)
     }
@@ -608,7 +641,7 @@ fn solver_proves_the_built_in_rules(solver: Solver) {
                 ("unsat", false) => proved += 1,
                 ("sat", true) => refuted = true,
                 ("unsat", true) => {}
-                ("unknown", _) if ws.iter().any(|&w| w > 64) => {
+                ("unknown" | "timeout", _) if ws.iter().any(|&w| w > 64) => {
                     gave_up.push(format!("{name} {ws:?}"));
                 }
                 (a, _) => failures.push(format!("{name} {ws:?}: {a}")),

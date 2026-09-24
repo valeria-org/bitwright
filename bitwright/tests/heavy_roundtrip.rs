@@ -369,7 +369,8 @@ fn smtlib_export_then_import_keeps_meaning_heavy() {
 /// A solver proves the simplifier's results equivalent to their inputs (`unsat`), up to 512
 /// bits. A timeout or `unknown` is inconclusive and counted; `sat` is a counterexample, unless
 /// the query has extension calls (uninterpreted functions, whose models need not be real).
-/// Skipped, with a note, when the solver is not on `PATH`.
+/// Each query gets its own solver process, so one the solver cannot settle costs only its own
+/// time. Skipped, with a note, when the solver is not on `PATH`.
 #[cfg(feature = "smtlib")]
 fn solver_simplifications(solver: Solver, size: Size) {
     use bitwright::engine::{Engine, Strategy};
@@ -383,7 +384,6 @@ fn solver_simplifications(solver: Solver, size: Size) {
         .build()
         .unwrap();
     let (mut proved, mut inconclusive) = (0, 0);
-    let mut script = String::new();
     let mut cases = Vec::new();
     let reg = registry();
     for seed in 0..size.pick(6, 600u64) {
@@ -397,37 +397,25 @@ fn solver_simplifications(solver: Solver, size: Size) {
                 continue;
             }
             let q = equivalence_query(&mut cx, e, r.expr).unwrap();
-            // One logic for the whole batch (queries with calls say QF_UFBV).
-            let body: String = q
-                .lines()
-                .filter(|l| !l.starts_with("(set-logic"))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            script.push_str("(push 1)\n");
-            script.push_str(&body);
-            script.push_str("(pop 1)\n");
-            cases.push((
-                format!(
-                    "seed {:#x}: `{}` => `{}`",
-                    0x23_0000 + seed,
-                    cx.display(e),
-                    cx.display(r.expr)
-                ),
-                q.contains("QF_UFBV"),
-            ));
+            let case = format!(
+                "seed {:#x}: `{}` => `{}`",
+                0x23_0000 + seed,
+                cx.display(e),
+                cx.display(r.expr)
+            );
+            cases.push((case, q));
         }
     }
-    let out = solver
-        .run(&format!("(set-logic ALL)\n{script}"), Some(5000))
-        .unwrap();
-    let answers: Vec<&str> = out.lines().filter(|l| !l.starts_with('(')).collect();
-    assert_eq!(answers.len(), cases.len(), "{}: {out}", solver.name());
-    for (a, (case, uninterpreted)) in answers.iter().zip(&cases) {
-        match *a {
+    for (case, q) in &cases {
+        let out = solver.run(q, Some(5000)).unwrap();
+        let answers: Vec<&str> = out.lines().filter(|l| !l.starts_with('(')).collect();
+        assert_eq!(answers.len(), 1, "{}: {case}: {out}", solver.name());
+        match answers[0] {
             "unsat" => proved += 1,
-            // With extension calls as uninterpreted functions, a model may rest on values the
-            // real operation never takes (the reference suites check those results).
-            "sat" if *uninterpreted => inconclusive += 1,
+            // With extension calls as uninterpreted functions (queries with calls say
+            // QF_UFBV), a model may rest on values the real operation never takes (the
+            // reference suites check those results).
+            "sat" if q.contains("QF_UFBV") => inconclusive += 1,
             "sat" => panic!("{} found a counterexample: {case}", solver.name()),
             _ => inconclusive += 1,
         }
