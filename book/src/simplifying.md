@@ -20,6 +20,25 @@ assert!(out.changed);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Ways to simplify
+
+The same expressions can be simplified in several ways, depending on what a tool needs:
+
+| To | Use | See |
+|-|-|-|
+| clean up compiler or lifter output | `Engine::standard()` | below |
+| undo obfuscation, MBA included | `Strategy::deobfuscate()` with the MBA service, or the command line's `simplify` | [Deobfuscation and MBA](deobfuscation.md) |
+| run only some passes, or more rounds | a `Strategy` of your own `Phase`s | below |
+| simplify under a path condition | `Run::with_assumptions` | [Constraints](constraints.md) |
+| decide a condition without rewriting | `Context::prove`, `Context::facts` | [Facts and proofs](facts.md) |
+| rewrite a target's own idioms | rules of your own, linked with their proof ledger | [Writing rules](rules.md) |
+| find a smaller form the directed engine misses | the equality-saturation search | [Equality saturation](eqsat.md) |
+| keep some rewrites out, or watch them | `Hooks` and `Observer`s | below |
+| check a result independently | an SMT-LIB equivalence query | [SMT-LIB](smtlib.md) |
+| use a solver's results, or simplify its terms | SMT-LIB import | [SMT-LIB](smtlib.md) |
+
+[Examples](examples.md) shows each of them on a task from reverse engineering.
+
 ## Strategies
 
 `Strategy::standard()` is fact folding, the built-in rules, the normal-form passes (linear
@@ -27,6 +46,31 @@ arithmetic, xor forms, casts, equalities through invertible maps, comparisons, b
 tables, demanded bits) and the rules again. `Strategy::deobfuscate()` adds the linear-MBA and
 bit-shuffle passes (see [Deobfuscation and MBA](deobfuscation.md)). You can build your own from
 `Phase`s.
+
+A strategy of your own runs just the phases you name, in your order. One that only folds what
+the facts pin and collects linear sums cancels additive masking and leaves everything else as
+the lifter wrote it:
+
+```rust
+use bitwright::engine::{Engine, Phase, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let unmask = Engine::builder()
+    .builtin()
+    .strategy(Strategy::new("unmask", vec![Phase::FactFold, Phase::Linear]))
+    .build()?;
+let mut cx = Context::new();
+let e = cx.parse("(x + y) * 3 - 3 * y + ((z & 0xff) | (z & 0xff00))", &ParseOptions::width(Width::W32))?;
+let out = unmask.simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x * 3 + (z & 255 | z & 65280)");
+// The standard strategy merges the masks too.
+let out = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x * 3 + (z & 65535)");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`Phase::Local` runs the rules of the groups it names (the built-in groups are listed in the
+[rule catalog](catalog.md)), and `Strategy::max_rounds` bounds the rounds.
 
 Each pass commits a rewrite only if it makes the expression DAG strictly smaller, counted over
 everything the call keeps alive, so shared subexpressions are never duplicated to "simplify"

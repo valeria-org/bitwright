@@ -139,8 +139,43 @@ gives the canonical NaN on both sides, zeros keep their signs) and add no node: 
 `x + y`, `fma(x, y, −0)` is `x · y` except toward −∞, `x · 2` is `x + x`, `(−a) · (−b)` is
 `a · b` (and so for `/`), `−a < −b` is `b < a`, `x < x` is false, rounding to an integral value
 twice is rounding once, and a signed conversion of a zero or sign extension converts the operand
-itself. Identities that hold only on the values (`x · 1 = x` fails for a NaN with a payload,
-`x + (−0) = x` for `+0` toward −∞) are not applied.
+itself.
+
+Identities that hold only on some encodings (`x · 1 = x` fails for a NaN with a payload,
+`x + (−0) = x` for `+0` toward −∞) are the built-in rules of the group `core.float`, each
+guarded by what it needs: that an operand is no NaN (`fp.not_nan`), no zero (`fp.nonzero`) or
+finite (`fp.finite`), which the [facts](#facts) prove or do not. Dividing by a power of two
+whose reciprocal is a normal number becomes multiplying by the reciprocal, which is the same
+real number rounded once in the same mode. So a float that came from an integer, which the
+facts know is no NaN, loses a multiplication by 1.0, and `x · 1.0` of an unknown `x` stays:
+
+```rust
+use bitwright::engine::Engine;
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::standard();
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W64);
+for (float, simplified) in [
+    ("fp.mul.rne.f64(fp.from_sbv.rne.f64(i:32), 0x3ff0000000000000)", "fp.from_sbv.rne.f64(i)"),
+    ("fp.mul.rne.f64(x, 0x3ff0000000000000)", "fp.mul.rne.f64(x, 0x3ff0000000000000)"),
+    ("fp.div.rtz.f64(x, 0x4010000000000000)", "fp.mul.rtz.f64(x, 0x3fd0000000000000)"),
+    ("fp.eq.f64(fp.sqrt.rne.f64(fp.from_ubv.rne.f64(u:32)), fp.sqrt.rne.f64(fp.from_ubv.rne.f64(u:32)))", "1:1"),
+] {
+    let e = cx.parse(float, &o)?;
+    let out = engine.simplify(&mut cx, e)?;
+    assert_eq!(cx.display(out.expr).to_string(), simplified, "{float}");
+}
+# Ok::<(), bitwright::Error>(())
+```
+
+The rules are listed in the [rule catalog](catalog.md), and a rule of your own can use the same
+guards (see [Writing rules](rules.md#floating-point)).
+
+Comparisons and class tests of one operand combine as the bit-vector conditions do: a lifted
+`ucomiss` followed by `ja`, `(¬(x < y ∨ unordered)) ∧ ¬(x = y ∨ unordered)`, is `y < x`,
+and `iszero(x) ∨ issubnormal(x)` is one unsigned comparison of `x` without its sign bit (see
+[Examples](examples.md#conditions-from-lifted-flags)).
 
 ## Facts
 

@@ -536,16 +536,18 @@ def test_version():
 
 
 def test_the_book_examples():
-    """Every Python example of the book's chapter on the bindings runs (its checks are asserts)."""
+    """Every Python example of the book's chapters on the bindings and their examples runs (its
+    checks are asserts)."""
     import pathlib
 
-    chapter = pathlib.Path(__file__).parents[2] / "book" / "src" / "bindings.md"
-    text = chapter.read_text()
-    parts = text.split("```python\n")
-    assert len(parts) > 1
-    line = parts[0].count("\n") + 1
-    for part in parts[1:]:
-        code = part.split("```\n")[0]
-        # Padded so that a failure reports the chapter's line numbers.
-        exec(compile("\n" * line + code, str(chapter), "exec"), {})
-        line += part.count("\n") + 1
+    book = pathlib.Path(__file__).parents[2] / "book" / "src"
+    for chapter in (book / "bindings.md", book / "examples-bindings.md"):
+        text = chapter.read_text()
+        parts = text.split("```python\n")
+        assert len(parts) > 1
+        line = parts[0].count("\n") + 1
+        for part in parts[1:]:
+            code = part.split("```\n")[0]
+            # Padded so that a failure reports the chapter's line numbers.
+            exec(compile("\n" * line + code, str(chapter), "exec"), {})
+            line += part.count("\n") + 1

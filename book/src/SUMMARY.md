@@ -17,6 +17,8 @@
 - [SMT-LIB](smtlib.md)
 - [The command line](cli.md)
 - [C, C++ and Python](bindings.md)
+- [Examples](examples.md)
+- [Examples in Python, C and C++](examples-bindings.md)
 - [Stability](stability.md)
 
 ---

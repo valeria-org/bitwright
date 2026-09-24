@@ -180,3 +180,47 @@ Trusting backend certificates means trusting the backend: a host that needs inde
 turns `backend_certificates` off. Answers are then accepted only on bitwright's own
 certificates, which cover the fragments above, or on the proof of an `EquivalenceProver` the
 host supplies for the rest.
+
+## Beyond MBA
+
+Obfuscation rarely comes in one kind. The rest of the library handles what an obfuscator
+combines with MBA, all in the same run:
+
+- **Opaque predicates.** A condition whose value follows from the known bits or the ranges of
+  its operands is folded by the facts, so the dead arm of a branch or a `select` goes (see
+  [Facts and proofs](facts.md)).
+- **Encoded constants.** Multiplications by an odd constant and its inverse, complements that
+  cancel and sums that add up to a constant fold in the linear and rule passes.
+- **Lifted flags.** Sign, overflow, carry and zero flags spelled out bit by bit, and the flags
+  of a floating-point compare, combine back into the one comparison a branch tests.
+- **Hash checks.** A comparison of an invertible keyed mix with a constant becomes one of the
+  key with the preimage (see [Invertibility](invertibility.md)).
+- **Path conditions.** Under [assumptions](constraints.md), what the branches taken so far
+  imply is used too, and each result names the assumptions it relied on.
+
+```rust
+use std::sync::Arc;
+use bitwright::engine::{Engine, Strategy};
+use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::builder()
+    .builtin()
+    .strategy(Strategy::deobfuscate().with_mba(
+        MbaConfig::default().with_trust(MbaTrust::default().with_backend_certificates(false)),
+    ))
+    .mba_solver(Arc::new(NormalFormSolver::default()))
+    .build()?;
+let mut cx = Context::new();
+// An always-true predicate picks an MBA of `x + y` over a decoy, and the choice is multiplied
+// by 7 and by 7's inverse modulo 256.
+let e = cx.parse(
+    "select(((x | 1) & 1) == 1, (x ^ y) + 2 * (x & y), x * 0x34) * 7 * 0xb7",
+    &ParseOptions::width(Width::W8),
+)?;
+let out = engine.simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x + y");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+[Examples](examples.md) has one section for each of them.

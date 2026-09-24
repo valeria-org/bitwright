@@ -1,6 +1,7 @@
 # The command line
 
-`bitwright-cli` builds a `bitwright` binary for rule authors. Reports go to standard output
+`bitwright-cli` builds a `bitwright` binary: `simplify` for anyone with an expression to read,
+and the other commands for rule authors. Reports go to standard output
 (also when a check fails); errors, including a rule file's compile diagnostics, go to standard
 error. A command exits with 0 on success, 1 when a check fails (or `lint` finds errors), and 2
 on bad usage or unreadable input. `--` ends the options, for an expression starting with `-`.
@@ -13,6 +14,26 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright catalog [rules.bwr]` | A Markdown catalog of the rules: the built-in rules without a file. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
 | `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). |
+
+## Simplifying from the shell
+
+```text
+$ bitwright simplify --width 64 -- '(x & y) * (x | y) + (x & ~y) * (~x & y)'
+x * y
+$ bitwright simplify --width 8 -- '(x ^ 0xa5) * 0x3d * 0xf5'
+(x ^ -91) * 97
+$ bitwright simplify --width 32 -- '((a - b) >>u 31) ^ (((a ^ b) & (a ^ (a - b))) >>u 31)'
+zext<32>(a <s b)
+$ bitwright simplify --width 32 --assume 'x <u 16' --assume 'y == 3' -- '(x & 0xf0) + y * x'
+x * 3    # relies on 0, 1
+$ bitwright simplify --width 64 -- 'fp.div.rne.f64(x, 0x4010000000000000)'
+fp.mul.rne.f64(x, 0x3fd0000000000000)
+```
+
+The expression is in the [text syntax](getting-started.md), floating-point operations
+included; symbols have the `--width` (64 by default) unless they say otherwise (`b:8`).
+
+## Rule files
 
 A typical workflow for a rule file:
 

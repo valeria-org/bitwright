@@ -152,14 +152,19 @@ fn the_static_library() {
     assert_eq!(run(&mut Command::new(&exe)), C_EXPECTED);
 }
 
-/// The code blocks of `lang` in the book's chapter on the bindings.
+/// The code blocks of `lang` in the book's chapters on the bindings and their examples.
 fn book_blocks(lang: &str) -> Vec<String> {
-    let chapter = std::fs::read_to_string(manifest().join("../book/src/bindings.md")).unwrap();
     let fence = format!("```{lang}\n");
-    chapter
-        .split(&fence)
-        .skip(1)
-        .map(|rest| rest.split("```\n").next().unwrap().to_string())
+    ["bindings.md", "examples-bindings.md"]
+        .iter()
+        .flat_map(|chapter| {
+            let text =
+                std::fs::read_to_string(manifest().join("../book/src").join(chapter)).unwrap();
+            text.split(&fence)
+                .skip(1)
+                .map(|rest| rest.split("```\n").next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 

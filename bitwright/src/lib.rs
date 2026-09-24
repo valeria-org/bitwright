@@ -137,6 +137,9 @@ mod book {
     #[cfg(feature = "smtlib")]
     #[doc = include_str!("../../book/src/smtlib.md")]
     struct Smtlib;
+    #[cfg(all(feature = "check", feature = "mba", feature = "smtlib"))]
+    #[doc = include_str!("../../book/src/examples.md")]
+    struct Examples;
     #[doc = include_str!("../../book/src/stability.md")]
     struct Stability;
 }

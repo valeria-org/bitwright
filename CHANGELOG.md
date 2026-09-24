@@ -19,6 +19,13 @@
   same points in the same order, with half the instructions for nonlinear MBA at 64 bits
   (`simplify/mba-nonlinear/64` −52 %, the normal-form solver's nonlinear corpus of
   `--corpus-diff` −48 %).
+- **Book.** Two chapters of worked examples from reverse engineering: [Examples](book/src/examples.md)
+  (MBA, encoded constants, opaque predicates, lifted integer and floating-point flags, bit
+  shuffles, hash checks, floating point, path constraints, a rule of your own, batches, SMT-LIB)
+  and the same tasks from Python, C and C++; every example runs as a test. The introduction,
+  `Simplifying` (the ways to simplify, custom strategies), `Deobfuscation and MBA` (what
+  besides MBA it handles), `Floating point` (the built-in rules) and `The command line`
+  (`simplify` from the shell) are brought up to date.
 - **Behavior changes.** Floating-point results change where the new rules apply.
 
 ## 0.9.0
