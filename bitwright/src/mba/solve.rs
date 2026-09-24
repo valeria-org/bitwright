@@ -15,16 +15,25 @@ use crate::{BitVec, Width};
 pub struct MbaBudget {
     /// A work bound in the solver's own units.
     pub steps: u64,
+    /// Whether answers should carry the solver's own evidence (default true). A caller that
+    /// proves every answer itself asks without, and a solver may then skip checking an answer
+    /// it built exactly (answering [`Claim::Unverified`]); the engine does so when backend
+    /// certificates are not trusted.
+    pub evidence: bool,
 }
 
 impl Default for MbaBudget {
     fn default() -> Self {
-        MbaBudget { steps: 1 << 20 }
+        MbaBudget {
+            steps: 1 << 20,
+            evidence: true,
+        }
     }
 }
 
 setters!(MbaBudget {
     with_steps: steps: u64,
+    with_evidence: evidence: bool,
 });
 
 /// The evidence a solver attaches to an answer.

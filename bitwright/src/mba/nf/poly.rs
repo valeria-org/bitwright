@@ -359,6 +359,31 @@ impl Poly {
         Some(out)
     }
 
+    /// The same function with symbol `s` (read arithmetically) replaced by `r`, a polynomial
+    /// equal to it: `None` past `limit` monomials.
+    pub(crate) fn replace(&self, s: Sym, r: &Poly, limit: usize) -> Option<Poly> {
+        let mut out = Poly::zero(self.w);
+        let mut powers: Vec<Poly> = vec![Poly::constant(BitVec::one(self.w))];
+        for (m, c) in &self.terms {
+            let e = m.iter().find(|&&(t, _)| t == s).map_or(0, |&(_, e)| e);
+            let rest: Mono = m.iter().copied().filter(|&(t, _)| t != s).collect();
+            while powers.len() <= e as usize {
+                let next = powers.last()?.mul(r);
+                if next.len() > limit {
+                    return None;
+                }
+                powers.push(next);
+            }
+            for (pm, pc) in &powers[e as usize].terms {
+                out.add_term(mono_mul(&rest, pm), &mul(c, pc));
+            }
+            if out.len() > limit {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     /// The non-constant term with the fewest factors of two in its coefficient (the first of
     /// them).
     pub(crate) fn pivot(&self) -> Option<(&Mono, &BitVec)> {
@@ -503,6 +528,57 @@ impl Poly {
             q.add_term(qm, &qc);
         }
         Ok(Some(q))
+    }
+
+    /// `self = f·q + r` by the division algorithm in graded lexicographic order, the terms no
+    /// multiple of `f`'s leading monomial going to `r` (`b·c + b² − c·e − (b & c)·b` by `b` is
+    /// `b·(c + b − (b & c)) − c·e`). `f`'s leading coefficient must be odd. Work as for
+    /// [`div_exact`](Self::div_exact); `Ok(None)` when `q` is zero or `f` does not qualify.
+    pub(crate) fn div_rem(&self, f: &Poly, budget: &mut u64) -> Result<Option<(Poly, Poly)>, ()> {
+        let Some((lm, lc)) = f.leading() else {
+            return Ok(None);
+        };
+        if !lc.bit(0).unwrap_or(false) || lm.is_empty() {
+            return Ok(None);
+        }
+        *budget = budget.checked_sub(self.len() as u64).ok_or(())?;
+        let inv = odd_inverse(lc);
+        let tail: Vec<(&Mono, &BitVec)> = f.terms.iter().filter(|(m, _)| *m != lm).collect();
+        let mut rest: BTreeMap<Graded, BitVec> = self
+            .terms
+            .iter()
+            .map(|(m, c)| (Graded(m.clone()), *c))
+            .collect();
+        let (mut q, mut r) = (Poly::zero(self.w), Poly::zero(self.w));
+        while let Some((Graded(m), c)) = rest.pop_last() {
+            *budget = budget.checked_sub(f.len() as u64).ok_or(())?;
+            let Some(qm) = mono_div(&m, lm) else {
+                r.add_term(m, &c);
+                continue;
+            };
+            let qc = mul(&c, &inv);
+            for &(n, d) in &tail {
+                let v = mul(&qc, d);
+                if v.is_zero() {
+                    continue;
+                }
+                match rest.entry(Graded(mono_mul(&qm, n))) {
+                    Entry::Occupied(mut e) => {
+                        let x = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        if x.is_zero() {
+                            e.remove();
+                        } else {
+                            *e.get_mut() = x;
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                    }
+                }
+            }
+            q.add_term(qm, &qc);
+        }
+        Ok((!q.is_zero()).then_some((q, r)))
     }
 
     /// The one-position rule: a symbol of a class with the single position `j` takes only the
@@ -657,7 +733,11 @@ impl Poly {
     /// full expansion of the unmasked monomial (`c` its coefficient with every factor in class 0,
     /// which has every precision) leaves no term of that shape (modulo precision), the shape
     /// becomes that one unmasked term. Expansions over `limit` monomials are not tried.
-    pub(crate) fn declass(&self, classes: &Classes, limit: usize) -> Poly {
+    ///
+    /// A monomial with a symbol of `nulls` (masked conjunctions known to be zero) is zero
+    /// whatever its coefficient: such a class takes the others' coefficient
+    /// (`2·(a & b & M₁)` is `2·(a & b)` when `a & b & M₀` is zero).
+    pub(crate) fn declass(&self, classes: &Classes, limit: usize, nulls: &[Sym]) -> Poly {
         let w = self.w;
         if classes.len() <= 1 {
             return self.clone();
@@ -691,6 +771,13 @@ impl Poly {
             db.cmp(&da).then_with(|| a.cmp(b))
         });
         shapes.dedup();
+        let null = |m: &Mono| m.iter().any(|(s, _)| nulls.contains(s));
+        // The lowest position a monomial's symbols can take: its coefficient's precision.
+        let tau = |m: &Mono| -> u32 {
+            m.iter()
+                .map(|&(s, e)| u32::from(classes.low(usize::from(s.class))).saturating_mul(e))
+                .fold(0u32, u32::saturating_add)
+        };
         let mut rest = self.clone();
         let mut full = Poly::zero(w);
         for sh in shapes {
@@ -704,8 +791,25 @@ impl Poly {
                 .iter()
                 .map(|&(set, e)| (Sym { set, class: 0 }, e))
                 .collect();
-            let Some(c) = rest.terms.get(&rep).copied() else {
-                continue;
+            let c = match rest.terms.get(&rep) {
+                Some(c) if !null(&rep) => *c,
+                // Class 0's monomial is zero or absent: with every exponent 1 each monomial of
+                // the expansion has the unmasked coefficient, so the present one of the most
+                // precision gives it (the check below decides).
+                _ if !nulls.is_empty() && sh.iter().all(|&(_, e)| e == 1) => {
+                    let Some((_, c)) = by_shape
+                        .get(&sh)
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| !null(m) && m.iter().all(|(s, _)| s.class != FULL))
+                        .filter_map(|m| rest.terms.get(m).map(|c| (tau(m), *c)))
+                        .min_by_key(|&(t, _)| t)
+                    else {
+                        continue;
+                    };
+                    c
+                }
+                _ => continue,
             };
             let unmasked: Mono = sh
                 .iter()
@@ -725,6 +829,7 @@ impl Poly {
             };
             let mut diff = part.sub(&expansion);
             diff.reduce_core(classes);
+            diff.terms.retain(|m, _| !null(m));
             if diff.terms.keys().any(|m| !m.is_empty() && shape(m) == sh) {
                 continue;
             }

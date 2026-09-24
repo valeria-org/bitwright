@@ -25,9 +25,9 @@ impl Default for MbaLimits {
     fn default() -> Self {
         MbaLimits {
             max_vars: 8,
-            max_nodes: 256,
+            max_nodes: 2048,
             max_width: 512,
-            min_nodes: 5,
+            min_nodes: 4,
         }
     }
 }
@@ -89,7 +89,8 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
         | OpCode::Xor
         | OpCode::Not
         | OpCode::Zext
-        | OpCode::Sext => true,
+        | OpCode::Sext
+        | OpCode::Concat => true,
         OpCode::Extract => n.b == 0,
         OpCode::Shl | OpCode::LShr => cx
             .const_val(n.b)
@@ -99,12 +100,16 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
     }
 }
 
-/// Lowers the fragment rooted at `root` (arena index); non-fragment subterms become variables.
-pub(crate) fn lower_id(
-    cx: &Context,
-    root: u32,
-    lim: &MbaLimits,
-) -> Result<(MbaExpr, Bindings), Refusal> {
+/// Whether the fragment rooted at `root` is one [`lower_id`] takes (rooted at a fragment
+/// operator, within `lim`): its number of nodes, atoms included.
+pub(crate) fn fits(cx: &Context, root: u32, lim: &MbaLimits) -> Result<u32, Refusal> {
+    let (atoms, order) = scan(cx, root, lim)?;
+    Ok((atoms.len() + order.len()) as u32)
+}
+
+/// The fragment rooted at `root`: its atoms (in order of discovery) and its other nodes,
+/// operands first.
+fn scan(cx: &Context, root: u32, lim: &MbaLimits) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
     let mut atoms: Vec<u32> = Vec::new();
     let mut order: Vec<u32> = Vec::new();
     let mut seen: IdMap<u32, ()> = IdMap::default();
@@ -138,6 +143,16 @@ pub(crate) fn lower_id(
             stack.push((c, false));
         }
     }
+    Ok((atoms, order))
+}
+
+/// Lowers the fragment rooted at `root` (arena index); non-fragment subterms become variables.
+pub(crate) fn lower_id(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    let (atoms, order) = scan(cx, root, lim)?;
     let mut m = MbaExpr::new(atoms.iter().map(|&a| cx.width_of(a)).collect());
     let mut at: IdMap<u32, u32> = IdMap::default();
     for (&a, k) in atoms.iter().zip(0u32..) {
@@ -175,6 +190,25 @@ pub(crate) fn lower_id(
             OpCode::Zext => m.push_cast(MOp::Zext, arg(n.a), cx.width_of(i)),
             OpCode::Sext => m.push_cast(MOp::Sext, arg(n.a), cx.width_of(i)),
             OpCode::Extract => m.push_cast(MOp::Trunc, arg(n.a), cx.width_of(i)),
+            // `concat(hi, lo)` is `(hi << |lo|) + lo`, both extended (their bits are disjoint);
+            // a high part that is the low bits of a value of the full width is that value, the
+            // rest shifting out (`concat(trunc<62>(y), 3)` is `(y << 2) + 3`).
+            OpCode::Concat => (|| {
+                let w = cx.width_of(i);
+                let lw = cx.width_of(n.b);
+                let hn = cx.node(n.a);
+                let hi = if hn.op == OpCode::Extract && hn.b == 0 && cx.width_of(hn.a) == w {
+                    arg(hn.a)
+                } else {
+                    m.push_cast(MOp::Zext, arg(n.a), w)?
+                };
+                let hi = m.push(MOp::Shl(lw.bits()), &[hi])?;
+                let lo = match cx.const_val(n.b) {
+                    Some(c) => m.push(MOp::Const(c.zext(w).unwrap_or(BitVec::zero(w))), &[])?,
+                    None => m.push_cast(MOp::Zext, arg(n.b), w)?,
+                };
+                m.push(MOp::Add, &[hi, lo])
+            })(),
             _ => return Err(Refusal::Unsupported("not an MBA operator".into())),
         }
         .map_err(bad)?;

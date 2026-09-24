@@ -710,6 +710,12 @@ impl Context {
     /// argument is).
     pub(crate) fn transfer_at(&self, i: u32, op: &TOp, args: &[&Facts]) -> Facts {
         let n = self.node(i);
+        if n.op == OpCode::Add && n.a == n.b && args.len() == 2 {
+            // `a + a` is `a << 1`, whose transfer knows the low bit (an addition's does not
+            // know its operands are one value).
+            let one = Facts::constant(&BitVec::one(args[0].width()));
+            return transfer(&TOp::Bin(crate::ops::BinOp::Shl), &[args[0], &one]);
+        }
         if n.op == OpCode::Select {
             let f = transfer(op, args);
             return self

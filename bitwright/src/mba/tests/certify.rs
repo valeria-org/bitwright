@@ -333,13 +333,11 @@ fn a_point_function_is_refuted_by_its_constant_and_never_proved() {
 fn certificates_are_sized_and_budgeted() {
     let w = Width::W64;
     let vars = [w, w, w];
-    // Degree 2 over three 64-bit variables: 99,233 points.
-    let a = add(
-        mul(and(V(0), V(1)), or(V(0), V(1))),
-        mul(and(V(0), not(V(1))), and(not(V(0)), V(1))),
-    );
-    let a = add(a, V(2)).expr(&vars);
-    let b = add(mul(V(0), V(1)), V(2)).expr(&vars);
+    // Degree 2 over three 64-bit variables: 99,233 points. `(x & 1)² = x & 1` holds bit by bit,
+    // not as polynomials over symbols, so only the test decides it.
+    let low = || and(V(0), k(w, 1));
+    let a = add(mul(low(), low()), mul(V(1), V(2))).expr(&vars);
+    let b = add(low(), mul(V(1), V(2))).expr(&vars);
     let full = certify::prove(&a, &b, &mut Steps::new(u64::MAX)).unwrap();
     assert_eq!(full.verdict, Verdict::Proved);
     assert_eq!(full.points, certify::sparse_points(64, 3, 2));
@@ -351,7 +349,8 @@ fn certificates_are_sized_and_budgeted() {
         if budget < need {
             assert_eq!(r.verdict, Verdict::Unknown, "{budget}");
             assert!(r.over_budget);
-            assert_eq!(m.spent, 0, "nothing is spent on a test that is not run");
+            // Nothing is spent on a test that is not run; the symbolic comparison is cheap.
+            assert!(m.spent <= 64 && m.spent <= budget, "{budget}: {}", m.spent);
         } else {
             assert_eq!(r.verdict, Verdict::Proved);
         }
@@ -546,4 +545,232 @@ fn splits_agree_with_exhaustive_truth() {
     // Every decided pair was decided by cases.
     assert_eq!(split, proved + refuted);
     assert!(proved > 100 && refuted > 100, "{proved} {refuted}");
+}
+
+/// A random T-function (`+ − neg ~ & | ^`, left shifts by 1 or 2, products by small
+/// constants, small constants) over two variables.
+fn t_function(rng: &mut crate::testutil::Rng, w: Width, depth: u32) -> T {
+    if depth == 0 || rng.below(4) == 0 {
+        return match rng.below(5) {
+            0 => k(w, i128::from(rng.below(7)) - 3),
+            1 | 2 => V(0),
+            _ => V(1),
+        };
+    }
+    let a = t_function(rng, w, depth - 1);
+    match rng.below(10) {
+        0 => neg(a),
+        1 => not(a),
+        2 => un(MOp::Shl(1 + rng.below(2) as u16), a),
+        8 => mul(a, k(w, i128::from(rng.below(15)) - 7)),
+        op => {
+            let b = t_function(rng, w, depth - 1);
+            match op {
+                3 => add(a, b),
+                4 => sub(a, b),
+                5 => and(a, b),
+                6 => or(a, b),
+                _ => xor(a, b),
+            }
+        }
+    }
+}
+
+#[test]
+fn carries_decide_t_functions_exactly() {
+    // Against exhaustive evaluation at 5 bits: proved only equal pairs, refuted only unequal
+    // ones with a real counterexample, and decided unless products need more state than the
+    // cap.
+    let w = Width::new(5).unwrap();
+    let vars = [w, w];
+    let mut rng = crate::testutil::Rng(0xca7);
+    let (mut proved, mut refuted, mut declined) = (0, 0, 0);
+    for i in 0..400 {
+        let a = t_function(&mut rng, w, 4);
+        // Every other pair: an MBA identity applied to the same tree.
+        let b = if i % 2 == 0 {
+            t_function(&mut rng, w, 4)
+        } else {
+            let x = t_function(&mut rng, w, 2);
+            let y = t_function(&mut rng, w, 2);
+            // x + y = (x ^ y) + 2·(x & y), used as a difference.
+            sub(
+                add(a.clone(), add(x.clone(), y.clone())),
+                add(xor(x.clone(), y.clone()), un(MOp::Shl(1), and(x, y))),
+            )
+        };
+        let (ea, eb) = (a.expr(&vars), b.expr(&vars));
+        let truth = equal_everywhere(&ea, &eb);
+        let mut r = certify::Report::new();
+        if !certify::carries(&mut Steps::new(u64::MAX), &ea, &eb, &mut r).unwrap() {
+            assert_eq!(r.verdict, Verdict::Unknown);
+            declined += 1;
+            continue;
+        }
+        match r.verdict {
+            Verdict::Proved => {
+                assert!(truth, "proved an unequal pair: {a:?} vs {b:?}");
+                proved += 1;
+            }
+            Verdict::Refuted => {
+                assert!(!truth, "refuted an equal pair: {a:?} vs {b:?}");
+                let p = r.counterexample.clone().expect("a counterexample");
+                assert_ne!(ea.eval(&p), eb.eval(&p), "not a counterexample: {p:?}");
+                refuted += 1;
+            }
+            Verdict::Unknown => panic!("undecided: {a:?} vs {b:?}"),
+        }
+    }
+    assert!(
+        proved > 50 && refuted > 50 && declined < 20,
+        "{proved} {refuted} {declined}"
+    );
+    // `x << 0` is `x`: no state, no shifted bit (a wrapped `0 − 1` read it as 0).
+    let x0 = V(0);
+    let a = add(un(MOp::Shl(0), x0.clone()), V(1)).expr(&vars);
+    let b = add(x0, V(1)).expr(&vars);
+    let mut r = certify::Report::new();
+    assert!(certify::carries(&mut Steps::new(u64::MAX), &a, &b, &mut r).unwrap());
+    assert_eq!(r.verdict, Verdict::Proved);
+    // At 64 bits: no bit of y both follows a set bit and has none below it.
+    let w = Width::W64;
+    let y = V(0);
+    let zero = k(w, 0).expr(&[w]);
+    let a = and(and(add(y.clone(), y.clone()), y.clone()), neg(y.clone())).expr(&[w]);
+    let r = certify::prove(&a, &zero, &mut Steps::new(u64::MAX)).unwrap();
+    assert_eq!((r.verdict, r.cert), (Verdict::Proved, Some(Cert::Carries)));
+    let b = and(add(y.clone(), y.clone()), y.clone()).expr(&[w]);
+    let r = check(&b, &zero, false);
+    assert_eq!(r.verdict, Verdict::Refuted);
+}
+
+#[test]
+fn symbolic_equality_is_polynomial_identity_only() {
+    let mut work = 0;
+    for w in [8u16, 64, 512] {
+        let width = Width::new(w).unwrap();
+        let vars = [width, width];
+        let (x, y) = (V(0), V(1));
+        // (x & y)·(x | y) + (x & ~y)·(~x & y) = x·y: the same polynomial over x, y, x & y.
+        let a = add(
+            mul(and(x.clone(), y.clone()), or(x.clone(), y.clone())),
+            mul(
+                and(x.clone(), not(y.clone())),
+                and(not(x.clone()), y.clone()),
+            ),
+        )
+        .expr(&vars);
+        let b = mul(x.clone(), y.clone()).expr(&vars);
+        assert_eq!(certify::symbolic_equal(&a, &b, &mut work), Some(true));
+        // (x & 1)² = x & 1 bit by bit, not as polynomials: undecided here.
+        let low = || and(x.clone(), k(width, 1));
+        let a = mul(low(), low()).expr(&vars);
+        assert_eq!(
+            certify::symbolic_equal(&a, &low().expr(&vars), &mut work),
+            Some(false)
+        );
+    }
+    // Never equal for unequal pairs: random polynomial pairs, checked at random points.
+    let w = Width::W64;
+    let vars = [w, w, w];
+    for (a, b) in pairs(Frag::Poly, 64, 3, 0x5e11, 300) {
+        if certify::symbolic_equal(&a, &b, &mut work) == Some(true) {
+            let mut rng = crate::testutil::Rng(3);
+            for _ in 0..256 {
+                let p: Vec<BitVec> = vars
+                    .iter()
+                    .map(|&w| BitVec::wrapping_from_u64(w, rng.next()))
+                    .collect();
+                assert_eq!(a.eval(&p), b.eval(&p), "{a:?} vs {b:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn atoms_through_complements_bitwise_forms_and_definitions() {
+    let w = Width::W64;
+    let prove = |a: &T, b: &T, vars: &[Width]| {
+        certify::prove(&a.expr(vars), &b.expr(vars), &mut Steps::new(1 << 30))
+            .unwrap()
+            .verdict
+    };
+    let (x, y, z) = (V(0), V(1), V(2));
+    let vars = [w, w, w];
+    let one = || k(w, 1);
+    // `(b ^ c) − 1` is the complement of the answer's atom `−(b ^ c)`, `−1 − b·c` of `b·c`,
+    // and `v | u` read arithmetically is `v + u − (v & u)` with each lone atom its definition.
+    let u = || xor(x.clone(), y.clone());
+    let v = || mul(x.clone(), y.clone());
+    let q = add(
+        add(sub(v(), u()), one()),
+        or(sub(u(), one()), sub(k(w, -1), v())),
+    );
+    assert_eq!(prove(&q, &or(neg(u()), v()), &vars), Verdict::Proved);
+    // Changed slightly: never proved.
+    let wrong = add(
+        add(sub(v(), u()), k(w, 2)),
+        or(sub(u(), one()), sub(k(w, -1), v())),
+    );
+    assert_ne!(prove(&wrong, &or(neg(u()), v()), &vars), Verdict::Proved);
+    // (((e − 1) & d) − e) & d is d: the atom is the bitwise function ~(e − 1) | d.
+    let q = and(
+        sub(and(sub(y.clone(), one()), x.clone()), y.clone()),
+        x.clone(),
+    );
+    assert_eq!(prove(&q, &x, &vars), Verdict::Proved);
+    assert_ne!(prove(&q, &y, &vars), Verdict::Proved);
+    // An atom read only as a multiple of itself, class by class: 9·(a & −2) + 8·(a & 1) −
+    // 7·a − 2·~(a | −2) − ~(a | 1) + 2·~a is a − 2, with a = (x ^ y) + 1.
+    let a = || add(u(), one());
+    let m2 = || k(w, -2);
+    let q = [
+        mul(k(w, 9), and(a(), m2())),
+        mul(k(w, 8), and(a(), one())),
+        mul(k(w, -7), a()),
+        mul(k(w, -2), not(or(a(), m2()))),
+        neg(not(or(a(), one()))),
+        mul(k(w, 2), not(a())),
+    ]
+    .into_iter()
+    .reduce(add)
+    .unwrap();
+    assert_eq!(prove(&q, &sub(u(), one()), &vars), Verdict::Proved);
+    assert_ne!(prove(&q, &u(), &vars), Verdict::Proved);
+    let _ = z;
+}
+
+/// A bitwise function read arithmetically whose expansion is one leaf (here `y`: `(−x ^ ~y) ^
+/// (x − 1)` with `x − 1` the complement of `−x`) is that leaf's node in the skeleton, not the
+/// node built last: `((y & x) | x) + ((x − 1) ^ (~y ^ −x))` is `x + y`, not `2·x`. Refuted
+/// wrongly at 64 bits (where the compositional test decides) before the fix.
+#[test]
+fn a_one_leaf_expansion_is_its_leaf() {
+    let w = Width::W64;
+    // As the engine lowers it: operands in this order.
+    let mut q = MbaExpr::new(vec![w, w]);
+    let x = q.push(MOp::Var(0), &[]).unwrap();
+    let y = q.push(MOp::Var(1), &[]).unwrap();
+    let nx = q.push(MOp::Neg, &[x]).unwrap();
+    let ny = q.push(MOp::Not, &[y]).unwrap();
+    let t = q.push(MOp::Xor, &[ny, nx]).unwrap();
+    let m1 = q.push(MOp::Const(BitVec::ones(w)), &[]).unwrap();
+    let xm1 = q.push(MOp::Add, &[x, m1]).unwrap();
+    let f = q.push(MOp::Xor, &[xm1, t]).unwrap();
+    let xy = q.push(MOp::And, &[x, y]).unwrap();
+    let o = q.push(MOp::Or, &[xy, x]).unwrap();
+    q.push(MOp::Add, &[o, f]).unwrap();
+    let side = |twice: bool| {
+        let mut m = MbaExpr::new(vec![w, w]);
+        let a = m.push(MOp::Var(0), &[]).unwrap();
+        let b = m.push(MOp::Var(1), &[]).unwrap();
+        m.push(MOp::Add, &[a, if twice { a } else { b }]).unwrap();
+        m
+    };
+    let r = certify::prove(&q, &side(false), &mut Steps::new(1 << 40)).unwrap();
+    assert_eq!((r.verdict, r.internal), (Verdict::Proved, 0));
+    let r = certify::prove(&q, &side(true), &mut Steps::new(1 << 40)).unwrap();
+    assert_eq!(r.verdict, Verdict::Refuted);
+    let p = r.counterexample.expect("a counterexample");
+    assert_ne!(q.eval(&p), side(true).eval(&p));
 }

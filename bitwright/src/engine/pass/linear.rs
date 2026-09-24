@@ -12,7 +12,7 @@ use super::{Fin, PassKind, Runner, Step, Stop, facts, finish, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
-use crate::facts::known::bv_and;
+use crate::facts::known::{bv_and, count_ones};
 use crate::ops::{BinOp, UnOp};
 
 /// The most terms a form keeps before its node is treated as an atom.
@@ -132,24 +132,125 @@ impl Form {
 }
 
 /// An upper bound on the nodes [`emit`] creates for `form`: a constant and an operator per scaled
-/// term, an operator per extra term, a negation when no term is positive, and the constant with
-/// its add.
+/// term, an operator per extra term, a `~` for a term the constant is folded into, and the
+/// constant with its operator (or a negation when no term is positive and there is no
+/// constant).
 pub(super) fn estimate(form: &Form) -> u32 {
-    let w = form.konst.width();
+    // Which term takes the constant in does not change the count.
+    count(&plan(form, &form.terms))
+}
+
+/// What [`emit`] writes for a form: the constant and the terms `(atom, coefficient, under ~)`,
+/// the whole complemented when `not`.
+struct Plan {
+    konst: BitVec,
+    terms: Vec<(u32, BitVec, bool)>,
+    not: bool,
+}
+
+/// The nodes [`emit`] creates for `plan`: a constant and an operator per scaled term, an
+/// operator per extra term, a `~` per complemented term and for the whole, and the constant
+/// with its operator (or a negation when no term is positive and there is no constant).
+fn count(plan: &Plan) -> u32 {
+    let (konst, terms) = (&plan.konst, &plan.terms);
+    let w = konst.width();
     let one = BitVec::one(w);
-    let t = form.terms.len() as u32;
-    let scaled = form
-        .terms
+    let t = terms.len() as u32;
+    let two = BitVec::wrapping_from_u64(w, 2);
+    let doubled = |k: &BitVec| *k == two || BitVec::un_unchecked(UnOp::Neg, k) == two;
+    let scaled = terms
         .iter()
-        .filter(|(_, k)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one)
+        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one && !doubled(k))
         .count() as u32;
-    let all_negative = t > 0 && form.terms.iter().all(|(_, k)| k.msb());
-    let konst = match (t, form.konst.is_zero()) {
+    // `a + a` is one node.
+    let doubles = terms.iter().filter(|(_, k, _)| doubled(k)).count() as u32;
+    let nots = terms.iter().filter(|(_, _, not)| *not).count() as u32;
+    let minus_one = BitVec::ones(w);
+    // With no positive term and no constant, a negation only when every coefficient is −1.
+    let negation = t > 0 && terms.iter().all(|(_, k, _)| *k == minus_one);
+    let konst = match (t, konst.is_zero()) {
         (0, _) => 1,
-        (_, true) => 0,
+        (_, true) => u32::from(negation),
         _ => 2,
     };
-    2 * scaled + t.saturating_sub(1) + u32::from(all_negative) + konst
+    2 * scaled + doubles + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
+}
+
+/// What [`emit`] writes for `form`, terms in the given order: the cheapest of trading the
+/// constant for complements (ties to the plain sum). The first term whose coefficient equals
+/// the constant takes it in, `k·a + k = (−k)·~a`, when the constant is negative (`−x − 1` is
+/// `~x`) or a power of two from 2 (`2·y + 2` is `~y·−2`, where the shift's amount would be a
+/// second constant); a constant 1 goes into a term of coefficient 1 beside another term
+/// (`a + t + 1` is `a − ~t`) or splits one of coefficient 2 (`2·t + 1` is `t − ~t`); and a
+/// constant −1 complements the negated rest (`−1 − 2·x` is `~(x + x)`).
+fn plan(form: &Form, order: &[(u32, BitVec)]) -> Plan {
+    let w = form.konst.width();
+    let neg = |k: &BitVec| BitVec::un_unchecked(UnOp::Neg, k);
+    let one = BitVec::one(w);
+    let mut konst = form.konst;
+    let mut terms: Vec<(u32, BitVec, bool)> = order.iter().map(|&(a, k)| (a, k, false)).collect();
+    let pow2 = !konst.msb() && count_ones(&konst) == 1 && konst != one;
+    if (konst.msb() || pow2)
+        && let Some(t) = terms.iter_mut().find(|(_, k, _)| *k == konst)
+    {
+        t.1 = neg(&t.1);
+        t.2 = true;
+        konst = BitVec::zero(w);
+    }
+    let base = Plan {
+        konst,
+        terms,
+        not: false,
+    };
+    let plain: Vec<(u32, BitVec, bool)> = order.iter().map(|&(a, k)| (a, k, false)).collect();
+    let mut best = base;
+    let consider = |p: Plan, best: &mut Plan| {
+        if count(&p) < count(best) {
+            *best = p;
+        }
+    };
+    if form.konst == one {
+        if plain.len() >= 2
+            && let Some(i) = plain.iter().position(|(_, k, _)| *k == one)
+        {
+            let mut t = plain.clone();
+            t[i] = (t[i].0, neg(&one), true);
+            consider(
+                Plan {
+                    konst: BitVec::zero(w),
+                    terms: t,
+                    not: false,
+                },
+                &mut best,
+            );
+        }
+        let two = BitVec::wrapping_from_u64(w, 2);
+        if let Some(i) = plain.iter().position(|(_, k, _)| *k == two) {
+            let mut t = plain.clone();
+            let a = t[i].0;
+            t[i] = (a, one, false);
+            t.push((a, neg(&one), true));
+            consider(
+                Plan {
+                    konst: BitVec::zero(w),
+                    terms: t,
+                    not: false,
+                },
+                &mut best,
+            );
+        }
+    }
+    if form.konst == BitVec::ones(w) && !plain.is_empty() {
+        consider(
+            Plan {
+                konst: BitVec::zero(w),
+                terms: plain.iter().map(|&(a, k, _)| (a, neg(&k), false)).collect(),
+                not: true,
+            },
+            &mut best,
+        );
+    }
+    best
 }
 
 /// Whether the node's operator can be part of a linear region.
@@ -165,6 +266,7 @@ fn linear_op(op: OpCode) -> bool {
             | OpCode::Or
             | OpCode::Xor
             | OpCode::Const
+            | OpCode::Concat
     )
 }
 
@@ -241,6 +343,22 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             }
             None => Form::atom(i, w),
         },
+        // `concat(trunc(x), c)` with `x` of the full width is `x·2^|c| + c`: the bits of `x`
+        // the truncation drops shift out.
+        OpCode::Concat => {
+            let hi = cx.node(node.a);
+            match cx.const_val(node.b) {
+                Some(c) if hi.op == OpCode::Extract && hi.b == 0 && cx.width_of(hi.a) == w => {
+                    let j = u32::from(cx.width_of(node.b).bits());
+                    let scale = crate::facts::known::bv_shl(&BitVec::one(w), j);
+                    let mut f = Form::atom(hi.a, w).scale(&scale);
+                    let lo = c.zext(w).unwrap_or(BitVec::zero(w));
+                    f.konst = BitVec::bin_unchecked(BinOp::Add, &f.konst, &lo);
+                    f
+                }
+                _ => Form::atom(i, w),
+            }
+        }
         OpCode::Or | OpCode::Xor => {
             let (fa, fina) = facts(r, cx, node.a)?;
             let (fb, finb) = facts(r, cx, node.b)?;
@@ -268,16 +386,32 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
 
 /// Emits `form` canonically.
 pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, Stop> {
-    let w = form.konst.width();
-    let mut terms = form.terms.clone();
+    let mut order = form.terms.clone();
+    order.sort_by(|a, b| cx.order(a.0, b.0));
+    let Plan {
+        konst,
+        mut terms,
+        not: complemented,
+    } = plan(form, &order);
+    let w = konst.width();
+    for (a, _, not) in terms.iter_mut() {
+        if *not {
+            let x = *a;
+            *a = r.build(cx, |cx| cx.c_un(UnOp::Not, x))?;
+        }
+    }
     terms.sort_by(|a, b| cx.order(a.0, b.0));
     // Positive (signed non-negative) coefficients first, in canonical order; then the negated.
-    let (pos, neg): (Vec<_>, Vec<_>) = terms.into_iter().partition(|(_, k)| !k.msb());
+    let (pos, neg): (Vec<_>, Vec<_>) = terms.into_iter().partition(|(_, k, _)| !k.msb());
     let term =
         |r: &mut Runner<'_, '_>, cx: &mut Context, a: u32, k: &BitVec| -> Result<u32, Stop> {
             r.meter.charge(Counter::PassWork, 1)?;
             if *k == BitVec::one(w) {
                 return Ok(a);
+            }
+            // `a + a`: one node, where a shift needs its amount too.
+            if *k == BitVec::wrapping_from_u64(w, 2) {
+                return r.build(cx, |cx| cx.c_bin(BinOp::Add, a, a));
             }
             if crate::facts::known::count_ones(k) == 1 {
                 let sh = BitVec::apply_un(UnOp::Ctz, k).map_err(|e| Stop::Error(e.into()))?;
@@ -292,14 +426,36 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
             })
         };
     let mut acc: Option<u32> = None;
-    for (a, k) in &pos {
+    for (a, k, _) in &pos {
         let t = term(r, cx, *a, k)?;
         acc = Some(match acc {
             None => t,
             Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::Add, x, t))?,
         });
     }
-    for (a, k) in &neg {
+    // With no positive term, the constant starts the sum (`5 − 3·x`), or else the first
+    // negative term is a product by its (negative) coefficient, one node cheaper than negating
+    // it (`y·−2` for `−(y << 1)`); a coefficient of −1 stays a negation.
+    let mut konst_left = konst;
+    let mut first = None;
+    if acc.is_none() && !neg.is_empty() {
+        if !konst.is_zero() {
+            acc = Some(r.build(cx, |cx| cx.mk_const(&konst))?);
+            konst_left = BitVec::zero(w);
+        } else if let Some(i) = neg.iter().position(|(_, k, _)| *k != BitVec::ones(w)) {
+            let (a, k, _) = neg[i];
+            r.meter.charge(Counter::PassWork, 1)?;
+            acc = Some(r.build(cx, |cx| {
+                let c = cx.mk_const(&k)?;
+                cx.c_bin(BinOp::Mul, a, c)
+            })?);
+            first = Some(i);
+        }
+    }
+    for (i, (a, k, _)) in neg.iter().enumerate() {
+        if first == Some(i) {
+            continue;
+        }
         let nk = BitVec::un_unchecked(UnOp::Neg, k);
         let t = term(r, cx, *a, &nk)?;
         acc = Some(match acc {
@@ -307,15 +463,19 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
             Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::Sub, x, t))?,
         });
     }
-    let konst = form.konst;
     r.meter.check()?;
-    match acc {
-        None => r.build(cx, |cx| cx.mk_const(&konst)),
-        Some(x) if konst.is_zero() => Ok(x),
+    let sum = match acc {
+        None => r.build(cx, |cx| cx.mk_const(&konst_left)),
+        Some(x) if konst_left.is_zero() => Ok(x),
         Some(x) => r.build(cx, |cx| {
-            let c = cx.mk_const(&konst)?;
+            let c = cx.mk_const(&konst_left)?;
             cx.c_bin(BinOp::Add, x, c)
         }),
+    }?;
+    if complemented {
+        r.build(cx, |cx| cx.c_un(UnOp::Not, sum))
+    } else {
+        Ok(sum)
     }
 }
 
@@ -332,7 +492,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let mut atoms: Vec<u32> = form.terms.iter().map(|t| t.0).collect();
     atoms.sort_unstable();
     let estimate = estimate(&form);
-    if let Some(f) = worth_building(r, cx, n, &atoms, estimate)? {
+    // A constant always commits (see `shrinks`).
+    if !form.terms.is_empty()
+        && let Some(f) = worth_building(r, cx, n, &atoms, estimate)?
+    {
         r.stats.passes.entry("linear").or_default().rejected_cost += 1;
         return Ok(Step::Normal(form.fin.and(f)));
     }

@@ -183,8 +183,29 @@ fn simplify_runs_the_engine() {
     let (code, out, _) = run(&["simplify", "(x ^ y) + 2 * (x & y)", "--deobfuscate"]);
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "x + y");
+    // The standard strategy has no linear-MBA pass.
+    let (code, out, _) = run(&["simplify", "(x | y) - (x & y)", "--standard"]);
+    assert_eq!((code, out.trim()), (0, "(x | y) - (x & y)"));
+    assert_eq!(run(&["simplify", "x", "--standard", "--deobfuscate"]).0, 2);
     assert_eq!(run(&["simplify", "x +", "--width", "8"]).0, 2);
     assert_eq!(run(&["simplify", "x", "--width", "0"]).0, 2);
+}
+
+/// Nonlinear MBA simplifies by default (the MBA service with the native solver).
+#[test]
+fn simplify_deobfuscates_nonlinear_mba() {
+    for (input, simplified) in [
+        (
+            "-8*~y*(x&y)-8*~y*(x&~y)+10*~y*x+3*~y*~(x|y)+8*(x^y)*(x&y)+8*(x^y)*(x&~y)\
+             -10*(x^y)*x-3*(x^y)*~(x|y)-3*~y*(x|~y)-1*~y*~x+3*(x^y)*(x|~y)+1*(x^y)*~x",
+            "(~x ^ y) - y",
+        ),
+        ("(x & y) * (x | y) + (x & ~y) * (~x & y)", "x * y"),
+    ] {
+        let (code, out, err) = run(&["simplify", input]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out.trim(), simplified, "{input}");
+    }
 }
 
 /// The book's catalog page is the output of `bitwright catalog`.

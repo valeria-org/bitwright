@@ -12,7 +12,7 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright smt rules.bwr` | Prints each rule's soundness obligation as SMT-LIB, separated by `(reset)`, at every admitted assignment of the widths 8, 32 and 64; a rule admitted at none of those gets three other admitted assignments. `--widths 13` (one width per width variable) and `--rule group::name` narrow it. A rule with no obligation prints a line the solver echoes (`SKIPPED …`) and the command exits 1. |
 | `bitwright catalog [rules.bwr]` | A Markdown catalog of the rules: the built-in rules without a file. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
-| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`, `--deobfuscate`). Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). |
+| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). |
 
 A typical workflow for a rule file:
 

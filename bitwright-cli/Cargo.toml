@@ -15,7 +15,7 @@ name = "bitwright"
 path = "src/main.rs"
 
 [dependencies]
-bitwright = { path = "../bitwright", features = ["check", "smtlib"] }
+bitwright = { path = "../bitwright", features = ["check", "smtlib", "mba"] }
 
 [lints]
 workspace = true

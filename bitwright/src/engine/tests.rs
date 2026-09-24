@@ -736,7 +736,7 @@ fn rewrite_chains_reach_the_normal_form() {
     let mut cx = Context::new();
     let o = ParseOptions::width(Width::W8);
     // `-~x` becomes `x + 1`, whose operands share no bits, so it becomes `x | 1`: two rewrites
-    // at the same node.
+    // at the same node. (The linear pass then writes `2·y + 1` as `y − ~y`.)
     let e = cx.parse("-(~(y << 1))", &o).unwrap();
     let mut census = RuleCensus::default();
     let out = engine
@@ -749,8 +749,11 @@ fn rewrite_chains_reach_the_normal_form() {
             },
         )
         .unwrap();
-    assert_eq!(out.stats.rewrites, 2, "{census:?}");
-    assert_eq!(cx.parse("(y << 1) | 1", &o).unwrap(), out.roots[0].expr);
+    let applied = |name: &str| census.rules.get(name).map_or(0, |c| c.applied);
+    assert_eq!(applied("core.arith::neg_not"), 1, "{census:?}");
+    assert_eq!(applied("core.arith::add_disjoint"), 1, "{census:?}");
+    assert_eq!(out.stats.rewrites, 3, "{census:?}");
+    assert_eq!(cx.parse("y - ~y", &o).unwrap(), out.roots[0].expr);
 }
 
 /// Rules covering every parameter kind and every kind of pattern root, for the dispatch net.

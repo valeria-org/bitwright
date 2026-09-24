@@ -891,6 +891,14 @@ struct Runner<'r, 'a> {
     /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
     /// rebuilt, over its operands' results, into one a pass rewrote it from (see `local`).
     rewritten: IdMap<(u32, u32), ()>,
+    /// In the MBA phase: the user through which the walk first reached each node (see
+    /// `pass::mba_step`).
+    chain_parent: IdMap<u32, u32>,
+    /// In the MBA phase: whether the question at a node is asked (see `pass::mba::asks`).
+    asks: IdMap<u32, bool>,
+    /// In the MBA phase: the nodes whose question was considered before their operands were
+    /// walked, with its finality when it was asked and not taken (see `pass::mba_first`).
+    first: IdMap<u32, Option<Fin>>,
 }
 
 impl Runner<'_, '_> {
@@ -916,18 +924,55 @@ impl Runner<'_, '_> {
         }
     }
 
-    /// Records that node `n` is no longer used in this phase run (it was replaced): its edges
-    /// stop counting as uses of its operands.
-    fn retire(&mut self, cx: &Context, n: u32) {
-        if self.dead.insert(n, ()).is_some() {
-            return;
-        }
-        if self.counted.remove(&n).is_some()
-            && let Some(uses) = self.uses.as_mut()
+    /// Whether `phase` is the MBA service.
+    fn is_mba(&self, phase: usize) -> bool {
+        #[cfg(feature = "mba")]
         {
+            matches!(self.inner.phases[phase], PhaseImpl::Mba(_))
+        }
+        #[cfg(not(feature = "mba"))]
+        {
+            let _ = phase;
+            false
+        }
+    }
+
+    /// `r` replaces `n`: it is reached through `n`'s user.
+    fn inherit_parent(&mut self, n: u32, r: u32) {
+        if let Some(&p) = self.chain_parent.get(&n) {
+            self.chain_parent.entry(r).or_insert(p);
+        }
+    }
+
+    /// Records that node `n` is no longer used in this phase run (it was replaced): its edges
+    /// stop counting as uses of its operands, and an operand that no counted node uses any
+    /// more (and that is no root of the call) goes the same way. A node used again later is
+    /// counted again (see `pass::refresh_uses`).
+    fn retire(&mut self, cx: &Context, n: u32) {
+        let mut stack = vec![n];
+        let mut orphans: Vec<u32> = Vec::new();
+        while let Some(n) = stack.pop() {
+            if self.dead.insert(n, ()).is_some() {
+                continue;
+            }
+            if self.counted.remove(&n).is_none() {
+                continue;
+            }
+            let Some(uses) = self.uses.as_mut() else {
+                continue;
+            };
+            orphans.clear();
             for c in cx.node(n).children() {
                 if let Some(u) = uses.get_mut(&c) {
                     *u = u.saturating_sub(1);
+                    if *u == 0 {
+                        orphans.push(c);
+                    }
+                }
+            }
+            for &c in &orphans {
+                if self.counted.contains_key(&c) && !self.live_roots.contains(&c) {
+                    stack.push(c);
                 }
             }
         }
@@ -967,6 +1012,9 @@ impl Runner<'_, '_> {
             self.counted.clear();
             self.dead.clear();
             self.partial[phase].clear();
+            self.chain_parent.clear();
+            self.asks.clear();
+            self.first.clear();
             self.phase_start = cx.len() as u32;
             if let Some(slot) = self.live_roots.get_mut(self.active) {
                 *slot = root;
@@ -1021,8 +1069,37 @@ impl Runner<'_, '_> {
                         self.set(cx, phase, n, n, Fin::FINAL);
                         continue;
                     }
+                    let mba = !local && self.is_mba(phase);
+                    // In the MBA phase the question at the top of a fragment is asked first,
+                    // over the fragment as it is (see `pass::mba_first`); a rewrite is taken
+                    // as a pass's is below, with nothing to wait on.
+                    #[cfg(feature = "mba")]
+                    if mba && !self.first.contains_key(&n) {
+                        let inner = self.inner;
+                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
+                            && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
+                        {
+                            stack.pop();
+                            if pending.contains_key(&r) {
+                                self.stats.cycles_cut += 1;
+                                self.retire(cx, n);
+                                self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
+                            } else {
+                                self.rewritten.insert((n, r), ());
+                                *pending.entry(n).or_default() += 1;
+                                self.retire(cx, n);
+                                self.inherit_parent(n, r);
+                                stack.push(Frame::Finish(n, r, fin));
+                                stack.push(Frame::Visit(r));
+                            }
+                            continue;
+                        }
+                    }
                     let mut waiting = false;
                     for c in node.children() {
+                        if mba {
+                            self.chain_parent.entry(c).or_insert(n);
+                        }
                         if self.lookup(cx, phase, c).is_none() {
                             stack.push(Frame::Visit(c));
                             waiting = true;
@@ -1055,6 +1132,9 @@ impl Runner<'_, '_> {
                             if !local {
                                 *pending.entry(n).or_default() += 1;
                             }
+                            // `n1` replaces `n`: `n` no longer counts as a user.
+                            self.retire(cx, n);
+                            self.inherit_parent(n, n1);
                             stack.push(Frame::Finish(n, n1, own));
                             stack.push(Frame::Visit(n1));
                             continue;
@@ -1079,6 +1159,8 @@ impl Runner<'_, '_> {
                                 self.rewritten.insert((n, r), ());
                                 *pending.entry(n).or_default() += 1;
                             }
+                            self.retire(cx, n);
+                            self.inherit_parent(n, r);
                             stack.push(Frame::Finish(n, r, own.and(fin)));
                             stack.push(Frame::Visit(r));
                         }
@@ -1476,6 +1558,9 @@ impl Engine {
             active: 0,
             counted: IdMap::default(),
             rewritten: IdMap::default(),
+            chain_parent: IdMap::default(),
+            asks: IdMap::default(),
+            first: IdMap::default(),
         };
         let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
         let mut failure: Option<Error> = None;

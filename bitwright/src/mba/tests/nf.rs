@@ -653,14 +653,11 @@ fn synthesis_finds_products_the_input_multiplied_out() {
         else {
             panic!("{bits}");
         };
+        // Proved at every width: above 64 bits the grid and sparse tests are too large for
+        // three atoms at degree 2, but the hit and the normal form are the same polynomial.
         let s = solver.stats();
-        if bits > 64 {
-            assert_eq!(claim, Claim::Sampled);
-            assert!(s.synth_unproved > 0 && s.synth_sampled > 0, "{s:?}");
-        } else {
-            assert_eq!(claim, Claim::Proved);
-            assert!(s.synth_proved > 0 && s.synth_sampled == 0, "{s:?}");
-        }
+        assert_eq!(claim, Claim::Proved);
+        assert!(s.synth_proved > 0 && s.synth_sampled == 0, "{s:?}");
     }
     // Off, the table is not asked.
     let w = Width::W64;
@@ -702,4 +699,338 @@ fn the_solver_declines_what_it_does_not_take_and_counts_it() {
         }
     }
     let _ = Program::new(&e.expr(&[w, w]), false);
+}
+
+/// The sum of `c·t` over the pairs.
+fn combine(w: Width, terms: &[(i128, T)]) -> T {
+    terms
+        .iter()
+        .map(|(c, t)| mul(k(w, *c), t.clone()))
+        .reduce(add)
+        .expect("a term")
+}
+
+#[test]
+fn scaled_two_term_wide_and_grouped_renderings() {
+    for w in [8u16, 16, 64] {
+        let width = Width::new(w).unwrap();
+        let vars2 = [width; 2];
+        let (x, y, z, t) = (V(0), V(1), V(2), V(3));
+        // 1111·(x ^ 0x2d), multiplied out: an odd scale of a bitwise function.
+        let kk = k(width, 0x2d);
+        solves_to(
+            &combine(
+                width,
+                &[
+                    (1111, x.clone()),
+                    (1111, kk.clone()),
+                    (-2222, and(x.clone(), kk.clone())),
+                ],
+            ),
+            &mul(xor(x.clone(), kk.clone()), k(width, 1111)),
+            &vars2,
+        );
+        // −7·~y + 4·(x ^ y) = 7 + 4x + 11y − 8(x & y): two terms, read off the corners.
+        solves_to(
+            &add(
+                combine(
+                    width,
+                    &[
+                        (4, x.clone()),
+                        (11, y.clone()),
+                        (-8, and(x.clone(), y.clone())),
+                    ],
+                ),
+                k(width, 7),
+            ),
+            &add(
+                mul(k(width, -7), not(y.clone())),
+                mul(k(width, 4), xor(x.clone(), y.clone())),
+            ),
+            &vars2,
+        );
+        // −4·~(x | y | z | t), multiplied out into its 15 conjunctions: one term of four atoms.
+        let vars4 = [width; 4];
+        let atoms = [x.clone(), y.clone(), z.clone(), t.clone()];
+        let mut terms: Vec<(i128, T)> = Vec::new();
+        for s in 1..16usize {
+            let conj = (0..4)
+                .filter(|&i| s >> i & 1 == 1)
+                .map(|i| atoms[i].clone())
+                .reduce(and)
+                .unwrap();
+            let sign = if s.count_ones() % 2 == 1 { 4 } else { -4 };
+            terms.push((sign, conj));
+        }
+        solves_to(
+            &add(combine(width, &terms), k(width, 4)),
+            &mul(
+                k(width, -4),
+                not(or(or(or(x.clone(), y.clone()), z.clone()), t.clone())),
+            ),
+            &vars4,
+        );
+        // 2·(~x & (y ^ z)) + a − 1: independent groups, each rendered on its own.
+        let a = t.clone();
+        let inner = [
+            (2, y.clone()),
+            (2, z.clone()),
+            (-4, and(y.clone(), z.clone())),
+            (-2, and(x.clone(), y.clone())),
+            (-2, and(x.clone(), z.clone())),
+            (4, and(and(x.clone(), y.clone()), z.clone())),
+            (1, a.clone()),
+        ];
+        solves_to(
+            &sub(combine(width, &inner), k(width, 1)),
+            &sub(
+                add(
+                    mul(k(width, 2), and(not(x.clone()), xor(y.clone(), z.clone()))),
+                    a.clone(),
+                ),
+                k(width, 1),
+            ),
+            &vars4,
+        );
+    }
+}
+
+#[test]
+fn atoms_up_to_complement_and_dependence() {
+    for w in [8u16, 16, 64] {
+        let width = Width::new(w).unwrap();
+        let vars2 = [width; 2];
+        let vars3 = [width; 3];
+        let (x, y, z) = (V(0), V(1), V(2));
+        let one = || k(width, 1);
+        // (a − 1 | a) + 1: `a − 1` is the complement of `−a`, one atom.
+        solves_to(
+            &add(or(sub(x.clone(), one()), x.clone()), one()),
+            &sub(and(neg(x.clone()), x.clone()), neg(x.clone())),
+            &vars2,
+        );
+        // (((e − 1) & d) − e) & d: `(~a & d) − e` with `a = −e` is `d | a`, so the whole is d.
+        solves_to(
+            &neg(and(
+                sub(and(sub(y.clone(), one()), x.clone()), y.clone()),
+                x.clone(),
+            )),
+            &neg(x.clone()),
+            &vars2,
+        );
+        // x & −(x & −x) is x: −(x & −x) is x | −x, found at the sample and proved.
+        solves_to(
+            &add(
+                and(x.clone(), neg(and(x.clone(), neg(x.clone())))),
+                y.clone(),
+            ),
+            &add(x.clone(), y.clone()),
+            &vars2,
+        );
+        // (y + y) & y & −y is 0: dropped once proved, then −(−y) is y.
+        solves_to(
+            &sub(
+                x.clone(),
+                and(
+                    not(and(add(y.clone(), y.clone()), y.clone())),
+                    neg(y.clone()),
+                ),
+            ),
+            &add(x.clone(), y.clone()),
+            &vars2,
+        );
+        // ((y + 1) & (~y + ~y)) | y | x: the conjunction never has a bit outside y.
+        solves_to(
+            &or(
+                or(
+                    and(add(y.clone(), one()), add(not(y.clone()), not(y.clone()))),
+                    y.clone(),
+                ),
+                x.clone(),
+            ),
+            &or(x.clone(), y.clone()),
+            &vars2,
+        );
+        // ~((a − (n & a))·(n − (n & a))) − (n & a)·(n | a) with n = −z is −1 − a·n: the
+        // arithmetic −z read as the atom n.
+        let n = || neg(z.clone());
+        let na = || and(n(), x.clone());
+        let p = mul(sub(x.clone(), na()), sub(n(), na()));
+        let q = mul(na(), or(n(), x.clone()));
+        solves_to(
+            &sub(not(p), q),
+            &add(mul(x.clone(), z.clone()), k(width, -1)),
+            &vars3,
+        );
+        // −(−b & b) is b | −b: b + n − (b & n) with n = −b, zero added.
+        solves_to(
+            &neg(and(neg(x.clone()), x.clone())),
+            &or(x.clone(), neg(x.clone())),
+            &vars2,
+        );
+    }
+}
+
+/// Without evidence asked for, the same answer comes back unchecked (`Claim::Unverified`), and
+/// with it, proved; the two are remembered apart.
+#[test]
+fn evidence_is_optional() {
+    let w = Width::W64;
+    let vars = [w, w];
+    let (x, y) = (V(0), V(1));
+    let e = add(
+        mul(and(x.clone(), y.clone()), or(x.clone(), y.clone())),
+        mul(
+            and(x.clone(), not(y.clone())),
+            and(not(x.clone()), y.clone()),
+        ),
+    )
+    .expr(&vars);
+    let solver = NormalFormSolver::default();
+    let with = solver.solve(&e, &MbaBudget::default());
+    let without = solver.solve(&e, &MbaBudget::default().with_evidence(false));
+    let (
+        MbaAnswer::Simplified { expr: a, claim: ca },
+        MbaAnswer::Simplified { expr: b, claim: cb },
+    ) = (with, without)
+    else {
+        panic!("not simplified");
+    };
+    assert_eq!(a, b);
+    assert_eq!((ca, cb), (Claim::Proved, Claim::Unverified));
+    assert_eq!(certify::check(&e, &b, u64::MAX).verdict, Verdict::Proved);
+}
+
+/// A variable eliminated through an atom's definition must be unmasked: in a form with several
+/// bit classes, `v & M` is not `α⁻¹·((n & M) − …)`. This question (random code at 16 bits,
+/// six variables, the classes of `0xc98b` and `0xff00`) was answered wrongly without the
+/// self-check.
+#[test]
+fn elimination_through_an_atom_is_unmasked() {
+    use crate::mba::{MbaLimits, lower};
+    use crate::{Context, ParseOptions};
+    let q7 = "((c | b) + a)";
+    let q13 = "(a | 0xc98b)";
+    let q15 = "((c | b) | a)";
+    let q19 = format!("((~({q7} + {q13}) | {q15}) + ({q13} ^ f))");
+    let src = format!(
+        "((({q19} & {q7}) & 0xff00) ^ (((({q15} * f) - {q7})) ^ ({q19} ^ ((e - 1) ^ (d ^ {q7})))))"
+    );
+    let w = Width::new(16).unwrap();
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &ParseOptions::width(w)).unwrap();
+    let (m, _) = lower(&cx, e, &MbaLimits::default()).unwrap();
+    let solver = NormalFormSolver::default();
+    for evidence in [false, true] {
+        match solver.solve(&m, &MbaBudget::default().with_evidence(evidence)) {
+            MbaAnswer::Simplified { expr, .. } => {
+                let points = certify::sample_points(m.vars(), &[&m, &expr], 7);
+                assert!(certify::refute(&m, &expr, &points).is_none(), "{expr:?}");
+            }
+            MbaAnswer::NoSimpler => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(solver.stats().declined_internal, 0);
+}
+
+/// Solves `src` at width `w` with the default budget: the answer is checked as `solves_to`
+/// checks it and has at most `want` nodes.
+fn solves_text(src: &str, w: Width, want: usize) -> MbaExpr {
+    use crate::mba::{MbaLimits, lower};
+    use crate::{Context, ParseOptions};
+    let mut cx = Context::new();
+    let e = cx.parse(src, &ParseOptions::width(w)).unwrap();
+    let (m, _) = lower(&cx, e, &MbaLimits::default()).unwrap();
+    let MbaAnswer::Simplified { expr, claim } =
+        NormalFormSolver::default().solve(&m, &MbaBudget::default())
+    else {
+        panic!("not simplified: {src}");
+    };
+    let r = certify::prove(&m, &expr, &mut Steps::new(1 << 26)).unwrap();
+    if claim == Claim::Sampled {
+        let points = certify::sample_points(m.vars(), &[&m, &expr], 7);
+        assert!(
+            certify::refute(&m, &expr, &points).is_none(),
+            "{src}: {expr:?}"
+        );
+    } else {
+        assert_eq!(r.verdict, Verdict::Proved, "{src} -> {expr:?}");
+    }
+    assert!(
+        cost(&expr) <= want,
+        "{src}: {} nodes, want {want}: {expr:?}",
+        cost(&expr)
+    );
+    expr
+}
+
+/// Renderings and normal forms that take more than one decomposition or normal form: each
+/// question is one the engine's passes leave to the solver.
+#[test]
+fn shared_split_and_factored_renderings() {
+    let w64 = Width::W64;
+    let w8 = Width::new(8).unwrap();
+    // A conjunction proved zero in one class takes the others' coefficient there: `2·(a & y) &
+    // ~1` with `a = y + y` (bit 0 of `a` is 0) is `2·(a & y)`, and the whole `1 − (a ^ y)`.
+    solves_text("((~((y + y) ^ y) & 1) << 1) - (((y + y) ^ y) ^ 1)", w64, 5);
+    // `~(−x) ^ y` is built `~(−x ^ y)`: the rules would read `~(−x)` as `x − 1`, which shares
+    // nothing with the `−x` of the product.
+    let e = solves_text("((x - 1) ^ y) + -x * y", w64, 7);
+    assert!(
+        !e.nodes()
+            .iter()
+            .any(|n| n.op == MOp::Not && e.nodes()[n.args[0] as usize].op == MOp::Neg),
+        "{e:?}"
+    );
+    // An atom `a + a` linear in the variable `a`: zero added to the form with atoms reused
+    // splits its coefficient (`2·D − a` beside `a` as `D + a − …`), `(p | (a ^ d)) + (a ^ D)`.
+    solves_text("(a * d | a ^ d) + (~a & (a + a)) * 2 - a", w64, 8);
+    // Two atoms whose definitions sum to zero: `d + e` added makes the form a bitwise function
+    // (`(d & e) − 1` is `~(d | e)` for `e = −d`).
+    solves_text("(((c - e) & (e - c)) - 1) ^ e", w64, 7);
+    // A table over four atoms read through `u | v`: `f = g(d, s, u | v)`.
+    solves_text(
+        "(~d & ~((a - d) | (a + (a & d)) | (a + d))) | (d & ((a - d) | (a + (a & d))) & (a + d))",
+        w64,
+        11,
+    );
+    // Two terms whose minimum forms share a subterm: `6·~((x | y) | z)` beside the majority as
+    // `(x & y) | ((x | y) & z)`.
+    solves_text(
+        "6*x + 6*y + 6*z - 7*(x&y) - 7*(x&z) - 7*(y&z) + 8*(x&y&z) + 6",
+        w64,
+        12,
+    );
+    // One term read through the other: `y ^ w` beside `~w` as `~(y ^ n)`, `n` the node of `~w`.
+    solves_text("14*(x&y) - 7*y - 2*x + 2*(x&z) - 2*(x&y&z) - 7", w64, 13);
+    // A constant traded for a complement in a two-term decomposition that then shares `y ^ z`.
+    solves_text("6*y + (x&z) + 11*(x&y&z) - x - 5*(x&y) - 13*(y&z)", w64, 14);
+    // A third term beside two: `(x & z) − 6·~((x & y) | …) − (x & y)` sharing `x & y`.
+    solves_text(
+        "6 + 6*x + 6*y + 6*z - 7*(x&y) - 11*(x&z) - 12*(y&z) + 18*(x&y&z)",
+        w8,
+        13,
+    );
+    // The constant inside a factored sum, as a complement: `6·x − 12·(x & y) − 6` is
+    // `(~y + (x ^ y))·6`.
+    solves_text("x*6 - (x&y)*12 - 6", w8, 7);
+    // A coefficient taken out with the sign its terms have: `−5·(t ^ z) − 5·(z & ~t)` as
+    // `((t ^ z) + …)·−5`; and inside a complement traded for the constant: `~(3·g + 3·h)` as
+    // `~((g + h)·3)`.
+    solves_text("(t & z) * 15 - t * 5 - z * 10", w64, 7);
+    solves_text("~(y * 6 + x * 3 - (x & y) * 9)", w64, 8);
+    // Halves: `(y + y) ^ ((x ^ z) + x − z)` is `2·t`, `t = y ^ (x & ~z)`, and the whole `t − ~t`.
+    solves_text("((y + y) ^ ((x ^ z) + x - z)) + 1", w64, 8);
+    // Part of the nonlinear terms factored by a symbol most of them share.
+    solves_text("2*c*(a&c) - a*c - c*c - a*a", w64, 7);
+    solves_text("b*c + b*b - b*(b&c) + (b|c) - c*e", w64, 8);
+    // `p·q` written `(p & q)·(p | q) + (p & ~q)·(~p & q)`: `p` and `q` are sums of the
+    // products' operands.
+    solves_text(
+        "(((a + b) | b) & (-b ^ a)) * (((a + b) | b) | (-b ^ a)) \
+         + (((a + b) | b) & ~(-b ^ a)) * (~((a + b) | b) & (-b ^ a))",
+        w64,
+        7,
+    );
 }

@@ -10,6 +10,7 @@ should not pick up) and not run in CI.
 | `bw-standard` | bitwright, `Strategy::standard()` |
 | `bw-deobf` | bitwright, `Strategy::deobfuscate()` (linear MBA and shuffle passes) |
 | `bw-mba` | bitwright, deobfuscate with the MBA service and the native `SignatureSolver` |
+| `bw-nf` | bitwright, deobfuscate with the MBA service, the native `NormalFormSolver` and bitwright's own evidence only |
 | `bw-cobra` | bitwright, deobfuscate with the MBA service and the `CobraSolver` backend |
 | `bw-eqsat` | bitwright's equality saturation, every built-in equation group (`eqsat.bwr`) |
 | `egg-bw` | [egg](https://github.com/egraphs-good/egg) 0.11 with the same equations, plus commutativity (bitwright's e-graph sorts operands; egg needs rules) |
@@ -38,7 +39,9 @@ A `work/` directory here is git-ignored, for a local CoBRA checkout, builds and 
 engines' packages. `--only TEXT` and `--skip TEXT` select files by path, `--limit N` takes the
 first N cases of each, `--tools a,b` picks tools (`--list` lists them), and `--csv FILE` writes
 one row per case and tool. The table goes to standard output, one block per file as each
-finishes, then the totals.
+finishes, then the totals. With `BW_FAILURES=FILE` in the environment, every scored case a
+bitwright tool leaves larger than the ground truth is appended to `FILE` (tool, line, input,
+ground truth and answer, tab-separated).
 
 **C++ CoBRA.** Build its dependencies and the driver against the checkout (CMake 3.20+, a C++23
 compiler; LLVM is not needed), then pass `--cobra-cpp`:
@@ -66,14 +69,24 @@ package does not import are skipped.
 
 Every tool starts from the same text and gets each case alone (bitwright and egg in a fresh
 context or e-graph each). Every answer is read into a bitwright context and measured there, the
-same way for every tool:
+same way for every tool. A line bitwright's parser declines is read in the datasets' own syntax
+(`src/read.rs`: Python's operators and precedence, `**` with a constant exponent, literals of
+any size modulo 2^64, `X[0]` names, a trailing note in words, a leading label, a ground truth
+written `(constant N)`). Cases are 64-bit, except that bitwright's tools measure a line whose
+ground truth disagrees with its input at 64 bits and agrees at 32, 16 or 8 at the widest such
+width (some OSES lines are 8-bit arithmetic; the note says so); the other tools get it at 64
+bits, where it counts as a dataset error.
 
 - **wrong**: the answer disagrees with the input at one of 64 points (the boundary values 0, all
   ones, 1 and the sign bit, then random values): an unsound answer.
 - **failed**: the tool reported an error or timed out, or its answer could not be read back.
 - **solved**: the answer is correct at every point and no larger than the dataset's ground truth
-  (DAG nodes in bitwright's canonical form, sharing counted once).
+  (DAG nodes in bitwright's canonical form, sharing counted once). Rounded down, so 100.0 means
+  every scored line.
 - **exact**: the answer is the ground truth itself (the same canonical node).
+- **no truth**: lines that are checked but not scored: without a ground truth (`-`), or with
+  one that disagrees with the input at every width (a dataset error, also reported on standard
+  error). **reduced**: those among them answered smaller than the input.
 - **size/truth**: the median ratio of the answer's size to the ground truth's.
 - **µs**: from the text to the answer, parsing included, for bitwright (whose parser builds the
   canonical, hash-consed form), egg (parse, saturation, extraction) and both CoBRAs. For the

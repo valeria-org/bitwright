@@ -32,7 +32,16 @@ pub(crate) enum T {
 /// in operators.
 pub(crate) struct MinForms {
     pub(crate) forms: Vec<(Vec<T>, u8)>,
+    /// Per truth table, more templates of the same size, for renderings that share subterms
+    /// with others: the first [`ALTERNATIVES`] found, then as many again each with a subterm
+    /// (by table) the ones before lack.
+    #[cfg_attr(not(feature = "mba"), allow(dead_code))]
+    pub(crate) alts: Vec<Vec<Vec<T>>>,
 }
+
+/// The most other templates of minimum size kept per truth table in order found (and again as
+/// many for new subterms).
+pub(crate) const ALTERNATIVES: usize = 8;
 
 /// The minimum forms, computed on first use.
 pub(crate) fn min_forms() -> &'static MinForms {
@@ -46,6 +55,9 @@ pub(crate) fn min_forms() -> &'static MinForms {
 fn search() -> MinForms {
     // best[tt] = (template, size)
     let mut best: Vec<Option<(Vec<T>, u8)>> = vec![None; 256];
+    let mut alts: Vec<Vec<Vec<T>>> = vec![Vec::new(); 256];
+    // Per table, the subterm tables of its form and alternatives.
+    let mut covered: Vec<Vec<u8>> = vec![Vec::new(); 256];
     best[0x00] = Some((vec![T::Zero], 0));
     best[0xFF] = Some((vec![T::Ones], 0));
     for (k, &v) in VARS.iter().enumerate() {
@@ -82,9 +94,63 @@ fn search() -> MinForms {
                 }
             }
         }
+        // For the tables first reached at this size, also the combinations of the operands'
+        // other forms (after the forms' own, which decide the form): `(x & y) | ~(y ^ z)` from
+        // `~(y ^ z)`, the other form of `~z ^ y`.
+        let fresh: Vec<bool> = best.iter().map(Option::is_none).collect();
+        let all = |f: usize| -> Vec<&Vec<T>> {
+            best[f]
+                .iter()
+                .map(|(t, _)| t)
+                .chain(alts[f].iter())
+                .collect()
+        };
+        let mut more: Vec<(usize, Vec<T>)> = Vec::new();
+        for f in 0..256usize {
+            let Some((_, sf)) = &best[f] else { continue };
+            if *sf + 1 == size && fresh[usize::from(!(f as u8))] {
+                for tf in all(f).into_iter().skip(1) {
+                    let mut t = tf.clone();
+                    t.push(T::Not(t.len() as u16 - 1));
+                    more.push((usize::from(!(f as u8)), t));
+                }
+            }
+            for (g, bg) in best.iter().enumerate().skip(f) {
+                let Some((_, sg)) = bg else { continue };
+                if sf + sg + 1 != size {
+                    continue;
+                }
+                for (op, v) in [(BinOp::And, f & g), (BinOp::Or, f | g), (BinOp::Xor, f ^ g)] {
+                    if !fresh[v] {
+                        continue;
+                    }
+                    for (i, tf) in all(f).into_iter().enumerate() {
+                        for (j, tg) in all(g).into_iter().enumerate() {
+                            if i > 0 || j > 0 {
+                                more.push((v, concat(tf, tg, op)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found.extend(more);
+        // The first template found at a table's size is its form; others of that size are
+        // kept as alternatives, the first few found and then those with a subterm (by table) the
+        // ones kept so far lack (the forms of the level before stay as they are).
         for (v, t) in found {
             if best[v].is_none() {
+                covered[v] = subtables(&t);
                 best[v] = Some((t, size));
+            } else if fresh[v] && alts[v].len() < 2 * ALTERNATIVES && !alts[v].contains(&t) {
+                let subs = subtables(&t);
+                let new = subs.iter().any(|s| !covered[v].contains(s));
+                if alts[v].len() < ALTERNATIVES && best[v].as_ref().is_some_and(|(b, _)| *b != t)
+                    || new
+                {
+                    covered[v].extend(subs);
+                    alts[v].push(t);
+                }
             }
         }
         size += 1;
@@ -94,7 +160,39 @@ fn search() -> MinForms {
             .into_iter()
             .map(|b| b.unwrap_or((vec![T::Zero], 0)))
             .collect(),
+        alts,
     }
+}
+
+/// The truth tables of a template's operators but its root.
+pub(crate) fn subtables(t: &[T]) -> Vec<u8> {
+    let mut vals: Vec<u8> = Vec::with_capacity(t.len());
+    for n in t {
+        vals.push(match *n {
+            T::Var(k) => VARS[usize::from(k)],
+            T::Zero => 0,
+            T::Ones => 0xFF,
+            T::Not(a) => !vals[usize::from(a)],
+            T::Bin(op, a, b) => {
+                let (x, y) = (vals[usize::from(a)], vals[usize::from(b)]);
+                match op {
+                    BinOp::And => x & y,
+                    BinOp::Or => x | y,
+                    _ => x ^ y,
+                }
+            }
+        });
+    }
+    let mut out: Vec<u8> = t
+        .iter()
+        .zip(&vals)
+        .take(t.len().saturating_sub(1))
+        .filter(|(n, _)| matches!(n, T::Not(_) | T::Bin(..)))
+        .map(|(_, &v)| v)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// A node's bitwise description: its atoms (sorted by index, at most three) and its truth

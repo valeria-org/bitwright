@@ -934,7 +934,7 @@ counts `{calls, noop, changed, rejected_cost, rejected, atomized}` per pass.
 | Pass | Fragment and algorithm |
 |-|-|
 | `FactFold` | A node whose facts pin one value becomes that constant, subject to `Hooks::fold_known`. |
-| `Linear` | `c + Σ kᵢ·aᵢ` over Z/2^W through `+ − neg`, `~a = −a − 1`, multiplication by a constant, left shifts by a constant, and `\|`/`^` of operands the facts prove disjoint. Coefficients are `BitVec`s, so every width to 512 works; at most 64 terms. Emitted with atoms in canonical order, positive coefficients first, power-of-two coefficients as shifts, the constant last. Cancels additive masking. |
+| `Linear` | `c + Σ kᵢ·aᵢ` over Z/2^W through `+ − neg`, `~a = −a − 1`, multiplication by a constant, left shifts by a constant, and `\|`/`^` of operands the facts prove disjoint. Coefficients are `BitVec`s, so every width to 512 works; at most 64 terms. Emitted with atoms in canonical order, positive coefficients first, `2·a` as `a + a` and other power-of-two coefficients as shifts, the constant last, or traded for complements where that is smaller: into a term of the same coefficient (`−x − 1` is `~x`), into a term of coefficient 1 beside another (`a + t + 1` is `a − ~t`), splitting one of coefficient 2 (`2·t + 1` is `t − ~t`), or complementing the negated rest (`−1 − 2·x` is `~(x + x)`). Cancels additive masking. |
 | `Xor` | `k ⊕ ⊕ᵢ (aᵢ & mᵢ)` over GF(2)^W through `^`, `~x = x ⊕ ones`, `&`/`\|` with a constant (`x \| c = (x & ~c) ⊕ c`), and disjoint `\|`. At most 64 terms. Cancels boolean masking over any number of atoms. A constant that misses every mask is emitted as `\| k`, each mask widened by `k`, when that leaves a mask out (so `x \| c` comes back as itself, after a cancellation too). |
 | `Bitwise` | A pure bitwise function of ≤ 3 atoms (plus 0/ones) has an 8-bit truth table, exact at every width; it is replaced by the minimum-size form from a table of all 256 functions, found by a breadth-first search over expression sizes (computed once, verified exhaustively by the tests). Variables follow the atoms' canonical order; atoms the table ignores are pruned. 4 atoms via NPN classes is a later option. |
 | `Compares` | Boolean combinations of comparisons. For one operand pair: the five relations {EQ, (LTu,LTs), (LTu,GTs), (GTu,LTs), (GTu,GTs)}, each predicate a set, `& \| ^ ~` set operations, emitted when the set is one predicate, true or false (at W = 1 only three relations occur). For one operand against constants: exact unsigned interval sets (signed comparisons split at the sign boundary, at most 8 intervals), emitted as a comparison or the wrapped range check `x − lo <=u hi − lo`. Checked exhaustively at W ≤ 6. |
@@ -1064,16 +1064,25 @@ pub mod mba {
     pub struct MemoryCache;       // bounded, oldest evicted first
     pub struct NoCache;
     pub struct MbaConfig { pub limits: MbaLimits, pub trust: MbaTrust, pub budget: MbaBudget }
+    pub struct MbaBudget { pub steps: u64 /* default 2^20 */, pub evidence: bool /* default true */ }
     pub struct MbaTrust { pub backend_certificates: bool /* default true */, pub sampled: bool /* default false */ }
 }
 // EngineBuilder::mba_solver(Arc<dyn MbaSolver>), ::mba_prover(..), ::mba_cache(..); Phase::Mba(MbaConfig)
 ```
 
-- **Placement.** `Phase::Mba(config)` runs in the same bottom-up walk as the passes, so innermost
-  fragments are solved first and their parents are then asked over the simplified children. A
-  fragment is `+ − * neg & | ^ ~`, constant shifts below the width, extensions and truncation;
-  anything else is an atom (a variable of the `MbaExpr`). Only mixed fragments (arithmetic and
-  bitwise) within `MbaLimits` (variables, nodes, width, a minimum size) are asked about.
+- **Placement.** `Phase::Mba(config)` runs in the same walk as the passes. A fragment is
+  `+ − * neg & | ^ ~`, constant shifts below the width, extensions, truncation and a `concat`
+  whose high part truncates a value of the full width (`x·2^k + c`); anything else is an atom
+  (a variable of the `MbaExpr`). Only mixed fragments (arithmetic and bitwise) within
+  `MbaLimits` (variables, nodes 2,048, width, a minimum size of 4 nodes) are asked about. The
+  question at the *top* of a fragment (a root, or a node whose user in the walk is not asked,
+  or is over the limits) is asked first, over the fragment as it is: an answer to a part can
+  hide what only the whole shows (a relation between atoms that rewrites one factor of the
+  product identity `(x & y)·(x | y) + (x & ~y)·(~x & y) = x·y`). When it is not taken, the
+  operands are walked bottom-up as before, innermost fragments first, and the top is asked
+  again only if one of them changed. Inside a chain of sums (or of products) a link is not
+  asked when its user in the chain is (a sum of `n` terms would otherwise be `n` questions, each
+  a little larger); such a node is not final, so a later call may ask it.
 - **Gate.** An answer must have the input's variables and width, agree with the input at 64
   points (a refutation check that always runs: zero, all-ones, one and the signed minimum, the
   constants of both sides with their neighbours `c ± 1`, `−c`, `~c`, points whose set bits lie
@@ -1082,7 +1091,9 @@ pub mod mba {
   exact evidence, in this order: bitwright's own certificates (below), a configured
   `EquivalenceProver`'s proof, the backend's `Proved` or `Certified` claim if
   `trust.backend_certificates` (the default), or agreement at the sampled points only if
-  `trust.sampled`. The lifted result must then agree with the original expression at seeded
+  `trust.sampled`. When the backend's claim is not trusted it is not asked for either
+  (`MbaBudget::evidence` off): a solver may then skip checking an answer it built exactly. The
+  lifted result must then agree with the original expression at seeded
   symbol values (this checks lowering and lifting, which no proof about the lowered form
   can), and pass the postconditions and the host veto (§6.4). **Trusting backend
   certificates means trusting the backend**: an answer wrong at a point no sample reaches is
@@ -1124,7 +1135,37 @@ pub mod mba {
     disagreement would be a bug and declines. Atoms are paired by evaluation and proof only,
     never by the solver's normal forms: definitions with equal normal forms agree at the
     sample and are then proved equal like any others, so the gate's soundness does not depend
-    on the normal-form code.
+    on the normal-form code. Three readings widen what the atoms let through, each an equality
+    at every input: every atom's complement joins the DAG (so `x − 1` and `−x`, complements of
+    each other, meet at the sample and are paired); an atom whose bits at the sample are a
+    bitwise function of the leaves of its definition (at most five, at 64 bits or fewer) has
+    that function tried as a member of its class, proved like any pairing; and a second
+    skeleton reads an atom whose class has such a bitwise member as that function, and a
+    bitwise function of atoms read arithmetically as its Möbius expansion
+    `−a_∅ + Σ_T a_T·AND_T` (exact at every width) with lone atoms as their definitions (so
+    `~a | ~b` is `−1 − (a & b)`). When those skeletons still differ, an atom a side reads
+    only as `γ·v` (its class variable `v`: the side is its value at `v = 0` plus `γ·v`, proved
+    by a direct test with `γ` read at one point) stands for `γ` times its definition, and the
+    sides are compared again (at most four definitions). At 64 bits or fewer every skeleton is
+    checked against its side's values at the sample (its variables taking their nodes' values)
+    before a test decides on it, and any refutation's counterexample is checked on the two
+    sides; either failing would be a bug, and the question is declined (`CertStats::internal`,
+    an assertion in debug builds).
+  - *Symbolic*: when no direct test fits a pair of polynomial sides (or it is over its
+    budget), both are expanded as polynomials over symbols (variables, conjunctions of the
+    leaves of a bitwise function by its Möbius expansion, other bitwise subterms by their
+    structure; at most 4,096 monomials). Equal polynomials are equal functions whatever the
+    symbols' values; unequal ones decide nothing (`(x & 1)² = x & 1` holds bit by bit, not as
+    polynomials). Inside the compositional test it compares skeletons no direct test fits.
+  - *Carries*: sides built from `+ − neg ~ & | ^`, constants, left shifts by at most 8 and
+    products by a constant of at most 9 bits (or its negation, whichever needs less state: a
+    sum of shifts) are T-functions: bit `j` depends on bits `0..=j` of the variables through a
+    few bits of state (each adder's carry, each shift's last bits; at most 32, over at most six
+    variables of one width). Walking every reachable state through every combination of the
+    variables' bits at every position decides equality exactly, whatever the carries do, and a
+    difference comes with the path to a real counterexample (`(y + y) & y & −y` is 0). It runs
+    after the compositional test when that leaves the question open for a reason other than
+    budget, and is charged by the work done.
   - *Known bits*: when the tests above leave the question undecided (and none was skipped
     for lack of budget), `x op k` (`op` bitwise, `k` a constant) is read as arithmetic
     wherever the bits of `x` that are known cover the bits `k` is 1 at, or those it is 0 at
@@ -1152,7 +1193,7 @@ pub mod mba {
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
   (corner-invisible products, terms nonzero only when three different positions are set,
   point functions) are never proved at any width.
-- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v2;…` with its options).
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v3;…` with its options).
   One pass over the question, operands first, gives every node the normal form of the smallest
   fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
   through. The first version takes one width (nodes of other widths only below casts, which are
@@ -1179,7 +1220,8 @@ pub mod mba {
     or products over the size limits, and bitwise functions read arithmetically whose
     polynomial would have more than `max_terms` monomials are atoms kept as they are. Every atom is rendered
     once, lower atoms first, from its own cheapest form (the input subterm as it is among the
-    candidates), and shared by everything that uses it. Relations between atoms (between
+    candidates; the form by the decompositions a peel's rest gets, not the searches below that
+    are for a question's own form), and shared by everything that uses it. Relations between atoms (between
     `x >> 1` and `x`) are not seen: that loses completeness, never soundness.
   - *Known low bits.* Every non-constant monomial of a polynomial is a multiple of `2^j`
     (its coefficient's trailing zeros plus `τ·e` per factor `m^e` of a class starting at
@@ -1191,7 +1233,11 @@ pub mod mba {
     question itself is first read so wherever the facts know the bits (as the certificates read
     it), when that leaves fewer bit classes: `x·−100 | 1`, which the core rules make of
     `x·−100 + 1`, stays a polynomial in `x`. Answers are still measured against the question
-    as asked.
+    as asked. Likewise a bitwise operation of two polynomials that are multiples of `2^k`
+    (every coefficient and the constant) is `2^k·(a/2^k op b/2^k)`, arithmetic, when the
+    halves are bitwise functions: bitwise operators commute with a left shift (`(y + y) ^ ((x ^
+    z) + x − z)` is `2·(y ^ (x & ~z))`). The certificates do not read halves, so the fixed
+    point below does not take an answer only they reached.
   - *Atom reuse.* An atom's definition (arithmetic read by a bitwise operator) may also
     appear arithmetically: in `p + x + (x ^ 4) − ((x ^ 4) & p)` the normal form holds `p`'s
     terms beside the atom `p`. When a normal form of at most 64 terms contains `c` times an
@@ -1200,6 +1246,36 @@ pub mod mba {
     the same function. Atoms are taken lower first, each substitution kept while the finished
     form does not grow, and the result is rendered beside the normal form (once, with the
     input's factors), the cheapest winning: here `x + ((x ^ 4) | p)`, sharing `p`.
+  - *Atoms, further.* Of `p` and `~p = −1 − p` the atom is the one with the smaller constant,
+    so bitwise readers of either read one atom, complemented or not (`x − 1` and `−x`).
+    Arithmetic read by a bitwise operator is a bitwise function when it is one once other
+    atoms stand for their definitions: a multiple of an atom's definition becomes the atom, or
+    a variable the definition reads alone and unmasked, with an odd coefficient `α`, becomes
+    `α⁻¹·(n − rest)` (`d − (n & s)` with `s = a + d` is `s − a − (n & s)`; up to three passes;
+    a variable masked to a class is not `α⁻¹·((n & M) − rest)`, so it stays).
+    Otherwise its bits at the refutation sample may follow, class by class, a bitwise function
+    of the atoms it mentions that no linear reading shows (`−(x & −x)` is `x | −x`): that
+    function is used once a certificate proves the subterm equal to it (at most four such
+    proofs per question; a subterm of degree at most 1 over the variables alone is canonical
+    and not looked at).
+  - *Relations between atoms.* A conjunction that is zero at the sample although no reduction
+    shows it (`(y + y) & y & −y`) is dropped once a certificate proves it zero under its
+    class's mask. A degree-≤1 form whose values follow, in every class over the patterns of
+    the atoms' bits that occur at the sample, a function of fewer atoms (derived atoms dropped
+    first) is that function, with the constant the dropped atoms leave in each class, once a
+    certificate proves the two equal (`((y + 1) & (~y + ~y)) | y | x` is `x | y`).
+  - *Other forms.* Beside atom reuse, more forms of the same function are rendered too: a
+    variable eliminated through an atom whose definition reads it once,
+    alone, with an odd coefficient (at most two; `−a·c + c·(n & a) + n·(n & a)` with `n` the
+    atom `−c` is `a·n`); zero added, `±(n − d)` for an atom `n` with a linear definition `d`
+    that the form reads bitwise, to the normal form and to the one with atoms reused,
+    completing a bitwise function of it (`−(b & n)` with `n = −b` is `b | n`; at most four, on
+    forms of at most 32 terms; `(p | (a ^ d)) + (a ^ D)` with `D` the atom `a + a` and `p` the
+    atom `a·d` needs `D − 2·a` added to the reused form); and, first, zero that makes the form
+    a bitwise function: one or two relations `n − d` of the first five such atoms times ±1 or
+    ±2, kept only when the sum is one (`(n & m) − 1` with `n = c − e` and `m = e − c` is
+    `~(n | m)`: one each of both relations). These forms are optional: each renders on at most
+    half of the budget left while a quarter of it is, and running short only stops it.
   - *Polynomials.* A product of two non-constants multiplies the operands' forms out
     (`|A|·|B|` monomial products, sized and charged first; beyond `max_terms` or
     `max_degree` the product is an atom, the degree taken after the exact reductions below,
@@ -1222,7 +1298,10 @@ pub mod mba {
     shape (a monomial with classes erased), highest degree first, becomes one unmasked term
     `c·Π AND_S^e` when subtracting `c` times its full expansion over the classes (`c` read
     from class 0, which has every precision) leaves no term of that shape (checked with the
-    same exact reductions; the one-position rule applies only after this step).
+    same exact reductions; the one-position rule applies only after this step). A conjunction
+    proved zero in a class (above) takes whatever coefficient the others have there, `c` read
+    from the class of most precision that is not zero: `2·(a & y & ~1)` with `a = y + y` is
+    `2·(a & y)`, so `2·(~(a ^ y) & 1) − ((a ^ y) ^ 1)` is `1 − (a ^ y)`.
   - *Rendering.* Candidates are built into one builder with local interning and costed by the
     nodes their root reaches, a shift's amount counted as the constant node it is once lifted;
     the cheapest wins (then by an operator-weighted size, then by structure), and only if it
@@ -1238,16 +1317,28 @@ pub mod mba {
     conjunction coefficients `c` scales to the group's (solved 2-adically). With one group
     every rendering is a candidate (constants merged); with several each group's is chosen in
     turn for the cheapest whole. Every decomposition also comes with complements traded for
-    the constant (`c·~h = −c·h − c` and back). Sums put positive coefficients first, powers of
-    two as shifts, and choose each sign so a constant already needed is reused. Higher
-    degrees render as the linear part's cheapest decomposition plus the nonlinear part
-    monomial by monomial (powers by squaring), or factored: by a symbol common to all its
-    monomials, or by exact division (in graded lexicographic order, the divisor's leading
-    coefficient odd, which then always finds the quotient) by the normal form of an operand of
-    one of the input's products, recursively for the quotient; and the whole form as such a
-    product. Rendering is repeated with the factors the best candidate multiplies until none
-    is new, and the answer is normalized again (its own constants may give coarser classes)
-    until that renders nothing smaller: solving an answer again gives `NoSimpler`. Two
+    the constant (`c·~h = −c·h − c` and back; `−1 + R` as `~(−R)`, `k + 2k·t` as `k·t −
+    k·~t`) and with a coefficient several terms share taken out, with the sign most of them
+    have (`−5·a − 5·b` is `(a + b)·−5`) and a constant that is a small multiple of it inside
+    (`6·x − 6·y − 6` is `(x + ~y)·6`). Sums put positive coefficients first, powers of two as
+    shifts, choose each sign so a constant already needed is reused, and merge a term into
+    another whose node is its power-of-two multiple (`−2·a` beside an atom rendered `a + a`).
+    The builder writes what the engine's rules would rewrite as they would: `a − c` as `a +
+    (−c)`, a constant of its own, and `~(−x) ^ y` as `~(−x ^ y)`; a `~(−x)` or `−(~x)` whose
+    inner node has other uses costs a node more (the rules make it `x − 1` or `x + 1`, which
+    share nothing with them). Higher degrees render as the linear part's cheapest
+    decompositions (the eight cheapest, each joined with every rendering of the nonlinear
+    part) plus the nonlinear part monomial by monomial (powers by squaring), or factored: by
+    a symbol common to all its monomials, by a symbol most of them share with the others
+    beside (at the top, for at most twelve monomials: `2·c·(a & c) − a·c − c² − a²` is
+    `−(a ^ c)·c − a²`), or by exact division (in graded lexicographic order, the divisor's
+    leading coefficient odd, which then always finds the quotient) by the normal form of an
+    operand of one of the input's products, or by a sum or difference of two such operands no
+    longer than either (`(x & y)·(x | y) + (x & ~y)·(~x & y)` is divided by `x`, the sum of the
+    first and third), recursively for the quotient; and the whole form as such a product.
+    Rendering is repeated with the factors the best candidate multiplies until none is new,
+    and the answer is normalized again (its own constants may give coarser classes) until
+    that renders nothing smaller: solving an answer again gives `NoSimpler`. Two
     renderings span classes: `g(x₁ ^ A₁, …) ^ O` for a table `g` of at most three atoms when
     every class's table is `g` with some inputs complemented, and maybe its output (`Aᵢ` the
     classes complementing input `i`, `O` those complementing the output; so
@@ -1258,25 +1349,63 @@ pub mod mba {
     `k ≥ 2` atoms keeps its coefficient, which a bitwise function bounds by `2^(k−1)`; each
     choice is checked on the tables' corner sums before anything is built, and only the
     cheapest decomposition is kept.
+  - *Searches.* A degree-≤1 form is also rendered as `c + a·g + b·h` for bitwise functions `g`
+    and `h` of two to six atoms whose symbols are unmasked (such a form takes at most four
+    values at the corners; up to three atoms every table is tried, above that the tables are
+    read off the values). Up to three atoms the decompositions are ranked by an estimate from
+    the minimum-form sizes and the eight cheapest are built; the three best also with other
+    minimum forms of their functions, so the two share subterms: the first five forms of each
+    in every pairing, eight more pairs whose forms share a subterm (by table), and each
+    function read through the other's node and at most two atoms (`y ^ w` beside `~w` as `~(y
+    ^ n)`, `n` the node of `~w`). The minimum-form table keeps, per table, the first eight other
+    forms of its size and eight more that each bring a subterm the ones before lack, built also
+    from the operands' other forms (`(x & y) | ~(y ^ z)` from `~(y ^ z)`, beside `(x | y) & (x ^
+    (y ^ z))`). The form is also rendered as `s·g + d` for an odd `s` (`1111·x + 1111·k −
+    2222·(x & k)` is `(x ^ k)·1111`), group by group when its atoms fall into independent
+    groups, and with a bitwise function of two or three atoms peeled off at an atom whose
+    terms are a multiple of that function's (what is left rendered without further groups,
+    peels or pairings: `(p | (a ^ d)) + (a ^ D)` comes apart at `D`). A normal form's own
+    linear part of three atoms is also split as `k·g + rest`, `g` a function of two of them
+    and `k` one of ±1, ±2, where the rest takes at most three values at the corners (the two
+    such splits leaving the fewest, the rest's decompositions read off its values): a third
+    term beside two, `(x & z) − 6·~((x & y) | (x ^ y ^ z)) − (x & y)` sharing `x & y`. A table
+    of four to six atoms is rendered by splitting on an atom down to three (`a ? f₁ : f₀`, with
+    its cheap special cases), and of four or five also as `g(free, h(bound))` for a set of two
+    or three atoms it reads only through one function `h` of them (its chart has two distinct
+    columns), `h` and `g` each by its minimum form (`~((d ^ s) | ((u | v) ^ d))` through `u |
+    v`); the best form of each such table is kept per rendering. A function whose bits do not
+    all follow the classes renders as `g ^ k`. Sums merge terms of one node, and a mostly
+    negative quotient of a division is also subtracted (`d − f·q`, a negation smaller).
+  - *Bar.* An answer must be smaller than the question, and every rendering of a form reads all
+    of its atoms (the form is canonical over independent atoms). So a form whose atoms'
+    renderings and one node joining each further atom that no other contains already reach
+    the question's size is not rendered at all (a sum or product it is part of only adds
+    nodes), and an atom's definition is rendered only toward fewer nodes than the subterm as
+    it is.
   - *Self-check.* The chosen answer is certified against the input (§ Certificates) within the
     solver's remaining budget: `Claim::Proved` when a certificate ran, `Claim::Sampled` when
-    none fit but the refutation sample agrees (the gate then decides on its own evidence).
+    none fit but the refutation sample agrees (the gate then decides on its own evidence). A
+    caller that asks without evidence (`MbaBudget::evidence` off) gets an answer built exactly
+    as `Claim::Unverified`, not checked again.
     Budget exhaustion before an answer is `Exhausted`; every decline is counted
     (`NfStats`: fragments reached, atoms, candidates, null parts, certificates, declines by
     reason). Steps count nodes, table words and monomial products; rendering work (terms and
     table entries visited, four per term operation of a division, each division also bounded
     by its dividend's size); and one per 32 node evaluations of a certificate. Rendering
-    stops generating candidates when the budget runs out, and the answer is then
-    `Exhausted`: a question's time is bounded by its budget (about 40 to 60 ns per step on
-    the benchmark machine, so tens of milliseconds at the default `2^20`).
+    stops generating candidates when the budget runs out; if the normal form itself did not
+    render within it, the answer is `Exhausted` (nothing says the best was seen), while what
+    comes after (the other forms, later rounds with more factors, the fixed point) only stops.
+    A question's time is bounded by its budget (about 40 to 60 ns per step on the benchmark
+    machine, so tens of milliseconds at the default `2^20`).
   - *Memo.* The engine asks about nested fragments bottom-up, and asks some again as the DAG
     around them changes. The solver remembers its last `NfOptions::memo` answers (1,024 by
     default) by question and budget, keeping each question to compare on use (a hash
-    collision is a miss), and rendering keeps each form's renderings per product depth with
-    the work they cost, charged again on reuse. Neither changes an answer or where the budget
-    runs out (tested with the memo off, on, and forgetting constantly). On the corpus diff
-    they take about 30 % off the proposed configuration's instructions on random DAGs, and
-    half to three quarters on nonlinear MBA.
+    collision is a miss); that never changes an answer or where the budget runs out (tested
+    with the memo off, on, and forgetting constantly). Rendering keeps each form's renderings
+    per product depth, and a reuse costs the lookup: products render their factors for every
+    quotient, and charging each reuse the rendering's work again spent most of a budget on
+    nothing. On the corpus diff they take about 30 % off the proposed configuration's
+    instructions on random DAGs, and half to three quarters on nonlinear MBA.
   - *Synthesis* (`NfOptions::synthesis`, on by default). A table holds the smallest
     expressions of up to seven nodes over the atoms `a`, `b`, `c` and the constant 1 with
     `+ − · & | ^ ~` and negation, one per vector of values at 24 fixed probe points (the eight

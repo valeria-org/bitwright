@@ -16,8 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use self::bits::{BitOp, Bits};
-use self::classes::Classes;
-use self::poly::Poly;
+use self::classes::{Classes, FULL};
+use self::poly::{Mono, Poly, Sym};
 use self::render::{Builder, Render};
 use super::certify::{self, Steps};
 use super::expr::{MNode, MOp, MbaExpr};
@@ -71,13 +71,13 @@ pub struct NfOptions {
 }
 
 impl Default for NfOptions {
-    /// 16 atoms, 16 classes, 1024 monomials, degree 16; 1024 answers remembered; synthesis on.
+    /// 16 atoms, 32 classes, 1024 monomials, degree 32; 1024 answers remembered; synthesis on.
     fn default() -> Self {
         NfOptions {
             max_atoms: 16,
-            max_classes: 16,
+            max_classes: 32,
             max_terms: 1024,
-            max_degree: 16,
+            max_degree: 32,
             memo: 1024,
             synthesis: true,
         }
@@ -206,7 +206,7 @@ pub struct NormalFormSolver {
 }
 
 /// A remembered question: its content hash and budget.
-type MemoKey = ([u64; 2], u64);
+type MemoKey = ([u64; 2], MbaBudget);
 
 /// Answers by question and budget, oldest forgotten first. An entry keeps its question, which
 /// must equal the one asked (a hash collision is a miss, never someone else's answer).
@@ -248,7 +248,7 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v2;atoms={};classes={};terms={};degree={};synth={}",
+            "bitwright.nf.v3;atoms={};classes={};terms={};degree={};synth={}",
             opts.max_atoms,
             opts.max_classes,
             opts.max_terms,
@@ -295,7 +295,7 @@ impl MbaSolver for NormalFormSolver {
             calls: 1,
             ..NfStats::default()
         };
-        let key = (p.key(), budget.steps);
+        let key = (p.key(), *budget);
         let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p));
         let answer = match remembered {
             Some(a) => {
@@ -313,10 +313,11 @@ impl MbaSolver for NormalFormSolver {
         match &answer {
             MbaAnswer::Simplified { claim, .. } => {
                 tally.simplified += 1;
-                if *claim == Claim::Proved {
-                    tally.proved += 1;
-                } else {
-                    tally.sampled += 1;
+                match claim {
+                    Claim::Proved => tally.proved += 1,
+                    Claim::Sampled => tally.sampled += 1,
+                    // Asked without evidence: unchecked here, the caller proves it.
+                    _ => {}
                 }
             }
             MbaAnswer::NoSimpler => tally.no_simpler += 1,
@@ -410,6 +411,9 @@ enum Def {
     Verbatim(u32),
     /// An input subterm (arithmetic read by a bitwise operator), rendered from its normal form.
     Form(u32),
+    /// The complement of an input subterm (arithmetic read by a bitwise operator, which reads
+    /// the atom complemented), rendered from its normal form.
+    Complement(u32),
     /// `a >> k` of an input subterm `a`, rendered from `a`'s normal form.
     Shift(u16, u32),
 }
@@ -437,13 +441,27 @@ struct Pass<'p> {
     canon: Vec<u32>,
     forms: Vec<Option<Form>>,
     atoms: Vec<Def>,
-    /// Per atom: the normal form it is rendered from (for `Def::Form` and `Def::Shift`).
+    /// Per atom: the normal form it is rendered from (for `Def::Form`, `Def::Complement` and
+    /// `Def::Shift`).
     atom_nf: Vec<Option<Poly>>,
     /// Atoms by what identifies them.
     atom_of: HashMap<AtomKey, u32>,
     /// Normal forms of the operands of products: factors worth trying when rendering.
     factors: Vec<Poly>,
+    /// Every node's values at the refutation sample (up to 64 bits), computed on first need,
+    /// with the variables' values: for reading a subterm's bits (see `bitwise_by_bits`).
+    sample: Option<Option<Sample>>,
+    /// Bitwise forms looked for at the sample so far.
+    discoveries: u32,
+    /// Whether a bitwise operation was read as halves (see [`Pass::halves`]).
+    halved: bool,
 }
+
+/// The most bitwise forms a question looks for at the sample (each is proved before use).
+const DISCOVERIES: u32 = 4;
+
+/// Values at the refutation sample: per node (empty for one not evaluated), and per variable.
+type Sample = (Vec<Vec<u64>>, Vec<Vec<u64>>);
 
 fn solve(p: &MbaExpr, opts: &NfOptions, budget: &MbaBudget, tally: &mut NfStats) -> MbaAnswer {
     match run(p, opts, budget, tally) {
@@ -494,6 +512,263 @@ impl Pass<'_> {
         key_form(p, &self.classes)
     }
 
+    /// A degree-≤1 form as a bitwise function once atoms stand for multiples of their
+    /// definitions (greedily, over the atoms defined by normal forms, while it is not one).
+    fn bitwise_over_atoms(&mut self, key: &Poly) -> Result<Option<Bits>, Decline> {
+        let mut cur: Option<Poly> = None;
+        // Again while something is substituted: one substitution can expose another's
+        // definition (`d − (n & s)` with `s = a + d` is `s − a − (n & s)`, then `n = −a`).
+        for _ in 0..3 {
+            let mut progress = false;
+            for a in 0..self.atoms.len() {
+                if !matches!(self.atoms[a], Def::Form(_) | Def::Complement(_)) {
+                    continue;
+                }
+                let Some(d) = self.atom_nf[a].clone() else {
+                    continue;
+                };
+                if d.degree() > 1 {
+                    continue;
+                }
+                let base = cur.as_ref().unwrap_or(key);
+                self.charge((d.len() + base.len()) as u64 * 4)?;
+                // The atom for a multiple of its definition, or, when only a variable of the
+                // definition is there, that variable eliminated (`d` is `s − a` for the atom
+                // `s = a + d`).
+                let whole = if self.classes.len() <= 1 { 0 } else { FULL };
+                let Some(sub) = base.substitute(a as u32, &d).or_else(|| {
+                    eliminate_var(base, a as u32, &d, self.p.vars().len() as u32, whole)
+                }) else {
+                    continue;
+                };
+                self.charge((sub.len() as u64) << sub.atoms().count_ones().min(12))?;
+                // The atom stands unmasked: in every class.
+                let sub = sub.expand_full(&self.classes);
+                if let Some(f) = Bits::from_linear(&sub, &self.classes) {
+                    return Ok(Some(f));
+                }
+                cur = Some(sub);
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// The question's node values and variable values at the refutation sample (points in
+    /// lanes of 64 bits: `None` for wider questions).
+    fn sample(&mut self) -> Result<Option<&Sample>, Decline> {
+        if self.sample.is_none() {
+            let computed = (|| {
+                let prog = crate::mba::batch::Program::new(self.p, true)?;
+                if prog.widest() > 64 {
+                    return None;
+                }
+                let points = certify::sample_points(self.p.vars(), &[self.p], self.p.key()[0]);
+                let inputs: Vec<Vec<u64>> = (0..self.p.vars().len())
+                    .map(|v| {
+                        points
+                            .iter()
+                            .map(|pt| pt[v].limbs().first().copied().unwrap_or(0))
+                            .collect()
+                    })
+                    .collect();
+                let mut regs: Vec<Vec<u64>> = Vec::new();
+                prog.run(&mut regs, &inputs, points.len());
+                let values = (0..self.p.nodes().len())
+                    .map(|i| prog.reg_of(i).map_or_else(Vec::new, |r| regs[r].clone()))
+                    .collect();
+                Some((values, inputs))
+            })();
+            let units = (self.p.nodes().len() * certify::SAMPLE_POINTS) as u64;
+            self.charge(units.div_ceil(EVALS_PER_STEP))?;
+            self.sample = Some(computed);
+        }
+        Ok(self.sample.as_ref().and_then(Option::as_ref))
+    }
+
+    /// Atom `a`'s values at the sample.
+    fn atom_values(&mut self, a: u32) -> Result<Option<Vec<u64>>, Decline> {
+        let def = self.atoms[a as usize].clone();
+        let bits = self.w.bits();
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let Some((values, inputs)) = self.sample()? else {
+            return Ok(None);
+        };
+        let col = |i: u32| values.get(i as usize).filter(|v| !v.is_empty()).cloned();
+        Ok(match def {
+            Def::Var(v) => inputs.get(v as usize).cloned(),
+            Def::Verbatim(i) | Def::Form(i) => col(i),
+            Def::Complement(i) => col(i).map(|v| v.iter().map(|x| !x & mask).collect()),
+            Def::Shift(k, i) => col(i).map(|v| v.iter().map(|x| x >> k).collect()),
+        })
+    }
+
+    /// Arithmetic `i` (normal form `key`) read by a bitwise operator, when it is a bitwise
+    /// function of the atoms it mentions in a way no linear reading shows (`−(x & −x)` is
+    /// `x | −x`): the function its bits follow at the sample, per class, used once a
+    /// certificate proves the subterm equal to it.
+    fn bitwise_by_bits(
+        &mut self,
+        i: u32,
+        key: &Poly,
+        tally: &mut NfStats,
+    ) -> Result<Option<Bits>, Decline> {
+        let atoms = key.atoms();
+        let mut leaves: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
+        if self.discoveries >= DISCOVERIES || leaves.is_empty() || leaves.len() > 4 {
+            return Ok(None);
+        }
+        // Over the variables alone a form of degree at most 1 is canonical: it is a bitwise
+        // function exactly when `Bits::from_linear` reads it as one (which the caller tried).
+        let vars = self.p.vars().len() as u32;
+        if key.degree() <= 1 && leaves.iter().all(|&a| a < vars) {
+            return Ok(None);
+        }
+        // And the variables, while there is room: a subterm can be a bitwise function of an
+        // atom and the variables inside it together (`−(a & x)` with `a = −(x & y)` is
+        // `(a & ~x) | (x & y)`).
+        for v in 0..self.p.vars().len() as u32 {
+            if leaves.len() < 4
+                && !leaves.contains(&v)
+                && matches!(self.atoms.get(v as usize), Some(Def::Var(_)))
+            {
+                leaves.push(v);
+            }
+        }
+        leaves.sort_unstable();
+        let Some((values, _)) = self.sample()? else {
+            return Ok(None);
+        };
+        let Some(own) = values.get(i as usize).filter(|v| !v.is_empty()).cloned() else {
+            return Ok(None);
+        };
+        let mut cols = Vec::with_capacity(leaves.len());
+        for &a in &leaves {
+            match self.atom_values(a)? {
+                Some(v) => cols.push(v),
+                None => return Ok(None),
+            }
+        }
+        let n = self.classes.len();
+        let bits = self.w.bits();
+        let class_of: Vec<usize> = (0..bits)
+            .map(|j| {
+                (0..n)
+                    .find(|&c| self.classes.mask(c).bit(j) == Some(true))
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.charge((own.len() * usize::from(bits) * leaves.len()) as u64 / EVALS_PER_STEP + 1)?;
+        let (mut seen, mut ones) = (vec![0u64; n], vec![0u64; n]);
+        for (p, &v) in own.iter().enumerate() {
+            for j in 0..bits {
+                let e = cols
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |e, (t, col)| e | (((col[p] >> j) & 1) as u32) << t);
+                let (c, bit) = (class_of[usize::from(j)], (v >> j) & 1);
+                if seen[c] >> e & 1 == 1 {
+                    if ones[c] >> e & 1 != bit {
+                        return Ok(None);
+                    }
+                } else {
+                    seen[c] |= 1 << e;
+                    ones[c] |= bit << e;
+                }
+            }
+        }
+        // A form the sample agrees with: only these count as discoveries (each costs a proof).
+        self.discoveries += 1;
+        let f = Bits {
+            support: leaves.clone(),
+            tables: ones.iter().map(|&t| vec![t]).collect(),
+        };
+        // The proof: the subterm against the function of the atoms' own expressions, class by
+        // class under its mask.
+        let internal = || Decline::Unsupported("internal: bitwise form");
+        let lhs = verbatim(self.p, i).ok_or_else(internal)?;
+        let mut b = Builder::new(self.p.vars().to_vec());
+        let mut ins = Vec::with_capacity(leaves.len());
+        for &a in &leaves {
+            let x = match self.atoms[a as usize] {
+                Def::Var(v) => b.var(v),
+                Def::Verbatim(k) | Def::Form(k) => b
+                    .import(&verbatim(self.p, k).ok_or_else(internal)?)
+                    .ok_or_else(internal)?,
+                Def::Complement(k) => {
+                    let x = b
+                        .import(&verbatim(self.p, k).ok_or_else(internal)?)
+                        .ok_or_else(internal)?;
+                    b.un(MOp::Not, x)
+                }
+                Def::Shift(k, j) => {
+                    let x = b
+                        .import(&verbatim(self.p, j).ok_or_else(internal)?)
+                        .ok_or_else(internal)?;
+                    b.un(MOp::LShr(k), x)
+                }
+            };
+            ins.push(x);
+        }
+        let mut acc: Option<u32> = None;
+        for (c, &t) in ones.iter().enumerate() {
+            // The algebraic normal form of this class's table.
+            let k = leaves.len();
+            let mut anf: Vec<bool> = (0..1usize << k).map(|e| t >> e & 1 == 1).collect();
+            for bit in 0..k {
+                for e in 0..1usize << k {
+                    if e >> bit & 1 == 1 {
+                        anf[e] ^= anf[e ^ 1 << bit];
+                    }
+                }
+            }
+            let mut g: Option<u32> = None;
+            for (e, &on) in anf.iter().enumerate().skip(1) {
+                if !on {
+                    continue;
+                }
+                let mut m: Option<u32> = None;
+                for (t, &x) in ins.iter().enumerate() {
+                    if e >> t & 1 == 1 {
+                        m = Some(match m {
+                            None => x,
+                            Some(y) => b.bin(MOp::And, y, x),
+                        });
+                    }
+                }
+                if let Some(m) = m {
+                    g = Some(match g {
+                        None => m,
+                        Some(y) => b.bin(MOp::Xor, y, m),
+                    });
+                }
+            }
+            let mut g = g.unwrap_or_else(|| b.konst(&BitVec::zero(self.w)));
+            if anf[0] {
+                g = b.un(MOp::Not, g);
+            }
+            if n > 1 {
+                let m = b.konst(self.classes.mask(c));
+                g = b.bin(MOp::And, g, m);
+            }
+            acc = Some(match acc {
+                None => g,
+                Some(y) => b.bin(MOp::Or, y, g),
+            });
+        }
+        let rhs = b.finish(acc.ok_or_else(internal)?).ok_or_else(internal)?;
+        let report = certify_within(&lhs, &rhs, &mut self.work);
+        tally.certificates.record(&report);
+        Ok((report.verdict == Verdict::Proved).then(|| f.prune()))
+    }
+
     /// Node `i` read by a bitwise operator: its bitwise function (an atom when it is not one).
     fn bitwise(&mut self, i: u32, tally: &mut NfStats) -> Result<Bits, Decline> {
         let n = self.classes.len();
@@ -505,17 +780,36 @@ impl Pass<'_> {
             }
             Some(Form::Bits(f)) => Ok(f),
             Some(Form::Poly(p)) => {
-                // Arithmetic that is secretly a bitwise function is read as one; otherwise it
-                // is an atom, identified by its normal form.
+                // Arithmetic that is secretly a bitwise function is read as one, also once
+                // other atoms stand for their definitions (`(~a & d) − e` with `a` the atom
+                // `−e` is `d | a`); otherwise it is an atom, identified by its normal form.
                 let key = self.key_form(&p);
                 if key.degree() <= 1 {
                     self.charge((key.len() as u64) << key.atoms().count_ones().min(12))?;
                     if let Some(f) = Bits::from_linear(&key, &self.classes) {
                         return Ok(f);
                     }
+                    if let Some(f) = self.bitwise_over_atoms(&key)? {
+                        return Ok(f);
+                    }
                 }
-                let a = self.atom(AtomKey::Form(key.clone()), Def::Form(i), Some(key), tally)?;
-                Ok(Bits::atom(n, a))
+                if let Some(f) = self.bitwise_by_bits(i, &key, tally)? {
+                    return Ok(f);
+                }
+                // Atoms are one up to complement: of `p` and `~p = −1 − p`, the one with the
+                // smaller constant (`−x` for `x − 1`), so a bitwise reader of either reads the
+                // same atom, complemented or not.
+                let not = self.key_form(&Poly::constant(BitVec::ones(self.w)).sub(&p));
+                let complement =
+                    BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &not.konst(), &key.konst());
+                let (key, def) = if complement {
+                    (not, Def::Complement(i))
+                } else {
+                    (key, Def::Form(i))
+                };
+                let a = self.atom(AtomKey::Form(key.clone()), def, Some(key), tally)?;
+                let f = Bits::atom(n, a);
+                Ok(if complement { f.not() } else { f })
             }
             None => {
                 let a = self.verbatim_atom(i, tally)?;
@@ -552,9 +846,13 @@ impl Pass<'_> {
         Ok(p)
     }
 
-    /// Remembers the normal form of a product's operand: rendering tries it as a factor.
+    /// Remembers the normal form of a product's operand: rendering tries it as a factor. A
+    /// single monomial is not one: rendering takes out common symbols anyway.
     fn note_factor(&mut self, f: &Poly) {
-        if f.degree() >= 1 && f.len() <= 64 && self.factors.len() < 16 && !self.factors.contains(f)
+        if f.degree() >= 1
+            && (2..=64).contains(&f.len())
+            && self.factors.len() < 16
+            && !self.factors.contains(f)
         {
             self.factors.push(f.clone());
         }
@@ -583,6 +881,68 @@ impl Pass<'_> {
         Ok(known_bits(op, &p, &self.classes, &k).map(Form::Poly))
     }
 
+    /// `a op b` (`op` bitwise) for operands that are both multiples of `2^k` as polynomials
+    /// (every coefficient and the constant): bitwise operators commute with a left shift, so
+    /// it is `2^k·(a/2^k op b/2^k)`, arithmetic, when the halves are bitwise functions
+    /// (`(y + y) ^ ((x ^ z) + x − z)` is `2·(y ^ (x & ~z))`).
+    fn halves(&mut self, op: MOp, a: u32, b: u32) -> Result<Option<Form>, Decline> {
+        let w = self.w;
+        let operand = |s: &Self, i: u32| -> Option<Poly> {
+            match &s.forms[i as usize] {
+                Some(Form::Poly(p)) => Some(p.clone()),
+                Some(Form::Const(v)) => Some(Poly::constant(*v)),
+                _ => None,
+            }
+        };
+        let (Some(pa), Some(pb)) = (operand(self, a), operand(self, b)) else {
+            return Ok(None);
+        };
+        // Both constants fold elsewhere.
+        if pa.len() <= 1 && pb.len() <= 1 && pa.degree() == 0 && pb.degree() == 0 {
+            return Ok(None);
+        }
+        self.charge((pa.len() + pb.len()) as u64)?;
+        let tz = |p: &Poly| {
+            p.terms()
+                .values()
+                .map(crate::facts::known::trailing_zeros)
+                .min()
+                .unwrap_or(u32::from(w.bits()))
+        };
+        let k = tz(&pa).min(tz(&pb)).min(u32::from(w.bits()) - 1);
+        if k == 0 {
+            return Ok(None);
+        }
+        let amount = BitVec::wrapping_from_u64(w, u64::from(k));
+        let half = |p: &Poly| {
+            let mut q = Poly::zero(w);
+            for (m, c) in p.terms() {
+                q.add_term(
+                    m.clone(),
+                    &BitVec::bin_unchecked(crate::ops::BinOp::AShr, c, &amount),
+                );
+            }
+            q
+        };
+        let (ha, hb) = (half(&pa), half(&pb));
+        let (Some(x), Some(y)) = (
+            Bits::from_linear(&ha.expand_full(&self.classes), &self.classes),
+            Bits::from_linear(&hb.expand_full(&self.classes), &self.classes),
+        ) else {
+            return Ok(None);
+        };
+        let bop = match op {
+            MOp::And => BitOp::And,
+            MOp::Or => BitOp::Or,
+            _ => BitOp::Xor,
+        };
+        let Some(r) = Bits::bin(bop, &x, &y) else {
+            return Ok(None);
+        };
+        let scale = crate::facts::known::bv_shl(&BitVec::one(w), k);
+        Ok(Some(Form::Poly(r.to_poly(&self.classes).scale(&scale))))
+    }
+
     /// The normal form of live node `i` from its operands' forms.
     fn visit(&mut self, i: u32, tally: &mut NfStats) -> Result<Option<Form>, Decline> {
         let n = self.p.nodes()[i as usize];
@@ -605,6 +965,11 @@ impl Pass<'_> {
             MOp::And | MOp::Or | MOp::Xor => {
                 if let Some(f) = self.known_bits(n.op, a, b)? {
                     tally.known_bits += 1;
+                    return Ok(Some(f));
+                }
+                if let Some(f) = self.halves(n.op, a, b)? {
+                    tally.known_bits += 1;
+                    self.halved = true;
                     return Ok(Some(f));
                 }
                 let (x, y) = (self.bitwise(a, tally)?, self.bitwise(b, tally)?);
@@ -874,16 +1239,43 @@ fn verbatim(p: &MbaExpr, i: u32) -> Option<MbaExpr> {
 /// A question's normal form, ready to render.
 struct Normal {
     w: Width,
+    /// The question's variables (the first atoms).
+    vars: u32,
     classes: Classes,
     nf: Poly,
     /// The same function with atoms standing for their definitions where these appear
     /// arithmetically (rendered too; the cheapest wins).
     alts: Vec<Poly>,
+    /// The atoms and their normal forms (see [`more_forms`]).
+    defs: Vec<Def>,
+    atom_nf: Vec<Option<Poly>>,
     atom_exprs: Vec<MbaExpr>,
     factors: Vec<Poly>,
+    /// Masked conjunctions proved zero (see [`prune_null_conjunctions`]).
+    nulls: Vec<poly::Sym>,
+    /// Whether a bitwise operation was read as halves.
+    halved: bool,
     input_cost: u32,
     work: Steps,
     synthesis: bool,
+    max_terms: u32,
+}
+
+/// A normal form as rendered: unmasked symbols wherever the classes allow (the same function;
+/// `nulls` are masked conjunctions known to be zero), then the one-position rule.
+fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym]) -> Poly {
+    // With one class an unmasked symbol is that class's (substitution writes unmasked atoms):
+    // one symbol either way.
+    let mut f = if classes.len() <= 1 {
+        f.expand_full(classes)
+    } else {
+        f.clone()
+    };
+    f.reduce_core(classes);
+    let mut f = f.declass(classes, DECLASS_LIMIT, nulls);
+    f.single_positions(classes);
+    f.reduce_core(classes);
+    f
 }
 
 fn normalize(
@@ -953,6 +1345,9 @@ fn normalize(
         atom_nf: vec![None; p.vars().len()],
         atom_of: HashMap::new(),
         factors: Vec::new(),
+        sample: None,
+        discoveries: 0,
+        halved: false,
     };
     for (i, &is_live) in live.iter().enumerate() {
         if !is_live {
@@ -979,17 +1374,8 @@ fn normalize(
     } else {
         tally.linear += 1;
     }
-    // Normal forms as rendered: unmasked symbols wherever the classes allow (the same
-    // function), then the one-position rule.
-    let finish = |f: &Poly| {
-        let mut f = f.clone();
-        f.reduce_core(&pass.classes);
-        let mut f = f.declass(&pass.classes, DECLASS_LIMIT);
-        f.single_positions(&pass.classes);
-        f.reduce_core(&pass.classes);
-        f
-    };
-    let factors: Vec<Poly> = pass.factors.iter().map(finish).collect();
+    let finish = |f: &Poly| finished(f, &pass.classes, &[]);
+    let mut factors: Vec<Poly> = pass.factors.iter().map(finish).collect();
     let mut work = pass.work;
     // The atoms' renderings, lower atoms first: each once, from its own cheapest form (the
     // subterm as it is among the candidates).
@@ -1003,22 +1389,32 @@ fn normalize(
                 m
             }
             Def::Verbatim(i) => verbatim(p, i).ok_or_else(internal)?,
-            Def::Form(i) | Def::Shift(_, i) => {
+            Def::Form(i) | Def::Complement(i) | Def::Shift(_, i) => {
                 let form = finish(pass.atom_nf[a].as_ref().ok_or_else(internal)?);
+                // Without the searches meant for a question's own form.
                 let mut r = Render::new(
                     p.vars().to_vec(),
                     w,
                     &pass.classes,
                     &atom_exprs[..a],
                     work.left,
-                );
-                let mut cands = candidates(&mut r, &form, &factors);
-                if let Some(v) = verbatim(p, i)
-                    && let Some(root) = r.b.import(&v)
-                {
-                    cands.push(root);
+                )
+                .for_atom();
+                // The subterm as it is: a rendering of the form replaces it only with fewer
+                // nodes.
+                let as_is = verbatim(p, i)
+                    .and_then(|v| r.b.import(&v))
+                    .map(|root| match *def {
+                        Def::Complement(_) => r.b.un(MOp::Not, root),
+                        _ => root,
+                    });
+                if let Some(x) = as_is {
+                    let bar = r.b.cost(x).0;
+                    r = r.with_bar(bar);
                 }
-                if opts.synthesis {
+                let mut cands = candidates(&mut r, &form, &factors);
+                cands.extend(as_is);
+                if opts.synthesis && !r.hopeless(form.atoms()) {
                     let bar = r.best(&cands).map(|b| r.b.cost(b));
                     if let Some(render::Hit::Exact(x)) = r.synthesize(&form, bar) {
                         cands.push(x);
@@ -1046,6 +1442,39 @@ fn normalize(
         };
         atom_exprs.push(e);
     }
+    let mut nulls = Vec::new();
+    prune_null_conjunctions(
+        p,
+        &mut nf,
+        &pass.classes,
+        &atom_exprs,
+        &mut nulls,
+        &mut work,
+        tally,
+    )?;
+    // For the question's own rendering (not its atoms'), sums and differences of two factors,
+    // where no longer than either: `x·y` written `(x & y)·(x | y) + (x & ~y)·(~x & y)` has the
+    // factors `x = (x & y) + (x & ~y)` and `y = (x | y) − (x & ~y)`.
+    let noted = factors.len().min(FACTORS_PAIRED);
+    for i in 0..noted {
+        for j in i + 1..noted {
+            let most = factors[i].len().min(factors[j].len());
+            for f in [factors[i].add(&factors[j]), factors[i].sub(&factors[j])] {
+                if f.degree() >= 1 && (2..=most).contains(&f.len()) && !factors.contains(&f) {
+                    factors.push(f);
+                }
+            }
+        }
+    }
+    drop_dependent_atoms(
+        p,
+        &mut nf,
+        &pass.classes,
+        &pass.atoms,
+        &atom_exprs,
+        &mut work,
+        tally,
+    )?;
     if nf.degree() >= 2 {
         prune_null(p, &mut nf, &pass.classes, &atom_exprs, &mut work, tally)?;
     }
@@ -1059,11 +1488,13 @@ fn normalize(
     // also appears arithmetically, a multiple of it becomes the atom, which the rendering then
     // shares with the bitwise uses. Greedy over the atoms, while the finished form does not
     // grow.
+    // Known-zero conjunctions are don't-cares when unmasking.
+    let finish = |f: &Poly| finished(f, &pass.classes, &nulls);
     let mut alt: Option<Poly> = None;
     let mut alt_len: Option<usize> = None;
     let mut reused = false;
     for (a, def) in pass.atoms.iter().enumerate() {
-        let (Def::Form(_), Some(d)) = (def, pass.atom_nf[a].as_ref()) else {
+        let (Def::Form(_) | Def::Complement(_), Some(d)) = (def, pass.atom_nf[a].as_ref()) else {
             continue;
         };
         if nf.len() > REUSE_TERMS {
@@ -1097,15 +1528,641 @@ fn normalize(
     tally.reused += u64::from(!alts.is_empty());
     Ok(Normal {
         w,
+        vars: p.vars().len() as u32,
         classes: pass.classes,
         nf,
         alts,
+        defs: pass.atoms,
+        atom_nf: pass.atom_nf,
         atom_exprs,
         factors,
+        nulls,
+        halved: pass.halved,
         input_cost,
         work,
         synthesis: opts.synthesis,
+        max_terms: opts.max_terms,
     })
+}
+
+/// Other forms of the normal form's function, rendered beside it (see `best_rendering`): a
+/// variable eliminated through an atom's definition, and zero added to complete a bitwise
+/// function of an atom.
+fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
+    let w = n.w;
+    let nf = &n.nf;
+    let finish = |f: &Poly| finished(f, &n.classes, &n.nulls);
+    let mut alts: Vec<Poly> = n.alts.clone();
+    let known = alts.len();
+    // Unmasked symbols in finished forms: `FULL`, or the only class.
+    let whole = if n.classes.len() <= 1 { 0 } else { FULL };
+    // Elimination: an atom whose definition is linear in the variables, `α·v + …` with `α`
+    // odd, determines `v = α⁻¹·(n − …)`; the form with `v` read so wherever it is read
+    // arithmetically (`−a·c + c·(n & a) + n·(n & a)` with `n` the atom `−c` is `a·n`).
+    let vars = n.vars;
+    let mut eliminated = 0;
+    for (a, def) in n.defs.iter().enumerate() {
+        let (Def::Form(_) | Def::Complement(_), Some(d)) = (def, n.atom_nf[a].as_ref()) else {
+            continue;
+        };
+        let d = finish(d);
+        if eliminated == 2 {
+            continue;
+        }
+        let plain = |m: &Mono| {
+            matches!(m.as_slice(), [(s, 1)] if s.class == whole
+                && s.set.count_ones() == 1
+                && s.set.trailing_zeros() < vars)
+        };
+        // A variable the definition reads once, alone, with an odd coefficient (its other
+        // terms need not be linear: `e² + d` determines `d`).
+        let once = |v: Sym| {
+            d.terms()
+                .keys()
+                .filter(|t| t.iter().any(|&(s, _)| s.set & v.set != 0))
+                .count()
+                == 1
+        };
+        let Some((m, alpha)) = d
+            .terms()
+            .iter()
+            .find(|(m, c)| plain(m) && c.bit(0) == Some(true) && once(m[0].0))
+        else {
+            continue;
+        };
+        let v = m[0].0;
+        if !nf.terms().keys().any(|t| t.iter().any(|&(s, _)| s == v)) {
+            continue;
+        }
+        // v = α⁻¹·(n − (d − α·v)).
+        let mut rest = d.clone();
+        rest.add_term(
+            m.clone(),
+            &BitVec::un_unchecked(crate::ops::UnOp::Neg, alpha),
+        );
+        let mut r = Poly::sym(
+            w,
+            Sym {
+                set: 1 << a,
+                class: whole,
+            },
+        )
+        .sub(&rest);
+        r = r.scale(&poly::odd_inverse(alpha));
+        {
+            use certify::Meter;
+            work.charge((nf.len() as u64).saturating_mul(u64::from(nf.degree()) + 1) * 4)
+                .map_err(|()| Decline::Exhausted)?;
+        }
+        if let Some(e) = nf.replace(v, &r, n.max_terms as usize) {
+            let e = finish(&e);
+            if e != *nf && !alts.contains(&e) {
+                alts.push(e);
+                eliminated += 1;
+            }
+        }
+    }
+    // And zero added: `c·(n − d)` for an atom `n` with a linear definition `d` that the form
+    // reads bitwise, `c = ±1`, which completes a bitwise function of it (`−(b & n)` with `n` the
+    // atom `−b` is `b + n − (b & n)`, `b | n`). Also to the form with atoms reused, which may
+    // read the atom arithmetically where the normal form reads its definition (`(p | (a ^ d)) +
+    // (a ^ D)` with `D` the atom `2·a` and `p` the atom `a·d`).
+    let mut added = 0;
+    for (a, def) in n.defs.iter().enumerate() {
+        let (Def::Form(_) | Def::Complement(_), Some(d)) = (def, n.atom_nf[a].as_ref()) else {
+            continue;
+        };
+        if added == 4 || nf.len() > 16 {
+            break;
+        }
+        let d = finish(d);
+        let read = nf.terms().keys().any(|m| {
+            m.iter()
+                .any(|&(s, _)| s.set >> a & 1 == 1 && s.set.count_ones() > 1)
+        });
+        if d.degree() != 1 || !read {
+            continue;
+        }
+        let zero = Poly::sym(
+            w,
+            Sym {
+                set: 1 << a,
+                class: whole,
+            },
+        )
+        .sub(&d);
+        {
+            use certify::Meter;
+            work.charge((nf.len() + zero.len()) as u64 * 8)
+                .map_err(|()| Decline::Exhausted)?;
+        }
+        for base in std::iter::once(nf).chain(&n.alts) {
+            for c in [BitVec::one(w), BitVec::ones(w)] {
+                let e = finish(&base.add(&zero.scale(&c)));
+                if e != *nf && !alts.contains(&e) {
+                    alts.push(e);
+                    added += 1;
+                }
+            }
+        }
+    }
+    // And zero that makes the form a bitwise function: one or two relations `n − d` (atoms
+    // with linear definitions the form reads) times small multiples, kept only when the sum is
+    // one (`−(d & e)` with `e` the atom `−d` is `d | e`: `d + e − (d & e)`, one each of
+    // `d − (c − e)` and `e − (e − c)`).
+    let reads = |a: usize| {
+        nf.terms()
+            .keys()
+            .any(|m| m.iter().any(|&(s, _)| s.set >> a & 1 == 1))
+    };
+    let relations: Vec<Poly> = n
+        .defs
+        .iter()
+        .enumerate()
+        .filter_map(|(a, def)| match (def, n.atom_nf[a].as_ref()) {
+            (Def::Form(_) | Def::Complement(_), Some(d)) if a < 64 && reads(a) => {
+                let d = finish(d);
+                let atom = Poly::sym(
+                    w,
+                    Sym {
+                        set: 1 << a,
+                        class: whole,
+                    },
+                );
+                (d.degree() == 1).then(|| atom.sub(&d))
+            }
+            _ => None,
+        })
+        .take(BITWISE_RELATIONS)
+        .collect();
+    let mut bitwise: Vec<Poly> = Vec::new();
+    if !relations.is_empty() && nf.len() <= 32 {
+        let small: Vec<BitVec> = [1i128, -1, 2, -2]
+            .iter()
+            .map(|&k| BitVec::wrapping_from_i128(w, k))
+            .collect();
+        let mut combos: Vec<Poly> = Vec::new();
+        for (i, r) in relations.iter().enumerate() {
+            for k in &small {
+                let one = r.scale(k);
+                for r2 in &relations[i + 1..] {
+                    for k2 in &small {
+                        combos.push(one.add(&r2.scale(k2)));
+                    }
+                }
+                combos.push(one);
+            }
+        }
+        for base in std::iter::once(nf).chain(&n.alts) {
+            if base.degree() > 1 {
+                continue;
+            }
+            for z in &combos {
+                {
+                    use certify::Meter;
+                    let corners = 1u64 << (base.atoms() | z.atoms()).count_ones().min(16);
+                    work.charge((base.len() + z.len()) as u64 + corners)
+                        .map_err(|()| Decline::Exhausted)?;
+                }
+                let g = base.add(z);
+                // A bitwise function's single atoms have coefficients −1, 0 or 1 (an unmasked
+                // one alone, then in every class): most sums fail that first.
+                let masked: u64 = g
+                    .terms()
+                    .keys()
+                    .flat_map(|m| m.iter())
+                    .filter(|(s, _)| s.class != whole)
+                    .fold(0, |a, (s, _)| a | s.set);
+                let loose = g.terms().iter().any(|(m, c)| {
+                    matches!(m.as_slice(), [(s, 1)] if s.class == whole
+                        && s.set.count_ones() == 1
+                        && s.set & masked == 0)
+                        && *c != BitVec::one(w)
+                        && *c != BitVec::ones(w)
+                });
+                if loose || Bits::from_linear(&g.expand_full(&n.classes), &n.classes).is_none() {
+                    continue;
+                }
+                let e = finish(&g);
+                if e != *nf && !alts.contains(&e) && !bitwise.contains(&e) {
+                    bitwise.push(e);
+                }
+            }
+        }
+    }
+    // Bitwise forms first: they render cheaply, and the others may not all fit the budget.
+    let rest: Vec<Poly> = alts
+        .split_off(known)
+        .into_iter()
+        .filter(|a| !bitwise.contains(a))
+        .collect();
+    let mut out = bitwise;
+    out.extend(rest);
+    out.retain(|a| a != nf);
+    Ok(out)
+}
+
+/// `p` (of degree at most 1) with a variable of atom `a`'s definition `d` read through the
+/// atom: `v = α⁻¹·(a − (d − α·v))` for a variable `v` that `d` reads alone, with an odd
+/// coefficient `α`, and that `p` reads alone, both unmasked (`whole`: `FULL`, or the only
+/// class). A masked `v & M` is not `α⁻¹·((a & M) − …)`: the identity holds for the whole
+/// atom only. `None` when there is none or nothing changes.
+fn eliminate_var(p: &Poly, a: u32, d: &Poly, vars: u32, whole: u16) -> Option<Poly> {
+    let w = p.width();
+    if p.degree() > 1 || d.degree() > 1 || a >= 64 {
+        return None;
+    }
+    let (m, alpha) = d.terms().iter().find(|(m, c)| {
+        matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() == 1
+            && s.set.trailing_zeros() < vars
+            && (s.class == whole || s.class == FULL)
+            && p.terms().contains_key(*m))
+            && c.bit(0) == Some(true)
+    })?;
+    let v = m[0].0;
+    // v = α⁻¹·(a − (d − α·v)).
+    let mut rest = d.clone();
+    rest.add_term(
+        m.clone(),
+        &BitVec::un_unchecked(crate::ops::UnOp::Neg, alpha),
+    );
+    let r = Poly::sym(
+        w,
+        Sym {
+            set: 1 << a,
+            class: v.class,
+        },
+    )
+    .sub(&rest)
+    .scale(&poly::odd_inverse(alpha));
+    let out = p.replace(v, &r, 4096)?;
+    (out != *p).then_some(out)
+}
+
+/// The values of `exprs` at the refutation sample of `p` (lanes of 64 bits: `None` wider).
+fn sample_values(
+    p: &MbaExpr,
+    exprs: &[&MbaExpr],
+    work: &mut Steps,
+) -> Result<Option<Vec<Vec<u64>>>, Decline> {
+    use certify::Meter;
+    let points = certify::sample_points(p.vars(), &[p], p.key()[0]);
+    let inputs: Vec<Vec<u64>> = (0..p.vars().len())
+        .map(|v| {
+            points
+                .iter()
+                .map(|pt| pt[v].limbs().first().copied().unwrap_or(0))
+                .collect()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let Some(prog) = crate::mba::batch::Program::new(e, false) else {
+            return Ok(None);
+        };
+        if prog.widest() > 64 {
+            return Ok(None);
+        }
+        let units = (prog.len() * points.len()) as u64;
+        work.charge(units.div_ceil(EVALS_PER_STEP))
+            .map_err(|()| Decline::Exhausted)?;
+        let mut regs: Vec<Vec<u64>> = Vec::new();
+        prog.run(&mut regs, &inputs, points.len());
+        match regs.get(prog.root()) {
+            Some(r) => out.push(r[..points.len()].to_vec()),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Atoms that depend on each other so that some patterns of their bits never occur (`y + 1`
+/// and `(y + y)` of `~y` are never both 1 outside `y`): a degree-≤1 form whose values follow,
+/// in every class over the patterns that occur there at the sample, a function of fewer atoms
+/// is that function (with the constant the dropped atoms leave in each class), used once a
+/// certificate proves the two equal. So `((y + 1) & (~y + ~y)) | y | x` is `x | y`. Atoms
+/// defined by normal forms are dropped first, greedily.
+fn drop_dependent_atoms(
+    p: &MbaExpr,
+    nf: &mut Poly,
+    classes: &Classes,
+    atoms: &[Def],
+    atom_exprs: &[MbaExpr],
+    work: &mut Steps,
+    tally: &mut NfStats,
+) -> Result<(), Decline> {
+    let w = nf.width();
+    if nf.degree() > 1 || w.bits() > 64 {
+        return Ok(());
+    }
+    let set = nf.atoms();
+    let u: Vec<u32> = (0..64).filter(|&a| set >> a & 1 == 1).collect();
+    let derived = |a: u32| {
+        matches!(
+            atoms.get(a as usize),
+            Some(Def::Form(_) | Def::Complement(_))
+        )
+    };
+    if u.len() < 2 || u.len() > 5 || !u.iter().any(|&a| derived(a)) {
+        return Ok(());
+    }
+    // The patterns of the atoms' bits at the sample, per class.
+    let exprs: Vec<&MbaExpr> = u
+        .iter()
+        .filter_map(|&a| atom_exprs.get(a as usize))
+        .collect();
+    if exprs.len() != u.len() {
+        return Ok(());
+    }
+    let Some(vals) = sample_values(p, &exprs, work)? else {
+        return Ok(());
+    };
+    let k = u.len();
+    let n = classes.len();
+    let class_of: Vec<usize> = (0..w.bits())
+        .map(|j| {
+            (0..n)
+                .find(|&c| classes.mask(c).bit(j) == Some(true))
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut seen = vec![0u64; n];
+    for (pt, _) in vals[0].iter().enumerate() {
+        for j in 0..w.bits() {
+            let e = vals
+                .iter()
+                .enumerate()
+                .fold(0u64, |e, (i, col)| e | ((col[pt] >> j) & 1) << i);
+            seen[class_of[usize::from(j)]] |= 1 << e;
+        }
+    }
+    let all = if 1u64 << k == 64 {
+        u64::MAX
+    } else {
+        (1u64 << (1u64 << k)) - 1
+    };
+    if seen.iter().all(|&s| s == all) {
+        return Ok(());
+    }
+    // Per class, the form's value at each pattern (the constant apart): the sum of the
+    // coefficients of the conjunctions inside it, modulo the class's precision.
+    let index = |s: u64| {
+        (0..k)
+            .filter(|&i| s >> u[i] & 1 == 1)
+            .fold(0usize, |q, i| q | 1 << i)
+    };
+    let q = nf.expand_full(classes);
+    let mut val = vec![vec![BitVec::zero(w); 1 << k]; n];
+    for (m, c) in q.terms() {
+        match m.as_slice() {
+            [] => {}
+            [(s, 1)] => {
+                let v = &mut val[usize::from(s.class).min(n - 1)][index(s.set)];
+                *v = BitVec::bin_unchecked(crate::ops::BinOp::Add, v, c);
+            }
+            _ => return Ok(()),
+        }
+    }
+    let prec = |c: usize| {
+        crate::facts::known::low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)))
+    };
+    for (c, v) in val.iter_mut().enumerate() {
+        for b in 0..k {
+            for q in 0..1usize << k {
+                if q >> b & 1 == 1 {
+                    v[q] = BitVec::bin_unchecked(crate::ops::BinOp::Add, &v[q], &v[q ^ 1 << b]);
+                }
+            }
+        }
+        let lm = prec(c);
+        for x in v.iter_mut() {
+            *x = crate::facts::known::bv_and(x, &lm);
+        }
+    }
+    // Greedily, atoms the values over the occurring patterns do not depend on, in any class.
+    let mut keep: Vec<usize> = (0..k).collect();
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by_key(|&i| !derived(u[i]));
+    let mut dropped = false;
+    for i in order {
+        let independent = (0..n).all(|c| {
+            (0..1usize << k).all(|q| {
+                let r = q ^ 1 << i;
+                seen[c] >> q & 1 == 0 || seen[c] >> r & 1 == 0 || val[c][q] == val[c][r]
+            })
+        });
+        if independent && keep.len() > 1 {
+            keep.retain(|&x| x != i);
+            for c in 0..n {
+                // Read the dropped atom where a pattern occurs, else as 0.
+                for q in 0..1usize << k {
+                    let r = q ^ 1 << i;
+                    if q >> i & 1 == 0 && seen[c] >> q & 1 == 0 && seen[c] >> r & 1 == 1 {
+                        val[c][q] = val[c][r];
+                    }
+                    if q >> i & 1 == 1 {
+                        val[c][q] = val[c][r];
+                    }
+                }
+                for q in 0..1usize << k {
+                    if seen[c] >> q & 1 == 1 {
+                        seen[c] |= 1 << (q & !(1 << i));
+                    }
+                }
+            }
+            dropped = true;
+        }
+    }
+    if !dropped {
+        return Ok(());
+    }
+    // The new part over the atoms kept, class by class: Möbius over their patterns (the dropped
+    // ones at 0).
+    let kk = keep.len();
+    let mut fresh = Poly::constant(nf.konst());
+    for (c, v) in val.iter().enumerate() {
+        let mut coef: Vec<BitVec> = (0..1usize << kk)
+            .map(|q| {
+                let full = keep
+                    .iter()
+                    .enumerate()
+                    .fold(0usize, |f, (t, &i)| f | ((q >> t) & 1) << i);
+                v[full]
+            })
+            .collect();
+        for b in 0..kk {
+            for q in 0..1usize << kk {
+                if q >> b & 1 == 1 {
+                    coef[q] =
+                        BitVec::bin_unchecked(crate::ops::BinOp::Sub, &coef[q], &coef[q ^ 1 << b]);
+                }
+            }
+        }
+        // What the dropped atoms contribute where the kept ones are all 0: a constant in the
+        // class's positions.
+        fresh.add_term(
+            Vec::new(),
+            &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &coef[0], classes.mask(c)),
+        );
+        for (q, x) in coef.iter().enumerate().skip(1) {
+            let s = keep
+                .iter()
+                .enumerate()
+                .filter(|&(t, _)| q >> t & 1 == 1)
+                .fold(0u64, |s, (_, &i)| s | 1 << u[i]);
+            fresh.add_term(
+                vec![(
+                    poly::Sym {
+                        set: s,
+                        class: c as u16,
+                    },
+                    1,
+                )],
+                x,
+            );
+        }
+    }
+    fresh.reduce_core(classes);
+    if fresh == *nf {
+        return Ok(());
+    }
+    // The proof: both as expressions over the atoms' renderings.
+    let render = |f: &Poly| -> Option<MbaExpr> {
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
+        let mut sum = render::Sum {
+            terms: Vec::new(),
+            konst: Some(f.konst()),
+        };
+        for (m, c) in f.terms() {
+            if !m.is_empty() {
+                sum.terms.push((r.mono(m)?, *c));
+            }
+        }
+        let root = r.sum(&sum);
+        r.b.finish(root)
+    };
+    let (Some(old), Some(new)) = (render(nf), render(&fresh)) else {
+        return Ok(());
+    };
+    let report = certify_within(&old, &new, work);
+    tally.certificates.record(&report);
+    if report.verdict == Verdict::Proved {
+        *nf = fresh;
+    }
+    Ok(())
+}
+
+/// The most factors of the input's products whose sums and differences are tried as factors.
+const FACTORS_PAIRED: usize = 6;
+
+/// The most atom relations `n − d` [`more_forms`] combines looking for a bitwise function.
+const BITWISE_RELATIONS: usize = 5;
+
+/// The most conjunctions of atoms a question tries to prove zero.
+const NULL_CONJUNCTIONS: usize = 8;
+
+/// Drops conjunctions of atoms that are zero although no reduction shows it, because the atoms
+/// depend on each other (`(y + y) & y & −y`: no bit of `y` both follows a set bit and has none
+/// below it). A term whose conjunction is zero at the refutation sample is tried, and dropped
+/// only when a certificate proves the conjunction (under its class's mask) zero; `nulls` gets
+/// the proved ones.
+fn prune_null_conjunctions(
+    p: &MbaExpr,
+    nf: &mut Poly,
+    classes: &Classes,
+    atom_exprs: &[MbaExpr],
+    nulls: &mut Vec<poly::Sym>,
+    work: &mut Steps,
+    tally: &mut NfStats,
+) -> Result<(), Decline> {
+    use certify::Meter;
+    let w = nf.width();
+    let bits = w.bits();
+    if bits > 64 {
+        return Ok(());
+    }
+    let mask64 = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let points = certify::sample_points(p.vars(), &[p], p.key()[0]);
+    let inputs: Vec<Vec<u64>> = (0..p.vars().len())
+        .map(|v| {
+            points
+                .iter()
+                .map(|pt| pt[v].limbs().first().copied().unwrap_or(0))
+                .collect()
+        })
+        .collect();
+    // An atom's values at the sample, from its rendering.
+    let atom_values = |a: u32, work: &mut Steps| -> Result<Option<Vec<u64>>, Decline> {
+        let Some(e) = atom_exprs.get(a as usize) else {
+            return Ok(None);
+        };
+        let Some(prog) = crate::mba::batch::Program::new(e, false) else {
+            return Ok(None);
+        };
+        if prog.widest() > 64 {
+            return Ok(None);
+        }
+        let units = (prog.len() * points.len()) as u64;
+        work.charge(units.div_ceil(EVALS_PER_STEP))
+            .map_err(|()| Decline::Exhausted)?;
+        let mut regs: Vec<Vec<u64>> = Vec::new();
+        prog.run(&mut regs, &inputs, points.len());
+        Ok(regs.get(prog.root()).map(|r| r[..points.len()].to_vec()))
+    };
+    let cand: Vec<(poly::Mono, BitVec)> = nf
+        .terms()
+        .iter()
+        .filter(|(m, _)| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() >= 2))
+        .map(|(m, c)| (m.clone(), *c))
+        .take(NULL_CONJUNCTIONS)
+        .collect();
+    if cand.is_empty() {
+        return Ok(());
+    }
+    let mut zero = MbaExpr::new(p.vars().to_vec());
+    zero.push(MOp::Const(BitVec::zero(w)), &[])
+        .map_err(|_| Decline::Unsupported("internal: zero"))?;
+    for (m, c) in cand {
+        let sym = m[0].0;
+        let mut vals: Option<Vec<u64>> = None;
+        for a in (0..64u32).filter(|&a| sym.set >> a & 1 == 1) {
+            let Some(v) = atom_values(a, work)? else {
+                return Ok(());
+            };
+            vals = Some(match vals {
+                None => v,
+                Some(acc) => acc.iter().zip(&v).map(|(x, y)| x & y).collect(),
+            });
+        }
+        let class_mask = classes
+            .mask(usize::from(sym.class))
+            .limbs()
+            .first()
+            .copied();
+        let masked = |x: &u64| x & class_mask.unwrap_or(u64::MAX) & mask64;
+        if !vals.is_some_and(|v| v.iter().all(|x| masked(x) == 0)) {
+            continue;
+        }
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
+        let Some(root) = r.mono(&m) else {
+            continue;
+        };
+        let Some(e) = r.b.finish(root) else {
+            continue;
+        };
+        let report = certify_within(&e, &zero, work);
+        tally.certificates.record(&report);
+        if report.verdict == Verdict::Proved {
+            nf.add_term(m, &BitVec::un_unchecked(crate::ops::UnOp::Neg, &c));
+            nulls.push(sym);
+            tally.null_parts += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Drops null parts the reductions miss. Every null polynomial of degree at most `d` in one
@@ -1196,6 +2253,7 @@ struct Rendered {
 fn best_rendering(
     p: &MbaExpr,
     n: &Normal,
+    bar: u32,
     work: &mut Steps,
     tally: &mut NfStats,
 ) -> Result<Rendered, Decline> {
@@ -1203,17 +2261,39 @@ fn best_rendering(
     let mut factors = n.factors.clone();
     let mut best: Option<(render::Cost, MbaExpr)> = None;
     let mut unproved = None;
+    // The other forms of the function (atoms reused, variables eliminated, zero added):
+    // rendered in the first round, with the input's factors.
+    let more = more_forms(n, work)?;
+    tally.reused += u64::from(n.alts.is_empty() && !more.is_empty());
     for round in 0..3 {
-        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left);
+        let mut r =
+            Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left).with_bar(bar);
         let mut cands = candidates(&mut r, &n.nf, &factors);
-        // The forms with atoms reused: once, with the input's factors.
+        // The normal form renders within the budget or not at all (nothing would say the best
+        // was seen); what comes after only adds candidates, so running short there only stops
+        // it: the other forms each take at most half of what is left while a quarter is, and a
+        // later round cut short is dropped.
+        if r.exhausted() {
+            if round == 0 {
+                return Err(Decline::Exhausted);
+            }
+            break;
+        }
         if round == 0 {
-            for alt in &n.alts {
+            let cap = r.limit();
+            for alt in n.alts.iter().chain(&more) {
+                let left = cap.saturating_sub(r.work);
+                if left < cap / 4 {
+                    break;
+                }
+                r.set_limit(r.work + left / 2);
                 cands.extend(candidates(&mut r, alt, &factors));
+                r.set_limit(cap);
+                r.work = r.work.min(cap);
             }
         }
         // Synthesis does not depend on the factors: the first round is enough.
-        if round == 0 && n.synthesis {
+        if round == 0 && n.synthesis && !r.hopeless(n.nf.atoms()) {
             let bar = r.best(&cands).map(|b| r.b.cost(b));
             match r.synthesize(&n.nf, bar) {
                 Some(render::Hit::Exact(x)) => cands.push(x),
@@ -1226,7 +2306,10 @@ fn best_rendering(
         }
         tally.candidates += r.built;
         if r.exhausted() {
-            return Err(Decline::Exhausted);
+            if round == 0 {
+                return Err(Decline::Exhausted);
+            }
+            break;
         }
         work.charge(r.work.max(1))
             .map_err(|()| Decline::Exhausted)?;
@@ -1267,7 +2350,8 @@ fn run(
     let n = normalize(p, opts, budget, tally)?;
     let input_cost = n.input_cost;
     let mut work = Steps::new(n.work.left);
-    let rendered = best_rendering(p, &n, &mut work, tally)?;
+    // Only renderings smaller than the question can be answers.
+    let rendered = best_rendering(p, &n, input_cost, &mut work, tally)?;
     let mut exact = rendered.exact.filter(|(c, _)| c.0 < input_cost);
     if let Some((mut cost, mut answer)) = exact.take() {
         // A fixed point: the answer, normalized again (its own constants may give coarser bit
@@ -1283,18 +2367,25 @@ fn run(
             )
             .and_then(|m| {
                 let mut w2 = Steps::new(m.work.left);
-                let r = best_rendering(&answer, &m, &mut w2, &mut scratch);
+                // Ties in nodes may still weigh less.
+                let r = best_rendering(&answer, &m, cost.0 + 1, &mut w2, &mut scratch);
                 let spent = work.left - w2.left.min(work.left);
                 work = Steps::new(work.left - spent);
-                r
+                r.map(|r| (m.halved, r))
             });
             tally.candidates += scratch.candidates;
-            match again.map(|r| r.exact) {
-                Ok(Some((c, e))) if c < cost => {
+            // Running short only ends the search.
+            match again.map(|(halved, r)| (halved, r.exact)) {
+                Ok((halved, Some((c, e)))) if c < cost => {
+                    // Halves the question's own normal form did not take lead where the
+                    // certificates do not follow (`(x + x) & (y + y)` as `2·(x & y)` against
+                    // `(y·a + b)·c | …`, the question): the answer stays within their reach.
+                    if halved && !n.halved {
+                        break;
+                    }
                     cost = c;
                     answer = e;
                 }
-                Err(Decline::Exhausted) => return Err(Decline::Exhausted),
                 _ => break,
             }
         }
@@ -1333,6 +2424,13 @@ fn run(
     let Some((_, answer)) = exact else {
         return Ok(MbaAnswer::NoSimpler);
     };
+    // Exact by construction; a caller that proves answers itself asked for no evidence.
+    if !budget.evidence {
+        return Ok(MbaAnswer::Simplified {
+            expr: answer,
+            claim: Claim::Unverified,
+        });
+    }
     // The self-check: the answer against the input, by a certificate (within what is left),
     // else at the refutation sample only.
     let report = certify_within(p, &answer, &mut work);

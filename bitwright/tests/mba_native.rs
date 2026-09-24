@@ -753,7 +753,8 @@ fn the_memo_changes_nothing() {
     let mut hits = 0;
     for (p, b, a) in &asked[0] {
         for steps in [b.steps, 1 << 12, 300] {
-            let budget = MbaBudget::default().with_steps(steps);
+            // As the engine asked (without evidence, its gate proving every answer).
+            let budget = b.with_steps(steps);
             let want = if steps == b.steps {
                 a.clone()
             } else {

@@ -19,7 +19,7 @@ pub(super) mod xor;
 use super::{Accept, By, Fin, Reject, Runner, Step, Stop};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
-use crate::expr::Context;
+use crate::expr::{Context, OpCode};
 use crate::facts::{Facts, Reliance};
 use crate::hash::IdMap;
 
@@ -95,9 +95,60 @@ pub(super) fn mba_step(
     if r.quarantined_passes.contains(&PassKind::Mba) {
         return Ok(Step::Normal(Fin::PROVISIONAL));
     }
+    // Asked before the operands were walked, which left them as they are: the same question.
+    if let Some(Some(fin)) = r.first.get(&n) {
+        return Ok(Step::Normal(*fin));
+    }
+    // Inside a chain of sums (or of products) the question at the chain's top covers the node:
+    // asking at every link would ask the same fragment again and again, each time a little
+    // larger (a sum of n terms is n questions). So a link is not asked when the question at its
+    // user in the chain is (and that one's fragment, which contains the link's, is within the
+    // limits). Not final: a later call may ask it.
+    let additive = |op: OpCode| matches!(op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl);
+    if let Some(&p) = r.chain_parent.get(&n) {
+        let (op, up) = (cx.node(n).op, cx.node(p).op);
+        if ((matches!(op, OpCode::Add | OpCode::Sub) && additive(up))
+            || (op == OpCode::Mul && up == OpCode::Mul))
+            && mba::asks(r, cx, cfg, p)?
+        {
+            return Ok(Step::Normal(Fin::PROVISIONAL));
+        }
+    }
     r.stats.passes.entry("mba").or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
     mba::step(r, cx, cfg, n)
+}
+
+/// The question at the top of a fragment (a node whose user in the walk is not asked, or a
+/// root), asked before the MBA phase walks its operands: an answer to a part can hide what only
+/// the whole shows (a relation between atoms that rewrites one factor of a product identity).
+/// `Some` rewrite when it is taken; otherwise the operands are walked as usual, and the question
+/// is asked again only if one of them changed.
+#[cfg(feature = "mba")]
+pub(super) fn mba_first(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &crate::mba::MbaConfig,
+    n: u32,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    let top = match r.chain_parent.get(&n) {
+        None => true,
+        Some(&p) => !mba::asks(r, cx, cfg, p)?,
+    };
+    if !top || !mba::asks(r, cx, cfg, n)? {
+        r.first.insert(n, None);
+        return Ok(None);
+    }
+    match mba_step(r, cx, cfg, n)? {
+        Step::To(x, fin) => {
+            r.first.insert(n, None);
+            Ok(Some((x, fin)))
+        }
+        Step::Normal(fin) => {
+            r.first.insert(n, Some(fin));
+            Ok(None)
+        }
+    }
 }
 
 /// Facts about `n` for a pass, under the call's fact budget and the run's assumptions.
@@ -162,15 +213,16 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 }
 
 /// Use counts (parent edges) of the live DAG: counted once per phase run over the current
-/// version of every root of the call, then kept up to date as nodes are created (counted) and
-/// replaced (uncounted, see `Runner::retire`).
+/// version of every root of the call (nodes only replaced ones reach are not live), then kept
+/// up to date as nodes are created (counted) and replaced (uncounted, see `Runner::retire`). A
+/// node a counted node uses is counted too, so one replaced and then used again is live again.
 fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     if r.uses.is_none() {
         let mut uses: IdMap<u32, u32> = IdMap::default();
         let mut seen: IdMap<u32, ()> = IdMap::default();
         let mut stack: Vec<u32> = r.live_roots.clone();
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if seen.insert(i, ()).is_some() || r.dead.contains_key(&i) {
                 continue;
             }
             if let Err(e) = r.meter.charge(Counter::PassWork, 1) {
@@ -178,16 +230,11 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
                 r.counted.clear();
                 return Err(e.into());
             }
-            let live = !r.dead.contains_key(&i);
             for c in cx.node(i).children() {
-                if live {
-                    *uses.entry(c).or_default() += 1;
-                }
+                *uses.entry(c).or_default() += 1;
                 stack.push(c);
             }
-            if live {
-                r.counted.insert(i, ());
-            }
+            r.counted.insert(i, ());
         }
         r.uses = Some(uses);
         r.uses_upto = r.phase_start;
@@ -195,14 +242,22 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     let len = cx.len() as u32;
     let from = r.uses_upto.min(len);
     r.meter.charge(Counter::PassWork, u64::from(len - from))?;
-    for i in from..len {
-        if r.dead.contains_key(&i) || r.counted.contains_key(&i) {
+    let mut stack: Vec<u32> = (from..len)
+        .rev()
+        .filter(|i| !r.dead.contains_key(i) && !r.counted.contains_key(i))
+        .collect();
+    while let Some(i) = stack.pop() {
+        if r.counted.insert(i, ()).is_some() {
             continue;
         }
-        r.counted.insert(i, ());
+        r.dead.remove(&i);
+        r.meter.charge(Counter::PassWork, 1)?;
         if let Some(uses) = r.uses.as_mut() {
             for c in cx.node(i).children() {
                 *uses.entry(c).or_default() += 1;
+                if !r.counted.contains_key(&c) {
+                    stack.push(c);
+                }
             }
         }
     }
@@ -367,7 +422,9 @@ pub(super) fn worth_building(
 /// nodes than replacing `n` frees. `Err(fin)` when it does not, with what that contributes to
 /// the node's finality: a rejection that only sharing caused may flip once other users of the
 /// region are simplified away later in the walk, so it is not final and a later round decides
-/// again.
+/// again. A constant always replaces a node that is not one: it frees the node's operator for a
+/// constant, which rewrites nothing further (so the non-constant nodes strictly decrease), and
+/// it lets the users fold (`~x + x` is -1 even beside `~x ^ …`, which then is `x`).
 pub(super) fn shrinks(
     r: &mut Runner<'_, '_>,
     cx: &Context,
@@ -375,6 +432,9 @@ pub(super) fn shrinks(
     e: u32,
     atoms: &[u32],
 ) -> Result<Result<(), Fin>, Stop> {
+    if cx.node(e).op == OpCode::Const && cx.node(n).op != OpCode::Const {
+        return Ok(Ok(()));
+    }
     let mut sorted = atoms.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

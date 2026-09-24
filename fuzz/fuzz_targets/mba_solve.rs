@@ -2,9 +2,10 @@
 //! synthesis every `Simplified` answer is exact by construction, so it has the input's
 //! variables and width and agrees with it at sampled points (the evidence gate either proves
 //! it or refuses it for lack of proof, never for a refutation), and the prover never refutes
-//! it. With synthesis, a `Proved` answer is held to the same; a `Sampled` one may be a table
-//! hit no certificate could decide, so only its shape is checked. The prover never proves a
-//! pair that differs at a sampled point.
+//! it. Asked without evidence, the solver returns its answers unchecked, so an inexact step
+//! shows here rather than as a declined question. With synthesis, a `Proved` answer is held to
+//! the same; a `Sampled` one may be a table hit no certificate could decide, so only its shape
+//! is checked. The prover never proves a pair that differs at a sampled point.
 #![no_main]
 
 use bitwright::mba::{
@@ -130,9 +131,10 @@ fuzz_target!(|data: &[u8]| {
     };
     let budget = MbaBudget::default().with_steps(1 << (10 + b.byte() % 12));
     let prover = NativeProver::default();
-    for synthesis in [false, true] {
+    for (synthesis, evidence) in [(false, true), (false, false), (true, true), (true, false)] {
         let solver = NormalFormSolver::new(NfOptions::default().with_synthesis(synthesis));
-        if let MbaAnswer::Simplified { expr, claim } = solver.solve(&m, &budget) {
+        let asked = budget.with_evidence(evidence);
+        if let MbaAnswer::Simplified { expr, claim } = solver.solve(&m, &asked) {
             assert_eq!(expr.vars(), m.vars());
             assert_eq!(expr.width(), m.width());
             if synthesis && claim == Claim::Sampled {

@@ -142,7 +142,7 @@ bitwright lint rules.bwr                                # every diagnostic, rend
 bitwright smt rules.bwr | z3 -in                        # prove every rule at 8, 32 and 64 bits (or `| bitwuzla`)
 bitwright catalog > RULES.md                            # the built-in rules as Markdown
 bitwright explain BW0302                                # what a diagnostic means
-bitwright simplify '(x | y) - (x & y)' --deobfuscate    # x ^ y
+bitwright simplify '(x & y) * (x | y) + (x & ~y) * (~x & y)'   # x * y (nonlinear MBA, proved)
 bitwright simplify 'x * k == y * k' --assume '(k & 1) == 1'   # x == y, relying on the assumption
 ```
 

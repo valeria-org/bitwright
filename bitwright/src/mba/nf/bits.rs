@@ -222,34 +222,12 @@ impl Bits {
     /// be 0 or all-ones in each class) and `Δ_c(p) = Σ_{∅≠S⊆p} γ_{c,S}`, `k_c + Δ_c(p)` must be 0
     /// or 1 modulo `2^(W − τ_c)` at every class corner `p`; it is the table's entry.
     pub(crate) fn from_linear(p: &Poly, classes: &Classes) -> Option<Bits> {
-        if p.degree() > 1 {
-            return None;
-        }
+        let (support, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
-        let atoms = p.atoms();
-        let mut support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
-        support.sort_unstable();
-        if support.len() > MAX_SUPPORT {
-            return None;
-        }
         let s = support.len();
-        let n = classes.len();
         let konst = p.konst();
-        let mut gamma: Vec<Vec<BitVec>> = vec![vec![BitVec::zero(w); 1 << s]; n];
-        for (m, c) in p.terms() {
-            let Some(&(sym, _)) = m.first() else {
-                continue;
-            };
-            let q = support
-                .iter()
-                .enumerate()
-                .filter(|&(_, &a)| sym.set >> a & 1 == 1)
-                .fold(0usize, |q, (j, _)| q | 1 << j);
-            let slot = &mut gamma[usize::from(sym.class)][q];
-            *slot = BitVec::bin_unchecked(BinOp::Add, slot, c);
-        }
-        let mut tables = Vec::with_capacity(n);
-        for (c, g) in gamma.iter_mut().enumerate() {
+        let mut tables = Vec::with_capacity(deltas.len());
+        for (c, g) in deltas.iter().enumerate() {
             let inside = bv_and(&konst, classes.mask(c));
             let k = if inside.is_zero() {
                 BitVec::zero(w)
@@ -258,14 +236,6 @@ impl Bits {
             } else {
                 return None;
             };
-            // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
-            for b in 0..s {
-                for q in 0..1usize << s {
-                    if q >> b & 1 == 1 {
-                        g[q] = BitVec::bin_unchecked(BinOp::Add, &g[q], &g[q ^ 1 << b]);
-                    }
-                }
-            }
             let prec = u32::from(w.bits()) - u32::from(classes.low(c));
             let lm = low_mask(w, prec);
             let mut t = vec![0u64; words(s)];
@@ -281,6 +251,73 @@ impl Bits {
         }
         Some(Bits { support, tables }.prune())
     }
+
+    /// Per class, the values at zero `k` (0, 1) with which a polynomial of degree at most 1
+    /// would be a bitwise function there, whatever its constant (`k + Δ_c(p)` 0 or 1 at every
+    /// corner, as in [`from_linear`](Self::from_linear)), and whether the atoms move it there
+    /// (some `Δ_c(p)` is not 0). `None` if in some class neither value fits.
+    pub(crate) fn zero_values(p: &Poly, classes: &Classes) -> Option<Vec<([bool; 2], bool)>> {
+        let (_, deltas) = corner_sums(p, classes)?;
+        let w = classes.width();
+        let one = BitVec::one(w);
+        let mut out = Vec::with_capacity(deltas.len());
+        for (c, g) in deltas.iter().enumerate() {
+            let lm = low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)));
+            let mut fits = [true, true];
+            let mut moved = false;
+            for d in g {
+                let d = bv_and(d, &lm);
+                moved |= !d.is_zero();
+                fits[0] &= d.is_zero() || d == one;
+                let v = bv_and(&BitVec::bin_unchecked(BinOp::Add, &one, &d), &lm);
+                fits[1] &= v.is_zero() || v == one;
+            }
+            if fits == [false, false] {
+                return None;
+            }
+            out.push((fits, moved));
+        }
+        Some(out)
+    }
+}
+
+/// The support of a polynomial of degree at most 1 (ascending, at most [`MAX_SUPPORT`] atoms)
+/// and per class its corner sums `Δ_c(p) = Σ_{S⊆p} γ_{c,S}`, the constant left out.
+fn corner_sums(p: &Poly, classes: &Classes) -> Option<(Vec<u32>, Vec<Vec<BitVec>>)> {
+    if p.degree() > 1 {
+        return None;
+    }
+    let w = classes.width();
+    let atoms = p.atoms();
+    let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
+    if support.len() > MAX_SUPPORT {
+        return None;
+    }
+    let s = support.len();
+    let mut gamma: Vec<Vec<BitVec>> = vec![vec![BitVec::zero(w); 1 << s]; classes.len()];
+    for (m, c) in p.terms() {
+        let Some(&(sym, _)) = m.first() else {
+            continue;
+        };
+        let q = support
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| sym.set >> a & 1 == 1)
+            .fold(0usize, |q, (j, _)| q | 1 << j);
+        let slot = gamma.get_mut(usize::from(sym.class))?.get_mut(q)?;
+        *slot = BitVec::bin_unchecked(BinOp::Add, slot, c);
+    }
+    // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
+    for g in gamma.iter_mut() {
+        for b in 0..s {
+            for q in 0..1usize << s {
+                if q >> b & 1 == 1 {
+                    g[q] = BitVec::bin_unchecked(BinOp::Add, &g[q], &g[q ^ 1 << b]);
+                }
+            }
+        }
+    }
+    Some((support, gamma))
 }
 
 /// The integer multilinear coefficients of a 0/1 table of 2^s entries: `a_T = Σ_{U⊆T}

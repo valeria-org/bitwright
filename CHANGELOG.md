@@ -1,5 +1,116 @@
 # Changelog
 
+## Unreleased
+
+- **Nonlinear MBA from the command line.** `bitwright simplify` deobfuscates by default: the
+  rules, the normal-form passes and the MBA service with `NormalFormSolver`, every answer proved
+  by bitwright itself (backend certificates are not trusted). `--standard` runs the rules and the
+  standard passes only, as `simplify` did before; `--deobfuscate` is still accepted. So
+  `-8*~y*(x&y) - 8*~y*(x&~y) + 10*~y*x + … + 1*(x^y)*~x` (the nonlinear MBA of the report that
+  prompted this) prints `(~x ^ y) - y`, and `(x & y)*(x | y) + (x & ~y)*(~x & y)` prints `x * y`.
+- **CoBRA's datasets.** Of the 76,080 expressions CoBRA collects (SiMBA, GAMBA, NeuReduce,
+  MBA-Obfuscator, MBA-Solver, QSynth, Loki, OSES and others; see `compare/`), 75,737 have a
+  ground truth that agrees with the input: the MBA service with `NormalFormSolver` on its own
+  evidence answers every one of them no larger than the ground truth (22,644 smaller, 49,839
+  the ground truth itself) and equal to the input at 64 points. The upstream C++ CoBRA
+  (af44b8a) reduces 64,396 of them that far (85.0 %). The other 343 (337 lines
+  without a ground truth, 6 whose ground truth disagrees with the input) are answered
+  correctly too, 279 smaller than the input. 0.30 ms per expression at the median, 4.5 ms at
+  the 95th percentile (CoBRA: 1.4 and 171 ms). `compare/`'s `bw-nf` tool runs that
+  configuration, and `BW_FAILURES=FILE` lists the cases a bitwright tool leaves larger than
+  the ground truth.
+- **`compare/`.** Lines bitwright's parser declines are read in the datasets' own syntax
+  (Python's operators and precedence, literals of any size modulo 2^64, `X[0]` names, a
+  trailing note in words, a leading label, `(constant N)`): every line is read. A line whose
+  ground truth holds only at a narrower width (some OSES lines are 8-bit arithmetic) is
+  measured at the widest such width for bitwright's tools. Lines without a ground truth, or
+  whose ground truth disagrees with the input at every width, are checked but not scored:
+  the `no truth` column counts them and `reduced` those answered smaller than the input.
+  `solved %` rounds down, so 100.0 means every scored line.
+- **MBA evidence.** Two more tests, when the others leave a question open: equal polynomials
+  over symbols (variables, the conjunctions of a bitwise function's leaves by its Möbius
+  expansion, other bitwise subterms), which prove whatever values the symbols take, for
+  polynomial sides no direct test fits (`CertStats::symbolic`); and a bit-serial comparison
+  of expressions built from `+ − neg ~ & | ^`, small left shifts and products by small constants
+  (T-functions: bit `j` depends on bits up to `j` through a few carries), exact over every
+  reachable carry state, a difference always with a real counterexample (`(y + y) & y & −y` is
+  0; `CertStats::carries`). Atoms get further: their complements join the pairing (`x − 1`
+  and `−x`), an atom whose bits at the sample are a bitwise function of its definition's
+  leaves has that function tried (and proved) as a member, a second skeleton reads such atoms
+  as their functions and bitwise functions read arithmetically as their integer expansions,
+  and an atom a side reads only linearly stands for its definition. Every skeleton is checked
+  against its side at the sample, and every counterexample on the two sides, before either
+  decides anything (a failure declines, counted in `CertStats::internal`).
+- **Normal-form solver.** Sums of two bitwise functions (`c + a·g + b·h`, two to six atoms),
+  scaled functions (`1111·x + 1111·k − 2222·(x & k)` is `(x ^ k)·1111`), independent groups of
+  atoms rendered apart, a function of two or three atoms peeled off at an atom, tables of four
+  to six atoms split on an atom, and functions whose bits do not all follow the classes
+  (`g ^ k`). Of `p` and `−1 − p` one atom (the smaller constant); arithmetic that is a bitwise
+  function once other atoms stand for their definitions, or whose bits at the sample follow
+  one (`−(x & −x)` is `x | −x`, used once proved); conjunctions of dependent atoms that are
+  zero, and atoms the form's values do not depend on over the patterns that occur, dropped
+  once proved (`((y + 1) & (~y + ~y)) | y | x` is `x | y`); and two more forms of the function
+  rendered beside it, a variable eliminated through an atom's definition and zero added to
+  complete a bitwise function. A form whose atoms alone reach the question's size is not
+  rendered, and an atom's definition only toward fewer nodes than the subterm. The solver's id
+  is `bitwright.nf.v3`.
+- **Normal-form solver, further.** Two bitwise functions of a sum rendered with forms that
+  share subterms (the majority as `(y & z) | (x & (y | z))` beside `~(x | (y | z))`, and
+  `~(y ^ n)` for `y ^ w` beside `n = ~w`), the minimum-form table keeping, per function,
+  further forms that each bring a new subterm; a third term beside two (`(x & z) − 6·~((x &
+  y) | (x ^ y ^ z)) − (x & y)`); tables of four or five atoms through a function of two or
+  three of them (`~((d ^ s) | ((u | v) ^ d))`); a coefficient terms share taken out, a
+  constant inside when a small multiple (`6·x − 6·y − 6` is `(x + ~y)·6`); nonlinear parts
+  factored by a symbol most monomials share (`2·c·(a & c) − a·c − c² − a²` is `−(a ^ c)·c −
+  a²`) and products divided by sums of the input's product operands (`(p & q)·(p | q) + (p &
+  ~q)·(~p & q)` is `p·q` for bitwise `p`, `q` over atoms). Zero from one or two atom relations
+  that makes the form a bitwise function (`(n & m) − 1` with `n = c − e`, `m = e − c` is
+  `~(n | m)`); zero added to the form with atoms reused, so a coefficient splits between an
+  atom and its definition (`(a·d | (a ^ d)) + (a ^ (a + a))`); a conjunction known to be zero
+  in a class takes the others' coefficient there (`2·(~((y + y) ^ y) & 1) − (((y + y) ^ y) ^
+  1)` is `1 − ((y + y) ^ y)`); a bitwise operation of two multiples of `2^k` read as `2^k`
+  times one of their halves. Renderings are priced as the engine's rules leave them (`a − c`
+  is `a + (−c)`; a `~(−x)` beside other uses of `−x` becomes `x − 1`, so `~(−x) ^ y` is built
+  `~(−x ^ y)`). The other forms, later rounds and the fixed point only stop when the budget
+  runs short (only the normal form's own rendering makes a question `Exhausted`), and the
+  fixed point keeps an answer the certificates can follow. A reuse of a rendering costs its
+  lookup, not the rendering's work again.
+- **Engine.** The MBA phase asks the question at the top of a fragment first, over the fragment
+  as it is (an answer to a part can hide a product identity only the whole shows), then walks
+  the operands as before, asking the top again only if one changed; inside a chain of sums or
+  products a link is not asked when its user is (a sum of `n` terms was `n` questions). Use
+  counts forget replaced nodes and what only they used, so a smaller answer is no longer
+  rejected for users that are gone; a constant always replaces the node it folds.
+- **Passes.** The linear pass writes `2·a` as `a + a` (one node, where a shift needs its amount),
+  takes the constant into a term when that is smaller (`−x − 1` is `~x`, `(y << 2) + 4` is
+  `~y * −4`, `a + t + 1` is `a − ~t`, `2·t + 1` is `t − ~t`, `−1 − 2·x` is `~(x + x)`), starts
+  a sum of subtractions from its constant or a product by a negative coefficient (`5 − x *
+  3`, `y * −3 − z * 5`), and reads `concat(trunc(x), c)` as `x·2^|c| + c`, which the MBA
+  fragment now takes too. The facts know `a + a`'s low bit.
+- **API.** `MbaBudget::evidence` (default true): a caller that proves every answer itself asks
+  without, and a solver may skip checking an answer it built exactly (`Claim::Unverified`);
+  the engine does so when backend certificates are not trusted. `CertStats::symbolic` and
+  `CertStats::carries`.
+- **Performance.** In instructions against 0.5.0: `simplify/standard` −0.7 to −2.5 %,
+  `simplify/mba` −0.2 %, `simplify/mba-native` −0.5 to −1.1 % (84 nodes become 83),
+  `simplify/mba-nonlinear/8` +49 % and `simplify/mba-nonlinear/64` +208 % (its questions are
+  asked whole first and its answers, now with atoms, proved over them; 34 nodes become 27),
+  `simplify/mba-nonlinear-sig/64` +2.5 %; the rest within noise. On the corpus diff the
+  default configuration takes up to 5 % fewer instructions (as many on nonlinear MBA); the
+  proposed one 5 % more on linear MBA, 47 % more on nonlinear MBA at 8 bits and 2.4 times as
+  many at 64, and 2.8 times as many on random DAGs (170.6 G against 60.2 G at 8 bits), for the
+  searches above.
+- **Fixes.** `NativeProver`'s id is `bitwright.native.v2`, as 0.5.0 announced (it kept
+  `bitwright.native.v1`, so cache keys did not tell its evidence from 0.4's).
+- **Behavior changes.** `MbaLimits::max_nodes` is 2,048 (was 256) and `min_nodes` 4 (was 5);
+  `NfOptions::max_classes` and `max_degree` are 32 (were 16). The CLI, the solver and the
+  passes change results as above. On the corpus diff the default configuration's results
+  shrink from 9,142 to 9,094 nodes on random DAGs at 8 bits and from 9,511 to 9,466 at 64, and
+  from 1,794 to 1,673 on linear MBA (nonlinear MBA unchanged); under the proposed
+  configuration from 1,635 to 1,524 on linear MBA, from 1,005 to 901 on nonlinear MBA, and
+  from 9,084 to 9,023 and from 9,477 to 9,414 on random DAGs. A rendering's reuse costs its
+  lookup, so the budget goes further on questions whose products share factors.
+
 ## 0.5.0
 
 - **MBA evidence.** When the other tests leave an equality open, the certificates read a

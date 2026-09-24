@@ -2081,7 +2081,7 @@ fn linear_mba_emits_conjunctions_for_any_number_of_atoms() {
         (
             "3 * (x & ~y) + 2 * (~x & y) + 5 * (x & y) - (x | y)",
             64,
-            "(x & y) + (x << 1) + y",
+            "x + x + (x & y) + y",
         ),
         // Four atoms: the indicator form needs three or fewer, and a conjunction remains.
         ("(a | b) - (a ^ b) + (c & ~d) + (c & d)", 32, "(a & b) + c"),
@@ -2482,4 +2482,145 @@ fn invert_obeys_budgets_and_the_host_veto() {
         .unwrap();
     assert!(!r.roots[0].changed);
     assert!(r.stats.hook_vetoes > 0);
+}
+
+/// The linear pass takes a constant into a term (`k·a + k = −k·~a`) when that is smaller,
+/// doubles as `a + a`, starts a sum of subtractions from its constant or a product by a
+/// negative coefficient, reads `concat(trunc(x), c)` as `x·2^|c| + c`, and a constant always
+/// replaces what it folds.
+#[test]
+fn linear_emissions() {
+    let eng = engine(vec![Phase::Linear]);
+    for (src, want) in [
+        ("-x - 1", "~x"),
+        ("(y << 2) + 4", "~y * -4"),
+        ("-2 * y - 2", "let %0 = ~y;\n%0 + %0"),
+        ("2 * x + y", "x + x + y"),
+        ("5 - 3 * x", "5 - x * 3"),
+        ("-(y * 3) - z * 5", "y * -3 - z * 5"),
+        (
+            "concat(trunc<62>(y), 3:2) - 6 * y - 5",
+            "let %0 = ~y;\n%0 + %0",
+        ),
+    ] {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(cx.display(out.expr).to_string(), want, "{src}");
+    }
+    // A constant replaces the node it is, even beside a shared term: `~x + x` is −1.
+    let eng = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let e = cx.parse("(~x ^ (x + ~x)) + y", &o).unwrap();
+    let out = eng.simplify(&mut cx, e).unwrap();
+    assert_eq!(cx.display(out.expr).to_string(), "x + y");
+}
+
+/// `a + a` is `a << 1` for the facts: its low bit is known.
+#[test]
+fn doubling_knows_its_low_bit() {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let e = cx.parse("x + x", &o).unwrap();
+    let f = cx.facts(e).unwrap();
+    assert_eq!(f.known().known_zero().bit(0), Some(true));
+}
+
+/// The MBA service with the native solver, on bitwright's own evidence (the `bw-nf` setup).
+#[cfg(feature = "mba")]
+mod native_mba {
+    use super::*;
+    use crate::Bounded;
+    use crate::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+    use std::sync::Arc;
+
+    fn nf_engine() -> Engine {
+        let trust = MbaTrust::default().with_backend_certificates(false);
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust)))
+            .mba_solver(Arc::new(NormalFormSolver::default()))
+            .build()
+            .unwrap()
+    }
+
+    fn size(cx: &mut Context, e: Expr) -> u32 {
+        match cx.dag_size(&[e], u32::MAX).unwrap() {
+            Bounded::Exact(n) => n,
+            _ => u32::MAX,
+        }
+    }
+
+    /// A sum of sixty null products (`2^57·c·x(x − 1)⋯(x − 7)·y^j` is 0 at 64 bits: 8! has
+    /// the other seven factors of two) and `3·x`: the question is asked at the top of the sum
+    /// first, and never at every link, so it is answered within the call budget.
+    #[test]
+    fn chains_are_asked_at_their_tops() {
+        let mut src = String::from("x * 3");
+        for i in 0..60u64 {
+            let c = (2 * i + 1) << 57;
+            src.push_str(&format!(" + {c} * x"));
+            for d in 1..8 {
+                src.push_str(&format!(" * (x - {d})"));
+            }
+            for _ in 0..i % 3 {
+                src.push_str(" * y");
+            }
+        }
+        let mut cx = Context::new();
+        let e = cx.parse(&src, &ParseOptions::width(Width::W64)).unwrap();
+        let out = nf_engine().run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(r.end, End::Completed);
+        // `x * 3` or `x + x + x`: three nodes either way.
+        assert_eq!(size(&mut cx, r.expr), 3, "{}", cx.display(r.expr));
+        assert!(out.stats.mba.calls < 400, "{}", out.stats.mba.calls);
+    }
+
+    /// A link of a chain is asked when its user is not: a shift by a variable is no MBA
+    /// operator, and a sum over more variables than the limits allow is refused.
+    #[test]
+    fn links_are_asked_under_users_that_are_not() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx
+            .parse("((x & y) * (x | y) + (x & ~y) * (~x & y)) << z", &o)
+            .unwrap();
+        let out = nf_engine().simplify(&mut cx, e).unwrap();
+        assert_eq!(cx.display(out.expr).to_string(), "x * y << z");
+        let lim = crate::mba::MbaLimits::default().with_max_vars(2);
+        let trust = MbaTrust::default().with_backend_certificates(false);
+        let cfg = MbaConfig::default().with_trust(trust).with_limits(lim);
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(cfg))
+            .mba_solver(Arc::new(NormalFormSolver::default()))
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let e = cx
+            .parse("(x & y) * (x | y) + (x & ~y) * (~x & y) + z", &o)
+            .unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(cx.display(out.expr).to_string(), "x * y + z");
+    }
+
+    /// Accurate use counts: a replaced node (and what only it used) no longer counts as a user,
+    /// so a smaller answer is committed (10 nodes for 13).
+    #[test]
+    fn replaced_nodes_do_not_count_as_users() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx
+            .parse("(~x & y) * -15 - ((~y & x) << 3) - 7", &o)
+            .unwrap();
+        let out = nf_engine().simplify(&mut cx, e).unwrap();
+        assert!(size(&mut cx, out.expr) <= 10, "{}", cx.display(out.expr));
+    }
 }

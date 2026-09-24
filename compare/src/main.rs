@@ -20,6 +20,7 @@
 
 mod eggs;
 mod heap;
+mod read;
 
 #[global_allocator]
 static HEAP: heap::Counting = heap::Counting;
@@ -34,7 +35,7 @@ use std::time::Instant;
 
 use bitwright::engine::{Engine, Run, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
-use bitwright::mba::{CobraSolver, MbaConfig, SignatureSolver};
+use bitwright::mba::{CobraSolver, MbaConfig, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{BitVec, Bounded, Context, Expr, ParseOptions, SymbolKey, Width};
 
 /// Every dataset is 64-bit.
@@ -48,6 +49,7 @@ enum Tool {
     Standard,
     Deobfuscate,
     Mba,
+    Nf,
     BwCobra,
     BwEqsat,
     EggBw,
@@ -65,10 +67,11 @@ enum Tool {
 }
 
 impl Tool {
-    const ALL: [Tool; 17] = [
+    const ALL: [Tool; 18] = [
         Tool::Standard,
         Tool::Deobfuscate,
         Tool::Mba,
+        Tool::Nf,
         Tool::BwCobra,
         Tool::BwEqsat,
         Tool::EggBw,
@@ -90,6 +93,7 @@ impl Tool {
             Tool::Standard => "bw-standard",
             Tool::Deobfuscate => "bw-deobf",
             Tool::Mba => "bw-mba",
+            Tool::Nf => "bw-nf",
             Tool::BwCobra => "bw-cobra",
             Tool::BwEqsat => "bw-eqsat",
             Tool::EggBw => "egg-bw",
@@ -116,6 +120,10 @@ impl Tool {
             Tool::Mba => {
                 "bitwright, deobfuscate with the MBA service and the native SignatureSolver"
             }
+            Tool::Nf => {
+                "bitwright, deobfuscate with the MBA service, the native NormalFormSolver and \
+                 bitwright's own evidence only"
+            }
             Tool::BwCobra => "bitwright, deobfuscate with the MBA service and the CoBRA backend",
             Tool::BwEqsat => "bitwright's equality saturation, every built-in equation group",
             Tool::EggBw => "egg with bitwright's equations plus commutativity, default limits",
@@ -140,6 +148,13 @@ struct Case {
     line: usize,
     input: String,
     truth: String,
+}
+
+impl Case {
+    /// Some lines give no ground truth (`-`): they are read and checked, but not scored.
+    fn has_truth(&self) -> bool {
+        !matches!(self.truth.as_str(), "" | "-")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +183,8 @@ struct Row {
     exact: bool,
     /// The dataset's ground truth disagrees with its input at a sampled point.
     bad_truth: bool,
+    /// The dataset gives no ground truth for the line.
+    no_truth: bool,
     /// The simplification call alone, in microseconds.
     micros: f64,
     /// The heap the call used at its peak, in bytes (in-process tools only).
@@ -186,6 +203,7 @@ impl Row {
             truth: 0,
             exact: false,
             bad_truth: false,
+            no_truth: !case.has_truth(),
             micros: 0.0,
             heap: None,
             note: String::new(),
@@ -204,9 +222,58 @@ fn bw_syntax(s: &str) -> String {
     s.replace(">>", ">>u")
 }
 
+/// bitwright's parser, or where it declines, the datasets' own syntax (see `read`).
 fn parse(cx: &mut Context, s: &str) -> Result<Expr, String> {
-    cx.parse(&bw_syntax(s), &ParseOptions::width(W))
+    parse_at(cx, s, W)
+}
+
+/// [`parse`] at width `w`.
+fn parse_at(cx: &mut Context, s: &str, w: Width) -> Result<Expr, String> {
+    cx.parse(&bw_syntax(s), &ParseOptions::width(w))
         .map_err(|e| e.to_string())
+        .or_else(|e| read::read(cx, s, w).map_err(|_| e))
+}
+
+/// The width a case is measured at: 64 bits, unless its ground truth disagrees with its input
+/// there and agrees at a narrower one (some OSES lines are 8-bit arithmetic, as `((x + y)·5 +
+/// 7)·205 + 101` is `x + y` modulo 2^8 only), then the widest such.
+fn case_width(case: &Case) -> Width {
+    if !case.has_truth() {
+        return W;
+    }
+    let agrees = |w: Width| -> bool {
+        let mut cx = Context::new();
+        let (Ok(i), Ok(t)) = (
+            parse_at(&mut cx, &case.input, w),
+            parse_at(&mut cx, &case.truth, w),
+        ) else {
+            return false;
+        };
+        let Ok(syms) = cx.symbols_in(&[i, t]) else {
+            return false;
+        };
+        let keys: Vec<SymbolKey> = syms
+            .iter()
+            .filter_map(|&s| cx.symbol_key(s).cloned())
+            .collect();
+        let mut rng = Rng(0x5eed ^ case.line as u64);
+        let edges = [0, u64::MAX, 1, 1 << 63];
+        let mut env: HashMap<SymbolKey, BitVec> = HashMap::new();
+        (0..POINTS).all(|p| {
+            for k in &keys {
+                let v = edges.get(p).copied().unwrap_or_else(|| rng.next());
+                env.insert(k.clone(), BitVec::wrapping_from_u64(w, v));
+            }
+            matches!(cx.eval(&[i, t], &env), Ok(v) if v[0] == v[1])
+        })
+    };
+    if agrees(W) {
+        return W;
+    }
+    [Width::W32, Width::W16, Width::W8]
+        .into_iter()
+        .find(|&w| agrees(w))
+        .unwrap_or(W)
 }
 
 fn dag(cx: &mut Context, e: Expr) -> u32 {
@@ -233,9 +300,16 @@ impl Rng {
 /// and agreement with the input at [`POINTS`] points (boundary values first, then random). The
 /// ground truth is checked the same way, so a dataset error shows as `bad_truth`.
 fn measure(cx: &mut Context, input: Expr, answer: Expr, case: &Case, mut row: Row) -> Row {
-    let truth = match parse(cx, &case.truth) {
-        Ok(t) => t,
-        Err(e) => return row.fail(Status::Unreadable, format!("ground truth: {e}")),
+    // At the input's width (see `case_width`).
+    let w = cx.width(input).unwrap_or(W);
+    // No ground truth: the input stands in for it (checked, never scored).
+    let truth = if case.has_truth() {
+        match parse_at(cx, &case.truth, w) {
+            Ok(t) => t,
+            Err(e) => return row.fail(Status::Unreadable, format!("ground truth: {e}")),
+        }
+    } else {
+        input
     };
     row.input = dag(cx, input);
     row.answer = dag(cx, answer);
@@ -255,7 +329,7 @@ fn measure(cx: &mut Context, input: Expr, answer: Expr, case: &Case, mut row: Ro
     for p in 0..POINTS {
         for k in &keys {
             let v = edges.get(p).copied().unwrap_or_else(|| rng.next());
-            env.insert(k.clone(), BitVec::wrapping_from_u64(W, v));
+            env.insert(k.clone(), BitVec::wrapping_from_u64(w, v));
         }
         let vals = match cx.eval(&[input, answer, truth], &env) {
             Ok(v) => v,
@@ -290,6 +364,16 @@ fn engine(tool: Tool) -> Result<Engine, String> {
             .strategy(Strategy::deobfuscate())
             .build(),
         Tool::Mba => mba(Arc::new(SignatureSolver)),
+        Tool::Nf => Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(
+                    MbaConfig::default()
+                        .with_trust(MbaTrust::default().with_backend_certificates(false)),
+                ),
+            )
+            .mba_solver(Arc::new(NormalFormSolver::default()))
+            .build(),
         Tool::BwCobra => mba(Arc::new(CobraSolver::default())),
         _ => unreachable!("not a bitwright tool"),
     };
@@ -299,11 +383,15 @@ fn engine(tool: Tool) -> Result<Engine, String> {
 /// Times and heap cover everything from the text to the answer, parsing included (bitwright's
 /// parser builds the canonical, hash-consed form).
 fn run_bitwright(tool: Tool, engine: &Engine, case: &Case) -> Row {
-    let row = Row::new(tool, case);
+    let mut row = Row::new(tool, case);
+    let w = case_width(case);
+    if w != W {
+        row.note = format!("{} bits", w.bits());
+    }
     let base = heap::start();
     let t = Instant::now();
     let mut cx = Context::new();
-    let input = match parse(&mut cx, &case.input) {
+    let input = match parse_at(&mut cx, &case.input, w) {
         Ok(e) => e,
         Err(e) => return row.fail(Status::Unreadable, e),
     };
@@ -317,7 +405,33 @@ fn run_bitwright(tool: Tool, engine: &Engine, case: &Case) -> Row {
     let mut row = measure(&mut cx, input, answer, case, row);
     row.micros = micros;
     row.heap = Some(heap);
+    if row.status == Status::Ok && !row.no_truth && !row.bad_truth && row.answer > row.truth {
+        failure(tool, case, &cx.display(answer).to_string());
+    }
     row
+}
+
+/// With `BW_FAILURES` set to a file, appends every scored case a bitwright tool leaves larger
+/// than the ground truth to it: tool, line, input, ground truth and answer, tab-separated.
+fn failure(tool: Tool, case: &Case, answer: &str) {
+    let Some(path) = std::env::var_os("BW_FAILURES") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            tool.name(),
+            case.line,
+            case.input,
+            case.truth,
+            answer.replace('\n', "; ")
+        );
+    }
 }
 
 /// bitwright's equality saturation: the candidate if the search published one (it publishes only
@@ -626,14 +740,37 @@ fn summary(label: &str, tool: Tool, rows: &[&Row]) -> String {
     let n = rows.len();
     let count = |s: Status| rows.iter().filter(|r| r.status == s).count();
     let ok: Vec<&&Row> = rows.iter().filter(|r| r.status == Status::Ok).collect();
-    let solved = ok.iter().filter(|r| r.answer <= r.truth).count();
-    let exact = ok.iter().filter(|r| r.exact).count();
-    let pct = |k: usize| 100.0 * k as f64 / n.max(1) as f64;
+    // Lines without a ground truth, or with one that disagrees with the input at every width
+    // (a dataset error), are scored apart: whether the answer is smaller.
+    let unscored = |r: &Row| r.no_truth || r.bad_truth;
+    let untrue = rows.iter().filter(|r| unscored(r)).count();
+    let reduced = ok
+        .iter()
+        .filter(|r| unscored(r) && r.answer < r.input)
+        .count();
+    let solved = ok
+        .iter()
+        .filter(|r| !unscored(r) && r.answer <= r.truth)
+        .count();
+    let exact = ok.iter().filter(|r| !unscored(r) && r.exact).count();
+    // Rounded down, so only every scored line solved reads 100.0; `-` without scored lines.
+    let scored = n - untrue;
+    let pct = |k: usize| {
+        (1000 * k)
+            .checked_div(scored)
+            .map_or("-".to_string(), |t| format!("{:.1}", t as f64 / 10.0))
+    };
     let (ratio, _) = quantiles(
         ok.iter()
+            .filter(|r| !unscored(r))
             .map(|r| f64::from(r.answer) / f64::from(r.truth.max(1)))
             .collect(),
     );
+    let ratio = if ratio.is_nan() {
+        "-".to_string()
+    } else {
+        format!("{ratio:.2}")
+    };
     let (t50, t95) = quantiles(ok.iter().map(|r| r.micros).collect());
     let heaps: Vec<f64> = ok
         .iter()
@@ -646,7 +783,7 @@ fn summary(label: &str, tool: Tool, rows: &[&Row]) -> String {
         format!("{:.0}", quantiles(heaps).0)
     };
     format!(
-        "| {label} | {} | {n} | {:.1} | {:.1} | {} | {} | {} | {ratio:.2} | {t50:.0} | {t95:.0} | {heap} |",
+        "| {label} | {} | {n} | {} | {} | {} | {} | {} | {untrue} | {reduced} | {ratio} | {t50:.0} | {t95:.0} | {heap} |",
         tool.name(),
         pct(solved),
         pct(exact),
@@ -656,7 +793,7 @@ fn summary(label: &str, tool: Tool, rows: &[&Row]) -> String {
     )
 }
 
-const HEADER: &str = "| dataset | tool | cases | solved % | exact % | wrong | failed | unread | size/truth | µs p50 | µs p95 | heap KB p50 |\n|-|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|";
+const HEADER: &str = "| dataset | tool | cases | solved % | exact % | wrong | failed | unread | no truth | reduced | size/truth | µs p50 | µs p95 | heap KB p50 |\n|-|-|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|-:|";
 
 #[derive(Debug)]
 struct Options {
@@ -769,7 +906,7 @@ fn main() -> ExitCode {
     for &t in &tools {
         if matches!(
             t,
-            Tool::Standard | Tool::Deobfuscate | Tool::Mba | Tool::BwCobra
+            Tool::Standard | Tool::Deobfuscate | Tool::Mba | Tool::Nf | Tool::BwCobra
         ) {
             match engine(t) {
                 Ok(e) => {
@@ -805,7 +942,7 @@ fn main() -> ExitCode {
     if let Some(w) = csv.as_mut() {
         let _ = writeln!(
             w,
-            "dataset,line,tool,status,input,answer,truth,exact,bad_truth,micros,heap,note"
+            "dataset,line,tool,status,input,answer,truth,exact,bad_truth,no_truth,micros,heap,note"
         );
     }
     for path in &paths {
@@ -871,7 +1008,7 @@ fn main() -> ExitCode {
             for r in &rows {
                 let _ = writeln!(
                     w,
-                    "{label},{},{},{:?},{},{},{},{},{},{:.1},{},{:?}",
+                    "{label},{},{},{:?},{},{},{},{},{},{},{:.1},{},{:?}",
                     r.line,
                     r.tool.name(),
                     r.status,
@@ -880,6 +1017,7 @@ fn main() -> ExitCode {
                     r.truth,
                     r.exact,
                     r.bad_truth,
+                    r.no_truth,
                     r.micros,
                     r.heap.map_or(String::new(), |h| h.to_string()),
                     r.note,

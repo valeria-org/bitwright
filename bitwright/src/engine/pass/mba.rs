@@ -39,9 +39,9 @@ fn charge(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, evals: u64) -> Resul
 /// Whether `a` and `b` agree at the refutation sample: zero, all-ones, one and the signed
 /// minimum, the constants of both sides and their neighbours, single bit positions, and seeded
 /// random points (see [`certify::sample_points`]). A filter, never evidence on its own.
-fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<bool, Stop> {
+fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Result<bool, Stop> {
     charge(r, a, b, u64::from(SAMPLE_POINTS))?;
-    let points = certify::sample_points(a.vars(), &[a, b], a.key()[0]);
+    let points = certify::sample_points(a.vars(), &[a, b], seed);
     Ok(certify::refute(a, b, &points).is_none())
 }
 
@@ -74,6 +74,35 @@ fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Re
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::MbaStats {
     &mut r.stats.mba
+}
+
+/// Whether the MBA phase asks the question at `n`: its operator is one it asks at and its
+/// fragment is one it lowers (within the limits); remembered for the phase run. A link of a
+/// chain below `n` is then not asked (see `pass::mba_step`).
+pub(super) fn asks(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<bool, Stop> {
+    if let Some(&a) = r.asks.get(&n) {
+        return Ok(a);
+    }
+    let poly = r.inner.mba.solver.polynomial_fragments();
+    let op = cx.node(n).op;
+    let a = if mixed_op(op) || (poly && op == OpCode::Shl) {
+        match crate::mba::fits(cx, n, &cfg.limits) {
+            Ok(nodes) => {
+                r.meter.charge(Counter::PassWork, u64::from(nodes))?;
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    r.asks.insert(n, a);
+    Ok(a)
 }
 
 /// The MBA phase at `n`.
@@ -110,7 +139,9 @@ pub(super) fn step(
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
     let inner = r.inner;
     let prover_id = inner.mba.prover.as_ref().map_or("", |p| p.id());
-    let mut kh = combine(m.key()[0], m.key()[1]);
+    // The question's content hash, once (it hashes every node).
+    let mk = m.key();
+    let mut kh = combine(mk[0], mk[1]);
     for b in inner.mba.solver.id().bytes().chain(prover_id.bytes()) {
         kh = combine(kh, u64::from(b));
     }
@@ -122,7 +153,7 @@ pub(super) fn step(
     );
     let key = CacheKey([
         combine(kh, LOWERING_VERSION),
-        combine(kh ^ 0x6361_6368, m.key()[1]),
+        combine(kh ^ 0x6361_6368, mk[1]),
     ]);
     // The answer, and where it was lifted if it already was.
     let (cand, lifted) = match inner.mba.cache.get(&key) {
@@ -137,14 +168,19 @@ pub(super) fn step(
         _ => {
             r.meter.charge(Counter::MbaCalls, 1)?;
             count(r).calls += 1;
-            match inner.mba.solver.solve(&m, &cfg.budget) {
+            // The solver's own evidence counts only where backend certificates are trusted:
+            // elsewhere the gate proves every answer itself.
+            let budget = cfg
+                .budget
+                .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
+            match inner.mba.solver.solve(&m, &budget) {
                 MbaAnswer::Simplified { expr, claim } => {
                     if expr.vars() != m.vars() || expr.width() != m.width() {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     // Always: a cheap refutation check.
-                    if !sampled(r, &m, &expr)? {
+                    if !sampled(r, &m, &expr, mk[0])? {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }

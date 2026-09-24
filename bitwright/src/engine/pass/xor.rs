@@ -292,7 +292,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         2
     };
     let estimate = 2 * masked + t.saturating_sub(1) + konst;
-    if let Some(f) = worth_building(r, cx, n, &atoms, estimate)? {
+    // A constant always commits (see `shrinks`).
+    if !form.terms.is_empty()
+        && let Some(f) = worth_building(r, cx, n, &atoms, estimate)?
+    {
         r.stats.passes.entry("xor").or_default().rejected_cost += 1;
         return Ok(Step::Normal(form.fin.and(f)));
     }

@@ -65,8 +65,14 @@ bitwright's certificates are finite evaluation tests, each complete for its frag
 - **polynomials** without bitwise operators: a small grid, `{0, 1, 2}` per variable for degree 2;
 - every assignment when the variables total at most 20 bits;
 - anything else through **atoms**: right shifts, casts and arithmetic under a bitwise operator
-  are abstracted, paired between the two sides when they are provably equal, and the two
-  skeletons are compared by one of the tests above;
+  are abstracted, paired between the two sides when they are provably equal (also as each
+  other's complements, `x − 1` and `−x`, or when an atom's bits follow a bitwise function of
+  its definition's leaves), and the two skeletons are compared by one of the tests above;
+- **polynomials over symbols**: two sides that expand to the same polynomial in variables,
+  conjunctions and other bitwise subterms are equal whatever values those take;
+- **carries**: expressions built from `+ − ~ & | ^`, small left shifts and products by small
+  constants are compared bit by bit, over every carry that can reach each position, which
+  decides them exactly (`(y + y) & y & −y` is 0 at every width);
 - when those leave the question open, a bitwise operation with a constant that reads only
   **known bits** of its other operand is read as arithmetic (`−2·(x & 1) | 1` is
   `−2·(x & 1) + 1`, the low bit being known to be 0), and a variable is split into **cases**
@@ -76,6 +82,11 @@ bitwright's certificates are finite evaluation tests, each complete for its frag
 A test is sized before it runs and charged to the pass-work budget; one that does not fit is not
 started, and the node is asked again by a later call with more budget. `NativeProver` offers the
 same checks to hosts that use the MBA module directly.
+
+The phase asks about the largest fragment first: the question at the top of a fragment is asked
+over the fragment as it is, and only when that answer is not taken are the pieces asked, inner
+ones first, and the top again over them. A piece's answer can hide what only the whole shows (a
+relation between two atoms that rewrites one factor of a product identity).
 
 Answers are cached (keyed by the lowered input, the solver's and prover's ids, the trust
 setting and the lowering version) in an `MbaCacheStore` you provide; `MemoryCache` is a bounded
@@ -104,7 +115,7 @@ let e = cx.parse(
 let out = engine.run(&mut cx, &[e], Default::default())?;
 assert!(out.stats.mba.calls + out.stats.mba.cache_hits > 0);
 // 2·x + y + (x & y): the same function of x and y at every bit.
-assert_eq!(cx.display(out.roots[0].expr).to_string(), "(x & y) + (x << 1) + y");
+assert_eq!(cx.display(out.roots[0].expr).to_string(), "x + x + (x & y) + y");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -122,6 +133,13 @@ A bitwise operation with a constant that reads only low bits of a polynomial tha
 arithmetic again, so `(x + y)·(−2·(z & 1) | 1)²` is `x + y`; and an atom's definition that also
 appears outside it is replaced by the atom, so `p + x + (x ^ 4) − ((x ^ 4) & p)`, with `p` any
 polynomial, is `x + ((x ^ 4) | p)`.
+Forms are also rendered as sums of two bitwise functions (in forms that share subterms, so
+`−6·~(x | (y | z))` and the majority `(y & z) | (x & (y | z))` share `y | z`) or three, as a
+bitwise function times an odd constant, group by group when their atoms fall apart, with a
+bitwise function peeled off, and partly factored, so an obfuscation's pieces come back as
+written: a 33-node obfuscation of `(d·a | (a ^ d)) + (a ^ (a + a))` from the QSynth dataset
+comes back as exactly that. Atoms that depend on each other are seen through where a certificate
+proves it: `((y + 1) & (~y + ~y)) | y | x` is `x | y`, and `−(x & −x)` is `x | −x`.
 A normal form over at most three atoms is also looked up in a precomputed table of the
 smallest expressions, so products the input has multiplied out come back: `x·y + x + y + 1` is
 `~x·~y`, and `x² + 2·x·y + y²` is `(x + y)²`. A form from the table is used only when a
@@ -130,8 +148,11 @@ sampled answer (`NfOptions::synthesis` turns the table off). Every answer is cer
 its input before it is returned, and the evidence gate checks it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
 certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
 for a later call with more budget. It remembers its recent answers (`NfOptions::memo`), which
-saves time when the engine asks again and never changes an answer. It is not the default
-solver: pass it to `mba_solver`.
+saves time when the engine asks again and never changes an answer. It is not the library's
+default solver: pass it to `mba_solver` (the command line's `simplify` uses it, on bitwright's
+own evidence only). Of the 76,080 expressions of CoBRA's MBA datasets, it brings every one
+whose ground truth agrees with its input (75,737) to the ground truth's size or less, 22,644
+smaller; CoBRA itself reaches 85.0 % of them. See `compare/` in the repository.
 
 ```rust
 use std::sync::Arc;

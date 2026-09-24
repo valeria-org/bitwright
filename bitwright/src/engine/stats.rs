@@ -130,6 +130,12 @@ pub struct CertStats {
     pub grid: u64,
     /// Decided exhaustively.
     pub exhaustive: u64,
+    /// Decided as equal polynomials over symbols (variables, conjunctions of the leaves of a
+    /// bitwise function, other bitwise subterms).
+    pub symbolic: u64,
+    /// Decided bit-serially over every reachable carry state (`+ − ~ & | ^`, small left shifts
+    /// and products by small constants).
+    pub carries: u64,
     /// Decided over abstracted atoms.
     pub compositional: u64,
     /// Decided case by case over a few bits of one variable: bits it is read through a narrow
@@ -165,6 +171,8 @@ impl CertStats {
                 Some(Cert::Sparse) => self.sparse += 1,
                 Some(Cert::Grid) => self.grid += 1,
                 Some(Cert::Exhaustive) => self.exhaustive += 1,
+                Some(Cert::Symbolic) => self.symbolic += 1,
+                Some(Cert::Carries) => self.carries += 1,
                 None => {}
             }
             if r.compositional {

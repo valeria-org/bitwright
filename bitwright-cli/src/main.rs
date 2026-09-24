@@ -4,7 +4,10 @@ use std::fmt::Write as _;
 use std::process::ExitCode;
 
 use bitwright::check::{CheckConfig, Verdict, check_program};
+use std::sync::Arc;
+
 use bitwright::engine::{Engine, Run, Strategy};
+use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::rules::{Ledger, Level, Rule, RuleKind, RuleProgram, builtin_sources, explain};
 use bitwright::{Assumptions, Context, ParseOptions, Reliance, Width, smtlib};
 
@@ -29,9 +32,12 @@ commands:
         a Markdown catalog of the rules (the built-in rules without a file).
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
-  simplify <expr> [--width <n>] [--deobfuscate] [--assume <predicate>]...
+  simplify <expr> [--width <n>] [--standard] [--assume <predicate>]...
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
+        Deobfuscates: the rules, the normal-form passes and the MBA service with the native
+        normal-form solver, whose every answer bitwright proves itself. `--standard` runs only
+        the rules and the standard passes (`--deobfuscate`, the default, is accepted).
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -467,7 +473,14 @@ fn dedent(lines: &[&str]) -> String {
 }
 
 fn simplify(rest: &[String]) -> Result<String, Fail> {
-    let a = Args::parse(rest, &["width", "deobfuscate", "assume"], &["deobfuscate"])?;
+    let a = Args::parse(
+        rest,
+        &["width", "deobfuscate", "standard", "assume"],
+        &["deobfuscate", "standard"],
+    )?;
+    if a.flag("standard") && a.flag("deobfuscate") {
+        return Err(usage("--standard and --deobfuscate exclude each other"));
+    }
     let src = a.one("expression")?;
     let w: u16 = match a.value("width") {
         Some(w) => w.parse().map_err(|_| usage(format!("bad --width {w}")))?,
@@ -497,16 +510,17 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             ),
         ));
     }
-    let strategy = if a.flag("deobfuscate") {
-        Strategy::deobfuscate()
+    let mut builder = Engine::builder().builtin();
+    builder = if a.flag("standard") {
+        builder.strategy(Strategy::standard())
     } else {
-        Strategy::standard()
+        // The MBA service with the native solver, on bitwright's own evidence only.
+        let trust = MbaTrust::default().with_backend_certificates(false);
+        builder
+            .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust)))
+            .mba_solver(Arc::new(NormalFormSolver::default()))
     };
-    let engine = Engine::builder()
-        .builtin()
-        .strategy(strategy)
-        .build()
-        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let engine = builder.build().map_err(|e| Fail::Err(2, format!("{e}")))?;
     let out = engine
         .run(&mut cx, &[e], Run::default().with_assumptions(&assumptions))
         .map_err(|e| Fail::Err(2, format!("{e}")))?

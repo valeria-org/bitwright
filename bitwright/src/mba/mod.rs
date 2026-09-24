@@ -44,7 +44,7 @@ pub use threaded::ThreadedSolver;
 
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
-pub(crate) use lower::{lift_id, lower_id};
+pub(crate) use lower::{fits, lift_id, lower_id};
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
     MemoryCache, NoCache, SignatureSolver, Verdict,
