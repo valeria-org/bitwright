@@ -143,7 +143,8 @@ script, each solver's answer as printed and each answer as bitwright reads it ar
 `DIR`.
 
 **Identities.** `versus-smt --facts` runs the fact sets of [`facts/`](facts) instead: 580
-identities, written from textbook mathematics, without mixed boolean-arithmetic ones.
+bit-vector identities and 71 floating-point ones, written from textbook mathematics and IEEE
+754, without mixed boolean-arithmetic ones.
 [`bitvector.txt`](facts/bitvector.txt) (377, in 15 groups: Boolean algebra, ring arithmetic,
 two's complement, shifts, rotations, extraction and extension, division, comparisons,
 if-then-else, known bits; its header gives the format) is the algebra;
@@ -155,7 +156,13 @@ laws, bounds, minimum and maximum, monotone operations), [`slices.txt`](facts/sl
 from slices, selection through masks) and [`canonical.txt`](facts/canonical.txt) (reordered
 operands, gathered constants) add one area each. Each identity runs at 8 and 64 bits, over the
 atoms `x`, `y`, `z` and over compound terms (`x = a·b`, `y = c | d`, `z = e − f`), with `p` a
-comparison: 2,320 cases. Every
+comparison: 2,320 cases. [`float.txt`](facts/float.txt) (71, from IEEE 754: sign operations,
+classification, comparisons, arithmetic, rounding, conversions) runs in binary32 and binary64
+(the 8- and 64-bit runs), over float atoms and over compound floats (`x = a·b`, `y = c + d`,
+`z = √e`), in SMT-LIB's FloatingPoint theory: 284 cases; answers are compared as SMT-LIB values
+(every NaN one value). Its last group holds only on values (a NaN operand's payload changes the
+bits), so bitwright, which keeps bit patterns, leaves it; the others hold bit for bit. `--set
+NAME` runs one set. Every
 tool starts from the unsimplified side as SMT-LIB text, so none gets a head start from another's
 reading of it. A case is solved when the answer is no larger than the simpler side, and exact
 when it is that side (both in bitwright's canonical form). The two sides of every case are

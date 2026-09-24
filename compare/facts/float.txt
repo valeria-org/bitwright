@@ -1,0 +1,99 @@
+# Floating-point identities for `versus-smt --facts`, in the format of the other sets
+# (`name [sort]: LHS ==> RHS`), run in binary32 and binary64 over atoms and over compound terms.
+# The terms are SMT-LIB 2.6 QF_BVFP over x, y, z (floats of the run's format), i (32 bits),
+# j (16 bits) and k (8 bits). `$eb`, `$sb` are the format's sizes; `<r>` is the float of the
+# real r (`((_ to_fp $eb $sb) RNE r)`). `[sort]` is the root's sort when it is not the format:
+# `bool`, or a bit-vector width. Written from IEEE 754, not from any tool's rules.
+#
+# Every identity but the last group's holds bit for bit on every encoding (with the canonical
+# NaN of every operation, as bitwright computes), so each tool's answer is checked against the
+# input at 64 points as an SMT-LIB value (every NaN one value). The last group holds only on
+# values: a NaN operand's payload makes the two sides different bit patterns, so bitwright,
+# which keeps bit patterns, leaves them, while a solver's abstract floats may use them. Nothing
+# SMT-LIB leaves unspecified (a NaN converted to an integer, the zero min(+0, −0) returns) is
+# in the set.
+
+## Sign operations
+neg-neg: (fp.neg (fp.neg x)) ==> x
+abs-abs: (fp.abs (fp.abs x)) ==> (fp.abs x)
+abs-neg: (fp.abs (fp.neg x)) ==> (fp.abs x)
+neg-abs-neg: (fp.neg (fp.abs (fp.neg x))) ==> (fp.neg (fp.abs x))
+sub-as-add: (fp.sub RNE x y) ==> (fp.add RNE x (fp.neg y))
+sub-neg: (fp.sub RNE x (fp.neg y)) ==> (fp.add RNE x y)
+neg-const: (fp.neg <1.5>) ==> <-1.5>
+abs-const: (fp.abs <-2.25>) ==> <2.25>
+
+## Classification
+isnan-neg [bool]: (fp.isNaN (fp.neg x)) ==> (fp.isNaN x)
+isnan-abs [bool]: (fp.isNaN (fp.abs x)) ==> (fp.isNaN x)
+isinf-neg [bool]: (fp.isInfinite (fp.neg x)) ==> (fp.isInfinite x)
+iszero-abs [bool]: (fp.isZero (fp.abs x)) ==> (fp.isZero x)
+isnormal-neg [bool]: (fp.isNormal (fp.neg x)) ==> (fp.isNormal x)
+issubnormal-abs [bool]: (fp.isSubnormal (fp.abs x)) ==> (fp.isSubnormal x)
+isneg-abs [bool]: (fp.isNegative (fp.abs x)) ==> false
+ispos-abs [bool]: (fp.isPositive (fp.abs x)) ==> (not (fp.isNaN x))
+isneg-neg [bool]: (fp.isNegative (fp.neg x)) ==> (fp.isPositive x)
+nan-not-inf [bool]: (and (fp.isNaN x) (fp.isInfinite x)) ==> false
+zero-not-normal [bool]: (and (fp.isZero x) (fp.isNormal x)) ==> false
+classes-cover [bool]: (or (fp.isNaN x) (fp.isInfinite x) (fp.isZero x) (fp.isNormal x) (fp.isSubnormal x)) ==> true
+signs-cover [bool]: (or (fp.isNaN x) (fp.isNegative x) (fp.isPositive x)) ==> true
+isnan-const [bool]: (fp.isNaN (_ NaN $eb $sb)) ==> true
+isinf-const [bool]: (fp.isInfinite (_ -oo $eb $sb)) ==> true
+
+## Comparisons
+lt-self [bool]: (fp.lt x x) ==> false
+gt-self [bool]: (fp.gt x x) ==> false
+eq-self [bool]: (fp.eq x x) ==> (not (fp.isNaN x))
+leq-self [bool]: (fp.leq x x) ==> (not (fp.isNaN x))
+gt-swap [bool]: (fp.gt x y) ==> (fp.lt y x)
+geq-swap [bool]: (fp.geq x y) ==> (fp.leq y x)
+lt-neg [bool]: (fp.lt (fp.neg x) (fp.neg y)) ==> (fp.lt y x)
+leq-neg [bool]: (fp.leq (fp.neg x) (fp.neg y)) ==> (fp.leq y x)
+eq-neg [bool]: (fp.eq (fp.neg x) (fp.neg y)) ==> (fp.eq x y)
+eq-symmetric [bool]: (fp.eq y x) ==> (fp.eq x y)
+eq-nan [bool]: (fp.eq x (_ NaN $eb $sb)) ==> false
+lt-nan [bool]: (fp.lt (_ NaN $eb $sb) x) ==> false
+lt-above-inf [bool]: (fp.lt (_ +oo $eb $sb) x) ==> false
+lt-below-minus-inf [bool]: (fp.lt x (_ -oo $eb $sb)) ==> false
+lt-both-ways [bool]: (and (fp.lt x y) (fp.lt y x)) ==> false
+eq-zeros [bool]: (fp.eq (_ +zero $eb $sb) (_ -zero $eb $sb)) ==> true
+lt-zeros [bool]: (fp.lt (_ -zero $eb $sb) (_ +zero $eb $sb)) ==> false
+
+## Arithmetic
+fma-one: (fp.fma RNE x <1.0> y) ==> (fp.add RNE x y)
+fma-one-left: (fp.fma RTZ <1.0> x y) ==> (fp.add RTZ x y)
+fma-minus-zero: (fp.fma RNE x y (_ -zero $eb $sb)) ==> (fp.mul RNE x y)
+mul-two: (fp.mul RNE x <2.0>) ==> (fp.add RNE x x)
+mul-neg-neg: (fp.mul RNE (fp.neg x) (fp.neg y)) ==> (fp.mul RNE x y)
+div-neg-neg: (fp.div RTP (fp.neg x) (fp.neg y)) ==> (fp.div RTP x y)
+add-commutes: (fp.add RNE y x) ==> (fp.add RNE x y)
+mul-commutes: (fp.mul RTN y x) ==> (fp.mul RTN x y)
+add-consts: (fp.add RNE <1.5> <2.25>) ==> <3.75>
+mul-consts: (fp.mul RNE <1.5> <-2.0>) ==> <-3.0>
+sqrt-const: (fp.sqrt RNE <6.25>) ==> <2.5>
+div-by-zero: (fp.div RNE <1.0> (_ +zero $eb $sb)) ==> (_ +oo $eb $sb)
+inf-minus-inf: (fp.sub RNE (_ +oo $eb $sb) (_ +oo $eb $sb)) ==> (_ NaN $eb $sb)
+zero-times-inf: (fp.mul RNE (_ +zero $eb $sb) (_ -oo $eb $sb)) ==> (_ NaN $eb $sb)
+
+## Rounding
+round-round: (fp.roundToIntegral RNE (fp.roundToIntegral RTZ x)) ==> (fp.roundToIntegral RTZ x)
+round-round-same: (fp.roundToIntegral RTP (fp.roundToIntegral RTP x)) ==> (fp.roundToIntegral RTP x)
+round-away: (fp.roundToIntegral RNA <2.5>) ==> <3.0>
+round-even: (fp.roundToIntegral RNE <2.5>) ==> <2.0>
+round-int: (fp.roundToIntegral RTN ((_ to_fp $eb $sb) RNE i)) ==> ((_ to_fp $eb $sb) RNE i)
+
+## Conversions
+isnan-of-int [bool]: (fp.isNaN ((_ to_fp $eb $sb) RNE i)) ==> false
+isinf-of-int [bool]: (fp.isInfinite ((_ to_fp $eb $sb) RNE i)) ==> false
+isneg-of-uint [bool]: (fp.isNegative ((_ to_fp_unsigned $eb $sb) RNE k)) ==> false
+from-zext: ((_ to_fp $eb $sb) RNE ((_ zero_extend 24) k)) ==> ((_ to_fp_unsigned $eb $sb) RNE k)
+int-round-trip [32]: ((_ fp.to_sbv 32) RTZ ((_ to_fp $eb $sb) RNE j)) ==> ((_ sign_extend 16) j)
+uint-round-trip [8]: ((_ fp.to_ubv 8) RNE ((_ to_fp_unsigned $eb $sb) RNE k)) ==> k
+
+## Values (all NaNs one value)
+mul-one: (fp.mul RNE x <1.0>) ==> x
+div-one: (fp.div RTZ x <1.0>) ==> x
+add-minus-zero: (fp.add RNE x (_ -zero $eb $sb)) ==> x
+min-self: (fp.min x x) ==> x
+max-self: (fp.max x x) ==> x
+widen-narrow: ((_ to_fp $eb $sb) RNE ((_ to_fp 15 113) RNE x)) ==> x

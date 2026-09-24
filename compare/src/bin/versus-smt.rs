@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use bitwright::engine::{Engine, Strategy};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::smtlib::import;
+use bitwright::fp::{FpFormat, FpTest};
 use bitwright::{BinOp, BitVec, Bounded, CmpOp, Context, Expr, SymbolKey, UnOp, Width};
 
 /// Runs per case and tool; the fastest counts.
@@ -80,8 +81,8 @@ const Z3_PRINT_SMTLIB2_COMPLIANT: c_uint = 2;
 fn z3(script: &str) -> Result<(String, Duration), String> {
     // A definition is expanded while parsing; an uninterpreted predicate keeps the term.
     let text = format!(
-        "{script}(declare-fun bw_keep ((_ BitVec {})) Bool)\n(assert (bw_keep root0))\n",
-        root_width(script)?
+        "{script}(declare-fun bw_keep ({}) Bool)\n(assert (bw_keep root0))\n",
+        root_sort(script)?
     );
     let text = CString::new(text).map_err(|e| e.to_string())?;
     // SAFETY: a fresh context used on this thread only and deleted at the end; every pointer
@@ -213,7 +214,16 @@ fn bitwright(engine: &Engine, script: &str) -> Result<(Measured, Duration), Stri
         .map_err(|e| e.to_string())?
         .expr;
     let time = start.elapsed();
-    Ok((Measured { cx, input, answer }, time))
+    let float = root_float(script);
+    Ok((
+        Measured {
+            cx,
+            input,
+            answer,
+            float,
+        },
+        time,
+    ))
 }
 
 // ----- measuring ---------------------------------------------------------------------------------
@@ -223,20 +233,24 @@ struct Measured {
     cx: Context,
     input: Expr,
     answer: Expr,
+    /// The root's format when it is a float: then values are compared as SMT-LIB's (every NaN
+    /// one value).
+    float: Option<FpFormat>,
 }
 
 impl Measured {
     /// A solver's answer (an SMT-LIB term over the script's symbols), read back.
     fn read(script: &str, answer: &str) -> Result<Measured, String> {
         let mut cx = Context::new();
-        let w = root_width(script)?;
-        let text = format!("{script}(define-fun bw_answer () (_ BitVec {w}) {answer})\n");
+        let sort = root_sort(script)?;
+        let text = format!("{script}(define-fun bw_answer () {sort} {answer})\n");
         let read = import(&mut cx, &text).map_err(|e| format!("answer not read back: {e}"))?;
         let (input, answer) = (read.definition("root0"), read.definition("bw_answer"));
         Ok(Measured {
             cx,
             input: input.ok_or("no root0")?,
             answer: answer.ok_or("no answer")?,
+            float: root_float(script),
         })
     }
 
@@ -288,22 +302,45 @@ impl Measured {
                 })
                 .collect();
             let v = self.cx.eval(&[a, b], &env);
-            v.is_ok_and(|v| v[0] == v[1])
+            let nan = |f: FpFormat, x: &BitVec| f.test(FpTest::Nan, x).unwrap_or(false);
+            v.is_ok_and(|v| {
+                v[0] == v[1] || self.float.is_some_and(|f| nan(f, &v[0]) && nan(f, &v[1]))
+            })
         })
     }
 }
 
-/// The width of `root0` in an exported script.
-fn root_width(script: &str) -> Result<u16, String> {
+/// The sort of `root0` in a script, as written.
+fn root_sort(script: &str) -> Result<String, String> {
     let line = script
         .lines()
-        .find(|l| l.starts_with("(define-fun root0 () (_ BitVec "))
+        .find(|l| l.starts_with("(define-fun root0 () "))
         .ok_or("no root0 definition")?;
-    let digits = &line["(define-fun root0 () (_ BitVec ".len()..];
-    let end = digits.find(')').ok_or("bad root0 sort")?;
-    digits[..end]
-        .parse()
-        .map_err(|_| "bad root0 width".to_string())
+    let rest = &line["(define-fun root0 () ".len()..];
+    // One balanced form: `(_ BitVec w)` or `(_ FloatingPoint eb sb)`.
+    let mut depth = 0;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(rest[..=i].to_string());
+                }
+            }
+            ' ' if depth == 0 => return Ok(rest[..i].to_string()),
+            _ => {}
+        }
+    }
+    Err("bad root0 sort".to_string())
+}
+
+/// The format of `root0` when it is a float.
+fn root_float(script: &str) -> Option<FpFormat> {
+    let sort = root_sort(script).ok()?;
+    let inner = sort.strip_prefix("(_ FloatingPoint ")?.strip_suffix(')')?;
+    let (eb, sb) = inner.split_once(' ')?;
+    FpFormat::new(eb.parse().ok()?, sb.parse().ok()?).ok()
 }
 
 /// The claim that bitwright's answer equals `root0` of `script`, for any SMT solver: the script
@@ -534,7 +571,7 @@ fn run(
 // ----- the fact sets -----------------------------------------------------------------------------
 
 /// The fact sets, `facts/NAME.txt`: bit-vector algebra first, then one set per area.
-const FACT_SETS: [(&str, &str); 6] = [
+const FACT_SETS: [(&str, &str); 7] = [
     ("bitvector", include_str!("../../facts/bitvector.txt")),
     (
         "number-theory",
@@ -544,6 +581,7 @@ const FACT_SETS: [(&str, &str); 6] = [
     ("slices", include_str!("../../facts/slices.txt")),
     ("bit-tricks", include_str!("../../facts/bit-tricks.txt")),
     ("canonical", include_str!("../../facts/canonical.txt")),
+    ("float", include_str!("../../facts/float.txt")),
 ];
 
 /// One identity of a fact set: `lhs` equals the simpler `rhs`.
@@ -801,6 +839,10 @@ impl Calc {
 /// `compound` terms over fresh atoms), p a comparison, and `root0` the fact's left side; and
 /// the fact's right side, the ground truth.
 fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), String> {
+    if f.set == "float" {
+        let format = if w == 8 { FpFormat::F32 } else { FpFormat::F64 };
+        return float_script(f, format, compound);
+    }
     let width = match f.sort.as_deref() {
         None => w,
         Some("bool") => 1,
@@ -837,6 +879,68 @@ fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), Stri
     Ok((text, Truth { sort, rhs }))
 }
 
+/// A float identity's text with `$eb`, `$sb` and the real constants `<r>` filled in.
+fn instantiate_float(text: &str, format: FpFormat) -> Result<String, String> {
+    let (eb, sb) = (format.eb(), format.sb());
+    let text = text.replace("$eb", &eb.to_string()).replace("$sb", &sb.to_string());
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let end = i + rest[i..].find('>').ok_or("an unclosed <r>")?;
+        // A negative real is the negation of the positive one (rounding to nearest is
+        // symmetric), since Bitwuzla's parser has no `(- r)` in a real constant.
+        let r = &rest[i + 1..end];
+        match r.strip_prefix('-') {
+            Some(m) => out.push_str(&format!("(fp.neg ((_ to_fp {eb} {sb}) RNE {m}))")),
+            None => out.push_str(&format!("((_ to_fp {eb} {sb}) RNE {r})")),
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The script for one float identity in `format`: floats x, y, z (atoms, or with `compound`
+/// a product, a sum and a root of fresh atoms), integers i (32 bits), j (16), k (8), and `root0`
+/// the left side; and the right side, the ground truth.
+fn float_script(f: &Fact, format: FpFormat, compound: bool) -> Result<(String, Truth), String> {
+    let float = format!("(_ FloatingPoint {} {})", format.eb(), format.sb());
+    let sort = match f.sort.as_deref() {
+        None => float.clone(),
+        Some("bool") => "(_ BitVec 1)".to_string(),
+        Some(n) => format!("(_ BitVec {})", n.parse::<u32>().map_err(|e| e.to_string())?),
+    };
+    let (mut lhs, mut rhs) = (
+        instantiate_float(&f.lhs, format)?,
+        instantiate_float(&f.rhs, format)?,
+    );
+    if f.sort.as_deref() == Some("bool") {
+        lhs = format!("(ite {lhs} #b1 #b0)");
+        rhs = format!("(ite {rhs} #b1 #b0)");
+    }
+    let mut text = String::from("(set-logic QF_BVFP)\n");
+    let atoms: &[&str] = if compound {
+        &["a", "b", "c", "d", "e"]
+    } else {
+        &["x", "y", "z"]
+    };
+    for a in atoms {
+        text.push_str(&format!("(declare-const {a} {float})\n"));
+    }
+    if compound {
+        text.push_str(&format!(
+            "(define-fun x () {float} (fp.mul RNE a b))\n(define-fun y () {float} \
+             (fp.add RNE c d))\n(define-fun z () {float} (fp.sqrt RNE e))\n"
+        ));
+    }
+    for (name, w) in [("i", 32), ("j", 16), ("k", 8)] {
+        text.push_str(&format!("(declare-const {name} (_ BitVec {w}))\n"));
+    }
+    text.push_str(&format!("(define-fun root0 () {sort} {lhs})\n"));
+    Ok((text, Truth { sort, rhs }))
+}
+
 /// One group's (or set's) results in `--facts`.
 #[derive(Default)]
 struct Row {
@@ -853,8 +957,11 @@ struct Row {
 /// three tools. One markdown row per category: the cases, and per tool how many it solves (its
 /// answer no larger than the simpler side) and how many exactly (the simpler side itself).
 /// Unsolved cases go to standard error.
-fn run_facts(engine: &Engine, proofs: Option<&str>) {
-    let facts = facts().expect("the fact set parses");
+fn run_facts(engine: &Engine, proofs: Option<&str>, only: Option<&str>) {
+    let mut facts = facts().expect("the fact set parses");
+    if let Some(set) = only {
+        facts.retain(|f| f.set == set);
+    }
     let mut rows: Vec<Row> = Vec::new();
     let mut micros: [Vec<f64>; 3] = Default::default();
     let (mut wrong, mut failed, mut invalid) = ([0usize; 3], [0usize; 3], 0);
@@ -1019,6 +1126,14 @@ fn main() {
         .iter()
         .position(|a| a == "--facts")
         .map(|i| args.remove(i));
+    let only = match args.iter().position(|a| a == "--set") {
+        Some(i) => {
+            let set = args.get(i + 1).expect("--set NAME").clone();
+            args.drain(i..i + 2);
+            Some(set)
+        }
+        None => None,
+    };
     let deobfuscate = args
         .iter()
         .position(|a| a == "--deobfuscate")
@@ -1040,7 +1155,7 @@ fn main() {
         Engine::standard()
     };
     if facts.is_some() {
-        run_facts(&engine, proofs.as_deref());
+        run_facts(&engine, proofs.as_deref(), only.as_deref());
         return;
     }
     let corpora = [
