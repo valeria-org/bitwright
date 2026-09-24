@@ -191,17 +191,40 @@ impl FpFormat {
 
     /// The canonical quiet NaN.
     pub fn nan(self) -> BitVec {
+        if let Some(w) = self.word() {
+            return w.value(w.inf | 1 << (self.sb() - 2));
+        }
         frames!(self, S => store::<S>(self.width(), soft::nan::<S>(&self.fmt())))
     }
 
     /// An infinity.
     pub fn inf(self, negative: bool) -> BitVec {
+        if let Some(w) = self.word() {
+            return w.value(w.inf | if negative { w.sign } else { 0 });
+        }
         frames!(self, S => store::<S>(self.width(), soft::inf::<S>(&self.fmt(), negative)))
     }
 
     /// A zero.
     pub fn zero(self, negative: bool) -> BitVec {
+        if let Some(w) = self.word() {
+            return w.value(if negative { w.sign } else { 0 });
+        }
         frames!(self, S => store::<S>(self.width(), soft::zero::<S>(&self.fmt(), negative)))
+    }
+
+    /// The format's masks, when an encoding fits a machine word (the classification and
+    /// comparison fast paths).
+    fn word(self) -> Option<Word> {
+        let w = self.eb() + self.sb();
+        (w <= 64).then(|| {
+            let sign = 1u64 << (w - 1);
+            Word {
+                width: self.width(),
+                sign,
+                inf: ((1u64 << self.eb()) - 1) << (self.sb() - 1),
+            }
+        })
     }
 
     /// `a + b`.
@@ -328,6 +351,9 @@ impl FpFormat {
     pub fn compare(self, a: &BitVec, b: &BitVec) -> Result<Option<Ordering>, WidthError> {
         self.check(a)?;
         self.check(b)?;
+        if let Some(w) = self.word() {
+            return Ok(w.compare(a.limbs()[0], b.limbs()[0]));
+        }
         Ok(frames_short!(self, S => soft::compare::<S>(&self.fmt(), load(a), load(b))))
     }
 
@@ -348,12 +374,23 @@ impl FpFormat {
     pub fn test(self, t: FpTest, a: &BitVec) -> Result<bool, WidthError> {
         self.check(a)?;
         let (eb, sb) = (self.eb(), self.sb());
-        let e_bits = frames!(self, S => {
-            let mut l = [0u64; 1];
-            load::<S>(a).shr(sb - 1).low(eb).write_limbs(&mut l);
-            l[0]
-        });
-        let t_zero = frames!(self, S => load::<S>(a).low(sb - 1).is_zero());
+        let (e_bits, t_zero) = match self.word() {
+            Some(_) => {
+                let x = a.limbs()[0];
+                (
+                    (x >> (sb - 1)) & ((1 << eb) - 1),
+                    x & ((1 << (sb - 1)) - 1) == 0,
+                )
+            }
+            None => (
+                frames!(self, S => {
+                    let mut l = [0u64; 1];
+                    load::<S>(a).shr(sb - 1).low(eb).write_limbs(&mut l);
+                    l[0]
+                }),
+                frames!(self, S => load::<S>(a).low(sb - 1).is_zero()),
+            ),
+        };
         let e_max = (1u64 << eb) - 1;
         let nan = e_bits == e_max && !t_zero;
         Ok(match t {
@@ -523,6 +560,42 @@ impl FpFormat {
         self.check(a)?;
         self.check(b)?;
         Ok(k(self, a, b))
+    }
+}
+
+/// A format whose encodings fit a machine word: its width, sign bit and +∞.
+#[derive(Clone, Copy)]
+struct Word {
+    width: Width,
+    sign: u64,
+    inf: u64,
+}
+
+impl Word {
+    fn value(self, x: u64) -> BitVec {
+        BitVec::from_canonical_u64(self.width, x)
+    }
+
+    /// IEEE comparison of two encodings: `None` when either is a NaN; zeros are equal.
+    fn compare(self, x: u64, y: u64) -> Option<Ordering> {
+        let abs = self.sign - 1;
+        let (ax, ay) = (x & abs, y & abs);
+        if ax > self.inf || ay > self.inf {
+            return None;
+        }
+        if ax == 0 && ay == 0 {
+            return Some(Ordering::Equal);
+        }
+        // Sign and magnitude as one order: a positive value above every negative one, and
+        // the negative ones in reverse.
+        let key = |v: u64, a: u64| {
+            if v & self.sign != 0 {
+                abs - a
+            } else {
+                self.sign | a
+            }
+        };
+        Some(key(x, ax).cmp(&key(y, ay)))
     }
 }
 
