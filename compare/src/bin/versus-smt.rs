@@ -1,6 +1,7 @@
 //! `versus-smt`: bitwright's simplifier against the term simplifiers of z3 and Bitwuzla, on
 //! random bit-vector DAGs built from operators SMT-LIB's QF_BV has natively (no tool reads a
-//! lowered form of an operator another tool has as one node).
+//! lowered form of an operator another tool has as one node), and on random floating-point
+//! DAGs written in SMT-LIB's FloatingPoint theory.
 //!
 //! Every tool starts from the same SMT-LIB script, bitwright's export of the DAG, and is timed
 //! from that text to its answer, parsing included, in a context created before the clock
@@ -30,9 +31,9 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use bitwright::engine::{Engine, Strategy};
+use bitwright::fp::{FpFormat, FpTest};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::smtlib::import;
-use bitwright::fp::{FpFormat, FpTest};
 use bitwright::{BinOp, BitVec, Bounded, CmpOp, Context, Expr, SymbolKey, UnOp, Width};
 
 /// Runs per case and tool; the fastest counts.
@@ -504,6 +505,89 @@ fn script(seed: u64, w: Width, nodes: usize, heavy: bool) -> Result<String, Stri
     Ok(format!("(set-logic QF_BV)\n{text}"))
 }
 
+/// A random DAG of floating-point operations in `f`, written in SMT-LIB's FloatingPoint theory
+/// (so each tool reads floats, not bitwright's encodings), shaped like the bit-vector ones:
+/// over 6 atoms and a few constants, operands mostly from the last few nodes, the last 8
+/// nodes summed into the root. Only what SMT-LIB specifies: sums, differences, products,
+/// quotients, fused multiply-adds, roots, remainders, rounding to an integral value (to nearest
+/// even three times in four), negations, absolute values, round trips through another format,
+/// and choices on comparisons and tests; not `fp.min` and `fp.max` (open on zeros) or
+/// conversions to integers (open out of range).
+fn float_dag_script(seed: u64, f: FpFormat, nodes: usize) -> String {
+    let mut rng = Rng(seed);
+    let (eb, sb) = (f.eb(), f.sb());
+    let sort = format!("(_ FloatingPoint {eb} {sb})");
+    let mut out = String::from("(set-logic QF_FP)\n");
+    let mut pool: Vec<String> = Vec::new();
+    for i in 0..6 {
+        out.push_str(&format!("(declare-const a{i} {sort})\n"));
+        pool.push(format!("a{i}"));
+    }
+    for c in ["1.5", "0.1", "3.0"] {
+        pool.push(format!("((_ to_fp {eb} {sb}) RNE {c})"));
+    }
+    let other = if f == FpFormat::F64 {
+        (8, 24)
+    } else {
+        (11, 53)
+    };
+    let modes = ["RNE", "RNA", "RTP", "RTN", "RTZ"];
+    for k in 0..nodes {
+        let n = pool.len() as u64;
+        let operand = |rng: &mut Rng| {
+            if rng.below(4) == 0 {
+                pool[rng.below(n) as usize].clone()
+            } else {
+                pool[(n - 1 - rng.below(n.min(8))) as usize].clone()
+            }
+        };
+        let (a, b, c, d) = (
+            operand(&mut rng),
+            operand(&mut rng),
+            operand(&mut rng),
+            operand(&mut rng),
+        );
+        let rm = if rng.below(4) == 0 {
+            rng.pick(&modes)
+        } else {
+            "RNE"
+        };
+        let t = match rng.below(16) {
+            0..=2 => format!("(fp.add {rm} {a} {b})"),
+            3 => format!("(fp.sub {rm} {a} {b})"),
+            4 | 5 => format!("(fp.mul {rm} {a} {b})"),
+            6 => format!("(fp.div {rm} {a} {b})"),
+            7 => format!("(fp.fma {rm} {a} {b} {c})"),
+            8 => format!("(fp.sqrt {rm} {a})"),
+            9 => format!("(fp.roundToIntegral {rm} {a})"),
+            10 => format!("(fp.rem {a} {b})"),
+            11 => format!("(fp.neg {a})"),
+            12 => format!("(fp.abs {a})"),
+            13 => {
+                let test = rng.pick(&["fp.isNaN", "fp.isInfinite", "fp.isZero", "fp.isNegative"]);
+                format!("(ite ({test} {a}) {b} {c})")
+            }
+            14 => format!(
+                "((_ to_fp {eb} {sb}) {rm} ((_ to_fp {} {}) RNE {a}))",
+                other.0, other.1
+            ),
+            _ => {
+                let cmp = rng.pick(&["fp.lt", "fp.leq", "fp.eq", "fp.gt", "fp.geq"]);
+                format!("(ite ({cmp} {a} {b}) {c} {d})")
+            }
+        };
+        out.push_str(&format!("(define-fun n{k} () {sort} {t})\n"));
+        pool.push(format!("n{k}"));
+    }
+    let last: Vec<String> = pool.iter().rev().take(8).cloned().collect();
+    let sum = last
+        .iter()
+        .skip(1)
+        .fold(last[0].clone(), |acc, x| format!("(fp.add RNE {acc} {x})"));
+    out.push_str(&format!("(define-fun root0 () {sort} {sum})\n"));
+    out
+}
+
 // ----- the report --------------------------------------------------------------------------------
 
 const TOOLS: [&str; 3] = ["bitwright", "z3", "Bitwuzla"];
@@ -882,7 +966,9 @@ fn fact_script(f: &Fact, w: u32, compound: bool) -> Result<(String, Truth), Stri
 /// A float identity's text with `$eb`, `$sb` and the real constants `<r>` filled in.
 fn instantiate_float(text: &str, format: FpFormat) -> Result<String, String> {
     let (eb, sb) = (format.eb(), format.sb());
-    let text = text.replace("$eb", &eb.to_string()).replace("$sb", &sb.to_string());
+    let text = text
+        .replace("$eb", &eb.to_string())
+        .replace("$sb", &sb.to_string());
     let mut out = String::new();
     let mut rest = text.as_str();
     while let Some(i) = rest.find('<') {
@@ -909,7 +995,10 @@ fn float_script(f: &Fact, format: FpFormat, compound: bool) -> Result<(String, T
     let sort = match f.sort.as_deref() {
         None => float.clone(),
         Some("bool") => "(_ BitVec 1)".to_string(),
-        Some(n) => format!("(_ BitVec {})", n.parse::<u32>().map_err(|e| e.to_string())?),
+        Some(n) => format!(
+            "(_ BitVec {})",
+            n.parse::<u32>().map_err(|e| e.to_string())?
+        ),
     };
     let (mut lhs, mut rhs) = (
         instantiate_float(&f.lhs, format)?,
@@ -1158,16 +1247,20 @@ fn main() {
         run_facts(&engine, proofs.as_deref(), only.as_deref());
         return;
     }
+    // (name, bits, nodes, heavy, float format): a float corpus's `bits` is its format's width.
     let corpora = [
-        ("40 nodes, 8 bits", 8u16, 40usize, false),
-        ("40 nodes, 64 bits", 64, 40, false),
+        ("40 nodes, 8 bits", 8u16, 40usize, false, None),
+        ("40 nodes, 64 bits", 64, 40, false, None),
         (
             "40 nodes with division and variable shifts, 64 bits",
             64,
             40,
             true,
+            None,
         ),
-        ("400 nodes, 64 bits", 64, 400, false),
+        ("400 nodes, 64 bits", 64, 400, false, None),
+        ("40 floats, binary32", 32, 40, false, Some(FpFormat::F32)),
+        ("40 floats, binary64", 64, 40, false, Some(FpFormat::F64)),
     ];
     if proofs.is_none() {
         println!(
@@ -1175,19 +1268,26 @@ fn main() {
         );
         println!("|-|-|-|-|-|-|-|-|-|-|");
     }
-    for (name, bits, nodes, heavy) in corpora {
+    for (name, bits, nodes, heavy, float) in corpora {
         let w = Width::new(bits).expect("width");
         let mut before = 0u64;
         let mut results: Vec<[Outcome; 3]> = Vec::new();
         let mut sizes_before: Vec<u32> = Vec::new();
         for i in 0..cases {
             let seed = 0x5eed + i;
-            let script = script(seed, w, nodes, heavy).expect("the corpus exports");
+            let script = match float {
+                Some(f) => float_dag_script(seed, f, nodes),
+                None => script(seed, w, nodes, heavy).expect("the corpus exports"),
+            };
             let mut m = Measured::read(&script, "root0").expect("the input reads back");
             let n = m.size(m.input);
             before += u64::from(n);
             sizes_before.push(n);
-            let case = format!("{bits}-{nodes}{}-{seed:x}", if heavy { "h" } else { "" });
+            let case = format!(
+                "{}{bits}-{nodes}{}-{seed:x}",
+                if float.is_some() { "f" } else { "" },
+                if heavy { "h" } else { "" }
+            );
             if let Some(dir) = &proofs {
                 let (mut m, _) = bitwright(&engine, &script).expect("bitwright answers");
                 let text = obligation(&script, &mut m).expect("the answer exports");

@@ -113,7 +113,14 @@ or 64 bits), built only from operators SMT-LIB's QF_BV has natively: arithmetic,
 operations, shifts, comparisons under `ite`, truncations extended back, and in one corpus
 division, remainder and shifts by variable amounts. So no tool reads a lowered form of an
 operator another tool has as one node (bitwright exports rotations, population counts or
-byte swaps as several SMT-LIB operations).
+byte swaps as several SMT-LIB operations). Two more corpora are floating point, in binary32 and
+binary64: random DAGs of 40 operations over 6 float atoms and a few constants, written in
+SMT-LIB's FloatingPoint theory (not as bitwright's encodings), with only what SMT-LIB
+specifies (sums, differences, products, quotients, fused multiply-adds, roots, remainders,
+rounding to an integral value, negations, absolute values, round trips through another format,
+choices on comparisons and tests; not `fp.min`, `fp.max` or conversions to integers, which it
+leaves open on some inputs); their answers are compared as SMT-LIB values (every NaN one
+value).
 
 Every tool starts from the same SMT-LIB script, bitwright's export of the DAG, and is timed from
 that text to its answer, parsing included, in a context made before the clock starts; a case's
