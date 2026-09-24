@@ -183,3 +183,242 @@ group core.shift {
     #[example("rotr(rotl(p, q), q)" => "p")]
     rule rotr_rotl<W>(x: W, y: W) { rotr(rotl(x, y), y) => x }
 }
+
+// Valeria corpus gaps measured against 0.4.1's standard strategy. These are
+// mathematical bit-vector identities; ISA-masked shifts remain a host concern.
+group core.recovery_arith {
+    // universal r0037/r0054-r0057/r0287-r0290.
+    #[example("(p | q) - (p & q)" => "p ^ q")]
+    rule xor_from_or_minus_and<W>(x: W, y: W) { (x | y) - (x & y) => x ^ y }
+    #[example("(p + q) - ((p & q) << 1)" => "p ^ q")]
+    rule xor_from_sum_double_and<W>(x: W, y: W) { (x + y) - ((x & y) << 1) => x ^ y }
+    #[example("(p + q) - (p & q)" => "p | q")]
+    rule or_from_sum_minus_and<W>(x: W, y: W) { (x + y) - (x & y) => x | y }
+    #[example("(p + q) - (p | q)" => "p & q")]
+    rule and_from_sum_minus_or<W>(x: W, y: W) { (x + y) - (x | y) => x & y }
+    #[example("(p | q) - (p ^ q)" => "p & q")]
+    rule and_from_or_minus_xor<W>(x: W, y: W) { (x | y) - (x ^ y) => x & y }
+    #[example("((p | q) << 1) - (p + q)" => "p ^ q")]
+    rule xor_from_double_or_sum<W>(x: W, y: W) { ((x | y) << 1) - (x + y) => x ^ y }
+    #[example("((p | q) << 1) - (p ^ q)" => "p + q")]
+    rule sum_from_double_or_xor<W>(x: W, y: W) { ((x | y) << 1) - (x ^ y) => x + y }
+    // join r0108-r0109/r0111; universal r0041/r0045-r0046.
+    #[example("p * q + p * r" => "p * (q + r)")]
+    rule factor_mul_add<W>(x: W, y: W, z: W) { (x * y) + (x * z) => x * (y + z) }
+    #[example("p * q - p * r" => "p * (q - r)")]
+    rule factor_mul_sub<W>(x: W, y: W, z: W) { (x * y) - (x * z) => x * (y - z) }
+    #[example("p * 127 + p" => "p * 128")]
+    rule collect_mul_add<W>(x: W, c: const W) { (x * c) + x => x * k let k: W = c + 1 }
+    #[example("(p << 7) + p" => "p * 129")]
+    rule collect_shift_add<W>(x: W, c: const W) { (x << c) + x => x * k let k: W = (1 << c) + 1 }
+    #[example("~p + 2" => "1 - p")]
+    rule not_plus_constant<W>(x: W, c: const W) { ~x + c => k - x let k: W = c - 1 }
+    #[example("-p - p" => "p * 254")]
+    rule negative_double<W>(x: W) { -x - x => x * k let k: W = ones - 1 }
+}
+
+group core.recovery_bitwise {
+    // universal r0070-r0071/r0147: DAG sharing can hide these from the pass cost gate.
+    #[example("(p & q) ^ p" => "p & ~q")]
+    rule xor_and_self<W>(x: W, y: W) { (x & y) ^ x => x & ~y }
+    #[example("(p | q) ^ p" => "~p & q")]
+    rule xor_or_self<W>(x: W, y: W) { (x | y) ^ x => ~x & y }
+    #[example("(p ^ q) & p" => "p & ~q")]
+    rule and_xor_self<W>(x: W, y: W) { (x ^ y) & x => x & ~y }
+}
+
+group core.recovery_compare {
+    // universal r0137-r0144; boolean-simplifiers r0000-r0005/r0016-r0017.
+    #[example("p == ~p" => "0:1")]
+    rule eq_complement<W>(x: W) { x == ~x => false }
+    #[example("p != ~p" => "1:1")]
+    rule ne_complement<W>(x: W) { x != ~x => true }
+    #[example("(p + q) <u q" => "~p <u q")]
+    rule ult_add_carry<W>(x: W, y: W) { (x + y) <u y => ~x <u y }
+    #[example("(p + q) <=u q" => "-p <=u q")]
+    rule ule_add_carry<W>(x: W, y: W) { (x + y) <=u y => -x <=u y }
+    #[example("q <u (p + q)" => "q <u -p")]
+    rule ugt_add_no_carry<W>(x: W, y: W) { y <u (x + y) => y <u -x }
+    #[example("q <=u (p + q)" => "q <=u ~p")]
+    rule uge_add_no_carry<W>(x: W, y: W) { y <=u (x + y) => y <=u ~x }
+    #[example("(p - q) <=u ~q" => "q <=u p")]
+    rule ule_sub_no_borrow<W>(x: W, y: W) { (x - y) <=u ~y => y <=u x }
+    #[example("~q <u (p - q)" => "p <u q")]
+    rule ugt_sub_borrow<W>(x: W, y: W) { ~y <u (x - y) => x <u y }
+    // universal r0185.
+    #[example("(p - q) != 0" => "p != q")]
+    rule ne_sub_zero<W>(x: W, y: W) { (x - y) != 0 => x != y }
+}
+
+group core.recovery_shift {
+    // join r0058-r0061; total shifts also cover c >= W.
+    #[example("(p << 1) >>u 1" => "p & 127")]
+    rule shl_lshr<W>(x: W, c: const W) { (x << c) >>u c => x & m let m: W = ones >>u c }
+    // universal r0086-r0091. Saturate before adding to avoid count overflow.
+    #[example("(p >>s 7) >>s 7" => "p >>s 7")]
+    rule ashr_ashr<W>(x: W, a: const W, b: const W) {
+        (x >>s a) >>s b => x >>s k
+        let k: W = umin(umin(a, W - 1) + umin(b, W - 1), W - 1)
+    }
+    // join r0043/r0057: discard constant bits shifted entirely out of the result.
+    #[example("(p ^ 128) << 7" => "p << 7")]
+    rule shl_xor_dead_constant<W>(x: W, c: const W, k: const W) {
+        (x ^ c) << k => x << k if (c << k) == 0
+    }
+    #[example("(p ^ 1) >>u 1" => "p >>u 1")]
+    rule lshr_xor_dead_constant<W>(x: W, c: const W, k: const W) {
+        (x ^ c) >>u k => x >>u k if (c >>u k) == 0
+    }
+    // universal r0181 and r0258-r0273 (width-preserving Boolean result).
+    #[example("-(p >>u 7)" => "p >>s 7")]
+    rule negate_sign_bit<W>(x: W) { -(x >>u (W - 1)) => x >>s (W - 1) }
+    #[example("(p | -p) >>u 7" => "zext<8>(p != 0)")]
+    rule nonzero_from_sign_union<W>(x: W) where 1 < W {
+        (x | -x) >>u (W - 1) => zext<W>(x != 0)
+    }
+}
+
+group core.recovery_bmi2 {
+    // universal r0172-r0174/r0274-r0281.
+    #[example("pdep(pext(p, q), q)" => "p & q")]
+    rule pdep_pext<W>(x: W, m: W) { pdep(pext(x, m), m) => x & m }
+    #[example("pext(pdep(p, 0x55), 0x55)" => "p & 15")]
+    rule pext_pdep<W>(x: W, m: const W) {
+        pext(pdep(x, m), m) => x & k let k: W = ones >>u (W - popcnt(m))
+    }
+    #[example("pdep(255, p)" => "p")]
+    rule pdep_ones<W>(m: W) { pdep(ones, m) => m }
+    #[example("pext(~p, p)" => "0:8")]
+    rule pext_complement_mask<W>(m: W) { pext(~m, m) => 0 }
+    #[example("pdep(p, q) & ~q" => "0:8")]
+    rule pdep_outside_mask<W>(x: W, m: W) { pdep(x, m) & ~m => 0 }
+    #[example("pdep(p, q) & q" => "pdep(p, q)")]
+    rule pdep_inside_mask<W>(x: W, m: W) { pdep(x, m) & m => pdep(x, m) }
+    #[example("pdep(pext(p, r) & pext(q, r), r)" => "(p & q) & r")]
+    rule pdep_pext_and<W>(x: W, y: W, m: W) { pdep(pext(x, m) & pext(y, m), m) => (x & y) & m }
+    #[example("pdep(pext(p, r) | pext(q, r), r)" => "(p | q) & r")]
+    rule pdep_pext_or<W>(x: W, y: W, m: W) { pdep(pext(x, m) | pext(y, m), m) => (x | y) & m }
+    #[example("pdep(pext(p, r) ^ pext(q, r), r)" => "(p ^ q) & r")]
+    rule pdep_pext_xor<W>(x: W, y: W, m: W) { pdep(pext(x, m) ^ pext(y, m), m) => (x ^ y) & m }
+}
+
+group core.recovery_cast {
+    // universal r0195-r0203. Only low bits are observed; high carries are irrelevant.
+    #[example("trunc<4>(p) + trunc<4>(q)" => "trunc<4>(p + q)")]
+    rule add_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) + trunc<N>(y) => trunc<N>(x + y)
+    }
+    #[example("trunc<4>(p) - trunc<4>(q)" => "trunc<4>(p - q)")]
+    rule sub_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) - trunc<N>(y) => trunc<N>(x - y)
+    }
+    #[example("trunc<4>(p) * trunc<4>(q)" => "trunc<4>(p * q)")]
+    rule mul_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) * trunc<N>(y) => trunc<N>(x * y)
+    }
+}
+
+group core.recovery_select {
+    // universal r0191 and display/pack r0003-r0010.
+    #[example("select(0 <u p, p, 0)" => "p")]
+    rule select_nonzero_self<W>(x: W) { select(0 <u x, x, 0) => x }
+    #[example("select(p == 0, q, 0) | select(p == 0, 0, r)" => "select(p == 0, q, r)")]
+    rule merge_complementary_select_or<W>(c: 1, x: W, y: W) {
+        select(c, x, 0) | select(c, 0, y) => select(c, x, y)
+    }
+    #[example("select(p == 0, q, 0) + select(p == 0, 0, r)" => "select(p == 0, q, r)")]
+    rule merge_complementary_select_add<W>(c: 1, x: W, y: W) {
+        select(c, x, 0) + select(c, 0, y) => select(c, x, y)
+    }
+}
+
+group core.recovery_canonical {
+    // Forms exposed by constructor/normal-form rewrites of the measured ports.
+    #[example("255 - p" => "~p")]
+    rule ones_minus<W>(x: W) { ones - x => ~x }
+    #[example("-p + 255" => "~p")]
+    rule negative_plus_ones<W>(x: W) { -x + ones => ~x }
+    #[example("~(p + 1)" => "254 - p")]
+    rule not_add_constant<W>(x: W, c: const W) { ~(x + c) => k - x let k: W = ~c }
+    #[example("-(p * 127)" => "p * 129")]
+    rule neg_mul_constant<W>(x: W, c: const W) { -(x * c) => x * k let k: W = -c }
+    #[example("(p ^ 128) + 128" => "p")]
+    rule xor_sign_bit_add<W>(x: W) { (x ^ bit(W - 1)) + bit(W - 1) => x }
+    #[example("p + 255 <=u 254" => "1 <=u p")]
+    rule ule_constant_borrow<W>(x: W, c: const W, m: const W) {
+        (x + c) <=u m => k <=u x if m == c - 1 let k: W = -c
+    }
+    #[example("254 <u p + 255" => "p <u 1")]
+    rule ugt_constant_borrow<W>(x: W, c: const W, m: const W) {
+        m <u (x + c) => x <u k if m == c - 1 let k: W = -c
+    }
+    #[example("pdep(pext(p, 1) ^ 1, 1)" => "(p ^ 1) & 1")]
+    rule pdep_pext_xor_constant<W>(x: W, c: const W, m: const W) {
+        pdep(pext(x, m) ^ c, m) => (x ^ k) & m let k: W = pdep(c, m)
+    }
+}
+
+group core.recovery_minmax {
+    #[example("select(p <=s q, p, 0) | select(q <s p, q, 0)" => "smin(p, q)")]
+    rule smin_select_or<W>(x: W, y: W) { select(x <=s y, x, 0) | select(y <s x, y, 0) => smin(x, y) }
+    #[example("select(p <=s q, p, 0) + select(q <s p, q, 0)" => "smin(p, q)")]
+    rule smin_select_add<W>(x: W, y: W) { select(x <=s y, x, 0) + select(y <s x, y, 0) => smin(x, y) }
+    #[example("select(q <=s p, p, 0) | select(p <s q, q, 0)" => "smax(p, q)")]
+    rule smax_select_or<W>(x: W, y: W) { select(y <=s x, x, 0) | select(x <s y, y, 0) => smax(x, y) }
+    #[example("select(q <=s p, p, 0) + select(p <s q, q, 0)" => "smax(p, q)")]
+    rule smax_select_add<W>(x: W, y: W) { select(y <=s x, x, 0) + select(x <s y, y, 0) => smax(x, y) }
+    #[example("select(p <=u q, p, 0) | select(q <u p, q, 0)" => "umin(p, q)")]
+    rule umin_select_or<W>(x: W, y: W) { select(x <=u y, x, 0) | select(y <u x, y, 0) => umin(x, y) }
+    #[example("select(p <=u q, p, 0) + select(q <u p, q, 0)" => "umin(p, q)")]
+    rule umin_select_add<W>(x: W, y: W) { select(x <=u y, x, 0) + select(y <u x, y, 0) => umin(x, y) }
+    #[example("select(q <=u p, p, 0) | select(p <u q, q, 0)" => "umax(p, q)")]
+    rule umax_select_or<W>(x: W, y: W) { select(y <=u x, x, 0) | select(x <u y, y, 0) => umax(x, y) }
+    #[example("select(q <=u p, p, 0) + select(p <u q, q, 0)" => "umax(p, q)")]
+    rule umax_select_add<W>(x: W, y: W) { select(y <=u x, x, 0) + select(x <u y, y, 0) => umax(x, y) }
+    // select(c, ones, 0) canonicalizes to sext(c) before its parent is visited.
+    #[example("sext<8>(p <u 255) | select(255 <=u p, p, 0)" => "255:8")]
+    rule umax_ones_sext_or<W>(x: W) where 1 < W {
+        sext<W>(x <u ones) | select(ones <=u x, x, 0) => ones
+    }
+    #[example("sext<8>(p <u 255) + select(255 <=u p, p, 0)" => "255:8")]
+    rule umax_ones_sext_add<W>(x: W) where 1 < W {
+        sext<W>(x <u ones) + select(ones <=u x, x, 0) => ones
+    }
+}
+
+group core.recovery_select_one {
+    #[example("zext<8>(1 <s p) | select(p <=s 1, p, 0)" => "smin(p, 1)")]
+    rule smin_one_or<W>(x: W) where 1 < W { zext<W>(1 <s x) | select(x <=s 1, x, 0) => smin(x, 1) }
+    #[example("zext<8>(1 <s p) + select(p <=s 1, p, 0)" => "smin(p, 1)")]
+    rule smin_one_add<W>(x: W) where 1 < W { zext<W>(1 <s x) + select(x <=s 1, x, 0) => smin(x, 1) }
+    #[example("zext<8>(p <s 1) | select(1 <=s p, p, 0)" => "smax(p, 1)")]
+    rule smax_one_or<W>(x: W) where 1 < W { zext<W>(x <s 1) | select(1 <=s x, x, 0) => smax(x, 1) }
+    #[example("zext<8>(p <s 1) + select(1 <=s p, p, 0)" => "smax(p, 1)")]
+    rule smax_one_add<W>(x: W) where 1 < W { zext<W>(x <s 1) + select(1 <=s x, x, 0) => smax(x, 1) }
+    #[example("zext<8>(1 <u p) | select(p <=u 1, p, 0)" => "umin(p, 1)")]
+    rule umin_one_or<W>(x: W) where 1 < W { zext<W>(1 <u x) | select(x <=u 1, x, 0) => umin(x, 1) }
+    #[example("zext<8>(1 <u p) + select(p <=u 1, p, 0)" => "umin(p, 1)")]
+    rule umin_one_add<W>(x: W) where 1 < W { zext<W>(1 <u x) + select(x <=u 1, x, 0) => umin(x, 1) }
+    #[example("zext<8>(p == 0) | select(1 <=u p, p, 0)" => "umax(p, 1)")]
+    rule umax_one_or<W>(x: W) where 1 < W { zext<W>(x == 0) | select(1 <=u x, x, 0) => umax(x, 1) }
+    #[example("zext<8>(p == 0) + select(1 <=u p, p, 0)" => "umax(p, 1)")]
+    rule umax_one_add<W>(x: W) where 1 < W { zext<W>(x == 0) + select(1 <=u x, x, 0) => umax(x, 1) }
+}
+
+group core.recovery_shuffle {
+    #[example("concat(trunc<1>(p), 0:7)" => "p << 7")]
+    rule concat_low_zero<N, U>(x: N + U, z: const U) where N + U <= 512 {
+        concat(trunc<N>(x), z) => x << U if z == 0
+    }
+}
+
+group core.recovery_select_ones {
+    #[example("sext<8>(255 <s p) | select(p <=s 255, p, 0)" => "smin(p, 255)")]
+    rule smin_ones_or<W>(x: W) where 1 < W { sext<W>(ones <s x) | select(x <=s ones, x, 0) => smin(x, ones) }
+    #[example("sext<8>(255 <s p) + select(p <=s 255, p, 0)" => "smin(p, 255)")]
+    rule smin_ones_add<W>(x: W) where 1 < W { sext<W>(ones <s x) + select(x <=s ones, x, 0) => smin(x, ones) }
+    #[example("sext<8>(p <s 255) | select(255 <=s p, p, 0)" => "smax(p, 255)")]
+    rule smax_ones_or<W>(x: W) where 1 < W { sext<W>(x <s ones) | select(ones <=s x, x, 0) => smax(x, ones) }
+    #[example("sext<8>(p <s 255) + select(255 <=s p, p, 0)" => "smax(p, 255)")]
+    rule smax_ones_add<W>(x: W) where 1 < W { sext<W>(x <s ones) + select(ones <=s x, x, 0) => smax(x, ones) }
+}
