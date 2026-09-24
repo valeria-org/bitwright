@@ -48,6 +48,10 @@ fn main() -> Result<(), bitwright::Error> {
   by zero included, checked against an independent bit-serial reference evaluator.
 - **A hash-consed expression arena** with canonicalization at construction, owned by a context.
   There is no global state, and the same input gives the same output on every run.
+- **Floating point**: IEEE 754 in any format (binary16 to binary256, bfloat16, x87's 80 bits,
+  and any other), under all five rounding modes, exact and total (the canonical NaN, saturating
+  conversions), in software: evaluation, expressions, facts and SMT-LIB, checked against an
+  independent implementation on every input of every format up to 8 bits.
 - **Bit-level facts**: known bits, an unsigned strided interval (the values `lo`, `lo + stride`,
   …, `hi`) and a signed range, each tightening the others, tri-state proofs, and
   constraints you assume (a path condition, an invariant), with the ones each result relies on

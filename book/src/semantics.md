@@ -23,8 +23,9 @@ Every operator is defined for every input, exactly as SMT-LIB QF_BV defines it:
 | `rotl(x, c)`, `rotr(x, c)` | rotation by `c mod W` (any W) |
 | `clz(0)`, `ctz(0)` | `W` |
 
-Because there is no undefined behavior, equal handles always mean equal values, and every rule
-is a closed statement a solver can check. A host that needs fault semantics (a division that
+Floating-point operations are total too, each result pinned where IEEE 754 leaves it open (see
+[Floating point](floating-point.md)). Because there is no undefined behavior, equal handles always
+mean equal values, and every rule is a closed statement a solver can check. A host that needs fault semantics (a division that
 traps) builds the trap condition as its own expression; see `bitwright::traps`.
 
 ```rust

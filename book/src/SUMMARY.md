@@ -4,6 +4,7 @@
 
 - [Getting started](getting-started.md)
 - [Semantics](semantics.md)
+- [Floating point](floating-point.md)
 - [Facts and proofs](facts.md)
 - [Constraints](constraints.md)
 - [Extension operations](extensions.md)

@@ -160,8 +160,12 @@ full W-bit unsigned count.
 | `Concat` | H, L → H + L ≤ 512 | hi · 2^L + lo | `concat` |
 | `Select` | 1, W, W → W | c ? a : b | `ite` |
 | `Ext(op, k)` | per registry | output k of a registered total extension operation | user body or uninterpreted |
+| `FAdd`, `FMul`, `FDiv`, `FFma`, `FSqrt`, `FRem`, `FRound`, `FMin`, `FMax` | F,F(,F) → F | IEEE 754 in format F, the rounding mode in the node (§3.5) | FloatingPoint theory |
+| `FEq`, `FLt`, `FLe` | F,F → 1 | IEEE comparisons (false with a NaN) | `fp.eq`, `fp.lt`, `fp.leq` |
+| `FConvert`, `FFromS`, `FFromU`, `FToS`, `FToU` | F → G, N → F, F → N | conversions (to integers saturating, NaN → 0) | `to_fp`, `fp.to_sbv`, … |
 
-That is under 50 kinds; the opcode is a `u8`.
+That is 80 kinds, the floating-point ones last (so every earlier kind keeps its rank, and so
+its hash and canonical order); the opcode is a `u8`.
 
 **Derived constructors** build existing kinds and are not node kinds: `ugt uge sgt sge` (operand
 swap), `trunc<N>` (= `extract<0,N>`), `umin umax smin smax` (compare + select), `andn orn xnor`,
@@ -246,6 +250,30 @@ The guard is an ordinary expression: the host keeps its effect anchor while
 srem}` cover `y == 0` and, for signed forms, `x == smin & y == −1`; `traps::{shift, rotate}` cover a
 count `>=u W`, for hosts where an out-of-range count faults or is undefined. On a path that does not
 fault, the host assumes the guard false (§5, constraints).
+
+### 3.5 Floating point
+
+A float is a bit-vector holding an IEEE 754 interchange encoding of a format `(eb, sb)`
+(`2 ≤ eb ≤ 31`, `sb ≥ 2` counting the hidden bit, `eb + sb ≤ 512`); x87's 80-bit encoding
+converts to `(15, 64)` by load and store compositions. The semantics are total and portable
+(the book's chapter "Floating point" is the contract): correctly rounded results in the node's
+static rounding mode (RNE, RNA, RTP, RTN, RTZ; a dynamic mode is a select over the five), the
+canonical quiet NaN for every NaN result, `min`/`max` as IEEE 754-2019 minimumNumber and
+maximumNumber (`−0 < +0`), conversions to integers saturating with NaN → 0, and `neg`, `abs`,
+`copysign` as sign-bit operations. A node keeps its rounding mode and its format's `eb` in `aux`
+(`rm << 5 | eb`), a conversion between formats the target's `eb` in `b`; `sb` follows from the
+operand's width. The sign and class operations, `sub`, `>` and `≥`, and x87's load and store are
+built from bit-vector kinds.
+
+The arithmetic is software (`fp::soft`), exact by construction: operands decode to `m · 2^e`
+with `m` normalized to `p` bits, each operation computes its exact result or a truncation with a
+sticky bit jammed at least two places below the rounding position, and one rounding function
+encodes it. It runs in `u64`, `u128`, a 320-bit or a 1,280-bit integer, the smallest that holds
+the operation's intermediates (sums, comparisons and conversions of formats up to 64 bits in
+`u64`). It never uses the host's floating-point unit, whose flush-to-zero and rounding state a
+host may change. Validation (§12): an independent exact-rational implementation
+(`bitwright-ref::fp`) exhaustively on every format up to 8 bits, the host's binary32 and binary64,
+and z3 and Bitwuzla on exported terms.
 
 ---
 

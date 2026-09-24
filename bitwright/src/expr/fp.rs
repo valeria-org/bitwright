@@ -337,9 +337,9 @@ impl Context {
     ///
     /// let mut cx = Context::new();
     /// let x = cx.symbol("x", Width::W64)?;
-    /// let two = cx.constant(&BitVec::from_f64(2.0))?;
-    /// let e = cx.fp(FpOp::Mul(RoundingMode::Rne), FpFormat::F64, &[x, two])?;
-    /// assert_eq!(cx.display(e).to_string(), "fp.mul.rne.f64(x, 0x4000000000000000)");
+    /// let three = cx.constant(&BitVec::from_f64(3.0))?;
+    /// let e = cx.fp(FpOp::Mul(RoundingMode::Rne), FpFormat::F64, &[x, three])?;
+    /// assert_eq!(cx.display(e).to_string(), "fp.mul.rne.f64(x, 0x4008000000000000)");
     /// # Ok::<(), bitwright::Error>(())
     /// ```
     pub fn fp(&mut self, op: FpOp, format: FpFormat, args: &[Expr]) -> Result<Expr, Error> {

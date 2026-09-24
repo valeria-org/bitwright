@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- **Floating point.** IEEE 754 binary floating point on bit-vectors holding interchange
+  encodings, in any format `(eb, sb)` (`FpFormat`: binary16, bfloat16, binary32, binary64,
+  binary128, binary256, and any `2 ≤ eb ≤ 31`, `eb + sb ≤ 512`) and x87's 80-bit encoding
+  (`x87_load`, `x87_store`), under the five rounding modes (`RoundingMode`). Total, portable
+  semantics: correctly rounded results, the canonical quiet NaN for every NaN result, `min` and
+  `max` as IEEE 754-2019 minimumNumber and maximumNumber (`−0 < +0`), conversions to integers
+  saturating with NaN → 0, and sign-bit `neg`, `abs`, `copysign`. Exact software arithmetic,
+  never the host's floating-point unit. `FpFormat` evaluates every operation on `BitVec`s;
+  `Context::fp` (`FpOp`: add, mul, div, fma, sqrt, rem, round to integral, min, max, the
+  comparisons, conversions between formats and to and from integers of any width) and
+  `fp_sub`, `fp_neg`, `fp_abs`, `fp_copysign`, `fp_cmp`, `fp_test`, `x87_load`, `x87_store`
+  build expressions (`View::Fp`), with exact identities at construction; the text syntax spells
+  them `fp.add.rne.f32(a, b)` (every name starting with `fp.` is reserved). Facts bound
+  floating-point results (a NaN possibility and an interval per sign), so the simplifier decides
+  questions such as `fp.isnan` of an integer converted to a float. SMT-LIB export uses the
+  FloatingPoint theory (`QF_BVFP`), and import reads it. The book's new chapter "Floating
+  point" is the specification. Checked against an independent exact-rational implementation
+  (exhaustively on every format of up to 8 bits), the host's binary32 and binary64, Bitwuzla and
+  z3.
+- **Facts.** Flipping or clearing the top bit (`x ^ smin`, `x & smax`) keeps the ranges exactly:
+  the unsigned and signed ranges trade places, or the negative half moves down.
+
 ## 0.8.0
 
 - **C, C++ and Python.** bitwright can be used from other languages. `bitwright-ffi` builds a C

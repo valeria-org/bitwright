@@ -110,6 +110,8 @@ mod book {
     struct GettingStarted;
     #[doc = include_str!("../../book/src/semantics.md")]
     struct Semantics;
+    #[doc = include_str!("../../book/src/floating-point.md")]
+    struct FloatingPoint;
     #[doc = include_str!("../../book/src/facts.md")]
     struct Facts;
     #[doc = include_str!("../../book/src/constraints.md")]
