@@ -1,0 +1,30 @@
+[package]
+name = "bitwright-ffi"
+description = "The C API of bitwright (include/bitwright.h), and a C++ wrapper over it (include/bitwright.hpp)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+# `libbitwright.so` / `libbitwright.a` (`bitwright.dll` / `bitwright.lib` on Windows), linked
+# with `-lbitwright`. No rlib: it would collide with the `bitwright` crate's.
+name = "bitwright"
+crate-type = ["cdylib", "staticlib"]
+# Documented by the headers; rustdoc would write over the `bitwright` crate's pages.
+doc = false
+
+[dependencies]
+bw = { package = "bitwright", path = "../bitwright", features = ["check", "smtlib", "mba"] }
+
+# The workspace forbids `unsafe`; a C API cannot avoid it, so this crate keeps it to pointer
+# reads and writes at the boundary.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

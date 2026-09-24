@@ -34,6 +34,30 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # The Python bindings, their own workspace (the C and C++ ones test in `cargo test --workspace`).
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bitwright-py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10" # the oldest the abi3 wheel supports
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+        env:
+          PYO3_BUILD_EXTENSION_MODULE: "1"
+      - run: pip install . pytest mypy
+      - run: pytest tests
+      # The type stubs match the module, and the tests type-check against them.
+      - run: python -m mypy.stubtest bitwright._bitwright
+      - run: python -m mypy --check-untyped-defs tests
+
   msrv:
     runs-on: ubuntu-latest
     steps:

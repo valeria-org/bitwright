@@ -137,7 +137,7 @@ in it is compiled and run as a test. It reads fine on GitHub too:
 | Reasoning | [Facts and proofs](book/src/facts.md) · [Constraints](book/src/constraints.md) · [Extension operations](book/src/extensions.md) |
 | Simplifying | [Simplifying](book/src/simplifying.md) · [Deobfuscation and MBA](book/src/deobfuscation.md) · [Invertibility](book/src/invertibility.md) |
 | Rules | [Writing rules](book/src/rules.md) · [Checking rules](book/src/checking.md) · [Rule catalog](book/src/catalog.md) |
-| Services | [Equality saturation](book/src/eqsat.md) · [SMT-LIB](book/src/smtlib.md) · [The command line](book/src/cli.md) |
+| Services | [Equality saturation](book/src/eqsat.md) · [SMT-LIB](book/src/smtlib.md) · [The command line](book/src/cli.md) · [C, C++ and Python](book/src/bindings.md) |
 | Contracts | [Stability](book/src/stability.md) |
 
 - **[API reference](https://docs.rs/bitwright)** on docs.rs, for the latest release.
@@ -163,6 +163,24 @@ bitwright simplify '(x & y) * (x | y) + (x & ~y) * (~x & y)'   # x * y (nonlinea
 bitwright simplify 'x * k == y * k' --assume '(k & 1) == 1'   # x == y, relying on the assumption
 ```
 
+## C, C++ and Python
+
+The same engine, from other languages: a C API (`bitwright-ffi`: a shared and a static
+library, and [`bitwright.h`](bitwright-ffi/include/bitwright.h)), a header-only C++17 wrapper
+over it ([`bitwright.hpp`](bitwright-ffi/include/bitwright.hpp)), and a Python package
+(`bitwright-py`, built with maturin). They build, parse, inspect, evaluate and simplify
+expressions, with facts, proofs, assumptions, budgets, rules of your own and SMT-LIB; the
+[chapter on them](book/src/bindings.md) is the guide.
+
+```python
+import bitwright as bw                   # pip install ./bitwright-py
+
+cx = bw.Context()
+x, y = cx.symbols("x y", 64)
+print(((x & y) + (x | y)).simplify())    # x + y
+print(bw.simplify("(x & y) * (x | y) + (x & ~y) * (~x & y)"))   # x * y
+```
+
 ## Stability
 
 bitwright is 0.x. A minor release may change the API and simplification results, and lists
@@ -177,6 +195,7 @@ cargo test --workspace                                                  # every 
 cargo test --workspace --release -- --ignored --skip write_corpus_ledger    # the long suites (z3 and bitwuzla on PATH for the SMT proofs)
 mdbook serve book                                                       # the book at http://localhost:3000
 cargo run --release -p bitwright-bench                                  # benchmarks, in instructions retired
+pip install ./bitwright-py pytest && pytest bitwright-py/tests          # the Python bindings
 ```
 
 Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`),

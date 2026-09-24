@@ -15,6 +15,7 @@
 - [Equality saturation](eqsat.md)
 - [SMT-LIB](smtlib.md)
 - [The command line](cli.md)
+- [C, C++ and Python](bindings.md)
 - [Stability](stability.md)
 
 ---

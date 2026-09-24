@@ -22,3 +22,7 @@ target
 
 # mdBook output
 book/book
+
+# Python bindings: bytecode and type-checker caches
+__pycache__/
+.mypy_cache/

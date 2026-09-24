@@ -1,0 +1,28 @@
+[package]
+name = "bitwright-py"
+description = "Python bindings for bitwright (the `bitwright` Python package)."
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.88"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/valeria-org/bitwright"
+publish = false
+
+# Its own workspace: PyO3 needs a Python interpreter to build, which the main workspace's builds
+# and tests should not. maturin builds it (see pyproject.toml).
+[workspace]
+members = ["."]
+
+[lib]
+name = "_bitwright"
+crate-type = ["cdylib"]
+
+[dependencies]
+bitwright = { path = "../bitwright", features = ["check", "smtlib", "mba"] }
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+
+[lints.rust]
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

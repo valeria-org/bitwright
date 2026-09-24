@@ -46,6 +46,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitwright-ffi"
+version = "0.7.0"
+dependencies = [
+ "bitwright",
+]
+
+[[package]]
 name = "bitwright-ref"
 version = "0.7.0"
 

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **C, C++ and Python.** bitwright can be used from other languages. `bitwright-ffi` builds a C
+  library (`libbitwright`, shared and static) declared by `include/bitwright.h`, and
+  `include/bitwright.hpp` wraps it for C++17 (objects own their C counterparts, errors are
+  exceptions, expressions have operators). `bitwright-py` is the `bitwright` Python package
+  (PyO3, one abi3 wheel for CPython 3.10 and later, typed). They build, parse, print, inspect,
+  evaluate and substitute expressions of 1 to 512 bits; answer facts and proofs, invertibility
+  included, under assumptions; and simplify with the standard or the deobfuscation engine (the
+  command line's `simplify`), with budgets and with rule files linked through their proof
+  ledgers; and export and import SMT-LIB. The book's new chapter "C, C++ and Python" is the
+  guide, and its examples run as tests. `Expr::to_bits` and `Expr::from_bits` give a handle as
+  one integer, for hosts that keep handles outside Rust; a context rejects bits it did not
+  create, as it rejects any foreign handle.
 - **README.** The Performance section compares bitwright with other tools, each on what it is
   built for: with the simplifiers of z3 5.1.0 and Bitwuzla 0.9.1 on random bit-vector DAGs
   (bitwright's answer is the smallest for 799 of 800; Bitwuzla is faster), and with CoBRA on
