@@ -619,18 +619,65 @@ impl Points {
                 }
             }
             Cert::SingleBit | Cert::Sparse => {
+                // A column at a time, a run at a time: while the patterns of all positions but
+                // the last stay, variable j is their bits plus the last position's bit where
+                // the last pattern (counting up) holds j.
+                let full = if self.t >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << self.t) - 1
+                };
                 while n < BLOCK && !self.done {
+                    let k = self.k;
+                    if k == 0 {
+                        // The point with no bit set.
+                        for &v in used {
+                            cols[v][n] = L::default();
+                        }
+                        n += 1;
+                        self.advance_positions();
+                        continue;
+                    }
+                    let p0 = self.pats[k - 1];
+                    let run = usize::try_from(full - p0 + 1)
+                        .unwrap_or(usize::MAX)
+                        .min(BLOCK - n);
+                    let last = self.combo[k - 1];
                     for (j, &v) in used.iter().enumerate() {
-                        let mut x = L::default();
-                        for (s, &pos) in self.combo.iter().enumerate() {
+                        let mut outer = L::default();
+                        for s in 0..k - 1 {
                             if self.pats[s] >> j & 1 == 1 {
-                                x = L::or(x, L::pow2(pos, masks[v]));
+                                outer = L::or(outer, L::pow2(self.combo[s], masks[v]));
                             }
                         }
-                        cols[v][n] = x;
+                        let with = L::or(outer, L::pow2(last, masks[v]));
+                        for (i, c) in cols[v][n..n + run].iter_mut().enumerate() {
+                            *c = if (p0 + i as u64) >> j & 1 == 1 {
+                                with
+                            } else {
+                                outer
+                            };
+                        }
                     }
-                    self.advance_sparse();
-                    n += 1;
+                    n += run;
+                    if p0 + (run as u64 - 1) < full {
+                        self.pats[k - 1] = p0 + run as u64;
+                    } else {
+                        // The last pattern wrapped: carry into the others, then the positions.
+                        self.pats[k - 1] = 1;
+                        let mut carry = true;
+                        for s in (0..k - 1).rev() {
+                            if self.pats[s] < full {
+                                self.pats[s] += 1;
+                                carry = false;
+                                break;
+                            }
+                            self.pats[s] = 1;
+                        }
+                        if carry {
+                            self.advance_positions();
+                        }
+                    }
                 }
             }
             // No points: never planned.
@@ -639,19 +686,9 @@ impl Points {
         n
     }
 
-    fn advance_sparse(&mut self) {
-        let top = if self.t >= 64 {
-            u64::MAX
-        } else {
-            1u64 << self.t
-        };
-        for s in (0..self.k).rev() {
-            self.pats[s] += 1;
-            if self.pats[s] < top {
-                return;
-            }
-            self.pats[s] = 1;
-        }
+    /// With every pattern back at its first: the next set of positions of the same size, or
+    /// one more position.
+    fn advance_positions(&mut self) {
         // The next set of positions of the same size.
         let (k, w) = (self.k, self.width);
         for s in (0..k).rev() {
@@ -3491,4 +3528,117 @@ pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
     };
     r.work = meter.spent;
     r
+}
+
+#[cfg(test)]
+mod point_tests {
+    use super::*;
+
+    /// The sparse points in their order, written out directly: for each number of positions
+    /// `k` up to `d`, each set of `k` bit positions in increasing lexicographic order, each
+    /// assignment of nonzero patterns (subsets of the `t` variables) to them, the last position
+    /// fastest; variable `j` has the bits of the positions whose pattern holds it.
+    fn reference(w: u16, t: usize, d: u32) -> Vec<Vec<u64>> {
+        let mut out = vec![vec![0u64; t]];
+        for k in 1..=(d as usize).min(usize::from(w)) {
+            let mut combo: Vec<u16> = (0..k as u16).collect();
+            loop {
+                let mut pats = vec![1u64; k];
+                loop {
+                    out.push(
+                        (0..t)
+                            .map(|j| {
+                                combo
+                                    .iter()
+                                    .zip(&pats)
+                                    .filter(|&(_, &p)| p >> j & 1 == 1)
+                                    .fold(0u64, |x, (&pos, _)| x | 1 << pos)
+                            })
+                            .collect(),
+                    );
+                    let mut s = k;
+                    loop {
+                        if s == 0 {
+                            break;
+                        }
+                        s -= 1;
+                        pats[s] += 1;
+                        if pats[s] < 1 << t {
+                            break;
+                        }
+                        pats[s] = 1;
+                        if s == 0 {
+                            s = usize::MAX;
+                            break;
+                        }
+                    }
+                    if s == usize::MAX {
+                        break;
+                    }
+                }
+                // The next combination.
+                let mut s = k;
+                let mut moved = false;
+                while s > 0 {
+                    s -= 1;
+                    if usize::from(combo[s]) < usize::from(w) - k + s {
+                        combo[s] += 1;
+                        for u in s + 1..k {
+                            combo[u] = combo[u - 1] + 1;
+                        }
+                        moved = true;
+                        break;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sparse_points_are_the_ones_written_out() {
+        for (w, t, d) in [
+            (4u16, 1usize, 1u32),
+            (4, 2, 2),
+            (5, 3, 2),
+            (8, 2, 3),
+            (6, 4, 2),
+            (3, 2, 5),
+            (7, 1, 3),
+            // Runs of the last pattern longer than a block (2^9 - 1 = 511 > 256).
+            (3, 9, 1),
+            (2, 9, 2),
+        ] {
+            let plan = Plan {
+                cert: if d <= 1 {
+                    Cert::SingleBit
+                } else {
+                    Cert::Sparse
+                },
+                points: sparse_points(w, t, d),
+                used: (0..t).collect(),
+                radix: Vec::new(),
+                degree: d,
+            };
+            let width = Width::new(w).unwrap();
+            let vars = vec![width; t];
+            let masks: Vec<u64> = vars.iter().map(|&v| <u64 as Lane>::mask(v)).collect();
+            let mut cols: Vec<Vec<u64>> = vec![Vec::new(); t];
+            let mut points = Points::new(&plan, w);
+            let mut got: Vec<Vec<u64>> = Vec::new();
+            loop {
+                let n = points.fill(&mut cols, &plan.used, &vars, &masks);
+                if n == 0 {
+                    break;
+                }
+                got.extend((0..n).map(|p| cols.iter().map(|c| c[p]).collect::<Vec<u64>>()));
+            }
+            let want = reference(w, t, d);
+            assert_eq!(got.len() as u64, plan.points, "w {w} t {t} d {d}");
+            assert_eq!(got, want, "w {w} t {t} d {d}");
+        }
+    }
 }
