@@ -92,8 +92,9 @@ impl Context {
     /// `fma(x, 1, y) = x + y`; `fma(x, y, −0) = x · y` except toward −∞ (where `+0 + −0` is
     /// `−0`); `x · 2 = x + x`; `(−a) · (−b) = a · b` and likewise for `/`; negation reverses
     /// the order (`−a < −b` is `b < a`, `−a = −b` is `a = b`); `x < x` is false; rounding to
-    /// an integral value twice is rounding once; a signed conversion of a zero or sign extension
-    /// converts the operand itself.
+    /// an integral value a rounded value or a converted integer changes nothing; a signed
+    /// conversion of a zero or sign extension converts the operand itself; and an integer that
+    /// converts exactly converts back to itself, extended.
     fn fp_identity(&mut self, d: Desc, k: &[u32]) -> Result<Option<u32>, Error> {
         let f = d.format;
         if !matches!(
@@ -107,6 +108,8 @@ impl Context {
                 | FpOp::RoundToIntegral(_)
                 | FpOp::FromSInt(_)
                 | FpOp::FromUInt(_)
+                | FpOp::ToSInt(..)
+                | FpOp::ToUInt(..)
         ) {
             return Ok(None);
         }
@@ -141,13 +144,25 @@ impl Context {
                     _ => None,
                 }
             }
-            // Only in one format: binary16 and bfloat16 are both 16 bits.
+            // Already integral: a rounded value; or a converted integer (exact, or rounded to a
+            // float of at least 2^(p−1), which is an integer), when an overflow's ±Ω is an
+            // integer too (`emax ≥ p − 1`: not so in tiny formats, where −4 toward +∞ in (2, 3)
+            // is −3.5). In one format only: binary16 and bfloat16 are both 16 bits.
             FpOp::RoundToIntegral(_)
-                if self.node(k[0]).op == super::OpCode::FRound
-                    && self.fp_desc(k[0]).is_some_and(|inner| inner.format == f) =>
+                if self.fp_desc(k[0]).is_some_and(|inner| inner.format == f)
+                    && match self.node(k[0]).op {
+                        super::OpCode::FRound => true,
+                        // emax + 1 = 2^(eb−1) ≥ p.
+                        super::OpCode::FFromS | super::OpCode::FFromU => {
+                            1u32 << (f.eb() - 1) >= f.sb()
+                        }
+                        _ => false,
+                    } =>
             {
                 Some(k[0])
             }
+            // An integer that converts exactly converts back to itself, extended.
+            FpOp::ToSInt(_, w) | FpOp::ToUInt(_, w) => self.int_round_trip(d, f, k[0], w)?,
             FpOp::FromSInt(rm) | FpOp::FromUInt(rm) => {
                 let n = self.node(k[0]);
                 match (d.op, n.op) {
@@ -159,6 +174,56 @@ impl Context {
             _ => None,
         };
         Ok(r)
+    }
+
+    /// `to_int(from_int(i))` when every value of `i` converts exactly and fits the result:
+    /// `i` extended. Exact means at most `p` significant bits and within the format's range: `m`
+    /// bits unsigned, `m − 1` signed (whose `−2^(m−1)` is a power of two).
+    fn int_round_trip(
+        &mut self,
+        d: Desc,
+        f: FpFormat,
+        a: u32,
+        w: Width,
+    ) -> Result<Option<u32>, Error> {
+        let n = self.node(a);
+        let signed_out = matches!(d.op, FpOp::ToSInt(..));
+        let (signed_in, i) = match n.op {
+            super::OpCode::FFromS => (true, n.a),
+            super::OpCode::FFromU => (false, n.a),
+            _ => return Ok(None),
+        };
+        if self.fp_desc(a).is_none_or(|inner| inner.format != f) {
+            return Ok(None);
+        }
+        let m = u32::from(self.wid(i));
+        let emax = (1u32 << (f.eb() - 1)) - 1;
+        let exact = if signed_in {
+            m - 1 <= f.sb() && m - 1 <= emax
+        } else {
+            m <= f.sb() && m <= emax + 1
+        };
+        let out = u32::from(w.bits());
+        // The result's range must hold every value: signed into signed needs n ≥ m, unsigned
+        // into unsigned n ≥ m, unsigned into signed n > m; a negative value into unsigned
+        // saturates, so not that.
+        let fits = match (signed_in, signed_out) {
+            (true, true) | (false, false) => out >= m,
+            (false, true) => out > m,
+            (true, false) => false,
+        };
+        if !exact || !fits {
+            return Ok(None);
+        }
+        if out == m {
+            return Ok(Some(i));
+        }
+        let e = if signed_in {
+            self.c_sext(i, w.bits())?
+        } else {
+            self.c_zext(i, w.bits())?
+        };
+        Ok(Some(e))
     }
 
     fn c_fneg(&mut self, f: FpFormat, a: u32) -> Result<u32, Error> {

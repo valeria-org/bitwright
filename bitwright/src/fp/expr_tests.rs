@@ -598,6 +598,32 @@ fn construction_identities_are_exact() {
                     Box::new(move |a| f.from_sint(rm, &a[3].sext(Width::new(5).unwrap()).unwrap())),
                 ),
             ];
+            let mut cases = cases;
+            let (fs, fu) = (
+                cx.fp(FpOp::FromSInt(rm), f, &[i]).unwrap(),
+                cx.fp(FpOp::FromUInt(rm), f, &[i]).unwrap(),
+            );
+            let w4 = Width::new(4).unwrap();
+            cases.push((
+                cx.fp(FpOp::RoundToIntegral(rm), f, &[fs]).unwrap(),
+                Box::new(move |a| f.round_to_integral(rm, &f.from_sint(rm, &a[3])).unwrap()),
+            ));
+            cases.push((
+                cx.fp(FpOp::ToSInt(RoundingMode::Rtz, w4), f, &[fs])
+                    .unwrap(),
+                Box::new(move |a| {
+                    f.to_sint(RoundingMode::Rtz, &f.from_sint(rm, &a[3]), w4)
+                        .unwrap()
+                }),
+            ));
+            cases.push((
+                cx.fp(FpOp::ToUInt(rm, w4), f, &[fu]).unwrap(),
+                Box::new(move |a| f.to_uint(rm, &f.from_uint(rm, &a[3]), w4).unwrap()),
+            ));
+            cases.push((
+                cx.fp(FpOp::ToSInt(rm, w4), f, &[fu]).unwrap(),
+                Box::new(move |a| f.to_sint(rm, &f.from_uint(rm, &a[3]), w4).unwrap()),
+            ));
             for xv in 0..n {
                 for yv in 0..n {
                     let vals = [
@@ -663,4 +689,34 @@ fn construction_identities_fire() {
             .to_string()
             .starts_with("fp.round.rne.bf16(fp.round")
     );
+    // Integers: already integral, and back exactly when the format holds them.
+    for (src, want) in [
+        (
+            "fp.round.rtp.f32(fp.from_sbv.rne.f32(i:32))",
+            "fp.from_sbv.rne.f32(i)",
+        ),
+        (
+            "fp.to_sbv.rtz.f64<32>(fp.from_sbv.rne.f64(j:16))",
+            "sext<32>(j)",
+        ),
+        ("fp.to_sbv.rtz.f64<16>(fp.from_sbv.rne.f64(j))", "j"),
+        ("fp.to_ubv.rne.f32<24>(fp.from_ubv.rne.f32(k:24))", "k"),
+        (
+            "fp.to_sbv.rne.f32<25>(fp.from_ubv.rne.f32(k))",
+            "zext<25>(k)",
+        ),
+    ] {
+        let e = cx.parse(src, &o).unwrap();
+        assert_eq!(cx.display(e).to_string(), want, "{src}");
+    }
+    // Not when the integer may not convert exactly (25 bits in binary32), or may not fit.
+    for src in [
+        "fp.to_ubv.rne.f32<32>(fp.from_ubv.rne.f32(u:25))",
+        "fp.to_sbv.rtz.f64<8>(fp.from_sbv.rne.f64(j:16))",
+        "fp.to_ubv.rtz.f64<32>(fp.from_sbv.rne.f64(j:16))",
+        "fp.to_sbv.rtz.f64<16>(fp.from_ubv.rne.f64(q:16))",
+    ] {
+        let e = cx.parse(src, &o).unwrap();
+        assert!(cx.display(e).to_string().starts_with("fp.to_"), "{src}");
+    }
 }
