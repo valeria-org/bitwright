@@ -14,6 +14,11 @@
   `x · −1` is `−x`, adding a zero to a nonzero number or `−0` to anything (to nearest even)
   changes nothing, and `x == x`, `x <= x`, `min(x, x)`, `max(x, x)` fold. The rule catalog
   lists them. The rule constant `fp.max` is `fp.max_finite`, as `fp.max` is the operation.
+- **Performance.** The MBA service's sparse certificates (the complete tests of nonlinear
+  MBA) generate their points a column and a run at a time instead of one point at a time: the
+  same points in the same order, with half the instructions for nonlinear MBA at 64 bits
+  (`simplify/mba-nonlinear/64` −52 %, the normal-form solver's nonlinear corpus of
+  `--corpus-diff` −48 %).
 - **Behavior changes.** Floating-point results change where the new rules apply.
 
 ## 0.9.0
