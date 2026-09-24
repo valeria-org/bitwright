@@ -32,7 +32,6 @@ changes a result, and the same input gives the same output on every run.
 | `check` | yes | the rule soundness checker, evidence and proof ledgers |
 | `smtlib` | no | SMT-LIB export and import, rule obligations for any SMT solver |
 | `mba` | no | the MBA service: lowering, solver and prover traits, the evidence gate |
-| `cobra` | no | `mba` plus a backend over the `cobra-mba` crate |
 | `eqsat` | no | a bounded equality-saturation search for alternative expressions |
 
 ## This book

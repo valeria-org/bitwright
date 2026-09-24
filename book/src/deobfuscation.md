@@ -174,9 +174,9 @@ assert_eq!(cx.display(out.expr).to_string(), "(x & 255) * 3");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-With feature `cobra`, `CobraSolver` asks the `cobra-mba` crate, which proves its answers with
-Lean certificates by default. `ThreadedSolver` wraps any solver with a hard wall-clock deadline
-per question (a late answer is abandoned and never cached). Trusting backend certificates means
-trusting the backend: a host that needs independent evidence turns `backend_certificates` off.
-Answers are then accepted only on bitwright's own certificates, which cover the fragments above,
-or on the proof of an `EquivalenceProver` the host supplies for the rest.
+A host can plug in a solver of its own through `MbaSolver`. `ThreadedSolver` wraps any solver
+with a hard wall-clock deadline per question (a late answer is abandoned and never cached).
+Trusting backend certificates means trusting the backend: a host that needs independent evidence
+turns `backend_certificates` off. Answers are then accepted only on bitwright's own
+certificates, which cover the fragments above, or on the proof of an `EquivalenceProver` the
+host supplies for the rest.

@@ -27,8 +27,6 @@
 
 mod batch;
 pub(crate) mod certify;
-#[cfg(feature = "cobra")]
-mod cobra;
 mod expr;
 mod lower;
 mod nf;
@@ -37,8 +35,6 @@ mod threaded;
 
 pub use crate::engine::CertStats;
 pub use certify::NativeProver;
-#[cfg(feature = "cobra")]
-pub use cobra::{CobraOptions, CobraSolver};
 pub use nf::{NfOptions, NfStats, NormalFormSolver};
 pub use threaded::ThreadedSolver;
 

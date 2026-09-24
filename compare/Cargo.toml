@@ -6,13 +6,14 @@ edition = "2024"
 publish = false
 license = "PolyForm-Noncommercial-1.0.0"
 
-# Its own workspace: it enables the `cobra` feature, which the main workspace's builds and
-# tests should not pick up through feature unification, and it is run by hand, not in CI.
+# Its own workspace: it depends on other engines (egg, CoBRA's Rust port, and with
+# `native-smt` z3 and Bitwuzla) that the main workspace should not build, and it is run by
+# hand, not in CI.
 [workspace]
 members = ["."]
 
 [dependencies]
-bitwright = { path = "../bitwright", features = ["mba", "cobra", "smtlib", "eqsat"] }
+bitwright = { path = "../bitwright", features = ["mba", "smtlib", "eqsat"] }
 cobra = { package = "cobra-mba", version = "0.4" }
 egg = "0.11"
 

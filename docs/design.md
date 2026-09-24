@@ -73,7 +73,7 @@ bitwright/                       workspace; edition 2024; rust-version 1.88; Pol
 │  ├─ src/check/                 soundness checker, evidence, ledger (feature "check")
 │  ├─ src/engine/                Engine, Strategy/Phase, Run/Outcome, budgets, dispatch net, memo, stats
 │  ├─ src/passes/                linear, xor, bitwise, compares, casts, demanded, linear_mba, shuffle, fact_fold
-│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits, certificates, batched evaluator, nf/ (normal-form solver) (feature "mba"); cobra.rs ("cobra")
+│  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits, certificates, batched evaluator, nf/ (normal-form solver) (feature "mba")
 │  └─ src/eqsat/                 e-graph, admission, schedule, extraction (feature "eqsat")
 ├─ bitwright-ref/                independent bit-serial reference evaluator (publish = false)
 ├─ bitwright-cli/                `bitwright check | lint | smt | catalog | explain | simplify` (published after 0.1)
@@ -96,14 +96,13 @@ Features other than `check` arrive with their milestones.
 | `check` | yes | `bitwright::check`: the rule soundness checker, evidence and ledgers |
 | `smtlib` | no | SMT-LIB export of expressions and rule obligations; import of a QF_BV subset |
 | `mba` | no | `MbaExpr`, lowering/lifting, the evidence gate and its certificates, solver/prover/cache traits, `SignatureSolver`, `NormalFormSolver`, `NativeProver`, `MemoryCache`, `Phase::Mba` |
-| `cobra` | no | `mba` plus `CobraSolver` (the `cobra-mba` 0.4 backend) |
 | `eqsat` | no | `bitwright::eqsat`: the bounded equality-saturation search service and its built-in equations |
 | `deobf` | no | GF(2) linear-map normal form (mixer inversion is in the core: §8.1) |
 | `serde` | no | serialization of configs, stats, values, facts |
 
 **Dependencies.** One required dependency: `hashbrown` (no default features) for `HashTable<u32>`
 interning without duplicated keys. Hashing uses an in-crate, specified, versioned 64-bit mixer, so
-there is no hasher dependency. Optional: `cobra-mba ~0.4` (Apache-2.0), `serde`. Dev-only: `criterion`
+there is no hasher dependency. Optional: `serde`. Dev-only: `criterion`
 (benches), `libfuzzer-sys`/`arbitrary` (fuzz). Random numbers in tests come from in-crate SplitMix64
 with explicit seeds. The library has **no `build.rs`** and embeds no binary artifacts; the built-in rule
 corpus is embedded `.bwr` source compiled at run time, with a checked-in proof ledger and a
@@ -1039,7 +1038,7 @@ it, and gets sampled verification.
 
 ---
 
-## 9. MBA (feature `mba`; cobra backend under `cobra`)
+## 9. MBA (feature `mba`)
 
 ```rust
 pub mod mba {
@@ -1440,8 +1439,8 @@ pub mod mba {
     (`bitwright-bench --corpus-diff`): much smaller results on MBA, at a time cost that is
     largest on code that is not obfuscated.
 - **Caching.** Keys hash the lowered input, the solver and prover ids, the trust setting, and the
-  lowering version. A solver's id must record everything that changes its answers (`CobraSolver`'s
-  records its options and `max_vars`). Only results accepted by the gate under the key's trust
+  lowering version. A solver's id must record everything that changes its answers. Only results
+  accepted by the gate under the key's trust
   setting and complete `NoSimpler` answers are stored, so an answer accepted on the backend's word
   or on sampling is never reused where that evidence is not accepted; `Exhausted` is never stored and
   leaves the node non-final (a later call with more budget asks again). bitwright performs no file
@@ -1450,21 +1449,13 @@ pub mod mba {
   `Stats::mba` counts calls, cache hits, simplifications, no-simpler, unsupported, exhausted,
   refuted, proof-unknown and not-smaller answers, and refusals (too many variables, too large, too
   wide, too small).
-- **cobra 0.4** (feature `cobra`, Apache-2.0). `CobraSolver` takes expressions of one width of at
-  most 64 bits and at most `max_vars` variables (no casts), lowers `Sub` to `a + (−b)` and
-  `Shl(k)` to `· 2^k`, calls `cobra::simplify_expr`, maps the result back with
-  `outcome_expr_in_original_space`, and reports cobra's proof level as the `Claim`
-  (`LeanCertified` → `Certified`, `SmtProved` → `Proved`, `SpotChecked` → `Sampled`). cobra's
-  "unchanged" answer is a cached `NoSimpler` (cobra is deterministic for given options, which the
-  id records); a panic inside cobra is caught and answered as unsupported. With cobra's default of requiring a Lean certificate, measured here: linear MBA is
-  simplified and certified; a degree-2 identity comes back unchanged. cobra 0.4 exposes no
-  caller-visible budget, so `ThreadedSolver<S>` (for any solver) runs each question on its own
-  thread with a hard wait deadline: a late answer is abandoned as `Exhausted` (never cached, the
-  node stays non-final), and new questions are refused while `max_abandoned` abandoned ones are
-  still running (checked before each question starts, so concurrent callers may briefly exceed it).
-  A panic in the wrapped solver is answered as unsupported and never counts as abandoned. The
-  threads are the instance's own; nothing is global. The planned upstream
-  change is to expose cobra's orchestrator policy in its `Options`.
+- **Deadlines.** `ThreadedSolver<S>` (for any solver, and for a backend without a caller-visible
+  budget in particular) runs each question on its own thread with a hard wait deadline: a late
+  answer is abandoned as `Exhausted` (never cached, the node stays non-final), and new questions
+  are refused while `max_abandoned` abandoned ones are still running (checked before each
+  question starts, so concurrent callers may briefly exceed it). A panic in the wrapped solver is
+  answered as unsupported and never counts as abandoned. The threads are the instance's own;
+  nothing is global.
 
 ---
 

@@ -3,9 +3,9 @@
 Compares bitwright with other symbolic engines on public mixed Boolean-arithmetic (MBA)
 datasets: how much of each expression they simplify, how fast, and with how much memory; and,
 with [`versus-smt`](#versus-smt-the-smt-solvers-simplifiers), with the simplifiers of z3 and
-Bitwuzla on random bit-vector expressions and on identities of bit-vector algebra. It is not
-part of the main workspace (it enables the `cobra` feature, which the workspace's own builds
-should not pick up) and not run in CI.
+Bitwuzla on random bit-vector expressions and on identities of bit-vector algebra. It is its
+own Cargo workspace (the other engines are its dependencies, not the main workspace's) and not
+run in CI.
 
 | Tool | What runs |
 |-|-|
@@ -13,7 +13,6 @@ should not pick up) and not run in CI.
 | `bw-deobf` | bitwright, `Strategy::deobfuscate()` (linear MBA and shuffle passes) |
 | `bw-mba` | bitwright, deobfuscate with the MBA service and the native `SignatureSolver` |
 | `bw-nf` | bitwright, deobfuscate with the MBA service, the native `NormalFormSolver` and bitwright's own evidence only |
-| `bw-cobra` | bitwright, deobfuscate with the MBA service and the `CobraSolver` backend |
 | `bw-eqsat` | bitwright's equality saturation, every built-in equation group (`eqsat.bwr`) |
 | `egg-bw` | [egg](https://github.com/egraphs-good/egg) 0.11 with the same equations, plus commutativity (bitwright's e-graph sorts operands; egg needs rules) |
 | `egg-mba` | egg with those, the usual MBA identities and constant folding |

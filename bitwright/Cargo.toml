@@ -14,12 +14,11 @@ keywords = ["bitvector", "smt", "simplification", "deobfuscation", "symbolic"]
 categories = ["mathematics", "compilers", "algorithms"]
 
 [package.metadata.docs.rs]
-# Document the optional services (MBA, cobra backend, equality saturation, SMT-LIB) too.
+# Document the optional services (MBA, equality saturation, SMT-LIB) too.
 all-features = true
 
 [dependencies]
 hashbrown = { version = "0.17", default-features = false }
-cobra = { package = "cobra-mba", version = "0.4", optional = true }
 
 [features]
 default = ["check"]
@@ -31,8 +30,6 @@ mba = []
 eqsat = []
 ## SMT-LIB 2.6 export of expressions and rule obligations, and import of a QF_BV subset.
 smtlib = []
-## The cobra 0.4 backend for the MBA service (`bitwright::mba::CobraSolver`).
-cobra = ["mba", "dep:cobra"]
 
 [dev-dependencies]
 bitwright-ref = { path = "../bitwright-ref" }

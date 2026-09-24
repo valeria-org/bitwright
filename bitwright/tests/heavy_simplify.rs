@@ -83,18 +83,6 @@ fn engines() -> Vec<(&'static str, Engine)> {
     v
 }
 
-#[cfg(feature = "cobra")]
-fn cobra_engine() -> Engine {
-    use bitwright::mba::{CobraSolver, MbaConfig};
-    use std::sync::Arc;
-    Engine::builder()
-        .builtin()
-        .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
-        .mba_solver(Arc::new(CobraSolver::default()))
-        .build()
-        .unwrap()
-}
-
 // ----- equivalence by the reference -------------------------------------------------------------
 
 /// Environments for the symbols under `roots`: every assignment when there are at most
@@ -538,34 +526,6 @@ fn mba_inputs_simplify_soundly_smoke() {
 #[ignore = "heavy: run with --release -- --ignored"]
 fn mba_inputs_simplify_soundly_heavy() {
     mba_inputs(Size::Heavy);
-}
-
-/// The cobra backend (feature `cobra`) on MBA-shaped inputs.
-#[cfg(feature = "cobra")]
-fn cobra(size: Size) {
-    let engines = vec![("cobra", cobra_engine())];
-    for seed in 0..size.pick(4, 300) {
-        let seed = 0xc0b_0000 + seed;
-        let mut rng = Rng(seed);
-        let mut cx = Context::new();
-        let width = w(rng.pick(&[4, 8, 32, 64]));
-        let e = mba_input(&mut cx, &mut rng, width, 2);
-        let envs = envs(&mut cx, &[e], &mut rng, 12, 32);
-        check_engines(&mut cx, &engines, e, &envs, &format!("seed {seed:#x}"));
-    }
-}
-
-#[cfg(feature = "cobra")]
-#[test]
-fn cobra_results_are_sound_smoke() {
-    cobra(Size::Smoke);
-}
-
-#[cfg(feature = "cobra")]
-#[test]
-#[ignore = "heavy: run with --release -- --ignored"]
-fn cobra_results_are_sound_heavy() {
-    cobra(Size::Heavy);
 }
 
 // ----- tiny budgets ------------------------------------------------------------------------------

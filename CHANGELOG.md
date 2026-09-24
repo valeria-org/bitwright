@@ -14,6 +14,12 @@
   guide, and its examples run as tests. `Expr::to_bits` and `Expr::from_bits` give a handle as
   one integer, for hosts that keep handles outside Rust; a context rejects bits it did not
   create, as it rejects any foreign handle.
+- **Removed.** The `cobra` feature and its backend over the `cobra-mba` crate (`CobraSolver`,
+  `CobraOptions`). bitwright's own `NormalFormSolver` answers, on its own evidence, every
+  expression of CoBRA's datasets that CoBRA does. A host that wants another backend implements
+  `MbaSolver` (and can bound it with `ThreadedSolver`). A public feature and types go, so the
+  next release is minor. `compare/` loses its `bw-cobra` tool; `cobra-cpp` (the C++ tool) and
+  the `cobra` and `cobra-cert` tools (CoBRA's Rust port, called directly) remain for comparison.
 - **README.** The Performance section compares bitwright with other tools, each on what it is
   built for: with the simplifiers of z3 5.1.0 and Bitwuzla 0.9.1 on random bit-vector DAGs
   (bitwright's answer is the smallest for 799 of 800; Bitwuzla is faster), and with CoBRA on

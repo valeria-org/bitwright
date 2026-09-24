@@ -157,7 +157,6 @@ features:
 | `check` | yes | the rule soundness checker, evidence and proof ledgers |
 | `smtlib` | no | SMT-LIB export and import, rule obligations for any SMT solver |
 | `mba` | no | the MBA service: lowering, the native normal-form solver, solver and prover traits, the evidence gate and its certificates |
-| `cobra` | no | `mba` plus a backend over the `cobra-mba` crate |
 | `eqsat` | no | a bounded equality-saturation search for alternative expressions |
 
 ## Documentation

@@ -22,9 +22,9 @@
 //!   whether an expression is an invertible function of one of its subexpressions.
 //! - [`ext`]: host-defined extension operations (multi-output, total), registered in a
 //!   [`Registry`](ext::Registry) and built with [`Context::ext`].
-//! - `mba` (feature `mba`): the MBA service with an evidence gate, and `cobra` for the
-//!   `cobra-mba` backend; `eqsat` (feature `eqsat`): a bounded equality-saturation search;
-//!   `smtlib` (feature `smtlib`): SMT-LIB export, import and rule obligations.
+//! - `mba` (feature `mba`): the MBA service with an evidence gate and bitwright's own solvers;
+//!   `eqsat` (feature `eqsat`): a bounded equality-saturation search; `smtlib` (feature
+//!   `smtlib`): SMT-LIB export, import and rule obligations.
 //!
 //! ```
 //! use bitwright::{BinOp, BitVec, Width};

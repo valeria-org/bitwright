@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use bitwright::engine::{Engine, Run, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
-use bitwright::mba::{CobraSolver, MbaConfig, MbaTrust, NormalFormSolver, SignatureSolver};
+use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{BitVec, Bounded, Context, Expr, ParseOptions, SymbolKey, Width};
 
 /// Every dataset is 64-bit.
@@ -50,7 +50,6 @@ enum Tool {
     Deobfuscate,
     Mba,
     Nf,
-    BwCobra,
     BwEqsat,
     EggBw,
     EggMba,
@@ -67,12 +66,11 @@ enum Tool {
 }
 
 impl Tool {
-    const ALL: [Tool; 18] = [
+    const ALL: [Tool; 17] = [
         Tool::Standard,
         Tool::Deobfuscate,
         Tool::Mba,
         Tool::Nf,
-        Tool::BwCobra,
         Tool::BwEqsat,
         Tool::EggBw,
         Tool::EggMba,
@@ -94,7 +92,6 @@ impl Tool {
             Tool::Deobfuscate => "bw-deobf",
             Tool::Mba => "bw-mba",
             Tool::Nf => "bw-nf",
-            Tool::BwCobra => "bw-cobra",
             Tool::BwEqsat => "bw-eqsat",
             Tool::EggBw => "egg-bw",
             Tool::EggMba => "egg-mba",
@@ -124,7 +121,6 @@ impl Tool {
                 "bitwright, deobfuscate with the MBA service, the native NormalFormSolver and \
                  bitwright's own evidence only"
             }
-            Tool::BwCobra => "bitwright, deobfuscate with the MBA service and the CoBRA backend",
             Tool::BwEqsat => "bitwright's equality saturation, every built-in equation group",
             Tool::EggBw => "egg with bitwright's equations plus commutativity, default limits",
             Tool::EggMba => "egg with those, MBA identities and constant folding, default limits",
@@ -374,7 +370,6 @@ fn engine(tool: Tool) -> Result<Engine, String> {
             )
             .mba_solver(Arc::new(NormalFormSolver::default()))
             .build(),
-        Tool::BwCobra => mba(Arc::new(CobraSolver::default())),
         _ => unreachable!("not a bitwright tool"),
     };
     e.map_err(|e| e.to_string())
@@ -904,10 +899,7 @@ fn main() -> ExitCode {
     });
     let mut engines: HashMap<Tool, Engine> = HashMap::new();
     for &t in &tools {
-        if matches!(
-            t,
-            Tool::Standard | Tool::Deobfuscate | Tool::Mba | Tool::Nf | Tool::BwCobra
-        ) {
+        if matches!(t, Tool::Standard | Tool::Deobfuscate | Tool::Mba | Tool::Nf) {
             match engine(t) {
                 Ok(e) => {
                     engines.insert(t, e);

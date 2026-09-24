@@ -120,10 +120,9 @@ that rarely simplify.
   the number of questions. A host that runs the MBA service over large amounts of code that is
   not obfuscated, and cares about time more than size, keeps the signature solver or lowers
   the budget.
-- **Hosts using `CobraSolver`.** With trust off, cobra's answers are accepted only when
-  bitwright's certificates prove them. The others are refused and counted as unproved. This is
-  not measured here: this work keeps other simplifiers out of its evaluation. Hosts that accept
-  cobra's own certificates set `backend_certificates` back to true.
+- **Hosts with a backend of their own.** With trust off, a backend's answers are accepted only
+  when bitwright's certificates prove them. The others are refused and counted as unproved.
+  Hosts that accept their backend's certificates set `backend_certificates` back to true.
 - **Sampled answers.** A synthesized form that no certificate can decide (three atoms at
   degree 2 and 512 bits, say) is returned only as `Claim::Sampled`, after the refutation
   sample; it is the solver's only answer that is not exact by construction. With trust off
@@ -144,8 +143,8 @@ that rarely simplify.
 ## Alternatives
 
 - **Trust off alone.** No result changes on these corpora and no time cost; accepted answers
-  no longer depend on any backend's word. The cost falls on hosts using `CobraSolver`, as
-  above.
+  no longer depend on any backend's word. The cost falls on hosts with a backend of their own,
+  as above.
 - **The solver alone, trust on.** The normal-form solver claims `Proved` only when one of the
   gate's own certificates ran, so trusting its claim adds little: at most answers it proved
   within its own budget that the gate could not fit in the remaining pass work. Trust stays a
