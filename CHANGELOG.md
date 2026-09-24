@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 - **C, C++ and Python.** bitwright can be used from other languages. `bitwright-ffi` builds a C
   library (`libbitwright`, shared and static) declared by `include/bitwright.h`, and
@@ -38,8 +38,8 @@
 - **Removed.** The `cobra` feature and its backend over the `cobra-mba` crate (`CobraSolver`,
   `CobraOptions`). bitwright's own `NormalFormSolver` answers, on its own evidence, every
   expression of CoBRA's datasets that CoBRA does. A host that wants another backend implements
-  `MbaSolver` (and can bound it with `ThreadedSolver`). A public feature and types go, so the
-  next release is minor. `compare/` loses its `bw-cobra` tool; `cobra-cpp` (the C++ tool) and
+  `MbaSolver` (and can bound it with `ThreadedSolver`). A public feature and types go, so this
+  release is minor. `compare/` loses its `bw-cobra` tool; `cobra-cpp` (the C++ tool) and
   the `cobra` and `cobra-cert` tools (CoBRA's Rust port, called directly) remain for comparison.
 - **README.** The Performance section compares bitwright with other tools, each on what it is
   built for: with the simplifiers of z3 5.1.0 and Bitwuzla 0.9.1 on random bit-vector DAGs
