@@ -184,8 +184,14 @@ fn simplify_runs_the_engine() {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "x + y");
     // The standard strategy has no linear-MBA pass.
-    let (code, out, _) = run(&["simplify", "(x | y) - (x & y)", "--standard"]);
-    assert_eq!((code, out.trim()), (0, "(x | y) - (x & y)"));
+    let mba = "2 * (x | y) - (x & ~y) - (~x & y)";
+    let (code, out, _) = run(&["simplify", mba, "--standard"]);
+    assert_eq!(
+        (code, out.trim()),
+        (0, "let %0 = x | y;\n%0 + %0 - (~y & x) - (~x & y)")
+    );
+    let (code, out, _) = run(&["simplify", mba, "--deobfuscate"]);
+    assert_eq!((code, out.trim()), (0, "x + y"));
     assert_eq!(run(&["simplify", "x", "--standard", "--deobfuscate"]).0, 2);
     assert_eq!(run(&["simplify", "x +", "--width", "8"]).0, 2);
     assert_eq!(run(&["simplify", "x", "--width", "0"]).0, 2);

@@ -413,6 +413,12 @@ impl Context {
             return self.c_zext(lo, total);
         }
         let (nh, nl) = (self.node(hi), self.node(lo));
+        if nh.op == OpCode::Concat
+            && let (Some(left), Some(right)) = (self.const_val(nh.b), self.const_val(lo))
+        {
+            let tail = self.mk_const(&BitVec::concat(&left, &right)?)?;
+            return self.c_concat(nh.a, tail);
+        }
         if nh.op == OpCode::Extract
             && nl.op == OpCode::Extract
             && nh.a == nl.a

@@ -88,6 +88,16 @@ rule and_mask_disjoint<W>(x: W, c: const W) { x & c => 0 if zero_bits(x, c) }
 
 - `(q & 0xf0) & 15` → `0:8`
 
+#### `and_not_disjoint` — rule
+
+Clearing bits the value does not have.
+
+```text
+rule and_not_disjoint<W>(x: W, y: W) { ~x & y => y if disjoint(x, y) }
+```
+
+- `~(p & 15) & (q << 4)` → `q << 4`
+
 #### `or_known_ones` — rule
 
 Setting bits that are already set.
@@ -161,6 +171,16 @@ rule not_neg<W>(x: W) { ~(-x) => x - 1 }
 
 - `~(-p)` → `p - 1`
 
+#### `neg_or_one` — rule
+
+`-(x + 1) = ~x`, with the increment spelled as an or.
+
+```text
+rule neg_or_one<W>(x: W) { -(x | 1) => ~x if zero_bits(x, 1) }
+```
+
+- `-((p << 1) | 1)` → `~(p << 1)`
+
 #### `add_disjoint` — rule
 
 An add without carries is an or.
@@ -223,6 +243,242 @@ rule eq_xor_zero<W>(a: W, b: W) { (a ^ b) == 0 => a == b }
 
 - `(p ^ q) == 0` → `p == q`
 
+#### `ne_xor_zero` — rule
+
+A nonzero xor is inequality.
+
+```text
+rule ne_xor_zero<W>(a: W, b: W) { (a ^ b) != 0 => a != b }
+```
+
+- `(p ^ q) != 0` → `p != q`
+
+#### `slt_not_not` — rule
+
+Complementing reverses the order (signed less-than).
+
+```text
+rule slt_not_not<W>(x: W, y: W) { ~x <s ~y => y <s x }
+```
+
+- `~p <s ~q` → `q <s p`
+
+#### `slt_const_not` — rule
+
+Complementing reverses the order against a constant (signed less-than).
+
+```text
+rule slt_const_not<W>(x: W, c: const W) { c <s ~x => x <s k let k: W = ~c }
+```
+
+- `5 <s ~p` → `p <s 250`
+
+#### `slt_not_const` — rule
+
+Complementing reverses the order against a constant (signed less-than).
+
+```text
+rule slt_not_const<W>(x: W, c: const W) { ~x <s c => k <s x if c != 0 let k: W = ~c }
+```
+
+- `~p <s 5` → `250 <s p`
+
+#### `slt_not_zero` — rule
+
+The complement is negative when the value is not (spelled as the compares pass does).
+
+```text
+rule slt_not_zero<W>(x: W) { ~x <s 0 => 0 <=s x }
+```
+
+- `~p <s 0` → `0 <=s p`
+
+#### `sle_not_not` — rule
+
+Complementing reverses the order (signed less-or-equal).
+
+```text
+rule sle_not_not<W>(x: W, y: W) { ~x <=s ~y => y <=s x }
+```
+
+- `~p <=s ~q` → `q <=s p`
+
+#### `sle_const_not` — rule
+
+Complementing reverses the order against a constant (signed less-or-equal).
+
+```text
+rule sle_const_not<W>(x: W, c: const W) { c <=s ~x => x <=s k let k: W = ~c }
+```
+
+- `5 <=s ~p` → `p <=s 250`
+
+#### `sle_not_const` — rule
+
+Complementing reverses the order against a constant (signed less-or-equal).
+
+```text
+rule sle_not_const<W>(x: W, c: const W) { ~x <=s c => k <=s x let k: W = ~c }
+```
+
+- `~p <=s 5` → `250 <=s p`
+
+#### `ult_not_not` — rule
+
+Complementing reverses the order (unsigned less-than).
+
+```text
+rule ult_not_not<W>(x: W, y: W) { ~x <u ~y => y <u x }
+```
+
+- `~p <u ~q` → `q <u p`
+
+#### `ult_const_not` — rule
+
+Complementing reverses the order against a constant (unsigned less-than).
+
+```text
+rule ult_const_not<W>(x: W, c: const W) { c <u ~x => x <u k let k: W = ~c }
+```
+
+- `5 <u ~p` → `p <u 250`
+
+#### `ult_not_const` — rule
+
+Complementing reverses the order against a constant (unsigned less-than).
+
+```text
+rule ult_not_const<W>(x: W, c: const W) { ~x <u c => k <u x let k: W = ~c }
+```
+
+- `~p <u 5` → `250 <u p`
+
+#### `ule_not_not` — rule
+
+Complementing reverses the order (unsigned less-or-equal).
+
+```text
+rule ule_not_not<W>(x: W, y: W) { ~x <=u ~y => y <=u x }
+```
+
+- `~p <=u ~q` → `q <=u p`
+
+#### `ule_const_not` — rule
+
+Complementing reverses the order against a constant (unsigned less-or-equal).
+
+```text
+rule ule_const_not<W>(x: W, c: const W) { c <=u ~x => x <=u k let k: W = ~c }
+```
+
+- `5 <=u ~p` → `p <=u 250`
+
+#### `ule_not_const` — rule
+
+Complementing reverses the order against a constant (unsigned less-or-equal).
+
+```text
+rule ule_not_const<W>(x: W, c: const W) { ~x <=u c => k <=u x let k: W = ~c }
+```
+
+- `~p <=u 5` → `250 <=u p`
+
+#### `slt_or_common` — rule
+
+Bits set in both operands, outside their masks, do not decide the order (signed less-than).
+
+```text
+rule slt_or_common<W>(x: W, y: W, m: const W, c: const W) {
+        ((x & m) | c) <s ((y & m) | c) => (x & m) <s (y & m) if (m & c) == 0
+    }
+```
+
+- `((p & 0xfc) | 1) <s ((q & 0xfc) | 1)` → `(p & 0xfc) <s (q & 0xfc)`
+
+#### `sle_or_common` — rule
+
+Bits set in both operands, outside their masks, do not decide the order (signed less-or-equal).
+
+```text
+rule sle_or_common<W>(x: W, y: W, m: const W, c: const W) {
+        ((x & m) | c) <=s ((y & m) | c) => (x & m) <=s (y & m) if (m & c) == 0
+    }
+```
+
+- `((p & 0xfc) | 1) <=s ((q & 0xfc) | 1)` → `(p & 0xfc) <=s (q & 0xfc)`
+
+#### `ult_or_common` — rule
+
+Bits set in both operands, outside their masks, do not decide the order (unsigned less-than).
+
+```text
+rule ult_or_common<W>(x: W, y: W, m: const W, c: const W) {
+        ((x & m) | c) <u ((y & m) | c) => (x & m) <u (y & m) if (m & c) == 0
+    }
+```
+
+- `((p & 0xfc) | 1) <u ((q & 0xfc) | 1)` → `(p & 0xfc) <u (q & 0xfc)`
+
+#### `ule_or_common` — rule
+
+Bits set in both operands, outside their masks, do not decide the order (unsigned less-or-equal).
+
+```text
+rule ule_or_common<W>(x: W, y: W, m: const W, c: const W) {
+        ((x & m) | c) <=u ((y & m) | c) => (x & m) <=u (y & m) if (m & c) == 0
+    }
+```
+
+- `((p & 0xfc) | 1) <=u ((q & 0xfc) | 1)` → `(p & 0xfc) <=u (q & 0xfc)`
+
+#### `slt_zero_or_low` — rule
+
+Low bits set outside the mask do not change the sign.
+
+```text
+rule slt_zero_or_low<W>(x: W, m: const W, c: const W) {
+        ((x & m) | c) <s 0 => (x & m) <s 0 if (m & c) == 0 && (c & smin_lit) == 0
+    }
+```
+
+- `((p & 0xfc) | 1) <s 0` → `(p & 0xfc) <s 0`
+
+#### `sle_zero_or_low` — rule
+
+Low bits set outside the mask do not change the sign, and make the value nonzero.
+
+```text
+rule sle_zero_or_low<W>(x: W, m: const W, c: const W) {
+        ((x & m) | c) <=s 0 => (x & m) <s 0 if (m & c) == 0 && (c & smin_lit) == 0 && c != 0
+    }
+```
+
+- `((p & 0xfc) | 1) <=s 0` → `(p & 0xfc) <s 0`
+
+#### `zero_slt_or_low` — rule
+
+Low bits set outside the mask do not change the sign, and make the value nonzero.
+
+```text
+rule zero_slt_or_low<W>(x: W, m: const W, c: const W) {
+        0 <s ((x & m) | c) => 0 <=s (x & m) if (m & c) == 0 && (c & smin_lit) == 0 && c != 0
+    }
+```
+
+- `0 <s ((p & 0xfc) | 1)` → `0 <=s (p & 0xfc)`
+
+#### `zero_sle_or_low` — rule
+
+Low bits set outside the mask do not change the sign.
+
+```text
+rule zero_sle_or_low<W>(x: W, m: const W, c: const W) {
+        0 <=s ((x & m) | c) => 0 <=s (x & m) if (m & c) == 0 && (c & smin_lit) == 0
+    }
+```
+
+- `0 <=s ((p & 0xfc) | 1)` → `0 <=s (p & 0xfc)`
+
 #### `ult_one` — rule
 
 Below one is zero.
@@ -272,6 +528,200 @@ rule eq_zext<W, U>(a: W, b: W) where W < U { zext<U>(a) == zext<U>(b) => a == b 
 ```
 
 - `zext<16>(p) == zext<16>(q)` → `p == q`
+
+### core.sign
+
+#### `ne_signs` — rule
+
+Two signs differ when their xor is negative.
+
+```text
+rule ne_signs<W>(x: W, y: W) { (x <s 0) != (y <s 0) => (x ^ y) <s 0 }
+```
+
+- `(p <s 0) != (q <s 0)` → `(p ^ q) <s 0`
+
+#### `xor_signs` — rule
+
+Two signs differ when their xor is negative.
+
+```text
+rule xor_signs<W>(x: W, y: W) { (x <s 0) ^ (y <s 0) => (x ^ y) <s 0 }
+```
+
+- `(p <s 0) ^ (q <s 0)` → `(p ^ q) <s 0`
+
+#### `eq_signs` — rule
+
+Two signs agree when their xor is not negative.
+
+```text
+rule eq_signs<W>(x: W, y: W) { (x <s 0) == (y <s 0) => 0 <=s (x ^ y) }
+```
+
+- `(p <s 0) == (q <s 0)` → `0 <=s (p ^ q)`
+
+#### `and_signs` — rule
+
+Both are negative when their and is.
+
+```text
+rule and_signs<W>(x: W, y: W) { (x <s 0) & (y <s 0) => (x & y) <s 0 }
+```
+
+- `(p <s 0) & (q <s 0)` → `(p & q) <s 0`
+
+#### `or_signs` — rule
+
+Either is negative when their or is.
+
+```text
+rule or_signs<W>(x: W, y: W) { (x <s 0) | (y <s 0) => (x | y) <s 0 }
+```
+
+- `(p <s 0) | (q <s 0)` → `(p | q) <s 0`
+
+#### `lshr_sign_eq_one` — rule
+
+The sign bit shifted down is one when the value is negative.
+
+```text
+rule lshr_sign_eq_one<W>(x: W) where 1 < W { x >>u (W - 1) == 1 => x <s 0 }
+```
+
+- `p >>u 7 == 1` → `p <s 0`
+
+#### `lshr_sign_ne_zero` — rule
+
+The sign bit shifted down is nonzero when the value is negative.
+
+```text
+rule lshr_sign_ne_zero<W>(x: W) { x >>u (W - 1) != 0 => x <s 0 }
+```
+
+- `p >>u 7 != 0` → `p <s 0`
+
+#### `xor_lshr_signs` — rule
+
+The xor of two sign bits shifted down is the sign bit of the xor.
+
+```text
+rule xor_lshr_signs<W>(x: W, y: W) {
+        (x >>u (W - 1)) ^ (y >>u (W - 1)) => (x ^ y) >>u (W - 1)
+    }
+```
+
+- `(p >>u 7) ^ (q >>u 7)` → `(p ^ q) >>u 7`
+
+#### `ne_sign_bits` — rule
+
+Two sign bits differ when the xor's sign bit is set.
+
+```text
+rule ne_sign_bits<W>(x: W, y: W) {
+        extract<W - 1, 1>(x) != extract<W - 1, 1>(y) => extract<W - 1, 1>(x ^ y)
+    }
+```
+
+- `extract<7, 1>(p) != extract<7, 1>(q)` → `extract<7, 1>(p ^ q)`
+
+#### `xor_sign_bits` — rule
+
+The xor of two sign bits is the sign bit of the xor.
+
+```text
+rule xor_sign_bits<W>(x: W, y: W) {
+        extract<W - 1, 1>(x) ^ extract<W - 1, 1>(y) => extract<W - 1, 1>(x ^ y)
+    }
+```
+
+- `extract<7, 1>(p) ^ extract<7, 1>(q)` → `extract<7, 1>(p ^ q)`
+
+#### `slt_from_flags` — rule
+
+SF != OF after `a - b` (x86 `setl`, AArch64 `lt`) is signed less-than.
+
+```text
+rule slt_from_flags<W>(a: W, b: W) {
+        ((a - b) ^ (((a - b) ^ a) & (a ^ b))) <s 0 => a <s b
+    }
+```
+
+- `(p - q ^ ((p - q ^ p) & (p ^ q))) <s 0` → `p <s q`
+
+#### `sge_from_flags` — rule
+
+SF == OF after `a - b` (x86 `setge`, AArch64 `ge`) is signed greater-or-equal.
+
+```text
+rule sge_from_flags<W>(a: W, b: W) {
+        0 <=s ((a - b) ^ (((a - b) ^ a) & (a ^ b))) => b <=s a
+    }
+```
+
+- `0 <=s (p - q ^ ((p - q ^ p) & (p ^ q)))` → `q <=s p`
+
+#### `slt_from_flags_const` — rule
+
+SF != OF after `a - k` for a constant `k` (whose subtraction is built as `a + -k`).
+
+```text
+rule slt_from_flags_const<W>(a: W, c: const W, k: const W) {
+        ((a + c) ^ (((a + c) ^ a) & (a ^ k))) <s 0 => a <s k
+        if c + k == 0
+    }
+```
+
+- `(p + 0xfb ^ ((p + 0xfb ^ p) & (p ^ 5))) <s 0` → `p <s 5`
+
+#### `sge_from_flags_const` — rule
+
+SF == OF after `a - k` for a constant `k`.
+
+```text
+rule sge_from_flags_const<W>(a: W, c: const W, k: const W) {
+        0 <=s ((a + c) ^ (((a + c) ^ a) & (a ^ k))) => k <=s a
+        if c + k == 0
+    }
+```
+
+- `0 <=s (p + 0xfb ^ ((p + 0xfb ^ p) & (p ^ 5)))` → `5 <=s p`
+
+#### `slt_from_flags_word` — rule
+
+SF != OF as a 0 or 1 word.
+
+```text
+rule slt_from_flags_word<W>(a: W, b: W) where 1 < W {
+        ((a - b) ^ (((a - b) ^ a) & (a ^ b))) >>u (W - 1) => zext<W>(a <s b)
+    }
+```
+
+- `(p - q ^ ((p - q ^ p) & (p ^ q))) >>u 7` → `zext<8>(p <s q)`
+
+#### `slt_from_flag_bits` — rule
+
+SF != OF as a bit.
+
+```text
+rule slt_from_flag_bits<W>(a: W, b: W) {
+        extract<W - 1, 1>((a - b) ^ (((a - b) ^ a) & (a ^ b))) => a <s b
+    }
+```
+
+- `extract<7, 1>(p - q ^ ((p - q ^ p) & (p ^ q)))` → `p <s q`
+
+#### `sge_from_flag_bits` — rule
+
+SF == OF as bits.
+
+```text
+rule sge_from_flag_bits<W>(a: W, b: W) {
+        extract<W - 1, 1>(a - b) == extract<W - 1, 1>(((a - b) ^ a) & (a ^ b)) => b <=s a
+    }
+```
+
+- `extract<7, 1>(p - q) == extract<7, 1>((p - q ^ p) & (p ^ q))` → `q <=s p`
 
 ### core.casts
 
@@ -407,6 +857,888 @@ rule rotr_rotl<W>(x: W, y: W) { rotr(rotl(x, y), y) => x }
 ```
 
 - `rotr(rotl(p, q), q)` → `p`
+
+### core.recovery_arith
+
+#### `xor_from_or_minus_and` — rule
+
+```text
+rule xor_from_or_minus_and<W>(x: W, y: W) { (x | y) - (x & y) => x ^ y }
+```
+
+- `(p | q) - (p & q)` → `p ^ q`
+
+#### `xor_from_sum_double_and` — rule
+
+```text
+rule xor_from_sum_double_and<W>(x: W, y: W) { (x + y) - ((x & y) << 1) => x ^ y }
+```
+
+- `(p + q) - ((p & q) << 1)` → `p ^ q`
+
+#### `or_from_sum_minus_and` — rule
+
+```text
+rule or_from_sum_minus_and<W>(x: W, y: W) { (x + y) - (x & y) => x | y }
+```
+
+- `(p + q) - (p & q)` → `p | q`
+
+#### `and_from_sum_minus_or` — rule
+
+```text
+rule and_from_sum_minus_or<W>(x: W, y: W) { (x + y) - (x | y) => x & y }
+```
+
+- `(p + q) - (p | q)` → `p & q`
+
+#### `and_from_or_minus_xor` — rule
+
+```text
+rule and_from_or_minus_xor<W>(x: W, y: W) { (x | y) - (x ^ y) => x & y }
+```
+
+- `(p | q) - (p ^ q)` → `p & q`
+
+#### `xor_from_double_or_sum` — rule
+
+```text
+rule xor_from_double_or_sum<W>(x: W, y: W) { ((x | y) << 1) - (x + y) => x ^ y }
+```
+
+- `((p | q) << 1) - (p + q)` → `p ^ q`
+
+#### `sum_from_double_or_xor` — rule
+
+```text
+rule sum_from_double_or_xor<W>(x: W, y: W) { ((x | y) << 1) - (x ^ y) => x + y }
+```
+
+- `((p | q) << 1) - (p ^ q)` → `p + q`
+
+#### `negative_double` — rule
+
+```text
+rule negative_double<W>(x: W) { -x - x => x * k let k: W = ones - 1 }
+```
+
+- `-p - p` → `p * 254`
+
+### core.recovery_compare
+
+#### `eq_complement` — rule
+
+```text
+rule eq_complement<W>(x: W) { x == ~x => false }
+```
+
+- `p == ~p` → `0:1`
+
+#### `ne_complement` — rule
+
+```text
+rule ne_complement<W>(x: W) { x != ~x => true }
+```
+
+- `p != ~p` → `1:1`
+
+#### `ule_add_carry` — rule
+
+```text
+rule ule_add_carry<W>(x: W, y: W) { (x + y) <=u y => -x <=u y }
+```
+
+- `(p + q) <=u q` → `-p <=u q`
+
+#### `ugt_add_no_carry` — rule
+
+```text
+rule ugt_add_no_carry<W>(x: W, y: W) { y <u (x + y) => y <u -x }
+```
+
+- `q <u (p + q)` → `q <u -p`
+
+#### `uge_add_no_carry` — rule
+
+```text
+rule uge_add_no_carry<W>(x: W, y: W) { y <=u (x + y) => y <=u ~x }
+```
+
+- `q <=u (p + q)` → `q <=u ~p`
+
+#### `ule_sub_no_borrow` — rule
+
+```text
+rule ule_sub_no_borrow<W>(x: W, y: W) { (x - y) <=u ~y => y <=u x }
+```
+
+- `(p - q) <=u ~q` → `q <=u p`
+
+#### `ugt_sub_borrow` — rule
+
+```text
+rule ugt_sub_borrow<W>(x: W, y: W) { ~y <u (x - y) => x <u y }
+```
+
+- `~q <u (p - q)` → `p <u q`
+
+#### `ne_sub_zero` — rule
+
+```text
+rule ne_sub_zero<W>(x: W, y: W) { (x - y) != 0 => x != y }
+```
+
+- `(p - q) != 0` → `p != q`
+
+### core.recovery_shift
+
+#### `shl_lshr` — rule
+
+```text
+rule shl_lshr<W>(x: W, c: const W) { (x << c) >>u c => x & m let m: W = ones >>u c }
+```
+
+- `(p << 1) >>u 1` → `p & 127`
+
+#### `ashr_ashr` — rule
+
+```text
+rule ashr_ashr<W>(x: W, a: const W, b: const W) {
+        (x >>s a) >>s b => x >>s k
+        let k: W = umin(umin(a, W - 1) + umin(b, W - 1), W - 1)
+    }
+```
+
+- `(p >>s 7) >>s 7` → `p >>s 7`
+
+#### `shl_xor_dead_constant` — rule
+
+```text
+rule shl_xor_dead_constant<W>(x: W, c: const W, k: const W) {
+        (x ^ c) << k => x << k if (c << k) == 0
+    }
+```
+
+- `(p ^ 128) << 7` → `p << 7`
+
+#### `lshr_xor_dead_constant` — rule
+
+```text
+rule lshr_xor_dead_constant<W>(x: W, c: const W, k: const W) {
+        (x ^ c) >>u k => x >>u k if (c >>u k) == 0
+    }
+```
+
+- `(p ^ 1) >>u 1` → `p >>u 1`
+
+#### `negate_sign_bit` — rule
+
+```text
+rule negate_sign_bit<W>(x: W) { -(x >>u (W - 1)) => x >>s (W - 1) }
+```
+
+- `-(p >>u 7)` → `p >>s 7`
+
+#### `nonzero_from_sign_union` — rule
+
+```text
+rule nonzero_from_sign_union<W>(x: W) where 1 < W {
+        (x | -x) >>u (W - 1) => zext<W>(x != 0)
+    }
+```
+
+- `(p | -p) >>u 7` → `zext<8>(p != 0)`
+
+### core.recovery_bmi2
+
+#### `pdep_pext` — rule
+
+```text
+rule pdep_pext<W>(x: W, m: W) { pdep(pext(x, m), m) => x & m }
+```
+
+- `pdep(pext(p, q), q)` → `p & q`
+
+#### `pext_pdep` — rule
+
+```text
+rule pext_pdep<W>(x: W, m: const W) {
+        pext(pdep(x, m), m) => x & k let k: W = ones >>u (W - popcnt(m))
+    }
+```
+
+- `pext(pdep(p, 0x55), 0x55)` → `p & 15`
+
+#### `pdep_ones` — rule
+
+```text
+rule pdep_ones<W>(m: W) { pdep(ones, m) => m }
+```
+
+- `pdep(255, p)` → `p`
+
+#### `pext_complement_mask` — rule
+
+```text
+rule pext_complement_mask<W>(m: W) { pext(~m, m) => 0 }
+```
+
+- `pext(~p, p)` → `0:8`
+
+#### `pdep_outside_mask` — rule
+
+```text
+rule pdep_outside_mask<W>(x: W, m: W) { pdep(x, m) & ~m => 0 }
+```
+
+- `pdep(p, q) & ~q` → `0:8`
+
+#### `pdep_inside_mask` — rule
+
+```text
+rule pdep_inside_mask<W>(x: W, m: W) { pdep(x, m) & m => pdep(x, m) }
+```
+
+- `pdep(p, q) & q` → `pdep(p, q)`
+
+#### `pdep_pext_and` — rule
+
+```text
+rule pdep_pext_and<W>(x: W, y: W, m: W) { pdep(pext(x, m) & pext(y, m), m) => (x & y) & m }
+```
+
+- `pdep(pext(p, r) & pext(q, r), r)` → `(p & q) & r`
+
+#### `pdep_pext_or` — rule
+
+```text
+rule pdep_pext_or<W>(x: W, y: W, m: W) { pdep(pext(x, m) | pext(y, m), m) => (x | y) & m }
+```
+
+- `pdep(pext(p, r) | pext(q, r), r)` → `(p | q) & r`
+
+#### `pdep_pext_xor` — rule
+
+```text
+rule pdep_pext_xor<W>(x: W, y: W, m: W) { pdep(pext(x, m) ^ pext(y, m), m) => (x ^ y) & m }
+```
+
+- `pdep(pext(p, r) ^ pext(q, r), r)` → `(p ^ q) & r`
+
+### core.recovery_cast
+
+#### `add_trunc_pair` — rule
+
+```text
+rule add_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) + trunc<N>(y) => trunc<N>(x + y)
+    }
+```
+
+- `trunc<4>(p) + trunc<4>(q)` → `trunc<4>(p + q)`
+
+#### `sub_trunc_pair` — rule
+
+```text
+rule sub_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) - trunc<N>(y) => trunc<N>(x - y)
+    }
+```
+
+- `trunc<4>(p) - trunc<4>(q)` → `trunc<4>(p - q)`
+
+#### `mul_trunc_pair` — rule
+
+```text
+rule mul_trunc_pair<W, N>(x: W, y: W) where N < W {
+        trunc<N>(x) * trunc<N>(y) => trunc<N>(x * y)
+    }
+```
+
+- `trunc<4>(p) * trunc<4>(q)` → `trunc<4>(p * q)`
+
+### core.recovery_select
+
+#### `select_nonzero_self` — rule
+
+```text
+rule select_nonzero_self<W>(x: W) { select(0 <u x, x, 0) => x }
+```
+
+- `select(0 <u p, p, 0)` → `p`
+
+#### `merge_complementary_select_or` — rule
+
+```text
+rule merge_complementary_select_or<W>(c: 1, x: W, y: W) {
+        select(c, x, 0) | select(c, 0, y) => select(c, x, y)
+    }
+```
+
+- `select(p == 0, q, 0) | select(p == 0, 0, r)` → `select(p == 0, q, r)`
+
+#### `merge_complementary_select_add` — rule
+
+```text
+rule merge_complementary_select_add<W>(c: 1, x: W, y: W) {
+        select(c, x, 0) + select(c, 0, y) => select(c, x, y)
+    }
+```
+
+- `select(p == 0, q, 0) + select(p == 0, 0, r)` → `select(p == 0, q, r)`
+
+### core.recovery_canonical
+
+#### `xor_sign_bit_add` — rule
+
+```text
+rule xor_sign_bit_add<W>(x: W) { (x ^ bit(W - 1)) + bit(W - 1) => x }
+```
+
+- `(p ^ 128) + 128` → `p`
+
+#### `ule_constant_borrow` — rule
+
+```text
+rule ule_constant_borrow<W>(x: W, c: const W, m: const W) {
+        (x + c) <=u m => k <=u x if m == c - 1 let k: W = -c
+    }
+```
+
+- `p + 255 <=u 254` → `1 <=u p`
+
+#### `ugt_constant_borrow` — rule
+
+```text
+rule ugt_constant_borrow<W>(x: W, c: const W, m: const W) {
+        m <u (x + c) => x <u k if m == c - 1 let k: W = -c
+    }
+```
+
+- `254 <u p + 255` → `p <u 1`
+
+#### `pdep_pext_xor_constant` — rule
+
+```text
+rule pdep_pext_xor_constant<W>(x: W, c: const W, m: const W) {
+        pdep(pext(x, m) ^ c, m) => (x ^ k) & m let k: W = pdep(c, m)
+    }
+```
+
+- `pdep(pext(p, 1) ^ 1, 1)` → `(p ^ 1) & 1`
+
+### core.recovery_minmax
+
+#### `smin_select_or` — rule
+
+```text
+rule smin_select_or<W>(x: W, y: W) { select(x <=s y, x, 0) | select(y <s x, y, 0) => smin(x, y) }
+```
+
+- `select(p <=s q, p, 0) | select(q <s p, q, 0)` → `smin(p, q)`
+
+#### `smin_select_add` — rule
+
+```text
+rule smin_select_add<W>(x: W, y: W) { select(x <=s y, x, 0) + select(y <s x, y, 0) => smin(x, y) }
+```
+
+- `select(p <=s q, p, 0) + select(q <s p, q, 0)` → `smin(p, q)`
+
+#### `smax_select_or` — rule
+
+```text
+rule smax_select_or<W>(x: W, y: W) { select(y <=s x, x, 0) | select(x <s y, y, 0) => smax(x, y) }
+```
+
+- `select(q <=s p, p, 0) | select(p <s q, q, 0)` → `smax(p, q)`
+
+#### `smax_select_add` — rule
+
+```text
+rule smax_select_add<W>(x: W, y: W) { select(y <=s x, x, 0) + select(x <s y, y, 0) => smax(x, y) }
+```
+
+- `select(q <=s p, p, 0) + select(p <s q, q, 0)` → `smax(p, q)`
+
+#### `umin_select_or` — rule
+
+```text
+rule umin_select_or<W>(x: W, y: W) { select(x <=u y, x, 0) | select(y <u x, y, 0) => umin(x, y) }
+```
+
+- `select(p <=u q, p, 0) | select(q <u p, q, 0)` → `umin(p, q)`
+
+#### `umin_select_add` — rule
+
+```text
+rule umin_select_add<W>(x: W, y: W) { select(x <=u y, x, 0) + select(y <u x, y, 0) => umin(x, y) }
+```
+
+- `select(p <=u q, p, 0) + select(q <u p, q, 0)` → `umin(p, q)`
+
+#### `umax_select_or` — rule
+
+```text
+rule umax_select_or<W>(x: W, y: W) { select(y <=u x, x, 0) | select(x <u y, y, 0) => umax(x, y) }
+```
+
+- `select(q <=u p, p, 0) | select(p <u q, q, 0)` → `umax(p, q)`
+
+#### `umax_select_add` — rule
+
+```text
+rule umax_select_add<W>(x: W, y: W) { select(y <=u x, x, 0) + select(x <u y, y, 0) => umax(x, y) }
+```
+
+- `select(q <=u p, p, 0) + select(p <u q, q, 0)` → `umax(p, q)`
+
+#### `umax_ones_sext_or` — rule
+
+```text
+rule umax_ones_sext_or<W>(x: W) where 1 < W {
+        sext<W>(x <u ones) | select(ones <=u x, x, 0) => ones
+    }
+```
+
+- `sext<8>(p <u 255) | select(255 <=u p, p, 0)` → `255:8`
+
+#### `umax_ones_sext_add` — rule
+
+```text
+rule umax_ones_sext_add<W>(x: W) where 1 < W {
+        sext<W>(x <u ones) + select(ones <=u x, x, 0) => ones
+    }
+```
+
+- `sext<8>(p <u 255) + select(255 <=u p, p, 0)` → `255:8`
+
+### core.recovery_select_one
+
+#### `smin_one_or` — rule
+
+```text
+rule smin_one_or<W>(x: W) where 1 < W { zext<W>(1 <s x) | select(x <=s 1, x, 0) => smin(x, 1) }
+```
+
+- `zext<8>(1 <s p) | select(p <=s 1, p, 0)` → `smin(p, 1)`
+
+#### `smin_one_add` — rule
+
+```text
+rule smin_one_add<W>(x: W) where 1 < W { zext<W>(1 <s x) + select(x <=s 1, x, 0) => smin(x, 1) }
+```
+
+- `zext<8>(1 <s p) + select(p <=s 1, p, 0)` → `smin(p, 1)`
+
+#### `smax_one_or` — rule
+
+```text
+rule smax_one_or<W>(x: W) where 1 < W { zext<W>(x <s 1) | select(1 <=s x, x, 0) => smax(x, 1) }
+```
+
+- `zext<8>(p <s 1) | select(1 <=s p, p, 0)` → `smax(p, 1)`
+
+#### `smax_one_add` — rule
+
+```text
+rule smax_one_add<W>(x: W) where 1 < W { zext<W>(x <s 1) + select(1 <=s x, x, 0) => smax(x, 1) }
+```
+
+- `zext<8>(p <s 1) + select(1 <=s p, p, 0)` → `smax(p, 1)`
+
+#### `umin_one_or` — rule
+
+```text
+rule umin_one_or<W>(x: W) where 1 < W { zext<W>(1 <u x) | select(x <=u 1, x, 0) => umin(x, 1) }
+```
+
+- `zext<8>(1 <u p) | select(p <=u 1, p, 0)` → `umin(p, 1)`
+
+#### `umin_one_add` — rule
+
+```text
+rule umin_one_add<W>(x: W) where 1 < W { zext<W>(1 <u x) + select(x <=u 1, x, 0) => umin(x, 1) }
+```
+
+- `zext<8>(1 <u p) + select(p <=u 1, p, 0)` → `umin(p, 1)`
+
+#### `umax_one_or` — rule
+
+```text
+rule umax_one_or<W>(x: W) where 1 < W { zext<W>(x == 0) | select(1 <=u x, x, 0) => umax(x, 1) }
+```
+
+- `zext<8>(p == 0) | select(1 <=u p, p, 0)` → `umax(p, 1)`
+
+#### `umax_one_add` — rule
+
+```text
+rule umax_one_add<W>(x: W) where 1 < W { zext<W>(x == 0) + select(1 <=u x, x, 0) => umax(x, 1) }
+```
+
+- `zext<8>(p == 0) + select(1 <=u p, p, 0)` → `umax(p, 1)`
+
+### core.recovery_shuffle
+
+#### `concat_low_zero` — rule
+
+```text
+rule concat_low_zero<N, U>(x: N + U, z: const U) where N + U <= 512 {
+        concat(trunc<N>(x), z) => x << U if z == 0
+    }
+```
+
+- `concat(trunc<1>(p), 0:7)` → `p << 7`
+
+### core.recovery_select_ones
+
+#### `smin_ones_or` — rule
+
+```text
+rule smin_ones_or<W>(x: W) where 1 < W { sext<W>(ones <s x) | select(x <=s ones, x, 0) => smin(x, ones) }
+```
+
+- `sext<8>(255 <s p) | select(p <=s 255, p, 0)` → `smin(p, 255)`
+
+#### `smin_ones_add` — rule
+
+```text
+rule smin_ones_add<W>(x: W) where 1 < W { sext<W>(ones <s x) + select(x <=s ones, x, 0) => smin(x, ones) }
+```
+
+- `sext<8>(255 <s p) + select(p <=s 255, p, 0)` → `smin(p, 255)`
+
+#### `smax_ones_or` — rule
+
+```text
+rule smax_ones_or<W>(x: W) where 1 < W { sext<W>(x <s ones) | select(ones <=s x, x, 0) => smax(x, ones) }
+```
+
+- `sext<8>(p <s 255) | select(255 <=s p, p, 0)` → `smax(p, 255)`
+
+#### `smax_ones_add` — rule
+
+```text
+rule smax_ones_add<W>(x: W) where 1 < W { sext<W>(x <s ones) + select(ones <=s x, x, 0) => smax(x, ones) }
+```
+
+- `sext<8>(p <s 255) + select(255 <=s p, p, 0)` → `smax(p, 255)`
+
+### core.guarded_recovery
+
+#### `slt_neg_pair` — rule
+
+```text
+rule slt_neg_pair<W>(x: W, y: W) {
+        -x <s -y => y <s x if proves(x != bit(W - 1)) && proves(y != bit(W - 1))
+    }
+```
+
+- `-((p & 252) | 2) <s -((q & 252) | 2)` → `((q & 252) | 2) <s ((p & 252) | 2)`
+
+#### `sle_neg_pair` — rule
+
+```text
+rule sle_neg_pair<W>(x: W, y: W) {
+        -x <=s -y => y <=s x if proves(x != bit(W - 1)) && proves(y != bit(W - 1))
+    }
+```
+
+- `-((p & 252) | 2) <=s -((q & 252) | 2)` → `((q & 252) | 2) <=s ((p & 252) | 2)`
+
+#### `select_nonzero_value` — rule
+
+```text
+rule select_nonzero_value<W>(x: W) { select(x != 0, x, 0) => x }
+```
+
+- `select(p != 0, p, 0)` → `p`
+
+#### `negate_boolean` — rule
+
+```text
+rule negate_boolean(x: 1) { -x => x }
+```
+
+- `-p:1` → `p:1`
+
+#### `increment_boolean` — rule
+
+```text
+rule increment_boolean(x: 1) { x + 1 => ~x }
+```
+
+- `p:1 + 1:1` → `~p:1`
+
+#### `complementary_shift_rotate` — rule
+
+```text
+rule complementary_shift_rotate<W>(x: W, a: const W, b: const W) {
+        (x >>u a) | (x << b) => rotr(x, a)
+        if (a <u W) && (b <u W) && (a + b == W)
+    }
+```
+
+- `(p >>u 3) | (p << 5)` → `rotr(p, 3)`
+
+#### `xor_zext_lowmask` — rule
+
+```text
+rule xor_zext_lowmask<W, U>(x: W) where W < U {
+        zext<U>(x) ^ lowmask(W) => zext<U>(~x)
+    }
+```
+
+- `zext<16>(p) ^ 255:16` → `zext<16>(~p)`
+
+#### `xor_complement_mask` — rule
+
+```text
+rule xor_complement_mask<W>(x: W, m: const W, n: const W) {
+        (x & n) ^ m => x | m if n == ~m
+    }
+```
+
+- `(p & 254) ^ 1` → `p | 1`
+
+#### `mask_or_add_constant` — rule
+
+```text
+rule mask_or_add_constant<W>(x: W, c: const W, m: const W, d: const W) {
+        ((x | c) & m) + d => (x & kept) | k
+        if (((c & m) + d) & (m & ~c)) == 0
+        let kept: W = m & ~c
+        let k: W = (c & m) + d
+    }
+```
+
+- `((p | 3) & 15) + 255` → `(p & 12) | 2`
+
+#### `mask_or_add_constant_carry` — rule
+
+```text
+rule mask_or_add_constant_carry<W>(x: W, c: const W, m: const W, d: const W) {
+        ((x | c) & m) + d => (x & kept) + k
+        let kept: W = m & ~c
+        let k: W = (c & m) + d
+    }
+```
+
+- `((p | 127) & 0xf0) + 16` → `(p & 128) + 128`
+
+#### `boolean_lowbit_mask_keep` — rule
+
+```text
+rule boolean_lowbit_mask_keep<W>(x: W, y: W) where 1 < W {
+        -(x & 1) & y => select(trunc<1>(x), y, 0)
+    }
+```
+
+- `-(p & 1) & q` → `select(trunc<1>(p), q, 0)`
+
+#### `boolean_zext_mask_keep` — rule
+
+```text
+rule boolean_zext_mask_keep<W>(x: 1, y: W) where 1 < W {
+        -zext<W>(x) & y => select(x, y, 0)
+    }
+```
+
+- `-zext<8>(p:1) & q` → `select(p:1, q, 0)`
+
+#### `split_mask_add` — rule
+
+```text
+rule split_mask_add<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) + c) => (x & k) + c if (m & n) == 0 let k: W = m | n
+    }
+```
+
+- `(p & 240) + ((p & 15) + q)` → `p + q`
+
+#### `split_mask_sub` — rule
+
+```text
+rule split_mask_sub<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) - c) => x - c if (m | n) == ones && (m & n) == 0
+    }
+```
+
+- `(p & 240) + ((p & 15) - q)` → `p - q`
+
+#### `split_mask_increment` — rule
+
+```text
+rule split_mask_increment<W>(x: W, m: const W, n: const W) {
+        (x & m) - ~(x & n) => x + 1 if (m | n) == ones && (m & n) == 0
+    }
+```
+
+- `(p & 240) - ~(p & 15)` → `p + 1`
+
+#### `recombine_shifted_field_or` — rule
+
+```text
+rule recombine_shifted_field_or<W>(x: W, a: W, m: const W, k: const W) {
+        (x & m) | (((x >>u k) + a) << k) => (x & keep) + (a << k)
+        if (k <=u W) && (m & (ones << k)) == 0
+        let keep: W = (ones << k) | m
+    }
+```
+
+- `(p & 15) | (((p >>u 4) + q) << 4)` → `p + (q << 4)`
+
+### core.guarded_recovery_canonical
+
+#### `slt_neg_zero` — rule
+
+```text
+rule slt_neg_zero<W>(x: W) { -x <s 0 => 0 <s x if proves(x != bit(W - 1)) }
+```
+
+- `-((p & 252) | 2) <s 0` → `0 <s ((p & 252) | 2)`
+
+#### `slt_zero_neg` — rule
+
+```text
+rule slt_zero_neg<W>(x: W) { 0 <s -x => x <s 0 if proves(x != bit(W - 1)) }
+```
+
+- `0 <s -((p & 252) | 2)` → `((p & 252) | 2) <s 0`
+
+#### `sle_neg_zero` — rule
+
+```text
+rule sle_neg_zero<W>(x: W) { -x <=s 0 => 0 <=s x if proves(x != bit(W - 1)) }
+```
+
+- `-((p & 252) | 2) <=s 0` → `0 <=s ((p & 252) | 2)`
+
+#### `sle_zero_neg` — rule
+
+```text
+rule sle_zero_neg<W>(x: W) { 0 <=s -x => x <=s 0 if proves(x != bit(W - 1)) }
+```
+
+- `0 <=s -((p & 252) | 2)` → `((p & 252) | 2) <=s 0`
+
+#### `split_mask_or_add` — rule
+
+```text
+rule split_mask_or_add<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) + ((x & n) | c) => x + c
+        if (m | n) == ones && (m & n) == 0 && zero_bits(c, n)
+    }
+```
+
+- `(p & 240) + ((p & 15) | 128)` → `p + 128`
+
+### core.guarded_recovery_shuffle
+
+#### `recombine_extracted_field` — rule
+
+```text
+rule recombine_extracted_field<N, K, M>(x: N + K, a: N + K) where M <= N, N + K <= 512 {
+        concat(trunc<N>(zext<N + K>(extract<K, M>(x)) + a), trunc<K>(x))
+        => (x & lowmask(K + M)) + (a << K)
+    }
+```
+
+- `concat(trunc<4>(zext<8>(extract<4,3>(p)) + q), trunc<4>(p))` → `(p & 127) + (q << 4)`
+
+### core.guarded_recovery_layout
+
+#### `shifted_masked_add` — rule
+
+```text
+rule shifted_masked_add<W>(x: W, a: W, s: const W, k: const W) {
+        (((x >>u k) & s) + a) << k => (x & keep) + (a << k)
+        let keep: W = s << k
+    }
+```
+
+- `(((p >>u 4) & 8) + q) << 4` → `(p & 128) + (q << 4)`
+
+#### `recombine_low_constant` — rule
+
+```text
+rule recombine_low_constant<W>(x: W, a: W, c: const W, k: const W) {
+        (((x >>u k) + a) << k) | c => (x | c) + (a << k)
+        if (k <=u W) && c == ones >>u (W - k)
+    }
+```
+
+- `(((p >>u 4) + q) << 4) | 15` → `(p | 15) + (q << 4)`
+
+#### `split_or_masked_sum` — rule
+
+```text
+rule split_or_masked_sum<W>(x: W, c: W, m: const W, n: const W) {
+        (x & m) | ((x & n) + c) => (x & keep) + c
+        if (n & prefix) == 0 && zero_bits(c, prefix)
+        let prefix: W = ones >>u clz(m)
+        let keep: W = m | n
+    }
+```
+
+- `(p & 14) | ((p & 240) + (q << 4))` → `(p & 254) + (q << 4)`
+
+#### `add_constant_to_concat` — rule
+
+```text
+rule add_constant_to_concat<H, L>(x: H + L, c: const L, d: const H + L) where H + L <= 512 {
+        concat(extract<L,H>(x), c) + d => (x & ~lowmask(L)) + k
+        let k: H + L = zext<H + L>(c) + d
+    }
+```
+
+- `concat(extract<7,1>(p), 112:7) + 16` → `(p & 128) + 128`
+
+### core.guarded_recovery_mba_normalized
+
+#### `xor_from_distributed_double_or` — rule
+
+```text
+rule xor_from_distributed_double_or<W>(x: W, c: const W, k: const W) {
+        ((x << 1) | k) - (x + c) => x ^ c if k == c << 1
+    }
+```
+
+- `((p << 1) | 2) - (p + 1)` → `p ^ 1`
+
+#### `sum_from_distributed_double_or` — rule
+
+```text
+rule sum_from_distributed_double_or<W>(x: W, c: const W, k: const W) {
+        ((x << 1) | k) - (x ^ c) => x + c if k == c << 1
+    }
+```
+
+- `((p << 1) | 2) - (p ^ 1)` → `p + 1`
+
+#### `sum_from_vanishing_double_mask` — rule
+
+```text
+rule sum_from_vanishing_double_mask<W>(x: W, c: const W) {
+        (x << 1) - (x ^ c) => x + c if (c << 1) == 0
+    }
+```
+
+- `(p << 1) - (p ^ 128)` → `p + 128`
+
+### core.guarded_recovery_concat
+
+#### `add_aligned_to_concat` — rule
+
+```text
+rule add_aligned_to_concat<H, L>(a: H + L, x: H + L, c: const L) where H + L <= 512 {
+        (a << L) + concat(extract<L,H>(x), c)
+        => concat(trunc<H>(a) + extract<L,H>(x), c)
+    }
+```
+
+- `(q << 4) + concat(extract<4,4>(p), 15:4)` → `concat(trunc<4>(q) + extract<4,4>(p), 15:4)`
 
 ## `eqsat.bwr`
 

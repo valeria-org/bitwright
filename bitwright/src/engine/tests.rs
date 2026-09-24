@@ -756,6 +756,63 @@ fn rewrite_chains_reach_the_normal_form() {
     assert_eq!(cx.parse("y - ~y", &o).unwrap(), out.roots[0].expr);
 }
 
+#[test]
+fn lifted_flag_conditions_become_comparisons() {
+    // The conditions a lifter computes from the flags of `cmp a, b` (x86) or `subs` (AArch64),
+    // in the spellings lifters use: sign tests, sign-bit extracts, shifted-down sign words and
+    // the builder's own `ssub_overflow`. `$` is the sign bit's index.
+    let cases = [
+        ("(a - b <s 0) != ssub_overflow(a, b)", "a <s b"),
+        ("(a - b <s 0) ^ ssub_overflow(a, b)", "a <s b"),
+        ("(a - b <s 0) == ssub_overflow(a, b)", "b <=s a"),
+        ("~((a - b <s 0) ^ ssub_overflow(a, b))", "b <=s a"),
+        (
+            "(a - b == 0) | ((a - b <s 0) != ssub_overflow(a, b))",
+            "a <=s b",
+        ),
+        (
+            "(a - b != 0) & ((a - b <s 0) == ssub_overflow(a, b))",
+            "b <s a",
+        ),
+        (
+            "(a - b <s 0) != (((a <s 0) != (b <s 0)) & ((a - b <s 0) != (a <s 0)))",
+            "a <s b",
+        ),
+        (
+            "extract<$, 1>(a - b) != extract<$, 1>((a ^ b) & (a ^ (a - b)))",
+            "a <s b",
+        ),
+        (
+            "extract<$, 1>(a - b) == extract<$, 1>((a ^ b) & (a ^ (a - b)))",
+            "b <=s a",
+        ),
+        (
+            "((a - b) >>u $) ^ (((a ^ b) & (a ^ (a - b))) >>u $) == 1",
+            "a <s b",
+        ),
+        ("(a - 5 <s 0) != ssub_overflow(a, 5)", "a <s 5"),
+        ("(5 - b <s 0) == ssub_overflow(5, b)", "b <=s 5"),
+        ("(a - b != 0) & ~(a <u b)", "b <u a"),
+    ];
+    let engine = strict();
+    for w in [Width::W8, Width::W32, Width::W64] {
+        let o = ParseOptions::width(w);
+        let sign = (w.bits() - 1).to_string();
+        for (input, expected) in cases {
+            let mut cx = Context::new();
+            let e = cx.parse(&input.replace('$', &sign), &o).unwrap();
+            let out = engine.simplify(&mut cx, e).unwrap();
+            let want = cx.parse(expected, &o).unwrap();
+            assert_eq!(
+                out.expr,
+                want,
+                "at {w:?}: {input} gave {}",
+                cx.display(out.expr)
+            );
+        }
+    }
+}
+
 /// Rules covering every parameter kind and every kind of pattern root, for the dispatch net.
 const DISPATCH_FIXTURE: &str = r#"
 bitwright 1;

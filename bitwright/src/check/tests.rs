@@ -389,7 +389,7 @@ group fixture {
     rule uge_spelled<W>(a: W, b: W) { (b <u a) | (a == b) => a >=u b }
     rule and_sext_bool<W>(c: 1, x: W) where 1 < W { x & sext<W>(c) => select(c, x, 0) }
     rule sext_masked<W, U>(a: W) where W < U { sext<U>(a) & lowmask(W) => zext<U>(a) }
-    rule trunc_high<W, N>(x: W) where N < W { trunc<N>(x >>u (W - N)) => extract<W - N, N>(x) }
+    rule trunc_high<W, N>(x: W) where N < W { trunc<N>(x >>s (W - N)) => extract<W - N, N>(x) }
 }
 "#;
 

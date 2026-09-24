@@ -51,9 +51,9 @@ use bitwright::{Context, ParseOptions, Width};
 
 let src = "bitwright 1;
 group my.rules {
-    /// The bits of x that y lacks.
-    #[example(\"(p ^ q) & p\" => \"p & ~q\")]
-    rule xor_and_self<W>(x: W, y: W) { (x ^ y) & x => x & ~y }
+    /// Whatever y is, x stays.
+    #[example(\"(p | q) & (p | ~q)\" => \"p\")]
+    rule and_or_complement<W>(x: W, y: W) { (x | y) & (x | ~y) => x }
 }";
 let program = RuleProgram::compile(src).map_err(|e| e.to_string())?;
 let ledger = Ledger::from_checks(&check_program(&program, &CheckConfig::default()));
@@ -66,13 +66,13 @@ let engine = Engine::builder()
     .build()
     .map_err(|e| e.to_string())?;
 let mut cx = Context::new();
-let e = cx.parse("(a ^ b) & a", &ParseOptions::width(Width::W64)).map_err(|e| e.to_string())?;
+let e = cx.parse("(a | b) & (a | ~b)", &ParseOptions::width(Width::W64)).map_err(|e| e.to_string())?;
 let mut census = RuleCensus::default();
 let out = engine
     .run(&mut cx, &[e], Run::default().with_observer(&mut census))
     .map_err(|e| e.to_string())?;
-assert_eq!(cx.display(out.roots[0].expr).to_string(), "~b & a");
-assert_eq!(census.rules["my.rules::xor_and_self"].applied, 1);
+assert_eq!(cx.display(out.roots[0].expr).to_string(), "a");
+assert_eq!(census.rules["my.rules::and_or_complement"].applied, 1);
 
 // Without a ledger that vouches for it, a program does not link.
 let again = RuleProgram::compile(src).map_err(|e| e.to_string())?;
