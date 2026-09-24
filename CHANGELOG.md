@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
 - **Signed comparisons from flags.** The conditions a lifter computes from the flags of a
   subtraction (x86 `cmp`, AArch64 `subs`) simplify to the comparison they test: SF != OF is
