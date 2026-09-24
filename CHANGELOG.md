@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - **Floating point.** IEEE 754 binary floating point on bit-vectors holding interchange
   encodings, in any format `(eb, sb)` (`FpFormat`: binary16, bfloat16, binary32, binary64,
