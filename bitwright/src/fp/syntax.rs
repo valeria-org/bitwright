@@ -33,7 +33,7 @@ const NAMES: &[(&str, Base)] = &[
     ("fma", Base::Op(Kind::Fma)),
     ("sqrt", Base::Op(Kind::Sqrt)),
     ("rem", Base::Op(Kind::Rem)),
-    ("round", Base::Op(Kind::Round)),
+    ("round", Base::Op(Kind::RoundToIntegral)),
     ("min", Base::Op(Kind::Min)),
     ("max", Base::Op(Kind::Max)),
     ("eq", Base::Op(Kind::Eq)),
@@ -52,16 +52,16 @@ const NAMES: &[(&str, Base)] = &[
     ("isneg", Base::Test(FpTest::Negative)),
     ("ispos", Base::Test(FpTest::Positive)),
     ("convert", Base::Op(Kind::Convert)),
-    ("from_sbv", Base::Op(Kind::FromS)),
-    ("from_ubv", Base::Op(Kind::FromU)),
-    ("to_sbv", Base::Op(Kind::ToS)),
-    ("to_ubv", Base::Op(Kind::ToU)),
+    ("from_sbv", Base::Op(Kind::FromSInt)),
+    ("from_ubv", Base::Op(Kind::FromUInt)),
+    ("to_sbv", Base::Op(Kind::ToSInt)),
+    ("to_ubv", Base::Op(Kind::ToUInt)),
     ("x87_load", Base::X87Load),
     ("x87_store", Base::X87Store),
 ];
 
 impl Base {
-    fn rounds(self) -> bool {
+    pub(crate) fn rounds(self) -> bool {
         match self {
             Base::Op(k) => matches!(
                 k,
@@ -70,12 +70,12 @@ impl Base {
                     | Kind::Div
                     | Kind::Fma
                     | Kind::Sqrt
-                    | Kind::Round
+                    | Kind::RoundToIntegral
                     | Kind::Convert
-                    | Kind::FromS
-                    | Kind::FromU
-                    | Kind::ToS
-                    | Kind::ToU
+                    | Kind::FromSInt
+                    | Kind::FromUInt
+                    | Kind::ToSInt
+                    | Kind::ToUInt
             ),
             Base::Sub => true,
             _ => false,
@@ -83,7 +83,7 @@ impl Base {
     }
 
     /// How many formats the name gives.
-    fn formats(self) -> usize {
+    pub(crate) fn formats(self) -> usize {
         match self {
             Base::Op(Kind::Convert) => 2,
             Base::X87Load | Base::X87Store => 0,
@@ -91,8 +91,8 @@ impl Base {
         }
     }
 
-    fn int_width(self) -> bool {
-        matches!(self, Base::Op(Kind::ToS | Kind::ToU))
+    pub(crate) fn int_width(self) -> bool {
+        matches!(self, Base::Op(Kind::ToSInt | Kind::ToUInt))
     }
 
     pub(crate) fn arity(self) -> usize {
@@ -213,7 +213,7 @@ impl Call {
             Kind::Fma => FpOp::Fma(rm),
             Kind::Sqrt => FpOp::Sqrt(rm),
             Kind::Rem => FpOp::Rem,
-            Kind::Round => FpOp::RoundToIntegral(rm),
+            Kind::RoundToIntegral => FpOp::RoundToIntegral(rm),
             Kind::Min => FpOp::Min,
             Kind::Max => FpOp::Max,
             Kind::Eq => FpOp::Eq,
@@ -223,10 +223,10 @@ impl Call {
                 to: *self.formats.get(1)?,
                 rm,
             },
-            Kind::FromS => FpOp::FromSInt(rm),
-            Kind::FromU => FpOp::FromUInt(rm),
-            Kind::ToS => FpOp::ToSInt(rm, self.int_width?),
-            Kind::ToU => FpOp::ToUInt(rm, self.int_width?),
+            Kind::FromSInt => FpOp::FromSInt(rm),
+            Kind::FromUInt => FpOp::FromUInt(rm),
+            Kind::ToSInt => FpOp::ToSInt(rm, self.int_width?),
+            Kind::ToUInt => FpOp::ToUInt(rm, self.int_width?),
         };
         Some(Desc {
             op,
@@ -238,7 +238,7 @@ impl Call {
     /// from an integer takes any width).
     pub(crate) fn operand_width(&self) -> Option<u16> {
         match self.base {
-            Base::Op(Kind::FromS | Kind::FromU) => None,
+            Base::Op(Kind::FromSInt | Kind::FromUInt) => None,
             Base::X87Load => Some(80),
             Base::X87Store => Some(FpFormat::X87.width().bits()),
             _ => Some(self.format().width().bits()),
@@ -259,6 +259,19 @@ impl Call {
 
 /// Parses an identifier that starts with `fp.`.
 pub(crate) fn parse_name(ident: &str) -> Result<Name, String> {
+    let (base, rm, named) = split_name(ident)?;
+    let rm = match rm {
+        Some(m) => RoundingMode::from_name(m)
+            .ok_or_else(|| format!("`{m}` is not a rounding mode (rne, rna, rtp, rtn, rtz)"))?,
+        None => RoundingMode::Rne,
+    };
+    Ok(Name { base, rm, named })
+}
+
+/// An `fp.` identifier's parts: what it calls, the word in the rounding mode's place (for the
+/// operations that round; a rule may name a rounding-mode variable there), and the formats it
+/// names.
+pub(crate) fn split_name(ident: &str) -> Result<(Base, Option<&str>, Vec<FpFormat>), String> {
     let mut parts = ident.split('.');
     parts.next(); // "fp"
     let op = parts.next().unwrap_or("");
@@ -268,13 +281,13 @@ pub(crate) fn parse_name(ident: &str) -> Result<Name, String> {
         .map(|&(_, b)| b)
         .ok_or_else(|| format!("unknown floating-point operation `fp.{op}`"))?;
     let rm = if base.rounds() {
-        let m = parts
-            .next()
-            .ok_or_else(|| format!("`fp.{op}` needs a rounding mode (`fp.{op}.rne`, …)"))?;
-        RoundingMode::from_name(m)
-            .ok_or_else(|| format!("`{m}` is not a rounding mode (rne, rna, rtp, rtn, rtz)"))?
+        Some(
+            parts
+                .next()
+                .ok_or_else(|| format!("`fp.{op}` needs a rounding mode (`fp.{op}.rne`, …)"))?,
+        )
     } else {
-        RoundingMode::Rne
+        None
     };
     let mut named = Vec::new();
     for p in parts {
@@ -289,5 +302,5 @@ pub(crate) fn parse_name(ident: &str) -> Result<Name, String> {
             base.formats()
         ));
     }
-    Ok(Name { base, rm, named })
+    Ok((base, rm, named))
 }

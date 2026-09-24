@@ -131,6 +131,9 @@ assert_eq!(cx.eval(&[e], &env[..])?[0].to_f32(), Some(5.0));
 # Ok::<(), bitwright::Error>(())
 ```
 
+[Rules](rules.md#floating-point) can rewrite floating-point operations too, generic in the
+format and the rounding mode, and the checker checks them in every small format.
+
 Construction applies the identities that hold bit for bit on every encoding (a NaN operand
 gives the canonical NaN on both sides, zeros keep their signs) and add no node: `fma(x, 1, y)` is
 `x + y`, `fma(x, y, −0)` is `x · y` except toward −∞, `x · 2` is `x + x`, `(−a) · (−b)` is

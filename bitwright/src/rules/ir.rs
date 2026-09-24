@@ -3,6 +3,7 @@
 
 use core::fmt;
 
+use crate::fp::{FpKind, RoundingMode};
 use crate::ops::{BinOp, CmpOpExt, UnOp};
 
 /// A linear expression over a rule's width variables: `konst + Σ coeff·var`.
@@ -230,6 +231,76 @@ pub enum Literal {
     Bit(WExpr),
     /// A width expression used as a value (for example `W - 1`).
     Width(WExpr),
+    /// A floating-point constant of the format with exponent width `eb` (and the literal's
+    /// width), for example `fp.one<E, S>`.
+    Float {
+        /// Which constant.
+        value: FloatLit,
+        /// The format's exponent width.
+        eb: WExpr,
+    },
+}
+
+/// A floating-point constant a rule can name, in any format.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum FloatLit {
+    /// `fp.zero`: +0.
+    Zero,
+    /// `fp.nzero`: −0.
+    NegZero,
+    /// `fp.inf`: +∞.
+    Inf,
+    /// `fp.ninf`: −∞.
+    NegInf,
+    /// `fp.nan`: the canonical NaN.
+    Nan,
+    /// `fp.one`: 1.
+    One,
+    /// `fp.none`: −1.
+    NegOne,
+    /// `fp.two`: 2.
+    Two,
+    /// `fp.half`: 1/2.
+    Half,
+    /// `fp.min_normal`: the smallest positive normal value.
+    MinNormal,
+    /// `fp.min_subnormal`: the smallest positive value.
+    MinSubnormal,
+    /// `fp.max`: the largest finite value.
+    MaxFinite,
+}
+
+/// The rounding mode of a floating-point node in a rule: a fixed one, or one of the rule's
+/// rounding-mode variables ([`Rule::modes`]).
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum Rounding {
+    /// A fixed mode (`fp.add.rne`).
+    Mode(RoundingMode),
+    /// Rounding-mode variable `i` (`fp.add.r` with `r: rm`).
+    Var(u8),
+}
+
+/// A floating-point operation in a rule: the node [`crate::Context::fp`] builds, with its
+/// format as width expressions. Its result is the format's width (1 bit for a comparison, the
+/// node's width for a conversion to an integer).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub struct FpNode {
+    /// The operation.
+    pub kind: FpKind,
+    /// Its rounding mode, for the operations that round.
+    pub rounding: Option<Rounding>,
+    /// The exponent width of the floating-point operands' format (the result's, from an
+    /// integer).
+    pub eb: WExpr,
+    /// Its significand width, the hidden bit included.
+    pub sb: WExpr,
+    /// A conversion's target format.
+    pub to: Option<(WExpr, WExpr)>,
+    /// The operands.
+    pub args: Vec<NodeId>,
 }
 
 /// Guard predicates about facts. Each is true only when provable, so a guard that uses them
@@ -300,6 +371,8 @@ pub enum RNode {
     Fact(FactPred, NodeId, Option<NodeId>),
     /// A constant predicate.
     ConstP(ConstPred, NodeId),
+    /// A floating-point operation.
+    Fp(FpNode),
 }
 
 /// The sort of a node: a bit-vector of a (symbolic) width, or a guard boolean.
@@ -362,6 +435,9 @@ pub struct Rule {
     pub id: RuleId,
     /// Width variable names.
     pub width_vars: Vec<String>,
+    /// Rounding-mode variable names (parameters declared `r: rm`). An assignment of a rule's
+    /// variables lists the widths, then each mode as its index in [`RoundingMode::ALL`].
+    pub modes: Vec<String>,
     /// `where` constraints.
     pub constraints: Vec<WCons>,
     /// Parameters.
@@ -394,8 +470,9 @@ impl Rule {
         self.decreasing
     }
     /// Whether the rule applies at this assignment of its width variables (in
-    /// [`width_vars`](Rule::width_vars) order): its `where` constraints hold and its pattern,
-    /// template, guard and lets are well formed there. The matcher, the checker and the SMT
+    /// [`width_vars`](Rule::width_vars) order, then its [`modes`](Rule::modes), each as an
+    /// index in [`RoundingMode::ALL`]): its `where` constraints hold and its pattern,
+    /// template, guard and lets are well formed there (floating-point formats valid). The matcher, the checker and the SMT
     /// obligations all use this one test.
     pub fn admits(&self, widths: &[u16]) -> bool {
         super::eval::admitted(self, widths)

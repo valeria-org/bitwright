@@ -33,6 +33,7 @@
 mod expr_tests;
 mod frame;
 pub(crate) mod node;
+pub use node::Kind as FpKind;
 #[cfg(test)]
 mod reference;
 mod soft;

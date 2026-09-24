@@ -52,6 +52,7 @@ fn mask(rule: &Rule, pat: NodeId) -> Mask {
         RNode::Extract(..) => bit(OpCode::Extract),
         RNode::Concat(..) => bit(OpCode::Concat),
         RNode::Select(..) => bit(OpCode::Select),
+        RNode::Fp(f) => bit(f.kind.opcode()),
         // Nothing else occurs in a pattern.
         _ => 0,
     }
@@ -60,8 +61,7 @@ fn mask(rule: &Rule, pat: NodeId) -> Mask {
 impl DispatchNet {
     /// A net over `rules[i]` for the given indices, in that (priority) order.
     pub(crate) fn new(rules: &[Rule], order: &[u32]) -> DispatchNet {
-        let mut by_op: Vec<Vec<Entry>> =
-            (0..=OpCode::Select as usize).map(|_| Vec::new()).collect();
+        let mut by_op: Vec<Vec<Entry>> = (0..OpCode::ALL.len()).map(|_| Vec::new()).collect();
         for &ri in order {
             let rule = &rules[ri as usize];
             let root = rule.lhs;
@@ -79,6 +79,7 @@ impl DispatchNet {
                 RNode::Extract(_, a) => (OpCode::Extract, vec![*a], false),
                 RNode::Concat(h, l) => (OpCode::Concat, vec![*h, *l], false),
                 RNode::Select(c, t, f) => (OpCode::Select, vec![*c, *t, *f], false),
+                RNode::Fp(f) => (f.kind.opcode(), f.args.clone(), f.kind.commutative()),
                 // A pattern rooted at a parameter or constant never decreases the order, so the
                 // compiler rejects it; nothing to index.
                 _ => continue,
@@ -114,7 +115,7 @@ impl DispatchNet {
             }
             k
         };
-        // Extension and floating-point nodes (past `Select`) have no rules yet.
+        // Extension nodes have no rules.
         let entries = self.by_op.get(node.op as usize).map_or(&[][..], |v| &v[..]);
         entries.iter().filter_map(move |e| {
             let fits = |order: [usize; 3]| {

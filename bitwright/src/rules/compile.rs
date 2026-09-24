@@ -4,10 +4,12 @@ use std::collections::HashMap;
 
 use super::diag::{CompileError, Diagnostic, Level};
 use super::ir::{
-    ConstPred, FactPred, Group, LetDef, Literal, NodeId, Param, ParamKind, RNode, Rule, RuleId,
-    RuleKind, Sort, WCmp, WCons, WExpr,
+    ConstPred, FactPred, FloatLit, FpNode, Group, LetDef, Literal, NodeId, Param, ParamKind, RNode,
+    Rounding, Rule, RuleId, RuleKind, Sort, WCmp, WCons, WExpr,
 };
 use super::order::kbo_greater;
+use crate::fp::syntax::Base;
+use crate::fp::{FpFormat, FpKind, FpTest, RoundingMode};
 use crate::hash::combine;
 use crate::ops::{BinOp, CmpOpExt, UnOp};
 use crate::text::lex::{Tok, Token, lex_mode};
@@ -125,6 +127,8 @@ pub(crate) type Compiled = (Vec<Group>, Vec<Rule>, Vec<Diagnostic>);
 
 struct RuleBuilder {
     width_vars: Vec<String>,
+    /// Rounding-mode variables (`r: rm`).
+    modes: Vec<String>,
     params: Vec<Param>,
     param_index: HashMap<String, u16>,
     lets: Vec<PendingLet>,
@@ -594,8 +598,18 @@ impl Parser<'_> {
             "smax_lit" => return lit(b, Literal::SMax),
             _ => {}
         }
+        if name.starts_with("fp.") {
+            return self.fp_call(b, depth, &name, sp);
+        }
         if *self.peek() == Tok::LParen || *self.peek() == Tok::LAngle {
             return self.call(b, depth, &name, sp);
+        }
+        if b.modes.contains(&name) {
+            return Err(Diagnostic::error(
+                "BW0101",
+                format!("`{name}` is a rounding mode, not a value: write `fp.add.{name}<E, S>(…)`"),
+                sp,
+            ));
         }
         if let Some(&i) = b.param_index.get(&name) {
             let w = b.params[i as usize].width.clone();
@@ -813,6 +827,229 @@ impl Parser<'_> {
         }
     }
 
+    /// A floating-point call, `fp.<op>[.<mode>](.<format>… | <eb, sb, …>)(operands)`, or a
+    /// floating-point constant, `fp.<name>(.<format> | <eb, sb>)`. The operations the
+    /// builder makes from other operators (`neg`, `abs`, `copysign`, `sub`, `gt`, `ge`, the
+    /// tests) are written out the same way here, so a pattern matches what the builder makes.
+    fn fp_call(
+        &mut self,
+        b: &mut RuleBuilder,
+        depth: u32,
+        name: &str,
+        start: (usize, usize),
+    ) -> R<NodeId> {
+        let span = |p: &Self| (start.0, p.prev_end());
+        let bad = |m: String| Diagnostic::error("BW0001", m, start);
+        let too_big = |sp| Diagnostic::error("BW0102", "width expression too large", sp);
+        let konst = |v: u32| WExpr::konst(i64::from(v));
+        let mut parts = name.split('.');
+        parts.next();
+        let op = parts.next().unwrap_or("");
+        if let Some(value) = float_lit(op) {
+            let rest: Vec<&str> = parts.collect();
+            let (eb, sb) = match rest.as_slice() {
+                [] => {
+                    let g = self.generics(b, 2)?;
+                    (g[0].clone(), g[1].clone())
+                }
+                [f] => {
+                    let f = FpFormat::from_name(f).ok_or_else(|| {
+                        bad(format!(
+                            "`{f}` is not a format name (f16, bf16, f32, f64, f128, f256)"
+                        ))
+                    })?;
+                    (konst(f.eb()), konst(f.sb()))
+                }
+                _ => return Err(bad(format!("`fp.{op}` takes one format"))),
+            };
+            let sp = span(self);
+            let w = eb.add(&sb, 1).ok_or_else(|| too_big(sp))?;
+            let n = b.node(RNode::Lit(Literal::Float { value, eb }), sp)?;
+            b.fix(n, SV::Bv(w), sp)?;
+            return Ok(n);
+        }
+        let (base, rm_word, named) = crate::fp::syntax::split_name(name).map_err(bad)?;
+        let rounding = match rm_word {
+            None => None,
+            Some(m) => Some(match RoundingMode::from_name(m) {
+                Some(mode) => Rounding::Mode(mode),
+                None => match b.modes.iter().position(|v| v == m) {
+                    Some(i) => Rounding::Var(i as u8),
+                    None => {
+                        return Err(bad(format!(
+                            "`{m}` is not a rounding mode (rne, rna, rtp, rtn, rtz) or a \
+                             rounding-mode parameter (`{m}: rm`)"
+                        )));
+                    }
+                },
+            }),
+        };
+        if matches!(base, Base::X87Load | Base::X87Store) {
+            return Err(bad("x87's load and store are not available in rules".into()));
+        }
+        let count = 2 * (base.formats() - named.len()) + usize::from(base.int_width());
+        let g = if count > 0 {
+            self.generics(b, count)?
+        } else {
+            Vec::new()
+        };
+        let mut g = g.into_iter();
+        let mut formats: Vec<(WExpr, WExpr)> = named
+            .iter()
+            .map(|f| (konst(f.eb()), konst(f.sb())))
+            .collect();
+        while formats.len() < base.formats() {
+            match (g.next(), g.next()) {
+                (Some(e), Some(s)) => formats.push((e, s)),
+                _ => return Err(bad("missing format".into())),
+            }
+        }
+        let int_width = g.next();
+        let args = self.args(b, depth, base.arity())?;
+        let sp = span(self);
+        let (eb, sb) = formats[0].clone();
+        let fw = eb.add(&sb, 1).ok_or_else(|| too_big(sp))?;
+        let fixed = |b: &mut RuleBuilder, n: RNode, w: &WExpr| -> R<NodeId> {
+            let k = b.node(n, sp)?;
+            b.fix(k, SV::Bv(w.clone()), sp)?;
+            Ok(k)
+        };
+        let lit = |b: &mut RuleBuilder, l: Literal| fixed(b, RNode::Lit(l), &fw);
+        let float = |b: &mut RuleBuilder, v: FloatLit| {
+            fixed(
+                b,
+                RNode::Lit(Literal::Float {
+                    value: v,
+                    eb: eb.clone(),
+                }),
+                &fw,
+            )
+        };
+        let bin = |b: &mut RuleBuilder, op: BinOp, x: NodeId, y: NodeId| {
+            fixed(b, RNode::Bin(op, x, y), &fw)
+        };
+        let cmp = |b: &mut RuleBuilder, op: CmpOpExt, x: NodeId, y: NodeId| {
+            fixed(b, RNode::Cmp(op, x, y), &WExpr::konst(1))
+        };
+        let node = |b: &mut RuleBuilder, kind: FpKind, args: Vec<NodeId>| -> R<NodeId> {
+            let from_int = matches!(kind, FpKind::FromSInt | FpKind::FromUInt);
+            if !from_int {
+                for &a in &args {
+                    b.fix(a, SV::Bv(fw.clone()), sp)?;
+                }
+            }
+            let to = formats.get(1).cloned();
+            let result = match kind {
+                FpKind::Eq | FpKind::Lt | FpKind::Le => WExpr::konst(1),
+                FpKind::Convert => {
+                    let (e, s) = to.clone().ok_or_else(|| bad("missing format".into()))?;
+                    e.add(&s, 1).ok_or_else(|| too_big(sp))?
+                }
+                FpKind::ToSInt | FpKind::ToUInt => int_width
+                    .clone()
+                    .ok_or_else(|| bad("missing integer width".into()))?,
+                _ => fw.clone(),
+            };
+            let n = RNode::Fp(FpNode {
+                kind,
+                rounding,
+                eb: eb.clone(),
+                sb: sb.clone(),
+                to,
+                args,
+            });
+            fixed(b, n, &result)
+        };
+        for &a in &args {
+            if !matches!(base, Base::Op(FpKind::FromSInt | FpKind::FromUInt)) {
+                b.fix(a, SV::Bv(fw.clone()), sp)?;
+            }
+        }
+        match base {
+            Base::Op(kind) => node(b, kind, args),
+            Base::Sub => {
+                let s = lit(b, Literal::SMin)?;
+                let nb = bin(b, BinOp::Xor, args[1], s)?;
+                node(b, FpKind::Add, vec![args[0], nb])
+            }
+            Base::Neg => {
+                let s = lit(b, Literal::SMin)?;
+                bin(b, BinOp::Xor, args[0], s)
+            }
+            Base::Abs => {
+                let s = lit(b, Literal::SMax)?;
+                bin(b, BinOp::And, args[0], s)
+            }
+            Base::CopySign => {
+                let m = lit(b, Literal::SMax)?;
+                let mag = bin(b, BinOp::And, args[0], m)?;
+                let s = lit(b, Literal::SMin)?;
+                let sign = bin(b, BinOp::And, args[1], s)?;
+                bin(b, BinOp::Or, mag, sign)
+            }
+            Base::Gt => node(b, FpKind::Lt, vec![args[1], args[0]]),
+            Base::Ge => node(b, FpKind::Le, vec![args[1], args[0]]),
+            Base::Test(t) => {
+                let m = lit(b, Literal::SMax)?;
+                let mut mag = || bin(b, BinOp::And, args[0], m);
+                match t {
+                    FpTest::Nan => {
+                        let mag = mag()?;
+                        let i = float(b, FloatLit::Inf)?;
+                        cmp(b, CmpOpExt::Ult, i, mag)
+                    }
+                    FpTest::Infinite => {
+                        let mag = mag()?;
+                        let i = float(b, FloatLit::Inf)?;
+                        cmp(b, CmpOpExt::Eq, mag, i)
+                    }
+                    FpTest::Zero => {
+                        let mag = mag()?;
+                        let z = lit(
+                            b,
+                            Literal::Int {
+                                limbs: vec![0],
+                                negative: false,
+                            },
+                        )?;
+                        cmp(b, CmpOpExt::Eq, mag, z)
+                    }
+                    FpTest::Subnormal => {
+                        // (|a| - 1) <u (min_normal - 1), as the builder writes it.
+                        let mag = mag()?;
+                        let ones = lit(b, Literal::Ones)?;
+                        let shifted = bin(b, BinOp::Add, mag, ones)?;
+                        let k = sb.add(&WExpr::konst(1), -1).ok_or_else(|| too_big(sp))?;
+                        let bound = lit(b, Literal::LowMask(k))?;
+                        cmp(b, CmpOpExt::Ult, shifted, bound)
+                    }
+                    FpTest::Normal => {
+                        // (|a| - min_normal) <u (inf - min_normal).
+                        let mag = mag()?;
+                        let mn = float(b, FloatLit::MinNormal)?;
+                        let neg = fixed(b, RNode::Un(UnOp::Neg, mn), &fw)?;
+                        let shifted = bin(b, BinOp::Add, mag, neg)?;
+                        let i = float(b, FloatLit::Inf)?;
+                        let mn2 = float(b, FloatLit::MinNormal)?;
+                        let bound = bin(b, BinOp::Sub, i, mn2)?;
+                        cmp(b, CmpOpExt::Ult, shifted, bound)
+                    }
+                    FpTest::Negative => {
+                        let s = lit(b, Literal::SMin)?;
+                        let flipped = bin(b, BinOp::Xor, args[0], s)?;
+                        let i = float(b, FloatLit::Inf)?;
+                        cmp(b, CmpOpExt::Ule, flipped, i)
+                    }
+                    _ => {
+                        let i = float(b, FloatLit::Inf)?;
+                        cmp(b, CmpOpExt::Ule, args[0], i)
+                    }
+                }
+            }
+            Base::X87Load | Base::X87Store => unreachable!("refused above"),
+        }
+    }
+
     // ----- items ------------------------------------------------------------------------------
 
     fn attrs(&mut self) -> R<Attrs> {
@@ -922,6 +1159,7 @@ impl Parser<'_> {
         let (short, name_span) = self.ident("a rule name")?;
         let mut b = RuleBuilder {
             width_vars: Vec::new(),
+            modes: Vec::new(),
             params: Vec::new(),
             param_index: HashMap::new(),
             lets: Vec::new(),
@@ -963,7 +1201,11 @@ impl Parser<'_> {
         self.expect(Tok::LParen, "`(`")?;
         while *self.peek() != Tok::RParen {
             let (pname, sp) = self.ident("a parameter name")?;
-            if crate::text::is_reserved(&pname) || b.param_index.contains_key(&pname) {
+            if crate::text::is_reserved(&pname)
+                || b.param_index.contains_key(&pname)
+                || b.modes.contains(&pname)
+                || RoundingMode::from_name(&pname).is_some()
+            {
                 return Err(Diagnostic::error(
                     "BW0103",
                     format!("parameter name `{pname}` is reserved or repeated"),
@@ -971,6 +1213,23 @@ impl Parser<'_> {
                 ));
             }
             self.expect(Tok::Colon, "`:`")?;
+            if self.is_ident("rm") {
+                // A rounding-mode variable: every mode, bound by the pattern.
+                self.bump();
+                if b.modes.len() >= 2 {
+                    return Err(Diagnostic::error(
+                        "BW0103",
+                        "at most 2 rounding-mode parameters",
+                        sp,
+                    ));
+                }
+                b.modes.push(pname);
+                if *self.peek() == Tok::Comma {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
             let pkind = match self.peek() {
                 Tok::Ident(s) if s == "const" => ParamKind::Const,
                 Tok::Ident(s) if s == "sym" => ParamKind::Sym,
@@ -1199,6 +1458,7 @@ fn finish_rule(
         kind: f.kind,
         id: RuleId([0, 0]),
         width_vars: b.width_vars,
+        modes: b.modes,
         constraints: f.constraints,
         params: b.params,
         lets,
@@ -1259,6 +1519,7 @@ pub(crate) fn children(n: &RNode) -> Vec<NodeId> {
             v.extend(m);
             v
         }
+        RNode::Fp(ref f) => f.args.clone(),
     }
 }
 
@@ -1291,8 +1552,13 @@ pub(crate) fn undetermined_width(rule: &Rule) -> Option<u8> {
         if let Sort::Bv(w) = &rule.sorts[n as usize] {
             exprs.push(w);
         }
-        if let RNode::Extract(lo, _) = &rule.nodes[n as usize] {
-            exprs.push(lo);
+        match &rule.nodes[n as usize] {
+            RNode::Extract(lo, _) => exprs.push(lo),
+            RNode::Fp(f) => {
+                exprs.push(&f.eb);
+                exprs.extend(f.to.as_ref().map(|(e, _)| e));
+            }
+            _ => {}
         }
     });
     let mut bound = vec![false; rule.width_vars.len()];
@@ -1427,6 +1693,25 @@ fn static_checks(rule: &Rule, spans: &[(usize, usize)], name_span: (usize, usize
             format!(
                 "width variable `{}` is not determined by the pattern",
                 rule.width_vars[usize::from(v)]
+            ),
+            name_span,
+        ));
+    }
+    // Every rounding-mode variable is bound by the pattern too.
+    let mut bound_modes = vec![false; rule.modes.len()];
+    walk(rule, rule.lhs, |n| {
+        if let RNode::Fp(f) = &rule.nodes[n as usize]
+            && let Some(super::ir::Rounding::Var(i)) = f.rounding
+        {
+            bound_modes[usize::from(i)] = true;
+        }
+    });
+    if let Some(i) = bound_modes.iter().position(|b| !b) {
+        return Err(Diagnostic::error(
+            "BW0102",
+            format!(
+                "rounding-mode parameter `{}` does not occur in the pattern",
+                rule.modes[i]
             ),
             name_span,
         ));
@@ -1569,6 +1854,9 @@ fn rule_id(rule: &Rule) -> RuleId {
     };
     feed(rule.kind as u64);
     feed(rule.width_vars.len() as u64);
+    if !rule.modes.is_empty() {
+        feed(0x6d6f_6465 + rule.modes.len() as u64);
+    }
     for c in &rule.constraints {
         match c {
             WCons::Cmp(a, op, b) => {
@@ -1643,6 +1931,18 @@ fn rule_id(rule: &Rule) -> RuleId {
                         RNode::Extract(lo, _) => wexpr(&mut feed, lo),
                         RNode::Fact(p, ..) => feed(*p as u64),
                         RNode::ConstP(p, _) => feed(*p as u64),
+                        RNode::Fp(f) => {
+                            feed(crate::hash::bytes(
+                                6,
+                                format!("{:?} {:?}", f.kind, f.rounding).as_bytes(),
+                            ));
+                            wexpr(&mut feed, &f.eb);
+                            wexpr(&mut feed, &f.sb);
+                            if let Some((e, s)) = &f.to {
+                                wexpr(&mut feed, e);
+                                wexpr(&mut feed, s);
+                            }
+                        }
                         _ => {}
                     }
                     sort(&mut feed, n);
@@ -1652,6 +1952,25 @@ fn rule_id(rule: &Rule) -> RuleId {
         }
     }
     RuleId(hs)
+}
+
+/// The floating-point constant `fp.<name>` names.
+fn float_lit(name: &str) -> Option<FloatLit> {
+    Some(match name {
+        "zero" => FloatLit::Zero,
+        "nzero" => FloatLit::NegZero,
+        "inf" => FloatLit::Inf,
+        "ninf" => FloatLit::NegInf,
+        "nan" => FloatLit::Nan,
+        "one" => FloatLit::One,
+        "none" => FloatLit::NegOne,
+        "two" => FloatLit::Two,
+        "half" => FloatLit::Half,
+        "min_normal" => FloatLit::MinNormal,
+        "min_subnormal" => FloatLit::MinSubnormal,
+        "max" => FloatLit::MaxFinite,
+        _ => return None,
+    })
 }
 
 /// Parses digits into little-endian limbs (at most 512 bits).
@@ -1860,7 +2179,7 @@ fn width_domain(vars: usize) -> Vec<u16> {
 }
 
 /// The width assignments of the rule's variables over [`width_domain`] that satisfy the
-/// constraints.
+/// constraints, each with every assignment of its rounding-mode variables after the widths.
 pub(crate) fn width_assignments(rule: &Rule) -> Vec<Vec<u16>> {
     let n = rule.width_vars.len();
     let domain = width_domain(n);
@@ -1869,7 +2188,7 @@ pub(crate) fn width_assignments(rule: &Rule) -> Vec<Vec<u16>> {
     loop {
         let cur: Vec<u16> = idx.iter().map(|&i| domain[i]).collect();
         if rule.constraints.iter().all(|c| c.holds(&cur)) {
-            out.push(cur);
+            out.extend(with_modes(rule, cur));
         }
         let mut k = 0;
         loop {
@@ -1884,6 +2203,24 @@ pub(crate) fn width_assignments(rule: &Rule) -> Vec<Vec<u16>> {
             k += 1;
         }
     }
+}
+
+/// `widths` followed by each assignment of the rule's rounding-mode variables.
+pub(crate) fn with_modes(rule: &Rule, widths: Vec<u16>) -> Vec<Vec<u16>> {
+    let mut out = vec![widths];
+    for _ in &rule.modes {
+        out = out
+            .into_iter()
+            .flat_map(|ws| {
+                (0..RoundingMode::ALL.len() as u16).map(move |m| {
+                    let mut v = ws.clone();
+                    v.push(m);
+                    v
+                })
+            })
+            .collect();
+    }
+    out
 }
 
 /// Checks that wherever the pattern can match, the template, guard and lets are well typed

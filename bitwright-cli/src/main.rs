@@ -274,17 +274,42 @@ fn lint(rest: &[String]) -> Result<String, Fail> {
     Ok(out)
 }
 
-/// Every assignment of `domain` to the rule's width variables that the rule admits, in order,
-/// at most `cap` of them.
+/// `widths` followed by each assignment of the rule's rounding-mode variables (an index in
+/// `RoundingMode::ALL` each).
+fn with_modes(rule: &Rule, widths: &[u16]) -> Vec<Vec<u16>> {
+    let mut out = vec![widths.to_vec()];
+    for _ in &rule.modes {
+        out = out
+            .into_iter()
+            .flat_map(|ws| {
+                (0..bitwright::fp::RoundingMode::ALL.len() as u16).map(move |m| {
+                    let mut v = ws.clone();
+                    v.push(m);
+                    v
+                })
+            })
+            .collect();
+    }
+    out
+}
+
+/// Every assignment of `domain` to the rule's width variables that the rule admits (each with
+/// every rounding mode of its mode variables), in order, at most `cap` width assignments.
 fn admitted_over(rule: &Rule, domain: &[u16], cap: usize) -> Vec<Vec<u16>> {
     let n = rule.width_vars.len();
     let mut out = Vec::new();
+    let mut found = 0;
     let mut idx = vec![0usize; n];
     loop {
         let ws: Vec<u16> = idx.iter().map(|&i| domain[i]).collect();
-        if rule.admits(&ws) {
-            out.push(ws);
-            if out.len() >= cap {
+        let admitted: Vec<Vec<u16>> = with_modes(rule, &ws)
+            .into_iter()
+            .filter(|w| rule.admits(w))
+            .collect();
+        if !admitted.is_empty() {
+            out.extend(admitted);
+            found += 1;
+            if found >= cap {
                 return out;
             }
         }
@@ -308,11 +333,10 @@ fn admitted_over(rule: &Rule, domain: &[u16], cap: usize) -> Vec<Vec<u16>> {
 /// widths 1..=16 and a few wide ones.
 fn assignments(rule: &Rule, given: Option<&[u16]>) -> Vec<Vec<u16>> {
     if let Some(g) = given {
-        return if rule.admits(g) {
-            vec![g.to_vec()]
-        } else {
-            vec![]
-        };
+        return with_modes(rule, g)
+            .into_iter()
+            .filter(|w| rule.admits(w))
+            .collect();
     }
     let usual = admitted_over(rule, &[8, 32, 64], usize::MAX);
     if !usual.is_empty() {

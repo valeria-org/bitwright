@@ -32,8 +32,8 @@ use std::sync::Arc;
 pub use compile::CompileLimits;
 pub use diag::{CompileError, Diagnostic, Level, explain};
 pub use ir::{
-    ConstPred, FactPred, Group, LetDef, Literal, NodeId, Param, ParamKind, RNode, Rule, RuleId,
-    RuleKind, Sort, WCmp, WCons, WExpr,
+    ConstPred, FactPred, FloatLit, FpNode, Group, LetDef, Literal, NodeId, Param, ParamKind, RNode,
+    Rounding, Rule, RuleId, RuleKind, Sort, WCmp, WCons, WExpr,
 };
 pub use ledger::Ledger;
 

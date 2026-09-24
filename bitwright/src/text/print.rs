@@ -311,7 +311,7 @@ impl Printer<'_> {
                     let int_operand = d.is_some_and(|d| {
                         matches!(
                             d.kind(),
-                            crate::fp::node::Kind::FromS | crate::fp::node::Kind::FromU
+                            crate::fp::node::Kind::FromSInt | crate::fp::node::Kind::FromUInt
                         )
                     });
                     let name =

@@ -9,7 +9,7 @@
 //! search over budget is no match, which is always sound.
 
 use super::eval::{admitted, literal};
-use super::ir::{NodeId, ParamKind, RNode, Rule, Sort, WExpr};
+use super::ir::{NodeId, ParamKind, RNode, Rounding, Rule, Sort, WExpr};
 use crate::Width;
 use crate::expr::{Context, OpCode};
 use crate::ops::CmpOp;
@@ -44,7 +44,20 @@ impl Bindings {
     pub(crate) fn new(rule: &Rule) -> Self {
         Bindings {
             params: vec![None; rule.params.len()],
-            widths: vec![None; rule.width_vars.len()],
+            // The width variables, then the rounding-mode variables.
+            widths: vec![None; rule.width_vars.len() + rule.modes.len()],
+        }
+    }
+
+    /// Binds rounding-mode variable slot `k` (after the width variables) to `mode`, or checks
+    /// it.
+    fn bind_mode(&mut self, k: usize, mode: u16) -> bool {
+        match self.widths[k] {
+            Some(m) => m == mode,
+            None => {
+                self.widths[k] = Some(mode);
+                true
+            }
         }
     }
 
@@ -82,13 +95,26 @@ impl Bindings {
     }
 }
 
+/// Which width expression of a pattern node.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Which {
+    /// Its sort's width.
+    Sort,
+    /// An extract's offset.
+    Offset,
+    /// A floating-point node's exponent width.
+    Eb,
+    /// A conversion's target exponent width.
+    ToEb,
+}
+
 /// A partial match: bindings plus the pairs still to visit and the checks still to make.
 #[derive(Clone)]
 struct State {
     b: Bindings,
     todo: Vec<(NodeId, u32)>,
-    /// `(width expression's owner, is extract offset, actual)` not yet determined.
-    widths: Vec<(NodeId, bool, i64)>,
+    /// `(width expression's owner, which one, actual)` not yet determined.
+    widths: Vec<(NodeId, Which, i64)>,
     /// Literals and closed subterms, compared by value once every width is bound.
     values: Vec<(NodeId, u32)>,
 }
@@ -99,30 +125,29 @@ struct M<'a> {
     steps: u32,
 }
 
-fn width_expr(rule: &Rule, pat: NodeId, offset: bool) -> Option<&WExpr> {
-    if offset {
-        match &rule.nodes[pat as usize] {
-            RNode::Extract(lo, _) => Some(lo),
-            _ => None,
-        }
-    } else {
-        match &rule.sorts[pat as usize] {
+fn width_expr(rule: &Rule, pat: NodeId, which: Which) -> Option<&WExpr> {
+    match (which, &rule.nodes[pat as usize]) {
+        (Which::Sort, _) => match &rule.sorts[pat as usize] {
             Sort::Bv(w) => Some(w),
             Sort::Bool => None,
-        }
+        },
+        (Which::Offset, RNode::Extract(lo, _)) => Some(lo),
+        (Which::Eb, RNode::Fp(f)) => Some(&f.eb),
+        (Which::ToEb, RNode::Fp(f)) => f.to.as_ref().map(|(e, _)| e),
+        _ => None,
     }
 }
 
 /// Binds (or defers) one width expression of the pattern.
-fn bind_or_defer(m: &M<'_>, st: &mut State, pat: NodeId, offset: bool, actual: i64) -> bool {
-    let Some(e) = width_expr(m.rule, pat, offset) else {
+fn bind_or_defer(m: &M<'_>, st: &mut State, pat: NodeId, which: Which, actual: i64) -> bool {
+    let Some(e) = width_expr(m.rule, pat, which) else {
         return true;
     };
     match st.b.bind(e, actual) {
         Bind::Ok => true,
         Bind::Fail => false,
         Bind::Later => {
-            st.widths.push((pat, offset, actual));
+            st.widths.push((pat, which, actual));
             true
         }
     }
@@ -132,7 +157,7 @@ fn bind_or_defer(m: &M<'_>, st: &mut State, pat: NodeId, offset: bool, actual: i
 fn step(m: &mut M<'_>, st: &mut State, pat: NodeId, node: u32) -> Step {
     let (rule, cx) = (m.rule, m.cx);
     let n = cx.node(node);
-    if !bind_or_defer(m, st, pat, false, i64::from(n.width)) {
+    if !bind_or_defer(m, st, pat, Which::Sort, i64::from(n.width)) {
         return Step::Fail;
     }
     // A closed subterm (no parameters) denotes one constant, which the builder has folded.
@@ -197,7 +222,7 @@ fn step(m: &mut M<'_>, st: &mut State, pat: NodeId, node: u32) -> Step {
             Step::Ok
         }
         RNode::Extract(_, a) if n.op == OpCode::Extract => {
-            if !bind_or_defer(m, st, pat, true, i64::from(n.b)) {
+            if !bind_or_defer(m, st, pat, Which::Offset, i64::from(n.b)) {
                 return Step::Fail;
             }
             st.todo.push((*a, n.a));
@@ -213,6 +238,42 @@ fn step(m: &mut M<'_>, st: &mut State, pat: NodeId, node: u32) -> Step {
             st.todo.push((*t, n.b));
             st.todo.push((*c, n.a));
             Step::Ok
+        }
+        RNode::Fp(f) if n.op == f.kind.opcode() => {
+            // The node's attributes: the format's exponent width, a conversion's target's,
+            // and the rounding mode (fixed, or bound to a variable).
+            let aux = n.aux;
+            if !bind_or_defer(m, st, pat, Which::Eb, i64::from(aux & 31)) {
+                return Step::Fail;
+            }
+            if f.to.is_some() && !bind_or_defer(m, st, pat, Which::ToEb, i64::from(n.b)) {
+                return Step::Fail;
+            }
+            let mode = u16::from(aux >> 5);
+            match f.rounding {
+                Some(Rounding::Mode(r)) if u16::from(crate::fp::node::rm_code(r)) != mode => {
+                    return Step::Fail;
+                }
+                Some(Rounding::Var(i))
+                    if !st.b.bind_mode(rule.width_vars.len() + usize::from(i), mode) =>
+                {
+                    return Step::Fail;
+                }
+                _ => {}
+            }
+            let kids = [n.a, n.b, n.c];
+            if f.kind.commutative() {
+                // The first two operands in either order (the third, fma's addend, fixed).
+                if let Some(&c) = f.args.get(2) {
+                    st.todo.push((c, kids[2]));
+                }
+                Step::Either((f.args[0], f.args[1]), (n.a, n.b))
+            } else {
+                for (k, &a) in f.args.iter().enumerate().rev() {
+                    st.todo.push((a, kids[k]));
+                }
+                Step::Ok
+            }
         }
         _ => Step::Fail,
     }
@@ -261,12 +322,12 @@ fn finish(m: &M<'_>, mut st: State) -> Option<Bindings> {
     loop {
         let before = st.widths.len();
         let pending = std::mem::take(&mut st.widths);
-        for (pat, offset, actual) in pending {
-            let e = width_expr(rule, pat, offset)?;
+        for (pat, which, actual) in pending {
+            let e = width_expr(rule, pat, which)?;
             match st.b.bind(e, actual) {
                 Bind::Ok => {}
                 Bind::Fail => return None,
-                Bind::Later => st.widths.push((pat, offset, actual)),
+                Bind::Later => st.widths.push((pat, which, actual)),
             }
         }
         if st.widths.is_empty() {
@@ -400,6 +461,11 @@ pub(crate) fn build_pattern(
             RNode::Select(c, t, f) => {
                 let (c, t, f) = (rec(cx, *c)?, rec(cx, *t)?, rec(cx, *f)?);
                 cx.c_select(c, t, f).ok()?
+            }
+            RNode::Fp(f) => {
+                let d = super::eval::fp_desc(rule, n, f, widths)?;
+                let args: Vec<u32> = f.args.iter().map(|&a| rec(cx, a)).collect::<Option<_>>()?;
+                cx.c_fp(d, &args).ok()?
             }
             _ => return None,
         })

@@ -291,6 +291,11 @@ fn build(
             let (c, t, f) = (rec(cx, *c)?, rec(cx, *t)?, rec(cx, *f)?);
             cx.c_select(c, t, f).ok()?
         }
+        RNode::Fp(f) => {
+            let d = super::eval::fp_desc(rule, n, f, widths)?;
+            let args: Vec<u32> = f.args.iter().map(|&a| rec(cx, a)).collect::<Option<_>>()?;
+            cx.c_fp(d, &args).ok()?
+        }
         _ => return None,
     })
 }

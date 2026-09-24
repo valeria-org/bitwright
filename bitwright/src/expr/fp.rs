@@ -44,7 +44,7 @@ impl Context {
             )));
         }
         let fw = d.format.width().bits();
-        if !matches!(kind, Kind::FromS | Kind::FromU) {
+        if !matches!(kind, Kind::FromSInt | Kind::FromUInt) {
             for &a in args {
                 let w = self.wid(a);
                 if w != fw {

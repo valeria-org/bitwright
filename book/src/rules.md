@@ -77,6 +77,58 @@ An identity is an unconditional equation: no guard, no `let`, no capture kinds, 
 on both sides. The directed engine uses it left to right only if that direction decreases the
 order; the [equality-saturation search](eqsat.md) uses identities in both directions.
 
+## Floating point
+
+Rules can rewrite [floating-point](floating-point.md) operations. They are written as in the
+text syntax, with the format as width expressions: `fp.mul.rne<E, S>(x, y)` is a product in the
+format with `E` exponent and `S` significand bits, whose operands have width `E + S`; a named
+format (`fp.mul.rne.f32(x, y)`) needs no width variables. A rounding-mode parameter, declared
+`r: rm`, stands for all five modes: the pattern binds it from the node it matches
+(`fp.mul.r<E, S>(…)`), and the template can use it. A rule has at most two.
+
+Constants are written `fp.zero`, `fp.nzero` (−0), `fp.inf`, `fp.ninf`, `fp.nan`, `fp.one`,
+`fp.none` (−1), `fp.two`, `fp.half`, `fp.min_normal`, `fp.min_subnormal` and `fp.max` (the
+largest finite value), each with its format: `fp.one<E, S>`, `fp.inf.f64`. The operations the
+builder makes from other operators (`fp.neg`, `fp.abs`, `fp.copysign`, `fp.sub`, `fp.gt`,
+`fp.ge` and the tests `fp.isnan` …) are written out as the builder writes them, so a pattern
+of them matches what it builds. They have no floating-point node of their own, so a pattern
+whose format is generic must also contain an operation that is one (it binds `E` apart from
+`S`), or name its format. x87's load and store are not available in rules.
+
+```rust
+use bitwright::check::{CheckConfig, Verdict, check_program};
+use bitwright::rules::RuleProgram;
+
+let src = "bitwright 1;
+group float {
+    /// A square is never negative: the sign of a product of equal signs is clear, and a NaN
+    /// result is the canonical one.
+    #[example(\"fp.abs.f64(fp.mul.rtz.f64(x:64, x:64))\" => \"fp.mul.rtz.f64(x:64, x:64)\")]
+    rule abs_square<E, S>(x: E + S, r: rm) {
+        fp.abs<E, S>(fp.mul.r<E, S>(x, x)) => fp.mul.r<E, S>(x, x)
+    }
+
+    /// Wrong: x · 1 is x only on values, a NaN operand's payload is lost.
+    #[allow(BW0407)]
+    rule mul_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+}";
+let program = RuleProgram::compile(src).map_err(|e| e.render("float.bwr", src))?;
+let checks = check_program(&program, &CheckConfig::default());
+assert!(checks[0].is_sound() && checks[0].examples.is_empty());
+let Verdict::Unsound(cx) = &checks[1].verdict else { panic!() };
+// E = 2, S = 2, r = rne; x = 0xf:4: lhs = 0x7:4, rhs = 0xf:4 (−NaN becomes the NaN)
+assert_eq!(cx.lhs.to_u64(), Some(0x7));
+# Ok::<(), String>(())
+```
+
+The [checker](checking.md) checks a floating-point rule in every format whose widths it
+enumerates exhaustively (`E` and `S` up to 6, which is where formats are strangest) and at
+sampled wider ones, under every rounding mode of its mode parameters. It finds what holds
+almost everywhere: rounding a value to an integral one and then converting it to an integer
+is not the same as converting it directly in a format such as `(2, 3)`, where 3.5 rounds to 4,
+which is past the largest finite value, so the rule needs `where S <= E` (a format in which
+every value with a large enough exponent is an integer).
+
 ## Attributes and diagnostics
 
 `/// doc comments` and `#[example("input" => "output")]` document a rule; examples are checked

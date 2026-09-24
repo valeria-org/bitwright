@@ -949,6 +949,102 @@ fn bitwuzla_proves_the_built_in_rules() {
     solver_proves_the_built_in_rules(Solver::Bitwuzla);
 }
 
+/// A program of floating-point rules: sound ones, then one that is not.
+const FP_RULES: &str = "bitwright 1;
+group fp {
+    #[allow(BW0407)]
+    rule abs_square<E, S>(x: E + S, r: rm) {
+        fp.abs<E, S>(fp.mul.r<E, S>(x, x)) => fp.mul.r<E, S>(x, x)
+    }
+    #[allow(BW0407)]
+    rule sqrt_neg<E, S>(x: E + S, r: rm) {
+        fp.isneg<E, S>(fp.sqrt.r<E, S>(x)) => x == smin_lit
+    }
+    #[allow(BW0407)]
+    rule to_int_of_round<E, S, W>(x: E + S, r: rm, q: rm) where S <= E {
+        fp.to_sbv.q<E, S, W>(fp.round.r<E, S>(x)) => fp.to_sbv.r<E, S, W>(x)
+    }
+    #[allow(BW0407)]
+    rule mul_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+}
+";
+
+/// The obligations of [`FP_RULES`] at standard formats, every rounding mode: `(rule, sound,
+/// assignment, script)`.
+fn fp_obligations() -> Vec<(String, bool, Vec<u16>, String)> {
+    let p =
+        RuleProgram::compile(FP_RULES).unwrap_or_else(|e| panic!("{}", e.render("t", FP_RULES)));
+    let mut out = Vec::new();
+    for rule in p.rules() {
+        let widths: &[&[u16]] = if rule.width_vars.len() == 3 {
+            &[&[8, 8, 8], &[5, 5, 16]]
+        } else {
+            &[&[5, 11], &[8, 24], &[11, 53]]
+        };
+        for ws in widths {
+            for full in crate::rules::compile::with_modes(rule, ws.to_vec()) {
+                assert!(rule.admits(&full), "{} {full:?}", rule.name);
+                let script = rule_obligation(rule, &full).unwrap();
+                out.push((
+                    rule.name.clone(),
+                    !rule.name.ends_with("mul_one"),
+                    full,
+                    script,
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn floating_point_obligations_read_back() {
+    for (name, _, ws, script) in fp_obligations() {
+        assert!(
+            script.contains("(set-logic QF_BVFP)"),
+            "{name} {ws:?}:\n{script}"
+        );
+        import(&mut Context::new(), &script).unwrap_or_else(|e| panic!("{name}: {e}\n{script}"));
+    }
+}
+
+/// The floating-point rules proved, and the unsound one refuted, by a solver.
+fn solver_proves_floating_point_rules(solver: Solver) {
+    if !solver.available() {
+        return;
+    }
+    let mut refuted = false;
+    for (name, sound, ws, script) in fp_obligations() {
+        // Bitwuzla has only binary16, 32, 64 and 128 (without its experimental formats).
+        let standard = [[5, 11], [8, 24], [11, 53], [15, 113]]
+            .iter()
+            .any(|f| ws[..2] == f[..]);
+        if matches!(solver, Solver::Bitwuzla) && !standard {
+            continue;
+        }
+        let answer = solver.run(&script, Some(60_000)).unwrap();
+        match (answer.trim(), sound) {
+            ("unsat", true) => {}
+            ("sat", false) => refuted = true,
+            ("unsat", false) => {}
+            (a, _) => panic!("{}: {name} {ws:?}: {a}", solver.name()),
+        }
+    }
+    assert!(refuted, "{}: mul_one never refuted", solver.name());
+}
+
+#[test]
+#[ignore = "needs z3 on PATH"]
+fn z3_proves_floating_point_rules() {
+    solver_proves_floating_point_rules(Solver::Z3);
+}
+
+#[test]
+#[ignore = "needs bitwuzla on PATH"]
+fn bitwuzla_proves_floating_point_rules() {
+    solver_proves_floating_point_rules(Solver::Bitwuzla);
+}
+
 // ----- regressions from the M8 review ------------------------------------------------------------
 
 #[test]

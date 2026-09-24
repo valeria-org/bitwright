@@ -130,6 +130,8 @@ impl fmt::Display for Evidence {
 pub struct Counterexample {
     /// Width variable values.
     pub widths: Vec<(String, u16)>,
+    /// Rounding-mode variable values.
+    pub modes: Vec<(String, crate::fp::RoundingMode)>,
     /// Parameter values.
     pub params: Vec<(String, BitVec)>,
     /// The pattern's value.
@@ -144,6 +146,11 @@ impl fmt::Display for Counterexample {
             .widths
             .iter()
             .map(|(n, w)| format!("{n} = {w}"))
+            .chain(
+                self.modes
+                    .iter()
+                    .map(|(n, m)| format!("{n} = {}", m.name())),
+            )
             .collect();
         let ps: Vec<String> = self
             .params
@@ -370,6 +377,16 @@ fn counterexample(
             .cloned()
             .zip(widths.iter().copied())
             .collect(),
+        modes: rule
+            .modes
+            .iter()
+            .cloned()
+            .zip(
+                widths[rule.width_vars.len().min(widths.len())..]
+                    .iter()
+                    .filter_map(|&m| crate::fp::RoundingMode::ALL.get(usize::from(m)).copied()),
+            )
+            .collect(),
         params: rule
             .params
             .iter()
@@ -517,8 +534,9 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
     let max_bits = cfg.max_exhaustive_bits.min(40);
     let mut complete = true;
     // Exhaustive.
+    let nw = rule.width_vars.len();
     'exhaustive: for ws in &admitted_all {
-        if ws.iter().any(|&w| w > cfg.max_exhaustive_width) {
+        if ws[..nw].iter().any(|&w| w > cfg.max_exhaustive_width) {
             complete = false;
             continue;
         }
@@ -532,7 +550,7 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
             continue;
         }
         ev.exhaustive_instances += 1;
-        let maxw = ws
+        let maxw = ws[..nw]
             .iter()
             .copied()
             .chain(Some(width_of(rule, rule.lhs, ws).map_or(0, |w| w.bits())))
@@ -584,12 +602,17 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
             // whose first width is in the list.
             for ws in &admitted_all {
                 if cfg.sample_widths.contains(&ws[0]) && picks.len() < 400 {
-                    picks.push(ws.clone());
+                    picks.push(ws[..n].to_vec());
                 }
             }
         }
         picks.sort();
         picks.dedup();
+        // Every rounding mode at each.
+        let picks: Vec<Vec<u16>> = picks
+            .into_iter()
+            .flat_map(|ws| crate::rules::compile::with_modes(rule, ws))
+            .collect();
         'sampled: for ws in picks {
             if !admitted(rule, &ws) {
                 continue;

@@ -892,3 +892,234 @@ group g {
         );
     }
 }
+
+// ----- floating point ---------------------------------------------------------------------------
+
+/// A lighter check for floating-point rules, which sample formats up to 512 bits wide.
+fn check_fp(body: &str) -> RuleCheck {
+    let p = program(body);
+    assert_eq!(p.rules().len(), 1);
+    let cfg = CheckConfig::default()
+        .with_samples(3)
+        .with_sample_widths(vec![7, 8, 11, 16, 24, 32, 53]);
+    check_rule(&p.rules()[0], &cfg)
+}
+
+#[test]
+fn floating_point_rules_are_checked() {
+    for body in [
+        // Rounding to an integral value first changes nothing a conversion to an integer
+        // does, whatever the two modes, where every value that large is an integer (S <= E
+        // implies emax >= S - 1).
+        "rule to_int_of_round<E, S, W>(x: E + S, r: rm, q: rm) where S <= E { \
+            fp.to_sbv.q<E, S, W>(fp.round.r<E, S>(x)) => fp.to_sbv.r<E, S, W>(x) }",
+        // A square is never negative, a NaN included (the canonical one has sign 0).
+        "rule abs_square<E, S>(x: E + S, r: rm) { \
+            fp.abs<E, S>(fp.mul.r<E, S>(x, x)) => fp.mul.r<E, S>(x, x) }",
+        // Only the root of -0 is negative.
+        "rule sqrt_neg<E, S>(x: E + S, r: rm) { \
+            fp.isneg<E, S>(fp.sqrt.r<E, S>(x)) => x == smin_lit }",
+        "rule iszero_eq(x: 16) { fp.iszero.f16(x) => fp.eq.f16(x, fp.zero.f16) }",
+        "identity isnan_ne(x: 16) { fp.isnan.f16(x) <=> ~fp.eq.f16(x, x) }",
+        "identity double(x: 16) { fp.mul.rne.f16(x, fp.two.f16) <=> fp.add.rne.f16(x, x) }",
+    ] {
+        let c = check_fp(body);
+        assert!(c.is_sound(), "{body}\n{:?}\n{}", c.verdict, c.evidence);
+        assert!(c.evidence.exhaustive_cases > 0, "{body}");
+    }
+    // Identities on values only: a NaN operand's payload, or -0 toward -inf, breaks them;
+    // and without its constraint the first rule above fails where rounding to an integral
+    // value overflows (in (2, 3), 3.5 rounds to 4, which is past the largest value).
+    for (body, why) in [
+        (
+            "rule to_int_of_round<E, S, W>(x: E + S, r: rm, q: rm) { \
+                fp.to_sbv.q<E, S, W>(fp.round.r<E, S>(x)) => fp.to_sbv.r<E, S, W>(x) }",
+            "rounding to an integral value can overflow",
+        ),
+        (
+            "rule mul_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }",
+            "a NaN with a payload",
+        ),
+        (
+            "rule add_nzero<E, S>(x: E + S) { fp.add.rtn<E, S>(x, fp.nzero<E, S>) => x }",
+            "+0 + -0 is -0 toward -inf",
+        ),
+        (
+            "rule neg_sub<E, S>(x: E + S, y: E + S, r: rm) { \
+                fp.neg<E, S>(fp.sub.r<E, S>(x, y)) => fp.sub.r<E, S>(y, x) }",
+            "the sign of a zero difference, and the direction of rounding",
+        ),
+    ] {
+        let c = check_fp(body);
+        match &c.verdict {
+            Verdict::Unsound(cex) => assert_ne!(cex.lhs, cex.rhs, "{body}"),
+            v => panic!("{why}: expected a counterexample for\n{body}\ngot {v:?}"),
+        }
+    }
+    // The counterexample names the rounding mode.
+    let c = check_fp(
+        "rule add_nzero<E, S>(x: E + S, r: rm) { fp.add.r<E, S>(x, fp.nzero<E, S>) => x }",
+    );
+    let Verdict::Unsound(cex) = c.verdict else {
+        panic!()
+    };
+    assert_eq!(cex.modes.len(), 1);
+    assert!(cex.to_string().contains("r = "), "{cex}");
+}
+
+#[test]
+fn floating_point_patterns_match_the_builder() {
+    use crate::fp::{FpCmpOp, FpFormat, FpTest, RoundingMode};
+    // Each operation the builder makes from other operators, written in a rule, matches the
+    // builder's own nodes in every format.
+    type Build = fn(&mut crate::Context, FpFormat, Expr, Expr) -> Expr;
+    let cases: [(&str, Build); 15] = [
+        ("fp.neg<E, S>(x)", |cx, f, x, _| cx.fp_neg(f, x).unwrap()),
+        ("fp.abs<E, S>(x)", |cx, f, x, _| cx.fp_abs(f, x).unwrap()),
+        ("fp.copysign<E, S>(x, y)", |cx, f, x, y| {
+            cx.fp_copysign(f, x, y).unwrap()
+        }),
+        ("fp.sub.rtz<E, S>(x, y)", |cx, f, x, y| {
+            cx.fp_sub(f, RoundingMode::Rtz, x, y).unwrap()
+        }),
+        ("fp.gt<E, S>(x, y)", |cx, f, x, y| {
+            cx.fp_cmp(f, FpCmpOp::Gt, x, y).unwrap()
+        }),
+        ("fp.ge<E, S>(x, y)", |cx, f, x, y| {
+            cx.fp_cmp(f, FpCmpOp::Ge, x, y).unwrap()
+        }),
+        ("fp.lt<E, S>(x, y)", |cx, f, x, y| {
+            cx.fp_cmp(f, FpCmpOp::Lt, x, y).unwrap()
+        }),
+        ("fp.isnan<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Nan, x).unwrap()
+        }),
+        ("fp.isinf<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Infinite, x).unwrap()
+        }),
+        ("fp.iszero<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Zero, x).unwrap()
+        }),
+        ("fp.isnormal<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Normal, x).unwrap()
+        }),
+        ("fp.issubnormal<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Subnormal, x).unwrap()
+        }),
+        ("fp.isneg<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Negative, x).unwrap()
+        }),
+        ("fp.ispos<E, S>(x)", |cx, f, x, _| {
+            cx.fp_test(f, FpTest::Positive, x).unwrap()
+        }),
+        ("fp.fma.rtp<E, S>(x, y, x)", |cx, f, x, y| {
+            cx.fp(crate::fp::FpOp::Fma(RoundingMode::Rtp), f, &[x, y, x])
+                .unwrap()
+        }),
+    ];
+    for (text, build) in cases {
+        let binary = text.contains('y');
+        // At concrete formats: an operation built from other operators binds no exponent
+        // width of its own.
+        for (eb, sb) in [(2u32, 3u32), (3, 4), (5, 11), (8, 24), (11, 53)] {
+            let w = eb + sb;
+            let params = if binary {
+                format!("x: {w}, y: {w}")
+            } else {
+                format!("x: {w}")
+            };
+            let text = text.replace("<E, S>", &format!("<{eb}, {sb}>"));
+            let p = program(&format!("identity t({params}) {{ {text} <=> {text} }}"));
+            let rule = &p.rules()[0];
+            let f = FpFormat::new(eb, sb).unwrap();
+            let mut cx = crate::Context::new();
+            let x = cx.symbol("x", f.width()).unwrap();
+            let y = cx.symbol("y", f.width()).unwrap();
+            let e = build(&mut cx, f, x, y);
+            let id = cx.id(e).unwrap();
+            assert!(
+                crate::rules::matcher::match_rule(&cx, rule, id).is_some(),
+                "{text} does not match {}",
+                cx.display(e)
+            );
+        }
+    }
+}
+
+#[test]
+fn floating_point_rules_apply() {
+    let p = program(
+        "/// A square is never negative.
+        #[example(\"fp.abs.f64(fp.mul.rtz.f64(x:64, x:64))\" => \"fp.mul.rtz.f64(x:64, x:64)\")]
+        rule abs_square<E, S>(x: E + S, r: rm) {
+            fp.abs<E, S>(fp.mul.r<E, S>(x, x)) => fp.mul.r<E, S>(x, x)
+        }
+        rule to_int_of_round<E, S, W>(x: E + S, r: rm, q: rm) where S <= E {
+            fp.to_sbv.q<E, S, W>(fp.round.r<E, S>(x)) => fp.to_sbv.r<E, S, W>(x)
+        }",
+    );
+    let rule = &p.rules()[0];
+    assert!(rule.is_directed());
+    assert_eq!(rule.modes, vec!["r".to_string()]);
+    assert!(
+        check_examples(rule).is_empty(),
+        "{:?}",
+        check_examples(rule)
+    );
+    // The pattern binds the format and the rounding mode from the node.
+    let (cx, _, out) = apply_to(&p, "abs_square", "fp.abs<3, 4>(fp.mul.rna<3, 4>(x, x))", 7);
+    assert_eq!(
+        cx.display(out.unwrap()).to_string(),
+        "fp.mul.rna<3, 4>(x, x)"
+    );
+    let (_, _, out) = apply_to(&p, "abs_square", "fp.abs.f32(fp.mul.rne.f32(x, y))", 32);
+    assert!(out.is_none());
+    let (cx, _, out) = apply_to(
+        &p,
+        "to_int_of_round",
+        "fp.to_sbv.rtz<4, 4, 5>(fp.round.rna<4, 4>(x))",
+        8,
+    );
+    assert_eq!(
+        cx.display(out.unwrap()).to_string(),
+        "fp.to_sbv.rna<4, 4, 5>(x)"
+    );
+    // Not where the constraint fails (binary64: S > E), nor on another operation.
+    let (_, _, out) = apply_to(
+        &p,
+        "to_int_of_round",
+        "fp.to_sbv.rtz.f64<32>(fp.round.rne.f64(x))",
+        64,
+    );
+    assert!(out.is_none());
+    let (_, _, out) = apply_to(
+        &p,
+        "to_int_of_round",
+        "fp.to_sbv.rtz<4, 4, 5>(fp.sqrt.rna<4, 4>(x))",
+        8,
+    );
+    assert!(out.is_none());
+}
+
+#[test]
+fn floating_point_rules_are_validated() {
+    for (body, code) in [
+        (
+            "rule t<E, S>(x: E + S) { fp.add.r<E, S>(x, x) => x }",
+            "BW0001",
+        ),
+        (
+            "rule t<E, S>(x: E + S, r: rm) { fp.add.rne<E, S>(x, x) => fp.add.r<E, S>(x, x) }",
+            "BW0102",
+        ),
+        ("rule t(x: 80) { fp.x87_load(x) => x }", "BW0001"),
+        (
+            "rule t<E, S>(x: E + S, r: rm) { fp.add.r<E, S>(x, r) => x }",
+            "BW0101",
+        ),
+        ("rule t<E, S>(x: E + S) { fp.frob<E, S>(x) => x }", "BW0001"),
+    ] {
+        let e = compile_err(body);
+        assert!(codes(&e).contains(&code), "{body}: {:?}", codes(&e));
+    }
+}

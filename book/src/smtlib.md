@@ -56,7 +56,9 @@ assert_eq!(script.assertions.len(), 1);
 parameters are free, the guard is asserted, and the two sides are asserted to differ. It is
 translated from the rule itself, not from expressions built through the canonicalizing
 constructors, so nothing stands between the rule and the proof. `unsat` proves the rule at those
-widths; `sat` comes with a counterexample.
+widths; `sat` comes with a counterexample. A rule with floating-point operations gives a
+`QF_BVFP` script, and the assignment lists its rounding-mode parameters after the widths, each
+as an index in `RoundingMode::ALL` (`bitwright smt` writes one obligation per mode).
 
 ```rust
 use bitwright::rules::RuleProgram;

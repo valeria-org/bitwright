@@ -21,7 +21,7 @@
 use core::cmp::Ordering;
 
 use super::ir::ParamKind;
-use super::ir::{NodeId, RNode, Rule, Sort, WExpr};
+use super::ir::{NodeId, RNode, Rounding, Rule, Sort, WExpr};
 use crate::expr::{Context, OpCode};
 
 /// Precedence rank of an operator; higher is "bigger". Leaves are 0.
@@ -143,11 +143,15 @@ enum T {
     Var(u16),
     App {
         op: OpCode,
-        /// The result width of a cast or extract, and an extract's offset.
-        params: (Option<WExpr>, Option<WExpr>),
+        /// The result width of a cast or extract, an extract's offset, and a floating-point
+        /// node's attributes.
+        params: (Option<WExpr>, Option<WExpr>, Option<Box<FpParams>>),
         kids: Vec<T>,
     },
 }
+
+/// A floating-point node's rounding mode, format and target format.
+type FpParams = (Option<Rounding>, WExpr, WExpr, Option<(WExpr, WExpr)>);
 
 /// Whether the subterm's value is a constant once matched: it mentions only `const`
 /// parameters, literals and `let`s.
@@ -177,21 +181,47 @@ fn term(rule: &Rule, n: NodeId) -> T {
     match &rule.nodes[n as usize] {
         RNode::Param(i) => T::Var(*i),
         RNode::Lit(_) | RNode::Let(_) => T::Const,
-        RNode::Un(op, a) => app(OpCode::from_un(*op), (None, None), vec![rec(*a)]),
-        RNode::Bin(op, a, b) => app(OpCode::from_bin(*op), (None, None), vec![rec(*a), rec(*b)]),
+        RNode::Un(op, a) => app(OpCode::from_un(*op), (None, None, None), vec![rec(*a)]),
+        RNode::Bin(op, a, b) => app(
+            OpCode::from_bin(*op),
+            (None, None, None),
+            vec![rec(*a), rec(*b)],
+        ),
         RNode::Cmp(op, a, b) => {
             let (stored, swap) = op.canonical();
             let (a, b) = if swap { (*b, *a) } else { (*a, *b) };
-            app(OpCode::from_cmp(stored), (None, None), vec![rec(a), rec(b)])
+            app(
+                OpCode::from_cmp(stored),
+                (None, None, None),
+                vec![rec(a), rec(b)],
+            )
         }
-        RNode::Zext(a) => app(OpCode::Zext, (width(), None), vec![rec(*a)]),
-        RNode::Sext(a) => app(OpCode::Sext, (width(), None), vec![rec(*a)]),
-        RNode::Extract(lo, a) => app(OpCode::Extract, (width(), Some(lo.clone())), vec![rec(*a)]),
-        RNode::Concat(h, l) => app(OpCode::Concat, (None, None), vec![rec(*h), rec(*l)]),
+        RNode::Zext(a) => app(OpCode::Zext, (width(), None, None), vec![rec(*a)]),
+        RNode::Sext(a) => app(OpCode::Sext, (width(), None, None), vec![rec(*a)]),
+        RNode::Extract(lo, a) => app(
+            OpCode::Extract,
+            (width(), Some(lo.clone()), None),
+            vec![rec(*a)],
+        ),
+        RNode::Concat(h, l) => app(OpCode::Concat, (None, None, None), vec![rec(*h), rec(*l)]),
         RNode::Select(c, t, f) => app(
             OpCode::Select,
-            (None, None),
+            (None, None, None),
             vec![rec(*c), rec(*t), rec(*f)],
+        ),
+        RNode::Fp(f) => app(
+            f.kind.opcode(),
+            (
+                width(),
+                None,
+                Some(Box::new((
+                    f.rounding,
+                    f.eb.clone(),
+                    f.sb.clone(),
+                    f.to.clone(),
+                ))),
+            ),
+            f.args.iter().map(|&a| rec(a)).collect(),
         ),
         // Guard-only nodes never occur in patterns or templates (checked by the compiler).
         _ => T::Const,
@@ -372,12 +402,15 @@ fn ground(cx: &Context, mut s: u32, mut t: u32, steps: &mut u32) -> Option<bool>
             Ordering::Less => return Some(false),
             Ordering::Equal => {}
         }
-        let param = |op: OpCode, width: u16, b: u32| match op {
+        let param = |op: OpCode, width: u16, aux: u8, b: u32| match op {
             OpCode::Zext | OpCode::Sext => (width, 0),
             OpCode::Extract => (width, b),
+            // The rounding mode and formats.
+            OpCode::FConvert => (u16::from(aux), b),
+            op if op.is_fp() => (u16::from(aux), 0),
             _ => (0, 0),
         };
-        match param(ns.op, ns.width, ns.b).cmp(&param(nt.op, nt.width, nt.b)) {
+        match param(ns.op, ns.width, ns.aux, ns.b).cmp(&param(nt.op, nt.width, nt.aux, nt.b)) {
             Ordering::Greater => return Some(true),
             Ordering::Less => return Some(false),
             Ordering::Equal => {}

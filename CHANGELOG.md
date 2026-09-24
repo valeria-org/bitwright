@@ -40,6 +40,15 @@
   of either is a set: x86's `ucomiss` flags combined for `ja`, `jae`, `jb`, `jbe` come back as
   one comparison, `fp.lt(x, y) & fp.lt(y, x)` is false. A set is emitted as one integer or
   float comparison (or a negated one) when that is smaller.
+- **Floating-point rules.** `.bwr` rules rewrite floating-point operations, written as in the
+  text syntax with the format as width expressions (`fp.mul.r<E, S>(x, y)` over operands of
+  width `E + S`, or a named format), with constants (`fp.one<E, S>`, `fp.inf.f64`, …) and
+  rounding-mode parameters (`r: rm`, standing for all five modes). The checker checks such a
+  rule in every format up to `(6, 6)` exhaustively and in wider ones by sampling, under every
+  mode, and `bitwright smt` writes `QF_BVFP` obligations, one per mode. New in the rule IR:
+  `RNode::Fp` (`FpNode`, `Rounding`), `Literal::Float` (`FloatLit`), `Rule::modes`,
+  `Counterexample::modes`; `fp::FpKind` names an operation without its attributes. The book's
+  chapter "Writing rules" has a section.
 - **Bindings.** Floating point in C, C++ and Python: formats (`bw_fp_format`, `FpFormat`, the
   named ones), rounding modes, every operation, comparison and test, x87's load and store, and
   the inspection of floating-point nodes (`BW_KIND_FP`, `bw_fp_node_of`, `fp_node()`, and

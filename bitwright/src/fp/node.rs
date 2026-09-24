@@ -7,26 +7,46 @@
 use super::{FpFormat, FpOp, RoundingMode};
 use crate::expr::{Node, OpCode};
 
-/// The operation a floating-point opcode performs, without its attributes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Kind {
+/// A floating-point operation without its attributes (rounding mode, formats, integer width):
+/// what an [`FpOp`] is, and what a rule's floating-point node names
+/// ([`FpNode`](crate::rules::ir::FpNode)).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum Kind {
+    /// [`FpOp::Add`].
     Add,
+    /// [`FpOp::Mul`].
     Mul,
+    /// [`FpOp::Div`].
     Div,
+    /// [`FpOp::Fma`].
     Fma,
+    /// [`FpOp::Sqrt`].
     Sqrt,
+    /// [`FpOp::Rem`].
     Rem,
-    Round,
+    /// [`FpOp::RoundToIntegral`].
+    RoundToIntegral,
+    /// [`FpOp::Min`].
     Min,
+    /// [`FpOp::Max`].
     Max,
+    /// [`FpOp::Eq`].
     Eq,
+    /// [`FpOp::Lt`].
     Lt,
+    /// [`FpOp::Le`].
     Le,
+    /// [`FpOp::Convert`].
     Convert,
-    FromS,
-    FromU,
-    ToS,
-    ToU,
+    /// [`FpOp::FromSInt`].
+    FromSInt,
+    /// [`FpOp::FromUInt`].
+    FromUInt,
+    /// [`FpOp::ToSInt`].
+    ToSInt,
+    /// [`FpOp::ToUInt`].
+    ToUInt,
 }
 
 impl Kind {
@@ -38,17 +58,17 @@ impl Kind {
             Kind::Fma => OpCode::FFma,
             Kind::Sqrt => OpCode::FSqrt,
             Kind::Rem => OpCode::FRem,
-            Kind::Round => OpCode::FRound,
+            Kind::RoundToIntegral => OpCode::FRound,
             Kind::Min => OpCode::FMin,
             Kind::Max => OpCode::FMax,
             Kind::Eq => OpCode::FEq,
             Kind::Lt => OpCode::FLt,
             Kind::Le => OpCode::FLe,
             Kind::Convert => OpCode::FConvert,
-            Kind::FromS => OpCode::FFromS,
-            Kind::FromU => OpCode::FFromU,
-            Kind::ToS => OpCode::FToS,
-            Kind::ToU => OpCode::FToU,
+            Kind::FromSInt => OpCode::FFromS,
+            Kind::FromUInt => OpCode::FFromU,
+            Kind::ToSInt => OpCode::FToS,
+            Kind::ToUInt => OpCode::FToU,
         }
     }
 
@@ -60,17 +80,17 @@ impl Kind {
             OpCode::FFma => Kind::Fma,
             OpCode::FSqrt => Kind::Sqrt,
             OpCode::FRem => Kind::Rem,
-            OpCode::FRound => Kind::Round,
+            OpCode::FRound => Kind::RoundToIntegral,
             OpCode::FMin => Kind::Min,
             OpCode::FMax => Kind::Max,
             OpCode::FEq => Kind::Eq,
             OpCode::FLt => Kind::Lt,
             OpCode::FLe => Kind::Le,
             OpCode::FConvert => Kind::Convert,
-            OpCode::FFromS => Kind::FromS,
-            OpCode::FFromU => Kind::FromU,
-            OpCode::FToS => Kind::ToS,
-            OpCode::FToU => Kind::ToU,
+            OpCode::FFromS => Kind::FromSInt,
+            OpCode::FFromU => Kind::FromUInt,
+            OpCode::FToS => Kind::ToSInt,
+            OpCode::FToU => Kind::ToUInt,
             _ => return None,
         })
     }
@@ -99,17 +119,17 @@ impl Kind {
             FpOp::Fma(_) => Kind::Fma,
             FpOp::Sqrt(_) => Kind::Sqrt,
             FpOp::Rem => Kind::Rem,
-            FpOp::RoundToIntegral(_) => Kind::Round,
+            FpOp::RoundToIntegral(_) => Kind::RoundToIntegral,
             FpOp::Min => Kind::Min,
             FpOp::Max => Kind::Max,
             FpOp::Eq => Kind::Eq,
             FpOp::Lt => Kind::Lt,
             FpOp::Le => Kind::Le,
             FpOp::Convert { .. } => Kind::Convert,
-            FpOp::FromSInt(_) => Kind::FromS,
-            FpOp::FromUInt(_) => Kind::FromU,
-            FpOp::ToSInt(..) => Kind::ToS,
-            FpOp::ToUInt(..) => Kind::ToU,
+            FpOp::FromSInt(_) => Kind::FromSInt,
+            FpOp::FromUInt(_) => Kind::FromUInt,
+            FpOp::ToSInt(..) => Kind::ToSInt,
+            FpOp::ToUInt(..) => Kind::ToUInt,
         }
     }
 
@@ -131,7 +151,8 @@ pub(crate) struct Desc {
     pub(crate) format: FpFormat,
 }
 
-fn rm_code(rm: RoundingMode) -> u8 {
+/// A rounding mode's code in a node's `aux`: its index in [`RoundingMode::ALL`].
+pub(crate) fn rm_code(rm: RoundingMode) -> u8 {
     match rm {
         RoundingMode::Rne => 0,
         RoundingMode::Rna => 1,
@@ -183,7 +204,7 @@ impl Desc {
         let rm = rm_of(n.aux);
         let eb = u32::from(n.aux & 0x1f);
         let fp_width = match kind {
-            Kind::FromS | Kind::FromU => n.width,
+            Kind::FromSInt | Kind::FromUInt => n.width,
             _ => operand_width,
         };
         let format = FpFormat::new(eb, u32::from(fp_width) - eb).ok()?;
@@ -194,7 +215,7 @@ impl Desc {
             Kind::Fma => FpOp::Fma(rm),
             Kind::Sqrt => FpOp::Sqrt(rm),
             Kind::Rem => FpOp::Rem,
-            Kind::Round => FpOp::RoundToIntegral(rm),
+            Kind::RoundToIntegral => FpOp::RoundToIntegral(rm),
             Kind::Min => FpOp::Min,
             Kind::Max => FpOp::Max,
             Kind::Eq => FpOp::Eq,
@@ -207,10 +228,10 @@ impl Desc {
                     rm,
                 }
             }
-            Kind::FromS => FpOp::FromSInt(rm),
-            Kind::FromU => FpOp::FromUInt(rm),
-            Kind::ToS => FpOp::ToSInt(rm, crate::Width::new(n.width).ok()?),
-            Kind::ToU => FpOp::ToUInt(rm, crate::Width::new(n.width).ok()?),
+            Kind::FromSInt => FpOp::FromSInt(rm),
+            Kind::FromUInt => FpOp::FromUInt(rm),
+            Kind::ToSInt => FpOp::ToSInt(rm, crate::Width::new(n.width).ok()?),
+            Kind::ToUInt => FpOp::ToUInt(rm, crate::Width::new(n.width).ok()?),
         };
         Some(Desc { op, format })
     }

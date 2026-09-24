@@ -1,8 +1,12 @@
 //! Concrete evaluation of rule terms, guards and lets, and width well-formedness per
 //! instance. Used by the compiler's width validation and by the soundness checker.
 
-use super::ir::{ConstPred, FactPred, Literal, NodeId, RNode, Rule, Sort};
+use super::ir::{
+    ConstPred, FactPred, FloatLit, FpNode, Literal, NodeId, RNode, Rounding, Rule, Sort,
+};
 use crate::facts::known::{bv_and, count_ones, low_mask};
+use crate::fp::node::Desc;
+use crate::fp::{FpFormat, FpKind, FpOp, RoundingMode};
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
@@ -75,7 +79,84 @@ pub(crate) fn literal(l: &Literal, w: Width, widths: &[u16]) -> Option<BitVec> {
             }
             BitVec::from_u64(w, v as u64).ok()
         }
+        Literal::Float { value, eb } => {
+            let eb = u32::try_from(eb.eval(widths)).ok()?;
+            let f = FpFormat::new(eb, u32::from(w.bits()).checked_sub(eb)?).ok()?;
+            Some(float_value(*value, f))
+        }
     }
+}
+
+/// The encoding of a floating-point constant in format `f`.
+pub(crate) fn float_value(v: FloatLit, f: FpFormat) -> BitVec {
+    let w = f.width();
+    let rne = RoundingMode::Rne;
+    let small = |k: u64| f.from_uint(rne, &BitVec::wrapping_from_u64(Width::W8, k));
+    let flip = |x: &BitVec| BitVec::bin_unchecked(BinOp::Xor, x, &BitVec::smin(w));
+    match v {
+        FloatLit::Zero => f.zero(false),
+        FloatLit::NegZero => f.zero(true),
+        FloatLit::Inf => f.inf(false),
+        FloatLit::NegInf => f.inf(true),
+        FloatLit::Nan => f.nan(),
+        FloatLit::One => small(1),
+        FloatLit::NegOne => flip(&small(1)),
+        FloatLit::Two => small(2),
+        FloatLit::Half => f.div(rne, &small(1), &small(2)).unwrap_or_else(|_| f.nan()),
+        FloatLit::MinNormal => BitVec::bin_unchecked(
+            BinOp::Shl,
+            &BitVec::one(w),
+            &BitVec::wrapping_from_u64(w, u64::from(f.sb() - 1)),
+        ),
+        FloatLit::MinSubnormal => BitVec::one(w),
+        FloatLit::MaxFinite => BitVec::bin_unchecked(BinOp::Sub, &f.inf(false), &BitVec::one(w)),
+    }
+}
+
+/// The node a rule's floating-point node stands for at this assignment (`n` is the node, for
+/// its width): its format valid, its rounding-mode variable assigned.
+pub(crate) fn fp_desc(rule: &Rule, n: NodeId, f: &FpNode, widths: &[u16]) -> Option<Desc> {
+    let format = |eb: &super::ir::WExpr, sb: &super::ir::WExpr| {
+        let (eb, sb) = (eb.eval(widths), sb.eval(widths));
+        FpFormat::new(u32::try_from(eb).ok()?, u32::try_from(sb).ok()?).ok()
+    };
+    let rm = match f.rounding {
+        None => RoundingMode::Rne,
+        Some(Rounding::Mode(m)) => m,
+        Some(Rounding::Var(i)) => {
+            let k = *widths.get(rule.width_vars.len() + usize::from(i))?;
+            *RoundingMode::ALL.get(usize::from(k))?
+        }
+    };
+    let op = match f.kind {
+        FpKind::Add => FpOp::Add(rm),
+        FpKind::Mul => FpOp::Mul(rm),
+        FpKind::Div => FpOp::Div(rm),
+        FpKind::Fma => FpOp::Fma(rm),
+        FpKind::Sqrt => FpOp::Sqrt(rm),
+        FpKind::Rem => FpOp::Rem,
+        FpKind::RoundToIntegral => FpOp::RoundToIntegral(rm),
+        FpKind::Min => FpOp::Min,
+        FpKind::Max => FpOp::Max,
+        FpKind::Eq => FpOp::Eq,
+        FpKind::Lt => FpOp::Lt,
+        FpKind::Le => FpOp::Le,
+        FpKind::Convert => {
+            let (e, s) = f.to.as_ref()?;
+            FpOp::Convert {
+                to: format(e, s)?,
+                rm,
+            }
+        }
+        FpKind::FromSInt => FpOp::FromSInt(rm),
+        FpKind::FromUInt => FpOp::FromUInt(rm),
+        FpKind::ToSInt => FpOp::ToSInt(rm, width_of(rule, n, widths)?),
+        FpKind::ToUInt => FpOp::ToUInt(rm, width_of(rule, n, widths)?),
+    };
+    Some(Desc {
+        op,
+        format: format(&f.eb, &f.sb)?,
+    })
 }
 
 /// Whether every node under `root` is well formed at this width assignment. `strict` is for
@@ -112,6 +193,11 @@ pub(crate) fn well_formed(
                     return Err(n);
                 }
             }
+            // A valid format (and assigned rounding mode); the operands' and result's widths
+            // follow from it by construction.
+            RNode::Fp(f) => {
+                fp_desc(rule, n, f, widths).ok_or(n)?;
+            }
             _ => {}
         }
         stack.extend(super::compile::children(node));
@@ -124,8 +210,12 @@ pub(crate) fn well_formed(
 /// The matcher, the checker and compile-time validation all use this one definition, so a
 /// rule is only ever applied at assignments of the kind the checker checks.
 pub(crate) fn admitted(rule: &Rule, widths: &[u16]) -> bool {
-    if widths.len() != rule.width_vars.len()
-        || widths.iter().any(|&w| w == 0 || w > Width::MAX_BITS)
+    let n = rule.width_vars.len();
+    if widths.len() != n + rule.modes.len()
+        || widths[..n].iter().any(|&w| w == 0 || w > Width::MAX_BITS)
+        || widths[n..]
+            .iter()
+            .any(|&m| usize::from(m) >= RoundingMode::ALL.len())
         || !rule.constraints.iter().all(|c| c.holds(widths))
         || well_formed(rule, rule.lhs, widths, true).is_err()
     {
@@ -184,6 +274,11 @@ pub(crate) fn eval(
                     bv_and(&xv?, &mv) == mv
                 }
             })
+        }
+        RNode::Fp(f) => {
+            let d = fp_desc(rule, n, f, widths)?;
+            let args: Vec<BitVec> = f.args.iter().map(|&a| bv(a)).collect::<Option<_>>()?;
+            Val::Bv(crate::fp::eval(&d, &args))
         }
         RNode::ConstP(p, a) => {
             let c = bv(*a)?;

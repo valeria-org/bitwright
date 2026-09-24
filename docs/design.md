@@ -263,7 +263,8 @@ maximumNumber (`−0 < +0`), conversions to integers saturating with NaN → 0, 
 `copysign` as sign-bit operations. A node keeps its rounding mode and its format's `eb` in `aux`
 (`rm << 5 | eb`), a conversion between formats the target's `eb` in `b`; `sb` follows from the
 operand's width. The sign and class operations, `sub`, `>` and `≥`, and x87's load and store are
-built from bit-vector kinds.
+built from bit-vector kinds. Rules (§7.2) rewrite floating-point nodes generically in the format
+and the rounding mode.
 
 The arithmetic is software (`fp::soft`), exact by construction: operands decode to `m · 2^e`
 with `m` normalized to `p` bits, each operation computes its exact result or a truncation with a
@@ -826,6 +827,13 @@ group core.casts {
   application, and an application whose `let` is undefined does not fire.
 - **Casts carry their target width as a type argument**; matching binds widths from node widths and
   never allocates.
+- **Floating point** (§3.5) is written as in the text syntax with the format as width expressions,
+  `fp.mul.r<E, S>(x, y)` over operands of width `E + S` (`RNode::Fp`), plus constants such as
+  `fp.one<E, S>` (`Literal::Float`). A parameter `r: rm` is a rounding-mode variable (`Rule::modes`,
+  at most two): the matcher binds it and `E` from the node's `aux`, the checker and the SMT export
+  enumerate its five values, and an assignment of a rule's variables lists the modes after the
+  widths. The operations the builder composes from bit-vector kinds (neg, abs, copysign, sub, gt,
+  ge, the tests) desugar to those compositions, so their patterns match what the builder makes.
 - **The template's width must equal the pattern's width** (compile error otherwise). Every template
   variable must be bound.
 - **`identity` vs `rule`** is explicit and checked at three levels: syntax (an identity has no `if`,

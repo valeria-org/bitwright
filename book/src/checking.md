@@ -4,7 +4,9 @@ A rule is used only if it is proven. The checker (feature `check`, on by default
 rule's obligation, *if the guard holds then the pattern equals the template*, on concrete values:
 
 - **exhaustively** at every admitted width assignment with widths up to 6, over every value of
-  the parameters when they total at most 16 bits;
+  the parameters when they total at most 16 bits (and under every rounding mode of a rule's
+  rounding-mode parameters, so a floating-point rule is checked in every format up to
+  `(6, 6)`);
 - **by sampling** at 22 widths up to 512 bits (7, 8, 9, 12, 16, 31, 32, 33, 63, 64, 65, …), with
   boundary-biased values (0, 1, −1, the signed extremes, powers of two), half of them steered
   toward making the guard true.
