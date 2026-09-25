@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0
 
 - **A strategy for compilers, `Strategy::compile()`.** A compiler simplifies every value of
   every function. The standard strategy's passes weigh sharing against every root of a call,
@@ -69,8 +69,12 @@
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.
-- **Behavior changes.** None: the default policy keeps every existing strategy's results and
-  engine ids.
+- **Behavior changes.** None. The default commit policy keeps every existing strategy's
+  results and engine ids (so contexts keep their memos). The word-sized fact transfers, the
+  matcher and construction give the same facts, matches and nodes as before, and
+  declarations and host rewrites act only where a host uses them. The additions to public
+  types (`Strategy::sharing` and `max_region`, `Stats::host`, `By::Rewrite`,
+  `BuildError::UnprovenRewrite`) are to `#[non_exhaustive]` ones.
 
 ## 0.11.0
 

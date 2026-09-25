@@ -1,7 +1,7 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
 Status: in progress. Steps 1, 2, 5 and 6 of the order of work are done, and steps 3 and 4 in
-part (see there): the workload is the benchmark group `compile/*` (`cargo run --release -p
+part, released in 0.12.0 (see there): the workload is the benchmark group `compile/*` (`cargo run --release -p
 bitwright-bench -- compile`), and `Strategy::compile()` is the engine tier. The numbers below
 were measured before step 2, on a shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on
 the reference machine of `docs/benchmarking.md`. Use them for ratios, not as reference
