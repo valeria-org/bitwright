@@ -27,6 +27,7 @@ The same expressions can be simplified in several ways, depending on what a tool
 | To | Use | See |
 |-|-|-|
 | clean up compiler or lifter output | `Engine::standard()` | below |
+| simplify every value of every function, in a compiler | `Strategy::compile()` | [below](#inside-a-compiler) |
 | undo obfuscation, MBA included | `Strategy::deobfuscate()` with the MBA service, or the command line's `simplify` | [Deobfuscation and MBA](deobfuscation.md) |
 | run only some passes, or more rounds | a `Strategy` of your own `Phase`s | below |
 | simplify under a path condition | `Run::with_assumptions` | [Constraints](constraints.md) |
@@ -78,6 +79,9 @@ one user. Equal-size rewrites are never made, which is why passes and rules cann
 one exception is `Phase::Invert` (see [Invertibility](invertibility.md)): like a rule, it
 replaces a comparison by one of proper subterms of its operands, so it commits even when those
 operands stay alive for other users.
+`Strategy::sharing` can make the passes decide by each node's own subexpressions instead
+(`Sharing::Ignored`, see [Inside a compiler](#inside-a-compiler)), and `Strategy::max_region`
+bounds how many nodes a pass examines to decide.
 
 ## Budgets, allowances and deadlines
 
@@ -161,6 +165,63 @@ assert_eq!(shown, ["x + y", "y", "zext<32>(a <s b)"]);
 and hooks that are `Sync`; observers, allowances and deadlines are `run`'s. On a target
 without threads the calling thread does all the work. The command line's `simplify --file`
 does the same for a file of expressions, one per line.
+
+## Inside a compiler
+
+A compiler simplifies every value of every function, and most of them are already simple, so
+it needs a cost per value that stays the same however large the function grows.
+`Strategy::compile()` is built for that. It runs the standard phases without demanded bits, in
+one round. Its passes decide as if each node's subexpressions were used by that node alone
+(`Sharing::Ignored`), and look at most 64 nodes deep (`Strategy::max_region`). A decision
+therefore depends only on the node, never on which other values the call has, so every
+result is final and memoized. One call over every value of a function costs time in
+proportion to its size. A later call over the same values, or over values built on them, is
+answered from the memo.
+
+The standard strategy weighs sharing across all the roots of a call. That gives smaller
+results, but some decisions must then be made again for every root, so a call over every value
+of a function costs time growing with its size. `Strategy::compile()` can leave a result
+larger where values share subterms: a rewrite may keep alive a subterm another value still
+uses. The compiler keeps its own use counts and decides what to replace.
+
+Build values through the builder, not text, with the compiler's value numbers as symbol keys,
+and reuse one context per function (`Context::clear` keeps its allocations):
+
+```rust
+use bitwright::engine::{Engine, Run, Strategy};
+use bitwright::{BinOp, Context, Width};
+
+let engine = Engine::builder().builtin().strategy(Strategy::compile()).build()?;
+let mut cx = Context::new();
+let w = Width::W64;
+// The parameters %0 and %1.
+let a = cx.symbol(0u64, w)?;
+let b = cx.symbol(1u64, w)?;
+let seven = cx.constant_u64(w, 7)?;
+let v2 = cx.bin(BinOp::Add, a, seven)?; // %2 = add %0, 7
+let v3 = cx.bin(BinOp::Sub, v2, seven)?; // %3 = sub %2, 7
+let v4 = cx.bin(BinOp::And, v3, b)?; // %4 = and %3, %1
+let v5 = cx.bin(BinOp::Or, v3, b)?; // %5 = or %3, %1
+let v6 = cx.bin(BinOp::Add, v4, v5)?; // %6 = add %4, %5
+let values = [v2, v3, v4, v5, v6];
+let out = engine.run(&mut cx, &values, Run::default())?;
+let shown: Vec<String> = out.roots.iter().map(|r| cx.display(r.expr).to_string()).collect();
+assert_eq!(shown, ["#0 + 7", "#0", "#0 & #1", "#0 | #1", "#0 + #1"]);
+// Every result is final: the same values again are answered from the memo.
+let again = engine.run(&mut cx, &values, Run::default())?;
+assert_eq!(again.stats.node_visits, 0);
+assert_eq!(again.roots, out.roots);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Equal handles always mean equal values (see [Semantics](semantics.md)). A result that is already
+the expression of another value (`%3` is `%0` above) is that value, and the compiler can
+replace the uses of one with the other.
+
+One call over every value of a function is the fastest way to use it. A call per value as it
+is created (`Engine::simplify`) gives the same results, and values already simplified are
+answered from the memo. It costs more, because the passes' own caches last one call.
+`compile/*` in `bitwright-bench` measures both shapes.
 
 ## Hooks and observers
 

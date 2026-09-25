@@ -21,7 +21,7 @@ pub(super) mod shuffle;
 mod tests;
 pub(super) mod xor;
 
-use super::{Accept, By, Fin, Reject, Runner, Step, Stop};
+use super::{Accept, By, Fin, Reject, Runner, Sharing, Step, Stop};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -683,6 +683,7 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
 /// `r.scratch.atoms`). Also counts in `r.scratch.local` each region node's uses from region
 /// nodes, and lists in `r.scratch.zeros` the region nodes no live node uses (see [`dying_in`]).
 fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result<(), Stop> {
+    let cap = region_cap(r);
     let sc = &mut r.scratch;
     sc.atoms.begin(cx.len());
     for &a in atoms {
@@ -704,7 +705,7 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
             sc.zeros.push(i);
         }
         size += 1;
-        if size >= REGION_CAP {
+        if size >= cap {
             last = Some(i);
             break;
         }
@@ -806,6 +807,7 @@ fn dying_in(
 /// `r.scratch.kept`; `None` if more than [`REGION_CAP`]. Counted against the structure, not the
 /// arena, so the decision never depends on which nodes happen to exist already.
 fn needed(r: &mut Runner<'_, '_>, cx: &Context, e: u32) -> Result<Option<u32>, Stop> {
+    let cap = region_cap(r);
     let sc = &mut r.scratch;
     sc.seen.begin(cx.len());
     sc.kept.begin(cx.len());
@@ -822,7 +824,7 @@ fn needed(r: &mut Runner<'_, '_>, cx: &Context, e: u32) -> Result<Option<u32>, S
             continue;
         }
         new += 1;
-        if new > REGION_CAP {
+        if new > cap {
             r.meter.check()?;
             return Ok(None);
         }
@@ -832,8 +834,19 @@ fn needed(r: &mut Runner<'_, '_>, cx: &Context, e: u32) -> Result<Option<u32>, S
     Ok(Some(new))
 }
 
-/// The most nodes the commit rule examines on either side.
-pub(super) const REGION_CAP: u32 = 1024;
+/// The most nodes the commit rule examines on either side, by default
+/// ([`Strategy::max_region`](crate::engine::Strategy::max_region)).
+pub(crate) const REGION_CAP: u32 = 1024;
+
+/// The strategy's cap on the nodes the commit rule examines on either side.
+pub(super) fn region_cap(r: &Runner<'_, '_>) -> u32 {
+    r.inner.strategy.max_region.max(1)
+}
+
+/// Whether the commit rule ignores sharing ([`Sharing::Ignored`]).
+fn alone(r: &Runner<'_, '_>) -> bool {
+    r.inner.strategy.sharing == Sharing::Ignored
+}
 
 /// Whether building a candidate of at most `estimate` nodes can pay: fewer than the nodes
 /// replacing `n` would free. Checked before building, so rejected candidates cost no nodes.
@@ -848,6 +861,11 @@ pub(super) fn worth_building(
 ) -> Result<Option<Fin>, Stop> {
     region(r, cx, n, atoms)?;
     r.meter.check()?;
+    if alone(r) {
+        // Decided on the region alone: final either way.
+        let freed = dying_in(r, cx, n, false, estimate.saturating_add(1), false)?;
+        return Ok((freed <= estimate).then_some(Fin::FINAL));
+    }
     if dying_in(r, cx, n, false, estimate.saturating_add(1), true)? > estimate {
         return Ok(None);
     }
@@ -881,6 +899,10 @@ pub(super) fn shrinks(
     let Some(new) = needed(r, cx, e)? else {
         return Ok(Err(Fin::FINAL));
     };
+    if alone(r) {
+        let freed = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
+        return Ok(if new < freed { Ok(()) } else { Err(Fin::FINAL) });
+    }
     let freed = dying_in(r, cx, n, true, new.saturating_add(1), true)?;
     if new >= freed {
         let alone = dying_in(r, cx, n, true, new.saturating_add(1), false)?;

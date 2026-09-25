@@ -558,8 +558,9 @@ fn simplify(v: &mut Vec<Bench>) {
 /// Functions as a compiler simplifies them: every SSA value of a function is a root, one
 /// context is reused across functions (`clear` between them), and the function is built
 /// through the builder (`workload::ssa_function`). The rules-only engine runs the built-in
-/// rules for one round; the standard one is `Engine::standard()`. `-rerun` rows run the same
-/// roots a second time in the same context, where the memo should answer.
+/// rules for one round; the compile one `Strategy::compile()`; the standard one is
+/// `Engine::standard()`. `-rerun` rows run the same roots a second time in the same context,
+/// where the memo should answer.
 fn compile(v: &mut Vec<Bench>) {
     /// Functions measured in turn, so a row is not one function's accident.
     const SEEDS: u64 = 8;
@@ -584,11 +585,21 @@ fn compile(v: &mut Vec<Bench>) {
             workload::ssa_function(&mut cx, 900 + seed, 200)
         });
     }));
+    fn compile_engine() -> Engine {
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::compile())
+            .build()
+            .expect("engine")
+    }
     type MakeEngine = fn() -> Engine;
-    let rows: [(&str, MakeEngine, usize, bool, u64); 6] = [
+    let rows: [(&str, MakeEngine, usize, bool, u64); 9] = [
         ("rules", rules_only, 50, false, 200),
         ("rules", rules_only, 200, false, 48),
         ("rules-rerun", rules_only, 200, true, 200),
+        ("compile", compile_engine, 50, false, 80),
+        ("compile", compile_engine, 200, false, 24),
+        ("compile-rerun", compile_engine, 200, true, 200),
         ("standard", Engine::standard, 50, false, 40),
         ("standard", Engine::standard, 200, false, 8),
         ("standard-rerun", Engine::standard, 200, true, 8),

@@ -2051,3 +2051,139 @@ fn adding_many_constraints_takes_linear_work() {
         "{small} transfers for 250, {large} for 1000"
     );
 }
+
+/// A function as a compiler holds it: a few random expressions of one width, then values each
+/// combining two earlier ones (so later values share earlier ones), every value a root.
+fn function(g: &mut Gen, cx: &mut Context, w: u16) -> Vec<Expr> {
+    let ops = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::And,
+        BinOp::Or,
+        BinOp::Xor,
+        BinOp::Shl,
+        BinOp::LShr,
+    ];
+    let mut vals: Vec<Expr> = (0..3).map(|_| g.expr(cx, w, 2).0).collect();
+    for _ in 0..10 {
+        let a = vals[vals.len() - 1 - g.rng.below(vals.len().min(4) as u64) as usize];
+        let b = vals[g.rng.below(vals.len() as u64) as usize];
+        let op = ops[g.rng.below(ops.len() as u64) as usize];
+        vals.push(cx.bin(op, a, b).unwrap());
+    }
+    vals
+}
+
+/// The compiler strategy, and passes over a small region: results equal their inputs, pass
+/// every postcondition, and are final (a second call over the same roots does no work).
+#[test]
+fn ignoring_sharing_is_sound_and_every_result_final() {
+    let engines = [
+        Strategy::compile(),
+        Strategy::standard()
+            .with_sharing(Sharing::Ignored)
+            .with_max_region(4),
+        Strategy::standard().with_max_region(4),
+    ]
+    .map(|s| {
+        Engine::builder()
+            .builtin()
+            .strategy(s)
+            .verify(Verify::strict())
+            .build()
+            .unwrap()
+    });
+    let mut rng = Rng(11);
+    for (k, engine) in engines.iter().enumerate() {
+        let mut g = generator(0xc0_0001 + k as u64);
+        let mut rewrites = 0;
+        for _ in 0..120 {
+            let mut cx = Context::new();
+            let w = 1 + g.rng.below(6) as u16;
+            let roots = function(&mut g, &mut cx, w);
+            let out = engine.run(&mut cx, &roots, Run::default()).unwrap();
+            assert_eq!(
+                out.stats.rejected, 0,
+                "a postcondition rejected an application"
+            );
+            assert_eq!(out.stats.quarantined, 0);
+            for (&e, r) in roots.iter().zip(&out.roots) {
+                assert_eq!(r.end, End::Completed);
+                assert!(
+                    equivalent(&mut cx, e, r.expr, &mut rng),
+                    "{} vs {}",
+                    cx.display(e),
+                    cx.display(r.expr)
+                );
+            }
+            rewrites += out.stats.rewrites;
+            if engine.strategy().sharing == Sharing::Ignored {
+                let again = engine.run(&mut cx, &roots, Run::default()).unwrap();
+                assert_eq!(again.roots, out.roots);
+                assert_eq!(again.stats.node_visits, 0);
+                assert_eq!(again.stats.rewrites, 0);
+            }
+        }
+        assert!(rewrites > 50, "few rewrites ({rewrites})");
+    }
+}
+
+/// Ignoring sharing, a value's result does not depend on which other values the call has.
+#[test]
+fn ignoring_sharing_makes_results_independent_of_the_roots() {
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::compile())
+        .build()
+        .unwrap();
+    let mut g1 = generator(0xc0_0002);
+    let mut g2 = generator(0xc0_0002);
+    for _ in 0..120 {
+        let (mut c1, mut c2) = (Context::new(), Context::new());
+        let w = 1 + g1.rng.below(6) as u16;
+        g2.rng.below(6);
+        let all = function(&mut g1, &mut c1, w);
+        let each = function(&mut g2, &mut c2, w);
+        let together = engine.run(&mut c1, &all, Run::default()).unwrap();
+        for (i, &e) in each.iter().enumerate() {
+            // Alone, in a context of its own (no memo from the other values either).
+            let mut c3 = Context::new();
+            let e3 = c3.import(&c2, &[e]).unwrap()[0];
+            let alone = engine.simplify(&mut c3, e3).unwrap();
+            assert_eq!(
+                c1.display(together.roots[i].expr).to_string(),
+                c3.display(alone.expr).to_string(),
+                "value {i} of {}",
+                c1.display(all[i])
+            );
+        }
+    }
+}
+
+/// The default commit policy does not enter the engine's id: engines that keep it keep their
+/// memos; another policy does.
+#[test]
+fn the_default_commit_policy_keeps_engine_ids() {
+    let id = |s: Strategy| {
+        Engine::builder()
+            .builtin()
+            .strategy(s)
+            .build()
+            .unwrap()
+            .inner
+            .id
+    };
+    let standard = id(Strategy::standard());
+    assert_eq!(
+        standard,
+        id(Strategy::standard()
+            .with_sharing(Sharing::Roots)
+            .with_max_region(pass::REGION_CAP))
+    );
+    assert_ne!(
+        standard,
+        id(Strategy::standard().with_sharing(Sharing::Ignored))
+    );
+    assert_ne!(standard, id(Strategy::standard().with_max_region(64)));
+}

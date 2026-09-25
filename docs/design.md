@@ -578,13 +578,37 @@ pub enum Phase {
     Invert,                          // equalities through invertible maps (§8.1)
     // M6: Mba(MbaConfig); later: Raise (display idioms, last phase only)
 }
-pub struct Strategy { pub name: Cow<'static, str>, pub phases: Vec<Phase>, pub max_rounds: u8 }
-// Strategy::standard(), Strategy::deobfuscate(), Strategy::new(name, phases), .with_max_rounds(n)
+pub struct Strategy { pub name: Cow<'static, str>, pub phases: Vec<Phase>, pub max_rounds: u8,
+                      pub float_values: bool, pub sharing: Sharing, pub max_region: u32 }
+pub enum Sharing { Roots /* default */, Ignored }
+// Strategy::standard(), Strategy::deobfuscate(), Strategy::compile(), Strategy::new(name, phases),
+// .with_max_rounds(n), .with_sharing(s), .with_max_region(n)
 ```
 
 Phases run in order within a round; rounds repeat until nothing changes or `max_rounds` is reached.
 A `Local` phase reaches its fixpoint within one round by itself; rounds exist for the interplay of
 phases.
+
+`sharing` and `max_region` are the passes' commit policy (§8).
+- **`Sharing::Roots`, the default.** The commit rule counts the nodes a rewrite frees against
+  the uses from every root of the call. A decision that sharing made is not final (§6.5). With
+  every value of a function as a root, it is made again for each root, so the call's cost grows
+  with the function's size.
+- **`Sharing::Ignored`.** The rule counts only the uses inside the region below the node, so a
+  decision depends on the node alone. Every result is final and memoized, and a node is decided
+  once per context. A committed rewrite still shrinks that node's own DAG, but may keep alive a
+  subterm another root uses.
+- **`max_region`** (1024 by default) caps the region and the candidate the rule examines, and
+  (up to 256) the demanded-bits pass's visits per operand. A region cut short counts fewer
+  nodes freed, so fewer rewrites commit, never a wrong one.
+
+The policy enters the engine's id only when it is not the default, so default engines keep
+their ids and contexts their memos.
+
+`Strategy::compile()` is `[FactFold, Local(core), Linear, Xor, Casts, Invert, Compares,
+Bitwise, Local(core)]`, one round, `Sharing::Ignored`, `max_region` 64: for a compiler, which
+simplifies every value of every function. Demanded bits is left out: measured on the `compile/*`
+workload, deciding it node by node made results larger and cost a quarter of the time.
 
 ### 6.2 Budgets and allowances
 

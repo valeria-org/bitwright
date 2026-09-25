@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **A strategy for compilers, `Strategy::compile()`.** A compiler simplifies every value of
+  every function. The standard strategy's passes weigh sharing against every root of a call,
+  and a decision that sharing made is taken again for each root, so a call over every value of
+  a function cost time growing with the function's size.
+  - **`Strategy::sharing`** (`Sharing::Roots` by default): with `Sharing::Ignored` the passes
+    decide as if each node's subexpressions were used by that node alone. Every result is
+    final and memoized, and a value's result does not depend on the call's other values.
+  - **`Strategy::max_region`** (1024 by default) caps how many nodes the passes examine to
+    decide.
+  - **`Strategy::compile()`** is the standard phases without demanded bits, one round,
+    `Sharing::Ignored`, 64 nodes.
+
+  On 200-instruction functions with every value a root it takes 1.4 ms, against 18.6 ms for
+  the standard strategy (the same machine, CPU time), with results no larger on that
+  workload. The book's *Simplifying* chapter has a section on it.
+- **Cheaper calls on memoized values.** A phase whose memo holds the root answers without
+  preparing a walk, and the walk's stack is reused: a call on an already simplified value costs
+  about half what it did.
+- **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
+  through the builder, every value a root, one context reused. Rows for building, the rules
+  alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.
+- **Behavior changes.** None: the default policy keeps every existing strategy's results and
+  engine ids.
+
 ## 0.11.0
 
 - **Floating point: `x / ½` is `x + x`.** Construction writes a division by one half as the

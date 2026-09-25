@@ -94,6 +94,24 @@ pub enum Phase {
     Mba(crate::mba::MbaConfig),
 }
 
+/// How the normal-form passes weigh sharing when they decide whether a rewrite makes the DAG
+/// smaller (see [`Strategy::sharing`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Sharing {
+    /// Against the DAG of every root of the call: a node another root still uses is not
+    /// freed by rewriting its user. Results are the smallest, but a decision depends on which
+    /// roots a call has, so one that sharing made is decided again for every root, and not
+    /// memoized; a call over every value of a function costs time growing with its size.
+    #[default]
+    Roots,
+    /// As if the region below each node were used by that node alone: decisions depend on the
+    /// node only, so every result is final and memoized, and each node is decided once per
+    /// context. A rewrite may then keep a subterm alive that another root still uses. For hosts
+    /// that simplify every value of a function (a compiler) and keep their own use counts.
+    Ignored,
+}
+
 /// Named, hashable policy: phases run in order within a round, and rounds repeat until nothing
 /// changes or `max_rounds` is reached.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -112,6 +130,13 @@ pub struct Strategy {
     /// sign. Off by default; for hosts that observe floats only as values (a compiler's
     /// fast-math, most deobfuscation).
     pub float_values: bool,
+    /// How the passes weigh sharing in their commit rule. [`Sharing::Roots`] by default.
+    pub sharing: Sharing,
+    /// The most nodes the passes' commit rule examines below a node and in a candidate, and
+    /// (up to 256) the demanded-bits pass visits for one operand: the per-node work of the
+    /// passes. A region cut short counts fewer nodes freed, so fewer rewrites commit; never a
+    /// wrong one. 1024 by default.
+    pub max_region: u32,
 }
 
 impl Strategy {
@@ -122,6 +147,8 @@ impl Strategy {
             phases,
             max_rounds: 4,
             float_values: false,
+            sharing: Sharing::Roots,
+            max_region: pass::REGION_CAP,
         }
     }
 
@@ -191,6 +218,42 @@ impl Strategy {
         )
     }
 
+    /// For a compiler, which simplifies every value of every function: the standard phases
+    /// without the demanded-bits pass, `[FactFold, Local(core), Linear, Xor, Casts, Invert,
+    /// Compares, Bitwise, Local(core)]`, one round, with the passes deciding as if each node
+    /// were alone ([`Sharing::Ignored`]) over at most 64 nodes ([`max_region`](Self::max_region)).
+    ///
+    /// Every result is final and memoized, so a call over every value of a function costs time
+    /// in proportion to its size, and a later call over the same values is answered by the
+    /// memo. Results can be larger than [`Strategy::standard`]'s where values share subterms.
+    pub fn compile() -> Strategy {
+        let core = || Phase::Local {
+            groups: builtin()
+                .program
+                .groups()
+                .iter()
+                .map(|g| g.name.clone())
+                .collect(),
+        };
+        Strategy::new(
+            "compile",
+            vec![
+                Phase::FactFold,
+                core(),
+                Phase::Linear,
+                Phase::Xor,
+                Phase::Casts,
+                Phase::Invert,
+                Phase::Compares,
+                Phase::Bitwise,
+                core(),
+            ],
+        )
+        .with_max_rounds(1)
+        .with_sharing(Sharing::Ignored)
+        .with_max_region(64)
+    }
+
     /// Adds the MBA service before the strategy's last phase (after the passes, before the
     /// final rules).
     #[cfg(feature = "mba")]
@@ -216,6 +279,18 @@ impl Strategy {
                 groups: groups.iter().map(|s| s.to_string()).collect(),
             });
         }
+        self
+    }
+
+    /// Sets [`sharing`](Self::sharing).
+    pub fn with_sharing(mut self, sharing: Sharing) -> Strategy {
+        self.sharing = sharing;
+        self
+    }
+
+    /// Sets [`max_region`](Self::max_region) (at least 1).
+    pub fn with_max_region(mut self, n: u32) -> Strategy {
+        self.max_region = n.max(1);
         self
     }
 
@@ -551,6 +626,18 @@ impl EngineBuilder {
         });
         let mut phases = Vec::new();
         let mut id = combine(0x656e_6769_6e65, u64::from(strategy.max_rounds));
+        // The commit policy enters only when it is not the default, so engines that keep it
+        // keep their ids (and contexts their memos).
+        if strategy.sharing != Sharing::Roots || strategy.max_region != pass::REGION_CAP {
+            let sharing = match strategy.sharing {
+                Sharing::Roots => 0,
+                Sharing::Ignored => 1,
+            };
+            id = combine(
+                combine(combine(id, 0x7368_6172), sharing),
+                u64::from(strategy.max_region),
+            );
+        }
         for phase in &strategy.phases {
             match phase {
                 Phase::Local { groups: names } => {
@@ -973,11 +1060,14 @@ struct Runner<'r, 'a> {
     observer: Option<&'a mut dyn Observer>,
     hooks: Option<&'a dyn Hooks>,
     assumptions: Option<&'a Assumptions>,
+    /// Rules quarantined for the call, by index (sized on the first quarantine).
     quarantined: Vec<bool>,
     /// Results of this call that are not final (not memoized), per phase.
     partial: Vec<IdMap<u32, (u32, Fin)>>,
     /// Candidate buffer, reused.
     cands: Vec<u32>,
+    /// The walk's stack, reused across phases.
+    stack: Vec<Frame>,
     /// Sampled verification: the values of every node evaluated so far at each point.
     samples: IdMap<u32, Box<[BitVec]>>,
     /// The linear pass's forms, per node.
@@ -1137,6 +1227,12 @@ impl Runner<'_, '_> {
 
     /// Normalizes `root` under a `Local` phase.
     fn local(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
+        // A root with a final result: what the walk would find at its first step, without
+        // preparing one (the preparation only matters to a walk that does work).
+        if let Some((r, rel)) = cx.memo.phases[phase].get(root) {
+            self.stats.memo_hits += 1;
+            return Ok((r, Fin::relying(rel)));
+        }
         if !matches!(self.inner.phases[phase], PhaseImpl::Local(_)) {
             // A pass's decisions depend on sharing, which the previous phase or round may have
             // changed: start afresh (final results stay memoized).
@@ -1153,7 +1249,22 @@ impl Runner<'_, '_> {
                 *slot = root;
             }
         }
-        let mut stack = vec![Frame::Visit(root)];
+        let mut stack = core::mem::take(&mut self.stack);
+        stack.clear();
+        stack.push(Frame::Visit(root));
+        let out = self.walk(cx, phase, root, &mut stack);
+        self.stack = stack;
+        out
+    }
+
+    /// The walk of [`local`](Self::local), from `stack` (holding the root).
+    fn walk(
+        &mut self,
+        cx: &mut Context,
+        phase: usize,
+        root: u32,
+        stack: &mut Vec<Frame>,
+    ) -> Result<(u32, Fin), Stop> {
         // Rewrites are accepted where they are made, but results are remembered and reused
         // anywhere: a pass's decision depends on sharing, so an operand's remembered result can
         // rebuild the very node its parent was rewritten from, which the pass rewrites again,
@@ -1327,7 +1438,7 @@ impl Runner<'_, '_> {
         let mut fin = Fin::FINAL;
         for &ri in cands {
             let rule = &inner.rules[ri as usize];
-            if self.quarantined[ri as usize] {
+            if self.quarantined.get(ri as usize).copied().unwrap_or(false) {
                 // Skipped only for this call: the result is not final.
                 fin = fin.and(Fin::PROVISIONAL);
                 continue;
@@ -1395,6 +1506,9 @@ impl Runner<'_, '_> {
                 Accept::Vetoed => continue,
                 Accept::Rejected(reason) => {
                     if matches!(reason, Reject::Width | Reject::Verify | Reject::Tripwire) {
+                        if self.quarantined.len() <= ri as usize {
+                            self.quarantined.resize(ri as usize + 1, false);
+                        }
                         self.quarantined[ri as usize] = true;
                         self.stats.quarantined += 1;
                     }
@@ -1802,9 +1916,10 @@ impl Engine {
             observer,
             hooks,
             assumptions,
-            quarantined: vec![false; inner.rules.len()],
+            quarantined: Vec::new(),
             partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
             cands: Vec::new(),
+            stack: Vec::new(),
             samples: IdMap::default(),
             linear: Default::default(),
             bitwise: IdMap::default(),

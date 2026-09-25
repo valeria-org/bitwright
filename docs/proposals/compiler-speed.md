@@ -1,10 +1,10 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
-Status: exploration. Step 1 of the order of work is done: the workload is the benchmark
-group `compile/*` (`cargo run --release -p bitwright-bench -- compile`). Nothing else is
-implemented. The numbers below come from that workload on a shared cloud VM (Intel Xeon at
-2.8 GHz, Rust 1.94), not on the reference machine of `docs/benchmarking.md`. Use them for
-ratios, not as reference numbers.
+Status: in progress. Steps 1 and 2 of the order of work are done (see there): the workload is
+the benchmark group `compile/*` (`cargo run --release -p bitwright-bench -- compile`), and
+`Strategy::compile()` is the engine tier. The numbers below were measured before step 2, on a
+shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on the reference machine of
+`docs/benchmarking.md`. Use them for ratios, not as reference numbers.
 
 ## The operating point
 
@@ -343,8 +343,47 @@ Each step is measured with the benchmark from step 1 and lands alone.
    faster row that simplifies less shows it. The standard re-run at 200 instructions makes
    *more* rewrites than the first run (578 against 402), so the second run does not merely
    confirm the first.
-2. **Engine tier**: `Strategy::compile()`, per-node commit decisions, sessions that keep their
-   scratch, `simplify_node`. This is the largest gain, and it needs no new crate.
+2. **Done: the engine tier.** Three changes:
+   - **`Strategy::sharing`.** `Sharing::Ignored` makes the commit rule count only the uses
+     inside the region below the node, so every pass result is final and memoized.
+   - **`Strategy::max_region`** caps the region the rule examines and the demanded-bits walk.
+   - **`Strategy::compile()`**: the standard phases without demanded bits, one round,
+     `Sharing::Ignored`, `max_region` 64.
+
+   The defaults keep every existing strategy's results and engine ids. On `compile/*` (same
+   VM), a 200-instruction function costs 1.4 ms against 18.6 ms for the standard strategy,
+   about 7 µs per instruction instead of 93 µs. Its result is 179 nodes against 213 on the
+   row's seed, and on 100 functions 14,118 against 14,447. Cost per instruction no longer
+   grows with the function: 11.6, 8.2 and 2.8 µs at 50, 200 and 1,000 instructions. A second
+   call over the same values visits nothing.
+
+   Measured on the way:
+   - **Demanded bits, decided node by node,** made results larger (15,064 with it) and cost a
+     quarter of the time, so `compile()` leaves it out.
+   - **A second round** cost 35 % more and found nothing.
+   - **The region cap** did not matter on this workload; 64 bounds the work per node on deep
+     chains.
+
+   New tests check that results under `Sharing::Ignored` are equal to their inputs, pass
+   strict verification and are final. They also check that a value's result is the same alone
+   as with the rest of its function.
+
+   Two smaller changes to the engine's walk:
+   - A phase whose memo already holds the root returns without setting up a walk.
+   - The walk's stack is reused.
+
+   Together they bring a fully memoized single-value call from 980 to about 470 ns.
+
+   Not done, and next for this tier:
+   - **The passes' caches outlive only one call.** Those caches are the linear and xor forms,
+     truth tables, comparison descriptions and residues. Calling once per instruction as it is
+     created therefore costs about 50 % more than one call per function (10 against 6.5 µs
+     per instruction). Keeping them in the context's memo, keyed like it (engine, hooks,
+     assumptions), would remove that. Their entries record finality and reliance, which
+     depend on budgets and assumptions, so this needs care.
+   - **Use counts from the host.** They would let the commit rule weigh real sharing and stay
+     final.
+   - **Host-supplied facts** (`FactSource`).
 3. **Builder fast paths (1b).** Mostly internal.
 4. **The rule middle end.** First the decision tree, interpreted (2b); then the codegen back
    end, `RuleSet` and a precompiled built-in corpus (2a).

@@ -38,6 +38,8 @@ pub(crate) type Memo = IdMap<Key, u32>;
 
 struct Demand {
     memo: Memo,
+    /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
+    cap: u32,
     stops: Vec<u32>,
     visits: u32,
     fin: Fin,
@@ -123,7 +125,7 @@ fn simplify(
         st.stops.push(x);
         Ok(x)
     };
-    if st.visits > MAX_VISITS || cx.const_val(x).is_some() {
+    if st.visits > st.cap || cx.const_val(x).is_some() {
         let v = stop(st)?;
         st.memo.insert(Key(x, *m), v);
         return Ok(v);
@@ -313,6 +315,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let before = cx.len() as u32;
     let mut st = Demand {
         memo: std::mem::take(&mut r.demanded),
+        cap: MAX_VISITS.min(super::region_cap(r)),
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
@@ -320,7 +323,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
     st.memo.clear();
     r.demanded = std::mem::take(&mut st.memo);
-    if st.visits > MAX_VISITS {
+    if st.visits > st.cap {
         count(r).atomized += 1;
     }
     let fin = st.fin;
