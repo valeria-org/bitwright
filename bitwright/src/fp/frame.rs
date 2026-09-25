@@ -480,11 +480,22 @@ impl<const N: usize> Frame for Big<N> {
         (q, r.shr(s))
     }
     fn isqrt(self) -> Self {
-        if self.is_zero() {
-            return self;
+        let bits = self.bits();
+        let top = |x: Self| {
+            let mut l = [0u64; 2];
+            x.write_limbs(&mut l);
+            u128::from(l[0]) | (u128::from(l[1]) << 64)
+        };
+        if bits <= 128 {
+            let r = top(self).isqrt();
+            return Self::from_limbs(&[r as u64, (r >> 64) as u64]);
         }
-        // Newton's iteration from above: x ← (x + n/x) / 2 decreases to ⌊√n⌋.
-        let mut x = Self::pow2(self.bits().div_ceil(2));
+        // Newton's iteration from above: x ← (x + n/x) / 2 decreases to ⌊√n⌋. It starts at
+        // (⌊√(n / 4^k)⌋ + 1)·2^k > √n, from the top bits of n: good to about 64 bits, so a few
+        // steps finish.
+        let k = (bits - 127).div_ceil(2);
+        let r = top(self.shr(2 * k)).isqrt() + 1;
+        let mut x = Self::from_limbs(&[r as u64, (r >> 64) as u64]).shl(k);
         loop {
             let y = x.add(self.divrem(x).0).shr(1);
             if y >= x {

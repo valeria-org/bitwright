@@ -68,6 +68,14 @@ fn wide_division_and_roots_are_exact() {
         assert!(s.mul(s) <= a);
         let s1 = s.add(Wide::one());
         assert!(s1.mul(s1) > a);
+        // Squares and their neighbours: the root's last step.
+        let t = random(&mut rng, 1 + bits_b.min(500));
+        if !t.is_zero() {
+            let sq = t.mul(t);
+            assert_eq!(sq.isqrt(), t);
+            assert_eq!(sq.sub(Wide::one()).isqrt(), t.sub(Wide::one()));
+            assert_eq!(sq.add(t).add(t).isqrt(), t);
+        }
     }
 }
 
