@@ -34,47 +34,61 @@ fn linear_op(op: OpCode) -> bool {
     )
 }
 
+/// The operands of linear node `node` that are part of its linear map (not shift counts).
+fn linear_operands(node: &crate::expr::Node) -> impl Iterator<Item = u32> + '_ {
+    let counted = matches!(
+        node.op,
+        OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
+    );
+    node.children().filter(move |&c| !(counted && c == node.b))
+}
+
 /// Whether the linear part below `n` reads a single atom, from its operands' answers
-/// (remembered for the call): `u32::MAX` when it reads several.
+/// (remembered for the call, per node): `u32::MAX` when it reads several.
 fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
     const MANY: u32 = u32::MAX;
     const NONE: u32 = u32::MAX - 1;
-    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    // (Not a node: arenas stay below it.)
+    const UNKNOWN: u32 = u32::MAX - 2;
+    let memo = &mut r.gf2_atoms;
+    if memo.len() < cx.len() {
+        memo.resize(cx.len(), UNKNOWN);
+    }
+    let known = |memo: &Vec<u32>, i: u32| Some(memo[i as usize]).filter(|&a| a != UNKNOWN);
+    let set = |memo: &mut Vec<u32>, i: u32, a: u32| memo[i as usize] = a;
+    if let Some(a) = known(memo, n) {
+        return a;
+    }
+    let mut stack = std::mem::take(&mut r.gf2_stack);
+    let memo = &mut r.gf2_atoms;
+    stack.clear();
+    stack.push((n, false));
     let w = cx.wid(n);
     while let Some((i, done)) = stack.pop() {
-        if r.gf2_atoms.contains_key(&i) {
+        if known(memo, i).is_some() {
             continue;
         }
         let node = cx.node(i);
         if cx.const_val(i).is_some() {
-            r.gf2_atoms.insert(i, NONE);
+            set(memo, i, NONE);
             continue;
         }
         if !linear_op(node.op) || node.width != w {
-            r.gf2_atoms.insert(i, i);
+            set(memo, i, i);
             continue;
         }
-        let operands: Vec<u32> = node
-            .children()
-            .filter(|&c| {
-                !(matches!(
-                    node.op,
-                    OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
-                ) && c == node.b)
-            })
-            .collect();
         if !done {
             stack.push((i, true));
-            for c in operands {
-                if !r.gf2_atoms.contains_key(&c) {
+            for c in linear_operands(&node) {
+                if known(memo, c).is_none() {
                     stack.push((c, false));
                 }
             }
             continue;
         }
         let mut atom = NONE;
-        for c in operands {
-            let a = r.gf2_atoms.get(&c).copied().unwrap_or(MANY);
+        for c in linear_operands(&node) {
+            let a = known(memo, c).unwrap_or(MANY);
             atom = match (atom, a) {
                 (_, MANY) | (MANY, _) => MANY,
                 (NONE, a) => a,
@@ -83,9 +97,10 @@ fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
                 _ => MANY,
             };
         }
-        r.gf2_atoms.insert(i, atom);
+        set(memo, i, atom);
     }
-    r.gf2_atoms.get(&n).copied().unwrap_or(MANY)
+    r.gf2_stack = stack;
+    known(&r.gf2_atoms, n).unwrap_or(MANY)
 }
 
 /// The one atom below `n` and the nodes between (ascending), if the expression is a linear map
@@ -187,7 +202,8 @@ fn term(cx: &mut Context, x: u32, k: u32, d: &BitVec, w: Width) -> Result<u32, c
 /// The xor pass's linear reading of `n`, if it applies.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
     let w = cx.width_of(n);
-    if w.bits() > 128 || w.bits() < 2 {
+    // (A node not linear itself is its own atom, with no region.)
+    if w.bits() > 128 || w.bits() < 2 || !linear_op(cx.node(n).op) {
         return Ok(None);
     }
     // Most regions read several atoms: known at once from the operands.
