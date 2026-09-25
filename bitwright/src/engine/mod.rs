@@ -707,6 +707,40 @@ impl fmt::Debug for Run<'_> {
     }
 }
 
+/// Options of [`Engine::run_each`].
+#[derive(Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct Each<'a> {
+    /// Threads to use at most (0: as many as the machine runs at once).
+    pub threads: usize,
+    /// Caps on each root (as [`Run::per_call`] on a call with that root alone).
+    pub per_root: Budget,
+    /// Per-root caps, checked before any work.
+    pub admission: Admission,
+    /// Facts in guards are read under these assumptions.
+    pub assumptions: Option<&'a Assumptions>,
+    /// Host policy, shared by the threads; it sees each root in the root's own context.
+    pub hooks: Option<&'a (dyn Hooks + Sync)>,
+}
+
+setters!(Each<'a> {
+    with_threads: threads: usize,
+    with_per_root: per_root: Budget,
+    with_admission: admission: Admission,
+    with_assumptions: assumptions ? &'a Assumptions,
+    with_hooks: hooks ? &'a (dyn Hooks + Sync),
+});
+
+impl fmt::Debug for Each<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Each")
+            .field("threads", &self.threads)
+            .field("per_root", &self.per_root)
+            .field("admission", &self.admission)
+            .finish_non_exhaustive()
+    }
+}
+
 /// How a root's processing ended.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1604,6 +1638,128 @@ impl Engine {
     /// Simplifies one expression with default options.
     pub fn simplify(&self, cx: &mut Context, e: Expr) -> Result<RootOutcome, Error> {
         Ok(self.run(cx, &[e], Run::default())?.roots[0])
+    }
+
+    /// Simplifies each root as a call of [`run`](Self::run) with that root alone would, on up
+    /// to [`Each::threads`] threads at once. Each distinct root is copied into a context of its
+    /// own (with `cx`'s configuration and registry, and the assumptions copied too), simplified
+    /// there, and its result copied back into `cx` ([`Context::import`]); `roots[i]` of the
+    /// outcome answers `roots[i]` of the input, and the statistics are the sums over the roots.
+    ///
+    /// A root's work does not depend on the other roots or on the number of threads, so neither
+    /// do the results. Unlike [`run`](Self::run) over several roots, sharing between roots is not
+    /// weighed: a node two roots share counts as used by each alone. Observers, allowances and
+    /// deadlines are [`run`](Self::run)'s.
+    pub fn run_each(
+        &self,
+        cx: &mut Context,
+        roots: &[Expr],
+        each: Each<'_>,
+    ) -> Result<Outcome, Error> {
+        let ids = cx.ids(roots)?;
+        if let Some(a) = each.assumptions {
+            a.check_context(cx)?;
+        }
+        let mut distinct: Vec<Expr> = Vec::new();
+        let mut slot: IdMap<u32, usize> = IdMap::default();
+        for (&i, &e) in ids.iter().zip(roots) {
+            slot.entry(i).or_insert_with(|| {
+                distinct.push(e);
+                distinct.len() - 1
+            });
+        }
+        let threads = match each.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
+        .clamp(1, distinct.len().max(1));
+        // Each worker takes the next root; its result is kept alone in a small context.
+        type Done = Result<(Context, RootOutcome, Stats), Error>;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<std::sync::Mutex<Option<Done>>> = distinct
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        let src: &Context = cx;
+        let work = || {
+            loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(&root) = distinct.get(k) else {
+                    break;
+                };
+                let done = self.run_alone(src, root, &each);
+                if let Ok(mut r) = results[k].lock() {
+                    *r = Some(done);
+                }
+            }
+        };
+        // The calling thread works too; where no thread can be started (WebAssembly without
+        // threads, say), it does everything.
+        std::thread::scope(|s| {
+            for _ in 1..threads {
+                if std::thread::Builder::new().spawn_scoped(s, work).is_err() {
+                    break;
+                }
+            }
+            work();
+        });
+        let mut outcome = Outcome {
+            roots: Vec::with_capacity(roots.len()),
+            stats: Stats::default(),
+        };
+        let mut answers: Vec<RootOutcome> = Vec::with_capacity(distinct.len());
+        for (r, &root) in results.into_iter().zip(&distinct) {
+            let done = r.into_inner().ok().flatten().ok_or_else(|| {
+                Error::Contract("a root's worker stopped without a result".into())
+            })?;
+            let (small, mut out, stats) = done?;
+            out.expr = cx.import(&small, &[out.expr])?[0];
+            out.changed = out.expr != root;
+            outcome.stats.absorb(&stats);
+            answers.push(out);
+        }
+        for i in &ids {
+            outcome.roots.push(answers[slot[i]]);
+        }
+        Ok(outcome)
+    }
+
+    /// [`run_each`](Self::run_each) for one root of `src`: the outcome, its result alone in a
+    /// context of its own, and the statistics.
+    fn run_alone(
+        &self,
+        src: &Context,
+        root: Expr,
+        each: &Each<'_>,
+    ) -> Result<(Context, RootOutcome, Stats), Error> {
+        let fresh = || {
+            let mut cx = Context::with_config(src.config().clone());
+            cx.registry = src.registry.clone();
+            cx
+        };
+        let mut cx = fresh();
+        let x = cx.import(src, &[root])?[0];
+        let mut assumptions = Assumptions::new();
+        if let Some(a) = each.assumptions {
+            for (_, e, facts) in a.constraints() {
+                let e = cx.import(src, &[e])?[0];
+                assumptions.assume(&mut cx, e, facts)?;
+            }
+        }
+        let mut run = Run::default()
+            .with_per_call(each.per_root)
+            .with_admission(each.admission);
+        if each.assumptions.is_some() {
+            run = run.with_assumptions(&assumptions);
+        }
+        if let Some(h) = each.hooks {
+            run = run.with_hooks(h);
+        }
+        let out = self.run(&mut cx, &[x], run)?;
+        let mut small = fresh();
+        let mut root_out = out.roots[0];
+        root_out.expr = small.import(&cx, &[root_out.expr])?[0];
+        Ok((small, root_out, out.stats))
     }
 
     /// Simplifies `roots` under `run`. Each distinct root is processed once; `roots[i]` of the

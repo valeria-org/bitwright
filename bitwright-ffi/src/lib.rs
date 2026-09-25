@@ -16,7 +16,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use bw::check::{CheckConfig, Verdict, check_program};
-use bw::engine::{Budget, End, Engine, Exhausted, Run, Strategy};
+use bw::engine::{Budget, Each, End, Engine, Exhausted, Run, Strategy};
 use bw::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::rules::{Ledger, RuleProgram};
@@ -1774,21 +1774,71 @@ pub unsafe extern "C" fn bw_engine_run(
             options = options.with_hooks(&refuse);
         }
         let out = engine.run(cx, &roots, options)?;
-        for (i, r) in out.roots.iter().enumerate() {
-            let (end, limit) = match r.end {
-                End::Completed => (0, -1),
-                End::BudgetTerminated(x) => (1, code_of(&LIMITS, &x)),
-                _ => (2, -1),
-            };
-            let o = BwOutcome {
-                expr: r.expr.to_bits(),
-                changed: r.changed,
-                end,
-                limit,
-                relies_on: mask(r.relies_on),
-            };
-            unsafe { outcomes.add(i).write(o) };
+        unsafe { write_outcomes(&out, outcomes) };
+        Ok(())
+    })
+}
+
+/// Writes `out`'s outcomes to `outcomes[0..)`.
+///
+/// # Safety
+/// `outcomes` has room for every outcome.
+unsafe fn write_outcomes(out: &bw::engine::Outcome, outcomes: *mut BwOutcome) {
+    for (i, r) in out.roots.iter().enumerate() {
+        let (end, limit) = match r.end {
+            End::Completed => (0, -1),
+            End::BudgetTerminated(x) => (1, code_of(&LIMITS, &x)),
+            _ => (2, -1),
+        };
+        let o = BwOutcome {
+            expr: r.expr.to_bits(),
+            changed: r.changed,
+            end,
+            limit,
+            relies_on: mask(r.relies_on),
+        };
+        unsafe { outcomes.add(i).write(o) };
+    }
+}
+
+/// # Safety
+/// As [`bw_engine_run`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_engine_run_each(
+    engine: *const BwEngine,
+    cx: *mut BwContext,
+    roots: *const u64,
+    n: usize,
+    threads: usize,
+    b: *const BwBudget,
+    a: *const BwAssumptions,
+    outcomes: *mut BwOutcome,
+) -> c_int {
+    run(|| {
+        let bw_engine = unsafe { get(engine, "engine") }?;
+        let engine = &bw_engine.engine;
+        let refuse = Refuse(&bw_engine.refuse);
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let roots = exprs(unsafe { slice(roots, n, "roots") }?)?;
+        let per_root = match unsafe { b.as_ref() } {
+            Some(b) => budget(b),
+            None => Budget::default(),
+        };
+        let a = unsafe { assumptions(a) };
+        if n > 0 && outcomes.is_null() {
+            return Err(invalid("`outcomes` is NULL"));
         }
+        let mut each = Each::default()
+            .with_threads(threads)
+            .with_per_root(per_root);
+        if let Some(a) = a {
+            each = each.with_assumptions(a);
+        }
+        if !bw_engine.refuse.is_empty() {
+            each = each.with_hooks(&refuse);
+        }
+        let out = engine.run_each(cx, &roots, each)?;
+        unsafe { write_outcomes(&out, outcomes) };
         Ok(())
     })
 }

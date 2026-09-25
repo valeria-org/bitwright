@@ -603,9 +603,32 @@ fn runs_with_budgets_and_assumptions() {
             BW_OK
         );
         assert_eq!((outs[0].end, outs[0].limit), (1, 0));
+        // Each on its own, on threads: the same answers.
+        for threads in [1, 4, 0] {
+            assert_eq!(
+                bw_engine_run_each(
+                    engine,
+                    cx.0,
+                    roots.as_ptr(),
+                    3,
+                    threads,
+                    &b,
+                    a,
+                    outs.as_mut_ptr()
+                ),
+                BW_OK
+            );
+            assert_eq!(cx.print(outs[0].expr), "x + y");
+            assert_eq!(cx.print(outs[1].expr), "0:32");
+            assert_eq!((outs[1].relies_on, outs[2].changed), (1, false));
+        }
         // Nothing to do.
         assert_eq!(
             bw_engine_run(engine, cx.0, null(), 0, null(), null(), null_mut()),
+            BW_OK
+        );
+        assert_eq!(
+            bw_engine_run_each(engine, cx.0, null(), 0, 2, null(), null(), null_mut()),
             BW_OK
         );
         assert_eq!(

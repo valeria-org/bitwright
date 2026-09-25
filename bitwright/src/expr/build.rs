@@ -588,9 +588,27 @@ impl Context {
     /// Rebuilds node `i` with new children, through the canonicalizing constructors.
     pub(crate) fn rebuild(&mut self, i: u32, kids: [u32; 3]) -> Result<u32, Error> {
         let n = self.node(i);
+        if matches!(n.op, OpCode::Const | OpCode::Sym) {
+            return Ok(i);
+        }
+        let fp = self.fp_desc(i);
+        self.rebuild_node(n, fp, kids)
+    }
+
+    /// Node `n` (of this context or another, with its floating-point description `fp`, if it
+    /// is a floating-point operation) over the children `kids` of this one, through the
+    /// canonicalizing constructors. Not for constants and symbols.
+    fn rebuild_node(
+        &mut self,
+        n: Node,
+        fp: Option<crate::fp::node::Desc>,
+        kids: [u32; 3],
+    ) -> Result<u32, Error> {
         let [a, b, c] = kids;
         match n.op {
-            OpCode::Const | OpCode::Sym => Ok(i),
+            OpCode::Const | OpCode::Sym => Err(Error::Contract(
+                "a constant or symbol rebuilt as an operation".into(),
+            )),
             OpCode::Zext => self.c_zext(a, n.width),
             OpCode::Sext => self.c_sext(a, n.width),
             OpCode::Extract => self.c_extract(a, n.b as u16, n.width),
@@ -607,12 +625,87 @@ impl Context {
                     self.c_bin(bo, a, b)
                 } else if let Some(co) = op.as_cmp() {
                     self.c_cmp(co, a, b)
-                } else if let Some(d) = self.fp_desc(i) {
+                } else if let Some(d) = fp {
                     self.c_fp(d, &[a, b, c][..d.kind().arity()])
                 } else {
                     unreachable!("every opcode is covered")
                 }
             }
+        }
+    }
+
+    /// Copies `roots` of the context `src` into this one: `roots[i]` of the result is equal to
+    /// `roots[i]` of `src`. Nodes are rebuilt through the constructors, so the copies are in
+    /// this context's canonical form and share whatever it already holds. Symbols keep their
+    /// keys (a key this context has at another width is an error); an extension operation must
+    /// be in this context's registry at the position it has in `src`'s (as
+    /// [`extend_registry`](Context::extend_registry) keeps it).
+    pub fn import(&mut self, src: &Context, roots: &[Expr]) -> Result<Vec<Expr>, Error> {
+        let ids = src.ids(roots)?;
+        let mut map: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+        let mut stack: Vec<(u32, bool)> = ids.iter().rev().map(|&i| (i, false)).collect();
+        while let Some((i, expanded)) = stack.pop() {
+            if map.contains_key(&i) {
+                continue;
+            }
+            let n = src.node(i);
+            if !expanded {
+                stack.push((i, true));
+                stack.extend(
+                    n.children()
+                        .filter(|c| !map.contains_key(c))
+                        .map(|c| (c, false)),
+                );
+                continue;
+            }
+            let j = match n.op {
+                OpCode::Const => {
+                    let v = src
+                        .const_val(i)
+                        .ok_or_else(|| Error::Contract("a constant without a value".into()))?;
+                    self.mk_const(&v)?
+                }
+                OpCode::Sym => {
+                    let e = &src.symbols.entries[n.a as usize];
+                    let s = self.symbol(e.key.clone(), e.width)?;
+                    self.id(s)?
+                }
+                op => {
+                    if op.as_ext().is_some() {
+                        self.same_ext_op(src, n.aux)?;
+                    }
+                    let mut kids = [0u32; 3];
+                    for (k, c) in n.children().enumerate() {
+                        kids[k] = map[&c];
+                    }
+                    self.rebuild_node(n, src.fp_desc(i), kids)?
+                }
+            };
+            map.insert(i, j);
+        }
+        Ok(ids.iter().map(|i| self.handle(map[i])).collect())
+    }
+
+    /// Whether the extension operation at registry position `index` of `src` is at the same
+    /// position here (same name, revision and traits).
+    fn same_ext_op(&self, src: &Context, index: u8) -> Result<(), Error> {
+        let theirs = src.registry.as_deref().and_then(|r| r.op_at(index));
+        let ours = self.registry.as_deref().and_then(|r| r.op_at(index));
+        match (theirs, ours) {
+            (Some(p), Some(o))
+                if p.name() == o.name()
+                    && p.revision() == o.revision()
+                    && p.traits() == o.traits() =>
+            {
+                Ok(())
+            }
+            (Some(p), _) => Err(Error::Unsupported(format!(
+                "the extension operation {} is not in this context's registry at its position",
+                p.name()
+            ))),
+            (None, _) => Err(Error::Contract(
+                "an extension node without its operation".into(),
+            )),
         }
     }
 

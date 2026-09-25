@@ -416,6 +416,15 @@ class Engine:
         budget: Budget | None = None,
         assumptions: Assumptions | None = None,
     ) -> list[Outcome]: ...
+    def run_each(
+        self,
+        exprs: Sequence[Expr],
+        *,
+        threads: int = 0,
+        budget: Budget | None = None,
+        assumptions: Assumptions | None = None,
+    ) -> list[Outcome]:
+        """Each expression simplified on its own, on up to `threads` threads (0: all)."""
 
 def check_rules(source: str) -> str:
     """Checks every rule of a `.bwr` source; the proof ledger vouching for them."""

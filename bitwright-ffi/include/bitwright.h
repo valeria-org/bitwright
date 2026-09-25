@@ -609,6 +609,13 @@ bw_status bw_engine_run(const bw_engine *engine, bw_context *cx, const bw_expr *
                         const bw_budget *budget, const bw_assumptions *a,
                         bw_outcome *outcomes);
 
+/* Simplifies `n` roots each on its own, as `bw_engine_run` would with that root alone, on up to
+ * `threads` threads (0: as many as the machine runs at once), writing `outcomes[0..n)`. The
+ * results do not depend on the number of threads; `budget` caps each root. */
+bw_status bw_engine_run_each(const bw_engine *engine, bw_context *cx, const bw_expr *roots,
+                             size_t n, size_t threads, const bw_budget *budget,
+                             const bw_assumptions *a, bw_outcome *outcomes);
+
 /* ----- SMT-LIB ----------------------------------------------------------------------------- */
 
 /* A QF_BV script (QF_BVFP with floating-point operations) declaring the roots' symbols and

@@ -99,13 +99,20 @@ fresh = cx.parse("(p | q) & (p | ~q)", 64)
 stopped = engine.run([fresh], budget=bw.Budget(node_visits=0))[0]
 assert stopped.end == "budget" and stopped.limit == "node visits"
 assert engine.run([e], budget=bw.Budget(node_visits=0))[0].end == "completed"
+
+# Many independent expressions: each on its own, on threads, with the interpreter released.
+exprs = [cx.parse(t, 64) for t in ["(x ^ y) + 2 * (x & y)", "(x | y) - (x & ~y)"]]
+out = bw.Engine.deobfuscate().run_each(exprs, threads=4)
+assert [str(o.expr) for o in out] == ["x + y", "y"]
 ```
 
 Errors are exceptions: `ParseError` for text, `WidthError` for width rules, `RuleError` for rule
 files and ledgers, `BitwrightError` (their base) for the rest, `ValueError` for an int that does
 not fit and `TypeError` for an operand that is not an expression or an int. Contexts and engines
 may be shared between threads: a context serializes the operations on it, and simplification
-releases the interpreter. The package is typed (`py.typed`).
+releases the interpreter. `Engine.run_each` simplifies many expressions each on its own on
+threads of its own (as `Engine::run_each` in Rust; `bw_engine_run_each` in C, `run_each` in
+C++). The package is typed (`py.typed`).
 
 ## C
 

@@ -18,7 +18,7 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright lift block.vex` | Reads lifted code (Ghidra p-code, VEX as pyvex prints it, an LLVM IR function; `--from pcode|vex|llvm` when the extension does not say) and prints each register it writes, each store and each exit, deobfuscated; `--synth` also searches for smaller equal expressions. See [Lifted code](lifting.md). |
 | `bitwright tv before.ll after.ll` | Translation validation: each function of the second file must refine the function of the same name in the first (or `@tgt` refine `@src` of one file), for a subset of LLVM IR. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
-| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). |
+| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). `--file exprs.txt` simplifies each line of a file on its own, on `--jobs` threads. |
 
 ## Simplifying from the shell
 
@@ -37,6 +37,21 @@ fp.mul.rne.f64(x, 0x3fd0000000000000)
 
 The expression is in the [text syntax](getting-started.md), floating-point operations
 included; symbols have the `--width` (64 by default) unless they say otherwise (`b:8`).
+
+`--file` simplifies a file of expressions, one per line (`-` reads standard input), each on its
+own and on up to `--jobs` threads (all the machine runs at once by default). It prints one line
+per line read, blank lines and `#` comments as they are:
+
+```text
+$ cat exprs.txt
+# from the obfuscated function
+(x ^ y) + 2 * (x & y)
+(x | y) - (x & ~y)
+$ bitwright simplify --width 32 --file exprs.txt --jobs 8
+# from the obfuscated function
+x + y
+y
+```
 
 Rules of your own join the built-in ones with `--rules`; `bitwright check my.bwr --ledger
 my.bwr.proof` once saves checking them on every call:

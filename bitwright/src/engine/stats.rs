@@ -59,6 +59,63 @@ pub struct Stats {
     pub declined: u64,
 }
 
+impl Stats {
+    /// Adds another call's counters (`rounds` is the larger of the two).
+    pub fn absorb(&mut self, o: &Stats) {
+        // Every field by name, so a new one cannot be forgotten.
+        let Stats {
+            node_visits,
+            memo_hits,
+            candidates,
+            match_steps,
+            no_match,
+            guard_false,
+            degraded,
+            no_change,
+            rewrites,
+            hook_vetoes,
+            rejected,
+            cycles_cut,
+            quarantined,
+            new_nodes,
+            fact_work,
+            pass_work,
+            rounds,
+            passes,
+            mba,
+            completed,
+            budget_terminated,
+            declined,
+        } = o;
+        self.node_visits += node_visits;
+        self.memo_hits += memo_hits;
+        self.candidates += candidates;
+        self.match_steps += match_steps;
+        self.no_match += no_match;
+        self.guard_false += guard_false;
+        self.degraded += degraded;
+        self.no_change += no_change;
+        self.rewrites += rewrites;
+        self.hook_vetoes += hook_vetoes;
+        self.rejected += rejected;
+        self.cycles_cut += cycles_cut;
+        self.quarantined += quarantined;
+        self.new_nodes += new_nodes;
+        self.fact_work += fact_work;
+        self.pass_work += pass_work;
+        self.rounds = self.rounds.max(*rounds);
+        for (name, c) in passes {
+            self.passes.entry(name).or_default().absorb(c);
+        }
+        self.mba.absorb(mba);
+        for k in 0..2 {
+            self.completed[k] += completed[k];
+            self.budget_terminated[k] += budget_terminated[k];
+        }
+        self.declined += declined;
+    }
+}
+
 /// Counters for the MBA service: calls, outcomes, and the refusal taxonomy.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -95,6 +152,40 @@ pub struct MbaStats {
 }
 
 impl MbaStats {
+    /// Adds another call's counters.
+    pub fn absorb(&mut self, o: &MbaStats) {
+        let MbaStats {
+            calls,
+            cache_hits,
+            simplified,
+            no_simpler,
+            unsupported,
+            exhausted,
+            refuted,
+            proof_unknown,
+            not_smaller,
+            too_many_vars,
+            too_large,
+            too_wide,
+            too_small,
+            certificates,
+        } = o;
+        self.calls += calls;
+        self.cache_hits += cache_hits;
+        self.simplified += simplified;
+        self.no_simpler += no_simpler;
+        self.unsupported += unsupported;
+        self.exhausted += exhausted;
+        self.refuted += refuted;
+        self.proof_unknown += proof_unknown;
+        self.not_smaller += not_smaller;
+        self.too_many_vars += too_many_vars;
+        self.too_large += too_large;
+        self.too_wide += too_wide;
+        self.too_small += too_small;
+        self.certificates.absorb(certificates);
+    }
+
     #[cfg(feature = "mba")]
     pub(crate) fn refused(&mut self, why: &crate::mba::Refusal) {
         use crate::mba::Refusal;
@@ -153,6 +244,46 @@ pub struct CertStats {
 }
 
 impl CertStats {
+    /// Adds another call's counters.
+    pub fn absorb(&mut self, o: &CertStats) {
+        let CertStats {
+            calls,
+            proved,
+            refuted,
+            unknown,
+            signature,
+            single_bit,
+            sparse,
+            grid,
+            exhaustive,
+            symbolic,
+            carries,
+            compositional,
+            split,
+            known_bits,
+            points,
+            over_budget,
+            internal,
+        } = o;
+        self.calls += calls;
+        self.proved += proved;
+        self.refuted += refuted;
+        self.unknown += unknown;
+        self.signature += signature;
+        self.single_bit += single_bit;
+        self.sparse += sparse;
+        self.grid += grid;
+        self.exhaustive += exhaustive;
+        self.symbolic += symbolic;
+        self.carries += carries;
+        self.compositional += compositional;
+        self.split += split;
+        self.known_bits += known_bits;
+        self.points += points;
+        self.over_budget += over_budget;
+        self.internal += internal;
+    }
+
     /// Adds a report.
     #[cfg(feature = "mba")]
     pub(crate) fn record(&mut self, r: &crate::mba::certify::Report) {
@@ -207,6 +338,26 @@ pub struct PassCounts {
     pub rejected: u64,
     /// Regions over the pass's size cap, treated as opaque atoms.
     pub atomized: u64,
+}
+
+impl PassCounts {
+    /// Adds another call's counters.
+    pub fn absorb(&mut self, o: &PassCounts) {
+        let PassCounts {
+            calls,
+            noop,
+            changed,
+            rejected_cost,
+            rejected,
+            atomized,
+        } = o;
+        self.calls += calls;
+        self.noop += noop;
+        self.changed += changed;
+        self.rejected_cost += rejected_cost;
+        self.rejected += rejected;
+        self.atomized += atomized;
+    }
 }
 
 /// Why an application was rejected after its rule applied.

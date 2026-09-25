@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 
 use bitwright::check::{CheckConfig, Verdict, check_program};
-use bitwright::engine::{Budget, End, Engine, Run, Strategy};
+use bitwright::engine::{Budget, Each, End, Engine, Run, Strategy};
 use bitwright::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::rules::{Ledger, RuleProgram};
@@ -1344,7 +1344,7 @@ impl PyExpr {
                 &standard
             }
         };
-        Ok(run(py, engine, &[self], Budget::default(), None, None)?
+        Ok(run(py, engine, &[self], Budget::default(), None, None, None)?
             .remove(0)
             .expr)
     }
@@ -1652,7 +1652,8 @@ impl Outcome {
     }
 }
 
-/// Simplifies `exprs` (of one context) with the interpreter released.
+/// Simplifies `exprs` (of one context) with the interpreter released: in one call, or with
+/// `threads` each on its own (`Engine::run_each`).
 fn run(
     py: Python<'_>,
     engine: &PyEngine,
@@ -1660,6 +1661,7 @@ fn run(
     budget: Budget,
     assumptions: Option<&PyAssumptions>,
     trace: Option<&mut Trace>,
+    threads: Option<usize>,
 ) -> PyResult<Vec<Outcome>> {
     let refuse = Refuse(&engine.refuse);
     let engine = &engine.engine;
@@ -1673,6 +1675,18 @@ fn run(
         .detach(|| {
             let mut c = pycx.cx.lock().unwrap_or_else(|p| p.into_inner());
             let a = assumptions.map(|a| a.a.lock().unwrap_or_else(|p| p.into_inner()));
+            if let Some(threads) = threads {
+                let mut each = Each::default()
+                    .with_threads(threads)
+                    .with_per_root(budget);
+                if let Some(a) = &a {
+                    each = each.with_assumptions(a);
+                }
+                if !refuse.0.is_empty() {
+                    each = each.with_hooks(&refuse);
+                }
+                return engine.run_each(&mut c, &roots, each);
+            }
             let mut options = Run::default().with_per_call(budget);
             if let Some(a) = &a {
                 options = options.with_assumptions(a);
@@ -1914,7 +1928,7 @@ impl PyEngine {
         assumptions: Option<&PyAssumptions>,
     ) -> PyResult<PyExpr> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
-        Ok(run(py, self, &[&expr], budget, assumptions, None)?
+        Ok(run(py, self, &[&expr], budget, assumptions, None, None)?
             .remove(0)
             .expr)
     }
@@ -1930,7 +1944,7 @@ impl PyEngine {
     ) -> PyResult<(PyExpr, Vec<Step>)> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let mut trace = Trace::default();
-        let out = run(py, self, &[&expr], budget, assumptions, Some(&mut trace))?
+        let out = run(py, self, &[&expr], budget, assumptions, Some(&mut trace), None)?
             .remove(0)
             .expr;
         let cx = expr.cx.bind(py);
@@ -1954,7 +1968,24 @@ impl PyEngine {
     ) -> PyResult<Vec<Outcome>> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let refs: Vec<&PyExpr> = exprs.iter().map(|e| &**e).collect();
-        run(py, self, &refs, budget, assumptions, None)
+        run(py, self, &refs, budget, assumptions, None, None)
+    }
+
+    /// Simplifies expressions of one context each on its own, as `run` would with that one
+    /// alone, on up to `threads` threads (0: as many as the machine runs at once), with the
+    /// interpreter released; an `Outcome` each. `budget` caps each expression.
+    #[pyo3(signature = (exprs, *, threads = 0, budget = None, assumptions = None))]
+    fn run_each(
+        &self,
+        py: Python<'_>,
+        exprs: Vec<PyRef<'_, PyExpr>>,
+        threads: usize,
+        budget: Option<&PyBudget>,
+        assumptions: Option<&PyAssumptions>,
+    ) -> PyResult<Vec<Outcome>> {
+        let budget = budget.map_or_else(Budget::default, |b| b.b);
+        let refs: Vec<&PyExpr> = exprs.iter().map(|e| &**e).collect();
+        run(py, self, &refs, budget, assumptions, None, Some(threads))
     }
 
     fn __repr__(&self) -> String {

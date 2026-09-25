@@ -127,6 +127,40 @@ Results are memoized in the context: simplifying the same node again (or a large
 containing it) is answered from the memo, as long as the engine, the host hooks and the
 assumptions are the same.
 
+## Many expressions at once
+
+`Engine::run` takes several roots and processes them one after another, in one context: work
+on shared subexpressions is done once, and a rewrite is weighed against every root that uses
+a node. For many independent expressions (every instruction of a function, a dataset of
+obfuscated expressions), `Engine::run_each` simplifies each root on its own, as a call with
+that root alone would, on threads. Each root is copied into a context of its own
+(`Context::import`, which also moves expressions between contexts in general), simplified
+there, and its result copied back. The results do not depend on the number of threads, and
+`Outcome::stats` sums the roots':
+
+```rust
+use bitwright::engine::{Each, Engine, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W32);
+let roots = [
+    cx.parse("(x ^ y) + 2 * (x & y)", &o)?,
+    cx.parse("(x | y) - (x & ~y)", &o)?,
+    cx.parse("((a - b) >>u 31) ^ (((a ^ b) & (a ^ (a - b))) >>u 31)", &o)?,
+];
+let engine = Engine::builder().builtin().strategy(Strategy::deobfuscate()).build()?;
+let out = engine.run_each(&mut cx, &roots, Each::default().with_threads(4))?;
+let shown: Vec<String> = out.roots.iter().map(|r| cx.display(r.expr).to_string()).collect();
+assert_eq!(shown, ["x + y", "y", "zext<32>(a <s b)"]);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`Each` takes a per-root budget, admission caps, assumptions (copied into each root's context)
+and hooks that are `Sync`; observers, allowances and deadlines are `run`'s. On a target
+without threads the calling thread does all the work. The command line's `simplify --file`
+does the same for a file of expressions, one per line.
+
 ## Hooks and observers
 
 `Hooks` let the host veto a rewrite (`admit`) or a fold of a fact-known value into a constant

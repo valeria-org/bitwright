@@ -217,6 +217,14 @@ def test_engines_budgets_and_outcomes(cx):
     mba = (x & y) * (x | y) + (x & ~y) * (~x & y)
     assert str(mba.simplify(bw.Engine.deobfuscate())) == "x * y"
     assert str(mba.simplify()) != "x * y"
+    # Each expression on its own, on threads: as a call with that one alone.
+    exprs = [(x & y) + (x | y), x & 0xFFFF0000, x, mba, (x & y) + (x | y)]
+    deob = bw.Engine.deobfuscate()
+    for threads in (1, 4, 0):
+        each = deob.run_each(exprs, threads=threads, assumptions=a)
+        assert [str(o.expr) for o in each] == ["x + y", "0:32", "x", "x * y", "x + y"]
+        assert [o.relies_on for o in each] == [(), (0,), (), (), ()]
+    assert deob.run_each([]) == []
 
 
 RULES = """bitwright 1;

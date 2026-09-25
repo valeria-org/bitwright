@@ -176,6 +176,17 @@
   stored value reassemble into it, so a spill reloaded is the spilled value. `Memory::bind`
   gives the unknown cells their values from a memory image. SMT-LIB import reads arrays
   (QF_ABV: `select`, `store`) as memories.
+- **Many expressions at once, on threads.** `Engine::run_each` simplifies each root on its own,
+  as a call of `run` with that root alone would, on up to `Each::threads` threads: each root is
+  copied into a context of its own, simplified there, and its result copied back. The results
+  and statistics do not depend on the number of threads (200 random DAGs of 120 nodes: 197 ms
+  with `run`, 139 ms with `run_each` on one thread, 31 ms on eight). `Each` takes a per-root
+  budget, admission caps, assumptions and `Sync` hooks. `Context::import` copies expressions
+  from another context through the constructors (symbols by key; extension operations need the
+  same registry). `Stats::absorb` (and `MbaStats`, `CertStats`, `PassCounts`) add another
+  call's counters. The command line's `simplify --file exprs.txt --jobs 8` simplifies a file of
+  expressions, one per line; Python has `Engine.run_each(exprs, threads=…)` (the interpreter
+  released), C `bw_engine_run_each`, C++ `Engine::run_each`.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use bitwright::check::{CheckConfig, Verdict, check_program};
 use std::sync::Arc;
 
-use bitwright::engine::{Engine, Run, Strategy};
+use bitwright::engine::{Each, Engine, Run, Strategy};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::rules::{Ledger, Level, Rule, RuleKind, RuleProgram, builtin_sources, explain};
 use bitwright::{Assumptions, Context, ParseOptions, Reliance, Width, smtlib};
@@ -62,8 +62,12 @@ commands:
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
            [--float-values] [--synth]
+  simplify --file <path> [--jobs <n>] [options as above]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
+        `--file` simplifies each line of a file (`-`: standard input) on its own, on up to
+        `--jobs` threads (all the machine runs at once by default), and prints one line per
+        line read (blank lines and `#` comments as they are).
         Deobfuscates: the rules, the normal-form passes and the MBA service with the native
         normal-form solver, whose every answer bitwright proves itself. `--standard` runs only
         the rules and the standard passes (`--deobfuscate`, the default, is accepted).
@@ -808,13 +812,40 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "rules",
             "float-values",
             "synth",
+            "file",
+            "jobs",
         ],
         &["deobfuscate", "standard", "float-values", "synth"],
     )?;
     if a.flag("standard") && a.flag("deobfuscate") {
         return Err(usage("--standard and --deobfuscate exclude each other"));
     }
-    let src = a.one("expression")?;
+    // One expression, or a file of them (one per line; blank lines and `#` comments kept).
+    let file = a.value("file");
+    let lines: Vec<String> = match file {
+        Some(path) => {
+            if !a.pos.is_empty() {
+                return Err(usage("--file replaces the expression"));
+            }
+            let text = if path == "-" {
+                std::io::read_to_string(std::io::stdin())
+                    .map_err(|e| Fail::Err(2, format!("stdin: {e}")))?
+            } else {
+                read(path)?
+            };
+            text.lines().map(str::to_string).collect()
+        }
+        None => {
+            if a.value("jobs").is_some() {
+                return Err(usage("--jobs goes with --file"));
+            }
+            vec![a.one("expression")?.to_string()]
+        }
+    };
+    let jobs: usize = match a.value("jobs") {
+        Some(j) => j.parse().map_err(|_| usage(format!("bad --jobs {j}")))?,
+        None => 0,
+    };
     let w: u16 = match a.value("width") {
         Some(w) => w.parse().map_err(|_| usage(format!("bad --width {w}")))?,
         None => 64,
@@ -822,9 +853,18 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
     let width = Width::new(w).map_err(|_| usage("the width must be 1..=512"))?;
     let mut cx = Context::new();
     let o = ParseOptions::width(width);
-    let e = cx
-        .parse(src, &o)
-        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let expression =
+        |l: &str| file.is_none() || (!l.trim().is_empty() && !l.trim_start().starts_with('#'));
+    let mut exprs = Vec::new();
+    for (k, l) in lines.iter().enumerate() {
+        if expression(l) {
+            let e = cx.parse(l, &o).map_err(|e| match file {
+                Some(path) => Fail::Err(2, format!("{path}:{}: {e}", k + 1)),
+                None => Fail::Err(2, format!("{e}")),
+            })?;
+            exprs.push(e);
+        }
+    }
     let mut assumptions = Assumptions::new();
     for p in a.values("assume") {
         let p = cx
@@ -867,26 +907,55 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         .strategy(strategy)
         .build()
         .map_err(|e| Fail::Err(2, format!("{e}")))?;
-    let out = engine
-        .run(&mut cx, &[e], Run::default().with_assumptions(&assumptions))
-        .map_err(|e| Fail::Err(2, format!("{e}")))?
-        .roots[0];
-    // Then, on request, the smallest equal expression the synthesizer finds (proved equal).
-    let mut result = out.expr;
-    if a.flag("synth")
-        && let Some(s) = bitwright::synth::synthesize(&mut cx, result, &Default::default())
-            .map_err(|e| Fail::Err(2, format!("{e}")))?
-    {
-        result = s;
+    // A file's expressions each on its own, on threads; one expression as before.
+    let outs = match file {
+        Some(_) => engine.run_each(
+            &mut cx,
+            &exprs,
+            Each::default()
+                .with_threads(jobs)
+                .with_assumptions(&assumptions),
+        ),
+        None => engine.run(
+            &mut cx,
+            &exprs,
+            Run::default().with_assumptions(&assumptions),
+        ),
     }
-    let mut text = format!("{}", cx.display(result));
-    if !out.relies_on.is_none() {
-        text.push_str(&format!(
-            "    # relies on {}",
-            constraint_ids(out.relies_on)
-        ));
+    .map_err(|e| Fail::Err(2, format!("{e}")))?
+    .roots;
+    let mut outs = outs.into_iter();
+    let mut report = String::new();
+    for l in &lines {
+        if !expression(l) {
+            writeln!(report, "{l}").unwrap_or(());
+            continue;
+        }
+        let Some(out) = outs.next() else {
+            break;
+        };
+        // Then, on request, the smallest equal expression the synthesizer finds (proved equal).
+        let mut result = out.expr;
+        if a.flag("synth")
+            && let Some(s) = bitwright::synth::synthesize(&mut cx, result, &Default::default())
+                .map_err(|e| Fail::Err(2, format!("{e}")))?
+        {
+            result = s;
+        }
+        let mut text = format!("{}", cx.display(result));
+        if file.is_some() {
+            // One line per line read (`let` bindings end in `;`).
+            text = text.replace('\n', " ");
+        }
+        if !out.relies_on.is_none() {
+            text.push_str(&format!(
+                "    # relies on {}",
+                constraint_ids(out.relies_on)
+            ));
+        }
+        writeln!(report, "{text}").unwrap_or(());
     }
-    Ok(format!("{text}\n"))
+    Ok(report)
 }
 
 /// A rule file for `simplify --rules`, with the ledger vouching for it: `<path>.proof` if it

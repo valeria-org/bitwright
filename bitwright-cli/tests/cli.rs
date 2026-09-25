@@ -197,6 +197,34 @@ fn simplify_runs_the_engine() {
     assert_eq!(run(&["simplify", "x", "--width", "0"]).0, 2);
 }
 
+#[test]
+fn simplify_a_file_line_by_line() {
+    let f = file(
+        "exprs.txt",
+        "# MBA\n(x ^ y) + 2 * (x & y)\n\n2 * (x | y) - (x & ~y) - (~x & y)\nx & 15\n",
+    );
+    for jobs in ["1", "3"] {
+        let (code, out, _) = run(&[
+            "simplify", "--file", &f, "--jobs", jobs, "--width", "8", "--assume", "x <u 16",
+        ]);
+        assert_eq!(code, 0);
+        assert_eq!(out, "# MBA\nx + y\n\nx + y\nx    # relies on 0\n");
+    }
+    // A result with bindings stays on its line.
+    let (code, out, _) = run(&["simplify", "--file", &f, "--standard"]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.lines().nth(3),
+        Some("let %0 = x | y; %0 + %0 - (~y & x) - (~x & y)")
+    );
+    let bad = file("bad.txt", "x\nx +\n");
+    let (code, _, err) = run(&["simplify", "--file", &bad]);
+    assert_eq!(code, 2);
+    assert!(err.contains("bad.txt:2:"), "{err}");
+    assert_eq!(run(&["simplify", "x", "--jobs", "2"]).0, 2);
+    assert_eq!(run(&["simplify", "x", "--file", &f]).0, 2);
+}
+
 /// `--rules` adds a rule file's rules: checked now, or vouched for by `<file>.proof`.
 #[test]
 fn simplify_with_rules_of_your_own() {

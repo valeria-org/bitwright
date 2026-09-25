@@ -820,6 +820,28 @@ class Engine {
     // Simplifies roots of one context in one call.
     std::vector<Outcome> run(const std::vector<Expr> &roots, const Budget *budget = nullptr,
                              const Assumptions *a = nullptr) const {
+        return run_with(roots, [&](bw_context *cx, const bw_expr *r, size_t n, bw_outcome *out) {
+            return bw_engine_run(e_.get(), cx, r, n, budget, raw_of(a), out);
+        });
+    }
+
+    // Simplifies roots of one context each on its own, on up to `threads` threads (0: all).
+    std::vector<Outcome> run_each(const std::vector<Expr> &roots, size_t threads = 0,
+                                  const Budget *budget = nullptr,
+                                  const Assumptions *a = nullptr) const {
+        return run_with(roots, [&](bw_context *cx, const bw_expr *r, size_t n, bw_outcome *out) {
+            return bw_engine_run_each(e_.get(), cx, r, n, threads, budget, raw_of(a), out);
+        });
+    }
+
+    const bw_engine *raw() const { return e_.get(); }
+
+  private:
+    friend class EngineBuilder;
+    explicit Engine(bw_engine *e) : e_(e, &bw_engine_free) {}
+
+    template <class Call>
+    static std::vector<Outcome> run_with(const std::vector<Expr> &roots, Call call) {
         if (roots.empty()) {
             return {};
         }
@@ -829,8 +851,7 @@ class Engine {
         }
         std::vector<bw_outcome> out(roots.size());
         bw_context *cx = roots[0].context();
-        detail::check(
-            bw_engine_run(e_.get(), cx, r.data(), r.size(), budget, raw_of(a), out.data()));
+        detail::check(call(cx, r.data(), r.size(), out.data()));
         std::vector<Outcome> res;
         for (const bw_outcome &o : out) {
             res.push_back(
@@ -838,12 +859,6 @@ class Engine {
         }
         return res;
     }
-
-    const bw_engine *raw() const { return e_.get(); }
-
-  private:
-    friend class EngineBuilder;
-    explicit Engine(bw_engine *e) : e_(e, &bw_engine_free) {}
 
     std::shared_ptr<bw_engine> e_;
 };
