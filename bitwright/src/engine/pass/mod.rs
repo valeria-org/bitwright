@@ -25,7 +25,7 @@ use super::{Accept, By, Fin, Reject, Runner, Step, Stop};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
-use crate::facts::{Facts, Reliance};
+use crate::facts::{Facts, KnownBits, Reliance};
 
 /// A set of node indices emptied in constant time (by a new epoch; a stamp of 0 is never
 /// current): the engine's per-node scratch, kept by the runner and reused instead of hash sets.
@@ -156,17 +156,6 @@ impl Counts {
         self.stamp[i] = self.epoch;
         self.val[i] = v;
     }
-
-    /// Counts one less for `i` (not below 0), if it has a count: the count left.
-    #[inline]
-    pub(crate) fn dec(&mut self, i: u32) -> Option<u32> {
-        let i = i as usize;
-        if self.stamp.get(i) != Some(&self.epoch) {
-            return None;
-        }
-        self.val[i] = self.val[i].saturating_sub(1);
-        Some(self.val[i])
-    }
 }
 
 /// The commit rule's scratch (see [`shrinks`]).
@@ -182,8 +171,13 @@ pub(crate) struct Scratch {
     dying: Counts,
     /// Uses from inside the region.
     local: Counts,
+    /// The atoms of the region.
+    atoms: Marks,
+    /// Region nodes nothing live uses.
+    zeros: Vec<u32>,
     queue: std::collections::VecDeque<u32>,
     stack: Vec<u32>,
+    heap: std::collections::BinaryHeap<u32>,
 }
 
 /// A normal-form pass.
@@ -324,6 +318,74 @@ pub(super) fn facts(
     if let Some(v) = cx.const_val(n) {
         return Ok((Some(Facts::constant(&v)), Fin::FINAL));
     }
+    query(r, cx, n, |f| f, Context::try_facts_cap)
+}
+
+/// The known bits of [`facts`], without building the other facts where no assumptions apply.
+pub(super) fn known(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<(Option<KnownBits>, Fin), Stop> {
+    if let Some(v) = cx.const_val(n) {
+        return Ok((Some(KnownBits::constant(&v)), Fin::FINAL));
+    }
+    query(r, cx, n, |f| f.known(), Context::try_known_cap)
+}
+
+/// [`known`] of a node of at most 64 bits, as its known-zero and known-one words.
+pub(super) fn known_words(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<(Option<[u64; 2]>, Fin), Stop> {
+    let words = |k: &KnownBits| [k.known_zero().limbs()[0], k.known_one().limbs()[0]];
+    if let Some(v) = cx.const_val(n) {
+        return Ok((Some(words(&KnownBits::constant(&v))), Fin::FINAL));
+    }
+    query(
+        r,
+        cx,
+        n,
+        |f| words(&f.known()),
+        Context::try_known_words_cap,
+    )
+}
+
+/// Whether the facts prove that `a` and `b` (of one width) never have a bit set in both, with
+/// what the facts of each relied on.
+pub(super) fn disjoint(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<(bool, Fin, Fin), Stop> {
+    let bits = cx.width_of(a).bits();
+    if bits <= 64 {
+        let (ka, fa) = known_words(r, cx, a)?;
+        let (kb, fb) = known_words(r, cx, b)?;
+        let mask = u64::MAX >> (64 - bits);
+        let d = matches!((ka, kb), (Some([za, _]), Some([zb, _])) if !za & !zb & mask == 0);
+        return Ok((d, fa, fb));
+    }
+    let (ka, fa) = known(r, cx, a)?;
+    let (kb, fb) = known(r, cx, b)?;
+    let d = match (ka, kb) {
+        (Some(x), Some(y)) => crate::facts::known::bv_and(&x.maybe_one(), &y.maybe_one()).is_zero(),
+        _ => false,
+    };
+    Ok((d, fa, fb))
+}
+
+/// [`facts`] of a node that is not a constant, read by `of` under assumptions and by `base`
+/// from the base facts otherwise.
+fn query<T>(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    of: impl FnOnce(Facts) -> T,
+    base: impl FnOnce(&mut Context, crate::Expr, u32) -> Result<Option<T>, crate::Error>,
+) -> Result<(Option<T>, Fin), Stop> {
     let left = r.meter.left().fact_work;
     let cap = u32::try_from(left).unwrap_or(u32::MAX);
     if cap == 0 {
@@ -334,13 +396,10 @@ pub(super) fn facts(
     // Infeasible assumptions prove anything; the engine proves nothing from them.
     let (f, rel) = match r.assumptions {
         Some(a) => match cx.facts_under_cap(e, a, cap).map_err(Stop::Error)? {
-            Ok((f, rel)) => (Some(f), rel),
+            Ok((f, rel)) => (Some(of(f)), rel),
             Err(_) => (None, Reliance::NONE),
         },
-        None => (
-            cx.try_facts_cap(e, cap).map_err(Stop::Error)?,
-            Reliance::NONE,
-        ),
+        None => (base(cx, e, cap).map_err(Stop::Error)?, Reliance::NONE),
     };
     r.meter.spent.fact_work += cx.facts.work - work0;
     if cx.facts.capped != capped0 {
@@ -379,25 +438,43 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// version of every root of the call (nodes only replaced ones reach are not live), then kept
 /// up to date as nodes are created (counted) and replaced (uncounted, see `Runner::retire`). A
 /// node a counted node uses is counted too, so one replaced and then used again is live again.
+///
+/// The roots other than the active one do not change while it is processed: their part is
+/// counted once per root ([`Live`]) and stands in every phase run in which none of the nodes
+/// they reach was retired (a count from scratch skips retired nodes, and what only they reach).
 fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     if !r.uses_on {
-        r.uses.begin(cx.len());
+        r.live.clear();
         r.scratch.seen.begin(cx.len());
-        let mut stack: Vec<u32> = r.live_roots.clone();
+        let others = others_hold(r, cx);
+        let mut stack: Vec<u32> = if others {
+            if let Err(e) = charge_each(&mut r.meter, r.live.others.nodes as u64) {
+                r.live.clear();
+                return Err(e.into());
+            }
+            // (Off when the other roots reach nothing: then it adds nothing.)
+            r.live.base = r.live.others.nodes > 0;
+            r.live_roots.get(r.active).copied().into_iter().collect()
+        } else {
+            r.live_roots.clone()
+        };
         while let Some(i) = stack.pop() {
-            if !r.scratch.seen.insert(i) || r.dead.contains(i) {
+            if (others && r.live.others.reach.contains(i))
+                || !r.scratch.seen.insert(i)
+                || r.dead.contains(i)
+            {
                 continue;
             }
             if let Err(e) = r.meter.charge(Counter::PassWork, 1) {
-                // Nothing counted yet (`uses` is still off): keep `counted` consistent.
-                r.counted.clear();
+                // Nothing counted yet (`uses` is still off): keep the counted set consistent.
+                r.live.clear();
                 return Err(e.into());
             }
             for c in cx.node(i).children() {
-                r.uses.add(c);
+                r.live.add(c);
                 stack.push(c);
             }
-            r.counted.insert(i);
+            r.live.count(i);
         }
         r.uses_on = true;
         r.uses_upto = r.phase_start;
@@ -407,17 +484,17 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     r.meter.charge(Counter::PassWork, u64::from(len - from))?;
     let mut stack: Vec<u32> = (from..len)
         .rev()
-        .filter(|&i| !r.dead.contains(i) && !r.counted.contains(i))
+        .filter(|&i| !r.dead.contains(i) && !r.live.counted(i))
         .collect();
     while let Some(i) = stack.pop() {
-        if !r.counted.insert(i) {
+        if !r.live.count(i) {
             continue;
         }
         r.dead.remove(i);
         r.meter.charge(Counter::PassWork, 1)?;
         for c in cx.node(i).children() {
-            r.uses.add(c);
-            if !r.counted.contains(c) {
+            r.live.add(c);
+            if !r.live.counted(c) {
                 stack.push(c);
             }
         }
@@ -426,50 +503,239 @@ fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     Ok(())
 }
 
-/// The region of `n`: the nodes reachable from it without entering `atoms` (sorted), at most
-/// [`REGION_CAP`] of them (the ones nearest `n`), in descending index order. Operands always
-/// have lower indices than their users, so this order lists every user before its operands.
-/// Also leaves the region as `r.scratch.region`.
-fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result<Vec<u32>, Stop> {
+/// Charges `n` units of pass work as `n` charges of one would: on failure, what was left is
+/// spent.
+fn charge_each(meter: &mut crate::engine::budget::Meter, n: u64) -> Result<(), Exhausted> {
+    if meter.charge(Counter::PassWork, n).is_err() {
+        for _ in 0..n {
+            meter.charge(Counter::PassWork, 1)?;
+        }
+    }
+    Ok(())
+}
+
+/// The uses the live roots other than the active one contribute, counted once per root.
+#[derive(Default)]
+pub(crate) struct Others {
+    /// The entry of `live_roots` they were counted for.
+    active: Option<usize>,
+    /// The nodes the other roots reach, and how many.
+    reach: Marks,
+    nodes: u32,
+    /// The uses from those nodes.
+    uses: Counts,
+}
+
+/// The use counts and the set of nodes whose edges they count ("counted"), for the commit
+/// rule: when `base` is on, the other roots' part ([`Others`]) with this phase run's changes on
+/// top, else the changes alone. Answers as one [`Counts`] and one [`Marks`] would.
+#[derive(Default)]
+pub(crate) struct Live {
+    others: Others,
+    base: bool,
+    /// Counted nodes outside the base, and base nodes no longer counted.
+    counted: Marks,
+    uncounted: Marks,
+    /// Changes of the use counts (signed), stamped as in [`Counts`].
+    stamp: Vec<u32>,
+    delta: Vec<i32>,
+    epoch: u32,
+}
+
+impl Live {
+    /// Empties it: nothing counted, no uses, the base off.
+    pub(crate) fn clear(&mut self) {
+        self.base = false;
+        self.counted.clear();
+        self.uncounted.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    fn in_base(&self, i: u32) -> bool {
+        self.base && self.others.reach.contains(i)
+    }
+
+    #[inline]
+    fn delta(&self, i: u32) -> Option<i32> {
+        let i = i as usize;
+        (self.stamp.get(i) == Some(&self.epoch)).then(|| self.delta[i])
+    }
+
+    #[inline]
+    fn change(&mut self, i: u32, by: i32) {
+        let i = i as usize;
+        if i >= self.stamp.len() {
+            self.stamp.resize(i + 1, 0);
+            self.delta.resize(i + 1, 0);
+        }
+        if self.stamp[i] != self.epoch {
+            self.stamp[i] = self.epoch;
+            self.delta[i] = 0;
+        }
+        self.delta[i] += by;
+    }
+
+    /// The uses of `i`, if it has a count.
+    #[inline]
+    pub(crate) fn uses(&self, i: u32) -> Option<u32> {
+        let d = self.delta(i);
+        if !self.base {
+            return d.map(|d| d.max(0) as u32);
+        }
+        match (self.others.uses.get(i), d) {
+            (None, None) => None,
+            (b, d) => Some((i64::from(b.unwrap_or(0)) + i64::from(d.unwrap_or(0))).max(0) as u32),
+        }
+    }
+
+    /// Counts one more use of `i`.
+    #[inline]
+    pub(crate) fn add(&mut self, i: u32) {
+        self.change(i, 1);
+    }
+
+    /// Counts one use less of `i` (not below 0), if it has a count: the count left.
+    #[inline]
+    pub(crate) fn dec(&mut self, i: u32) -> Option<u32> {
+        let n = self.uses(i)?;
+        if n > 0 {
+            self.change(i, -1);
+        }
+        Some(n.saturating_sub(1))
+    }
+
+    /// Whether `i`'s edges are counted.
+    #[inline]
+    pub(crate) fn counted(&self, i: u32) -> bool {
+        (self.in_base(i) && !self.uncounted.contains(i)) || self.counted.contains(i)
+    }
+
+    /// Counts `i`'s edges from now on: whether they were not.
+    #[inline]
+    pub(crate) fn count(&mut self, i: u32) -> bool {
+        if self.counted(i) {
+            return false;
+        }
+        if self.in_base(i) {
+            self.uncounted.remove(i);
+        } else {
+            self.counted.insert(i);
+        }
+        true
+    }
+
+    /// Stops counting `i`'s edges: whether they were.
+    #[inline]
+    pub(crate) fn uncount(&mut self, i: u32) -> bool {
+        if self.counted.remove(i) {
+            return true;
+        }
+        self.in_base(i) && self.uncounted.insert(i)
+    }
+}
+
+/// Whether the other roots' part holds in this phase run, counting it first if it is for
+/// another root: no node the other roots reach was retired in the run.
+fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
+    let o = &mut r.live.others;
+    if o.active != Some(r.active) {
+        o.active = Some(r.active);
+        // (Sized as they grow: often the other roots reach nothing.)
+        o.reach.clear();
+        o.uses.begin(0);
+        o.nodes = 0;
+        let mut stack: Vec<u32> = r
+            .live_roots
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| k != r.active)
+            .map(|(_, &i)| i)
+            .collect();
+        while let Some(i) = stack.pop() {
+            if !o.reach.insert(i) {
+                continue;
+            }
+            o.nodes += 1;
+            for c in cx.node(i).children() {
+                o.uses.add(c);
+                stack.push(c);
+            }
+        }
+    }
+    !r.dead_log.iter().any(|&d| o.reach.contains(d))
+}
+
+/// The region of `n`: the nodes reachable from it without entering `atoms`, at most
+/// [`REGION_CAP`] of them (the ones nearest `n`), left as `r.scratch.region` (and the atoms as
+/// `r.scratch.atoms`). Also counts in `r.scratch.local` each region node's uses from region
+/// nodes, and lists in `r.scratch.zeros` the region nodes no live node uses (see [`dying_in`]).
+fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result<(), Stop> {
     let sc = &mut r.scratch;
+    sc.atoms.begin(cx.len());
+    for &a in atoms {
+        sc.atoms.insert(a);
+    }
     sc.region.begin(cx.len());
+    sc.local.begin(cx.len());
+    sc.zeros.clear();
     sc.queue.clear();
     sc.queue.push_back(n);
-    let mut out: Vec<u32> = Vec::new();
+    let mut size = 0u32;
+    let mut last = None;
     while let Some(i) = sc.queue.pop_front() {
         if !sc.region.insert(i) {
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        out.push(i);
-        if out.len() >= REGION_CAP as usize {
+        if r.uses_on && r.live.uses(i) == Some(0) {
+            sc.zeros.push(i);
+        }
+        size += 1;
+        if size >= REGION_CAP {
+            last = Some(i);
             break;
         }
+        // Every operand's use is counted, whether or not the operand joins the region: only
+        // region nodes' counts are read.
         for c in cx.node(i).children() {
-            if atoms.binary_search(&c).is_err() {
+            if !sc.atoms.contains(c) {
+                sc.local.add(c);
                 sc.queue.push_back(c);
             }
         }
     }
-    out.sort_unstable_by(|a, b| b.cmp(a));
-    Ok(out)
+    // The node the cap stopped at uses region nodes too.
+    if let Some(i) = last {
+        for c in cx.node(i).children() {
+            if sc.region.contains(c) {
+                sc.local.add(c);
+            }
+        }
+    }
+    Ok(())
 }
 
-/// How many nodes of `order` (the region of `n`, users first) stop being used when `n` is
+/// How many nodes of the region of `n` (left by [`region`]) stop being used when `n` is
 /// replaced, counting at most `limit`: `n`, and every node all of whose uses come from nodes
-/// that stop being used; nodes in `kept` (reused by the replacement) stay. A truncated region
-/// gives a lower bound.
+/// that stop being used; with `kept`, nodes in `r.scratch.kept` (reused by the replacement)
+/// stay. A truncated region gives a lower bound.
 ///
 /// With `shared = false`, uses from outside the region are ignored: the count a context-free
 /// decision would make, used to tell whether a rejection depended on sharing.
 ///
-/// `order` is the region `region` left in `r.scratch.region`; with `kept`, the nodes in
-/// `r.scratch.kept` stay.
+/// Operands have lower indices than their users, so taking the nodes that may stop being used
+/// highest index first decides each after all its users. A node may stop being used only if
+/// one of its users does, or if nothing uses it (only nodes `region` listed in `zeros`: counting
+/// the uses since only adds; a region node's uses from the region are never none).
 fn dying_in(
     r: &mut Runner<'_, '_>,
     cx: &Context,
     n: u32,
-    order: &[u32],
     kept: bool,
     limit: u32,
     shared: bool,
@@ -478,30 +744,29 @@ fn dying_in(
         refresh_uses(r, cx)?;
     }
     let sc = &mut r.scratch;
-    if !shared {
-        sc.local.begin(cx.len());
-        for &i in order {
-            for c in cx.node(i).children() {
-                if sc.region.contains(c) {
-                    sc.local.add(c);
-                }
-            }
-        }
-    }
-    let uses = |sc: &Scratch, i: u32| {
-        if shared {
-            r.uses.get(i)
-        } else {
-            sc.local.get(i)
-        }
-    };
     sc.dying.begin(cx.len());
+    sc.heap.clear();
+    sc.heap.push(n);
+    if shared {
+        sc.heap.extend(sc.zeros.iter().copied());
+    }
     let mut count = 0u32;
-    for &i in order {
+    let mut last = None;
+    while let Some(i) = sc.heap.pop() {
+        // Copies of a node come out together (nothing larger is added after it).
+        if last == Some(i) {
+            continue;
+        }
+        last = Some(i);
         if kept && sc.kept.contains(i) {
             continue;
         }
-        let dies = i == n || sc.dying.get(i).unwrap_or(0) >= uses(sc, i).unwrap_or(u32::MAX);
+        let uses = if shared {
+            r.live.uses(i)
+        } else {
+            sc.local.get(i)
+        };
+        let dies = i == n || sc.dying.get(i).unwrap_or(0) >= uses.unwrap_or(u32::MAX);
         if !dies {
             continue;
         }
@@ -512,22 +777,18 @@ fn dying_in(
         for c in cx.node(i).children() {
             if sc.region.contains(c) {
                 sc.dying.add(c);
+                sc.heap.push(c);
             }
         }
     }
     Ok(count)
 }
 
-/// The nodes candidate `e` needs that are neither atoms nor in the region (`r.scratch.region`,
-/// of the node it replaces), leaving the region nodes it reuses in `r.scratch.kept`; `None` if
-/// more than [`REGION_CAP`]. Counted against the structure, not the arena, so the decision never
-/// depends on which nodes happen to exist already.
-fn needed(
-    r: &mut Runner<'_, '_>,
-    cx: &Context,
-    e: u32,
-    atoms: &[u32],
-) -> Result<Option<u32>, Stop> {
+/// The nodes candidate `e` needs that are neither atoms nor in the region (`r.scratch.atoms`
+/// and `r.scratch.region`, of the node it replaces), leaving the region nodes it reuses in
+/// `r.scratch.kept`; `None` if more than [`REGION_CAP`]. Counted against the structure, not the
+/// arena, so the decision never depends on which nodes happen to exist already.
+fn needed(r: &mut Runner<'_, '_>, cx: &Context, e: u32) -> Result<Option<u32>, Stop> {
     let sc = &mut r.scratch;
     sc.seen.begin(cx.len());
     sc.kept.begin(cx.len());
@@ -535,7 +796,7 @@ fn needed(
     sc.stack.push(e);
     let mut new = 0u32;
     while let Some(i) = sc.stack.pop() {
-        if !sc.seen.insert(i) || atoms.binary_search(&i).is_ok() {
+        if !sc.seen.insert(i) || sc.atoms.contains(i) {
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
@@ -568,15 +829,12 @@ pub(super) fn worth_building(
     atoms: &[u32],
     estimate: u32,
 ) -> Result<Option<Fin>, Stop> {
-    let mut sorted = atoms.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let order = region(r, cx, n, &sorted)?;
+    region(r, cx, n, atoms)?;
     r.meter.check()?;
-    if dying_in(r, cx, n, &order, false, estimate.saturating_add(1), true)? > estimate {
+    if dying_in(r, cx, n, false, estimate.saturating_add(1), true)? > estimate {
         return Ok(None);
     }
-    let alone = dying_in(r, cx, n, &order, false, estimate.saturating_add(1), false)?;
+    let alone = dying_in(r, cx, n, false, estimate.saturating_add(1), false)?;
     Ok(Some(if alone > estimate {
         Fin::PROVISIONAL
     } else {
@@ -601,17 +859,14 @@ pub(super) fn shrinks(
     if cx.node(e).op == OpCode::Const && cx.node(n).op != OpCode::Const {
         return Ok(Ok(()));
     }
-    let mut sorted = atoms.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let order = region(r, cx, n, &sorted)?;
+    region(r, cx, n, atoms)?;
     r.meter.check()?;
-    let Some(new) = needed(r, cx, e, &sorted)? else {
+    let Some(new) = needed(r, cx, e)? else {
         return Ok(Err(Fin::FINAL));
     };
-    let freed = dying_in(r, cx, n, &order, true, new.saturating_add(1), true)?;
+    let freed = dying_in(r, cx, n, true, new.saturating_add(1), true)?;
     if new >= freed {
-        let alone = dying_in(r, cx, n, &order, true, new.saturating_add(1), false)?;
+        let alone = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
         return Ok(Err(if new < alone {
             Fin::PROVISIONAL
         } else {

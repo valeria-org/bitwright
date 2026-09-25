@@ -613,6 +613,26 @@ impl BaseFacts {
         Some(from_words(w, &self.narrow[k]))
     }
 
+    /// The known-zero and known-one words of node `i`, of width at most 64.
+    fn known_words(&self, i: u32) -> Option<[u64; 2]> {
+        let k = (*self.slot.get(i as usize)?).checked_sub(1)? as usize;
+        let x = self.narrow.get(k)?;
+        Some([x[0], x[1]])
+    }
+
+    /// The known bits of node `i`, of width `w`, without the other facts.
+    fn known(&self, i: u32, w: Width) -> Option<KnownBits> {
+        let k = (*self.slot.get(i as usize)?).checked_sub(1)? as usize;
+        if w.bits() > 64 {
+            return Some(self.wide[k].known);
+        }
+        let x = &self.narrow[k];
+        Some(KnownBits::from_masks(
+            BitVec::from_canonical_u64(w, x[0]),
+            BitVec::from_canonical_u64(w, x[1]),
+        ))
+    }
+
     fn insert(&mut self, i: u32, f: Facts) {
         let i = i as usize;
         if i >= self.slot.len() {
@@ -1017,13 +1037,22 @@ impl Context {
 
     /// [`Self::compute_facts`] with at most `cap` transfers (and at most the context's cap).
     fn compute_facts_cap(&mut self, root: u32, cap: u32) -> Option<Facts> {
-        if let Some(f) = self.cached_facts(root) {
-            return Some(f);
+        if self.ensure_facts_cap(root, cap) {
+            self.cached_facts(root)
+        } else {
+            None
+        }
+    }
+
+    /// Caches the base facts of `root` (as [`Self::compute_facts_cap`]): whether they are.
+    fn ensure_facts_cap(&mut self, root: u32, cap: u32) -> bool {
+        if self.facts.base.contains(root) {
+            return true;
         }
         let cap = cap.min(self.config().fact_work.max(1));
         if cap == 0 {
             self.facts.capped += 1;
-            return None;
+            return false;
         }
         let cap = cap as usize;
         let mut pending = match self.facts.pending.take() {
@@ -1045,7 +1074,7 @@ impl Context {
                 if done >= cap {
                     self.facts.pending = Some(pending);
                     self.facts.capped += 1;
-                    return None;
+                    return false;
                 }
                 let f = self.transfer_node(i, |c| {
                     self.cached_facts(c)
@@ -1057,7 +1086,7 @@ impl Context {
             }
             pending.pos += 1;
         }
-        self.cached_facts(root)
+        self.facts.base.contains(root)
     }
 
     /// The cached base facts of node `i`.
@@ -1136,6 +1165,30 @@ impl Context {
     pub(crate) fn try_facts_cap(&mut self, e: Expr, cap: u32) -> Result<Option<Facts>, Error> {
         let i = self.id(e)?;
         Ok(self.compute_facts_cap(i, cap))
+    }
+
+    /// The known-zero and known-one words of [`Self::try_facts_cap`] for an expression of at
+    /// most 64 bits, without building the facts.
+    pub(crate) fn try_known_words_cap(
+        &mut self,
+        e: Expr,
+        cap: u32,
+    ) -> Result<Option<[u64; 2]>, Error> {
+        let i = self.id(e)?;
+        debug_assert!(self.width_of(i).bits() <= 64);
+        if !self.ensure_facts_cap(i, cap) {
+            return Ok(None);
+        }
+        Ok(self.facts.base.known_words(i))
+    }
+
+    /// The known bits of [`Self::try_facts_cap`], without building the other facts.
+    pub(crate) fn try_known_cap(&mut self, e: Expr, cap: u32) -> Result<Option<KnownBits>, Error> {
+        let i = self.id(e)?;
+        if !self.ensure_facts_cap(i, cap) {
+            return Ok(None);
+        }
+        Ok(self.facts.base.known(i, self.width_of(i)))
     }
 
     /// Facts about `e` under `assumptions`, with the constraints they rely on; `None` if the

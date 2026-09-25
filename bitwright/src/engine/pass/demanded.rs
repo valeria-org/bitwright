@@ -10,10 +10,10 @@
 use crate::engine::budget::Counter;
 use crate::hash::IdMap;
 
-use super::{Fin, PassKind, Runner, Step, Stop, facts, finish};
+use super::{Fin, PassKind, Runner, Step, Stop, finish, known, known_words};
 use crate::BitVec;
 use crate::expr::{Context, OpCode};
-use crate::facts::known::{bv_and, bv_not, low_mask};
+use crate::facts::known::{bv_and, bv_not, bv_or, low_mask};
 use crate::ops::{BinOp, UnOp};
 
 /// The most nodes one simplification visits.
@@ -22,7 +22,7 @@ const MAX_VISITS: u32 = 256;
 /// A node and a demanded mask: hashed by the mask's active limbs only (one for 64 bits), not
 /// all eight a `BitVec` stores.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Key(u32, BitVec);
+pub(crate) struct Key(u32, BitVec);
 
 impl core::hash::Hash for Key {
     fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
@@ -33,8 +33,11 @@ impl core::hash::Hash for Key {
     }
 }
 
+/// Results per node and demanded mask, for one simplification (kept by the runner and reused).
+pub(crate) type Memo = IdMap<Key, u32>;
+
 struct Demand {
-    memo: IdMap<Key, u32>,
+    memo: Memo,
     stops: Vec<u32>,
     visits: u32,
     fin: Fin,
@@ -125,18 +128,28 @@ fn simplify(
         st.memo.insert(Key(x, *m), v);
         return Ok(v);
     }
-    // Known demanded bits make the operand a constant.
-    let (f, fin) = facts(r, cx, x)?;
+    // Known demanded bits make the operand a constant: the value on them, if all are known.
+    let (fold, fin) = if w.bits() <= 64 {
+        let (k, fin) = known_words(r, cx, x)?;
+        let mw = m.limbs()[0];
+        let fold = k.map(|[zero, one]| {
+            ((zero | one) & mw == mw).then(|| BitVec::from_canonical_u64(w, one & mw))
+        });
+        (fold, fin)
+    } else {
+        let (k, fin) = known(r, cx, x)?;
+        let fold = k.map(|k| {
+            let known = bv_and(&bv_or(&k.known_zero(), &k.known_one()), m);
+            (known == *m).then(|| bv_and(&k.known_one(), m))
+        });
+        (fold, fin)
+    };
     // What the facts relied on counts only if they fold the operand.
     st.fin = st.fin.and(fin.unchanged());
-    if let Some(f) = f {
-        let k = f.known();
-        let known = bv_and(&bv_not(&k.maybe_one()), m);
-        let known = crate::facts::known::bv_or(&known, &bv_and(&k.known_one(), m));
+    if let Some(fold) = fold {
         let allowed = r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(x)));
-        if known == *m && allowed {
+        if let Some(v) = fold.filter(|_| allowed) {
             st.fin = st.fin.and(fin);
-            let v = bv_and(&k.known_one(), m);
             let c = r.build(cx, |cx| cx.mk_const(&v))?;
             st.memo.insert(Key(x, *m), c);
             return Ok(c);
@@ -299,12 +312,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     let before = cx.len() as u32;
     let mut st = Demand {
-        memo: IdMap::default(),
+        memo: std::mem::take(&mut r.demanded),
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
+    st.memo.clear();
+    r.demanded = std::mem::take(&mut st.memo);
     if st.visits > MAX_VISITS {
         count(r).atomized += 1;
     }

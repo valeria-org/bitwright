@@ -966,22 +966,24 @@ struct Runner<'r, 'a> {
     scratch: pass::Scratch,
     /// The linear-MBA pass's scratch.
     linear_mba: pass::linear_mba::Scratch,
-    /// Use counts (parent edges of live nodes) for the passes' commit rule, per phase run,
-    /// computed on first need (`uses_on`).
-    uses: pass::Counts,
+    /// The demanded-bits pass's memo, empty between calls.
+    demanded: pass::demanded::Memo,
+    /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
+    /// edges they count, per phase run, computed on first need (`uses_on`).
+    live: pass::Live,
     uses_on: bool,
-    /// Arena nodes whose edges `uses` already counts.
+    /// Arena nodes whose edges `live` already counts.
     uses_upto: u32,
     /// The arena length when the current phase run began.
     phase_start: u32,
     /// Nodes replaced (or built and discarded) in the current phase run: not parents.
     dead: pass::Marks,
+    /// The nodes `dead` took in the current phase run, in order.
+    dead_log: Vec<u32>,
     /// The current version of every distinct root of the call (for use counts).
     live_roots: Vec<u32>,
     /// Which entry of `live_roots` is being processed.
     active: usize,
-    /// Nodes whose edges `uses` currently counts.
-    counted: pass::Marks,
     /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
     /// rebuilt, over its operands' results, into one a pass rewrote it from (see `local`).
     rewritten: IdMap<(u32, u32), ()>,
@@ -1049,7 +1051,8 @@ impl Runner<'_, '_> {
             if !self.dead.insert(n) {
                 continue;
             }
-            if !self.counted.remove(n) {
+            self.dead_log.push(n);
+            if !self.live.uncount(n) {
                 continue;
             }
             if !self.uses_on {
@@ -1057,12 +1060,12 @@ impl Runner<'_, '_> {
             }
             orphans.clear();
             for c in cx.node(n).children() {
-                if self.uses.dec(c) == Some(0) {
+                if self.live.dec(c) == Some(0) {
                     orphans.push(c);
                 }
             }
             for &c in &orphans {
-                if self.counted.contains(c) && !self.live_roots.contains(&c) {
+                if self.live.counted(c) && !self.live_roots.contains(&c) {
                     stack.push(c);
                 }
             }
@@ -1100,8 +1103,9 @@ impl Runner<'_, '_> {
             // A pass's decisions depend on sharing, which the previous phase or round may have
             // changed: start afresh (final results stay memoized).
             self.uses_on = false;
-            self.counted.clear();
+            self.live.clear();
             self.dead.clear();
+            self.dead_log.clear();
             self.partial[phase].clear();
             self.chain_parent.clear();
             self.asks.clear();
@@ -1652,11 +1656,13 @@ impl Engine {
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
-            uses: pass::Counts::default(),
+            demanded: Default::default(),
+            live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
             phase_start: 0,
             dead: pass::Marks::default(),
+            dead_log: Vec::new(),
             live_roots: {
                 let mut seen: IdMap<u32, ()> = IdMap::default();
                 ids.iter()
@@ -1665,7 +1671,6 @@ impl Engine {
                     .collect()
             },
             active: 0,
-            counted: pass::Marks::default(),
             rewritten: IdMap::default(),
             chain_parent: IdMap::default(),
             asks: IdMap::default(),

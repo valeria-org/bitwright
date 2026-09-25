@@ -8,7 +8,7 @@
 //! replaces the node only when the region above the atoms gets strictly smaller. Cancels
 //! boolean (xor) masking.
 
-use super::{Fin, PassKind, Runner, Step, Stop, facts, finish, worth_building};
+use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -173,14 +173,7 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             (Some(c), _) => get(r, node.b).mask(&bv_not(&c)).xor_const(&c),
             (_, Some(c)) => get(r, node.a).mask(&bv_not(&c)).xor_const(&c),
             _ => {
-                let (fa, fina) = facts(r, cx, node.a)?;
-                let (fb, finb) = facts(r, cx, node.b)?;
-                let disjoint = match (fa, fb) {
-                    (Some(a), Some(b)) => {
-                        bv_and(&a.known().maybe_one(), &b.known().maybe_one()).is_zero()
-                    }
-                    _ => false,
-                };
+                let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
                 if disjoint {
                     // The form relies on what proved the operands disjoint.
                     let mut f = get(r, node.a).xor(&get(r, node.b));

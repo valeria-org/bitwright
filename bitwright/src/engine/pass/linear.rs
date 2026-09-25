@@ -8,11 +8,11 @@
 //! coefficients as shifts, the constant last), and the emission replaces the node only when
 //! the region above the atoms gets strictly smaller.
 
-use super::{Fin, PassKind, Runner, Step, Stop, facts, finish, worth_building};
+use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
-use crate::facts::known::{bv_and, count_ones};
+use crate::facts::known::count_ones;
 use crate::ops::{BinOp, UnOp};
 
 /// The most terms a form keeps before its node is treated as an atom.
@@ -360,14 +360,7 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             }
         }
         OpCode::Or | OpCode::Xor => {
-            let (fa, fina) = facts(r, cx, node.a)?;
-            let (fb, finb) = facts(r, cx, node.b)?;
-            let disjoint = match (fa, fb) {
-                (Some(a), Some(b)) => {
-                    bv_and(&a.known().maybe_one(), &b.known().maybe_one()).is_zero()
-                }
-                _ => false,
-            };
+            let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
             if disjoint {
                 // The sum relies on what proved the operands disjoint.
                 let mut f = get(r, node.a).add(&get(r, node.b));
