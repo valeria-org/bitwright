@@ -446,6 +446,18 @@ impl Context {
         self.tag = fresh_tag();
     }
 
+    /// Makes room for at least `additional` more nodes without reallocating (a host that knows
+    /// the size of the function it is about to build). Nodes are still created only on demand,
+    /// and [`ContextConfig::max_nodes`] still bounds them.
+    pub fn reserve(&mut self, additional: usize) {
+        self.nodes.reserve(additional);
+        self.meta.reserve(additional);
+        let seed = self.config.hash_seed;
+        let meta = &self.meta;
+        self.interner
+            .reserve(additional, |&i| combine(seed, meta[i as usize].shash));
+    }
+
     /// Node creation counters.
     pub fn counters(&self) -> ArenaCounters {
         self.counters
@@ -511,6 +523,12 @@ impl Context {
     pub(crate) fn width_of(&self, i: u32) -> Width {
         // Every stored width was validated at construction.
         Width::new(self.nodes[i as usize].width).unwrap_or(Width::W1)
+    }
+
+    /// Whether node `i` is a constant (without reading its value).
+    #[inline]
+    pub(crate) fn is_const(&self, i: u32) -> bool {
+        self.nodes[i as usize].op == OpCode::Const
     }
 
     /// The value of a constant node.
@@ -629,9 +647,36 @@ impl Context {
         self.push(n, shash)
     }
 
+    /// Interns a constant of at most 64 bits, `v` with no bit set at or above `w`: the node and
+    /// structural hash [`mk_const`](Self::mk_const) gives the same value, without a `BitVec`.
+    pub(crate) fn mk_const_u64(&mut self, w: u16, v: u64) -> Result<u32, Error> {
+        debug_assert!(
+            w <= 64 && (w == 64 || v >> w == 0),
+            "a canonical small constant"
+        );
+        // `const_hash` of a one-limb value.
+        let shash = combine(combine(u64::from(OpCode::Const as u8), u64::from(w)), v);
+        let nodes = &self.nodes;
+        let found = self.interner.find(self.table_hash(shash), |&i| {
+            let n = &nodes[i as usize];
+            n.op == OpCode::Const && n.width == w && u64::from(n.a) | (u64::from(n.b) << 32) == v
+        });
+        if let Some(&i) = found {
+            return Ok(i);
+        }
+        self.room()?;
+        self.push(
+            Node::new(OpCode::Const, w, v as u32, (v >> 32) as u32, 0),
+            shash,
+        )
+    }
+
     /// Interns a constant.
     pub(crate) fn mk_const(&mut self, v: &BitVec) -> Result<u32, Error> {
         let w = v.width().bits();
+        if w <= 64 {
+            return self.mk_const_u64(w, v.limbs()[0]);
+        }
         let shash = Self::const_hash(v);
         let (nodes, wide) = (&self.nodes, &self.wide_consts);
         let limbs = v.limbs();

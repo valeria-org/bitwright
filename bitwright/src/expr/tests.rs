@@ -1121,3 +1121,48 @@ fn bounded_substitution_of_a_deep_chain_takes_linear_total_work() {
     assert!(calls <= 62, "{calls} calls");
     assert_eq!(out, cx.substitute(&[e], &[(x, y)]).unwrap());
 }
+
+/// Constants of at most 64 bits built from a word are the nodes built from a `BitVec`: the same
+/// node, structural hash and printed form, whichever path makes them first.
+#[test]
+fn word_constants_are_the_bitvec_constants() {
+    let mut rng = Rng(0x5eed_c0de);
+    for word_first in [true, false] {
+        let mut cx = Context::new();
+        for w in 1..=64u16 {
+            let width = Width::new(w).unwrap();
+            let mask = u64::MAX >> (64 - w);
+            for v in [0, 1, mask, mask >> 1, rng.next() & mask, rng.next() & mask] {
+                let bv = BitVec::from_u64(width, v).unwrap();
+                let (a, b) = if word_first {
+                    let a = cx.constant_u64(width, v).unwrap();
+                    (a, cx.constant(&bv).unwrap())
+                } else {
+                    let b = cx.constant(&bv).unwrap();
+                    (cx.constant_u64(width, v).unwrap(), b)
+                };
+                assert_eq!(a, b, "{v:#x} at {w} bits");
+                let i = cx.id(a).unwrap();
+                assert_eq!(cx.meta[i as usize].shash, Context::const_hash(&bv));
+                assert_eq!(cx.as_const(a).unwrap(), Some(bv));
+            }
+            // A value that does not fit is refused as before.
+            if w < 64 {
+                assert!(cx.constant_u64(width, mask + 1).is_err());
+            }
+        }
+    }
+}
+
+/// Reserving room changes nothing but capacity.
+#[test]
+fn reserving_room_builds_the_same_nodes() {
+    let (mut a, mut b) = (Context::new(), Context::new());
+    b.reserve(10_000);
+    let o = ParseOptions::width(Width::W32);
+    for src in ["(x & y) + (x | y)", "x - 5 + 5", "(x ^ 0x5a) * 3 == y"] {
+        let (ea, eb) = (a.parse(src, &o).unwrap(), b.parse(src, &o).unwrap());
+        assert_eq!(a.display(ea).to_string(), b.display(eb).to_string());
+        assert_eq!(ea.index(), eb.index());
+    }
+}

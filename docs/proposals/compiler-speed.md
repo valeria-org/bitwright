@@ -1,10 +1,11 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
-Status: in progress. Steps 1 and 2 of the order of work are done (see there): the workload is
-the benchmark group `compile/*` (`cargo run --release -p bitwright-bench -- compile`), and
-`Strategy::compile()` is the engine tier. The numbers below were measured before step 2, on a
-shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on the reference machine of
-`docs/benchmarking.md`. Use them for ratios, not as reference numbers.
+Status: in progress. Steps 1 and 2 of the order of work are done, and step 3 in part (see
+there): the workload is the benchmark group `compile/*` (`cargo run --release -p
+bitwright-bench -- compile`), and `Strategy::compile()` is the engine tier. The numbers below
+were measured before step 2, on a shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on
+the reference machine of `docs/benchmarking.md`. Use them for ratios, not as reference
+numbers.
 
 ## The operating point
 
@@ -384,7 +385,28 @@ Each step is measured with the benchmark from step 1 and lands alone.
    - **Use counts from the host.** They would let the commit rule weigh real sharing and stay
      final.
    - **Host-supplied facts** (`FactSource`).
-3. **Builder fast paths (1b).** Mostly internal.
+3. **Done, in part: builder fast paths (1b).**
+   - **Constants of 64 bits or fewer** are interned from a word (`mk_const_u64`), with the same
+     node and structural hash as from a `BitVec`. A test checks this at every width, whichever
+     path comes first.
+   - **The canonicalizer's constant checks** read words: `is_ones`, shift counts,
+     subtraction of a constant, and the fold test. The fold test no longer builds either
+     operand's value unless both are constants.
+   - **`Context::reserve`** makes room for a function's nodes.
+
+   Building the `compile/*` workload went from 1,248 to 958 instructions per built instruction
+   (callgrind, 400,000 instructions: −23 %), about 145 ns on the VM.
+
+   Left as they were:
+   - **The symbol index keeps SipHash.** Its keys can be strings from untrusted input (the
+     bindings take names), and a compiler that keeps its own dense value map calls `symbol`
+     once per value.
+   - **`Error` keeps its variants.** Boxing its payloads changes a public type, for a gain not
+     yet measured.
+   - **The structural hash stays as it is.** Most of what remains is interning: a Merkle hash
+     of four mixes per binary node, a table probe, and the height and tree-size columns. The
+     hash fixes canonical operand order, so it is part of the output-stability contract.
+     Changing it changes results, and belongs in a release that says so.
 4. **The rule middle end.** First the decision tree, interpreted (2b); then the codegen back
    end, `RuleSet` and a precompiled built-in corpus (2a).
 5. **`Semantics` and `Raise`**, then the derive (1a, 1c).

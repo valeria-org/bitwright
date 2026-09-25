@@ -45,7 +45,18 @@ impl Context {
     }
 
     fn is_ones(&self, i: u32) -> bool {
-        self.is_const_where(i, BitVec::is_ones)
+        match self.small_const(i) {
+            Some(v) => v == u64::MAX >> (64 - self.wid(i)),
+            None => self.is_const_where(i, BitVec::is_ones),
+        }
+    }
+
+    /// Whether `b` is a constant shift count of at least `w`.
+    fn shifts_out(&self, b: u32, w: u16) -> bool {
+        match self.small_const(b) {
+            Some(v) => v >= u64::from(w),
+            None => self.is_const_where(b, |c| count_at_least(c, w)),
+        }
     }
 
     fn is_one(&self, i: u32) -> bool {
@@ -56,14 +67,20 @@ impl Context {
     }
 
     fn c_zero(&mut self, w: u16) -> Result<u32, Error> {
+        if w <= 64 {
+            return self.mk_const_u64(w, 0);
+        }
         self.mk_const(&BitVec::zero(Width::new(w)?))
     }
 
     fn c_bool(&mut self, b: bool) -> Result<u32, Error> {
-        self.mk_const(&BitVec::from_bool(b))
+        self.mk_const_u64(1, u64::from(b))
     }
 
     fn c_uint(&mut self, w: u16, v: u64) -> Result<u32, Error> {
+        if (1..=64).contains(&w) {
+            return self.mk_const_u64(w, v & (u64::MAX >> (64 - w)));
+        }
         self.mk_const(&BitVec::wrapping_from_u64(Width::new(w)?, v))
     }
 
@@ -112,7 +129,10 @@ impl Context {
             .into());
         }
         let w = wa;
-        if let (Some(x), Some(y)) = (self.const_val(a), self.const_val(b)) {
+        if self.is_const(a)
+            && self.is_const(b)
+            && let (Some(x), Some(y)) = (self.const_val(a), self.const_val(b))
+        {
             return self.mk_const(&BitVec::bin_unchecked(op, &x, &y));
         }
         // Commutative operators: constants right, otherwise the canonical order.
@@ -125,6 +145,13 @@ impl Context {
             BinOp::Sub => {
                 if a == b {
                     return self.c_zero(w);
+                }
+                if let Some(c) = self.small_const(b) {
+                    if c == 0 {
+                        return Ok(a);
+                    }
+                    let neg = self.c_uint(w, c.wrapping_neg())?;
+                    return self.c_bin(BinOp::Add, a, neg);
                 }
                 if let Some(c) = self.const_val(b) {
                     if c.is_zero() {
@@ -218,7 +245,7 @@ impl Context {
                 if self.is_zero(b) || self.is_zero(a) {
                     return Ok(a);
                 }
-                if self.is_const_where(b, |c| count_at_least(c, w)) {
+                if self.shifts_out(b, w) {
                     return self.c_zero(w);
                 }
             }
@@ -226,7 +253,7 @@ impl Context {
                 if self.is_zero(b) || self.is_zero(a) || self.is_ones(a) {
                     return Ok(a);
                 }
-                if self.is_const_where(b, |c| count_at_least(c, w)) {
+                if self.shifts_out(b, w) {
                     let top = self.c_uint(w, u64::from(w) - 1)?;
                     return self.c_bin(BinOp::AShr, a, top);
                 }
@@ -273,7 +300,10 @@ impl Context {
             }
             .into());
         }
-        if let (Some(x), Some(y)) = (self.const_val(a), self.const_val(b)) {
+        if self.is_const(a)
+            && self.is_const(b)
+            && let (Some(x), Some(y)) = (self.const_val(a), self.const_val(b))
+        {
             return self.c_bool(BitVec::cmp_unchecked(op, &x, &y));
         }
         let (a, b) = if op.is_commutative() && self.order(a, b).is_gt() {
@@ -743,6 +773,11 @@ impl Context {
 
     /// The constant `v`, which must fit in `width` bits.
     pub fn constant_u64(&mut self, width: Width, v: u64) -> Result<Expr, Error> {
+        let w = width.bits();
+        if w <= 64 && (w == 64 || v >> w == 0) {
+            let i = self.mk_const_u64(w, v)?;
+            return Ok(self.handle(i));
+        }
         self.constant(&BitVec::from_u64(width, v)?)
     }
 

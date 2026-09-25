@@ -185,7 +185,8 @@ larger where values share subterms: a rewrite may keep alive a subterm another v
 uses. The compiler keeps its own use counts and decides what to replace.
 
 Build values through the builder, not text, with the compiler's value numbers as symbol keys,
-and reuse one context per function (`Context::clear` keeps its allocations):
+and reuse one context per function (`Context::clear` keeps its allocations, and
+`Context::reserve` makes room for a function you know the size of):
 
 ```rust
 use bitwright::engine::{Engine, Run, Strategy};

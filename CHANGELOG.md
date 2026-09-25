@@ -20,6 +20,10 @@
 - **Cheaper calls on memoized values.** A phase whose memo holds the root answers without
   preparing a walk, and the walk's stack is reused: a call on an already simplified value costs
   about half what it did.
+- **Cheaper construction.** Constants of 64 bits or fewer are interned from a word, and the
+  canonicalizer's constant checks read words instead of building values: building SSA code
+  takes about a quarter fewer instructions. `Context::reserve` makes room for a known number
+  of nodes. The nodes built are the same.
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.
