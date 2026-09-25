@@ -102,9 +102,9 @@ whose facts are measured. It runs with the counters paused.
 
 ## Reference numbers
 
-bitwright 0.10.0 with the unreleased changes, `cargo run --release -p bitwright-bench` (Rust
-1.98, Linux, one performance core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs
-of the thread's CPU time; instructions are the median.
+bitwright 0.11.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
+core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's CPU time;
+instructions are the median.
 
 | Operation | CPU time | Instructions |
 |-|-|-|

@@ -76,10 +76,10 @@ fn main() -> Result<(), bitwright::Error> {
 
 ## Performance
 
-bitwright (0.10.0 with the unreleased changes) against other tools, each on what it is built
-for, on one performance core of an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every answer is
-read into bitwright, sized in DAG nodes of its canonical form (a shared subterm counts once) and
-checked against its input; no tool gave a wrong answer. [`compare/`](compare/README.md) reproduces the tables, and
+bitwright 0.11.0 against other tools, each on what it is built for, on one performance core of
+an Intel Core Ultra 7 265 (Linux, Rust 1.98). Every answer is read into bitwright, sized in DAG
+nodes of its canonical form (a shared subterm counts once) and checked against its input; no
+tool gave a wrong answer. [`compare/`](compare/README.md) reproduces the tables, and
 [docs/benchmarking.md](docs/benchmarking.md#reference-numbers) has bitwright's own costs per
 operation.
 

@@ -1,11 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
 - **Floating point: `x / ½` is `x + x`.** Construction writes a division by one half as the
   sum, like `x · 2`: the same real number, rounded once in the same mode, so every result is
   the same bit pattern (½ is computed per format, subnormal where the exponent has two bits).
-
 - **`simplify --rules`.** The command line's `simplify` takes rule files of your own
   (`--rules my.bwr`, repeatable), run after the built-in rules in every rule phase. A file is
   vouched for by the ledger `my.bwr.proof` next to it (as `check --ledger` writes it), or
@@ -238,7 +237,10 @@
   behavior with `.mba_solver(Arc::new(SignatureSolver))` and
   `MbaTrust::default().with_backend_certificates(true)`. The command line and the bindings
   already used these settings; their results do not change.
-  The new rules change results wherever they apply.
+  The new rules and passes (orders of several terms, parity and residues, bit tests and
+  concatenations, case splits, polynomial identities, maps over GF(2), `x / ½`) change results
+  wherever they apply, and so does the second look at several roots (on the corpora measured,
+  only to smaller results); `core.casts::trunc_and_zext` is gone.
 
 ## 0.10.0
 

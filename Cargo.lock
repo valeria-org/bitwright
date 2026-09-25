@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "bitwright"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bitwright-ref",
  "hashbrown",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "bitwright-bench"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bitwright",
  "libc",
@@ -20,25 +20,25 @@ dependencies = [
 
 [[package]]
 name = "bitwright-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bitwright",
 ]
 
 [[package]]
 name = "bitwright-ffi"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bitwright",
 ]
 
 [[package]]
 name = "bitwright-ref"
-version = "0.10.0"
+version = "0.11.0"
 
 [[package]]
 name = "bitwright-wasm"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "bitwright",
 ]

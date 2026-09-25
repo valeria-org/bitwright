@@ -1,6 +1,6 @@
 # Proposal: the normal-form solver and bitwright's own evidence as the MBA defaults
 
-Status: accepted and implemented for the release after 0.10.0 (see the changelog). Was: proposed, not implemented. Both changes alter results, so they are proposed apart
+Status: accepted and implemented in 0.11.0 (see the changelog). Was: proposed, not implemented. Both changes alter results, so they are proposed apart
 from the code that makes them possible (the `NormalFormSolver`, the gate's certificates).
 
 ## The change
