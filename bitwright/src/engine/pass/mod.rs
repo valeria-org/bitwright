@@ -177,7 +177,10 @@ pub(crate) struct Scratch {
     zeros: Vec<u32>,
     queue: std::collections::VecDeque<u32>,
     stack: Vec<u32>,
-    heap: std::collections::BinaryHeap<u32>,
+    /// Region nodes found to stop being used, not yet propagated.
+    dead: Vec<u32>,
+    /// Region nodes decided to stop being used.
+    decided: Marks,
 }
 
 /// A normal-form pass.
@@ -728,10 +731,10 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
 /// With `shared = false`, uses from outside the region are ignored: the count a context-free
 /// decision would make, used to tell whether a rejection depended on sharing.
 ///
-/// Operands have lower indices than their users, so taking the nodes that may stop being used
-/// highest index first decides each after all its users. A node may stop being used only if
-/// one of its users does, or if nothing uses it (only nodes `region` listed in `zeros`: counting
-/// the uses since only adds; a region node's uses from the region are never none).
+/// A node stops being used once as many of its uses come from nodes that stop being used as it
+/// has, so it is decided when the last of those is (in any order); or at once if nothing uses
+/// it (only nodes `region` listed in `zeros` can be: counting the uses since only adds, and a
+/// region node's uses from the region are never none).
 fn dying_in(
     r: &mut Runner<'_, '_>,
     cx: &Context,
@@ -745,39 +748,48 @@ fn dying_in(
     }
     let sc = &mut r.scratch;
     sc.dying.begin(cx.len());
-    sc.heap.clear();
-    sc.heap.push(n);
-    if shared {
-        sc.heap.extend(sc.zeros.iter().copied());
-    }
-    let mut count = 0u32;
-    let mut last = None;
-    while let Some(i) = sc.heap.pop() {
-        // Copies of a node come out together (nothing larger is added after it).
-        if last == Some(i) {
-            continue;
-        }
-        last = Some(i);
-        if kept && sc.kept.contains(i) {
-            continue;
-        }
-        let uses = if shared {
-            r.live.uses(i)
+    sc.decided.begin(cx.len());
+    sc.dead.clear();
+    let uses = |sc: &Scratch, live: &Live, i: u32| {
+        if shared {
+            live.uses(i)
         } else {
             sc.local.get(i)
-        };
-        let dies = i == n || sc.dying.get(i).unwrap_or(0) >= uses.unwrap_or(u32::MAX);
-        if !dies {
-            continue;
         }
+    };
+    // `n`, and the region nodes nothing uses (only those `region` listed can be).
+    if !(kept && sc.kept.contains(n)) {
+        sc.decided.insert(n);
+        sc.dead.push(n);
+    }
+    if shared {
+        for k in 0..sc.zeros.len() {
+            let z = sc.zeros[k];
+            if !(kept && sc.kept.contains(z))
+                && uses(sc, &r.live, z) == Some(0)
+                && sc.decided.insert(z)
+            {
+                sc.dead.push(z);
+            }
+        }
+    }
+    let mut count = 0u32;
+    while let Some(i) = sc.dead.pop() {
         count += 1;
         if count >= limit {
             return Ok(count);
         }
         for c in cx.node(i).children() {
-            if sc.region.contains(c) {
-                sc.dying.add(c);
-                sc.heap.push(c);
+            if !sc.region.contains(c) {
+                continue;
+            }
+            sc.dying.add(c);
+            if sc.decided.contains(c) || (kept && sc.kept.contains(c)) {
+                continue;
+            }
+            if sc.dying.get(c).unwrap_or(0) >= uses(sc, &r.live, c).unwrap_or(u32::MAX) {
+                sc.decided.insert(c);
+                sc.dead.push(c);
             }
         }
     }
