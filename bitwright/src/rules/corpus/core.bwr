@@ -753,7 +753,7 @@ group core.float {
     /// Dividing by a power of two is multiplying by its reciprocal when that is a normal
     /// number: the two are the same real number, rounded once in the same mode, so every result
     /// (a NaN, an infinity, the sign of a zero, an underflow) is the same. Not by ½: the
-    /// builder writes `x · 2` as `x + x`, which is not smaller.
+    /// builder already writes `x / ½` (and `x · 2`) as `x + x`.
     #[example("fp.div.rne.f32(p:32, 0x40800000)" => "fp.mul.rne.f32(p:32, 0x3e800000)")]
     rule div_pow2<E, S>(x: E + S, c: const E + S, r: rm) {
         fp.div.r<E, S>(x, c) => fp.mul.r<E, S>(x, k)

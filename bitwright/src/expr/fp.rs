@@ -90,7 +90,8 @@ impl Context {
     /// Exact identities, bit for bit on every encoding (so a NaN operand gives the canonical NaN
     /// on both sides, and zeros keep their signs), none of which adds a node:
     /// `fma(x, 1, y) = x + y`; `fma(x, y, −0) = x · y` except toward −∞ (where `+0 + −0` is
-    /// `−0`); `x · 2 = x + x`; `(−a) · (−b) = a · b` and likewise for `/`; negation reverses
+    /// `−0`); `x · 2 = x + x` and `x / ½ = x + x` (the same real number, rounded once in the
+    /// same mode); `(−a) · (−b) = a · b` and likewise for `/`; negation reverses
     /// the order (`−a < −b` is `b < a`, `−a = −b` is `a = b`); `x < x` is false; rounding to
     /// an integral value a rounded value or a converted integer changes nothing; a signed
     /// conversion of a zero or sign extension converts the operand itself; and an integer that
@@ -130,6 +131,14 @@ impl Context {
                 Some(self.c_fp(with(FpOp::Mul(rm)), &[k[0], k[1]])?)
             }
             FpOp::Mul(rm) if self.fp_is(k[1], &two) => {
+                Some(self.c_fp(with(FpOp::Add(rm)), &[k[0], k[0]])?)
+            }
+            // ½ is subnormal in formats with a 2-bit exponent, so it is computed, not encoded.
+            FpOp::Div(rm)
+                if self.const_val(k[1]).is_some_and(|c| {
+                    f.div(RoundingMode::Rne, &one, &two).is_ok_and(|half| c == half)
+                }) =>
+            {
                 Some(self.c_fp(with(FpOp::Add(rm)), &[k[0], k[0]])?)
             }
             FpOp::Mul(_) | FpOp::Div(_) => match (self.fneg_of(f, k[0]), self.fneg_of(f, k[1])) {

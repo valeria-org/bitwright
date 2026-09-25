@@ -134,12 +134,12 @@ assert_eq!(cx.eval(&[e], &env[..])?[0].to_f32(), Some(5.0));
 [Rules](rules.md#floating-point) can rewrite floating-point operations too, generic in the
 format and the rounding mode, and the checker checks them in every small format.
 
-Construction applies the identities that hold bit for bit on every encoding (a NaN operand
-gives the canonical NaN on both sides, zeros keep their signs) and add no node: `fma(x, 1, y)` is
-`x + y`, `fma(x, y, −0)` is `x · y` except toward −∞, `x · 2` is `x + x`, `(−a) · (−b)` is
-`a · b` (and so for `/`), `−a < −b` is `b < a`, `x < x` is false, rounding to an integral value
-twice is rounding once, and a signed conversion of a zero or sign extension converts the operand
-itself.
+Construction applies the identities that hold bit for bit on every encoding (a NaN operand gives
+the canonical NaN on both sides, zeros keep their signs) and add no node: `fma(x, 1, y)` is `x +
+y`, `fma(x, y, −0)` is `x · y` except toward −∞, `x · 2` and `x / ½` are `x + x`, `(−a) · (−b)`
+is `a · b` (and so for `/`), `−a < −b` is `b < a`, `x < x` is false, rounding to an integral
+value twice is rounding once, and a signed conversion of a zero or sign extension converts the
+operand itself.
 
 Identities that hold only on some encodings (`x · 1 = x` fails for a NaN with a payload,
 `x + (−0) = x` for `+0` toward −∞) are the built-in rules of the group `core.float`, each

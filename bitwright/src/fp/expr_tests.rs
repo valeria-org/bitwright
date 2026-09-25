@@ -515,12 +515,14 @@ fn construction_identities_are_exact() {
         let n = 1u64 << w.bits();
         let one = f.from_uint(RoundingMode::Rne, &BitVec::one(Width::W8));
         let two = f.from_uint(RoundingMode::Rne, &BitVec::wrapping_from_u64(Width::W8, 2));
+        let half = f.div(RoundingMode::Rne, &one, &two).unwrap();
         for rm in RoundingMode::ALL {
             let mut cx = Context::new();
             let (x, y) = (cx.symbol("x", w).unwrap(), cx.symbol("y", w).unwrap());
             let i = cx.symbol("i", Width::new(3).unwrap()).unwrap();
             let c1 = cx.constant(&one).unwrap();
             let c2 = cx.constant(&two).unwrap();
+            let ch = cx.constant(&half).unwrap();
             let nz = cx.constant(&f.zero(true)).unwrap();
             let (nx, ny) = (cx.fp_neg(f, x).unwrap(), cx.fp_neg(f, y).unwrap());
             let i5 = cx.zext(i, Width::new(5).unwrap()).unwrap();
@@ -547,6 +549,10 @@ fn construction_identities_are_exact() {
                 (
                     cx.fp(FpOp::Mul(rm), f, &[x, c2]).unwrap(),
                     Box::new(move |a| f.mul(rm, &a[0], &two).unwrap()),
+                ),
+                (
+                    cx.fp(FpOp::Div(rm), f, &[x, ch]).unwrap(),
+                    Box::new(move |a| f.div(rm, &a[0], &half).unwrap()),
                 ),
                 (
                     cx.fp(FpOp::Mul(rm), f, &[nx, ny]).unwrap(),
@@ -659,6 +665,7 @@ fn construction_identities_fire() {
         ("fp.fma.rtp.f32(x, 0x3f800000, y)", "fp.add.rtp.f32(x, y)"),
         ("fp.fma.rne.f32(x, y, 0x80000000)", "fp.mul.rne.f32(x, y)"),
         ("fp.mul.rtz.f32(x, 0x40000000)", "fp.add.rtz.f32(x, x)"),
+        ("fp.div.rtn.f64(d:64, 0x3fe0000000000000)", "fp.add.rtn.f64(d, d)"),
         (
             "fp.mul.rne.f32(fp.neg.f32(x), fp.neg.f32(y))",
             "fp.mul.rne.f32(x, y)",

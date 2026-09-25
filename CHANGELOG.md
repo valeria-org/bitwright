@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Floating point: `x / ½` is `x + x`.** Construction writes a division by one half as the
+  sum, like `x · 2`: the same real number, rounded once in the same mode, so every result is
+  the same bit pattern (½ is computed per format, subnormal where the exponent has two bits).
+
 ## 0.10.0
 
 - **Floating-point guards.** Rules can ask the facts about a float: `fp.not_nan<E, S>(x)`,

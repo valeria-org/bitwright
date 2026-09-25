@@ -1747,7 +1747,7 @@ rule add_aligned_to_concat<H, L>(a: H + L, x: H + L, c: const L) where H + L <= 
 Dividing by a power of two is multiplying by its reciprocal when that is a normal
 number: the two are the same real number, rounded once in the same mode, so every result
 (a NaN, an infinity, the sign of a zero, an underflow) is the same. Not by ½: the
-builder writes `x · 2` as `x + x`, which is not smaller.
+builder already writes `x / ½` (and `x · 2`) as `x + x`.
 
 ```text
 rule div_pow2<E, S>(x: E + S, c: const E + S, r: rm) {
