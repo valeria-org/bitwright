@@ -61,6 +61,9 @@
   pass splits an operation that reads a mask of a condition (`sext(c)`, `-zext(c)`, a sign
   mask) into `select(c, …, …)` when that is smaller: the conditional negation `(x ^ m) − m` is
   `select(c, −x, x)`.
+- **Polynomial identities.** The compares pass expands `a == b` (and `!=`) over sums, products
+  and constant left shifts of up to four leaves, and decides it when the polynomials are equal
+  (`(x + y)·(x − y) == x·x − y·y`, the sum of cubes).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

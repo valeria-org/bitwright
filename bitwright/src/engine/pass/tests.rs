@@ -1427,6 +1427,53 @@ fn residues_are_sound_and_idempotent() {
     assert!(changed > 200, "{changed}");
 }
 
+/// Polynomial equality: comparisons of random polynomials (with each other, and with a
+/// rearrangement) are decided soundly, exhaustively at small widths.
+#[test]
+fn polynomial_equality_is_sound() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0x9017);
+    let mut rng = Rng(50);
+    let mut decided = 0;
+    for i in 0..1500 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            64
+        } else {
+            1 + g.rng.below(6) as u16
+        };
+        let a = poly_expr(&mut g, &mut cx, w, 3);
+        let b = if g.rng.chance(1, 2) {
+            poly_expr(&mut g, &mut cx, w, 3)
+        } else {
+            // a·(1 + k) − a·k, which expands to a.
+            let k = g.constant(w);
+            let k = cx.constant(&k).unwrap();
+            let one = cx.constant_u64(Width::new(w).unwrap(), 1).unwrap();
+            let k1 = cx.bin(BinOp::Add, one, k).unwrap();
+            let p = cx.bin(BinOp::Mul, a, k1).unwrap();
+            let q = cx.bin(BinOp::Mul, a, k).unwrap();
+            cx.bin(BinOp::Sub, p, q).unwrap()
+        };
+        let op = if g.rng.chance(1, 2) {
+            CmpOpExt::Eq
+        } else {
+            CmpOpExt::Ne
+        };
+        let e = cx.cmp(op, a, b).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        decided += u64::from(cx.const_val(cx.id(r.expr).unwrap()).is_some());
+    }
+    assert!(decided > 300, "{decided}");
+}
+
 #[test]
 fn residue_fixtures() {
     let eng = Engine::standard();
