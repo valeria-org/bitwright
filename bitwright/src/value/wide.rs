@@ -149,27 +149,45 @@ pub(crate) fn neg(w: u16, a: &Limbs) -> Limbs {
     sub(w, &[0; MAX_LIMBS], a)
 }
 
+/// The number of limbs up to the highest nonzero one.
+fn significant(a: &Limbs) -> usize {
+    a.iter().rposition(|&l| l != 0).map_or(0, |i| i + 1)
+}
+
 /// The full `2n`-limb product of two `n`-limb operands.
 fn mul_full(n: usize, a: &Limbs, b: &Limbs) -> [u64; 2 * MAX_LIMBS] {
     let mut p = [0u64; 2 * MAX_LIMBS];
-    for i in 0..n {
+    let (la, lb) = (significant(a).min(n), significant(b).min(n));
+    for i in 0..la {
         let mut carry: u128 = 0;
-        for j in 0..n {
+        for j in 0..lb {
             // (2^64-1) + (2^64-1)^2 + (2^64-1) = 2^128 - 1: no overflow.
             let t = u128::from(p[i + j]) + u128::from(a[i]) * u128::from(b[j]) + carry;
             p[i + j] = t as u64;
             carry = t >> 64;
         }
-        p[i + n] = carry as u64;
+        p[i + lb] = carry as u64;
     }
     p
 }
 
+/// The product modulo 2^W: only the partial products below limb `n`.
 pub(crate) fn mul(w: u16, a: &Limbs, b: &Limbs) -> Limbs {
     let n = nlimbs(w);
-    let p = mul_full(n, a, b);
-    let mut r = [0; MAX_LIMBS];
-    r[..n].copy_from_slice(&p[..n]);
+    let mut r = [0u64; MAX_LIMBS];
+    let (la, lb) = (significant(a).min(n), significant(b).min(n));
+    for i in 0..la {
+        let mut carry: u128 = 0;
+        let top = lb.min(n - i);
+        for j in 0..top {
+            let t = u128::from(r[i + j]) + u128::from(a[i]) * u128::from(b[j]) + carry;
+            r[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        if i + top < n {
+            r[i + top] = carry as u64;
+        }
+    }
     mask_top(&mut r, w);
     r
 }
@@ -223,7 +241,11 @@ pub(crate) fn udivrem(w: u16, a: &Limbs, b: &Limbs) -> (Limbs, Limbs) {
     // Normalize: v = b << s, u = a << s (one limb longer).
     let s = b[n - 1].leading_zeros();
     let shl = |x: &[u64], i: usize| {
-        let lo = if i > 0 && s > 0 { x[i - 1] >> (64 - s) } else { 0 };
+        let lo = if i > 0 && s > 0 {
+            x[i - 1] >> (64 - s)
+        } else {
+            0
+        };
         (x.get(i).copied().unwrap_or(0) << s) | lo
     };
     let mut v = [0u64; MAX_LIMBS];

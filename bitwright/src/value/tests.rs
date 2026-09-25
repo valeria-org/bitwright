@@ -400,7 +400,8 @@ fn limb_division_matches_bitwise_division() {
         _ => rng.next(),
     };
     for _ in 0..20_000 {
-        let w = [64u16, 65, 127, 128, 129, 192, 256, 300, 384, 448, 511, 512][rng.below(12) as usize];
+        let w =
+            [64u16, 65, 127, 128, 129, 192, 256, 300, 384, 448, 511, 512][rng.below(12) as usize];
         let n = wide::nlimbs(w);
         let mut value = |rng: &mut Rng| {
             let len = 1 + rng.below(n as u64) as usize;
