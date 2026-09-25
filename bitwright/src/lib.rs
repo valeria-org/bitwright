@@ -95,6 +95,8 @@ mod invert;
 #[cfg(feature = "mba")]
 pub mod mba;
 mod ops;
+#[cfg(feature = "prove")]
+pub mod prove;
 pub mod rules;
 #[cfg(feature = "smtlib")]
 pub mod smtlib;

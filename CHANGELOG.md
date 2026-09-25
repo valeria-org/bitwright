@@ -93,6 +93,17 @@
   registry (with `ExtInverse`, `InverseArg`) that undoes an output in one argument; the
   registry checks it by sampled evaluation once both are registered, and the builder cancels
   the round trip (`dec(k, enc(k, x))` is `x`).
+- **A native prover** (`bitwright::prove`, feature `prove`, on with `check`): expressions are
+  bit-blasted into an and-inverter graph (every bit-vector operator with bitwright's total
+  semantics; extension operations through their expansion), encoded as clauses, and decided by
+  bitwright's own CDCL SAT solver (watched literals, VSIDS, first-UIP learning with
+  minimization, Luby restarts, LBD-based clause deletion). `prove::equal`, `valid`,
+  `valid_under` (with assumptions) and `satisfy` answer proved, refuted (with a counterexample
+  checked by evaluation) or unknown (a conflict or size budget). A proof can come with a
+  certificate: the clauses and a DRUP proof, checked by an independent forward checker
+  (`Certificate::check`) and printable as DIMACS and DRAT for any other checker. Without a
+  certificate, questions are first simplified by bitwright's engine, which settles what
+  bit-level SAT finds hard (MBA products).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
