@@ -187,6 +187,37 @@
   call's counters. The command line's `simplify --file exprs.txt --jobs 8` simplifies a file of
   expressions, one per line; Python has `Engine.run_each(exprs, threads=…)` (the interpreter
   released), C `bw_engine_run_each`, C++ `Engine::run_each`.
+- **Performance.** Against 0.10.0 (instructions, the benchmark suite): `simplify/standard`
+  −11 to −13 %, `simplify/mba` −5 %, `simplify/mba-native` −17 %, `simplify/mba-nonlinear`
+  −39 to −47 %, `simplify/mba-nonlinear-sig` −11 %, `value/udiv/512` −99 %, `value/mul/512`
+  −38 %, `expr/eval/512` −60 %, `facts/cold/512` −19 %, `fp/sqrt/128` −46 %; `fp/simplify` +4 %
+  and `simplify/tiny-context` +3 % (the new rules and passes, and the second look at several
+  roots). One random DAG of 20,000 nodes −26 %; 200 roots in one call −55 %. The command line
+  starts in 0.20 G instructions (0.10.0: 0.47 G). Where the time went:
+  - the passes' commit rule decides which nodes stop being used by propagating counts from the
+    replaced node (no scan of the region, no sort), marks the atoms in a dense set, and counts
+    the uses the other roots of a call contribute once per root (it counted every root's DAG
+    at every pass phase of every root);
+  - the demanded-bits, linear and xor passes read only the known bits of the fact cache's two
+    words instead of whole facts; the linear-MBA pass evaluates its signatures in words and
+    walks in reused tables; the order, residue and GF(2) passes check cheaply before working
+    (a sample of the orders, a sample of the residues, the one atom below a node, a rank that
+    stops early);
+  - wide division is Knuth's algorithm D instead of one bit per step, products form only the
+    limbs they keep, and wide square roots start from the root of the top 128 bits;
+  - the normal-form solver costs its candidates once and hashes its nodes in two words;
+  - the built-in rules compile without repeating the checks their tests run.
+
+  On versus-smt's corpora, one DAG per call, against 0.10.0: random 40-node DAGs +4 to +9 %
+  (the new passes at work: their answers are smaller), 400-node DAGs −10 %, random float DAGs
+  +15 %.
+- **README and reference numbers, measured again.** Against z3 and Bitwuzla, bitwright's
+  answer is the smallest for all 800 random bit-vector DAGs (0.10.0: 799) and 392 of the 400
+  floating-point ones; on 400-node DAGs Bitwuzla is 2.3 times faster (was 2.7). The identity
+  sets: 2,370 of 2,604 cases as the library (91 %, was 71 %) and 2,536 as `simplify` (97 %, was
+  78 %); z3 1,289, Bitwuzla 1,079. CoBRA's datasets: every scored expression solved, 49,856 to
+  the ground truth exactly, median 0.21 ms (was 0.26), 95th percentile 3.4 ms (was 4.1).
+  `docs/benchmarking.md` has the new costs per operation.
 - **Several roots: a second look.** `Engine::run` processes its roots one after another, and a
   rewrite that would not make the DAG smaller because another root still uses its subterms is
   not final; before, it was never reconsidered. Once every root is done, the roots with such a
