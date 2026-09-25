@@ -145,6 +145,18 @@ impl Counts {
         self.val[i] += 1;
     }
 
+    /// Sets `i`'s count to `v`.
+    #[inline]
+    pub(crate) fn set(&mut self, i: u32, v: u32) {
+        let i = i as usize;
+        if i >= self.stamp.len() {
+            self.stamp.resize(i + 1, 0);
+            self.val.resize(i + 1, 0);
+        }
+        self.stamp[i] = self.epoch;
+        self.val[i] = v;
+    }
+
     /// Counts one less for `i` (not below 0), if it has a count: the count left.
     #[inline]
     pub(crate) fn dec(&mut self, i: u32) -> Option<u32> {

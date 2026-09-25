@@ -19,7 +19,9 @@
 //! Both have the input's signature and are linear MBAs, so they are equal to it. The result
 //! replaces the node when the DAG gets smaller.
 
-use super::{Fin, PassKind, Runner, Step, Stop, bitwise, finish, linear, worth_building};
+use super::{
+    Counts, Fin, Marks, PassKind, Runner, Step, Stop, bitwise, finish, linear, worth_building,
+};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -97,38 +99,54 @@ enum Walk {
     Over,
 }
 
-fn walk(cx: &Context, root: u32, forced: &IdMap<u32, ()>) -> Result<Region, Walk> {
-    // Per node: whether it is interior, and the modes it was read in.
-    let mut seen: IdMap<u32, (bool, [bool; 2])> = IdMap::default();
+/// The walks' and signatures' buffers, kept by the runner and reused.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    /// In a walk, per node reached: bit 0 whether it is interior, bit 1 + mode the readings
+    /// seen, bit 3 whether it is in the post-order. In a signature, per region node: its row
+    /// of corner values in `words`.
+    seen: Counts,
+    /// Nodes that must be atoms.
+    forced: Marks,
+    stack: Vec<(u32, Mode, bool)>,
+    words: Vec<u64>,
+}
+
+/// The `seen` bit of a node in the post-order.
+const LISTED: u32 = 8;
+
+fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
+    s.seen.begin(cx.len());
+    let mut reached = 0usize;
     let mut order = Vec::new();
     let mut atoms = Vec::new();
     let (mut lin, mut bit) = (false, false);
-    let mut stack: Vec<(u32, Mode, bool)> = vec![(root, Mode::Linear, false)];
-    while let Some((i, mode, expanded)) = stack.pop() {
+    s.stack.clear();
+    s.stack.push((root, Mode::Linear, false));
+    while let Some((i, mode, expanded)) = s.stack.pop() {
         if expanded {
             order.push(i);
             continue;
         }
-        let inner = !forced.contains_key(&i) && interior(cx, i, mode);
-        let slot = mode as usize;
-        match seen.get_mut(&i) {
-            Some((was, modes)) => {
-                if *was != inner {
+        let inner = !s.forced.contains(i) && interior(cx, i, mode);
+        let read = 2 << mode as u32;
+        match s.seen.get(i) {
+            Some(state) => {
+                if (state & 1 == 1) != inner {
                     return Err(Walk::Conflict(i));
                 }
-                if modes[slot] {
+                if state & read != 0 {
                     continue;
                 }
-                modes[slot] = true;
+                s.seen.set(i, state | read);
                 if !inner {
                     continue;
                 }
             }
             None => {
-                let mut modes = [false, false];
-                modes[slot] = true;
-                seen.insert(i, (inner, modes));
-                if seen.len() > MAX_REGION {
+                s.seen.set(i, u32::from(inner) | read);
+                reached += 1;
+                if reached > MAX_REGION {
                     return Err(Walk::Over);
                 }
                 if !inner {
@@ -138,7 +156,7 @@ fn walk(cx: &Context, root: u32, forced: &IdMap<u32, ()>) -> Result<Region, Walk
                     }
                     continue;
                 }
-                stack.push((i, mode, true));
+                s.stack.push((i, mode, true));
             }
         }
         let op = cx.node(i).op;
@@ -146,12 +164,15 @@ fn walk(cx: &Context, root: u32, forced: &IdMap<u32, ()>) -> Result<Region, Walk
         bit |= matches!(op, OpCode::And | OpCode::Or | OpCode::Xor);
         let m = operand_mode(cx, i, mode);
         for c in cx.node(i).children() {
-            stack.push((c, m, false));
+            s.stack.push((c, m, false));
         }
     }
     // Keep each interior node once, operands first (a node read in both modes was pushed twice).
-    let mut kept: IdMap<u32, ()> = IdMap::default();
-    order.retain(|&i| kept.insert(i, ()).is_none());
+    order.retain(|&i| {
+        let state = s.seen.get(i).unwrap_or(0);
+        s.seen.set(i, state | LISTED);
+        state & LISTED == 0
+    });
     // The canonical order of the atoms, independent of node indices.
     atoms.sort_by(|a, b| cx.order(*a, *b));
     Ok(Region {
@@ -161,13 +182,13 @@ fn walk(cx: &Context, root: u32, forced: &IdMap<u32, ()>) -> Result<Region, Walk
     })
 }
 
-fn region(cx: &Context, root: u32) -> Option<Region> {
-    let mut forced: IdMap<u32, ()> = IdMap::default();
+fn region(cx: &Context, root: u32, s: &mut Scratch) -> Option<Region> {
+    s.forced.begin(cx.len());
     for _ in 0..32 {
-        match walk(cx, root, &forced) {
+        match walk(cx, root, s) {
             Ok(r) => return Some(r),
             Err(Walk::Conflict(i)) if i != root => {
-                forced.insert(i, ());
+                s.forced.insert(i);
             }
             Err(_) => return None,
         }
@@ -175,9 +196,88 @@ fn region(cx: &Context, root: u32) -> Option<Region> {
     None
 }
 
-/// The values of every fragment node at the 2^t corners (corner `p`: atom `j` is all-ones when
-/// bit `j` of `p` is set).
-fn signature(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
+/// The values of the root at the 2^t corners (corner `p`: atom `j` is all-ones when bit `j` of
+/// `p` is set).
+fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitVec> {
+    let w = cx.width_of(root);
+    let bits = u64::from(w.bits());
+    if bits > 64 {
+        return signature_wide(cx, reg, root);
+    }
+    // Every region node has the root's width: a row of words per node, masked to it.
+    let mask = u64::MAX >> (64 - bits);
+    let t = reg.atoms.len();
+    let corners = 1usize << t;
+    s.seen.begin(cx.len());
+    s.words.clear();
+    s.words.resize((t + reg.order.len()) * corners, 0);
+    for (j, &a) in reg.atoms.iter().enumerate() {
+        s.seen.set(a, j as u32);
+        for (p, v) in s.words[j * corners..(j + 1) * corners]
+            .iter_mut()
+            .enumerate()
+        {
+            if p >> j & 1 == 1 {
+                *v = mask;
+            }
+        }
+    }
+    for (k, &i) in reg.order.iter().enumerate() {
+        let at = (t + k) * corners;
+        s.seen.set(i, (t + k) as u32);
+        let (done, rest) = s.words.split_at_mut(at);
+        let out = &mut rest[..corners];
+        if let Some(c) = cx.const_val(i) {
+            out.fill(c.limbs()[0]);
+            continue;
+        }
+        let n = cx.node(i);
+        let operand = |x: u32| {
+            s.seen
+                .get(x)
+                .map(|r| &done[r as usize * corners..(r as usize + 1) * corners])
+        };
+        let Some(a) = operand(n.a) else {
+            return signature_wide(cx, reg, root);
+        };
+        match n.op {
+            OpCode::Not => out.iter_mut().zip(a).for_each(|(o, &x)| *o = !x & mask),
+            OpCode::Neg => out
+                .iter_mut()
+                .zip(a)
+                .for_each(|(o, &x)| *o = x.wrapping_neg() & mask),
+            op => {
+                let Some(b) = operand(n.b) else {
+                    return signature_wide(cx, reg, root);
+                };
+                let f: fn(u64, u64, u64) -> u64 = match op {
+                    OpCode::Add => |x, y, _| x.wrapping_add(y),
+                    OpCode::Sub => |x, y, _| x.wrapping_sub(y),
+                    OpCode::Mul => |x, y, _| x.wrapping_mul(y),
+                    OpCode::Shl => |x, y, bits| if y < bits { x << y } else { 0 },
+                    OpCode::And => |x, y, _| x & y,
+                    OpCode::Or => |x, y, _| x | y,
+                    OpCode::Xor => |x, y, _| x ^ y,
+                    _ => return signature_wide(cx, reg, root),
+                };
+                for (o, (&x, &y)) in out.iter_mut().zip(a.iter().zip(b)) {
+                    *o = f(x, y, bits) & mask;
+                }
+            }
+        }
+    }
+    let r = (t + reg.order.len() - 1) * corners;
+    match s.seen.get(root) {
+        Some(k) if k as usize * corners == r => s.words[r..r + corners]
+            .iter()
+            .map(|&v| BitVec::wrapping_from_u64(w, v))
+            .collect(),
+        _ => signature_wide(cx, reg, root),
+    }
+}
+
+/// [`signature`] in `BitVec`s, for any width.
+fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
     let w = cx.width_of(root);
     let t = reg.atoms.len();
     let corners = 1usize << t;
@@ -257,7 +357,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if !(is_linear(op) || is_bitwise(op)) || !interior(cx, n, Mode::Linear) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let Some(reg) = region(cx, n) else {
+    let Some(reg) = region(cx, n, &mut r.linear_mba) else {
         count(r).atomized += 1;
         return Ok(Step::Normal(Fin::FINAL));
     };
@@ -268,7 +368,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let t = reg.atoms.len();
     r.meter
         .charge(Counter::PassWork, (reg.order.len() << t) as u64)?;
-    let sig = signature(cx, &reg, n);
+    let sig = signature(cx, &reg, n, &mut r.linear_mba);
     let w = cx.width_of(n);
     let d = mobius(&sig);
     // (The atoms, and so the corners, are already in the canonical order.)

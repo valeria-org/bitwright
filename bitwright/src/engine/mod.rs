@@ -964,6 +964,8 @@ struct Runner<'r, 'a> {
     quarantined_passes: Vec<pass::PassKind>,
     /// The passes' commit rule's scratch.
     scratch: pass::Scratch,
+    /// The linear-MBA pass's scratch.
+    linear_mba: pass::linear_mba::Scratch,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, per phase run,
     /// computed on first need (`uses_on`).
     uses: pass::Counts,
@@ -1649,6 +1651,7 @@ impl Engine {
             gf2_atoms: IdMap::default(),
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
+            linear_mba: Default::default(),
             uses: pass::Counts::default(),
             uses_on: false,
             uses_upto: 0,
