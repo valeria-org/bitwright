@@ -479,6 +479,11 @@ pub struct Rule {
     /// rounding-mode variable (bit `w`, bit 0 for no variable): computed with the compiler's
     /// validation, so the matcher answers it with one load.
     pub(crate) admitted_widths: Option<Box<[u64; 9]>>,
+    /// Whether each node mentions no parameter and no `let` ([`is_closed`]), computed once
+    /// when the rule is compiled so the matcher answers it with one load. Empty when unknown.
+    ///
+    /// [`is_closed`]: super::matcher::is_closed
+    pub(crate) closed: Box<[bool]>,
 }
 
 impl Rule {

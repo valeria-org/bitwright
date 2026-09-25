@@ -1,7 +1,7 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
-Status: in progress. Steps 1 and 2 of the order of work are done, and step 3 in part (see
-there): the workload is the benchmark group `compile/*` (`cargo run --release -p
+Status: in progress. Steps 1 and 2 of the order of work are done, and steps 3 and 4 in part
+(see there): the workload is the benchmark group `compile/*` (`cargo run --release -p
 bitwright-bench -- compile`), and `Strategy::compile()` is the engine tier. The numbers below
 were measured before step 2, on a shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on
 the reference machine of `docs/benchmarking.md`. Use them for ratios, not as reference
@@ -407,8 +407,37 @@ Each step is measured with the benchmark from step 1 and lands alone.
      of four mixes per binary node, a table probe, and the height and tree-size columns. The
      hash fixes canonical operand order, so it is part of the output-stability contract.
      Changing it changes results, and belongs in a release that says so.
-4. **The rule middle end.** First the decision tree, interpreted (2b); then the codegen back
-   end, `RuleSet` and a precompiled built-in corpus (2a).
+4. **The rule middle end: measured first, and re-planned.** On `compile/*` the dispatch net
+   already leaves 0.4 candidate rules per node visit (rules alone) and 0.1 (`compile()`).
+   About half of those fail to match and half fail their guard. So a decision tree would save
+   little on candidate selection. The cost was per candidate: about 3,900 instructions of
+   matching for under four matcher steps, spent in two places:
+   - `is_closed` walked the pattern with a fresh stack at every step;
+   - every attempt allocated its bindings and work lists, and a commutative node cloned
+     them all.
+
+   Done:
+   - Closedness is a table computed when a rule compiles.
+   - The matcher's bindings, work lists and width values are small inline vectors, which
+     allocate only beyond their capacity.
+
+   The matcher's semantics are unchanged, and so are the results. Matching went from 78.7 to
+   37.0 million instructions (−53 %). The whole run went from 263 to 214 million with the
+   rules alone (−19 %), and from 755 to 695 million under `compile()` (−8 %).
+
+   Guards are most of what rule application costs now, and that is fact computation: an
+   operand's facts, computed once per node and shared with the passes.
+
+   Under `compile()` the matcher is now 6 % of the time:
+   - the passes are 46 % (linear forms 14 %, xor and truth tables 6 % each);
+   - fact transfers are 23 %;
+   - rule application is 18 %.
+
+   Generated Rust (2a) would cut into the matcher's 6 % only, and is postponed. What pays
+   next is facts: a compiler's own known bits (the `FactSource` of step 2's list), or a
+   lighter fact tier for `compile()` (known bits without the ranges). A lighter tier changes
+   results, so it needs measuring like the demanded-bits decision was. After that come the
+   passes' per-node costs.
 5. **`Semantics` and `Raise`**, then the derive (1a, 1c).
 6. **Native `Rewrite` and `check::rewrite`** (2c).
 

@@ -25,11 +25,109 @@ pub(crate) enum Match {
     OutOfSteps,
 }
 
+/// A vector of `Copy` items kept inline up to `N` of them (a match's bindings and work lists
+/// are small: cloning one at a commutative node, or returning one, allocates nothing), and on
+/// the heap beyond. Reads as a slice. Up to `N` items live in `inline` (the heap empty); more
+/// live in `heap` alone.
+#[derive(Clone, Debug)]
+pub(crate) struct Small<T: Copy + Default, const N: usize> {
+    len: usize,
+    inline: [T; N],
+    /// Every item, while there are more than `N` (then `inline` is unused).
+    heap: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Small<T, N> {
+    pub(crate) fn new() -> Self {
+        Small {
+            len: 0,
+            inline: [T::default(); N],
+            heap: Vec::new(),
+        }
+    }
+
+    /// `n` copies of `v`.
+    pub(crate) fn filled(v: T, n: usize) -> Self {
+        let mut s = Self::new();
+        for _ in 0..n {
+            s.push(v);
+        }
+        s
+    }
+
+    pub(crate) fn push(&mut self, v: T) {
+        if self.len < N {
+            self.inline[self.len] = v;
+        } else {
+            if self.len == N {
+                self.heap.extend_from_slice(&self.inline);
+            }
+            self.heap.push(v);
+        }
+        self.len += 1;
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.len > N {
+            let v = self.heap.pop();
+            self.len -= 1;
+            if self.len == N {
+                // Back inline: at most `N` items live there, with the heap empty.
+                self.inline.copy_from_slice(&self.heap);
+                self.heap.clear();
+            }
+            return v;
+        }
+        self.len -= 1;
+        Some(self.inline[self.len])
+    }
+}
+
+impl<T: Copy + Default, const N: usize> core::ops::Deref for Small<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.len > N {
+            &self.heap
+        } else {
+            &self.inline[..self.len]
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> core::ops::DerefMut for Small<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.len > N {
+            &mut self.heap
+        } else {
+            &mut self.inline[..self.len]
+        }
+    }
+}
+
+impl<'a, T: Copy + Default, const N: usize> IntoIterator for &'a Small<T, N> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<T: Copy + Default + PartialEq, const N: usize> PartialEq for Small<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Copy + Default + Eq, const N: usize> Eq for Small<T, N> {}
+
 /// The result of a match: node indices bound to parameters, widths bound to width variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Bindings {
-    pub(crate) params: Vec<Option<u32>>,
-    pub(crate) widths: Vec<Option<u16>>,
+    pub(crate) params: Small<Option<u32>, 8>,
+    pub(crate) widths: Small<Option<u16>, 4>,
 }
 
 /// The outcome of binding a width expression to a value.
@@ -43,9 +141,9 @@ enum Bind {
 impl Bindings {
     pub(crate) fn new(rule: &Rule) -> Self {
         Bindings {
-            params: vec![None; rule.params.len()],
+            params: Small::filled(None, rule.params.len()),
             // The width variables, then the rounding-mode variables.
-            widths: vec![None; rule.width_vars.len() + rule.modes.len()],
+            widths: Small::filled(None, rule.width_vars.len() + rule.modes.len()),
         }
     }
 
@@ -90,15 +188,21 @@ impl Bindings {
         }
     }
 
-    pub(crate) fn width_values(&self) -> Option<Vec<u16>> {
-        self.widths.iter().copied().collect()
+    /// Every width (and rounding-mode) variable's value, if all are bound.
+    pub(crate) fn width_values(&self) -> Option<Small<u16, 4>> {
+        let mut out = Small::new();
+        for w in self.widths.iter() {
+            out.push((*w)?);
+        }
+        Some(out)
     }
 }
 
 /// Which width expression of a pattern node.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum Which {
     /// Its sort's width.
+    #[default]
     Sort,
     /// An extract's offset.
     Offset,
@@ -112,11 +216,11 @@ enum Which {
 #[derive(Clone)]
 struct State {
     b: Bindings,
-    todo: Vec<(NodeId, u32)>,
+    todo: Small<(NodeId, u32), 16>,
     /// `(width expression's owner, which one, actual)` not yet determined.
-    widths: Vec<(NodeId, Which, i64)>,
+    widths: Small<(NodeId, Which, i64), 4>,
     /// Literals and closed subterms, compared by value once every width is bound.
-    values: Vec<(NodeId, u32)>,
+    values: Small<(NodeId, u32), 8>,
 }
 
 struct M<'a> {
@@ -161,7 +265,7 @@ fn step(m: &mut M<'_>, st: &mut State, pat: NodeId, node: u32) -> Step {
         return Step::Fail;
     }
     // A closed subterm (no parameters) denotes one constant, which the builder has folded.
-    if matches!(rule.nodes[pat as usize], RNode::Lit(_)) || is_closed(rule, pat) {
+    if matches!(rule.nodes[pat as usize], RNode::Lit(_)) || closed(rule, pat) {
         if n.op != OpCode::Const {
             return Step::Fail;
         }
@@ -321,8 +425,8 @@ fn finish(m: &M<'_>, mut st: State) -> Option<Bindings> {
     // Width expressions with several unbound variables, until nothing changes.
     loop {
         let before = st.widths.len();
-        let pending = std::mem::take(&mut st.widths);
-        for (pat, which, actual) in pending {
+        let pending = core::mem::replace(&mut st.widths, Small::new());
+        for &(pat, which, actual) in pending.iter() {
             let e = width_expr(rule, pat, which)?;
             match st.b.bind(e, actual) {
                 Bind::Ok => {}
@@ -341,7 +445,7 @@ fn finish(m: &M<'_>, mut st: State) -> Option<Bindings> {
     if !admitted(rule, &widths) {
         return None;
     }
-    for (pat, n) in st.values {
+    for &(pat, n) in st.values.iter() {
         let want = match &rule.nodes[pat as usize] {
             RNode::Lit(l) => literal(l, m.cx.width_of(n), &widths)?,
             _ => super::eval::eval(rule, pat, &widths, &[], &[])?.bv()?,
@@ -351,6 +455,15 @@ fn finish(m: &M<'_>, mut st: State) -> Option<Bindings> {
         }
     }
     Some(st.b)
+}
+
+/// [`is_closed`], from the rule's table when it has one.
+#[inline]
+pub(crate) fn closed(rule: &Rule, n: NodeId) -> bool {
+    match rule.closed.get(n as usize) {
+        Some(&c) => c,
+        None => is_closed(rule, n),
+    }
 }
 
 /// Whether the subterm mentions no parameter (and no `let`).
@@ -382,12 +495,13 @@ pub(crate) fn match_rule_steps(cx: &Context, rule: &Rule, node: u32, steps: &mut
         rule,
         steps: *steps,
     };
-    let st = State {
+    let mut st = State {
         b: Bindings::new(rule),
-        todo: vec![(rule.lhs, node)],
-        widths: Vec::new(),
-        values: Vec::new(),
+        todo: Small::new(),
+        widths: Small::new(),
+        values: Small::new(),
     };
+    st.todo.push((rule.lhs, node));
     let r = solve(&mut m, st);
     let exhausted = m.steps == 0;
     *steps = m.steps;
@@ -534,4 +648,37 @@ pub(crate) fn pattern_reachable(rule: &Rule) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod small_tests {
+    use super::Small;
+
+    /// Pushes and pops across the inline capacity, with writes through the slice on both sides,
+    /// agree with a `Vec`.
+    #[test]
+    fn small_vectors_behave_as_vecs() {
+        let mut s: Small<u32, 3> = Small::new();
+        let mut v: Vec<u32> = Vec::new();
+        let mut x = 1u32;
+        for round in 0..200u32 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if x.is_multiple_of(3) {
+                assert_eq!(s.pop(), v.pop());
+            } else {
+                s.push(round);
+                v.push(round);
+            }
+            if let (Some(a), Some(b)) = (s.last_mut(), v.last_mut()) {
+                *a += 1000;
+                *b += 1000;
+            }
+            assert_eq!(&*s, v.as_slice());
+            assert_eq!(s.clone(), s);
+        }
+        while let Some(b) = v.pop() {
+            assert_eq!(s.pop(), Some(b));
+        }
+        assert_eq!(s.pop(), None);
+    }
 }

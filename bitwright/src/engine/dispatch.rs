@@ -3,7 +3,7 @@
 
 use crate::expr::{Context, OpCode};
 use crate::ops::CmpOp;
-use crate::rules::matcher::is_closed;
+use crate::rules::matcher::closed as is_closed;
 use crate::rules::{NodeId, ParamKind, RNode, Rule};
 
 /// Operators as a bit set.

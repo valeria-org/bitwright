@@ -1521,7 +1521,11 @@ fn finish_rule(
         doc: f.doc,
         span: f.span,
         admitted_widths: None,
+        closed: Box::new([]),
     };
+    rule.closed = (0..rule.nodes.len() as NodeId)
+        .map(|k| super::matcher::is_closed(&rule, k))
+        .collect();
     static_checks(&rule, &b.spans, f.name_span)?;
     if rule.float_values {
         let float_result = matches!(

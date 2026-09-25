@@ -24,6 +24,11 @@
   canonicalizer's constant checks read words instead of building values: building SSA code
   takes about a quarter fewer instructions. `Context::reserve` makes room for a known number
   of nodes. The nodes built are the same.
+- **Cheaper rule matching.** Whether a pattern node is closed (has no parameters) is computed
+  when a rule compiles, not at every matcher step. The matcher's bindings and work lists stay
+  inline instead of allocating on every attempt. Matching takes half the instructions it did,
+  and a run of the rules alone a fifth fewer. The matcher's semantics and results are
+  unchanged.
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.
