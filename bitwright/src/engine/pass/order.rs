@@ -456,10 +456,12 @@ pub(super) fn decide(
     }
     let (kn, fin) = known(r, cx, &m)?;
     let orders = preorders(m.atoms.len());
-    let states: Vec<(Vec<u8>, u32)> = orders
+    // With nothing known, every order is possible.
+    let anything = kn.mono.is_empty() && kn.le.iter().chain(&kn.lt).all(|row| !row.contains(&true));
+    let states: Vec<(&[u8], u32)> = orders
         .iter()
-        .filter(|rk| feasible(&kn, rk))
-        .flat_map(|rk| (0..1u32 << m.bools.len()).map(move |b| (rk.clone(), b)))
+        .filter(|rk| anything || feasible(&kn, rk))
+        .flat_map(|rk| (0..1u32 << m.bools.len()).map(move |b| (rk.as_slice(), b)))
         .collect();
     r.meter.charge(
         Counter::PassWork,

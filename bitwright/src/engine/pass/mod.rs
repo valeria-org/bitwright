@@ -15,7 +15,7 @@ pub(super) mod linear_mba;
 pub(super) mod mba;
 mod order;
 mod poly;
-mod residue;
+pub(super) mod residue;
 pub(super) mod shuffle;
 #[cfg(test)]
 mod tests;

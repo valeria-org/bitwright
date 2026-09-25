@@ -34,6 +34,60 @@ fn linear_op(op: OpCode) -> bool {
     )
 }
 
+/// Whether the linear part below `n` reads a single atom, from its operands' answers
+/// (remembered for the call): `u32::MAX` when it reads several.
+fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
+    const MANY: u32 = u32::MAX;
+    const NONE: u32 = u32::MAX - 1;
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    let w = cx.wid(n);
+    while let Some((i, done)) = stack.pop() {
+        if r.gf2_atoms.contains_key(&i) {
+            continue;
+        }
+        let node = cx.node(i);
+        if cx.const_val(i).is_some() {
+            r.gf2_atoms.insert(i, NONE);
+            continue;
+        }
+        if !linear_op(node.op) || node.width != w {
+            r.gf2_atoms.insert(i, i);
+            continue;
+        }
+        let operands: Vec<u32> = node
+            .children()
+            .filter(|&c| {
+                !(matches!(
+                    node.op,
+                    OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
+                ) && c == node.b)
+            })
+            .collect();
+        if !done {
+            stack.push((i, true));
+            for c in operands {
+                if !r.gf2_atoms.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        let mut atom = NONE;
+        for c in operands {
+            let a = r.gf2_atoms.get(&c).copied().unwrap_or(MANY);
+            atom = match (atom, a) {
+                (_, MANY) | (MANY, _) => MANY,
+                (NONE, a) => a,
+                (x, NONE) => x,
+                (x, a) if x == a => x,
+                _ => MANY,
+            };
+        }
+        r.gf2_atoms.insert(i, atom);
+    }
+    r.gf2_atoms.get(&n).copied().unwrap_or(MANY)
+}
+
 /// The one atom below `n` and the nodes between (ascending), if the expression is a linear map
 /// of one atom with something to gain (a shift, rotation or permutation of the atom).
 fn region(cx: &Context, n: u32) -> Option<(u32, Vec<u32>)> {
@@ -136,9 +190,18 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
     if w.bits() > 128 || w.bits() < 2 {
         return Ok(None);
     }
+    // Most regions read several atoms: known at once from the operands.
+    if one_atom(r, cx, n) >= u32::MAX - 1 {
+        return Ok(None);
+    }
     let Some((x, nodes)) = region(cx, n) else {
         return Ok(None);
     };
+    // A form of one term costs 4 nodes, and replacing `n` frees at most the region's operators
+    // and their constant operands (see below): too small a region never pays.
+    if 2 * nodes.len() <= 4 {
+        return Ok(None);
+    }
     r.meter.charge(Counter::PassWork, nodes.len() as u64 * 4)?;
     let Some(map) = gf2::rows(cx, x, &nodes) else {
         return Ok(None);
@@ -167,6 +230,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
     }
     // Each term is at most a rotation or shift with its count, a mask; an xor joins each.
     let estimate = terms.len() as u32 * 4 + if c.is_zero() { 0 } else { 2 };
+    // Replacing `n` frees at most the region's operators and their constant operands: a
+    // form this large can never pay (and the xor pass goes on either way).
+    if estimate >= 2 * nodes.len() as u32 {
+        return Ok(None);
+    }
     if let Some(f) = worth_building(r, cx, n, &[x], estimate)? {
         return Ok(Some(Step::Normal(f)));
     }

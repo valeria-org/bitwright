@@ -68,6 +68,9 @@ fn by_residues(
     {
         return Ok(None);
     }
+    if !super::residue::may_fold(r, cx, x, k, mv) {
+        return Ok(None);
+    }
     let Some(t) = super::residue::residues(r, cx, x, k)? else {
         return Ok(None);
     };

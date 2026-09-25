@@ -36,7 +36,7 @@ enum Op {
 }
 
 /// The values of an expression modulo `2^k`, for every combination of its leaves' residues.
-pub(super) struct Residues {
+pub(crate) struct Residues {
     /// The leaves (atoms), in the order their residues are enumerated.
     pub(super) leaves: Vec<u32>,
     /// `2^k - 1`.
@@ -128,13 +128,88 @@ fn compile(cx: &Context, x: u32) -> Option<(Vec<Op>, Vec<u32>)> {
     product.then_some((ops, leaves))
 }
 
-/// The table of `x` modulo `2^k` (`1 <= k <= 16`), if it fits the caps.
+/// The value modulo `2^k` of the compiled expression at combination `c`.
+fn eval(ops: &[Op], k: u32, mask: u64, c: u64, vals: &mut [u64]) -> u64 {
+    for (j, op) in ops.iter().enumerate() {
+        vals[j] = match *op {
+            Op::Leaf(i) => c >> (k * i as u32),
+            Op::Const(v) => v,
+            Op::Add(a, b) => vals[a].wrapping_add(vals[b]),
+            Op::Sub(a, b) => vals[a].wrapping_sub(vals[b]),
+            Op::Mul(a, b) => vals[a].wrapping_mul(vals[b]),
+            Op::Neg(a) => vals[a].wrapping_neg(),
+            Op::Not(a) => !vals[a],
+            Op::And(a, b) => vals[a] & vals[b],
+            Op::Or(a, b) => vals[a] | vals[b],
+            Op::Xor(a, b) => vals[a] ^ vals[b],
+            Op::Shl(a, s) => {
+                if s >= 64 {
+                    0
+                } else {
+                    vals[a] << s
+                }
+            }
+        } & mask;
+    }
+    vals[ops.len() - 1]
+}
+
+/// Whether the bits of `m` (among the low `k`) of `x` may be constant, or equal to one leaf's,
+/// at every combination: false when a few combinations already show neither, which saves the
+/// full table (a table seen before answers exactly).
+pub(super) fn may_fold(r: &Runner<'_, '_>, cx: &Context, x: u32, k: u32, m: u64) -> bool {
+    if let Some(t) = r.residues.get(&(x, k)) {
+        return t.is_some();
+    }
+    if k == 0 || k > u32::from(cx.wid(x)) {
+        return false;
+    }
+    let Some((ops, leaves)) = compile(cx, x) else {
+        return false;
+    };
+    let combos = 1u64 << (k as usize * leaves.len());
+    if leaves.len() * k as usize > 16 || combos > MAX_COMBOS {
+        return false;
+    }
+    let mask = (1u64 << k) - 1;
+    let mut vals = vec![0u64; ops.len()];
+    // Combinations spread over the table (a fixed sequence: the answer is deterministic).
+    let picks: Vec<u64> = (0..8u64)
+        .map(|j| j.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17) % combos)
+        .chain([0, combos - 1])
+        .collect();
+    let values: Vec<(u64, u64)> = picks
+        .iter()
+        .map(|&c| (c, eval(&ops, k, mask, c, &mut vals)))
+        .collect();
+    let first = values[0].1 & m;
+    if values.iter().all(|&(_, v)| v & m == first) {
+        return true;
+    }
+    (0..leaves.len()).any(|i| {
+        values
+            .iter()
+            .all(|&(c, v)| v & m == (c >> (k * i as u32)) & mask & m)
+    })
+}
+
+/// The table of `x` modulo `2^k` (`1 <= k <= 16`), if it fits the caps; remembered for the
+/// call (a node's table never changes).
 pub(super) fn residues(
     r: &mut Runner<'_, '_>,
     cx: &Context,
     x: u32,
     k: u32,
-) -> Result<Option<Residues>, Stop> {
+) -> Result<Option<std::rc::Rc<Residues>>, Stop> {
+    if let Some(t) = r.residues.get(&(x, k)) {
+        return Ok(t.clone());
+    }
+    let t = table(r, cx, x, k)?.map(std::rc::Rc::new);
+    r.residues.insert((x, k), t.clone());
+    Ok(t)
+}
+
+fn table(r: &mut Runner<'_, '_>, cx: &Context, x: u32, k: u32) -> Result<Option<Residues>, Stop> {
     if k == 0 || k > u32::from(cx.wid(x)) {
         return Ok(None);
     }
@@ -150,30 +225,7 @@ pub(super) fn residues(
     let mask = (1u64 << k) - 1;
     let mut vals = vec![0u64; ops.len()];
     let values = (0..combos)
-        .map(|c| {
-            for (j, op) in ops.iter().enumerate() {
-                vals[j] = match *op {
-                    Op::Leaf(i) => c >> (k * i as u32),
-                    Op::Const(v) => v,
-                    Op::Add(a, b) => vals[a].wrapping_add(vals[b]),
-                    Op::Sub(a, b) => vals[a].wrapping_sub(vals[b]),
-                    Op::Mul(a, b) => vals[a].wrapping_mul(vals[b]),
-                    Op::Neg(a) => vals[a].wrapping_neg(),
-                    Op::Not(a) => !vals[a],
-                    Op::And(a, b) => vals[a] & vals[b],
-                    Op::Or(a, b) => vals[a] | vals[b],
-                    Op::Xor(a, b) => vals[a] ^ vals[b],
-                    Op::Shl(a, s) => {
-                        if s >= 64 {
-                            0
-                        } else {
-                            vals[a] << s
-                        }
-                    }
-                } & mask;
-            }
-            vals[ops.len() - 1]
-        })
+        .map(|c| eval(&ops, k, mask, c, &mut vals))
         .collect();
     Ok(Some(Residues {
         leaves,

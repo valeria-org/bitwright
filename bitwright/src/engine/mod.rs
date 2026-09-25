@@ -956,6 +956,10 @@ struct Runner<'r, 'a> {
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
     shuffle: IdMap<u32, pass::shuffle::Bits>,
+    /// The single atom the linear map below each node reads, if one (see `pass::gf2`).
+    gf2_atoms: IdMap<u32, u32>,
+    /// Residue tables, per node and number of low bits (see `pass::residue`).
+    residues: IdMap<(u32, u32), Option<std::rc::Rc<pass::residue::Residues>>>,
     /// Passes quarantined for the call after a postcondition failure.
     quarantined_passes: Vec<pass::PassKind>,
     /// The passes' commit rule's scratch.
@@ -1641,6 +1645,8 @@ impl Engine {
             xor: Default::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),
+            residues: IdMap::default(),
+            gf2_atoms: IdMap::default(),
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
             uses: pass::Counts::default(),
