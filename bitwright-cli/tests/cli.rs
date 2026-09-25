@@ -245,6 +245,16 @@ group mine {
     assert_eq!(run(&["simplify", "x", "--rules", "/nonexistent.bwr"]).0, 2);
 }
 
+/// `--float-values` applies the rules that hold for floats as values.
+#[test]
+fn simplify_float_values() {
+    let e = "fp.mul.rne.f32(x:32, 0x3f800000)";
+    let (code, out, _) = run(&["simplify", e]);
+    assert_eq!((code, out.trim()), (0, "fp.mul.rne.f32(x, 0x3f800000)"));
+    let (code, out, _) = run(&["simplify", e, "--float-values"]);
+    assert_eq!((code, out.trim()), (0, "x"));
+}
+
 /// Nonlinear MBA simplifies by default (the MBA service with the native solver).
 #[test]
 fn simplify_deobfuscates_nonlinear_mba() {

@@ -358,6 +358,16 @@ fn check_case(rule: &Rule, widths: &[u16], params: &[BitVec]) -> Outcome {
     );
     match (l, r) {
         (Some(l), Some(r)) if l == r => Outcome::Ok { fired: true },
+        // Equal as floats: two NaNs of the result's format.
+        (Some(l), Some(r))
+            if rule.float_values
+                && rule.values_format(widths).is_some_and(|f| {
+                    f.test(crate::fp::FpTest::Nan, &l) == Ok(true)
+                        && f.test(crate::fp::FpTest::Nan, &r) == Ok(true)
+                }) =>
+        {
+            Outcome::Ok { fired: true }
+        }
         (Some(l), Some(r)) => Outcome::Mismatch(l, r),
         _ => Outcome::Skip,
     }

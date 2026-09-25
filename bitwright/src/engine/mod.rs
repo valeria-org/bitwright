@@ -105,6 +105,13 @@ pub struct Strategy {
     pub phases: Vec<Phase>,
     /// The most rounds (at least 1).
     pub max_rounds: u8,
+    /// Whether rules marked `#[float_values]` apply: identities that hold for floats as
+    /// values, every NaN one value (`x · 1 = x` for every `x`, where the product of a NaN with
+    /// a payload is the canonical NaN). A result then equals its input as a float of each
+    /// rewritten operation's format, not necessarily bit for bit: a NaN may change payload or
+    /// sign. Off by default; for hosts that observe floats only as values (a compiler's
+    /// fast-math, most deobfuscation).
+    pub float_values: bool,
 }
 
 impl Strategy {
@@ -114,7 +121,14 @@ impl Strategy {
             name: name.into(),
             phases,
             max_rounds: 4,
+            float_values: false,
         }
+    }
+
+    /// Sets [`float_values`](Self::float_values).
+    pub fn with_float_values(mut self, yes: bool) -> Strategy {
+        self.float_values = yes;
+        self
     }
 
     /// The built-in strategy: fact folding, the built-in rules, the normal-form passes, and the
@@ -388,7 +402,7 @@ fn builtin() -> &'static Builtin {
             .groups()
             .iter()
             .flat_map(|g| g.rules.iter().map(|&r| r as u32))
-            .filter(|&r| rules[r as usize].decreasing)
+            .filter(|&r| rules[r as usize].decreasing && !rules[r as usize].float_values)
             .collect();
         let net = Arc::new(DispatchNet::new(rules, &order));
         Builtin {
@@ -547,7 +561,11 @@ impl EngineBuilder {
                         };
                         // Only directed rules: an identity that does not decrease the order
                         // belongs to the search service.
-                        order.extend(rs.iter().copied().filter(|&r| rules[r as usize].decreasing));
+                        // `#[float_values]` rules only when the strategy opts in.
+                        order.extend(rs.iter().copied().filter(|&r| {
+                            let rule = &rules[r as usize];
+                            rule.decreasing && (!rule.float_values || strategy.float_values)
+                        }));
                     }
                     id = combine(id, 1);
                     for &r in &order {
@@ -1403,11 +1421,25 @@ impl Runner<'_, '_> {
             let k = points as usize;
             let held = self.constraints_hold(cx, rel, k)?;
             let (a, b) = (&self.samples[&n], &self.samples[&r]);
-            if (0..k).any(|j| held[j] && a[j] != b[j]) {
+            // A `#[float_values]` rule may change a NaN into another NaN.
+            let values = match by {
+                By::Rule(rule) if rule.float_values => cx.fp_desc(n).map(|d| match d.op {
+                    crate::fp::FpOp::Convert { to, .. } => to,
+                    _ => d.format,
+                }),
+                _ => None,
+            };
+            let nan =
+                |f: crate::FpFormat, x: &BitVec| f.test(crate::fp::FpTest::Nan, x) == Ok(true);
+            if (0..k).any(|j| {
+                held[j] && a[j] != b[j] && !values.is_some_and(|f| nan(f, &a[j]) && nan(f, &b[j]))
+            }) {
                 return Ok(Some(Reject::Verify));
             }
         }
-        if v.tripwire {
+        // The facts of two NaNs may be disjoint; a `#[float_values]` rewrite is not compared.
+        let values_rule = matches!(by, By::Rule(rule) if rule.float_values);
+        if v.tripwire && !values_rule {
             // Capped by what remains of the fact budget, both queries together.
             let cap = u32::try_from(self.meter.left().fact_work).unwrap_or(u32::MAX);
             let work0 = cx.facts.work;

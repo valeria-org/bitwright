@@ -465,6 +465,12 @@ pub struct Rule {
     pub decreasing: bool,
     /// `#[example("input" => "output")]` attributes.
     pub examples: Vec<(String, String)>,
+    /// `#[float_values]`: the two sides are equal as floats of the pattern's result format,
+    /// every NaN one value (so the rule may change a NaN's payload or sign). The engine applies
+    /// such a rule only when the strategy opts in ([`Strategy::float_values`]).
+    ///
+    /// [`Strategy::float_values`]: crate::engine::Strategy::float_values
+    pub float_values: bool,
     /// Doc comment.
     pub doc: String,
     /// Byte span of the rule in its source.
@@ -476,6 +482,20 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// The format of the pattern's float result at an assignment, for a
+    /// [`float_values`](Rule::float_values) rule (whose pattern is a floating-point operation
+    /// with a float result).
+    pub fn values_format(&self, widths: &[u16]) -> Option<crate::FpFormat> {
+        let RNode::Fp(f) = &self.nodes[self.lhs as usize] else {
+            return None;
+        };
+        let (eb, sb) = match (f.kind, &f.to) {
+            (FpKind::Convert, Some((e, s))) => (e.eval(widths), s.eval(widths)),
+            _ => (f.eb.eval(widths), f.sb.eval(widths)),
+        };
+        crate::FpFormat::new(u32::try_from(eb).ok()?, u32::try_from(sb).ok()?).ok()
+    }
+
     /// Whether the directed engine may use this rule (left to right).
     pub fn is_directed(&self) -> bool {
         self.decreasing

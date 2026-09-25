@@ -120,7 +120,7 @@ type PendingLet = (String, Option<NodeId>, WExpr, (usize, usize));
 const ALLOWABLE: &[&str] = &["BW0402", "BW0407"];
 
 /// Attributes of an item: `#[example]` pairs, `#[allow]` codes, doc text.
-type Attrs = (Vec<(String, String)>, Vec<String>, String);
+type Attrs = (Vec<(String, String)>, Vec<String>, String, bool);
 
 /// A compiled program: groups, rules, and non-error diagnostics.
 pub(crate) type Compiled = (Vec<Group>, Vec<Rule>, Vec<Diagnostic>);
@@ -1093,6 +1093,7 @@ impl Parser<'_> {
 
     fn attrs(&mut self) -> R<Attrs> {
         let (mut examples, mut allows, mut doc) = (Vec::new(), Vec::new(), String::new());
+        let mut float_values = false;
         loop {
             match self.peek().clone() {
                 Tok::Doc(d) => {
@@ -1114,6 +1115,7 @@ impl Parser<'_> {
                             self.expect(Tok::RParen, "`)`")?;
                             examples.push((a, c));
                         }
+                        "float_values" => float_values = true,
                         "allow" => {
                             self.expect(Tok::LParen, "`(`")?;
                             loop {
@@ -1148,7 +1150,7 @@ impl Parser<'_> {
                     }
                     self.expect(Tok::RBracket, "`]`")?;
                 }
-                _ => return Ok((examples, allows, doc)),
+                _ => return Ok((examples, allows, doc, float_values)),
             }
         }
     }
@@ -1187,7 +1189,7 @@ impl Parser<'_> {
         group: usize,
         group_name: &str,
     ) -> R<(RuleBuilder, FinishInput, Vec<String>)> {
-        let (examples, allows, doc) = self.attrs()?;
+        let (examples, allows, doc, float_values) = self.attrs()?;
         let start = self.span().0;
         let kind = match self.peek() {
             Tok::Ident(s) if s == "rule" => RuleKind::Rewrite,
@@ -1222,10 +1224,10 @@ impl Parser<'_> {
                         sp,
                     ));
                 }
-                if b.width_vars.contains(&v) || b.width_vars.len() >= 3 {
+                if b.width_vars.contains(&v) || b.width_vars.len() >= 4 {
                     return Err(Diagnostic::error(
                         "BW0102",
-                        "duplicate width variable, or more than 3",
+                        "duplicate width variable, or more than 4",
                         sp,
                     ));
                 }
@@ -1377,6 +1379,7 @@ impl Parser<'_> {
                 guard,
                 examples,
                 doc,
+                float_values,
                 span: (start, end),
             },
             allows,
@@ -1395,6 +1398,7 @@ struct FinishInput {
     guard: Option<NodeId>,
     examples: Vec<(String, String)>,
     doc: String,
+    float_values: bool,
     span: (usize, usize),
 }
 
@@ -1508,11 +1512,33 @@ fn finish_rule(
         guard: f.guard,
         decreasing: false,
         examples: f.examples,
+        float_values: f.float_values,
         doc: f.doc,
         span: f.span,
         admitted_widths: None,
     };
     static_checks(&rule, &b.spans, f.name_span)?;
+    if rule.float_values {
+        let float_result = matches!(
+            &rule.nodes[rule.lhs as usize],
+            RNode::Fp(n) if !matches!(
+                n.kind,
+                crate::fp::FpKind::Eq
+                    | crate::fp::FpKind::Lt
+                    | crate::fp::FpKind::Le
+                    | crate::fp::FpKind::ToSInt
+                    | crate::fp::FpKind::ToUInt
+            )
+        );
+        if !float_result {
+            return Err(Diagnostic::error(
+                "BW0310",
+                "a `#[float_values]` rule's pattern must be a floating-point operation with a \
+                 float result (its sides are compared as floats of that format)",
+                f.name_span,
+            ));
+        }
+    }
     let mut assignments = 0u64;
     for_each_assignment(&rule, |_| {
         assignments += 1;
@@ -1903,6 +1929,10 @@ fn rule_id(rule: &Rule) -> RuleId {
     };
     feed(rule.kind as u64);
     feed(rule.width_vars.len() as u64);
+    // Only when set, so every other rule keeps its id.
+    if rule.float_values {
+        feed(0x666c_6f61_745f_7661);
+    }
     if !rule.modes.is_empty() {
         feed(0x6d6f_6465 + rule.modes.len() as u64);
     }
@@ -2211,12 +2241,18 @@ pub(crate) fn compile(src: &str, limits: &CompileLimits) -> Result<Compiled, Com
 
 /// The widths each width variable ranges over in compile-time validation and the checker:
 /// every width for one variable; for two, every width to 64 plus boundary widths above; for
-/// three, every width to 16 plus boundary widths. Validation is a diagnostic aid: the matcher
-/// independently refuses any assignment at which the rule is not well formed.
+/// three, every width to 16 plus boundary widths; for four, every width to 8 and a few
+/// boundary widths (the formats of a conversion's two sides). Validation is a diagnostic aid:
+/// the matcher independently refuses any assignment at which the rule is not well formed.
 fn width_domain(vars: usize) -> Vec<u16> {
     const WIDE: &[u16] = &[
         24, 31, 32, 33, 48, 63, 64, 65, 96, 127, 128, 129, 192, 255, 256, 257, 384, 511, 512,
     ];
+    if vars >= 4 {
+        let mut d: Vec<u16> = (1..=8).collect();
+        d.extend([11, 15, 24, 53, 64, 113]);
+        return d;
+    }
     let dense: u16 = match vars {
         0 | 1 => 512,
         2 => 64,

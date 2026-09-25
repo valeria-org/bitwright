@@ -33,6 +33,7 @@ commands:
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
+           [--float-values]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
         Deobfuscates: the rules, the normal-form passes and the MBA service with the native
@@ -40,7 +41,9 @@ commands:
         the rules and the standard passes (`--deobfuscate`, the default, is accepted).
         `--rules` adds a rule file's rules after the built-in ones, vouched for by the ledger
         `<file.bwr>.proof` if there is one (as `check --ledger` writes it), else checked now:
-        exit 1 unless every rule is sound.
+        exit 1 unless every rule is sound. `--float-values` also applies the rules that hold
+        for floats as values, every NaN one value (`x · 1` is `x`): the result may then differ
+        from the input in a NaN's payload or sign.
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -450,6 +453,9 @@ fn catalog(rest: &[String]) -> Result<String, Fail> {
                 let r = &program.rules()[i];
                 let short = r.name.rsplit("::").next().unwrap_or(&r.name);
                 let kind = match (r.kind, r.is_directed()) {
+                    (RuleKind::Rewrite, _) if r.float_values => {
+                        "rule (`#[float_values]`: equal as floats, applied only on request)"
+                    }
                     (RuleKind::Rewrite, _) => "rule",
                     (RuleKind::Identity, true) => "identity (directed and search)",
                     (RuleKind::Identity, false) => "identity (search only)",
@@ -502,8 +508,15 @@ fn dedent(lines: &[&str]) -> String {
 fn simplify(rest: &[String]) -> Result<String, Fail> {
     let a = Args::parse(
         rest,
-        &["width", "deobfuscate", "standard", "assume", "rules"],
-        &["deobfuscate", "standard"],
+        &[
+            "width",
+            "deobfuscate",
+            "standard",
+            "assume",
+            "rules",
+            "float-values",
+        ],
+        &["deobfuscate", "standard", "float-values"],
     )?;
     if a.flag("standard") && a.flag("deobfuscate") {
         return Err(usage("--standard and --deobfuscate exclude each other"));
@@ -556,6 +569,7 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
         strategy = strategy.with_rule_groups(&groups);
     }
+    strategy = strategy.with_float_values(a.flag("float-values"));
     let engine = builder
         .strategy(strategy)
         .build()

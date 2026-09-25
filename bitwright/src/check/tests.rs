@@ -518,6 +518,14 @@ fn application_is_sound(p: &RuleProgram) {
                     vals.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v)
                 });
                 let r = cx.eval(&[input, out], &env).unwrap();
+                // A `#[float_values]` rule may turn a NaN into another.
+                let nan = |v: &BitVec| {
+                    rule.values_format(ws)
+                        .is_some_and(|f| f.test(crate::fp::FpTest::Nan, v) == Ok(true))
+                };
+                if rule.float_values && nan(&r[0]) && nan(&r[1]) {
+                    continue;
+                }
                 assert_eq!(
                     r[0],
                     r[1],
@@ -1193,4 +1201,33 @@ fn floating_point_guards_are_checked_and_answered_by_facts() {
     );
     let (_, _, out) = apply_to(&p, "mul_one", "fp.mul.rne.f64(x, 0x3ff0000000000000)", 64);
     assert!(out.is_none());
+}
+
+/// `#[float_values]`: sound when the sides are equal as floats (every NaN one value), the
+/// same rule without it unsound, and only on a pattern with a float result.
+#[test]
+fn float_values_rules_are_checked_as_floats() {
+    use crate::rules::RuleProgram;
+    let src = "bitwright 1;
+group g {
+    #[float_values]
+    #[allow(BW0407)]
+    rule values<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+    #[allow(BW0407)]
+    rule bits<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+}";
+    let p = RuleProgram::compile(src).unwrap();
+    let checks = check_program(&p, &CheckConfig::default());
+    assert!(checks[0].is_sound(), "{:?}", checks[0].verdict);
+    assert!(matches!(checks[1].verdict, Verdict::Unsound(_)));
+    // Different ids: a ledger for one does not vouch for the other.
+    assert_ne!(p.rules()[0].id, p.rules()[1].id);
+    let bad = "bitwright 1;
+group g {
+    #[float_values]
+    #[allow(BW0407)]
+    rule r<E, S>(x: E + S) { fp.lt<E, S>(x, x) => false }
+}";
+    let err = RuleProgram::compile(bad).unwrap_err();
+    assert!(err.render("g.bwr", bad).contains("BW0310"));
 }

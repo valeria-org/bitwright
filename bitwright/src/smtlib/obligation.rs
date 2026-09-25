@@ -64,13 +64,23 @@ pub fn rule_obligation(rule: &Rule, widths: &[u16]) -> Result<String, Error> {
         None => "true".to_string(),
     };
     writeln!(out, "(assert {guard})").ok();
-    writeln!(
-        out,
-        "(assert (not (= {} {})))\n(check-sat)",
-        name(rule.lhs),
-        name(rule.rhs)
-    )
-    .ok();
+    let (l, r) = (name(rule.lhs), name(rule.rhs));
+    let equal = match rule
+        .float_values
+        .then(|| rule.values_format(widths))
+        .flatten()
+    {
+        // Equal as floats: equal, or both NaNs (`|x| > ∞` on the encodings).
+        Some(f) => {
+            let smax = literal(&crate::BitVec::smax(f.width()));
+            let inf = literal(&f.inf(false));
+            format!(
+                "(or (= {l} {r}) (and (bvugt (bvand {l} {smax}) {inf}) (bvugt (bvand {r} {smax}) {inf})))"
+            )
+        }
+        None => format!("(= {l} {r})"),
+    };
+    writeln!(out, "(assert (not {equal}))\n(check-sat)").ok();
     // QF_BV, or QF_BVFP when the rule has floating-point operations.
     Ok(format!("{header}{}{out}", super::logic(&out)))
 }

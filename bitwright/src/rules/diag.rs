@@ -200,7 +200,7 @@ const EXPLANATIONS: &[(&str, &str)] = &[
     (
         "BW0102",
         "Bad width variable or constraint. A width is not one of the rule's width variables, \
-         a width variable is repeated (at most 3 are allowed), or a `where` constraint is \
+         a width variable is repeated (at most 4 are allowed), or a `where` constraint is \
          malformed (`a op b` with `==`, `!=`, `<`, `>`, `<=`, `>=`, or `a % m == r`).",
     ),
     (
@@ -247,6 +247,15 @@ const EXPLANATIONS: &[(&str, &str)] = &[
         "Invalid identity. An identity is an unconditional equation `lhs <=> rhs`: no guard, \
          no `let`, no capture kinds (`const`, `sym`, `nonconst`), no extension operations, \
          and every parameter on both sides.",
+    ),
+    (
+        "BW0310",
+        "Invalid `#[float_values]` rule. Such a rule claims its sides equal as floats (every \
+         NaN one value) of its pattern's result format, so the pattern must be a \
+         floating-point operation with a float result: arithmetic, `sqrt`, `rem`, rounding, \
+         `min`, `max` or a conversion to a float (not a comparison, a conversion to an \
+         integer, or an operation the builder writes with bit-vector operators, such as \
+         `fp.neg`).",
     ),
     (
         "BW0402",

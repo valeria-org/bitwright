@@ -169,8 +169,33 @@ for (float, simplified) in [
 # Ok::<(), bitwright::Error>(())
 ```
 
-The rules are listed in the [rule catalog](catalog.md), and a rule of your own can use the same
-guards (see [Writing rules](rules.md#floating-point)).
+They also divide a finite nonzero number by itself (1), subtract it from itself (+0, or −0
+toward −∞), take the square root of a square that is a normal number (`|x|`, to nearest), and
+widen a number and narrow it back. The rules are listed in the [rule catalog](catalog.md), and a
+rule of your own can use the same guards (see [Writing rules](rules.md#floating-point)).
+
+A host that observes floats only as values, as a compiler's fast-math does, can also let the
+engine treat every NaN as one value: `Strategy::with_float_values(true)` (or `bitwright
+simplify --float-values`) applies the rules of `core.float_values`, which hold that way but
+may change a NaN's payload or sign: `x · 1` and `x + (−0)` (to nearest) are `x`, `x · −1` is
+`−x`, `min(x, x)` and `max(x, x)` are `x`, widening and narrowing back is `x`.
+
+```rust
+use bitwright::engine::{Engine, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let mut cx = Context::new();
+let e = cx.parse("fp.mul.rne.f32(x, 0x3f800000)", &ParseOptions::width(Width::W32))?;
+let exact = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(exact.expr, e); // a NaN `x` with a payload would lose it
+let values = Engine::builder()
+    .builtin()
+    .strategy(Strategy::standard().with_float_values(true))
+    .build()?;
+let out = values.simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 Comparisons and class tests of one operand combine as the bit-vector conditions do: a lifted
 `ucomiss` followed by `ja`, `(¬(x < y ∨ unordered)) ∧ ¬(x = y ∨ unordered)`, is `y < x`,

@@ -109,7 +109,7 @@ fn assert_normal(engine: &Engine, cx: &mut Context, e: Expr) {
     for n in order {
         let id = cx.id(n).unwrap();
         for rule in engine.inner.rules.iter() {
-            if !rule.decreasing {
+            if !rule.decreasing || (rule.float_values && !engine.inner.strategy.float_values) {
                 continue;
             }
             if let Some(r) = crate::rules::apply::try_apply(cx, rule, id)
@@ -129,7 +129,12 @@ fn assert_normal(engine: &Engine, cx: &mut Context, e: Expr) {
 /// A random instance of a random directed rule's pattern at a small admitted width, its
 /// parameters replaced by random subexpressions, combined with a random expression.
 fn redex_rich(engine: &Engine, g: &mut Gen, cx: &mut Context) -> Expr {
-    let rules: Vec<&Rule> = engine.inner.rules.iter().filter(|r| r.decreasing).collect();
+    let rules: Vec<&Rule> = engine
+        .inner
+        .rules
+        .iter()
+        .filter(|r| r.decreasing && !r.float_values)
+        .collect();
     loop {
         let rule = rules[g.rng.below(rules.len() as u64) as usize];
         let widths: Vec<Vec<u16>> = crate::rules::width_assignments(rule)
@@ -222,7 +227,8 @@ fn every_rule_fires_inside_larger_expressions() {
     let engine = strict_rules();
     let mut census = RuleCensus::default();
     let mut rng = Rng(11);
-    for rule in engine.inner.rules.iter() {
+    // `#[float_values]` rules apply only when a strategy opts in (tested below).
+    for rule in engine.inner.rules.iter().filter(|r| !r.float_values) {
         for (input, _) in &rule.examples {
             let mut cx = Context::new();
             let o = ParseOptions::width(Width::W8);
@@ -246,13 +252,66 @@ fn every_rule_fires_inside_larger_expressions() {
             assert_normal(&engine, &mut cx, r);
         }
     }
-    for rule in engine.inner.rules.iter() {
+    for rule in engine.inner.rules.iter().filter(|r| !r.float_values) {
         let c = census.rules.get(&rule.name).copied().unwrap_or_default();
         assert!(
             c.applied > 0,
             "{} never applied inside a larger expression",
             rule.name
         );
+    }
+}
+
+/// `#[float_values]` rules apply exactly when the strategy opts in, and give their examples;
+/// with the option, strict verification accepts their NaN changes.
+#[test]
+fn float_values_rules_apply_when_enabled() {
+    let off = strict_rules();
+    let on = Engine::builder()
+        .builtin()
+        .strategy(rules_only().with_float_values(true))
+        .verify(Verify::strict())
+        .build()
+        .unwrap();
+    let values: Vec<&Rule> = on.inner.rules.iter().filter(|r| r.float_values).collect();
+    assert!(values.len() >= 6);
+    for rule in values {
+        for (input, output) in &rule.examples {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::W8);
+            let e = cx.parse(input, &o).unwrap();
+            let want = cx.parse(output, &o).unwrap();
+            let mut census = RuleCensus::default();
+            let out = on
+                .run(
+                    &mut cx,
+                    &[e],
+                    Run {
+                        observer: Some(&mut census),
+                        ..Run::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(out.stats.rejected, 0, "{}", rule.name);
+            assert_eq!(out.roots[0].expr, want, "{}: {input}", rule.name);
+            assert!(
+                census.rules.get(&rule.name).is_some_and(|c| c.applied > 0),
+                "{}: {input}",
+                rule.name
+            );
+            // Off: the rule does not apply.
+            let mut census = RuleCensus::default();
+            off.run(
+                &mut cx,
+                &[e],
+                Run {
+                    observer: Some(&mut census),
+                    ..Run::default()
+                },
+            )
+            .unwrap();
+            assert!(census.rules.get(&rule.name).is_none_or(|c| c.applied == 0));
+        }
     }
 }
 

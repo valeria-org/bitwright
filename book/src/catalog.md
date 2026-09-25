@@ -2816,6 +2816,195 @@ rule max_self<E, S>(x: E + S) { fp.max<E, S>(x, x) => x if fp.not_nan<E, S>(x) }
 
 - `fp.max.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `fp.from_sbv.rne.f64(i:32)`
 
+#### `div_self` — rule
+
+A finite nonzero number divided by itself is exactly 1, in every mode.
+
+```text
+rule div_self<E, S>(x: E + S, r: rm) {
+        fp.div.r<E, S>(x, x) => fp.one<E, S> if fp.finite<E, S>(x) && fp.nonzero<E, S>(x)
+    }
+```
+
+- `fp.div.rne.f64(fp.from_ubv.rne.f64(zext<32>(u:8) + 1), fp.from_ubv.rne.f64(zext<32>(u:8) + 1))` → `0x3ff0000000000000:64`
+
+#### `sub_self_rne` — rule
+
+A finite number minus itself is +0 (the sum of opposites rounds to +0 except toward −∞).
+
+```text
+rule sub_self_rne<E, S>(x: E + S) { fp.add.rne<E, S>(x, fp.neg<E, S>(x)) => fp.zero<E, S> if fp.finite<E, S>(x) }
+```
+
+- `fp.sub.rne.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `0:64`
+
+#### `sub_self_rna` — rule
+
+Likewise to nearest, ties away.
+
+```text
+rule sub_self_rna<E, S>(x: E + S) { fp.add.rna<E, S>(x, fp.neg<E, S>(x)) => fp.zero<E, S> if fp.finite<E, S>(x) }
+```
+
+- `fp.sub.rna.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `0:64`
+
+#### `sub_self_rtp` — rule
+
+Likewise toward +∞.
+
+```text
+rule sub_self_rtp<E, S>(x: E + S) { fp.add.rtp<E, S>(x, fp.neg<E, S>(x)) => fp.zero<E, S> if fp.finite<E, S>(x) }
+```
+
+- `fp.sub.rtp.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `0:64`
+
+#### `sub_self_rtz` — rule
+
+Likewise toward 0.
+
+```text
+rule sub_self_rtz<E, S>(x: E + S) { fp.add.rtz<E, S>(x, fp.neg<E, S>(x)) => fp.zero<E, S> if fp.finite<E, S>(x) }
+```
+
+- `fp.sub.rtz.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `0:64`
+
+#### `sub_self_rtn` — rule
+
+Toward −∞, a finite number minus itself is −0.
+
+```text
+rule sub_self_rtn<E, S>(x: E + S) { fp.add.rtn<E, S>(x, fp.neg<E, S>(x)) => fp.nzero<E, S> if fp.finite<E, S>(x) }
+```
+
+- `fp.sub.rtn.f64(fp.from_sbv.rne.f64(i:32), fp.from_sbv.rne.f64(i:32))` → `0x8000000000000000:64`
+
+#### `sqrt_square` — rule
+
+The square root of a square is the magnitude when the square is a normal number (no
+overflow, no underflow), to nearest: `|x|` between `2^⌈emin/2⌉` and `2^⌊emax/2⌋`.
+
+```text
+rule sqrt_square<E, S>(x: E + S) {
+        fp.sqrt.rne<E, S>(fp.mul.rne<E, S>(x, x)) => fp.abs<E, S>(x)
+        if (proves(lo <=u x) && proves(x <u hi)) || (proves(nlo <=u x) && proves(x <u nhi))
+        let b: E + S = (one << (E - 1)) - one
+        let lo: E + S = (b - ((b - one) >>u 1)) << (S - 1)
+        let hi: E + S = (b + (b >>u 1)) << (S - 1)
+        let nlo: E + S = lo | smin_lit
+        let nhi: E + S = hi | smin_lit
+    }
+```
+
+- `fp.sqrt.rne.f64(fp.mul.rne.f64(fp.from_ubv.rne.f64(zext<32>(u:8) + 1), fp.from_ubv.rne.f64(zext<32>(u:8) + 1)))` → `fp.from_ubv.rne.f64(zext<32>(u:8) + 1) & 0x7fffffffffffffff`
+
+#### `widen_narrow` — rule
+
+Widening and narrowing back is exact for numbers (every number of the narrower format
+is one of the wider).
+
+```text
+rule widen_narrow<E, S, F, T>(x: E + S, r: rm, q: rm) where E <= F, S <= T {
+        fp.convert.r<F, T, E, S>(fp.convert.q<E, S, F, T>(x)) => x if fp.not_nan<E, S>(x)
+    }
+```
+
+- `fp.convert.rne.f64.f32(fp.convert.rne.f32.f64(fp.from_sbv.rne.f32(i:16)))` → `fp.from_sbv.rne.f32(i:16)`
+
+### core.float_values
+
+#### `mul_one` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+`x · 1` is `x` as a float (a NaN's product is the canonical NaN). With `div_pow2`,
+`x / 1` is `x` too.
+
+```text
+rule mul_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+```
+
+- `fp.mul.rne.f32(p:32, 0x3f800000)` → `p:32`
+
+#### `mul_neg_one` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+`x · −1` is `−x` as a float.
+
+```text
+rule mul_neg_one<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.none<E, S>) => fp.neg<E, S>(x) }
+```
+
+- `fp.mul.rne.f32(p:32, 0xbf800000)` → `p:32 ^ 0x80000000`
+
+#### `add_neg_zero_rne` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+`x + (−0)` is `x` as a float, to nearest (toward −∞, `+0 + −0` is `−0`).
+
+```text
+rule add_neg_zero_rne<E, S>(x: E + S) { fp.add.rne<E, S>(x, fp.nzero<E, S>) => x }
+```
+
+- `fp.add.rne.f32(p:32, 0x80000000)` → `p:32`
+
+#### `add_neg_zero_rna` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+Likewise to nearest, ties away.
+
+```text
+rule add_neg_zero_rna<E, S>(x: E + S) { fp.add.rna<E, S>(x, fp.nzero<E, S>) => x }
+```
+
+- `fp.add.rna.f32(p:32, 0x80000000)` → `p:32`
+
+#### `add_neg_zero_rtp` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+Likewise toward +∞.
+
+```text
+rule add_neg_zero_rtp<E, S>(x: E + S) { fp.add.rtp<E, S>(x, fp.nzero<E, S>) => x }
+```
+
+- `fp.add.rtp.f32(p:32, 0x80000000)` → `p:32`
+
+#### `add_neg_zero_rtz` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+Likewise toward 0.
+
+```text
+rule add_neg_zero_rtz<E, S>(x: E + S) { fp.add.rtz<E, S>(x, fp.nzero<E, S>) => x }
+```
+
+- `fp.add.rtz.f32(p:32, 0x80000000)` → `p:32`
+
+#### `min_self` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+A value is its own minimum.
+
+```text
+rule min_self<E, S>(x: E + S) { fp.min<E, S>(x, x) => x }
+```
+
+- `fp.min.f32(p:32, p:32)` → `p:32`
+
+#### `max_self` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+And its own maximum.
+
+```text
+rule max_self<E, S>(x: E + S) { fp.max<E, S>(x, x) => x }
+```
+
+- `fp.max.f32(p:32, p:32)` → `p:32`
+
+#### `widen_narrow` — rule (`#[float_values]`: equal as floats, applied only on request)
+
+Widening and narrowing back is `x` as a float.
+
+```text
+rule widen_narrow<E, S, F, T>(x: E + S, r: rm, q: rm) where E <= F, S <= T {
+        fp.convert.r<F, T, E, S>(fp.convert.q<E, S, F, T>(x)) => x
+    }
+```
+
+- `fp.convert.rne.f64.f32(fp.convert.rne.f32.f64(p:32))` → `p:32`
+
 ## `eqsat.bwr`
 
 ### eqsat.assoc

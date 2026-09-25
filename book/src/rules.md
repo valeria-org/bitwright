@@ -21,7 +21,7 @@ group my.bitwise {
 
 ## Rules
 
-A `rule` rewrites left to right: `pattern => template`. It is generic over one to three width
+A `rule` rewrites left to right: `pattern => template`. It is generic over one to four width
 variables (`<W>`, `<W, U>`), which may be constrained: `where W < U, U <= 2 * W`, or moduli such
 as `W % 8 == 0`.
 
@@ -135,6 +135,19 @@ let Verdict::Unsound(cx) = &checks[1].verdict else { panic!() };
 assert_eq!(cx.lhs.to_u64(), Some(0x7));
 # Ok::<(), String>(())
 ```
+
+A rule may instead claim its sides equal *as floats*, every NaN one value: `#[float_values]`
+before the rule. It may then change a NaN's payload or sign, so `x · 1 = x` needs no guard:
+
+```text
+#[float_values]
+rule mul_one_values<E, S>(x: E + S, r: rm) { fp.mul.r<E, S>(x, fp.one<E, S>) => x }
+```
+
+Its pattern must be a floating-point operation with a float result, whose format the checker
+and the SMT obligation compare the sides in. The engine applies such rules only when the
+strategy opts in (`Strategy::with_float_values(true)`, `bitwright simplify --float-values`):
+for hosts that observe floats only as values, as a compiler's fast-math does.
 
 The [checker](checking.md) checks a floating-point rule in every format whose widths it
 enumerates exhaustively (`E` and `S` up to 6, which is where formats are strangest) and at

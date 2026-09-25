@@ -64,6 +64,17 @@
 - **Polynomial identities.** The compares pass expands `a == b` (and `!=`) over sums, products
   and constant left shifts of up to four leaves, and decides it when the polynomials are equal
   (`(x + y)·(x − y) == x·x − y·y`, the sum of cubes).
+- **Floating point: more guarded rules, and floats as values on request.** `core.float` now
+  divides a finite nonzero number by itself (1), subtracts a finite number from itself (+0,
+  −0 toward −∞), takes the square root of a normal square to nearest (`|x|`), and widens and
+  narrows back (`fp.not_nan`). A rule can claim its sides equal as floats, every NaN one value
+  (`#[float_values]`, error BW0310 on a pattern without a float result): the checker and the
+  SMT obligations compare them so, its id differs from the bit-exact rule's, and the engine
+  applies it only when the strategy opts in (`Strategy::float_values`,
+  `bitwright simplify --float-values`), verifying it modulo NaNs. The built-in
+  `core.float_values` has `x · 1`, `x · −1`, `x + (−0)` to nearest, `min(x, x)`,
+  `max(x, x)` and the round trip through a wider format. Rules may have four width variables
+  (a conversion's two formats).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
