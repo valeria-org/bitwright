@@ -183,10 +183,10 @@ in it is compiled and run as a test. It reads fine on GitHub too:
 | Part | Chapters |
 |-|-|
 | Basics | [Introduction](book/src/introduction.md) · [Getting started](book/src/getting-started.md) · [Semantics](book/src/semantics.md) |
-| Reasoning | [Facts and proofs](book/src/facts.md) · [Constraints](book/src/constraints.md) · [Extension operations](book/src/extensions.md) |
+| Reasoning | [Facts and proofs](book/src/facts.md) · [Constraints](book/src/constraints.md) · [Extension operations](book/src/extensions.md) · [Memory](book/src/memory.md) · [Lifted code](book/src/lifting.md) |
 | Simplifying | [Simplifying](book/src/simplifying.md) · [Deobfuscation and MBA](book/src/deobfuscation.md) · [Invertibility](book/src/invertibility.md) |
-| Rules | [Writing rules](book/src/rules.md) · [Checking rules](book/src/checking.md) · [Rule catalog](book/src/catalog.md) |
-| Services | [Equality saturation](book/src/eqsat.md) · [SMT-LIB](book/src/smtlib.md) · [The command line](book/src/cli.md) · [C, C++ and Python](book/src/bindings.md) |
+| Rules | [Writing rules](book/src/rules.md) · [Checking rules](book/src/checking.md) · [Verifying compiler transformations](book/src/transformations.md) · [Rule catalog](book/src/catalog.md) |
+| Services | [Equality saturation](book/src/eqsat.md) · [SMT-LIB](book/src/smtlib.md) · [The command line](book/src/cli.md) · [C, C++, Python and JavaScript](book/src/bindings.md) |
 | Contracts | [Stability](book/src/stability.md) |
 
 - **[API reference](https://docs.rs/bitwright)** on docs.rs, for the latest release.
@@ -210,19 +210,22 @@ bitwright catalog > RULES.md                            # the built-in rules as 
 bitwright explain BW0302                                # what a diagnostic means
 bitwright prove opt.txt                                 # verify LLVM peephole transformations (Alive syntax)
 bitwright tv before.ll after.ll                         # translation validation of LLVM IR functions
+bitwright lift block.vex                                # lifted code (VEX, p-code, LLVM IR), deobfuscated
 bitwright lean rules.bwr --at 8 > rules.lean            # the rules as Lean theorems (bv_decide proves them)
 bitwright simplify '(x & y) * (x | y) + (x & ~y) * (~x & y)'   # x * y (nonlinear MBA, proved)
 bitwright simplify 'x * k == y * k' --assume '(k & 1) == 1'   # x == y, relying on the assumption
 ```
 
-## C, C++ and Python
+## C, C++, Python and JavaScript
 
 The same engine, from other languages: a C API (`bitwright-ffi`: a shared and a static
 library, and [`bitwright.h`](bitwright-ffi/include/bitwright.h)), a header-only C++17 wrapper
-over it ([`bitwright.hpp`](bitwright-ffi/include/bitwright.hpp)), and a Python package
-(`bitwright-py`, built with maturin). They build, parse, inspect, evaluate and simplify
-expressions, with facts, proofs, assumptions, budgets, rules of your own and SMT-LIB; the
-[chapter on them](book/src/bindings.md) is the guide.
+over it ([`bitwright.hpp`](bitwright-ffi/include/bitwright.hpp)), a Python package
+(`bitwright-py`, built with maturin), and a WebAssembly module with a JavaScript wrapper
+(`bitwright-wasm`). They build, parse, inspect, evaluate and simplify expressions, with facts,
+proofs, assumptions, budgets, rules of your own, SMT-LIB, memory, lifted code and the verifier
+of compiler transformations; the [chapter on them](book/src/bindings.md) is the guide.
+[`tools/plugins/`](tools/plugins/) has (untested) scripts for Ghidra, Binary Ninja and IDA.
 
 ```python
 import bitwright as bw                   # pip install ./bitwright-py

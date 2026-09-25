@@ -26,6 +26,19 @@ __all__ = [
     "WidthError",
     "check_rules",
     "simplify",
+    "Memory",
+    "LiftedBlock",
+    "TransformReport",
+    "InferredPrecondition",
+    "equivalent",
+    "synthesize",
+    "saturate",
+    "lift_pcode",
+    "lift_vex",
+    "lift_llvm",
+    "verify_transforms",
+    "validate_functions",
+    "infer_preconditions",
 ]
 
 class BitwrightError(Exception):
@@ -291,6 +304,12 @@ class Expr:
         self, of: Expr, *, bijective: bool = False, assumptions: Assumptions | None = None
     ) -> bool | None: ...
     def simplify(self, engine: Engine | None = None) -> Expr: ...
+    def equivalent(self, other: Expr, *, conflicts: int = 1000000) -> bool | dict[str, int] | None:
+        """True (proved equal), a dict of symbol values where they differ, or None."""
+    def synthesize(self, *, max_size: int = 7) -> Expr | None:
+        """The smallest equal expression synthesis finds (proved), or None."""
+    def saturate(self, *, groups: Sequence[str] | None = None) -> Expr | None:
+        """The equality-saturation search's smaller candidate, or None."""
 
 @final
 class Facts:
@@ -376,6 +395,8 @@ class Engine:
         *,
         rules: Sequence[str | tuple[str, str | None]] = ...,
         max_rounds: int | None = None,
+        float_values: bool = False,
+        refuse: Sequence[str] = ...,
     ) -> Engine: ...
     @staticmethod
     def standard() -> Engine: ...
@@ -384,6 +405,10 @@ class Engine:
     def simplify(
         self, expr: Expr, *, budget: Budget | None = None, assumptions: Assumptions | None = None
     ) -> Expr: ...
+    def trace(
+        self, expr: Expr, *, budget: Budget | None = None, assumptions: Assumptions | None = None
+    ) -> tuple[Expr, list[tuple[str, Expr, Expr]]]:
+        """The expression simplified, and each rewrite: (rule or pass, before, after)."""
     def run(
         self,
         exprs: Sequence[Expr],
@@ -399,3 +424,79 @@ def simplify(
     text: str, width: int = 64, *, deobfuscate: bool = True, assume: Sequence[str] = ...
 ) -> str:
     """Simplifies expression text, like the command line's `simplify`."""
+
+def equivalent(a: Expr, b: Expr, *, conflicts: int = 1000000) -> bool | dict[str, int] | None:
+    """Whether `a` equals `b` for every value of the symbols: True, a counterexample, or None."""
+
+def synthesize(e: Expr, *, max_size: int = 7) -> Expr | None:
+    """The smallest expression equal to `e` that synthesis finds (proved), or None."""
+
+def saturate(e: Expr, *, groups: Sequence[str] | None = None) -> Expr | None:
+    """The equality-saturation search's candidate for `e`, or None."""
+
+@final
+class Memory:
+    """A memory of a context: loads and stores as expressions."""
+
+    def __new__(
+        cls,
+        ctx: Context,
+        name: str = "mem",
+        addr_width: int = 64,
+        cell_width: int = 8,
+        *,
+        big_endian: bool = False,
+        zeroed: bool = False,
+    ) -> Memory: ...
+    def set_bytes(self, start: int, data: Sequence[int] | bytes) -> None:
+        """Known contents from address `start` on (8-bit cells), before any load or store."""
+    def store(self, addr: Expr, value: Expr) -> None: ...
+    def load(self, addr: Expr, cells: int = 1) -> Expr: ...
+    def reads(self) -> list[tuple[Expr, Expr]]:
+        """The reads of unknown cells so far: (address, symbol)."""
+
+@final
+class LiftedBlock:
+    """A block of lifted code, read into expressions."""
+
+    inputs: list[tuple[str, Expr]]
+    outputs: list[tuple[str, Expr]]
+    stores: list[tuple[Expr, Expr]]
+    exits: list[tuple[Expr, Expr]]
+    next: Expr | None
+    def register(self, name: str) -> Expr | None: ...
+
+def lift_pcode(ctx: Context, text: str) -> LiftedBlock:
+    """Ghidra p-code, one operation per line."""
+
+def lift_vex(ctx: Context, text: str) -> LiftedBlock:
+    """VEX IR as pyvex prints an IRSB."""
+
+def lift_llvm(ctx: Context, text: str, function: str | None = None) -> LiftedBlock:
+    """A function of an LLVM IR module: its return value is the output `ret`."""
+
+@final
+class TransformReport:
+    name: str
+    verdict: Literal["valid", "invalid", "unknown", "unsupported"]
+    text: str
+
+@final
+class InferredPrecondition:
+    name: str
+    pre: str | None
+    weakest: bool
+    verdict: Literal["valid", "invalid", "unknown", "unsupported"] | None
+
+def verify_transforms(
+    text: str, *, widths: Sequence[int] | None = None, conflicts: int | None = None
+) -> list[TransformReport]:
+    """Verifies transformations in the syntax of the Alive paper."""
+
+def validate_functions(
+    src: str, tgt: str | None = None, *, conflicts: int | None = None
+) -> list[TransformReport]:
+    """Translation validation of LLVM IR functions."""
+
+def infer_preconditions(text: str) -> list[InferredPrecondition]:
+    """Infers each transformation's precondition over its symbolic constants."""

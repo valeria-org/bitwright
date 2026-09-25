@@ -49,6 +49,10 @@ commands:
         (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified at every
         width. Exit 1 unless every transformation gets a verified precondition (or needs
         none).
+  lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard] [--synth]
+        read lifted code (Ghidra p-code, pyvex's VEX IR, or an LLVM IR function; guessed from
+        the file's extension, .pcode, .vex, .ll, without --from) and print each register it
+        writes, each store and each exit, deobfuscated as `simplify` does.
   tv <src.ll> [<tgt.ll>] [--conflicts <n>]
         translation validation: that each function of the second file refines the function of
         the same name in the first (or @tgt refines @src of one file), for a subset of LLVM
@@ -184,6 +188,7 @@ fn run(args: &[String]) -> Result<String, Fail> {
         "prove" => prove(rest),
         "tv" => tv(rest),
         "infer" => infer(rest),
+        "lift" => lift(rest),
         "explain" => {
             let a = Args::parse(rest, &[], &[])?;
             let code = a.one("diagnostic code")?;
@@ -526,6 +531,83 @@ fn prove(rest: &[String]) -> Result<String, Fail> {
             .map(|t| bitwright::transform::verify(t, &cfg))
             .collect(),
     )
+}
+
+fn lift(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(
+        rest,
+        &["from", "function", "standard", "synth"],
+        &["standard", "synth"],
+    )?;
+    let path = a.one("file")?;
+    let text = read(path)?;
+    let from = match a.value("from") {
+        Some(f) => f.to_string(),
+        None => match std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            Some("ll") => "llvm".into(),
+            Some("vex") => "vex".into(),
+            Some("pcode" | "p-code") => "pcode".into(),
+            _ => {
+                return Err(usage(
+                    "--from pcode, vex or llvm (the extension says nothing)",
+                ));
+            }
+        },
+    };
+    let mut cx = Context::new();
+    let block = match from.as_str() {
+        "pcode" => bitwright::lift::pcode(&mut cx, &text),
+        "vex" => bitwright::lift::vex(&mut cx, &text),
+        "llvm" => bitwright::lift::llvm(&mut cx, &text, a.value("function")),
+        f => return Err(usage(format!("--from {f}: pcode, vex or llvm"))),
+    }
+    .map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+    let mut builder = Engine::builder().builtin();
+    let strategy = if a.flag("standard") {
+        Strategy::standard()
+    } else {
+        let trust = MbaTrust::default().with_backend_certificates(false);
+        builder = builder.mba_solver(Arc::new(NormalFormSolver::default()));
+        Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
+    };
+    let engine = builder
+        .strategy(strategy)
+        .build()
+        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let simplify = |cx: &mut Context, e| -> Result<String, Fail> {
+        let mut r = engine
+            .simplify(cx, e)
+            .map_err(|e| Fail::Err(2, format!("{e}")))?
+            .expr;
+        if a.flag("synth")
+            && let Some(s) = bitwright::synth::synthesize(cx, r, &Default::default())
+                .map_err(|e| Fail::Err(2, format!("{e}")))?
+        {
+            r = s;
+        }
+        Ok(cx.display(r).to_string())
+    };
+    let mut out = String::new();
+    for (name, e) in &block.outputs {
+        let s = simplify(&mut cx, *e)?;
+        writeln!(out, "{name} = {s}").ok();
+    }
+    for (addr, v) in &block.stores {
+        let (sa, sv) = (simplify(&mut cx, *addr)?, simplify(&mut cx, *v)?);
+        writeln!(out, "store [{sa}] = {sv}").ok();
+    }
+    for (c, t) in &block.exits {
+        let (sc, st) = (simplify(&mut cx, *c)?, simplify(&mut cx, *t)?);
+        writeln!(out, "exit to {st} if {sc}").ok();
+    }
+    if let Some(n) = block.next {
+        let s = simplify(&mut cx, n)?;
+        writeln!(out, "next = {s}").ok();
+    }
+    Ok(out)
 }
 
 fn infer(rest: &[String]) -> Result<String, Fail> {

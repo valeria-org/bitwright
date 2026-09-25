@@ -869,6 +869,18 @@ class EngineBuilder {
         return *this;
     }
 
+    // Also the rules that hold for floats as values (every NaN one value).
+    EngineBuilder &float_values(bool yes = true) {
+        bw_engine_builder_set_float_values(b_.get(), yes);
+        return *this;
+    }
+
+    // Refuses the rewrites of a rule (`group::rule`) or a pass (`linear`, …).
+    EngineBuilder &refuse(const std::string &name) {
+        detail::check(bw_engine_builder_refuse(b_.get(), name.c_str()));
+        return *this;
+    }
+
     Engine build() const {
         bw_engine *e = nullptr;
         detail::check(bw_engine_builder_build(b_.get(), &e));
@@ -883,6 +895,153 @@ class EngineBuilder {
 inline std::string check_rules(const std::string &source) {
     char *s = nullptr;
     detail::check(bw_check_rules(source.c_str(), &s));
+    return detail::take(s);
+}
+
+// ----- proofs and synthesis ------------------------------------------------------------------
+
+// Whether `a` and `b` are equal for every value of their symbols: true (proved), false
+// (refuted), or no value (not decided within `conflicts`).
+inline std::optional<bool> equivalent(Expr a, Expr b, uint64_t conflicts = 1000000) {
+    int v = BW_UNDECIDED;
+    detail::check(bw_equivalent(a.context(), a.raw(), b.raw(), conflicts, &v));
+    if (v == BW_UNDECIDED) {
+        return std::nullopt;
+    }
+    return v == BW_EQUIVALENT;
+}
+
+// The smallest expression equal to `e` that synthesis finds (proved), if any.
+inline std::optional<Expr> synthesize(Expr e, uint8_t max_size = 7) {
+    bw_expr out = BW_NULL_EXPR;
+    bool found = false;
+    detail::check(bw_synthesize(e.context(), e.raw(), max_size, &out, &found));
+    if (!found) {
+        return std::nullopt;
+    }
+    return Expr(e.context(), out);
+}
+
+// ----- memory --------------------------------------------------------------------------------
+
+// A memory: loads and stores as expressions of one context.
+class Memory {
+  public:
+    explicit Memory(const std::string &name = "mem", uint16_t addr_width = 64,
+                    uint16_t cell_width = 8, bool big_endian = false)
+        : m_(detail::check_new(bw_memory_new(name.c_str(), addr_width, cell_width, big_endian)),
+             &bw_memory_free) {}
+
+    // Known contents of 8-bit cells from `start` on, before any load or store.
+    void set_bytes(uint64_t start, const std::vector<uint8_t> &data) {
+        detail::check(bw_memory_set_bytes(m_.get(), start, data.data(), data.size()));
+    }
+    void store(Expr addr, Expr value) {
+        detail::check(bw_memory_store(m_.get(), addr.context(), addr.raw(), value.raw()));
+    }
+    Expr load(Expr addr, uint16_t cells = 1) {
+        bw_expr out = BW_NULL_EXPR;
+        detail::check(bw_memory_load(m_.get(), addr.context(), addr.raw(), cells, &out));
+        return Expr(addr.context(), out);
+    }
+
+  private:
+    std::unique_ptr<bw_memory, void (*)(bw_memory *)> m_;
+};
+
+// ----- lifted code ---------------------------------------------------------------------------
+
+enum class FrontEnd : int { Pcode = BW_LIFT_PCODE, Vex = BW_LIFT_VEX, Llvm = BW_LIFT_LLVM };
+
+// A block of lifted code, read into expressions.
+struct Lifted {
+    std::vector<std::pair<std::string, Expr>> inputs;  // registers read before written
+    std::vector<std::pair<std::string, Expr>> outputs; // registers written: final values
+    std::vector<std::pair<Expr, Expr>> stores;         // (address, value)
+    std::vector<std::pair<Expr, Expr>> exits;          // (condition, target)
+    std::optional<Expr> next;
+
+    // The final value of a register (an output, else an input).
+    std::optional<Expr> reg(const std::string &name) const {
+        for (const auto *list : {&outputs, &inputs}) {
+            for (const auto &[n, e] : *list) {
+                if (n == name) {
+                    return e;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+// Reads lifted code into `cx` (`function` names an LLVM IR function; empty: the first).
+inline Lifted lift(Context &cx, FrontEnd from, const std::string &code,
+                   const std::string &function = "") {
+    bw_lifted *l = nullptr;
+    detail::check(bw_lift(cx.raw(), static_cast<int>(from), code.c_str(),
+                          function.empty() ? nullptr : function.c_str(), &l));
+    std::unique_ptr<bw_lifted, void (*)(bw_lifted *)> guard(l, &bw_lifted_free);
+    Lifted out;
+    for (int part : {BW_LIFTED_INPUTS, BW_LIFTED_OUTPUTS, BW_LIFTED_STORES, BW_LIFTED_EXITS}) {
+        std::size_t n = bw_lifted_count(l, part);
+        for (std::size_t i = 0; i < n; i++) {
+            const char *name = nullptr;
+            bw_expr a = BW_NULL_EXPR, b = BW_NULL_EXPR;
+            detail::check(bw_lifted_get(l, part, i, &name, &a, &b));
+            Expr ea(cx.raw(), a), eb(cx.raw(), b);
+            switch (part) {
+            case BW_LIFTED_INPUTS: out.inputs.emplace_back(name, ea); break;
+            case BW_LIFTED_OUTPUTS: out.outputs.emplace_back(name, ea); break;
+            case BW_LIFTED_STORES: out.stores.emplace_back(ea, eb); break;
+            default: out.exits.emplace_back(ea, eb); break;
+            }
+        }
+    }
+    bw_expr next = BW_NULL_EXPR;
+    bool has = false;
+    detail::check(bw_lifted_next(l, &next, &has));
+    if (has) {
+        out.next = Expr(cx.raw(), next);
+    }
+    return out;
+}
+
+// ----- compiler transformations --------------------------------------------------------------
+
+// A report on transformations (as `bitwright prove` prints it) and its counts.
+struct TransformReport {
+    std::string text;
+    uint32_t valid = 0, invalid = 0, undecided = 0;
+};
+
+namespace detail {
+inline TransformReport report(char *s, const bw_transform_counts &c) {
+    return TransformReport{take(s), c.valid, c.invalid, c.undecided};
+}
+} // namespace detail
+
+// Verifies transformations in the syntax of the Alive paper.
+inline TransformReport verify_transforms(const std::string &text, uint64_t conflicts = 0) {
+    char *s = nullptr;
+    bw_transform_counts c{};
+    detail::check(bw_transform_verify(text.c_str(), conflicts, &s, &c));
+    return detail::report(s, c);
+}
+
+// Translation validation of LLVM IR functions (`tgt` empty: @tgt against @src of `src`).
+inline TransformReport validate_functions(const std::string &src, const std::string &tgt = "",
+                                          uint64_t conflicts = 0) {
+    char *s = nullptr;
+    bw_transform_counts c{};
+    detail::check(bw_transform_validate(src.c_str(), tgt.empty() ? nullptr : tgt.c_str(),
+                                        conflicts, &s, &c));
+    return detail::report(s, c);
+}
+
+// Each transformation's inferred precondition: `name TAB precondition TAB verdict` lines.
+inline std::string infer_preconditions(const std::string &text) {
+    char *s = nullptr;
+    detail::check(bw_transform_infer(text.c_str(), &s));
     return detail::take(s);
 }
 

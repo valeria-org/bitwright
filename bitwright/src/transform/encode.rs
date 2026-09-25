@@ -73,6 +73,10 @@ pub(crate) struct Side {
     pub(crate) values: Vec<(NodeId, Expr, Expr)>,
     /// The precondition (true without one).
     pub(crate) pre: Expr,
+    /// The memory after the program, when lifting.
+    pub(crate) mem: Option<(crate::memory::Memory, crate::memory::Version)>,
+    /// Its stores, in order: address and value.
+    pub(crate) stores: Vec<(Expr, Expr)>,
 }
 
 /// An error that makes a type assignment meaningless (`bswap` of an odd number of bytes):
@@ -100,6 +104,10 @@ pub(crate) struct Enc<'a> {
     values: Vec<(NodeId, Expr, Expr)>,
     tru: Expr,
     fls: Expr,
+    /// Memory, when lifting (the verifier refuses loads and stores).
+    mem: Option<(crate::memory::Memory, crate::memory::Version)>,
+    stores: Vec<(Expr, Expr)>,
+    allocas: u32,
 }
 
 fn w(bits: u16) -> Result<Width, Error> {
@@ -133,7 +141,17 @@ impl<'a> Enc<'a> {
             values: Vec::new(),
             tru,
             fls,
+            mem: None,
+            stores: Vec::new(),
+            allocas: 0,
         })
+    }
+
+    /// Reads and writes of memory go to `m` (lifting).
+    pub(crate) fn with_memory(mut self, m: crate::memory::Memory) -> Self {
+        let v = m.initial();
+        self.mem = Some((m, v));
+        self
     }
 
     // Boolean helpers (1-bit values).
@@ -838,6 +856,67 @@ impl<'a> Enc<'a> {
                 Ok((v, p))
             }
             Op::BitCast | Op::Copy => Ok((vs[0], ps[0])),
+            Op::Resize => {
+                let bits = self.int_bits(n)?;
+                let from = self.cx.width(vs[0])?.bits();
+                let v = match from.cmp(&bits) {
+                    core::cmp::Ordering::Equal => vs[0],
+                    core::cmp::Ordering::Less => self.cx.zext(vs[0], w(bits)?)?,
+                    core::cmp::Ordering::Greater => self.cx.trunc(vs[0], w(bits)?)?,
+                };
+                Ok((v, ps[0]))
+            }
+            Op::Gep(size) => {
+                // p + i · size, the index sign-extended to the address width.
+                let iw = self.cx.width(vs[1])?.bits();
+                let i = match iw.cmp(&64) {
+                    core::cmp::Ordering::Equal => vs[1],
+                    core::cmp::Ordering::Less => self.cx.sext(vs[1], Width::W64)?,
+                    core::cmp::Ordering::Greater => self.cx.trunc(vs[1], Width::W64)?,
+                };
+                let k = self.konst(64, u64::from(size))?;
+                let off = self.cx.bin(BinOp::Mul, i, k)?;
+                let v = self.cx.bin(BinOp::Add, vs[0], off)?;
+                let p = any_poison(self, &ps)?;
+                Ok((v, p))
+            }
+            Op::Alloca => {
+                let k = self.allocas;
+                self.allocas += 1;
+                let s = self.cx.symbol(format!("alloca.{k}").as_str(), Width::W64)?;
+                Ok((s, self.fls))
+            }
+            Op::Load | Op::Store => {
+                let Some((mut m, mut ver)) = self.mem.take() else {
+                    return Err(unsupported(
+                        "memory (loads and stores are read only when lifting)",
+                    ));
+                };
+                let out = if inst.op == Op::Load {
+                    let bytes = self.ty(n).bits().div_ceil(8);
+                    let v = m.load(self.cx, ver, vs[0], bytes)?;
+                    let bits = self.ty(n).bits();
+                    let v = if self.cx.width(v)?.bits() == bits {
+                        v
+                    } else {
+                        self.cx.trunc(v, w(bits)?)?
+                    };
+                    Ok((v, ps[0]))
+                } else {
+                    let (value, addr) = (vs[0], vs[1]);
+                    let bits = self.cx.width(value)?.bits();
+                    let value = if bits % 8 == 0 {
+                        value
+                    } else {
+                        self.cx.zext(value, w(bits.div_ceil(8) * 8)?)?
+                    };
+                    ver = m.store(self.cx, ver, addr, value)?;
+                    self.stores.push((addr, value));
+                    Ok((self.tru, self.fls))
+                };
+                self.mem = Some((m, ver));
+                out
+            }
             Op::FAdd | Op::FSub | Op::FMul | Op::FDiv | Op::FRem => {
                 let f = self.format(n)?;
                 let (a, b) = (vs[0], vs[1]);
@@ -1419,6 +1498,8 @@ impl<'a> Enc<'a> {
             keyed: self.keyed,
             values: self.values,
             pre,
+            mem: self.mem,
+            stores: self.stores,
         })
     }
 

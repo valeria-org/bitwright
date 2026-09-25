@@ -11,6 +11,10 @@ use super::lex::{Cursor, SyntaxError, Tok};
 
 /// A type name (`i8`, `float`, …).
 pub(crate) fn type_name(w: &str) -> Option<Ty> {
+    // Pointers are 64-bit addresses (lifting reads memory as one flat array of bytes).
+    if w == "ptr" {
+        return Some(Ty::Int(64));
+    }
     if let Some(n) = w.strip_prefix('i')
         && !n.is_empty()
         && n.bytes().all(|b| b.is_ascii_digit())
@@ -21,6 +25,15 @@ pub(crate) fn type_name(w: &str) -> Option<Ty> {
             .then_some(Ty::Int(bits as u16));
     }
     float_type(w).map(Ty::Float)
+}
+
+/// `, align N` after a memory instruction.
+fn skip_align(c: &mut Cursor<'_>) {
+    if matches!(c.peek(), Some(Tok::P(",")))
+        && matches!(c.peek_at(1), Some(Tok::Ident(w)) if w == "align")
+    {
+        c.pos += 3;
+    }
 }
 
 /// The words that are not symbolic constants in an operand.
@@ -329,6 +342,12 @@ impl Ctx<'_> {
                         | "tail"
                         | "musttail"
                         | "notail"
+                        | "load"
+                        | "store"
+                        | "getelementptr"
+                        | "alloca"
+                        | "ptrtoint"
+                        | "inttoptr"
                 )
         });
         if !is_op {
@@ -412,6 +431,67 @@ impl Ctx<'_> {
                     let b = self.operand(c)?;
                     inst.args = vec![cnd, a, b];
                     self.annotate(c, cnd, Ty::Int(1))?;
+                }
+                "load" => {
+                    // load [volatile] <ty>, ptr %p [, align N]
+                    c.eat_word("volatile");
+                    inst.op = Op::Load;
+                    let Some(ty) = self.opt_type(c) else {
+                        return c.err("expected the loaded type");
+                    };
+                    result_ty = Some(ty);
+                    c.expect(",")?;
+                    let p = self.operand(c)?;
+                    inst.args = vec![p];
+                    skip_align(c);
+                }
+                "store" => {
+                    // store [volatile] <ty> %v, ptr %p [, align N]
+                    c.eat_word("volatile");
+                    inst.op = Op::Store;
+                    let v = self.operand(c)?;
+                    c.expect(",")?;
+                    let p = self.operand(c)?;
+                    inst.args = vec![v, p];
+                    result_ty = Some(Ty::Int(1));
+                    skip_align(c);
+                }
+                "alloca" => {
+                    inst.op = Op::Alloca;
+                    if self.opt_type(c).is_none() {
+                        return c.err("expected the allocated type");
+                    }
+                    result_ty = Some(Ty::Int(64));
+                    skip_align(c);
+                }
+                "getelementptr" => {
+                    // getelementptr [inbounds|nuw|nusw]* <elem>, ptr %p, <ty> %i
+                    while matches!(c.peek_word(), Some("inbounds" | "nuw" | "nusw")) {
+                        c.pos += 1;
+                    }
+                    let Some(elem) = self.opt_type(c) else {
+                        return c.err("getelementptr over a scalar type (i8, i32, …)");
+                    };
+                    c.expect(",")?;
+                    let p = self.operand(c)?;
+                    c.expect(",")?;
+                    let i = self.operand(c)?;
+                    inst.op = Op::Gep(elem.bits().div_ceil(8));
+                    inst.args = vec![p, i];
+                    result_ty = Some(Ty::Int(64));
+                }
+                "ptrtoint" | "inttoptr" => {
+                    // A resize of the address: zero extension or truncation.
+                    let a = self.operand(c)?;
+                    if !c.eat_word("to") {
+                        return c.err("expected `to`");
+                    }
+                    let Some(ty) = c.word().and_then(type_name) else {
+                        return c.err("expected a type after `to`");
+                    };
+                    inst.op = Op::Resize;
+                    inst.args = vec![a];
+                    result_ty = Some(ty);
                 }
                 "freeze" | "fneg" => {
                     inst.op = if opname == "freeze" {

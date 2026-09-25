@@ -37,6 +37,13 @@ name = "bitwright-ref"
 version = "0.10.0"
 
 [[package]]
+name = "bitwright-wasm"
+version = "0.10.0"
+dependencies = [
+ "bitwright",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

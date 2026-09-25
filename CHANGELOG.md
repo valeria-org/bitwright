@@ -147,6 +147,20 @@
   interpreter and random sampling finds no difference in the mutants judged valid. Of the
   fast-math flags, `nnan`, `ninf` and `nsz` are modeled; `reassoc`, `arcp`, `contract` and
   `afn` are not.
+- **Lifted code** (`bitwright::lift`): front ends for Ghidra's p-code, VEX as pyvex prints an
+  IRSB, and LLVM IR functions (loads, stores, `getelementptr`, `alloca` over one flat memory),
+  each read into a block's inputs, final register values (x86-64's register parts by byte
+  range), stores and exits. `bitwright lift` prints them deobfuscated.
+- **Bindings for everything above.** Python: `equivalent`, `synthesize`, `saturate` (equality
+  saturation, now in the package), `Memory`, `lift_pcode`, `lift_vex`, `lift_llvm`,
+  `verify_transforms`, `validate_functions`, `infer_preconditions`, and engines with
+  `float_values`, `refuse` (rules or passes vetoed by name) and `trace` (the rewrites of a
+  run). C and C++: the same except equality saturation and traces (`bw_equivalent`,
+  `bw_synthesize`, `bw_memory_*`, `bw_lift`, `bw_transform_*`,
+  `bw_engine_builder_set_float_values`, `bw_engine_builder_refuse`). JavaScript: a WebAssembly
+  module (`bitwright-wasm`, no bindings generator) and `bitwright.mjs`, strings in and out,
+  tested under Node. Scripts for Ghidra, Binary Ninja and IDA (`tools/plugins/`, untested: none
+  of the tools is available where bitwright is developed).
 - **Synthesis** (`bitwright::synth`, feature `prove`): the smallest expression equal to a
   given one over its variables and constants, whatever its shape, by bottom-up enumeration
   with observational equivalence on sample points and counterexample-guided refinement, each

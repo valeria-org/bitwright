@@ -531,6 +531,91 @@ def test_threads_share_engines_and_contexts():
     assert results == {i: f"x + {i}" for i in range(1, 9)}
 
 
+def test_proofs_synthesis_and_saturation(cx):
+    x, y = cx.symbols("x y", 32)
+    assert ((x ^ y) + 2 * (x & y)).equivalent(x + y) is True
+    cex = (x + y).equivalent(x | y)
+    assert isinstance(cex, dict) and set(cex) <= {"x", "y"}
+    vx, vy = cex.get("x", 0), cex.get("y", 0)
+    assert (vx + vy) % 2**32 != vx | vy
+    assert bw.equivalent(x * 2, x + x) is True
+    s = (((x + y) & 1) ^ (x & 1)).synthesize()
+    assert s is not None and str(s) == "y & 1"
+    assert (x + y).synthesize() is None
+    z = cx.symbol("z", 32)
+    f = (x * y + x * z).saturate()
+    assert f is not None and str(f) == "(y + z) * x"
+
+
+def test_engine_hooks(cx):
+    x = cx.symbol("x", 8)
+    e = x * 3 - x - x
+    out, steps = bw.Engine().trace(e)
+    assert str(out) == "x"
+    assert steps and all(isinstance(by, str) for by, _, _ in steps)
+    assert steps[-1][2] == out
+    # Refusing the linear pass leaves the sum as the other passes and rules leave it.
+    kept = bw.Engine(refuse=["linear"]).simplify(e)
+    assert "linear" not in [by for by, _, _ in bw.Engine(refuse=["linear"]).trace(e)[1]]
+    assert kept.equivalent(e) is True
+
+
+def test_memory(cx):
+    sp, x = cx.symbols("sp x", 64)
+    m = bw.Memory(cx)
+    slot = sp - 8
+    m.store(slot, x)
+    assert m.load(slot, 8) == x
+    other = m.load(sp, 1)
+    assert str(other) == "mem.0"
+    assert len(m.reads()) == 1
+    t = bw.Memory(cx, "t")
+    t.set_bytes(0x1000, bytes([7, 8, 9]))
+    assert t.load(cx.const(0x1001, 64)).value == 8
+
+
+def test_lifting(cx):
+    b = bw.lift_vex(
+        cx,
+        """t0 = GET:I64(rdi)
+           t1 = GET:I64(rsi)
+           t2 = Xor64(t0,t1)
+           t3 = And64(t0,t1)
+           t4 = Shl64(t3,0x01)
+           t5 = Add64(t2,t4)
+           PUT(rax) = t5""",
+    )
+    assert str(b.register("rax").simplify()) == "rdi + rsi"
+    p = bw.lift_pcode(cx, "(register, RAX, 8) = INT_MULT (register, RDI, 8) , (const, 0x2, 8)")
+    assert str(p.register("RAX").simplify()) == "RDI + RDI"
+    ll = bw.lift_llvm(cx, "define i32 @f(i32 %a) {\n  %r = shl i32 %a, 1\n  ret i32 %r\n}\n")
+    assert str(ll.register("ret").simplify()) == "a + a"
+
+
+def test_transformations():
+    reports = bw.verify_transforms(
+        """Name: good
+        %a = xor %x, -1
+        %r = add %a, 1
+          =>
+        %r = sub 0, %x
+
+        Name: bad
+        %r = select %c, %x, false
+          =>
+        %r = and %c, %x"""
+    )
+    assert [r.verdict for r in reports] == ["valid", "invalid"]
+    assert "poison" in reports[1].text
+    tv = bw.validate_functions(
+        "define i8 @src(i8 %x) {\n  %r = mul i8 %x, 2\n  ret i8 %r\n}\n"
+        "define i8 @tgt(i8 %x) {\n  %r = add i8 %x, %x\n  ret i8 %r\n}\n"
+    )
+    assert tv[0].verdict == "valid"
+    (i,) = bw.infer_preconditions("%r = mul %x, C\n  =>\n%r = shl %x, log2(C)")
+    assert i.pre == "isPowerOf2(C)" and i.weakest and i.verdict == "valid"
+
+
 def test_version():
     assert bw.__version__.count(".") == 2
 

@@ -31,7 +31,12 @@ them it relied on.
 
 - **As a library**, in Rust: build expressions or parse them, ask for facts and proofs, and run
   an engine of your choice (see [Simplifying](simplifying.md)).
-- **From C, C++ and Python**, through the [bindings](bindings.md), with the same results.
+- **From C, C++, Python and JavaScript**, through the [bindings](bindings.md) (JavaScript
+  through WebAssembly), with the same results.
+- **On lifted code**: p-code, VEX and LLVM IR read into expressions (see
+  [Lifted code](lifting.md)), and from a disassembler through its plugin scripts.
+- **To verify a compiler**: peephole transformations and pairs of LLVM IR functions proved or
+  refuted under LLVM's semantics (see [Verifying compiler transformations](transformations.md)).
 - **From the command line**: `bitwright simplify` deobfuscates an expression, and the other
   commands check, lint and document rule files (see [The command line](cli.md)).
 - **With your own rules**, written in a small language, checked for soundness before they can be

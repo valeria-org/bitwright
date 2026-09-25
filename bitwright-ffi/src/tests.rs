@@ -82,7 +82,7 @@ fn version_and_abi() {
 #[test]
 fn the_header_declares_every_entry_point_and_matches_the_tables() {
     let header = include_str!("../include/bitwright.h");
-    let source = include_str!("lib.rs");
+    let source = [include_str!("lib.rs"), include_str!("more.rs")].concat();
     let exported: Vec<&str> = source
         .lines()
         .filter_map(|l| l.split("extern \"C\" fn ").nth(1))
@@ -1220,5 +1220,113 @@ fn floating_point_errors() {
         assert_eq!(bw_fp_node_of(cx.0, e, null_mut()), BW_ERR_INVALID_ARGUMENT);
         let mut n = other.fp_node(other.parse("fp.max.f32(p, q)", 32));
         assert_eq!(bw_fp_node_of(cx.0, 0, &mut n), BW_ERR_FOREIGN_EXPR);
+    }
+}
+
+#[test]
+fn proofs_synthesis_memory_lifting_and_transformations() {
+    use super::more::*;
+    let cx = Cx::new();
+    // Equivalence and synthesis.
+    let (a, b) = (cx.parse("(x ^ y) + 2 * (x & y)", 32), cx.parse("x + y", 32));
+    let mut v = 7;
+    assert_eq!(unsafe { bw_equivalent(cx.0, a, b, 100_000, &mut v) }, BW_OK);
+    assert_eq!(v, 1);
+    let c = cx.parse("x | y", 32);
+    assert_eq!(unsafe { bw_equivalent(cx.0, b, c, 100_000, &mut v) }, BW_OK);
+    assert_eq!(v, 0);
+    let e = cx.parse("((x + y) & 1) ^ (x & 1)", 32);
+    let (mut s, mut found) = (0, false);
+    assert_eq!(
+        unsafe { bw_synthesize(cx.0, e, 7, &mut s, &mut found) },
+        BW_OK
+    );
+    assert!(found);
+    assert_eq!(cx.print(s), "y & 1");
+    // Memory.
+    let m = unsafe { bw_memory_new(cstr("mem").as_ptr(), 64, 8, false) };
+    assert!(!m.is_null());
+    let (slot, x) = (cx.parse("sp - 8", 64), cx.sym("v", 64));
+    assert_eq!(unsafe { bw_memory_store(m, cx.0, slot, x) }, BW_OK);
+    let mut back = 0;
+    assert_eq!(
+        unsafe { bw_memory_load(m, cx.0, slot, 8, &mut back) },
+        BW_OK
+    );
+    assert_eq!(back, x);
+    unsafe { bw_memory_free(m) };
+    // Lifting.
+    let mut l = null_mut();
+    let code = cstr("t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1");
+    assert_eq!(
+        unsafe { bw_lift(cx.0, 1, code.as_ptr(), null(), &mut l) },
+        BW_OK
+    );
+    assert_eq!(unsafe { bw_lifted_count(l, 1) }, 1);
+    let (mut name, mut out) = (null(), 0u64);
+    assert_eq!(
+        unsafe { bw_lifted_get(l, 1, 0, &mut name, &mut out, null_mut()) },
+        BW_OK
+    );
+    assert_eq!(unsafe { CStr::from_ptr(name) }.to_str().unwrap(), "rax");
+    assert_eq!(cx.print(out), "rdi + rdi");
+    assert_ne!(
+        unsafe { bw_lifted_get(l, 1, 5, null_mut(), null_mut(), null_mut()) },
+        BW_OK
+    );
+    unsafe { bw_lifted_free(l) };
+    // Transformations.
+    let (mut report, mut counts) = (null_mut(), BwTransformCounts::default());
+    let t = cstr("%r = select %c, %x, false\n=>\n%r = and %c, %x");
+    assert_eq!(
+        unsafe { bw_transform_verify(t.as_ptr(), 0, &mut report, &mut counts) },
+        BW_OK
+    );
+    let text = take(report);
+    assert!(text.starts_with("INVALID"), "{text}");
+    assert_eq!((counts.valid, counts.invalid, counts.undecided), (0, 1, 0));
+    let pair = cstr(
+        "define i8 @src(i8 %x) {\n  %r = mul i8 %x, 2\n  ret i8 %r\n}\n\
+         define i8 @tgt(i8 %x) {\n  %r = add i8 %x, %x\n  ret i8 %r\n}\n",
+    );
+    assert_eq!(
+        unsafe { bw_transform_validate(pair.as_ptr(), null(), 0, &mut report, &mut counts) },
+        BW_OK
+    );
+    take(report);
+    assert_eq!(counts.valid, 1);
+    let i = cstr("%r = mul %x, C\n=>\n%r = shl %x, log2(C)");
+    assert_eq!(
+        unsafe { bw_transform_infer(i.as_ptr(), &mut report) },
+        BW_OK
+    );
+    assert_eq!(take(report), "transformation 1\tisPowerOf2(C)\tvalid\n");
+    // A syntax error.
+    let bad = cstr("%r = frob %x\n=>\n%r = %x");
+    assert_eq!(
+        unsafe { bw_transform_verify(bad.as_ptr(), 0, &mut report, &mut counts) },
+        BW_ERR_SYNTAX
+    );
+    // Engines that refuse a pass.
+    let bld = bw_engine_builder_new(0);
+    assert_eq!(
+        unsafe { bw_engine_builder_refuse(bld, cstr("linear").as_ptr()) },
+        BW_OK
+    );
+    unsafe { bw_engine_builder_set_float_values(bld, true) };
+    let mut eng = null_mut();
+    assert_eq!(unsafe { bw_engine_builder_build(bld, &mut eng) }, BW_OK);
+    let sum = cx.parse("x * 3 - x - x", 8);
+    let mut r = 0;
+    assert_eq!(unsafe { bw_simplify(eng, cx.0, sum, &mut r) }, BW_OK);
+    let mut same = 7;
+    assert_eq!(
+        unsafe { bw_equivalent(cx.0, r, sum, 100_000, &mut same) },
+        BW_OK
+    );
+    assert_eq!(same, 1);
+    unsafe {
+        bw_engine_free(eng);
+        bw_engine_builder_free(bld);
     }
 }

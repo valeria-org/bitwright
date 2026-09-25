@@ -1,7 +1,7 @@
-# C, C++ and Python
+# C, C++, Python and JavaScript
 
-bitwright can be used from C, C++ and Python. The bindings cover what a host needs to hand its
-expressions to bitwright and read the results back:
+bitwright can be used from C, C++, Python and, compiled to WebAssembly, JavaScript. The bindings
+cover what a host needs to hand its expressions to bitwright and read the results back:
 
 - building, parsing, printing and inspecting expressions, at any width from 1 to 512 bits;
 - IEEE 754 [floating point](floating-point.md) in any format and under every rounding mode, on
@@ -12,11 +12,18 @@ expressions to bitwright and read the results back:
 - simplification with the standard engine or the deobfuscation engine (the command line's
   `simplify`: the MBA service with the native solver, on bitwright's own evidence), with budgets,
   and with rule files of your own, linked with their proof ledgers;
-- SMT-LIB export and import.
+- SMT-LIB export and import;
+- proofs of equivalence by the native prover, synthesis, and (Python) equality saturation;
+- [memory](memory.md) (loads and stores as expressions) and [lifted code](lifting.md) (p-code,
+  VEX, LLVM IR);
+- [verifying compiler transformations](transformations.md): transformations in the Alive
+  syntax, translation validation of LLVM IR, precondition inference;
+- engines that refuse rewrites by rule or pass name, and (Python) the trace of a run's
+  rewrites.
 
-Extension operations, host hooks, observers, deadlines, allowances, custom strategies, other MBA
-backends and equality saturation are Rust only. The bindings have the version of the crate they
-are built with, and give the same results.
+Extension operations, host hooks as callbacks, deadlines, allowances, custom strategies and
+other MBA backends are Rust only. The bindings have the version of the crate they are built
+with, and give the same results. JavaScript has a string API: text in, text out.
 
 ## Python
 
@@ -390,3 +397,161 @@ int main() {
     return 0;
 }
 ```
+
+## Proofs, memory, lifted code and transformations
+
+The same services from each language: an equivalence proved by bitwright's own SAT solver,
+synthesis, a spill reloaded through memory, a lifted VEX block, and a transformation refuted.
+
+```python
+import bitwright as bw
+
+cx = bw.Context()
+x, y = cx.symbols("x y", 32)
+assert ((x ^ y) + 2 * (x & y)).equivalent(x + y) is True
+cex = (x + y).equivalent(x | y)  # a counterexample: {"x": ..., "y": ...}
+assert isinstance(cex, dict)
+assert str((((x + y) & 1) ^ (x & 1)).synthesize()) == "y & 1"
+z = cx.symbol("z", 32)
+assert str((x * y + x * z).saturate()) == "(y + z) * x"
+
+# Memory: a spill and its reload.
+sp, v = cx.symbols("sp v", 64)
+m = bw.Memory(cx)
+m.store(sp - 8, v)
+assert m.load(sp - 8, 8) == v
+
+# Lifted code: an MBA as pyvex prints it, back to the sum.
+block = bw.lift_vex(
+    cx,
+    """t0 = GET:I64(rdi)
+       t1 = GET:I64(rsi)
+       t2 = Xor64(t0,t1)
+       t3 = And64(t0,t1)
+       t4 = Add64(t3,t3)
+       t5 = Add64(t2,t4)
+       PUT(rax) = t5""",
+)
+assert str(block.register("rax").simplify(bw.Engine.deobfuscate())) == "rdi + rsi"
+
+# A transformation, and the precondition it needs.
+(r,) = bw.verify_transforms("%r = select %c, %x, false\n=>\n%r = and %c, %x")
+assert r.verdict == "invalid" and "poison" in r.text
+(i,) = bw.infer_preconditions("%r = mul %x, C\n=>\n%r = shl %x, log2(C)")
+assert i.pre == "isPowerOf2(C)"
+
+# The rewrites of a run, and an engine that refuses a pass.
+out, steps = bw.Engine().trace(x * 3 - x - x)
+assert str(out) == "x" and steps
+kept = bw.Engine(refuse=["linear"]).simplify(x * 3 - x - x)
+assert kept.equivalent(x) is True
+```
+
+```c
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "bitwright.h"
+
+int main(void) {
+    bw_context *cx = bw_context_new();
+    bw_expr a, b, s;
+    bw_parse(cx, "(x ^ y) + 2 * (x & y)", 32, &a);
+    bw_parse(cx, "x + y", 32, &b);
+    int verdict;
+    bw_equivalent(cx, a, b, 1000000, &verdict);
+    assert(verdict == BW_EQUIVALENT);
+
+    bool found;
+    bw_parse(cx, "((x + y) & 1) ^ (x & 1)", 32, &a);
+    bw_synthesize(cx, a, 7, &s, &found);
+    char *text;
+    bw_print(cx, s, 0, &text);
+    assert(found && strcmp(text, "y & 1") == 0);
+    bw_string_free(text);
+
+    /* Memory: a spill and its reload. */
+    bw_memory *m = bw_memory_new("mem", 64, 8, false);
+    bw_expr slot, v, back;
+    bw_parse(cx, "sp - 8", 64, &slot);
+    bw_symbol(cx, "v", 64, &v);
+    bw_memory_store(m, cx, slot, v);
+    bw_memory_load(m, cx, slot, 8, &back);
+    assert(back == v);
+    bw_memory_free(m);
+
+    /* Lifted VEX. */
+    bw_lifted *l;
+    assert(bw_lift(cx, BW_LIFT_VEX, "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1", NULL,
+                   &l) == BW_OK);
+    const char *name;
+    bw_expr rax;
+    bw_lifted_get(l, BW_LIFTED_OUTPUTS, 0, &name, &rax, NULL);
+    assert(strcmp(name, "rax") == 0);
+    bw_lifted_free(l);
+
+    /* A transformation refuted. */
+    char *report;
+    bw_transform_counts counts;
+    bw_transform_verify("%r = select %c, %x, false\n=>\n%r = and %c, %x", 0, &report, &counts);
+    assert(counts.invalid == 1);
+    printf("%s", report);
+    bw_string_free(report);
+    bw_context_free(cx);
+    return 0;
+}
+```
+
+```cpp
+#include <cassert>
+
+#include "bitwright.hpp"
+
+namespace bw = bitwright;
+
+int main() {
+    bw::Context cx;
+    bw::Expr e = cx.parse("(x ^ y) + 2 * (x & y)", 32);
+    assert(bw::equivalent(e, cx.parse("x + y", 32)) == true);
+    assert(bw::synthesize(cx.parse("((x + y) & 1) ^ (x & 1)", 32))->str() == "y & 1");
+
+    bw::Memory m;
+    bw::Expr slot = cx.parse("sp - 8", 64), v = cx.parse("v", 64);
+    m.store(slot, v);
+    assert(m.load(slot, 8).raw() == v.raw());
+
+    auto block = bw::lift(cx, bw::FrontEnd::Vex, "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1");
+    assert(block.reg("rax")->str() == "rdi + rdi");
+
+    auto report = bw::verify_transforms("%r = select %c, %x, false\n=>\n%r = and %c, %x");
+    assert(report.invalid == 1);
+    return 0;
+}
+```
+
+## JavaScript (WebAssembly)
+
+`bitwright-wasm/` builds bitwright as a WebAssembly module with no bindings generator, and
+`bitwright-wasm/js/bitwright.mjs` wraps it for JavaScript, in a browser or Node: every
+function takes and returns strings.
+
+```text
+cargo build --release -p bitwright-wasm --target wasm32-unknown-unknown
+# target/wasm32-unknown-unknown/release/bitwright_wasm.wasm
+```
+
+```js
+import { readFile } from "node:fs/promises";
+import { instantiate } from "./bitwright.mjs";
+
+const bw = await instantiate(await readFile("bitwright_wasm.wasm")); // or fetch(url)
+bw.simplify("(x & y) * (x | y) + (x & ~y) * (~x & y)", 64); // "x * y"
+bw.synthesize("((x + y) & 1) ^ (x & 1)", 32);               // "y & 1"
+bw.equivalent("x * 2", "x + x", 16);                         // "equivalent"
+bw.prove("%r = select %c, %x, false\n=>\n%r = and %c, %x");   // "INVALID …" and why
+bw.lift("vex", "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1"); // "rax = rdi + rdi\n"
+```
+
+`validate` (translation validation), `infer` (preconditions) and `toSmtlib` complete it;
+`bitwright-wasm/js/test.mjs` exercises each under Node.

@@ -536,6 +536,13 @@ bw_status bw_engine_builder_add_rules(bw_engine_builder *b, const char *source,
 /* At most `rounds` rounds of the strategy (default 4; 0 reads as 1). */
 void bw_engine_builder_set_max_rounds(bw_engine_builder *b, uint8_t rounds);
 
+/* Also applies the rules that hold for floats as values, every NaN one value (`x * 1` is `x`):
+ * a result may then differ from the input in a NaN's payload or sign. */
+void bw_engine_builder_set_float_values(bw_engine_builder *b, bool yes);
+
+/* Refuses every rewrite of the rule (`group::rule`) or pass (`linear`, `xor`, …) named. */
+bw_status bw_engine_builder_refuse(bw_engine_builder *b, const char *name);
+
 /* The engine. The builder stays valid and may build again. */
 bw_status bw_engine_builder_build(const bw_engine_builder *b, bw_engine **out);
 
@@ -627,6 +634,100 @@ size_t bw_smt_import_count(const bw_smt_import *imp, int part /* bw_smt_part */)
  * import; NULL for assertions). `name` may be NULL. */
 bw_status bw_smt_import_get(const bw_smt_import *imp, int part, size_t i, bw_expr *e,
                             const char **name);
+
+/* ----- proofs and synthesis ----------------------------------------------------------------- */
+
+typedef enum bw_equivalence {
+    BW_DIFFERENT = 0,  /* refuted: they differ at some values of the symbols */
+    BW_EQUIVALENT = 1, /* proved equal for every value */
+    BW_UNDECIDED = -1  /* not decided within the conflict budget */
+} bw_equivalence;
+
+/* Whether `a` and `b` are equal for every value of their symbols, by bitwright's own
+ * bit-blaster and SAT solver, within `conflicts` conflicts. */
+bw_status bw_equivalent(bw_context *cx, bw_expr a, bw_expr b, uint64_t conflicts,
+                        int *verdict /* bw_equivalence */);
+
+/* The smallest expression equal to `e` that synthesis finds (proved equal), of at most
+ * `max_size` nodes: `*found` is false (and `*out` is `e`) when there is none. */
+bw_status bw_synthesize(bw_context *cx, bw_expr e, uint8_t max_size, bw_expr *out, bool *found);
+
+/* ----- memory ------------------------------------------------------------------------------ */
+
+typedef struct bw_memory bw_memory;
+
+/* A memory from `addr_width`-bit addresses to `cell_width`-bit cells, all unknown (the symbols
+ * `name.0`, `name.1`, …). Its loads and stores are expressions of the context they are made
+ * in (use one context per memory). NULL on failure. */
+bw_memory *bw_memory_new(const char *name, uint16_t addr_width, uint16_t cell_width,
+                         bool big_endian);
+void bw_memory_free(bw_memory *m);
+
+/* Known contents of 8-bit cells from `start` on, before any load or store. */
+bw_status bw_memory_set_bytes(bw_memory *m, uint64_t start, const uint8_t *data, size_t n);
+
+/* Stores `value` (a whole number of cells) at `addr`: the memory moves to the new version. */
+bw_status bw_memory_store(bw_memory *m, bw_context *cx, bw_expr addr, bw_expr value);
+
+/* Loads `cells` cells at `addr` from the current version, as one value. */
+bw_status bw_memory_load(bw_memory *m, bw_context *cx, bw_expr addr, uint16_t cells,
+                         bw_expr *out);
+
+/* ----- lifted code ------------------------------------------------------------------------- */
+
+typedef struct bw_lifted bw_lifted;
+
+typedef enum bw_front_end {
+    BW_LIFT_PCODE = 0, /* Ghidra p-code, one operation per line */
+    BW_LIFT_VEX = 1,   /* VEX IR as pyvex prints an IRSB */
+    BW_LIFT_LLVM = 2   /* an LLVM IR function (its return value is the output `ret`) */
+} bw_front_end;
+
+typedef enum bw_lifted_part {
+    BW_LIFTED_INPUTS = 0,  /* registers read before written: a name and a symbol */
+    BW_LIFTED_OUTPUTS = 1, /* registers written: a name and the final value */
+    BW_LIFTED_STORES = 2,  /* stores: an address and a value */
+    BW_LIFTED_EXITS = 3    /* conditional exits: a condition and a target */
+} bw_lifted_part;
+
+/* Reads lifted code into `cx`. `function` names the LLVM IR function (NULL: the first). */
+bw_status bw_lift(bw_context *cx, int from /* bw_front_end */, const char *code,
+                  const char *function, bw_lifted **out);
+void bw_lifted_free(bw_lifted *l);
+
+/* The number of entries of a part (0 for an unknown part). */
+size_t bw_lifted_count(const bw_lifted *l, int part /* bw_lifted_part */);
+
+/* Entry `i` of a part: a name (owned by `l`; NULL for stores and exits) and one or two
+ * expressions. Any output pointer may be NULL. */
+bw_status bw_lifted_get(const bw_lifted *l, int part, size_t i, const char **name, bw_expr *a,
+                        bw_expr *b);
+
+/* Where the block continues: `*has` is false when it does not say. */
+bw_status bw_lifted_next(const bw_lifted *l, bw_expr *out, bool *has);
+
+/* ----- compiler transformations ------------------------------------------------------------ */
+
+typedef struct bw_transform_counts {
+    uint32_t valid;
+    uint32_t invalid;
+    uint32_t undecided; /* unknown within the budget, or outside what bitwright models */
+} bw_transform_counts;
+
+/* Verifies transformations in the syntax of the Alive paper (`Pre:`, source, `=>`, target):
+ * the report (as `bitwright prove` prints it, counterexamples included) and the counts.
+ * `conflicts` is the SAT budget per question (0: the default). */
+bw_status bw_transform_verify(const char *text, uint64_t conflicts, char **report,
+                              bw_transform_counts *counts);
+
+/* Translation validation: each function of `tgt` against the function of the same name in
+ * `src`, or, with `tgt` NULL, `@tgt` against `@src` of one module. */
+bw_status bw_transform_validate(const char *src, const char *tgt, uint64_t conflicts,
+                                char **report, bw_transform_counts *counts);
+
+/* Infers each transformation's precondition over its symbolic constants: one line each, `name
+ * TAB precondition-or-(none) TAB valid|invalid|undecided|-`. */
+bw_status bw_transform_infer(const char *text, char **report);
 
 #ifdef __cplusplus
 }

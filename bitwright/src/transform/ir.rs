@@ -341,6 +341,16 @@ pub enum Op {
     Call(Intrinsic),
     /// `%r = <operand>`: the operand itself (the transformation syntax).
     Copy,
+    /// `load <ty>, ptr %p` (lifting only: the verifier refuses memory).
+    Load,
+    /// `store <ty> %v, ptr %p`.
+    Store,
+    /// `getelementptr <elem>, ptr %p, <ty> %i`: `p + i · size`, the element's size in bytes.
+    Gep(u16),
+    /// `alloca <ty>`: a fresh address.
+    Alloca,
+    /// `ptrtoint` and `inttoptr`: an address resized (zero extension or truncation).
+    Resize,
 }
 
 impl Op {

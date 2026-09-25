@@ -27,15 +27,15 @@
 //! against exact IEEE semantics.
 
 mod alive;
-mod encode;
+pub(crate) mod encode;
 mod infer;
 pub mod ir;
 mod lex;
-mod llvm;
+pub(crate) mod llvm;
 mod parse;
 #[cfg(test)]
 mod tests;
-mod types;
+pub(crate) mod types;
 mod value;
 mod verify;
 

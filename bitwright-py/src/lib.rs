@@ -28,6 +28,8 @@ use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyInt, PyString, PyTuple};
 
+mod more;
+
 create_exception!(
     bitwright,
     BitwrightError,
@@ -1331,13 +1333,46 @@ impl PyExpr {
     /// The expression simplified by `engine` (default: the standard engine).
     #[pyo3(signature = (engine = None))]
     fn simplify(&self, py: Python<'_>, engine: Option<&PyEngine>) -> PyResult<PyExpr> {
+        let standard;
         let engine = match engine {
-            Some(e) => e.engine.clone(),
-            None => Engine::standard(),
+            Some(e) => e,
+            None => {
+                standard = PyEngine {
+                    engine: Engine::standard(),
+                    refuse: Vec::new(),
+                };
+                &standard
+            }
         };
-        Ok(run(py, &engine, &[self], Budget::default(), None)?
+        Ok(run(py, engine, &[self], Budget::default(), None, None)?
             .remove(0)
             .expr)
+    }
+
+    /// Whether this equals `other` for every value of the symbols: True (proved), a dict of
+    /// symbol values where they differ, or None (not decided). See `bitwright.equivalent`.
+    #[pyo3(signature = (other, *, conflicts = 1_000_000))]
+    fn equivalent<'py>(
+        slf: PyRef<'py, Self>,
+        other: PyRef<'py, PyExpr>,
+        conflicts: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        more::equivalent(py, slf, other, conflicts)
+    }
+
+    /// The smallest equal expression synthesis finds (proved), or None.
+    #[pyo3(signature = (*, max_size = 7))]
+    fn synthesize(slf: PyRef<'_, Self>, max_size: u8) -> PyResult<Option<PyExpr>> {
+        let py = slf.py();
+        more::synthesize(py, slf, max_size)
+    }
+
+    /// The equality-saturation search's smaller candidate, or None.
+    #[pyo3(signature = (*, groups = None))]
+    fn saturate(slf: PyRef<'_, Self>, groups: Option<Vec<String>>) -> PyResult<Option<PyExpr>> {
+        let py = slf.py();
+        more::saturate(py, slf, groups)
     }
 }
 
@@ -1620,11 +1655,14 @@ impl Outcome {
 /// Simplifies `exprs` (of one context) with the interpreter released.
 fn run(
     py: Python<'_>,
-    engine: &Engine,
+    engine: &PyEngine,
     exprs: &[&PyExpr],
     budget: Budget,
     assumptions: Option<&PyAssumptions>,
+    trace: Option<&mut Trace>,
 ) -> PyResult<Vec<Outcome>> {
+    let refuse = Refuse(&engine.refuse);
+    let engine = &engine.engine;
     let Some(first) = exprs.first() else {
         return Ok(Vec::new());
     };
@@ -1638,6 +1676,12 @@ fn run(
             let mut options = Run::default().with_per_call(budget);
             if let Some(a) = &a {
                 options = options.with_assumptions(a);
+            }
+            if !refuse.0.is_empty() {
+                options = options.with_hooks(&refuse);
+            }
+            if let Some(t) = trace {
+                options = options.with_observer(t);
             }
             engine.run(&mut c, &roots, options)
         })
@@ -1701,7 +1745,9 @@ fn preset(name: &str) -> PyResult<Engine> {
     match name {
         "standard" => Ok(Engine::standard()),
         "deobfuscate" => Ok(DEOBFUSCATE
-            .get_or_init(|| build(false, Vec::new(), None).expect("the deobfuscation engine links"))
+            .get_or_init(|| {
+                build(false, Vec::new(), None, false).expect("the deobfuscation engine links")
+            })
             .clone()),
         other => Err(PyValueError::new_err(format!(
             "unknown preset {other:?} (\"standard\" or \"deobfuscate\")"
@@ -1714,6 +1760,7 @@ fn build(
     standard: bool,
     programs: Vec<(RuleProgram, Ledger)>,
     max_rounds: Option<u8>,
+    float_values: bool,
 ) -> PyResult<Engine> {
     let mut b = Engine::builder().builtin();
     let mut strategy = if standard {
@@ -1737,6 +1784,7 @@ fn build(
     if let Some(n) = max_rounds {
         strategy = strategy.with_max_rounds(n);
     }
+    strategy = strategy.with_float_values(float_values);
     b.strategy(strategy)
         .build()
         .map_err(|e| RuleError::new_err(e.to_string()))
@@ -1749,15 +1797,59 @@ fn build(
 #[derive(Debug)]
 struct PyEngine {
     engine: Engine,
+    /// Rules and passes whose rewrites are refused, by name.
+    refuse: Vec<String>,
+}
+
+/// Refuses the rewrites of the named rules and passes.
+struct Refuse<'a>(&'a [String]);
+
+impl bitwright::engine::Hooks for Refuse<'_> {
+    fn admit(&self, _: &Context, _: Expr, _: Expr, by: bitwright::engine::By<'_>) -> bool {
+        !self.0.iter().any(|n| n == by.name())
+    }
+
+    fn revision(&self) -> u64 {
+        // One per refusal list.
+        self.0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, n| {
+            n.bytes()
+                .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        })
+    }
+}
+
+/// One rewrite of a trace: the rule or pass, the node before, its replacement.
+type Step = (String, PyExpr, PyExpr);
+
+/// Records the rewrites of a run: what rewrote which node to which.
+#[derive(Default)]
+struct Trace(Vec<(String, Expr, Expr)>);
+
+impl bitwright::engine::Observer for Trace {
+    fn event(&mut self, event: bitwright::engine::Event<'_>) {
+        if let bitwright::engine::Event::Applied { by, before, after } = event {
+            self.0.push((by.name().to_string(), before, after));
+        }
+    }
 }
 
 #[pymethods]
 impl PyEngine {
     /// `rules` is a sequence of `.bwr` sources, each a string (checked now, which can take a
     /// while) or a `(source, ledger)` pair with the proof ledger from `check_rules`.
+    ///
+    /// `float_values` also applies the rules that hold for floats as values (every NaN one
+    /// value); `refuse` names rules (`group::rule`) and passes (`linear`, …) whose rewrites are
+    /// refused.
     #[new]
-    #[pyo3(signature = (preset = "standard", *, rules = Vec::new(), max_rounds = None))]
-    fn new(preset: &str, rules: Vec<Rules>, max_rounds: Option<u8>) -> PyResult<Self> {
+    #[pyo3(signature = (preset = "standard", *, rules = Vec::new(), max_rounds = None, float_values = false, refuse = Vec::new()))]
+    fn new(
+        preset: &str,
+        rules: Vec<Rules>,
+        max_rounds: Option<u8>,
+        float_values: bool,
+        refuse: Vec<String>,
+    ) -> PyResult<Self> {
         let standard = match preset {
             "standard" => true,
             "deobfuscate" => false,
@@ -1767,9 +1859,10 @@ impl PyEngine {
                 )));
             }
         };
-        if rules.is_empty() && max_rounds.is_none() {
+        if rules.is_empty() && max_rounds.is_none() && !float_values {
             return Ok(PyEngine {
                 engine: self::preset(preset)?,
+                refuse,
             });
         }
         let mut programs = Vec::new();
@@ -1788,7 +1881,8 @@ impl PyEngine {
             programs.push((program, ledger));
         }
         Ok(PyEngine {
-            engine: build(standard, programs, max_rounds)?,
+            engine: build(standard, programs, max_rounds, float_values)?,
+            refuse,
         })
     }
 
@@ -1797,6 +1891,7 @@ impl PyEngine {
     fn standard() -> PyResult<Self> {
         Ok(PyEngine {
             engine: preset("standard")?,
+            refuse: Vec::new(),
         })
     }
 
@@ -1805,6 +1900,7 @@ impl PyEngine {
     fn deobfuscate() -> PyResult<Self> {
         Ok(PyEngine {
             engine: preset("deobfuscate")?,
+            refuse: Vec::new(),
         })
     }
 
@@ -1818,9 +1914,33 @@ impl PyEngine {
         assumptions: Option<&PyAssumptions>,
     ) -> PyResult<PyExpr> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
-        Ok(run(py, &self.engine, &[&expr], budget, assumptions)?
+        Ok(run(py, self, &[&expr], budget, assumptions, None)?
             .remove(0)
             .expr)
+    }
+
+    /// The expression simplified, and each rewrite on the way: (rule or pass, before, after).
+    #[pyo3(signature = (expr, *, budget = None, assumptions = None))]
+    fn trace(
+        &self,
+        py: Python<'_>,
+        expr: PyRef<'_, PyExpr>,
+        budget: Option<&PyBudget>,
+        assumptions: Option<&PyAssumptions>,
+    ) -> PyResult<(PyExpr, Vec<Step>)> {
+        let budget = budget.map_or_else(Budget::default, |b| b.b);
+        let mut trace = Trace::default();
+        let out = run(py, self, &[&expr], budget, assumptions, Some(&mut trace))?
+            .remove(0)
+            .expr;
+        let cx = expr.cx.bind(py);
+        let c = cx.get().lock(py);
+        let steps = trace
+            .0
+            .iter()
+            .map(|(by, b, a)| Ok((by.clone(), wrap(cx, &c, *b)?, wrap(cx, &c, *a)?)))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok((out, steps))
     }
 
     /// Simplifies expressions of one context in one call (they share work); an `Outcome` each.
@@ -1834,7 +1954,7 @@ impl PyEngine {
     ) -> PyResult<Vec<Outcome>> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let refs: Vec<&PyExpr> = exprs.iter().map(|e| &**e).collect();
-        run(py, &self.engine, &refs, budget, assumptions)
+        run(py, self, &refs, budget, assumptions, None)
     }
 
     fn __repr__(&self) -> String {
@@ -1905,5 +2025,18 @@ fn _bitwright(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("RuleError", py.get_type::<RuleError>())?;
     m.add_function(wrap_pyfunction!(check_rules, m)?)?;
     m.add_function(wrap_pyfunction!(simplify, m)?)?;
+    m.add_class::<more::PyMemory>()?;
+    m.add_class::<more::LiftedBlock>()?;
+    m.add_class::<more::TransformReport>()?;
+    m.add_class::<more::InferredPrecondition>()?;
+    m.add_function(wrap_pyfunction!(more::equivalent, m)?)?;
+    m.add_function(wrap_pyfunction!(more::synthesize, m)?)?;
+    m.add_function(wrap_pyfunction!(more::saturate, m)?)?;
+    m.add_function(wrap_pyfunction!(more::lift_pcode, m)?)?;
+    m.add_function(wrap_pyfunction!(more::lift_vex, m)?)?;
+    m.add_function(wrap_pyfunction!(more::lift_llvm, m)?)?;
+    m.add_function(wrap_pyfunction!(more::verify_transforms, m)?)?;
+    m.add_function(wrap_pyfunction!(more::validate_functions, m)?)?;
+    m.add_function(wrap_pyfunction!(more::infer_preconditions, m)?)?;
     Ok(())
 }

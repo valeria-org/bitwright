@@ -25,6 +25,7 @@ use bw::{
     ParseOptions, PrintOptions, Query, Reliance, SymbolKey, Truth, UnOp, View, Width,
 };
 
+mod more;
 #[cfg(test)]
 mod tests;
 
@@ -404,6 +405,24 @@ pub struct BwAssumptions {
 #[derive(Debug)]
 pub struct BwEngine {
     engine: Engine,
+    /// Rules and passes whose rewrites are refused, by name.
+    refuse: Vec<String>,
+}
+
+/// Refuses the rewrites of the named rules and passes.
+struct Refuse<'a>(&'a [String]);
+
+impl bw::engine::Hooks for Refuse<'_> {
+    fn admit(&self, _: &Context, _: Expr, _: Expr, by: bw::engine::By<'_>) -> bool {
+        !self.0.iter().any(|n| n == by.name())
+    }
+
+    fn revision(&self) -> u64 {
+        self.0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, n| {
+            n.bytes()
+                .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+        })
+    }
 }
 
 /// `bw_engine_builder`.
@@ -412,6 +431,8 @@ pub struct BwEngineBuilder {
     preset: c_int,
     programs: Vec<(RuleProgram, Ledger)>,
     max_rounds: Option<u8>,
+    float_values: bool,
+    refuse: Vec<String>,
 }
 
 /// `bw_smt_import`.
@@ -1453,6 +1474,8 @@ impl BwEngineBuilder {
             preset,
             programs: Vec::new(),
             max_rounds: None,
+            float_values: false,
+            refuse: Vec::new(),
         })
     }
 
@@ -1476,6 +1499,7 @@ impl BwEngineBuilder {
         if let Some(n) = self.max_rounds {
             strategy = strategy.with_max_rounds(n);
         }
+        strategy = strategy.with_float_values(self.float_values);
         b.strategy(strategy)
             .build()
             .map_err(|e| Fail(BW_ERR_RULES, e.to_string()))
@@ -1503,6 +1527,7 @@ pub extern "C" fn bw_engine_new(preset: c_int) -> *mut BwEngine {
     run_new(|| {
         Ok(BwEngine {
             engine: preset_engine(preset)?,
+            refuse: Vec::new(),
         })
     })
 }
@@ -1606,12 +1631,13 @@ pub unsafe extern "C" fn bw_engine_builder_build(
     run(|| {
         let b = unsafe { get(b, "b") }?;
         let out = Out::new(out, "out")?;
-        let engine = if b.programs.is_empty() && b.max_rounds.is_none() {
+        let engine = if b.programs.is_empty() && b.max_rounds.is_none() && !b.float_values {
             preset_engine(b.preset)?
         } else {
             b.build()?
         };
-        unsafe { out.set(Box::into_raw(Box::new(BwEngine { engine }))) };
+        let refuse = b.refuse.clone();
+        unsafe { out.set(Box::into_raw(Box::new(BwEngine { engine, refuse }))) };
         Ok(())
     })
 }
@@ -1699,10 +1725,15 @@ pub unsafe extern "C" fn bw_simplify(
     out: *mut u64,
 ) -> c_int {
     run(|| {
-        let engine = &unsafe { get(engine, "engine") }?.engine;
+        let engine = unsafe { get(engine, "engine") }?;
         let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
         let out = Out::new(out, "out")?;
-        let r = engine.simplify(cx, expr(e)?)?;
+        let refuse = Refuse(&engine.refuse);
+        let mut options = Run::default();
+        if !engine.refuse.is_empty() {
+            options = options.with_hooks(&refuse);
+        }
+        let r = engine.engine.run(cx, &[expr(e)?], options)?.roots[0];
         unsafe { out.set(r.expr.to_bits()) };
         Ok(())
     })
@@ -1722,7 +1753,9 @@ pub unsafe extern "C" fn bw_engine_run(
     outcomes: *mut BwOutcome,
 ) -> c_int {
     run(|| {
-        let engine = &unsafe { get(engine, "engine") }?.engine;
+        let bw_engine = unsafe { get(engine, "engine") }?;
+        let engine = &bw_engine.engine;
+        let refuse = Refuse(&bw_engine.refuse);
         let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
         let roots = exprs(unsafe { slice(roots, n, "roots") }?)?;
         let per_call = match unsafe { b.as_ref() } {
@@ -1736,6 +1769,9 @@ pub unsafe extern "C" fn bw_engine_run(
         let mut options = Run::default().with_per_call(per_call);
         if let Some(a) = a {
             options = options.with_assumptions(a);
+        }
+        if !bw_engine.refuse.is_empty() {
+            options = options.with_hooks(&refuse);
         }
         let out = engine.run(cx, &roots, options)?;
         for (i, r) in out.roots.iter().enumerate() {

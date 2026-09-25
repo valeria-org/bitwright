@@ -540,6 +540,14 @@ fn expect_label(c: &mut Cursor<'_>, blocks: &HashMap<String, usize>) -> Result<u
     }
 }
 
+/// One function as the source of a transformation without a target (for lifting).
+pub(crate) fn single(f: &FnText) -> Result<Transform, SyntaxError> {
+    let mut t = Transform::new(f.name.clone());
+    t.src = body(&mut t, f, None)?;
+    t.tgt.returns_value = t.src.returns_value;
+    Ok(t)
+}
+
 /// The transformation that `tgt` refines `src`: two functions of one signature, their
 /// parameters the shared inputs by position.
 pub fn function_pair(src: &FnText, tgt: &FnText) -> Result<Transform, SyntaxError> {

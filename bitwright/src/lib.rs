@@ -92,6 +92,7 @@ mod facts;
 pub mod fp;
 mod hash;
 mod invert;
+pub mod lift;
 #[cfg(feature = "mba")]
 pub mod mba;
 pub mod memory;
@@ -127,6 +128,9 @@ mod book {
     struct Extensions;
     #[doc = include_str!("../../book/src/memory.md")]
     struct MemoryChapter;
+    #[cfg(feature = "mba")]
+    #[doc = include_str!("../../book/src/lifting.md")]
+    struct Lifting;
     #[doc = include_str!("../../book/src/simplifying.md")]
     struct Simplifying;
     #[cfg(feature = "check")]

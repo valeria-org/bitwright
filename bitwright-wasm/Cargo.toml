@@ -1,0 +1,26 @@
+[package]
+name = "bitwright-wasm"
+description = "bitwright for WebAssembly: a string API for JavaScript (js/bitwright.mjs), no bindings generator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+doc = false
+
+[dependencies]
+bw = { package = "bitwright", path = "../bitwright", features = ["check", "smtlib", "mba"] }
+
+# The workspace forbids `unsafe`; reading and writing the module's memory for JavaScript cannot
+# avoid it, so this crate keeps it to the buffers at the boundary.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -214,6 +214,23 @@ pub(crate) fn typing(t: &Transform) -> Result<Typing, String> {
                             uf.union(i, a[2])?;
                         }
                         Op::Freeze | Op::Copy => uf.union(i, a[0])?,
+                        Op::Load => {
+                            uf.fix(a[0], Ty::Int(64))?;
+                        }
+                        Op::Store => {
+                            uf.fix(i, bool_ty)?;
+                            uf.fix(a[1], Ty::Int(64))?;
+                        }
+                        Op::Gep(_) => {
+                            uf.fix(i, Ty::Int(64))?;
+                            uf.fix(a[0], Ty::Int(64))?;
+                            uf.set_kind(a[1], Kind::Int)?;
+                        }
+                        Op::Alloca => uf.fix(i, Ty::Int(64))?,
+                        Op::Resize => {
+                            uf.set_kind(i, Kind::Int)?;
+                            uf.set_kind(a[0], Kind::Int)?;
+                        }
                         Op::Trunc => {
                             uf.set_kind(i, Kind::Int)?;
                             uf.set_kind(a[0], Kind::Int)?;
