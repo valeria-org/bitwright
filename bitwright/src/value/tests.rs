@@ -386,6 +386,48 @@ fn every_width_sweep() {
     }
 }
 
+/// Limb division against shift-subtract division: operands of every significant length, and
+/// limbs near the base's edges, where the quotient estimates need correcting.
+#[test]
+fn limb_division_matches_bitwise_division() {
+    let mut rng = Rng(0x5eed_0004);
+    let edge = |rng: &mut Rng| match rng.below(6) {
+        0 => 0,
+        1 => u64::MAX,
+        2 => 1 << 63,
+        3 => (1 << 63) - 1,
+        4 => u64::MAX - rng.below(4),
+        _ => rng.next(),
+    };
+    for _ in 0..20_000 {
+        let w = [64u16, 65, 127, 128, 129, 192, 256, 300, 384, 448, 511, 512][rng.below(12) as usize];
+        let n = wide::nlimbs(w);
+        let mut value = |rng: &mut Rng| {
+            let len = 1 + rng.below(n as u64) as usize;
+            let mut l = [0u64; wide::MAX_LIMBS];
+            for x in l.iter_mut().take(len) {
+                *x = edge(rng);
+            }
+            wide::mask_top(&mut l, w);
+            l
+        };
+        let a = value(&mut rng);
+        let mut b = value(&mut rng);
+        if rng.below(4) == 0 {
+            // A divisor sharing the dividend's top limbs, so estimates are too large.
+            let k = rng.below(n as u64) as usize;
+            b[..=k].copy_from_slice(&a[..=k]);
+            b[k] = b[k].wrapping_sub(rng.below(3));
+            wide::mask_top(&mut b, w);
+        }
+        assert_eq!(
+            wide::udivrem(w, &a, &b),
+            wide::udivrem_bits(w, &a, &b),
+            "udivrem at {w}: {a:x?} / {b:x?}"
+        );
+    }
+}
+
 #[test]
 fn random_wide_widths() {
     random_wide_battery(150, 0x5eed_0001);

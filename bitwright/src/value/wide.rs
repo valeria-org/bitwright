@@ -196,14 +196,106 @@ pub(crate) fn smulhi(w: u16, a: &Limbs, b: &Limbs) -> Limbs {
 
 /// Unsigned quotient and remainder with the SMT-LIB conventions for a zero divisor.
 ///
-/// Shift-subtract long division, one quotient bit per step over whole limbs (about 3 µs at 512
-/// bits). Wide division is rare in practice; Knuth's algorithm D is the planned replacement if
-/// profiling ever shows it matters.
+/// Long division one limb at a time (Knuth, TAOCP vol. 2, 4.3.1, algorithm D): the divisor is
+/// shifted so its top limb has its top bit set, which makes each estimate of a quotient limb
+/// from the top two limbs of the remainder at most two too large; a test against the next limb
+/// removes most of that, and a final add-back the rest.
 pub(crate) fn udivrem(w: u16, a: &Limbs, b: &Limbs) -> (Limbs, Limbs) {
     if is_zero(b) {
         return (ones(w), *a);
     }
-    // Binary long division with one extra limb for the remainder's shifted-out bit.
+    let len = |x: &Limbs| x.iter().rposition(|&l| l != 0).map_or(0, |i| i + 1);
+    let (m, n) = (len(a), len(b));
+    let mut q = [0u64; MAX_LIMBS];
+    if m < n {
+        return (q, *a);
+    }
+    if n == 1 {
+        let d = u128::from(b[0]);
+        let mut r = 0u128;
+        for i in (0..m).rev() {
+            let cur = (r << 64) | u128::from(a[i]);
+            q[i] = (cur / d) as u64;
+            r = cur % d;
+        }
+        return (q, small(r as u64));
+    }
+    // Normalize: v = b << s, u = a << s (one limb longer).
+    let s = b[n - 1].leading_zeros();
+    let shl = |x: &[u64], i: usize| {
+        let lo = if i > 0 && s > 0 { x[i - 1] >> (64 - s) } else { 0 };
+        (x.get(i).copied().unwrap_or(0) << s) | lo
+    };
+    let mut v = [0u64; MAX_LIMBS];
+    for (i, x) in v.iter_mut().enumerate().take(n) {
+        *x = shl(&b[..n], i);
+    }
+    let mut u = [0u64; MAX_LIMBS + 1];
+    for (i, x) in u.iter_mut().enumerate().take(m + 1) {
+        *x = shl(&a[..m], i);
+    }
+    const BASE: u128 = 1 << 64;
+    let top = u128::from(v[n - 1]);
+    let next = u128::from(v[n - 2]);
+    for j in (0..=m - n).rev() {
+        // The estimate from the top two limbs, at most B - 1 (the quotient limb is).
+        let num = (u128::from(u[j + n]) << 64) | u128::from(u[j + n - 1]);
+        let mut qhat = num / top;
+        let mut rhat = num % top;
+        if qhat >= BASE {
+            rhat += (qhat - (BASE - 1)) * top;
+            qhat = BASE - 1;
+        }
+        while rhat < BASE && qhat * next > ((rhat << 64) | u128::from(u[j + n - 2])) {
+            qhat -= 1;
+            rhat += top;
+        }
+        // u[j..=j+n] -= qhat * v.
+        let mut carry = 0u128;
+        let mut borrow = false;
+        for i in 0..n {
+            let p = qhat * u128::from(v[i]) + carry;
+            carry = p >> 64;
+            let (d1, b1) = u[i + j].overflowing_sub(p as u64);
+            let (d2, b2) = d1.overflowing_sub(u64::from(borrow));
+            u[i + j] = d2;
+            borrow = b1 | b2;
+        }
+        let (d1, b1) = u[j + n].overflowing_sub(carry as u64);
+        let (d2, b2) = d1.overflowing_sub(u64::from(borrow));
+        u[j + n] = d2;
+        if b1 | b2 {
+            // One too large: add the divisor back.
+            qhat -= 1;
+            let mut c = 0u128;
+            for i in 0..n {
+                let t = u128::from(u[i + j]) + u128::from(v[i]) + c;
+                u[i + j] = t as u64;
+                c = t >> 64;
+            }
+            u[j + n] = u[j + n].wrapping_add(c as u64);
+        }
+        q[j] = qhat as u64;
+    }
+    // The remainder is u >> s, in n limbs.
+    let mut r = [0u64; MAX_LIMBS];
+    for (i, x) in r.iter_mut().enumerate().take(n) {
+        *x = if s == 0 {
+            u[i]
+        } else {
+            (u[i] >> s) | (u[i + 1] << (64 - s))
+        };
+    }
+    (q, r)
+}
+
+/// Shift-subtract long division, one quotient bit per step: the reference [`udivrem`] is
+/// tested against.
+#[cfg(test)]
+pub(crate) fn udivrem_bits(w: u16, a: &Limbs, b: &Limbs) -> (Limbs, Limbs) {
+    if is_zero(b) {
+        return (ones(w), *a);
+    }
     let mut q = [0u64; MAX_LIMBS];
     let mut r = [0u64; MAX_LIMBS + 1];
     for i in (0..w as usize).rev() {
