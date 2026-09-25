@@ -18,6 +18,21 @@
   (standard, and deobfuscation with the MBA service) equal it, and that it survives SMT-LIB
   export and import. CI fuzzes it nightly with the others; `smt_import` has a floating-point
   seed.
+- **More built-in rules**, for identities the comparison with z3 and Bitwuzla found missing
+  (`compare/facts/`): `core.factor` takes shifts, rotations, extensions, truncations and
+  extracts out of `&`, `|` and `^` (and left shifts out of `+` and `-`), and moves complements
+  through arithmetic shifts and rotations; `core.select_idioms` simplifies selects whose arms
+  share a term or repeat the condition, selects guarded by an equality, and the branchless
+  choices `(x & m) | (y & ~m)`, `y ^ ((x ^ y) & m)` and `(x & -zext(c)) | (y & (zext(c) − 1))`
+  with a mask of a condition (so the branchless minimum `y ^ ((x ^ y) & -(x <u y))` is
+  `select(x <u y, x, y)`); `core.division` has the remainder of a value by itself, a
+  remainder reduced twice, the division identities and signed division of a nonnegative value
+  by a power of two; `core.sign_tests` reads the sign bit and sign mask (`zext(x <s 0)` is
+  `x >>u (W − 1)`, `(x & smin) != 0` is `x <s 0`) and flips between signed and unsigned order
+  through the sign bit; `core.bounds` decides `x & y <=u x`, `x <=u x | y`, shifts, quotients
+  and remainders at most their dividend, a remainder below its divisor, the wraparounds of
+  `x ± 1`, and the no-overflow sum of halves. `core.casts::trunc_and_zext` is gone: the new
+  rules subsume it.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
@@ -27,6 +42,7 @@
   behavior with `.mba_solver(Arc::new(SignatureSolver))` and
   `MbaTrust::default().with_backend_certificates(true)`. The command line and the bindings
   already used these settings; their results do not change.
+  The new rules change results wherever they apply.
 
 ## 0.10.0
 

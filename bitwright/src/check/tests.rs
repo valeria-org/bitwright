@@ -434,23 +434,27 @@ fn application_is_sound(p: &RuleProgram) {
                 .iter()
                 .map(|q| q.width.eval(ws) as u16)
                 .collect();
-            let consts: Vec<BitVec> = pw
-                .iter()
-                .map(|&w| {
-                    let w16 = Width::new(w).unwrap();
-                    match g.rng.below(5) {
-                        0 => {
-                            let k = BitVec::wrapping_from_u64(w16, g.rng.below(u64::from(w)));
-                            BitVec::apply_bin(crate::BinOp::Shl, &BitVec::one(w16), &k).unwrap()
-                        }
-                        1 => BitVec::wrapping_from_u64(
-                            w16,
-                            (1u64 << g.rng.below(u64::from(w) + 1)) - 1,
-                        ),
-                        _ => g.constant(w),
+            // Powers of two, low masks, values below the width (shift amounts), random values,
+            // and the complement of the previous constant of the same width (guards pairing
+            // complementary masks).
+            let mut consts: Vec<BitVec> = Vec::new();
+            for &w in &pw {
+                let w16 = Width::new(w).unwrap();
+                let prev = consts.iter().rev().find(|c| c.width() == w16).copied();
+                let c = match (g.rng.below(6), prev) {
+                    (0, _) => {
+                        let k = BitVec::wrapping_from_u64(w16, g.rng.below(u64::from(w)));
+                        BitVec::apply_bin(crate::BinOp::Shl, &BitVec::one(w16), &k).unwrap()
                     }
-                })
-                .collect();
+                    (1, _) => {
+                        BitVec::wrapping_from_u64(w16, (1u64 << g.rng.below(u64::from(w) + 1)) - 1)
+                    }
+                    (2, _) => BitVec::wrapping_from_u64(w16, g.rng.below(u64::from(w))),
+                    (5, Some(p)) => BitVec::apply_un(crate::UnOp::Not, &p).unwrap(),
+                    _ => g.constant(w),
+                };
+                consts.push(c);
+            }
             let Some(root) = crate::rules::matcher::build_pattern(&mut cx, rule, ws, &consts)
             else {
                 continue;

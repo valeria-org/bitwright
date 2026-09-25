@@ -333,12 +333,6 @@ group core.casts {
     rule sext_from_sign_word<W, U>(a: W) where W < U, U <= 2 * W {
         zext<U>(a) | (zext<U>(a >>s (W - 1)) << W) => sext<U>(a)
     }
-
-    /// The low bits of a zero extension's operand.
-    #[example("trunc<8>(zext<16>(p) & zext<16>(q))" => "p & q")]
-    rule trunc_and_zext<W, U>(a: W, b: W) where W < U {
-        trunc<W>(zext<U>(a) & zext<U>(b)) => a & b
-    }
 }
 
 group core.select {
@@ -749,6 +743,279 @@ group core.guarded_recovery_concat {
 // Floating point. Construction already applies what holds bit for bit on every encoding; these
 // need a constant of a kind or the facts (an operand that is no NaN: a NaN operand gives the
 // canonical NaN, and an identity on values would keep its payload).
+group core.factor {
+    /// A left shift distributes over `&`, so the shift of the conjunction is one shift.
+    #[example("(p << 3) & (q << 3)" => "(p & q) << 3")]
+    rule shl_and<W>(x: W, y: W, s: W) { (x << s) & (y << s) => (x & y) << s }
+    /// Likewise over `|`.
+    #[example("(p << 3) | (q << 3)" => "(p | q) << 3")]
+    rule shl_or<W>(x: W, y: W, s: W) { (x << s) | (y << s) => (x | y) << s }
+    /// Likewise over `^`.
+    #[example("(p << 3) ^ (q << 3)" => "(p ^ q) << 3")]
+    rule shl_xor<W>(x: W, y: W, s: W) { (x << s) ^ (y << s) => (x ^ y) << s }
+    /// A left shift multiplies by a power of two (or by 0), which distributes over `+`.
+    #[example("(p << 3) + (q << 3)" => "(p + q) << 3")]
+    rule shl_add<W>(x: W, y: W, s: W) { (x << s) + (y << s) => (x + y) << s }
+    /// And over `-`.
+    #[example("(p << 3) - (q << 3)" => "(p - q) << 3")]
+    rule shl_sub<W>(x: W, y: W, s: W) { (x << s) - (y << s) => (x - y) << s }
+    /// A logical right shift moves every bit alike, so it distributes over `&`.
+    #[example("(p >>u 3) & (q >>u 3)" => "(p & q) >>u 3")]
+    rule lshr_and<W>(x: W, y: W, s: W) { (x >>u s) & (y >>u s) => (x & y) >>u s }
+    /// Likewise over `|`.
+    #[example("(p >>u 3) | (q >>u 3)" => "(p | q) >>u 3")]
+    rule lshr_or<W>(x: W, y: W, s: W) { (x >>u s) | (y >>u s) => (x | y) >>u s }
+    /// Likewise over `^`.
+    #[example("(p >>u 3) ^ (q >>u 3)" => "(p ^ q) >>u 3")]
+    rule lshr_xor<W>(x: W, y: W, s: W) { (x >>u s) ^ (y >>u s) => (x ^ y) >>u s }
+    /// An arithmetic right shift copies the sign bit, a bit like the others, so it distributes
+    /// over `&`.
+    #[example("(p >>s 3) & (q >>s 3)" => "(p & q) >>s 3")]
+    rule ashr_and<W>(x: W, y: W, s: W) { (x >>s s) & (y >>s s) => (x & y) >>s s }
+    /// Likewise over `|`.
+    #[example("(p >>s 3) | (q >>s 3)" => "(p | q) >>s 3")]
+    rule ashr_or<W>(x: W, y: W, s: W) { (x >>s s) | (y >>s s) => (x | y) >>s s }
+    /// Likewise over `^`.
+    #[example("(p >>s 3) ^ (q >>s 3)" => "(p ^ q) >>s 3")]
+    rule ashr_xor<W>(x: W, y: W, s: W) { (x >>s s) ^ (y >>s s) => (x ^ y) >>s s }
+    /// An arithmetic right shift commutes with complement.
+    #[example("~(~p >>s 3)" => "p >>s 3")]
+    rule not_ashr_not<W>(x: W, s: W) { ~(~x >>s s) => x >>s s }
+    /// A rotation moves every bit alike, so it distributes over `&`.
+    #[example("rotl(p, 3) & rotl(q, 3)" => "rotl(p & q, 3)")]
+    rule rotl_and<W>(x: W, y: W, s: W) { rotl(x, s) & rotl(y, s) => rotl(x & y, s) }
+    /// Likewise over `|`.
+    #[example("rotl(p, 3) | rotl(q, 3)" => "rotl(p | q, 3)")]
+    rule rotl_or<W>(x: W, y: W, s: W) { rotl(x, s) | rotl(y, s) => rotl(x | y, s) }
+    /// Likewise over `^`.
+    #[example("rotl(p, 3) ^ rotl(q, 3)" => "rotl(p ^ q, 3)")]
+    rule rotl_xor<W>(x: W, y: W, s: W) { rotl(x, s) ^ rotl(y, s) => rotl(x ^ y, s) }
+    /// A rotation commutes with complement.
+    #[example("~rotl(~p, 3)" => "rotl(p, 3)")]
+    rule not_rotl_not<W>(x: W, s: W) { ~rotl(~x, s) => rotl(x, s) }
+    /// Zero extension distributes over `&`.
+    #[example("zext<16>(p) & zext<16>(q)" => "zext<16>(p & q)")]
+    rule zext_and<W, U>(x: W, y: W) where W < U { zext<U>(x) & zext<U>(y) => zext<U>(x & y) }
+    /// Likewise over `|`.
+    #[example("zext<16>(p) | zext<16>(q)" => "zext<16>(p | q)")]
+    rule zext_or<W, U>(x: W, y: W) where W < U { zext<U>(x) | zext<U>(y) => zext<U>(x | y) }
+    /// Likewise over `^`.
+    #[example("zext<16>(p) ^ zext<16>(q)" => "zext<16>(p ^ q)")]
+    rule zext_xor<W, U>(x: W, y: W) where W < U { zext<U>(x) ^ zext<U>(y) => zext<U>(x ^ y) }
+    /// Sign extension copies the top bit, a bit like the others: it distributes over `&`.
+    #[example("sext<16>(p) & sext<16>(q)" => "sext<16>(p & q)")]
+    rule sext_and<W, U>(x: W, y: W) where W < U { sext<U>(x) & sext<U>(y) => sext<U>(x & y) }
+    /// Likewise over `|`.
+    #[example("sext<16>(p) | sext<16>(q)" => "sext<16>(p | q)")]
+    rule sext_or<W, U>(x: W, y: W) where W < U { sext<U>(x) | sext<U>(y) => sext<U>(x | y) }
+    /// Likewise over `^`.
+    #[example("sext<16>(p) ^ sext<16>(q)" => "sext<16>(p ^ q)")]
+    rule sext_xor<W, U>(x: W, y: W) where W < U { sext<U>(x) ^ sext<U>(y) => sext<U>(x ^ y) }
+    /// A slice of each operand of `&` is the slice of the conjunction.
+    #[example("extract<4, 4>(p) & extract<4, 4>(q)" => "extract<4, 4>(p & q)")]
+    rule extract_and<W, N, L>(x: W, y: W) where N + L <= W, N < W {
+        extract<L, N>(x) & extract<L, N>(y) => extract<L, N>(x & y)
+    }
+    /// Likewise for `|`.
+    #[example("extract<4, 4>(p) | extract<4, 4>(q)" => "extract<4, 4>(p | q)")]
+    rule extract_or<W, N, L>(x: W, y: W) where N + L <= W, N < W {
+        extract<L, N>(x) | extract<L, N>(y) => extract<L, N>(x | y)
+    }
+    /// Likewise for `^`.
+    #[example("extract<4, 4>(p) ^ extract<4, 4>(q)" => "extract<4, 4>(p ^ q)")]
+    rule extract_xor<W, N, L>(x: W, y: W) where N + L <= W, N < W {
+        extract<L, N>(x) ^ extract<L, N>(y) => extract<L, N>(x ^ y)
+    }
+    /// The low bits of each operand of `&` are the low bits of the conjunction.
+    #[example("trunc<4>(p) & trunc<4>(q)" => "trunc<4>(p & q)")]
+    rule trunc_and<W, N>(x: W, y: W) where N < W { trunc<N>(x) & trunc<N>(y) => trunc<N>(x & y) }
+    /// Likewise for `|`.
+    #[example("trunc<4>(p) | trunc<4>(q)" => "trunc<4>(p | q)")]
+    rule trunc_or<W, N>(x: W, y: W) where N < W { trunc<N>(x) | trunc<N>(y) => trunc<N>(x | y) }
+    /// Likewise for `^`.
+    #[example("trunc<4>(p) ^ trunc<4>(q)" => "trunc<4>(p ^ q)")]
+    rule trunc_xor<W, N>(x: W, y: W) where N < W { trunc<N>(x) ^ trunc<N>(y) => trunc<N>(x ^ y) }
+}
+
+group core.select_idioms {
+    /// Both arms add the same term.
+    #[example("select(p <u q, p + r, q + r)" => "select(p <u q, p, q) + r")]
+    rule select_add<W>(c: 1, x: W, y: W, z: W) { select(c, x + z, y + z) => select(c, x, y) + z }
+    /// Both arms xor the same term.
+    #[example("select(p <u q, p ^ r, q ^ r)" => "select(p <u q, p, q) ^ r")]
+    rule select_xor<W>(c: 1, x: W, y: W, z: W) { select(c, x ^ z, y ^ z) => select(c, x, y) ^ z }
+    /// Both arms complement.
+    #[example("select(p <u q, ~p, ~q)" => "~select(p <u q, p, q)")]
+    rule select_not<W>(c: 1, x: W, y: W) { select(c, ~x, ~y) => ~select(c, x, y) }
+    /// The same condition again in the chosen arm.
+    #[example("select(p <u q, select(p <u q, p, q), r)" => "select(p <u q, p, r)")]
+    rule select_then_same<W>(c: 1, x: W, y: W, z: W) { select(c, select(c, x, y), z) => select(c, x, z) }
+    /// The same condition again in the other arm.
+    #[example("select(p <u q, r, select(p <u q, p, q))" => "select(p <u q, r, q)")]
+    rule select_else_same<W>(c: 1, x: W, y: W, z: W) { select(c, x, select(c, y, z)) => select(c, x, z) }
+    /// Choosing `x` when it equals `y`, else `y`: always `y` (`==` is commutative, so this is
+    /// also `select(y == x, x, y)`).
+    #[example("select(p == q, p, q)" => "q")]
+    #[example("select(p == q, q, p)" => "p")]
+    rule select_eq_then<W>(x: W, y: W) { select(x == y, x, y) => y }
+    /// When `x == y`, `x - y` is 0.
+    #[example("select(p == q, p - q, 0)" => "0")]
+    rule select_eq_difference<W>(x: W, y: W) { select(x == y, x - y, 0) => 0 }
+    /// When `x == c`, `x + d` is `c + d`.
+    #[example("select(p == 5, p + 1, 6)" => "6")]
+    rule select_eq_offset<W>(x: W, c: const W, d: const W, e: const W) {
+        select(x == c, x + d, e) => e if e == c + d
+    }
+    /// When `x == 0`, `x + y` is `y`.
+    #[example("select(p == 0, p + q, q)" => "q")]
+    rule select_zero_sum<W>(x: W, y: W) { select(x == 0, x + y, y) => y }
+    /// Choosing by a mask: `m` all ones takes `x`, all zeros `y`.
+    #[example("(p & sext<8>(r:1)) | (q & ~sext<8>(r:1))" => "select(r:1, p, q)")]
+    rule select_by_mask<W>(c: 1, x: W, y: W) where 1 < W {
+        (x & sext<W>(c)) | (y & ~sext<W>(c)) => select(c, x, y)
+    }
+    /// Choosing by a mask with xor: `y ^ ((x ^ y) & m)`.
+    #[example("q ^ ((p ^ q) & sext<8>(r:1))" => "select(r:1, p, q)")]
+    rule select_by_xor_mask<W>(c: 1, x: W, y: W) where 1 < W {
+        ((x ^ y) & sext<W>(c)) ^ y => select(c, x, y)
+    }
+    /// The xor-mask choice once the mask became a select.
+    #[example("select(r:1, p ^ q, 0) ^ q" => "select(r:1, p, q)")]
+    rule select_xor_zero<W>(c: 1, x: W, y: W) { select(c, x ^ y, 0) ^ y => select(c, x, y) }
+    /// `zext(c) - 1` is all ones when `c` is false and zero when it is true: a mask. (With the
+    /// rules that make `x & -zext(c)` a select and merge complementary selects, the branchless
+    /// choice `(x & -zext(c)) | (y & (zext(c) - 1))` becomes `select(c, x, y)`.)
+    #[example("(zext<8>(r:1) - 1) & q" => "select(r:1, 0, q)")]
+    rule mask_by_decremented_bit<W>(c: 1, y: W) where 1 < W {
+        (zext<W>(c) + ones) & y => select(c, 0, y)
+    }
+}
+
+group core.division {
+    /// `x` divided by itself leaves no remainder (and `x mod 0` is `x`, which is 0 then too).
+    #[example("urem(p, p)" => "0")]
+    rule urem_self<W>(x: W) { urem(x, x) => 0 }
+    /// Likewise signed.
+    #[example("srem(p, p)" => "0")]
+    rule srem_self<W>(x: W) { srem(x, x) => 0 }
+    /// A remainder is already reduced.
+    #[example("urem(urem(p, q), q)" => "urem(p, q)")]
+    rule urem_urem<W>(x: W, y: W) { urem(urem(x, y), y) => urem(x, y) }
+    /// Division identity: quotient times divisor plus remainder (a zero divisor included: its
+    /// quotient is all ones, times 0, and its remainder is `x`).
+    #[example("udiv(p, q) * q + urem(p, q)" => "p")]
+    rule udiv_identity<W>(x: W, y: W) { udiv(x, y) * y + urem(x, y) => x }
+    /// Likewise signed (for 0: a quotient of ±1 times 0, and the remainder `x`).
+    #[example("sdiv(p, q) * q + srem(p, q)" => "p")]
+    rule sdiv_identity<W>(x: W, y: W) { sdiv(x, y) * y + srem(x, y) => x }
+    /// Signed division of a value the facts show nonnegative by a positive power of two is a
+    /// logical right shift.
+    #[example("sdiv(p >>u 1, 8)" => "p >>u 1 >>u 3")]
+    rule sdiv_nonnegative_pow2<W>(x: W, c: const W) {
+        sdiv(x, c) => x >>u k if is_pow2(c) && 0 <s c && proves(0 <=s x) let k: W = ctz(c)
+    }
+}
+
+group core.sign_tests {
+    /// The sign bit of `x` as a word: `x >>u (W - 1)`.
+    #[example("zext<8>(p <s 0)" => "p >>u 7")]
+    rule zext_negative<W>(x: W) where 1 < W { zext<W>(x <s 0) => x >>u (W - 1) }
+    /// The sign mask of `x`: `x >>s (W - 1)`.
+    #[example("sext<8>(p <s 0)" => "p >>s 7")]
+    rule sext_negative<W>(x: W) where 1 < W { sext<W>(x <s 0) => x >>s (W - 1) }
+    /// The sign bit is clear: `x` is nonnegative.
+    #[example("(p >>u 7) == 0" => "0 <=s p")]
+    rule sign_bit_clear<W>(x: W) where 1 < W { (x >>u (W - 1)) == 0 => 0 <=s x }
+    /// The sign mask is 0: `x` is nonnegative.
+    #[example("(p >>s 7) == 0" => "0 <=s p")]
+    rule sign_mask_zero<W>(x: W) where 1 < W { (x >>s (W - 1)) == 0 => 0 <=s x }
+    /// The sign mask is all ones: `x` is negative.
+    #[example("(p >>s 7) == 0xff" => "p <s 0")]
+    rule sign_mask_ones<W>(x: W) where 1 < W { (x >>s (W - 1)) == ones => x <s 0 }
+    /// The sign bit tested through a mask.
+    #[example("(p & 0x80) != 0" => "p <s 0")]
+    rule sign_by_mask<W>(x: W) { (x & smin_lit) != 0 => x <s 0 }
+    /// The sign bit clear, tested through a mask.
+    #[example("(p & 0x80) == 0" => "0 <=s p")]
+    rule sign_clear_by_mask<W>(x: W) { (x & smin_lit) == 0 => 0 <=s x }
+    /// The sign mask's low bit is the sign bit.
+    #[example("(p >>s 7) & (p >>u 7)" => "p >>u 7")]
+    rule sign_mask_and_bit<W>(x: W) where 1 < W { (x >>s (W - 1)) & (x >>u (W - 1)) => x >>u (W - 1) }
+    /// The negated sign mask is the sign bit.
+    #[example("-(p >>s 7)" => "p >>u 7")]
+    rule neg_sign_mask<W>(x: W) where 1 < W { -(x >>s (W - 1)) => x >>u (W - 1) }
+    /// Flipping both sign bits turns an unsigned comparison into a signed one.
+    #[example("(p ^ 0x80) <u (q ^ 0x80)" => "p <s q")]
+    rule ult_sign_flipped<W>(x: W, y: W) { (x ^ smin_lit) <u (y ^ smin_lit) => x <s y }
+    /// And a signed one into an unsigned one.
+    #[example("(p ^ 0x80) <s (q ^ 0x80)" => "p <u q")]
+    rule slt_sign_flipped<W>(x: W, y: W) { (x ^ smin_lit) <s (y ^ smin_lit) => x <u y }
+    /// Adding the sign bit flips it (the builder's form of `x + smin`).
+    #[example("(p + 0x80) <u (q + 0x80)" => "p <s q")]
+    rule ult_offset_by_smin<W>(x: W, y: W) { (x + smin_lit) <u (y + smin_lit) => x <s y }
+    /// Likewise signed.
+    #[example("(p + 0x80) <s (q + 0x80)" => "p <u q")]
+    rule slt_offset_by_smin<W>(x: W, y: W) { (x + smin_lit) <s (y + smin_lit) => x <u y }
+    /// Zero-extended values are nonnegative, so their signed order is the unsigned one.
+    #[example("zext<16>(p) <s zext<16>(q)" => "p <u q")]
+    rule slt_zext<W, U>(x: W, y: W) where W < U { zext<U>(x) <s zext<U>(y) => x <u y }
+}
+
+group core.bounds {
+    /// A conjunction is at most each operand (so is `x & -x`, its lowest set bit).
+    #[example("(p & q) <=u p" => "true")]
+    #[example("(p & -p) <=u p" => "true")]
+    rule and_at_most<W>(x: W, y: W) { (x & y) <=u x => true }
+    /// No operand is below its conjunction with anything.
+    #[example("p <u (p & q)" => "false")]
+    rule and_not_above<W>(x: W, y: W) { x <u (x & y) => false }
+    /// A disjunction is at least each operand.
+    #[example("p <=u (p | q)" => "true")]
+    rule or_at_least<W>(x: W, y: W) { x <=u (x | y) => true }
+    /// No disjunction is below one of its operands.
+    #[example("(p | q) <u p" => "false")]
+    rule or_not_below<W>(x: W, y: W) { (x | y) <u x => false }
+    /// A conjunction is at most the disjunction.
+    #[example("(p & q) <=u (p | q)" => "true")]
+    rule and_at_most_or<W>(x: W, y: W) { (x & y) <=u (x | y) => true }
+    /// A logical right shift does not grow a value.
+    #[example("(p >>u 1) <=u p" => "true")]
+    rule lshr_at_most<W>(x: W, s: W) { (x >>u s) <=u x => true }
+    /// Nor does unsigned division (by 0 it is all ones... except that `x / 0` is all ones,
+    /// so only by a divisor the facts show nonzero).
+    #[example("udiv(p, q | 1) <=u p" => "true")]
+    rule udiv_at_most<W>(x: W, y: W) { udiv(x, y) <=u x => true if proves(y != 0) }
+    /// A remainder is at most the dividend (by 0 it is the dividend).
+    #[example("urem(p, q) <=u p" => "true")]
+    rule urem_at_most<W>(x: W, y: W) { urem(x, y) <=u x => true }
+    /// A remainder is below its divisor, or (for 0) at most `y - 1`, all ones.
+    #[example("urem(p, q) <=u q - 1" => "true")]
+    rule urem_below_divisor<W>(x: W, y: W) { urem(x, y) <=u (y + ones) => true }
+    /// `x - 1 < x` except at 0, where it wraps.
+    #[example("p - 1 <u p" => "p != 0")]
+    rule decrement_below<W>(x: W) { (x + ones) <u x => x != 0 }
+    /// `x + 1 < x` only at all ones, where it wraps.
+    #[example("p + 1 <u p" => "p == 0xff")]
+    rule increment_wraps<W>(x: W) { (x + 1) <u x => x == ones }
+    /// `x + 1 <s x` only at the signed maximum.
+    #[example("p + 1 <s p" => "p == 0x7f")]
+    rule signed_increment_wraps<W>(x: W) { (x + 1) <s x => x == smax_lit }
+    /// `x <s x + 1` except at the signed maximum.
+    #[example("p <s p + 1" => "p != 0x7f")]
+    rule signed_increment_grows<W>(x: W) { x <s (x + 1) => x != smax_lit }
+    /// The larger of two shifts right by constants leaves the smaller value.
+    #[allow(BW0402)] // the lint's probes use equal constants, which the builder folds
+    #[example("(p >>u 3) <=u (p >>u 1)" => "true")]
+    rule longer_shift_smaller<W>(x: W, a: const W, b: const W) {
+        (x >>u a) <=u (x >>u b) => true if b <=u a
+    }
+    /// Halves of two values never overflow their sum.
+    #[example("((p >>u 1) + (q >>u 1)) <u (p >>u 1)" => "false")]
+    rule halves_sum_no_overflow<W>(x: W, y: W) where 1 < W {
+        ((x >>u 1) + (y >>u 1)) <u (x >>u 1) => false
+    }
+}
+
 group core.float {
     /// Dividing by a power of two is multiplying by its reciprocal when that is a normal
     /// number: the two are the same real number, rounded once in the same mode, so every result
