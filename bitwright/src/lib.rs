@@ -101,6 +101,8 @@ pub mod prove;
 pub mod rules;
 #[cfg(feature = "smtlib")]
 pub mod smtlib;
+#[cfg(feature = "prove")]
+pub mod synth;
 #[cfg(test)]
 mod testutil;
 #[cfg(feature = "prove")]

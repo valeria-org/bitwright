@@ -217,3 +217,30 @@ assert_eq!(cx.display(out.expr).to_string(), "x + y");
 ```
 
 [Examples](examples.md) has one section for each of them.
+
+## Synthesis (feature `prove`)
+
+What no normal form or rule reduces can still have a small equal: `synth::synthesize` searches
+for one, whatever its shape. It enumerates expressions over the input's variables, the
+constants it mentions and a few others (0, 1, all ones, the width less one, the sign bit), by
+size, keeping one expression per behavior on a set of sample points; one that behaves like the
+input everywhere sampled is proved equal by the native prover, and a counterexample becomes a
+sample and the search starts over. An answer is always proved, and always smaller (as a DAG)
+than the input. The search is bounded (7 nodes, 4 variables, 64 bits by default), so it suits
+the small residue a simplification leaves, not a whole function. `bitwright simplify --synth`
+runs it on the simplifier's result.
+
+```rust
+use bitwright::engine::Engine;
+use bitwright::synth::{Config, synthesize};
+use bitwright::{Context, ParseOptions, Width};
+
+let mut cx = Context::new();
+let e = cx.parse("((x + y) & 1) ^ (x & 1)", &ParseOptions::width(Width::W32))?;
+// The simplifier moves the mask outward; parity reasoning is the synthesizer's.
+let out = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "(x + y ^ x) & 1");
+let s = synthesize(&mut cx, out.expr, &Config::default())?.unwrap();
+assert_eq!(cx.display(s).to_string(), "y & 1");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```

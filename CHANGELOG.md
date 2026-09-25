@@ -147,6 +147,11 @@
   interpreter and random sampling finds no difference in the mutants judged valid. Of the
   fast-math flags, `nnan`, `ninf` and `nsz` are modeled; `reassoc`, `arcp`, `contract` and
   `afn` are not.
+- **Synthesis** (`bitwright::synth`, feature `prove`): the smallest expression equal to a
+  given one over its variables and constants, whatever its shape, by bottom-up enumeration
+  with observational equivalence on sample points and counterexample-guided refinement, each
+  answer proved by the native prover (`((x + y) & 1) ^ (x & 1)` is `y & 1`). `bitwright
+  simplify --synth` runs it on the simplifier's result.
 - **Memory** (`bitwright::memory`): loads and stores over an array from addresses to cells
   (bytes, usually; little- or big-endian), resolved at construction into bitwright's own
   operators, so every service works on code that reads memory. A load reads through the

@@ -57,7 +57,7 @@ commands:
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
-           [--float-values]
+           [--float-values] [--synth]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
         Deobfuscates: the rules, the normal-form passes and the MBA service with the native
@@ -67,7 +67,9 @@ commands:
         `<file.bwr>.proof` if there is one (as `check --ledger` writes it), else checked now:
         exit 1 unless every rule is sound. `--float-values` also applies the rules that hold
         for floats as values, every NaN one value (`x · 1` is `x`): the result may then differ
-        from the input in a NaN's payload or sign.
+        from the input in a NaN's payload or sign. `--synth` then searches for a smaller
+        equal expression over the result's variables and constants (up to 7 nodes, at most
+        64 bits and 4 variables), proved equal.
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -723,8 +725,9 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "assume",
             "rules",
             "float-values",
+            "synth",
         ],
-        &["deobfuscate", "standard", "float-values"],
+        &["deobfuscate", "standard", "float-values", "synth"],
     )?;
     if a.flag("standard") && a.flag("deobfuscate") {
         return Err(usage("--standard and --deobfuscate exclude each other"));
@@ -786,7 +789,15 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         .run(&mut cx, &[e], Run::default().with_assumptions(&assumptions))
         .map_err(|e| Fail::Err(2, format!("{e}")))?
         .roots[0];
-    let mut text = format!("{}", cx.display(out.expr));
+    // Then, on request, the smallest equal expression the synthesizer finds (proved equal).
+    let mut result = out.expr;
+    if a.flag("synth")
+        && let Some(s) = bitwright::synth::synthesize(&mut cx, result, &Default::default())
+            .map_err(|e| Fail::Err(2, format!("{e}")))?
+    {
+        result = s;
+    }
+    let mut text = format!("{}", cx.display(result));
     if !out.relies_on.is_none() {
         text.push_str(&format!(
             "    # relies on {}",
