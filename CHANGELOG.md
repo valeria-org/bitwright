@@ -43,6 +43,14 @@
   is false), trichotomy, `~(x <u y) & ~(y <u x)` is `x == y`, and the lattice laws of minimum
   and maximum (`select(x <u y, x, y) == select(y <u x, y, x)` is true). Swapped arms under one
   condition combine (`min + max` is `x + y`).
+- **Parity and squares.** Facts know the low bits of a square from its operand's: bit 1 of
+  `x·x` is 0, an odd square is 1 modulo 8, and `(2^t·y)²` has `2t` low zeros. And the low bits
+  of a polynomial (with bitwise operations and constant shifts) are read by residues: they are
+  a function of its leaves' low bits, a small table over up to three leaves. So the demanded
+  bits pass replaces an operand whose demanded low bits are a constant or equal a leaf's
+  (`(x·x) & 1` is `x & 1`, `(x·x + x) & 1` and `x·(x+1)·(x+2)·(x+3)·32` are 0 at 8 bits), and
+  the compares pass decides `e == c` when no residue of `e` matches `c` (`x·x == 2`,
+  `(x·x & 7) == 5` are false).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

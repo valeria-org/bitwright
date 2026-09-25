@@ -1344,6 +1344,116 @@ fn demanded_is_sound_and_idempotent() {
     assert!(changed > 200, "{changed}");
 }
 
+/// A polynomial over one or two symbols, with bitwise operations and constants: the
+/// fragment residues read.
+fn poly_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
+    let width = Width::new(w).unwrap();
+    if depth == 0 || g.rng.chance(1, 4) {
+        return match g.rng.below(4) {
+            0 => {
+                let v = g.constant(w);
+                cx.constant(&v).unwrap()
+            }
+            1 => cx.symbol("y", width).unwrap(),
+            _ => cx.symbol("x", width).unwrap(),
+        };
+    }
+    let d = depth - 1;
+    let ops = [
+        BinOp::Mul,
+        BinOp::Mul,
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::And,
+        BinOp::Or,
+        BinOp::Xor,
+    ];
+    let op = ops[g.rng.below(ops.len() as u64) as usize];
+    let (a, b) = (poly_expr(g, cx, w, d), poly_expr(g, cx, w, d));
+    cx.bin(op, a, b).unwrap()
+}
+
+/// Residues: the low bits of polynomials (masked, compared with constants, shifted up) are
+/// decided soundly, exhaustively at small widths.
+#[test]
+fn residues_are_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Demanded, Phase::Compares]);
+    let mut g = generator(0x7e51);
+    let mut rng = Rng(47);
+    let mut changed = 0;
+    for i in 0..2000 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            64
+        } else {
+            1 + g.rng.below(7) as u16
+        };
+        let width = Width::new(w).unwrap();
+        let p = poly_expr(&mut g, &mut cx, w, 3);
+        let e = match g.rng.below(3) {
+            0 => {
+                let m = BitVec::wrapping_from_u64(width, g.rng.below(16));
+                let m = cx.constant(&m).unwrap();
+                cx.bin(BinOp::And, p, m).unwrap()
+            }
+            1 => {
+                let c = BitVec::wrapping_from_u64(width, g.rng.below(16));
+                let c = cx.constant(&c).unwrap();
+                cx.cmp(CmpOpExt::Eq, p, c).unwrap()
+            }
+            _ => {
+                let s = cx.constant_u64(width, g.rng.below(u64::from(w))).unwrap();
+                cx.bin(BinOp::Shl, p, s).unwrap()
+            }
+        };
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {}",
+            cx.display(r.expr)
+        );
+    }
+    assert!(changed > 200, "{changed}");
+}
+
+#[test]
+fn residue_fixtures() {
+    let eng = Engine::standard();
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W8);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same("(x * x) & 1", "x & 1");
+    same("(x * x * x) & 1", "x & 1");
+    same("(x * x + x) & 1", "0");
+    same("(x * (x + 1) * (x + 2)) & 1", "0");
+    same("((x | 1) * (x | 1)) & 7", "1");
+    same("(((x | 1) - 1) * ((x | 1) + 1)) & 7", "0");
+    same("((x * x) & 3) == 3", "false");
+    same("((x * x) & 7) == 5", "false");
+    same("x * x == 2", "false");
+    same("(x * x) & 2", "0");
+    same("(x * x + x) * 0x80", "0");
+    same("(x * (x + 1) * ((x + 2) * (x + 3))) * 0x20", "0");
+    // A product of two values has no such law.
+    same("(x * y) & 1", "(x * y) & 1");
+}
+
 #[test]
 fn demanded_fixtures() {
     let eng = engine(vec![Phase::Demanded]);

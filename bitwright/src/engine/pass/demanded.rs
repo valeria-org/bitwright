@@ -50,6 +50,46 @@ fn low_prefix(m: &BitVec) -> BitVec {
     low_mask(w, u32::from(w.bits()) - clz)
 }
 
+/// `x` on the bits of `m`, when they are among the lowest [`RESIDUE_BITS`] and `x`'s residues
+/// show them constant or equal to a leaf's.
+fn by_residues(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    m: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let Some(mv) = m.to_u64() else {
+        return Ok(None);
+    };
+    let k = 64 - mv.leading_zeros();
+    if k == 0
+        || k > RESIDUE_BITS
+        || !matches!(cx.node(x).op, OpCode::Mul | OpCode::Add | OpCode::Sub)
+    {
+        return Ok(None);
+    }
+    let Some(t) = super::residue::residues(r, cx, x, k)? else {
+        return Ok(None);
+    };
+    let first = t.values[0] & mv;
+    let allowed = r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(x)));
+    if allowed && t.values.iter().all(|&v| v & mv == first) {
+        let c = BitVec::wrapping_from_u64(m.width(), first);
+        return Ok(Some(r.build(cx, |cx| cx.mk_const(&c))?));
+    }
+    Ok((0..t.leaves.len())
+        .find(|&i| {
+            t.values
+                .iter()
+                .enumerate()
+                .all(|(c, &v)| v & mv == t.leaf(c, i) & mv)
+        })
+        .map(|i| t.leaves[i]))
+}
+
+/// The most low bits read by residues.
+const RESIDUE_BITS: u32 = 4;
+
 fn subset(a: &BitVec, b: &BitVec) -> bool {
     bv_and(a, &bv_not(b)).is_zero()
 }
@@ -98,6 +138,12 @@ fn simplify(
             st.memo.insert(Key(x, *m), c);
             return Ok(c);
         }
+    }
+    // Demanded bits among the lowest few: the residues of `x` decide them (a constant, or a
+    // leaf equal to `x` there).
+    if let Some(v) = by_residues(r, cx, x, m)? {
+        st.memo.insert(Key(x, *m), v);
+        return Ok(v);
     }
     let bin = |r: &mut Runner<'_, '_>, cx: &mut Context, op: BinOp, a: u32, b: u32| {
         r.build(cx, |cx| cx.c_bin(op, a, b))

@@ -760,6 +760,12 @@ impl Context {
             let one = Facts::constant(&BitVec::one(args[0].width()));
             return transfer(&TOp::Bin(crate::ops::BinOp::Shl), &[args[0], &one]);
         }
+        if n.op == OpCode::Mul && n.a == n.b && args.len() == 2 {
+            // A square: its low bits follow from its operand's (a product's transfer does not
+            // know the operands are one value).
+            let f = transfer(op, args);
+            return f.meet(&square_known(args[0])).unwrap_or(f);
+        }
         if n.op == OpCode::Select {
             let f = transfer(op, args);
             return self
@@ -1550,4 +1556,48 @@ impl Context {
         };
         Ok(proof(truth, rel))
     }
+}
+
+/// The known low bits of `x·x` from those of `x`. Bit 1 of a square is 0 (squares are 0 or 1
+/// modulo 4). When the low `L` bits of `x` are known: all zero, `x = 2^L·z` and `x·x = 4^L·z²`
+/// has `2L` low zeros and bit `2L + 1` clear; otherwise `x = 2^t·y` with `y` odd and its low
+/// `L − t` bits known, so `y²` is known modulo `2^(L − t + 1)` (`(y + 2^j·u)² ≡ y² mod 2^(j+1)`),
+/// or modulo 8 when only its low bit is (an odd square is 1 modulo 8), and `x·x = 4^t·y²`.
+pub(crate) fn square_known(x: &Facts) -> Facts {
+    let w = x.width();
+    let wb = u32::from(w.bits());
+    let top = wb.min(64);
+    let low = |n: u32| if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let kn = x.known;
+    let known = kn.known().limbs()[0];
+    let l = (!known).trailing_zeros().min(top).min(62);
+    let (mut zeros, mut ones) = (if wb >= 2 { 2u64 } else { 0 }, 0u64);
+    if l >= 1 {
+        let v = kn.known_one().limbs()[0] & low(l);
+        if v == 0 {
+            zeros |= low((2 * l).min(top));
+            if 2 * l + 1 < top {
+                zeros |= 1u64 << (2 * l + 1);
+            }
+        } else {
+            let t = v.trailing_zeros();
+            let j = l - t;
+            let n = if j == 1 { 3 } else { j + 1 };
+            let y = v >> t;
+            let ysq = y.wrapping_mul(y) & low(n);
+            let bits = (2 * t + n).min(top);
+            let value = if 2 * t >= 64 {
+                0
+            } else {
+                (ysq << (2 * t)) & low(bits)
+            };
+            ones = value;
+            zeros = (zeros | low(bits)) & !value;
+        }
+    }
+    let zeros = zeros & !ones & low(top);
+    Facts::from_known(KnownBits::from_masks(
+        BitVec::wrapping_from_u64(w, zeros),
+        BitVec::wrapping_from_u64(w, ones & low(top)),
+    ))
 }

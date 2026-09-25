@@ -1998,3 +1998,40 @@ fn floating_point_transfers_are_sound() {
         }
     }
 }
+
+/// The known bits of a square contain every square of a value the operand's facts admit:
+/// every known-bits pattern at widths 1 to 6.
+#[test]
+fn square_known_bits_are_sound() {
+    let mut rng = Rng(0x5ca7);
+    for w in 1..=6u16 {
+        for f in states(&mut rng, w, 40) {
+            let sq = super::square_known(&f);
+            for v in all_values(w) {
+                if !f.contains(&v) {
+                    continue;
+                }
+                let p = BitVec::apply_bin(BinOp::Mul, &v, &v).unwrap();
+                assert!(sq.contains(&p), "W={w} {f:?}: {v}² = {p} not in {sq:?}");
+            }
+        }
+    }
+    // And they are strong: an odd square is 1 modulo 8, bit 1 of any square is 0.
+    let w = width(8);
+    let odd = Facts::from_known(KnownBits::from_masks(BitVec::zero(w), BitVec::one(w)));
+    assert_eq!(
+        super::square_known(&odd).known().known_one().limbs()[0] & 7,
+        1
+    );
+    assert_eq!(
+        super::square_known(&odd).known().known_zero().limbs()[0] & 7,
+        6
+    );
+    assert_eq!(
+        super::square_known(&Facts::top(w))
+            .known()
+            .known_zero()
+            .limbs()[0],
+        2
+    );
+}

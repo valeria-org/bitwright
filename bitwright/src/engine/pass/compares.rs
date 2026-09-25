@@ -1080,9 +1080,39 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     let e = match e {
         Some(e) if e != n => e,
-        _ => return order_step(r, cx, n),
+        _ => {
+            if let Some(b) = residue_decide(r, cx, n)? {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, b)?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
+            return order_step(r, cx, n);
+        }
     };
     finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)
+}
+
+/// `e == c` or `e != c` decided by the residues of `e`: when `c`'s low bits are none of the
+/// values `e` takes there (`x·x == 2`, `(x·x & 7) == 5`).
+fn residue_decide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<bool>, Stop> {
+    let node = cx.node(n);
+    if !matches!(node.op, OpCode::Eq | OpCode::Ne) {
+        return Ok(None);
+    }
+    let (e, c) = match (cx.const_val(node.a), cx.const_val(node.b)) {
+        (None, Some(c)) => (node.a, c),
+        (Some(c), None) => (node.b, c),
+        _ => return Ok(None),
+    };
+    let k = u32::from(cx.wid(e)).min(4);
+    let Some(t) = super::residue::residues(r, cx, e, k)? else {
+        return Ok(None);
+    };
+    let low = c.limbs()[0] & t.mask;
+    if t.values.contains(&low) {
+        return Ok(None);
+    }
+    Ok(Some(node.op == OpCode::Ne))
 }
 
 /// The order reading of `n` (see `order`).
