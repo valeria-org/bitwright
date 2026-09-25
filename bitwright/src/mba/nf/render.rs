@@ -18,11 +18,41 @@ use crate::mba::solve::Verdict;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BNode {
     op: MOp,
     w: Width,
     args: [u32; 2],
+}
+
+/// Hashed as two words and a constant's significant limbs (interning hashes every node built).
+impl core::hash::Hash for BNode {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        let (tag, extra) = match self.op {
+            MOp::Const(_) => (0u64, 0u64),
+            MOp::Var(i) => (1, u64::from(i)),
+            MOp::Add => (2, 0),
+            MOp::Sub => (3, 0),
+            MOp::Mul => (4, 0),
+            MOp::Neg => (5, 0),
+            MOp::And => (6, 0),
+            MOp::Or => (7, 0),
+            MOp::Xor => (8, 0),
+            MOp::Not => (9, 0),
+            MOp::Shl(k) => (10, u64::from(k)),
+            MOp::LShr(k) => (11, u64::from(k)),
+            MOp::Zext => (12, 0),
+            MOp::Sext => (13, 0),
+            MOp::Trunc => (14, 0),
+        };
+        h.write_u64(tag | u64::from(self.w.bits()) << 8 | extra << 24);
+        h.write_u64(u64::from(self.args[0]) | u64::from(self.args[1]) << 32);
+        if let MOp::Const(v) = &self.op {
+            for &l in v.limbs() {
+                h.write_u64(l);
+            }
+        }
+    }
 }
 
 /// Nodes with local interning.
@@ -31,11 +61,11 @@ pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
     memo: IdMap<BNode, u32>,
+    /// [`Builder::reach`]'s visited marks: a stamp per node, current when equal to the epoch.
+    marks: core::cell::RefCell<(Vec<u32>, u32)>,
+    /// Costs of candidates already costed (nodes never change once interned).
+    costs: core::cell::RefCell<IdMap<u32, Cost>>,
 }
-
-/// Builders up to this many nodes mark a candidate's nodes in a table of flags (see
-/// [`Builder::reach`]).
-const REACH_FLAGS: usize = 4096;
 
 /// A candidate's cost: nodes, then operator weight.
 pub(crate) type Cost = (u32, u32);
@@ -58,6 +88,8 @@ impl Builder {
             vars,
             nodes: Vec::new(),
             memo: IdMap::default(),
+            marks: Default::default(),
+            costs: Default::default(),
         }
     }
 
@@ -224,15 +256,17 @@ impl Builder {
         map.last().copied()
     }
 
-    /// The nodes `root` uses, operands first. (Candidates are small: past a few thousand
-    /// nodes in the builder, the visited set is kept by node rather than by the builder's size.)
+    /// The nodes `root` uses, operands first.
     pub(crate) fn reach(&self, root: u32) -> Vec<u32> {
-        let mut flags: Vec<bool> = Vec::new();
-        let mut set: std::collections::HashSet<u32, crate::hash::IdBuild> =
-            std::collections::HashSet::with_hasher(crate::hash::IdBuild);
-        let small = self.nodes.len() <= REACH_FLAGS;
-        if small {
-            flags = vec![false; self.nodes.len()];
+        let mut marks = self.marks.borrow_mut();
+        let (stamp, epoch) = &mut *marks;
+        *epoch = epoch.wrapping_add(1);
+        if *epoch == 0 {
+            stamp.fill(0);
+            *epoch = 1;
+        }
+        if stamp.len() < self.nodes.len() {
+            stamp.resize(self.nodes.len(), 0);
         }
         let mut out = Vec::new();
         let mut stack = vec![(root, false)];
@@ -241,11 +275,7 @@ impl Builder {
                 out.push(i);
                 continue;
             }
-            let fresh = if small {
-                !core::mem::replace(&mut flags[i as usize], true)
-            } else {
-                set.insert(i)
-            };
+            let fresh = core::mem::replace(&mut stamp[i as usize], *epoch) != *epoch;
             if !fresh {
                 continue;
             }
@@ -265,6 +295,15 @@ impl Builder {
     /// `x − 1` or `−(~x)` to `x + 1` while the inner node stays for other uses, then operator
     /// weight.
     pub(crate) fn cost(&self, root: u32) -> Cost {
+        if let Some(&c) = self.costs.borrow().get(&root) {
+            return c;
+        }
+        let c = self.cost_of(root);
+        self.costs.borrow_mut().insert(root, c);
+        c
+    }
+
+    fn cost_of(&self, root: u32) -> Cost {
         let r = self.reach(root);
         let weight: u32 = r.iter().map(|&i| weight(&self.nodes[i as usize].op)).sum();
         let unstable = r
@@ -749,10 +788,23 @@ impl<'a> Render<'a> {
         let mut acc: Option<u32> = None;
         type Terms = Vec<(u32, BitVec)>;
         let mut merged: Terms = Vec::with_capacity(s.terms.len());
+        // Each node's position in `merged`, for sums too long to search (same order either way).
+        let indexed = s.terms.len() > 8;
+        let mut at: IdMap<u32, usize> = IdMap::default();
         for &(t, k) in &s.terms {
-            match merged.iter_mut().find(|(u, _)| *u == t) {
-                Some((_, c)) => *c = BitVec::bin_unchecked(BinOp::Add, c, &k),
-                None => merged.push((t, k)),
+            let found = if indexed {
+                at.get(&t).copied()
+            } else {
+                merged.iter().position(|(u, _)| *u == t)
+            };
+            match found {
+                Some(j) => merged[j].1 = BitVec::bin_unchecked(BinOp::Add, &merged[j].1, &k),
+                None => {
+                    if indexed {
+                        at.insert(t, merged.len());
+                    }
+                    merged.push((t, k));
+                }
             }
         }
         // A term whose power-of-two multiple is another term's node goes into that term
@@ -760,10 +812,13 @@ impl<'a> Render<'a> {
         let mut i = 0;
         while i < merged.len() {
             let (t, k) = merged[i];
-            let into = self
-                .b
-                .multiple(t, &k)
-                .and_then(|x| merged.iter().position(|&(u, _)| u == x));
+            let into = self.b.multiple(t, &k).and_then(|x| {
+                if indexed {
+                    at.get(&x).copied()
+                } else {
+                    merged.iter().position(|&(u, _)| u == x)
+                }
+            });
             match into {
                 Some(j) if j != i => {
                     let one = if k.msb() {
@@ -773,6 +828,10 @@ impl<'a> Render<'a> {
                     };
                     merged[j].1 = BitVec::bin_unchecked(BinOp::Add, &merged[j].1, &one);
                     merged.remove(i);
+                    if indexed {
+                        at.clear();
+                        at.extend(merged.iter().enumerate().map(|(p, &(u, _))| (u, p)));
+                    }
                     i = 0;
                 }
                 _ => i += 1,
