@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bitwright::engine::{Engine, Run};
-use bitwright::ext::{ExtError, ExtOp, ExtSig, ExtTraits, Registry};
+use bitwright::ext::{ExtError, ExtInverse, ExtOp, ExtSig, ExtTraits, InverseArg, Registry};
 use bitwright::{
     Assumptions, BinOp, BitVec, Context, ContextConfig, Error, Expr, KnownBits, ParseOptions,
     SymbolKey, UnOp, View, Width,
@@ -543,4 +543,87 @@ fn a_context_adopts_a_registry_that_extends_its_own() {
     let other = Arc::new(Registry::builder().register(Mix).unwrap().build());
     assert!(cx.extend_registry(other).is_err());
     assert_eq!(cx.ext(addc, &[x, y, c]).unwrap(), before);
+}
+
+/// `enc(k, x) = rotl(x ^ k, 3)` and `dec(k, y) = rotr(y, 3) ^ k`, declared each other's
+/// inverse in `x` (resp. `y`).
+struct Enc(bool);
+struct Dec;
+
+impl ExtOp for Enc {
+    fn name(&self) -> &str {
+        if self.0 { "test.enc_wrong" } else { "test.enc" }
+    }
+    fn signature(&self, args: &[Width]) -> Result<ExtSig, String> {
+        match args {
+            [a, b] if a == b => Ok(ExtSig::new(&[("y", *a)])),
+            _ => Err("two operands of one width".into()),
+        }
+    }
+    fn eval(&self, args: &[BitVec], out: &mut [BitVec]) {
+        let w = args[0].width();
+        let x = bin(BinOp::Xor, &args[1], &args[0]);
+        out[0] = bin(BinOp::RotL, &x, &BitVec::wrapping_from_u64(w, 3));
+        if self.0 {
+            // Off by one bit: the declared inverse does not undo it.
+            out[0] = bin(BinOp::Xor, &out[0], &BitVec::one(w));
+        }
+    }
+    fn inverse(&self, output: u8, arg: u8) -> Option<ExtInverse> {
+        (output == 0 && arg == 1)
+            .then(|| ExtInverse::new("test.dec", 0, &[InverseArg::Arg(0), InverseArg::Output]))
+    }
+}
+
+impl ExtOp for Dec {
+    fn name(&self) -> &str {
+        "test.dec"
+    }
+    fn signature(&self, args: &[Width]) -> Result<ExtSig, String> {
+        match args {
+            [a, b] if a == b => Ok(ExtSig::new(&[("x", *a)])),
+            _ => Err("two operands of one width".into()),
+        }
+    }
+    fn eval(&self, args: &[BitVec], out: &mut [BitVec]) {
+        let w = args[0].width();
+        let y = bin(BinOp::RotR, &args[1], &BitVec::wrapping_from_u64(w, 3));
+        out[0] = bin(BinOp::Xor, &y, &args[0]);
+    }
+}
+
+/// Round trips (R3 for extension operations): a declared inverse cancels at construction,
+/// whichever of the two is registered first; a wrong declaration is refused by the registry.
+#[test]
+fn declared_inverses_cancel_round_trips() {
+    for enc_first in [true, false] {
+        let b = Registry::builder();
+        let b = if enc_first {
+            b.register(Enc(false)).unwrap().register(Dec).unwrap()
+        } else {
+            b.register(Dec).unwrap().register(Enc(false)).unwrap()
+        };
+        let reg = Arc::new(b.build());
+        let mut cx = Context::with_registry(ContextConfig::default(), reg.clone());
+        let (enc, dec) = (reg.id("test.enc").unwrap(), reg.id("test.dec").unwrap());
+        let x = cx.symbol("x", Width::W32).unwrap();
+        let k = cx.symbol("k", Width::W32).unwrap();
+        let y = cx.ext(enc, &[k, x]).unwrap()[0];
+        assert_eq!(cx.ext(dec, &[k, y]).unwrap()[0], x);
+        // Another key: no round trip.
+        let j = cx.symbol("j", Width::W32).unwrap();
+        let other = cx.ext(dec, &[j, y]).unwrap()[0];
+        assert_ne!(other, x);
+        // Through substitution too: dec(k, enc(k, v)) with v bound later.
+        let v = cx.symbol("v", Width::W32).unwrap();
+        let yv = cx.ext(enc, &[k, v]).unwrap()[0];
+        let back = cx.ext(dec, &[k, yv]).unwrap()[0];
+        assert_eq!(back, v);
+    }
+    let err = Registry::builder()
+        .register(Dec)
+        .unwrap()
+        .register(Enc(true))
+        .unwrap_err();
+    assert!(err.to_string().contains("the inverse gives"), "{err}");
 }

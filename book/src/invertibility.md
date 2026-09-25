@@ -250,6 +250,12 @@ assert_eq!(cx.display(out.expr).to_string(), "x == y");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+An operation can also name the operation that undoes it (`ExtOp::inverse`): a decryption for
+an encryption under one key, whose arguments are the encryption's output and its other
+arguments. Once both are registered, the registry checks the round trip by sampled evaluation
+(refusing a wrong declaration), and the builder cancels it: `dec(k, enc(k, x))` is `x`, while
+`dec(j, enc(k, x))` stays.
+
 ## Facts proved elsewhere
 
 Some facts hold only on a finite domain and were proved by exhaustion elsewhere, for example

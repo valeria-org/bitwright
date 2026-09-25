@@ -537,6 +537,37 @@ impl Context {
         {
             return self.mk_const(&out[k]);
         }
+        // A round trip: the call undoes an output of another call over it.
+        for rt in reg.round_trips(op.raw()) {
+            if usize::from(rt.g_output) != k || rt.args.len() != arity {
+                continue;
+            }
+            let Some(pos) = rt
+                .args
+                .iter()
+                .position(|a| *a == crate::ext::InverseArg::Output)
+            else {
+                continue;
+            };
+            let inner = self.node(kids[pos]);
+            let Some((f_arity, f_out)) = inner.op.as_ext() else {
+                continue;
+            };
+            if inner.aux != rt.f || f_out != usize::from(rt.f_output) {
+                continue;
+            }
+            let fargs = [inner.a, inner.b, inner.c];
+            let fits = rt.args.iter().zip(&kids[..arity]).all(|(a, &x)| match *a {
+                crate::ext::InverseArg::Output => x == kids[pos],
+                crate::ext::InverseArg::Arg(i) => {
+                    usize::from(i) < f_arity && fargs[usize::from(i)] == x
+                }
+            });
+            let back = fargs[usize::from(rt.f_arg)];
+            if fits && usize::from(rt.f_arg) < f_arity && self.wid(back) == w.bits() {
+                return Ok(back);
+            }
+        }
         let code = OpCode::ext(arity, k)
             .ok_or_else(|| Error::Unsupported(format!("output {k} of {arity} arguments")))?;
         let mut n = Node::new(code, w.bits(), kids[0], kids[1], kids[2]);

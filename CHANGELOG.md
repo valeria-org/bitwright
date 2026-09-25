@@ -89,6 +89,10 @@
   stays. The xor pass writes such an expression as the xor of rotations masked by `M`'s
   diagonals when smaller: the xorshift involution `y ^ (y >>u 5) ^ (y >>u 7)` with
   `y = x ^ (x >>u 5) ^ (x >>u 7)` is `x`.
+- **Round trips of extension operations.** `ExtOp::inverse` names another operation of the
+  registry (with `ExtInverse`, `InverseArg`) that undoes an output in one argument; the
+  registry checks it by sampled evaluation once both are registered, and the builder cancels
+  the round trip (`dec(k, enc(k, x))` is `x`).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

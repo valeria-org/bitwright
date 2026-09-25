@@ -148,6 +148,39 @@ pub enum Invertible {
     Bijective,
 }
 
+/// An argument of an inverse call (see [`ExtOp::inverse`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum InverseArg {
+    /// The output being undone.
+    Output,
+    /// The undone call's own argument at this position (a key, say).
+    Arg(u8),
+}
+
+/// The operation that undoes an output of another in one argument (see [`ExtOp::inverse`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExtInverse {
+    /// The operation's name, in the same registry.
+    pub op: Cow<'static, str>,
+    /// Its output that gives the argument back.
+    pub output: u8,
+    /// Its arguments, in order.
+    pub args: Vec<InverseArg>,
+}
+
+impl ExtInverse {
+    /// Output `output` of `op` over `args` gives the argument back.
+    pub fn new(op: &'static str, output: u8, args: &[InverseArg]) -> ExtInverse {
+        ExtInverse {
+            op: Cow::Borrowed(op),
+            output,
+            args: args.to_vec(),
+        }
+    }
+}
+
 /// A host-defined operation. Every method must be deterministic; `eval` must be total.
 pub trait ExtOp: Send + Sync + 'static {
     /// A namespaced name: `acme.avgu`. Letters, digits, `_` and `.`, starting with a letter.
@@ -202,6 +235,17 @@ pub trait ExtOp: Send + Sync + 'static {
     /// entry `arg` is to be ignored), or `None` if there is none (never for a bijection).
     /// Answers are checked by evaluation before they are used.
     fn invert(&self, _output: u8, _arg: u8, _args: &[BitVec], _value: &BitVec) -> Option<BitVec> {
+        None
+    }
+
+    /// Another operation of the registry that undoes output `output` in argument `arg`: for
+    /// every argument values, that operation's output [`ExtInverse::output`] over
+    /// [`ExtInverse::args`] (this call's output, or its other arguments) is `args[arg]`. A
+    /// decryption for an encryption under one key, say. The builder then cancels the round
+    /// trip: that call over this call's output is `args[arg]` itself (`dec(k, enc(k, x))` is
+    /// `x`). The registry checks the declaration by sampled evaluation once both operations
+    /// are registered; one whose other operation never is, is unused.
+    fn inverse(&self, _output: u8, _arg: u8) -> Option<ExtInverse> {
         None
     }
 }
@@ -291,6 +335,22 @@ pub struct Registry {
     by_name: HashMap<String, ExtId>,
     /// Per operation: a hash of its name and revision (enters structural hashes).
     hashes: Vec<u64>,
+    /// Declared and checked round trips, by the undoing operation's position.
+    round_trips: HashMap<u8, Vec<RoundTrip>>,
+    /// Declarations waiting for their undoing operation: (declaring position, output, argument,
+    /// declaration, whether to check it).
+    pending: Vec<(u8, u8, u8, ExtInverse, bool)>,
+}
+
+/// A checked round trip: output `g_output` of operation `g` over `args` undoes output
+/// `f_output` of operation `f` in argument `f_arg`.
+#[derive(Clone, Debug)]
+pub(crate) struct RoundTrip {
+    pub(crate) f: u8,
+    pub(crate) f_output: u8,
+    pub(crate) f_arg: u8,
+    pub(crate) g_output: u8,
+    pub(crate) args: Vec<InverseArg>,
 }
 
 impl fmt::Debug for Registry {
@@ -354,6 +414,119 @@ impl Registry {
     pub(crate) fn hash_at(&self, index: u8) -> u64 {
         self.hashes.get(usize::from(index)).copied().unwrap_or(0)
     }
+
+    /// The round trips output `g_output` of the operation at position `g` undoes.
+    pub(crate) fn round_trips(&self, g: u8) -> &[RoundTrip] {
+        self.round_trips.get(&g).map_or(&[], Vec::as_slice)
+    }
+
+    /// Resolves the declarations of the operation at `f` and those waiting for it.
+    fn resolve(&mut self, f: u8, check: bool) -> Result<(), ExtError> {
+        let op = self.ops[usize::from(f)].clone();
+        for output in 0..MAX_OUTPUTS as u8 {
+            for arg in 0..MAX_ARGS as u8 {
+                if let Some(inv) = op.inverse(output, arg) {
+                    self.pending.push((f, output, arg, inv, check));
+                }
+            }
+        }
+        let pending = core::mem::take(&mut self.pending);
+        for (f, output, arg, inv, check) in pending {
+            let Some(g) = self.by_name.get(&*inv.op).map(|id| id.index) else {
+                self.pending.push((f, output, arg, inv, check));
+                continue;
+            };
+            let (fop, gop) = (
+                self.ops[usize::from(f)].clone(),
+                self.ops[usize::from(g)].clone(),
+            );
+            if check {
+                check_round_trip(&*fop, output, arg, &*gop, &inv)
+                    .map_err(|why| ExtError::Contract(fop.name().to_string(), why))?;
+            }
+            self.round_trips.entry(g).or_default().push(RoundTrip {
+                f,
+                f_output: output,
+                f_arg: arg,
+                g_output: inv.output,
+                args: inv.args,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Checks a declared round trip by sampled evaluation at the argument widths the declaring
+/// operation accepts.
+fn check_round_trip(
+    f: &dyn ExtOp,
+    output: u8,
+    arg: u8,
+    g: &dyn ExtOp,
+    inv: &ExtInverse,
+) -> Result<(), String> {
+    let mut rng = Rng(0x7e7e ^ u64::from(f.revision()));
+    let mut tested = 0;
+    for tuple in width_tuples() {
+        if tested >= TESTED_TUPLES {
+            break;
+        }
+        let widths: Vec<Width> = tuple
+            .iter()
+            .map(|&w| Width::new(w).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let Ok(sig) = f.signature(&widths) else {
+            continue;
+        };
+        if usize::from(output) >= sig.len() || usize::from(arg) >= widths.len() {
+            continue;
+        }
+        let at = || format!(" (inverse `{}`) at argument widths {tuple:?}", inv.op);
+        let gw: Vec<Width> = inv
+            .args
+            .iter()
+            .map(|a| match *a {
+                InverseArg::Output => sig.width(usize::from(output)),
+                InverseArg::Arg(i) => widths.get(usize::from(i)).copied(),
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("an inverse argument out of range{}", at()))?;
+        let gsig = g
+            .signature(&gw)
+            .map_err(|e| format!("the inverse refuses its arguments: {e}{}", at()))?;
+        if gsig.width(usize::from(inv.output)) != Some(widths[usize::from(arg)]) {
+            return Err(format!("the inverse's output has another width{}", at()));
+        }
+        tested += 1;
+        for _ in 0..16 {
+            let args: Vec<BitVec> = widths.iter().map(|&w| rng.value(w)).collect();
+            let out = run_eval(f, &args)?;
+            let gargs: Vec<BitVec> = inv
+                .args
+                .iter()
+                .map(|a| match *a {
+                    InverseArg::Output => out[usize::from(output)],
+                    InverseArg::Arg(i) => args[usize::from(i)],
+                })
+                .collect();
+            let back = run_eval(g, &gargs)?;
+            if back[usize::from(inv.output)] != args[usize::from(arg)] {
+                return Err(format!(
+                    "the inverse gives {} for argument {}{}",
+                    back[usize::from(inv.output)],
+                    args[usize::from(arg)],
+                    at()
+                ));
+            }
+        }
+    }
+    if tested == 0 {
+        return Err(format!(
+            "no argument widths to check the inverse `{}` at",
+            inv.op
+        ));
+    }
+    Ok(())
 }
 
 /// Collects operations into a [`Registry`].
@@ -363,17 +536,22 @@ pub struct RegistryBuilder {
 }
 
 impl RegistryBuilder {
-    /// Adds `op` after its contract self-test.
+    /// Adds `op` after its contract self-test (and the check of each round trip it declares,
+    /// or completes, with [`ExtOp::inverse`]).
     pub fn register(self, op: impl ExtOp) -> Result<Self, ExtError> {
         check(&op)?;
-        self.register_unchecked(op)
+        self.add(op, true)
     }
 
     /// Adds `op` without its contract self-test (names are still checked). For a host that
     /// registers the same operations in many registries, and runs [`check`] on each of them once,
     /// in its own tests: the self-test samples hundreds of evaluations, too many to repeat per
     /// registry. A broken operation registered this way makes facts and folds wrong.
-    pub fn register_unchecked(mut self, op: impl ExtOp) -> Result<Self, ExtError> {
+    pub fn register_unchecked(self, op: impl ExtOp) -> Result<Self, ExtError> {
+        self.add(op, false)
+    }
+
+    fn add(mut self, op: impl ExtOp, check: bool) -> Result<Self, ExtError> {
         let name = op.name().to_string();
         let good = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
             && name
@@ -403,6 +581,7 @@ impl RegistryBuilder {
         };
         self.reg.by_name.insert(name, id);
         self.reg.ops.push(Arc::new(op));
+        self.reg.resolve(index, check)?;
         Ok(self)
     }
 
