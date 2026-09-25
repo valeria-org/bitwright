@@ -30,6 +30,7 @@ pub mod aig;
 pub mod blast;
 pub mod drup;
 mod fp;
+mod rule;
 pub mod sat;
 #[cfg(test)]
 mod tests;
@@ -39,6 +40,8 @@ use crate::expr::{Context, Expr, OpCode};
 use crate::facts::Assumptions;
 use crate::hash::IdMap;
 use crate::{BitVec, SymbolKey, Width};
+
+pub use rule::{RuleOutcome, WidthReport, rule, rule_all_widths};
 
 use aig::{Aig, Cnf, L};
 use blast::Bits;
@@ -285,7 +288,10 @@ impl<'c> Blaster<'c> {
                 }
             }
             op if op.as_ext().is_some() => self.ext(i)?,
-            _ => fp::blast(self, i)?,
+            _ => {
+                let kids: Vec<Bits> = n.children().map(|c| self.bits[&c].clone()).collect();
+                fp::blast(self, i, &kids)?
+            }
         })
     }
 

@@ -1231,3 +1231,42 @@ group g {
     let err = RuleProgram::compile(bad).unwrap_err();
     assert!(err.render("g.bwr", bad).contains("BW0310"));
 }
+
+#[test]
+fn native_proofs_settle_rules_too_wide_to_enumerate() {
+    // At a fixed 64 bits there is nothing to enumerate: sampling alone is inconclusive, and a
+    // proof makes the rule sound.
+    let p = program("rule mba(x: 64, y: 64) { (x ^ y) + 2 * (x & y) => x + y }");
+    let r = &p.rules()[0];
+    let plain = check_rule(r, &CheckConfig::default());
+    assert!(
+        matches!(plain.verdict, Verdict::Inconclusive(_)),
+        "{:?}",
+        plain.verdict
+    );
+    let c = check_rule(r, &CheckConfig::default().with_proofs(3));
+    assert!(c.is_sound(), "{:?} {}", c.verdict, c.evidence);
+    assert_eq!(c.evidence.proved_instances, 1);
+    assert!(c.evidence.to_string().contains("proved(inst=1,open=0)"));
+    // A rule wrong at one value in 2^64, which sampling misses, is refuted.
+    let p = program("rule rare(x: 64) { select(x == 0x123456789abcdef0, 1:64, 0:64) => 0 }");
+    let r = &p.rules()[0];
+    let c = check_rule(r, &CheckConfig::default().with_proofs(3));
+    match &c.verdict {
+        Verdict::Unsound(cx) => {
+            assert_eq!(
+                cx.params[0].1,
+                BitVec::from_u64(Width::W64, 0x1234_5678_9abc_def0).unwrap()
+            );
+        }
+        v => panic!("expected a counterexample, got {v:?}"),
+    }
+    // A width-generic rule is proved at 8, 32 and 64 bits besides its exhaustive tier.
+    let p = program("rule mba<W>(x: W, y: W) { (x ^ y) + 2 * (x & y) => x + y }");
+    let c = check_rule(&p.rules()[0], &CheckConfig::default().with_proofs(3));
+    assert!(c.is_sound());
+    assert_eq!(
+        (c.evidence.proved_instances, c.evidence.unproved_instances),
+        (3, 0)
+    );
+}

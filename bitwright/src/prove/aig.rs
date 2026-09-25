@@ -158,6 +158,37 @@ impl Aig {
         vals
     }
 
+    /// The value of every node for 64 input assignments at once: bit `j` of input `k`'s word
+    /// is its value in assignment `j`.
+    pub fn eval_words(&self, input: impl Fn(u32) -> u64) -> Vec<u64> {
+        let mut vals: Vec<u64> = Vec::with_capacity(self.nodes.len());
+        let mut k = 0;
+        for n in &self.nodes {
+            let v = match *n {
+                Node::Const => 0,
+                Node::Input => {
+                    k += 1;
+                    input(k - 1)
+                }
+                Node::And(a, b) => {
+                    let get = |l: L| {
+                        let x = vals[(l >> 1) as usize];
+                        if l & 1 == 1 { !x } else { x }
+                    };
+                    get(a) & get(b)
+                }
+            };
+            vals.push(v);
+        }
+        vals
+    }
+
+    /// A literal's word in `eval_words`'s result.
+    pub fn word(vals: &[u64], l: L) -> u64 {
+        let x = vals[(l >> 1) as usize];
+        if l & 1 == 1 { !x } else { x }
+    }
+
     /// A literal's value in `eval_all`'s result.
     pub fn value(vals: &[bool], l: L) -> bool {
         vals[(l >> 1) as usize] != (l & 1 == 1)

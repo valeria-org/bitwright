@@ -23,6 +23,7 @@ pub(crate) mod corpus;
 mod diag;
 pub(crate) mod eval;
 pub mod ir;
+pub mod lean;
 mod ledger;
 pub(crate) mod matcher;
 pub(crate) mod order;

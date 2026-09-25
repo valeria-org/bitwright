@@ -40,6 +40,14 @@ pub struct CheckConfig {
     pub samples: u32,
     /// Seed for sampling.
     pub seed: u64,
+    /// How many width assignments too wide to enumerate the native prover proves
+    /// ([`crate::prove::rule`]; 0: none): widths 8, 32 and 64, standard floating-point
+    /// formats, each with every rounding mode; every admitted assignment of a rule over fixed
+    /// widths. A rule with no assignment small enough to enumerate is sound when every one of
+    /// those is proved.
+    pub proofs: u32,
+    /// The SAT solver's conflict budget per proof.
+    pub proof_conflicts: u64,
 }
 
 impl Default for CheckConfig {
@@ -53,6 +61,8 @@ impl Default for CheckConfig {
             ],
             samples: 64,
             seed: 0x5eed_cafe,
+            proofs: 0,
+            proof_conflicts: 100_000,
         }
     }
 }
@@ -63,6 +73,8 @@ setters!(CheckConfig {
     with_sample_widths: sample_widths: Vec<u16>,
     with_samples: samples: u32,
     with_seed: seed: u64,
+    with_proofs: proofs: u32,
+    with_proof_conflicts: proof_conflicts: u64,
 });
 
 impl CheckConfig {
@@ -98,6 +110,10 @@ pub struct Evidence {
     /// Whether every admitted width assignment of the rule was checked exhaustively (so
     /// sampling adds nothing).
     pub complete: bool,
+    /// Width assignments proved by the native prover.
+    pub proved_instances: u32,
+    /// Width assignments the native prover did not decide.
+    pub unproved_instances: u32,
 }
 
 impl Evidence {
@@ -120,7 +136,16 @@ impl fmt::Display for Evidence {
             self.sampled_instances,
             self.sampled_cases,
             self.sampled_fired
-        )
+        )?;
+        // Only with proofs, so ledgers written without them keep their lines.
+        if self.proved_instances + self.unproved_instances > 0 {
+            write!(
+                f,
+                " proved(inst={},open={})",
+                self.proved_instances, self.unproved_instances
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -666,7 +691,29 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
             }
         }
     }
-    let verdict = verdict.unwrap_or(if ev.exhaustive_instances == 0 {
+    // Native proofs at assignments too wide to enumerate.
+    if verdict.is_none() && cfg.proofs > 0 {
+        let pcfg = crate::prove::Config::default().with_max_conflicts(cfg.proof_conflicts);
+        for ws in proof_assignments(rule, &admitted_all, cfg) {
+            match crate::prove::rule(rule, &ws, &pcfg) {
+                Ok(crate::prove::RuleOutcome::Proved(_)) => ev.proved_instances += 1,
+                Ok(crate::prove::RuleOutcome::Refuted(params)) => {
+                    let lets = eval_lets(rule, &ws, &params);
+                    let side = |n| eval(rule, n, &ws, &params, &lets).and_then(Val::bv);
+                    if let (Some(l), Some(r)) = (side(rule.lhs), side(rule.rhs)) {
+                        verdict = Some(Verdict::Unsound(counterexample(rule, &ws, &params, l, r)));
+                        break;
+                    }
+                    ev.unproved_instances += 1;
+                }
+                _ => ev.unproved_instances += 1,
+            }
+        }
+    }
+    let proved_all = ev.proved_instances > 0 && ev.unproved_instances == 0;
+    let verdict = verdict.unwrap_or(if ev.exhaustive_instances == 0 && proved_all {
+        Verdict::Sound
+    } else if ev.exhaustive_instances == 0 {
         Verdict::Inconclusive("no admitted width assignment is small enough to check exhaustively")
     } else if ev.exhaustive_fired == 0 {
         Verdict::Inconclusive("the guard never held in the exhaustive tier")
@@ -683,6 +730,48 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
         evidence: ev,
         examples: check_examples(rule),
     }
+}
+
+/// The assignments [`CheckConfig::proofs`] asks the native prover about: every admitted one of
+/// a rule over fixed widths; else those wider than the exhaustive tier at widths 8, 32 and 64
+/// (standard formats, binary16, binary32 and binary64, for floating-point rules), or the first
+/// wider ones; at most `proofs` width assignments, each with every rounding mode.
+fn proof_assignments(rule: &Rule, admitted_all: &[Vec<u16>], cfg: &CheckConfig) -> Vec<Vec<u16>> {
+    let nw = rule.width_vars.len();
+    if nw == 0 {
+        return admitted_all.to_vec();
+    }
+    let wide = |ws: &[u16]| ws[..nw].iter().any(|&w| w > cfg.max_exhaustive_width);
+    let float = rule.nodes.iter().any(|n| matches!(n, RNode::Fp(_)));
+    let standard = |ws: &[u16]| {
+        if float {
+            let formats = [(5u16, 11u16), (8, 24), (11, 53)];
+            ws[..nw]
+                .chunks(2)
+                .all(|p| p.len() == 2 && formats.contains(&(p[0], p[1])))
+        } else {
+            ws[..nw].iter().all(|w| [8, 32, 64].contains(w))
+        }
+    };
+    let mut widths: Vec<Vec<u16>> = Vec::new();
+    for ws in admitted_all.iter().filter(|ws| wide(ws) && standard(ws)) {
+        if !widths.contains(&ws[..nw].to_vec()) {
+            widths.push(ws[..nw].to_vec());
+        }
+    }
+    if widths.is_empty() {
+        for ws in admitted_all.iter().filter(|ws| wide(ws)) {
+            if !widths.contains(&ws[..nw].to_vec()) {
+                widths.push(ws[..nw].to_vec());
+            }
+        }
+    }
+    widths.truncate(cfg.proofs as usize);
+    admitted_all
+        .iter()
+        .filter(|ws| widths.contains(&ws[..nw].to_vec()))
+        .cloned()
+        .collect()
 }
 
 /// Checks every rule of a program, in parallel across threads.

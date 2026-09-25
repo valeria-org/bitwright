@@ -103,7 +103,28 @@
   certificate: the clauses and a DRUP proof, checked by an independent forward checker
   (`Certificate::check`) and printable as DIMACS and DRAT for any other checker. Without a
   certificate, questions are first simplified by bitwright's engine, which settles what
-  bit-level SAT finds hard (MBA products).
+  bit-level SAT finds hard (MBA products). Floating-point operations are blasted too (every
+  operation of every format, under every rounding mode; the circuits agree with the reference
+  semantics exhaustively in tiny formats and on special and random values in the standard
+  ones).
+- **Proving rules.** `prove::rule` proves a rule's obligation at chosen widths (guard, lets and
+  fact predicates read as the SMT obligations read them), splitting a constant parameter into
+  the constants its guard admits when the whole question runs out of budget, so `x / 2^k` is
+  proved in binary16 and binary32. `prove::rule_all_widths` proves every assignment up to a
+  bound, and settles a rule of bitwise operations for every width at width 1. The checker
+  proves rules at widths too wide to enumerate on request (`CheckConfig::with_proofs`,
+  `bitwright check --prove`: 8, 32 and 64 bits, binary16, binary32 and binary64): a rule with
+  no assignment small enough to enumerate becomes sound by proof, and a refutation is a
+  counterexample. With 20,000 conflicts per question, the built-in rules are proved at two
+  assignments each of widths 4, 8 and 16 (577 proofs) but `select_swapped_mul` at 8 bits, and
+  the floating-point rules in binary16, binary32 and binary64 but `x / 2^k` in binary64 and
+  `√(x·x)` in binary32 and binary64.
+- **Rules as Lean theorems.** `bitwright lean` (`rules::lean::lean`) writes rules as Lean 4
+  theorems over `BitVec`, for every width (proofs `sorry`), or with `--at 8` at fixed widths
+  proved by `bv_decide`, whose certificates Lean's kernel checks. Lean elaborates every
+  statement of the built-in rules it can state (272 of 313: floating point, bit counts, `pdep`
+  and `pext` are left out), and `bv_decide` proves all of them at 8 bits but two
+  multiplication identities, which exceed its budget.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

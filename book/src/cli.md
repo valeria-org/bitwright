@@ -8,10 +8,11 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 
 | Command | What it does |
 |-|-|
-| `bitwright check rules.bwr` | Checks every rule's soundness and examples; exits 1 unless every rule is sound and every example holds. `--thorough` checks more widths and bits exhaustively; `--ledger out.proof` writes the proof ledger; `--against rules.bwr.proof` compares with an existing ledger. |
+| `bitwright check rules.bwr` | Checks every rule's soundness and examples; exits 1 unless every rule is sound and every example holds. `--thorough` checks more widths and bits exhaustively; `--prove` also proves each rule with the native prover at widths too wide to enumerate (8, 32 and 64; binary16, 32 and 64); `--ledger out.proof` writes the proof ledger; `--against rules.bwr.proof` compares with an existing ledger. |
 | `bitwright lint rules.bwr` | Prints every diagnostic, rendered with its position. |
 | `bitwright smt rules.bwr` | Prints each rule's soundness obligation as SMT-LIB, separated by `(reset)`, at every admitted assignment of the widths 8, 32 and 64; a rule admitted at none of those gets three other admitted assignments. `--widths 13` (one width per width variable) and `--rule group::name` narrow it. A rule with no obligation prints a line the solver echoes (`SKIPPED …`) and the command exits 1. |
 | `bitwright catalog [rules.bwr]` | A Markdown catalog of the rules: the built-in rules without a file. |
+| `bitwright lean [rules.bwr] [--at 8]` | The rules as Lean 4 theorems over `BitVec`: for every width with `sorry` proofs, or with `--at` at fixed widths proved by `bv_decide` (see [Checking rules](checking.md#rules-as-lean-theorems)). |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
 | `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). |
 

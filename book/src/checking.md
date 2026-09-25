@@ -14,8 +14,9 @@ rule's obligation, *if the guard holds then the pattern equals the template*, on
 The verdict is `Sound` only when there is no counterexample and the guard actually held in the
 exhaustive tier (and in the sampled tier, unless the exhaustive tier covered every admitted
 width). Otherwise it is `Unsound` with a counterexample, or `Inconclusive` with the missing tier
-named. This is testing, not proof: for proof at wide widths, export the obligations to an SMT
-solver (see [SMT-LIB](smtlib.md)).
+named. This is testing, not proof: for proof at wide widths, ask the native prover (see
+[Proving rules](#proving-rules)) or export the obligations to an SMT solver (see
+[SMT-LIB](smtlib.md)).
 
 ```rust
 use bitwright::check::{CheckConfig, Verdict, check_program};
@@ -38,6 +39,73 @@ match &checks[1].verdict {
 }
 # Ok::<(), String>(())
 ```
+
+## Proving rules
+
+`CheckConfig::with_proofs(n)` (`bitwright check --prove`, with `n` = 3) also proves each rule
+with bitwright's native prover at up to `n` width assignments too wide to enumerate: widths 8,
+32 and 64 for a rule over bit-vectors, binary16, binary32 and binary64 for a floating-point rule
+(each under every rounding mode), and every assignment of a rule over fixed widths. The prover
+bit-blasts the obligation, floating-point operations included, and decides it with its own SAT
+solver; a constant parameter under a guard (`c` a power of two) is split into the constants the
+guard admits when the whole question is too hard. A refutation is a counterexample, checked by
+evaluation; a rule with no assignment small enough to enumerate is `Sound` when every one of
+its proofs succeeds; the evidence counts the assignments proved and those left open (the
+solver has a conflict budget, `with_proof_conflicts`).
+
+`prove::rule` asks about one assignment, with a certificate on request: the clauses and a DRUP
+proof, checked by an independent checker. `prove::rule_all_widths` proves every assignment up
+to a bound, and settles a rule of bitwise operations on its parameters and the constants 0 and
+all ones for every width at once: bit `i` of each side is one Boolean function of bit `i` of
+the parameters, the same at every position and every width, so width 1 decides it.
+
+```rust
+use bitwright::check::{CheckConfig, check_program};
+use bitwright::prove::{self, Config, RuleOutcome};
+use bitwright::rules::RuleProgram;
+
+let src = "bitwright 1;
+group demo {
+    #[allow(BW0407)]
+    rule wide(x: 64, y: 64) { (x ^ y) + 2 * (x & y) => x + y }
+
+    #[example(\"p & (p | q)\" => \"p\")]
+    rule absorb<W>(x: W, y: W) { x & (x | y) => x }
+}";
+let program = RuleProgram::compile(src).map_err(|e| e.to_string())?;
+// At 64 bits there is nothing to enumerate: sampling alone would be inconclusive.
+let checks = check_program(&program, &CheckConfig::default().with_proofs(3));
+assert!(checks[0].is_sound());
+assert_eq!(checks[0].evidence.proved_instances, 1);
+
+// One rule at chosen widths, with a certificate that an independent checker verifies.
+let absorb = &program.rules()[1];
+match prove::rule(absorb, &[128], &Config::default().with_certificate(true))? {
+    RuleOutcome::Proved(Some(certificate)) => certificate.check()?,
+    other => panic!("{other:?}"),
+}
+// Bitwise operations only: width 1 settles every width.
+assert!(prove::rule_all_widths(absorb, 64, &Config::default())?.every_width);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### Rules as Lean theorems
+
+`bitwright lean rules.bwr` (`rules::lean::lean`) writes the rules as Lean 4 theorems over
+`BitVec`, for every width: the width variables universally quantified (positive, and meeting
+the `where` constraints), the guard a hypothesis, the proof `sorry` for you to write. A proof in
+Lean covers every width at once, which neither the checker nor the prover can. `--at 8` writes
+each rule instead at the widest widths up to 8 it admits, proved by `bv_decide`, whose
+certificates Lean's kernel checks: an oracle that shares nothing with bitwright. Division is
+SMT-LIB's (`BitVec.smtUDiv`); floating point, bit counts, `pdep` and `pext`, which Lean's core
+`BitVec` lacks, leave a rule out with a comment.
+
+```text
+$ bitwright lean --at 8 > rules8.lean && lean rules8.lean
+```
+
+At 8 bits `bv_decide` proves every built-in rule Lean can state but the distributivity and
+associativity of multiplication, which run out of its budget.
 
 ## Proof ledgers
 

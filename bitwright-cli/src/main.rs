@@ -15,10 +15,13 @@ const USAGE: &str = "\
 usage: bitwright <command> [options]
 
 commands:
-  check <file.bwr> [--thorough] [--ledger <out>] [--against <ledger>]
+  check <file.bwr> [--thorough] [--prove] [--ledger <out>] [--against <ledger>]
         check every rule's soundness and examples; exit 1 unless every rule is sound and every
         example holds. `--ledger` writes the proof ledger; `--against` compares with an
-        existing one.
+        existing one. `--prove` also proves each rule with the native prover at widths too wide
+        to enumerate (8, 32 and 64; binary16, binary32 and binary64 for floating-point rules;
+        every assignment of a rule over fixed widths), so a rule with none small enough to
+        enumerate can be proved sound.
   lint <file.bwr>
         compile and print every diagnostic; exit 1 on errors.
   smt <file.bwr> [--rule <group::name>] [--widths <w,...>]
@@ -30,6 +33,10 @@ commands:
         A rule with no obligation prints a SKIPPED line a solver echoes, and exits 1.
   catalog [<file.bwr>]
         a Markdown catalog of the rules (the built-in rules without a file).
+  lean [<file.bwr>] [--at <n>]
+        the rules (the built-in ones without a file) as Lean 4 theorems over BitVec, for every
+        width, their proofs left as `sorry`; with `--at`, at the widest widths up to <n> each
+        rule admits, proved by `bv_decide` (`lean rules.lean` checks them).
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
@@ -154,6 +161,7 @@ fn run(args: &[String]) -> Result<String, Fail> {
         "lint" => lint(rest),
         "smt" => smt(rest),
         "catalog" => catalog(rest),
+        "lean" => lean(rest),
         "explain" => {
             let a = Args::parse(rest, &[], &[])?;
             let code = a.one("diagnostic code")?;
@@ -177,15 +185,22 @@ fn compile(path: &str, src: &str) -> Result<RuleProgram, Fail> {
 }
 
 fn check(rest: &[String]) -> Result<String, Fail> {
-    let a = Args::parse(rest, &["thorough", "ledger", "against"], &["thorough"])?;
+    let a = Args::parse(
+        rest,
+        &["thorough", "prove", "ledger", "against"],
+        &["thorough", "prove"],
+    )?;
     let path = a.one("rule file")?;
     let src = read(path)?;
     let program = compile(path, &src)?;
-    let cfg = if a.flag("thorough") {
+    let mut cfg = if a.flag("thorough") {
         CheckConfig::thorough()
     } else {
         CheckConfig::default()
     };
+    if a.flag("prove") {
+        cfg = cfg.with_proofs(3);
+    }
     let checks = check_program(&program, &cfg);
     let mut out = String::new();
     let (mut sound, mut unsound, mut inconclusive, mut bad_examples) = (0, 0, 0, 0);
@@ -194,9 +209,18 @@ fn check(rest: &[String]) -> Result<String, Fail> {
         match &c.verdict {
             Verdict::Sound => {
                 sound += 1;
+                let proved = if e.proved_instances + e.unproved_instances > 0 {
+                    format!(
+                        "; proved at {} of {} wide assignments",
+                        e.proved_instances,
+                        e.proved_instances + e.unproved_instances
+                    )
+                } else {
+                    String::new()
+                };
                 writeln!(
                     out,
-                    "sound         {}  ({} exhaustive cases to W = {}{}, {} sampled; guard held {} times)",
+                    "sound         {}  ({} exhaustive cases to W = {}{}, {} sampled; guard held {} times{proved})",
                     c.name,
                     e.exhaustive_cases,
                     e.exhaustive_max_width,
@@ -422,6 +446,33 @@ fn smt(rest: &[String]) -> Result<String, Fail> {
         writeln!(out, "; {} rules skipped", skipped.len()).ok();
         Err(Fail::Report(out))
     }
+}
+
+fn lean(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["at"], &[])?;
+    let at = match a.value("at") {
+        Some(v) => Some(
+            v.parse::<u16>()
+                .ok()
+                .filter(|&w| w > 0)
+                .ok_or_else(|| usage(format!("--at: {v} is not a width")))?,
+        ),
+        None => None,
+    };
+    let files: Vec<(String, String)> = match a.pos.as_slice() {
+        [] => builtin_sources()
+            .iter()
+            .map(|(n, s, _)| (n.to_string(), s.to_string()))
+            .collect(),
+        [p] => vec![(p.clone(), read(p)?)],
+        _ => return Err(usage("expected at most one rule file")),
+    };
+    let programs = files
+        .iter()
+        .map(|(path, src)| compile(path, src))
+        .collect::<Result<Vec<_>, _>>()?;
+    let refs: Vec<&RuleProgram> = programs.iter().collect();
+    Ok(bitwright::rules::lean::lean(&refs, at))
 }
 
 fn catalog(rest: &[String]) -> Result<String, Fail> {
