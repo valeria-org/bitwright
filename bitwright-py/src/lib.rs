@@ -1344,9 +1344,11 @@ impl PyExpr {
                 &standard
             }
         };
-        Ok(run(py, engine, &[self], Budget::default(), None, None, None)?
-            .remove(0)
-            .expr)
+        Ok(
+            run(py, engine, &[self], Budget::default(), None, None, None)?
+                .remove(0)
+                .expr,
+        )
     }
 
     /// Whether this equals `other` for every value of the symbols: True (proved), a dict of
@@ -1676,9 +1678,7 @@ fn run(
             let mut c = pycx.cx.lock().unwrap_or_else(|p| p.into_inner());
             let a = assumptions.map(|a| a.a.lock().unwrap_or_else(|p| p.into_inner()));
             if let Some(threads) = threads {
-                let mut each = Each::default()
-                    .with_threads(threads)
-                    .with_per_root(budget);
+                let mut each = Each::default().with_threads(threads).with_per_root(budget);
                 if let Some(a) = &a {
                     each = each.with_assumptions(a);
                 }
@@ -1944,9 +1944,17 @@ impl PyEngine {
     ) -> PyResult<(PyExpr, Vec<Step>)> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let mut trace = Trace::default();
-        let out = run(py, self, &[&expr], budget, assumptions, Some(&mut trace), None)?
-            .remove(0)
-            .expr;
+        let out = run(
+            py,
+            self,
+            &[&expr],
+            budget,
+            assumptions,
+            Some(&mut trace),
+            None,
+        )?
+        .remove(0)
+        .expr;
         let cx = expr.cx.bind(py);
         let c = cx.get().lock(py);
         let steps = trace

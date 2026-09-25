@@ -593,11 +593,14 @@ def test_lifting(cx):
            t5 = Add64(t2,t4)
            PUT(rax) = t5""",
     )
-    assert str(b.register("rax").simplify()) == "rdi + rsi"
+    rax = b.register("rax")
+    assert rax is not None and str(rax.simplify()) == "rdi + rsi"
     p = bw.lift_pcode(cx, "(register, RAX, 8) = INT_MULT (register, RDI, 8) , (const, 0x2, 8)")
-    assert str(p.register("RAX").simplify()) == "RDI + RDI"
+    rax = p.register("RAX")
+    assert rax is not None and str(rax.simplify()) == "RDI + RDI"
     ll = bw.lift_llvm(cx, "define i32 @f(i32 %a) {\n  %r = shl i32 %a, 1\n  ret i32 %r\n}\n")
-    assert str(ll.register("ret").simplify()) == "a + a"
+    ret = ll.register("ret")
+    assert ret is not None and str(ret.simplify()) == "a + a"
 
 
 def test_transformations():

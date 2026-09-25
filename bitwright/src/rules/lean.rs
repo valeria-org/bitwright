@@ -10,7 +10,7 @@
 //! hypotheses (fact predicates read as what they state about values, as the SMT obligations
 //! read them) and its `let`s written out. The checker establishes a rule at the widths it
 //! enumerates and samples, and the native prover at the ones it is asked about; a proof of the
-//! Lean statement covers every width at once. [`lean_instances`] states each rule at fixed
+//! Lean statement covers every width at once. [`lean`] with `at` states each rule at fixed
 //! widths instead, proved by `bv_decide`, whose certificates Lean's kernel checks: an oracle
 //! that shares nothing with bitwright.
 //!

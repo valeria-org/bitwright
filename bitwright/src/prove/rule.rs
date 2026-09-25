@@ -276,7 +276,7 @@ fn bin(g: &mut Aig, op: crate::BinOp, a: &[L], b: &[L]) -> Bits {
 /// [`RoundingMode::ALL`](crate::fp::RoundingMode::ALL)). When the solver runs out of conflicts
 /// and the rule has `const` parameters, the proof is split into the values of those the guard
 /// admits (found by the solver, each blocked once proved), each proved with the parameters
-/// fixed, which folds their circuits (a division by a constant), up to [`MAX_CASES`] of them.
+/// fixed, which folds their circuits (a division by a constant), up to 8,192 of them.
 pub fn rule(rule: &Rule, widths: &[u16], cfg: &Config) -> Result<RuleOutcome, Error> {
     if !rule.admits(widths) {
         return Err(Error::Unsupported(format!(

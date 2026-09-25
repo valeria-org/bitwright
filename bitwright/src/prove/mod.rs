@@ -7,7 +7,7 @@
 //!
 //! No other solver is involved. Bit-vector operators are blasted with bitwright's total
 //! semantics (SMT-LIB's); floating-point operators with IEEE 754's and bitwright's canonical
-//! NaN ([`fp`]); extension operations through their [`expand`](crate::ext::ExtOp::expand)
+//! NaN ([`crate::fp`]); extension operations through their [`expand`](crate::ext::ExtOp::expand)
 //! definition, if they have one (otherwise the question is not decided).
 //!
 //! ```

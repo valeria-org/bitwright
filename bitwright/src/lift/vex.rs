@@ -352,7 +352,7 @@ impl State<'_> {
     }
 }
 
-/// Reads an IRSB (see the [module](self) documentation).
+/// Reads an IRSB (see [`lift`](crate::lift)).
 pub fn vex(cx: &mut Context, text: &str) -> Result<Block, Error> {
     let mut st = State {
         cx,

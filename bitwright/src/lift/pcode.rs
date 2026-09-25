@@ -488,7 +488,7 @@ impl State<'_> {
     }
 }
 
-/// Reads a block of p-code (see the [module](self) documentation), until a `BRANCH` or
+/// Reads a block of p-code (see [`lift`](crate::lift)), until a `BRANCH` or
 /// `RETURN` (a `CBRANCH` is an exit; the code after it runs as if it was not taken).
 pub fn pcode(cx: &mut Context, text: &str) -> Result<Block, Error> {
     let mut ops = Vec::new();

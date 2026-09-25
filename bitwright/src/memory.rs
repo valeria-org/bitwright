@@ -531,19 +531,23 @@ mod tests {
         let v1 = m.store(&mut cx, m.initial(), p, x8).unwrap();
         let at_q = m.load(&mut cx, v1, q, 1).unwrap();
         assert_eq!(cx.display(at_q).to_string(), "select(p == q, x, m.0)");
-        // Two reads of unknown memory at addresses that may be equal agree when they are.
-        let r1 = m.load(&mut cx, m.initial(), p, 1).unwrap();
-        let r2 = m.load(&mut cx, m.initial(), q, 1).unwrap();
-        let same = cx.cmp(CmpOpExt::Eq, p, q).unwrap();
-        let eq = cx.cmp(CmpOpExt::Eq, r1, r2).unwrap();
-        let claim = {
-            let n = cx.un(crate::UnOp::Not, same).unwrap();
-            cx.bin(BinOp::Or, n, eq).unwrap()
-        };
-        assert!(matches!(
-            crate::prove::valid(&mut cx, claim, &crate::prove::Config::default()).unwrap(),
-            crate::prove::Outcome::Proved(_)
-        ));
+        // Two reads of unknown memory at addresses that may be equal agree when they are
+        // (proved by the native prover, when it is built).
+        #[cfg(feature = "prove")]
+        {
+            let r1 = m.load(&mut cx, m.initial(), p, 1).unwrap();
+            let r2 = m.load(&mut cx, m.initial(), q, 1).unwrap();
+            let same = cx.cmp(CmpOpExt::Eq, p, q).unwrap();
+            let eq = cx.cmp(CmpOpExt::Eq, r1, r2).unwrap();
+            let claim = {
+                let n = cx.un(crate::UnOp::Not, same).unwrap();
+                cx.bin(BinOp::Or, n, eq).unwrap()
+            };
+            assert!(matches!(
+                crate::prove::valid(&mut cx, claim, &crate::prove::Config::default()).unwrap(),
+                crate::prove::Outcome::Proved(_)
+            ));
+        }
     }
 
     #[test]
