@@ -233,7 +233,10 @@ group mine {
     std::fs::copy(&proof, format!("{changed}.proof")).unwrap();
     let (code, _, err) = run(&["simplify", expr, "--rules", &changed]);
     assert_eq!(code, 1);
-    assert!(err.contains("does not vouch for mine::popcnt_complement"), "{err}");
+    assert!(
+        err.contains("does not vouch for mine::popcnt_complement"),
+        "{err}"
+    );
     // Unsound rules are refused, with the counterexample.
     let bad = file("bad-rules.bwr", UNSOUND);
     let (code, _, err) = run(&["simplify", "x + y", "--rules", &bad]);
