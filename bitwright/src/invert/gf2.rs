@@ -149,9 +149,7 @@ pub(crate) fn solve(rows: &[u128], y: &[bool], wv: u32) -> Option<Option<u128>> 
     let mut row = 0;
     for col in 0..wv {
         let bit = 1u128 << col;
-        let Some(p) = (row..m.len()).find(|&i| m[i].0 & bit != 0) else {
-            return None;
-        };
+        let p = (row..m.len()).find(|&i| m[i].0 & bit != 0)?;
         m.swap(row, p);
         let (pr, pv) = m[row];
         for (i, e) in m.iter_mut().enumerate() {

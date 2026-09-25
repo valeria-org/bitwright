@@ -80,9 +80,7 @@ fn region(cx: &Context, n: u32) -> Option<(u32, Vec<u32>)> {
                 OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
             ) && c == node.b
             {
-                if cx.const_val(c).is_none() {
-                    return None;
-                }
+                cx.const_val(c)?;
                 continue;
             }
             stack.push(c);
