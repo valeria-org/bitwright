@@ -37,6 +37,10 @@
   - A result is equal to its input wherever the symbols agree with their declarations.
   - Sampled verification and the equality-saturation check use points that agree with them.
   - SMT-LIB export asserts them, and `Context::import` carries them.
+- **Cheaper facts up to 64 bits.** The transfers of addition, subtraction, `&`, `|` and `^`
+  (and the carry chain) run on machine words for widths up to 64, the reduced product
+  included, with the same results. A test compares them with the `BitVec` code. A
+  compiler-shaped run takes about 6 % fewer instructions.
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.

@@ -110,7 +110,60 @@ fn over_values(f: &Facts, mut g: impl FnMut(&BitVec) -> Facts) -> Option<Facts> 
 // ----- known-bits helpers ----------------------------------------------------------------------
 
 /// Known bits of `a + b + carry_in` (LLVM's computeForAddCarry, width-generic).
+/// The mask of a word-sized width (1 to 64 bits).
+#[inline]
+fn wmask(w: Width) -> u64 {
+    u64::MAX >> (64 - w.bits())
+}
+
+/// The value of a `BitVec` of at most 64 bits, as a word.
+#[inline]
+fn word(v: &BitVec) -> u64 {
+    v.limbs()[0]
+}
+
+/// A word as a `BitVec` of `w` (at most 64) bits; `v` already fits.
+#[inline]
+fn bv(w: Width, v: u64) -> BitVec {
+    BitVec::from_canonical_u64(w, v)
+}
+
+/// Known bits from word masks (disjoint, within the width).
+#[inline]
+fn kb(w: Width, zero: u64, one: u64) -> KnownBits {
+    KnownBits::from_masks(bv(w, zero), bv(w, one))
+}
+
+/// [`kb_add_carry_wide`] on the words of widths up to 64 (known zero and one bits of each
+/// operand): the same formula, masked to the width.
+#[inline]
+fn add_carry_words(a: (u64, u64), b: (u64, u64), carry_one: bool, m: u64) -> (u64, u64) {
+    let ((az, ao), (bz, bo)) = (a, b);
+    let carry = u64::from(carry_one);
+    let possible_sum_zero = (!az & m).wrapping_add(!bz & m).wrapping_add(carry) & m;
+    let possible_sum_one = ao.wrapping_add(bo).wrapping_add(carry) & m;
+    let carry_known_zero = !(possible_sum_zero ^ az ^ bz) & m;
+    let carry_known_one = possible_sum_one ^ ao ^ bo;
+    let known = (az | ao) & (bz | bo) & (carry_known_zero | carry_known_one);
+    (!possible_sum_zero & known, possible_sum_one & known)
+}
+
+/// [`add_carry_words`] of known bits.
+fn kb_add_carry_word(a: &KnownBits, b: &KnownBits, carry_one: bool, m: u64) -> (u64, u64) {
+    let w = |k: &KnownBits| (word(&k.known_zero()), word(&k.known_one()));
+    add_carry_words(w(a), w(b), carry_one, m)
+}
+
 fn kb_add_carry(a: &KnownBits, b: &KnownBits, carry_one: bool) -> KnownBits {
+    let w = a.width();
+    if w.bits() <= 64 {
+        let (z, o) = kb_add_carry_word(a, b, carry_one, wmask(w));
+        return kb(w, z, o);
+    }
+    kb_add_carry_wide(a, b, carry_one)
+}
+
+fn kb_add_carry_wide(a: &KnownBits, b: &KnownBits, carry_one: bool) -> KnownBits {
     let w = a.width();
     let carry = if carry_one {
         BitVec::one(w)
@@ -402,7 +455,8 @@ fn top_bit_exact(flip: bool, x: &Facts) -> Option<Facts> {
 
 fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     let w = a.width();
-    let top = Facts::top(w);
+    // Built only where a path needs it.
+    let top = || Facts::top(w);
     let full_u = URange::full(w);
     let full_s = SRange::full(w);
     let bin = |x: &BitVec, y: &BitVec| BitVec::bin_unchecked(op, x, y);
@@ -412,56 +466,15 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
         c.to_u64()
             .map_or(u32::MAX, |v| v.min(u64::from(u32::MAX)) as u32)
     });
-    let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or(top);
+    let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or_else(top);
     if matches!(op, BinOp::Xor | BinOp::And)
         && let Some(f) = top_bit(op, a, b, bc.as_ref())
     {
         return f;
     }
     match op {
-        BinOp::Add | BinOp::Sub => {
-            let known = if op == BinOp::Add {
-                kb_add_carry(&a.known, &b.known, false)
-            } else {
-                kb_add_carry(&a.known, &kb_not(&b.known), true)
-            };
-            let (au, bu, as_, bs) = (a.urange, b.urange, a.srange, b.srange);
-            // Without wrap-around, a sum or difference of members steps by the strides' gcd.
-            let stride = gcd(au.stride(), bu.stride());
-            let u = if op == BinOp::Add {
-                let hi = bin(&au.hi(), &bu.hi());
-                if ule(&au.hi(), &hi) {
-                    strided(bin(&au.lo(), &bu.lo()), hi, stride, full_u)
-                } else {
-                    full_u
-                }
-            } else if ule(&bu.hi(), &au.lo()) {
-                strided(
-                    bin(&au.lo(), &bu.hi()),
-                    bin(&au.hi(), &bu.lo()),
-                    stride,
-                    full_u,
-                )
-            } else {
-                full_u
-            };
-            let s = {
-                // No signed overflow at either end means none in between.
-                let (lo, hi) = if op == BinOp::Add {
-                    ((as_.lo(), bs.lo()), (as_.hi(), bs.hi()))
-                } else {
-                    ((as_.lo(), bs.hi()), (as_.hi(), bs.lo()))
-                };
-                match (
-                    signed_exact(op, &lo.0, &lo.1),
-                    signed_exact(op, &hi.0, &hi.1),
-                ) {
-                    (Some(l), Some(h)) => SRange::new(l, h).unwrap_or(full_s),
-                    _ => full_s,
-                }
-            };
-            reduce(known, u, s)
-        }
+        BinOp::Add | BinOp::Sub if w.bits() <= 64 => add_sub_word(op, a, b),
+        BinOp::Add | BinOp::Sub => add_sub_wide(op, a, b),
         BinOp::Mul => {
             let known = kb_mul(&a.known, &b.known);
             let (au, bu) = (a.urange, b.urange);
@@ -491,7 +504,7 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
             let (au, bu) = (a.urange, b.urange);
             from_urange(bin(&au.lo(), &bu.lo()), bin(&au.hi(), &bu.hi()))
         }
-        BinOp::SMulHi => top,
+        BinOp::SMulHi => top(),
         BinOp::UDiv => {
             let (au, bu) = (a.urange, b.urange);
             if bu.hi().is_zero() {
@@ -572,7 +585,7 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                     return reduce(KnownBits::unknown(w), full_u, s);
                 }
             }
-            top
+            top()
         }
         BinOp::SRem => {
             // |r| < |d| and the sign follows the dividend (narrow widths).
@@ -603,8 +616,191 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 .unwrap_or(full_s);
                 return reduce(KnownBits::unknown(w), full_u, s);
             }
-            top
+            top()
         }
+        BinOp::And | BinOp::Or | BinOp::Xor if w.bits() <= 64 => bitwise_word(op, a, b),
+        BinOp::And | BinOp::Or | BinOp::Xor => bitwise_wide(op, a, b),
+        BinOp::Shl | BinOp::LShr | BinOp::AShr | BinOp::RotL | BinOp::RotR => {
+            if let Some(c) = count {
+                let rotate = matches!(op, BinOp::RotL | BinOp::RotR);
+                let c = if rotate {
+                    // The count's full value modulo W.
+                    let cv = b.known.as_constant().unwrap_or(BitVec::zero(w));
+                    let m = BitVec::bin_unchecked(BinOp::URem, &cv, &small(w, u64::from(w.bits())));
+                    m.to_u64().unwrap_or(0) as u32
+                } else {
+                    c
+                };
+                let known = kb_shift_const(op, &a.known, c);
+                let (u, s) = shift_ranges(op, a, c);
+                return reduce(known, u, s);
+            }
+            if let Some(f) = over_values(b, |cv| binary(op, a, &Facts::constant(cv))) {
+                return f;
+            }
+            shift_symbolic(op, a, b)
+        }
+        BinOp::Pdep | BinOp::Pext => bit_permute(op, a, b),
+    }
+}
+
+/// Addition and subtraction: known bits through the carries, strided unsigned ranges without
+/// wrap-around, signed ranges without overflow at either end.
+fn add_sub_wide(op: BinOp, a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let top = Facts::top(w);
+    let full_u = URange::full(w);
+    let full_s = SRange::full(w);
+    let bin = |x: &BitVec, y: &BitVec| BitVec::bin_unchecked(op, x, y);
+    let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or(top);
+
+    let known = if op == BinOp::Add {
+        kb_add_carry_wide(&a.known, &b.known, false)
+    } else {
+        kb_add_carry_wide(&a.known, &kb_not(&b.known), true)
+    };
+    let (au, bu, as_, bs) = (a.urange, b.urange, a.srange, b.srange);
+    // Without wrap-around, a sum or difference of members steps by the strides' gcd.
+    let stride = gcd(au.stride(), bu.stride());
+    let u = if op == BinOp::Add {
+        let hi = bin(&au.hi(), &bu.hi());
+        if ule(&au.hi(), &hi) {
+            strided(bin(&au.lo(), &bu.lo()), hi, stride, full_u)
+        } else {
+            full_u
+        }
+    } else if ule(&bu.hi(), &au.lo()) {
+        strided(
+            bin(&au.lo(), &bu.hi()),
+            bin(&au.hi(), &bu.lo()),
+            stride,
+            full_u,
+        )
+    } else {
+        full_u
+    };
+    let s = {
+        // No signed overflow at either end means none in between.
+        let (lo, hi) = if op == BinOp::Add {
+            ((as_.lo(), bs.lo()), (as_.hi(), bs.hi()))
+        } else {
+            ((as_.lo(), bs.hi()), (as_.hi(), bs.lo()))
+        };
+        match (
+            signed_exact(op, &lo.0, &lo.1),
+            signed_exact(op, &hi.0, &hi.1),
+        ) {
+            (Some(l), Some(h)) => SRange::new(l, h).unwrap_or(full_s),
+            _ => full_s,
+        }
+    };
+    reduce(known, u, s)
+}
+
+/// Word-sized facts as words: `[known zero, known one, ulo, uhi, stride, slo, shi]`.
+#[inline]
+fn words(f: &Facts) -> [u64; 7] {
+    super::to_words(f)
+}
+
+/// The unsigned interval `URange::strided(lo, hi, stride)` makes, else `URange::new(lo, hi)`,
+/// else every value, as words (the `strided` helper on words).
+#[inline]
+fn u_strided(lo: u64, hi: u64, stride: u64, m: u64) -> super::narrow::U<u64> {
+    if lo > hi {
+        (0, m, 1)
+    } else if lo == hi {
+        (lo, lo, 0)
+    } else if stride >= 1 && (hi - lo).is_multiple_of(stride) {
+        (lo, hi, stride)
+    } else {
+        (lo, hi, 1)
+    }
+}
+
+/// The signed interval `SRange::new(lo, hi)` makes, else every value, as words.
+#[inline]
+fn s_new(lo: u64, hi: u64, w: Width) -> (u64, u64) {
+    let sign = 1u64 << (w.bits() - 1);
+    if (lo ^ sign) <= (hi ^ sign) {
+        (lo, hi)
+    } else {
+        (sign, sign.wrapping_sub(1) & wmask(w))
+    }
+}
+
+/// `Facts::reduce` of word components, or nothing known if they contradict.
+#[inline]
+fn reduce_words(w: Width, z: u64, o: u64, u: super::narrow::U<u64>, s: (u64, u64)) -> Facts {
+    super::narrow::reduce_raw::<u64>(w, z, o, u, s.0, s.1).unwrap_or_else(|| Facts::top(w))
+}
+
+/// [`add_sub_wide`] on the words of widths up to 64: the same steps, masked to the width, so
+/// the same facts (a test compares them).
+fn add_sub_word(op: BinOp, a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let m = wmask(w);
+    let add = op == BinOp::Add;
+    let [az, ao, alo, ahi, astride, aslo, ashi] = words(a);
+    let [bz, bo, blo, bhi, bstride, bslo, bshi] = words(b);
+    // Subtraction adds the complement and a carry.
+    let (z, o) = if add {
+        add_carry_words((az, ao), (bz, bo), false, m)
+    } else {
+        add_carry_words((az, ao), (bo, bz), true, m)
+    };
+    let stride = gcd(astride, bstride);
+    let u = if add {
+        let hi = ahi.wrapping_add(bhi) & m;
+        if ahi <= hi {
+            u_strided(alo.wrapping_add(blo) & m, hi, stride, m)
+        } else {
+            (0, m, 1)
+        }
+    } else if bhi <= alo {
+        u_strided(
+            alo.wrapping_sub(bhi) & m,
+            ahi.wrapping_sub(blo) & m,
+            stride,
+            m,
+        )
+    } else {
+        (0, m, 1)
+    };
+    // Signed bounds as integers; a result outside the width's signed range overflowed.
+    let shift = 64 - u32::from(w.bits());
+    let signed = |v: u64| i128::from(((v << shift) as i64) >> shift);
+    let (smin, smax) = (-(1i128 << (w.bits() - 1)), (1i128 << (w.bits() - 1)) - 1);
+    let exact = |x: u64, y: u64| {
+        let (x, y) = (signed(x), signed(y));
+        let r = if add { x + y } else { x - y };
+        (smin..=smax).contains(&r).then_some((r as u64) & m)
+    };
+    let (lo, hi) = if add {
+        (exact(aslo, bslo), exact(ashi, bshi))
+    } else {
+        (exact(aslo, bshi), exact(ashi, bslo))
+    };
+    let s = match (lo, hi) {
+        (Some(l), Some(h)) => s_new(l, h, w),
+        _ => s_new(
+            1 << (w.bits() - 1),
+            (1u64 << (w.bits() - 1)).wrapping_sub(1) & m,
+            w,
+        ),
+    };
+    reduce_words(w, z, o, u, s)
+}
+
+/// And, or and xor (after `top_bit`): known bits bit by bit, and for `&` and `|` a bound from
+/// the operands' unsigned ranges.
+fn bitwise_wide(op: BinOp, a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let top = Facts::top(w);
+    let full_u = URange::full(w);
+    let full_s = SRange::full(w);
+    let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or(top);
+    match op {
         BinOp::And => {
             let known = KnownBits::from_masks(
                 bv_or(&a.known.known_zero(), &b.known.known_zero()),
@@ -649,27 +845,36 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 bv_or(&bv_and(&az, &bo), &bv_and(&ao, &bz)),
             ))
         }
-        BinOp::Shl | BinOp::LShr | BinOp::AShr | BinOp::RotL | BinOp::RotR => {
-            if let Some(c) = count {
-                let rotate = matches!(op, BinOp::RotL | BinOp::RotR);
-                let c = if rotate {
-                    // The count's full value modulo W.
-                    let cv = b.known.as_constant().unwrap_or(BitVec::zero(w));
-                    let m = BitVec::bin_unchecked(BinOp::URem, &cv, &small(w, u64::from(w.bits())));
-                    m.to_u64().unwrap_or(0) as u32
-                } else {
-                    c
-                };
-                let known = kb_shift_const(op, &a.known, c);
-                let (u, s) = shift_ranges(op, a, c);
-                return reduce(known, u, s);
-            }
-            if let Some(f) = over_values(b, |cv| binary(op, a, &Facts::constant(cv))) {
-                return f;
-            }
-            shift_symbolic(op, a, b)
+        _ => top,
+    }
+}
+
+/// [`bitwise_wide`] on the words of widths up to 64: the same steps, so the same facts.
+fn bitwise_word(op: BinOp, a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let m = wmask(w);
+    let [az, ao, alo, ahi, ..] = words(a);
+    let [bz, bo, blo, bhi, ..] = words(b);
+    let sign = 1u64 << (w.bits() - 1);
+    let full_s = (sign, sign.wrapping_sub(1) & m);
+    // `URange::new(lo, hi)`, else every value.
+    let interval = |lo: u64, hi: u64| {
+        if lo <= hi {
+            (lo, hi, u64::from(lo != hi))
+        } else {
+            (0, m, 1)
         }
-        BinOp::Pdep | BinOp::Pext => bit_permute(op, a, b),
+    };
+    match op {
+        BinOp::And => reduce_words(w, az | bz, ao & bo, interval(0, ahi.min(bhi)), full_s),
+        BinOp::Or => reduce_words(w, az & bz, ao | bo, interval(alo.max(blo), m), full_s),
+        _ => reduce_words(
+            w,
+            (az & bz) | (ao & bo),
+            (az & bo) | (ao & bz),
+            (0, m, 1),
+            full_s,
+        ),
     }
 }
 
@@ -1054,5 +1259,117 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
             }
         }
         TOp::Fp(d) => super::fp::transfer(&d, args),
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+    use crate::testutil::Rng;
+
+    fn all_known(w: Width) -> Vec<KnownBits> {
+        let n = 1u64 << w.bits();
+        let mut v = Vec::new();
+        for z in 0..n {
+            for o in 0..n {
+                if z & o == 0 {
+                    v.push(kb(w, z, o));
+                }
+            }
+        }
+        v
+    }
+
+    /// Random facts of width `w`: often a constant or nothing known, otherwise random known
+    /// bits, unsigned (strided) and signed ranges, reduced.
+    fn random_facts(rng: &mut Rng, w: Width) -> Facts {
+        let m = wmask(w);
+        let r = |rng: &mut Rng| rng.next() & m;
+        match rng.below(6) {
+            0 => return Facts::constant(&bv(w, r(rng))),
+            1 => return Facts::top(w),
+            _ => {}
+        }
+        loop {
+            let known = r(rng) & r(rng);
+            let one = r(rng) & known;
+            let k = kb(w, known & !one, one);
+            let (x, y) = (r(rng), r(rng));
+            let (lo, hi) = (x.min(y), x.max(y));
+            let stride = if hi > lo && rng.below(3) == 0 {
+                1 + rng.below(8)
+            } else {
+                1
+            };
+            let hi = if hi > lo {
+                lo + (hi - lo) / stride * stride
+            } else {
+                hi
+            };
+            let u = URange::strided(bv(w, lo), bv(w, hi), stride)
+                .or_else(|| URange::new(bv(w, lo), bv(w, hi)))
+                .unwrap_or(URange::full(w));
+            let s = if rng.below(2) == 0 {
+                SRange::full(w)
+            } else {
+                let (p, q) = (r(rng), r(rng));
+                let shift = 64 - u32::from(w.bits());
+                let signed = |v: u64| ((v << shift) as i64) >> shift;
+                let (p, q) = if signed(p) <= signed(q) {
+                    (p, q)
+                } else {
+                    (q, p)
+                };
+                SRange::new(bv(w, p), bv(w, q)).unwrap_or(SRange::full(w))
+            };
+            if let Some(f) = Facts::reduce(k, u, s) {
+                return f;
+            }
+        }
+    }
+
+    /// The carry chain on words is the one on `BitVec`s: every pair of known bits up to 4 bits.
+    #[test]
+    fn word_carries_are_the_bitvec_carries() {
+        for bits in 1..=4 {
+            let w = Width::new(bits).unwrap();
+            let all = all_known(w);
+            for a in &all {
+                for b in &all {
+                    for carry in [false, true] {
+                        let (z, o) = kb_add_carry_word(a, b, carry, wmask(w));
+                        assert_eq!(kb(w, z, o), kb_add_carry_wide(a, b, carry));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The word transfers of `+ - & | ^` give the facts the `BitVec` ones give, at every width
+    /// up to 8 and at 16, 32, 63 and 64.
+    #[test]
+    fn word_transfers_are_the_bitvec_transfers() {
+        let mut rng = Rng(0x0077_0e1d);
+        let widths = (1..=8).chain([16, 32, 63, 64]);
+        for bits in widths {
+            let w = Width::new(bits).unwrap();
+            for _ in 0..4000 {
+                let (a, b) = (random_facts(&mut rng, w), random_facts(&mut rng, w));
+                for op in [BinOp::Add, BinOp::Sub] {
+                    assert_eq!(
+                        add_sub_word(op, &a, &b),
+                        add_sub_wide(op, &a, &b),
+                        "{op:?} {a:?} {b:?}"
+                    );
+                }
+                for op in [BinOp::And, BinOp::Or, BinOp::Xor] {
+                    assert_eq!(
+                        bitwise_word(op, &a, &b),
+                        bitwise_wide(op, &a, &b),
+                        "{op:?} {a:?} {b:?}"
+                    );
+                }
+            }
+        }
     }
 }

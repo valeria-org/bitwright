@@ -156,7 +156,7 @@ fn snap<T: Word>(lo: T, hi: T, r: u64, m: u64) -> Option<(T, T)> {
 }
 
 /// An unsigned strided interval: bounds and stride.
-type U<T> = (T, T, u64);
+pub(super) type U<T> = (T, T, u64);
 
 fn strided<T: Word>(lo: T, hi: T, stride: u64) -> U<T> {
     (lo, hi, if lo == hi { 0 } else { stride })
@@ -189,7 +189,27 @@ fn meet_class<T: Word>(u: U<T>, r: u64, m: u64) -> Option<U<T>> {
 
 /// `Facts::reduce` for widths up to `T::BITS`.
 pub(super) fn reduce<T: Word>(k: &KnownBits, u: &URange, s: &SRange) -> Option<Facts> {
-    let w = k.width();
+    let word = |v: BitVec| T::from_bits(&v);
+    reduce_raw(
+        k.width(),
+        word(k.known_zero()),
+        word(k.known_one()),
+        (word(u.lo()), word(u.hi()), u.stride()),
+        word(s.lo()),
+        word(s.hi()),
+    )
+}
+
+/// [`reduce`] of components given as words of width `w`: known zero and one bits, a strided
+/// unsigned interval as `URange` normalizes it, and signed bounds with `slo <=s shi`.
+pub(super) fn reduce_raw<T: Word>(
+    w: Width,
+    mut kz: T,
+    mut ko: T,
+    mut u: U<T>,
+    mut slo: T,
+    mut shi: T,
+) -> Option<Facts> {
     let bits = u32::from(w.bits());
     let mask = if bits == T::BITS {
         !T::ZERO
@@ -198,11 +218,7 @@ pub(super) fn reduce<T: Word>(k: &KnownBits, u: &URange, s: &SRange) -> Option<F
     };
     let sign = T::ONE << (bits - 1);
     let smax = below::<T>(bits - 1);
-    let word = |v: BitVec| T::from_bits(&v);
     let slt = |a: T, b: T| (a ^ sign) < (b ^ sign);
-    let (mut kz, mut ko) = (word(k.known_zero()), word(k.known_one()));
-    let mut u: U<T> = (word(u.lo()), word(u.hi()), u.stride());
-    let (mut slo, mut shi) = (word(s.lo()), word(s.hi()));
     // `[slo, shi]` met with the signed interval `[a, b]`, if `a <=s b` and the meet is not empty.
     let meet_signed = |slo: T, shi: T, a: T, b: T| {
         if slt(b, a) {

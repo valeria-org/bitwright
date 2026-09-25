@@ -468,9 +468,21 @@ Each step is measured with the benchmark from step 1 and lands alone.
    point or two, at the cost of a second transfer family with its own soundness validation.
 
    The ranges are not where the facts' time goes. The known-bits transfers themselves
-   (`kb_add_carry`, the bitwise ones) compute on 72-byte `BitVec`s at every width. For
-   widths up to 64 the reduced product already runs on words (`narrow::reduce`), and the
-   transfers could too, with the same results. That is the next candidate for the facts.
+   (`kb_add_carry`, the bitwise ones) compute on 72-byte `BitVec`s at every width.
+
+   **Done: word-sized transfers.** For widths up to 64, the transfers of `+ - & | ^` and the
+   carry chain run on words. They read the facts' seven words (as the cache stores them),
+   normalize ranges as `URange`/`SRange` do, and reduce through `narrow::reduce_raw` (the
+   reduced product's word core, split out of `narrow::reduce`). A `Facts` is built only at the
+   end. These are the same formulas as the `BitVec` code, which stays for wider widths.
+   Differential tests compare the two paths:
+   - every pair of known bits up to 4 bits for the carry chain;
+   - random reduced facts at widths 1 to 8, 16, 32, 63 and 64 for every arm.
+
+   Two planted bugs were caught. Results are identical (the same nodes on every row), and the
+   instructions went from 695.1 M to 654.3 M under `compile()` (−5.9 %) and from 214.8 M to
+   199.3 M with the rules alone (−7.2 %). That is more than the known-bits-only tier saved,
+   and changes nothing. Multiplication and constant shifts are the arms left on `BitVec`s.
 5. **`Semantics` and `Raise`**, then the derive (1a, 1c).
 6. **Native `Rewrite` and `check::rewrite`** (2c).
 
