@@ -598,6 +598,65 @@ fn xor_is_sound_and_idempotent() {
     assert!(changed > 300, "{changed}");
 }
 
+/// Linear maps over GF(2) of one atom (xors of shifted, rotated, masked copies): the xor
+/// pass's diagonal form is equivalent, exhaustively at small widths, and idempotent.
+#[test]
+fn gf2_forms_are_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Xor]);
+    let mut g = generator(0x6f2f);
+    let mut rng = Rng(51);
+    let mut changed = 0;
+    for i in 0..2000 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            64
+        } else {
+            2 + g.rng.below(7) as u16
+        };
+        let width = Width::new(w).unwrap();
+        let x = cx.symbol("x", width).unwrap();
+        let mut e = x;
+        for _ in 0..1 + g.rng.below(5) {
+            let k = BitVec::wrapping_from_u64(width, g.rng.below(u64::from(w)));
+            let k = cx.constant(&k).unwrap();
+            let t = match g.rng.below(5) {
+                0 => cx.bin(BinOp::RotL, e, k).unwrap(),
+                1 => cx.bin(BinOp::Shl, e, k).unwrap(),
+                2 => cx.bin(BinOp::LShr, e, k).unwrap(),
+                3 => {
+                    let m = g.constant(w);
+                    let m = cx.constant(&m).unwrap();
+                    cx.bin(BinOp::And, e, m).unwrap()
+                }
+                _ => cx.un(UnOp::Not, e).unwrap(),
+            };
+            e = if g.rng.chance(1, 2) {
+                cx.bin(BinOp::Xor, e, t).unwrap()
+            } else {
+                cx.bin(BinOp::Xor, t, x).unwrap()
+            };
+        }
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {}",
+            cx.display(r.expr)
+        );
+    }
+    assert!(changed > 100, "{changed}");
+}
+
 #[test]
 fn xor_cancels_boolean_masking() {
     let eng = engine(vec![Phase::Xor]);

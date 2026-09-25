@@ -909,3 +909,101 @@ fn wide_rotation_counts_are_not_saturated() {
         }
     }
 }
+
+/// A random affine map over GF(2) of `x`: xors of shifted, rotated, masked, reversed copies.
+fn gf2_expr(rng: &mut Rng, cx: &mut Context, x: Expr, w: u16, depth: u32) -> Expr {
+    let wd = width(w);
+    let k = |cx: &mut Context, v: u64| cx.constant(&BitVec::wrapping_from_u64(wd, v)).unwrap();
+    if depth == 0 || rng.chance(1, 4) {
+        return x;
+    }
+    let d = depth - 1;
+    let a = gf2_expr(rng, cx, x, w, d);
+    match rng.below(9) {
+        0 | 1 => {
+            let b = gf2_expr(rng, cx, x, w, d);
+            cx.bin(BinOp::Xor, a, b).unwrap()
+        }
+        2 => {
+            let s = k(cx, rng.below(u64::from(w)));
+            cx.bin(BinOp::RotL, a, s).unwrap()
+        }
+        3 => {
+            let s = k(cx, 1 + rng.below(u64::from(w)));
+            cx.bin(BinOp::LShr, a, s).unwrap()
+        }
+        4 => {
+            let s = k(cx, 1 + rng.below(u64::from(w)));
+            cx.bin(BinOp::Shl, a, s).unwrap()
+        }
+        5 => {
+            let m = k(cx, rng.next());
+            cx.bin(BinOp::And, a, m).unwrap()
+        }
+        6 => {
+            let m = k(cx, rng.next());
+            cx.bin(BinOp::Xor, a, m).unwrap()
+        }
+        7 => cx.un(UnOp::Not, a).unwrap(),
+        _ => {
+            let s = k(cx, rng.below(u64::from(w)));
+            let r = cx.bin(BinOp::RotR, a, s).unwrap();
+            cx.bin(BinOp::Xor, r, x).unwrap()
+        }
+    }
+}
+
+/// Affine maps over GF(2): the rank decides injectivity exactly (checked by every input at
+/// small widths), `Query::Injective` agrees where it answers, and solving at a constant gives
+/// the preimage or proves there is none.
+#[test]
+fn gf2_maps_are_decided_by_rank() {
+    let mut rng = Rng(0x6f2);
+    let (mut yes, mut no, mut solved) = (0, 0, 0);
+    for i in 0..600 {
+        let w = 2 + (i % 7) as u16;
+        let mut cx = Context::new();
+        let x = cx.symbol("x", width(w)).unwrap();
+        let e = gf2_expr(&mut rng, &mut cx, x, w, 4);
+        let (ei, xi) = (cx.id(e).unwrap(), cx.id(x).unwrap());
+        let nodes: Vec<u32> = cx
+            .post_order(&[e])
+            .unwrap()
+            .into_iter()
+            .map(|h| cx.id(h).unwrap())
+            .collect();
+        let Some(map) = gf2::rows(&cx, xi, &nodes) else {
+            continue;
+        };
+        // Folded to a constant by construction (`x ^ x`).
+        let Some(rows) = map.get(&ei).cloned() else {
+            continue;
+        };
+        let full = gf2::rank(&rows) == u32::from(w);
+        // The truth, by every input.
+        let mut seen: Vec<BitVec> = (0..1u64 << w)
+            .map(|v| eval(&mut cx, e, &[("x", val(w, v))]))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(full, seen.len() == 1 << w, "{}", cx.display(e));
+        let t = cx.prove(Query::Injective { e, of: x }).unwrap();
+        check_injective(&mut cx, e, x, t, &mut yes, &mut no);
+        // Preimages through the engine's solver: e == c.
+        let c = val(w, rng.next());
+        let f0 = eval(&mut cx, e, &[("x", val(w, 0))]);
+        let y: Vec<bool> = (0..w).map(|k| c.bit(k) != f0.bit(k)).collect();
+        match gf2::solve(&rows, &y, u32::from(w)) {
+            Some(Some(v)) => {
+                assert_eq!(eval(&mut cx, e, &[("x", val(w, v as u64))]), c);
+                solved += 1;
+            }
+            Some(None) => {
+                assert!(!seen.contains(&c));
+            }
+            None => assert!(!full),
+        }
+    }
+    eprintln!("gf2: {yes} injective, {no} refuted, {solved} solved");
+    assert!(yes > 50 && solved > 50, "{yes} {no} {solved}");
+}

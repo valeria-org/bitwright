@@ -52,6 +52,7 @@
 //!
 //! [`ExtOp::invert`]: crate::ext::ExtOp::invert
 
+pub(crate) mod gf2;
 #[cfg(test)]
 mod tests;
 
@@ -156,7 +157,17 @@ pub(crate) struct Region {
     /// The nodes between the hole and the node, ascending (the node last).
     nodes: Vec<u32>,
     /// How the hole's bits are recovered.
-    levels: Plan,
+    how: How,
+}
+
+/// How a region's hole is recovered from its value.
+#[derive(Clone, Debug)]
+pub(crate) enum How {
+    /// Bit by bit, level by level (the pivot analysis).
+    Levels(Plan),
+    /// By elimination: the region is affine over GF(2) with a matrix of full column rank,
+    /// these its rows (per output bit, the hole bits it is the xor of).
+    Linear(gf2::Rows),
 }
 
 // ----- primitive layers -------------------------------------------------------------------------
@@ -492,6 +503,29 @@ fn recover<O: Oracle>(
     top: u32,
     hole: u32,
     nodes: &[u32],
+) -> Result<Option<How>, O::Err> {
+    if let Some(plan) = recover_levels(cx, o, top, hole, nodes)? {
+        return Ok(Some(How::Levels(plan)));
+    }
+    // An affine map over GF(2) whose rows span every hole bit.
+    o.charge(nodes.len() as u64 * 4 + 1)?;
+    let wv = u32::from(cx.wid(hole));
+    if let Some(map) = gf2::rows(cx, hole, nodes)
+        && let Some(r) = map.get(&top)
+        && gf2::rank(r) == wv
+    {
+        return Ok(Some(How::Linear(r.clone())));
+    }
+    Ok(None)
+}
+
+/// [`recover`] by the pivot analysis.
+fn recover_levels<O: Oracle>(
+    cx: &mut Context,
+    o: &mut O,
+    top: u32,
+    hole: u32,
+    nodes: &[u32],
 ) -> Result<Option<Plan>, O::Err> {
     let wv = cx.wid(hole);
     if wv > MAX_HOLE_BITS || nodes.last() != Some(&top) {
@@ -784,7 +818,7 @@ fn anti_unify(cx: &Context, n1: u32, n2: u32) -> (Option<Unified>, u32) {
 }
 
 /// The value of the last of `nodes` with the hole at `x` (every other operand a constant).
-fn eval_region(cx: &Context, nodes: &[u32], hole: u32, x: &BitVec) -> Option<BitVec> {
+pub(crate) fn eval_region(cx: &Context, nodes: &[u32], hole: u32, x: &BitVec) -> Option<BitVec> {
     let mut vals: IdMap<u32, BitVec> = IdMap::default();
     vals.insert(hole, *x);
     for &i in nodes {
@@ -816,8 +850,30 @@ fn region_solve<O: Oracle>(
 ) -> Result<Option<Option<BitVec>>, O::Err> {
     let w = cx.width_of(hole);
     let cost = r.nodes.len() as u64;
+    let levels = match &r.how {
+        How::Levels(l) => l,
+        How::Linear(rows) => {
+            // x = M⁻¹·(c ⊕ f(0)): the map is affine, f(x) = M·x ⊕ f(0).
+            o.charge(cost + rows.len() as u64)?;
+            let Some(f0) = eval_region(cx, &r.nodes, hole, &BitVec::zero(w)) else {
+                return Ok(None);
+            };
+            let y: Vec<bool> = (0..rows.len() as u16)
+                .map(|k| c.bit(k) != f0.bit(k))
+                .collect();
+            let x = match gf2::solve(rows, &y, u32::from(w.bits())) {
+                Some(Some(x)) => BitVec::wrapping_from_limbs(w, &[x as u64, (x >> 64) as u64]),
+                Some(None) => return Ok(Some(None)),
+                None => return Ok(None),
+            };
+            let Some(back) = eval_region(cx, &r.nodes, hole, &x) else {
+                return Ok(None);
+            };
+            return Ok(Some((back == *c).then_some(x)));
+        }
+    };
     let mut x = BitVec::zero(w);
-    for level in &r.levels {
+    for level in levels {
         o.charge(cost)?;
         let Some(y) = eval_region(cx, &r.nodes, hole, &x) else {
             return Ok(None);
@@ -885,7 +941,7 @@ pub(crate) fn solve_layer<O: Oracle>(
     let (cands, work) = candidates(cx, n, &|c| cx.const_val(c).is_none());
     o.charge(work)?;
     for (d, nodes) in cands {
-        if let Some(levels) = recover(cx, o, n, d, &nodes)? {
+        if let Some(how) = recover(cx, o, n, d, &nodes)? {
             let kind = if cx.wid(n) == cx.wid(d) {
                 Kind::Bijective
             } else {
@@ -894,7 +950,7 @@ pub(crate) fn solve_layer<O: Oracle>(
             return Ok(Some(Layer {
                 inner: d,
                 kind,
-                map: Map::Region(Box::new(Region { nodes, levels })),
+                map: Map::Region(Box::new(Region { nodes, how })),
             }));
         }
     }

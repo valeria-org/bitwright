@@ -257,6 +257,14 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, St
 /// The xor pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    // A linear map of one atom through shifts and rotations (see `gf2`).
+    if matches!(
+        op,
+        OpCode::Xor | OpCode::RotL | OpCode::RotR | OpCode::Shl | OpCode::LShr
+    ) && let Some(Step::To(x, fin)) = super::gf2::step(r, cx, n)?
+    {
+        return Ok(Step::To(x, fin));
+    }
     if !xor_op(op) || op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
     }

@@ -81,6 +81,14 @@
   `k = W` on): the expansion of `(x − 1)^100` at 8 bits, which the normal form reduces to
   degree 9, is `(x − 1)^36`, 9 nodes (issue #5). Like every rendering it is certified against
   the question.
+- **Linear maps over GF(2).** An expression built from one value by `^`, `~`, masks, shifts
+  and rotations by constants, byte swaps and bit reversals is `M·x ⊕ c` over GF(2). The
+  invertibility analysis now proves such a region injective when `M` has full rank, where the
+  bit-by-bit pivot analysis gives up (`x ^ rotl(x, a) ^ rotl(x, b)`, which reads every bit
+  three times), and solves it at a constant by elimination; `x ^ rotl(x, 3)`, not injective,
+  stays. The xor pass writes such an expression as the xor of rotations masked by `M`'s
+  diagonals when smaller: the xorshift involution `y ^ (y >>u 5) ^ (y >>u 7)` with
+  `y = x ^ (x >>u 5) ^ (x >>u 7)` is `x`.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

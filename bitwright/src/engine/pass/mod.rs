@@ -7,6 +7,7 @@ pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;
 pub(super) mod forms;
+mod gf2;
 pub(super) mod invert;
 pub(super) mod linear;
 pub(super) mod linear_mba;

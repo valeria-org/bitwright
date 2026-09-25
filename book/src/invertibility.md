@@ -148,6 +148,35 @@ bits; larger layers are simply not recognized. Maps that are bijective for reaso
 model, such as a GF(2)-linear map with cyclic dependencies (`x ^ rotl(x, 5) ^ rotl(x, 9)` at
 32 bits), are not recognized either.
 
+## Linear maps
+
+A value mixed with rotations and shifts of itself by xor (`x ^ rotl(x, 3) ^ rotl(x, 5)`) reads
+every bit several times, so no bit can be recovered first. Such a map is linear over GF(2):
+every output bit is the xor of some input bits (and a constant), `M·x ⊕ c`. It is injective
+exactly when the matrix `M` has full rank, and then its inverse is found by elimination.
+bitwright reads any region built from `^`, `~`, masks, shifts and rotations by constants, byte
+swaps and bit reversals this way when the bit-by-bit recovery fails. `x ^ rotl(x, 3)` is not
+injective (it maps `x` and `~x` alike), and stays.
+
+```rust
+use bitwright::engine::Engine;
+use bitwright::{Context, ParseOptions, Width};
+
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W32);
+let e = cx.parse("(x ^ rotl(x, 3) ^ rotl(x, 5)) == (y ^ rotl(y, 3) ^ rotl(y, 5))", &o)?;
+let out = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(cx.display(out.expr).to_string(), "x == y");
+let e = cx.parse("(x ^ rotl(x, 3)) == (y ^ rotl(y, 3))", &o)?;
+let out = Engine::standard().simplify(&mut cx, e)?;
+assert_eq!(out.expr, e);
+# Ok::<(), bitwright::Error>(())
+```
+
+The xor pass uses the same reading to simplify: it writes such an expression as the xor of
+rotations of `x` masked by the diagonals of `M` when that is smaller, so an involution applied
+twice is `x`.
+
 ## Knowing more about data-dependent shifts
 
 `h ^ ((h >>u 32) >>u (h >>u 60))` shifts the high half by its own top four bits. When those
