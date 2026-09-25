@@ -41,6 +41,31 @@
   (and the carry chain) run on machine words for widths up to 64, the reduced product
   included, with the same results. A test compares them with the `BitVec` code. A
   compiler-shaped run takes about 6 % fewer instructions.
+- **Rewrites in Rust, linked at run time.** `engine::Rewrite` is a rewrite the host writes in
+  Rust: a name, a group, a revision, and a function from a node to its replacement through a
+  `Site` (views, facts, construction).
+  - **Linking.** `EngineBuilder::rewrite` links one with sampled verification at every
+    application (it needs `allow_unproven`), and `trusted_rewrite` links one the host vouches
+    for. A strategy runs it by naming its group in a rule phase; it is tried after the rules.
+  - **Guarantees.** A result commits only when it is smaller in the order the rules decrease,
+    so nothing cycles. It passes the rules' postconditions, a wrong one is quarantined for
+    the call, and its work is charged to the budgets.
+  - **Observability.** `Stats::host` counts host rewrites, and `By::Rewrite` names them to
+    hooks and observers.
+- **`check::rewrite`.** Tests a host rewrite offline, before it is trusted:
+  - its results against their nodes, at every node of the given inputs, at every width they
+    parse at, and with other constants (exhaustively over few bits);
+  - width, determinism and the termination order;
+  - typed failures with counterexamples.
+- **`bitwright::translate`.** A host's IR in and out, without text:
+  - `Semantics` for what an instruction computes;
+  - `Lowering` for a function's values, with fresh (optionally declared) symbols for values
+    defined outside;
+  - `Raise` to emit instructions for the nodes no host value computes, value numbering
+    included;
+  - `Template` for semantics given as text at run time, compiled once per operand widths.
+- **Book: *In a compiler*.** A chapter on translation, raising, templates, host rewrites and
+  their checker, with tested examples.
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.

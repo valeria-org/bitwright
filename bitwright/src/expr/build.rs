@@ -671,8 +671,19 @@ impl Context {
     /// be in this context's registry at the position it has in `src`'s (as
     /// [`extend_registry`](Context::extend_registry) keeps it).
     pub fn import(&mut self, src: &Context, roots: &[Expr]) -> Result<Vec<Expr>, Error> {
+        self.import_mapped(src, roots, &[])
+    }
+
+    /// [`import`](Self::import) with some nodes of `src` (by index) already mapped to nodes of
+    /// this context: they are taken as they are, and so is what only they reach.
+    pub(crate) fn import_mapped(
+        &mut self,
+        src: &Context,
+        roots: &[Expr],
+        pre: &[(u32, u32)],
+    ) -> Result<Vec<Expr>, Error> {
         let ids = src.ids(roots)?;
-        let mut map: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+        let mut map: crate::hash::IdMap<u32, u32> = pre.iter().copied().collect();
         let mut stack: Vec<(u32, bool)> = ids.iter().rev().map(|&i| (i, false)).collect();
         while let Some((i, expanded)) = stack.pop() {
             if map.contains_key(&i) {

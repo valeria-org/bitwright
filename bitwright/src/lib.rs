@@ -23,6 +23,9 @@
 //!   whether an expression is an invertible function of one of its subexpressions.
 //! - [`ext`]: host-defined extension operations (multi-output, total), registered in a
 //!   [`Registry`](ext::Registry) and built with [`Context::ext`].
+//! - [`translate`]: a host's IR into expressions and back (`Semantics`, `Lowering`, `Raise`,
+//!   and `Template` for semantics given as text at run time); host rewrites in Rust are
+//!   [`engine::Rewrite`].
 //! - `mba` (feature `mba`): the MBA service with an evidence gate and bitwright's own solvers;
 //!   `eqsat` (feature `eqsat`): a bounded equality-saturation search; `smtlib` (feature
 //!   `smtlib`): SMT-LIB export, import and rule obligations.
@@ -139,6 +142,9 @@ mod book {
     #[cfg(feature = "check")]
     #[doc = include_str!("../../book/src/checking.md")]
     struct Checking;
+    #[cfg(feature = "check")]
+    #[doc = include_str!("../../book/src/compilers.md")]
+    struct Compilers;
     #[cfg(feature = "prove")]
     #[doc = include_str!("../../book/src/transformations.md")]
     struct Transformations;
@@ -160,6 +166,7 @@ mod book {
     struct Stability;
 }
 pub mod text;
+pub mod translate;
 mod value;
 
 pub use error::{Error, ParseError, ValueError, WidthError};

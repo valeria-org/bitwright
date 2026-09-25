@@ -1,7 +1,7 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
-Status: in progress. Steps 1 and 2 of the order of work are done, and steps 3 and 4 in part
-(see there): the workload is the benchmark group `compile/*` (`cargo run --release -p
+Status: in progress. Steps 1, 2, 5 and 6 of the order of work are done, and steps 3 and 4 in
+part (see there): the workload is the benchmark group `compile/*` (`cargo run --release -p
 bitwright-bench -- compile`), and `Strategy::compile()` is the engine tier. The numbers below
 were measured before step 2, on a shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on
 the reference machine of `docs/benchmarking.md`. Use them for ratios, not as reference
@@ -483,8 +483,32 @@ Each step is measured with the benchmark from step 1 and lands alone.
    instructions went from 695.1 M to 654.3 M under `compile()` (−5.9 %) and from 214.8 M to
    199.3 M with the rules alone (−7.2 %). That is more than the known-bits-only tier saved,
    and changes nothing. Multiplication and constant shifts are the arms left on `BitVec`s.
-5. **`Semantics` and `Raise`**, then the derive (1a, 1c).
-6. **Native `Rewrite` and `check::rewrite`** (2c).
+5. **Done, without the derive: `bitwright::translate`** (1a, 1c). Four pieces, each differing
+   from the sketch:
+   - **`Semantics`** has `result()` and `lower(&mut Lowering)`.
+   - **`Lowering`** makes a fresh symbol for each value defined outside, optionally with its
+     declared known bits, so host values need no integer key; `input_named` gives one a name.
+   - **`Raise::emit`** gets the node's `View` and its operands' host values. `raise` keeps an
+     owner per expression, so a node some value computes is that value (value numbering),
+     and raised nodes are owned afterwards.
+   - **`Template`**, instead of the derive, gives semantics as text read at run time. It is
+     compiled once per operand widths and instantiated by `import` with the parameters
+     mapped.
+
+   The derive is not built. It needs a proc-macro crate (and `syn`) beside the core crate.
+   `Template` covers the same need without one, at a copy per instantiation instead of
+   direct builder calls.
+6. **Done: native `Rewrite` and `check::rewrite`** (2c). Rewrites join the rule phases by
+   group name, as programs' groups do, and are tried after the phase's rules. Two changes
+   from the sketch:
+   - **Termination.** Arbitrary code has no termination proof, so a result commits only
+     when it is smaller in the rules' ground order. Expansions belong in `Raise`.
+   - **Trust.** `trusted_rewrite` takes the host's word rather than a checker report, since a
+     report would have to be produced at startup, and the checker belongs in the host's
+     tests.
+
+   `check::rewrite` takes inputs as text. It covers every node, every width they parse at,
+   and constant variations, and checks width, determinism and the order.
 
 Rough targets for a compiler-shaped run with the rules-only tier: construction under 100 ns
 per instruction, and translation plus simplification under 500 ns per instruction, down from

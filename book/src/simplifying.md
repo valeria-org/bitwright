@@ -253,6 +253,9 @@ value that agrees with the declarations, and SMT-LIB export states them as asser
 right after creating a symbol: a declaration drops the facts and results the context has
 cached, since they may depend on it.
 
+[In a compiler](compilers.md) covers the rest: translating instructions into expressions and
+results back, templates read at run time, and rewrites written in Rust.
+
 One call over every value of a function is the fastest way to use it. A call per value as it
 is created (`Engine::simplify`) gives the same results, and values already simplified are
 answered from the memo. It costs more, because the passes' own caches last one call.

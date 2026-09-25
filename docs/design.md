@@ -617,6 +617,24 @@ phases.
 The policy enters the engine's id only when it is not the default, so default engines keep
 their ids and contexts their memos.
 
+**Host rewrites** (`engine::Rewrite`) are Rust code linked at run time
+(`EngineBuilder::rewrite`, `trusted_rewrite`). They join `Local` phases by group name, like a
+program's groups, and are tried after the phase's rules through a `Site`: views, facts under
+the run's assumptions and declared bits, and construction as engine work. With no static proof
+of termination, a result commits only when `rules::order::ground_greater` shows it smaller than
+the node (the order every directed rule decreases), so rules and host rewrites together keep
+§6.5's termination argument. Results then pass §6.4's postconditions, with sampled
+verification unless the rewrite is trusted, and a failing rewrite is quarantined for the call.
+Name, revision and trust enter the configuration hash. `check::rewrite` tests one offline:
+width, determinism, the order, and values at every node of host-given inputs and their
+constant variations (exhaustive over few bits, sampled otherwise).
+
+`bitwright::translate` is the host's IR in and out, without text. `Semantics` lowers an
+instruction; `Lowering` maps host values to expressions and makes fresh symbols, optionally
+declared, for values defined outside; `Raise` emits instructions for the nodes no host value
+computes (hash-consing makes this value numbering). `Template` compiles text semantics once
+per operand widths and instantiates by `Context::import` with the parameters mapped.
+
 `Strategy::compile()` is `[FactFold, Local(core), Linear, Xor, Casts, Invert, Compares,
 Bitwise, Local(core)]`, one round, `Sharing::Ignored`, `max_region` 64: for a compiler, which
 simplifies every value of every function. Demanded bits is left out: measured on the `compile/*`

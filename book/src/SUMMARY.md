@@ -13,6 +13,7 @@
 - [Simplifying](simplifying.md)
 - [Writing rules](rules.md)
 - [Checking rules](checking.md)
+- [In a compiler](compilers.md)
 - [Verifying compiler transformations](transformations.md)
 - [Deobfuscation and MBA](deobfuscation.md)
 - [Invertibility](invertibility.md)
