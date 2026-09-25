@@ -3575,7 +3575,7 @@ impl<'a> Render<'a> {
         let w = self.w;
         let bits = u32::from(w.bits());
         let atoms = p.atoms();
-        if bits > 64 || bits < 3 || p.degree() < 4 || atoms.count_ones() != 1 {
+        if !(3..=64).contains(&bits) || p.degree() < 4 || atoms.count_ones() != 1 {
             return None;
         }
         // Every monomial a power of one symbol: the atom at every position.
