@@ -15,6 +15,7 @@ members = ["."]
 [dependencies]
 libfuzzer-sys = "0.4"
 bitwright = { path = "../bitwright", features = ["check", "smtlib", "mba"] }
+bitwright-ref = { path = "../bitwright-ref" }
 
 [profile.release]
 debug = 1
@@ -59,6 +60,13 @@ bench = false
 [[bin]]
 name = "mba_solve"
 path = "fuzz_targets/mba_solve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fp_dag"
+path = "fuzz_targets/fp_dag.rs"
 test = false
 doc = false
 bench = false

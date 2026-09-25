@@ -243,7 +243,8 @@ cargo run --release -p bitwright-bench                                  # benchm
 pip install ./bitwright-py pytest && pytest bitwright-py/tests          # the Python bindings
 ```
 
-Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`),
+Fuzz targets are in [`fuzz/`](fuzz) (`cargo +nightly fuzz run simplify_dag`; `fp_dag` checks
+floating point against the independent reference),
 [`docs/benchmarking.md`](docs/benchmarking.md) explains how to compare a change against its
 baseline, and [`compare/`](compare) compares bitwright with other symbolic engines (egg, CoBRA,
 Triton, SMT solvers) on public MBA datasets.

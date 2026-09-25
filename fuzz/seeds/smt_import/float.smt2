@@ -1,0 +1,7 @@
+(set-logic QF_BVFP)
+(declare-const x (_ FloatingPoint 8 24))
+(declare-const y (_ FloatingPoint 8 24))
+(declare-const i (_ BitVec 16))
+(define-fun root0 () (_ FloatingPoint 8 24) (fp.fma RTZ x ((_ to_fp 8 24) RNE 1.5) (fp.neg y)))
+(define-fun root1 () Bool (fp.lt (fp.sqrt RNE (fp.abs x)) ((_ to_fp 8 24) RNE i)))
+(define-fun root2 () (_ BitVec 16) ((_ fp.to_sbv 16) RTN (fp.roundToIntegral RNA y)))

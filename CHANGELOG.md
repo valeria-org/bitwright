@@ -10,6 +10,14 @@
   (`--rules my.bwr`, repeatable), run after the built-in rules in every rule phase. A file is
   vouched for by the ledger `my.bwr.proof` next to it (as `check --ledger` writes it), or
   checked first; the command exits 1 when a rule is not sound or the ledger is stale.
+- **Fuzzing floating point.** A new fuzz target, `fp_dag`, builds floating-point DAGs in tiny
+  and standard formats (every operation, conversions through integers and other formats,
+  comparisons and tests choosing between floats) and checks, at points with special values,
+  that the built expression evaluates like the independent reference semantics applied
+  operation by operation, that its facts contain every value, that the simplifier's results
+  (standard, and deobfuscation with the MBA service) equal it, and that it survives SMT-LIB
+  export and import. CI fuzzes it nightly with the others; `smt_import` has a floating-point
+  seed.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
