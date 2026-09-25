@@ -13,7 +13,7 @@
 //!   --threshold PCT   smallest change reported as one (default 1 for instructions, 5 for CPU time)
 //!   --metric M        compare `instructions` (default when available) or `cpu`
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
-//!   --corpus-diff     print how the proposed MBA defaults change results (no measurement)
+//!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
 //! ```
 
 mod bench;

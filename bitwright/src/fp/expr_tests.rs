@@ -665,7 +665,10 @@ fn construction_identities_fire() {
         ("fp.fma.rtp.f32(x, 0x3f800000, y)", "fp.add.rtp.f32(x, y)"),
         ("fp.fma.rne.f32(x, y, 0x80000000)", "fp.mul.rne.f32(x, y)"),
         ("fp.mul.rtz.f32(x, 0x40000000)", "fp.add.rtz.f32(x, x)"),
-        ("fp.div.rtn.f64(d:64, 0x3fe0000000000000)", "fp.add.rtn.f64(d, d)"),
+        (
+            "fp.div.rtn.f64(d:64, 0x3fe0000000000000)",
+            "fp.add.rtn.f64(d, d)",
+        ),
         (
             "fp.mul.rne.f32(fp.neg.f32(x), fp.neg.f32(y))",
             "fp.mul.rne.f32(x, y)",

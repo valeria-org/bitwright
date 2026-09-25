@@ -1743,7 +1743,8 @@ mod mba_service {
         let lim = crate::mba::MbaLimits::default().with_min_nodes(0);
         let q = |cx: &Context, e: Expr| crate::mba::lower(cx, e, &lim).unwrap().0;
         let script = vec![(q(&cx, n), q(&cx, r)), (q(&cx, c), q(&cx, c1))];
-        let eng = mba_engine(Arc::new(Scripted(script)), MbaTrust::default());
+        let trusted = MbaTrust::default().with_backend_certificates(true);
+        let eng = mba_engine(Arc::new(Scripted(script)), trusted);
         let alone = eng.run(&mut cx, &[c], Run::default()).unwrap();
         assert_eq!(alone.roots[0].expr, c1);
         let out = eng.run(&mut cx, &[n], Run::default()).unwrap();
@@ -1912,19 +1913,18 @@ mod mba_service {
 
     #[test]
     fn the_gate_refutes_liars_and_honours_trust() {
-        // A certified lie is refuted by the always-on sampled check.
+        // Trusting the backend: a certified lie is refuted by the always-on sampled check.
+        let trusted = MbaTrust::default().with_backend_certificates(true);
         let (_, out, _) = run(
-            &mba_engine(Arc::new(Liar), MbaTrust::default()),
+            &mba_engine(Arc::new(Liar), trusted),
             "(x ^ y) + 2 * (x & y)",
         );
         assert!(!out.roots[0].changed);
         assert!(out.stats.mba.refuted > 0);
         // An answer wrong at one unsampled point is accepted only on the backend's word, so
-        // without trust in certificates it is rejected.
-        let no_trust = MbaTrust {
-            backend_certificates: false,
-            sampled: false,
-        };
+        // without trust in certificates (the default) it is rejected.
+        let no_trust = MbaTrust::default();
+        assert!(!no_trust.backend_certificates && !no_trust.sampled);
         let (mut cx, out, _) = run(&mba_engine(Arc::new(Subtle), no_trust), NONLINEAR);
         let wrong = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_ne!(out.roots[0].expr, wrong);

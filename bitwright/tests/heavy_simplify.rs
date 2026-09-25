@@ -42,13 +42,13 @@ fn engines() -> Vec<(&'static str, Engine)> {
     {
         use bitwright::mba::{MbaConfig, MbaTrust, MemoryCache, SignatureSolver};
         use std::sync::Arc;
-        // Our own evidence only, and also the solver's certificates (the default).
+        // Our own evidence only (the default), and also the solver's certificates.
         for (name, trust) in [
+            ("mba-signature", MbaTrust::default()),
             (
-                "mba-signature",
-                MbaTrust::default().with_backend_certificates(false),
+                "mba-signature-certified",
+                MbaTrust::default().with_backend_certificates(true),
             ),
-            ("mba-signature-certified", MbaTrust::default()),
         ] {
             v.push((
                 name,

@@ -308,7 +308,7 @@ struct MbaService {
 impl Default for MbaService {
     fn default() -> Self {
         MbaService {
-            solver: Arc::new(crate::mba::SignatureSolver),
+            solver: Arc::new(crate::mba::NormalFormSolver::default()),
             prover: None,
             cache: Arc::new(crate::mba::NoCache),
         }
@@ -450,7 +450,8 @@ impl EngineBuilder {
         self
     }
 
-    /// The MBA solver (default: [`SignatureSolver`](crate::mba::SignatureSolver)).
+    /// The MBA solver (default: [`NormalFormSolver`](crate::mba::NormalFormSolver); the
+    /// [`SignatureSolver`](crate::mba::SignatureSolver) answers linear MBA only, faster).
     #[cfg(feature = "mba")]
     pub fn mba_solver(mut self, s: Arc<dyn crate::mba::MbaSolver>) -> Self {
         self.mba.solver = s;

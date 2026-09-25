@@ -8,7 +8,7 @@ cargo run --release -p bitwright-bench -- --list            # what is measured
 cargo run --release -p bitwright-bench                      # everything, 7 samples each
 cargo run --release -p bitwright-bench -- facts simplify    # names containing "facts" or "simplify"
 cargo run --release -p bitwright-bench -- --quick           # a tenth of the iterations, 3 samples
-cargo run --release -p bitwright-bench -- --corpus-diff     # results under proposed MBA defaults
+cargo run --release -p bitwright-bench -- --corpus-diff     # MBA defaults against the signature solver
 ```
 
 ## What is measured, and why instructions
@@ -135,13 +135,14 @@ nodes and 20 nonlinear ones from 141 to 25 (the signature solver: 92 and 71).
 
 `--corpus-diff` measures no instructions. It runs the deobfuscation strategy with the MBA
 service on generated corpora (200 linear MBA inputs, 200 nonlinear MBA inputs and 200 random
-DAGs, each at 8 and 64 bits) under three configurations: the current defaults (the signature
-solver, backend certificates trusted), the same solver with bitwright's own evidence only, and
-the proposed defaults (the normal-form solver, bitwright's own evidence only). It prints
+DAGs, each at 8 and 64 bits) under three configurations: the defaults before 0.11 (the
+signature solver, backend certificates trusted), the same solver with bitwright's own evidence
+only, and the defaults since (the normal-form solver, bitwright's own evidence only). It prints
 markdown: per corpus the result sizes, how many results change and in which direction, the
 user-space instructions each configuration took (and its wall time, for orientation only), the
-MBA service's answers and refusals, and examples of changed results. It is the evidence for a change of defaults, which
-changes behavior; see `docs/proposals/`.
+MBA service's answers and refusals, and examples of changed results. It was the evidence for
+the change of defaults (`docs/proposals/mba-defaults.md`), and measures the MBA service's
+answers whenever they change.
 
 ## Comparing with other engines
 

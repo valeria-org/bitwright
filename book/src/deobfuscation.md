@@ -49,8 +49,8 @@ the answer only through an evidence gate:
    an answer that would be rejected anyway is not proved);
 3. then evidence, in order: bitwright's own certificates (below), a configured
    `EquivalenceProver`, the backend's own `Proved` or `Certified` claim if
-   `MbaTrust::backend_certificates` is set (the default), or agreement at the sampled points
-   if `MbaTrust::sampled` is set (off by default);
+   `MbaTrust::backend_certificates` is set (off by default), or agreement at the sampled
+   points if `MbaTrust::sampled` is set (off by default);
 4. the lifted answer must agree with the original at seeded values of its symbols, and pass
    the usual postconditions and host veto.
 
@@ -99,12 +99,12 @@ use bitwright::mba::{MbaConfig, MbaTrust, MemoryCache, SignatureSolver};
 use bitwright::{Context, ParseOptions, Width};
 
 let config = MbaConfig::default().with_trust(
-    MbaTrust::default().with_backend_certificates(false), // trust only evidence we can check
+    MbaTrust::default(), // the default: only evidence bitwright checks itself
 );
 let engine = Engine::builder()
     .builtin()
     .strategy(Strategy::deobfuscate().with_mba(config))
-    .mba_solver(Arc::new(SignatureSolver)) // native, complete for linear MBA
+    .mba_solver(Arc::new(SignatureSolver)) // linear MBA only, and fast
     .mba_cache(Arc::new(MemoryCache::new(4096)))
     .build()?;
 let mut cx = Context::new();
@@ -148,24 +148,21 @@ sampled answer (`NfOptions::synthesis` turns the table off). Every answer is cer
 its input before it is returned, and the evidence gate checks it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
 certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
 for a later call with more budget. It remembers its recent answers (`NfOptions::memo`), which
-saves time when the engine asks again and never changes an answer. It is not the library's
-default solver: pass it to `mba_solver` (the command line's `simplify` uses it, on bitwright's
-own evidence only). Of the 76,080 expressions of CoBRA's MBA datasets, it brings every one
+saves time when the engine asks again and never changes an answer. It is the default solver
+(the command line's `simplify` uses it too); `SignatureSolver` answers linear MBA only, at a
+fraction of the cost on code that is not obfuscated. Of the 76,080 expressions of CoBRA's MBA datasets, it brings every one
 whose ground truth agrees with its input (75,737) to the ground truth's size or less, 22,677
 smaller; CoBRA itself reaches 85.0 % of them. See `compare/` in the repository.
 
 ```rust
-use std::sync::Arc;
 use bitwright::engine::{Engine, Strategy};
-use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::mba::MbaConfig;
 use bitwright::{Context, ParseOptions, Width};
 
-let config = MbaConfig::default()
-    .with_trust(MbaTrust::default().with_backend_certificates(false));
+// The default solver and trust: `NormalFormSolver`, bitwright's own evidence only.
 let engine = Engine::builder()
     .builtin()
-    .strategy(Strategy::deobfuscate().with_mba(config))
-    .mba_solver(Arc::new(NormalFormSolver::default()))
+    .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
     .build()?;
 let mut cx = Context::new();
 let e = cx.parse("3 * (x & 0x55) + 3 * (x & 0xaa)", &ParseOptions::width(Width::W32))?;
@@ -176,10 +173,10 @@ assert_eq!(cx.display(out.expr).to_string(), "(x & 255) * 3");
 
 A host can plug in a solver of its own through `MbaSolver`. `ThreadedSolver` wraps any solver
 with a hard wall-clock deadline per question (a late answer is abandoned and never cached).
-Trusting backend certificates means trusting the backend: a host that needs independent evidence
-turns `backend_certificates` off. Answers are then accepted only on bitwright's own
-certificates, which cover the fragments above, or on the proof of an `EquivalenceProver` the
-host supplies for the rest.
+Trusting backend certificates means trusting the backend, so it is off by default: answers are
+accepted only on bitwright's own certificates, which cover the fragments above, or on the proof
+of an `EquivalenceProver` the host supplies for the rest. A host that trusts its backend turns
+`backend_certificates` on.
 
 ## Beyond MBA
 
@@ -199,17 +196,13 @@ combines with MBA, all in the same run:
   imply is used too, and each result names the assumptions it relied on.
 
 ```rust
-use std::sync::Arc;
 use bitwright::engine::{Engine, Strategy};
-use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::mba::MbaConfig;
 use bitwright::{Context, ParseOptions, Width};
 
 let engine = Engine::builder()
     .builtin()
-    .strategy(Strategy::deobfuscate().with_mba(
-        MbaConfig::default().with_trust(MbaTrust::default().with_backend_certificates(false)),
-    ))
-    .mba_solver(Arc::new(NormalFormSolver::default()))
+    .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
     .build()?;
 let mut cx = Context::new();
 // An always-true predicate picks an MBA of `x + y` over a decoy, and the choice is multiplied

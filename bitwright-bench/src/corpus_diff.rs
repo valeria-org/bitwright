@@ -1,8 +1,9 @@
 //! `--corpus-diff`: the results of the deobfuscation strategy with the MBA service under the
-//! current defaults (the signature solver; backend certificates trusted) and under a proposed
-//! configuration (the normal-form solver; bitwright's own evidence only), over generated
-//! corpora: linear MBA, nonlinear MBA, and random DAGs. Prints a markdown report: sizes, how
-//! many results change and which way, time, the MBA service's answers, and examples.
+//! defaults before 0.11 (the signature solver; backend certificates trusted, "signature") and
+//! under the defaults since (the normal-form solver; bitwright's own evidence only,
+//! "defaults"), over generated corpora: linear MBA, nonlinear MBA, and random DAGs. Prints a
+//! markdown report: sizes, how many results change and which way, time, the MBA service's
+//! answers, and examples.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -114,15 +115,12 @@ fn cost(r: &Results) -> String {
 
 /// Prints the report.
 pub fn report() {
-    let current = engine(Arc::new(SignatureSolver), MbaTrust::default());
-    let trust_off = engine(
+    let current = engine(
         Arc::new(SignatureSolver),
-        MbaTrust::default().with_backend_certificates(false),
+        MbaTrust::default().with_backend_certificates(true),
     );
-    let proposed = engine(
-        Arc::new(NormalFormSolver::default()),
-        MbaTrust::default().with_backend_certificates(false),
-    );
+    let trust_off = engine(Arc::new(SignatureSolver), MbaTrust::default());
+    let proposed = engine(Arc::new(NormalFormSolver::default()), MbaTrust::default());
     let mut corpora: Vec<(String, Vec<Input>)> = Vec::new();
     for bits in [8u16, 64] {
         corpora.push((
@@ -154,7 +152,7 @@ pub fn report() {
         corpora.push((format!("random DAGs, {bits} bits"), dags));
     }
     println!(
-        "| corpus | inputs | nodes before | current | trust off only | proposed | changed | smaller | larger | cost current | cost proposed |"
+        "| corpus | inputs | nodes before | signature | signature, trust off | defaults | changed | smaller | larger | cost signature | cost defaults |"
     );
     println!("|-|-|-|-|-|-|-|-|-|-|-|");
     let mut examples: Vec<String> = Vec::new();
@@ -199,7 +197,10 @@ pub fn report() {
     );
     println!("|-|-|-|-|-|-|-|-|-|-|-|");
     for (name, stats) in &answers {
-        for (which, s) in ["current", "trust off only", "proposed"].iter().zip(stats) {
+        for (which, s) in ["signature", "signature, trust off", "defaults"]
+            .iter()
+            .zip(stats)
+        {
             println!(
                 "| {name} | {which} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 s.calls,
@@ -215,7 +216,7 @@ pub fn report() {
         }
     }
     println!();
-    println!("Examples of changed results (current → proposed, nodes):");
+    println!("Examples of changed results (signature → defaults, nodes):");
     println!();
     for e in examples {
         println!("{e}");

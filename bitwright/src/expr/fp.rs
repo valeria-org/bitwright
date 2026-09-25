@@ -136,7 +136,8 @@ impl Context {
             // ½ is subnormal in formats with a 2-bit exponent, so it is computed, not encoded.
             FpOp::Div(rm)
                 if self.const_val(k[1]).is_some_and(|c| {
-                    f.div(RoundingMode::Rne, &one, &two).is_ok_and(|half| c == half)
+                    f.div(RoundingMode::Rne, &one, &two)
+                        .is_ok_and(|half| c == half)
                 }) =>
             {
                 Some(self.c_fp(with(FpOp::Add(rm)), &[k[0], k[0]])?)

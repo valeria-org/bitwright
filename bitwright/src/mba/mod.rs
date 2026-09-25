@@ -62,10 +62,11 @@ setters!(MbaTrust {
 });
 
 impl Default for MbaTrust {
-    /// Backend certificates yes, sampling no.
+    /// Neither: answers are accepted on bitwright's own certificates, or on the proof of a
+    /// configured [`EquivalenceProver`], only.
     fn default() -> Self {
         MbaTrust {
-            backend_certificates: true,
+            backend_certificates: false,
             sampled: false,
         }
     }

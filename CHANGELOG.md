@@ -10,6 +10,15 @@
   (`--rules my.bwr`, repeatable), run after the built-in rules in every rule phase. A file is
   vouched for by the ledger `my.bwr.proof` next to it (as `check --ledger` writes it), or
   checked first; the command exits 1 when a rule is not sound or the ledger is stale.
+- **Behavior changes.** The MBA service's defaults are the ones
+  `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
+  answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
+  certificates, so answers are accepted only on bitwright's own certificates or a configured
+  prover's proof. Results of `Phase::Mba` with the defaults get smaller (nonlinear MBA is
+  answered, not declined), at more cost on code that is not obfuscated; hosts keep the old
+  behavior with `.mba_solver(Arc::new(SignatureSolver))` and
+  `MbaTrust::default().with_backend_certificates(true)`. The command line and the bindings
+  already used these settings; their results do not change.
 
 ## 0.10.0
 

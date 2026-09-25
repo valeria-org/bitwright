@@ -20,18 +20,15 @@ deobfuscation engine reads such expressions as functions of their bits and bring
 linear ones, ones with constants inside the bitwise parts, and products:
 
 ```rust
-use std::sync::Arc;
 use bitwright::engine::{Engine, Strategy};
-use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::mba::MbaConfig;
 use bitwright::{Context, ParseOptions, Width};
 
-// The command line's `simplify`: answers are published only on bitwright's own proof.
+// The command line's `simplify`: the MBA service with its defaults, the normal-form solver
+// and answers published only on bitwright's own proof.
 let engine = Engine::builder()
     .builtin()
-    .strategy(Strategy::deobfuscate().with_mba(
-        MbaConfig::default().with_trust(MbaTrust::default().with_backend_certificates(false)),
-    ))
-    .mba_solver(Arc::new(NormalFormSolver::default()))
+    .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
     .build()?;
 let mut cx = Context::new();
 let o = ParseOptions::width(Width::W64);
