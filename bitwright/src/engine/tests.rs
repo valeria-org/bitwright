@@ -15,7 +15,7 @@ fn net(engine: &Engine) -> &DispatchNet {
         .phases
         .iter()
         .find_map(|p| match p {
-            PhaseImpl::Local(n) => Some(&**n),
+            PhaseImpl::Local(n, _) => Some(&**n),
             _ => None,
         })
         .unwrap()
@@ -644,7 +644,7 @@ fn builtin_engines_share_rules_and_nets() {
             .phases
             .iter()
             .filter_map(|p| match p {
-                PhaseImpl::Local(n) => Some(n.clone()),
+                PhaseImpl::Local(n, _) => Some(n.clone()),
                 _ => None,
             })
             .collect()
@@ -2363,4 +2363,227 @@ fn run_each_keeps_declared_known_bits() {
         .map(|r| cx.display(r.expr).to_string())
         .collect();
     assert_eq!(shown, ["x", "y"]);
+}
+
+mod host_rewrites {
+    use super::*;
+    use crate::{BinOp, View};
+    use std::sync::Arc;
+
+    /// `x + 1 => x`: wrong.
+    struct DropIncrement;
+    impl Rewrite for DropIncrement {
+        fn name(&self) -> &str {
+            "t.drop_increment"
+        }
+        fn group(&self) -> &str {
+            "t"
+        }
+        fn rewrite(&self, site: &mut Site<'_>, e: Expr) -> Option<Expr> {
+            let View::Bin(BinOp::Add, x, c) = site.view(e)? else {
+                return None;
+            };
+            (site.as_u64(c)? == 1).then_some(x)
+        }
+    }
+
+    /// `x << k => x * 2^k`: right, but larger in the termination order.
+    struct ShlToMul;
+    impl Rewrite for ShlToMul {
+        fn name(&self) -> &str {
+            "t.shl_to_mul"
+        }
+        fn group(&self) -> &str {
+            "t"
+        }
+        fn rewrite(&self, site: &mut Site<'_>, e: Expr) -> Option<Expr> {
+            let View::Bin(BinOp::Shl, x, k) = site.view(e)? else {
+                return None;
+            };
+            let k = site.as_u64(k)?;
+            let w = site.width(e)?;
+            let m = site.constant_u64(w, 1u64.checked_shl(u32::try_from(k).ok()?)?)?;
+            site.bin(BinOp::Mul, x, m)
+        }
+    }
+
+    /// `x & c => x` when the facts show `x` has no bit outside `c`.
+    struct MaskByFacts;
+    impl Rewrite for MaskByFacts {
+        fn name(&self) -> &str {
+            "t.mask_by_facts"
+        }
+        fn group(&self) -> &str {
+            "t"
+        }
+        fn revision(&self) -> u32 {
+            2
+        }
+        fn rewrite(&self, site: &mut Site<'_>, e: Expr) -> Option<Expr> {
+            let View::Bin(BinOp::And, x, c) = site.view(e)? else {
+                return None;
+            };
+            let c = site.as_const(c)?;
+            let maybe = site.known(x)?.maybe_one();
+            let outside = crate::facts::known::bv_and(&maybe, &crate::facts::known::bv_not(&c));
+            outside.is_zero().then_some(x)
+        }
+    }
+
+    fn engine(r: Arc<dyn Rewrite>, trusted: bool) -> Engine {
+        let b = Engine::builder().strategy(Strategy::new("t", vec![]).with_rule_groups(&["t"]));
+        let b = if trusted {
+            b.trusted_rewrite(r)
+        } else {
+            b.rewrite(r).allow_unproven(true)
+        };
+        b.build().unwrap()
+    }
+
+    #[test]
+    fn a_wrong_rewrite_is_caught_and_quarantined() {
+        let eng = engine(Arc::new(DropIncrement), false);
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W8);
+        let roots = [
+            cx.parse("x + 1", &o).unwrap(),
+            cx.parse("(y + 1) * 3", &o).unwrap(),
+        ];
+        let out = eng.run(&mut cx, &roots, Run::default()).unwrap();
+        assert_eq!(out.roots[0].expr, roots[0]);
+        assert_eq!(out.roots[1].expr, roots[1]);
+        assert!(out.stats.quarantined >= 1);
+        assert!(out.stats.host.rejected >= 1);
+        assert_eq!(out.stats.host.changed, 0);
+    }
+
+    #[test]
+    fn a_rewrite_that_does_not_decrease_the_order_is_not_committed() {
+        let eng = engine(Arc::new(ShlToMul), true);
+        let mut cx = Context::new();
+        let e = cx.parse("x << 3", &ParseOptions::width(Width::W8)).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(out.roots[0].expr, e);
+        assert_eq!(out.stats.host.rejected_cost, 1);
+        assert_eq!(out.stats.quarantined, 0);
+    }
+
+    #[test]
+    fn linking_follows_the_proof_policy_and_the_groups() {
+        let r: Arc<dyn Rewrite> = Arc::new(DropIncrement);
+        let unproven = Engine::builder()
+            .rewrite(r.clone())
+            .strategy(Strategy::new("t", vec![]).with_rule_groups(&["t"]))
+            .build();
+        assert!(matches!(unproven, Err(BuildError::UnprovenRewrite { .. })));
+        // A group no program or rewrite defines.
+        let unknown = Engine::builder()
+            .trusted_rewrite(r.clone())
+            .strategy(Strategy::new("t", vec![]).with_rule_groups(&["nope"]))
+            .build();
+        assert!(matches!(unknown, Err(BuildError::UnknownGroup(_))));
+        // A rewrite group named like a rule group.
+        struct Clash;
+        impl Rewrite for Clash {
+            fn name(&self) -> &str {
+                "clash"
+            }
+            fn group(&self) -> &str {
+                "core.bitwise"
+            }
+            fn rewrite(&self, _: &mut Site<'_>, _: Expr) -> Option<Expr> {
+                None
+            }
+        }
+        let clash = Engine::builder()
+            .builtin()
+            .trusted_rewrite(Arc::new(Clash))
+            .build();
+        assert!(matches!(clash, Err(BuildError::DuplicateGroup(_))));
+        // The default strategy runs every linked group, rewrites included.
+        let default = Engine::builder()
+            .trusted_rewrite(Arc::new(MaskByFacts))
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let e = cx
+            .parse("(x & 15) & 255", &ParseOptions::width(Width::W8))
+            .unwrap();
+        let out = default.simplify(&mut cx, e).unwrap();
+        assert_eq!(cx.display(out.expr).to_string(), "x & 15");
+    }
+
+    /// Facts through the site, under declared known bits: final results, memoized, and keyed by
+    /// the rewrite's revision.
+    #[test]
+    fn rewrites_read_facts_and_their_results_are_final() {
+        let eng = engine(Arc::new(MaskByFacts), false);
+        let mut cx = Context::new();
+        let w = Width::W16;
+        let x = cx.symbol("x", w).unwrap();
+        let high = BitVec::from_u64(w, 0xff00).unwrap();
+        cx.declare_known(x, KnownBits::new(high, BitVec::zero(w)).unwrap())
+            .unwrap();
+        let e = cx.parse("(x & 0xff) + 1", &ParseOptions::width(w)).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(cx.display(out.roots[0].expr).to_string(), "x + 1");
+        assert_eq!(out.roots[0].end, End::Completed);
+        assert_eq!(out.stats.rejected, 0, "sampled verification agrees");
+        let again = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(again.stats.node_visits, 0);
+        assert_eq!(again.roots[0].expr, out.roots[0].expr);
+        // Another revision is another engine.
+        struct Rev3;
+        impl Rewrite for Rev3 {
+            fn name(&self) -> &str {
+                "t.mask_by_facts"
+            }
+            fn group(&self) -> &str {
+                "t"
+            }
+            fn revision(&self) -> u32 {
+                3
+            }
+            fn rewrite(&self, s: &mut Site<'_>, e: Expr) -> Option<Expr> {
+                MaskByFacts.rewrite(s, e)
+            }
+        }
+        assert_ne!(eng.inner.id, engine(Arc::new(Rev3), false).inner.id);
+        assert_ne!(eng.inner.id, engine(Arc::new(MaskByFacts), true).inner.id);
+    }
+
+    /// A rewrite building past the call's node budget stops the call honestly.
+    #[test]
+    fn budgets_bound_what_a_rewrite_builds() {
+        struct Builds;
+        impl Rewrite for Builds {
+            fn name(&self) -> &str {
+                "t.builds"
+            }
+            fn group(&self) -> &str {
+                "t"
+            }
+            fn rewrite(&self, site: &mut Site<'_>, e: Expr) -> Option<Expr> {
+                let w = site.width(e)?;
+                let mut acc = site.constant_u64(w, 0)?;
+                for k in 1..100u64 {
+                    let c = site.constant_u64(w, k)?;
+                    acc = site.bin(BinOp::Xor, acc, c)?;
+                }
+                None
+            }
+        }
+        let eng = engine(Arc::new(Builds), true);
+        let mut cx = Context::new();
+        let e = cx.parse("x + y", &ParseOptions::width(Width::W16)).unwrap();
+        let out = eng
+            .run(
+                &mut cx,
+                &[e],
+                Run::default().with_per_call(Budget::default().with_new_nodes(10)),
+            )
+            .unwrap();
+        assert_eq!(out.roots[0].end, End::BudgetTerminated(Exhausted::NewNodes));
+        assert!(out.stats.new_nodes <= 10);
+    }
 }

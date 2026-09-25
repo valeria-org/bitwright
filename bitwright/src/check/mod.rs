@@ -20,6 +20,9 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
+mod host;
+pub use host::{RewriteCheckConfig, RewriteFailure, RewriteReport, rewrite};
+
 use crate::ops::{BinOp, CmpOp};
 use crate::rules::eval::{Val, admitted, eval, eval_lets, width_of};
 use crate::rules::{ConstPred, FactPred, NodeId, RNode};

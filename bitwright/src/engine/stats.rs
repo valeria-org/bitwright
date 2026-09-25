@@ -49,6 +49,10 @@ pub struct Stats {
     pub rounds: u32,
     /// Per normal-form pass, by name.
     pub passes: BTreeMap<&'static str, PassCounts>,
+    /// The host rewrites ([`Rewrite`](super::Rewrite)), together: nodes offered, results
+    /// equal to the node (`noop`), committed (`changed`), not smaller in the termination
+    /// order (`rejected_cost`), rejected by a postcondition or vetoed (`rejected`).
+    pub host: PassCounts,
     /// The MBA service.
     pub mba: MbaStats,
     /// Distinct roots by outcome: `[unchanged, changed]` for each end.
@@ -82,6 +86,7 @@ impl Stats {
             pass_work,
             rounds,
             passes,
+            host,
             mba,
             completed,
             budget_terminated,
@@ -107,6 +112,7 @@ impl Stats {
         for (name, c) in passes {
             self.passes.entry(name).or_default().absorb(c);
         }
+        self.host.absorb(host);
         self.mba.absorb(mba);
         for k in 0..2 {
             self.completed[k] += completed[k];
@@ -382,6 +388,8 @@ pub enum By<'a> {
     Rule(&'a Rule),
     /// A normal-form pass, e.g. `"linear"`.
     Pass(&'static str),
+    /// A host rewrite ([`Rewrite`](super::Rewrite)), by name.
+    Rewrite(&'a str),
 }
 
 impl By<'_> {
@@ -390,6 +398,7 @@ impl By<'_> {
         match self {
             By::Rule(r) => &r.name,
             By::Pass(p) => p,
+            By::Rewrite(r) => r,
         }
     }
 }

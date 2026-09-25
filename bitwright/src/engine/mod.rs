@@ -15,6 +15,7 @@
 
 pub(crate) mod budget;
 mod dispatch;
+pub(crate) mod host;
 pub(crate) mod pass;
 mod stats;
 #[cfg(test)]
@@ -26,6 +27,7 @@ use std::sync::{Arc, OnceLock};
 use core::fmt;
 
 pub use budget::{Admission, Allowance, Budget, Cap, Clock, Deadline, Exhausted};
+pub use host::{Rewrite, Site};
 pub use stats::{
     By, CertStats, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus, RuleCounts,
     Stats,
@@ -359,6 +361,12 @@ pub enum BuildError {
     DuplicateGroup(String),
     /// The strategy names a group no linked program defines.
     UnknownGroup(String),
+    /// A host rewrite linked with [`EngineBuilder::rewrite`] (sampled at every application)
+    /// while unproven rules are not allowed.
+    UnprovenRewrite {
+        /// Its name.
+        rewrite: String,
+    },
 }
 
 impl fmt::Display for BuildError {
@@ -367,6 +375,11 @@ impl fmt::Display for BuildError {
             BuildError::Unproven { rule } => write!(
                 f,
                 "rule `{rule}` is not vouched for by its ledger (allow unproven rules to link it)"
+            ),
+            BuildError::UnprovenRewrite { rewrite } => write!(
+                f,
+                "host rewrite `{rewrite}` has no proof (allow unproven rules to link it with \
+                 sampled verification, or link it as trusted)"
             ),
             BuildError::DuplicateGroup(g) => write!(f, "group `{g}` is defined twice"),
             BuildError::UnknownGroup(g) => write!(f, "the strategy names unknown group `{g}`"),
@@ -378,7 +391,8 @@ impl std::error::Error for BuildError {}
 
 /// A phase as the engine runs it.
 enum PhaseImpl {
-    Local(Arc<DispatchNet>),
+    /// The rules' dispatch net and the host rewrites, by index, tried after the rules.
+    Local(Arc<DispatchNet>, Arc<[u32]>),
     Pass(pass::PassKind),
     #[cfg(feature = "mba")]
     Mba(crate::mba::MbaConfig),
@@ -407,6 +421,8 @@ impl Default for MbaService {
 struct Inner {
     /// Every linked rule, in link order.
     rules: Arc<[Rule]>,
+    /// Every linked host rewrite, in link order.
+    host: Arc<[host::Linked]>,
     /// Whether each rule is vouched for by its program's ledger.
     proven: Arc<[bool]>,
     strategy: Strategy,
@@ -440,6 +456,8 @@ pub struct EngineBuilder {
     strategy: Option<Strategy>,
     verify: Verify,
     allow_unproven: bool,
+    /// Host rewrites, in link order.
+    host: Vec<host::Linked>,
     #[cfg(feature = "mba")]
     mba: MbaService,
 }
@@ -521,6 +539,30 @@ impl EngineBuilder {
         self
     }
 
+    /// Links a host rewrite ([`Rewrite`]), run in the rule phases whose strategy names its
+    /// group. Requires [`allow_unproven`](Self::allow_unproven): each application is checked
+    /// at sampled points ([`Verify::unproven_points`]), and a rewrite found wrong is quarantined
+    /// for the rest of the call.
+    pub fn rewrite(mut self, r: Arc<dyn Rewrite>) -> Self {
+        self.host.push(host::Linked {
+            op: r,
+            trusted: false,
+        });
+        self
+    }
+
+    /// Links a host rewrite the host vouches for: its applications are not sampled, like a
+    /// proven rule's. Vouch only for a rewrite that
+    /// [`check::rewrite`](crate::check::rewrite) (or a proof of your own) establishes; a wrong
+    /// trusted rewrite makes wrong results.
+    pub fn trusted_rewrite(mut self, r: Arc<dyn Rewrite>) -> Self {
+        self.host.push(host::Linked {
+            op: r,
+            trusted: true,
+        });
+        self
+    }
+
     /// Whether rules without a proof may be linked (for experiments; counted per rule).
     pub fn allow_unproven(mut self, yes: bool) -> Self {
         self.allow_unproven = yes;
@@ -563,6 +605,13 @@ impl EngineBuilder {
 
     /// Links everything.
     pub fn build(self) -> Result<Engine, BuildError> {
+        if !self.allow_unproven
+            && let Some(h) = self.host.iter().find(|h| !h.trusted)
+        {
+            return Err(BuildError::UnprovenRewrite {
+                rewrite: h.op.name().to_string(),
+            });
+        }
         let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
         let mut base = 0u32;
         for (program, proven) in &self.programs {
@@ -616,11 +665,27 @@ impl EngineBuilder {
         {
             nets.push(b.core.clone());
         }
+        // The host rewrites' groups, in the order their first rewrite was linked.
+        let mut host_groups: Vec<(String, Vec<u32>)> = Vec::new();
+        for (k, h) in self.host.iter().enumerate() {
+            let g = h.op.group();
+            if groups.iter().any(|(n, _)| n == g) {
+                return Err(BuildError::DuplicateGroup(g.to_string()));
+            }
+            match host_groups.iter_mut().find(|(n, _)| n == g) {
+                Some((_, list)) => list.push(k as u32),
+                None => host_groups.push((g.to_string(), vec![k as u32])),
+            }
+        }
         let strategy = self.strategy.unwrap_or_else(|| {
             Strategy::new(
                 "default",
                 vec![Phase::Local {
-                    groups: groups.iter().map(|(n, _)| n.clone()).collect(),
+                    groups: groups
+                        .iter()
+                        .chain(&host_groups)
+                        .map(|(n, _)| n.clone())
+                        .collect(),
                 }],
             )
         });
@@ -642,7 +707,12 @@ impl EngineBuilder {
             match phase {
                 Phase::Local { groups: names } => {
                     let mut order = Vec::new();
+                    let mut host_order: Vec<u32> = Vec::new();
                     for name in names {
+                        if let Some((_, hs)) = host_groups.iter().find(|(n, _)| n == name) {
+                            host_order.extend(hs);
+                            continue;
+                        }
                         let Some((_, rs)) = groups.iter().find(|(n, _)| n == name) else {
                             return Err(BuildError::UnknownGroup(name.clone()));
                         };
@@ -668,7 +738,19 @@ impl EngineBuilder {
                             net
                         }
                     };
-                    phases.push(PhaseImpl::Local(net));
+                    // Host rewrites by name, revision and trust (never by address).
+                    for &h in &host_order {
+                        let l = &self.host[h as usize];
+                        id = combine(id, 0x686f_7374);
+                        for b in l.op.name().bytes() {
+                            id = combine(id, u64::from(b));
+                        }
+                        id = combine(
+                            combine(id, u64::from(l.op.revision())),
+                            u64::from(l.trusted),
+                        );
+                    }
+                    phases.push(PhaseImpl::Local(net, host_order.into()));
                 }
                 Phase::FactFold => {
                     id = combine(id, 2);
@@ -743,6 +825,7 @@ impl EngineBuilder {
         Ok(Engine {
             inner: Arc::new(Inner {
                 rules,
+                host: self.host.into(),
                 proven,
                 strategy,
                 phases,
@@ -1062,6 +1145,8 @@ struct Runner<'r, 'a> {
     assumptions: Option<&'a Assumptions>,
     /// Rules quarantined for the call, by index (sized on the first quarantine).
     quarantined: Vec<bool>,
+    /// Host rewrites quarantined for the call, likewise.
+    host_quarantined: Vec<bool>,
     /// Results of this call that are not final (not memoized), per phase.
     partial: Vec<IdMap<u32, (u32, Fin)>>,
     /// Candidate buffer, reused.
@@ -1233,7 +1318,7 @@ impl Runner<'_, '_> {
             self.stats.memo_hits += 1;
             return Ok((r, Fin::relying(rel)));
         }
-        if !matches!(self.inner.phases[phase], PhaseImpl::Local(_)) {
+        if !matches!(self.inner.phases[phase], PhaseImpl::Local(..)) {
             // A pass's decisions depend on sharing, which the previous phase or round may have
             // changed: start afresh (final results stay memoized).
             self.uses_on = false;
@@ -1274,7 +1359,7 @@ impl Runner<'_, '_> {
         // waiting one takes it. Rules strictly decrease an order, so their phases never cycle
         // and keep no such records.
         let mut pending: IdMap<u32, u32> = IdMap::default();
-        let local = matches!(self.inner.phases[phase], PhaseImpl::Local(_));
+        let local = matches!(self.inner.phases[phase], PhaseImpl::Local(..));
         while let Some(top) = stack.last() {
             match *top {
                 Frame::Finish(n, t, own) => {
@@ -1385,7 +1470,7 @@ impl Runner<'_, '_> {
                         }
                     }
                     let step = match &self.inner.phases[phase] {
-                        PhaseImpl::Local(_) => self.rewrite(cx, phase, n)?,
+                        PhaseImpl::Local(..) => self.rewrite(cx, phase, n)?,
                         PhaseImpl::Pass(k) => pass::step(self, cx, *k, n)?,
                         #[cfg(feature = "mba")]
                         PhaseImpl::Mba(cfg) => pass::mba_step(self, cx, cfg, n)?,
@@ -1422,7 +1507,7 @@ impl Runner<'_, '_> {
     /// Tries the phase's candidate rules at `n`, whose operands are normal.
     fn rewrite(&mut self, cx: &mut Context, phase: usize, n: u32) -> Result<Step, Stop> {
         let inner = self.inner;
-        let PhaseImpl::Local(net) = &inner.phases[phase] else {
+        let PhaseImpl::Local(net, host) = &inner.phases[phase] else {
             return Ok(Step::Normal(Fin::FINAL));
         };
         let mut cands = core::mem::take(&mut self.cands);
@@ -1430,7 +1515,14 @@ impl Runner<'_, '_> {
         cands.extend(net.candidates(cx, n));
         let r = self.try_candidates(cx, n, &cands);
         self.cands = cands;
-        r
+        // The host rewrites, where no rule applied.
+        match r? {
+            Step::Normal(fin) if !host.is_empty() => Ok(match self.try_host(cx, n, host)? {
+                Step::To(t, f) => Step::To(t, fin.and(f)),
+                Step::Normal(f) => Step::Normal(fin.and(f)),
+            }),
+            step => Ok(step),
+        }
     }
 
     fn try_candidates(&mut self, cx: &mut Context, n: u32, cands: &[u32]) -> Result<Step, Stop> {
@@ -1923,6 +2015,7 @@ impl Engine {
             hooks,
             assumptions,
             quarantined: Vec::new(),
+            host_quarantined: Vec::new(),
             partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
             cands: Vec::new(),
             stack: Vec::new(),
