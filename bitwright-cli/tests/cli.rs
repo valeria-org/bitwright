@@ -197,6 +197,51 @@ fn simplify_runs_the_engine() {
     assert_eq!(run(&["simplify", "x", "--width", "0"]).0, 2);
 }
 
+/// `--rules` adds a rule file's rules: checked now, or vouched for by `<file>.proof`.
+#[test]
+fn simplify_with_rules_of_your_own() {
+    let src = "bitwright 1;
+group mine {
+    /// Every bit is set in x or in ~x.
+    #[example(\"popcnt(p:8) + popcnt(~p:8)\" => \"8:8\")]
+    rule popcnt_complement<W>(x: W) { popcnt(x) + popcnt(~x) => W }
+}
+";
+    let expr = "popcnt(x) + popcnt(~x)";
+    let (code, out, _) = run(&["simplify", expr, "--width", "16"]);
+    assert_eq!((code, out.trim()), (0, expr));
+    let path = file("mine.bwr", src);
+    let proof = format!("{path}.proof");
+    let _ = std::fs::remove_file(&proof);
+    for standard in [false, true] {
+        let mut args = vec!["simplify", expr, "--width", "16", "--rules", &path];
+        if standard {
+            args.push("--standard");
+        }
+        let (code, out, err) = run(&args);
+        assert_eq!((code, out.trim()), (0, "16:16"), "{err}");
+    }
+    // With the ledger `check` writes next to it.
+    assert_eq!(run(&["check", &path, "--ledger", &proof]).0, 0);
+    let (code, out, err) = run(&["simplify", expr, "--width", "32", "--rules", &path]);
+    assert_eq!((code, out.trim()), (0, "32:32"), "{err}");
+    // A stale ledger is refused.
+    let changed = file(
+        "mine2.bwr",
+        &src.replace("popcnt(x) + popcnt(~x) => W", "popcnt(~x) + popcnt(x) => W"),
+    );
+    std::fs::copy(&proof, format!("{changed}.proof")).unwrap();
+    let (code, _, err) = run(&["simplify", expr, "--rules", &changed]);
+    assert_eq!(code, 1);
+    assert!(err.contains("does not vouch for mine::popcnt_complement"), "{err}");
+    // Unsound rules are refused, with the counterexample.
+    let bad = file("bad-rules.bwr", UNSOUND);
+    let (code, _, err) = run(&["simplify", "x + y", "--rules", &bad]);
+    assert_eq!(code, 1);
+    assert!(err.contains("UNSOUND       bad::add_is_or"), "{err}");
+    assert_eq!(run(&["simplify", "x", "--rules", "/nonexistent.bwr"]).0, 2);
+}
+
 /// Nonlinear MBA simplifies by default (the MBA service with the native solver).
 #[test]
 fn simplify_deobfuscates_nonlinear_mba() {

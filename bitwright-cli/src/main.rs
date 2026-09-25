@@ -32,12 +32,15 @@ commands:
         a Markdown catalog of the rules (the built-in rules without a file).
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
-  simplify <expr> [--width <n>] [--standard] [--assume <predicate>]...
+  simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
         Deobfuscates: the rules, the normal-form passes and the MBA service with the native
         normal-form solver, whose every answer bitwright proves itself. `--standard` runs only
         the rules and the standard passes (`--deobfuscate`, the default, is accepted).
+        `--rules` adds a rule file's rules after the built-in ones, vouched for by the ledger
+        `<file.bwr>.proof` if there is one (as `check --ledger` writes it), else checked now:
+        exit 1 unless every rule is sound.
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -499,7 +502,7 @@ fn dedent(lines: &[&str]) -> String {
 fn simplify(rest: &[String]) -> Result<String, Fail> {
     let a = Args::parse(
         rest,
-        &["width", "deobfuscate", "standard", "assume"],
+        &["width", "deobfuscate", "standard", "assume", "rules"],
         &["deobfuscate", "standard"],
     )?;
     if a.flag("standard") && a.flag("deobfuscate") {
@@ -535,16 +538,28 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         ));
     }
     let mut builder = Engine::builder().builtin();
-    builder = if a.flag("standard") {
-        builder.strategy(Strategy::standard())
+    let mut strategy = if a.flag("standard") {
+        Strategy::standard()
     } else {
         // The MBA service with the native solver, on bitwright's own evidence only.
         let trust = MbaTrust::default().with_backend_certificates(false);
-        builder
-            .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust)))
-            .mba_solver(Arc::new(NormalFormSolver::default()))
+        builder = builder.mba_solver(Arc::new(NormalFormSolver::default()));
+        Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
     };
-    let engine = builder.build().map_err(|e| Fail::Err(2, format!("{e}")))?;
+    let mut groups = Vec::new();
+    for path in a.values("rules") {
+        let (program, ledger) = vouched_rules(path)?;
+        groups.extend(program.groups().iter().map(|g| g.name.clone()));
+        builder = builder.program(program, &ledger);
+    }
+    if !groups.is_empty() {
+        let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
+        strategy = strategy.with_rule_groups(&groups);
+    }
+    let engine = builder
+        .strategy(strategy)
+        .build()
+        .map_err(|e| Fail::Err(2, format!("{e}")))?;
     let out = engine
         .run(&mut cx, &[e], Run::default().with_assumptions(&assumptions))
         .map_err(|e| Fail::Err(2, format!("{e}")))?
@@ -557,6 +572,51 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         ));
     }
     Ok(format!("{text}\n"))
+}
+
+/// A rule file for `simplify --rules`, with the ledger vouching for it: `<path>.proof` if it
+/// exists, else the checker's, which must find every rule sound.
+fn vouched_rules(path: &str) -> Result<(RuleProgram, Ledger), Fail> {
+    let src = read(path)?;
+    let program = compile(path, &src)?;
+    let proof = format!("{path}.proof");
+    if std::path::Path::new(&proof).exists() {
+        let ledger =
+            Ledger::parse(&read(&proof)?).map_err(|e| Fail::Err(2, format!("{proof}: {e}")))?;
+        if let Some(r) = program
+            .rules()
+            .iter()
+            .find(|r| !ledger.vouches_for(&r.name, r.id))
+        {
+            return Err(Fail::Err(
+                1,
+                format!(
+                    "{proof} does not vouch for {} (changed since it was written? run `bitwright check {path} --ledger {proof}`)",
+                    r.name
+                ),
+            ));
+        }
+        return Ok((program, ledger));
+    }
+    let checks = check_program(&program, &CheckConfig::default());
+    let mut bad = String::new();
+    for c in &checks {
+        match &c.verdict {
+            Verdict::Sound => {}
+            Verdict::Unsound(cx) => writeln!(bad, "UNSOUND       {}  {cx}", c.name).unwrap_or(()),
+            Verdict::Inconclusive(why) => {
+                writeln!(bad, "inconclusive  {}  ({why})", c.name).unwrap_or(())
+            }
+            _ => writeln!(bad, "inconclusive  {}", c.name).unwrap_or(()),
+        }
+    }
+    if !bad.is_empty() {
+        return Err(Fail::Err(
+            1,
+            format!("{path}: not every rule is sound\n{bad}"),
+        ));
+    }
+    Ok((program, Ledger::from_checks(&checks)))
 }
 
 /// The indices of the `--assume` options (from 0) a reliance names.

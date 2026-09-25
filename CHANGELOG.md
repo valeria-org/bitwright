@@ -6,6 +6,11 @@
   sum, like `x · 2`: the same real number, rounded once in the same mode, so every result is
   the same bit pattern (½ is computed per format, subnormal where the exponent has two bits).
 
+- **`simplify --rules`.** The command line's `simplify` takes rule files of your own
+  (`--rules my.bwr`, repeatable), run after the built-in rules in every rule phase. A file is
+  vouched for by the ledger `my.bwr.proof` next to it (as `check --ledger` writes it), or
+  checked first; the command exits 1 when a rule is not sound or the ledger is stale.
+
 ## 0.10.0
 
 - **Floating-point guards.** Rules can ask the facts about a float: `fp.not_nan<E, S>(x)`,

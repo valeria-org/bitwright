@@ -13,7 +13,7 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright smt rules.bwr` | Prints each rule's soundness obligation as SMT-LIB, separated by `(reset)`, at every admitted assignment of the widths 8, 32 and 64; a rule admitted at none of those gets three other admitted assignments. `--widths 13` (one width per width variable) and `--rule group::name` narrow it. A rule with no obligation prints a line the solver echoes (`SKIPPED …`) and the command exits 1. |
 | `bitwright catalog [rules.bwr]` | A Markdown catalog of the rules: the built-in rules without a file. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
-| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). |
+| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). |
 
 ## Simplifying from the shell
 
@@ -32,6 +32,21 @@ fp.mul.rne.f64(x, 0x3fd0000000000000)
 
 The expression is in the [text syntax](getting-started.md), floating-point operations
 included; symbols have the `--width` (64 by default) unless they say otherwise (`b:8`).
+
+Rules of your own join the built-in ones with `--rules`; `bitwright check my.bwr --ledger
+my.bwr.proof` once saves checking them on every call:
+
+```text
+$ cat my.bwr
+bitwright 1;
+group mine {
+    /// Every bit is set in x or in ~x.
+    #[example("popcnt(p:8) + popcnt(~p:8)" => "8:8")]
+    rule popcnt_complement<W>(x: W) { popcnt(x) + popcnt(~x) => W }
+}
+$ bitwright simplify --width 32 --rules my.bwr -- 'popcnt(x) + popcnt(~x)'
+32:32
+```
 
 ## Rule files
 
