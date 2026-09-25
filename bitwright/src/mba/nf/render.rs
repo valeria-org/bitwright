@@ -8,7 +8,7 @@ use crate::hash::IdMap;
 
 use super::bits::{self, Bits, anf, mobius, table8};
 use super::classes::{Classes, FULL};
-use super::poly::{Mono, Poly, Sym};
+use super::poly::{self, Mono, Poly, Sym};
 use super::synth;
 use crate::engine::pass::bitwise::{T, min_forms, subtables};
 use crate::facts::known::{bv_and, bv_not, bv_or, bv_xor, count_ones, trailing_zeros};
@@ -425,6 +425,8 @@ pub(crate) struct Render<'a> {
     memo_factors: Vec<Poly>,
     /// What synthesis did.
     pub(crate) synth: SynthTally,
+    /// Normal forms rendered as a power of a shifted symbol (telemetry).
+    pub(crate) powers: u64,
     /// Peels in progress (see [`Render::peel`]); an atom's definition renders as if in one
     /// (see [`Render::for_atom`]).
     peeling: u32,
@@ -476,6 +478,10 @@ const PARTIAL_TERMS: usize = 12;
 /// Steps per term operation of exact division (a map update with a monomial key).
 const DIVISION_STEP: u64 = 4;
 
+/// Normal forms in one symbol of at least this degree are also tried as a power of the
+/// symbol shifted (see [`Render::shifted_power`]).
+const POWER_DEGREE: u32 = 4;
+
 /// A table hit for a normal form (see [`Render::synthesize`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Hit {
@@ -523,6 +529,7 @@ impl<'a> Render<'a> {
             memo: HashMap::new(),
             memo_factors: Vec::new(),
             synth: SynthTally::default(),
+            powers: 0,
             peeling: 0,
             top: false,
             bar: None,
@@ -3205,6 +3212,10 @@ impl<'a> Render<'a> {
                 }
             }
         }
+        // A power of its one symbol shifted, spelled out: `(x − 1)^100` from its expansion.
+        if let Some(x) = self.shifted_power(p) {
+            out.push(x);
+        }
         self.built += out.len() as u64;
         out
     }
@@ -3576,6 +3587,260 @@ impl<'a> Render<'a> {
         }
         result.unwrap_or(x)
     }
+
+    /// `a·(s + t)^k + b` for a normal form in one symbol `s` of degree at least
+    /// [`POWER_DEGREE`], the power by square and multiply: `(x − 1)^100` however it was spelled
+    /// out, as `(x − 1)^36` at 8 bits (see [`least_exponent`]). The form is such a power when,
+    /// for a shift `t` of [`shifts`](Self::shifts), its normal form at `y − t` is that of
+    /// `a·y^k + b`. For a symbol of a class from bit 0 the reductions hold at every integer
+    /// (falling factorials) and leave one form per function, so the test is exact both ways: a
+    /// candidate is never a guess, and a power at a shift tried is never missed.
+    fn shifted_power(&mut self, p: &Poly) -> Option<u32> {
+        let s = p.univariate()?;
+        if p.degree() < POWER_DEGREE || self.classes.low(usize::from(s.class)) != 0 {
+            return None;
+        }
+        // Shifts that fit may differ in a bit that changes `a` too: the cheapest rendering is
+        // kept, the shift nearest zero among equals (`3·(x − 0x12345)^7`, not
+        // `(2^31 + 3)·(x + 0x7ffedcbb)^7` at 32 bits).
+        let mut best: Option<(Cost, u32)> = None;
+        for t in self.shifts(p) {
+            if self.exhausted() {
+                return None;
+            }
+            let Some((a, k, b)) = self.as_power(p, s, &t) else {
+                continue;
+            };
+            let x = self.sym(s)?;
+            let y = self.sum(&Sum {
+                terms: vec![(x, BitVec::one(self.w))],
+                konst: (!t.is_zero()).then_some(t),
+            });
+            let power = self.power(y, k);
+            let r = self.sum(&Sum {
+                terms: vec![(power, a)],
+                konst: (!b.is_zero()).then_some(b),
+            });
+            let cost = self.b.cost(r);
+            if best.is_none_or(|(c, _)| cost < c) {
+                best = Some((cost, r));
+            }
+        }
+        self.powers += u64::from(best.is_some());
+        best.map(|(_, r)| r)
+    }
+
+    /// The shifts [`shifted_power`](Self::shifted_power) tries for `p`: `−c` for each center `c`
+    /// found a bit at a time. For `p = a·(y − c)^k + b` and `c' = c + δ`, `δ` even and nonzero,
+    /// the first difference `p(c' + 1) − p(c' − 1) = 2·a·δ·(k + C(k, 3)·δ² + …)` has
+    /// `1 + v₂(a) + v₂(k) + v₂(δ)` factors of two for an even `k`, and the second difference
+    /// `p(c' + 1) − 2·p(c') + p(c' − 1) = 2·a·δ·(k + C(k, 3)·δ² + …)` has `1 + v₂(a) + v₂(δ)` for an
+    /// odd one (`v₂(C(k, i)) ≥ v₂(k)` for odd `i`: lifting the exponent at 2). So of two
+    /// candidates right below bit `j`, differing there, the right one has more: per parity of
+    /// `c` and of `k`, the larger is kept up the bits, equal counts short of `W` end the branch
+    /// (no such power), and where both reach `W` the bits left change the difference no more,
+    /// so `c` is tried as found and with that bit flipped, the bits above as near zero as they
+    /// go. At most eight shifts, nearest zero first, each then checked exactly; `b` is never
+    /// needed, and the power may have folded.
+    fn shifts(&mut self, p: &Poly) -> Vec<BitVec> {
+        use crate::facts::known::bv_shl;
+        let w = self.w;
+        let bits = u32::from(w.bits());
+        let one = BitVec::one(w);
+        let add = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Add, a, b);
+        let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
+        // The factors of two of the first or second difference at `c` (`W` for zero).
+        let twos = |c: &BitVec, second: bool| {
+            let (up, down) = (p.at(&add(c, &one)), p.at(&sub(c, &one)));
+            let d = if second {
+                let mid = p.at(c);
+                sub(&add(&up, &down), &add(&mid, &mid))
+            } else {
+                sub(&up, &down)
+            };
+            trailing_zeros(&d)
+        };
+        let mut out: Vec<BitVec> = Vec::new();
+        for second in [false, true] {
+            'parity: for parity in 0..2 {
+                let mut c = BitVec::wrapping_from_u64(w, parity);
+                let mut flat = bits;
+                for j in 1..bits {
+                    if !self.spend(6 * p.len() as u64) {
+                        return out;
+                    }
+                    let flip = add(&c, &bv_shl(&one, j));
+                    let (here, there) = (twos(&c, second), twos(&flip, second));
+                    if here >= bits && there >= bits {
+                        flat = j;
+                        break;
+                    }
+                    if here == there {
+                        continue 'parity;
+                    }
+                    if there > here {
+                        c = flip;
+                    }
+                }
+                // Bits above `flat` change nothing: the representative nearest zero.
+                let flipped = (flat < bits).then(|| add(&c, &bv_shl(&one, flat)));
+                for c in [Some(c), flipped].into_iter().flatten() {
+                    let t = poly::signed_rep(&BitVec::un_unchecked(UnOp::Neg, &c), flat + 1);
+                    if !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|t| {
+            if t.msb() {
+                BitVec::un_unchecked(UnOp::Neg, t)
+            } else {
+                *t
+            }
+        });
+        out
+    }
+
+    /// `(a, k, b)` with `p = a·(s + t)^k + b` at every value of `s`, `k` the least such (see
+    /// [`least_exponent`]). With `r` the normal form of `p` at `y − t` less its constant `b`,
+    /// either `r` is the single term `a·y^k`, or the power folded into lower degrees: then
+    /// `a = r(1)`, and `k` is read off `r(2) = a·2^k`, nonzero only for `k < W − v₂(a)`, or else
+    /// off `r(3) = a·3^k` (see [`log3`]); it is checked at two more points, then by the normal
+    /// form of `a·y^k`, which must be `r`.
+    fn as_power(&mut self, p: &Poly, s: Sym, t: &BitVec) -> Option<(BitVec, u32, BitVec)> {
+        use crate::facts::known::bv_lshr;
+        let w = self.w;
+        let bits = u32::from(w.bits());
+        let d = p.degree();
+        if !self.spend(p.len() as u64 * u64::from(d)) {
+            return None;
+        }
+        let at = Poly::sym(w, s).sub(&Poly::constant(*t));
+        let mut q = p.replace(s, &at, d as usize + 1)?;
+        q.reduce_core(self.classes);
+        let b = q.konst();
+        let r = q.part(|e| e > 0);
+        if let Some((m, a)) = r.terms().iter().next()
+            && r.len() == 1
+        {
+            let n = bits - trailing_zeros(a);
+            let k = least_exponent(n, u64::from(poly::degree(m)));
+            return Some((*a, u32::try_from(k).ok()?, b));
+        }
+        let value = |v: u64| r.at(&BitVec::wrapping_from_u64(w, v));
+        let a = value(1);
+        if a.is_zero() {
+            return None;
+        }
+        let v = trailing_zeros(&a);
+        let n = bits - v;
+        let r2 = value(2);
+        let k = if r2.is_zero() {
+            let r3 = value(3);
+            if trailing_zeros(&r3) != v {
+                return None;
+            }
+            let odd = poly::odd_inverse(&bv_lshr(&a, v));
+            log3(
+                &BitVec::bin_unchecked(BinOp::Mul, &bv_lshr(&r3, v), &odd),
+                n,
+            )?
+        } else {
+            u64::from(trailing_zeros(&r2).checked_sub(v).filter(|&k| k > 0)?)
+        };
+        // Cheap points first: the normal form of `a·y^k` costs a product per bit of `k`.
+        for y in [BitVec::wrapping_from_u64(w, 5), BitVec::ones(w)] {
+            if r.at(&y) != BitVec::bin_unchecked(BinOp::Mul, &a, &poly::pow(&y, k)) {
+                return None;
+            }
+        }
+        let k = u32::try_from(k).ok()?;
+        if self
+            .bar
+            .is_some_and(|bar| k.ilog2() + k.count_ones() >= bar)
+        {
+            return None;
+        }
+        (self.power_form(s, &a, k)? == r).then_some((a, k, b))
+    }
+
+    /// The normal form of `a·s^k`, by square and multiply with the reductions after each
+    /// product, so no power grows past the degrees that do not fold. `None` out of budget.
+    fn power_form(&mut self, s: Sym, a: &BitVec, k: u32) -> Option<Poly> {
+        let mut acc = Poly::constant(*a);
+        let mut base = Poly::sym(self.w, s);
+        let mut e = k;
+        loop {
+            if e & 1 == 1 {
+                if !self.spend((acc.len() * base.len()) as u64 * u64::from(base.degree())) {
+                    return None;
+                }
+                acc = acc.mul(&base);
+                acc.reduce_core(self.classes);
+            }
+            e >>= 1;
+            if e == 0 {
+                return Some(acc);
+            }
+            if !self.spend((base.len() * base.len()) as u64 * u64::from(base.degree())) {
+                return None;
+            }
+            base = base.mul(&base);
+            base.reduce_core(self.classes);
+        }
+    }
+}
+
+/// The least exponent `k' ≥ 1` with `y^k' ≡ y^k` modulo `2^n` at every `y`: `k` itself below
+/// `n`, else the least `k' ≥ n` congruent to `k` modulo the exponent `λ(2^n)` of the units
+/// (`2^(n−2)` from `n = 3`, `n` below). An even `y` then gives 0 either way and an odd one a
+/// unit, whose order divides `λ` (`(Z/2^n)^× ≅ C₂ × C_(2^(n−2))`). At 8 bits `(x − 1)^100` is
+/// `(x − 1)^36`, and `a·y^k` needs only `n = W − v₂(a)`.
+fn least_exponent(n: u32, k: u64) -> u64 {
+    let n64 = u64::from(n);
+    let l = unit_order_bits(n);
+    if k < n64 || l >= 64 {
+        return k;
+    }
+    n64 + ((k - n64) & ((1u64 << l) - 1))
+}
+
+/// `log₂ λ(2^n)` (see [`least_exponent`]), which is also the order of 3 modulo `2^n`.
+fn unit_order_bits(n: u32) -> u32 {
+    if n < 3 { n.saturating_sub(1) } else { n - 2 }
+}
+
+/// The least `k ≥ n` with `3^k ≡ z` modulo `2^n`, if there is one. `3` has order `2^l`,
+/// `l = log₂ λ(2^n)`, and the residue of `k` modulo that is found a bit at a time
+/// (Pohlig–Hellman): with the bits below `i` found, `z·3^−k` is a power of `3^(2^i)`, of order
+/// at most `2^(l−i)`, and bit `i` is set when its `2^(l−1−i)`-th power is not 1.
+fn log3(z: &BitVec, n: u32) -> Option<u64> {
+    use crate::facts::known::low_mask;
+    let w = z.width();
+    let l = unit_order_bits(n);
+    if l >= 64 {
+        return None;
+    }
+    let mask = low_mask(w, n);
+    let mul = |a: &BitVec, b: &BitVec| bv_and(&BitVec::bin_unchecked(BinOp::Mul, a, b), &mask);
+    let one = BitVec::one(w);
+    let mut x = bv_and(z, &mask);
+    let mut g = bv_and(&poly::odd_inverse(&BitVec::wrapping_from_u64(w, 3)), &mask);
+    let mut k = 0u64;
+    for i in 0..l {
+        let mut h = x;
+        for _ in i + 1..l {
+            h = mul(&h, &h);
+        }
+        if h != one {
+            k |= 1 << i;
+            x = mul(&x, &g);
+        }
+        g = mul(&g, &g);
+    }
+    let n = u64::from(n);
+    (x == one).then(|| n + (k.wrapping_sub(n) & ((1u64 << l) - 1)))
 }
 
 /// Table `t` of `s` inputs with the inputs in `f` complemented: entry `p` is `t`'s entry

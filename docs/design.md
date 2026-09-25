@@ -1244,7 +1244,7 @@ pub mod mba {
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
   (corner-invisible products, terms nonzero only when three different positions are set,
   point functions) are never proved at any width.
-- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v3;…` with its options).
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v4;…` with its options).
   One pass over the question, operands first, gives every node the normal form of the smallest
   fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
   through. The first version takes one width (nodes of other widths only below casts, which are
@@ -1386,7 +1386,19 @@ pub mod mba {
     leading coefficient odd, which then always finds the quotient) by the normal form of an
     operand of one of the input's products, or by a sum or difference of two such operands no
     longer than either (`(x & y)·(x | y) + (x & ~y)·(~x & y)` is divided by `x`, the sum of the
-    first and third), recursively for the quotient; and the whole form as such a product.
+    first and third), recursively for the quotient; and the whole form as such a product. A
+    form in one symbol `s` of degree at least 4 (of a class from bit 0) is also rendered as a
+    power of it shifted, `a·(s + t)^k + b` by squaring, when its normal form at `y − t` is that
+    of `a·y^k + b`: the reductions hold at every integer and leave one form per function, so
+    the match is exact. The center `c = −t` is lifted a bit at a time from values: for
+    `c' = c + δ`, `δ` even and nonzero, `f(c' + 1) − f(c' − 1)` has `1 + v₂(a) + v₂(k) + v₂(δ)`
+    factors of two for an even `k`, and `f(c' + 1) − 2·f(c') + f(c' − 1)` has
+    `1 + v₂(a) + v₂(δ)` for an odd one, so of two candidates differing in the next bit the right
+    one has more (per parity of `c` and of `k`; at most eight shifts, each checked, the cheapest
+    rendering kept). Where the power folded, `a` is the value at 1 and `k` is read off the value
+    at 2 (`a·2^k`, nonzero below `n = W − v₂(a)`) or at 3 (a discrete logarithm base 3, bit by
+    bit), and the least exponent of the same power is taken (`y^k = y^k'` for `k, k' ≥ n`,
+    `k ≡ k'` modulo `λ(2^n) = 2^(n−2)`): at 8 bits `(x − 1)^100` is `(x − 1)^36`, 9 nodes.
     Rendering is repeated with the factors the best candidate multiplies until none is new,
     and the answer is normalized again (its own constants may give coarser classes) until
     that renders nothing smaller: solving an answer again gives `NoSimpler`. Two

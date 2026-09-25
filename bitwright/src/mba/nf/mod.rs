@@ -146,6 +146,9 @@ pub struct NfStats {
     /// Normal forms also rendered with an atom standing for its definition where that appears
     /// arithmetically (`p + (y & p)` shares `p`).
     pub reused: u64,
+    /// Normal forms in one symbol rendered as a power of it shifted, by square and multiply
+    /// (`(x − 1)^100` from its expansion; each rendering round counts).
+    pub powers: u64,
     /// Declined: a candidate the self-check refuted (a bug; never expected).
     pub declined_internal: u64,
     /// Questions answered from the memo (see [`NfOptions::memo`]); also counted by their
@@ -248,7 +251,7 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v3;atoms={};classes={};terms={};degree={};synth={}",
+            "bitwright.nf.v4;atoms={};classes={};terms={};degree={};synth={}",
             opts.max_atoms,
             opts.max_classes,
             opts.max_terms,
@@ -368,6 +371,7 @@ fn add_stats(s: &mut NfStats, t: &NfStats) {
     s.lowered += t.lowered;
     s.known_bits += t.known_bits;
     s.reused += t.reused;
+    s.powers += t.powers;
     s.declined_internal += t.declined_internal;
     s.memo_hits += t.memo_hits;
     s.synth_lookups += t.synth_lookups;
@@ -2305,6 +2309,7 @@ fn best_rendering(
             add_synth(tally, &r.synth);
         }
         tally.candidates += r.built;
+        tally.powers += r.powers;
         if r.exhausted() {
             if round == 0 {
                 return Err(Decline::Exhausted);

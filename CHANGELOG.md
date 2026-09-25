@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Normal-form solver.** A normal form in one symbol of degree 4 or more is also rendered as a
+  power of the symbol shifted, `a·(s + t)^k + b` by square and multiply: the 101-term expansion
+  of `(x − 1)^100` at 8 bits from the REcon talk is `(x − 1)^36`, 9 nodes (the solver gave 25,
+  the engine 24; the talk's own original, the power by squaring, has 11), and so is its degree-9
+  normal form. The center `−t` is found a bit at a time from the form's values: the first
+  difference around it (for an even `k`) or the second (for an odd one) gains a factor of two
+  with each further bit right, so of two candidates the right one shows (lifting the exponent
+  at 2), whatever `t` and even where the power folded into lower degrees at narrow widths
+  (`3·(x + 0x5a)^100 − 7` at 8 bits). The form at `y − t` must then have the normal form of
+  `a·y^k + b`, so a candidate is exact, never a guess. Where the power folded, `k` is read off
+  the values at 2 and 3 (a discrete logarithm base 3), and the least exponent of the same power
+  is taken: `y^k = y^k'` for `k, k' ≥ n = W − v₂(a)` with `k ≡ k'` modulo `2^(n−2)`.
+  `NfStats::powers` counts them. The solver's id is `bitwright.nf.v4`, so cached answers are
+  not reused.
+
 ## 0.10.0
 
 - **Floating-point guards.** Rules can ask the facts about a float: `fp.not_nan<E, S>(x)`,

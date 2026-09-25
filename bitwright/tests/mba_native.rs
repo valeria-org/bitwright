@@ -244,6 +244,8 @@ fn a_long_polynomial_expansion_shrinks() {
     // `+ 1` becomes `| 1` on the way (its low bit is known): both used to stop the solver. And
     // a remembered answer rebuilt what the MBA phase had just rewritten, over and over, until
     // the budget ran out (without the walk's cycle cut this still ends by budget, unchanged).
+    // The answer is `(x − 1)^36` by squaring, the same function at 8 bits: 9 nodes, where the
+    // talk's original has 11.
     let src = expansion_of_x_minus_1_to_the_100();
     let o = ParseOptions::width(Width::W8);
     let mut cx = Context::new();
@@ -257,7 +259,7 @@ fn a_long_polynomial_expansion_shrinks() {
     let after = dag_size(&mut cx, r);
     assert_eq!(out.roots[0].end, bitwright::engine::End::Completed);
     assert!(
-        before == 333 && after <= 30,
+        before == 333 && after <= 9,
         "{before} -> {after}: {}",
         cx.display(r)
     );

@@ -144,7 +144,7 @@ fn mul(a: &BitVec, b: &BitVec) -> BitVec {
 }
 
 /// `v₂(n!)` (Legendre).
-fn v2_factorial(n: u32) -> u32 {
+pub(crate) fn v2_factorial(n: u32) -> u32 {
     n - n.count_ones()
 }
 
@@ -247,6 +247,28 @@ impl Poly {
             .keys()
             .flat_map(|m| m.iter())
             .fold(0, |acc, (s, _)| acc | s.set)
+    }
+
+    /// The symbol every non-constant monomial is a power of, if there is one.
+    pub(crate) fn univariate(&self) -> Option<Sym> {
+        let mut sym = None;
+        for m in self.terms.keys().filter(|m| !m.is_empty()) {
+            match (m.as_slice(), sym) {
+                (&[(s, _)], None) => sym = Some(s),
+                (&[(s, _)], Some(t)) if s == t => {}
+                _ => return None,
+            }
+        }
+        sym
+    }
+
+    /// The value with every symbol at `v` (for a polynomial in one symbol, its value there).
+    pub(crate) fn at(&self, v: &BitVec) -> BitVec {
+        self.terms
+            .iter()
+            .fold(BitVec::zero(self.w), |total, (m, c)| {
+                add(&total, &mul(c, &pow(v, u64::from(degree(m)))))
+            })
     }
 
     /// The low 64 bits of the value where atom `i` has low 64 bits `atoms[i]` (`None` if it
@@ -359,8 +381,9 @@ impl Poly {
         Some(out)
     }
 
-    /// The same function with symbol `s` (read arithmetically) replaced by `r`, a polynomial
-    /// equal to it: `None` past `limit` monomials.
+    /// The polynomial with symbol `s` (read arithmetically) replaced by `r`: the same function
+    /// when `r` is equal to `s`, the form shifted when `r` is `s` plus a constant. `None` past
+    /// `limit` monomials.
     pub(crate) fn replace(&self, s: Sym, r: &Poly, limit: usize) -> Option<Poly> {
         let mut out = Poly::zero(self.w);
         let mut powers: Vec<Poly> = vec![Poly::constant(BitVec::one(self.w))];
@@ -854,6 +877,19 @@ impl Poly {
             self.terms.insert(m.clone(), c);
         }
     }
+}
+
+/// `v^e` mod 2^W (square and multiply).
+pub(crate) fn pow(v: &BitVec, e: u64) -> BitVec {
+    let (mut acc, mut base, mut e) = (BitVec::one(v.width()), *v, e);
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = mul(&acc, &base);
+        }
+        base = mul(&base, &base);
+        e >>= 1;
+    }
+    acc
 }
 
 /// The inverse of an odd value mod 2^W (Newton's iteration).

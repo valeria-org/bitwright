@@ -1034,3 +1034,168 @@ fn shared_split_and_factored_renderings() {
         7,
     );
 }
+
+/// `(a, t, e, b)` for `a·(x + t)^e + b`.
+type Power = (i128, i128, u32, i128);
+
+/// `a·(x + t)^e + b` at width `w`, multiplied out: `Σ_i a·C(e, i)·t^(e−i)·x^i + b`, each power a
+/// product of `x`s, with `off` added to the coefficient of `x` (a near-power when nonzero).
+fn expanded_power(w: Width, (a, t, e, b): Power, off: i128) -> T {
+    let bits = u32::from(w.bits());
+    let wrap = |v: u128| {
+        if bits >= 128 {
+            v
+        } else {
+            v & ((1 << bits) - 1)
+        }
+    };
+    // Binomial coefficients mod 2^W, row by row.
+    let mut row = vec![1u128];
+    for _ in 0..e {
+        let mut next = vec![1u128; row.len() + 1];
+        for i in 1..row.len() {
+            next[i] = wrap(row[i - 1].wrapping_add(row[i]));
+        }
+        row = next;
+    }
+    let mut sum = k(w, b);
+    let mut power: Option<T> = None;
+    for (i, c) in row.iter().enumerate() {
+        let tp = (i..e as usize).fold(1u128, |p, _| wrap(p.wrapping_mul(t as u128)));
+        let mut coef = wrap((a as u128).wrapping_mul(*c).wrapping_mul(tp));
+        if i == 1 {
+            coef = wrap(coef.wrapping_add(off as u128));
+        }
+        if i == 0 {
+            sum = add(sum, k(w, coef as i128));
+            continue;
+        }
+        let x = power.map_or(V(0), |p| mul(p, V(0)));
+        power = Some(x.clone());
+        sum = add(sum, mul(k(w, coef as i128), x));
+    }
+    sum
+}
+
+/// Solves `m` with the default budget: a proved answer (by the solver and again by a
+/// certificate here) of at most `want` nodes.
+fn proves_within(solver: &NormalFormSolver, m: &MbaExpr, want: usize) -> MbaExpr {
+    let MbaAnswer::Simplified { expr, claim } = solver.solve(m, &MbaBudget::default()) else {
+        panic!("not simplified: {m:?}");
+    };
+    assert_eq!(claim, Claim::Proved, "{expr:?}");
+    let r = certify::prove(m, &expr, &mut Steps::new(1 << 26)).unwrap();
+    assert_eq!(r.verdict, Verdict::Proved, "{expr:?}");
+    assert!(
+        cost(&expr) <= want,
+        "{} nodes, want {want}: {expr:?}",
+        cost(&expr)
+    );
+    expr
+}
+
+/// Powers of a shifted variable: the width, the power, and its nodes by squaring.
+const SHIFTED_POWERS: [(u16, Power, usize); 9] = [
+    (8, (1, 3, 5, 1), 8),
+    (16, (5, 0x1234, 6, 9), 10),
+    (32, (3, -0x12345, 7, 5), 11),
+    (64, (-1, 0xdead_beef, 5, 0x1234), 8),
+    (64, (1, -1, 32, 0), 8),
+    // Folded into lower degrees (at 8 bits from `x^10` on, at 16 from `x^18`): the shift is
+    // found all the same, and the least exponent of the power is taken.
+    (8, (3, 0x5a, 100, -7), 13),
+    (16, (1, 0x1234, 20, 0), 8),
+    (16, (3, 1, 20, -7), 12),
+    // No shift: `x^100` is `x^36` at 8 bits.
+    (8, (1, 0, 100, 0), 7),
+];
+
+#[test]
+fn powers_of_a_shifted_variable_render_by_squaring() {
+    // The two `(x − 1)^100` examples of Arnau Gàmez i Montolio's REcon 2026 MBA talk at 8 bits,
+    // its 101-term expansion and the degree-9 normal form: `(x − 1)^36`, 9 nodes, where the
+    // talk's own `(x − 1)^100` by squaring has 11.
+    let w8 = [Width::W8];
+    let expansion = expanded_power(Width::W8, (1, -1, 100, 0), 0).expr(&w8);
+    let (nf, _) = inspect(&expansion, &NfOptions::default()).unwrap();
+    for m in [&expansion, &nf] {
+        let solver = NormalFormSolver::default();
+        proves_within(&solver, m, 9);
+        assert!(solver.stats().powers > 0);
+    }
+    for (w, power, want) in SHIFTED_POWERS {
+        let vars = [Width::new(w).unwrap()];
+        let m = expanded_power(vars[0], power, 0).expr(&vars);
+        proves_within(&NormalFormSolver::default(), &m, want);
+    }
+}
+
+#[test]
+fn near_powers_are_not_powers() {
+    // One coefficient off: the power is refuted against it, no shift makes it one, and what
+    // the solver answers instead is proved.
+    for (w, power, _) in SHIFTED_POWERS {
+        let vars = [Width::new(w).unwrap()];
+        let exact = expanded_power(vars[0], power, 0).expr(&vars);
+        let MbaAnswer::Simplified { expr: rendered, .. } =
+            NormalFormSolver::default().solve(&exact, &MbaBudget::default())
+        else {
+            panic!("not simplified: {power:?}");
+        };
+        for off in [1, -2, 1 << 5] {
+            let near = expanded_power(vars[0], power, off).expr(&vars);
+            let r = certify::prove(&near, &rendered, &mut Steps::new(1 << 26)).unwrap();
+            assert_eq!(r.verdict, Verdict::Refuted, "{power:?} {off}");
+            let solver = NormalFormSolver::default();
+            match solver.solve(&near, &MbaBudget::default()) {
+                MbaAnswer::Simplified { expr, claim } => {
+                    assert_eq!(claim, Claim::Proved, "{power:?} {off}");
+                    let r = certify::prove(&near, &expr, &mut Steps::new(1 << 26)).unwrap();
+                    assert_eq!(r.verdict, Verdict::Proved, "{power:?} {off}");
+                }
+                MbaAnswer::NoSimpler => {}
+                other => panic!("{power:?} {off}: {other:?}"),
+            }
+            assert_eq!(solver.stats().powers, 0, "{power:?} {off}");
+        }
+    }
+}
+
+#[test]
+fn shifted_power_candidates_are_exact_exhaustively() {
+    // Random powers of a shifted variable and near-powers at narrow widths, where most powers
+    // fold: every candidate equals the input at every input, and every power whose normal form
+    // has degree 4 or more is found, whatever its shift.
+    let mut rng = crate::testutil::Rng(0x5_41f7);
+    let mut found = 0;
+    for w in 1..=10u16 {
+        let width = Width::new(w).unwrap();
+        let vars = [width];
+        for _ in 0..16 {
+            let mut draw = |m: u64| (rng.next() % m) as i128;
+            let power = (
+                draw(1 << w) | 1,
+                draw(1 << w),
+                4 + draw(40) as u32,
+                draw(1 << w),
+            );
+            for off in [0, 1] {
+                let m = expanded_power(width, power, off).expr(&vars);
+                let Some((naive, cands)) = inspect(&m, &NfOptions::default()) else {
+                    continue;
+                };
+                assert!(equal_everywhere(&m, &naive), "{power:?} {off}");
+                for c in &cands {
+                    assert!(equal_everywhere(&m, c), "{power:?} {off}: {c:?}");
+                }
+                if off == 0 && naive.shape().degree >= 4 {
+                    let solver = NormalFormSolver::default();
+                    let _ = solver.solve(&m, &MbaBudget::default());
+                    assert!(solver.stats().powers > 0, "{w} bits: {power:?}");
+                    found += 1;
+                }
+            }
+        }
+    }
+    assert!(found > 60, "{found}");
+}
