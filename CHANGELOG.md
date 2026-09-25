@@ -75,6 +75,12 @@
   `core.float_values` has `x · 1`, `x · −1`, `x + (−0)` to nearest, `min(x, x)`,
   `max(x, x)` and the round trip through a wider format. Rules may have four width variables
   (a conversion's two formats).
+- **MBA: powers of a shifted variable.** The normal-form solver renders a polynomial in one
+  variable of degree 4 or more that is `a·(x + s)^k + b` as that power, built by repeated
+  squaring with the cheapest equivalent exponent (`y^k` repeats with period `2^(W−2)` from
+  `k = W` on): the expansion of `(x − 1)^100` at 8 bits, which the normal form reduces to
+  degree 9, is `(x − 1)^36`, 9 nodes (issue #5). Like every rendering it is certified against
+  the question.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

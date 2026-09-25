@@ -1034,3 +1034,106 @@ fn shared_split_and_factored_renderings() {
         7,
     );
 }
+
+/// Powers of a shifted variable come back from their expansion (issue #5): `a·(x + s)^k + b`
+/// expanded (and, at narrow widths, reduced by the normal form) renders as the power by
+/// repeated squaring, at several widths. A near-power (one coefficient off) never becomes a
+/// power: every answer is certified, and the result stays equal to the input.
+#[test]
+fn shifted_powers_come_back_from_their_expansion() {
+    use crate::engine::{Engine, Strategy};
+    use crate::mba::MbaConfig;
+    use crate::{Bounded, Context, ParseOptions};
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
+        .build()
+        .unwrap();
+    // The expansion of a·(x + s)^k + b, term by term.
+    let expansion = |w: u16, a: u64, s: i64, k: u32, b: u64, off: Option<u32>| -> String {
+        let width = Width::new(w).unwrap();
+        let mut coef = vec![BitVec::zero(width); k as usize + 1];
+        // Binomial coefficients times s^(k-i), modulo 2^w.
+        let s = BitVec::wrapping_from_u64(width, s as u64);
+        let mut binom = BitVec::one(width);
+        for i in 0..=k {
+            let mut spow = BitVec::one(width);
+            for _ in 0..(k - i) {
+                spow = BitVec::apply_bin(crate::BinOp::Mul, &spow, &s).unwrap();
+            }
+            let c = BitVec::apply_bin(crate::BinOp::Mul, &binom, &spow).unwrap();
+            coef[i as usize] =
+                BitVec::apply_bin(crate::BinOp::Mul, &c, &BitVec::wrapping_from_u64(width, a))
+                    .unwrap();
+            // binom(k, i+1) = binom(k, i)·(k−i)/(i+1), over the integers (small k).
+            let exact: u128 =
+                (0..=i).fold(1u128, |acc, j| acc * u128::from(k - j) / u128::from(j + 1));
+            binom = BitVec::wrapping_from_u64(width, exact as u64);
+        }
+        coef[0] = BitVec::apply_bin(
+            crate::BinOp::Add,
+            &coef[0],
+            &BitVec::wrapping_from_u64(width, b),
+        )
+        .unwrap();
+        if let Some(i) = off {
+            coef[i as usize] =
+                BitVec::apply_bin(crate::BinOp::Add, &coef[i as usize], &BitVec::one(width))
+                    .unwrap();
+        }
+        let mut terms = Vec::new();
+        for (i, c) in coef.iter().enumerate() {
+            if c.is_zero() {
+                continue;
+            }
+            let pow = if i == 0 {
+                "1".to_string()
+            } else {
+                vec!["x"; i].join(" * ")
+            };
+            terms.push(format!("{} * {pow}", c.to_u64().unwrap()));
+        }
+        terms.join(" + ")
+    };
+    let size = |cx: &mut Context, e: crate::Expr| match cx.dag_size(&[e], u32::MAX).unwrap() {
+        Bounded::Exact(n) => n,
+        _ => u32::MAX,
+    };
+    for (w, a, s, k, b) in [
+        (8u16, 1u64, -1i64, 12u32, 0u64),
+        (8, 3, 2, 9, 5),
+        (16, 1, -1, 6, 0),
+        (16, 5, 3, 5, 7),
+        (32, 1, -2, 8, 1),
+        (64, 1, -1, 7, 0),
+        (64, 9, 4, 6, 11),
+    ] {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let mut cx = Context::new();
+        let src = expansion(w, a, s, k, b, None);
+        let e = cx.parse(&src, &o).unwrap();
+        let out = engine.simplify(&mut cx, e).unwrap();
+        // x, s, the shift, the squarings and products, a, b and their operations: a handful.
+        let n = size(&mut cx, out.expr);
+        assert!(
+            n <= 16,
+            "W={w} a={a} s={s} k={k} b={b}: {} nodes: {}",
+            n,
+            cx.display(out.expr)
+        );
+        // One coefficient off: still equal to the input, never the power.
+        for off in [0, k - 1] {
+            let mut cx = Context::new();
+            let src = expansion(w, a, s, k, b, Some(off));
+            let e = cx.parse(&src, &o).unwrap();
+            let out = engine.simplify(&mut cx, e).unwrap();
+            let mut rng = crate::testutil::Rng(w as u64);
+            assert!(
+                crate::engine::tests::equivalent(&mut cx, e, out.expr, &mut rng),
+                "W={w}: {} became {}",
+                cx.display(e),
+                cx.display(out.expr)
+            );
+        }
+    }
+}

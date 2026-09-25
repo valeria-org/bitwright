@@ -3189,6 +3189,11 @@ impl<'a> Render<'a> {
                 out.push(self.sum(&s));
             }
         }
+        if depth == 0
+            && let Some(x) = self.shifted_power(p)
+        {
+            out.push(x);
+        }
         if depth < MAX_DEPTH {
             // The whole form as a product: by a factor of the input's products, or by a
             // symbol all its monomials share (`x·y − 3·y` is `(x − 3)·y`).
@@ -3557,6 +3562,107 @@ impl<'a> Render<'a> {
         Some(acc.unwrap_or_else(|| self.b.konst(&BitVec::one(self.w))))
     }
 
+    /// A polynomial in one atom `x`, of degree 4 or more, that is `a·(x + s)^k + b` as a
+    /// function: its value built by repeated squaring (`(x − 1)^100`, whose expansion the
+    /// normal form reduces at narrow widths, is `(x − 1)^36` at 8 bits). The shift `s` is
+    /// tried among small constants; `b` is the value at `x = −s` and `a` the value at
+    /// `x = 1 − s` less `b`; the exponent is every one at widths to 12 (where `y^k` repeats
+    /// with period `2^(W−2)` from `k = W` on, [`power_class`]) and the degree beyond (where a
+    /// polynomial of degree at most `max_degree` is not reduced). A candidate that matches at
+    /// the probe points is built with its cheapest equivalent exponent; like every rendering,
+    /// it is certified against the question before it is returned.
+    fn shifted_power(&mut self, p: &Poly) -> Option<u32> {
+        let w = self.w;
+        let bits = u32::from(w.bits());
+        let atoms = p.atoms();
+        if bits > 64 || bits < 3 || p.degree() < 4 || atoms.count_ones() != 1 {
+            return None;
+        }
+        // Every monomial a power of one symbol: the atom at every position.
+        let sym = p.terms().keys().find_map(|m| m.first().map(|&(s, _)| s))?;
+        let whole = sym.set == atoms
+            && (sym.class == FULL || self.classes.mask(usize::from(sym.class)).is_ones());
+        if !whole
+            || !p
+                .terms()
+                .keys()
+                .all(|m| m.is_empty() || (m.len() == 1 && m[0].0 == sym))
+        {
+            return None;
+        }
+        let atom = atoms.trailing_zeros() as usize;
+        let mask = u64::MAX >> (64 - bits);
+        let mut point = vec![0u64; atom + 1];
+        let classes = self.classes;
+        let mut eval = |x: u64| -> Option<u64> {
+            point[atom] = x & mask;
+            Some(p.eval_low(classes, &point)? & mask)
+        };
+        let ks: Vec<u32> = if bits <= 12 {
+            (2..bits + (1 << (bits - 2))).collect()
+        } else {
+            vec![p.degree()]
+        };
+        if !self.spend(ks.len() as u64 * 33 * p.len() as u64) {
+            return None;
+        }
+        // Probe points: small values, both signs, and a spread of others.
+        let probes: Vec<u64> = (0..24u64)
+            .map(|i| match i {
+                0..=9 => i,
+                10..=15 => (i - 9).wrapping_neg(),
+                _ => i.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(i as u32),
+            })
+            .collect();
+        let pow = |y: u64, k: u32| -> u64 {
+            let (mut r, mut b, mut e) = (1u64, y, k);
+            while e > 0 {
+                if e & 1 == 1 {
+                    r = r.wrapping_mul(b);
+                }
+                b = b.wrapping_mul(b);
+                e >>= 1;
+            }
+            r & mask
+        };
+        let values: Vec<u64> = probes
+            .iter()
+            .map(|&x| eval(x))
+            .collect::<Option<Vec<u64>>>()?;
+        for s in (0..=16u64).flat_map(|v| [v, v.wrapping_neg()]).skip(1) {
+            let s = s & mask;
+            let b = eval(s.wrapping_neg())?;
+            let a = eval(1u64.wrapping_sub(s))?.wrapping_sub(b) & mask;
+            if a == 0 {
+                continue;
+            }
+            let Some(&k) = ks.iter().find(|&&k| {
+                probes.iter().zip(&values).all(|(&x, &v)| {
+                    a.wrapping_mul(pow(x.wrapping_add(s), k)).wrapping_add(b) & mask == v
+                })
+            }) else {
+                continue;
+            };
+            let k = power_class(k, bits);
+            let x = self.sym(sym)?;
+            let base = if s == 0 {
+                x
+            } else {
+                self.sum(&Sum {
+                    terms: vec![(x, BitVec::one(w))],
+                    konst: Some(BitVec::wrapping_from_u64(w, s)),
+                })
+            };
+            let y = self.power(base, k);
+            let b = BitVec::wrapping_from_u64(w, b);
+            return Some(self.sum(&Sum {
+                terms: vec![(y, BitVec::wrapping_from_u64(w, a))],
+                konst: (!b.is_zero()).then_some(b),
+            }));
+        }
+        None
+    }
+
     fn power(&mut self, x: u32, e: u32) -> u32 {
         let mut result: Option<u32> = None;
         let mut base = x;
@@ -3576,6 +3682,24 @@ impl<'a> Render<'a> {
         }
         result.unwrap_or(x)
     }
+}
+
+/// The cheapest exponent `k'` with `y^k' = y^k` for every `y` at `bits` (at least 3): `k`
+/// itself below `bits`; from `bits` on, where every even `y` gives 0 and the odd ones form a
+/// group of exponent `2^(bits−2)`, any `k' >= bits` with `k' ≡ k (mod 2^(bits−2))`, the one
+/// with the fewest multiplications by repeated squaring.
+fn power_class(k: u32, bits: u32) -> u32 {
+    if k < bits || bits > 34 {
+        return k;
+    }
+    let period = 1u64 << (bits - 2);
+    let first = u64::from(bits) + (u64::from(k) - u64::from(bits)) % period;
+    let cost = |e: u64| (63 - e.leading_zeros()) + e.count_ones();
+    (0..4u64)
+        .map(|j| first + j * period)
+        .filter(|&e| e <= u64::from(u32::MAX))
+        .min_by_key(|&e| (cost(e), e))
+        .map_or(k, |e| e as u32)
 }
 
 /// Table `t` of `s` inputs with the inputs in `f` complemented: entry `p` is `t`'s entry
