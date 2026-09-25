@@ -1,5 +1,5 @@
-//! What a benchmark sample measures: user-space instructions retired (hardware counters, Linux),
-//! the thread's CPU time, and wall time.
+//! What a benchmark sample measures: the thread's instructions retired (hardware counters:
+//! user space on Linux, kernel mode too on macOS), its CPU time, and wall time.
 //!
 //! Instructions retired is the primary metric: it does not depend on other load, frequency
 //! scaling or which core the thread runs on, so two runs on a busy machine agree to a fraction
@@ -11,6 +11,13 @@
 //! On a hybrid CPU (performance and efficiency cores are separate PMUs, `cpu_core` and
 //! `cpu_atom`), one counter per PMU is opened and their counts are added: each counts only
 //! while the thread runs on its kind of core.
+//!
+//! On macOS the kernel keeps each thread's instructions retired per kind of core (performance,
+//! efficiency) and `proc_pidinfo(PROC_PIDTHREADCOUNTS)` reads them without privileges; the
+//! kinds are added as on a hybrid Linux CPU. They include kernel mode, which no unprivileged
+//! interface separates: the cost of a reading itself (a system call, about 5,000 instructions)
+//! is measured when the counters open and subtracted, and what remains is the workload with the
+//! page faults and interrupts it takes.
 
 #![allow(unsafe_code)]
 
@@ -32,6 +39,8 @@ pub struct Reading {
 pub struct Counters {
     #[cfg(target_os = "linux")]
     fds: Vec<i32>,
+    #[cfg(target_os = "macos")]
+    thread: macos::Thread,
     /// Why instructions are unavailable, if they are.
     pub unavailable: Option<String>,
 }
@@ -52,10 +61,21 @@ impl Counters {
                 },
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let (thread, unavailable) = match macos::Thread::open() {
+                Ok(t) => (t, None),
+                Err(why) => (macos::Thread::default(), Some(why)),
+            };
+            Counters {
+                thread,
+                unavailable,
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Counters {
-                unavailable: Some("instruction counters are only read on Linux".into()),
+                unavailable: Some("instruction counters are only read on Linux and macOS".into()),
             }
         }
     }
@@ -69,6 +89,8 @@ impl Counters {
     pub fn start(&mut self) -> Start {
         #[cfg(target_os = "linux")]
         linux::reset_enable(&self.fds);
+        #[cfg(target_os = "macos")]
+        self.thread.reset_enable();
         Start {
             cpu: thread_cpu_ns(),
             wall: Instant::now(),
@@ -79,13 +101,17 @@ impl Counters {
     pub fn stop(&mut self, start: Start) -> Reading {
         #[cfg(target_os = "linux")]
         linux::disable(&self.fds);
+        #[cfg(target_os = "macos")]
+        self.thread.disable();
         let cpu = thread_cpu_ns().saturating_sub(start.cpu);
         let wall = u64::try_from(start.wall.elapsed().as_nanos()).unwrap_or(u64::MAX);
         #[cfg(target_os = "linux")]
         let instructions = (!self.fds.is_empty())
             .then(|| linux::read_sum(&self.fds))
             .flatten();
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        let instructions = self.unavailable.is_none().then_some(self.thread.counted);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let instructions = None;
         Reading {
             instructions,
@@ -114,12 +140,16 @@ impl Counters {
     pub fn pause(&mut self) {
         #[cfg(target_os = "linux")]
         linux::disable(&self.fds);
+        #[cfg(target_os = "macos")]
+        self.thread.disable();
     }
 
     /// Resumes paused counters without resetting them.
     pub fn resume(&mut self) {
         #[cfg(target_os = "linux")]
         linux::enable(&self.fds);
+        #[cfg(target_os = "macos")]
+        self.thread.enable();
     }
 }
 
@@ -293,5 +323,110 @@ mod linux {
             total = total.saturating_add(value);
         }
         Some(total)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    //! `proc_pidinfo(PROC_PIDTHREADCOUNTS)` for the calling thread's instructions retired.
+
+    /// The flavor, from XNU's `bsd/sys/proc_info_private.h` (used by `taskinfo`).
+    const PROC_PIDTHREADCOUNTS: libc::c_int = 34;
+
+    /// `struct proc_threadcounts_data`, one per kind of core, in `u64`s: instructions first.
+    const DATA: usize = 5;
+
+    /// The most kinds of core read (`hw.nperflevels` is 1 or 2 on current machines).
+    const KINDS: usize = 8;
+
+    /// A counter over the enabled intervals, less the cost of the readings that bound them.
+    #[derive(Debug, Default)]
+    pub(super) struct Thread {
+        /// The thread's system-wide id (`pthread_threadid_np`).
+        tid: u64,
+        /// The kinds of core (`hw.nperflevels`).
+        kinds: usize,
+        /// Instructions counted since the last reset.
+        pub(super) counted: u64,
+        /// The reading at the last enable, while enabled.
+        since: Option<u64>,
+        /// What one reading costs, as the least of a few back-to-back pairs.
+        reading: u64,
+    }
+
+    impl Thread {
+        pub(super) fn open() -> Result<Thread, String> {
+            let mut kinds = 0u32;
+            let mut len = std::mem::size_of::<u32>();
+            // SAFETY: `kinds` is a writable u32 and `len` its size, as the sysctl expects.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    c"hw.nperflevels".as_ptr(),
+                    (&mut kinds as *mut u32).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let mut tid = 0u64;
+            // SAFETY: thread 0 is the calling thread; `tid` is writable.
+            let tc = unsafe { libc::pthread_threadid_np(0, &mut tid) };
+            if rc != 0 || tc != 0 {
+                return Err("no thread id or kinds of core".into());
+            }
+            let mut t = Thread {
+                tid,
+                kinds: (kinds as usize).clamp(1, KINDS),
+                ..Thread::default()
+            };
+            t.reading = u64::MAX;
+            for _ in 0..8 {
+                let before = t
+                    .instructions()
+                    .ok_or("PROC_PIDTHREADCOUNTS reads nothing")?;
+                let after = t
+                    .instructions()
+                    .ok_or("PROC_PIDTHREADCOUNTS reads nothing")?;
+                t.reading = t.reading.min(after.saturating_sub(before));
+            }
+            Ok(t)
+        }
+
+        /// The instructions the thread has retired so far, on every kind of core (no allocation:
+        /// a reading's cost is subtracted as measured).
+        fn instructions(&self) -> Option<u64> {
+            // The header (two u16 and a u32: the entries filled) and one entry per kind.
+            let mut buf = [0u64; 1 + KINDS * DATA];
+            let size = libc::c_int::try_from((1 + self.kinds * DATA) * 8).ok()?;
+            // SAFETY: `buf` is writable for `size` bytes, which the flavor fills at most.
+            let n = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    PROC_PIDTHREADCOUNTS,
+                    self.tid,
+                    buf.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            let filled = ((buf[0] & 0xffff) as usize).min(self.kinds);
+            let total: u64 = (0..filled).map(|i| buf[1 + i * DATA]).sum();
+            (n > 0 && total > 0).then_some(total)
+        }
+
+        pub(super) fn reset_enable(&mut self) {
+            self.counted = 0;
+            self.enable();
+        }
+
+        pub(super) fn enable(&mut self) {
+            self.since = self.instructions();
+        }
+
+        pub(super) fn disable(&mut self) {
+            if let (Some(since), Some(now)) = (self.since.take(), self.instructions()) {
+                let spent = now.saturating_sub(since).saturating_sub(self.reading);
+                self.counted = self.counted.saturating_add(spent);
+            }
+        }
     }
 }

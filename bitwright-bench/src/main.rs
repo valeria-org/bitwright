@@ -1,5 +1,5 @@
-//! bitwright's benchmarks, measured in user-space instructions retired (Linux hardware
-//! counters) and thread CPU time, so that results do not move with other load on the machine.
+//! bitwright's benchmarks, measured in instructions retired (hardware counters, Linux and
+//! macOS) and thread CPU time, so that results do not move with other load on the machine.
 //! See `docs/benchmarking.md`.
 //!
 //! ```text

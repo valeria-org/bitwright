@@ -18,7 +18,7 @@ is, for example "1024 ops", "1000 nodes" or "context". Three quantities are repo
 
 | Column | Meaning |
 |-|-|
-| `instr` | Median user-space instructions retired, from the CPU's hardware counters (Linux, `perf_event_open`). |
+| `instr` | Median instructions retired, from the CPU's hardware counters: the thread's user-space instructions on Linux (`perf_event_open`), the thread's instructions on macOS (`proc_pidinfo(PROC_PIDTHREADCOUNTS)`, kernel mode included). |
 | `spread` | (max − min) / median of the instruction counts over the samples. It is the noise floor of that benchmark. |
 | `cpu (min)`, `cpu (med)` | The thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`): minimum and median over the samples. |
 | `wall (med)` | Elapsed time, for reference only. |
@@ -37,6 +37,12 @@ On a hybrid CPU (separate `cpu_core` and `cpu_atom` PMUs), one counter is opened
 counts are added. Each counter counts only while the thread runs on its kind of core. Kernel
 instructions (system calls, page faults) are excluded.
 
+On macOS the kernel keeps each thread's count per kind of core (performance, efficiency), and
+the kinds are added the same way; no privileges are needed. No unprivileged interface separates
+kernel mode, so its instructions are in the count: the cost of the reading itself (a system call,
+about 5,000 instructions) is measured once and subtracted, and what remains is the workload with
+the page faults and interrupts it takes. Compare macOS counts with macOS counts only.
+
 Instructions are a proxy, not the truth:
 - They do not see **cache misses**, **branch mispredictions** or **memory stalls**. A change that
   makes a data structure larger can keep the instruction count and still be slower.
@@ -45,8 +51,8 @@ Instructions are a proxy, not the truth:
 For any change that alters data layout or memory traffic, look at CPU time as well: compare the
 **minimum** CPU times, and repeat on a quiet machine before believing a difference under ~5%.
 
-If hardware counters are unavailable (another OS, a container, `perf_event_paranoid` above 2),
-the tool says so and falls back to CPU time.
+If hardware counters are unavailable (another OS, a container, `perf_event_paranoid` above 2,
+a macOS without per-thread counts), the tool says so and falls back to CPU time.
 
 ## Comparing a change against its baseline
 
