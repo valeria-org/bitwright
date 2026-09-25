@@ -296,6 +296,27 @@ fn corpus_compiles_cleanly() {
     assert!(loud.is_empty(), "{}", loud.join("\n"));
 }
 
+/// The engine compiles the corpora without repeating these checks: the same rules.
+#[test]
+fn trusted_compiles_are_the_same_programs() {
+    for src in [CORE, crate::rules::corpus::EQSAT] {
+        let full = RuleProgram::compile(src).unwrap();
+        let fast = RuleProgram::compile_trusted(src).unwrap();
+        assert_eq!(full.rules().len(), fast.rules().len());
+        for (a, b) in full.rules().iter().zip(fast.rules()) {
+            assert_eq!((a.id, &a.name, a.decreasing), (b.id, &b.name, b.decreasing));
+            assert_eq!(a.admitted_widths, b.admitted_widths, "{}", a.name);
+        }
+        let groups = |p: &RuleProgram| {
+            p.groups()
+                .iter()
+                .map(|g| (g.name.clone(), g.rules.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(groups(&full), groups(&fast));
+    }
+}
+
 #[test]
 fn corpus_is_sound() {
     let p = core();

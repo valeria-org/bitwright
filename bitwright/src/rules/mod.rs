@@ -87,6 +87,17 @@ impl RuleProgram {
         })
     }
 
+    /// A built-in corpus, compiled without the checks its tests run (see
+    /// `compile::compile_trusted`).
+    pub(crate) fn compile_trusted(src: &str) -> Result<RuleProgram, CompileError> {
+        let (groups, rules, diagnostics) = compile::compile_trusted(src)?;
+        Ok(RuleProgram {
+            groups,
+            rules: rules.into(),
+            diagnostics,
+        })
+    }
+
     /// Every rule, in source order.
     pub fn rules(&self) -> &[Rule] {
         &self.rules

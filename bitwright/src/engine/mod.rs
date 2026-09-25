@@ -392,7 +392,7 @@ static BUILTIN: OnceLock<Builtin> = OnceLock::new();
 
 fn builtin() -> &'static Builtin {
     BUILTIN.get_or_init(|| {
-        let program = RuleProgram::compile(crate::rules::corpus::CORE)
+        let program = RuleProgram::compile_trusted(crate::rules::corpus::CORE)
             .unwrap_or_else(|e| panic!("the built-in corpus does not compile: {e}"));
         let ledger = Ledger::parse(crate::rules::corpus::CORE_LEDGER)
             .unwrap_or_else(|e| panic!("the built-in ledger does not parse: {e}"));

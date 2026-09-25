@@ -300,7 +300,7 @@ impl Memo {
 fn builtin_program() -> &'static (RuleProgram, Ledger) {
     static B: OnceLock<(RuleProgram, Ledger)> = OnceLock::new();
     B.get_or_init(|| {
-        let p = RuleProgram::compile(crate::rules::corpus::EQSAT)
+        let p = RuleProgram::compile_trusted(crate::rules::corpus::EQSAT)
             .unwrap_or_else(|e| panic!("the built-in identities do not compile: {e}"));
         let l = Ledger::parse(crate::rules::corpus::EQSAT_LEDGER)
             .unwrap_or_else(|e| panic!("the built-in identity ledger does not parse: {e}"));

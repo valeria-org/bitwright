@@ -207,6 +207,9 @@ struct Parser<'a> {
     wdepth: u32,
     /// Validation work spent so far (see `CompileLimits::max_work`).
     work: u64,
+    /// A source the tests compile with every check (the built-in corpora): rules over several
+    /// widths are not validated at every assignment again, and lints are not run.
+    trusted: bool,
 }
 
 const MAX_DEPTH: u32 = 64;
@@ -1180,7 +1183,8 @@ impl Parser<'_> {
     ) -> Result<(Rule, Vec<String>), (Diagnostic, bool)> {
         let parsed = self.rule_parse(group, group_name).map_err(|d| (d, false))?;
         let (b, fin, allows) = parsed;
-        let rule = finish_rule(b, fin, &self.limits, &mut self.work).map_err(|d| (d, true))?;
+        let rule = finish_rule(b, fin, &self.limits, &mut self.work, self.trusted)
+            .map_err(|d| (d, true))?;
         Ok((rule, allows))
     }
 
@@ -1408,6 +1412,7 @@ fn finish_rule(
     f: FinishInput,
     limits: &CompileLimits,
     work: &mut u64,
+    trusted: bool,
 ) -> R<Rule> {
     if b.nodes.len() > limits.max_nodes {
         return Err(Diagnostic::error(
@@ -1539,22 +1544,25 @@ fn finish_rule(
             ));
         }
     }
-    let mut assignments = 0u64;
-    for_each_assignment(&rule, |_| {
-        assignments += 1;
-        true
-    });
-    let cost = (rule.nodes.len() as u64).saturating_mul(assignments);
-    *work = work.saturating_add(cost.saturating_mul(2));
-    if *work > limits.max_work {
-        return Err(Diagnostic::error(
-            "BW0100",
-            "the program is too costly to validate (width variables × rule size); \
-             raise `CompileLimits::max_work`",
-            f.span,
-        ));
+    // (A trusted source's rules over several widths: their validation admits no width set.)
+    if !(trusted && rule.width_vars.len() >= 2) {
+        let mut assignments = 0u64;
+        for_each_assignment(&rule, |_| {
+            assignments += 1;
+            true
+        });
+        let cost = (rule.nodes.len() as u64).saturating_mul(assignments);
+        *work = work.saturating_add(cost.saturating_mul(2));
+        if *work > limits.max_work {
+            return Err(Diagnostic::error(
+                "BW0100",
+                "the program is too costly to validate (width variables × rule size); \
+                 raise `CompileLimits::max_work`",
+                f.span,
+            ));
+        }
+        rule.admitted_widths = validate_widths(&rule, &b.spans)?;
     }
-    rule.admitted_widths = validate_widths(&rule, &b.spans)?;
     rule.decreasing = kbo_greater(&rule, rule.lhs, rule.rhs);
     rule.id = rule_id(&rule);
     Ok(rule)
@@ -2073,6 +2081,19 @@ fn parse_limbs(digits: &str, radix: u32) -> Option<Vec<u64>> {
 
 /// Compiles a rule program. Returns the rules and groups, plus warnings and notes.
 pub(crate) fn compile(src: &str, limits: &CompileLimits) -> Result<Compiled, CompileError> {
+    compile_mode(src, limits, false)
+}
+
+/// [`compile`] for a source the tests compile with every check (see `Parser::trusted`).
+pub(crate) fn compile_trusted(src: &str) -> Result<Compiled, CompileError> {
+    compile_mode(src, &CompileLimits::default(), true)
+}
+
+fn compile_mode(
+    src: &str,
+    limits: &CompileLimits,
+    trusted: bool,
+) -> Result<Compiled, CompileError> {
     let fail = |d: Diagnostic| CompileError {
         diagnostics: vec![d],
     };
@@ -2093,6 +2114,7 @@ pub(crate) fn compile(src: &str, limits: &CompileLimits) -> Result<Compiled, Com
         limits: limits.clone(),
         wdepth: 0,
         work: 0,
+        trusted,
     };
     // Header: `bitwright 1;`
     let header_ok = p.is_ident("bitwright") && matches!(p.peek2(), Tok::Int(d, 10) if d == "1");
@@ -2201,7 +2223,8 @@ pub(crate) fn compile(src: &str, limits: &CompileLimits) -> Result<Compiled, Com
                             rule.span,
                         ));
                     }
-                    if !allows.iter().any(|a| a == "BW0402")
+                    if !p.trusted
+                        && !allows.iter().any(|a| a == "BW0402")
                         && !super::matcher::pattern_reachable(&rule)
                     {
                         p.diags.push(Diagnostic::warning(
