@@ -1037,6 +1037,9 @@ impl Context {
 
     /// [`Self::compute_facts`] with at most `cap` transfers (and at most the context's cap).
     fn compute_facts_cap(&mut self, root: u32, cap: u32) -> Option<Facts> {
+        if let Some(f) = self.cached_facts(root) {
+            return Some(f);
+        }
         if self.ensure_facts_cap(root, cap) {
             self.cached_facts(root)
         } else {
