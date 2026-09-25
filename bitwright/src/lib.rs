@@ -102,6 +102,8 @@ pub mod rules;
 pub mod smtlib;
 #[cfg(test)]
 mod testutil;
+#[cfg(feature = "prove")]
+pub mod transform;
 
 /// The README's and the book's examples (`book/src`), compiled and run as doctests.
 #[cfg(doctest)]
@@ -128,6 +130,9 @@ mod book {
     #[cfg(feature = "check")]
     #[doc = include_str!("../../book/src/checking.md")]
     struct Checking;
+    #[cfg(feature = "prove")]
+    #[doc = include_str!("../../book/src/transformations.md")]
+    struct Transformations;
     #[cfg(feature = "mba")]
     #[doc = include_str!("../../book/src/deobfuscation.md")]
     struct Deobfuscation;

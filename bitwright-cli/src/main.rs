@@ -37,6 +37,23 @@ commands:
         the rules (the built-in ones without a file) as Lean 4 theorems over BitVec, for every
         width, their proofs left as `sorry`; with `--at`, at the widest widths up to <n> each
         rule admits, proved by `bv_decide` (`lean rules.lean` checks them).
+  prove <file.opt> [--widths <w,...>] [--conflicts <n>]
+        verify compiler transformations written as in the Alive paper (`Pre:`, source,
+        `=>`, target): that each target refines its source under LLVM's semantics of
+        poison, undefined behavior and floating point, at every width (1 to 8, 16, 32, 64)
+        and format left open; a counterexample shows the inputs and each side's values as
+        LLVM IR constants. Exit 1 unless every transformation is valid.
+  infer <file.opt> [--widths <w,...>] [--conflicts <n>]
+        infer a precondition over each transformation's symbolic constants (its own `Pre:` is
+        ignored): the values where it is valid are learned as a formula over predicates
+        (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified at every
+        width. Exit 1 unless every transformation gets a verified precondition (or needs
+        none).
+  tv <src.ll> [<tgt.ll>] [--conflicts <n>]
+        translation validation: that each function of the second file refines the function of
+        the same name in the first (or @tgt refines @src of one file), for a subset of LLVM
+        IR (integers, floating point, acyclic control flow, the intrinsics bitwright knows).
+        Exit 1 unless every pair is valid.
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
@@ -162,6 +179,9 @@ fn run(args: &[String]) -> Result<String, Fail> {
         "smt" => smt(rest),
         "catalog" => catalog(rest),
         "lean" => lean(rest),
+        "prove" => prove(rest),
+        "tv" => tv(rest),
+        "infer" => infer(rest),
         "explain" => {
             let a = Args::parse(rest, &[], &[])?;
             let code = a.one("diagnostic code")?;
@@ -446,6 +466,143 @@ fn smt(rest: &[String]) -> Result<String, Fail> {
         writeln!(out, "; {} rules skipped", skipped.len()).ok();
         Err(Fail::Report(out))
     }
+}
+
+/// The verifier's configuration from `--widths` and `--conflicts`.
+fn transform_config(a: &Args) -> Result<bitwright::transform::Config, Fail> {
+    let mut cfg = bitwright::transform::Config::default();
+    if let Some(ws) = a.value("widths") {
+        let widths = ws
+            .split(',')
+            .map(|w| w.trim().parse::<u16>().ok().filter(|&w| w > 0))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| usage(format!("--widths: {ws} is not a list of widths")))?;
+        cfg = cfg.with_widths(widths);
+    }
+    if let Some(c) = a.value("conflicts") {
+        let n = c
+            .parse::<u64>()
+            .map_err(|_| usage(format!("--conflicts: {c} is not a number")))?;
+        cfg = cfg.with_conflicts(n);
+    }
+    Ok(cfg)
+}
+
+fn reports(reports: Vec<bitwright::transform::Report>) -> Result<String, Fail> {
+    use bitwright::transform::Verdict;
+    let mut out = String::new();
+    let (mut valid, mut invalid, mut open) = (0, 0, 0);
+    for r in &reports {
+        out.push_str(&r.to_string());
+        match r.verdict() {
+            Verdict::Valid => valid += 1,
+            Verdict::Invalid(_) => invalid += 1,
+            _ => open += 1,
+        }
+    }
+    writeln!(
+        out,
+        "\n{valid} valid, {invalid} invalid, {open} not decided"
+    )
+    .ok();
+    if invalid == 0 && open == 0 {
+        Ok(out)
+    } else {
+        Err(Fail::Report(out))
+    }
+}
+
+fn prove(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["widths", "conflicts"], &[])?;
+    let path = a.one("transformation file")?;
+    let src = read(path)?;
+    let cfg = transform_config(&a)?;
+    let ts = bitwright::transform::parse_transforms(&src)
+        .map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+    reports(
+        ts.iter()
+            .map(|t| bitwright::transform::verify(t, &cfg))
+            .collect(),
+    )
+}
+
+fn infer(rest: &[String]) -> Result<String, Fail> {
+    use bitwright::transform::Verdict;
+    let a = Args::parse(rest, &["widths", "conflicts"], &[])?;
+    let path = a.one("transformation file")?;
+    let src = read(path)?;
+    let cfg = transform_config(&a)?;
+    let ts = bitwright::transform::parse_transforms(&src)
+        .map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+    let mut out = String::new();
+    let mut ok = true;
+    for t in &ts {
+        let i = bitwright::transform::infer(t, &cfg)
+            .map_err(|e| Fail::Err(2, format!("{}: {e}", t.name)))?;
+        let verdict = i.report.as_ref().map(|r| r.verdict());
+        let (pos, neg) = i.examples;
+        match (&i.pre, verdict) {
+            (_, None) => {
+                ok = false;
+                writeln!(
+                    out,
+                    "none         {}  (no symbolic constants, or no valid value)",
+                    t.name
+                )
+                .ok();
+            }
+            (None, Some(Verdict::Valid)) => {
+                writeln!(out, "not needed   {}  (valid as it is)", t.name).ok();
+            }
+            (Some(p), Some(Verdict::Valid)) => {
+                let how = if i.weakest {
+                    "weakest found"
+                } else {
+                    "some valid values excluded"
+                };
+                writeln!(
+                    out,
+                    "Pre: {p}\n             {}  ({how}; {pos} valid and {neg} invalid examples)",
+                    t.name
+                )
+                .ok();
+            }
+            (p, Some(v)) => {
+                ok = false;
+                let what = match v {
+                    Verdict::Invalid(cx) => format!("still invalid:\n{cx}"),
+                    Verdict::Unknown(w) | Verdict::Unsupported(w) => format!("not decided: {w}"),
+                    Verdict::Valid => unreachable!("handled"),
+                };
+                writeln!(
+                    out,
+                    "Pre: {}\n             {}  {what}",
+                    p.as_deref().unwrap_or("(none)"),
+                    t.name
+                )
+                .ok();
+            }
+        }
+    }
+    if ok { Ok(out) } else { Err(Fail::Report(out)) }
+}
+
+fn tv(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["conflicts"], &[])?;
+    let (first, second) = match a.pos.as_slice() {
+        [p] => (read(p)?, None),
+        [p, q] => (read(p)?, Some(read(q)?)),
+        _ => return Err(usage("expected one or two LLVM IR files")),
+    };
+    let cfg = transform_config(&a)?;
+    let pairs = bitwright::transform::pairs(&first, second.as_deref())
+        .map_err(|e| Fail::Err(2, e.to_string()))?;
+    reports(
+        pairs
+            .iter()
+            .map(|t| bitwright::transform::verify(t, &cfg))
+            .collect(),
+    )
 }
 
 fn lean(rest: &[String]) -> Result<String, Fail> {

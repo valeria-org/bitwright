@@ -387,7 +387,15 @@ fn decide(
             Ok(Outcome::Proved(cert))
         }
         Answer::Sat(model) => {
-            let ce = b.counterexample(&cnf, &model)?;
+            let mut ce = b.counterexample(&cnf, &model)?;
+            // Symbols the simplified question no longer reads take any value: 0.
+            for id in b.cx.symbols_in(&[root])? {
+                if let (Some(k), Some(w)) = (b.cx.symbol_key(id).cloned(), b.cx.symbol_width(id))
+                    && !ce.iter().any(|(kk, _)| *kk == k)
+                {
+                    ce.push((k, BitVec::zero(w)));
+                }
+            }
             // Checked by bitwright's evaluator: a solver or blaster bug cannot produce a false
             // refutation unnoticed.
             let env =

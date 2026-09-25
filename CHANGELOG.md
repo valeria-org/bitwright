@@ -125,6 +125,28 @@
   statement of the built-in rules it can state (272 of 313: floating point, bit counts, `pdep`
   and `pext` are left out), and `bv_decide` proves all of them at 8 bits but two
   multiplication identities, which exceed its budget.
+- **Verifying compiler transformations** (`bitwright::transform`, feature `prove`): that a
+  target program refines a source program under LLVM's semantics, read from the language
+  reference: values with poison (every poison-generating flag: `nsw`, `nuw`, `exact`,
+  `disjoint`, `nneg`, `samesign`, `trunc nuw/nsw`), undefined behavior (division, `INT_MIN /
+  -1`, branching on poison, `unreachable`, `llvm.assume`, `noundef`), and nondeterminism
+  (`undef`, `freeze`, NaN signs and payloads, `nsz` zeros, `fmuladd`), chosen existentially by
+  the source and universally by the target, decided by counterexample-guided search over the
+  native prover. Two front ends: peephole transformations in the syntax of the Alive paper
+  (`parse_transforms`, `bitwright prove`), with preconditions, constant expressions and types
+  inferred and checked at every width left open (1 to 8, 16, 32, 64; half, float, double);
+  and translation validation of LLVM IR function pairs (`pairs`, `bitwright tv`: integers and
+  floating point, acyclic control flow with `phi` and `switch`, 35 intrinsics, the `noundef`,
+  `range` and `nofpclass` attributes). Counterexamples are minimized (no poison where
+  possible, 0, 1, −1, then few significant bits) and printed as LLVM IR constants.
+  Preconditions are inferred from examples the prover classifies (`infer`, `bitwright
+  infer`): `isPowerOf2(C)` for a multiplication as a shift, `C != 1 && !isSignBit(C)` for
+  PR20186. Checked against LLVM itself: 800 random integer functions optimized by clang 21 at
+  `-O2` all validate (and 59 of 60 floating-point ones, the last over budget); of 2,400
+  mutations of the optimized functions, every counterexample is confirmed by an independent
+  interpreter and random sampling finds no difference in the mutants judged valid. Of the
+  fast-math flags, `nnan`, `ninf` and `nsz` are modeled; `reassoc`, `arcp`, `contract` and
+  `afn` are not.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

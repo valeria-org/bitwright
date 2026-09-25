@@ -65,6 +65,10 @@ fn main() -> Result<(), bitwright::Error> {
   a hash comparison becomes a plain one.
 - **A rule language (`.bwr`)** for your own rewrites, with a mandatory soundness check
   (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
+- **Verified compiler transformations**: peephole optimizations in the Alive syntax and pairs
+  of LLVM IR functions are proved correct (refinement under LLVM's poison, undefined behavior
+  and floating-point semantics, every width left open) or refuted with a small counterexample,
+  and preconditions are inferred; by bitwright's own bit-blaster and SAT solver.
 - **Optional services**: MBA simplification (a native solver for linear, semi-linear and
   polynomial MBA, pluggable backends, and answers bitwright proves itself), a bounded
   equality-saturation search, and SMT-LIB export and import, so any SMT solver can prove a rule
@@ -204,6 +208,9 @@ bitwright lint rules.bwr                                # every diagnostic, rend
 bitwright smt rules.bwr | z3 -in                        # prove every rule at 8, 32 and 64 bits (or `| bitwuzla`)
 bitwright catalog > RULES.md                            # the built-in rules as Markdown
 bitwright explain BW0302                                # what a diagnostic means
+bitwright prove opt.txt                                 # verify LLVM peephole transformations (Alive syntax)
+bitwright tv before.ll after.ll                         # translation validation of LLVM IR functions
+bitwright lean rules.bwr --at 8 > rules.lean            # the rules as Lean theorems (bv_decide proves them)
 bitwright simplify '(x & y) * (x | y) + (x & ~y) * (~x & y)'   # x * y (nonlinear MBA, proved)
 bitwright simplify 'x * k == y * k' --assume '(k & 1) == 1'   # x == y, relying on the assumption
 ```
