@@ -131,7 +131,8 @@ assumptions are the same.
 
 `Engine::run` takes several roots and processes them one after another, in one context: work
 on shared subexpressions is done once, and a rewrite is weighed against every root that uses
-a node. For many independent expressions (every instruction of a function, a dataset of
+a node. A rewrite held back only because another root shared its subterms is reconsidered once
+every root is done, when those roots may no longer use them. For many independent expressions (every instruction of a function, a dataset of
 obfuscated expressions), `Engine::run_each` simplifies each root on its own, as a call with
 that root alone would, on threads. Each root is copied into a context of its own
 (`Context::import`, which also moves expressions between contexts in general), simplified

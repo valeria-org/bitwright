@@ -187,6 +187,17 @@
   call's counters. The command line's `simplify --file exprs.txt --jobs 8` simplifies a file of
   expressions, one per line; Python has `Engine.run_each(exprs, threads=…)` (the interpreter
   released), C `bw_engine_run_each`, C++ `Engine::run_each`.
+- **Several roots: a second look.** `Engine::run` processes its roots one after another, and a
+  rewrite that would not make the DAG smaller because another root still uses its subterms is
+  not final; before, it was never reconsidered. Once every root is done, the roots with such a
+  result are run again (while that changes something, at most three times; a root is skipped
+  when nothing was rewritten after its result was reached), so the subterms the other roots
+  have since stopped using can go. On the benchmark's nonlinear MBA inputs, 20 roots in one
+  call, the results shrink from 31 nodes to 16 (0.10.0: 25) and on its linear ones from 85 to
+  82 (0.10.0: 83); on calls of 20 and 100 random expressions, 94 and 114 of 12,000 results get
+  smaller and none larger. It costs 4 % on `simplify/standard` and 6 to 17 % on the MBA
+  benchmarks (instructions). The MBA phase also keeps each call's solver answers by question,
+  so a question asked again (its answer not committed the first time) is not solved again.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

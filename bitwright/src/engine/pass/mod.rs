@@ -558,6 +558,11 @@ impl Live {
         }
     }
 
+    /// Drops the other roots' part (they changed: it is counted again when next needed).
+    pub(crate) fn forget_others(&mut self) {
+        self.others.active = None;
+    }
+
     #[inline]
     fn in_base(&self, i: u32) -> bool {
         self.base && self.others.reach.contains(i)

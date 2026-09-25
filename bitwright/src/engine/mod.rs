@@ -1002,6 +1002,9 @@ struct Runner<'r, 'a> {
     linear_mba: pass::linear_mba::Scratch,
     /// The demanded-bits pass's memo, empty between calls.
     demanded: pass::demanded::Memo,
+    /// The MBA solver's answers in this call, by question.
+    #[cfg(feature = "mba")]
+    mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -1813,6 +1816,8 @@ impl Engine {
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
             demanded: Default::default(),
+            #[cfg(feature = "mba")]
+            mba_answers: IdMap::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -1834,6 +1839,11 @@ impl Engine {
         };
         let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
         let mut failure: Option<Error> = None;
+        // Roots whose result is not final only because of what other roots share, with their
+        // entry of `live_roots` and the version of the live roots their result was reached at
+        // (the count of roots rewritten so far).
+        let mut provisional: Vec<(u32, usize, u64)> = Vec::new();
+        let mut version = 0u64;
         for &root in &ids {
             if done.contains_key(&root) {
                 continue;
@@ -1851,7 +1861,16 @@ impl Engine {
                     let (r, end, rel) = match runner.strategy(cx, root) {
                         Ok((r, fin)) => match fin.why {
                             Some(why) if !fin.done => (r, End::BudgetTerminated(why), fin.rel),
-                            _ => (r, End::Completed, fin.rel),
+                            _ => {
+                                if !fin.done {
+                                    provisional.push((
+                                        root,
+                                        runner.active,
+                                        version + u64::from(r != root),
+                                    ));
+                                }
+                                (r, End::Completed, fin.rel)
+                            }
                         },
                         Err((r, fin, Stop::Exhausted(e))) => (r, End::BudgetTerminated(e), fin.rel),
                         Err((_, _, Stop::Error(e))) => {
@@ -1870,8 +1889,69 @@ impl Engine {
             if let Some(slot) = runner.live_roots.get_mut(runner.active) {
                 *slot = out.0;
             }
+            version += u64::from(out.0 != root);
             runner.active += 1;
             done.insert(root, out);
+        }
+        // Once every root is done, sharing that kept a rewrite back may be gone (a subterm
+        // only other roots' parts used, simplified away since): those roots again, while that
+        // changes something.
+        if runner.live_roots.len() > 1 {
+            for _ in 0..3 {
+                if failure.is_some() || provisional.is_empty() {
+                    break;
+                }
+                runner.live.forget_others();
+                let mut changed = false;
+                for (root, k, seen) in std::mem::take(&mut provisional) {
+                    // Nothing rewritten since this root's result was reached: the live roots
+                    // are as they were then, and the result a fixed point of them.
+                    if seen == version {
+                        provisional.push((root, k, seen));
+                        continue;
+                    }
+                    let (r0, _, rel0) = done[&root];
+                    runner.active = k;
+                    let (r, end, rel, again) = match runner.strategy(cx, r0) {
+                        Ok((r, fin)) => match fin.why {
+                            Some(why) if !fin.done => {
+                                (r, End::BudgetTerminated(why), fin.rel, false)
+                            }
+                            _ => (r, End::Completed, fin.rel, !fin.done),
+                        },
+                        Err((r, fin, Stop::Exhausted(e))) => {
+                            (r, End::BudgetTerminated(e), fin.rel, false)
+                        }
+                        Err((_, _, Stop::Error(e))) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    };
+                    if r != r0 {
+                        changed = true;
+                        version += 1;
+                        runner.stats.completed[usize::from(r0 != root)] -= 1;
+                        let slot = match end {
+                            End::Completed => &mut runner.stats.completed,
+                            _ => &mut runner.stats.budget_terminated,
+                        };
+                        slot[usize::from(r != root)] += 1;
+                        if let Some(slot) = runner.live_roots.get_mut(k) {
+                            *slot = r;
+                        }
+                    } else if end != End::Completed {
+                        runner.stats.completed[usize::from(r0 != root)] -= 1;
+                        runner.stats.budget_terminated[usize::from(r != root)] += 1;
+                    }
+                    done.insert(root, (r, end, rel0 | rel));
+                    if again {
+                        provisional.push((root, k, version));
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
         }
         let spent = runner.meter.spent;
         if let Some(a) = allowance {

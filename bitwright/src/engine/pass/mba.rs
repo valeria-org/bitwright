@@ -166,14 +166,29 @@ pub(super) fn step(
             (e, None)
         }
         _ => {
-            r.meter.charge(Counter::MbaCalls, 1)?;
-            count(r).calls += 1;
-            // The solver's own evidence counts only where backend certificates are trusted:
-            // elsewhere the gate proves every answer itself.
-            let budget = cfg
-                .budget
-                .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
-            match inner.mba.solver.solve(&m, &budget) {
+            // A question asked earlier in this call whose answer was not committed then (not
+            // smaller, say): the same answer (every answer but running short is complete).
+            let answer = match r.mba_answers.get(&key).cloned() {
+                Some(a) => {
+                    count(r).cache_hits += 1;
+                    a
+                }
+                None => {
+                    r.meter.charge(Counter::MbaCalls, 1)?;
+                    count(r).calls += 1;
+                    // The solver's own evidence counts only where backend certificates are
+                    // trusted: elsewhere the gate proves every answer itself.
+                    let budget = cfg
+                        .budget
+                        .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
+                    let a = inner.mba.solver.solve(&m, &budget);
+                    if a != MbaAnswer::Exhausted {
+                        r.mba_answers.insert(key, a.clone());
+                    }
+                    a
+                }
+            };
+            match answer {
                 MbaAnswer::Simplified { expr, claim } => {
                     if expr.vars() != m.vars() || expr.width() != m.width() {
                         count(r).refuted += 1;
