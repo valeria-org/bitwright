@@ -774,6 +774,10 @@ impl Context {
     /// argument is).
     pub(crate) fn transfer_at(&self, i: u32, op: &TOp, args: &[&Facts]) -> Facts {
         let n = self.node(i);
+        // A symbol: what the host declared of it, else nothing.
+        if let Some(k) = self.declared_at(i) {
+            return Facts::from_known(k);
+        }
         if n.op == OpCode::Add && n.a == n.b && args.len() == 2 {
             // `a + a` is `a << 1`, whose transfer knows the low bit (an addition's does not
             // know its operands are one value).

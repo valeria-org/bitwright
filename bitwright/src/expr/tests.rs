@@ -1166,3 +1166,36 @@ fn reserving_room_builds_the_same_nodes() {
         assert_eq!(ea.index(), eb.index());
     }
 }
+
+/// Declaring known bits: only for symbols of the same width; kept by `import`, which refuses a
+/// conflicting declaration; facts start from it.
+#[test]
+fn declared_known_bits_are_checked_and_carried() {
+    let w = Width::W8;
+    let low = crate::KnownBits::new(BitVec::from_u64(w, 0x0f).unwrap(), BitVec::zero(w)).unwrap();
+    let mut cx = Context::new();
+    let x = cx.symbol("x", w).unwrap();
+    let y = cx.symbol("y", w).unwrap();
+    let sum = cx.bin(BinOp::Add, x, y).unwrap();
+    assert!(matches!(
+        cx.declare_known(sum, low),
+        Err(Error::Unsupported(_))
+    ));
+    let wide = crate::KnownBits::unknown(Width::W16);
+    assert!(matches!(cx.declare_known(x, wide), Err(Error::Width(_))));
+    cx.declare_known(x, low).unwrap();
+    assert_eq!(cx.declared_known(x).unwrap(), Some(low));
+    assert_eq!(cx.facts(x).unwrap().known(), low);
+    // Imported with its declaration; a context that declares otherwise refuses it.
+    let mut other = Context::new();
+    let s = other.import(&cx, &[sum]).unwrap()[0];
+    let ox = other.find_symbol(&SymbolKey::from("x")).unwrap();
+    assert_eq!(other.declared_known(ox).unwrap(), Some(low));
+    assert_eq!(other.display(s).to_string(), cx.display(sum).to_string());
+    let mut conflicting = Context::new();
+    let cxx = conflicting.symbol("x", w).unwrap();
+    conflicting
+        .declare_known(cxx, crate::KnownBits::constant(&BitVec::one(w)))
+        .unwrap();
+    assert!(conflicting.import(&cx, &[sum]).is_err());
+}

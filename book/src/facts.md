@@ -89,5 +89,10 @@ assert_eq!(cx.prove(Query::Cmp(CmpOpExt::Ne, odd, zero))?, Truth::Unknown);
 # Ok::<(), bitwright::Error>(())
 ```
 
+What holds of a symbol everywhere, not just on one path, is declared instead:
+`Context::declare_known(x, kb)` makes the known bits part of the symbol's meaning. The context's
+own facts then start from them, and no run pays for assumptions. The book's [Inside a
+compiler](simplifying.md#inside-a-compiler) shows it.
+
 Rule guards (the next chapters) are answered by these same facts, which is why a guard can only
 ever say "proven", never "disproven".

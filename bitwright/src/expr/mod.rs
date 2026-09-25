@@ -921,7 +921,12 @@ impl Context {
         );
         let node = self.push(Node::new(OpCode::Sym, width.bits(), id, 0, 0), shash)?;
         self.symbols.index.insert(key.clone(), id);
-        self.symbols.entries.push(SymEntry { key, width, node });
+        self.symbols.entries.push(SymEntry {
+            key,
+            width,
+            node,
+            known: None,
+        });
         Ok(node)
     }
 
@@ -961,6 +966,72 @@ impl Context {
     /// The number of symbols.
     pub fn symbol_count(&self) -> usize {
         self.symbols.entries.len()
+    }
+
+    /// Declares what the host knows of the value of symbol `s`: every bit `known` has as zero
+    /// or one is that bit of every value the symbol stands for (a compiler's known bits of a
+    /// parameter, a load or a call result). It replaces any earlier declaration;
+    /// [`KnownBits::unknown`](crate::KnownBits::unknown) withdraws it.
+    ///
+    /// The declaration becomes part of the symbol's meaning. Facts, proofs and the simplifier
+    /// use it, and a result is equal to its input for every value of the symbols that agrees
+    /// with their declarations, not for others. Evaluating at a value that does not agree is
+    /// the host's error. A declaration drops the context's facts and simplification memo
+    /// (both may depend on it), so declare right after creating the symbol.
+    ///
+    /// ```
+    /// use bitwright::{BitVec, Context, KnownBits, ParseOptions, Query, Truth, Width};
+    ///
+    /// let mut cx = Context::new();
+    /// let x = cx.symbol("x", Width::W8)?;
+    /// // The top four bits of `x` are zero.
+    /// let zero = BitVec::from_u64(Width::W8, 0xf0)?;
+    /// cx.declare_known(x, KnownBits::new(zero, BitVec::zero(Width::W8)).unwrap())?;
+    /// let high = cx.parse("x >>u 4", &ParseOptions::width(Width::W8))?;
+    /// assert_eq!(cx.prove(Query::IsZero(high))?, Truth::True);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn declare_known(&mut self, s: Expr, known: crate::KnownBits) -> Result<(), Error> {
+        let i = self.id(s)?;
+        let n = self.node(i);
+        if n.op != OpCode::Sym {
+            return Err(Error::Unsupported(
+                "known bits are declared for symbols only".into(),
+            ));
+        }
+        if known.width().bits() != n.width {
+            return Err(crate::error::WidthError::Mismatch {
+                left: n.width,
+                right: known.width().bits(),
+            }
+            .into());
+        }
+        let known = (!known.known().is_zero()).then_some(known);
+        let entry = &mut self.symbols.entries[n.a as usize];
+        if entry.known == known {
+            return Ok(());
+        }
+        entry.known = known;
+        // Every cached fact and result may rest on the old declaration.
+        self.facts.clear();
+        self.memo.clear();
+        #[cfg(feature = "eqsat")]
+        self.eqsat_memo.clear();
+        Ok(())
+    }
+
+    /// The known bits declared for symbol `s` ([`declare_known`](Self::declare_known)), if any.
+    pub fn declared_known(&self, s: Expr) -> Result<Option<crate::KnownBits>, Error> {
+        let i = self.id(s)?;
+        Ok(self.declared_at(i))
+    }
+
+    /// The known bits declared for node `i`, if it is a symbol with a declaration.
+    pub(crate) fn declared_at(&self, i: u32) -> Option<crate::KnownBits> {
+        let n = self.node(i);
+        (n.op == OpCode::Sym)
+            .then(|| self.symbols.entries[n.a as usize].known)
+            .flatten()
     }
 
     // ----- traversal ------------------------------------------------------------------------

@@ -698,6 +698,19 @@ impl Context {
                 OpCode::Sym => {
                     let e = &src.symbols.entries[n.a as usize];
                     let s = self.symbol(e.key.clone(), e.width)?;
+                    // With what the host declared of it: results from `src` may rely on it.
+                    if let Some(k) = e.known {
+                        match self.declared_known(s)? {
+                            None => self.declare_known(s, k)?,
+                            Some(have) if have == k => {}
+                            Some(_) => {
+                                return Err(Error::Unsupported(format!(
+                                    "symbol {} has other declared known bits in this context",
+                                    e.key
+                                )));
+                            }
+                        }
+                    }
                     self.id(s)?
                 }
                 op => {

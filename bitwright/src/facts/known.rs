@@ -117,6 +117,11 @@ impl KnownBits {
         self.one
     }
 
+    /// `v` with the known bits set to their values: a value these known bits allow.
+    pub(crate) fn fit(&self, v: &BitVec) -> BitVec {
+        bv_or(&bv_and(v, &bv_not(&self.zero)), &self.one)
+    }
+
     /// Bits whose value is known.
     pub fn known(&self) -> BitVec {
         bv_or(&self.zero, &self.one)

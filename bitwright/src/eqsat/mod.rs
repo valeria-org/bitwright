@@ -781,15 +781,22 @@ impl Saturator {
 fn agrees(cx: &mut Context, a: u32, b: u32) -> Result<bool, Error> {
     let (ea, eb) = (cx.handle(a), cx.handle(b));
     let syms = cx.symbols_in(&[ea, eb])?;
-    let keys: Vec<(SymbolKey, Width)> = syms
+    // With what the host declared of each (the points agree with it).
+    let keys: Vec<(SymbolKey, Width, Option<crate::KnownBits>)> = syms
         .iter()
-        .filter_map(|&s| Some((cx.symbol_key(s)?.clone(), cx.symbol_width(s)?)))
+        .filter_map(|&s| {
+            let key = cx.symbol_key(s)?.clone();
+            let known = cx
+                .find_symbol(&key)
+                .and_then(|e| cx.declared_known(e).ok().flatten());
+            Some((key, cx.symbol_width(s)?, known))
+        })
         .collect();
     let mut x = cx.meta[a as usize].shash;
     for k in 0..32u32 {
         let vals: Vec<(SymbolKey, BitVec)> = keys
             .iter()
-            .map(|(key, w)| {
+            .map(|(key, w, known)| {
                 let v = match k {
                     0 => BitVec::zero(*w),
                     1 => BitVec::ones(*w),
@@ -806,7 +813,7 @@ fn agrees(cx: &mut Context, a: u32, b: u32) -> Result<bool, Error> {
                         BitVec::wrapping_from_limbs(*w, &limbs)
                     }
                 };
-                (key.clone(), v)
+                (key.clone(), known.map_or(v, |d| d.fit(&v)))
             })
             .collect();
         let env =

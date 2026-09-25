@@ -511,8 +511,20 @@ impl Context {
 - **Public transfers.** `Facts::apply_un/apply_bin/apply_cmp`, `zext/sext/extract/concat/select`
   and `KnownBits::apply_un/apply_bin` expose the transfer functions (width-checked), so a host can
   compose facts for its own operations.
-- **Fact providers** (host-supplied facts for symbols) are not a separate mechanism in 0.x:
-  assumptions about symbol nodes cover the same need.
+- **Declared known bits** (host-supplied facts for symbols). `Context::declare_known(s, k)`
+  makes `k` part of symbol `s`'s meaning. The symbol's base facts are `k` instead of top, so
+  every fact query, proof, guard and pass sees it without the per-run cost of assumptions: an
+  exact copy in the memo key, an overlay, reliance.
+
+  A result is equal to its input for every value of the symbols that agrees with their
+  declarations. Everything that evaluates at invented points uses points fitted to the
+  declarations (the engine's sampled verification, the search service's check), and
+  `smtlib::export` asserts them.
+
+  Declaring drops the base facts, the overlay and the memos, since all may rest on the old
+  declaration. `Context::import` carries declarations and refuses a conflicting one. Only
+  known bits are declared: they are what a compiler has (`computeKnownBits`), and points can
+  be fitted to them exactly. Path conditions stay assumptions.
 - **Storage (current).** The cache is a sparse map keyed by node, filled only for nodes that were
   queried or lie under a queried node (a `Facts` is 432 bytes). A compact dense tier for
   ≤ 128-bit nodes is planned once the engine's access pattern is measured (M4).

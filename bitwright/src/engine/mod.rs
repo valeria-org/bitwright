@@ -1688,8 +1688,14 @@ impl Runner<'_, '_> {
                 break;
             }
             let seed = cx.meta[i as usize].shash;
+            // A symbol's points agree with what the host declared of it.
+            let declared = cx.declared_at(i);
+            let point = |w: Width, k: usize| {
+                let v = point_value(seed, w, k);
+                declared.map_or(v, |d| d.fit(&v))
+            };
             let vals: Result<Vec<BitVec>, Error> = (0..points)
-                .map(|k| cx.eval_node(i, |j| samples[&j][k], |_, w| Some(point_value(seed, w, k))))
+                .map(|k| cx.eval_node(i, |j| samples[&j][k], |_, w| Some(point(w, k))))
                 .collect();
             match vals {
                 Ok(v) => {

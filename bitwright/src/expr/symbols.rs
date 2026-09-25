@@ -109,6 +109,10 @@ pub(crate) struct SymEntry {
     pub(crate) key: SymbolKey,
     pub(crate) width: Width,
     pub(crate) node: u32,
+    /// What the host declared of the symbol's value ([`Context::declare_known`]).
+    ///
+    /// [`Context::declare_known`]: crate::Context::declare_known
+    pub(crate) known: Option<crate::KnownBits>,
 }
 
 /// Lookup only; never iterated for a decision, so the std hasher is fine.

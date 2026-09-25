@@ -1333,3 +1333,27 @@ fn arrays_import_as_memory() {
     .unwrap_err();
     assert!(err.to_string().contains("equality of arrays"), "{err}");
 }
+
+/// A symbol's declared known bits are stated in the script (a result may rely on them), and
+/// read back as an assertion.
+#[test]
+fn declared_known_bits_are_asserted() {
+    let w = Width::W8;
+    let mut cx = Context::new();
+    let e = cx.parse("x & 15", &ParseOptions::width(w)).unwrap();
+    let x = cx.find_symbol(&SymbolKey::from("x")).unwrap();
+    let k = crate::KnownBits::new(
+        BitVec::from_u64(w, 0xf0).unwrap(),
+        BitVec::from_u64(w, 0x01).unwrap(),
+    )
+    .unwrap();
+    cx.declare_known(x, k).unwrap();
+    let q = equivalence_query(&mut cx, e, x).unwrap();
+    assert!(
+        q.contains("(assert (= (bvand |x| #b11110001) #b00000001))"),
+        "{q}"
+    );
+    let mut back = Context::new();
+    let imported = import(&mut back, &export(&mut cx, &[e]).unwrap()).unwrap();
+    assert_eq!(imported.assertions.len(), 1);
+}

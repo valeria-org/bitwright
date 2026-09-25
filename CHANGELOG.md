@@ -29,6 +29,14 @@
   inline instead of allocating on every attempt. Matching takes half the instructions it did,
   and a run of the rules alone a fifth fewer. The matcher's semantics and results are
   unchanged.
+- **Declared known bits of symbols.** `Context::declare_known` states what the host knows of
+  a symbol's value (a compiler's known bits of a parameter, a load, a call result, a value from
+  another block) as part of its meaning. Facts, proofs and every simplifier phase use it, so
+  an alignment check of an aligned pointer is true, and a zero-extended value's high half is
+  zero. Unlike an assumption, it costs nothing per run.
+  - A result is equal to its input wherever the symbols agree with their declarations.
+  - Sampled verification and the equality-saturation check use points that agree with them.
+  - SMT-LIB export asserts them, and `Context::import` carries them.
 - **Benchmarks: `compile/*`.** Functions as a compiler simplifies them: SSA values built
   through the builder, every value a root, one context reused. Rows for building, the rules
   alone, `Strategy::compile()` and the standard strategy, and memoized re-runs.

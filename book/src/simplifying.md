@@ -219,6 +219,40 @@ Equal handles always mean equal values (see [Semantics](semantics.md)). A result
 the expression of another value (`%3` is `%0` above) is that value, and the compiler can
 replace the uses of one with the other.
 
+A compiler also knows things about values bitwright sees only as symbols: a parameter
+zero-extended from 32 bits, an aligned pointer, a load's range, a value computed in another
+block. `Context::declare_known` states such knowledge as known bits of the symbol. Facts,
+proofs and the simplifier all use it:
+
+```rust
+use bitwright::engine::{Engine, Strategy};
+use bitwright::{BitVec, Context, KnownBits, ParseOptions, SymbolKey, Width};
+
+let engine = Engine::builder().builtin().strategy(Strategy::compile()).build()?;
+let mut cx = Context::new();
+let w = Width::W64;
+let o = ParseOptions::width(w);
+let p = cx.symbol("p", w)?;
+let n = cx.symbol("n", w)?;
+// `p` is 8-byte aligned; `n` was zero-extended from 32 bits.
+cx.declare_known(p, KnownBits::new(BitVec::from_u64(w, 7)?, BitVec::zero(w)).unwrap())?;
+let high = BitVec::from_u64(w, 0xffff_ffff_0000_0000)?;
+cx.declare_known(n, KnownBits::new(high, BitVec::zero(w)).unwrap())?;
+let checks = cx.parse("((p & 7) == 0) & (zext<64>(trunc<32>(n)) == n)", &o)?;
+let bump = cx.parse("(p + 8 & -8) + (n >>u 32)", &o)?;
+let out = engine.simplify(&mut cx, checks)?;
+assert_eq!(cx.display(out.expr).to_string(), "1:1");
+let out = engine.simplify(&mut cx, bump)?;
+assert_eq!(cx.display(out.expr).to_string(), "p + 8");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Without the declarations both stay as they are, apart from construction's canonical forms. A
+declaration becomes part of the symbol's meaning. A result is equal to its input for every
+value that agrees with the declarations, and SMT-LIB export states them as assertions. Declare
+right after creating a symbol: a declaration drops the facts and results the context has
+cached, since they may depend on it.
+
 One call over every value of a function is the fastest way to use it. A call per value as it
 is created (`Engine::simplify`) gives the same results, and values already simplified are
 answered from the memo. It costs more, because the passes' own caches last one call.

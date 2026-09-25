@@ -526,6 +526,16 @@ pub(crate) fn emit(cx: &mut Context, roots: &[Expr]) -> Result<String, Error> {
                     .ok_or_else(|| Error::Contract("dangling symbol".into()))?;
                 let sname = symbol_name(&key, n.a);
                 writeln!(out, "(declare-const {sname} {})", sort(n.width)).ok();
+                // What the host declared of it: results may rely on it.
+                if let Some(k) = cx.declared_at(i) {
+                    writeln!(
+                        out,
+                        "(assert (= (bvand {sname} {}) {}))",
+                        literal(&k.known()),
+                        literal(&k.known_one())
+                    )
+                    .ok();
+                }
                 sname
             }
             op => {

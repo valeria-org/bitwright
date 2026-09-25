@@ -2187,3 +2187,180 @@ fn the_default_commit_policy_keeps_engine_ids() {
     );
     assert_ne!(standard, id(Strategy::standard().with_max_region(64)));
 }
+
+/// Whether `a` and `b` agree on every assignment of their symbols that agrees with the symbols'
+/// declared known bits (every such assignment up to 14 bits, else 2048 random ones fitted to
+/// the declarations).
+fn equivalent_declared(cx: &mut Context, a: Expr, b: Expr, rng: &mut Rng) -> bool {
+    let syms = cx.symbols_in(&[a, b]).unwrap();
+    let keys: Vec<(SymbolKey, Width, Option<KnownBits>)> = syms
+        .iter()
+        .map(|&s| {
+            let key = cx.symbol_key(s).unwrap().clone();
+            let e = cx.find_symbol(&key).unwrap();
+            (
+                key,
+                cx.symbol_width(s).unwrap(),
+                cx.declared_known(e).unwrap(),
+            )
+        })
+        .collect();
+    let bits: u32 = keys.iter().map(|(_, w, _)| u32::from(w.bits())).sum();
+    let exhaustive = bits <= 14;
+    let cases: u64 = if exhaustive { 1 << bits } else { 2048 };
+    for case in 0..cases {
+        let mut rest = case;
+        let mut agrees = true;
+        let vals: Vec<(SymbolKey, BitVec)> = keys
+            .iter()
+            .map(|(k, w, known)| {
+                let v = if exhaustive {
+                    let v = rest & ((1u64 << w.bits()) - 1);
+                    rest >>= w.bits();
+                    BitVec::wrapping_from_u64(*w, v)
+                } else {
+                    let limbs: Vec<u64> = (0..8).map(|_| rng.next()).collect();
+                    let v = BitVec::wrapping_from_limbs(*w, &limbs);
+                    known.map_or(v, |d| d.fit(&v))
+                };
+                if let Some(d) = known {
+                    agrees &= d.fit(&v) == v;
+                }
+                (k.clone(), v)
+            })
+            .collect();
+        if !agrees {
+            continue;
+        }
+        let env = FnEnv(|k: &SymbolKey, _| vals.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v));
+        let r = cx.eval(&[a, b], &env).unwrap();
+        if r[0] != r[1] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Random known bits of width `w`: some bits known, each zero or one.
+fn random_known(rng: &mut Rng, w: Width) -> KnownBits {
+    let limbs = |rng: &mut Rng| -> Vec<u64> { (0..8).map(|_| rng.next()).collect() };
+    let known = BitVec::wrapping_from_limbs(w, &limbs(rng));
+    let ones = BitVec::wrapping_from_limbs(w, &limbs(rng));
+    let one = crate::facts::known::bv_and(&known, &ones);
+    let zero = crate::facts::known::bv_and(&known, &crate::facts::known::bv_not(&ones));
+    KnownBits::new(zero, one).unwrap()
+}
+
+/// Declared known bits of symbols: every result agrees with its input wherever the symbols
+/// agree with their declarations, every rewrite passes strict verification (whose points
+/// agree with the declarations too), and the declarations let the simplifier do more.
+#[test]
+fn declared_known_bits_are_used_soundly() {
+    let mut rng = Rng(0xdec1_a4ed);
+    for strategy in [Strategy::standard(), Strategy::compile()] {
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .verify(Verify::strict())
+            .build()
+            .unwrap();
+        let mut g = generator(0xdec1_0001);
+        let (mut rewrites, mut more) = (0u64, 0u32);
+        for _ in 0..200 {
+            let mut cx = Context::new();
+            let w = 1 + g.rng.below(6) as u16;
+            let roots = function(&mut g, &mut cx, w);
+            // The same values without declarations, in a context of their own.
+            let mut plain = Context::new();
+            let plain_roots = plain.import(&cx, &roots).unwrap();
+            let plain_out = engine
+                .run(&mut plain, &plain_roots, Run::default())
+                .unwrap();
+            for s in cx.symbols_in(&roots).unwrap() {
+                let key = cx.symbol_key(s).unwrap().clone();
+                let e = cx.find_symbol(&key).unwrap();
+                let k = random_known(&mut rng, cx.symbol_width(s).unwrap());
+                cx.declare_known(e, k).unwrap();
+            }
+            let out = engine.run(&mut cx, &roots, Run::default()).unwrap();
+            assert_eq!(
+                out.stats.rejected, 0,
+                "a postcondition rejected an application"
+            );
+            assert_eq!(out.stats.quarantined, 0);
+            for (k, (&e, r)) in roots.iter().zip(&out.roots).enumerate() {
+                assert!(
+                    equivalent_declared(&mut cx, e, r.expr, &mut rng),
+                    "{} vs {}",
+                    cx.display(e),
+                    cx.display(r.expr)
+                );
+                let size = |cx: &mut Context, e: Expr| match cx.dag_size(&[e], u32::MAX) {
+                    Ok(crate::Bounded::Exact(n)) => n,
+                    _ => u32::MAX,
+                };
+                let (with, without) = (
+                    size(&mut cx, r.expr),
+                    size(&mut plain, plain_out.roots[k].expr),
+                );
+                more += u32::from(with < without);
+            }
+            rewrites += out.stats.rewrites;
+        }
+        assert!(rewrites > 50, "few rewrites ({rewrites})");
+        assert!(
+            more > 20,
+            "declarations rarely helped ({more} smaller results)"
+        );
+    }
+}
+
+/// A declaration made after a run drops the memo that run filled: the next run uses it.
+#[test]
+fn declaring_known_bits_drops_what_rested_on_their_absence() {
+    let engine = Engine::standard();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W8);
+    let e = cx.parse("(x & 15) + ((x >>u 4) * y)", &o).unwrap();
+    let before = engine.simplify(&mut cx, e).unwrap();
+    assert_eq!(
+        cx.display(before.expr).to_string(),
+        "(x >>u 4) * y + (x & 15)"
+    );
+    let x = cx.find_symbol(&SymbolKey::from("x")).unwrap();
+    let high = BitVec::from_u64(Width::W8, 0xf0).unwrap();
+    cx.declare_known(x, KnownBits::new(high, BitVec::zero(Width::W8)).unwrap())
+        .unwrap();
+    let after = engine.simplify(&mut cx, e).unwrap();
+    assert_eq!(cx.display(after.expr).to_string(), "x");
+    // Withdrawn: back to the first result.
+    cx.declare_known(x, KnownBits::unknown(Width::W8)).unwrap();
+    assert_eq!(cx.declared_known(x).unwrap(), None);
+    let again = engine.simplify(&mut cx, e).unwrap();
+    assert_eq!(again.expr, before.expr);
+}
+
+/// `run_each` copies declarations into each root's context and back.
+#[test]
+fn run_each_keeps_declared_known_bits() {
+    let engine = Engine::standard();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W8);
+    let roots = [
+        cx.parse("x & 15", &o).unwrap(),
+        cx.parse("(x >>u 4) + y", &o).unwrap(),
+    ];
+    let x = cx.find_symbol(&SymbolKey::from("x")).unwrap();
+    let high = BitVec::from_u64(Width::W8, 0xf0).unwrap();
+    cx.declare_known(x, KnownBits::new(high, BitVec::zero(Width::W8)).unwrap())
+        .unwrap();
+    let each = engine
+        .run_each(&mut cx, &roots, Each::default().with_threads(2))
+        .unwrap();
+    let shown: Vec<String> = each
+        .roots
+        .iter()
+        .map(|r| cx.display(r.expr).to_string())
+        .collect();
+    assert_eq!(shown, ["x", "y"]);
+}

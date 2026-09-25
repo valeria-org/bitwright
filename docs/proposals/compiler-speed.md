@@ -438,6 +438,21 @@ Each step is measured with the benchmark from step 1 and lands alone.
    lighter fact tier for `compile()` (known bits without the ranges). A lighter tier changes
    results, so it needs measuring like the demanded-bits decision was. After that come the
    passes' per-node costs.
+
+   **Done: declared known bits** (`Context::declare_known`). A compiler states its known
+   bits of symbols (parameters, loads, calls, values from other blocks), and they become the
+   symbols' base facts.
+
+   Measured on `compile/*`, with two parameters declared (one zero-extended from 32 bits, one
+   an 8-byte-aligned pointer):
+   - **Time is unchanged** (within noise).
+   - **Results are slightly smaller** (14,118 → 14,070 nodes). The random workload rarely
+     uses those bits; code with alignment checks, masks and extensions does (the book's
+     example folds both checks, and `p + 8 & -8` to `p + 8`).
+
+   So declarations add precision and knowledge bitwright cannot derive. They do not cut the
+   facts' cost, which is the transfers of every interior node. That cost needs the lighter
+   fact tier (known bits without ranges, for `compile()`), measured for how results change.
 5. **`Semantics` and `Raise`**, then the derive (1a, 1c).
 6. **Native `Rewrite` and `check::rewrite`** (2c).
 
