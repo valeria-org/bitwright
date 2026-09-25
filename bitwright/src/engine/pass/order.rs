@@ -458,19 +458,30 @@ pub(super) fn decide(
     let orders = preorders(m.atoms.len());
     // With nothing known, every order is possible.
     let anything = kn.mono.is_empty() && kn.le.iter().chain(&kn.lt).all(|row| !row.contains(&true));
-    let states: Vec<(&[u8], u32)> = orders
+    // The states: each possible order with each assignment of the 1-bit leaves.
+    let possible: Vec<&[u8]> = orders
         .iter()
         .filter(|rk| anything || feasible(&kn, rk))
-        .flat_map(|rk| (0..1u32 << m.bools.len()).map(move |b| (rk.as_slice(), b)))
+        .map(Vec::as_slice)
         .collect();
-    r.meter.charge(
-        Counter::PassWork,
-        (states.len() * m.items.len()) as u64 / 8 + 1,
-    )?;
-    if states.is_empty() {
+    let per = 1usize << m.bools.len();
+    let count = possible.len() * per;
+    r.meter
+        .charge(Counter::PassWork, (count * m.items.len()) as u64 / 8 + 1)?;
+    if count == 0 {
         // No order is possible: the facts contradict each other (infeasible assumptions).
         return Ok(None);
     }
+    let state = |s: usize| (possible[s / per], (s % per) as u32);
+    // Whatever the formula turns out to be, it agrees with it on every state: first on a
+    // sample of them, which most formulas with no simpler form fail.
+    if count > 64 {
+        let sample: Vec<(&[u8], u32)> = (0..32).map(|i| state(i * count / 32)).collect();
+        if !may_simplify(&m, root, &sample) {
+            return Ok(None);
+        }
+    }
+    let states: Vec<(&[u8], u32)> = (0..count).map(state).collect();
     // Every item's value in every state (item-major).
     let mut vals = Vec::with_capacity(m.items.len());
     let mut all = vec![0u8; m.items.len() * states.len()];
@@ -595,6 +606,59 @@ pub(super) fn decide(
     let mut atoms = m.atoms.clone();
     atoms.extend(&m.bools);
     Ok(Some((e, atoms, fin)))
+}
+
+/// Whether some form [`decide`] looks for agrees with the formula at `root` on `sample` (a
+/// necessary condition for agreeing on every state).
+fn may_simplify(m: &Model, root: usize, sample: &[(&[u8], u32)]) -> bool {
+    let mut vals = Vec::with_capacity(m.items.len());
+    let mut rows = vec![vec![0u8; sample.len()]; m.items.len()];
+    for (s, (rk, b)) in sample.iter().enumerate() {
+        eval(&m.items, rk, *b, &mut vals);
+        for (i, &v) in vals.iter().enumerate() {
+            rows[i][s] = v;
+        }
+    }
+    let t = &rows[root];
+    // A part of the formula.
+    if (0..m.items.len()).any(|i| {
+        i != root
+            && m.term[i] == m.term[root]
+            && !matches!(m.items[i], Item::Const(_))
+            && rows[i] == *t
+    }) {
+        return true;
+    }
+    let agrees =
+        |f: &dyn Fn(&[u8], u32) -> u8| sample.iter().zip(t).all(|((rk, b), &v)| f(rk, *b) == v);
+    let k = m.atoms.len();
+    if !m.term[root] {
+        // A constant, a comparison of two atoms, a 1-bit leaf or its complement.
+        t.iter().all(|&v| v == t[0])
+            || (0..k).any(|i| {
+                (0..k).any(|j| {
+                    i != j
+                        && (agrees(&|rk, _| u8::from(rk[i] < rk[j]))
+                            || agrees(&|rk, _| u8::from(rk[i] <= rk[j]))
+                            || agrees(&|rk, _| u8::from(rk[i] == rk[j]))
+                            || agrees(&|rk, _| u8::from(rk[i] != rk[j])))
+                })
+            })
+            || (0..m.bools.len()).any(|bi| {
+                [false, true]
+                    .into_iter()
+                    .any(|neg| agrees(&|_, b| u8::from(((b >> bi) & 1 == 1) != neg)))
+            })
+    } else {
+        // An atom, or the lesser or greater of two.
+        (0..k).any(|i| agrees(&|rk, _| rk[i]))
+            || (m.signed.is_some()
+                && (0..k).any(|i| {
+                    (i + 1..k).any(|j| {
+                        agrees(&|rk, _| rk[i].min(rk[j])) || agrees(&|rk, _| rk[i].max(rk[j]))
+                    })
+                }))
+    }
 }
 
 /// Whether two atoms of the model are related by structure (so a lone comparison of them may

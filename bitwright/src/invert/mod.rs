@@ -512,7 +512,7 @@ fn recover<O: Oracle>(
     let wv = u32::from(cx.wid(hole));
     if let Some(map) = gf2::rows(cx, hole, nodes)
         && let Some(r) = map.get(&top)
-        && gf2::rank(r) == wv
+        && gf2::full_rank(r, wv)
     {
         return Ok(Some(How::Linear(r.clone())));
     }

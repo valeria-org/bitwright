@@ -980,6 +980,7 @@ fn gf2_maps_are_decided_by_rank() {
             continue;
         };
         let full = gf2::rank(&rows) == u32::from(w);
+        assert_eq!(gf2::full_rank(&rows, u32::from(w)), full);
         // The truth, by every input.
         let mut seen: Vec<BitVec> = (0..1u64 << w)
             .map(|v| eval(&mut cx, e, &[("x", val(w, v))]))

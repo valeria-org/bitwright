@@ -123,20 +123,37 @@ pub(crate) fn rows(cx: &Context, hole: u32, nodes: &[u32]) -> Option<IdMap<u32, 
 }
 
 /// The rank of the rows over GF(2).
+#[cfg(test)]
 pub(crate) fn rank(rows: &[u128]) -> u32 {
-    let mut basis: Vec<u128> = Vec::new();
+    rank_upto(rows, u32::MAX)
+}
+
+/// Whether the rows have rank `wv` (their columns being the `wv` hole bits: full column rank).
+pub(crate) fn full_rank(rows: &[u128], wv: u32) -> bool {
+    rows.len() >= wv as usize && rank_upto(rows, wv) == wv
+}
+
+/// The rank of the rows, stopping once it reaches `stop`: a basis by leading bit, each row
+/// reduced by the basis vectors of its leading bits in turn.
+fn rank_upto(rows: &[u128], stop: u32) -> u32 {
+    let mut basis = [0u128; 128];
+    let mut rank = 0;
     for &r in rows {
         let mut v = r;
-        for &b in &basis {
-            v = v.min(v ^ b);
+        while v != 0 {
+            let lead = 127 - v.leading_zeros() as usize;
+            if basis[lead] == 0 {
+                basis[lead] = v;
+                rank += 1;
+                break;
+            }
+            v ^= basis[lead];
         }
-        if v != 0 {
-            basis.push(v);
-            // Keep the basis reduced by leading bit (highest set bit first).
-            basis.sort_unstable_by(|a, b| b.cmp(a));
+        if rank >= stop {
+            break;
         }
     }
-    basis.len() as u32
+    rank
 }
 
 /// A solution `x` of `M·x = y` (rows of `M` with the bits of `y`), when `M` has full column
