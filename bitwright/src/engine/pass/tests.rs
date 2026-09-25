@@ -750,6 +750,181 @@ fn compares_fixtures() {
     same("(x + 1 == 0) | (x + 1 == 1)", "x - 255 <=u 1", 8);
 }
 
+/// A term for the order reading: a symbol, a constant, an operation bounded by or monotone in
+/// its operands, or a select between terms on a comparison (a minimum or maximum).
+fn order_term(g: &mut Gen, cx: &mut Context, w: u16, depth: u32, signed: bool) -> Expr {
+    let width = Width::new(w).unwrap();
+    let sym = |cx: &mut Context, g: &mut Gen| {
+        cx.symbol(["x", "y", "z"][g.rng.below(3) as usize], width)
+            .unwrap()
+    };
+    if depth == 0 || g.rng.chance(1, 3) {
+        return match g.rng.below(8) {
+            0 => {
+                let v = g.constant(w);
+                cx.constant(&v).unwrap()
+            }
+            1 => {
+                let (a, b) = (sym(cx, g), sym(cx, g));
+                cx.bin(BinOp::And, a, b).unwrap()
+            }
+            2 => {
+                let (a, b) = (sym(cx, g), sym(cx, g));
+                cx.bin(BinOp::Or, a, b).unwrap()
+            }
+            3 => {
+                let a = sym(cx, g);
+                let k = BitVec::wrapping_from_u64(width, g.rng.below(3));
+                let k = cx.constant(&k).unwrap();
+                let op = if signed { BinOp::AShr } else { BinOp::LShr };
+                cx.bin(op, a, k).unwrap()
+            }
+            4 => {
+                let a = sym(cx, g);
+                let k = BitVec::wrapping_from_u64(width, 1 + g.rng.below(3));
+                let k = cx.constant(&k).unwrap();
+                cx.bin(BinOp::UDiv, a, k).unwrap()
+            }
+            _ => sym(cx, g),
+        };
+    }
+    let c = order_formula(g, cx, w, depth - 1, signed);
+    let (a, b) = (
+        order_term(g, cx, w, depth - 1, signed),
+        order_term(g, cx, w, depth - 1, signed),
+    );
+    cx.select(c, a, b).unwrap()
+}
+
+/// A boolean combination of comparisons between order terms.
+fn order_formula(g: &mut Gen, cx: &mut Context, w: u16, depth: u32, signed: bool) -> Expr {
+    use crate::CmpOpExt;
+    if depth == 0 || g.rng.chance(1, 3) {
+        let ops: &[CmpOpExt] = if signed {
+            &[
+                CmpOpExt::Slt,
+                CmpOpExt::Sle,
+                CmpOpExt::Sgt,
+                CmpOpExt::Sge,
+                CmpOpExt::Eq,
+                CmpOpExt::Ne,
+            ]
+        } else {
+            &[
+                CmpOpExt::Ult,
+                CmpOpExt::Ule,
+                CmpOpExt::Ugt,
+                CmpOpExt::Uge,
+                CmpOpExt::Eq,
+                CmpOpExt::Ne,
+            ]
+        };
+        let op = ops[g.rng.below(ops.len() as u64) as usize];
+        let a = order_term(g, cx, w, depth.min(1), signed);
+        let b = order_term(g, cx, w, depth.min(1), signed);
+        return cx.cmp(op, a, b).unwrap();
+    }
+    let d = depth - 1;
+    match g.rng.below(4) {
+        0 => {
+            let x = order_formula(g, cx, w, d, signed);
+            cx.un(UnOp::Not, x).unwrap()
+        }
+        k => {
+            let x = order_formula(g, cx, w, d, signed);
+            let y = order_formula(g, cx, w, d, signed);
+            cx.bin([BinOp::And, BinOp::Or, BinOp::Xor][(k - 1) as usize], x, y)
+                .unwrap()
+        }
+    }
+}
+
+/// The order reading (in the compares pass) is sound: every result is equivalent,
+/// exhaustively at small widths, and a second run changes nothing.
+#[test]
+fn order_is_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0x0de5);
+    let mut rng = Rng(46);
+    let mut changed = 0;
+    for i in 0..3000 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            [8, 32, 64][g.rng.below(3) as usize]
+        } else {
+            1 + g.rng.below(4) as u16
+        };
+        let signed = g.rng.chance(1, 3);
+        let e = if g.rng.chance(1, 3) {
+            order_term(&mut g, &mut cx, w, 3, signed)
+        } else {
+            order_formula(&mut g, &mut cx, w, 3, signed)
+        };
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {} became {}",
+            cx.display(r.expr),
+            cx.display(again.roots[0].expr)
+        );
+    }
+    assert!(changed > 300, "{changed}");
+}
+
+#[test]
+fn order_fixtures() {
+    let eng = engine(vec![Phase::Compares]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W8);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    // Laws of the order: transitivity, asymmetry, trichotomy, totality.
+    same("(x <u y) & (y <u z) & (z <=u x)", "false");
+    same("(x <=s y) & (y <=s z) & (z <s x)", "false");
+    same("(x <u y) | (x == y) | (y <u x)", "true");
+    same("~(x <u y) & ~(y <u x)", "x == y");
+    same("(x <=u y) & (y <=u z) & (x <=u z)", "(x <=u y) & (y <=u z)");
+    // Minimum and maximum, however they are written.
+    same("select(x <u y, x, y) == select(y <u x, y, x)", "true");
+    same("select(x <u y, x, y) <=u select(x <u y, y, x)", "true");
+    same(
+        "select(x <u select(x <u y, y, x), x, select(x <u y, y, x))",
+        "x",
+    );
+    same(
+        "select(x <u select(y <u z, y, z), x, select(y <u z, y, z)) \
+         == select(select(x <u y, x, y) <u z, select(x <u y, x, y), z)",
+        "true",
+    );
+    same("select(x <s y, x, y) == select(y <s x, y, x)", "true");
+    // Bounded and monotone operations.
+    same("(x & y) <=u x", "true");
+    same("x <=u (x | y)", "true");
+    same("~(x <=u y) | ((x >>u 2) <=u (y >>u 2))", "true");
+    same("~(x <=u y) | (udiv(x, 3) <=u udiv(y, 3))", "true");
+    same("~(x <=s y) | ((x >>s 2) <=s (y >>s 2))", "true");
+    // Constants and ranges order atoms too.
+    same("select(x <u 0xff, x, 0xff)", "x");
+    same("((x & 0x0f) <u 0x20) & (y <=u x)", "y <=u x");
+    // Other pairs stay.
+    same("(x <u y) & (x <u z)", "(x <u y) & (x <u z)");
+}
+
 /// Comparisons of `x`, of functions of it that the pass sees through, and of extensions of a
 /// narrower `v`, combined.
 fn peeled_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {

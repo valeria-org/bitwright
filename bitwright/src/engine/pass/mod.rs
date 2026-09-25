@@ -11,6 +11,7 @@ pub(super) mod linear;
 pub(super) mod linear_mba;
 #[cfg(feature = "mba")]
 pub(super) mod mba;
+mod order;
 pub(super) mod shuffle;
 #[cfg(test)]
 mod tests;

@@ -1055,9 +1055,19 @@ fn emit_values(
 /// The compares pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
-    if node.width != 1 || !(boolean_op(node.op) || node.op.as_cmp().is_some() || float_cmp(node.op))
+    if node.op == OpCode::Select && node.width > 1 {
+        return order_step(r, cx, n);
+    }
+    if node.width != 1
+        || !(boolean_op(node.op)
+            || node.op.as_cmp().is_some()
+            || float_cmp(node.op)
+            || node.op == OpCode::Select)
     {
         return Ok(Step::Normal(Fin::FINAL));
+    }
+    if node.op == OpCode::Select {
+        return order_step(r, cx, n);
     }
     let info = info_of(r, cx, n)?;
     let before = cx.len() as u32;
@@ -1068,8 +1078,18 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         Info::Const(v) if boolean_op(node.op) => (Some(bool_const(r, cx, *v)?), Vec::new()),
         _ => (None, Vec::new()),
     };
-    let Some(e) = e else {
-        return Ok(Step::Normal(Fin::FINAL));
+    let e = match e {
+        Some(e) if e != n => e,
+        _ => return order_step(r, cx, n),
     };
     finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)
+}
+
+/// The order reading of `n` (see `order`).
+fn order_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let before = cx.len() as u32;
+    match super::order::decide(r, cx, n)? {
+        Some((e, atoms, fin)) => finish(r, cx, PassKind::Compares, n, e, before, &atoms, fin),
+        None => Ok(Step::Normal(Fin::FINAL)),
+    }
 }

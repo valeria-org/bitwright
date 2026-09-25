@@ -2039,6 +2039,57 @@ rule select_xor<W>(c: 1, x: W, y: W, z: W) { select(c, x ^ z, y ^ z) => select(c
 
 - `select(p <u q, p ^ r, q ^ r)` → `select(p <u q, p, q) ^ r`
 
+#### `select_swapped_add` — rule
+
+Swapped arms under one condition, combined commutatively: the minimum plus the
+maximum is the sum.
+
+```text
+rule select_swapped_add<W>(c: 1, x: W, y: W) { select(c, x, y) + select(c, y, x) => x + y }
+```
+
+- `select(p <u q, p, q) + select(p <u q, q, p)` → `p + q`
+
+#### `select_swapped_mul` — rule
+
+Likewise for `*`.
+
+```text
+rule select_swapped_mul<W>(c: 1, x: W, y: W) { select(c, x, y) * select(c, y, x) => x * y }
+```
+
+- `select(p <u q, p, q) * select(p <u q, q, p)` → `p * q`
+
+#### `select_swapped_and` — rule
+
+Likewise for `&`.
+
+```text
+rule select_swapped_and<W>(c: 1, x: W, y: W) { select(c, x, y) & select(c, y, x) => x & y }
+```
+
+- `select(p <u q, p, q) & select(p <u q, q, p)` → `p & q`
+
+#### `select_swapped_or` — rule
+
+Likewise for `|`.
+
+```text
+rule select_swapped_or<W>(c: 1, x: W, y: W) { select(c, x, y) | select(c, y, x) => x | y }
+```
+
+- `select(p <u q, p, q) | select(p <u q, q, p)` → `p | q`
+
+#### `select_swapped_xor` — rule
+
+Likewise for `^`.
+
+```text
+rule select_swapped_xor<W>(c: 1, x: W, y: W) { select(c, x, y) ^ select(c, y, x) => x ^ y }
+```
+
+- `select(p <u q, p, q) ^ select(p <u q, q, p)` → `p ^ q`
+
 #### `select_not` — rule
 
 Both arms complement.

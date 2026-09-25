@@ -33,6 +33,16 @@
   and remainders at most their dividend, a remainder below its divisor, the wraparounds of
   `x ± 1`, and the no-overflow sum of halves. `core.casts::trunc_and_zext` is gone: the new
   rules subsume it.
+- **Orders of several terms.** The compares pass reads a combination of comparisons between
+  up to five terms, and selects between them (minima and maxima however they are written), in
+  every order the terms can stand in: constants in their own order, ranges the facts show
+  apart, operations bounded by an operand (`x & y <=u x`, `x >>u s <=u x`, remainders and
+  quotients) and monotone ones (`x <=u y` gives `x >>u 2 <=u y >>u 2`). A formula that has one
+  value, equals one comparison of two terms or a part of itself, or a select that is always one
+  term or the minimum or maximum of two, becomes that: transitivity (`x <u y & y <u z & z <=u x`
+  is false), trichotomy, `~(x <u y) & ~(y <u x)` is `x == y`, and the lattice laws of minimum
+  and maximum (`select(x <u y, x, y) == select(y <u x, y, x)` is true). Swapped arms under one
+  condition combine (`min + max` is `x + y`).
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
