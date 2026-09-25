@@ -451,8 +451,26 @@ Each step is measured with the benchmark from step 1 and lands alone.
      example folds both checks, and `p + 8 & -8` to `p + 8`).
 
    So declarations add precision and knowledge bitwright cannot derive. They do not cut the
-   facts' cost, which is the transfers of every interior node. That cost needs the lighter
-   fact tier (known bits without ranges, for `compile()`), measured for how results change.
+   facts' cost, which is the transfers of every interior node.
+
+   **Measured and not built: a known-bits-only fact tier.** A prototype replaced the transfers
+   of the hot binary operators with known bits alone:
+   - add, subtract, multiply, and, or, xor, and shifts by constants;
+   - no evaluation mismatches.
+
+   | Binary transfers | `compile()` instructions | `compile()` nodes | Rules alone | Nodes |
+   |-|-:|-:|-:|-:|
+   | Full facts (today) | 695.1 M | 14,118 | 214.8 M | 21,422 |
+   | Known bits, ranges derived from them | 682.3 M (−1.8 %) | 14,185 (+0.5 %) | 208.4 M (−3.0 %) | 21,546 |
+   | Known bits only | 656.6 M (−5.5 %) | 14,404 (+2.0 %) | 201.6 M (−6.2 %) | 21,915 |
+
+   At most about 6 % faster for results 2 % larger. The rest of the operators would add a
+   point or two, at the cost of a second transfer family with its own soundness validation.
+
+   The ranges are not where the facts' time goes. The known-bits transfers themselves
+   (`kb_add_carry`, the bitwise ones) compute on 72-byte `BitVec`s at every width. For
+   widths up to 64 the reduced product already runs on words (`narrow::reduce`), and the
+   transfers could too, with the same results. That is the next candidate for the facts.
 5. **`Semantics` and `Raise`**, then the derive (1a, 1c).
 6. **Native `Rewrite` and `check::rewrite`** (2c).
 
