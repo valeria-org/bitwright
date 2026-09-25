@@ -1032,6 +1032,49 @@ group core.bounds {
     }
 }
 
+group core.concat {
+    /// `&` of concatenations with one low part: the low part stays.
+    #[example("concat(p, r:4) & concat(q, r:4)" => "concat(p & q, r:4)")]
+    rule concat_and_low<W, V>(x: W, y: V, z: W) { concat(x, y) & concat(z, y) => concat(x & z, y) }
+    /// Likewise with one high part.
+    #[example("concat(r:4, p) & concat(r:4, q)" => "concat(r:4, p & q)")]
+    rule concat_and_high<W, V>(x: W, y: V, z: V) { concat(x, y) & concat(x, z) => concat(x, y & z) }
+    /// `|` of concatenations with one low part.
+    #[example("concat(p, r:4) | concat(q, r:4)" => "concat(p | q, r:4)")]
+    rule concat_or_low<W, V>(x: W, y: V, z: W) { concat(x, y) | concat(z, y) => concat(x | z, y) }
+    /// Likewise with one high part.
+    #[example("concat(r:4, p) | concat(r:4, q)" => "concat(r:4, p | q)")]
+    rule concat_or_high<W, V>(x: W, y: V, z: V) { concat(x, y) | concat(x, z) => concat(x, y | z) }
+    /// `^` of concatenations with one low part: that part cancels.
+    #[example("concat(p, r:4) ^ concat(q, r:4)" => "concat(p ^ q, 0:4)")]
+    rule concat_xor_low<W, V>(x: W, y: V, z: W) { concat(x, y) ^ concat(z, y) => concat(x ^ z, zero) }
+    /// Concatenation associates; right nesting is the canonical one.
+    #[example("concat(concat(p, q), r)" => "concat(p, concat(q, r))")]
+    rule concat_assoc<A, B, C>(x: A, y: B, z: C) { concat(concat(x, y), z) => concat(x, concat(y, z)) }
+    /// An arithmetic shift right by the low part's width sign-extends the high part.
+    #[example("concat(p, q:4) >>s 4" => "sext<12>(p)")]
+    rule concat_ashr<W, V>(x: W, y: V) { concat(x, y) >>s V => sext<W + V>(x) }
+    /// A logical shift right by the low part's width zero-extends the high part.
+    #[example("concat(p, q:4) >>u 4" => "zext<12>(p)")]
+    rule concat_lshr<W, V>(x: W, y: V) { concat(x, y) >>u V => zext<W + V>(x) }
+    /// A value above a sign-extended copy of its top bit is its sign extension.
+    #[example("concat(sext<8>(extract<7, 1>(p)), p)" => "sext<16>(p)")]
+    rule concat_sign_word<W>(x: W) where 1 < W {
+        concat(sext<W>(extract<W - 1, 1>(x)), x) => sext<W + W>(x)
+    }
+    /// A zero low part with a zero-extended value in it is their concatenation (a sum of the
+    /// two has no carries, so it is this `|` too).
+    #[example("concat(p, 0:4) | zext<12>(q:4)" => "concat(p, q:4)")]
+    rule concat_or_zext<W, V>(x: W, y: V) { concat(x, 0) | zext<W + V>(y) => concat(x, y) }
+}
+
+group core.single_bit {
+    /// A power of two shares no bit with the value one below it (and `1 << s` past the width
+    /// is 0).
+    #[example("(1 << (q & 7)) & ((1 << (q & 7)) - 1)" => "0")]
+    rule pow2_and_below<W>(s: W) { (one << s) & ((one << s) + ones) => 0 }
+}
+
 group core.float {
     /// Dividing by a power of two is multiplying by its reciprocal when that is a normal
     /// number: the two are the same real number, rounded once in the same mode, so every result

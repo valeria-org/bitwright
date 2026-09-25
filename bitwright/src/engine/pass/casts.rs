@@ -154,9 +154,62 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
     r.stats.passes.entry("casts").or_default()
 }
 
+/// The width `k` and operand `x` when `n` sign-extends the low `k` bits of `x` spelled with
+/// shifts or arithmetic: `(x << c) >>s c` (`k = W − c`), or `((x & (2^k − 1)) ^ 2^(k−1)) −
+/// 2^(k−1)` (the builder's `+ −2^(k−1)`; the masked value may also be `zext(trunc<k>(x))`).
+fn sext_idiom(cx: &Context, n: u32) -> Option<(u16, u32)> {
+    let node = cx.node(n);
+    let w = node.width;
+    let small = |i: u32| cx.const_val(i).and_then(|v| v.to_u64());
+    match node.op {
+        OpCode::AShr => {
+            let c = small(node.b)?;
+            let inner = cx.node(node.a);
+            (inner.op == OpCode::Shl && small(inner.b) == Some(c) && c >= 1 && c < u64::from(w))
+                .then_some((w - c as u16, inner.a))
+        }
+        OpCode::Add => {
+            // (t ^ h) + (−h) with h = 2^(k−1) and t the low k bits of x.
+            let (x, k) = (node.a, cx.const_val(node.b)?);
+            let neg_h = BitVec::apply_un(UnOp::Neg, &k).ok()?;
+            let h = neg_h.to_u64()?;
+            if !h.is_power_of_two() {
+                return None;
+            }
+            let kk = h.trailing_zeros() as u16 + 1;
+            if kk >= w {
+                return None;
+            }
+            let xor = cx.node(x);
+            if xor.op != OpCode::Xor || small(xor.b) != Some(h) {
+                return None;
+            }
+            let t = cx.node(xor.a);
+            match t.op {
+                OpCode::And if small(t.b) == Some((1u64 << kk) - 1) => Some((kk, t.a)),
+                OpCode::Zext => {
+                    let e = cx.node(t.a);
+                    (e.op == OpCode::Extract && e.b == 0 && e.width == kk).then_some((kk, e.a))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The casts pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
+    if let Some((k, x)) = sext_idiom(cx, n) {
+        let before = cx.len() as u32;
+        let w = node.width;
+        let e = r.build(cx, |cx| {
+            let t = cx.c_extract(x, 0, k)?;
+            cx.c_sext(t, w)
+        })?;
+        return finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL);
+    }
     if node.op != OpCode::Extract {
         return Ok(Step::Normal(Fin::FINAL));
     }

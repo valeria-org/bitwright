@@ -1069,6 +1069,15 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if node.op == OpCode::Select {
         return order_step(r, cx, n);
     }
+    // A test of one bit through a mask: `(x & 2^k) != 0` is bit k of x.
+    if let Some((x, k, set)) = bit_test(cx, n) {
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| {
+            let b = cx.c_extract(x, k, 1)?;
+            if set { Ok(b) } else { cx.c_un(UnOp::Not, b) }
+        })?;
+        return finish(r, cx, PassKind::Compares, n, e, before, &[x], Fin::FINAL);
+    }
     let info = info_of(r, cx, n)?;
     let before = cx.len() as u32;
     let (e, atoms) = match &info {
@@ -1090,6 +1099,27 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     };
     finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)
+}
+
+/// `(x & 2^k) != 0` (`Some((x, k, true))`) or `(x & 2^k) == 0` (`false`).
+fn bit_test(cx: &Context, n: u32) -> Option<(u32, u16, bool)> {
+    let node = cx.node(n);
+    let set = match node.op {
+        OpCode::Ne => true,
+        OpCode::Eq => false,
+        _ => return None,
+    };
+    if !cx.const_val(node.b)?.is_zero() {
+        return None;
+    }
+    let and = cx.node(node.a);
+    if and.op != OpCode::And {
+        return None;
+    }
+    let m = cx.const_val(and.b)?;
+    let one = BitVec::apply_un(UnOp::Popcnt, &m).ok()?.to_u64()? == 1;
+    let k = BitVec::apply_un(UnOp::Ctz, &m).ok()?.to_u64()? as u16;
+    one.then_some((and.a, k, set))
 }
 
 /// `e == c` or `e != c` decided by the residues of `e`: when `c`'s low bits are none of the

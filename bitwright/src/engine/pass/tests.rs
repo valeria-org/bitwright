@@ -1454,6 +1454,121 @@ fn residue_fixtures() {
     same("(x * y) & 1", "(x * y) & 1");
 }
 
+/// Sign extension spelled with shifts or with xor and a subtraction, and bit tests through a
+/// mask: equivalent at every shift and mask at small widths, and recognized.
+#[test]
+fn sign_extension_and_bit_test_idioms() {
+    let eng = Engine::standard();
+    let mut rng = Rng(48);
+    for w in 2..=8u16 {
+        let width = Width::new(w).unwrap();
+        let o = ParseOptions::width(width);
+        for c in 1..w {
+            let mut cx = Context::new();
+            let e = cx.parse(&format!("(x << {c}) >>s {c}"), &o).unwrap();
+            let out = eng.simplify(&mut cx, e).unwrap();
+            assert!(equivalent(&mut cx, e, out.expr, &mut rng));
+            assert_eq!(
+                cx.display(out.expr).to_string(),
+                format!("sext<{w}>(trunc<{}>(x))", w - c)
+            );
+            let (m, h) = ((1u64 << c) - 1, 1u64 << (c - 1));
+            let e = cx.parse(&format!("((x & {m}) ^ {h}) - {h}"), &o).unwrap();
+            let out = eng.simplify(&mut cx, e).unwrap();
+            assert!(
+                equivalent(&mut cx, e, out.expr, &mut rng),
+                "{}",
+                cx.display(e)
+            );
+            if c > 1 {
+                assert_eq!(
+                    cx.display(out.expr).to_string(),
+                    format!("sext<{w}>(trunc<{c}>(x))")
+                );
+            }
+        }
+        for k in 0..w {
+            let mut cx = Context::new();
+            for (src, set) in [
+                (format!("(x & {}) != 0", 1u64 << k), true),
+                (format!("(x & {}) == 0", 1u64 << k), false),
+            ] {
+                let e = cx.parse(&src, &o).unwrap();
+                let out = eng.simplify(&mut cx, e).unwrap();
+                assert!(equivalent(&mut cx, e, out.expr, &mut rng), "{src}");
+                let s = cx.display(out.expr).to_string();
+                if k + 1 < w {
+                    let bit = if k == 0 {
+                        "trunc<1>(x)".to_string()
+                    } else {
+                        format!("extract<{k}, 1>(x)")
+                    };
+                    assert_eq!(s, if set { bit } else { format!("~{bit}") }, "{src}");
+                }
+            }
+        }
+    }
+}
+
+/// Case splits on condition masks: random linear and bitwise expressions reading `sext(c)`,
+/// `-zext(c)` or a sign mask are equivalent after the split, exhaustively at small widths.
+#[test]
+fn case_splits_are_sound() {
+    let eng = engine(vec![Phase::Linear]);
+    let mut g = generator(0xca5e);
+    let mut rng = Rng(49);
+    let mut changed = 0;
+    for i in 0..1500 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            32
+        } else {
+            2 + g.rng.below(4) as u16
+        };
+        let width = Width::new(w).unwrap();
+        let c = cx.symbol("p", Width::W1).unwrap();
+        let x = cx.symbol("x", width).unwrap();
+        let m = match g.rng.below(3) {
+            0 => cx.sext(c, width).unwrap(),
+            1 => {
+                let z = cx.zext(c, width).unwrap();
+                cx.un(UnOp::Neg, z).unwrap()
+            }
+            _ => {
+                let k = cx.constant_u64(width, u64::from(w) - 1).unwrap();
+                cx.bin(BinOp::AShr, x, k).unwrap()
+            }
+        };
+        let other = linear_expr(&mut g, &mut cx, w, 2);
+        let ops = [BinOp::Add, BinOp::Sub, BinOp::Xor, BinOp::Or, BinOp::And];
+        let op1 = ops[g.rng.below(5) as usize];
+        let op2 = ops[g.rng.below(5) as usize];
+        let inner = cx.bin(op1, other, m).unwrap();
+        let e = cx.bin(op2, inner, m).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+    }
+    assert!(changed > 100, "{changed}");
+    // The conditional negation.
+    let mut cx = Context::new();
+    let e = cx
+        .parse(
+            "(x ^ sext<8>(c:1)) - sext<8>(c:1)",
+            &ParseOptions::width(Width::W8),
+        )
+        .unwrap();
+    let out = Engine::standard().simplify(&mut cx, e).unwrap();
+    assert_eq!(cx.display(out.expr).to_string(), "select(c, -x, x)");
+}
+
 #[test]
 fn demanded_fixtures() {
     let eng = engine(vec![Phase::Demanded]);

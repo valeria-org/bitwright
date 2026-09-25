@@ -23,7 +23,7 @@ pub(crate) const MAX_TERMS: usize = 64;
 pub(crate) struct Form {
     konst: BitVec,
     terms: Vec<(u32, BitVec)>,
-    fin: Fin,
+    pub(super) fin: Fin,
 }
 
 impl super::forms::Parts for Form {
@@ -68,7 +68,7 @@ impl Form {
         }
     }
 
-    fn is_atom_of(&self, n: u32) -> bool {
+    pub(super) fn is_atom_of(&self, n: u32) -> bool {
         self.konst.is_zero()
             && self.terms.len() == 1
             && self.terms[0].0 == n
@@ -271,7 +271,7 @@ fn linear_op(op: OpCode) -> bool {
 }
 
 /// The form of `root`, computing (iteratively) and caching the forms below it.
-fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, Stop> {
+pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
         if r.linear.contains(i) {
@@ -482,6 +482,13 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
 /// The linear pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    // A case split on a condition mask the node reads, first (see `cases`).
+    let before = cx.len() as u32;
+    if let Some((e, f)) = super::cases::split(r, cx, n)?
+        && let Step::To(x, fin) = finish(r, cx, PassKind::Linear, n, e, before, &[], f)?
+    {
+        return Ok(Step::To(x, fin));
+    }
     if !linear_op(op) || op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
     }

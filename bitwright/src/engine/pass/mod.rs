@@ -2,6 +2,7 @@
 //! are already normal) to a candidate replacement, committed only when it is strictly smaller.
 
 pub(crate) mod bitwise;
+mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;

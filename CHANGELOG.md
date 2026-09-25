@@ -51,6 +51,16 @@
   (`(x·x) & 1` is `x & 1`, `(x·x + x) & 1` and `x·(x+1)·(x+2)·(x+3)·32` are 0 at 8 bits), and
   the compares pass decides `e == c` when no residue of `e` matches `c` (`x·x == 2`,
   `(x·x & 7) == 5` are false).
+- **Bit tests, sign extensions, concatenations, case splits.** `(x & 2^k) != 0` is
+  `extract<k, 1>(x)` (and `== 0` its complement); the casts pass reads sign extension spelled
+  `(x << c) >>s c` or `((x & 2^k − 1) ^ 2^(k−1)) − 2^(k−1)` as `sext(trunc<k>(x))`; new rules
+  (`core.concat`) take a shared part out of `&`, `|` and `^` of concatenations, nest
+  concatenations to the right, read shifts of a concatenation by its low part's width as an
+  extension, and a zero low part `|` a zero-extended value as their concatenation;
+  `core.single_bit` knows a power of two shares no bit with the value below it. And the linear
+  pass splits an operation that reads a mask of a condition (`sext(c)`, `-zext(c)`, a sign
+  mask) into `select(c, …, …)` when that is smaller: the conditional negation `(x ^ m) − m` is
+  `select(c, −x, x)`.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's
