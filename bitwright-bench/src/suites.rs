@@ -1,9 +1,10 @@
 //! The benchmarks. Names are `group/case/width`; every workload is deterministic.
 
+use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bitwright::engine::{Engine, Strategy};
+use bitwright::engine::{Engine, Phase, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
 use bitwright::fp::{FpFormat, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
@@ -24,6 +25,7 @@ pub fn all() -> Vec<Bench> {
     facts(&mut v);
     constraints(&mut v);
     simplify(&mut v);
+    compile(&mut v);
     services(&mut v);
     v
 }
@@ -551,6 +553,109 @@ fn simplify(v: &mut Vec<Bench>) {
             });
         },
     ));
+}
+
+/// Functions as a compiler simplifies them: every SSA value of a function is a root, one
+/// context is reused across functions (`clear` between them), and the function is built
+/// through the builder (`workload::ssa_function`). The rules-only engine runs the built-in
+/// rules for one round; the standard one is `Engine::standard()`. `-rerun` rows run the same
+/// roots a second time in the same context, where the memo should answer.
+fn compile(v: &mut Vec<Bench>) {
+    /// Functions measured in turn, so a row is not one function's accident.
+    const SEEDS: u64 = 8;
+    fn rules_only() -> Engine {
+        let local = Strategy::standard()
+            .phases
+            .into_iter()
+            .find(|p| matches!(p, Phase::Local { .. }))
+            .expect("the standard strategy has a rule phase");
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::new("rules", vec![local]).with_max_rounds(1))
+            .build()
+            .expect("engine")
+    }
+    v.push(Bench::new("compile/build-200/64", 400, "function", |b| {
+        let mut cx = Context::new();
+        let mut seed = 0;
+        b.iter(|| {
+            seed = (seed + 1) % SEEDS;
+            cx.clear();
+            workload::ssa_function(&mut cx, 900 + seed, 200)
+        });
+    }));
+    type MakeEngine = fn() -> Engine;
+    let rows: [(&str, MakeEngine, usize, bool, u64); 6] = [
+        ("rules", rules_only, 50, false, 200),
+        ("rules", rules_only, 200, false, 48),
+        ("rules-rerun", rules_only, 200, true, 200),
+        ("standard", Engine::standard, 50, false, 40),
+        ("standard", Engine::standard, 200, false, 8),
+        ("standard-rerun", Engine::standard, 200, true, 8),
+    ];
+    for (case, engine, n, rerun, iters) in rows {
+        v.push(
+            Bench::new(
+                format!("compile/{case}-{n}/64"),
+                iters,
+                "function",
+                move |b| {
+                    let engine = engine();
+                    let slot = RefCell::new(Some(Context::new()));
+                    let seed = Cell::new(0);
+                    b.iter_batched(
+                        || {
+                            seed.set((seed.get() + 1) % SEEDS);
+                            let mut cx = slot.borrow_mut().take().expect("the context is back");
+                            cx.clear();
+                            let roots = workload::ssa_function(&mut cx, 900 + seed.get(), n);
+                            if rerun {
+                                engine
+                                    .run(&mut cx, &roots, Default::default())
+                                    .expect("simplify");
+                            }
+                            (cx, roots)
+                        },
+                        |(mut cx, roots)| {
+                            let out = engine
+                                .run(&mut cx, &roots, Default::default())
+                                .expect("simplify");
+                            *slot.borrow_mut() = Some(cx);
+                            out
+                        },
+                    );
+                },
+            )
+            .with_note(move || {
+                let engine = engine();
+                let mut cx = Context::new();
+                let roots = workload::ssa_function(&mut cx, 900, n);
+                let size = |cx: &mut Context, r: &[Expr]| match cx.dag_size(r, u32::MAX) {
+                    Ok(bitwright::Bounded::Exact(n)) => n,
+                    _ => 0,
+                };
+                let before = size(&mut cx, &roots);
+                let mut out = engine
+                    .run(&mut cx, &roots, Default::default())
+                    .expect("simplify");
+                let results: Vec<Expr> = out.roots.iter().map(|r| r.expr).collect();
+                let after = size(&mut cx, &results);
+                if rerun {
+                    out = engine
+                        .run(&mut cx, &roots, Default::default())
+                        .expect("simplify");
+                }
+                let s = &out.stats;
+                format!(
+                    "nodes {before} -> {after}; {}{} visits, {} memo hits, {} rewrites",
+                    if rerun { "again: " } else { "" },
+                    s.node_visits,
+                    s.memo_hits,
+                    s.rewrites
+                )
+            }),
+        );
+    }
 }
 
 /// Engine construction (rule compilation), equality saturation, SMT-LIB.

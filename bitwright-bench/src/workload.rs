@@ -400,3 +400,44 @@ pub fn fp_dag(cx: &mut Context, seed: u64, f: bitwright::fp::FpFormat, nodes: us
     }
     *pool.last().expect("a root")
 }
+
+/// One function as a compiler holds it: `n` SSA instructions over four 64-bit parameters,
+/// each reading two of the last eight values, mostly already simple, with a peephole
+/// opportunity in about one in six (`(a + c) - c`, `(a ^ b) ^ b`). Built through the builder,
+/// no text; returns every value, in order (a compiler simplifies each one).
+pub fn ssa_function(cx: &mut Context, seed: u64, n: usize) -> Vec<Expr> {
+    let mut rng = Rng::new(seed);
+    let w = Width::W64;
+    let mut vals: Vec<Expr> = (0..4)
+        .map(|i| cx.symbol(SymbolKey::U64(i), w).expect("a 64-bit symbol"))
+        .collect();
+    for _ in 0..n {
+        let window = vals.len().min(8) as u64;
+        let a = vals[vals.len() - 1 - rng.below(window) as usize];
+        let b = vals[vals.len() - 1 - rng.below(window) as usize];
+        let c = cx
+            .constant_u64(w, rng.below(64) + 1)
+            .expect("a 64-bit constant");
+        let v = match rng.below(12) {
+            0 => cx.bin(BinOp::Add, a, b),
+            1 => cx.bin(BinOp::Sub, a, b),
+            2 => cx.bin(BinOp::And, a, c),
+            3 => cx.bin(BinOp::Or, a, b),
+            4 => cx.bin(BinOp::Xor, a, b),
+            5 => cx.bin(BinOp::Shl, a, c),
+            6 => cx.bin(BinOp::Mul, a, c),
+            7 => cx.bin(BinOp::Add, a, c),
+            8 => cx.cmp(CmpOp::Ult, a, b).and_then(|t| cx.select(t, a, b)),
+            9 => cx.trunc(a, Width::W32).and_then(|t| cx.zext(t, w)),
+            10 => cx
+                .bin(BinOp::Add, a, c)
+                .and_then(|t| cx.bin(BinOp::Sub, t, c)),
+            _ => cx
+                .bin(BinOp::Xor, a, b)
+                .and_then(|t| cx.bin(BinOp::Xor, t, b)),
+        }
+        .expect("operands of one width");
+        vals.push(v);
+    }
+    vals.split_off(4)
+}

@@ -1,8 +1,10 @@
 # Proposal: bitwright inside a compiler, translation and rewrites at compiler speed
 
-Status: exploration, nothing implemented. The numbers below come from a scratch benchmark
-(described in the appendix) on a shared cloud VM (Intel Xeon at 2.8 GHz, Rust 1.94), not on
-the reference machine of `docs/benchmarking.md`. Use them for ratios, not as reference numbers.
+Status: exploration. Step 1 of the order of work is done: the workload is the benchmark
+group `compile/*` (`cargo run --release -p bitwright-bench -- compile`). Nothing else is
+implemented. The numbers below come from that workload on a shared cloud VM (Intel Xeon at
+2.8 GHz, Rust 1.94), not on the reference machine of `docs/benchmarking.md`. Use them for
+ratios, not as reference numbers.
 
 ## The operating point
 
@@ -335,8 +337,12 @@ This is the largest gain: it removes the growth with function size, not just a c
 
 Each step is measured with the benchmark from step 1 and lands alone.
 
-1. **Add the compiler-shaped workload to `bitwright-bench`**: every SSA value a root, sizes 50
-   to 400, rules only and standard.
+1. **Done: the compiler-shaped workload in `bitwright-bench`** (`compile/*`): every SSA value
+   a root, 50 and 200 instructions, rules only and standard, and memoized re-runs. The note
+   under each row gives the DAG size before and after, visits, memo hits and rewrites, so a
+   faster row that simplifies less shows it. The standard re-run at 200 instructions makes
+   *more* rewrites than the first run (578 against 402), so the second run does not merely
+   confirm the first.
 2. **Engine tier**: `Strategy::compile()`, per-node commit decisions, sessions that keep their
    scratch, `simplify_node`. This is the largest gain, and it needs no new crate.
 3. **Builder fast paths (1b).** Mostly internal.
@@ -365,10 +371,9 @@ grow. These are targets, not measurements.
 
 ## Appendix: the benchmark
 
-A standalone crate depending on `bitwright` by path (`default-features = false`), release
-profile with debug info. `build(cx, n, seed)` creates four 64-bit symbols (`U64` keys). It
-then appends *n* values, each from two of the last eight values and a constant in `1..=64`,
-with the operation chosen uniformly from:
+`workload::ssa_function(cx, seed, n)` in `bitwright-bench` creates four 64-bit symbols
+(`U64` keys). It then appends *n* values, each from two of the last eight values and a
+constant in `1..=64`, with the operation chosen uniformly from:
 
 - `a + b`, `a − b`, `a & c`, `a | b`, `a ^ b`, `a << c`, `a · c`, `a + c`;
 - `select(a <u b, a, b)`;
@@ -376,9 +381,11 @@ with the operation chosen uniformly from:
 - `(a + c) − c`;
 - `(a ^ b) ^ b`.
 
-It returns the *n* values as roots. Each configuration runs 100,000 / *n* functions in one
-reused context (`clear` between functions). A run is timed with `Instant` around
-`Engine::run`, then the same roots are run again in the same context. The floor is the same
-generator over a bare `hashbrown::HashTable<u32>` of 16-byte nodes. Profiles are callgrind at
-*N* = 100 (standard) and *N* = 200 (rules only). Adding this workload to `bitwright-bench` is
-step 1 above.
+It returns the *n* values as roots. The `compile/*` rows cycle through eight seeds in one
+reused context (`clear` between functions); `Engine::run` alone is measured, and a `-rerun`
+row's first run happens in the unmeasured setup. The table above was measured before the
+workload moved into the suite, with a scratch copy of the same generator (a different random
+generator, so the functions differ) at 50 to 400 instructions: 100,000 / *N* functions per
+configuration, timed with `Instant`. The floor is the same generator over a bare
+`hashbrown::HashTable<u32>` of 16-byte nodes. Profiles are callgrind at *N* = 100 (standard)
+and *N* = 200 (rules only).
