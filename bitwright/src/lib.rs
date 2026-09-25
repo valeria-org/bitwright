@@ -94,6 +94,7 @@ mod hash;
 mod invert;
 #[cfg(feature = "mba")]
 pub mod mba;
+pub mod memory;
 mod ops;
 #[cfg(feature = "prove")]
 pub mod prove;
@@ -122,6 +123,8 @@ mod book {
     struct Constraints;
     #[doc = include_str!("../../book/src/extensions.md")]
     struct Extensions;
+    #[doc = include_str!("../../book/src/memory.md")]
+    struct MemoryChapter;
     #[doc = include_str!("../../book/src/simplifying.md")]
     struct Simplifying;
     #[cfg(feature = "check")]

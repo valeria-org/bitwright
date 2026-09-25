@@ -23,6 +23,10 @@ pub struct Import {
     pub definitions: Vec<(String, Expr)>,
     /// Asserted formulas, as 1-bit expressions.
     pub assertions: Vec<Expr>,
+    /// Declared arrays, as memories (see [`crate::memory`]): a `select` is a load of their
+    /// final contents' history, so a model's values for the reads' symbols
+    /// ([`Memory::reads`](crate::memory::Memory::reads)) give the array's cells.
+    pub arrays: Vec<(String, crate::memory::Memory)>,
 }
 
 impl Import {
@@ -55,6 +59,10 @@ impl Import {
 /// canonical one). `=` on floats treats every NaN as one value. What SMT-LIB leaves open
 /// (the zero `fp.min` of `+0` and `−0` returns, conversions out of range) takes bitwright's
 /// definitions.
+///
+/// Arrays (QF_ABV): the sort `(Array (_ BitVec n) (_ BitVec m))`, declared constants of it,
+/// `select` and `store`, read as [`memory`](crate::memory) loads and stores (equality of
+/// arrays, and arrays chosen by `ite`, are refused).
 ///
 /// Anything else is an error. Symbol names `#k` and `$k` (decimal `k`) read as integer and
 /// fresh keys, so an [`export`](super::export)ed script reads back to the same symbols.
@@ -330,9 +338,19 @@ impl<'s> Sx<'s> {
             let n = self.numeral(k[2])?;
             return Ok(Sort::Bv(self.width(k[2], n)?));
         }
+        if let Some(k) = self.list(id)
+            && k.len() == 3
+            && self.sym(k[0]) == Some("Array")
+        {
+            return match (self.sort(k[1])?, self.sort(k[2])?) {
+                (Sort::Bv(i), Sort::Bv(e)) => Ok(Sort::Array(i, e)),
+                _ => Err(self.err(id, "arrays from bit-vectors to bit-vectors only")),
+            };
+        }
         Err(self.err(
             id,
-            "unsupported sort (Bool, (_ BitVec n), a FloatingPoint sort or RoundingMode)",
+            "unsupported sort (Bool, (_ BitVec n), an Array of them, a FloatingPoint sort or \
+             RoundingMode)",
         ))
     }
 }
@@ -347,6 +365,8 @@ enum Val {
     Bool(Expr),
     Fp(Expr, FpFormat),
     Rm(RoundingMode),
+    /// An array: a memory of [`Import::arrays`] at a version.
+    Array(u32, crate::memory::Version),
 }
 
 impl Val {
@@ -354,7 +374,7 @@ impl Val {
     fn expr(self) -> Option<Expr> {
         match self {
             Val::Bv(e) | Val::Bool(e) | Val::Fp(e, _) => Some(e),
-            Val::Rm(_) => None,
+            Val::Rm(_) | Val::Array(..) => None,
         }
     }
 }
@@ -365,6 +385,7 @@ enum Sort {
     Bv(Width),
     Fp(FpFormat),
     Rm,
+    Array(Width, Width),
 }
 
 struct State<'a, 's> {
@@ -441,6 +462,12 @@ impl<'s> State<'_, 's> {
     fn declare(&mut self, sx: &Sx<'s>, name_id: u32, sort_id: u32) -> Result<(), Error> {
         let name = sx.name(name_id)?;
         let sort = sx.sort(sort_id)?;
+        if let Sort::Array(i, e) = sort {
+            let m = crate::memory::Memory::new(name, i, e, crate::memory::Endian::Little);
+            let v = Val::Array(self.out.arrays.len() as u32, m.initial());
+            self.out.arrays.push((name.to_string(), m));
+            return self.bind_global(sx, name_id, name, v);
+        }
         let key = key_of(name);
         let w = match sort {
             Sort::Bool => Width::W1,
@@ -451,6 +478,7 @@ impl<'s> State<'_, 's> {
                     "rounding-mode variables (bitwright's rounding modes are constants)".into(),
                 ));
             }
+            Sort::Array(..) => unreachable!("declared above"),
         };
         let e = self.cx.symbol(key, w)?;
         let v = match sort {
@@ -468,6 +496,10 @@ impl<'s> State<'_, 's> {
             (Val::Bool(_), Sort::Bool) | (Val::Rm(_), Sort::Rm) => true,
             (Val::Bv(e), Sort::Bv(w)) => self.cx.width(e)? == w,
             (Val::Fp(_, f), Sort::Fp(g)) => f == g,
+            (Val::Array(m, _), Sort::Array(i, e)) => {
+                let mem = &self.out.arrays[m as usize].1;
+                mem.addr_width() == i && mem.cell_width() == e
+            }
             _ => false,
         };
         if ok {
@@ -732,6 +764,26 @@ impl<'s> State<'_, 's> {
         if op.starts_with("fp") && (op == "fp" || op.starts_with("fp.")) {
             return self.apply_float(sx, id, op, args);
         }
+        if op == "select" || op == "store" {
+            arity(n == if op == "select" { 2 } else { 3 })?;
+            let Val::Array(m, at) = args[0].1 else {
+                return Err(sx.err(args[0].0, "expected an array"));
+            };
+            let i = self.bv(sx, args[1].0, args[1].1)?;
+            if op == "select" {
+                let mem = &mut self.out.arrays[m as usize].1;
+                return Ok(Val::Bv(mem.load(self.cx, at, i, 1)?));
+            }
+            let v = self.bv(sx, args[2].0, args[2].1)?;
+            let mem = &mut self.out.arrays[m as usize].1;
+            if self.cx.width(v)? != mem.cell_width() {
+                return Err(sx.err(
+                    args[2].0,
+                    "the stored value is not the array's element sort",
+                ));
+            }
+            return Ok(Val::Array(m, mem.store(self.cx, at, i, v)?));
+        }
         // Operators over bit-vectors.
         let bin = match op {
             "bvadd" => Some((BinOp::Add, true)),
@@ -860,7 +912,11 @@ impl<'s> State<'_, 's> {
                     Val::Bv(_) => 1,
                     Val::Fp(..) => 2,
                     Val::Rm(_) => 3,
+                    Val::Array(..) => 4,
                 };
+                if matches!(args[0].1, Val::Array(..)) {
+                    return Err(Error::Unsupported("equality of arrays".into()));
+                }
                 if args.iter().any(|&(_, v)| kind(v) != kind(args[0].1)) {
                     return Err(sx.err(id, "operands of different sorts"));
                 }
@@ -916,6 +972,9 @@ impl<'s> State<'_, 's> {
                     (Val::Rm(_), Val::Rm(_)) => Err(Error::Unsupported(
                         "a rounding mode chosen by a condition".into(),
                     )),
+                    (Val::Array(..), Val::Array(..)) => {
+                        Err(Error::Unsupported("an array chosen by a condition".into()))
+                    }
                     _ => Err(sx.err(id, "ite arms of different sorts")),
                 }
             }

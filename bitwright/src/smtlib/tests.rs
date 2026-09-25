@@ -1277,3 +1277,45 @@ fn z3_proves_rewrites_under_the_constraints_they_rely_on() {
 fn bitwuzla_proves_rewrites_under_the_constraints_they_rely_on() {
     solver_proves_rewrites_under_the_constraints_they_rely_on(Solver::Bitwuzla);
 }
+
+#[test]
+fn arrays_import_as_memory() {
+    let script = "
+(set-logic QF_ABV)
+(declare-fun m () (Array (_ BitVec 32) (_ BitVec 8)))
+(declare-const a (_ BitVec 32))
+(declare-const b (_ BitVec 32))
+(declare-const v (_ BitVec 8))
+(define-fun m1 () (Array (_ BitVec 32) (_ BitVec 8)) (store m a v))
+(assert (= (select m1 a) v))
+(assert (= (select m1 b) (ite (= a b) v (select m b))))
+(assert (= (select (store m1 (bvadd a #x00000001) #x07) a) v))
+(check-sat)
+";
+    let mut cx = Context::new();
+    let imp = crate::smtlib::import(&mut cx, script).unwrap();
+    assert_eq!(imp.arrays.len(), 1);
+    assert_eq!(imp.assertions.len(), 3);
+    // Read over write decides the first and last at once; the middle one is valid.
+    for (k, &e) in imp.assertions.iter().enumerate() {
+        match k {
+            0 | 2 => assert_eq!(
+                cx.as_const(e).unwrap(),
+                Some(BitVec::from_bool(true)),
+                "{k}"
+            ),
+            _ => assert!(matches!(
+                crate::prove::valid(&mut cx, e, &crate::prove::Config::default()).unwrap(),
+                crate::prove::Outcome::Proved(_)
+            )),
+        }
+    }
+    let err = crate::smtlib::import(
+        &mut Context::new(),
+        "(declare-fun m () (Array (_ BitVec 8) (_ BitVec 8)))
+         (declare-fun n () (Array (_ BitVec 8) (_ BitVec 8)))
+         (assert (= m n))",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("equality of arrays"), "{err}");
+}

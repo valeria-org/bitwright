@@ -147,6 +147,16 @@
   interpreter and random sampling finds no difference in the mutants judged valid. Of the
   fast-math flags, `nnan`, `ninf` and `nsz` are modeled; `reassoc`, `arcp`, `contract` and
   `afn` are not.
+- **Memory** (`bitwright::memory`): loads and stores over an array from addresses to cells
+  (bytes, usually; little- or big-endian), resolved at construction into bitwright's own
+  operators, so every service works on code that reads memory. A load reads through the
+  stores before it (store-to-load forwarding; a store at an address that may alias becomes a
+  `select`; one base with constant offsets is decided by the offsets), known contents (read-only
+  data: a constant, or a table selected by an index the facts keep in range), and unknown cells
+  as symbols made consistent by address (two reads at equal addresses agree); pieces of one
+  stored value reassemble into it, so a spill reloaded is the spilled value. `Memory::bind`
+  gives the unknown cells their values from a memory image. SMT-LIB import reads arrays
+  (QF_ABV: `select`, `store`) as memories.
 - **Behavior changes.** The MBA service's defaults are the ones
   `docs/proposals/mba-defaults.md` proposed: the normal-form solver (`NormalFormSolver`)
   answers when the host sets no solver, and `MbaTrust::default()` no longer trusts a backend's

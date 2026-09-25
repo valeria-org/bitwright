@@ -8,6 +8,7 @@
 - [Facts and proofs](facts.md)
 - [Constraints](constraints.md)
 - [Extension operations](extensions.md)
+- [Memory](memory.md)
 - [Simplifying](simplifying.md)
 - [Writing rules](rules.md)
 - [Checking rules](checking.md)

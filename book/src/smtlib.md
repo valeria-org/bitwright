@@ -31,8 +31,10 @@ hold.
 
 `smtlib::import` reads a QF_BV subset: declarations and definitions without parameters,
 assertions, `let`, `ite`, `=`, `distinct`, the Boolean operators, and every QF_BV operator.
-Booleans become 1-bit expressions. Anything else is an error, never a guess, and the reader is
-iterative and bounded, so hostile input cannot exhaust the stack.
+Booleans become 1-bit expressions. Arrays from bit-vectors to bit-vectors (QF_ABV) become
+[memories](memory.md): `select` a load, `store` a store, resolved as the memory chapter
+describes (equality of arrays is refused). Anything else is an error, never a guess, and the
+reader is iterative and bounded, so hostile input cannot exhaust the stack.
 
 ```rust
 use bitwright::{Context, smtlib};
