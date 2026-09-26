@@ -82,7 +82,12 @@ fn version_and_abi() {
 #[test]
 fn the_header_declares_every_entry_point_and_matches_the_tables() {
     let header = include_str!("../include/bitwright.h");
-    let source = [include_str!("lib.rs"), include_str!("more.rs")].concat();
+    let source = [
+        include_str!("lib.rs"),
+        include_str!("more.rs"),
+        include_str!("compiler.rs"),
+    ]
+    .concat();
     let exported: Vec<&str> = source
         .lines()
         .filter_map(|l| l.split("extern \"C\" fn ").nth(1))
@@ -167,6 +172,29 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
     assert_eq!(tests.len(), FPTESTS.len());
     for (i, t) in tests.iter().enumerate() {
         assert_eq!(value_of(&format!("BW_FP_{t}")), i);
+    }
+    assert_eq!(value_of("BW_PRESET_STANDARD"), PRESET_STANDARD as usize);
+    assert_eq!(
+        value_of("BW_PRESET_DEOBFUSCATE"),
+        PRESET_DEOBFUSCATE as usize
+    );
+    assert_eq!(value_of("BW_PRESET_COMPILE"), PRESET_COMPILE as usize);
+    for (i, s) in SHARINGS.iter().enumerate() {
+        assert_eq!(value_of(&format!("BW_SHARING_{s:?}").to_uppercase()), i);
+    }
+    for (name, code) in [
+        ("UNPARSABLE", crate::compiler::FAILURE_UNPARSABLE),
+        ("NEVER_APPLIED", crate::compiler::FAILURE_NEVER_APPLIED),
+        ("DIFFERS", crate::compiler::FAILURE_DIFFERS),
+        ("WIDTH", crate::compiler::FAILURE_WIDTH),
+        ("NOT_SMALLER", crate::compiler::FAILURE_NOT_SMALLER),
+        (
+            "NONDETERMINISTIC",
+            crate::compiler::FAILURE_NONDETERMINISTIC,
+        ),
+        ("FOREIGN_EXPR", crate::compiler::FAILURE_FOREIGN_EXPR),
+    ] {
+        assert_eq!(value_of(&format!("BW_REWRITE_{name}")), code as usize);
     }
     // The named formats.
     let named = FpFormat::NAMED.into_iter().chain([(FpFormat::X87, "x87")]);
@@ -440,7 +468,7 @@ fn errors_leave_outputs_alone_and_are_described() {
         assert_eq!(bw_un(cx.0, 7, x, &mut e), BW_ERR_INVALID_ARGUMENT);
         assert_eq!(bw_bin(cx.0, -1, x, x, &mut e), BW_ERR_INVALID_ARGUMENT);
         assert_eq!(bw_cmp(cx.0, 10, x, x, &mut e), BW_ERR_INVALID_ARGUMENT);
-        assert!(bw_engine_new(2).is_null());
+        assert!(bw_engine_new(3).is_null());
         assert!(last_error().contains("preset"));
         // Width rules.
         let y = cx.sym("y", 16);
@@ -1351,5 +1379,890 @@ fn proofs_synthesis_memory_lifting_and_transformations() {
     unsafe {
         bw_engine_free(eng);
         bw_engine_builder_free(bld);
+    }
+}
+
+// ----- in a compiler --------------------------------------------------------------------------
+
+mod compiler {
+    use core::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::compiler::*;
+    use super::super::more::bw_engine_builder_refuse;
+    use super::*;
+
+    const UREM: c_int = 6;
+    const ADD: c_int = 0;
+    const MUL: c_int = 2;
+    const XOR: c_int = 11;
+    const SHL: c_int = 12;
+
+    fn blank_node() -> BwNode {
+        BwNode {
+            kind: -9,
+            op: -9,
+            width: 0,
+            lo: 0,
+            n_children: 0,
+            children: [0; 3],
+        }
+    }
+
+    /// Node `e` if it is binary operator `op`: its operands.
+    unsafe fn bin_of(s: *mut BwSite, e: u64, op: c_int) -> Option<(u64, u64)> {
+        let mut n = blank_node();
+        let found = unsafe { bw_site_node(s, e, &mut n) };
+        (found && n.kind == KIND_BINARY && n.op == op).then_some((n.children[0], n.children[1]))
+    }
+
+    /// `urem(x, c)` as `x` when the facts show `x < c` (the book's example).
+    unsafe extern "C" fn needless_rem(_: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        unsafe {
+            let Some((x, c)) = bin_of(s, e, UREM) else {
+                return 0;
+            };
+            let mut c_value = 0;
+            if !bw_site_as_u64(s, c, &mut c_value) {
+                return 0;
+            }
+            let mut f = BwFacts {
+                known_zero: val(1, 0),
+                known_one: val(1, 0),
+                umin: val(1, 0),
+                umax: val(1, 0),
+                ustride: 0,
+                smin: val(1, 0),
+                smax: val(1, 0),
+                relies_on: 9,
+            };
+            if !bw_site_facts(s, x, &mut f) {
+                return 0;
+            }
+            assert_eq!(f.relies_on, 0);
+            let hi = f.umax.limbs;
+            if hi[1..].iter().any(|&l| l != 0) || hi[0] >= c_value {
+                return 0;
+            }
+            x
+        }
+    }
+
+    /// `x * 2^k` as `x << k`, built through the site.
+    unsafe extern "C" fn mul_pow2(_: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        unsafe {
+            let Some((x, c)) = bin_of(s, e, MUL) else {
+                return 0;
+            };
+            let mut c_value = 0;
+            if !bw_site_as_u64(s, c, &mut c_value) || !c_value.is_power_of_two() {
+                return 0;
+            }
+            let k = bw_site_const_u64(s, bw_site_width(s, e), u64::from(c_value.trailing_zeros()));
+            bw_site_bin(s, SHL, x, k)
+        }
+    }
+
+    /// `(x ^ y) ^ y` as `x`.
+    unsafe extern "C" fn xor_twice(_: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        unsafe {
+            let Some((a, y)) = bin_of(s, e, XOR) else {
+                return 0;
+            };
+            let Some((x, z)) = bin_of(s, a, XOR) else {
+                return 0;
+            };
+            if z == y {
+                x
+            } else if x == y {
+                z
+            } else {
+                0
+            }
+        }
+    }
+
+    /// `(x + c) - c` (built as `(x + c) + -c`) as `x + c`: wrong.
+    unsafe extern "C" fn wrong(_: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        unsafe {
+            let Some((a, _)) = bin_of(s, e, ADD) else {
+                return 0;
+            };
+            if bin_of(s, a, ADD).is_some() { a } else { 0 }
+        }
+    }
+
+    /// `x + y` as `x`: wrong, and smaller, so the engine's sampling must catch it.
+    unsafe extern "C" fn drop_addend(_: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        unsafe { bin_of(s, e, ADD).map_or(0, |(x, _)| x) }
+    }
+
+    static RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_release(user: *mut c_void) {
+        assert_eq!(user as usize, 42);
+        RELEASED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn rewrite(name: &CString, f: RewriteFnForTests) -> BwRewrite {
+        BwRewrite {
+            name: name.as_ptr(),
+            group: null(),
+            revision: 1,
+            user: null_mut(),
+            rewrite: Some(f),
+            release: None,
+        }
+    }
+
+    type RewriteFnForTests = unsafe extern "C" fn(*mut c_void, *mut BwSite, u64) -> u64;
+
+    fn build(b: *mut BwEngineBuilder) -> *mut BwEngine {
+        let mut e = null_mut();
+        assert_eq!(
+            unsafe { bw_engine_builder_build(b, &mut e) },
+            BW_OK,
+            "{}",
+            last_error()
+        );
+        e
+    }
+
+    fn run_stats(engine: *mut BwEngine, cx: &Cx, roots: &[u64]) -> (Vec<BwOutcome>, BwStats) {
+        let mut out = vec![
+            BwOutcome {
+                expr: 0,
+                changed: false,
+                end: 0,
+                limit: 0,
+                relies_on: 0
+            };
+            roots.len()
+        ];
+        let mut stats = BwStats::default();
+        let st = unsafe {
+            bw_engine_run_stats(
+                engine,
+                cx.0,
+                roots.as_ptr(),
+                roots.len(),
+                null(),
+                null(),
+                out.as_mut_ptr(),
+                &mut stats,
+            )
+        };
+        assert_eq!(st, BW_OK, "{}", last_error());
+        (out, stats)
+    }
+
+    #[test]
+    fn the_compile_preset_and_its_options() {
+        let cx = Cx::new();
+        let e = cx.parse("(x ^ y) + 2 * (x & y)", 32);
+        let engine = bw_engine_new(PRESET_COMPILE);
+        assert!(!engine.is_null());
+        let mut s = 0;
+        assert_eq!(unsafe { bw_simplify(engine, cx.0, e, &mut s) }, BW_OK);
+        assert_eq!(cx.print(s), "x + y");
+        // One round, and memoized: the same call again is answered by the memo.
+        let (_, first) = run_stats(engine, &cx, &[e]);
+        assert_eq!(first.rounds, 1);
+        let (out, second) = run_stats(engine, &cx, &[e]);
+        assert!(second.memo_hits > 0, "{second:?}");
+        assert_eq!(cx.print(out[0].expr), "x + y");
+        unsafe { bw_engine_free(engine) };
+
+        // The options, on another preset.
+        let b = bw_engine_builder_new(PRESET_STANDARD);
+        assert_eq!(unsafe { bw_engine_builder_set_sharing(b, 1) }, BW_OK);
+        assert_eq!(
+            unsafe { bw_engine_builder_set_sharing(b, 2) },
+            BW_ERR_INVALID_ARGUMENT
+        );
+        assert!(last_error().contains("sharing"), "{}", last_error());
+        unsafe { bw_engine_builder_set_max_region(b, 0) };
+        let engine = build(b);
+        assert_eq!(unsafe { bw_simplify(engine, cx.0, e, &mut s) }, BW_OK);
+        assert_eq!(cx.print(s), "x + y");
+        unsafe {
+            bw_engine_free(engine);
+            bw_engine_builder_free(b);
+            bw_engine_builder_set_max_region(null_mut(), 3);
+            assert_eq!(
+                bw_engine_builder_set_sharing(null_mut(), 0),
+                BW_ERR_INVALID_ARGUMENT
+            );
+        }
+        assert!(bw_engine_builder_new(3).is_null());
+    }
+
+    #[test]
+    fn declared_known_bits() {
+        let cx = Cx::new();
+        let x = cx.sym("x", 8);
+        unsafe {
+            // The top four bits are zero.
+            assert_eq!(bw_declare_known(cx.0, x, 0xf0, 0), BW_OK);
+            let (mut zero, mut one, mut has) = (val(1, 0), val(1, 0), false);
+            assert_eq!(
+                bw_declared_known(cx.0, x, &mut zero, &mut one, &mut has),
+                BW_OK
+            );
+            assert!(has);
+            assert_eq!((zero.width, zero.limbs[0], one.limbs[0]), (8, 0xf0, 0));
+            let high = cx.parse("x >>u 4", 8);
+            let mut p = BwProof {
+                truth: 9,
+                relies_on: 9,
+            };
+            assert_eq!(bw_prove(cx.0, high, null(), &mut p), BW_OK);
+            // `x >>u 4` is zero: proving it nonzero is false.
+            assert_eq!(p.truth, 0);
+            let mut s = 0;
+            let engine = bw_engine_new(PRESET_COMPILE);
+            assert_eq!(bw_simplify(engine, cx.0, high, &mut s), BW_OK);
+            assert_eq!(cx.print(s), "0:8");
+            bw_engine_free(engine);
+            // Removed by empty masks.
+            assert_eq!(bw_declare_known(cx.0, x, 0, 0), BW_OK);
+            assert_eq!(
+                bw_declared_known(cx.0, x, &mut zero, &mut one, &mut has),
+                BW_OK
+            );
+            assert!(!has);
+            assert_eq!(zero.limbs[0], 0);
+
+            // Wide symbols take values.
+            let w = cx.sym("w", 128);
+            assert_eq!(bw_declare_known(cx.0, w, 1, 0), BW_ERR_WIDTH);
+            let mut z = val(128, 0);
+            z.limbs[1] = 1 << 63;
+            let o = val(128, 1);
+            assert_eq!(bw_declare_known_value(cx.0, w, &z, &o), BW_OK);
+            assert_eq!(
+                bw_declared_known(cx.0, w, &mut zero, &mut one, &mut has),
+                BW_OK
+            );
+            assert!(has);
+            assert_eq!((zero.limbs[1], one.limbs[0]), (1 << 63, 1));
+            let mut f = BwFacts {
+                known_zero: val(1, 0),
+                known_one: val(1, 0),
+                umin: val(1, 0),
+                umax: val(1, 0),
+                ustride: 0,
+                smin: val(1, 0),
+                smax: val(1, 0),
+                relies_on: 0,
+            };
+            assert_eq!(bw_facts_of(cx.0, w, null(), &mut f), BW_OK);
+            assert_eq!(f.umin.limbs[0], 1);
+
+            // Errors: not a symbol, a conflict, a mask too wide, masks of another width.
+            let sum = cx.parse("x + 1", 8);
+            assert_eq!(bw_declare_known(cx.0, sum, 1, 0), BW_ERR_INVALID_ARGUMENT);
+            assert_eq!(
+                bw_declared_known(cx.0, sum, &mut zero, &mut one, &mut has),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(bw_declare_known(cx.0, x, 1, 1), BW_ERR_VALUE);
+            assert!(last_error().contains("both"), "{}", last_error());
+            assert_eq!(bw_declare_known(cx.0, x, 0x100, 0), BW_ERR_VALUE);
+            assert_eq!(
+                bw_declare_known_value(cx.0, w, &val(8, 1), &o),
+                BW_ERR_WIDTH
+            );
+            assert_eq!(bw_declare_known(cx.0, 0, 1, 0), BW_ERR_FOREIGN_EXPR);
+
+            // Reserving room changes nothing else.
+            let n = bw_context_len(cx.0);
+            bw_context_reserve(cx.0, 1 << 16);
+            bw_context_reserve(null_mut(), 1);
+            assert_eq!(bw_context_len(cx.0), n);
+        }
+    }
+
+    #[test]
+    fn host_rewrites_in_an_engine() {
+        let cx = Cx::new();
+        cx.sym("b", 8);
+        let e = cx.parse("urem(zext<32>(b), 1000)", 32);
+        let name = cstr("acme.needless_rem");
+        let group = cstr("acme");
+        let mut rw = rewrite(&name, needless_rem);
+        rw.group = group.as_ptr();
+        rw.user = 42 as *mut c_void;
+        rw.release = Some(count_release);
+        let before = RELEASED.load(Ordering::SeqCst);
+
+        // The built-in rules and passes leave it.
+        let plain = bw_engine_new(PRESET_COMPILE);
+        let (out, _) = run_stats(plain, &cx, &[e]);
+        assert_eq!(out[0].expr, e);
+        unsafe { bw_engine_free(plain) };
+
+        for trusted in [false, true] {
+            let b = bw_engine_builder_new(PRESET_COMPILE);
+            assert_eq!(
+                unsafe { bw_engine_builder_add_rewrite(b, &rw, trusted) },
+                BW_OK
+            );
+            let engine = build(b);
+            // The builder's copy and the engine's: released once, when both are gone.
+            unsafe { bw_engine_builder_free(b) };
+            assert_eq!(
+                RELEASED.load(Ordering::SeqCst),
+                before + usize::from(trusted)
+            );
+            let (out, stats) = run_stats(engine, &cx, &[e]);
+            assert_eq!(cx.print(out[0].expr), "zext<32>(b)");
+            assert!(stats.host.calls > 0 && stats.host.changed == 1, "{stats:?}");
+            unsafe { bw_engine_free(engine) };
+            assert_eq!(
+                RELEASED.load(Ordering::SeqCst),
+                before + 1 + usize::from(trusted)
+            );
+        }
+
+        // Each root on its own, on several threads.
+        let b = bw_engine_builder_new(PRESET_STANDARD);
+        rw.release = None;
+        assert_eq!(
+            unsafe { bw_engine_builder_add_rewrite(b, &rw, true) },
+            BW_OK
+        );
+        let engine = build(b);
+        let roots: Vec<u64> = (1..=16)
+            .map(|k| cx.parse(&format!("urem(zext<32>(b) + {k}, 300)"), 32))
+            .collect();
+        let mut out = vec![
+            BwOutcome {
+                expr: 0,
+                changed: false,
+                end: 0,
+                limit: 0,
+                relies_on: 0
+            };
+            roots.len()
+        ];
+        let mut stats = BwStats::default();
+        let st = unsafe {
+            bw_engine_run_each_stats(
+                engine,
+                cx.0,
+                roots.as_ptr(),
+                roots.len(),
+                4,
+                null(),
+                null(),
+                out.as_mut_ptr(),
+                &mut stats,
+            )
+        };
+        assert_eq!(st, BW_OK, "{}", last_error());
+        for (k, o) in out.iter().enumerate() {
+            assert_eq!(cx.print(o.expr), format!("zext<32>(b) + {}", k + 1));
+        }
+        assert_eq!(stats.host.changed, 16);
+        unsafe { bw_engine_free(engine) };
+
+        // Refused by name.
+        let b = bw_engine_builder_new(PRESET_COMPILE);
+        unsafe {
+            assert_eq!(bw_engine_builder_add_rewrite(b, &rw, true), BW_OK);
+            assert_eq!(bw_engine_builder_refuse(b, name.as_ptr()), BW_OK);
+        }
+        let engine = build(b);
+        let (out, stats) = run_stats(engine, &cx, &[e]);
+        assert_eq!(out[0].expr, e);
+        assert!(stats.hook_vetoes > 0, "{stats:?}");
+        unsafe {
+            bw_engine_free(engine);
+            bw_engine_builder_free(b);
+        }
+
+        // A wrong rewrite, sampled: rejected and quarantined, the result left alone.
+        let bad_name = cstr("acme.drop_addend");
+        let bad = rewrite(&bad_name, drop_addend);
+        let b = bw_engine_builder_new(PRESET_COMPILE);
+        assert_eq!(
+            unsafe { bw_engine_builder_add_rewrite(b, &bad, false) },
+            BW_OK
+        );
+        let engine = build(b);
+        let sum = cx.parse("x * y + z", 16);
+        let (out, stats) = run_stats(engine, &cx, &[sum]);
+        assert_eq!(cx.print(out[0].expr), "x * y + z");
+        assert!(
+            stats.quarantined >= 1 && stats.host.rejected >= 1,
+            "{stats:?}"
+        );
+        unsafe {
+            bw_engine_free(engine);
+            bw_engine_builder_free(b);
+        }
+
+        // Bad arguments; nothing is taken over on failure.
+        let b = bw_engine_builder_new(PRESET_COMPILE);
+        let mut none = rewrite(&name, needless_rem);
+        none.rewrite = None;
+        none.release = Some(count_release);
+        let released = RELEASED.load(Ordering::SeqCst);
+        unsafe {
+            assert_eq!(
+                bw_engine_builder_add_rewrite(b, &none, false),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            let mut nameless = rewrite(&name, needless_rem);
+            nameless.name = null();
+            assert_eq!(
+                bw_engine_builder_add_rewrite(b, &nameless, false),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                bw_engine_builder_add_rewrite(b, null(), false),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                bw_engine_builder_add_rewrite(null_mut(), &rw, false),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            bw_engine_builder_free(b);
+        }
+        assert_eq!(RELEASED.load(Ordering::SeqCst), released);
+    }
+
+    /// Exercises every site accessor at `urem(x, 7)` nodes: `x` wider than 8 bits is left.
+    unsafe extern "C" fn inspect(user: *mut c_void, s: *mut BwSite, e: u64) -> u64 {
+        let seen = unsafe { &*(user as *const AtomicUsize) };
+        unsafe {
+            let Some((x, c)) = bin_of(s, e, UREM) else {
+                return 0;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let w = bw_site_width(s, e);
+            assert_eq!(w, 32);
+            assert_eq!(bw_site_width(s, 0), 0);
+            assert_eq!(bw_site_width(s, e ^ (1 << 40)), 0);
+            let mut v = val(1, 0);
+            assert!(bw_site_const_value(s, c, &mut v));
+            assert_eq!((v.width, v.limbs[0]), (32, 7));
+            assert!(!bw_site_const_value(s, x, &mut v));
+            let mut u = 0;
+            assert!(!bw_site_as_u64(s, x, &mut u));
+            let p = bw_site_print(s, e, 0);
+            assert!(!p.is_null());
+            assert_eq!(take(p), "urem(zext<32>(b), 7)");
+            assert!(bw_site_print(s, 0, 0).is_null());
+            let mut n = blank_node();
+            assert!(!bw_site_node(s, 0, &mut n));
+            // Construction: every constructor once, and failures as 0.
+            let one = bw_site_const(s, &val(32, 1));
+            let two = bw_site_const_u64(s, 32, 2);
+            assert!(one != 0 && two != 0);
+            assert_eq!(bw_site_const_u64(s, 8, 256), 0);
+            assert_eq!(bw_site_const(s, null()), 0);
+            let neg = bw_site_un(s, 1, x);
+            let sum = bw_site_bin(s, ADD, x, one);
+            let lt = bw_site_cmp(s, 2, x, two);
+            let ext = bw_site_zext(s, x, 64);
+            let sx = bw_site_sext(s, x, 64);
+            let tr = bw_site_trunc(s, x, 8);
+            let ex = bw_site_extract(s, x, 0, 8);
+            let cat = bw_site_concat(s, tr, ex);
+            let sel = bw_site_select(s, lt, x, sum);
+            for h in [neg, sum, lt, ext, sx, tr, ex, cat, sel] {
+                assert_ne!(h, 0);
+            }
+            assert_eq!(bw_site_width(s, cat), 16);
+            assert_eq!(bw_site_bin(s, 99, x, one), 0);
+            assert_eq!(bw_site_un(s, -1, x), 0);
+            assert_eq!(bw_site_cmp(s, 10, x, one), 0);
+            assert_eq!(bw_site_bin(s, ADD, x, tr), 0, "a width mismatch");
+            assert_eq!(bw_site_zext(s, x, 8), 0);
+            // Returning an existing, larger node is not committed.
+            sel
+        }
+    }
+
+    #[test]
+    fn the_site_accessors() {
+        let cx = Cx::new();
+        cx.sym("b", 8);
+        let e = cx.parse("urem(zext<32>(b), 7)", 32);
+        let seen = AtomicUsize::new(0);
+        let name = cstr("acme.inspect");
+        let mut rw = rewrite(&name, inspect);
+        rw.user = &seen as *const AtomicUsize as *mut c_void;
+        let b = bw_engine_builder_new(PRESET_COMPILE);
+        assert_eq!(
+            unsafe { bw_engine_builder_add_rewrite(b, &rw, true) },
+            BW_OK
+        );
+        let engine = build(b);
+        let (out, stats) = run_stats(engine, &cx, &[e]);
+        assert!(seen.load(Ordering::SeqCst) > 0);
+        assert_eq!(out[0].expr, e);
+        assert!(stats.host.rejected_cost > 0, "{stats:?}");
+        unsafe {
+            bw_engine_free(engine);
+            bw_engine_builder_free(b);
+            // A NULL site answers nothing.
+            assert_eq!(bw_site_width(null_mut(), e), 0);
+            assert_eq!(bw_site_const_u64(null_mut(), 8, 1), 0);
+            assert!(!bw_site_facts(null_mut(), e, null_mut()));
+        }
+    }
+
+    #[test]
+    fn checking_host_rewrites() {
+        let check = |f: RewriteFnForTests,
+                     inputs: &[&str]|
+         -> (Option<BwRewriteReport>, *mut BwRewriteFailure) {
+            let name = cstr("acme.checked");
+            let rw = rewrite(&name, f);
+            let inputs: Vec<CString> = inputs.iter().map(|s| cstr(s)).collect();
+            let ptrs: Vec<*const c_char> = inputs.iter().map(|s| s.as_ptr()).collect();
+            let mut report = BwRewriteReport {
+                applications: 0,
+                points: 0,
+                exhaustive: 0,
+            };
+            let mut failure = core::ptr::dangling_mut::<BwRewriteFailure>();
+            let cfg = bw_rewrite_check_default();
+            let st = unsafe {
+                bw_check_rewrite(
+                    &rw,
+                    ptrs.as_ptr(),
+                    ptrs.len(),
+                    &cfg,
+                    &mut report,
+                    &mut failure,
+                )
+            };
+            assert_eq!(st, BW_OK, "{}", last_error());
+            (failure.is_null().then_some(report), failure)
+        };
+        let text_of = |p: *const c_char| unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_string();
+
+        let (report, _) = check(xor_twice, &["(x ^ y) ^ y", "((a + 1) ^ 7) ^ 7"]);
+        let report = report.expect("passes");
+        assert!(report.applications > 0 && report.exhaustive > 0 && report.points > 0);
+        let (report, _) = check(mul_pow2, &["x * 8", "(a + b) * 2", "x * 6"]);
+        assert!(report.expect("passes").applications > 0);
+
+        // A wrong rewrite: the node, the result and the assignment.
+        let (_, f) = check(wrong, &["(x + 3) - 3"]);
+        assert!(!f.is_null());
+        let fr = unsafe { &*f };
+        assert_eq!(fr.kind, 2);
+        assert!(
+            text_of(fr.message).contains("differs at"),
+            "{}",
+            text_of(fr.message)
+        );
+        // `(x + c) - c` => `x + c`, for some variation of the input.
+        let (node, result) = (text_of(fr.node), text_of(fr.result));
+        assert!(
+            node.len() > result.len() && node.starts_with(&result),
+            "{node} => {result}"
+        );
+        assert!(fr.second.is_null());
+        assert!(fr.n_assignment >= 1);
+        let names = unsafe { core::slice::from_raw_parts(fr.names, fr.n_assignment) };
+        let values = unsafe { core::slice::from_raw_parts(fr.values, fr.n_assignment) };
+        assert_eq!(text_of(names[0]), "x");
+        assert!(values[0].width >= 1);
+        unsafe { bw_rewrite_failure_free(f) };
+
+        // Inputs that never exercise it, and one that does not parse.
+        let (_, f) = check(xor_twice, &["x + y"]);
+        let fr = unsafe { &*f };
+        assert_eq!(fr.kind, 1);
+        assert!(fr.node.is_null() && fr.n_assignment == 0);
+        unsafe { bw_rewrite_failure_free(f) };
+        let (_, f) = check(xor_twice, &["x +"]);
+        let fr = unsafe { &*f };
+        assert_eq!((fr.kind, text_of(fr.node)), (0, "x +".to_string()));
+        unsafe { bw_rewrite_failure_free(f) };
+        unsafe { bw_rewrite_failure_free(null_mut()) };
+
+        // A configuration: one width, no variants; NULL for the defaults and the report.
+        let name = cstr("acme.xor_twice");
+        let rw = rewrite(&name, xor_twice);
+        let input = cstr("(x ^ y) ^ y");
+        let ptrs = [input.as_ptr()];
+        let widths = [4u16];
+        let mut cfg = bw_rewrite_check_default();
+        assert_eq!((cfg.variants, cfg.samples), (16, 256));
+        cfg.widths = widths.as_ptr();
+        cfg.n_widths = 1;
+        cfg.variants = 0;
+        let mut report = BwRewriteReport {
+            applications: 0,
+            points: 0,
+            exhaustive: 0,
+        };
+        let mut failure = null_mut();
+        unsafe {
+            assert_eq!(
+                bw_check_rewrite(&rw, ptrs.as_ptr(), 1, &cfg, &mut report, &mut failure),
+                BW_OK
+            );
+            assert!(failure.is_null());
+            // Every assignment of two 4-bit symbols.
+            assert_eq!((report.applications, report.points), (1, 256));
+            assert_eq!(
+                bw_check_rewrite(&rw, ptrs.as_ptr(), 1, null(), null_mut(), &mut failure),
+                BW_OK
+            );
+            assert!(failure.is_null());
+            assert_eq!(
+                bw_check_rewrite(&rw, ptrs.as_ptr(), 1, null(), null_mut(), null_mut()),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(
+                bw_check_rewrite(&rw, null(), 1, null(), null_mut(), &mut failure),
+                BW_ERR_INVALID_ARGUMENT
+            );
+        }
+    }
+
+    #[test]
+    fn templates() {
+        let cx = Cx::new();
+        let (a, b) = (cx.sym("a", 32), cx.sym("b", 32));
+        let c = cx.sym("c", 1);
+        let (text, pa, pb, pc) = (cstr("select(c, a + 1, b)"), cstr("a"), cstr("b"), cstr("c"));
+        let params = [pc.as_ptr(), pa.as_ptr(), pb.as_ptr()];
+        let mut t = null_mut();
+        let mut e = 0;
+        unsafe {
+            assert_eq!(
+                bw_template_new(text.as_ptr(), params.as_ptr(), 3, &mut t),
+                BW_OK
+            );
+            assert_eq!(bw_template_check(t, [1u16, 32, 32].as_ptr(), 3), BW_OK);
+            // The condition must be 1 bit: a typing error.
+            assert_eq!(
+                bw_template_check(t, [8u16, 8, 8].as_ptr(), 3),
+                BW_ERR_SYNTAX
+            );
+            assert_eq!(
+                bw_template_check(t, [1u16, 8].as_ptr(), 2),
+                BW_ERR_UNSUPPORTED
+            );
+            assert_eq!(
+                bw_template_instantiate(t, cx.0, [c, a, b].as_ptr(), 3, &mut e),
+                BW_OK
+            );
+            assert_eq!(cx.print(e), "select(c, a + 1, b)");
+            // Instantiating twice gives the same node.
+            let mut again = 0;
+            assert_eq!(
+                bw_template_instantiate(t, cx.0, [c, a, b].as_ptr(), 3, &mut again),
+                BW_OK
+            );
+            assert_eq!(again, e);
+            // Other operands, at another width.
+            let x = cx.sym("x", 8);
+            assert_eq!(
+                bw_template_instantiate(t, cx.0, [c, x, x].as_ptr(), 3, &mut e),
+                BW_OK
+            );
+            assert_eq!(cx.print(e), "select(c, x + 1, x)");
+            assert_eq!(
+                bw_template_instantiate(t, cx.0, [a, b].as_ptr(), 2, &mut e),
+                BW_ERR_UNSUPPORTED
+            );
+            bw_template_free(t);
+            bw_template_free(null_mut());
+            // Repeated parameters, and a syntax error at the first check.
+            let rep = [pa.as_ptr(), pa.as_ptr()];
+            assert_eq!(
+                bw_template_new(text.as_ptr(), rep.as_ptr(), 2, &mut t),
+                BW_ERR_UNSUPPORTED
+            );
+            let broken = cstr("a +");
+            assert_eq!(
+                bw_template_new(broken.as_ptr(), params[1..].as_ptr(), 1, &mut t),
+                BW_OK
+            );
+            assert_eq!(bw_template_check(t, [8u16].as_ptr(), 1), BW_ERR_SYNTAX);
+            bw_template_free(t);
+            assert_eq!(
+                bw_template_new(null(), params.as_ptr(), 3, &mut t),
+                BW_ERR_INVALID_ARGUMENT
+            );
+        }
+    }
+
+    /// Records what it emits as text; new values from 100.
+    unsafe extern "C" fn record(
+        user: *mut c_void,
+        cx: *const BwContext,
+        e: u64,
+        node: *const BwNode,
+        ops: *const u64,
+        n: usize,
+        value: *mut u64,
+    ) -> c_int {
+        let log = unsafe { &mut *(user as *mut Vec<String>) };
+        let node = unsafe { &*node };
+        let ops = unsafe { core::slice::from_raw_parts(ops, n) };
+        assert_eq!(n, node.n_children as usize);
+        let v = 100 + log.len() as u64;
+        let mut s = null_mut();
+        assert_eq!(unsafe { bw_print(cx, e, 0, &mut s) }, BW_OK);
+        log.push(format!("%{v} = {} {ops:?}", take(s)));
+        unsafe { value.write(v) };
+        BW_OK
+    }
+
+    unsafe extern "C" fn refuse_to_emit(
+        _: *mut c_void,
+        cx: *const BwContext,
+        _: u64,
+        _: *const BwNode,
+        _: *const u64,
+        _: usize,
+        _: *mut u64,
+    ) -> c_int {
+        // Fails the way a C host would, leaving a message.
+        let mut out = 0;
+        assert_ne!(unsafe { bw_width(cx, 0, &mut out) }, BW_OK);
+        BW_ERR_UNSUPPORTED
+    }
+
+    #[test]
+    fn lowering_and_raising() {
+        let cx = Cx::new();
+        let lw = bw_lowering_new();
+        let mut e = 0;
+        unsafe {
+            // %0 is a parameter known 16-byte aligned; %1 is read first when used.
+            let (zero, one) = (val(64, 15), val(64, 0));
+            let p = cstr("p");
+            assert_eq!(
+                bw_lowering_input(lw, cx.0, 0, 64, p.as_ptr(), &zero, &one, &mut e),
+                BW_OK
+            );
+            assert_eq!(cx.print(e), "p");
+            let mut again = 0;
+            assert_eq!(
+                bw_lowering_input(lw, cx.0, 0, 64, null(), null(), null(), &mut again),
+                BW_OK
+            );
+            assert_eq!(again, e);
+            let (mut v0, mut v1) = (0, 0);
+            assert_eq!(bw_lowering_value(lw, cx.0, 0, 64, &mut v0), BW_OK);
+            assert_eq!(bw_lowering_value(lw, cx.0, 1, 64, &mut v1), BW_OK);
+            assert_eq!(bw_lowering_value(lw, cx.0, 1, 32, &mut again), BW_ERR_WIDTH);
+            assert_eq!(cx.print(v1), "$0");
+            // %2 = and %0, %1; %3 = add %2, %0.
+            let mut v2 = 0;
+            assert_eq!(bw_bin(cx.0, 9, v0, v1, &mut v2), BW_OK);
+            assert_eq!(bw_lowering_define(lw, cx.0, 2, v2), BW_OK);
+            let mut v3 = 0;
+            assert_eq!(bw_bin(cx.0, ADD, v2, v0, &mut v3), BW_OK);
+            assert_eq!(bw_lowering_define(lw, cx.0, 3, v3), BW_OK);
+            assert!(bw_lowering_get(lw, 3, &mut e));
+            assert_eq!(e, v3);
+            assert!(!bw_lowering_get(lw, 9, &mut e));
+            let mut owner = 0;
+            assert!(bw_lowering_owner(lw, v2, &mut owner));
+            assert_eq!(owner, 2);
+            assert_eq!(bw_lowering_input_count(lw), 2);
+            let (mut v, mut s) = (0, 0);
+            assert_eq!(bw_lowering_input_at(lw, 1, &mut v, &mut s), BW_OK);
+            assert_eq!((v, s), (1, v1));
+            assert_eq!(
+                bw_lowering_input_at(lw, 2, &mut v, &mut s),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            // The declaration came with the input.
+            let (mut kz, mut ko, mut has) = (val(1, 0), val(1, 0), false);
+            assert_eq!(
+                bw_declared_known(cx.0, v0, &mut kz, &mut ko, &mut has),
+                BW_OK
+            );
+            assert!(has && kz.limbs[0] == 15);
+
+            // Raising: (%0 & %1) + %0 ^ (%0 & 5): %3 is there, the mask and the xor are new.
+            let (mut five, mut mask, mut x) = (0, 0, 0);
+            assert_eq!(bw_const_u64(cx.0, 64, 5, &mut five), BW_OK);
+            assert_eq!(bw_bin(cx.0, 9, v0, five, &mut mask), BW_OK);
+            assert_eq!(bw_bin(cx.0, XOR, v3, mask, &mut x), BW_OK);
+            let mut log: Vec<String> = Vec::new();
+            let user = &mut log as *mut Vec<String> as *mut c_void;
+            let mut out = 0;
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, x, Some(record), user, &mut out),
+                BW_OK
+            );
+            assert_eq!(out, 102);
+            assert_eq!(
+                log,
+                [
+                    "%100 = 5:64 []",
+                    "%101 = p & 5 [0, 100]",
+                    "%102 = (p & $0) + p ^ p & 5 [3, 101]",
+                ]
+            );
+            // Raised values are owned: raising again emits nothing; %3 is itself.
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, x, Some(record), user, &mut out),
+                BW_OK
+            );
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, v3, Some(record), user, &mut out),
+                BW_OK
+            );
+            assert_eq!((out, log.len()), (3, 3));
+            // A symbol no host value stands for, a failing callback, no callback.
+            let stray = cx.sym("stray", 64);
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, stray, Some(record), user, &mut out),
+                BW_ERR_UNSUPPORTED
+            );
+            let mut y = 0;
+            assert_eq!(bw_bin(cx.0, MUL, v0, v1, &mut y), BW_OK);
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, y, Some(refuse_to_emit), null_mut(), &mut out),
+                BW_ERR_UNSUPPORTED
+            );
+            assert!(
+                last_error().contains("emit callback failed with status 11: the null handle"),
+                "{}",
+                last_error()
+            );
+            assert_eq!(
+                bw_lowering_raise(lw, cx.0, y, None, null_mut(), &mut out),
+                BW_ERR_INVALID_ARGUMENT
+            );
+            assert_eq!(out, 3);
+
+            // Known bits of the wrong width, or in conflict; a foreign definition.
+            let bad = val(32, 1);
+            assert_eq!(
+                bw_lowering_input(lw, cx.0, 7, 64, null(), &bad, null(), &mut e),
+                BW_ERR_WIDTH
+            );
+            assert_eq!(
+                bw_lowering_input(lw, cx.0, 7, 64, null(), &val(64, 1), &val(64, 1), &mut e),
+                BW_ERR_VALUE
+            );
+            let other = Cx::new();
+            let foreign = other.sym("f", 64);
+            assert_eq!(
+                bw_lowering_define(lw, cx.0, 8, foreign),
+                BW_ERR_FOREIGN_EXPR
+            );
+            bw_lowering_free(lw);
+            bw_lowering_free(null_mut());
+            assert!(!bw_lowering_get(null(), 0, &mut e));
+            assert_eq!(bw_lowering_input_count(null()), 0);
+        }
     }
 }

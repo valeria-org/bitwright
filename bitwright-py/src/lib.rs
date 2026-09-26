@@ -10,12 +10,15 @@
 //! after unlocking (Python code, such as an `__index__` or a finalizer run by an allocation,
 //! could use the same context again and deadlock). A thread waits for a busy lock with the
 //! interpreter released, so a long simplification in one thread does not stall the others.
+//! The exception is a host rewrite written in Python, which the engine calls with the context
+//! locked: it works through a `Site`, and a lock it cannot take at once is an error instead of
+//! a wait (see `compiler`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 
 use bitwright::check::{CheckConfig, Verdict, check_program};
-use bitwright::engine::{Budget, Each, End, Engine, Run, Strategy};
+use bitwright::engine::{Budget, Each, End, Engine, Run, Sharing, Strategy};
 use bitwright::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::rules::{Ledger, RuleProgram};
@@ -28,6 +31,7 @@ use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyInt, PyString, PyTuple};
 
+mod compiler;
 mod more;
 
 create_exception!(
@@ -280,18 +284,28 @@ struct PyContext {
 }
 
 /// Locks `m`, waiting with the interpreter released if another thread holds it.
-fn lock<'a, T: Send>(py: Python<'_>, m: &'a Mutex<T>) -> MutexGuard<'a, T> {
+///
+/// A host rewrite runs while the engine holds the lock of the context it simplifies: a lock a
+/// rewrite cannot take at once is most likely that one, which it would wait for forever, so it
+/// is an error instead.
+fn lock<'a, T: Send>(py: Python<'_>, m: &'a Mutex<T>) -> PyResult<MutexGuard<'a, T>> {
     loop {
         match m.try_lock() {
-            Ok(g) => return g,
-            Err(TryLockError::Poisoned(p)) => return p.into_inner(),
+            Ok(g) => return Ok(g),
+            Err(TryLockError::Poisoned(p)) => return Ok(p.into_inner()),
+            Err(TryLockError::WouldBlock) if compiler::in_rewrite() => {
+                return Err(BitwrightError::new_err(
+                    "a host rewrite used a context (or assumptions) that is busy, most likely \
+                     the one being simplified: a rewrite works through its Site",
+                ));
+            }
             Err(TryLockError::WouldBlock) => py.detach(|| drop(m.lock())),
         }
     }
 }
 
 impl PyContext {
-    fn lock(&self, py: Python<'_>) -> MutexGuard<'_, Context> {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, Context>> {
         lock(py, &self.cx)
     }
 }
@@ -346,17 +360,58 @@ impl PyContext {
     }
 
     /// The number of nodes.
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.lock(py).len()
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.lock(py)?.len())
     }
 
-    fn __repr__(&self, py: Python<'_>) -> String {
-        format!("<bitwright.Context with {} nodes>", self.lock(py).len())
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "<bitwright.Context with {} nodes>",
+            self.lock(py)?.len()
+        ))
     }
 
     /// Drops every node and symbol: every expression of the context becomes stale.
-    fn clear(&self, py: Python<'_>) {
-        self.lock(py).clear();
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.lock(py)?.clear();
+        Ok(())
+    }
+
+    /// Makes room for `additional` more nodes (a host about to build a function of known
+    /// size). Nodes are still created only on demand.
+    fn reserve(&self, py: Python<'_>, additional: usize) -> PyResult<()> {
+        self.lock(py)?.reserve(additional);
+        Ok(())
+    }
+
+    /// Declares what the host knows of symbol `sym`'s value: `known` is a `(zero, one)` pair of
+    /// masks of the bits known to be 0 and to be 1 (a 16-byte aligned pointer: `(15, 0)`). The
+    /// declaration becomes part of the symbol's meaning: facts, proofs and the simplifier use
+    /// it, and a result equals its input for every value that agrees with it. `(0, 0)` removes
+    /// it. It drops the context's facts and memo, so declare right after creating the symbol.
+    fn declare_known(
+        &self,
+        py: Python<'_>,
+        sym: PyRef<'_, PyExpr>,
+        known: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        compiler::declare_known(py, self, &sym, known)
+    }
+
+    /// The `(zero, one)` masks declared for symbol `sym`, or None.
+    fn declared_known(
+        &self,
+        py: Python<'_>,
+        sym: PyRef<'_, PyExpr>,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+        let k = {
+            let c = self.lock(py)?;
+            if c.symbol_id(sym.e).or_raise()?.is_none() {
+                return Err(PyTypeError::new_err("not a symbol"));
+            }
+            c.declared_known(sym.e).or_raise()?
+        };
+        compiler::declared_pair(py, k)
     }
 
     /// The symbol `name` (a `str`, or an `int` key printed `#k`) of `width` bits; the same
@@ -364,7 +419,7 @@ impl PyContext {
     fn symbol(slf: &Bound<'_, Self>, name: &Bound<'_, PyAny>, width: u16) -> PyResult<PyExpr> {
         let key = symbol_key(name)?;
         let w = self::width(width)?;
-        let mut c = slf.get().lock(slf.py());
+        let mut c = slf.get().lock(slf.py())?;
         let e = c.symbol(key, w).or_raise()?;
         wrap(slf, &c, e)
     }
@@ -372,7 +427,7 @@ impl PyContext {
     /// Symbols named by the words of `names` (e.g. `"x y z"`), all of `width` bits.
     fn symbols(slf: &Bound<'_, Self>, names: &str, width: u16) -> PyResult<Vec<PyExpr>> {
         let w = self::width(width)?;
-        let mut c = slf.get().lock(slf.py());
+        let mut c = slf.get().lock(slf.py())?;
         names
             .split_whitespace()
             .map(|n| {
@@ -385,7 +440,7 @@ impl PyContext {
     /// A symbol distinct from every other (printed `$k`).
     fn fresh_symbol(slf: &Bound<'_, Self>, width: u16) -> PyResult<PyExpr> {
         let w = self::width(width)?;
-        let mut c = slf.get().lock(slf.py());
+        let mut c = slf.get().lock(slf.py())?;
         let e = c.fresh_symbol(w).or_raise()?;
         wrap(slf, &c, e)
     }
@@ -395,7 +450,7 @@ impl PyContext {
     #[pyo3(name = "const")]
     fn constant(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>, width: u16) -> PyResult<PyExpr> {
         let v = to_bitvec(value, self::width(width)?)?;
-        let mut c = slf.get().lock(slf.py());
+        let mut c = slf.get().lock(slf.py())?;
         let e = c.constant(&v).or_raise()?;
         wrap(slf, &c, e)
     }
@@ -408,7 +463,7 @@ impl PyContext {
             Some(w) => ParseOptions::width(self::width(w)?),
             None => ParseOptions::default(),
         };
-        let mut c = slf.get().lock(slf.py());
+        let mut c = slf.get().lock(slf.py())?;
         let e = c.parse(text, &opts).or_raise()?;
         wrap(slf, &c, e)
     }
@@ -418,7 +473,7 @@ impl PyContext {
     #[pyo3(signature = (*exprs))]
     fn to_smtlib(&self, py: Python<'_>, exprs: Vec<PyRef<'_, PyExpr>>) -> PyResult<String> {
         let roots: Vec<Expr> = exprs.iter().map(|e| e.e).collect();
-        bitwright::smtlib::export(&mut self.lock(py), &roots).or_raise()
+        bitwright::smtlib::export(&mut *self.lock(py)?, &roots).or_raise()
     }
 
     /// Reads an SMT-LIB QF_BV script, floating-point (QF_BVFP) terms included, into this
@@ -426,7 +481,7 @@ impl PyContext {
     fn from_smtlib(slf: &Bound<'_, Self>, script: &str) -> PyResult<SmtScript> {
         let py = slf.py();
         let (symbols, definitions, assertions) = {
-            let mut c = slf.get().lock(py);
+            let mut c = slf.get().lock(py)?;
             let imp = bitwright::smtlib::import(&mut c, script).or_raise()?;
             let named = |v: Vec<(String, Expr)>| -> PyResult<Vec<(String, PyExpr)>> {
                 v.into_iter()
@@ -475,6 +530,36 @@ struct SmtScript {
 /// An expression: a node of a context. Immutable and hashable; `==` is identity (hash-consing
 /// makes structurally equal expressions one node). Comparisons that build a 1-bit expression
 /// are methods (`eq`, `ult`, `slt`, ...), since `<` could be signed or unsigned.
+/// A node's kind, as `Expr.kind` names it.
+fn kind_name(v: &View) -> &'static str {
+    match v {
+        View::Const(_) => "const",
+        View::Sym(_) => "symbol",
+        View::Un(..) => "unary",
+        View::Bin(..) => "binary",
+        View::Cmp(..) => "compare",
+        View::Zext(_) => "zext",
+        View::Sext(_) => "sext",
+        View::Extract { .. } => "extract",
+        View::Concat { .. } => "concat",
+        View::Select { .. } => "select",
+        View::Ext { .. } => "ext",
+        View::Fp { .. } => "fp",
+        _ => "other",
+    }
+}
+
+/// A node's operator, as `Expr.op` names it.
+fn op_name(v: &View) -> Option<String> {
+    match v {
+        View::Un(op, _) => Some(op.name().to_string()),
+        View::Bin(op, ..) => Some(op.name().to_string()),
+        View::Cmp(op, ..) => Some(format!("{op:?}").to_lowercase()),
+        View::Fp { op, .. } => fp_name(*op).map(str::to_string),
+        _ => None,
+    }
+}
+
 #[pyclass(frozen, skip_from_py_object, name = "Expr", module = "bitwright")]
 #[derive(Debug)]
 struct PyExpr {
@@ -508,7 +593,7 @@ impl PyExpr {
         f: impl FnOnce(&mut Context) -> Result<Expr, Error>,
     ) -> PyResult<PyExpr> {
         let cx = self.cx.bind(py);
-        let mut c = cx.get().lock(py);
+        let mut c = cx.get().lock(py)?;
         let e = f(&mut c).or_raise()?;
         wrap(cx, &c, e)
     }
@@ -519,7 +604,7 @@ impl PyExpr {
             Operand::Expr(e) => Ok(e.e),
             Operand::Int(i) => {
                 let v = to_bitvec(i.as_any(), width(self.width)?)?;
-                self.cx.bind(py).get().lock(py).constant(&v).or_raise()
+                self.cx.bind(py).get().lock(py)?.constant(&v).or_raise()
             }
         }
     }
@@ -592,7 +677,7 @@ impl PyExpr {
             }
         }
         let resolved = {
-            let c = self.cx.bind(py).get().lock(py);
+            let c = self.cx.bind(py).get().lock(py)?;
             let mut resolved = Vec::with_capacity(pending.len());
             for (key, v) in pending {
                 let symbol = match key {
@@ -646,43 +731,23 @@ impl PyExpr {
     /// `"sext"`, `"extract"`, `"concat"`, `"select"`, `"ext"` or `"fp"`.
     #[getter]
     fn kind(&self, py: Python<'_>) -> PyResult<&'static str> {
-        let c = self.cx.bind(py).get().lock(py);
-        Ok(match c.view(self.e).or_raise()? {
-            View::Const(_) => "const",
-            View::Sym(_) => "symbol",
-            View::Un(..) => "unary",
-            View::Bin(..) => "binary",
-            View::Cmp(..) => "compare",
-            View::Zext(_) => "zext",
-            View::Sext(_) => "sext",
-            View::Extract { .. } => "extract",
-            View::Concat { .. } => "concat",
-            View::Select { .. } => "select",
-            View::Ext { .. } => "ext",
-            View::Fp { .. } => "fp",
-            _ => "other",
-        })
+        let c = self.cx.bind(py).get().lock(py)?;
+        Ok(kind_name(&c.view(self.e).or_raise()?))
     }
 
     /// The operator of a unary, binary, comparison or floating-point node (`"add"`, `"ult"`,
     /// `"sqrt"`, ...: a floating-point operation as the text syntax names it), else None.
     #[getter]
     fn op(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let c = self.cx.bind(py).get().lock(py);
-        Ok(match c.view(self.e).or_raise()? {
-            View::Un(op, _) => Some(op.name().to_string()),
-            View::Bin(op, ..) => Some(op.name().to_string()),
-            View::Cmp(op, ..) => Some(format!("{op:?}").to_lowercase()),
-            View::Fp { op, .. } => fp_name(op).map(str::to_string),
-            _ => None,
-        })
+        let c = self.cx.bind(py).get().lock(py)?;
+        Ok(op_name(&c.view(self.e).or_raise()?))
     }
 
     /// The format of a floating-point node's operands (for `"from_sbv"` and `"from_ubv"`, of its
     /// result), else None.
     #[getter]
     fn format(&self, py: Python<'_>) -> PyResult<Option<PyFpFormat>> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         Ok(match c.view(self.e).or_raise()? {
             View::Fp { format, .. } => Some(PyFpFormat { f: format }),
             _ => None,
@@ -692,7 +757,7 @@ impl PyExpr {
     /// The result's format of a conversion between formats (`"convert"`), else None.
     #[getter]
     fn to_format(&self, py: Python<'_>) -> PyResult<Option<PyFpFormat>> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         Ok(match c.view(self.e).or_raise()? {
             View::Fp {
                 op: FpOp::Convert { to, .. },
@@ -707,7 +772,7 @@ impl PyExpr {
     /// the comparisons).
     #[getter]
     fn rounding(&self, py: Python<'_>) -> PyResult<Option<&'static str>> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         Ok(match c.view(self.e).or_raise()? {
             View::Fp { op, .. } => op.rounding_mode().map(RoundingMode::name),
             _ => None,
@@ -718,7 +783,7 @@ impl PyExpr {
     #[getter]
     fn children(&self, py: Python<'_>) -> PyResult<Vec<PyExpr>> {
         let cx = self.cx.bind(py);
-        let c = cx.get().lock(py);
+        let c = cx.get().lock(py)?;
         let kids: Vec<Expr> = c.children(self.e).or_raise()?.collect();
         kids.into_iter().map(|e| wrap(cx, &c, e)).collect()
     }
@@ -730,7 +795,7 @@ impl PyExpr {
             .cx
             .bind(py)
             .get()
-            .lock(py)
+            .lock(py)?
             .as_const(self.e)
             .or_raise()?;
         v.map(|v| to_int(py, &v)).transpose()
@@ -743,7 +808,7 @@ impl PyExpr {
             .cx
             .bind(py)
             .get()
-            .lock(py)
+            .lock(py)?
             .as_const(self.e)
             .or_raise()?;
         v.map(|v| to_signed_int(py, &v)).transpose()
@@ -752,7 +817,7 @@ impl PyExpr {
     /// The name of a symbol (`#k` for an integer key, `$k` for a fresh symbol), else None.
     #[getter]
     fn name(&self, py: Python<'_>) -> PyResult<Option<String>> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         let id = c.symbol_id(self.e).or_raise()?;
         Ok(id.and_then(|id| c.symbol_key(id)).map(key_name))
     }
@@ -760,7 +825,7 @@ impl PyExpr {
     /// The first bit of an extract (the output of an extension call), else None.
     #[getter]
     fn lo(&self, py: Python<'_>) -> PyResult<Option<u16>> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         Ok(match c.view(self.e).or_raise()? {
             View::Extract { lo, .. } => Some(lo),
             View::Ext { output, .. } => Some(u16::from(output)),
@@ -770,7 +835,7 @@ impl PyExpr {
 
     /// The number of distinct nodes under this one, itself included.
     fn dag_size(&self, py: Python<'_>) -> PyResult<u32> {
-        let mut c = self.cx.bind(py).get().lock(py);
+        let mut c = self.cx.bind(py).get().lock(py)?;
         Ok(match c.dag_size(&[self.e], u32::MAX - 1).or_raise()? {
             Bounded::Exact(n) | Bounded::AtLeast(n) => n,
             _ => u32::MAX,
@@ -781,7 +846,7 @@ impl PyExpr {
     /// `symbol_widths` annotates symbols with their widths (`x:64`).
     #[pyo3(signature = (*, lets = true, symbol_widths = false))]
     fn to_string(&self, py: Python<'_>, lets: bool, symbol_widths: bool) -> PyResult<String> {
-        let c = self.cx.bind(py).get().lock(py);
+        let c = self.cx.bind(py).get().lock(py)?;
         c.width(self.e).or_raise()?;
         let opts = PrintOptions::default()
             .with_lets(lets)
@@ -1034,7 +1099,7 @@ impl PyExpr {
                 Operand::Expr(e) => Ok(e.e),
                 Operand::Int(i) => {
                     let v = to_bitvec(i.as_any(), width(w)?)?;
-                    self.cx.bind(py).get().lock(py).constant(&v).or_raise()
+                    self.cx.bind(py).get().lock(py)?.constant(&v).or_raise()
                 }
             }
         };
@@ -1246,7 +1311,7 @@ impl PyExpr {
             .cx
             .bind(py)
             .get()
-            .lock(py)
+            .lock(py)?
             .eval(&[self.e], &env)
             .or_raise()?;
         to_int(py, &v[0])
@@ -1274,34 +1339,18 @@ impl PyExpr {
     #[pyo3(signature = (assumptions = None))]
     fn facts(&self, py: Python<'_>, assumptions: Option<&PyAssumptions>) -> PyResult<Facts> {
         let (f, r) = {
-            let mut c = self.cx.bind(py).get().lock(py);
+            let mut c = self.cx.bind(py).get().lock(py)?;
             match assumptions {
                 None => (c.facts(self.e).or_raise()?, Reliance::NONE),
                 Some(a) => c
-                    .facts_under(self.e, &a.lock(py))
+                    .facts_under(self.e, &*a.lock(py)?)
                     .or_raise()?
                     .ok_or_else(|| {
                         BitwrightError::new_err("the assumptions contradict each other")
                     })?,
             }
         };
-        let (k, u, s) = (f.known(), f.urange(), f.srange());
-        Ok(Facts {
-            width: self.width,
-            known_zero: to_int(py, &k.known_zero())?.unbind(),
-            known_one: to_int(py, &k.known_one())?.unbind(),
-            umin: to_int(py, &u.lo())?.unbind(),
-            umax: to_int(py, &u.hi())?.unbind(),
-            ustride: u.stride(),
-            smin: to_signed_int(py, &s.lo())?.unbind(),
-            smax: to_signed_int(py, &s.hi())?.unbind(),
-            constant: f
-                .as_constant()
-                .map(|v| to_int(py, &v))
-                .transpose()?
-                .map(Bound::unbind),
-            relies_on: reliance(py, r)?.unbind(),
-        })
+        py_facts(py, &f, self.width, r)
     }
 
     /// Whether the expression is nonzero (for a 1-bit predicate: whether it holds): True, False,
@@ -1346,6 +1395,7 @@ impl PyExpr {
         };
         Ok(
             run(py, engine, &[self], Budget::default(), None, None, None)?
+                .0
                 .remove(0)
                 .expr,
         )
@@ -1384,15 +1434,36 @@ fn prove(
     q: Query<'_>,
     assumptions: Option<&PyAssumptions>,
 ) -> PyResult<Option<bool>> {
-    let mut c = cx.bind(py).get().lock(py);
+    let mut c = cx.bind(py).get().lock(py)?;
     let t = match assumptions {
         None => c.prove(q),
-        Some(a) => c.prove_with(q, &a.lock(py)),
+        Some(a) => c.prove_with(q, &*a.lock(py)?),
     };
     Ok(truth(t.or_raise()?))
 }
 
 // ----- facts and assumptions -----------------------------------------------------------------
+
+/// Facts of a `width`-bit value as Python sees them.
+fn py_facts(py: Python<'_>, f: &bitwright::Facts, width: u16, r: Reliance) -> PyResult<Facts> {
+    let (k, u, s) = (f.known(), f.urange(), f.srange());
+    Ok(Facts {
+        width,
+        known_zero: to_int(py, &k.known_zero())?.unbind(),
+        known_one: to_int(py, &k.known_one())?.unbind(),
+        umin: to_int(py, &u.lo())?.unbind(),
+        umax: to_int(py, &u.hi())?.unbind(),
+        ustride: u.stride(),
+        smin: to_signed_int(py, &s.lo())?.unbind(),
+        smax: to_signed_int(py, &s.hi())?.unbind(),
+        constant: f
+            .as_constant()
+            .map(|v| to_int(py, &v))
+            .transpose()?
+            .map(Bound::unbind),
+        relies_on: reliance(py, r)?.unbind(),
+    })
+}
 
 /// What is known about every value of an expression.
 #[pyclass(frozen, module = "bitwright")]
@@ -1463,7 +1534,7 @@ struct PyAssumptions {
 }
 
 impl PyAssumptions {
-    fn lock(&self, py: Python<'_>) -> MutexGuard<'_, Assumptions> {
+    fn lock(&self, py: Python<'_>) -> PyResult<MutexGuard<'_, Assumptions>> {
         lock(py, &self.a)
     }
 }
@@ -1485,8 +1556,8 @@ impl PyAssumptions {
     /// A contradiction is not an error: it makes the set infeasible.
     #[pyo3(signature = (predicate, holds = true))]
     fn assume(&self, py: Python<'_>, predicate: PyRef<'_, PyExpr>, holds: bool) -> PyResult<u32> {
-        let mut c = predicate.cx.bind(py).get().lock(py);
-        let mut a = self.lock(py);
+        let mut c = predicate.cx.bind(py).get().lock(py)?;
+        let mut a = self.lock(py)?;
         let id = if holds {
             a.assume_true(&mut c, predicate.e)
         } else {
@@ -1497,17 +1568,17 @@ impl PyAssumptions {
 
     /// Whether the constraints contradict each other.
     #[getter]
-    fn infeasible(&self, py: Python<'_>) -> bool {
-        self.lock(py).is_infeasible()
+    fn infeasible(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.lock(py)?.is_infeasible())
     }
 
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.lock(py).len()
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.lock(py)?.len())
     }
 
-    fn __repr__(&self, py: Python<'_>) -> String {
-        let a = self.lock(py);
-        format!(
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let a = self.lock(py)?;
+        Ok(format!(
             "<bitwright.Assumptions: {} constraints{}>",
             a.len(),
             if a.is_infeasible() {
@@ -1515,7 +1586,7 @@ impl PyAssumptions {
             } else {
                 ""
             }
-        )
+        ))
     }
 }
 
@@ -1664,11 +1735,11 @@ fn run(
     assumptions: Option<&PyAssumptions>,
     trace: Option<&mut Trace>,
     threads: Option<usize>,
-) -> PyResult<Vec<Outcome>> {
+) -> PyResult<(Vec<Outcome>, bitwright::engine::Stats)> {
     let refuse = Refuse(&engine.refuse);
     let engine = &engine.engine;
     let Some(first) = exprs.first() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Default::default()));
     };
     let cx = first.cx.bind(py);
     let roots: Vec<Expr> = exprs.iter().map(|e| e.e).collect();
@@ -1701,13 +1772,14 @@ fn run(
         })
         .or_raise()?;
     let exprs = {
-        let c = pycx.lock(py);
+        let c = pycx.lock(py)?;
         out.roots
             .iter()
             .map(|r| wrap(cx, &c, r.expr))
             .collect::<PyResult<Vec<_>>>()?
     };
-    out.roots
+    let outcomes = out
+        .roots
         .iter()
         .zip(exprs)
         .map(|(r, expr)| {
@@ -1724,7 +1796,22 @@ fn run(
                 relies_on: reliance(py, r.relies_on)?.unbind(),
             })
         })
-        .collect()
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok((outcomes, out.stats))
+}
+
+/// Outcomes, and with `stats`, the call's counters too.
+fn with_stats(
+    py: Python<'_>,
+    (outcomes, stats): (Vec<Outcome>, bitwright::engine::Stats),
+    want: bool,
+) -> PyResult<Py<PyAny>> {
+    if want {
+        let stats = Py::new(py, compiler::RunStats::from(&stats))?;
+        Ok((outcomes, stats).into_pyobject(py)?.into_any().unbind())
+    } else {
+        Ok(outcomes.into_pyobject(py)?.into_any().unbind())
+    }
 }
 
 /// A rule file's source, and the proof ledger vouching for its rules (None: check them now).
@@ -1756,57 +1843,104 @@ fn compile(source: &str) -> PyResult<RuleProgram> {
 /// The engine of a preset without rules of its own, built once per process.
 fn preset(name: &str) -> PyResult<Engine> {
     static DEOBFUSCATE: OnceLock<Engine> = OnceLock::new();
-    match name {
-        "standard" => Ok(Engine::standard()),
-        "deobfuscate" => Ok(DEOBFUSCATE
-            .get_or_init(|| {
-                build(false, Vec::new(), None, false).expect("the deobfuscation engine links")
-            })
-            .clone()),
-        other => Err(PyValueError::new_err(format!(
-            "unknown preset {other:?} (\"standard\" or \"deobfuscate\")"
-        ))),
+    static COMPILE: OnceLock<Engine> = OnceLock::new();
+    let cell = match name {
+        "standard" => return Ok(Engine::standard()),
+        "deobfuscate" => &DEOBFUSCATE,
+        "compile" => &COMPILE,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown preset {other:?} (\"standard\", \"deobfuscate\" or \"compile\")"
+            )));
+        }
+    };
+    Ok(cell
+        .get_or_init(|| {
+            build(name, Vec::new(), &Options::default()).expect("a preset engine links")
+        })
+        .clone())
+}
+
+/// What an engine adds to its preset.
+#[derive(Default)]
+struct Options {
+    max_rounds: Option<u8>,
+    float_values: bool,
+    sharing: Option<Sharing>,
+    max_region: Option<u32>,
+    /// Host rewrites, each with whether it is trusted.
+    rewrites: Vec<(Arc<compiler::PyHostRewrite>, bool)>,
+}
+
+impl Options {
+    fn is_plain(&self) -> bool {
+        self.max_rounds.is_none()
+            && !self.float_values
+            && self.sharing.is_none()
+            && self.max_region.is_none()
+            && self.rewrites.is_empty()
     }
 }
 
-/// An engine: the standard or deobfuscation strategy, with the rules of `programs`.
+/// An engine: the strategy of a preset (a name `preset` checked), with the rules of `programs`
+/// and `options`.
 fn build(
-    standard: bool,
+    preset: &str,
     programs: Vec<(RuleProgram, Ledger)>,
-    max_rounds: Option<u8>,
-    float_values: bool,
+    options: &Options,
 ) -> PyResult<Engine> {
     let mut b = Engine::builder().builtin();
-    let mut strategy = if standard {
-        Strategy::standard()
-    } else {
-        // The command line's `simplify`: the MBA service with the native solver, on
-        // bitwright's own evidence only.
-        b = b.mba_solver(Arc::new(NormalFormSolver::default()));
-        let trust = MbaTrust::default().with_backend_certificates(false);
-        Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
+    let mut strategy = match preset {
+        "deobfuscate" => {
+            // The command line's `simplify`: the MBA service with the native solver, on
+            // bitwright's own evidence only.
+            b = b.mba_solver(Arc::new(NormalFormSolver::default()));
+            let trust = MbaTrust::default().with_backend_certificates(false);
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
+        }
+        "compile" => Strategy::compile(),
+        _ => Strategy::standard(),
     };
-    let mut groups = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
     for (program, ledger) in programs {
         groups.extend(program.groups().iter().map(|g| g.name.clone()));
         b = b.program(program, &ledger);
+    }
+    for (r, trusted) in &options.rewrites {
+        let group = bitwright::engine::Rewrite::group(&**r);
+        if !groups.iter().any(|g| g == group) {
+            groups.push(group.to_string());
+        }
+        let r: Arc<dyn bitwright::engine::Rewrite> = r.clone();
+        b = if *trusted {
+            b.trusted_rewrite(r)
+        } else {
+            b.rewrite(r).allow_unproven(true)
+        };
     }
     if !groups.is_empty() {
         let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
         strategy = strategy.with_rule_groups(&groups);
     }
-    if let Some(n) = max_rounds {
+    if let Some(n) = options.max_rounds {
         strategy = strategy.with_max_rounds(n);
     }
-    strategy = strategy.with_float_values(float_values);
+    if let Some(s) = options.sharing {
+        strategy = strategy.with_sharing(s);
+    }
+    if let Some(n) = options.max_region {
+        strategy = strategy.with_max_region(n);
+    }
+    strategy = strategy.with_float_values(options.float_values);
     b.strategy(strategy)
         .build()
         .map_err(|e| RuleError::new_err(e.to_string()))
 }
 
-/// A simplifier: `"standard"` (fact folding, the built-in rules, the normal-form passes) or
+/// A simplifier: `"standard"` (fact folding, the built-in rules, the normal-form passes),
 /// `"deobfuscate"` (also linear MBA, bit shuffles, and the MBA service with the native solver:
-/// the command line's `simplify`), with rule files of your own. Immutable; shared freely.
+/// the command line's `simplify`) or `"compile"` (for a compiler, which simplifies every value
+/// of every function), with rule files and host rewrites of your own. Immutable; shared freely.
 #[pyclass(frozen, name = "Engine", module = "bitwright")]
 #[derive(Debug)]
 struct PyEngine {
@@ -1855,25 +1989,49 @@ impl PyEngine {
     /// `float_values` also applies the rules that hold for floats as values (every NaN one
     /// value); `refuse` names rules (`group::rule`) and passes (`linear`, …) whose rewrites are
     /// refused.
+    ///
+    /// `sharing` (`"roots"` or `"ignored"`) and `max_region` set how the normal-form passes
+    /// weigh sharing and how far below a node they look (the `"compile"` preset: `"ignored"`
+    /// and 64). `rewrites` are host rewrites (`Rewrite`), each application compared with the
+    /// node at sampled points; `trusted_rewrites` are not sampled (after `check_rewrite`, say).
+    /// Their groups run in every rule phase.
     #[new]
-    #[pyo3(signature = (preset = "standard", *, rules = Vec::new(), max_rounds = None, float_values = false, refuse = Vec::new()))]
+    #[pyo3(signature = (preset = "standard", *, rules = Vec::new(), max_rounds = None, float_values = false, refuse = Vec::new(), sharing = None, max_region = None, rewrites = Vec::new(), trusted_rewrites = Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         preset: &str,
         rules: Vec<Rules>,
         max_rounds: Option<u8>,
         float_values: bool,
         refuse: Vec<String>,
+        sharing: Option<&str>,
+        max_region: Option<u32>,
+        rewrites: Vec<PyRef<'_, compiler::PyRewrite>>,
+        trusted_rewrites: Vec<PyRef<'_, compiler::PyRewrite>>,
     ) -> PyResult<Self> {
-        let standard = match preset {
-            "standard" => true,
-            "deobfuscate" => false,
-            other => {
+        self::preset(preset)?;
+        let sharing = match sharing {
+            None => None,
+            Some("roots") => Some(Sharing::Roots),
+            Some("ignored") => Some(Sharing::Ignored),
+            Some(other) => {
                 return Err(PyValueError::new_err(format!(
-                    "unknown preset {other:?} (\"standard\" or \"deobfuscate\")"
+                    "unknown sharing {other:?} (\"roots\" or \"ignored\")"
                 )));
             }
         };
-        if rules.is_empty() && max_rounds.is_none() && !float_values {
+        let options = Options {
+            max_rounds,
+            float_values,
+            sharing,
+            max_region,
+            rewrites: rewrites
+                .iter()
+                .map(|r| (r.r.clone(), false))
+                .chain(trusted_rewrites.iter().map(|r| (r.r.clone(), true)))
+                .collect(),
+        };
+        if rules.is_empty() && options.is_plain() {
             return Ok(PyEngine {
                 engine: self::preset(preset)?,
                 refuse,
@@ -1895,7 +2053,7 @@ impl PyEngine {
             programs.push((program, ledger));
         }
         Ok(PyEngine {
-            engine: build(standard, programs, max_rounds, float_values)?,
+            engine: build(preset, programs, &options)?,
             refuse,
         })
     }
@@ -1918,6 +2076,18 @@ impl PyEngine {
         })
     }
 
+    /// The engine for a compiler: the standard phases without the demanded-bits pass, one
+    /// round, the passes deciding as if each node were alone over at most 64 nodes. Every
+    /// result is final and memoized, so simplifying every value of a function costs time in
+    /// proportion to its size.
+    #[staticmethod]
+    fn compile() -> PyResult<Self> {
+        Ok(PyEngine {
+            engine: preset("compile")?,
+            refuse: Vec::new(),
+        })
+    }
+
     /// The expression simplified: equal to it everywhere, or wherever `assumptions` hold.
     #[pyo3(signature = (expr, *, budget = None, assumptions = None))]
     fn simplify(
@@ -1929,6 +2099,7 @@ impl PyEngine {
     ) -> PyResult<PyExpr> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         Ok(run(py, self, &[&expr], budget, assumptions, None, None)?
+            .0
             .remove(0)
             .expr)
     }
@@ -1953,10 +2124,11 @@ impl PyEngine {
             Some(&mut trace),
             None,
         )?
+        .0
         .remove(0)
         .expr;
         let cx = expr.cx.bind(py);
-        let c = cx.get().lock(py);
+        let c = cx.get().lock(py)?;
         let steps = trace
             .0
             .iter()
@@ -1965,24 +2137,28 @@ impl PyEngine {
         Ok((out, steps))
     }
 
-    /// Simplifies expressions of one context in one call (they share work); an `Outcome` each.
-    #[pyo3(signature = (exprs, *, budget = None, assumptions = None))]
+    /// Simplifies expressions of one context in one call (they share work); an `Outcome` each,
+    /// and with `stats`, the call's counters too: `(outcomes, Stats)`.
+    #[pyo3(signature = (exprs, *, budget = None, assumptions = None, stats = false))]
     fn run(
         &self,
         py: Python<'_>,
         exprs: Vec<PyRef<'_, PyExpr>>,
         budget: Option<&PyBudget>,
         assumptions: Option<&PyAssumptions>,
-    ) -> PyResult<Vec<Outcome>> {
+        stats: bool,
+    ) -> PyResult<Py<PyAny>> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let refs: Vec<&PyExpr> = exprs.iter().map(|e| &**e).collect();
-        run(py, self, &refs, budget, assumptions, None, None)
+        let out = run(py, self, &refs, budget, assumptions, None, None)?;
+        with_stats(py, out, stats)
     }
 
     /// Simplifies expressions of one context each on its own, as `run` would with that one
     /// alone, on up to `threads` threads (0: as many as the machine runs at once), with the
-    /// interpreter released; an `Outcome` each. `budget` caps each expression.
-    #[pyo3(signature = (exprs, *, threads = 0, budget = None, assumptions = None))]
+    /// interpreter released; an `Outcome` each (and with `stats`, the counters of all:
+    /// `(outcomes, Stats)`). `budget` caps each expression.
+    #[pyo3(signature = (exprs, *, threads = 0, budget = None, assumptions = None, stats = false))]
     fn run_each(
         &self,
         py: Python<'_>,
@@ -1990,10 +2166,12 @@ impl PyEngine {
         threads: usize,
         budget: Option<&PyBudget>,
         assumptions: Option<&PyAssumptions>,
-    ) -> PyResult<Vec<Outcome>> {
+        stats: bool,
+    ) -> PyResult<Py<PyAny>> {
         let budget = budget.map_or_else(Budget::default, |b| b.b);
         let refs: Vec<&PyExpr> = exprs.iter().map(|e| &**e).collect();
-        run(py, self, &refs, budget, assumptions, None, Some(threads))
+        let out = run(py, self, &refs, budget, assumptions, None, Some(threads))?;
+        with_stats(py, out, stats)
     }
 
     fn __repr__(&self) -> String {
@@ -2077,5 +2255,14 @@ fn _bitwright(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(more::verify_transforms, m)?)?;
     m.add_function(wrap_pyfunction!(more::validate_functions, m)?)?;
     m.add_function(wrap_pyfunction!(more::infer_preconditions, m)?)?;
+    m.add_class::<compiler::PyRewrite>()?;
+    m.add_class::<compiler::PySite>()?;
+    m.add_class::<compiler::RewriteReport>()?;
+    m.add_class::<compiler::RewriteFailureInfo>()?;
+    m.add_class::<compiler::RunStats>()?;
+    m.add_class::<compiler::PassStats>()?;
+    m.add_class::<compiler::PyTemplate>()?;
+    m.add_class::<compiler::PyLowering>()?;
+    m.add_function(wrap_pyfunction!(compiler::check_rewrite, m)?)?;
     Ok(())
 }

@@ -19,7 +19,7 @@
  *   `BW_ERR_STALE_EXPR`); it never refers to another node.
  * - Threads: a context and an assumption set may be used from one thread at a time. An engine
  *   is immutable once built and may be shared by any number of threads, each with its own
- *   context.
+ *   context; the host rewrites linked into it are then called from those threads.
  * - Enumerations are passed as `int`; their values are fixed and never renumbered.
  */
 #ifndef BITWRIGHT_H
@@ -204,6 +204,10 @@ void bw_context_clear(bw_context *cx);
 /* The number of nodes. */
 size_t bw_context_len(const bw_context *cx);
 
+/* Makes room for `additional` more nodes without reallocating (a host that knows the size of the
+ * function it is about to build). Nodes are still created only on demand. */
+void bw_context_reserve(bw_context *cx, size_t additional);
+
 /* ----- building ---------------------------------------------------------------------------- */
 
 /* Every constructor canonicalizes: structurally equal expressions are one node (the same
@@ -217,6 +221,24 @@ bw_status bw_symbol_u64(bw_context *cx, uint64_t key, uint16_t width, bw_expr *o
 
 /* A symbol distinct from every other (printed `$k`). */
 bw_status bw_fresh_symbol(bw_context *cx, uint16_t width, bw_expr *out);
+
+/* Declares what the host knows of the value of symbol `sym`: the bits set in `zero` are 0 and
+ * the bits set in `one` are 1 (a 16-byte aligned pointer: `zero` = 15). The declaration becomes
+ * part of the symbol's meaning: facts, proofs and the simplifier use it, and a result equals its
+ * input for every value that agrees with it. Both masks 0 remove it. It drops the context's facts
+ * and simplification memo, so declare right after creating the symbol. For symbols of at most 64
+ * bits (BW_ERR_WIDTH otherwise; see bw_declare_known_value). BW_ERR_INVALID_ARGUMENT if `sym` is
+ * not a symbol, BW_ERR_VALUE if a bit is in both masks or above the symbol's width. */
+bw_status bw_declare_known(bw_context *cx, bw_expr sym, uint64_t zero, uint64_t one);
+
+/* bw_declare_known at any width: `zero` and `one` have the symbol's width. */
+bw_status bw_declare_known_value(bw_context *cx, bw_expr sym, const bw_value *zero,
+                                 const bw_value *one);
+
+/* The known bits declared for symbol `sym`: `*has` is false, and both masks are 0, when there is
+ * no declaration. */
+bw_status bw_declared_known(const bw_context *cx, bw_expr sym, bw_value *zero, bw_value *one,
+                            bool *has);
 
 bw_status bw_const(bw_context *cx, const bw_value *v, bw_expr *out);
 
@@ -516,7 +538,13 @@ typedef enum bw_preset {
     /* The standard strategy, the linear MBA and bit-shuffle passes, and the MBA service with the
      * native solver, accepting only answers bitwright proves itself (the command line's
      * `simplify`). */
-    BW_PRESET_DEOBFUSCATE = 1
+    BW_PRESET_DEOBFUSCATE = 1,
+    /* For a compiler, which simplifies every value of every function: the standard phases
+     * without the demanded-bits pass, one round, the passes deciding as if each node were alone
+     * (BW_SHARING_IGNORED) over at most 64 nodes. Every result is final and memoized, so a call
+     * over every value of a function costs time in proportion to its size. Results can be larger
+     * than BW_PRESET_STANDARD's where values share subterms. */
+    BW_PRESET_COMPILE = 2
 } bw_preset;
 
 /* An engine with a preset strategy. NULL on failure (see bw_last_error). */
@@ -542,6 +570,27 @@ void bw_engine_builder_set_float_values(bw_engine_builder *b, bool yes);
 
 /* Refuses every rewrite of the rule (`group::rule`) or pass (`linear`, `xor`, …) named. */
 bw_status bw_engine_builder_refuse(bw_engine_builder *b, const char *name);
+
+/* How the normal-form passes weigh sharing when they decide whether a rewrite makes the DAG
+ * smaller. */
+typedef enum bw_sharing {
+    /* Against the DAG of every root of the call: a node another root still uses is not freed by
+     * rewriting its user. The smallest results, but a decision depends on which roots a call
+     * has, so it is made again for every root and not memoized (the default of the standard and
+     * deobfuscation presets). */
+    BW_SHARING_ROOTS = 0,
+    /* As if the region below each node were used by that node alone: every result is final and
+     * memoized, each node decided once per context (BW_PRESET_COMPILE's). For hosts that keep
+     * their own use counts. */
+    BW_SHARING_IGNORED = 1
+} bw_sharing;
+
+bw_status bw_engine_builder_set_sharing(bw_engine_builder *b, int sharing /* bw_sharing */);
+
+/* The most nodes the passes' commit rule examines below a node and in a candidate: their work
+ * per node (default 1024; BW_PRESET_COMPILE: 64; 0 reads as 1). A region cut short counts fewer
+ * nodes freed, so fewer rewrites commit; never a wrong one. */
+void bw_engine_builder_set_max_region(bw_engine_builder *b, uint32_t n);
 
 /* The engine. The builder stays valid and may build again. */
 bw_status bw_engine_builder_build(const bw_engine_builder *b, bw_engine **out);
@@ -615,6 +664,49 @@ bw_status bw_engine_run(const bw_engine *engine, bw_context *cx, const bw_expr *
 bw_status bw_engine_run_each(const bw_engine *engine, bw_context *cx, const bw_expr *roots,
                              size_t n, size_t threads, const bw_budget *budget,
                              const bw_assumptions *a, bw_outcome *outcomes);
+
+/* Counters of one pass, or of the host rewrites together. */
+typedef struct bw_pass_counts {
+    uint64_t calls;         /* nodes considered */
+    uint64_t noop;          /* results equal to the node */
+    uint64_t changed;       /* nodes replaced */
+    uint64_t rejected_cost; /* results that would not make the DAG smaller (host rewrites: not
+                               smaller in the termination order) */
+    uint64_t rejected;      /* results rejected by a postcondition or vetoed */
+    uint64_t atomized;      /* regions over the size cap, treated as atoms */
+} bw_pass_counts;
+
+/* Counters of one call. Always collected; no-op work is counted like useful work. */
+typedef struct bw_stats {
+    uint64_t node_visits;
+    uint64_t memo_hits;   /* nodes answered from the context's memo */
+    uint64_t candidates;  /* rules tried after the dispatch prefilter */
+    uint64_t match_steps;
+    uint64_t no_match;    /* candidates whose pattern did not match */
+    uint64_t guard_false; /* candidates that matched but whose guard did not hold */
+    uint64_t degraded;    /* candidates and pass steps declined for lack of work or facts */
+    uint64_t no_change;   /* candidates that produced the node itself */
+    uint64_t rewrites;    /* rewrites committed */
+    uint64_t hook_vetoes; /* rewrites refused (bw_engine_builder_refuse) */
+    uint64_t rejected;    /* rewrites rejected by a postcondition */
+    uint64_t cycles_cut;
+    uint64_t quarantined; /* rules and host rewrites quarantined for the rest of the call */
+    uint64_t new_nodes;
+    uint64_t fact_work;
+    uint64_t pass_work;
+    uint32_t rounds;
+    bw_pass_counts host; /* the host rewrites (bw_engine_builder_add_rewrite) */
+} bw_stats;
+
+/* bw_engine_run and bw_engine_run_each, also writing the call's counters to `*stats` (which may
+ * be NULL). */
+bw_status bw_engine_run_stats(const bw_engine *engine, bw_context *cx, const bw_expr *roots,
+                              size_t n, const bw_budget *budget, const bw_assumptions *a,
+                              bw_outcome *outcomes, bw_stats *stats);
+bw_status bw_engine_run_each_stats(const bw_engine *engine, bw_context *cx, const bw_expr *roots,
+                                   size_t n, size_t threads, const bw_budget *budget,
+                                   const bw_assumptions *a, bw_outcome *outcomes,
+                                   bw_stats *stats);
 
 /* ----- SMT-LIB ----------------------------------------------------------------------------- */
 
@@ -735,6 +827,222 @@ bw_status bw_transform_validate(const char *src, const char *tgt, uint64_t confl
 /* Infers each transformation's precondition over its symbolic constants: one line each, `name
  * TAB precondition-or-(none) TAB valid|invalid|undecided|-`. */
 bw_status bw_transform_infer(const char *text, char **report);
+
+/* ----- in a compiler ------------------------------------------------------------------------ */
+
+/* A compiler lowers its IR into expressions (declaring what it knows of values defined elsewhere
+ * with bw_declare_known), simplifies every value with BW_PRESET_COMPILE, and raises results back
+ * into instructions. It may add rewrites of its own, written in C, that the rule language cannot
+ * say. The book's chapter "In a compiler" describes the Rust API these mirror. */
+
+/* ----- host rewrites */
+
+/* What a rewrite callback may do at a node: inspect nodes, ask for their facts, build nodes. Lent
+ * for the length of one call; never kept. The engine charges what it does to the call's budget:
+ * when the budget runs out, every further request answers "none" (false, 0 or NULL), and the
+ * call stops after the callback returns. These functions never set bw_last_error. */
+typedef struct bw_site bw_site;
+
+/* The replacement of node `e`, whose operands are already simplified, or BW_NULL_EXPR to leave
+ * it. It must be equal to `e` for every value of its symbols, of the same width, and built
+ * through `site` (a handle of another context is the rewrite's error, and quarantines it). */
+typedef bw_expr (*bw_rewrite_fn)(void *user, bw_site *site, bw_expr e);
+
+/* A rewrite written by the host (see the book's "Rewrites in Rust" for the checks the engine
+ * holds it to). It runs in the rule phases, after the phase's rules, at every node they leave.
+ *
+ * - The engine commits a result only when it is smaller than the node in the order every rule
+ *   decreases (tree size, then operator precedence), so rules and host rewrites cannot cycle.
+ * - The callback may be called from several threads at once (bw_engine_run_each, or an engine
+ *   shared between threads) with the same `user`: it must be safe for that. It must not unwind
+ *   (a C++ exception, longjmp) out of the call.
+ * - It must be deterministic: its result a function of the node, its facts and `revision`, since
+ *   results are memoized. Bump `revision` whenever its results change. */
+typedef struct bw_rewrite {
+    const char *name;  /* namespaced, for statistics and bw_engine_builder_refuse: "acme.fold" */
+    const char *group; /* the rule group that runs it; NULL: "host" */
+    uint32_t revision;
+    void *user;             /* passed to `rewrite` and `release` */
+    bw_rewrite_fn rewrite;  /* not NULL */
+    void (*release)(void *user); /* NULL, or called once when no engine or builder holds the
+                                    rewrite any more (not by bw_check_rewrite) */
+} bw_rewrite;
+
+/* Links a host rewrite. The strings are copied; `user` belongs to the library from a successful
+ * call on (see `release`). Without `trusted`, each application is compared with the node at
+ * sampled points, and a rewrite found wrong is quarantined for the rest of the call; with
+ * `trusted`, the host vouches for it (after bw_check_rewrite, say), and a wrong one makes wrong
+ * results. The builder's strategy runs the rewrite's group in every rule phase. */
+bw_status bw_engine_builder_add_rewrite(bw_engine_builder *b, const bw_rewrite *rewrite,
+                                        bool trusted);
+
+/* Node `e`: false if it is not a handle of the site's context. */
+bool bw_site_node(bw_site *site, bw_expr e, bw_node *out);
+
+/* The width of `e`; 0 if it is not a handle of the site's context. */
+uint16_t bw_site_width(bw_site *site, bw_expr e);
+
+/* The value of `e` if it is a constant (of at most 64 bits, for bw_site_as_u64). */
+bool bw_site_const_value(bw_site *site, bw_expr e, bw_value *out);
+bool bw_site_as_u64(bw_site *site, bw_expr e, uint64_t *out);
+
+/* The facts of `e`, under the call's assumptions and the declared known bits: false when the
+ * fact budget declined the query (the node's result is then not final). `relies_on` is 0: the
+ * engine keeps track of what the result relies on. */
+bool bw_site_facts(bw_site *site, bw_expr e, bw_facts *out);
+
+/* `e` in the text syntax (BW_PRINT_* flags), released with bw_string_free; NULL if `e` is not a
+ * handle of the site's context. */
+char *bw_site_print(bw_site *site, bw_expr e, unsigned flags);
+
+/* Construction, as bw_const, bw_const_u64, bw_un, bw_bin, bw_cmp, bw_zext, bw_sext, bw_trunc,
+ * bw_extract, bw_concat and bw_select: the node, or BW_NULL_EXPR (a width error, an unknown
+ * operator, an exhausted budget). */
+bw_expr bw_site_const(bw_site *site, const bw_value *v);
+bw_expr bw_site_const_u64(bw_site *site, uint16_t width, uint64_t v);
+bw_expr bw_site_un(bw_site *site, int op /* bw_unop */, bw_expr a);
+bw_expr bw_site_bin(bw_site *site, int op /* bw_binop */, bw_expr a, bw_expr b);
+bw_expr bw_site_cmp(bw_site *site, int op /* bw_cmpop */, bw_expr a, bw_expr b);
+bw_expr bw_site_zext(bw_site *site, bw_expr a, uint16_t width);
+bw_expr bw_site_sext(bw_site *site, bw_expr a, uint16_t width);
+bw_expr bw_site_trunc(bw_site *site, bw_expr a, uint16_t width);
+bw_expr bw_site_extract(bw_site *site, bw_expr a, uint16_t lo, uint16_t len);
+bw_expr bw_site_concat(bw_site *site, bw_expr hi, bw_expr lo);
+bw_expr bw_site_select(bw_site *site, bw_expr cond, bw_expr then, bw_expr els);
+
+/* ----- checking a host rewrite */
+
+/* How thoroughly bw_check_rewrite checks. */
+typedef struct bw_rewrite_check {
+    const uint16_t *widths; /* widths each input is parsed at; NULL: 1 to 8, 16, 32 and 64 */
+    size_t n_widths;
+    uint32_t variants;            /* variations of each input with other constants (16) */
+    uint32_t max_exhaustive_bits; /* compare at every assignment up to this many bits (16) */
+    uint32_t samples;             /* random points otherwise (256) */
+    uint64_t seed;
+} bw_rewrite_check;
+
+/* The defaults (in parentheses above). */
+bw_rewrite_check bw_rewrite_check_default(void);
+
+/* What a passing check covered. */
+typedef struct bw_rewrite_report {
+    uint64_t applications; /* nodes where the rewrite returned a result other than the node */
+    uint64_t points;       /* points at which a result was compared with its node */
+    uint64_t exhaustive;   /* applications compared at every assignment of their symbols */
+} bw_rewrite_report;
+
+typedef enum bw_rewrite_failure_kind {
+    BW_REWRITE_UNPARSABLE = 0,       /* an input parses at none of the widths (`node`: it) */
+    BW_REWRITE_NEVER_APPLIED = 1,    /* the rewrite applied nowhere: the inputs miss it */
+    BW_REWRITE_DIFFERS = 2,          /* a result differs from its node at `assignment` */
+    BW_REWRITE_WIDTH = 3,            /* a result of another width */
+    BW_REWRITE_NOT_SMALLER = 4,      /* a result the engine would never commit */
+    BW_REWRITE_NONDETERMINISTIC = 5, /* the same node gave `result` and then `second` */
+    BW_REWRITE_FOREIGN_EXPR = 6      /* a result that is not a handle of the site's context */
+} bw_rewrite_failure_kind;
+
+/* Why a check failed. Expressions are in the text syntax; the strings and arrays belong to the
+ * failure (released with bw_rewrite_failure_free). */
+typedef struct bw_rewrite_failure {
+    int kind;            /* bw_rewrite_failure_kind; -1 for a kind newer than this header */
+    const char *message; /* the whole failure, as a sentence */
+    const char *node;    /* the node (the input, for BW_REWRITE_UNPARSABLE); NULL if none */
+    const char *result;  /* the rewrite's result (the first, if nondeterministic); NULL if none */
+    const char *second;  /* BW_REWRITE_NONDETERMINISTIC: the second result; else NULL */
+    size_t n_assignment; /* BW_REWRITE_DIFFERS: the symbols' values */
+    const char *const *names;
+    const bw_value *values;
+} bw_rewrite_failure;
+
+/* Tests host rewrite `rewrite` offline on `n` inputs in the expression syntax (its `release` is
+ * not called): at every node of every input, at every width it parses at and with other
+ * constants, each result compared with its node (at every assignment when their symbols have few
+ * bits, at boundary-biased points otherwise), and what the engine relies on (width,
+ * determinism, the termination order). `config` may be NULL (the defaults). On success `*failure`
+ * is NULL and `*report` (may be NULL) says what was covered; otherwise `*failure` describes the
+ * first failure found. This is testing, not proof: give inputs where the rewrite applies and
+ * where it nearly does. */
+bw_status bw_check_rewrite(const bw_rewrite *rewrite, const char *const *inputs, size_t n,
+                           const bw_rewrite_check *config, bw_rewrite_report *report,
+                           bw_rewrite_failure **failure);
+void bw_rewrite_failure_free(bw_rewrite_failure *f);
+
+/* ----- templates */
+
+/* An instruction's semantics as an expression over named parameters, in the expression syntax,
+ * read at run time: "select(a <s b, a, b)". The parameters take the widths of the operands it is
+ * instantiated with, and a literal whose width the text does not fix takes the widest operand's.
+ * It is compiled once per combination of widths and then instantiated by copying, with no
+ * parsing. It may be shared between threads. */
+typedef struct bw_template bw_template;
+
+/* A template over `n` distinct parameter names (BW_ERR_UNSUPPORTED for an empty or repeated one);
+ * the text is read at the first instantiation or check at some widths. */
+bw_status bw_template_new(const char *text, const char *const *params, size_t n,
+                          bw_template **out);
+void bw_template_free(bw_template *t);
+
+/* Reads the text with parameters of these widths: a syntax or width error now, not at the first
+ * instantiation. */
+bw_status bw_template_check(const bw_template *t, const uint16_t *widths, size_t n);
+
+/* The template's expression in `cx`, its parameters bound to `args` (one per parameter). */
+bw_status bw_template_instantiate(const bw_template *t, bw_context *cx, const bw_expr *args,
+                                  size_t n, bw_expr *out);
+
+/* ----- lowering and raising */
+
+/* One function (or block) of the host's IR being translated into expressions of a context: the
+ * expression of every host value (a `uint64_t` the host chooses: an SSA number, a pointer), and a
+ * symbol for every value defined outside it. Use it with one context; it does not own it. */
+typedef struct bw_lowering bw_lowering;
+
+bw_lowering *bw_lowering_new(void);
+void bw_lowering_free(bw_lowering *lw);
+
+/* The expression of host value `v` of `width` bits: its definition, or for a value not defined,
+ * a new fresh symbol that stands for it (as bw_lowering_input). BW_ERR_WIDTH if the value has
+ * another width. */
+bw_status bw_lowering_value(bw_lowering *lw, bw_context *cx, uint64_t v, uint16_t width,
+                            bw_expr *out);
+
+/* A value defined outside (a parameter, a load, a call result): a symbol of `width` bits that
+ * stands for it, named `name` (NULL: a fresh symbol), with the known bits the host has of it
+ * (`known_zero` and `known_one`, of `width` bits, either may be NULL; as bw_declare_known). Its
+ * expression if it has one already. */
+bw_status bw_lowering_input(bw_lowering *lw, bw_context *cx, uint64_t v, uint16_t width,
+                            const char *name, const bw_value *known_zero,
+                            const bw_value *known_one, bw_expr *out);
+
+/* Records that host value `v` is `e`, built with the bw_* constructors over the expressions of
+ * its operands (bw_lowering_value). */
+bw_status bw_lowering_define(bw_lowering *lw, bw_context *cx, uint64_t v, bw_expr e);
+
+/* The expression of host value `v`, if it has one. */
+bool bw_lowering_get(const bw_lowering *lw, uint64_t v, bw_expr *out);
+
+/* A host value that computes `e` already (the first defined), if one does. */
+bool bw_lowering_owner(const bw_lowering *lw, bw_expr e, uint64_t *v);
+
+/* The values defined outside that were read, in order, with their symbols. */
+size_t bw_lowering_input_count(const bw_lowering *lw);
+bw_status bw_lowering_input_at(const bw_lowering *lw, size_t i, uint64_t *v, bw_expr *sym);
+
+/* Emits instructions computing node `e` (`node` describes it) from the host values of its
+ * operands, `operands[0..n)` in the order of `node->children`, and writes the value that holds
+ * it to `*value`. Any status other than BW_OK stops the raise, which fails with it (and the
+ * message bw_last_error had when the callback returned). `cx` is to read (bw_print,
+ * bw_const_value, ...), not to build in. */
+typedef bw_status (*bw_emit_fn)(void *user, const bw_context *cx, bw_expr e, const bw_node *node,
+                                const uint64_t *operands, size_t n, uint64_t *value);
+
+/* Turns `e` into host instructions: the value computing it. A node some host value computes is
+ * that value (equal expressions are equal values, so raising is value numbering); every other
+ * node is emitted through `emit`, operands first, and then owned by the value it returns, so
+ * later raises reuse it. A symbol no host value stands for is BW_ERR_UNSUPPORTED. */
+bw_status bw_lowering_raise(bw_lowering *lw, bw_context *cx, bw_expr e, bw_emit_fn emit,
+                            void *user, uint64_t *out);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **The compiler integration in the C, C++, Python and JavaScript APIs** (issue #9): what 0.12.0
+  added to the Rust API.
+  - **The compile strategy.** `BW_PRESET_COMPILE`, `Engine::compile()` (C++),
+    `Engine.compile()` (Python), `engine: "compile"` (JavaScript). Builders set sharing
+    (`BW_SHARING_ROOTS`, `BW_SHARING_IGNORED`) and the region cap on any preset.
+  - **Declared known bits.** `bw_declare_known` (up to 64 bits), `bw_declare_known_value`,
+    `bw_declared_known`, and `Context.declare_known` in C++ and Python; `known` in JavaScript.
+    `bw_context_reserve` and `Context.reserve`.
+  - **Host rewrites as callbacks.** A C `bw_rewrite` (a function pointer with a user pointer,
+    released when no engine holds it), a C++ `bitwright::Rewrite` over a `std::function`, a
+    Python `Rewrite` over a callable, a JavaScript function. Each sees the node through a site:
+    views, facts under the run's assumptions, construction. The engine holds them to the checks
+    it holds a Rust rewrite to.
+  - **Checking a rewrite offline:** `bw_check_rewrite`, `check_rewrite`, `checkRewrite`, with
+    the failure's node, result and assignment.
+  - **Templates** (`bw_template_*`, `Template`) and **lowering and raising** with host values
+    as 64-bit integers (`bw_lowering_*`, `Lowering`; not in JavaScript, which keeps no context
+    between calls).
+  - **Counters of a run**, host rewrites included: `bw_engine_run_stats`,
+    `bw_engine_run_each_stats`, and a `stats` argument in C++, Python and JavaScript.
+- **`Lowering::detach` and `Lowered::attach`**: a lowering's values kept between calls while
+  the context is used on its own (a binding cannot keep a borrow of it). **`Lowering::unraised`
+  and `Lowering::emitted`** raise in steps, for a host that emits with the context released.
+  `Lowering::raise` now fails on a symbol no host value stands for before emitting anything.
+- **Python:** a host rewrite that uses the context being simplified gets a `BitwrightError`
+  instead of waiting for itself.
+
 ## 0.12.0
 
 - **A strategy for compilers, `Strategy::compile()`.** A compiler simplifies every value of

@@ -1,5 +1,5 @@
-from collections.abc import Mapping, Sequence
-from typing import Literal, TypeAlias, final
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal, TypeAlias, final, overload
 
 __version__: str
 __all__ = [
@@ -39,6 +39,15 @@ __all__ = [
     "verify_transforms",
     "validate_functions",
     "infer_preconditions",
+    "Rewrite",
+    "Site",
+    "RewriteReport",
+    "RewriteFailure",
+    "Stats",
+    "PassStats",
+    "Template",
+    "Lowering",
+    "check_rewrite",
 ]
 
 class BitwrightError(Exception):
@@ -109,6 +118,13 @@ class Context:
     def __len__(self) -> int: ...
     def clear(self) -> None:
         """Drops every node and symbol: every expression of the context becomes stale."""
+    def reserve(self, additional: int) -> None:
+        """Makes room for `additional` more nodes (a host about to build a function)."""
+    def declare_known(self, sym: Expr, known: tuple[int, int]) -> None:
+        """Declares the `(zero, one)` masks of the bits the host knows are 0 and 1 in symbol
+        `sym`'s value; part of the symbol's meaning from then on. `(0, 0)` removes it."""
+    def declared_known(self, sym: Expr) -> tuple[int, int] | None:
+        """The `(zero, one)` masks declared for symbol `sym`, or None."""
     def symbol(self, name: str | int, width: int) -> Expr:
         """The symbol `name` of `width` bits (an int key prints as `#k`)."""
     def symbols(self, names: str, width: int) -> list[Expr]:
@@ -387,21 +403,29 @@ class Outcome:
 
 @final
 class Engine:
-    """A simplifier: `"standard"` or `"deobfuscate"`, with rule files of your own."""
+    """A simplifier: `"standard"`, `"deobfuscate"` or `"compile"`, with rule files and host
+    rewrites of your own."""
 
     def __new__(
         cls,
-        preset: Literal["standard", "deobfuscate"] = "standard",
+        preset: Literal["standard", "deobfuscate", "compile"] = "standard",
         *,
         rules: Sequence[str | tuple[str, str | None]] = ...,
         max_rounds: int | None = None,
         float_values: bool = False,
         refuse: Sequence[str] = ...,
+        sharing: Literal["roots", "ignored"] | None = None,
+        max_region: int | None = None,
+        rewrites: Sequence[Rewrite] = ...,
+        trusted_rewrites: Sequence[Rewrite] = ...,
     ) -> Engine: ...
     @staticmethod
     def standard() -> Engine: ...
     @staticmethod
     def deobfuscate() -> Engine: ...
+    @staticmethod
+    def compile() -> Engine:
+        """For a compiler, which simplifies every value of every function."""
     def simplify(
         self, expr: Expr, *, budget: Budget | None = None, assumptions: Assumptions | None = None
     ) -> Expr: ...
@@ -409,13 +433,25 @@ class Engine:
         self, expr: Expr, *, budget: Budget | None = None, assumptions: Assumptions | None = None
     ) -> tuple[Expr, list[tuple[str, Expr, Expr]]]:
         """The expression simplified, and each rewrite: (rule or pass, before, after)."""
+    @overload
     def run(
         self,
         exprs: Sequence[Expr],
         *,
         budget: Budget | None = None,
         assumptions: Assumptions | None = None,
+        stats: Literal[False] = False,
     ) -> list[Outcome]: ...
+    @overload
+    def run(
+        self,
+        exprs: Sequence[Expr],
+        *,
+        budget: Budget | None = None,
+        assumptions: Assumptions | None = None,
+        stats: Literal[True],
+    ) -> tuple[list[Outcome], Stats]: ...
+    @overload
     def run_each(
         self,
         exprs: Sequence[Expr],
@@ -423,8 +459,54 @@ class Engine:
         threads: int = 0,
         budget: Budget | None = None,
         assumptions: Assumptions | None = None,
+        stats: Literal[False] = False,
     ) -> list[Outcome]:
         """Each expression simplified on its own, on up to `threads` threads (0: all)."""
+    @overload
+    def run_each(
+        self,
+        exprs: Sequence[Expr],
+        *,
+        threads: int = 0,
+        budget: Budget | None = None,
+        assumptions: Assumptions | None = None,
+        stats: Literal[True],
+    ) -> tuple[list[Outcome], Stats]: ...
+
+@final
+class PassStats:
+    """Counters of one pass, or of the host rewrites together."""
+
+    calls: int
+    noop: int
+    changed: int
+    rejected_cost: int
+    rejected: int
+    atomized: int
+
+@final
+class Stats:
+    """Counters of one simplification call (`Engine.run(..., stats=True)`)."""
+
+    node_visits: int
+    memo_hits: int
+    candidates: int
+    match_steps: int
+    no_match: int
+    guard_false: int
+    degraded: int
+    no_change: int
+    rewrites: int
+    hook_vetoes: int
+    rejected: int
+    cycles_cut: int
+    quarantined: int
+    new_nodes: int
+    fact_work: int
+    pass_work: int
+    rounds: int
+    passes: dict[str, PassStats]
+    host: PassStats
 
 def check_rules(source: str) -> str:
     """Checks every rule of a `.bwr` source; the proof ledger vouching for them."""
@@ -509,3 +591,121 @@ def validate_functions(
 
 def infer_preconditions(text: str) -> list[InferredPrecondition]:
     """Infers each transformation's precondition over its symbolic constants."""
+
+# ----- in a compiler ----------------------------------------------------------------------
+
+_UnOp: TypeAlias = Literal["not", "neg", "popcnt", "clz", "ctz", "bswap", "bitrev"]
+_BinOp: TypeAlias = Literal[
+    "add", "sub", "mul", "umulhi", "smulhi", "udiv", "urem", "sdiv", "srem", "and", "or", "xor",
+    "shl", "lshr", "ashr", "rotl", "rotr", "pdep", "pext",
+]
+_CmpOp: TypeAlias = Literal["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"]
+
+@final
+class Site:
+    """What a host rewrite may do at a node, on integer handles of the context being
+    simplified. Valid during the rewrite call only; a request the budget declines is None."""
+
+    def kind(self, e: int) -> _Kind | Literal["other"] | None: ...
+    def op(self, e: int) -> str | None: ...
+    def children(self, e: int) -> list[int]: ...
+    def lo(self, e: int) -> int | None: ...
+    def width(self, e: int) -> int | None: ...
+    def value(self, e: int) -> int | None: ...
+    def facts(self, e: int) -> Facts | None: ...
+    def to_string(self, e: int, *, lets: bool = True) -> str | None: ...
+    def constant(self, value: int, width: int) -> int | None: ...
+    def un(self, op: _UnOp, a: int) -> int | None: ...
+    def bin(self, op: _BinOp, a: int, b: int) -> int | None: ...
+    def cmp(self, op: _CmpOp, a: int, b: int) -> int | None: ...
+    def zext(self, a: int, width: int) -> int | None: ...
+    def sext(self, a: int, width: int) -> int | None: ...
+    def trunc(self, a: int, width: int) -> int | None: ...
+    def extract(self, a: int, lo: int, length: int) -> int | None: ...
+    def concat(self, hi: int, lo: int) -> int | None: ...
+    def select(self, cond: int, then: int, els: int) -> int | None: ...
+
+@final
+class Rewrite:
+    """A host rewrite: `function(site, node)` returns the node's replacement (a handle built
+    through the site) or None to leave it."""
+
+    def __new__(
+        cls,
+        name: str,
+        function: Callable[[Site, int], int | None],
+        *,
+        group: str = ...,
+        revision: int = 1,
+    ) -> Rewrite: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def group(self) -> str: ...
+    @property
+    def revision(self) -> int: ...
+
+@final
+class RewriteFailure:
+    kind: Literal[
+        "unparsable", "never_applied", "differs", "width", "not_smaller", "nondeterministic",
+        "foreign_expr", "other",
+    ]
+    message: str
+    node: str | None
+    result: str | None
+    second: str | None
+    assignment: dict[str, int]
+
+@final
+class RewriteReport:
+    """What `check_rewrite` covered, or why it failed: true when it passed."""
+
+    applications: int
+    points: int
+    exhaustive: int
+    failure: RewriteFailure | None
+    def __bool__(self) -> bool: ...
+
+def check_rewrite(
+    rewrite: Rewrite,
+    inputs: Sequence[str],
+    *,
+    widths: Sequence[int] | None = None,
+    variants: int | None = None,
+    max_exhaustive_bits: int | None = None,
+    samples: int | None = None,
+    seed: int | None = None,
+) -> RewriteReport:
+    """Tests a host rewrite offline on expression text: testing, not proof."""
+
+@final
+class Template:
+    """An instruction's semantics as an expression over named parameters, read at run time."""
+
+    def __new__(cls, text: str, params: Sequence[str]) -> Template: ...
+    @property
+    def params(self) -> list[str]: ...
+    def check(self, widths: Sequence[int]) -> None: ...
+    def instantiate(self, args: Sequence[Expr], context: Context | None = None) -> Expr: ...
+
+@final
+class Lowering:
+    """One function of the host's IR translated into expressions of a context; host values are
+    non-negative ints of the host's choosing."""
+
+    def __new__(cls, context: Context) -> Lowering: ...
+    @property
+    def context(self) -> Context: ...
+    def value(self, v: int, width: int) -> Expr: ...
+    def input(
+        self, v: int, width: int, *, name: str | None = None, known: tuple[int, int] | None = None
+    ) -> Expr: ...
+    def define(self, v: int, e: Expr) -> None: ...
+    def get(self, v: int) -> Expr | None: ...
+    def owner(self, e: Expr) -> int | None: ...
+    @property
+    def inputs(self) -> list[tuple[int, Expr]]: ...
+    def raise_(self, e: Expr, emit: Callable[[Expr, list[int]], int]) -> int:
+        """Turns `e` into host instructions: the value computing it; `emit(node, operands)`
+        emits each node no host value computes, operands first."""

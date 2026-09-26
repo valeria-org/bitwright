@@ -72,7 +72,7 @@ pub(super) fn synthesize(
             bitwright::synth::synthesize(&mut c, x, &cfg)
         })
         .or_raise()?;
-    let c = cx.lock(py);
+    let c = cx.lock(py)?;
     out.map(|s| wrap(cxb, &c, s)).transpose()
 }
 
@@ -110,7 +110,7 @@ pub(super) fn saturate(
             sat.search(&mut c, &[x], SearchRun::default())
         })
         .or_raise()?;
-    let c = cx.lock(py);
+    let c = cx.lock(py)?;
     out.roots[0].candidate.map(|s| wrap(cxb, &c, s)).transpose()
 }
 
@@ -158,7 +158,7 @@ impl PyMemory {
     /// Known contents: `data` (bytes, for 8-bit cells) from address `start` on. Before any
     /// load or store.
     fn set_bytes(&self, py: Python<'_>, start: u128, data: Vec<u8>) -> PyResult<()> {
-        let mut g = lock(py, &self.m);
+        let mut g = lock(py, &self.m)?;
         let (m, v) = &mut *g;
         let taken = std::mem::replace(m, Memory::new("tmp", Width::W8, Width::W8, Endian::Little));
         *m = taken.with_bytes(start, &data).or_raise()?;
@@ -175,8 +175,8 @@ impl PyMemory {
     ) -> PyResult<()> {
         let (a, x) = (addr.e, value.e);
         let cx = self.cx.bind(py).get();
-        let mut c = cx.lock(py);
-        let mut g = lock(py, &self.m);
+        let mut c = cx.lock(py)?;
+        let mut g = lock(py, &self.m)?;
         let (m, v) = &mut *g;
         *v = m.store(&mut c, *v, a, x).or_raise()?;
         Ok(())
@@ -188,20 +188,20 @@ impl PyMemory {
         let a = addr.e;
         let cxb = self.cx.bind(py);
         let e = {
-            let mut c = cxb.get().lock(py);
-            let mut g = lock(py, &self.m);
+            let mut c = cxb.get().lock(py)?;
+            let mut g = lock(py, &self.m)?;
             let (m, v) = &mut *g;
             m.load(&mut c, *v, a, cells).or_raise()?
         };
-        let c = cxb.get().lock(py);
+        let c = cxb.get().lock(py)?;
         wrap(cxb, &c, e)
     }
 
     /// The reads of unknown cells so far: (address, symbol) pairs.
     fn reads(&self, py: Python<'_>) -> PyResult<Vec<(PyExpr, PyExpr)>> {
-        let list: Vec<(Expr, Expr)> = lock(py, &self.m).0.reads().to_vec();
+        let list: Vec<(Expr, Expr)> = lock(py, &self.m)?.0.reads().to_vec();
         let cxb = self.cx.bind(py);
-        let c = cxb.get().lock(py);
+        let c = cxb.get().lock(py)?;
         list.into_iter()
             .map(|(a, s)| Ok((wrap(cxb, &c, a)?, wrap(cxb, &c, s)?)))
             .collect()
@@ -266,7 +266,7 @@ fn lifted(
             read(&mut c)
         })
         .or_raise()?;
-    let c = cx.lock(py);
+    let c = cx.lock(py)?;
     let w = |e: Expr| wrap(ctx, &c, e);
     Ok(LiftedBlock {
         inputs: b

@@ -49,6 +49,15 @@ from ._bitwright import (
     synthesize,
     validate_functions,
     verify_transforms,
+    Lowering,
+    PassStats,
+    Rewrite,
+    RewriteFailure,
+    RewriteReport,
+    Site,
+    Stats,
+    Template,
+    check_rewrite,
 )
 
 __all__ = [
@@ -88,4 +97,13 @@ __all__ = [
     "synthesize",
     "validate_functions",
     "verify_transforms",
+    "Lowering",
+    "PassStats",
+    "Rewrite",
+    "RewriteFailure",
+    "RewriteReport",
+    "Site",
+    "Stats",
+    "Template",
+    "check_rewrite",
 ]

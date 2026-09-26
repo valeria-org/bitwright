@@ -226,7 +226,9 @@ over it ([`bitwright.hpp`](bitwright-ffi/include/bitwright.hpp)), a Python packa
 (`bitwright-py`, built with maturin), and a WebAssembly module with a JavaScript wrapper
 (`bitwright-wasm`). They build, parse, inspect, evaluate and simplify expressions, with facts,
 proofs, assumptions, budgets, rules of your own, SMT-LIB, memory, lifted code and the verifier
-of compiler transformations; the [chapter on them](book/src/bindings.md) is the guide.
+of compiler transformations, and have what a compiler needs: the compile strategy, declared
+known bits, host rewrites as callbacks, templates, lowering and raising. The
+[chapter on them](book/src/bindings.md) is the guide.
 [`tools/plugins/`](tools/plugins/) has (untested) scripts for Ghidra, Binary Ninja and IDA.
 
 ```python
