@@ -15,6 +15,9 @@ rewrites of its own that the rule language cannot say. This chapter covers those
 - **`engine::Rewrite`**: rewrites written in Rust, linked into an engine at run time.
   `check::rewrite` tests them before they are trusted.
 
+C, C++, Python and JavaScript have these pieces too, with host values as 64-bit integers and
+rewrites as callbacks: see [their chapter](bindings.md#in-a-compiler).
+
 ## Translating instructions
 
 The compiler implements `Semantics` for its instruction type once: the value an instruction

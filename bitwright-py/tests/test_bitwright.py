@@ -627,6 +627,304 @@ def test_transformations():
     assert i.pre == "isPowerOf2(C)" and i.weakest and i.verdict == "valid"
 
 
+def test_the_compile_preset_and_engine_options(cx):
+    x, y = cx.symbols("x y", 32)
+    e = (x ^ y) + 2 * (x & y)
+    engine = bw.Engine.compile()
+    assert repr(engine) == "<bitwright.Engine compile>"
+    assert str(e.simplify(engine)) == "x + y"
+    out, stats = engine.run([e], stats=True)
+    assert str(out[0].expr) == "x + y"
+    assert stats.rounds == 1 and stats.memo_hits > 0  # answered by the memo
+    assert isinstance(stats.passes, dict) and stats.host.calls == 0
+    assert "visits" in repr(stats)
+    each, stats = engine.run_each([e, x], threads=2, stats=True)
+    assert [str(o.expr) for o in each] == ["x + y", "x"] and stats.node_visits >= 0
+    # The options on another preset.
+    tuned = bw.Engine("standard", sharing="ignored", max_region=16)
+    assert str(e.simplify(tuned)) == "x + y"
+    assert str(bw.Engine("compile", sharing="roots").simplify(e)) == "x + y"
+    with pytest.raises(ValueError):
+        bw.Engine(sharing="some")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        bw.Engine("fastest")  # type: ignore[arg-type]
+
+
+def test_declared_known_bits(cx):
+    x = cx.symbol("x", 8)
+    assert cx.declared_known(x) is None
+    cx.declare_known(x, (0xF0, 0))
+    assert cx.declared_known(x) == (0xF0, 0)
+    assert (x >> 4).prove() is False  # zero: never nonzero
+    assert str((x >> 4).simplify(bw.Engine.compile())) == "0:8"
+    assert x.facts().umax == 15
+    cx.declare_known(x, (0, 0))
+    assert cx.declared_known(x) is None
+    wide = cx.symbol("w", 200)
+    cx.declare_known(wide, (1 << 199, 1))
+    assert cx.declared_known(wide) == (1 << 199, 1)
+    assert wide.facts().umin == 1
+    with pytest.raises(ValueError):
+        cx.declare_known(x, (1, 1))  # a bit both 0 and 1
+    with pytest.raises(ValueError):
+        cx.declare_known(x, (0x100, 0))  # wider than the symbol
+    with pytest.raises(TypeError):
+        cx.declare_known(x + 1, (1, 0))
+    with pytest.raises(TypeError):
+        cx.declared_known(x + 1)
+    n = len(cx)
+    cx.reserve(1 << 16)
+    assert len(cx) == n
+
+
+def needless_rem(site, e):
+    """`urem(x, c)` as `x` when the facts show `x < c`."""
+    if site.op(e) != "urem":
+        return None
+    x, c = site.children(e)
+    bound, facts = site.value(c), site.facts(x)
+    if bound is None or facts is None or facts.umax >= bound:
+        return None
+    return x
+
+
+def test_host_rewrites(cx):
+    b = cx.symbol("b", 8)
+    e = b.zext(32).urem(1000)
+    rw = bw.Rewrite("acme.needless_rem", needless_rem, group="acme", revision=2)
+    assert (rw.name, rw.group, rw.revision) == ("acme.needless_rem", "acme", 2)
+    assert "acme.needless_rem" in repr(rw)
+    # The built-in rules and passes leave it.
+    assert e.simplify(bw.Engine.compile()) == e
+    for engine in (
+        bw.Engine("compile", rewrites=[rw]),
+        bw.Engine("compile", trusted_rewrites=[rw]),
+    ):
+        out, stats = engine.run([e], stats=True)
+        assert str(out[0].expr) == "zext<32>(b)"
+        assert stats.host.changed == 1 and stats.host.calls >= 1
+    # On threads, each expression on its own.
+    exprs = [(b.zext(32) + k).urem(300) for k in range(1, 9)]
+    each, stats = bw.Engine(trusted_rewrites=[rw]).run_each(exprs, threads=4, stats=True)
+    assert [str(o.expr) for o in each] == [f"zext<32>(b) + {k}" for k in range(1, 9)]
+    assert stats.host.changed == 8
+    # Refused by name.
+    refused = bw.Engine("compile", trusted_rewrites=[rw], refuse=["acme.needless_rem"])
+    out, stats = refused.run([e], stats=True)
+    assert out[0].expr == e and stats.hook_vetoes > 0
+
+    # A wrong rewrite, sampled: rejected and quarantined.
+    x, y, z = cx.symbols("x y z", 16)
+    drop_addend = bw.Rewrite("acme.drop", lambda s, n: s.children(n)[0] if s.op(n) == "add" else None)
+    out, stats = bw.Engine("compile", rewrites=[drop_addend]).run([x * y + z], stats=True)
+    assert str(out[0].expr) == "x * y + z"
+    assert stats.quarantined >= 1 and stats.host.rejected >= 1
+
+
+def test_the_site(cx, monkeypatch):
+    b = cx.symbol("b", 8)
+    e = b.zext(32).urem(7)
+    seen = []
+
+    def inspect(site, n):
+        if site.op(n) != "urem":
+            return None
+        x, c = site.children(n)
+        seen.append(site)
+        assert site.kind(n) == "binary" and site.kind(x) == "zext" and site.kind(c) == "const"
+        assert site.width(n) == 32 and site.width(0) is None and site.kind(0) is None
+        assert site.value(c) == 7 and site.value(x) is None
+        assert site.to_string(n) == "urem(zext<32>(b), 7)"
+        assert site.lo(site.extract(x, 2, 4)) == 2 and site.lo(x) is None
+        assert site.children(0) == []
+        facts = site.facts(x)
+        assert facts.umax == 255 and facts.relies_on == ()
+        one = site.constant(1, 32)
+        minus = site.constant(-1, 32)
+        assert site.value(minus) == 0xFFFFFFFF
+        built = [
+            site.un("neg", x),
+            site.bin("add", x, one),
+            site.cmp("ult", x, one),
+            site.zext(x, 64),
+            site.sext(x, 64),
+            site.trunc(x, 8),
+            site.concat(site.trunc(x, 8), site.trunc(x, 8)),
+            site.select(site.cmp("eq", x, one), x, one),
+        ]
+        assert all(isinstance(h, int) for h in built)
+        assert site.width(built[6]) == 16
+        assert site.bin("add", x, site.trunc(x, 8)) is None  # a width mismatch
+        assert site.zext(x, 8) is None
+        with pytest.raises(ValueError):
+            site.bin("frob", x, one)
+        with pytest.raises(ValueError):
+            site.un("add", x)
+        with pytest.raises(ValueError):
+            site.cmp("lt", x, one)
+        return built[7]  # larger: not committed
+
+    out, stats = bw.Engine("compile", trusted_rewrites=[bw.Rewrite("t.inspect", inspect)]).run(
+        [e], stats=True
+    )
+    assert out[0].expr == e and seen and stats.host.rejected_cost > 0
+    # A site is lent for the call only.
+    with pytest.raises(RuntimeError):
+        seen[0].width(e.handle)
+    assert "expired" in repr(seen[0])
+
+    # An exception leaves the node, reported as unraisable.
+    reported = []
+    monkeypatch.setattr("sys.unraisablehook", lambda u: reported.append(u.exc_value))
+
+    def broken(site, n):
+        raise KeyError("oops")
+
+    out = bw.Engine("compile", trusted_rewrites=[bw.Rewrite("t.broken", broken)]).run([e])
+    assert out[0].expr == e and reported and isinstance(reported[0], KeyError)
+    reported.clear()
+    # A result that is not a handle is reported too.
+    not_a_handle = bw.Rewrite("t.text", lambda s, n: "x")  # type: ignore[arg-type,return-value]
+    out = bw.Engine(trusted_rewrites=[not_a_handle]).run([e])
+    assert out[0].expr == e and reported
+    reported.clear()
+
+    # Using the context being simplified from a rewrite is an error, not a deadlock.
+    def uses_the_context(site, n):
+        str(e)
+        return None
+
+    out = bw.Engine(trusted_rewrites=[bw.Rewrite("t.ctx", uses_the_context)]).run([e])
+    assert out[0].expr == e and reported and "busy" in str(reported[0])
+    with pytest.raises(TypeError):
+        bw.Rewrite("t.none", None)  # type: ignore[arg-type]
+
+
+def test_checking_host_rewrites():
+    def xor_twice(site, n):
+        if site.op(n) != "xor":
+            return None
+        a, y = site.children(n)
+        if site.op(a) != "xor":
+            return None
+        x, z = site.children(a)
+        return x if z == y else z if x == y else None
+
+    def mul_pow2(site, n):
+        if site.op(n) != "mul":
+            return None
+        x, c = site.children(n)
+        v = site.value(c)
+        if v is None or v & (v - 1):
+            return None
+        return site.bin("shl", x, site.constant(v.bit_length() - 1, site.width(n)))
+
+    report = bw.check_rewrite(bw.Rewrite("t.xor", xor_twice), ["(x ^ y) ^ y", "((a + 1) ^ 7) ^ 7"])
+    assert report and report.failure is None
+    assert report.applications > 0 and report.exhaustive > 0 and report.points > 0
+    assert "passed" in repr(report)
+    assert bw.check_rewrite(bw.Rewrite("t.shl", mul_pow2), ["x * 8", "(a + b) * 2", "x * 6"])
+    # Every assignment of two 4-bit symbols, at one width, without variations.
+    small = bw.check_rewrite(bw.Rewrite("t.xor", xor_twice), ["(x ^ y) ^ y"], widths=[4], variants=0)
+    assert (small.applications, small.points) == (1, 256)
+
+    def wrong(site, n):
+        return site.children(n)[0] if site.op(n) == "or" else None
+
+    report = bw.check_rewrite(bw.Rewrite("t.wrong", wrong), ["x | y"], seed=7, samples=64)
+    assert not report
+    f = report.failure
+    assert f is not None
+    assert f.kind == "differs" and f.node == "x | y" and f.result == "x"
+    assert set(f.assignment) == {"x", "y"}
+    assert f.assignment["y"] & ~f.assignment["x"] != 0
+    assert "differs at" in f.message and "differs" in repr(f)
+    never = bw.check_rewrite(bw.Rewrite("t.xor", xor_twice), ["x + y"]).failure
+    assert never is not None and never.kind == "never_applied" and never.node is None
+    bad = bw.check_rewrite(bw.Rewrite("t.xor", xor_twice), ["x +"]).failure
+    assert bad is not None and bad.kind == "unparsable" and bad.node == "x +"
+
+
+def test_templates(cx):
+    a, b = cx.symbols("a b", 32)
+    c = cx.symbol("c", 1)
+    pick = bw.Template("select(c, a + 1, b)", ["c", "a", "b"])
+    assert pick.params == ["c", "a", "b"] and "c, a, b" in repr(pick)
+    pick.check([1, 32, 32])
+    with pytest.raises(bw.ParseError):
+        pick.check([8, 8, 8])  # the condition must be 1 bit
+    e = pick.instantiate([c, a, b])
+    assert str(e) == "select(c, a + 1, b)" and pick.instantiate([c, a, b]) == e
+    x = cx.symbol("x", 8)
+    assert str(pick.instantiate([c, x, x])) == "select(c, x + 1, x)"
+    with pytest.raises(bw.BitwrightError):
+        pick.instantiate([a, b])
+    with pytest.raises(bw.BitwrightError):
+        bw.Template("a + a", ["a", "a"])
+    with pytest.raises(bw.ParseError):
+        bw.Template("a +", ["a"]).check([8])
+    seven = bw.Template("7:16", [])
+    assert str(seven.instantiate([], context=cx)) == "7:16"
+    with pytest.raises(ValueError):
+        seven.instantiate([])
+    with pytest.raises(ValueError):
+        pick.instantiate([c, a, bw.Context().symbol("b", 32)])
+
+
+def test_lowering_and_raising(cx):
+    lw = bw.Lowering(cx)
+    assert lw.context is cx or lw.context.__class__ is bw.Context
+    # %0 is a parameter known 16-byte aligned; %1 is read first when used.
+    p = lw.input(0, 64, name="p", known=(15, 0))
+    assert str(p) == "p" and cx.declared_known(p) == (15, 0)
+    assert lw.input(0, 64) == p and lw.value(0, 64) == p
+    v1 = lw.value(1, 64)
+    assert str(v1) == "$0"
+    with pytest.raises(bw.WidthError):
+        lw.value(1, 32)
+    v2 = p & v1
+    lw.define(2, v2)
+    v3 = v2 + p
+    lw.define(3, v3)
+    assert lw.get(3) == v3 and lw.get(9) is None
+    assert lw.owner(v2) == 2 and lw.owner(p + 1) is None
+    assert [(v, str(s)) for v, s in lw.inputs] == [(0, "p"), (1, "$0")]
+    assert "2 inputs" in repr(lw)
+
+    # (p & $0) + p ^ (p & 5): %3 is there; the mask and the xor are new.
+    x = v3 ^ (p & 5)
+    code = []
+
+    def emit(node, operands):
+        code.append((node.kind, node.op, operands))
+        return 100 + len(code) - 1
+
+    assert lw.raise_(x, emit) == 102
+    assert code == [("const", None, []), ("binary", "and", [0, 100]), ("binary", "xor", [3, 101])]
+    assert lw.raise_(x, emit) == 102 and lw.raise_(v3, emit) == 3 and len(code) == 3
+    assert lw.owner(x) == 102
+    # A symbol no host value stands for; an emit that fails leaves what it did.
+    with pytest.raises(bw.BitwrightError):
+        lw.raise_(x - cx.symbol("stray", 64), emit)
+
+    def fails(node, operands):
+        raise ValueError("no such instruction")
+
+    with pytest.raises(ValueError):
+        lw.raise_(p * v1, fails)
+    with pytest.raises(TypeError):
+        lw.raise_(p * v1, lambda node, operands: "r1")  # type: ignore[arg-type,return-value]
+    # The emit callback may use the context.
+    assert lw.raise_(p * v1, lambda node, operands: len(str(node))) == len("p * $0")
+    # Known bits of the wrong width or in conflict; an expression of another context.
+    with pytest.raises(ValueError):
+        lw.input(7, 8, known=(0x100, 0))
+    with pytest.raises(ValueError):
+        lw.input(7, 8, known=(1, 1))
+    with pytest.raises(ValueError):
+        lw.define(8, bw.Context().symbol("f", 64))
+
+
 def test_version():
     assert bw.__version__.count(".") == 2
 

@@ -5,6 +5,9 @@
 //! operation on up to two strings and a number, and returns a buffer holding a status byte (0
 //! for success, 1 for an error), the result's length (4 bytes, little-endian) and its UTF-8
 //! bytes; `bw_dealloc` frees each buffer. Every operation runs under `catch_unwind`.
+//!
+//! Host rewrites are JavaScript functions, called through the one import, `bitwright.rewrite`
+//! (see `compiler`).
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
@@ -12,6 +15,8 @@ use std::sync::{Arc, OnceLock};
 use bw::engine::{Engine, Strategy};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::{Context, ParseOptions, Width};
+
+mod compiler;
 
 /// A buffer of `len` bytes, for JavaScript to fill (freed with `bw_dealloc(ptr, len)`).
 #[unsafe(no_mangle)]
@@ -44,15 +49,25 @@ const LIFT: u32 = 6;
 const EQUIVALENT: u32 = 7;
 const TO_SMTLIB: u32 = 8;
 const VERSION: u32 = 9;
+const SIMPLIFY_WITH: u32 = 10;
+const CHECK_REWRITE: u32 = 11;
+const INSTANTIATE: u32 = 12;
+const CHECK_TEMPLATE: u32 = 13;
+const NAMES: u32 = 14;
+
+/// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
+fn deobfuscate_strategy() -> Strategy {
+    let trust = MbaTrust::default().with_backend_certificates(false);
+    Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
+}
 
 fn deobfuscator() -> &'static Engine {
     static E: OnceLock<Engine> = OnceLock::new();
     E.get_or_init(|| {
-        let trust = MbaTrust::default().with_backend_certificates(false);
         Engine::builder()
             .builtin()
             .mba_solver(Arc::new(NormalFormSolver::default()))
-            .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust)))
+            .strategy(deobfuscate_strategy())
             .build()
             .expect("the deobfuscation engine links")
     })
@@ -184,6 +199,11 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
             text(bw::smtlib::export(&mut cx, &[e]))
         }
         VERSION => Ok(env!("CARGO_PKG_VERSION").to_string()),
+        SIMPLIFY_WITH => compiler::simplify_with(a, b, n),
+        CHECK_REWRITE => compiler::check_rewrite(a, b),
+        INSTANTIATE => compiler::instantiate(a, b, n),
+        CHECK_TEMPLATE => compiler::check_template(a, b),
+        NAMES => Ok(compiler::names()),
         _ => Err(format!("unknown operation {op}")),
     }
 }
@@ -218,10 +238,15 @@ pub unsafe extern "C" fn bw_call(
         call(op, a, b, n)
     }))
     .unwrap_or_else(|_| Err("bitwright panicked".into()));
-    let (status, s) = match result {
-        Ok(s) => (0u8, s),
-        Err(e) => (1u8, e),
-    };
+    match result {
+        Ok(s) => buffer(0, &s),
+        Err(e) => buffer(1, &e),
+    }
+}
+
+/// A buffer holding `status`, the length of `s` and its bytes (freed with `bw_dealloc(ptr,
+/// len + 5)`).
+fn buffer(status: u8, s: &str) -> *mut u8 {
     let bytes = s.as_bytes();
     let total = bytes.len() + 5;
     let p = bw_alloc(total);

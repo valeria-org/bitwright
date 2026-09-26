@@ -141,15 +141,75 @@ impl<V> fmt::Debug for Lowering<'_, V> {
     }
 }
 
+/// A [`Lowering`]'s values detached from its context: what a host keeps between the calls
+/// that lower a function, when the context is used on its own in between (a language binding,
+/// which cannot keep a borrow of it). [`attach`](Self::attach) it to the same context to go on;
+/// with another, its expressions are foreign handles, rejected wherever they are used.
+pub struct Lowered<V> {
+    exprs: HashMap<V, Expr>,
+    inputs: Vec<(V, Expr)>,
+    owners: HashMap<Expr, V>,
+}
+
+impl<V> fmt::Debug for Lowered<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Lowered")
+            .field("values", &self.exprs.len())
+            .field("inputs", &self.inputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<V> Default for Lowered<V> {
+    fn default() -> Self {
+        Lowered {
+            exprs: HashMap::new(),
+            inputs: Vec::new(),
+            owners: HashMap::new(),
+        }
+    }
+}
+
+impl<V: Copy + Eq + Hash> Lowered<V> {
+    /// The expression of host value `v`, if it has one ([`Lowering::get`]).
+    pub fn get(&self, v: V) -> Option<Expr> {
+        self.exprs.get(&v).copied()
+    }
+
+    /// The values defined outside that were read ([`Lowering::inputs`]).
+    pub fn inputs(&self) -> &[(V, Expr)] {
+        &self.inputs
+    }
+
+    /// A host value that computes `e` already, if one does ([`Lowering::owner`]).
+    pub fn owner(&self, e: Expr) -> Option<V> {
+        self.owners.get(&e).copied()
+    }
+
+    /// The lowering again, over `cx`.
+    pub fn attach(self, cx: &mut Context) -> Lowering<'_, V> {
+        Lowering {
+            cx,
+            exprs: self.exprs,
+            inputs: self.inputs,
+            owners: self.owners,
+        }
+    }
+}
+
 impl<'cx, V: Copy + Eq + Hash> Lowering<'cx, V> {
     /// A lowering into `cx` (reuse one context per function: [`Context::clear`] keeps its
     /// allocations).
     pub fn new(cx: &'cx mut Context) -> Self {
-        Lowering {
-            cx,
-            exprs: HashMap::new(),
-            inputs: Vec::new(),
-            owners: HashMap::new(),
+        Lowered::default().attach(cx)
+    }
+
+    /// Releases the context, keeping the values: [`Lowered::attach`] resumes.
+    pub fn detach(self) -> Lowered<V> {
+        Lowered {
+            exprs: self.exprs,
+            inputs: self.inputs,
+            owners: self.owners,
         }
     }
 
@@ -268,31 +328,47 @@ impl<'cx, V: Copy + Eq + Hash> Lowering<'cx, V> {
     /// then owned by the value `r` returns (so later raises reuse it). A symbol no host value
     /// stands for is an error.
     pub fn raise<R: Raise<Value = V> + ?Sized>(&mut self, e: Expr, r: &mut R) -> Result<V, Error> {
-        if let Some(v) = self.owner(e) {
-            return Ok(v);
-        }
-        let order = self.cx.post_order(&[e])?;
         let mut ops: Vec<V> = Vec::new();
-        for n in order {
-            if self.owners.contains_key(&n) {
-                continue;
-            }
+        for n in self.unraised(e)? {
             let view = self.cx.view(n)?;
-            if matches!(view, View::Sym(_)) {
-                return Err(Error::Unsupported(format!(
-                    "symbol {} stands for no host value",
-                    self.cx.display(n)
-                )));
-            }
             ops.clear();
             for c in self.cx.children(n)? {
                 ops.push(self.owners[&c]);
             }
             let v = r.emit(self.cx, n, &view, &ops)?;
-            self.exprs.entry(v).or_insert(n);
-            self.owners.insert(n, v);
+            self.emitted(n, v)?;
         }
         Ok(self.owners[&e])
+    }
+
+    /// The nodes of `e` that [`raise`](Self::raise) would emit, operands first: those no host
+    /// value computes. With [`emitted`](Self::emitted), a raise in steps, for a host that must
+    /// emit with the context released (a language binding calling back into its interpreter).
+    /// A symbol no host value stands for is an error.
+    pub fn unraised(&mut self, e: Expr) -> Result<Vec<Expr>, Error> {
+        if self.owner(e).is_some() {
+            return Ok(Vec::new());
+        }
+        let mut order = self.cx.post_order(&[e])?;
+        order.retain(|n| !self.owners.contains_key(n));
+        for &n in &order {
+            if matches!(self.cx.view(n)?, View::Sym(_)) {
+                return Err(Error::Unsupported(format!(
+                    "symbol {} stands for no host value",
+                    self.cx.display(n)
+                )));
+            }
+        }
+        Ok(order)
+    }
+
+    /// Records that host value `v` computes node `e`, emitted by the host: what
+    /// [`raise`](Self::raise) does after each emit. Later raises reuse it.
+    pub fn emitted(&mut self, e: Expr, v: V) -> Result<(), Error> {
+        self.cx.id(e)?;
+        self.exprs.entry(v).or_insert(e);
+        self.owners.insert(e, v);
+        Ok(())
     }
 }
 
@@ -498,6 +574,44 @@ mod tests {
         // A symbol the lowering did not make stands for no host value.
         let stray = lw.context().symbol("stray", Width::W8).unwrap();
         assert!(lw.raise(stray, &mut rec).is_err());
+    }
+
+    #[test]
+    fn a_detached_lowering_resumes() {
+        let mut cx = Context::new();
+        let mut lw = Lowering::new(&mut cx);
+        lw.lower(&Bin(2, BinOp::Add, 0, 1)).unwrap();
+        let kept = lw.detach();
+        // The context on its own in between.
+        let one = cx.constant_u64(Width::W8, 1).unwrap();
+        let mut lw = kept.attach(&mut cx);
+        let v2 = lw.get(2).unwrap();
+        let e = lw.context().bin(BinOp::Add, v2, one).unwrap();
+        lw.define(3, e).unwrap();
+        assert_eq!(lw.inputs().len(), 2);
+        assert_eq!(lw.owner(v2), Some(2));
+        let mut rec = Rec(Vec::new());
+        assert_eq!(lw.raise(e, &mut rec).unwrap(), 3);
+        assert!(rec.0.is_empty());
+    }
+
+    #[test]
+    fn raising_in_steps() {
+        let mut cx = Context::new();
+        let mut lw = Lowering::new(&mut cx);
+        lw.lower(&Bin(2, BinOp::Add, 0, 1)).unwrap();
+        let (v2, v0) = (lw.get(2).unwrap(), lw.get(0).unwrap());
+        let cx = lw.context();
+        let e = cx.bin(BinOp::Mul, v2, v0).unwrap();
+        let todo = lw.unraised(e).unwrap();
+        assert_eq!(todo, [e]);
+        lw.emitted(e, 7).unwrap();
+        assert!(lw.unraised(e).unwrap().is_empty());
+        assert_eq!(lw.raise(e, &mut Rec(Vec::new())).unwrap(), 7);
+        // A stray symbol fails before anything is emitted.
+        let stray = lw.context().symbol("stray", Width::W8).unwrap();
+        let f = lw.context().bin(BinOp::Sub, e, stray).unwrap();
+        assert!(lw.unraised(f).is_err());
     }
 
     #[test]

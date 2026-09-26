@@ -9,6 +9,7 @@
 //! the order of the Rust enums.
 
 use core::ffi::{c_char, c_int, c_uint};
+use core::ptr::null_mut;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -16,7 +17,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
 use bw::check::{CheckConfig, Verdict, check_program};
-use bw::engine::{Budget, Each, End, Engine, Exhausted, Run, Strategy};
+use bw::engine::{Budget, Each, End, Engine, Exhausted, Run, Sharing, Strategy};
 use bw::fp::{FpCmpOp, FpFormat, FpOp, FpTest, RoundingMode};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::rules::{Ledger, RuleProgram};
@@ -25,6 +26,7 @@ use bw::{
     ParseOptions, PrintOptions, Query, Reliance, SymbolKey, Truth, UnOp, View, Width,
 };
 
+mod compiler;
 mod more;
 #[cfg(test)]
 mod tests;
@@ -161,6 +163,9 @@ const FPTESTS: [FpTest; 7] = [
 
 const PRESET_STANDARD: c_int = 0;
 const PRESET_DEOBFUSCATE: c_int = 1;
+const PRESET_COMPILE: c_int = 2;
+
+const SHARINGS: [Sharing; 2] = [Sharing::Roots, Sharing::Ignored];
 
 const PRINT_NO_LETS: c_uint = 1;
 const PRINT_SYMBOL_WIDTHS: c_uint = 2;
@@ -389,8 +394,10 @@ fn mask(r: Reliance) -> u64 {
 
 // ----- objects --------------------------------------------------------------------------------
 
-/// `bw_context`.
+/// `bw_context`. Transparent, so that a `&Context` the library lends a callback can be handed
+/// to C as a `const bw_context *`.
 #[derive(Debug, Default)]
+#[repr(transparent)]
 pub struct BwContext {
     cx: Context,
 }
@@ -433,6 +440,10 @@ pub struct BwEngineBuilder {
     max_rounds: Option<u8>,
     float_values: bool,
     refuse: Vec<String>,
+    sharing: Option<Sharing>,
+    max_region: Option<u32>,
+    /// Host rewrites, each with whether it is trusted.
+    rewrites: Vec<(Arc<compiler::HostRewrite>, bool)>,
 }
 
 /// `bw_smt_import`.
@@ -752,13 +763,17 @@ pub unsafe extern "C" fn bw_print(
         let out = Out::new(out, "out")?;
         let e = expr(e)?;
         cx.width(e)?;
-        let opts = PrintOptions::default()
-            .with_lets(flags & PRINT_NO_LETS == 0)
-            .with_symbol_widths(flags & PRINT_SYMBOL_WIDTHS != 0);
-        let s = cx.display_with(e, opts).to_string();
-        unsafe { out.set(give(s)) };
+        unsafe { out.set(give(print(cx, e, flags))) };
         Ok(())
     })
+}
+
+/// `e` (a handle of `cx`) in the text syntax, with `BW_PRINT_*` flags.
+fn print(cx: &Context, e: Expr, flags: c_uint) -> String {
+    let opts = PrintOptions::default()
+        .with_lets(flags & PRINT_NO_LETS == 0)
+        .with_symbol_widths(flags & PRINT_SYMBOL_WIDTHS != 0);
+    cx.display_with(e, opts).to_string()
 }
 
 // ----- inspecting -----------------------------------------------------------------------------
@@ -1333,21 +1348,23 @@ pub unsafe extern "C" fn bw_facts_of(
             None => (cx.facts(e)?, Reliance::NONE),
             Some(a) => cx.facts_under(e, a)?.ok_or_else(infeasible)?,
         };
-        let (k, u, s) = (f.known(), f.urange(), f.srange());
-        unsafe {
-            out.set(BwFacts {
-                known_zero: value(&k.known_zero()),
-                known_one: value(&k.known_one()),
-                umin: value(&u.lo()),
-                umax: value(&u.hi()),
-                ustride: u.stride(),
-                smin: value(&s.lo()),
-                smax: value(&s.hi()),
-                relies_on: mask(r),
-            })
-        };
+        unsafe { out.set(c_facts(&f, mask(r))) };
         Ok(())
     })
+}
+
+fn c_facts(f: &bw::Facts, relies_on: u64) -> BwFacts {
+    let (k, u, s) = (f.known(), f.urange(), f.srange());
+    BwFacts {
+        known_zero: value(&k.known_zero()),
+        known_one: value(&k.known_one()),
+        umin: value(&u.lo()),
+        umax: value(&u.hi()),
+        ustride: u.stride(),
+        smin: value(&s.lo()),
+        smax: value(&s.hi()),
+        relies_on,
+    }
 }
 
 fn infeasible() -> Fail {
@@ -1467,7 +1484,10 @@ fn deobfuscate_strategy() -> Strategy {
 
 impl BwEngineBuilder {
     fn new(preset: c_int) -> Res<BwEngineBuilder> {
-        if !matches!(preset, PRESET_STANDARD | PRESET_DEOBFUSCATE) {
+        if !matches!(
+            preset,
+            PRESET_STANDARD | PRESET_DEOBFUSCATE | PRESET_COMPILE
+        ) {
             return Err(invalid(format!("unknown preset {preset}")));
         }
         Ok(BwEngineBuilder {
@@ -1476,21 +1496,48 @@ impl BwEngineBuilder {
             max_rounds: None,
             float_values: false,
             refuse: Vec::new(),
+            sharing: None,
+            max_region: None,
+            rewrites: Vec::new(),
         })
+    }
+
+    /// Whether the builder adds nothing to its preset (whose engine is shared).
+    fn is_plain(&self) -> bool {
+        self.programs.is_empty()
+            && self.max_rounds.is_none()
+            && !self.float_values
+            && self.sharing.is_none()
+            && self.max_region.is_none()
+            && self.rewrites.is_empty()
     }
 
     fn build(&self) -> Res<Engine> {
         let mut b = Engine::builder().builtin();
-        let mut strategy = if self.preset == PRESET_DEOBFUSCATE {
-            b = b.mba_solver(Arc::new(NormalFormSolver::default()));
-            deobfuscate_strategy()
-        } else {
-            Strategy::standard()
+        let mut strategy = match self.preset {
+            PRESET_DEOBFUSCATE => {
+                b = b.mba_solver(Arc::new(NormalFormSolver::default()));
+                deobfuscate_strategy()
+            }
+            PRESET_COMPILE => Strategy::compile(),
+            _ => Strategy::standard(),
         };
-        let mut groups = Vec::new();
+        let mut groups: Vec<String> = Vec::new();
         for (program, ledger) in &self.programs {
             groups.extend(program.groups().iter().map(|g| g.name.clone()));
             b = b.program(program.clone(), ledger);
+        }
+        for (r, trusted) in &self.rewrites {
+            let group = bw::engine::Rewrite::group(&**r);
+            if !groups.iter().any(|g| g == group) {
+                groups.push(group.to_string());
+            }
+            let r: Arc<dyn bw::engine::Rewrite> = r.clone();
+            b = if *trusted {
+                b.trusted_rewrite(r)
+            } else {
+                b.rewrite(r).allow_unproven(true)
+            };
         }
         let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
         if !groups.is_empty() {
@@ -1498,6 +1545,12 @@ impl BwEngineBuilder {
         }
         if let Some(n) = self.max_rounds {
             strategy = strategy.with_max_rounds(n);
+        }
+        if let Some(s) = self.sharing {
+            strategy = strategy.with_sharing(s);
+        }
+        if let Some(n) = self.max_region {
+            strategy = strategy.with_max_region(n);
         }
         strategy = strategy.with_float_values(self.float_values);
         b.strategy(strategy)
@@ -1509,17 +1562,18 @@ impl BwEngineBuilder {
 /// The engine of a preset without rules of its own, built once per process.
 fn preset_engine(preset: c_int) -> Res<Engine> {
     static DEOBFUSCATE: OnceLock<Engine> = OnceLock::new();
-    match preset {
-        PRESET_STANDARD => Ok(Engine::standard()),
-        PRESET_DEOBFUSCATE => {
-            if let Some(e) = DEOBFUSCATE.get() {
-                return Ok(e.clone());
-            }
-            let e = BwEngineBuilder::new(preset)?.build()?;
-            Ok(DEOBFUSCATE.get_or_init(|| e).clone())
-        }
-        _ => Err(invalid(format!("unknown preset {preset}"))),
+    static COMPILE: OnceLock<Engine> = OnceLock::new();
+    let cell = match preset {
+        PRESET_STANDARD => return Ok(Engine::standard()),
+        PRESET_DEOBFUSCATE => &DEOBFUSCATE,
+        PRESET_COMPILE => &COMPILE,
+        _ => return Err(invalid(format!("unknown preset {preset}"))),
+    };
+    if let Some(e) = cell.get() {
+        return Ok(e.clone());
     }
+    let e = BwEngineBuilder::new(preset)?.build()?;
+    Ok(cell.get_or_init(|| e).clone())
 }
 
 #[unsafe(no_mangle)]
@@ -1631,7 +1685,7 @@ pub unsafe extern "C" fn bw_engine_builder_build(
     run(|| {
         let b = unsafe { get(b, "b") }?;
         let out = Out::new(out, "out")?;
-        let engine = if b.programs.is_empty() && b.max_rounds.is_none() && !b.float_values {
+        let engine = if b.is_plain() {
             preset_engine(b.preset)?
         } else {
             b.build()?
@@ -1739,6 +1793,142 @@ pub unsafe extern "C" fn bw_simplify(
     })
 }
 
+/// `bw_pass_counts`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BwPassCounts {
+    calls: u64,
+    noop: u64,
+    changed: u64,
+    rejected_cost: u64,
+    rejected: u64,
+    atomized: u64,
+}
+
+impl From<&bw::engine::PassCounts> for BwPassCounts {
+    fn from(c: &bw::engine::PassCounts) -> Self {
+        BwPassCounts {
+            calls: c.calls,
+            noop: c.noop,
+            changed: c.changed,
+            rejected_cost: c.rejected_cost,
+            rejected: c.rejected,
+            atomized: c.atomized,
+        }
+    }
+}
+
+/// `bw_stats`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BwStats {
+    node_visits: u64,
+    memo_hits: u64,
+    candidates: u64,
+    match_steps: u64,
+    no_match: u64,
+    guard_false: u64,
+    degraded: u64,
+    no_change: u64,
+    rewrites: u64,
+    hook_vetoes: u64,
+    rejected: u64,
+    cycles_cut: u64,
+    quarantined: u64,
+    new_nodes: u64,
+    fact_work: u64,
+    pass_work: u64,
+    rounds: u32,
+    host: BwPassCounts,
+}
+
+impl From<&bw::engine::Stats> for BwStats {
+    fn from(s: &bw::engine::Stats) -> Self {
+        BwStats {
+            node_visits: s.node_visits,
+            memo_hits: s.memo_hits,
+            candidates: s.candidates,
+            match_steps: s.match_steps,
+            no_match: s.no_match,
+            guard_false: s.guard_false,
+            degraded: s.degraded,
+            no_change: s.no_change,
+            rewrites: s.rewrites,
+            hook_vetoes: s.hook_vetoes,
+            rejected: s.rejected,
+            cycles_cut: s.cycles_cut,
+            quarantined: s.quarantined,
+            new_nodes: s.new_nodes,
+            fact_work: s.fact_work,
+            pass_work: s.pass_work,
+            rounds: s.rounds,
+            host: (&s.host).into(),
+        }
+    }
+}
+
+/// Simplifies `n` roots in one call, or with `threads`, each on its own: the body of
+/// `bw_engine_run`, `bw_engine_run_each` and their `_stats` forms.
+///
+/// # Safety
+/// `engine` and `cx` are live, `roots` holds and `outcomes` has room for `n` elements, `budget`,
+/// `a` and `stats` are NULL or valid.
+#[allow(clippy::too_many_arguments)]
+unsafe fn simplify_roots(
+    engine: *const BwEngine,
+    cx: *mut BwContext,
+    roots: *const u64,
+    n: usize,
+    threads: Option<usize>,
+    b: *const BwBudget,
+    a: *const BwAssumptions,
+    outcomes: *mut BwOutcome,
+    stats: *mut BwStats,
+) -> c_int {
+    run(|| {
+        let bw_engine = unsafe { get(engine, "engine") }?;
+        let engine = &bw_engine.engine;
+        let refuse = Refuse(&bw_engine.refuse);
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let roots = exprs(unsafe { slice(roots, n, "roots") }?)?;
+        let limit = match unsafe { b.as_ref() } {
+            Some(b) => budget(b),
+            None => Budget::default(),
+        };
+        let a = unsafe { assumptions(a) };
+        if n > 0 && outcomes.is_null() {
+            return Err(invalid("`outcomes` is NULL"));
+        }
+        let out = match threads {
+            None => {
+                let mut options = Run::default().with_per_call(limit);
+                if let Some(a) = a {
+                    options = options.with_assumptions(a);
+                }
+                if !bw_engine.refuse.is_empty() {
+                    options = options.with_hooks(&refuse);
+                }
+                engine.run(cx, &roots, options)?
+            }
+            Some(threads) => {
+                let mut each = Each::default().with_threads(threads).with_per_root(limit);
+                if let Some(a) = a {
+                    each = each.with_assumptions(a);
+                }
+                if !bw_engine.refuse.is_empty() {
+                    each = each.with_hooks(&refuse);
+                }
+                engine.run_each(cx, &roots, each)?
+            }
+        };
+        unsafe { write_outcomes(&out, outcomes) };
+        if !stats.is_null() {
+            unsafe { stats.write((&out.stats).into()) };
+        }
+        Ok(())
+    })
+}
+
 /// # Safety
 /// `engine` and `cx` are live, `roots` holds and `outcomes` has room for `n` elements, `budget`
 /// and `a` are NULL or valid.
@@ -1752,31 +1942,24 @@ pub unsafe extern "C" fn bw_engine_run(
     a: *const BwAssumptions,
     outcomes: *mut BwOutcome,
 ) -> c_int {
-    run(|| {
-        let bw_engine = unsafe { get(engine, "engine") }?;
-        let engine = &bw_engine.engine;
-        let refuse = Refuse(&bw_engine.refuse);
-        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
-        let roots = exprs(unsafe { slice(roots, n, "roots") }?)?;
-        let per_call = match unsafe { b.as_ref() } {
-            Some(b) => budget(b),
-            None => Budget::default(),
-        };
-        let a = unsafe { assumptions(a) };
-        if n > 0 && outcomes.is_null() {
-            return Err(invalid("`outcomes` is NULL"));
-        }
-        let mut options = Run::default().with_per_call(per_call);
-        if let Some(a) = a {
-            options = options.with_assumptions(a);
-        }
-        if !bw_engine.refuse.is_empty() {
-            options = options.with_hooks(&refuse);
-        }
-        let out = engine.run(cx, &roots, options)?;
-        unsafe { write_outcomes(&out, outcomes) };
-        Ok(())
-    })
+    unsafe { simplify_roots(engine, cx, roots, n, None, b, a, outcomes, null_mut()) }
+}
+
+/// # Safety
+/// As [`bw_engine_run`]; `stats` is NULL or valid for writes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn bw_engine_run_stats(
+    engine: *const BwEngine,
+    cx: *mut BwContext,
+    roots: *const u64,
+    n: usize,
+    b: *const BwBudget,
+    a: *const BwAssumptions,
+    outcomes: *mut BwOutcome,
+    stats: *mut BwStats,
+) -> c_int {
+    unsafe { simplify_roots(engine, cx, roots, n, None, b, a, outcomes, stats) }
 }
 
 /// Writes `out`'s outcomes to `outcomes[0..)`.
@@ -1804,6 +1987,7 @@ unsafe fn write_outcomes(out: &bw::engine::Outcome, outcomes: *mut BwOutcome) {
 /// # Safety
 /// As [`bw_engine_run`].
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn bw_engine_run_each(
     engine: *const BwEngine,
     cx: *mut BwContext,
@@ -1814,33 +1998,37 @@ pub unsafe extern "C" fn bw_engine_run_each(
     a: *const BwAssumptions,
     outcomes: *mut BwOutcome,
 ) -> c_int {
-    run(|| {
-        let bw_engine = unsafe { get(engine, "engine") }?;
-        let engine = &bw_engine.engine;
-        let refuse = Refuse(&bw_engine.refuse);
-        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
-        let roots = exprs(unsafe { slice(roots, n, "roots") }?)?;
-        let per_root = match unsafe { b.as_ref() } {
-            Some(b) => budget(b),
-            None => Budget::default(),
-        };
-        let a = unsafe { assumptions(a) };
-        if n > 0 && outcomes.is_null() {
-            return Err(invalid("`outcomes` is NULL"));
-        }
-        let mut each = Each::default()
-            .with_threads(threads)
-            .with_per_root(per_root);
-        if let Some(a) = a {
-            each = each.with_assumptions(a);
-        }
-        if !bw_engine.refuse.is_empty() {
-            each = each.with_hooks(&refuse);
-        }
-        let out = engine.run_each(cx, &roots, each)?;
-        unsafe { write_outcomes(&out, outcomes) };
-        Ok(())
-    })
+    unsafe {
+        simplify_roots(
+            engine,
+            cx,
+            roots,
+            n,
+            Some(threads),
+            b,
+            a,
+            outcomes,
+            null_mut(),
+        )
+    }
+}
+
+/// # Safety
+/// As [`bw_engine_run_stats`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn bw_engine_run_each_stats(
+    engine: *const BwEngine,
+    cx: *mut BwContext,
+    roots: *const u64,
+    n: usize,
+    threads: usize,
+    b: *const BwBudget,
+    a: *const BwAssumptions,
+    outcomes: *mut BwOutcome,
+    stats: *mut BwStats,
+) -> c_int {
+    unsafe { simplify_roots(engine, cx, roots, n, Some(threads), b, a, outcomes, stats) }
 }
 
 // ----- SMT-LIB --------------------------------------------------------------------------------

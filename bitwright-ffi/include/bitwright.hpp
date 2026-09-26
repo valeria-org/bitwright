@@ -26,6 +26,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -140,7 +142,14 @@ enum class Kind : int {
 
 enum class Truth : int { False = BW_FALSE, True = BW_TRUE, Unknown = BW_UNKNOWN };
 
-enum class Preset : int { Standard = BW_PRESET_STANDARD, Deobfuscate = BW_PRESET_DEOBFUSCATE };
+enum class Preset : int {
+    Standard = BW_PRESET_STANDARD,
+    Deobfuscate = BW_PRESET_DEOBFUSCATE,
+    Compile = BW_PRESET_COMPILE,
+};
+
+// How the normal-form passes weigh sharing (see `bw_sharing`).
+enum class Sharing : int { Roots = BW_SHARING_ROOTS, Ignored = BW_SHARING_IGNORED };
 
 enum class End : int {
     Completed = BW_END_COMPLETED,
@@ -667,6 +676,11 @@ inline Proof prove_injective(Expr e, Expr of, bool bijective = false,
 
 // ----- contexts ------------------------------------------------------------------------------
 
+// Bits known to be 0 and bits known to be 1, masks of one width.
+struct KnownBits {
+    Value zero, one;
+};
+
 // A script read from SMT-LIB.
 struct SmtScript {
     std::vector<std::pair<std::string, Expr>> symbols;
@@ -697,6 +711,28 @@ class Context {
     std::size_t size() const { return bw_context_len(cx_); }
     // Drops every node: every expression of the context becomes stale.
     void clear() { bw_context_clear(cx_); }
+    // Makes room for `additional` more nodes (a host about to build a function of known size).
+    void reserve(std::size_t additional) { bw_context_reserve(cx_, additional); }
+
+    // Declares what the host knows of symbol `sym`'s value (see `bw_declare_known`): it becomes
+    // part of the symbol's meaning. Declare right after creating the symbol.
+    void declare_known(Expr sym, const KnownBits &k) {
+        detail::check(bw_declare_known_value(cx_, sym.raw(), &k.zero.raw(), &k.one.raw()));
+    }
+    // The same with masks of a symbol of at most 64 bits.
+    void declare_known(Expr sym, uint64_t zero, uint64_t one) {
+        detail::check(bw_declare_known(cx_, sym.raw(), zero, one));
+    }
+    // The known bits declared for symbol `sym`, if any.
+    std::optional<KnownBits> declared_known(Expr sym) const {
+        bw_value zero, one;
+        bool has = false;
+        detail::check(bw_declared_known(cx_, sym.raw(), &zero, &one, &has));
+        if (!has) {
+            return std::nullopt;
+        }
+        return KnownBits{Value(zero), Value(one)};
+    }
 
     Expr symbol(const std::string &name, uint16_t width) {
         return make(bw_symbol, name.c_str(), width);
@@ -784,11 +820,210 @@ class Context {
     bw_context *cx_;
 };
 
+// ----- host rewrites -------------------------------------------------------------------------
+
+// A node as a site sees it: its children are handles of the site's context.
+struct SiteNode {
+    Kind kind;
+    int op;      // UnOp, BinOp, CmpOp or FpOp by kind; -1 otherwise
+    uint16_t lo; // first bit of an extract; output of an extension call
+    uint16_t width;
+    std::vector<bw_expr> children;
+};
+
+// What a host rewrite may do at a node (see `bw_site`): inspect nodes, ask for their facts, build
+// nodes, on handles of the site's context. Lent for one call. When the call's budget runs out,
+// every request answers none (std::nullopt, 0, BW_NULL_EXPR).
+class Site {
+  public:
+    explicit Site(bw_site *s) : s_(s) {}
+
+    std::optional<SiteNode> node(bw_expr e) const {
+        bw_node n;
+        if (!bw_site_node(s_, e, &n)) {
+            return std::nullopt;
+        }
+        SiteNode r{static_cast<Kind>(n.kind), n.op, n.lo, n.width, {}};
+        r.children.assign(n.children, n.children + n.n_children);
+        return r;
+    }
+    // The width of `e`; 0 if it is not a handle of the site's context.
+    uint16_t width(bw_expr e) const { return bw_site_width(s_, e); }
+    // The value of `e`, if it is a constant.
+    std::optional<Value> value(bw_expr e) const {
+        bw_value v;
+        return bw_site_const_value(s_, e, &v) ? std::optional<Value>(Value(v)) : std::nullopt;
+    }
+    // The value of `e`, if it is a constant that fits in 64 bits.
+    std::optional<uint64_t> as_u64(bw_expr e) const {
+        uint64_t v = 0;
+        return bw_site_as_u64(s_, e, &v) ? std::optional<uint64_t>(v) : std::nullopt;
+    }
+    // The facts of `e` under the call's assumptions and declared bits, unless the fact budget
+    // declined the query.
+    std::optional<Facts> facts(bw_expr e) const {
+        bw_facts f;
+        if (!bw_site_facts(s_, e, &f)) {
+            return std::nullopt;
+        }
+        return Facts{Value(f.known_zero), Value(f.known_one), Value(f.umin),
+                     Value(f.umax),       f.ustride,          Value(f.smin),
+                     Value(f.smax),       f.relies_on};
+    }
+    // `e` in the text syntax (empty if it is not a handle of the site's context).
+    std::string str(bw_expr e, unsigned flags = 0) const {
+        return detail::take(bw_site_print(s_, e, flags));
+    }
+
+    bw_expr constant(const Value &v) { return bw_site_const(s_, &v.raw()); }
+    bw_expr constant(uint16_t width, uint64_t v) { return bw_site_const_u64(s_, width, v); }
+    bw_expr un(UnOp op, bw_expr a) { return bw_site_un(s_, static_cast<int>(op), a); }
+    bw_expr bin(BinOp op, bw_expr a, bw_expr b) {
+        return bw_site_bin(s_, static_cast<int>(op), a, b);
+    }
+    bw_expr cmp(CmpOp op, bw_expr a, bw_expr b) {
+        return bw_site_cmp(s_, static_cast<int>(op), a, b);
+    }
+    bw_expr zext(bw_expr a, uint16_t w) { return bw_site_zext(s_, a, w); }
+    bw_expr sext(bw_expr a, uint16_t w) { return bw_site_sext(s_, a, w); }
+    bw_expr trunc(bw_expr a, uint16_t w) { return bw_site_trunc(s_, a, w); }
+    bw_expr extract(bw_expr a, uint16_t lo, uint16_t len) {
+        return bw_site_extract(s_, a, lo, len);
+    }
+    bw_expr concat(bw_expr hi, bw_expr lo) { return bw_site_concat(s_, hi, lo); }
+    bw_expr select(bw_expr cond, bw_expr then, bw_expr els) {
+        return bw_site_select(s_, cond, then, els);
+    }
+
+    bw_site *raw() const { return s_; }
+
+  private:
+    bw_site *s_;
+};
+
+// A rewrite written by the host (see `bw_rewrite`): `fn` returns the replacement of a node, or
+// BW_NULL_EXPR to leave it. It may be called from several threads at once, and must be
+// deterministic. An exception it throws leaves the node.
+struct Rewrite {
+    std::string name;           // namespaced: "acme.fold_flags"
+    std::function<bw_expr(Site &, bw_expr)> fn;
+    std::string group = "host"; // the rule group that runs it
+    uint32_t revision = 1;      // bumped whenever its results change
+};
+
+namespace detail {
+inline bw_expr call_rewrite(void *user, bw_site *s, bw_expr e) noexcept {
+    try {
+        Site site(s);
+        return static_cast<const Rewrite *>(user)->fn(site, e);
+    } catch (...) {
+        return BW_NULL_EXPR;
+    }
+}
+
+inline void release_rewrite(void *user) noexcept { delete static_cast<Rewrite *>(user); }
+
+inline bw_rewrite c_rewrite(const Rewrite &r) {
+    bw_rewrite c{};
+    c.name = r.name.c_str();
+    c.group = r.group.c_str();
+    c.revision = r.revision;
+    c.user = const_cast<Rewrite *>(&r);
+    c.rewrite = &call_rewrite;
+    return c;
+}
+} // namespace detail
+
+// How thoroughly `check_rewrite` checks (see `bw_rewrite_check`); starts at the defaults.
+struct RewriteCheckConfig {
+    std::vector<uint16_t> widths; // empty: 1 to 8, 16, 32 and 64
+    uint32_t variants, max_exhaustive_bits, samples;
+    uint64_t seed;
+    RewriteCheckConfig() {
+        bw_rewrite_check d = bw_rewrite_check_default();
+        variants = d.variants;
+        max_exhaustive_bits = d.max_exhaustive_bits;
+        samples = d.samples;
+        seed = d.seed;
+    }
+};
+
+enum class RewriteFailureKind : int {
+    Unparsable = BW_REWRITE_UNPARSABLE,
+    NeverApplied = BW_REWRITE_NEVER_APPLIED,
+    Differs = BW_REWRITE_DIFFERS,
+    Width = BW_REWRITE_WIDTH,
+    NotSmaller = BW_REWRITE_NOT_SMALLER,
+    Nondeterministic = BW_REWRITE_NONDETERMINISTIC,
+    ForeignExpr = BW_REWRITE_FOREIGN_EXPR,
+};
+
+// Why a check failed; expressions in the text syntax.
+struct RewriteFailure {
+    RewriteFailureKind kind;
+    std::string message;
+    std::optional<std::string> node;   // the node (the input, for Unparsable)
+    std::optional<std::string> result; // the rewrite's result (the first, if nondeterministic)
+    std::optional<std::string> second; // Nondeterministic: the second result
+    std::vector<std::pair<std::string, Value>> assignment; // Differs: the symbols' values
+};
+
+// What a check covered, or why it failed: true when it passed.
+struct RewriteReport {
+    uint64_t applications = 0, points = 0, exhaustive = 0;
+    std::optional<RewriteFailure> failure;
+    explicit operator bool() const { return !failure; }
+};
+
+// Tests host rewrite `r` offline on `inputs` in the expression syntax (see `bw_check_rewrite`).
+inline RewriteReport check_rewrite(const Rewrite &r, const std::vector<std::string> &inputs,
+                                   const RewriteCheckConfig &cfg = RewriteCheckConfig()) {
+    bw_rewrite c = detail::c_rewrite(r);
+    std::vector<const char *> in;
+    for (const std::string &s : inputs) {
+        in.push_back(s.c_str());
+    }
+    bw_rewrite_check cc = bw_rewrite_check_default();
+    cc.widths = cfg.widths.empty() ? nullptr : cfg.widths.data();
+    cc.n_widths = cfg.widths.size();
+    cc.variants = cfg.variants;
+    cc.max_exhaustive_bits = cfg.max_exhaustive_bits;
+    cc.samples = cfg.samples;
+    cc.seed = cfg.seed;
+    bw_rewrite_report rep{};
+    bw_rewrite_failure *f = nullptr;
+    detail::check(bw_check_rewrite(&c, in.data(), in.size(), &cc, &rep, &f));
+    RewriteReport out;
+    if (f == nullptr) {
+        out.applications = rep.applications;
+        out.points = rep.points;
+        out.exhaustive = rep.exhaustive;
+        return out;
+    }
+    std::unique_ptr<bw_rewrite_failure, void (*)(bw_rewrite_failure *)> guard(
+        f, &bw_rewrite_failure_free);
+    auto text = [](const char *s) {
+        return s != nullptr ? std::optional<std::string>(s) : std::nullopt;
+    };
+    RewriteFailure fail{static_cast<RewriteFailureKind>(f->kind), f->message, text(f->node),
+                        text(f->result), text(f->second), {}};
+    for (std::size_t i = 0; i < f->n_assignment; i++) {
+        fail.assignment.emplace_back(f->names[i], Value(f->values[i]));
+    }
+    out.failure = std::move(fail);
+    return out;
+}
+
 // ----- engines -------------------------------------------------------------------------------
 
 // Caps on the work of one call; starts at the default budget.
 struct Budget : bw_budget {
     Budget() : bw_budget(bw_budget_default()) {}
+};
+
+// Counters of one call (see `bw_stats`); `host` counts the host rewrites.
+struct Stats : bw_stats {
+    Stats() : bw_stats() {}
 };
 
 // The result for one root: equal to the input wherever the constraints in `relies_on` hold.
@@ -810,6 +1045,8 @@ class Engine {
     static Engine standard() { return Engine(Preset::Standard); }
     // Also the deobfuscation passes and the MBA service (the command line's `simplify`).
     static Engine deobfuscate() { return Engine(Preset::Deobfuscate); }
+    // For a compiler, which simplifies every value of every function (see BW_PRESET_COMPILE).
+    static Engine compile() { return Engine(Preset::Compile); }
 
     Expr simplify(Expr e) const {
         bw_expr out = BW_NULL_EXPR;
@@ -817,20 +1054,21 @@ class Engine {
         return Expr(e.context(), out);
     }
 
-    // Simplifies roots of one context in one call.
+    // Simplifies roots of one context in one call; the call's counters to `*stats`, if given.
     std::vector<Outcome> run(const std::vector<Expr> &roots, const Budget *budget = nullptr,
-                             const Assumptions *a = nullptr) const {
+                             const Assumptions *a = nullptr, Stats *stats = nullptr) const {
         return run_with(roots, [&](bw_context *cx, const bw_expr *r, size_t n, bw_outcome *out) {
-            return bw_engine_run(e_.get(), cx, r, n, budget, raw_of(a), out);
+            return bw_engine_run_stats(e_.get(), cx, r, n, budget, raw_of(a), out, stats);
         });
     }
 
     // Simplifies roots of one context each on its own, on up to `threads` threads (0: all).
     std::vector<Outcome> run_each(const std::vector<Expr> &roots, size_t threads = 0,
-                                  const Budget *budget = nullptr,
-                                  const Assumptions *a = nullptr) const {
+                                  const Budget *budget = nullptr, const Assumptions *a = nullptr,
+                                  Stats *stats = nullptr) const {
         return run_with(roots, [&](bw_context *cx, const bw_expr *r, size_t n, bw_outcome *out) {
-            return bw_engine_run_each(e_.get(), cx, r, n, threads, budget, raw_of(a), out);
+            return bw_engine_run_each_stats(e_.get(), cx, r, n, threads, budget, raw_of(a), out,
+                                            stats);
         });
     }
 
@@ -893,6 +1131,28 @@ class EngineBuilder {
     // Refuses the rewrites of a rule (`group::rule`) or a pass (`linear`, …).
     EngineBuilder &refuse(const std::string &name) {
         detail::check(bw_engine_builder_refuse(b_.get(), name.c_str()));
+        return *this;
+    }
+
+    EngineBuilder &sharing(Sharing s) {
+        detail::check(bw_engine_builder_set_sharing(b_.get(), static_cast<int>(s)));
+        return *this;
+    }
+
+    // The most nodes the passes examine below a node (default 1024; the compile preset: 64).
+    EngineBuilder &max_region(uint32_t n) {
+        bw_engine_builder_set_max_region(b_.get(), n);
+        return *this;
+    }
+
+    // Links a host rewrite (a copy of `r`): sampled at every application, or, `trusted`, not
+    // (after `check_rewrite`, say). Its group runs in every rule phase.
+    EngineBuilder &rewrite(const Rewrite &r, bool trusted = false) {
+        auto owned = std::make_unique<Rewrite>(r);
+        bw_rewrite c = detail::c_rewrite(*owned);
+        c.release = &detail::release_rewrite;
+        detail::check(bw_engine_builder_add_rewrite(b_.get(), &c, trusted));
+        owned.release();
         return *this;
     }
 
@@ -1059,6 +1319,146 @@ inline std::string infer_preconditions(const std::string &text) {
     detail::check(bw_transform_infer(text.c_str(), &s));
     return detail::take(s);
 }
+
+// ----- in a compiler -------------------------------------------------------------------------
+
+// An instruction's semantics as an expression over named parameters, read at run time (see
+// `bw_template`). Cheap to copy, and safe to share between threads.
+class Template {
+  public:
+    Template(const std::string &text, const std::vector<std::string> &params) {
+        std::vector<const char *> p;
+        for (const std::string &s : params) {
+            p.push_back(s.c_str());
+        }
+        bw_template *t = nullptr;
+        detail::check(bw_template_new(text.c_str(), p.data(), p.size(), &t));
+        t_.reset(t, &bw_template_free);
+    }
+
+    // Reads the text with parameters of these widths: an error now, not at first use.
+    void check(const std::vector<uint16_t> &widths) const {
+        detail::check(bw_template_check(t_.get(), widths.data(), widths.size()));
+    }
+
+    // The expression in `cx`, the parameters bound to `args`.
+    Expr instantiate(Context &cx, const std::vector<Expr> &args) const {
+        std::vector<bw_expr> a;
+        for (Expr e : args) {
+            a.push_back(e.raw());
+        }
+        bw_expr out = BW_NULL_EXPR;
+        detail::check(bw_template_instantiate(t_.get(), cx.raw(), a.data(), a.size(), &out));
+        return cx.wrap(out);
+    }
+
+  private:
+    std::shared_ptr<bw_template> t_;
+};
+
+// One function of the host's IR translated into expressions of a context (see `bw_lowering`):
+// host values are `uint64_t`s of the host's choosing. The context must outlive it.
+class Lowering {
+  public:
+    explicit Lowering(Context &cx)
+        : cx_(&cx), lw_(detail::check_new(bw_lowering_new()), &bw_lowering_free) {}
+
+    Context &context() const { return *cx_; }
+
+    // The expression of host value `v`: its definition, or a fresh symbol standing for it.
+    Expr value(uint64_t v, uint16_t width) {
+        bw_expr out = BW_NULL_EXPR;
+        detail::check(bw_lowering_value(lw_.get(), cx_->raw(), v, width, &out));
+        return cx_->wrap(out);
+    }
+
+    // A value defined outside: a fresh symbol, with the known bits the host has of it.
+    Expr input(uint64_t v, uint16_t width, const std::optional<KnownBits> &known = std::nullopt) {
+        return input_raw(v, width, nullptr, known);
+    }
+    // The same with a symbol named `name`.
+    Expr input(uint64_t v, const std::string &name, uint16_t width,
+               const std::optional<KnownBits> &known = std::nullopt) {
+        return input_raw(v, width, name.c_str(), known);
+    }
+
+    // Records that host value `v` is `e`.
+    void define(uint64_t v, Expr e) {
+        detail::check(bw_lowering_define(lw_.get(), cx_->raw(), v, e.raw()));
+    }
+
+    std::optional<Expr> get(uint64_t v) const {
+        bw_expr e = BW_NULL_EXPR;
+        return bw_lowering_get(lw_.get(), v, &e) ? std::optional<Expr>(cx_->wrap(e)) : std::nullopt;
+    }
+
+    // A host value that computes `e` already, if one does.
+    std::optional<uint64_t> owner(Expr e) const {
+        uint64_t v = 0;
+        return bw_lowering_owner(lw_.get(), e.raw(), &v) ? std::optional<uint64_t>(v)
+                                                         : std::nullopt;
+    }
+
+    // The values defined outside that were read, in order, with their symbols.
+    std::vector<std::pair<uint64_t, Expr>> inputs() const {
+        std::vector<std::pair<uint64_t, Expr>> r;
+        std::size_t n = bw_lowering_input_count(lw_.get());
+        for (std::size_t i = 0; i < n; i++) {
+            uint64_t v = 0;
+            bw_expr s = BW_NULL_EXPR;
+            detail::check(bw_lowering_input_at(lw_.get(), i, &v, &s));
+            r.emplace_back(v, cx_->wrap(s));
+        }
+        return r;
+    }
+
+    // Turns `e` into host instructions: the value computing it. Nodes no host value computes are
+    // emitted, operands first, by `emit(Expr node_expr, const Node &node, const std::vector<
+    // uint64_t> &operands) -> uint64_t` (the value holding it), which is to read the context,
+    // not to build in it. An exception from `emit` stops the raise and is rethrown.
+    template <class Emit> uint64_t raise(Expr e, Emit &&emit) {
+        struct State {
+            Emit *emit;
+            std::exception_ptr error;
+        } state{&emit, nullptr};
+        auto call = [](void *user, const bw_context *cx, bw_expr x, const bw_node *n,
+                       const uint64_t *ops, size_t k, uint64_t *out) -> bw_status {
+            auto *st = static_cast<State *>(user);
+            try {
+                bw_context *c = const_cast<bw_context *>(cx);
+                Node node{static_cast<Kind>(n->kind), n->op, n->lo, n->width, {}};
+                for (uint32_t i = 0; i < n->n_children; i++) {
+                    node.children.emplace_back(c, n->children[i]);
+                }
+                *out = (*st->emit)(Expr(c, x), node, std::vector<uint64_t>(ops, ops + k));
+                return BW_OK;
+            } catch (...) {
+                st->error = std::current_exception();
+                return BW_ERR_UNSUPPORTED;
+            }
+        };
+        uint64_t v = 0;
+        bw_status s = bw_lowering_raise(lw_.get(), cx_->raw(), e.raw(), call, &state, &v);
+        if (state.error) {
+            std::rethrow_exception(state.error);
+        }
+        detail::check(s);
+        return v;
+    }
+
+  private:
+    Expr input_raw(uint64_t v, uint16_t width, const char *name,
+                   const std::optional<KnownBits> &known) {
+        bw_expr out = BW_NULL_EXPR;
+        detail::check(bw_lowering_input(lw_.get(), cx_->raw(), v, width, name,
+                                        known ? &known->zero.raw() : nullptr,
+                                        known ? &known->one.raw() : nullptr, &out));
+        return cx_->wrap(out);
+    }
+
+    Context *cx_;
+    std::unique_ptr<bw_lowering, void (*)(bw_lowering *)> lw_;
+};
 
 } // namespace bitwright
 

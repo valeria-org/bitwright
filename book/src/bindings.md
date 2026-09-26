@@ -19,10 +19,13 @@ cover what a host needs to hand its expressions to bitwright and read the result
 - [verifying compiler transformations](transformations.md): transformations in the Alive
   syntax, translation validation of LLVM IR, precondition inference;
 - engines that refuse rewrites by rule or pass name, and (Python) the trace of a run's
-  rewrites.
+  rewrites;
+- [in a compiler](compilers.md): the compile strategy, declared known bits, host rewrites as
+  callbacks with their checker, semantics templates, lowering a function into expressions and
+  raising results back, and the counters of a run.
 
-Extension operations, host hooks as callbacks, deadlines, allowances, custom strategies and
-other MBA backends are Rust only. The bindings have the version of the crate they are built
+Extension operations, host hooks (`Hooks`) as callbacks, deadlines, allowances, custom
+strategies and other MBA backends are Rust only. The bindings have the version of the crate they are built
 with, and give the same results. JavaScript has a string API: text in, text out.
 
 ## Python
@@ -537,6 +540,249 @@ int main() {
 }
 ```
 
+## In a compiler
+
+The pieces of [In a compiler](compilers.md), with host values as unsigned 64-bit integers of
+the host's choosing (an SSA number, a pointer) in place of Rust's generic value type:
+
+- **The compile strategy.** `BW_PRESET_COMPILE`, `Engine::compile()`, `Engine.compile()`. A
+  builder sets its two options on any preset: sharing (`BW_SHARING_ROOTS`, the default, or
+  `BW_SHARING_IGNORED`) and the region cap.
+- **Declared known bits** of a symbol (`bw_declare_known`), which become part of its meaning,
+  and `bw_context_reserve`.
+- **Host rewrites.** A callback that gets a site and a node and returns the node's replacement,
+  or nothing to leave it. The site views nodes, gives their facts, and builds nodes, charged to
+  the call's budget.
+  - The engine holds a callback to the checks it holds a Rust rewrite to: a result is committed
+    only when it is smaller in the termination order and passes the postconditions, and an
+    untrusted rewrite is compared with the node at sampled points at every application.
+  - A callback may run on several threads at once (`run_each`, an engine shared between
+    threads), so what it reads must be safe for that. In C it must not unwind (the C++ wrapper
+    catches an exception and leaves the node).
+  - Python calls it with the interpreter lock held: a callback per node is slow, so Python
+    rewrites are for prototyping. The expressions it gets and builds are views of the site
+    (`bw.Site`), valid for the call only.
+- **Checking a rewrite** offline (`bw_check_rewrite`, `check_rewrite`): a report of what was
+  covered, or the first failure, with the node, the result and the assignment where they
+  differ.
+- **Templates**, semantics as text read at run time and shareable between threads.
+- **Lowering and raising.** A lowering maps host values to expressions; raising a result calls
+  the host's emit callback for the nodes no host value computes, operands first.
+- **The counters of a run** (`bw_engine_run_stats`, the `stats` argument of `run` in C++ and
+  Python), host rewrites included.
+
+A function whose pointer parameter is 16-byte aligned, a remainder the compiler's own range
+analysis would remove written as a host rewrite, checked and then trusted, and the result raised
+back into instructions:
+
+```python
+import bitwright as bw
+
+cx = bw.Context()
+lw = bw.Lowering(cx)
+# %0 is a pointer the compiler knows is 16-byte aligned, %1 a byte:
+# %2 = and %0, 15; %3 = zext %1; %4 = urem %3, 1000; %5 = add %4, %2
+p = lw.input(0, 64, name="p", known=(15, 0))  # (bits known 0, bits known 1)
+wide = lw.input(1, 8, name="b").zext(64)
+lw.define(2, p & 15)
+lw.define(3, wide)
+lw.define(4, wide.urem(1000))
+v5 = wide.urem(1000) + (p & 15)
+lw.define(5, v5)
+
+
+def needless_rem(site: bw.Site, e: int) -> int | None:
+    """`urem(x, c)` as `x` when the facts show `x < c`. Nodes are the site's int handles."""
+    if site.op(e) != "urem":
+        return None
+    x, c = site.children(e)
+    bound, facts = site.value(c), site.facts(x)
+    return x if bound is not None and facts is not None and facts.umax < bound else None
+
+
+rem = bw.Rewrite("acme.needless_rem", needless_rem)
+assert bw.check_rewrite(rem, ["urem(zext<32>(b), 1000)", "urem(x, 1000)"])
+engine = bw.Engine("compile", trusted_rewrites=[rem])
+(out,), stats = engine.run([v5], stats=True)
+assert out.expr == wide and stats.host.changed == 1
+
+# Raising: %5 is %3 now. An unsigned minimum as a template, raised: two new instructions.
+code = []
+
+
+def emit(node: bw.Expr, operands: list[int]) -> int:
+    code.append(f"%{100 + len(code)} = {node.op or node.kind} {operands}")
+    return 100 + len(code) - 1
+
+
+assert lw.raise_(out.expr, emit) == 3 and not code
+umin = bw.Template("select(a <u b, a, b)", ["a", "b"])
+assert lw.raise_(umin.instantiate([out.expr, p]), emit) == 101
+assert code == ["%100 = ult [3, 0]", "%101 = select [100, 3, 0]"]
+```
+
+```c
+#include <assert.h>
+#include <inttypes.h>
+#include <stdio.h>
+
+#include "bitwright.h"
+
+/* `urem(x, c)` as `x` when the facts show `x < c`. */
+static bw_expr needless_rem(void *user, bw_site *site, bw_expr e) {
+    bw_node n;
+    uint64_t c;
+    bw_facts f;
+    int i;
+    (void)user;
+    if (!bw_site_node(site, e, &n) || n.kind != BW_KIND_BINARY || n.op != BW_UREM ||
+        !bw_site_as_u64(site, n.children[1], &c) || !bw_site_facts(site, n.children[0], &f)) {
+        return BW_NULL_EXPR;
+    }
+    for (i = 1; i < BW_VALUE_LIMBS; i++) {
+        if (f.umax.limbs[i] != 0) {
+            return BW_NULL_EXPR;
+        }
+    }
+    return f.umax.limbs[0] < c ? n.children[0] : BW_NULL_EXPR;
+}
+
+/* Prints an instruction for each new node; new values are numbered from 100. */
+static bw_status emit(void *user, const bw_context *cx, bw_expr e, const bw_node *node,
+                      const uint64_t *operands, size_t n, uint64_t *value) {
+    uint64_t *next = user;
+    char *text;
+    size_t i;
+    (void)node;
+    bw_print(cx, e, BW_PRINT_NO_LETS, &text);
+    printf("%%%" PRIu64 " = %s   (from", *next, text);
+    for (i = 0; i < n; i++) {
+        printf(" %%%" PRIu64, operands[i]);
+    }
+    printf(")\n");
+    bw_string_free(text);
+    *value = (*next)++;
+    return BW_OK;
+}
+
+int main(void) {
+    bw_context *cx = bw_context_new();
+    bw_lowering *lw = bw_lowering_new();
+    bw_expr p, b, fifteen, low, wide, thousand, rem, sum;
+
+    /* %0 is a pointer the compiler knows is 16-byte aligned, %1 a byte:
+     * %2 = and %0, 15; %3 = zext %1; %4 = urem %3, 1000; %5 = add %4, %2 */
+    bw_value aligned = bw_value_u64(64, 15), none = bw_value_u64(64, 0);
+    bw_lowering_input(lw, cx, 0, 64, "p", &aligned, &none, &p);
+    bw_lowering_input(lw, cx, 1, 8, "b", NULL, NULL, &b);
+    bw_const_u64(cx, 64, 15, &fifteen);
+    bw_bin(cx, BW_AND, p, fifteen, &low);
+    bw_lowering_define(lw, cx, 2, low);
+    bw_zext(cx, b, 64, &wide);
+    bw_lowering_define(lw, cx, 3, wide);
+    bw_const_u64(cx, 64, 1000, &thousand);
+    bw_bin(cx, BW_UREM, wide, thousand, &rem);
+    bw_lowering_define(lw, cx, 4, rem);
+    bw_bin(cx, BW_ADD, rem, low, &sum);
+    bw_lowering_define(lw, cx, 5, sum);
+
+    /* The rewrite, checked offline, then linked trusted. */
+    bw_rewrite rw = {"acme.needless_rem", NULL, 1, NULL, needless_rem, NULL};
+    const char *inputs[] = {"urem(zext<32>(b), 1000)", "urem(x, 1000)"};
+    bw_rewrite_report report;
+    bw_rewrite_failure *failure;
+    assert(bw_check_rewrite(&rw, inputs, 2, NULL, &report, &failure) == BW_OK);
+    assert(failure == NULL && report.applications > 0);
+    bw_engine_builder *builder = bw_engine_builder_new(BW_PRESET_COMPILE);
+    bw_engine_builder_add_rewrite(builder, &rw, true);
+    bw_engine *engine;
+    assert(bw_engine_builder_build(builder, &engine) == BW_OK);
+
+    /* %5 simplifies to %3: `p & 15` is 0, and the remainder is needless. */
+    bw_outcome out;
+    bw_stats stats;
+    assert(bw_engine_run_stats(engine, cx, &sum, 1, NULL, NULL, &out, &stats) == BW_OK);
+    assert(stats.host.changed == 1);
+    uint64_t next = 100, v;
+    assert(bw_lowering_raise(lw, cx, out.expr, emit, &next, &v) == BW_OK);
+    assert(v == 3 && next == 100); /* nothing to emit */
+
+    /* An unsigned minimum as a template, raised: the compare and the select are new. */
+    const char *params[] = {"a", "b"};
+    bw_template *umin;
+    bw_expr args[2] = {out.expr, p}, m;
+    assert(bw_template_new("select(a <u b, a, b)", params, 2, &umin) == BW_OK);
+    assert(bw_template_instantiate(umin, cx, args, 2, &m) == BW_OK);
+    assert(bw_lowering_raise(lw, cx, m, emit, &next, &v) == BW_OK);
+    assert(v == 101);
+
+    bw_template_free(umin);
+    bw_engine_free(engine);
+    bw_engine_builder_free(builder);
+    bw_lowering_free(lw);
+    bw_context_free(cx);
+    return 0;
+}
+```
+
+In C++, a rewrite is a `bitwright::Rewrite` holding a `std::function`, which the builder copies:
+
+```cpp
+#include <cassert>
+#include <string>
+#include <vector>
+
+#include "bitwright.hpp"
+
+namespace bw = bitwright;
+
+int main() {
+    bw::Context cx;
+    bw::Lowering lw(cx);
+    bw::Expr p = lw.input(0, "p", 64, bw::KnownBits{bw::Value(64, 15), bw::Value(64, 0)});
+    bw::Expr wide = lw.input(1, "b", 8).zext(64);
+    lw.define(2, wide);
+    bw::Expr v3 = wide.urem(wide.constant(1000)) + (p & 15);
+    lw.define(3, v3);
+
+    bw::Rewrite needless_rem{"acme.needless_rem", [](bw::Site &site, bw_expr e) -> bw_expr {
+        auto n = site.node(e);
+        if (!n || n->kind != bw::Kind::Binary || n->op != BW_UREM) {
+            return BW_NULL_EXPR;
+        }
+        auto c = site.as_u64(n->children[1]);
+        auto f = site.facts(n->children[0]);
+        auto hi = f ? f->umax.to_u64() : std::nullopt;
+        return c && hi && *hi < *c ? n->children[0] : BW_NULL_EXPR;
+    }};
+    assert(bw::check_rewrite(needless_rem, {"urem(zext<32>(b), 1000)", "urem(x, 1000)"}));
+
+    bw::Engine engine = bw::EngineBuilder(bw::Preset::Compile).rewrite(needless_rem, true).build();
+    bw::Stats stats;
+    auto out = engine.run({v3}, nullptr, nullptr, &stats);
+    assert(out[0].expr == wide && stats.host.changed == 1);
+
+    bw::Template umin("select(a <u b, a, b)", {"a", "b"});
+    bw::Expr m = umin.instantiate(cx, {out[0].expr, p});
+    std::vector<std::string> code;
+    uint64_t v = lw.raise(m, [&](bw::Expr e, const bw::Node &, const std::vector<uint64_t> &ops) {
+        code.push_back(e.str() + " from " + std::to_string(ops.size()) + " operands");
+        return uint64_t(100 + code.size());
+    });
+    assert(v == 102 && code.size() == 2 && lw.owner(m) == uint64_t(102));
+
+    // A wrong rewrite, caught offline with a counterexample.
+    bw::Rewrite wrong{"acme.wrong", [](bw::Site &site, bw_expr e) -> bw_expr {
+        auto n = site.node(e);
+        return n && n->kind == bw::Kind::Binary && n->op == BW_OR ? n->children[0] : BW_NULL_EXPR;
+    }};
+    bw::RewriteReport report = bw::check_rewrite(wrong, {"x | y"});
+    assert(!report && report.failure->kind == bw::RewriteFailureKind::Differs);
+    assert(!report.failure->assignment.empty());
+    return 0;
+}
+```
+
 ## JavaScript (WebAssembly)
 
 `bitwright-wasm/` builds bitwright as a WebAssembly module with no bindings generator, and
@@ -562,3 +808,31 @@ bw.lift("vex", "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1"); // "rax =
 
 `validate` (translation validation), `infer` (preconditions) and `toSmtlib` complete it;
 `bitwright-wasm/js/test.mjs` exercises each under Node.
+
+For a compiler, `simplify` takes more options: `engine: "compile"`, a symbol's declared known
+bits (`known`), host rewrites as JavaScript functions (`rewrites`), `sharing`, `maxRegion`,
+`maxRounds`, and `stats` (the result is then `{ expr, stats }`). A rewrite sees nodes as
+`BigInt` handles through its site, as in Python; an exception it throws is rethrown when the call
+ends. `checkRewrite` tests one offline, and `template` and `checkTemplate` read semantics as
+text. The module keeps no context between calls, so there is no lowering: a JavaScript host
+lowers by writing its values as expression text.
+
+```js
+const needlessRem = {
+  name: "acme.needless_rem",
+  // `urem(x, c)` as `x` when the facts show `x < c`.
+  rewrite: (site, e) => {
+    if (site.op(e) !== "urem") return null;
+    const [x, c] = site.children(e);
+    const bound = site.value(c), facts = site.facts(x);
+    return bound !== null && facts !== null && facts.umax < bound ? x : null;
+  },
+};
+bw.checkRewrite(needlessRem, ["urem(zext<32>(b), 1000)"]).passed; // true
+bw.simplify("urem(zext<64>(b:8), 1000) + (p & 15)", 64, {
+  engine: "compile",
+  known: { p: [15n, 0n] }, // 16-byte aligned: bits known 0, bits known 1
+  rewrites: [{ ...needlessRem, trusted: true }],
+}); // "zext<64>(b)"
+bw.template("select(a <u b, a, b)", ["a", "b"], ["x", "y"], 32); // "select(x <u y, x, y)"
+```
