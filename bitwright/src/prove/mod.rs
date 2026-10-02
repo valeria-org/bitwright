@@ -35,6 +35,7 @@ pub mod blast;
 mod cuts;
 pub mod domain;
 pub mod drup;
+mod exhaustion;
 pub mod finite;
 mod fp;
 mod relations;
@@ -50,6 +51,7 @@ use crate::facts::Assumptions;
 use crate::hash::IdMap;
 use crate::{BitVec, SymbolKey, Width};
 
+pub use exhaustion::Exhaustion;
 pub use rule::{RuleOutcome, WidthReport, rule, rule_all_widths};
 
 use aig::{Aig, Cnf, L};
@@ -132,6 +134,17 @@ pub struct Config {
     /// even after complete enumeration.
     /// [`SampleMode::Words`] also enables this path.
     pub word_sampling: bool,
+    /// Decide a question by evaluating it at every legal assignment when it has at most this
+    /// many unknown input bits, before bit-blasting. It applies to bounded integer DAGs of at
+    /// most 64-bit words, the same as [`word_sampling`](Self::word_sampling), and costs
+    /// `2^bits` evaluations, in parallel across threads; it is not bounded by the search
+    /// limits. A failing assignment is replayed on the original question. A proof asked for
+    /// with a [`certificate`](Self::certificate) comes with an [`Exhaustion`], which checks the
+    /// question's bit-blasted circuit at every assignment of its inputs, independently of the
+    /// word-level decision. If that circuit has more inputs than this bound (it may keep bits
+    /// the word program fixes from scoped assumptions as constrained inputs), the search
+    /// decides the question instead. 0 (the default): never.
+    pub exhaustive_inputs: u8,
 }
 
 impl Default for Config {
@@ -151,6 +164,7 @@ impl Default for Config {
             xor3_encoding: false,
             carry_save_multiplication: false,
             word_sampling: false,
+            exhaustive_inputs: 0,
         }
     }
 }
@@ -170,6 +184,7 @@ setters!(Config {
     with_xor3_encoding: xor3_encoding: bool,
     with_carry_save_multiplication: carry_save_multiplication: bool,
     with_word_sampling: word_sampling: bool,
+    with_exhaustive_inputs: exhaustive_inputs: u8,
 });
 
 impl Config {
@@ -200,7 +215,8 @@ fn simplifier() -> &'static crate::engine::Engine {
     })
 }
 
-/// Clauses and a DRUP proof that they are unsatisfiable.
+/// Clauses and a DRUP proof that they are unsatisfiable, or, for a proof by complete
+/// enumeration ([`Config::exhaustive_inputs`]), the circuit to enumerate.
 #[derive(Clone, Debug)]
 pub struct Certificate {
     /// The number of variables.
@@ -209,12 +225,20 @@ pub struct Certificate {
     pub clauses: Vec<Vec<Lit>>,
     /// The proof.
     pub proof: Vec<Step>,
+    /// The circuit of a proof by complete enumeration. Such a certificate has no clauses or
+    /// DRUP proof, so its [`dimacs`](Self::dimacs) and [`drat`](Self::drat) export nothing a
+    /// DRAT checker would accept.
+    pub exhaustion: Option<Exhaustion>,
 }
 
 impl Certificate {
-    /// Checks the proof with the independent checker.
+    /// Checks the proof with the independent checker: the DRUP proof against the clauses, or
+    /// the circuit of an [`Exhaustion`] at every assignment of its inputs.
     pub fn check(&self) -> Result<(), String> {
-        drup::check(&self.clauses, &self.proof)
+        match &self.exhaustion {
+            Some(exhaustion) => exhaustion.check(),
+            None => drup::check(&self.clauses, &self.proof),
+        }
     }
 
     /// The clauses in DIMACS CNF.
@@ -722,24 +746,30 @@ impl Question {
             q.stats.samples = trial.samples;
             word_sampled = true;
             if let Some(mut model) = trial.model {
-                // Simplification can omit original symbols. Supply values consistent with
-                // their declarations before replaying the original constrained predicate.
-                for id in cx.symbols_in(&[q.root])? {
-                    let key = cx.symbol_key(id).unwrap().clone();
-                    if !model.iter().any(|(k, _)| *k == key) {
-                        let symbol = cx.find_symbol(&key).unwrap();
-                        let value = cx.declared_known(symbol)?.map_or_else(
-                            || BitVec::zero(cx.symbol_width(id).unwrap()),
-                            |k| k.known_one(),
-                        );
-                        model.push((key, value));
-                    }
-                }
+                complete_model(cx, q.root, &mut model)?;
                 let outcome = q.refuted(cx, model)?;
                 return decided(q, outcome);
             }
             if trial.complete && !cfg.certificate {
                 return decided(q, Outcome::Proved(None));
+            }
+        }
+        // Every legal assignment, when there are few enough. A proof that asks for a
+        // certificate takes it from the circuit below, which is checked independently.
+        let mut exhausted = false;
+        if cfg.exhaustive_inputs != 0
+            && let Some((failure, evaluated)) =
+                sample_words::try_exhaust(cx, goal_node, &cons, assumptions, cfg.exhaustive_inputs)
+        {
+            q.stats.samples += evaluated;
+            match failure {
+                Some(mut model) => {
+                    complete_model(cx, q.root, &mut model)?;
+                    let outcome = q.refuted(cx, model)?;
+                    return decided(q, outcome);
+                }
+                None if !cfg.certificate => return decided(q, Outcome::Proved(None)),
+                None => exhausted = true,
             }
         }
         let constant_goal = cuts::constant_true(cx, goal_node);
@@ -791,6 +821,18 @@ impl Question {
                         .map(|known| blast::konst(&known.known_one()))
                         .unwrap_or_default();
                 q.symbols.push((k, w, bits));
+            }
+        }
+        if exhausted {
+            let exhaustion = Exhaustion::of(&b.g, goal, &extra);
+            if exhaustion.inputs() <= u32::from(cfg.exhaustive_inputs.min(63)) {
+                let cert = Certificate {
+                    vars: 0,
+                    clauses: Vec::new(),
+                    proof: Vec::new(),
+                    exhaustion: Some(exhaustion),
+                };
+                return decided(q, Outcome::Proved(Some(cert)));
             }
         }
         // Sampled: a lane where the constraints hold and the goal does not refutes it.
@@ -883,6 +925,7 @@ impl Question {
                     vars: s.solver.num_vars(),
                     clauses: core::mem::take(&mut s.cnf.clauses),
                     proof,
+                    exhaustion: None,
                 });
                 Outcome::Proved(cert)
             }
@@ -938,6 +981,23 @@ impl Question {
             )))
         }
     }
+}
+
+/// Simplification can omit original symbols: supply values consistent with their declarations
+/// before replaying the original constrained predicate.
+fn complete_model(cx: &mut Context, root: Expr, model: &mut Model) -> Result<(), Error> {
+    for id in cx.symbols_in(&[root])? {
+        let key = cx.symbol_key(id).unwrap().clone();
+        if !model.iter().any(|(k, _)| *k == key) {
+            let symbol = cx.find_symbol(&key).unwrap();
+            let value = cx.declared_known(symbol)?.map_or_else(
+                || BitVec::zero(cx.symbol_width(id).unwrap()),
+                |k| k.known_one(),
+            );
+            model.push((key, value));
+        }
+    }
+    Ok(())
 }
 
 /// The 64 consecutive assignments `64*batch .. 64*batch+64`, transposed into input words.

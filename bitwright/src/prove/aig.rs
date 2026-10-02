@@ -399,6 +399,42 @@ impl Aig {
         self.or(t, bc)
     }
 
+    /// The cone of `roots`, renumbered: node 0 is the constant, nodes `1..=inputs` are the
+    /// cone's inputs in creation order, and gate `i` is node `inputs + 1 + i`. Returns the
+    /// input count, each gate's operands, and the roots, all in the new numbering.
+    pub(crate) fn cone(&self, roots: &[L]) -> (u32, Vec<(L, L)>, Vec<L>) {
+        let mut live = vec![false; self.nodes.len()];
+        let mut stack: Vec<u32> = roots.iter().map(|&l| l >> 1).collect();
+        while let Some(n) = stack.pop() {
+            if core::mem::replace(&mut live[n as usize], true) {
+                continue;
+            }
+            if let Node::And(a, b) = self.nodes[n as usize] {
+                stack.push(a >> 1);
+                stack.push(b >> 1);
+            }
+        }
+        let mut id = vec![0u32; self.nodes.len()];
+        let mut inputs = 0;
+        for (n, node) in self.nodes.iter().enumerate() {
+            if live[n] && matches!(node, Node::Input) {
+                inputs += 1;
+                id[n] = inputs;
+            }
+        }
+        let renumber = |id: &[u32], l: L| (id[(l >> 1) as usize] << 1) | (l & 1);
+        let mut gates = Vec::new();
+        for (n, node) in self.nodes.iter().enumerate() {
+            if let (true, Node::And(a, b)) = (live[n], *node) {
+                // Operands precede their gate, so both are numbered already.
+                gates.push((renumber(&id, a), renumber(&id, b)));
+                id[n] = inputs + gates.len() as u32;
+            }
+        }
+        let roots = roots.iter().map(|&l| renumber(&id, l)).collect();
+        (inputs, gates, roots)
+    }
+
     /// The value of every node, the `k`-th input (in creation order) taking `input(k)`: nodes
     /// are created after their operands, so one pass in order evaluates them all.
     pub fn eval_all(&self, input: impl Fn(u32) -> bool) -> Vec<bool> {

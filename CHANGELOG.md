@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Certified exhaustive decisions:** `Config::exhaustive_inputs` (default 0, off) decides
+  a question with at most that many unknown input bits by evaluating every legal
+  assignment of its word-level program, in blocks and in parallel across threads. A
+  failure is the first failing assignment in enumeration order, replayed on the original
+  question. With a certificate, the proof is a new `Exhaustion`: the question's bit-blasted
+  circuit, which `Certificate::check` simulates at every assignment of its inputs,
+  independently of the word-level decision. The simulation reuses registers by liveness and
+  stops a block once each assignment has a false conjunct of a negated-conjunction goal.
+  `Certificate` gains a public `exhaustion` field (an exhaustion certificate has no clauses
+  or DRUP proof). The two valid 32-bit hard fixtures, `masked-pair-32-unique` and
+  `fingerprint-32`, are now proved with checked certificates in both spellings and both
+  arithmetic encodings, in 8.3–11.1 s per query (12–20 s under heavy load) on a shared
+  20-core host; the benchmark's `--exhaustive-inputs N` measures this. `fingerprint-64` and full-width
+  sources stay beyond enumeration.
 - **Complete-query benchmark target:** `--mixers --query-budget-ms 10` measures fresh
   original native queries through preparation and independent proof/model checking.
   Unresolved queries and queries over the target fail the acceptance run, with separate

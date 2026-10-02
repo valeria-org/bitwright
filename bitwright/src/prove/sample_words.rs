@@ -8,6 +8,9 @@ use crate::{
 
 const MAX_NODES: usize = 4096;
 
+mod exhaust;
+pub(super) use exhaust::stripes;
+
 pub(super) struct Trial {
     pub samples: u64,
     pub model: Option<Model>,
@@ -610,6 +613,32 @@ pub(super) fn try_sample(
         model: None,
         complete: false,
     })
+}
+
+/// Decides the goal under the constraints by evaluating every legal assignment, when the word
+/// program has at most `limit` unknown input bits. Returns the first failing assignment's model
+/// (`None` when the goal holds everywhere) and the number of assignments evaluated.
+pub(super) fn try_exhaust(
+    cx: &mut Context,
+    goal: u32,
+    constraints: &[u32],
+    assumptions: Option<&Assumptions>,
+    limit: u8,
+) -> Option<(Option<Model>, u64)> {
+    let program = Program::compile(cx, goal, constraints, assumptions)?;
+    let (found, evaluated) = program.exhaust(limit)?;
+    let model = match found {
+        exhaust::Exhausted::Holds => None,
+        exhaust::Exhausted::Fails(values) => Some(
+            program
+                .symbols
+                .iter()
+                .zip(values)
+                .map(|(s, v)| (s.key.clone(), BitVec::from_u64(s.width, v).unwrap()))
+                .collect(),
+        ),
+    };
+    Some((model, evaluated))
 }
 
 #[cfg(test)]

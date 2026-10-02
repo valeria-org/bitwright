@@ -26,6 +26,8 @@
 //!   --word-samples    with --mixers: try machine-word samples before building circuits
 //!   --query-budget-ms N   with --mixers: require each fresh native query to settle within N ms,
 //!                         including preparation, certificate checking and original model replay
+//!   --exhaustive-inputs N with --mixers: decide questions of at most N unknown input bits by
+//!                         complete enumeration (certificates simulate the circuit independently)
 //! ```
 
 mod bench;
@@ -62,6 +64,7 @@ struct Options {
     carry_save: bool,
     word_sampling: bool,
     query_budget_ns: Option<u64>,
+    exhaustive_inputs: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +96,7 @@ fn parse_args() -> Result<Options, String> {
         carry_save: false,
         word_sampling: false,
         query_budget_ns: None,
+        exhaustive_inputs: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -149,6 +153,13 @@ fn parse_args() -> Result<Options, String> {
                         .ok_or("--query-budget-ms must be positive and fit in nanoseconds")?,
                 );
             }
+            "--exhaustive-inputs" => {
+                o.exhaustive_inputs = value("--exhaustive-inputs")?
+                    .parse()
+                    .ok()
+                    .filter(|n| (1..=63).contains(n))
+                    .ok_or("--exhaustive-inputs takes a bit count from 1 to 63")?;
+            }
             // `cargo bench` passes this; accept it so the binary works as a bench target too.
             "--bench" => {}
             f if f.starts_with("--") => return Err(format!("unknown option `{f}`")),
@@ -179,6 +190,9 @@ fn main() -> ExitCode {
                     && !arg
                         .strip_prefix("query-budget-ns=")
                         .is_some_and(|value| value.parse::<u64>().is_ok_and(|ns| ns != 0))
+                    && !arg.strip_prefix("exhaustive-inputs=").is_some_and(|value| {
+                        value.parse::<u8>().is_ok_and(|n| (1..=63).contains(&n))
+                    })
             })
             || !["nested", "compact"].contains(&worker[2].as_str())
             || !["raw", "simplified"].contains(&worker[3].as_str())
@@ -205,6 +219,10 @@ fn main() -> ExitCode {
                 query_budget_ns: worker[4..]
                     .iter()
                     .find_map(|arg| arg.strip_prefix("query-budget-ns=")?.parse().ok()),
+                exhaustive_inputs: worker[4..]
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("exhaustive-inputs=")?.parse().ok())
+                    .unwrap_or(0),
             },
         );
     }
@@ -223,7 +241,8 @@ fn main() -> ExitCode {
         || opts.xor3
         || opts.carry_save
         || opts.word_sampling
-        || opts.query_budget_ns.is_some())
+        || opts.query_budget_ns.is_some()
+        || opts.exhaustive_inputs != 0)
         && !opts.mixers
     {
         eprintln!("mixer search options require --mixers");
@@ -258,6 +277,7 @@ fn main() -> ExitCode {
                     "--carry-save",
                     "--word-samples",
                     "--query-budget-ms",
+                    "--exhaustive-inputs",
                 ]
                 .contains(&arg.as_str())
         }) {
@@ -279,6 +299,7 @@ fn main() -> ExitCode {
                 word_sampling: opts.word_sampling,
                 fast: opts.fast,
                 query_budget_ns: opts.query_budget_ns,
+                exhaustive_inputs: opts.exhaustive_inputs,
             },
         );
     }

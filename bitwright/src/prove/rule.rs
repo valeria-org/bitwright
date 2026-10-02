@@ -458,6 +458,7 @@ fn attempt(
             vars: solver.num_vars(),
             clauses: core::mem::take(&mut cnf.clauses),
             proof: solver.take_proof().unwrap_or_default(),
+            exhaustion: None,
         })),
         Answer::Sat(model) => {
             let params: Vec<BitVec> = s

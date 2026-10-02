@@ -408,3 +408,169 @@ fn independent_streams_are_bounded_and_keep_shared_inputs_single_valued() {
         }
     }
 }
+
+fn exhaustive_config(bits: u8) -> Config {
+    Config::default()
+        .with_simplify(false)
+        .with_samples(0)
+        .with_exhaustive_inputs(bits)
+}
+
+#[test]
+fn exhaustive_decisions_carry_independent_circuit_certificates() {
+    let mut cx = Context::new();
+    let w = Width::W16;
+    let x = cx.symbol("x", w).unwrap();
+    let square = cx.mul(x, x).unwrap();
+    // 0x1234 is not a square modulo 2^16.
+    let k = cx.constant_u64(w, 0x1234).unwrap();
+    let p = cx.ne(square, k).unwrap();
+    let q = Question::valid(&mut cx, p, &exhaustive_config(16)).unwrap();
+    assert!(matches!(q.outcome(), Some(Outcome::Proved(None))));
+    assert_eq!(q.stats().samples, 1 << 16);
+    assert_eq!(q.stats().nodes, 0, "decided before blasting");
+    let cfg = exhaustive_config(16).with_certificate(true);
+    let q = Question::valid(&mut cx, p, &cfg).unwrap();
+    let Some(Outcome::Proved(Some(cert))) = q.outcome() else {
+        panic!("{:?}", q.outcome());
+    };
+    let exhaustion = cert.exhaustion.as_ref().expect("an exhaustion certificate");
+    assert_eq!(exhaustion.inputs(), 16);
+    assert!(cert.clauses.is_empty() && cert.proof.is_empty());
+    cert.check().unwrap();
+    // Below the domain, the question stays open for the search.
+    let q = Question::valid(&mut cx, p, &exhaustive_config(15)).unwrap();
+    assert!(q.outcome().is_none());
+    assert_eq!(q.stats().samples, 0);
+
+    // 9 is a square: the first root in enumeration order is reported and replayed.
+    let nine = cx.constant_u64(w, 9).unwrap();
+    let p = cx.ne(square, nine).unwrap();
+    for certificate in [false, true] {
+        let q = Question::valid(&mut cx, p, &cfg.with_certificate(certificate)).unwrap();
+        let Some(Outcome::Refuted(model)) = q.outcome() else {
+            panic!("{:?}", q.outcome());
+        };
+        assert_eq!(model[0].1.to_u64(), Some(3));
+        assert_eq!(q.stats().samples, 4);
+    }
+    // Under assumptions excluding every root, it holds; the certificate checks the
+    // constraint inside the circuit, over the whole domain.
+    let three = cx.constant_u64(w, 3).unwrap();
+    let small = cx.ult(x, three).unwrap();
+    let mut assumptions = crate::Assumptions::new();
+    assumptions.assume_true(&mut cx, small).unwrap();
+    let q = Question::valid_under(&mut cx, p, Some(&assumptions), &cfg).unwrap();
+    let Some(Outcome::Proved(Some(cert))) = q.outcome() else {
+        panic!("{:?}", q.outcome());
+    };
+    assert_eq!(cert.exhaustion.as_ref().unwrap().inputs(), 16);
+    cert.check().unwrap();
+}
+
+#[test]
+fn exhaustive_decisions_match_independent_generated_truth_tables() {
+    let mut decisions = [0usize; 2];
+    let mut certified = 0;
+    for seed in 0..160 {
+        let mut cx = Context::new();
+        let mut generator = Gen {
+            rng: Rng(0x4558_4841_5553_5449 + seed),
+            max_w: 6,
+            vars: Vec::new(),
+        };
+        let (p, reference) = generator.expr(&mut cx, 1, 4);
+        let input_bits: u16 = generator.vars.iter().map(|(_, width)| width).sum();
+        if input_bits > 14 {
+            continue;
+        }
+        let mut valid = true;
+        for assignment in 0..1u64 << input_bits {
+            let mut offset = 0;
+            let env: Vec<_> = generator
+                .vars
+                .iter()
+                .map(|(_, width)| {
+                    let value = (assignment >> offset) & mask(*width);
+                    offset += width;
+                    reference::Bits::from_u128(*width, u128::from(value))
+                })
+                .collect();
+            valid &= reference.eval(&env).unwrap().bit(0);
+        }
+        decisions[usize::from(valid)] += 1;
+        for certificate in [false, true] {
+            let cfg = exhaustive_config(14).with_certificate(certificate);
+            let mut q = Question::valid(&mut cx, p, &cfg).unwrap();
+            let outcome = match q.outcome() {
+                Some(o) => o.clone(),
+                // Outside the word program's operations: the ordinary path decides it.
+                None => q.solve(&mut cx, Limits::conflicts(100_000)).unwrap(),
+            };
+            match outcome {
+                Outcome::Proved(cert) => {
+                    assert!(valid, "{}", cx.display(p));
+                    assert_eq!(cert.is_some(), certificate);
+                    if let Some(cert) = cert {
+                        cert.check().unwrap();
+                        certified += usize::from(cert.exhaustion.is_some());
+                    }
+                }
+                Outcome::Refuted(model) => {
+                    assert!(!valid, "{}", cx.display(p));
+                    let env: Vec<_> = generator
+                        .vars
+                        .iter()
+                        .map(|(name, width)| {
+                            let value = model
+                                .iter()
+                                .find(|(key, _)| key == &SymbolKey::from(name.as_str()))
+                                .map_or(0, |(_, value)| value.to_u64().unwrap());
+                            reference::Bits::from_u128(*width, u128::from(value))
+                        })
+                        .collect();
+                    assert!(!reference.eval(&env).unwrap().bit(0));
+                }
+                other => panic!("complete small domain left undecided: {other:?}"),
+            }
+        }
+    }
+    assert!(decisions[0] >= 10 && decisions[1] >= 10, "{decisions:?}");
+    assert!(certified >= 10, "{certified}");
+}
+
+#[test]
+fn scoped_seed_bits_shrink_both_the_enumeration_and_its_certificate() {
+    let mut cx = Context::new();
+    let w = Width::W16;
+    let x = cx.symbol("x", w).unwrap();
+    // The scope fixes the high byte to 0x12 directly on the symbol, a seed mask.
+    let mut assumptions = crate::Assumptions::new();
+    let high = crate::KnownBits::new(
+        BitVec::from_u64(w, 0xed00).unwrap(),
+        BitVec::from_u64(w, 0x1200).unwrap(),
+    )
+    .unwrap();
+    assumptions
+        .assume(&mut cx, x, crate::Facts::from_known(high))
+        .unwrap();
+    let cfg = exhaustive_config(8).with_certificate(true);
+    let floor = cx.constant_u64(w, 0x1200).unwrap();
+    let p = cx.uge(x, floor).unwrap();
+    let q = Question::valid_under(&mut cx, p, Some(&assumptions), &cfg).unwrap();
+    assert_eq!(q.stats().samples, 256);
+    let Some(Outcome::Proved(Some(cert))) = q.outcome() else {
+        panic!("{:?}", q.outcome());
+    };
+    // The circuit honours the same scoped domain: eight inputs, not sixteen.
+    assert_eq!(cert.exhaustion.as_ref().unwrap().inputs(), 8);
+    cert.check().unwrap();
+    // A bound that fails inside the scope is refuted there, and only there.
+    let floor = cx.constant_u64(w, 0x1280).unwrap();
+    let p = cx.uge(x, floor).unwrap();
+    let q = Question::valid_under(&mut cx, p, Some(&assumptions), &cfg).unwrap();
+    let Some(Outcome::Refuted(model)) = q.outcome() else {
+        panic!("{:?}", q.outcome());
+    };
+    assert_eq!(model[0].1.to_u64(), Some(0x1200));
+}

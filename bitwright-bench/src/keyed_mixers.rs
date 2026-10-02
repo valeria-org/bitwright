@@ -247,6 +247,7 @@ pub struct SearchOptions {
     pub word_sampling: bool,
     pub fast: bool,
     pub query_budget_ns: Option<u64>,
+    pub exhaustive_inputs: u8,
 }
 
 fn native_config(options: SearchOptions) -> Config {
@@ -258,6 +259,7 @@ fn native_config(options: SearchOptions) -> Config {
         .with_xor3_encoding(options.xor3)
         .with_carry_save_multiplication(options.carry_save)
         .with_word_sampling(options.word_sampling)
+        .with_exhaustive_inputs(options.exhaustive_inputs)
         .with_certificate(true)
         .with_samples(0)
         .with_simplify(false)
@@ -308,13 +310,14 @@ fn query_budget_worker(
     let (status, passed) = budget_status(status, reading.wall_ns, budget_ns);
     let stats = question.stats();
     let mode = format!(
-        "raw+relations={}+selectors={}+input-cancel={}+factor-joins={}+xor3={}+carry-save={}",
+        "raw+relations={}+selectors={}+input-cancel={}+factor-joins={}+xor3={}+carry-save={}+exhaustive-inputs={}",
         options.relations,
         options.selectors,
         options.input_cancellation,
         options.join_factoring,
         options.xor3,
         options.carry_save,
+        options.exhaustive_inputs,
     );
     row(
         name,
@@ -359,6 +362,7 @@ pub fn worker(name: &str, compact: bool, simplified: bool, options: SearchOption
         word_sampling,
         fast,
         query_budget_ns: _,
+        exhaustive_inputs: _,
     } = options;
     let spelling = if compact {
         Spelling::Compact
@@ -686,6 +690,7 @@ pub fn report(filters: &[String], options: SearchOptions) -> ExitCode {
         word_sampling,
         fast,
         query_budget_ns,
+        exhaustive_inputs,
     } = options;
     println!(
         "case,spelling,mode,expected,phase,status,instructions,cpu_ns,wall_ns,aig_nodes,cnf_vars,cnf_clauses,conflicts,propagations,process_peak_kib,samples,learned"
@@ -733,6 +738,9 @@ pub fn report(filters: &[String], options: SearchOptions) -> ExitCode {
                 }
                 if let Some(ns) = query_budget_ns {
                     command.arg(format!("query-budget-ns={ns}"));
+                }
+                if exhaustive_inputs != 0 {
+                    command.arg(format!("exhaustive-inputs={exhaustive_inputs}"));
                 }
                 let result = command.status().expect("keyed-mixer worker");
                 if !result.success() {

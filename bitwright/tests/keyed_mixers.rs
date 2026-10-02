@@ -1688,3 +1688,40 @@ fn cross_key_budget_exhaustion_is_explicit_and_escalation_reuses_the_question() 
         assert_eq!(once.stats(), spent);
     }
 }
+
+#[test]
+#[ignore = "heavy: four 2^32-input exhaustive decisions with circuit-simulation certificates; run with --release -- --ignored"]
+fn narrow_original_queries_are_decided_by_certified_exhaustion() {
+    let cfg = Config::default()
+        .with_certificate(true)
+        .with_samples(0)
+        .with_simplify(false)
+        .with_exhaustive_inputs(32);
+    for spelling in [Spelling::Nested, Spelling::Compact] {
+        for name in ["masked-pair-32-unique", "fingerprint-32", "masked-pair-32"] {
+            let mut cx = Context::new();
+            let (claim, expected) = claim(&mut cx, name, spelling);
+            let q = Question::valid(&mut cx, claim, &cfg).unwrap();
+            assert_eq!(q.stats().nodes > 0, expected == Expected::Proved, "{name}");
+            match (q.outcome(), expected) {
+                (Some(Outcome::Proved(Some(cert))), Expected::Proved) => {
+                    let exhaustion = cert.exhaustion.as_ref().unwrap();
+                    assert_eq!(exhaustion.inputs(), 32, "{name}");
+                    cert.check().unwrap();
+                }
+                (Some(Outcome::Refuted(model)), Expected::Refuted) => {
+                    // The unique masked-pair solution, replayed on the original predicate.
+                    assert_eq!(model[0].1.to_u64(), Some(CANDIDATE));
+                    assert!(cx.eval(&[claim], &model[..]).unwrap()[0].is_zero());
+                }
+                (other, _) => panic!("{name} {spelling:?}: {other:?}"),
+            }
+        }
+        // A full-width source is beyond any enumeration and keeps the ordinary search.
+        let mut cx = Context::new();
+        let (claim, _) = claim(&mut cx, "fingerprint-64", spelling);
+        let q = Question::valid(&mut cx, claim, &cfg.with_exhaustive_inputs(63)).unwrap();
+        assert!(q.outcome().is_none());
+        assert_eq!(q.stats().samples, 0);
+    }
+}

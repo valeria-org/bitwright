@@ -2225,3 +2225,95 @@ controls pass; a one-nanosecond diagnostic correctly rejects a checked proof as
 over time. Invalid or overflowing budgets, incompatible sampling/escalation and
 empty fixture selections are errors. These measurements add an acceptance check,
 not a new inference rule or a recovery claim.
+
+### Certified exhaustive decisions
+
+The hard 32-bit fixtures have no structure a shortcut could use. Over the whole source domain,
+the 36 masked conditions of `masked-pair-32-unique` follow Binomial(36, 1/2) in every bucket,
+and only the planted point satisfies all of them. For low-order prefixes of 4–24 bits, no
+masked bit is constant across its prefix's completions (0 of 18,432 sampled). No masked bit
+correlates with any source bit beyond 3.4σ (0 of 1,152 pairs above 5σ). Bounded CDCL is still
+unknown after about 7.6e5 conflicts and 100 s. The scrambled term feeds high inner-product bits
+back into the low output bits, and the outer multiplication does not distribute over that XOR.
+Sieves, lookup chunks, fixed-bias splits and linear methods therefore have nothing to filter on.
+
+`Config::exhaustive_inputs` instead decides a question completely when its word-level program
+has at most that many unknown input bits. Every legal assignment is evaluated, 128 at a time
+per instruction, in parallel. Declared known bits, scoped assumption bits and constraints are
+handled as in ordered word sampling. A failure is the first failing assignment in enumeration
+order, whatever the thread count, and is replayed on the original question.
+
+A proof with a certificate does not trust that evaluator. Its certificate is the question's
+bit-blasted circuit: the same circuit that DRUP clauses encode, reduced to the cone of the
+goal and constraints. `Certificate::check` simulates it at every input assignment, 1024 at a
+time. Values live in a register file reused by liveness: the masked-pair circuit's 20,260
+gates need 345 registers (44 KB). A goal that is a negated conjunction is simulated one
+conjunct cone at a time, greedily ordered by new gates. A block stops once each lane has a
+false conjunct, which is sound because any false conjunct makes the goal true. Random circuits
+of up to 14 inputs agree with brute-force evaluation, including constraints and constant goals.
+Block evaluation matches the per-lane evaluator at every instruction slot.
+
+Measured with `exhaustive_inputs = 32`, certificates on, samples and simplification off, on a
+hybrid 20-core host shared with other work (load average 12–34), wall times are:
+
+| fixture | decision | certificate check |
+|---|---|---|
+| `masked-pair-32-unique` | 1.2–1.6 s | 7.9–8.0 s (140–144 CPU-s) |
+| `fingerprint-32` | 2.2–4.5 s | 7.6–8.8 s |
+
+The fingerprint check costs about the same as the masked pair. The first cross-key term
+falsifies a conjunct at almost every assignment, so the other two terms' cones are rarely
+simulated. About 9,950 of the masked pair's 20,260 gates run per block. The first segment, both
+inner products and the shift selection, accounts for 8,636 of them and is needed at every
+assignment. Branch misses are negligible; an AVX2 build saves only about 10%, because the
+efficiency cores split 256-bit operations. Three further ideas were measured and not kept:
+
+- Setting nearly decided lanes aside for packed batches can save at most the ~13% beyond the
+  first segment, and saved nothing measurable.
+- Folding block-constant high source bits into the circuit barely shrinks it. With 22 of 32
+  source bits fixed, 17,275 gates remain, because the constant multipliers' carry chains stay.
+- Wider registers (2048 lanes) overflow L1 and are slower.
+
+Reading operands by reference instead of copying 128-byte registers saved about 7%.
+
+The complete-query acceptance mode measures the whole path, preparation, decision and
+certificate check included:
+
+```sh
+cargo run --release -p bitwright-bench -- --mixers fingerprint masked-pair-32-unique \
+    --query-budget-ms 30000 --exhaustive-inputs 32
+cargo run --release -p bitwright-bench -- --mixers fingerprint masked-pair-32-unique \
+    --query-budget-ms 30000 --exhaustive-inputs 32 --carry-save --xor3
+```
+
+All eight rows of the two 32-bit fixtures pass with checked certificates: in 11.9–19.8 s under
+a load average of 31–34, and within a 15 s budget in 8.3–11.1 s under a load average of 7–13.
+Selecting `fingerprint-32 masked-pair-32-unique` with `--query-budget-ms 15000` exits 0. With
+`fingerprint` selected the commands still exit 1, because `fingerprint-64` remains unknown.
+This is not the 10 ms target: it is a complete, independently certified decision under a
+raised budget.
+
+Full-width sources remain out of reach. `fingerprint-64` needs 3 × 36 = 108 masked
+conditions on a 64-bit source. The best of 2^32 random sources meets 86, and the expected
+number of preimages over all 2^64 sources is about 1e-15. It is almost certainly valid and
+needs an exclusion proof, not a model. The single-word captured runtime guards are three
+exact 64-bit equalities over one free source word, 192 conditions on 64 bits. The best of
+2^32 samples meets 138–140 per guard, and they show no prefix determination up to 48 bits
+and no linear bias. Enumerating 2^64 sources at the measured rate would take decades.
+
+Neither does a decomposition apply. Multiplication and XOR are T-functions: low result bits
+depend only on low operand bits. Only the scrambled term breaks that, by moving inner-product
+bit `32 + c + j` down to bit `j`. Lifting a solution from the low bits upward therefore meets
+no constraint until `32 + c` source bits are chosen, for each guess of the four shift counts.
+Splitting the source into halves does not separate either. The high half of each inner product
+is `A_K(x_lo) + K_lo * (x_hi ^ K_hi)`, where `A_K` is the carry out of the low product, which
+couples both halves in every equation. No sub-2^64 procedure for the full-width queries was
+found.
+
+The target itself argues against a `fingerprint-64` model. An OR of three 64-bit terms sets each
+bit with probability 7/8, so a typical fingerprint has about 56 set bits. The target has 28, and
+the probability of at most 28 is 9e-17. A structured witness search also found nothing. It tried
+the six single-word guards and the fingerprint at every 33-bit value, every sign-extended
+negative 32-bit value, every 32-bit value shifted into the high half, every replicated half,
+every complemented 33-bit value and every 40-bit value: about 1.1e12 candidates in roughly 15 minutes. A hit would have
+been an original model after replay; finding none decides nothing, and the queries stay open.
