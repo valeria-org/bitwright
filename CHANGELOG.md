@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
 
 - **Certified exhaustive decisions:** `Config::exhaustive_inputs` (default 0, off) decides
   a question with at most that many unknown input bits by evaluating every legal
@@ -255,6 +255,9 @@
   owner. Stale and foreign handles are rejected before consulting ownership.
 - **Substitution skips replaced subtrees**, while still visiting shared descendants reached
   elsewhere. Identity substitutions return without walking the graph.
+- **Breaking:** `prove::Certificate` gains the public field `exhaustion`, so code that builds
+  a `Certificate` literal must set it (`None` for a DRUP certificate). With
+  `exhaustive_inputs` left at 0, which is the default, the prover decides questions as before.
 
 ## 0.13.0
 
