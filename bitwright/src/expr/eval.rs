@@ -241,22 +241,21 @@ impl Context {
         roots: &[u32],
         repl: &IdMap<u32, u32>,
     ) -> Result<Vec<u32>, Error> {
-        let order = self.post_order_ids(roots);
-        let mut new: IdMap<u32, u32> = IdMap::default();
+        if repl.is_empty() {
+            return Ok(roots.to_vec());
+        }
+        let order = self.post_order_ids_pruned(roots, |e| repl.contains_key(&e.index()));
+        let mut new = repl.clone();
         for i in order {
-            let r = if let Some(&t) = repl.get(&i) {
-                t
-            } else {
-                let n = self.node(i);
-                let mut kids = [n.a, n.b, n.c];
-                let mut changed = false;
-                for (k, c) in n.children().enumerate() {
-                    let nc = new[&c];
-                    changed |= nc != c;
-                    kids[k] = nc;
-                }
-                if changed { self.rebuild(i, kids)? } else { i }
-            };
+            let n = self.node(i);
+            let mut kids = [n.a, n.b, n.c];
+            let mut changed = false;
+            for (k, c) in n.children().enumerate() {
+                let nc = new[&c];
+                changed |= nc != c;
+                kids[k] = nc;
+            }
+            let r = if changed { self.rebuild(i, kids)? } else { i };
             new.insert(i, r);
         }
         Ok(roots.iter().map(|r| new[r]).collect())

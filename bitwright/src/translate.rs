@@ -346,11 +346,17 @@ impl<'cx, V: Copy + Eq + Hash> Lowering<'cx, V> {
     /// emit with the context released (a language binding calling back into its interpreter).
     /// A symbol no host value stands for is an error.
     pub fn unraised(&mut self, e: Expr) -> Result<Vec<Expr>, Error> {
+        let i = self.cx.id(e)?;
         if self.owner(e).is_some() {
             return Ok(Vec::new());
         }
-        let mut order = self.cx.post_order(&[e])?;
-        order.retain(|n| !self.owners.contains_key(n));
+        let owners = &self.owners;
+        let order: Vec<Expr> = self
+            .cx
+            .post_order_ids_pruned(&[i], |n| owners.contains_key(&n))
+            .into_iter()
+            .map(|n| self.cx.handle(n))
+            .collect();
         for &n in &order {
             if matches!(self.cx.view(n)?, View::Sym(_)) {
                 return Err(Error::Unsupported(format!(
@@ -612,6 +618,54 @@ mod tests {
         let stray = lw.context().symbol("stray", Width::W8).unwrap();
         let f = lw.context().bin(BinOp::Sub, e, stray).unwrap();
         assert!(lw.unraised(f).is_err());
+    }
+
+    #[test]
+    fn raising_treats_owned_nodes_as_available_values() {
+        let mut cx = Context::new();
+        let hidden = cx.symbol("hidden", Width::W8).unwrap();
+        let one = cx.one(Width::W8).unwrap();
+        let owned = cx.add(hidden, one).unwrap();
+        let two = cx.constant_u64(Width::W8, 2).unwrap();
+        let root = cx.mul(owned, two).unwrap();
+        let mut lw = Lowering::new(&mut cx);
+        lw.define(7u32, owned).unwrap();
+        assert_eq!(lw.unraised(root).unwrap(), [two, root]);
+        let mut rec = Rec(Vec::new());
+        assert_eq!(lw.raise(root, &mut rec).unwrap(), 101);
+        assert_eq!(rec.0, ["%100 = const 0x2:8", "%101 = Mul [7, 100]"]);
+
+        // A descendant of an owned value is still needed when another path reads it.
+        let shared = lw.context().xor(owned, hidden).unwrap();
+        assert!(lw.raise(shared, &mut rec).is_err());
+        assert_eq!(rec.0.len(), 2, "failure precedes all emission");
+        lw.define(8, hidden).unwrap();
+        assert_eq!(lw.unraised(shared).unwrap(), [shared]);
+        assert_eq!(lw.raise(shared, &mut rec).unwrap(), 102);
+    }
+
+    #[test]
+    fn raising_rejects_stale_and_foreign_owned_handles() {
+        let mut cx = Context::new();
+        let e = cx.constant_u64(Width::W8, 7).unwrap();
+        let mut lw = Lowering::new(&mut cx);
+        lw.define(7u32, e).unwrap();
+        let kept = lw.detach();
+        let mut other = Context::new();
+        let mut lw = kept.attach(&mut other);
+        assert!(matches!(lw.unraised(e), Err(Error::ForeignExpr)));
+        assert!(matches!(
+            lw.raise(e, &mut Rec(Vec::new())),
+            Err(Error::ForeignExpr)
+        ));
+        let kept = lw.detach();
+        cx.clear();
+        let mut lw = kept.attach(&mut cx);
+        assert!(matches!(lw.unraised(e), Err(Error::StaleExpr)));
+        assert!(matches!(
+            lw.raise(e, &mut Rec(Vec::new())),
+            Err(Error::StaleExpr)
+        ));
     }
 
     #[test]

@@ -7,6 +7,176 @@ use super::*;
 use crate::testutil::{Gen, Rng, width};
 use crate::{BinOp, CmpOpExt, SymbolKey, UnOp};
 
+#[test]
+fn original_constraint_predicates_match_facts_membership_exhaustively() {
+    let mut rng = Rng(0x824a_139e_552c_0697);
+    for bits in 1..=8 {
+        let w = width(bits);
+        let mut cx = Context::new();
+        let x = cx.symbol("x", w).unwrap();
+        let offset = cx.constant_u64(w, u64::from(bits % 3)).unwrap();
+        let shifted = cx.add(x, offset).unwrap();
+        for facts in states(&mut rng, bits, 32) {
+            for subject in [x, shifted] {
+                let mut assumptions = Assumptions::new();
+                assumptions.assume(&mut cx, subject, facts).unwrap();
+                let predicates = assumptions.predicates(&mut cx).unwrap();
+                assert_eq!(predicates.len(), 1);
+                for value in all_values(bits) {
+                    let env = [(SymbolKey::from("x"), value)];
+                    let evaluated = cx.eval(&[subject, predicates[0]], &env[..]).unwrap();
+                    assert_eq!(
+                        !evaluated[1].is_zero(),
+                        facts.contains(&evaluated[0]),
+                        "width={bits}, facts={facts:?}, value={value:?}"
+                    );
+                }
+            }
+        }
+        assert!(cx.declared_known(x).unwrap().is_none());
+    }
+}
+
+#[test]
+fn wide_constraint_predicates_keep_signed_crossings_masks_and_nonzero_stride_origins() {
+    let mut rng = Rng(0x364e_71ac_954b_2801);
+    for bits in [32, 64, 65, 129, 512] {
+        let w = width(bits);
+        let mut cx = Context::new();
+        let x = cx.symbol("x", w).unwrap();
+        let masks = KnownBits::new(
+            BitVec::wrapping_from_u64(w, 0x8420),
+            BitVec::wrapping_from_u64(w, 0x0041),
+        )
+        .unwrap();
+        let lo = BitVec::wrapping_from_u64(w, 13);
+        let hi = BitVec::wrapping_from_u64(w, 433);
+        let stride = Facts::new(
+            KnownBits::unknown(w),
+            URange::strided(lo, hi, 7).unwrap(),
+            SRange::full(w),
+        )
+        .unwrap();
+        let crossing = Facts::new(
+            KnownBits::unknown(w),
+            URange::full(w),
+            SRange::new(
+                BitVec::wrapping_from_i128(w, -20),
+                BitVec::wrapping_from_i128(w, 20),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for facts in [Facts::from_known(masks), stride, crossing, Facts::top(w)] {
+            let mut assumptions = Assumptions::new();
+            assumptions.assume(&mut cx, x, facts).unwrap();
+            let predicate = assumptions.predicates(&mut cx).unwrap()[0];
+            let mut values = (-21..=21)
+                .map(|v| BitVec::wrapping_from_i128(w, v))
+                .collect::<Vec<_>>();
+            values.extend([lo, hi, BitVec::ones(w), BitVec::smin(w), BitVec::smax(w)]);
+            for _ in 0..64 {
+                let limbs = (0..8).map(|_| rng.next()).collect::<Vec<_>>();
+                values.push(BitVec::wrapping_from_limbs(w, &limbs));
+            }
+            for value in values {
+                let env = [(SymbolKey::from("x"), value)];
+                let actual = cx.eval(&[predicate], &env[..]).unwrap()[0];
+                assert_eq!(
+                    !actual.is_zero(),
+                    facts.contains(&value),
+                    "width={bits}, facts={facts:?}, value={value:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn constraint_predicates_preserve_original_seeds_and_handle_scope_checks() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W8).unwrap();
+    let mut assumptions = Assumptions::new();
+    let one = BitVec::from_u64(Width::W8, 1).unwrap();
+    let two = BitVec::from_u64(Width::W8, 2).unwrap();
+    assumptions
+        .assume(&mut cx, x, Facts::constant(&one))
+        .unwrap();
+    assumptions
+        .assume(&mut cx, x, Facts::constant(&two))
+        .unwrap();
+    assert!(assumptions.is_infeasible());
+    let predicates = assumptions.predicates(&mut cx).unwrap();
+    assert_eq!(predicates.len(), 2);
+    for value in all_values(8) {
+        let env = [(SymbolKey::from("x"), value)];
+        assert!(
+            !cx.eval(&predicates, &env[..])
+                .unwrap()
+                .iter()
+                .all(|v| !v.is_zero())
+        );
+    }
+    let mut other = Context::new();
+    assert!(matches!(
+        assumptions.predicates(&mut other),
+        Err(Error::ForeignExpr)
+    ));
+    cx.clear();
+    assert!(matches!(
+        assumptions.predicates(&mut cx),
+        Err(Error::StaleExpr)
+    ));
+    assert!(
+        Assumptions::new()
+            .predicates(&mut other)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn declaration_changes_refresh_constraint_propagation_and_preserve_seed_ids() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W8).unwrap();
+    cx.declare_known(x, KnownBits::constant(&BitVec::zero(Width::W8)))
+        .unwrap();
+    let bounded = Facts::new(
+        KnownBits::unknown(Width::W8),
+        URange::new(
+            BitVec::zero(Width::W8),
+            BitVec::from_u64(Width::W8, 3).unwrap(),
+        )
+        .unwrap(),
+        SRange::full(Width::W8),
+    )
+    .unwrap();
+    let mut assumptions = Assumptions::new();
+    let id = assumptions.assume(&mut cx, x, bounded).unwrap();
+    cx.declare_known(x, KnownBits::unknown(Width::W8)).unwrap();
+    let current = cx.facts_under(x, &assumptions).unwrap().unwrap().0;
+    assert_eq!(current.urange().hi().to_u64(), Some(3));
+    assert!(current.as_constant().is_none());
+    assumptions.refresh(&mut cx).unwrap();
+    assert_eq!(assumptions.constraint(id), Some((x, bounded)));
+    let next = assumptions.assume(&mut cx, x, bounded).unwrap();
+    assert_eq!(next.index(), id.index() + 1);
+
+    cx.declare_known(
+        x,
+        KnownBits::constant(&BitVec::from_u64(Width::W8, 4).unwrap()),
+    )
+    .unwrap();
+    assert!(cx.facts_under(x, &assumptions).unwrap().is_none());
+    assumptions.refresh(&mut cx).unwrap();
+    assert!(assumptions.is_infeasible());
+    cx.declare_known(x, KnownBits::unknown(Width::W8)).unwrap();
+    assert!(cx.facts_under(x, &assumptions).unwrap().is_some());
+    assumptions.refresh(&mut cx).unwrap();
+    assert!(!assumptions.is_infeasible());
+    assert_eq!(assumptions.constraints().count(), 2);
+}
+
 fn all_values(w: u16) -> Vec<BitVec> {
     (0..(1u64 << w))
         .map(|v| BitVec::wrapping_from_u64(width(w), v))
@@ -791,6 +961,547 @@ fn assumptions_refine_without_polluting_base_facts() {
     a.assume(&mut cx, x, big).unwrap();
     assert!(a.is_infeasible());
     assert_eq!(cx.facts_with(e, &a).unwrap(), None);
+}
+
+#[test]
+fn bitwise_identities_preserve_ranges_strides_and_both_operand_reliances() {
+    for bits in [8, 32, 64, 65, 129, 512] {
+        let w = width(bits);
+        for op in [BinOp::And, BinOp::Or, BinOp::Xor] {
+            for swapped in [false, true] {
+                let mut cx = Context::new();
+                let x = cx.symbol("x", w).unwrap();
+                let mask = cx.symbol("mask", w).unwrap();
+                let result = if swapped {
+                    cx.bin(op, mask, x).unwrap()
+                } else {
+                    cx.bin(op, x, mask).unwrap()
+                };
+                let (lo, hi, stride, mask_facts) = match op {
+                    BinOp::And => {
+                        let ones = BitVec::wrapping_from_u64(w, 15);
+                        let known = KnownBits::new(BitVec::zero(w), ones).unwrap();
+                        (4, 12, 4, Facts::from_known(known))
+                    }
+                    BinOp::Or => {
+                        let ones = BitVec::wrapping_from_u64(w, 0xf0);
+                        let zeros = known::bv_not(&ones);
+                        let known = KnownBits::new(zeros, BitVec::zero(w)).unwrap();
+                        (0xf0, 0xf5, 1, Facts::from_known(known))
+                    }
+                    _ => (4, 12, 4, Facts::constant(&BitVec::zero(w))),
+                };
+                let original = Facts::reduce(
+                    KnownBits::unknown(w),
+                    URange::strided(
+                        BitVec::wrapping_from_u64(w, lo),
+                        BitVec::wrapping_from_u64(w, hi),
+                        stride,
+                    )
+                    .unwrap(),
+                    SRange::full(w),
+                )
+                .unwrap();
+                let base = cx.facts(result).unwrap();
+                let mut assumptions = Assumptions::new();
+                let input_id = assumptions.assume(&mut cx, x, original).unwrap();
+                let mask_id = assumptions.assume(&mut cx, mask, mask_facts).unwrap();
+                let (facts, reliance) = cx.facts_under(result, &assumptions).unwrap().unwrap();
+                assert_eq!(facts, original);
+                assert!(reliance.may_use(input_id));
+                assert!(reliance.may_use(mask_id));
+                assert_eq!(cx.facts(result).unwrap(), base);
+
+                // Omitting either operand's requirement removes the identity or
+                // its selected range, so the cached conditional result must go.
+                for keep_mask in [false, true] {
+                    let mut partial = Assumptions::new();
+                    if keep_mask {
+                        partial.assume(&mut cx, mask, mask_facts).unwrap();
+                    } else {
+                        partial.assume(&mut cx, x, original).unwrap();
+                    }
+                    assert_ne!(cx.facts_with(result, &partial).unwrap().unwrap(), original);
+                }
+
+                // A changing bit operation must keep its normal conservative
+                // transfer. Supply an explicit value violating the identity.
+                let (changed_mask, input) = match op {
+                    BinOp::And => (7, 8),
+                    BinOp::Or => (0x100, 0xf0),
+                    _ => (1, 4),
+                };
+                if bits == 8 && op == BinOp::Or {
+                    continue;
+                }
+                let changed = cx.constant_u64(w, changed_mask).unwrap();
+                let changed = cx.bin(op, x, changed).unwrap();
+                let mut input_only = Assumptions::new();
+                input_only.assume(&mut cx, x, original).unwrap();
+                let output_facts = cx.facts_with(changed, &input_only).unwrap().unwrap();
+                let model = [(SymbolKey::from("x"), BitVec::wrapping_from_u64(w, input))];
+                let value = cx.eval(&[changed], &model[..]).unwrap()[0];
+                assert!(output_facts.contains(&value));
+                assert_ne!(value, BitVec::wrapping_from_u64(w, input));
+                assert_ne!(output_facts, original);
+            }
+        }
+    }
+}
+
+#[test]
+fn redundant_selector_masks_preserve_the_conditional_shift_lower_bound() {
+    for text in [
+        "(h >>u 32) >>u ((h >>u 60) & 63)",
+        "h >>u (32 + ((h >>u 60) & 63))",
+    ] {
+        let mut cx = Context::new();
+        let options = crate::ParseOptions::width(Width::W64);
+        let shifted = cx.parse(text, &options).unwrap();
+        let nonzero = cx.parse("h >>u 60 != 0", &options).unwrap();
+        let mut assumptions = Assumptions::new();
+        let id = assumptions.assume_true(&mut cx, nonzero).unwrap();
+        let (conditional, reliance) = cx.facts_under(shifted, &assumptions).unwrap().unwrap();
+        assert_eq!(conditional.urange.lo().to_u64(), Some(15 << 13));
+        assert_eq!(conditional.urange.hi().to_u64(), Some((1 << 28) - 1));
+        assert!(reliance.may_use(id));
+        for selector in 1..16u64 {
+            for high in [selector << 28, ((selector + 1) << 28) - 1] {
+                let h = high << 32;
+                let scalar = high >> selector;
+                let model = [(
+                    SymbolKey::from("h"),
+                    BitVec::wrapping_from_u64(Width::W64, h),
+                )];
+                let actual = cx.eval(&[shifted], &model[..]).unwrap()[0];
+                assert_eq!(actual.to_u64(), Some(scalar));
+                assert!(conditional.contains(&actual));
+            }
+        }
+        let mut zero = Assumptions::new();
+        zero.assume_false(&mut cx, nonzero).unwrap();
+        assert_eq!(
+            cx.facts_with(shifted, &zero)
+                .unwrap()
+                .unwrap()
+                .urange
+                .lo()
+                .to_u64(),
+            Some(0)
+        );
+        assert_eq!(cx.facts(shifted).unwrap().urange.lo().to_u64(), Some(0));
+
+        let changing = cx.parse(&text.replace("& 63", "& 7"), &options).unwrap();
+        let model = [(
+            SymbolKey::from("h"),
+            BitVec::wrapping_from_u64(Width::W64, 8 << 60),
+        )];
+        let actual = cx.eval(&[changing], &model[..]).unwrap()[0];
+        assert_eq!(actual.to_u64(), Some(1 << 31));
+        assert!(
+            cx.facts_with(changing, &assumptions)
+                .unwrap()
+                .unwrap()
+                .contains(&actual)
+        );
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn conditional_selector_bounds_prove_without_search_and_keep_scope() {
+    use crate::prove::{Config, Limits, Outcome, Question};
+
+    for text in [
+        "(h >>u 32) >>u ((h >>u 60) & 63)",
+        "h >>u (32 + ((h >>u 60) & 63))",
+    ] {
+        let mut cx = Context::new();
+        let options = crate::ParseOptions::width(Width::W64);
+        let shifted = cx.parse(text, &options).unwrap();
+        let nonzero = cx.parse("h >>u 60 != 0", &options).unwrap();
+        let minimum = cx.constant_u64(Width::W64, 15 << 13).unwrap();
+        let claim = cx.cmp(CmpOp::Ule, minimum, shifted).unwrap();
+        let mut assumptions = Assumptions::new();
+        assumptions.assume_true(&mut cx, nonzero).unwrap();
+        let cfg = Config::default().with_samples(0);
+        let mut question = Question::valid_under(&mut cx, claim, Some(&assumptions), &cfg).unwrap();
+        assert!(matches!(
+            question
+                .solve(
+                    &mut cx,
+                    Limits {
+                        conflicts: 0,
+                        propagations: 0
+                    }
+                )
+                .unwrap(),
+            Outcome::Proved(None)
+        ));
+        assert_eq!(question.stats().nodes, 0);
+
+        // Certificate mode proves the original conditional predicate through
+        // its circuit, rather than admitting the word-fact result as a premise.
+        let mut checked = Question::valid_under(
+            &mut cx,
+            claim,
+            Some(&assumptions),
+            &cfg.with_certificate(true),
+        )
+        .unwrap();
+        let Outcome::Proved(Some(cert)) = checked.solve(&mut cx, Limits::conflicts(1000)).unwrap()
+        else {
+            panic!("the conditional interval must have an independent original-CNF proof");
+        };
+        cert.check().unwrap();
+
+        // The same claim fails with a zero selector. Reuse the context to
+        // exercise both fact-overlay and simplifier-memo scope changes.
+        let mut zero = Assumptions::new();
+        zero.assume_false(&mut cx, nonzero).unwrap();
+        let mut outside = Question::valid_under(&mut cx, claim, Some(&zero), &cfg).unwrap();
+        let Outcome::Refuted(model) = outside.solve(&mut cx, Limits::conflicts(1000)).unwrap()
+        else {
+            panic!("a conditional lower bound must not escape its nonzero-selector scope");
+        };
+        assert!(cx.eval(&[nonzero], &model[..]).unwrap()[0].is_zero());
+        assert!(cx.eval(&[claim], &model[..]).unwrap()[0].is_zero());
+    }
+}
+
+#[test]
+fn odd_products_preserve_nonzero_values_and_conditional_scope() {
+    for bits in [1, 8, 32, 64, 65, 129, 512] {
+        let w = width(bits);
+        let mut cx = Context::new();
+        let x = cx.symbol("x", w).unwrap();
+        let y = cx.symbol("y", w).unwrap();
+        let p = cx.mul(x, y).unwrap();
+        let nonzero = Facts::new(
+            KnownBits::unknown(w),
+            URange::new(BitVec::one(w), BitVec::ones(w)).unwrap(),
+            SRange::full(w),
+        )
+        .unwrap();
+        let odd = Facts::from_known(KnownBits::new(BitVec::zero(w), BitVec::one(w)).unwrap());
+        for swapped in [false, true] {
+            let (input, multiplier) = if swapped { (y, x) } else { (x, y) };
+            let mut both = Assumptions::new();
+            let input_id = both.assume(&mut cx, input, nonzero).unwrap();
+            let odd_id = both.assume(&mut cx, multiplier, odd).unwrap();
+            let proof = cx.prove_under(Query::IsNonZero(p), &both).unwrap();
+            assert_eq!(proof.truth, Truth::True, "width={bits}, swapped={swapped}");
+            assert!(proof.relies_on.may_use(input_id));
+            assert!(proof.relies_on.may_use(odd_id));
+            if bits > 1 {
+                for keep_odd in [false, true] {
+                    let mut partial = Assumptions::new();
+                    if keep_odd {
+                        partial.assume(&mut cx, multiplier, odd).unwrap();
+                    } else {
+                        partial.assume(&mut cx, input, nonzero).unwrap();
+                    }
+                    assert_eq!(
+                        cx.prove_with(Query::IsNonZero(p), &partial).unwrap(),
+                        Truth::Unknown
+                    );
+                }
+            }
+            let mut zero = Assumptions::new();
+            zero.assume(&mut cx, input, Facts::constant(&BitVec::zero(w)))
+                .unwrap();
+            zero.assume(&mut cx, multiplier, odd).unwrap();
+            assert_eq!(cx.prove_with(Query::IsZero(p), &zero).unwrap(), Truth::True);
+        }
+        assert_eq!(cx.prove(Query::IsNonZero(p)).unwrap(), Truth::Unknown);
+
+        if bits > 1 {
+            let high = known::bv_shl(&BitVec::one(w), u32::from(bits - 1));
+            let even = Facts::constant(&BitVec::wrapping_from_u64(w, 2));
+            let result = Facts::apply_bin(BinOp::Mul, &Facts::constant(&high), &even).unwrap();
+            assert_eq!(result.as_constant(), Some(BitVec::zero(w)));
+        }
+    }
+
+    // Exercise the public transfer over complete independent small domains,
+    // including even factors and strided nonzero inputs.
+    for bits in 1..=6 {
+        let w = width(bits);
+        let maximum = (1u64 << bits) - 1;
+        for stride in [1, 2, 3, 4] {
+            let Some(u) = URange::strided(BitVec::one(w), BitVec::ones(w), stride) else {
+                continue;
+            };
+            let input = Facts::new(KnownBits::unknown(w), u, SRange::full(w)).unwrap();
+            for parity in [0, 1] {
+                let factor = Facts::from_known(
+                    KnownBits::new(
+                        BitVec::wrapping_from_u64(w, 1 - parity),
+                        BitVec::wrapping_from_u64(w, parity),
+                    )
+                    .unwrap(),
+                );
+                for swapped in [false, true] {
+                    let output = if swapped {
+                        Facts::apply_bin(BinOp::Mul, &factor, &input)
+                    } else {
+                        Facts::apply_bin(BinOp::Mul, &input, &factor)
+                    }
+                    .unwrap();
+                    if parity == 1 {
+                        assert!(!output.contains(&BitVec::zero(w)));
+                    }
+                    for x in 1..=maximum {
+                        if !input.contains(&BitVec::wrapping_from_u64(w, x)) {
+                            continue;
+                        }
+                        for y in (parity..=maximum).step_by(2) {
+                            let actual = BitVec::wrapping_from_u64(w, x * y);
+                            assert!(output.contains(&actual));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn positive_logical_xorshifts_preserve_nonzero_and_keep_scope() {
+    for bits in [1, 8, 32, 64, 65, 129, 512] {
+        let w = width(bits);
+        let options = crate::ParseOptions::width(w);
+        let mut cx = Context::new();
+        let nonzero = cx.parse("x != 0", &options).unwrap();
+        let mut assumptions = Assumptions::new();
+        let id = assumptions.assume_true(&mut cx, nonzero).unwrap();
+        for text in [
+            "x ^ (x >>u 1)",
+            "(x >>u 1) ^ x",
+            "x ^ ((x >>u 1) >>u n)",
+            "x ^ (x >>u (n | 1))",
+            "x ^ (x >>u (1 + (x >>u 1)))",
+        ] {
+            let expression = cx.parse(text, &options).unwrap();
+            let proof = cx
+                .prove_under(Query::IsNonZero(expression), &assumptions)
+                .unwrap();
+            assert_eq!(proof.truth, Truth::True, "width={bits}: {text}");
+            assert!(proof.relies_on.may_use(id));
+            // A positive count does not justify nonzero without a nonzero source.
+            let facts = cx.facts(expression).unwrap();
+            assert!(facts.contains(&BitVec::zero(w)));
+            let mut zero = Assumptions::new();
+            zero.assume_false(&mut cx, nonzero).unwrap();
+            assert_eq!(
+                cx.prove_with(Query::IsZero(expression), &zero).unwrap(),
+                Truth::True
+            );
+        }
+        for text in ["x ^ (x >>u n)", "x ^ (x >>s 1)", "x ^ (y >>u 1)"] {
+            let expression = cx.parse(text, &options).unwrap();
+            let (x, y, n) = (BitVec::ones(w), BitVec::ones(w), BitVec::zero(w));
+            let model = [
+                (SymbolKey::from("x"), x),
+                (SymbolKey::from("y"), y),
+                (SymbolKey::from("n"), n),
+            ];
+            let actual = cx.eval(&[expression], &model[..]).unwrap()[0];
+            assert!(
+                cx.facts_with(expression, &assumptions)
+                    .unwrap()
+                    .unwrap()
+                    .contains(&actual)
+            );
+            if text != "x ^ (y >>u 1)" {
+                assert!(actual.is_zero());
+                assert_ne!(
+                    cx.prove_with(Query::IsNonZero(expression), &assumptions)
+                        .unwrap(),
+                    Truth::True
+                );
+            }
+        }
+    }
+
+    // Every value and variable count of small words, with source-dependent
+    // count expressions and a saturating count wider than the data width.
+    for bits in 1..=6 {
+        let w = width(bits);
+        let mut cx = Context::new();
+        let options = crate::ParseOptions::width(w);
+        let predicate = cx.parse("x != 0", &options).unwrap();
+        let mut assumptions = Assumptions::new();
+        assumptions.assume_true(&mut cx, predicate).unwrap();
+        for text in [
+            "x ^ (x >>u (n | 1))",
+            "x ^ ((x >>u 1) >>u n)",
+            "x ^ (x >>u (1 + (x >>u 1)))",
+            "x ^ (x >>u (n + 1))",
+        ] {
+            let expression = cx.parse(text, &options).unwrap();
+            let facts = cx.facts_with(expression, &assumptions).unwrap().unwrap();
+            for x in 1..1u64 << bits {
+                for n in 0..1u64 << bits {
+                    let model = [
+                        (SymbolKey::from("x"), BitVec::wrapping_from_u64(w, x)),
+                        (SymbolKey::from("n"), BitVec::wrapping_from_u64(w, n)),
+                    ];
+                    let actual = cx.eval(&[expression], &model[..]).unwrap()[0];
+                    assert!(
+                        facts.contains(&actual),
+                        "width={bits}: {text}, x={x}, n={n}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn xorshift_nonzero_facts_do_not_admit_wrapping_counts_or_unrelated_sources() {
+    for bits in [2, 8, 64, 65, 129, 512] {
+        let w = width(bits);
+        let options = crate::ParseOptions::width(w);
+        let mut cx = Context::new();
+        let nonzero = cx.parse("x != 0", &options).unwrap();
+        let mut assumptions = Assumptions::new();
+        assumptions.assume_true(&mut cx, nonzero).unwrap();
+        // The count's own assumption is not a global premise. Dropping it
+        // must restore the model with zero count in the same context.
+        let count_nonzero = cx.parse("n != 0", &options).unwrap();
+        let mut conditional = assumptions.clone();
+        conditional.assume_true(&mut cx, count_nonzero).unwrap();
+        let general = cx.parse("x ^ (x >>u n)", &options).unwrap();
+        let _ = cx.facts_with(general, &conditional).unwrap();
+        for (text, x, y, n) in [
+            (
+                "x ^ (x >>u n)",
+                BitVec::one(w),
+                BitVec::zero(w),
+                BitVec::zero(w),
+            ),
+            (
+                "x ^ (x >>u (n + 1))",
+                BitVec::one(w),
+                BitVec::zero(w),
+                BitVec::ones(w),
+            ),
+            (
+                "x ^ (x >>u (1 + (x >>u 0)))",
+                BitVec::ones(w),
+                BitVec::zero(w),
+                BitVec::zero(w),
+            ),
+            (
+                "x ^ (y >>u 1)",
+                BitVec::one(w),
+                BitVec::wrapping_from_u64(w, 2),
+                BitVec::zero(w),
+            ),
+            (
+                "x ^ (x >>s 1)",
+                BitVec::ones(w),
+                BitVec::zero(w),
+                BitVec::zero(w),
+            ),
+        ] {
+            let expression = cx.parse(text, &options).unwrap();
+            let model = [
+                (SymbolKey::from("x"), x),
+                (SymbolKey::from("y"), y),
+                (SymbolKey::from("n"), n),
+            ];
+            assert!(cx.eval(&[expression], &model[..]).unwrap()[0].is_zero());
+            assert!(
+                cx.facts_with(expression, &assumptions)
+                    .unwrap()
+                    .unwrap()
+                    .contains(&BitVec::zero(w))
+            );
+            assert_ne!(
+                cx.prove_with(Query::IsNonZero(expression), &assumptions)
+                    .unwrap(),
+                Truth::True
+            );
+        }
+
+        // With no fact allowance the correlation matcher cannot walk a DAG
+        // on its own to establish a nonzero source or count.
+        let mut capped = Context::with_config(crate::ContextConfig::default().with_fact_work(0));
+        let expression = capped.parse("(x | 1) ^ ((x | 1) >>u 1)", &options).unwrap();
+        assert_eq!(
+            capped.prove(Query::IsNonZero(expression)).unwrap(),
+            Truth::Unknown
+        );
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn zero_preserving_facts_avoid_circuits_and_have_original_cnf_certificates() {
+    use crate::prove::{Config, Limits, Outcome, Question};
+
+    for (bits, text) in [
+        (8, "x * (y | 1)"),
+        (64, "x * (y | 1)"),
+        (65, "x * (y | 1)"),
+        (8, "x ^ (x >>u 1)"),
+        (65, "x ^ (x >>u 1)"),
+        (64, "x ^ ((x >>u 32) >>u (x >>u 60))"),
+        (64, "x ^ (x >>u (32 + (x >>u 60)))"),
+    ] {
+        let mut cx = Context::new();
+        let options = crate::ParseOptions::width(width(bits));
+        let expression = cx.parse(text, &options).unwrap();
+        let source = cx.parse("x != 0", &options).unwrap();
+        let zero = cx.zero(width(bits)).unwrap();
+        let claim = cx.ne(expression, zero).unwrap();
+        let mut assumptions = Assumptions::new();
+        assumptions.assume_true(&mut cx, source).unwrap();
+        let cfg = Config::default().with_samples(0);
+        let mut q = Question::valid_under(&mut cx, claim, Some(&assumptions), &cfg).unwrap();
+        assert!(
+            matches!(
+                q.solve(
+                    &mut cx,
+                    Limits {
+                        conflicts: 0,
+                        propagations: 0
+                    }
+                )
+                .unwrap(),
+                Outcome::Proved(None)
+            ),
+            "width={bits}: {text}"
+        );
+        assert_eq!(q.stats().nodes, 0);
+
+        let mut checked = Question::valid_under(
+            &mut cx,
+            claim,
+            Some(&assumptions),
+            &cfg.with_certificate(true),
+        )
+        .unwrap();
+        let Outcome::Proved(Some(cert)) = checked.solve(&mut cx, Limits::conflicts(1000)).unwrap()
+        else {
+            panic!("expected an original-CNF certificate: width={bits}: {text}");
+        };
+        cert.check().unwrap();
+
+        let mut outside = Question::valid(&mut cx, claim, &cfg).unwrap();
+        let Outcome::Refuted(model) = outside.solve(&mut cx, Limits::conflicts(1000)).unwrap()
+        else {
+            panic!("zero source must refute the unconditional claim: {text}");
+        };
+        assert!(
+            cx.eval(&[claim, source], &model[..])
+                .unwrap()
+                .iter()
+                .all(BitVec::is_zero)
+        );
+    }
 }
 
 #[test]
@@ -1932,6 +2643,216 @@ fn self_shifts_bound_their_range() {
     let h = BitVec::wrapping_from_u64(width(64), 0x0fff_ffff_ffff_ffff);
     let env: HashMap<SymbolKey, BitVec> = [(SymbolKey::from("h"), h)].into_iter().collect();
     assert_eq!(cx.eval(&[g], &env).unwrap()[0].to_u64(), Some(0x0fff_ffff));
+}
+
+#[test]
+fn self_shifts_with_constant_count_offsets_are_sound_including_wrapping_counts() {
+    for bits in 1..=7u16 {
+        let w = width(bits);
+        let o = crate::ParseOptions::width(w);
+        let mut cx = Context::new();
+        let maximum = (1u64 << bits) - 1;
+        for j in 0..bits {
+            for m in j..bits {
+                let top_max = maximum >> m;
+                let mut offsets = vec![0, 1, u64::from(bits) & maximum, maximum, maximum - top_max];
+                if maximum - top_max < maximum {
+                    offsets.push(maximum - top_max + 1);
+                }
+                offsets.sort_unstable();
+                offsets.dedup();
+                for offset in offsets {
+                    let e = cx
+                        .parse(&format!("(x >>u {j}) >>u ({offset} + (x >>u {m}))"), &o)
+                        .unwrap();
+                    let f = cx.facts(e).unwrap();
+                    for x in 0..=maximum {
+                        let shifted = x >> j;
+                        let count = (offset + (x >> m)) & maximum;
+                        let expected = if count >= u64::from(bits) {
+                            0
+                        } else {
+                            shifted >> count
+                        };
+                        assert!(
+                            f.contains(&BitVec::wrapping_from_u64(w, expected)),
+                            "bits={bits}, j={j}, m={m}, offset={offset}, x={x}, facts={f:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let mut cx = Context::new();
+    let o = crate::ParseOptions::width(Width::W64);
+    for spelling in ["(h >>u 32) >>u (h >>u 60)", "h >>u (32 + (h >>u 60))"] {
+        let shifted = cx.parse(spelling, &o).unwrap();
+        let facts = cx.facts(shifted).unwrap();
+        assert_eq!(facts.urange().hi().to_u64(), Some((1 << 28) - 1));
+        assert_eq!(
+            facts.known().known_zero().to_u64(),
+            Some(!((1u64 << 28) - 1))
+        );
+    }
+    for (bits, offset, top) in [(65u16, 32u32, 61u32), (129, 64, 125), (512, 256, 508)] {
+        let mut cx = Context::new();
+        let w = width(bits);
+        let o = crate::ParseOptions::width(w);
+        let shifted = cx
+            .parse(&format!("h >>u ({offset} + (h >>u {top}))"), &o)
+            .unwrap();
+        assert_eq!(
+            cx.facts(shifted).unwrap().urange().hi(),
+            known::low_mask(w, top - offset)
+        );
+    }
+}
+
+#[test]
+fn self_shift_bounds_through_redundant_count_masks() {
+    let mut cx = Context::new();
+    let options = crate::ParseOptions::width(Width::W64);
+    let bound = (1u64 << 28) - 1;
+    for spelling in [
+        "(h >>u 32) >>u ((h >>u 60) & 63)",
+        "h >>u (32 + ((h >>u 60) & 63))",
+        "h >>u ((32 + (h >>u 60)) & 63)",
+        "(h >>u 32) >>u (((h >>u 60) & 63) & 15)",
+    ] {
+        let shifted = cx.parse(spelling, &options).unwrap();
+        let facts = cx.facts(shifted).unwrap();
+        assert_eq!(facts.urange().hi().to_u64(), Some(bound), "{spelling}");
+        assert_eq!(facts.known().known_zero().to_u64(), Some(!bound));
+        assert_eq!(
+            cx.prove(Query::FitsUnsigned {
+                e: shifted,
+                bits: 28,
+            })
+            .unwrap(),
+            Truth::True
+        );
+    }
+
+    // Clearing a possible selector bit changes the count, so this mask cannot be
+    // stripped. In particular selector 8 becomes 0 and permits a 32-bit result.
+    let shifted = cx
+        .parse("(h >>u 32) >>u ((h >>u 60) & 7)", &options)
+        .unwrap();
+    let wide = BitVec::from_u64(Width::W64, 0x8fff_ffff).unwrap();
+    assert!(cx.facts(shifted).unwrap().contains(&wide));
+    assert_ne!(
+        cx.prove(Query::FitsUnsigned {
+            e: shifted,
+            bits: 28,
+        })
+        .unwrap(),
+        Truth::True
+    );
+
+    // A base declaration can make the same mask redundant. Withdrawing the
+    // declaration must also withdraw the tighter bound from the base cache.
+    let h = cx.find_symbol(&SymbolKey::from("h")).unwrap();
+    cx.declare_known(
+        h,
+        KnownBits::new(
+            BitVec::from_u64(Width::W64, 1 << 63).unwrap(),
+            BitVec::zero(Width::W64),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cx.facts(shifted).unwrap().urange().hi().to_u64(),
+        Some(bound)
+    );
+    cx.declare_known(h, KnownBits::unknown(Width::W64)).unwrap();
+    assert!(cx.facts(shifted).unwrap().contains(&wide));
+
+    for (bits, offset, top) in [(65u16, 32u32, 61u32), (129, 64, 125), (512, 256, 508)] {
+        let mut cx = Context::new();
+        let w = width(bits);
+        let options = crate::ParseOptions::width(w);
+        let count_mask = offset * 2 - 1;
+        for spelling in [
+            format!("(h >>u {offset}) >>u ((h >>u {top}) & 63)"),
+            format!("h >>u ({offset} + ((h >>u {top}) & 63))"),
+            format!("h >>u (({offset} + (h >>u {top})) & {count_mask})"),
+        ] {
+            let shifted = cx.parse(&spelling, &options).unwrap();
+            assert_eq!(
+                cx.facts(shifted).unwrap().urange().hi(),
+                known::low_mask(w, top - offset)
+            );
+        }
+    }
+    let w = Width::new(512).unwrap();
+    let mut cx = Context::new();
+    let shifted = cx
+        .parse(
+            "h >>u ((256 + (h >>u 508)) & 63)",
+            &crate::ParseOptions::width(w),
+        )
+        .unwrap();
+    // This mask removes the offset's set bit, making the actual count 15 at h = -1.
+    let actual = known::bv_lshr(&BitVec::ones(w), 15);
+    assert!(cx.facts(shifted).unwrap().contains(&actual));
+    assert_ne!(
+        cx.prove(Query::FitsUnsigned {
+            e: shifted,
+            bits: 252,
+        })
+        .unwrap(),
+        Truth::True
+    );
+}
+
+#[test]
+fn masked_self_shift_counts_are_sound_including_nonredundant_and_wrapping_cases() {
+    for bits in 1..=6u16 {
+        let w = width(bits);
+        let maximum = (1u64 << bits) - 1;
+        let options = crate::ParseOptions::width(w);
+        let mut cx = Context::new();
+        for m in 0..bits {
+            for j in 0..=m {
+                let mut masks = vec![0, 1, maximum >> m, maximum, maximum ^ 1];
+                masks.sort_unstable();
+                masks.dedup();
+                for mask in masks {
+                    for offset in [0, 1, maximum] {
+                        for before_add in [false, true] {
+                            let count = if before_add {
+                                format!("((x >>u {m}) & {mask}) + {offset}")
+                            } else {
+                                format!("((x >>u {m}) + {offset}) & {mask}")
+                            };
+                            let expression = cx
+                                .parse(&format!("(x >>u {j}) >>u ({count})"), &options)
+                                .unwrap();
+                            let facts = cx.facts(expression).unwrap();
+                            for x in 0..=maximum {
+                                let count = if before_add {
+                                    (((x >> m) & mask) + offset) & maximum
+                                } else {
+                                    (((x >> m) + offset) & maximum) & mask
+                                };
+                                let value = if count >= u64::from(bits) {
+                                    0
+                                } else {
+                                    (x >> j) >> count
+                                };
+                                assert!(
+                                    facts.contains(&BitVec::wrapping_from_u64(w, value)),
+                                    "bits={bits}, j={j}, m={m}, mask={mask}, offset={offset}, \
+                                     before_add={before_add}, x={x}, facts={facts:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ----- floating point ----------------------------------------------------------------------------

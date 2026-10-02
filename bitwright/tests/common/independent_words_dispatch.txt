@@ -1,0 +1,23 @@
+let %0 = concat(byte7:8, concat(byte6:8, concat(byte5:8, concat(byte4:8, concat(byte3:8, concat(byte2:8, concat(byte1:8, byte0:8)))))));
+let %1 = (%0 ^ 0xfd239eb4f774897f) * 0xfd239eb4f774897f;
+let %2 = (%1 ^ %1 >>u 32 >>u (%1 >>u 60)) * 0xfd239eb4f774897f;
+let %3 = (%0 ^ 0xea9237c16f144361) * 0xea9237c16f144361;
+let %4 = (%0 ^ 0xf018dd3f70b01c73) * 0xf018dd3f70b01c73;
+let %5 = (%0 ^ 0xcdd4e5f587be86d1) * 0xcdd4e5f587be86d1;
+let %6 = zext<64>(%2 ^ (%3 ^ %3 >>u 32 >>u (%3 >>u 60)) * 0xea9237c16f144361 ^ 0x298597b21ad639a6 | (%4 ^ %4 >>u 32 >>u (%4 >>u 60)) * 0xf018dd3f70b01c73 ^ %2 ^ 0x79c7ce6df477379a | %2 ^ (%5 ^ %5 >>u 32 >>u (%5 >>u 60)) * 0xcdd4e5f587be86d1 ^ 0xd0cd4b0de5d39dd1 == 0xebf1c1e6ebce0980) * 0x36411b;
+let %7 = (%0 ^ 0xdd632cda9aa25f55) * 0xdd632cda9aa25f55;
+let %8 = (%0 ^ 0xf6fbc61c6e96c8d5) * 0xf6fbc61c6e96c8d5;
+let %9 = (%8 ^ %8 >>u 32 >>u (%8 >>u 60)) * 0xf6fbc61c6e96c8d5;
+let %10 = (%0 ^ 0xfe841ac331dc1f55) * 0xfe841ac331dc1f55;
+let %11 = (%0 ^ 0xff8a090769c7e487) * 0xff8a090769c7e487;
+let %12 = zext<64>(((%7 ^ %7 >>u 32 >>u (%7 >>u 60)) * 0xdd632cda9aa25f55 ^ %9 == 0x4f0be6dc0f2fc375) & ((%10 ^ %10 >>u 32 >>u (%10 >>u 60)) * 0xfe841ac331dc1f55 ^ %9 == 0x167e2ddcd46dcf09) & ((%11 ^ %11 >>u 32 >>u (%11 >>u 60)) * 0xff8a090769c7e487 ^ %9 == 0xed3b73d24fcd6122));
+let %13 = concat(byte23:8, concat(byte22:8, concat(byte21:8, concat(byte20:8, concat(byte19:8, concat(byte18:8, concat(byte17:8, byte16:8)))))));
+let %14 = (%13 ^ 0xc39bc7d529e82bd5) * 0xc39bc7d529e82bd5;
+let %15 = (%14 ^ %14 >>u 32 >>u (%14 >>u 60)) * 0xc39bc7d529e82bd5;
+let %16 = (%13 ^ 0xc1ea39f6247be785) * 0xc1ea39f6247be785;
+let %17 = (%13 ^ 0xc443bccf8bbf79a5) * 0xc443bccf8bbf79a5;
+let %18 = (%13 ^ 0xf8cf23cfb2aae541) * 0xf8cf23cfb2aae541;
+let %19 = zext<64>((%15 ^ (%16 ^ %16 >>u 32 >>u (%16 >>u 60)) * 0xc1ea39f6247be785 == 0x72d4a37c1076c0e2) & ((%17 ^ %17 >>u 32 >>u (%17 >>u 60)) * 0xc443bccf8bbf79a5 ^ %15 == 0x3c03f91829de0e8c) & (%15 ^ (%18 ^ %18 >>u 32 >>u (%18 >>u 60)) * 0xf8cf23cfb2aae541 == 0x45816965f2a1108c));
+let %20 = %19 * 0x3e39b2;
+let %21 = %19 * 0x3ea059;
+(%6 ^ (%12 * 0x3ea059 ^ ((%20 ^ %21 ^ 0x3ea059) * %12 ^ (%20 ^ (%21 ^ %6)))) ^ 0x3ea059) + 0x140005352

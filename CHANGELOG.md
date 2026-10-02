@@ -1,5 +1,247 @@
 # Changelog
 
+## Unreleased
+
+- **Complete-query benchmark target:** `--mixers --query-budget-ms 10` measures fresh
+  original native queries through preparation and independent proof/model checking.
+  Unresolved queries and queries over the target fail the acceptance run, with separate
+  statuses; all selected cases are still reported. This measures wall time rather than
+  imposing a cancellation deadline.
+- **Affine constant products:** eligible 64-bit odd coefficients can use two modular
+  factors plus an addition or subtraction of the source. The bounded planner examines
+  381 recipes and retains the existing input guards and 10% estimated-work threshold.
+  Bit-parallel signed-digit costing matches the serial calculation on more than 98,000
+  coefficients. Twelve affine equivalence checks now have zero-search certificates;
+  the full fingerprint circuits use about 5% fewer variables and clauses beyond exact
+  factorization. The original hard guards remain unknown within the 10 ms target.
+- **Masked source projections:** bounded Boolean cuts now follow single-bit extracts and
+  AND masks keeping at most eight source bits without expanding the whole source word.
+  Pure wiring preserves overlaps and complements; other projected bits remain conservative
+  inputs. Exhaustive reference checks, wide boundaries, declaration changes, resource caps
+  and original refuting models cover the proof boundary. One original full tail now has a
+  three-value superset with a one-node coverage certificate; the complete joint output and
+  hard guard questions remain unknown.
+- **Scoped fact premises:** native validity questions now accept partial known bits,
+  unsigned and signed ranges, and unsigned strides. `Assumptions::predicates` exposes
+  their exact original Boolean conditions; SMT-LIB queries use the same encoding and
+  retain odd strides that were previously omitted. The word sampler fixes scoped bits
+  only through original seed masks and pure wiring, preserving overlapping symbols,
+  exhaustive coverage limits, original model replay and the certificate path.
+- **Declaration changes and assumptions:** propagated facts are refreshed from the original
+  constraints when symbol declarations change. This prevents withdrawn global bits from
+  surviving in scoped facts and producing false proofs. Constraint ids remain stable,
+  and explicitly refreshing a set also updates its infeasibility diagnostics.
+- **Bounded joint output domains:** `prove::domain::analyze` computes a conservative
+  tuple superset from original output roots and scoped Boolean premises, preserving
+  shared predicates, casts and distinct keys/tails at one target. Explicit construction,
+  live-input, enumeration and tuple caps discard incomplete results. Coverage predicates
+  retain the original expressions for independent certification. Both multiplication
+  encodings now treat a zero-extended Boolean factor as a conditional bitwise copy.
+  Complete cut evaluation with at most eight live predicates proves Boolean tautologies
+  that structural hashing alone leaves open, under a separate fixed work allowance.
+  The eight captured nonconstant targets expose their output domains within the default
+  limits and one-node coverage certificates; their original fingerprint reachability
+  questions remain unresolved.
+- **Correlated dispatch-tail regressions:** shared Boolean predicates retain the same
+  numeric value through 32-bit and 64-bit casts. A captured full-width target and
+  its conditional tail outputs prove their two-tuple superset and exclude mismatched
+  tuples with zero search work and one-node checked certificates. Original byte models,
+  both abstract predicate values, and independent-predicate counterexamples preserve
+  the distinction between output correlation, arm reachability and graph closure.
+- **Zero-preserving facts:** wrapping multiplication by a known-odd value retains
+  nonzero operands, including variable factors. XOR with a positive logical right
+  shift of the same source also retains nonzero values, including nested and
+  self-selected counts. The bounded matcher checks count offsets for wraparound
+  and uses global count facts; conditional source dependencies remain tracked.
+  These queries now prove before circuit construction. Complete small domains,
+  words through 512 bits, negative controls, scope changes and original-CNF
+  certificates cover the rules. The complete hard mixer queries remain unknown.
+- **Bitwise identity facts:** AND, OR and zero-XOR transfers retain the operand's complete
+  ranges and strides when known bits establish that the operation preserves its value.
+  Both operand dependencies remain tracked under assumptions. A redundant selector mask
+  now preserves its nonzero lower bound, letting the compact conditional shift bound prove
+  before bit-blasting. Wide words, changing masks, scope withdrawal and original-CNF
+  certificates are covered. The complete hard mixer queries remain unknown.
+- **Bounded constant-product factorization:** eligible 64-bit odd products use two exact
+  modular factors, optionally corrected by the source, when a bounded search predicts
+  at least 10% less carry work.
+  Words with fewer than 32 distinct nonconstant literals, a fixed low bit or a known-zero
+  high bit retain the existing encoding. Both multiplication encodings are covered by
+  scalar, model, continuation and certificate checks. The three hard
+  fixtures use 13–18% fewer variables and 14–18% fewer clauses than the shared-gate encoding;
+  their full-domain verdicts remain unknown at the measured budgets.
+- **Shared logical-gate encoding:** XOR, majority and mux recognition now bypasses shared
+  AND internals while preserving separately observed roots and operands. Complemented XORs
+  share their graph representation throughout arithmetic. The three hard-query fixtures
+  use about 8–10% fewer CNF variables and 4–6% fewer clauses; their full-domain verdicts
+  remain unknown. Exhaustive signed-input and observation-set checks validate models and
+  independent refutation certificates.
+- **Wrapping arithmetic at the highest bit:** additions and subtractions skip their
+  discarded outgoing carry and share complemented XORs in that final column. Carry-save
+  products share their final-column parity too. Highest-bit covariance of odd products now
+  proves with zero conflicts, including the default paired-product encoding. Tests check
+  even-product counterexamples, wide words, certificates and the boundary between necessary
+  mixer symmetries and exact guards. The full hard queries remain unknown at tested budgets.
+- **Masked self-selected counts:** range analysis now recognizes redundant constant masks
+  around a self-selected shift count or its constant offset. The masked mixer shift now
+  gets the same 28-bit bound as its unmasked form without first rewriting the expression.
+  Masks that change the count stay conservative. Tests cover complete small domains,
+  declaration withdrawal, wrapping offsets and widths through 512 bits.
+- **Exact decoded-guard checks:** complete small input/image domains, both shift spellings
+  and independent native certificates check cancellation of odd outer products with a
+  shared image word. A counterexample rejects dropping the image link. The corresponding
+  unrestricted captured guards still exhaust the tested search budgets.
+- **Necessary-condition model checks:** mixer regressions cover signed correction bounds
+  and decoded high-bit preservation, including selector endpoints and full-width values.
+  A supplied model satisfies the relaxed conditions while failing to match the original
+  image; original-expression replay and independent point certificates enforce that boundary.
+- **Captured pair replay:** a typed eight-byte dispatch regression checks all three numeric
+  mixer pairs against independent scalar values, including full-width boundary inputs and
+  both shift spellings. It detects choosing the first listed mixer as the common term when
+  another mixer is shared across the comparisons, even when both resulting guards are false.
+- **Complete online word domains:** ordered word enumeration now returns `Proved(None)`
+  after the joint stream covers every legal assignment without a counterexample. Partial,
+  random, individual-word and diagonal coverage cannot prove validity. Declared sparse bits
+  and assumptions are respected; certificate requests retain the original circuit path.
+  Fingerprint and uniqueness fixtures with 8, 12 or 16 free input bits now prove online in
+  about 22 µs–4.2 ms, with zero circuit nodes. Complete 32-bit and unrestricted 64-bit domains
+  still need further work. Independent generated truth tables and late witnesses test the
+  proof boundary.
+- **Explicit verified finite facts:** `prove::finite::CheckedPair::verify` completely
+  enumerates a requested source domain before producing a reusable masked-pair fact.
+  `Question::valid_with_pairs` applies it only to matching integer mixers with the same
+  source and an established bound. The prepared facts settle the 32-bit fingerprint,
+  masked-pair uniqueness and a captured 32-bit loaded-word guard without circuit work.
+  Their preparation costs seconds; warm queries take tens of microseconds. This path is
+  opt-in, replays original models, and preserves the original path for DRUP requests.
+  Unrestricted 64-bit cases remain unknown.
+- **Restart priorities:** SAT trail reuse now includes higher-priority implied variables
+  that a restart would free, while keeping root assignments out of that comparison.
+  Completed models are returned without undoing and rebuilding their trail. Focused
+  regressions cover implication priorities, retained prefixes, root priorities and model
+  completion. The hard mixer verdicts remain unknown in the measured short budgets.
+- **Independent-word streams:** `SampleMode::Words` shares its existing allowance between
+  joint, individual-word and diagonal prefixes, so later words can expose witnesses without
+  enumerating an earlier 64-bit word. A captured two-word dispatch now returns its original
+  sixteen-byte model in 128 samples / about 0.1 ms without constructing a circuit. Standalone
+  symbols, shared bytes, bounded exhaustion and constrained diagonal witnesses are covered.
+  Remaining captured exclusions still require further work; application replay is separate.
+  A complete independent 32-bit oracle also establishes a captured loaded-word pair's
+  exclusion; the native solver still needs a faster proof path for it.
+- **Reconstructed-word coordinates:** opt-in `SampleMode::Words` searches the low bits of
+  maximal pure concatenations before the remaining symbol bits. Original byte symbols,
+  overlapping bits and fixed declarations retain their identity. A byte-concatenated
+  cross-key guard that ordinary small-input order leaves unknown recovers its eight-byte
+  witness in about 3 ms without a circuit. Generated programs, complete small input cubes,
+  repeated-byte near misses and wide fallback cover the new ordering.
+- **Early word sampling:** opt-in `Config::with_word_sampling(true)` searches for
+  counterexamples directly on bounded integer DAGs of words through 64 bits before
+  bit-blasting. It preserves sampling order, declared bits, assumptions and original-model
+  replay. Incomplete sample coverage resumes normal SAT preparation; wide, floating-point,
+  extension and oversized DAGs use the existing circuit path. `--word-samples` exposes the
+  staged measurements: the full-width cross-key witness takes about 2 ms, versus 18 ms
+  through the circuit sampler. Tests include 36 guard variants and independent scalar
+  operator checks. The three hard exclusion/uniqueness queries remain unresolved.
+- **Carry-save products:** opt-in `Config::with_carry_save_multiplication(true)` compresses
+  modular product columns before one final carry-propagating addition. Constant rows use
+  signed digits with exact complement/correction handling. Exhaustive small products,
+  independent reference checks through 1,024 bits, fixed/correlated inputs, declared-bit
+  models, certificates and exact resumed searches cover the option. `--carry-save` exposes
+  staged measurements: short hard-query search instructions fall 18–44%, while the three
+  hard verdicts remain unknown at the measured longer budgets.
+- **Three-input parity encoding:** opt-in `Config::with_xor3_encoding(true)` inlines a
+  private intermediate XOR, reducing the hard-query encodings by 24–28% of variables with
+  the same clause count. Initial watches follow the output and outer-input roles. All
+  polarities, repeated operands, observed intermediates, root aliases, declared models and
+  exact resumption are checked. `--xor3` exposes staged measurements; longer searches remain
+  mixed, so the default encoding is retained.
+- **Selector partition regression:** an opt-in long suite checks the complete first-selector
+  range and all 16 conditional cases for each hard query, preserving original domains and
+  distinguishing conditional proofs from an unsplit proof. All 48 cases remain unknown at
+  the measured 10,000-conflict / 5-million-propagation limits.
+
+- **Peepholes for hard queries:** word-level self-shift bounds also recognize nonwrapping
+  constant offsets in the count, giving compact and nested spellings the same 28-bit bound.
+  Wrapping counts are conservatively left to ordinary transfer; exhaustive tests cover small
+  widths and wide bounds through 512 bits.
+- **Positive OR target factoring:** opt-in `Config::with_join_factoring(true)` factors ORs
+  of XORs sharing an operand into a conditional gate. Zero target bits retain direct XOR
+  aliases. The fingerprint fixtures lose another 28 variables / 112 clauses; the masked-pair
+  uniqueness encoding is unchanged. `--factor-joins` exposes measurements, with checked
+  polarity/sharing proofs and original-symbol models. Longer-search performance is mixed,
+  and all three queries remain unknown under measured budgets.
+- **Masked-pair near misses:** concrete original-expression regressions reject dropping the
+  higher mask bits and distributing multiplication over XOR.
+
+- **Correlated shift counts:** the bit-blaster evaluates a count's Boolean support when at
+  most four count literals also occur in the data. Constant and literal-valued outputs fold
+  without constraining that support; this exposes the upper zero bits of self-selected
+  shifts before subsequent products. Differential tests cover signs, repeated/complemented
+  count bits, overshifts and widths through 1,024 bits.
+- **Shared input cancellation:** opt-in `Config::with_input_cancellation(true)` removes a
+  shared input occurrence along bounded XOR paths while retaining other arithmetic branches.
+  Paired dense odd products lose their direct high-bit dependency, with zero-conflict checked
+  certificates at 8–129 bits. Original-symbol models, declared bits and exact resumption are
+  retained. `bitwright-bench --mixers --input-cancel` measures the option; hard fingerprint
+  and masked-pair uniqueness searches still exhaust the measured larger budgets.
+
+- **Masked-bit relationships:** native preparation extracts fixed XOR relationships below
+  asserted conjunctions and closes inconsistent signed-equality cycles without SAT conflicts.
+  Derived clauses are proof steps, never certificate premises. Low-bit bitwise XOR cones
+  cancel shared terms without changing arithmetic carry networks.
+- **Optional search strategies:** `Config::with_relational_lemmas(true)` adds bounded,
+  certified transitive equality lemmas; `with_selector_branching(true)` initially prefers
+  small shift-count bits without fixing their values. Benchmarks expose `--relations`,
+  `--selectors`, `--escalate-fast` and learned-clause counts, plus separate masked-pair
+  candidate and uniqueness workloads. Hard fingerprint and uniqueness queries remain unknown
+  under the measured budgets; the strategies remain opt-in because performance is mixed.
+- **Relational regressions:** checked proof prefixes on satisfiable inputs, signed equality
+  cycles and long chains, OR-target coverage, bounded XOR rewriting, exact resumed selector
+  search, and original-symbol mixer low-bit identities and masked-pair witnesses.
+
+- **Unknown-query workloads:** opt-in `SampleMode::Small` enumerates small assignments of
+  unknown input bits, finding replayable wide-domain counterexamples without narrowing the
+  domain. Sample exhaustion leaves proof search open. The full-width cross-key guard fixture
+  is refuted at `x = 0x4563` after 17,792 sampled assignments.
+- **Carry encoding:** majority gates with private inner products use one CNF variable and
+  six clauses. Polarity, shared inner gates and near misses are checked against exhaustive
+  truth tables, with independently verified UNSAT proofs.
+- **Longer mixer searches:** `bitwright-bench --mixers --escalate` tries small witnesses and
+  resumes unresolved native questions with larger explicit budgets; CSV includes sample counts.
+
+- **Search limits and statistics:** zero allowances preserve an undecided search, and
+  propagation budgets pause between literals instead of after an entire implication chain.
+  Resuming preserves models, proofs and total search work. Preparation statistics now include
+  propagation during CNF construction.
+- **Cheaper prover preparation:** AIG gate pairs use the internal integer hasher, and
+  incoming SAT clauses normalize in a reused buffer rather than allocating temporary vectors
+  for each clause. Circuit identities, clause ordering and proof logging are preserved.
+
+- **Native prover preparation:** a bounded Boolean overapproximation proves correlated
+  dispatch/target tautologies before expanding their arithmetic predicates, including in
+  certificate mode. Constant multipliers use signed digits when these need fewer arithmetic
+  rows; already blasted subtrees are skipped on subsequent requests.
+
+- **Keyed mixer/fingerprint workloads:** exact odd-key cancellation/inversion for both shift
+  spellings, even-key collisions, original-symbol replay, correlated target/key exclusions,
+  bounded fingerprint domain regressions and full enumeration, and bounded cross-key search escalation.
+  `bitwright-bench --mixers` reports preparation/search stages and per-process peak memory, retaining
+  explicit unknown outcomes and checking decided answers.
+
+- **Broader native prover test suites:** structured and incremental SAT with checked proofs,
+  exhaustive small-width and boundary-width circuits against the independent reference,
+  solver-only arithmetic and memory workloads, declared model enumeration, floating-point
+  classification, and SMT-LIB fixtures; large-width circuits run in the nightly suites.
+
+- **Known memory regions:** preserve address offsets above 64 bits and resolve regions that
+  cover the entire address space. A region larger than its address space is rejected.
+- **Native proofs respect declared known bits** in circuit sampling, SAT search and
+  certificates, including counterexamples for symbols eliminated by simplification.
+- **Raising stops at host-owned values:** their internal nodes need no emission or symbol
+  owner. Stale and foreign handles are rejected before consulting ownership.
+- **Substitution skips replaced subtrees**, while still visiting shared descendants reached
+  elsewhere. Identity substitutions return without walking the graph.
+
 ## 0.13.0
 
 - **A constant and a left shift have one form.** `(x << k) & m` (and `(x + x) & m`, as the

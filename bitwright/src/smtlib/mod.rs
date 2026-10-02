@@ -40,7 +40,7 @@ pub use obligation::rule_obligation;
 
 use crate::error::Error;
 use crate::expr::{Context, Expr};
-use crate::facts::{Assumptions, Facts, Reliance};
+use crate::facts::{Assumptions, Reliance};
 
 /// The expressions as SMT-LIB 2.6: a `declare-const` per symbol, a `define-fun` per node
 /// (operands first, so sharing is kept; the names `n…` are internal), and `define-fun rootK` for
@@ -80,18 +80,18 @@ pub fn equivalence_query_under(
         return Err(Error::Unsupported("different widths".into()));
     }
     let mut roots = vec![a, b];
-    let mut constraints = Vec::new();
     for (id, e, f) in assumptions.constraints() {
         if relied.may_use(id) {
-            roots.push(e);
-            constraints.push(f);
+            let value = cx.id(e)?;
+            let predicate = crate::facts::facts_predicate(cx, value, f)?;
+            roots.push(cx.handle(predicate));
         }
     }
     let body = export::emit(cx, &roots)?;
     let mut s = logic(&body);
     s.push_str(&body);
-    for (k, f) in constraints.iter().enumerate() {
-        s.push_str(&facts_assertion(&format!("root{}", k + 2), f));
+    for k in 2..roots.len() {
+        s.push_str(&format!("(assert (= root{k} #b1))\n"));
     }
     s.push_str("(assert (not (= root0 root1)))\n(check-sat)\n");
     Ok(s)
@@ -109,34 +109,4 @@ fn logic(body: &str) -> String {
         (false, true) => "(set-logic QF_BVFP)\n",
         (true, true) => "(set-logic ALL)\n",
     })
-}
-
-/// `(assert …)` lines stating that `term` satisfies `f`.
-fn facts_assertion(term: &str, f: &Facts) -> String {
-    use crate::BitVec;
-    let w = f.width();
-    let lit = export::literal;
-    let mut s = String::new();
-    let k = f.known();
-    if !k.known().is_zero() {
-        s.push_str(&format!(
-            "(assert (= (bvand {term} {}) {}))\n",
-            lit(&k.known()),
-            lit(&k.known_one())
-        ));
-    }
-    let (u, sr) = (f.urange(), f.srange());
-    if !u.lo().is_zero() {
-        s.push_str(&format!("(assert (bvule {} {term}))\n", lit(&u.lo())));
-    }
-    if !u.hi().is_ones() {
-        s.push_str(&format!("(assert (bvule {term} {}))\n", lit(&u.hi())));
-    }
-    if sr.lo() != BitVec::smin(w) {
-        s.push_str(&format!("(assert (bvsle {} {term}))\n", lit(&sr.lo())));
-    }
-    if sr.hi() != BitVec::smax(w) {
-        s.push_str(&format!("(assert (bvsle {term} {}))\n", lit(&sr.hi())));
-    }
-    s
 }

@@ -453,6 +453,56 @@ fn top_bit_exact(flip: bool, x: &Facts) -> Option<Facts> {
     }
 }
 
+// When a bit operation is an identity under its operands' known bits, retain
+// the full interval and stride facts rather than rebuilding them from masks.
+// The overlay records both operands' reliance before calling this transfer.
+fn bitwise_identity(op: BinOp, a: &Facts, b: &Facts) -> Option<Facts> {
+    let (keep_a, keep_b) = if a.width().bits() <= 64 {
+        let m = wmask(a.width());
+        let az = word(&a.known.known_zero());
+        let ao = word(&a.known.known_one());
+        let bz = word(&b.known.known_zero());
+        let bo = word(&b.known.known_one());
+        match op {
+            BinOp::And => ((!az & !bo & m) == 0, (!bz & !ao & m) == 0),
+            BinOp::Or => ((!ao & !bz & m) == 0, (!bo & !az & m) == 0),
+            BinOp::Xor => (bz == m, az == m),
+            _ => return None,
+        }
+    } else {
+        match op {
+            BinOp::And => (
+                bv_and(&a.known.maybe_one(), &bv_not(&b.known.known_one())).is_zero(),
+                bv_and(&b.known.maybe_one(), &bv_not(&a.known.known_one())).is_zero(),
+            ),
+            BinOp::Or => (
+                bv_and(
+                    &bv_not(&a.known.known_one()),
+                    &bv_not(&b.known.known_zero()),
+                )
+                .is_zero(),
+                bv_and(
+                    &bv_not(&b.known.known_one()),
+                    &bv_not(&a.known.known_zero()),
+                )
+                .is_zero(),
+            ),
+            BinOp::Xor => (
+                b.known.known_zero().is_ones(),
+                a.known.known_zero().is_ones(),
+            ),
+            _ => return None,
+        }
+    };
+    if keep_a {
+        Some(*a)
+    } else if keep_b {
+        Some(*b)
+    } else {
+        None
+    }
+}
+
 fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     let w = a.width();
     // Built only where a path needs it.
@@ -467,6 +517,11 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
             .map_or(u32::MAX, |v| v.min(u64::from(u32::MAX)) as u32)
     });
     let reduce = |k: KnownBits, u: URange, s: SRange| Facts::reduce(k, u, s).unwrap_or_else(top);
+    if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor)
+        && let Some(f) = bitwise_identity(op, a, b)
+    {
+        return f;
+    }
     if matches!(op, BinOp::Xor | BinOp::And)
         && let Some(f) = top_bit(op, a, b, bc.as_ref())
     {
@@ -478,7 +533,7 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
         BinOp::Mul => {
             let known = kb_mul(&a.known, &b.known);
             let (au, bu) = (a.urange, b.urange);
-            let u = if BitVec::bin_unchecked(BinOp::UMulHi, &au.hi(), &bu.hi()).is_zero() {
+            let mut u = if BitVec::bin_unchecked(BinOp::UMulHi, &au.hi(), &bu.hi()).is_zero() {
                 // (la + i·sa)(lb + j·sb) − la·lb is a multiple of gcd(la·sb, lb·sa, sa·sb).
                 let (sa, sb) = (u128::from(au.stride()), u128::from(bu.stride()));
                 let stride = match (au.lo().to_u64(), bu.lo().to_u64()) {
@@ -498,6 +553,19 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 full_u
             };
             let s = signed_corners(w, a, b, |x, y| x.checked_mul(y)).unwrap_or(full_s);
+            // An odd factor is a unit modulo 2^w, even when it is variable.
+            // Wrapping can lose interval bounds, but cannot map a nonzero
+            // operand to zero. Intersect rather than resetting the lower
+            // endpoint: an existing stride must retain its residue class.
+            if u.lo().is_zero()
+                && known.known_one().is_zero()
+                && ((a.known.known_one().bit(0) == Some(true) && !b.contains(&BitVec::zero(w)))
+                    || (b.known.known_one().bit(0) == Some(true) && !a.contains(&BitVec::zero(w))))
+            {
+                u = u
+                    .meet(&URange::new(BitVec::one(w), BitVec::ones(w)).unwrap())
+                    .unwrap_or(u);
+            }
             reduce(known, u, s)
         }
         BinOp::UMulHi => {

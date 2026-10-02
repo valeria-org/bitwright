@@ -1142,7 +1142,7 @@ struct Runner<'r, 'a> {
     stats: Stats,
     observer: Option<&'a mut dyn Observer>,
     hooks: Option<&'a dyn Hooks>,
-    assumptions: Option<&'a Assumptions>,
+    assumptions: Option<&'r Assumptions>,
     /// Rules quarantined for the call, by index (sized on the first quarantine).
     quarantined: Vec<bool>,
     /// Host rewrites quarantined for the call, likewise.
@@ -2025,9 +2025,8 @@ impl Engine {
             assumptions,
             deadline,
         } = run;
-        if let Some(a) = assumptions {
-            a.check_context(cx)?;
-        }
+        let current = assumptions.map(|a| a.refreshed(cx)).transpose()?;
+        let assumptions = current.as_deref();
         // Contradictory constraints prove anything, so the engine simplifies as without them
         // (they would justify any rewrite; none is made from them).
         let assumptions = assumptions.filter(|a| !a.is_infeasible());

@@ -126,6 +126,8 @@ pub struct Solver {
     clauses: Vec<Clause>,
     /// Every clause's literals, one after another.
     arena: Vec<Lit>,
+    /// Reused while normalizing incoming clauses; never retained as a clause's storage.
+    clause_buffer: Vec<Lit>,
     /// Literals of deleted clauses still in the arena.
     wasted: usize,
     /// Clauses of three or more literals, under the negation of each watched literal.
@@ -186,6 +188,7 @@ impl Solver {
         Solver {
             clauses: Vec::new(),
             arena: Vec::new(),
+            clause_buffer: Vec::new(),
             wasted: 0,
             watches: Vec::new(),
             bins: Vec::new(),
@@ -269,6 +272,12 @@ impl Solver {
         }
     }
 
+    pub(super) fn prefer_selector(&mut self, l: Lit) {
+        self.activity[l.var() as usize] = 0.5;
+        self.phase[l.var() as usize] = l.is_neg();
+        self.heap.decrease(l.var(), &self.activity);
+    }
+
     fn lits(&self, c: u32) -> &[Lit] {
         let c = self.clauses[c as usize];
         &self.arena[c.start as usize..(c.start + c.len) as usize]
@@ -277,18 +286,63 @@ impl Solver {
     /// Adds a clause (the search goes back to the top level first). Returns `false` when the
     /// formula is now known unsatisfiable.
     pub fn add_clause(&mut self, lits: &[Lit]) -> bool {
+        self.add_incoming_clause(lits, false, None)
+    }
+
+    /// Initial watches for an encoding clause may follow its gate's roles instead of the
+    /// numeric variable order. Normalization and proof premises remain unchanged.
+    pub(super) fn add_clause_watching(&mut self, lits: &[Lit], watches: [Lit; 2]) -> bool {
+        self.add_incoming_clause(lits, false, Some(watches))
+    }
+
+    /// A RUP consequence established by native preprocessing, logged as a proof step rather
+    /// than admitted as an additional premise. Binary consequences are retained glue clauses.
+    pub(super) fn add_rup_clause(&mut self, lits: &[Lit]) -> bool {
         if self.unsat {
             return false;
         }
+        if let Some(proof) = &mut self.proof {
+            proof.push(Step::Add(lits.to_vec()));
+        }
+        self.add_incoming_clause(lits, true, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn proof_steps(&self) -> Option<&[Step]> {
+        self.proof.as_deref()
+    }
+
+    fn add_incoming_clause(
+        &mut self,
+        lits: &[Lit],
+        learnt: bool,
+        watches: Option<[Lit; 2]>,
+    ) -> bool {
+        if self.unsat {
+            return false;
+        }
+        let mut buffer = core::mem::take(&mut self.clause_buffer);
+        buffer.clear();
+        buffer.extend_from_slice(lits);
+        let result = self.add_buffered_clause(&mut buffer, learnt, watches);
+        self.clause_buffer = buffer;
+        result
+    }
+
+    fn add_buffered_clause(
+        &mut self,
+        c: &mut Vec<Lit>,
+        learnt: bool,
+        watches: Option<[Lit; 2]>,
+    ) -> bool {
         self.cancel_until(0);
-        let mut c: Vec<Lit> = lits.to_vec();
         c.sort_unstable();
         c.dedup();
         // A tautology is always true.
         if c.windows(2).any(|w| w[0].var() == w[1].var()) {
             return true;
         }
-        for &l in &c {
+        for &l in c.iter() {
             while l.var() >= self.num_vars() {
                 self.new_var();
             }
@@ -298,23 +352,20 @@ impl Solver {
         if c.iter().any(|&l| self.value(l) == Value::True) {
             return true;
         }
-        let reduced: Vec<Lit> = c
-            .iter()
-            .copied()
-            .filter(|&l| self.value(l) != Value::False)
-            .collect();
-        if reduced.len() != c.len()
+        let original_len = c.len();
+        c.retain(|&l| self.value(l) != Value::False);
+        if c.len() != original_len
             && let Some(p) = &mut self.proof
         {
-            p.push(Step::Add(reduced.clone()));
+            p.push(Step::Add(c.clone()));
         }
-        match reduced.len() {
+        match c.len() {
             0 => {
                 self.unsat = true;
                 false
             }
             1 => {
-                self.assign(reduced[0], None);
+                self.assign(c[0], None);
                 if self.propagate().is_some() {
                     self.unsat = true;
                     if let Some(p) = &mut self.proof {
@@ -325,7 +376,16 @@ impl Solver {
                 true
             }
             _ => {
-                self.attach(&reduced, false, 0);
+                if let Some(watches) = watches {
+                    let mut selected = 0;
+                    for wanted in watches {
+                        if let Some(i) = c[selected..].iter().position(|&l| l == wanted) {
+                            c.swap(selected, selected + i);
+                            selected += 1;
+                        }
+                    }
+                }
+                self.attach(c, learnt, if learnt { 2 } else { 0 });
                 true
             }
         }
@@ -377,7 +437,12 @@ impl Solver {
 
     /// Unit propagation from `qhead`: the conflicting clause, if any.
     fn propagate(&mut self) -> Option<u32> {
-        while self.qhead < self.trail.len() {
+        self.propagate_until(u64::MAX)
+    }
+
+    /// Complete each literal's watch list before pausing, leaving the remaining trail queued.
+    fn propagate_until(&mut self, stop: u64) -> Option<u32> {
+        while self.qhead < self.trail.len() && self.propagations < stop {
             let p = self.trail[self.qhead];
             self.qhead += 1;
             self.propagations += 1;
@@ -639,29 +704,43 @@ impl Solver {
     }
 
     /// The decision levels a restart can keep (van der Tak, Ramos and Heule, "Reusing the
-    /// Assignment Trail in CDCL Solvers", 2011): those whose decisions are all more active than
-    /// the next decision would be. Going back to level 0, the search would take those same
-    /// decisions again, with the same phases, and propagate the same literals, which on a large
-    /// circuit is most of a restart's cost.
+    /// Assignment Trail in CDCL Solvers", 2011): a prefix whose decisions have no lower
+    /// priority than variables a restart would free. Root assignments remain fixed;
+    /// implications in a discarded suffix become candidates too. Keeping an eligible
+    /// prefix avoids rebuilding its propagated literals, which on a large circuit is most
+    /// of a restart's cost.
     fn reusable_levels(&mut self) -> u32 {
         // The next decision: the most active unassigned variable (assigned ones leave the
         // heap, and come back when unassigned).
         let next = loop {
             match self.heap.top() {
-                None => return 0,
+                // Propagation has completed and every variable is assigned: keep the
+                // completed model instead of undoing and rebuilding it at a restart.
+                None => return self.decision_level(),
                 Some(v) if self.values[v as usize] == Value::Unset => break v,
                 Some(_) => {
                     self.heap.pop(&self.activity);
                 }
             }
         };
-        let act = self.activity[next as usize];
-        (0..self.decision_level())
-            .find(|&l| {
-                let d = self.trail[self.trail_lim[l as usize]].var();
-                self.activity[d as usize] < act
-            })
-            .unwrap_or_else(|| self.decision_level())
+        let mut competing = self.activity[next as usize];
+        let mut keep = self.decision_level();
+        let mut end = self.trail.len();
+        // A fresh restart can also choose variables that are currently implied. Build
+        // the maximum priority of the suffix that would become unassigned, excluding
+        // the root assignments and the implications of already retained decisions.
+        for level in (0..self.trail_lim.len()).rev() {
+            let start = self.trail_lim[level];
+            for literal in &self.trail[start..end] {
+                competing = competing.max(self.activity[literal.var() as usize]);
+            }
+            let decision = self.trail[start].var();
+            if self.activity[decision as usize] < competing {
+                keep = level as u32;
+            }
+            end = start;
+        }
+        keep
     }
 
     fn pick(&mut self) -> Option<Lit> {
@@ -749,14 +828,19 @@ impl Solver {
     }
 
     /// Solves within `limits`, counted from this call. On [`Answer::Unknown`] the search stays
-    /// where it stopped: the next call goes on from there.
+    /// where it stopped: the next call goes on from there. A zero allowance pauses an
+    /// undecided search without work; a contradiction already established is still returned.
     pub fn solve_within(&mut self, limits: Limits) -> Answer {
         if self.unsat {
             return Answer::Unsat;
         }
+        if limits.conflicts == 0 || limits.propagations == 0 {
+            return Answer::Unknown;
+        }
         let (c0, p0) = (self.conflicts, self.propagations);
+        let propagation_stop = p0.saturating_add(limits.propagations);
         loop {
-            if let Some(confl) = self.propagate() {
+            if let Some(confl) = self.propagate_until(propagation_stop) {
                 self.conflicts += 1;
                 self.here += 1;
                 if self.decision_level() == 0 {
@@ -917,5 +1001,103 @@ impl Heap {
         }
         self.heap[i] = v;
         self.index[v as usize] = i as i64;
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn priority(s: &mut Solver, v: Var, value: f64) {
+        s.activity[v as usize] = value;
+        s.heap.decrease(v, &s.activity);
+    }
+
+    fn decide(s: &mut Solver, v: Var) {
+        s.trail_lim.push(s.trail.len());
+        s.assign(Lit::pos(v), None);
+        assert!(s.propagate_until(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn a_higher_priority_implication_prevents_retaining_its_decision() {
+        let mut s = Solver::new();
+        let root = s.new_var();
+        let decision = s.new_var();
+        let implied = s.new_var();
+        let unset = s.new_var();
+        assert!(s.add_clause(&[Lit::pos(root)]));
+        assert!(s.add_clause(&[Lit::neg(decision), Lit::pos(implied)]));
+        for (v, p) in [
+            (root, 1000.0),
+            (decision, 10.0),
+            (implied, 20.0),
+            (unset, 1.0),
+        ] {
+            priority(&mut s, v, p);
+        }
+        decide(&mut s, decision);
+        assert_eq!(s.values[implied as usize], Value::True);
+        let keep = s.reusable_levels();
+        assert_eq!(keep, 0);
+        s.cancel_until(keep);
+        assert_eq!(s.pick().unwrap().var(), implied);
+        assert_eq!(s.values[root as usize], Value::True);
+    }
+
+    #[test]
+    fn the_restart_keeps_earlier_levels_but_reconsiders_later_implications() {
+        let mut s = Solver::new();
+        let first = s.new_var();
+        let second = s.new_var();
+        let implied = s.new_var();
+        let unset = s.new_var();
+        assert!(s.add_clause(&[Lit::neg(second), Lit::pos(implied)]));
+        for (v, p) in [(first, 30.0), (second, 20.0), (implied, 25.0), (unset, 1.0)] {
+            priority(&mut s, v, p);
+        }
+        decide(&mut s, first);
+        decide(&mut s, second);
+        let keep = s.reusable_levels();
+        assert_eq!(keep, 1);
+        s.cancel_until(keep);
+        assert_eq!(s.values[first as usize], Value::True);
+        assert_eq!(s.values[second as usize], Value::Unset);
+        assert_eq!(s.pick().unwrap().var(), implied);
+    }
+
+    #[test]
+    fn root_priorities_do_not_force_a_restart_of_reusable_levels() {
+        let mut s = Solver::new();
+        let root = s.new_var();
+        let decision = s.new_var();
+        let implied = s.new_var();
+        let unset = s.new_var();
+        assert!(s.add_clause(&[Lit::pos(root)]));
+        assert!(s.add_clause(&[Lit::neg(decision), Lit::pos(implied)]));
+        for (v, p) in [
+            (root, 1000.0),
+            (decision, 20.0),
+            (implied, 10.0),
+            (unset, 1.0),
+        ] {
+            priority(&mut s, v, p);
+        }
+        decide(&mut s, decision);
+        assert_eq!(s.reusable_levels(), 1);
+    }
+
+    #[test]
+    fn a_completed_model_is_returned_without_rebuilding_its_trail() {
+        let mut s = Solver::new();
+        let decision = s.new_var();
+        let implied = s.new_var();
+        assert!(s.add_clause(&[Lit::neg(decision), Lit::pos(implied)]));
+        decide(&mut s, decision);
+        s.here = 100;
+        assert_eq!(s.reusable_levels(), 1);
+        let before = s.decisions;
+        assert_eq!(s.solve(1), Answer::Sat(vec![true, true]));
+        assert_eq!(s.decisions, before);
     }
 }

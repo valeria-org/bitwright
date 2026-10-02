@@ -201,6 +201,16 @@ impl Db {
 /// Checks a DRUP proof of the unsatisfiability of `cnf`: `Ok` when every added clause follows
 /// by reverse unit propagation and the empty clause is added; else the first failing step.
 pub fn check(cnf: &[Vec<Lit>], proof: &[Step]) -> Result<(), String> {
+    check_steps(cnf, proof, true)
+}
+
+/// Test preprocessing and interrupted search transcripts without claiming UNSAT.
+#[cfg(test)]
+pub(super) fn check_prefix(cnf: &[Vec<Lit>], proof: &[Step]) -> Result<(), String> {
+    check_steps(cnf, proof, false)
+}
+
+fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), String> {
     let mut db = Db {
         clauses: Vec::new(),
         alive: Vec::new(),
@@ -258,5 +268,9 @@ pub fn check(cnf: &[Vec<Lit>], proof: &[Step]) -> Result<(), String> {
             }
         }
     }
-    Err("the proof does not add the empty clause".into())
+    if complete {
+        Err("the proof does not add the empty clause".into())
+    } else {
+        Ok(())
+    }
 }

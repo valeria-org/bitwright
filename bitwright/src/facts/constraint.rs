@@ -171,6 +171,8 @@ pub(crate) struct Relation {
 /// The contents of an [`Assumptions`] set.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Store {
+    /// Global declarations used when propagating these constraints.
+    pub(crate) declaration_revision: u64,
     /// The constraints as added: an expression and facts its value satisfies.
     pub(crate) seeds: Vec<(Expr, Facts)>,
     /// Facts known per expression (the seeds and what propagation derived from them).
@@ -313,11 +315,13 @@ impl Assumptions {
     fn add(&mut self, cx: &mut Context, e: Expr, facts: Facts) -> Result<ConstraintId, Error> {
         let n = cx.id(e)?;
         self.check_context(cx)?;
+        self.refresh(cx)?;
         let id = self.next_id();
         // The context's fact overlay may hold this very set as its key: drop that, so the set
         // is changed in place instead of copied.
         cx.facts.forget(self);
         let store = Arc::make_mut(&mut self.store);
+        store.declaration_revision = cx.declaration_revision;
         store.seeds.push((e, facts));
         if store.infeasible.is_none() {
             let mut p = Propagation {
@@ -348,7 +352,42 @@ impl Assumptions {
         Ok(())
     }
 
-    /// Whether the constraints contradict each other.
+    /// Repropagate the original constraints if global symbol declarations changed.
+    /// Constraint ids and original seeds are preserved. Facts and simplification queries
+    /// refresh automatically; this method also updates this set's propagation diagnostics.
+    pub fn refresh(&mut self, cx: &mut Context) -> Result<(), Error> {
+        if let std::borrow::Cow::Owned(current) = self.refreshed(cx)? {
+            *self = current;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refreshed<'a>(
+        &'a self,
+        cx: &mut Context,
+    ) -> Result<std::borrow::Cow<'a, Self>, Error> {
+        use std::borrow::Cow;
+        self.check_context(cx)?;
+        if self.is_empty() || self.store.declaration_revision == cx.declaration_revision {
+            return Ok(Cow::Borrowed(self));
+        }
+        if let Some(cached) = &cx.facts.overlay_key
+            && cached.store.declaration_revision == cx.declaration_revision
+            && cached.store.seeds == self.store.seeds
+        {
+            return Ok(Cow::Owned(cached.clone()));
+        }
+        let mut current = Assumptions::new();
+        for &(expression, facts) in &self.store.seeds {
+            current.assume(cx, expression, facts)?;
+        }
+        cx.facts.overlay.clear();
+        cx.facts.overlay_key = Some(current.clone());
+        Ok(Cow::Owned(current))
+    }
+
+    /// Whether the constraints contradicted each other at their last propagation.
+    /// After global declarations change, [`refresh`](Self::refresh) updates this diagnostic.
     pub fn is_infeasible(&self) -> bool {
         self.store.infeasible.is_some()
     }
@@ -388,11 +427,90 @@ impl Assumptions {
             .map(|(i, (e, f))| (ConstraintId(i as u32), *e, *f))
     }
 
+    /// Exact Boolean predicates for the original constraints, in constraint-id order.
+    ///
+    /// Known bits, unsigned bounds and strides, and signed bounds are all retained.
+    /// This exposes scoped premises for consumers such as the native prover or joint
+    /// output analysis without making path facts into global symbol declarations.
+    /// Propagated consequences are not substituted for the original constraints.
+    pub fn predicates(&self, cx: &mut Context) -> Result<Vec<Expr>, Error> {
+        self.check_context(cx)?;
+        self.constraints()
+            .map(|(_, expression, facts)| {
+                let id = cx.id(expression)?;
+                let predicate = facts_predicate(cx, id, facts)?;
+                Ok(cx.handle(predicate))
+            })
+            .collect()
+    }
+
     /// Whether propagation stopped at its bound for some constraint, so some consequences were
     /// not derived (results stay sound, just less precise).
     pub fn is_truncated(&self) -> bool {
         self.store.truncated
     }
+}
+
+pub(crate) fn facts_predicate(cx: &mut Context, value: u32, facts: Facts) -> Result<u32, Error> {
+    use crate::{BinOp, BitVec, CmpOp};
+    let width = facts.width();
+    if let Some(constant) = facts.as_constant() {
+        let constant = cx.mk_const(&constant)?;
+        return cx.c_cmp(CmpOp::Eq, value, constant);
+    }
+    let mut clauses = Vec::new();
+    let known = facts.known();
+    if !known.known().is_zero() {
+        let mask = cx.mk_const(&known.known())?;
+        let ones = cx.mk_const(&known.known_one())?;
+        let masked = cx.c_bin(BinOp::And, value, mask)?;
+        clauses.push(cx.c_cmp(CmpOp::Eq, masked, ones)?);
+    }
+    let unsigned = facts.urange();
+    let lo = unsigned.lo();
+    let hi = unsigned.hi();
+    if !lo.is_zero() {
+        let bound = cx.mk_const(&lo)?;
+        clauses.push(cx.c_cmp(CmpOp::Ule, bound, value)?);
+    }
+    if !hi.is_ones() {
+        let bound = cx.mk_const(&hi)?;
+        clauses.push(cx.c_cmp(CmpOp::Ule, value, bound)?);
+    }
+    let stride = unsigned.stride();
+    if stride > 1 {
+        let bound = cx.mk_const(&lo)?;
+        if width.bits() < 64 && stride >> width.bits() != 0 {
+            // A stride larger than the whole word can describe only a singleton.
+            // Never truncate it into a different modulus, including division by zero.
+            clauses.push(cx.c_cmp(CmpOp::Eq, value, bound)?);
+        } else if stride.is_power_of_two() {
+            let mask = cx.mk_const(&BitVec::wrapping_from_u64(width, stride - 1))?;
+            let masked = cx.c_bin(BinOp::And, value, mask)?;
+            let residue = cx.c_bin(BinOp::And, bound, mask)?;
+            clauses.push(cx.c_cmp(CmpOp::Eq, masked, residue)?);
+        } else {
+            let delta = cx.c_bin(BinOp::Sub, value, bound)?;
+            let modulus = cx.mk_const(&BitVec::wrapping_from_u64(width, stride))?;
+            let remainder = cx.c_bin(BinOp::URem, delta, modulus)?;
+            let zero = cx.mk_const(&BitVec::zero(width))?;
+            clauses.push(cx.c_cmp(CmpOp::Eq, remainder, zero)?);
+        }
+    }
+    let signed = facts.srange();
+    if signed.lo() != BitVec::smin(width) {
+        let bound = cx.mk_const(&signed.lo())?;
+        clauses.push(cx.c_cmp(CmpOp::Sle, bound, value)?);
+    }
+    if signed.hi() != BitVec::smax(width) {
+        let bound = cx.mk_const(&signed.hi())?;
+        clauses.push(cx.c_cmp(CmpOp::Sle, value, bound)?);
+    }
+    let mut predicate = cx.mk_const(&BitVec::from_bool(true))?;
+    for clause in clauses {
+        predicate = cx.c_bin(BinOp::And, predicate, clause)?;
+    }
+    Ok(predicate)
 }
 
 /// The assumptions in the form the fact overlay reads: assumed facts and orderings by node.

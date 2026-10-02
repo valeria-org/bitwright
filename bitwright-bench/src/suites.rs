@@ -225,6 +225,41 @@ fn exprs(v: &mut Vec<Bench>) {
             |(mut cx, root, x, yk)| cx.substitute(&[root], &[(x, yk)]).expect("substitute"),
         );
     }));
+    v.push(Bench::new(
+        "expr/substitute-root/64",
+        2000,
+        "10000-node root",
+        |b| {
+            let mut cx = Context::new();
+            let mut root = cx.symbol("x", Width::W64).expect("symbol");
+            let one = cx.one(Width::W64).expect("one");
+            let zero = cx.zero(Width::W64).expect("zero");
+            for _ in 0..10_000 {
+                root = cx.add(root, one).expect("add");
+            }
+            b.iter(|| cx.substitute(&[root], &[(root, zero)]).expect("substitute"));
+        },
+    ));
+    v.push(Bench::new(
+        "expr/unraised-owned/64",
+        2000,
+        "10000-node owner",
+        |b| {
+            let mut cx = Context::new();
+            let x = cx.symbol("x", Width::W64).expect("symbol");
+            let one = cx.one(Width::W64).expect("one");
+            let mut owned = x;
+            for _ in 0..10_000 {
+                owned = cx.add(owned, one).expect("add");
+            }
+            let root = cx.xor(owned, one).expect("xor");
+            let mut lw = bitwright::translate::Lowering::new(&mut cx);
+            lw.define(0u32, x).expect("define");
+            lw.define(1, one).expect("define");
+            lw.define(2, owned).expect("define");
+            b.iter(|| lw.unraised(root).expect("unraised"));
+        },
+    ));
     let texts = |bits: u16| -> Vec<String> {
         let mut cx = Context::new();
         (0..20)

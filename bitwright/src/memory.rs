@@ -117,8 +117,13 @@ impl Memory {
     }
 
     /// Known contents from address `start` on, one value per cell (for example a binary's
-    /// read-only data). Regions must not overlap.
+    /// read-only data). Regions must not overlap, including themselves when addresses wrap.
     pub fn with_region(mut self, start: u128, cells: &[BitVec]) -> Result<Memory, Error> {
+        if self.addr.bits() < 128 && cells.len() as u128 > (1u128 << self.addr.bits()) {
+            return Err(Error::Unsupported(
+                "a known region exceeds the memory's address space".into(),
+            ));
+        }
         for c in cells {
             if c.width() != self.cell {
                 return Err(crate::WidthError::Mismatch {
@@ -365,18 +370,23 @@ impl Memory {
             let start = self.regions[r].start;
             // The offset into the region, as its base plus one constant.
             let neg = BitVec::apply_un(crate::UnOp::Neg, &start)?;
-            let off = match neg.to_u128() {
-                Some(k) => self.offset(cx, a, k as u64)?,
+            let off = match neg.to_u64() {
+                Some(k) => self.offset(cx, a, k)?,
                 None => {
                     let s = cx.constant(&start)?;
                     cx.bin(BinOp::Sub, a, s)?
                 }
             };
-            let lim = cx.constant(&BitVec::wrapping_from_u128(self.addr, len))?;
-            let inside = cx.cmp(CmpOpExt::Ult, off, lim)?;
+            let inside = if self.addr.bits() < 128 && len == (1u128 << self.addr.bits()) {
+                // A full address space has no representable exclusive upper bound.
+                cx.one(Width::W1)?
+            } else {
+                let lim = cx.constant(&BitVec::from_u128(self.addr, len)?)?;
+                cx.cmp(CmpOpExt::Ult, off, lim)?
+            };
             let decided = match cx.as_const(inside)? {
                 Some(v) => Some(!v.is_zero()),
-                None => match cx.prove(Query::Cmp(CmpOpExt::Ult, off, lim))? {
+                None => match cx.prove(Query::IsNonZero(inside))? {
                     Truth::True => Some(true),
                     Truth::False => Some(false),
                     _ => None,
@@ -494,6 +504,85 @@ mod tests {
 
     fn setup() -> (Context, ParseOptions) {
         (Context::new(), ParseOptions::width(Width::W32))
+    }
+
+    #[test]
+    fn known_regions_preserve_wide_offsets_and_address_wrap() {
+        for bits in [8, 64, 65, 128, 129, 256, 512] {
+            let w = Width::new(bits).unwrap();
+            let mut starts = vec![1];
+            if bits > 64 {
+                starts.push((1u128 << 64) + 3);
+            }
+            if bits <= 128 {
+                starts.push(if bits == 128 {
+                    u128::MAX - 1
+                } else {
+                    (1u128 << bits) - 2
+                });
+            }
+            for start in starts {
+                let mut cx = Context::new();
+                let mut m = Memory::new("m", w, Width::W8, Endian::Little)
+                    .zeroed()
+                    .with_bytes(start, &[42, 99, 17])
+                    .unwrap();
+                let p = cx.symbol("p", w).unwrap();
+                let symbolic = m.load(&mut cx, m.initial(), p, 1).unwrap();
+                for (offset, want) in [(0, 42), (1, 99), (2, 17), (3, 0)] {
+                    let address = BitVec::apply_bin(
+                        BinOp::Add,
+                        &BitVec::from_u128(w, start).unwrap(),
+                        &BitVec::from_u64(w, offset).unwrap(),
+                    )
+                    .unwrap();
+                    let a = cx.constant(&address).unwrap();
+                    let direct = m.load(&mut cx, m.initial(), a, 1).unwrap();
+                    assert_eq!(cx.as_const(direct).unwrap().unwrap().to_u64(), Some(want));
+                    let env = [(SymbolKey::from("p"), address)];
+                    assert_eq!(
+                        cx.eval(&[symbolic], &env[..]).unwrap()[0].to_u64(),
+                        Some(want)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_regions_can_cover_the_whole_address_space() {
+        for bits in 1..=8 {
+            let w = Width::new(bits).unwrap();
+            let size = 1usize << bits;
+            let bytes: Vec<u8> = (0..size)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let start = size / 2;
+            let mut cx = Context::new();
+            let mut m = Memory::new("m", w, Width::W8, Endian::Little)
+                .with_bytes(start as u128, &bytes)
+                .unwrap();
+            let p = cx.symbol("p", w).unwrap();
+            let symbolic = m.load(&mut cx, m.initial(), p, 1).unwrap();
+            assert!(m.reads().is_empty());
+            for address in 0..size {
+                let want = u64::from(bytes[(address + size - start) % size]);
+                let value = BitVec::from_u64(w, address as u64).unwrap();
+                let a = cx.constant(&value).unwrap();
+                let direct = m.load(&mut cx, m.initial(), a, 1).unwrap();
+                assert_eq!(cx.as_const(direct).unwrap().unwrap().to_u64(), Some(want));
+                let env = [(SymbolKey::from("p"), value)];
+                assert_eq!(
+                    cx.eval(&[symbolic], &env[..]).unwrap()[0].to_u64(),
+                    Some(want)
+                );
+            }
+        }
+        assert!(
+            Memory::new("m", Width::W1, Width::W8, Endian::Little)
+                .with_bytes(0, &[1, 2, 3])
+                .is_err()
+        );
     }
 
     #[test]

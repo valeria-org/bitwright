@@ -293,6 +293,7 @@ pub struct Context {
     pub(crate) symbols: SymbolTable,
     config: ContextConfig,
     generation: u32,
+    pub(crate) declaration_revision: u64,
     tag: NonZeroU32,
     retired: [u32; RETIRED],
     counters: ArenaCounters,
@@ -344,6 +345,7 @@ impl Context {
             symbols: SymbolTable::default(),
             config,
             generation: 0,
+            declaration_revision: 0,
             tag: fresh_tag(),
             retired: [0; RETIRED],
             counters: ArenaCounters::default(),
@@ -434,6 +436,7 @@ impl Context {
         self.interner.clear();
         self.wide_consts.clear();
         self.symbols.clear();
+        self.declaration_revision = 0;
         self.dag_cache.clear();
         self.facts.clear();
         self.memo.clear();
@@ -977,7 +980,9 @@ impl Context {
     /// use it, and a result is equal to its input for every value of the symbols that agrees
     /// with their declarations, not for others. Evaluating at a value that does not agree is
     /// the host's error. A declaration drops the context's facts and simplification memo
-    /// (both may depend on it), so declare right after creating the symbol.
+    /// (both may depend on it), so declare right after creating the symbol. Existing assumption
+    /// sets are repropagated from their original constraints when subsequently queried;
+    /// [`Assumptions::refresh`](crate::Assumptions::refresh) also updates their diagnostics.
     ///
     /// ```
     /// use bitwright::{BitVec, Context, KnownBits, ParseOptions, Query, Truth, Width};
@@ -1012,6 +1017,7 @@ impl Context {
             return Ok(());
         }
         entry.known = known;
+        self.declaration_revision = self.declaration_revision.wrapping_add(1);
         // Every cached fact and result may rest on the old declaration.
         self.facts.clear();
         self.memo.clear();
@@ -1044,10 +1050,27 @@ impl Context {
     }
 
     pub(crate) fn post_order_ids(&mut self, roots: &[u32]) -> Vec<u32> {
-        self.marks.begin(self.nodes.len());
+        self.post_order_ids_pruned(roots, |_| false)
+    }
+
+    /// A post-order walk that omits nodes `skip` answers and their descendants, unless a
+    /// descendant is also reached through another, unskipped path.
+    pub(crate) fn post_order_ids_pruned(
+        &mut self,
+        roots: &[u32],
+        skip: impl Fn(Expr) -> bool,
+    ) -> Vec<u32> {
         let mut out = Vec::new();
         let mut stack: Vec<(u32, u8)> = Vec::new();
+        let mut begun = false;
         for &r in roots {
+            if skip(self.handle(r)) {
+                continue;
+            }
+            if !begun {
+                self.marks.begin(self.nodes.len());
+                begun = true;
+            }
             if self.marks.test_and_set(r) {
                 continue;
             }
@@ -1058,7 +1081,7 @@ impl Context {
                 if (k as usize) < n.op.arity() {
                     top.1 += 1;
                     let c = [n.a, n.b, n.c][k as usize];
-                    if !self.marks.test_and_set(c) {
+                    if !self.marks.test_and_set(c) && !skip(self.handle(c)) {
                         stack.push((c, 0));
                     }
                 } else {

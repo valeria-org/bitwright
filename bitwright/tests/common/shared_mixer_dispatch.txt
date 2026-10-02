@@ -1,0 +1,9 @@
+// Captured three-pair dispatch; the comparisons share the second listed mixer.
+let %0 = concat(byte15:8, concat(byte14:8, concat(byte13:8, concat(byte12:8, concat(byte11:8, concat(byte10:8, concat(byte9:8, byte8:8)))))));
+let %1 = (%0 ^ 0xdbc7d903c04032f9) * 0xdbc7d903c04032f9;
+let %2 = (%0 ^ 0xe97b53013b3955b1) * 0xe97b53013b3955b1;
+let %3 = (%2 ^ %2 >>u 32 >>u (%2 >>u 60)) * 0xe97b53013b3955b1;
+let %4 = (%0 ^ 0xc07b1c823afc12ad) * 0xc07b1c823afc12ad;
+let %5 = (%0 ^ 0xc766dfa6fc622543) * 0xc766dfa6fc622543;
+let %6 = zext<64>(((%1 ^ %1 >>u 32 >>u (%1 >>u 60)) * 0xdbc7d903c04032f9 ^ %3 == 0xfccd74550edcae39) & ((%4 ^ %4 >>u 32 >>u (%4 >>u 60)) * 0xc07b1c823afc12ad ^ %3 == 0xdbeb5595b167b8cb) & ((%5 ^ %5 >>u 32 >>u (%5 >>u 60)) * 0xc766dfa6fc622543 ^ %3 == 0xb5fa5a781d17faab));
+(%6 * 0x442690 ^ %6 * 0x3613e1 ^ 0x442690) + 0x140005352

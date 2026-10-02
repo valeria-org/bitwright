@@ -7,6 +7,217 @@ use super::*;
 use crate::testutil::{Gen, Rng};
 use crate::{BinOp, CmpOpExt, ParseOptions, UnOp};
 
+mod bitvectors;
+mod carry_save;
+mod cuts;
+mod parity_encoding;
+mod peepholes;
+mod problems;
+mod relations;
+mod sampling;
+mod sat_families;
+mod scoped_facts;
+
+#[test]
+fn preparation_stats_include_propagation_and_zero_work_preserves_them() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W8).unwrap();
+    let zero = cx.zero(Width::W8).unwrap();
+    let p = cx.eq(x, zero).unwrap();
+    let cfg = Config::default()
+        .with_samples(0)
+        .with_simplify(false)
+        .with_certificate(true);
+    let mut question = Question::valid(&mut cx, p, &cfg).unwrap();
+    let before = question.stats();
+    assert!(before.propagations > 0);
+    assert!(question.outcome().is_none());
+    let Outcome::Unknown(Unknown::Budget {
+        conflicts,
+        propagations,
+    }) = question
+        .solve(
+            &mut cx,
+            Limits {
+                conflicts: 0,
+                propagations: 0,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("an open question must stay paused");
+    };
+    assert_eq!(
+        (conflicts, propagations),
+        (before.conflicts, before.propagations)
+    );
+    assert_eq!(question.stats(), before);
+    let Outcome::Refuted(model) = question.solve(&mut cx, Limits::conflicts(100)).unwrap() else {
+        panic!("the query must resume normally after a zero-work call");
+    };
+    assert!(cx.eval(&[p], &model[..]).unwrap()[0].is_zero());
+}
+
+#[test]
+fn majority_encoding_is_exact_for_all_input_and_output_polarities() {
+    for signs in 0..8 {
+        for invert in 0..2 {
+            let mut graph = Aig::new();
+            let inputs: Vec<_> = (0..3).map(|_| graph.input()).collect();
+            let root = graph.maj(
+                inputs[0] ^ (signs & 1),
+                inputs[1] ^ (signs >> 1 & 1),
+                inputs[2] ^ (signs >> 2 & 1),
+            ) ^ invert;
+            for assignment in 0..8 {
+                let values = graph.eval_all(|i| assignment >> i & 1 == 1);
+                let want = Aig::value(&values, root);
+                let mut solver = Solver::new();
+                solver.log_proof();
+                let mut cnf = aig::Cnf::encode(&graph, &[root], &mut solver, true);
+                assert_eq!(solver.num_vars(), 4);
+                assert_eq!(cnf.emitted(), 6);
+                cnf.assert(root, &mut solver);
+                for (i, &input) in inputs.iter().enumerate() {
+                    cnf.assert(input ^ u32::from(assignment >> i & 1 == 0), &mut solver);
+                }
+                match solver.solve(100) {
+                    Answer::Sat(model) => {
+                        assert!(want);
+                        assert!(cnf.value(root, &model));
+                    }
+                    Answer::Unsat => {
+                        assert!(!want);
+                        drup::check(&cnf.clauses, &solver.take_proof().unwrap()).unwrap();
+                    }
+                    Answer::Unknown => panic!("tiny majority circuit exceeded budget"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn majority_recognition_preserves_observed_inner_gates_and_rejects_near_misses() {
+    for share in [false, true] {
+        for near_miss in [false, true] {
+            let mut graph = Aig::new();
+            let inputs: Vec<_> = (0..4).map(|_| graph.input()).collect();
+            let (a, b, c, d) = (inputs[0], inputs[1], inputs[2], inputs[3]);
+            let ab = graph.and(a, b);
+            let ac = graph.and(a, c);
+            let bc = graph.and(b, if near_miss { d } else { c });
+            let sum = graph.or(ab, ac);
+            let root = graph.or(sum, bc);
+            let mut roots = inputs.clone();
+            roots.push(root);
+            if share {
+                roots.push(ab);
+            }
+            for assignment in 0..16 {
+                let values = graph.eval_all(|i| assignment >> i & 1 == 1);
+                let want = Aig::value(&values, root);
+                let mut solver = Solver::new();
+                solver.log_proof();
+                let mut cnf = aig::Cnf::encode(&graph, &roots, &mut solver, true);
+                cnf.assert(root, &mut solver);
+                for (i, &input) in inputs.iter().enumerate() {
+                    cnf.assert(input ^ u32::from(assignment >> i & 1 == 0), &mut solver);
+                }
+                match solver.solve(100) {
+                    Answer::Sat(model) => {
+                        assert!(want);
+                        if share {
+                            assert_eq!(cnf.value(ab, &model), Aig::value(&values, ab));
+                        }
+                    }
+                    Answer::Unsat => {
+                        assert!(!want);
+                        drup::check(&cnf.clauses, &solver.take_proof().unwrap()).unwrap();
+                    }
+                    Answer::Unknown => panic!("tiny circuit exceeded budget"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn declarations_hold_in_sampled_sat_and_certified_proofs() {
+    for bits in [1, 8, 65, 128, 512] {
+        let w = Width::new(bits).unwrap();
+        let mut cx = Context::new();
+        let x = cx.symbol("x", w).unwrap();
+        let zero = cx.zero(w).unwrap();
+        let one = cx.one(w).unwrap();
+        for value in [BitVec::zero(w), BitVec::one(w)] {
+            let known = crate::KnownBits::constant(&value);
+            cx.declare_known(x, known).unwrap();
+            let constant = cx.constant(&value).unwrap();
+            for certificate in [false, true] {
+                for simplify in [false, true] {
+                    for samples in [0, 256] {
+                        let cfg = Config::default()
+                            .with_certificate(certificate)
+                            .with_simplify(simplify)
+                            .with_samples(samples);
+                        match equal(&mut cx, x, constant, &cfg).unwrap() {
+                            Outcome::Proved(Some(cert)) => cert.check().unwrap(),
+                            Outcome::Proved(None) => assert!(!certificate),
+                            other => panic!("declaration at {bits} bits: {other:?}"),
+                        }
+                        let different = if value.is_zero() { one } else { zero };
+                        let Outcome::Refuted(model) = equal(&mut cx, x, different, &cfg).unwrap()
+                        else {
+                            panic!("different declared value must be refuted");
+                        };
+                        assert_eq!(
+                            model
+                                .iter()
+                                .find(|(k, _)| *k == SymbolKey::from("x"))
+                                .unwrap()
+                                .1,
+                            value
+                        );
+                    }
+                }
+            }
+        }
+        if bits == 1 {
+            continue;
+        }
+        // Keep unknown bits free while fixing a one and a zero across the entire width.
+        let mut limbs = [0u64; 8];
+        limbs[(bits as usize - 1) / 64] = 1 << ((bits - 1) % 64);
+        let known_zero = BitVec::wrapping_from_limbs(w, &limbs);
+        let known_one = BitVec::one(w);
+        let known = crate::KnownBits::new(known_zero, known_one).unwrap();
+        cx.declare_known(x, known).unwrap();
+        let mask = BitVec::apply_bin(BinOp::Or, &known_zero, &known_one).unwrap();
+        let mask = cx.constant(&mask).unwrap();
+        let fixed = cx.and(x, mask).unwrap();
+        for samples in [0, 256] {
+            let cfg = Config::default()
+                .with_certificate(true)
+                .with_samples(samples);
+            let Outcome::Proved(Some(cert)) = equal(&mut cx, fixed, one, &cfg).unwrap() else {
+                panic!("fixed bits must be proved");
+            };
+            cert.check().unwrap();
+            let Outcome::Refuted(model) = equal(&mut cx, x, one, &cfg).unwrap() else {
+                panic!("unknown bits must remain free");
+            };
+            let value = model
+                .iter()
+                .find(|(k, _)| *k == SymbolKey::from("x"))
+                .unwrap()
+                .1;
+            assert!(known.contains(&value));
+            assert_ne!(value, known_one);
+        }
+    }
+}
+
 /// Random 3-SAT near the threshold, against brute force; models satisfy every clause, and
 /// every unsatisfiability proof checks.
 #[test]
@@ -625,9 +836,7 @@ fn a_resumed_search_is_the_search_it_continues() {
                 let (c0, p0) = (s.conflicts, s.propagations);
                 let a = s.solve_within(step);
                 assert!(s.conflicts - c0 <= step.conflicts);
-                // A limit on propagations is checked between propagations of whole literals'
-                // clauses, so a call may pass it by one literal's worth.
-                assert!(s.propagations - p0 <= step.propagations.saturating_add(90));
+                assert!(s.propagations - p0 <= step.propagations);
                 if a != Answer::Unknown {
                     break a;
                 }
@@ -674,11 +883,12 @@ fn encoded_circuits_agree_with_evaluation() {
         for _ in 0..3 + rng.below(30) {
             let mut pick = || lits[rng.below(lits.len() as u64) as usize] ^ rng.below(2) as u32;
             let (a, b, c) = (pick(), pick(), pick());
-            let x = match rng.below(5) {
+            let x = match rng.below(6) {
                 0 | 1 => g.and(a, b),
                 2 => g.xor(a, b),
                 3 => g.mux(a, b, c),
-                _ => g.or(a, b),
+                4 => g.or(a, b),
+                _ => g.maj(a, b, c),
             };
             lits.push(x);
         }
@@ -727,9 +937,10 @@ fn questions_resume_and_say_why_they_are_undecided() {
     let p = cx.parse(claim, &o).unwrap();
     let mut q = Question::valid(&mut cx, p, &cfg).unwrap();
     let mut steps = 0;
+    let chunk = 10;
     let stepped = loop {
         steps += 1;
-        match q.solve(&mut cx, Limits::conflicts(20)).unwrap() {
+        match q.solve(&mut cx, Limits::conflicts(chunk)).unwrap() {
             Outcome::Unknown(why) => {
                 let Unknown::Budget { conflicts, .. } = why else {
                     panic!("{why}")
@@ -755,7 +966,9 @@ fn questions_resume_and_say_why_they_are_undecided() {
     let mut cx2 = Context::new();
     let p2 = cx2.parse(claim, &o).unwrap();
     let mut q2 = Question::valid(&mut cx2, p2, &cfg).unwrap();
-    let once = q2.solve(&mut cx2, Limits::conflicts(steps * 20)).unwrap();
+    let once = q2
+        .solve(&mut cx2, Limits::conflicts(steps * chunk))
+        .unwrap();
     assert!(matches!(&once, Outcome::Refuted(n) if n == m));
     assert_eq!(q2.stats(), st);
     // A propagation limit stops the search as well.

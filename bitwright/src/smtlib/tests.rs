@@ -1208,9 +1208,49 @@ fn equivalence_under_constraints_asserts_exactly_the_relied_on_ones() {
     let q = super::equivalence_query_under(&mut cx, e, r.expr, &a, r.relies_on).unwrap();
     // The alignment predicate asserted true, and nothing about x.
     assert!(q.contains("(define-fun root2 () (_ BitVec 1)"), "{q}");
-    assert!(q.contains("(assert (= (bvand root2 #b1) #b1))"), "{q}");
+    assert!(q.contains("(assert (= root2 #b1))"), "{q}");
     assert!(!q.contains("root3"), "{q}");
     assert!(q.ends_with("(assert (not (= root0 root1)))\n(check-sat)\n"));
+}
+
+#[test]
+fn exported_fact_constraints_preserve_unsigned_strides_and_signed_membership() {
+    use crate::{Assumptions, Facts, KnownBits, SRange, URange};
+    for (lo, hi, stride) in [(13, 223, 7), (64, 200, 17), (3, 227, 8)] {
+        let mut cx = Context::new();
+        let w = Width::W8;
+        let x = cx.symbol("x", w).unwrap();
+        let facts = Facts::new(
+            KnownBits::unknown(w),
+            URange::strided(
+                BitVec::from_u64(w, lo).unwrap(),
+                BitVec::from_u64(w, hi).unwrap(),
+                stride,
+            )
+            .unwrap(),
+            SRange::full(w),
+        )
+        .unwrap();
+        let mut assumptions = Assumptions::new();
+        let id = assumptions.assume(&mut cx, x, facts).unwrap();
+        let zero = cx.zero(w).unwrap();
+        let one = cx.one(w).unwrap();
+        let text =
+            equivalence_query_under(&mut cx, zero, one, &assumptions, crate::Reliance::of(id))
+                .unwrap();
+        let mut parsed = Context::new();
+        let imported = import(&mut parsed, &text).unwrap();
+        for value in 0..256 {
+            let value = BitVec::from_u64(w, value).unwrap();
+            let env = [(SymbolKey::from("x"), value)];
+            let satisfies = parsed
+                .eval(&imported.assertions, &env[..])
+                .unwrap()
+                .iter()
+                .all(|v| !v.is_zero());
+            assert_eq!(satisfies, facts.contains(&value), "{facts:?}, {value:?}");
+        }
+    }
 }
 
 /// Every rewrite made under random constraints is proved by a solver under the constraints it

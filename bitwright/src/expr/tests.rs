@@ -1096,6 +1096,39 @@ fn bounded_substitution_never_walks_below_what_it_replaces() {
 }
 
 #[test]
+fn pruned_walks_keep_shared_descendants_on_other_paths() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W32).unwrap();
+    let y = cx.symbol("y", Width::W32).unwrap();
+    let z = cx.symbol("z", Width::W32).unwrap();
+    let owned = cx.add(x, y).unwrap();
+    let root = cx.xor(owned, x).unwrap();
+    let order = cx.post_order_ids_pruned(&[owned.index(), root.index()], |e| e == owned);
+    assert_eq!(order, [x.index(), root.index()]);
+    let expected = cx.xor(z, y).unwrap();
+    assert_eq!(
+        cx.substitute(&[root, owned], &[(owned, z), (x, y)])
+            .unwrap(),
+        [expected, z]
+    );
+    // Images are simultaneous: neither a replacement nor its descendants are substituted.
+    assert_eq!(cx.substitute(&[owned], &[(owned, x), (x, z)]).unwrap(), [x]);
+    assert_eq!(cx.substitute(&[root], &[]).unwrap(), [root]);
+}
+
+#[test]
+fn substitution_does_not_build_discarded_subtrees_in_a_full_arena() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W32).unwrap();
+    let y = cx.symbol("y", Width::W32).unwrap();
+    let z = cx.symbol("z", Width::W32).unwrap();
+    let sum = cx.add(x, y).unwrap();
+    let root = cx.xor(sum, x).unwrap();
+    cx.set_max_nodes(cx.len() as u32);
+    assert_eq!(cx.substitute(&[root], &[(root, y), (x, z)]).unwrap(), [y]);
+}
+
+#[test]
 fn bounded_substitution_of_a_deep_chain_takes_linear_total_work() {
     let mut cx = Context::new();
     let x = cx.symbol("x", Width::W64).unwrap();

@@ -20,6 +20,8 @@ use core::fmt;
 use std::sync::Arc;
 
 pub(crate) use constraint::Env;
+#[cfg(feature = "smtlib")]
+pub(crate) use constraint::facts_predicate;
 pub use constraint::{Assumptions, ConstraintId, Reliance};
 pub use known::KnownBits;
 pub use range::{SRange, URange};
@@ -811,6 +813,23 @@ impl Context {
                 .and_then(|g| f.meet(&g))
                 .unwrap_or(f);
         }
+        if n.op == OpCode::Xor && args.len() == 2 {
+            for (source, shifted, facts) in [(n.a, n.b, args[0]), (n.b, n.a, args[1])] {
+                if self.node(shifted).op == OpCode::LShr
+                    && !facts.contains(&BitVec::zero(facts.width()))
+                    && self.positive_right_shift_of(shifted, source)
+                {
+                    // A positive logical right shift cannot reach the
+                    // source's highest set bit, so XOR preserves that bit.
+                    let f = transfer(op, args);
+                    return f
+                        .meet_urange(
+                            &URange::new(BitVec::one(f.width()), BitVec::ones(f.width())).unwrap(),
+                        )
+                        .unwrap_or(f);
+                }
+            }
+        }
         let Some((_, k)) = n.op.as_ext() else {
             return transfer(op, args);
         };
@@ -838,6 +857,62 @@ impl Context {
                 .map_or(Facts::top(w), |kb| Facts::from_known(*kb)),
             Err(_) => Facts::top(w),
         }
+    }
+
+    /// Match at most four logical shifts of exactly `source`, with at least
+    /// one globally positive count. Counts may depend on the source. Literal
+    /// counts, nonwrapping offsets of constant shifts, and cached base facts
+    /// avoid untracked conditional dependencies or extra fact traversal.
+    fn positive_right_shift_of(&self, mut shifted: u32, source: u32) -> bool {
+        let mut positive = false;
+        for _ in 0..4 {
+            let n = self.node(shifted);
+            if n.op != OpCode::LShr {
+                return false;
+            }
+            positive |= self.globally_positive_shift_count(n.b);
+            shifted = n.a;
+            if shifted == source {
+                return positive;
+            }
+        }
+        false
+    }
+
+    fn globally_positive_shift_count(&self, i: u32) -> bool {
+        if let Some(c) = self.const_val(i) {
+            return !c.is_zero();
+        }
+        if self
+            .cached_facts(i)
+            .is_some_and(|f| !f.urange.lo().is_zero())
+        {
+            return true;
+        }
+        // `offset + (v >>u k)` can be checked without fetching conditional
+        // facts of the count. An offset alone is insufficient if it wraps.
+        let n = self.node(i);
+        if n.op != OpCode::Add {
+            return false;
+        }
+        let (raw, offset) = match (self.const_val(n.a), self.const_val(n.b)) {
+            (Some(c), _) => (n.b, c),
+            (_, Some(c)) => (n.a, c),
+            _ => return false,
+        };
+        if offset.is_zero() {
+            return false;
+        }
+        let raw = self.node(raw);
+        if raw.op != OpCode::LShr {
+            return false;
+        }
+        let Some(count) = self.const_val(raw.b) else {
+            return false;
+        };
+        let count = count.to_u64().unwrap_or(u64::MAX).min(u64::from(u32::MAX)) as u32;
+        let maximum = known::bv_lshr(&BitVec::ones(offset.width()), count);
+        ule(&maximum, &known::bv_not(&offset))
     }
 
     /// A select choosing between the two operands of its own ordered comparison is a minimum or
@@ -877,19 +952,62 @@ impl Context {
     }
 
     /// A right shift of a value by its own top bits, `a >>u (a >>u k)` (the count spelled
-    /// `b >>u m` with `a = b >>u j`, `j <= m`, or `a = b`), as in xorshift-multiply mixers
-    /// (`h ^ ((h >>u 32) >>u (h >>u 60))`). When the count is `t`, `a` lies in
-    /// `[t << k, ((t + 1) << k) - 1]`, so the result is below `2^k` at every `t` (for
-    /// `2^t >= t + 1`), where the count's range alone allows the whole of `a`'s.
+    /// `b >>u m` with `a = b >>u j`, `j <= m`, or `a = b`), or a nonwrapping constant
+    /// offset added to that count, as in xorshift-multiply mixers
+    /// (`h ^ ((h >>u 32) >>u (h >>u 60))`). When the count is `t + offset`, `a` lies in
+    /// `[t << k, ((t + 1) << k) - 1]`. Intersect that interval with `a`'s range before
+    /// shifting it by the actual count; the count's range alone loses this correlation.
     fn self_shift_bound(&self, i: u32, args: &[&Facts]) -> Option<Facts> {
         let n = self.node(i);
         let w = self.width_of(i);
         let wb = u64::from(w.bits());
-        let s = self.node(n.b);
+        // A count mask can hide the shared source even when it changes no value.
+        // Use only cached base facts here: assuming the masked result fits does not
+        // establish that the unmasked count fits, and overlay facts need reliance.
+        let unmask = |mut id| {
+            for _ in 0..4 {
+                let node = self.node(id);
+                if node.op != OpCode::And {
+                    return Some(node);
+                }
+                let (raw, mask) = match (self.const_val(node.a), self.const_val(node.b)) {
+                    (Some(mask), _) => (node.b, mask),
+                    (_, Some(mask)) => (node.a, mask),
+                    _ => return None,
+                };
+                let facts = self.cached_facts(raw)?;
+                let possible = known::bv_not(&facts.known.known_zero());
+                if !known::bv_and(&possible, &known::bv_not(&mask)).is_zero() {
+                    return None;
+                }
+                id = raw;
+            }
+            None
+        };
+        let count = unmask(n.b)?;
+        let (s, offset) = if count.op == OpCode::Add {
+            let (raw, offset) = match (self.const_val(count.a), self.const_val(count.b)) {
+                (Some(c), _) => (count.b, c),
+                (_, Some(c)) => (count.a, c),
+                _ => return None,
+            };
+            (unmask(raw)?, offset.to_u64()?)
+        } else {
+            (count, 0)
+        };
         if s.op != OpCode::LShr {
             return None;
         }
         let m = self.const_val(s.b)?.to_u64()?;
+        if offset != 0 {
+            // The offset must not wrap for any source value. Otherwise the observed
+            // count cannot be inverted by subtracting it (small word widths matter).
+            let maximum = known::bv_lshr(&BitVec::ones(w), u32::try_from(m).ok()?);
+            let base = BitVec::wrapping_from_u64(w, offset);
+            if ult(&known::bv_add(&maximum, &base), &maximum) {
+                return None;
+            }
+        }
         let j = if n.a == s.a {
             0
         } else {
@@ -917,8 +1035,8 @@ impl Context {
                 ),
             });
         };
-        for t in slo..=shi.min(wb - 1) {
-            let tv = BitVec::wrapping_from_u64(w, t);
+        for t in slo.max(offset)..=shi.min(wb - 1) {
+            let tv = BitVec::wrapping_from_u64(w, t - offset);
             let first = shl(&tv);
             if known::bv_lshr(&first, k) != tv {
                 // No value of `a` has these top bits.
@@ -1232,6 +1350,8 @@ impl Context {
         cap: u32,
     ) -> Result<Result<(Facts, Reliance), Reliance>, Error> {
         let root = self.id(e)?;
+        let current = assumptions.refreshed(self)?;
+        let assumptions = current.as_ref();
         self.overlay_for(assumptions)?;
         let mut overlay = core::mem::take(&mut self.facts.overlay);
         let r = self.overlay_facts(&assumptions.store.env, &mut overlay, root, cap);
@@ -1258,6 +1378,9 @@ impl Context {
         x: u32,
         y: u32,
     ) -> Option<(bool, Reliance)> {
+        if assumptions.store.declaration_revision != self.declaration_revision {
+            return None;
+        }
         let env = &assumptions.store.env;
         if env.infeasible.is_some() || x == y {
             return None;
@@ -1456,6 +1579,10 @@ impl Context {
 
     fn prove_inner(&mut self, q: Query<'_>, a: Option<&Assumptions>) -> Result<Proof, Error> {
         let exprs = self.validate_query(&q)?;
+        let current = a
+            .map(|assumptions| assumptions.refreshed(self))
+            .transpose()?;
+        let a = current.as_deref();
         if let Query::Injective { e, of } | Query::Bijective { e, of } = q {
             let onto = matches!(q, Query::Bijective { .. });
             return crate::invert::prove(self, e, of, onto, a);

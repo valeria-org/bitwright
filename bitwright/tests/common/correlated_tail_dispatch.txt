@@ -1,0 +1,8 @@
+let %0 = concat(byte7:8, concat(byte6:8, concat(byte5:8, concat(byte4:8, concat(byte3:8, concat(byte2:8, concat(byte1:8, byte0:8)))))));
+let %1 = (%0 ^ 0xf82363f7ac0e82d1) * 0xf82363f7ac0e82d1;
+let %2 = (%1 ^ %1 >>u 32 >>u (%1 >>u 60)) * 0xf82363f7ac0e82d1;
+let %3 = (%0 ^ 0xfbd288d2aea1644f) * 0xfbd288d2aea1644f;
+let %4 = (%0 ^ 0xe5014cce21694c23) * 0xe5014cce21694c23;
+let %5 = (%0 ^ 0xf3ef9404df334875) * 0xf3ef9404df334875;
+let %6 = zext<64>((%2 ^ (%3 ^ %3 >>u 32 >>u (%3 >>u 60)) * 0xfbd288d2aea1644f == 0xb095d55d8a6e22a3) & (%2 ^ (%4 ^ %4 >>u 32 >>u (%4 >>u 60)) * 0xe5014cce21694c23 == 0xc346f6ac3dd914d8) & (%2 ^ (%5 ^ %5 >>u 32 >>u (%5 >>u 60)) * 0xf3ef9404df334875 == 0x6247aa15f4fd146d));
+(%6 * 0x36411b ^ %6 * 0x3d0dcc ^ 0x3d0dcc) + 0x140005352

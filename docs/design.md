@@ -480,7 +480,13 @@ impl Context {
   (`assume(cx, e, facts)`) and 1-bit predicates assumed true or false (`assume_true`,
   `assume_false`), each numbered by a `ConstraintId` (its position). A constraint restricts values
   and never changes an operator's meaning, so every proof under constraints is valid wherever
-  they hold. Adding one propagates it, bounded at 4096 steps with 3 re-propagation rounds
+  they hold. `predicates(cx)` expresses every original seed exactly as a Boolean premise,
+  including signed/unsigned intervals, masks and strides. Native questions and SMT-LIB
+  queries preserve these premises in proofs and counterexample replay. Propagation records
+  the symbol-declaration revision: facts and simplification queries refresh original seeds
+  when declarations change, rather than retaining withdrawn global bits. `refresh(cx)`
+  also updates the set's propagation diagnostics while preserving constraint ids.
+  Adding one propagates it, bounded at 4096 steps with 3 re-propagation rounds
   (`is_truncated` reports a stop):
   *backwards* through a backward transfer per operator (`facts/backward.rs`: bitwise with known
   bits, add/sub/odd-multiply low bits and constant offsets, constant shifts and rotations,
@@ -779,8 +785,8 @@ Vetoed, Rejected}` carry `by` as well, and `Stats` reports `pass_work` and per-p
 | Cache | Owner | Stores | Depends on | Invalidated by |
 |-|-|-|-|-|
 | interner, node columns | Context generation | structure (immutable) | nothing | `clear()` |
-| fact cache (base) | Context | completed transfers only | provider revision | `clear()`, provider revision |
-| fact overlay | Context | facts under assumptions | assumptions revision | new assumptions, `clear()` |
+| fact cache (base) | Context | completed transfers only | provider revision, symbol declarations | `clear()`, provider revision, `declare_known` |
+| fact overlay | Context | facts under assumptions | assumptions and declaration revisions | new assumptions, changed declarations, `clear()` |
 | rewrite memo (per phase) | Context | final results only | memo epoch (§6.6) | epoch change, `clear()` |
 | analysis products | Context | exact values; bounded sizes as `AtLeast` | node only | `clear()` |
 | eqsat memo | Context | completed candidates, stable declines | eqsat epoch | epoch change, `clear()` |
@@ -1754,6 +1760,108 @@ casts, compares), each with new admission tests.
     nodes, search on productive **and unproductive** workloads, solver round trips. Every benchmark
     reports declined and unsuccessful work alongside successes. Performance claims are paired
     before/after measurements from the same build.
+11. **Native prover.** `prove::tests::sat_families` checks cardinality, parity, graph coloring,
+    long watched clauses, normalization, renamed variables, and incremental clause/model blocking
+    against truth tables or mathematical verdicts; UNSAT certificates go through the independent
+    DRUP checker, including negative tests of proof steps and deleted reasons.
+    Zero budgets preserve fresh and paused searches; one-, two- and seven-literal propagation
+    allowances interrupt chains through 4096 implications while preserving the uninterrupted
+    model, proof log and final counters. Preparation propagation is reported before search.
+    `prove::tests::bitvectors` compares circuits directly with `bitwright-ref`: every integer
+    operator and comparison exhaustively at widths 1–4, boundary operands through 129 bits,
+    mixed-width DAGs through 512 bits, and a nightly suite for every operator at 255–512 bits.
+    Constant products are exhaustive through six bits, cover dense signed-digit constants
+    and terminal carry through 1024-bit intermediate widths, and retain fixed upper bits and
+    zero-extended domains. `prove::tests::cuts` checks shared and distinct predicates, real
+    counterexample fallback and bounded descent through deep DAGs. Raw dispatch fixtures
+    prove with a one-node circuit limit and independently checked certificates.
+    Masked source projections and single-bit extracts preserve pure wiring, overlap and
+    complements without expanding unavailable wide words. Independent small truth tables,
+    sparse masks through 512 bits, changed declarations, explicit caps and spurious opaque
+    tuples check the conservative domain guarantee. False cuts require replayed original
+    models; abstract bit assignments are never reported as guest witnesses.
+    Constant products also cover affine modular factors with both source-correction
+    signs. Bit-parallel signed-digit cost masks are checked against serial carries on
+    complete 16-bit coefficients and generated 64-bit values. Full and fixed-upper
+    coefficient identities have zero-search certificates, while omitted corrections
+    retain original-symbol counterexamples.
+    Majority CNF recognition checks all input/output polarities, observed inner gates and
+    near misses against truth tables and independently checked proofs.
+    `prove::tests::relations` checks root-conditioned signed bit equalities, including
+    inconsistent cycles, long components, and target-one coverage that must not force every
+    OR operand. Derived lemmas are checked as proof prefixes against satisfiable premises;
+    contradictory systems also have complete independently checked certificates. XOR
+    normalization covers complemented/shared nonlinear leaves and bounded fallback on deep
+    parity cones. Selector preferences retain all count values and exact resumed search.
+    Bounded shared-input cancellation rebuilds just the input's XOR path and retains opaque
+    arithmetic branches. Its tests check both sides of the depth bound, separately observed
+    branches, zero-conflict paired-product certificates through 129 bits, declared model bits
+    and exact resumed counterexamples. Correlated shift counts are differentially checked
+    against the reference through 1,024 bits, including repeated/complemented count literals
+    and unsigned/arithmetic overshifts; the self-selected shift's high zeros fold structurally.
+    `prove::tests::peepholes` checks factoring a common XOR operand out of positive OR
+    targets, including polarities, shared outputs, unrelated near misses, mixed-target models,
+    retained zero-target aliases and complete native certificates. Fact soundness checks
+    nonwrapping offsets in self-shift counts, wrapping near misses and wide range bounds.
+    `prove::tests::parity_encoding` checks opt-in three-input parity gates over every polarity,
+    including repeated operands, observed intermediate/product gates, fixed root aliases,
+    independently checked wrong-output certificates and exact resumed original-symbol models
+    through 129 bits. The long mixer suite also profiles all sixteen first-selector cases per
+    hard query; it checks range coverage and any conditional certificate without narrowing
+    symbol declarations or presenting unresolved cases as a complete proof.
+    `prove::tests::carry_save` covers opt-in modular product column compression: exhaustive
+    small constant and variable products, independent reference results through 1,024 bits,
+    negative-row corrections, fixed/correlated literals, declared-bit model replay, checked
+    certificates and exact one-propagation resumption with both parity encodings.
+    `prove::tests::sampling` exercises opt-in small-integer assignments across wide domains,
+    fixed declared bits, multiple symbols and assumptions. Sample exhaustion leaves SAT search
+    open; the full-width guard integration fixture finds and replays its small witness.
+    Early machine-word sampling adds exhaustive integer operator checks against the independent
+    reference, mixed-width generated DAGs against the generic evaluator, bounded deep-DAG
+    fallback, original declared-symbol restoration, sampling-order parity with the circuit
+    sampler, and checked certificates after samples exhaust. Thirty-six cross-key guard
+    variants recover original-width witnesses with zero circuit nodes.
+    Reconstructed-word sampling checks complete input cubes with overlapping concatenations
+    and fixed bits, generated programs after coordinate reordering, repeated-byte near misses
+    with checked certificates, wide fallback and original eight-byte cross-key models that
+    ordinary traversal-order prefixes miss. Independent and diagonal streams recover later
+    words under one shared allowance, reject witnesses excluded by assumptions, and keep
+    native certificates after exhaustion. A captured two-word dispatch replays all sixteen
+    original byte bindings. Sampling never replaces shared bytes with independent word symbols.
+    Complete ordered word enumeration can prove when the joint stream covers every legal
+    input assignment. Independent generated truth tables check proofs and counterexamples;
+    sparse high declared bits, constrained domains, zero divisors and requested DRUP
+    certificates cover the proof path. Partial prefixes, individual-word and diagonal
+    exhaustion remain inconclusive. Mixer integration checks online proofs with 8, 12
+    and 16 free input bits without finite-fact preparation or circuit construction.
+    `prove::finite` checks complete finite-domain facts before they can be supplied explicitly
+    to a query. Its tests cover verification limits, exact candidate coverage, even keys,
+    source identity and range checks, shift semantics, mask strengthening, residual symbols,
+    original assumptions and model restoration. Certificate requests retain the original
+    bit-blast path. A long integration verifies both 32-bit domains and settles bounded
+    fingerprint/uniqueness/loaded-word questions while leaving unrestricted sources open.
+    A shared-mixer capture also checks reconstructed comparison operands numerically at
+    full-width boundary inputs. Its incorrect-anchor control differs at the pair level even
+    when both Boolean guards evaluate false; both shift spellings preserve the original
+    eight-byte source. Diagnostic guard profiles audit each key pair and source bound before
+    measuring forward or inverse coordinates.
+    Correction regressions check the selected XOR's signed difference bound and decoded
+    high-bit preservation. A zero-error relaxation point differs from the actual mixer
+    image; both shift spellings require original-model replay and checked original point
+    certificates. Necessary-condition models are not admitted as original witnesses.
+    `prove::sat::restart_tests` checks that discarded implications participate in restart
+    priorities, retained levels and root assignments stay valid, and a completed model
+    does not rebuild its trail. Output-prefix regressions require original-domain model
+    replay and reject promotion of a partial fingerprint match into a full counterexample.
+    `prove::tests::problems` forces SAT without word-level simplification or circuit sampling
+    for arithmetic identities and near misses, overflow, overshifts, path conditions, aliased
+    stores, and IEEE NaN classification. Model enumeration also exercises simplification and
+    sampling with declared bits. Under `smtlib`, fixed SAT/UNSAT scripts exercise QF_BV, Boolean,
+    array read-over-write and floating-point input, and unsupported theories are refused.
+
+Run these suites with `cargo test -p bitwright --all-features --lib prove::tests::`.
+Run the additional large-width circuit suite with
+`cargo test -p bitwright --release --all-features --lib prove::tests::bitvectors:: -- --ignored`.
 
 CI: stable and MSRV `check`; feature matrix; clippy `-D warnings`; rustfmt; docs; `cargo publish
 --dry-run`; the gate; fuzz smoke; `cargo deny` (MIT, Apache-2.0, BSD-style, Unicode licenses only).
