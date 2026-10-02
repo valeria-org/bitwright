@@ -195,7 +195,8 @@ fn truth(t: Truth) -> Option<bool> {
     name = "FpFormat",
     module = "bitwright"
 )]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Not `Copy`: PyO3's `from_py_object` clones the value, which clippy flags on a `Copy` type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PyFpFormat {
     f: FpFormat,
 }
