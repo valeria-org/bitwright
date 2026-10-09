@@ -1,6 +1,6 @@
 //! SMT-LIB 2.6 import of a QF_BV subset, and of floating-point (QF_BVFP) terms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::expr::{Context, Expr};
@@ -68,15 +68,15 @@ impl Import {
 /// fresh keys, so an [`export`](super::export)ed script reads back to the same symbols.
 pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
     // A syntax error anywhere fails the import before any command runs.
-    check(script)?;
+    let reserved_read_prefixes = check(script)?;
     let mut st = State {
         cx,
         globals: HashMap::new(),
         scope: Vec::new(),
+        reserved_read_prefixes,
         out: Import::default(),
     };
-    // Then one top-level form at a time: memory is bounded by the largest command, not by the
-    // script.
+    // Then one top-level form at a time: syntax buffers are bounded by the largest command.
     let mut sx = Sx::default();
     let mut pos = 0;
     while let Some(top) = sx.read(script, &mut pos)? {
@@ -185,11 +185,12 @@ fn lex<'s>(src: &'s str, i: &mut usize) -> Result<Option<(Lex<'s>, usize, usize)
 }
 
 /// Checks the syntax of the whole script (balance, depth, quoted symbols and strings) without
-/// building anything.
-fn check(src: &str) -> Result<(), Error> {
+/// building anything, reserving prefixes of numbered symbols for array reads.
+fn check(src: &str) -> Result<HashSet<&str>, Error> {
     // The start of every open list.
     let mut open: Vec<usize> = Vec::new();
     let mut i = 0;
+    let mut reserved_read_prefixes = HashSet::new();
     while let Some((lexeme, start, end)) = lex(src, &mut i)? {
         match lexeme {
             Lex::Open => {
@@ -203,12 +204,20 @@ fn check(src: &str) -> Result<(), Error> {
                     return Err(syntax("unbalanced ')'", start, end));
                 }
             }
+            Lex::Atom(Tok::Sym(name)) => {
+                if let Some((prefix, index)) = name.rsplit_once('.')
+                    && !index.is_empty()
+                    && index.bytes().all(|b| b.is_ascii_digit())
+                {
+                    reserved_read_prefixes.insert(prefix);
+                }
+            }
             Lex::Atom(_) => {}
         }
     }
     match open.last() {
         Some(&start) => Err(syntax("unbalanced '('", start, src.len())),
-        None => Ok(()),
+        None => Ok(reserved_read_prefixes),
     }
 }
 
@@ -394,6 +403,8 @@ struct State<'a, 's> {
     globals: HashMap<&'s str, (Val, bool)>,
     /// `let` bindings, innermost last.
     scope: Vec<(&'s str, Val)>,
+    /// Prefixes of numbered script symbols, including declarations after an array's first read.
+    reserved_read_prefixes: HashSet<&'s str>,
     out: Import,
 }
 
@@ -463,7 +474,15 @@ impl<'s> State<'_, 's> {
         let name = sx.name(name_id)?;
         let sort = sx.sort(sort_id)?;
         if let Sort::Array(i, e) = sort {
-            let m = crate::memory::Memory::new(name, i, e, crate::memory::Endian::Little);
+            // Read symbols must not capture any script name, even one declared later.
+            // Keep the usual readable prefix unless its numbered reads could collide.
+            let mut read_name = name.to_string();
+            let mut suffix = 0;
+            while self.reserved_read_prefixes.contains(read_name.as_str()) {
+                read_name = format!("{name}.reads{suffix}");
+                suffix += 1;
+            }
+            let m = crate::memory::Memory::new(&read_name, i, e, crate::memory::Endian::Little);
             let v = Val::Array(self.out.arrays.len() as u32, m.initial());
             self.out.arrays.push((name.to_string(), m));
             return self.bind_global(sx, name_id, name, v);

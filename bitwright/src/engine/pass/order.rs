@@ -65,6 +65,9 @@ enum Item {
 
 /// The formula below a node, compiled.
 struct Model {
+    /// Visits left, consumed before descent and never refunded by backtracking. This also
+    /// bounds recursive stack depth, including nodes whose children have not finished.
+    remaining: usize,
     items: Vec<Item>,
     index: IdMap<u32, usize>,
     atoms: Vec<u32>,
@@ -93,6 +96,11 @@ struct Mark {
 }
 
 impl Model {
+    fn visit(&mut self) -> Option<()> {
+        self.remaining = self.remaining.checked_sub(1)?;
+        Some(())
+    }
+
     fn push(&mut self, n: u32, it: Item, term: bool) -> usize {
         self.items.push(it);
         self.term.push(term);
@@ -133,9 +141,7 @@ impl Model {
         if let Some(&i) = self.index.get(&n) {
             return (!self.term[i]).then_some(i);
         }
-        if self.items.len() >= MAX_ITEMS {
-            return None;
-        }
+        self.visit()?;
         let node = cx.node(n);
         let it = match node.op {
             OpCode::Const => Item::Const(cx.const_val(n).is_some_and(|v| !v.is_zero())),
@@ -198,9 +204,7 @@ impl Model {
         if let Some(&i) = self.index.get(&n) {
             return self.term[i].then_some(i);
         }
-        if self.items.len() >= MAX_ITEMS {
-            return None;
-        }
+        self.visit()?;
         let node = cx.node(n);
         if node.op == OpCode::Select {
             let mark = self.mark();
@@ -427,6 +431,7 @@ pub(super) fn decide(
 ) -> Result<Option<(u32, Vec<u32>, Fin)>, Stop> {
     let node = cx.node(n);
     let mut m = Model {
+        remaining: MAX_ITEMS,
         items: Vec::new(),
         index: IdMap::default(),
         atoms: Vec::new(),

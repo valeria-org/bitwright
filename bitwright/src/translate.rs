@@ -389,7 +389,7 @@ pub struct Template {
     params: Vec<String>,
     /// Compiled forms by operand widths: a context holding the expression over the
     /// parameters' symbols.
-    compiled: Mutex<Vec<(Vec<Width>, Compiled)>>,
+    compiled: Mutex<Vec<(Vec<Width>, std::sync::Arc<Compiled>)>>,
 }
 
 struct Compiled {
@@ -458,11 +458,13 @@ impl Template {
             Some(k) => k,
             None => {
                 let c = self.compile(widths)?;
-                compiled.push((widths.to_vec(), c));
+                compiled.push((widths.to_vec(), std::sync::Arc::new(c)));
                 compiled.len() - 1
             }
         };
-        f(&compiled[k].1)
+        let c = std::sync::Arc::clone(&compiled[k].1);
+        drop(compiled);
+        f(&c)
     }
 
     fn compile(&self, widths: &[Width]) -> Result<Compiled, Error> {
@@ -723,5 +725,48 @@ mod tests {
         assert!(pick.check(&[Width::W1, Width::W8, Width::W8]).is_ok());
         fn shared<T: Send + Sync>() {}
         shared::<Template>();
+    }
+
+    #[test]
+    fn template_callbacks_run_without_the_cache_lock() {
+        let template = Template::new("a + 1", &["a"]).unwrap();
+        for _ in 0..2 {
+            template
+                .with_compiled(&[Width::W64], |_| {
+                    assert!(template.compiled.try_lock().is_ok());
+                    // Re-entering the same cache also succeeds, on both cold and warm calls.
+                    template.check(&[Width::W64])
+                })
+                .unwrap();
+        }
+        assert_eq!(template.compiled.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn shared_templates_instantiate_concurrently_at_multiple_widths() {
+        let template = Template::new("a + b", &["a", "b"]).unwrap();
+        std::thread::scope(|scope| {
+            for bits in [8, 64, 128, 512, 8, 64, 128, 512] {
+                let template = &template;
+                scope.spawn(move || {
+                    let w = Width::new(bits).unwrap();
+                    let mut cx = Context::new();
+                    let a = cx.symbol("x", w).unwrap();
+                    let b = cx.symbol("y", w).unwrap();
+                    for k in 0..32 {
+                        let e = template.instantiate(&mut cx, &[a, b]).unwrap();
+                        let env = [
+                            (crate::SymbolKey::from("x"), BitVec::from_u64(w, k).unwrap()),
+                            (crate::SymbolKey::from("y"), BitVec::one(w)),
+                        ];
+                        assert_eq!(
+                            cx.eval(&[e], env.as_slice()).unwrap()[0].to_u64(),
+                            Some(k + 1)
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(template.compiled.lock().unwrap().len(), 4);
     }
 }

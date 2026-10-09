@@ -434,6 +434,37 @@ fn congruence_and_extraction_ties() {
 }
 
 #[test]
+fn extraction_propagates_costs_without_changing_selected_nodes() {
+    let mut meter = Meter::new(Budget::UNLIMITED, None);
+    let mut eg = EGraph::new();
+    let add = |eg: &mut EGraph, op, kid, meter: &mut Meter<'_>| {
+        eg.add(ENode { op, kids: [kid, 0] }, true, meter)
+            .ok()
+            .unwrap()
+    };
+    let x = add(&mut eg, EOp::Leaf(0), 0, &mut meter);
+    let mut expensive = x;
+    for _ in 0..4 {
+        expensive = add(&mut eg, EOp::Un(UnOp::Neg), expensive, &mut meter);
+    }
+    let parent = add(&mut eg, EOp::Un(UnOp::Not), expensive, &mut meter);
+    let root_index = eg.nodes.len() as u32;
+    let root = add(&mut eg, EOp::Un(UnOp::Neg), parent, &mut meter);
+    // This cheaper representative is visited after the original parents in each scan.
+    let late = add(&mut eg, EOp::Leaf(1), 0, &mut meter);
+    let mut alternative = x;
+    for op in [UnOp::Not, UnOp::Neg, UnOp::Not] {
+        alternative = add(&mut eg, EOp::Un(op), alternative, &mut meter);
+    }
+    eg.union(expensive, late, &mut meter).ok().unwrap();
+    eg.union(root, alternative, &mut meter).ok().unwrap();
+    eg.rebuild(&mut meter).ok().unwrap();
+    let best = extract::costs(&mut eg, &mut meter).ok().unwrap();
+    assert_eq!(best[&eg.find(parent)].0, 2);
+    assert_eq!(best[&eg.find(root)], (3, root_index));
+}
+
+#[test]
 fn an_iteration_cap_withholds_and_is_not_memoized() {
     // `&` over `|` and `|` over `&` rewrite each other's results without end.
     let (s, _) = Saturator::builtin_groups(

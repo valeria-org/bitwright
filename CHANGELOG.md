@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.15.0
+
+- **Repeated evaluation:** `Context::eval` caches the most recent nonempty root set,
+  maps the reachable graph to registers, and reuses storage. Supported integer operations
+  through 128 bits use native registers independently of wide, floating-point, extension,
+  and unsupported multiply-high operations in the same batch. Values are materialized
+  only at fallback boundaries; symbol bindings and widths are checked on every call.
+  Measured mixed batches are about 4.1 times faster than whole-graph fallback. Earlier
+  comparisons against rebuilding the schedule on every call show about 4.8–6.2 times
+  faster narrow evaluation. See `docs/benchmarking.md` for workloads and limits.
+- **Shared templates:** immutable compiled forms use `Arc`, and imports release the cache
+  mutex before callbacks. Warm imports can proceed concurrently into independent contexts;
+  the eight-worker benchmark improved about 4.7 times, with one-worker cost within noise.
+- **Memory correctness:** reused unknown reads retain pending alias conditions, generated
+  symbols skip occupied names, and changes to initial contents invalidate cached loads.
+  Address normalization handles deep additive chains iteratively.
+- **SMT array names:** imports reserve numbered symbol prefixes across the entire script,
+  including declarations after an array's first read, preventing generated reads from
+  capturing caller symbols.
+- **Bounded parsing and comparison analysis:** deeply nested transformation constant
+  expressions return syntax errors, and comparison-order modeling consumes a cumulative
+  visit budget before descent. Both avoid reproduced stack overflows.
+- **Benchmarking:** added cold, sparse, mixed, and cheap evaluation workloads, shared-template
+  worker workloads, and `--metric wall` comparisons using saved elapsed time.
+
+### Behavior changes
+
+- EqSat extraction propagates reduced child costs even when the chosen child node is
+  unchanged. This can produce different, cheaper equivalent expressions.
+- Comparison-order analysis stops after its cumulative visit allowance is exhausted,
+  including failed speculative branches. Deep or expensive patterns may remain unsimplified.
+- Memory versions are specific to their memory and store history. Foreign versions and
+  versions created on diverged clone branches return errors; clones still accept their
+  shared history. Oversized loads return an invalid-width error before constructing cells.
+- Generated memory and SMT array read names can change when caller symbols occupy the
+  usual names. Existing load expressions retain their old contents when initial memory is
+  changed, while subsequent loads use the new contents.
+- Excessively nested transformation expressions now fail with a syntax error instead of
+  overflowing the process stack.
+
 ## 0.14.0
 
 - **Certified exhaustive decisions:** `Config::exhaustive_inputs` (default 0, off) decides

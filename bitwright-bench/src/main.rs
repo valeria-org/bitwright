@@ -11,7 +11,7 @@
 //!   --save FILE       write the results as CSV
 //!   --compare FILE    compare with results saved earlier
 //!   --threshold PCT   smallest change reported as one (default 1 for instructions, 5 for CPU time)
-//!   --metric M        compare `instructions` (default when available) or `cpu`
+//!   --metric M        compare `instructions` (default when available), `cpu`, or `wall`
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
 //!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
@@ -71,6 +71,7 @@ struct Options {
 enum Metric {
     Instructions,
     Cpu,
+    Wall,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -125,6 +126,7 @@ fn parse_args() -> Result<Options, String> {
                 o.metric = Some(match value("--metric")?.as_str() {
                     "instructions" => Metric::Instructions,
                     "cpu" => Metric::Cpu,
+                    "wall" => Metric::Wall,
                     m => return Err(format!("unknown metric `{m}`")),
                 })
             }
@@ -334,7 +336,7 @@ fn main() -> ExitCode {
         Metric::Cpu
     });
     if let Some(why) = &counters.unavailable {
-        eprintln!("note: instructions are not counted ({why}); comparing CPU time");
+        eprintln!("note: instructions are not counted ({why})");
         if metric == Metric::Instructions {
             eprintln!("error: --metric instructions needs hardware counters");
             return ExitCode::from(2);
@@ -342,7 +344,7 @@ fn main() -> ExitCode {
     }
     let threshold = opts.threshold.unwrap_or(match metric {
         Metric::Instructions => 1.0,
-        Metric::Cpu => 5.0,
+        Metric::Cpu | Metric::Wall => 5.0,
     }) / 100.0;
 
     println!(
@@ -432,6 +434,7 @@ fn compare(new: &Summary, old: &Saved, metric: Metric, threshold: f64) -> (Strin
             _ => return ("(no instruction counts)".into(), false),
         },
         Metric::Cpu => (new.cpu_ns.0, old.cpu_ns_min, 0.0),
+        Metric::Wall => (new.wall_ns, old.wall_ns_median, 0.0),
     };
     if then <= 0.0 {
         return ("(no baseline)".into(), false);
@@ -446,4 +449,27 @@ fn compare(new: &Summary, old: &Saved, metric: Metric, threshold: f64) -> (Strin
         format!("{:+.2}% SLOWER", delta * 100.0)
     };
     (verdict, significant && delta > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wall_comparisons_use_saved_elapsed_time_instead_of_thread_cpu() {
+        let saved = bench::parse_saved("parallel,batch,1,7,,,,10,12,100\n").unwrap();
+        let new = Summary {
+            name: "parallel".into(),
+            unit: "batch".into(),
+            iters: 1,
+            samples: 7,
+            instructions: None,
+            cpu_ns: (20.0, 20.0),
+            wall_ns: 50.0,
+        };
+        let (wall, regressed) = compare(&new, &saved[0].1, Metric::Wall, 0.05);
+        assert!(wall.contains("faster"));
+        assert!(!regressed);
+        assert!(compare(&new, &saved[0].1, Metric::Cpu, 0.05).1);
+    }
 }

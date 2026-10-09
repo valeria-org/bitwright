@@ -69,6 +69,7 @@ impl Pending {
             syms: core::mem::take(&mut self.syms),
             alive: true,
             blocks: HashMap::new(),
+            expression_depth: 0,
         }
     }
 

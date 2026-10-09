@@ -43,7 +43,9 @@ pub(crate) fn costs(
                                 > (eg.imported[bi as usize], std::cmp::Reverse(bi)))
                 }
             };
-            if better && best.get(&c).map(|b| b.1) != Some(idx) {
+            // A cheaper child lowers this node's cost even when the selected node is
+            // unchanged. Propagate that improvement to its parents on the next pass.
+            if better {
                 best.insert(c, (cost, idx));
                 changed = true;
             }

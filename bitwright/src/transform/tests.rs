@@ -3,6 +3,31 @@
 
 use super::*;
 
+#[test]
+fn deeply_nested_constant_expressions_return_syntax_errors() {
+    for expr in [
+        format!("{}C", "~".repeat(10_000)),
+        format!("{}C{}", "(".repeat(10_000), ")".repeat(10_000)),
+        format!("{}C{}", "abs(".repeat(10_000), ")".repeat(10_000)),
+    ] {
+        let source = format!("Pre: {expr} == C\n%r = add i8 %x, C\n=>\n%r = add i8 %x, C");
+        let err = parse_transforms(&source).unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("nested too deeply"), "{err}");
+    }
+    let normal = format!(
+        "Pre: {}C{} == C\n%r = add i8 %x, C\n=>\n%r = add i8 %x, C",
+        "(".repeat(32),
+        ")".repeat(32)
+    );
+    assert!(parse_transforms(&normal).is_ok());
+    let flat = std::iter::repeat_n("C", 10_000)
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let source = format!("Pre: {flat} == C\n%r = add i8 %x, C\n=>\n%r = add i8 %x, C");
+    assert!(parse_transforms(&source).is_ok());
+}
+
 fn one(text: &str) -> Report {
     let ts = parse_transforms(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     assert_eq!(ts.len(), 1, "{text}");

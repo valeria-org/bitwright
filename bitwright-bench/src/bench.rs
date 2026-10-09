@@ -238,6 +238,7 @@ pub fn csv_line(s: &Summary) -> String {
 pub struct Saved {
     pub instructions: Option<(f64, f64)>,
     pub cpu_ns_min: f64,
+    pub wall_ns_median: f64,
 }
 
 /// Parses a file written with `--save`.
@@ -266,6 +267,7 @@ pub fn parse_saved(text: &str) -> Result<Vec<(String, Saved)>, String> {
             Saved {
                 instructions,
                 cpu_ns_min: num(f[7])?,
+                wall_ns_median: num(f[9])?,
             },
         ));
     }

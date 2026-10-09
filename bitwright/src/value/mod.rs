@@ -5,7 +5,7 @@
 //! Every operation dispatches once on the width: `W <= 128` runs on a native `u128`, wider
 //! values on `u64` limbs. Both paths are tested against an independent bit-serial reference.
 
-mod narrow;
+pub(crate) mod narrow;
 pub(crate) mod wide;
 
 #[cfg(test)]

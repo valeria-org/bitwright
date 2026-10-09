@@ -942,6 +942,22 @@ fn order_is_sound_and_idempotent() {
 }
 
 #[test]
+fn compares_handles_deep_boolean_chains() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut cx = Context::new();
+    let mut root = cx.symbol("p", Width::W1).unwrap();
+    for k in 0..10_000 {
+        let leaf = cx.symbol(format!("q{k}"), Width::W1).unwrap();
+        let op = if k % 2 == 0 { BinOp::And } else { BinOp::Or };
+        root = cx.bin(op, root, leaf).unwrap();
+    }
+    assert_eq!(cx.height(root).unwrap(), 10_000);
+    // This formula has too many Boolean leaves for the order model. Declining it must be
+    // bounded even when its entire left spine is visited before the first leaf is completed.
+    assert_eq!(eng.simplify(&mut cx, root).unwrap().expr, root);
+}
+
+#[test]
 fn order_fixtures() {
     let eng = engine(vec![Phase::Compares]);
     let same = |src: &str, want: &str| {

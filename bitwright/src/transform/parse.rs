@@ -62,6 +62,7 @@ pub(crate) struct Ctx<'a> {
     pub(crate) alive: bool,
     /// Block labels (the function syntax).
     pub(crate) blocks: HashMap<String, usize>,
+    pub(crate) expression_depth: usize,
 }
 
 impl Ctx<'_> {
@@ -172,6 +173,24 @@ impl Ctx<'_> {
     /// A constant expression or precondition, by precedence climbing (`min` is the lowest
     /// level allowed: 0 for anything).
     pub(crate) fn cexpr(&mut self, c: &mut Cursor<'_>, min: u8) -> Result<NodeId, SyntaxError> {
+        self.nested(c, |cx, c| cx.cexpr_inner(c, min))
+    }
+
+    fn nested(
+        &mut self,
+        c: &mut Cursor<'_>,
+        f: impl FnOnce(&mut Self, &mut Cursor<'_>) -> Result<NodeId, SyntaxError>,
+    ) -> Result<NodeId, SyntaxError> {
+        if self.expression_depth >= 128 {
+            return c.err("constant expression nested too deeply");
+        }
+        self.expression_depth += 1;
+        let result = f(self, c);
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn cexpr_inner(&mut self, c: &mut Cursor<'_>, min: u8) -> Result<NodeId, SyntaxError> {
         let mut lhs = self.unary(c)?;
         loop {
             let Some(Tok::P(p)) = c.peek() else {
@@ -228,6 +247,10 @@ impl Ctx<'_> {
     }
 
     fn unary(&mut self, c: &mut Cursor<'_>) -> Result<NodeId, SyntaxError> {
+        self.nested(c, |cx, c| cx.unary_inner(c))
+    }
+
+    fn unary_inner(&mut self, c: &mut Cursor<'_>) -> Result<NodeId, SyntaxError> {
         match c.peek() {
             Some(Tok::P("-")) => {
                 // A negative number is a literal.

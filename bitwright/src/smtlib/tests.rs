@@ -1333,6 +1333,46 @@ fn bitwuzla_proves_rewrites_under_the_constraints_they_rely_on() {
 }
 
 #[test]
+fn array_reads_do_not_capture_script_names() {
+    for (before, after) in [
+        ("(declare-const m.0 (_ BitVec 8))", ""),
+        ("", "(declare-const m.0 (_ BitVec 8))"),
+        (
+            "(declare-const |m.0| (_ BitVec 8)) (declare-const m.reads0.0 (_ BitVec 32))",
+            "",
+        ),
+    ] {
+        let script = format!(
+            "(declare-const m (Array (_ BitVec 8) (_ BitVec 8)))
+             {before}
+             (define-fun first () (_ BitVec 8) (select m #x00))
+             {after}
+             (assert (distinct first m.0))"
+        );
+        let mut cx = Context::new();
+        let imported = import(&mut cx, &script).unwrap();
+        let read = imported.definition("first").unwrap();
+        let user = cx.find_symbol(&SymbolKey::from("m.0")).unwrap();
+        assert_ne!(read, user);
+        let read_key = cx
+            .symbol_key(cx.symbol_id(read).unwrap().unwrap())
+            .unwrap()
+            .clone();
+        let env = [
+            (read_key, BitVec::wrapping_from_u64(Width::W8, 42)),
+            (
+                SymbolKey::from("m.0"),
+                BitVec::wrapping_from_u64(Width::W8, 99),
+            ),
+        ];
+        assert_eq!(
+            cx.eval(&imported.assertions, &env[..]).unwrap(),
+            [BitVec::from_bool(true)]
+        );
+    }
+}
+
+#[test]
 fn arrays_import_as_memory() {
     let script = "
 (set-logic QF_ABV)

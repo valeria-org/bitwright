@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bitwright::engine::{Engine, Phase, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
-use bitwright::fp::{FpFormat, RoundingMode};
+use bitwright::fp::{FpFormat, FpOp, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
 use bitwright::{
     Assumptions, BinOp, BitVec, CmpOpExt, Context, Expr, ParseOptions, Query, SymbolKey, Width,
@@ -22,6 +22,7 @@ pub fn all() -> Vec<Bench> {
     floats(&mut v);
     float_exprs(&mut v);
     exprs(&mut v);
+    templates(&mut v);
     facts(&mut v);
     constraints(&mut v);
     simplify(&mut v);
@@ -208,6 +209,106 @@ fn exprs(v: &mut Vec<Bench>) {
             },
         ));
     }
+    for bits in [64, 128, 512] {
+        v.push(Bench::new(
+            format!("expr/eval-cheap/{bits}"),
+            1000,
+            "1000 nodes",
+            move |b| {
+                let mut cx = Context::new();
+                let root = workload::dag(
+                    &mut cx,
+                    7,
+                    Dag {
+                        heavy_ops: false,
+                        ..dag_shape(bits, 1000)
+                    },
+                );
+                let env: Vec<_> = (0..6)
+                    .map(|i| {
+                        (
+                            SymbolKey::U64(i),
+                            BitVec::from_u64(workload::width(bits), i + 1).unwrap(),
+                        )
+                    })
+                    .collect();
+                b.iter(|| cx.eval(&[root], env.as_slice()).expect("eval"));
+            },
+        ));
+    }
+    // One unsupported root must not send the shared narrow chain through BitVec arithmetic.
+    for case in ["chain", "mixed-wide", "mixed-fp", "mixed-mulhi"] {
+        v.push(Bench::new(
+            format!("expr/eval-{case}/64"),
+            1000,
+            "1000 adds + roots",
+            move |b| {
+                let mut cx = Context::new();
+                let x = cx.symbol("x", Width::W64).unwrap();
+                let one = cx.one(Width::W64).unwrap();
+                let mut root = x;
+                for _ in 0..1000 {
+                    root = cx.add(root, one).unwrap();
+                }
+                let mut roots = vec![root];
+                match case {
+                    "mixed-wide" => roots.push(cx.zero(Width::W512).unwrap()),
+                    "mixed-fp" => {
+                        let one = cx.constant(&BitVec::from_f64(1.0)).unwrap();
+                        roots.push(
+                            cx.fp(FpOp::Add(RoundingMode::Rne), FpFormat::F64, &[root, one])
+                                .unwrap(),
+                        );
+                    }
+                    "mixed-mulhi" => {
+                        let x = cx.zext(x, Width::W128).unwrap();
+                        let root = cx.zext(root, Width::W128).unwrap();
+                        roots.push(cx.bin(BinOp::UMulHi, x, root).unwrap());
+                    }
+                    _ => {}
+                }
+                let env = [(SymbolKey::from("x"), BitVec::one(Width::W64))];
+                b.iter(|| cx.eval(&roots, env.as_slice()).expect("eval"));
+            },
+        ));
+    }
+    v.push(Bench::new("expr/eval-cold/64", 100, "1000 nodes", |b| {
+        let env: Vec<_> = (0..6)
+            .map(|i| {
+                (
+                    SymbolKey::U64(i),
+                    BitVec::from_u64(Width::W64, i + 1).unwrap(),
+                )
+            })
+            .collect();
+        b.iter_batched(
+            || {
+                let mut cx = Context::new();
+                let root = workload::dag(&mut cx, 7, dag_shape(64, 1000));
+                (cx, root)
+            },
+            |(mut cx, root)| cx.eval(&[root], env.as_slice()).expect("eval"),
+        );
+    }));
+    v.push(Bench::new(
+        "expr/eval-sparse/64",
+        20_000,
+        "3 nodes in a large arena",
+        |b| {
+            let mut cx = Context::new();
+            let x = cx.symbol("x", Width::W64).unwrap();
+            let y = cx.symbol("y", Width::W64).unwrap();
+            let root = cx.add(x, y).unwrap();
+            for i in 0..100_000 {
+                cx.symbol(SymbolKey::U64(i), Width::W64).unwrap();
+            }
+            let env = [
+                (SymbolKey::from("x"), BitVec::one(Width::W64)),
+                (SymbolKey::from("y"), BitVec::one(Width::W64)),
+            ];
+            b.iter(|| cx.eval(&[root], env.as_slice()).expect("eval"));
+        },
+    ));
     v.push(Bench::new("expr/context-new", 20_000, "context", |b| {
         b.iter(Context::new);
     }));
@@ -292,6 +393,42 @@ fn exprs(v: &mut Vec<Bench>) {
             n
         });
     }));
+}
+
+/// Warm shared-template throughput. Use wall time for these rows: the caller's thread CPU
+/// counter excludes the worker threads. Each worker imports into an independent context.
+fn templates(v: &mut Vec<Bench>) {
+    use bitwright::translate::Template;
+    for workers in [1, 2, 4, 8] {
+        v.push(Bench::new(
+            format!("translate/template-shared/{workers}"),
+            5,
+            "1024 imports per worker",
+            move |b| {
+                let mut text = "a".to_string();
+                for k in 1..=24 {
+                    text = format!("(({text}) + b) ^ (a << {k})");
+                }
+                let template = Template::new(&text, &["a", "b"]).unwrap();
+                template.check(&[Width::W64, Width::W64]).unwrap();
+                b.iter(|| {
+                    std::thread::scope(|scope| {
+                        for _ in 0..workers {
+                            let template = &template;
+                            scope.spawn(move || {
+                                let mut cx = Context::new();
+                                let a = cx.symbol("x", Width::W64).unwrap();
+                                let b = cx.symbol("y", Width::W64).unwrap();
+                                for _ in 0..1024 {
+                                    black_box(template.instantiate(&mut cx, &[a, b]).unwrap());
+                                }
+                            });
+                        }
+                    })
+                });
+            },
+        ));
+    }
 }
 
 /// Facts: cold (every node's facts computed once), warm (cached), proofs, and a fresh tiny

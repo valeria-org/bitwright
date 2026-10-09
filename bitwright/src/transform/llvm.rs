@@ -397,6 +397,7 @@ fn body(t: &mut Transform, f: &FnText, inputs: Option<&[NodeId]>) -> Result<Body
         syms: HashMap::new(),
         alive: false,
         blocks: block_of.clone(),
+        expression_depth: 0,
     };
     let mut b = 0usize;
     let mut terminated = false;

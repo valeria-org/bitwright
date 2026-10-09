@@ -305,6 +305,8 @@ pub struct Context {
     engine_refused: bool,
     pub(crate) marks: Marks,
     dag_cache: IdMap<u32, u32>,
+    /// The last evaluation's immutable schedule and reusable reachable-node registers.
+    eval_plan: Option<Box<eval::Plan>>,
     pub(crate) facts: crate::facts::FactCache,
     pub(crate) memo: crate::engine::Memo,
     #[cfg(feature = "eqsat")]
@@ -354,6 +356,7 @@ impl Context {
             engine_refused: false,
             marks: Marks::default(),
             dag_cache: IdMap::default(),
+            eval_plan: None,
             facts: crate::facts::FactCache::default(),
             memo: crate::engine::Memo::default(),
             #[cfg(feature = "eqsat")]
@@ -438,6 +441,9 @@ impl Context {
         self.symbols.clear();
         self.declaration_revision = 0;
         self.dag_cache.clear();
+        if let Some(plan) = &mut self.eval_plan {
+            plan.clear();
+        }
         self.facts.clear();
         self.memo.clear();
         #[cfg(feature = "eqsat")]

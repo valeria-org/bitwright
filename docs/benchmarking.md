@@ -47,6 +47,91 @@ For any change that alters data layout or memory traffic, look at CPU time as we
 
 If hardware counters are unavailable (another OS, a container, `perf_event_paranoid` above 2),
 the tool says so and falls back to CPU time.
+Where the thread CPU clock is also unavailable, including Windows, the CPU columns use elapsed
+time instead.
+
+The `expr/eval-cheap` rows exercise repeated evaluation of cheap integer operations at 64,
+128 and 512 bits. `expr/eval-cold` includes preparation of the evaluation schedule on its first
+call; `expr/eval-sparse` evaluates just three reachable nodes in a 100,000-symbol arena. These
+complement the existing mixed-arithmetic and floating-point evaluation rows.
+`expr/eval-chain/64` evaluates 1,000 successive additions. The three `expr/eval-mixed-*/64`
+rows add a 512-bit constant root, an FP addition consuming the chain, or a 128-bit multiply-high
+root. They measure the cost of combining native and fallback operations in one evaluation.
+
+`translate/template-shared/{1,2,4,8}` measures warm imports of one shared template into
+independent worker contexts, 1024 imports per worker. For these parallel rows, compare with
+`--metric wall` on a quiet machine: the caller's thread CPU counter excludes the workers.
+The work increases with the worker count, so compare throughput as `1024 * workers / seconds`,
+or compare the same worker count before and after a change. Thread creation is included and
+amortized across each worker's batch.
+
+## Evaluation and shared-template cache measurements
+
+Measured on 2026-10-09 on Windows with an Intel Core i5-9600KF (six cores), release builds,
+11 samples, using median elapsed time. The baseline rebuilt the evaluation traversal and value
+map on every call and held the template cache mutex throughout import. Both binaries included
+the same memory and comparison-pass fixes. Runs were consecutive, with no test or build jobs
+running. These are workload-specific timings, not end-to-end application speedups.
+
+| benchmark | before | after | before / after |
+|---|---:|---:|---:|
+| `expr/eval/64` | 52.03 µs | 8.48 µs | 6.14× |
+| `expr/eval-cheap/64` | 31.88 µs | 5.63 µs | 5.66× |
+| `expr/eval-cheap/128` | 42.67 µs | 8.96 µs | 4.76× |
+| `expr/eval/512` | 46.53 µs | 22.10 µs | 2.11× |
+| `fp/eval-dag/64` | 92.81 µs | 71.10 µs | 1.31× |
+| `expr/eval-cold/64` | 76.79 µs | 49.57 µs | 1.55× |
+| `expr/eval-sparse/64` | 321 ns | 152 ns | 2.11× |
+| `translate/template-shared/1` | 7.67 ms | 7.84 ms | 0.98× |
+| `translate/template-shared/2` | 17.55 ms | 8.10 ms | 2.17× |
+| `translate/template-shared/4` | 36.58 ms | 9.60 ms | 3.81× |
+| `translate/template-shared/8` | 73.01 ms | 15.62 ms | 4.67× |
+
+Evaluation caches the most recent nonempty root set, maps operands to compact registers, and
+reuses storage. Supported integer instructions with operands and results up to 128 bits use
+the existing native arithmetic kernels with `u128` registers. Wide, floating-point, extension,
+and unsupported multiply-high instructions use the `BitVec` evaluator. Symbol values and
+their widths are checked on every call. The plan is allocated lazily, invalidated by
+`Context::clear`, and keeps allocation capacity for reuse. Context creation showed no regression
+in the final comparison.
+
+The template cache stores immutable compiled forms behind `Arc`, releasing its mutex before
+import. One-worker timing is within noise; multiple workers can now import concurrently.
+The EqSat cost-propagation correction is primarily an extraction-quality fix: parents must
+observe cheaper descendants even when the selected descendant node stays the same. Smaller
+extracted trees, rather than a timing improvement, are its acceptance criterion.
+
+### Mixed evaluation measurements
+
+A subsequent comparison on the same Windows/i5-9600KF host measures per-instruction fallback
+against the cached evaluator's original whole-graph fallback. Both release binaries include
+the same correctness fixes. Each row has 11 samples of 1,000 evaluations, with both processes
+restricted to the same CPU core and no concurrent test or build jobs. Background scheduling
+made elapsed medians variable, so these figures use the minimum elapsed cost per evaluation.
+They are workload-specific measurements, not application speedup guarantees.
+
+| benchmark | before | after | before / after |
+|---|---:|---:|---:|
+| `expr/eval-mixed-wide/64` | 24.54 µs | 5.91 µs | 4.15× |
+| `expr/eval-mixed-fp/64` | 24.90 µs | 6.01 µs | 4.14× |
+| `expr/eval-mixed-mulhi/64` | 24.56 µs | 5.96 µs | 4.12× |
+| `expr/eval-chain/64` (native control) | 5.06 µs | 5.03 µs | 1.01× |
+| `expr/eval/512` (wide control) | 21.67 µs | 21.79 µs | 0.99× |
+
+The plan classifies each instruction independently, checking operand widths as well as result
+widths. A wide comparison or extraction uses `BitVec` even if its result is narrow; subsequent
+narrow arithmetic returns to native registers. Native values needed by fallback operations
+are materialized once per node, and fallback values needed by native operations are converted
+once. Other native results never require `BitVec` storage. The chain plus a wide constant needs
+one `BitVec` register instead of 1,003. Entirely native and entirely fallback plans retain
+separate loops and do not allocate mixed routing metadata.
+
+Regressions compare cold and warm plans with the existing interpreter for every integer
+opcode, widths around 128 bits, wide-to-narrow crossings, FP conversions and predicates, and
+multi-output extensions. They also check input errors, duplicate roots, changed environments,
+and root-set changes. FP-only control timings varied with background load; no FP speedup is
+claimed from this change. Mixed routing and boundary conversions have a cost: workloads
+dominated by fallback arithmetic may gain little or incur overhead.
 
 ## Comparing a change against its baseline
 
@@ -65,7 +150,8 @@ reports a change as `faster` or `SLOWER` only if the change exceeds both:
 - twice the larger spread of the two runs.
 
 Smaller changes are shown as a plain percentage. `--metric cpu` compares minimum CPU times
-instead. `--fail-on-regression` exits with status 1 if anything got slower, for scripted checks.
+instead, and `--metric wall` compares median elapsed times. `--fail-on-regression` exits with
+status 1 if anything got slower, for scripted checks.
 
 When reporting a result, give the paired numbers, what was measured, and the correctness side:
 the test suite passes on both commits.

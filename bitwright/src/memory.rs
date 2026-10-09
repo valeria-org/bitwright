@@ -31,6 +31,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{BinOp, BitVec, CmpOpExt, Context, Error, Expr, Query, SymbolKey, Truth, View, Width};
 
@@ -43,12 +44,19 @@ pub enum Endian {
     Big,
 }
 
-/// A version of a memory: its state after some stores.
+/// A version of a memory: its state after some stores. A clone accepts the versions shared
+/// at the time of cloning, but not versions created later on a different clone branch.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Version(u32);
+pub struct Version(u32, u64);
+
+fn fresh_version(index: u32) -> Version {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    Version(index, NEXT.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Clone)]
 struct Store {
+    version: Version,
     parent: Option<Version>,
     addr: Expr,
     cell: Expr,
@@ -71,10 +79,13 @@ pub struct Memory {
     /// Unknown cells read as zero, not as symbols.
     zeroed: bool,
     regions: Vec<Region>,
+    initial: Version,
     /// Version `k + 1` is store `k`; version 0 has no stores.
     stores: Vec<Store>,
     /// Reads of unknown cells: address and symbol, in order.
     reads: Vec<(Expr, Expr)>,
+    /// Next named read to try; occupied symbol names are skipped.
+    next_read: usize,
     /// Loads already built, by version and address.
     cache: HashMap<(Version, Expr), Expr>,
 }
@@ -94,8 +105,8 @@ impl core::fmt::Debug for Memory {
 }
 
 impl Memory {
-    /// A memory named `name` (its unknown cells are the symbols `name.0`, `name.1`, …) from
-    /// addresses of width `addr` to cells of width `cell`, all of it unknown.
+    /// A memory named `name` (its unknown cells use unused symbols `name.0`, `name.1`, …)
+    /// from addresses of width `addr` to cells of width `cell`, all of it unknown.
     pub fn new(name: &str, addr: Width, cell: Width, endian: Endian) -> Memory {
         Memory {
             name: name.to_string(),
@@ -104,20 +115,25 @@ impl Memory {
             endian,
             zeroed: false,
             regions: Vec::new(),
+            initial: fresh_version(0),
             stores: Vec::new(),
             reads: Vec::new(),
+            next_read: 0,
             cache: HashMap::new(),
         }
     }
 
-    /// Unknown cells read as zero instead (memory that starts cleared).
+    /// Unknown cells read as zero instead (memory that starts cleared). Previously returned
+    /// load expressions retain their original contents.
     pub fn zeroed(mut self) -> Memory {
         self.zeroed = true;
+        self.cache.clear();
         self
     }
 
     /// Known contents from address `start` on, one value per cell (for example a binary's
     /// read-only data). Regions must not overlap, including themselves when addresses wrap.
+    /// Previously returned load expressions retain their original contents.
     pub fn with_region(mut self, start: u128, cells: &[BitVec]) -> Result<Memory, Error> {
         if self.addr.bits() < 128 && cells.len() as u128 > (1u128 << self.addr.bits()) {
             return Err(Error::Unsupported(
@@ -138,6 +154,7 @@ impl Memory {
             start,
             cells: cells.to_vec(),
         });
+        self.cache.clear();
         Ok(self)
     }
 
@@ -152,7 +169,7 @@ impl Memory {
 
     /// The memory before any store.
     pub fn initial(&self) -> Version {
-        Version(0)
+        self.initial
     }
 
     /// The address width.
@@ -170,22 +187,42 @@ impl Memory {
             return None;
         }
         let s = &self.stores[v.0 as usize - 1];
-        Some((s.parent.unwrap_or(Version(0)), s))
+        Some((s.parent.unwrap_or(self.initial), s))
+    }
+
+    fn check_version(&self, v: Version) -> Result<(), Error> {
+        let known = if v.0 == 0 {
+            v == self.initial
+        } else {
+            self.stores
+                .get(v.0 as usize - 1)
+                .is_some_and(|s| s.version == v)
+        };
+        if known {
+            Ok(())
+        } else {
+            Err(Error::Unsupported(
+                "a version from another memory or clone branch".into(),
+            ))
+        }
     }
 
     /// An address as a base (none for a constant) plus a constant offset.
-    fn split(cx: &Context, e: Expr) -> Result<(Option<Expr>, BitVec), Error> {
-        Ok(match cx.view(e)? {
-            View::Const(c) => (None, c),
-            View::Bin(BinOp::Add, a, b) => match cx.view(b)? {
-                View::Const(c) => {
-                    let (base, off) = Self::split(cx, a)?;
-                    (base, BitVec::apply_bin(BinOp::Add, &off, &c)?)
-                }
-                _ => (Some(e), BitVec::zero(cx.width(e)?)),
-            },
-            _ => (Some(e), BitVec::zero(cx.width(e)?)),
-        })
+    fn split(cx: &Context, mut e: Expr) -> Result<(Option<Expr>, BitVec), Error> {
+        let mut off = BitVec::zero(cx.width(e)?);
+        loop {
+            match cx.view(e)? {
+                View::Const(c) => return Ok((None, BitVec::apply_bin(BinOp::Add, &off, &c)?)),
+                View::Bin(BinOp::Add, a, b) => match cx.view(b)? {
+                    View::Const(c) => {
+                        off = BitVec::apply_bin(BinOp::Add, &off, &c)?;
+                        e = a;
+                    }
+                    _ => return Ok((Some(e), off)),
+                },
+                _ => return Ok((Some(e), off)),
+            }
+        }
     }
 
     /// `addr + k`, written as its base plus one offset (so an address has one form however it
@@ -235,17 +272,20 @@ impl Memory {
         addr: Expr,
         value: Expr,
     ) -> Result<Version, Error> {
+        self.check_version(at)?;
         self.check_addr(cx, addr)?;
         let cells = self.cells_of(cx, value)?;
         let mut v = at;
         for (k, cell) in cells.into_iter().enumerate() {
             let a = self.offset(cx, addr, k as u64)?;
+            let next = fresh_version(self.stores.len() as u32 + 1);
             self.stores.push(Store {
+                version: next,
                 parent: Some(v),
                 addr: a,
                 cell,
             });
-            v = Version(self.stores.len() as u32);
+            v = next;
         }
         Ok(v)
     }
@@ -270,9 +310,14 @@ impl Memory {
         addr: Expr,
         cells: u16,
     ) -> Result<Expr, Error> {
+        self.check_version(at)?;
         self.check_addr(cx, addr)?;
         if cells == 0 {
             return Err(Error::Unsupported("a load of no cells".into()));
+        }
+        let bits = u32::from(cells) * u32::from(self.cell.bits());
+        if bits > u32::from(Width::MAX_BITS) {
+            return Err(crate::WidthError::Invalid { bits }.into());
         }
         let mut parts = Vec::with_capacity(cells as usize);
         for k in 0..cells {
@@ -447,17 +492,33 @@ impl Memory {
             return cx.zero(self.cell);
         }
         let mut pending: Vec<(Expr, Expr)> = Vec::new();
+        let mut found = None;
         for k in 0..self.reads.len() {
             let (ra, rs) = self.reads[k];
             match Self::same(cx, a, ra)? {
-                Ok(true) => return Ok(rs),
+                Ok(true) => {
+                    found = Some(rs);
+                    break;
+                }
                 Ok(false) => {}
                 Err(eq) => pending.push((eq, rs)),
             }
         }
-        let key = SymbolKey::from(format!("{}.{}", self.name, self.reads.len()).as_str());
-        let s = cx.symbol(key, self.cell)?;
-        self.reads.push((a, s));
+        let s = match found {
+            Some(s) => s,
+            None => {
+                let key = loop {
+                    let key = SymbolKey::from(format!("{}.{}", self.name, self.next_read));
+                    self.next_read += 1;
+                    if cx.find_symbol(&key).is_none() {
+                        break key;
+                    }
+                };
+                let s = cx.symbol(key, self.cell)?;
+                self.reads.push((a, s));
+                s
+            }
+        };
         // Earlier reads first: the first one at an equal address answers.
         let mut value = s;
         for &(eq, rs) in pending.iter().rev() {
@@ -504,6 +565,177 @@ mod tests {
 
     fn setup() -> (Context, ParseOptions) {
         (Context::new(), ParseOptions::width(Width::W32))
+    }
+
+    #[test]
+    fn versions_reject_other_memories_and_diverged_clone_branches() {
+        let mut cx = Context::new();
+        let a = cx.zero(Width::W8).unwrap();
+        let x = cx.constant_u64(Width::W8, 42).unwrap();
+        let y = cx.constant_u64(Width::W8, 99).unwrap();
+        let mut left = Memory::new("left", Width::W8, Width::W8, Endian::Little);
+        let mut right = Memory::new("right", Width::W8, Width::W8, Endian::Little);
+        let initial = left.initial();
+        let shared = left.store(&mut cx, initial, a, x).unwrap();
+        assert!(right.load(&mut cx, shared, a, 1).is_err());
+        assert!(right.store(&mut cx, shared, a, y).is_err());
+        assert!(right.stores.is_empty());
+        let other = right.store(&mut cx, right.initial(), a, y).unwrap();
+        assert_ne!(shared, other);
+        assert!(right.load(&mut cx, shared, a, 1).is_err());
+        assert!(left.load(&mut cx, other, a, 1).is_err());
+        assert!(right.load(&mut cx, initial, a, 1).is_err());
+        let mut fork = left.clone();
+        assert_eq!(fork.load(&mut cx, shared, a, 1).unwrap(), x);
+        let lv = left.store(&mut cx, shared, a, y).unwrap();
+        let rv = fork.store(&mut cx, shared, a, x).unwrap();
+        assert_ne!(lv, rv);
+        assert!(fork.load(&mut cx, lv, a, 1).is_err());
+        assert!(left.load(&mut cx, rv, a, 1).is_err());
+        assert!(fork.store(&mut cx, lv, a, x).is_err());
+        assert_eq!(left.load(&mut cx, lv, a, 1).unwrap(), y);
+        assert_eq!(fork.load(&mut cx, rv, a, 1).unwrap(), x);
+        assert_eq!(left.load(&mut cx, shared, a, 1).unwrap(), x);
+    }
+
+    #[test]
+    fn oversized_loads_fail_before_creating_cells() {
+        for (w, cells) in [
+            (Width::W8, 65),
+            (Width::W1, 513),
+            (Width::W512, 2),
+            (Width::W8, u16::MAX),
+            (Width::W512, u16::MAX),
+        ] {
+            let mut cx = Context::new();
+            let a = cx.symbol("address", Width::W64).unwrap();
+            let mut m = Memory::new("m", Width::W64, w, Endian::Little);
+            let before = cx.len();
+            assert!(matches!(m.load(&mut cx, m.initial(), a, cells),
+                Err(Error::Width(crate::WidthError::Invalid { bits }))
+                    if bits == u32::from(w.bits()) * u32::from(cells)));
+            assert_eq!(cx.len(), before);
+            assert!(m.reads().is_empty());
+            assert!(m.cache.is_empty());
+        }
+        let mut cx = Context::new();
+        let a = cx.zero(Width::W8).unwrap();
+        let mut m = Memory::new("m", Width::W8, Width::W8, Endian::Little).zeroed();
+        let full = m.load(&mut cx, m.initial(), a, 64).unwrap();
+        assert_eq!(cx.as_const(full).unwrap(), Some(BitVec::zero(Width::W512)));
+    }
+
+    #[test]
+    fn reused_reads_preserve_aliases_across_versions() {
+        let mut cx = Context::new();
+        let mut m = Memory::new("m", Width::W8, Width::W8, Endian::Little);
+        let p = cx.symbol("p", Width::W8).unwrap();
+        let q = cx.symbol("q", Width::W8).unwrap();
+        m.load(&mut cx, m.initial(), p, 1).unwrap();
+        let before = m.load(&mut cx, m.initial(), q, 1).unwrap();
+        let zero = cx.zero(Width::W8).unwrap();
+        let version = m.store(&mut cx, m.initial(), zero, zero).unwrap();
+        let after = m.load(&mut cx, version, q, 1).unwrap();
+        assert_eq!(m.reads().len(), 2);
+        for p in 0..4 {
+            for q in 0..4 {
+                let env: Vec<_> = [("p", p), ("q", q), ("m.0", 42), ("m.1", 99)]
+                    .into_iter()
+                    .map(|(key, v)| {
+                        (
+                            SymbolKey::from(key),
+                            BitVec::wrapping_from_u64(Width::W8, v),
+                        )
+                    })
+                    .collect();
+                let values = cx.eval(&[before, after], &env[..]).unwrap();
+                let old = if p == q { 42 } else { 99 };
+                let new = if q == 0 { 0 } else { old };
+                assert_eq!(values[0].to_u64(), Some(old), "p={p}, q={q}");
+                assert_eq!(values[1].to_u64(), Some(new), "p={p}, q={q}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_reads_skip_occupied_symbol_names() {
+        let mut cx = Context::new();
+        // Both equal-width and incompatible-width caller symbols must remain independent.
+        cx.symbol("m.0", Width::W8).unwrap();
+        cx.symbol("m.1", Width::W32).unwrap();
+        let mut m = Memory::new("m", Width::W8, Width::W8, Endian::Little);
+        for (address, value) in [(0, 42), (1, 99)] {
+            let address = cx.constant_u64(Width::W8, address).unwrap();
+            let read = m.load(&mut cx, m.initial(), address, 1).unwrap();
+            let bound = m
+                .bind(&mut cx, &[], &|a| {
+                    Some(BitVec::wrapping_from_u64(
+                        Width::W8,
+                        if a.is_zero() { 42 } else { 99 },
+                    ))
+                })
+                .unwrap();
+            assert_eq!(
+                cx.eval(&[read], &bound[..]).unwrap()[0].to_u64(),
+                Some(value)
+            );
+        }
+        let keys: Vec<_> = m
+            .reads()
+            .iter()
+            .map(|&(_, s)| {
+                cx.symbol_key(cx.symbol_id(s).unwrap().unwrap())
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert_eq!(keys, [SymbolKey::from("m.2"), SymbolKey::from("m.3")]);
+    }
+
+    #[test]
+    fn deep_addresses_normalize_without_recursion() {
+        for width in [Width::W8, Width::W64, Width::W512] {
+            let mut cx = Context::new();
+            let p = cx.symbol("p", width).unwrap();
+            let one = cx.one(width).unwrap();
+            let mut address = p;
+            for _ in 0..10_000 {
+                address = cx.add(address, one).unwrap();
+            }
+            let offset = cx
+                .constant(&BitVec::wrapping_from_u64(width, 10_000))
+                .unwrap();
+            let flat = cx.add(p, offset).unwrap();
+            let value = cx.constant_u64(Width::W8, 42).unwrap();
+            let mut m = Memory::new("m", width, Width::W8, Endian::Little);
+            let version = m.store(&mut cx, m.initial(), address, value).unwrap();
+            assert_eq!(m.load(&mut cx, version, flat, 1).unwrap(), value);
+            assert_eq!(m.load(&mut cx, version, address, 1).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn changing_initial_contents_refreshes_cached_loads() {
+        let mut cx = Context::new();
+        let mut m = Memory::new("m", Width::W8, Width::W8, Endian::Little);
+        let zero = cx.zero(Width::W8).unwrap();
+        let one = cx.one(Width::W8).unwrap();
+        let value = cx.constant_u64(Width::W8, 99).unwrap();
+        let version = m.store(&mut cx, m.initial(), one, value).unwrap();
+        let old = m.load(&mut cx, m.initial(), zero, 1).unwrap();
+        m.load(&mut cx, version, zero, 1).unwrap();
+        m = m.with_bytes(0, &[42]).unwrap();
+        for at in [m.initial(), version] {
+            let read = m.load(&mut cx, at, zero, 1).unwrap();
+            assert_eq!(cx.as_const(read).unwrap().unwrap().to_u64(), Some(42));
+        }
+        assert!(matches!(cx.view(old).unwrap(), View::Sym(_)));
+        assert_eq!(m.load(&mut cx, version, one, 1).unwrap(), value);
+        let two = cx.constant_u64(Width::W8, 2).unwrap();
+        m.load(&mut cx, version, two, 1).unwrap();
+        m = m.zeroed();
+        assert_eq!(m.load(&mut cx, version, two, 1).unwrap(), zero);
+        assert_eq!(m.load(&mut cx, version, one, 1).unwrap(), value);
     }
 
     #[test]
