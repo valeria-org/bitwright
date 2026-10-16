@@ -6,12 +6,15 @@
 //! ∀ I, T.  valid_T → ∃ S.  valid_S ∧ (¬pre ∨ ub_S ∨ (¬ub_T ∧ (p_S ∨ (¬p_T ∧ v_T = v_S))))
 //! ```
 //!
-//! decided by counterexample-guided search over the native prover: a candidate `(I, T)` that
-//! defeats every source choice found so far, then a source choice that answers it (added to
-//! the set) or a proof that none does (a counterexample).
+//! (with every register the target defines again refined as the result is), decided by
+//! counterexample-guided search over the native prover: a candidate `(I, T)` that defeats
+//! every source choice found so far, then a source choice that answers it (added to the set)
+//! or a proof that none does (a counterexample). Each program reads the inputs through its own
+//! attributes; the inputs themselves are what a caller passes.
 
 use core::fmt;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::encode::{
@@ -19,6 +22,7 @@ use super::encode::{
     TGT_CHOICE_KEY,
 };
 use super::ir::{Lit, Node, NodeId, Op, Term, Transform, Ty};
+use super::lex::SyntaxError;
 use super::types::{Assignment, typing};
 use super::value::ir_constant;
 use crate::prove::{self, Model};
@@ -30,7 +34,8 @@ use crate::{BinOp, BitVec, CmpOpExt, Context, Error, Expr, FnEnv, SymbolKey, UnO
 pub struct Config {
     /// The widths an open integer type takes.
     pub widths: Vec<u16>,
-    /// The most type assignments checked.
+    /// The most type assignments checked. A transformation with more is not decided (it is
+    /// never valid on the ones checked alone): give some types, or raise this.
     pub max_types: usize,
     /// The SAT solver's conflict budget per question.
     pub conflicts: u64,
@@ -41,17 +46,23 @@ pub struct Config {
     /// The conflict budget of each question that simplifies a counterexample (an undecided
     /// one keeps the counterexample as it is).
     pub minimize_conflicts: u64,
+    /// Accept each proof only with a DRUP certificate that the independent checker verifies,
+    /// every question blasted as it is (without bitwright's simplifier). The encoding of
+    /// LLVM's semantics and the bit-blaster stay trusted; the SAT solver and the simplifier no
+    /// longer are. Slower, and a check that fails is an unknown verdict.
+    pub certify: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             widths: vec![1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64],
-            max_types: 32,
+            max_types: 128,
             conflicts: 200_000,
             rounds: 64,
             minimize: true,
             minimize_conflicts: 5_000,
+            certify: false,
         }
     }
 }
@@ -63,6 +74,7 @@ setters!(Config {
     with_rounds: rounds: usize,
     with_minimize: minimize: bool,
     with_minimize_conflicts: minimize_conflicts: u64,
+    with_certify: certify: bool,
 });
 
 /// A value in a counterexample.
@@ -90,7 +102,7 @@ pub enum Mismatch {
 pub struct Counterexample {
     /// The types checked (`i8`, or each open type).
     pub types: String,
-    /// The inputs.
+    /// The inputs, as a caller passes them.
     pub inputs: Vec<(String, Ty, Shown)>,
     /// The symbolic constants.
     pub consts: Vec<(String, Ty, BitVec)>,
@@ -98,12 +110,14 @@ pub struct Counterexample {
     pub source: Vec<(String, Ty, Shown)>,
     /// The target's named values.
     pub target: Vec<(String, Ty, Shown)>,
-    /// The source's result.
+    /// The source's result (or the register of [`output`](Self::output)).
     pub source_result: Option<(Ty, Shown)>,
-    /// The target's result.
+    /// The target's result (or the register of [`output`](Self::output)).
     pub target_result: Option<(Ty, Shown)>,
     /// What goes wrong.
     pub mismatch: Mismatch,
+    /// The register the target defines again whose value fails, when it is not the result.
+    pub output: Option<String>,
     /// Whether the source makes choices (then the values shown are one execution of many,
     /// and none of them matches the target).
     pub nondeterministic: bool,
@@ -118,10 +132,16 @@ fn shown(ty: Ty, v: &Shown) -> String {
 
 impl fmt::Display for Counterexample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = match self.mismatch {
-            Mismatch::TargetUb => "the target has undefined behavior where the source has none",
-            Mismatch::TargetPoison => "the target is poison where the source is not",
-            Mismatch::Value => "the values differ",
+        let what = match (self.mismatch, &self.output) {
+            (Mismatch::TargetUb, _) => {
+                "the target has undefined behavior where the source has none".to_string()
+            }
+            (Mismatch::TargetPoison, None) => "the target is poison where the source is not".into(),
+            (Mismatch::Value, None) => "the values differ".into(),
+            (Mismatch::TargetPoison, Some(r)) => {
+                format!("the target's {r} is poison where the source's is not")
+            }
+            (Mismatch::Value, Some(r)) => format!("the values of {r} differ"),
         };
         write!(f, "{what}")?;
         if !self.types.is_empty() {
@@ -146,11 +166,12 @@ impl fmt::Display for Counterexample {
                 writeln!(f, "  {n} = {}", shown(*ty, v))?;
             }
         }
+        let which = self.output.as_deref().unwrap_or("result");
         match (&self.source_result, &self.target_result, self.mismatch) {
             (_, _, Mismatch::TargetUb) => writeln!(f, "the target's undefined behavior")?,
             (Some((ts, s)), Some((tt, t)), _) => {
-                writeln!(f, "source result: {}", shown(*ts, s))?;
-                writeln!(f, "target result: {}", shown(*tt, t))?;
+                writeln!(f, "source {which}: {}", shown(*ts, s))?;
+                writeln!(f, "target {which}: {}", shown(*tt, t))?;
             }
             _ => {}
         }
@@ -184,11 +205,15 @@ pub struct Report {
     pub name: String,
     /// Per type assignment checked: its label and verdict.
     pub checks: Vec<(String, Verdict)>,
+    /// Type assignments left unchecked because there were more than
+    /// [`Config::max_types`]: then the transformation is not valid, only not refuted.
+    pub unchecked: usize,
 }
 
 impl Report {
     /// The overall verdict: a counterexample if any assignment has one; else unsupported or
-    /// unknown if any is; else valid (at every assignment checked).
+    /// unknown if any is, or if assignments were left unchecked; else valid (at every
+    /// assignment of the widths configured).
     pub fn verdict(&self) -> Verdict {
         if let Some((_, v)) = self
             .checks
@@ -217,6 +242,14 @@ impl Report {
         }
         if self.checks.is_empty() {
             return Verdict::Unsupported("no type assignment to check".into());
+        }
+        if self.unchecked > 0 {
+            let done = self.checks.len();
+            return Verdict::Unknown(format!(
+                "valid at the {done} type assignments checked of {}; give some types, or raise \
+                 the most checked (max_types, --max-types)",
+                done + self.unchecked
+            ));
         }
         Verdict::Valid
     }
@@ -251,23 +284,21 @@ pub fn verify(t: &Transform, cfg: &Config) -> Report {
     let mut report = Report {
         name: t.name.clone(),
         checks: Vec::new(),
+        unchecked: 0,
     };
-    if let Some(why) = undef_reuse(t) {
-        report
-            .checks
-            .push((String::new(), Verdict::Unsupported(why)));
-        return report;
-    }
-    let assignments = match typing(t).and_then(|ty| ty.assignments(t, &cfg.widths, cfg.max_types)) {
-        Ok(a) => a,
-        Err(e) => {
-            report.checks.push((String::new(), Verdict::Unsupported(e)));
+    let (t, assignments, total) = match prepare(t, cfg) {
+        Ok(p) => p,
+        Err(why) => {
+            report
+                .checks
+                .push((String::new(), Verdict::Unsupported(why)));
             return report;
         }
     };
     for a in &assignments {
-        let v = match check(t, a, cfg) {
+        let v = match check(&t, a, cfg) {
             Ok(v) => v,
+            // A meaningless assignment (`bswap` of an odd number of bytes) is passed over.
             Err(Error::Unsupported(m)) if m.starts_with(SKIP) => continue,
             Err(Error::Unsupported(m)) => Verdict::Unsupported(m),
             Err(e) => Verdict::Unsupported(e.to_string()),
@@ -275,18 +306,114 @@ pub fn verify(t: &Transform, cfg: &Config) -> Report {
         let stop = matches!(v, Verdict::Invalid(_) | Verdict::Unsupported(_));
         report.checks.push((a.label.clone(), v));
         if stop {
-            break;
+            return report;
         }
     }
+    report.unchecked = total.saturating_sub(assignments.len());
     report
 }
 
-/// A target value that depends on an `undef` without a `freeze` between may differ at each of
-/// its uses in LLVM; bitwright gives it one value, so it refuses such a value used twice (or
-/// branched on) in the target, where fewer behaviors would miss a bug.
-fn undef_reuse(t: &Transform) -> Option<String> {
+/// Translation validation of two modules (see [`pairs_each`](super::pairs_each)): a report
+/// per function pair, one the subset cannot read reported unsupported with its error, so
+/// that the others are still checked. The error is the module's.
+pub fn validate(
+    first: &str,
+    second: Option<&str>,
+    cfg: &Config,
+) -> Result<Vec<Report>, SyntaxError> {
+    Ok(super::pairs_each(first, second)?
+        .into_iter()
+        .map(|(name, t)| match t {
+            Ok(t) => verify(&t, cfg),
+            Err(e) => Report {
+                name,
+                checks: vec![(String::new(), Verdict::Unsupported(e.to_string()))],
+                unchecked: 0,
+            },
+        })
+        .collect())
+}
+
+/// What the verifier checks: the transformation with the source's attributes on its body,
+/// and its type assignments (at most [`Config::max_types`], with how many there are); or why
+/// it cannot be verified.
+fn prepare<'t>(
+    t: &'t Transform,
+    cfg: &Config,
+) -> Result<(Cow<'t, Transform>, Vec<Assignment>, usize), String> {
+    if let Some(why) = refusal(t) {
+        return Err(why);
+    }
+    if let Some(why) = undef_reuse(t) {
+        return Err(why);
+    }
+    // A transformation built with the source's attributes on its inputs only: on the body.
+    let t = if t.src.params.len() != t.inputs.len()
+        && (0..t.inputs.len()).any(|i| !t.source_attrs(i).is_empty())
+    {
+        let mut owned = t.clone();
+        owned.src.params = (0..t.inputs.len()).map(|i| t.source_attrs(i)).collect();
+        Cow::Owned(owned)
+    } else {
+        Cow::Borrowed(t)
+    };
+    let (assignments, total) = typing(&t)?.assignments(&t, &cfg.widths, cfg.max_types)?;
+    if let Some(why) = &t.float_env
+        && assignments
+            .iter()
+            .any(|a| a.types.iter().any(|ty| matches!(ty, Ty::Float(_))))
+    {
+        return Err(why.clone());
+    }
+    Ok((t, assignments, total))
+}
+
+/// Why the verifier cannot check `t` at all: pointers, or something it reads without modeling
+/// (the source may declare more than is modeled, which only makes it more defined; the target
+/// may not).
+fn refusal(t: &Transform) -> Option<String> {
+    if t.pointers {
+        return Some(
+            "pointers and memory (`ptr`, `getelementptr`, `alloca`, `load`, …) are outside the \
+             subset the verifier reads"
+                .into(),
+        );
+    }
+    if let Some(why) = t.unsupported.first() {
+        return Some(why.clone());
+    }
+    let reach = target_reach(t);
+    for (i, &seen) in reach.seen.iter().enumerate() {
+        if !seen {
+            continue;
+        }
+        if let Node::Inst(inst) = t.node(i as NodeId)
+            && let Some(a) = &inst.attrs
+            && let Some(u) = a.unmodeled.first()
+        {
+            let what = if inst.name.is_empty() {
+                format!("a call to {:?}", inst.op)
+            } else {
+                t.label(i as NodeId)
+            };
+            return Some(format!(
+                "{what} in the target has {u}, which bitwright does not model"
+            ));
+        }
+    }
+    None
+}
+
+/// The nodes the target evaluates (its instructions, what they read, its branch conditions
+/// and results), how many times each is read, and its branch conditions.
+struct Reach {
+    seen: Vec<bool>,
+    used: Vec<u32>,
+    branch_conds: Vec<NodeId>,
+}
+
+fn target_reach(t: &Transform) -> Reach {
     let n = t.nodes.len();
-    // The nodes the target evaluates: its instructions and what they read.
     let mut used = vec![0u32; n];
     let mut seen = vec![false; n];
     let mut stack: Vec<NodeId> = Vec::new();
@@ -302,9 +429,8 @@ fn undef_reuse(t: &Transform) -> Option<String> {
             _ => {}
         }
     }
-    if let Some(r) = t.tgt.root {
-        stack.push(r);
-    }
+    stack.extend(t.tgt.root);
+    stack.extend(t.tgt.matched.iter().map(|&(_, n)| n));
     while let Some(x) = stack.pop() {
         if std::mem::replace(&mut seen[x as usize], true) {
             continue;
@@ -319,27 +445,56 @@ fn undef_reuse(t: &Transform) -> Option<String> {
             stack.push(a);
         }
     }
-    let mut tainted = vec![false; n];
-    for i in 0..n {
-        // Arguments precede their users in the arena, except phis (which LLVM orders freely).
-        tainted[i] = match t.node(i as NodeId) {
-            Node::Lit(Lit::Undef) => true,
-            Node::Inst(inst) if inst.op != Op::Freeze => inst
-                .args
-                .iter()
-                .any(|&a| (a as usize) < i && tainted[a as usize]),
-            _ => false,
-        };
+    Reach {
+        seen,
+        used,
+        branch_conds,
     }
-    for i in 0..n {
-        if seen[i] && tainted[i] && matches!(t.node(i as NodeId), Node::Inst(_)) && used[i] > 1 {
-            return Some(format!(
-                "{} depends on undef and is used more than once in the target (freeze it)",
-                t.label(i as NodeId)
-            ));
+}
+
+/// A target value that depends on an `undef` without a `freeze` between may differ at each of
+/// its uses in LLVM; bitwright gives it one value, so it refuses such a value used twice (or
+/// branched on) in the target, where fewer behaviors would miss a bug.
+fn undef_reuse(t: &Transform) -> Option<String> {
+    let n = t.nodes.len();
+    let reach = target_reach(t);
+    // What depends on an undef, to a fixed point: operands may come after their users in
+    // the arena (the function syntax names every register before reading any instruction).
+    let mut tainted = vec![false; n];
+    loop {
+        let mut changed = false;
+        for i in 0..n {
+            if tainted[i] {
+                continue;
+            }
+            let depends = match t.node(i as NodeId) {
+                Node::Lit(Lit::Undef) => true,
+                Node::Inst(inst) if inst.op != Op::Freeze => {
+                    inst.args.iter().any(|&a| tainted[a as usize])
+                }
+                Node::CExpr(_, args) => args.iter().any(|&a| tainted[a as usize]),
+                _ => false,
+            };
+            if depends {
+                tainted[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
-    for c in branch_conds {
+    let reused = (0..n as NodeId).find(|&i| {
+        let k = i as usize;
+        reach.seen[k] && tainted[k] && matches!(t.node(i), Node::Inst(_)) && reach.used[k] > 1
+    });
+    if let Some(i) = reused {
+        return Some(format!(
+            "{} depends on undef and is used more than once in the target (freeze it)",
+            t.label(i)
+        ));
+    }
+    for c in reach.branch_conds {
         if tainted[c as usize] {
             return Some("a branch on a value that depends on undef".into());
         }
@@ -347,14 +502,14 @@ fn undef_reuse(t: &Transform) -> Option<String> {
     None
 }
 
-/// Symbolic inputs and constants.
+/// Symbolic inputs (as a caller passes them: never poison where the source declares
+/// `noundef`, since passing poison there is the source's undefined behavior) and constants.
 fn symbolic_leaves(cx: &mut Context, t: &Transform, ty: &[Ty]) -> Result<Leaves, Error> {
     let mut inputs = Vec::new();
     for (i, &n) in t.inputs.iter().enumerate() {
         let width = Width::new(ty[n as usize].bits())?;
         let v = cx.symbol(SymbolKey::U64(INPUT_KEY + 2 * i as u64), width)?;
-        let noundef = matches!(t.node(n), Node::Input { noundef: true, .. });
-        let p = if noundef {
+        let p = if t.source_attrs(i).noundef {
             cx.bool(false)?
         } else {
             cx.symbol(SymbolKey::U64(INPUT_KEY + 2 * i as u64 + 1), Width::W1)?
@@ -366,49 +521,11 @@ fn symbolic_leaves(cx: &mut Context, t: &Transform, ty: &[Ty]) -> Result<Leaves,
         let width = Width::new(ty[n as usize].bits())?;
         consts.push(cx.symbol(SymbolKey::U64(CONST_KEY + i as u64), width)?);
     }
-    constrain_inputs(cx, t, ty, Leaves { inputs, consts })
-}
-
-/// Inputs with `range` and `nofpclass` attributes are poison outside them.
-fn constrain_inputs(
-    cx: &mut Context,
-    t: &Transform,
-    ty: &[Ty],
-    mut leaves: Leaves,
-) -> Result<Leaves, Error> {
-    let empty = Leaves {
-        inputs: Vec::new(),
-        consts: Vec::new(),
-    };
-    for (i, &n) in t.inputs.iter().enumerate() {
-        let range = match t.node(n) {
-            Node::Input { range, .. } => range.clone(),
-            _ => None,
-        };
-        let classes = t
-            .nofpclass
-            .iter()
-            .filter(|(m, _)| *m == n)
-            .fold(0u16, |a, (_, c)| a | c);
-        if range.is_none() && classes == 0 {
-            continue;
-        }
-        let (v, p) = leaves.inputs[i];
-        let mut e = Enc::new(cx, t, ty, &empty, Choices::Fixed(&[]))?;
-        let extra = e.constrained(ty[n as usize], v, range.as_ref(), classes)?;
-        let p = cx.bin(BinOp::Or, p, extra)?;
-        leaves.inputs[i] = (v, p);
-    }
-    Ok(leaves)
+    Ok(Leaves { inputs, consts })
 }
 
 /// Concrete inputs and constants.
-fn concrete_leaves(
-    cx: &mut Context,
-    t: &Transform,
-    ty: &[Ty],
-    pt: &Point,
-) -> Result<Leaves, Error> {
+fn concrete_leaves(cx: &mut Context, pt: &Point) -> Result<Leaves, Error> {
     let mut inputs = Vec::new();
     for (v, p) in &pt.inputs {
         inputs.push((cx.constant(v)?, cx.bool(*p)?));
@@ -417,7 +534,7 @@ fn concrete_leaves(
     for v in &pt.consts {
         consts.push(cx.constant(v)?);
     }
-    constrain_inputs(cx, t, ty, Leaves { inputs, consts })
+    Ok(Leaves { inputs, consts })
 }
 
 /// A point of the input space with the target's choices.
@@ -440,8 +557,7 @@ fn point(m: &Model, t: &Transform, ty: &[Ty], tgt_choices: &[Width]) -> Result<P
         let width = Width::new(ty[n as usize].bits())?;
         let v = read(m, INPUT_KEY + 2 * i as u64, width);
         let p = !read(m, INPUT_KEY + 2 * i as u64 + 1, Width::W1).is_zero();
-        let noundef = matches!(t.node(n), Node::Input { noundef: true, .. });
-        inputs.push((v, p && !noundef));
+        inputs.push((v, p && !t.source_attrs(i).noundef));
     }
     let mut consts = Vec::new();
     for (i, &n) in t.consts.iter().enumerate() {
@@ -460,15 +576,22 @@ fn point(m: &Model, t: &Transform, ty: &[Ty], tgt_choices: &[Width]) -> Result<P
     })
 }
 
+/// Whether the target's value `(vt, pt)` refines the source's `(vs, ps)`.
+fn value_refines(
+    cx: &mut Context,
+    (vs, ps): (Expr, Expr),
+    (vt, pt): (Expr, Expr),
+) -> Result<Expr, Error> {
+    let eq = cx.cmp(CmpOpExt::Eq, vt, vs)?;
+    let npt = cx.un(UnOp::Not, pt)?;
+    let same = cx.bin(BinOp::And, npt, eq)?;
+    cx.bin(BinOp::Or, ps, same)
+}
+
 /// `φ`: the source (with its choices) answers the target at this point.
 fn refines(cx: &mut Context, src: &Side, tgt: &Side) -> Result<Expr, Error> {
-    let r = match (src.result, tgt.result) {
-        (Some((vs, ps)), Some((vt, pt))) => {
-            let eq = cx.cmp(CmpOpExt::Eq, vt, vs)?;
-            let npt = cx.un(UnOp::Not, pt)?;
-            let same = cx.bin(BinOp::And, npt, eq)?;
-            cx.bin(BinOp::Or, ps, same)?
-        }
+    let mut r = match (src.result, tgt.result) {
+        (Some(s), Some(t)) => value_refines(cx, s, t)?,
         (None, None) => cx.bool(true)?,
         _ => {
             return Err(Error::Unsupported(
@@ -476,12 +599,49 @@ fn refines(cx: &mut Context, src: &Side, tgt: &Side) -> Result<Expr, Error> {
             ));
         }
     };
+    if src.matched.len() != tgt.matched.len() {
+        return Err(Error::Contract(
+            "the source and the target match different registers".into(),
+        ));
+    }
+    for (&s, &t) in src.matched.iter().zip(&tgt.matched) {
+        let m = value_refines(cx, s, t)?;
+        r = cx.bin(BinOp::And, r, m)?;
+    }
     let nub = cx.un(UnOp::Not, tgt.ub)?;
     let defined = cx.bin(BinOp::And, nub, r)?;
     let ok = cx.bin(BinOp::Or, src.ub, defined)?;
     let npre = cx.un(UnOp::Not, src.pre)?;
     let ok = cx.bin(BinOp::Or, npre, ok)?;
     cx.bin(BinOp::And, src.valid, ok)
+}
+
+/// A model of `q`, or `None` when there is none, or why it is not decided. With a
+/// certificate asked for, an unsatisfiable `q` is accepted only with a DRUP proof that the
+/// independent checker verifies.
+fn satisfy(
+    cx: &mut Context,
+    q: Expr,
+    pcfg: &prove::Config,
+) -> Result<Result<Option<Model>, String>, Error> {
+    let nq = cx.un(UnOp::Not, q)?;
+    Ok(match prove::valid(cx, nq, pcfg)? {
+        prove::Outcome::Proved(cert) => {
+            if pcfg.certificate {
+                match cert {
+                    Some(c) => {
+                        if let Err(e) = c.check() {
+                            return Ok(Err(format!("a certificate does not check: {e}")));
+                        }
+                    }
+                    None => return Ok(Err("a proof without its certificate".into())),
+                }
+            }
+            Ok(None)
+        }
+        prove::Outcome::Refuted(m) => Ok(Some(m)),
+        prove::Outcome::Unknown(why) => Err(why.to_string()),
+    })
 }
 
 struct Search<'a> {
@@ -536,7 +696,9 @@ impl Search<'_> {
             base,
             src_choices: !src0.choices.is_empty(),
             rounds: cfg.rounds,
-            pcfg: prove::Config::default().with_max_conflicts(cfg.conflicts),
+            pcfg: prove::Config::default()
+                .with_max_conflicts(cfg.conflicts)
+                .with_certificate(cfg.certify),
         })
     }
 
@@ -544,7 +706,7 @@ impl Search<'_> {
     fn find(&mut self, extra: Expr) -> Result<Found, Error> {
         for _ in 0..=self.rounds {
             let q = self.cx.bin(BinOp::And, self.base, extra)?;
-            let model = match prove::satisfy(&mut self.cx, q, &self.pcfg)? {
+            let model = match satisfy(&mut self.cx, q, &self.pcfg)? {
                 Ok(None) => return Ok(Found::None),
                 Ok(Some(m)) => m,
                 Err(why) => return Err(Error::Unsupported(format!("unknown: {why}"))),
@@ -554,7 +716,7 @@ impl Search<'_> {
                 return Ok(Found::Point(pt));
             }
             // A source choice that answers this point?
-            let cl = concrete_leaves(&mut self.cx, self.t, self.ty, &pt)?;
+            let cl = concrete_leaves(&mut self.cx, &pt)?;
             let tgt_c = Enc::new(&mut self.cx, self.t, self.ty, &cl, Choices::Fixed(&pt.tgt))?
                 .body(&self.t.tgt, false)?;
             let src_s = Enc::new(
@@ -566,7 +728,7 @@ impl Search<'_> {
             )?
             .body(&self.t.src, true)?;
             let phi = refines(&mut self.cx, &src_s, &tgt_c)?;
-            let answer = match prove::satisfy(&mut self.cx, phi, &self.pcfg)? {
+            let answer = match satisfy(&mut self.cx, phi, &self.pcfg)? {
                 Ok(None) => return Ok(Found::Point(pt)),
                 Ok(Some(m)) => m,
                 Err(why) => return Err(Error::Unsupported(format!("unknown: {why}"))),
@@ -613,7 +775,9 @@ fn check(t: &Transform, a: &Assignment, cfg: &Config) -> Result<Verdict, Error> 
         Err(e) => return Err(e),
     };
     if cfg.minimize {
-        s.pcfg = prove::Config::default().with_max_conflicts(cfg.minimize_conflicts);
+        s.pcfg = prove::Config::default()
+            .with_max_conflicts(cfg.minimize_conflicts)
+            .with_certificate(cfg.certify);
         pt = minimize(&mut s, pt)?;
     }
     Ok(Verdict::Invalid(Box::new(describe(&mut s, a, &pt)?)))
@@ -754,25 +918,49 @@ fn result_type(body: &super::ir::Body, ty: &[Ty]) -> Option<Ty> {
 fn describe(s: &mut Search<'_>, a: &Assignment, pt: &Point) -> Result<Counterexample, Error> {
     let (t, ty) = (s.t, s.ty);
     let cx = &mut s.cx;
-    let leaves = concrete_leaves(cx, t, ty, pt)?;
+    let leaves = concrete_leaves(cx, pt)?;
     let src = Enc::new(cx, t, ty, &leaves, Choices::Fixed(&[]))?.body(&t.src, true)?;
     let tgt = Enc::new(cx, t, ty, &leaves, Choices::Fixed(&pt.tgt))?.body(&t.tgt, false)?;
     let source = named_values(cx, t, ty, &src)?;
     let target = named_values(cx, t, ty, &tgt)?;
-    let source_result = match (src.result, result_type(&t.src, ty)) {
+    let mut source_result = match (src.result, result_type(&t.src, ty)) {
         (Some((v, p)), Some(rt)) => Some((rt, shown_of(cx, v, p)?)),
         _ => None,
     };
-    let target_result = match (tgt.result, result_type(&t.tgt, ty)) {
+    let mut target_result = match (tgt.result, result_type(&t.tgt, ty)) {
         (Some((v, p)), Some(rt)) => Some((rt, shown_of(cx, v, p)?)),
         _ => None,
     };
+    let fails = |cx: &mut Context, s: (Expr, Expr), t: (Expr, Expr)| -> Result<bool, Error> {
+        let ok = value_refines(cx, s, t)?;
+        Ok(eval_one(cx, ok)?.is_zero())
+    };
+    let mut output = None;
     let mismatch = if !eval_one(cx, tgt.ub)?.is_zero() {
         Mismatch::TargetUb
-    } else if matches!(target_result, Some((_, Shown::Poison))) {
-        Mismatch::TargetPoison
     } else {
-        Mismatch::Value
+        // The first value that fails: the result, else a register defined again.
+        let result_fails = match (src.result, tgt.result) {
+            (Some(sr), Some(tr)) => fails(cx, sr, tr)?,
+            _ => false,
+        };
+        if !result_fails {
+            for (k, (&sv, &tv)) in src.matched.iter().zip(&tgt.matched).enumerate() {
+                if fails(cx, sv, tv)? {
+                    let (name, n) = &t.src.matched[k];
+                    output = Some(format!("%{name}"));
+                    source_result = Some((ty[*n as usize], shown_of(cx, sv.0, sv.1)?));
+                    let tn = t.tgt.matched[k].1;
+                    target_result = Some((ty[tn as usize], shown_of(cx, tv.0, tv.1)?));
+                    break;
+                }
+            }
+        }
+        if matches!(target_result, Some((_, Shown::Poison))) {
+            Mismatch::TargetPoison
+        } else {
+            Mismatch::Value
+        }
     };
     let inputs = t
         .inputs
@@ -801,8 +989,73 @@ fn describe(s: &mut Search<'_>, a: &Assignment, pt: &Point) -> Result<Counterexa
         source_result,
         target_result,
         mismatch,
+        output,
         nondeterministic: s.src_choices,
     })
+}
+
+/// A type assignment's label and its SMT-LIB question, or why it has none (see [`smt`]).
+#[cfg(feature = "smtlib")]
+pub type Question = (String, Result<String, String>);
+
+/// Each type assignment's question as an SMT-LIB 2.6 script, for another solver to check what
+/// a verdict rests on: whether, at some input and with some choices of the target, the target
+/// does what none of the source's executions found by the search does. For a valid
+/// transformation every script is unsatisfiable, which a solver confirms independently of
+/// bitwright's SAT solver and simplifier (the encoding of LLVM's semantics is bitwright's);
+/// for an invalid one whose source makes no choices, the script of the failing assignment is
+/// satisfiable. One per type assignment, with its label (the transformation's name and
+/// types): the script, or why there is none (the search did not decide, or the source makes
+/// choices and the counterexample is the verifier's). The error is the transformation's.
+#[cfg(feature = "smtlib")]
+pub fn smt(t: &Transform, cfg: &Config) -> Result<Vec<Question>, String> {
+    let (t, assignments, total) = prepare(t, cfg)?;
+    if total > assignments.len() {
+        return Err(format!(
+            "{total} type assignments, more than the most checked ({}); give some types",
+            cfg.max_types
+        ));
+    }
+    let mut out = Vec::new();
+    for a in &assignments {
+        let label = if a.label.is_empty() {
+            t.name.clone()
+        } else {
+            format!("{} ({})", t.name, a.label)
+        };
+        let mut s = match Search::new(&t, a, cfg) {
+            Ok(s) => s,
+            Err(Error::Unsupported(m)) if m.starts_with(SKIP) => continue,
+            Err(e) => {
+                out.push((label, Err(e.to_string())));
+                continue;
+            }
+        };
+        let script = (|| -> Result<String, String> {
+            let tru = s.cx.bool(true).map_err(|e| e.to_string())?;
+            let expect = match s.find(tru) {
+                Ok(Found::None) => "unsat",
+                Ok(Found::Point(_)) if !s.src_choices => "sat",
+                Ok(Found::Point(_)) => {
+                    return Err(
+                        "invalid (the source makes choices: the counterexample is the \
+                                verifier's)"
+                            .into(),
+                    );
+                }
+                Err(Error::Unsupported(m)) => {
+                    return Err(m.trim_start_matches("unknown: ").to_string());
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            let base = s.base;
+            let script =
+                crate::smtlib::satisfiability_query(&mut s.cx, base).map_err(|e| e.to_string())?;
+            Ok(format!("; {label}: expect {expect}\n{script}"))
+        })();
+        out.push((label, script));
+    }
+    Ok(out)
 }
 
 /// Whether a transformation is valid at fixed values of its symbolic constants, one type

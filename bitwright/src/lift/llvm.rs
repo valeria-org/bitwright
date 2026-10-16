@@ -19,7 +19,7 @@ pub fn llvm(cx: &mut Context, text: &str, name: Option<&str>) -> Result<Block, E
     }
     .ok_or_else(|| Error::Unsupported("no such function in the module".into()))?;
     let t = crate::transform::llvm::single(f).map_err(syntax)?;
-    let a = crate::transform::types::typing(&t)
+    let (a, _) = crate::transform::types::typing(&t)
         .and_then(|ty| ty.assignments(&t, &[64], 1))
         .map_err(Error::Unsupported)?;
     let Some(a) = a.first() else {

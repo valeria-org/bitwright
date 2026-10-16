@@ -4,10 +4,178 @@
 use std::collections::HashMap;
 
 use super::ir::{
-    CFun, FPred, IPred, Inst, Intrinsic, Lit, Node, NodeId, Op, PFun, Transform, Ty, flags,
-    float_type,
+    CFun, FPred, IPred, Inst, InstAttrs, Intrinsic, Lit, Node, NodeId, Op, PFun, ParamAttrs,
+    Transform, Ty, flags, float_type,
 };
 use super::lex::{Cursor, SyntaxError, Tok};
+use super::llvm::fpclass;
+
+/// What an attribute word means for an integer or floating-point value.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Attr {
+    /// `noundef`, `range`, `nofpclass`, `returned`: read and modeled.
+    Modeled,
+    /// No effect on what the value may be: ABI details (`zeroext`, `signext`, `noext`,
+    /// `inreg`) and `immarg`.
+    Neutral,
+    /// A known attribute that may matter (on pointers, mostly) and that bitwright does not
+    /// model.
+    Other,
+}
+
+fn attr_kind(w: &str) -> Option<Attr> {
+    Some(match w {
+        "noundef" | "range" | "nofpclass" | "returned" => Attr::Modeled,
+        "zeroext" | "signext" | "noext" | "inreg" | "immarg" => Attr::Neutral,
+        "noalias"
+        | "nonnull"
+        | "nocapture"
+        | "captures"
+        | "nofree"
+        | "nest"
+        | "readnone"
+        | "readonly"
+        | "writeonly"
+        | "writable"
+        | "dereferenceable"
+        | "dereferenceable_or_null"
+        | "align"
+        | "alignstack"
+        | "allocalign"
+        | "allocptr"
+        | "byval"
+        | "byref"
+        | "preallocated"
+        | "inalloca"
+        | "sret"
+        | "elementtype"
+        | "swiftself"
+        | "swiftasync"
+        | "swifterror"
+        | "initializes"
+        | "dead_on_unwind"
+        | "dead_on_return" => Attr::Other,
+        _ => return None,
+    })
+}
+
+/// The attributes at the cursor (of a parameter, a return value, a call's result or one of
+/// its arguments): what they declare, and the names of those that may matter but that
+/// bitwright does not model. With `known_only` (a value follows: a call's argument), only
+/// attribute words are read; otherwise every word up to a type is, unknown ones as attributes
+/// that may matter.
+pub(crate) fn attributes(
+    c: &mut Cursor<'_>,
+    known_only: bool,
+) -> Result<(ParamAttrs, Vec<String>), SyntaxError> {
+    let mut a = ParamAttrs::default();
+    let mut other = Vec::new();
+    loop {
+        match c.peek() {
+            Some(Tok::Ident(w)) => {
+                let w = w.clone();
+                // A type ends the attributes of a return value.
+                if type_name(&w).is_some() || w == "void" {
+                    break;
+                }
+                let kind = attr_kind(&w);
+                if kind.is_none() && known_only {
+                    break;
+                }
+                c.pos += 1;
+                match w.as_str() {
+                    "noundef" => a.noundef = true,
+                    "returned" => a.returned = true,
+                    "range" => {
+                        c.expect("(")?;
+                        c.word();
+                        let lo = signed_num(c)?;
+                        c.expect(",")?;
+                        let hi = signed_num(c)?;
+                        c.expect(")")?;
+                        a.range = Some((lo, hi));
+                    }
+                    "nofpclass" => {
+                        c.expect("(")?;
+                        while let Some(w) = c.word() {
+                            match fpclass::parse(w) {
+                                Some(b) => a.nofpclass |= b,
+                                None => return c.err(format!("unknown class `{w}` in nofpclass")),
+                            }
+                        }
+                        c.expect(")")?;
+                    }
+                    _ => {
+                        // `align 4`, `dereferenceable(8)`, `byval(i32)`, "": skip arguments.
+                        if c.eat("(") {
+                            let mut depth = 1;
+                            while depth > 0 {
+                                match c.next() {
+                                    Some(Tok::P("(")) => depth += 1,
+                                    Some(Tok::P(")")) => depth -= 1,
+                                    None => return c.err("unbalanced parentheses"),
+                                    _ => {}
+                                }
+                            }
+                        } else if matches!(c.peek(), Some(Tok::Num(_))) {
+                            c.pos += 1;
+                        }
+                        if kind != Some(Attr::Neutral) {
+                            other.push(w);
+                        }
+                    }
+                }
+            }
+            // String attributes (`"key"="value"`) may matter too.
+            Some(Tok::Str(s)) if !known_only => {
+                let s = s.clone();
+                c.pos += 1;
+                if c.eat("=") {
+                    c.next();
+                }
+                other.push(format!("\"{s}\""));
+            }
+            Some(Tok::P("#")) if !known_only => {
+                c.pos += 1;
+                c.next();
+            }
+            _ => break,
+        }
+    }
+    Ok((a, other))
+}
+
+pub(crate) fn signed_num(c: &mut Cursor<'_>) -> Result<String, SyntaxError> {
+    let neg = c.eat("-");
+    match c.next() {
+        Some(Tok::Num(s)) => Ok(if neg { format!("-{s}") } else { s.clone() }),
+        Some(Tok::Ident(w)) if w == "true" => Ok("1".into()),
+        Some(Tok::Ident(w)) if w == "false" => Ok("0".into()),
+        _ => c.err("expected a number"),
+    }
+}
+
+/// Metadata that says nothing about the values an instruction computes (debug information,
+/// profiles, aliasing of memory, which the verifier refuses anyway).
+fn harmless_metadata(kind: &str) -> bool {
+    matches!(
+        kind,
+        "dbg"
+            | "prof"
+            | "annotation"
+            | "unpredictable"
+            | "llvm.loop"
+            | "nosanitize"
+            | "tbaa"
+            | "tbaa.struct"
+            | "alias.scope"
+            | "noalias"
+            | "DIAssignID"
+            | "heapallocsite"
+            | "pcsections"
+            | "srcloc"
+    )
+}
 
 /// A type name (`i8`, `float`, …).
 pub(crate) fn type_name(w: &str) -> Option<Ty> {
@@ -86,10 +254,22 @@ impl Ctx<'_> {
     }
 
     /// An optional type.
-    pub(crate) fn opt_type(&self, c: &mut Cursor<'_>) -> Option<Ty> {
-        let ty = c.peek_word().and_then(type_name)?;
+    pub(crate) fn opt_type(&mut self, c: &mut Cursor<'_>) -> Option<Ty> {
+        let w = c.peek_word()?;
+        let ty = type_name(w)?;
+        if w == "ptr" {
+            self.t.pointers = true;
+        }
         c.pos += 1;
         Some(ty)
+    }
+
+    /// A type, after `to`.
+    fn type_after_to(&mut self, c: &mut Cursor<'_>) -> Result<Ty, SyntaxError> {
+        match self.opt_type(c) {
+            Some(ty) => Ok(ty),
+            None => c.err("expected a type after `to`"),
+        }
     }
 
     fn lit(&mut self, l: Lit) -> NodeId {
@@ -382,24 +562,14 @@ impl Ctx<'_> {
                 };
             }
             let a = self.operand(c)?;
-            let inst = Inst {
-                name: name.to_string(),
-                op: Op::Copy,
-                flags: 0,
-                args: vec![a],
-                incoming: Vec::new(),
-            };
+            let mut inst = Inst::new(name, Op::Copy);
+            inst.args = vec![a];
             return Ok((inst, None));
         }
         let opname = c.word().expect("checked");
         let mut result_ty = None;
-        let mut inst = Inst {
-            name: name.to_string(),
-            op: Op::Freeze,
-            flags: 0,
-            args: Vec::new(),
-            incoming: Vec::new(),
-        };
+        let mut inst = Inst::new(name, Op::Freeze);
+        let mut attrs = InstAttrs::default();
         if let Some(op) = Op::binary(opname) {
             inst.op = op;
             inst.flags = self.flags(c);
@@ -412,10 +582,7 @@ impl Ctx<'_> {
             inst.flags = self.flags(c);
             let a = self.operand(c)?;
             if c.eat_word("to") {
-                match c.word().and_then(type_name) {
-                    Some(ty) => result_ty = Some(ty),
-                    None => return c.err("expected a type after `to`"),
-                }
+                result_ty = Some(self.type_after_to(c)?);
             }
             inst.args = vec![a];
         } else {
@@ -457,6 +624,7 @@ impl Ctx<'_> {
                 }
                 "load" => {
                     // load [volatile] <ty>, ptr %p [, align N]
+                    self.t.pointers = true;
                     c.eat_word("volatile");
                     inst.op = Op::Load;
                     let Some(ty) = self.opt_type(c) else {
@@ -470,6 +638,7 @@ impl Ctx<'_> {
                 }
                 "store" => {
                     // store [volatile] <ty> %v, ptr %p [, align N]
+                    self.t.pointers = true;
                     c.eat_word("volatile");
                     inst.op = Op::Store;
                     let v = self.operand(c)?;
@@ -480,6 +649,7 @@ impl Ctx<'_> {
                     skip_align(c);
                 }
                 "alloca" => {
+                    self.t.pointers = true;
                     inst.op = Op::Alloca;
                     if self.opt_type(c).is_none() {
                         return c.err("expected the allocated type");
@@ -488,7 +658,9 @@ impl Ctx<'_> {
                     skip_align(c);
                 }
                 "getelementptr" => {
-                    // getelementptr [inbounds|nuw|nusw]* <elem>, ptr %p, <ty> %i
+                    // getelementptr [inbounds|nuw|nusw]* <elem>, ptr %p, <ty> %i (their
+                    // poison is not modeled: only lifting reads memory)
+                    self.t.pointers = true;
                     while matches!(c.peek_word(), Some("inbounds" | "nuw" | "nusw")) {
                         c.pos += 1;
                     }
@@ -505,13 +677,12 @@ impl Ctx<'_> {
                 }
                 "ptrtoint" | "inttoptr" => {
                     // A resize of the address: zero extension or truncation.
+                    self.t.pointers = true;
                     let a = self.operand(c)?;
                     if !c.eat_word("to") {
                         return c.err("expected `to`");
                     }
-                    let Some(ty) = c.word().and_then(type_name) else {
-                        return c.err("expected a type after `to`");
-                    };
+                    let ty = self.type_after_to(c)?;
                     inst.op = Op::Resize;
                     inst.args = vec![a];
                     result_ty = Some(ty);
@@ -555,9 +726,9 @@ impl Ctx<'_> {
                     }
                     inst.flags = self.flags(c);
                     // Return attributes and the return type.
-                    while matches!(c.peek_word(), Some("noundef" | "zeroext" | "signext")) {
-                        c.pos += 1;
-                    }
+                    let (result, other) = attributes(c, false)?;
+                    attrs.result = result;
+                    attrs.unmodeled.extend(other);
                     let ret = if c.eat_word("void") {
                         None
                     } else {
@@ -573,20 +744,18 @@ impl Ctx<'_> {
                     c.expect("(")?;
                     if !c.eat(")") {
                         loop {
-                            while matches!(
-                                c.peek_word(),
-                                Some("noundef" | "zeroext" | "signext" | "immarg")
-                            ) && !matches!(c.peek_at(1), Some(Tok::P(",") | Tok::P(")")))
-                            {
-                                c.pos += 1;
-                            }
-                            // `ty attrs value`: a type, attributes, then the value.
+                            // `ty attrs value`: a type, attributes, then the value (some write
+                            // the attributes first).
+                            let (mut arg, other) = attributes(c, true)?;
+                            attrs.unmodeled.extend(other);
                             let ty = self.opt_type(c);
-                            while matches!(
-                                c.peek_word(),
-                                Some("noundef" | "immarg" | "zeroext" | "signext")
-                            ) {
-                                c.pos += 1;
+                            let (after, other) = attributes(c, true)?;
+                            attrs.unmodeled.extend(other);
+                            arg.noundef |= after.noundef;
+                            arg.range = arg.range.or(after.range);
+                            arg.nofpclass |= after.nofpclass;
+                            if arg.returned || after.returned {
+                                attrs.unmodeled.push("`returned` on an argument".into());
                             }
                             let a = if self.alive {
                                 self.cexpr(c, 0)?
@@ -597,11 +766,15 @@ impl Ctx<'_> {
                                 self.annotate(c, a, ty)?;
                             }
                             inst.args.push(a);
+                            attrs.args.push(arg);
                             if c.eat(")") {
                                 break;
                             }
                             c.expect(",")?;
                         }
+                    }
+                    if attrs.args.iter().all(ParamAttrs::is_empty) {
+                        attrs.args.clear();
                     }
                     if inst.args.len() != i.arity() {
                         return c.err(format!(
@@ -622,7 +795,21 @@ impl Ctx<'_> {
                 _ => return c.err(format!("unknown instruction `{opname}`")),
             }
         }
-        c.end()?;
+        // Metadata and call-site attribute groups: any that may change the result is not
+        // modeled (`!fpmath` allows an error, `!range` makes poison, a group may hold
+        // `strictfp`).
+        for kind in c.trailer()? {
+            if !harmless_metadata(&kind) {
+                attrs.unmodeled.push(if kind.starts_with('#') {
+                    format!("the attribute group {kind}")
+                } else {
+                    format!("!{kind}")
+                });
+            }
+        }
+        if attrs != InstAttrs::default() {
+            inst.attrs = Some(Box::new(attrs));
+        }
         Ok((inst, result_ty))
     }
 }

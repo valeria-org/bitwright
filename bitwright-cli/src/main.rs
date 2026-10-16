@@ -40,26 +40,34 @@ commands:
         the rules (the built-in ones without a file) as Lean 4 theorems over BitVec, for every
         width, their proofs left as `sorry`; with `--at`, at the widest widths up to <n> each
         rule admits, proved by `bv_decide` (`lean rules.lean` checks them).
-  prove <file.opt> [--widths <w,...>] [--conflicts <n>]
+  prove <file.opt> [--widths <w,...>] [--conflicts <n>] [--max-types <n>] [--certify] [--smt]
         verify compiler transformations written as in the Alive paper (`Pre:`, source,
         `=>`, target): that each target refines its source under LLVM's semantics of
-        poison, undefined behavior and floating point, at every width (1 to 8, 16, 32, 64)
-        and format left open; a counterexample shows the inputs and each side's values as
-        LLVM IR constants. Exit 1 unless every transformation is valid.
-  infer <file.opt> [--widths <w,...>] [--conflicts <n>]
+        poison, undefined behavior and floating point, at each width (1 to 8, 16, 32, 64,
+        or --widths) and format left open, at most --max-types assignments (128; with more,
+        the verdict is unknown); valid is valid at those, not at every width. A
+        counterexample shows the inputs and each side's values as LLVM IR constants.
+        --certify accepts a proof only with a DRUP certificate an independent checker
+        verifies; --smt prints each assignment's final question as SMT-LIB instead (pipe it
+        to `z3 -in`: every answer of a valid transformation is unsat). Exit 1 unless every
+        transformation is valid.
+  infer <file.opt> [--widths <w,...>] [--conflicts <n>] [--max-types <n>] [--certify]
         infer a precondition over each transformation's symbolic constants (its own `Pre:` is
         ignored): the values where it is valid are learned as a formula over predicates
-        (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified at every
-        width. Exit 1 unless every transformation gets a verified precondition (or needs
+        (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified as `prove`
+        verifies. Exit 1 unless every transformation gets a verified precondition (or needs
         none).
   lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard] [--synth]
         read lifted code (Ghidra p-code, pyvex's VEX IR, or an LLVM IR function; guessed from
         the file's extension, .pcode, .vex, .ll, without --from) and print each register it
         writes, each store and each exit, deobfuscated as `simplify` does.
-  tv <src.ll> [<tgt.ll>] [--conflicts <n>]
+  tv <src.ll> [<tgt.ll>] [--conflicts <n>] [--max-types <n>] [--certify] [--smt]
         translation validation: that each function of the second file refines the function of
         the same name in the first (or @tgt refines @src of one file), for a subset of LLVM
-        IR (integers, floating point, acyclic control flow, the intrinsics bitwright knows).
+        IR (integers, floating point, acyclic control flow, the intrinsics bitwright knows),
+        each function with its own attributes. A function outside the subset (pointers,
+        memory, calls, attributes or metadata of the target it does not model) is reported
+        unsupported; the others are still checked.
         Exit 1 unless every pair is valid.
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
@@ -530,9 +538,21 @@ fn smt(rest: &[String]) -> Result<String, Fail> {
     }
 }
 
-/// The verifier's configuration from `--widths` and `--conflicts`.
+/// The verifier's configuration from `--widths`, `--conflicts`, `--max-types` and
+/// `--certify`.
 fn transform_config(a: &Args) -> Result<bitwright::transform::Config, Fail> {
     let mut cfg = bitwright::transform::Config::default();
+    if let Some(m) = a.value("max-types") {
+        let n = m
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| usage(format!("--max-types: {m} is not a positive number")))?;
+        cfg = cfg.with_max_types(n);
+    }
+    if a.flag("certify") {
+        cfg = cfg.with_certify(true);
+    }
     if let Some(ws) = a.value("widths") {
         let widths = ws
             .split(',')
@@ -575,17 +595,70 @@ fn reports(reports: Vec<bitwright::transform::Report>) -> Result<String, Fail> {
 }
 
 fn prove(rest: &[String]) -> Result<String, Fail> {
-    let a = Args::parse(rest, &["widths", "conflicts"], &[])?;
+    let a = Args::parse(
+        rest,
+        &["widths", "conflicts", "max-types", "certify", "smt"],
+        &["certify", "smt"],
+    )?;
     let path = a.one("transformation file")?;
     let src = read(path)?;
     let cfg = transform_config(&a)?;
     let ts = bitwright::transform::parse_transforms(&src)
         .map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+    if a.flag("smt") {
+        return smt_scripts(&ts, &cfg, String::new());
+    }
     reports(
         ts.iter()
             .map(|t| bitwright::transform::verify(t, &cfg))
             .collect(),
     )
+}
+
+/// Each transformation's final questions as SMT-LIB, one script per type assignment,
+/// separated by `(reset)`, after `out` (echoes already written). A transformation without
+/// them is echoed, so that a pipeline that expects only `unsat` sees it.
+fn smt_scripts(
+    ts: &[bitwright::transform::ir::Transform],
+    cfg: &bitwright::transform::Config,
+    mut out: String,
+) -> Result<String, Fail> {
+    let mut missing = usize::from(!out.is_empty());
+    let mut count = 0;
+    for t in ts {
+        match bitwright::transform::smt(t, cfg) {
+            Ok(scripts) => {
+                for (label, script) in scripts {
+                    let quoted = label.replace('"', "'");
+                    match script {
+                        Ok(script) => {
+                            writeln!(out, "(echo \"{quoted}\")").ok();
+                            out.push_str(&script);
+                            out.push_str("(reset)\n");
+                            count += 1;
+                        }
+                        Err(why) => {
+                            let why = why.replace('"', "'");
+                            writeln!(out, "(echo \"NO QUESTION {quoted}: {why}\")\n(reset)").ok();
+                            missing += 1;
+                        }
+                    }
+                }
+            }
+            Err(why) => {
+                let quoted = format!("{}: {why}", t.name).replace('"', "'");
+                writeln!(out, "(echo \"NO QUESTION {quoted}\")\n(reset)").ok();
+                missing += 1;
+            }
+        }
+    }
+    writeln!(out, "; {count} questions").ok();
+    if missing == 0 {
+        Ok(out)
+    } else {
+        writeln!(out, "; some transformations have no questions").ok();
+        Err(Fail::Report(out))
+    }
 }
 
 fn lift(rest: &[String]) -> Result<String, Fail> {
@@ -667,7 +740,11 @@ fn lift(rest: &[String]) -> Result<String, Fail> {
 
 fn infer(rest: &[String]) -> Result<String, Fail> {
     use bitwright::transform::Verdict;
-    let a = Args::parse(rest, &["widths", "conflicts"], &[])?;
+    let a = Args::parse(
+        rest,
+        &["widths", "conflicts", "max-types", "certify"],
+        &["certify"],
+    )?;
     let path = a.one("transformation file")?;
     let src = read(path)?;
     let cfg = transform_config(&a)?;
@@ -727,21 +804,37 @@ fn infer(rest: &[String]) -> Result<String, Fail> {
 }
 
 fn tv(rest: &[String]) -> Result<String, Fail> {
-    let a = Args::parse(rest, &["conflicts"], &[])?;
+    let a = Args::parse(
+        rest,
+        &["conflicts", "max-types", "certify", "smt"],
+        &["certify", "smt"],
+    )?;
     let (first, second) = match a.pos.as_slice() {
         [p] => (read(p)?, None),
         [p, q] => (read(p)?, Some(read(q)?)),
         _ => return Err(usage("expected one or two LLVM IR files")),
     };
     let cfg = transform_config(&a)?;
-    let pairs = bitwright::transform::pairs(&first, second.as_deref())
+    if a.flag("smt") {
+        // Each pair that reads; one that does not is echoed with its error.
+        let pairs = bitwright::transform::pairs_each(&first, second.as_deref())
+            .map_err(|e| Fail::Err(2, e.to_string()))?;
+        let mut ts = Vec::new();
+        let mut echoed = String::new();
+        for (name, t) in pairs {
+            match t {
+                Ok(t) => ts.push(t),
+                Err(e) => {
+                    let quoted = format!("{name}: {e}").replace('"', "'");
+                    writeln!(echoed, "(echo \"NO QUESTION {quoted}\")\n(reset)").ok();
+                }
+            }
+        }
+        return smt_scripts(&ts, &cfg, echoed);
+    }
+    let checked = bitwright::transform::validate(&first, second.as_deref(), &cfg)
         .map_err(|e| Fail::Err(2, e.to_string()))?;
-    reports(
-        pairs
-            .iter()
-            .map(|t| bitwright::transform::verify(t, &cfg))
-            .collect(),
-    )
+    reports(checked)
 }
 
 fn lean(rest: &[String]) -> Result<String, Fail> {

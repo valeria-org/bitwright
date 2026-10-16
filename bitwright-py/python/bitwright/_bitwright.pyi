@@ -587,7 +587,8 @@ def verify_transforms(
 def validate_functions(
     src: str, tgt: str | None = None, *, conflicts: int | None = None
 ) -> list[TransformReport]:
-    """Translation validation of LLVM IR functions."""
+    """Translation validation of LLVM IR functions: a report per function pair, one outside
+    the subset reported ``"unsupported"`` (the others still checked)."""
 
 def infer_preconditions(text: str) -> list[InferredPrecondition]:
     """Infers each transformation's precondition over its symbolic constants."""

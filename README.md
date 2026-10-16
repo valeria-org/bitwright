@@ -67,8 +67,12 @@ fn main() -> Result<(), bitwright::Error> {
   (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
 - **Verified compiler transformations**: peephole optimizations in the Alive syntax and pairs
   of LLVM IR functions are proved correct (refinement under LLVM's poison, undefined behavior
-  and floating-point semantics, every width left open) or refuted with a small counterexample,
-  and preconditions are inferred; by bitwright's own bit-blaster and SAT solver.
+  and floating-point semantics, at each width and format left open in a configurable set: 1
+  to 8, 16, 32 and 64 bits by default) or refuted with a small counterexample, and
+  preconditions are inferred; by bitwright's own bit-blaster and SAT solver, with DRUP
+  certificates checked on request and the final questions exported to SMT-LIB for any other
+  solver. What it reads but does not model (pointers, an unknown attribute of the target) is
+  refused, never ignored.
 - **Optional services**: MBA simplification (a native solver for linear, semi-linear and
   polynomial MBA, pluggable backends, and answers bitwright proves itself), a bounded
   equality-saturation search, and SMT-LIB export and import, so any SMT solver can prove a rule

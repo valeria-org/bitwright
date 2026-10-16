@@ -65,6 +65,20 @@ pub fn equivalence_query(cx: &mut Context, a: Expr, b: Expr) -> Result<String, E
     Ok(s)
 }
 
+/// A complete script asking whether the 1-bit `p` can be true: `unsat` from a solver proves
+/// it never is (so `\neg p` is valid); with `sat`, the model satisfies it, unless extension
+/// operations were declared as uninterpreted functions (see [`equivalence_query`]).
+pub fn satisfiability_query(cx: &mut Context, p: Expr) -> Result<String, Error> {
+    if cx.width(p)? != crate::Width::W1 {
+        return Err(Error::Unsupported("not a 1-bit predicate".into()));
+    }
+    let body = export::emit(cx, &[p])?;
+    let mut s = logic(&body);
+    s.push_str(&body);
+    s.push_str("(assert (= root0 #b1))\n(check-sat)\n");
+    Ok(s)
+}
+
 /// [`equivalence_query`] where the constraints of `assumptions` in `relied` hold: each is
 /// asserted, so `unsat` proves `a` and `b` equal wherever they hold. Pass the
 /// [`relies_on`](crate::engine::RootOutcome::relies_on) of a rewrite to check it independently

@@ -356,10 +356,12 @@ impl Pred {
     }
 }
 
-/// The atoms over constants with these types, and the negations that are not atoms already.
-fn vocabulary(types: &[Ty]) -> Vec<Pred> {
+/// The atoms over constants with these types, and the negations that are not atoms already
+/// (`one_type(i, j)`: constants `i` and `j` have one type at every assignment, so a binary
+/// atom may relate them).
+fn vocabulary(types: &[Ty], one_type: &dyn Fn(usize, usize) -> bool) -> Vec<Pred> {
     let mut out: Vec<Pred> = Vec::new();
-    for a in atoms(types) {
+    for a in atoms(types, one_type) {
         out.push(Pred {
             atom: a,
             neg: false,
@@ -387,8 +389,10 @@ fn vocabulary(types: &[Ty]) -> Vec<Pred> {
     out
 }
 
-/// The atoms over constants with these types.
-fn atoms(types: &[Ty]) -> Vec<Atom> {
+/// The atoms over constants with these types. Binary atoms relate constants of one type class
+/// only: two that merely have the same width at one assignment may not at another, where the
+/// atom means nothing (and a precondition relating them would force one type on them).
+fn atoms(types: &[Ty], one_type: &dyn Fn(usize, usize) -> bool) -> Vec<Atom> {
     let mut out = Vec::new();
     for (i, ty) in types.iter().enumerate() {
         if matches!(ty, Ty::Int(_)) {
@@ -397,7 +401,8 @@ fn atoms(types: &[Ty]) -> Vec<Atom> {
     }
     for i in 0..types.len() {
         for j in 0..types.len() {
-            if i == j || types[i] != types[j] || !matches!(types[i], Ty::Int(_)) {
+            if i == j || types[i] != types[j] || !matches!(types[i], Ty::Int(_)) || !one_type(i, j)
+            {
                 continue;
             }
             for &b in &BINARY {
@@ -597,7 +602,10 @@ pub fn infer(t: &Transform, cfg: &Config) -> Result<Inference, String> {
         });
     }
     let names: Vec<String> = base.consts.iter().map(|&c| base.label(c)).collect();
-    let all = typing(&base)?.assignments(&base, &cfg.widths, cfg.max_types)?;
+    let typed = typing(&base)?;
+    let (all, _) = typed.assignments(&base, &cfg.widths, cfg.max_types)?;
+    let consts = base.consts.clone();
+    let one_type = |i: usize, j: usize| typed.same_class(consts[i], consts[j]);
     // Sample at the smallest assignment with every constant at least 4 bits wide, and at 8.
     let wide_enough = |a: &Assignment, min: u16| {
         base.consts
@@ -639,7 +647,7 @@ pub fn infer(t: &Transform, cfg: &Config) -> Result<Inference, String> {
         .iter()
         .map(|&c| sample[0].types[c as usize])
         .collect();
-    let atoms = vocabulary(&const_types);
+    let atoms = vocabulary(&const_types, &one_type);
     let mut last: Option<Inference> = None;
     for _round in 0..4 {
         let (npos, nneg) = (

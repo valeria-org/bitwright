@@ -120,11 +120,20 @@ question is decided by counterexample-guided search over bitwright's own SAT sol
 candidate input that no source choice found so far answers, then a source choice that answers
 it or a proof that none does.
 
+An input is what a caller passes, and each program reads it through its own declarations:
+a target that adds `noundef` to a parameter has undefined behavior where a caller passes
+poison, and one that adds `range` or `nofpclass` sees poison where the argument is outside
+them, while the source's attributes never apply to the target. (A poison argument to a
+`noundef` parameter of the source is the source's undefined behavior, so such inputs need no
+answer.)
+
 The semantics come from LLVM's language reference: poison from `nsw`, `nuw`, `exact`,
-`disjoint`, `nneg`, `samesign` and `trunc`'s flags, from shifts past the width and from
-`select` on poison; undefined behavior from division by zero or by poison, `INT_MIN / -1`
-(a poison dividend included), a branch on poison, `unreachable`, a false `llvm.assume`, and
-returning poison from a `noundef` function.
+`disjoint`, `nneg`, `samesign` and `trunc`'s flags, from shifts past the width, from
+`select` on poison, and from `range` and `nofpclass` on parameters, return values and call
+sites; undefined behavior from division by zero or by poison, `INT_MIN / -1` (a poison
+dividend included), a branch on poison, `unreachable`, a false `llvm.assume`, a poison
+argument to a `noundef` parameter or call argument, returning poison from a `noundef`
+function or call, and returning anything but a `returned` parameter.
 
 ## Transformations
 
@@ -133,7 +142,10 @@ instructions, `=>`, and the target instructions. Registers the source reads with
 them are inputs; words in operands (`C`, `C1`) are symbolic constants, the same in both
 programs and never poison; operands may be constant expressions (`-C`, `C1 + C2`,
 `log2(C)`, `width(%x)`). Types may be omitted: they are inferred, and each width left open
-is checked in turn (1 to 8, 16, 32 and 64 bits; half, float and double), smallest first.
+is checked in turn (1 to 8, 16, 32 and 64 bits; half, float and double), smallest first, at
+most `Config::max_types` assignments (128, `--max-types`). A transformation with more is
+not decided: valid at the assignments checked is not valid, so the verdict is unknown until
+some types are given. Fast-math flags on a `select` or a `phi` make its type floating point.
 
 ```rust
 use bitwright::transform::{Config, Mismatch, Verdict, parse_transforms, verify};
@@ -193,15 +205,26 @@ the target is poison where the source is not
 ```
 
 and `freeze` repairs it (`%f = freeze %x`, `%r = and %c, %f`). The target may use the
-source's registers; those instructions stay in the target program.
+source's registers; those instructions stay in the target program. A source register that the
+target defines again must be refined as the result is, since the rewrite replaces it at its
+other uses too:
+
+```text
+INVALID      redefined intermediate
+the values of %a differ (i2)
+```
+
+for `%a = add %x, 1`, `%r = and %a, 0` rewritten to `%a = add %x, 2`, `%r = 0`.
 
 A counterexample lists the inputs and symbolic constants, then each named value of the source
 and of the target at those inputs, then the results. When the source makes choices (an `undef`,
 a `freeze`, a NaN), the source values shown are one of its executions, and none of its
 executions matches the target; the report says so on its last line.
 
-The precondition language has `&&`, `||`, `!`, signed comparisons (`<`, `<=`, …), unsigned
-ones (`u<`, `u<=`, …), and the predicates `isPowerOf2`, `isPowerOf2OrZero`, `isSignBit`,
+The precondition may name the source's registers as well as its inputs and constants
+(`MaskedValueIsZero(%a, 1)` with `%a = mul %x, %y` is about that product). Its language has
+`&&`, `||`, `!`, signed comparisons (`<`, `<=`, …), unsigned ones (`u<`, `u<=`, …), and the
+predicates `isPowerOf2`, `isPowerOf2OrZero`, `isSignBit`,
 `isMask`, `isShiftedMask`, `MaskedValueIsZero(%x, C)` and the `WillNotOverflow{Signed,Unsigned}{Add,Sub,Mul,Shl}`
 family, each read as what it states about the values. Constant expressions have `+ - * & | ^
 << >> u>> / /u %`, `~` and `-`, and the functions `abs`, `log2`, `width`, `trunc`, `zext`,
@@ -304,9 +327,16 @@ valid        bits
 ```
 
 clang made `@clamp` a `smax` and a `umin` with a `range(i32 0, 256)` return attribute, and
-`@bits` a single test of both bits. Attributes, metadata and declarations that the check
-does not need are skipped. To check one pass rather than a pipeline, run `opt` instead:
-`opt -passes=instcombine -S before.ll -o after.ll`.
+`@bits` a single test of both bits. Each function is checked with its own attributes: those
+that change what a value may be are read on parameters, return values and call sites
+(`noundef`, `range`, `nofpclass`, and `returned`, which clang infers), ABI attributes
+(`zeroext`, `signext`) change nothing, and declarations and debug metadata are skipped. An
+attribute or metadata that the target declares and that bitwright does not model (`!fpmath`,
+`!range`, a call's attribute group) makes the function unsupported, never silently ignored;
+so do pointers and memory, and a floating-point environment other than the default
+(`strictfp`, `"denormal-fp-math"` flushing, or relaxed-math attributes on the target). A
+function outside the subset is reported, and the others are still checked. To check one pass
+rather than a pipeline, run `opt` instead: `opt -passes=instcombine -S before.ll -o after.ll`.
 
 A wrong rewrite fails. Here `after.ll`'s `@avg` has `add nsw` in place of `add`:
 
@@ -397,8 +427,10 @@ bitwise, shift, comparison, conversion and `select` instruction with its flags, 
 `fshl`, `fshr`, the saturating additions and subtractions, `assume`, `fabs`, `copysign`,
 `sqrt`, `fma`, `fmuladd`, `minnum`, `maxnum`, `minimum`, `maximum`, `minimumnum`,
 `maximumnum`, `floor`, `ceil`, `trunc`, `round`, `roundeven`, `rint` and `nearbyint`; the
-attributes `noundef`, `range` and `nofpclass` on parameters and return values. Loops, memory
-and calls to other functions are outside it.
+attributes `noundef`, `range` and `nofpclass` on parameters, return values and call sites, and
+`returned`. Uses must be dominated by their definitions and phis have one entry per edge, as
+LLVM's verifier requires (a malformed function is a syntax error, not a proof). Loops,
+pointers, memory and calls to other functions are outside it.
 
 Branching on poison is undefined, selecting on it is not, so branches that merge into a
 `select` are a valid rewrite and the reverse is not. With both functions in `pair.ll`:
@@ -456,7 +488,9 @@ touch the sign. So `fadd %x, -0.0` is `%x` (a NaN result may be the operand itse
 `%x` is not `fmul %x, 1.0` (whose NaN sign is free). `frem` is `fmod`.
 
 Of the fast-math flags, `nnan` and `ninf` make NaNs and infinities among the operands and the
-result poison, and `nsz` lets zero operands flip sign (so `fadd nsz %x, 0.0` is `%x`). The
+result poison, and `nsz` makes the sign of a zero operand or of a zero result insignificant
+(so `fadd nsz %x, 0.0` is `%x`, and `fadd nsz 1.0, -1.0` may be `-0.0`: adding `nsz` to an
+instruction is not a refinement). The
 flags whose meaning is which rewrites are allowed, `reassoc`, `arcp`, `contract` and `afn`,
 are not modeled: a transformation that needs them is checked against exact IEEE semantics and
 reported invalid.
@@ -564,6 +598,31 @@ the values differ
 Only rewrites that are exact under IEEE semantics, given the flags `nnan`, `ninf` and `nsz`,
 are proved.
 
+## Trusting a verdict
+
+A verdict rests on bitwright's encoding of LLVM's semantics, its bit-blaster, and by default
+its simplifier and SAT solver. `--certify` (`Config::certify`) takes the last two out:
+every question is blasted as it is, and a proof counts only with a DRUP certificate that an
+independent checker verifies (slower; a certificate that does not check makes the verdict
+unknown). `bitwright prove --smt` and `bitwright tv --smt` (`transform::smt`, feature
+`smtlib`) print, for each type assignment, the final question the search answered, for
+another solver to confirm:
+
+```text
+$ bitwright prove --smt --widths 1,2,8 div.opt | z3 -in
+udiv by a power of two (i1)
+unsat
+udiv by a power of two (i2)
+unsat
+udiv by a power of two (i8)
+unsat
+```
+
+Every answer of a valid transformation is `unsat`; for an invalid one whose source makes no
+choices, the failing assignment's is `sat`. An assignment the search did not decide is echoed
+as `NO QUESTION` with the reason. The questions are bitwright's encoding, so a solver checks
+the solving, not the semantics.
+
 ## Limits
 
 - `undef` inputs are not modeled (inputs are values or poison). An `undef` in the source is a
@@ -573,7 +632,10 @@ are proved.
 - Wide multiplication and division, and double-precision arithmetic the two programs do
   differently, can exceed the SAT solver's budget (`--conflicts`): the verdict is then
   unknown, never valid.
-- A transformation is checked at 32 type assignments at most (`Config::max_types`).
+- A transformation is checked at 128 type assignments at most (`Config::max_types`); with
+  more, the verdict is unknown.
 - "Valid" is valid at each type assignment checked, not at every width: a rewrite that fails
   only at, say, 12 bits passes the default widths. Add such widths with `--widths`
   (`Config::widths`).
+- NaN payloads follow the language reference's choices without the target-specific extra
+  payloads (none on x86 and ARM).

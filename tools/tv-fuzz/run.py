@@ -30,16 +30,54 @@ def reports(text):
 
 
 def sample_args(f, rnd):
-    args = []
-    for (_, w, noundef) in f["params"]:
-        r = rnd.random()
-        if r < 0.1 and not noundef:
-            args.append(interp.POISON)
-        elif r < 0.5:
-            args.append(rnd.choice([0, 1, (1 << w) - 1, 1 << (w - 1), (1 << (w - 1)) - 1, 2, 3, 7, 8]) & ((1 << w) - 1))
-        else:
-            args.append(rnd.randrange(1 << w))
-    return args
+    return interp.random_args(f, rnd)
+
+
+def target_choices(block):
+    """The values the counterexample's target computed, by register (its freezes' choices
+    among them)."""
+    target = block.split("\ntarget:\n", 1)
+    if len(target) < 2:
+        return {}
+    out = {}
+    for m in re.finditer(r'(?m)^  (%[\w.]+) = i\d+ (\S+)$', target[1]):
+        v = m.group(2)
+        if v not in ("poison",):
+            out[m.group(1)] = int(v == "true") if v in ("true", "false") else int(v)
+    return out
+
+
+def confirmed(f, g, args, block, rnd, tries=300):
+    """Whether the counterexample holds in the interpreter: the target's execution with the
+    report's choices is matched by no execution of the source found (the source's one
+    execution, when it makes no choices)."""
+    t = interp.behaviors(g, args, rnd, chosen=target_choices(block))
+    trace = {}
+    s = interp.behaviors(f, args, rnd, trace=trace)
+    if interp.refines(s, t):
+        return False
+    if not trace.get("freeze"):
+        return True
+    return not any(interp.refines(interp.behaviors(f, args, rnd), t) for _ in range(tries))
+
+
+def refinement_sample(f, g, args, rnd, tries=300):
+    """Whether the target `g` refines the source `f` at `args`, by sampling: None when it
+    does, "inconclusive" when a nondeterministic source might match with choices not found,
+    else the failing behaviors. Freezing a poison parameter gives one value in both programs
+    (a choice each may make); a mismatch then searches the source's other choices."""
+    frozen = [rnd.randrange(1 << p["w"]) for p in f["params"]]
+    by_name = lambda h: {p["name"]: v for p, v in zip(h["params"], frozen)}
+    trace = {}
+    t = interp.behaviors(g, args, rnd, by_name(g))
+    s = interp.behaviors(f, args, rnd, by_name(f), trace)
+    if interp.refines(s, t):
+        return None
+    if not trace.get("freeze"):
+        return f"{s} then {t}"
+    if any(interp.refines(interp.behaviors(f, args, rnd), t) for _ in range(tries)):
+        return None
+    return "inconclusive"
 
 
 def main():
@@ -53,12 +91,13 @@ def main():
     a = ap.parse_args()
     gen = os.path.join(HERE, "gen_float.py" if a.float else "gen_int.py")
     stats = dict(original_valid=0, original_invalid=0, undecided=0, mutants_valid=0,
-                 mutants_invalid=0, unconfirmed=0, unsound=0)
+                 mutants_invalid=0, mutants_undecided=0, unconfirmed=0, unsound=0,
+                 inconclusive=0)
     with tempfile.TemporaryDirectory() as d:
         for seed in range(1, a.seeds + 1):
             src, out, mut = (os.path.join(d, n) for n in ("in.ll", "out.ll", "mut.ll"))
             with open(src, "w") as fh:
-                fh.write(sh(["python3", gen, str(seed), str(a.functions)]).stdout)
+                fh.write(sh([sys.executable, gen, str(seed), str(a.functions)]).stdout)
             r = sh([a.clang, "-x", "ir", "-O2", "-S", "-emit-llvm", src, "-o", out])
             if r.returncode:
                 sys.exit(r.stderr)
@@ -74,7 +113,7 @@ def main():
                 continue
             fsrc = interp.parse(open(src).read())
             for m in range(3):
-                sh(["python3", os.path.join(HERE, "mutate.py"), str(100 * seed + m), out, mut,
+                sh([sys.executable, os.path.join(HERE, "mutate.py"), str(100 * seed + m), out, mut,
                     os.path.join(d, "mut.log")])
                 ftgt = interp.parse(open(mut).read())
                 rnd = random.Random(seed * 7 + m)
@@ -86,23 +125,26 @@ def main():
                         stats["mutants_valid"] += 1
                         for _ in range(a.samples):
                             args = sample_args(f, rnd)
-                            s, t = interp.behaviors(f, args, rnd), interp.behaviors(g, args, rnd)
-                            if not interp.refines(s, t):
+                            verdict = refinement_sample(f, g, args, rnd)
+                            if verdict == "inconclusive":
+                                stats["inconclusive"] += 1
+                            elif verdict is not None:
                                 stats["unsound"] += 1
-                                print(f"seed {seed}/{m} {name}: judged valid, but {args}: {s} then {t}")
+                                print(f"seed {seed}/{m} {name}: judged valid, but {args}: {verdict}")
                                 break
                     elif verdict == "INVALID":
                         stats["mutants_invalid"] += 1
                         args = []
-                        for (p, w, _) in f["params"]:
+                        for prm in f["params"]:
+                            p, w = prm["name"], prm["w"]
                             v = re.search(r'^\s+' + re.escape(p) + r' = i\d+ (\S+)', block, re.M).group(1)
                             args.append(interp.POISON if v == "poison" else
                                         int(v == "true") if v in ("true", "false") else int(v) & ((1 << w) - 1))
-                        # The target's freeze choices are random: a few tries.
-                        if not any(not interp.refines(interp.behaviors(f, args, rnd), interp.behaviors(g, args, rnd))
-                                   for _ in range(30)):
+                        if not confirmed(f, g, args, block, rnd):
                             stats["unconfirmed"] += 1
                             print(f"seed {seed}/{m} {name}: counterexample not confirmed\n{block}")
+                    else:
+                        stats["mutants_undecided"] += 1
     print(stats)
     bad = stats["original_invalid"] + stats["unconfirmed"] + stats["unsound"]
     sys.exit(1 if bad else 0)

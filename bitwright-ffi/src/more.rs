@@ -429,12 +429,8 @@ pub unsafe extern "C" fn bw_transform_validate(
             Some(unsafe { text(tgt, "tgt") }?)
         };
         let (report, counts) = (Out::new(report, "report")?, Out::new(counts, "counts")?);
-        let pairs = bw::transform::pairs(src, tgt).map_err(syntax)?;
         let cfg = config(conflicts);
-        let reports: Vec<_> = pairs
-            .iter()
-            .map(|t| bw::transform::verify(t, &cfg))
-            .collect();
+        let reports = bw::transform::validate(src, tgt, &cfg).map_err(syntax)?;
         let (s, c) = tally(&reports);
         unsafe {
             report.set(give(s));

@@ -116,12 +116,9 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
         }
         VALIDATE => {
             let tgt = (!b.is_empty()).then_some(b);
-            let pairs = bw::transform::pairs(a, tgt).map_err(|e| e.to_string())?;
             let cfg = bw::transform::Config::default();
-            Ok(pairs
-                .iter()
-                .map(|t| bw::transform::verify(t, &cfg).to_string())
-                .collect())
+            let reports = bw::transform::validate(a, tgt, &cfg).map_err(|e| e.to_string())?;
+            Ok(reports.iter().map(ToString::to_string).collect())
         }
         INFER => {
             let ts = bw::transform::parse_transforms(a).map_err(|e| e.to_string())?;

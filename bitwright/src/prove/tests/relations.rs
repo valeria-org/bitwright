@@ -205,6 +205,8 @@ fn large_signed_equality_components_retain_checked_models_and_proof_prefixes() {
     let mut question = Question::valid(&mut cx, claim, &raw()).unwrap();
     assert!(question.stats().learned > 0);
     let search = question.search.as_ref().unwrap();
+    // Every lemma preprocessing offered was confirmed by propagation.
+    assert_eq!(search.solver.rejected_lemmas, 0);
     drup::check_prefix(&search.cnf.clauses, search.solver.proof_steps().unwrap()).unwrap();
     let Outcome::Refuted(model) = question.solve(&mut cx, Limits::conflicts(100)).unwrap() else {
         panic!("a long acyclic signed equality chain is satisfiable");
@@ -233,6 +235,8 @@ fn root_conditioned_aliases_have_checked_proof_prefixes_without_extra_premises()
         let claim = cx.ne(combined, target).unwrap();
         let mut question = Question::valid(&mut cx, claim, &raw()).unwrap();
         let search = question.search.as_ref().unwrap();
+        // Every lemma preprocessing offered was confirmed by propagation.
+        assert_eq!(search.solver.rejected_lemmas, 0);
         assert!(search.solver.num_learnts() > 0);
         let proof = search.solver.proof_steps().unwrap();
         assert!(!proof.is_empty());
@@ -268,6 +272,8 @@ fn contradictory_masked_parity_cycles_prove_without_sat_conflicts() {
             let cfg = raw().with_relational_lemmas(lemmas);
             let mut question = Question::valid(&mut cx, claim, &cfg).unwrap();
             let search = question.search.as_ref().unwrap();
+            // Every lemma preprocessing offered was confirmed by propagation.
+            assert_eq!(search.solver.rejected_lemmas, 0);
             drup::check_prefix(&search.cnf.clauses, search.solver.proof_steps().unwrap()).unwrap();
             let Outcome::Proved(Some(cert)) =
                 question.solve(&mut cx, Limits::conflicts(0)).unwrap()
@@ -294,6 +300,8 @@ fn one_bits_of_or_targets_require_coverage_instead_of_forcing_each_term() {
     let mut question = Question::valid(&mut cx, claim, &raw()).unwrap();
     assert_eq!(question.stats().learned, 0);
     let search = question.search.as_ref().unwrap();
+    // Every lemma preprocessing offered was confirmed by propagation.
+    assert_eq!(search.solver.rejected_lemmas, 0);
     drup::check_prefix(&search.cnf.clauses, search.solver.proof_steps().unwrap()).unwrap();
     let Outcome::Refuted(model) = question.solve(&mut cx, Limits::conflicts(100)).unwrap() else {
         panic!("coverage can be satisfied")
@@ -398,6 +406,8 @@ fn signed_relations_agree_with_brute_force_and_all_derivations_check() {
             let mut question =
                 Question::valid(&mut cx, claim, &raw().with_relational_lemmas(lemmas)).unwrap();
             let search = question.search.as_ref().unwrap();
+            // Every lemma preprocessing offered was confirmed by propagation.
+            assert_eq!(search.solver.rejected_lemmas, 0);
             drup::check_prefix(&search.cnf.clauses, search.solver.proof_steps().unwrap()).unwrap();
             match question.solve(&mut cx, Limits::conflicts(100)).unwrap() {
                 Outcome::Refuted(model) => {

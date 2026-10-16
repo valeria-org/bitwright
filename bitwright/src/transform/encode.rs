@@ -5,7 +5,7 @@
 //! zero's sign under `nsz`, `llvm.fmuladd` fusing or not) is a fresh leaf whose allowed values
 //! are stated by a validity condition.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ir::{
     Body, CFun, FPred, IPred, Intrinsic, Lit, Node, NodeId, Op, PFun, Term, Transform, Ty, flags,
@@ -61,6 +61,8 @@ pub(crate) enum Purpose {
 pub(crate) struct Side {
     /// Its result: value and poison flag (`None` for a function returning `void`).
     pub(crate) result: Option<(Expr, Expr)>,
+    /// The values of [`Body::matched`], in order.
+    pub(crate) matched: Vec<(Expr, Expr)>,
     /// Its undefined behavior.
     pub(crate) ub: Expr,
     /// Whether the choices are allowed ones.
@@ -99,6 +101,8 @@ pub(crate) struct Enc<'a> {
     ub: Expr,
     reach: Expr,
     memo: HashMap<NodeId, (Expr, Expr)>,
+    /// Instructions being encoded (one met again depends on itself).
+    active: HashSet<NodeId>,
     input_index: HashMap<NodeId, usize>,
     const_index: HashMap<NodeId, usize>,
     values: Vec<(NodeId, Expr, Expr)>,
@@ -136,6 +140,7 @@ impl<'a> Enc<'a> {
             ub: fls,
             reach: tru,
             memo: HashMap::new(),
+            active: HashSet::new(),
             input_index: t.inputs.iter().enumerate().map(|(i, &n)| (n, i)).collect(),
             const_index: t.consts.iter().enumerate().map(|(i, &n)| (n, i)).collect(),
             values: Vec::new(),
@@ -417,11 +422,16 @@ impl<'a> Enc<'a> {
         self.cx.select(c, n, x)
     }
 
-    /// The result `r` of an `nsz` operation whose zero operands (`when`) flipping would only
-    /// flip the result's sign: flipped, by one choice about `r`. For `a ± b` that is when
-    /// both are zeros; for `a · b`, `a / b`, when either is (a zero or an infinite result);
-    /// for one-operand operations and `fmod`, when the (first) operand is.
+    /// The result `r` of an `nsz` operation, its sign free where LangRef makes it
+    /// insignificant: where `r` is a zero ("the sign of a zero result"), and where zero
+    /// operands (`when`) flipping would only flip the result's sign ("of a zero argument").
+    /// For `a ± b` that is when both are zeros; for `a · b`, `a / b`, when either is (a zero
+    /// or an infinite result); for one-operand operations and `fmod`, when the (first)
+    /// operand is. One choice about `r` flips it.
     fn nsz_out(&mut self, f: FpFormat, r: Expr, when: Expr) -> Result<Expr, Error> {
+        // And whenever the result is a zero: its sign is insignificant too.
+        let zero = self.test(f, FpTest::Zero, r)?;
+        let when = self.or(when, zero)?;
         let flip = self.choice(1, Some((Purpose::ZeroSign, r)))?;
         let c = self.and(when, flip)?;
         let n = self.cx.fp_neg(f, r)?;
@@ -488,7 +498,12 @@ impl<'a> Enc<'a> {
                         t.label(n)
                     )));
                 }
-                let v = self.inst(n)?;
+                if !self.active.insert(n) {
+                    return Err(unsupported(format!("{} depends on itself", t.label(n))));
+                }
+                let v = self.inst(n);
+                self.active.remove(&n);
+                let v = v?;
                 self.values.push((n, v.0, v.1));
                 v
             }
@@ -856,6 +871,9 @@ impl<'a> Enc<'a> {
                 Ok((v, p))
             }
             Op::BitCast | Op::Copy => Ok((vs[0], ps[0])),
+            Op::Gep(_) | Op::Alloca | Op::Resize if self.mem.is_none() => {
+                Err(unsupported("pointers and memory (read only when lifting)"))
+            }
             Op::Resize => {
                 let bits = self.int_bits(n)?;
                 let from = self.cx.width(vs[0])?.bits();
@@ -1047,7 +1065,37 @@ impl<'a> Enc<'a> {
                 p = self.or(p, fp)?;
                 Ok((r, p))
             }
-            Op::Call(i) => self.intrinsic(n, i, fl, &vs, &ps),
+            Op::Call(i) => {
+                // Call-site attributes: an argument out of its `range` or `nofpclass` is
+                // poison, a poison `noundef` argument undefined behavior; likewise the result.
+                let attrs = inst.attrs.as_deref();
+                let mut ps = ps;
+                if let Some(a) = attrs {
+                    for (k, pa) in a.args.iter().enumerate() {
+                        let (Some(&v), Some(&x)) = (vs.get(k), inst.args.get(k)) else {
+                            continue;
+                        };
+                        let ty = self.ty(x);
+                        let extra = self.constrained(ty, v, pa.range.as_ref(), pa.nofpclass)?;
+                        ps[k] = self.or(ps[k], extra)?;
+                        if pa.noundef {
+                            self.add_ub(ps[k])?;
+                        }
+                    }
+                }
+                let (v, mut p) = self.intrinsic(n, i, fl, &vs, &ps)?;
+                if let Some(a) = attrs
+                    && i != Intrinsic::Assume
+                {
+                    let r = &a.result;
+                    let extra = self.constrained(self.ty(n), v, r.range.as_ref(), r.nofpclass)?;
+                    p = self.or(p, extra)?;
+                    if r.noundef {
+                        self.add_ub(p)?;
+                    }
+                }
+                Ok((v, p))
+            }
             Op::Phi => unreachable!("phis are encoded with their block"),
         }
     }
@@ -1261,19 +1309,6 @@ impl<'a> Enc<'a> {
                     }
                     _ => {}
                 }
-                if fl & flags::NSZ != 0 {
-                    // Zeros of different signs: either one.
-                    let za = self.test(f, FpTest::Zero, a[0])?;
-                    let zb = self.test(f, FpTest::Zero, a[1])?;
-                    let (sa, sb) = (self.msb(a[0])?, self.msb(a[1])?);
-                    let both = self.and(za, zb)?;
-                    let differ = self.ne(sa, sb)?;
-                    let mixed = self.and(both, differ)?;
-                    let c = self.choice(1, Some((Purpose::ZeroSign, r)))?;
-                    let flip = self.and(mixed, c)?;
-                    let nr = self.cx.fp_neg(f, r)?;
-                    r = self.cx.select(flip, nr, r)?;
-                }
                 self.nan_result(f, r, &ins)?
             }
             Intrinsic::Floor
@@ -1298,6 +1333,9 @@ impl<'a> Enc<'a> {
         };
         let mut r = r;
         if fl & flags::NSZ != 0 {
+            // A zero result's sign is free for every operation (zeros of different signs
+            // for `minnum` and the like, `fabs` of a zero, a fused product that cancels);
+            // besides, the sign of a zero operand where it would flip the result.
             let when = match i {
                 Intrinsic::Sqrt
                 | Intrinsic::Floor
@@ -1306,13 +1344,11 @@ impl<'a> Enc<'a> {
                 | Intrinsic::Round
                 | Intrinsic::RoundEven
                 | Intrinsic::Rint
-                | Intrinsic::NearbyInt => Some(self.test(f, FpTest::Zero, a[0])?),
-                Intrinsic::CopySign => Some(self.test(f, FpTest::Zero, a[1])?),
-                _ => None,
+                | Intrinsic::NearbyInt => self.test(f, FpTest::Zero, a[0])?,
+                Intrinsic::CopySign => self.test(f, FpTest::Zero, a[1])?,
+                _ => self.fls,
             };
-            if let Some(when) = when {
-                r = self.nsz_out(f, r, when)?;
-            }
+            r = self.nsz_out(f, r, when)?;
         }
         let mut all = a.clone();
         all.push(r);
@@ -1385,6 +1421,21 @@ impl<'a> Enc<'a> {
 
     /// Encodes a program (with the precondition, for the source).
     pub(crate) fn body(mut self, body: &Body, with_pre: bool) -> Result<Side, Error> {
+        // The inputs as this program sees them, through its own attributes: out of a `range`
+        // or in a `nofpclass` class, poison; poison where `noundef` is declared, undefined
+        // behavior at the call, whether the program reads it or not.
+        for (i, a) in body.params.iter().enumerate() {
+            let Some(&n) = self.t.inputs.get(i) else {
+                break;
+            };
+            let (v, p) = self.leaves.inputs[i];
+            let extra = self.constrained(self.ty(n), v, a.range.as_ref(), a.nofpclass)?;
+            let p = self.or(p, extra)?;
+            if a.noundef {
+                self.ub = self.or(self.ub, p)?;
+            }
+            self.memo.insert(n, (v, p));
+        }
         let pre = match self.t.pre {
             Some(p) if with_pre => self.val(p)?.0,
             _ => self.tru,
@@ -1431,11 +1482,30 @@ impl<'a> Enc<'a> {
                 Term::None => {}
                 Term::Ret(v) => {
                     if let Some(v) = v {
-                        let (x, mut px) = self.val(*v)?;
+                        let (x, returned) = self.val(*v)?;
+                        // A `returned` parameter: returning anything but that argument (both
+                        // poison, or both the same value, before the return value's own
+                        // attributes apply) is undefined behavior.
+                        for (i, a) in body.params.iter().enumerate() {
+                            if !a.returned {
+                                continue;
+                            }
+                            let n = self.t.inputs[i];
+                            let (y, py) = self.val(n)?;
+                            if self.cx.width(y)? != self.cx.width(x)? {
+                                return Err(unsupported("a `returned` parameter of another type"));
+                            }
+                            let same_p = self.eq(returned, py)?;
+                            let same_v = self.eq(x, y)?;
+                            let either = self.or(py, same_v)?;
+                            let same = self.and(same_p, either)?;
+                            let differs = self.not(same)?;
+                            self.add_ub(differs)?;
+                        }
                         let ty = self.ty(*v);
                         let extra =
                             self.constrained(ty, x, body.ret_range.as_ref(), body.ret_nofpclass)?;
-                        px = self.or(px, extra)?;
+                        let px = self.or(returned, extra)?;
                         if body.ret_noundef {
                             self.add_ub(px)?;
                         }
@@ -1490,8 +1560,14 @@ impl<'a> Enc<'a> {
             self.reach = self.tru;
             result = Some(self.val(root)?);
         }
+        let mut matched = Vec::with_capacity(body.matched.len());
+        for &(_, n) in &body.matched {
+            self.reach = self.tru;
+            matched.push(self.val(n)?);
+        }
         Ok(Side {
             result,
+            matched,
             ub: self.ub,
             valid: self.valid,
             choices: self.widths,

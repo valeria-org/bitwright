@@ -157,6 +157,9 @@ pub struct Solver {
     next_reduce: u64,
     /// Learned clauses not deleted.
     learnts: usize,
+    /// Lemmas offered by preprocessing as RUP consequences that unit propagation did not
+    /// confirm, so they were not added.
+    pub(super) rejected_lemmas: u64,
     /// Conflicts so far.
     pub conflicts: u64,
     /// Decisions so far.
@@ -210,6 +213,7 @@ impl Solver {
             here: 0,
             next_reduce: 2000,
             learnts: 0,
+            rejected_lemmas: 0,
             conflicts: 0,
             decisions: 0,
             propagations: 0,
@@ -297,7 +301,17 @@ impl Solver {
 
     /// A RUP consequence established by native preprocessing, logged as a proof step rather
     /// than admitted as an additional premise. Binary consequences are retained glue clauses.
+    /// The claim is checked first, by the solver's own unit propagation: a lemma it does not
+    /// confirm is dropped (and counted), so a mistake in the preprocessing that offers it can
+    /// cost a deduction but never decide a question wrongly, with or without a certificate.
     pub(super) fn add_rup_clause(&mut self, lits: &[Lit]) -> bool {
+        if self.unsat {
+            return false;
+        }
+        if !self.follows_by_propagation(lits) {
+            self.rejected_lemmas += 1;
+            return !self.unsat;
+        }
         if self.unsat {
             return false;
         }
@@ -305,6 +319,55 @@ impl Solver {
             proof.push(Step::Add(lits.to_vec()));
         }
         self.add_incoming_clause(lits, true, None)
+    }
+
+    /// Whether `lits` follows from the clauses by reverse unit propagation: at the top level,
+    /// with every literal of it false, propagation meets a conflict. (A conflict at the top
+    /// level alone makes the formula unsatisfiable, which is recorded.)
+    fn follows_by_propagation(&mut self, lits: &[Lit]) -> bool {
+        self.cancel_until(0);
+        for &l in lits {
+            while l.var() >= self.num_vars() {
+                self.new_var();
+            }
+        }
+        if self.propagate().is_some() {
+            self.unsat = true;
+            if let Some(p) = &mut self.proof {
+                p.push(Step::Add(Vec::new()));
+            }
+            return true;
+        }
+        if lits.iter().any(|&l| self.value(l) == Value::True) {
+            return true;
+        }
+        let mark = self.trail.len();
+        self.trail_lim.push(mark);
+        let mut conflict = false;
+        for &l in lits {
+            match self.value(l) {
+                Value::Unset => self.assign(!l, None),
+                Value::False => {}
+                // A tautology: its negation is contradictory.
+                Value::True => {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+        if !conflict {
+            conflict = self.propagate().is_some();
+        }
+        // Undone without a trace: the phases the search saved stay as they were.
+        let saved: Vec<(usize, bool)> = self.trail[mark..]
+            .iter()
+            .map(|l| (l.var() as usize, self.phase[l.var() as usize]))
+            .collect();
+        self.cancel_until(0);
+        for (v, phase) in saved {
+            self.phase[v] = phase;
+        }
+        conflict
     }
 
     #[cfg(test)]
@@ -1001,6 +1064,43 @@ impl Heap {
         }
         self.heap[i] = v;
         self.index[v as usize] = i as i64;
+    }
+}
+
+#[cfg(test)]
+mod lemma_tests {
+    use super::*;
+
+    #[test]
+    fn a_lemma_is_added_only_when_propagation_confirms_it() {
+        let mut s = Solver::new();
+        s.log_proof();
+        let (a, b, c) = (s.new_var(), s.new_var(), s.new_var());
+        // a = b and b = c.
+        for (x, y) in [(a, b), (b, c)] {
+            assert!(s.add_clause(&[Lit::neg(x), Lit::pos(y)]));
+            assert!(s.add_clause(&[Lit::pos(x), Lit::neg(y)]));
+        }
+        // a = c follows by unit propagation: kept, and logged as a proof step.
+        assert!(s.add_rup_clause(&[Lit::neg(a), Lit::pos(c)]));
+        assert_eq!(s.rejected_lemmas, 0);
+        let logged = s.proof_steps().unwrap().len();
+        // a != c does not follow (and is false): dropped, not logged, the formula intact.
+        assert!(s.add_rup_clause(&[Lit::neg(a), Lit::neg(c)]));
+        assert_eq!(s.rejected_lemmas, 1);
+        assert_eq!(s.proof_steps().unwrap().len(), logged);
+        assert!(s.add_clause(&[Lit::pos(a)]));
+        assert!(matches!(s.solve(1000), Answer::Sat(_)));
+    }
+
+    #[test]
+    fn a_tautology_or_a_satisfied_lemma_follows() {
+        let mut s = Solver::new();
+        let (a, b) = (s.new_var(), s.new_var());
+        assert!(s.add_clause(&[Lit::pos(a)]));
+        assert!(s.add_rup_clause(&[Lit::pos(b), Lit::neg(b)]));
+        assert!(s.add_rup_clause(&[Lit::pos(a), Lit::pos(b)]));
+        assert_eq!(s.rejected_lemmas, 0);
     }
 }
 

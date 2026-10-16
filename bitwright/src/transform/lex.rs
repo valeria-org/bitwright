@@ -286,6 +286,51 @@ impl<'t> Cursor<'t> {
         }
     }
 
+    /// The end of an instruction: nothing left but a call site's attribute groups (`#3`) and
+    /// metadata attachments (`, !dbg !7`, `, !range !{i32 0, i32 8}`), whose names it returns
+    /// (`#3`, `dbg`, `range`) for the caller to sort out.
+    pub(crate) fn trailer(&mut self) -> Result<Vec<String>, SyntaxError> {
+        let mut out = Vec::new();
+        while self.eat("#") {
+            match self.next() {
+                Some(Tok::Num(n)) => out.push(format!("#{n}")),
+                _ => return self.err("expected an attribute group after `#`"),
+            }
+        }
+        while self.eat(",") {
+            if !self.eat("!") {
+                return self.err("expected metadata after `,`");
+            }
+            let kind = match self.next() {
+                Some(Tok::Ident(k)) => k.clone(),
+                _ => return self.err("expected a metadata kind after `!`"),
+            };
+            if !self.eat("!") {
+                return self.err(format!("expected the node of `!{kind}`"));
+            }
+            match self.next() {
+                Some(Tok::Num(_) | Tok::Str(_) | Tok::Ident(_)) => {}
+                Some(Tok::P("{")) => {
+                    let mut depth = 1;
+                    while depth > 0 {
+                        match self.next() {
+                            Some(Tok::P("{")) => depth += 1,
+                            Some(Tok::P("}")) => depth -= 1,
+                            None => return self.err("unbalanced braces in metadata"),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return self.err(format!("expected the node of `!{kind}`")),
+            }
+            out.push(kind);
+        }
+        match self.peek() {
+            None => Ok(out),
+            Some(t) => self.err(format!("unexpected `{t}`")),
+        }
+    }
+
     pub(crate) fn expect(&mut self, p: &str) -> Result<(), SyntaxError> {
         if self.eat(p) {
             Ok(())

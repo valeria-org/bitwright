@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.16.0
+
+- **Each program's own attributes:** translation validation reads each function's parameter
+  attributes for that function only (`Body::params`, `ir::ParamAttrs`). A target that adds
+  `noundef`, `range` or `nofpclass` to a parameter was checked as if it had not, and judged
+  valid; it now has undefined behavior (`noundef`, even on an unused parameter) or poison
+  where it should. The source's attributes no longer reach the target either, which removes
+  false alarms (an argument outside the source's `range` is a value to the target).
+- **Call sites:** `noundef`, `range` and `nofpclass` on a call's arguments and result are
+  modeled (`ir::InstAttrs`), including the `range` clang writes on `ctpop`, `ctlz` and `cttz`,
+  which made a whole module unreadable before. `returned` on parameters is modeled: returning
+  another value is undefined behavior.
+- **Nothing silently ignored:** pointers and memory (`ptr`, `getelementptr`, `inttoptr`, …),
+  which the verifier read as plain 64-bit integers (provenance and `inbounds` lost), are
+  refused; so are an attribute or metadata a target declares that bitwright does not model
+  (`!fpmath`, `!range`, call attribute groups, unknown parameter attributes), and a
+  floating-point environment other than the default (`strictfp`, denormal flushing, relaxed
+  math attributes on the target), read through attribute groups.
+- **`undef` in functions:** the guard against an `undef`-derived value used twice in the
+  target (or branched on) followed operands in arena order, which the function syntax does
+  not keep, so it never fired for `tv`; it now propagates to a fixed point.
+- **`nsz`:** the sign of a zero *result* is insignificant too, as the language reference says
+  (`fadd nsz 1.0, -1.0` may be `-0.0`), for every operation, intrinsics included. Adding `nsz`
+  to an instruction was judged valid where a zero comes from nonzero operands.
+- **Redefined registers:** a source register that a transformation's target defines again
+  must be refined as the root is (it replaces the register at its other uses), as in Alive.
+  `Body::matched`; a counterexample names the register (`Counterexample::output`).
+- **Type assignments:** more than `Config::max_types` (now 128, was 32) leave the verdict
+  unknown instead of valid at the ones checked (`Report::unchecked`). A cast between two open
+  types never reached i32 or i64 before. Fast-math flags on a `select` or `phi` make its type
+  floating point (an untyped `select nnan` was only checked over integers).
+- **Malformed functions:** an empty block was read as `unreachable` (a source with one proved
+  anything on that path); uses not dominated by their definitions and a value read in its own
+  definition (which overflowed the stack) were accepted; phis without an entry per edge too.
+  Each is now a syntax error with its line, as LLVM's verifier would reject it.
+- **One function at a time:** `transform::validate` and `pairs_each` read each function pair
+  on its own; `bitwright tv` and the C, Python and JavaScript bindings report a function
+  outside the subset as unsupported and check the others (`pairs` stays strict).
+- **Inference:** a binary atom relates two constants only when they have one type at every
+  assignment; examples of two widths no longer panic, and preconditions no longer force a
+  type on constants.
+- **Preconditions over the source's registers:** `Pre:` is read after the source, so it may
+  name its registers (it named a fresh input of the same name before).
+- **What a verdict rests on:** `Config::certify` (`--certify`) accepts a proof only with a DRUP
+  certificate the independent checker verifies, every question blasted without the
+  simplifier. `transform::smt` (`--smt`, feature `smtlib`) writes each type assignment's final
+  question as SMT-LIB for another solver (`smtlib::satisfiability_query` builds such scripts).
+  The SAT solver checks each lemma its preprocessing offers by unit propagation before adding
+  it, so a preprocessing mistake cannot decide a question, with or without a certificate.
+- **Command line:** `prove`, `tv` and `infer` take `--max-types` and `--certify`; `prove` and
+  `tv` take `--smt`. The help no longer says "every width".
+- **Fuzzing:** `tools/tv-fuzz` generates control flow (diamonds with phis), `freeze` and
+  `ctpop`; mutants add poison flags, parameter, return and call-site attributes and swap phi
+  entries; the interpreter reads attributes, phis and switches and replays a counterexample's
+  choices; nondeterministic samples it cannot settle are counted apart, not as unsound.
+
+### Behavior changes
+
+- Transformations judged valid before may now be invalid (attributes a target adds, `nsz`
+  added, a redefined register that does not refine), unsupported (pointers, memory, an
+  unmodeled attribute or metadata of the target, a non-default floating-point environment,
+  an `undef`-derived value used twice in a function), or unknown (more type assignments than
+  `max_types`).
+- Some judged invalid before may now be valid: the source's parameter attributes no longer
+  apply to the target, and a source with `noundef` and `range` has undefined behavior outside
+  the range.
+- Transformations with two open types check up to 128 assignments instead of 32, which takes
+  longer; `bitwright tv` reports a function with a syntax error as unsupported instead of
+  failing the whole run, and so do the bindings' translation validation.
+- `transform::Report` gains `unchecked`, `Counterexample` gains `output`, `ir::Inst` gains
+  `attrs`, `ir::Body` gains `matched` and `params`, `ir::Transform` gains `pointers`,
+  `unsupported` and `float_env`, and `Config` gains `certify`.
+
 ## 0.15.0
 
 - **Repeated evaluation:** `Context::eval` caches the most recent nonempty root set,

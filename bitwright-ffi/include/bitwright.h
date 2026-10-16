@@ -820,7 +820,10 @@ bw_status bw_transform_verify(const char *text, uint64_t conflicts, char **repor
                               bw_transform_counts *counts);
 
 /* Translation validation: each function of `tgt` against the function of the same name in
- * `src`, or, with `tgt` NULL, `@tgt` against `@src` of one module. */
+ * `src`, or, with `tgt` NULL, `@tgt` against `@src` of one module. A function outside the
+ * subset (pointers, memory, an attribute of the target bitwright does not model) is reported
+ * unsupported and counted undecided; the others are still checked. BW_ERR_SYNTAX is for the
+ * modules themselves (no function in both, an unclosed function). */
 bw_status bw_transform_validate(const char *src, const char *tgt, uint64_t conflicts,
                                 char **report, bw_transform_counts *counts);
 

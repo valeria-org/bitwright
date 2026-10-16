@@ -416,14 +416,11 @@ pub(super) fn validate_functions(
     tgt: Option<&str>,
     conflicts: Option<u64>,
 ) -> PyResult<Vec<TransformReport>> {
-    let pairs = bitwright::transform::pairs(src, tgt).map_err(syntax)?;
     let cfg = transform_config(None, conflicts);
-    Ok(py.detach(|| {
-        pairs
-            .iter()
-            .map(|t| report(&bitwright::transform::verify(t, &cfg)))
-            .collect()
-    }))
+    let reports = py
+        .detach(|| bitwright::transform::validate(src, tgt, &cfg))
+        .map_err(syntax)?;
+    Ok(reports.iter().map(report).collect())
 }
 
 /// A precondition inferred for a transformation.

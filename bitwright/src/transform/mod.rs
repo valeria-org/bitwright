@@ -22,9 +22,16 @@
 //! each nondeterministic choice (an `undef` use, a `freeze` of poison, a NaN's sign and
 //! payload, a zero's sign under `nsz`) is a leaf, chosen by the source existentially and by the
 //! target universally. Types left open are checked at each width (1 to 8, 16, 32, 64) and
-//! format (half, float, double) they may take. The rewrite-based fast-math flags (`reassoc`,
-//! `arcp`, `contract`, `afn`) are not modeled: a transformation that needs them is checked
-//! against exact IEEE semantics.
+//! format (half, float, double) they may take, at most [`Config::max_types`] assignments (with
+//! more, the verdict is unknown). The rewrite-based fast-math flags (`reassoc`, `arcp`,
+//! `contract`, `afn`) are not modeled: a transformation that needs them is checked against
+//! exact IEEE semantics. What bitwright reads but does not model (pointers, an attribute or
+//! metadata of the target it does not know, a non-default floating-point environment) makes a
+//! transformation unsupported, never silently ignored.
+//!
+//! A verdict rests on the encoding of LLVM's semantics, the bit-blaster and, unless
+//! [`Config::certify`] asks for DRUP certificates, bitwright's simplifier and SAT solver.
+//! `smt` (feature `smtlib`) writes the final questions for another solver to confirm.
 
 mod alive;
 pub(crate) mod encode;
@@ -35,6 +42,8 @@ pub(crate) mod llvm;
 mod parse;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_semantics;
 pub(crate) mod types;
 mod value;
 mod verify;
@@ -42,6 +51,8 @@ mod verify;
 pub use alive::parse_transforms;
 pub use infer::{Inference, infer};
 pub use lex::SyntaxError;
-pub use llvm::{FnText, function_pair, functions, pairs};
+pub use llvm::{FnText, Pair, function_pair, functions, pairs, pairs_each};
 pub use types::Assignment;
-pub use verify::{Config, Counterexample, Mismatch, Report, Shown, Verdict, verify};
+pub use verify::{Config, Counterexample, Mismatch, Report, Shown, Verdict, validate, verify};
+#[cfg(feature = "smtlib")]
+pub use verify::{Question, smt};

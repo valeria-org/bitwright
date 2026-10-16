@@ -352,3 +352,49 @@ fn a_double_dash_ends_the_options() {
     assert_eq!(code, 0, "{err}");
     assert_eq!(out.trim(), "x");
 }
+
+#[test]
+fn tv_checks_each_function_with_its_own_attributes() {
+    let src = file(
+        "tv-src.ll",
+        "define i8 @a(i8 %x) {\n  ret i8 %x\n}\n\ndefine i8 @b(i8 %x) {\n  ret i8 %x\n}\n\n\
+         define i8 @c(i8 %x) {\n  ret i8 %x\n}\n",
+    );
+    let tgt = file(
+        "tv-tgt.ll",
+        "define i8 @a(i8 noundef %x) {\n  ret i8 %x\n}\n\n\
+         define i8 @b(i8 %x) {\n  %y = frob i8 %x\n  ret i8 %y\n}\n\n\
+         define i8 @c(i8 %x) {\n  %y = or i8 %x, 0\n  ret i8 %y\n}\n",
+    );
+    let (code, out, _) = run(&["tv", &src, &tgt]);
+    assert_eq!(code, 1, "{out}");
+    // The parameter the target makes `noundef`: undefined behavior on poison.
+    assert!(out.contains("INVALID      a"), "{out}");
+    // A function outside the subset does not stop the others.
+    assert!(out.contains("unsupported  b"), "{out}");
+    assert!(out.contains("valid        c"), "{out}");
+    assert!(out.contains("1 valid, 1 invalid, 1 not decided"), "{out}");
+}
+
+#[test]
+fn prove_writes_smtlib_questions_and_reports_unchecked_types() {
+    let opt = file(
+        "smt.opt",
+        "Name: not plus one\n%a = xor i8 %x, -1\n%r = add %a, 1\n  =>\n%r = sub 0, %x\n",
+    );
+    let (code, out, _) = run(&["prove", "--smt", &opt]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("(check-sat)").count(), 1, "{out}");
+    assert!(
+        out.contains("expect unsat") && out.ends_with("; 1 questions\n"),
+        "{out}"
+    );
+    // More type assignments than the most checked: unknown, not valid.
+    let cast = file("cast.opt", "%a = zext %x\n%r = trunc %a\n  =>\n%r = %x\n");
+    let (code, out, _) = run(&["prove", "--max-types", "10", &cast]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("unknown") && out.contains("10 type assignments checked of 55"));
+    let (code, out, _) = run(&["prove", "--certify", "--widths", "1,2,8", &cast]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(run(&["prove", "--max-types", "0", &cast]).0, 2);
+}

@@ -1,7 +1,9 @@
 //! Types: unification over the arena (every operation says which of its operands and result
 //! share a type), then an enumeration of the widths and formats left open.
 
-use super::ir::{CFun, Intrinsic, Lit, Node, NodeId, Op, PFun, Term, Transform, Ty};
+use std::collections::HashMap;
+
+use super::ir::{CFun, Intrinsic, Lit, Node, NodeId, Op, PFun, Term, Transform, Ty, flags};
 use crate::fp::FpFormat;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -212,6 +214,10 @@ pub(crate) fn typing(t: &Transform) -> Result<Typing, String> {
                             uf.fix(a[0], bool_ty)?;
                             uf.union(i, a[1])?;
                             uf.union(i, a[2])?;
+                            // Fast-math flags are for floating point only.
+                            if inst.flags & flags::FAST_MATH != 0 {
+                                uf.set_kind(i, Kind::Float)?;
+                            }
                         }
                         Op::Freeze | Op::Copy => uf.union(i, a[0])?,
                         Op::Load => {
@@ -263,6 +269,9 @@ pub(crate) fn typing(t: &Transform) -> Result<Typing, String> {
                         Op::Phi => {
                             for &x in a {
                                 uf.union(i, x)?;
+                            }
+                            if inst.flags & flags::FAST_MATH != 0 {
+                                uf.set_kind(i, Kind::Float)?;
                             }
                         }
                         Op::Call(f) => match f {
@@ -365,15 +374,21 @@ pub struct Assignment {
 pub(crate) const FORMATS: [FpFormat; 3] = [FpFormat::F16, FpFormat::F32, FpFormat::F64];
 
 impl Typing {
+    /// Whether nodes `a` and `b` have one type at every assignment.
+    pub(crate) fn same_class(&self, a: NodeId, b: NodeId) -> bool {
+        self.class[a as usize] == self.class[b as usize]
+    }
+
     /// Every assignment of the open classes (integers from `widths`, floating point from
     /// half, float and double) that meets the ordering constraints and lets every literal fit,
-    /// smallest first, at most `max`.
+    /// smallest first, at most `max`; and how many there are in all (more than returned when
+    /// `max` cut them short).
     pub(crate) fn assignments(
         &self,
         t: &Transform,
         widths: &[u16],
         max: usize,
-    ) -> Result<Vec<Assignment>, String> {
+    ) -> Result<(Vec<Assignment>, usize), String> {
         let options: Vec<Vec<Ty>> = self
             .open
             .iter()
@@ -446,26 +461,49 @@ impl Typing {
                 bits,
             )
         });
+        // The literals, by class, and whether each fits a type (asked once per pair).
+        let class_pos = |c: u32| self.open.iter().position(|&(r, ..)| r == c);
+        let literals: Vec<(NodeId, Option<usize>)> = (0..t.nodes.len())
+            .filter(|&i| matches!(t.nodes[i], Node::Lit(_)))
+            .map(|i| (i as NodeId, class_pos(self.class[i])))
+            .collect();
+        let mut fits: HashMap<(NodeId, Ty), Option<String>> = HashMap::new();
         let mut out = Vec::new();
+        let mut total = 0usize;
         let mut misfit = None;
         for pick in combos {
-            let types: Vec<Ty> = (0..t.nodes.len())
-                .map(|i| {
-                    let c = self.class[i];
-                    self.fixed[i].unwrap_or_else(|| {
-                        let k = self
-                            .open
-                            .iter()
-                            .position(|&(r, ..)| r == c)
-                            .expect("an open class");
-                        pick[k]
-                    })
-                })
-                .collect();
-            if let Some(why) = misfit_literal(t, &types) {
+            let mut bad = None;
+            for &(n, pos) in &literals {
+                let ty = match pos {
+                    Some(k) => pick[k],
+                    None => match self.fixed[n as usize] {
+                        Some(ty) => ty,
+                        None => continue,
+                    },
+                };
+                let why = fits
+                    .entry((n, ty))
+                    .or_insert_with(|| misfit_literal(t, n, ty))
+                    .clone();
+                if why.is_some() {
+                    bad = why;
+                    break;
+                }
+            }
+            if let Some(why) = bad {
                 misfit.get_or_insert(why);
                 continue;
             }
+            total += 1;
+            if out.len() == max {
+                continue;
+            }
+            let types: Vec<Ty> = (0..t.nodes.len())
+                .map(|i| {
+                    self.fixed[i]
+                        .unwrap_or_else(|| pick[class_pos(self.class[i]).expect("an open class")])
+                })
+                .collect();
             let label = match self.open.len() {
                 0 => String::new(),
                 1 => pick[0].to_string(),
@@ -478,32 +516,27 @@ impl Typing {
                     .join(", "),
             };
             out.push(Assignment { types, label });
-            if out.len() == max {
-                break;
-            }
         }
         match (out.is_empty(), misfit) {
             (true, Some(why)) => Err(why),
-            _ => Ok(out),
+            _ => Ok((out, total)),
         }
     }
 }
 
-/// A literal that does not fit its type (an integer as an unsigned or a signed number, a
-/// floating-point number exactly), if there is one.
-fn misfit_literal(t: &Transform, types: &[Ty]) -> Option<String> {
-    t.nodes.iter().enumerate().find_map(|(i, n)| {
-        let ty = types[i];
-        let fits = match (n, ty) {
-            (Node::Lit(Lit::Num(s)), Ty::Int(w)) => super::value::int_literal(s, w).is_some(),
-            (Node::Lit(Lit::Num(s)), Ty::Float(f)) => super::value::float_literal(s, f).is_some(),
-            (Node::Lit(Lit::Inf(_) | Lit::Nan), Ty::Int(_)) => false,
-            _ => true,
-        };
-        match n {
-            Node::Lit(Lit::Num(s)) if !fits => Some(format!("{s} does not fit {ty}")),
-            Node::Lit(_) if !fits => Some(format!("a floating-point literal where {ty} belongs")),
-            _ => None,
-        }
-    })
+/// Why literal `n` does not fit type `ty` (an integer as an unsigned or a signed number, a
+/// floating-point number exactly), if it does not.
+fn misfit_literal(t: &Transform, n: NodeId, ty: Ty) -> Option<String> {
+    let node = t.node(n);
+    let fits = match (node, ty) {
+        (Node::Lit(Lit::Num(s)), Ty::Int(w)) => super::value::int_literal(s, w).is_some(),
+        (Node::Lit(Lit::Num(s)), Ty::Float(f)) => super::value::float_literal(s, f).is_some(),
+        (Node::Lit(Lit::Inf(_) | Lit::Nan), Ty::Int(_)) => false,
+        _ => true,
+    };
+    match node {
+        Node::Lit(Lit::Num(s)) if !fits => Some(format!("{s} does not fit {ty}")),
+        Node::Lit(_) if !fits => Some(format!("a floating-point literal where {ty} belongs")),
+        _ => None,
+    }
 }

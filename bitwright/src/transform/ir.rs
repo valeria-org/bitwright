@@ -428,6 +428,8 @@ pub mod flags {
     /// The rewrite-based fast-math flags, which change which rewrites are allowed rather than
     /// what an instruction computes.
     pub const REWRITE: u16 = ARCP | CONTRACT | AFN | REASSOC;
+    /// Every fast-math flag (only floating-point values carry them).
+    pub const FAST_MATH: u16 = NNAN | NINF | NSZ | REWRITE;
 
     /// The flag a keyword names (`fast` is every fast-math flag).
     pub fn parse(s: &str) -> Option<u16> {
@@ -451,6 +453,42 @@ pub mod flags {
     }
 }
 
+/// What a function declares about a parameter or its return value, or a call about an
+/// argument or its result: the attributes that change what the value may be.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamAttrs {
+    /// `noundef`: a poison value is undefined behavior.
+    pub noundef: bool,
+    /// `range(ty lo, hi)`: outside `[lo, hi)`, wrapping, the value is poison.
+    pub range: Option<(String, String)>,
+    /// `nofpclass(…)`: in these classes (`nan`, `inf`, `zero`, … as bits), the value is
+    /// poison.
+    pub nofpclass: u16,
+    /// `returned` (a parameter): the function returns this argument, which callers may rely
+    /// on, so returning anything else is undefined behavior.
+    pub returned: bool,
+}
+
+impl ParamAttrs {
+    /// Whether it declares nothing.
+    pub fn is_empty(&self) -> bool {
+        *self == ParamAttrs::default()
+    }
+}
+
+/// What an instruction's call site and metadata declare (the function syntax).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstAttrs {
+    /// A call's return attributes.
+    pub result: ParamAttrs,
+    /// A call's argument attributes, by operand (empty when it has none).
+    pub args: Vec<ParamAttrs>,
+    /// Attributes and metadata that may change what the instruction does and that bitwright
+    /// does not model (`!fpmath`, `!range`, `returned`, …): a target that runs such an
+    /// instruction is not verified.
+    pub unmodeled: Vec<String>,
+}
+
 /// An instruction.
 #[derive(Clone, Debug)]
 pub struct Inst {
@@ -464,6 +502,22 @@ pub struct Inst {
     pub args: Vec<NodeId>,
     /// For a `phi`, the block each operand comes from (indices in the body).
     pub incoming: Vec<usize>,
+    /// Call-site attributes and metadata, when it has any.
+    pub attrs: Option<Box<InstAttrs>>,
+}
+
+impl Inst {
+    /// An instruction without operands, flags or attributes.
+    pub(crate) fn new(name: &str, op: Op) -> Inst {
+        Inst {
+            name: name.to_string(),
+            op,
+            flags: 0,
+            args: Vec::new(),
+            incoming: Vec::new(),
+            attrs: None,
+        }
+    }
 }
 
 /// A function in a constant expression or a precondition, or an operator of either.
@@ -556,12 +610,16 @@ impl PFun {
 #[derive(Clone, Debug)]
 pub enum Node {
     /// An input (a register the source reads without defining it, or a function parameter).
+    /// Its attributes are the source's declaration; each program's own are
+    /// [`Body::params`].
     Input {
         /// Its name (without `%`).
         name: String,
-        /// `noundef`: it is never poison (passing poison is the caller's undefined behavior).
+        /// The source's `noundef`: it is never poison (passing poison is the caller's
+        /// undefined behavior).
         noundef: bool,
-        /// A `range(ty lo, hi)` attribute: outside `[lo, hi)`, wrapping, it is poison.
+        /// The source's `range(ty lo, hi)`: outside `[lo, hi)`, wrapping, it is poison to the
+        /// source.
         range: Option<(String, String)>,
     },
     /// A symbolic constant (`C`, `C1`): some value, the same in source and target, never
@@ -612,6 +670,16 @@ pub struct Body {
     pub blocks: Vec<Block>,
     /// A transformation's root: the instruction whose value the target must refine.
     pub root: Option<NodeId>,
+    /// Registers besides the root, matched by position between the source and the target,
+    /// with their names: the target's must refine the source's too (the transformation
+    /// syntax: each register of the source that the target defines again, since the rewrite
+    /// replaces it at its other uses).
+    pub matched: Vec<(String, NodeId)>,
+    /// The attributes this program declares on each input, in [`Transform::inputs`] order
+    /// (the function syntax; empty in the transformation syntax). Each program sees an input
+    /// through its own: a target that adds `noundef` or `range` to a parameter is checked
+    /// with them, the source's never apply to the target.
+    pub params: Vec<ParamAttrs>,
     /// `noundef` on the return value: returning poison is undefined behavior.
     pub ret_noundef: bool,
     /// `range(ty lo, hi)` on the return value: outside it, the value is poison.
@@ -641,8 +709,19 @@ pub struct Transform {
     pub src: Body,
     /// The target.
     pub tgt: Body,
-    /// `nofpclass(…)` of inputs: in those classes, the input is poison.
+    /// The source's `nofpclass(…)` of inputs: in those classes, the input is poison to the
+    /// source.
     pub nofpclass: Vec<(NodeId, u16)>,
+    /// Whether the text uses pointers or memory (`ptr`, `getelementptr`, `alloca`, `load`,
+    /// …), which only lifting reads: the verifier refuses them.
+    pub pointers: bool,
+    /// What the text declares that bitwright reads but does not model, so that it cannot
+    /// verify the transformation (an attribute of a target parameter it does not know, say).
+    pub unsupported: Vec<String>,
+    /// A floating-point environment other than the default (`strictfp`, denormals flushed,
+    /// …) that either function declares: the verifier refuses the transformation where it
+    /// computes on floating point.
+    pub float_env: Option<String>,
 }
 
 impl Transform {
@@ -657,6 +736,33 @@ impl Transform {
             src: Body::default(),
             tgt: Body::default(),
             nofpclass: Vec::new(),
+            pointers: false,
+            unsupported: Vec::new(),
+            float_env: None,
+        }
+    }
+
+    /// The attributes the source declares on input `i`: [`Body::params`], or for a
+    /// transformation built without them, the input's node and [`Transform::nofpclass`].
+    pub(crate) fn source_attrs(&self, i: usize) -> ParamAttrs {
+        if self.src.params.len() == self.inputs.len() {
+            return self.src.params[i].clone();
+        }
+        let n = self.inputs[i];
+        let (noundef, range) = match self.node(n) {
+            Node::Input { noundef, range, .. } => (*noundef, range.clone()),
+            _ => (false, None),
+        };
+        let nofpclass = self
+            .nofpclass
+            .iter()
+            .filter(|(m, _)| *m == n)
+            .fold(0, |a, (_, c)| a | c);
+        ParamAttrs {
+            noundef,
+            range,
+            nofpclass,
+            returned: false,
         }
     }
 

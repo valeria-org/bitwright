@@ -12,10 +12,13 @@
 //! Registers the source reads without defining them are inputs; words in operands are
 //! symbolic constants; types are optional (instruction syntax as in LLVM IR, `add i8 %x, %y`,
 //! `zext i8 %x to i16`), inferred, and every assignment of the widths left open is checked.
+//! A source register that the target defines again must be refined as the root is (the
+//! rewrite replaces it at its other uses too), and the precondition may name the source's
+//! registers.
 
 use std::collections::HashMap;
 
-use super::ir::{Block, Body, Node, Term, Transform};
+use super::ir::{Block, Body, Node, NodeId, Term, Transform};
 use super::lex::{Cursor, SyntaxError, Tok, lex, strip_comment};
 use super::parse::Ctx;
 
@@ -34,6 +37,8 @@ struct Pending {
     syms: HashMap<String, super::ir::NodeId>,
     root_name: Option<String>,
     start: usize,
+    /// The precondition's text and line, read once the source is (it may name its registers).
+    pre: Option<(String, usize)>,
 }
 
 impl Pending {
@@ -59,7 +64,33 @@ impl Pending {
             syms: HashMap::new(),
             root_name: None,
             start,
+            pre: None,
         }
+    }
+
+    /// Reads the precondition, over the source's registers, inputs and constants.
+    fn read_pre(&mut self) -> Result<(), SyntaxError> {
+        let Some((pre, n)) = self.pre.take() else {
+            return Ok(());
+        };
+        let toks = lex(&pre, n)?;
+        let mut c = Cursor::new(&toks, n);
+        let mut cx = self.ctx();
+        let e = cx.cexpr(&mut c, 0)?;
+        if !c.at_end() {
+            return c.err("unexpected text after the precondition");
+        }
+        let (names, syms) = (cx.names, cx.syms);
+        self.names = names;
+        self.syms = syms;
+        if !matches!(self.t.node(e), Node::Pred(..)) {
+            return Err(SyntaxError {
+                line: n,
+                message: "the precondition is not a condition".into(),
+            });
+        }
+        self.t.pre = Some(e);
+        Ok(())
     }
 
     fn ctx(&mut self) -> Ctx<'_> {
@@ -96,6 +127,23 @@ impl Pending {
         };
         self.t.src.root = Some(src_root);
         self.t.tgt.root = Some(tgt_root);
+        // The other source registers the target defines again, in the source's order.
+        let mut matched: Vec<(NodeId, String, NodeId)> = self
+            .names
+            .iter()
+            .filter(|(name, _)| **name != root)
+            .filter_map(|(name, &tn)| {
+                let &sn = self.src_names.get(name)?;
+                let both = matches!(self.t.node(sn), Node::Inst(_))
+                    && matches!(self.t.node(tn), Node::Inst(_));
+                (sn != tn && both).then(|| (sn, name.clone(), tn))
+            })
+            .collect();
+        matched.sort_by_key(|m| m.0);
+        for (sn, name, tn) in matched {
+            self.t.src.matched.push((name.clone(), sn));
+            self.t.tgt.matched.push((name, tn));
+        }
         Ok(self.t)
     }
 }
@@ -133,23 +181,9 @@ pub fn parse_transforms(text: &str) -> Result<Vec<Transform>, SyntaxError> {
                     message: "`Pre:` comes before the source".into(),
                 });
             }
-            let toks = lex(pre, n)?;
-            let mut c = Cursor::new(&toks, n);
-            let mut cx = p.ctx();
-            let e = cx.cexpr(&mut c, 0)?;
-            if !c.at_end() {
-                return c.err("unexpected text after the precondition");
-            }
-            let (names, syms) = (cx.names, cx.syms);
-            p.names = names;
-            p.syms = syms;
-            if !matches!(p.t.node(e), Node::Pred(..)) {
-                return Err(SyntaxError {
-                    line: n,
-                    message: "the precondition is not a condition".into(),
-                });
-            }
-            p.t.pre = Some(e);
+            // Checked now, read after the source.
+            lex(pre, n)?;
+            p.pre = Some((pre.to_string(), n));
             continue;
         }
         if line == "=>" {
@@ -159,6 +193,7 @@ pub fn parse_transforms(text: &str) -> Result<Vec<Transform>, SyntaxError> {
                     message: "`=>` without source instructions".into(),
                 });
             }
+            p.read_pre()?;
             p.part = Part::Target;
             p.src_names = p.names.clone();
             continue;
