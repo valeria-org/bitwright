@@ -198,6 +198,41 @@ fn simplify_runs_the_engine() {
 }
 
 #[test]
+fn simplify_recovers_divisions_by_constants() {
+    for (src, want) in [
+        ("umulhi(x, 0xaaaaaaab) >>u 1", "udiv(x, 3)"),
+        (
+            "x - 7 * ((umulhi(x, 0x24924925) + ((x - umulhi(x, 0x24924925)) >>u 1)) >>u 2)",
+            "urem(x, 7)",
+        ),
+        ("trunc<32>((zext<64>(x) * 0xaaaaaaab) >>u 33)", "udiv(x, 3)"),
+        (
+            "((smulhi(x, 0x92492493) + x) >>s 2) + (x >>u 31)",
+            "sdiv(x, 7)",
+        ),
+        (
+            "x - 5 * (trunc<32>((sext<64>(x) * 0x66666667) >>s 33) - (x >>s 31))",
+            "srem(x, 5)",
+        ),
+        ("x - udiv(x, 7) * 7", "urem(x, 7)"),
+    ] {
+        let (code, out, _) = run(&["simplify", src, "--width", "32"]);
+        assert_eq!((code, out.trim()), (0, want), "{src}");
+    }
+    let (code, out, _) = run(&[
+        "simplify",
+        "x - 10 * (extract<64, 64>(zext<128>(x) * 0xcccccccccccccccd) >>u 3)",
+        "--width",
+        "64",
+    ]);
+    assert_eq!((code, out.trim()), (0, "urem(x, 10)"));
+    // The standard strategy keeps a compiler's strength reduction.
+    let src = "umulhi(x, 0xaaaaaaab) >>u 1";
+    let (code, out, _) = run(&["simplify", src, "--width", "32", "--standard"]);
+    assert_eq!((code, out.trim()), (0, src));
+}
+
+#[test]
 fn simplify_a_file_line_by_line() {
     let f = file(
         "exprs.txt",

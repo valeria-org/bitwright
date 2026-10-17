@@ -72,7 +72,7 @@ bitwright/                       workspace; edition 2024; rust-version 1.88; Pol
 │  ├─ src/rules/                 RuleIr, compiler, termination order, reference matcher, corpus/ (*.bwr, *.bwr.proof)
 │  ├─ src/check/                 soundness checker, evidence, ledger (feature "check")
 │  ├─ src/engine/                Engine, Strategy/Phase, Run/Outcome, budgets, dispatch net, memo, stats
-│  ├─ src/passes/                linear, xor, bitwise, compares, casts, demanded, linear_mba, shuffle, fact_fold
+│  ├─ src/passes/                linear, xor, bitwise, compares, casts, demanded, linear_mba, shuffle, division, fact_fold
 │  ├─ src/mba/                   classifier, MbaExpr, lower/lift, gate, traits, certificates, batched evaluator, nf/ (normal-form solver) (feature "mba")
 │  └─ src/eqsat/                 e-graph, admission, schedule, extraction (feature "eqsat")
 ├─ bitwright-ref/                independent bit-serial reference evaluator (publish = false)
@@ -593,6 +593,7 @@ pub enum Decline { AdmissionCap(Cap) }        // Unsupported(..) arrives with ex
 pub enum Phase {
     Local { groups: Vec<String> },   // directed rules of these groups, bottom-up fixpoint
     FactFold, Linear, Xor, Bitwise, Compares, Casts, Demanded, LinearMba, Shuffle,  // passes (§8)
+    Division,                        // divisions by constants (§8, deobfuscation only)
     Invert,                          // equalities through invertible maps (§8.1)
     // M6: Mba(MbaConfig); later: Raise (display idioms, last phase only)
 }
@@ -1043,7 +1044,8 @@ gain. Linear, xor and bitwise candidates are costed from their form before they 
 rejected candidate builds nothing. A rejection that happened only because of sharing is not final
 (the sharing may disappear as other users are simplified later in the walk), so a later round
 decides again; with rounds, results are idempotent. Equal-size rewrites are never made, so a pass
-cannot fight the rules or another pass. Every commit then goes through the postconditions and the
+cannot fight the rules or another pass; the one exception is `Division` replacing a bare
+`umulhi(x, M)` by the `udiv` it equals (both two nodes), which nothing rewrites back. Every commit then goes through the postconditions and the
 host veto (§6.4). Per-node descriptions are cached for the call and derived from a node's own
 structure. Work is charged to `Budget::pass_work`, fact queries to `fact_work`; `Stats::passes`
 counts `{calls, noop, changed, rejected_cost, rejected, atomized}` per pass.
@@ -1058,11 +1060,12 @@ counts `{calls, noop, changed, rejected_cost, rejected, atomized}` per pass.
 | `Casts` | An extract/trunc is pushed through `+ − * neg` (low bits), `& \| ^ ~` and `select` (any bits), constant shifts, extensions, `concat` and nested extracts (re-indexing, becoming 0, or extending the remaining part); the whole bounded narrowing is compared with the original region. |
 | `Demanded` | An operand observed only through some bits (`& c`, `\| c`, an extract, a constant shift) is simplified under that mask: masks that keep every demanded bit are dropped, constants that settle every demanded bit replace the operand, operands whose demanded bits the facts know become constants, arithmetic demands only its low prefix, and shifts, extensions and `concat` re-index the mask. A sum, difference or product demanded only in its low `k ≤ 4` bits is replaced by a constant or a leaf when its residues show those bits are one (`(x·x) & 1` is `x & 1`). |
 
-Added in M6 (in `Strategy::deobfuscate()`):
+In `Strategy::deobfuscate()` only (`LinearMba` and `Shuffle` added in M6, `Division` after 0.16):
 
 | Pass | Fragment and algorithm |
 |-|-|
 | `LinearMba` | Linear combinations of bitwise functions of ≤ 6 atoms. The operands of `& \| ^` are read as bitwise: only `& \| ^ ~`, atoms, and 0 or all-ones constants may appear there, so a linear term or a non-uniform mask under a bitwise operator is an atom, and so is a node read both ways. Atoms are ordered canonically (by structure, not node index), so the result does not depend on construction order. Every bitwise function is an integer combination of conjunctions (`AND_∅ = −1`), bit by bit and so exactly in Z/2^W, so the values at the 2^t corners where every atom is 0 or all-ones determine the expression. A Möbius transform gives the conjunction coefficients; the emission is the cheapest of the affine form (when no conjunction of two or more atoms remains), the conjunction form `c + Σ k_S·AND_S` itself (any number of atoms), and `u₀ + Σ (u₀ − uₖ)·gₖ` over the distinct corner values, `gₖ` a minimum-form bitwise function (≤ 3 atoms). Only mixed regions (linear and bitwise operators) are considered. |
+| `Division` | Multiply-high sequences of ≤ 64 bits (intermediates ≤ 128) that divide by a constant, as compilers emit them: `umulhi(x, M) >>u s`, the add-and-halve step for a multiplier of `W + 1` bits, a pre-shift, the product in a double-width register (`trunc((zext(x) · M) >>u k)`), and `smulhi` with `± x`, an arithmetic shift and a correction by the quotient's or the dividend's sign bit. From the multiplicand `n` (found below the node), the node is read as `floor((a·n + b) / c)` per interval of `n`, in 512-bit integers, through `+ − neg ~`, constant products and shifts, `umulhi`/`smulhi`, `udiv`/`sdiv` by constants, extensions, extracts, the add-and-halve step, and bitwise operations of values constant on the interval; an interval is split where a step's bits wrap or an operand that must be exact takes a few values (a sign bit), at most 8 pieces. On each piece `floor((a·n + b)/c) = floor(n/d)` (or the truncating quotient, by sign) is decided at ≤ 8 points: with `n = q·d + r`, the difference `q·(a·d − c) + a·r + b` is affine in `(q, r)`, so its extremes over the rows of `r` are at the ends of the first and last row and the corners of the full rows. The divisor comes from where the value first leaves 0. A dividend `x >>u j` merges into `udiv(x, d·2^j)` when that fits. The whole range of the input is tried first, then the facts' bounds on it (a multiplier exact only below a bound). In a linear sum, `c·x − c·d·q` over `q = udiv(x, d)` (or `sdiv`) and `c·x − c·(udiv(x, y)·y)` become `c·rem`. Checked exhaustively: every multiplier and shift of every form at W ≤ 8 (unsigned to 10) is rewritten exactly when it divides, and every divisor at W ≤ 10 with the Hacker's Delight magics. Only in `Strategy::deobfuscate()`: it undoes strength reduction. |
 | `Shuffle` | Values of ≤ 128 bits assembled from bit slices: every output bit is traced to a constant or to one bit of a source through `&` with a constant, `\|` (with constant-one bits), `^`/`+` of pieces whose traced bits do not overlap, constant shifts and rotations, extensions, `extract`, `concat` and `bswap`. A fully traced value is re-emitted as the source, a rotation, a byte swap, one source in place with constant bits (`(s & ~zeros) \| ones`), or a `concat` of slices and constant runs. |
 
 Feature `deobf` keeps one planned item: a GF(2) linear-map normal form over rotations, shifts and
@@ -1071,7 +1074,7 @@ xors (which would also decide invertibility of maps with cyclic bit dependencies
 core (§8.1).
 
 **Pipeline order is part of the contract:** `Strategy::deobfuscate()` is the standard pipeline with
-`LinearMba` and `Shuffle` after `Bitwise`. `Strategy::standard()` is `[FactFold, Local(core), Linear,
+`Division` after `Casts` and `LinearMba` and `Shuffle` after `Bitwise`. `Strategy::standard()` is `[FactFold, Local(core), Linear,
 Xor, Casts, Invert, Compares, Bitwise, Demanded, Local(core)]` for up to 4 rounds (`Invert` before
 `Compares`, so comparisons it solves are combined in the same round). Measured on a 700k-node
 random chain of mixed bitwise and additive steps: 2.9 s in release, linear in size; other shapes

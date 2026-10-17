@@ -6,6 +6,7 @@ mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
 pub(super) mod demanded;
+mod division;
 pub(super) mod forms;
 mod gf2;
 pub(super) mod invert;
@@ -197,6 +198,7 @@ pub(crate) enum PassKind {
     LinearMba,
     Shuffle,
     Invert,
+    Division,
     /// The MBA service (the configuration lives in the phase).
     #[cfg_attr(not(feature = "mba"), allow(dead_code))]
     Mba,
@@ -215,6 +217,7 @@ impl PassKind {
             PassKind::LinearMba => "linear_mba",
             PassKind::Shuffle => "shuffle",
             PassKind::Invert => "invert",
+            PassKind::Division => "division",
             PassKind::Mba => "mba",
         }
     }
@@ -240,6 +243,7 @@ pub(super) fn step(
         PassKind::LinearMba => linear_mba::step(r, cx, n),
         PassKind::Shuffle => shuffle::step(r, cx, n),
         PassKind::Invert => invert::step(r, cx, n),
+        PassKind::Division => division::step(r, cx, n),
         // Dispatched with its configuration by the engine.
         PassKind::Mba => Ok(Step::Normal(Fin::FINAL)),
     }
@@ -892,6 +896,18 @@ pub(super) fn shrinks(
     e: u32,
     atoms: &[u32],
 ) -> Result<Result<(), Fin>, Stop> {
+    pays(r, cx, n, e, atoms, false)
+}
+
+/// [`shrinks`], or with `tie` whether replacing `n` by `e` leaves the DAG no larger.
+fn pays(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+    tie: bool,
+) -> Result<Result<(), Fin>, Stop> {
     if cx.node(e).op == OpCode::Const && cx.node(n).op != OpCode::Const {
         return Ok(Ok(()));
     }
@@ -900,14 +916,15 @@ pub(super) fn shrinks(
     let Some(new) = needed(r, cx, e)? else {
         return Ok(Err(Fin::FINAL));
     };
+    let gain = |freed: u32| new < freed || (tie && new == freed);
     if alone(r) {
         let freed = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
-        return Ok(if new < freed { Ok(()) } else { Err(Fin::FINAL) });
+        return Ok(if gain(freed) { Ok(()) } else { Err(Fin::FINAL) });
     }
     let freed = dying_in(r, cx, n, true, new.saturating_add(1), true)?;
-    if new >= freed {
+    if !gain(freed) {
         let alone = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
-        return Ok(Err(if new < alone {
+        return Ok(Err(if gain(alone) {
             Fin::PROVISIONAL
         } else {
             Fin::FINAL
@@ -930,12 +947,35 @@ pub(super) fn finish(
     atoms: &[u32],
     fin: Fin,
 ) -> Result<Step, Stop> {
+    finish_with(r, cx, kind, n, e, before, atoms, fin, false)
+}
+
+/// [`finish`], with `tie` also committing a candidate that leaves the DAG the same size: for a
+/// pass whose result is a normal form nothing rewrites back (a division in place of the
+/// multiply-high that computes it), so no two rewrites can undo each other.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_with(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+    e: u32,
+    before: u32,
+    atoms: &[u32],
+    fin: Fin,
+    tie: bool,
+) -> Result<Step, Stop> {
     let name = kind.name();
     if e == n {
         r.stats.passes.entry(name).or_default().noop += 1;
         return Ok(Step::Normal(fin));
     }
-    if let Err(more) = shrinks(r, cx, n, e, atoms)? {
+    let pays = if tie {
+        pays(r, cx, n, e, atoms, true)?
+    } else {
+        shrinks(r, cx, n, e, atoms)?
+    };
+    if let Err(more) = pays {
         // A rejection that only sharing caused is not final (see `shrinks`).
         r.stats.passes.entry(name).or_default().rejected_cost += 1;
         discard(r, cx, before);

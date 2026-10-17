@@ -18,8 +18,8 @@
 //!   the soundness checker and proof ledgers.
 //! - [`engine`]: the simplifier: proven rules and normal-form passes (linear, xor, bitwise,
 //!   comparisons, casts, demanded bits, equalities through invertible maps, and for
-//!   deobfuscation linear MBA and bit shuffles), applied bottom-up under caller-owned budgets,
-//!   with a memo, telemetry and host hooks. [`Query::Injective`] and [`Query::Bijective`] ask
+//!   deobfuscation divisions by constants, linear MBA and bit shuffles), applied bottom-up under
+//!   caller-owned budgets, with a memo, telemetry and host hooks. [`Query::Injective`] and [`Query::Bijective`] ask
 //!   whether an expression is an invertible function of one of its subexpressions.
 //! - [`ext`]: host-defined extension operations (multi-output, total), registered in a
 //!   [`Registry`](ext::Registry) and built with [`Context::ext`].

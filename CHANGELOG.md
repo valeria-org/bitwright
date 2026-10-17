@@ -35,9 +35,36 @@
 - The residue searches are bounded (48 operations, 4 leaves, 16,384 operations evaluated per
   search, charged to the pass budget), run only on a predicate with a product of a value with
   itself, and stop at the first two points that disagree.
-- **Behavior changes.** Results change where the new decisions apply: predicates become
-  constants, disguised low-bit tests become plain ones, and facts of squares are tighter. A
+- **Divisions by constants:** deobfuscation turns the multiply-high sequences compilers emit
+  for a division by a constant back into `udiv` and `sdiv` (`Phase::Division`, in
+  `Strategy::deobfuscate()`): `umulhi(x, M) >>u s`, the add-and-halve form for a multiplier of
+  `W + 1` bits, a pre-shift for even divisors, the product in a register twice as wide
+  (`trunc<32>((zext<64>(x) * M) >>u (32 + s))`, x86-64's `imul` and `shr`, or the high half of
+  a 128-bit product), and the signed forms with an arithmetic shift and a correction by the
+  sign of the quotient (LLVM) or of the dividend (GCC), for either sign of divisor. A sequence
+  is read as an exact function of its input, split into pieces where its bits wrap or a sign
+  bit flips, and replaced only when it is proved equal to the quotient at every input the
+  facts allow, in integers wide enough that nothing wraps (decided at no more than eight
+  points per piece), so a multiplier valid only below a bound is recognized where the facts
+  show the bound (LLVM picks those for dividends with leading zeros). A quotient shifted or
+  negated further becomes one division (`udiv(x, 3) >>u 2` is `udiv(x, 12)`, `-sdiv(x, 7)`
+  is `sdiv(x, -7)`). In a linear sum, `x − d·q` over such a quotient becomes the remainder,
+  however the product is spelled (`x - (q + (q << 1))` for 3), and so does `x − udiv(x, y)·y`
+  for any `y`. `bitwright simplify` now shows `udiv(x, 3)` for `umulhi(x, 0xaaaaaaab) >>u 1`
+  and `urem(x, 7)` for the remainder by 7. The other built-in strategies keep a compiler's
+  strength reduction.
+
+### Behavior changes
+
+- Every strategy's results change where residues decide a predicate: it becomes a constant,
+  a disguised low-bit test becomes the plain one, and facts of squares are tighter. A
   comparison the compares pass re-emitted at the same size is now also checked by residues.
+- `Strategy::deobfuscate()` runs `Phase::Division` after `Casts`, so its results change where
+  an expression holds such a sequence: those of `bitwright simplify` and `lift`, of the C,
+  Python and JavaScript bindings' deobfuscation presets, and the prover's simplification of
+  a question (`Config::simplify`). A bare `umulhi(x, M)` that divides is replaced by its
+  `udiv` although both are two nodes: the one rewrite a pass makes that leaves the DAG the
+  same size (nothing rewrites a division back).
 
 ## 0.16.0
 

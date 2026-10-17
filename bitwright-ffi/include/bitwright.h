@@ -535,9 +535,9 @@ typedef struct bw_engine_builder bw_engine_builder;
 typedef enum bw_preset {
     /* Fact folding, the built-in rules and the normal-form passes. */
     BW_PRESET_STANDARD = 0,
-    /* The standard strategy, the linear MBA and bit-shuffle passes, and the MBA service with the
-     * native solver, accepting only answers bitwright proves itself (the command line's
-     * `simplify`). */
+    /* The standard strategy, the passes for divisions by constants, linear MBA and bit
+     * shuffles, and the MBA service with the native solver, accepting only answers bitwright
+     * proves itself (the command line's `simplify`). */
     BW_PRESET_DEOBFUSCATE = 1,
     /* For a compiler, which simplifies every value of every function: the standard phases
      * without the demanded-bits pass, one round, the passes deciding as if each node were alone

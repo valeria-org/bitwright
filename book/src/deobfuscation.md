@@ -1,11 +1,15 @@
 # Deobfuscation and MBA
 
 Obfuscators hide simple operations behind *mixed boolean-arithmetic* (MBA) identities, such as
-`x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back.
-`Strategy::deobfuscate()` adds two passes to the standard strategy for these (hash
-comparisons through invertible mixers are handled by the standard strategy; see
+`x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back;
+code lifted from a binary also has the compiler's own disguises, such as divisions by constants
+done with multiplications. `Strategy::deobfuscate()` adds three passes to the standard strategy
+for these (hash comparisons through invertible mixers are handled by the standard strategy; see
 [Invertibility](invertibility.md)):
 
+- **Divisions by constants.** The multiply-high sequences a compiler emits for `x / d` and
+  `x % d` become `udiv`, `sdiv`, `urem` and `srem` again, when they are proved to be (see
+  [below](#divisions-by-constants)).
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature
   and emits the cheapest equivalent form it knows, if that is smaller.
@@ -35,6 +39,72 @@ for (obfuscated, plain) in [
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Divisions by constants
+
+A compiler divides by a constant `d` by multiplying with a *magic* number `M ≈ 2^k / d` and
+keeping the high bits (Granlund and Montgomery): for a 32-bit `x`, `x / 3` is
+`umulhi(x, 0xaaaaaaab) >>u 1`. The division pass (`Phase::Division`) recognizes the forms
+compilers use:
+
+- `umulhi(x, M) >>u s`, with a shift of the dividend first for some even divisors, and the
+  add-and-halve form for a multiplier of `W + 1` bits:
+  `(t + ((x - t) >>u 1)) >>u s` with `t = umulhi(x, M - 2^W)`;
+- the product in a register twice as wide, as x86-64 code divides 32-bit values:
+  `trunc<32>((zext<64>(x) * M) >>u (32 + s))`, and the high half of a 128-bit product for
+  64-bit ones;
+- signed division (C's `int`), `smulhi` with an arithmetic shift (and `+ x` or `- x` where
+  the multiplier's sign needs it), then a correction by the sign of the quotient (LLVM,
+  `q + (q >>u 31)`) or of the dividend (GCC, `q - (x >>s 31)`), for divisors of either sign;
+- and a remainder computed from such a quotient, `x - d·q`, however the sum spells the
+  product.
+
+It does not trust the multiplier to be one. It reads the sequence as an exact function of its
+input `n`: on each interval of `n` it is `floor((a·n + b) / c)`, an affine function under a
+floor, and where the bits of some step wrap around (or a sign bit flips) the interval is split
+there. On each interval, such a function equals `floor(n / d)` everywhere exactly when it does
+at no more than eight points (the extremes of an affine function over the pairs of quotient
+and remainder), computed with integers wide enough that nothing wraps, so the check covers
+every input without trying them. A multiplier that is exact only for a bounded dividend, as
+LLVM picks for one with known leading zeros, is accepted where the facts show the bound.
+
+```rust
+use bitwright::engine::{Engine, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::builder().builtin().strategy(Strategy::deobfuscate()).build()?;
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W32);
+for (compiled, source) in [
+    ("umulhi(x, 0xaaaaaaab) >>u 1", "udiv(x, 3)"),
+    // x % 7: the multiplier 0x124924925 needs 33 bits.
+    (
+        "x - 7 * ((umulhi(x, 0x24924925) + ((x - umulhi(x, 0x24924925)) >>u 1)) >>u 2)",
+        "urem(x, 7)",
+    ),
+    // x86-64: a 32-bit division in 64-bit registers.
+    ("trunc<32>((zext<64>(x) * 0xaaaaaaab) >>u 33)", "udiv(x, 3)"),
+    // int division by 7 (LLVM), by -7 and remainder by 5 (GCC).
+    ("((smulhi(x, 0x92492493) + x) >>s 2) + (x >>u 31)", "sdiv(x, 7)"),
+    ("(x >>s 31) - ((smulhi(x, 0x92492493) + x) >>s 2)", "sdiv(x, -7)"),
+    (
+        "x - 5 * (trunc<32>((sext<64>(x) * 0x66666667) >>s 33) - (x >>s 31))",
+        "srem(x, 5)",
+    ),
+    // Exact for dividends below 2^31 only: kept for any x, divided for x & 0x7fffffff.
+    ("umulhi(x, 0x92492493) >>u 2", "umulhi(x, 0x92492493) >>u 2"),
+    ("umulhi(x & 0x7fffffff, 0x92492493) >>u 2", "udiv(x & 0x7fffffff, 7)"),
+] {
+    let e = cx.parse(compiled, &o)?;
+    let out = engine.simplify(&mut cx, e)?;
+    assert_eq!(cx.display(out.expr).to_string(), source);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Only `Strategy::deobfuscate()` runs the pass: a division is fewer nodes than its multiply-high
+sequence, so in a compiler's strategy it would undo the strength reduction the compiler did on
+purpose.
 
 ## The MBA service (feature `mba`)
 

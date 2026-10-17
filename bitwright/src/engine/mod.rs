@@ -90,6 +90,19 @@ pub enum Phase {
     /// Orderings are left alone. Like a rule, it commits whether or not the operands are
     /// shared (see `bitwright::Query::Injective` for what counts as a layer).
     Invert,
+    /// Divisions by a constant that a compiler wrote as a multiplication by a magic number
+    /// become `udiv`/`sdiv` again: `umulhi(x, M) >>u s`, its add-and-halve form for a
+    /// multiplier of `W + 1` bits, the same in a register twice as wide
+    /// (`trunc((zext(x) * M) >>u k)`), and the signed forms with an arithmetic shift and a
+    /// sign correction. A sequence is replaced only when an exact check proves it equal to the
+    /// quotient for every value the input can take (with the facts' bounds on it), and only
+    /// when that is not larger (a bare `umulhi(x, M)` is the size of its `udiv`). In a linear
+    /// sum, `c·x − c·d·q` for such a quotient `q = udiv(x, d)` (or `sdiv`) becomes
+    /// `c·urem(x, d)` (or `srem`), and `c·x − c·(udiv(x, y)·y)` becomes `c·urem(x, y)`.
+    ///
+    /// It undoes a compiler's strength reduction, which a compiler wants kept: only
+    /// [`Strategy::deobfuscate`] runs it among the built-in strategies.
+    Division,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -189,9 +202,9 @@ impl Strategy {
         )
     }
 
-    /// The standard strategy plus the deobfuscation passes (linear MBA and bit shuffles):
-    /// `[FactFold, Local(core), Linear, Xor, Casts, Invert, Compares, Bitwise, LinearMba,
-    /// Shuffle, Demanded, Local(core)]`, up to 4 rounds.
+    /// The standard strategy plus the deobfuscation passes (divisions by constants, linear MBA
+    /// and bit shuffles): `[FactFold, Local(core), Linear, Xor, Casts, Division, Invert,
+    /// Compares, Bitwise, LinearMba, Shuffle, Demanded, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -209,6 +222,7 @@ impl Strategy {
                 Phase::Linear,
                 Phase::Xor,
                 Phase::Casts,
+                Phase::Division,
                 Phase::Invert,
                 Phase::Compares,
                 Phase::Bitwise,
@@ -791,6 +805,10 @@ impl EngineBuilder {
                 Phase::Invert => {
                     id = combine(id, 12);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Invert));
+                }
+                Phase::Division => {
+                    id = combine(id, 13);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Division));
                 }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {

@@ -44,9 +44,9 @@ The same expressions can be simplified in several ways, depending on what a tool
 
 `Strategy::standard()` is fact folding, the built-in rules, the normal-form passes (linear
 arithmetic, xor forms, casts, equalities through invertible maps, comparisons, bitwise truth
-tables, demanded bits) and the rules again. `Strategy::deobfuscate()` adds the linear-MBA and
-bit-shuffle passes (see [Deobfuscation and MBA](deobfuscation.md)). You can build your own from
-`Phase`s.
+tables, demanded bits) and the rules again. `Strategy::deobfuscate()` adds the passes for
+divisions by constants, linear MBA and bit shuffles (see
+[Deobfuscation and MBA](deobfuscation.md)). You can build your own from `Phase`s.
 
 A strategy of your own runs just the phases you name, in your order. One that only folds what
 the facts pin and collects linear sums cancels additive masking and leaves everything else as
