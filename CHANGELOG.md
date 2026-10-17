@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0
 
 - **Opaque predicates of number theory.** The compares pass decides a predicate by residues
   where no bit or range of its operands shows its value: each leaf's value is taken modulo

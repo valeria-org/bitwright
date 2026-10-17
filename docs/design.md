@@ -1060,7 +1060,7 @@ counts `{calls, noop, changed, rejected_cost, rejected, atomized}` per pass.
 | `Casts` | An extract/trunc is pushed through `+ − * neg` (low bits), `& \| ^ ~` and `select` (any bits), constant shifts, extensions, `concat` and nested extracts (re-indexing, becoming 0, or extending the remaining part); the whole bounded narrowing is compared with the original region. |
 | `Demanded` | An operand observed only through some bits (`& c`, `\| c`, an extract, a constant shift) is simplified under that mask: masks that keep every demanded bit are dropped, constants that settle every demanded bit replace the operand, operands whose demanded bits the facts know become constants, arithmetic demands only its low prefix, and shifts, extensions and `concat` re-index the mask. A sum, difference or product demanded only in its low `k ≤ 4` bits is replaced by a constant or a leaf when its residues show those bits are one (`(x·x) & 1` is `x & 1`). |
 
-In `Strategy::deobfuscate()` only (`LinearMba` and `Shuffle` added in M6, `Division` after 0.16):
+In `Strategy::deobfuscate()` only (`LinearMba` and `Shuffle` added in M6, `Division` in 0.17):
 
 | Pass | Fragment and algorithm |
 |-|-|
