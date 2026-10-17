@@ -106,6 +106,47 @@ assert_eq!(cx.prove(Query::Cmp(CmpOpExt::Ult, low, sixteen))?, Truth::True);
 # Ok::<(), bitwright::Error>(())
 ```
 
+The predicates of number theory have a value that no bit or range of their operands shows:
+`x² ≠ 7y² − 1` holds because a square is 0 or 1 modulo 4 and `7y² − 1` is 2 or 3. The
+simplifier decides them by residues, modulo powers of two (which machine arithmetic keeps, so
+they hold at every width) and, where the arithmetic cannot wrap (bytes or shorts widened before
+the product, as C promotes them), modulo the divisors of their remainders. However they are
+combined with real conditions, the opaque part goes, and a parity or alignment test in their
+disguise comes off:
+
+```rust
+use bitwright::engine::Engine;
+use bitwright::{Context, ParseOptions, Query, Truth, Width};
+
+let engine = Engine::standard();
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W64);
+for (predicate, value) in [
+    ("x * x != 7 * y * y - 1", "1:1"),
+    // OLLVM's bogus control flow: `x·(x − 1)` is even.
+    ("(((x * (x - 1)) & 1) == 0) | (y <s 10)", "1:1"),
+    // An odd square is 1 modulo 8; a sum of three squares is never 7 modulo 8.
+    ("((x & 1) == 0) | ((x * x & 7) == 1)", "1:1"),
+    ("x * x + y * y + z * z != 7", "1:1"),
+    // C's `%` on shorts: `s² + 1` is never a multiple of 3.
+    ("srem(sext<64>(s:16) * sext<64>(s:16) + 1, 3) != 0", "1:1"),
+    ("(x * x == 7 * y * y - 1) | (z == 3)", "z == 3"),
+    // `x` odd, disguised.
+    ("((x * x) & 7) == 1", "trunc<1>(x)"),
+] {
+    let e = cx.parse(predicate, &o)?;
+    let out = engine.simplify(&mut cx, e)?;
+    assert_eq!(cx.display(out.expr).to_string(), value, "{predicate}");
+}
+// Asked directly.
+let (square, other) = (cx.parse("x * x", &o)?, cx.parse("7 * y * y - 1", &o)?);
+assert_eq!(cx.prove(Query::Eq(square, other))?, Truth::False);
+# Ok::<(), bitwright::Error>(())
+```
+
+A predicate that only holds where the arithmetic does not wrap is left alone where it does:
+`(x³ − x) mod 3` is 0 over the integers, but at 8 bits `7³ − 7 = 336` wraps to 80.
+
 ## Conditions from lifted flags
 
 A lifter turns a compare-and-branch into the flags the instruction sets and the condition the

@@ -787,10 +787,11 @@ impl Context {
             return transfer(&TOp::Bin(crate::ops::BinOp::Shl), &[args[0], &one]);
         }
         if n.op == OpCode::Mul && n.a == n.b && args.len() == 2 {
-            // A square: its low bits follow from its operand's (a product's transfer does not
-            // know the operands are one value).
+            // A square: its low bits follow from its operand's, and where it cannot wrap it is
+            // at least 0 (a product's transfer does not know the operands are one value).
             let f = transfer(op, args);
-            return f.meet(&square_known(args[0])).unwrap_or(f);
+            let f = f.meet(&square_known(args[0])).unwrap_or(f);
+            return square_range(args[0]).and_then(|g| f.meet(&g)).unwrap_or(f);
         }
         if n.op == OpCode::Select {
             let f = transfer(op, args);
@@ -1741,8 +1742,85 @@ impl Context {
                 }
             }
         };
+        // What the facts leave open, residues may decide (`x·x != 7·y·y − 1`), relying on
+        // nothing.
+        if truth == Truth::Unknown
+            && let Some(v) = self.residue_truth(&q)?
+        {
+            return Ok(proof(Truth::from_opt(Some(v)), Reliance::NONE));
+        }
         Ok(proof(truth, rel))
     }
+
+    /// A comparison, a test against zero or a bit test decided by residues (see
+    /// `engine::pass::predicate`), if they show it constant.
+    fn residue_truth(&self, q: &Query<'_>) -> Result<Option<bool>, Error> {
+        use crate::engine::pass::predicate::{Pred, constant};
+        let (pred, flip) = match *q {
+            Query::IsZero(e) => (Pred::NonZero(self.id(e)?), true),
+            Query::IsNonZero(e) => (Pred::NonZero(self.id(e)?), false),
+            Query::Bit { e, bit, value } => (Pred::Bit(self.id(e)?, bit), !value),
+            Query::Eq(x, y) => (Pred::Cmp(CmpOp::Eq, self.id(x)?, self.id(y)?), false),
+            Query::Cmp(op, x, y) => {
+                let (op, swap) = op.canonical();
+                let (x, y) = (self.id(x)?, self.id(y)?);
+                let (x, y) = if swap { (y, x) } else { (x, y) };
+                (Pred::Cmp(op, x, y), false)
+            }
+            _ => return Ok(None),
+        };
+        Ok(constant(self, pred).0.map(|v| v != flip))
+    }
+}
+
+/// The values of `x·x` from those of `x`, at most 64 bits: with `x` signed between `−a` and `a`
+/// (and at least `b` in magnitude), a square below `2^(W−1)` is `[b², a²]` both signed and
+/// unsigned, and one below `2^W` unsigned; so is the square of an unsigned `[l, h]` with `h²`
+/// below `2^W`. `None` when neither applies.
+pub(crate) fn square_range(x: &Facts) -> Option<Facts> {
+    let w = x.width();
+    let wb = u32::from(w.bits());
+    if wb > 64 {
+        return None;
+    }
+    let (sl, sh) = (x.srange.lo().to_i128()?, x.srange.hi().to_i128()?);
+    let (ul, uh) = (x.urange.lo().to_u128()?, x.urange.hi().to_u128()?);
+    let top = 1u128 << wb;
+    let (amin, amax) = if sl <= 0 && sh >= 0 {
+        (0, sl.unsigned_abs().max(sh.unsigned_abs()))
+    } else {
+        let (a, b) = (sl.unsigned_abs(), sh.unsigned_abs());
+        (a.min(b), a.max(b))
+    };
+    let mut u = URange::full(w);
+    let mut sr = SRange::full(w);
+    let range = |lo: u128, hi: u128| {
+        URange::new(
+            BitVec::wrapping_from_u128(w, lo),
+            BitVec::wrapping_from_u128(w, hi),
+        )
+    };
+    let sq = |v: u128| v.checked_mul(v);
+    if let (Some(lo), Some(hi)) = (sq(amin), sq(amax))
+        && hi < top
+    {
+        u = range(lo, hi)?;
+        if hi < top >> 1 {
+            sr = SRange::new(
+                BitVec::wrapping_from_u128(w, lo),
+                BitVec::wrapping_from_u128(w, hi),
+            )?;
+        }
+    }
+    if let (Some(lo), Some(hi)) = (sq(ul), sq(uh))
+        && hi < top
+    {
+        u = u.meet(&range(lo, hi)?)?;
+    }
+    if u.is_full() && sr.is_full() {
+        return None;
+    }
+    Facts::new(KnownBits::unknown(w), u, sr)
 }
 
 /// The known low bits of `x·x` from those of `x`. Bit 1 of a square is 0 (squares are 0 or 1

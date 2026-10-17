@@ -2920,6 +2920,45 @@ fn floating_point_transfers_are_sound() {
     }
 }
 
+/// The ranges of a square contain every square of a value the operand's facts admit (at widths
+/// 1 to 8), and a square that cannot wrap is not negative.
+#[test]
+fn square_ranges_are_sound() {
+    let mut rng = Rng(0x5ca8);
+    let mut found = 0;
+    for w in 1..=8u16 {
+        for f in states(&mut rng, w, 60) {
+            let Some(sq) = super::square_range(&f) else {
+                continue;
+            };
+            found += 1;
+            for v in all_values(w) {
+                if !f.contains(&v) {
+                    continue;
+                }
+                let p = BitVec::apply_bin(BinOp::Mul, &v, &v).unwrap();
+                assert!(sq.contains(&p), "W={w} {f:?}: {v}² = {p} not in {sq:?}");
+            }
+        }
+    }
+    assert!(found > 50, "{found}");
+    // A sign-extended byte squared at 32 bits is in [0, 2^14].
+    let w = width(32);
+    let x = Facts::new(
+        KnownBits::unknown(w),
+        URange::full(w),
+        SRange::new(
+            BitVec::wrapping_from_i128(w, -128),
+            BitVec::wrapping_from_i128(w, 127),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sq = super::square_range(&x).unwrap();
+    assert_eq!(sq.srange().lo(), BitVec::zero(w));
+    assert_eq!(sq.srange().hi(), BitVec::wrapping_from_u64(w, 1 << 14));
+}
+
 /// The known bits of a square contain every square of a value the operand's facts admit:
 /// every known-bits pattern at widths 1 to 6.
 #[test]

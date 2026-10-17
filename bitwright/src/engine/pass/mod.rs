@@ -15,6 +15,7 @@ pub(super) mod linear_mba;
 pub(super) mod mba;
 mod order;
 mod poly;
+pub(crate) mod predicate;
 pub(super) mod residue;
 pub(super) mod shuffle;
 #[cfg(test)]

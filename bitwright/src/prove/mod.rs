@@ -588,7 +588,9 @@ struct Search {
 /// let mut cx = Context::new();
 /// let o = ParseOptions::width(Width::W16);
 /// let p = cx.parse("x * x != 0x1234", &o)?;
-/// let mut q = Question::valid(&mut cx, p, &Config::default().with_samples(0))?;
+/// // Without the engine's simplification first, which decides it by residues.
+/// let cfg = Config::default().with_samples(0).with_simplify(false);
+/// let mut q = Question::valid(&mut cx, p, &cfg)?;
 /// let mut out = q.solve(&mut cx, Limits::conflicts(10))?;
 /// while let Outcome::Unknown(why) = &out {
 ///     assert!(why.is_budget());

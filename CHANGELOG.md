@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- **Opaque predicates of number theory.** The compares pass decides a predicate by residues
+  where no bit or range of its operands shows its value: each leaf's value is taken modulo
+  `2^k`, the predicate is evaluated three-valued at every such class (a comparison of terms
+  whose known low bits differ is false), and an undecided class is split by the next bit, as
+  Hensel lifting does, until every class decides alike. So `x·x != 7·y·y − 1` is true at every
+  width (a square is 0 or 1 modulo 4, `7·y·y − 1` is 2 or 3), and so are `x·(x + 1)` even
+  (OLLVM's bogus control flow, `urem` or `srem`), `x·x == 8·y + 5` false, a sum of three
+  squares never 7 modulo 8, and their combinations with each other and with real conditions
+  (`(x & 1) == 0 | (x·x & 7) == 1` is true, `(x·x == 7·y·y − 1) | (z == 3)` is `z == 3`).
+  Before, only a predicate with a constant side was decided, at a fixed 4 bits. Masks,
+  extensions, extracts, concatenations, constant shifts both ways, selects and signed
+  remainders by powers of two (which keep the dividend's low bits) are read through; a
+  predicate over a few narrow values is decided by exhausting them.
+- **Other moduli, where the arithmetic cannot wrap.** Where intervals (from extensions, masks,
+  remainders, squares and constants) show that no sum, difference, product or shift wraps
+  around, unsigned or signed, the predicate is decided modulo the divisors of its remainders
+  and quotients, and modulo 3, 5 and 7 for its equalities: `urem(zext(a)·zext(a), 7) != 3`,
+  for a short `s` `srem(sext(s)·sext(s) + 1, 3) != 0` and `srem(s³ − s, 6) == 0`, and the
+  divisibility test `udiv(p, 3)·3 == p` with `p = d² + 1` (a multiple of the modulus has
+  residue 0 whatever its other factor). The native prover, which simplifies a question first
+  by default, now proves these in under a millisecond (its search did not finish them in
+  100,000 conflicts).
+- **Squares are not negative.** The facts of `x·x` include the range of a square where it
+  cannot wrap: `sext<64>(a:32)·sext<64>(a:32) >=s 0` is true.
+- **Disguised tests of low bits.** A predicate over one value that its low bits alone decide
+  becomes the test of the fewest of them: `(x·x & 7) == 1` is `trunc<1>(x)` (`x` odd),
+  `(x·x & 15) == 0` is `trunc<2>(x) == 0`, `(x·(x + 1) & 3) == 2` is
+  `trunc<2>(x) − 1 <=u 1`.
+- **`Context::prove`** answers a comparison, a test against zero or a bit test by residues
+  when the facts leave it open (`Query::Eq(x·x, 7·y·y − 1)` is false), building no node.
+- The residue searches are bounded (48 operations, 4 leaves, 16,384 operations evaluated per
+  search, charged to the pass budget), run only on a predicate with a product of a value with
+  itself, and stop at the first two points that disagree.
+- **Behavior changes.** Results change where the new decisions apply: predicates become
+  constants, disguised low-bit tests become plain ones, and facts of squares are tighter. A
+  comparison the compares pass re-emitted at the same size is now also checked by residues.
+
 ## 0.16.0
 
 - **Each program's own attributes:** translation validation reads each function's parameter

@@ -1103,10 +1103,48 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 let c = bool_const(r, cx, b)?;
                 return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
             }
+            if let Some(b) = super::predicate::decide(r, cx, n)? {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, b)?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
+            if let Some((x, j, truth)) = super::predicate::recover(r, cx, n)? {
+                let before = cx.len() as u32;
+                let t = r.build(cx, |cx| cx.c_extract(x, 0, j))?;
+                let e = if j == 1 {
+                    // One residue of two is true (the other, or it would be constant, is not).
+                    Some(if truth[1] {
+                        t
+                    } else {
+                        r.build(cx, |cx| cx.c_un(UnOp::Not, t))?
+                    })
+                } else {
+                    emit_values(r, cx, t, &residue_set(&truth, cx.width_of(t)), None)?
+                };
+                if let Some(e) = e {
+                    return finish(r, cx, PassKind::Compares, n, e, before, &[x], Fin::FINAL);
+                }
+                super::discard(r, cx, before);
+            }
             return order_step(r, cx, n);
         }
     };
-    finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)
+    let step = finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)?;
+    let Step::Normal(fin) = step else {
+        return Ok(step);
+    };
+    // Not smaller (`0 <=s x·x` as `x·x <=u smax`): residues may still show it constant.
+    if let Some(b) = super::predicate::decide(r, cx, n)? {
+        let before = cx.len() as u32;
+        let c = bool_const(r, cx, b)?;
+        return Ok(
+            match finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL)? {
+                Step::Normal(f) => Step::Normal(f.and(fin)),
+                to => to,
+            },
+        );
+    }
+    Ok(Step::Normal(fin))
 }
 
 /// `(x & 2^k) != 0` (`Some((x, k, true))`) or `(x & 2^k) == 0` (`false`).
@@ -1151,6 +1189,28 @@ fn residue_decide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Op
         return Ok(None);
     }
     Ok(Some(node.op == OpCode::Ne))
+}
+
+/// The values `r` below `2^W` where `truth[r]`, as an interval set.
+fn residue_set(truth: &[bool], w: Width) -> Set {
+    let mut out = Set::new();
+    let mut r = 0;
+    while r < truth.len() {
+        if !truth[r] {
+            r += 1;
+            continue;
+        }
+        let lo = r;
+        while r + 1 < truth.len() && truth[r + 1] {
+            r += 1;
+        }
+        out.push((
+            BitVec::wrapping_from_u64(w, lo as u64),
+            BitVec::wrapping_from_u64(w, r as u64),
+        ));
+        r += 1;
+    }
+    out
 }
 
 /// The order reading of `n` (see `order`).

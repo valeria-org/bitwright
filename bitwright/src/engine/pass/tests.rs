@@ -1576,6 +1576,331 @@ fn residue_fixtures() {
     same("(x * y) & 1", "(x * y) & 1");
 }
 
+/// A term of width `w` for the predicate tests: squares and products of sums, multiples, masks,
+/// shifts, remainders and quotients by small constants (unsigned and signed), and narrow values
+/// extended.
+fn predicate_term(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
+    let width = Width::new(w).unwrap();
+    if depth == 0 || g.rng.chance(1, 4) {
+        return match g.rng.below(7) {
+            0 => {
+                let v = BitVec::wrapping_from_u64(width, g.rng.below(16));
+                cx.constant(&v).unwrap()
+            }
+            1 => cx.symbol("y", width).unwrap(),
+            2 if w > 2 => {
+                let a = cx.symbol("a", Width::new(2).unwrap()).unwrap();
+                cx.zext(a, width).unwrap()
+            }
+            3 if w > 2 => {
+                let b = cx.symbol("b", Width::new(2).unwrap()).unwrap();
+                cx.sext(b, width).unwrap()
+            }
+            _ => cx.symbol("x", width).unwrap(),
+        };
+    }
+    let d = depth - 1;
+    let small = |g: &mut Gen, cx: &mut Context, n: u64| {
+        let v = BitVec::wrapping_from_u64(width, g.rng.below(n));
+        cx.constant(&v).unwrap()
+    };
+    match g.rng.below(11) {
+        0 | 1 => {
+            let t = predicate_term(g, cx, w, d);
+            cx.bin(BinOp::Mul, t, t).unwrap()
+        }
+        2 => {
+            let (a, b) = (predicate_term(g, cx, w, d), predicate_term(g, cx, w, d));
+            cx.bin(BinOp::Mul, a, b).unwrap()
+        }
+        3 => {
+            let (a, b) = (predicate_term(g, cx, w, d), predicate_term(g, cx, w, d));
+            cx.bin(BinOp::Add, a, b).unwrap()
+        }
+        4 => {
+            let (a, b) = (predicate_term(g, cx, w, d), predicate_term(g, cx, w, d));
+            cx.bin(BinOp::Sub, a, b).unwrap()
+        }
+        5 => {
+            let (t, k) = (predicate_term(g, cx, w, d), small(g, cx, 16));
+            cx.bin(BinOp::Mul, t, k).unwrap()
+        }
+        6 => {
+            let t = predicate_term(g, cx, w, d);
+            let m = cx
+                .constant_u64(width, (1u64 << g.rng.below(u64::from(w) + 1)) - 1)
+                .unwrap();
+            cx.bin(BinOp::And, t, m).unwrap()
+        }
+        7 => {
+            let (t, k) = (predicate_term(g, cx, w, d), small(g, cx, 4));
+            cx.bin(BinOp::Or, t, k).unwrap()
+        }
+        8 => {
+            let t = predicate_term(g, cx, w, d);
+            let k = BitVec::wrapping_from_u64(width, 2 + g.rng.below(6));
+            let k = cx.constant(&k).unwrap();
+            let op = [
+                BinOp::URem,
+                BinOp::URem,
+                BinOp::SRem,
+                BinOp::SRem,
+                BinOp::UDiv,
+                BinOp::SDiv,
+            ][g.rng.below(6) as usize];
+            cx.bin(op, t, k).unwrap()
+        }
+        9 => {
+            let t = predicate_term(g, cx, w, d);
+            let s = cx.constant_u64(width, g.rng.below(u64::from(w))).unwrap();
+            cx.bin(BinOp::Shl, t, s).unwrap()
+        }
+        _ => {
+            let (c, a, b) = (
+                predicate(g, cx, w, 0),
+                predicate_term(g, cx, w, d),
+                predicate_term(g, cx, w, d),
+            );
+            cx.select(c, a, b).unwrap()
+        }
+    }
+}
+
+/// A 1-bit predicate over [`predicate_term`]s: comparisons of two terms or of a term with a
+/// constant, under `& | ^ ~`.
+fn predicate(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
+    if depth == 0 || g.rng.chance(1, 3) {
+        let a = predicate_term(g, cx, w, 3);
+        let b = if g.rng.chance(1, 3) {
+            let v = BitVec::wrapping_from_u64(Width::new(w).unwrap(), g.rng.below(16));
+            cx.constant(&v).unwrap()
+        } else {
+            predicate_term(g, cx, w, 3)
+        };
+        let op = [
+            CmpOpExt::Eq,
+            CmpOpExt::Ne,
+            CmpOpExt::Eq,
+            CmpOpExt::Ne,
+            CmpOpExt::Ult,
+            CmpOpExt::Slt,
+        ][g.rng.below(6) as usize];
+        return cx.cmp(op, a, b).unwrap();
+    }
+    let p = predicate(g, cx, w, depth - 1);
+    if g.rng.chance(1, 4) {
+        return cx.un(UnOp::Not, p).unwrap();
+    }
+    let q = predicate(g, cx, w, depth - 1);
+    let op = [BinOp::And, BinOp::Or, BinOp::Xor][g.rng.below(3) as usize];
+    cx.bin(op, p, q).unwrap()
+}
+
+/// Predicates decided by residues: random predicates over squares, products, masks and
+/// remainders are folded only when constant (exhaustively checked), and many are.
+#[test]
+fn residue_predicates_are_sound() {
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0x0b5c_7e11);
+    let mut rng = Rng(53);
+    let mut decided = 0;
+    for _ in 0..3000 {
+        let mut cx = Context::new();
+        let w = 1 + g.rng.below(6) as u16;
+        let p = predicate(&mut g, &mut cx, w, 2);
+        let out = eng.run(&mut cx, &[p], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert!(
+            equivalent(&mut cx, p, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(p),
+            cx.display(r.expr)
+        );
+        decided += u64::from(r.changed && cx.const_val(cx.id(r.expr).unwrap()).is_some());
+    }
+    assert!(decided > 300, "{decided}");
+}
+
+/// The decision itself, on its own: a predicate it calls constant is constant (exhaustively
+/// checked), and it finds many of the constant ones the generator makes (those without a
+/// product of a value with itself, or with comparisons only full values decide, it leaves).
+#[test]
+fn residue_decision_is_sound() {
+    let mut g = generator(0x5e4c_0de1);
+    let mut rng = Rng(54);
+    let (mut constant, mut decided) = (0, 0);
+    for _ in 0..4000 {
+        let mut cx = Context::new();
+        let w = 1 + g.rng.below(6) as u16;
+        let p = predicate(&mut g, &mut cx, w, 2);
+        let id = cx.id(p).unwrap();
+        let (got, _) = super::predicate::constant(&cx, super::predicate::Pred::Node(id));
+        let t = cx.bool(true).unwrap();
+        let f = cx.bool(false).unwrap();
+        let truth = if equivalent(&mut cx, p, t, &mut rng) {
+            Some(true)
+        } else if equivalent(&mut cx, p, f, &mut rng) {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(v) = got {
+            assert_eq!(truth, Some(v), "W={w}: {} is not {v}", cx.display(p));
+            decided += 1;
+        }
+        constant += u32::from(truth.is_some() && cx.const_val(id).is_none());
+    }
+    assert!(decided * 2 > constant, "{decided} of {constant}");
+}
+
+/// The opaque predicates of number theory, as obfuscators write them, fold at every width; the
+/// ones that are not constant on machine integers (a product that wraps) stay.
+#[test]
+fn opaque_predicate_fixtures() {
+    let eng = Engine::standard();
+    for w in [8, 32, 64, 128] {
+        for (src, want) in [
+            ("x * x != 7 * y * y - 1", "1:1"),
+            ("7 * y * y - 1 == x * x", "0:1"),
+            ("x * x + 1 != 7 * y * y", "1:1"),
+            ("(x * x ^ (7 * y * y - 1)) == 0", "0:1"),
+            ("x * x + x == 2 * y + 1", "0:1"),
+            ("x * (x + 1) == 2 * y + 1", "0:1"),
+            ("x * x == 8 * y + 5", "0:1"),
+            ("x * x + y * y == 4 * z + 3", "0:1"),
+            ("x * x - y * y != 4 * z + 2", "1:1"),
+            ("x * x + y * y + z * z != 7", "1:1"),
+            ("x * x * x != 4 * y + 2", "1:1"),
+            ("(x * x | 1) != 7 * y * y - 1", "1:1"),
+            ("((x & 1) == 0) | ((x * x & 7) == 1)", "1:1"),
+            ("(urem(x * (x - 1), 2) == 0) | (y <s 10)", "1:1"),
+            ("(x * x == 7 * y * y - 1) | (x == 3)", "x == 3"),
+            ("(x * x != 7 * y * y - 1) & (x == 3)", "x == 3"),
+            // Disguised: the sum `x·x + t` and the difference `x·x − (7·y·y − 1)` as MBA.
+            ("(x * x ^ t) + 2 * (x * x & t) == 7 * y * y - 1 + t", "0:1"),
+            (
+                "((x * x | (7 * y * y - 1)) - (x * x & (7 * y * y - 1))) != 0",
+                "1:1",
+            ),
+            ("select(x * x != 7 * y * y - 1, z + 1, z * 3)", "z + 1"),
+            // Not constant: 2 is a difference of these modulo every power of two.
+            ("x * x != 7 * y * y + 2", "y * 7 * y + 2 != x * x"),
+        ] {
+            assert_eq!(simplify(&eng, src, w), want, "{src} at {w} bits");
+        }
+    }
+    // Signed remainders keep the low bits of their dividend; over values that do not wrap
+    // (zero- or sign-extended, unsigned or signed), residues modulo other numbers decide: no
+    // square is 3 modulo 7 or 2 modulo 3, `x² + 1` is never a multiple of 3, `x³ − x` always
+    // one of 6, a square is not negative. `None`: not a constant (a product that wraps).
+    for (src, want) in [
+        ("srem(x * (x + 1), 2) == 0", Some("1:1")),
+        ("srem(x * x, 4) != 2", Some("1:1")),
+        ("srem((2 * x + 1) * (2 * x + 1), 8) != 3", Some("1:1")),
+        ("urem(zext<32>(a:8) * zext<32>(a:8), 7) != 3", Some("1:1")),
+        (
+            "urem(zext<64>(c:16) * zext<64>(c:16) + 1, 3) != 0",
+            Some("1:1"),
+        ),
+        ("urem(zext<64>(d:32) * zext<64>(d:32), 7) != 3", Some("1:1")),
+        ("urem(zext<64>(d:32) * zext<64>(d:32), 3) == 2", Some("0:1")),
+        (
+            "urem(zext<64>(d:32) * (zext<64>(d:32) + 1), 6) != 1",
+            Some("1:1"),
+        ),
+        // A divisibility test: `d² + 1` is never a multiple of 3.
+        (
+            "udiv(zext<64>(d:32) * zext<64>(d:32) + 1, 3) * 3 == zext<64>(d:32) * zext<64>(d:32) + 1",
+            Some("0:1"),
+        ),
+        (
+            "zext<64>(d:32) * zext<64>(d:32) + 1 != 3 * zext<64>(e:32)",
+            Some("1:1"),
+        ),
+        (
+            "urem(zext<32>(a:8) * (zext<32>(a:8) + 1) * (zext<32>(a:8) + 2), 3) == 0",
+            Some("1:1"),
+        ),
+        (
+            "srem(sext<64>(c:16) * sext<64>(c:16) + 1, 3) != 0",
+            Some("1:1"),
+        ),
+        (
+            "srem(sext<64>(c:16) * sext<64>(c:16) * sext<64>(c:16) - sext<64>(c:16), 6) == 0",
+            Some("1:1"),
+        ),
+        ("sext<32>(a:8) * sext<32>(a:8) >=s 0", Some("1:1")),
+        ("sext<64>(d:32) * sext<64>(d:32) >=s 0", Some("1:1")),
+        ("x * x >=s 0", None),
+        // Wraps: x = 7 at 8 bits, 336 mod 256 = 80.
+        ("urem(x * x * x - x, 3) == 0", None),
+        ("urem(x * x, 7) != 3", None),
+    ] {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        let got = cx.display(out.expr).to_string();
+        match want {
+            Some(want) => assert_eq!(got, want, "{src}"),
+            None => assert!(
+                cx.const_val(cx.id(out.expr).unwrap()).is_none(),
+                "{src}: {got}"
+            ),
+        }
+    }
+}
+
+/// A predicate over one value that only its low bits decide is recovered as the test of those
+/// bits: parity and alignment tests in disguise.
+#[test]
+fn residue_tests_are_recovered() {
+    let eng = Engine::standard();
+    for w in [8, 32, 64] {
+        for (src, want) in [
+            ("((x * x) & 7) == 1", "trunc<1>(x)"),
+            ("((x * x) & 7) != 1", "~trunc<1>(x)"),
+            ("((x * x) & 3) == 0", "~trunc<1>(x)"),
+            ("((x * x) & 15) == 0", "trunc<2>(x) == 0"),
+            ("((x * x * x) & 7) == 1", "trunc<3>(x) == 1"),
+            // 1 or 2 modulo 4.
+            ("((x * (x + 1)) & 3) == 2", "trunc<2>(x) - 1 <=u 1"),
+        ] {
+            assert_eq!(simplify(&eng, src, w), want, "{src} at {w} bits");
+        }
+    }
+}
+
+/// `Context::prove` answers what residues decide, about expressions it does not build: the
+/// equality, the order, the test against zero and the bit.
+#[test]
+fn prove_decides_by_residues() {
+    use crate::{Query, Truth};
+    for w in [8, 64] {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let sq = cx.parse("x * x", &o).unwrap();
+        let rhs = cx.parse("7 * y * y - 1", &o).unwrap();
+        let d = cx.bin(BinOp::Sub, sq, rhs).unwrap();
+        // `x·(x + 1)` is even: bit 0 is 0.
+        let e = cx.parse("x * (x + 1) + y * y * 4", &o).unwrap();
+        let open = cx.parse("x * x != 7 * y * y + 2", &o).unwrap();
+        let before = cx.len();
+        assert_eq!(cx.prove(Query::Eq(sq, rhs)).unwrap(), Truth::False);
+        assert_eq!(
+            cx.prove(Query::Cmp(CmpOpExt::Ne, rhs, sq)).unwrap(),
+            Truth::True
+        );
+        assert_eq!(cx.prove(Query::IsZero(d)).unwrap(), Truth::False);
+        assert_eq!(cx.prove(Query::IsNonZero(d)).unwrap(), Truth::True);
+        let bit = |value| Query::Bit { e, bit: 0, value };
+        assert_eq!(cx.prove(bit(false)).unwrap(), Truth::True);
+        assert_eq!(cx.prove(bit(true)).unwrap(), Truth::False);
+        assert_eq!(cx.prove(Query::IsNonZero(open)).unwrap(), Truth::Unknown);
+        // Nothing was built for the questions.
+        assert_eq!(cx.len(), before);
+    }
+}
+
 /// Sign extension spelled with shifts or with xor and a subtraction, and bit tests through a
 /// mask: equivalent at every shift and mask at small widths, and recognized.
 #[test]

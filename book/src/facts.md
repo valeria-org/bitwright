@@ -61,6 +61,11 @@ assert_eq!(cx.prove(Query::IsZero(y))?, Truth::Unknown); // y may or may not be 
 # Ok::<(), bitwright::Error>(())
 ```
 
+What the facts leave open, a comparison, a test against zero or a bit test may still be decided
+by residues, as the simplifier decides the predicates of number theory (`x·x == 7·y·y − 1` is
+false; see [Opaque predicates](examples.md#opaque-predicates-and-dead-code)), without building
+any node.
+
 `Query::Injective` and `Query::Bijective` ask whether an expression is an invertible function
 of one of its subexpressions; see [Invertibility](invertibility.md).
 

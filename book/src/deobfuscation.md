@@ -185,7 +185,11 @@ combines with MBA, all in the same run:
 
 - **Opaque predicates.** A condition whose value follows from the known bits or the ranges of
   its operands is folded by the facts, so the dead arm of a branch or a `select` goes (see
-  [Facts and proofs](facts.md)).
+  [Facts and proofs](facts.md)). So is one of number theory, decided by residues: modulo
+  powers of two (`x² ≠ 7y² − 1`, `x·(x + 1)` even, an odd square 1 modulo 8) and, where the
+  arithmetic cannot wrap, modulo the divisors of its remainders (`(a² + 1) mod 3 ≠ 0` for a
+  byte or a short `a`). A test of low bits in such a disguise becomes the plain test
+  (`(x² & 7) == 1` is `x` odd).
 - **Encoded constants.** Multiplications by an odd constant and its inverse, complements that
   cancel and sums that add up to a constant fold in the linear and rule passes.
 - **Lifted flags.** Sign, overflow, carry and zero flags spelled out bit by bit, and the flags
