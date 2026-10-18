@@ -1276,12 +1276,19 @@ pub mod mba {
     before a test decides on it, and any refutation's counterexample is checked on the two
     sides; either failing would be a bug, and the question is declined (`CertStats::internal`,
     an assertion in debug builds).
-  - *Symbolic*: when no direct test fits a pair of polynomial sides (or it is over its
-    budget), both are expanded as polynomials over symbols (variables, conjunctions of the
-    leaves of a bitwise function by its Möbius expansion, other bitwise subterms by their
-    structure; at most 4,096 monomials). Equal polynomials are equal functions whatever the
-    symbols' values; unequal ones decide nothing (`(x & 1)² = x & 1` holds bit by bit, not as
-    polynomials). Inside the compositional test it compares skeletons no direct test fits.
+  - *Symbolic*: both sides are expanded as polynomials over symbols (variables, conjunctions
+    of the leaves of a bitwise function by its Möbius expansion, other bitwise subterms by
+    their structure; at most 4,096 monomials). Equal polynomials are equal functions whatever
+    the symbols' values; unequal ones decide nothing (`(x & 1)² = x & 1` holds bit by bit, not
+    as polynomials). It runs when no direct test fits a pair of polynomial sides (or the test
+    is over its budget), and before a polynomial test that would take far longer: its work, a
+    unit per monomial operation (about as long as a thousand node evaluations), is capped at
+    half the test's estimated time and at what leaves the test affordable. It proves only
+    pairs the test finds equal, and when it decides nothing the test still fits, so a
+    certificate's verdict is the same at every budget and only its work changes:
+    `(x & y)·(x | y) + (x & ~y)·(~x & y) = x·y` at 64 bits takes 43 units instead of the
+    degree-2 test's 18,337 points (256,718 units). Inside the compositional test it compares
+    skeletons the same way.
   - *Carries*: sides built from `+ − neg ~ & | ^`, constants, left shifts by at most 8 and
     products by a constant of at most 9 bits (or its negation, whichever needs less state: a
     sum of shifts) are T-functions: bit `j` depends on bits `0..=j` of the variables through a

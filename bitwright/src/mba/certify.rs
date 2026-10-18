@@ -36,7 +36,10 @@
 //!   cover every input, and each is proved on its own.
 //!
 //! Every test is sized before it runs and charged a block at a time; one over the budget is
-//! not run. `Refuted` always comes with a concrete input where the two sides differ.
+//! not run. A polynomial test that would take far longer than reading both sides as
+//! polynomials over symbols ([`symbolic_equal`], which only ever proves) tries that first: the
+//! verdict is the test's either way, at a fraction of the work when the polynomials are equal.
+//! `Refuted` always comes with a concrete input where the two sides differ.
 
 use std::collections::HashMap;
 
@@ -81,6 +84,12 @@ const SPLIT_EFFORT: u64 = MAX_EFFORT;
 /// Work charged per node for reading known bits as arithmetic (a transfer of facts costs about
 /// as much as evaluating a node at this many points).
 pub(crate) const LOWER_COST: u64 = 64;
+
+/// Node evaluations (one lane each, a block at a time) that take about as long as one unit of
+/// symbolic work, a monomial operation (measured: 0.3–0.4 ns against 100–400 ns). It decides
+/// when the symbolic comparison is worth trying ahead of a test (see [`run`]); each is still
+/// charged in its own units.
+const SYMBOLIC_UNIT: u64 = 1 << 10;
 
 /// Work accounting for a certificate: units are node evaluations (one per node per point).
 pub(crate) trait Meter {
@@ -509,9 +518,28 @@ pub(crate) fn prove_with(a: &MbaExpr, b: &MbaExpr, cert: Cert) -> Option<bool> {
         p.points = sparse_points(pa.width.bits(), p.used.len(), 2);
     }
     let mut report = Report::new();
-    match run(&mut Steps::new(u64::MAX), a, b, &p, &mut report).ok()? {
-        Run::Equal => Some(true),
+    match test(&mut Steps::new(u64::MAX), a, b, &p, &mut report, false).ok()? {
+        Run::Equal(_) => Some(true),
         Run::Differ(_) => Some(false),
+        _ => None,
+    }
+}
+
+/// The cheapest direct test on `a` and `b`, with the symbolic comparison tried first where
+/// [`run`] tries it or never (for tests): `Some((equal, the test that decided, the input
+/// where they differ))`.
+#[cfg(test)]
+pub(crate) fn direct(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    symbolic: bool,
+) -> Option<(bool, Cert, Option<Vec<BitVec>>)> {
+    let (pa, pb) = (profile(a)?, profile(b)?);
+    let p = plan(a, &pa, &pb)?;
+    let mut report = Report::new();
+    match test(&mut Steps::new(u64::MAX), a, b, &p, &mut report, symbolic).ok()? {
+        Run::Equal(cert) => Some((true, cert, None)),
+        Run::Differ(point) => Some((false, p.cert, Some(point))),
         _ => None,
     }
 }
@@ -715,7 +743,8 @@ impl Points {
 
 /// The outcome of one test.
 enum Run {
-    Equal,
+    /// Equal everywhere: by the test, or by the symbolic comparison it ran first (see [`run`]).
+    Equal(Cert),
     /// A point (one value per variable) where the sides differ.
     Differ(Vec<BitVec>),
     /// Not run: over the budget.
@@ -724,12 +753,30 @@ enum Run {
     TooBig,
 }
 
+/// Runs a planned test. A polynomial test that would take far longer than the symbolic
+/// comparison ([`symbolic_equal`]) runs the comparison first: within half the test's time
+/// (at [`SYMBOLIC_UNIT`] evaluations per unit of its work) and within what leaves the test
+/// affordable, so one that decides nothing never puts the test over budget. It proves only
+/// sides that are equal everywhere, which the test would find equal too, so the outcome is the
+/// test's own and only the work changes.
 fn run<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
     b: &MbaExpr,
     plan: &Plan,
     report: &mut Report,
+) -> Result<Run, M::Err> {
+    test(meter, a, b, plan, report, true)
+}
+
+/// [`run`]; without `symbolic`, the planned test alone.
+fn test<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    plan: &Plan,
+    report: &mut Report,
+    symbolic: bool,
 ) -> Result<Run, M::Err> {
     let (Some(pa), Some(pb)) = (Program::new(a, false), Program::new(b, false)) else {
         return Ok(Run::TooBig);
@@ -745,9 +792,21 @@ fn run<M: Meter>(
     {
         return Ok(Run::TooBig);
     }
-    if plan.points.saturating_mul(per) > meter.left() {
+    let cost = plan.points.saturating_mul(per);
+    if cost > meter.left() {
         report.over_budget = true;
         return Ok(Run::OverBudget);
+    }
+    // The polynomial tests are planned for polynomial sides only, which the comparison reads;
+    // it takes at least a unit per node.
+    let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() - cost);
+    if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
+        let mut work = 0;
+        let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
+        meter.charge(work.min(cap))?;
+        if equal {
+            return Ok(Run::Equal(Cert::Symbolic));
+        }
     }
     let width = a.width().map_or(1, |w| w.bits());
     match kind {
@@ -775,7 +834,7 @@ fn run_in<L: Lane, M: Meter>(
     loop {
         let n = points.fill(&mut cols, &plan.used, vars, &masks);
         if n == 0 {
-            return Ok(Run::Equal);
+            return Ok(Run::Equal(plan.cert));
         }
         meter.charge(per * n as u64)?;
         report.points += n as u64;
@@ -974,9 +1033,9 @@ fn prove_at<M: Meter>(
     }
     if let Some(p) = direct {
         match run(meter, a, b, &p, &mut report)? {
-            Run::Equal => {
+            Run::Equal(cert) => {
                 report.verdict = Verdict::Proved;
-                report.cert = Some(p.cert);
+                report.cert = Some(cert);
                 return Ok(report);
             }
             Run::Differ(point) => {
@@ -1912,8 +1971,8 @@ impl Compose {
             return self.eliminate(meter, report, &mut vm, [a, b], w);
         }
         Ok(match direct {
-            Run::Equal => {
-                report.cert = Some(p.cert);
+            Run::Equal(cert) => {
+                report.cert = Some(cert);
                 (Some(Verdict::Proved), None)
             }
             Run::Differ(point) if !vm.abstracted => {
@@ -2074,7 +2133,7 @@ impl Compose {
                 }
                 let linear = match plan(side, &ps, &pt) {
                     Some(p) => match run(meter, side, &t, &p, report)? {
-                        Run::Equal => true,
+                        Run::Equal(_) => true,
                         Run::Differ(_) => false,
                         Run::TooBig | Run::OverBudget => symbolic(meter, side, &t, report)?,
                     },
@@ -2106,8 +2165,8 @@ impl Compose {
             });
         };
         Ok(match run(meter, &a, &b, &p, report)? {
-            Run::Equal => {
-                report.cert = Some(p.cert);
+            Run::Equal(cert) => {
+                report.cert = Some(cert);
                 (Some(Verdict::Proved), None)
             }
             Run::Differ(_) => (Some(Verdict::Unknown), None),
@@ -3102,8 +3161,8 @@ impl SymPoly {
 /// integer expansion (`x | y` is `x + y − (x & y)`, every bit alike); and any other bitwise
 /// subterm, one symbol by its structure. Equal polynomials are equal functions, whatever the
 /// symbols' values (so for their actual ones); unequal ones decide nothing. `None` past
-/// [`SYMBOLIC_TERMS`]. Work: one unit per monomial operation.
-pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, work: &mut u64) -> Option<bool> {
+/// [`SYMBOLIC_TERMS`], or once `work` is past `limit`. Work: one unit per monomial operation.
+pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u64) -> Option<bool> {
     let w = a.width()?;
     if b.width()? != w || a.vars() != b.vars() {
         return None;
@@ -3157,6 +3216,9 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, work: &mut u64) -> Option
                 MOp::Mul => {
                     let (x, y) = (arg(0)?, arg(1)?);
                     *work = work.saturating_add((x.0.len() * y.0.len()) as u64);
+                    if *work > limit {
+                        return None;
+                    }
                     x.mul(&y)?
                 }
                 MOp::And | MOp::Or | MOp::Xor | MOp::Not => {
@@ -3259,6 +3321,9 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, work: &mut u64) -> Option
             }
         };
         *work = work.saturating_add(p.0.len() as u64 + 1);
+        if *work > limit {
+            return None;
+        }
         polys[i] = Some(p);
     }
     let (pa, pb) = (
@@ -3277,7 +3342,7 @@ fn symbolic<M: Meter>(
     report: &mut Report,
 ) -> Result<bool, M::Err> {
     let mut work = 0u64;
-    let equal = symbolic_equal(a, b, &mut work) == Some(true);
+    let equal = symbolic_equal(a, b, u64::MAX, &mut work) == Some(true);
     meter.charge(work.min(meter.left()))?;
     if equal {
         report.verdict = Verdict::Proved;
@@ -3431,9 +3496,10 @@ fn digests_in<L: Lane>(
 
 /// bitwright's own exact equivalence checks as an [`EquivalenceProver`]: the refutation sample,
 /// then the cheapest certificate that applies (the corner signature, single bit positions, at
-/// most `d` bit positions for degree `d`, the pure-polynomial grid, exhaustive evaluation), over
-/// abstracted atoms when a side leaves the polynomial fragment. The same checks are the evidence
-/// gate's own, so an engine needs this prover only when its host uses the MBA module directly.
+/// most `d` bit positions for degree `d`, the pure-polynomial grid, exhaustive evaluation; equal
+/// polynomials over symbols first where that test would take far longer), over abstracted
+/// atoms when a side leaves the polynomial fragment. The same checks are the evidence gate's
+/// own, so an engine needs this prover only when its host uses the MBA module directly.
 ///
 /// Work is counted in node evaluations against [`MbaBudget::steps`]; a certificate over the
 /// budget is not run (`Unknown`). `Refuted` comes with a concrete counterexample.
@@ -3442,7 +3508,8 @@ fn digests_in<L: Lane>(
 /// use bitwright::mba::{EquivalenceProver, MOp, MbaBudget, MbaExpr, NativeProver, Verdict};
 /// use bitwright::Width;
 ///
-/// // (x & y)·(x | y) + (x & ~y)·(~x & y) == x·y, a degree-2 identity, at 64 bits.
+/// // (x & y)·(x | y) + (x & ~y)·(~x & y) == x·y, a degree-2 identity, at 64 bits: the same
+/// // polynomial over x, y and x & y, so it takes none of the degree-2 test's 18,337 points.
 /// let w = Width::W64;
 /// let mut a = MbaExpr::new(vec![w, w]);
 /// let (x, y) = (a.push(MOp::Var(0), &[])?, a.push(MOp::Var(1), &[])?);
@@ -3457,7 +3524,7 @@ fn digests_in<L: Lane>(
 /// b.push(MOp::Mul, &[x, y])?;
 /// let prover = NativeProver::default();
 /// assert_eq!(prover.prove_equal(&a, &b, &MbaBudget::default()), Verdict::Proved);
-/// assert_eq!(prover.stats().sparse, 1);
+/// assert_eq!((prover.stats().symbolic, prover.stats().sparse), (1, 0));
 /// # Ok::<(), bitwright::mba::MbaError>(())
 /// ```
 ///

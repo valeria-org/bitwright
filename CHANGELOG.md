@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Cheaper MBA certificates.** A polynomial test that would take far longer than reading both
+  sides as polynomials over symbols now tries that first (the symbolic comparison,
+  `CertStats::symbolic`, which ran only where no test fit or the test was over its budget).
+  It proves only sides that are equal everywhere, which the test finds equal too, and its work
+  is capped at half the test's estimated time and at what leaves the test affordable, so a
+  comparison that decides nothing never costs the test its budget: every certificate's verdict
+  is the same at every budget, and only its work changes. The 48 MBA identities of
+  `bitwright-bench --prover-budgets` take 20,371 units of pass work and 23.2 million
+  instructions under the default budget, where they took 3,100,471 and 57.0 million (12
+  products at 18,337 points each); fuel `2^14` spent 20,371 before and still does.
+  `simplify/mba-nonlinear/64` takes 82 % fewer instructions, `simplify/mba-nonlinear/8` 2.7 %
+  fewer, and the normal-form solver's nonlinear corpus of `--corpus-diff` at 64 bits 0.30 G
+  instead of 2.73 G; every `--corpus-diff` result is the same.
+- **Behavior changes.** None in results under the default budgets: `--corpus-diff`, the
+  `simplify/mba*` rows and `--prover-budgets` answer as before, and so does `compare/`'s
+  `bw-nf` on every expression of CoBRA's datasets (76,080). Certificates spend less of a
+  budget, so a run a budget stops may get further than before. `CertStats` counts proofs the
+  symbolic comparison makes first as `symbolic` (the `NativeProver` example's identity, once
+  `sparse`).
+
 ## 0.19.0
 
 - **A budget for the prover's simplification.** `prove::Config::simplify_budget`, an

@@ -2776,12 +2776,12 @@ mod mba_service {
         let wrong = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_ne!(out.roots[0].expr, wrong);
         assert!(out.stats.mba.proof_unknown > 0);
-        // A right answer bitwright can prove itself is taken without any trust: here by the
-        // degree-2 certificate.
+        // A right answer bitwright can prove itself is taken without any trust: here as the
+        // same polynomial over symbols, tried ahead of the degree-2 certificate's 18,337 points.
         let (mut cx, out, _) = run(&mba_engine(Arc::new(Unproven), no_trust), NONLINEAR);
         let want = cx.parse("x + y", &ParseOptions::width(Width::W64)).unwrap();
         assert_eq!(out.roots[0].expr, want);
-        assert!(out.stats.mba.certificates.sparse > 0);
+        assert!(out.stats.mba.certificates.symbolic > 0);
         // A right but unproven answer no native certificate reaches: rejected by default,
         // accepted when sampling is trusted, and accepted by default when a prover proves it.
         let (mut cx, out, _) = run(

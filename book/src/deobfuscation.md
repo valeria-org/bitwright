@@ -139,7 +139,10 @@ bitwright's certificates are finite evaluation tests, each complete for its frag
   other's complements, `x − 1` and `−x`, or when an atom's bits follow a bitwise function of
   its definition's leaves), and the two skeletons are compared by one of the tests above;
 - **polynomials over symbols**: two sides that expand to the same polynomial in variables,
-  conjunctions and other bitwise subterms are equal whatever values those take;
+  conjunctions and other bitwise subterms are equal whatever values those take. Where a test
+  above would take far longer, this is tried first; it never refutes, so the verdict is the
+  test's either way (the identity above is the same polynomial over `x`, `y` and `x & y`, and
+  is proved without its 18,337 points);
 - **carries**: expressions built from `+ − ~ & | ^`, small left shifts and products by small
   constants are compared bit by bit, over every carry that can reach each position, which
   decides them exactly (`(y + y) & y & −y` is 0 at every width);

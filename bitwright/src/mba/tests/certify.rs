@@ -343,7 +343,7 @@ fn certificates_are_sized_and_budgeted() {
     assert_eq!(full.points, certify::sparse_points(64, 3, 2));
     // Every budget from 0 up: never a wrong verdict, and unknown (over budget) below the size.
     let need = full.points * (a.nodes().len() + b.nodes().len()) as u64;
-    for budget in [0, 1, 100, need / 2, need - 1, need] {
+    for budget in [0, 1, 100, need / 2, need - 1, need, need + 1, need + 1000] {
         let mut m = Steps::new(budget);
         let r = certify::prove(&a, &b, &mut m).unwrap();
         if budget < need {
@@ -352,7 +352,18 @@ fn certificates_are_sized_and_budgeted() {
             // Nothing is spent on a test that is not run; the symbolic comparison is cheap.
             assert!(m.spent <= 64 && m.spent <= budget, "{budget}: {}", m.spent);
         } else {
-            assert_eq!(r.verdict, Verdict::Proved);
+            // Tried first where something is left beside the test, the symbolic comparison
+            // decides nothing here and leaves the test what it needs.
+            assert_eq!(
+                (r.verdict, r.cert, r.points),
+                (Verdict::Proved, Some(Cert::Sparse), full.points),
+                "{budget}"
+            );
+            assert!(
+                m.spent >= need && m.spent <= budget,
+                "{budget}: {}",
+                m.spent
+            );
         }
     }
     // The prover counts it.
@@ -661,12 +672,15 @@ fn symbolic_equality_is_polynomial_identity_only() {
         )
         .expr(&vars);
         let b = mul(x.clone(), y.clone()).expr(&vars);
-        assert_eq!(certify::symbolic_equal(&a, &b, &mut work), Some(true));
+        assert_eq!(
+            certify::symbolic_equal(&a, &b, u64::MAX, &mut work),
+            Some(true)
+        );
         // (x & 1)² = x & 1 bit by bit, not as polynomials: undecided here.
         let low = || and(x.clone(), k(width, 1));
         let a = mul(low(), low()).expr(&vars);
         assert_eq!(
-            certify::symbolic_equal(&a, &low().expr(&vars), &mut work),
+            certify::symbolic_equal(&a, &low().expr(&vars), u64::MAX, &mut work),
             Some(false)
         );
     }
@@ -674,7 +688,7 @@ fn symbolic_equality_is_polynomial_identity_only() {
     let w = Width::W64;
     let vars = [w, w, w];
     for (a, b) in pairs(Frag::Poly, 64, 3, 0x5e11, 300) {
-        if certify::symbolic_equal(&a, &b, &mut work) == Some(true) {
+        if certify::symbolic_equal(&a, &b, u64::MAX, &mut work) == Some(true) {
             let mut rng = crate::testutil::Rng(3);
             for _ in 0..256 {
                 let p: Vec<BitVec> = vars
@@ -685,6 +699,88 @@ fn symbolic_equality_is_polynomial_identity_only() {
             }
         }
     }
+}
+
+#[test]
+fn a_long_test_tries_the_symbolic_comparison_first() {
+    // (x & y)·(x | y) + (x & ~y)·(~x & y) = x·y at 64 bits: 18,337 points of degree 2, or the
+    // same polynomial over x, y and x & y.
+    let w = Width::W64;
+    let vars = [w, w];
+    let (x, y) = (V(0), V(1));
+    let a = add(
+        mul(and(x.clone(), y.clone()), or(x.clone(), y.clone())),
+        mul(
+            and(x.clone(), not(y.clone())),
+            and(not(x.clone()), y.clone()),
+        ),
+    )
+    .expr(&vars);
+    let b = mul(x.clone(), y.clone()).expr(&vars);
+    let mut work = 0;
+    assert_eq!(
+        certify::symbolic_equal(&a, &b, u64::MAX, &mut work),
+        Some(true)
+    );
+    // Past its limit, the comparison stops and decides nothing.
+    assert_eq!(certify::symbolic_equal(&a, &b, work - 1, &mut 0), None);
+    let mut m = Steps::new(u64::MAX);
+    let r = certify::prove(&a, &b, &mut m).unwrap();
+    assert_eq!(
+        (r.verdict, r.cert, r.points),
+        (Verdict::Proved, Some(Cert::Symbolic), 0)
+    );
+    assert_eq!(m.spent, work);
+    // A budget that covers the test and no more leaves nothing to try first with.
+    let points = certify::sparse_points(64, 2, 2);
+    let need = points * (a.nodes().len() + b.nodes().len()) as u64;
+    let mut m = Steps::new(need);
+    let r = certify::prove(&a, &b, &mut m).unwrap();
+    assert_eq!(
+        (r.verdict, r.cert, r.points),
+        (Verdict::Proved, Some(Cert::Sparse), points)
+    );
+    assert_eq!(m.spent, need);
+    // With the comparison's work beside it, the comparison decides.
+    let mut m = Steps::new(need + work);
+    let r = certify::prove(&a, &b, &mut m).unwrap();
+    assert_eq!((r.verdict, r.cert), (Verdict::Proved, Some(Cert::Symbolic)));
+    assert_eq!(m.spent, work);
+    // The test alone proves it too.
+    assert_eq!(certify::prove_with(&a, &b, Cert::Sparse), Some(true));
+}
+
+#[test]
+fn trying_the_symbolic_comparison_first_changes_no_outcome() {
+    // Wherever it is tried (tests long next to it: degree 2 from 64 bits on, degree 1 at 512
+    // bits), the outcome with it is the outcome without it: equal or not, at the same input.
+    let mut first = 0;
+    for (i, (w, t)) in [(64u16, 2u32), (64, 3), (128, 2), (512, 2)]
+        .into_iter()
+        .enumerate()
+    {
+        for frag in [Frag::SemiLinear, Frag::Poly] {
+            for (a, b) in pairs(frag, w, t, 0x5f1e_0000 + i as u64 * 16, 60) {
+                let (Some(with), Some(without)) = (
+                    certify::direct(&a, &b, true),
+                    certify::direct(&a, &b, false),
+                ) else {
+                    continue;
+                };
+                assert_eq!(
+                    (with.0, &with.2),
+                    (without.0, &without.2),
+                    "w={w}\n{a:?}\n{b:?}"
+                );
+                if with.1 == Cert::Symbolic {
+                    first += 1;
+                } else {
+                    assert_eq!(with.1, without.1);
+                }
+            }
+        }
+    }
+    assert!(first >= 10, "{first}");
 }
 
 #[test]

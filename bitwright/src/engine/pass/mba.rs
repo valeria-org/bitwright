@@ -63,9 +63,10 @@ impl certify::Meter for Gate<'_, '_, '_> {
 
 /// bitwright's own exact evidence about `a == b`: the cheapest certificate that applies (the
 /// corner signature, single bit positions, sparse points for degree `d`, the pure-polynomial
-/// grid, exhaustive evaluation), over abstracted atoms when a side leaves the polynomial
-/// fragment. Charged as pass work, a block at a time, so a budget or deadline can stop it; a
-/// certificate larger than what is left is not started (reported as over budget).
+/// grid, exhaustive evaluation; equal polynomials over symbols first where that test would
+/// take far longer), over abstracted atoms when a side leaves the polynomial fragment. Charged
+/// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
+/// than what is left is not started (reported as over budget).
 fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
     let report = certify::prove(a, b, &mut Gate(r))?;
     count(r).certificates.record(&report);
