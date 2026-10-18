@@ -64,6 +64,10 @@ group core.arith {
     #[example("p - (p & q)" => "p & ~q")]
     rule sub_and<W>(x: W, y: W) { x - (x & y) => x & ~y }
 
+    /// The bits an or adds.
+    #[example("(p | q) - p" => "q & ~p")]
+    rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }
+
     /// `-~x = x + 1`.
     #[example("-(~p)" => "p + 1")]
     rule neg_not<W>(x: W) { -(~x) => x + 1 }

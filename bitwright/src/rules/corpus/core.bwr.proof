@@ -8,6 +8,7 @@ core.arith::neg_or_one 98376163b2a5e94798912073d97d99ce rule exhaustive(inst=6,m
 core.arith::not_neg 96eba82dd2b9705852f297d0e47405d2 rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)
 core.arith::or_from_xor_and a443c4a7e3f9daf9bff105bcdadf5353 rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
 core.arith::sub_and f494f97854ab0848902d5d10e05d614e rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
+core.arith::sub_or 98af6cc381e96fdd11156579398556cb rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
 core.arith::udiv_pow2 ba7f88934bfc987b78342932a53ee20c rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=920)
 core.arith::urem_pow2 dc139eed7a696ecabc31d530548007af rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=892)
 core.bitwise::and_absorb_or 9fd8d816ee32d581eb8d62a20c32876f rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)

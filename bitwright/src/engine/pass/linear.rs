@@ -127,6 +127,17 @@ impl Form {
         }
     }
 
+    /// The form modulo `2^j` (`j` up to the width): the constant and coefficients by their low
+    /// `j` bits, sign-extended, and terms whose coefficient that makes 0 dropped.
+    pub(super) fn reduce(&self, j: crate::Width) -> Form {
+        let w = self.konst.width();
+        let low = |v: &BitVec| v.trunc(j).and_then(|t| t.sext(w)).unwrap_or(*v);
+        let terms: Vec<(u32, BitVec)> = self.terms.iter().map(|&(a, k)| (a, low(&k))).collect();
+        let mut f = Form::of(low(&self.konst), &terms);
+        f.fin = self.fin;
+        f
+    }
+
     fn neg(&self) -> Form {
         let w = self.konst.width();
         self.scale(&BitVec::ones(w))
@@ -520,6 +531,19 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if form.is_atom_of(n) {
         return Ok(Step::Normal(form.fin));
     }
+    // Terms reading one condition, merged first (see `conditions`).
+    let merged = match super::conditions::step(r, cx, n, &form)? {
+        Ok(s) => return Ok(s),
+        Err(f) => f,
+    };
+    Ok(match plain(r, cx, n, form)? {
+        Step::Normal(f) => Step::Normal(f.and(merged)),
+        s => s,
+    })
+}
+
+/// The linear pass at `n` over its form as computed.
+fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result<Step, Stop> {
     let mut atoms: Vec<u32> = form.terms.iter().map(|t| t.0).collect();
     atoms.sort_unstable();
     let estimate = estimate(&form);

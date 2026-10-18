@@ -4,8 +4,9 @@
 //!
 //! Under a mask, `a & k` with `k ⊇ m` is `a`; `a | k` with `k ∩ m = ∅` is `a`, and with `k ⊇ m`
 //! is `k`; an operand whose demanded bits the facts know is that constant; arithmetic demands
-//! only the low prefix of its operands; shifts, extensions and `concat` re-index the mask. The
-//! simplified region replaces the node only when it is strictly smaller.
+//! only the low prefix of its operands; shifts, extensions and `concat` re-index the mask. A sum whose terms read one condition several ways is read with them merged,
+//! modulo the low prefix (see `conditions`). The simplified region replaces the node only when
+//! it is strictly smaller.
 
 use crate::engine::budget::Counter;
 use crate::hash::IdMap;
@@ -43,6 +44,10 @@ struct Demand {
     stops: Vec<u32>,
     visits: u32,
     fin: Fin,
+    /// The arena length when the simplification began: a node from here on was built by it.
+    before: u32,
+    /// The operand the simplification began at.
+    root: u32,
 }
 
 /// The low prefix covering every bit of `m` (the bits arithmetic depends on).
@@ -121,12 +126,12 @@ fn simplify(
     r.meter.charge(Counter::PassWork, 1)?;
     r.meter.check()?;
     let node = cx.node(x);
-    let stop = |st: &mut Demand| -> Result<u32, Stop> {
-        st.stops.push(x);
+    let stop = |cx: &Context, st: &mut Demand| -> Result<u32, Stop> {
+        stop_at(cx, st, x);
         Ok(x)
     };
     if st.visits > st.cap || cx.const_val(x).is_some() {
-        let v = stop(st)?;
+        let v = stop(cx, st)?;
         st.memo.insert(Key(x, *m), v);
         return Ok(v);
     }
@@ -167,6 +172,16 @@ fn simplify(
         r.build(cx, |cx| cx.c_bin(op, a, b))
     };
     let konst = |cx: &Context, j: u32| cx.const_val(j);
+    // Arithmetic reading one condition several ways, merged and taken modulo the demanded
+    // prefix (see `conditions`), at the operand observed (every operand a mask, an extraction
+    // or a shift observes is one, in the pass's step at its user).
+    if x == st.root
+        && matches!(node.op, OpCode::Add | OpCode::Sub)
+        && let Some(v) = merged(r, cx, st, x, m)?
+    {
+        st.memo.insert(Key(x, *m), v);
+        return Ok(v);
+    }
     let v = match node.op {
         OpCode::And => match (konst(cx, node.a), konst(cx, node.b)) {
             (Some(k), _) | (_, Some(k)) => {
@@ -261,10 +276,61 @@ fn simplify(
             let l = simplify(r, cx, st, node.b, &ml)?;
             r.build(cx, |cx| cx.c_concat(h, l))?
         }
-        _ => stop(st)?,
+        _ => stop(cx, st)?,
     };
     st.memo.insert(Key(x, *m), v);
     Ok(v)
+}
+
+/// Records `x` as a node the simplification stops at: a node it built itself is no leaf of the
+/// region (the commit rule counts it), so the nodes below it that existed are.
+fn stop_at(cx: &Context, st: &mut Demand, x: u32) {
+    if x < st.before {
+        st.stops.push(x);
+        return;
+    }
+    let mut stack = vec![x];
+    while let Some(i) = stack.pop() {
+        if i < st.before {
+            st.stops.push(i);
+        } else {
+            stack.extend(cx.node(i).children());
+        }
+    }
+}
+
+/// `x` on the bits of `m` from its linear form with the conditions its terms read merged, the
+/// form taken modulo `2^j` for the `j` low bits arithmetic depends on: a condition whose
+/// coefficient that makes 0 is not read at all. `None` when no two terms read one condition
+/// or every bit is demanded (the linear pass reads that case).
+fn merged(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Demand,
+    x: u32,
+    m: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let w = m.width();
+    let p = low_prefix(m);
+    let j = crate::facts::known::count_ones(&p);
+    if j >= u32::from(w.bits()) || !super::conditions::may_merge(cx, x) {
+        return Ok(None);
+    }
+    let form = super::linear::form_of(r, cx, x)?;
+    let Some((f, _)) = super::conditions::merge(r, cx, &form)? else {
+        return Ok(None);
+    };
+    let jw = crate::Width::new(j as u16).map_err(|e| Stop::Error(e.into()))?;
+    let f = f.reduce(jw);
+    st.fin = st.fin.and(f.fin);
+    let (konst, terms, _) = super::forms::Parts::parts(&f);
+    let (konst, terms) = (*konst, terms.to_vec());
+    let mut out = Vec::with_capacity(terms.len());
+    for (a, k) in terms {
+        out.push((simplify(r, cx, st, a, &p)?, k));
+    }
+    let f = super::linear::Form::of(konst, &out);
+    Ok(Some(super::linear::emit(r, cx, &f)?))
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
@@ -319,6 +385,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
+        before,
+        root: operand,
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
     st.memo.clear();

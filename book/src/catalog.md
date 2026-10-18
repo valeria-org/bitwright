@@ -151,6 +151,16 @@ rule sub_and<W>(x: W, y: W) { x - (x & y) => x & ~y }
 
 - `p - (p & q)` → `p & ~q`
 
+#### `sub_or` — rule
+
+The bits an or adds.
+
+```text
+rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }
+```
+
+- `(p | q) - p` → `q & ~p`
+
 #### `neg_not` — rule
 
 `-~x = x + 1`.

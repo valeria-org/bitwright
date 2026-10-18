@@ -15,6 +15,26 @@
   trunc<16>(x & y), trunc<16>(x), trunc<16>(x & y))` is `trunc<16>(x & y)`.
 - **Both readings of a condition.** A linear sum with both `sext(c)` and `zext(c)` of a 1-bit
   `c` reads the first as `−zext(c)`, so `zext(c) + sext(c)` is 0.
+- **One condition read several ways.** A linear sum whose terms read one 1-bit condition in
+  different ways reads them all over one `zext` of it: `zext(c)`, `sext(c)`, a select between
+  constants (`select(c, K1, K0)` is `K0 + (K1 − K0)·zext(c)`), and the carry out of a
+  partial-width addition (`concat(H, trunc_j(x + k))`, `zext(trunc_j(x + k))` and
+  `(x + k) & (2^j − 1)` are the same field over `x`, plus `k mod 2^j`, minus `2^j` when
+  `trunc_j(x) >=u 2^j − (k mod 2^j)`). The condition is recognized across spellings and polarity:
+  `trunc_j(x) <u t` and its `<=u` forms with a constant on either side, `x & M == 0` for a
+  run of bits `M`, an extraction compared with zero, `!=` and `~`. So
+  `zext<64>(trunc<16>(x) <u 64) + zext<64>(64 <=u trunc<16>(x))` is 1 and
+  `((x + 65472) & 65535) + zext<64>(64 <=u trunc<16>(x)) * 65536` is `(x & 65535) + 65472`.
+  The demanded-bits pass reads such a sum modulo the low bits its user reads, so a condition
+  whose coefficient vanishes there is dropped. x86's `sub ax, 64` merged into the wide
+  register with a constant chosen by its borrow,
+  `(select((x & 0xffc0) == 0, 0xffbf, 0x1ffffffbf) - (((x + 0xffc0) & 0xffff) | (x &
+  0x1ffff0000))) & 0x100050040`, deobfuscates to `~x & 0x100050040`. Readings apply only
+  where two terms read one condition, and the nodes they build (the `zext`, the field over
+  `x`) count against the rewrite.
+- **`(x | y) - x` is `y & ~x`** (core rule `sub_or`, the dual of `sub_and`): the MBA service
+  wrote the masked complement `~x & 0x100050040` as `(x | 0x100050040) - x`, which compared
+  unequal to itself in its other spelling.
 - **SMT-LIB import.** z3's `ext_rotate_left` and `ext_rotate_right` (rotation by a term,
   modulo the width) are read. A `let` in another's body no longer counts towards the nesting
   bound, and `let` names are looked up in constant time, so the long `let` chains z3 prints

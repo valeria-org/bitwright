@@ -5,6 +5,7 @@ pub(crate) mod bitwise;
 mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
+mod conditions;
 pub(super) mod demanded;
 mod division;
 pub(super) mod forms;
