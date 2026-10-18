@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0
 
 - **A budget for the prover's simplification.** `prove::Config::simplify_budget`, an
   `engine::Budget`, caps the engine's work on a question before it is blasted;
