@@ -1,8 +1,10 @@
 //! The linear pass: `c + Σ kᵢ·aᵢ` over Z/2^W.
 //!
 //! A node's *form* is computed from its operands' forms: `+`, `−`, negation, `~a = −a − 1`,
-//! multiplication by a constant, shifts left by a constant (scaling), and `|`/`^` of operands
-//! the facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1.
+//! multiplication by a constant, shifts left by a constant (scaling), `|`/`^` of operands the
+//! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1,
+//! except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads the first as
+//! `−zext(c)`.
 //! A form with more than [`MAX_TERMS`] terms is atomized. The form is re-emitted canonically
 //! (terms in the context's canonical order, positive coefficients first, power-of-two
 //! coefficients as shifts, the constant last), and the emission replaces the node only when
@@ -11,7 +13,7 @@
 use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
-use crate::expr::{Context, OpCode};
+use crate::expr::{Context, Node, OpCode};
 use crate::facts::known::count_ones;
 use crate::ops::{BinOp, UnOp};
 
@@ -321,8 +323,8 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => get(r, node.a).add(&get(r, node.b)),
-        OpCode::Sub => get(r, node.a).add(&get(r, node.b).neg()),
+        OpCode::Add => merge_signs(cx, get(r, node.a).add(&get(r, node.b))),
+        OpCode::Sub => merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -375,6 +377,35 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
         }
         _ => Form::atom(i, w),
     })
+}
+
+/// `form` with each term `k·sext(c)` of a 1-bit `c` (`0` or `−1`) moved to `−k·zext(c)` when
+/// the form has that atom too, so the two readings of a condition cancel. Only then: building a
+/// `zext` for a lone `sext` would make the emission look cheaper than it is.
+fn merge_signs(cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut moves = Vec::new();
+    for &(a, k) in &form.terms {
+        let n = cx.node(a);
+        if n.op == OpCode::Sext
+            && cx.width_of(n.a).bits() == 1
+            && let Some(z) = cx.find(&Node::new(OpCode::Zext, w.bits(), n.a, 0, 0))
+            && form.terms.binary_search_by_key(&z, |t| t.0).is_ok()
+        {
+            let minus_k = BitVec::un_unchecked(UnOp::Neg, &k);
+            moves.push((a, z, minus_k));
+        }
+    }
+    if moves.is_empty() {
+        return form;
+    }
+    let fin = form.fin;
+    let mut f = form;
+    for (a, z, minus_k) in moves {
+        f = f.add(&Form::of(BitVec::zero(w), &[(a, minus_k), (z, minus_k)]));
+    }
+    f.fin = fin;
+    f
 }
 
 /// Emits `form` canonically.

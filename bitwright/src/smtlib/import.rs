@@ -72,7 +72,7 @@ pub fn import(cx: &mut Context, script: &str) -> Result<Import, Error> {
     let mut st = State {
         cx,
         globals: HashMap::new(),
-        scope: Vec::new(),
+        scope: Scope::default(),
         reserved_read_prefixes,
         out: Import::default(),
     };
@@ -110,6 +110,7 @@ fn syntax(message: &str, start: usize, end: usize) -> Error {
 }
 
 /// The lexeme at or after `*i`, skipping blanks and comments, with its span; `None` at the end.
+#[inline(always)]
 fn lex<'s>(src: &'s str, i: &mut usize) -> Result<Option<(Lex<'s>, usize, usize)>, Error> {
     let b = src.as_bytes();
     while *i < b.len() {
@@ -187,38 +188,55 @@ fn lex<'s>(src: &'s str, i: &mut usize) -> Result<Option<(Lex<'s>, usize, usize)
 /// Checks the syntax of the whole script (balance, depth, quoted symbols and strings) without
 /// building anything, reserving prefixes of numbered symbols for array reads.
 fn check(src: &str) -> Result<HashSet<&str>, Error> {
-    // The start of every open list.
-    let mut open: Vec<usize> = Vec::new();
+    // Every open list: its start, its depth, its elements so far, and whether it is a `let`.
+    let mut open: Vec<(usize, usize, usize, bool)> = Vec::new();
     let mut i = 0;
     let mut reserved_read_prefixes = HashSet::new();
     while let Some((lexeme, start, end)) = lex(src, &mut i)? {
         match lexeme {
             Lex::Open => {
-                if open.len() >= MAX_DEPTH {
+                let depth = open
+                    .last()
+                    .map_or(0, |&(_, d, items, is_let)| d + list_depth(items, is_let));
+                if depth >= MAX_DEPTH {
                     return Err(syntax("nested too deeply", start, end));
                 }
-                open.push(start);
+                open.push((start, depth, 0, false));
             }
             Lex::Close => {
                 if open.pop().is_none() {
                     return Err(syntax("unbalanced ')'", start, end));
                 }
+                if let Some(parent) = open.last_mut() {
+                    parent.2 += 1;
+                }
             }
-            Lex::Atom(Tok::Sym(name)) => {
-                if let Some((prefix, index)) = name.rsplit_once('.')
+            Lex::Atom(tok) => {
+                if let Some(list) = open.last_mut() {
+                    list.3 |= list.2 == 0 && matches!(tok, Tok::Sym("let"));
+                    list.2 += 1;
+                }
+                if let Tok::Sym(name) = tok
+                    && let Some((prefix, index)) = name.rsplit_once('.')
                     && !index.is_empty()
                     && index.bytes().all(|b| b.is_ascii_digit())
                 {
                     reserved_read_prefixes.insert(prefix);
                 }
             }
-            Lex::Atom(_) => {}
         }
     }
     match open.last() {
-        Some(&start) => Err(syntax("unbalanced '('", start, src.len())),
+        Some(&(start, ..)) => Err(syntax("unbalanced '('", start, src.len())),
         None => Ok(reserved_read_prefixes),
     }
+}
+
+/// The depth a list adds to its elements' when it has `items` before the next one: one,
+/// except for a `let`'s body (its third element), which the import evaluates in a loop, not
+/// nested in the `let`. So a chain of `let`s, as z3 prints a large term, is as deep as one.
+fn list_depth(items: usize, is_let: bool) -> usize {
+    usize::from(!(is_let && items == 2))
 }
 
 /// One top-level form: its tokens with their spans in the script. The buffers are reused from
@@ -230,8 +248,9 @@ struct Sx<'s> {
     kids: Vec<u32>,
     /// While reading: the elements of the open lists read so far.
     stack: Vec<u32>,
-    /// While reading: each open list's start, and where its elements begin in `stack`.
-    open: Vec<(usize, usize)>,
+    /// While reading: each open list's start, where its elements begin in `stack`, and its
+    /// depth (see [`list_depth`]).
+    open: Vec<(usize, usize, usize)>,
 }
 
 impl<'s> Sx<'s> {
@@ -245,14 +264,20 @@ impl<'s> Sx<'s> {
         while let Some((lexeme, start, end)) = lex(src, pos)? {
             let node = match lexeme {
                 Lex::Open => {
-                    if self.open.len() >= MAX_DEPTH {
+                    let depth = self.open.last().map_or(0, |&(_, base, d)| {
+                        let items = self.stack.len() - base;
+                        let is_let =
+                            items > 0 && matches!(self.tok(self.stack[base]), Tok::Sym("let"));
+                        d + list_depth(items, is_let)
+                    });
+                    if depth >= MAX_DEPTH {
                         return Err(syntax("nested too deeply", start, end));
                     }
-                    self.open.push((start, self.stack.len()));
+                    self.open.push((start, self.stack.len(), depth));
                     continue;
                 }
                 Lex::Close => {
-                    let Some((list_start, base)) = self.open.pop() else {
+                    let Some((list_start, base, _)) = self.open.pop() else {
                         return Err(syntax("unbalanced ')'", start, end));
                     };
                     let first = self.kids.len() as u32;
@@ -270,7 +295,7 @@ impl<'s> Sx<'s> {
             self.stack.push(id);
         }
         match self.open.last() {
-            Some(&(start, _)) => Err(syntax("unbalanced '('", start, src.len())),
+            Some(&(start, ..)) => Err(syntax("unbalanced '('", start, src.len())),
             None => Ok(None),
         }
     }
@@ -397,12 +422,47 @@ enum Sort {
     Array(Width, Width),
 }
 
+/// `let` bindings: each name's values, innermost last, and the names in binding order.
+#[derive(Default)]
+struct Scope<'s> {
+    values: HashMap<&'s str, Vec<Val>>,
+    order: Vec<&'s str>,
+}
+
+impl<'s> Scope<'s> {
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn bind(&mut self, name: &'s str, v: Val) {
+        self.values.entry(name).or_default().push(v);
+        self.order.push(name);
+    }
+
+    /// Drops the bindings after the first `len`.
+    fn truncate(&mut self, len: usize) {
+        while self.order.len() > len {
+            let name = self.order.pop().unwrap_or_default();
+            if let Some(vs) = self.values.get_mut(name) {
+                vs.pop();
+                if vs.is_empty() {
+                    self.values.remove(name);
+                }
+            }
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<Val> {
+        self.values.get(name).and_then(|vs| vs.last()).copied()
+    }
+}
+
 struct State<'a, 's> {
     cx: &'a mut Context,
     /// Declared and defined names, and whether a term has read each so far.
     globals: HashMap<&'s str, (Val, bool)>,
-    /// `let` bindings, innermost last.
-    scope: Vec<(&'s str, Val)>,
+    /// `let` bindings.
+    scope: Scope<'s>,
     /// Prefixes of numbered script symbols, including declarations after an array's first read.
     reserved_read_prefixes: HashSet<&'s str>,
     out: Import,
@@ -530,7 +590,7 @@ impl<'s> State<'_, 's> {
 
     /// The value of a name a term reads, marking a global as read.
     fn lookup(&mut self, name: &str) -> Option<Val> {
-        if let Some(&(_, v)) = self.scope.iter().rev().find(|(n, _)| *n == name) {
+        if let Some(v) = self.scope.get(name) {
             return Some(v);
         }
         let (v, read) = self.globals.get_mut(name)?;
@@ -553,6 +613,51 @@ impl<'s> State<'_, 's> {
     }
 
     fn term(&mut self, sx: &Sx<'s>, id: u32) -> Result<Val, Error> {
+        if !matches!(sx.list(id), Some(&[head, ..]) if sx.sym(head) == Some("let")) {
+            return self.term_in_scope(sx, id);
+        }
+        let outer = self.scope.len();
+        let r = self
+            .let_chain(sx, id)
+            .and_then(|body| self.term_in_scope(sx, body));
+        self.scope.truncate(outer);
+        r
+    }
+
+    /// Binds the `let`s of the chain starting at `id`, one in another's body, in a loop: the
+    /// last body.
+    fn let_chain(&mut self, sx: &Sx<'s>, mut id: u32) -> Result<u32, Error> {
+        while let Some(&[head, ref args @ ..]) = sx.list(id)
+            && sx.sym(head) == Some("let")
+        {
+            let [binds, body] = *args else {
+                return Err(sx.err(id, "let takes bindings and a body"));
+            };
+            let Some(bs) = sx.list(binds) else {
+                return Err(sx.err(binds, "expected let bindings"));
+            };
+            // Parallel: every binding is evaluated in the outer scope.
+            let mut new = Vec::with_capacity(bs.len());
+            for &b in bs {
+                match sx.list(b) {
+                    Some(&[n, t]) => {
+                        let name = sx.name(n)?;
+                        let v = self.term(sx, t)?;
+                        new.push((name, v));
+                    }
+                    _ => return Err(sx.err(b, "expected (name term)")),
+                }
+            }
+            for (name, v) in new {
+                self.scope.bind(name, v);
+            }
+            id = body;
+        }
+        Ok(id)
+    }
+
+    /// A term that is not a `let`, in the current scope.
+    fn term_in_scope(&mut self, sx: &Sx<'s>, id: u32) -> Result<Val, Error> {
         match sx.tok(id) {
             Tok::Lit(s) => self.literal(sx, id, s),
             Tok::Sym(s) => match s {
@@ -578,7 +683,6 @@ impl<'s> State<'_, 's> {
                 }
                 match sx.sym(head) {
                     Some("_") => self.indexed_constant(sx, id, args),
-                    Some("let") => self.let_(sx, id, args),
                     Some(op) => {
                         let mut vals = Vec::with_capacity(args.len());
                         for &a in args {
@@ -590,32 +694,6 @@ impl<'s> State<'_, 's> {
                 }
             }
         }
-    }
-
-    fn let_(&mut self, sx: &Sx<'s>, id: u32, args: &[u32]) -> Result<Val, Error> {
-        let [binds, body] = args else {
-            return Err(sx.err(id, "let takes bindings and a body"));
-        };
-        let Some(bs) = sx.list(*binds) else {
-            return Err(sx.err(*binds, "expected let bindings"));
-        };
-        // Parallel: every binding is evaluated in the outer scope.
-        let mut new = Vec::with_capacity(bs.len());
-        for &b in bs {
-            match sx.list(b) {
-                Some(&[n, t]) => {
-                    let name = sx.name(n)?;
-                    let v = self.term(sx, t)?;
-                    new.push((name, v));
-                }
-                _ => return Err(sx.err(b, "expected (name term)")),
-            }
-        }
-        let depth = self.scope.len();
-        self.scope.extend(new);
-        let r = self.term(sx, *body);
-        self.scope.truncate(depth);
-        r
     }
 
     fn literal(&mut self, sx: &Sx<'s>, id: u32, s: &str) -> Result<Val, Error> {
@@ -818,6 +896,9 @@ impl<'s> State<'_, 's> {
             "bvshl" => Some((BinOp::Shl, false)),
             "bvlshr" => Some((BinOp::LShr, false)),
             "bvashr" => Some((BinOp::AShr, false)),
+            // z3's rotations by a term (as it prints them), by the count modulo the width.
+            "ext_rotate_left" => Some((BinOp::RotL, false)),
+            "ext_rotate_right" => Some((BinOp::RotR, false)),
             _ => None,
         };
         if let Some((b, left_assoc)) = bin {
@@ -1371,7 +1452,7 @@ impl<'s> State<'_, 's> {
         let Some(&(Val::Bv(symbol), read)) = self.globals.get(name) else {
             return Ok(false);
         };
-        if read || self.scope.iter().any(|(n, _)| *n == name) {
+        if read || self.scope.get(name).is_some() {
             return Ok(false);
         }
         let Val::Fp(e, f) = self.term(sx, t1)? else {

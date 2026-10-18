@@ -62,7 +62,8 @@ pub enum Phase {
     /// that is smaller: cancels additive masking.
     Linear,
     /// Pure bitwise functions of at most three atoms become a minimum-size form of their truth
-    /// table when that is smaller.
+    /// table when that is smaller; constants (masks) are read per class of bit positions, not
+    /// as atoms.
     Bitwise,
     /// Xor sums `k ⊕ ⊕ᵢ (aᵢ & mᵢ)` over GF(2)^W are collected and re-emitted canonically when
     /// that is smaller: cancels boolean masking.
@@ -1177,6 +1178,9 @@ struct Runner<'r, 'a> {
     linear: pass::forms::FormCache<pass::linear::Form>,
     /// The bitwise pass's truth tables, per node.
     bitwise: IdMap<u32, pass::bitwise::Info>,
+    /// Nodes whose bitwise region is beyond the bitwise pass's reading with constants (see
+    /// `pass::bitwise`): so is every region above them.
+    bitwise_beyond: IdMap<u32, ()>,
     /// The xor pass's forms, per node.
     xor: pass::forms::FormCache<pass::xor::Form>,
     /// The compares pass's descriptions, per node.
@@ -2072,6 +2076,7 @@ impl Engine {
             samples: IdMap::default(),
             linear: Default::default(),
             bitwise: IdMap::default(),
+            bitwise_beyond: IdMap::default(),
             xor: Default::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),

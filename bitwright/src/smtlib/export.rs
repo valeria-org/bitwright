@@ -84,6 +84,8 @@ const RESERVED: &[&str] = &[
     "sign_extend",
     "rotate_left",
     "rotate_right",
+    "ext_rotate_left",
+    "ext_rotate_right",
     "bvnot",
     "bvand",
     "bvor",

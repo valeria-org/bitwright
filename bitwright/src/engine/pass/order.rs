@@ -13,6 +13,9 @@
 //! - an operation bounded by an operand stands at most (or at least) there: `x & y <=u x`,
 //!   `x <=u x | y`, `x >>u s <=u x`, `urem(x, y) <=u x`, `udiv(x, d) <=u x` for a divisor the
 //!   facts show nonzero;
+//! - a term whose set bits are bits of another's, as their structure shows through `& | ~`,
+//!   extractions, extensions and concatenations (`trunc(x & y) <=u trunc(x)`), stands at most
+//!   there unsigned, and signed too when the facts show the other not negative or it negative;
 //! - monotone operations keep the order of their operands: `x <=u y` gives
 //!   `x >>u s <=u y >>u s` and `udiv(x, d) <=u udiv(y, d)`, and `x <=s y` gives
 //!   `x >>s s <=s y >>s s`.
@@ -32,7 +35,7 @@ use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::hash::IdMap;
-use crate::ops::CmpOp;
+use crate::ops::{BinOp, CmpOp, UnOp};
 
 /// The most term atoms (541 preorders at 5).
 const MAX_ATOMS: usize = 5;
@@ -315,6 +318,19 @@ fn known(r: &mut Runner<'_, '_>, cx: &mut Context, m: &Model) -> Result<(Known, 
             }
             _ => {}
         }
+        // Bit subsets: `b` within `a` is `b <=u a`, and `b <=s a` unless `a` is negative and `b`
+        // is not.
+        for (j, &b) in m.atoms.iter().enumerate() {
+            let sign_ok = !signed
+                || bounds[i].as_ref().is_some_and(|(lo, _)| !lo.msb())
+                || bounds[j].as_ref().is_some_and(|(_, hi)| hi.msb());
+            if j != i && !kn.le[j][i] && sign_ok {
+                let mut left = SUBMASK_STEPS;
+                if submask(cx, b, 0, a, 0, m.width, &mut left) {
+                    kn.le[j][i] = true;
+                }
+            }
+        }
         // Monotone pairs: the same operation with the same second operand.
         let monotone = if signed {
             matches!(node.op, OpCode::AShr)
@@ -335,6 +351,147 @@ fn known(r: &mut Runner<'_, '_>, cx: &mut Context, m: &Model) -> Result<(Known, 
         }
     }
     Ok((kn, fin))
+}
+
+/// The most steps [`submask`] takes for one pair of atoms.
+pub(super) const SUBMASK_STEPS: u32 = 32;
+
+/// Whether every bit set in bits `[bl, bl + len)` of `b` is set in bits `[al, al + len)` of `a`,
+/// as their structure shows (sound, not complete), within `*left` steps.
+pub(super) fn submask(
+    cx: &Context,
+    b: u32,
+    bl: u16,
+    a: u32,
+    al: u16,
+    len: u16,
+    left: &mut u32,
+) -> bool {
+    if *left == 0 {
+        return false;
+    }
+    *left -= 1;
+    if b == a && bl == al {
+        return true;
+    }
+    let Ok(w) = crate::Width::new(len) else {
+        return false;
+    };
+    let window = |i: u32, lo: u16| cx.const_val(i).and_then(|v| v.extract(lo, w).ok());
+    let (bc, ac) = (window(b, bl), window(a, al));
+    if bc.as_ref().is_some_and(BitVec::is_zero) || ac.as_ref().is_some_and(BitVec::is_ones) {
+        return true;
+    }
+    if let (Some(x), Some(y)) = (&bc, &ac) {
+        let y = BitVec::un_unchecked(UnOp::Not, y);
+        return BitVec::bin_unchecked(BinOp::And, x, &y).is_zero();
+    }
+    let (bn, an) = (cx.node(b), cx.node(a));
+    // Into extractions, extensions and concatenations, on either side.
+    match bn.op {
+        OpCode::Extract => return submask(cx, bn.a, bl + bn.b as u16, a, al, len, left),
+        OpCode::Zext => {
+            // Bits above the operand are 0.
+            let ow = cx.wid(bn.a);
+            return bl >= ow || submask(cx, bn.a, bl, a, al, len.min(ow - bl), left);
+        }
+        OpCode::Concat => {
+            let lw = cx.wid(bn.b);
+            return if bl + len <= lw {
+                submask(cx, bn.b, bl, a, al, len, left)
+            } else if bl >= lw {
+                submask(cx, bn.a, bl - lw, a, al, len, left)
+            } else {
+                let k = lw - bl;
+                submask(cx, b, bl, a, al, k, left) && submask(cx, b, lw, a, al + k, len - k, left)
+            };
+        }
+        _ => {}
+    }
+    match an.op {
+        OpCode::Extract => return submask(cx, b, bl, an.a, al + an.b as u16, len, left),
+        OpCode::Zext => {
+            // Bits above the operand are 0: `b`'s must be too.
+            let ow = cx.wid(an.a);
+            if al >= ow {
+                return zero_bits(cx, b, bl, len, left);
+            }
+            let k = len.min(ow - al);
+            return submask(cx, b, bl, an.a, al, k, left)
+                && (k == len || zero_bits(cx, b, bl + k, len - k, left));
+        }
+        OpCode::Concat => {
+            let lw = cx.wid(an.b);
+            return if al + len <= lw {
+                submask(cx, b, bl, an.b, al, len, left)
+            } else if al >= lw {
+                submask(cx, b, bl, an.a, al - lw, len, left)
+            } else {
+                let k = lw - al;
+                submask(cx, b, bl, a, al, k, left) && submask(cx, b, bl + k, a, lw, len - k, left)
+            };
+        }
+        _ => {}
+    }
+    // A meet below or a join above needs one side; a join below or a meet above needs both.
+    if bn.op == OpCode::And
+        && (submask(cx, bn.a, bl, a, al, len, left) || submask(cx, bn.b, bl, a, al, len, left))
+    {
+        return true;
+    }
+    if an.op == OpCode::Or
+        && (submask(cx, b, bl, an.a, al, len, left) || submask(cx, b, bl, an.b, al, len, left))
+    {
+        return true;
+    }
+    if bn.op == OpCode::Or {
+        return submask(cx, bn.a, bl, a, al, len, left) && submask(cx, bn.b, bl, a, al, len, left);
+    }
+    if an.op == OpCode::And {
+        return submask(cx, b, bl, an.a, al, len, left) && submask(cx, b, bl, an.b, al, len, left);
+    }
+    // `~x` within `~y` exactly when `y` is within `x`.
+    if bn.op == OpCode::Not && an.op == OpCode::Not {
+        return submask(cx, an.a, al, bn.a, bl, len, left);
+    }
+    false
+}
+
+/// Whether bits `[bl, bl + len)` of `b` are 0, as its structure shows (sound, not complete),
+/// within `*left` steps.
+pub(super) fn zero_bits(cx: &Context, b: u32, bl: u16, len: u16, left: &mut u32) -> bool {
+    if *left == 0 {
+        return false;
+    }
+    *left -= 1;
+    if let Some(v) = cx.const_val(b) {
+        return crate::Width::new(len)
+            .ok()
+            .and_then(|w| v.extract(bl, w).ok())
+            .is_some_and(|v| v.is_zero());
+    }
+    let n = cx.node(b);
+    match n.op {
+        OpCode::And => zero_bits(cx, n.a, bl, len, left) || zero_bits(cx, n.b, bl, len, left),
+        OpCode::Or => zero_bits(cx, n.a, bl, len, left) && zero_bits(cx, n.b, bl, len, left),
+        OpCode::Extract => zero_bits(cx, n.a, bl + n.b as u16, len, left),
+        OpCode::Zext => {
+            let ow = cx.wid(n.a);
+            bl >= ow || zero_bits(cx, n.a, bl, len.min(ow - bl), left)
+        }
+        OpCode::Concat => {
+            let lw = cx.wid(n.b);
+            if bl + len <= lw {
+                zero_bits(cx, n.b, bl, len, left)
+            } else if bl >= lw {
+                zero_bits(cx, n.a, bl - lw, len, left)
+            } else {
+                let k = lw - bl;
+                zero_bits(cx, n.b, bl, k, left) && zero_bits(cx, n.a, 0, len - k, left)
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Every total preorder of `k <= MAX_ATOMS` atoms, computed once per `k`.
@@ -672,7 +829,7 @@ fn related(cx: &Context, m: &Model) -> bool {
     let has = |n: u32| m.atoms.contains(&n);
     m.atoms.iter().any(|&a| {
         let node = cx.node(a);
-        match node.op {
+        let direct = match node.op {
             OpCode::And | OpCode::Or => has(node.a) || has(node.b),
             OpCode::LShr | OpCode::URem | OpCode::UDiv | OpCode::AShr => {
                 has(node.a)
@@ -682,6 +839,12 @@ fn related(cx: &Context, m: &Model) -> bool {
                     })
             }
             _ => false,
-        }
+        };
+        // Or one's bits are within the other's (see `known`).
+        direct
+            || m.atoms.iter().any(|&b| {
+                let mut left = SUBMASK_STEPS;
+                b != a && submask(cx, b, 0, a, 0, m.width, &mut left)
+            })
     })
 }

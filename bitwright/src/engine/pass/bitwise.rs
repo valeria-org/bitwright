@@ -6,10 +6,20 @@
 //! bits (W = 1) determines the function at every width: the table is exact, not an
 //! approximation. The minimum forms are found once by a breadth-first search over expression
 //! sizes (an immutable cache, computed on first use) and verified exhaustively by the tests.
+//!
+//! *Constants.* A function of at most three atoms and some constants (masks, `(y & C) ^ C`) is,
+//! on each class of bit positions where every constant is 0 or all-ones, a function of the
+//! atoms alone: one truth table per class. Bit positions are independent, so the tables
+//! determine the function exactly. When the classes take at most two tables, `t` on the bits of
+//! a mask `M` and `u` elsewhere, it is written as the cheapest of `f_t & M` (`u` zero),
+//! `f_t | ~M` (`u` all-ones), `f_u ^ M` (`t` the complement of `u`) and `f_u ^ (f_{t^u} & M)`,
+//! with `f` the minimum forms (and the same with the roles swapped). The compares pass decides
+//! `a == b` by the same tables: equal tables in every class, or complementary ones in some.
 
 use std::sync::OnceLock;
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish, worth_building};
+use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::ops::{BinOp, UnOp};
@@ -350,6 +360,347 @@ pub(super) fn emit(
     Ok(*built.last().unwrap_or(&atoms[0]))
 }
 
+/// The most distinct constants (other than 0 and all-ones) a masked description splits on.
+const MAX_MASKS: usize = 3;
+
+/// The most nodes a masked description walks.
+const MAX_MASKED_REGION: usize = 32;
+
+/// Bitwise functions of at most three atoms and some constants (see the module notes): the atoms
+/// (sorted by index), and per class of bit positions with one table for each root, the class's
+/// positions (classes with equal tables merged) and the tables.
+pub(crate) struct Masked {
+    atoms: Vec<u32>,
+    consts: Vec<u32>,
+    classes: Vec<(BitVec, Vec<u8>)>,
+    /// The region's operators.
+    ops: u32,
+}
+
+/// The masked description of `roots` (of one width), if their bitwise region below has at most
+/// three atoms and [`MAX_MASKS`] constants.
+fn masked(r: &mut Runner<'_, '_>, cx: &Context, roots: &[u32]) -> Result<Option<Masked>, Stop> {
+    /// A region node: an atom (its index), a constant (its index), or an operator over slots.
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Atom(usize),
+        Const(usize),
+        Op(OpCode, usize, usize),
+    }
+    // The region in post-order (a node's slot after its operands'), at most
+    // `MAX_MASKED_REGION` nodes: small enough to search.
+    // Fixed buffers: a region visits at most `MAX_MASKED_REGION` nodes, each pushing itself
+    // and at most two operands.
+    let mut ids = [0u32; MAX_MASKED_REGION];
+    let mut slots = [Slot::Atom(0); MAX_MASKED_REGION];
+    let mut len = 0usize;
+    let (mut atoms, mut consts) = (Vec::with_capacity(3), Vec::with_capacity(2));
+    let slot_of = |ids: &[u32], i: u32| ids.iter().position(|&j| j == i);
+    let mut stack = [(0u32, false); 3 * MAX_MASKED_REGION + 2];
+    let mut top = 0usize;
+    for &n in roots.iter().rev() {
+        stack[top] = (n, false);
+        top += 1;
+    }
+    let mut visits = 0usize;
+    let beyond = loop {
+        if top == 0 {
+            break false;
+        }
+        top -= 1;
+        let (i, expanded) = stack[top];
+        if slot_of(&ids[..len], i).is_some() {
+            continue;
+        }
+        let node = cx.node(i);
+        if expanded {
+            let a = slot_of(&ids[..len], node.a).unwrap_or(0);
+            let b = if node.op == OpCode::Not {
+                a
+            } else {
+                slot_of(&ids[..len], node.b).unwrap_or(0)
+            };
+            ids[len] = i;
+            slots[len] = Slot::Op(node.op, a, b);
+            len += 1;
+            continue;
+        }
+        visits += 1;
+        if visits > MAX_MASKED_REGION || r.bitwise_beyond.contains_key(&i) {
+            break true;
+        }
+        if !bitwise_op(node.op) {
+            let slot = if cx.const_val(i).is_some() {
+                consts.push(i);
+                Slot::Const(consts.len() - 1)
+            } else {
+                atoms.push(i);
+                Slot::Atom(atoms.len() - 1)
+            };
+            if atoms.len() > 3 || consts.len() > MAX_MASKS + 2 {
+                break true;
+            }
+            ids[len] = i;
+            slots[len] = slot;
+            len += 1;
+            continue;
+        }
+        stack[top] = (i, true);
+        top += 1;
+        for c in node.children() {
+            if slot_of(&ids[..len], c).is_none() {
+                stack[top] = (c, false);
+                top += 1;
+            }
+        }
+    };
+    let (ids, slots) = (&ids[..len], &slots[..len]);
+    if beyond {
+        // So are the regions above a lone root (they contain its region).
+        if let [n] = roots {
+            r.bitwise_beyond.insert(*n, ());
+        }
+        r.meter.charge(Counter::PassWork, visits as u64)?;
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, visits as u64)?;
+    // Atoms in index order: the tables' variables.
+    let mut by_index: Vec<usize> = (0..atoms.len()).collect();
+    by_index.sort_unstable_by_key(|&k| atoms[k]);
+    let mut var = [0u8; 3];
+    for (v, &k) in by_index.iter().enumerate() {
+        var[k] = VARS[v];
+    }
+    atoms.sort_unstable();
+    let w = cx.width_of(roots[0]);
+    let values: Vec<BitVec> = consts
+        .iter()
+        .map(|&c| cx.const_val(c).unwrap_or(BitVec::zero(w)))
+        .collect();
+    // The constants that split: neither 0 nor all-ones.
+    let mut splits: Vec<BitVec> = Vec::new();
+    for v in &values {
+        if !v.is_zero() && !v.is_ones() && !splits.contains(v) {
+            splits.push(*v);
+        }
+    }
+    if splits.len() > MAX_MASKS {
+        if let [n] = roots {
+            r.bitwise_beyond.insert(*n, ());
+        }
+        return Ok(None);
+    }
+    let mut classes: Vec<(BitVec, Vec<u8>)> = Vec::new();
+    let mut vals: Vec<u8> = vec![0; slots.len()];
+    for pattern in 0..1usize << splits.len() {
+        // The class's positions: each splitting constant set (or clear) as the pattern says.
+        let mut mask = BitVec::ones(w);
+        for (k, v) in splits.iter().enumerate() {
+            let v = if pattern >> k & 1 == 1 {
+                *v
+            } else {
+                BitVec::un_unchecked(UnOp::Not, v)
+            };
+            mask = BitVec::bin_unchecked(BinOp::And, &mask, &v);
+        }
+        if mask.is_zero() {
+            continue;
+        }
+        r.meter
+            .charge(Counter::PassWork, slots.len() as u64 / 4 + 1)?;
+        // Every slot's table in this class (a constant is all-ones on a class exactly when its
+        // bits there are set: the class lies within it or outside it).
+        for (k, slot) in slots.iter().enumerate() {
+            vals[k] = match *slot {
+                Slot::Atom(a) => var[a],
+                Slot::Const(c) => {
+                    if BitVec::bin_unchecked(BinOp::And, &values[c], &mask) == mask {
+                        0xFF
+                    } else {
+                        0x00
+                    }
+                }
+                Slot::Op(OpCode::Not, a, _) => !vals[a],
+                Slot::Op(OpCode::And, a, b) => vals[a] & vals[b],
+                Slot::Op(OpCode::Or, a, b) => vals[a] | vals[b],
+                Slot::Op(_, a, b) => vals[a] ^ vals[b],
+            };
+        }
+        let tables: Vec<u8> = roots
+            .iter()
+            .map(|&n| vals[slot_of(ids, n).unwrap_or(0)])
+            .collect();
+        match classes.iter_mut().find(|(_, t)| *t == tables) {
+            Some((m, _)) => *m = BitVec::bin_unchecked(BinOp::Or, m, &mask),
+            None => classes.push((mask, tables)),
+        }
+    }
+    let ops = slots.iter().filter(|s| matches!(s, Slot::Op(..))).count() as u32;
+    Ok(Some(Masked {
+        atoms,
+        consts,
+        classes,
+        ops,
+    }))
+}
+
+/// Whether `a == b` (of one width) always (`Some(true)`) or never (`Some(false)`) holds, by
+/// their masked descriptions: equal tables in every class, or complementary ones in a class.
+pub(super) fn equal(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    a: u32,
+    b: u32,
+) -> Result<Option<bool>, Stop> {
+    if !bitwise_op(cx.node(a).op) && !bitwise_op(cx.node(b).op) {
+        return Ok(None);
+    }
+    let Some(m) = masked(r, cx, &[a, b])? else {
+        return Ok(None);
+    };
+    if m.classes.iter().all(|(_, t)| t[0] == t[1]) {
+        return Ok(Some(true));
+    }
+    if m.classes.iter().any(|(_, t)| t[0] == !t[1]) {
+        return Ok(Some(false));
+    }
+    Ok(None)
+}
+
+/// The operators and constants a template adds.
+fn cost(tt: u8) -> u32 {
+    min_forms().forms[tt as usize]
+        .0
+        .iter()
+        .filter(|t| !matches!(t, T::Var(_)))
+        .count() as u32
+}
+
+/// How a function of two classes is written (see the module notes): `t` on the mask's bits,
+/// `u` elsewhere.
+#[derive(Clone, Copy)]
+enum Split {
+    /// `f_t & mask`.
+    And(u8),
+    /// `f_t | mask` (the mask's bits all-ones).
+    Or(u8),
+    /// `f_u ^ mask`.
+    Xor(u8),
+    /// `f_u ^ (f_g & mask)`.
+    Blend(u8, u8),
+}
+
+/// The bitwise pass at `n` for a function with constants: its masked description written
+/// as the module notes say, when that is smaller.
+fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let Some(m) = masked(r, cx, &[n])? else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    if m.consts.is_empty() || m.classes.len() > 2 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    // A rewrite frees at most the region's operators: a form needing as many is not smaller.
+    let cheapest = |t: u8| cost(t) + 1;
+    let floor = match &m.classes[..] {
+        [(_, t)] => cost(t[0]),
+        [(_, t), (_, u)] => cheapest(t[0]).min(cheapest(u[0])),
+        _ => u32::MAX,
+    };
+    if floor >= m.ops {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut canon = m.atoms.clone();
+    canon.sort_by(|a, b| cx.order(*a, *b));
+    let tt = |t: u8| remap(t, &m.atoms, &canon);
+    let w = cx.width_of(n);
+    // Each candidate: the function, its mask, and the nodes it adds (a mask that is not one of
+    // the constants already there is one more).
+    let is_old = |v: &BitVec| {
+        m.consts
+            .iter()
+            .any(|&c| cx.const_val(c).as_ref() == Some(v))
+    };
+    let mut best: Option<(u32, Option<(Split, BitVec)>)> = None;
+    let mut offer = |c: u32, s: Option<(Split, BitVec)>| {
+        if best.as_ref().is_none_or(|(b, _)| c < *b) {
+            best = Some((c, s));
+        }
+    };
+    if let [(_, t)] = &m.classes[..] {
+        offer(cost(tt(t[0])), None);
+    } else {
+        for (x, y) in [(0, 1), (1, 0)] {
+            let (mask, t) = (m.classes[x].0, tt(m.classes[x].1[0]));
+            let u = tt(m.classes[y].1[0]);
+            let extra = 1 + u32::from(!is_old(&mask));
+            if u == 0x00 {
+                offer(cost(t) + extra, Some((Split::And(t), mask)));
+            }
+            if t == 0xFF {
+                offer(cost(u) + extra, Some((Split::Or(u), mask)));
+            }
+            if t == !u {
+                offer(cost(u) + extra, Some((Split::Xor(u), mask)));
+            }
+            offer(
+                cost(u) + cost(t ^ u) + extra + 1,
+                Some((Split::Blend(u, t ^ u), mask)),
+            );
+        }
+    }
+    let Some((estimate, split)) = best else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    if estimate >= m.ops {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut bounds = m.atoms.clone();
+    bounds.extend(&m.consts);
+    if let Some(f) = worth_building(r, cx, n, &bounds, estimate)? {
+        r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
+        return Ok(Step::Normal(Fin::FINAL.and(f)));
+    }
+    let before = cx.len() as u32;
+    let form = |r: &mut Runner<'_, '_>, cx: &mut Context, t: u8| -> Result<u32, Stop> {
+        if canon.is_empty() || t == 0x00 || t == 0xFF {
+            let v = if t == 0xFF {
+                BitVec::ones(w)
+            } else {
+                BitVec::zero(w)
+            };
+            r.build(cx, |cx| cx.mk_const(&v))
+        } else {
+            emit(r, cx, t, &canon)
+        }
+    };
+    let e = match split {
+        None => form(r, cx, tt(m.classes[0].1[0]))?,
+        Some((split, mask)) => {
+            let k = r.build(cx, |cx| cx.mk_const(&mask))?;
+            match split {
+                Split::And(t) => {
+                    let f = form(r, cx, t)?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::And, f, k))?
+                }
+                Split::Or(u) => {
+                    let f = form(r, cx, u)?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::Or, f, k))?
+                }
+                Split::Xor(u) => {
+                    let f = form(r, cx, u)?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::Xor, f, k))?
+                }
+                Split::Blend(u, g) => {
+                    let (f, g) = (form(r, cx, u)?, form(r, cx, g)?);
+                    let gm = r.build(cx, |cx| cx.c_bin(BinOp::And, g, k))?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::Xor, f, gm))?
+                }
+            }
+        }
+    };
+    finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
+}
+
 /// The bitwise pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if !bitwise_op(cx.node(n).op) {
@@ -358,8 +709,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
         return Ok(Step::Normal(Fin::FINAL));
     };
+    // More than three atoms (constants included): by classes of bit positions, where the
+    // constants are not atoms.
     if atoms == [n] {
-        return Ok(Step::Normal(Fin::FINAL));
+        return masked_step(r, cx, n);
     }
     // Canonical variable order: the context's order of the atoms, independent of indices.
     let mut canon = atoms.clone();

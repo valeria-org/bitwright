@@ -1098,6 +1098,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 let c = bool_const(r, cx, node.op == OpCode::Eq)?;
                 return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
             }
+            if matches!(node.op, OpCode::Eq | OpCode::Ne)
+                && cx.wid(node.a) > 1
+                && let Some(same) = super::bitwise::equal(r, cx, node.a, node.b)?
+            {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, same == (node.op == OpCode::Eq))?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
             if let Some(b) = residue_decide(r, cx, n)? {
                 let before = cx.len() as u32;
                 let c = bool_const(r, cx, b)?;

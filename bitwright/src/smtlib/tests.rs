@@ -231,6 +231,101 @@ fn import_reads_the_qf_bv_theory() {
     assert_eq!(v(&mut cx, "g"), 0);
 }
 
+/// A chain of `let`s, each in the previous one's body (as z3 prints a large term), imports
+/// however long it is, with each name the innermost binding's (and the outer one again after
+/// the inner one's body).
+#[test]
+fn long_let_chains_import() {
+    let n = 200_000usize;
+    let mut s = String::from("(declare-const x (_ BitVec 8)) (define-fun a () (_ BitVec 8) ");
+    for k in 0..n {
+        let prev = if k == 0 {
+            "x".to_string()
+        } else {
+            format!("(bvadd v{} #x01)", k - 1)
+        };
+        s += &format!("(let ((v{k} {prev})) ");
+    }
+    s += &format!("v{})", n - 1);
+    s.insert_str(s.len() - 1, &")".repeat(n));
+    let mut cx = Context::new();
+    let imp = import(&mut cx, &s).unwrap();
+    let w8 = Width::W8;
+    let env: BTreeMap<SymbolKey, BitVec> =
+        [(SymbolKey::from("x"), BitVec::from_u64(w8, 5).unwrap())]
+            .into_iter()
+            .collect();
+    let a = imp.definition("a").unwrap();
+    assert_eq!(
+        cx.eval(&[a], &env).unwrap()[0].to_u64(),
+        Some(((5 + n - 1) % 256) as u64)
+    );
+    let mut cx = Context::new();
+    let imp = import(
+        &mut cx,
+        "(declare-const x (_ BitVec 8))
+         (define-fun a () (_ BitVec 8)
+           (let ((t x)) (let ((u t)) (bvadd (let ((t #x02)) (bvmul t u)) t))))",
+    )
+    .unwrap();
+    let want = cx.parse("x * 3", &ParseOptions::width(w8)).unwrap();
+    let got = imp.definition("a").unwrap();
+    for xv in 0..256u64 {
+        let env: BTreeMap<SymbolKey, BitVec> =
+            [(SymbolKey::from("x"), BitVec::from_u64(w8, xv).unwrap())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            cx.eval(&[got], &env).unwrap(),
+            cx.eval(&[want], &env).unwrap()
+        );
+    }
+    // Nesting in a binding still counts.
+    let deep = format!(
+        "(declare-const x (_ BitVec 8)) (define-fun a () (_ BitVec 8) {}x{})",
+        "(let ((t ".repeat(1000),
+        ")) t)".repeat(1000)
+    );
+    assert!(import(&mut Context::new(), &deep).is_err());
+}
+
+/// z3's rotations by a term, `ext_rotate_left` and `ext_rotate_right`, rotate by the count
+/// modulo the width (exhaustively at a few widths).
+#[test]
+fn z3_rotations_by_a_term_import() {
+    for w in [1u16, 3, 5, 8] {
+        let mut cx = Context::new();
+        let imp = import(
+            &mut cx,
+            &format!(
+                "(declare-const x (_ BitVec {w})) (declare-const y (_ BitVec {w}))
+                 (define-fun l () (_ BitVec {w}) (ext_rotate_left x y))
+                 (define-fun r () (_ BitVec {w}) (ext_rotate_right x y))"
+            ),
+        )
+        .unwrap();
+        let (l, r) = (imp.definition("l").unwrap(), imp.definition("r").unwrap());
+        let width = Width::new(w).unwrap();
+        let m = (1u64 << w) - 1;
+        for xv in 0..1u64 << w {
+            for yv in 0..1u64 << w {
+                let env: BTreeMap<SymbolKey, BitVec> = [
+                    (SymbolKey::from("x"), BitVec::from_u64(width, xv).unwrap()),
+                    (SymbolKey::from("y"), BitVec::from_u64(width, yv).unwrap()),
+                ]
+                .into_iter()
+                .collect();
+                let k = yv % u64::from(w);
+                let rotl = ((xv << k) | (xv >> ((u64::from(w) - k) % u64::from(w)))) & m;
+                let rotr = ((xv >> k) | (xv << ((u64::from(w) - k) % u64::from(w)))) & m;
+                let got = cx.eval(&[l, r], &env).unwrap();
+                assert_eq!(got[0].to_u64(), Some(rotl), "rotl({xv}, {yv}) at {w}");
+                assert_eq!(got[1].to_u64(), Some(rotr), "rotr({xv}, {yv}) at {w}");
+            }
+        }
+    }
+}
+
 #[test]
 fn import_rejects_what_it_does_not_model_without_panicking() {
     let bad = [

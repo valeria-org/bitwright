@@ -656,6 +656,16 @@ impl Context {
         self.push(n, shash)
     }
 
+    /// The interned node `n` (canonical, neither a constant nor a symbol), without creating it.
+    pub(crate) fn find(&self, n: &Node) -> Option<u32> {
+        let nodes = &self.nodes;
+        self.interner
+            .find(self.table_hash(self.structural_hash(n)), |&i| {
+                nodes[i as usize] == *n
+            })
+            .copied()
+    }
+
     /// Interns a constant of at most 64 bits, `v` with no bit set at or above `w`: the node and
     /// structural hash [`mk_const`](Self::mk_const) gives the same value, without a `BitVec`.
     pub(crate) fn mk_const_u64(&mut self, w: u16, v: u64) -> Result<u32, Error> {

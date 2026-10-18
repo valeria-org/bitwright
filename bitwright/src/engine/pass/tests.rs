@@ -3630,3 +3630,439 @@ mod native_mba {
         assert!(size(&mut cx, out.expr) <= 10, "{}", cx.display(out.expr));
     }
 }
+
+// ----- bit subsets, masked bitwise functions, and both readings of a condition -----------------
+
+/// A term of width `w` (at most 6) over `x`, `y` of 6 bits: their extractions, constants,
+/// bitwise operations, and extractions, extensions and concatenations of other terms.
+fn subset_term(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
+    let width = Width::new(w).unwrap();
+    if depth == 0 || g.rng.chance(1, 4) {
+        if g.rng.chance(1, 4) {
+            let v = g.constant(w);
+            return cx.constant(&v).unwrap();
+        }
+        let s = cx
+            .symbol(["x", "y"][g.rng.below(2) as usize], Width::new(6).unwrap())
+            .unwrap();
+        let lo = g.rng.below(u64::from(6 - w) + 1) as u16;
+        return cx.extract(s, lo, width).unwrap();
+    }
+    let d = depth - 1;
+    match g.rng.below(9) {
+        0 => {
+            let a = subset_term(g, cx, w, d);
+            cx.un(UnOp::Not, a).unwrap()
+        }
+        1..=4 => {
+            let a = subset_term(g, cx, w, d);
+            let b = subset_term(g, cx, w, d);
+            let op = [BinOp::And, BinOp::And, BinOp::Or, BinOp::Xor][g.rng.below(4) as usize];
+            cx.bin(op, a, b).unwrap()
+        }
+        5 if w > 1 => {
+            let from = 1 + g.rng.below(u64::from(w) - 1) as u16;
+            let a = subset_term(g, cx, from, d);
+            cx.zext(a, width).unwrap()
+        }
+        6 if w < 6 => {
+            let from = w + 1 + g.rng.below(u64::from(6 - w)) as u16;
+            let lo = g.rng.below(u64::from(from - w) + 1) as u16;
+            let a = subset_term(g, cx, from, d);
+            cx.extract(a, lo, width).unwrap()
+        }
+        7 if w > 1 => {
+            let h = 1 + g.rng.below(u64::from(w) - 1) as u16;
+            let a = subset_term(g, cx, h, d);
+            let b = subset_term(g, cx, w - h, d);
+            cx.concat(a, b).unwrap()
+        }
+        _ => subset_term(g, cx, w, d),
+    }
+}
+
+/// Every value of `e` over `x`, `y` of 6 bits.
+fn values_6x6(cx: &mut Context, e: Expr) -> Vec<BitVec> {
+    let w6 = Width::new(6).unwrap();
+    (0..1u64 << 12)
+        .map(|i| {
+            let (xv, yv) = (
+                BitVec::wrapping_from_u64(w6, i & 63),
+                BitVec::wrapping_from_u64(w6, i >> 6),
+            );
+            let env = FnEnv(|k: &crate::SymbolKey, _| match k.to_string().as_str() {
+                "x" => Some(xv),
+                "y" => Some(yv),
+                _ => None,
+            });
+            cx.eval(&[e], &env).unwrap()[0]
+        })
+        .collect()
+}
+
+/// What the order reading takes as bit subsets is: whenever `submask(b, a)` holds, no value of
+/// `b` has a bit `a`'s lacks (exhaustively), and `zero_bits` likewise; and both hold often.
+#[test]
+fn bit_subsets_are_sound() {
+    let mut g = generator(0x0005_b5e7);
+    let (mut subsets, mut zeros) = (0, 0);
+    for _ in 0..3000 {
+        let mut cx = Context::new();
+        let w = 1 + g.rng.below(6) as u16;
+        let width = Width::new(w).unwrap();
+        let a = subset_term(&mut g, &mut cx, w, 3);
+        // Often a term built from the other, so that the relation is there to find.
+        let b = match g.rng.below(4) {
+            0 => {
+                let t = subset_term(&mut g, &mut cx, w, 2);
+                cx.bin(BinOp::And, a, t).unwrap()
+            }
+            1 => {
+                let wide = subset_term(&mut g, &mut cx, w, 2);
+                let t = cx.bin(BinOp::And, a, wide).unwrap();
+                let t = cx.zext(t, Width::new(6).unwrap()).unwrap();
+                let u = subset_term(&mut g, &mut cx, 6, 1);
+                let t = cx.bin(BinOp::And, t, u).unwrap();
+                cx.extract(t, 0, width).unwrap()
+            }
+            _ => subset_term(&mut g, &mut cx, w, 3),
+        };
+        let (ai, bi) = (cx.id(a).unwrap(), cx.id(b).unwrap());
+        let mut left = super::order::SUBMASK_STEPS;
+        if super::order::submask(&cx, bi, 0, ai, 0, w, &mut left) {
+            let (va, vb) = (values_6x6(&mut cx, a), values_6x6(&mut cx, b));
+            for (x, y) in vb.iter().zip(&va) {
+                let extra =
+                    BitVec::bin_unchecked(BinOp::And, x, &BitVec::un_unchecked(UnOp::Not, y));
+                assert!(
+                    extra.is_zero(),
+                    "W={w}: {} not within {}",
+                    cx.display(b),
+                    cx.display(a)
+                );
+            }
+            subsets += 1;
+        }
+        let mut left = super::order::SUBMASK_STEPS;
+        let lo = g.rng.below(u64::from(w)) as u16;
+        let len = 1 + g.rng.below(u64::from(w - lo)) as u16;
+        if super::order::zero_bits(&cx, bi, lo, len, &mut left) {
+            for v in values_6x6(&mut cx, b) {
+                let part = v.extract(lo, Width::new(len).unwrap()).unwrap();
+                assert!(
+                    part.is_zero(),
+                    "W={w}: bits {lo}+{len} of {}",
+                    cx.display(b)
+                );
+            }
+            zeros += 1;
+        }
+    }
+    assert!(
+        subsets > 600 && zeros > 300,
+        "{subsets} subsets, {zeros} zero windows"
+    );
+}
+
+/// Comparisons and selects of bit-subset terms through the order reading: sound
+/// (exhaustively), idempotent, and many decided.
+#[test]
+fn order_through_bit_subsets_is_sound_and_idempotent() {
+    use crate::CmpOpExt;
+    let eng = engine(vec![Phase::Compares]);
+    let mut g = generator(0x0de6);
+    let mut rng = Rng(47);
+    let mut changed = 0;
+    for _ in 0..2000 {
+        let mut cx = Context::new();
+        let w = 1 + g.rng.below(6) as u16;
+        let a = subset_term(&mut g, &mut cx, w, 3);
+        let b = if g.rng.chance(1, 2) {
+            let t = subset_term(&mut g, &mut cx, w, 2);
+            let t = cx.bin(BinOp::And, a, t).unwrap();
+            let s = cx.symbol("x", Width::new(6).unwrap()).unwrap();
+            let u = cx.zext(t, Width::new(6).unwrap()).unwrap();
+            let u = cx.bin(BinOp::And, u, s).unwrap();
+            cx.trunc(u, Width::new(w).unwrap()).unwrap()
+        } else {
+            subset_term(&mut g, &mut cx, w, 3)
+        };
+        let ops = [
+            CmpOpExt::Ult,
+            CmpOpExt::Ule,
+            CmpOpExt::Slt,
+            CmpOpExt::Sle,
+            CmpOpExt::Eq,
+        ];
+        let op = ops[g.rng.below(ops.len() as u64) as usize];
+        let (p, q) = if g.rng.chance(1, 2) { (a, b) } else { (b, a) };
+        let c = cx.cmp(op, p, q).unwrap();
+        let e = if g.rng.chance(1, 3) {
+            cx.select(c, p, q).unwrap()
+        } else {
+            c
+        };
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {}",
+            cx.display(r.expr)
+        );
+    }
+    assert!(changed > 400, "{changed}");
+}
+
+/// A random bitwise expression over `a`, `b`, `c` and constants from a small pool.
+fn masked_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32, pool: &[BitVec]) -> Expr {
+    let width = Width::new(w).unwrap();
+    if depth == 0 || g.rng.chance(1, 5) {
+        return match g.rng.below(5) {
+            0 | 1 => {
+                let v = pool[g.rng.below(pool.len() as u64) as usize];
+                cx.constant(&v).unwrap()
+            }
+            k => cx.symbol(["a", "b", "c"][(k - 2) as usize], width).unwrap(),
+        };
+    }
+    let d = depth - 1;
+    match g.rng.below(4) {
+        0 => {
+            let x = masked_expr(g, cx, w, d, pool);
+            cx.un(UnOp::Not, x).unwrap()
+        }
+        k => {
+            let x = masked_expr(g, cx, w, d, pool);
+            let y = masked_expr(g, cx, w, d, pool);
+            cx.bin([BinOp::And, BinOp::Or, BinOp::Xor][(k - 1) as usize], x, y)
+                .unwrap()
+        }
+    }
+}
+
+/// Bitwise functions with constants, by classes of bit positions: sound (exhaustively at small
+/// widths), idempotent, and often smaller.
+#[test]
+fn masked_bitwise_is_sound_and_idempotent() {
+    let eng = engine(vec![Phase::Bitwise]);
+    let mut g = generator(0xb17_3a5c);
+    let mut rng = Rng(22);
+    let mut changed = 0;
+    for i in 0..2000 {
+        let mut cx = Context::new();
+        let w = if i % 10 == 0 {
+            [8, 64, 129][g.rng.below(3) as usize]
+        } else {
+            1 + g.rng.below(4) as u16
+        };
+        let pool: Vec<BitVec> = (0..1 + g.rng.below(4)).map(|_| g.constant(w)).collect();
+        let e = masked_expr(&mut g, &mut cx, w, 5, &pool);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(out.stats.rejected, 0);
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+        assert!(
+            !again.roots[0].changed,
+            "not idempotent: {}",
+            cx.display(r.expr)
+        );
+    }
+    assert!(changed > 500, "{changed}");
+}
+
+/// `p == q` of bitwise functions with constants is decided by their tables: soundly, and for
+/// every pair that is the same function written twice.
+#[test]
+fn masked_equalities_are_decided_soundly() {
+    use crate::CmpOpExt;
+    let eng = engine(vec![Phase::Compares]);
+    let rewrite = engine(vec![Phase::Bitwise]);
+    let mut g = generator(0xe9_3a5c);
+    let mut rng = Rng(23);
+    let mut decided = 0;
+    for _ in 0..2000 {
+        let mut cx = Context::new();
+        let w = 2 + g.rng.below(3) as u16;
+        let pool: Vec<BitVec> = (0..1 + g.rng.below(3)).map(|_| g.constant(w)).collect();
+        let p = masked_expr(&mut g, &mut cx, w, 4, &pool);
+        // The same function in another form, or another function.
+        let q = if g.rng.chance(1, 2) {
+            let r = rewrite.run(&mut cx, &[p], Run::default()).unwrap().roots[0].expr;
+            let x = cx.symbol("b", Width::new(w).unwrap()).unwrap();
+            let y = cx.bin(BinOp::Xor, r, x).unwrap();
+            cx.bin(BinOp::Xor, y, x).unwrap()
+        } else {
+            masked_expr(&mut g, &mut cx, w, 4, &pool)
+        };
+        let op = if g.rng.chance(1, 2) {
+            CmpOpExt::Eq
+        } else {
+            CmpOpExt::Ne
+        };
+        let e = cx.cmp(op, p, q).unwrap();
+        let r = eng.run(&mut cx, &[e], Run::default()).unwrap().roots[0];
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        decided += u32::from(cx.const_val(cx.id(r.expr).unwrap()).is_some());
+    }
+    assert!(decided > 900, "{decided}");
+}
+
+#[test]
+fn masked_bitwise_fixtures() {
+    let eng = Engine::standard();
+    for w in [8, 32, 64] {
+        let (zero, f) = (format!("0:{w}"), "0:1".to_string());
+        for (src, want) in [
+            // Four atoms, one of them a mask: a function of three per class.
+            ("~a & (~b & (y & 5))", "~(a | b) & y & 5"),
+            ("(~a & (~b & (y & 5))) ^ (~(a | b) & y & 5)", &zero),
+            // The same function written two ways is one value.
+            ("~y & 37 != (y & 37) ^ 37", &f),
+            ("~a & (~b & 37) & y != ~a & (~b & (y & 37))", &f),
+            ("(x & y ^ x) & 37 != ~y & (x & 37)", &f),
+            // Complementary on the mask's bits: never equal.
+            ("(y & 5) == (~y & 5) | 2", &f),
+        ] {
+            assert_eq!(simplify(&eng, src, w), want, "{src} at {w} bits");
+        }
+        // Different functions stay.
+        assert!(!simplify(&eng, "x & 5 == x & 6", w).contains(':'));
+    }
+    // Each two-class form, by the bitwise pass alone.
+    let eng = engine(vec![Phase::Bitwise]);
+    for (src, want) in [
+        ("(y & a & 5) | (y & 5 & ~a)", "y & 5"),
+        ("(~(y & a) & 5) | (y & a & 250)", "a & y ^ 5"),
+        ("(y & a) | 5", "a & y | 5"),
+        ("(~(y & a) & 5) | (a & 250)", "(~a | y) & 5 ^ a"),
+    ] {
+        assert_eq!(simplify(&eng, src, 8), want, "{src}");
+    }
+}
+
+#[test]
+fn order_bit_subset_fixtures() {
+    let eng = Engine::standard();
+    for (src, want) in [
+        // Through truncations and extractions of a meet.
+        ("trunc<16>(a) & 5 <u trunc<16>(~b & (a & 5))", "0:1"),
+        (
+            "extract<16, 16>(y) & 16389 <u extract<16, 16>(~x & (y & 0x140050000))",
+            "0:1",
+        ),
+        (
+            "zext<16>(extract<32, 1>(y)) <u extract<32, 16>(~x & (y & 0x140050000))",
+            "0:1",
+        ),
+        ("trunc<16>(x & y) <=u trunc<16>(x)", "1:1"),
+        // A lane minimum of a value and its meet with another is the meet.
+        (
+            "select(trunc<16>(x) <u trunc<16>(x & y), trunc<16>(x), trunc<16>(x & y))",
+            "trunc<16>(x & y)",
+        ),
+        // Undecided where a bit of the mask escapes the window, or equality is possible.
+        (
+            "zext<16>(extract<32, 1>(y)) <u extract<32, 16>(~x & (y & 0x340050000))",
+            "zext<16>(extract<32, 1>(y)) <u extract<32, 16>(~x & (y & 0x340050000))",
+        ),
+        (
+            "trunc<16>(x) <u trunc<16>(x | y)",
+            "trunc<16>(x) <u trunc<16>(x | y)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 64), want, "{src}");
+    }
+}
+
+/// `sext(c)` and `zext(c)` of a 1-bit `c` in one sum are one atom: sound (exhaustively), and
+/// `zext(c) + sext(c)` cancels. (Not checked for idempotence: the linear pass alone was not
+/// idempotent on these sums before either; the engine's rounds settle them.)
+#[test]
+fn linear_merges_both_readings_of_a_condition() {
+    let eng = engine(vec![Phase::Linear]);
+    let mut g = generator(0x5e_c71);
+    let mut rng = Rng(24);
+    let mut changed = 0;
+    for _ in 0..1500 {
+        let mut cx = Context::new();
+        let w = 2 + g.rng.below(4) as u16;
+        let width = Width::new(w).unwrap();
+        let conds: Vec<Expr> = (0..2)
+            .map(|k| cx.symbol(["p", "q"][k], Width::W1).unwrap())
+            .collect();
+        let mut e = cx.symbol("x", width).unwrap();
+        for _ in 0..1 + g.rng.below(4) {
+            let c = conds[g.rng.below(2) as usize];
+            let t = if g.rng.chance(1, 2) {
+                cx.zext(c, width).unwrap()
+            } else {
+                cx.sext(c, width).unwrap()
+            };
+            let k = cx.constant(&g.constant(w)).unwrap();
+            let t = if g.rng.chance(1, 2) {
+                cx.bin(BinOp::Mul, t, k).unwrap()
+            } else {
+                t
+            };
+            let op = [BinOp::Add, BinOp::Sub][g.rng.below(2) as usize];
+            e = cx.bin(op, e, t).unwrap();
+        }
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert!(
+            equivalent(&mut cx, e, r.expr, &mut rng),
+            "{} vs {}",
+            cx.display(e),
+            cx.display(r.expr)
+        );
+        changed += u64::from(r.changed);
+    }
+    assert!(changed > 300, "{changed}");
+    let std = Engine::standard();
+    let mut cx = Context::new();
+    let c = cx.symbol("c", Width::W1).unwrap();
+    let (z, s) = (
+        cx.zext(c, Width::W64).unwrap(),
+        cx.sext(c, Width::W64).unwrap(),
+    );
+    let e = cx.bin(BinOp::Add, z, s).unwrap();
+    let r = std.simplify(&mut cx, e).unwrap().expr;
+    assert_eq!(cx.display(r).to_string(), "0:64");
+    assert_eq!(
+        simplify(
+            &std,
+            "~x + zext<64>(trunc<16>(x) != -1) + sext<64>(trunc<16>(x) != -1)",
+            64
+        ),
+        "~x"
+    );
+    // A lone `sext` stays: rewriting it to `−zext` would not be smaller.
+    let p = cx.sext(c, Width::W64).unwrap();
+    let five = cx
+        .constant(&BitVec::wrapping_from_u64(Width::W64, 5))
+        .unwrap();
+    let e = cx.bin(BinOp::Add, p, five).unwrap();
+    assert_eq!(std.simplify(&mut cx, e).unwrap().expr, e);
+}

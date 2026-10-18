@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Masks in bitwise functions.** The bitwise pass reads a function of at most three atoms and
+  some constants as one truth table per class of bit positions (where every constant is 0 or
+  all-ones), so a mask no longer takes an atom's place: `~a & (~b & (y & 5))` is
+  `~(a | b) & y & 5`. A function that takes two tables is written as the cheapest of `f & M`,
+  `f | M`, `f ^ M` and `f ^ (g & M)`. The compares pass decides `p == q` by the same tables:
+  `~y & 37 == (y & 37) ^ 37` is true, `(y & 5) == (~y & 5) | 2` false.
+- **Bit subsets order values.** A term whose set bits are bits of another's, as `& | ~`,
+  extractions, extensions and concatenations show, is at most that term in the compares pass's
+  order reading (signed too when the other is not negative): `trunc<16>(a) & 5 <u
+  trunc<16>(~b & (a & 5))` is false, and the lane minimum `select(trunc<16>(x) <u
+  trunc<16>(x & y), trunc<16>(x), trunc<16>(x & y))` is `trunc<16>(x & y)`.
+- **Both readings of a condition.** A linear sum with both `sext(c)` and `zext(c)` of a 1-bit
+  `c` reads the first as `−zext(c)`, so `zext(c) + sext(c)` is 0.
+- **SMT-LIB import.** z3's `ext_rotate_left` and `ext_rotate_right` (rotation by a term,
+  modulo the width) are read. A `let` in another's body no longer counts towards the nesting
+  bound, and `let` names are looked up in constant time, so the long `let` chains z3 prints
+  for large terms import (a script with 850 nested `let`s was refused before). Importing takes
+  about 10 % fewer instructions.
+
 ## 0.17.0
 
 - **Opaque predicates of number theory.** The compares pass decides a predicate by residues
