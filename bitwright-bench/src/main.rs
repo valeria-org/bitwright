@@ -14,6 +14,7 @@
 //!   --metric M        compare `instructions` (default when available), `cpu`, or `wall`
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
 //!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
+//!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches
 //!   --escalate-fast   omit the final 500-million-propagation escalation stage
@@ -34,6 +35,7 @@ mod bench;
 mod corpus_diff;
 mod counter;
 mod keyed_mixers;
+mod prover_budgets;
 mod suites;
 mod workload;
 
@@ -53,6 +55,7 @@ struct Options {
     metric: Option<Metric>,
     fail_on_regression: bool,
     corpus_diff: bool,
+    prover_budgets: bool,
     mixers: bool,
     escalate: bool,
     fast: bool,
@@ -86,6 +89,7 @@ fn parse_args() -> Result<Options, String> {
         metric: None,
         fail_on_regression: false,
         corpus_diff: false,
+        prover_budgets: false,
         mixers: false,
         escalate: false,
         fast: false,
@@ -132,6 +136,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--fail-on-regression" => o.fail_on_regression = true,
             "--corpus-diff" => o.corpus_diff = true,
+            "--prover-budgets" => o.prover_budgets = true,
             "--mixers" => o.mixers = true,
             "--escalate" => o.escalate = true,
             "--escalate-fast" => {
@@ -253,6 +258,9 @@ fn main() -> ExitCode {
     if opts.corpus_diff {
         corpus_diff::report();
         return ExitCode::SUCCESS;
+    }
+    if opts.prover_budgets {
+        return prover_budgets::report();
     }
     if opts.query_budget_ns.is_some() && opts.escalate {
         eprintln!(

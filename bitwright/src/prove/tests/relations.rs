@@ -160,7 +160,7 @@ fn input_cancellation_preserves_declared_bits_models_and_exact_resumption() {
             other => panic!("unexpected outcome: {other:?}"),
         }
     }
-    assert_eq!(stepped.stats(), whole.stats());
+    assert_eq!(stepped.stats().totals(), whole.stats().totals());
 }
 
 #[test]
@@ -369,7 +369,7 @@ fn selectors_do_not_assume_a_count_value_and_resume_exactly() {
         }
         assert!(matches!(answer, Outcome::Unknown(_)));
     }
-    assert_eq!(stepped.stats(), whole.stats());
+    assert_eq!(stepped.stats().totals(), whole.stats().totals());
 }
 
 #[test]

@@ -59,6 +59,35 @@ impl Budget {
         eqsat_work: 0,
     };
 
+    /// Caps on one call scaled by one number, in the proportions of [`Budget::default`] (which
+    /// is `Budget::fuel(1 << 22)`): `fuel` node visits, candidates, rewrites, new nodes and
+    /// e-nodes; `16·fuel` matcher steps, fact transfers, pass work and equality-saturation
+    /// work; `fuel / 1024` MBA solver calls (at least 1 unless `fuel` is 0). Like every budget,
+    /// a count of work units, never time: the same input stops at the same place on every run,
+    /// and a run it stops keeps what it did ([`End::BudgetTerminated`](super::End)).
+    pub const fn fuel(fuel: u64) -> Budget {
+        let wide = fuel.saturating_mul(16);
+        let mba = if fuel == 0 {
+            0
+        } else if fuel < 1024 {
+            1
+        } else {
+            fuel / 1024
+        };
+        Budget {
+            node_visits: fuel,
+            candidates: fuel,
+            match_steps: wide,
+            rewrites: fuel,
+            new_nodes: fuel,
+            fact_work: wide,
+            pass_work: wide,
+            mba_calls: mba,
+            eqsat_nodes: fuel,
+            eqsat_work: wide,
+        }
+    }
+
     /// Field-wise minimum.
     pub fn min(&self, o: &Budget) -> Budget {
         self.zip(o, u64::min)
@@ -89,21 +118,11 @@ impl Budget {
 }
 
 impl Default for Budget {
-    /// Generous caps for one call: 2^22 visits, candidates, rewrites and new nodes, 2^26
-    /// matcher steps, fact transfers and pass work, 4096 MBA solver calls.
+    /// Generous caps for one call, [`Budget::fuel`]`(1 << 22)`: 2^22 visits, candidates,
+    /// rewrites and new nodes, 2^26 matcher steps, fact transfers and pass work, 4096 MBA
+    /// solver calls.
     fn default() -> Self {
-        Budget {
-            node_visits: 1 << 22,
-            candidates: 1 << 22,
-            match_steps: 1 << 26,
-            rewrites: 1 << 22,
-            new_nodes: 1 << 22,
-            fact_work: 1 << 26,
-            pass_work: 1 << 26,
-            mba_calls: 1 << 12,
-            eqsat_nodes: 1 << 22,
-            eqsat_work: 1 << 26,
-        }
+        Budget::fuel(1 << 22)
     }
 }
 

@@ -263,6 +263,66 @@ rule ne_xor_zero<W>(a: W, b: W) { (a ^ b) != 0 => a != b }
 
 - `(p ^ q) != 0` → `p != q`
 
+#### `eq_add_same` — rule
+
+Adding to a value leaves it as it was only when adding zero.
+
+```text
+rule eq_add_same<W>(x: W, y: W) { (x + y) == x => y == 0 }
+```
+
+- `p + q == p` → `q == 0`
+
+#### `ne_add_same` — rule
+
+Adding to a value changes it unless adding zero.
+
+```text
+rule ne_add_same<W>(x: W, y: W) { (x + y) != x => y != 0 }
+```
+
+- `p + q != p` → `q != 0`
+
+#### `eq_sub_same` — rule
+
+Subtracting from a value leaves it as it was only when subtracting zero.
+
+```text
+rule eq_sub_same<W>(x: W, y: W) { (x - y) == x => y == 0 }
+```
+
+- `p - q == p` → `q == 0`
+
+#### `ne_sub_same` — rule
+
+Subtracting from a value changes it unless subtracting zero.
+
+```text
+rule ne_sub_same<W>(x: W, y: W) { (x - y) != x => y != 0 }
+```
+
+- `p - q != p` → `q != 0`
+
+#### `eq_xor_same` — rule
+
+A xor leaves a value as it was only with zero.
+
+```text
+rule eq_xor_same<W>(x: W, y: W) { (x ^ y) == x => y == 0 }
+```
+
+- `(p ^ q) == p` → `q == 0`
+
+#### `ne_xor_same` — rule
+
+A xor changes a value unless with zero.
+
+```text
+rule ne_xor_same<W>(x: W, y: W) { (x ^ y) != x => y != 0 }
+```
+
+- `(p ^ q) != p` → `q != 0`
+
 #### `slt_not_not` — rule
 
 Complementing reverses the order (signed less-than).

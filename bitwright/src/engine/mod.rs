@@ -1332,6 +1332,83 @@ impl Runner<'_, '_> {
         }
     }
 
+    /// `root` with what an interrupted walk of `phase` did kept: a node the walk finished is
+    /// its result, a node it rewrote but did not finish (a `Finish` on the stack) is what the
+    /// rewrite has become so far, and the nodes above are rebuilt over them. No rule or pass
+    /// runs; the walk visits each node below `root` once without charging it, and builds nodes
+    /// only within the budget's new nodes (a node it cannot rebuild stays as it was, operands
+    /// included). `None` when nothing changes.
+    fn salvage(&mut self, cx: &mut Context, phase: usize, root: u32) -> Option<(u32, Fin)> {
+        let mut rewrote: IdMap<u32, (u32, Fin)> = IdMap::default();
+        for f in &self.stack {
+            if let Frame::Finish(n, t, own) = *f {
+                rewrote.entry(n).or_insert((t, own));
+            }
+        }
+        // Each node's salvaged value, and the nodes whose value is being worked out (a node
+        // met again below itself keeps its own value, which is always sound).
+        let mut done: IdMap<u32, (u32, Fin)> = IdMap::default();
+        let mut open: IdMap<u32, ()> = IdMap::default();
+        let mut work: Vec<(u32, bool)> = vec![(root, false)];
+        while let Some((n, expanded)) = work.pop() {
+            if done.contains_key(&n) {
+                continue;
+            }
+            if let Some(r) = self.lookup(cx, phase, n) {
+                done.insert(n, r);
+                continue;
+            }
+            if let Some(&(t, own)) = rewrote.get(&n) {
+                if !expanded && open.insert(n, ()).is_none() {
+                    work.push((n, true));
+                    if !done.contains_key(&t) && !open.contains_key(&t) {
+                        work.push((t, false));
+                    }
+                    continue;
+                }
+                open.remove(&n);
+                let (r, f) = done.get(&t).copied().unwrap_or((t, Fin::FINAL));
+                done.insert(n, (r, own.and(f)));
+                continue;
+            }
+            let node = cx.node(n);
+            if !expanded && open.insert(n, ()).is_none() {
+                work.push((n, true));
+                for c in node.children() {
+                    if !done.contains_key(&c) && !open.contains_key(&c) {
+                        work.push((c, false));
+                    }
+                }
+                continue;
+            }
+            open.remove(&n);
+            let mut kids = [0u32; 3];
+            let mut fin = Fin::FINAL;
+            let mut changed = false;
+            for (k, c) in node.children().enumerate() {
+                let (r, f) = done.get(&c).copied().unwrap_or((c, Fin::FINAL));
+                kids[k] = r;
+                changed |= r != c;
+                fin = fin.and(f);
+            }
+            let value = if changed {
+                let left = self.meter.left().new_nodes;
+                let before = cx.counters().engine_nodes;
+                let (r, refused) = cx.as_engine_limited(left, |cx| cx.rebuild(n, kids));
+                self.meter.spent.new_nodes += cx.counters().engine_nodes - before;
+                match r {
+                    Ok(n1) if !refused => (n1, fin),
+                    _ => (n, Fin::FINAL),
+                }
+            } else {
+                (n, Fin::FINAL)
+            };
+            done.insert(n, value);
+        }
+        let (r, f) = done.get(&root).copied()?;
+        (r != root).then_some((r, f.and(Fin::PROVISIONAL)))
+    }
+
     /// Normalizes `root` under a `Local` phase.
     fn local(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
         // A root with a final result: what the walk would find at its first step, without
@@ -2293,6 +2370,13 @@ impl Runner<'_, '_> {
                     Ok((r, f)) => {
                         cur = r;
                         fin = fin.and(f);
+                    }
+                    // A budget keeps what the stopped phase did (see `salvage`).
+                    Err(stop @ Stop::Exhausted(_)) => {
+                        return Err(match self.salvage(cx, phase, cur) {
+                            Some((r, f)) => (r, fin.and(f), stop),
+                            None => (cur, fin, stop),
+                        });
                     }
                     Err(stop) => return Err((cur, fin, stop)),
                 }

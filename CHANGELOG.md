@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased
+
+- **A budget for the prover's simplification.** `prove::Config::simplify_budget`, an
+  `engine::Budget`, caps the engine's work on a question before it is blasted;
+  `Config::with_simplify_fuel(n)` sets it to the new `Budget::fuel(n)`, which scales every cap
+  of a budget by one number in the default's proportions (`Budget::default()` is
+  `Budget::fuel(1 << 22)`, the budget the prover used until now, and stays the default). Caps
+  count work, never time, so a question stops at the same place on every run. A simplification
+  its budget stops keeps the rewrites it made, and the rest of the question is blasted as it
+  stands. The new `Stats::simplification` (`prove::Simplification`) says whether the engine
+  ran, what it spent, which cap stopped it, and whether it decided the question alone. Under
+  the default budget the prover simplifies as it did, apart from the new rules below. Measured
+  (`bitwright-bench --prover-budgets`): 48 MBA identities over 64-bit symbols, conjoined, are
+  undecided after 20,000 conflicts without simplification (2.9 s); fuel `2^10` settles 11 of
+  them and `2^12` 36 before the search; `2^14` and more decide the question alone in 1.6 ms.
+  Of 27 identities of a keyed invertible mix and one guard over four mixes, 18 stay undecided
+  without simplification (360,521 conflicts, 403.6 million propagations, 40 s); with fuel
+  `2^12` 27 are decided by simplification alone and the guard by 432 conflicts (25 ms).
+- **A run its budget stops keeps its work.** When a budget (or deadline) stops the engine in
+  the middle of a phase, every node that phase finished is replaced by its result, every node it
+  had rewritten but not finished by what the rewrite has become, and the nodes above are rebuilt
+  over them (within the new-nodes cap; no rule or pass runs). Before, the stopped phase's work
+  was dropped and the root came back as the phase before had left it: 200 MBA identities over
+  64-bit symbols (1,840 nodes), stopped after 4,096 node visits and 140 rewrites, came back
+  unchanged, and now come back with those rewrites (1,037 nodes). Results of runs that complete
+  do not change.
+- **What each search costs.** `prove::Stats` reports each `Question::solve`'s own work beside the
+  totals: `last_conflicts`, `last_decisions`, `last_propagations` and `last_lemmas`, with
+  `searches` counting the calls that searched, `lemmas` the clauses learned in all and `fixed`
+  the variables the search has settled for good (`sat::Solver::lemmas` and `num_fixed`). A
+  search goes on from where the last one stopped, so the marginal costs add up to the totals:
+  three resumes of 100 conflicts cost what one search of 300 does, and the last of them a third
+  of its conflicts (`Stats::totals` clears the per-search counts, so two questions compare by
+  their work however their searches were split). Every count is the same on every run.
+- **A value compared with itself changed.** New core rules: `x + y == x` is `y == 0`, and
+  likewise for `x - y`, `x ^ y` and `!=` (`eq_add_same`, `eq_sub_same`, `eq_xor_same`,
+  `ne_add_same`, `ne_sub_same`, `ne_xor_same`). So `x + 1 == x` is false, and murmur3's
+  finalizer at two consecutive inputs differs at the word level (`mix(x) != mix(x + 1)` is
+  true, where the invert pass stopped at `x + 1 != x`).
+- **Invertible mixes, as a prover meets them** (`tests/mix_identities.rs`): for the 64-bit mix
+  `C·(t ^ ((t >>u 32) >>u (t >>u 60)))`, `t = C·(x ^ C)`, under nine odd keys, equal mixes are
+  equal inputs, a mix at a constant is its preimage, and a mix with its inverse is its input,
+  each proved by simplification alone with no circuit or search; so are murmur3's finalizer
+  lemmas. Seven spellings of the data-dependent shift are recognized alike. Scaled-down mixes of
+  8 and 16 bits and xorshifts below half the width are checked at every input, every shift
+  amount (0 included), against an independent scalar oracle. Mixes of one value under several
+  keys combined (`H(p, C1) ^ H(p, C2)`) are not injective and are not cancelled: a guard over
+  them is answered by the search when it is satisfiable, and stays open when it is a preimage
+  question (the `fingerprint-64` fixture).
+- **Behavior changes.** Results change where the six new comparison rules apply, and a run a
+  budget or deadline stops returns what it had done in the stopped phase where it returned that
+  phase's input before. Completed runs change only through the new rules. No answer of the
+  prover changes from proved to refuted or back; more questions are decided, by the rules and
+  by `simplify_budget` where a caller raises it.
+- Benchmarks: no row of `bitwright-bench` changes its results; every one is within 0.8 % of
+  0.18.0's instructions (`service/eqsat/32`, which varies by about 6 % between processes, +5.6 %).
+
 ## 0.18.0
 
 - **Masks in bitwise functions.** The bitwise pass reads a function of at most three atoms and

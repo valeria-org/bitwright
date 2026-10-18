@@ -110,6 +110,30 @@ group core.compare {
     #[example("(p ^ q) != 0" => "p != q")]
     rule ne_xor_zero<W>(a: W, b: W) { (a ^ b) != 0 => a != b }
 
+    /// Adding to a value leaves it as it was only when adding zero.
+    #[example("p + q == p" => "q == 0")]
+    rule eq_add_same<W>(x: W, y: W) { (x + y) == x => y == 0 }
+
+    /// Adding to a value changes it unless adding zero.
+    #[example("p + q != p" => "q != 0")]
+    rule ne_add_same<W>(x: W, y: W) { (x + y) != x => y != 0 }
+
+    /// Subtracting from a value leaves it as it was only when subtracting zero.
+    #[example("p - q == p" => "q == 0")]
+    rule eq_sub_same<W>(x: W, y: W) { (x - y) == x => y == 0 }
+
+    /// Subtracting from a value changes it unless subtracting zero.
+    #[example("p - q != p" => "q != 0")]
+    rule ne_sub_same<W>(x: W, y: W) { (x - y) != x => y != 0 }
+
+    /// A xor leaves a value as it was only with zero.
+    #[example("(p ^ q) == p" => "q == 0")]
+    rule eq_xor_same<W>(x: W, y: W) { (x ^ y) == x => y == 0 }
+
+    /// A xor changes a value unless with zero.
+    #[example("(p ^ q) != p" => "q != 0")]
+    rule ne_xor_same<W>(x: W, y: W) { (x ^ y) != x => y != 0 }
+
     /// Complementing reverses the order (signed less-than).
     #[example("~p <s ~q" => "q <s p")]
     rule slt_not_not<W>(x: W, y: W) { ~x <s ~y => y <s x }

@@ -379,7 +379,7 @@ fn factored_native_products_preserve_models_continuation_and_certificates() {
                 }
             }
             assert!(interruptions > 1);
-            assert_eq!(stepped.stats(), whole.stats());
+            assert_eq!(stepped.stats().totals(), whole.stats().totals());
 
             let value = cx.constant_u64(Width::W64, chosen).unwrap();
             let at_value = cx.eq(x, value).unwrap();

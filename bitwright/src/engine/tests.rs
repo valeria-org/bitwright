@@ -502,6 +502,53 @@ fn budgets_stop_runs_and_are_never_refunded() {
     );
 }
 
+/// A run its budget stops keeps the work of the phase it stopped in: the nodes that phase
+/// finished (and rewrites it had not finished) replace theirs, and their users are rebuilt.
+/// Every budget gives a result equal to the input and the same result on every run; here a
+/// larger budget never leaves more than a smaller one, and between nothing and the whole
+/// strategy some budgets leave a part done.
+#[test]
+fn budgets_keep_the_stopped_phase_work() {
+    let engine = Engine::standard();
+    let mut rng = Rng(11);
+    let src = (0..40)
+        .map(|i| format!("((a{i} ^ b{i}) + ((a{i} & b{i}) << 1) == a{i} + b{i})"))
+        .collect::<Vec<_>>()
+        .join(" & ");
+    let o = ParseOptions::width(Width::W16);
+    let size = |cx: &mut Context, e: Expr| match cx.dag_size(&[e], u32::MAX).unwrap() {
+        crate::Bounded::Exact(n) => n,
+        b => panic!("{b:?}"),
+    };
+    let mut cx = Context::new();
+    let input = cx.parse(&src, &o).unwrap();
+    let full = size(&mut cx, input);
+    let (mut last, mut partial) = (full, 0);
+    for visits in (0..=1200).step_by(40) {
+        let budget = Budget::UNLIMITED.with_node_visits(visits);
+        let mut sizes = Vec::new();
+        for _ in 0..2 {
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let out = engine
+                .run(&mut cx, &[e], Run::default().with_per_call(budget))
+                .unwrap();
+            let r = out.roots[0];
+            assert!(equivalent(&mut cx, e, r.expr, &mut rng), "{visits} visits");
+            sizes.push((size(&mut cx, r.expr), cx.display(r.expr).to_string()));
+        }
+        assert_eq!(sizes[0], sizes[1], "{visits} visits: not reproducible");
+        let n = sizes[0].0;
+        assert!(n <= last, "{visits} visits: {n} nodes after {last}");
+        if n < full && n > 1 {
+            partial += 1;
+        }
+        last = n;
+    }
+    assert_eq!(last, 1, "the whole strategy folds the conjunction");
+    assert!(partial >= 3, "{partial} budgets left a part done");
+}
+
 #[test]
 fn admission_declines_before_any_work() {
     let engine = Engine::standard();

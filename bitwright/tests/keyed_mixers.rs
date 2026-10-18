@@ -1685,7 +1685,7 @@ fn cross_key_budget_exhaustion_is_explicit_and_escalation_reuses_the_question() 
             std::mem::discriminant(&result),
             std::mem::discriminant(&whole)
         );
-        assert_eq!(once.stats(), spent);
+        assert_eq!(once.stats().totals(), spent.totals());
     }
 }
 

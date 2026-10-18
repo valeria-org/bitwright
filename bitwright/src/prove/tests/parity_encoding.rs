@@ -259,6 +259,6 @@ fn native_three_input_encoding_preserves_declared_models_and_exact_resumption() 
             }
             assert!(stepped.stats().propagations - before.propagations <= 1);
         }
-        assert_eq!(stepped.stats(), whole.stats());
+        assert_eq!(stepped.stats().totals(), whole.stats().totals());
     }
 }

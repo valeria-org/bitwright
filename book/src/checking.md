@@ -127,6 +127,62 @@ assert!(q.stats().conflicts > 10);
 # Ok::<(), bitwright::Error>(())
 ```
 
+Each `solve` reports its own cost too: `last_conflicts`, `last_decisions`, `last_propagations`
+and `last_lemmas` are the last search's, `searches` counts them, `lemmas` the clauses learned
+in all, and `fixed` the variables the search has settled for good. A search goes on from where
+the one before stopped, so the marginal costs add up to the totals and nothing is searched
+twice. Every count is of work, not time: a question asked the same way reports the same numbers
+on every run.
+
+### Simplifying within a budget
+
+Before blasting, the prover simplifies the question with bitwright's engine
+(`Config::simplify`, on by default). Identities it settles at the word level answer the question
+with no circuit at all: an invertible mix compared with itself at another input (see
+[Invertibility](invertibility.md)), products of mixed boolean-arithmetic expressions. What it
+does not settle is blasted smaller. The engine works within `Config::simplify_budget`, an
+`engine::Budget` of work units (node visits, rewrites, pass work, MBA solver calls), never time,
+so a question stops at the same place on every run. `Budget::default()` is generous, and
+`Config::with_simplify_fuel(n)` scales every cap by one number (`Budget::fuel`). When the budget
+stops the engine, the rewrites it made are kept and the rest of the question is blasted as it
+stands. `Stats::simplification` says whether the engine ran, what it spent, which cap stopped
+it, and whether it decided the question alone. The engine remembers finished work in the
+context, so a question asked after related ones in the same context may cost it less.
+
+```rust
+use bitwright::engine::Exhausted;
+use bitwright::prove::{Config, Limits, Outcome, Question};
+use bitwright::{Context, ParseOptions, Width};
+
+// A keyed mix with a data-dependent shift: equal images under one key are equal inputs.
+let mix = |v: &str| {
+    let t = format!("(0x87c37b91114253d5 * ({v} ^ 0x87c37b91114253d5))");
+    format!("(0x87c37b91114253d5 * ({t} ^ (({t} >>u 32) >>u ({t} >>u 60))))")
+};
+let src = format!("({} == {}) == (x == y)", mix("x"), mix("y"));
+let o = ParseOptions::width(Width::W64);
+// Proved by the engine, with no circuit and no search.
+let mut cx = Context::new();
+let p = cx.parse(&src, &o)?;
+let mut q = Question::valid(&mut cx, p, &Config::default())?;
+assert!(matches!(q.solve(&mut cx, Limits::conflicts(1_000))?, Outcome::Proved(_)));
+let s = q.stats();
+assert!(s.simplification.decided && s.nodes == 0 && s.conflicts == 0);
+// Too little fuel to get there: the engine says which cap stopped it, and the search, which
+// finds this question hard, takes over.
+let mut cx = Context::new();
+let p = cx.parse(&src, &o)?;
+let cfg = Config::default().with_simplify_fuel(16);
+let mut q = Question::valid(&mut cx, p, &cfg)?;
+assert_eq!(q.stats().simplification.stopped, Some(Exhausted::NodeVisits));
+for n in 1..=2 {
+    assert!(matches!(q.solve(&mut cx, Limits::conflicts(50))?, Outcome::Unknown(_)));
+    assert_eq!((q.stats().searches, q.stats().last_conflicts), (n, 50));
+}
+assert_eq!(q.stats().conflicts, 100);
+# Ok::<(), bitwright::Error>(())
+```
+
 ### Rules as Lean theorems
 
 `bitwright lean rules.bwr` (`rules::lean::lean`) writes the rules as Lean 4 theorems over

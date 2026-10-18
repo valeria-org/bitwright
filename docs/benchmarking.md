@@ -9,6 +9,7 @@ cargo run --release -p bitwright-bench                      # everything, 7 samp
 cargo run --release -p bitwright-bench -- facts simplify    # names containing "facts" or "simplify"
 cargo run --release -p bitwright-bench -- --quick           # a tenth of the iterations, 3 samples
 cargo run --release -p bitwright-bench -- --corpus-diff     # MBA defaults against the signature solver
+cargo run --release -p bitwright-bench -- --prover-budgets  # the prover's simplification under budgets
 ```
 
 ## What is measured, and why instructions
@@ -230,6 +231,23 @@ user-space instructions each configuration took (and its wall time, for orientat
 MBA service's answers and refusals, and examples of changed results. It was the evidence for
 the change of defaults (`docs/proposals/mba-defaults.md`), and measures the MBA service's
 answers whenever they change.
+
+## Prover budgets
+
+`--prover-budgets` is an opt-in report on the prover's word-level simplification
+(`prove::Config::simplify_budget`). It asks two families of questions under fuel from none
+(`simplify` off) to the default (`Budget::fuel`), with a search budget of 20,000 conflicts:
+
+- 48 MBA identities over 64-bit symbols, conjoined (linear ones and products). Per fuel, which
+  cap stopped the engine, what it spent (node visits, pass work, MBA solver calls), how many
+  identities it settled (counted with the same engine run directly), the circuit left, the
+  answer, the search's conflicts and propagations, instructions and wall time.
+- 27 identities of a keyed invertible mix under nine keys (cancelling, solved at a constant,
+  inverted) and one guard over four mixes of one value against a free lane: how many questions
+  the engine decides alone, how many the search decides, how many stay unknown, and the
+  search's conflicts and propagations in total.
+
+Every row is asked twice, and the report fails if the two reports differ in answer or in work.
 
 ## Comparing with other engines
 

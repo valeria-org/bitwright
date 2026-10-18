@@ -100,6 +100,14 @@ pub struct Config {
     /// hard) are answered at once, and the rest is blasted smaller. Not with a certificate: a
     /// certificate is of the question as asked, with its symbols' declared known bits.
     pub simplify: bool,
+    /// The engine's budget for [`simplify`](Self::simplify): caps in the units of
+    /// [`Budget`](crate::engine::Budget), counts of work and never time, so a question stops at
+    /// the same place on every run. [`Budget::default`](crate::engine::Budget::default) (the
+    /// default) is generous; [`with_simplify_fuel`](Self::with_simplify_fuel) scales every cap
+    /// by one number. A simplification its budget stops keeps the rewrites it made, and the
+    /// rest of the question is blasted as it stands; [`Stats::simplification`] says what was
+    /// spent and which cap stopped it.
+    pub simplify_budget: crate::engine::Budget,
     /// Assignments of the symbols to evaluate before the search, 64 at a time
     /// (in batches of 64, selected by [`sample_mode`](Self::sample_mode)): a refutation that a fraction of
     /// the values give is found without the search, which needs many conflicts for it on a
@@ -155,6 +163,7 @@ impl Default for Config {
             max_nodes: 4_000_000,
             certificate: false,
             simplify: true,
+            simplify_budget: crate::engine::Budget::default(),
             samples: 256,
             sample_mode: SampleMode::Random,
             relational_lemmas: false,
@@ -175,6 +184,7 @@ setters!(Config {
     with_max_nodes: max_nodes: usize,
     with_certificate: certificate: bool,
     with_simplify: simplify: bool,
+    with_simplify_budget: simplify_budget: crate::engine::Budget,
     with_samples: samples: u32,
     with_sample_mode: sample_mode: SampleMode,
     with_relational_lemmas: relational_lemmas: bool,
@@ -188,6 +198,13 @@ setters!(Config {
 });
 
 impl Config {
+    /// Sets [`simplify_budget`](Self::simplify_budget) to
+    /// [`Budget::fuel`](crate::engine::Budget::fuel)`(fuel)`: `fuel` node visits of the engine
+    /// and every other cap in proportion (the default is `1 << 22`).
+    pub fn with_simplify_fuel(self, fuel: u64) -> Self {
+        self.with_simplify_budget(crate::engine::Budget::fuel(fuel))
+    }
+
     /// The search's limits: [`max_conflicts`](Self::max_conflicts) and
     /// [`max_propagations`](Self::max_propagations).
     pub fn limits(&self) -> Limits {
@@ -334,10 +351,14 @@ impl core::fmt::Display for Unknown {
     }
 }
 
-/// The work a question took, so far.
+/// The work a question took, so far. Every count is of work done, not of time, and the same on
+/// every run: a question asked the same way (in a context with the same history) reports the
+/// same numbers, and the totals of one resumed in steps are those of one asked at once.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
+    /// What simplifying the question took ([`Config::simplify`]).
+    pub simplification: Simplification,
     /// AIG nodes of the circuit (inputs and gates).
     pub nodes: usize,
     /// Assignments evaluated before search, on words or the circuit ([`Config::samples`]).
@@ -348,12 +369,76 @@ pub struct Stats {
     pub clauses: usize,
     /// Learned clauses kept.
     pub learned: usize,
+    /// Clauses learned in all, units included, whether kept or since deleted.
+    pub lemmas: u64,
+    /// Variables fixed for good: assigned with no decision made, by the clauses and the units
+    /// learned so far. Of [`vars`](Self::vars), the part of the circuit the search has settled.
+    pub fixed: usize,
     /// Conflicts.
     pub conflicts: u64,
     /// Decisions.
     pub decisions: u64,
     /// Propagations.
     pub propagations: u64,
+    /// Searches run: [`Question::solve`] calls that searched (one that finds the question
+    /// already decided, or that has a zero allowance, does not).
+    pub searches: u32,
+    /// The last search's conflicts: the marginal cost of its call. A search goes on from where
+    /// the one before stopped, so these add up to [`conflicts`](Self::conflicts) and nothing
+    /// is searched twice.
+    pub last_conflicts: u64,
+    /// The last search's decisions.
+    pub last_decisions: u64,
+    /// The last search's propagations (they add up to [`propagations`](Self::propagations)
+    /// with the propagation of the clauses before any search).
+    pub last_propagations: u64,
+    /// Clauses the last search learned.
+    pub last_lemmas: u64,
+}
+
+impl Stats {
+    /// These counts without the last search's own ([`searches`](Self::searches) and the
+    /// `last_*` fields cleared): the work done in all, which is the same for a question
+    /// resumed in steps and one asked at once under their combined limits.
+    pub fn totals(self) -> Stats {
+        Stats {
+            searches: 0,
+            last_conflicts: 0,
+            last_decisions: 0,
+            last_propagations: 0,
+            last_lemmas: 0,
+            ..self
+        }
+    }
+}
+
+/// What simplifying a question with bitwright's own engine took ([`Config::simplify`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Simplification {
+    /// Whether the engine ran on the question.
+    pub ran: bool,
+    /// The work it did, in the units of its budget ([`Config::simplify_budget`]): every
+    /// field counted, capped or not. Work the engine finished on the same nodes earlier in the
+    /// same context is remembered there and not done again.
+    pub spent: crate::engine::Budget,
+    /// The cap that stopped it, if one did. The rewrites it made until then are kept, and the
+    /// rest of the question is blasted as it stands; a larger budget may settle more.
+    pub stopped: Option<crate::engine::Exhausted>,
+    /// Whether it decided the question (the simplified question is true).
+    pub decided: bool,
+}
+
+impl Default for Simplification {
+    /// The engine did not run.
+    fn default() -> Self {
+        Simplification {
+            ran: false,
+            spent: crate::engine::Budget::ZERO,
+            stopped: None,
+            decided: false,
+        }
+    }
 }
 
 /// The bits of expressions, blasted on demand.
@@ -726,14 +811,28 @@ impl Question {
             }
         }
         if cfg.simplify && !cfg.certificate {
+            let mut spent = crate::engine::Allowance::new(crate::engine::Budget::UNLIMITED);
+            let run = crate::engine::Run::default()
+                .with_per_call(cfg.simplify_budget)
+                .with_allowance(&mut spent);
             let run = match assumptions {
-                Some(a) => crate::engine::Run::default().with_assumptions(a),
-                None => crate::engine::Run::default(),
+                Some(a) => run.with_assumptions(a),
+                None => run,
             };
             let goal = cx.handle(goal_node);
             let out = simplifier().run(cx, &[goal], run)?.roots[0];
             let s = cx.id(out.expr)?;
-            if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
+            let proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+            q.stats.simplification = Simplification {
+                ran: true,
+                spent: spent.spent(),
+                stopped: match out.end {
+                    crate::engine::End::BudgetTerminated(why) => Some(why),
+                    _ => None,
+                },
+                decided: proved,
+            };
+            if proved {
                 return decided(q, Outcome::Proved(None));
             }
             // A result that relies on constraints holds where they do, which is all a proof
@@ -892,6 +991,8 @@ impl Question {
         q.stats.vars = solver.num_vars();
         q.stats.clauses = cnf.emitted();
         q.stats.learned = solver.num_learnts();
+        q.stats.lemmas = solver.lemmas;
+        q.stats.fixed = solver.num_fixed();
         q.stats.propagations = solver.propagations;
         q.search = Some(Box::new(Search { solver, cnf }));
         Ok(q)
@@ -910,11 +1011,27 @@ impl Question {
                 "a question neither decided nor open".into(),
             ));
         };
+        let before = (
+            s.solver.conflicts,
+            s.solver.decisions,
+            s.solver.propagations,
+            s.solver.lemmas,
+        );
         let answer = s.solver.solve_within(limits);
         self.stats.learned = s.solver.num_learnts();
+        self.stats.lemmas = s.solver.lemmas;
+        self.stats.fixed = s.solver.num_fixed();
         self.stats.conflicts = s.solver.conflicts;
         self.stats.decisions = s.solver.decisions;
         self.stats.propagations = s.solver.propagations;
+        // A zero allowance pauses the question without searching.
+        if limits.conflicts != 0 && limits.propagations != 0 {
+            self.stats.searches += 1;
+            self.stats.last_conflicts = s.solver.conflicts - before.0;
+            self.stats.last_decisions = s.solver.decisions - before.1;
+            self.stats.last_propagations = s.solver.propagations - before.2;
+            self.stats.last_lemmas = s.solver.lemmas - before.3;
+        }
         let o = match answer {
             Answer::Unknown => {
                 return Ok(Outcome::Unknown(Unknown::Budget {

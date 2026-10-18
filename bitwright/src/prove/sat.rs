@@ -160,6 +160,8 @@ pub struct Solver {
     /// Lemmas offered by preprocessing as RUP consequences that unit propagation did not
     /// confirm, so they were not added.
     pub(super) rejected_lemmas: u64,
+    /// Clauses learned so far, units included (kept or since deleted).
+    pub lemmas: u64,
     /// Conflicts so far.
     pub conflicts: u64,
     /// Decisions so far.
@@ -214,6 +216,7 @@ impl Solver {
             next_reduce: 2000,
             learnts: 0,
             rejected_lemmas: 0,
+            lemmas: 0,
             conflicts: 0,
             decisions: 0,
             propagations: 0,
@@ -244,6 +247,12 @@ impl Solver {
     /// The number of learned clauses kept.
     pub fn num_learnts(&self) -> usize {
         self.learnts
+    }
+
+    /// The number of variables assigned with no decision made: fixed by the clauses and the
+    /// units learned, whatever the search does next.
+    pub fn num_fixed(&self) -> usize {
+        self.trail_lim.first().copied().unwrap_or(self.trail.len())
     }
 
     /// A new variable.
@@ -914,6 +923,7 @@ impl Solver {
                     return Answer::Unsat;
                 }
                 let (learnt, bt, lbd) = self.analyze(confl);
+                self.lemmas += 1;
                 self.cancel_until(bt);
                 if let Some(p) = &mut self.proof {
                     p.push(Step::Add(learnt.clone()));

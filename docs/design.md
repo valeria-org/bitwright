@@ -580,6 +580,11 @@ pub enum Decline { AdmissionCap(Cap) }        // Unsupported(..) arrives with ex
   fact cap (`ContextConfig::fact_work`) or the matcher's per-application step cap only declines the
   rule at hand, the call goes on, and a root whose result depends on such a decline also ends
   `BudgetTerminated` (with `FactWork` or `MatchSteps`). `Completed` therefore always means final.
+- A budget-terminated root keeps the work of the phase that was stopped (`Runner::salvage`): every
+  node that phase finished is replaced by its result, every node it rewrote but had not finished
+  by what the rewrite has become, and the nodes above are rebuilt over them, within the new-nodes
+  cap (a node it cannot rebuild stays as it was, operands included). No rule or pass runs, and
+  only the rebuilt nodes are charged.
 - `Engine` is `Send + Sync` and cheap to clone. `Context` is `Send`, not `Sync`. The engine never
   spawns threads.
 - **Linking.** Every rule must be vouched for by its program's ledger (name and content hash), or the

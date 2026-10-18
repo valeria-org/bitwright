@@ -970,7 +970,7 @@ fn questions_resume_and_say_why_they_are_undecided() {
         .solve(&mut cx2, Limits::conflicts(steps * chunk))
         .unwrap();
     assert!(matches!(&once, Outcome::Refuted(n) if n == m));
-    assert_eq!(q2.stats(), st);
+    assert_eq!(q2.stats().totals(), st.totals());
     // A propagation limit stops the search as well.
     let mut cx3 = Context::new();
     let p3 = cx3.parse(claim, &o).unwrap();
