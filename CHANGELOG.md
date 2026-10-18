@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.0
 
 - **Masks in bitwise functions.** The bitwise pass reads a function of at most three atoms and
   some constants as one truth table per class of bit positions (where every constant is 0 or
