@@ -390,13 +390,26 @@ fn run_bitwright(tool: Tool, engine: &Engine, case: &Case) -> Row {
         Ok(e) => e,
         Err(e) => return row.fail(Status::Unreadable, e),
     };
-    let out = engine.run(&mut cx, &[input], Run::default());
+    // PROTOTYPE (symbolic-charge investigation): `BW_FUEL=N` runs at `Budget::fuel(2^N)`.
+    let run = match std::env::var("BW_FUEL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(n) => Run::default().with_per_call(bitwright::engine::Budget::fuel(1 << n)),
+        None => Run::default(),
+    };
+    let out = engine.run(&mut cx, &[input], run);
     let micros = t.elapsed().as_secs_f64() * 1e6;
     let heap = heap::used_since(base);
-    let answer = match out {
-        Ok(o) => o.roots[0].expr,
+    let (answer, pass, end) = match out {
+        Ok(o) => (
+            o.roots[0].expr,
+            o.stats.pass_work,
+            format!("{:?}", o.roots[0].end),
+        ),
         Err(e) => return row.fail(Status::Failed, e.to_string()),
     };
+    answers(case, &cx.display(answer).to_string(), pass, &end);
     let mut row = measure(&mut cx, input, answer, case, row);
     row.micros = micros;
     row.heap = Some(heap);
@@ -404,6 +417,30 @@ fn run_bitwright(tool: Tool, engine: &Engine, case: &Case) -> Row {
         failure(tool, case, &cx.display(answer).to_string());
     }
     row
+}
+
+/// PROTOTYPE: with `BW_ANSWERS` set to a file, appends every bitwright answer to it: line, a
+/// hash of the input, pass work, how the run ended, and the answer, tab-separated.
+fn answers(case: &Case, answer: &str, pass: u64, end: &str) {
+    use std::hash::{Hash, Hasher};
+    let Some(path) = std::env::var_os("BW_ANSWERS") else {
+        return;
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    case.input.hash(&mut h);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            f,
+            "{}\t{:016x}\t{pass}\t{end}\t{}",
+            case.line,
+            h.finish(),
+            answer.replace('\n', "; ")
+        );
+    }
 }
 
 /// With `BW_FAILURES` set to a file, appends every scored case a bitwright tool leaves larger

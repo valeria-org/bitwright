@@ -10,10 +10,10 @@ use bitwright::{Context, Expr, ParseOptions, Width};
 use std::process::ExitCode;
 
 /// The search's budget in every row (questions it does not settle stop there).
-const CONFLICTS: u64 = 20_000;
+pub(crate) const CONFLICTS: u64 = 20_000;
 
 /// `n` MBA identities over fresh symbols, conjoined: linear ones and products.
-fn identities(n: usize) -> String {
+pub(crate) fn identities(n: usize) -> String {
     let forms = [
         "((a{i} ^ b{i}) + 2 * (a{i} & b{i})) == (a{i} + b{i})",
         "((a{i} | b{i}) - (a{i} & b{i})) == (a{i} ^ b{i})",
@@ -110,7 +110,7 @@ fn mix_questions() -> Vec<(String, String)> {
 }
 
 /// A question's answer and work, asked once.
-fn ask(src: &str, w: Width, cfg: &Config) -> (&'static str, Stats) {
+pub(crate) fn ask(src: &str, w: Width, cfg: &Config) -> (&'static str, Stats) {
     let mut cx = Context::new();
     let p = cx.parse(src, &ParseOptions::width(w)).expect("parse");
     let mut q = Question::valid(&mut cx, p, cfg).expect("question");

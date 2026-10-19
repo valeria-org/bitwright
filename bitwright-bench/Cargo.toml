@@ -12,6 +12,10 @@ publish = false
 [dependencies]
 bitwright = { path = "../bitwright", features = ["mba", "eqsat", "smtlib"] }
 
+[features]
+## PROTOTYPE: `--symbolic-cost`, tallies of MBA certificate work by kind.
+probe = ["bitwright/cost-probe"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -6,6 +6,7 @@ use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::hash::combine;
 use crate::mba::certify;
+use crate::mba::probe::{self, Kind as PKind};
 use crate::mba::{
     CacheEntry, CacheKey, Claim, LOWERING_VERSION, MbaAnswer, MbaConfig, MbaExpr, Refusal, Verdict,
     lift_id, lower_id,
@@ -41,8 +42,14 @@ fn charge(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, evals: u64) -> Resul
 /// random points (see [`certify::sample_points`]). A filter, never evidence on its own.
 fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Result<bool, Stop> {
     charge(r, a, b, u64::from(SAMPLE_POINTS))?;
-    let points = certify::sample_points(a.vars(), &[a, b], seed);
-    Ok(certify::refute(a, b, &points).is_none())
+    let units = (a.nodes().len() + b.nodes().len()) as u64 * u64::from(SAMPLE_POINTS);
+    probe::gate(|| {
+        let span = probe::begin(PKind::Sample);
+        let points = certify::sample_points(a.vars(), &[a, b], seed);
+        let agree = certify::refute(a, b, &points).is_none();
+        probe::end(span, 0, units, false);
+        Ok(agree)
+    })
 }
 
 /// Pass work as a certificate's meter.
@@ -59,6 +66,9 @@ impl certify::Meter for Gate<'_, '_, '_> {
             .charge(Counter::PassWork, units)
             .map_err(Stop::Exhausted)
     }
+    fn scope(&self) -> probe::Scope {
+        probe::Scope::Gate
+    }
 }
 
 /// bitwright's own exact evidence about `a == b`: the cheapest certificate that applies (the
@@ -68,7 +78,15 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
 /// than what is left is not started (reported as over budget).
 fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
-    let report = certify::prove(a, b, &mut Gate(r))?;
+    let left = r.meter.left().pass_work;
+    let report = probe::gate(|| {
+        let span = probe::begin(PKind::Cert);
+        let report = certify::prove(a, b, &mut Gate(r));
+        let units = left - r.meter.left().pass_work;
+        let proved = report.as_ref().is_ok_and(|x| x.verdict == Verdict::Proved);
+        probe::end(span, 0, units, proved);
+        report
+    })?;
     count(r).certificates.record(&report);
     Ok(report)
 }
@@ -182,7 +200,9 @@ pub(super) fn step(
                     let budget = cfg
                         .budget
                         .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
+                    let span = probe::begin(PKind::Solve);
                     let a = inner.mba.solver.solve(&m, &budget);
+                    probe::end(span, 0, 0, matches!(a, MbaAnswer::Simplified { .. }));
                     if a != MbaAnswer::Exhausted {
                         r.mba_answers.insert(key, a.clone());
                     }

@@ -15,6 +15,9 @@
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
 //!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
 //!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
+//!   --symbolic-sweep FILE  PROTOTYPE: per-root MBA results at small fuels, for charge factors
+//!   --symbolic-cost   PROTOTYPE (feature `probe`): certificate work by kind, per charged unit
+//!   --symbolic-worst  PROTOTYPE (feature `probe`): one symbolic comparison no test can take
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches
 //!   --escalate-fast   omit the final 500-million-propagation escalation stage
@@ -37,6 +40,7 @@ mod counter;
 mod keyed_mixers;
 mod prover_budgets;
 mod suites;
+mod symbolic_cost;
 mod workload;
 
 use std::process::ExitCode;
@@ -56,6 +60,9 @@ struct Options {
     fail_on_regression: bool,
     corpus_diff: bool,
     prover_budgets: bool,
+    symbolic_sweep: Option<String>,
+    symbolic_cost: bool,
+    symbolic_worst: bool,
     mixers: bool,
     escalate: bool,
     fast: bool,
@@ -90,6 +97,9 @@ fn parse_args() -> Result<Options, String> {
         fail_on_regression: false,
         corpus_diff: false,
         prover_budgets: false,
+        symbolic_sweep: None,
+        symbolic_cost: false,
+        symbolic_worst: false,
         mixers: false,
         escalate: false,
         fast: false,
@@ -137,6 +147,9 @@ fn parse_args() -> Result<Options, String> {
             "--fail-on-regression" => o.fail_on_regression = true,
             "--corpus-diff" => o.corpus_diff = true,
             "--prover-budgets" => o.prover_budgets = true,
+            "--symbolic-sweep" => o.symbolic_sweep = Some(value("--symbolic-sweep")?),
+            "--symbolic-cost" => o.symbolic_cost = true,
+            "--symbolic-worst" => o.symbolic_worst = true,
             "--mixers" => o.mixers = true,
             "--escalate" => o.escalate = true,
             "--escalate-fast" => {
@@ -261,6 +274,27 @@ fn main() -> ExitCode {
     }
     if opts.prover_budgets {
         return prover_budgets::report();
+    }
+    if let Some(path) = &opts.symbolic_sweep {
+        return symbolic_cost::sweep(path);
+    }
+    if opts.symbolic_worst {
+        #[cfg(feature = "probe")]
+        return symbolic_cost::worst_report();
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--symbolic-worst needs the `probe` feature");
+            return ExitCode::from(2);
+        }
+    }
+    if opts.symbolic_cost {
+        #[cfg(feature = "probe")]
+        return symbolic_cost::probe_report();
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--symbolic-cost needs the `probe` feature");
+            return ExitCode::from(2);
+        }
     }
     if opts.query_budget_ns.is_some() && opts.escalate {
         eprintln!(

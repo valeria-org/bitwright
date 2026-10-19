@@ -45,6 +45,7 @@ use std::collections::HashMap;
 
 use super::batch::{BLOCK, Kind, Lane, Program, Wide};
 use super::expr::{MNode, MOp, MbaExpr};
+use super::probe::{self, Kind as PKind, Scope};
 use super::solve::Verdict;
 use crate::engine::CertStats;
 use crate::ops::{BinOp, UnOp};
@@ -99,6 +100,10 @@ pub(crate) trait Meter {
     fn left(&self) -> u64;
     /// Spends `units`.
     fn charge(&mut self, units: u64) -> Result<(), Self::Err>;
+    /// PROTOTYPE: which meter this is (see [`probe`]).
+    fn scope(&self) -> Scope {
+        Scope::Solver
+    }
 }
 
 /// A meter over a plain count (a solver's or a prover's budget).
@@ -799,21 +804,40 @@ fn test<M: Meter>(
     }
     // The polynomial tests are planned for polynomial sides only, which the comparison reads;
     // it takes at least a unit per node.
-    let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() - cost);
+    // PROTOTYPE: `k` units per unit of symbolic work (1 today; see `probe`).
+    let k = probe::rate(meter.scope());
+    // PROTOTYPE: without the reserve, the attempt may leave the test unaffordable.
+    let reserve = if probe::reserve(meter.scope()) {
+        cost
+    } else {
+        0
+    };
+    let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min((meter.left() - reserve) / k);
     if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
         let mut work = 0;
+        let span = probe::begin(PKind::SymFirst);
         let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
-        meter.charge(work.min(cap))?;
+        let units = work.min(cap).saturating_mul(k);
+        probe::end(span, work, units, equal);
+        meter.charge(units)?;
         if equal {
             return Ok(Run::Equal(Cert::Symbolic));
         }
+        if cost > meter.left() {
+            report.over_budget = true;
+            return Ok(Run::OverBudget);
+        }
     }
     let width = a.width().map_or(1, |w| w.bits());
-    match kind {
+    let (span, points) = (probe::begin(PKind::Eval), report.points);
+    let out = match kind {
         Kind::N64 => run_in::<u64, M>(meter, a, &pa, &pb, plan, width, report),
         Kind::N128 => run_in::<u128, M>(meter, a, &pa, &pb, plan, width, report),
         Kind::Wide => run_in::<Wide, M>(meter, a, &pa, &pb, plan, width, report),
-    }
+    };
+    let units = (report.points - points).saturating_mul(per);
+    probe::end(span, 0, units, matches!(out, Ok(Run::Equal(_))));
+    out
 }
 
 fn run_in<L: Lane, M: Meter>(
@@ -3341,9 +3365,23 @@ fn symbolic<M: Meter>(
     b: &MbaExpr,
     report: &mut Report,
 ) -> Result<bool, M::Err> {
+    // PROTOTYPE: `k` units per unit of work; `bound`: within what is left (see `probe`).
+    let k = probe::rate(meter.scope());
+    let limit = if probe::bound(meter.scope()) {
+        meter.left() / k
+    } else {
+        u64::MAX
+    };
     let mut work = 0u64;
-    let equal = symbolic_equal(a, b, u64::MAX, &mut work) == Some(true);
-    meter.charge(work.min(meter.left()))?;
+    let span = probe::begin(PKind::SymFallback);
+    let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+    if work > limit {
+        // Stopped by the budget: more might decide.
+        report.over_budget = true;
+    }
+    let units = work.min(limit).saturating_mul(k).min(meter.left());
+    probe::end(span, work, units, equal);
+    meter.charge(units)?;
     if equal {
         report.verdict = Verdict::Proved;
         report.cert = Some(Cert::Symbolic);
@@ -3564,6 +3602,13 @@ impl super::EquivalenceProver for NativeProver {
 /// The refutation sample, then [`prove`], under a budget of `steps` node evaluations (the
 /// report says how many it spent).
 pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
+    let span = probe::begin(PKind::Cert);
+    let r = check_in(a, b, steps);
+    probe::end(span, 0, r.work, r.verdict == Verdict::Proved);
+    r
+}
+
+fn check_in(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
     let mut meter = Steps::new(steps);
     let mut report = Report::new();
     if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
@@ -3577,8 +3622,11 @@ pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
     report.points += SAMPLE_POINTS as u64;
     report.work = meter.spent;
     let seed = crate::hash::combine(a.key()[0], b.key()[1]);
+    let span = probe::begin(PKind::Sample);
     let points = sample_points(a.vars(), &[a, b], seed);
-    if let Some(p) = refute(a, b, &points) {
+    let refuted = refute(a, b, &points);
+    probe::end(span, 0, units, false);
+    if let Some(p) = refuted {
         report.verdict = Verdict::Refuted;
         report.counterexample = Some(p);
         return report;

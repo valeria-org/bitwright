@@ -30,6 +30,11 @@ pub(crate) mod certify;
 mod expr;
 mod lower;
 mod nf;
+#[cfg(feature = "cost-probe")]
+#[doc(hidden)]
+pub mod probe;
+#[cfg(not(feature = "cost-probe"))]
+pub(crate) mod probe;
 mod solve;
 mod threaded;
 

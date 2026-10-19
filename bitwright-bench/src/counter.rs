@@ -123,6 +123,32 @@ impl Counters {
     }
 }
 
+/// PROTOTYPE: a free-running user-space instruction counter for the calling thread (opened and
+/// started once), as a plain function for `bitwright::mba::probe::set_clock`; `None` where
+/// counters are unavailable.
+#[cfg(feature = "probe")]
+pub fn free_running() -> Option<fn() -> u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        static FDS: OnceLock<Vec<i32>> = OnceLock::new();
+        let fds = FDS.get_or_init(|| {
+            let fds = linux::open_instructions().unwrap_or_default();
+            linux::reset_enable(&fds);
+            fds
+        });
+        if fds.is_empty() {
+            return None;
+        }
+        fn read() -> u64 {
+            FDS.get().and_then(|f| linux::read_sum(f)).unwrap_or(0)
+        }
+        Some(read)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 impl Drop for Counters {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]

@@ -28,6 +28,8 @@ check = ["prove"]
 prove = []
 ## The MBA service (`bitwright::mba`, `Phase::Mba`) with the native signature solver.
 mba = []
+## PROTOTYPE (not for release): tallies of MBA certificate work (`bitwright::mba::probe`).
+cost-probe = ["mba"]
 ## The equality-saturation search service (`bitwright::eqsat`), default off.
 eqsat = []
 ## SMT-LIB 2.6 export of expressions and rule obligations, and import of a QF_BV subset.
