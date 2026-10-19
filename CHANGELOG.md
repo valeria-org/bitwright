@@ -15,6 +15,17 @@
   `simplify/mba-nonlinear/64` takes 82 % fewer instructions, `simplify/mba-nonlinear/8` 2.7 %
   fewer, and the normal-form solver's nonlinear corpus of `--corpus-diff` at 64 bits 0.30 G
   instead of 2.73 G; every `--corpus-diff` result is the same.
+- **A cheaper sample check in the compositional certificate.** Its check that each pair's
+  skeletons agree with their nodes at the 64 points of the refutation sample now evaluates
+  them a batch of points at a time with the batched evaluator, where it evaluated them one point
+  at a time; where the batched evaluator might not compute the same (a value of another width,
+  a cast, anything wider than 64 bits) it still does, and debug builds check that both agree.
+  The check's answer is the same, and it is charged nothing, as before. It was half of the
+  longest normal-form solver calls measured: one on a 44-node fragment of a random DAG takes
+  5.3 G instructions instead of 10.4 G. `simplify/mba-nonlinear/8` and `/64` take 2.8 and 3.0 %
+  fewer instructions, `--corpus-diff`'s random DAGs 2.3 % (8 bits) and 0.5 % (64 bits) fewer,
+  `compare/`'s `bw-nf` on CoBRA's datasets 0.7 % fewer; every result, and every count of work
+  and of certificates, is the same.
 - **Behavior changes.** None in results under the default budgets: `--corpus-diff`, the
   `simplify/mba*` rows and `--prover-budgets` answer as before, and so does `compare/`'s
   `bw-nf` on every expression of CoBRA's datasets (76,080). Certificates spend less of a
