@@ -1,7 +1,7 @@
 # Proposal: charging the MBA certifier's symbolic comparison at its cost
 
-Status: the recommendation (k = 256, the fallback bound, no reserve) is implemented on `main`
-after 0.20.0 (`SYMBOLIC_RATE` in `mba/certify.rs`), with the solver-budget proposal's account.
+Status: the recommendation (k = 256, the fallback bound, no reserve) is implemented in 0.21.0
+(`SYMBOLIC_RATE` in `mba/certify.rs`), with the solver-budget proposal's account.
 Measured on a prototype with local switches (6a9d522 on
 branch `claude/cool-taussig-d53190`, on 20fb416, the tip of `main` after 0.19.0; it reads
 environment variables in the library, so it is kept off `main`). Bounding the

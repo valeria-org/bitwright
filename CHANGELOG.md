@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.21.0
 
 - **The MBA certifier's symbolic comparison is charged at its cost.** It was charged a unit of
   pass work per monomial operation, which costs about 250 node evaluations, and where no

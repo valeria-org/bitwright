@@ -1,7 +1,7 @@
 # Proposal: bounding the MBA solver's work by the engine's fuel
 
 Status: the recommendation (`Budget::mba_steps = 4 · fuel`, `MbaSolver::solve_counted`, with
-the symbolic-charge proposal's charge) is implemented on `main` after 0.20.0. The solver counts
+the symbolic-charge proposal's charge) is implemented in 0.21.0. The solver counts
 its steps through its meters' shared count, not the prototype's thread-local counter. Measured on
 a prototype with local switches (cc3df21 on
 branch `claude/gracious-lamarr-d02f7e`, on top of the symbolic-charge prototype and proposal,
