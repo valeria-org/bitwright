@@ -1,8 +1,9 @@
 # Proposal: bounding the MBA solver's work by the engine's fuel
 
-Status: proposed, not implemented. Measured on a prototype with local switches (the commit
-before this document's, on top of the symbolic-charge prototype and proposal, 6a9d522 and
-c39d8df, on 20fb416, the tip of `main` after 0.19.0; not pushed). Every option that bounds the
+Status: proposed, not implemented. Measured on a prototype with local switches (cc3df21 on
+branch `claude/gracious-lamarr-d02f7e`, on top of the symbolic-charge prototype and proposal,
+6a9d522 and c39d8df, on 20fb416, the tip of `main` after 0.19.0; it reads environment variables
+in the library, so it is kept off `main`). Every option that bounds the
 solver changes some results under small budgets; none of the recommended ones changes a scored
 result at the default budget. The choice is the user's, and any option is a "Behavior changes"
 entry of a minor release (`book/src/stability.md`).

@@ -1,7 +1,8 @@
 # Proposal: charging the MBA certifier's symbolic comparison at its cost
 
-Status: proposed, not implemented. Measured on a prototype with local switches (the commit
-before this document's, on 20fb416, the tip of `main` after 0.19.0; not pushed). Bounding the
+Status: proposed, not implemented. Measured on a prototype with local switches (6a9d522 on
+branch `claude/cool-taussig-d53190`, on 20fb416, the tip of `main` after 0.19.0; it reads
+environment variables in the library, so it is kept off `main`). Bounding the
 fallback alone changed no result measured; every higher charge changes some results under small
 budgets. The choice is the user's, and any option is a "Behavior changes" entry of a minor
 release (`book/src/stability.md`).
