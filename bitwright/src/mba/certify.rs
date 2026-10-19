@@ -111,11 +111,27 @@ pub(crate) trait Meter {
 pub(crate) struct Steps {
     pub(crate) left: u64,
     pub(crate) spent: u64,
+    /// PROTOTYPE: a solver's own step meter, whose consumption the probe adds up (see
+    /// [`probe::take_solver_steps`]).
+    solver: bool,
 }
 
 impl Steps {
     pub(crate) fn new(left: u64) -> Steps {
-        Steps { left, spent: 0 }
+        Steps {
+            left,
+            spent: 0,
+            solver: false,
+        }
+    }
+
+    /// PROTOTYPE: a solver's step meter (see [`probe::take_solver_steps`]).
+    pub(crate) fn solver(left: u64) -> Steps {
+        Steps {
+            left,
+            spent: 0,
+            solver: true,
+        }
     }
 }
 
@@ -126,6 +142,9 @@ impl Meter for Steps {
     }
     fn charge(&mut self, units: u64) -> Result<(), ()> {
         self.spent = self.spent.saturating_add(units);
+        if self.solver {
+            probe::solver_steps(units.min(self.left));
+        }
         if units > self.left {
             self.left = 0;
             return Err(());

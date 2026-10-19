@@ -47,6 +47,7 @@ dependencies = [
  "bitwright",
  "cobra-mba",
  "egg",
+ "libc",
 ]
 
 [[package]]

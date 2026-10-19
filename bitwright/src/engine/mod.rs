@@ -1203,6 +1203,10 @@ struct Runner<'r, 'a> {
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
+    /// PROTOTYPE (solver-budget investigation): solver steps charged to the call's own account
+    /// (`BW_SOLVER_MODE=account`, see `mba::probe`).
+    #[cfg(feature = "mba")]
+    solver_spent: u64,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2166,6 +2170,8 @@ impl Engine {
             demanded: Default::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
+            #[cfg(feature = "mba")]
+            solver_spent: 0,
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,

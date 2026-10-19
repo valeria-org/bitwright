@@ -209,24 +209,30 @@ pub struct NormalFormSolver {
 type MemoKey = ([u64; 2], MbaBudget);
 
 /// Answers by question and budget, oldest forgotten first. An entry keeps its question, which
-/// must equal the one asked (a hash collision is a miss, never someone else's answer).
+/// must equal the one asked (a hash collision is a miss, never someone else's answer), and
+/// (PROTOTYPE) the steps solving it spent, which a hit reports again so that a caller charging
+/// the solver's steps charges the same whether the answer was remembered or not.
 #[derive(Debug, Default)]
 struct Memo {
-    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer)>,
+    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer, u64)>,
     order: VecDeque<MemoKey>,
 }
 
 impl Memo {
-    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<MbaAnswer> {
-        let (q, a) = self.answers.get(key)?;
-        (q == p).then(|| a.clone())
+    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<(MbaAnswer, u64)> {
+        let (q, a, steps) = self.answers.get(key)?;
+        (q == p).then(|| (a.clone(), *steps))
     }
 
-    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer) {
+    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer, steps: u64) {
         if capacity == 0 {
             return;
         }
-        if self.answers.insert(key, (p.clone(), a.clone())).is_none() {
+        if self
+            .answers
+            .insert(key, (p.clone(), a.clone(), steps))
+            .is_none()
+        {
             self.order.push_back(key);
         }
         while self.answers.len() > capacity {
@@ -298,14 +304,18 @@ impl MbaSolver for NormalFormSolver {
         let key = (p.key(), *budget);
         let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p));
         let answer = match remembered {
-            Some(a) => {
+            Some((a, steps)) => {
                 tally.memo_hits += 1;
+                super::probe::memo_hit();
+                super::probe::solver_steps(steps);
                 a
             }
             None => {
+                let before = super::probe::peek_solver_steps();
                 let a = solve(p, &self.opts, budget, &mut tally);
+                let steps = super::probe::peek_solver_steps().saturating_sub(before);
                 if let Ok(mut m) = self.memo.lock() {
-                    m.put(self.opts.memo as usize, key, p, &a);
+                    m.put(self.opts.memo as usize, key, p, &a, steps);
                 }
                 a
             }
@@ -1308,7 +1318,7 @@ fn normalize(
         tally.declined_atoms += 1;
         return Err(Decline::Unsupported("too many variables"));
     }
-    let mut work = Steps::new(budget.steps);
+    let mut work = Steps::solver(budget.steps);
     {
         use certify::Meter;
         // A node visit each, and the facts of the reading above (a transfer of facts costs
@@ -2349,7 +2359,7 @@ fn run(
 ) -> Result<MbaAnswer, Decline> {
     let n = normalize(p, opts, budget, tally)?;
     let input_cost = n.input_cost;
-    let mut work = Steps::new(n.work.left);
+    let mut work = Steps::solver(n.work.left);
     // Only renderings smaller than the question can be answers.
     let rendered = best_rendering(p, &n, input_cost, &mut work, tally)?;
     let mut exact = rendered.exact.filter(|(c, _)| c.0 < input_cost);
@@ -2366,11 +2376,11 @@ fn run(
                 &mut scratch,
             )
             .and_then(|m| {
-                let mut w2 = Steps::new(m.work.left);
+                let mut w2 = Steps::solver(m.work.left);
                 // Ties in nodes may still weigh less.
                 let r = best_rendering(&answer, &m, cost.0 + 1, &mut w2, &mut scratch);
                 let spent = work.left - w2.left.min(work.left);
-                work = Steps::new(work.left - spent);
+                work = Steps::solver(work.left - spent);
                 r.map(|r| (m.halved, r))
             });
             tally.candidates += scratch.candidates;

@@ -6,7 +6,7 @@ use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::hash::combine;
 use crate::mba::certify;
-use crate::mba::probe::{self, Kind as PKind};
+use crate::mba::probe::{self, Kind as PKind, SolverMode};
 use crate::mba::{
     CacheEntry, CacheKey, Claim, LOWERING_VERSION, MbaAnswer, MbaConfig, MbaExpr, Refusal, Verdict,
     lift_id, lower_id,
@@ -193,16 +193,82 @@ pub(super) fn step(
                     a
                 }
                 None => {
+                    // PROTOTYPE (solver-budget investigation): the solver's steps tied to the
+                    // run's budget as the switches say (see `mba::probe`); `off` is today's.
+                    let sw = probe::solver_switch();
+                    let left = r.meter.left().pass_work;
+                    let cap = r.meter.limit.pass_work;
+                    let steps = cfg.budget.steps;
+                    let limit = match sw.mode {
+                        SolverMode::Off | SolverMode::Charge => steps,
+                        SolverMode::Bound | SolverMode::Derive => {
+                            probe::lowered(steps, left / sw.rate)
+                        }
+                        SolverMode::Scale => probe::lowered(steps, cap / sw.rate),
+                        SolverMode::Account => {
+                            let account = r.meter.limit.node_visits.saturating_mul(sw.account);
+                            probe::lowered(steps, account.saturating_sub(r.solver_spent))
+                        }
+                    };
+                    let lowered = limit < steps;
+                    if lowered && limit < sw.floor {
+                        count(r).exhausted += 1;
+                        let why = match sw.mode {
+                            SolverMode::Account => Exhausted::MbaCalls,
+                            _ => Exhausted::PassWork,
+                        };
+                        return Ok(Step::Normal(Fin::capped(why)));
+                    }
                     r.meter.charge(Counter::MbaCalls, 1)?;
                     count(r).calls += 1;
                     // The solver's own evidence counts only where backend certificates are
                     // trusted: elsewhere the gate proves every answer itself.
                     let budget = cfg
                         .budget
-                        .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
+                        .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates)
+                        .with_steps(limit);
+                    let _ = (probe::take_solver_steps(), probe::take_memo_hit());
                     let span = probe::begin(PKind::Solve);
                     let a = inner.mba.solver.solve(&m, &budget);
-                    probe::end(span, 0, 0, matches!(a, MbaAnswer::Simplified { .. }));
+                    let spent = probe::take_solver_steps();
+                    let call = probe::end_call(
+                        span,
+                        probe::Call {
+                            steps: spent,
+                            limit,
+                            nodes: m.nodes().len() as u32,
+                            vars: m.vars().len() as u32,
+                            answer: match a {
+                                MbaAnswer::Simplified { .. } => 0,
+                                MbaAnswer::NoSimpler => 1,
+                                MbaAnswer::Unsupported(_) => 2,
+                                _ => 3,
+                            },
+                            memo: probe::take_memo_hit(),
+                            left,
+                            cap,
+                            ..Default::default()
+                        },
+                    );
+                    probe::dump(&call, &m);
+                    match sw.mode {
+                        SolverMode::Charge | SolverMode::Bound => {
+                            let units = spent.saturating_mul(sw.rate).min(r.meter.left().pass_work);
+                            r.meter.charge(Counter::PassWork, units)?;
+                        }
+                        SolverMode::Account => {
+                            r.solver_spent = r.solver_spent.saturating_add(spent);
+                        }
+                        _ => {}
+                    }
+                    if a == MbaAnswer::Exhausted && lowered {
+                        count(r).exhausted += 1;
+                        let why = match sw.mode {
+                            SolverMode::Account => Exhausted::MbaCalls,
+                            _ => Exhausted::PassWork,
+                        };
+                        return Ok(Step::Normal(Fin::capped(why)));
+                    }
                     if a != MbaAnswer::Exhausted {
                         r.mba_answers.insert(key, a.clone());
                     }

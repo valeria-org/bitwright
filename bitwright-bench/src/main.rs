@@ -18,6 +18,8 @@
 //!   --symbolic-sweep FILE  PROTOTYPE: per-root MBA results at small fuels, for charge factors
 //!   --symbolic-cost   PROTOTYPE (feature `probe`): certificate work by kind, per charged unit
 //!   --symbolic-worst  PROTOTYPE (feature `probe`): one symbolic comparison no test can take
+//!   --solver-calls FILE  PROTOTYPE (feature `probe`): every MBA solver call, its steps and cost
+//!   --solver-worst FILE  PROTOTYPE (feature `probe`): questions asked of the solver alone
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches
 //!   --escalate-fast   omit the final 500-million-propagation escalation stage
@@ -39,6 +41,7 @@ mod corpus_diff;
 mod counter;
 mod keyed_mixers;
 mod prover_budgets;
+mod solver_cost;
 mod suites;
 mod symbolic_cost;
 mod workload;
@@ -63,6 +66,11 @@ struct Options {
     symbolic_sweep: Option<String>,
     symbolic_cost: bool,
     symbolic_worst: bool,
+    solver_calls: Option<String>,
+    solver_worst: Option<String>,
+    solver_dags: Option<(String, String)>,
+    solver_search: Option<(String, u64)>,
+    solver_fuel: Option<(String, u16)>,
     mixers: bool,
     escalate: bool,
     fast: bool,
@@ -100,6 +108,11 @@ fn parse_args() -> Result<Options, String> {
         symbolic_sweep: None,
         symbolic_cost: false,
         symbolic_worst: false,
+        solver_calls: None,
+        solver_worst: None,
+        solver_dags: None,
+        solver_search: None,
+        solver_fuel: None,
         mixers: false,
         escalate: false,
         fast: false,
@@ -150,6 +163,26 @@ fn parse_args() -> Result<Options, String> {
             "--symbolic-sweep" => o.symbolic_sweep = Some(value("--symbolic-sweep")?),
             "--symbolic-cost" => o.symbolic_cost = true,
             "--symbolic-worst" => o.symbolic_worst = true,
+            "--solver-calls" => o.solver_calls = Some(value("--solver-calls")?),
+            "--solver-worst" => o.solver_worst = Some(value("--solver-worst")?),
+            "--solver-search" => {
+                let file = value("--solver-search")?;
+                let n = value("--solver-search")?
+                    .parse()
+                    .map_err(|_| "--solver-search takes FILE ITERS")?;
+                o.solver_search = Some((file, n));
+            }
+            "--solver-fuel" => {
+                let file = value("--solver-fuel")?;
+                let bits = value("--solver-fuel")?
+                    .parse()
+                    .map_err(|_| "--solver-fuel takes FILE BITS")?;
+                o.solver_fuel = Some((file, bits));
+            }
+            "--solver-dags" => {
+                let spec = value("--solver-dags")?;
+                o.solver_dags = Some((spec, value("--solver-dags")?));
+            }
             "--mixers" => o.mixers = true,
             "--escalate" => o.escalate = true,
             "--escalate-fast" => {
@@ -277,6 +310,51 @@ fn main() -> ExitCode {
     }
     if let Some(path) = &opts.symbolic_sweep {
         return symbolic_cost::sweep(path);
+    }
+    if let Some((_path, _bits)) = &opts.solver_fuel {
+        #[cfg(feature = "probe")]
+        return solver_cost::fuel(_path, *_bits);
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--solver-fuel needs the `probe` feature");
+            return ExitCode::from(2);
+        }
+    }
+    if let Some((_path, _iters)) = &opts.solver_search {
+        #[cfg(feature = "probe")]
+        return solver_cost::search(_path, *_iters);
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--solver-search needs the `probe` feature");
+            return ExitCode::from(2);
+        }
+    }
+    if let Some((_spec, _path)) = &opts.solver_dags {
+        #[cfg(feature = "probe")]
+        return solver_cost::dags(_spec, _path);
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--solver-dags needs the `probe` feature");
+            return ExitCode::from(2);
+        }
+    }
+    if let Some(_path) = &opts.solver_worst {
+        #[cfg(feature = "probe")]
+        return solver_cost::worst(_path);
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--solver-worst needs the `probe` feature");
+            return ExitCode::from(2);
+        }
+    }
+    if let Some(_path) = &opts.solver_calls {
+        #[cfg(feature = "probe")]
+        return solver_cost::calls(_path);
+        #[cfg(not(feature = "probe"))]
+        {
+            eprintln!("--solver-calls needs the `probe` feature");
+            return ExitCode::from(2);
+        }
     }
     if opts.symbolic_worst {
         #[cfg(feature = "probe")]

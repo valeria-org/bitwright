@@ -20,6 +20,8 @@
 
 mod eggs;
 mod heap;
+#[cfg(feature = "probe")]
+mod instr;
 mod read;
 
 #[global_allocator]
@@ -398,8 +400,14 @@ fn run_bitwright(tool: Tool, engine: &Engine, case: &Case) -> Row {
         Some(n) => Run::default().with_per_call(bitwright::engine::Budget::fuel(1 << n)),
         None => Run::default(),
     };
+    #[cfg(feature = "probe")]
+    let _ = bitwright::mba::probe::take_calls();
+    #[cfg(feature = "probe")]
+    let i0 = instr::now();
     let out = engine.run(&mut cx, &[input], run);
     let micros = t.elapsed().as_secs_f64() * 1e6;
+    #[cfg(feature = "probe")]
+    instr::record(case.line, &bitwright::mba::probe::take_calls(), i0);
     let heap = heap::used_since(base);
     let (answer, pass, end) = match out {
         Ok(o) => (
@@ -1013,6 +1021,8 @@ fn main() -> ExitCode {
                 }
                 _ => {
                     let e = &engines[&t];
+                    #[cfg(feature = "probe")]
+                    instr::dataset(&label);
                     rows.extend(cases.iter().map(|c| run_bitwright(t, e, c)));
                 }
             }

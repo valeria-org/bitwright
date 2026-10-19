@@ -149,6 +149,13 @@ pub fn free_running() -> Option<fn() -> u64> {
     None
 }
 
+/// PROTOTYPE: the calling thread's CPU time in nanoseconds, as a plain function for
+/// `bitwright::mba::probe::set_cpu_clock`.
+#[cfg(feature = "probe")]
+pub fn cpu_clock() -> fn() -> u64 {
+    thread_cpu_ns
+}
+
 impl Drop for Counters {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]

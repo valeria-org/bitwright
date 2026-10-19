@@ -21,11 +21,11 @@ use crate::counter::Counters;
 use crate::workload::{self, Dag};
 
 /// One input: its roots, built into a fresh context.
-type Build = Box<dyn Fn(&mut Context) -> Vec<Expr>>;
+pub(crate) type Build = Box<dyn Fn(&mut Context) -> Vec<Expr>>;
 
-struct Corpus {
-    name: &'static str,
-    inputs: Vec<Build>,
+pub(crate) struct Corpus {
+    pub(crate) name: &'static str,
+    pub(crate) inputs: Vec<Build>,
 }
 
 fn options(bits: u16) -> ParseOptions {
@@ -72,7 +72,7 @@ fn dags(bits: u16) -> Vec<Build> {
         .collect()
 }
 
-fn corpora() -> Vec<Corpus> {
+pub(crate) fn corpora() -> Vec<Corpus> {
     vec![
         Corpus {
             name: "bench/mba-native/8",
@@ -118,7 +118,7 @@ fn corpora() -> Vec<Corpus> {
 }
 
 /// The MBA rows' and `--corpus-diff`'s "defaults" engine.
-fn engine() -> Engine {
+pub(crate) fn engine() -> Engine {
     let config =
         MbaConfig::default().with_trust(MbaTrust::default().with_backend_certificates(false));
     Engine::builder()
@@ -136,33 +136,38 @@ fn size(cx: &mut Context, e: &[Expr]) -> u32 {
     }
 }
 
-fn run_of(fuel: Option<u64>) -> Run<'static> {
+pub(crate) fn run_of(fuel: Option<u64>) -> Run<'static> {
     match fuel {
         None => Run::default(),
         Some(f) => Run::default().with_per_call(Budget::fuel(f)),
     }
 }
 
-fn fuel_label(fuel: Option<u64>) -> String {
+pub(crate) fn fuel_label(fuel: Option<u64>) -> String {
     match fuel {
         None => "default".into(),
         Some(f) => format!("2^{}", f.trailing_zeros()),
     }
 }
 
-fn setting() -> String {
+pub(crate) fn setting() -> String {
     let var = |v: &str, d: &str| std::env::var(v).unwrap_or_else(|_| d.into());
     format!(
-        "k={} scope={} mode={} reserve={}",
+        "k={} scope={} mode={} reserve={} solver={} rate={} account={} round={} floor={}",
         var("BW_SYMBOLIC_CHARGE", "1"),
         var("BW_SYMBOLIC_SCOPE", "all"),
         var("BW_SYMBOLIC_MODE", "clamp"),
-        var("BW_SYMBOLIC_RESERVE", "1")
+        var("BW_SYMBOLIC_RESERVE", "1"),
+        var("BW_SOLVER_MODE", "off"),
+        var("BW_SOLVER_RATE", "64"),
+        var("BW_SOLVER_ACCOUNT", "256"),
+        var("BW_SOLVER_ROUND", "exact"),
+        var("BW_SOLVER_FLOOR", "1")
     )
 }
 
 /// Process-wide tables (rule compile, synthesis) are built once, outside every measurement.
-fn warm_up() {
+pub(crate) fn warm_up() {
     let e = engine();
     let mut cx = Context::new();
     let roots = together(workload::nonlinear_mba_corpus(23, 20, 64), 64)[0](&mut cx);
