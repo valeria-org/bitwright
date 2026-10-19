@@ -1992,7 +1992,9 @@ impl Compose {
 
     /// Whether the skeletons agree with their nodes at the sample (when its values are kept):
     /// each variable of `vm` takes its node's or class's value at each point. A value the
-    /// sample did not keep (a node the evaluation left out) checks nothing.
+    /// sample did not keep (a node the evaluation left out) checks nothing. Evaluated a batch
+    /// of points at a time where that computes what [`MbaExpr::eval`] does, else point by
+    /// point (debug builds check that both agree).
     fn agrees(&mut self, vm: &VarMap, sides: [(&MbaExpr, u32); 2]) -> bool {
         let Some((points, digests)) = self.sample.take() else {
             return true;
@@ -2005,12 +2007,36 @@ impl Compose {
                 Slot::Orig(_) => 0,
             })
             .collect();
-        let mut ok = true;
-        'points: for (p, point) in points.iter().enumerate() {
+        let ok = match self.agrees_batched(vm, sides, &points, &digests, &class_root) {
+            Some(ok) => {
+                debug_assert_eq!(
+                    ok,
+                    self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
+                    "the batched sample check differs from the pointwise one"
+                );
+                ok
+            }
+            None => self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
+        };
+        self.sample = Some((points, digests));
+        ok
+    }
+
+    /// [`Compose::agrees`] point by point, with [`MbaExpr::eval`]: it stops at the first point
+    /// where a variable has no value.
+    fn agrees_pointwise(
+        &self,
+        vm: &VarMap,
+        sides: [(&MbaExpr, u32); 2],
+        points: &[Vec<BitVec>],
+        digests: &[Vec<u64>],
+        class_root: &[u32],
+    ) -> bool {
+        for (p, point) in points.iter().enumerate() {
             let inputs: Option<Vec<BitVec>> = vm
                 .slots
                 .iter()
-                .zip(&class_root)
+                .zip(class_root)
                 .map(|(&(slot, sw), &c)| match slot {
                     Slot::Orig(v) => point.get(v as usize).copied(),
                     Slot::Class(_) => digests
@@ -2020,7 +2046,7 @@ impl Compose {
                 })
                 .collect();
             let Some(inputs) = inputs else {
-                break;
+                return true;
             };
             for (skel, node) in sides {
                 let w = self.nodes[node as usize].width;
@@ -2032,13 +2058,99 @@ impl Compose {
                     continue;
                 };
                 if skel.eval(&inputs) != Some(want) {
-                    ok = false;
-                    break 'points;
+                    return false;
                 }
             }
         }
-        self.sample = Some((points, digests));
-        ok
+        true
+    }
+
+    /// [`Compose::agrees`] with the batched evaluator, over the points where every variable has
+    /// a value (the pointwise check stops at the first one where a class's value was not kept,
+    /// and those are the first `n` points). `None` where it might not compute what
+    /// [`MbaExpr::eval`] does: an original variable without a value or of another width, a
+    /// skeleton whose variables are not the map's, a cast, or anything wider than 64 bits.
+    fn agrees_batched(
+        &self,
+        vm: &VarMap,
+        sides: [(&MbaExpr, u32); 2],
+        points: &[Vec<BitVec>],
+        digests: &[Vec<u64>],
+        class_root: &[u32],
+    ) -> Option<bool> {
+        let mut n = points.len();
+        for (&(slot, sw), &c) in vm.slots.iter().zip(class_root) {
+            if sw.bits() > 64 {
+                return None;
+            }
+            match slot {
+                Slot::Orig(v) => {
+                    let valued =
+                        |p: &Vec<BitVec>| p.get(v as usize).is_some_and(|x| x.width() == sw);
+                    if !points.iter().all(valued) {
+                        return None;
+                    }
+                }
+                Slot::Class(_) => n = n.min(digests.get(c as usize).map_or(0, Vec::len)),
+            }
+        }
+        let mut progs = Vec::with_capacity(sides.len());
+        for (skel, node) in sides {
+            let w = self.nodes[node as usize].width;
+            let fits = skel.width() == Some(w)
+                && skel.vars().len() == vm.slots.len()
+                && skel
+                    .vars()
+                    .iter()
+                    .zip(&vm.slots)
+                    .all(|(&v, &(_, sw))| v == sw)
+                && !skel
+                    .nodes()
+                    .iter()
+                    .any(|m| matches!(m.op, MOp::Zext | MOp::Sext | MOp::Trunc));
+            if !fits {
+                return None;
+            }
+            let prog = Program::new(skel, false)?;
+            if prog.widest() > 64 {
+                return None;
+            }
+            progs.push((prog, node, w));
+        }
+        // Each variable's values at the first `n` points, as lanes (a class's value reduced to
+        // the variable's width, as `BitVec::wrapping_from_u64` does).
+        let inputs: Vec<Vec<u64>> = vm
+            .slots
+            .iter()
+            .zip(class_root)
+            .map(|(&(slot, sw), &c)| match slot {
+                Slot::Orig(v) => points[..n]
+                    .iter()
+                    .map(|p| <u64 as Lane>::from_bv(&p[v as usize]))
+                    .collect(),
+                Slot::Class(_) => {
+                    let m = <u64 as Lane>::mask(sw);
+                    digests[c as usize][..n].iter().map(|&x| x & m).collect()
+                }
+            })
+            .collect();
+        let mut regs: Vec<Vec<u64>> = Vec::new();
+        for (prog, node, w) in &progs {
+            let Some(want) = digests.get(*node as usize) else {
+                continue;
+            };
+            let upto = n.min(want.len());
+            if upto == 0 {
+                continue;
+            }
+            prog.run(&mut regs, &inputs, upto);
+            let m = <u64 as Lane>::mask(*w);
+            let got = &regs[prog.root()][..upto];
+            if got.iter().zip(&want[..upto]).any(|(&g, &d)| g != d & m) {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     /// Under [`Policy::Linear`], when the skeletons differ over independent atoms: an atom
