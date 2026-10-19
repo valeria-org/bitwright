@@ -34,7 +34,7 @@ extern "C" {
 #endif
 
 /* Version of this header's ABI; `bw_abi_version()` gives the library's. They must be equal. */
-#define BW_ABI_VERSION 1
+#define BW_ABI_VERSION 2
 
 /* ----- status ---------------------------------------------------------------------------- */
 
@@ -612,6 +612,7 @@ typedef struct bw_budget {
     uint64_t mba_calls;
     uint64_t eqsat_nodes;
     uint64_t eqsat_work;
+    uint64_t mba_steps; /* the MBA solver's steps, summed over its calls (ABI 2) */
 } bw_budget;
 
 /* The default budget: generous caps for one call. */
@@ -636,7 +637,8 @@ typedef enum bw_limit {
     BW_LIMIT_EQSAT_NODES = 8,
     BW_LIMIT_EQSAT_WORK = 9,
     BW_LIMIT_DEADLINE = 10,
-    BW_LIMIT_ARENA_CAPACITY = 11
+    BW_LIMIT_ARENA_CAPACITY = 11,
+    BW_LIMIT_MBA_STEPS = 12
 } bw_limit;
 
 /* The result for one root: equal to the input wherever the assumptions in `relies_on` hold

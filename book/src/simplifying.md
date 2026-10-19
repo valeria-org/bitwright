@@ -86,9 +86,13 @@ bounds how many nodes a pass examines to decide.
 ## Budgets, allowances and deadlines
 
 Every run is bounded. A `Budget` caps node visits, rule candidates, matcher steps, rewrites, new
-nodes, fact work, pass work, MBA solver calls and equality-saturation work; `Run` carries the
-per-call budget and optionally an `Allowance`, an account several calls share. Work is charged
-before it is done, so a call never spends past its limit:
+nodes, fact work, pass work, MBA solver calls, the MBA solver's steps and equality-saturation
+work, each in counted units of work, never time; `Budget::fuel(n)` scales every cap by one number
+(`Budget::default()` is `Budget::fuel(1 << 22)`). `Run` carries the per-call budget and
+optionally an `Allowance`, an account several calls share. A run its budget stops keeps the
+rewrites it made; its result is as valid as a completed one, but not final. Work is charged before
+it is done (the MBA solver works within what is left of its steps and is charged what it spent),
+so a call never spends past its limit:
 
 ```rust
 use bitwright::engine::{Allowance, Budget, End, Engine, Exhausted, Run};

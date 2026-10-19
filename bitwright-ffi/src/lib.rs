@@ -52,7 +52,7 @@ const BW_ERR_INFEASIBLE: c_int = 15;
 const BW_ERR_PANIC: c_int = 16;
 
 /// `BW_ABI_VERSION` in `bitwright.h`: bumped on any change to a declared signature or struct.
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 
 // ----- enumeration tables (bitwright.h) -------------------------------------------------------
 
@@ -101,7 +101,7 @@ const CMPOPS: [CmpOpExt; 10] = [
     CmpOpExt::Sge,
 ];
 
-const LIMITS: [Exhausted; 12] = [
+const LIMITS: [Exhausted; 13] = [
     Exhausted::NodeVisits,
     Exhausted::Candidates,
     Exhausted::MatchSteps,
@@ -114,6 +114,7 @@ const LIMITS: [Exhausted; 12] = [
     Exhausted::EqsatWork,
     Exhausted::Deadline,
     Exhausted::ArenaCapacity,
+    Exhausted::MbaSteps,
 ];
 
 const KIND_CONST: c_int = 0;
@@ -1725,6 +1726,7 @@ pub struct BwBudget {
     mba_calls: u64,
     eqsat_nodes: u64,
     eqsat_work: u64,
+    mba_steps: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -1741,6 +1743,7 @@ pub extern "C" fn bw_budget_default() -> BwBudget {
         mba_calls: b.mba_calls,
         eqsat_nodes: b.eqsat_nodes,
         eqsat_work: b.eqsat_work,
+        mba_steps: b.mba_steps,
     }
 }
 
@@ -1756,6 +1759,7 @@ fn budget(b: &BwBudget) -> Budget {
         .with_mba_calls(b.mba_calls)
         .with_eqsat_nodes(b.eqsat_nodes)
         .with_eqsat_work(b.eqsat_work)
+        .with_mba_steps(b.mba_steps)
 }
 
 /// `bw_outcome`.

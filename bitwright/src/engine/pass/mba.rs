@@ -51,7 +51,7 @@ struct Gate<'x, 'r, 'a>(&'x mut Runner<'r, 'a>);
 impl certify::Meter for Gate<'_, '_, '_> {
     type Err = Stop;
     fn left(&self) -> u64 {
-        self.0.meter.left().pass_work
+        self.0.meter.left_in(|b| b.pass_work)
     }
     fn charge(&mut self, units: u64) -> Result<(), Stop> {
         self.0
@@ -175,14 +175,31 @@ pub(super) fn step(
                     a
                 }
                 None => {
+                    // The solver works within its own limit and what is left of the run's
+                    // account of its steps, and is charged the steps it spent. With nothing
+                    // left the question is not asked: over budget, so not final.
+                    let limit = cfg.budget.steps.min(r.meter.left_in(|b| b.mba_steps));
+                    if limit == 0 {
+                        count(r).exhausted += 1;
+                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
+                    }
                     r.meter.charge(Counter::MbaCalls, 1)?;
                     count(r).calls += 1;
                     // The solver's own evidence counts only where backend certificates are
                     // trusted: elsewhere the gate proves every answer itself.
                     let budget = cfg
                         .budget
-                        .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates);
-                    let a = inner.mba.solver.solve(&m, &budget);
+                        .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates)
+                        .with_steps(limit);
+                    let (a, spent) = inner.mba.solver.solve_counted(&m, &budget);
+                    let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
+                    r.meter.charge(Counter::MbaSteps, spent)?;
+                    if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
+                        // Run short within what the account left it: more budget might
+                        // decide.
+                        count(r).exhausted += 1;
+                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
+                    }
                     if a != MbaAnswer::Exhausted {
                         r.mba_answers.insert(key, a.clone());
                     }

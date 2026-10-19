@@ -87,9 +87,15 @@ pub(crate) const LOWER_COST: u64 = 64;
 
 /// Node evaluations (one lane each, a block at a time) that take about as long as one unit of
 /// symbolic work, a monomial operation (measured: 0.3–0.4 ns against 100–400 ns). It decides
-/// when the symbolic comparison is worth trying ahead of a test (see [`run`]); each is still
-/// charged in its own units.
+/// when the symbolic comparison is worth trying ahead of a test (see [`run`]); the comparison
+/// is charged at [`SYMBOLIC_RATE`].
 const SYMBOLIC_UNIT: u64 = 1 << 10;
+
+/// Units charged per unit of symbolic work, a monomial operation: what one costs in node
+/// evaluations (measured on identical certificates: 208 in instructions and 308 in time; 250
+/// to 350 over the bench and `--corpus-diff` corpora), so that a budget bounds the comparison's
+/// time as it bounds a test's.
+pub(crate) const SYMBOLIC_RATE: u64 = 256;
 
 /// Work accounting for a certificate: units are node evaluations (one per node per point).
 pub(crate) trait Meter {
@@ -106,11 +112,30 @@ pub(crate) trait Meter {
 pub(crate) struct Steps {
     pub(crate) left: u64,
     pub(crate) spent: u64,
+    /// Where the units this meter consumed are added up, if anywhere: the meters of one
+    /// question of the normal-form solver share one, which says what the question spent.
+    used: Option<Used>,
 }
+
+/// The units consumed by the meters that share it.
+pub(crate) type Used = std::rc::Rc<std::cell::Cell<u64>>;
 
 impl Steps {
     pub(crate) fn new(left: u64) -> Steps {
-        Steps { left, spent: 0 }
+        Steps {
+            left,
+            spent: 0,
+            used: None,
+        }
+    }
+
+    /// A meter whose consumption is added to `used`.
+    pub(crate) fn counted(left: u64, used: &Used) -> Steps {
+        Steps {
+            left,
+            spent: 0,
+            used: Some(used.clone()),
+        }
     }
 }
 
@@ -121,6 +146,9 @@ impl Meter for Steps {
     }
     fn charge(&mut self, units: u64) -> Result<(), ()> {
         self.spent = self.spent.saturating_add(units);
+        if let Some(u) = &self.used {
+            u.set(u.get().saturating_add(units.min(self.left)));
+        }
         if units > self.left {
             self.left = 0;
             return Err(());
@@ -755,10 +783,10 @@ enum Run {
 
 /// Runs a planned test. A polynomial test that would take far longer than the symbolic
 /// comparison ([`symbolic_equal`]) runs the comparison first: within half the test's time
-/// (at [`SYMBOLIC_UNIT`] evaluations per unit of its work) and within what leaves the test
-/// affordable, so one that decides nothing never puts the test over budget. It proves only
-/// sides that are equal everywhere, which the test would find equal too, so the outcome is the
-/// test's own and only the work changes.
+/// (at [`SYMBOLIC_UNIT`] evaluations per unit of its work) and within what is left, charged
+/// at [`SYMBOLIC_RATE`]. It proves only sides that are equal everywhere, which the test would
+/// find equal too; one that decides nothing leaves the test to run, or over budget when what
+/// is left no longer covers it.
 fn run<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -799,13 +827,17 @@ fn test<M: Meter>(
     }
     // The polynomial tests are planned for polynomial sides only, which the comparison reads;
     // it takes at least a unit per node.
-    let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() - cost);
+    let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() / SYMBOLIC_RATE);
     if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
         let mut work = 0;
         let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
-        meter.charge(work.min(cap))?;
+        meter.charge(work.min(cap) * SYMBOLIC_RATE)?;
         if equal {
             return Ok(Run::Equal(Cert::Symbolic));
+        }
+        if cost > meter.left() {
+            report.over_budget = true;
+            return Ok(Run::OverBudget);
         }
     }
     let width = a.width().map_or(1, |w| w.bits());
@@ -3445,17 +3477,22 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     Some(pa == pb)
 }
 
-/// [`symbolic_equal`], charged to `meter` (a unit per monomial operation, at most what is
-/// left): true only for a proof, which it records.
+/// [`symbolic_equal`] within what is left of `meter`, charged [`SYMBOLIC_RATE`] units per unit
+/// of its work: true only for a proof, which it records. Stopped by the budget, it reports
+/// over budget (more might decide).
 fn symbolic<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
     b: &MbaExpr,
     report: &mut Report,
 ) -> Result<bool, M::Err> {
+    let limit = meter.left() / SYMBOLIC_RATE;
     let mut work = 0u64;
-    let equal = symbolic_equal(a, b, u64::MAX, &mut work) == Some(true);
-    meter.charge(work.min(meter.left()))?;
+    let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+    if work > limit {
+        report.over_budget = true;
+    }
+    meter.charge(work.min(limit) * SYMBOLIC_RATE)?;
     if equal {
         report.verdict = Verdict::Proved;
         report.cert = Some(Cert::Symbolic);
@@ -3613,8 +3650,10 @@ fn digests_in<L: Lane>(
 /// atoms when a side leaves the polynomial fragment. The same checks are the evidence gate's
 /// own, so an engine needs this prover only when its host uses the MBA module directly.
 ///
-/// Work is counted in node evaluations against [`MbaBudget::steps`]; a certificate over the
-/// budget is not run (`Unknown`). `Refuted` comes with a concrete counterexample.
+/// Work is counted in node evaluations against [`MbaBudget::steps`], the symbolic comparison
+/// at 256 per monomial operation (what one costs) and within what is left; a certificate over
+/// the budget is not run, and one stopped by it is not finished (`Unknown`). `Refuted` comes
+/// with a concrete counterexample.
 ///
 /// ```
 /// use bitwright::mba::{EquivalenceProver, MOp, MbaBudget, MbaExpr, NativeProver, Verdict};

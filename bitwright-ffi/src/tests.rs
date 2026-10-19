@@ -148,6 +148,7 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
         "EQSAT_WORK",
         "DEADLINE",
         "ARENA_CAPACITY",
+        "MBA_STEPS",
     ];
     for (i, l) in limits.iter().enumerate() {
         assert_eq!(value_of(&format!("BW_LIMIT_{l}")), i);
@@ -614,6 +615,7 @@ fn runs_with_budgets_and_assumptions() {
         assert_eq!(bw_assume(a, cx.0, small, true, null_mut()), BW_OK);
         let b = bw_budget_default();
         assert_eq!(b.mba_calls, 1 << 12);
+        assert_eq!(b.mba_steps, 1 << 24);
         assert_eq!(
             bw_engine_run(engine, cx.0, roots.as_ptr(), 3, &b, a, outs.as_mut_ptr()),
             BW_OK

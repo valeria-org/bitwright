@@ -1314,7 +1314,7 @@ impl Runner<'_, '_> {
         f: impl FnOnce(&mut Context) -> Result<T, Error>,
     ) -> Result<T, Stop> {
         // Nodes are refused before they would exceed the budget, so it is never overspent.
-        let left = self.meter.left().new_nodes;
+        let left = self.meter.left_in(|b| b.new_nodes);
         let before = cx.counters().engine_nodes;
         let (r, refused) = cx.as_engine_limited(left, f);
         let made = cx.counters().engine_nodes - before;
@@ -1392,7 +1392,7 @@ impl Runner<'_, '_> {
                 fin = fin.and(f);
             }
             let value = if changed {
-                let left = self.meter.left().new_nodes;
+                let left = self.meter.left_in(|b| b.new_nodes);
                 let before = cx.counters().engine_nodes;
                 let (r, refused) = cx.as_engine_limited(left, |cx| cx.rebuild(n, kids));
                 self.meter.spent.new_nodes += cx.counters().engine_nodes - before;
@@ -1641,11 +1641,10 @@ impl Runner<'_, '_> {
                 rule,
                 node: cx.handle(n),
             });
-            let left = self.meter.left();
-            let steps = u32::try_from(left.match_steps)
+            let steps = u32::try_from(self.meter.left_in(|b| b.match_steps))
                 .unwrap_or(u32::MAX)
                 .min(MATCH_STEPS);
-            let fact_cap = u32::try_from(left.fact_work).unwrap_or(u32::MAX);
+            let fact_cap = u32::try_from(self.meter.left_in(|b| b.fact_work)).unwrap_or(u32::MAX);
             // `one_use` is answered from the use counts of the live DAG (under
             // `Sharing::Ignored`, as if each node were used by its user alone: always).
             let one_use = uses_one_use(rule) && !pass::alone(self);
@@ -1827,7 +1826,7 @@ impl Runner<'_, '_> {
         let values_rule = matches!(by, By::Rule(rule) if rule.float_values);
         if v.tripwire && !values_rule {
             // Capped by what remains of the fact budget, both queries together.
-            let cap = u32::try_from(self.meter.left().fact_work).unwrap_or(u32::MAX);
+            let cap = u32::try_from(self.meter.left_in(|b| b.fact_work)).unwrap_or(u32::MAX);
             let work0 = cx.facts.work;
             let (a, b) = (cx.handle(n), cx.handle(r));
             let fa = cx.try_facts_cap(a, cap).map_err(Stop::Error)?;
@@ -2317,6 +2316,7 @@ impl Engine {
         stats.fact_work = spent.fact_work;
         stats.pass_work = spent.pass_work;
         stats.mba.calls = spent.mba_calls;
+        stats.mba.steps = spent.mba_steps;
         Ok(Outcome {
             roots: ids
                 .iter()

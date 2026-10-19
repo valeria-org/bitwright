@@ -19,7 +19,7 @@ use self::bits::{BitOp, Bits};
 use self::classes::{Classes, FULL};
 use self::poly::{Mono, Poly, Sym};
 use self::render::{Builder, Render};
-use super::certify::{self, Steps};
+use super::certify::{self, Steps, Used};
 use super::expr::{MNode, MOp, MbaExpr};
 use super::solve::{Claim, MbaAnswer, MbaBudget, MbaSolver, Verdict};
 use crate::engine::CertStats;
@@ -212,21 +212,26 @@ type MemoKey = ([u64; 2], MbaBudget);
 /// must equal the one asked (a hash collision is a miss, never someone else's answer).
 #[derive(Debug, Default)]
 struct Memo {
-    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer)>,
+    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer, u64)>,
     order: VecDeque<MemoKey>,
 }
 
 impl Memo {
-    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<MbaAnswer> {
-        let (q, a) = self.answers.get(key)?;
-        (q == p).then(|| a.clone())
+    /// The answer to `p`, and the steps finding it cost.
+    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<(MbaAnswer, u64)> {
+        let (q, a, steps) = self.answers.get(key)?;
+        (q == p).then(|| (a.clone(), *steps))
     }
 
-    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer) {
+    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer, steps: u64) {
         if capacity == 0 {
             return;
         }
-        if self.answers.insert(key, (p.clone(), a.clone())).is_none() {
+        if self
+            .answers
+            .insert(key, (p.clone(), a.clone(), steps))
+            .is_none()
+        {
             self.order.push_back(key);
         }
         while self.answers.len() > capacity {
@@ -291,23 +296,30 @@ impl MbaSolver for NormalFormSolver {
     }
 
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+        self.solve_counted(p, budget).0
+    }
+
+    /// The steps its meters consumed (node visits, table words, products, renderings, and a
+    /// step per 32 evaluations of its own certificates); a remembered answer is charged what
+    /// finding it cost.
+    fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
         let mut tally = NfStats {
             calls: 1,
             ..NfStats::default()
         };
         let key = (p.key(), *budget);
         let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p));
-        let answer = match remembered {
+        let (answer, steps) = match remembered {
             Some(a) => {
                 tally.memo_hits += 1;
                 a
             }
             None => {
-                let a = solve(p, &self.opts, budget, &mut tally);
+                let (a, steps) = solve(p, &self.opts, budget, &mut tally);
                 if let Ok(mut m) = self.memo.lock() {
-                    m.put(self.opts.memo as usize, key, p, &a);
+                    m.put(self.opts.memo as usize, key, p, &a, steps);
                 }
-                a
+                (a, steps)
             }
         };
         match &answer {
@@ -325,7 +337,7 @@ impl MbaSolver for NormalFormSolver {
             MbaAnswer::Exhausted => tally.exhausted += 1,
         }
         self.count(|s| add_stats(s, &tally));
-        answer
+        (answer, steps)
     }
 }
 
@@ -463,12 +475,20 @@ const DISCOVERIES: u32 = 4;
 /// Values at the refutation sample: per node (empty for one not evaluated), and per variable.
 type Sample = (Vec<Vec<u64>>, Vec<Vec<u64>>);
 
-fn solve(p: &MbaExpr, opts: &NfOptions, budget: &MbaBudget, tally: &mut NfStats) -> MbaAnswer {
-    match run(p, opts, budget, tally) {
+/// The answer to `p`, and the steps its meters consumed.
+fn solve(
+    p: &MbaExpr,
+    opts: &NfOptions,
+    budget: &MbaBudget,
+    tally: &mut NfStats,
+) -> (MbaAnswer, u64) {
+    let used = Used::default();
+    let answer = match run(p, opts, budget, tally, &used) {
         Ok(a) => a,
         Err(Decline::Exhausted) => MbaAnswer::Exhausted,
         Err(Decline::Unsupported(why)) => MbaAnswer::Unsupported(why.into()),
-    }
+    };
+    (answer, used.get())
 }
 
 impl Pass<'_> {
@@ -1283,6 +1303,7 @@ fn normalize(
     opts: &NfOptions,
     budget: &MbaBudget,
     tally: &mut NfStats,
+    used: &Used,
 ) -> Result<Normal, Decline> {
     let Some(w) = input.width() else {
         return Err(Decline::Unsupported("empty"));
@@ -1308,7 +1329,7 @@ fn normalize(
         tally.declined_atoms += 1;
         return Err(Decline::Unsupported("too many variables"));
     }
-    let mut work = Steps::new(budget.steps);
+    let mut work = Steps::counted(budget.steps, used);
     {
         use certify::Meter;
         // A node visit each, and the facts of the reading above (a transfer of facts costs
@@ -2346,10 +2367,11 @@ fn run(
     opts: &NfOptions,
     budget: &MbaBudget,
     tally: &mut NfStats,
+    used: &Used,
 ) -> Result<MbaAnswer, Decline> {
-    let n = normalize(p, opts, budget, tally)?;
+    let n = normalize(p, opts, budget, tally, used)?;
     let input_cost = n.input_cost;
-    let mut work = Steps::new(n.work.left);
+    let mut work = Steps::counted(n.work.left, used);
     // Only renderings smaller than the question can be answers.
     let rendered = best_rendering(p, &n, input_cost, &mut work, tally)?;
     let mut exact = rendered.exact.filter(|(c, _)| c.0 < input_cost);
@@ -2364,13 +2386,14 @@ fn run(
                 opts,
                 &MbaBudget::default().with_steps(work.left),
                 &mut scratch,
+                used,
             )
             .and_then(|m| {
-                let mut w2 = Steps::new(m.work.left);
+                let mut w2 = Steps::counted(m.work.left, used);
                 // Ties in nodes may still weigh less.
                 let r = best_rendering(&answer, &m, cost.0 + 1, &mut w2, &mut scratch);
                 let spent = work.left - w2.left.min(work.left);
-                work = Steps::new(work.left - spent);
+                work = Steps::counted(work.left - spent, used);
                 r.map(|r| (m.halved, r))
             });
             tally.candidates += scratch.candidates;
@@ -2473,6 +2496,7 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
         opts,
         &MbaBudget::default().with_steps(u64::MAX),
         &mut tally,
+        &Used::default(),
     )
     .ok()?;
     let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, u64::MAX);

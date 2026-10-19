@@ -341,26 +341,44 @@ fn certificates_are_sized_and_budgeted() {
     let full = certify::prove(&a, &b, &mut Steps::new(u64::MAX)).unwrap();
     assert_eq!(full.verdict, Verdict::Proved);
     assert_eq!(full.points, certify::sparse_points(64, 3, 2));
-    // Every budget from 0 up: never a wrong verdict, and unknown (over budget) below the size.
+    // Every budget from 0 up: never a wrong verdict, and unknown (over budget) below the size
+    // of the test and of the symbolic comparison tried ahead of it, which decides nothing here
+    // and is charged at its rate.
     let need = full.points * (a.nodes().len() + b.nodes().len()) as u64;
-    for budget in [0, 1, 100, need / 2, need - 1, need, need + 1, need + 1000] {
+    let mut work = 0;
+    assert_eq!(
+        certify::symbolic_equal(&a, &b, u64::MAX, &mut work),
+        Some(false)
+    );
+    let first = work * certify::SYMBOLIC_RATE;
+    assert!(work <= 64 && first < need / 16);
+    for budget in [
+        0,
+        1,
+        100,
+        need / 2,
+        need - 1,
+        need,
+        need + first - 1,
+        need + first,
+        need + first + 1000,
+    ] {
         let mut m = Steps::new(budget);
         let r = certify::prove(&a, &b, &mut m).unwrap();
-        if budget < need {
+        if budget < need + first {
             assert_eq!(r.verdict, Verdict::Unknown, "{budget}");
             assert!(r.over_budget);
-            // Nothing is spent on a test that is not run; the symbolic comparison is cheap.
-            assert!(m.spent <= 64 && m.spent <= budget, "{budget}: {}", m.spent);
+            // Nothing is spent on a test that is not run; the comparison is charged its rate.
+            assert!(m.spent <= budget, "{budget}: {}", m.spent);
+            assert_eq!(m.spent % certify::SYMBOLIC_RATE, 0, "{budget}: {}", m.spent);
         } else {
-            // Tried first where something is left beside the test, the symbolic comparison
-            // decides nothing here and leaves the test what it needs.
             assert_eq!(
                 (r.verdict, r.cert, r.points),
                 (Verdict::Proved, Some(Cert::Sparse), full.points),
                 "{budget}"
             );
             assert!(
-                m.spent >= need && m.spent <= budget,
+                m.spent >= need + first && m.spent <= budget,
                 "{budget}: {}",
                 m.spent
             );
@@ -730,22 +748,24 @@ fn a_long_test_tries_the_symbolic_comparison_first() {
         (r.verdict, r.cert, r.points),
         (Verdict::Proved, Some(Cert::Symbolic), 0)
     );
-    assert_eq!(m.spent, work);
-    // A budget that covers the test and no more leaves nothing to try first with.
+    // Charged at its rate: a unit of its work costs about as much as that many evaluations.
+    let charge = work * certify::SYMBOLIC_RATE;
+    assert_eq!(m.spent, charge);
+    // Within what the test would take, the comparison is tried first and decides, for a
+    // fraction of the test's cost.
     let points = certify::sparse_points(64, 2, 2);
     let need = points * (a.nodes().len() + b.nodes().len()) as u64;
+    assert!(charge < need / 8, "{charge} of {need}");
     let mut m = Steps::new(need);
     let r = certify::prove(&a, &b, &mut m).unwrap();
-    assert_eq!(
-        (r.verdict, r.cert, r.points),
-        (Verdict::Proved, Some(Cert::Sparse), points)
-    );
-    assert_eq!(m.spent, need);
-    // With the comparison's work beside it, the comparison decides.
-    let mut m = Steps::new(need + work);
-    let r = certify::prove(&a, &b, &mut m).unwrap();
     assert_eq!((r.verdict, r.cert), (Verdict::Proved, Some(Cert::Symbolic)));
-    assert_eq!(m.spent, work);
+    assert_eq!(m.spent, charge);
+    // Below its charge the budget stops it: neither it nor the test decides (over budget, not
+    // wrong), and what it spent is within the budget.
+    let mut m = Steps::new(charge - 1);
+    let r = certify::prove(&a, &b, &mut m).unwrap();
+    assert_eq!(r.verdict, Verdict::Unknown);
+    assert!(r.over_budget && m.spent < charge, "{}", m.spent);
     // The test alone proves it too.
     assert_eq!(certify::prove_with(&a, &b, Cert::Sparse), Some(true));
 }

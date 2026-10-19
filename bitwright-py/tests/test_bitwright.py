@@ -208,6 +208,7 @@ def test_engines_budgets_and_outcomes(cx):
     assert engine.run([]) == []
     b = bw.Budget(mba_calls=None, rewrites=10)
     assert b.mba_calls is None and b.rewrites == 10 and b.node_visits == 1 << 22
+    assert b.mba_steps == 1 << 24 and bw.Budget(mba_steps=5).mba_steps == 5
     assert bw.Budget.unlimited().node_visits is None
     with pytest.raises(TypeError):
         bw.Budget(node_vists=1)  # type: ignore[call-arg]

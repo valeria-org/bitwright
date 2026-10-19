@@ -20,10 +20,16 @@ pub struct Budget {
     pub new_nodes: u64,
     /// Fact transfer functions run for guards and passes.
     pub fact_work: u64,
-    /// Normal-form pass work (one per node a pass reads or emits).
+    /// Normal-form pass work (one per node a pass reads or emits), and the MBA gate's own
+    /// certificates: a node evaluation each, and 256 per monomial operation of their symbolic
+    /// comparison (what one costs in evaluations).
     pub pass_work: u64,
     /// Calls to the MBA solver.
     pub mba_calls: u64,
+    /// The MBA solver's steps, its own unit of work, summed over its calls: each call runs
+    /// within the least of its own limit (`MbaBudget::steps`) and what is left here, and is
+    /// charged the steps it spent (a remembered answer the steps it cost when it was found).
+    pub mba_steps: u64,
     /// E-nodes inserted by the equality-saturation search.
     pub eqsat_nodes: u64,
     /// Equality-saturation work (matching, unions, repairs, extraction).
@@ -41,6 +47,7 @@ impl Budget {
         fact_work: u64::MAX,
         pass_work: u64::MAX,
         mba_calls: u64::MAX,
+        mba_steps: u64::MAX,
         eqsat_nodes: u64::MAX,
         eqsat_work: u64::MAX,
     };
@@ -55,6 +62,7 @@ impl Budget {
         fact_work: 0,
         pass_work: 0,
         mba_calls: 0,
+        mba_steps: 0,
         eqsat_nodes: 0,
         eqsat_work: 0,
     };
@@ -62,7 +70,9 @@ impl Budget {
     /// Caps on one call scaled by one number, in the proportions of [`Budget::default`] (which
     /// is `Budget::fuel(1 << 22)`): `fuel` node visits, candidates, rewrites, new nodes and
     /// e-nodes; `16·fuel` matcher steps, fact transfers, pass work and equality-saturation
-    /// work; `fuel / 1024` MBA solver calls (at least 1 unless `fuel` is 0). Like every budget,
+    /// work; `fuel / 1024` MBA solver calls (at least 1 unless `fuel` is 0) and `4·fuel` MBA
+    /// solver steps (a step costs about as much as two to three units of pass work, so the
+    /// solver spends about what the passes do). Like every budget,
     /// a count of work units, never time: the same input stops at the same place on every run,
     /// and a run it stops keeps what it did ([`End::BudgetTerminated`](super::End)).
     pub const fn fuel(fuel: u64) -> Budget {
@@ -83,6 +93,7 @@ impl Budget {
             fact_work: wide,
             pass_work: wide,
             mba_calls: mba,
+            mba_steps: fuel.saturating_mul(4),
             eqsat_nodes: fuel,
             eqsat_work: wide,
         }
@@ -103,6 +114,7 @@ impl Budget {
             fact_work: f(self.fact_work, o.fact_work),
             pass_work: f(self.pass_work, o.pass_work),
             mba_calls: f(self.mba_calls, o.mba_calls),
+            mba_steps: f(self.mba_steps, o.mba_steps),
             eqsat_nodes: f(self.eqsat_nodes, o.eqsat_nodes),
             eqsat_work: f(self.eqsat_work, o.eqsat_work),
         }
@@ -120,7 +132,7 @@ impl Budget {
 impl Default for Budget {
     /// Generous caps for one call, [`Budget::fuel`]`(1 << 22)`: 2^22 visits, candidates,
     /// rewrites and new nodes, 2^26 matcher steps, fact transfers and pass work, 4096 MBA
-    /// solver calls.
+    /// solver calls and 2^24 MBA solver steps.
     fn default() -> Self {
         Budget::fuel(1 << 22)
     }
@@ -135,6 +147,7 @@ setters!(Budget {
     with_fact_work: fact_work: u64,
     with_pass_work: pass_work: u64,
     with_mba_calls: mba_calls: u64,
+    with_mba_steps: mba_steps: u64,
     with_eqsat_nodes: eqsat_nodes: u64,
     with_eqsat_work: eqsat_work: u64,
 });
@@ -167,6 +180,8 @@ pub enum Exhausted {
     Deadline,
     /// The context's node capacity ([`ContextConfig::max_nodes`](crate::ContextConfig)).
     ArenaCapacity,
+    /// [`Budget::mba_steps`].
+    MbaSteps,
 }
 
 impl fmt::Display for Exhausted {
@@ -184,6 +199,7 @@ impl fmt::Display for Exhausted {
             Exhausted::EqsatWork => "equality-saturation work",
             Exhausted::Deadline => "deadline",
             Exhausted::ArenaCapacity => "arena capacity",
+            Exhausted::MbaSteps => "MBA solver steps",
         })
     }
 }
@@ -317,6 +333,7 @@ pub(crate) enum Counter {
     Rewrites,
     PassWork,
     MbaCalls,
+    MbaSteps,
     EqsatNodes,
     EqsatWork,
 }
@@ -329,6 +346,7 @@ impl Counter {
             Counter::Rewrites => b.rewrites,
             Counter::PassWork => b.pass_work,
             Counter::MbaCalls => b.mba_calls,
+            Counter::MbaSteps => b.mba_steps,
             Counter::EqsatNodes => b.eqsat_nodes,
             Counter::EqsatWork => b.eqsat_work,
         }
@@ -341,6 +359,7 @@ impl Counter {
             Counter::Rewrites => &mut b.rewrites,
             Counter::PassWork => &mut b.pass_work,
             Counter::MbaCalls => &mut b.mba_calls,
+            Counter::MbaSteps => &mut b.mba_steps,
             Counter::EqsatNodes => &mut b.eqsat_nodes,
             Counter::EqsatWork => &mut b.eqsat_work,
         }
@@ -353,6 +372,7 @@ impl Counter {
             Counter::Rewrites => Exhausted::Rewrites,
             Counter::PassWork => Exhausted::PassWork,
             Counter::MbaCalls => Exhausted::MbaCalls,
+            Counter::MbaSteps => Exhausted::MbaSteps,
             Counter::EqsatNodes => Exhausted::EqsatNodes,
             Counter::EqsatWork => Exhausted::EqsatWork,
         }
@@ -406,6 +426,8 @@ impl<'a> Meter<'a> {
             Some(Exhausted::PassWork)
         } else if s.mba_calls > l.mba_calls {
             Some(Exhausted::MbaCalls)
+        } else if s.mba_steps > l.mba_steps {
+            Some(Exhausted::MbaSteps)
         } else if s.eqsat_nodes > l.eqsat_nodes {
             Some(Exhausted::EqsatNodes)
         } else if s.eqsat_work > l.eqsat_work {
@@ -484,8 +506,9 @@ impl<'a> Meter<'a> {
         }
     }
 
-    pub(crate) fn left(&self) -> Budget {
-        self.limit.saturating_sub(&self.spent)
+    /// What is left of one field of the budget.
+    pub(crate) fn left_in(&self, field: impl Fn(&Budget) -> u64) -> u64 {
+        field(&self.limit).saturating_sub(field(&self.spent))
     }
 }
 

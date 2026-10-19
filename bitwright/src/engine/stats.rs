@@ -128,6 +128,8 @@ impl Stats {
 pub struct MbaStats {
     /// Solver calls.
     pub calls: u64,
+    /// The solver's steps charged to the run ([`Budget::mba_steps`](super::Budget::mba_steps)).
+    pub steps: u64,
     /// Answers taken from the cache.
     pub cache_hits: u64,
     /// Nodes replaced.
@@ -136,7 +138,8 @@ pub struct MbaStats {
     pub no_simpler: u64,
     /// Inputs the solver does not handle.
     pub unsupported: u64,
-    /// Calls that ran out of the solver's budget.
+    /// Calls that ran out of the solver's budget, and questions not asked because the run's
+    /// solver steps were spent.
     pub exhausted: u64,
     /// Answers found wrong (at a sampled point, or after lifting).
     pub refuted: u64,
@@ -162,6 +165,7 @@ impl MbaStats {
     pub fn absorb(&mut self, o: &MbaStats) {
         let MbaStats {
             calls,
+            steps,
             cache_hits,
             simplified,
             no_simpler,
@@ -177,6 +181,7 @@ impl MbaStats {
             certificates,
         } = o;
         self.calls += calls;
+        self.steps += steps;
         self.cache_hits += cache_hits;
         self.simplified += simplified;
         self.no_simpler += no_simpler;

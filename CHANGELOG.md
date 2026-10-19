@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+- **The MBA certifier's symbolic comparison is charged at its cost.** It was charged a unit of
+  pass work per monomial operation, which costs about 250 node evaluations, and where no
+  evaluation test fit it ran in full and was charged at most what was left (one call took
+  2.7 s). It is now charged 256 units per operation (`SYMBOLIC_RATE`, the measured cost) and
+  runs within what is left: stopped there, it is over budget, as a test over the budget is.
+  Ahead of a long test it no longer keeps the test's budget in reserve; when it decides
+  nothing and leaves too little for the test, the test is over budget.
+- **The MBA solver's steps under the fuel.** New `Budget::mba_steps`, the solver's steps summed
+  over a run (`Budget::fuel(f)` gives `4·f`, so 2^24 by default; a step costs about two to three
+  units of pass work), and `Exhausted::MbaSteps`. Each call runs within the least of
+  `MbaBudget::steps` and what is left, and is charged the steps it spent. With nothing left a
+  question is not asked, and the node is not final. New `MbaSolver::solve_counted` reports a
+  call's steps; its default is `solve`, charged the whole limit. `NormalFormSolver` counts its
+  steps, and its memo charges a remembered answer what finding it cost, so a charge never
+  depends on what it remembers. `SignatureSolver` counts its corner evaluations and does not
+  compute a signature its limit cannot cover. `ThreadedSolver` passes the count through.
+  `MbaStats::steps` reports them. C: `bw_budget.mba_steps`, `BW_LIMIT_MBA_STEPS` and
+  `BW_ABI_VERSION` 2; Python: `Budget(mba_steps=…)`.
+- Together the two make the fuel bound the MBA work's time. The input the solver-budget proposal
+  found by hill climbing (44 nodes, 8 bits, five variables) took 142.5 G instructions (9 s) at
+  `Budget::fuel(1024)` and 201.8 G at the default budget. It now takes 0.27 G and 2.2 G, with
+  the same 39-node result at every fuel; the proposal's two other worst inputs also keep their
+  results, for 0.3 to 3.1 G instead of 2.3 to 8.7 G. The measurements behind both choices are in
+  `docs/proposals/symbolic-charge.md` and `docs/proposals/solver-budget.md`.
+- **Behavior changes.** At the default budget no bench row and no `--prover-budgets` answer
+  changes; per the proposals' measurements, neither do `--corpus-diff`'s results or any scored
+  line of CoBRA's datasets. Some runs on random DAGs end "exhausted" where they ended "no
+  simpler", with the same results. Under small fuels results change wherever the comparison or
+  the solver needed more than the fuel now gives, and every change measured was a larger
+  result. CoBRA solves 66,975 lines at fuel 2^12 instead of 69,833, and 58,579 at 2^10 instead
+  of 63,280; twice the fuel brings more back than that, for fewer instructions (72,065 at 2^13).
+  The MBA-heavy question of `--prover-budgets` spends 151,951 units of pass work instead of
+  20,371 and is still proved from fuel 2^14 up. A solver that does not report its steps is
+  charged its whole limit per call: at the default budget at most 16 calls of 2^20 steps per
+  run, where 4,096 were allowed.
+- Benchmarks: no row of `bitwright-bench` changes its results. Instructions against 0.20.0:
+  `simplify/*` −0.4 % to +0.1 %, `compile/*` −1.2 % to 0 %, `constraints/*` +0.3 %, the others
+  within ±1 % but `service/eqsat/32` (−8.8 %; it varies by about 6 % between processes) and
+  `service/smt-export/64` (+1.6 %), which this change does not touch.
+  Reading the one budget field it needs, where it computed the whole remaining budget, keeps the
+  larger `Budget` from costing more.
+
 ## 0.20.0
 
 - **Cheaper MBA certificates.** A polynomial test that would take far longer than reading both

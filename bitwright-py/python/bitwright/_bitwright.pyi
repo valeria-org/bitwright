@@ -367,6 +367,7 @@ class Budget:
         fact_work: int | None = ...,
         pass_work: int | None = ...,
         mba_calls: int | None = ...,
+        mba_steps: int | None = ...,
         eqsat_nodes: int | None = ...,
         eqsat_work: int | None = ...,
     ) -> Budget: ...
@@ -388,6 +389,8 @@ class Budget:
     def pass_work(self) -> int | None: ...
     @property
     def mba_calls(self) -> int | None: ...
+    @property
+    def mba_steps(self) -> int | None: ...
     @property
     def eqsat_nodes(self) -> int | None: ...
     @property

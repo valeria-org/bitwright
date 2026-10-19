@@ -66,11 +66,17 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
     }
 
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+        self.solve_counted(p, budget).0
+    }
+
+    /// The inner solver's steps; a question abandoned at the deadline is charged its limit (it
+    /// may still be running), one refused or not started nothing.
+    fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
         const RUNNING: u8 = 0;
         const DONE: u8 = 1;
         const ABANDONED: u8 = 2;
         if self.abandoned.load(Ordering::Acquire) >= self.max_abandoned {
-            return MbaAnswer::Exhausted;
+            return (MbaAnswer::Exhausted, 0);
         }
         let (tx, rx) = mpsc::channel();
         let (inner, p, budget) = (self.inner.clone(), p.clone(), *budget);
@@ -83,9 +89,12 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
             .spawn(move || {
                 // A panic in the solver is an answer, not a lost question.
                 let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inner.solve(&p, &budget)
+                    inner.solve_counted(&p, &budget)
                 }))
-                .unwrap_or_else(|_| MbaAnswer::Unsupported("the solver panicked".into()));
+                .unwrap_or_else(|_| {
+                    let why = MbaAnswer::Unsupported("the solver panicked".into());
+                    (why, budget.steps)
+                });
                 let _ = tx.send(answer);
                 if st
                     .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
@@ -96,7 +105,7 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
                 }
             });
         if spawned.is_err() {
-            return MbaAnswer::Exhausted;
+            return (MbaAnswer::Exhausted, 0);
         }
         match rx.recv_timeout(self.timeout) {
             Ok(a) => a,
@@ -107,11 +116,11 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
                     .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    MbaAnswer::Exhausted
+                    (MbaAnswer::Exhausted, budget.steps)
                 } else {
                     // The worker finished (and sent) just in time.
                     self.abandoned.fetch_sub(1, Ordering::AcqRel);
-                    rx.recv().unwrap_or(MbaAnswer::Exhausted)
+                    rx.recv().unwrap_or((MbaAnswer::Exhausted, budget.steps))
                 }
             }
         }

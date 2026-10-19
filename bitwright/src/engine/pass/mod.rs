@@ -395,7 +395,7 @@ fn query<T>(
     of: impl FnOnce(Facts) -> T,
     base: impl FnOnce(&mut Context, crate::Expr, u32) -> Result<Option<T>, crate::Error>,
 ) -> Result<(Option<T>, Fin), Stop> {
-    let left = r.meter.left().fact_work;
+    let left = r.meter.left_in(|b| b.fact_work);
     let cap = u32::try_from(left).unwrap_or(u32::MAX);
     if cap == 0 {
         return Err(Stop::Exhausted(Exhausted::FactWork));

@@ -1609,7 +1609,7 @@ fn uncap(v: u64) -> Option<u64> {
 impl PyBudget {
     /// `Budget(node_visits=10_000, mba_calls=None)`: each limit an int, or None for unlimited.
     /// The limits are `node_visits`, `candidates`, `match_steps`, `rewrites`, `new_nodes`,
-    /// `fact_work`, `pass_work`, `mba_calls`, `eqsat_nodes` and `eqsat_work`.
+    /// `fact_work`, `pass_work`, `mba_calls`, `mba_steps`, `eqsat_nodes` and `eqsat_work`.
     #[new]
     #[pyo3(signature = (**limits))]
     fn new(limits: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
@@ -1626,6 +1626,7 @@ impl PyBudget {
                 "fact_work" => b.with_fact_work(v),
                 "pass_work" => b.with_pass_work(v),
                 "mba_calls" => b.with_mba_calls(v),
+                "mba_steps" => b.with_mba_steps(v),
                 "eqsat_nodes" => b.with_eqsat_nodes(v),
                 "eqsat_work" => b.with_eqsat_work(v),
                 other => {
@@ -1677,6 +1678,10 @@ impl PyBudget {
     #[getter]
     fn mba_calls(&self) -> Option<u64> {
         uncap(self.b.mba_calls)
+    }
+    #[getter]
+    fn mba_steps(&self) -> Option<u64> {
+        uncap(self.b.mba_steps)
     }
     #[getter]
     fn eqsat_nodes(&self) -> Option<u64> {

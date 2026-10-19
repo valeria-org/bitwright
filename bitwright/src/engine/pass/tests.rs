@@ -2901,6 +2901,119 @@ mod mba_service {
         );
     }
 
+    /// Answers "no simpler" for a fixed number of steps (at most its limit), counting calls.
+    struct Steady(u64, AtomicU64);
+    impl MbaSolver for Steady {
+        fn id(&self) -> &str {
+            "test.steady"
+        }
+        fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+            self.solve_counted(p, budget).0
+        }
+        fn solve_counted(&self, _: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            (MbaAnswer::NoSimpler, self.0.min(budget.steps))
+        }
+    }
+
+    /// Several MBA questions, one per summand.
+    const MANY: &str = "((x ^ y) + 2 * (x & y)) * ((x | z) - (x & z)) \
+                        + ((y ^ z) + 2 * (y & z)) * ((y | x) + (y & x)) \
+                        + ((z ^ x) + 2 * (z & x)) * ((z | y) - (z & y))";
+
+    #[test]
+    fn the_solvers_steps_are_an_account_of_the_run() {
+        assert_eq!(Budget::fuel(1000).mba_steps, 4000);
+        assert_eq!(Budget::default().mba_steps, 1 << 24);
+        let ask = |solver: Arc<dyn MbaSolver>, steps: u64| {
+            let eng = mba_engine(solver, MbaTrust::default());
+            let mut cx = Context::new();
+            let e = cx.parse(MANY, &ParseOptions::width(Width::W64)).unwrap();
+            let run = Run::default().with_per_call(Budget::UNLIMITED.with_mba_steps(steps));
+            eng.run(&mut cx, &[e], run).unwrap()
+        };
+        // Unlimited: every question asked, each charged what it spent.
+        let s = Arc::new(Steady(1000, AtomicU64::new(0)));
+        let out = ask(s.clone(), u64::MAX);
+        let calls = s.1.load(Ordering::Relaxed);
+        assert!(calls >= 3, "{calls}");
+        assert_eq!(out.stats.mba.calls, calls);
+        assert_eq!(out.stats.mba.steps, 1000 * calls);
+        assert_eq!(out.roots[0].end, End::Completed);
+        // An account for one question: the next ones are not asked, and the run says why.
+        let s = Arc::new(Steady(1000, AtomicU64::new(0)));
+        let out = ask(s.clone(), 1000);
+        assert_eq!(
+            (s.1.load(Ordering::Relaxed), out.stats.mba.steps),
+            (1, 1000)
+        );
+        assert_eq!(
+            out.roots[0].end,
+            End::BudgetTerminated(crate::engine::Exhausted::MbaSteps)
+        );
+        // Nothing in it: nothing asked.
+        let s = Arc::new(Steady(1000, AtomicU64::new(0)));
+        let out = ask(s.clone(), 0);
+        assert_eq!(s.1.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            out.roots[0].end,
+            End::BudgetTerminated(crate::engine::Exhausted::MbaSteps)
+        );
+        // A last question gets what is left, never more.
+        let s = Arc::new(Steady(1000, AtomicU64::new(0)));
+        let out = ask(s.clone(), 1000 * calls - 1);
+        assert_eq!(out.stats.mba.steps, 1000 * calls - 1);
+        // A solver that does not count is charged its whole limit.
+        let limit = MbaConfig::default().budget.steps;
+        let c = Arc::new(Counting(AtomicU64::new(0)));
+        let out = ask(c.clone(), 2 * limit);
+        assert_eq!(c.0.load(Ordering::Relaxed), 2);
+        assert_eq!(out.stats.mba.steps, 2 * limit);
+        // The normal-form solver counts its steps, and a remembered answer is charged what
+        // finding it cost: the same run in a fresh context, answered from the solver's memory,
+        // spends the same and gives the same.
+        let nf: Arc<dyn MbaSolver> = Arc::new(crate::mba::NormalFormSolver::default());
+        let eng = mba_engine(nf, MbaTrust::default());
+        let once = |eng: &Engine| {
+            let mut cx = Context::new();
+            let e = cx.parse(MANY, &ParseOptions::width(Width::W64)).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            (cx.display(out.roots[0].expr).to_string(), out.stats.mba)
+        };
+        let (first, a) = once(&eng);
+        let (again, b) = once(&eng);
+        assert_eq!(first, again);
+        assert!(a.calls > 0 && a.steps > 0 && a.steps < a.calls * limit);
+        assert_eq!((a.calls, a.steps), (b.calls, b.steps));
+    }
+
+    #[test]
+    fn the_signature_solver_counts_its_corners() {
+        let s = crate::mba::SignatureSolver;
+        let w = Width::W64;
+        let mut p = MbaExpr::new(vec![w, w]);
+        let x = p.push(MOp::Var(0), &[]).unwrap();
+        let y = p.push(MOp::Var(1), &[]).unwrap();
+        let and = p.push(MOp::And, &[x, y]).unwrap();
+        let xor = p.push(MOp::Xor, &[x, y]).unwrap();
+        let two = p
+            .push(MOp::Const(BitVec::wrapping_from_u64(w, 2)), &[])
+            .unwrap();
+        let dbl = p.push(MOp::Mul, &[and, two]).unwrap();
+        p.push(MOp::Add, &[xor, dbl]).unwrap();
+        // Six nodes at four corners: 24 evaluations, one step.
+        let (a, steps) = s.solve_counted(&p, &MbaBudget::default());
+        assert!(matches!(a, MbaAnswer::Simplified { .. }));
+        assert_eq!(steps, 1);
+        assert_eq!(s.solve(&p, &MbaBudget::default()), a);
+        // No step to spend: not computed.
+        let (a, steps) = s.solve_counted(&p, &MbaBudget::default().with_steps(0));
+        assert_eq!((a, steps), (MbaAnswer::Exhausted, 0));
+        // Through the deadline wrapper, the same count.
+        let t = crate::mba::ThreadedSolver::new(s, std::time::Duration::from_secs(30), 2);
+        assert_eq!(t.solve_counted(&p, &MbaBudget::default()).1, 1);
+    }
+
     // ----- M6 review regressions ------------------------------------------------------------
 
     #[test]

@@ -657,10 +657,13 @@ workload, deciding it node by node made results larger and cost a quarter of the
 ```rust
 pub struct Budget { pub node_visits: u64, pub candidates: u64, pub match_steps: u64,
                     pub rewrites: u64, pub new_nodes: u64, pub fact_work: u64,
-                    pub pass_work: u64 }                                          // #[non_exhaustive]
-// Budget::UNLIMITED, Budget::ZERO, Budget::default() (generous per-call caps)
+                    pub pass_work: u64, pub mba_calls: u64, pub mba_steps: u64,
+                    pub eqsat_nodes: u64, pub eqsat_work: u64 }                   // #[non_exhaustive]
+// Budget::UNLIMITED, Budget::ZERO, Budget::fuel(f) (every cap scaled by one number),
+// Budget::default() == Budget::fuel(1 << 22) (generous per-call caps)
 pub enum Exhausted { NodeVisits, Candidates, MatchSteps, Rewrites, NewNodes, FactWork,
-                     PassWork, Deadline, ArenaCapacity }
+                     PassWork, MbaCalls, EqsatNodes, EqsatWork, Deadline, ArenaCapacity,
+                     MbaSteps }                                                   // #[non_exhaustive]
 pub struct Allowance { /* remaining: Budget, spent: Budget */ }
 pub trait Clock { fn now_ticks(&self) -> u64; }
 pub struct Deadline<'a> { pub clock: &'a dyn Clock, pub at: u64, pub check_every: u32 }
@@ -1176,7 +1179,8 @@ pub mod mba {
     pub fn lower(cx: &Context, e: Expr, lim: &MbaLimits) -> Result<(MbaExpr, Bindings), Error>;
     pub fn lift(cx: &mut Context, m: &MbaExpr, b: &Bindings) -> Result<Expr, Error>;
 
-    pub trait MbaSolver: Send + Sync { fn id(&self) -> &str; fn solve(&self, p: &MbaExpr, b: &MbaBudget) -> MbaAnswer; }
+    pub trait MbaSolver: Send + Sync { fn id(&self) -> &str; fn solve(&self, p: &MbaExpr, b: &MbaBudget) -> MbaAnswer;
+        fn solve_counted(&self, p: &MbaExpr, b: &MbaBudget) -> (MbaAnswer, u64) /* the steps it spent; default: its limit */; }
     pub enum MbaAnswer { Simplified { expr: MbaExpr, claim: Claim }, NoSimpler, Unsupported(String), Exhausted }
     pub enum Claim { Unverified, Sampled, Proved, Certified }
     pub trait EquivalenceProver: Send + Sync { fn id(&self) -> &str;
@@ -1281,14 +1285,18 @@ pub mod mba {
     their structure; at most 4,096 monomials). Equal polynomials are equal functions whatever
     the symbols' values; unequal ones decide nothing (`(x & 1)² = x & 1` holds bit by bit, not
     as polynomials). It runs when no direct test fits a pair of polynomial sides (or the test
-    is over its budget), and before a polynomial test that would take far longer: its work, a
-    unit per monomial operation (about as long as a thousand node evaluations), is capped at
-    half the test's estimated time and at what leaves the test affordable. It proves only
-    pairs the test finds equal, and when it decides nothing the test still fits, so a
-    certificate's verdict is the same at every budget and only its work changes:
-    `(x & y)·(x | y) + (x & ~y)·(~x & y) = x·y` at 64 bits takes 43 units instead of the
-    degree-2 test's 18,337 points (256,718 units). Inside the compositional test it compares
-    skeletons the same way.
+    is over its budget), and before a polynomial test that would take far longer: within half
+    the test's estimated time (at a thousand node evaluations per unit of its work, a monomial
+    operation, for that ordering) and within what is left. It is charged `SYMBOLIC_RATE`, 256
+    units per unit of its work, what one costs in node evaluations (measured: 208 in
+    instructions and 308 in time on identical certificates, 250 to 350 over the corpora), so a
+    budget bounds it as it bounds a test; where no test fits it runs within what is left and,
+    stopped there, reports over budget. It proves only pairs the test finds equal; when it
+    decides nothing the test runs, or is over budget when what is left no longer covers it:
+    `(x & y)·(x | y) + (x & ~y)·(~x & y) = x·y` at 64 bits takes 43 units of its work (11,008
+    charged) instead of the degree-2 test's 18,337 points (256,718 units). Inside the
+    compositional test it compares skeletons the same way. (`docs/proposals/symbolic-charge.md`
+    has the measurements.)
   - *Carries*: sides built from `+ − neg ~ & | ^`, constants, left shifts by at most 8 and
     products by a constant of at most 9 bits (or its negation, whichever needs less state: a
     sum of shifts) are T-functions: bit `j` depends on bits `0..=j` of the variables through a
@@ -1527,8 +1535,15 @@ pub mod mba {
     stops generating candidates when the budget runs out; if the normal form itself did not
     render within it, the answer is `Exhausted` (nothing says the best was seen), while what
     comes after (the other forms, later rounds with more factors, the fixed point) only stops.
-    A question's time is bounded by its budget (about 40 to 60 ns per step on the benchmark
-    machine, so tens of milliseconds at the default `2^20`).
+    A question's time is bounded by its budget: a step costs 230 to 930 instructions on
+    average (40 to 100 ns), and one question's steps up to 30 times that on generated inputs,
+    so tens to hundreds of milliseconds at the default `2^20`. In the engine a call runs within
+    the least of `MbaBudget::steps` and what is left of the run's `Budget::mba_steps` (4 per
+    unit of fuel, 2^24 by default; a step costs about as much as two to three units of pass
+    work), and is charged the steps it spent (`MbaSolver::solve_counted`; a remembered answer
+    the steps finding it cost, so a charge never depends on the solver's memory; a solver that
+    does not count is charged its limit). With nothing left a question is not asked, and the
+    node is not final. (`docs/proposals/solver-budget.md` has the measurements.)
   - *Memo.* The engine asks about nested fragments bottom-up, and asks some again as the DAG
     around them changes. The solver remembers its last `NfOptions::memo` answers (1,024 by
     default) by question and budget, keeping each question to compare on use (a hash

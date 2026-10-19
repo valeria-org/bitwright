@@ -13,7 +13,9 @@ use crate::{BitVec, Width};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct MbaBudget {
-    /// A work bound in the solver's own units.
+    /// A work bound in the solver's own units, for one question. In the engine a question
+    /// runs within the least of this and what is left of the run's
+    /// [`Budget::mba_steps`](crate::engine::Budget::mba_steps).
     pub steps: u64,
     /// Whether answers should carry the solver's own evidence (default true). A caller that
     /// proves every answer itself asks without, and a solver may then skip checking an answer
@@ -75,6 +77,15 @@ pub trait MbaSolver: Send + Sync {
     fn id(&self) -> &str;
     /// Simplifies `p`.
     fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer;
+    /// Simplifies `p`, and says how many of `budget`'s steps it spent: what the engine charges
+    /// the call against [`Budget::mba_steps`](crate::engine::Budget::mba_steps). A solver that
+    /// counts its work reports what it spent, and a remembered answer what finding it cost, so
+    /// that a charge does not depend on what the solver remembers. This default is
+    /// [`solve`](Self::solve) charged its whole limit (`budget.steps`), the most a solver that
+    /// keeps to its budget spends.
+    fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+        (self.solve(p, budget), budget.steps)
+    }
     /// Whether `Phase::Mba` should also ask about polynomials: fragments without bitwise
     /// operators in which two non-constants are multiplied, and fragments rooted at a constant
     /// left shift. By default only mixed fragments (arithmetic and bitwise operators) rooted at
@@ -201,34 +212,51 @@ pub struct SignatureSolver;
 /// The most variables the signature solver takes (2^t corners).
 const SIGNATURE_MAX_VARS: usize = 10;
 
+/// Node evaluations per step of the signature solver's work (as the normal-form solver counts
+/// its certificates').
+const SIGNATURE_EVALS_PER_STEP: u64 = 32;
+
 impl MbaSolver for SignatureSolver {
     fn id(&self) -> &str {
         "bitwright.signature.v1"
     }
 
-    fn solve(&self, p: &MbaExpr, _: &MbaBudget) -> MbaAnswer {
+    fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+        self.solve_counted(p, budget).0
+    }
+
+    /// Its work is evaluating the input at the 2^t corners, counted as the normal-form solver
+    /// counts certificate evaluations (a step per 32 node evaluations); a signature that does
+    /// not fit `budget.steps` is not computed (exhausted, nothing spent).
+    fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
         if !p.is_linear() {
-            return MbaAnswer::Unsupported("not a linear MBA".into());
+            return (MbaAnswer::Unsupported("not a linear MBA".into()), 0);
         }
         let t = p.vars().len();
         if t > SIGNATURE_MAX_VARS || p.vars().iter().any(|&w| Some(w) != p.width()) {
-            return MbaAnswer::Unsupported("too many variables, or mixed widths".into());
+            let why = "too many variables, or mixed widths";
+            return (MbaAnswer::Unsupported(why.into()), 0);
+        }
+        let steps = ((p.nodes().len() as u64) << t).div_ceil(SIGNATURE_EVALS_PER_STEP);
+        if steps > budget.steps {
+            return (MbaAnswer::Exhausted, 0);
         }
         let Some(sig) = p.corners() else {
-            return MbaAnswer::Unsupported("no signature".into());
+            return (MbaAnswer::Unsupported("no signature".into()), steps);
         };
         let Some(w) = p.width() else {
-            return MbaAnswer::Unsupported("empty".into());
+            return (MbaAnswer::Unsupported("empty".into()), steps);
         };
         let d = mobius(&sig);
         let m = conjunction_form(p.vars(), w, &d);
-        match m {
+        let answer = match m {
             Some(m) if m.nodes().len() < p.nodes().len() => MbaAnswer::Simplified {
                 expr: m,
                 claim: Claim::Proved,
             },
             _ => MbaAnswer::NoSimpler,
-        }
+        };
+        (answer, steps)
     }
 }
 
