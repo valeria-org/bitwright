@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.20.0
 
 - **Cheaper MBA certificates.** A polynomial test that would take far longer than reading both
   sides as polynomials over symbols now tries that first (the symbolic comparison,
