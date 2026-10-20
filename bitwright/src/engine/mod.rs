@@ -1364,6 +1364,7 @@ impl Runner<'_, '_> {
     /// only within the budget's new nodes (a node it cannot rebuild stays as it was, operands
     /// included). `None` when nothing changes.
     fn salvage(&mut self, cx: &mut Context, phase: usize, root: u32) -> Option<(u32, Fin)> {
+        self.stats.salvaged += 1;
         let mut rewrote: IdMap<u32, (u32, Fin)> = IdMap::default();
         for f in &self.stack {
             if let Frame::Finish(n, t, own) = *f {
@@ -2223,6 +2224,22 @@ impl Engine {
             if done.contains_key(&root) {
                 continue;
             }
+            // Once the deadline has passed, no root is started: the call returns
+            // what it has, and the rest say why they did not run. (A budget stop
+            // goes on to the next root, whose own work is still worth keeping.)
+            if runner.meter.deadline_passed() {
+                done.insert(
+                    root,
+                    (
+                        root,
+                        End::BudgetTerminated(Exhausted::Deadline),
+                        Reliance::NONE,
+                    ),
+                );
+                runner.stats.budget_terminated[0] += 1;
+                runner.stats.not_started += 1;
+                continue;
+            }
             let out = match admit(cx, root, &admission) {
                 Some(cap) => {
                     runner.stats.declined += 1;
@@ -2399,7 +2416,13 @@ impl Runner<'_, '_> {
                         cur = r;
                         fin = fin.and(f);
                     }
-                    // A budget keeps what the stopped phase did (see `salvage`).
+                    // A budget keeps what the stopped phase did (see `salvage`). A
+                    // deadline does not: it means stop now, the caller is waiting, and
+                    // salvaging walks the whole DAG below the root once more — work the
+                    // run was just told to stop doing.
+                    Err(stop @ Stop::Exhausted(Exhausted::Deadline)) => {
+                        return Err((cur, fin, stop));
+                    }
                     Err(stop @ Stop::Exhausted(_)) => {
                         return Err(match self.salvage(cx, phase, cur) {
                             Some((r, f)) => (r, fin.and(f), stop),

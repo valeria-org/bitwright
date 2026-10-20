@@ -121,6 +121,12 @@ not final, and a later call with more budget continues from it. A `Deadline` sto
 time your own `Clock` reports; bitwright never reads a clock itself. Budgets are the
 deterministic choice; a deadline makes results depend on timing.
 
+A deadline also means *stop now*: the root it stops is returned as the phases before it left it
+(its stopped phase is not salvaged, which would walk that root's whole DAG again), and the roots
+after it are not started — `Stats::salvaged` and `Stats::not_started` say so. A budget stop is
+the other way around: every root keeps its own work, so a call with many roots salvages each of
+them.
+
 Admission caps (`Admission`) decline roots that are too large before any work is done.
 
 ## What the result tells you

@@ -61,6 +61,11 @@ pub struct Stats {
     pub budget_terminated: [u64; 2],
     /// Distinct roots declined by an admission cap.
     pub declined: u64,
+    /// Roots whose stopped phase was salvaged (its work kept, see the
+    /// engine's `salvage`): a budget stop does that, a deadline does not.
+    pub salvaged: u64,
+    /// Roots a passed deadline left unstarted.
+    pub not_started: u64,
 }
 
 impl Stats {
@@ -91,6 +96,8 @@ impl Stats {
             completed,
             budget_terminated,
             declined,
+            salvaged,
+            not_started,
         } = o;
         self.node_visits += node_visits;
         self.memo_hits += memo_hits;
@@ -119,6 +126,8 @@ impl Stats {
             self.budget_terminated[k] += budget_terminated[k];
         }
         self.declined += declined;
+        self.salvaged += salvaged;
+        self.not_started += not_started;
     }
 }
 

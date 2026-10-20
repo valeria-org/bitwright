@@ -455,6 +455,12 @@ impl<'a> Meter<'a> {
         Ok(())
     }
 
+    /// Whether a deadline has already been seen to pass (latched; reads no
+    /// clock, so it costs nothing to ask between roots).
+    pub(crate) fn deadline_passed(&self) -> bool {
+        self.expired
+    }
+
     /// Reads the deadline's clock now (not when due); latched once it has passed.
     #[cfg_attr(not(feature = "eqsat"), allow(dead_code))]
     pub(crate) fn deadline_now(&mut self) -> Result<(), Exhausted> {
