@@ -715,9 +715,15 @@ impl Ctx<'_> {
                         c.expect("]")?;
                         inst.args.push(v);
                         inst.incoming.push(bi);
-                        if !c.eat(",") {
+                        // `, [` is another pair; `, !dbg !7` is metadata, read with the
+                        // trailer below.
+                        if !matches!(
+                            (c.peek(), c.peek_at(1)),
+                            (Some(Tok::P(",")), Some(Tok::P("[")))
+                        ) {
                             break;
                         }
+                        c.pos += 1;
                     }
                 }
                 "call" | "tail" | "musttail" | "notail" => {

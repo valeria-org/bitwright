@@ -189,13 +189,43 @@ fn float_env(attrs: &str, target: bool) -> Option<String> {
     None
 }
 
-/// Open `[` brackets on a line.
+/// Open `[` brackets on a line, outside quotes (a quoted name may hold one: `%"a[b"`).
 fn brackets(line: &str) -> i32 {
+    let mut quoted = false;
     line.chars().fold(0, |d, c| match c {
-        '[' => d + 1,
-        ']' => d - 1,
+        '"' => {
+            quoted = !quoted;
+            d
+        }
+        '[' if !quoted => d + 1,
+        ']' if !quoted => d - 1,
         _ => d,
     })
+}
+
+/// The block a line labels, if it is a label: by LLVM's grammar, a name of `[-a-zA-Z$._0-9]`
+/// (`entry`, `.lr.ph`, `if-then`, `7`) or a quoted name (`"a b"`), then its colon, alone on
+/// the line.
+fn block_label(line: &str) -> Option<&str> {
+    let name = line.strip_suffix(':')?;
+    match name.strip_prefix('"') {
+        Some(quoted) => quoted.strip_suffix('"').filter(|q| !q.contains('"')),
+        None => (!name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'$' | b'.' | b'_')))
+        .then_some(name),
+    }
+}
+
+/// Whether a line calls a `llvm.dbg.` intrinsic (`call void @llvm.dbg.value(metadata …)`).
+fn debug_call(toks: &[Tok]) -> bool {
+    let call = match toks {
+        [Tok::Ident(t), rest @ ..] if matches!(t.as_str(), "tail" | "musttail" | "notail") => rest,
+        _ => toks,
+    };
+    matches!(call, [Tok::Ident(c), Tok::Ident(v), Tok::Global(f), ..]
+        if c == "call" && v == "void" && f.starts_with("llvm.dbg."))
 }
 
 /// Classes of `nofpclass`, as bits.
@@ -409,13 +439,10 @@ fn body(t: &mut Transform, f: &FnText, src: Option<&Header>) -> Result<Body, Syn
         .filter(|p| p.name.parse::<u32>().is_ok())
         .count() as u32;
     for (n, text) in &f.body {
-        let toks = lex(text, *n)?;
-        let label = match toks.as_slice() {
-            [Tok::Ident(l), Tok::P(":")] | [Tok::Num(l), Tok::P(":")] => Some(l.clone()),
-            [Tok::Str(l), Tok::P(":")] => Some(l.clone()),
-            _ => None,
-        };
-        if let Some(l) = label {
+        // A label is read by its own grammar: the tokens of an instruction would split
+        // `if-then` and refuse `.lr.ph`.
+        if let Some(l) = block_label(text) {
+            let l = l.to_string();
             if block_of.insert(l.clone(), blocks.len()).is_some() {
                 return Err(SyntaxError {
                     line: *n,
@@ -428,6 +455,15 @@ fn body(t: &mut Transform, f: &FnText, src: Option<&Header>) -> Result<Body, Syn
                 term: Term::Unreachable,
             });
             block_line.push(*n);
+            continue;
+        }
+        // Debug records say nothing about values: `#dbg_value(…)` (LLVM 19 on) is not read,
+        // nor is a call of a `llvm.dbg.` intrinsic (how LLVM wrote them before).
+        if text.starts_with("#dbg_") {
+            continue;
+        }
+        let toks = lex(text, *n)?;
+        if debug_call(&toks) {
             continue;
         }
         if blocks.is_empty() {

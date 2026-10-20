@@ -1,6 +1,6 @@
 //! Each program's own attributes, call sites, `nsz`, what is refused rather than ignored,
-//! type assignments, redefined registers, malformed functions, and the certified and
-//! exported questions.
+//! type assignments, redefined registers, malformed functions, labels and metadata as LLVM
+//! writes them, and the certified and exported questions.
 
 use super::*;
 
@@ -339,6 +339,104 @@ fn malformed_functions_are_syntax_errors() {
     // A block named twice.
     let e = err("a:\n  br label %a\na:\n  ret i8 %x\n");
     assert!(e.message.contains("defined twice"), "{e}");
+}
+
+/// A diamond on `%c` whose blocks `a`, `b` and `m` are spelled as given, each as its label and
+/// as its uses, with `md` after the phi.
+fn diamond([(a, ua), (b, ub), (m, um)]: [(&str, &str); 3], md: &str) -> String {
+    format!(
+        "define i8 @f(i8 %x, i1 %c) {{\nentry:\n  br i1 %c, label %{ua}, label %{ub}\n\
+         {a}:\n  %y = add i8 %x, 1\n  br label %{um}\n{b}:\n  %z = sub i8 %x, 1\n  \
+         br label %{um}\n{m}:\n  %r = phi i8 [ %y, %{ua} ], [ %z, %{ub} ]{md}\n  ret i8 %r\n}}\n"
+    )
+}
+
+#[test]
+fn labels_are_read_as_llvm_spells_them() {
+    let plain = diamond([("a", "a"), ("b", "b"), ("m", "m")], "");
+    for blocks in [
+        // As optimizations name blocks.
+        [
+            (".lr.ph", ".lr.ph"),
+            ("._crit_edge", "._crit_edge"),
+            (".loopexit", ".loopexit"),
+        ],
+        [
+            ("if-then", "if-then"),
+            ("if-else", "if-else"),
+            ("if-end", "if-end"),
+        ],
+        // Quoted where the name needs it and where it does not: the same block either way.
+        [
+            ("\"if then\"", "\"if then\""),
+            ("\"b\"", "b"),
+            ("m", "\"m\""),
+        ],
+        [("0", "0"), ("1", "1"), ("2", "2")],
+        [("$a", "$a"), ("-1", "-1"), ("1b", "\"1b\"")],
+        // A quoted name may hold a bracket, which must not open a statement over lines.
+        [("\"a[b\"", "\"a[b\""), ("b", "b"), ("m", "m")],
+    ] {
+        // The same function: each phi entry and branch is read from its own block.
+        let r = tv1(&plain, &diamond(blocks, ""));
+        assert!(matches!(r.verdict(), Verdict::Valid), "{blocks:?}\n{r}");
+    }
+}
+
+#[test]
+fn metadata_after_a_phi_is_metadata() {
+    let blocks = [("a", "a"), ("b", "b"), ("m", "m")];
+    let plain = diamond(blocks, "");
+    for md in [", !dbg !7", ", !annotation !0, !dbg !7"] {
+        let r = tv1(&plain, &diamond(blocks, md));
+        assert!(matches!(r.verdict(), Verdict::Valid), "{md}\n{r}");
+    }
+    // Metadata bitwright does not know is not ignored.
+    let why = unsupported(&tv1(&plain, &diamond(blocks, ", !acme !0")));
+    assert!(why.contains("!acme"), "{why}");
+}
+
+#[test]
+fn debug_records_are_skipped() {
+    let plain = diamond([("a", "a"), ("b", "b"), ("m", "m")], "");
+    // The diamond as `clang -g` writes it: debug records from LLVM 19 on, calls of the
+    // `llvm.dbg` intrinsics before.
+    let records: [fn(&str) -> String; 3] = [
+        |v| format!("    #dbg_value(i8 {v}, !12, !DIExpression(), !11)\n    #dbg_label(!13, !11)"),
+        |v| {
+            format!(
+                "  call void @llvm.dbg.value(metadata i8 {v}, metadata !12, \
+                 metadata !DIExpression()), !dbg !11\n  call void @llvm.dbg.label(metadata !13)"
+            )
+        },
+        |v| {
+            format!(
+                "  tail call void @llvm.dbg.value(metadata i8 {v}, metadata !12, metadata !DIExpression(DW_OP_LLVM_fragment, 0, 8)), !dbg !11"
+            )
+        },
+    ];
+    for record in records {
+        let f = format!(
+            "define i8 @f(i8 %x, i1 %c) !dbg !5 {{\nentry:\n{}\n  \
+             br i1 %c, label %a, label %b, !dbg !11\na:\n  %y = add i8 %x, 1, !dbg !11\n{}\n  \
+             br label %m, !dbg !11\nb:\n  %z = sub i8 %x, 1, !dbg !11\n  br label %m\nm:\n  \
+             %r = phi i8 [ %y, %a ], [ %z, %b ], !dbg !11\n{}\n  ret i8 %r, !dbg !11\n}}\n",
+            record("%x"),
+            record("%y"),
+            record("%r"),
+        );
+        let r = tv1(&plain, &f);
+        assert!(matches!(r.verdict(), Verdict::Valid), "{f}\n{r}");
+    }
+    // Records of every kind before the first instruction of a block without a label.
+    let r = tv1(
+        "define i8 @f(i8 %x) {\n  %y = add i8 %x, 1\n  ret i8 %y\n}\n",
+        "define i8 @f(i8 %x) !dbg !5 {\n    #dbg_declare(ptr undef, !12, !DIExpression(), !11)\n    \
+         #dbg_assign(i8 %x, !12, !DIExpression(), !14, ptr undef, !DIExpression(), !11)\n  \
+         notail call void @llvm.dbg.label(metadata !13) #3\n  %y = add i8 %x, 1, !dbg !11\n  \
+         ret i8 %y, !dbg !11\n}\n",
+    );
+    assert!(matches!(r.verdict(), Verdict::Valid), "{r}");
 }
 
 #[test]

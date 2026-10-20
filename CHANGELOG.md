@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Fixes.** The LLVM IR reader (`lift::llvm`, `transform::pairs`, `bitwright lift` and `tv`)
+  refused four things LLVM writes. Block labels are read by LLVM's grammar for labels, a name
+  of `[-a-zA-Z$._0-9]` or a quoted one, followed by its colon: a label that starts with a dot
+  (`.lr.ph:`, `.preheader:`, as optimizations name blocks) was a syntax error, and one with a
+  hyphen (`if-then:`) was not read as a label, so a branch to it named an unknown block. A
+  quoted name holding a bracket (`%"a[b"`) opened a statement over the lines after it.
+  Metadata after a `phi`'s last pair (`, !dbg !7`, `, !annotation !0`) was read as one more
+  pair; it is read as on any other instruction: debug locations and annotations are skipped,
+  and a kind bitwright does not model makes a target unsupported. Debug records are skipped,
+  as the book says debug metadata is: a `#dbg_value(…)` line (LLVM 19 on) was not an
+  instruction, and a call of `@llvm.dbg.value` and the other `llvm.dbg` intrinsics (before)
+  not one bitwright knows, so no function compiled with `-g` could be read. Present since
+  0.11.0.
+- **Behavior changes.** A label's colon must follow it directly, as LLVM requires: `entry :`
+  was read as a label and is now a syntax error.
+
 ## 0.21.1
 
 - **Fixes.** Soundness: a step the MBA certifier's compositional test proved on its way to the
