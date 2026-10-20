@@ -15,6 +15,14 @@
 //! `f_t | ~M` (`u` all-ones), `f_u ^ M` (`t` the complement of `u`) and `f_u ^ (f_{t^u} & M)`,
 //! with `f` the minimum forms (and the same with the roles swapped). The compares pass decides
 //! `a == b` by the same tables: equal tables in every class, or complementary ones in some.
+//!
+//! *Wider regions.* Above three atoms a region is an atom of the regions over it, which can
+//! hide that a function depends on few of the atoms below: a node one of whose atoms is such a
+//! region is read again over up to six atoms (a 64-entry table, one `u64`), through every
+//! region of at most six, and when its table depends on three atoms or fewer it is written as
+//! their minimum form. So masking that cancels over more atoms comes apart:
+//! `((a ^ m) & (b ^ n)) ^ ((a ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)` is `a & b`. Constants are
+//! atoms there, so a node of more than three atoms is read by classes first.
 
 use std::sync::OnceLock;
 
@@ -27,6 +35,19 @@ use crate::ops::{BinOp, UnOp};
 /// The truth tables of the three atoms: bit `i` is the atom's value in combination `i`, where
 /// atom `k` is 1 exactly when bit `k` of `i` is.
 const VARS: [u8; 3] = [0xAA, 0xCC, 0xF0];
+
+/// The most atoms of a wide description: its table has 2^6 entries, one `u64`.
+const WIDE: usize = 6;
+
+/// The truth tables of six atoms, as [`VARS`] for three.
+const WIDE_VARS: [u64; WIDE] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
 
 /// A node of a minimum-form template.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -209,6 +230,22 @@ pub(crate) fn subtables(t: &[T]) -> Vec<u8> {
 /// table over them; `None` for a node with more than three atoms.
 pub(crate) type Info = Option<(Vec<u32>, u8)>;
 
+/// A node's description over at most [`WIDE`] atoms, read through every bitwise region of at
+/// most that many: its atoms (sorted by index) and its table over them, entries past the atoms
+/// repeating (over three atoms or fewer, its first eight entries are a table as [`Info`] has).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Wide {
+    atoms: [u32; WIDE],
+    len: u8,
+    tt: u64,
+}
+
+impl Wide {
+    fn atoms(&self) -> &[u32] {
+        &self.atoms[..usize::from(self.len)]
+    }
+}
+
 /// Drops the atoms `tt` does not depend on.
 fn prune(atoms: Vec<u32>, tt: u8) -> (Vec<u32>, u8) {
     let mut keep: Vec<u32> = Vec::new();
@@ -327,6 +364,166 @@ fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop
         r.bitwise.insert(i, info);
     }
     Ok(r.bitwise[&root].clone())
+}
+
+/// Table `tt` with its variables `a < b` exchanged (a delta swap of the entries that differ).
+fn swap_vars(tt: u64, a: usize, b: usize) -> u64 {
+    let d = (1u32 << b) - (1u32 << a);
+    // Each entry with `a` set and `b` clear, and its partner `d` above.
+    let t = ((tt >> d) ^ tt) & WIDE_VARS[a] & !WIDE_VARS[b];
+    tt ^ t ^ (t << d)
+}
+
+/// Re-expresses wide table `tt` over atoms `from` as a table over `to` (a superset; both sorted
+/// by index): each atom's variable moves up to its place in `to`, the highest first, onto a
+/// variable the table does not read.
+fn remap_wide(tt: u64, from: &[u32], to: &[u32]) -> u64 {
+    let mut tt = tt;
+    let mut p = to.len();
+    for (k, a) in from.iter().enumerate().rev() {
+        while to[p - 1] != *a {
+            p -= 1;
+        }
+        p -= 1;
+        if p > k {
+            tt = swap_vars(tt, k, p);
+        }
+    }
+    tt
+}
+
+/// Drops the atoms of `atoms` (sorted by index) that table `tt` does not depend on: each kept
+/// atom's variable moves down to its place among them, the lowest first.
+fn prune_wide(atoms: &[u32], tt: u64) -> Wide {
+    let mut out = Wide {
+        atoms: [0; WIDE],
+        len: 0,
+        tt,
+    };
+    for (k, &a) in atoms.iter().enumerate() {
+        // The table with atom `k` flipped.
+        let (v, s) = (WIDE_VARS[k], 1u32 << k);
+        if (tt & v) >> s | (tt & !v) << s == tt {
+            continue;
+        }
+        let m = usize::from(out.len);
+        if m < k {
+            out.tt = swap_vars(out.tt, m, k);
+        }
+        out.atoms[m] = a;
+        out.len += 1;
+    }
+    out
+}
+
+/// The wide description of node `i` as an atom (or a constant).
+fn wide_leaf(cx: &Context, i: u32) -> Wide {
+    let mut w = Wide {
+        atoms: [0; WIDE],
+        len: 0,
+        tt: 0,
+    };
+    match cx.const_val(i) {
+        Some(v) if v.is_zero() => {}
+        Some(v) if v.is_ones() => w.tt = u64::MAX,
+        _ => (w.atoms[0], w.len, w.tt) = (i, 1, WIDE_VARS[0]),
+    }
+    w
+}
+
+/// The wide description of bitwise node `i` from its operands' (`b` is `a` for `~`); over more
+/// than [`WIDE`] atoms, `i` is an atom.
+fn wide_op(cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
+    // The operands' atoms merged, in index order.
+    let mut atoms = [0u32; 2 * WIDE];
+    let (mut n, mut x, mut y) = (0, a.atoms().iter().peekable(), b.atoms().iter().peekable());
+    while let Some(&next) = match (x.peek(), y.peek()) {
+        (Some(&&p), Some(&&q)) if p == q => {
+            y.next();
+            x.next()
+        }
+        (Some(&&p), Some(&&q)) if q < p => y.next(),
+        (Some(_), _) => x.next(),
+        (None, _) => y.next(),
+    } {
+        atoms[n] = next;
+        n += 1;
+    }
+    if n > WIDE {
+        return wide_leaf(cx, i);
+    }
+    let atoms = &atoms[..n];
+    let (ta, tb) = (
+        remap_wide(a.tt, a.atoms(), atoms),
+        remap_wide(b.tt, b.atoms(), atoms),
+    );
+    let tt = match cx.node(i).op {
+        OpCode::Not => !ta,
+        OpCode::And => ta & tb,
+        OpCode::Or => ta | tb,
+        _ => ta ^ tb,
+    };
+    prune_wide(atoms, tt)
+}
+
+/// The wide description of `i` if it needs no computing: cached, an atom, or the three-atom
+/// reading's where that reads no region of more than three atoms (the same atoms and function,
+/// its table repeated).
+fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
+    if !bitwise_op(cx.node(i).op) {
+        return Some(wide_leaf(cx, i));
+    }
+    if let Some(&w) = r.bitwise_wide.get(&i) {
+        return Some(w);
+    }
+    match r.bitwise.get(&i) {
+        Some(Some((atoms, tt)))
+            if atoms[..] != [i] && atoms.iter().all(|&a| !bitwise_op(cx.node(a).op)) =>
+        {
+            let mut w = Wide {
+                atoms: [0; WIDE],
+                len: atoms.len() as u8,
+                tt: u64::from(*tt) * 0x0101_0101_0101_0101,
+            };
+            w.atoms[..atoms.len()].copy_from_slice(atoms);
+            Some(w)
+        }
+        _ => None,
+    }
+}
+
+/// The wide description of `root`, computing (iteratively) and caching those below it that
+/// [`known_wide`] does not give.
+fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop> {
+    if let Some(w) = known_wide(r, cx, root) {
+        return Ok(w);
+    }
+    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+    while let Some((i, expanded)) = stack.pop() {
+        if r.bitwise_wide.contains_key(&i) {
+            continue;
+        }
+        let node = cx.node(i);
+        if !expanded {
+            stack.push((i, true));
+            for c in node.children() {
+                if known_wide(r, cx, c).is_none() {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        r.meter.charge(Counter::PassWork, 1)?;
+        let known = |c: u32| known_wide(r, cx, c).expect("operands come first");
+        let a = known(node.a);
+        let b = if node.op == OpCode::Not {
+            a
+        } else {
+            known(node.b)
+        };
+        r.bitwise_wide.insert(i, wide_op(cx, i, a, b));
+    }
+    Ok(r.bitwise_wide[&root])
 }
 
 /// Builds the minimum form of `tt` over `atoms` (in the order the table's variables use).
@@ -701,6 +898,41 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
     finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
 }
 
+/// Writes the function `tt` of `atoms` (at most three, sorted by index) at `n` as its minimum
+/// form, when that is smaller; `fin` is what the node's candidates declined so far contribute.
+fn write(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    atoms: &[u32],
+    tt: u8,
+    fin: Fin,
+) -> Result<Step, Stop> {
+    // Canonical variable order: the context's order of the atoms, independent of indices.
+    let mut canon = atoms.to_vec();
+    canon.sort_by(|a, b| cx.order(*a, *b));
+    let tt_c = remap(tt, atoms, &canon);
+    // Upper bound on new nodes: the template's operators and constants.
+    if let Some(f) = worth_building(r, cx, n, atoms, cost(tt_c))? {
+        r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
+        return Ok(Step::Normal(fin.and(f)));
+    }
+    let before = cx.len() as u32;
+    // A constant needs a width: when the function ignores every atom, use the node's.
+    let e = if canon.is_empty() {
+        let w = cx.width_of(n);
+        let v = if tt == 0 {
+            BitVec::zero(w)
+        } else {
+            BitVec::ones(w)
+        };
+        r.build(cx, |cx| cx.mk_const(&v))?
+    } else {
+        emit(r, cx, tt_c, &canon)?
+    };
+    finish(r, cx, PassKind::Bitwise, n, e, before, atoms, fin)
+}
+
 /// The bitwise pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if !bitwise_op(cx.node(n).op) {
@@ -709,37 +941,91 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
         return Ok(Step::Normal(Fin::FINAL));
     };
-    // More than three atoms (constants included): by classes of bit positions, where the
-    // constants are not atoms.
-    if atoms == [n] {
-        return masked_step(r, cx, n);
-    }
-    // Canonical variable order: the context's order of the atoms, independent of indices.
-    let mut canon = atoms.clone();
-    canon.sort_by(|a, b| cx.order(*a, *b));
-    let tt_c = remap(tt, &atoms, &canon);
-    // Upper bound on new nodes: the template's operators and constants.
-    let estimate = min_forms().forms[tt_c as usize]
-        .0
-        .iter()
-        .filter(|t| !matches!(t, T::Var(_)))
-        .count() as u32;
-    if let Some(f) = worth_building(r, cx, n, &atoms, estimate)? {
-        r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
-        return Ok(Step::Normal(Fin::FINAL.and(f)));
-    }
-    let before = cx.len() as u32;
-    // A constant needs a width: when the function ignores every atom, use the node's.
-    let e = if canon.is_empty() {
-        let w = cx.width_of(n);
-        let v = if tt == 0 {
-            crate::BitVec::zero(w)
-        } else {
-            crate::BitVec::ones(w)
-        };
-        r.build(cx, |cx| cx.mk_const(&v))?
+    // More than three atoms (constants included): `n` is an atom itself, read first by classes
+    // of bit positions, where the constants are not atoms.
+    let first = if atoms == [n] {
+        masked_step(r, cx, n)?
     } else {
-        emit(r, cx, tt_c, &canon)?
+        write(r, cx, n, &atoms, tt, Fin::FINAL)?
     };
-    finish(r, cx, PassKind::Bitwise, n, e, before, &atoms, Fin::FINAL)
+    let mut fin = match first {
+        Step::Normal(f) => f,
+        done => return Ok(done),
+    };
+    // An atom that is a bitwise region of its own may hide that `n` reads three atoms or fewer
+    // below it (see the module notes); read over more than six, `n` is an atom again.
+    if atoms.iter().any(|&a| bitwise_op(cx.node(a).op)) {
+        let wide = wide_of(r, cx, n)?;
+        if wide.atoms().len() <= 3 && wide.atoms() != atoms && wide.atoms() != [n] {
+            match write(r, cx, n, wide.atoms(), wide.tt as u8, fin)? {
+                Step::Normal(f) => fin = f,
+                done => return Ok(done),
+            }
+        }
+    }
+    Ok(Step::Normal(fin))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `tt` over `from` as a table over `to`, entry by entry.
+    fn reference(tt: u64, from: &[u32], to: &[u32]) -> u64 {
+        (0..64).fold(0, |out, i| {
+            let j = from.iter().enumerate().fold(0, |j, (k, a)| {
+                let p = to.iter().position(|b| b == a).unwrap();
+                j | ((i >> p) & 1) << k
+            });
+            out | ((tt >> j) & 1) << i
+        })
+    }
+
+    /// A random table over `m` variables (its entries repeating past them).
+    fn table(state: &mut u64, m: usize) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (0..64).fold(0, |out, i| out | ((*state >> (i % (1 << m))) & 1) << i)
+    }
+
+    /// The atoms of subset `s` of `ids`.
+    fn subset(ids: &[u32], s: usize) -> Vec<u32> {
+        (0..ids.len())
+            .filter(|k| s >> k & 1 == 1)
+            .map(|k| ids[k])
+            .collect()
+    }
+
+    #[test]
+    fn wide_tables_move_between_atom_sets() {
+        let ids = [3, 5, 8, 9, 12, 20];
+        let mut state = 0x7769_6465;
+        for big in 0..64usize {
+            let to = subset(&ids, big);
+            // Every subset of `to`, with tables over it.
+            for small in (0..64usize).filter(|s| s & !big == 0) {
+                let from = subset(&ids, small);
+                for _ in 0..4 {
+                    let tt = table(&mut state, from.len());
+                    assert_eq!(
+                        remap_wide(tt, &from, &to),
+                        reference(tt, &from, &to),
+                        "{from:?} -> {to:?}, {tt:#x}"
+                    );
+                }
+            }
+            // A table over all six that reads exactly `to`: pruning finds `to`, and its table.
+            let mut tt = table(&mut state, to.len());
+            while (0..to.len()).any(|k| {
+                let (v, s) = (WIDE_VARS[k], 1u32 << k);
+                (tt & v) >> s | (tt & !v) << s == tt
+            }) {
+                tt = table(&mut state, to.len());
+            }
+            let p = prune_wide(&ids, reference(tt, &to, &ids));
+            assert_eq!(p.atoms(), &to[..]);
+            assert_eq!(p.tt, tt, "{to:?}");
+        }
+    }
 }

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Bitwise functions over up to six atoms.** The bitwise pass reads a function of at most three
+  atoms and takes a region of more than three as one atom, which hid that a function depends
+  on few of the atoms below: Boolean masking over more atoms was left as it was by every
+  strategy (`((a ^ m) & (b ^ n)) ^ ((a ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)` is `a & b`, and
+  with `^ (a & b)` it is 0). A node one of whose atoms is such a region is now read again flat,
+  over up to six atoms (a 64-entry table, one `u64`; regions of more than six are atoms, and
+  so are constants, so a node of more than three atoms is read by classes first), and written
+  as the minimum form of the three atoms or fewer it depends on. In every strategy.
+- **Carry networks** (`Phase::Carries`, feature `prove`; in `Strategy::deobfuscate()` only):
+  additions and subtractions written out as `& | ^ ~` and constant left shifts over up to three
+  atoms (parallel-prefix adders and subtractors, ripple chains of up to about 40 bits) become
+  the affine form they compute (`x + y`, `x − y`). The form is read off the network's values
+  at 0 and at each atom alone, checked at 64 fixed points (some near the region's constants,
+  where a sum with one carries far), and committed only when the native prover proves it
+  equal, on a copy of the region in a scratch context with a fresh symbol for each atom (its
+  own simplification off, so it never re-enters the engine), within 2^16 AIG nodes and 2^22
+  propagations and within what is left of the pass work (4 units a propagation). A truncated
+  or miswired prefix tree, or one wrong only at inputs the points miss, is left as it is; so is
+  a network the prover does not decide within its caps (a ripple chain of 48 bits or more),
+  and every region holding it is not asked again. `bitwright simplify` turns the 8- to 64-bit
+  prefix adders and subtractors that only `--synth` recovered into `x + y` and `x - y` (0.03 s
+  for the 32-bit adder; the 64-bit subtractor's proof takes 1.24 M propagations).
+  `PassCounts` gains `proofs`, `proved`, `refuted` and `unknown`.
 - **Fixes.** The LLVM IR reader (`lift::llvm`, `transform::pairs`, `bitwright lift` and `tv`)
   refused four things LLVM writes. Block labels are read by LLVM's grammar for labels, a name
   of `[-a-zA-Z$._0-9]` or a quoted one, followed by its colon: a label that starts with a dot
@@ -15,8 +38,22 @@
   instruction, and a call of `@llvm.dbg.value` and the other `llvm.dbg` intrinsics (before)
   not one bitwright knows, so no function compiled with `-g` could be read. Present since
   0.11.0.
-- **Behavior changes.** A label's colon must follow it directly, as LLVM requires: `entry :`
-  was read as a label and is now a syntax error.
+- **Behavior changes.** Results change only where they get smaller. On CoBRA's 76,080
+  expressions (`compare/`'s `bw-nf`) 3 answers change, none wrong: three `oses_fast` lines
+  (371, 397, 399) from 489, 29 and 28 nodes to 488, 16 and 16. `--corpus-diff`: the random
+  DAGs' results are 17 nodes smaller in all at 8 and at 64 bits under the signature solver,
+  and 11 and 17 under the defaults; the MBA corpora's are unchanged. `simplify/mba-native/*`
+  ends at 80 nodes instead of 82 (two `a << 1` written `a + a`, which needs no constant). A
+  label's colon must follow it directly, as LLVM requires: `entry :` was read as a label and
+  is now a syntax error. `--prover-budgets` (the prover's simplification runs the deobfuscation
+  strategy) settles the same questions at every fuel; the MBA-heavy question spends 152,423
+  units of pass work instead of 151,951.
+- Benchmarks: instructions against 0.21.1, medians of three runs back to back:
+  `simplify/standard/*` +0.6 % to +0.7 % (the flat reading), `simplify/mba/*` +1.6 % to
+  +1.8 % and `simplify/mba-nonlinear-sig/64` +1.8 % (the carries walk), `simplify/mba-native/*`
+  −2.8 % to −2.9 % (smaller results), `compile/standard-200/64` −4.4 % and its rerun −4.5 %;
+  the others within ±1 % but `simplify/tiny-context/64`, about +1 % (it varies by 2 % between
+  processes).
 
 ## 0.21.1
 

@@ -23,7 +23,8 @@ C++ and Python as well as Rust. It gives you three things:
 For deobfuscation, bitwright undoes mixed boolean-arithmetic, linear and nonlinear, with its
 own solver and proofs; folds opaque predicates from what is known about their operands; brings
 back the comparisons that lifted flag computations stand for, integer and floating-point;
-recognizes rotations, byte swaps and extensions in bit shuffles; turns a compiler's
+recognizes rotations, byte swaps and extensions in bit shuffles, and additions and
+subtractions written out as carry networks; turns a compiler's
 multiplications by magic numbers back into the divisions and remainders they compute; and
 reduces checks of keyed hashes to their one solution. It works under path constraints, and each result says which of
 them it relied on.

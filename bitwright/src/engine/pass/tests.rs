@@ -343,7 +343,7 @@ fn bitwise_table_is_exact_and_sized() {
     assert_eq!(forms[0xAA ^ 0xCC ^ 0xF0].1, 2);
 }
 
-/// A random bitwise expression over up to four atoms (so some regions are over the cap).
+/// A random bitwise expression over up to six atoms (so some regions are over the caps).
 fn bitwise_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32, atoms: u64) -> Expr {
     let width = Width::new(w).unwrap();
     if depth == 0 || g.rng.chance(1, 5) {
@@ -351,7 +351,7 @@ fn bitwise_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32, atoms: u64) -
             0 => cx.constant(&crate::BitVec::zero(width)).unwrap(),
             1 => cx.constant(&crate::BitVec::ones(width)).unwrap(),
             k => {
-                let name = ["a", "b", "c", "d"][(k - 2) as usize];
+                let name = ["a", "b", "c", "d", "e", "f"][(k - 2) as usize];
                 let s = cx.symbol(name, width).unwrap();
                 if name == "d" {
                     // A non-bitwise atom.
@@ -391,7 +391,7 @@ fn bitwise_is_sound_minimal_and_idempotent() {
         } else {
             1 + g.rng.below(6) as u16
         };
-        let atoms = 2 + g.rng.below(3);
+        let atoms = 2 + g.rng.below(5);
         let e = bitwise_expr(&mut g, &mut cx, w, 5, atoms);
         let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
         let r = out.roots[0];
@@ -436,6 +436,63 @@ fn bitwise_fixtures() {
     same("(d & ~b & ~a & ((b & c) | b)) | ~(d | a)", "~(a | d)");
     // Atoms may be arbitrary subterms.
     same("((p + q) & r) | ((p + q) & ~r)", "p + q");
+}
+
+#[test]
+fn bitwise_reads_masking_over_six_atoms() {
+    for eng in [engine(vec![Phase::Bitwise]), Engine::standard()] {
+        let same = |src: &str, want: &str| {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::W32);
+            let e = cx.parse(src, &o).unwrap();
+            let w = cx.parse(want, &o).unwrap();
+            let out = eng.simplify(&mut cx, e).unwrap();
+            assert_eq!(out.expr, w, "{src}: got {}", cx.display(out.expr));
+        };
+        // Boolean shares of `a & b` (masks `m`, `n`), and of `a & b & c` (six atoms).
+        let share = "((a ^ m) & (b ^ n)) ^ ((a ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)";
+        same(share, "a & b");
+        same(&format!("{share} ^ (a & b)"), "0");
+        same(
+            "((a ^ m) & (b ^ n) & (c ^ o)) ^ ((a ^ m) & (b ^ n) & o) ^ ((a ^ m) & n & (c ^ o)) \
+             ^ ((a ^ m) & n & o) ^ (m & (b ^ n) & (c ^ o)) ^ (m & (b ^ n) & o) \
+             ^ (m & n & (c ^ o)) ^ (m & n & o)",
+            "a & b & c",
+        );
+        // Atoms may be subterms or constants.
+        same(
+            "(((p + q) ^ m) & (b ^ n)) ^ (((p + q) ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)",
+            "(p + q) & b",
+        );
+        same(
+            "((a ^ 0x5a) & (b ^ n)) ^ ((a ^ 0x5a) & n) ^ (0x5a & (b ^ n)) ^ (0x5a & n)",
+            "a & b",
+        );
+        // Read flat, this depends on four atoms; the three-atom reading still writes it over
+        // the region of four as one atom.
+        same(
+            "((a ^ b ^ c ^ d) & x) | ((a ^ b ^ c ^ d) & ~x)",
+            "a ^ b ^ c ^ d",
+        );
+    }
+}
+
+#[test]
+fn bitwise_reads_constants_by_classes_before_reading_wide() {
+    let eng = engine(vec![Phase::Bitwise]);
+    let o = ParseOptions::width(Width::W8);
+    // Four atoms with the constants: by classes, the constants fold (`~(0x36 ^ 0xc5)` is 12);
+    // read wide, they would be atoms of the form.
+    let mut cx = Context::new();
+    let e = cx.parse("~(b ^ 0x36 ^ 0xc5) ^ (b ^ d)", &o).unwrap();
+    let want = cx.parse("d ^ 12", &o).unwrap();
+    assert_eq!(eng.simplify(&mut cx, e).unwrap().expr, want);
+    // Over more than six atoms the wide reading is the node itself: nothing to write.
+    let mut cx = Context::new();
+    let e = cx.parse("(a ^ b ^ c ^ d) | (e ^ f ^ g ^ h)", &o).unwrap();
+    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+    assert!(!out.roots[0].changed);
+    assert_eq!(out.stats.passes["bitwise"].noop, 0);
 }
 
 #[test]
@@ -4178,4 +4235,295 @@ fn linear_merges_both_readings_of_a_condition() {
         .unwrap();
     let e = cx.bin(BinOp::Add, p, five).unwrap();
     assert_eq!(std.simplify(&mut cx, e).unwrap().expr, e);
+}
+
+/// A parallel-prefix adder (or, with `sub`, subtractor) of `x` and `y` with its first `levels`
+/// levels (shifts 1, 2, 4, …; a network of `w` bits needs `log2(w)`, see [`full_levels`]);
+/// `shift` overrides some levels' shifts and `extra` is xor-ed into the result.
+#[cfg(feature = "prove")]
+fn prefix_network(sub: bool, levels: usize, shift: &[(usize, u32)], extra: &str) -> String {
+    let mut s = String::from("let s = x ^ y; ");
+    s += if sub {
+        "let p0 = ~s; let g0 = ~x & y; "
+    } else {
+        "let p0 = s; let g0 = x & y; "
+    };
+    for k in 0..levels {
+        let sh = shift
+            .iter()
+            .find(|&&(l, _)| l == k)
+            .map_or(1u32 << k, |&(_, v)| v);
+        s += &format!(
+            "let g{n} = g{k} | (p{k} & (g{k} << {sh})); let p{n} = p{k} & (p{k} << {sh}); ",
+            n = k + 1
+        );
+    }
+    s += &format!("s ^ (g{levels} << 1){extra}");
+    s
+}
+
+#[cfg(feature = "prove")]
+fn full_levels(w: u16) -> usize {
+    (u16::BITS - (w - 1).leading_zeros()) as usize
+}
+
+#[cfg(feature = "prove")]
+fn deobfuscator() -> Engine {
+    Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .verify(Verify::strict())
+        .build()
+        .unwrap()
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recovers_prefix_adders_and_subtractors() {
+    let eng = deobfuscator();
+    for w in [8u16, 13, 16, 32, 33, 64] {
+        for (sub, want) in [(false, "x + y"), (true, "x - y")] {
+            let mut cx = Context::new();
+            let src = prefix_network(sub, full_levels(w), &[], "");
+            let e = cx
+                .parse(&src, &ParseOptions::width(Width::new(w).unwrap()))
+                .unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert_eq!(
+                cx.display(out.roots[0].expr).to_string(),
+                want,
+                "{w} bits: {src}"
+            );
+            assert_eq!(out.roots[0].end, End::Completed);
+            let c = out.stats.passes["carries"];
+            assert_eq!((c.proved, c.changed), (1, 1), "{w} bits: {c:?}");
+        }
+    }
+}
+
+/// A ripple chain adding `a` and `b` (texts) at `w` bits: `w` half additions, each sum
+/// `a ^ b` and carry `(a & b) << 1`.
+#[cfg(feature = "prove")]
+fn ripple_sum(a: &str, b: &str, w: u16) -> String {
+    let mut s = format!("let a0 = {a}; let b0 = {b}; ");
+    for k in 0..w {
+        s += &format!(
+            "let a{n} = a{k} ^ b{k}; let b{n} = (a{k} & b{k}) << 1; ",
+            n = k + 1
+        );
+    }
+    s + &format!("a{w}")
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recovers_ripple_chains_constants_and_three_atoms() {
+    let eng = deobfuscator();
+    let same = |src: &str, want: &str, w: u16| -> crate::engine::PassCounts {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(
+            out.roots[0].expr,
+            want,
+            "{w} bits: {}",
+            cx.display(out.roots[0].expr)
+        );
+        out.stats.passes["carries"]
+    };
+    same(&ripple_sum("x", "y", 32), "x + y", 32);
+    // With a constant, long carries happen only near `−K`: points there keep the partial sums
+    // from the prover.
+    let c = same(&ripple_sum("x", "0x55555555", 32), "x + 0x55555555", 32);
+    assert!(c.refuted <= 1, "{c:?}");
+    // Three atoms: a carry-save step, then a prefix adder of its sum and carries.
+    let mut s = String::from(
+        "let u = x ^ y ^ z; let v = ((x & y) | (x & z) | (y & z)) << 1; \
+         let s = u ^ v; let p0 = s; let g0 = u & v; ",
+    );
+    for k in 0..4 {
+        s += &format!(
+            "let g{n} = g{k} | (p{k} & (g{k} << {sh})); let p{n} = p{k} & (p{k} << {sh}); ",
+            n = k + 1,
+            sh = 1 << k
+        );
+    }
+    s += "s ^ (g4 << 1)";
+    same(&s, "x + y + z", 16);
+}
+
+#[cfg(feature = "prove")]
+#[test]
+#[ignore = "heavy: a proof to the pass's caps; run with --release -- --ignored"]
+fn carries_asks_a_region_past_its_caps_once() {
+    // A 48-bit ripple chain is past the proof's caps; the region holding it, its double, is
+    // larger still, and is not asked.
+    let eng = deobfuscator();
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(48).unwrap());
+    let src = format!("{} << 1", ripple_sum("x", "y", 48));
+    let e = cx.parse(&src, &o).unwrap();
+    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+    let mut rng = Rng(48);
+    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+    let c = out.stats.passes["carries"];
+    assert_eq!((c.proved, c.unknown), (0, 1), "{c:?}");
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_leaves_a_prefix_tree_missing_its_last_level() {
+    let eng = deobfuscator();
+    let mut rng = Rng(7);
+    for w in [8u16, 16, 32, 64] {
+        for sub in [false, true] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::new(w).unwrap());
+            let e = cx
+                .parse(&prefix_network(sub, full_levels(w) - 1, &[], ""), &o)
+                .unwrap();
+            let sum = cx.parse(if sub { "x - y" } else { "x + y" }, &o).unwrap();
+            // Truncated, it is not the sum.
+            assert!(matches!(
+                crate::prove::equal(&mut cx, e, sum, &crate::prove::Config::default()).unwrap(),
+                crate::prove::Outcome::Refuted(_)
+            ));
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert_ne!(r, sum, "{w} bits");
+            assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits");
+            let c = out.stats.passes["carries"];
+            assert_eq!((c.proved, c.changed), (0, 0), "{w} bits: {c:?}");
+        }
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_refutes_a_network_wrong_only_at_rare_inputs() {
+    // The adder xor a term that is nonzero only where `x` has 16 alternating bits under a set
+    // bit of `y`: none of the pass's points has that, so only the proof tells.
+    let rare: String = (0..16)
+        .map(|k| match (k, k % 2) {
+            (0, _) => "x".to_string(),
+            (_, 0) => format!(" & (x << {k})"),
+            _ => format!(" & ~(x << {k})"),
+        })
+        .collect();
+    let eng = deobfuscator();
+    let mut rng = Rng(11);
+    for w in [32u16, 64] {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let src = prefix_network(false, full_levels(w), &[], &format!(" ^ ({rare} & y)"));
+        let e = cx.parse(&src, &o).unwrap();
+        let sum = cx.parse("x + y", &o).unwrap();
+        assert!(matches!(
+            crate::prove::equal(&mut cx, e, sum, &crate::prove::Config::default()).unwrap(),
+            crate::prove::Outcome::Refuted(_)
+        ));
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0].expr;
+        assert_ne!(r, sum, "{w} bits");
+        assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits");
+        let c = out.stats.passes["carries"];
+        // The adder inside may become `x + y`; the whole is refuted.
+        assert!(c.refuted >= 1, "{w} bits: {c:?}");
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_proves_within_what_is_left() {
+    let eng = deobfuscator();
+    let o = ParseOptions::width(Width::W32);
+    let src = prefix_network(false, 5, &[], "");
+    let nodes = super::carries::MAX_AIG_NODES as u64;
+    // Room for a few hundred propagations: the proof (about 100,000) stops short, and the root
+    // is not final.
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let short = Budget::default().with_pass_work(nodes + 4_000);
+    let out = eng
+        .run(&mut cx, &[e], Run::default().with_per_call(short))
+        .unwrap();
+    assert_ne!(cx.display(out.roots[0].expr).to_string(), "x + y");
+    assert_eq!(
+        out.roots[0].end,
+        End::BudgetTerminated(crate::engine::Exhausted::PassWork)
+    );
+    assert_eq!(out.stats.passes["carries"].proved, 0);
+    // Less than a capped proof's whole cost is enough for this one.
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let enough = Budget::default().with_pass_work(nodes + (1 << 20));
+    let out = eng
+        .run(&mut cx, &[e], Run::default().with_per_call(enough))
+        .unwrap();
+    assert_eq!(cx.display(out.roots[0].expr).to_string(), "x + y");
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_is_sound_on_mutated_networks() {
+    // 6-bit networks (shifts 1, 2, 4), some miswired: every result is checked at every input.
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0xca44);
+    let o = ParseOptions::width(Width::new(6).unwrap());
+    let (mut changed, mut refuted) = (0, 0);
+    for _ in 0..200 {
+        let sub = rng.chance(1, 2);
+        let levels = 1 + rng.below(3) as usize;
+        let mut shift = Vec::new();
+        if rng.chance(1, 2) {
+            shift.push((rng.below(levels as u64) as usize, 1 + rng.below(5) as u32));
+        }
+        let extra = match rng.below(4) {
+            0 => " ^ (x & (x << 1) & y)",
+            1 => " ^ (y << 5)",
+            _ => "",
+        };
+        let src = prefix_network(sub, levels, &shift, extra);
+        let mut cx = Context::new();
+        let e = cx.parse(&src, &o).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(
+            equivalent(&mut cx, e, out.roots[0].expr, &mut rng),
+            "{src} became {}",
+            cx.display(out.roots[0].expr)
+        );
+        let c = out.stats.passes["carries"];
+        changed += c.changed;
+        refuted += c.refuted;
+    }
+    assert!(changed > 0 && refuted > 0, "{changed} {refuted}");
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_reads_shifts_of_one_atom_exactly() {
+    // `a << k` is `2^k·a`, and 0 once the shifts reach the width: no proof needed, so none is
+    // taken, and every result is equal to its input. (Inner shifts by more than 1 are their
+    // own form, so the chain is read whole; `a << 1` alone becomes `a + a`.)
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0x5e1f);
+    for w in [8u16, 64] {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        for (src, want) in [
+            ("(x << 2) << 3".to_string(), "x << 5".to_string()),
+            ("((x << 3) << 2) << 1".into(), "x << 6".into()),
+            (format!("(x << {}) << 3", w - 2), format!("0:{w}")),
+            ("x << 1".into(), "x + x".into()),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert_eq!(cx.display(r).to_string(), want, "{w} bits: {src}");
+            assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
+            assert_eq!(out.stats.passes["carries"].proofs, 0, "{w} bits: {src}");
+        }
+    }
 }

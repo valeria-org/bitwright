@@ -112,7 +112,7 @@ impl Tool {
         match self {
             Tool::Standard => "bitwright, Strategy::standard()",
             Tool::Deobfuscate => {
-                "bitwright, Strategy::deobfuscate() (linear MBA and shuffle passes)"
+                "bitwright, Strategy::deobfuscate() (carries, linear MBA and shuffle passes)"
             }
             Tool::Mba => {
                 "bitwright, deobfuscate with the MBA service and the native SignatureSolver"

@@ -63,7 +63,8 @@ pub enum Phase {
     Linear,
     /// Pure bitwise functions of at most three atoms become a minimum-size form of their truth
     /// table when that is smaller; constants (masks) are read per class of bit positions, not
-    /// as atoms.
+    /// as atoms; and, failing those, a function of up to six atoms (constants among them) that
+    /// depends on three or fewer becomes their minimum form.
     Bitwise,
     /// Xor sums `k ⊕ ⊕ᵢ (aᵢ & mᵢ)` over GF(2)^W are collected and re-emitted canonically when
     /// that is smaller: cancels boolean masking.
@@ -104,6 +105,17 @@ pub enum Phase {
     /// It undoes a compiler's strength reduction, which a compiler wants kept: only
     /// [`Strategy::deobfuscate`] runs it among the built-in strategies.
     Division,
+    /// Carry and borrow networks: `& | ^ ~` and left shifts by constants over at most three
+    /// atoms (a parallel-prefix adder or subtractor, a ripple chain written out of up to about
+    /// 40 bits) become the affine form `c + Σ aᵢ·xᵢ` they compute (`x + y`, `x − y`) when that
+    /// is smaller. The form is read off the network's values at 0 and at each atom alone,
+    /// checked at a fixed set of points, and committed only when the native prover proves it
+    /// equal, within the pass's own caps on the proof and what is left of the pass work; a
+    /// network the prover refutes or does not decide within its caps stays as it is (shifts of
+    /// one atom alone are `2^k·a` exactly, unproved). Only [`Strategy::deobfuscate`] runs it
+    /// among the built-in strategies.
+    #[cfg(feature = "prove")]
+    Carries,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -203,9 +215,10 @@ impl Strategy {
         )
     }
 
-    /// The standard strategy plus the deobfuscation passes (divisions by constants, linear MBA
-    /// and bit shuffles): `[FactFold, Local(core), Linear, Xor, Casts, Division, Invert,
-    /// Compares, Bitwise, LinearMba, Shuffle, Demanded, Local(core)]`, up to 4 rounds.
+    /// The standard strategy plus the deobfuscation passes (divisions by constants, carry
+    /// networks with feature `prove`, linear MBA and bit shuffles): `[FactFold, Local(core),
+    /// Linear, Xor, Casts, Division, Invert, Compares, Bitwise, Carries, LinearMba, Shuffle,
+    /// Demanded, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -227,6 +240,8 @@ impl Strategy {
                 Phase::Invert,
                 Phase::Compares,
                 Phase::Bitwise,
+                #[cfg(feature = "prove")]
+                Phase::Carries,
                 Phase::LinearMba,
                 Phase::Shuffle,
                 Phase::Demanded,
@@ -811,6 +826,11 @@ impl EngineBuilder {
                     id = combine(id, 13);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Division));
                 }
+                #[cfg(feature = "prove")]
+                Phase::Carries => {
+                    id = combine(id, 14);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Carries));
+                }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {
                     use core::hash::{Hash, Hasher};
@@ -1178,6 +1198,8 @@ struct Runner<'r, 'a> {
     linear: pass::forms::FormCache<pass::linear::Form>,
     /// The bitwise pass's truth tables, per node.
     bitwise: IdMap<u32, pass::bitwise::Info>,
+    /// The bitwise pass's tables over up to six atoms, per node (read where three hide some).
+    bitwise_wide: IdMap<u32, pass::bitwise::Wide>,
     /// Nodes whose bitwise region is beyond the bitwise pass's reading with constants (see
     /// `pass::bitwise`): so is every region above them.
     bitwise_beyond: IdMap<u32, ()>,
@@ -1198,6 +1220,9 @@ struct Runner<'r, 'a> {
     scratch: pass::Scratch,
     /// The linear-MBA pass's scratch.
     linear_mba: pass::linear_mba::Scratch,
+    /// The carries pass's scratch.
+    #[cfg(feature = "prove")]
+    carries: pass::carries::Scratch,
     /// The demanded-bits pass's memo, empty between calls.
     demanded: pass::demanded::Memo,
     /// The MBA solver's answers in this call, by question.
@@ -2152,6 +2177,7 @@ impl Engine {
             samples: IdMap::default(),
             linear: Default::default(),
             bitwise: IdMap::default(),
+            bitwise_wide: IdMap::default(),
             bitwise_beyond: IdMap::default(),
             xor: Default::default(),
             compares: IdMap::default(),
@@ -2162,6 +2188,8 @@ impl Engine {
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
+            #[cfg(feature = "prove")]
+            carries: Default::default(),
             demanded: Default::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),

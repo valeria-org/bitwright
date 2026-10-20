@@ -10,7 +10,7 @@ run in CI.
 | Tool | What runs |
 |-|-|
 | `bw-standard` | bitwright, `Strategy::standard()` |
-| `bw-deobf` | bitwright, `Strategy::deobfuscate()` (linear MBA and shuffle passes) |
+| `bw-deobf` | bitwright, `Strategy::deobfuscate()` (carries, linear MBA and shuffle passes) |
 | `bw-mba` | bitwright, deobfuscate with the MBA service and the native `SignatureSolver` |
 | `bw-nf` | bitwright, deobfuscate with the MBA service, the native `NormalFormSolver` and bitwright's own evidence only |
 | `bw-eqsat` | bitwright's equality saturation, every built-in equation group (`eqsat.bwr`) |

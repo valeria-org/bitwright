@@ -349,6 +349,14 @@ pub struct PassCounts {
     pub rejected: u64,
     /// Regions over the pass's size cap, treated as opaque atoms.
     pub atomized: u64,
+    /// Candidates sent to the native prover (the carries pass).
+    pub proofs: u64,
+    /// ... proved equal (and then committed if the commit rule allows).
+    pub proved: u64,
+    /// ... refuted by a counterexample.
+    pub refuted: u64,
+    /// ... not decided within the pass's caps on a proof.
+    pub unknown: u64,
 }
 
 impl PassCounts {
@@ -361,6 +369,10 @@ impl PassCounts {
             rejected_cost,
             rejected,
             atomized,
+            proofs,
+            proved,
+            refuted,
+            unknown,
         } = o;
         self.calls += calls;
         self.noop += noop;
@@ -368,6 +380,10 @@ impl PassCounts {
         self.rejected_cost += rejected_cost;
         self.rejected += rejected;
         self.atomized += atomized;
+        self.proofs += proofs;
+        self.proved += proved;
+        self.refuted += refuted;
+        self.unknown += unknown;
     }
 }
 

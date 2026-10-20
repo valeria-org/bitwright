@@ -3,13 +3,19 @@
 Obfuscators hide simple operations behind *mixed boolean-arithmetic* (MBA) identities, such as
 `x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back;
 code lifted from a binary also has the compiler's own disguises, such as divisions by constants
-done with multiplications. `Strategy::deobfuscate()` adds three passes to the standard strategy
+done with multiplications. `Strategy::deobfuscate()` adds four passes to the standard strategy
 for these (hash comparisons through invertible mixers are handled by the standard strategy; see
 [Invertibility](invertibility.md)):
 
 - **Divisions by constants.** The multiply-high sequences a compiler emits for `x / d` and
   `x % d` become `udiv`, `sdiv`, `urem` and `srem` again, when they are proved to be (see
   [below](#divisions-by-constants)).
+- **Carry networks.** Additions and subtractions written out as bitwise operations and shifts
+  (a parallel-prefix adder, a ripple chain of up to about 40 bits) over up to three atoms
+  become `x + y`, `x - y` or whatever affine form they compute: the pass reads the form off
+  the network's values, checks it at a fixed set of points, and commits it only when
+  bitwright's own prover proves it equal within the pass's caps (feature `prove`, on by
+  default; shifts of one atom, `2^k·a`, need no proof).
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature
   and emits the cheapest equivalent form it knows, if that is smaller.

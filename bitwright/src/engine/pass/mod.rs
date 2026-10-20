@@ -2,6 +2,8 @@
 //! are already normal) to a candidate replacement, committed only when it is strictly smaller.
 
 pub(crate) mod bitwise;
+#[cfg(feature = "prove")]
+pub(super) mod carries;
 mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
@@ -203,6 +205,9 @@ pub(crate) enum PassKind {
     /// The MBA service (the configuration lives in the phase).
     #[cfg_attr(not(feature = "mba"), allow(dead_code))]
     Mba,
+    /// Carry and borrow networks, proved by the native prover.
+    #[cfg(feature = "prove")]
+    Carries,
 }
 
 impl PassKind {
@@ -220,6 +225,8 @@ impl PassKind {
             PassKind::Invert => "invert",
             PassKind::Division => "division",
             PassKind::Mba => "mba",
+            #[cfg(feature = "prove")]
+            PassKind::Carries => "carries",
         }
     }
 }
@@ -245,6 +252,8 @@ pub(super) fn step(
         PassKind::Shuffle => shuffle::step(r, cx, n),
         PassKind::Invert => invert::step(r, cx, n),
         PassKind::Division => division::step(r, cx, n),
+        #[cfg(feature = "prove")]
+        PassKind::Carries => carries::step(r, cx, n),
         // Dispatched with its configuration by the engine.
         PassKind::Mba => Ok(Step::Normal(Fin::FINAL)),
     }

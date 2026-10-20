@@ -58,7 +58,7 @@ fn main() -> Result<(), bitwright::Error> {
   reported back.
 - **A directed simplifier** built from normal-form passes (linear arithmetic, xor forms, truth
   tables, comparison lattices, casts, demanded bits, linear MBA, bit shuffles, divisions by
-  constants) and a small rule corpus. Termination is guaranteed by construction, and every run is bounded by budgets you
+  constants, carry networks) and a small rule corpus. Termination is guaranteed by construction, and every run is bounded by budgets you
   choose.
 - **Invertibility**: proofs that an expression is an injective or bijective function of a
   subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so

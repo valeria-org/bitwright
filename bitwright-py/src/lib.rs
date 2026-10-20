@@ -1944,9 +1944,10 @@ fn build(
 }
 
 /// A simplifier: `"standard"` (fact folding, the built-in rules, the normal-form passes),
-/// `"deobfuscate"` (also divisions by constants, linear MBA, bit shuffles, and the MBA service
-/// with the native solver: the command line's `simplify`) or `"compile"` (for a compiler, which
-/// simplifies every value of every function), with rule files and host rewrites of your own.
+/// `"deobfuscate"` (also divisions by constants, carry networks, linear MBA, bit shuffles, and
+/// the MBA service with the native solver: the command line's `simplify`) or `"compile"` (for
+/// a compiler, which simplifies every value of every function), with rule files and host
+/// rewrites of your own.
 /// Immutable; shared freely.
 #[pyclass(frozen, name = "Engine", module = "bitwright")]
 #[derive(Debug)]
