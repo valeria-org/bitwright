@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.23.0
+
+- **A deadline means stop now.** Since 0.19 a run its budget stops keeps the work of the
+  stopped phase (`salvage`: the root is rebuilt over what the walk finished). A deadline took
+  the same path, which is the opposite of what it asks for: the caller has stopped waiting,
+  and salvaging walks the stopped root's whole DAG once more — then the call went on to the
+  next root, stopped it at its first charge, and salvaged that one too. A call over many roots
+  therefore returned long after its deadline: 31,343 roots of a 12,000-step mixed Boolean
+  chain took 19,711 salvages over 230 million node visits, 24 s after the host cancelled a
+  call that runs in 0.7 s. Now a deadline stops the run where it is: the root it stops is
+  returned as the phases before it left it, and the roots after it are not started
+  (`End::BudgetTerminated(Exhausted::Deadline)`). The same call returns in 4 ms. A budget stop
+  is unchanged — every root still keeps its own work.
+- **`Stats::salvaged` and `Stats::not_started`**: how many roots had a stopped phase salvaged,
+  and how many a passed deadline left unstarted. A deadline-stopped call reports `salvaged: 0`.
+- **Behavior changes.** Only under a deadline, and only where a run would have continued past
+  it: a root a deadline stopped no longer comes back with that phase's partial work, and roots
+  after it come back unchanged rather than rebuilt. Results of runs that complete, and of runs
+  a budget stops, do not change.
+
 ## 0.22.0
 
 - **Bitwise functions over up to six atoms.** The bitwise pass reads a function of at most three
