@@ -260,6 +260,91 @@ fn simplify_a_file_line_by_line() {
     assert_eq!(run(&["simplify", "x", "--file", &f]).0, 2);
 }
 
+/// 0, by a product's factor shifted either way: the simplifier keeps it, and synthesis proves 0
+/// with SAT work.
+const SHIFTED_PRODUCTS: &str = "((x << z) * y) ^ ((x * y) << z)";
+const SHIFTED_PRODUCTS_KEPT: &str = "(x << z) * y ^ x * y << z";
+const BUDGET_NOTE: &str = "note: synthesis left `0:8` unproved: its proof ran out of the budget";
+
+#[test]
+fn simplify_synth_says_which_proof_ran_out_of_its_budget() {
+    let e = SHIFTED_PRODUCTS;
+    let (code, out, err) = run(&["simplify", "--width", "8", "--synth", "--", e]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "0:8\n", ""));
+    for budget in [["--synth-conflicts", "1"], ["--synth-propagations", "100"]] {
+        let (code, out, err) = run(&[
+            "simplify", "--width", "8", "--synth", budget[0], budget[1], "--", e,
+        ]);
+        assert_eq!(
+            (code, out.trim()),
+            (0, SHIFTED_PRODUCTS_KEPT),
+            "{budget:?}: {err}"
+        );
+        assert!(err.starts_with(BUDGET_NOTE), "{budget:?}: {err}");
+        assert!(err.contains("--synth-propagations may prove it"), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+    }
+    // A file: a note for each line it concerns, named by the line.
+    let f = file("synth.txt", &format!("# products\n{e}\nx + y\n"));
+    let (code, out, err) = run(&[
+        "simplify",
+        "--width",
+        "8",
+        "--file",
+        &f,
+        "--synth",
+        "--synth-conflicts",
+        "1",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, format!("# products\n{SHIFTED_PRODUCTS_KEPT}\nx + y\n"));
+    assert!(err.starts_with(&format!("{f}:2: {BUDGET_NOTE}")), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+}
+
+#[test]
+fn lift_synth_says_which_proof_ran_out_of_its_budget() {
+    let f = file(
+        "synth.ll",
+        "define i8 @f(i8 %x, i8 %y, i8 %z) {\n  %a = shl i8 %x, %z\n  %b = mul i8 %a, %y\n  \
+         %c = mul i8 %x, %y\n  %d = shl i8 %c, %z\n  %r = xor i8 %b, %d\n  ret i8 %r\n}\n",
+    );
+    let (code, out, err) = run(&["lift", &f, "--synth"]);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "ret = 0:8\n", ""));
+    let (code, out, err) = run(&["lift", &f, "--synth", "--synth-propagations", "100"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, format!("ret = {SHIFTED_PRODUCTS_KEPT}\n"));
+    assert!(
+        err.starts_with(&format!("{f}: ret: {BUDGET_NOTE}")),
+        "{err}"
+    );
+}
+
+#[test]
+fn synth_budgets_go_with_synth() {
+    for (args, why) in [
+        (
+            &["simplify", "--synth-conflicts", "1", "x"][..],
+            "--synth-conflicts goes with --synth",
+        ),
+        (
+            &["lift", "f.ll", "--synth-propagations", "1"],
+            "--synth-propagations goes with --synth",
+        ),
+        (
+            &["simplify", "--synth", "--synth-conflicts", "many", "x"],
+            "--synth-conflicts: many is not a number",
+        ),
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!((code, out.as_str()), (2, ""), "{args:?}");
+        assert!(
+            err.starts_with(why) && err.contains("usage: bitwright"),
+            "{err}"
+        );
+    }
+}
+
 /// `--rules` adds a rule file's rules: checked now, or vouched for by `<file>.proof`.
 #[test]
 fn simplify_with_rules_of_your_own() {

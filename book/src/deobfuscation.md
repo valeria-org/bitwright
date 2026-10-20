@@ -310,8 +310,12 @@ size, keeping one expression per behavior on a set of sample points; one that be
 input everywhere sampled is proved equal by the native prover, and a counterexample becomes a
 sample and the search starts over. An answer is always proved, and always smaller (as a DAG)
 than the input. The search is bounded (7 nodes, 4 variables, 64 bits by default), so it suits
-the small residue a simplification leaves, not a whole function. `bitwright simplify --synth`
-runs it on the simplifier's result.
+the small residue a simplification leaves, not a whole function. Each proof has a budget of SAT
+conflicts (`Config::conflicts`) and of propagations (`Config::propagations`, unlimited by
+default; it bounds a proof's time more closely); `synth::synthesize_report` also returns the
+candidate, equal at every sample, whose proof it left undecided (`Report::unproved`).
+`bitwright simplify --synth` runs it on the simplifier's result (`--synth-conflicts`,
+`--synth-propagations`).
 
 ```rust
 use bitwright::engine::Engine;

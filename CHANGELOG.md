@@ -25,6 +25,14 @@
   prefix adders and subtractors that only `--synth` recovered into `x + y` and `x - y` (0.03 s
   for the 32-bit adder; the 64-bit subtractor's proof takes 1.24 M propagations).
   `PassCounts` gains `proofs`, `proved`, `refuted` and `unknown`.
+- **Synthesis budgets.** `synth::Config::propagations` caps each proof's SAT propagations
+  (unlimited by default, as before), which bounds its time where `conflicts` (200,000) does
+  not: one proof of `x + y` against a 32-bit protected addition took 1.08 billion propagations
+  and 128 s, and was still left unproved. `synth::synthesize_report` also returns the
+  candidate equal at every sample whose proof was left undecided (`Report::unproved`). The
+  command line's `simplify` and `lift` take `--synth-conflicts` and `--synth-propagations`
+  with `--synth`, and name such a candidate on standard error: with `--synth-propagations
+  20000000` that addition ends in 2.5 s, naming `x + y`.
 - **Fixes.** The LLVM IR reader (`lift::llvm`, `transform::pairs`, `bitwright lift` and `tv`)
   refused four things LLVM writes. Block labels are read by LLVM's grammar for labels, a name
   of `[-a-zA-Z$._0-9]` or a quoted one, followed by its colon: a label that starts with a dot
@@ -45,9 +53,10 @@
   and 11 and 17 under the defaults; the MBA corpora's are unchanged. `simplify/mba-native/*`
   ends at 80 nodes instead of 82 (two `a << 1` written `a + a`, which needs no constant). A
   label's colon must follow it directly, as LLVM requires: `entry :` was read as a label and
-  is now a syntax error. `--prover-budgets` (the prover's simplification runs the deobfuscation
-  strategy) settles the same questions at every fuel; the MBA-heavy question spends 152,423
-  units of pass work instead of 151,951.
+  is now a syntax error. `--synth` writes a note on standard error when it leaves a candidate
+  unproved. `--prover-budgets` (the prover's simplification runs the deobfuscation strategy)
+  settles the same questions at every fuel; the MBA-heavy question spends 152,423 units of
+  pass work instead of 151,951.
 - Benchmarks: instructions against 0.21.1, medians of three runs back to back:
   `simplify/standard/*` +0.6 % to +0.7 % (the flat reading), `simplify/mba/*` +1.6 % to
   +1.8 % and `simplify/mba-nonlinear-sig/64` +1.8 % (the carries walk), `simplify/mba-native/*`

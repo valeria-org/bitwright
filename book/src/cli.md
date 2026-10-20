@@ -15,10 +15,10 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright lean [rules.bwr] [--at 8]` | The rules as Lean 4 theorems over `BitVec`: for every width with `sorry` proofs, or with `--at` at fixed widths proved by `bv_decide` (see [Checking rules](checking.md#rules-as-lean-theorems)). |
 | `bitwright prove opt.txt` | Verifies compiler transformations in the Alive syntax (`Pre:`, source, `=>`, target): each target must refine its source under LLVM's semantics of poison, undefined behavior and floating point, at every width left open; a counterexample shows small inputs and each side's values as LLVM IR constants. `--widths 8,32` and `--conflicts` narrow it. Exits 1 unless every transformation is valid. See [Verifying compiler transformations](transformations.md). |
 | `bitwright infer opt.txt` | Infers each transformation's precondition over its symbolic constants and verifies it. |
-| `bitwright lift block.vex` | Reads lifted code (Ghidra p-code, VEX as pyvex prints it, an LLVM IR function; `--from pcode|vex|llvm` when the extension does not say) and prints each register it writes, each store and each exit, deobfuscated; `--synth` also searches for smaller equal expressions. See [Lifted code](lifting.md). |
+| `bitwright lift block.vex` | Reads lifted code (Ghidra p-code, VEX as pyvex prints it, an LLVM IR function; `--from pcode|vex|llvm` when the extension does not say) and prints each register it writes, each store and each exit, deobfuscated; `--synth` also searches for smaller equal expressions, with `--synth-conflicts` and `--synth-propagations` as for `simplify`. See [Lifted code](lifting.md). |
 | `bitwright tv before.ll after.ll` | Translation validation: each function of the second file must refine the function of the same name in the first (or `@tgt` refine `@src` of one file), for a subset of LLVM IR. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
-| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). `--file exprs.txt` simplifies each line of a file on its own, on `--jobs` threads. |
+| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). `--file exprs.txt` simplifies each line of a file on its own, on `--jobs` threads. `--synth` then searches for a smaller equal expression (see [Synthesis](#synthesis)). |
 
 ## Simplifying from the shell
 
@@ -67,6 +67,30 @@ group mine {
 $ bitwright simplify --width 32 --rules my.bwr -- 'popcnt(x) + popcnt(~x)'
 32:32
 ```
+
+## Synthesis
+
+`--synth` (for `simplify` and `lift`) then searches for the smallest expression equal to each
+result, over its variables and constants (up to 7 nodes, at most 64 bits and 4 variables): a
+candidate that behaves like the result at every sample point is proved equal by the native
+prover, each proof within a budget of SAT conflicts (`--synth-conflicts`, 200000 by default)
+and of propagations (`--synth-propagations`, no limit by default). Both count work, not time,
+so the outcome is the same on every run; propagations bound the time a proof takes more closely,
+since a conflict costs more on a larger circuit. When nothing is found and a candidate's proof
+was left undecided, a note on standard error names the candidate (prefixed by the file and
+line with `--file`, by the file and the output with `lift`); the result printed is the
+simplifier's, and the exit code is unchanged:
+
+```text
+$ bitwright simplify --width 8 --synth -- '((x << z) * y) ^ ((x * y) << z)'
+0:8
+$ bitwright simplify --width 8 --synth --synth-conflicts 1 -- '((x << z) * y) ^ ((x * y) << z)'
+note: synthesis left `0:8` unproved: its proof ran out of the budget (conflicts: 1, propagations: 107); a larger --synth-conflicts or --synth-propagations may prove it
+(x << z) * y ^ x * y << z
+```
+
+On a large input, where each proof is a large circuit, `--synth-propagations` (in the tens of
+millions, say) keeps the search to seconds and says which candidate more budget may prove.
 
 ## Rule files
 

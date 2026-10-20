@@ -1,6 +1,6 @@
 //! `bitwright`: check, lint, prove and catalog rule files; simplify expressions.
 
-use std::fmt::Write as _;
+use std::fmt::{Display, Write as _};
 use std::process::ExitCode;
 
 use bitwright::check::{CheckConfig, PreemptionKind, Verdict, check_program, preempted};
@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use bitwright::engine::{Each, Engine, Run, Strategy};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bitwright::prove::Unknown;
 use bitwright::rules::{Ledger, Level, Rule, RuleKind, RuleProgram, builtin_sources, explain};
-use bitwright::{Assumptions, Context, ParseOptions, Reliance, Width, smtlib};
+use bitwright::{Assumptions, Context, Expr, ParseOptions, Reliance, Width, smtlib};
 
 const USAGE: &str = "\
 usage: bitwright <command> [options]
@@ -57,10 +58,12 @@ commands:
         (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified as `prove`
         verifies. Exit 1 unless every transformation gets a verified precondition (or needs
         none).
-  lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard] [--synth]
+  lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard]
+       [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
         read lifted code (Ghidra p-code, pyvex's VEX IR, or an LLVM IR function; guessed from
         the file's extension, .pcode, .vex, .ll, without --from) and print each register it
-        writes, each store and each exit, deobfuscated as `simplify` does.
+        writes, each store and each exit, deobfuscated as `simplify` does (`--synth` and its
+        budgets as there).
   tv <src.ll> [<tgt.ll>] [--conflicts <n>] [--max-types <n>] [--certify] [--smt]
         translation validation: that each function of the second file refines the function of
         the same name in the first (or @tgt refines @src of one file), for a subset of LLVM
@@ -72,7 +75,7 @@ commands:
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
-           [--float-values] [--synth]
+           [--float-values] [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
   simplify --file <path> [--jobs <n>] [options as above]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
@@ -88,7 +91,11 @@ commands:
         for floats as values, every NaN one value (`x · 1` is `x`): the result may then differ
         from the input in a NaN's payload or sign. `--synth` then searches for a smaller
         equal expression over the result's variables and constants (up to 7 nodes, at most
-        64 bits and 4 variables), proved equal.
+        64 bits and 4 variables), proved equal: each proof within `--synth-conflicts` SAT
+        conflicts (200000 by default) and `--synth-propagations` propagations (no limit by
+        default; it bounds the time more closely). When nothing is found and a candidate
+        equal at every sample was left unproved (by that budget, say), a note on stderr
+        names it.
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -664,9 +671,17 @@ fn smt_scripts(
 fn lift(rest: &[String]) -> Result<String, Fail> {
     let a = Args::parse(
         rest,
-        &["from", "function", "standard", "synth"],
+        &[
+            "from",
+            "function",
+            "standard",
+            "synth",
+            "synth-conflicts",
+            "synth-propagations",
+        ],
         &["standard", "synth"],
     )?;
+    let synth = synth_config(&a)?;
     let path = a.one("file")?;
     let text = read(path)?;
     let from = match a.value("from") {
@@ -705,34 +720,34 @@ fn lift(rest: &[String]) -> Result<String, Fail> {
         .strategy(strategy)
         .build()
         .map_err(|e| Fail::Err(2, format!("{e}")))?;
-    let simplify = |cx: &mut Context, e| -> Result<String, Fail> {
+    // `at`: what the expression is, for a note.
+    let simplify = |cx: &mut Context, e, at: &dyn Display| -> Result<String, Fail> {
         let mut r = engine
             .simplify(cx, e)
             .map_err(|e| Fail::Err(2, format!("{e}")))?
             .expr;
-        if a.flag("synth")
-            && let Some(s) = bitwright::synth::synthesize(cx, r, &Default::default())
-                .map_err(|e| Fail::Err(2, format!("{e}")))?
-        {
-            r = s;
+        if let Some(cfg) = &synth {
+            r = synthesized(cx, r, cfg, &format_args!("{path}: {at}: "))?;
         }
         Ok(cx.display(r).to_string())
     };
     let mut out = String::new();
     for (name, e) in &block.outputs {
-        let s = simplify(&mut cx, *e)?;
+        let s = simplify(&mut cx, *e, name)?;
         writeln!(out, "{name} = {s}").ok();
     }
-    for (addr, v) in &block.stores {
-        let (sa, sv) = (simplify(&mut cx, *addr)?, simplify(&mut cx, *v)?);
+    for (k, (addr, v)) in block.stores.iter().enumerate() {
+        let sa = simplify(&mut cx, *addr, &format_args!("store {} address", k + 1))?;
+        let sv = simplify(&mut cx, *v, &format_args!("store {} value", k + 1))?;
         writeln!(out, "store [{sa}] = {sv}").ok();
     }
-    for (c, t) in &block.exits {
-        let (sc, st) = (simplify(&mut cx, *c)?, simplify(&mut cx, *t)?);
+    for (k, (c, t)) in block.exits.iter().enumerate() {
+        let sc = simplify(&mut cx, *c, &format_args!("exit {} condition", k + 1))?;
+        let st = simplify(&mut cx, *t, &format_args!("exit {} target", k + 1))?;
         writeln!(out, "exit to {st} if {sc}").ok();
     }
     if let Some(n) = block.next {
-        let s = simplify(&mut cx, n)?;
+        let s = simplify(&mut cx, n, &"next")?;
         writeln!(out, "next = {s}").ok();
     }
     Ok(out)
@@ -956,11 +971,14 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "rules",
             "float-values",
             "synth",
+            "synth-conflicts",
+            "synth-propagations",
             "file",
             "jobs",
         ],
         &["deobfuscate", "standard", "float-values", "synth"],
     )?;
+    let synth = synth_config(&a)?;
     if a.flag("standard") && a.flag("deobfuscate") {
         return Err(usage("--standard and --deobfuscate exclude each other"));
     }
@@ -1070,7 +1088,7 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
     .roots;
     let mut outs = outs.into_iter();
     let mut report = String::new();
-    for l in &lines {
+    for (k, l) in lines.iter().enumerate() {
         if !expression(l) {
             writeln!(report, "{l}").unwrap_or(());
             continue;
@@ -1080,11 +1098,13 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         };
         // Then, on request, the smallest equal expression the synthesizer finds (proved equal).
         let mut result = out.expr;
-        if a.flag("synth")
-            && let Some(s) = bitwright::synth::synthesize(&mut cx, result, &Default::default())
-                .map_err(|e| Fail::Err(2, format!("{e}")))?
-        {
-            result = s;
+        if let Some(cfg) = &synth {
+            result = match file {
+                Some(path) => {
+                    synthesized(&mut cx, result, cfg, &format_args!("{path}:{}: ", k + 1))?
+                }
+                None => synthesized(&mut cx, result, cfg, &"")?,
+            };
         }
         let mut text = format!("{}", cx.display(result));
         if file.is_some() {
@@ -1100,6 +1120,71 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         writeln!(report, "{text}").unwrap_or(());
     }
     Ok(report)
+}
+
+/// The synthesis configuration for `--synth` with its budgets (`--synth-conflicts`,
+/// `--synth-propagations`), or `None` without `--synth`.
+fn synth_config(a: &Args) -> Result<Option<bitwright::synth::Config>, Fail> {
+    let budget = |name: &str| -> Result<Option<u64>, Fail> {
+        let Some(v) = a.value(name) else {
+            return Ok(None);
+        };
+        if !a.flag("synth") {
+            return Err(usage(format!("--{name} goes with --synth")));
+        }
+        v.parse()
+            .map(Some)
+            .map_err(|_| usage(format!("--{name}: {v} is not a number")))
+    };
+    let (conflicts, propagations) = (budget("synth-conflicts")?, budget("synth-propagations")?);
+    if !a.flag("synth") {
+        return Ok(None);
+    }
+    let mut cfg = bitwright::synth::Config::default();
+    if let Some(n) = conflicts {
+        cfg = cfg.with_conflicts(n);
+    }
+    if let Some(n) = propagations {
+        cfg = cfg.with_propagations(n);
+    }
+    Ok(Some(cfg))
+}
+
+/// The smaller equal expression synthesis finds for `e` (proved), else `e`. When it finds none
+/// and a candidate equal at every sample was left unproved, a note on stderr names it (`at`:
+/// where `e` comes from, as a prefix).
+fn synthesized(
+    cx: &mut Context,
+    e: Expr,
+    cfg: &bitwright::synth::Config,
+    at: &dyn Display,
+) -> Result<Expr, Fail> {
+    let report = bitwright::synth::synthesize_report(cx, e, cfg)
+        .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    if let Some(s) = report.found {
+        return Ok(s);
+    }
+    let Some((c, why)) = report.unproved else {
+        return Ok(e);
+    };
+    let mut note = format!(
+        "{at}note: synthesis left `{}` unproved",
+        cx.display(c).to_string().replace('\n', " ")
+    );
+    match why {
+        Unknown::Budget {
+            conflicts,
+            propagations,
+        } => write!(
+            note,
+            ": its proof ran out of the budget (conflicts: {conflicts}, propagations: \
+             {propagations}); a larger --synth-conflicts or --synth-propagations may prove it"
+        ),
+        why => write!(note, ": {why}"),
+    }
+    .ok();
+    eprintln!("{note}");
+    Ok(e)
 }
 
 /// A rule file for `simplify --rules`, with the ledger vouching for it: `<path>.proof` if it

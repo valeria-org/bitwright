@@ -59,7 +59,9 @@ assert_eq!(cx.display(rax.expr).to_string(), "reg_0x38 + 1");
 ```
 
 `bitwright lift file.vex` (or `.pcode`, `.ll`, or `--from`) prints each register a block writes,
-each store and each exit, deobfuscated; `--synth` also searches for a smaller equal expression.
+each store and each exit, deobfuscated; `--synth` also searches for a smaller equal expression,
+each proof within `--synth-conflicts` and `--synth-propagations`, and a note on standard error
+names an output whose candidate was left unproved (see [Synthesis](cli.md#synthesis)).
 A call, a helper VEX leaves opaque (an unknown value, for a helper call such as a flag
 computation), a loop or an operation outside the front end's subset is reported, not guessed.
 

@@ -4,7 +4,9 @@
 //! Alur et al., TACAS 2017), and counterexample-guided inductive synthesis (Solar-Lezama et
 //! al., ASPLOS 2006): a candidate that behaves like the target on every sample is proved equal
 //! by the native prover, and a counterexample becomes a sample and the enumeration starts over.
-//! Every answer is proved. Feature `prove`.
+//! Every answer is proved, each proof within [`Config::conflicts`] and
+//! [`Config::propagations`]; [`synthesize_report`] also names the candidates whose proofs those
+//! budgets left undecided. Feature `prove`.
 //!
 //! ```
 //! use bitwright::{Context, ParseOptions, Width};
@@ -32,8 +34,14 @@ pub struct Config {
     pub max_terms: usize,
     /// Random sample points (besides boundary values).
     pub samples: usize,
-    /// The SAT solver's conflict budget for each proof.
+    /// The SAT solver's conflict budget for each proof; a candidate whose proof needs more is
+    /// left unproved ([`Report::unproved`]).
     pub conflicts: u64,
+    /// The SAT solver's propagation budget for each proof (`u64::MAX`, the default: no limit),
+    /// likewise. A conflict costs more propagation on a larger circuit, so this bounds the time
+    /// a proof takes more closely than [`conflicts`](Self::conflicts) does, and as
+    /// deterministically.
+    pub propagations: u64,
     /// How many counterexamples may restart the search.
     pub restarts: usize,
     /// At most this many variables.
@@ -47,6 +55,7 @@ impl Default for Config {
             max_terms: 400_000,
             samples: 24,
             conflicts: 200_000,
+            propagations: u64::MAX,
             restarts: 8,
             max_vars: 4,
         }
@@ -58,6 +67,7 @@ setters!(Config {
     with_max_terms: max_terms: usize,
     with_samples: samples: usize,
     with_conflicts: conflicts: u64,
+    with_propagations: propagations: u64,
     with_restarts: restarts: usize,
     with_max_vars: max_vars: usize,
 });
@@ -325,15 +335,34 @@ fn constants(cx: &mut Context, e: Expr, w: Width) -> Result<Vec<u64>, Error> {
     Ok(out)
 }
 
+/// What a search found, and what it could not settle.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Report {
+    /// A smaller expression equal to the target (proved), if one was found.
+    pub found: Option<Expr>,
+    /// The candidate that behaves like the target at every sample point but whose proof was
+    /// not decided, with why: one left by [`prove::Unknown::Budget`] may be proved with a
+    /// larger [`Config::conflicts`] or [`Config::propagations`]. (At most one: no other term
+    /// behaves like it at the points, so the search ends there.)
+    pub unproved: Option<(Expr, prove::Unknown)>,
+}
+
 /// A smaller expression equal to `e` (proved), over `e`'s variables, the constants it mentions,
 /// 0, 1, all ones, the width less one and the sign bit, and the operators `~ − + − · & | ^ << >>u >>s udiv urem`; `None` when
 /// none is found within the limits. Only for a value of at most 64 bits whose variables all
-/// have its width.
+/// have its width. [`synthesize_report`] also says which candidate was left unproved.
 pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr>, Error> {
+    Ok(synthesize_report(cx, e, cfg)?.found)
+}
+
+/// [`synthesize`], with the candidate whose proof was not decided ([`Report::unproved`]).
+pub fn synthesize_report(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Report, Error> {
+    let nothing = Ok(Report::default());
     let width = cx.width(e)?;
     let w = u32::from(width.bits());
     if w > 64 {
-        return Ok(None);
+        return nothing;
     }
     let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
     let ids = cx.symbols_in(&[e])?;
@@ -344,13 +373,13 @@ pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr
             continue;
         };
         if sw != width {
-            return Ok(None);
+            return nothing;
         }
         vars.push(cx.symbol(k.clone(), sw)?);
         keys.push(k);
     }
     if vars.len() > cfg.max_vars {
-        return Ok(None);
+        return nothing;
     }
     // Candidates are enumerated by tree size, up to the target's less one; an answer must also
     // be smaller as a DAG (what it costs).
@@ -359,7 +388,7 @@ pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr
         crate::Bounded::Exact(n) | crate::Bounded::AtLeast(n) => n,
     };
     if limit == 0 {
-        return Ok(None);
+        return nothing;
     }
     let mut leaves: Vec<Term> = (0..vars.len()).map(Term::Var).collect();
     let mut consts = vec![
@@ -405,17 +434,14 @@ pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr
     for _ in 0..cfg.samples {
         points.push((0..nv).map(|_| next() & mask).collect());
     }
-    let pcfg = prove::Config::default().with_max_conflicts(cfg.conflicts);
+    let pcfg = prove::Config::default()
+        .with_max_conflicts(cfg.conflicts)
+        .with_max_propagations(cfg.propagations);
     for _restart in 0..=cfg.restarts {
         // The target's behavior at the points.
         let mut target = Vec::with_capacity(points.len());
         for p in &points {
-            let env: Vec<(SymbolKey, BitVec)> = keys
-                .iter()
-                .zip(p)
-                .map(|(k, &v)| (k.clone(), BitVec::wrapping_from_u64(width, v)))
-                .collect();
-            target.push(cx.eval(&[e], &env[..])?[0].to_u64().unwrap_or(0));
+            target.push(value_at(cx, e, &keys, width, p)?);
         }
         let mut s = Search {
             lanes: Lanes { w, mask },
@@ -428,6 +454,7 @@ pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr
         };
         let mut counterexample: Option<Vec<u64>> = None;
         let mut found: Option<Expr> = None;
+        let mut unproved: Option<(Expr, prove::Unknown)> = None;
         let step = {
             let mut check = |k: u32, s: &Search<'_>| -> Result<bool, Error> {
                 // `true`: refuted (keep searching).
@@ -459,20 +486,48 @@ pub fn synthesize(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Option<Expr
                         // Stop: the points change and the search starts over.
                         Ok(false)
                     }
-                    Outcome::Unknown(_) => Ok(true),
+                    Outcome::Unknown(why) => {
+                        unproved = Some((cand, why));
+                        Ok(true)
+                    }
                 }
             };
             s.run(&leaves, &target, limit, cfg.max_terms, &mut check)?
         };
         if let Some(f) = found {
-            return Ok(Some(f));
+            return Ok(Report {
+                found: Some(f),
+                unproved: None,
+            });
         }
         match (step, counterexample) {
             (_, Some(p)) => points.push(p),
-            (Step::Exhausted | Step::Candidate, None) => return Ok(None),
+            (Step::Exhausted | Step::Candidate, None) => {
+                return Ok(Report {
+                    found: None,
+                    unproved,
+                });
+            }
         }
     }
-    Ok(None)
+    // Out of restarts: every round ended with a counterexample.
+    nothing
+}
+
+/// `x`'s value at `p`, a value for each symbol of `keys`.
+fn value_at(
+    cx: &mut Context,
+    x: Expr,
+    keys: &[SymbolKey],
+    width: Width,
+    p: &[u64],
+) -> Result<u64, Error> {
+    let env: Vec<(SymbolKey, BitVec)> = keys
+        .iter()
+        .zip(p)
+        .map(|(k, &v)| (k.clone(), BitVec::wrapping_from_u64(width, v)))
+        .collect();
+    Ok(cx.eval(&[x], &env[..])?[0].to_u64().unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -514,8 +569,33 @@ mod tests {
     #[test]
     fn a_rare_difference_is_found_and_nothing_wrong_is_returned() {
         // Equal to x except at one input, which sampling misses: the prover's counterexample
-        // restarts the search, and nothing smaller is equal.
-        let r = synth("select(x == 0x12345678, 1, x)", Width::W32);
-        assert_eq!(r, None);
+        // restarts the search, and nothing smaller is equal; no proof was left undecided.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W32);
+        let e = cx.parse("select(x == 0x12345678, 1, x)", &o).unwrap();
+        let r = synthesize_report(&mut cx, e, &Config::default()).unwrap();
+        assert!(r.found.is_none() && r.unproved.is_none(), "{r:?}");
+    }
+
+    #[test]
+    fn a_proof_past_the_budget_leaves_its_candidate_unproved() {
+        // 0, by a product's factor shifted either way: the proof takes SAT work.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W8);
+        let e = cx.parse("((x << z) * y) ^ ((x * y) << z)", &o).unwrap();
+        let zero = cx.zero(Width::W8).unwrap();
+        let r = synthesize_report(&mut cx, e, &Config::default()).unwrap();
+        assert_eq!(r.found, Some(zero));
+        for cfg in [
+            Config::default().with_conflicts(1),
+            Config::default().with_propagations(100),
+        ] {
+            let r = synthesize_report(&mut cx, e, &cfg).unwrap();
+            assert_eq!(r.found, None);
+            let Some((c, why)) = r.unproved else {
+                panic!("{r:?}")
+            };
+            assert!(c == zero && why.is_budget(), "{why}");
+        }
     }
 }
