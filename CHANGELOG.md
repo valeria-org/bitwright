@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **Fixes.** Soundness: a step the MBA certifier's compositional test proved on its way to the
+  question could stand for the question. The test pairs atoms whose definitions it proves
+  equal and eliminates an atom a side reads only as `γ·v` once it proves that reading; when
+  the symbolic comparison (equal polynomials over symbols) proved such a step, it recorded
+  `Proved` as the question's verdict, and a comparison of the two sides that then failed left
+  it so. The evidence gate on bitwright's own evidence (the default), `NativeProver`, and the
+  normal-form solver's steps that wait on a certificate (relations between atoms, null parts,
+  bitwise forms, synthesis hits) could so take a pair that differs at some input as proved: at
+  64 bits, `x + 2^63·y + 2^63·x` against `((x ^ s) + 2·(x & s)) ^ ((2^63 ^ ((u + 1) & ~u &
+  2^63))·x)` with `s = 2^63·y` and `u = x + 598`, which differ where `x = 2^63 − 599`. The
+  symbolic comparison now answers only for its pair; the question's verdict is recorded only
+  where the question itself is decided. Present since 0.6.0. Found by checking every proof
+  exhaustively on unequal pairs that agree at most inputs, at 21 to 25 variable bits, above
+  the exhaustive certificate, so that the compositional test decides; the test of compositional
+  verdicts ran only at sizes where the exhaustive certificate decides first. That check is now
+  a test among the ignored ones (`proofs_above_the_exhaustive_test_hold_at_every_input`).
+- **Behavior changes.** An answer changes only where it rested on such a step: none of
+  CoBRA's 76,080 expressions (`compare/`'s `bw-nf`) and no `--corpus-diff` result. Of 218,770
+  mutants of those expressions (one constant, operator or variable changed), 62 change: 3 are
+  no longer simplified, 59 get another answer.
+
 ## 0.21.0
 
 - **The MBA certifier's symbolic comparison is charged at its cost.** It was charged a unit of

@@ -199,6 +199,164 @@ fn compositional_verdicts_are_sound() {
     assert!(proved > 50 && refuted > 50, "{proved} {refuted} {unknown}");
 }
 
+#[test]
+fn a_step_proved_on_the_way_does_not_prove_the_question() {
+    // `b` is `a` except at one value of `x`: `(x ^ s) + 2·(x & s)` is `x + s`, and the factor
+    // `smin ^ ((u + 1) & ~u & smin)` with `u = x + 598` is `smin` except where `u` is
+    // `smin − 1`, where it is 0 (and `x` is odd there). On the way the compositional test
+    // proves steps (the sums paired, a skeleton that reads the atom `s` only as `0·s`, by the
+    // symbolic comparison) and then fails on the roots; such a step once stood for the
+    // question.
+    for w in [11u16, 64] {
+        let width = Width::new(w).unwrap();
+        let vars = [width; 2];
+        let (x, y) = (V(0), V(1));
+        let top = C(BitVec::smin(width));
+        let s = mul(top.clone(), y);
+        let a = add(add(x.clone(), s.clone()), mul(top.clone(), x.clone()));
+        let u = add(x.clone(), k(width, 598));
+        let p = and(and(add(k(width, 1), u.clone()), not(u)), top.clone());
+        let sum = add(
+            xor(x.clone(), s.clone()),
+            mul(k(width, 2), and(x.clone(), s)),
+        );
+        let b = xor(sum, mul(xor(top, p), x));
+        let (a, b) = (a.expr(&vars), b.expr(&vars));
+        let at = [
+            BitVec::wrapping_from_i128(width, (1i128 << (w - 1)) - 1 - 598),
+            BitVec::zero(width),
+        ];
+        assert_ne!(a.eval(&at), b.eval(&at), "w={w}");
+        check(&a, &b, false);
+    }
+}
+
+/// The first input (one value per variable) where `a` and `b` differ, over every input of at
+/// most 26 bits in all, a block at a time.
+fn differ_anywhere(a: &MbaExpr, b: &MbaExpr) -> Option<Vec<u64>> {
+    use crate::mba::batch::{BLOCK, Program};
+    let (pa, pb) = (
+        Program::new(a, false).unwrap(),
+        Program::new(b, false).unwrap(),
+    );
+    let vars = a.vars();
+    let bits: u32 = vars.iter().map(|w| u32::from(w.bits())).sum();
+    assert!(bits <= 26 && pa.widest().max(pb.widest()) <= 64);
+    let (mut ra, mut rb): (Vec<Vec<u64>>, Vec<Vec<u64>>) = (Vec::new(), Vec::new());
+    let mut start = 0u64;
+    while start < 1 << bits {
+        let n = ((1u64 << bits) - start).min(BLOCK as u64) as usize;
+        let mut shift = 0;
+        let cols: Vec<Vec<u64>> = vars
+            .iter()
+            .map(|w| {
+                let (s, mask) = (shift, (1u64 << w.bits()) - 1);
+                shift += u32::from(w.bits());
+                (start..start + n as u64).map(|c| (c >> s) & mask).collect()
+            })
+            .collect();
+        pa.run(&mut ra, &cols, n);
+        pb.run(&mut rb, &cols, n);
+        if let Some(p) = (0..n).find(|&p| ra[pa.root()][p] != rb[pb.root()][p]) {
+            return Some(cols.iter().map(|c| c[p]).collect());
+        }
+        start += n as u64;
+    }
+    None
+}
+
+/// A term that is zero at most inputs: the sign bit where a polynomial is zero, the carry out
+/// of a sum, three masked bits whose positions sum to the top, low bits of two variables in
+/// one pattern each, or a term of [`Gen::nonzero`].
+fn rarely_nonzero(g: &mut Gen) -> T {
+    let w = g.w;
+    let top = || C(BitVec::smin(w));
+    let is_zero = |t: T| not(or(t.clone(), neg(t)));
+    let bit = |v: T, p: u16| and(v, k(w, 1i128 << p));
+    match g.rng.below(5) {
+        0 => {
+            let t = g.expr(Frag::Poly, 2);
+            and(top(), is_zero(t))
+        }
+        1 => {
+            let (x, y) = (g.expr(Frag::Poly, 1), g.expr(Frag::Poly, 1));
+            and(and(add(x.clone(), y.clone()), not(or(x, y))), top())
+        }
+        2 => {
+            let bits = w.bits();
+            let i = g.rng.below(u64::from(bits)) as u16;
+            let j = g.rng.below(u64::from(bits - i)) as u16;
+            let (x, y, z) = (g.var(), g.var(), g.var());
+            mul(mul(bit(x, i), bit(y, j)), bit(z, bits - 1 - i - j))
+        }
+        3 => {
+            let mut pattern = || {
+                let (m, c) = (g.rng.below(8) | 1, g.rng.below(8));
+                is_zero(xor(and(g.var(), k(w, m.into())), k(w, (c & m).into())))
+            };
+            and(and(pattern(), pattern()), top())
+        }
+        _ => g.nonzero(Frag::Poly),
+    }
+}
+
+/// `e` with `p` added, subtracted or xored at a random subterm.
+fn plant(g: &mut Gen, e: &T, p: &T, depth: u32) -> T {
+    if depth == 0 || !g.rng.chance(1, 3) {
+        match e {
+            Un(op, a) if matches!(op, MOp::Neg | MOp::Not) => {
+                return un(*op, plant(g, a, p, depth + 1));
+            }
+            Bin(op, a, b) => {
+                return if g.rng.chance(1, 2) {
+                    bin(*op, plant(g, a, p, depth + 1), (**b).clone())
+                } else {
+                    bin(*op, (**a).clone(), plant(g, b, p, depth + 1))
+                };
+            }
+            _ => {}
+        }
+    }
+    let op = [MOp::Add, MOp::Sub, MOp::Xor][g.rng.below(3) as usize];
+    bin(op, e.clone(), p.clone())
+}
+
+#[test]
+#[ignore = "heavy: every proof checked at every input of 21 to 25 bits; run with --release -- --ignored"]
+fn proofs_above_the_exhaustive_test_hold_at_every_input() {
+    // Above 20 variable bits no exhaustive test is planned, so the compositional test, known
+    // bits, cases and carries decide. Each pair is an expression and the expression rewritten
+    // with a term that is zero at most inputs folded in somewhere, so that most agree at the
+    // refutation sample; every proof is checked against every input.
+    let mut proved = 0;
+    for (i, (w, t)) in [(7u16, 3u32), (11, 2), (6, 4), (5, 5)]
+        .into_iter()
+        .enumerate()
+    {
+        let width = Width::new(w).unwrap();
+        let vars = vec![width; t as usize];
+        let mut g = Gen::new(0x5ec0_0000 + i as u64, width, t);
+        for round in 0..150 {
+            let frag = [Frag::Linear, Frag::SemiLinear, Frag::Poly, Frag::Any][round % 4];
+            let e = g.expr(frag, 2);
+            let any = g.rng.chance(1, 2);
+            let f = g.rewrite(&e, any);
+            let p = rarely_nonzero(&mut g);
+            let (a, b) = (e.expr(&vars), plant(&mut g, &f, &p, 0).expr(&vars));
+            let r = certify::prove(&a, &b, &mut Steps::new(1 << 26)).unwrap();
+            if r.verdict == Verdict::Proved {
+                proved += 1;
+                let at = differ_anywhere(&a, &b);
+                assert!(
+                    at.is_none(),
+                    "proved, but they differ at {at:?}:\n{a:?}\n{b:?}"
+                );
+            }
+        }
+    }
+    assert!(proved > 100, "{proved}");
+}
+
 fn lshr(a: T, s: u16) -> T {
     un(MOp::LShr(s), a)
 }

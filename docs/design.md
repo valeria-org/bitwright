@@ -1275,7 +1275,9 @@ pub mod mba {
     `~a | ~b` is `−1 − (a & b)`). When those skeletons still differ, an atom a side reads
     only as `γ·v` (its class variable `v`: the side is its value at `v = 0` plus `γ·v`, proved
     by a direct test with `γ` read at one point) stands for `γ` times its definition, and the
-    sides are compared again (at most four definitions). At 64 bits or fewer every skeleton is
+    sides are compared again (at most four definitions). A pairing or an elimination step,
+    whichever test proves it, decides only itself: the question is proved only when the roots
+    fall in one class or their skeletons are proved equal. At 64 bits or fewer every skeleton is
     checked against its side's values at the sample (its variables taking their nodes' values)
     before a test decides on it, and any refutation's counterexample is checked on the two
     sides; either failing would be a bug, and the question is declined (`CertStats::internal`,

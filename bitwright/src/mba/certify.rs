@@ -1061,6 +1061,8 @@ fn prove_at<M: Meter>(
     let direct = plan(a, &pa, &pb);
     // A polynomial pair no test fits (or can afford, below): maybe the same polynomial.
     if direct.is_none() && poly && symbolic(meter, a, b, &mut report)? {
+        report.verdict = Verdict::Proved;
+        report.cert = Some(Cert::Symbolic);
         return Ok(report);
     }
     if let Some(p) = direct {
@@ -1079,6 +1081,8 @@ fn prove_at<M: Meter>(
             Run::OverBudget | Run::TooBig => {
                 compose = !poly;
                 if poly && symbolic(meter, a, b, &mut report)? {
+                    report.verdict = Verdict::Proved;
+                    report.cert = Some(Cert::Symbolic);
                     return Ok(report);
                 }
             }
@@ -1985,6 +1989,7 @@ impl Compose {
         }
         let Some(p) = plan(&a, &pa, &pb) else {
             if symbolic(meter, &a, &b, report)? {
+                report.cert = Some(Cert::Symbolic);
                 return Ok((Some(Verdict::Proved), None));
             }
             if policy == Policy::Linear {
@@ -1994,6 +1999,7 @@ impl Compose {
         };
         let direct = run(meter, &a, &b, &p, report)?;
         if matches!(direct, Run::TooBig | Run::OverBudget) && symbolic(meter, &a, &b, report)? {
+            report.cert = Some(Cert::Symbolic);
             return Ok((Some(Verdict::Proved), None));
         }
         if policy == Policy::Linear
@@ -2303,6 +2309,7 @@ impl Compose {
         }
         let Some(p) = plan(&a, &pa, &pb) else {
             return Ok(if symbolic(meter, &a, &b, report)? {
+                report.cert = Some(Cert::Symbolic);
                 (Some(Verdict::Proved), None)
             } else {
                 (None, None)
@@ -2316,6 +2323,7 @@ impl Compose {
             Run::Differ(_) => (Some(Verdict::Unknown), None),
             Run::OverBudget | Run::TooBig => {
                 if symbolic(meter, &a, &b, report)? {
+                    report.cert = Some(Cert::Symbolic);
                     (Some(Verdict::Proved), None)
                 } else {
                     (None, None)
@@ -3478,8 +3486,10 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
 }
 
 /// [`symbolic_equal`] within what is left of `meter`, charged [`SYMBOLIC_RATE`] units per unit
-/// of its work: true only for a proof, which it records. Stopped by the budget, it reports
-/// over budget (more might decide).
+/// of its work: true only for a proof. Stopped by the budget, it reports over budget (more
+/// might decide). It decides the pair it is given, which may be a step toward the question (a
+/// pairing of atoms, an elimination), so it records no verdict: the caller that proves the
+/// question does.
 fn symbolic<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -3493,10 +3503,6 @@ fn symbolic<M: Meter>(
         report.over_budget = true;
     }
     meter.charge(work.min(limit) * SYMBOLIC_RATE)?;
-    if equal {
-        report.verdict = Verdict::Proved;
-        report.cert = Some(Cert::Symbolic);
-    }
     Ok(equal)
 }
 
