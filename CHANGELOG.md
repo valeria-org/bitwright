@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.22.0
 
 - **Bitwise functions over up to six atoms.** The bitwise pass reads a function of at most three
   atoms and takes a region of more than three as one atom, which hid that a function depends
