@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.21.1
 
 - **Fixes.** Soundness: a step the MBA certifier's compositional test proved on its way to the
   question could stand for the question. The test pairs atoms whose definitions it proves
