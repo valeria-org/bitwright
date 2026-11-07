@@ -7,6 +7,10 @@
   demanded bits, casts, rotations, condition-dependent pieces and complementary shared products.
   The default strategy does not run the additional sweep. Every committed answer remains
   certificate-checked; ordinary MBA certificates retain the caller's existing run budget.
+- **Exact modular product equalities.** Equality with an even constant multiplier is reduced to
+  its exact low-bit residue, or to false when the target has no preimage.
+- **Bounded polynomial collection.** Existing additive terms with the same non-constant product
+  factors combine their constant coefficients without distributive expansion.
 - **Reusable independent contexts.** `Context::fork` keeps existing expressions and analysis
   caches while isolating nodes and proof history added afterward.
 - **MBA question keys are cached.** `MbaExpr::key` computes its content hash once and invalidates

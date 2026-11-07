@@ -126,6 +126,24 @@ fn compare(
     })
 }
 
+/// `(x & mask) op v`.
+fn compare_masked(
+    o: &mut Calls<'_, '_, '_>,
+    cx: &mut Context,
+    op: CmpOp,
+    x: u32,
+    mask: &BitVec,
+    v: &BitVec,
+) -> Result<u32, Stop> {
+    let (mask, v) = (*mask, *v);
+    o.r.build(cx, |cx| {
+        let mask = cx.mk_const(&mask)?;
+        let x = cx.c_bin(BinOp::And, x, mask)?;
+        let v = cx.mk_const(&v)?;
+        cx.c_cmp(op, x, v)
+    })
+}
+
 /// `f(x) op f(y)` as `x op y`, through every common injective layer.
 fn cancel(
     cx: &mut Context,
@@ -159,6 +177,7 @@ fn solve(
         None => None,
         Some(Solved::Const(eq)) => Some(truth(o, cx, eq == (op == CmpOp::Eq))?),
         Some(Solved::Eq(x, v)) => Some(compare(o, cx, op, x, &v)?),
+        Some(Solved::MaskEq(x, mask, v)) => Some(compare_masked(o, cx, op, x, &mask, &v)?),
     })
 }
 
@@ -204,7 +223,8 @@ fn split(
                 solved = true;
                 (x, v)
             }
-            None => (leaf, *c),
+            // A masked equality does not fit `conj`'s one-value form.
+            Some(Solved::MaskEq(..)) | None => (leaf, *c),
         };
         match conj.iter().find(|(y, _)| *y == x) {
             // One value equal to two different constants.

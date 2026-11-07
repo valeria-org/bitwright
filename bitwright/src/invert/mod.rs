@@ -18,6 +18,10 @@
 //! Composing layers keeps injectivity (and bijectivity), so a chain of layers is injective in
 //! its inner value; nothing else is ever claimed.
 //!
+//! At an equality root, `x * m == c` with even constant `m` is solved without
+//! claiming injectivity: factoring `m = 2^s·q` gives either no preimage or the
+//! exact residue `(x & (2^(W-s) - 1)) == (c / 2^s)·q⁻¹`.
+//!
 //! **Regions.** Combining two values that both depend on the inner one generally destroys
 //! invertibility: `f(x) ^ x`, `f_a(x) ^ f_b(x)` and `f_a(x) | f_b(x)` are not injective even for
 //! bijective `f`. Such a node is a layer only when a *pivot analysis* proves it. Over the region
@@ -1039,8 +1043,45 @@ pub(crate) fn preimage<O: Oracle>(
 pub(crate) enum Solved {
     /// `e == c` holds exactly when `x == v`.
     Eq(u32, BitVec),
+    /// `e == c` holds exactly when `x & mask == v`.
+    MaskEq(u32, BitVec, BitVec),
     /// `e == c` is this constant.
     Const(bool),
+}
+
+/// The preimage of `x·m == c` for a constant even `m`: one residue of
+/// `x mod 2^(W-ctz(m))`, or no value. Multiplication by the odd part is
+/// invertible in that field.
+fn even_mul_preimage(cx: &Context, e: u32, c: &BitVec) -> Option<Solved> {
+    let n = cx.node(e);
+    if n.op != OpCode::Mul {
+        return None;
+    }
+    let (x, m) = match (cx.const_val(n.a), cx.const_val(n.b)) {
+        (None, Some(m)) => (n.a, m),
+        (Some(m), None) => (n.b, m),
+        _ => return None,
+    };
+    let w = m.width();
+    let bits = w.bits();
+    let shift = BitVec::un_unchecked(crate::ops::UnOp::Ctz, &m).to_u64()? as u16;
+    if shift == 0 || shift >= bits {
+        return None;
+    }
+    let amount = BitVec::wrapping_from_u64(w, u64::from(shift));
+    let shr = |v: &BitVec| BitVec::bin_unchecked(BinOp::LShr, v, &amount);
+    let shl = |v: &BitVec| BitVec::bin_unchecked(BinOp::Shl, v, &amount);
+    if shl(&shr(c)) != *c {
+        return Some(Solved::Const(false));
+    }
+    let field = crate::Width::new(bits - shift).ok()?;
+    let odd = shr(&m).trunc(field).ok()?;
+    let rhs = shr(c).trunc(field).ok()?;
+    let value = BitVec::bin_unchecked(BinOp::Mul, &rhs, &mul_inverse(&odd)?)
+        .zext(w)
+        .ok()?;
+    let mask = BitVec::ones(field).zext(w).ok()?;
+    Some(Solved::MaskEq(x, mask, value))
 }
 
 /// Solves `e == c` through as many layers of `e` with constant parameters as possible; `None`
@@ -1056,6 +1097,9 @@ pub(crate) fn solve_eq<O: Oracle>(
     loop {
         o.charge(1)?;
         let Some(l) = solve_layer(cx, o, cur)? else {
+            if let Some(solved) = even_mul_preimage(cx, cur, &val) {
+                return Ok(Some(solved));
+            }
             break;
         };
         match preimage(cx, o, cur, &l, &val)? {

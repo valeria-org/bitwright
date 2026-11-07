@@ -3526,6 +3526,10 @@ fn invert_fixtures() {
     );
     // Moving a constant across: 5 * 3⁻¹ = 5 * 171 = 0x57 (mod 2^8).
     check_to(&eng, "x * 3 == 5", "x == 0x57", 8);
+    // An even multiplier fixes a low field, or has no preimage.
+    check_to(&eng, "x * 12 == 36", "(x & 0x3f) == 3", 8);
+    check_to(&eng, "x * 12 != 36", "(x & 0x3f) != 3", 8);
+    check_to(&eng, "x * 12 == 2", "false", 8);
     check_to(&eng, "rotl(x, 3) != 5", "x != 0xa0", 8);
     check_to(&eng, "~(x - 9) == 0", "x == 8", 8);
     // A triangular map: the high nibble first, then the low one.

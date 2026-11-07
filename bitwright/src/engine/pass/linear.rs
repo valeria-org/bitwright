@@ -579,6 +579,164 @@ fn sum(cx: &Context, n: u32) -> Option<Sum> {
     Some(out)
 }
 
+/// One product as a constant coefficient and a sorted multiset of non-constant factors.
+#[derive(Copy, Clone)]
+struct Monomial {
+    coefficient: BitVec,
+    factors: [u32; MAX_PRODUCT_FACTORS],
+    len: usize,
+}
+
+fn monomial(cx: &Context, n: u32) -> Option<Monomial> {
+    fn collect(cx: &Context, n: u32, out: &mut Monomial) -> Option<()> {
+        let node = cx.node(n);
+        if node.op == OpCode::Mul {
+            collect(cx, node.a, out)?;
+            collect(cx, node.b, out)
+        } else if node.op == OpCode::Neg {
+            collect(cx, node.a, out)?;
+            out.coefficient = BitVec::un_unchecked(UnOp::Neg, &out.coefficient);
+            Some(())
+        } else if let Some(k) = cx.const_val(n) {
+            out.coefficient = BitVec::bin_unchecked(BinOp::Mul, &out.coefficient, &k);
+            Some(())
+        } else if out.len < out.factors.len() {
+            out.factors[out.len] = n;
+            out.len += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    let mut out = Monomial {
+        coefficient: BitVec::one(cx.width_of(n)),
+        factors: [0; MAX_PRODUCT_FACTORS],
+        len: 0,
+    };
+    collect(cx, n, &mut out)?;
+    out.factors[..out.len].sort_by(|a, b| cx.order(*a, *b));
+    Some(out)
+}
+
+fn same_monomial(a: &Monomial, b: &Monomial) -> bool {
+    a.len == b.len && a.factors[..a.len] == b.factors[..b.len]
+}
+
+/// Combine products with the same non-constant factors by adding their coefficients.
+///
+/// This is bounded polynomial collection, not a distributive expansion: only the additive
+/// terms already present and each term's existing multiplicative leaves are inspected.
+fn combine_like_products(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    sum: &Sum,
+) -> Result<Option<Step>, Stop> {
+    let mut terms: [Option<Monomial>; MAX_SUM_TERMS] = [None; MAX_SUM_TERMS];
+    for (slot, &term) in terms.iter_mut().zip(&sum.terms[..sum.len]) {
+        let Some(monomial) = monomial(cx, term) else {
+            return Ok(None);
+        };
+        *slot = Some(monomial);
+    }
+    let mut consumed = [false; MAX_SUM_TERMS];
+    let mut combined = false;
+    for i in 0..sum.len {
+        if consumed[i] {
+            continue;
+        }
+        let Some(base) = terms[i] else {
+            return Ok(None);
+        };
+        let mut coefficient = base.coefficient;
+        for j in i + 1..sum.len {
+            let Some(candidate) = terms[j] else {
+                return Ok(None);
+            };
+            if !consumed[j] && same_monomial(&base, &candidate) {
+                coefficient =
+                    BitVec::bin_unchecked(BinOp::Add, &coefficient, &candidate.coefficient);
+                consumed[j] = true;
+                combined = true;
+            }
+        }
+        let Some(base) = terms[i].as_mut() else {
+            return Ok(None);
+        };
+        base.coefficient = coefficient;
+    }
+    if !combined {
+        return Ok(None);
+    }
+
+    let before = cx.len() as u32;
+    let mut result = None;
+    let one = BitVec::one(cx.width_of(n));
+    for i in 0..sum.len {
+        if consumed[i] {
+            continue;
+        }
+        let Some(term) = terms[i] else {
+            return Ok(None);
+        };
+        if term.coefficient.is_zero() {
+            continue;
+        }
+        let value = match term.factors[..term.len].split_first() {
+            Some((&first, rest)) => {
+                let mut value = first;
+                for &factor in rest {
+                    value = r.build(cx, |cx| cx.c_bin(BinOp::Mul, value, factor))?;
+                }
+                if term.coefficient != one {
+                    let coefficient = term.coefficient;
+                    value = r.build(cx, |cx| {
+                        let coefficient = cx.mk_const(&coefficient)?;
+                        cx.c_bin(BinOp::Mul, value, coefficient)
+                    })?;
+                }
+                value
+            }
+            None => {
+                let coefficient = term.coefficient;
+                r.build(cx, |cx| cx.mk_const(&coefficient))?
+            }
+        };
+        result = Some(match result {
+            None => value,
+            Some(left) => r.build(cx, |cx| cx.c_bin(BinOp::Add, left, value))?,
+        });
+    }
+    let result = match result {
+        Some(result) => result,
+        None => {
+            let zero = BitVec::zero(cx.width_of(n));
+            r.build(cx, |cx| cx.mk_const(&zero))?
+        }
+    };
+    let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS];
+    let mut count = 0;
+    for term in terms[..sum.len].iter().flatten() {
+        for &factor in &term.factors[..term.len] {
+            if !atoms[..count].contains(&factor) {
+                atoms[count] = factor;
+                count += 1;
+            }
+        }
+    }
+    Ok(Some(finish(
+        r,
+        cx,
+        PassKind::Linear,
+        n,
+        result,
+        before,
+        &atoms[..count],
+        Fin::FINAL,
+    )?))
+}
+
 /// A structurally shared factor and its position in every product, preferring a non-constant.
 fn common_factor(cx: &Context, products: &[Product]) -> Option<(u32, [usize; MAX_SUM_TERMS])> {
     let first = products.first()?;
@@ -719,6 +877,9 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
     };
     if sum.len < 2 {
         return Ok(None);
+    }
+    if let Some(step @ Step::To(..)) = combine_like_products(r, cx, n, &sum)? {
+        return Ok(Some(step));
     }
     let mut products = [Product {
         factors: [0; MAX_PRODUCT_FACTORS],

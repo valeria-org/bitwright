@@ -363,6 +363,13 @@ fn primitive_layers_solve_exactly() {
                         assert_eq!(cx.handle(*x), v, "{}", cx.display(n));
                         assert_eq!(*s, val(w, *one), "{} == {c}", cx.display(n));
                     }
+                    (Some(Solved::MaskEq(x, mask, s)), _) => {
+                        assert_eq!(cx.handle(*x), v, "{}", cx.display(n));
+                        let selected: Vec<u64> = (0..1u64 << w)
+                            .filter(|&x| BitVec::bin_unchecked(BinOp::And, &val(w, x), mask) == *s)
+                            .collect();
+                        assert_eq!(selected, want, "{} == {c}", cx.display(n));
+                    }
                     (Some(Solved::Const(false)), []) => {}
                     (None, _) => assert!(!solvable, "{} == {c} not solved", cx.display(n)),
                     _ => panic!("{} == {c}: {got:?}, preimages {want:?}", cx.display(n)),
@@ -864,6 +871,17 @@ fn regions_are_injective_and_solve_exactly() {
                     for xv in 0..1u64 << w {
                         let lhs = image[xv as usize] == c;
                         let rhs = eval(&mut cx, vh, &[("x", val(w, xv))]) == s;
+                        assert_eq!(lhs, rhs, "{} == {cv} at x={xv}", cx.display(ec));
+                    }
+                    solved += 1;
+                }
+                Some(Solved::MaskEq(v, mask, s)) => {
+                    // `v & mask == s` must hold exactly where `ec == c` does.
+                    let vh = cx.handle(v);
+                    for xv in 0..1u64 << w {
+                        let lhs = image[xv as usize] == c;
+                        let value = eval(&mut cx, vh, &[("x", val(w, xv))]);
+                        let rhs = BitVec::bin_unchecked(BinOp::And, &value, &mask) == s;
                         assert_eq!(lhs, rhs, "{} == {cv} at x={xv}", cx.display(ec));
                     }
                     solved += 1;

@@ -236,3 +236,13 @@ fn complementary_cofactors_cancel_even_when_the_products_are_shared() {
     assert!(agrees, "{out}");
     assert!(!out.contains("secret_input_zz"), "{out}");
 }
+
+#[test]
+fn equal_products_combine_their_constant_coefficients() {
+    let text = "~secret_input * lane * 0xf96149ed4a85ee7f \
+                + lane * ~secret_input * 0x69eb612b57a1181 \
+                + lane * 0xf96149ed4a85ee7f";
+    let (out, agrees) = noise_forms(text, true);
+    assert!(agrees, "{out}");
+    assert_eq!(out, "lane * 0xf96149ed4a85ee7f");
+}
