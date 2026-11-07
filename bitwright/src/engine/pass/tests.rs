@@ -4015,6 +4015,110 @@ fn monotone_fixtures() {
     );
 }
 
+#[test]
+fn monotone_trees() {
+    let eng = Engine::standard();
+    let only = engine(vec![Phase::Invert]);
+    // A select passes its order to its arms: the leaves of both sides are peeled together.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), zext<16>(y)) <u zext<16>(z)",
+        "select(c, x, y) <u z",
+        8,
+    );
+    check_to(
+        &eng,
+        "select(zext<16>(x) <u zext<16>(y), zext<16>(x), zext<16>(y)) <u zext<16>(z)",
+        "select(x <u y, x, y) <u z",
+        8,
+    );
+    check_to(&only, "select(c, ~x, ~y) <u ~z", "z <u select(c, x, y)", 8);
+    check_to(
+        &only,
+        "select(c, select(d, ~x, ~y), ~w) <=s ~z",
+        "z <=s select(c, select(d, x, y), w)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x ^ 0x80, y ^ 0x80) <s (z ^ 0x80)",
+        "select(c, x, y) <u z",
+        8,
+    );
+    // A constant leaf stands for its exact preimage, or stops the peeling.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 5) <u zext<16>(z)",
+        "select(c, x, 5) <u z",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 300) <u zext<16>(z)",
+        "select(c, zext<16>(x), 300) <u zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, ~x, 5) <u ~z",
+        "z <u select(c, x, 0xfa)",
+        8,
+    );
+    // ... but not through a layer monotone only on the facts' range.
+    check_under(
+        &only,
+        &["x <u 10", "z <u 10"],
+        "select(c, x + 1, 5) <u z + 1",
+        "select(c, x + 1, 5) <u z + 1",
+        8,
+    );
+    check_under(
+        &only,
+        &["x <u 10", "y <u 10", "z <u 10"],
+        "select(c, x + 1, y + 1) <u z + 1",
+        "select(c, x, y) <u z",
+        8,
+    );
+    // Different layers, or one leaf that is not a layer: nothing.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), sext<16>(y)) <u zext<16>(z)",
+        "select(c, zext<16>(x), sext<16>(y)) <u zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), w) <u zext<16>(z)",
+        "select(c, zext<16>(x), w) <u zext<16>(z)",
+        8,
+    );
+    // Equalities through selects: an injective layer, constants by preimage.
+    check_to(
+        &only,
+        "select(c, x + 1, y + 1) == z + 1",
+        "select(c, x, y) == z",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x * 3, 7) != y * 3",
+        "select(c, x, 0xad) != y",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 300) == zext<16>(z)",
+        "select(c, zext<16>(x), 300) == zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x ^ (x >>u 4), y ^ (y >>u 4)) == z ^ (z >>u 4)",
+        "select(c, x, y) == z",
+        8,
+    );
+}
+
 /// Random chains of layers monotone where the facts allow (sums, differences, products and
 /// shifts by a constant or a shared symbol, complements, negations, `^ smin`, casts and
 /// concatenations), compared through every ordering on both sides or against a constant, under
@@ -4081,10 +4185,47 @@ fn monotone_is_sound_under_ranges() {
         }
         let op =
             [CmpOpExt::Ult, CmpOpExt::Ule, CmpOpExt::Slt, CmpOpExt::Sle][g.rng.below(4) as usize];
-        let root = match g.rng.below(4) {
+        let root = match g.rng.below(6) {
             0 => {
                 let fy = cx.substitute(&[e], &[(x, y)]).unwrap()[0];
                 cx.cmp(op, e, fy).unwrap()
+            }
+            // Select trees over the chain at `x`, `y`, `k` and constants, compared by an
+            // ordering or an equality.
+            4 | 5 => {
+                let fy = cx.substitute(&[e], &[(x, y)]).unwrap()[0];
+                let fk = cx.substitute(&[e], &[(x, k)]).unwrap()[0];
+                let ewd = Width::new(ew).unwrap();
+                let leaf = |cx: &mut Context, g: &mut Gen| match g.rng.below(4) {
+                    0 => e,
+                    1 => fy,
+                    2 => fk,
+                    _ => {
+                        let v = g.constant(ewd.bits());
+                        cx.constant(&v).unwrap()
+                    }
+                };
+                let cond = |cx: &mut Context, g: &mut Gen| {
+                    let a = [x, y, k][g.rng.below(3) as usize];
+                    let b = [x, y, k][g.rng.below(3) as usize];
+                    cx.cmp(CmpOpExt::Ult, a, b).unwrap()
+                };
+                let c1 = cond(&mut cx, &mut g);
+                let (l1, l2) = (leaf(&mut cx, &mut g), leaf(&mut cx, &mut g));
+                let a = cx.select(c1, l1, l2).unwrap();
+                let b = if g.rng.chance(1, 2) {
+                    leaf(&mut cx, &mut g)
+                } else {
+                    let c2 = cond(&mut cx, &mut g);
+                    let (l3, l4) = (leaf(&mut cx, &mut g), leaf(&mut cx, &mut g));
+                    cx.select(c2, l3, l4).unwrap()
+                };
+                let op = if g.rng.chance(1, 3) {
+                    [CmpOpExt::Eq, CmpOpExt::Ne][g.rng.below(2) as usize]
+                } else {
+                    op
+                };
+                cx.cmp(op, a, b).unwrap()
             }
             1 => {
                 let c = cx.constant(&g.constant(ew)).unwrap();

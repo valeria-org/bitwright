@@ -1171,6 +1171,33 @@ relies on the constraints they used. Analysis work is charged to `pass_work`. Me
 the previous pipeline: +1.5 % to +2.6 % instructions on the `simplify/standard` benchmarks (one
 more walk per round over DAGs with few comparisons), no change to fact benchmarks.
 
+**Observations.** The demanded-bits pass, the equality rewrites and the ordering rewrites are
+one idea: what a parent can *observe* about an operand licenses replacing the operand by anything
+the parent cannot tell apart. The observations differ in two ways that fix the implementation. A
+mask `m` (`Bits`) has *independent* representatives: each node under it may be replaced on its
+own by any value agreeing on `m`, so the demanded-bits pass is a recursive region rewrite launched
+at one parent (`x & c`, a shift, an extraction), each node simplified under the mask the path to
+it implies. Equality (`Partition`) and an ordering (`Order(u|s)`) have *joint* representatives:
+every value that reaches the comparison must be relabelled by one map, injective for equality,
+strictly monotone for an ordering, so these rewrites act at the comparison node over all its
+leaves at once. The structure that passes an observation to its operands unchanged is `select`
+(min and max are selects), whose condition observes nothing of the arms, so the invert pass takes
+the leaves of the `select` trees on both sides of a comparison (at most 16, without repeats),
+peels one common layer from every leaf (a constant leaf standing for its exact preimage: under an
+injective layer with constant parameters by `preimage`, under a monotone layer by bisection, and
+only through a layer monotone at every input, since a constant has no facts to keep it on one
+piece), rebuilds the trees over the inner values and compares those, in the order the layer is
+monotone from, swapped for a decreasing layer: `select(c, zext(x), zext(y)) <u zext(z)` is
+`select(c, x, y) <u z`, `select(c, ~x, ~y) <u ~z` is `z <u select(c, x, y)`, and
+`select(c, x * 3, 7) == y * 3` is `select(c, x, 0xad) == y`. The conditions are left alone;
+where one is itself a comparison of leaves (a minimum written out), its own step rewrites it, so
+`select(zext(x) <u zext(y), zext(x), zext(y)) <u zext(z)` ends as `select(x <u y, x, y) <u z`.
+A lattice *join* of observations (a node read by a mask here and compared there) never arises in
+this form, because each rewrite is launched by one parent and sees only what that parent observes;
+a node shared by several parents is simply rewritten at each, and the hash-consed DAG shares the
+results. `Dead` (a node whose value nothing observes) does not arise either: construction folds
+`x & 0` and `select(c, x, x)`.
+
 **Queries.** `Query::Injective { e, of }` (`Bijective`) is `True` when the chain from `e` down to
 `of` is proved, reading `e` as a function of a value put in place of `of` with every value not
 depending on `of` fixed; `False` when `e` does not depend on `of`, or is narrower (for

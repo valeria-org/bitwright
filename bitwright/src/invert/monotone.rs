@@ -28,6 +28,12 @@
 //! space, where a signed value `v` is read as `v ^ smin`, every order is the unsigned one, and a
 //! map between different orders is the same map shifted by `smin`.
 //!
+//! The comparison's operands may be `select` trees: a `select` passes what is observed about
+//! it (its order) to its arms, so the leaves of both trees are relabelled together, every
+//! non-constant leaf one layer over its own inner value, every constant leaf its exact
+//! preimage under a layer monotone at every input, and the comparison is one of the trees over
+//! the inner values (`select(c, zext(x), zext(y)) <u zext(z)` is `select(c, x, y) <u z`).
+//!
 //! Against a constant, the threshold is found by bisection over the inner value's range: the
 //! comparison, as a function of the inner value, changes at most once there (the map is
 //! strictly monotone, and a comparison with a constant is monotone in the map's order), so it
@@ -194,6 +200,20 @@ fn facts_of<O: Oracle>(cx: &mut Context, o: &mut O, i: u32) -> Result<Facts, O::
         .unwrap_or_else(|| Facts::top(cx.width_of(i))))
 }
 
+/// The inner value a layer is classified over: a node, with its facts, or any value of a width.
+#[derive(Copy, Clone)]
+enum Dom {
+    Of(u32),
+    Any(Width),
+}
+
+fn dom_facts<O: Oracle>(cx: &mut Context, o: &mut O, d: Dom) -> Result<Facts, O::Err> {
+    match d {
+        Dom::Of(i) => facts_of(cx, o, i),
+        Dom::Any(w) => Ok(Facts::top(w)),
+    }
+}
+
 fn arg_val(cx: &Context, a: &Arg) -> Option<BitVec> {
     match a {
         Arg::Node(i) => cx.const_val(*i),
@@ -292,7 +312,7 @@ fn classify<O: Oracle>(
     cx: &mut Context,
     o: &mut O,
     map: &Map,
-    inner: u32,
+    inner: Dom,
     input: Order,
     out: Order,
 ) -> Result<Option<(bool, i8)>, O::Err> {
@@ -303,7 +323,7 @@ fn classify<O: Oracle>(
         Map::Zext | Map::ConcatLo(_) => (input == U).then_some(up),
         Map::Sext | Map::ConcatHi(_) => same.then_some(up),
         Map::Add(arg) | Map::Sub(arg) | Map::SubFrom(arg) => {
-            let f = facts_of(cx, o, inner)?;
+            let f = dom_facts(cx, o, inner)?;
             let increasing = !matches!(map, Map::SubFrom(_));
             let piece = if let Some(k) = arg_val(cx, arg) {
                 // In key space: a change of order shifts the constant by `smin`.
@@ -357,11 +377,11 @@ fn classify<O: Oracle>(
             if !same {
                 return Ok(None);
             }
-            let w = cx.width_of(inner);
+            let f = dom_facts(cx, o, inner)?;
+            let w = f.width();
             let Ok(w2) = Width::new(w.bits().saturating_mul(2)) else {
                 return Ok(None);
             };
-            let f = facts_of(cx, o, inner)?;
             let kf = facts_of(cx, o, *k)?;
             match input {
                 U => {
@@ -400,7 +420,7 @@ fn classify<O: Oracle>(
             if !same {
                 return Ok(None);
             }
-            let f = facts_of(cx, o, inner)?;
+            let f = dom_facts(cx, o, inner)?;
             let shi = facts_of(cx, o, *s)?.urange().hi();
             // No bit shifted out at the largest count: then at none, and the map is `v * 2^s`.
             let keeps = |v: &BitVec, back: BinOp| bin(back, &bin(BinOp::Shl, v, &shi), &shi) == *v;
@@ -423,7 +443,7 @@ fn mono<O: Oracle>(
     out: Order,
 ) -> Result<Option<Mono>, O::Err> {
     for input in [out, out.other()] {
-        if let Some((increasing, piece)) = classify(cx, o, map, inner, input, out)? {
+        if let Some((increasing, piece)) = classify(cx, o, map, Dom::Of(inner), input, out)? {
             return Ok(Some(Mono {
                 input,
                 increasing,
@@ -452,22 +472,26 @@ fn apply(cx: &Context, n: u32, map: &Map, v: &BitVec) -> Option<BitVec> {
 
 // ----- cancelling on both sides -----------------------------------------------------------------
 
-/// If `n1` and `n2` are one strictly monotone layer to order `out` over different operands,
-/// those operands and how: `n1 <out n2` is `x <in y` (`y <in x` for a decreasing layer).
-pub(crate) fn cancel<O: Oracle>(
-    cx: &mut Context,
-    o: &mut O,
-    n1: u32,
-    n2: u32,
-    out: Order,
-) -> Result<Option<(u32, u32, Mono)>, O::Err> {
-    let (a, b) = (cx.node(n1), cx.node(n2));
-    if a.op != b.op || a.width != b.width || a.aux != b.aux || n1 == n2 {
-        return Ok(None);
+/// The inner value a leaf stands for once its layer is peeled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Inner {
+    /// A node.
+    Node(u32),
+    /// A constant: the exact preimage of a constant leaf.
+    Const(BitVec),
+}
+
+/// The position of `n`'s operand paired with position `p` of `n0`, when the two nodes are the
+/// same operator with the same operands everywhere else (operands of a commutative operator in
+/// either order) and the paired operands have one width.
+fn paired(cx: &Context, n0: u32, n: u32, p: usize) -> Option<usize> {
+    let (a, b) = (cx.node(n0), cx.node(n));
+    if a.op != b.op || a.width != b.width || a.aux != b.aux {
+        return None;
     }
     let (ka, kb): (Vec<u32>, Vec<u32>) = (a.children().collect(), b.children().collect());
-    if ka.len() != kb.len() || ka.is_empty() {
-        return Ok(None);
+    if ka.len() != kb.len() || p >= ka.len() {
+        return None;
     }
     let mut pairings = vec![(0..ka.len()).collect::<Vec<usize>>()];
     if a.op.as_bin().is_some_and(BinOp::is_commutative) {
@@ -475,35 +499,141 @@ pub(crate) fn cancel<O: Oracle>(
         s.swap(0, 1);
         pairings.push(s);
     }
-    for pairing in &pairings {
-        let diff: Vec<usize> = (0..ka.len()).filter(|&p| ka[p] != kb[pairing[p]]).collect();
-        let [p] = diff[..] else {
+    pairings.into_iter().find_map(|pi| {
+        let same = (0..ka.len()).all(|q| q == p || ka[q] == kb[pi[q]]);
+        (same && cx.wid(ka[p]) == cx.wid(kb[pi[p]])).then_some(pi[p])
+    })
+}
+
+/// The exact preimage of `c` under `map` at node `n` (its inner operand `w` bits wide, its
+/// parameters constants), strictly monotone to order `out` as `m` says at every input, by
+/// bisection; `None` if nothing maps to `c`.
+fn preimage(
+    cx: &Context,
+    n: u32,
+    map: &Map,
+    w: Width,
+    m: Mono,
+    out: Order,
+    c: &BitVec,
+) -> Option<BitVec> {
+    let (input, increasing) = (m.input, m.increasing);
+    let (mut lo, mut hi) = (BitVec::zero(w), BitVec::ones(w));
+    let one = BitVec::one(w);
+    let less = out.cmp(true);
+    for _ in 0..=w.bits() + 1 {
+        if ult(&hi, &lo) {
+            break;
+        }
+        let gap = bin(BinOp::Sub, &hi, &lo);
+        let mid = bin(BinOp::Add, &lo, &bin(BinOp::LShr, &gap, &one));
+        let v = input.key(&mid);
+        let fv = apply(cx, n, map, &v)?;
+        if fv == *c {
+            return Some(v);
+        }
+        if BitVec::cmp_unchecked(less, &fv, c) == increasing {
+            // Below `c`: the preimage is above `mid`.
+            if mid == BitVec::ones(w) {
+                break;
+            }
+            lo = bin(BinOp::Add, &mid, &one);
+        } else {
+            if mid.is_zero() {
+                break;
+            }
+            hi = bin(BinOp::Sub, &mid, &one);
+        }
+    }
+    None
+}
+
+/// If every non-constant leaf is one strictly monotone layer to order `out` over its own inner
+/// value (the same layer with the same parameters, monotone in the same way), and every
+/// constant leaf has an exact preimage under it (a layer monotone at every input): the inner
+/// value of each leaf, and how. A comparison of two trees over the leaves is then the same
+/// comparison of the trees over the inner values, in the layer's input order, its sides swapped
+/// when the layer is decreasing.
+pub(crate) fn cancel_many<O: Oracle>(
+    cx: &mut Context,
+    o: &mut O,
+    leaves: &[u32],
+    out: Order,
+) -> Result<Option<(Vec<Inner>, Mono)>, O::Err> {
+    let Some(&n0) = leaves.iter().find(|&&l| cx.const_val(l).is_none()) else {
+        return Ok(None);
+    };
+    let consts = leaves.iter().any(|&l| cx.const_val(l).is_some());
+    let kids0: Vec<u32> = cx.node(n0).children().collect();
+    'position: for p in 0..kids0.len() {
+        let Some(map0) = map_at(cx, n0, p) else {
             continue;
         };
-        let (x, y) = (ka[p], kb[pairing[p]]);
-        if cx.wid(x) != cx.wid(y) {
+        // With a constant leaf the parameters must be constants, to evaluate the layer.
+        if consts && (0..kids0.len()).any(|q| q != p && cx.const_val(kids0[q]).is_none()) {
             continue;
         }
-        let (Some(m1), Some(m2)) = (map_at(cx, n1, p), map_at(cx, n2, pairing[p])) else {
-            continue;
-        };
+        // Every non-constant leaf: the same layer, over its operand at the paired position.
+        let mut inner: Vec<Option<(u32, Map)>> = Vec::with_capacity(leaves.len());
+        for &l in leaves {
+            if cx.const_val(l).is_some() {
+                inner.push(None);
+                continue;
+            }
+            let Some(q) = paired(cx, n0, l, p) else {
+                continue 'position;
+            };
+            let Some(map) = map_at(cx, l, q) else {
+                continue 'position;
+            };
+            let x = cx.node(l).children().nth(q).unwrap_or(l);
+            inner.push(Some((x, map)));
+        }
         for input in [out, out.other()] {
             o.charge(1)?;
-            let c1 = classify(cx, o, &m1, x, input, out)?;
-            let c2 = classify(cx, o, &m2, y, input, out)?;
-            if let (Some(c), Some(d)) = (c1, c2)
-                && c == d
-            {
-                return Ok(Some((
-                    x,
-                    y,
-                    Mono {
-                        input,
-                        increasing: c.0,
-                        piece: c.1,
-                    },
-                )));
+            let mut mono: Option<(bool, i8)> = None;
+            let mut agree = true;
+            for (x, map) in inner.iter().flatten() {
+                match (classify(cx, o, map, Dom::Of(*x), input, out)?, mono) {
+                    (Some(c), None) => mono = Some(c),
+                    (Some(c), Some(m)) if c == m => {}
+                    _ => {
+                        agree = false;
+                        break;
+                    }
+                }
             }
+            let Some((increasing, piece)) = mono.filter(|_| agree) else {
+                continue;
+            };
+            let w = cx.width_of(kids0[p]);
+            if consts
+                && classify(cx, o, &map0, Dom::Any(w), input, out)? != Some((increasing, piece))
+            {
+                continue;
+            }
+            let m = Mono {
+                input,
+                increasing,
+                piece,
+            };
+            let mut inners = Vec::with_capacity(leaves.len());
+            for (i, &l) in leaves.iter().enumerate() {
+                match &inner[i] {
+                    Some((x, _)) => inners.push(Inner::Node(*x)),
+                    None => {
+                        let Some(c) = cx.const_val(l) else {
+                            continue 'position;
+                        };
+                        o.charge(1)?;
+                        let Some(v) = preimage(cx, n0, &map0, w, m, out, &c) else {
+                            continue 'position;
+                        };
+                        inners.push(Inner::Const(v));
+                    }
+                }
+            }
+            return Ok(Some((inners, m)));
         }
     }
     Ok(None)

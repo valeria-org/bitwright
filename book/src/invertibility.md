@@ -9,6 +9,10 @@ at equalities:
 - **move a constant across**: `f(x) == c` is `x == f⁻¹(c)`, or `false` when `c` has no
   preimage. A hash comparison becomes a plain equality.
 
+Both sides may be `select` trees over such values (a minimum or maximum written out): their
+leaves are cancelled together, a constant leaf by its preimage, so
+`select(c, x * 3, 7) == y * 3` is `select(c, x, 0xad) == y` at 8 bits.
+
 A bijection does not preserve order, so none of this applies to `<u` or `<s`: an ordering sees
 through a *strictly monotone* map instead (below).
 
@@ -95,7 +99,11 @@ when:
 The facts about `v` hold wherever the result is used, so a sum need only be monotone on the
 range they give: `x + 7 <u y + 7` is `x <u y` wherever both sums are known not to wrap (both on
 the wrapping side is fine too), and `x ^ 0x80` turns a signed comparison into an unsigned one.
-Against a constant, the threshold is found by bisection over the range of `x`.
+Against a constant, the threshold is found by bisection over the range of `x`. A `select`
+passes the order it is read in to its arms, so the leaves of `select` trees on both sides are
+peeled together, like the leaves of an equality: `select(c, zext(x), zext(y)) <u zext(z)` is
+`select(c, x, y) <u z`, and a minimum written out, `select(zext(x) <u zext(y), zext(x), zext(y))`,
+loses its casts in the condition as well, in that comparison's own step.
 
 ```rust
 use bitwright::engine::{Engine, Run};
@@ -125,6 +133,12 @@ assert_eq!(simplify(&mut cx, "zext<16>(x) <u 300", &[])?, "1:1");
 assert!(simplify(&mut cx, "x + 7 <u y + 7", &[])?.contains("+"));
 assert_eq!(simplify(&mut cx, "x + 7 <u y + 7", &["x <u 100", "y <u 100"])?, "x <u y");
 assert_eq!(simplify(&mut cx, "x + 7 <u 50", &["x <u 100"])?, "x <u 43");
+// Select trees: every leaf loses the layer, a constant leaf becomes its preimage.
+assert_eq!(
+    simplify(&mut cx, "select(zext<16>(x) <u zext<16>(y), zext<16>(x), zext<16>(y)) <u zext<16>(z)", &[])?,
+    "select(x <u y, x, y) <u z"
+);
+assert_eq!(simplify(&mut cx, "select(c, ~x, 5) <u ~z", &[])?, "z <u select(c, x, -6)");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

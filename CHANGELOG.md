@@ -15,6 +15,16 @@
   the threshold is found by bisection over the inner value's range, or the comparison is
   decided. Like the rest of the pass, a rewrite replaces a comparison by one of proper
   subterms and a constant and relies on the constraints its facts used.
+- **Comparisons of `select` trees are cancelled leaf by leaf.** A `select` passes what is
+  observed about it, its order or its equality, to its arms, so the leaves of the trees on both
+  sides of a comparison are peeled together through one common layer, injective for `==` and
+  `!=`, strictly monotone for an ordering, a constant leaf standing for its exact preimage:
+  `select(c, zext<16>(x), zext<16>(y)) <u zext<16>(z)` is `select(c, x, y) <u z`,
+  `select(c, ~x, 5) <u ~z` is `z <u select(c, x, 0xfa)` and `select(c, x * 3, 7) == y * 3` is
+  `select(c, x, 0xad) == y`; a minimum written out loses its casts in the condition too, in
+  that comparison's own step. The design notes (§8.1, "Observations") set out how this, the
+  equality cancellation and the demanded-bits pass are one idea with two kinds of
+  representative.
 
 ## 0.24.0
 

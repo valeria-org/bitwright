@@ -1152,6 +1152,67 @@ pub(crate) fn cancel_layer<O: Oracle>(
     Ok(None)
 }
 
+/// If every non-constant leaf is one injective layer over its own inner value, the same layer
+/// as the first leaf's with the same parameters, and every constant leaf has an exact preimage
+/// under it (its parameters then constants): the inner value of each leaf. Two `select` trees
+/// over the leaves are then equal exactly when the trees over the inner values are.
+pub(crate) fn cancel_leaves<O: Oracle>(
+    cx: &mut Context,
+    o: &mut O,
+    leaves: &[u32],
+) -> Result<Option<Vec<monotone::Inner>>, O::Err> {
+    use monotone::Inner;
+    let Some(&n0) = leaves.iter().find(|&&l| cx.const_val(l).is_none()) else {
+        return Ok(None);
+    };
+    let consts = leaves.iter().any(|&l| cx.const_val(l).is_some());
+    // The layer at `n0` with constant parameters, for the constant leaves.
+    let layer = if consts {
+        match solve_layer(cx, o, n0)? {
+            Some(l) => Some(l),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    let mut x0: Option<u32> = layer.as_ref().map(|l| l.inner);
+    let mut out = Vec::with_capacity(leaves.len());
+    for &l in leaves {
+        o.charge(1)?;
+        if l == n0 {
+            out.push(Inner::Node(0));
+            continue;
+        }
+        if let Some(c) = cx.const_val(l) {
+            let Some(layer) = &layer else {
+                return Ok(None);
+            };
+            match preimage(cx, o, n0, layer, &c)? {
+                Some(Some(v)) => out.push(Inner::Const(v)),
+                _ => return Ok(None),
+            }
+            continue;
+        }
+        let Some((p, q)) = cancel_layer(cx, o, n0, l)? else {
+            return Ok(None);
+        };
+        if x0.is_some_and(|x| x != p) {
+            return Ok(None);
+        }
+        x0 = Some(p);
+        out.push(Inner::Node(q));
+    }
+    let Some(x0) = x0 else {
+        return Ok(None);
+    };
+    for (i, &l) in leaves.iter().enumerate() {
+        if l == n0 {
+            out[i] = Inner::Node(x0);
+        }
+    }
+    Ok(Some(out))
+}
+
 // ----- chains (queries) ---------------------------------------------------------------------------
 
 /// How `e` depends on a subexpression `x`.

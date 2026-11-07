@@ -9,14 +9,19 @@
 //!   no preimage;
 //! - `a₁ | … | aₙ == 0` (and `a₁ & … & aₙ == ones`): every `aᵢ` is solved against the constant
 //!   on its own, and the answers are intersected, so one value compared with two different
-//!   constants is false.
+//!   constants is false;
+//! - the sides `select` trees: their leaves are peeled together through one common injective
+//!   layer, a constant leaf by its preimage (`select(c, x + 1, y + 1) == z + 1` is
+//!   `select(c, x, y) == z`).
 //!
 //! At `a <u b`, `a <=u b`, `a <s b` and `a <=s b` (see `crate::invert::monotone`):
 //!
-//! - both sides one strictly monotone layer over different operands (`f(x) <u f(y)`): the
-//!   operands are compared instead, in the order the layer is monotone from, swapped for a
-//!   decreasing layer, layer after layer (`zext(x) <s zext(y)` is `x <u y`, `~x <u ~y` is
-//!   `y <u x`, `x + k <u y + k` is `x <u y` where neither sum wraps);
+//! - both sides one strictly monotone layer over different operands (`f(x) <u f(y)`), or
+//!   `select` trees whose leaves all are: the operands (the trees over the inner values) are
+//!   compared instead, in the order the layer is monotone from, swapped for a decreasing layer,
+//!   layer after layer (`zext(x) <s zext(y)` is `x <u y`, `~x <u ~y` is `y <u x`, `x + k <u
+//!   y + k` is `x <u y` where neither sum wraps, `select(c, ~x, ~y) <u ~z` is
+//!   `z <u select(c, x, y)`);
 //! - against a constant on either side (`f(x) <u c`): `x` is compared with the threshold where
 //!   the comparison changes, found by bisection over `x`'s range, or the comparison is a
 //!   constant (`zext<16>(x) <u 300` at 8 bits is true).
@@ -33,7 +38,8 @@ use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::facts::Facts;
-use crate::invert::monotone::{self, Order};
+use crate::hash::IdMap;
+use crate::invert::monotone::{self, Inner, Order};
 use crate::invert::{self, MAX_SPLIT, Oracle, Solved};
 use crate::ops::{BinOp, CmpOp};
 
@@ -144,7 +150,78 @@ fn compare(
     })
 }
 
-/// `f(x) op f(y)` as `x op y`, through every common injective layer.
+/// The leaves of the `select` trees at `a` and `b` (the nodes under their arms that are not
+/// selects, without repeats), and whether any select was seen; `None` past [`MAX_SPLIT`]
+/// leaves.
+fn leaves(
+    cx: &Context,
+    o: &mut Calls<'_, '_, '_>,
+    a: u32,
+    b: u32,
+) -> Result<Option<(Vec<u32>, bool)>, Stop> {
+    let mut out = Vec::new();
+    let mut seen = false;
+    let mut stack = vec![b, a];
+    while let Some(i) = stack.pop() {
+        o.charge(1)?;
+        let node = cx.node(i);
+        if node.op == OpCode::Select {
+            seen = true;
+            stack.push(node.c);
+            stack.push(node.b);
+        } else if out.contains(&i) {
+        } else if out.len() >= MAX_SPLIT {
+            return Ok(None);
+        } else {
+            out.push(i);
+        }
+    }
+    Ok(Some((out, seen)))
+}
+
+/// `t` with each leaf replaced by its inner value (`map`), its selects rebuilt.
+fn relabel(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    t: u32,
+    map: &IdMap<u32, u32>,
+) -> Result<u32, Stop> {
+    if let Some(&x) = map.get(&t) {
+        return Ok(x);
+    }
+    let node = cx.node(t);
+    debug_assert_eq!(node.op, OpCode::Select);
+    let (c, p, q) = (node.a, node.b, node.c);
+    let p = relabel(cx, o, p, map)?;
+    let q = relabel(cx, o, q, map)?;
+    o.r.build(cx, |cx| cx.c_select(c, p, q))
+}
+
+/// The leaves of `a` and `b` as their inner values: the two trees over them.
+fn relabelled(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    a: u32,
+    b: u32,
+    leaves: &[u32],
+    inners: &[Inner],
+) -> Result<(u32, u32), Stop> {
+    let mut map = IdMap::default();
+    for (&l, x) in leaves.iter().zip(inners) {
+        let x = match x {
+            Inner::Node(x) => *x,
+            Inner::Const(v) => {
+                let v = *v;
+                o.r.build(cx, |cx| cx.mk_const(&v))?
+            }
+        };
+        map.insert(l, x);
+    }
+    Ok((relabel(cx, o, a, &map)?, relabel(cx, o, b, &map)?))
+}
+
+/// `f(x) op f(y)` as `x op y`, through every common injective layer; then, when the sides are
+/// `select` trees, their leaves peeled together through every common injective layer.
 fn cancel(
     cx: &mut Context,
     o: &mut Calls<'_, '_, '_>,
@@ -158,6 +235,15 @@ fn cancel(
         o.charge(1)?;
         (x, y) = (p, q);
         peeled = true;
+    }
+    if !peeled {
+        while let Some((ls, true)) = leaves(cx, o, x, y)? {
+            let Some(inners) = invert::cancel_leaves(cx, o, &ls)? else {
+                break;
+            };
+            (x, y) = relabelled(cx, o, x, y, &ls, &inners)?;
+            peeled = true;
+        }
     }
     if !peeled {
         return Ok(None);
@@ -180,7 +266,8 @@ fn solve(
     })
 }
 
-/// `f(x) op f(y)` as `x op' y`, through every common strictly monotone layer.
+/// `f(x) op f(y)` as `x op' y`, through every common strictly monotone layer, the sides
+/// `select` trees whose leaves are peeled together.
 fn cancel_order(
     cx: &mut Context,
     o: &mut Calls<'_, '_, '_>,
@@ -193,8 +280,11 @@ fn cancel_order(
     };
     let (mut x, mut y) = (a, b);
     let mut peeled = false;
-    while let Some((p, q, m)) = monotone::cancel(cx, o, x, y, order)? {
-        o.charge(1)?;
+    while let Some((ls, _)) = leaves(cx, o, x, y)? {
+        let Some((inners, m)) = monotone::cancel_many(cx, o, &ls, order)? else {
+            break;
+        };
+        let (p, q) = relabelled(cx, o, x, y, &ls, &inners)?;
         (x, y) = if m.increasing { (p, q) } else { (q, p) };
         order = m.input;
         peeled = true;
