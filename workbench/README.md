@@ -34,6 +34,22 @@ leading/trailing zero counts cannot be stated); *Export LaTeX* writes the deriva
 prover, in the browser, in milliseconds. *Large editor* makes room for `let` programs; *Copy
 link* copies the address of what you see.
 
+**My rules.** A `.bwr` program of your own, linked after the built-in rules in every run while
+*use in runs* is on. *Check* compiles it and runs the soundness checker: each rule sound (with
+the evidence), unsound (with a counterexample) or inconclusive, and the compiler's diagnostics
+with their lines. A run refuses rules the checker did not pass unless *trusted* is on, which
+links them without the checker and samples every application. Your rules appear in the story
+like any other, with their source on the card. The text is kept in the browser.
+
+**Lean theorems as rules.** *Import Lean theorems* reads Lean 4 statements about `BitVec`
+(`theorem t {w : Nat} (x y : BitVec w) (h : x.ult y) : lhs = rhs := …`): the binders become
+the parameters (a `Nat` is a width variable, `BitVec 32` a fixed width), hypotheses become
+`proves(…)` guards, and the equation becomes the rewrite. The proof is not read; Lean did it.
+A theorem outside the subset read (Booleans, `clz`, quantifiers in the statement) becomes a
+comment saying why. The translation lands in My rules, so you can read it, edit it and check it;
+the checker and Lean should agree, and when they do not, the counterexample says where the
+translation went wrong.
+
 **Phases.** The engine's strategy is a list of phases run in order, repeated until a round
 changes nothing. The toggles turn any phase off (or on): the result, the story and the
 inspector then show what that phase was doing. The two presets are the command line's

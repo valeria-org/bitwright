@@ -150,7 +150,12 @@
   rules are a click away. It imports a QF_BV script, exports the input and the result as flat
   SMT-LIB definitions with an equivalence query, as a Lean 4 `example` for `bv_decide`, or as a
   LaTeX derivation, and proves them equal with bitwright's own prover in the browser; expression
-  text is highlighted, in the editor too. The
+  text is highlighted, in the editor too. Rules of your own are checked and linked from a panel,
+  and Lean 4 theorems about `BitVec` are translated into rules (binders to parameters,
+  hypotheses to `proves` guards). The WebAssembly module gains `checkRules`, `leanToRules`, and
+  `rules`/`trusted` options on `trace`.
+- **The checker in one thread.** `check_program` runs on the calling thread where no thread
+  can be spawned (WebAssembly) or one is all there is, instead of failing. The
   WebAssembly module gains `trace` (with a `phases` option for a strategy of chosen phases),
   `evaluate`, `rules`, `fromSmtlib`, `toLean` and `equivalenceQuery` for it.
 - **The inspector** (`workbench/inspect.html`): a viewer of trace files, with no build step. Each

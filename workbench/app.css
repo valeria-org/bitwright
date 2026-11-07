@@ -558,3 +558,21 @@ pre.expr.hl { position: absolute; inset: 0; overflow: hidden; pointer-events: no
 mark .ts, mark .tc, mark .tv, mark .tf, mark .to { color: inherit; }
 .result .out .tv { font-weight: 500; }
 .xp .code, .result .out, .code.block { white-space: pre-wrap; }
+
+/* ---- my rules ------------------------------------------------------------------------------- */
+.myrules { margin-top: 10px; background: var(--sunk); border-radius: 8px; padding: 10px 12px 12px; }
+.mr-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.mr-head .t { font: 600 13px var(--sans); }
+.mr-head .muted { font-size: 12px; }
+.mr-head .right { margin-left: auto; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.chk { display: inline-flex; gap: 5px; align-items: center; font: 500 12px var(--sans); color: var(--ink-2); cursor: pointer; }
+.myrules textarea { width: 100%; min-height: 140px; resize: vertical; font: 400 12.5px/1.55 var(--mono); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; tab-size: 4; }
+.verdicts { display: grid; gap: 4px; margin-top: 8px; font-size: 12.5px; }
+.verdict { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 4px 12px; padding: 7px 10px; background: var(--surface); border-radius: 6px; }
+.verdict .v { font: 600 11px/1.7 var(--mono); text-transform: uppercase; letter-spacing: 0.05em; }
+.verdict.sound .v { color: var(--pass); }
+.verdict.unsound .v, .verdict.error .v { color: var(--miss); }
+.verdict.inconclusive .v, .verdict.warning .v { color: var(--solver); }
+.verdict.note .v { color: var(--ink-3); }
+.verdict .nm { font: 500 12.5px var(--mono); }
+.verdict .d { grid-column: 2; color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }

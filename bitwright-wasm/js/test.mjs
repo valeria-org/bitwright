@@ -58,6 +58,34 @@ assert.match(lean, /\(\(x &&& y\) \+ \(x \|\|\| y\)\)\n  = \(x \+ y\) := by\n  b
 assert.equal(bw.toLean("rotl(x, 8)", "", 32), "(x.rotateLeft 8)");
 assert.equal(bw.toLean("bswap(x)", "", 16), "((x.extractLsb' 0 8) ++ (x.extractLsb' 8 8))");
 assert.throws(() => bw.toLean("clz(x)", "", 32), /zero count/);
+// Rules of your own: checked, then linked; an unsound one is refused unless trusted.
+const mine = 'bitwright 1;\ngroup mine {\n  #[allow(BW0407)]\n  rule ctz_bitrev<W>(x: W) { ctz(bitrev(x)) => clz(x) }\n}\n';
+const checked = bw.checkRules(mine);
+assert.equal(checked.rules.length, 1);
+assert.equal(checked.rules[0].verdict, "sound");
+const withMine = bw.trace("ctz(bitrev(y))", 16, { rules: mine, phases: ["local"] }).trim().split("\n").map((l) => JSON.parse(l));
+assert.ok(withMine.some((l) => l.name === "mine::ctz_bitrev" && l.source.startsWith("rule ctz_bitrev")));
+assert.ok(withMine.some((l) => l.ev === "applied"));
+const unsound = 'bitwright 1;\ngroup bad {\n  #[allow(BW0407)]\n  rule add_is_or<W>(x: W, y: W) { x + y => x | y }\n}\n';
+assert.equal(bw.checkRules(unsound).rules[0].verdict, "unsound");
+assert.throws(() => bw.trace("a + b", 8, { rules: unsound }), /unsound/);
+assert.ok(bw.trace("a + b", 8, { rules: unsound, trusted: true }).includes('"trace":"bitwright"'));
+assert.ok(bw.checkRules("bitwright 1;\ngroup g { rule t<W>(x: W) { x + => x } }").diagnostics.length > 0);
+// Lean theorems as rules.
+const fromLean = bw.leanToRules(`
+theorem and_or {w : Nat} (x y : BitVec w) : (x &&& y) + (x ||| y) = x + y := by bv_decide
+theorem masked (x : BitVec 32) (h : x.ult 16#32) : x &&& 0xff#32 = x := by sorry
+theorem notBV (a b : Bool) : a = b := sorry
+`);
+assert.match(fromLean, /rule and_or<W>\(x: W, y: W\) \{\n\s+\(x & y\) \+ \(x \| y\) => x \+ y/);
+assert.match(fromLean, /rule masked\(x: 32\) \{\n\s+x & 0xff => x\n\s+if proves\(x <u 16\)/);
+assert.match(fromLean, /notBV: not translated/);
+// The generic rule is proved exhaustively; the fixed 32-bit one with a guard cannot be
+// enumerated, so the checker is inconclusive and Lean's proof is what vouches for it.
+assert.equal(bw.checkRules(fromLean).rules.map((r) => r.verdict).join(","), "sound,inconclusive");
+// Linked trusted, the translated rules run (fact folding gets `y & 0xff` first under the
+// assumption, so the rule is not what fires here; the run itself is what is checked).
+assert.ok(bw.trace("y & 0xff", 32, { rules: fromLean, trusted: true, assume: ["y <u 16"] }).includes('"trace":"bitwright"'));
 // The rule catalog.
 const rules = bw.rules();
 assert.ok(rules.length > 300);

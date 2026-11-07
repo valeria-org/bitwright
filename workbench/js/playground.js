@@ -75,6 +75,7 @@ const app = {
   treeFocus: true,
   point: {},
   rules: null,
+  myRules: { src: "", use: false, trusted: false },
 
   /// Expands step `i` (0-based) and scrolls to it: the trace view's "select".
   select(i) {
@@ -133,6 +134,10 @@ function runNow() {
     const opts = { assume: app.assumes };
     if (app.engine === "custom") opts.phases = app.phases ?? [];
     else opts.deobfuscate = app.engine === "deobfuscate";
+    if (app.myRules.use && app.myRules.src.trim()) {
+      opts.rules = app.myRules.src;
+      opts.trusted = app.myRules.trusted;
+    }
     app.trace = app.bw.trace(text, app.width, opts);
     [app.run] = parseTrace(app.trace);
     err.hidden = true;
@@ -325,6 +330,114 @@ $("proveBtn").addEventListener("click", () => {
       h("div", { class: "note" }, "This decides the whole run at once, independently of the rules' and passes' own proofs. For a certificate another checker can verify, export Lean (bv_decide) or SMT-LIB (z3, Bitwuzla)."),
     ],
   );
+});
+
+// ----- rules of your own ---------------------------------------------------------------------
+
+const RULES_SKELETON = `bitwright 1;
+
+group mine {
+    /// Counting the trailing zeros of the reversed bits counts the leading zeros.
+    #[example("ctz(bitrev(p:8))" => "clz(p)")]
+    rule ctz_bitrev<W>(x: W) { ctz(bitrev(x)) => clz(x) }
+
+    /// A guard from the facts: only where x is known to fit in four bits.
+    #[allow(BW0407)]
+    rule low_nibble<W>(x: W) where W >= 5 { x & 0xf => x if proves(x <u 16) }
+}
+`;
+
+function saveRules() {
+  try {
+    localStorage.setItem("wb-rules", JSON.stringify(app.myRules));
+  } catch {
+    // the page keeps them
+  }
+}
+
+function loadRules() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("wb-rules") ?? "null");
+    if (saved && typeof saved.src === "string") app.myRules = { src: saved.src, use: !!saved.use, trusted: !!saved.trusted };
+  } catch {
+    // none saved
+  }
+  if (!app.myRules.src) app.myRules.src = RULES_SKELETON;
+  $("rulesSrc").value = app.myRules.src;
+  $("useRules").checked = app.myRules.use;
+  $("trustRules").checked = app.myRules.trusted;
+}
+
+$("rulesBtn").addEventListener("click", () => {
+  const box = $("myrules");
+  box.hidden = !box.hidden;
+  if (!box.hidden) $("rulesSrc").focus();
+});
+$("rulesSrc").addEventListener("input", (e) => {
+  app.myRules.src = e.target.value;
+  saveRules();
+  if (app.myRules.use) schedule();
+});
+$("useRules").addEventListener("change", (e) => {
+  app.myRules.use = e.target.checked;
+  saveRules();
+  $("rulesBtn").textContent = app.myRules.use ? "My rules · on" : "My rules";
+  schedule();
+});
+$("trustRules").addEventListener("change", (e) => {
+  app.myRules.trusted = e.target.checked;
+  saveRules();
+  if (app.myRules.use) schedule();
+});
+$("checkRules").addEventListener("click", () => {
+  if (!app.bw) return;
+  const out = $("verdicts");
+  fill(out, h("div", { class: "muted" }, "Checking…"));
+  setTimeout(() => {
+    let r;
+    const t0 = performance.now();
+    try {
+      r = app.bw.checkRules(app.myRules.src);
+    } catch (e) {
+      fill(out, h("div", { class: "verdict error" }, h("span", { class: "v" }, "error"), h("span", { class: "nm" }, e.message)));
+      return;
+    }
+    const items = [];
+    for (const d of r.diagnostics) {
+      const line = app.myRules.src.slice(0, d.start).split("\n").length;
+      items.push(h("div", { class: `verdict ${d.level}` }, h("span", { class: "v" }, d.level), h("span", { class: "nm" }, `${d.code} · line ${line}`), h("span", { class: "d" }, d.message)));
+    }
+    for (const c of r.rules) {
+      const detail = c.verdict === "sound" ? ledgerText(c.evidence) : c.verdict === "unsound" ? `counterexample: ${c.detail}` : `not enough evidence: ${c.detail}. A fixed width the checker cannot enumerate, or a guard the samples rarely meet; link trusted when a proof elsewhere vouches for it.`;
+      items.push(h("div", { class: `verdict ${c.verdict}` }, h("span", { class: "v" }, c.verdict), h("span", { class: "nm" }, `${c.name} `, h("span", { class: "muted" }, c.kind)), h("span", { class: "d" }, detail, c.failedExamples ? ` · ${c.failedExamples} example${c.failedExamples > 1 ? "s" : ""} did not hold` : "")));
+    }
+    if (items.length === 0) items.push(h("div", { class: "muted" }, "No rules."));
+    items.push(h("div", { class: "muted", style: { fontSize: "12px" } }, `${(performance.now() - t0).toFixed(0)} ms. Sound rules link with the checker's ledger; trusted links them without it, every application sampled.`));
+    fill(out, items);
+  }, 20);
+});
+$("leanBtn").addEventListener("click", () => {
+  const ta = h("textarea", { spellcheck: "false", placeholder: "theorem and_or {w : Nat} (x y : BitVec w) : (x &&& y) + (x ||| y) = x + y := by\n  bv_decide\n\ntheorem masked (x : BitVec 32) (h : x.ult 16#32) : x &&& 0xff#32 = x := by\n  bv_decide" });
+  const note = h("div", { class: "note" }, "Theorems proved in Lean become rules: binders are the parameters, hypotheses become proves(…) guards, the equation is the rewrite. The result lands in My rules, where you can read, edit and check it. Lean already proved them, so you may link them trusted; where the checker can enumerate, it should agree.");
+  const go = (replace) => {
+    if (!app.bw) return;
+    const bwr = app.bw.leanToRules(ta.value);
+    if (replace || !app.myRules.src.trim() || app.myRules.src === RULES_SKELETON) {
+      app.myRules.src = bwr;
+    } else {
+      const body = bwr.split("group lean {")[1]?.replace(/}\s*$/, "") ?? "";
+      const notes = bwr.split("\n").filter((l) => l.startsWith("//")).join("\n");
+      app.myRules.src = `${app.myRules.src.trimEnd()}\n\n${notes ? `${notes}\n` : ""}group lean {${body}}\n`;
+    }
+    $("rulesSrc").value = app.myRules.src;
+    saveRules();
+    $("myrules").hidden = false;
+    $("io").hidden = true;
+    $("checkRules").click();
+    if (app.myRules.use) schedule();
+  };
+  panel("Import Lean theorems", null, [ta, note], [h("button", { type: "button", class: "quiet", onclick: () => go(false) }, "Append"), h("button", { type: "button", class: "primary", onclick: () => go(true) }, "Replace my rules")]);
+  ta.focus();
 });
 
 $("shareBtn").addEventListener("click", (e) => {
@@ -622,6 +735,8 @@ async function start() {
   popover.install();
   popover.wire(app, main);
   readUrl();
+  loadRules();
+  $("rulesBtn").textContent = app.myRules.use ? "My rules · on" : "My rules";
   $("expr").value = app.text;
   grow();
   renderControls();

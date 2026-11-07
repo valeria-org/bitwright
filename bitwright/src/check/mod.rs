@@ -787,13 +787,21 @@ pub fn check_program(program: &RuleProgram, cfg: &CheckConfig) -> Vec<RuleCheck>
         .min(rules.len().max(1));
     let chunk = rules.len().div_ceil(threads.max(1)).max(1);
     let mut out: Vec<RuleCheck> = Vec::with_capacity(rules.len());
+    // One thread (or none to be had, as in WebAssembly): on the calling thread.
+    if threads <= 1 {
+        out.extend(rules.iter().map(|r| check_rule(r, cfg)));
+        return out;
+    }
     std::thread::scope(|s| {
-        let handles: Vec<_> = rules
-            .chunks(chunk)
-            .map(|part| {
-                s.spawn(move || part.iter().map(|r| check_rule(r, cfg)).collect::<Vec<_>>())
-            })
-            .collect();
+        let mut handles = Vec::new();
+        for part in rules.chunks(chunk) {
+            let work = move || part.iter().map(|r| check_rule(r, cfg)).collect::<Vec<_>>();
+            match std::thread::Builder::new().spawn_scoped(s, work) {
+                Ok(h) => handles.push(h),
+                // No thread to be had: this part on the calling thread.
+                Err(_) => out.extend(part.iter().map(|r| check_rule(r, cfg))),
+            }
+        }
         for h in handles {
             // A panicking check is a bug in the checker; surface it.
             match h.join() {
