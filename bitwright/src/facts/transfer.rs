@@ -95,8 +95,8 @@ fn from_urange(lo: BitVec, hi: BitVec) -> Facts {
 
 /// Up to `limit` concrete values consistent with `f`, if there are that few.
 fn small_set(f: &Facts, limit_bits: u32) -> Option<Vec<BitVec>> {
-    let vals = f.known.enumerate(limit_bits)?;
-    Some(vals.into_iter().filter(|v| f.contains(v)).collect())
+    f.known
+        .enumerate_where(limit_bits, usize::MAX, |v| f.contains(v))
 }
 
 /// Join of `g(v)` over every value `v` of `f`, if there are at most 16.

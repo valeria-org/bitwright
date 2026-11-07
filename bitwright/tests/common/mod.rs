@@ -9,7 +9,7 @@
 // Each test binary uses a different part of this module.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -787,7 +787,8 @@ pub fn envs_for(dag: &Dag, rng: &mut Rng, max_bits: u32, samples: usize) -> Vec<
 #[derive(Debug)]
 pub struct Canonical {
     nodes: Vec<(Expr, View, u16)>,
-    index: HashMap<Expr, usize>,
+    /// Each node's position in `nodes`, by its index in the context.
+    index: Vec<usize>,
     keys: Vec<Option<SymbolKey>>,
     ext: Vec<Option<ExtKind>>,
     roots: Vec<Expr>,
@@ -797,7 +798,7 @@ impl Canonical {
     pub fn new(cx: &mut Context, roots: &[Expr]) -> Canonical {
         let order = cx.post_order(roots).unwrap();
         let mut nodes = Vec::with_capacity(order.len());
-        let mut index = HashMap::new();
+        let mut index = Vec::new();
         let mut keys = Vec::with_capacity(order.len());
         let mut ext = Vec::with_capacity(order.len());
         for e in order {
@@ -813,7 +814,11 @@ impl Canonical {
                 }
                 _ => None,
             });
-            index.insert(e, nodes.len());
+            let i = e.index() as usize;
+            if index.len() <= i {
+                index.resize(i + 1, usize::MAX);
+            }
+            index[i] = nodes.len();
             nodes.push((e, view, cx.width(e).unwrap().bits()));
         }
         Canonical {
@@ -834,7 +839,7 @@ impl Canonical {
     /// given values instead of their own.
     pub fn eval(&self, env: &[(SymbolKey, BitVec)], overrides: &[(Expr, r::Bits)]) -> Vec<r::Bits> {
         let mut v: Vec<r::Bits> = Vec::with_capacity(self.nodes.len());
-        let at = |v: &Vec<r::Bits>, e: &Expr| v[self.index[e]].clone();
+        let at = |v: &Vec<r::Bits>, e: &Expr| v[self.index[e.index() as usize]].clone();
         for (k, (e, view, width)) in self.nodes.iter().enumerate() {
             if let Some((_, o)) = overrides.iter().find(|(t, _)| t == e) {
                 v.push(o.clone());

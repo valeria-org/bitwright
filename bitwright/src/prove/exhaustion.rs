@@ -118,33 +118,93 @@ impl Exhaustion {
         for s in scheduled.iter_mut().take(1 + self.inputs as usize) {
             *s = true;
         }
-        // The nodes a literal needs that are not scheduled yet, in topological order.
-        let missing = |scheduled: &[bool], roots: &[L]| -> Vec<u32> {
-            let mut mark = vec![false; nodes];
-            let mut stack: Vec<u32> = roots.iter().map(|&l| l >> 1).collect();
-            while let Some(n) = stack.pop() {
-                if scheduled[n as usize] || core::mem::replace(&mut mark[n as usize], true) {
-                    continue;
-                }
-                if let Some((a, b)) = self.gate(n) {
-                    stack.push(a >> 1);
-                    stack.push(b >> 1);
+        // The unscheduled part of a cone, visited once per query: the marks are stamped, so
+        // a query costs that part and not the circuit, which the greedy choice below asks
+        // once per pending conjunct per round.
+        struct Cone<'a> {
+            circuit: &'a Exhaustion,
+            mark: Vec<u32>,
+            stamp: u32,
+            stack: Vec<u32>,
+        }
+        impl Cone<'_> {
+            /// Visits the unscheduled nodes under `roots` once each, at most `limit` of them.
+            fn walk(
+                &mut self,
+                scheduled: &[bool],
+                roots: &[L],
+                limit: usize,
+                mut visit: impl FnMut(u32),
+            ) {
+                self.stamp += 1;
+                self.stack.clear();
+                self.stack.extend(roots.iter().map(|&l| l >> 1));
+                let mut seen = 0;
+                while seen < limit
+                    && let Some(n) = self.stack.pop()
+                {
+                    if scheduled[n as usize] || self.mark[n as usize] == self.stamp {
+                        continue;
+                    }
+                    self.mark[n as usize] = self.stamp;
+                    seen += 1;
+                    visit(n);
+                    if let Some((a, b)) = self.circuit.gate(n) {
+                        self.stack.push(a >> 1);
+                        self.stack.push(b >> 1);
+                    }
                 }
             }
-            (0..nodes as u32).filter(|&n| mark[n as usize]).collect()
+
+            /// How many nodes a literal needs that are not scheduled yet, or `limit` if at
+            /// least that many.
+            fn count(&mut self, scheduled: &[bool], l: L, limit: usize) -> usize {
+                let mut n = 0;
+                self.walk(scheduled, &[l], limit, |_| n += 1);
+                n
+            }
+
+            /// The nodes some literals need that are not scheduled yet, in topological
+            /// order: the gates are in that order, so it is the order of their indices.
+            fn missing(&mut self, scheduled: &[bool], roots: &[L]) -> Vec<u32> {
+                let mut found = Vec::new();
+                self.walk(scheduled, roots, usize::MAX, |n| found.push(n));
+                found.sort_unstable();
+                found
+            }
+        }
+        let mut cone = Cone {
+            circuit: self,
+            mark: vec![0; nodes],
+            stamp: 0,
+            stack: Vec::new(),
         };
         let mut order: Vec<(Vec<u32>, L)> = Vec::new();
         let goal = match self.conjuncts() {
             Some(mut pending) => {
-                // Greedily the conjunct that needs the fewest new gates.
+                // Greedily the conjunct that needs the fewest new gates (the first of them in
+                // `pending`). A count only falls as gates are scheduled, so the last one
+                // bounds the next: the round starts from the conjunct with the lowest bound,
+                // whose count is exact, and every other walk is cut off at that count.
+                let mut counts: Vec<usize> = pending
+                    .iter()
+                    .map(|&l| cone.count(&scheduled, l, usize::MAX))
+                    .collect();
                 while !pending.is_empty() {
-                    let (best, nodes) = pending
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &l)| (i, missing(&scheduled, &[l])))
-                        .min_by_key(|(_, n)| n.len())
-                        .unwrap();
+                    let mut best = (0..pending.len()).min_by_key(|&i| counts[i]).unwrap();
+                    counts[best] = cone.count(&scheduled, pending[best], usize::MAX);
+                    for i in 0..pending.len() {
+                        let c = cone.count(&scheduled, pending[i], counts[best] + 1);
+                        if c <= counts[best] {
+                            counts[i] = c;
+                            if c < counts[best] || i < best {
+                                best = i;
+                            }
+                        }
+                    }
                     let l = pending.swap_remove(best);
+                    counts.swap_remove(best);
+                    let nodes = cone.missing(&scheduled, &[l]);
                     for &n in &nodes {
                         scheduled[n as usize] = true;
                     }
@@ -153,7 +213,7 @@ impl Exhaustion {
                 None
             }
             None => {
-                let nodes = missing(&scheduled, &[self.goal]);
+                let nodes = cone.missing(&scheduled, &[self.goal]);
                 for &n in &nodes {
                     scheduled[n as usize] = true;
                 }
@@ -161,7 +221,7 @@ impl Exhaustion {
                 Some(())
             }
         };
-        let constraint_nodes = missing(&scheduled, &self.constraints);
+        let constraint_nodes = cone.missing(&scheduled, &self.constraints);
 
         // Liveness: the last position at which each node is read. Segment ends read their
         // literal; constraints are read after everything.

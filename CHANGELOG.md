@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Exhaustion certificates are scheduled in near-linear time.** `Exhaustion::check` simulates
+  the goal's conjuncts cheapest cone first, and chose each round's conjunct by walking the
+  unscheduled cone of every pending one with a fresh mark per node and a scan of the whole
+  circuit: quadratic in the conjuncts times the circuit, serial, and below about 28 inputs
+  most of the check (1.5 s of the 1.7 s a 43k-gate certificate over 24 inputs took). The
+  walks now share stamped marks and are cut off at the round's best count, so a round costs
+  about the pending conjuncts times that count (0.1 s there). The schedule is the same, so
+  the simulation is unchanged.
+- **`enumerate_values` stops at its limit.** It built every candidate of the known bits (up to
+  2^20, a heap allocation each), filtered them by the ranges and threw the list away when more
+  than `limit` were left. It now keeps admitted values as it goes and stops at the first past
+  the limit; the same answer, at a bounded cost. The fact transfers over small value sets use
+  the same enumeration.
+- Tests: `value::tests::random_wide_widths_deep` (and the short `random_wide_widths`) run each
+  width's samples in chunks across the available threads, each chunk on its own stream (the
+  deep run takes 10 s of wall time on 20 threads, from 140); the test oracle `Canonical`
+  indexes nodes by position instead of hashing them.
+
 - **A register read through its low bits is a narrow variable to the MBA certificates.** The
   question's casts are taken out before the normal form and the certificates (`decast`), but a
   truncated register (`trunc<32>(x)`, or `x & 0xffffffff` after the rules) was left as the

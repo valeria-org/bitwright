@@ -1271,9 +1271,7 @@ impl Context {
         }
         // From the known bits otherwise.
         Ok(f.known
-            .enumerate(20)
-            .map(|vs| vs.into_iter().filter(|v| f.contains(v)).collect::<Vec<_>>())
-            .filter(|vs| vs.len() as u64 <= limit))
+            .enumerate_where(20, limit as usize, |v| f.contains(v)))
     }
 
     /// Facts about `e` under `assumptions`, or `None` if the assumptions are infeasible for
