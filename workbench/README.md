@@ -25,11 +25,13 @@ browses the built-in corpus (search by name, text or doc, click an example to lo
 popover; the button at the top right switches the theme.
 
 **In and out.** *Import SMT-LIB* reads a QF_BV script (its last definition, or its assertions
-conjoined; the symbols keep their declared widths). *Export SMT-LIB* writes the equivalence
-query of the input and the result, for z3 or Bitwuzla (`unsat` means they agree everywhere);
-*Export Lean* writes them as a Lean 4 `example` that `bv_decide` checks (for what Lean's core
-`BitVec` can state: no bit counts, byte swaps or floats); *Export LaTeX* writes the derivation
-as an aligned equation, one line per step. *Large editor* makes room for `let` programs; *Copy
+conjoined; the symbols keep their declared widths). *Export SMT-LIB* writes the input and the
+result as flat definitions, asserted different, for z3 or Bitwuzla (`unsat` means they agree
+everywhere), or either one alone; *Export Lean* writes them as a Lean 4 `example` that
+`bv_decide` checks (byte swaps, bit reversals and popcounts are written with slices; floats and
+leading/trailing zero counts cannot be stated); *Export LaTeX* writes the derivation as an
+`align*` block, one line per step. *Prove here* decides input = result with bitwright's own
+prover, in the browser, in milliseconds. *Large editor* makes room for `let` programs; *Copy
 link* copies the address of what you see.
 
 **Phases.** The engine's strategy is a list of phases run in order, repeated until a round

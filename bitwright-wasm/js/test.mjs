@@ -56,7 +56,8 @@ const lean = bw.toLean("(x & y) + (x | y)", "x + y", 32);
 assert.match(lean, /example \(x : BitVec 32\) \(y : BitVec 32\) :/);
 assert.match(lean, /\(\(x &&& y\) \+ \(x \|\|\| y\)\)\n  = \(x \+ y\) := by\n  bv_decide/);
 assert.equal(bw.toLean("rotl(x, 8)", "", 32), "(x.rotateLeft 8)");
-assert.throws(() => bw.toLean("popcnt(x)", "", 32), /bit count/);
+assert.equal(bw.toLean("bswap(x)", "", 16), "((x.extractLsb' 0 8) ++ (x.extractLsb' 8 8))");
+assert.throws(() => bw.toLean("clz(x)", "", 32), /zero count/);
 // The rule catalog.
 const rules = bw.rules();
 assert.ok(rules.length > 300);

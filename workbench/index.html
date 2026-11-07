@@ -25,7 +25,10 @@ try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "da
 <main class="pg-main" id="main">
   <section class="editor" id="editor">
     <label class="sr" for="expr">Expression</label>
-    <textarea id="expr" class="expr" rows="2" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Type an expression: (x ^ y) + 2 * (x &amp; y)"></textarea>
+    <div class="editor-wrap">
+      <pre class="expr hl" id="exprHl" aria-hidden="true"></pre>
+      <textarea id="expr" class="expr" rows="2" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Type an expression: (x ^ y) + 2 * (x &amp; y)"></textarea>
+    </div>
     <div class="controls">
       <div class="seg" role="radiogroup" aria-label="Width" id="widths"></div>
       <div class="seg" role="radiogroup" aria-label="Engine" id="engines"></div>
@@ -46,6 +49,8 @@ try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "da
       <button type="button" class="quiet" data-export="smtlib" title="An SMT-LIB script that is unsat exactly when the input and the result are equal">Export SMT-LIB</button>
       <button type="button" class="quiet" data-export="lean" title="A Lean 4 example: input = result, by bv_decide">Export Lean</button>
       <button type="button" class="quiet" data-export="latex" title="The input and the result as LaTeX">Export LaTeX</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="proveBtn" title="Decide input = result with bitwright's own prover, here in the browser">Prove here</button>
       <span class="sepv"></span>
       <button type="button" class="quiet" id="shareBtn" title="Copy a link to this view">Copy link</button>
     </div>

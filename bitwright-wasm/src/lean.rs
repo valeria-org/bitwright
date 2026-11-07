@@ -20,7 +20,25 @@ pub fn term(cx: &Context, e: Expr) -> Result<String, String> {
             match op {
                 UnOp::Not => format!("(~~~{a})"),
                 UnOp::Neg => format!("(-{a})"),
-                _ => return Err("a bit count, byte swap or bit reversal".into()),
+                // Written with slices and concatenation, which bv_decide understands.
+                UnOp::Bswap if w % 8 == 0 => {
+                    let bytes: Vec<String> = (0..w / 8)
+                        .map(|i| format!("({a}.extractLsb' {} 8)", i * 8))
+                        .collect();
+                    format!("({})", bytes.join(" ++ "))
+                }
+                UnOp::BitRev => {
+                    let bits: Vec<String> =
+                        (0..w).map(|i| format!("({a}.extractLsb' {i} 1)")).collect();
+                    format!("({})", bits.join(" ++ "))
+                }
+                UnOp::Popcnt => {
+                    let bits: Vec<String> = (0..w)
+                        .map(|i| format!("(({a}.extractLsb' {i} 1).zeroExtend {w})"))
+                        .collect();
+                    format!("({})", bits.join(" + "))
+                }
+                _ => return Err("a leading or trailing zero count".into()),
             }
         }
         View::Bin(op, a, b) => {

@@ -4,7 +4,7 @@
 // six-tab inspector (inspect.html) opens on the same run.
 
 import { parseTrace, provenance, symbolWidth } from "./model.js";
-import { print, short, latex } from "./print.js";
+import { print, short, latex, highlight, smtScript } from "./print.js";
 import { h, fill, chip, kindClass } from "./dom.js";
 import { stepBody } from "./trace-view.js";
 import * as popover from "./popover.js";
@@ -200,7 +200,12 @@ function grow() {
   const ta = $("expr");
   ta.style.height = "auto";
   ta.style.height = `${Math.min(ta.scrollHeight + 2, window.innerHeight * 0.6)}px`;
+  const hl = $("exprHl");
+  hl.innerHTML = `${highlight(ta.value)}\n`;
+  hl.style.height = ta.style.height;
+  hl.scrollTop = ta.scrollTop;
 }
+$("expr").addEventListener("scroll", () => { $("exprHl").scrollTop = $("expr").scrollTop; });
 $("expr").addEventListener("input", (e) => {
   app.text = e.target.value;
   grow();
@@ -259,14 +264,35 @@ function exportAs(kind) {
   const output = print(run, run.result.expr, { lets: false });
   try {
     if (kind === "smtlib") {
-      const text = app.bw.equivalenceQuery(input, output, app.width);
-      panel("SMT-LIB", "unsat means the input and the result agree at every point: pipe it to z3 -in or bitwuzla", h("pre", {}, text), [copyButton(text), downloadButton("equivalence.smt2", text)]);
+      const modes = [
+        ["both", "input and result, asserted different: unsat means they agree everywhere (z3 -in, bitwuzla)"],
+        ["input", "the input as a definition"],
+        ["result", "the result as a definition"],
+      ];
+      let mode = "both";
+      const pre = h("pre");
+      const note = h("div", { class: "note" });
+      const text = () => {
+        try {
+          if (mode === "input") return smtScript(run, [["input", run.result.input]], false);
+          if (mode === "result") return smtScript(run, [["result", run.result.expr]], false);
+          return smtScript(run, [["input", run.result.input], ["result", run.result.expr]], true);
+        } catch (e) {
+          // An operator QF_BV lacks: the library's form, one definition per node.
+          note.textContent = `Flat form impossible (${e.message}); this is the library's own export, one definition per node.`;
+          return mode === "both" ? app.bw.equivalenceQuery(input, output, app.width) : app.bw.toSmtlib(mode === "input" ? input : output, app.width);
+        }
+      };
+      const seg = h("div", { class: "seg" }, modes.map(([m, tip]) => h("button", { type: "button", class: m === mode ? "on" : "", title: tip, onclick: (e) => { mode = m; for (const b of seg.children) b.classList.toggle("on", b === e.target); note.textContent = modes.find(([x]) => x === m)[1]; pre.textContent = text(); } }, m)));
+      note.textContent = modes[0][1];
+      pre.textContent = text();
+      panel("SMT-LIB", null, [seg, pre, note], [copyButton(text), downloadButton("bitwright.smt2", text)]);
     } else if (kind === "lean") {
       const text = app.bw.toLean(input, output, app.width);
       panel("Lean 4", "an example bv_decide checks; needs Std's BVDecide", h("pre", {}, text), [copyButton(text), downloadButton("Equation.lean", text)]);
     } else if (kind === "latex") {
       const steps = run.steps.filter((s) => s.kind !== "fold");
-      const lines = [`${latex(run, run.result.input)}`, ...steps.map((s) => `  &= ${latex(run, s.whole.after)} && \text{${s.kind === "rule" ? s.name.split("::").pop().replace(/_/g, "\\_") : s.name}}`)];
+      const lines = [`${latex(run, run.result.input)}`, ...steps.map((s) => `  &= ${latex(run, s.whole.after)} && \\text{${s.kind === "rule" ? s.name.split("::").pop().replace(/_/g, "\\_") : s.name}}`)];
       const text = ["\\begin{align*}", lines.join(" \\\\\n"), "\\end{align*}"].join("\n");
       const short = `${latex(run, run.result.input)} = ${latex(run, run.result.expr)}`;
       panel("LaTeX", "the input and every step as an aligned derivation; the short form is the input and the result alone", [h("pre", {}, text), h("div", { class: "note" }, "Short form:"), h("pre", {}, short)], [copyButton(text), downloadButton("derivation.tex", text)]);
@@ -276,6 +302,30 @@ function exportAs(kind) {
     panel(kind === "lean" ? "Lean 4" : kind, null, h("div", { class: "note warn" }, why));
   }
 }
+
+$("proveBtn").addEventListener("click", () => {
+  const run = app.run;
+  if (!run?.result || !app.bw) return;
+  const input = print(run, run.result.input, { lets: false });
+  const output = print(run, run.result.expr, { lets: false });
+  const t0 = performance.now();
+  let verdict;
+  try {
+    verdict = app.bw.equivalent(input, output, app.width);
+  } catch (e) {
+    verdict = `error: ${e.message}`;
+  }
+  const ms = (performance.now() - t0).toFixed(1);
+  const ok = verdict === "equivalent";
+  panel(
+    "Proved here",
+    `bitwright's own prover (bit-blasting and its SAT solver), in this browser, ${ms} ms`,
+    [
+      h("div", { class: ok ? "note" : "note warn", style: { fontSize: "13.5px", color: ok ? "var(--pass)" : "" } }, ok ? "Input and result are equal at every point: the engine's rewrites were right." : verdict === "undecided" ? "Not decided within the prover's default budget." : verdict),
+      h("div", { class: "note" }, "This decides the whole run at once, independently of the rules' and passes' own proofs. For a certificate another checker can verify, export Lean (bv_decide) or SMT-LIB (z3, Bitwuzla)."),
+    ],
+  );
+});
 
 $("shareBtn").addEventListener("click", (e) => {
   writeUrl();
@@ -348,7 +398,7 @@ function renderStory() {
         { type: "button", class: "head", "aria-expanded": String(isOpen), onclick: () => { if (app.open.has(i)) app.open.delete(i); else app.open.add(i); renderStory(); } },
         h("span", { class: "i" }, String(s.index)),
         h("span", { class: "dot" }),
-        h("span", { class: "what", title: `${print(run, s.before)}  ⇒  ${print(run, s.after)}` }, short(run, s.before, 70), h("span", { class: "arr" }, "→"), h("span", { class: "to" }, short(run, s.after, 50))),
+        h("span", { class: "what", title: `${print(run, s.before)}  ⇒  ${print(run, s.after)}` }, h("span", { html: highlight(short(run, s.before, 90)) }), h("span", { class: "arr" }, "→"), h("span", { class: "to", html: highlight(short(run, s.after, 70)) })),
         h("span", { class: "by" }, by, h("small", {}, byKind)),
         h("span", { class: `delta${sa < sb ? " down" : ""}`, title: `${sb} → ${sa} nodes` }, sa < sb ? `−${sb - sa}` : sa > sb ? `+${sa - sb}` : "="),
       ),
