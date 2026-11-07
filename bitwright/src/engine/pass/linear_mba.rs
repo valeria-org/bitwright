@@ -616,6 +616,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         super::discard(r, cx, before);
         return Ok(Step::Normal(f));
     }
+    let kind = match &cand {
+        Candidate::Affine(..) => "affine",
+        Candidate::Indicators(..) => "indicators",
+        Candidate::Conjunctions(..) => "conjunctions",
+    };
     let form = match cand {
         Candidate::Affine(konst, terms) => {
             let terms: Vec<(u32, BitVec)> =
@@ -651,6 +656,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     };
     let e = linear::emit(r, cx, &form)?;
+    r.explain_with(|| crate::engine::Explanation::LinearMba {
+        atoms: reg.atoms.iter().map(|&a| cx.handle(a)).collect(),
+        corners: sig.clone(),
+        form: kind,
+    });
     finish(
         r,
         cx,

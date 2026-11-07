@@ -1056,6 +1056,18 @@ pub(crate) fn solve_eq<O: Oracle>(
     e: u32,
     c: &BitVec,
 ) -> Result<Option<Solved>, O::Err> {
+    solve_eq_peels(cx, o, e, c, None)
+}
+
+/// [`solve_eq`], recording in `peels` each layer undone: its top node, the layer, and the
+/// preimage of the constant under it (`None`: nothing maps to it).
+pub(crate) fn solve_eq_peels<O: Oracle>(
+    cx: &mut Context,
+    o: &mut O,
+    e: u32,
+    c: &BitVec,
+    mut peels: Option<&mut Vec<(u32, Layer, Option<BitVec>)>>,
+) -> Result<Option<Solved>, O::Err> {
     let (mut cur, mut val) = (e, *c);
     let mut peeled = false;
     loop {
@@ -1065,14 +1077,49 @@ pub(crate) fn solve_eq<O: Oracle>(
         };
         match preimage(cx, o, cur, &l, &val)? {
             None => break,
-            Some(None) => return Ok(Some(Solved::Const(false))),
+            Some(None) => {
+                if let Some(p) = peels.as_deref_mut() {
+                    p.push((cur, l, None));
+                }
+                return Ok(Some(Solved::Const(false)));
+            }
             Some(Some(v)) => {
-                (cur, val) = (l.inner, v);
+                let next = l.inner;
+                if let Some(p) = peels.as_deref_mut() {
+                    p.push((cur, l, Some(v)));
+                }
+                (cur, val) = (next, v);
                 peeled = true;
             }
         }
     }
     Ok(peeled.then_some(Solved::Eq(cur, val)))
+}
+
+impl Map {
+    /// How the layer maps its operand `v`, written with `k` for its parameter.
+    pub(crate) fn spelling(&self) -> &'static str {
+        match self {
+            Map::Un(UnOp::Not) => "~v",
+            Map::Un(UnOp::Neg) => "-v",
+            Map::Un(UnOp::Bswap) => "bswap(v)",
+            Map::Un(UnOp::BitRev) => "bitrev(v)",
+            Map::Un(_) => "op(v)",
+            Map::Add(_) => "v + k",
+            Map::Sub(_) => "v - k",
+            Map::SubFrom(_) => "k - v",
+            Map::Xor(_) => "v ^ k",
+            Map::Mul(_) => "v * k",
+            Map::RotL(_) => "rotl(v, k)",
+            Map::RotR(_) => "rotr(v, k)",
+            Map::Zext => "zext(v)",
+            Map::Sext => "sext(v)",
+            Map::ConcatHi(_) => "concat(v, k)",
+            Map::ConcatLo(_) => "concat(k, v)",
+            Map::Ext { .. } => "ext",
+            Map::Region(_) => "region",
+        }
+    }
 }
 
 // ----- cancelling on both sides (R1) --------------------------------------------------------------

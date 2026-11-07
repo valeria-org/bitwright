@@ -177,6 +177,21 @@ pub(crate) enum Cert {
     Carries,
 }
 
+impl Cert {
+    /// A short name, as `CertStats` counts it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Cert::Signature => "signature",
+            Cert::SingleBit => "single_bit",
+            Cert::Sparse => "sparse",
+            Cert::Grid => "grid",
+            Cert::Exhaustive => "exhaustive",
+            Cert::Symbolic => "symbolic",
+            Cert::Carries => "carries",
+        }
+    }
+}
+
 /// What a certificate found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Report {

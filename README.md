@@ -64,6 +64,9 @@ fn main() -> Result<(), bitwright::Error> {
   subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so
   a hash comparison becomes a plain one; and strictly monotone maps (casts, complements, sums,
   products and shifts the facts show do not wrap) do the same for orderings.
+- **Traces of every run**: each rewrite with the phase and round that made it, the rule as
+  written or the pass's reasoning, the candidates dropped and the guards that failed, written as
+  JSON Lines (`bitwright simplify --trace`), and [a viewer](workbench/README.md) for them.
 - **A rule language (`.bwr`)** for your own rewrites, with a mandatory soundness check
   (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
 - **Verified compiler transformations**: peephole optimizations in the Alive syntax and pairs

@@ -15,11 +15,13 @@
 
 pub(crate) mod budget;
 mod dispatch;
+mod explain;
 pub(crate) mod host;
 pub(crate) mod pass;
 mod stats;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod trace;
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -27,11 +29,13 @@ use std::sync::{Arc, OnceLock};
 use core::fmt;
 
 pub use budget::{Admission, Allowance, Budget, Cap, Clock, Deadline, Exhausted};
+pub use explain::{Explanation, Peel, Source};
 pub use host::{Rewrite, Site};
 pub use stats::{
-    By, CertStats, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus, RuleCounts,
-    Stats,
+    By, CertStats, Detail, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus,
+    RuleCounts, Stage, Stats,
 };
+pub use trace::Trace;
 
 use budget::{Counter, Meter};
 use dispatch::DispatchNet;
@@ -120,6 +124,31 @@ pub enum Phase {
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
     Mba(crate::mba::MbaConfig),
+}
+
+impl Phase {
+    /// A short name: `local` for rules, else the pass's name as [`By::Pass`] and
+    /// [`Stats::passes`] give it (`fact_fold`, `linear`, `linear_mba`, `mba`, …).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Phase::Local { .. } => "local",
+            Phase::FactFold => "fact_fold",
+            Phase::Linear => "linear",
+            Phase::Bitwise => "bitwise",
+            Phase::Xor => "xor",
+            Phase::Compares => "compares",
+            Phase::Casts => "casts",
+            Phase::Demanded => "demanded",
+            Phase::LinearMba => "linear_mba",
+            Phase::Shuffle => "shuffle",
+            Phase::Invert => "invert",
+            Phase::Division => "division",
+            #[cfg(feature = "prove")]
+            Phase::Carries => "carries",
+            #[cfg(feature = "mba")]
+            Phase::Mba(_) => "mba",
+        }
+    }
 }
 
 /// How the normal-form passes weigh sharing when they decide whether a rewrite makes the DAG
@@ -1261,12 +1290,72 @@ struct Runner<'r, 'a> {
     /// In the MBA phase: the nodes whose question was considered before their operands were
     /// walked, with its finality when it was asked and not taken (see `pass::mba_first`).
     first: IdMap<u32, Option<Fin>>,
+    /// What the observer asks for ([`Detail::Events`] without one).
+    detail: Detail,
+    /// The name of the phase being run (`local`, or the pass's), for the events of the
+    /// passes' commit rule.
+    phase_name: &'static str,
+    /// The reasoning of the pass step under way, for the `Explain` event after its rewrite
+    /// (recorded only under [`Detail::Explain`]).
+    explain: Option<Explanation>,
 }
 
 impl Runner<'_, '_> {
     fn emit(&mut self, e: Event<'_>) {
         if let Some(o) = self.observer.as_deref_mut() {
             o.event(e);
+        }
+    }
+
+    /// Whether an observer receives events (the structural events are built only then).
+    fn observing(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// Reports a stage's rewrite of the root, when it changed it.
+    #[cfg_attr(not(feature = "mba"), allow(dead_code))]
+    fn emit_stage(&mut self, cx: &Context, stage: Stage, before: u32, after: u32) {
+        if before != after && self.observing() {
+            self.emit(Event::Stage {
+                stage,
+                before: cx.handle(before),
+                after: cx.handle(after),
+            });
+        }
+    }
+
+    /// Reports a candidate the commit rule dropped (see [`Event::NotSmaller`]).
+    pub(crate) fn not_smaller(
+        &mut self,
+        cx: &Context,
+        n: u32,
+        candidate: Option<u32>,
+        added: u32,
+        freed: u32,
+        shared: bool,
+    ) {
+        if self.observing() {
+            self.emit(Event::NotSmaller {
+                by: By::Pass(self.phase_name),
+                node: cx.handle(n),
+                candidate: candidate.map(|c| cx.handle(c)),
+                added,
+                freed,
+                shared,
+            });
+        }
+    }
+
+    /// Whether the passes record their reasoning for an `Explain` event.
+    pub(crate) fn explaining(&self) -> bool {
+        self.detail >= Detail::Explain
+    }
+
+    /// Records the reasoning of the step under way (when explaining), for the `Explain` event
+    /// that follows its rewrite.
+    pub(crate) fn explain_with(&mut self, f: impl FnOnce() -> Explanation) {
+        if self.explaining() {
+            self.explain = Some(f());
         }
     }
 
@@ -1538,6 +1627,7 @@ impl Runner<'_, '_> {
                     // as a pass's is below, with nothing to wait on.
                     #[cfg(feature = "mba")]
                     if mba && !self.first.contains_key(&n) {
+                        self.explain = None;
                         let inner = self.inner;
                         if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
                             && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
@@ -1583,6 +1673,12 @@ impl Runner<'_, '_> {
                     }
                     if changed {
                         let n1 = self.build(cx, |cx| cx.rebuild(n, kids))?;
+                        if n1 != n && self.observing() && !same_operator(cx, n, n1, &kids) {
+                            self.emit(Event::Folded {
+                                node: cx.handle(n),
+                                after: cx.handle(n1),
+                            });
+                        }
                         if n1 != n
                             && (pending.contains_key(&n1)
                                 || (!local && self.rewritten.contains_key(&(n1, n))))
@@ -1603,6 +1699,8 @@ impl Runner<'_, '_> {
                             continue;
                         }
                     }
+                    // An explanation belongs to the step that records it.
+                    self.explain = None;
                     let step = match &self.inner.phases[phase] {
                         PhaseImpl::Local(..) => self.rewrite(cx, phase, n)?,
                         PhaseImpl::Pass(k) => pass::step(self, cx, *k, n)?,
@@ -1709,6 +1807,7 @@ impl Runner<'_, '_> {
                 rel: env.rel,
                 one_use: None,
                 shared,
+                failed: env.failed,
             };
             self.live = live;
             self.live_roots = roots;
@@ -1746,6 +1845,16 @@ impl Runner<'_, '_> {
                 } else if env.matched {
                     self.stats.guard_false += 1;
                     self.emit(Event::GuardFalse { rule });
+                    if let Some((pred, [a, b])) = env.failed
+                        && self.observing()
+                    {
+                        let h = |i: Option<u32>| i.map(|i| cx.handle(i));
+                        self.emit(Event::GuardFailed {
+                            rule,
+                            pred,
+                            args: [h(a), h(b)],
+                        });
+                    }
                 } else {
                     self.stats.no_match += 1;
                     self.emit(Event::NoMatch { rule });
@@ -1786,6 +1895,8 @@ impl Runner<'_, '_> {
         r: u32,
         rel: Reliance,
     ) -> Result<Accept, Stop> {
+        // The step's explanation goes with this application, taken or not.
+        let why = self.explain.take();
         if let Some(reason) = self.postcondition(cx, by, proven, n, r, rel)? {
             self.stats.rejected += 1;
             self.emit(Event::Rejected { by, reason });
@@ -1801,6 +1912,16 @@ impl Runner<'_, '_> {
         }
         self.meter.charge(Counter::Rewrites, 1)?;
         self.emit(Event::Applied { by, before, after });
+        if !rel.is_none() {
+            self.emit(Event::Relied { on: rel });
+        }
+        if let Some(why) = why {
+            self.emit(Event::Explain {
+                by,
+                node: before,
+                why: &why,
+            });
+        }
         Ok(Accept::Yes)
     }
 
@@ -2222,7 +2343,13 @@ impl Engine {
             chain_parent: IdMap::default(),
             asks: IdMap::default(),
             first: IdMap::default(),
+            detail: Detail::Events,
+            phase_name: "",
+            explain: None,
         };
+        if let Some(o) = runner.observer.as_deref() {
+            runner.detail = o.detail();
+        }
         let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
         let mut failure: Option<Error> = None;
         // Roots whose result is not final only because of what other roots share, with their
@@ -2230,7 +2357,7 @@ impl Engine {
         // (the count of roots rewritten so far).
         let mut provisional: Vec<(u32, usize, u64)> = Vec::new();
         let mut version = 0u64;
-        for &root in &ids {
+        for (index, &root) in ids.iter().enumerate() {
             if done.contains_key(&root) {
                 continue;
             }
@@ -2260,6 +2387,13 @@ impl Engine {
                     )
                 }
                 None => {
+                    if runner.observing() {
+                        runner.emit(Event::Root {
+                            index,
+                            root: cx.handle(root),
+                            again: false,
+                        });
+                    }
                     let (r, end, rel) = match runner.strategy(cx, root) {
                         Ok((r, fin)) => match fin.why {
                             Some(why) if !fin.done => (r, End::BudgetTerminated(why), fin.rel),
@@ -2314,6 +2448,14 @@ impl Engine {
                     }
                     let (r0, _, rel0) = done[&root];
                     runner.active = k;
+                    if runner.observing() {
+                        let index = ids.iter().position(|&i| i == root).unwrap_or(0);
+                        runner.emit(Event::Root {
+                            index,
+                            root: cx.handle(r0),
+                            again: true,
+                        });
+                    }
                     let (r, end, rel, again) = match runner.strategy(cx, r0) {
                         Ok((r, fin)) => match fin.why {
                             Some(why) if !fin.done => {
@@ -2432,7 +2574,10 @@ impl Runner<'_, '_> {
                 _ => 0,
             };
             match pass::push_context(self, cx, cur, own) {
-                Ok(Some(p)) => cur = p,
+                Ok(Some(p)) => {
+                    self.emit_stage(cx, Stage::Context, cur, p);
+                    cur = p;
+                }
                 Ok(None) | Err(Stop::Exhausted(_)) => {}
                 Err(stop) => return Err((cur, fin, stop)),
             }
@@ -2445,7 +2590,10 @@ impl Runner<'_, '_> {
             _ => None,
         }) {
             match pass::mba_sweep(self, cx, cfg, cur) {
-                Ok(r) => cur = r,
+                Ok(r) => {
+                    self.emit_stage(cx, Stage::Sweep, cur, r);
+                    cur = r;
+                }
                 Err(Stop::Exhausted(_)) => {}
                 Err(stop) => return Err((cur, fin, stop)),
             }
@@ -2471,13 +2619,37 @@ impl Runner<'_, '_> {
                 _ => return Ok(cur),
             };
             return match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
-                Ok(Some(p)) => Ok(p),
+                Ok(Some(p)) => {
+                    self.emit_stage(cx, Stage::Cases, cur, p);
+                    Ok(p)
+                }
                 Ok(None) | Err(Stop::Exhausted(_)) => Ok(cur),
                 Err(stop) => Err(stop),
             };
         }
         let _ = cx;
         Ok(cur)
+    }
+
+    /// Reports the end of a phase that began when the meter had spent `spent0`.
+    fn emit_phase_end(
+        &mut self,
+        cx: &Context,
+        round: u8,
+        phase: usize,
+        root: u32,
+        spent0: Budget,
+        stopped: Option<Exhausted>,
+    ) {
+        if self.observing() {
+            self.emit(Event::PhaseEnd {
+                round,
+                phase,
+                root: cx.handle(root),
+                spent: self.meter.spent.saturating_sub(&spent0),
+                stopped,
+            });
+        }
     }
 
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
@@ -2496,24 +2668,43 @@ impl Runner<'_, '_> {
             }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
-                let _ = p;
+                let spent0 = self.meter.spent;
+                self.phase_name = p.name();
+                if self.observing() {
+                    self.emit(Event::PhaseBegin {
+                        round,
+                        phase,
+                        root: cx.handle(cur),
+                    });
+                }
                 match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
                         cur = r;
                         fin = fin.and(f);
+                        self.emit_phase_end(cx, round, phase, cur, spent0, None);
                     }
                     // A budget keeps what the stopped phase did (see `salvage`). A
                     // deadline does not: it means stop now, the caller is waiting, and
                     // salvaging walks the whole DAG below the root once more — work the
                     // run was just told to stop doing.
                     Err(stop @ Stop::Exhausted(Exhausted::Deadline)) => {
+                        self.emit_phase_end(
+                            cx,
+                            round,
+                            phase,
+                            cur,
+                            spent0,
+                            Some(Exhausted::Deadline),
+                        );
                         return Err((cur, fin, stop));
                     }
-                    Err(stop @ Stop::Exhausted(_)) => {
-                        return Err(match self.salvage(cx, phase, cur) {
-                            Some((r, f)) => (r, fin.and(f), stop),
-                            None => (cur, fin, stop),
-                        });
+                    Err(Stop::Exhausted(why)) => {
+                        let out = match self.salvage(cx, phase, cur) {
+                            Some((r, f)) => (r, fin.and(f), Stop::Exhausted(why)),
+                            None => (cur, fin, Stop::Exhausted(why)),
+                        };
+                        self.emit_phase_end(cx, round, phase, out.0, spent0, Some(why));
+                        return Err(out);
                     }
                     Err(stop) => return Err((cur, fin, stop)),
                 }
@@ -2524,6 +2715,20 @@ impl Runner<'_, '_> {
         }
         Ok((cur, fin))
     }
+}
+
+/// Whether `n1`, the rebuild of `n` over new operands `kids`, is `n`'s operator over them (in
+/// any order: the constructors sort commutative operands), not a fold the constructors made.
+fn same_operator(cx: &Context, n: u32, n1: u32, kids: &[u32; 3]) -> bool {
+    let (a, b) = (cx.node(n), cx.node(n1));
+    if a.op != b.op {
+        return false;
+    }
+    let mut want: Vec<u32> = kids[..a.children().count()].to_vec();
+    let mut got: Vec<u32> = b.children().collect();
+    want.sort_unstable();
+    got.sort_unstable();
+    want == got
 }
 
 /// Whether the rule's guard asks `one_use`.

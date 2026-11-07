@@ -18,7 +18,7 @@ on bad usage or unreadable input. `--` ends the options, for an expression start
 | `bitwright lift block.vex` | Reads lifted code (Ghidra p-code, VEX as pyvex prints it, an LLVM IR function; `--from pcode|vex|llvm` when the extension does not say) and prints each register it writes, each store and each exit, deobfuscated; `--synth` also searches for smaller equal expressions, with `--synth-conflicts` and `--synth-propagations` as for `simplify`. See [Lifted code](lifting.md). |
 | `bitwright tv before.ll after.ll` | Translation validation: each function of the second file must refine the function of the same name in the first (or `@tgt` refine `@src` of one file), for a subset of LLVM IR. |
 | `bitwright explain BW0302` | What a diagnostic code means and how to fix it. |
-| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). `--file exprs.txt` simplifies each line of a file on its own, on `--jobs` threads. `--synth` then searches for a smaller equal expression (see [Synthesis](#synthesis)). |
+| `bitwright simplify '<expr>'` | Simplifies an expression (`--width 32`), deobfuscating: the rules, the normal-form passes and the MBA service with the native normal-form solver, every answer proved by bitwright itself; `--standard` runs only the rules and the standard passes. Each `--assume '<predicate>'` adds a 1-bit constraint; a result that relies on constraints is followed by `# relies on 0, 2` (their positions among the `--assume` options). Each `--rules my.bwr` adds a rule file's rules after the built-in ones, vouched for by the ledger `my.bwr.proof` next to it if there is one, else checked first (the command exits 1 unless every rule is sound). `--file exprs.txt` simplifies each line of a file on its own, on `--jobs` threads. `--synth` then searches for a smaller equal expression (see [Synthesis](#synthesis)). `--trace run.bwt` writes the run as a trace (below). |
 
 ## Simplifying from the shell
 
@@ -66,6 +66,22 @@ group mine {
 }
 $ bitwright simplify --width 32 --rules my.bwr -- 'popcnt(x) + popcnt(~x)'
 32:32
+```
+
+`--trace <out>` writes the engine's run as a trace: JSON Lines with the strategy's phases, the
+rules and nodes the run names, every event in order (each phase's begin and end with the work it
+spent, each rule tried and how it ended, each rewrite with the pass's reasoning and the
+assumptions it relies on, each candidate dropped as not smaller) and the result. With `--file`,
+each line runs alone and its trace follows the one before. The same run writes the same file, so
+traces diff cleanly. See [Tracing a run](simplifying.md#tracing-a-run) for the format; the
+Workbench in the repository's `workbench/` shows them.
+
+```text
+$ bitwright simplify --width 32 --trace run.bwt -- '((x ^ 0x5a) + 3 - 3) ^ 0x5a'
+x
+$ grep '"ev":"applied"' run.bwt
+{"ev":"applied","pass":"linear","before":6,"after":2}
+{"ev":"applied","pass":"xor","before":8,"after":0}
 ```
 
 ## Synthesis

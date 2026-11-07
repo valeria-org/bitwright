@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitwright Workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+<script>
+try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}
+</script>
+</head>
+<body class="pg">
+<header class="pg-top">
+  <div class="brand">bitwright <span>Workbench</span></div>
+  <nav class="pg-nav">
+    <a href="#examples" id="navExamples">Examples</a>
+    <a href="#rules" id="navRules">Rules</a>
+    <a href="inspect.html" id="inspectLink" title="Every view of this run: phases, attempts, facts, corpus, compare">Inspect ↗</a>
+    <button id="themeBtn" type="button" class="quiet icon" title="Theme: system" aria-label="Theme">◐</button>
+  </nav>
+</header>
+<main class="pg-main" id="main">
+  <section class="editor" id="editor">
+    <label class="sr" for="expr">Expression</label>
+    <div class="editor-wrap">
+      <pre class="expr hl" id="exprHl" aria-hidden="true"></pre>
+      <textarea id="expr" class="expr" rows="2" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Type an expression: (x ^ y) + 2 * (x &amp; y)"></textarea>
+    </div>
+    <div class="controls">
+      <div class="seg" role="radiogroup" aria-label="Width" id="widths"></div>
+      <div class="seg" role="radiogroup" aria-label="Engine" id="engines"></div>
+      <div class="assume" id="assume">
+        <span class="label">assume</span>
+        <span id="assumePills"></span>
+        <input id="assumeInput" spellcheck="false" placeholder="x <u 16" title="A 1-bit predicate assumed true; Enter adds it">
+      </div>
+    </div>
+    <details class="phases" id="phasesBox">
+      <summary>Phases <span class="n" id="phasesNote"></span></summary>
+      <div class="toggles" id="phases"></div>
+    </details>
+    <div class="tools">
+      <button type="button" class="quiet" id="bigBtn" title="A larger editor">Large editor</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="importBtn" title="Read a QF_BV script's definition or assertions">Import SMT-LIB</button>
+      <button type="button" class="quiet" data-export="smtlib" title="An SMT-LIB script that is unsat exactly when the input and the result are equal">Export SMT-LIB</button>
+      <button type="button" class="quiet" data-export="lean" title="A Lean 4 example: input = result, by bv_decide">Export Lean</button>
+      <button type="button" class="quiet" data-export="latex" title="The input and the result as LaTeX">Export LaTeX</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="proveBtn" title="Decide input = result with bitwright's own prover, here in the browser">Prove here</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="rulesBtn" title="Rules of your own, checked and linked after the built-in ones">My rules</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="shareBtn" title="Copy a link to this view">Copy link</button>
+    </div>
+    <div class="io" id="io" hidden></div>
+    <div class="err" id="err" hidden></div>
+  </section>
+  <section class="myrules" id="myrules" hidden>
+    <div class="mr-head">
+      <span class="t">My rules</span>
+      <span class="muted">a <code>.bwr</code> program; sound rules link after the built-in ones in every run</span>
+      <span class="right">
+        <label class="chk"><input type="checkbox" id="useRules"> use in runs</label>
+        <label class="chk" title="Link without the checker's verdict; every application is then sampled at 16 points"><input type="checkbox" id="trustRules"> trusted</label>
+        <button type="button" class="quiet" id="leanBtn" title="Translate Lean 4 theorems about BitVec into rules">Import Lean theorems</button>
+        <button type="button" class="quiet" id="rulesDocBtn" title="The rule language, in the book">Syntax</button>
+        <button type="button" class="quiet" id="closeRules" aria-label="Close">×</button>
+      </span>
+    </div>
+    <div class="mr-body">
+      <div class="editor-wrap mr-editor">
+        <pre class="expr hl bwr" id="rulesHl" aria-hidden="true"></pre>
+        <textarea id="rulesSrc" class="expr bwr" spellcheck="false" autocomplete="off" autocapitalize="off" rows="10"></textarea>
+      </div>
+      <div class="verdicts" id="verdicts"></div>
+    </div>
+  </section>
+  <section class="result" id="result" hidden></section>
+  <section class="point" id="point" hidden></section>
+  <section class="story" id="story"></section>
+  <section class="gallery" id="examples"></section>
+  <section class="rules" id="rules"></section>
+</main>
+<footer class="status"><span id="hint" class="hint">Type an expression; it runs as you type. Click a step to see why; click any subterm for its node.</span><span id="status"></span></footer>
+<div class="popover" id="popover" hidden role="dialog" aria-label="Node"></div>
+<script type="module" src="js/playground.js"></script>
+</body>
+</html>

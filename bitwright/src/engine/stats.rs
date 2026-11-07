@@ -1,4 +1,4 @@
-//! Telemetry: counters that are always collected, and per-rule events for an observer.
+//! Telemetry: counters that are always collected, and events for an observer.
 
 use std::collections::BTreeMap;
 
@@ -465,7 +465,37 @@ impl By<'_> {
     }
 }
 
-/// A per-rule event.
+/// A rewrite of a whole root made outside the phases (see [`Event::Stage`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Stage {
+    /// What a root's conditions fix, put into the operands they guard (MBA noise forms).
+    Context,
+    /// The opaque-constant sweep before the first round (MBA opaque sweep, noise forms or
+    /// known atoms).
+    Sweep,
+    /// Pieces that depend only on a few conditions, written as tables of their values (MBA
+    /// noise forms; before every round).
+    Cases,
+}
+
+impl Stage {
+    /// A short name: `context`, `sweep` or `cases`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Stage::Context => "context",
+            Stage::Sweep => "sweep",
+            Stage::Cases => "cases",
+        }
+    }
+}
+
+/// An event of a run: rule attempts and rewrites, and where in the run they happen.
+///
+/// The structural events nest: each distinct root's work begins with [`Root`](Event::Root);
+/// then come its [`Stage`](Event::Stage) rewrites, if any, and its phases, each between a
+/// [`PhaseBegin`](Event::PhaseBegin) and a [`PhaseEnd`](Event::PhaseEnd), round after round.
+/// The rule and rewrite events of a phase come between its two.
 #[derive(Copy, Clone, Debug)]
 #[non_exhaustive]
 pub enum Event<'a> {
@@ -517,12 +547,132 @@ pub enum Event<'a> {
         /// Which one.
         reason: Reject,
     },
+    /// The rewrite just [`Applied`](Event::Applied) holds only where these constraints of the
+    /// run's assumptions hold. Follows the `Applied` it qualifies, and only when it relies on
+    /// some constraint.
+    Relied {
+        /// The constraints.
+        on: crate::facts::Reliance,
+    },
+    /// The work on a distinct root of the call begins.
+    Root {
+        /// The root's position in the call's roots (its first, when it is given more than once).
+        index: usize,
+        /// The root as the work begins: the input, or with `again`, the result so far.
+        root: Expr,
+        /// Whether the root is worked on again once every root is done, because a rewrite that
+        /// sharing with other roots held back may now go through (see [`Sharing::Roots`]).
+        ///
+        /// [`Sharing::Roots`]: super::Sharing::Roots
+        again: bool,
+    },
+    /// A rewrite of the whole root outside the phases.
+    Stage {
+        /// Which.
+        stage: Stage,
+        /// The root before it.
+        before: Expr,
+        /// The root after it.
+        after: Expr,
+    },
+    /// A phase of the strategy begins on the root.
+    PhaseBegin {
+        /// The round, from 0.
+        round: u8,
+        /// The phase's position in [`Strategy::phases`](super::Strategy::phases).
+        phase: usize,
+        /// The root it begins on.
+        root: Expr,
+    },
+    /// Why the guard of the rule just reported [`GuardFalse`](Event::GuardFalse) did not
+    /// hold: its last predicate that did not, and the nodes bound to its operands. Follows that
+    /// `GuardFalse`.
+    GuardFailed {
+        /// The rule.
+        rule: &'a Rule,
+        /// The predicate's spelling in the rule language: a fact predicate (`disjoint`,
+        /// `zero_bits`, `proves`, `one_use`, …), a constant predicate (`is_pow2`, …), a
+        /// comparison of constants (`==`, `<u`, …), or `condition` for another pure condition.
+        pred: &'static str,
+        /// The nodes bound to its operands, where they are pattern parameters (`proves`: the
+        /// two sides of its comparison).
+        args: [Option<Expr>; 2],
+    },
+    /// A pass dropped a candidate for `node` because it would not make the DAG smaller.
+    NotSmaller {
+        /// The pass.
+        by: By<'a>,
+        /// The node it would have replaced.
+        node: Expr,
+        /// The candidate, when it was built (a candidate whose estimate already cannot pay is
+        /// dropped before it is built).
+        candidate: Option<Expr>,
+        /// The nodes it needs: counted when it was built, else the pass's upper estimate.
+        added: u32,
+        /// The nodes replacing `node` would free (counted no further than `added`).
+        freed: u32,
+        /// Whether only sharing with other roots kept it back: alone, it would have paid. A
+        /// later round decides again.
+        shared: bool,
+    },
+    /// `node`, rebuilt over its operands' new results, became `after` through the constructors'
+    /// canonicalization rather than as the same operator over those results: `x ^ 0` folded
+    /// to `x` once a rewrite made the `0`. Reported where the rebuild happens, in the walk.
+    Folded {
+        /// The node whose operands changed.
+        node: Expr,
+        /// What the constructors made of it.
+        after: Expr,
+    },
+    /// A pass's reasoning for the rewrite it just [`Applied`](Event::Applied): the form it
+    /// read, the layers it undid, the certificate it checked. Follows that `Applied`, and only
+    /// for an observer whose [`detail`](Observer::detail) is [`Detail::Explain`].
+    Explain {
+        /// The pass.
+        by: By<'a>,
+        /// The node it rewrote.
+        node: Expr,
+        /// The reasoning.
+        why: &'a super::Explanation,
+    },
+    /// The phase ended.
+    PhaseEnd {
+        /// The round, from 0.
+        round: u8,
+        /// The phase's position in [`Strategy::phases`](super::Strategy::phases).
+        phase: usize,
+        /// The root it left: its result, or with `stopped`, what it had done (the root it
+        /// began on under a deadline).
+        root: Expr,
+        /// The work it spent, in the units of [`Budget`](super::Budget).
+        spent: super::Budget,
+        /// The limit that stopped it, if one did (the run stops with it).
+        stopped: Option<super::Exhausted>,
+    },
+}
+
+/// How much an [`Observer`] asks the engine to build for it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Detail {
+    /// Every event but [`Event::Explain`].
+    #[default]
+    Events,
+    /// Every event, with the passes' reasoning ([`Event::Explain`]), which costs the passes
+    /// work to record.
+    Explain,
 }
 
 /// Receives per-rule and per-pass events. With no observer the cost is one predictable branch per event.
 pub trait Observer {
     /// Called for every event, in order.
     fn event(&mut self, event: Event<'_>);
+
+    /// How much the engine builds for this observer: [`Detail::Events`] unless it asks for
+    /// more.
+    fn detail(&self) -> Detail {
+        Detail::Events
+    }
 }
 
 /// Per-rule counts, keyed by `group::rule`.

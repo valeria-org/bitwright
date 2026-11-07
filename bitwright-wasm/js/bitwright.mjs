@@ -26,6 +26,14 @@ const OPS = {
   template: 12,
   checkTemplate: 13,
   names: 14,
+  trace: 15,
+  evaluate: 16,
+  rules: 17,
+  fromSmtlib: 18,
+  toLean: 19,
+  equivalenceQuery: 20,
+  checkRules: 21,
+  leanToRules: 22,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -244,6 +252,66 @@ export async function instantiate(bytes) {
       }
       return simplifyWith(text, width, opts);
     },
+    // Simplifies like `simplify` and returns the run as a trace (JSON Lines, as `bitwright
+    // simplify --trace` writes it, with the passes' reasoning and the facts of the nodes it
+    // names). Options: `deobfuscate` (default true), `assume`, a list of 1-bit predicates, and
+    // `phases`, a list of phase names to run instead of a built-in strategy (`fact_fold`,
+    // `local`, `linear`, `xor`, `casts`, `division`, `invert`, `compares`, `bitwise`, `carries`,
+    // `linear_mba`, `shuffle`, `demanded`, `mba`).
+    // `rules` is a `.bwr` program of your own linked after the built-in rules: checked by the
+    // soundness checker first (an unsound rule is an error), or with `trusted: true` linked
+    // without checking, every application sampled.
+    trace: (text, width = 64, opts = {}) => {
+      const { deobfuscate = true, assume = [], phases = null, rules = null, trusted = false, ...rest } = opts;
+      const unknown = Object.keys(rest);
+      if (unknown.length > 0) {
+        throw new Error(`unknown option ${unknown[0]}`);
+      }
+      const lines = [];
+      if (!deobfuscate) {
+        lines.push("standard");
+      }
+      for (const p of assume) {
+        lines.push(`assume ${String(p).replace(/\n/g, " ")}`);
+      }
+      if (phases) {
+        lines.push(`phases ${phases.map((p) => word(p, "phase")).join(",")}`);
+      }
+      if (trusted) lines.push("trusted");
+      if (rules) lines.push("rules", String(rules));
+      return call(OPS.trace, text, lines.join("\n"), width);
+    },
+    // Compiles and checks a `.bwr` program: `{ diagnostics: [{ code, level, message, start,
+    // end }], rules: [{ name, kind, verdict, detail, evidence, failedExamples }] }`.
+    checkRules: (source) => {
+      const out = { diagnostics: [], rules: [] };
+      for (const line of call(OPS.checkRules, source, "", 0).trim().split("\n").filter(Boolean)) {
+        const o = JSON.parse(line);
+        if (o.diag !== undefined) out.diagnostics.push({ code: o.diag, level: o.level, message: o.message, start: o.start, end: o.end });
+        else out.rules.push({ name: o.rule, kind: o.kind, verdict: o.verdict, detail: o.detail, evidence: o.evidence, failedExamples: o.failed_examples });
+      }
+      return out;
+    },
+    // Lean 4 theorems about BitVec (`theorem t (x y : BitVec w) (h : x.ult y) : lhs = rhs`) as
+    // a `.bwr` program; a theorem outside the subset read becomes a comment saying why.
+    leanToRules: (source) => call(OPS.leanToRules, source, "", 0),
+    // The value of an expression at a point: `env` maps symbol names to values (BigInt, number
+    // or a decimal/hex string). Symbols the expression does not have are ignored; one it has
+    // and the point does not name is an error. The value is a hex string.
+    evaluate: (text, width = 64, env = {}) => {
+      const lines = Object.entries(env).map(([k, v]) => `${word(k, "symbol")} = ${typeof v === "bigint" || typeof v === "number" ? v.toString() : String(v).trim()}`);
+      return call(OPS.evaluate, text, lines.join("\n"), width);
+    },
+    // Reads a QF_BV script: the named definition (or the last one, or the assertions
+    // conjoined) as expression text, the symbols' widths written (`x:64`).
+    fromSmtlib: (script, definition = "") => call(OPS.fromSmtlib, script, definition, 0),
+    // `lhs = rhs` as a Lean 4 `example` over their symbols, proved by `bv_decide`; without
+    // `rhs`, the Lean term of `lhs` alone. Throws for what Lean's core BitVec cannot state.
+    toLean: (lhs, rhs = "", width = 64) => call(OPS.toLean, lhs, rhs, width),
+    // An SMT-LIB script that is unsat exactly when `a` and `b` are equal at every input.
+    equivalenceQuery: (a, b, width = 64) => call(OPS.equivalenceQuery, a, b, width),
+    // The built-in rules: `[{ name, kind, doc, examples: [[input, output]], source, ledger }]`.
+    rules: () => call(OPS.rules, "", "", 0).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     // Tests a host rewrite offline on expression texts: `{ passed, applications, points,
     // exhaustive, failure }`, `failure` null or `{ kind, message, node, result, second,
     // assignment }` (assignment: symbol name to BigInt). Options: `widths`, `variants`,

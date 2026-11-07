@@ -1030,6 +1030,11 @@ fn quotient(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
     })?;
     // A bare multiply-high is the size of its division: the division is the normal form.
     let tie = matches!(cx.node(n).op, OpCode::UMulHi | OpCode::SMulHi);
+    r.explain_with(|| crate::engine::Explanation::Division {
+        dividend: cx.handle(x),
+        divisor: dv,
+        signed,
+    });
     finish_with(r, cx, PassKind::Division, n, e, before, &[x], fin, tie)
 }
 

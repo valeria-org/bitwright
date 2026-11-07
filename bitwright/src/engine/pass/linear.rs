@@ -859,6 +859,10 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
     }
     let before = cx.len() as u32;
     let e = emit(r, cx, &form)?;
+    r.explain_with(|| crate::engine::Explanation::Linear {
+        konst: form.konst,
+        terms: form.terms.iter().map(|&(a, k)| (cx.handle(a), k)).collect(),
+    });
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
 }
 

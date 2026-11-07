@@ -26,7 +26,10 @@ cover what a host needs to hand its expressions to bitwright and read the result
 
 Extension operations, host hooks (`Hooks`) as callbacks, deadlines, allowances, custom
 strategies and other MBA backends are Rust only. The bindings have the version of the crate they are built
-with, and give the same results. JavaScript has a string API: text in, text out.
+with, and give the same results. JavaScript has a string API: text in, text out. Its `trace`
+returns a run as a trace, as `bitwright simplify --trace` writes it (see
+[Tracing a run](simplifying.md#tracing-a-run)): the Workbench runs the engine in the browser
+with it.
 
 ## Python
 

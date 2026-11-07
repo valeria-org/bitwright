@@ -1323,6 +1323,18 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             return order_step(r, cx, n);
         }
     };
+    match &info {
+        Info::Pair(x, y, s) => r.explain_with(|| crate::engine::Explanation::Relations {
+            x: cx.handle(*x),
+            y: cx.handle(*y),
+            set: *s,
+        }),
+        Info::Values(x, s, _) => r.explain_with(|| crate::engine::Explanation::Intervals {
+            x: cx.handle(*x),
+            set: s.clone(),
+        }),
+        _ => {}
+    }
     let step = finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL)?;
     let Step::Normal(fin) = step else {
         return Ok(step);

@@ -506,5 +506,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     let before = cx.len() as u32;
     let e = linear::emit(r, cx, &form)?;
+    r.explain_with(|| crate::engine::Explanation::Carries {
+        konst: BitVec::wrapping_from_u64(w, konst),
+        terms: terms.iter().map(|&(a, k)| (cx.handle(a), k)).collect(),
+        proved: !exact,
+    });
     finish(r, cx, PassKind::Carries, n, e, before, &atoms, Fin::FINAL)
 }

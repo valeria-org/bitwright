@@ -930,6 +930,10 @@ fn write(
     } else {
         emit(r, cx, tt_c, &canon)?
     };
+    r.explain_with(|| crate::engine::Explanation::Bitwise {
+        atoms: atoms.iter().map(|&a| cx.handle(a)).collect(),
+        table: u64::from(tt),
+    });
     finish(r, cx, PassKind::Bitwise, n, e, before, atoms, fin)
 }
 

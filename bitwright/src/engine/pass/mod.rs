@@ -29,8 +29,8 @@ mod tests;
 pub(super) mod xor;
 
 use super::{Accept, By, Fin, Reject, Runner, Sharing, Step, Stop};
-use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
+use crate::engine::{Exhausted, Explanation};
 use crate::expr::{Context, OpCode};
 use crate::facts::{Facts, KnownBits, Reliance};
 
@@ -551,6 +551,13 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
     }
     let before = cx.len() as u32;
     let c = r.build(cx, |cx| cx.mk_const(&v))?;
+    if let Some(f) = f {
+        r.explain_with(|| Explanation::Fold {
+            known_zero: f.known().known_zero(),
+            known_one: f.known().known_one(),
+            value: v,
+        });
+    }
     finish(r, cx, PassKind::FactFold, n, c, before, &[], fin)
 }
 
@@ -999,12 +1006,18 @@ pub(super) fn worth_building(
     if alone(r) {
         // Decided on the region alone: final either way.
         let freed = dying_in(r, cx, n, false, estimate.saturating_add(1), false)?;
-        return Ok((freed <= estimate).then_some(Fin::FINAL));
+        if freed > estimate {
+            return Ok(None);
+        }
+        r.not_smaller(cx, n, None, estimate, freed, false);
+        return Ok(Some(Fin::FINAL));
     }
-    if dying_in(r, cx, n, false, estimate.saturating_add(1), true)? > estimate {
+    let freed = dying_in(r, cx, n, false, estimate.saturating_add(1), true)?;
+    if freed > estimate {
         return Ok(None);
     }
     let alone = dying_in(r, cx, n, false, estimate.saturating_add(1), false)?;
+    r.not_smaller(cx, n, None, estimate, freed, alone > estimate);
     Ok(Some(if alone > estimate {
         Fin::PROVISIONAL
     } else {
@@ -1049,11 +1062,16 @@ fn pays(
     let gain = |freed: u32| new < freed || (tie && new == freed);
     if alone(r) {
         let freed = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
-        return Ok(if gain(freed) { Ok(()) } else { Err(Fin::FINAL) });
+        if gain(freed) {
+            return Ok(Ok(()));
+        }
+        r.not_smaller(cx, n, Some(e), new, freed, false);
+        return Ok(Err(Fin::FINAL));
     }
     let freed = dying_in(r, cx, n, true, new.saturating_add(1), true)?;
     if !gain(freed) {
         let alone = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
+        r.not_smaller(cx, n, Some(e), new, freed, gain(alone));
         return Ok(Err(if gain(alone) {
             Fin::PROVISIONAL
         } else {
@@ -1097,6 +1115,7 @@ pub(super) fn finish_with(
 ) -> Result<Step, Stop> {
     let name = kind.name();
     if e == n {
+        r.explain = None;
         r.stats.passes.entry(name).or_default().noop += 1;
         return Ok(Step::Normal(fin));
     }
@@ -1107,6 +1126,7 @@ pub(super) fn finish_with(
     };
     if let Err(more) = pays {
         // A rejection that only sharing caused is not final (see `shrinks`).
+        r.explain = None;
         r.stats.passes.entry(name).or_default().rejected_cost += 1;
         discard(r, cx, before);
         return Ok(Step::Normal(fin.and(more)));

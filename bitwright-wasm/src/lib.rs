@@ -12,11 +12,14 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
-use bw::engine::{Engine, Strategy};
+use bw::engine::{Engine, Phase, Run, Strategy, Trace};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
+use bw::rules::{Ledger, RuleProgram};
 use bw::{Context, ParseOptions, Width};
 
 mod compiler;
+mod lean;
+mod lean_in;
 
 /// A buffer of `len` bytes, for JavaScript to fill (freed with `bw_dealloc(ptr, len)`).
 #[unsafe(no_mangle)]
@@ -54,6 +57,14 @@ const CHECK_REWRITE: u32 = 11;
 const INSTANTIATE: u32 = 12;
 const CHECK_TEMPLATE: u32 = 13;
 const NAMES: u32 = 14;
+const TRACE: u32 = 15;
+const EVALUATE: u32 = 16;
+const RULES: u32 = 17;
+const FROM_SMTLIB: u32 = 18;
+const TO_LEAN: u32 = 19;
+const EQUIVALENCE_QUERY: u32 = 20;
+const CHECK_RULES: u32 = 21;
+const LEAN_TO_RULES: u32 = 22;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -201,8 +212,357 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
         INSTANTIATE => compiler::instantiate(a, b, n),
         CHECK_TEMPLATE => compiler::check_template(a, b),
         NAMES => Ok(compiler::names()),
+        TRACE => {
+            // Options, a line each: `standard` (the standard engine), `assume <predicate>`,
+            // `phases <name>,<name>,…` (a strategy of just those phases, in that order).
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let e = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            let mut standard = false;
+            let mut trusted = false;
+            let mut phases: Option<Vec<String>> = None;
+            let mut assumptions = bw::Assumptions::new();
+            // `rules` on a line of its own: the rest of `b` is a `.bwr` program to link.
+            let (opts, rules_src) = match b.find("\nrules\n") {
+                Some(i) => (&b[..i], Some(&b[i + 7..])),
+                None => match b.strip_prefix("rules\n") {
+                    Some(rest) => ("", Some(rest)),
+                    None => (b, None),
+                },
+            };
+            for line in opts.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if line == "standard" {
+                    standard = true;
+                } else if line == "trusted" {
+                    trusted = true;
+                } else if let Some(list) = line.strip_prefix("phases ") {
+                    phases = Some(list.split(',').map(|p| p.trim().to_string()).collect());
+                } else if let Some(p) = line.strip_prefix("assume ") {
+                    let p = cx.parse(p, &o).map_err(|e| format!("assume {p}: {e}"))?;
+                    assumptions
+                        .assume_true(&mut cx, p)
+                        .map_err(|e| format!("assume: {e} (a predicate is 1 bit wide)"))?;
+                } else {
+                    return Err(format!("unknown option `{line}`"));
+                }
+            }
+            let own_engine;
+            let mut linked: Option<(String, Option<Ledger>)> = None;
+            let engine = if let Some(src) = rules_src {
+                let (program, ledger) = own_rules(src, trusted)?;
+                let groups: Vec<String> = program.groups().iter().map(|g| g.name.clone()).collect();
+                let group_refs: Vec<&str> = groups.iter().map(String::as_str).collect();
+                let mut strategy = if let Some(names) = &phases {
+                    custom_strategy(names)?
+                } else if standard {
+                    Strategy::standard()
+                } else {
+                    deobfuscate_strategy()
+                };
+                strategy = strategy.with_rule_groups(&group_refs);
+                let mut builder = Engine::builder()
+                    .builtin()
+                    .mba_solver(Arc::new(NormalFormSolver::default()))
+                    .strategy(strategy);
+                builder = match &ledger {
+                    Some(l) => builder.program(program, l),
+                    None => builder.unproven_program(program).allow_unproven(true),
+                };
+                own_engine = builder.build().map_err(|e| e.to_string())?;
+                linked = Some((src.to_string(), ledger));
+                &own_engine
+            } else if let Some(names) = phases {
+                own_engine = custom_engine(&names)?;
+                &own_engine
+            } else if standard {
+                own_engine = Engine::standard();
+                &own_engine
+            } else {
+                deobfuscator()
+            };
+            let mut t = Trace::new(engine).with_explanations(true).with_facts(true);
+            if let Some((src, ledger)) = &linked {
+                t = t.with_source(src, ledger.as_ref());
+            }
+            t.with_assumptions(&mut cx, &assumptions)
+                .map_err(|e| e.to_string())?;
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[e],
+                    Run::default()
+                        .with_assumptions(&assumptions)
+                        .with_observer(&mut t),
+                )
+                .map_err(|e| e.to_string())?;
+            t.to_jsonl(&mut cx, &[e], &out).map_err(|e| e.to_string())
+        }
+        EVALUATE => {
+            // `b`: a line per symbol, `name = value` (decimal, or hex with `0x`).
+            let mut cx = Context::new();
+            let w = width(n)?;
+            let e = cx
+                .parse(a, &ParseOptions::width(w))
+                .map_err(|e| e.to_string())?;
+            let mut env: std::collections::HashMap<bw::SymbolKey, bw::BitVec> = Default::default();
+            for line in b.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let (name, value) = line
+                    .split_once('=')
+                    .ok_or_else(|| format!("`{line}`: expected `name = value`"))?;
+                let name = name.trim();
+                let sym = cx
+                    .symbols_in(&[e])
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|&s| cx.symbol_key(s).is_some_and(|k| k.to_string() == name));
+                let Some(sym) = sym else {
+                    continue; // a symbol the expression does not have
+                };
+                let sw = cx.symbol_width(sym).unwrap_or(w);
+                let v = parse_value(value.trim(), sw)?;
+                if let Some(k) = cx.symbol_key(sym) {
+                    env.insert(k.clone(), v);
+                }
+            }
+            let v = cx.eval(&[e], &env).map_err(|e| e.to_string())?;
+            Ok(format!("{:#x}", v[0]))
+        }
+        RULES => Ok(rule_catalog()),
+        CHECK_RULES => check_rules(a),
+        LEAN_TO_RULES => Ok(lean_in::to_bwr(a)),
+        FROM_SMTLIB => {
+            // The script's definitions, or its assertions conjoined, as expression text with
+            // the symbols' widths; `b` names one definition.
+            let mut cx = Context::new();
+            let import = bw::smtlib::import(&mut cx, a).map_err(|e| e.to_string())?;
+            let e = if !b.is_empty() {
+                import
+                    .definition(b)
+                    .ok_or_else(|| format!("no definition `{b}`"))?
+            } else if let Some(&(_, e)) = import.definitions.last() {
+                e
+            } else if let Some((&first, rest)) = import.assertions.split_first() {
+                let mut acc = first;
+                for &p in rest {
+                    acc = cx.bin(bw::BinOp::And, acc, p).map_err(|e| e.to_string())?;
+                }
+                acc
+            } else {
+                return Err("the script defines and asserts nothing".to_string());
+            };
+            let opts = bw::PrintOptions::default().with_symbol_widths(true);
+            Ok(cx.display_with(e, opts).to_string())
+        }
+        TO_LEAN => {
+            // `a = b` as a Lean example over their symbols (`b` empty: the term of `a` alone).
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let l = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            if b.is_empty() {
+                return lean::term(&cx, l);
+            }
+            let r = cx.parse(b, &o).map_err(|e| e.to_string())?;
+            lean::equation(&mut cx, l, r)
+        }
+        EQUIVALENCE_QUERY => {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let l = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            let r = cx.parse(b, &o).map_err(|e| e.to_string())?;
+            text(bw::smtlib::equivalence_query(&mut cx, l, r))
+        }
         _ => Err(format!("unknown operation {op}")),
     }
+}
+
+/// A value for a symbol of `w` bits: decimal, or hex with `0x`; negative with a leading `-`.
+fn parse_value(text: &str, w: bw::Width) -> Result<bw::BitVec, String> {
+    let (neg, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let magnitude =
+        bw::BitVec::parse(&format!("{body}:{}", w.bits())).map_err(|e| format!("`{text}`: {e}"))?;
+    Ok(if neg {
+        bw::BitVec::apply_un(bw::UnOp::Neg, &magnitude).map_err(|e| e.to_string())?
+    } else {
+        magnitude
+    })
+}
+
+/// An engine of the named phases (`fact_fold`, `local`, `linear`, …, `mba`), in that order.
+fn custom_engine(names: &[String]) -> Result<Engine, String> {
+    Engine::builder()
+        .builtin()
+        .mba_solver(Arc::new(NormalFormSolver::default()))
+        .strategy(custom_strategy(names)?)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// A strategy of the named phases, in that order.
+fn custom_strategy(names: &[String]) -> Result<Strategy, String> {
+    let groups = Strategy::standard()
+        .phases
+        .iter()
+        .find_map(|p| match p {
+            Phase::Local { groups } => Some(groups.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut phases = Vec::new();
+    for name in names {
+        phases.push(match name.as_str() {
+            "fact_fold" => Phase::FactFold,
+            "local" => Phase::Local {
+                groups: groups.clone(),
+            },
+            "linear" => Phase::Linear,
+            "bitwise" => Phase::Bitwise,
+            "xor" => Phase::Xor,
+            "compares" => Phase::Compares,
+            "casts" => Phase::Casts,
+            "demanded" => Phase::Demanded,
+            "linear_mba" => Phase::LinearMba,
+            "shuffle" => Phase::Shuffle,
+            "invert" => Phase::Invert,
+            "division" => Phase::Division,
+            "carries" => Phase::Carries,
+            "mba" => Phase::Mba(
+                MbaConfig::default()
+                    .with_trust(MbaTrust::default().with_backend_certificates(false)),
+            ),
+            other => return Err(format!("unknown phase `{other}`")),
+        });
+    }
+    if phases.is_empty() {
+        return Err("no phases".to_string());
+    }
+    Ok(Strategy::new("custom", phases))
+}
+
+/// A `.bwr` program of the user's, compiled; checked by the soundness checker (its ledger)
+/// unless `trusted`, when it links unproven and every application is sampled.
+fn own_rules(src: &str, trusted: bool) -> Result<(RuleProgram, Option<Ledger>), String> {
+    let program = RuleProgram::compile(src).map_err(|e| e.to_string())?;
+    if trusted {
+        return Ok((program, None));
+    }
+    let checks = bw::check::check_program(&program, &bw::check::CheckConfig::default());
+    let bad: Vec<String> = checks
+        .iter()
+        .filter_map(|c| match &c.verdict {
+            bw::check::Verdict::Sound => None,
+            bw::check::Verdict::Unsound(cx) => Some(format!("{} is unsound: {cx}", c.name)),
+            bw::check::Verdict::Inconclusive(why) => {
+                Some(format!("{} could not be checked ({why})", c.name))
+            }
+            _ => Some(format!("{} could not be checked", c.name)),
+        })
+        .collect();
+    if !bad.is_empty() {
+        return Err(format!(
+            "the rules did not pass the checker (link them trusted to run them anyway):\n{}",
+            bad.join("\n")
+        ));
+    }
+    Ok((program, Some(Ledger::from_checks(&checks))))
+}
+
+/// A `.bwr` program compiled and checked: a JSON object per line. Diagnostics first
+/// (`{"diag":"BW0302","level":"error","message":…,"start":…,"end":…}`), then, when the program
+/// compiles, each rule's verdict (`{"rule":…,"kind":…,"verdict":"sound"|"unsound"|
+/// "inconclusive","detail":…,"evidence":…}`).
+fn check_rules(src: &str) -> Result<String, String> {
+    let j = |s: &str| format!("{:?}", s);
+    let mut out = String::new();
+    let program = match RuleProgram::compile(src) {
+        Ok(p) => p,
+        Err(e) => {
+            // The compile error carries the diagnostics; report them.
+            for d in &e.diagnostics {
+                out.push_str(&format!(
+                    "{{\"diag\":{},\"level\":{},\"message\":{},\"start\":{},\"end\":{}}}\n",
+                    j(d.code),
+                    j(&format!("{:?}", d.level).to_lowercase()),
+                    j(&d.message),
+                    d.span.0,
+                    d.span.1
+                ));
+            }
+            if e.diagnostics.is_empty() {
+                out.push_str(&format!(
+                    "{{\"diag\":\"\",\"level\":\"error\",\"message\":{},\"start\":0,\"end\":0}}\n",
+                    j(&e.to_string())
+                ));
+            }
+            return Ok(out);
+        }
+    };
+    for d in program.diagnostics() {
+        out.push_str(&format!(
+            "{{\"diag\":{},\"level\":{},\"message\":{},\"start\":{},\"end\":{}}}\n",
+            j(d.code),
+            j(&format!("{:?}", d.level).to_lowercase()),
+            j(&d.message),
+            d.span.0,
+            d.span.1
+        ));
+    }
+    for c in bw::check::check_program(&program, &bw::check::CheckConfig::default()) {
+        let (verdict, detail) = match &c.verdict {
+            bw::check::Verdict::Sound => ("sound", String::new()),
+            bw::check::Verdict::Unsound(cx) => ("unsound", cx.to_string()),
+            bw::check::Verdict::Inconclusive(why) => ("inconclusive", why.to_string()),
+            _ => ("inconclusive", String::new()),
+        };
+        let examples: Vec<String> = c.examples.iter().map(|e| format!("{e:?}")).collect();
+        out.push_str(&format!(
+            "{{\"rule\":{},\"kind\":{},\"verdict\":{},\"detail\":{},\"evidence\":{},\"failed_examples\":{}}}\n",
+            j(&c.name),
+            j(if c.kind == bw::rules::RuleKind::Identity { "identity" } else { "rule" }),
+            j(verdict),
+            j(&detail),
+            j(&c.evidence.to_string()),
+            examples.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// The built-in rules, a JSON object per line: name, kind, doc, examples, source, ledger.
+fn rule_catalog() -> String {
+    let mut out = String::new();
+    for (_, src, ledger_text) in bw::rules::builtin_sources() {
+        let Ok(program) = bw::rules::RuleProgram::compile(src) else {
+            continue;
+        };
+        let ledger: std::collections::HashMap<&str, &str> = ledger_text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .filter_map(|l| {
+                let mut p = l.splitn(3, ' ');
+                Some((p.next()?, p.nth(1)?))
+            })
+            .collect();
+        for r in program.rules() {
+            let j = |s: &str| format!("{:?}", s);
+            out.push_str(&format!(
+                "{{\"name\":{},\"kind\":{},\"doc\":{},\"examples\":[{}],\"source\":{},\"ledger\":{}}}\n",
+                j(&r.name),
+                j(if r.kind == bw::rules::RuleKind::Identity { "identity" } else { "rule" }),
+                j(&r.doc),
+                r.examples
+                    .iter()
+                    .map(|(a, b)| format!("[{},{}]", j(a), j(b)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                j(src.get(r.span.0..r.span.1).unwrap_or("")),
+                j(ledger.get(r.name.as_str()).copied().unwrap_or("")),
+            ));
+        }
+    }
+    out
 }
 
 /// # Safety
