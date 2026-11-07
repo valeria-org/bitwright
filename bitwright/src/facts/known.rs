@@ -324,6 +324,18 @@ impl KnownBits {
     /// Enumerates every consistent value if there are at most `2^max_unknown_bits` (and at
     /// most 2^20 in any case).
     pub fn enumerate(&self, max_unknown_bits: u32) -> Option<Vec<BitVec>> {
+        self.enumerate_where(max_unknown_bits, usize::MAX, |_| true)
+    }
+
+    /// The consistent values `keep` admits, if there are at most `2^max_unknown_bits`
+    /// candidates (and at most 2^20 in any case) and at most `limit` of them are kept: the
+    /// enumeration stops at the first kept value past `limit`.
+    pub(crate) fn enumerate_where(
+        &self,
+        max_unknown_bits: u32,
+        limit: usize,
+        mut keep: impl FnMut(&BitVec) -> bool,
+    ) -> Option<Vec<BitVec>> {
         let unknown = self.unknown_mask();
         let n = count_ones(&unknown);
         if n > max_unknown_bits.min(20) {
@@ -332,15 +344,24 @@ impl KnownBits {
         let positions: Vec<u16> = (0..self.width().bits())
             .filter(|&i| unknown.bit(i) == Some(true))
             .collect();
-        let mut out = Vec::with_capacity(1 << n);
+        let ones = self.one.limbs();
+        let mut limbs = [0u64; crate::value::wide::MAX_LIMBS];
+        let mut out = Vec::new();
         for k in 0u64..(1u64 << n) {
-            let mut limbs: Vec<u64> = self.one.limbs().to_vec();
+            limbs.fill(0);
+            limbs[..ones.len()].copy_from_slice(ones);
             for (j, &p) in positions.iter().enumerate() {
                 if (k >> j) & 1 == 1 {
-                    limbs[p as usize / 64] |= 1 << (p % 64);
+                    limbs[usize::from(p) / 64] |= 1 << (p % 64);
                 }
             }
-            out.push(BitVec::wrapping_from_limbs(self.width(), &limbs));
+            let v = BitVec::wrapping_from_limbs(self.width(), &limbs);
+            if keep(&v) {
+                if out.len() == limit {
+                    return None;
+                }
+                out.push(v);
+            }
         }
         Some(out)
     }

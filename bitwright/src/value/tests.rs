@@ -288,55 +288,86 @@ fn biased(rng: &mut Rng, width: Width) -> BitVec {
     }
 }
 
+/// Boundary-biased random operands at every wide width, `samples` per width, through every
+/// operator against the reference. The reference works bit by bit, so the long run is spread
+/// over the available threads: each width's samples in chunks, each chunk on its own stream.
 fn random_wide_battery(samples: usize, seed: u64) {
-    let mut rng = Rng(seed);
-    for w in WIDE_WIDTHS {
-        let width = Width::new(w).unwrap();
-        for _ in 0..samples {
-            let a = biased(&mut rng, width);
-            let b = biased(&mut rng, width);
-            for op in UnOp::ALL {
-                check_un(op, &a);
-            }
-            for op in BinOp::ALL {
-                check_bin(op, &a, &b);
-            }
-            for op in CmpOpExt::ALL {
-                check_cmp(op, &a, &b);
-            }
-            // Casts across the limb boundaries.
-            let ra = to_ref(&a);
-            let to = w + rng.below(u64::from(Width::MAX_BITS - w) + 1) as u16;
-            let tw = Width::new(to).unwrap();
-            assert_eq!(
-                a.zext(tw).unwrap(),
-                from_ref(&r::zext(&ra, to)),
-                "zext {a} {to}"
-            );
-            assert_eq!(
-                a.sext(tw).unwrap(),
-                from_ref(&r::sext(&ra, to)),
-                "sext {a} {to}"
-            );
-            let lo = rng.below(u64::from(w)) as u16;
-            let len = 1 + rng.below(u64::from(w - lo)) as u16;
-            assert_eq!(
-                a.extract(lo, Width::new(len).unwrap()).unwrap(),
-                from_ref(&r::extract(&ra, lo, len)),
-                "extract {a} {lo} {len}"
-            );
-            // Concatenation with an operand of an unrelated width.
-            if w < 512 {
-                let lw = 1 + rng.below(u64::from(512 - w)) as u16;
-                let l = biased(&mut rng, Width::new(lw).unwrap());
-                assert_eq!(
-                    BitVec::concat(&a, &l).unwrap(),
-                    from_ref(&r::concat(&ra, &to_ref(&l))),
-                    "concat {a} {l}"
-                );
-            }
-            check_signed_conversion(&a);
+    const CHUNK: usize = 250;
+    let tasks: Vec<(u16, u64, usize)> = WIDE_WIDTHS
+        .iter()
+        .flat_map(|&w| {
+            (0..samples)
+                .step_by(CHUNK)
+                .enumerate()
+                .map(move |(chunk, start)| (w, chunk as u64, (samples - start).min(CHUNK)))
+        })
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(tasks.len());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(w, chunk, n)) = tasks.get(i) else {
+                        break;
+                    };
+                    let mut rng = Rng(seed ^ (u64::from(w) << 40) ^ (chunk << 24));
+                    random_wide_samples(&mut rng, Width::new(w).unwrap(), n);
+                }
+            });
         }
+    });
+}
+
+fn random_wide_samples(rng: &mut Rng, width: Width, samples: usize) {
+    let w = width.bits();
+    for _ in 0..samples {
+        let a = biased(rng, width);
+        let b = biased(rng, width);
+        for op in UnOp::ALL {
+            check_un(op, &a);
+        }
+        for op in BinOp::ALL {
+            check_bin(op, &a, &b);
+        }
+        for op in CmpOpExt::ALL {
+            check_cmp(op, &a, &b);
+        }
+        // Casts across the limb boundaries.
+        let ra = to_ref(&a);
+        let to = w + rng.below(u64::from(Width::MAX_BITS - w) + 1) as u16;
+        let tw = Width::new(to).unwrap();
+        assert_eq!(
+            a.zext(tw).unwrap(),
+            from_ref(&r::zext(&ra, to)),
+            "zext {a} {to}"
+        );
+        assert_eq!(
+            a.sext(tw).unwrap(),
+            from_ref(&r::sext(&ra, to)),
+            "sext {a} {to}"
+        );
+        let lo = rng.below(u64::from(w)) as u16;
+        let len = 1 + rng.below(u64::from(w - lo)) as u16;
+        assert_eq!(
+            a.extract(lo, Width::new(len).unwrap()).unwrap(),
+            from_ref(&r::extract(&ra, lo, len)),
+            "extract {a} {lo} {len}"
+        );
+        // Concatenation with an operand of an unrelated width.
+        if w < 512 {
+            let lw = 1 + rng.below(u64::from(512 - w)) as u16;
+            let l = biased(rng, Width::new(lw).unwrap());
+            assert_eq!(
+                BitVec::concat(&a, &l).unwrap(),
+                from_ref(&r::concat(&ra, &to_ref(&l))),
+                "concat {a} {l}"
+            );
+        }
+        check_signed_conversion(&a);
     }
 }
 
