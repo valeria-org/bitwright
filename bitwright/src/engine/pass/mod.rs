@@ -188,6 +188,9 @@ pub(crate) struct Scratch {
     dead: Vec<u32>,
     /// Region nodes decided to stop being used.
     decided: Marks,
+    /// What the region left in `region`, `local`, `zeros` and `atoms` is of: the node, a hash
+    /// of its atoms, and the state the counts depend on (see [`region`]).
+    region_for: Option<(u32, u64, bool, usize, u32)>,
 }
 
 /// A normal-form pass.
@@ -319,8 +322,18 @@ pub(super) fn mba_step(
     let additive = |op: OpCode| matches!(op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl);
     if let Some(&p) = r.chain_parent.get(&n) {
         let (op, up) = (cx.node(n).op, cx.node(p).op);
+        // A cast between a link and its user is part of the user's fragment (`zext(t ^ k)`
+        // beside other terms): the link is covered by the question above the cast.
+        let (p, up) = match up {
+            OpCode::Zext | OpCode::Sext | OpCode::Extract => match r.chain_parent.get(&p) {
+                Some(&q) => (q, cx.node(q).op),
+                None => (p, up),
+            },
+            _ => (p, up),
+        };
         if ((matches!(op, OpCode::Add | OpCode::Sub) && additive(up))
-            || (op == OpCode::Mul && up == OpCode::Mul))
+            || (op == OpCode::Mul && up == OpCode::Mul)
+            || (matches!(op, OpCode::Xor | OpCode::And | OpCode::Or) && up == op))
             && mba::asks(r, cx, cfg, p)?
         {
             return Ok(Step::Normal(Fin::PROVISIONAL));
@@ -787,6 +800,23 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
 /// `r.scratch.atoms`). Also counts in `r.scratch.local` each region node's uses from region
 /// nodes, and lists in `r.scratch.zeros` the region nodes no live node uses (see [`dying_in`]).
 fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result<(), Stop> {
+    // The same region as last time (a pass asks whether building pays, builds, then asks
+    // whether the result pays: twice per candidate): still there, while no node was retired
+    // and the use counts are as they were (new nodes only add uses, which `dying_in` reads
+    // afresh). A phase run starts over.
+    let key = (
+        n,
+        atoms.iter().fold(0x7265_6769_6f6e_u64, |h, &a| {
+            crate::hash::combine(h, u64::from(a))
+        }),
+        r.uses_on,
+        r.dead_log.len(),
+        r.phase_start,
+    );
+    if r.scratch.region_for == Some(key) {
+        return Ok(());
+    }
+    r.scratch.region_for = None;
     let cap = region_cap(r);
     let sc = &mut r.scratch;
     sc.atoms.begin(cx.len());
@@ -830,6 +860,7 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
             }
         }
     }
+    sc.region_for = Some(key);
     Ok(())
 }
 

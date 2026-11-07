@@ -965,6 +965,30 @@ fn emit_floats(
     Ok(None)
 }
 
+/// Whether [`emit_values`] writes `s` as one comparison with a constant (or a truth value).
+fn simple_set(s: &Set, w: Width) -> bool {
+    if s.is_empty() || *s == full(w) {
+        return true;
+    }
+    let wrapped = match s.as_slice() {
+        [(lo, hi)] => Some((*lo, *hi)),
+        [(z, hi), (lo, m)] if z.is_zero() && m.is_ones() => Some((*lo, *hi)),
+        _ => None,
+    };
+    let Some((lo, hi)) = wrapped else {
+        return false;
+    };
+    if lo == hi {
+        return true;
+    }
+    if let [(a, b)] = complement(s, w).as_slice()
+        && a == b
+    {
+        return true;
+    }
+    lo.is_zero() || hi.is_ones() || lo == BitVec::smin(w) || hi == BitVec::smax(w)
+}
+
 fn emit_values(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1000,6 +1024,11 @@ fn emit_values(
             && a == b
         {
             Some((CmpOp::Ne, *a, true))
+        } else if lo == smin && hi == max {
+            // The negative values: a sign test, not `smin <=u x`.
+            Some((CmpOp::Sle, max, true))
+        } else if lo == zero && hi == smax {
+            Some((CmpOp::Sle, zero, false))
         } else if lo == zero {
             Some((CmpOp::Ule, hi, true))
         } else if hi == max {
@@ -1203,7 +1232,44 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let (e, atoms) = match &info {
         Info::Pair(x, y, s) => (emit_pair(r, cx, *x, *y, *s)?, vec![*x, *y]),
         Info::Floats(x, y, f, s) => (emit_floats(r, cx, *x, *y, *f, *s)?, vec![*x, *y]),
-        Info::Values(x, s, h) => (emit_values(r, cx, *x, s, *h)?, vec![*x]),
+        // A set of values of `x`: emitted on the deepest term `x` is a function of where it
+        // is one comparison with a constant (`sext(a) <s 5` is `a <s 5`, `zext(a) <u 5` is
+        // `a <u 5`), else on `x` (`(x + 3) <u 10` stays: on `x` it is a range check). Decided
+        // before anything is built: a candidate built and dropped would count as a use of
+        // the nodes it shares with the chosen one.
+        Info::Values(x, s, h) => {
+            let (nodes, maps) = chain(cx, *x);
+            let mut at = 0usize;
+            let mut set = s.clone();
+            let mut best = u32::MAX;
+            for k in 0..nodes.len() {
+                let t = if k == 0 {
+                    Some(s.clone())
+                } else {
+                    pull(cx, &nodes, &maps, k, s)
+                };
+                let Some(t) = t else {
+                    continue;
+                };
+                // The term, and one comparison with a constant (two nodes) or a range check
+                // (a subtraction, two constants and the comparison).
+                let term = match cx.dag_size(&[cx.handle(nodes[k])], 256) {
+                    Ok(crate::expr::Bounded::Exact(n)) => n,
+                    _ => continue,
+                };
+                let cost = term
+                    + if simple_set(&t, cx.width_of(nodes[k])) {
+                        2
+                    } else {
+                        4
+                    };
+                if cost < best {
+                    (at, set, best) = (k, t, cost);
+                }
+            }
+            let hint = if at == 0 { *h } else { None };
+            (emit_values(r, cx, nodes[at], &set, hint)?, vec![nodes[at]])
+        }
         Info::Const(v) if boolean_op(node.op) => (Some(bool_const(r, cx, *v)?), Vec::new()),
         _ => (None, Vec::new()),
     };

@@ -1224,6 +1224,17 @@ fn float_compare_expr(g: &mut Gen, cx: &mut Context, f: FpFormat, depth: u32) ->
 
 #[test]
 fn compares_of_floats_is_sound_and_idempotent() {
+    compares_of_floats_is_sound_and_idempotent_cases(1500);
+}
+
+/// [`compares_of_floats_is_sound_and_idempotent`] over 4000 random cases.
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn compares_of_floats_is_sound_and_idempotent_heavy() {
+    compares_of_floats_is_sound_and_idempotent_cases(4000);
+}
+
+fn compares_of_floats_is_sound_and_idempotent_cases(cases: usize) {
     let eng = engine(vec![Phase::Compares]);
     let mut g = generator(0xf1_0a7);
     let mut rng = Rng(46);
@@ -1238,7 +1249,7 @@ fn compares_of_floats_is_sound_and_idempotent() {
         (5, 2),
     ];
     let mut changed = 0;
-    for i in 0..4000 {
+    for i in 0..cases {
         let mut cx = Context::new();
         let f = if i % 10 == 0 {
             [FpFormat::F16, FpFormat::BF16, FpFormat::F32][g.rng.below(3) as usize]
@@ -1266,7 +1277,7 @@ fn compares_of_floats_is_sound_and_idempotent() {
             cx.display(again.roots[0].expr)
         );
     }
-    assert!(changed > 800, "{changed}");
+    assert!(changed > 800 * cases as u64 / 4000, "{changed}");
 }
 
 #[test]
@@ -1367,9 +1378,10 @@ fn casts_is_sound_and_idempotent() {
         let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
         assert!(
             !again.roots[0].changed,
-            "not idempotent: {} -> {}",
+            "not idempotent: {} -> {} (from {})",
             cx.display(r.expr),
-            cx.display(again.roots[0].expr)
+            cx.display(again.roots[0].expr),
+            cx.display(e)
         );
     }
     assert!(changed > 100, "{changed}");
@@ -1468,9 +1480,10 @@ fn demanded_is_sound_and_idempotent() {
         let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
         assert!(
             !again.roots[0].changed,
-            "not idempotent: {} -> {}",
+            "not idempotent: {} -> {} (from {})",
             cx.display(r.expr),
-            cx.display(again.roots[0].expr)
+            cx.display(again.roots[0].expr),
+            cx.display(e)
         );
     }
     assert!(changed > 200, "{changed}");
@@ -1757,11 +1770,22 @@ fn predicate(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
 /// remainders are folded only when constant (exhaustively checked), and many are.
 #[test]
 fn residue_predicates_are_sound() {
+    residue_predicates_are_sound_cases(1000);
+}
+
+/// [`residue_predicates_are_sound`] over 3000 random cases.
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn residue_predicates_are_sound_heavy() {
+    residue_predicates_are_sound_cases(3000);
+}
+
+fn residue_predicates_are_sound_cases(cases: usize) {
     let eng = engine(vec![Phase::Compares]);
     let mut g = generator(0x0b5c_7e11);
     let mut rng = Rng(53);
     let mut decided = 0;
-    for _ in 0..3000 {
+    for _ in 0..cases {
         let mut cx = Context::new();
         let w = 1 + g.rng.below(6) as u16;
         let p = predicate(&mut g, &mut cx, w, 2);
@@ -1775,7 +1799,7 @@ fn residue_predicates_are_sound() {
         );
         decided += u64::from(r.changed && cx.const_val(cx.id(r.expr).unwrap()).is_some());
     }
-    assert!(decided > 300, "{decided}");
+    assert!(decided > 300 * cases as u64 / 3000, "{decided}");
 }
 
 /// The decision itself, on its own: a predicate it calls constant is constant (exhaustively
@@ -2352,9 +2376,10 @@ fn linear_mba_is_sound_and_idempotent() {
         let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
         assert!(
             !again.roots[0].changed,
-            "not idempotent: {} -> {}",
+            "not idempotent: {} -> {} (from {})",
             cx.display(r.expr),
-            cx.display(again.roots[0].expr)
+            cx.display(again.roots[0].expr),
+            cx.display(e)
         );
     }
     assert!(changed > 200, "{changed}");
@@ -2385,6 +2410,215 @@ fn linear_mba_identities() {
         // Atoms may be compound: (p * q) plays the role of x.
         same("((p * q) ^ r) + 2 * ((p * q) & r)", "p * q + r", w);
     }
+}
+
+/// Fragments through extensions of narrow values (see the module notes of `linear_mba`): the
+/// function under a cast is read over the atoms lifted by that cast.
+#[test]
+fn linear_mba_reads_through_extensions() {
+    let eng = engine(vec![Phase::LinearMba]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    // Casts of the atoms themselves (as the input spells them)...
+    same(
+        "(zext<64>(a:32) ^ zext<64>(b:32)) + 2 * (zext<64>(a:32) & zext<64>(b:32))",
+        "zext<64>(a) + zext<64>(b)",
+    );
+    same(
+        "(sext<64>(a:32) ^ sext<64>(b:32)) + 2 * (sext<64>(a:32) & sext<64>(b:32))",
+        "sext<64>(a) + sext<64>(b)",
+    );
+    // ...and casts of bitwise functions of them (as the rules spell them).
+    same(
+        "zext<64>(a:32 ^ b:32) + 2 * zext<64>(a:32 & b:32)",
+        "zext<64>(a) + zext<64>(b)",
+    );
+    same(
+        "sext<64>(a:32 ^ b:32) + 2 * sext<64>(a:32 & b:32)",
+        "sext<64>(a) + sext<64>(b)",
+    );
+    same(
+        "sext<64>(a:32 ^ b:32) - 2 * sext<64>(~a:32 & b:32)",
+        "sext<64>(a) - sext<64>(b)",
+    );
+    // (What the pass leaves of a sum is linear: the linear pass finishes it.)
+    {
+        let eng = engine(vec![Phase::LinearMba, Phase::Linear]);
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let src = "zext<64>(a:32 | b:32) + zext<64>(a:32 & b:32) - zext<64>(a:32) - zext<64>(b:32)";
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse("0", &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    }
+    // A zero extension of a function that is all ones at 0 is the function plus 2^W.
+    same("zext<64>(~a:32) + zext<64>(a:32)", "0xffffffff");
+    // (`~a & b` is 0 at 0: no `2^W` here.)
+    same(
+        "zext<64>(a:32 ^ b:32) - 2 * zext<64>(~a:32 & b:32)",
+        "zext<64>(a) - zext<64>(b)",
+    );
+    same(
+        "zext<64>(~a:32 | b:32) + zext<64>(a:32 & ~b:32)",
+        "0xffffffff",
+    );
+    // A value read under casts of two kinds: the second cast is an atom (no identity holds
+    // over independent lifted atoms), and nothing is rewritten.
+    same(
+        "zext<64>(a:32 & b:32) + sext<64>(a:32 & b:32)",
+        "zext<64>(a & b) + sext<64>(a & b)",
+    );
+}
+
+/// A tree of `& | ^ ~` over extensions of one kind and width, with constants, is the extension
+/// of the tree over the operands (see `bitwise::hoist_cast`).
+#[test]
+fn bitwise_hoists_a_common_extension() {
+    let eng = engine(vec![Phase::Bitwise]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same("zext<64>(a:32) & ~zext<64>(b:32)", "zext<64>(a & ~b)");
+    same("~zext<64>(a:32) & 0xffffffff", "zext<64>(~a)");
+    same(
+        "~(zext<64>(a:32) | zext<64>(b:32)) & 0xffffffff",
+        "zext<64>(~(a | b))",
+    );
+    same("sext<64>(a:32) & ~sext<64>(b:32)", "sext<64>(a & ~b)");
+    // The or below hoists; with one extension left and a constant, hoisting the xor would
+    // trade the constant for a narrower one, no smaller (a sign extension of its low bits or
+    // not).
+    same(
+        "(sext<64>(a:32) | sext<64>(b:32)) ^ 0xffffffff80000001",
+        "sext<64>(a | b) ^ 0xffffffff80000001",
+    );
+    same(
+        "(sext<64>(a:32) | sext<64>(b:32)) ^ 0xffffffff00000001",
+        "sext<64>(a | b) ^ 0xffffffff00000001",
+    );
+    same(
+        "(sext<64>(a:32) | sext<64>(b:32)) & 0xffffffff80000001 & sext<64>(c:32)",
+        "sext<64>((a | b) & 0x80000001 & c)",
+    );
+    // All ones above the width: the complement of a zero extension of the complement, where
+    // that is smaller (a constant absorbed); `~zext(a) | zext(b)` and `~zext(a & ~b)` are the
+    // same size, and so are the forms once the trees below are hoisted.
+    same("~zext<64>(a:32) | 0xffffffff00000000", "~zext<64>(a)");
+    same(
+        "~(zext<64>(a:32) | zext<64>(b:32)) | (zext<64>(c:32) & zext<64>(d:32))",
+        "~zext<64>(a | b) | zext<64>(c & d)",
+    );
+    same(
+        "~zext<64>(a:32) | zext<64>(b:32)",
+        "~zext<64>(a) | zext<64>(b)",
+    );
+    // A constant that is no sign extension of its low bits stops the hoist (the xor below
+    // still hoists), and so do extensions of two widths.
+    same(
+        "(sext<64>(a:32) ^ sext<64>(b:32)) | 0xffffffff00000000",
+        "sext<64>(a ^ b) | 0xffffffff00000000",
+    );
+    same(
+        "zext<64>(a:32) & zext<64>(c:16)",
+        "zext<64>(a) & zext<64>(c)",
+    );
+}
+
+/// `zext(~t)` is `lowmask − zext(t)` and `sext(~t)` is `−1 − sext(t)` to the linear pass,
+/// where the extension of `t` exists.
+#[test]
+fn linear_reads_extended_complements() {
+    let eng = engine(vec![Phase::Linear]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same("sext<64>(a:32) + sext<64>(~a:32)", "-1");
+    same("zext<64>(a:32) + zext<64>(~a:32)", "0xffffffff");
+    same("zext<64>(a:32) * 3 + zext<64>(~a:32) * 3", "0x2fffffffd");
+    same(
+        "sext<64>(a:32) * 2 + sext<64>(~a:32) * 2 + sext<64>(b:32)",
+        "sext<64>(b) - 2",
+    );
+    // A lone complement stays: building its extension would make the sum look cheaper.
+    same(
+        "zext<64>(~a:32) + zext<64>(b:32)",
+        "zext<64>(~a) + zext<64>(b)",
+    );
+}
+
+/// A lone comparison with a constant is re-expressed on the deepest term it is a function
+/// of where that is smaller (see `compares::step`): extensions, offsets and complements come
+/// off.
+#[test]
+fn compares_reexpress_on_the_deeper_term() {
+    let eng = engine(vec![Phase::Compares]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same("sext<64>(a:32) <s 0", "a <=s -1");
+    same("sext<64>(a:32) <s 5", "a <=s 4");
+    same("zext<64>(a:32) <u 5", "a <=u 4");
+    same("5 <u zext<64>(a:32)", "6 <=u a");
+    same("sext<64>(a:32) + 3 <s 10", "a <=s 6");
+    same("sext<64>(trunc<8>(x)) <s 0", "trunc<8>(x) <=s -1");
+    // A range check on the narrow term beats one comparison on the wide one...
+    same("zext<64>(a:32) - 3 <u 10", "a - 3 <=u 9");
+    // ...but not one on the same term.
+    same("(x + 3) <u 10", "x + 3 <u 10");
+    // Nothing deeper: as it is.
+    same("x <s 0", "x <s 0");
+}
+
+/// Extracts push through more (see the `casts` module notes): a doubled value, a sum or
+/// product with an operand whose low bits are zero, straddled left shifts, arithmetic shifts.
+#[test]
+fn casts_push_through_doubling_zero_lows_and_arithmetic_shifts() {
+    let eng = engine(vec![Phase::Casts]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same("extract<1, 31>(x + x)", "trunc<31>(x)");
+    same("extract<1, 63>(x + x)", "trunc<63>(x)");
+    same("extract<8, 8>((x << 8) + (y & 0xff))", "trunc<8>(x)");
+    same(
+        "extract<8, 8>((x << 8) - (y & 0xff))",
+        "extract<8, 8>((x << 8) - (y & 0xff))",
+    );
+    same("extract<8, 8>((y & 0xff) - (x << 8))", "-trunc<8>(x)");
+    same(
+        "extract<4, 8>((x & 0xfffffff0) * y)",
+        "trunc<8>(y) * extract<4, 8>(x)",
+    );
+    same("trunc<32>(x >>s 8)", "extract<8, 32>(x)");
+    same("extract<8, 8>(x >>s 60)", "sext<8>(extract<63, 1>(x))");
+    same("extract<8, 8>(x >>s 52)", "sext<8>(extract<60, 4>(x))");
 }
 
 // ----- shuffle ------------------------------------------------------------------------------------
@@ -2503,9 +2737,10 @@ fn shuffle_is_sound_and_idempotent() {
         let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
         assert!(
             !again.roots[0].changed,
-            "not idempotent: {} -> {}",
+            "not idempotent: {} -> {} (from {})",
             cx.display(r.expr),
-            cx.display(again.roots[0].expr)
+            cx.display(again.roots[0].expr),
+            cx.display(e)
         );
     }
     assert!(changed > 200, "{changed}");
@@ -3186,6 +3421,17 @@ mod mba_service {
 
 #[test]
 fn linear_mba_never_reads_linear_terms_as_bitwise_operands() {
+    linear_mba_never_reads_linear_terms_as_bitwise_operands_cases(1000);
+}
+
+/// [`linear_mba_never_reads_linear_terms_as_bitwise_operands`] over 3000 random cases.
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn linear_mba_never_reads_linear_terms_as_bitwise_operands_heavy() {
+    linear_mba_never_reads_linear_terms_as_bitwise_operands_cases(3000);
+}
+
+fn linear_mba_never_reads_linear_terms_as_bitwise_operands_cases(cases: usize) {
     for phases in [vec![Phase::LinearMba], Strategy::deobfuscate().phases] {
         let eng = engine(phases);
         let mut rng = Rng(0x6b);
@@ -3212,7 +3458,7 @@ fn linear_mba_never_reads_linear_terms_as_bitwise_operands() {
         }
         // Random DAGs over + - & | ^ of two symbols, linear terms under bitwise operators.
         let mut g = generator(0x6c);
-        for _ in 0..3000 {
+        for _ in 0..cases {
             let mut cx = Context::new();
             let w = Width::new(1 + g.rng.below(8) as u16).unwrap();
             let mut pool = vec![cx.symbol("x", w).unwrap(), cx.symbol("y", w).unwrap()];
@@ -3887,9 +4133,20 @@ fn values_6x6(cx: &mut Context, e: Expr) -> Vec<BitVec> {
 /// `b` has a bit `a`'s lacks (exhaustively), and `zero_bits` likewise; and both hold often.
 #[test]
 fn bit_subsets_are_sound() {
+    bit_subsets_are_sound_cases(1000);
+}
+
+/// [`bit_subsets_are_sound`] over 3000 random cases.
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn bit_subsets_are_sound_heavy() {
+    bit_subsets_are_sound_cases(3000);
+}
+
+fn bit_subsets_are_sound_cases(cases: usize) {
     let mut g = generator(0x0005_b5e7);
     let (mut subsets, mut zeros) = (0, 0);
-    for _ in 0..3000 {
+    for _ in 0..cases {
         let mut cx = Context::new();
         let w = 1 + g.rng.below(6) as u16;
         let width = Width::new(w).unwrap();
@@ -3942,7 +4199,7 @@ fn bit_subsets_are_sound() {
         }
     }
     assert!(
-        subsets > 600 && zeros > 300,
+        subsets > 600 * cases / 3000 && zeros > 300 * cases / 3000,
         "{subsets} subsets, {zeros} zero windows"
     );
 }

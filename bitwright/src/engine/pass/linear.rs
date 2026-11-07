@@ -334,8 +334,11 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => merge_signs(cx, get(r, node.a).add(&get(r, node.b))),
-        OpCode::Sub => merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
+        OpCode::Add => merge_complements(cx, merge_signs(cx, get(r, node.a).add(&get(r, node.b)))),
+        OpCode::Sub => merge_complements(
+            cx,
+            merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
+        ),
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -414,6 +417,45 @@ fn merge_signs(cx: &Context, form: Form) -> Form {
     let mut f = form;
     for (a, z, minus_k) in moves {
         f = f.add(&Form::of(BitVec::zero(w), &[(a, minus_k), (z, minus_k)]));
+    }
+    f.fin = fin;
+    f
+}
+
+/// `form` with each term `k·zext(~t)` moved to `k·lowmask(W) − k·zext(t)` and each
+/// `k·sext(~t)` to `−k − k·sext(t)` when the form has the extension of `t` as a term too, so
+/// the two cancel: `sext(a) + sext(~a)` is `−1`. Only then, as [`merge_signs`]: the extension
+/// found in the arena may be a dead node, and a rewrite over it would look cheaper than it is.
+fn merge_complements(cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut moves = Vec::new();
+    for &(a, k) in &form.terms {
+        let n = cx.node(a);
+        if !matches!(n.op, OpCode::Zext | OpCode::Sext) {
+            continue;
+        }
+        let inner = cx.node(n.a);
+        if inner.op == OpCode::Not
+            && let Some(z) = cx.find(&Node::new(n.op, w.bits(), inner.a, 0, 0))
+            && form.terms.binary_search_by_key(&z, |t| t.0).is_ok()
+        {
+            let c = if n.op == OpCode::Zext {
+                crate::facts::known::low_mask(w, u32::from(cx.width_of(n.a).bits()))
+            } else {
+                BitVec::ones(w)
+            };
+            moves.push((a, z, k, c));
+        }
+    }
+    if moves.is_empty() {
+        return form;
+    }
+    let fin = form.fin;
+    let mut f = form;
+    for (a, z, k, c) in moves {
+        let minus_k = BitVec::un_unchecked(UnOp::Neg, &k);
+        let kc = BitVec::bin_unchecked(BinOp::Mul, &k, &c);
+        f = f.add(&Form::of(kc, &[(a, minus_k), (z, minus_k)]));
     }
     f.fin = fin;
     f

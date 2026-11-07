@@ -253,6 +253,19 @@ group core.compare {
     /// Equality of extended values is equality.
     #[example("zext<16>(p) == zext<16>(q)" => "p == q")]
     rule eq_zext<W, U>(a: W, b: W) where W < U { zext<U>(a) == zext<U>(b) => a == b }
+
+    /// The difference of two zero extensions is negative exactly when the first is below.
+    #[example("zext<16>(p) - zext<16>(q) <s 0:16" => "p <u q")]
+    rule sub_zext_negative<W, U>(a: W, b: W) where W < U { zext<U>(a) - zext<U>(b) <s 0 => a <u b }
+    /// The difference of two sign extensions with a bit to spare cannot overflow.
+    #[example("sext<16>(p) - sext<16>(q) <s 0:16" => "p <s q")]
+    rule sub_sext_negative<W, U>(a: W, b: W) where W + 1 <= U { sext<U>(a) - sext<U>(b) <s 0 => a <s b }
+    /// A zero extension below another plus one, which cannot wrap: at most it.
+    #[example("zext<16>(p) <u zext<16>(q) + 1" => "p <=u q")]
+    rule ult_zext_succ<W, U>(a: W, b: W) where W < U { zext<U>(a) <u zext<U>(b) + 1 => a <=u b }
+    /// A value equal to its low bits is below their range.
+    #[example("p & 15 == p" => "p <u 16")]
+    rule masked_eq_self<W>(x: W, c: const W) { x & c == x => x <u k if is_pow2(c + 1) let k: W = c + 1 }
 }
 
 group core.sign {
@@ -355,6 +368,22 @@ group core.casts {
     /// Truncate, then zero-extend back: a mask.
     #[example("zext<8>(trunc<4>(p))" => "p & 15")]
     rule zext_trunc<W, N>(x: W) where N < W { zext<W>(trunc<N>(x)) => x & lowmask(N) }
+
+    /// The arithmetic shift of a sign extension by at least the operand's top bit is the
+    /// extended sign bit.
+    #[example("sext<16>(p) >>s 9" => "sext<16>(extract<7, 1>(p))")]
+    rule ashr_sext_sign<W, U>(a: W, c: const U) where W < U {
+        sext<U>(a) >>s c => sext<U>(extract<W - 1, 1>(a)) if W - 1 <=u c
+    }
+    /// A sign extension spelled as a flip of the sign bit and a subtraction, over a zero
+    /// extension (the spelling the MBA solver's cast removal uses).
+    #[example("(zext<16>(p) ^ 128:16) - 128:16" => "sext<16>(p)")]
+    rule sext_flip_zext<W, U>(a: W) where W < U { (zext<U>(a) ^ bit(W - 1)) + -bit(W - 1) => sext<U>(a) }
+    /// The high half of a widened product is the multiply-high.
+    #[example("extract<8, 8>(zext<16>(p) * zext<16>(q))" => "umulhi(p, q)")]
+    rule umulhi_from_wide<W>(a: W, b: W) where W + W <= 512 { extract<W, W>(zext<W + W>(a) * zext<W + W>(b)) => umulhi(a, b) }
+    #[example("extract<8, 8>(sext<16>(p) * sext<16>(q))" => "smulhi(p, q)")]
+    rule smulhi_from_wide<W>(a: W, b: W) where W + W <= 512 { extract<W, W>(sext<W + W>(a) * sext<W + W>(b)) => smulhi(a, b) }
 
     /// Sign extension spelled as "value | (sign word << W)". Needs `U <= 2W` to be exact.
     #[example("zext<16>(p) | (zext<16>(p >>s 7) << 8)" => "sext<16>(p)")]
@@ -1180,6 +1209,15 @@ group core.bounds {
 }
 
 group core.concat {
+    /// A sign word (the value shifted down to its sign bit) above the value is its sign
+    /// extension.
+    #[example("concat(p >>s 7, p)" => "sext<16>(p)")]
+    rule concat_sign_shift<W>(x: W) where W + W <= 512 { concat(x >>s (W - 1), x) => sext<W + W>(x) }
+    /// A constant added to the high part of a value is added to the value, shifted.
+    #[example("concat(extract<4, 4>(p) + 1, trunc<4>(p))" => "p + 16")]
+    rule concat_hi_add<H, L>(x: H + L, c: const H) where H + L <= 512 {
+        concat(extract<L, H>(x) + c, trunc<L>(x)) => x + k let k: H + L = zext<H + L>(c) << L
+    }
     /// `&` of concatenations with one low part: the low part stays.
     #[example("concat(p, r:4) & concat(q, r:4)" => "concat(p & q, r:4)")]
     rule concat_and_low<W, V>(x: W, y: V, z: W) { concat(x, y) & concat(z, y) => concat(x & z, y) }

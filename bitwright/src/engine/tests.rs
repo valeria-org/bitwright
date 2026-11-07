@@ -1666,9 +1666,23 @@ mod reliance {
     /// they report relying on hold.
     #[test]
     fn fact_reliance_is_sound_where_only_the_relied_on_constraints_hold() {
+        fact_reliance(200, 30_000, 300);
+    }
+
+    /// [`fact_reliance_is_sound_where_only_the_relied_on_constraints_hold`] over three times
+    /// the seeds.
+    #[test]
+    #[ignore = "heavy: run with --release -- --ignored"]
+    fn fact_reliance_is_sound_where_only_the_relied_on_constraints_hold_heavy() {
+        fact_reliance(600, 100_000, 1_000);
+    }
+
+    /// `seeds` random assumption sets and probes; at least `min_checked` facts and
+    /// `min_partial` partial reliances must have been checked.
+    fn fact_reliance(seeds: u64, min_checked: u64, min_partial: u64) {
         let mut checked = 0u64;
         let mut partial = 0u64;
-        for seed in 0..600u64 {
+        for seed in 0..seeds {
             let mut cx = Context::new();
             let mut g = Gen {
                 rng: Rng(0x7e71_0000 + seed),
@@ -1776,7 +1790,7 @@ mod reliance {
             }
         }
         assert!(
-            checked > 100_000 && partial > 1_000,
+            checked > min_checked && partial > min_partial,
             "checked {checked}, partial {partial}"
         );
     }

@@ -599,6 +599,46 @@ rule eq_zext<W, U>(a: W, b: W) where W < U { zext<U>(a) == zext<U>(b) => a == b 
 
 - `zext<16>(p) == zext<16>(q)` → `p == q`
 
+#### `sub_zext_negative` — rule
+
+The difference of two zero extensions is negative exactly when the first is below.
+
+```text
+rule sub_zext_negative<W, U>(a: W, b: W) where W < U { zext<U>(a) - zext<U>(b) <s 0 => a <u b }
+```
+
+- `zext<16>(p) - zext<16>(q) <s 0:16` → `p <u q`
+
+#### `sub_sext_negative` — rule
+
+The difference of two sign extensions with a bit to spare cannot overflow.
+
+```text
+rule sub_sext_negative<W, U>(a: W, b: W) where W + 1 <= U { sext<U>(a) - sext<U>(b) <s 0 => a <s b }
+```
+
+- `sext<16>(p) - sext<16>(q) <s 0:16` → `p <s q`
+
+#### `ult_zext_succ` — rule
+
+A zero extension below another plus one, which cannot wrap: at most it.
+
+```text
+rule ult_zext_succ<W, U>(a: W, b: W) where W < U { zext<U>(a) <u zext<U>(b) + 1 => a <=u b }
+```
+
+- `zext<16>(p) <u zext<16>(q) + 1` → `p <=u q`
+
+#### `masked_eq_self` — rule
+
+A value equal to its low bits is below their range.
+
+```text
+rule masked_eq_self<W>(x: W, c: const W) { x & c == x => x <u k if is_pow2(c + 1) let k: W = c + 1 }
+```
+
+- `p & 15 == p` → `p <u 16`
+
 ### core.sign
 
 #### `ne_signs` — rule
@@ -804,6 +844,48 @@ rule zext_trunc<W, N>(x: W) where N < W { zext<W>(trunc<N>(x)) => x & lowmask(N)
 ```
 
 - `zext<8>(trunc<4>(p))` → `p & 15`
+
+#### `ashr_sext_sign` — rule
+
+The arithmetic shift of a sign extension by at least the operand's top bit is the
+extended sign bit.
+
+```text
+rule ashr_sext_sign<W, U>(a: W, c: const U) where W < U {
+        sext<U>(a) >>s c => sext<U>(extract<W - 1, 1>(a)) if W - 1 <=u c
+    }
+```
+
+- `sext<16>(p) >>s 9` → `sext<16>(extract<7, 1>(p))`
+
+#### `sext_flip_zext` — rule
+
+A sign extension spelled as a flip of the sign bit and a subtraction, over a zero
+extension (the spelling the MBA solver's cast removal uses).
+
+```text
+rule sext_flip_zext<W, U>(a: W) where W < U { (zext<U>(a) ^ bit(W - 1)) + -bit(W - 1) => sext<U>(a) }
+```
+
+- `(zext<16>(p) ^ 128:16) - 128:16` → `sext<16>(p)`
+
+#### `umulhi_from_wide` — rule
+
+The high half of a widened product is the multiply-high.
+
+```text
+rule umulhi_from_wide<W>(a: W, b: W) where W + W <= 512 { extract<W, W>(zext<W + W>(a) * zext<W + W>(b)) => umulhi(a, b) }
+```
+
+- `extract<8, 8>(zext<16>(p) * zext<16>(q))` → `umulhi(p, q)`
+
+#### `smulhi_from_wide` — rule
+
+```text
+rule smulhi_from_wide<W>(a: W, b: W) where W + W <= 512 { extract<W, W>(sext<W + W>(a) * sext<W + W>(b)) => smulhi(a, b) }
+```
+
+- `extract<8, 8>(sext<16>(p) * sext<16>(q))` → `smulhi(p, q)`
 
 #### `sext_from_sign_word` — rule
 
@@ -2929,6 +3011,29 @@ rule halves_sum_no_overflow<W>(x: W, y: W) where 1 < W {
 - `((p >>u 1) + (q >>u 1)) <u (p >>u 1)` → `false`
 
 ### core.concat
+
+#### `concat_sign_shift` — rule
+
+A sign word (the value shifted down to its sign bit) above the value is its sign
+extension.
+
+```text
+rule concat_sign_shift<W>(x: W) where W + W <= 512 { concat(x >>s (W - 1), x) => sext<W + W>(x) }
+```
+
+- `concat(p >>s 7, p)` → `sext<16>(p)`
+
+#### `concat_hi_add` — rule
+
+A constant added to the high part of a value is added to the value, shifted.
+
+```text
+rule concat_hi_add<H, L>(x: H + L, c: const H) where H + L <= 512 {
+        concat(extract<L, H>(x) + c, trunc<L>(x)) => x + k let k: H + L = zext<H + L>(c) << L
+    }
+```
+
+- `concat(extract<4, 4>(p) + 1, trunc<4>(p))` → `p + 16`
 
 #### `concat_and_low` — rule
 

@@ -205,31 +205,50 @@ pub struct NormalFormSolver {
     memo: Mutex<Memo>,
 }
 
-/// A remembered question: its content hash and budget.
-type MemoKey = ([u64; 2], MbaBudget);
+/// A remembered question: its content hash and whether evidence was asked for.
+type MemoKey = ([u64; 2], bool);
 
-/// Answers by question and budget, oldest forgotten first. An entry keeps its question, which
-/// must equal the one asked (a hash collision is a miss, never someone else's answer).
+/// Answers by question, oldest forgotten first. An entry keeps its question, which must equal
+/// the one asked (a hash collision is a miss, never someone else's answer), the steps the
+/// answer cost and the step budget it was found within: an answer serves any budget of at
+/// least the steps it cost, a question that ran short any budget no larger than the one it
+/// ran short of (a host whose per-call budget shrinks as it is spent asks with a different
+/// limit each time).
 #[derive(Debug, Default)]
 struct Memo {
-    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer, u64)>,
+    answers: HashMap<MemoKey, (MbaExpr, MbaAnswer, u64, u64)>,
     order: VecDeque<MemoKey>,
 }
 
 impl Memo {
-    /// The answer to `p`, and the steps finding it cost.
-    fn get(&self, key: &MemoKey, p: &MbaExpr) -> Option<(MbaAnswer, u64)> {
-        let (q, a, steps) = self.answers.get(key)?;
-        (q == p).then(|| (a.clone(), *steps))
+    /// The answer to `p` within `budget`, and the steps finding it cost.
+    fn get(&self, key: &MemoKey, p: &MbaExpr, budget: &MbaBudget) -> Option<(MbaAnswer, u64)> {
+        let (q, a, steps, limit) = self.answers.get(key)?;
+        if q != p {
+            return None;
+        }
+        let serves = match a {
+            MbaAnswer::Exhausted => budget.steps <= *limit,
+            _ => budget.steps >= *steps,
+        };
+        serves.then(|| (a.clone(), *steps))
     }
 
-    fn put(&mut self, capacity: usize, key: MemoKey, p: &MbaExpr, a: &MbaAnswer, steps: u64) {
+    fn put(
+        &mut self,
+        capacity: usize,
+        key: MemoKey,
+        p: &MbaExpr,
+        a: &MbaAnswer,
+        steps: u64,
+        limit: u64,
+    ) {
         if capacity == 0 {
             return;
         }
         if self
             .answers
-            .insert(key, (p.clone(), a.clone(), steps))
+            .insert(key, (p.clone(), a.clone(), steps, limit))
             .is_none()
         {
             self.order.push_back(key);
@@ -307,8 +326,8 @@ impl MbaSolver for NormalFormSolver {
             calls: 1,
             ..NfStats::default()
         };
-        let key = (p.key(), *budget);
-        let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p));
+        let key = (p.key(), budget.evidence);
+        let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p, budget));
         let (answer, steps) = match remembered {
             Some(a) => {
                 tally.memo_hits += 1;
@@ -317,7 +336,7 @@ impl MbaSolver for NormalFormSolver {
             None => {
                 let (a, steps) = solve(p, &self.opts, budget, &mut tally);
                 if let Ok(mut m) = self.memo.lock() {
-                    m.put(self.opts.memo as usize, key, p, &a, steps);
+                    m.put(self.opts.memo as usize, key, p, &a, steps, budget.steps);
                 }
                 (a, steps)
             }
@@ -992,13 +1011,28 @@ impl Pass<'_> {
                     self.halved = true;
                     return Ok(Some(f));
                 }
-                let (x, y) = (self.bitwise(a, tally)?, self.bitwise(b, tally)?);
-                self.charge((x.tables.len() as u64) << (x.support.len() + y.support.len()))?;
                 let op = match n.op {
                     MOp::And => BitOp::And,
                     MOp::Or => BitOp::Or,
                     _ => BitOp::Xor,
                 };
+                // Bitwise operations over sign extensions are sign extensions of the operation
+                // over the values extended: `~sext(x) & sext(z)` is `sext(~x & z)`, a form over
+                // the atoms of `x` and `z` (the extensions themselves are no bitwise functions
+                // of them: their high bits are one position's).
+                if let (Some(Form::Poly(pa)), Some(Form::Poly(pb))) =
+                    (&self.forms[a as usize], &self.forms[b as usize])
+                    && let Some((sa, ga)) = sign_view(pa, &self.classes)
+                    && let Some((sb, gb)) = sign_view(pb, &self.classes)
+                    && sa == sb
+                {
+                    self.charge((ga.tables.len() as u64) << (ga.support.len() + gb.support.len()))?;
+                    if let Some(h) = Bits::bin(op, &ga, &gb) {
+                        return Ok(Some(Form::Poly(sext_of(&h, sa, &self.classes))));
+                    }
+                }
+                let (x, y) = (self.bitwise(a, tally)?, self.bitwise(b, tally)?);
+                self.charge((x.tables.len() as u64) << (x.support.len() + y.support.len()))?;
                 match Bits::bin(op, &x, &y) {
                     Some(f) => Form::Bits(f),
                     None => {
@@ -1075,7 +1109,23 @@ impl Pass<'_> {
                 )?;
                 Form::Bits(Bits::atom(self.classes.len(), at))
             }
-            MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
+            // A zero extension: an atom below its operand's width, zero from there on (the
+            // width is a class boundary, see `class_constants`), so `zext(a) + zext(~a)` has
+            // the mask of `a`'s width and `(zext(a) ^ 2^s) − 2^s` (a sign extension, see
+            // `decast`) is `zext(a)` on the low bits less its sign bit.
+            MOp::Zext => {
+                let at = self.verbatim_atom(i, tally)?;
+                let nw = self.p.nodes()[a as usize].width.bits();
+                let n = self.classes.len();
+                let mut f = Bits::atom(n, at);
+                for c in 0..n {
+                    if self.classes.low(c) >= nw {
+                        f.tables[c] = vec![0];
+                    }
+                }
+                Form::Bits(f)
+            }
+            MOp::Sext | MOp::Trunc | MOp::Const(_) => {
                 let at = self.verbatim_atom(i, tally)?;
                 Form::Bits(Bits::atom(self.classes.len(), at))
             }
@@ -1099,8 +1149,155 @@ fn class_constants(p: &MbaExpr, live: &[bool], cst: &[Option<BitVec>], w: Width)
                 }
             }
         }
+        // A zero extension is zero from its operand's width on: a class boundary, so the
+        // atom it is can be zero in the classes above (see `Pass::visit`).
+        if live[i] && n.width == w && cst[i].is_none() && n.op == MOp::Zext {
+            let nw = p.nodes()[n.args[0] as usize].width;
+            consts.push(crate::facts::known::low_mask(w, u32::from(nw.bits())));
+        }
     }
     consts
+}
+
+/// A degree-≤1 form that is a sign extension: `g[lo] − g[s]` for a bitwise function `g` of
+/// the atoms and a single-position class `{s}` (the classes below `s` lying below it, nothing
+/// above), which is `sext(trunc<s+1>(g))` extended to the width. `decast` writes `sext(a)` of
+/// a narrow variable as `(Z ^ 2^s) − 2^s`, whose form this is; so are the forms of bitwise
+/// operations over such forms ([`sext_of`]). The position `s` and `g`.
+fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
+    use crate::facts::known::{bv_and, bv_not, low_mask};
+    let w = p.width();
+    let n = classes.len();
+    if n < 2 || p.degree() > 1 {
+        return None;
+    }
+    let q = p.expand_full(classes);
+    let mut sign: Option<usize> = None;
+    for m in q.terms().keys() {
+        match m.as_slice() {
+            [] => {}
+            [(sym, 1)] if sym.class != FULL => {
+                let c = usize::from(sym.class);
+                if classes.single(c).is_some() {
+                    match sign {
+                        Some(x) if x != c => return None,
+                        _ => sign = Some(c),
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let s = sign?;
+    let pos = classes.single(s)?;
+    if u32::from(pos) + 1 >= u32::from(w.bits()) {
+        return None;
+    }
+    let below = low_mask(w, u32::from(pos));
+    if (0..n).any(|c| classes.low(c) < pos && !bv_and(classes.mask(c), &bv_not(&below)).is_zero()) {
+        return None;
+    }
+    // The constant is `g`'s value at zero, `k`, times `M_lo − M_s = −1`.
+    let konst = q.konst();
+    let k = if konst.is_zero() {
+        false
+    } else if konst.is_ones() {
+        true
+    } else {
+        return None;
+    };
+    // `g` from the sign class's terms, negated; the rest of `q` must be its expansion below.
+    let mut g = Poly::zero(w);
+    let mut expect = Poly::zero(w);
+    for (m, c) in q.terms() {
+        let [(sym, 1)] = m.as_slice() else {
+            continue;
+        };
+        if usize::from(sym.class) != s {
+            continue;
+        }
+        let neg = BitVec::un_unchecked(crate::ops::UnOp::Neg, c);
+        g.add_term(
+            vec![(
+                Sym {
+                    set: sym.set,
+                    class: FULL,
+                },
+                1,
+            )],
+            &neg,
+        );
+        expect.add_term(m.clone(), c);
+        for c2 in 0..n {
+            if classes.low(c2) < pos {
+                expect.add_term(
+                    vec![(
+                        Sym {
+                            set: sym.set,
+                            class: c2 as u16,
+                        },
+                        1,
+                    )],
+                    &neg,
+                );
+            }
+        }
+    }
+    let mut body = q.clone();
+    body.add_term(
+        Vec::new(),
+        &BitVec::un_unchecked(crate::ops::UnOp::Neg, &konst),
+    );
+    if body != expect {
+        return None;
+    }
+    if k {
+        g.add_term(Vec::new(), &BitVec::ones(w));
+    }
+    let f = Bits::from_linear(&g.expand_full(classes), classes)?;
+    f.uniform().then_some((pos, f))
+}
+
+/// `g[lo] − g[s]`: the sign extension of `g` truncated to `s + 1` bits, as a polynomial over
+/// masked conjunctions (the inverse of [`sign_view`]).
+fn sext_of(g: &Bits, pos: u16, classes: &Classes) -> Poly {
+    let w = classes.width();
+    let sl = g.support.len();
+    let mut out = Poly::zero(w);
+    for (c, t) in g.tables.iter().enumerate() {
+        let low = classes.low(c);
+        if low > pos {
+            continue;
+        }
+        let sign: i128 = if low == pos { -1 } else { 1 };
+        for (q, &k) in bits::mobius(t, sl).iter().enumerate() {
+            if k == 0 {
+                continue;
+            }
+            let kv = BitVec::wrapping_from_i128(w, sign * i128::from(k));
+            if q == 0 {
+                out.add_term(
+                    Vec::new(),
+                    &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &kv, classes.mask(c)),
+                );
+                continue;
+            }
+            let set = (0..sl)
+                .filter(|&j| q >> j & 1 == 1)
+                .fold(0u64, |m, j| m | 1u64 << g.support[j]);
+            out.add_term(
+                vec![(
+                    Sym {
+                        set,
+                        class: c as u16,
+                    },
+                    1,
+                )],
+                &kv,
+            );
+        }
+    }
+    out
 }
 
 /// See [`Pass::key_form`].
@@ -1273,6 +1470,9 @@ struct Normal {
     factors: Vec<Poly>,
     /// Masked conjunctions proved zero (see [`prune_null_conjunctions`]).
     nulls: Vec<poly::Sym>,
+    /// Per atom: its operand's width when it is the zero extension of a variable (zero from
+    /// there on, see [`Pass::visit`]).
+    narrow: Vec<Option<u16>>,
     /// Whether a bitwise operation was read as halves.
     halved: bool,
     input_cost: u32,
@@ -1281,9 +1481,19 @@ struct Normal {
     max_terms: u32,
 }
 
+/// The bit from which every conjunction of the atoms in `set` is zero, if one of them is a
+/// zero extension (`narrow`: per atom, its operand's width when it is one).
+fn zero_from(set: u64, narrow: &[Option<u16>]) -> Option<u16> {
+    (0..64u32)
+        .filter(|&a| set >> a & 1 == 1)
+        .filter_map(|a| narrow.get(a as usize).copied().flatten())
+        .min()
+}
+
 /// A normal form as rendered: unmasked symbols wherever the classes allow (the same function;
-/// `nulls` are masked conjunctions known to be zero), then the one-position rule.
-fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym]) -> Poly {
+/// `nulls` are masked conjunctions known to be zero, and so is any conjunction with a zero
+/// extension in a class from its operand's width on), then the one-position rule.
+fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym], narrow: &[Option<u16>]) -> Poly {
     // With one class an unmasked symbol is that class's (substitution writes unmasked atoms):
     // one symbol either way.
     let mut f = if classes.len() <= 1 {
@@ -1292,7 +1502,11 @@ fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym]) -> Poly {
         f.clone()
     };
     f.reduce_core(classes);
-    let mut f = f.declass(classes, DECLASS_LIMIT, nulls);
+    let null = |s: &poly::Sym| {
+        nulls.contains(s)
+            || zero_from(s.set, narrow).is_some_and(|z| z <= classes.low(usize::from(s.class)))
+    };
+    let mut f = f.declass(classes, DECLASS_LIMIT, &null);
     f.single_positions(classes);
     f.reduce_core(classes);
     f
@@ -1395,7 +1609,19 @@ fn normalize(
     } else {
         tally.linear += 1;
     }
-    let finish = |f: &Poly| finished(f, &pass.classes, &[]);
+    let narrow: Vec<Option<u16>> = pass
+        .atoms
+        .iter()
+        .map(|d| match *d {
+            Def::Verbatim(i) => {
+                let n = nodes[i as usize];
+                let arg = nodes[n.args[0] as usize];
+                (n.op == MOp::Zext && matches!(arg.op, MOp::Var(_))).then(|| arg.width.bits())
+            }
+            _ => None,
+        })
+        .collect();
+    let finish = |f: &Poly| finished(f, &pass.classes, &[], &narrow);
     let mut factors: Vec<Poly> = pass.factors.iter().map(finish).collect();
     let mut work = pass.work;
     // The atoms' renderings, lower atoms first: each once, from its own cheapest form (the
@@ -1510,7 +1736,7 @@ fn normalize(
     // shares with the bitwise uses. Greedy over the atoms, while the finished form does not
     // grow.
     // Known-zero conjunctions are don't-cares when unmasking.
-    let finish = |f: &Poly| finished(f, &pass.classes, &nulls);
+    let finish = |f: &Poly| finished(f, &pass.classes, &nulls, &narrow);
     let mut alt: Option<Poly> = None;
     let mut alt_len: Option<usize> = None;
     let mut reused = false;
@@ -1558,6 +1784,7 @@ fn normalize(
         atom_exprs,
         factors,
         nulls,
+        narrow,
         halved: pass.halved,
         input_cost,
         work,
@@ -1572,7 +1799,7 @@ fn normalize(
 fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
     let w = n.w;
     let nf = &n.nf;
-    let finish = |f: &Poly| finished(f, &n.classes, &n.nulls);
+    let finish = |f: &Poly| finished(f, &n.classes, &n.nulls, &n.narrow);
     let mut alts: Vec<Poly> = n.alts.clone();
     let known = alts.len();
     // Unmasked symbols in finished forms: `FULL`, or the only class.
@@ -2107,6 +2334,16 @@ fn prune_null_conjunctions(
     } else {
         (1u64 << bits) - 1
     };
+    let cand: Vec<(poly::Mono, BitVec)> = nf
+        .terms()
+        .iter()
+        .filter(|(m, _)| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() >= 2))
+        .map(|(m, c)| (m.clone(), *c))
+        .take(NULL_CONJUNCTIONS)
+        .collect();
+    if cand.is_empty() {
+        return Ok(());
+    }
     let points = certify::sample_points(p.vars(), &[p], p.key()[0]);
     let inputs: Vec<Vec<u64>> = (0..p.vars().len())
         .map(|v| {
@@ -2134,16 +2371,6 @@ fn prune_null_conjunctions(
         prog.run(&mut regs, &inputs, points.len());
         Ok(regs.get(prog.root()).map(|r| r[..points.len()].to_vec()))
     };
-    let cand: Vec<(poly::Mono, BitVec)> = nf
-        .terms()
-        .iter()
-        .filter(|(m, _)| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() >= 2))
-        .map(|(m, c)| (m.clone(), *c))
-        .take(NULL_CONJUNCTIONS)
-        .collect();
-    if cand.is_empty() {
-        return Ok(());
-    }
     let mut zero = MbaExpr::new(p.vars().to_vec());
     zero.push(MOp::Const(BitVec::zero(w)), &[])
         .map_err(|_| Decline::Unsupported("internal: zero"))?;

@@ -37,6 +37,23 @@ impl core::hash::Hash for Key {
 /// Results per node and demanded mask, for one simplification (kept by the runner and reused).
 pub(crate) type Memo = IdMap<Key, u32>;
 
+/// The operands a phase run's simplifications found nothing to simplify under a mask, each
+/// with the leaves its walk stopped at (the region boundary a later walk must report the
+/// same, for the commit rule to count what a candidate reuses below it as reused).
+#[derive(Default)]
+pub(crate) struct Same {
+    /// Per (node, mask): the range of its leaves in `leaves`.
+    map: IdMap<Key, (u32, u32)>,
+    leaves: Vec<u32>,
+}
+
+impl Same {
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.leaves.clear();
+    }
+}
+
 struct Demand {
     memo: Memo,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
@@ -51,6 +68,9 @@ struct Demand {
     /// each `a ^ k` built so far, as its operand `a`, `k`, the mask it was built
     /// under and the node (see the `Xor` arm).
     xors: Vec<(u32, BitVec, BitVec, u32)>,
+    /// The identities found (a node unchanged under a mask), each with the range of `stops`
+    /// its walk pushed: kept for the phase run once the step is done (see [`Same`]).
+    identities: Vec<(Key, u32, u32)>,
 }
 
 /// The low prefix covering every bit of `m` (the bits arithmetic depends on).
@@ -125,6 +145,16 @@ fn simplify(
     if let Some(&v) = st.memo.get(&Key(x, *m)) {
         return Ok(v);
     }
+    // Found nothing to simplify under this mask in an earlier step of the phase run: the same
+    // leaves as then.
+    if let Some(&(from, len)) = r.demanded_same.map.get(&Key(x, *m)) {
+        let (from, len) = (from as usize, len as usize);
+        st.stops
+            .extend_from_slice(&r.demanded_same.leaves[from..from + len]);
+        st.memo.insert(Key(x, *m), x);
+        return Ok(x);
+    }
+    let stops0 = st.stops.len() as u32;
     st.visits += 1;
     r.meter.charge(Counter::PassWork, 1)?;
     r.meter.check()?;
@@ -364,6 +394,10 @@ fn simplify(
         _ => stop(cx, st)?,
     };
     st.memo.insert(Key(x, *m), v);
+    if v == x && x < st.before {
+        st.identities
+            .push((Key(x, *m), stops0, st.stops.len() as u32));
+    }
     Ok(v)
 }
 
@@ -492,6 +526,7 @@ pub(super) fn reduced(
         before: cx.len() as u32,
         root: x,
         xors: Vec::new(),
+        identities: Vec::new(),
     };
     simplify(r, cx, &mut st, x, &BitVec::ones(w))
 }
@@ -555,8 +590,26 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         before,
         root: operand,
         xors: Vec::new(),
+        identities: Vec::new(),
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
+    // The operands this step found nothing to simplify under their masks are remembered for
+    // the phase run (every mask over one shared chain re-walked it, once per mask, and asked
+    // the facts again at every node): their values are fixed, so the answer is too. Not when
+    // the cap cut the walk short (an answer of more budget may differ), and not the
+    // simplifications, whose nodes a rejection retires.
+    if st.visits <= st.cap {
+        for &(key, from, to) in &st.identities {
+            if r.demanded_same.map.contains_key(&key) {
+                continue;
+            }
+            let at = r.demanded_same.leaves.len() as u32;
+            r.demanded_same
+                .leaves
+                .extend_from_slice(&st.stops[from as usize..to as usize]);
+            r.demanded_same.map.insert(key, (at, to - from));
+        }
+    }
     st.memo.clear();
     r.demanded = std::mem::take(&mut st.memo);
     if st.visits > st.cap {
