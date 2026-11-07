@@ -1,10 +1,12 @@
-name: Book
+name: Pages
 
-# Publishes the book (`book/`) to GitHub Pages: https://valeria-org.github.io/bitwright/
+# Publishes the book (`book/`) and the Workbench (`workbench/`) to GitHub Pages:
+#   https://valeria-org.github.io/bitwright/            the book
+#   https://valeria-org.github.io/bitwright/workbench/  the Workbench, with its WebAssembly module
 on:
   push:
     branches: [main]
-    paths: ["book/**", ".github/workflows/pages.yml"]
+    paths: ["book/**", "workbench/**", "bitwright/**", "bitwright-wasm/**", "Cargo.toml", "Cargo.lock", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -28,11 +30,25 @@ jobs:
           curl -sSfL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo build --release -p bitwright-wasm --target wasm32-unknown-unknown
       - run: mdbook build book
+      # The Workbench loads its module from the repository's layout: `../../bitwright-wasm/js/`
+      # and `../target/wasm32-unknown-unknown/release/` relative to `workbench/js/` and `workbench/`.
+      # The site keeps that layout, with the book at the root.
+      - name: Stage the site
+        run: |
+          mkdir -p _site/bitwright-wasm _site/target/wasm32-unknown-unknown/release
+          cp -r book/book/. _site/
+          cp -r workbench _site/workbench
+          cp -r bitwright-wasm/js _site/bitwright-wasm/js
+          cp target/wasm32-unknown-unknown/release/bitwright_wasm.wasm _site/target/wasm32-unknown-unknown/release/
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: book/book
+          path: _site
 
   deploy:
     needs: build
