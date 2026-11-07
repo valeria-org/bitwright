@@ -2715,3 +2715,430 @@ mod host_rewrites {
         assert!(out.stats.new_nodes <= 10);
     }
 }
+
+// ----- structural events and traces ----------------------------------------------------
+
+mod events {
+    use super::*;
+
+    /// An event, owned: its kind and the nodes and numbers it carries.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Ev {
+        Root(usize, Expr, bool),
+        Stage(Stage, Expr, Expr),
+        Begin(u8, usize, Expr),
+        End(u8, usize, Expr, Budget, Option<Exhausted>),
+        Candidate(String),
+        Applied(String, Expr, Expr),
+        Relied(Reliance),
+        Other,
+    }
+
+    #[derive(Default)]
+    struct Log(Vec<Ev>);
+
+    impl Observer for Log {
+        fn event(&mut self, e: Event<'_>) {
+            let i = |e: Expr| e;
+            self.0.push(match e {
+                Event::Root { index, root, again } => Ev::Root(index, i(root), again),
+                Event::Stage {
+                    stage,
+                    before,
+                    after,
+                } => Ev::Stage(stage, i(before), i(after)),
+                Event::PhaseBegin { round, phase, root } => Ev::Begin(round, phase, i(root)),
+                Event::PhaseEnd {
+                    round,
+                    phase,
+                    root,
+                    spent,
+                    stopped,
+                } => Ev::End(round, phase, i(root), spent, stopped),
+                Event::Candidate { rule, .. } => Ev::Candidate(rule.name.clone()),
+                Event::Applied { by, before, after } => {
+                    let by = match by {
+                        By::Rule(_) => "local".to_string(),
+                        other => other.name().to_string(),
+                    };
+                    Ev::Applied(by, i(before), i(after))
+                }
+                Event::Relied { on } => Ev::Relied(on),
+                _ => Ev::Other,
+            });
+        }
+    }
+
+    fn logged(
+        engine: &Engine,
+        cx: &mut Context,
+        roots: &[Expr],
+        assumptions: Option<&Assumptions>,
+    ) -> (Log, Outcome) {
+        let mut log = Log::default();
+        let mut run = Run::default().with_observer(&mut log);
+        if let Some(a) = assumptions {
+            run = run.with_assumptions(a);
+        }
+        let out = engine.run(cx, roots, run).unwrap();
+        (log, out)
+    }
+
+    /// Checks the structure of a run's events over one root: the root never changes without an
+    /// event saying so (from `Root` through each `Stage` and phase to the result), phases come in
+    /// order between their `PhaseBegin` and `PhaseEnd`, and every rewrite happens inside a phase
+    /// of its own kind. Returns the number of phases run.
+    fn check_structure(engine: &Engine, log: &Log, result: Expr) -> usize {
+        let phases = &engine.strategy().phases;
+        let mut cur: Option<Expr> = None;
+        let mut open: Option<(u8, usize)> = None;
+        let mut last: Option<(u8, usize)> = None;
+        let mut ran = 0;
+        for (k, e) in log.0.iter().enumerate() {
+            match e {
+                Ev::Root(0, root, false) => {
+                    assert_eq!(k, 0, "a root is announced first");
+                    cur = Some(*root);
+                }
+                Ev::Root(..) => panic!("one root, announced once: {e:?}"),
+                Ev::Stage(_, before, after) => {
+                    assert!(open.is_none(), "a stage runs outside the phases");
+                    assert_eq!(Some(*before), cur, "a stage starts from the current root");
+                    assert_ne!(
+                        before, after,
+                        "a stage is reported only when it changes the root"
+                    );
+                    cur = Some(*after);
+                }
+                Ev::Begin(round, phase, root) => {
+                    assert!(open.is_none(), "phases do not nest");
+                    assert_eq!(
+                        Some(*root),
+                        cur,
+                        "phase {phase} starts from the current root"
+                    );
+                    let expected = match last {
+                        None => (0, 0),
+                        Some((r, p)) if p + 1 == phases.len() => (r + 1, 0),
+                        Some((r, p)) => (r, p + 1),
+                    };
+                    assert_eq!((*round, *phase), expected, "phases run in order");
+                    open = Some((*round, *phase));
+                }
+                Ev::End(round, phase, root, _, _) => {
+                    assert_eq!(open, Some((*round, *phase)), "a phase ends where it began");
+                    open = None;
+                    last = Some((*round, *phase));
+                    cur = Some(*root);
+                    ran += 1;
+                }
+                Ev::Applied(by, ..) => {
+                    let (_, phase) = open.expect("a rewrite happens inside a phase");
+                    assert_eq!(by, phases[phase].name(), "a rewrite is made by its phase");
+                }
+                Ev::Candidate(_) => {
+                    let (_, phase) = open.expect("a rule is tried inside a phase");
+                    assert_eq!(phases[phase].name(), "local");
+                }
+                Ev::Relied(_) => assert!(
+                    matches!(log.0.get(k.wrapping_sub(1)), Some(Ev::Applied(..))),
+                    "a reliance follows its rewrite"
+                ),
+                Ev::Other => {}
+            }
+        }
+        assert!(open.is_none(), "every phase ends");
+        assert_eq!(cur, Some(result), "the last root reported is the result");
+        ran
+    }
+
+    fn deobfuscator() -> Engine {
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate())
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "mba")]
+    fn with_noise_forms() -> Engine {
+        let cfg = crate::mba::MbaConfig::default()
+            .with_noise_forms(true)
+            .with_known_atoms(true);
+        Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(cfg))
+            .build()
+            .unwrap()
+    }
+
+    const INPUTS: &[(&str, u16)] = &[
+        (
+            "(((x ^ y) + 2*(x & y)) * 3 + ((x | y) - (x & y))) ^ (~z & z)",
+            32,
+        ),
+        ("((x ^ 0x5a) + 3 - 3) ^ 0x5a", 64),
+        ("trunc<8>(zext<32>(b:8) + 256)", 32),
+        ("umulhi(x, 0xcccccccccccccccd) >>u 3", 64),
+        ("(x <u 10) & (3 <u x)", 32),
+        ("((a - b) >>u 31) ^ (((a ^ b) & (a ^ (a - b))) >>u 31)", 32),
+        (
+            "let m = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f; \
+          (m ^ ((m >>u 32) >>u (m >>u 60))) * 0xd3220fb78e33751f == 0",
+            64,
+        ),
+    ];
+
+    #[test]
+    fn the_root_never_changes_without_an_event() {
+        #[cfg_attr(not(feature = "mba"), allow(unused_mut))]
+        let mut engines = vec![Engine::standard(), deobfuscator()];
+        #[cfg(feature = "mba")]
+        engines.push(with_noise_forms());
+        for engine in &engines {
+            for &(text, w) in INPUTS {
+                let mut cx = Context::new();
+                let e = cx
+                    .parse(text, &ParseOptions::width(Width::new(w).unwrap()))
+                    .unwrap();
+                let (log, out) = logged(engine, &mut cx, &[e], None);
+                let ran = check_structure(engine, &log, out.roots[0].expr);
+                assert_eq!(
+                    ran,
+                    engine.strategy().phases.len() * out.stats.rounds as usize,
+                    "{text}: every phase of every round is reported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_phases_spend_the_run() {
+        // Without the MBA service's stages, all of a run's work is done inside its phases.
+        let engine = Engine::standard();
+        let mut cx = Context::new();
+        let e = big(&mut cx);
+        let (log, out) = logged(&engine, &mut cx, &[e], None);
+        let mut total = Budget::ZERO;
+        for ev in &log.0 {
+            if let Ev::End(.., spent, None) = ev {
+                total = total.saturating_add(spent);
+            }
+        }
+        let s = &out.stats;
+        assert_eq!(total.node_visits, s.node_visits);
+        assert_eq!(total.candidates, s.candidates);
+        assert_eq!(total.match_steps, s.match_steps);
+        assert_eq!(total.rewrites, s.rewrites);
+        assert_eq!(total.new_nodes, s.new_nodes);
+        assert_eq!(total.fact_work, s.fact_work);
+        assert_eq!(total.pass_work, s.pass_work);
+        assert!(s.rewrites > 0);
+    }
+
+    #[test]
+    fn a_budget_stop_ends_the_phase_it_stopped() {
+        let engine = Engine::standard();
+        let mut cx = Context::new();
+        let e = big(&mut cx);
+        let mut log = Log::default();
+        let out = engine
+            .run(
+                &mut cx,
+                &[e],
+                Run::default()
+                    .with_observer(&mut log)
+                    .with_per_call(Budget::default().with_node_visits(40)),
+            )
+            .unwrap();
+        let End::BudgetTerminated(why) = out.roots[0].end else {
+            panic!("the budget stops the run: {:?}", out.roots[0].end);
+        };
+        match log.0.last() {
+            Some(Ev::End(_, _, root, _, stopped)) => {
+                assert_eq!(*stopped, Some(why));
+                assert_eq!(
+                    *root, out.roots[0].expr,
+                    "the stopped phase leaves the result"
+                );
+            }
+            other => panic!("the run ends with the stopped phase: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_distinct_root_is_announced_once() {
+        let engine = Engine::standard();
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W32);
+        let a = cx.parse("(x & y) + (x | y)", &o).unwrap();
+        let b = cx.parse("x ^ x ^ y", &o).unwrap();
+        let (log, _) = logged(&engine, &mut cx, &[a, b, a], None);
+        let roots: Vec<_> = log.0.iter().filter(|e| matches!(e, Ev::Root(..))).collect();
+        assert_eq!(roots, [&Ev::Root(0, a, false), &Ev::Root(1, b, false)]);
+    }
+
+    #[test]
+    fn a_rewrite_under_assumptions_says_what_it_relied_on() {
+        let engine = Engine::standard();
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let mut a = Assumptions::new();
+        for p in ["rsp & 15 == 0", "idx <u n"] {
+            let p = cx.parse(p, &o).unwrap();
+            a.assume_true(&mut cx, p).unwrap();
+        }
+        let e = cx
+            .parse("((rsp + 32) & 15) + zext<64>(idx <=u n)", &o)
+            .unwrap();
+        let (log, out) = logged(&engine, &mut cx, &[e], Some(&a));
+        let mut all = Reliance::NONE;
+        let mut each = 0;
+        for (k, ev) in log.0.iter().enumerate() {
+            if let Ev::Relied(on) = ev {
+                assert!(matches!(log.0[k - 1], Ev::Applied(..)));
+                assert!(!on.is_none());
+                all = all.union(*on);
+                each += 1;
+            }
+        }
+        assert_eq!(each, 2, "both folds rely on a constraint");
+        assert!(!out.roots[0].relies_on.is_none());
+        assert_eq!(all, out.roots[0].relies_on);
+        check_structure(&engine, &log, out.roots[0].expr);
+    }
+
+    #[cfg(feature = "mba")]
+    #[test]
+    fn a_stage_that_rewrites_the_root_is_reported() {
+        let engine = with_noise_forms();
+        let text = "let %0 = trunc<8>(q) == 0; \
+             let %1 = select(%0, 0xe6229ed78bba3a02:64, 0x6917e97be2bd3a02); \
+             let %2 = ~x; let %3 = %2 & 0xfffffffebff828d3; \
+             let %4 = select(%0, 0x8ceeb0943a22e2ff:64, 0xcb740b420ea162ff); \
+             let %5 = ~%3 * %4; let %6 = ~(%2 & 0x14007d72c) * %1; let %7 = %3 * %4; \
+             let %8 = ~(x & 0xfffffffebff828d3) * %4; let %9 = %5 * 0xf03a49e91da5aae9; \
+             ~(x & 0x14007d72c) * %1 * 0xf03a49e91da5aae9 \
+             + select(%0, 0x3196701ba3cc70df:64, 0xb33d0377cd1af0df) \
+             + %9 + %6 * 0xf03a49e91da5aae9 + %9 + %7 * 0xf03a49e91da5aae9 \
+             + %8 * 0xf03a49e91da5aae9";
+        let mut cx = Context::new();
+        let e = cx.parse(text, &ParseOptions::width(Width::W64)).unwrap();
+        let (log, out) = logged(&engine, &mut cx, &[e], None);
+        assert!(
+            matches!(log.0.get(1), Some(Ev::Stage(Stage::Sweep, before, _)) if *before == e),
+            "the sweep rewrites the input before the first phase: {:?}",
+            log.0.get(1)
+        );
+        check_structure(&engine, &log, out.roots[0].expr);
+    }
+
+    /// The numbers after `"key":` on a line.
+    fn numbers(line: &str, key: &str) -> Vec<u64> {
+        let pat = format!("\"{key}\":");
+        let mut out = Vec::new();
+        let mut rest = line;
+        while let Some(at) = rest.find(&pat) {
+            rest = &rest[at + pat.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse() {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Whether a line is one JSON object whose brackets balance outside strings.
+    fn balanced(line: &str) -> bool {
+        let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+        for c in line.chars() {
+            if in_str {
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, '\\') => esc = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                return false;
+            }
+        }
+        depth == 0 && !in_str && line.starts_with('{') && line.ends_with('}')
+    }
+
+    fn traced(engine: &Engine, text: &str, w: u16) -> (String, Outcome) {
+        let mut cx = Context::new();
+        let e = cx
+            .parse(text, &ParseOptions::width(Width::new(w).unwrap()))
+            .unwrap();
+        let mut trace = Trace::new(engine);
+        let out = engine
+            .run(&mut cx, &[e], Run::default().with_observer(&mut trace))
+            .unwrap();
+        let text = trace.to_jsonl(&cx, &[e], &out).unwrap();
+        (text, out)
+    }
+
+    #[test]
+    fn a_trace_names_every_node_before_it_is_used() {
+        for engine in [Engine::standard(), deobfuscator()] {
+            for &(input, w) in INPUTS {
+                let (text, out) = traced(&engine, input, w);
+                let lines: Vec<&str> = text.lines().collect();
+                assert!(lines[0].starts_with("{\"trace\":\"bitwright\",\"format\":1,"));
+                let mut nodes: IdMap<u32, ()> = IdMap::default();
+                let (mut candidates, mut applied, mut results) = (0, 0, 0);
+                for l in &lines {
+                    assert!(balanced(l), "{l}");
+                    if let Some(n) = numbers(l, "node")
+                        .first()
+                        .filter(|_| l.starts_with("{\"node\":"))
+                    {
+                        let args = l
+                            .split("\"args\":[")
+                            .nth(1)
+                            .map_or("", |a| a.split(']').next().unwrap_or(""));
+                        for a in args.split(',').filter(|a| !a.is_empty()) {
+                            let a: u32 = a.parse().unwrap();
+                            assert!(nodes.contains_key(&a), "operand {a} before node {n}");
+                        }
+                        nodes.insert(*n as u32, ());
+                        continue;
+                    }
+                    for key in ["node", "before", "after", "root", "input", "expr"] {
+                        for n in numbers(l, key) {
+                            assert!(nodes.contains_key(&(n as u32)), "{key} {n} named in {l}");
+                        }
+                    }
+                    candidates += usize::from(l.starts_with("{\"ev\":\"candidate\""));
+                    applied += usize::from(l.starts_with("{\"ev\":\"applied\""));
+                    results += usize::from(l.starts_with("{\"result\":"));
+                }
+                assert_eq!(candidates as u64, out.stats.candidates, "{input}");
+                assert_eq!(applied as u64, out.stats.rewrites, "{input}");
+                assert_eq!(results, 1);
+                assert!(lines.last().unwrap().starts_with("{\"stats\":"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_trace_is_the_same_on_every_run() {
+        let engine = deobfuscator();
+        for &(input, w) in INPUTS {
+            assert_eq!(
+                traced(&engine, input, w).0,
+                traced(&engine, input, w).0,
+                "{input}"
+            );
+        }
+    }
+}

@@ -309,6 +309,52 @@ assert_eq!(census.rules["core.arith::mul_pow2"].applied, 1);
 # Ok::<(), bitwright::Error>(())
 ```
 
+### Tracing a run
+
+Events also say where in the run they happen. Each distinct root's work begins with
+`Event::Root`. Each phase of each round sits between `Event::PhaseBegin` and
+`Event::PhaseEnd`, and the end carries the root the phase left, the work it spent (in the units
+of `Budget`) and the limit that stopped it, if one did. `Event::Stage` reports a rewrite of the
+whole root made outside the phases: the MBA service's context push, case tables and
+opaque-constant sweep. `Event::Relied` follows a rewrite that holds only under some of the run's
+assumptions. Between them, the root never changes without an event saying so: from `Root`
+through each `Stage` and phase, the last root reported is the result.
+
+`Trace` is an observer that records all of it and writes the run as JSON Lines: a header with the
+strategy's phases, the rules and nodes the events name (operands first, numbered as in the
+context, so equal numbers are equal expressions), the events in order, each root's result and
+the run's counters. The same run writes the same trace, so two traces diff cleanly: across
+engine versions, strategies or budgets. `bitwright simplify --trace` writes one from the command
+line.
+
+```rust
+use bitwright::engine::{Engine, Run, Trace};
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::standard();
+let mut cx = Context::new();
+let e = cx.parse("((x ^ 0x5a) + 3 - 3) ^ 0x5a", &ParseOptions::width(Width::W32))?;
+let mut trace = Trace::new(&engine);
+let out = engine.run(&mut cx, &[e], Run::default().with_observer(&mut trace))?;
+let text = trace.to_jsonl(&cx, &[e], &out)?;
+
+let first = text.lines().next().unwrap();
+assert!(first.starts_with(r#"{"trace":"bitwright","format":1,"#));
+// The linear pass cancels `+ 3 - 3` in the first round, in phase 2 (`linear`).
+let (mut in_linear, mut seen) = (false, false);
+for line in text.lines() {
+    if line.starts_with(r#"{"ev":"phase_begin""#) {
+        in_linear = line.starts_with(r#"{"ev":"phase_begin","round":0,"phase":2,"#);
+    }
+    if line.starts_with(r#"{"ev":"applied","pass":"linear","#) {
+        assert!(in_linear);
+        seen = true;
+    }
+}
+assert!(seen);
+# Ok::<(), bitwright::Error>(())
+```
+
 ## Verification
 
 Rules linked from a proof ledger are trusted; every application still passes cheap

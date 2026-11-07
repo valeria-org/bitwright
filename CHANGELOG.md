@@ -109,6 +109,23 @@
   from 3,219 to 1,796 nodes (the same MBAs at one width: 1,223), in 4 M solver steps instead of
   30 M; over `zext<64>`ed variables from 1,822 to 1,805; the other corpora are unchanged.
 
+- **Where events happen.** An `Observer` saw each rule tried and each rewrite, but not which
+  phase or round made it, and some changes of the root it did not see at all. New events say
+  where: `Event::Root` when a distinct root's work begins, `Event::PhaseBegin` and
+  `Event::PhaseEnd` around every phase of every round (the end with the root the phase left,
+  the work it spent as a `Budget`, and the limit that stopped it), `Event::Stage` for the MBA
+  service's rewrites of the whole root outside the phases (context push, case tables, the
+  opaque sweep; `Stage::{Context, Cases, Sweep}`), and `Event::Relied` after a rewrite that
+  holds only under some of the run's assumptions. The root no longer changes without an event:
+  from `Root` through each `Stage` and phase, the last root reported is the result.
+  `Phase::name` gives each phase's short name (`local`, or the pass's name as `By::Pass` and
+  `Stats::passes` give it). With no observer nothing is built.
+- **Traces.** `engine::Trace` records every event of a run and writes it out as JSON Lines
+  (`Trace::to_jsonl`): a header with the strategy's phases, the rules and nodes the events name
+  (operands first, numbered as in the context), the events in order, each root's result and
+  the run's counters. The same run writes the same trace, so traces diff across engine
+  versions, strategies and budgets. `bitwright simplify --trace <out>` writes one for an
+  expression.
 - **Opt-in opaque and conditional MBA recovery.** `MbaConfig::with_opaque_sweep`,
   `with_noise_forms` and `with_known_atoms` enable exact rewrites for constants hidden through
   demanded bits, casts, rotations, condition-dependent pieces and complementary shared products.

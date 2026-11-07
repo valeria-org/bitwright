@@ -198,6 +198,54 @@ fn simplify_runs_the_engine() {
 }
 
 #[test]
+fn simplify_writes_a_trace() {
+    let path = file("trace.bwt", "");
+    let (code, out, _) = run(&[
+        "simplify",
+        "((x ^ 0x5a) + 3 - 3) ^ 0x5a",
+        "--width",
+        "32",
+        "--assume",
+        "x <u 1000",
+        "--trace",
+        &path,
+    ]);
+    assert_eq!((code, out.trim()), (0, "x"));
+    let trace = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = trace.lines().collect();
+    assert!(lines[0].starts_with(r#"{"trace":"bitwright","format":1,"#));
+    assert!(lines[0].contains(r#""strategy":"deobfuscate""#));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(r#"{"ev":"root","index":0,"#))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(r#"{"ev":"applied","pass":"linear","#))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(r#"{"ev":"phase_end","round":0,"phase":0,"#))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(r#"{"result":0,"#) && l.contains(r#""end":"completed""#))
+    );
+    assert!(lines.last().unwrap().starts_with(r#"{"stats":"#));
+    // One expression only, and somewhere it can be written.
+    let exprs = file("trace-lines.txt", "x + 0\n");
+    assert_eq!(run(&["simplify", "--file", &exprs, "--trace", &path]).0, 2);
+    assert_eq!(
+        run(&["simplify", "x", "--trace", "/nonexistent/dir/t.bwt"]).0,
+        2
+    );
+}
+
+#[test]
 fn simplify_recovers_divisions_by_constants() {
     for (src, want) in [
         ("umulhi(x, 0xaaaaaaab) >>u 1", "udiv(x, 3)"),

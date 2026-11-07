@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use bitwright::check::{CheckConfig, PreemptionKind, Verdict, check_program, preempted};
 use std::sync::Arc;
 
-use bitwright::engine::{Each, Engine, Run, Strategy};
+use bitwright::engine::{Each, Engine, Run, Strategy, Trace};
 use bitwright::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bitwright::prove::Unknown;
 use bitwright::rules::{Ledger, Level, Rule, RuleKind, RuleProgram, builtin_sources, explain};
@@ -76,7 +76,8 @@ commands:
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
            [--float-values] [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
-  simplify --file <path> [--jobs <n>] [options as above]
+           [--trace <out>]
+  simplify --file <path> [--jobs <n>] [options as above, but --trace]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
         `--file` simplifies each line of a file (`-`: standard input) on its own, on up to
@@ -95,7 +96,10 @@ commands:
         conflicts (200000 by default) and `--synth-propagations` propagations (no limit by
         default; it bounds the time more closely). When nothing is found and a candidate
         equal at every sample was left unproved (by that budget, say), a note on stderr
-        names it.
+        names it. `--trace` writes the engine's run as a trace to <out>: JSON Lines with the
+        strategy's phases, the rules and nodes the run names, every event in order (each phase's
+        begin and end with the work it spent, each rule tried and how it ended, each rewrite and
+        the assumptions it relies on) and the result; `--synth` runs after it, outside it.
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -975,6 +979,7 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "synth-propagations",
             "file",
             "jobs",
+            "trace",
         ],
         &["deobfuscate", "standard", "float-values", "synth"],
     )?;
@@ -984,10 +989,14 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
     }
     // One expression, or a file of them (one per line; blank lines and `#` comments kept).
     let file = a.value("file");
+    let trace = a.value("trace");
     let lines: Vec<String> = match file {
         Some(path) => {
             if !a.pos.is_empty() {
                 return Err(usage("--file replaces the expression"));
+            }
+            if trace.is_some() {
+                return Err(usage("--trace takes one expression, not --file"));
             }
             let text = if path == "-" {
                 std::io::read_to_string(std::io::stdin())
@@ -1069,8 +1078,14 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         .strategy(strategy)
         .build()
         .map_err(|e| Fail::Err(2, format!("{e}")))?;
-    // A file's expressions each on its own, on threads; one expression as before.
-    let outs = match file {
+    // A file's expressions each on its own, on threads; one expression as before, recorded
+    // with `--trace`.
+    let mut recorder = trace.map(|_| Trace::new(&engine));
+    let mut run = Run::default().with_assumptions(&assumptions);
+    if let Some(t) = recorder.as_mut() {
+        run = run.with_observer(t);
+    }
+    let outcome = match file {
         Some(_) => engine.run_each(
             &mut cx,
             &exprs,
@@ -1078,14 +1093,16 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
                 .with_threads(jobs)
                 .with_assumptions(&assumptions),
         ),
-        None => engine.run(
-            &mut cx,
-            &exprs,
-            Run::default().with_assumptions(&assumptions),
-        ),
+        None => engine.run(&mut cx, &exprs, run),
     }
-    .map_err(|e| Fail::Err(2, format!("{e}")))?
-    .roots;
+    .map_err(|e| Fail::Err(2, format!("{e}")))?;
+    if let (Some(path), Some(t)) = (trace, &recorder) {
+        let text = t
+            .to_jsonl(&cx, &exprs, &outcome)
+            .map_err(|e| Fail::Err(2, format!("{e}")))?;
+        std::fs::write(path, text).map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+    }
+    let outs = outcome.roots;
     let mut outs = outs.into_iter();
     let mut report = String::new();
     for (k, l) in lines.iter().enumerate() {
