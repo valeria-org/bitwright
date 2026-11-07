@@ -167,6 +167,22 @@ pub struct MbaStats {
     pub too_small: u64,
     /// bitwright's own certificates, run on every answer (see [`CertStats`]).
     pub certificates: CertStats,
+    /// fragments one value at every verification point, asked as that constant.
+    pub opaque_asked: u64,
+    /// those a certificate proved constant.
+    pub opaque_proved: u64,
+    /// those whose known bits are all known (no certificate needed).
+    pub opaque_known: u64,
+    /// those evaluated at every value of the few bits they read.
+    pub opaque_exhausted: u64,
+    /// those proved one case of a condition at a time (`known_atoms`).
+    pub opaque_cases: u64,
+    /// varying blocks proved constant on each side of one condition.
+    pub piecewise_blocks: u64,
+    /// varying sums over noise the sweep simplified with a subterm cut off.
+    pub noise_blocks: u64,
+    /// such sums whose noise atoms the sweep proved irrelevant and wrote as zero.
+    pub noise_atoms: u64,
 }
 
 impl MbaStats {
@@ -188,7 +204,23 @@ impl MbaStats {
             too_wide,
             too_small,
             certificates,
+            opaque_asked,
+            opaque_proved,
+            opaque_known,
+            opaque_exhausted,
+            opaque_cases,
+            piecewise_blocks,
+            noise_blocks,
+            noise_atoms,
         } = o;
+        self.opaque_asked += opaque_asked;
+        self.opaque_proved += opaque_proved;
+        self.opaque_known += opaque_known;
+        self.opaque_exhausted += opaque_exhausted;
+        self.opaque_cases += opaque_cases;
+        self.piecewise_blocks += piecewise_blocks;
+        self.noise_blocks += noise_blocks;
+        self.noise_atoms += noise_atoms;
         self.calls += calls;
         self.steps += steps;
         self.cache_hits += cache_hits;

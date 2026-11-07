@@ -12,10 +12,10 @@ use crate::engine::budget::Counter;
 use crate::hash::IdMap;
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish, known, known_words};
-use crate::BitVec;
 use crate::expr::{Context, OpCode};
 use crate::facts::known::{bv_and, bv_not, bv_or, low_mask};
 use crate::ops::{BinOp, UnOp};
+use crate::{BitVec, Width};
 
 /// The most nodes one simplification visits.
 const MAX_VISITS: u32 = 256;
@@ -48,6 +48,9 @@ struct Demand {
     before: u32,
     /// The operand the simplification began at.
     root: u32,
+    /// each `a ^ k` built so far, as its operand `a`, `k`, the mask it was built
+    /// under and the node (see the `Xor` arm).
+    xors: Vec<(u32, BitVec, BitVec, u32)>,
 }
 
 /// The low prefix covering every bit of `m` (the bits arithmetic depends on).
@@ -227,11 +230,55 @@ fn simplify(
                 bin(r, cx, BinOp::Or, a, b)?
             }
         },
-        OpCode::Xor => {
-            let a = simplify(r, cx, st, node.a, m)?;
-            let b = simplify(r, cx, st, node.b, m)?;
-            bin(r, cx, BinOp::Xor, a, b)?
-        }
+        // under the mask, `a ^ k` is `a` where `k` has none of its bits and `~a`
+        // where `k` has all of them (`(y ^ 63)` read by `& 63`).
+        OpCode::Xor => match (konst(cx, node.a), konst(cx, node.b)) {
+            (Some(k), _) | (_, Some(k)) if bv_and(m, &k).is_zero() || subset(m, &k) => {
+                let a = if konst(cx, node.a).is_some() {
+                    node.b
+                } else {
+                    node.a
+                };
+                let a2 = simplify(r, cx, st, a, m)?;
+                if bv_and(m, &k).is_zero() {
+                    a2
+                } else {
+                    r.build(cx, |cx| cx.c_un(UnOp::Not, a2))?
+                }
+            }
+            // `a ^ k2` is `~(a ^ k1)` where `k1 ^ k2` has every bit of the mask: one
+            // `a ^ k1` built under a mask that has this one's bits is shared, and a sum that
+            // reads both sees `y` and `~y`: `(t ^ c) + (t ^ c) + x - ~(t ^ c') -
+            // (x & (t ^ c)) - (x & (t ^ c'))`, with `c' = ~c` on the low 40 bits,
+            // read by bit 18.
+            (Some(k), _) | (_, Some(k)) => {
+                let a = if konst(cx, node.a).is_some() {
+                    node.b
+                } else {
+                    node.a
+                };
+                let twin = st.xors.iter().find(|(a1, k1, m1, _)| {
+                    *a1 == a && subset(m, m1) && subset(m, &bv_or(k1, &k)) && {
+                        let both = bv_and(k1, &k);
+                        bv_and(&both, m).is_zero()
+                    }
+                });
+                if let Some(&(_, _, _, y)) = twin {
+                    r.build(cx, |cx| cx.c_un(UnOp::Not, y))?
+                } else {
+                    let a2 = simplify(r, cx, st, a, m)?;
+                    let kc = r.build(cx, |cx| cx.mk_const(&k))?;
+                    let y = bin(r, cx, BinOp::Xor, a2, kc)?;
+                    st.xors.push((a, k, *m, y));
+                    y
+                }
+            }
+            _ => {
+                let a = simplify(r, cx, st, node.a, m)?;
+                let b = simplify(r, cx, st, node.b, m)?;
+                bin(r, cx, BinOp::Xor, a, b)?
+            }
+        },
         OpCode::Not => {
             let a = simplify(r, cx, st, node.a, m)?;
             r.build(cx, |cx| cx.c_un(UnOp::Not, a))?
@@ -241,7 +288,12 @@ fn simplify(
             let a = simplify(r, cx, st, node.a, &p)?;
             let b = simplify(r, cx, st, node.b, &p)?;
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
-            bin(r, cx, op, a, b)?
+            // a constant addend with none of the demanded bits goes (`63 - ~y`
+            // is `y + 64`, which is `y` on the low six bits).
+            match dropped_constant(cx, node.op, a, b, &p) {
+                Some(t) => t,
+                None => bin(r, cx, op, a, b)?,
+            }
         }
         OpCode::Neg => {
             let a = simplify(r, cx, st, node.a, &low_prefix(m))?;
@@ -265,6 +317,39 @@ fn simplify(
             let ml = m.trunc(wa).map_err(|e| Stop::Error(e.into()))?;
             let a = simplify(r, cx, st, node.a, &ml)?;
             r.build(cx, |cx| cx.c_zext(a, w.bits()))?
+        }
+        // an extraction reads the operand's bits it takes; a sign extension the
+        // operand's own bits, and its sign bit for any demanded bit above them.
+        OpCode::Extract => {
+            let wa = cx.width_of(node.a);
+            let lo = BitVec::wrapping_from_u64(wa, u64::from(node.b));
+            let ma = m.zext(wa).map_err(|e| Stop::Error(e.into()))?;
+            let ma = BitVec::bin_unchecked(BinOp::Shl, &ma, &lo);
+            let a = simplify(r, cx, st, node.a, &ma)?;
+            let (b, c) = (node.b, node.c);
+            r.build(cx, |cx| cx.rebuild(x, [a, b, c]))?
+        }
+        OpCode::Sext => {
+            let wa = cx.width_of(node.a);
+            let ml = m.trunc(wa).map_err(|e| Stop::Error(e.into()))?;
+            let above = m
+                .extract(
+                    wa.bits(),
+                    Width::new(w.bits() - wa.bits()).map_err(|e| Stop::Error(e.into()))?,
+                )
+                .map_err(|e| Stop::Error(e.into()))?;
+            let ml = if above.is_zero() {
+                ml
+            } else {
+                let sign = BitVec::bin_unchecked(
+                    BinOp::Shl,
+                    &BitVec::wrapping_from_u64(wa, 1),
+                    &BitVec::wrapping_from_u64(wa, u64::from(wa.bits() - 1)),
+                );
+                bv_or(&ml, &sign)
+            };
+            let a = simplify(r, cx, st, node.a, &ml)?;
+            r.build(cx, |cx| cx.c_sext(a, w.bits()))?
         }
         OpCode::Concat => {
             let (wh, wl) = (cx.width_of(node.a), cx.width_of(node.b));
@@ -333,6 +418,84 @@ fn merged(
     Ok(Some(super::linear::emit(r, cx, &f)?))
 }
 
+/// `x & k` is `x` when the bits `k` clears are among the lowest
+/// [`RESIDUE_BITS`] and `x`'s residues show them zero for every input: `(z·z + z) & ~1`, the
+/// product of two consecutive numbers being even (the known bits of a sum cannot see that its
+/// two low bits are always equal).
+fn clears_known_zeros(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> Result<Option<u32>, Stop> {
+    let node = cx.node(n);
+    if node.op != OpCode::And || cx.wid(n) > 64 {
+        return Ok(None);
+    }
+    let (x, k) = match (cx.const_val(node.a), cx.const_val(node.b)) {
+        (None, Some(k)) => (node.a, k),
+        (Some(k), None) => (node.b, k),
+        _ => return Ok(None),
+    };
+    let Some(kv) = k.to_u64() else {
+        return Ok(None);
+    };
+    let wbits = u32::from(cx.wid(n));
+    let all = if wbits >= 64 {
+        u64::MAX
+    } else {
+        (1 << wbits) - 1
+    };
+    let cleared = !kv & all;
+    let bits = 64 - cleared.leading_zeros();
+    if cleared == 0
+        || bits > RESIDUE_BITS
+        || !matches!(cx.node(x).op, OpCode::Mul | OpCode::Add | OpCode::Sub)
+    {
+        return Ok(None);
+    }
+    let Some(t) = super::residue::residues(r, cx, x, bits)? else {
+        return Ok(None);
+    };
+    Ok(t.values.iter().all(|&v| v & cleared == 0).then_some(x))
+}
+
+/// `t` when `a op b` (an `add` or `sub`) is `t` plus a constant with none of the
+/// bits of the prefix `p`; `k - ~t` is `t + (k + 1)`.
+fn dropped_constant(cx: &Context, op: OpCode, a: u32, b: u32, p: &BitVec) -> Option<u32> {
+    let (t, k) = match (op, cx.const_val(a), cx.const_val(b)) {
+        (OpCode::Sub, Some(k), None) if cx.node(b).op == OpCode::Not => {
+            let one = BitVec::one(k.width());
+            (cx.node(b).a, BitVec::bin_unchecked(BinOp::Add, &k, &one))
+        }
+        (OpCode::Add | OpCode::Sub, None, Some(k)) => (a, k),
+        (OpCode::Add, Some(k), None) => (b, k),
+        _ => return None,
+    };
+    bv_and(&k, p).is_zero().then_some(t)
+}
+
+/// a node equal to `x` on every bit, each operand taken on the bits its users read
+/// and folded to a constant where those bits are all known, within `cap` visits. The
+/// opaque-constant sweep asks it of a candidate before its readings: under `t << 42` only `t`'s
+/// low 22 bits are read, and a value whose noise reaches only higher bits (the left half of a
+/// rotate) is a constant there.
+#[cfg(feature = "mba")]
+pub(super) fn reduced(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    cap: u32,
+) -> Result<u32, Stop> {
+    let w = cx.width_of(x);
+    let mut st = Demand {
+        memo: Memo::default(),
+        cap,
+        stops: Vec::new(),
+        visits: 0,
+        fin: Fin::FINAL,
+        before: cx.len() as u32,
+        root: x,
+        xors: Vec::new(),
+    };
+    simplify(r, cx, &mut st, x, &BitVec::ones(w))
+}
+
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
     r.stats.passes.entry("demanded").or_default()
 }
@@ -341,6 +504,10 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
     let w = cx.width_of(n);
+    if let Some(x) = clears_known_zeros(r, cx, n)? {
+        let before = cx.len() as u32;
+        return finish(r, cx, PassKind::Demanded, n, x, before, &[x], Fin::FINAL);
+    }
     // The operand observed through a mask, and the mask.
     let (operand, mask): (u32, BitVec) = match node.op {
         OpCode::And | OpCode::Or => match (cx.const_val(node.a), cx.const_val(node.b)) {
@@ -387,6 +554,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         fin: Fin::FINAL,
         before,
         root: operand,
+        xors: Vec::new(),
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
     st.memo.clear();

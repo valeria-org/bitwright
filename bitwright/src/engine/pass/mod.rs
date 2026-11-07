@@ -8,6 +8,8 @@ mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
 mod conditions;
+#[cfg(feature = "mba")]
+mod context;
 pub(super) mod demanded;
 mod division;
 pub(super) mod forms;
@@ -259,6 +261,41 @@ pub(super) fn step(
     }
 }
 
+/// `root` with what its conditions fix put into the operands they guard (see
+/// `context::push`), within `max_new` new nodes.
+#[cfg(feature = "mba")]
+pub(super) fn push_context(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    max_new: u32,
+) -> Result<Option<u32>, Stop> {
+    r.build(cx, |cx| context::push(cx, root, max_new))
+}
+
+/// `root` with its pieces that depend only on a few conditions written as tables
+/// of their values (see `context::cut`), evaluating at most `fuel` nodes.
+#[cfg(feature = "mba")]
+pub(super) fn cut_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    fuel: u64,
+) -> Result<Option<u32>, Stop> {
+    r.build(cx, |cx| context::cut(cx, root, fuel))
+}
+
+/// the opaque-constant sweep before the first phase (see `mba::sweep`).
+#[cfg(feature = "mba")]
+pub(super) fn mba_sweep(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &crate::mba::MbaConfig,
+    root: u32,
+) -> Result<u32, Stop> {
+    mba::sweep(r, cx, cfg, root)
+}
+
 /// The MBA phase at `n` (its configuration comes from the phase).
 #[cfg(feature = "mba")]
 pub(super) fn mba_step(
@@ -291,7 +328,25 @@ pub(super) fn mba_step(
     }
     r.stats.passes.entry("mba").or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
-    mba::step(r, cx, cfg, n)
+    let whole = mba::step(r, cx, cfg, n)?;
+    if matches!(whole, Step::To(..)) {
+        return Ok(whole);
+    }
+    // a sum whose groups of terms share no leaf, each asked alone.
+    let mut part =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
+            Ok(match mba::step(r, cx, cfg, s)? {
+                Step::To(e, _) => Some(e),
+                Step::Normal(_) => None,
+            })
+        };
+    if let Some(step @ Step::To(..)) = linear::by_sums(r, cx, n, &mut part)? {
+        return Ok(step);
+    }
+    Ok(match linear::by_groups(r, cx, n, &mut part)? {
+        Some(step @ Step::To(..)) => step,
+        _ => whole,
+    })
 }
 
 /// The question at the top of a fragment (a node whose user in the walk is not asked, or a
@@ -384,6 +439,9 @@ pub(super) fn disjoint(
         let (kb, fb) = known_words(r, cx, b)?;
         let mask = u64::MAX >> (64 - bits);
         let d = matches!((ka, kb), (Some([za, _]), Some([zb, _])) if !za & !zb & mask == 0);
+        if !d && let Some(by) = disjoint_by_residues(r, cx, a, b)? {
+            return Ok((by, fa, fb));
+        }
         return Ok((d, fa, fb));
     }
     let (ka, fa) = known(r, cx, a)?;
@@ -393,6 +451,37 @@ pub(super) fn disjoint(
         _ => false,
     };
     Ok((d, fa, fb))
+}
+
+/// a constant whose bits are all among the lowest four, and a product or sum whose
+/// residues show those bits zero for every input (`(z·z + z) | 1`, the left operand even), are
+/// disjoint; `None` when the operands are not of that shape.
+fn disjoint_by_residues(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    a: u32,
+    b: u32,
+) -> Result<Option<bool>, Stop> {
+    const LOW_BITS: u32 = 4;
+    let (x, k) = match (cx.const_val(a), cx.const_val(b)) {
+        (None, Some(k)) => (a, k),
+        (Some(k), None) => (b, k),
+        _ => return Ok(None),
+    };
+    let Some(kv) = k.to_u64() else {
+        return Ok(None);
+    };
+    let bits = 64 - kv.leading_zeros();
+    if kv == 0
+        || bits > LOW_BITS
+        || !matches!(cx.node(x).op, OpCode::Mul | OpCode::Add | OpCode::Sub)
+    {
+        return Ok(None);
+    }
+    let Some(t) = residue::residues(r, cx, x, bits)? else {
+        return Ok(None);
+    };
+    Ok(Some(t.values.iter().all(|&v| v & kv == 0)))
 }
 
 /// [`facts`] of a node that is not a constant, read by `of` under assumptions and by `base`

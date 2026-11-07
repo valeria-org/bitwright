@@ -1,6 +1,6 @@
 //! Lowering from the arena into an [`MbaExpr`], and lifting back.
 
-use super::expr::{MOp, MbaExpr};
+use super::expr::{MNode, MOp, MbaExpr};
 use crate::error::Error;
 use crate::expr::{Context, Expr, OpCode};
 use crate::hash::IdMap;
@@ -91,7 +91,9 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
         | OpCode::Zext
         | OpCode::Sext
         | OpCode::Concat => true,
-        OpCode::Extract => n.b == 0,
+        // any slice, as a right shift then a truncation (`extract<8, 8>(x)` is
+        // `trunc<8>(x >> 8)`), so a byte of a value stays related to the value.
+        OpCode::Extract => n.b + u32::from(n.width) <= u32::from(cx.width_of(n.a).bits()),
         OpCode::Shl | OpCode::LShr => cx
             .const_val(n.b)
             .and_then(|k| k.to_u64())
@@ -107,9 +109,55 @@ pub(crate) fn fits(cx: &Context, root: u32, lim: &MbaLimits) -> Result<u32, Refu
     Ok((atoms.len() + order.len()) as u32)
 }
 
+/// the narrower fragments [`lower_id_reading`] lowers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// `+ − neg`, products and left shifts by a constant, and `& | ^ ~` with any constants, at
+    /// one width: a semi-linear MBA.
+    SemiLinear,
+    /// The same, with the operands of `& | ^ ~` bitwise functions of atoms: arithmetic under a
+    /// bitwise operator is an atom, as obfuscators build a semi-linear MBA (`Σ cᵢ·fᵢ(x)` over
+    /// whatever values they take for `x`).
+    Shallow,
+    /// The same with `& | ^ ~` only over 0 and all-ones: a linear MBA, decided at the corners.
+    Linear,
+    /// Semi-linear, with this node (shared by several terms) an atom: `Σ cᵢ·fᵢ(a)` over a
+    /// value every term reads.
+    Cut(u32),
+    /// The whole fragment, casts included, with this node an atom: a block over a rotated value
+    /// and over bytes and halves of it (`trunc<32>(t)`, `zext<64>(trunc<8>(n))`), which stay
+    /// related to `t` and `n`.
+    CutWhole(u32),
+}
+
+/// whether node `i` is interior to `reading`'s fragment.
+fn in_reading(cx: &Context, i: u32, reading: Reading) -> bool {
+    let n = cx.node(i);
+    let uniform = |k: u32| cx.const_val(k).is_none_or(|v| v.is_zero() || v.is_ones());
+    match n.op {
+        OpCode::Const | OpCode::Add | OpCode::Sub | OpCode::Neg => true,
+        OpCode::Mul => cx.const_val(n.a).is_some() || cx.const_val(n.b).is_some(),
+        OpCode::Shl => reading == Reading::SemiLinear && in_fragment(cx, i),
+        OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not => {
+            reading == Reading::SemiLinear || n.children().all(uniform)
+        }
+        _ => false,
+    }
+}
+
 /// The fragment rooted at `root`: its atoms (in order of discovery) and its other nodes,
 /// operands first.
 fn scan(cx: &Context, root: u32, lim: &MbaLimits) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
+    scan_in(cx, root, lim, &in_fragment)
+}
+
+/// [`scan`] over the fragment `in_fragment` defines.
+fn scan_in(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    in_fragment: &dyn Fn(&Context, u32) -> bool,
+) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
     let mut atoms: Vec<u32> = Vec::new();
     let mut order: Vec<u32> = Vec::new();
     let mut seen: IdMap<u32, ()> = IdMap::default();
@@ -153,6 +201,105 @@ pub(crate) fn lower_id(
     lim: &MbaLimits,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
     let (atoms, order) = scan(cx, root, lim)?;
+    build(cx, atoms, order)
+}
+
+/// [`lower_id`] over `reading`'s narrower fragment: every other subterm (a cast,
+/// a right shift, a product of two non-constants, for [`Reading::Linear`] a bitwise operation
+/// with another constant) is a variable. An identity of the result holds for independent
+/// values of those, so for theirs.
+pub(crate) fn lower_id_reading(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    reading: Reading,
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    let (atoms, order) = match reading {
+        Reading::Shallow => {
+            let under = under_bitwise(cx, root, lim)?;
+            scan_in(cx, root, lim, &|cx, i| {
+                in_reading(cx, i, Reading::SemiLinear)
+                    && (bitwise_or_const(cx, i) || !under.contains_key(&i))
+            })?
+        }
+        Reading::Cut(cut) => scan_in(cx, root, lim, &|cx, i| {
+            i != cut && in_reading(cx, i, Reading::SemiLinear)
+        })?,
+        Reading::CutWhole(cut) => scan_in(cx, root, lim, &|cx, i| i != cut && in_fragment(cx, i))?,
+        _ => scan_in(cx, root, lim, &|cx, i| in_reading(cx, i, reading))?,
+    };
+    build(cx, atoms, order)
+}
+
+/// the non-constant interior nodes of the semi-linear fragment below `root` that
+/// two or more of its nodes read, most read first (at most `n`): where a [`Reading::Cut`] may
+/// cut.
+pub(crate) fn shared_nodes(cx: &Context, root: u32, lim: &MbaLimits, n: usize) -> Vec<u32> {
+    let mut users: IdMap<u32, u32> = IdMap::default();
+    let mut seen: IdMap<u32, ()> = IdMap::default();
+    let mut stack = vec![root];
+    while let Some(i) = stack.pop() {
+        if seen.insert(i, ()).is_some() || seen.len() as u32 > lim.max_nodes {
+            continue;
+        }
+        if !in_reading(cx, i, Reading::SemiLinear) {
+            continue;
+        }
+        for c in cx.node(i).children() {
+            *users.entry(c).or_default() += 1;
+            stack.push(c);
+        }
+    }
+    let mut v: Vec<(u32, u32)> = users
+        .into_iter()
+        .filter(|&(i, k)| {
+            k >= 2 && cx.const_val(i).is_none() && in_reading(cx, i, Reading::SemiLinear)
+        })
+        .filter(|&(i, _)| cx.node(i).op != OpCode::Not)
+        .map(|(i, k)| (k, i))
+        .collect();
+    v.sort_by(|a, b| b.cmp(a));
+    v.into_iter().take(n).map(|(_, i)| i).collect()
+}
+
+/// Whether node `i` is a constant or `& | ^ ~`.
+fn bitwise_or_const(cx: &Context, i: u32) -> bool {
+    matches!(
+        cx.node(i).op,
+        OpCode::Const | OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not
+    )
+}
+
+/// The nodes of the semi-linear fragment below `root` that a bitwise operator of it reads
+/// (directly, or through other bitwise operators).
+fn under_bitwise(cx: &Context, root: u32, lim: &MbaLimits) -> Result<IdMap<u32, ()>, Refusal> {
+    let mut under: IdMap<u32, ()> = IdMap::default();
+    let mut seen: IdMap<(u32, bool), ()> = IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+    while let Some((i, bw)) = stack.pop() {
+        if seen.insert((i, bw), ()).is_some() {
+            continue;
+        }
+        if seen.len() as u32 > lim.max_nodes.saturating_mul(2) {
+            return Err(Refusal::TooLarge);
+        }
+        if bw {
+            under.insert(i, ());
+        }
+        let bitwise = bitwise_or_const(cx, i);
+        // Arithmetic read by a bitwise operator is an atom: nothing below it is read here.
+        if (bw && !bitwise) || !in_reading(cx, i, Reading::SemiLinear) {
+            continue;
+        }
+        for c in cx.node(i).children() {
+            stack.push((c, bitwise));
+        }
+    }
+    Ok(under)
+}
+
+/// The expression over `atoms` that the fragment's nodes `order` (operands first) compute.
+fn build(cx: &Context, atoms: Vec<u32>, order: Vec<u32>) -> Result<(MbaExpr, Bindings), Refusal> {
     let mut m = MbaExpr::new(atoms.iter().map(|&a| cx.width_of(a)).collect());
     let mut at: IdMap<u32, u32> = IdMap::default();
     for (&a, k) in atoms.iter().zip(0u32..) {
@@ -189,7 +336,14 @@ pub(crate) fn lower_id(
             }
             OpCode::Zext => m.push_cast(MOp::Zext, arg(n.a), cx.width_of(i)),
             OpCode::Sext => m.push_cast(MOp::Sext, arg(n.a), cx.width_of(i)),
-            OpCode::Extract => m.push_cast(MOp::Trunc, arg(n.a), cx.width_of(i)),
+            OpCode::Extract if n.b == 0 => m.push_cast(MOp::Trunc, arg(n.a), cx.width_of(i)),
+            OpCode::Extract => (|| {
+                let s = m.push(MOp::LShr(n.b as u16), &[arg(n.a)])?;
+                if cx.width_of(i) == cx.width_of(n.a) {
+                    return Ok(s);
+                }
+                m.push_cast(MOp::Trunc, s, cx.width_of(i))
+            })(),
             // `concat(hi, lo)` is `(hi << |lo|) + lo`, both extended (their bits are disjoint);
             // a high part that is the low bits of a value of the full width is that value, the
             // rest shifting out (`concat(trunc<62>(y), 3)` is `(y << 2) + 3`).
@@ -257,7 +411,17 @@ pub(crate) fn lift_id(cx: &mut Context, m: &MbaExpr, b: &Bindings) -> Result<u32
             }
             MOp::Zext => cx.c_zext(a(0), n.width.bits())?,
             MOp::Sext => cx.c_sext(a(0), n.width.bits())?,
-            MOp::Trunc => cx.c_extract(a(0), 0, n.width.bits())?,
+            // a truncated right shift is the slice it was lowered from.
+            MOp::Trunc => match m.nodes()[n.args[0] as usize] {
+                MNode {
+                    op: MOp::LShr(k),
+                    width,
+                    args,
+                } if k + n.width.bits() <= width.bits() => {
+                    cx.c_extract(v[args[0] as usize], k, n.width.bits())?
+                }
+                _ => cx.c_extract(a(0), 0, n.width.bits())?,
+            },
         };
         v.push(r);
     }

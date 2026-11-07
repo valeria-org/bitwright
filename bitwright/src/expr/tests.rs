@@ -63,6 +63,24 @@ fn construction_is_sound_against_the_reference() {
 }
 
 #[test]
+fn a_context_fork_accepts_existing_expressions_and_keeps_new_nodes_local() {
+    let mut cx = Context::new();
+    let w = Width::W64;
+    let x = cx.symbol("x", w).unwrap();
+    let one = cx.one(w).unwrap();
+    let sum = cx.add(x, one).unwrap();
+    let env = HashMap::from([(SymbolKey::from("x"), BitVec::wrapping_from_u64(w, 41))]);
+    assert_eq!(cx.eval(&[sum], &env).unwrap()[0].to_u64(), Some(42));
+
+    let original_len = cx.len();
+    let mut fork = cx.fork();
+    assert_eq!(fork.eval(&[sum], &env).unwrap()[0].to_u64(), Some(42));
+    let _ = fork.mul(sum, sum).unwrap();
+    assert_eq!(cx.len(), original_len);
+    assert!(fork.len() > original_len);
+}
+
+#[test]
 fn construction_is_sound_at_wide_widths() {
     for seed in 0..80 {
         let mut cx = Context::new();

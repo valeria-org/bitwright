@@ -2369,8 +2369,16 @@ fn run(
     tally: &mut NfStats,
     used: &Used,
 ) -> Result<MbaAnswer, Decline> {
+    // a question with casts is normalized and certified without them (an equal
+    // question, see `decast`); answers are still measured against the question as asked.
+    let decasted = crate::mba::decast::decast(p);
+    let asked = p;
+    let p = decasted.as_ref().unwrap_or(p);
     let n = normalize(p, opts, budget, tally, used)?;
-    let input_cost = n.input_cost;
+    let input_cost = match decasted {
+        Some(_) => canonical(asked, &live(asked)).1,
+        None => n.input_cost,
+    };
     let mut work = Steps::counted(n.work.left, used);
     // Only renderings smaller than the question can be answers.
     let rendered = best_rendering(p, &n, input_cost, &mut work, tally)?;

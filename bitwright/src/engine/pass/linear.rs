@@ -514,9 +514,270 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
     }
 }
 
+/// multiplicative leaves of one term, bounded so factor search never turns a large
+/// product into pass work proportional to its tree.
+#[derive(Copy, Clone)]
+struct Product {
+    factors: [u32; MAX_PRODUCT_FACTORS],
+    len: usize,
+}
+
+const MAX_PRODUCT_FACTORS: usize = 8;
+
+fn product(cx: &Context, n: u32) -> Option<Product> {
+    fn collect(cx: &Context, n: u32, out: &mut Product) -> Option<()> {
+        let node = cx.node(n);
+        if node.op == OpCode::Mul {
+            collect(cx, node.a, out)?;
+            collect(cx, node.b, out)
+        } else if out.len < out.factors.len() {
+            out.factors[out.len] = n;
+            out.len += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    let mut out = Product {
+        factors: [0; MAX_PRODUCT_FACTORS],
+        len: 0,
+    };
+    collect(cx, n, &mut out)?;
+    Some(out)
+}
+
+/// Additive terms of one sum, bounded for the same reason as [`Product`].
+#[derive(Copy, Clone)]
+struct Sum {
+    terms: [u32; MAX_SUM_TERMS],
+    len: usize,
+}
+
+const MAX_SUM_TERMS: usize = 16;
+
+fn sum(cx: &Context, n: u32) -> Option<Sum> {
+    fn collect(cx: &Context, n: u32, out: &mut Sum) -> Option<()> {
+        let node = cx.node(n);
+        if node.op == OpCode::Add {
+            collect(cx, node.a, out)?;
+            collect(cx, node.b, out)
+        } else if out.len < out.terms.len() {
+            out.terms[out.len] = n;
+            out.len += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    let mut out = Sum {
+        terms: [0; MAX_SUM_TERMS],
+        len: 0,
+    };
+    collect(cx, n, &mut out)?;
+    Some(out)
+}
+
+/// A structurally shared factor and its position in every product, preferring a non-constant.
+fn common_factor(cx: &Context, products: &[Product]) -> Option<(u32, [usize; MAX_SUM_TERMS])> {
+    let first = products.first()?;
+    for constants in [false, true] {
+        for &factor in &first.factors[..first.len] {
+            if cx.is_const(factor) != constants {
+                continue;
+            }
+            let mut positions = [0; MAX_SUM_TERMS];
+            let mut found = true;
+            for (i, p) in products.iter().enumerate() {
+                let Some(j) = p.factors[..p.len].iter().position(|&x| x == factor) else {
+                    found = false;
+                    break;
+                };
+                positions[i] = j;
+            }
+            if found {
+                return Some((factor, positions));
+            }
+        }
+    }
+    None
+}
+
+/// `a·x + a·~x`, including extra factors shared by both products, is `-a`.
+///
+/// Do this directly rather than through [`factor_sum`]'s one-factor-at-a-time rewrite. When
+/// both products are also used elsewhere, the intermediate factored form does not shrink the
+/// live DAG and is correctly rejected before the complementary cofactors meet.
+fn complementary_products(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    products: &[Product],
+) -> Result<Option<Step>, Stop> {
+    let [left, right] = products else {
+        return Ok(None);
+    };
+    let mut used = [false; MAX_PRODUCT_FACTORS];
+    let mut common = [0; MAX_PRODUCT_FACTORS];
+    let mut common_len = 0;
+    let mut left_only = None;
+    for &factor in &left.factors[..left.len] {
+        if let Some(i) = right.factors[..right.len]
+            .iter()
+            .enumerate()
+            .position(|(i, other)| !used[i] && *other == factor)
+        {
+            used[i] = true;
+            common[common_len] = factor;
+            common_len += 1;
+        } else if left_only.replace(factor).is_some() {
+            return Ok(None);
+        }
+    }
+    let mut right_only = None;
+    for (i, &factor) in right.factors[..right.len].iter().enumerate() {
+        if !used[i] && right_only.replace(factor).is_some() {
+            return Ok(None);
+        }
+    }
+    let Some((a, b)) = left_only.zip(right_only) else {
+        return Ok(None);
+    };
+    let complements = (cx.node(a).op == OpCode::Not && cx.node(a).a == b)
+        || (cx.node(b).op == OpCode::Not && cx.node(b).a == a);
+    if !complements {
+        return Ok(None);
+    }
+
+    let before = cx.len() as u32;
+    let mut shared = match common[..common_len].split_first() {
+        Some((&first, rest)) => {
+            let mut out = first;
+            for &factor in rest {
+                out = r.build(cx, |cx| cx.c_bin(BinOp::Mul, out, factor))?;
+            }
+            out
+        }
+        None => {
+            let one = BitVec::one(cx.width_of(n));
+            r.build(cx, |cx| cx.mk_const(&one))?
+        }
+    };
+    shared = r.build(cx, |cx| cx.c_un(UnOp::Neg, shared))?;
+    let mut atoms = [0; MAX_PRODUCT_FACTORS * 2];
+    let mut count = 0;
+    for product in products {
+        for &factor in &product.factors[..product.len] {
+            if !atoms[..count].contains(&factor) {
+                atoms[count] = factor;
+                count += 1;
+            }
+        }
+    }
+    Ok(Some(finish(
+        r,
+        cx,
+        PassKind::Linear,
+        n,
+        shared,
+        before,
+        &atoms[..count],
+        Fin::FINAL,
+    )?))
+}
+
+/// A product rebuilt without one of its factors. A caller supplies a product of at least two
+/// leaves, so one always remains.
+fn without_factor(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    p: &Product,
+    skip: usize,
+) -> Result<u32, Stop> {
+    if p.len == 1 {
+        let one = BitVec::one(cx.width_of(p.factors[0]));
+        return r.build(cx, |cx| cx.mk_const(&one));
+    }
+    let first = usize::from(skip == 0);
+    let mut out = p.factors[first];
+    for (i, &f) in p.factors[..p.len].iter().enumerate() {
+        if i == skip || i == first {
+            continue;
+        }
+        out = r.build(cx, |cx| cx.c_bin(BinOp::Mul, out, f))?;
+    }
+    Ok(out)
+}
+
+/// `a·x + a·y + …` written as `a·(x + y + …)`, including where products group more factors.
+/// The commit rule keeps the rewrite only when it shrinks the live DAG. Factoring the whole
+/// bounded sum avoids rejecting an intermediate pair when its product is shared elsewhere.
+fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let Some(sum) = sum(cx, n) else {
+        return Ok(None);
+    };
+    if sum.len < 2 {
+        return Ok(None);
+    }
+    let mut products = [Product {
+        factors: [0; MAX_PRODUCT_FACTORS],
+        len: 0,
+    }; MAX_SUM_TERMS];
+    for (slot, &term) in products.iter_mut().zip(&sum.terms[..sum.len]) {
+        let Some(p) = product(cx, term) else {
+            return Ok(None);
+        };
+        *slot = p;
+    }
+    let products = &products[..sum.len];
+    if let Some(step @ Step::To(..)) = complementary_products(r, cx, n, products)? {
+        return Ok(Some(step));
+    }
+    let Some((factor, positions)) = common_factor(cx, products) else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let mut rest = None;
+    for (i, p) in products.iter().enumerate() {
+        let q = without_factor(r, cx, p, positions[i])?;
+        rest = Some(match rest {
+            None => q,
+            Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Add, a, q))?,
+        });
+    }
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
+    let factored = r.build(cx, |cx| cx.c_bin(BinOp::Mul, factor, rest))?;
+    let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS];
+    let mut count = 0;
+    for p in products {
+        for a in &p.factors[..p.len] {
+            if !atoms[..count].contains(a) {
+                atoms[count] = *a;
+                count += 1;
+            }
+        }
+    }
+    Ok(Some(finish(
+        r,
+        cx,
+        PassKind::Linear,
+        n,
+        factored,
+        before,
+        &atoms[..count],
+        Fin::FINAL,
+    )?))
+}
+
 /// The linear pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    if let Some(step @ Step::To(..)) = factor_sum(r, cx, n)? {
+        return Ok(step);
+    }
     // A case split on a condition mask the node reads, first (see `cases`).
     let before = cx.len() as u32;
     if let Some((e, f)) = super::cases::split(r, cx, n)?
@@ -557,4 +818,226 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
     let before = cx.len() as u32;
     let e = emit(r, cx, &form)?;
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
+}
+
+/// the sum `n` taken apart into groups of terms whose bitwise parts share no
+/// atom (the operands of `& | ^` that are not themselves bitwise), each group with several
+/// terms simplified alone by `part` (the MBA phase), and the sum built again from the results;
+/// `None` when the sum has one group or no group changes. An identity hidden in a sum beside
+/// other terms (`(z | k) − (z & k) − (z ^ k)`, nothing, next to a polynomial in `x` and `y`;
+/// `(t ^ k) + 2 (t & k)`, which is `t + k`, of a sum `t`) is then decided on its own atoms.
+#[cfg(feature = "mba")]
+pub(super) fn by_groups(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    if form.terms.len() < 3 {
+        return Ok(None);
+    }
+    let mut sets = Vec::with_capacity(form.terms.len());
+    for &(a, _) in &form.terms {
+        match bitwise_atoms(cx, a) {
+            Some(s) => sets.push(s),
+            None => return Ok(None),
+        }
+    }
+    fn find(up: &mut [usize], mut i: usize) -> usize {
+        while up[i] != i {
+            up[i] = up[up[i]];
+            i = up[i];
+        }
+        i
+    }
+    let k = sets.len();
+    let mut up: Vec<usize> = (0..k).collect();
+    for i in 0..k {
+        for j in i + 1..k {
+            if sets[i].iter().any(|l| sets[j].binary_search(l).is_ok()) {
+                let (a, b) = (find(&mut up, i), find(&mut up, j));
+                up[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..k {
+        let g = find(&mut up, i);
+        groups.entry(g).or_default().push(i);
+    }
+    if groups.len() < 2 || groups.values().all(|g| g.len() < 2) {
+        return Ok(None);
+    }
+    let w = form.konst.width();
+    let before = cx.len() as u32;
+    let mut total = Form::of(form.konst, &[]);
+    let mut fin = form.fin;
+    let mut changed = false;
+    for idx in groups.values() {
+        let terms: Vec<(u32, BitVec)> = idx.iter().map(|&i| form.terms[i]).collect();
+        let mut f = Form::of(BitVec::zero(w), &terms);
+        if idx.len() >= 2 {
+            let s = emit(r, cx, &f)?;
+            if let Some(e) = part(r, cx, s)?
+                && e != s
+            {
+                f = form_of(r, cx, e)?;
+                fin = fin.and(f.fin);
+                changed = true;
+            }
+        }
+        total = total.add(&f);
+    }
+    if !changed {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    let e = emit(r, cx, &total)?;
+    // The nodes from before the rewrite that it reads.
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
+}
+
+/// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
+/// themselves bitwise (constants aside), or `e` itself when it is not bitwise; `None` past a
+/// few hundred nodes.
+#[cfg(feature = "mba")]
+fn bitwise_atoms(cx: &Context, e: u32) -> Option<Vec<u32>> {
+    const MAX_SEEN: usize = 512;
+    let bitwise = |op: OpCode| matches!(op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
+    if !bitwise(cx.node(e).op) {
+        return Some(vec![e]);
+    }
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut out = Vec::new();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if seen.len() > MAX_SEEN {
+            return None;
+        }
+        let node = cx.node(i);
+        if bitwise(node.op) {
+            todo.extend(node.children());
+        } else if node.op != OpCode::Const {
+            out.push(i);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+/// the sum `n` with terms that spell a sum `A` its bitwise parts read as an atom
+/// (`2 (A & k) − x·x − y` where `A = x·x + y`) written as `A` itself, then simplified by `part`
+/// (the MBA phase): an atom and its expansion are otherwise unrelated to the solver. `None`
+/// when no such sum is spelled out.
+#[cfg(feature = "mba")]
+pub(super) fn by_sums(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    let mut sums: Vec<u32> = Vec::new();
+    for &(t, _) in &form.terms {
+        if !matches!(cx.node(t).op, OpCode::And | OpCode::Or | OpCode::Xor) {
+            continue;
+        }
+        for a in bitwise_atoms(cx, t).unwrap_or_default() {
+            if matches!(cx.node(a).op, OpCode::Add | OpCode::Sub) && !sums.contains(&a) {
+                sums.push(a);
+            }
+        }
+    }
+    let w = form.konst.width();
+    let one = BitVec::one(w);
+    let minus_one = BitVec::ones(w);
+    let mut konst = form.konst;
+    let mut terms = form.terms.clone();
+    let mut changed = false;
+    for a in sums {
+        let fa = form_of(r, cx, a)?;
+        if fa.terms.len() < 2 || fa.terms.iter().any(|(_, k)| *k != one && *k != minus_one) {
+            continue;
+        }
+        let coeff = |terms: &[(u32, BitVec)], atom: u32| {
+            terms
+                .binary_search_by_key(&atom, |t| t.0)
+                .ok()
+                .map(|i| terms[i].1)
+        };
+        // The scale `c` with `c · fa`'s terms among the sum's.
+        let (t0, k0) = fa.terms[0];
+        let Some(c0) = coeff(&terms, t0) else {
+            continue;
+        };
+        let c = if k0 == one {
+            c0
+        } else {
+            BitVec::un_unchecked(UnOp::Neg, &c0)
+        };
+        let scaled = |k: &BitVec| BitVec::bin_unchecked(BinOp::Mul, &c, k);
+        if !fa
+            .terms
+            .iter()
+            .all(|(t, k)| coeff(&terms, *t) == Some(scaled(k)))
+        {
+            continue;
+        }
+        // `c·Σ` is `c·A − c·kA`.
+        let mut rest: Vec<(u32, BitVec)> = terms
+            .iter()
+            .filter(|(t, _)| fa.terms.binary_search_by_key(t, |x| x.0).is_err())
+            .copied()
+            .collect();
+        rest.push((a, c));
+        konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scaled(&fa.konst));
+        let f = Form::of(konst, &rest);
+        terms = f.terms.clone();
+        konst = f.konst;
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let s = emit(r, cx, &Form::of(konst, &terms))?;
+    let e = part(r, cx, s)?.unwrap_or(s);
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
 }

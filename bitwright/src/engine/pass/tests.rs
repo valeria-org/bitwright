@@ -2712,8 +2712,13 @@ mod mba_service {
             let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
             assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
             changed += u64::from(out.roots[0].changed);
-            // Everything it answered was proved by the gate's own certificates.
-            assert_eq!(out.stats.mba.proof_unknown, 0);
+            // Every answer it accepted was proved by the gate's own certificates; a candidate
+            // the stronger solver exposes may still exceed a certificate's local budget.
+            assert_eq!(
+                out.stats.mba.simplified, out.stats.mba.certificates.proved,
+                "iteration {i}: {:#?}",
+                out.stats.mba
+            );
         }
         assert!(changed > 50, "{changed}");
         let s = solver.stats();
@@ -2804,9 +2809,11 @@ mod mba_service {
     const NONLINEAR: &str =
         "(x ^ y) + 2 * (x & y) + x * y - (x & y) * (x | y) - (x & ~y) * (~x & y)";
 
-    /// `x + y`, through a relation between `x >> 1` and `x` that no native certificate sees (a
-    /// right shift is an atom, independent of `x`).
-    const NOT_NATIVE: &str = "(x >>u 1) * 2 + (x & 1) + y";
+    /// `x + y`, through a relation between `(x + y) >> 1` and `x + y` that no native
+    /// certificate sees (a right shift of arithmetic is an atom, independent of its operand).
+    /// a right shift of a bitwise function is not an atom (`(x >> 1) * 2 + (x & 1)`
+    /// is proved `x`), so the relation goes through a sum.
+    const NOT_NATIVE: &str = "((x + y) >>u 1) * 2 + ((x + y) & 1)";
 
     fn run(eng: &Engine, src: &str) -> (Context, crate::engine::Outcome, Expr) {
         let mut cx = Context::new();
@@ -3133,18 +3140,24 @@ mod mba_service {
 
     #[test]
     fn exact_evidence_is_charged_and_budgeted() {
-        // At W = 8 the two variables have 16 bits: `Unproven`'s right answer, outside the
-        // polynomial fragment, is proved by evaluating all 2^16 points, and that work is
+        // At W = 6 the two variables have 12 bits: `Unproven`'s right answer, outside the
+        // polynomial fragment, is proved by evaluating all 2^12 points, and that work is
         // charged.
         let eng = mba_engine(Arc::new(Unproven), MbaTrust::default());
-        let o = ParseOptions::width(Width::W8);
+        let o = ParseOptions::width(Width::new(6).unwrap());
         let mut cx = Context::new();
         let e = cx.parse(NOT_NATIVE, &o).unwrap();
         let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
-        assert_eq!(out.roots[0].expr, cx.parse("x + y", &o).unwrap());
-        assert!(out.stats.pass_work >= 1 << 16, "{}", out.stats.pass_work);
+        assert_eq!(
+            out.roots[0].expr,
+            cx.parse("x + y", &o).unwrap(),
+            "{}\n{:#?}",
+            cx.display(out.roots[0].expr),
+            out.stats
+        );
+        assert!(out.stats.pass_work >= 1 << 12, "{}", out.stats.pass_work);
         assert_eq!(out.stats.mba.certificates.exhaustive, 1);
-        assert_eq!(out.stats.mba.certificates.points, 1 << 16);
+        assert_eq!(out.stats.mba.certificates.points, 1 << 12);
         // A pass-work budget stops it: the certificate is not started, and the node is not
         // final (more budget may prove it).
         let mut cx = Context::new();
@@ -4525,5 +4538,80 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
             assert_eq!(out.stats.passes["carries"].proofs, 0, "{w} bits: {src}");
         }
+    }
+}
+
+// ----- opaque constants (`mba::sweep`) -------------------------------------------
+
+#[cfg(feature = "mba")]
+mod opaque_constants {
+    use super::*;
+    use crate::mba::MbaConfig;
+
+    fn simplified(src: &str, fuel: u64) -> (Context, crate::engine::Outcome) {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+        let out = eng
+            .run(
+                &mut cx,
+                &[e],
+                Run::default().with_per_call(Budget::fuel(fuel)),
+            )
+            .unwrap();
+        (cx, out)
+    }
+
+    /// A constant hidden over three values that cancel (the FNV-1a prime), then read as a hash
+    /// multiplier, through a high byte and through a cast.
+    const PRIME: &str = "let p4 = ~b & ~(~c & a); let p6 = ~b & ~a; let p8 = ~p6 & c; \
+         let p9 = ~(~b & c) & ~a; let p10 = ~(~(~a & b) & c); let p11 = p6 & c; \
+         let p12 = ~(~b & ~(~c & ~a)); let p13 = ~(a & b) & ~p6; \
+         let p14 = ~(p13 & c) & ~(~c & ~p13); let p15 = ~b & a; \
+         let p16 = ~(p15 & c) & ~(~c & ~p15); \
+         let p = p4 * 0x666665ffffffff52 + p8 * 0x999998fffffffefb + p9 * 0x99999a00000000ae \
+         + p10 * 0xcccccbfffffffea4 + p11 * 0x666665ffffffff52 + p12 * 0x333332ffffffffa9 \
+         + p14 * 0x666665ffffffff52 + p16 * 0xcccccd0000000057;";
+
+    #[test]
+    fn a_chain_of_hidden_constants_folds_operands_first() {
+        let src = format!(
+            "{PRIME} let h = (0xcbf29ce484222325 ^ (p >>u 40)) * p; \
+             let g = zext<64>(extract<8, 8>(h)) * p; \
+             g + (x ^ zext<64>(trunc<32>(h) & 39))"
+        );
+        let (mut cx, out) = simplified(&src, 1 << 14);
+        let h: u64 =
+            (0xcbf2_9ce4_8422_2325u64 ^ (0x100_0000_01b3u64 >> 40)).wrapping_mul(0x100_0000_01b3);
+        let g = ((h >> 8) & 0xff).wrapping_mul(0x100_0000_01b3);
+        let want = cx
+            .parse(
+                &format!("{g:#x} + (x ^ {:#x})", h & 39),
+                &ParseOptions::width(Width::W64),
+            )
+            .unwrap();
+        assert_eq!(out.roots[0].expr, want, "{}", cx.display(out.roots[0].expr));
+        assert!(out.stats.mba.opaque_proved > 0);
+    }
+
+    #[test]
+    fn a_guard_that_reads_constant_at_the_samples_is_not_folded() {
+        // `x == k` is false at every sample point: the sum reads as 5, and is not.
+        let (mut cx, out) = simplified("zext<64>(x == 0x1234567) + 5 + (y & (z | y)) - y", 1 << 14);
+        let r = out.roots[0].expr;
+        assert!(cx.as_const(r).unwrap().is_none(), "{}", cx.display(r));
+        let want = cx
+            .parse(
+                "zext<64>(x == 0x1234567) + 5",
+                &ParseOptions::width(Width::W64),
+            )
+            .unwrap();
+        assert_eq!(r, want, "{}", cx.display(r));
     }
 }

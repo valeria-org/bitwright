@@ -2403,11 +2403,87 @@ impl Runner<'_, '_> {
     /// Runs the strategy on one root: the result, or the best value-equivalent result so far
     /// with the reason it stopped.
     fn strategy(&mut self, cx: &mut Context, root: u32) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        #[cfg(feature = "mba")]
         let inner = self.inner;
         let mut cur = root;
-        let mut fin = Fin::FINAL;
+        let fin = Fin::FINAL;
+        // with the MBA phase's noise forms, the root is read with what its
+        // conditions fix put into the operands they guard first (see `pass::push_context`):
+        // a case table's noise folds once its selector's bits are constants, and the budget is
+        // spent on what is left. At most doubling the root; a budget keeps the root as it is.
+        #[cfg(feature = "mba")]
+        if inner
+            .phases
+            .iter()
+            .any(|p| matches!(p, PhaseImpl::Mba(c) if c.noise_forms))
+        {
+            let own = match cx.dag_size(&[cx.handle(cur)], 1 << 22) {
+                Ok(crate::expr::Bounded::Exact(n)) => n,
+                _ => 0,
+            };
+            match pass::push_context(self, cx, cur, own) {
+                Ok(Some(p)) => cur = p,
+                Ok(None) | Err(Stop::Exhausted(_)) => {}
+                Err(stop) => return Err((cur, fin, stop)),
+            }
+        }
+        // The exact opaque-constant sweep is opt-in: it can spend work on failed candidate
+        // proofs before the ordinary phases reach their root.
+        #[cfg(feature = "mba")]
+        if let Some(cfg) = inner.phases.iter().find_map(|p| match p {
+            PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms || c.known_atoms => Some(c),
+            _ => None,
+        }) {
+            match pass::mba_sweep(self, cx, cfg, cur) {
+                Ok(r) => cur = r,
+                Err(Stop::Exhausted(_)) => {}
+                Err(stop) => return Err((cur, fin, stop)),
+            }
+        }
+        cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        self.rounds(cx, cur, fin)
+    }
+
+    /// with the MBA phase's noise forms, `cur` with its pieces that depend only on
+    /// a few conditions written as tables of their values (see `pass::cut_cases`): what the
+    /// rounds leave of a noise term is often a constant on either side of one condition. The
+    /// evaluations walk at most 4 times the root's nodes; a budget keeps the root as it is.
+    fn cases(&mut self, cx: &mut Context, cur: u32) -> Result<u32, Stop> {
+        #[cfg(feature = "mba")]
+        if self
+            .inner
+            .phases
+            .iter()
+            .any(|p| matches!(p, PhaseImpl::Mba(c) if c.noise_forms))
+        {
+            let own = match cx.dag_size(&[cx.handle(cur)], 1 << 22) {
+                Ok(crate::expr::Bounded::Exact(n)) => n,
+                _ => return Ok(cur),
+            };
+            return match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+                Ok(Some(p)) => Ok(p),
+                Ok(None) | Err(Stop::Exhausted(_)) => Ok(cur),
+                Err(stop) => Err(stop),
+            };
+        }
+        let _ = cx;
+        Ok(cur)
+    }
+
+    /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
+    /// nothing.
+    fn rounds(
+        &mut self,
+        cx: &mut Context,
+        mut cur: u32,
+        mut fin: Fin,
+    ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        let inner = self.inner;
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
+            if round > 0 {
+                cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+            }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 let _ = p;

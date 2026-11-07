@@ -1052,9 +1052,121 @@ fn emit_values(
     .map(Some)
 }
 
+/// An OR of every value a masked word can take is true; when every test is
+/// conjoined with the same condition, it is that condition. VM case tables
+/// spell `c` as `(x & m == k0) & c | …` for every submask `k` of `m`.
+fn exhaustive_mask_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    root: u32,
+) -> Result<Option<Option<u32>>, Stop> {
+    const MAX_TERMS: usize = 32;
+
+    let mut terms = Vec::new();
+    let mut todo = vec![root];
+    while let Some(e) = todo.pop() {
+        r.meter.charge(Counter::PassWork, 1)?;
+        let n = cx.node(e);
+        if n.op == OpCode::Or && n.width == 1 {
+            todo.push(n.a);
+            todo.push(n.b);
+        } else {
+            terms.push(e);
+            if terms.len() > MAX_TERMS {
+                return Ok(None);
+            }
+        }
+    }
+    if terms.len() < 2 {
+        return Ok(None);
+    }
+
+    let first = cx.node(terms[0]);
+    let candidates = if first.op == OpCode::And && first.width == 1 {
+        [Some(first.a), Some(first.b), None]
+    } else {
+        [None, None, None]
+    };
+    for common in candidates.into_iter().flatten().map(Some).chain([None]) {
+        let mut expr = None;
+        let mut values = Vec::new();
+        let mut valid = true;
+        for &term in &terms {
+            let test = if let Some(c) = common {
+                let n = cx.node(term);
+                if n.op != OpCode::And || n.width != 1 {
+                    valid = false;
+                    break;
+                }
+                if n.a == c {
+                    n.b
+                } else if n.b == c {
+                    n.a
+                } else {
+                    valid = false;
+                    break;
+                }
+            } else {
+                term
+            };
+            let n = cx.node(test);
+            if n.op != OpCode::Eq {
+                valid = false;
+                break;
+            }
+            let (e, k) = match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => (n.a, k),
+                (Some(k), None) => (n.b, k),
+                _ => {
+                    valid = false;
+                    break;
+                }
+            };
+            if expr.replace(e).is_some_and(|old| old != e) {
+                valid = false;
+                break;
+            }
+            let Some(k) = k.to_u64() else {
+                valid = false;
+                break;
+            };
+            values.push(k);
+        }
+        let Some(e) = expr.filter(|_| valid) else {
+            continue;
+        };
+        let n = cx.node(e);
+        if n.op != OpCode::And {
+            continue;
+        }
+        let mask = match (cx.const_val(n.a), cx.const_val(n.b)) {
+            (Some(k), None) | (None, Some(k)) => k,
+            _ => continue,
+        };
+        let Some(mask) = mask.to_u64() else {
+            continue;
+        };
+        let bits = mask.count_ones();
+        if bits > 5 || values.iter().any(|v| v & !mask != 0) {
+            continue;
+        }
+        values.sort_unstable();
+        values.dedup();
+        if values.len() == 1usize << bits {
+            return Ok(Some(common));
+        }
+    }
+    Ok(None)
+}
+
 /// The compares pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
+    if node.op == OpCode::Select
+        && let Some(step @ Step::To(..)) = arms_read(r, cx, n)?
+    {
+        return Ok(step);
+    }
     if node.op == OpCode::Select && node.width > 1 {
         return order_step(r, cx, n);
     }
@@ -1068,6 +1180,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     if node.op == OpCode::Select {
         return order_step(r, cx, n);
+    }
+    if let Some(common) = exhaustive_mask_cases(r, cx, n)? {
+        let before = cx.len() as u32;
+        let (e, atoms) = match common {
+            Some(c) => (c, vec![c]),
+            None => (bool_const(r, cx, true)?, Vec::new()),
+        };
+        return finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL);
     }
     // A test of one bit through a mask: `(x & 2^k) != 0` is bit k of x.
     if let Some((x, k, set)) = bit_test(cx, n) {
@@ -1222,6 +1342,107 @@ fn residue_set(truth: &[bool], w: Width) -> Set {
 }
 
 /// The order reading of `n` (see `order`).
+/// The most nodes above its condition an arm may have for [`arms_read`].
+const MAX_ARM: usize = 64;
+
+/// Whether `e` reads `c` among at most [`MAX_ARM`] nodes made after `c`.
+fn reads(cx: &Context, e: u32, c: u32) -> bool {
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(v) = todo.pop() {
+        if v == c {
+            return true;
+        }
+        if v < c || seen.insert(v, ()).is_some() {
+            continue;
+        }
+        if seen.len() > MAX_ARM {
+            return false;
+        }
+        todo.extend(cx.node(v).children());
+    }
+    false
+}
+
+/// `select(c, t, f)` that is one of its values for every input (see
+/// [`one_value`]).
+fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let node = cx.node(n);
+    let (c, t, f) = (node.a, node.b, node.c);
+    if cx.const_val(c).is_some() {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let Some(e) = one_value(r, cx, c, t, f)? else {
+        super::discard(r, cx, before);
+        return Ok(None);
+    };
+    // The nodes from before the rewrite that it reads.
+    let mut stops = Vec::new();
+    let mut todo = vec![e];
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL).map(Some)
+}
+
+/// The one value `select(c, t, f)` takes, when it is one:
+///
+/// - arms that read `c` (a flag a `setcc` and a carry both spell): `t` with `c` true and `f`
+///   with `c` false, when they come out alike (`select(c, zext(c), zext(c) + 1)` is 1);
+/// - a flag (1 bit) chosen by a test of `p` against a constant `k`: the arm taken when
+///   `p != k`, when with `p` at `k` it is the other arm (a shift's flags by its count,
+///   `count != 0 ? r == 0 : x == 0`, with `x << 0` being `x`).
+///
+/// Only one value: a select with its arms rewritten is no smaller, and the commit rule would
+/// take it on one run and not another.
+fn one_value(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    c: u32,
+    t: u32,
+    f: u32,
+) -> Result<Option<u32>, Stop> {
+    let with = |r: &mut Runner<'_, '_>, cx: &mut Context, e: u32, from: u32, to: u32| {
+        let mut repl = crate::hash::IdMap::default();
+        repl.insert(from, to);
+        r.build(cx, |cx| Ok(cx.substitute_ids(&[e], &repl)?[0]))
+    };
+    if reads(cx, t, c) || reads(cx, f, c) {
+        let one = bool_const(r, cx, true)?;
+        let zero = bool_const(r, cx, false)?;
+        let t2 = with(r, cx, t, c, one)?;
+        let f2 = with(r, cx, f, c, zero)?;
+        if t2 == f2 {
+            return Ok(Some(t2));
+        }
+    }
+    // A flag's value only: on wider values the arm in place of the select shares less with
+    // the code around it.
+    let cn = cx.node(c);
+    if cx.wid(t) != 1 || !matches!(cn.op, OpCode::Eq | OpCode::Ne) {
+        return Ok(None);
+    }
+    let (p, k) = match (cx.const_val(cn.a), cx.const_val(cn.b)) {
+        (None, Some(_)) => (cn.a, cn.b),
+        (Some(_), None) => (cn.b, cn.a),
+        _ => return Ok(None),
+    };
+    let (held, other) = if cn.op == OpCode::Eq { (t, f) } else { (f, t) };
+    if !reads(cx, other, p) {
+        return Ok(None);
+    }
+    Ok((with(r, cx, other, p, k)? == held).then_some(other))
+}
+
 fn order_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let before = cx.len() as u32;
     match super::order::decide(r, cx, n)? {

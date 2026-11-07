@@ -321,6 +321,12 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
     let live = live(m);
     let cst = constants(nodes);
     let mut local = vec![false; nodes.len()];
+    // the bit position offset of a bitwise function of the variables (bit `i` of
+    // the node reads the variables' bits `i + shift`), `ANY` for constants. Shifts by
+    // constants move it; a bitwise operator takes operands at one offset only, so every bit
+    // still reads one position of the variables, which the sparse tests rest on.
+    const ANY: i32 = i32::MIN;
+    let mut shift = vec![0i32; nodes.len()];
     let mut deg = vec![0u32; nodes.len()];
     let mut vdeg: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
     let (mut poly, mut uniform, mut bitwise) = (true, true, false);
@@ -332,6 +338,7 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         }
         if cst[i].is_some() {
             local[i] = true;
+            shift[i] = ANY;
             vdeg[i] = zeros.clone();
             continue;
         }
@@ -365,12 +372,41 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                         uniform = false;
                     }
                 }
+                shift[i] = match (shift[a], shift[b]) {
+                    (ANY, s) | (s, ANY) => s,
+                    (s, t) if s == t => s,
+                    _ => {
+                        poly = false;
+                        0
+                    }
+                };
+                local[i] = true;
+                deg[i] = 1;
+                vdeg[i] = zeros.clone();
+            }
+            // a shift of a bitwise function is one, at another offset (its
+            // vacated bits are constants). Not at the corners, and not without bitwise
+            // operators: only the sparse tests take it.
+            MOp::Shl(k) | MOp::LShr(k)
+                if local[a]
+                    && cst[a].is_none()
+                    && (matches!(n.op, MOp::LShr(_)) || !matches!(nodes[a].op, MOp::Var(_))) =>
+            {
+                bitwise = true;
+                uniform = false;
+                let k = i32::from(k);
+                shift[i] = match (n.op, shift[a]) {
+                    (_, ANY) => ANY,
+                    (MOp::Shl(_), s) => s - k,
+                    (_, s) => s + k,
+                };
                 local[i] = true;
                 deg[i] = 1;
                 vdeg[i] = zeros.clone();
             }
             MOp::Not | MOp::Neg | MOp::Shl(_) => {
                 local[i] = matches!(n.op, MOp::Not) && local[a];
+                shift[i] = shift[a];
                 deg[i] = deg[a];
                 vdeg[i] = vdeg[a].clone();
             }
@@ -1019,7 +1055,24 @@ pub(crate) fn refute(a: &MbaExpr, b: &MbaExpr, points: &[Vec<BitVec>]) -> Option
 /// found to differ. Expressions over different variables or of different widths are not
 /// compared (`Unknown`).
 pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result<Report, M::Err> {
-    let mut report = prove_at(a, b, meter, 0, false)?;
+    // casts are atoms to the tests below, so a side that spells a value through
+    // the low half of another is unrelated to it there, and the tests spend their work on
+    // abstractions that cannot decide. Sides with casts are compared without them first
+    // (equal expressions, see `decast`), and as they are only when that does not decide.
+    let (da, db) = (super::decast::decast(a), super::decast::decast(b));
+    let mut report = Report::new();
+    if da.is_some() || db.is_some() {
+        report = prove_at(
+            da.as_ref().unwrap_or(a),
+            db.as_ref().unwrap_or(b),
+            meter,
+            0,
+            false,
+        )?;
+    }
+    if report.verdict == Verdict::Unknown {
+        report = prove_at(a, b, meter, 0, false)?;
+    }
     // A refutation comes with an input where the sides differ; one without would be a bug
     // (decided nothing).
     if report.verdict == Verdict::Refuted
@@ -3864,5 +3917,59 @@ mod point_tests {
             assert_eq!(got.len() as u64, plan.points, "w {w} t {t} d {d}");
             assert_eq!(got, want, "w {w} t {t} d {d}");
         }
+    }
+}
+
+// right shifts of bitwise functions in the polynomial fragment.
+#[cfg(test)]
+mod shift_tests {
+    use super::*;
+
+    fn var(m: &mut MbaExpr, v: u32) -> u32 {
+        m.push(MOp::Var(v), &[]).unwrap()
+    }
+    fn k(m: &mut MbaExpr, v: u64) -> u32 {
+        m.push(MOp::Const(BitVec::wrapping_from_u64(Width::W64, v)), &[])
+            .unwrap()
+    }
+    fn report(a: &MbaExpr, b: &MbaExpr) -> Report {
+        prove(a, b, &mut Steps::new(1 << 24)).unwrap_or_else(|()| Report::new())
+    }
+
+    #[test]
+    fn a_shifted_bitwise_function_at_its_own_offset_is_in_the_fragment() {
+        // `((~(x & K) >> 24) & 0xffff) << 24` is `~(x & K) & 0xffff000000`: bits `24..40` of
+        // one function of `x`, at offset 0 again.
+        let mut a = MbaExpr::new(vec![Width::W64]);
+        let x = var(&mut a, 0);
+        let c = k(&mut a, 0x1_4000_0000);
+        let t = a.push(MOp::And, &[x, c]).unwrap();
+        let n = a.push(MOp::Not, &[t]).unwrap();
+        let s = a.push(MOp::LShr(24), &[n]).unwrap();
+        let m = k(&mut a, 0xffff);
+        let s = a.push(MOp::And, &[s, m]).unwrap();
+        let s = a.push(MOp::Shl(24), &[s]).unwrap();
+        let hi = k(&mut a, 0xff_ff00_0000);
+        let u = a.push(MOp::And, &[t, hi]).unwrap();
+        a.push(MOp::Add, &[s, u]).unwrap();
+        let mut b = MbaExpr::new(vec![Width::W64]);
+        k(&mut b, 0xff_ff00_0000);
+        let p = profile(&a).unwrap();
+        assert!(p.poly && !p.uniform && p.degree == 1, "{p:?}");
+        assert_eq!(report(&a, &b).verdict, Verdict::Proved);
+    }
+
+    #[test]
+    fn bitwise_operands_at_different_offsets_are_not_one_position() {
+        // `(x >> 1) & x` is zero wherever `x` has at most one bit set, and not zero at 3:
+        // reading it as one position per bit would prove it zero.
+        let mut a = MbaExpr::new(vec![Width::W64]);
+        let x = var(&mut a, 0);
+        let s = a.push(MOp::LShr(1), &[x]).unwrap();
+        a.push(MOp::And, &[s, x]).unwrap();
+        let mut b = MbaExpr::new(vec![Width::W64]);
+        k(&mut b, 0);
+        assert!(!profile(&a).unwrap().poly);
+        assert_ne!(report(&a, &b).verdict, Verdict::Proved);
     }
 }

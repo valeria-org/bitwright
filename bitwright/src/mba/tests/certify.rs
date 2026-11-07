@@ -449,10 +449,10 @@ fn atoms_are_paired_by_structure_congruence_and_proof() {
     ] {
         assert_ne!(prove(&a, &b).verdict, Verdict::Proved, "{a:?} == {b:?}");
     }
-    // Equal through a relation between atoms (`x >> 1` and `x`) that abstraction loses:
-    // unknown, never refuted.
+    // Equal through a relation between atoms (`x >> 1` and `x`) that the shifted-bitwise
+    // certificate now retains.
     let a = add(mul(lshr(x.clone(), 1), two()), and(x.clone(), k(w, 1)));
-    assert_eq!(prove(&a, &x).verdict, Verdict::Unknown);
+    assert_eq!(prove(&a, &x).verdict, Verdict::Proved);
 }
 
 #[test]

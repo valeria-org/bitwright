@@ -104,10 +104,29 @@ impl std::error::Error for MbaError {}
 
 /// A DAG in the MBA fragment over declared variables. The last node is the root. Nodes refer
 /// only to earlier nodes, so evaluation and every traversal are single forward passes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct MbaExpr {
     vars: Vec<Width>,
     nodes: Vec<MNode>,
+    /// [`MbaExpr::key`], computed once (adding a node clears it). Not part of
+    /// the expression: equality and hashing read the variables and nodes alone.
+    key: std::sync::OnceLock<[u64; 2]>,
+}
+
+impl PartialEq for MbaExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.vars == other.vars && self.nodes == other.nodes
+    }
+}
+
+impl Eq for MbaExpr {}
+
+impl Hash for MbaExpr {
+    // The derived hash's: the variables, then the nodes.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.vars.hash(state);
+        self.nodes.hash(state);
+    }
 }
 
 /// Structural properties used to decide whether a solver is worth asking.
@@ -132,6 +151,7 @@ impl MbaExpr {
         MbaExpr {
             vars,
             nodes: Vec::new(),
+            key: std::sync::OnceLock::new(),
         }
     }
 
@@ -208,6 +228,7 @@ impl MbaExpr {
             a[k] = x;
         }
         self.nodes.push(MNode { op, width, args: a });
+        self.key = std::sync::OnceLock::new();
         Ok(self.nodes.len() as u32 - 1)
     }
 
@@ -253,6 +274,12 @@ impl MbaExpr {
 
     /// A 128-bit content hash (variables, nodes), stable across processes.
     pub fn key(&self) -> [u64; 2] {
+        // hashed once per expression; the engine and its solver ask it of one
+        // question several times.
+        *self.key.get_or_init(|| self.key_uncached())
+    }
+
+    fn key_uncached(&self) -> [u64; 2] {
         struct H(u64, u64);
         impl Hasher for H {
             fn finish(&self) -> u64 {
