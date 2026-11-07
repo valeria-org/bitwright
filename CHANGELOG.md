@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
 - **Orderings see through strictly monotone maps.** The invert pass cancelled and solved only
   equalities: a bijection does not preserve order. It now reads `<u`, `<=u`, `<s` and `<=s`
