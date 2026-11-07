@@ -63,6 +63,9 @@ fn main() -> Result<(), bitwright::Error> {
 - **Invertibility**: proofs that an expression is an injective or bijective function of a
   subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so
   a hash comparison becomes a plain one.
+- **Traces of every run**: each rewrite with the phase and round that made it, the rule as
+  written or the pass's reasoning, the candidates dropped and the guards that failed, written as
+  JSON Lines (`bitwright simplify --trace`), and [a viewer](workbench/README.md) for them.
 - **A rule language (`.bwr`)** for your own rewrites, with a mandatory soundness check
   (exhaustive at small widths, sampled up to 512 bits) and proof ledgers.
 - **Verified compiler transformations**: peephole optimizations in the Alive syntax and pairs

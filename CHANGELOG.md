@@ -120,12 +120,35 @@
   from `Root` through each `Stage` and phase, the last root reported is the result.
   `Phase::name` gives each phase's short name (`local`, or the pass's name as `By::Pass` and
   `Stats::passes` give it). With no observer nothing is built.
+- **What almost happened.** `Event::GuardFailed` names the guard predicate that did not hold
+  and the nodes bound to its operands. `Event::NotSmaller` reports each candidate a pass built
+  or estimated and dropped as not smaller, with the nodes it needs and would free; `Event::Folded`
+  each node the constructors turned into another operator when rebuilding it over new operands
+  (`… ^ 0` into `…`), which no event reported before.
+- **The passes' reasoning.** An observer whose `Observer::detail` is `Detail::Explain` receives
+  `Event::Explain` after each pass rewrite: an `Explanation` of what the pass read (fact folding's
+  known bits, the linear and xor forms, the truth table, a compared pair's relation set or an
+  operand's intervals, the corner values of a linear MBA, each bit's source, the demanded mask,
+  the narrowing the casts pass pushed, the layers the invert pass undid with the preimage under
+  each, the divisor behind a magic number, a carry network's affine form, the evidence that
+  vouched for an MBA answer). `Explanation` follows the passes and may change in any release.
 - **Traces.** `engine::Trace` records every event of a run and writes it out as JSON Lines
-  (`Trace::to_jsonl`): a header with the strategy's phases, the rules and nodes the events name
-  (operands first, numbered as in the context), the events in order, each root's result and
-  the run's counters. The same run writes the same trace, so traces diff across engine
-  versions, strategies and budgets. `bitwright simplify --trace <out>` writes one for an
-  expression.
+  (`Trace::to_jsonl`): a header with the strategy's phases, the rules the events name with their
+  text and proof-ledger evidence, the nodes they name (operands first, numbered as in the
+  context), the events in order, each root's result and the run's counters; with
+  `with_explanations`, `with_facts` and `with_assumptions`, the passes' reasoning, the known bits
+  and intervals of the nodes, and the run's constraints. The same run writes the same trace, so
+  traces diff across engine versions, strategies and budgets. `bitwright simplify --trace <out>`
+  writes one (with `--file`, one per line, one after the other), and the WebAssembly module's
+  `trace` returns one.
+- **The Workbench** (`workbench/`): a viewer of traces in the browser, with no build step. Each
+  step of a run with the whole expression before and after it, the rule (as written, with its
+  proof) or the pass's reasoning, and the phases × rounds it ran in; the run phase by phase; why
+  a rule did not fire at a node (its failed guard with the operands' known bits, its candidate
+  that was not smaller); the facts under the assumptions and what relied on each; a corpus with
+  a rule census; two runs side by side. It runs the engine live through the WebAssembly module.
+- **Behavior change.** `PassCounts::rejected_cost` of the xor pass now also counts the GF(2)
+  forms it drops as not smaller (one per `NotSmaller` event).
 - **Opt-in opaque and conditional MBA recovery.** `MbaConfig::with_opaque_sweep`,
   `with_noise_forms` and `with_known_atoms` enable exact rewrites for constants hidden through
   demanded bits, casts, rotations, condition-dependent pieces and complementary shared products.

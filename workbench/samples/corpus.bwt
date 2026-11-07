@@ -1,0 +1,1194 @@
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.bitwise::and_not_self","id":"a7155cc265a14fe9cc6247305f489835","kind":"rule","proven":true,"doc":"Complement.","examples":[["p & ~p","0:8"]],"source":"rule and_not_self<W>(x: W) { x & ~x => 0 }","ledger":"rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":1,"name":"core.arith::mul_pow2","id":"6496ccdcfe6d1bf9444d7f829bb87e6a","kind":"rule","proven":true,"doc":"Multiplying by a power of two is a shift.","examples":[["p * 8","p << 3"]],"source":"rule mul_pow2<W>(x: W, c: const W) { x * c => x << k if is_pow2(c) let k: W = ctz(c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=891)"}
+{"rule":2,"name":"core.shift_canonical::shl_mask_dead","id":"b687f5007019479c0957cd7cf5afab11","kind":"rule","proven":true,"doc":"A mask that keeps every bit the shift keeps.","examples":[["(p & 63) << 2","p << 2"]],"source":"rule shl_mask_dead<W>(x: W, c: const W, k: const W) {\n        (x & c) << k => x << k if (c | ~(ones >>u k)) == ones\n    }","ledger":"rule exhaustive(inst=5,maxw=5,cases=37448,fired=32378) sampled(inst=22,cases=1408,fired=1104)"}
+{"rule":3,"name":"core.arith::add_xor_and","id":"91a74de0aba7b7ddb91240edcadabeb2","kind":"identity","proven":true,"doc":"Xor plus twice the and is plus. (Twice is written as the shift `mul_pow2` makes of it:\npatterns are written in normal form, or bottom-up rewriting never reaches them.)","examples":[["(p ^ q) + ((p & q) << 1)","p + q"]],"source":"identity add_xor_and<W>(x: W, y: W) { (x ^ y) + ((x & y) << 1) <=> x + y }","ledger":"identity exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":4,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"rule":5,"name":"core.arith::sub_and","id":"f494f97854ab0848902d5d10e05d614e","kind":"rule","proven":true,"doc":"Removing the common bits.","examples":[["p - (p & q)","p & ~q"]],"source":"rule sub_and<W>(x: W, y: W) { x - (x & y) => x & ~y }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":6,"name":"core.arith::sub_or","id":"98af6cc381e96fdd11156579398556cb","kind":"rule","proven":true,"doc":"The bits an or adds.","examples":[["(p | q) - p","q & ~p"]],"source":"rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":7,"name":"core.recovery_arith::xor_from_or_minus_and","id":"da70d981bf49c9fd64529be76dc44a95","kind":"rule","proven":true,"examples":[["(p | q) - (p & q)","p ^ q"]],"source":"rule xor_from_or_minus_and<W>(x: W, y: W) { (x | y) - (x & y) => x ^ y }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"node":5,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":4,"op":"sym","name":"y","w":32,"text":"y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":12,"op":"or","w":32,"args":[5,4],"text":"x | y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":8,"op":"and","w":32,"args":[5,4]}
+{"node":13,"op":"sub","w":32,"args":[12,8],"text":"(x | y) - (x & y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":7,"op":"const","value":"0x2","w":32}
+{"node":9,"op":"mul","w":32,"args":[8,7],"text":"(x & y) * 2","facts":{"zero":"0x1","one":"0x0","u":["0x0","0xfffffffe"],"stride":2,"s":["0x80000000","0x7ffffffe"]}}
+{"node":6,"op":"xor","w":32,"args":[5,4],"text":"x ^ y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":10,"op":"add","w":32,"args":[9,6]}
+{"node":3,"op":"const","value":"0x3","w":32,"text":"3:32","facts":{"zero":"0xfffffffc","one":"0x3","u":["0x3","0x3"],"stride":0,"s":["0x3","0x3"]}}
+{"node":11,"op":"mul","w":32,"args":[10,3]}
+{"node":14,"op":"add","w":32,"args":[13,11]}
+{"node":0,"op":"sym","name":"z","w":32}
+{"node":1,"op":"not","w":32,"args":[0]}
+{"node":2,"op":"and","w":32,"args":[1,0],"text":"~z & z","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":15,"op":"xor","w":32,"args":[14,2],"text":"let %0 = x & y;\n(x | y) - %0 + (%0 * 2 + (x ^ y)) * 3 ^ ~z & z","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":23,"op":"add","w":32,"args":[12,4],"text":"(x | y) + y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":24,"op":"add","w":32,"args":[23,5],"text":"(x | y) + y + x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":25,"op":"add","w":32,"args":[24,24],"text":"let %0 = (x | y) + y + x;\n%0 + %0","facts":{"zero":"0x1","one":"0x0","u":["0x0","0xfffffffe"],"stride":2,"s":["0x80000000","0x7ffffffe"]}}
+{"node":16,"op":"const","value":"0x0","w":32,"text":"0:32","facts":{"zero":"0xffffffff","one":"0x0","u":["0x0","0x0"],"stride":0,"s":["0x0","0x0"]}}
+{"node":17,"op":"const","value":"0x1","w":32}
+{"node":18,"op":"shl","w":32,"args":[8,17],"text":"(x & y) << 1","facts":{"zero":"0x1","one":"0x0","u":["0x0","0xfffffffe"],"stride":2,"s":["0x80000000","0x7ffffffe"]}}
+{"node":19,"op":"add","w":32,"args":[6,18],"text":"(x ^ y) + ((x & y) << 1)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":20,"op":"add","w":32,"args":[5,4],"text":"x + y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":21,"op":"mul","w":32,"args":[20,3],"text":"(x + y) * 3","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":22,"op":"add","w":32,"args":[21,6],"text":"(x + y) * 3 + (x ^ y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"ev":"root","index":0,"root":15}
+{"ev":"phase_begin","round":0,"phase":0,"root":15}
+{"ev":"phase_end","round":0,"phase":0,"root":15,"spent":{"node_visits":24,"fact_work":16,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":1,"root":15}
+{"ev":"candidate","rule":0,"node":2}
+{"ev":"applied","rule":0,"before":2,"after":16}
+{"ev":"candidate","rule":1,"node":9}
+{"ev":"applied","rule":1,"before":9,"after":18}
+{"ev":"candidate","rule":2,"node":18}
+{"ev":"no_match","rule":2,"node":18}
+{"ev":"candidate","rule":3,"node":19}
+{"ev":"applied","rule":3,"before":19,"after":20}
+{"ev":"candidate","rule":4,"node":20}
+{"ev":"guard_false","rule":4,"node":20,"pred":"disjoint","args":[5,4]}
+{"ev":"candidate","rule":1,"node":21}
+{"ev":"guard_false","rule":1,"node":21,"pred":"is_pow2","args":[3,null]}
+{"ev":"candidate","rule":5,"node":13}
+{"ev":"no_match","rule":5,"node":13}
+{"ev":"candidate","rule":6,"node":13}
+{"ev":"no_match","rule":6,"node":13}
+{"ev":"candidate","rule":7,"node":13}
+{"ev":"applied","rule":7,"before":13,"after":6}
+{"ev":"candidate","rule":4,"node":22}
+{"ev":"guard_false","rule":4,"node":22,"pred":"disjoint","args":[21,6]}
+{"ev":"folded","node":15,"after":22}
+{"ev":"phase_end","round":0,"phase":1,"root":22,"spent":{"node_visits":32,"candidates":10,"match_steps":53,"rewrites":4,"new_nodes":7,"fact_work":2}}
+{"ev":"phase_begin","round":0,"phase":2,"root":22}
+{"ev":"not_smaller","pass":"linear","node":20,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":21,"candidate":null,"added":5,"freed":3,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":22,"candidate":null,"added":6,"freed":4,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":22,"spent":{"node_visits":10,"pass_work":27}}
+{"ev":"phase_begin","round":0,"phase":3,"root":22}
+{"ev":"not_smaller","pass":"xor","node":6,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":3,"root":22,"spent":{"node_visits":10,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":4,"root":22}
+{"ev":"phase_end","round":0,"phase":4,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":5,"root":22}
+{"ev":"phase_end","round":0,"phase":5,"root":22,"spent":{"node_visits":10,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":6,"root":22}
+{"ev":"phase_end","round":0,"phase":6,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":7,"root":22}
+{"ev":"phase_end","round":0,"phase":7,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":8,"root":22}
+{"ev":"not_smaller","pass":"bitwise","node":6,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":8,"root":22,"spent":{"node_visits":10,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":9,"root":22}
+{"ev":"phase_end","round":0,"phase":9,"root":22,"spent":{"node_visits":10,"pass_work":10}}
+{"ev":"phase_begin","round":0,"phase":10,"root":22}
+{"ev":"not_smaller","pass":"linear_mba","node":22,"candidate":null,"added":7,"freed":5,"shared":false}
+{"ev":"phase_end","round":0,"phase":10,"root":22,"spent":{"node_visits":10,"pass_work":39}}
+{"ev":"phase_begin","round":0,"phase":11,"root":22}
+{"ev":"phase_end","round":0,"phase":11,"root":22,"spent":{"node_visits":10,"pass_work":103}}
+{"ev":"phase_begin","round":0,"phase":12,"root":22}
+{"ev":"phase_end","round":0,"phase":12,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":13,"root":22}
+{"ev":"applied","pass":"mba","before":22,"after":25}
+{"ev":"explain","pass":"mba","node":22,"why":{"kind":"mba","atoms":[4,5],"evidence":"certificate","test":"signature","points":4}}
+{"ev":"phase_end","round":0,"phase":13,"root":25,"spent":{"node_visits":21,"rewrites":1,"new_nodes":3,"pass_work":960,"mba_calls":2,"mba_steps":6250}}
+{"ev":"phase_begin","round":0,"phase":14,"root":25}
+{"ev":"candidate","rule":4,"node":23}
+{"ev":"guard_false","rule":4,"node":23,"pred":"disjoint","args":[12,4]}
+{"ev":"candidate","rule":4,"node":24}
+{"ev":"guard_false","rule":4,"node":24,"pred":"disjoint","args":[23,5]}
+{"ev":"candidate","rule":4,"node":25}
+{"ev":"guard_false","rule":4,"node":25,"pred":"disjoint","args":[24,24]}
+{"ev":"phase_end","round":0,"phase":14,"root":25,"spent":{"node_visits":9,"candidates":3,"match_steps":9,"fact_work":2}}
+{"ev":"phase_begin","round":1,"phase":0,"root":25}
+{"ev":"phase_end","round":1,"phase":0,"root":25,"spent":{"node_visits":5,"fact_work":1,"pass_work":3}}
+{"ev":"phase_begin","round":1,"phase":1,"root":25}
+{"ev":"candidate","rule":4,"node":23}
+{"ev":"guard_false","rule":4,"node":23,"pred":"disjoint","args":[12,4]}
+{"ev":"candidate","rule":4,"node":24}
+{"ev":"guard_false","rule":4,"node":24,"pred":"disjoint","args":[23,5]}
+{"ev":"candidate","rule":4,"node":25}
+{"ev":"guard_false","rule":4,"node":25,"pred":"disjoint","args":[24,24]}
+{"ev":"phase_end","round":1,"phase":1,"root":25,"spent":{"node_visits":5,"candidates":3,"match_steps":9}}
+{"ev":"phase_begin","round":1,"phase":2,"root":25}
+{"ev":"not_smaller","pass":"linear","node":23,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":24,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":25,"candidate":null,"added":5,"freed":3,"shared":false}
+{"ev":"phase_end","round":1,"phase":2,"root":25,"spent":{"node_visits":7,"pass_work":16}}
+{"ev":"phase_begin","round":1,"phase":3,"root":25}
+{"ev":"phase_end","round":1,"phase":3,"root":25,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":4,"root":25}
+{"ev":"phase_end","round":1,"phase":4,"root":25,"spent":{"node_visits":7,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":5,"root":25}
+{"ev":"phase_end","round":1,"phase":5,"root":25,"spent":{"node_visits":7,"pass_work":23}}
+{"ev":"phase_begin","round":1,"phase":6,"root":25}
+{"ev":"phase_end","round":1,"phase":6,"root":25,"spent":{"node_visits":7,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":7,"root":25}
+{"ev":"phase_end","round":1,"phase":7,"root":25,"spent":{"node_visits":7,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":8,"root":25}
+{"ev":"not_smaller","pass":"bitwise","node":12,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":1,"phase":8,"root":25,"spent":{"node_visits":7,"pass_work":12}}
+{"ev":"phase_begin","round":1,"phase":9,"root":25}
+{"ev":"phase_end","round":1,"phase":9,"root":25,"spent":{"node_visits":7,"pass_work":7}}
+{"ev":"phase_begin","round":1,"phase":10,"root":25}
+{"ev":"not_smaller","pass":"linear_mba","node":23,"candidate":null,"added":4,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"linear_mba","node":24,"candidate":null,"added":5,"freed":3,"shared":false}
+{"ev":"not_smaller","pass":"linear_mba","node":25,"candidate":null,"added":7,"freed":4,"shared":false}
+{"ev":"phase_end","round":1,"phase":10,"root":25,"spent":{"node_visits":7,"pass_work":55}}
+{"ev":"phase_begin","round":1,"phase":11,"root":25}
+{"ev":"phase_end","round":1,"phase":11,"root":25,"spent":{"node_visits":7,"pass_work":132}}
+{"ev":"phase_begin","round":1,"phase":12,"root":25}
+{"ev":"phase_end","round":1,"phase":12,"root":25,"spent":{"node_visits":7,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":13,"root":25}
+{"ev":"phase_end","round":1,"phase":13,"root":25,"spent":{"node_visits":5,"pass_work":18}}
+{"ev":"phase_begin","round":1,"phase":14,"root":25}
+{"ev":"phase_end","round":1,"phase":14,"root":25,"spent":{}}
+{"result":0,"input":15,"expr":25,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":288,"memo_hits":17,"candidates":16,"match_steps":71,"no_match":3,"guard_false":9,"degraded":0,"no_change":0,"rewrites":5,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":10,"fact_work":21,"pass_work":1518,"rounds":2,"passes":{"bitwise":{"calls":11,"noop":0,"changed":0,"rejected_cost":2,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":19,"noop":17,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":11,"noop":0,"changed":0,"rejected_cost":6,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":11,"noop":0,"changed":0,"rejected_cost":4,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":6,"noop":0,"changed":1,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":11,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":11,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":2,"steps":6250,"cache_hits":1,"simplified":1,"no_simpler":2,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":1,"proved":1,"refuted":0,"unknown":0,"signature":1,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":4,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"rule":1,"name":"core.recovery_canonical::xor_sign_bit_add","id":"f18d342b0c28847a665ac1f8629c0834","kind":"rule","proven":true,"examples":[["(p ^ 128) + 128","p"]],"source":"rule xor_sign_bit_add<W>(x: W) { (x ^ bit(W - 1)) + bit(W - 1) => x }","ledger":"rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":2,"name":"core.guarded_recovery::increment_boolean","id":"cb487c5a0ad51813425d4989d024e1dd","kind":"rule","proven":true,"examples":[["p:1 + 1:1","~p:1"]],"source":"rule increment_boolean(x: 1) { x + 1 => ~x }","ledger":"rule exhaustive(inst=1,maxw=1,cases=2,fired=2,complete) sampled(inst=1,cases=64,fired=64)"}
+{"rule":3,"name":"core.shift_canonical::xor_double_const","id":"f8b7cd67abbe4487834a05877680d74c","kind":"rule","proven":true,"examples":[["(p + p) ^ 6","(p ^ 3) << 1"]],"source":"rule xor_double_const<W>(x: W, m: const W) {\n        (x + x) ^ m => (x ^ c) << 1 if (m & 1) == 0 && one_use(x + x) let c: W = m >>u 1\n    }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=2730) sampled(inst=22,cases=1408,fired=685)"}
+{"node":3,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":0,"op":"const","value":"0x5a","w":32}
+{"node":4,"op":"xor","w":32,"args":[3,0],"text":"x ^ 90","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":2,"op":"const","value":"0x3","w":32,"text":"3:32","facts":{"zero":"0xfffffffc","one":"0x3","u":["0x3","0x3"],"stride":0,"s":["0x3","0x3"]}}
+{"node":5,"op":"add","w":32,"args":[4,2],"text":"(x ^ 90) + 3","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":1,"op":"const","value":"0xfffffffd","w":32,"text":"-3:32","facts":{"zero":"0x2","one":"0xfffffffd","u":["0xfffffffd","0xfffffffd"],"stride":0,"s":["0xfffffffd","0xfffffffd"]}}
+{"node":6,"op":"add","w":32,"args":[5,1],"text":"(x ^ 90) + 3 - 3","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":7,"op":"xor","w":32,"args":[6,0],"text":"(x ^ 90) + 3 - 3 ^ 90","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":8,"op":"xor","w":32,"args":[4,0],"text":"x ^ 90 ^ 90","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"ev":"root","index":0,"root":7}
+{"ev":"phase_begin","round":0,"phase":0,"root":7}
+{"ev":"phase_end","round":0,"phase":0,"root":7,"spent":{"node_visits":12,"fact_work":8,"pass_work":8}}
+{"ev":"phase_begin","round":0,"phase":1,"root":7}
+{"ev":"candidate","rule":0,"node":5}
+{"ev":"guard_false","rule":0,"node":5,"pred":"disjoint","args":[4,2]}
+{"ev":"candidate","rule":1,"node":5}
+{"ev":"no_match","rule":1,"node":5}
+{"ev":"candidate","rule":2,"node":5}
+{"ev":"no_match","rule":2,"node":5}
+{"ev":"candidate","rule":0,"node":6}
+{"ev":"guard_false","rule":0,"node":6,"pred":"disjoint","args":[5,1]}
+{"ev":"candidate","rule":2,"node":6}
+{"ev":"no_match","rule":2,"node":6}
+{"ev":"candidate","rule":3,"node":7}
+{"ev":"no_match","rule":3,"node":7}
+{"ev":"phase_end","round":0,"phase":1,"root":7,"spent":{"node_visits":12,"candidates":6,"match_steps":23,"pass_work":8}}
+{"ev":"phase_begin","round":0,"phase":2,"root":7}
+{"ev":"not_smaller","pass":"linear","node":5,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"applied","pass":"linear","before":6,"after":4}
+{"ev":"explain","pass":"linear","node":6,"why":{"kind":"linear","konst":"0x0","terms":[[4,"0x1"]]}}
+{"ev":"phase_end","round":0,"phase":2,"root":8,"spent":{"node_visits":13,"rewrites":1,"new_nodes":1,"pass_work":34}}
+{"ev":"phase_begin","round":0,"phase":3,"root":8}
+{"ev":"not_smaller","pass":"xor","node":4,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"applied","pass":"xor","before":8,"after":3}
+{"ev":"explain","pass":"xor","node":8,"why":{"kind":"xor","konst":"0x0","terms":[[3,"0xffffffff"]]}}
+{"ev":"phase_end","round":0,"phase":3,"root":3,"spent":{"node_visits":6,"rewrites":1,"pass_work":20}}
+{"ev":"phase_begin","round":0,"phase":4,"root":3}
+{"ev":"phase_end","round":0,"phase":4,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":5,"root":3}
+{"ev":"phase_end","round":0,"phase":5,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":6,"root":3}
+{"ev":"phase_end","round":0,"phase":6,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":7,"root":3}
+{"ev":"phase_end","round":0,"phase":7,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":8,"root":3}
+{"ev":"phase_end","round":0,"phase":8,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":9,"root":3}
+{"ev":"phase_end","round":0,"phase":9,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":10,"root":3}
+{"ev":"phase_end","round":0,"phase":10,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":11,"root":3}
+{"ev":"phase_end","round":0,"phase":11,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":12,"root":3}
+{"ev":"phase_end","round":0,"phase":12,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":13,"root":3}
+{"ev":"phase_end","round":0,"phase":13,"root":3,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":14,"root":3}
+{"ev":"phase_end","round":0,"phase":14,"root":3,"spent":{"node_visits":1}}
+{"ev":"phase_begin","round":1,"phase":0,"root":3}
+{"ev":"phase_end","round":1,"phase":0,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":1,"root":3}
+{"ev":"phase_end","round":1,"phase":1,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":3}
+{"ev":"phase_end","round":1,"phase":2,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":3}
+{"ev":"phase_end","round":1,"phase":3,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":3}
+{"ev":"phase_end","round":1,"phase":4,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":3}
+{"ev":"phase_end","round":1,"phase":5,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":3}
+{"ev":"phase_end","round":1,"phase":6,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":3}
+{"ev":"phase_end","round":1,"phase":7,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":3}
+{"ev":"phase_end","round":1,"phase":8,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":3}
+{"ev":"phase_end","round":1,"phase":9,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":3}
+{"ev":"phase_end","round":1,"phase":10,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":3}
+{"ev":"phase_end","round":1,"phase":11,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":3}
+{"ev":"phase_end","round":1,"phase":12,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":3}
+{"ev":"phase_end","round":1,"phase":13,"root":3,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":3}
+{"ev":"phase_end","round":1,"phase":14,"root":3,"spent":{}}
+{"result":0,"input":7,"expr":3,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":54,"memo_hits":17,"candidates":6,"match_steps":23,"no_match":4,"guard_false":2,"degraded":0,"no_change":0,"rewrites":2,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":1,"fact_work":8,"pass_work":80,"rounds":2,"passes":{"bitwise":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":8,"noop":5,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":8,"noop":0,"changed":1,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":4,"noop":0,"changed":1,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.sign::xor_lshr_signs","id":"4593d16a8aafa26bda98589a0df02814","kind":"rule","proven":true,"doc":"The xor of two sign bits shifted down is the sign bit of the xor.","examples":[["(p >>u 7) ^ (q >>u 7)","(p ^ q) >>u 7"]],"source":"rule xor_lshr_signs<W>(x: W, y: W) {\n        (x >>u (W - 1)) ^ (y >>u (W - 1)) => (x ^ y) >>u (W - 1)\n    }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":1,"name":"core.select_idioms::select_by_xor_mask","id":"b6c8a35d5bde660c11f792433caf20d7","kind":"rule","proven":true,"doc":"Choosing by a mask with xor: `y ^ ((x ^ y) & m)`.","examples":[["q ^ ((p ^ q) & sext<8>(r:1))","select(r:1, p, q)"]],"source":"rule select_by_xor_mask<W>(c: 1, x: W, y: W) where 1 < W {\n        ((x ^ y) & sext<W>(c)) ^ y => select(c, x, y)\n    }","ledger":"rule exhaustive(inst=5,maxw=6,cases=10912,fired=10912) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":2,"name":"core.sign::slt_from_flags_word","id":"b2d108eb76f2ddf5509b3eab7551bd01","kind":"rule","proven":true,"doc":"SF != OF as a 0 or 1 word.","examples":[["(p - q ^ ((p - q ^ p) & (p ^ q))) >>u 7","zext<8>(p <s q)"]],"source":"rule slt_from_flags_word<W>(a: W, b: W) where 1 < W {\n        ((a - b) ^ (((a - b) ^ a) & (a ^ b))) >>u (W - 1) => zext<W>(a <s b)\n    }","ledger":"rule exhaustive(inst=5,maxw=6,cases=5456,fired=5456) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":3,"name":"core.sign_tests::zext_negative","id":"2e17d7a859df4dfa4d8de2fb605a7f00","kind":"rule","proven":true,"doc":"The sign bit of `x` as a word: `x >>u (W - 1)`.","examples":[["zext<8>(p <s 0)","p >>u 7"]],"source":"rule zext_negative<W>(x: W) where 1 < W { zext<W>(x <s 0) => x >>u (W - 1) }","ledger":"rule exhaustive(inst=5,maxw=6,cases=124,fired=124) sampled(inst=22,cases=1408,fired=1408)"}
+{"node":2,"op":"sym","name":"a","w":32}
+{"node":1,"op":"sym","name":"b","w":32}
+{"node":4,"op":"sub","w":32,"args":[2,1]}
+{"node":0,"op":"const","value":"0x1f","w":32}
+{"node":8,"op":"lshr","w":32,"args":[4,0]}
+{"node":5,"op":"xor","w":32,"args":[4,2]}
+{"node":3,"op":"xor","w":32,"args":[2,1]}
+{"node":6,"op":"and","w":32,"args":[5,3]}
+{"node":7,"op":"lshr","w":32,"args":[6,0]}
+{"node":9,"op":"xor","w":32,"args":[8,7],"text":"let %0 = a - b;\n%0 >>u 31 ^ ((%0 ^ a) & (a ^ b)) >>u 31","facts":{"zero":"0xfffffffe","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x0","0x1"]}}
+{"node":14,"op":"cmp","pred":"<s","w":1,"args":[2,1]}
+{"node":15,"op":"zext","w":32,"args":[14],"text":"zext<32>(a <s b)","facts":{"zero":"0xfffffffe","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x0","0x1"]}}
+{"node":10,"op":"xor","w":32,"args":[4,6],"text":"let %0 = a - b;\n%0 ^ (%0 ^ a) & (a ^ b)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":13,"op":"lshr","w":32,"args":[10,0],"text":"let %0 = a - b;\n(%0 ^ (%0 ^ a) & (a ^ b)) >>u 31","facts":{"zero":"0xfffffffe","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x0","0x1"]}}
+{"ev":"root","index":0,"root":9}
+{"ev":"phase_begin","round":0,"phase":0,"root":9}
+{"ev":"phase_end","round":0,"phase":0,"root":9,"spent":{"node_visits":15,"fact_work":10,"pass_work":10}}
+{"ev":"phase_begin","round":0,"phase":1,"root":9}
+{"ev":"candidate","rule":0,"node":9}
+{"ev":"applied","rule":0,"before":9,"after":13}
+{"ev":"candidate","rule":1,"node":10}
+{"ev":"no_match","rule":1,"node":10}
+{"ev":"candidate","rule":2,"node":13}
+{"ev":"applied","rule":2,"before":13,"after":15}
+{"ev":"candidate","rule":3,"node":15}
+{"ev":"no_match","rule":3,"node":15}
+{"ev":"phase_end","round":0,"phase":1,"root":15,"spent":{"node_visits":21,"candidates":4,"match_steps":43,"rewrites":2,"new_nodes":6}}
+{"ev":"phase_begin","round":0,"phase":2,"root":15}
+{"ev":"phase_end","round":0,"phase":2,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":3,"root":15}
+{"ev":"phase_end","round":0,"phase":3,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":4,"root":15}
+{"ev":"phase_end","round":0,"phase":4,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":5,"root":15}
+{"ev":"phase_end","round":0,"phase":5,"root":15,"spent":{"node_visits":6,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":6,"root":15}
+{"ev":"phase_end","round":0,"phase":6,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":7,"root":15}
+{"ev":"phase_end","round":0,"phase":7,"root":15,"spent":{"node_visits":6,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":8,"root":15}
+{"ev":"phase_end","round":0,"phase":8,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":9,"root":15}
+{"ev":"phase_end","round":0,"phase":9,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":10,"root":15}
+{"ev":"phase_end","round":0,"phase":10,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":11,"root":15}
+{"ev":"phase_end","round":0,"phase":11,"root":15,"spent":{"node_visits":6,"new_nodes":1,"pass_work":38}}
+{"ev":"phase_begin","round":0,"phase":12,"root":15}
+{"ev":"phase_end","round":0,"phase":12,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":13,"root":15}
+{"ev":"phase_end","round":0,"phase":13,"root":15,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":0,"phase":14,"root":15}
+{"ev":"candidate","rule":3,"node":15}
+{"ev":"no_match","rule":3,"node":15}
+{"ev":"phase_end","round":0,"phase":14,"root":15,"spent":{"node_visits":6,"candidates":1,"match_steps":4}}
+{"ev":"phase_begin","round":1,"phase":0,"root":15}
+{"ev":"phase_end","round":1,"phase":0,"root":15,"spent":{"node_visits":3,"fact_work":2,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":1,"root":15}
+{"ev":"phase_end","round":1,"phase":1,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":15}
+{"ev":"phase_end","round":1,"phase":2,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":15}
+{"ev":"phase_end","round":1,"phase":3,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":15}
+{"ev":"phase_end","round":1,"phase":4,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":15}
+{"ev":"phase_end","round":1,"phase":5,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":15}
+{"ev":"phase_end","round":1,"phase":6,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":15}
+{"ev":"phase_end","round":1,"phase":7,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":15}
+{"ev":"phase_end","round":1,"phase":8,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":15}
+{"ev":"phase_end","round":1,"phase":9,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":15}
+{"ev":"phase_end","round":1,"phase":10,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":15}
+{"ev":"phase_end","round":1,"phase":11,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":15}
+{"ev":"phase_end","round":1,"phase":12,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":15}
+{"ev":"phase_end","round":1,"phase":13,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":15}
+{"ev":"phase_end","round":1,"phase":14,"root":15,"spent":{}}
+{"result":0,"input":9,"expr":15,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":117,"memo_hits":14,"candidates":5,"match_steps":47,"no_match":3,"guard_false":0,"degraded":0,"no_change":0,"rewrites":2,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":7,"fact_work":12,"pass_work":98,"rounds":2,"passes":{"bitwise":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":12,"noop":11,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":4,"noop":1,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":4,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"rule":1,"name":"core.bitwise::or_known_ones","id":"ac0b9516b1f47ebda223602957a6db4d","kind":"rule","proven":true,"doc":"Setting bits that are already set.","examples":[["(q | 0x81) | 1","q | 0x81"]],"source":"rule or_known_ones<W>(x: W, c: const W) { x | c => x if one_bits(x, c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=914)"}
+{"node":1,"op":"sym","name":"c","w":8,"text":"c","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x80","0x7f"]}}
+{"node":2,"op":"zext","w":32,"args":[1],"text":"zext<32>(c)","facts":{"zero":"0xffffff00","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x0","0xff"]}}
+{"node":0,"op":"const","value":"0x100","w":32,"text":"256:32","facts":{"zero":"0xfffffeff","one":"0x100","u":["0x100","0x100"],"stride":0,"s":["0x100","0x100"]}}
+{"node":3,"op":"add","w":32,"args":[2,0],"text":"zext<32>(c) + 256","facts":{"zero":"0xfffffe00","one":"0x100","u":["0x100","0x1ff"],"stride":1,"s":["0x100","0x1ff"]}}
+{"node":4,"op":"extract","lo":0,"w":8,"args":[3],"text":"trunc<8>(zext<32>(c) + 256)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x80","0x7f"]}}
+{"node":5,"op":"or","w":32,"args":[2,0],"text":"zext<32>(c) | 256","facts":{"zero":"0xfffffe00","one":"0x100","u":["0x100","0x1ff"],"stride":1,"s":["0x100","0x1ff"]}}
+{"node":6,"op":"extract","lo":0,"w":8,"args":[5],"text":"trunc<8>(zext<32>(c) | 256)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x80","0x7f"]}}
+{"ev":"root","index":0,"root":4}
+{"ev":"phase_begin","round":0,"phase":0,"root":4}
+{"ev":"phase_end","round":0,"phase":0,"root":4,"spent":{"node_visits":8,"fact_work":5,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":1,"root":4}
+{"ev":"candidate","rule":0,"node":3}
+{"ev":"applied","rule":0,"before":3,"after":5}
+{"ev":"candidate","rule":1,"node":5}
+{"ev":"guard_false","rule":1,"node":5,"pred":"one_bits","args":[2,0]}
+{"ev":"phase_end","round":0,"phase":1,"root":6,"spent":{"node_visits":10,"candidates":2,"match_steps":6,"rewrites":1,"new_nodes":2}}
+{"ev":"phase_begin","round":0,"phase":2,"root":6}
+{"ev":"not_smaller","pass":"linear","node":5,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":6,"spent":{"node_visits":8,"pass_work":14}}
+{"ev":"phase_begin","round":0,"phase":3,"root":6}
+{"ev":"not_smaller","pass":"xor","node":5,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"phase_end","round":0,"phase":3,"root":6,"spent":{"node_visits":8,"pass_work":14}}
+{"ev":"phase_begin","round":0,"phase":4,"root":6}
+{"ev":"applied","pass":"casts","before":6,"after":1}
+{"ev":"explain","pass":"casts","node":6,"why":{"kind":"casts","source":5,"lo":0,"bits":8,"sign_extended":false}}
+{"ev":"phase_end","round":0,"phase":4,"root":1,"spent":{"node_visits":8,"rewrites":1,"new_nodes":1,"pass_work":19}}
+{"ev":"phase_begin","round":0,"phase":5,"root":1}
+{"ev":"phase_end","round":0,"phase":5,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":6,"root":1}
+{"ev":"phase_end","round":0,"phase":6,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":7,"root":1}
+{"ev":"phase_end","round":0,"phase":7,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":8,"root":1}
+{"ev":"phase_end","round":0,"phase":8,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":9,"root":1}
+{"ev":"phase_end","round":0,"phase":9,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":10,"root":1}
+{"ev":"phase_end","round":0,"phase":10,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":11,"root":1}
+{"ev":"phase_end","round":0,"phase":11,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":12,"root":1}
+{"ev":"phase_end","round":0,"phase":12,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":13,"root":1}
+{"ev":"phase_end","round":0,"phase":13,"root":1,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":14,"root":1}
+{"ev":"phase_end","round":0,"phase":14,"root":1,"spent":{"node_visits":1}}
+{"ev":"phase_begin","round":1,"phase":0,"root":1}
+{"ev":"phase_end","round":1,"phase":0,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":1,"root":1}
+{"ev":"phase_end","round":1,"phase":1,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":1}
+{"ev":"phase_end","round":1,"phase":2,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":1}
+{"ev":"phase_end","round":1,"phase":3,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":1}
+{"ev":"phase_end","round":1,"phase":4,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":1}
+{"ev":"phase_end","round":1,"phase":5,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":1}
+{"ev":"phase_end","round":1,"phase":6,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":1}
+{"ev":"phase_end","round":1,"phase":7,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":1}
+{"ev":"phase_end","round":1,"phase":8,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":1}
+{"ev":"phase_end","round":1,"phase":9,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":1}
+{"ev":"phase_end","round":1,"phase":10,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":1}
+{"ev":"phase_end","round":1,"phase":11,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":1}
+{"ev":"phase_end","round":1,"phase":12,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":1}
+{"ev":"phase_end","round":1,"phase":13,"root":1,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":1}
+{"ev":"phase_end","round":1,"phase":14,"root":1,"spent":{}}
+{"result":0,"input":4,"expr":1,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":52,"memo_hits":16,"candidates":2,"match_steps":6,"no_match":0,"guard_false":1,"degraded":0,"no_change":0,"rewrites":2,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":3,"fact_work":5,"pass_work":61,"rounds":2,"passes":{"bitwise":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":5,"noop":0,"changed":1,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":5,"noop":4,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":5,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":5,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.compare::ult_one","id":"2aed343e84cf6eef6c63488913bf5f5e","kind":"rule","proven":true,"doc":"Below one is zero.","examples":[["p <u 1","p == 0"]],"source":"rule ult_one<W>(x: W) { x <u 1 => x == 0 }","ledger":"rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":1,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"rule":2,"name":"core.guarded_recovery::increment_boolean","id":"cb487c5a0ad51813425d4989d024e1dd","kind":"rule","proven":true,"examples":[["p:1 + 1:1","~p:1"]],"source":"rule increment_boolean(x: 1) { x + 1 => ~x }","ledger":"rule exhaustive(inst=1,maxw=1,cases=2,fired=2,complete) sampled(inst=1,cases=64,fired=64)"}
+{"rule":3,"name":"core.recovery_compare::ule_add_carry","id":"db11312c1c1f6aa3198a77f33167ec6e","kind":"rule","proven":true,"examples":[["(p + q) <=u q","-p <=u q"]],"source":"rule ule_add_carry<W>(x: W, y: W) { (x + y) <=u y => -x <=u y }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":4,"name":"core.recovery_canonical::ule_constant_borrow","id":"15f51e06628836a54b64ad1b0e91685f","kind":"rule","proven":true,"examples":[["p + 255 <=u 254","1 <=u p"]],"source":"rule ule_constant_borrow<W>(x: W, c: const W, m: const W) {\n        (x + c) <=u m => k <=u x if m == c - 1 let k: W = -c\n    }","ledger":"rule exhaustive(inst=5,maxw=5,cases=37448,fired=1364) sampled(inst=22,cases=1408,fired=44)"}
+{"node":0,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":3,"op":"const","value":"0xa","w":32}
+{"node":4,"op":"cmp","pred":"<u","w":1,"args":[0,3],"text":"x <u 10","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":1,"op":"const","value":"0x3","w":32}
+{"node":2,"op":"cmp","pred":"<u","w":1,"args":[1,0],"text":"3 <u x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":5,"op":"and","w":1,"args":[4,2],"text":"(x <u 10) & (3 <u x)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":10,"op":"const","value":"0xfffffffc","w":32,"text":"-4:32","facts":{"zero":"0x3","one":"0xfffffffc","u":["0xfffffffc","0xfffffffc"],"stride":0,"s":["0xfffffffc","0xfffffffc"]}}
+{"node":11,"op":"add","w":32,"args":[0,10],"text":"x - 4","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":12,"op":"const","value":"0x5","w":32,"text":"5:32","facts":{"zero":"0xfffffffa","one":"0x5","u":["0x5","0x5"],"stride":0,"s":["0x5","0x5"]}}
+{"node":13,"op":"cmp","pred":"<=u","w":1,"args":[11,12],"text":"x - 4 <=u 5","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":6,"op":"const","value":"0x4","w":32}
+{"node":7,"op":"cmp","pred":"<=u","w":1,"args":[6,0],"text":"4 <=u x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":8,"op":"const","value":"0x9","w":32}
+{"node":9,"op":"cmp","pred":"<=u","w":1,"args":[0,8],"text":"x <=u 9","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"ev":"root","index":0,"root":5}
+{"ev":"phase_begin","round":0,"phase":0,"root":5}
+{"ev":"phase_end","round":0,"phase":0,"root":5,"spent":{"node_visits":9,"fact_work":6,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":1,"root":5}
+{"ev":"candidate","rule":0,"node":4}
+{"ev":"no_match","rule":0,"node":4}
+{"ev":"phase_end","round":0,"phase":1,"root":5,"spent":{"node_visits":9,"candidates":1,"match_steps":3}}
+{"ev":"phase_begin","round":0,"phase":2,"root":5}
+{"ev":"phase_end","round":0,"phase":2,"root":5,"spent":{"node_visits":9,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":3,"root":5}
+{"ev":"phase_end","round":0,"phase":3,"root":5,"spent":{"node_visits":9,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":4,"root":5}
+{"ev":"phase_end","round":0,"phase":4,"root":5,"spent":{"node_visits":9,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":5,"root":5}
+{"ev":"phase_end","round":0,"phase":5,"root":5,"spent":{"node_visits":9,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":6,"root":5}
+{"ev":"phase_end","round":0,"phase":6,"root":5,"spent":{"node_visits":9,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":7,"root":5}
+{"ev":"not_smaller","pass":"compares","node":2,"candidate":7,"added":2,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"compares","node":4,"candidate":9,"added":2,"freed":2,"shared":false}
+{"ev":"applied","pass":"compares","before":5,"after":13}
+{"ev":"explain","pass":"compares","node":5,"why":{"kind":"intervals","x":0,"set":[["0x4","0x9"]]}}
+{"ev":"phase_end","round":0,"phase":7,"root":13,"spent":{"node_visits":15,"rewrites":1,"new_nodes":8,"pass_work":58}}
+{"ev":"phase_begin","round":0,"phase":8,"root":13}
+{"ev":"phase_end","round":0,"phase":8,"root":13,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":9,"root":13}
+{"ev":"phase_end","round":0,"phase":9,"root":13,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":10,"root":13}
+{"ev":"phase_end","round":0,"phase":10,"root":13,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":11,"root":13}
+{"ev":"phase_end","round":0,"phase":11,"root":13,"spent":{"node_visits":7,"pass_work":69}}
+{"ev":"phase_begin","round":0,"phase":12,"root":13}
+{"ev":"phase_end","round":0,"phase":12,"root":13,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":13,"root":13}
+{"ev":"phase_end","round":0,"phase":13,"root":13,"spent":{"node_visits":7,"pass_work":10}}
+{"ev":"phase_begin","round":0,"phase":14,"root":13}
+{"ev":"candidate","rule":1,"node":11}
+{"ev":"guard_false","rule":1,"node":11,"pred":"disjoint","args":[0,10]}
+{"ev":"candidate","rule":2,"node":11}
+{"ev":"no_match","rule":2,"node":11}
+{"ev":"candidate","rule":3,"node":13}
+{"ev":"no_match","rule":3,"node":13}
+{"ev":"candidate","rule":4,"node":13}
+{"ev":"guard_false","rule":4,"node":13,"pred":"==","args":[12,null]}
+{"ev":"phase_end","round":0,"phase":14,"root":13,"spent":{"node_visits":7,"candidates":4,"match_steps":17}}
+{"ev":"phase_begin","round":1,"phase":0,"root":13}
+{"ev":"phase_end","round":1,"phase":0,"root":13,"spent":{"node_visits":6,"fact_work":4,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":1,"root":13}
+{"ev":"candidate","rule":1,"node":11}
+{"ev":"guard_false","rule":1,"node":11,"pred":"disjoint","args":[0,10]}
+{"ev":"candidate","rule":2,"node":11}
+{"ev":"no_match","rule":2,"node":11}
+{"ev":"candidate","rule":3,"node":13}
+{"ev":"no_match","rule":3,"node":13}
+{"ev":"candidate","rule":4,"node":13}
+{"ev":"guard_false","rule":4,"node":13,"pred":"==","args":[12,null]}
+{"ev":"phase_end","round":1,"phase":1,"root":13,"spent":{"node_visits":6,"candidates":4,"match_steps":17}}
+{"ev":"phase_begin","round":1,"phase":2,"root":13}
+{"ev":"not_smaller","pass":"linear","node":11,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"phase_end","round":1,"phase":2,"root":13,"spent":{"node_visits":6,"pass_work":11}}
+{"ev":"phase_begin","round":1,"phase":3,"root":13}
+{"ev":"phase_end","round":1,"phase":3,"root":13,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":4,"root":13}
+{"ev":"phase_end","round":1,"phase":4,"root":13,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":5,"root":13}
+{"ev":"phase_end","round":1,"phase":5,"root":13,"spent":{"node_visits":6,"pass_work":6}}
+{"ev":"phase_begin","round":1,"phase":6,"root":13}
+{"ev":"phase_end","round":1,"phase":6,"root":13,"spent":{"node_visits":6,"pass_work":4}}
+{"ev":"phase_begin","round":1,"phase":7,"root":13}
+{"ev":"phase_end","round":1,"phase":7,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":13}
+{"ev":"phase_end","round":1,"phase":8,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":13}
+{"ev":"phase_end","round":1,"phase":9,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":13}
+{"ev":"phase_end","round":1,"phase":10,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":13}
+{"ev":"phase_end","round":1,"phase":11,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":13}
+{"ev":"phase_end","round":1,"phase":12,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":13}
+{"ev":"phase_end","round":1,"phase":13,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":13}
+{"ev":"phase_end","round":1,"phase":14,"root":13,"spent":{}}
+{"result":0,"input":5,"expr":13,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":169,"memo_hits":8,"candidates":9,"match_steps":37,"no_match":5,"guard_false":4,"degraded":0,"no_change":0,"rewrites":1,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":8,"fact_work":10,"pass_work":227,"rounds":2,"passes":{"bitwise":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":10,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":10,"noop":0,"changed":1,"rejected_cost":2,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":10,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":10,"noop":6,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":10,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":10,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":10,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"node":1,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":0,"op":"sym","name":"y","w":32,"text":"y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":4,"op":"cmp","pred":"!=","w":1,"args":[1,0]}
+{"node":3,"op":"cmp","pred":"<=u","w":1,"args":[1,0]}
+{"node":5,"op":"and","w":1,"args":[4,3],"text":"(x != y) & (x <=u y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":2,"op":"cmp","pred":"<s","w":1,"args":[1,0]}
+{"node":6,"op":"and","w":1,"args":[5,2],"text":"(x != y) & (x <=u y) & (x <s y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":7,"op":"cmp","pred":"<u","w":1,"args":[1,0],"text":"x <u y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":8,"op":"and","w":1,"args":[7,2],"text":"(x <u y) & (x <s y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"ev":"root","index":0,"root":6}
+{"ev":"phase_begin","round":0,"phase":0,"root":6}
+{"ev":"phase_end","round":0,"phase":0,"root":6,"spent":{"node_visits":10,"fact_work":7,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":1,"root":6}
+{"ev":"phase_end","round":0,"phase":1,"root":6,"spent":{"node_visits":10}}
+{"ev":"phase_begin","round":0,"phase":2,"root":6}
+{"ev":"phase_end","round":0,"phase":2,"root":6,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":3,"root":6}
+{"ev":"phase_end","round":0,"phase":3,"root":6,"spent":{"node_visits":10,"pass_work":9}}
+{"ev":"phase_begin","round":0,"phase":4,"root":6}
+{"ev":"phase_end","round":0,"phase":4,"root":6,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":5,"root":6}
+{"ev":"phase_end","round":0,"phase":5,"root":6,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":6,"root":6}
+{"ev":"phase_end","round":0,"phase":6,"root":6,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":7,"root":6}
+{"ev":"applied","pass":"compares","before":5,"after":7}
+{"ev":"explain","pass":"compares","node":5,"why":{"kind":"relations","x":0,"y":1,"set":24}}
+{"ev":"phase_end","round":0,"phase":7,"root":8,"spent":{"node_visits":12,"rewrites":1,"new_nodes":2,"pass_work":39}}
+{"ev":"phase_begin","round":0,"phase":8,"root":8}
+{"ev":"not_smaller","pass":"bitwise","node":8,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":8,"root":8,"spent":{"node_visits":7,"pass_work":12}}
+{"ev":"phase_begin","round":0,"phase":9,"root":8}
+{"ev":"phase_end","round":0,"phase":9,"root":8,"spent":{"node_visits":7,"pass_work":8}}
+{"ev":"phase_begin","round":0,"phase":10,"root":8}
+{"ev":"phase_end","round":0,"phase":10,"root":8,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":11,"root":8}
+{"ev":"phase_end","round":0,"phase":11,"root":8,"spent":{"node_visits":7,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":12,"root":8}
+{"ev":"phase_end","round":0,"phase":12,"root":8,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":13,"root":8}
+{"ev":"phase_end","round":0,"phase":13,"root":8,"spent":{"node_visits":7,"pass_work":8}}
+{"ev":"phase_begin","round":0,"phase":14,"root":8}
+{"ev":"phase_end","round":0,"phase":14,"root":8,"spent":{"node_visits":7}}
+{"ev":"phase_begin","round":1,"phase":0,"root":8}
+{"ev":"phase_end","round":1,"phase":0,"root":8,"spent":{"node_visits":3,"fact_work":2,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":1,"root":8}
+{"ev":"phase_end","round":1,"phase":1,"root":8,"spent":{"node_visits":3}}
+{"ev":"phase_begin","round":1,"phase":2,"root":8}
+{"ev":"phase_end","round":1,"phase":2,"root":8,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":3,"root":8}
+{"ev":"phase_end","round":1,"phase":3,"root":8,"spent":{"node_visits":3,"pass_work":3}}
+{"ev":"phase_begin","round":1,"phase":4,"root":8}
+{"ev":"phase_end","round":1,"phase":4,"root":8,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":5,"root":8}
+{"ev":"phase_end","round":1,"phase":5,"root":8,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":6,"root":8}
+{"ev":"phase_end","round":1,"phase":6,"root":8,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":7,"root":8}
+{"ev":"phase_end","round":1,"phase":7,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":8}
+{"ev":"phase_end","round":1,"phase":8,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":8}
+{"ev":"phase_end","round":1,"phase":9,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":8}
+{"ev":"phase_end","round":1,"phase":10,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":8}
+{"ev":"phase_end","round":1,"phase":11,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":8}
+{"ev":"phase_end","round":1,"phase":12,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":8}
+{"ev":"phase_end","round":1,"phase":13,"root":8,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":8}
+{"ev":"phase_end","round":1,"phase":14,"root":8,"spent":{}}
+{"result":0,"input":6,"expr":8,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":152,"memo_hits":8,"candidates":0,"match_steps":0,"no_match":0,"guard_false":0,"degraded":0,"no_change":0,"rewrites":1,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":2,"fact_work":9,"pass_work":140,"rounds":2,"passes":{"bitwise":{"calls":5,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":9,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":8,"noop":0,"changed":1,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":9,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":9,"noop":9,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":9,"noop":1,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":9,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":5,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":9,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.bitwise::and_mask_redundant","id":"4b04f26d37d4b772c21cf6f7c3c3c8dd","kind":"rule","proven":true,"doc":"A mask that keeps every bit the value may have set.","examples":[["(q & 15) & 0x3f","q & 15"]],"source":"rule and_mask_redundant<W>(x: W, c: const W) { x & c => x if zero_bits(x, ~c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=926)"}
+{"rule":1,"name":"core.bitwise::and_mask_disjoint","id":"724ff9a4b679b662432c8d23dcd9fb85","kind":"rule","proven":true,"doc":"A mask that keeps none of the bits the value may have set.","examples":[["(q & 0xf0) & 15","0:8"]],"source":"rule and_mask_disjoint<W>(x: W, c: const W) { x & c => 0 if zero_bits(x, c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=982)"}
+{"rule":2,"name":"core.shift_canonical::shl_mask_dead","id":"b687f5007019479c0957cd7cf5afab11","kind":"rule","proven":true,"doc":"A mask that keeps every bit the shift keeps.","examples":[["(p & 63) << 2","p << 2"]],"source":"rule shl_mask_dead<W>(x: W, c: const W, k: const W) {\n        (x & c) << k => x << k if (c | ~(ones >>u k)) == ones\n    }","ledger":"rule exhaustive(inst=5,maxw=5,cases=37448,fired=32378) sampled(inst=22,cases=1408,fired=1104)"}
+{"rule":3,"name":"core.bitwise::or_absorb_and","id":"0575f368bd8b21ed6f428408bf9277b9","kind":"rule","proven":true,"doc":"Absorption.","examples":[["(q & p) | p","p"]],"source":"rule or_absorb_and<W>(x: W, y: W) { x | (x & y) => x }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":4,"name":"core.guarded_recovery::recombine_shifted_field_or","id":"8f9b6c7b8382124830bab5f753252d29","kind":"rule","proven":true,"examples":[["(p & 15) | (((p >>u 4) + q) << 4)","p + (q << 4)"]],"source":"rule recombine_shifted_field_or<W>(x: W, a: W, m: const W, k: const W) {\n        (x & m) | (((x >>u k) + a) << k) => (x & keep) + (a << k)\n        if (k <=u W) && (m & (ones << k)) == 0\n        let keep: W = (ones << k) | m\n    }","ledger":"rule exhaustive(inst=4,maxw=4,cases=69904,fired=9020) sampled(inst=22,cases=1408,fired=75)"}
+{"rule":5,"name":"core.guarded_recovery::split_mask_or_or","id":"3ebe1198631e1087ddabb16a6b70547c","kind":"rule","proven":true,"examples":[["(p & 240) | ((p & 2) | 1)","(p & 242) | 1"]],"source":"rule split_mask_or_or<W>(x: W, c: W, m: const W, n: const W) {\n        (x & m) | ((x & n) | c) => (x & k) | c let k: W = m | n\n    }","ledger":"rule exhaustive(inst=4,maxw=4,cases=69904,fired=69904) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":6,"name":"core.guarded_recovery_shuffle::recombine_extracted_field","id":"b550746379b99aa58a2c5bb6c72922e1","kind":"rule","proven":true,"examples":[["concat(trunc<4>(zext<8>(extract<4,3>(p)) + q), trunc<4>(p))","(p & 127) + (q << 4)"]],"source":"rule recombine_extracted_field<N, K, M>(x: N + K, a: N + K) where M <= N, N + K <= 512 {\n        concat(trunc<N>(zext<N + K>(extract<K, M>(x)) + a), trunc<K>(x))\n        => (x & lowmask(K + M)) + (a << K)\n    }","ledger":"rule exhaustive(inst=76,maxw=8,cases=1728208,fired=1728208) sampled(inst=357,cases=22848,fired=22848)"}
+{"rule":7,"name":"core.guarded_recovery_shuffle::recombine_extracted_field_or","id":"3ce7db0c3329567af085c8376f7ddb39","kind":"rule","proven":true,"examples":[["concat(trunc<4>(zext<8>(extract<4,3>(p)) | q), trunc<4>(p))","(p & 127) | (q << 4)"]],"source":"rule recombine_extracted_field_or<N, K, M>(x: N + K, a: N + K) where M <= N, N + K <= 512 {\n        concat(trunc<N>(zext<N + K>(extract<K, M>(x)) | a), trunc<K>(x))\n        => (x & lowmask(K + M)) | (a << K)\n    }","ledger":"rule exhaustive(inst=76,maxw=8,cases=1728208,fired=1728208) sampled(inst=362,cases=23168,fired=23168)"}
+{"rule":8,"name":"core.concat::concat_assoc","id":"0494da654abf31f834943b492cac0041","kind":"rule","proven":true,"doc":"Concatenation associates; right nesting is the canonical one.","examples":[["concat(concat(p, q), r)","concat(p, concat(q, r))"]],"source":"rule concat_assoc<A, B, C>(x: A, y: B, z: C) { concat(concat(x, y), z) => concat(x, concat(y, z)) }","ledger":"rule exhaustive(inst=212,maxw=16,cases=1345016,fired=1345016) sampled(inst=371,cases=23744,fired=23744)"}
+{"node":2,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":8,"op":"const","value":"0xffff0000","w":32,"text":"-65536:32","facts":{"zero":"0xffff","one":"0xffff0000","u":["0xffff0000","0xffff0000"],"stride":0,"s":["0xffff0000","0xffff0000"]}}
+{"node":9,"op":"and","w":32,"args":[2,8],"text":"x & -65536","facts":{"zero":"0xffff","one":"0x0","u":["0x0","0xffff0000"],"stride":65536,"s":["0x80000000","0x7fff0000"]}}
+{"node":0,"op":"const","value":"0x8","w":32}
+{"node":5,"op":"lshr","w":32,"args":[2,0],"text":"x >>u 8","facts":{"zero":"0xff000000","one":"0x0","u":["0x0","0xffffff"],"stride":1,"s":["0x0","0xffffff"]}}
+{"node":1,"op":"const","value":"0xff","w":32,"text":"255:32","facts":{"zero":"0xffffff00","one":"0xff","u":["0xff","0xff"],"stride":0,"s":["0xff","0xff"]}}
+{"node":6,"op":"and","w":32,"args":[5,1],"text":"x >>u 8 & 255","facts":{"zero":"0xffffff00","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x0","0xff"]}}
+{"node":3,"op":"and","w":32,"args":[2,1],"text":"x & 255","facts":{"zero":"0xffffff00","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x0","0xff"]}}
+{"node":4,"op":"shl","w":32,"args":[3,0],"text":"(x & 255) << 8","facts":{"zero":"0xffff00ff","one":"0x0","u":["0x0","0xff00"],"stride":256,"s":["0x0","0xff00"]}}
+{"node":7,"op":"or","w":32,"args":[6,4],"text":"x >>u 8 & 255 | (x & 255) << 8","facts":{"zero":"0xffff0000","one":"0x0","u":["0x0","0xffff"],"stride":1,"s":["0x0","0xffff"]}}
+{"node":10,"op":"or","w":32,"args":[9,7],"text":"x & -65536 | (x >>u 8 & 255 | (x & 255) << 8)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":23,"op":"extract","lo":16,"w":16,"args":[2]}
+{"node":12,"op":"extract","lo":0,"w":8,"args":[2]}
+{"node":19,"op":"extract","lo":8,"w":8,"args":[2]}
+{"node":26,"op":"concat","w":16,"args":[12,19],"text":"concat(trunc<8>(x), extract<8, 8>(x))","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffff"],"stride":1,"s":["0x8000","0x7fff"]}}
+{"node":27,"op":"concat","w":32,"args":[23,26],"text":"concat(extract<16, 16>(x), concat(trunc<8>(x), extract<8, 8>(x)))","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":13,"op":"zext","w":24,"args":[12]}
+{"node":14,"op":"const","value":"0x0","w":8}
+{"node":15,"op":"concat","w":32,"args":[13,14],"text":"concat(zext<24>(trunc<8>(x)), 0:8)","facts":{"zero":"0xffff00ff","one":"0x0","u":["0x0","0xff00"],"stride":256,"s":["0x0","0xff00"]}}
+{"node":16,"op":"extract","lo":8,"w":24,"args":[2]}
+{"node":17,"op":"zext","w":32,"args":[16],"text":"zext<32>(extract<8, 24>(x))","facts":{"zero":"0xff000000","one":"0x0","u":["0x0","0xffffff"],"stride":1,"s":["0x0","0xffffff"]}}
+{"node":20,"op":"zext","w":32,"args":[19],"text":"zext<32>(extract<8, 8>(x))","facts":{"zero":"0xffffff00","one":"0x0","u":["0x0","0xff"],"stride":1,"s":["0x0","0xff"]}}
+{"node":21,"op":"concat","w":32,"args":[13,19],"text":"concat(zext<24>(trunc<8>(x)), extract<8, 8>(x))","facts":{"zero":"0xffff0000","one":"0x0","u":["0x0","0xffff"],"stride":1,"s":["0x0","0xffff"]}}
+{"node":22,"op":"or","w":32,"args":[9,21],"text":"x & -65536 | concat(zext<24>(trunc<8>(x)), extract<8, 8>(x))","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":24,"op":"concat","w":24,"args":[23,12],"text":"concat(extract<16, 16>(x), trunc<8>(x))","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffff"],"stride":1,"s":["0x800000","0x7fffff"]}}
+{"node":25,"op":"concat","w":32,"args":[24,19],"text":"concat(concat(extract<16, 16>(x), trunc<8>(x)), extract<8, 8>(x))","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"ev":"root","index":0,"root":10}
+{"ev":"phase_begin","round":0,"phase":0,"root":10}
+{"ev":"phase_end","round":0,"phase":0,"root":10,"spent":{"node_visits":17,"fact_work":11,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":1,"root":10}
+{"ev":"candidate","rule":0,"node":3}
+{"ev":"guard_false","rule":0,"node":3,"pred":"zero_bits","args":[2,null]}
+{"ev":"candidate","rule":1,"node":3}
+{"ev":"guard_false","rule":1,"node":3,"pred":"zero_bits","args":[2,1]}
+{"ev":"candidate","rule":2,"node":4}
+{"ev":"guard_false","rule":2,"node":4,"pred":"==","args":[null,null]}
+{"ev":"candidate","rule":0,"node":6}
+{"ev":"guard_false","rule":0,"node":6,"pred":"zero_bits","args":[5,null]}
+{"ev":"candidate","rule":1,"node":6}
+{"ev":"guard_false","rule":1,"node":6,"pred":"zero_bits","args":[5,1]}
+{"ev":"candidate","rule":3,"node":7}
+{"ev":"no_match","rule":3,"node":7}
+{"ev":"candidate","rule":4,"node":7}
+{"ev":"no_match","rule":4,"node":7}
+{"ev":"candidate","rule":0,"node":9}
+{"ev":"guard_false","rule":0,"node":9,"pred":"zero_bits","args":[2,null]}
+{"ev":"candidate","rule":1,"node":9}
+{"ev":"guard_false","rule":1,"node":9,"pred":"zero_bits","args":[2,8]}
+{"ev":"candidate","rule":3,"node":10}
+{"ev":"no_match","rule":3,"node":10}
+{"ev":"candidate","rule":5,"node":10}
+{"ev":"no_match","rule":5,"node":10}
+{"ev":"phase_end","round":0,"phase":1,"root":10,"spent":{"node_visits":17,"candidates":11,"match_steps":58}}
+{"ev":"phase_begin","round":0,"phase":2,"root":10}
+{"ev":"not_smaller","pass":"linear","node":4,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":7,"candidate":null,"added":3,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":10,"candidate":null,"added":4,"freed":3,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":10,"spent":{"node_visits":17,"pass_work":35}}
+{"ev":"phase_begin","round":0,"phase":3,"root":10}
+{"ev":"not_smaller","pass":"xor","node":3,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"xor","node":6,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"xor","node":7,"candidate":null,"added":3,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"xor","node":9,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"xor","node":10,"candidate":null,"added":6,"freed":5,"shared":false}
+{"ev":"phase_end","round":0,"phase":3,"root":10,"spent":{"node_visits":17,"pass_work":44}}
+{"ev":"phase_begin","round":0,"phase":4,"root":10}
+{"ev":"phase_end","round":0,"phase":4,"root":10,"spent":{"node_visits":17,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":5,"root":10}
+{"ev":"phase_end","round":0,"phase":5,"root":10,"spent":{"node_visits":17,"pass_work":12}}
+{"ev":"phase_begin","round":0,"phase":6,"root":10}
+{"ev":"phase_end","round":0,"phase":6,"root":10,"spent":{"node_visits":17,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":7,"root":10}
+{"ev":"phase_end","round":0,"phase":7,"root":10,"spent":{"node_visits":17,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":8,"root":10}
+{"ev":"not_smaller","pass":"bitwise","node":3,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"bitwise","node":6,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"bitwise","node":7,"candidate":null,"added":2,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"bitwise","node":9,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":8,"root":10,"spent":{"node_visits":17,"pass_work":51}}
+{"ev":"phase_begin","round":0,"phase":9,"root":10}
+{"ev":"phase_end","round":0,"phase":9,"root":10,"spent":{"node_visits":17,"pass_work":69}}
+{"ev":"phase_begin","round":0,"phase":10,"root":10}
+{"ev":"phase_end","round":0,"phase":10,"root":10,"spent":{"node_visits":17,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":11,"root":10}
+{"ev":"not_smaller","pass":"shuffle","node":4,"candidate":15,"added":4,"freed":2,"shared":false}
+{"ev":"not_smaller","pass":"shuffle","node":5,"candidate":17,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"shuffle","node":6,"candidate":20,"added":2,"freed":2,"shared":true}
+{"ev":"applied","pass":"shuffle","before":7,"after":21}
+{"ev":"explain","pass":"shuffle","node":7,"why":{"kind":"shuffle","bits":[[2,8],[2,9],[2,10],[2,11],[2,12],[2,13],[2,14],[2,15],[2,0],[2,1],[2,2],[2,3],[2,4],[2,5],[2,6],[2,7],0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}}
+{"ev":"applied","pass":"shuffle","before":22,"after":25}
+{"ev":"explain","pass":"shuffle","node":22,"why":{"kind":"shuffle","bits":[[2,8],[2,9],[2,10],[2,11],[2,12],[2,13],[2,14],[2,15],[2,0],[2,1],[2,2],[2,3],[2,4],[2,5],[2,6],[2,7],[2,16],[2,17],[2,18],[2,19],[2,20],[2,21],[2,22],[2,23],[2,24],[2,25],[2,26],[2,27],[2,28],[2,29],[2,30],[2,31]]}}
+{"ev":"phase_end","round":0,"phase":11,"root":25,"spent":{"node_visits":29,"rewrites":2,"new_nodes":15,"pass_work":659}}
+{"ev":"phase_begin","round":0,"phase":12,"root":25}
+{"ev":"phase_end","round":0,"phase":12,"root":25,"spent":{"node_visits":9,"pass_work":9}}
+{"ev":"phase_begin","round":0,"phase":13,"root":25}
+{"ev":"phase_end","round":0,"phase":13,"root":25,"spent":{"node_visits":9,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":14,"root":25}
+{"ev":"candidate","rule":6,"node":24}
+{"ev":"no_match","rule":6,"node":24}
+{"ev":"candidate","rule":7,"node":24}
+{"ev":"no_match","rule":7,"node":24}
+{"ev":"candidate","rule":8,"node":25}
+{"ev":"applied","rule":8,"before":25,"after":27}
+{"ev":"candidate","rule":6,"node":26}
+{"ev":"no_match","rule":6,"node":26}
+{"ev":"candidate","rule":7,"node":26}
+{"ev":"no_match","rule":7,"node":26}
+{"ev":"phase_end","round":0,"phase":14,"root":27,"spent":{"node_visits":12,"candidates":5,"match_steps":15,"rewrites":1,"new_nodes":2}}
+{"ev":"phase_begin","round":1,"phase":0,"root":27}
+{"ev":"phase_end","round":1,"phase":0,"root":27,"spent":{"node_visits":7,"fact_work":5,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":1,"root":27}
+{"ev":"candidate","rule":6,"node":26}
+{"ev":"no_match","rule":6,"node":26}
+{"ev":"candidate","rule":7,"node":26}
+{"ev":"no_match","rule":7,"node":26}
+{"ev":"phase_end","round":1,"phase":1,"root":27,"spent":{"node_visits":7,"candidates":2,"match_steps":6}}
+{"ev":"phase_begin","round":1,"phase":2,"root":27}
+{"ev":"phase_end","round":1,"phase":2,"root":27,"spent":{"node_visits":7,"pass_work":7}}
+{"ev":"phase_begin","round":1,"phase":3,"root":27}
+{"ev":"phase_end","round":1,"phase":3,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":4,"root":27}
+{"ev":"phase_end","round":1,"phase":4,"root":27,"spent":{"node_visits":7,"pass_work":8}}
+{"ev":"phase_begin","round":1,"phase":5,"root":27}
+{"ev":"phase_end","round":1,"phase":5,"root":27,"spent":{"node_visits":7,"pass_work":8}}
+{"ev":"phase_begin","round":1,"phase":6,"root":27}
+{"ev":"phase_end","round":1,"phase":6,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":7,"root":27}
+{"ev":"phase_end","round":1,"phase":7,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":8,"root":27}
+{"ev":"phase_end","round":1,"phase":8,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":9,"root":27}
+{"ev":"phase_end","round":1,"phase":9,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":10,"root":27}
+{"ev":"phase_end","round":1,"phase":10,"root":27,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":1,"phase":11,"root":27}
+{"ev":"not_smaller","pass":"shuffle","node":27,"candidate":25,"added":2,"freed":2,"shared":false}
+{"ev":"phase_end","round":1,"phase":11,"root":27,"spent":{"node_visits":3,"pass_work":71}}
+{"ev":"phase_begin","round":1,"phase":12,"root":27}
+{"ev":"phase_end","round":1,"phase":12,"root":27,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":13,"root":27}
+{"ev":"phase_end","round":1,"phase":13,"root":27,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":14,"root":27}
+{"ev":"phase_end","round":1,"phase":14,"root":27,"spent":{}}
+{"result":0,"input":10,"expr":27,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":332,"memo_hits":1,"candidates":18,"match_steps":79,"no_match":10,"guard_false":7,"degraded":0,"no_change":0,"rewrites":3,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":17,"fact_work":16,"pass_work":1073,"rounds":2,"passes":{"bitwise":{"calls":16,"noop":0,"changed":0,"rejected_cost":4,"rejected":0,"atomized":1,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":16,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":16,"noop":3,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":16,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":8,"noop":3,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":16,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":16,"noop":13,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":16,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":16,"noop":0,"changed":0,"rejected_cost":3,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":16,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":8,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":20,"noop":10,"changed":2,"rejected_cost":4,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":16,"noop":0,"changed":0,"rejected_cost":5,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.arith::add_and_or","id":"231e32f29079f031059e35c9ff2c7c8d","kind":"identity","proven":true,"doc":"And plus or is plus.","examples":[["(p & q) + (p | q)","p + q"]],"source":"identity add_and_or<W>(x: W, y: W) { (x & y) + (x | y) <=> x + y }","ledger":"identity exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":1,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"node":1,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":0,"op":"sym","name":"y","w":32,"text":"y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":3,"op":"and","w":32,"args":[1,0]}
+{"node":2,"op":"or","w":32,"args":[1,0]}
+{"node":4,"op":"add","w":32,"args":[3,2],"text":"(x & y) + (x | y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":5,"op":"add","w":32,"args":[1,0],"text":"x + y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"ev":"root","index":0,"root":4}
+{"ev":"phase_begin","round":0,"phase":0,"root":4}
+{"ev":"phase_end","round":0,"phase":0,"root":4,"spent":{"node_visits":7,"fact_work":5,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":1,"root":4}
+{"ev":"candidate","rule":0,"node":4}
+{"ev":"applied","rule":0,"before":4,"after":5}
+{"ev":"candidate","rule":1,"node":5}
+{"ev":"guard_false","rule":1,"node":5,"pred":"disjoint","args":[1,0]}
+{"ev":"phase_end","round":0,"phase":1,"root":5,"spent":{"node_visits":8,"candidates":2,"match_steps":10,"rewrites":1,"new_nodes":1}}
+{"ev":"phase_begin","round":0,"phase":2,"root":5}
+{"ev":"not_smaller","pass":"linear","node":5,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":5,"spent":{"node_visits":4,"pass_work":8}}
+{"ev":"phase_begin","round":0,"phase":3,"root":5}
+{"ev":"phase_end","round":0,"phase":3,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":4,"root":5}
+{"ev":"phase_end","round":0,"phase":4,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":5,"root":5}
+{"ev":"phase_end","round":0,"phase":5,"root":5,"spent":{"node_visits":4,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":6,"root":5}
+{"ev":"phase_end","round":0,"phase":6,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":7,"root":5}
+{"ev":"phase_end","round":0,"phase":7,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":8,"root":5}
+{"ev":"phase_end","round":0,"phase":8,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":9,"root":5}
+{"ev":"phase_end","round":0,"phase":9,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":10,"root":5}
+{"ev":"phase_end","round":0,"phase":10,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":11,"root":5}
+{"ev":"phase_end","round":0,"phase":11,"root":5,"spent":{"node_visits":4,"pass_work":35}}
+{"ev":"phase_begin","round":0,"phase":12,"root":5}
+{"ev":"phase_end","round":0,"phase":12,"root":5,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":13,"root":5}
+{"ev":"phase_end","round":0,"phase":13,"root":5,"spent":{"node_visits":4,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":14,"root":5}
+{"ev":"candidate","rule":1,"node":5}
+{"ev":"guard_false","rule":1,"node":5,"pred":"disjoint","args":[1,0]}
+{"ev":"phase_end","round":0,"phase":14,"root":5,"spent":{"node_visits":4,"candidates":1,"match_steps":3}}
+{"ev":"phase_begin","round":1,"phase":0,"root":5}
+{"ev":"phase_end","round":1,"phase":0,"root":5,"spent":{"node_visits":1,"fact_work":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":1,"root":5}
+{"ev":"phase_end","round":1,"phase":1,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":5}
+{"ev":"phase_end","round":1,"phase":2,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":5}
+{"ev":"phase_end","round":1,"phase":3,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":5}
+{"ev":"phase_end","round":1,"phase":4,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":5}
+{"ev":"phase_end","round":1,"phase":5,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":5}
+{"ev":"phase_end","round":1,"phase":6,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":5}
+{"ev":"phase_end","round":1,"phase":7,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":5}
+{"ev":"phase_end","round":1,"phase":8,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":5}
+{"ev":"phase_end","round":1,"phase":9,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":5}
+{"ev":"phase_end","round":1,"phase":10,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":5}
+{"ev":"phase_end","round":1,"phase":11,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":5}
+{"ev":"phase_end","round":1,"phase":12,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":5}
+{"ev":"phase_end","round":1,"phase":13,"root":5,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":5}
+{"ev":"phase_end","round":1,"phase":14,"root":5,"spent":{}}
+{"result":0,"input":4,"expr":5,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":68,"memo_hits":14,"candidates":3,"match_steps":13,"no_match":0,"guard_false":2,"degraded":0,"no_change":0,"rewrites":1,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":1,"fact_work":6,"pass_work":85,"rounds":2,"passes":{"bitwise":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":6,"noop":6,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":3,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.arith::mul_pow2","id":"6496ccdcfe6d1bf9444d7f829bb87e6a","kind":"rule","proven":true,"doc":"Multiplying by a power of two is a shift.","examples":[["p * 8","p << 3"]],"source":"rule mul_pow2<W>(x: W, c: const W) { x * c => x << k if is_pow2(c) let k: W = ctz(c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=891)"}
+{"node":3,"op":"sym","name":"x","w":64,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":1,"op":"const","value":"0xd3220fb78e33751f","w":64,"text":"0xd3220fb78e33751f:64","facts":{"zero":"0x2cddf04871cc8ae0","one":"0xd3220fb78e33751f","u":["0xd3220fb78e33751f","0xd3220fb78e33751f"],"stride":0,"s":["0xd3220fb78e33751f","0xd3220fb78e33751f"]}}
+{"node":4,"op":"xor","w":64,"args":[3,1],"text":"x ^ 0xd3220fb78e33751f","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":5,"op":"mul","w":64,"args":[4,1],"text":"(x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":7,"op":"const","value":"0x20","w":64}
+{"node":8,"op":"lshr","w":64,"args":[5,7]}
+{"node":2,"op":"const","value":"0x3c","w":64}
+{"node":6,"op":"lshr","w":64,"args":[5,2]}
+{"node":9,"op":"lshr","w":64,"args":[8,6]}
+{"node":10,"op":"xor","w":64,"args":[5,9],"text":"let %0 = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f;\n%0 ^ %0 >>u 32 >>u (%0 >>u 60)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":11,"op":"mul","w":64,"args":[10,1],"text":"let %0 = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f;\n(%0 ^ %0 >>u 32 >>u (%0 >>u 60)) * 0xd3220fb78e33751f","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":0,"op":"const","value":"0x0","w":64}
+{"node":12,"op":"cmp","pred":"==","w":1,"args":[11,0],"text":"let %0 = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f;\n(%0 ^ %0 >>u 32 >>u (%0 >>u 60)) * 0xd3220fb78e33751f == 0","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"node":13,"op":"cmp","pred":"==","w":1,"args":[3,1],"text":"x == 0xd3220fb78e33751f","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]}}
+{"ev":"root","index":0,"root":12}
+{"ev":"phase_begin","round":0,"phase":0,"root":12}
+{"ev":"phase_end","round":0,"phase":0,"root":12,"spent":{"node_visits":21,"fact_work":13,"pass_work":13}}
+{"ev":"phase_begin","round":0,"phase":1,"root":12}
+{"ev":"candidate","rule":0,"node":5}
+{"ev":"guard_false","rule":0,"node":5,"pred":"is_pow2","args":[1,null]}
+{"ev":"candidate","rule":0,"node":11}
+{"ev":"guard_false","rule":0,"node":11,"pred":"is_pow2","args":[1,null]}
+{"ev":"phase_end","round":0,"phase":1,"root":12,"spent":{"node_visits":21,"candidates":2,"match_steps":6}}
+{"ev":"phase_begin","round":0,"phase":2,"root":12}
+{"ev":"not_smaller","pass":"linear","node":5,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":11,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":12,"spent":{"node_visits":21,"pass_work":35}}
+{"ev":"phase_begin","round":0,"phase":3,"root":12}
+{"ev":"not_smaller","pass":"xor","node":4,"candidate":null,"added":2,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"xor","node":10,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":3,"root":12,"spent":{"node_visits":21,"pass_work":32}}
+{"ev":"phase_begin","round":0,"phase":4,"root":12}
+{"ev":"phase_end","round":0,"phase":4,"root":12,"spent":{"node_visits":21,"pass_work":13}}
+{"ev":"phase_begin","round":0,"phase":5,"root":12}
+{"ev":"phase_end","round":0,"phase":5,"root":12,"spent":{"node_visits":21,"pass_work":17}}
+{"ev":"phase_begin","round":0,"phase":6,"root":12}
+{"ev":"applied","pass":"invert","before":12,"after":13}
+{"ev":"explain","pass":"invert","node":12,"why":{"kind":"invert","layers":[{"node":11,"inner":10,"map":"v * k","bijective":true,"preimage":"0x0"},{"node":10,"inner":5,"map":"region","bijective":true,"preimage":"0x0"},{"node":5,"inner":4,"map":"v * k","bijective":true,"preimage":"0x0"},{"node":4,"inner":3,"map":"v ^ k","bijective":true,"preimage":"0xd3220fb78e33751f"}]}}
+{"ev":"phase_end","round":0,"phase":6,"root":13,"spent":{"node_visits":22,"rewrites":1,"new_nodes":1,"pass_work":1530}}
+{"ev":"phase_begin","round":0,"phase":7,"root":13}
+{"ev":"phase_end","round":0,"phase":7,"root":13,"spent":{"node_visits":4,"pass_work":6}}
+{"ev":"phase_begin","round":0,"phase":8,"root":13}
+{"ev":"phase_end","round":0,"phase":8,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":9,"root":13}
+{"ev":"phase_end","round":0,"phase":9,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":10,"root":13}
+{"ev":"phase_end","round":0,"phase":10,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":11,"root":13}
+{"ev":"phase_end","round":0,"phase":11,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":12,"root":13}
+{"ev":"phase_end","round":0,"phase":12,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":13,"root":13}
+{"ev":"phase_end","round":0,"phase":13,"root":13,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":14,"root":13}
+{"ev":"phase_end","round":0,"phase":14,"root":13,"spent":{"node_visits":4}}
+{"ev":"phase_begin","round":1,"phase":0,"root":13}
+{"ev":"phase_end","round":1,"phase":0,"root":13,"spent":{"node_visits":1,"fact_work":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":1,"root":13}
+{"ev":"phase_end","round":1,"phase":1,"root":13,"spent":{"node_visits":1}}
+{"ev":"phase_begin","round":1,"phase":2,"root":13}
+{"ev":"phase_end","round":1,"phase":2,"root":13,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":3,"root":13}
+{"ev":"phase_end","round":1,"phase":3,"root":13,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":4,"root":13}
+{"ev":"phase_end","round":1,"phase":4,"root":13,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":5,"root":13}
+{"ev":"phase_end","round":1,"phase":5,"root":13,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":1,"phase":6,"root":13}
+{"ev":"phase_end","round":1,"phase":6,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":13}
+{"ev":"phase_end","round":1,"phase":7,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":13}
+{"ev":"phase_end","round":1,"phase":8,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":13}
+{"ev":"phase_end","round":1,"phase":9,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":13}
+{"ev":"phase_end","round":1,"phase":10,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":13}
+{"ev":"phase_end","round":1,"phase":11,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":13}
+{"ev":"phase_end","round":1,"phase":12,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":13}
+{"ev":"phase_end","round":1,"phase":13,"root":13,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":13}
+{"ev":"phase_end","round":1,"phase":14,"root":13,"spent":{}}
+{"result":0,"input":12,"expr":13,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":186,"memo_hits":16,"candidates":2,"match_steps":6,"no_match":0,"guard_false":2,"degraded":0,"no_change":0,"rewrites":1,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":1,"fact_work":14,"pass_work":1669,"rounds":2,"passes":{"bitwise":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":14,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":14,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":14,"noop":10,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":14,"noop":1,"changed":1,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":14,"noop":0,"changed":0,"rejected_cost":2,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":14,"noop":0,"changed":0,"rejected_cost":2,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.arith::udiv_pow2","id":"ba7f88934bfc987b78342932a53ee20c","kind":"rule","proven":true,"doc":"Unsigned division by a power of two is a shift.","examples":[["udiv(p, 16)","p >>u 4"]],"source":"rule udiv_pow2<W>(x: W, c: const W) { udiv(x, c) => x >>u k if is_pow2(c) let k: W = ctz(c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=920)"}
+{"node":2,"op":"sym","name":"x","w":64,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffffffffffff"],"stride":1,"s":["0x8000000000000000","0x7fffffffffffffff"]}}
+{"node":1,"op":"const","value":"0xcccccccccccccccd","w":64}
+{"node":3,"op":"umulhi","w":64,"args":[2,1]}
+{"node":0,"op":"const","value":"0x3","w":64}
+{"node":4,"op":"lshr","w":64,"args":[3,0],"text":"umulhi(x, 0xcccccccccccccccd) >>u 3","facts":{"zero":"0xe000000000000000","one":"0x0","u":["0x0","0x1999999999999999"],"stride":1,"s":["0x0","0x1999999999999999"]}}
+{"node":5,"op":"const","value":"0xa","w":64,"text":"10:64","facts":{"zero":"0xfffffffffffffff5","one":"0xa","u":["0xa","0xa"],"stride":0,"s":["0xa","0xa"]}}
+{"node":6,"op":"udiv","w":64,"args":[2,5],"text":"udiv(x, 10)","facts":{"zero":"0xe000000000000000","one":"0x0","u":["0x0","0x1999999999999999"],"stride":1,"s":["0x0","0x1999999999999999"]}}
+{"ev":"root","index":0,"root":4}
+{"ev":"phase_begin","round":0,"phase":0,"root":4}
+{"ev":"phase_end","round":0,"phase":0,"root":4,"spent":{"node_visits":7,"fact_work":5,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":1,"root":4}
+{"ev":"phase_end","round":0,"phase":1,"root":4,"spent":{"node_visits":7}}
+{"ev":"phase_begin","round":0,"phase":2,"root":4}
+{"ev":"phase_end","round":0,"phase":2,"root":4,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":3,"root":4}
+{"ev":"phase_end","round":0,"phase":3,"root":4,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":4,"root":4}
+{"ev":"phase_end","round":0,"phase":4,"root":4,"spent":{"node_visits":7,"pass_work":5}}
+{"ev":"phase_begin","round":0,"phase":5,"root":4}
+{"ev":"applied","pass":"division","before":4,"after":6}
+{"ev":"explain","pass":"division","node":4,"why":{"kind":"division","dividend":2,"divisor":"0xa","signed":false}}
+{"ev":"phase_end","round":0,"phase":5,"root":6,"spent":{"node_visits":10,"rewrites":1,"new_nodes":2,"pass_work":46}}
+{"ev":"phase_begin","round":0,"phase":6,"root":6}
+{"ev":"phase_end","round":0,"phase":6,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":7,"root":6}
+{"ev":"phase_end","round":0,"phase":7,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":8,"root":6}
+{"ev":"phase_end","round":0,"phase":8,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":9,"root":6}
+{"ev":"phase_end","round":0,"phase":9,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":10,"root":6}
+{"ev":"phase_end","round":0,"phase":10,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":11,"root":6}
+{"ev":"phase_end","round":0,"phase":11,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":12,"root":6}
+{"ev":"phase_end","round":0,"phase":12,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":13,"root":6}
+{"ev":"phase_end","round":0,"phase":13,"root":6,"spent":{"node_visits":4,"pass_work":3}}
+{"ev":"phase_begin","round":0,"phase":14,"root":6}
+{"ev":"candidate","rule":0,"node":6}
+{"ev":"guard_false","rule":0,"node":6,"pred":"is_pow2","args":[5,null]}
+{"ev":"phase_end","round":0,"phase":14,"root":6,"spent":{"node_visits":4,"candidates":1,"match_steps":3}}
+{"ev":"phase_begin","round":1,"phase":0,"root":6}
+{"ev":"phase_end","round":1,"phase":0,"root":6,"spent":{"node_visits":3,"fact_work":2,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":1,"root":6}
+{"ev":"candidate","rule":0,"node":6}
+{"ev":"guard_false","rule":0,"node":6,"pred":"is_pow2","args":[5,null]}
+{"ev":"phase_end","round":1,"phase":1,"root":6,"spent":{"node_visits":3,"candidates":1,"match_steps":3}}
+{"ev":"phase_begin","round":1,"phase":2,"root":6}
+{"ev":"phase_end","round":1,"phase":2,"root":6,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":3,"root":6}
+{"ev":"phase_end","round":1,"phase":3,"root":6,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":4,"root":6}
+{"ev":"phase_end","round":1,"phase":4,"root":6,"spent":{"node_visits":3,"pass_work":2}}
+{"ev":"phase_begin","round":1,"phase":5,"root":6}
+{"ev":"phase_end","round":1,"phase":5,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":6}
+{"ev":"phase_end","round":1,"phase":6,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":6}
+{"ev":"phase_end","round":1,"phase":7,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":6}
+{"ev":"phase_end","round":1,"phase":8,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":6}
+{"ev":"phase_end","round":1,"phase":9,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":6}
+{"ev":"phase_end","round":1,"phase":10,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":6}
+{"ev":"phase_end","round":1,"phase":11,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":6}
+{"ev":"phase_end","round":1,"phase":12,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":6}
+{"ev":"phase_end","round":1,"phase":13,"root":6,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":6}
+{"ev":"phase_end","round":1,"phase":14,"root":6,"spent":{}}
+{"result":0,"input":4,"expr":6,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":96,"memo_hits":10,"candidates":2,"match_steps":6,"no_match":0,"guard_false":2,"degraded":0,"no_change":0,"rewrites":1,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":2,"fact_work":7,"pass_work":98,"rounds":2,"passes":{"bitwise":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":7,"noop":1,"changed":1,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":7,"noop":4,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":3,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"deobfuscate","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"division"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"carries"},{"name":"linear_mba"},{"name":"shuffle"},{"name":"demanded"},{"name":"mba"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"node":6,"op":"sym","name":"rsp","w":64}
+{"node":5,"op":"const","value":"0x20","w":64}
+{"node":7,"op":"add","w":64,"args":[6,5]}
+{"node":4,"op":"const","value":"0xf","w":64}
+{"node":8,"op":"and","w":64,"args":[7,4],"text":"rsp + 32 & 15","facts":{"zero":"0xfffffffffffffff0","one":"0x0","u":["0x0","0xf"],"stride":1,"s":["0x0","0xf"]},"assumed":{"zero":"0xffffffffffffffff","one":"0x0","u":["0x0","0x0"],"stride":0,"s":["0x0","0x0"],"relies":[0]}}
+{"node":1,"op":"sym","name":"idx","w":64}
+{"node":0,"op":"sym","name":"n","w":64}
+{"node":2,"op":"cmp","pred":"<=u","w":1,"args":[1,0],"text":"idx <=u n","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]},"assumed":{"zero":"0x0","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"],"relies":[1]}}
+{"node":3,"op":"zext","w":64,"args":[2],"text":"zext<64>(idx <=u n)","facts":{"zero":"0xfffffffffffffffe","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x0","0x1"]},"assumed":{"zero":"0xfffffffffffffffe","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"],"relies":[1]}}
+{"node":9,"op":"add","w":64,"args":[8,3],"text":"(rsp + 32 & 15) + zext<64>(idx <=u n)","facts":{"zero":"0xffffffffffffffe0","one":"0x0","u":["0x0","0x10"],"stride":1,"s":["0x0","0x10"]},"assumed":{"zero":"0xfffffffffffffffe","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"],"relies":[0,1]}}
+{"node":15,"op":"const","value":"0x1","w":64,"text":"1:64","facts":{"zero":"0xfffffffffffffffe","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"]}}
+{"node":11,"op":"and","w":64,"args":[6,4]}
+{"node":10,"op":"const","value":"0x0","w":64,"text":"0:64","facts":{"zero":"0xffffffffffffffff","one":"0x0","u":["0x0","0x0"],"stride":0,"s":["0x0","0x0"]}}
+{"node":12,"op":"cmp","pred":"==","w":1,"args":[11,10],"text":"rsp & 15 == 0","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]},"assumed":{"zero":"0x0","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"],"relies":[0]}}
+{"node":13,"op":"cmp","pred":"<u","w":1,"args":[1,0],"text":"idx <u n","facts":{"zero":"0x0","one":"0x0","u":["0x0","0x1"],"stride":1,"s":["0x1","0x0"]},"assumed":{"zero":"0x0","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"],"relies":[1]}}
+{"node":14,"op":"const","value":"0x1","w":1,"text":"1:1","facts":{"zero":"0x0","one":"0x1","u":["0x1","0x1"],"stride":0,"s":["0x1","0x1"]}}
+{"assume":0,"expr":12}
+{"assume":1,"expr":13}
+{"ev":"root","index":0,"root":9}
+{"ev":"phase_begin","round":0,"phase":0,"root":9}
+{"ev":"applied","pass":"fact_fold","before":2,"after":14}
+{"ev":"relied","on":[1]}
+{"ev":"explain","pass":"fact_fold","node":2,"why":{"kind":"fold","zero":"0x0","one":"0x1","value":"0x1"}}
+{"ev":"folded","node":3,"after":15}
+{"ev":"applied","pass":"fact_fold","before":8,"after":10}
+{"ev":"relied","on":[0]}
+{"ev":"explain","pass":"fact_fold","node":8,"why":{"kind":"fold","zero":"0xffffffffffffffff","one":"0x0","value":"0x0"}}
+{"ev":"folded","node":9,"after":15}
+{"ev":"phase_end","round":0,"phase":0,"root":15,"spent":{"node_visits":18,"rewrites":2,"new_nodes":1,"fact_work":7,"pass_work":11}}
+{"ev":"phase_begin","round":0,"phase":1,"root":15}
+{"ev":"phase_end","round":0,"phase":1,"root":15,"spent":{"node_visits":1}}
+{"ev":"phase_begin","round":0,"phase":2,"root":15}
+{"ev":"phase_end","round":0,"phase":2,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":3,"root":15}
+{"ev":"phase_end","round":0,"phase":3,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":4,"root":15}
+{"ev":"phase_end","round":0,"phase":4,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":5,"root":15}
+{"ev":"phase_end","round":0,"phase":5,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":6,"root":15}
+{"ev":"phase_end","round":0,"phase":6,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":7,"root":15}
+{"ev":"phase_end","round":0,"phase":7,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":8,"root":15}
+{"ev":"phase_end","round":0,"phase":8,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":9,"root":15}
+{"ev":"phase_end","round":0,"phase":9,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":10,"root":15}
+{"ev":"phase_end","round":0,"phase":10,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":11,"root":15}
+{"ev":"phase_end","round":0,"phase":11,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":12,"root":15}
+{"ev":"phase_end","round":0,"phase":12,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":13,"root":15}
+{"ev":"phase_end","round":0,"phase":13,"root":15,"spent":{"node_visits":1,"pass_work":1}}
+{"ev":"phase_begin","round":0,"phase":14,"root":15}
+{"ev":"phase_end","round":0,"phase":14,"root":15,"spent":{"node_visits":1}}
+{"ev":"phase_begin","round":1,"phase":0,"root":15}
+{"ev":"phase_end","round":1,"phase":0,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":1,"root":15}
+{"ev":"phase_end","round":1,"phase":1,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":15}
+{"ev":"phase_end","round":1,"phase":2,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":15}
+{"ev":"phase_end","round":1,"phase":3,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":15}
+{"ev":"phase_end","round":1,"phase":4,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":15}
+{"ev":"phase_end","round":1,"phase":5,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":15}
+{"ev":"phase_end","round":1,"phase":6,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":15}
+{"ev":"phase_end","round":1,"phase":7,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":15}
+{"ev":"phase_end","round":1,"phase":8,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":15}
+{"ev":"phase_end","round":1,"phase":9,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":10,"root":15}
+{"ev":"phase_end","round":1,"phase":10,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":11,"root":15}
+{"ev":"phase_end","round":1,"phase":11,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":12,"root":15}
+{"ev":"phase_end","round":1,"phase":12,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":13,"root":15}
+{"ev":"phase_end","round":1,"phase":13,"root":15,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":14,"root":15}
+{"ev":"phase_end","round":1,"phase":14,"root":15,"spent":{}}
+{"result":0,"input":9,"expr":15,"changed":true,"end":"completed","relies_on":[0,1]}
+{"stats":{"node_visits":32,"memo_hits":16,"candidates":0,"match_steps":0,"no_match":0,"guard_false":0,"degraded":0,"no_change":0,"rewrites":2,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":1,"fact_work":7,"pass_work":23,"rounds":2,"passes":{"bitwise":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"carries":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"division":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":11,"noop":4,"changed":2,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear_mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"shuffle":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":1,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}
+{"trace":"bitwright","format":1,"version":"0.23.0","strategy":"standard","max_rounds":4,"phases":[{"name":"fact_fold"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]},{"name":"linear"},{"name":"xor"},{"name":"casts"},{"name":"invert"},{"name":"compares"},{"name":"bitwise"},{"name":"demanded"},{"name":"local","groups":["core.bitwise","core.arith","core.compare","core.sign","core.casts","core.select","core.shift","core.recovery_arith","core.recovery_compare","core.recovery_shift","core.recovery_bmi2","core.recovery_cast","core.recovery_select","core.recovery_canonical","core.recovery_minmax","core.recovery_select_one","core.recovery_shuffle","core.recovery_select_ones","core.guarded_recovery","core.guarded_recovery_canonical","core.guarded_recovery_shuffle","core.guarded_recovery_layout","core.guarded_recovery_mba_normalized","core.guarded_recovery_concat","core.shift_canonical","core.factor","core.select_idioms","core.division","core.sign_tests","core.bounds","core.concat","core.single_bit","core.float","core.float_values"]}]}
+{"rule":0,"name":"core.bitwise::and_not_self","id":"a7155cc265a14fe9cc6247305f489835","kind":"rule","proven":true,"doc":"Complement.","examples":[["p & ~p","0:8"]],"source":"rule and_not_self<W>(x: W) { x & ~x => 0 }","ledger":"rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":1,"name":"core.arith::mul_pow2","id":"6496ccdcfe6d1bf9444d7f829bb87e6a","kind":"rule","proven":true,"doc":"Multiplying by a power of two is a shift.","examples":[["p * 8","p << 3"]],"source":"rule mul_pow2<W>(x: W, c: const W) { x * c => x << k if is_pow2(c) let k: W = ctz(c) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=891)"}
+{"rule":2,"name":"core.shift_canonical::shl_mask_dead","id":"b687f5007019479c0957cd7cf5afab11","kind":"rule","proven":true,"doc":"A mask that keeps every bit the shift keeps.","examples":[["(p & 63) << 2","p << 2"]],"source":"rule shl_mask_dead<W>(x: W, c: const W, k: const W) {\n        (x & c) << k => x << k if (c | ~(ones >>u k)) == ones\n    }","ledger":"rule exhaustive(inst=5,maxw=5,cases=37448,fired=32378) sampled(inst=22,cases=1408,fired=1104)"}
+{"rule":3,"name":"core.arith::add_xor_and","id":"91a74de0aba7b7ddb91240edcadabeb2","kind":"identity","proven":true,"doc":"Xor plus twice the and is plus. (Twice is written as the shift `mul_pow2` makes of it:\npatterns are written in normal form, or bottom-up rewriting never reaches them.)","examples":[["(p ^ q) + ((p & q) << 1)","p + q"]],"source":"identity add_xor_and<W>(x: W, y: W) { (x ^ y) + ((x & y) << 1) <=> x + y }","ledger":"identity exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":4,"name":"core.arith::add_disjoint","id":"c21668d593d2958761d618170fb36e1a","kind":"rule","proven":true,"doc":"An add without carries is an or.","examples":[["(p & 0xf0) + (q & 15)","(p & 0xf0) | (q & 15)"]],"source":"rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)"}
+{"rule":5,"name":"core.arith::sub_and","id":"f494f97854ab0848902d5d10e05d614e","kind":"rule","proven":true,"doc":"Removing the common bits.","examples":[["p - (p & q)","p & ~q"]],"source":"rule sub_and<W>(x: W, y: W) { x - (x & y) => x & ~y }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":6,"name":"core.arith::sub_or","id":"98af6cc381e96fdd11156579398556cb","kind":"rule","proven":true,"doc":"The bits an or adds.","examples":[["(p | q) - p","q & ~p"]],"source":"rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"rule":7,"name":"core.recovery_arith::xor_from_or_minus_and","id":"da70d981bf49c9fd64529be76dc44a95","kind":"rule","proven":true,"examples":[["(p | q) - (p & q)","p ^ q"]],"source":"rule xor_from_or_minus_and<W>(x: W, y: W) { (x | y) - (x & y) => x ^ y }","ledger":"rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)"}
+{"node":5,"op":"sym","name":"x","w":32,"text":"x","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":4,"op":"sym","name":"y","w":32,"text":"y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":12,"op":"or","w":32,"args":[5,4]}
+{"node":8,"op":"and","w":32,"args":[5,4]}
+{"node":13,"op":"sub","w":32,"args":[12,8],"text":"(x | y) - (x & y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":7,"op":"const","value":"0x2","w":32}
+{"node":9,"op":"mul","w":32,"args":[8,7],"text":"(x & y) * 2","facts":{"zero":"0x1","one":"0x0","u":["0x0","0xfffffffe"],"stride":2,"s":["0x80000000","0x7ffffffe"]}}
+{"node":6,"op":"xor","w":32,"args":[5,4],"text":"x ^ y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":10,"op":"add","w":32,"args":[9,6]}
+{"node":3,"op":"const","value":"0x3","w":32,"text":"3:32","facts":{"zero":"0xfffffffc","one":"0x3","u":["0x3","0x3"],"stride":0,"s":["0x3","0x3"]}}
+{"node":11,"op":"mul","w":32,"args":[10,3]}
+{"node":14,"op":"add","w":32,"args":[13,11]}
+{"node":0,"op":"sym","name":"z","w":32}
+{"node":1,"op":"not","w":32,"args":[0]}
+{"node":2,"op":"and","w":32,"args":[1,0],"text":"~z & z","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":15,"op":"xor","w":32,"args":[14,2],"text":"let %0 = x & y;\n(x | y) - %0 + (%0 * 2 + (x ^ y)) * 3 ^ ~z & z","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":20,"op":"add","w":32,"args":[5,4],"text":"x + y","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":21,"op":"mul","w":32,"args":[20,3],"text":"(x + y) * 3","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":22,"op":"add","w":32,"args":[21,6],"text":"(x + y) * 3 + (x ^ y)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"node":16,"op":"const","value":"0x0","w":32,"text":"0:32","facts":{"zero":"0xffffffff","one":"0x0","u":["0x0","0x0"],"stride":0,"s":["0x0","0x0"]}}
+{"node":17,"op":"const","value":"0x1","w":32}
+{"node":18,"op":"shl","w":32,"args":[8,17],"text":"(x & y) << 1","facts":{"zero":"0x1","one":"0x0","u":["0x0","0xfffffffe"],"stride":2,"s":["0x80000000","0x7ffffffe"]}}
+{"node":19,"op":"add","w":32,"args":[6,18],"text":"(x ^ y) + ((x & y) << 1)","facts":{"zero":"0x0","one":"0x0","u":["0x0","0xffffffff"],"stride":1,"s":["0x80000000","0x7fffffff"]}}
+{"ev":"root","index":0,"root":15}
+{"ev":"phase_begin","round":0,"phase":0,"root":15}
+{"ev":"phase_end","round":0,"phase":0,"root":15,"spent":{"node_visits":24,"fact_work":16,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":1,"root":15}
+{"ev":"candidate","rule":0,"node":2}
+{"ev":"applied","rule":0,"before":2,"after":16}
+{"ev":"candidate","rule":1,"node":9}
+{"ev":"applied","rule":1,"before":9,"after":18}
+{"ev":"candidate","rule":2,"node":18}
+{"ev":"no_match","rule":2,"node":18}
+{"ev":"candidate","rule":3,"node":19}
+{"ev":"applied","rule":3,"before":19,"after":20}
+{"ev":"candidate","rule":4,"node":20}
+{"ev":"guard_false","rule":4,"node":20,"pred":"disjoint","args":[5,4]}
+{"ev":"candidate","rule":1,"node":21}
+{"ev":"guard_false","rule":1,"node":21,"pred":"is_pow2","args":[3,null]}
+{"ev":"candidate","rule":5,"node":13}
+{"ev":"no_match","rule":5,"node":13}
+{"ev":"candidate","rule":6,"node":13}
+{"ev":"no_match","rule":6,"node":13}
+{"ev":"candidate","rule":7,"node":13}
+{"ev":"applied","rule":7,"before":13,"after":6}
+{"ev":"candidate","rule":4,"node":22}
+{"ev":"guard_false","rule":4,"node":22,"pred":"disjoint","args":[21,6]}
+{"ev":"folded","node":15,"after":22}
+{"ev":"phase_end","round":0,"phase":1,"root":22,"spent":{"node_visits":32,"candidates":10,"match_steps":53,"rewrites":4,"new_nodes":7,"fact_work":2}}
+{"ev":"phase_begin","round":0,"phase":2,"root":22}
+{"ev":"not_smaller","pass":"linear","node":20,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":21,"candidate":null,"added":5,"freed":3,"shared":false}
+{"ev":"not_smaller","pass":"linear","node":22,"candidate":null,"added":6,"freed":4,"shared":false}
+{"ev":"phase_end","round":0,"phase":2,"root":22,"spent":{"node_visits":10,"pass_work":27}}
+{"ev":"phase_begin","round":0,"phase":3,"root":22}
+{"ev":"not_smaller","pass":"xor","node":6,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":3,"root":22,"spent":{"node_visits":10,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":4,"root":22}
+{"ev":"phase_end","round":0,"phase":4,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":5,"root":22}
+{"ev":"phase_end","round":0,"phase":5,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":6,"root":22}
+{"ev":"phase_end","round":0,"phase":6,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":7,"root":22}
+{"ev":"not_smaller","pass":"bitwise","node":6,"candidate":null,"added":1,"freed":1,"shared":false}
+{"ev":"phase_end","round":0,"phase":7,"root":22,"spent":{"node_visits":10,"pass_work":16}}
+{"ev":"phase_begin","round":0,"phase":8,"root":22}
+{"ev":"phase_end","round":0,"phase":8,"root":22,"spent":{"node_visits":10,"pass_work":7}}
+{"ev":"phase_begin","round":0,"phase":9,"root":22}
+{"ev":"candidate","rule":4,"node":20}
+{"ev":"guard_false","rule":4,"node":20,"pred":"disjoint","args":[5,4]}
+{"ev":"candidate","rule":1,"node":21}
+{"ev":"guard_false","rule":1,"node":21,"pred":"is_pow2","args":[3,null]}
+{"ev":"candidate","rule":4,"node":22}
+{"ev":"guard_false","rule":4,"node":22,"pred":"disjoint","args":[21,6]}
+{"ev":"phase_end","round":0,"phase":9,"root":22,"spent":{"node_visits":10,"candidates":3,"match_steps":9}}
+{"ev":"phase_begin","round":1,"phase":0,"root":22}
+{"ev":"phase_end","round":1,"phase":0,"root":22,"spent":{"node_visits":5,"fact_work":1,"pass_work":3}}
+{"ev":"phase_begin","round":1,"phase":1,"root":22}
+{"ev":"phase_end","round":1,"phase":1,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":2,"root":22}
+{"ev":"phase_end","round":1,"phase":2,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":3,"root":22}
+{"ev":"phase_end","round":1,"phase":3,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":4,"root":22}
+{"ev":"phase_end","round":1,"phase":4,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":5,"root":22}
+{"ev":"phase_end","round":1,"phase":5,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":6,"root":22}
+{"ev":"phase_end","round":1,"phase":6,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":7,"root":22}
+{"ev":"phase_end","round":1,"phase":7,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":8,"root":22}
+{"ev":"phase_end","round":1,"phase":8,"root":22,"spent":{}}
+{"ev":"phase_begin","round":1,"phase":9,"root":22}
+{"ev":"phase_end","round":1,"phase":9,"root":22,"spent":{}}
+{"result":0,"input":15,"expr":22,"changed":true,"end":"completed","relies_on":[]}
+{"stats":{"node_visits":141,"memo_hits":11,"candidates":13,"match_steps":62,"no_match":3,"guard_false":6,"degraded":0,"no_change":0,"rewrites":4,"hook_vetoes":0,"rejected":0,"cycles_cut":0,"quarantined":0,"new_nodes":7,"fact_work":19,"pass_work":106,"rounds":2,"passes":{"bitwise":{"calls":7,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"casts":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"compares":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"demanded":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"fact_fold":{"calls":19,"noop":17,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"invert":{"calls":7,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"linear":{"calls":7,"noop":0,"changed":0,"rejected_cost":3,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"xor":{"calls":7,"noop":0,"changed":0,"rejected_cost":1,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0}},"host":{"calls":0,"noop":0,"changed":0,"rejected_cost":0,"rejected":0,"atomized":0,"proofs":0,"proved":0,"refuted":0,"unknown":0},"mba":{"calls":0,"steps":0,"cache_hits":0,"simplified":0,"no_simpler":0,"unsupported":0,"exhausted":0,"refuted":0,"proof_unknown":0,"not_smaller":0,"too_many_vars":0,"too_large":0,"too_wide":0,"too_small":0,"opaque_asked":0,"opaque_proved":0,"opaque_known":0,"opaque_exhausted":0,"opaque_cases":0,"piecewise_blocks":0,"noise_blocks":0,"noise_atoms":0,"certificates":{"calls":0,"proved":0,"refuted":0,"unknown":0,"signature":0,"single_bit":0,"sparse":0,"grid":0,"exhaustive":0,"symbolic":0,"carries":0,"compositional":0,"split":0,"known_bits":0,"points":0,"over_budget":0,"internal":0}},"completed":[0,1],"budget_terminated":[0,0],"declined":0,"salvaged":0,"not_started":0}}

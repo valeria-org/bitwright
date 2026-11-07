@@ -26,6 +26,7 @@ const OPS = {
   template: 12,
   checkTemplate: 13,
   names: 14,
+  trace: 15,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -243,6 +244,24 @@ export async function instantiate(bytes) {
         return call(deobfuscate ? OPS.simplify : OPS.simplifyStandard, text, "", width);
       }
       return simplifyWith(text, width, opts);
+    },
+    // Simplifies like `simplify` and returns the run as a trace (JSON Lines, as `bitwright
+    // simplify --trace` writes it, with the passes' reasoning and the facts of the nodes it
+    // names). Options: `deobfuscate` (default true) and `assume`, a list of 1-bit predicates.
+    trace: (text, width = 64, opts = {}) => {
+      const { deobfuscate = true, assume = [], ...rest } = opts;
+      const unknown = Object.keys(rest);
+      if (unknown.length > 0) {
+        throw new Error(`unknown option ${unknown[0]}`);
+      }
+      const lines = [];
+      if (!deobfuscate) {
+        lines.push("standard");
+      }
+      for (const p of assume) {
+        lines.push(`assume ${String(p).replace(/\n/g, " ")}`);
+      }
+      return call(OPS.trace, text, lines.join("\n"), width);
     },
     // Tests a host rewrite offline on expression texts: `{ passed, applications, points,
     // exhaustive, failure }`, `failure` null or `{ kind, message, node, result, second,

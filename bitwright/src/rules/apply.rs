@@ -3,7 +3,7 @@
 //! against.
 
 use super::eval::{eval, literal, width_of};
-use super::ir::{FactPred, Literal, NodeId, ParamKind, RNode, Rule};
+use super::ir::{ConstPred, FactPred, Literal, NodeId, ParamKind, RNode, Rule};
 use super::matcher::{Bindings, Match};
 use crate::expr::Context;
 use crate::facts::known::bv_and;
@@ -60,6 +60,9 @@ pub(crate) struct ApplyEnv<'a> {
     /// Set when a `one_use` was false: the answer depends on sharing, so the node may not be
     /// normal once that changes.
     pub(crate) shared: bool,
+    /// The guard's last predicate that did not hold: its spelling in the rule language and
+    /// the nodes bound to its operands (for an observer).
+    pub(crate) failed: Option<(&'static str, [Option<u32>; 2])>,
 }
 
 impl ApplyEnv<'_> {
@@ -194,77 +197,150 @@ fn holds(
             let node = build(cx, rule, *x, widths, b, lets)?;
             let one = cx.len() == before && one_use(cx, node);
             env.shared |= !one;
+            if !one {
+                env.failed = Some(("one_use", [Some(node), None]));
+            }
             Some(one)
         }
         RNode::Fact(p, x, m) => {
-            let fx = operand_facts(env, cx, rule, b, *x, widths, consts, lets)?;
-            Some(match p {
-                // Answered above.
-                FactPred::OneUse => true,
-                FactPred::NonZero => {
-                    let z = Facts::constant(&BitVec::zero(fx.width()));
-                    crate::facts::decide_cmp(CmpOp::Eq, &fx, &z) == Some(false)
-                }
-                FactPred::ZeroBits => {
-                    let mv = eval(rule, (*m)?, widths, consts, lets)?.bv()?;
-                    bv_and(&fx.known().maybe_one(), &mv).is_zero()
-                }
-                FactPred::OneBits => {
-                    let mv = eval(rule, (*m)?, widths, consts, lets)?.bv()?;
-                    bv_and(&fx.known().known_one(), &mv) == mv
-                }
-                FactPred::Disjoint => {
-                    let fy = operand_facts(env, cx, rule, b, (*m)?, widths, consts, lets)?;
-                    bv_and(&fx.known().maybe_one(), &fy.known().maybe_one()).is_zero()
-                }
-                FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
-                    // The format: the infinity literal's exponent width, and `x`'s width.
-                    let RNode::Lit(Literal::Float { eb, .. }) = &rule.nodes[(*m)? as usize] else {
-                        return None;
-                    };
-                    let eb = u32::try_from(eb.eval(widths)).ok()?;
-                    let w = u32::from(fx.width().bits());
-                    let f = crate::fp::FpFormat::new(eb, w.checked_sub(eb)?).ok()?;
-                    let (nan, inf, zero) = crate::facts::fp_may_be(f, &fx);
-                    match p {
-                        FactPred::FpNotNan => !nan,
-                        FactPred::FpFinite => !nan && !inf,
-                        _ => !zero,
+            let r = fact_holds(env, cx, rule, b, *p, *x, *m, widths, consts, lets);
+            if r != Some(true) {
+                let args = match (p, &rule.nodes[*x as usize]) {
+                    (FactPred::Proves, RNode::Cmp(_, l, r)) => {
+                        [bound(rule, b, *l), bound(rule, b, *r)]
                     }
-                }
-                FactPred::Proves => {
-                    let RNode::Cmp(op, l, r) = &rule.nodes[*x as usize] else {
-                        return None;
-                    };
-                    let (stored, swap) = op.canonical();
-                    let (l, r) = if swap { (*r, *l) } else { (*l, *r) };
-                    if let (RNode::Param(i), RNode::Param(j)) =
-                        (&rule.nodes[l as usize], &rule.nodes[r as usize])
-                    {
-                        let (x, y) = (b.params[*i as usize]?, b.params[*j as usize]?);
-                        // The same bound node on both sides is decided by identity.
-                        if x == y {
-                            return Some(matches!(stored, CmpOp::Eq | CmpOp::Ule | CmpOp::Sle));
-                        }
-                        // An assumed ordering of the two decides it too.
-                        if let Some(a) = env.assumptions
-                            && let Some((v, rel)) = cx.assumed_order(a, stored, x, y)
-                        {
-                            if v {
-                                env.rel |= rel;
-                            }
-                            return Some(v);
-                        }
-                    }
-                    let fl = operand_facts(env, cx, rule, b, l, widths, consts, lets)?;
-                    let fr = operand_facts(env, cx, rule, b, r, widths, consts, lets)?;
-                    crate::facts::decide_cmp(stored, &fl, &fr) == Some(true)
-                }
-            })
+                    _ => [bound(rule, b, *x), m.and_then(|m| bound(rule, b, m))],
+                };
+                env.failed = Some((fact_name(*p), args));
+            }
+            r
         }
         // Pure: constant predicates, comparisons of constants, 1-bit constant values.
-        _ => Some(eval(rule, n, widths, consts, lets)?.truthy()),
+        node => {
+            let r = eval(rule, n, widths, consts, lets).map(|v| v.truthy());
+            if r != Some(true) {
+                env.failed = Some(match node {
+                    RNode::ConstP(p, x) => (const_name(*p), [bound(rule, b, *x), None]),
+                    RNode::Cmp(op, l, r) => (op.symbol(), [bound(rule, b, *l), bound(rule, b, *r)]),
+                    _ => ("condition", [None, None]),
+                });
+            }
+            r
+        }
     }
+}
+
+/// The node bound to a pattern parameter, if `n` is one.
+fn bound(rule: &Rule, b: &Bindings, n: NodeId) -> Option<u32> {
+    match rule.nodes[n as usize] {
+        RNode::Param(i) => b.params[i as usize],
+        _ => None,
+    }
+}
+
+/// A fact predicate's spelling in the rule language.
+fn fact_name(p: FactPred) -> &'static str {
+    match p {
+        FactPred::ZeroBits => "zero_bits",
+        FactPred::OneBits => "one_bits",
+        FactPred::NonZero => "nonzero",
+        FactPred::Disjoint => "disjoint",
+        FactPred::Proves => "proves",
+        FactPred::FpNotNan => "fp.not_nan",
+        FactPred::FpFinite => "fp.finite",
+        FactPred::FpNonZero => "fp.nonzero",
+        FactPred::OneUse => "one_use",
+    }
+}
+
+/// A constant predicate's spelling in the rule language.
+fn const_name(p: ConstPred) -> &'static str {
+    match p {
+        ConstPred::IsPow2 => "is_pow2",
+        ConstPred::IsLowMask => "is_lowmask",
+        ConstPred::IsShiftedMask => "is_shifted_mask",
+    }
+}
+
+/// Whether fact predicate `p` holds of operands `x` (and `m`).
+#[allow(clippy::too_many_arguments)]
+fn fact_holds(
+    env: &mut ApplyEnv<'_>,
+    cx: &mut Context,
+    rule: &Rule,
+    b: &Bindings,
+    p: FactPred,
+    x: NodeId,
+    m: Option<NodeId>,
+    widths: &[u16],
+    consts: &[BitVec],
+    lets: &[Option<BitVec>],
+) -> Option<bool> {
+    let (x, m) = (&x, &m);
+    let fx = operand_facts(env, cx, rule, b, *x, widths, consts, lets)?;
+    Some(match p {
+        // Answered above.
+        FactPred::OneUse => true,
+        FactPred::NonZero => {
+            let z = Facts::constant(&BitVec::zero(fx.width()));
+            crate::facts::decide_cmp(CmpOp::Eq, &fx, &z) == Some(false)
+        }
+        FactPred::ZeroBits => {
+            let mv = eval(rule, (*m)?, widths, consts, lets)?.bv()?;
+            bv_and(&fx.known().maybe_one(), &mv).is_zero()
+        }
+        FactPred::OneBits => {
+            let mv = eval(rule, (*m)?, widths, consts, lets)?.bv()?;
+            bv_and(&fx.known().known_one(), &mv) == mv
+        }
+        FactPred::Disjoint => {
+            let fy = operand_facts(env, cx, rule, b, (*m)?, widths, consts, lets)?;
+            bv_and(&fx.known().maybe_one(), &fy.known().maybe_one()).is_zero()
+        }
+        FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
+            // The format: the infinity literal's exponent width, and `x`'s width.
+            let RNode::Lit(Literal::Float { eb, .. }) = &rule.nodes[(*m)? as usize] else {
+                return None;
+            };
+            let eb = u32::try_from(eb.eval(widths)).ok()?;
+            let w = u32::from(fx.width().bits());
+            let f = crate::fp::FpFormat::new(eb, w.checked_sub(eb)?).ok()?;
+            let (nan, inf, zero) = crate::facts::fp_may_be(f, &fx);
+            match p {
+                FactPred::FpNotNan => !nan,
+                FactPred::FpFinite => !nan && !inf,
+                _ => !zero,
+            }
+        }
+        FactPred::Proves => {
+            let RNode::Cmp(op, l, r) = &rule.nodes[*x as usize] else {
+                return None;
+            };
+            let (stored, swap) = op.canonical();
+            let (l, r) = if swap { (*r, *l) } else { (*l, *r) };
+            if let (RNode::Param(i), RNode::Param(j)) =
+                (&rule.nodes[l as usize], &rule.nodes[r as usize])
+            {
+                let (x, y) = (b.params[*i as usize]?, b.params[*j as usize]?);
+                // The same bound node on both sides is decided by identity.
+                if x == y {
+                    return Some(matches!(stored, CmpOp::Eq | CmpOp::Ule | CmpOp::Sle));
+                }
+                // An assumed ordering of the two decides it too.
+                if let Some(a) = env.assumptions
+                    && let Some((v, rel)) = cx.assumed_order(a, stored, x, y)
+                {
+                    if v {
+                        env.rel |= rel;
+                    }
+                    return Some(v);
+                }
+            }
+            let fl = operand_facts(env, cx, rule, b, l, widths, consts, lets)?;
+            let fr = operand_facts(env, cx, rule, b, r, widths, consts, lets)?;
+            crate::facts::decide_cmp(stored, &fl, &fr) == Some(true)
+        }
+    })
 }
 
 /// Builds the template through the canonicalizing constructors.

@@ -1502,6 +1502,9 @@ fn ask(
     if r.mba_unproved.contains_key(&key) {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    // What vouched for the answer (for an explanation): an answer from the cache was proved
+    // when it was found.
+    let mut evidence: (&'static str, Option<&'static str>, u64) = ("cache", None, 0);
     // The answer, and where it was lifted if it already was.
     let (cand, lifted) = match inner.mba.cache.get(&key) {
         Some(CacheEntry::NoSimpler) => {
@@ -1582,12 +1585,28 @@ fn ask(
                         discard(r, cx, before);
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    let proved = own.verdict == Verdict::Proved
-                        || inner.mba.prover.as_ref().is_some_and(|p| {
+                    let by =
+                        if own.verdict == Verdict::Proved {
+                            Some("certificate")
+                        } else if inner.mba.prover.as_ref().is_some_and(|p| {
                             p.prove_equal(&m, &expr, &cfg.budget) == Verdict::Proved
-                        })
-                        || (cfg.trust.backend_certificates && claim >= Claim::Proved)
-                        || cfg.trust.sampled;
+                        }) {
+                            Some("prover")
+                        } else if cfg.trust.backend_certificates && claim >= Claim::Proved {
+                            Some("backend")
+                        } else if cfg.trust.sampled {
+                            Some("sampled")
+                        } else {
+                            None
+                        };
+                    let proved = by.is_some();
+                    if let Some(by) = by {
+                        let test = own
+                            .cert
+                            .filter(|_| by == "certificate")
+                            .map(crate::mba::certify::Cert::name);
+                        evidence = (by, test, own.points);
+                    }
                     if !proved {
                         count(r).proof_unknown += 1;
                         discard(r, cx, before);
@@ -1641,6 +1660,12 @@ fn ask(
             return Ok(Step::Normal(Fin::FINAL));
         }
     }
+    r.explain_with(|| crate::engine::Explanation::Mba {
+        atoms: bindings.atoms.iter().map(|&a| cx.handle(a)).collect(),
+        evidence: evidence.0,
+        test: evidence.1,
+        points: evidence.2,
+    });
     let out = finish(
         r,
         cx,

@@ -320,12 +320,30 @@ opaque-constant sweep. `Event::Relied` follows a rewrite that holds only under s
 assumptions. Between them, the root never changes without an event saying so: from `Root`
 through each `Stage` and phase, the last root reported is the result.
 
+They also say what almost happened. `Event::GuardFailed` follows a `GuardFalse` with the
+guard's predicate that did not hold (`disjoint`, `is_pow2`, `proves`, …) and the nodes bound to
+its operands. `Event::NotSmaller` reports a candidate a pass built, or estimated, and dropped
+because it would not make the DAG smaller: the node, the candidate when it was built, the nodes
+it needs and the nodes it would free. `Event::Folded` reports a node that, rebuilt over its
+operands' new results, the constructors turned into something else (`x ^ 0` into `x`). And an
+observer whose `detail()` is `Detail::Explain` gets `Event::Explain` after each pass rewrite:
+the pass's reasoning as an `Explanation`, such as the linear form it read, the truth table, the
+relations of a compared pair, the layers the invert pass undid with the preimage under each, the
+divisor behind a magic number, or the evidence that vouched for an MBA answer. What a pass
+records follows how it works, so `Explanation` is not covered by the crate's compatibility
+promises and may change in any release.
+
 `Trace` is an observer that records all of it and writes the run as JSON Lines: a header with the
-strategy's phases, the rules and nodes the events name (operands first, numbered as in the
-context, so equal numbers are equal expressions), the events in order, each root's result and
-the run's counters. The same run writes the same trace, so two traces diff cleanly: across
-engine versions, strategies or budgets. `bitwright simplify --trace` writes one from the command
-line.
+strategy's phases, the rules the events name (with their text and the evidence their proof
+ledger records), the nodes they name (operands first, numbered as in the context, so equal
+numbers are equal expressions), the events in order, each root's result and the run's counters.
+`with_explanations` asks for the passes' reasoning, `with_facts` writes the known bits and
+intervals of every node the events name, `with_assumptions` the run's constraints, and
+`with_source` the text of rule programs of your own. The same run writes the same trace, so two
+traces diff cleanly: across engine versions, strategies or budgets. `bitwright simplify --trace`
+writes one from the command line, and the Workbench in the repository's `workbench/` shows one:
+each step with the whole expression before and after, the rule or the pass's reasoning, the
+phases, the candidates that did not make it, and the facts.
 
 ```rust
 use bitwright::engine::{Engine, Run, Trace};
@@ -336,7 +354,7 @@ let mut cx = Context::new();
 let e = cx.parse("((x ^ 0x5a) + 3 - 3) ^ 0x5a", &ParseOptions::width(Width::W32))?;
 let mut trace = Trace::new(&engine);
 let out = engine.run(&mut cx, &[e], Run::default().with_observer(&mut trace))?;
-let text = trace.to_jsonl(&cx, &[e], &out)?;
+let text = trace.to_jsonl(&mut cx, &[e], &out)?;
 
 let first = text.lines().next().unwrap();
 assert!(first.starts_with(r#"{"trace":"bitwright","format":1,"#));

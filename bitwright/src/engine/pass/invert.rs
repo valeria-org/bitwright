@@ -155,7 +155,23 @@ fn solve(
     lhs: u32,
     c: &BitVec,
 ) -> Result<Option<u32>, Stop> {
-    Ok(match invert::solve_eq(cx, o, lhs, c)? {
+    let mut peels = Vec::new();
+    let explaining = o.r.explaining();
+    let solved = invert::solve_eq_peels(cx, o, lhs, c, explaining.then_some(&mut peels))?;
+    if explaining && solved.is_some() {
+        let layers = peels
+            .into_iter()
+            .map(|(node, l, preimage)| crate::engine::Peel {
+                node: cx.handle(node),
+                inner: cx.handle(l.inner),
+                map: l.map.spelling(),
+                bijective: l.kind == invert::Kind::Bijective,
+                preimage,
+            })
+            .collect();
+        o.r.explain_with(|| crate::engine::Explanation::Invert { layers });
+    }
+    Ok(match solved {
         None => None,
         Some(Solved::Const(eq)) => Some(truth(o, cx, eq == (op == CmpOp::Eq))?),
         Some(Solved::Eq(x, v)) => Some(compare(o, cx, op, x, &v)?),

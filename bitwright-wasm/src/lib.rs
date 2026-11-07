@@ -12,7 +12,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
-use bw::engine::{Engine, Strategy};
+use bw::engine::{Engine, Run, Strategy, Trace};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::{Context, ParseOptions, Width};
 
@@ -54,6 +54,7 @@ const CHECK_REWRITE: u32 = 11;
 const INSTANTIATE: u32 = 12;
 const CHECK_TEMPLATE: u32 = 13;
 const NAMES: u32 = 14;
+const TRACE: u32 = 15;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -201,6 +202,46 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
         INSTANTIATE => compiler::instantiate(a, b, n),
         CHECK_TEMPLATE => compiler::check_template(a, b),
         NAMES => Ok(compiler::names()),
+        TRACE => {
+            // Options, a line each: `standard` (the standard engine), `assume <predicate>`.
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let e = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            let mut standard = false;
+            let mut assumptions = bw::Assumptions::new();
+            for line in b.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if line == "standard" {
+                    standard = true;
+                } else if let Some(p) = line.strip_prefix("assume ") {
+                    let p = cx.parse(p, &o).map_err(|e| format!("assume {p}: {e}"))?;
+                    assumptions
+                        .assume_true(&mut cx, p)
+                        .map_err(|e| format!("assume: {e} (a predicate is 1 bit wide)"))?;
+                } else {
+                    return Err(format!("unknown option `{line}`"));
+                }
+            }
+            let standard_engine;
+            let engine = if standard {
+                standard_engine = Engine::standard();
+                &standard_engine
+            } else {
+                deobfuscator()
+            };
+            let mut t = Trace::new(engine).with_explanations(true).with_facts(true);
+            t.with_assumptions(&mut cx, &assumptions)
+                .map_err(|e| e.to_string())?;
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[e],
+                    Run::default()
+                        .with_assumptions(&assumptions)
+                        .with_observer(&mut t),
+                )
+                .map_err(|e| e.to_string())?;
+            t.to_jsonl(&mut cx, &[e], &out).map_err(|e| e.to_string())
+        }
         _ => Err(format!("unknown operation {op}")),
     }
 }

@@ -788,8 +788,15 @@ round (the end carries the root it left, the meter's delta over the phase and th
 stopped it, if any), `Stage` for a rewrite of the whole root outside the phases (the MBA
 service's context push, case tables and opaque sweep), and `Relied` after an `Applied` that
 holds only under some assumptions. Together they account for every change of the root: from
-`Root` through each `Stage` and phase, the last root reported is the result. With no observer
-the cost is one predictable branch per event; the structural events are not built at all.
+`Root` through each `Stage` and phase, the last root reported is the result. Near misses are
+events too: `GuardFailed` (the guard predicate that did not hold, with its operands' nodes),
+`NotSmaller` (a pass's candidate the commit rule dropped, with the nodes it needs and frees,
+reported from `worth_building` and `pays`), and `Folded` (a rebuild the constructors turned into
+another operator). With `Observer::detail` at `Detail::Explain`, each pass records its reasoning
+for the step under way (`Runner::explain_with`) and `accept` emits it as `Explain` after the
+`Applied` (any commit or rejection consumes it, so it never outlives its step). `Explanation` is
+outside the compatibility promise: it follows the passes. With no observer the cost is one
+predictable branch per event; the structural events are not built at all.
 `RuleCensus` (per-rule counts) and `Trace` (every event, written out as JSON Lines with the
 nodes they name, each root's result and the counters; deterministic, so traces diff) ship with
 the library.

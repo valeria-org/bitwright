@@ -15,12 +15,13 @@
 
 pub(crate) mod budget;
 mod dispatch;
+mod explain;
 pub(crate) mod host;
 pub(crate) mod pass;
 mod stats;
 #[cfg(test)]
 pub(crate) mod tests;
-mod trace;
+pub(crate) mod trace;
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -28,10 +29,11 @@ use std::sync::{Arc, OnceLock};
 use core::fmt;
 
 pub use budget::{Admission, Allowance, Budget, Cap, Clock, Deadline, Exhausted};
+pub use explain::{Explanation, Peel, Source};
 pub use host::{Rewrite, Site};
 pub use stats::{
-    By, CertStats, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus, RuleCounts,
-    Stage, Stats,
+    By, CertStats, Detail, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus,
+    RuleCounts, Stage, Stats,
 };
 pub use trace::Trace;
 
@@ -1288,6 +1290,14 @@ struct Runner<'r, 'a> {
     /// In the MBA phase: the nodes whose question was considered before their operands were
     /// walked, with its finality when it was asked and not taken (see `pass::mba_first`).
     first: IdMap<u32, Option<Fin>>,
+    /// What the observer asks for ([`Detail::Events`] without one).
+    detail: Detail,
+    /// The name of the phase being run (`local`, or the pass's), for the events of the
+    /// passes' commit rule.
+    phase_name: &'static str,
+    /// The reasoning of the pass step under way, for the `Explain` event after its rewrite
+    /// (recorded only under [`Detail::Explain`]).
+    explain: Option<Explanation>,
 }
 
 impl Runner<'_, '_> {
@@ -1311,6 +1321,41 @@ impl Runner<'_, '_> {
                 before: cx.handle(before),
                 after: cx.handle(after),
             });
+        }
+    }
+
+    /// Reports a candidate the commit rule dropped (see [`Event::NotSmaller`]).
+    pub(crate) fn not_smaller(
+        &mut self,
+        cx: &Context,
+        n: u32,
+        candidate: Option<u32>,
+        added: u32,
+        freed: u32,
+        shared: bool,
+    ) {
+        if self.observing() {
+            self.emit(Event::NotSmaller {
+                by: By::Pass(self.phase_name),
+                node: cx.handle(n),
+                candidate: candidate.map(|c| cx.handle(c)),
+                added,
+                freed,
+                shared,
+            });
+        }
+    }
+
+    /// Whether the passes record their reasoning for an `Explain` event.
+    pub(crate) fn explaining(&self) -> bool {
+        self.detail >= Detail::Explain
+    }
+
+    /// Records the reasoning of the step under way (when explaining), for the `Explain` event
+    /// that follows its rewrite.
+    pub(crate) fn explain_with(&mut self, f: impl FnOnce() -> Explanation) {
+        if self.explaining() {
+            self.explain = Some(f());
         }
     }
 
@@ -1582,6 +1627,7 @@ impl Runner<'_, '_> {
                     // as a pass's is below, with nothing to wait on.
                     #[cfg(feature = "mba")]
                     if mba && !self.first.contains_key(&n) {
+                        self.explain = None;
                         let inner = self.inner;
                         if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
                             && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
@@ -1627,6 +1673,12 @@ impl Runner<'_, '_> {
                     }
                     if changed {
                         let n1 = self.build(cx, |cx| cx.rebuild(n, kids))?;
+                        if n1 != n && self.observing() && !same_operator(cx, n, n1, &kids) {
+                            self.emit(Event::Folded {
+                                node: cx.handle(n),
+                                after: cx.handle(n1),
+                            });
+                        }
                         if n1 != n
                             && (pending.contains_key(&n1)
                                 || (!local && self.rewritten.contains_key(&(n1, n))))
@@ -1647,6 +1699,8 @@ impl Runner<'_, '_> {
                             continue;
                         }
                     }
+                    // An explanation belongs to the step that records it.
+                    self.explain = None;
                     let step = match &self.inner.phases[phase] {
                         PhaseImpl::Local(..) => self.rewrite(cx, phase, n)?,
                         PhaseImpl::Pass(k) => pass::step(self, cx, *k, n)?,
@@ -1753,6 +1807,7 @@ impl Runner<'_, '_> {
                 rel: env.rel,
                 one_use: None,
                 shared,
+                failed: env.failed,
             };
             self.live = live;
             self.live_roots = roots;
@@ -1790,6 +1845,16 @@ impl Runner<'_, '_> {
                 } else if env.matched {
                     self.stats.guard_false += 1;
                     self.emit(Event::GuardFalse { rule });
+                    if let Some((pred, [a, b])) = env.failed
+                        && self.observing()
+                    {
+                        let h = |i: Option<u32>| i.map(|i| cx.handle(i));
+                        self.emit(Event::GuardFailed {
+                            rule,
+                            pred,
+                            args: [h(a), h(b)],
+                        });
+                    }
                 } else {
                     self.stats.no_match += 1;
                     self.emit(Event::NoMatch { rule });
@@ -1830,6 +1895,8 @@ impl Runner<'_, '_> {
         r: u32,
         rel: Reliance,
     ) -> Result<Accept, Stop> {
+        // The step's explanation goes with this application, taken or not.
+        let why = self.explain.take();
         if let Some(reason) = self.postcondition(cx, by, proven, n, r, rel)? {
             self.stats.rejected += 1;
             self.emit(Event::Rejected { by, reason });
@@ -1847,6 +1914,13 @@ impl Runner<'_, '_> {
         self.emit(Event::Applied { by, before, after });
         if !rel.is_none() {
             self.emit(Event::Relied { on: rel });
+        }
+        if let Some(why) = why {
+            self.emit(Event::Explain {
+                by,
+                node: before,
+                why: &why,
+            });
         }
         Ok(Accept::Yes)
     }
@@ -2269,7 +2343,13 @@ impl Engine {
             chain_parent: IdMap::default(),
             asks: IdMap::default(),
             first: IdMap::default(),
+            detail: Detail::Events,
+            phase_name: "",
+            explain: None,
         };
+        if let Some(o) = runner.observer.as_deref() {
+            runner.detail = o.detail();
+        }
         let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
         let mut failure: Option<Error> = None;
         // Roots whose result is not final only because of what other roots share, with their
@@ -2588,8 +2668,8 @@ impl Runner<'_, '_> {
             }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
-                let _ = p;
                 let spent0 = self.meter.spent;
+                self.phase_name = p.name();
                 if self.observing() {
                     self.emit(Event::PhaseBegin {
                         round,
@@ -2635,6 +2715,20 @@ impl Runner<'_, '_> {
         }
         Ok((cur, fin))
     }
+}
+
+/// Whether `n1`, the rebuild of `n` over new operands `kids`, is `n`'s operator over them (in
+/// any order: the constructors sort commutative operands), not a fold the constructors made.
+fn same_operator(cx: &Context, n: u32, n1: u32, kids: &[u32; 3]) -> bool {
+    let (a, b) = (cx.node(n), cx.node(n1));
+    if a.op != b.op {
+        return false;
+    }
+    let mut want: Vec<u32> = kids[..a.children().count()].to_vec();
+    let mut got: Vec<u32> = b.children().collect();
+    want.sort_unstable();
+    got.sort_unstable();
+    want == got
 }
 
 /// Whether the rule's guard asks `one_use`.

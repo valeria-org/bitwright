@@ -1,0 +1,9 @@
+# 32-bit expressions: MBA, masking, flags, casts, comparisons, shuffles.
+(((x ^ y) + 2*(x & y)) * 3 + ((x | y) - (x & y))) ^ (~z & z)
+((x ^ 0x5a) + 3 - 3) ^ 0x5a
+((a - b) >>u 31) ^ (((a ^ b) & (a ^ (a - b))) >>u 31)
+trunc<8>(zext<32>(c:8) + 256)
+(x <u 10) & (3 <u x)
+(x <=u y) & (x != y) & (x <s y)
+((x >>u 8) & 0xff) | ((x & 0xff) << 8) | (x & 0xffff0000)
+(x & y) + (x | y)

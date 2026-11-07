@@ -252,6 +252,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         return Ok(None);
     }
     if let Some(f) = worth_building(r, cx, n, &[x], estimate)? {
+        r.stats
+            .passes
+            .entry(PassKind::Xor.name())
+            .or_default()
+            .rejected_cost += 1;
         return Ok(Some(Step::Normal(f)));
     }
     let before = cx.len() as u32;

@@ -5,14 +5,15 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use super::{
-    Budget, By, CertStats, Decline, End, Engine, Event, Exhausted, MbaStats, Observer, Outcome,
-    PassCounts, Phase, Reject, Stage, Stats,
+    Budget, By, CertStats, Decline, Detail, End, Engine, Event, Exhausted, Explanation, MbaStats,
+    Observer, Outcome, PassCounts, Phase, Reject, Stage, Stats,
 };
 use crate::error::Error;
 use crate::expr::{Context, Expr, View};
-use crate::facts::Reliance;
+use crate::facts::{Assumptions, Facts, Reliance};
 use crate::hash::IdMap;
 use crate::ops::CmpOpExt;
+use crate::rules::{Ledger, Rule, RuleKind};
 
 /// Records a run's events and writes them out as a trace.
 ///
@@ -28,7 +29,7 @@ use crate::ops::CmpOpExt;
 /// let e = cx.parse("((x ^ 0x5a) + 3 - 3) ^ 0x5a", &ParseOptions::width(Width::W32))?;
 /// let mut trace = Trace::new(&engine);
 /// let out = engine.run(&mut cx, &[e], Run::default().with_observer(&mut trace))?;
-/// let text = trace.to_jsonl(&cx, &[e], &out)?;
+/// let text = trace.to_jsonl(&mut cx, &[e], &out)?;
 /// assert!(text.lines().any(|l| l.contains(r#""ev":"applied","pass":"linear""#)));
 /// # Ok::<(), bitwright::Error>(())
 /// ```
@@ -40,39 +41,77 @@ use crate::ops::CmpOpExt;
 /// - a header: `{"trace":"bitwright","format":1,"version":…,"strategy":…,"max_rounds":…,
 ///   "phases":[{"name":"fact_fold"},{"name":"local","groups":[…]},…]}`;
 /// - each rule and host rewrite the events name, numbered from 0 in order of appearance:
-///   `{"rule":0,"name":"core.arith::add_xor_and","id":"…"}`, `{"rewrite":0,"name":…}`;
-/// - each node the events and results name, with every node below it, operands first:
-///   `{"node":12,"op":"add","w":32,"args":[5,9],"text":"x + y"}`. `op` is `const` (with
+///   `{"rule":0,"name":"core.arith::add_xor_and","id":"…","kind":"identity","proven":true,
+///   "doc":…,"examples":[["…","…"]],"source":…,"ledger":…}` (`source`, the rule as written,
+///   and `ledger`, the evidence its proof ledger records, when known: always for the built-in
+///   rules, and for others from [`with_source`](Trace::with_source)), `{"rewrite":0,"name":…}`;
+/// - each node the events, results and assumptions name, with every node below it, operands
+///   first: `{"node":12,"op":"add","w":32,"args":[5,9],"text":"x + y"}`. `op` is `const` (with
 ///   `value`), `sym` (with `name`), a unary or binary operator's name, `cmp` (with `pred`, its
 ///   spelling: `<u`), `zext`, `sext`, `extract` (with `lo`), `concat`, `select`, `fp` (with
 ///   `fp_op` and `format`) or `ext` (with `output`). Node numbers are the context's own, so a
 ///   node keeps its number across the whole trace: equal numbers are equal expressions. Only
-///   the nodes events name carry `text`, the expression as the printer writes it;
+///   the nodes named directly carry `text`, the expression as the printer writes it, and, with
+///   [`with_facts`](Trace::with_facts), `facts` (`{"zero":"0x…","one":"0x…","u":["0x…","0x…"],
+///   "stride":1,"s":["0x…","0x…"]}`: the known zero and one bits, the unsigned interval and
+///   its stride, the signed interval as bit patterns) and, under assumptions where they differ,
+///   `assumed` (the same, with `relies`);
+/// - each constraint of the run's assumptions ([`with_assumptions`](Trace::with_assumptions)):
+///   `{"assume":0,"expr":40}`;
 /// - the events, in order: `{"ev":"root","index":0,"root":20}` (with `"again":true` for a root
 ///   worked on again), `{"ev":"stage","stage":"cases","before":…,"after":…}`,
 ///   `{"ev":"phase_begin","round":0,"phase":1,"root":…}`, `{"ev":"candidate","rule":3,"node":…}`,
-///   `{"ev":"no_match","rule":3}` (also `guard_false`, `degraded`, `no_change`),
-///   `{"ev":"applied","rule":3,"before":…,"after":…}` (or `"pass":"linear"`, or
-///   `"rewrite":0`), `{"ev":"relied","on":[0,2]}` (with `"later":true` when constraints from
-///   63 on may be among them), `{"ev":"vetoed",…}`, `{"ev":"rejected",…,"reason":"verify"}`,
-///   `{"ev":"phase_end","round":0,"phase":1,"root":…,"spent":{"node_visits":16,…}}` (the
-///   nonzero work only; with `"stopped":"node_visits"` when a limit stopped it);
+///   `{"ev":"no_match","rule":3,"node":…}` (also `degraded` and `no_change`),
+///   `{"ev":"guard_false","rule":3,"node":…,"pred":"disjoint","args":[5,9]}` (`args` null where
+///   an operand is no parameter), `{"ev":"applied","rule":3,"before":…,"after":…}` (or
+///   `"pass":"linear"`, or `"rewrite":0`), `{"ev":"relied","on":[0,2]}` (with `"later":true`
+///   when constraints from 63 on may be among them), `{"ev":"explain","pass":"invert",
+///   "node":…,"why":{"kind":"invert",…}}`, `{"ev":"not_smaller","pass":"linear","node":…,
+///   "candidate":…,"added":4,"freed":3,"shared":false}` (`candidate` null when it was not
+///   built), `{"ev":"folded","node":…,"after":…}`, `{"ev":"vetoed",…}`,
+///   `{"ev":"rejected",…,"reason":"verify"}`, `{"ev":"phase_end","round":0,"phase":1,
+///   "root":…,"spent":{"node_visits":16,…}}` (the nonzero work only; with
+///   `"stopped":"node_visits"` when a limit stopped it);
 /// - each root's result: `{"result":0,"input":20,"expr":31,"changed":true,"end":"completed",
 ///   "relies_on":[]}` (`end` is also `budget_terminated`, with `stopped`, or `declined`, with
 ///   `cap`);
 /// - the run's counters: `{"stats":{…}}`, every field of [`Stats`] by name.
 ///
-/// The same run of the same engine on the same input writes the same trace.
+/// The `why` of an `explain` event is the pass's [`Explanation`] as an object with its `kind`;
+/// like the type, its fields may change in any release. A reader should skip events, fields
+/// and kinds it does not know. The same run of the same engine on the same input writes the
+/// same trace.
 #[derive(Clone, Debug)]
 pub struct Trace {
     strategy: String,
     max_rounds: u8,
     phases: Vec<(&'static str, Vec<String>)>,
-    rules: Vec<(String, String)>,
+    detail: Detail,
+    facts: bool,
+    /// Whether each linked rule is vouched for by its program's ledger, by name.
+    proven: HashMap<String, bool>,
+    /// Rule sources with their ledgers, for the rules' text and evidence.
+    sources: Vec<(String, Option<Ledger>)>,
+    rules: Vec<RuleInfo>,
     rule_index: HashMap<String, u32>,
     rewrites: Vec<String>,
     rewrite_index: HashMap<String, u32>,
     records: Vec<Rec>,
+    explanations: Vec<Explanation>,
+    assumptions: Vec<Expr>,
+    /// The node of the last candidate, for the outcome of the attempt that follows it.
+    last_candidate: Option<Expr>,
+}
+
+/// What the trace says about a rule.
+#[derive(Clone, Debug)]
+struct RuleInfo {
+    name: String,
+    id: String,
+    identity: bool,
+    doc: String,
+    examples: Vec<(String, String)>,
+    span: (usize, usize),
 }
 
 /// What made a rewrite, by its number in the trace.
@@ -83,18 +122,20 @@ enum Who {
     Rewrite(u32),
 }
 
-/// An event, owned.
+/// An event, owned. Explanations are kept apart, by index.
 #[derive(Copy, Clone, Debug)]
 enum Rec {
     Candidate(u32, Expr),
-    NoMatch(u32),
-    GuardFalse(u32),
-    Degraded(u32),
-    NoChange(u32),
+    /// `no_match`, `degraded` or `no_change`, by name, with the candidate's node.
+    Attempt(&'static str, u32, Option<Expr>),
+    GuardFalse(u32, Option<Expr>, Option<(&'static str, [Option<Expr>; 2])>),
     Applied(Who, Expr, Expr),
     Vetoed(Who),
     Rejected(Who, Reject),
     Relied(Reliance),
+    Explain(Who, Expr, usize),
+    NotSmaller(Who, Expr, Option<Expr>, u32, u32, bool),
+    Folded(Expr, Expr),
     Root(usize, Expr, bool),
     Stage(Stage, Expr, Expr),
     PhaseBegin(u8, usize, Expr),
@@ -105,9 +146,11 @@ impl Trace {
     /// The trace format this version writes.
     pub const FORMAT: u32 = 1;
 
-    /// An empty trace of runs of `engine` (its strategy goes in the header).
+    /// An empty trace of runs of `engine` (its strategy goes in the header), which knows the
+    /// built-in rules' text and proof ledger.
     pub fn new(engine: &Engine) -> Trace {
         let s = engine.strategy();
+        let inner = &engine.inner;
         Trace {
             strategy: s.name.to_string(),
             max_rounds: s.max_rounds,
@@ -119,12 +162,55 @@ impl Trace {
                     p => (p.name(), Vec::new()),
                 })
                 .collect(),
+            detail: Detail::Events,
+            facts: false,
+            proven: inner
+                .rules
+                .iter()
+                .zip(inner.proven.iter())
+                .map(|(r, &p)| (r.name.clone(), p))
+                .collect(),
+            sources: vec![(
+                crate::rules::corpus::CORE.to_string(),
+                Ledger::parse(crate::rules::corpus::CORE_LEDGER).ok(),
+            )],
             rules: Vec::new(),
             rule_index: HashMap::new(),
             rewrites: Vec::new(),
             rewrite_index: HashMap::new(),
             records: Vec::new(),
+            explanations: Vec::new(),
+            assumptions: Vec::new(),
+            last_candidate: None,
         }
+    }
+
+    /// Asks the engine for the passes' reasoning too ([`Detail::Explain`]), recorded as
+    /// `explain` events.
+    pub fn with_explanations(mut self, yes: bool) -> Trace {
+        self.detail = if yes { Detail::Explain } else { Detail::Events };
+        self
+    }
+
+    /// Writes the facts of every node named directly: known bits and intervals, and under the
+    /// assumptions given to [`with_assumptions`](Trace::with_assumptions) where they differ.
+    pub fn with_facts(mut self, yes: bool) -> Trace {
+        self.facts = yes;
+        self
+    }
+
+    /// The source of a rule program the engine links, with the ledger that vouches for it:
+    /// the trace gives the text and evidence of its rules (those of the groups it declares).
+    pub fn with_source(mut self, source: &str, ledger: Option<&Ledger>) -> Trace {
+        self.sources.push((source.to_string(), ledger.cloned()));
+        self
+    }
+
+    /// Records the run's assumptions, written as `assume` lines (and used for the facts under
+    /// them). Call it with the assumptions the run is given.
+    pub fn with_assumptions(&mut self, cx: &mut Context, a: &Assumptions) -> Result<(), Error> {
+        self.assumptions = a.predicates(cx)?;
+        Ok(())
     }
 
     /// The number of events recorded.
@@ -137,12 +223,19 @@ impl Trace {
         self.records.is_empty()
     }
 
-    fn rule(&mut self, rule: &crate::rules::Rule) -> u32 {
+    fn rule(&mut self, rule: &Rule) -> u32 {
         if let Some(&k) = self.rule_index.get(rule.name.as_str()) {
             return k;
         }
         let k = self.rules.len() as u32;
-        self.rules.push((rule.name.clone(), rule.id.to_string()));
+        self.rules.push(RuleInfo {
+            name: rule.name.clone(),
+            id: rule.id.to_string(),
+            identity: rule.kind == RuleKind::Identity,
+            doc: rule.doc.clone(),
+            examples: rule.examples.clone(),
+            span: rule.span,
+        });
         self.rule_index.insert(rule.name.clone(), k);
         k
     }
@@ -163,75 +256,189 @@ impl Trace {
         }
     }
 
-    /// The run as a trace: the header, the rules and nodes the events name, the events, the
-    /// result of each root (`roots[i]` is answered by `outcome.roots[i]`) and the counters. See
-    /// [`Trace`] for the format. Fails when an expression is not of `cx`.
+    /// The rule's text and ledger evidence, from the source declaring its group.
+    fn source_of(&self, r: &RuleInfo) -> (Option<&str>, Option<String>) {
+        let group = r.name.split("::").next().unwrap_or("");
+        let decl = format!("group {group} {{");
+        for (src, ledger) in &self.sources {
+            if !src.contains(&decl) {
+                continue;
+            }
+            let text = src.get(r.span.0..r.span.1);
+            let ev = ledger.as_ref().and_then(|l| {
+                l.entries
+                    .get(&r.name)
+                    .filter(|(id, _, _)| *id == r.id)
+                    .map(|(_, kind, ev)| format!("{kind} {ev}"))
+            });
+            return (text, ev);
+        }
+        (None, None)
+    }
+
+    /// The run as a trace: the header, the rules and nodes the events name, the assumptions,
+    /// the events, the result of each root (`roots[i]` is answered by `outcome.roots[i]`) and
+    /// the counters. See [`Trace`] for the format. Fails when an expression is not of `cx`.
     pub fn to_jsonl(
         &self,
-        cx: &Context,
+        cx: &mut Context,
         roots: &[Expr],
         outcome: &Outcome,
     ) -> Result<String, Error> {
         // The nodes the trace names directly, in order of first mention.
-        let mut named: Vec<u32> = Vec::new();
-        let mut seen: IdMap<u32, ()> = IdMap::default();
-        let mut name = |e: Expr| -> Result<(), Error> {
-            let i = cx.id(e)?;
-            if seen.insert(i, ()).is_none() {
-                named.push(i);
-            }
-            Ok(())
-        };
-        for (&input, r) in roots.iter().zip(&outcome.roots) {
-            name(input)?;
-            name(r.expr)?;
-        }
-        for rec in &self.records {
-            match *rec {
-                Rec::Candidate(_, e) | Rec::Root(_, e, _) | Rec::PhaseBegin(_, _, e) => name(e)?,
-                Rec::PhaseEnd(_, _, e, ..) => name(e)?,
-                Rec::Applied(_, a, b) | Rec::Stage(_, a, b) => {
-                    name(a)?;
-                    name(b)?;
+        let mut named: Vec<Expr> = Vec::new();
+        {
+            let mut seen: IdMap<u32, ()> = IdMap::default();
+            let cxr: &Context = cx;
+            let mut name = |e: Expr| -> Result<(), Error> {
+                if seen.insert(cxr.id(e)?, ()).is_none() {
+                    named.push(e);
                 }
-                Rec::NoMatch(_)
-                | Rec::GuardFalse(_)
-                | Rec::Degraded(_)
-                | Rec::NoChange(_)
-                | Rec::Vetoed(_)
-                | Rec::Rejected(..)
-                | Rec::Relied(_) => {}
+                Ok(())
+            };
+            for (&input, r) in roots.iter().zip(&outcome.roots) {
+                name(input)?;
+                name(r.expr)?;
+            }
+            for &a in &self.assumptions {
+                name(a)?;
+            }
+            for rec in &self.records {
+                match *rec {
+                    Rec::Candidate(_, e)
+                    | Rec::Root(_, e, _)
+                    | Rec::PhaseBegin(_, _, e)
+                    | Rec::Explain(_, e, _) => name(e)?,
+                    Rec::PhaseEnd(_, _, e, ..) => name(e)?,
+                    Rec::Applied(_, a, b) | Rec::Stage(_, a, b) | Rec::Folded(a, b) => {
+                        name(a)?;
+                        name(b)?;
+                    }
+                    Rec::NotSmaller(_, a, b, ..) => {
+                        name(a)?;
+                        if let Some(b) = b {
+                            name(b)?;
+                        }
+                    }
+                    Rec::Attempt(_, _, e) => {
+                        if let Some(e) = e {
+                            name(e)?;
+                        }
+                    }
+                    Rec::GuardFalse(_, e, d) => {
+                        for e in e
+                            .into_iter()
+                            .chain(d.into_iter().flat_map(|(_, a)| a).flatten())
+                        {
+                            name(e)?;
+                        }
+                    }
+                    Rec::Vetoed(_) | Rec::Rejected(..) | Rec::Relied(_) => {}
+                }
+            }
+            for why in &self.explanations {
+                let mut res = Ok(());
+                super::explain::exprs(why, &mut |e| {
+                    if res.is_ok() {
+                        res = name(e);
+                    }
+                });
+                res?;
             }
         }
-        let direct = seen;
+        // Their facts, before anything is written (they need the context mutably).
+        let mut facts: IdMap<u32, (Facts, Option<(Facts, Reliance)>)> = IdMap::default();
+        if self.facts {
+            let under = if self.assumptions.is_empty() {
+                None
+            } else {
+                let mut a = Assumptions::new();
+                for &p in &self.assumptions {
+                    a.assume_true(cx, p)?;
+                }
+                Some(a)
+            };
+            for &e in &named {
+                let Some(base) = cx.try_facts(e)? else {
+                    continue;
+                };
+                let assumed = match &under {
+                    Some(a) => cx.facts_under(e, a)?.filter(|(f, _)| *f != base),
+                    None => None,
+                };
+                facts.insert(cx.id(e)?, (base, assumed));
+            }
+        }
+        let cx: &Context = cx;
+        let direct: IdMap<u32, ()> = named
+            .iter()
+            .filter_map(|&e| cx.id(e).ok().map(|i| (i, ())))
+            .collect();
 
         let mut out = String::new();
         self.header(&mut out);
-        for (k, (n, id)) in self.rules.iter().enumerate() {
-            out.push_str("{\"rule\":");
-            num(&mut out, k as u64);
-            out.push_str(",\"name\":");
-            jstr(&mut out, n);
-            out.push_str(",\"id\":");
-            jstr(&mut out, id);
-            out.push_str("}\n");
+        for (k, r) in self.rules.iter().enumerate() {
+            let mut o = Obj::new(&mut out);
+            o.num("rule", k as u64);
+            o.str("name", &r.name);
+            o.str("id", &r.id);
+            o.str("kind", if r.identity { "identity" } else { "rule" });
+            if let Some(&p) = self.proven.get(&r.name) {
+                o.bool("proven", p);
+            }
+            if !r.doc.is_empty() {
+                o.str("doc", &r.doc);
+            }
+            if !r.examples.is_empty() {
+                o.key("examples");
+                o.out.push('[');
+                for (j, (a, b)) in r.examples.iter().enumerate() {
+                    if j > 0 {
+                        o.out.push(',');
+                    }
+                    o.out.push('[');
+                    jstr(o.out, a);
+                    o.out.push(',');
+                    jstr(o.out, b);
+                    o.out.push(']');
+                }
+                o.out.push(']');
+            }
+            let (text, ev) = self.source_of(r);
+            if let Some(t) = text {
+                o.str("source", t);
+            }
+            if let Some(ev) = ev {
+                o.str("ledger", &ev);
+            }
+            o.end();
+            out.push('\n');
         }
         for (k, n) in self.rewrites.iter().enumerate() {
-            out.push_str("{\"rewrite\":");
-            num(&mut out, k as u64);
-            out.push_str(",\"name\":");
-            jstr(&mut out, n);
-            out.push_str("}\n");
+            let mut o = Obj::new(&mut out);
+            o.num("rewrite", k as u64);
+            o.str("name", n);
+            o.end();
+            out.push('\n');
         }
 
         // Every node below the named ones, operands first, each once.
         let mut written: IdMap<u32, ()> = IdMap::default();
         let mut stack: Vec<(u32, bool)> = Vec::new();
         for &top in &named {
-            stack.push((top, false));
+            stack.push((cx.id(top)?, false));
             while let Some((i, expanded)) = stack.pop() {
                 if expanded {
                     node_line(&mut out, cx, i, direct.contains_key(&i));
+                    if let Some((base, assumed)) = facts.get(&i) {
+                        out.push_str(",\"facts\":");
+                        facts_obj(&mut out, base, None);
+                        if let Some((f, rel)) = assumed {
+                            out.push_str(",\"assumed\":");
+                            facts_obj(&mut out, f, Some(*rel));
+                        }
+                    }
+                    out.push_str("}\n");
                     continue;
                 }
                 if written.insert(i, ()).is_some() {
@@ -247,7 +454,22 @@ impl Trace {
             }
         }
 
-        let id = |e: Expr| cx.id(e).unwrap_or(0) as u64;
+        let id = |e: Expr| u64::from(cx.id(e).unwrap_or(0));
+        let opt = |out: &mut String, k: &str, e: Option<Expr>| {
+            out.push_str(",\"");
+            out.push_str(k);
+            out.push_str("\":");
+            match e {
+                Some(e) => num(out, id(e)),
+                None => out.push_str("null"),
+            }
+        };
+        for (k, &a) in self.assumptions.iter().enumerate() {
+            out.push_str("{\"assume\":");
+            num(&mut out, k as u64);
+            field(&mut out, "expr", id(a));
+            out.push_str("}\n");
+        }
         for rec in &self.records {
             out.push_str("{\"ev\":");
             match *rec {
@@ -256,17 +478,30 @@ impl Trace {
                     num(&mut out, u64::from(r));
                     field(&mut out, "node", id(e));
                 }
-                Rec::NoMatch(r) | Rec::GuardFalse(r) | Rec::Degraded(r) | Rec::NoChange(r) => {
-                    jstr(
-                        &mut out,
-                        match rec {
-                            Rec::NoMatch(_) => "no_match",
-                            Rec::GuardFalse(_) => "guard_false",
-                            Rec::Degraded(_) => "degraded",
-                            _ => "no_change",
-                        },
-                    );
+                Rec::Attempt(what, r, e) => {
+                    jstr(&mut out, what);
                     field(&mut out, "rule", u64::from(r));
+                    opt(&mut out, "node", e);
+                }
+                Rec::GuardFalse(r, e, detail) => {
+                    out.push_str("\"guard_false\"");
+                    field(&mut out, "rule", u64::from(r));
+                    opt(&mut out, "node", e);
+                    if let Some((pred, [a, b])) = detail {
+                        out.push_str(",\"pred\":");
+                        jstr(&mut out, pred);
+                        out.push_str(",\"args\":[");
+                        for (j, x) in [a, b].into_iter().enumerate() {
+                            if j > 0 {
+                                out.push(',');
+                            }
+                            match x {
+                                Some(x) => num(&mut out, id(x)),
+                                None => out.push_str("null"),
+                            }
+                        }
+                        out.push(']');
+                    }
                 }
                 Rec::Applied(w, a, b) => {
                     out.push_str("\"applied\"");
@@ -287,6 +522,31 @@ impl Trace {
                 Rec::Relied(on) => {
                     out.push_str("\"relied\",\"on\":");
                     reliance(&mut out, on, "later");
+                }
+                Rec::Explain(w, e, k) => {
+                    out.push_str("\"explain\"");
+                    who(&mut out, w);
+                    field(&mut out, "node", id(e));
+                    out.push_str(",\"why\":");
+                    super::explain::write(&mut out, &self.explanations[k], &id);
+                }
+                Rec::NotSmaller(w, e, c, added, freed, shared) => {
+                    out.push_str("\"not_smaller\"");
+                    who(&mut out, w);
+                    field(&mut out, "node", id(e));
+                    opt(&mut out, "candidate", c);
+                    field(&mut out, "added", u64::from(added));
+                    field(&mut out, "freed", u64::from(freed));
+                    out.push_str(if shared {
+                        ",\"shared\":true"
+                    } else {
+                        ",\"shared\":false"
+                    });
+                }
+                Rec::Folded(a, b) => {
+                    out.push_str("\"folded\"");
+                    field(&mut out, "node", id(a));
+                    field(&mut out, "after", id(b));
                 }
                 Rec::Root(index, e, again) => {
                     out.push_str("\"root\"");
@@ -400,15 +660,48 @@ impl Trace {
 impl Observer for Trace {
     fn event(&mut self, event: Event<'_>) {
         let rec = match event {
-            Event::Candidate { rule, node } => Rec::Candidate(self.rule(rule), node),
-            Event::NoMatch { rule } => Rec::NoMatch(self.rule(rule)),
-            Event::GuardFalse { rule } => Rec::GuardFalse(self.rule(rule)),
-            Event::Degraded { rule } => Rec::Degraded(self.rule(rule)),
-            Event::NoChange { rule } => Rec::NoChange(self.rule(rule)),
+            Event::Candidate { rule, node } => {
+                self.last_candidate = Some(node);
+                Rec::Candidate(self.rule(rule), node)
+            }
+            Event::NoMatch { rule } => {
+                Rec::Attempt("no_match", self.rule(rule), self.last_candidate)
+            }
+            Event::Degraded { rule } => {
+                Rec::Attempt("degraded", self.rule(rule), self.last_candidate)
+            }
+            Event::NoChange { rule } => {
+                Rec::Attempt("no_change", self.rule(rule), self.last_candidate)
+            }
+            Event::GuardFalse { rule } => {
+                Rec::GuardFalse(self.rule(rule), self.last_candidate, None)
+            }
+            Event::GuardFailed { rule, pred, args } => {
+                let k = self.rule(rule);
+                if let Some(Rec::GuardFalse(r, _, d)) = self.records.last_mut()
+                    && *r == k
+                {
+                    *d = Some((pred, args));
+                }
+                return;
+            }
             Event::Applied { by, before, after } => Rec::Applied(self.who(by), before, after),
             Event::Vetoed { by } => Rec::Vetoed(self.who(by)),
             Event::Rejected { by, reason } => Rec::Rejected(self.who(by), reason),
             Event::Relied { on } => Rec::Relied(on),
+            Event::Explain { by, node, why } => {
+                self.explanations.push(why.clone());
+                Rec::Explain(self.who(by), node, self.explanations.len() - 1)
+            }
+            Event::NotSmaller {
+                by,
+                node,
+                candidate,
+                added,
+                freed,
+                shared,
+            } => Rec::NotSmaller(self.who(by), node, candidate, added, freed, shared),
+            Event::Folded { node, after } => Rec::Folded(node, after),
             Event::Root { index, root, again } => Rec::Root(index, root, again),
             Event::Stage {
                 stage,
@@ -426,9 +719,39 @@ impl Observer for Trace {
         };
         self.records.push(rec);
     }
+
+    fn detail(&self) -> Detail {
+        self.detail
+    }
 }
 
-/// One node's line.
+/// Facts as an object (see the format), with what they rely on.
+fn facts_obj(out: &mut String, f: &Facts, rel: Option<Reliance>) {
+    let hex = |v: crate::BitVec| format!("{v:#x}");
+    let mut o = Obj::new(out);
+    o.str("zero", &hex(f.known().known_zero()));
+    o.str("one", &hex(f.known().known_one()));
+    o.key("u");
+    o.out.push('[');
+    jstr(o.out, &hex(f.urange().lo()));
+    o.out.push(',');
+    jstr(o.out, &hex(f.urange().hi()));
+    o.out.push(']');
+    o.num("stride", f.urange().stride());
+    o.key("s");
+    o.out.push('[');
+    jstr(o.out, &hex(f.srange().lo()));
+    o.out.push(',');
+    jstr(o.out, &hex(f.srange().hi()));
+    o.out.push(']');
+    if let Some(r) = rel {
+        o.key("relies");
+        reliance(o.out, r, "relies_later");
+    }
+    o.end();
+}
+
+/// One node's line, left open for its facts.
 fn node_line(out: &mut String, cx: &Context, i: u32, text: bool) {
     out.push_str("{\"node\":");
     num(out, u64::from(i));
@@ -491,7 +814,6 @@ fn node_line(out: &mut String, cx: &Context, i: u32, text: bool) {
         out.push_str(",\"text\":");
         jstr(out, &cx.display(e).to_string());
     }
-    out.push_str("}\n");
 }
 
 fn who(out: &mut String, w: Who) {
@@ -802,18 +1124,18 @@ fn exhausted_name(e: Exhausted) -> &'static str {
 }
 
 /// A JSON object being written: keys separated by commas.
-struct Obj<'o> {
-    out: &'o mut String,
+pub(super) struct Obj<'o> {
+    pub(super) out: &'o mut String,
     first: bool,
 }
 
 impl<'o> Obj<'o> {
-    fn new(out: &'o mut String) -> Obj<'o> {
+    pub(super) fn new(out: &'o mut String) -> Obj<'o> {
         out.push('{');
         Obj { out, first: true }
     }
 
-    fn key(&mut self, k: &str) {
+    pub(super) fn key(&mut self, k: &str) {
         if !self.first {
             self.out.push(',');
         }
@@ -822,30 +1144,40 @@ impl<'o> Obj<'o> {
         self.out.push(':');
     }
 
-    fn num(&mut self, k: &str, v: u64) {
+    pub(super) fn num(&mut self, k: &str, v: u64) {
         self.key(k);
         num(self.out, v);
     }
 
-    fn end(self) {
+    pub(super) fn str(&mut self, k: &str, v: &str) {
+        self.key(k);
+        jstr(self.out, v);
+    }
+
+    pub(super) fn bool(&mut self, k: &str, v: bool) {
+        self.key(k);
+        self.out.push_str(if v { "true" } else { "false" });
+    }
+
+    pub(super) fn end(self) {
         self.out.push('}');
     }
 }
 
 /// `,"<k>":<v>`.
-fn field(out: &mut String, k: &str, v: u64) {
+pub(super) fn field(out: &mut String, k: &str, v: u64) {
     out.push_str(",\"");
     out.push_str(k);
     out.push_str("\":");
     num(out, v);
 }
 
-fn num(out: &mut String, v: u64) {
+pub(super) fn num(out: &mut String, v: u64) {
     let _ = write!(out, "{v}");
 }
 
 /// `s` as a JSON string.
-fn jstr(out: &mut String, s: &str) {
+pub(super) fn jstr(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {

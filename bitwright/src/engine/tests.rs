@@ -2731,13 +2731,22 @@ mod events {
         Candidate(String),
         Applied(String, Expr, Expr),
         Relied(Reliance),
+        GuardFalse(String),
+        GuardFailed(String, &'static str, [Option<Expr>; 2]),
+        NotSmaller(String, Expr, Option<Expr>, u32, u32),
+        Folded(Expr, Expr),
+        Explain(String, Expr, Explanation),
         Other,
     }
 
     #[derive(Default)]
-    struct Log(Vec<Ev>);
+    struct Log(Vec<Ev>, Detail);
 
     impl Observer for Log {
+        fn detail(&self) -> Detail {
+            self.1
+        }
+
         fn event(&mut self, e: Event<'_>) {
             let i = |e: Expr| e;
             self.0.push(match e {
@@ -2764,6 +2773,22 @@ mod events {
                     Ev::Applied(by, i(before), i(after))
                 }
                 Event::Relied { on } => Ev::Relied(on),
+                Event::GuardFalse { rule } => Ev::GuardFalse(rule.name.clone()),
+                Event::GuardFailed { rule, pred, args } => {
+                    Ev::GuardFailed(rule.name.clone(), pred, args)
+                }
+                Event::NotSmaller {
+                    by,
+                    node,
+                    candidate,
+                    added,
+                    freed,
+                    ..
+                } => Ev::NotSmaller(by.name().to_string(), node, candidate, added, freed),
+                Event::Folded { node, after } => Ev::Folded(node, after),
+                Event::Explain { by, node, why } => {
+                    Ev::Explain(by.name().to_string(), node, why.clone())
+                }
                 _ => Ev::Other,
             });
         }
@@ -2775,7 +2800,17 @@ mod events {
         roots: &[Expr],
         assumptions: Option<&Assumptions>,
     ) -> (Log, Outcome) {
-        let mut log = Log::default();
+        logged_with(engine, cx, roots, assumptions, Detail::Events)
+    }
+
+    fn logged_with(
+        engine: &Engine,
+        cx: &mut Context,
+        roots: &[Expr],
+        assumptions: Option<&Assumptions>,
+        detail: Detail,
+    ) -> (Log, Outcome) {
+        let mut log = Log(Vec::new(), detail);
         let mut run = Run::default().with_observer(&mut log);
         if let Some(a) = assumptions {
             run = run.with_assumptions(a);
@@ -2844,6 +2879,28 @@ mod events {
                     matches!(log.0.get(k.wrapping_sub(1)), Some(Ev::Applied(..))),
                     "a reliance follows its rewrite"
                 ),
+                Ev::GuardFalse(_) | Ev::Folded(..) => {
+                    assert!(open.is_some(), "{e:?} happens inside a phase");
+                }
+                Ev::GuardFailed(rule, ..) => assert!(
+                    matches!(log.0.get(k.wrapping_sub(1)), Some(Ev::GuardFalse(r)) if r == rule),
+                    "a guard's detail follows its GuardFalse"
+                ),
+                Ev::NotSmaller(by, ..) => {
+                    let (_, phase) = open.expect("a pass drops a candidate inside a phase");
+                    assert_eq!(by, phases[phase].name(), "a pass's own phase drops it");
+                }
+                Ev::Explain(by, node, _) => {
+                    // After the rewrite it explains, and its reliance if any.
+                    let prev = log.0[..k]
+                        .iter()
+                        .rev()
+                        .find(|e| !matches!(e, Ev::Relied(_)));
+                    assert!(
+                        matches!(prev, Some(Ev::Applied(b, before, _)) if b == by && before == node),
+                        "an explanation follows its own rewrite: {prev:?}"
+                    );
+                }
                 Ev::Other => {}
             }
         }
@@ -3083,7 +3140,7 @@ mod events {
         let out = engine
             .run(&mut cx, &[e], Run::default().with_observer(&mut trace))
             .unwrap();
-        let text = trace.to_jsonl(&cx, &[e], &out).unwrap();
+        let text = trace.to_jsonl(&mut cx, &[e], &out).unwrap();
         (text, out)
     }
 
@@ -3139,6 +3196,276 @@ mod events {
                 traced(&engine, input, w).0,
                 "{input}"
             );
+        }
+    }
+
+    fn all_engines() -> Vec<Engine> {
+        #[cfg_attr(not(feature = "mba"), allow(unused_mut))]
+        let mut engines = vec![Engine::standard(), deobfuscator()];
+        #[cfg(feature = "mba")]
+        {
+            engines.push(
+                Engine::builder()
+                    .builtin()
+                    .strategy(Strategy::deobfuscate().with_mba(crate::mba::MbaConfig::default()))
+                    .build()
+                    .unwrap(),
+            );
+            engines.push(with_noise_forms());
+        }
+        engines
+    }
+
+    fn parse(cx: &mut Context, text: &str, w: u16) -> Expr {
+        cx.parse(text, &ParseOptions::width(Width::new(w).unwrap()))
+            .unwrap()
+    }
+
+    #[test]
+    fn explanations_follow_their_rewrites_and_only_when_asked() {
+        for engine in &all_engines() {
+            for &(text, w) in INPUTS {
+                let mut cx = Context::new();
+                let e = parse(&mut cx, text, w);
+                let (log, out) = logged_with(engine, &mut cx, &[e], None, Detail::Explain);
+                check_structure(engine, &log, out.roots[0].expr);
+                let mut cx = Context::new();
+                let e = parse(&mut cx, text, w);
+                let (plain, _) = logged(engine, &mut cx, &[e], None);
+                assert!(
+                    !plain.0.iter().any(|e| matches!(e, Ev::Explain(..))),
+                    "{text}: no explanation unless asked"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_candidates_match_the_counters() {
+        for engine in &all_engines() {
+            for &(text, w) in INPUTS {
+                let mut cx = Context::new();
+                let e = parse(&mut cx, text, w);
+                let (log, out) = logged(engine, &mut cx, &[e], None);
+                for (name, c) in &out.stats.passes {
+                    let events = log
+                        .0
+                        .iter()
+                        .filter(|e| matches!(e, Ev::NotSmaller(b, ..) if b == name))
+                        .count() as u64;
+                    assert_eq!(events, c.rejected_cost, "{text}: {name}");
+                }
+                for ev in &log.0 {
+                    if let Ev::NotSmaller(_, _, _, added, freed) = ev {
+                        assert!(freed <= added, "dropped only when it does not pay");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_guard_says_which_predicate_failed() {
+        let engine = deobfuscator();
+        let mut cx = Context::new();
+        let e = parse(&mut cx, INPUTS[0].0, 32);
+        let (log, _) = logged(&engine, &mut cx, &[e], None);
+        let three = cx.parse("3:32", &ParseOptions::default()).unwrap();
+        let mut disjoint = 0;
+        let mut pow2 = 0;
+        for ev in &log.0 {
+            match ev {
+                Ev::GuardFailed(rule, "disjoint", [Some(_), Some(_)])
+                    if rule == "core.arith::add_disjoint" =>
+                {
+                    disjoint += 1
+                }
+                Ev::GuardFailed(rule, "is_pow2", [Some(c), None])
+                    if rule == "core.arith::mul_pow2" =>
+                {
+                    assert_eq!(*c, three, "is_pow2 of the constant bound to c");
+                    pow2 += 1;
+                }
+                Ev::GuardFailed(rule, pred, _) => panic!("{rule}: {pred}"),
+                _ => {}
+            }
+        }
+        assert!(disjoint > 0 && pow2 > 0, "{disjoint} {pow2}");
+        let falses = log
+            .0
+            .iter()
+            .filter(|e| matches!(e, Ev::GuardFalse(_)))
+            .count();
+        let details = log
+            .0
+            .iter()
+            .filter(|e| matches!(e, Ev::GuardFailed(..)))
+            .count();
+        assert_eq!(falses, details, "every failed guard says why");
+    }
+
+    #[test]
+    fn a_fold_by_the_constructors_is_reported() {
+        // `~z & z` becomes 0, and the root `… ^ 0` folds when it is rebuilt over it.
+        let engine = deobfuscator();
+        let mut cx = Context::new();
+        let e = parse(&mut cx, INPUTS[0].0, 32);
+        let (log, _) = logged(&engine, &mut cx, &[e], None);
+        let folds: Vec<_> = log
+            .0
+            .iter()
+            .filter(|e| matches!(e, Ev::Folded(..)))
+            .collect();
+        let rest = parse(&mut cx, "(x + y) * 3 + (x ^ y)", 32);
+        assert_eq!(folds, [&Ev::Folded(e, rest)]);
+    }
+
+    /// The explanations of one input's rewrites by `engine`.
+    fn explanations(engine: &Engine, text: &str, w: u16) -> (Context, Vec<(String, Explanation)>) {
+        let mut cx = Context::new();
+        let e = parse(&mut cx, text, w);
+        let (log, _) = logged_with(engine, &mut cx, &[e], None, Detail::Explain);
+        let out = log
+            .0
+            .into_iter()
+            .filter_map(|e| match e {
+                Ev::Explain(by, _, why) => Some((by, why)),
+                _ => None,
+            })
+            .collect();
+        (cx, out)
+    }
+
+    #[test]
+    fn pass_explanations_say_what_the_pass_read() {
+        let engine = deobfuscator();
+        // The keyed mixer: four layers undone, the constant's preimage 0 under the first three.
+        let (_, ex) = explanations(&engine, INPUTS[6].0, 64);
+        let [(by, Explanation::Invert { layers })] = &ex[..] else {
+            panic!("{ex:?}");
+        };
+        assert_eq!(by, "invert");
+        let maps: Vec<_> = layers.iter().map(|l| l.map).collect();
+        assert_eq!(maps, ["v * k", "region", "v * k", "v ^ k"]);
+        let zero = BitVec::zero(Width::W64);
+        let key = BitVec::from_canonical_u64(Width::W64, 0xd322_0fb7_8e33_751f);
+        let pre: Vec<_> = layers.iter().map(|l| l.preimage).collect();
+        assert_eq!(pre, [Some(zero), Some(zero), Some(zero), Some(key)]);
+        assert!(layers.iter().all(|l| l.bijective));
+        // A division by 10.
+        let (_, ex) = explanations(&engine, INPUTS[3].0, 64);
+        assert!(matches!(
+            &ex[..],
+            [(_, Explanation::Division { divisor, signed: false, .. })]
+                if *divisor == BitVec::from_canonical_u64(Width::W64, 10)
+        ));
+        // Comparisons: one value against constants, and a pair.
+        let (_, ex) = explanations(&engine, INPUTS[4].0, 32);
+        let iv = |v: u64| BitVec::from_canonical_u64(Width::W32, v);
+        assert!(
+            matches!(&ex[..], [(_, Explanation::Intervals { set, .. })] if *set == [(iv(4), iv(9))])
+        );
+        let (_, ex) = explanations(&engine, "(x <=u y) & (x != y) & (x <s y)", 32);
+        assert!(
+            matches!(&ex[..], [(_, Explanation::Relations { set: 0b110, .. })]),
+            "{ex:?}"
+        );
+        // Linear and xor forms: `(x ^ 90) + 3 - 3` is 1·(x ^ 90), and `x ^ 90 ^ 90` is x.
+        let (mut cx, ex) = explanations(&engine, INPUTS[1].0, 64);
+        let atom = parse(&mut cx, "x ^ 90", 64);
+        let x = parse(&mut cx, "x", 64);
+        let one = BitVec::from_canonical_u64(Width::W64, 1);
+        match &ex[..] {
+            [
+                (_, Explanation::Linear { konst, terms }),
+                (
+                    _,
+                    Explanation::Xor {
+                        konst: k2,
+                        terms: t2,
+                    },
+                ),
+            ] => {
+                assert!(konst.is_zero() && k2.is_zero());
+                assert_eq!(terms, &[(atom, one)]);
+                assert_eq!(t2, &[(x, BitVec::ones(Width::W64))]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Folding under assumptions: the known bits pin the value.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let mut a = Assumptions::new();
+        let p = cx.parse("idx <u n", &o).unwrap();
+        a.assume_true(&mut cx, p).unwrap();
+        let e = cx.parse("zext<64>(idx <=u n)", &o).unwrap();
+        let (log, _) = logged_with(
+            &Engine::standard(),
+            &mut cx,
+            &[e],
+            Some(&a),
+            Detail::Explain,
+        );
+        assert!(log.0.iter().any(|e| matches!(
+            e,
+            Ev::Explain(by, _, Explanation::Fold { value, .. }) if by == "fact_fold" && value.is_ones()
+        )));
+    }
+
+    #[cfg(feature = "mba")]
+    #[test]
+    fn the_mba_service_says_what_vouched_for_its_answer() {
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(crate::mba::MbaConfig::default()))
+            .build()
+            .unwrap();
+        let (_, ex) = explanations(&engine, INPUTS[0].0, 32);
+        let mba: Vec<_> = ex.iter().filter(|(b, _)| b == "mba").collect();
+        assert!(
+            matches!(
+                &mba[..],
+                [(_, Explanation::Mba { atoms, evidence: "certificate", test: Some("signature"), points: 4 })]
+                    if atoms.len() == 2
+            ),
+            "{mba:?}"
+        );
+    }
+
+    #[test]
+    fn a_trace_writes_the_new_events_and_rule_cards() {
+        let engine = deobfuscator();
+        let mut cx = Context::new();
+        let e = parse(&mut cx, INPUTS[0].0, 32);
+        let mut trace = Trace::new(&engine).with_explanations(true).with_facts(true);
+        let out = engine
+            .run(&mut cx, &[e], Run::default().with_observer(&mut trace))
+            .unwrap();
+        let text = trace.to_jsonl(&mut cx, &[e], &out).unwrap();
+        let has = |p: &str| text.lines().any(|l| l.starts_with(p));
+        assert!(has(r#"{"ev":"folded","#));
+        assert!(has(r#"{"ev":"not_smaller","pass":"linear","#));
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with(r#"{"ev":"guard_false","#)
+                    && l.contains(r#""pred":"disjoint","args":["#))
+        );
+        let card = text
+            .lines()
+            .find(|l| l.contains(r#""name":"core.arith::add_xor_and""#))
+            .unwrap();
+        assert!(
+            card.contains(r#""source":"identity add_xor_and<W>"#),
+            "{card}"
+        );
+        assert!(card.contains(r#""ledger":"identity exhaustive("#), "{card}");
+        assert!(card.contains(r#""proven":true"#));
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with(r#"{"node":"#) && l.contains(r#""facts":{"zero":"#))
+        );
+        for l in text.lines() {
+            assert!(balanced(l), "{l}");
         }
     }
 }

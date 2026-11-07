@@ -584,6 +584,57 @@ pub enum Event<'a> {
         /// The root it begins on.
         root: Expr,
     },
+    /// Why the guard of the rule just reported [`GuardFalse`](Event::GuardFalse) did not
+    /// hold: its last predicate that did not, and the nodes bound to its operands. Follows that
+    /// `GuardFalse`.
+    GuardFailed {
+        /// The rule.
+        rule: &'a Rule,
+        /// The predicate's spelling in the rule language: a fact predicate (`disjoint`,
+        /// `zero_bits`, `proves`, `one_use`, …), a constant predicate (`is_pow2`, …), a
+        /// comparison of constants (`==`, `<u`, …), or `condition` for another pure condition.
+        pred: &'static str,
+        /// The nodes bound to its operands, where they are pattern parameters (`proves`: the
+        /// two sides of its comparison).
+        args: [Option<Expr>; 2],
+    },
+    /// A pass dropped a candidate for `node` because it would not make the DAG smaller.
+    NotSmaller {
+        /// The pass.
+        by: By<'a>,
+        /// The node it would have replaced.
+        node: Expr,
+        /// The candidate, when it was built (a candidate whose estimate already cannot pay is
+        /// dropped before it is built).
+        candidate: Option<Expr>,
+        /// The nodes it needs: counted when it was built, else the pass's upper estimate.
+        added: u32,
+        /// The nodes replacing `node` would free (counted no further than `added`).
+        freed: u32,
+        /// Whether only sharing with other roots kept it back: alone, it would have paid. A
+        /// later round decides again.
+        shared: bool,
+    },
+    /// `node`, rebuilt over its operands' new results, became `after` through the constructors'
+    /// canonicalization rather than as the same operator over those results: `x ^ 0` folded
+    /// to `x` once a rewrite made the `0`. Reported where the rebuild happens, in the walk.
+    Folded {
+        /// The node whose operands changed.
+        node: Expr,
+        /// What the constructors made of it.
+        after: Expr,
+    },
+    /// A pass's reasoning for the rewrite it just [`Applied`](Event::Applied): the form it
+    /// read, the layers it undid, the certificate it checked. Follows that `Applied`, and only
+    /// for an observer whose [`detail`](Observer::detail) is [`Detail::Explain`].
+    Explain {
+        /// The pass.
+        by: By<'a>,
+        /// The node it rewrote.
+        node: Expr,
+        /// The reasoning.
+        why: &'a super::Explanation,
+    },
     /// The phase ended.
     PhaseEnd {
         /// The round, from 0.
@@ -600,10 +651,28 @@ pub enum Event<'a> {
     },
 }
 
+/// How much an [`Observer`] asks the engine to build for it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum Detail {
+    /// Every event but [`Event::Explain`].
+    #[default]
+    Events,
+    /// Every event, with the passes' reasoning ([`Event::Explain`]), which costs the passes
+    /// work to record.
+    Explain,
+}
+
 /// Receives per-rule and per-pass events. With no observer the cost is one predictable branch per event.
 pub trait Observer {
     /// Called for every event, in order.
     fn event(&mut self, event: Event<'_>);
+
+    /// How much the engine builds for this observer: [`Detail::Events`] unless it asks for
+    /// more.
+    fn detail(&self) -> Detail {
+        Detail::Events
+    }
 }
 
 /// Per-rule counts, keyed by `group::rule`.

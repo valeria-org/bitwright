@@ -298,6 +298,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             let t = cx.c_extract(x, 0, k)?;
             cx.c_sext(t, w)
         })?;
+        r.explain_with(|| crate::engine::Explanation::Casts {
+            source: cx.handle(x),
+            lo: 0,
+            bits: k,
+            sign_extended: true,
+        });
         return finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL);
     }
     if node.op != OpCode::Extract {
@@ -315,5 +321,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         count(r).atomized += 1;
     }
     let fin = st.fin;
+    r.explain_with(|| crate::engine::Explanation::Casts {
+        source: cx.handle(node.a),
+        lo: node.b as u16,
+        bits: node.width,
+        sign_extended: false,
+    });
     finish(r, cx, PassKind::Casts, n, e, before, &st.stops, fin)
 }

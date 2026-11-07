@@ -77,7 +77,7 @@ commands:
   simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
            [--float-values] [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
            [--trace <out>]
-  simplify --file <path> [--jobs <n>] [options as above, but --trace]
+  simplify --file <path> [--jobs <n>] [options as above]
         simplify an expression (symbols default to --width, 64 if not given), assuming each
         1-bit predicate holds; prints the constraints a result relies on (`# relies on 0, 2`).
         `--file` simplifies each line of a file (`-`: standard input) on its own, on up to
@@ -98,8 +98,11 @@ commands:
         equal at every sample was left unproved (by that budget, say), a note on stderr
         names it. `--trace` writes the engine's run as a trace to <out>: JSON Lines with the
         strategy's phases, the rules and nodes the run names, every event in order (each phase's
-        begin and end with the work it spent, each rule tried and how it ended, each rewrite and
-        the assumptions it relies on) and the result; `--synth` runs after it, outside it.
+        begin and end with the work it spent, each rule tried and how it ended, each rewrite
+        with the pass's reasoning and the assumptions it relies on, each candidate dropped as
+        not smaller) and the result; `--synth` runs after it, outside it. With `--file` each
+        line runs alone, one after the other, and its trace follows the one before (each
+        begins with its header line).
 
 `--` ends the options: `bitwright simplify -- '-x + x'`.
 ";
@@ -995,9 +998,6 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             if !a.pos.is_empty() {
                 return Err(usage("--file replaces the expression"));
             }
-            if trace.is_some() {
-                return Err(usage("--trace takes one expression, not --file"));
-            }
             let text = if path == "-" {
                 std::io::read_to_string(std::io::stdin())
                     .map_err(|e| Fail::Err(2, format!("stdin: {e}")))?
@@ -1064,10 +1064,15 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
     };
     let mut groups = Vec::new();
+    // The rule files' text and ledgers, for a trace's rule cards.
+    let mut sources: Vec<(String, Ledger)> = Vec::new();
     for path in a.values("rules") {
         let (program, ledger) = vouched_rules(path)?;
         groups.extend(program.groups().iter().map(|g| g.name.clone()));
         builder = builder.program(program, &ledger);
+        if trace.is_some() {
+            sources.push((read(path)?, ledger));
+        }
     }
     if !groups.is_empty() {
         let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
@@ -1080,29 +1085,40 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         .map_err(|e| Fail::Err(2, format!("{e}")))?;
     // A file's expressions each on its own, on threads; one expression as before, recorded
     // with `--trace`.
-    let mut recorder = trace.map(|_| Trace::new(&engine));
-    let mut run = Run::default().with_assumptions(&assumptions);
-    if let Some(t) = recorder.as_mut() {
-        run = run.with_observer(t);
-    }
-    let outcome = match file {
-        Some(_) => engine.run_each(
-            &mut cx,
-            &exprs,
-            Each::default()
-                .with_threads(jobs)
-                .with_assumptions(&assumptions),
-        ),
-        None => engine.run(&mut cx, &exprs, run),
-    }
-    .map_err(|e| Fail::Err(2, format!("{e}")))?;
-    if let (Some(path), Some(t)) = (trace, &recorder) {
-        let text = t
-            .to_jsonl(&cx, &exprs, &outcome)
-            .map_err(|e| Fail::Err(2, format!("{e}")))?;
-        std::fs::write(path, text).map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
-    }
-    let outs = outcome.roots;
+    // A file's expressions each on its own, on threads; one expression as before. With
+    // `--trace`, each runs alone in a context of its own, one after the other, recorded.
+    let outs = match trace {
+        Some(path) => {
+            let mut text = String::new();
+            let mut outs = Vec::with_capacity(exprs.len());
+            for &e in &exprs {
+                let (out, t) = traced(&engine, &mut cx, e, &assumptions, &sources)
+                    .map_err(|e| Fail::Err(2, format!("{e}")))?;
+                outs.push(out);
+                text.push_str(&t);
+            }
+            std::fs::write(path, text).map_err(|e| Fail::Err(2, format!("{path}: {e}")))?;
+            outs
+        }
+        None => {
+            match file {
+                Some(_) => engine.run_each(
+                    &mut cx,
+                    &exprs,
+                    Each::default()
+                        .with_threads(jobs)
+                        .with_assumptions(&assumptions),
+                ),
+                None => engine.run(
+                    &mut cx,
+                    &exprs,
+                    Run::default().with_assumptions(&assumptions),
+                ),
+            }
+            .map_err(|e| Fail::Err(2, format!("{e}")))?
+            .roots
+        }
+    };
     let mut outs = outs.into_iter();
     let mut report = String::new();
     for (k, l) in lines.iter().enumerate() {
@@ -1137,6 +1153,39 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
         writeln!(report, "{text}").unwrap_or(());
     }
     Ok(report)
+}
+
+/// Runs `engine` on `e` alone, in a context of its own (with the assumptions carried over), and
+/// records the run: the outcome, its expression back in `cx`, and the trace (with the passes'
+/// reasoning and the facts of the nodes it names).
+fn traced(
+    engine: &Engine,
+    cx: &mut Context,
+    e: Expr,
+    assumptions: &Assumptions,
+    sources: &[(String, Ledger)],
+) -> Result<(bitwright::engine::RootOutcome, String), bitwright::Error> {
+    let mut own = Context::new();
+    let x = own.import(cx, &[e])?[0];
+    let mut a = Assumptions::new();
+    for (_, c, facts) in assumptions.constraints() {
+        let c = own.import(cx, &[c])?[0];
+        a.assume(&mut own, c, facts)?;
+    }
+    let mut t = Trace::new(engine).with_explanations(true).with_facts(true);
+    for (src, ledger) in sources {
+        t = t.with_source(src, Some(ledger));
+    }
+    t.with_assumptions(&mut own, &a)?;
+    let outcome = engine.run(
+        &mut own,
+        &[x],
+        Run::default().with_assumptions(&a).with_observer(&mut t),
+    )?;
+    let text = t.to_jsonl(&mut own, &[x], &outcome)?;
+    let mut out = outcome.roots[0];
+    out.expr = cx.import(&own, &[out.expr])?[0];
+    Ok((out, text))
 }
 
 /// The synthesis configuration for `--synth` with its budgets (`--synth-conflicts`,

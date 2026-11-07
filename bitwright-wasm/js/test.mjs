@@ -25,6 +25,16 @@ assert.equal(
 );
 assert.match(bw.toSmtlib("x + 1", 8), /bvadd/);
 assert.throws(() => bw.simplify("x +", 8), /./);
+
+// A run as a trace: header first, the rewrites with their reasoning, the result, the counters.
+const trace = bw.trace("((x ^ 0x5a) + 3 - 3) ^ 0x5a", 32).trim().split("\n").map((l) => JSON.parse(l));
+assert.equal(trace[0].trace, "bitwright");
+assert.ok(trace.some((l) => l.ev === "applied" && l.pass === "linear"));
+assert.ok(trace.some((l) => l.ev === "explain" && l.why.kind === "linear"));
+assert.equal(trace.at(-1).stats.rewrites, 2);
+const assumed = bw.trace("x & 15", 8, { assume: ["x <u 16"], deobfuscate: false }).trim().split("\n").map((l) => JSON.parse(l));
+assert.ok(assumed.some((l) => l.assume === 0));
+assert.throws(() => bw.trace("x", 8, { bogus: 1 }), /unknown option/);
 assert.throws(() => bw.lift("arm", "x"), /unknown front end/);
 
 // In a compiler: the compile engine, declared known bits, counters.

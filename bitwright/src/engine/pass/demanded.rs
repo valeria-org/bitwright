@@ -627,5 +627,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     }
     let e = r.build(cx, |cx| cx.rebuild(n, kids))?;
+    r.explain_with(|| crate::engine::Explanation::Demanded {
+        operand: cx.handle(operand),
+        mask,
+    });
     finish(r, cx, PassKind::Demanded, n, e, before, &st.stops, fin)
 }

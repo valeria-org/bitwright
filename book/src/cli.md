@@ -68,11 +68,13 @@ $ bitwright simplify --width 32 --rules my.bwr -- 'popcnt(x) + popcnt(~x)'
 32:32
 ```
 
-`--trace <out>` writes the engine's run on one expression as a trace: JSON Lines with the
-strategy's phases, the rules and nodes the run names, every event in order (each phase's begin
-and end with the work it spent, each rule tried and how it ended, each rewrite and the
-assumptions it relies on) and the result. The same run writes the same file, so traces diff
-cleanly. See [Tracing a run](simplifying.md#tracing-a-run) for the format.
+`--trace <out>` writes the engine's run as a trace: JSON Lines with the strategy's phases, the
+rules and nodes the run names, every event in order (each phase's begin and end with the work it
+spent, each rule tried and how it ended, each rewrite with the pass's reasoning and the
+assumptions it relies on, each candidate dropped as not smaller) and the result. With `--file`,
+each line runs alone and its trace follows the one before. The same run writes the same file, so
+traces diff cleanly. See [Tracing a run](simplifying.md#tracing-a-run) for the format; the
+Workbench in the repository's `workbench/` shows them.
 
 ```text
 $ bitwright simplify --width 32 --trace run.bwt -- '((x ^ 0x5a) + 3 - 3) ^ 0x5a'

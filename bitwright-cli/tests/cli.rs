@@ -236,9 +236,24 @@ fn simplify_writes_a_trace() {
             .any(|l| l.starts_with(r#"{"result":0,"#) && l.contains(r#""end":"completed""#))
     );
     assert!(lines.last().unwrap().starts_with(r#"{"stats":"#));
-    // One expression only, and somewhere it can be written.
-    let exprs = file("trace-lines.txt", "x + 0\n");
-    assert_eq!(run(&["simplify", "--file", &exprs, "--trace", &path]).0, 2);
+    // A pass's reasoning and the facts of the nodes it names.
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with(r#"{"ev":"explain","pass":"linear","#))
+    );
+    assert!(lines.iter().any(|l| l.contains(r#""facts":{"zero":"#)));
+    assert!(lines.iter().any(|l| l.starts_with(r#"{"assume":0,"#)));
+    // A file's lines each alone: one trace after the other, each with its header.
+    let exprs = file("trace-lines.txt", "x + 0\n# a comment\n(x & y) + (x | y)\n");
+    let corpus = file("trace-corpus.bwt", "");
+    let (code, out, _) = run(&[
+        "simplify", "--file", &exprs, "--width", "8", "--trace", &corpus,
+    ]);
+    assert_eq!((code, out.as_str()), (0, "x\n# a comment\nx + y\n"));
+    let text = std::fs::read_to_string(&corpus).unwrap();
+    assert_eq!(text.matches(r#"{"trace":"bitwright""#).count(), 2);
+    // Somewhere it can be written.
     assert_eq!(
         run(&["simplify", "x", "--trace", "/nonexistent/dir/t.bwt"]).0,
         2

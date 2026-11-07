@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitwright Workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="app.css">
+<script>
+// The theme before the first paint, so it does not flash.
+try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}
+</script>
+</head>
+<body>
+<header class="top">
+  <div class="row1">
+    <div class="brand" title="bitwright Workbench">bitwright <span>Workbench</span></div>
+    <form class="live" id="live" autocomplete="off">
+      <label class="sr" for="liveExpr">Expression</label>
+      <input id="liveExpr" class="expr-input" spellcheck="false" placeholder="An expression to simplify, e.g. (x ^ y) + 2 * (x &amp; y)">
+      <label class="sr" for="liveWidth">Width</label>
+      <select id="liveWidth" title="Width of the symbols">
+        <option>8</option><option>16</option><option selected>32</option><option>64</option>
+      </select>
+      <label class="sr" for="liveEngine">Engine</label>
+      <select id="liveEngine" title="Strategy">
+        <option value="deobfuscate">deobfuscate + MBA</option>
+        <option value="standard">standard</option>
+      </select>
+      <label class="sr" for="liveAssume">Assumptions</label>
+      <input id="liveAssume" class="assume-input" spellcheck="false" placeholder="assume x <u 16; y == 3" title="1-bit predicates assumed true, separated by ;">
+      <button id="liveRun" type="submit" class="primary">Run</button>
+    </form>
+    <div class="files">
+      <label class="button quiet" for="fileInput" title="Open a trace file (.bwt)">Open</label>
+      <input id="fileInput" type="file" accept=".bwt,.jsonl,.json,.txt" hidden>
+      <button id="saveBtn" type="button" class="quiet" title="Save the open trace as a file">Save</button>
+      <button id="themeBtn" type="button" class="quiet icon" title="Theme: system" aria-label="Theme">◐</button>
+    </div>
+  </div>
+  <div class="row2" id="runbar"></div>
+</header>
+<nav class="tabs" id="tabs" aria-label="Views">
+  <a href="#trace" data-tab="trace">Trace</a>
+  <a href="#stages" data-tab="stages">Stages</a>
+  <a href="#whynot" data-tab="whynot">Why not</a>
+  <a href="#facts" data-tab="facts">Facts</a>
+  <a href="#corpus" data-tab="corpus">Corpus</a>
+  <a href="#compare" data-tab="compare">Compare</a>
+</nav>
+<main id="main" tabindex="-1"></main>
+<footer class="status"><span id="hint" class="hint"></span><span id="status"></span></footer>
+<div class="drop" id="drop" hidden>Drop a trace file (.bwt) to open it</div>
+<div class="popover" id="popover" hidden role="dialog" aria-label="Node"></div>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

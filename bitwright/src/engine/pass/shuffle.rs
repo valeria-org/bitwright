@@ -381,5 +381,18 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let Some(e) = emit(r, cx, &bits)? else {
         return Ok(Step::Normal(Fin::FINAL));
     };
+    r.explain_with(|| crate::engine::Explanation::Shuffle {
+        bits: bits
+            .iter()
+            .map(|b| match *b {
+                Prov::Zero => crate::engine::Source::Zero,
+                Prov::One => crate::engine::Source::One,
+                Prov::Bit(s, j) => crate::engine::Source::Bit {
+                    of: cx.handle(s),
+                    bit: j,
+                },
+            })
+            .collect(),
+    });
     finish(r, cx, PassKind::Shuffle, n, e, before, &atoms, Fin::FINAL)
 }
