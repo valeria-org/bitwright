@@ -50,9 +50,14 @@
 //! different subterms, found as deep as the structure allows. At most [`MAX_REGION`] nodes, and
 //! holes of at most 128 bits, are examined.
 //!
+//! Orderings see through a different kind of layer, a strictly monotone one (`zext`, `sext`,
+//! `concat`, `~v`, and `v + k`, `v * k`, `v << s` where the facts show no wrap): see
+//! [`monotone`].
+//!
 //! [`ExtOp::invert`]: crate::ext::ExtOp::invert
 
 pub(crate) mod gf2;
+pub(crate) mod monotone;
 #[cfg(test)]
 mod tests;
 

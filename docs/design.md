@@ -1141,7 +1141,19 @@ maps such as the pointer encoding `compact` (low bits a bijection of the low bit
 those, one of the high bits), and refuses by construction `f(x) ^ x`, `f_a(x) ^ f_b(x)`, `f_a(x) |
 f_b(x)` and `u - ((u | b) & h)`.
 
-**The pass** acts only on `==` and `!=` (a bijection preserves no ordering): both sides the same
+**The pass** acts on `==` and `!=` with the injective layers above (a bijection preserves no
+ordering), and on `<u`, `<=u`, `<s`, `<=s` with **strictly monotone layers** (`invert::monotone`):
+`zext` (unsigned → unsigned or signed), `sext` (signed → signed, unsigned → unsigned), `concat`,
+and, where the facts about the inner value keep it on one piece of the wrapping operation, `v + k`,
+`v - k`, `v ^ smin` (increasing, between any two orders for a constant `k`), `k - v`, `~v`, `-v`
+(decreasing), `v * k` (by the sign of `k`, no overflow) and `v << s` (no bit shifted out); with
+constant parameters the orders are handled in one key space (`v ^ smin` for a signed order), where
+a map between different orders is the same map shifted by `smin`. On both sides, two inner values
+compared through one layer must lie on the same piece; the comparison becomes one of the inner
+values in the order the layer is monotone from, swapped for a decreasing layer. Against a
+constant, the threshold is found by bisection over the inner value's range (the comparison changes
+at most once there), after a bottom-up check that the image of that range stays inside the ranges
+the layers above were classified on. For equalities: both sides the same
 layer over different inner values with the same parameters (the same nodes; for a region, the
 sides anti-unified as one function of a pair of different subterms, as deep as their structure
 allows, commutative operands in either order, under a step cap, and the region taken over the

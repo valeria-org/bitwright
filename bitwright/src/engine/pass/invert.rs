@@ -11,17 +11,29 @@
 //!   on its own, and the answers are intersected, so one value compared with two different
 //!   constants is false.
 //!
-//! Orderings are never touched: a bijection does not preserve them. A rewrite replaces a
-//! comparison by one of proper subterms of its operands and a constant, or by a constant, so
-//! like a rule it strictly decreases the termination order, and it is committed whether or not
-//! the operands are shared elsewhere; a split is committed only when its result is a smaller
-//! tree.
+//! At `a <u b`, `a <=u b`, `a <s b` and `a <=s b` (see `crate::invert::monotone`):
+//!
+//! - both sides one strictly monotone layer over different operands (`f(x) <u f(y)`): the
+//!   operands are compared instead, in the order the layer is monotone from, swapped for a
+//!   decreasing layer, layer after layer (`zext(x) <s zext(y)` is `x <u y`, `~x <u ~y` is
+//!   `y <u x`, `x + k <u y + k` is `x <u y` where neither sum wraps);
+//! - against a constant on either side (`f(x) <u c`): `x` is compared with the threshold where
+//!   the comparison changes, found by bisection over `x`'s range, or the comparison is a
+//!   constant (`zext<16>(x) <u 300` at 8 bits is true).
+//!
+//! A bijection does not preserve order, so the injective layers above are never used for
+//! orderings; a strictly monotone layer is injective, but its monotonicity usually rests on
+//! facts, so equalities keep to the layers above. A rewrite replaces a comparison by one of proper subterms of its operands and a
+//! constant, or by a constant, so like a rule it strictly decreases the termination order, and
+//! it is committed whether or not the operands are shared elsewhere; a split is committed only
+//! when its result is a smaller tree.
 
 use super::{Accept, By, Fin, PassKind, Reject, Runner, Step, Stop, discard, facts};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::facts::Facts;
+use crate::invert::monotone::{self, Order};
 use crate::invert::{self, MAX_SPLIT, Oracle, Solved};
 use crate::ops::{BinOp, CmpOp};
 
@@ -55,27 +67,33 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
 /// The invert pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
-    let op = match node.op {
-        OpCode::Eq => CmpOp::Eq,
-        OpCode::Ne => CmpOp::Ne,
-        _ => return Ok(Step::Normal(Fin::FINAL)),
+    let Some(op) = node.op.as_cmp() else {
+        return Ok(Step::Normal(Fin::FINAL));
     };
     if r.quarantined_passes.contains(&PassKind::Invert) {
         return Ok(Step::Normal(Fin::PROVISIONAL));
     }
     let before = cx.len() as u32;
     let mut o = Calls { r, fin: Fin::FINAL };
-    // Constants are on the right of a stored equality.
-    let e = match cx.const_val(node.b) {
-        Some(c) => {
-            let join = cx.node(node.a).op;
-            if (join == OpCode::Or && c.is_zero()) || (join == OpCode::And && c.is_ones()) {
-                split(cx, &mut o, op, n, node.a, &c, before)?
-            } else {
-                solve(cx, &mut o, op, node.a, &c)?
+    let e = if op.is_commutative() {
+        // Constants are on the right of a stored equality.
+        match cx.const_val(node.b) {
+            Some(c) => {
+                let join = cx.node(node.a).op;
+                if (join == OpCode::Or && c.is_zero()) || (join == OpCode::And && c.is_ones()) {
+                    split(cx, &mut o, op, n, node.a, &c, before)?
+                } else {
+                    solve(cx, &mut o, op, node.a, &c)?
+                }
             }
+            None => cancel(cx, &mut o, op, node.a, node.b)?,
         }
-        None => cancel(cx, &mut o, op, node.a, node.b)?,
+    } else {
+        match (cx.const_val(node.a), cx.const_val(node.b)) {
+            (_, Some(c)) => solve_order(cx, &mut o, op, node.a, &c, false)?,
+            (Some(c), None) => solve_order(cx, &mut o, op, node.b, &c, true)?,
+            (None, None) => cancel_order(cx, &mut o, op, node.a, node.b)?,
+        }
     };
     let fin = o.fin;
     let e = match e {
@@ -159,6 +177,60 @@ fn solve(
         None => None,
         Some(Solved::Const(eq)) => Some(truth(o, cx, eq == (op == CmpOp::Eq))?),
         Some(Solved::Eq(x, v)) => Some(compare(o, cx, op, x, &v)?),
+    })
+}
+
+/// `f(x) op f(y)` as `x op' y`, through every common strictly monotone layer.
+fn cancel_order(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    a: u32,
+    b: u32,
+) -> Result<Option<u32>, Stop> {
+    let Some((mut order, strict)) = Order::of(op) else {
+        return Ok(None);
+    };
+    let (mut x, mut y) = (a, b);
+    let mut peeled = false;
+    while let Some((p, q, m)) = monotone::cancel(cx, o, x, y, order)? {
+        o.charge(1)?;
+        (x, y) = if m.increasing { (p, q) } else { (q, p) };
+        order = m.input;
+        peeled = true;
+    }
+    if !peeled {
+        return Ok(None);
+    }
+    Ok(Some(o.r.build(cx, |cx| cx.c_cmp(order.cmp(strict), x, y))?))
+}
+
+/// `f(x) op c` (or `c op f(x)`, with `const_left`) as a comparison of `x` with a threshold, or
+/// a constant.
+fn solve_order(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    lhs: u32,
+    c: &BitVec,
+    const_left: bool,
+) -> Result<Option<u32>, Stop> {
+    Ok(match monotone::solve(cx, o, op, lhs, c, const_left)? {
+        None => None,
+        Some(monotone::Solved::Const(v)) => Some(truth(o, cx, v)?),
+        Some(monotone::Solved::Cmp {
+            op,
+            x,
+            t,
+            const_left,
+        }) => Some(o.r.build(cx, |cx| {
+            let t = cx.mk_const(&t)?;
+            if const_left {
+                cx.c_cmp(op, t, x)
+            } else {
+                cx.c_cmp(op, x, t)
+            }
+        })?),
     })
 }
 

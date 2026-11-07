@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Orderings see through strictly monotone maps.** The invert pass cancelled and solved only
+  equalities: a bijection does not preserve order. It now reads `<u`, `<=u`, `<s` and `<=s`
+  through layers that are strictly monotone from an order of the inner value to an order of
+  the node: `zext`, `sext` and `concat` always (`zext<32>(x) <s zext<32>(y)` is `x <u y`,
+  `sext<32>(x) <s 5` is `x <s 5`), `~v` and `v ^ smin` always (`~x <u ~y` is `y <u x`,
+  `(x ^ 0x80) <u (y ^ 0x80)` is `x <s y`), and `v + k`, `v - k`, `k - v`, `-v`, `v * k` and
+  `v << s` where the facts keep the inner value on one piece of the wrapping operation
+  (`x + 7 <u y + 7` is `x <u y` under `x <u 100` and `y <u 100`, and `x + 7 <u 50` is
+  `x <u 43` there). Both sides are peeled layer by layer, the comparison moving to the order
+  each layer is monotone from and swapping its sides for a decreasing one; against a constant
+  the threshold is found by bisection over the inner value's range, or the comparison is
+  decided. Like the rest of the pass, a rewrite replaces a comparison by one of proper
+  subterms and a constant and relies on the constraints its facts used.
+
 ## 0.24.0
 
 - **Exhaustion certificates are scheduled in near-linear time.** `Exhaustion::check` simulates
