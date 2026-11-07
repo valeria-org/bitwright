@@ -370,3 +370,50 @@ export function smtScript(run, parts, query) {
   if (query && parts.length === 2) lines.push(`(assert (distinct ${parts[0][0]} ${parts[1][0]}))`, "(check-sat)");
   return lines.join("\n");
 }
+
+// ----- highlighting rule programs (.bwr) ------------------------------------------------------
+
+const BWR_KW = new Set(["bitwright", "group", "rule", "identity", "where", "if", "let", "const", "sym", "nonconst"]);
+const BWR_PRED = new Set(["zero_bits", "one_bits", "nonzero", "disjoint", "proves", "is_pow2", "is_lowmask", "is_shifted_mask", "one_use", "fp.not_nan", "fp.finite", "fp.nonzero"]);
+const BWR_LIT = new Set(["ones", "zero", "one", "smin_lit", "smax_lit", "lowmask", "bit", "true", "false"]);
+const BWR_TOKEN = /(\/\/\/[^\n]*)|(\/\/[^\n]*)|(#\[[^\]\n]*\])|("(?:[^"\\]|\\.)*")|(0x[0-9a-fA-F]+(?::\d+)?|\d+(?::\d+)?)|([A-Za-z_][\w.]*)|(=>|<=>|>>u|>>s|<=u|<=s|>=u|>=s|<u|<s|>u|>s|==|!=|<<|&&|\|\||[-+*&|^~<>=!%])/g;
+
+/// A `.bwr` program as highlighted HTML. `marks` are `{ start, end, level }` byte spans to
+/// underline (errors wavy, the rest dotted); spans are in bytes, as the compiler reports them.
+export function highlightBwr(text, marks = []) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Byte offsets to character offsets (the text is mostly ASCII; this handles the rest).
+  const enc = new TextEncoder();
+  const byteToChar = (b) => {
+    let bytes = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (bytes >= b) return i;
+      bytes += enc.encode(text[i]).length;
+    }
+    return text.length;
+  };
+  const spans = marks.map((m) => ({ s: byteToChar(m.start), e: Math.max(byteToChar(m.end), byteToChar(m.start) + 1), cls: m.level === "error" ? "bad" : "warnu" })).sort((a, b) => a.s - b.s);
+  let out = "";
+  let last = 0;
+  // Each token, wrapped in its class; a diagnostic span opens and closes around the tokens it covers.
+  const emit = (from, to, cls) => {
+    let i = from;
+    for (const sp of spans) {
+      if (sp.e <= i || sp.s >= to) continue;
+      if (sp.s > i) out += wrap(text.slice(i, sp.s), cls);
+      out += `<span class="${sp.cls}">${wrap(text.slice(Math.max(sp.s, i), Math.min(sp.e, to)), cls)}</span>`;
+      i = Math.min(sp.e, to);
+    }
+    if (i < to) out += wrap(text.slice(i, to), cls);
+  };
+  const wrap = (s, cls) => (cls ? `<span class="${cls}">${esc(s)}</span>` : esc(s));
+  for (const m of text.matchAll(BWR_TOKEN)) {
+    emit(last, m.index, "");
+    const word = m[6];
+    const cls = m[1] ? "dc" : m[2] ? "cm" : m[3] ? "at" : m[4] ? "st" : m[5] ? "tc" : word ? (BWR_KW.has(word) ? "kw" : BWR_PRED.has(word) ? "pr" : BWR_LIT.has(word) ? "tc" : /^[A-Z]$/.test(word) ? "wv" : /^(zext|sext|trunc|extract|concat|select|rotl|rotr|bswap|bitrev|popcnt|clz|ctz|umulhi|smulhi|udiv|urem|sdiv|srem|pdep|pext)$/.test(word) ? "tf" : "ts") : m[7] === "=>" || m[7] === "<=>" ? "ar" : "to";
+    emit(m.index, m.index + m[0].length, cls);
+    last = m.index + m[0].length;
+  }
+  emit(last, text.length, "");
+  return out;
+}

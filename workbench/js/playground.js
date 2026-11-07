@@ -4,7 +4,7 @@
 // six-tab inspector (inspect.html) opens on the same run.
 
 import { parseTrace, provenance, symbolWidth } from "./model.js";
-import { print, short, latex, highlight, smtScript } from "./print.js";
+import { print, short, latex, highlight, highlightBwr, smtScript } from "./print.js";
 import { h, fill, chip, kindClass } from "./dom.js";
 import { stepBody } from "./trace-view.js";
 import * as popover from "./popover.js";
@@ -368,14 +368,44 @@ function loadRules() {
   $("trustRules").checked = app.myRules.trusted;
 }
 
-$("rulesBtn").addEventListener("click", () => {
-  const box = $("myrules");
-  box.hidden = !box.hidden;
-  if (!box.hidden) $("rulesSrc").focus();
+let ruleMarks = [];
+function growRules() {
+  const ta = $("rulesSrc");
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight + 2, window.innerHeight * 0.7)}px`;
+  const hl = $("rulesHl");
+  hl.innerHTML = `${highlightBwr(ta.value, ruleMarks)}\n`;
+  hl.style.height = ta.style.height;
+  hl.scrollTop = ta.scrollTop;
+}
+$("rulesSrc").addEventListener("scroll", () => { $("rulesHl").scrollTop = $("rulesSrc").scrollTop; });
+$("rulesSrc").addEventListener("keydown", (e) => {
+  // Tab indents; the editor keeps the focus.
+  if (e.key === "Tab" && !e.shiftKey) {
+    e.preventDefault();
+    const ta = e.target;
+    const { selectionStart: a, selectionEnd: b } = ta;
+    ta.setRangeText("    ", a, b, "end");
+    ta.dispatchEvent(new Event("input"));
+  }
 });
+function showRules(on) {
+  const box = $("myrules");
+  box.hidden = !on;
+  if (on) {
+    growRules();
+    checkSoon();
+    $("rulesSrc").focus();
+  }
+}
+$("rulesBtn").addEventListener("click", () => showRules($("myrules").hidden));
+$("closeRules").addEventListener("click", () => showRules(false));
+$("rulesDocBtn").addEventListener("click", () => window.open("https://valeria-org.github.io/bitwright/rules.html", "_blank"));
 $("rulesSrc").addEventListener("input", (e) => {
   app.myRules.src = e.target.value;
   saveRules();
+  growRules();
+  checkSoon();
   if (app.myRules.use) schedule();
 });
 $("useRules").addEventListener("change", (e) => {
@@ -389,33 +419,57 @@ $("trustRules").addEventListener("change", (e) => {
   saveRules();
   if (app.myRules.use) schedule();
 });
-$("checkRules").addEventListener("click", () => {
+
+let checkTimer = null;
+function checkSoon() {
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(checkNow, 500);
+}
+
+/// Compiles and checks the rules; the verdicts beside the editor, the diagnostics underlined.
+function checkNow() {
   if (!app.bw) return;
   const out = $("verdicts");
-  fill(out, h("div", { class: "muted" }, "Checking…"));
-  setTimeout(() => {
-    let r;
-    const t0 = performance.now();
-    try {
-      r = app.bw.checkRules(app.myRules.src);
-    } catch (e) {
-      fill(out, h("div", { class: "verdict error" }, h("span", { class: "v" }, "error"), h("span", { class: "nm" }, e.message)));
-      return;
-    }
-    const items = [];
-    for (const d of r.diagnostics) {
-      const line = app.myRules.src.slice(0, d.start).split("\n").length;
-      items.push(h("div", { class: `verdict ${d.level}` }, h("span", { class: "v" }, d.level), h("span", { class: "nm" }, `${d.code} · line ${line}`), h("span", { class: "d" }, d.message)));
-    }
-    for (const c of r.rules) {
-      const detail = c.verdict === "sound" ? ledgerText(c.evidence) : c.verdict === "unsound" ? `counterexample: ${c.detail}` : `not enough evidence: ${c.detail}. A fixed width the checker cannot enumerate, or a guard the samples rarely meet; link trusted when a proof elsewhere vouches for it.`;
-      items.push(h("div", { class: `verdict ${c.verdict}` }, h("span", { class: "v" }, c.verdict), h("span", { class: "nm" }, `${c.name} `, h("span", { class: "muted" }, c.kind)), h("span", { class: "d" }, detail, c.failedExamples ? ` · ${c.failedExamples} example${c.failedExamples > 1 ? "s" : ""} did not hold` : "")));
-    }
-    if (items.length === 0) items.push(h("div", { class: "muted" }, "No rules."));
-    items.push(h("div", { class: "muted", style: { fontSize: "12px" } }, `${(performance.now() - t0).toFixed(0)} ms. Sound rules link with the checker's ledger; trusted links them without it, every application sampled.`));
-    fill(out, items);
-  }, 20);
-});
+  const src = app.myRules.src;
+  if (!src.trim()) {
+    ruleMarks = [];
+    growRules();
+    fill(out, h("div", { class: "foot" }, "Write a rule, or import Lean theorems."));
+    return;
+  }
+  let r;
+  const t0 = performance.now();
+  try {
+    r = app.bw.checkRules(src);
+  } catch (e) {
+    ruleMarks = [];
+    growRules();
+    fill(out, h("div", { class: "verdict error" }, h("span", { class: "v" }, "error"), h("span", { class: "nm" }, e.message)));
+    return;
+  }
+  ruleMarks = r.diagnostics.filter((d) => d.level !== "note").map((d) => ({ start: d.start, end: d.end, level: d.level }));
+  growRules();
+  const items = [];
+  const select = (start, end) => () => {
+    const ta = $("rulesSrc");
+    const enc = new TextEncoder();
+    const toChar = (b) => { let n = 0; for (let i = 0; i < src.length; i++) { if (n >= b) return i; n += enc.encode(src[i]).length; } return src.length; };
+    ta.focus();
+    ta.setSelectionRange(toChar(start), toChar(end));
+  };
+  for (const d of r.diagnostics) {
+    const line = src.slice(0, d.start).split("\n").length;
+    items.push(h("button", { type: "button", class: `verdict ${d.level}`, onclick: select(d.start, d.end), title: "Select in the editor" }, h("span", { class: "v" }, d.level), h("span", { class: "nm" }, `${d.code} · line ${line}`), h("span", { class: "d" }, d.message)));
+  }
+  for (const c of r.rules) {
+    const at = src.indexOf(`${c.kind} ${c.name.split("::").pop()}`);
+    const detail = c.verdict === "sound" ? ledgerText(c.evidence) : c.verdict === "unsound" ? `counterexample: ${c.detail}` : `not enough evidence: ${c.detail}. A fixed width the checker cannot enumerate, or a guard the samples rarely meet; link trusted when a proof elsewhere vouches for it.`;
+    items.push(h("button", { type: "button", class: `verdict ${c.verdict}`, onclick: at >= 0 ? select(at, at + c.kind.length + 1 + c.name.split("::").pop().length) : null, title: "Select in the editor" }, h("span", { class: "v" }, c.verdict), h("span", { class: "nm" }, `${c.name} `, h("span", { class: "muted" }, c.kind)), h("span", { class: "d" }, detail, c.failedExamples ? ` · ${c.failedExamples} example${c.failedExamples > 1 ? "s" : ""} did not hold` : "")));
+  }
+  const sound = r.rules.filter((c) => c.verdict === "sound").length;
+  items.push(h("div", { class: "foot" }, `${r.rules.length} rule${r.rules.length === 1 ? "" : "s"}, ${sound} sound · checked in ${(performance.now() - t0).toFixed(0)} ms · sound rules link with the checker's ledger; trusted links all of them, sampled at every application`));
+  fill(out, items);
+}
 $("leanBtn").addEventListener("click", () => {
   const ta = h("textarea", { spellcheck: "false", placeholder: "theorem and_or {w : Nat} (x y : BitVec w) : (x &&& y) + (x ||| y) = x + y := by\n  bv_decide\n\ntheorem masked (x : BitVec 32) (h : x.ult 16#32) : x &&& 0xff#32 = x := by\n  bv_decide" });
   const note = h("div", { class: "note" }, "Theorems proved in Lean become rules: binders are the parameters, hypotheses become proves(…) guards, the equation is the rewrite. The result lands in My rules, where you can read, edit and check it. Lean already proved them, so you may link them trusted; where the checker can enumerate, it should agree.");
@@ -431,9 +485,8 @@ $("leanBtn").addEventListener("click", () => {
     }
     $("rulesSrc").value = app.myRules.src;
     saveRules();
-    $("myrules").hidden = false;
     $("io").hidden = true;
-    $("checkRules").click();
+    showRules(true);
     if (app.myRules.use) schedule();
   };
   panel("Import Lean theorems", null, [ta, note], [h("button", { type: "button", class: "quiet", onclick: () => go(false) }, "Append"), h("button", { type: "button", class: "primary", onclick: () => go(true) }, "Replace my rules")]);

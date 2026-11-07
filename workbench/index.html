@@ -56,22 +56,28 @@ try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "da
       <span class="sepv"></span>
       <button type="button" class="quiet" id="shareBtn" title="Copy a link to this view">Copy link</button>
     </div>
-    <div class="myrules" id="myrules" hidden>
-      <div class="mr-head">
-        <span class="t">My rules</span>
-        <span class="muted">a <code>.bwr</code> program, linked after the built-in rules in every run</span>
-        <span class="right">
-          <label class="chk"><input type="checkbox" id="useRules"> use in runs</label>
-          <label class="chk" title="Link without running the checker; every application is then sampled at 16 points"><input type="checkbox" id="trustRules"> trusted</label>
-          <button type="button" class="quiet" id="leanBtn" title="Translate Lean 4 theorems about BitVec into rules">Import Lean theorems</button>
-          <button type="button" class="primary" id="checkRules">Check</button>
-        </span>
-      </div>
-      <textarea id="rulesSrc" spellcheck="false" rows="8"></textarea>
-      <div class="verdicts" id="verdicts"></div>
-    </div>
     <div class="io" id="io" hidden></div>
     <div class="err" id="err" hidden></div>
+  </section>
+  <section class="myrules" id="myrules" hidden>
+    <div class="mr-head">
+      <span class="t">My rules</span>
+      <span class="muted">a <code>.bwr</code> program; sound rules link after the built-in ones in every run</span>
+      <span class="right">
+        <label class="chk"><input type="checkbox" id="useRules"> use in runs</label>
+        <label class="chk" title="Link without the checker's verdict; every application is then sampled at 16 points"><input type="checkbox" id="trustRules"> trusted</label>
+        <button type="button" class="quiet" id="leanBtn" title="Translate Lean 4 theorems about BitVec into rules">Import Lean theorems</button>
+        <button type="button" class="quiet" id="rulesDocBtn" title="The rule language, in the book">Syntax</button>
+        <button type="button" class="quiet" id="closeRules" aria-label="Close">×</button>
+      </span>
+    </div>
+    <div class="mr-body">
+      <div class="editor-wrap mr-editor">
+        <pre class="expr hl bwr" id="rulesHl" aria-hidden="true"></pre>
+        <textarea id="rulesSrc" class="expr bwr" spellcheck="false" autocomplete="off" autocapitalize="off" rows="10"></textarea>
+      </div>
+      <div class="verdicts" id="verdicts"></div>
+    </div>
   </section>
   <section class="result" id="result" hidden></section>
   <section class="point" id="point" hidden></section>

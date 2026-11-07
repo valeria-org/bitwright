@@ -35,9 +35,10 @@ prover, in the browser, in milliseconds. *Large editor* makes room for `let` pro
 link* copies the address of what you see.
 
 **My rules.** A `.bwr` program of your own, linked after the built-in rules in every run while
-*use in runs* is on. *Check* compiles it and runs the soundness checker: each rule sound (with
-the evidence), unsound (with a counterexample) or inconclusive, and the compiler's diagnostics
-with their lines. A run refuses rules the checker did not pass unless *trusted* is on, which
+*use in runs* is on. The editor highlights the language and checks as you type: the compiler's
+diagnostics are underlined in the text and listed beside it, and each rule gets its verdict,
+sound (with the evidence), unsound (with a counterexample) or inconclusive; clicking a verdict
+selects the rule. *Syntax* opens the language chapter of the book. A run refuses rules the checker did not pass unless *trusted* is on, which
 links them without the checker and samples every application. Your rules appear in the story
 like any other, with their source on the card. The text is kept in the browser.
 
