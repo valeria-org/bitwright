@@ -197,3 +197,81 @@ export function short(run, t, max = 64) {
   const s = print(run, t, { lets: false });
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
+
+// ----- LaTeX ---------------------------------------------------------------------------------
+
+const TEX_INFIX = {
+  add: ["+", P_SUM],
+  sub: ["-", P_SUM],
+  mul: ["\\cdot", P_PROD],
+  shl: ["\\ll", P_SHIFT],
+  lshr: ["\\gg_{u}", P_SHIFT],
+  ashr: ["\\gg_{s}", P_SHIFT],
+  and: ["\\land", P_AND],
+  xor: ["\\oplus", P_XOR],
+  or: ["\\lor", P_OR],
+};
+const TEX_CMP = { "==": "=", "!=": "\\neq", "<u": "<_{u}", "<=u": "\\leq_{u}", "<s": "<_{s}", "<=s": "\\leq_{s}", ">u": ">_{u}", ">=u": "\\geq_{u}", ">s": ">_{s}", ">=s": "\\geq_{s}" };
+
+/// `t` as LaTeX math (no `let`s: every subterm inline). Symbols' names are escaped.
+export function latex(run, t) {
+  const node = (x) => (typeof x === "number" ? run.nodes.get(x) : x);
+  const name = (s) => s.replace(/[\\{}_^%$&#]/g, (c) => `\\${c}`);
+  const go = (x, minPrec) => {
+    const n = node(x);
+    if (!n) return "?";
+    const kids = children(run.nodes, x);
+    const at = (i, p) => go(kids[i], p);
+    let s;
+    let prec = P_ATOM;
+    switch (n.op) {
+      case "const": {
+        const v = BigInt(n.value);
+        const neg = smallNegative(n);
+        if (neg !== null) {
+          prec = P_UNARY;
+          s = `-${(-neg).toString()}`;
+        } else s = v < 65536n ? v.toString() : `\\mathtt{0x${v.toString(16)}}`;
+        break;
+      }
+      case "sym":
+        s = (n.name ?? "?").length > 1 ? `\\mathit{${name(n.name)}}` : name(n.name ?? "?");
+        break;
+      case "cmp":
+        prec = P_CMP;
+        s = `${at(0, P_CMP + 1)} ${TEX_CMP[n.pred] ?? n.pred} ${at(1, P_CMP + 1)}`;
+        break;
+      case "zext":
+      case "sext":
+        s = `\\mathrm{${n.op}}_{${n.w}}\\!\\left(${at(0, 0)}\\right)`;
+        break;
+      case "extract":
+        s = n.lo === 0 ? `\\mathrm{trunc}_{${n.w}}\\!\\left(${at(0, 0)}\\right)` : `${at(0, P_ATOM)}[${n.lo + n.w - 1}{:}${n.lo}]`;
+        break;
+      case "concat":
+        prec = P_OR;
+        s = `${at(0, P_OR + 1)} \\,\\Vert\\, ${at(1, P_OR + 1)}`;
+        break;
+      case "select":
+        s = `\\mathrm{ite}\\!\\left(${at(0, 0)},\\, ${at(1, 0)},\\, ${at(2, 0)}\\right)`;
+        break;
+      default:
+        if (TEX_INFIX[n.op] && kids.length === 2) {
+          const [sym, p] = TEX_INFIX[n.op];
+          prec = p;
+          s = `${at(0, p)} ${sym} ${at(1, p + 1)}`;
+        } else if (n.op === "not" && kids.length === 1) {
+          prec = P_UNARY;
+          s = `\\lnot ${at(0, P_UNARY)}`;
+        } else if (n.op === "neg" && kids.length === 1) {
+          prec = P_UNARY;
+          s = `-${at(0, P_UNARY)}`;
+        } else {
+          const f = n.op === "fp" ? n.fp_op ?? "fp" : n.op;
+          s = `\\mathrm{${name(f)}}\\!\\left(${kids.map((_, i) => at(i, 0)).join(",\\, ")}\\right)`;
+        }
+    }
+    return prec < minPrec ? `\\left(${s}\\right)` : s;
+  };
+  return go(t, 0);
+}

@@ -17,6 +17,7 @@ use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::{Context, ParseOptions, Width};
 
 mod compiler;
+mod lean;
 
 /// A buffer of `len` bytes, for JavaScript to fill (freed with `bw_dealloc(ptr, len)`).
 #[unsafe(no_mangle)]
@@ -57,6 +58,9 @@ const NAMES: u32 = 14;
 const TRACE: u32 = 15;
 const EVALUATE: u32 = 16;
 const RULES: u32 = 17;
+const FROM_SMTLIB: u32 = 18;
+const TO_LEAN: u32 = 19;
+const EQUIVALENCE_QUERY: u32 = 20;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -282,6 +286,47 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
             Ok(format!("{:#x}", v[0]))
         }
         RULES => Ok(rule_catalog()),
+        FROM_SMTLIB => {
+            // The script's definitions, or its assertions conjoined, as expression text with
+            // the symbols' widths; `b` names one definition.
+            let mut cx = Context::new();
+            let import = bw::smtlib::import(&mut cx, a).map_err(|e| e.to_string())?;
+            let e = if !b.is_empty() {
+                import
+                    .definition(b)
+                    .ok_or_else(|| format!("no definition `{b}`"))?
+            } else if let Some(&(_, e)) = import.definitions.last() {
+                e
+            } else if let Some((&first, rest)) = import.assertions.split_first() {
+                let mut acc = first;
+                for &p in rest {
+                    acc = cx.bin(bw::BinOp::And, acc, p).map_err(|e| e.to_string())?;
+                }
+                acc
+            } else {
+                return Err("the script defines and asserts nothing".to_string());
+            };
+            let opts = bw::PrintOptions::default().with_symbol_widths(true);
+            Ok(cx.display_with(e, opts).to_string())
+        }
+        TO_LEAN => {
+            // `a = b` as a Lean example over their symbols (`b` empty: the term of `a` alone).
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let l = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            if b.is_empty() {
+                return lean::term(&cx, l);
+            }
+            let r = cx.parse(b, &o).map_err(|e| e.to_string())?;
+            lean::equation(&mut cx, l, r)
+        }
+        EQUIVALENCE_QUERY => {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let l = cx.parse(a, &o).map_err(|e| e.to_string())?;
+            let r = cx.parse(b, &o).map_err(|e| e.to_string())?;
+            text(bw::smtlib::equivalence_query(&mut cx, l, r))
+        }
         _ => Err(format!("unknown operation {op}")),
     }
 }

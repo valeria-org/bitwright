@@ -29,6 +29,9 @@ const OPS = {
   trace: 15,
   evaluate: 16,
   rules: 17,
+  fromSmtlib: 18,
+  toLean: 19,
+  equivalenceQuery: 20,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -278,6 +281,14 @@ export async function instantiate(bytes) {
       const lines = Object.entries(env).map(([k, v]) => `${word(k, "symbol")} = ${typeof v === "bigint" || typeof v === "number" ? v.toString() : String(v).trim()}`);
       return call(OPS.evaluate, text, lines.join("\n"), width);
     },
+    // Reads a QF_BV script: the named definition (or the last one, or the assertions
+    // conjoined) as expression text, the symbols' widths written (`x:64`).
+    fromSmtlib: (script, definition = "") => call(OPS.fromSmtlib, script, definition, 0),
+    // `lhs = rhs` as a Lean 4 `example` over their symbols, proved by `bv_decide`; without
+    // `rhs`, the Lean term of `lhs` alone. Throws for what Lean's core BitVec cannot state.
+    toLean: (lhs, rhs = "", width = 64) => call(OPS.toLean, lhs, rhs, width),
+    // An SMT-LIB script that is unsat exactly when `a` and `b` are equal at every input.
+    equivalenceQuery: (a, b, width = 64) => call(OPS.equivalenceQuery, a, b, width),
     // The built-in rules: `[{ name, kind, doc, examples: [[input, output]], source, ledger }]`.
     rules: () => call(OPS.rules, "", "", 0).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     // Tests a host rewrite offline on expression texts: `{ passed, applications, points,

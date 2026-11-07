@@ -4,7 +4,7 @@
 // six-tab inspector (inspect.html) opens on the same run.
 
 import { parseTrace, provenance, symbolWidth } from "./model.js";
-import { print, short } from "./print.js";
+import { print, short, latex } from "./print.js";
 import { h, fill, chip, kindClass } from "./dom.js";
 import { stepBody } from "./trace-view.js";
 import * as popover from "./popover.js";
@@ -34,6 +34,20 @@ const STRATEGIES = {
 };
 
 const EXAMPLES = [
+  [
+    "A tour of the syntax",
+    `let k = 0xd3220fb78e33751f;
+let lo = trunc<32>(x);
+let hi = extract<32, 32>(x);
+let m = (x ^ k) * k;
+let mixed = (m ^ ((m >>u 32) >>u (m >>u 60))) * k;
+let swapped = concat(bswap(lo), rotl(hi, 8));
+let q = umulhi(y, 0xcccccccccccccccd) >>u 3;
+let flag = (lo <u hi) & (lo != hi);
+select(flag, swapped, x) + (q - udiv(y, 10)) + zext<64>(mixed == 0) + ((z & 0xff) + 0x100) - (z & 0xff)`,
+    64,
+    "let bindings, hex and decimal constants, casts and slices, concat and select, rotations and byte swaps, signed and unsigned operators spelled out. Several parts simplify independently: watch which passes take which.",
+  ],
   ["A linear MBA", "(((x ^ y) + 2*(x & y)) * 3 + ((x | y) - (x & y))) ^ (~z & z)", 32, "Four rules clear the easy parts, then the MBA service proves the rest is 2·((x | y) + x + y). Watch the fold the constructors make after step 1."],
   ["Masking that cancels", "((x ^ 0x5a) + 3 - 3) ^ 0x5a", 32, "No rule fires: the linear pass cancels + 3 − 3, the xor pass cancels the two ^ 0x5a. Turn either phase off and see what stays."],
   ["A keyed hash compared with 0", "let m = (x ^ 0xd3220fb78e33751f) * 0xd3220fb78e33751f; (m ^ ((m >>u 32) >>u (m >>u 60))) * 0xd3220fb78e33751f == 0", 64, "The invert pass undoes four injective layers in one step, the xorshift region included, and recovers the key."],
@@ -182,9 +196,90 @@ function togglePhase(name) {
   schedule();
 }
 
+function grow() {
+  const ta = $("expr");
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight + 2, window.innerHeight * 0.6)}px`;
+}
 $("expr").addEventListener("input", (e) => {
   app.text = e.target.value;
+  grow();
   schedule();
+});
+$("bigBtn").addEventListener("click", () => {
+  const on = $("editor").classList.toggle("big");
+  main.classList.toggle("big", on);
+  $("bigBtn").textContent = on ? "Normal editor" : "Large editor";
+  grow();
+  $("expr").focus();
+});
+
+// ----- import and export ------------------------------------------------------------------------
+
+function panel(title, note, body, right = []) {
+  const io = $("io");
+  fill(io, h("div", { class: "io-head" }, h("span", { class: "t" }, title), note ? h("span", { class: "muted" }, note) : null, h("span", { class: "right" }, right, h("button", { type: "button", class: "quiet", onclick: () => { io.hidden = true; } }, "Close"))), body);
+  io.hidden = false;
+}
+
+function copyButton(text) {
+  return h("button", { type: "button", class: "quiet", onclick: (e) => { navigator.clipboard?.writeText(typeof text === "function" ? text() : text).then(() => { e.target.textContent = "Copied"; setTimeout(() => (e.target.textContent = "Copy"), 1200); }).catch(() => {}); } }, "Copy");
+}
+
+function downloadButton(name, text, type = "text/plain") {
+  return h("button", { type: "button", class: "quiet", onclick: () => { const a = h("a", { href: URL.createObjectURL(new Blob([typeof text === "function" ? text() : text], { type })), download: name }); document.body.append(a); a.click(); a.remove(); } }, "Download");
+}
+
+$("importBtn").addEventListener("click", () => {
+  const ta = h("textarea", { spellcheck: "false", placeholder: "(declare-const x (_ BitVec 32))\n(define-fun f () (_ BitVec 32) (bvadd x #x00000001))" });
+  const note = h("div", { class: "note" }, "A QF_BV script: its last definition, or its assertions conjoined, becomes the expression; the symbols keep their declared widths.");
+  const run = () => {
+    if (!app.bw) return;
+    try {
+      const text = app.bw.fromSmtlib(ta.value);
+      load(text, app.width, app.assumes, app.engine);
+      $("io").hidden = true;
+    } catch (e) {
+      note.textContent = e.message;
+      note.classList.add("warn");
+    }
+  };
+  panel("Import SMT-LIB", null, [ta, note], [h("button", { type: "button", class: "primary", onclick: run }, "Import")]);
+  ta.focus();
+});
+
+for (const b of document.querySelectorAll("[data-export]")) {
+  b.addEventListener("click", () => exportAs(b.dataset.export));
+}
+
+function exportAs(kind) {
+  const run = app.run;
+  if (!run?.result || !app.bw) return;
+  const input = print(run, run.result.input, { lets: false });
+  const output = print(run, run.result.expr, { lets: false });
+  try {
+    if (kind === "smtlib") {
+      const text = app.bw.equivalenceQuery(input, output, app.width);
+      panel("SMT-LIB", "unsat means the input and the result agree at every point: pipe it to z3 -in or bitwuzla", h("pre", {}, text), [copyButton(text), downloadButton("equivalence.smt2", text)]);
+    } else if (kind === "lean") {
+      const text = app.bw.toLean(input, output, app.width);
+      panel("Lean 4", "an example bv_decide checks; needs Std's BVDecide", h("pre", {}, text), [copyButton(text), downloadButton("Equation.lean", text)]);
+    } else if (kind === "latex") {
+      const steps = run.steps.filter((s) => s.kind !== "fold");
+      const lines = [`${latex(run, run.result.input)}`, ...steps.map((s) => `  &= ${latex(run, s.whole.after)} && \text{${s.kind === "rule" ? s.name.split("::").pop().replace(/_/g, "\\_") : s.name}}`)];
+      const text = ["\\begin{align*}", lines.join(" \\\\\n"), "\\end{align*}"].join("\n");
+      const short = `${latex(run, run.result.input)} = ${latex(run, run.result.expr)}`;
+      panel("LaTeX", "the input and every step as an aligned derivation; the short form is the input and the result alone", [h("pre", {}, text), h("div", { class: "note" }, "Short form:"), h("pre", {}, short)], [copyButton(text), downloadButton("derivation.tex", text)]);
+    }
+  } catch (e) {
+    const why = kind === "lean" ? `Not stated: Lean's core BitVec has no counterpart for ${e.message}.` : e.message;
+    panel(kind === "lean" ? "Lean 4" : kind, null, h("div", { class: "note warn" }, why));
+  }
+}
+
+$("shareBtn").addEventListener("click", (e) => {
+  writeUrl();
+  navigator.clipboard?.writeText(location.href).then(() => { e.target.textContent = "Link copied"; setTimeout(() => (e.target.textContent = "Copy link"), 1200); }).catch(() => {});
 });
 $("assumeInput").addEventListener("keydown", (e) => {
   if (e.key !== "Enter") return;
@@ -351,6 +446,7 @@ function load(expr, w, assume = [], engine = "deobfuscate") {
   app.phases = null;
   app.point = {};
   $("expr").value = expr;
+  grow();
   renderControls();
   runNow();
   main.scrollTo({ top: 0, behavior: "smooth" });
@@ -477,6 +573,7 @@ async function start() {
   popover.wire(app, main);
   readUrl();
   $("expr").value = app.text;
+  grow();
   renderControls();
   renderExamples();
   app.bw = await loadWasm();

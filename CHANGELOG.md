@@ -147,8 +147,10 @@
   the rule as written and proved or the pass's reasoning. The width, the engine, the assumptions
   and any single phase can be changed and the run looked at again; the symbols can be given
   values and every step evaluated at them; a gallery of examples and a browser of the built-in
-  rules are a click away. The WebAssembly module gains `trace` (with a `phases` option for a
-  strategy of chosen phases), `evaluate` and `rules` for it.
+  rules are a click away. It imports a QF_BV script and exports the input and the result as an
+  SMT-LIB equivalence query, a Lean 4 `example` for `bv_decide`, or a LaTeX derivation. The
+  WebAssembly module gains `trace` (with a `phases` option for a strategy of chosen phases),
+  `evaluate`, `rules`, `fromSmtlib`, `toLean` and `equivalenceQuery` for it.
 - **The inspector** (`workbench/inspect.html`): a viewer of trace files, with no build step. Each
   step of a run with the whole expression before and after it, the rule (as written, with its
   proof) or the pass's reasoning, and the phases × rounds it ran in; the run phase by phase; why

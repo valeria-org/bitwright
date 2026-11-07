@@ -522,3 +522,20 @@ body.pg { grid-template-rows: auto minmax(0, 1fr) auto; }
 .notice { background: color-mix(in srgb, var(--solver) 10%, transparent); color: var(--ink); border-radius: 10px; padding: 12px 16px; font-size: 13px; }
 .notice code { background: color-mix(in srgb, var(--ink) 7%, transparent); padding: 1px 5px; border-radius: 4px; }
 @media (max-width: 760px) { .pg-main { padding: 16px 12px 40px; } .result { padding: 0 8px; } }
+
+/* ---- editor tools, import and export -------------------------------------------------------- */
+.pg-main.big > section { max-width: 1280px; }
+.editor.big .expr { min-height: 40vh; }
+.tools { display: flex; gap: 2px; align-items: center; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.tools button { font-size: 12.5px; padding: 4px 9px; }
+.tools .sepv { width: 1px; height: 16px; background: var(--line); margin: 0 6px; }
+.io { margin-top: 10px; background: var(--sunk); border-radius: 8px; padding: 10px 12px 12px; }
+.io .io-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.io .io-head .t { font: 600 13px var(--sans); }
+.io .io-head .muted { font-size: 12px; }
+.io .io-head .right { margin-left: auto; display: flex; gap: 4px; }
+.io textarea, .io pre { width: 100%; font: 400 12.5px/1.55 var(--mono); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }
+.io textarea { min-height: 120px; resize: vertical; }
+.io .note { font: 400 12px var(--sans); color: var(--ink-3); margin-top: 6px; }
+.io .note.warn { color: var(--miss); }
+.io .katex-like { font: 400 13px var(--mono); }

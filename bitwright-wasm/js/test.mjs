@@ -47,6 +47,16 @@ assert.throws(() => bw.trace("x", 8, { phases: ["nope"] }), /unknown phase/);
 assert.equal(bw.evaluate("x + y", 8, { x: 200, y: "0x40" }), "0x8");
 assert.equal(bw.evaluate("x - 1", 8, { x: 0, z: 9 }), "0xff");
 assert.throws(() => bw.evaluate("x + y", 8, { x: 1 }), /./);
+// SMT-LIB in, and out as an equivalence query; Lean out.
+const script = bw.toSmtlib("x + 1", 8);
+assert.equal(bw.fromSmtlib(script), "x:8 + 1");
+assert.equal(bw.fromSmtlib("(declare-const a (_ BitVec 16)) (assert (= a #x0001)) (assert (bvult a #x0010))"), "(a:16 == 1) & (a <u 16)");
+assert.match(bw.equivalenceQuery("x * 2", "x + x", 16), /check-sat/);
+const lean = bw.toLean("(x & y) + (x | y)", "x + y", 32);
+assert.match(lean, /example \(x : BitVec 32\) \(y : BitVec 32\) :/);
+assert.match(lean, /\(\(x &&& y\) \+ \(x \|\|\| y\)\)\n  = \(x \+ y\) := by\n  bv_decide/);
+assert.equal(bw.toLean("rotl(x, 8)", "", 32), "(x.rotateLeft 8)");
+assert.throws(() => bw.toLean("popcnt(x)", "", 32), /bit count/);
 // The rule catalog.
 const rules = bw.rules();
 assert.ok(rules.length > 300);

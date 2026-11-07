@@ -24,6 +24,14 @@ browses the built-in corpus (search by name, text or doc, click an example to lo
 **Inspect** opens the current run in the six-view inspector below. `Esc` closes the node
 popover; the button at the top right switches the theme.
 
+**In and out.** *Import SMT-LIB* reads a QF_BV script (its last definition, or its assertions
+conjoined; the symbols keep their declared widths). *Export SMT-LIB* writes the equivalence
+query of the input and the result, for z3 or Bitwuzla (`unsat` means they agree everywhere);
+*Export Lean* writes them as a Lean 4 `example` that `bv_decide` checks (for what Lean's core
+`BitVec` can state: no bit counts, byte swaps or floats); *Export LaTeX* writes the derivation
+as an aligned equation, one line per step. *Large editor* makes room for `let` programs; *Copy
+link* copies the address of what you see.
+
 **Phases.** The engine's strategy is a list of phases run in order, repeated until a round
 changes nothing. The toggles turn any phase off (or on): the result, the story and the
 inspector then show what that phase was doing. The two presets are the command line's

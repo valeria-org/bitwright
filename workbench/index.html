@@ -39,6 +39,17 @@ try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "da
       <summary>Phases <span class="n" id="phasesNote"></span></summary>
       <div class="toggles" id="phases"></div>
     </details>
+    <div class="tools">
+      <button type="button" class="quiet" id="bigBtn" title="A larger editor">Large editor</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="importBtn" title="Read a QF_BV script's definition or assertions">Import SMT-LIB</button>
+      <button type="button" class="quiet" data-export="smtlib" title="An SMT-LIB script that is unsat exactly when the input and the result are equal">Export SMT-LIB</button>
+      <button type="button" class="quiet" data-export="lean" title="A Lean 4 example: input = result, by bv_decide">Export Lean</button>
+      <button type="button" class="quiet" data-export="latex" title="The input and the result as LaTeX">Export LaTeX</button>
+      <span class="sepv"></span>
+      <button type="button" class="quiet" id="shareBtn" title="Copy a link to this view">Copy link</button>
+    </div>
+    <div class="io" id="io" hidden></div>
     <div class="err" id="err" hidden></div>
   </section>
   <section class="result" id="result" hidden></section>
