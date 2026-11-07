@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0
 
 - **Exhaustion certificates are scheduled in near-linear time.** `Exhaustion::check` simulates
   the goal's conjuncts cheapest cone first, and chose each round's conjunct by walking the
