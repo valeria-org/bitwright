@@ -3673,7 +3673,14 @@ fn invert_is_sound_and_idempotent() {
         };
         let fw = wide(&mut cx, f);
         let wc = cx.width(fw).unwrap();
-        let op = [CmpOpExt::Eq, CmpOpExt::Ne, CmpOpExt::Ult][g.rng.below(3) as usize];
+        let op = [
+            CmpOpExt::Eq,
+            CmpOpExt::Ne,
+            CmpOpExt::Ult,
+            CmpOpExt::Ule,
+            CmpOpExt::Slt,
+            CmpOpExt::Sle,
+        ][g.rng.below(6) as usize];
         let e = match i % 5 {
             // Against a constant: often an actual value of the chain, so it is solvable.
             0 | 1 => {
@@ -3795,7 +3802,7 @@ fn invert_fixtures() {
         "(x != 0xff) | (y != 0)",
         8,
     );
-    // Orderings are left alone.
+    // Orderings never go through a bijection that is not monotone.
     check_to(&eng, "x + 7 <u y + 7", "x + 7 <u y + 7", 8);
     check_to(&eng, "x * 3 <u 5", "x * 3 <u 5", 8);
     // The pass alone (fact folding would decide some of these first): no preimage.
@@ -3824,6 +3831,474 @@ fn invert_fixtures() {
         "(x == 0xff) & (y == 0xff)",
         8,
     );
+}
+
+/// Checks `src` simplifies to `want` at `w` bits under `eng`, assuming each of `under` true.
+fn check_under(eng: &Engine, under: &[&str], src: &str, want: &str, w: u16) {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(w).unwrap());
+    let e = cx.parse(src, &o).unwrap();
+    let mut a = Assumptions::new();
+    for u in under {
+        let u = cx.parse(u, &o).unwrap();
+        a.assume_true(&mut cx, u).unwrap();
+    }
+    let out = eng
+        .run(&mut cx, &[e], Run::default().with_assumptions(&a))
+        .unwrap()
+        .roots[0];
+    let want = cx
+        .parse(want, &ParseOptions::width(cx.width(e).unwrap()))
+        .unwrap();
+    assert_eq!(
+        out.expr,
+        want,
+        "{src} under {under:?} gave {}",
+        cx.display(out.expr)
+    );
+}
+
+#[test]
+fn monotone_fixtures() {
+    let eng = Engine::standard();
+    let only = engine(vec![Phase::Invert]);
+    // Layers monotone at every input, on both sides: the order they are monotone from.
+    check_to(&eng, "zext<16>(x) <u zext<16>(y)", "x <u y", 8);
+    check_to(&eng, "zext<16>(x) <s zext<16>(y)", "x <u y", 8);
+    check_to(&eng, "sext<16>(x) <s sext<16>(y)", "x <s y", 8);
+    check_to(&eng, "sext<16>(x) <u sext<16>(y)", "x <u y", 8);
+    check_to(&eng, "concat(x, 3:4) <=u concat(y, 3:4)", "x <=u y", 8);
+    check_to(&eng, "concat(x, 3:4) <s concat(y, 3:4)", "x <s y", 8);
+    check_to(&eng, "concat(3:4, x) <s concat(3:4, y)", "x <u y", 8);
+    check_to(&eng, "concat(9:4, x) <u concat(9:4, y)", "x <u y", 8);
+    // Decreasing: the sides swap. Between orders: `x ^ smin`.
+    check_to(&only, "~x <u ~y", "y <u x", 8);
+    check_to(&only, "~x <=s ~y", "y <=s x", 8);
+    check_to(&only, "(x ^ 0x80) <u (y ^ 0x80)", "x <s y", 8);
+    check_to(&only, "(x ^ 0x80) <s (y ^ 0x80)", "x <u y", 8);
+    check_to(&only, "(x + 0x80) <u (y + 0x80)", "x <s y", 8);
+    // Chains, mixing orders along the way.
+    check_to(&only, "zext<16>(~x) <s zext<16>(~y)", "y <u x", 8);
+    check_to(&only, "~zext<16>(x) <u ~zext<16>(y)", "y <u x", 8);
+    check_to(
+        &only,
+        "sext<16>(x ^ 0x80) <s sext<16>(y ^ 0x80)",
+        "x <u y",
+        8,
+    );
+    // Not without facts: a sum, a product or a shift may wrap.
+    check_to(&only, "x + 7 <u y + 7", "x + 7 <u y + 7", 8);
+    check_to(&only, "x * 3 <s y * 3", "x * 3 <s y * 3", 8);
+    check_to(&only, "(x << 1) <u (y << 1)", "(x << 1) <u (y << 1)", 8);
+    check_to(&only, "-x <u -y", "-x <u -y", 8);
+    // ... and with them, when both ranges keep to one piece.
+    check_under(
+        &eng,
+        &["x <u 100", "y <u 100"],
+        "x + 7 <u y + 7",
+        "x <u y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <u 100", "y <u 100", "k <u 10"],
+        "x + k <u y + k",
+        "x <u y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <u 100", "y <u 100"],
+        "x - 7 <u y - 7",
+        "x - 7 <u y - 7",
+        8,
+    );
+    check_under(&eng, &["7 <=u x", "7 <=u y"], "x - 7 <u y - 7", "x <u y", 8);
+    check_under(
+        &eng,
+        &["x <=u 50", "y <=u 50"],
+        "50 - x <u 50 - y",
+        "y <u x",
+        8,
+    );
+    check_under(&eng, &["0 <u x", "0 <u y"], "-x <u -y", "y <u x", 8);
+    check_under(
+        &eng,
+        &["x <s 50", "-50 <s x", "y <s 50", "-50 <s y"],
+        "x + 7 <s y + 7",
+        "x <s y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <s 40", "-40 <s x", "y <s 40", "-40 <s y"],
+        "x * 3 <s y * 3",
+        "x <s y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <s 40", "-40 <s x", "y <s 40", "-40 <s y"],
+        "x * -3 <s y * -3",
+        "y <s x",
+        8,
+    );
+    check_under(&eng, &["x <u 80", "y <u 80"], "x * 3 <u y * 3", "x <u y", 8);
+    check_under(
+        &eng,
+        &["x <u 60", "y <u 60"],
+        "(x << 2) <u (y << 2)",
+        "x <u y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <u 30", "y <u 30"],
+        "(x << 2) <s (y << 2)",
+        "x <s y",
+        8,
+    );
+    check_under(
+        &eng,
+        &["x <u 60", "y <u 60"],
+        "(x << 2) <s (y << 2)",
+        "(x << 2) <s (y << 2)",
+        8,
+    );
+    // Both on the wrapping piece is fine. One on each is not, unsigned; but read from the
+    // signed order, `v + 10` is increasing on all of `[-6, 9]`.
+    check_under(
+        &eng,
+        &["200 <=u x", "200 <=u y"],
+        "x + 100 <u y + 100",
+        "x <u y",
+        8,
+    );
+    check_under(
+        &only,
+        &["x <u 10", "250 <=u y"],
+        "x + 10 <u y + 10",
+        "x <s y",
+        8,
+    );
+    check_under(
+        &only,
+        &["200 <=u x", "x <u 210", "250 <=u y"],
+        "x + 10 <u y + 10",
+        "x + 10 <u y + 10",
+        8,
+    );
+    // Against a constant: a threshold, or decided.
+    check_to(&only, "zext<16>(x) <u 300", "true", 8);
+    check_to(&only, "zext<16>(x) <u 100", "x <u 100", 8);
+    check_to(&only, "zext<16>(x) <s 0xffff", "false", 8);
+    check_to(&only, "sext<16>(x) <s 5", "x <s 5", 8);
+    check_to(&only, "sext<16>(x) <=s 0x7f", "true", 8);
+    check_to(&only, "sext<16>(x) <s 0xff80", "false", 8);
+    check_to(&only, "~x <u 5", "0xfb <=u x", 8);
+    check_to(&only, "5 <u ~x", "x <u 0xfa", 8);
+    check_to(&only, "(x ^ 0x80) <u 0x90", "x <s 0x10", 8);
+    check_to(&only, "0x90 <=u (x ^ 0x80)", "0x10 <=s x", 8);
+    check_to(&only, "concat(x, 3:4) <u 0x5a3", "x <u 0x5a", 8);
+    check_to(&only, "concat(x, 3:4) <u 0x5a4", "x <u 0x5b", 8);
+    check_to(&only, "concat(x, 3:4) <u 0x5a2", "x <u 0x5a", 8);
+    check_to(&only, "(x << 1) <u 10", "(x << 1) <u 10", 8);
+    check_under(&eng, &["x <u 100"], "x + 7 <u 50", "x <u 43", 8);
+    check_under(&eng, &["x <u 100"], "x + 7 <u 200", "true", 8);
+    check_under(&eng, &["x <u 60"], "(x << 2) <u 100", "x <u 25", 8);
+    check_under(
+        &eng,
+        &["x <s 40", "-40 <s x"],
+        "x * 3 <s -30",
+        "x <s -10",
+        8,
+    );
+}
+
+#[test]
+fn monotone_trees() {
+    let eng = Engine::standard();
+    let only = engine(vec![Phase::Invert]);
+    // A select passes its order to its arms: the leaves of both sides are peeled together.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), zext<16>(y)) <u zext<16>(z)",
+        "select(c, x, y) <u z",
+        8,
+    );
+    check_to(
+        &eng,
+        "select(zext<16>(x) <u zext<16>(y), zext<16>(x), zext<16>(y)) <u zext<16>(z)",
+        "select(x <u y, x, y) <u z",
+        8,
+    );
+    check_to(&only, "select(c, ~x, ~y) <u ~z", "z <u select(c, x, y)", 8);
+    check_to(
+        &only,
+        "select(c, select(d, ~x, ~y), ~w) <=s ~z",
+        "z <=s select(c, select(d, x, y), w)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x ^ 0x80, y ^ 0x80) <s (z ^ 0x80)",
+        "select(c, x, y) <u z",
+        8,
+    );
+    // A constant leaf stands for its exact preimage, or stops the peeling.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 5) <u zext<16>(z)",
+        "select(c, x, 5) <u z",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 300) <u zext<16>(z)",
+        "select(c, zext<16>(x), 300) <u zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, ~x, 5) <u ~z",
+        "z <u select(c, x, 0xfa)",
+        8,
+    );
+    // ... but not through a layer monotone only on the facts' range.
+    check_under(
+        &only,
+        &["x <u 10", "z <u 10"],
+        "select(c, x + 1, 5) <u z + 1",
+        "select(c, x + 1, 5) <u z + 1",
+        8,
+    );
+    check_under(
+        &only,
+        &["x <u 10", "y <u 10", "z <u 10"],
+        "select(c, x + 1, y + 1) <u z + 1",
+        "select(c, x, y) <u z",
+        8,
+    );
+    // Different layers, or one leaf that is not a layer: nothing.
+    check_to(
+        &only,
+        "select(c, zext<16>(x), sext<16>(y)) <u zext<16>(z)",
+        "select(c, zext<16>(x), sext<16>(y)) <u zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), w) <u zext<16>(z)",
+        "select(c, zext<16>(x), w) <u zext<16>(z)",
+        8,
+    );
+    // Equalities through selects: an injective layer, constants by preimage.
+    check_to(
+        &only,
+        "select(c, x + 1, y + 1) == z + 1",
+        "select(c, x, y) == z",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x * 3, 7) != y * 3",
+        "select(c, x, 0xad) != y",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, zext<16>(x), 300) == zext<16>(z)",
+        "select(c, zext<16>(x), 300) == zext<16>(z)",
+        8,
+    );
+    check_to(
+        &only,
+        "select(c, x ^ (x >>u 4), y ^ (y >>u 4)) == z ^ (z >>u 4)",
+        "select(c, x, y) == z",
+        8,
+    );
+}
+
+/// Random chains of layers monotone where the facts allow (sums, differences, products and
+/// shifts by a constant or a shared symbol, complements, negations, `^ smin`, casts and
+/// concatenations), compared through every ordering on both sides or against a constant, under
+/// random range assumptions on the symbols: the result agrees with the input on every
+/// assignment the assumptions admit.
+#[test]
+fn monotone_is_sound_under_ranges() {
+    let eng = Engine::standard();
+    let only = engine(vec![Phase::Invert]);
+    let mut g = generator(0x3030_0001);
+    let (mut changed, mut by_pass) = (0, 0);
+    for _ in 0..800 {
+        let mut cx = Context::new();
+        let w = 3 + g.rng.below(3) as u16;
+        let wd = Width::new(w).unwrap();
+        let (x, y, k) = (
+            cx.symbol("x", wd).unwrap(),
+            cx.symbol("y", wd).unwrap(),
+            cx.symbol("k", wd).unwrap(),
+        );
+        let (mut e, mut ew) = (x, w);
+        for _ in 0..1 + g.rng.below(3) {
+            let ewd = Width::new(ew).unwrap();
+            let p = if ew == w && g.rng.chance(1, 3) {
+                k
+            } else {
+                let v = g.constant(ew);
+                cx.constant(&v).unwrap()
+            };
+            e = match g.rng.below(10) {
+                0 => cx.bin(BinOp::Add, e, p).unwrap(),
+                1 => cx.bin(BinOp::Sub, e, p).unwrap(),
+                2 => cx.bin(BinOp::Sub, p, e).unwrap(),
+                3 => cx.bin(BinOp::Mul, e, p).unwrap(),
+                4 => {
+                    let s = cx.constant_u64(ewd, g.rng.below(3)).unwrap();
+                    cx.bin(BinOp::Shl, e, s).unwrap()
+                }
+                5 => cx.un(UnOp::Not, e).unwrap(),
+                6 => cx.un(UnOp::Neg, e).unwrap(),
+                7 => {
+                    let m = cx.constant(&BitVec::smin(ewd)).unwrap();
+                    cx.bin(BinOp::Xor, e, m).unwrap()
+                }
+                _ if ew >= 7 => e,
+                _ => {
+                    let to = Width::new(ew + 1 + g.rng.below(2) as u16).unwrap();
+                    let r = match g.rng.below(4) {
+                        0 => cx.zext(e, to).unwrap(),
+                        1 => cx.sext(e, to).unwrap(),
+                        2 => {
+                            let c = cx.constant(&g.constant(to.bits() - ew)).unwrap();
+                            cx.concat(e, c).unwrap()
+                        }
+                        _ => {
+                            let c = cx.constant(&g.constant(to.bits() - ew)).unwrap();
+                            cx.concat(c, e).unwrap()
+                        }
+                    };
+                    ew = to.bits();
+                    r
+                }
+            };
+        }
+        let op =
+            [CmpOpExt::Ult, CmpOpExt::Ule, CmpOpExt::Slt, CmpOpExt::Sle][g.rng.below(4) as usize];
+        let root = match g.rng.below(6) {
+            0 => {
+                let fy = cx.substitute(&[e], &[(x, y)]).unwrap()[0];
+                cx.cmp(op, e, fy).unwrap()
+            }
+            // Select trees over the chain at `x`, `y`, `k` and constants, compared by an
+            // ordering or an equality.
+            4 | 5 => {
+                let fy = cx.substitute(&[e], &[(x, y)]).unwrap()[0];
+                let fk = cx.substitute(&[e], &[(x, k)]).unwrap()[0];
+                let ewd = Width::new(ew).unwrap();
+                let leaf = |cx: &mut Context, g: &mut Gen| match g.rng.below(4) {
+                    0 => e,
+                    1 => fy,
+                    2 => fk,
+                    _ => {
+                        let v = g.constant(ewd.bits());
+                        cx.constant(&v).unwrap()
+                    }
+                };
+                let cond = |cx: &mut Context, g: &mut Gen| {
+                    let a = [x, y, k][g.rng.below(3) as usize];
+                    let b = [x, y, k][g.rng.below(3) as usize];
+                    cx.cmp(CmpOpExt::Ult, a, b).unwrap()
+                };
+                let c1 = cond(&mut cx, &mut g);
+                let (l1, l2) = (leaf(&mut cx, &mut g), leaf(&mut cx, &mut g));
+                let a = cx.select(c1, l1, l2).unwrap();
+                let b = if g.rng.chance(1, 2) {
+                    leaf(&mut cx, &mut g)
+                } else {
+                    let c2 = cond(&mut cx, &mut g);
+                    let (l3, l4) = (leaf(&mut cx, &mut g), leaf(&mut cx, &mut g));
+                    cx.select(c2, l3, l4).unwrap()
+                };
+                let op = if g.rng.chance(1, 3) {
+                    [CmpOpExt::Eq, CmpOpExt::Ne][g.rng.below(2) as usize]
+                } else {
+                    op
+                };
+                cx.cmp(op, a, b).unwrap()
+            }
+            1 => {
+                let c = cx.constant(&g.constant(ew)).unwrap();
+                cx.cmp(op, c, e).unwrap()
+            }
+            _ => {
+                let c = cx.constant(&g.constant(ew)).unwrap();
+                cx.cmp(op, e, c).unwrap()
+            }
+        };
+        // Range assumptions: each symbol bounded on either side, in either order, or not.
+        let mut preds = Vec::new();
+        for s in [x, y, k] {
+            for _ in 0..g.rng.below(3) {
+                let c = cx.constant(&g.constant(w)).unwrap();
+                let op = [CmpOpExt::Ult, CmpOpExt::Ule, CmpOpExt::Slt, CmpOpExt::Sle]
+                    [g.rng.below(4) as usize];
+                preds.push(if g.rng.chance(1, 2) {
+                    cx.cmp(op, s, c).unwrap()
+                } else {
+                    cx.cmp(op, c, s).unwrap()
+                });
+            }
+        }
+        let mut a = Assumptions::new();
+        for &p in &preds {
+            a.assume_true(&mut cx, p).unwrap();
+        }
+        if a.is_infeasible() {
+            continue;
+        }
+        for engine in [&eng, &only] {
+            let out = engine
+                .run(&mut cx, &[root], Run::default().with_assumptions(&a))
+                .unwrap();
+            let r = out.roots[0];
+            assert_eq!(out.stats.rejected, 0, "{}", cx.display(root));
+            if !r.changed {
+                continue;
+            }
+            changed += 1;
+            by_pass += u64::from(core::ptr::eq(engine, &only));
+            for case in 0..1u64 << (3 * w) {
+                let vals = [
+                    ("x", case & ((1 << w) - 1)),
+                    ("y", (case >> w) & ((1 << w) - 1)),
+                    ("k", case >> (2 * w)),
+                ];
+                let env = FnEnv(|key: &crate::SymbolKey, _| {
+                    vals.iter()
+                        .find(|(n, _)| *key == crate::SymbolKey::from(*n))
+                        .map(|(_, v)| BitVec::wrapping_from_u64(wd, *v))
+                });
+                let pv = cx.eval(&preds, &env).unwrap();
+                if pv.iter().any(BitVec::is_zero) {
+                    continue;
+                }
+                let v = cx.eval(&[root, r.expr], &env).unwrap();
+                assert_eq!(
+                    v[0],
+                    v[1],
+                    "{} -> {} under {:?} at {vals:?}",
+                    cx.display(root),
+                    cx.display(r.expr),
+                    preds
+                        .iter()
+                        .map(|&p| cx.display(p).to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    assert!(changed > 300 && by_pass > 100, "{changed} {by_pass}");
 }
 
 #[test]

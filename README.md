@@ -62,7 +62,8 @@ fn main() -> Result<(), bitwright::Error> {
   choose.
 - **Invertibility**: proofs that an expression is an injective or bijective function of a
   subexpression (keyed mixers, xorshifts, T-functions), used to cancel and solve equalities, so
-  a hash comparison becomes a plain one.
+  a hash comparison becomes a plain one; and strictly monotone maps (casts, complements, sums,
+  products and shifts the facts show do not wrap) do the same for orderings.
 - **Traces of every run**: each rewrite with the phase and round that made it, the rule as
   written or the pass's reasoning, the candidates dropped and the guards that failed, written as
   JSON Lines (`bitwright simplify --trace`), and [a viewer](workbench/README.md) for them.

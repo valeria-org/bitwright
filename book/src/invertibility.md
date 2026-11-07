@@ -9,8 +9,12 @@ at equalities:
 - **move a constant across**: `f(x) == c` is `x == f⁻¹(c)`, or `false` when `c` has no
   preimage. A hash comparison becomes a plain equality.
 
-Orderings are never touched: a bijection does not preserve them, so `f(x) <u c` says nothing
-about `x`.
+Both sides may be `select` trees over such values (a minimum or maximum written out): their
+leaves are cancelled together, a constant leaf by its preimage, so
+`select(c, x * 3, 7) == y * 3` is `select(c, x, 0xad) == y` at 8 bits.
+
+A bijection does not preserve order, so none of this applies to `<u` or `<s`: an ordering sees
+through a *strictly monotone* map instead (below).
 
 ```rust
 use bitwright::engine::Engine;
@@ -40,7 +44,7 @@ assert_eq!(simplify(two)?, "0:1");
 // Feeding the input back in destroys injectivity: F_K(x) ^ x is not cancelled.
 let mix = |v: &str| format!("({} ^ {v})", fk(v, K));
 assert_ne!(simplify(format!("{} == {}", mix("x"), mix("y")))?, "x == y");
-// Nothing about orderings.
+// A bijection says nothing about orderings: the mixer scrambles them.
 assert!(simplify(format!("{} <u 0x1000", fk("x", K)))?.contains("<u"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -72,6 +76,71 @@ needs them to be constants, so the preimage is one.
 A node combining two values that *both* depend on the inner one is not a layer in general,
 even when each is a bijection: `f(x) ^ x`, `f_a(x) ^ f_b(x)` and `f_a(x) | f_b(x)` all
 collide. The exception is a map that gives the inner value back bit by bit.
+
+## Orderings
+
+What `f(x) <u f(y)` sees through is a map that is *strictly monotone* from an order of `x`
+(unsigned or signed) to an order of `f(x)`: then `f(x) <u f(y)` is `x < y` in the order `f` is
+monotone from, with the sides swapped when `f` is decreasing, and `f(x) <u c` is a comparison
+of `x` with the value where it starts to hold, or a constant. A layer is strictly monotone
+when:
+
+| Layer | From → to | Direction | When |
+|-|-|-|-|
+| `zext(v)` | unsigned → unsigned or signed | increasing | always |
+| `sext(v)` | signed → signed, unsigned → unsigned | increasing | always |
+| `concat(v, k)` | unsigned → unsigned, signed → signed | increasing | always |
+| `concat(k, v)` | unsigned → unsigned or signed | increasing | always |
+| `v + k`, `v - k`, `v ^ smin` | any | increasing | the facts keep `v` where the sum does not wrap (or always wraps) |
+| `k - v`, `~v`, `-v` | any | decreasing | likewise |
+| `v * k` | within one order | by the sign of `k` | the facts rule out overflow, `k` nonzero |
+| `v << s` | within one order | increasing | the facts rule out a bit shifted out |
+
+The facts about `v` hold wherever the result is used, so a sum need only be monotone on the
+range they give: `x + 7 <u y + 7` is `x <u y` wherever both sums are known not to wrap (both on
+the wrapping side is fine too), and `x ^ 0x80` turns a signed comparison into an unsigned one.
+Against a constant, the threshold is found by bisection over the range of `x`. A `select`
+passes the order it is read in to its arms, so the leaves of `select` trees on both sides are
+peeled together, like the leaves of an equality: `select(c, zext(x), zext(y)) <u zext(z)` is
+`select(c, x, y) <u z`, and a minimum written out, `select(zext(x) <u zext(y), zext(x), zext(y))`,
+loses its casts in the condition as well, in that comparison's own step.
+
+```rust
+use bitwright::engine::{Engine, Run};
+use bitwright::{Assumptions, Context, ParseOptions, Width};
+
+let engine = Engine::standard();
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W8);
+let mut simplify = |cx: &mut Context, src: &str, under: &[&str]| -> Result<String, bitwright::Error> {
+    let e = cx.parse(src, &o)?;
+    let mut a = Assumptions::new();
+    for u in under {
+        let u = cx.parse(u, &o)?;
+        a.assume_true(cx, u)?;
+    }
+    let out = engine.run(cx, &[e], Run::default().with_assumptions(&a))?;
+    Ok(cx.display(out.roots[0].expr).to_string())
+};
+// Casts, in the order they are monotone from; a complement swaps the sides.
+assert_eq!(simplify(&mut cx, "zext<32>(x) <s zext<32>(y)", &[])?, "x <u y");
+assert_eq!(simplify(&mut cx, "sext<32>(x) <s sext<32>(y)", &[])?, "x <s y");
+assert_eq!(simplify(&mut cx, "~x <u ~y", &[])?, "y <u x");
+// Against a constant: a threshold, or decided.
+assert_eq!(simplify(&mut cx, "sext<16>(x) <s 5", &[])?, "x <s 5");
+assert_eq!(simplify(&mut cx, "zext<16>(x) <u 300", &[])?, "1:1");
+// A sum, only where the facts show it does not wrap.
+assert!(simplify(&mut cx, "x + 7 <u y + 7", &[])?.contains("+"));
+assert_eq!(simplify(&mut cx, "x + 7 <u y + 7", &["x <u 100", "y <u 100"])?, "x <u y");
+assert_eq!(simplify(&mut cx, "x + 7 <u 50", &["x <u 100"])?, "x <u 43");
+// Select trees: every leaf loses the layer, a constant leaf becomes its preimage.
+assert_eq!(
+    simplify(&mut cx, "select(zext<16>(x) <u zext<16>(y), zext<16>(x), zext<16>(y)) <u zext<16>(z)", &[])?,
+    "select(x <u y, x, y) <u z"
+);
+assert_eq!(simplify(&mut cx, "select(c, ~x, 5) <u ~z", &[])?, "z <u select(c, x, -6)");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ## Maps recovered bit by bit
 
