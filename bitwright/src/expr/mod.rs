@@ -332,6 +332,40 @@ impl Default for Context {
 }
 
 impl Context {
+    // fork a pre-lowered context for independent proofs.
+    /// An independent copy that accepts every expression already built in
+    /// this context.
+    ///
+    /// The immutable evaluation schedule is a cache and is rebuilt on
+    /// demand. Expressions built after the fork belong only to the context
+    /// that built them and must not cross between the two.
+    pub fn fork(&self) -> Self {
+        Context {
+            nodes: self.nodes.clone(),
+            meta: self.meta.clone(),
+            interner: self.interner.clone(),
+            wide_consts: self.wide_consts.clone(),
+            symbols: self.symbols.clone(),
+            config: self.config.clone(),
+            generation: self.generation,
+            declaration_revision: self.declaration_revision,
+            tag: self.tag,
+            retired: self.retired,
+            counters: self.counters,
+            engine_mode: self.engine_mode,
+            engine_allowance: self.engine_allowance,
+            engine_refused: self.engine_refused,
+            marks: self.marks.clone(),
+            dag_cache: self.dag_cache.clone(),
+            eval_plan: None,
+            facts: self.facts.clone(),
+            memo: self.memo.clone(),
+            #[cfg(feature = "eqsat")]
+            eqsat_memo: self.eqsat_memo.clone(),
+            registry: self.registry.clone(),
+        }
+    }
+
     /// An empty context with the default configuration. Allocates nothing until the first node.
     pub fn new() -> Self {
         Self::with_config(ContextConfig::default())

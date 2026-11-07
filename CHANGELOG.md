@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Opt-in opaque and conditional MBA recovery.** `MbaConfig::with_opaque_sweep`,
+  `with_noise_forms` and `with_known_atoms` enable exact rewrites for constants hidden through
+  demanded bits, casts, rotations, condition-dependent pieces and complementary shared products.
+  The default strategy does not run the additional sweep. Every committed answer remains
+  certificate-checked; ordinary MBA certificates retain the caller's existing run budget.
+- **Reusable independent contexts.** `Context::fork` keeps existing expressions and analysis
+  caches while isolating nodes and proof history added afterward.
+- **MBA question keys are cached.** `MbaExpr::key` computes its content hash once and invalidates
+  it when a node is added.
+
 ## 0.23.0
 
 - **A deadline means stop now.** Since 0.19 a run its budget stops keeps the work of the

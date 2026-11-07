@@ -27,6 +27,8 @@
 
 mod batch;
 pub(crate) mod certify;
+// casts taken out of a question (see `decast`).
+mod decast;
 mod expr;
 mod lower;
 mod nf;
@@ -40,7 +42,7 @@ pub use threaded::ThreadedSolver;
 
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
-pub(crate) use lower::{fits, lift_id, lower_id};
+pub(crate) use lower::{Reading, fits, lift_id, lower_id, lower_id_reading, shared_nodes};
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
     MemoryCache, NoCache, SignatureSolver, Verdict,
@@ -82,16 +84,33 @@ pub struct MbaConfig {
     pub trust: MbaTrust,
     /// Passed to the solver.
     pub budget: MbaBudget,
+    /// Run the exact opaque-constant sweep before ordinary MBA phases. Off unless asked.
+    pub opaque_sweep: bool,
+    /// read noise forms used by obfuscated expressions. A rotate's
+    /// slices (`x >>u k`, `x << k`) are asked as masks of one rotation where a fragment reads
+    /// several (see `engine::pass::mba`); a root is read with what its conditions fix put into
+    /// the operands they guard, and a piece that depends on one or two conditions alone is
+    /// written as the table of its values (see `engine::pass::context`). Off unless asked.
+    pub noise_forms: bool,
+    /// the opaque-constant sweep asks a narrower reading its free atoms refute again
+    /// with their known bits written out (`(v & unknown) | ones`), proves a root constant one
+    /// case of the condition it tests at a time, and reconstructs a varying noise block as a
+    /// select when each side is proved constant (see `engine::pass::mba`). Off unless asked.
+    pub known_atoms: bool,
 }
 
 setters!(MbaConfig {
     with_limits: limits: MbaLimits,
     with_trust: trust: MbaTrust,
     with_budget: budget: MbaBudget,
+    with_opaque_sweep: opaque_sweep: bool,
+    with_noise_forms: noise_forms: bool,
+    with_known_atoms: known_atoms: bool,
 });
 
 /// The version of the lowering (part of every cache key).
 pub(crate) const LOWERING_VERSION: u64 = 1;
 
 #[cfg(test)]
+#[rustfmt::skip] // Published source omits this test module; dependency formatting must not traverse it.
 mod tests;

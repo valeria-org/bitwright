@@ -191,6 +191,76 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
     })
 }
 
+/// one pair of equally placed slices in an XOR form merged:
+/// `extract(a) ^ extract(b)` is `extract(a ^ b)`. The candidate has one
+/// fewer live node, and is committed by the usual sharing-aware rule.
+/// Obfuscated code may write one complement with `trunc(a ^ b)` and the
+/// other with `trunc(a) ^ trunc(b)`.
+fn merge_extract_pair(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    let mut pair = None;
+    for i in 0..form.terms.len() {
+        if !form.terms[i].1.is_ones() {
+            continue;
+        }
+        let a = cx.node(form.terms[i].0);
+        if a.op != OpCode::Extract {
+            continue;
+        }
+        for j in i + 1..form.terms.len() {
+            if !form.terms[j].1.is_ones() {
+                continue;
+            }
+            let b = cx.node(form.terms[j].0);
+            if b.op == OpCode::Extract
+                && a.b == b.b
+                && a.width == b.width
+                && cx.wid(a.a) == cx.wid(b.a)
+            {
+                pair = Some((i, j, a, b));
+                break;
+            }
+        }
+        if pair.is_some() {
+            break;
+        }
+    }
+    let Some((i, j, a, b)) = pair else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let merged = r.build(cx, |cx| {
+        let inner = cx.c_bin(BinOp::Xor, a.a, b.a)?;
+        cx.c_extract(inner, a.b as u16, a.width)
+    })?;
+    let mut next = form.clone();
+    next.terms.remove(j);
+    next.terms.remove(i);
+    next = next.xor(&Form::atom(merged, cx.width_of(n)));
+    let e = emit(r, cx, &next)?;
+    let mut stops: Vec<u32> = form
+        .terms
+        .iter()
+        .enumerate()
+        .filter_map(|(k, (atom, _))| (k != i && k != j).then_some(*atom))
+        .collect();
+    stops.extend([a.a, b.a]);
+    Ok(Some(finish(
+        r,
+        cx,
+        PassKind::Xor,
+        n,
+        e,
+        before,
+        &stops,
+        form.fin,
+    )?))
+}
+
 /// Whether `form` is emitted as `(⊕ (aᵢ & (mᵢ | k))) | k`: its constant `k` misses every mask
 /// (the terms are 0 where `k` is 1, so or and xor agree), and some mask covers everything `k`
 /// does not, so that term needs no mask (`x | c`, read as `(x & ~c) ⊕ c`, comes back as itself).
@@ -262,6 +332,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         return Ok(Step::Normal(Fin::FINAL));
     }
     let form = form_of(r, cx, n)?;
+    if let Some(step @ Step::To(..)) = merge_extract_pair(r, cx, n, &form)? {
+        return Ok(step);
+    }
     if form.is_atom_of(n) {
         return Ok(Step::Normal(form.fin));
     }
