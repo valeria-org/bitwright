@@ -141,7 +141,15 @@
   traces diff across engine versions, strategies and budgets. `bitwright simplify --trace <out>`
   writes one (with `--file`, one per line, one after the other), and the WebAssembly module's
   `trace` returns one.
-- **The Workbench** (`workbench/`): a viewer of traces in the browser, with no build step. Each
+- **The Workbench** (`workbench/`): a playground for the engine in the browser, with no build
+  step. An expression is simplified as you type (through the WebAssembly module); the rewrites
+  appear as a story opened step by step, each with the whole expression before and after and
+  the rule as written and proved or the pass's reasoning. The width, the engine, the assumptions
+  and any single phase can be changed and the run looked at again; the symbols can be given
+  values and every step evaluated at them; a gallery of examples and a browser of the built-in
+  rules are a click away. The WebAssembly module gains `trace` (with a `phases` option for a
+  strategy of chosen phases), `evaluate` and `rules` for it.
+- **The inspector** (`workbench/inspect.html`): a viewer of trace files, with no build step. Each
   step of a run with the whole expression before and after it, the rule (as written, with its
   proof) or the pass's reasoning, and the phases × rounds it ran in; the run phase by phase; why
   a rule did not fire at a node (its failed guard with the operands' known bits, its candidate

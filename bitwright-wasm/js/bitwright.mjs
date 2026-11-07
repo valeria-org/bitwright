@@ -27,6 +27,8 @@ const OPS = {
   checkTemplate: 13,
   names: 14,
   trace: 15,
+  evaluate: 16,
+  rules: 17,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -247,9 +249,12 @@ export async function instantiate(bytes) {
     },
     // Simplifies like `simplify` and returns the run as a trace (JSON Lines, as `bitwright
     // simplify --trace` writes it, with the passes' reasoning and the facts of the nodes it
-    // names). Options: `deobfuscate` (default true) and `assume`, a list of 1-bit predicates.
+    // names). Options: `deobfuscate` (default true), `assume`, a list of 1-bit predicates, and
+    // `phases`, a list of phase names to run instead of a built-in strategy (`fact_fold`,
+    // `local`, `linear`, `xor`, `casts`, `division`, `invert`, `compares`, `bitwise`, `carries`,
+    // `linear_mba`, `shuffle`, `demanded`, `mba`).
     trace: (text, width = 64, opts = {}) => {
-      const { deobfuscate = true, assume = [], ...rest } = opts;
+      const { deobfuscate = true, assume = [], phases = null, ...rest } = opts;
       const unknown = Object.keys(rest);
       if (unknown.length > 0) {
         throw new Error(`unknown option ${unknown[0]}`);
@@ -261,8 +266,20 @@ export async function instantiate(bytes) {
       for (const p of assume) {
         lines.push(`assume ${String(p).replace(/\n/g, " ")}`);
       }
+      if (phases) {
+        lines.push(`phases ${phases.map((p) => word(p, "phase")).join(",")}`);
+      }
       return call(OPS.trace, text, lines.join("\n"), width);
     },
+    // The value of an expression at a point: `env` maps symbol names to values (BigInt, number
+    // or a decimal/hex string). Symbols the expression does not have are ignored; one it has
+    // and the point does not name is an error. The value is a hex string.
+    evaluate: (text, width = 64, env = {}) => {
+      const lines = Object.entries(env).map(([k, v]) => `${word(k, "symbol")} = ${typeof v === "bigint" || typeof v === "number" ? v.toString() : String(v).trim()}`);
+      return call(OPS.evaluate, text, lines.join("\n"), width);
+    },
+    // The built-in rules: `[{ name, kind, doc, examples: [[input, output]], source, ledger }]`.
+    rules: () => call(OPS.rules, "", "", 0).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     // Tests a host rewrite offline on expression texts: `{ passed, applications, points,
     // exhaustive, failure }`, `failure` null or `{ kind, message, node, result, second,
     // assignment }` (assignment: symbol name to BigInt). Options: `widths`, `variants`,

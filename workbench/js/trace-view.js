@@ -115,9 +115,17 @@ function renderCenter(app, el, s, prov) {
       h("span", {}, `· ${sb} → ${sa} nodes`),
     ),
   );
+  inner.append(stepBody(app, run, s, prov));
+}
+
+/// The body of a step: the whole expression before and after it, the one card that explains
+/// it, and, folded away, the tree it matched in and the sizes. Shared with the playground.
+export function stepBody(app, run, s, prov) {
+  const out = h("div", { class: "step-body" });
+  const sb = run.sizes.size(s.whole.before);
   const k = kindClass(s.kind);
   const hl = s.whole.paths;
-  inner.append(
+  out.append(
     h(
       "div",
       { class: `xp ${k}` },
@@ -125,10 +133,10 @@ function renderCenter(app, el, s, prov) {
       h("div", { class: "xp-row" }, h("span", { class: "label" }, "after"), h("div", { class: "code", html: print(run, s.whole.after, { html: true, spans: true, highlight: hl }) })),
     ),
   );
-  if (!s.whole.exact) inner.append(h("p", { class: "xp-note warn" }, `This step could not be placed in the whole expression (the constructors reordered it). The subterm itself: ${cut(print(run, s.before), 160)} ⇒ ${cut(print(run, s.after), 160)}`));
-  else if (hl.length > 1) inner.append(h("p", { class: "xp-note" }, `The subterm occurs ${hl.length} times; every occurrence is rewritten.`));
+  if (!s.whole.exact) out.append(h("p", { class: "xp-note warn" }, `This step could not be placed in the whole expression (the constructors reordered it). The subterm itself: ${cut(print(run, s.before), 160)} ⇒ ${cut(print(run, s.after), 160)}`));
+  else if (hl.length > 1) out.append(h("p", { class: "xp-note" }, `The subterm occurs ${hl.length} times; every occurrence is rewritten.`));
   if (s.whole.phaseAfter !== undefined && run.sizes.key(s.whole.phaseAfter) !== run.sizes.key(s.whole.after)) {
-    inner.append(h("p", { class: "xp-note" }, `After this phase's last rewrite the engine's root reads ${cut(print(run, s.whole.phaseAfter), 160)}.`));
+    out.append(h("p", { class: "xp-note" }, `After this phase's last rewrite the engine's root reads ${cut(print(run, s.whole.phaseAfter), 160)}.`));
   }
 
   // The one card that explains the step.
@@ -161,7 +169,7 @@ function renderCenter(app, el, s, prov) {
     why.append(h("div", { class: "sep" }), kv(links.map(([a, b]) => [a, b])));
     for (const dd of why.querySelectorAll("dd")) if (dd.querySelector(".sans")) dd.classList.add("sans");
   }
-  inner.append(why);
+  out.append(why);
 
   // Folded away: the tree and the sizes.
   const treeBody = h("div", { class: "body" });
@@ -175,7 +183,8 @@ function renderCenter(app, el, s, prov) {
   };
   const treeDisc = h("details", { class: "disc", ontoggle: (e) => { if (e.target.open) drawTree(); } }, h("summary", {}, "Tree the step matched in ", h("span", { class: "n" }, `· ${sb} nodes before`)), treeBody);
   const chartDisc = h("details", { class: "disc" }, h("summary", {}, "Size after each step ", h("span", { class: "n" }, `· ${run.sizes.size(run.steps[0]?.whole.before ?? run.result?.input ?? 0)} → ${run.sizes.size(run.steps.at(-1)?.whole.after ?? 0)} nodes`)), h("div", { class: "body two-up" }, h("div", { class: "chart" }, sizeChart(app, s)), h("p", { class: "muted", style: { fontSize: "12px", margin: "0" } }, "Distinct DAG nodes after each step; shared subterms count once. A rule has to decrease the termination order, not the size, so a step may keep it.")));
-  inner.append(h("div", { class: "more" }, treeDisc, chartDisc));
+  out.append(h("div", { class: "more" }, treeDisc, chartDisc));
+  return out;
 }
 
 /// An indented tree of `t`, the subterms at `paths` marked with what replaced them. With

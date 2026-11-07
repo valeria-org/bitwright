@@ -35,6 +35,25 @@ assert.equal(trace.at(-1).stats.rewrites, 2);
 const assumed = bw.trace("x & 15", 8, { assume: ["x <u 16"], deobfuscate: false }).trim().split("\n").map((l) => JSON.parse(l));
 assert.ok(assumed.some((l) => l.assume === 0));
 assert.throws(() => bw.trace("x", 8, { bogus: 1 }), /unknown option/);
+// A strategy of chosen phases: the linear and xor passes alone cancel the masking; the rules
+// alone do not touch it.
+const only = bw.trace("((x ^ 0x5a) + 3 - 3) ^ 0x5a", 32, { phases: ["linear", "xor"] }).trim().split("\n").map((l) => JSON.parse(l));
+assert.equal(only[0].phases.length, 2);
+assert.equal(only.at(-1).stats.rewrites, 2);
+const rulesOnly = bw.trace("((x ^ 0x5a) + 3 - 3) ^ 0x5a", 32, { phases: ["local"] }).trim().split("\n").map((l) => JSON.parse(l));
+assert.equal(rulesOnly.at(-1).stats.rewrites, 0);
+assert.throws(() => bw.trace("x", 8, { phases: ["nope"] }), /unknown phase/);
+// Evaluation at a point.
+assert.equal(bw.evaluate("x + y", 8, { x: 200, y: "0x40" }), "0x8");
+assert.equal(bw.evaluate("x - 1", 8, { x: 0, z: 9 }), "0xff");
+assert.throws(() => bw.evaluate("x + y", 8, { x: 1 }), /./);
+// The rule catalog.
+const rules = bw.rules();
+assert.ok(rules.length > 300);
+const r = rules.find((r) => r.name === "core.arith::add_xor_and");
+assert.equal(r.kind, "identity");
+assert.ok(r.source.startsWith("identity add_xor_and"));
+assert.ok(r.ledger.startsWith("identity exhaustive"));
 assert.throws(() => bw.lift("arm", "x"), /unknown front end/);
 
 // In a compiler: the compile engine, declared known bits, counters.

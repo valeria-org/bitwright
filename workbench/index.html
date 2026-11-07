@@ -9,51 +9,46 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="app.css">
 <script>
-// The theme before the first paint, so it does not flash.
 try { const t = localStorage.getItem("wb-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}
 </script>
 </head>
-<body>
-<header class="top">
-  <div class="row1">
-    <div class="brand" title="bitwright Workbench">bitwright <span>Workbench</span></div>
-    <form class="live" id="live" autocomplete="off">
-      <label class="sr" for="liveExpr">Expression</label>
-      <input id="liveExpr" class="expr-input" spellcheck="false" placeholder="An expression to simplify, e.g. (x ^ y) + 2 * (x &amp; y)">
-      <label class="sr" for="liveWidth">Width</label>
-      <select id="liveWidth" title="Width of the symbols">
-        <option>8</option><option>16</option><option selected>32</option><option>64</option>
-      </select>
-      <label class="sr" for="liveEngine">Engine</label>
-      <select id="liveEngine" title="Strategy">
-        <option value="deobfuscate">deobfuscate + MBA</option>
-        <option value="standard">standard</option>
-      </select>
-      <label class="sr" for="liveAssume">Assumptions</label>
-      <input id="liveAssume" class="assume-input" spellcheck="false" placeholder="assume x <u 16; y == 3" title="1-bit predicates assumed true, separated by ;">
-      <button id="liveRun" type="submit" class="primary">Run</button>
-    </form>
-    <div class="files">
-      <label class="button quiet" for="fileInput" title="Open a trace file (.bwt)">Open</label>
-      <input id="fileInput" type="file" accept=".bwt,.jsonl,.json,.txt" hidden>
-      <button id="saveBtn" type="button" class="quiet" title="Save the open trace as a file">Save</button>
-      <button id="themeBtn" type="button" class="quiet icon" title="Theme: system" aria-label="Theme">◐</button>
-    </div>
-  </div>
-  <div class="row2" id="runbar"></div>
+<body class="pg">
+<header class="pg-top">
+  <div class="brand">bitwright <span>Workbench</span></div>
+  <nav class="pg-nav">
+    <a href="#examples" id="navExamples">Examples</a>
+    <a href="#rules" id="navRules">Rules</a>
+    <a href="inspect.html" id="inspectLink" title="Every view of this run: phases, attempts, facts, corpus, compare">Inspect ↗</a>
+    <button id="themeBtn" type="button" class="quiet icon" title="Theme: system" aria-label="Theme">◐</button>
+  </nav>
 </header>
-<nav class="tabs" id="tabs" aria-label="Views">
-  <a href="#trace" data-tab="trace">Trace</a>
-  <a href="#stages" data-tab="stages">Stages</a>
-  <a href="#whynot" data-tab="whynot">Why not</a>
-  <a href="#facts" data-tab="facts">Facts</a>
-  <a href="#corpus" data-tab="corpus">Corpus</a>
-  <a href="#compare" data-tab="compare">Compare</a>
-</nav>
-<main id="main" tabindex="-1"></main>
-<footer class="status"><span id="hint" class="hint"></span><span id="status"></span></footer>
-<div class="drop" id="drop" hidden>Drop a trace file (.bwt) to open it</div>
+<main class="pg-main" id="main">
+  <section class="editor" id="editor">
+    <label class="sr" for="expr">Expression</label>
+    <textarea id="expr" class="expr" rows="2" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Type an expression: (x ^ y) + 2 * (x &amp; y)"></textarea>
+    <div class="controls">
+      <div class="seg" role="radiogroup" aria-label="Width" id="widths"></div>
+      <div class="seg" role="radiogroup" aria-label="Engine" id="engines"></div>
+      <div class="assume" id="assume">
+        <span class="label">assume</span>
+        <span id="assumePills"></span>
+        <input id="assumeInput" spellcheck="false" placeholder="x <u 16" title="A 1-bit predicate assumed true; Enter adds it">
+      </div>
+    </div>
+    <details class="phases" id="phasesBox">
+      <summary>Phases <span class="n" id="phasesNote"></span></summary>
+      <div class="toggles" id="phases"></div>
+    </details>
+    <div class="err" id="err" hidden></div>
+  </section>
+  <section class="result" id="result" hidden></section>
+  <section class="point" id="point" hidden></section>
+  <section class="story" id="story"></section>
+  <section class="gallery" id="examples"></section>
+  <section class="rules" id="rules"></section>
+</main>
+<footer class="status"><span id="hint" class="hint">Type an expression; it runs as you type. Click a step to see why; click any subterm for its node.</span><span id="status"></span></footer>
 <div class="popover" id="popover" hidden role="dialog" aria-label="Node"></div>
-<script type="module" src="js/main.js"></script>
+<script type="module" src="js/playground.js"></script>
 </body>
 </html>

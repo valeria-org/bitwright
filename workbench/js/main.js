@@ -428,7 +428,29 @@ async function start() {
   });
   $("liveRun").disabled = true;
   const wanted = readHash();
-  const param = new URLSearchParams(location.search).get("trace");
+  const search = new URLSearchParams(location.search);
+  // Opened from the playground: its run is in the session.
+  if (search.get("from") === "playground") {
+    let text = null;
+    try {
+      text = sessionStorage.getItem("wb-trace");
+    } catch {
+      text = null;
+    }
+    if (text) {
+      try {
+        app.loadText(text, "playground run");
+        takePlace(wanted);
+        writeHash();
+        app.render();
+      } catch (e) {
+        say(e.message, true);
+      }
+      await wasm;
+      return;
+    }
+  }
+  const param = search.get("trace");
   const url = param ?? "samples/corpus.bwt";
   try {
     const res = await fetch(url);

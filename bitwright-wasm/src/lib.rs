@@ -12,7 +12,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, OnceLock};
 
-use bw::engine::{Engine, Run, Strategy, Trace};
+use bw::engine::{Engine, Phase, Run, Strategy, Trace};
 use bw::mba::{MbaConfig, MbaTrust, NormalFormSolver};
 use bw::{Context, ParseOptions, Width};
 
@@ -55,6 +55,8 @@ const INSTANTIATE: u32 = 12;
 const CHECK_TEMPLATE: u32 = 13;
 const NAMES: u32 = 14;
 const TRACE: u32 = 15;
+const EVALUATE: u32 = 16;
+const RULES: u32 = 17;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -203,15 +205,19 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
         CHECK_TEMPLATE => compiler::check_template(a, b),
         NAMES => Ok(compiler::names()),
         TRACE => {
-            // Options, a line each: `standard` (the standard engine), `assume <predicate>`.
+            // Options, a line each: `standard` (the standard engine), `assume <predicate>`,
+            // `phases <name>,<name>,…` (a strategy of just those phases, in that order).
             let mut cx = Context::new();
             let o = ParseOptions::width(width(n)?);
             let e = cx.parse(a, &o).map_err(|e| e.to_string())?;
             let mut standard = false;
+            let mut phases: Option<Vec<String>> = None;
             let mut assumptions = bw::Assumptions::new();
             for line in b.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 if line == "standard" {
                     standard = true;
+                } else if let Some(list) = line.strip_prefix("phases ") {
+                    phases = Some(list.split(',').map(|p| p.trim().to_string()).collect());
                 } else if let Some(p) = line.strip_prefix("assume ") {
                     let p = cx.parse(p, &o).map_err(|e| format!("assume {p}: {e}"))?;
                     assumptions
@@ -221,10 +227,13 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
                     return Err(format!("unknown option `{line}`"));
                 }
             }
-            let standard_engine;
-            let engine = if standard {
-                standard_engine = Engine::standard();
-                &standard_engine
+            let own_engine;
+            let engine = if let Some(names) = phases {
+                own_engine = custom_engine(&names)?;
+                &own_engine
+            } else if standard {
+                own_engine = Engine::standard();
+                &own_engine
             } else {
                 deobfuscator()
             };
@@ -242,8 +251,135 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
                 .map_err(|e| e.to_string())?;
             t.to_jsonl(&mut cx, &[e], &out).map_err(|e| e.to_string())
         }
+        EVALUATE => {
+            // `b`: a line per symbol, `name = value` (decimal, or hex with `0x`).
+            let mut cx = Context::new();
+            let w = width(n)?;
+            let e = cx
+                .parse(a, &ParseOptions::width(w))
+                .map_err(|e| e.to_string())?;
+            let mut env: std::collections::HashMap<bw::SymbolKey, bw::BitVec> = Default::default();
+            for line in b.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let (name, value) = line
+                    .split_once('=')
+                    .ok_or_else(|| format!("`{line}`: expected `name = value`"))?;
+                let name = name.trim();
+                let sym = cx
+                    .symbols_in(&[e])
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|&s| cx.symbol_key(s).is_some_and(|k| k.to_string() == name));
+                let Some(sym) = sym else {
+                    continue; // a symbol the expression does not have
+                };
+                let sw = cx.symbol_width(sym).unwrap_or(w);
+                let v = parse_value(value.trim(), sw)?;
+                if let Some(k) = cx.symbol_key(sym) {
+                    env.insert(k.clone(), v);
+                }
+            }
+            let v = cx.eval(&[e], &env).map_err(|e| e.to_string())?;
+            Ok(format!("{:#x}", v[0]))
+        }
+        RULES => Ok(rule_catalog()),
         _ => Err(format!("unknown operation {op}")),
     }
+}
+
+/// A value for a symbol of `w` bits: decimal, or hex with `0x`; negative with a leading `-`.
+fn parse_value(text: &str, w: bw::Width) -> Result<bw::BitVec, String> {
+    let (neg, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let magnitude =
+        bw::BitVec::parse(&format!("{body}:{}", w.bits())).map_err(|e| format!("`{text}`: {e}"))?;
+    Ok(if neg {
+        bw::BitVec::apply_un(bw::UnOp::Neg, &magnitude).map_err(|e| e.to_string())?
+    } else {
+        magnitude
+    })
+}
+
+/// An engine of the named phases (`fact_fold`, `local`, `linear`, …, `mba`), in that order.
+fn custom_engine(names: &[String]) -> Result<Engine, String> {
+    let groups = Strategy::standard()
+        .phases
+        .iter()
+        .find_map(|p| match p {
+            Phase::Local { groups } => Some(groups.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut phases = Vec::new();
+    for name in names {
+        phases.push(match name.as_str() {
+            "fact_fold" => Phase::FactFold,
+            "local" => Phase::Local {
+                groups: groups.clone(),
+            },
+            "linear" => Phase::Linear,
+            "bitwise" => Phase::Bitwise,
+            "xor" => Phase::Xor,
+            "compares" => Phase::Compares,
+            "casts" => Phase::Casts,
+            "demanded" => Phase::Demanded,
+            "linear_mba" => Phase::LinearMba,
+            "shuffle" => Phase::Shuffle,
+            "invert" => Phase::Invert,
+            "division" => Phase::Division,
+            "carries" => Phase::Carries,
+            "mba" => Phase::Mba(
+                MbaConfig::default()
+                    .with_trust(MbaTrust::default().with_backend_certificates(false)),
+            ),
+            other => return Err(format!("unknown phase `{other}`")),
+        });
+    }
+    if phases.is_empty() {
+        return Err("no phases".to_string());
+    }
+    Engine::builder()
+        .builtin()
+        .mba_solver(Arc::new(NormalFormSolver::default()))
+        .strategy(Strategy::new("custom", phases))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// The built-in rules, a JSON object per line: name, kind, doc, examples, source, ledger.
+fn rule_catalog() -> String {
+    let mut out = String::new();
+    for (_, src, ledger_text) in bw::rules::builtin_sources() {
+        let Ok(program) = bw::rules::RuleProgram::compile(src) else {
+            continue;
+        };
+        let ledger: std::collections::HashMap<&str, &str> = ledger_text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .filter_map(|l| {
+                let mut p = l.splitn(3, ' ');
+                Some((p.next()?, p.nth(1)?))
+            })
+            .collect();
+        for r in program.rules() {
+            let j = |s: &str| format!("{:?}", s);
+            out.push_str(&format!(
+                "{{\"name\":{},\"kind\":{},\"doc\":{},\"examples\":[{}],\"source\":{},\"ledger\":{}}}\n",
+                j(&r.name),
+                j(if r.kind == bw::rules::RuleKind::Identity { "identity" } else { "rule" }),
+                j(&r.doc),
+                r.examples
+                    .iter()
+                    .map(|(a, b)| format!("[{},{}]", j(a), j(b)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                j(src.get(r.span.0..r.span.1).unwrap_or("")),
+                j(ledger.get(r.name.as_str()).copied().unwrap_or("")),
+            ));
+        }
+    }
+    out
 }
 
 /// # Safety
