@@ -103,10 +103,10 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
 }
 
 /// Whether the fragment rooted at `root` is one [`lower_id`] takes (rooted at a fragment
-/// operator, within `lim`): its number of nodes, atoms included.
-pub(crate) fn fits(cx: &Context, root: u32, lim: &MbaLimits) -> Result<u32, Refusal> {
-    let (atoms, order) = scan(cx, root, lim)?;
-    Ok((atoms.len() + order.len()) as u32)
+/// operator, within `lim`): its interior nodes, operands first, when it is.
+pub(crate) fn fits_nodes(cx: &Context, root: u32, lim: &MbaLimits) -> Result<Vec<u32>, Refusal> {
+    let (_, order) = scan(cx, root, lim)?;
+    Ok(order)
 }
 
 /// the narrower fragments [`lower_id_reading`] lowers.

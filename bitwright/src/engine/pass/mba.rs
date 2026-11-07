@@ -91,10 +91,19 @@ pub(super) fn asks(
     }
     let poly = r.inner.mba.solver.polynomial_fragments();
     let op = cx.node(n).op;
-    let a = if mixed_op(op) || (poly && op == OpCode::Shl) {
-        match crate::mba::fits(cx, n, &cfg.limits) {
-            Ok(nodes) => {
-                r.meter.charge(Counter::PassWork, u64::from(nodes))?;
+    let qualifies = |op: OpCode| mixed_op(op) || (poly && op == OpCode::Shl);
+    let a = if qualifies(op) {
+        match crate::mba::fits_nodes(cx, n, &cfg.limits) {
+            Ok(order) => {
+                r.meter.charge(Counter::PassWork, order.len() as u64)?;
+                // A fragment within the limits: so is the fragment of every node inside it
+                // (a part of it), which is not scanned again when the walk reaches it (along
+                // a chain of n sums that was n scans of n links).
+                for &i in &order {
+                    if i != n && qualifies(cx.node(i).op) {
+                        r.asks.entry(i).or_insert(true);
+                    }
+                }
                 true
             }
             Err(_) => false,
@@ -1454,8 +1463,15 @@ fn ask(
     };
     let shape = m.shape();
     // Mixed fragments, and polynomials (a product of two non-constants) for a solver that asks
-    // for them.
-    if !shape.mixed && !(shape.degree >= 2 && poly) {
+    // for them. A fragment whose casts hide the mix (`sext(a) + sext(~a)` is a xor, a
+    // subtraction and a mask once its sign extensions are written out) is judged without them
+    // (see `decast`), as the solver and the certificates read it.
+    let mixed = shape.mixed
+        || crate::mba::decast(&m).is_some_and(|d| {
+            let s = d.shape();
+            s.mixed || (s.degree >= 2 && poly)
+        });
+    if !mixed && !(shape.degree >= 2 && poly) {
         return Ok(Step::Normal(Fin::FINAL));
     }
     if shape.nodes < cfg.limits.min_nodes {
@@ -1481,6 +1497,11 @@ fn ask(
         combine(kh, LOWERING_VERSION),
         combine(kh ^ 0x6361_6368, mk[1]),
     ]);
+    // An answer the gate could not prove earlier in this call (not for lack of budget): the
+    // same question would get the same answer and the same verdict.
+    if r.mba_unproved.contains_key(&key) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
     // The answer, and where it was lifted if it already was.
     let (cand, lifted) = match inner.mba.cache.get(&key) {
         Some(CacheEntry::NoSimpler) => {
@@ -1575,6 +1596,7 @@ fn ask(
                         let fin = if own.over_budget {
                             Fin::capped(Exhausted::PassWork)
                         } else {
+                            r.mba_unproved.insert(key, ());
                             Fin::FINAL
                         };
                         return Ok(Step::Normal(fin));

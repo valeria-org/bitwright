@@ -18,6 +18,13 @@
 //!
 //! Both have the input's signature and are linear MBAs, so they are equal to it. The result
 //! replaces the node when the DAG gets smaller.
+//!
+//! *Extensions.* A fragment reaches through `sext` and `zext` of bitwise functions of narrower
+//! values (a lifter's `sext<64>(a & b)` over 32-bit `a`, `b`): the function is read over the
+//! narrow atoms lifted to the root's width by the same cast, since `sext(f(a, b))` is
+//! `f(sext a, sext b)` for every bitwise `f`, and `zext(f(a, b))` is `f(zext a, zext b)` when
+//! `f` is 0 at 0, else that plus `2^W` (see [`interior`]). The emission is over the lifted
+//! atoms, which it builds; the commit rule's boundary stays at the narrow atoms, so they count.
 
 use super::{
     Counts, Fin, Marks, PassKind, Runner, Step, Stop, bitwise, finish, linear, worth_building,
@@ -37,9 +44,17 @@ const MAX_REGION: usize = 256;
 /// The fragment below `root`: its atoms (in the context's canonical order), its interior nodes
 /// in post-order, and whether it mixes linear and bitwise operators.
 struct Region {
+    /// The atoms the signature and the emission are over, in the canonical order: nodes of
+    /// the root's width, among them the lifted atoms of the narrow atoms under casts.
     atoms: Vec<u32>,
+    /// The interior nodes, operands first: the root's width, and under a cast its operand's.
     order: Vec<u32>,
     mixed: bool,
+    /// The region's boundary for the commit rule: the atoms, with each narrow atom in place of
+    /// its lifted one (which the emission builds, so it counts as new).
+    bounds: Vec<u32>,
+    /// Per narrow atom (under a cast): the lifted atom standing for it.
+    lifts: Vec<(u32, u32)>,
 }
 
 fn is_linear(op: OpCode) -> bool {
@@ -62,6 +77,14 @@ enum Mode {
 }
 
 /// Whether node `i` is interior when read in `mode` (otherwise it is an atom).
+///
+/// A cast is interior too (see the module notes on extensions): its operand is read as a
+/// bitwise function at the narrower width, over narrow atoms the emission lifts. A sign
+/// extension of a bitwise function is the function of the sign extensions (sign replication
+/// commutes with every bitwise operator); a zero extension of one is the function of the zero
+/// extensions when the function is 0 at 0 (above the operand's width every lifted atom is 0),
+/// and that plus `2^W` when it is all ones there (`zext(~a)` is `~zext(a) + 2^W`, i.e.
+/// `lowmask(W) − zext(a)`), which is a term but no operand of a bitwise function.
 fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
     let n = cx.node(i);
     if let Some(v) = cx.const_val(i) {
@@ -69,6 +92,8 @@ fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
         return mode == Mode::Linear || v.is_zero() || v.is_ones();
     }
     match n.op {
+        OpCode::Sext => true,
+        OpCode::Zext => mode == Mode::Linear || !at_zero(cx, n.a),
         // Linear operators are terms, never operands of a bitwise function.
         OpCode::Mul => {
             mode == Mode::Linear && (cx.const_val(n.a).is_some() || cx.const_val(n.b).is_some())
@@ -83,10 +108,32 @@ fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
     }
 }
 
+/// Whether the bitwise function at `i` (over 0/all-ones constants and atoms) is all ones when
+/// every atom is 0: its value above the operand's width once zero-extended.
+fn at_zero(cx: &Context, i: u32) -> bool {
+    fn go(cx: &Context, i: u32, depth: u32) -> bool {
+        let n = cx.node(i);
+        if let Some(v) = cx.const_val(i) {
+            return v.is_ones();
+        }
+        if depth > 64 {
+            return false;
+        }
+        match n.op {
+            OpCode::Not => !go(cx, n.a, depth + 1),
+            OpCode::And => go(cx, n.a, depth + 1) && go(cx, n.b, depth + 1),
+            OpCode::Or => go(cx, n.a, depth + 1) || go(cx, n.b, depth + 1),
+            OpCode::Xor => go(cx, n.a, depth + 1) ^ go(cx, n.b, depth + 1),
+            _ => false,
+        }
+    }
+    go(cx, i, 0)
+}
+
 /// The mode in which node `i`'s operands are read, when `i` is read in `mode`.
 fn operand_mode(cx: &Context, i: u32, mode: Mode) -> Mode {
     match cx.node(i).op {
-        OpCode::And | OpCode::Or | OpCode::Xor => Mode::Bitwise,
+        OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Zext | OpCode::Sext => Mode::Bitwise,
         // `~x` is `−x − 1` among terms and a bitwise function among bitwise operands.
         OpCode::Not => mode,
         _ => Mode::Linear,
@@ -99,6 +146,10 @@ enum Walk {
     Over,
 }
 
+/// A walk's stack entry: the node, its mode, whether its operands are listed, and the cast it
+/// is under (its kind and the cast node).
+type Frame = (u32, Mode, bool, Option<(OpCode, u32)>);
+
 /// The walks' and signatures' buffers, kept by the runner and reused.
 #[derive(Default)]
 pub(crate) struct Scratch {
@@ -108,8 +159,12 @@ pub(crate) struct Scratch {
     seen: Counts,
     /// Nodes that must be atoms.
     forced: Marks,
-    stack: Vec<(u32, Mode, bool)>,
+    stack: Vec<Frame>,
     words: Vec<u64>,
+    /// In a walk, per node under a cast: the kind of cast it was first reached under, and that
+    /// cast. A node reached under casts of two kinds would be two functions of the lifted
+    /// atoms: the second cast is an atom.
+    under: IdMap<u32, (OpCode, u32)>,
 }
 
 /// The `seen` bit of a node in the post-order.
@@ -117,18 +172,35 @@ const LISTED: u32 = 8;
 
 fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
     s.seen.begin(cx.len());
+    s.under.clear();
     let mut reached = 0usize;
     let mut order = Vec::new();
     let mut atoms = Vec::new();
+    // Narrow atoms, each with the kind of cast it is under (lifted after the walk).
+    let mut narrow: Vec<(u32, OpCode)> = Vec::new();
     let (mut lin, mut bit) = (false, false);
     s.stack.clear();
-    s.stack.push((root, Mode::Linear, false));
-    while let Some((i, mode, expanded)) = s.stack.pop() {
+    s.stack.push((root, Mode::Linear, false, None));
+    while let Some((i, mode, expanded, lift)) = s.stack.pop() {
         if expanded {
             order.push(i);
             continue;
         }
-        let inner = !s.forced.contains(i) && interior(cx, i, mode);
+        let op = cx.node(i).op;
+        // Under a cast: bitwise operators over uniform constants, nothing else (a cast there
+        // is an atom too, lifted by the outer one).
+        let inner = !s.forced.contains(i)
+            && interior(cx, i, mode)
+            && (lift.is_none() || is_bitwise(op) || cx.const_val(i).is_some());
+        if let Some((kind, cast)) = lift {
+            match s.under.get(&i) {
+                Some(&(k, _)) if k != kind => return Err(Walk::Conflict(cast)),
+                Some(_) => {}
+                None => {
+                    s.under.insert(i, (kind, cast));
+                }
+            }
+        }
         let read = 2 << mode as u32;
         match s.seen.get(i) {
             Some(state) => {
@@ -150,21 +222,30 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
                     return Err(Walk::Over);
                 }
                 if !inner {
-                    atoms.push(i);
-                    if atoms.len() > MAX_ATOMS {
+                    match lift {
+                        Some((kind, _)) => narrow.push((i, kind)),
+                        None => atoms.push(i),
+                    }
+                    if atoms.len() + narrow.len() > MAX_ATOMS {
                         return Err(Walk::Over);
                     }
                     continue;
                 }
-                s.stack.push((i, mode, true));
+                s.stack.push((i, mode, true, lift));
             }
         }
-        let op = cx.node(i).op;
         lin |= is_linear(op);
-        bit |= matches!(op, OpCode::And | OpCode::Or | OpCode::Xor);
+        // (A complement under a cast counts: `zext(~a)` is a term the linear pass cannot read
+        // without the extension of `a`.)
+        bit |= matches!(op, OpCode::And | OpCode::Or | OpCode::Xor)
+            || (op == OpCode::Not && lift.is_some());
         let m = operand_mode(cx, i, mode);
+        let under = match op {
+            OpCode::Zext | OpCode::Sext => Some((op, i)),
+            _ => lift,
+        };
         for c in cx.node(i).children() {
-            s.stack.push((c, m, false));
+            s.stack.push((c, m, false, under));
         }
     }
     // Keep each interior node once, operands first (a node read in both modes was pushed twice).
@@ -176,10 +257,40 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
     // The canonical order of the atoms, independent of node indices.
     atoms.sort_by(|a, b| cx.order(*a, *b));
     Ok(Region {
+        bounds: atoms
+            .iter()
+            .copied()
+            .chain(narrow.iter().map(|&(a, _)| a))
+            .collect(),
         atoms,
         order,
         mixed: lin && bit,
+        // The kinds, until the atoms are lifted (see `lift`).
+        lifts: narrow.iter().map(|&(a, k)| (a, k as u32)).collect(),
     })
+}
+
+/// Lifts the region's narrow atoms: each becomes the cast of its kind to the root's width
+/// (built, so counted as new by the commit rule, the narrow atom staying the boundary), and
+/// joins the atoms in the canonical order.
+fn lift(r: &mut Runner<'_, '_>, cx: &mut Context, reg: &mut Region, w: u16) -> Result<(), Stop> {
+    let kinds = core::mem::take(&mut reg.lifts);
+    for (a, kind) in kinds {
+        let sext = kind == OpCode::Sext as u32;
+        let l = r.build(cx, |cx| {
+            if sext {
+                cx.c_sext(a, w)
+            } else {
+                cx.c_zext(a, w)
+            }
+        })?;
+        reg.lifts.push((a, l));
+        if !reg.atoms.contains(&l) {
+            reg.atoms.push(l);
+        }
+    }
+    reg.atoms.sort_by(|a, b| cx.order(*a, *b));
+    Ok(())
 }
 
 fn region(cx: &Context, root: u32, s: &mut Scratch) -> Option<Region> {
@@ -222,13 +333,22 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
             }
         }
     }
+    // A narrow atom reads as its lifted atom: under its cast, the nodes are evaluated at the
+    // root's width over the lifted atoms (bitwise operators act by position).
+    for &(a, l) in &reg.lifts {
+        match s.seen.get(l) {
+            Some(j) => s.seen.set(a, j),
+            None => return signature_wide(cx, reg, root),
+        }
+    }
     for (k, &i) in reg.order.iter().enumerate() {
         let at = (t + k) * corners;
         s.seen.set(i, (t + k) as u32);
         let (done, rest) = s.words.split_at_mut(at);
         let out = &mut rest[..corners];
         if let Some(c) = cx.const_val(i) {
-            out.fill(c.limbs()[0]);
+            // A uniform constant under a cast at the root's width.
+            out.fill(if c.is_ones() { mask } else { c.limbs()[0] });
             continue;
         }
         let n = cx.node(i);
@@ -241,6 +361,19 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
             return signature_wide(cx, reg, root);
         };
         match n.op {
+            OpCode::Sext => out.copy_from_slice(a),
+            // The function of the lifted atoms, plus `2^W` where it is all ones at 0 (above
+            // the operand's width, where the lifted atoms are 0).
+            OpCode::Zext => {
+                let above = if a[0] == mask {
+                    1u64 << cx.width_of(n.a).bits()
+                } else {
+                    0
+                };
+                out.iter_mut()
+                    .zip(a)
+                    .for_each(|(o, &x)| *o = x.wrapping_add(above) & mask);
+            }
             OpCode::Not => out.iter_mut().zip(a).for_each(|(o, &x)| *o = !x & mask),
             OpCode::Neg => out
                 .iter_mut()
@@ -294,15 +427,32 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
             .collect();
         vals.insert(a, v);
     }
+    for &(a, l) in &reg.lifts {
+        let v = vals.get(&l).cloned().unwrap_or_default();
+        vals.insert(a, v);
+    }
     for &i in &reg.order {
         let n = cx.node(i);
         let v: Vec<BitVec> = if let Some(c) = cx.const_val(i) {
+            let c = if c.is_ones() {
+                BitVec::ones(w)
+            } else {
+                c.zext(w).unwrap_or(c)
+            };
             vec![c; corners]
         } else {
+            let above = (n.op == OpCode::Zext && vals[&n.a][0].is_ones()).then(|| {
+                crate::facts::known::bv_shl(&BitVec::one(w), u32::from(cx.width_of(n.a).bits()))
+            });
             (0..corners)
                 .map(|p| {
                     let get = |j: u32| vals[&j][p];
                     match n.op {
+                        OpCode::Sext => get(n.a),
+                        OpCode::Zext => match &above {
+                            Some(k) => BitVec::bin_unchecked(BinOp::Add, &get(n.a), k),
+                            None => get(n.a),
+                        },
                         OpCode::Not => BitVec::un_unchecked(UnOp::Not, &get(n.a)),
                         OpCode::Neg => BitVec::un_unchecked(UnOp::Neg, &get(n.a)),
                         op => {
@@ -357,19 +507,27 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if !(is_linear(op) || is_bitwise(op)) || !interior(cx, n, Mode::Linear) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let Some(reg) = region(cx, n, &mut r.linear_mba) else {
+    let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
         count(r).atomized += 1;
         return Ok(Step::Normal(Fin::FINAL));
     };
     // Pure linear or pure bitwise regions belong to those passes.
-    if !reg.mixed || reg.atoms.is_empty() {
+    if !reg.mixed || reg.bounds.is_empty() {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    let w = cx.width_of(n);
+    // The lifted atoms are built now: `before` lets a rejection discard them.
+    let before = cx.len() as u32;
+    lift(r, cx, &mut reg, w.bits())?;
     let t = reg.atoms.len();
+    if t > MAX_ATOMS {
+        count(r).atomized += 1;
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let lifted = reg.lifts.len() as u32;
     r.meter
         .charge(Counter::PassWork, (reg.order.len() << t) as u64)?;
     let sig = signature(cx, &reg, n, &mut r.linear_mba);
-    let w = cx.width_of(n);
     let d = mobius(&sig);
     // (The atoms, and so the corners, are already in the canonical order.)
     let canon = reg.atoms.clone();
@@ -450,13 +608,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     cands.sort_by_key(|c| c.0);
     let Some((est, cand)) = cands.into_iter().next() else {
+        super::discard(r, cx, before);
         return Ok(Step::Normal(Fin::FINAL));
     };
-    if let Some(f) = worth_building(r, cx, n, &reg.atoms, est)? {
+    if let Some(f) = worth_building(r, cx, n, &reg.bounds, est + lifted)? {
         count(r).rejected_cost += 1;
+        super::discard(r, cx, before);
         return Ok(Step::Normal(f));
     }
-    let before = cx.len() as u32;
     let form = match cand {
         Candidate::Affine(konst, terms) => {
             let terms: Vec<(u32, BitVec)> =
@@ -491,7 +650,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             linear::Form::of(konst, &terms)
         }
     };
-    let _ = w;
     let e = linear::emit(r, cx, &form)?;
     finish(
         r,
@@ -500,7 +658,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         n,
         e,
         before,
-        &reg.atoms,
+        &reg.bounds,
         Fin::FINAL,
     )
 }

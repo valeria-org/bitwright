@@ -2,8 +2,11 @@
 //!
 //! - through `+ − * neg` when `lo = 0` (the low bits of a sum, difference or product depend
 //!   only on the low bits of its operands), and through `& | ^ ~` and `select` for any `lo`;
-//! - through shifts by a constant, zero and sign extensions, and `concat`, by re-indexing
-//!   (or becoming the constant 0, or the extension of the part that remains).
+//! - through shifts by a constant (an arithmetic shift fills with the sign bit), zero and
+//!   sign extensions, and `concat`, by re-indexing (or becoming the constant 0, or the
+//!   extension of the part that remains);
+//! - above bit `lo` through `a + a` (the bits one lower), and through `+ − *` where an operand's
+//!   low `lo` bits are known zero (nothing carries in from below).
 //!
 //! The narrowing is computed for the whole region below the extract (bounded), and replaces the
 //! node only when that region gets strictly smaller: `trunc(zext(x) + zext(y))` becomes
@@ -25,6 +28,36 @@ struct Narrow {
     /// Nodes where narrowing stopped (the region's atoms).
     stops: Vec<u32>,
     pushes: u32,
+    /// What the facts a push relied on contribute to the node's finality.
+    fin: Fin,
+}
+
+/// Whether the low `lo` bits of `i` are known zero (so a sum or product with it carries
+/// nothing into the bits above), and what that relied on.
+fn low_zero(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    i: u32,
+    lo: u16,
+) -> Result<(bool, Fin), Stop> {
+    let w = cx.wid(i);
+    if lo == 0 {
+        return Ok((true, Fin::FINAL));
+    }
+    if w <= 64 {
+        let (k, fin) = super::known_words(r, cx, i)?;
+        let need = if lo >= 64 { u64::MAX } else { (1u64 << lo) - 1 };
+        return Ok((k.is_some_and(|[zero, _]| zero & need == need), fin));
+    }
+    let (k, fin) = super::known(r, cx, i)?;
+    let need = crate::facts::known::low_mask(
+        crate::Width::new(w).map_err(|e| Stop::Error(e.into()))?,
+        u32::from(lo),
+    );
+    Ok((
+        k.is_some_and(|k| crate::facts::known::bv_and(&k.known_zero(), &need) == need),
+        fin,
+    ))
 }
 
 /// `extract<lo, n>(x)`, narrowed as far as the rules above allow.
@@ -67,6 +100,43 @@ fn narrow(
                 let op = node.op.as_bin().unwrap_or(BinOp::Add);
                 r.build(cx, |cx| cx.c_bin(op, a, b))?
             }
+            // `a + a` is `a << 1` (the linear pass writes it so): the bits one lower.
+            OpCode::Add if node.a == node.b => narrow(r, cx, st, node.a, lo - 1, n)?,
+            // Above bit `lo`, a sum or difference with an operand whose low `lo` bits are zero
+            // carries nothing in: `(a + 2^lo·b') >> lo` is `(a >> lo) + b'`; and a product's
+            // bits from `lo` on are `a · b'` there.
+            OpCode::Add | OpCode::Sub | OpCode::Mul => {
+                let (za, fa) = low_zero(r, cx, node.a, lo)?;
+                let (zb, fb) = low_zero(r, cx, node.b, lo)?;
+                let op = node.op.as_bin().unwrap_or(BinOp::Add);
+                let ok = match node.op {
+                    OpCode::Add | OpCode::Mul => za || zb,
+                    _ => zb,
+                };
+                if !ok {
+                    st.fin = st.fin.and(fa.unchanged()).and(fb.unchanged());
+                    stop(r, cx, st)?
+                } else {
+                    st.fin = st.fin.and(if za { fa } else { fb });
+                    let (a, b) = if node.op == OpCode::Mul {
+                        // The operand with zero low bits is read from `lo`, the other below.
+                        let (z, o) = if zb {
+                            (node.b, node.a)
+                        } else {
+                            (node.a, node.b)
+                        };
+                        let zz = narrow(r, cx, st, z, lo, n)?;
+                        let oo = narrow(r, cx, st, o, 0, n)?;
+                        if zb { (oo, zz) } else { (zz, oo) }
+                    } else {
+                        (
+                            narrow(r, cx, st, node.a, lo, n)?,
+                            narrow(r, cx, st, node.b, lo, n)?,
+                        )
+                    };
+                    r.build(cx, |cx| cx.c_bin(op, a, b))?
+                }
+            }
             OpCode::Neg if lo == 0 => {
                 let a = narrow(r, cx, st, node.a, 0, n)?;
                 r.build(cx, |cx| cx.c_un(UnOp::Neg, a))?
@@ -101,6 +171,8 @@ fn narrow(
                     } else if lo64 >= k {
                         narrow(r, cx, st, node.a, (lo64 - k) as u16, n)?
                     } else {
+                        // (Straddling the shift, `concat(trunc(x), 0)` would be no smaller
+                        // than the shift, and a worse start for the passes after.)
                         stop(r, cx, st)?
                     }
                 } else if lo64 + k >= w64 {
@@ -109,6 +181,24 @@ fn narrow(
                     narrow(r, cx, st, node.a, (lo64 + k) as u16, n)?
                 } else {
                     stop(r, cx, st)?
+                }
+            }
+            // An arithmetic shift: the operand's bits from `lo + k`, the sign bit above them.
+            OpCode::AShr if cx.const_val(node.b).is_some() => {
+                let k = cx
+                    .const_val(node.b)
+                    .and_then(|k| k.to_u64())
+                    .unwrap_or(u64::MAX);
+                let (lo64, n64, w64) = (u64::from(lo), u64::from(n), u64::from(w));
+                if lo64 + k + n64 <= w64 {
+                    narrow(r, cx, st, node.a, (lo64 + k) as u16, n)?
+                } else if lo64 + k >= w64 - 1 {
+                    let sign = narrow(r, cx, st, node.a, w - 1, 1)?;
+                    r.build(cx, |cx| cx.c_sext(sign, n))?
+                } else {
+                    let from = (lo64 + k) as u16;
+                    let p = narrow(r, cx, st, node.a, from, w - from)?;
+                    r.build(cx, |cx| cx.c_sext(p, n))?
                 }
             }
             OpCode::Zext | OpCode::Sext => {
@@ -218,10 +308,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         memo: IdMap::default(),
         stops: Vec::new(),
         pushes: 0,
+        fin: Fin::FINAL,
     };
     let e = narrow(r, cx, &mut st, node.a, node.b as u16, node.width)?;
     if st.pushes > MAX_PUSHES {
         count(r).atomized += 1;
     }
-    finish(r, cx, PassKind::Casts, n, e, before, &st.stops, Fin::FINAL)
+    let fin = st.fin;
+    finish(r, cx, PassKind::Casts, n, e, before, &st.stops, fin)
 }

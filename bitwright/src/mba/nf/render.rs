@@ -11,7 +11,7 @@ use super::classes::{Classes, FULL};
 use super::poly::{Mono, Poly, Sym};
 use super::synth;
 use crate::engine::pass::bitwise::{T, min_forms, subtables};
-use crate::facts::known::{bv_and, bv_not, bv_or, bv_xor, count_ones, trailing_zeros};
+use crate::facts::known::{bv_and, bv_not, bv_or, bv_xor, count_ones, low_mask, trailing_zeros};
 use crate::mba::certify;
 use crate::mba::expr::{MNode, MOp, MbaExpr};
 use crate::mba::solve::Verdict;
@@ -230,8 +230,39 @@ impl Builder {
         })
     }
 
-    /// A cast of `a` to width `w`.
+    /// A cast of `a` to width `w`, with the obvious identities (a cast to the same width is
+    /// `a`; the low bits of an extension are its operand's; nested extensions of one kind are
+    /// one; a sign extension of a strict zero extension is a zero extension).
     pub(crate) fn cast(&mut self, op: MOp, a: u32, w: Width) -> u32 {
+        let na = self.nodes[a as usize];
+        if na.w == w {
+            return a;
+        }
+        if let MOp::Const(v) = na.op {
+            let r = match op {
+                MOp::Zext => v.zext(w),
+                MOp::Sext => v.sext(w),
+                _ => v.trunc(w),
+            };
+            if let Ok(r) = r {
+                return self.konst(&r);
+            }
+        }
+        match (op, na.op) {
+            (MOp::Trunc, MOp::Zext | MOp::Sext | MOp::Trunc) => {
+                let x = na.args[0];
+                let xw = self.width(x);
+                if xw == w {
+                    return x;
+                }
+                if xw > w {
+                    return self.cast(MOp::Trunc, x, w);
+                }
+            }
+            (MOp::Zext, MOp::Zext) | (MOp::Sext, MOp::Sext) => return self.cast(op, na.args[0], w),
+            (MOp::Sext, MOp::Zext) => return self.cast(MOp::Zext, na.args[0], w),
+            _ => {}
+        }
         self.intern(BNode {
             op,
             w,
@@ -478,6 +509,13 @@ pub(crate) struct Render<'a> {
     conjs: HashMap<u64, u32>,
     /// The best forms of tables over four to six atoms (nodes), by table and atoms.
     wide: HashMap<(u64, Vec<u32>), Option<u32>>,
+    /// Per atom: the variable and its width when the atom is the zero extension of a variable
+    /// narrower than the question (as `decast` writes narrow variables): zero from that width
+    /// on, and a function of such atoms can be written over the variables and extended (see
+    /// [`Render::narrow_cast`]).
+    narrow: Vec<Option<(u32, Width)>>,
+    /// Whether a sign extension's parts are being rendered (see [`Render::sign_extensions`]).
+    signing: bool,
 }
 
 /// The most decompositions [`Render::two_terms`] builds over up to three atoms, those whose
@@ -568,7 +606,28 @@ impl<'a> Render<'a> {
             floors: HashMap::new(),
             conjs: HashMap::new(),
             wide: HashMap::new(),
+            narrow: atom_exprs
+                .iter()
+                .map(|e| match e.nodes() {
+                    [v, z] if z.op == MOp::Zext && z.args[0] == 0 && z.width == w => match v.op {
+                        MOp::Var(i) => Some((i, v.width)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+            signing: false,
         }
+    }
+
+    /// The bit from which every conjunction of the atoms in `set` is zero, if one of them is
+    /// a zero extension (its operand's width).
+    fn zero_from(&self, set: u64) -> Option<u16> {
+        (0..64u32)
+            .filter(|&a| set >> a & 1 == 1)
+            .filter_map(|a| self.narrow.get(a as usize).copied().flatten())
+            .map(|(_, n)| n.bits())
+            .min()
     }
 
     /// Renders an atom's definition: with the decompositions a peel's rest gets (no groups,
@@ -1232,13 +1291,24 @@ impl<'a> Render<'a> {
 
     /// The minimum-size form of an 8-bit table over `atoms` (at most three).
     fn min_form(&mut self, tt: u8, atoms: &[u32]) -> Option<u32> {
+        let w = self.w;
+        self.min_form_at(tt, atoms, w)
+    }
+
+    /// [`Render::min_form`] over atoms of width `w`.
+    fn min_form_at(&mut self, tt: u8, atoms: &[u32], w: Width) -> Option<u32> {
         let (tmpl, _) = &min_forms().forms[tt as usize];
-        self.template(tmpl, atoms)
+        self.template_at(tmpl, atoms, w)
     }
 
     /// A minimum-form template built over `atoms`.
     fn template(&mut self, tmpl: &[T], atoms: &[u32]) -> Option<u32> {
         let w = self.w;
+        self.template_at(tmpl, atoms, w)
+    }
+
+    /// A minimum-form template built over `atoms` of width `w`.
+    fn template_at(&mut self, tmpl: &[T], atoms: &[u32], w: Width) -> Option<u32> {
         let mut built: Vec<u32> = Vec::with_capacity(tmpl.len());
         for t in tmpl {
             let id = match *t {
@@ -1270,6 +1340,62 @@ impl<'a> Render<'a> {
         self.best(&c)
     }
 
+    /// A bitwise function of at most three atoms that are zero extensions of variables of one
+    /// width `n`, written over the variables at that width and extended: `zext(a ^ b)` for
+    /// `Za ^ Zb`, `zext(a & ~b)` for `(Za & ~Zb) & lowmask(n)`. Below `n` the function must
+    /// be one table (the classes there lie below `n`); from `n` on, where every atom is zero,
+    /// it is its value at all-zero inputs: all zero gives `zext(g)`, all one `~zext(~g)`.
+    fn narrow_cast(&mut self, f: &Bits) -> Option<u32> {
+        let w = self.w;
+        let s = f.support.len();
+        if s == 0 || s > 3 {
+            return None;
+        }
+        let mut n: Option<Width> = None;
+        let mut vars: Vec<u32> = Vec::with_capacity(s);
+        for &a in &f.support {
+            let (v, nw) = self.narrow.get(a as usize).copied().flatten()?;
+            if n.is_some_and(|m| m != nw) {
+                return None;
+            }
+            n = Some(nw);
+            vars.push(v);
+        }
+        let n = n?;
+        let nb = n.bits();
+        let below = low_mask(w, u32::from(nb));
+        let mut low: Option<&Vec<u64>> = None;
+        let mut high: Option<bool> = None;
+        for c in 0..self.classes.len() {
+            let t = &f.tables[c];
+            if self.classes.low(c) < nb {
+                if !bv_and(self.classes.mask(c), &bv_not(&below)).is_zero() {
+                    return None;
+                }
+                match low {
+                    Some(l) if l != t => return None,
+                    Some(_) => {}
+                    None => low = Some(t),
+                }
+            } else {
+                let v = bits::get(t, 0);
+                match high {
+                    Some(h) if h != v => return None,
+                    _ => high = Some(v),
+                }
+            }
+        }
+        let (t, h) = (low?.clone(), high?);
+        let tt = table8(&t, s)?;
+        let tt = if h { !tt } else { tt };
+        self.spend(4u64 << s);
+        let atoms: Vec<u32> = vars.iter().map(|&v| self.b.var(v)).collect();
+        let g = self.min_form_at(tt, &atoms, n)?;
+        let z = self.b.cast(MOp::Zext, g, w);
+        self.built += 1;
+        Some(if h { self.b.un(MOp::Not, z) } else { z })
+    }
+
     /// Renderings of a bitwise function (tables per class).
     pub(crate) fn bits(&mut self, f: &Bits) -> Vec<u32> {
         self.bits_with(f, &BitVec::zero(self.w))
@@ -1284,8 +1410,15 @@ impl<'a> Render<'a> {
         if !self.spend((f.tables.len() as u64) << s) {
             return Vec::new();
         }
+        let narrow = if extra.is_zero() {
+            self.narrow_cast(f)
+        } else {
+            None
+        };
         if f.uniform() && extra.is_zero() {
-            return self.uniform(&f.tables[0], &f.support);
+            let mut out = self.uniform(&f.tables[0], &f.support);
+            out.extend(narrow);
+            return out;
         }
         let n = self.classes.len();
         // Positions grouped by table.
@@ -1312,11 +1445,14 @@ impl<'a> Render<'a> {
         }
         if let [(t, _)] = groups.as_slice() {
             let t = t.clone();
-            return self.uniform(&t, &f.support);
+            let mut out = self.uniform(&t, &f.support);
+            out.extend(narrow);
+            return out;
         }
         let full = |t: &Vec<u64>| (0..1usize << s).all(|p| bits::get(t, p));
         let empty = |t: &Vec<u64>| (0..1usize << s).all(|p| !bits::get(t, p));
         let mut out = Vec::new();
+        out.extend(narrow);
         // The or of the masked groups.
         let mut acc: Option<u32> = None;
         let mut ok = true;
@@ -1561,6 +1697,7 @@ impl<'a> Render<'a> {
         }
         out.extend(self.scaled_bits(p, plain.is_some()));
         out.extend(self.two_terms(p));
+        out.extend(self.sign_extensions(p));
         if top && self.peeling == 0 {
             out.extend(self.split_off(p));
         }
@@ -1575,6 +1712,215 @@ impl<'a> Render<'a> {
         out.extend(variants);
         self.built += out.len() as u64;
         out
+    }
+
+    /// Sign extensions in a degree-≤1 form. `sext<W>(trunc<j+1>(g))` is `g` on the bits below
+    /// `j` less `g`'s bit `j`: `g[lo] − g[j]`. So where the terms of a single-position class
+    /// `{j}` are the negatives of the terms of every class below `j` (set by set, and nothing
+    /// else has a term there), and the sets have nothing above `j` but where their atoms are
+    /// zero anyway, those terms are a sign extension of the function `g = Σ −c_S·AND_S` the sets
+    /// make, when `g` is `k` times a bitwise function (`2·Z[lo] − 2·Z[j]` is `2·sext(a)`, not
+    /// `sext(trunc(2·Z))`): `Z[lo] − Z[j]` over `Z = zext(a)` of `j + 1` bits is `sext(a)`
+    /// (`decast` writes `sext(a)` as `(Z ^ 2^j) − 2^j`, which the classes read that way). The
+    /// rest of the form is rendered as usual; one candidate, with the extensions added.
+    fn sign_extensions(&mut self, p: &Poly) -> Vec<Sum> {
+        let w = self.w;
+        let wb = u32::from(w.bits());
+        let n = self.classes.len();
+        if self.signing || n < 2 || p.degree() > 1 || !self.spend(p.len() as u64 * n as u64) {
+            return Vec::new();
+        }
+        let mut rest = p.expand_full(self.classes);
+        let single = |m: &Mono| -> Option<Sym> {
+            match m.as_slice() {
+                [(sym, 1)] if sym.class != FULL => Some(*sym),
+                _ => None,
+            }
+        };
+        let mut exts: Vec<(u32, BitVec)> = Vec::new();
+        for s in 0..n {
+            let Some(pos) = self.classes.single(s) else {
+                continue;
+            };
+            if u32::from(pos) + 1 >= wb {
+                continue;
+            }
+            // Classes need not be contiguous: a class that starts below `j` must lie below it
+            // (else `x ^ 8` at 5 bits, whose classes are `{3}` and `{0, 1, 2, 4}`, would read
+            // as `8 + sext<5>(trunc<4>(x))`, bit 4 lost).
+            let below = low_mask(w, u32::from(pos));
+            if (0..n).any(|c| {
+                self.classes.low(c) < pos
+                    && !bv_and(self.classes.mask(c), &bv_not(&below)).is_zero()
+            }) {
+                continue;
+            }
+            let signs: Vec<(u64, BitVec)> = rest
+                .terms()
+                .iter()
+                .filter_map(|(m, c)| {
+                    single(m)
+                        .filter(|sym| sym.class == s as u16)
+                        .map(|sym| (sym.set, *c))
+                })
+                .collect();
+            if signs.is_empty() {
+                continue;
+            }
+            let mut expect = Poly::zero(w);
+            for (set, c) in &signs {
+                let neg = BitVec::un_unchecked(UnOp::Neg, c);
+                for c2 in 0..n {
+                    if c2 == s {
+                        expect.add_term(
+                            vec![(
+                                Sym {
+                                    set: *set,
+                                    class: s as u16,
+                                },
+                                1,
+                            )],
+                            c,
+                        );
+                    } else if self.classes.low(c2) < pos {
+                        expect.add_term(
+                            vec![(
+                                Sym {
+                                    set: *set,
+                                    class: c2 as u16,
+                                },
+                                1,
+                            )],
+                            &neg,
+                        );
+                    }
+                }
+            }
+            let mut part = Poly::zero(w);
+            for (m, c) in rest.terms() {
+                if single(m).is_some_and(|sym| self.classes.low(usize::from(sym.class)) <= pos) {
+                    part.add_term(m.clone(), c);
+                }
+            }
+            if part != expect {
+                continue;
+            }
+            // Above `j`: nothing of these sets, unless their atoms are zero there.
+            let above: Vec<(Mono, BitVec)> = rest
+                .terms()
+                .iter()
+                .filter(|(m, _)| {
+                    single(m).is_some_and(|sym| {
+                        self.classes.low(usize::from(sym.class)) > pos
+                            && signs.iter().any(|(set, _)| *set == sym.set)
+                    })
+                })
+                .map(|(m, c)| (m.clone(), *c))
+                .collect();
+            if above.iter().any(|(m, _)| {
+                let sym = m[0].0;
+                !self
+                    .zero_from(sym.set)
+                    .is_some_and(|z| z <= self.classes.low(usize::from(sym.class)))
+            }) {
+                continue;
+            }
+            // The terms below `j`, `Σ d_S·AND_S` with `d_S = −c_S`, must be `k·g` for a bitwise
+            // function `g` (its Möbius coefficients `a_S`, `d_S = k·a_S`): then the whole is
+            // `k·sext(trunc(g))`. Some `a_S` is ±1, so `k` is `±d_S` for a set `S` whose
+            // coefficient has the fewest factors of two.
+            let d: Vec<(u64, BitVec)> = signs
+                .iter()
+                .map(|(set, c)| (*set, BitVec::un_unchecked(UnOp::Neg, c)))
+                .collect();
+            let Some(tz) = d.iter().map(|(_, c)| trailing_zeros(c)).min() else {
+                continue;
+            };
+            let Some((_, pivot)) = d.iter().find(|(_, c)| trailing_zeros(c) == tz) else {
+                continue;
+            };
+            let mut found: Option<(u32, BitVec)> = None;
+            // Exact division by `k`: the odd part's inverse, and the factors of two shifted out
+            // arithmetically (`−2 / 2` is `−1`, the coefficient of a bitwise function; its
+            // logical shift is not).
+            let by = BitVec::wrapping_from_u64(w, u64::from(tz));
+            for k in [*pivot, BitVec::un_unchecked(UnOp::Neg, pivot)] {
+                let shifted = BitVec::bin_unchecked(BinOp::AShr, &k, &by);
+                let inv = super::poly::odd_inverse(&shifted);
+                let mut g = Poly::zero(w);
+                let mut exact = true;
+                for (set, dc) in &d {
+                    let a = BitVec::bin_unchecked(
+                        BinOp::Mul,
+                        &BitVec::bin_unchecked(BinOp::AShr, dc, &by),
+                        &inv,
+                    );
+                    if BitVec::bin_unchecked(BinOp::Mul, &a, &k) != *dc {
+                        exact = false;
+                        break;
+                    }
+                    g.add_term(
+                        vec![(
+                            Sym {
+                                set: *set,
+                                class: FULL,
+                            },
+                            1,
+                        )],
+                        &a,
+                    );
+                }
+                if !exact {
+                    continue;
+                }
+                let Some(f) = Bits::from_linear(&g.expand_full(self.classes), self.classes) else {
+                    continue;
+                };
+                if !f.uniform() {
+                    continue;
+                }
+                self.signing = true;
+                let cands = self.bits(&f);
+                self.signing = false;
+                if let Some(best) = self.best(&cands) {
+                    found = Some((best, k));
+                    break;
+                }
+            }
+            let Some((best, k)) = found else {
+                continue;
+            };
+            let Ok(narrow) = Width::new(pos + 1) else {
+                continue;
+            };
+            let t = self.b.cast(MOp::Trunc, best, narrow);
+            let e = self.b.cast(MOp::Sext, t, w);
+            exts.push((e, k));
+            rest = rest.sub(&part);
+            for (m, c) in above {
+                rest.add_term(m, &BitVec::un_unchecked(UnOp::Neg, &c));
+            }
+        }
+        if exts.is_empty() {
+            return Vec::new();
+        }
+        let mut sum = if rest.terms().keys().all(Vec::is_empty) {
+            Sum {
+                terms: Vec::new(),
+                konst: (!rest.konst().is_zero()).then(|| rest.konst()),
+            }
+        } else {
+            self.signing = true;
+            let sums = self.linear_sums_at(&rest, false);
+            self.signing = false;
+            match self.cheapest(sums) {
+                Some(s) => s,
+                None => return Vec::new(),
+            }
+        };
+        sum.terms.extend(exts);
+        self.built += 1;
+        vec![sum]
     }
 
     /// The cheapest decomposition `Σ βᵢ·xᵢ ± g (+ k)` of a degree-≤1 form, `g` one bitwise

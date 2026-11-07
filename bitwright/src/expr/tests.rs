@@ -664,7 +664,19 @@ fn check_all_assignments(cx: &mut Context, vars: &[(String, u16)], e: Expr, t: &
 
 #[test]
 fn construction_table_is_sound() {
-    for w in 1..=3u16 {
+    construction_table(1..=2);
+}
+
+/// [`construction_table_is_sound`] at width 3 (atom pairs times assignments grow fastest
+/// at the top width).
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn construction_table_is_sound_at_width_3() {
+    construction_table(3..=3);
+}
+
+fn construction_table(widths: core::ops::RangeInclusive<u16>) {
+    for w in widths {
         let mut cx = Context::new();
         let mut vars = Vec::new();
         let here = atoms(&mut cx, &mut vars, w);

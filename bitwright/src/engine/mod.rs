@@ -1225,9 +1225,15 @@ struct Runner<'r, 'a> {
     carries: pass::carries::Scratch,
     /// The demanded-bits pass's memo, empty between calls.
     demanded: pass::demanded::Memo,
+    /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
+    /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
+    demanded_same: pass::demanded::Same,
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
+    /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_unproved: IdMap<crate::mba::CacheKey, ()>,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -1460,6 +1466,7 @@ impl Runner<'_, '_> {
             self.chain_parent.clear();
             self.asks.clear();
             self.first.clear();
+            self.demanded_same.clear();
         }
         let mut stack = core::mem::take(&mut self.stack);
         stack.clear();
@@ -2192,8 +2199,11 @@ impl Engine {
             #[cfg(feature = "prove")]
             carries: Default::default(),
             demanded: Default::default(),
+            demanded_same: Default::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_unproved: IdMap::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,

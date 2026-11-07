@@ -933,10 +933,168 @@ fn write(
     finish(r, cx, PassKind::Bitwise, n, e, before, atoms, fin)
 }
 
+/// The most nodes of a bitwise tree [`hoist_cast`] reads.
+const HOIST_NODES: usize = 64;
+
+/// A bitwise tree (`& | ^ ~`) whose leaves are extensions of one kind from one width `W`, and
+/// constants, is the extension of the tree over the operands: `zext(a) & ~zext(b)` is
+/// `zext(a & ~b)`, `~zext(a) & lowmask(W)` is `zext(~a)`, `sext(a) | sext(b)` is `sext(a | b)`.
+/// Bitwise operators act by position, and a sign extension replicates one position, so a sign
+/// extension of the narrow tree is the tree of the sign extensions when every constant's bits
+/// from `W − 1` on agree (the tree's bit there is then the narrow result's sign). Above `W`
+/// every zero extension is 0, so the wide tree is a constant bit there: 0 gives `zext(f)`, all
+/// ones `~zext(~f)`. Committed when smaller: with two or more extensions, or one and a
+/// constant it absorbs.
+fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let u = cx.width_of(n);
+    // The tree, operands first; its leaves.
+    let mut order: Vec<u32> = Vec::new();
+    let mut seen: Vec<u32> = Vec::new();
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    let mut kind: Option<(OpCode, crate::Width)> = None;
+    let mut casts = 0usize;
+    let mut consts = 0usize;
+    let mut narrow: Vec<u32> = Vec::new();
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            order.push(i);
+            continue;
+        }
+        if seen.contains(&i) {
+            continue;
+        }
+        seen.push(i);
+        if seen.len() > HOIST_NODES {
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+        let node = cx.node(i);
+        if cx.const_val(i).is_some() {
+            consts += 1;
+            continue;
+        }
+        match node.op {
+            OpCode::Zext | OpCode::Sext => {
+                let wa = cx.width_of(node.a);
+                match kind {
+                    Some(k) if k != (node.op, wa) => return Ok(Step::Normal(Fin::FINAL)),
+                    _ => kind = Some((node.op, wa)),
+                }
+                casts += 1;
+                narrow.push(node.a);
+            }
+            op if bitwise_op(op) => {
+                stack.push((i, true));
+                for c in node.children() {
+                    stack.push((c, false));
+                }
+            }
+            _ => return Ok(Step::Normal(Fin::FINAL)),
+        }
+    }
+    let Some((k, w)) = kind else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    if casts < 2 && consts == 0 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    // Every constant must agree with the extension: a sign extension of its low `W` bits, or
+    // (for a zero extension) any bits, which decide the wide tree's value above `W`.
+    let wide = |cx: &Context, i: u32| -> Option<BitVec> {
+        let node = cx.node(i);
+        if let Some(c) = cx.const_val(i) {
+            return Some(c);
+        }
+        match node.op {
+            OpCode::Zext | OpCode::Sext => Some(BitVec::zero(u)),
+            _ => None,
+        }
+    };
+    if k == OpCode::Sext {
+        for &i in &seen {
+            if let Some(c) = cx.const_val(i)
+                && c.trunc(w).ok().and_then(|t| t.sext(u).ok()) != Some(c)
+            {
+                return Ok(Step::Normal(Fin::FINAL));
+            }
+        }
+    }
+    let before = cx.len() as u32;
+    // The tree at `W` over the operands, and (for a zero extension) at the full width over
+    // zeros for its value above `W`.
+    let mut low: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+    let mut above: crate::hash::IdMap<u32, BitVec> = crate::hash::IdMap::default();
+    for &i in &seen {
+        let node = cx.node(i);
+        if let Some(c) = cx.const_val(i) {
+            let t = c.trunc(w).map_err(|e| Stop::Error(e.into()))?;
+            low.insert(i, r.build(cx, |cx| cx.mk_const(&t))?);
+            above.insert(i, c);
+        } else if matches!(node.op, OpCode::Zext | OpCode::Sext) {
+            low.insert(i, node.a);
+            above.insert(i, BitVec::zero(u));
+        }
+    }
+    for &i in &order {
+        let node = cx.node(i);
+        let (a, b) = (low[&node.a], node.b);
+        let (va, vb) = (
+            above[&node.a],
+            wide(cx, node.b).or_else(|| above.get(&node.b).copied()),
+        );
+        let (l, v) = match node.op {
+            OpCode::Not => (
+                r.build(cx, |cx| cx.c_un(UnOp::Not, a))?,
+                BitVec::un_unchecked(UnOp::Not, &va),
+            ),
+            op => {
+                let bin = op.as_bin().unwrap_or(BinOp::And);
+                let Some(vb) = vb else {
+                    return Ok(Step::Normal(Fin::FINAL));
+                };
+                let lb = low[&b];
+                (
+                    r.build(cx, |cx| cx.c_bin(bin, a, lb))?,
+                    BitVec::bin_unchecked(bin, &va, &vb),
+                )
+            }
+        };
+        low.insert(i, l);
+        above.insert(i, v);
+    }
+    let f = low[&n];
+    let e = if k == OpCode::Sext {
+        r.build(cx, |cx| cx.c_sext(f, u.bits()))?
+    } else {
+        // The wide tree's bits above `W`.
+        let v = above[&n];
+        let hi = crate::facts::known::bv_lshr(&v, u32::from(w.bits()));
+        let span = crate::facts::known::low_mask(u, u32::from(u.bits() - w.bits()));
+        if hi.is_zero() {
+            r.build(cx, |cx| cx.c_zext(f, u.bits()))?
+        } else if hi == span {
+            r.build(cx, |cx| {
+                let nf = cx.c_un(UnOp::Not, f)?;
+                let z = cx.c_zext(nf, u.bits())?;
+                cx.c_un(UnOp::Not, z)
+            })?
+        } else {
+            super::discard(r, cx, before);
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+    };
+    narrow.sort_unstable();
+    narrow.dedup();
+    finish(r, cx, PassKind::Bitwise, n, e, before, &narrow, Fin::FINAL)
+}
+
 /// The bitwise pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if !bitwise_op(cx.node(n).op) {
         return Ok(Step::Normal(Fin::FINAL));
+    }
+    if let done @ Step::To(..) = hoist_cast(r, cx, n)? {
+        return Ok(done);
     }
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
         return Ok(Step::Normal(Fin::FINAL));

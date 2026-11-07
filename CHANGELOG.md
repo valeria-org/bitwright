@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+- **A register read through its low bits is a narrow variable to the MBA certificates.** The
+  question's casts are taken out before the normal form and the certificates (`decast`), but a
+  truncated register (`trunc<32>(x)`, or `x & 0xffffffff` after the rules) was left as the
+  register behind masks, which put a question with products outside the fragment the
+  polynomial certificates and the symbolic comparison decide: the solver found the answer to
+  the lifter spelling of `c·(Z(A&B)·Z(A|B) + Z(A&~B)·Z(~A&B))` over `A = trunc<32>(x)` and
+  the gate could not prove it, so the expression stayed as it was while its spelling over
+  `a:32` was solved. Now, when the tests leave such a question open (and not for lack of
+  budget), both sides are compared as polynomials over symbols with each root-width variable
+  whose every reader demands the same low `n` bits (through truncations, masks and the
+  operators whose low bits depend on low bits alone) as the atom `zext(trunc<n>(x))`, the
+  masks to `n` bits over values known zero above `n` dropped: the question over 32-bit values,
+  which the comparison reads. The solver's normal form keeps the registers, whose masks its
+  bit classes read exactly. Results of the benchmark corpora are unchanged node for node; the
+  lifter spelling above is solved like the narrow one.
+- **The core passes read through extensions.** The linear-MBA, bitwise and linear passes took
+  a `zext` or `sext` as an atom, so an MBA over extended narrow values was a sum of unrelated
+  atoms to them (`zext(a ^ b) + 2·zext(a & b)` stayed, where `(a ^ b) + 2·(a & b)` is `a + b`)
+  and only the MBA service, at normal-form cost, recovered it. Now the linear-MBA pass reads
+  through a cast into the bitwise function below it, over the narrow atoms lifted by the same
+  cast (`sext(f(a, b))` is `f(sext a, sext b)` for every bitwise `f`; `zext(f(a, b))` is
+  `f(zext a, zext b)` when `f` is 0 at 0, else that plus `2^W`), the signature taken over the
+  lifted atoms and the commit rule's boundary kept at the narrow ones; the bitwise pass hoists
+  a common extension out of a tree of `& | ^ ~` over extensions of one kind and width, with
+  constants (`zext(a) & ~zext(b)` is `zext(a & ~b)`, `~zext(a) & 0xffffffff` is `zext(~a)`,
+  `sext(a) | sext(b)` is `sext(a | b)`), which subsumes the rules `zext_and`, `sext_xor` and
+  the like at any depth; and the linear pass reads `zext(~t)` as `lowmask(W) − zext(t)` and
+  `sext(~t)` as `−1 − sext(t)` in a sum that has the extension of `t` as a term too, so
+  `sext(a) + sext(~a)` is `−1` without the MBA service. On the benchmark corpora over `zext<64>`ed and `sext<64>`ed
+  32-bit variables, `Strategy::deobfuscate()` alone now gives 1,826 nodes instead of 3,926
+  and 3,922 (the same MBAs at one width: 1,223), and with the MBA service 1,812 and 1,796
+  nodes in a quarter of the time, the service being asked a sixth as often.
+- **Comparisons move to the narrow term; extracts push through more.** A lone comparison
+  with a constant was emitted on its own operand, so `sext<64>(a) <s 5`, `zext<64>(a) <u 5`
+  and `sext<64>(a) + 3 <s 10` stayed as they were; the compares pass now emits it on the
+  deepest term the operand is a function of (through extensions, offsets, complements and
+  masks, as it already combined two comparisons) where that is smaller: `a <=s 4`, `a <=u 4`,
+  `a <=s 6`, and `a - 3 <=u 9` for `zext<64>(a) - 3 <u 10`. A sign test is written as one
+  (`a <=s -1`, not `0x80000000 <=u a`). The casts pass pushes an extract through `a + a` (the
+  linear pass's spelling of `a << 1`, which hid the shift: `extract<1, 31>(x + x)` is
+  `trunc<31>(x)`), through a sum or product above an operand whose low bits are known zero, and through an
+  arithmetic shift (`trunc<32>(x >>s 8)` is `extract<8, 32>(x)`,
+  `extract<8, 8>(x >>s 60)` is `sext<8>(extract<63, 1>(x))`).
+- **Ten rules from the audit of mixed-width inputs**, each proved by the checker:
+  `sub_zext_negative`, `sub_sext_negative`, `ult_zext_succ` and `masked_eq_self` in
+  `core.compare` (`zext(a) - zext(b) <s 0` is `a <u b`, `zext(a) <u zext(b) + 1` is
+  `a <=u b`, `x & 15 == x` is `x <u 16`); `ashr_sext_sign`, `sext_flip_zext`,
+  `umulhi_from_wide` and `smulhi_from_wide` in `core.casts` (`extract<32, 32>(zext<64>(a) *
+  zext<64>(b))` is `umulhi(a, b)`); `concat_sign_shift` and `concat_hi_add` in `core.concat`
+  (`concat(x >>s 31, x)` is `sext<64>(x)`, `concat(extract<32, 32>(x) + 1, trunc<32>(x))` is
+  `x + 0x100000000`).
+- **Less repeated work in the passes and the MBA phase.** The demanded-bits pass keeps, for
+  the phase run, the operands it found nothing to simplify under a mask (every mask over one
+  shared chain re-walked the chain and asked the facts again at every node); the commit rule
+  keeps the region it computed to ask whether building a candidate pays and reuses it to ask
+  whether the result does, when nothing the counts depend on changed in between; the MBA phase
+  marks every node inside a fragment within its limits as asked without scanning it again
+  (along a chain of n sums that was n scans of n links), skips the links of `& | ^` chains and
+  the operands of a cast whose user is asked, as it did the links of sums and products, and
+  remembers the questions whose answers the gate could not prove, instead of asking, lifting
+  and certifying them again; the normal-form solver's memo serves an answer to any step budget
+  of at least the steps it cost (it was keyed by the exact budget, so a host whose per-call
+  budget shrinks as it is spent got no hits once it fell below the per-question limit), and
+  its null-conjunction search no longer builds its sample for a form with nothing to test.
+  Answers are unchanged; the MBA service is asked 400 times instead of 2,404 along a 400-term
+  masked `^` chain.
+- **The MBA phase judges a fragment's mix without its casts.** A fragment is asked only when
+  it mixes arithmetic and bitwise operators, and the test ran on the fragment as spelled, where
+  `~` and casts count as neither: `sext<64>(a) + sext<64>(~a)` and
+  `zext<64>(a) - zext<64>(a & b)` never reached the solver. The shape is now also taken of the
+  fragment with its casts written out, as the solver reads it.
+- **Extensions of narrow variables, read and written.** The normal form took a zero
+  extension `zext(a)` as an atom like any other, so `zext(a) + zext(~a)` had no mask and
+  `sext(a) + sext(~a)` (whose sign extensions `decast` writes as `(zext(a) ^ 2^31) − 2^31`)
+  was not `−1`; and it could not write a cast at all, so the normal form of
+  `(sext(a) ^ sext(b)) + 2·(sext(a) & sext(b))`, exactly `sext(a) + sext(b)`, rendered larger
+  than the question, while a sum of sign extensions that did render came out as the spelling
+  `0xffffffff7fffffff − (zext(z) ^ 0xffffffff7fffffff)`, a fixpoint of the whole simplifier.
+  Now the operand's width of a zero extension is a class boundary and the atom is zero in the
+  classes above it; the unmasking of a normal form knows that; a bitwise operation over sign
+  extensions (forms `g[lo] − g[sign]`) is the sign extension of the operation over the values
+  extended (`~sext(x) & sext(z)` is `sext(~x & z)`); and the renderer writes `k·sext(trunc(g))`
+  for such forms and `zext(f(a, b))` (or `~zext(~f)`) for a bitwise function of zero
+  extensions of one width. The certificates follow: the bit-serial comparison and the
+  polynomial tests take a zero-extended narrow variable as one whose bits above its width are
+  0. On the benchmark corpus of linear MBAs over `sext<64>`ed 32-bit variables, results shrink
+  from 3,219 to 1,796 nodes (the same MBAs at one width: 1,223), in 4 M solver steps instead of
+  30 M; over `zext<64>`ed variables from 1,822 to 1,805; the other corpora are unchanged.
+
 - **Opt-in opaque and conditional MBA recovery.** `MbaConfig::with_opaque_sweep`,
   `with_noise_forms` and `with_known_atoms` enable exact rewrites for constants hidden through
   demanded bits, casts, rotations, condition-dependent pieces and complementary shared products.

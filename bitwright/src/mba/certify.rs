@@ -342,11 +342,16 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
             vdeg[i] = zeros.clone();
             continue;
         }
-        if n.width != w {
+        // A variable narrower than the question is read through casts, which say what its
+        // readers can do; one read only through a zero extension is a variable of the
+        // polynomial fragment (as `decast` writes narrow variables): the tests enumerate its
+        // own bits.
+        if n.width != w && !matches!(n.op, MOp::Var(_)) {
             poly = false;
         }
         let a = n.args[0] as usize;
         let b = n.args[1] as usize;
+        let narrow_var = matches!(nodes[a].op, MOp::Var(_)) && nodes[a].width < w;
         match n.op {
             MOp::Var(v) => {
                 local[i] = true;
@@ -359,6 +364,11 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                     *u = true;
                 }
                 vdeg[i] = d;
+            }
+            MOp::Zext if narrow_var => {
+                local[i] = true;
+                deg[i] = 1;
+                vdeg[i] = vdeg[a].clone();
             }
             MOp::And | MOp::Or | MOp::Xor => {
                 bitwise = true;
@@ -430,11 +440,6 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 poly = false;
                 vdeg[i] = zeros.clone();
             }
-        }
-    }
-    for (v, &vw) in m.vars().iter().enumerate() {
-        if used[v] && vw != w {
-            poly = false;
         }
     }
     let root = nodes.len() - 1;
@@ -1072,6 +1077,24 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     }
     if report.verdict == Verdict::Unknown {
         report = prove_at(a, b, meter, 0, false)?;
+    }
+    // Still open, and not for lack of budget: a polynomial question over registers read
+    // through their low bits, compared as polynomials over symbols with those registers as
+    // narrow atoms (`decast_narrow`). Over the masks the question is outside the fragment the
+    // polynomial tests and the symbolic comparison decide, and the tests over abstracted atoms
+    // leave it open; over the narrow atoms the identity is one the comparison reads. Only the
+    // comparison, which is cheap and only ever proves: an evaluation test over the atoms would
+    // spend as much as the tests above and decide no more.
+    if report.verdict == Verdict::Unknown && !report.over_budget {
+        let narrow = |m: &MbaExpr| super::decast::decast_narrow(m).filter(|(_, n)| *n);
+        if let (Some((na, _)), Some((nb, _))) = (narrow(a), narrow(b))
+            && na.vars() == nb.vars()
+            && na.width() == nb.width()
+            && symbolic(meter, &na, &nb, &mut report)?
+        {
+            report.verdict = Verdict::Proved;
+            report.cert = Some(Cert::Symbolic);
+        }
     }
     // A refutation comes with an input where the sides differ; one without would be a bug
     // (decided nothing).
@@ -3022,6 +3045,8 @@ const CARRY_SHIFT: u16 = 8;
 enum Serial {
     Const(BitVec),
     Var(u32),
+    /// A variable narrower than the circuit, zero-extended: its bit below its width, else 0.
+    VarBelow(u32, u16),
     Not(usize),
     And(usize, usize),
     Or(usize, usize),
@@ -3043,7 +3068,9 @@ enum Serial {
 /// through every input bit combination at every position, the two sides agree everywhere or a
 /// path gives an input where they differ. Exact at the width, whatever carries propagate
 /// (`(y + y) & y & −y` is 0: no bit of `y` both follows a set bit and has none below it). Up to
-/// [`CARRY_BITS`] bits of state and six variables; charged as node evaluations.
+/// [`CARRY_BITS`] bits of state and six variables; charged as node evaluations. A variable
+/// narrower than the width read only through a zero extension (as `decast` writes narrow
+/// variables) is one whose bits above its width are 0.
 pub(crate) fn carries<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -3054,7 +3081,7 @@ pub(crate) fn carries<M: Meter>(
         return Ok(false);
     };
     let t = a.vars().len();
-    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 || a.vars().iter().any(|&v| v != w) {
+    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 || a.vars().iter().any(|&v| v > w) {
         return Ok(false);
     }
     // Both sides as one circuit (live nodes only, equal ones once: they share their state).
@@ -3070,7 +3097,20 @@ pub(crate) fn carries<M: Meter>(
                 continue;
             }
             if n.width != w {
+                // A narrow variable is read through its zero extension (below).
+                if matches!(n.op, MOp::Var(_)) {
+                    continue;
+                }
                 return Ok(false);
+            }
+            if n.op == MOp::Zext {
+                let arg = m.nodes()[n.args[0] as usize];
+                let MOp::Var(v) = arg.op else {
+                    return Ok(false);
+                };
+                circuit.push(Serial::VarBelow(v, arg.width.bits()));
+                map[i] = circuit.len() - 1;
+                continue;
             }
             let mut key = [0usize; 2];
             for (k, slot) in key.iter_mut().enumerate().take(n.op.arity()) {
@@ -3225,6 +3265,7 @@ pub(crate) fn carries<M: Meter>(
                     bits[k] = match *s {
                         Serial::Const(c) => c.bit(j).unwrap_or(false),
                         Serial::Var(v) => x >> v & 1 == 1,
+                        Serial::VarBelow(v, n) => j < n && x >> v & 1 == 1,
                         Serial::Not(p) => !bits[p],
                         Serial::And(p, q) => bits[p] & bits[q],
                         Serial::Or(p, q) => bits[p] | bits[q],
@@ -3271,7 +3312,8 @@ pub(crate) fn carries<M: Meter>(
                     report.cert = Some(Cert::Carries);
                     report.counterexample = Some(
                         vals.iter()
-                            .map(|&v| BitVec::wrapping_from_u64(w, v))
+                            .zip(a.vars())
+                            .map(|(&v, &vw)| BitVec::wrapping_from_u64(vw, v))
                             .collect(),
                     );
                     return Ok(true);

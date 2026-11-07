@@ -545,8 +545,20 @@ fn check_lanes(cx: &mut Context, e: Expr, syms: &[(Expr, Vec<BitVec>)]) {
 /// in tiny formats, in every mode.
 #[test]
 fn float_circuits_agree_exhaustively_in_tiny_formats() {
+    float_circuits_agree(&[(2, 3), (3, 3)]);
+}
+
+/// [`float_circuits_agree_exhaustively_in_tiny_formats`] in the two larger tiny formats (a
+/// binary operation's cases grow as the square of the format's width).
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn float_circuits_agree_exhaustively_in_larger_tiny_formats() {
+    float_circuits_agree(&[(2, 4), (3, 4)]);
+}
+
+fn float_circuits_agree(formats: &[(u32, u32)]) {
     use crate::fp::{FpFormat, FpOp, RoundingMode};
-    for (eb, sb) in [(2u32, 3u32), (3, 3), (2, 4), (3, 4)] {
+    for &(eb, sb) in formats {
         let f = FpFormat::new(eb, sb).unwrap();
         let w = f.width();
         let n = 1u64 << w.bits();

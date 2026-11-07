@@ -734,10 +734,15 @@ impl Poly {
     /// which has every precision) leaves no term of that shape (modulo precision), the shape
     /// becomes that one unmasked term. Expansions over `limit` monomials are not tried.
     ///
-    /// A monomial with a symbol of `nulls` (masked conjunctions known to be zero) is zero
+    /// A monomial with a symbol `null_sym` holds (a masked conjunction known to be zero) is zero
     /// whatever its coefficient: such a class takes the others' coefficient
     /// (`2·(a & b & M₁)` is `2·(a & b)` when `a & b & M₀` is zero).
-    pub(crate) fn declass(&self, classes: &Classes, limit: usize, nulls: &[Sym]) -> Poly {
+    pub(crate) fn declass(
+        &self,
+        classes: &Classes,
+        limit: usize,
+        null_sym: &dyn Fn(&Sym) -> bool,
+    ) -> Poly {
         let w = self.w;
         if classes.len() <= 1 {
             return self.clone();
@@ -771,7 +776,7 @@ impl Poly {
             db.cmp(&da).then_with(|| a.cmp(b))
         });
         shapes.dedup();
-        let null = |m: &Mono| m.iter().any(|(s, _)| nulls.contains(s));
+        let null = |m: &Mono| m.iter().any(|(s, _)| null_sym(s));
         // The lowest position a monomial's symbols can take: its coefficient's precision.
         let tau = |m: &Mono| -> u32 {
             m.iter()
@@ -796,7 +801,7 @@ impl Poly {
                 // Class 0's monomial is zero or absent: with every exponent 1 each monomial of
                 // the expansion has the unmasked coefficient, so the present one of the most
                 // precision gives it (the check below decides).
-                _ if !nulls.is_empty() && sh.iter().all(|&(_, e)| e == 1) => {
+                _ if sh.iter().all(|&(_, e)| e == 1) => {
                     let Some((_, c)) = by_shape
                         .get(&sh)
                         .into_iter()

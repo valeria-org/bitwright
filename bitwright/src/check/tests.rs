@@ -341,10 +341,16 @@ fn trusted_compiles_are_the_same_programs() {
     }
 }
 
+/// The checker's pass over the core corpus, once: `corpus_is_sound` and
+/// `corpus_ledger_is_fresh` read the same checks.
+fn corpus_checks() -> &'static Vec<RuleCheck> {
+    static CHECKS: std::sync::OnceLock<Vec<RuleCheck>> = std::sync::OnceLock::new();
+    CHECKS.get_or_init(|| check_program(&core(), &CheckConfig::default()))
+}
+
 #[test]
 fn corpus_is_sound() {
-    let p = core();
-    for c in check_program(&p, &CheckConfig::default()) {
+    for c in corpus_checks() {
         assert!(c.is_sound(), "{}: {:?} ({})", c.name, c.verdict, c.evidence);
         assert!(
             c.evidence.guard_true_cases() > 0,
@@ -459,8 +465,7 @@ fn preempted_finds_rules_that_never_fire() {
 
 #[test]
 fn corpus_ledger_is_fresh() {
-    let p = core();
-    let ledger = Ledger::from_checks(&check_program(&p, &CheckConfig::default()));
+    let ledger = Ledger::from_checks(corpus_checks());
     let checked_in = Ledger::parse(CORE_LEDGER).unwrap();
     let diff = ledger.diff(&checked_in);
     assert!(
@@ -496,7 +501,14 @@ fn write_corpus_ledger() {
 /// The checker proves each rule's semantics; this proves the engine-side reading of it.
 #[test]
 fn corpus_application_is_sound() {
-    application_is_sound(&core());
+    application_is_sound(&core(), 200, 6000);
+}
+
+/// [`corpus_application_is_sound`] with three times the instances per rule.
+#[test]
+#[ignore = "heavy: run with --release -- --ignored"]
+fn corpus_application_is_sound_heavy() {
+    application_is_sound(&core(), 600, 6000);
 }
 
 /// Sound rules that exercise the guard and template features the corpus does not: `nonzero`,
@@ -527,10 +539,12 @@ fn fixture_application_is_sound() {
     for c in check_program(&p, &CheckConfig::default()) {
         assert!(c.is_sound(), "{}: {:?} ({})", c.name, c.verdict, c.evidence);
     }
-    application_is_sound(&p);
+    application_is_sound(&p, 600, 6000);
 }
 
-fn application_is_sound(p: &RuleProgram) {
+/// `rounds` instances per rule, and up to `more` for a rule that has not fired yet (a guard
+/// on facts random operands rarely prove).
+fn application_is_sound(p: &RuleProgram, rounds: usize, more: usize) {
     use crate::expr::FnEnv;
     use crate::rules::ParamKind;
     use crate::testutil::{Gen, Rng};
@@ -551,10 +565,8 @@ fn application_is_sound(p: &RuleProgram) {
             .filter(|ws| ws.iter().all(|&w| w <= 5))
             .filter(|ws| crate::rules::eval::well_formed(rule, rule.lhs, ws, true).is_ok())
             .collect();
-        // 600 instances, and up to ten times as many for a rule that has not fired yet (a
-        // guard on facts random operands rarely prove).
-        for round in 0..6000 {
-            if round >= 600 && fired > 0 {
+        for round in 0..more {
+            if round >= rounds && fired > 0 {
                 break;
             }
             let ws = &assignments[round % assignments.len()];

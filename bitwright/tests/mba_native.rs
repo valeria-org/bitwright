@@ -806,3 +806,139 @@ fn every_budget_is_safe() {
     }
     let _ = MNode::clone;
 }
+
+/// A register read through its low half is a narrow variable to the solver and the
+/// certificates (see `mba::decast`): the polynomial identity
+/// `c·(Z(A&B)·Z(A|B) + Z(A&~B)·Z(~A&B)) = c·Z(A)·Z(B)` over `A = trunc<32>(x)`,
+/// `B = trunc<32>(y)` and `Z = zext<64>` is decided like its spelling over 32-bit variables,
+/// where the lifter spelling used to stay behind masks the certificates could not prove.
+#[test]
+fn a_register_read_through_its_low_half_is_a_narrow_variable() {
+    let o = ParseOptions::width(Width::W64);
+    let z = |e: &str| format!("zext<64>({e})");
+    let term = |a: &str, b: &str, c: u32| {
+        format!(
+            "{c} * ({} * {} + {} * {})",
+            z(&format!("{a} & {b}")),
+            z(&format!("{a} | {b}")),
+            z(&format!("{a} & ~{b}")),
+            z(&format!("~{a} & {b}"))
+        )
+    };
+    let lift = format!(
+        "{} + {} + q",
+        term("trunc<32>(x)", "trunc<32>(y)", 3),
+        term("trunc<32>(y)", "trunc<32>(w)", 5)
+    );
+    let narrow = format!(
+        "{} + {} + q",
+        term("x:32", "y:32", 3),
+        term("y:32", "w:32", 5)
+    );
+    let want_lift =
+        "(x & 0xffffffff) * (y & 0xffffffff) * 3 + (y & 0xffffffff) * (w & 0xffffffff) * 5 + q";
+    let want_narrow = "zext<64>(x) * zext<64>(y) * 3 + zext<64>(y) * zext<64>(w) * 5 + q";
+    for (src, want) in [(lift, want_lift), (narrow, want_narrow)] {
+        let mut cx = Context::new();
+        let e = cx.parse(&src, &o).unwrap();
+        let goal = cx.parse(want, &o).unwrap();
+        let out = native().run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0].expr;
+        assert_equivalent(&mut cx, e, r, &src);
+        let (got, limit) = (dag_size(&mut cx, r), dag_size(&mut cx, goal));
+        assert!(
+            got <= limit,
+            "`{src}` gave `{}` ({got} nodes), want `{want}` ({limit})",
+            cx.display(r)
+        );
+        assert_eq!(out.stats.mba.proof_unknown, 0, "`{src}`");
+    }
+}
+
+/// A fragment whose casts hide its mix of operators is still a question: `sext(a) · sext(~a)`
+/// is a product over a xor, a subtraction and a mask once its sign extensions are written out,
+/// so the MBA phase asks the solver (the shape is judged without the casts, see
+/// `mba::decast`). (Sums of such terms the core passes now settle before the MBA phase.)
+#[test]
+fn a_mix_hidden_by_casts_is_asked() {
+    let o = ParseOptions::width(Width::W64);
+    for src in [
+        "sext<64>(a:32) * sext<64>(~a:32)",
+        "zext<64>(a:32) * zext<64>(~a:32) + zext<64>(b:32)",
+        "sext<64>(a:32) * (sext<64>(a:32 & b:32) - sext<64>(a:32))",
+    ] {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &o).unwrap();
+        let out = native().run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(
+            out.stats.mba.calls >= 1,
+            "`{src}` was not asked: {:?}",
+            out.stats.mba
+        );
+        assert_equivalent(&mut cx, e, out.roots[0].expr, src);
+    }
+}
+
+/// Sign and zero extensions of narrow variables: the normal form knows a zero extension is
+/// zero above its operand's width, reads bitwise operations over sign extensions as sign
+/// extensions of the operation, and renders back `sext(v)` and `zext(f(…))` (see
+/// `mba::nf`); the certificates take such variables as their own bits.
+#[test]
+fn extensions_of_narrow_variables_are_read_and_written() {
+    let o = ParseOptions::width(Width::W64);
+    let cases = [
+        ("sext<64>(a:32) + sext<64>(~a:32)", "-1"),
+        ("zext<64>(a:32) + zext<64>(~a:32)", "0xffffffff"),
+        (
+            "(sext<64>(a:32) ^ sext<64>(b:32)) + 2 * (sext<64>(a:32) & sext<64>(b:32))",
+            "sext<64>(a) + sext<64>(b)",
+        ),
+        ("sext<64>(a:32) - sext<64>(a:32 & b:32)", "sext<64>(a & ~b)"),
+        ("zext<64>(a:32) - zext<64>(a:32 & b:32)", "zext<64>(a & ~b)"),
+        (
+            "(zext<64>(a:32) | zext<64>(b:32)) - (zext<64>(a:32) & zext<64>(b:32))",
+            "zext<64>(a ^ b)",
+        ),
+        ("~sext<64>(a:32) & sext<64>(b:32)", "sext<64>(~a & b)"),
+        (
+            "sext<64>(a:32 ^ b:32) - 2 * (~sext<64>(a:32) & sext<64>(b:32))",
+            "sext<64>(a) - sext<64>(b)",
+        ),
+        (
+            "sext<64>(a:32) * 2 - sext<64>(a:32 & b:32) * 2",
+            "sext<64>(a & ~b) * 2",
+        ),
+        // The spelling the solver itself once left behind (a fixpoint of the whole simplifier).
+        (
+            "0xffffffff7fffffff - (zext<64>(a:32) ^ 0xffffffff7fffffff)",
+            "sext<64>(a)",
+        ),
+        ("(zext<64>(a:32) ^ 0x80000000) - 0x80000000", "sext<64>(a)"),
+        (
+            "(sext<64>(a:32) + sext<64>(b:32) ^ sext<64>(c:32)) + sext<64>(a:32 | c:32) \
+             - (~sext<64>(a:32) & sext<64>(c:32)) - sext<64>(a:32)",
+            "sext<64>(a) + sext<64>(b) ^ sext<64>(c)",
+        ),
+        (
+            "(zext<64>(a:32) + zext<64>(b:32) ^ zext<64>(c:32)) + zext<64>(a:32 & c:32) \
+             + zext<64>(a:32 | c:32) - zext<64>(a:32) - zext<64>(c:32)",
+            "zext<64>(a) + zext<64>(b) ^ zext<64>(c)",
+        ),
+    ];
+    for (src, want) in cases {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &o).unwrap();
+        let goal = cx.parse(want, &o).unwrap();
+        let out = native().run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0].expr;
+        assert_equivalent(&mut cx, e, r, src);
+        let (got, limit) = (dag_size(&mut cx, r), dag_size(&mut cx, goal));
+        assert!(
+            got <= limit,
+            "`{src}` gave `{}` ({got} nodes), want `{want}` ({limit})",
+            cx.display(r)
+        );
+        assert_eq!(out.stats.mba.proof_unknown, 0, "`{src}`");
+        assert_eq!(out.stats.mba.refuted, 0, "`{src}`");
+    }
+}

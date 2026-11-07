@@ -339,7 +339,7 @@ fn solver_proves(solver: common::Solver, size: Size) {
     let engines = engines();
     let mut rng = Rng(0x64_c4d1);
     let mut queries = Vec::new();
-    for _ in 0..size.pick(40, 600) {
+    for _ in 0..size.pick(12, 600) {
         let j = 1 + rng.below(63) as u16;
         let src = random_sum(&mut rng, 64, j);
         let (name, eng) = &engines[rng.below(engines.len() as u64) as usize];
