@@ -642,6 +642,38 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
     }
 }
 
+/// The leaves of the tree of `op` at `n`, left to right, when there are at most `N`. It reads
+/// from the top and stops as soon as the nodes it holds must give more: a tree of `k` leaves
+/// takes `2k − 1` steps and a larger one at most `2N`, however deep it is. (Read by recursion
+/// to the bottom first, every node of a chain of 128 000 additions cost its depth, 29 s in
+/// all, and one of 80 000 overflowed a 2 MiB stack.)
+fn leaves<const N: usize>(cx: &Context, n: u32, op: OpCode) -> Option<([u32; N], usize)> {
+    let mut out = [0; N];
+    let mut len = 0;
+    // The nodes still to read, the next one last. Each gives at least one leaf, so `len + top`
+    // never passes `N`.
+    let mut todo = [0; N];
+    let mut top = 1;
+    *todo.first_mut()? = n;
+    while top > 0 {
+        top -= 1;
+        let i = todo[top];
+        let node = cx.node(i);
+        if node.op == op {
+            if len + top + 2 > N {
+                return None;
+            }
+            todo[top] = node.b;
+            todo[top + 1] = node.a;
+            top += 2;
+        } else {
+            out[len] = i;
+            len += 1;
+        }
+    }
+    Some((out, len))
+}
+
 /// multiplicative leaves of one term, bounded so factor search never turns a large
 /// product into pass work proportional to its tree.
 #[derive(Copy, Clone)]
@@ -653,26 +685,8 @@ struct Product {
 const MAX_PRODUCT_FACTORS: usize = 8;
 
 fn product(cx: &Context, n: u32) -> Option<Product> {
-    fn collect(cx: &Context, n: u32, out: &mut Product) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Mul {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.factors.len() {
-            out.factors[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Product {
-        factors: [0; MAX_PRODUCT_FACTORS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (factors, len) = leaves(cx, n, OpCode::Mul)?;
+    Some(Product { factors, len })
 }
 
 /// Additive terms of one sum, bounded for the same reason as [`Product`].
@@ -685,26 +699,8 @@ struct Sum {
 const MAX_SUM_TERMS: usize = 16;
 
 fn sum(cx: &Context, n: u32) -> Option<Sum> {
-    fn collect(cx: &Context, n: u32, out: &mut Sum) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Add {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.terms.len() {
-            out.terms[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Sum {
-        terms: [0; MAX_SUM_TERMS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (terms, len) = leaves(cx, n, OpCode::Add)?;
+    Some(Sum { terms, len })
 }
 
 /// A structurally shared factor and its position in every product, preferring a non-constant.

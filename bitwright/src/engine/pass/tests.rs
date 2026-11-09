@@ -443,6 +443,71 @@ fn a_rebuilt_node_counts_the_users_still_to_be_rebuilt() {
     }
 }
 
+/// Factoring reads a sum's terms and a term's factors from the top, and no more of them than
+/// it may factor: a sum of 100 000 terms, and a product of as many factors under a sum, are
+/// simplified on a stack of the size a thread gets by default. Read by recursion to the bottom
+/// of the chain, each overflowed it.
+#[test]
+fn factoring_reads_long_sums_and_products_from_the_top() {
+    let run = || {
+        let eng = engine(vec![Phase::Linear]);
+        for op in [BinOp::Add, BinOp::Mul] {
+            let mut cx = Context::new();
+            let s = symbols(&mut cx, 100_000, Width::W64);
+            let mut e = chain(&mut cx, op, &s);
+            if op == BinOp::Mul {
+                let x = cx.symbol("x", Width::W64).unwrap();
+                e = cx.bin(BinOp::Add, e, x).unwrap();
+            }
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert_eq!(out.roots[0].end, End::Completed, "{op:?}");
+        }
+    };
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Terms that read one condition are merged over the same spelling of it however the nodes
+/// were built. A form's terms are in the order of their nodes, `Context::import` builds
+/// operands right to left and the parser left to right; `zext(c) - zext(~c)` is
+/// `2·zext(c) - 1` or `1 - 2·zext(~c)`, and over a `1` the sum already reads only the second
+/// is smaller than it. Merged over the first term, the sum was left as written or not by the
+/// order its nodes were built in, so a result changed again once imported.
+#[test]
+fn conditions_merge_whatever_the_order_of_construction() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for src in [
+            "let a = udiv(1, x); zext<8>(x <=s a) - zext<8>(a <s x)",
+            "let a = udiv(1, x); zext<8>(a <s x) - zext<8>(x <=s a)",
+            "let a = udiv(1, x); zext<8>(x <u a) - zext<8>(a <=u x)",
+            "let a = udiv(1, x); zext<8>(x != a) - zext<8>(x == a)",
+        ] {
+            let mut parsed = Context::new();
+            let e = parsed.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+            let mut imported = Context::new();
+            let i = imported.import(&parsed, &[e]).unwrap()[0];
+            let (e, i) = (
+                eng.simplify(&mut parsed, e).unwrap().expr,
+                eng.simplify(&mut imported, i).unwrap().expr,
+            );
+            assert_eq!(
+                parsed.display(e).to_string(),
+                imported.display(i).to_string(),
+                "{src}"
+            );
+        }
+    }
+}
+
 #[test]
 fn linear_charges_pass_work() {
     let eng = engine(vec![Phase::Linear]);

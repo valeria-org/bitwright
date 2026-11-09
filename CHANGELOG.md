@@ -111,6 +111,23 @@ Defects in the driver and the normal forms, found reading the engine:
   `p & z`; putting that chain in order (`p & x & z`) built a second copy of it. Over 400 random
   DAGs of 200 nodes, results are smaller in 70 and larger in 7 with one root, and with four
   roots over one shared term 43 results are larger than their input, from 73.
+- **Long sums and products in the linear pass's factoring.** `a·x + a·y` is factored over a
+  sum of up to 16 terms of up to 8 factors, and the pass read a sum's terms and a term's
+  factors by recursion to the bottom of the chain before that bound applied, at every node of
+  it. A left-nested sum of 80 000 terms, or `v0 * … * v79999 + x`, overflowed a 2 MiB thread
+  stack (the process aborts), and below that a sum cost the square of its length outside any
+  budget: 32 000 terms took 1.5 s and 128 000 took 29 s, each `Completed`. Both are read from
+  the top now, in at most 32 steps: 140 ms and 0.58 s, as a chain of subtractions takes, and
+  100 000 terms or factors on that stack. Results are the same.
+- **Conditions merged in one spelling, whatever the order of construction.** Where two terms
+  of a sum read one condition (`zext(c) - zext(~c)`), the linear pass merged them over the
+  spelling of the first term, and a form's terms are in the order their nodes were built:
+  `zext<8>(x <=s a) - zext<8>(a <s x)` with `a = udiv(1, x)` stayed as written when parsed and
+  became `1 - (zext<8>(a <s x) << 1)` once imported into another context
+  (`Context::import` builds operands right to left), so a result could change again when
+  simplified there. The spelling kept is now the one that is no complement, then the first in
+  the context's order. Of 4 000 000 random inputs per preset, three changed again in a fresh
+  context, each through this; none does now.
 - **Sums and xors over 64 terms.** A form of more than 64 terms is an atom of the forms over
   it, which keeps every node's form small, and so nothing cancelled through it:
   `(v0 + … + v69) - v0` was left as written, and so was the same sum minus itself in another
