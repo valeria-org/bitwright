@@ -4997,6 +4997,81 @@ fn masked_bitwise_fixtures() {
     }
 }
 
+/// Limb arithmetic: a sum or difference computed digit by digit, the carry between the digits
+/// written as a comparison of the low ones, is the sum or difference.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_carry_fixtures() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        // The high digits and the carry into them are the high digit of the sum.
+        (
+            "zext<64>(extract<3, 5>(x) + extract<3, 5>(y) \
+             + zext<5>(trunc<3>(x + y) <u trunc<3>(x)))",
+            "zext<64>(extract<3, 5>(x + y))",
+        ),
+        // The halves joined with a shift, not a `concat`.
+        (
+            "((x >>u 21) + (y >>u 21) + zext<64>((x + y & 0x1fffff) <u (x & 0x1fffff)) << 21) \
+             | (x + y & 0x1fffff)",
+            "x + y",
+        ),
+        (
+            "((x >>u 21) - (y >>u 21) - zext<64>((x & 0x1fffff) <u (y & 0x1fffff)) << 21) \
+             | (x - y & 0x1fffff)",
+            "x - y",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 64), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: comparisons of digits held in wider registers, and their borrow tests.
+#[test]
+fn limb_compare_fixtures() {
+    let eng = Engine::standard();
+    for (src, want) in [
+        // Both sides fit in 21 bits: compared there, the masks gone.
+        (
+            "(x & 0x1fffff) <u (y & 0x1fffff)",
+            "trunc<21>(x) <u trunc<21>(y)",
+        ),
+        (
+            "(x & 0x1fffff) == (y & 0x1fffff)",
+            "trunc<21>(y) == trunc<21>(x)",
+        ),
+        // A signed order of values whose sign bits are known zero is the unsigned one.
+        (
+            "(x & 0x1fffff) <s (y & 0x1fffff)",
+            "trunc<21>(x) <u trunc<21>(y)",
+        ),
+        // A digit shared by two comparisons holds neither back.
+        (
+            "zext<32>((trunc<32>(y) & 0x3fff) <u (trunc<32>(z) & 0x3fff)) \
+             + zext<32>((trunc<32>(y) & 0x3fff) <u (trunc<32>(x) & 0x3fff))",
+            "let %0 = trunc<14>(y);\nzext<32>(%0 <u trunc<14>(z)) + zext<32>(%0 <u trunc<14>(x))",
+        ),
+        // The borrow test `~((b - a == 0) | (b <u a))` is `a <u b`, also where the difference
+        // is spelled with a negation, and where that negation is used again.
+        (
+            "sext<32>(~((-(trunc<32>(x) & 0x3fff) + (trunc<32>(y) & 0x3fff) == 0) \
+             | ((trunc<32>(y) & 0x3fff) <u (trunc<32>(x) & 0x3fff))))",
+            "sext<32>(trunc<14>(x) <u trunc<14>(y))",
+        ),
+        (
+            "zext<64>(~((-(x & 0x3fff) + (y & 0x3fff) == 0) | ((y & 0x3fff) <u (x & 0x3fff)))) \
+             + -(x & 0x3fff)",
+            "let %0 = x & 16383;\nzext<64>(%0 <u y & 16383) - %0",
+        ),
+        ("-x + y == 0", "x == y"),
+        ("-x + y != 0", "x != y"),
+        ("trunc<14>(x - y) == 0", "trunc<14>(x) == trunc<14>(y)"),
+        ("trunc<14>(x - y) != 0", "trunc<14>(x) != trunc<14>(y)"),
+    ] {
+        assert_eq!(simplify(&eng, src, 64), want, "{src}");
+    }
+}
+
 #[test]
 fn order_bit_subset_fixtures() {
     let eng = Engine::standard();
@@ -5017,10 +5092,11 @@ fn order_bit_subset_fixtures() {
             "select(trunc<16>(x) <u trunc<16>(x & y), trunc<16>(x), trunc<16>(x & y))",
             "trunc<16>(x & y)",
         ),
-        // Undecided where a bit of the mask escapes the window, or equality is possible.
+        // Undecided where a bit of the mask escapes the window, or equality is possible (here
+        // compared at the two bits both sides fit in).
         (
             "zext<16>(extract<32, 1>(y)) <u extract<32, 16>(~x & (y & 0x340050000))",
-            "zext<16>(extract<32, 1>(y)) <u extract<32, 16>(~x & (y & 0x340050000))",
+            "zext<2>(extract<32, 1>(y)) <u ~extract<32, 2>(x) & extract<32, 2>(y)",
         ),
         (
             "trunc<16>(x) <u trunc<16>(x | y)",

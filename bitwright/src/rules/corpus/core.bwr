@@ -102,6 +102,29 @@ group core.compare {
     #[example("p - q == 0" => "p == q")]
     rule eq_sub_zero<W>(a: W, b: W) { (a - b) == 0 => a == b }
 
+    /// A zero difference spelled with a negation is equality (the linear pass writes `-a + b`
+    /// as `b - a` only where that frees the negation, so not where it is shared, as the borrow
+    /// tests of limb arithmetic share it: `~((-a + b == 0) | (b <u a))`).
+    #[example("-p + q == 0" => "p == q")]
+    rule eq_neg_add_zero<W>(a: W, b: W) { -a + b == 0 => a == b }
+
+    /// A nonzero difference spelled with a negation is inequality.
+    #[example("-p + q != 0" => "p != q")]
+    rule ne_neg_add_zero<W>(a: W, b: W) { -a + b != 0 => a != b }
+
+    /// A zero difference in the low bits is equality of the low bits (`sub_trunc_pair` writes
+    /// `trunc(a) - trunc(b)` as `trunc(a - b)`, out of `eq_sub_zero`'s reach).
+    #[example("trunc<4>(p - q) == 0" => "trunc<4>(p) == trunc<4>(q)")]
+    rule eq_trunc_sub_zero<W, N>(a: W, b: W) where N < W {
+        trunc<N>(a - b) == 0 => trunc<N>(a) == trunc<N>(b)
+    }
+
+    /// A nonzero difference in the low bits is inequality of the low bits.
+    #[example("trunc<4>(p - q) != 0" => "trunc<4>(p) != trunc<4>(q)")]
+    rule ne_trunc_sub_zero<W, N>(a: W, b: W) where N < W {
+        trunc<N>(a - b) != 0 => trunc<N>(a) != trunc<N>(b)
+    }
+
     /// A zero xor is equality.
     #[example("(p ^ q) == 0" => "p == q")]
     rule eq_xor_zero<W>(a: W, b: W) { (a ^ b) == 0 => a == b }

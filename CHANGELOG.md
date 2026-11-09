@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and
+tested for borrows, from a corpus of 58,530 windowed expressions of a devirtualizer's limb
+engine.
+
+- **A comparison is made at the width both sides fit in.** The invert pass compared truncations
+  at their own width only where the full width decided nothing else. Where the known bits bound
+  both sides of any comparison to `k` low bits, it now compares their low `k` bits, the
+  narrowing pushed into each side, and a signed order becomes the unsigned one (both sign bits
+  are zero): `(x & 0x1fffff) <u (y & 0x1fffff)` is `trunc<21>(x) <u trunc<21>(y)`. It commits
+  where the DAG gets no larger and, on a tie, the tree gets smaller, so a digit shared by two
+  comparisons no longer holds both back.
+- **A zero difference spelled with a negation is equality** (`eq_neg_add_zero`,
+  `ne_neg_add_zero`): `-a + b == 0` is `a == b`. The linear pass writes `-a + b` as `b - a` only
+  where that frees the negation, so the borrow test `~((-a + b == 0) | (b <u a))`, which shares
+  it, stayed; it is `a <u b` now.
+- **A zero difference in the low bits is equality of the low bits** (`eq_trunc_sub_zero`,
+  `ne_trunc_sub_zero`): `trunc<14>(a - b) == 0` is `trunc<14>(a) == trunc<14>(b)`.
+- **A mask that is a slice is written as one on a tie.** The shuffle pass commits
+  `zext(extract(x))` for a mask of a narrower slice also where the DAG only ties and the tree
+  gets smaller: the masks of one digit share their constant, and each alone freed nothing.
+- **A sum split into digits with a shift is read like one split with `concat`.** The carries
+  pass reads `(hi << k) | lo` (or `+`, `^`, `-`) and constant `>>u` slices as it reads `concat`
+  and `extract`, where the region also compares (the carry written `lo(s) <u lo(x)`), and its
+  atoms may be of any width up to 64 bits: `((x >>u 21) + (y >>u 21) + zext(carry) << 21) |
+  (x + y & 0x1fffff)` is `x + y`.
+- **A carry written as a comparison of low digits is read as the high digits it completes.**
+  `[lo(P) <u lo(Q)] = hi(P) − hi(Q) − hi(P − Q)`, so `hi(a) + hi(b) + [lo(a + b) <u lo(a)]` is
+  `hi(a + b)`. The carries pass rewrites a sum that fits no affine form this way where that
+  leaves it fewer terms and the DAG smaller. A side of the comparison that is no low digit is
+  read as one where its known bits put it below `2^k`, or where it is `k` bits wide with the
+  narrowing pushed into it.
+- **Two neighbouring slices of one bitwise value are one slice.** The casts pass reads
+  `concat(hi(a) | hi(b), lo(a | b))` as the slice of `a | b` that covers both.
+
+On that corpus the results have about 13 percent fewer DAG nodes on the local windows and 10 to
+11 percent fewer on the deep ones, and 22 of the 234 that ran out of budget now finish.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths

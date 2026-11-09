@@ -3,6 +3,8 @@
 
 pub(crate) mod bitwise;
 #[cfg(feature = "prove")]
+mod borrows;
+#[cfg(feature = "prove")]
 pub(super) mod carries;
 mod cases;
 pub(super) mod casts;
@@ -1040,6 +1042,22 @@ pub(super) fn shrinks(
     atoms: &[u32],
 ) -> Result<Result<(), Fin>, Stop> {
     pays(r, cx, n, e, atoms, false)
+}
+
+/// Whether replacing `n` by `e` leaves the DAG no larger and makes `n` a strictly smaller tree:
+/// for a candidate nothing rewrites back, where rewrites that each only tie, because they share
+/// what they would free, together make the DAG smaller (two comparisons narrowed from the same
+/// wide operand). Each such step still decreases (DAG size, tree size), so they terminate.
+pub(super) fn ties_smaller(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Result<(), Fin>, Stop> {
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    let tie = tree(n) != u32::MAX && tree(e) < tree(n);
+    pays(r, cx, n, e, atoms, tie)
 }
 
 /// [`shrinks`], or with `tie` whether replacing `n` by `e` leaves the DAG no larger.

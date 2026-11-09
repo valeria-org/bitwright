@@ -503,17 +503,38 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
 
 /// The linear-MBA pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    Ok(solve(r, cx, n, true)?.0)
+}
+
+/// The cheapest form of the linear MBA at `n`, built whatever it costs and committed nowhere:
+/// for a caller that measures the result itself. `None` when `n` is no mixed fragment.
+#[cfg(feature = "prove")]
+pub(super) fn normal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<u32>, Stop> {
+    Ok(solve(r, cx, n, false)?.1)
+}
+
+/// [`step`] when `commit`; else the form alone ([`normal`]).
+fn solve(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    commit: bool,
+) -> Result<(Step, Option<u32>), Stop> {
     let op = cx.node(n).op;
     if !(is_linear(op) || is_bitwise(op)) || !interior(cx, n, Mode::Linear) {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok((Step::Normal(Fin::FINAL), None));
     }
     let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
         count(r).atomized += 1;
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok((Step::Normal(Fin::FINAL), None));
     };
     // Pure linear or pure bitwise regions belong to those passes.
     if !reg.mixed || reg.bounds.is_empty() {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok((Step::Normal(Fin::FINAL), None));
     }
     let w = cx.width_of(n);
     // The lifted atoms are built now: `before` lets a rejection discard them.
@@ -522,7 +543,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let t = reg.atoms.len();
     if t > MAX_ATOMS {
         count(r).atomized += 1;
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok((Step::Normal(Fin::FINAL), None));
     }
     let lifted = reg.lifts.len() as u32;
     r.meter
@@ -609,12 +630,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     cands.sort_by_key(|c| c.0);
     let Some((est, cand)) = cands.into_iter().next() else {
         super::discard(r, cx, before);
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok((Step::Normal(Fin::FINAL), None));
     };
-    if let Some(f) = worth_building(r, cx, n, &reg.bounds, est + lifted)? {
+    if commit && let Some(f) = worth_building(r, cx, n, &reg.bounds, est + lifted)? {
         count(r).rejected_cost += 1;
         super::discard(r, cx, before);
-        return Ok(Step::Normal(f));
+        return Ok((Step::Normal(f), None));
     }
     let kind = match &cand {
         Candidate::Affine(..) => "affine",
@@ -656,12 +677,15 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     };
     let e = linear::emit(r, cx, &form)?;
+    if !commit {
+        return Ok((Step::Normal(Fin::FINAL), Some(e)));
+    }
     r.explain_with(|| crate::engine::Explanation::LinearMba {
         atoms: reg.atoms.iter().map(|&a| cx.handle(a)).collect(),
         corners: sig.clone(),
         form: kind,
     });
-    finish(
+    let step = finish(
         r,
         cx,
         PassKind::LinearMba,
@@ -670,5 +694,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         before,
         &reg.bounds,
         Fin::FINAL,
-    )
+    )?;
+    Ok((step, None))
 }
