@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths
+(17, 20, 23, 34 bits inside 64-bit registers); none of them was specific to odd widths.
+
+- **A constant read on a low prefix is its residue there.** The demanded-bits pass took a
+  constant operand as it stood, so a multiplier that is an inverse modulo `2^17` and none at 64
+  bits survived its mask: `(x * 43 * 0xbe83) & 0x1ffff` stayed `x * 0x200001 & 0x1ffff`.
+  Under a low prefix of `k` bits, a constant is now replaced by its residue modulo `2^k`,
+  extended with zeros or with its sign, whichever is the smaller in magnitude, and a factor that
+  is −1 there negates: that example is `x & 0x1ffff`, and `(x * 0x3ffff) & 0x1ffff` is
+  `-x & 0x1ffff`. A residue of 0 is left to the facts, so `Hooks::fold_known` still decides it.
+- **An extract of a sum splits where the carry into it is decided.** The casts pass pushed
+  `extract<lo, n>` through `+` and `−` above bit `lo` only when an operand's low `lo` bits were
+  known zero. It now runs the carry from bit 0 up to `lo` over both operands' known bits (a bit
+  known zero in both stops it, one known one in both makes one, a known carry passes a bit known
+  to differ), so a lane of packed values with guard bits is read alone:
+  `extract<21, 20>((x & 0x3ffffdffffefffff) + (y & 0x3ffffdffffefffff))` is
+  `extract<21, 20>(x) + extract<21, 20>(y)`, and a decided borrow adds its `− 1`. A left shift
+  that straddles a truncation is pushed as the operand's low bits shifted at the narrow width
+  (`trunc<8>(zext<16>(a) << 3)` is `a << 3`).
+- **A sum split at any boundary is recombined.** The carries pass read only `& | ^ ~` and
+  constant left shifts. Below a `concat` it now also reads `+ − neg`, `extract`, `zext`, `sext`
+  and `<u`, down to atoms of the `concat`'s width, fits the affine form and proves it as before:
+  `x + y` added as 17 low bits at 18 bits and 47 high bits plus the low sum's top bit is
+  `x + y` again, and so are a 23/41 split with the carry as `s <u trunc<23>(x)` and the same
+  for differences and borrows; a split missing its carry, or reading it a bit too low, is
+  refuted.
+- **Equalities through permutation polynomials.** The pivot analysis took a product of two
+  values that both vary as reading every bit at and below each output bit, with no pivots, so
+  `2x² + x`, a bijection modulo every power of two, was not one to it. A product now reads `a`'s
+  bits up to `k − tc` and `c`'s up to `k − ta` (`ta`, `tc` low bits known zero), a square
+  `a·a` its bits below `k − ta` (and `a_ta` at `2ta`), and a factor known odd passes the other's
+  pivot through; `a + a` and `a − ~a` are read as `a << 1` and `(a << 1) | 1`. So
+  `2*x*x + x == 2*y*y + y`, `x*(2*x + 1) == …` and `4x³ + 2x² + 3x == …` are `x == y`,
+  `2*x*x + x == 5` is `x == 72115` at 17 bits, and `x*x + x` (always even) is still refused.
+  The invert pass also compares truncations at their own width when the full one decides
+  nothing: `trunc<17>(2*x*x + x) == trunc<17>(2*y*y + y)` is `trunc<17>(x) == trunc<17>(y)`
+  and `trunc<17>(x * 0x1234567 + 9) == 77` is `trunc<17>(x) == 110364`, committed only when the
+  result is a smaller tree.
 - **The demanded-bits pass no longer runs out of memory on shared chains.** Since 0.24.0 a
   phase run keeps, for every operand a step found nothing to simplify under a mask, the leaves
   its walk stopped at, and a later step copies them back. A range kept the copies its operands'

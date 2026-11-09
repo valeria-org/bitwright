@@ -60,6 +60,47 @@ fn low_zero(
     ))
 }
 
+/// The carry into bit `lo` of `a + b` (of `a − b`, as `a + ~b + 1`, when `sub`), when the
+/// operands' known bits below `lo` decide it, and what that relied on. From the carry into bit
+/// 0 up, each bit's carry out is the majority of its two operand bits and its carry in, known
+/// when two of the three are known and agree: a bit known zero in both stops any carry, one
+/// known one in both makes one, and a known carry passes a bit known to differ.
+fn carry_in(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+    lo: u16,
+    sub: bool,
+) -> Result<(Option<bool>, Fin), Stop> {
+    let (ka, fa) = super::known(r, cx, a)?;
+    let (kb, fb) = super::known(r, cx, b)?;
+    let fin = fa.and(fb);
+    let (Some(ka), Some(kb)) = (ka, kb) else {
+        return Ok((None, fin));
+    };
+    let bit = |k: &crate::facts::KnownBits, j: u16, flip: bool| {
+        if k.known_one().bit(j) == Some(true) {
+            Some(!flip)
+        } else if k.known_zero().bit(j) == Some(true) {
+            Some(flip)
+        } else {
+            None
+        }
+    };
+    let mut c = Some(sub);
+    for j in 0..lo {
+        let (x, y) = (bit(&ka, j, false), bit(&kb, j, sub));
+        c = match (x, y, c) {
+            (Some(p), Some(q), _) | (Some(p), _, Some(q)) | (_, Some(p), Some(q)) if p == q => {
+                Some(p)
+            }
+            _ => None,
+        };
+    }
+    Ok((c, fin))
+}
+
 /// `extract<lo, n>(x)`, narrowed as far as the rules above allow.
 fn narrow(
     r: &mut Runner<'_, '_>,
@@ -102,39 +143,61 @@ fn narrow(
             }
             // `a + a` is `a << 1` (the linear pass writes it so): the bits one lower.
             OpCode::Add if node.a == node.b => narrow(r, cx, st, node.a, lo - 1, n)?,
-            // Above bit `lo`, a sum or difference with an operand whose low `lo` bits are zero
-            // carries nothing in: `(a + 2^lo·b') >> lo` is `(a >> lo) + b'`; and a product's
-            // bits from `lo` on are `a · b'` there.
-            OpCode::Add | OpCode::Sub | OpCode::Mul => {
+            // Above bit `lo`, a sum or difference is the sum or difference of its operands' bits
+            // there and the carry into bit `lo`, when the operands' known bits below decide it:
+            // nothing carries past a bit known zero in both (a guard bit between packed lanes),
+            // or from operands whose low bits are known zero (`(a + 2^lo·b') >> lo` is
+            // `(a >> lo) + b'`).
+            OpCode::Add | OpCode::Sub => {
+                let sub = node.op == OpCode::Sub;
+                let (carry, f) = carry_in(r, cx, node.a, node.b, lo, sub)?;
+                match carry {
+                    None => {
+                        st.fin = st.fin.and(f.unchanged());
+                        stop(r, cx, st)?
+                    }
+                    Some(c) => {
+                        st.fin = st.fin.and(f);
+                        let a = narrow(r, cx, st, node.a, lo, n)?;
+                        let b = narrow(r, cx, st, node.b, lo, n)?;
+                        let op = if sub { BinOp::Sub } else { BinOp::Add };
+                        let s = r.build(cx, |cx| cx.c_bin(op, a, b))?;
+                        // `a − b` is `a + ~b + 1`: its own carry in is 1.
+                        if c == sub {
+                            s
+                        } else {
+                            let one = BitVec::one(
+                                crate::Width::new(n).map_err(|e| Stop::Error(e.into()))?,
+                            );
+                            let fix = if c { BinOp::Add } else { BinOp::Sub };
+                            r.build(cx, |cx| {
+                                let one = cx.mk_const(&one)?;
+                                cx.c_bin(fix, s, one)
+                            })?
+                        }
+                    }
+                }
+            }
+            // A product's bits from `lo` on are `a · b'` there when an operand's low `lo` bits
+            // are zero.
+            OpCode::Mul => {
                 let (za, fa) = low_zero(r, cx, node.a, lo)?;
                 let (zb, fb) = low_zero(r, cx, node.b, lo)?;
-                let op = node.op.as_bin().unwrap_or(BinOp::Add);
-                let ok = match node.op {
-                    OpCode::Add | OpCode::Mul => za || zb,
-                    _ => zb,
-                };
-                if !ok {
+                if !(za || zb) {
                     st.fin = st.fin.and(fa.unchanged()).and(fb.unchanged());
                     stop(r, cx, st)?
                 } else {
                     st.fin = st.fin.and(if za { fa } else { fb });
-                    let (a, b) = if node.op == OpCode::Mul {
-                        // The operand with zero low bits is read from `lo`, the other below.
-                        let (z, o) = if zb {
-                            (node.b, node.a)
-                        } else {
-                            (node.a, node.b)
-                        };
-                        let zz = narrow(r, cx, st, z, lo, n)?;
-                        let oo = narrow(r, cx, st, o, 0, n)?;
-                        if zb { (oo, zz) } else { (zz, oo) }
+                    // The operand with zero low bits is read from `lo`, the other below.
+                    let (z, o) = if zb {
+                        (node.b, node.a)
                     } else {
-                        (
-                            narrow(r, cx, st, node.a, lo, n)?,
-                            narrow(r, cx, st, node.b, lo, n)?,
-                        )
+                        (node.a, node.b)
                     };
-                    r.build(cx, |cx| cx.c_bin(op, a, b))?
+                    let zz = narrow(r, cx, st, z, lo, n)?;
+                    let oo = narrow(r, cx, st, o, 0, n)?;
+                    let (a, b) = if zb { (oo, zz) } else { (zz, oo) };
+                    r.build(cx, |cx| cx.c_bin(BinOp::Mul, a, b))?
                 }
             }
             OpCode::Neg if lo == 0 => {
@@ -171,9 +234,18 @@ fn narrow(
                     } else if lo64 >= k {
                         narrow(r, cx, st, node.a, (lo64 - k) as u16, n)?
                     } else {
-                        // (Straddling the shift, `concat(trunc(x), 0)` would be no smaller
-                        // than the shift, and a worse start for the passes after.)
-                        stop(r, cx, st)?
+                        // Straddling the shift: the operand's low bits, shifted by what is left
+                        // of the shift at the narrow width (not `concat(trunc(x), 0)`, a worse
+                        // start for the passes after).
+                        let a = narrow(r, cx, st, node.a, 0, n)?;
+                        let s = BitVec::wrapping_from_u64(
+                            crate::Width::new(n).map_err(|e| Stop::Error(e.into()))?,
+                            k - lo64,
+                        );
+                        r.build(cx, |cx| {
+                            let s = cx.mk_const(&s)?;
+                            cx.c_bin(BinOp::Shl, a, s)
+                        })?
                     }
                 } else if lo64 + k >= w64 {
                     r.build(cx, |cx| cx.mk_const(&BitVec::zero(crate::Width::new(n)?)))?
@@ -242,6 +314,26 @@ fn narrow(
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
     r.stats.passes.entry("casts").or_default()
+}
+
+/// `extract<lo, n>(x)` pushed into `x` as far as the rules above allow, whatever its size, and
+/// what the facts the pushes used relied on: for a caller that commits on its own measure (the
+/// invert pass compares truncations at their own width). `None` when the pushes were capped.
+pub(super) fn narrowed(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    lo: u16,
+    n: u16,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    let mut st = Narrow {
+        memo: IdMap::default(),
+        stops: Vec::new(),
+        pushes: 0,
+        fin: Fin::FINAL,
+    };
+    let e = narrow(r, cx, &mut st, x, lo, n)?;
+    Ok((st.pushes <= MAX_PUSHES).then_some((e, st.fin)))
 }
 
 /// The width `k` and operand `x` when `n` sign-extends the low `k` bits of `x` spelled with

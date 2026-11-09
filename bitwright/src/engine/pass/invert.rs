@@ -7,6 +7,10 @@
 //! - against a constant (`f(x) == c`): `x` is compared with the preimage `f⁻¹(c)`, through
 //!   every layer whose parameters are constants, and the comparison is a constant when `c` has
 //!   no preimage;
+//! - when neither of those decides it, truncations and slices (`extract<lo, k>(f(x))`) pushed
+//!   into their operands and tried again at their own width, where a map that is no bijection at
+//!   the full width can be one of the bits read (`trunc<17>(2x² + x) == trunc<17>(2y² + y)` is
+//!   `trunc<17>(x) == trunc<17>(y)`): committed only when the result is a smaller tree;
 //! - `a₁ | … | aₙ == 0` (and `a₁ & … & aₙ == ones`): every `aᵢ` is solved against the constant
 //!   on its own, and the answers are intersected, so one value compared with two different
 //!   constants is false;
@@ -89,10 +93,24 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 if (join == OpCode::Or && c.is_zero()) || (join == OpCode::And && c.is_ones()) {
                     split(cx, &mut o, op, n, node.a, &c, before)?
                 } else {
-                    solve(cx, &mut o, op, node.a, &c)?
+                    match solve(cx, &mut o, op, node.a, &c)? {
+                        Some(e) => Some(e),
+                        None => match narrowed(cx, &mut o, node.a)? {
+                            Some(a) => solve(cx, &mut o, op, a, &c)?,
+                            None => None,
+                        }
+                        .filter(|&e| smaller(cx, e, n)),
+                    }
                 }
             }
-            None => cancel(cx, &mut o, op, node.a, node.b)?,
+            None => match cancel(cx, &mut o, op, node.a, node.b)? {
+                Some(e) => Some(e),
+                None => match (narrowed(cx, &mut o, node.a)?, narrowed(cx, &mut o, node.b)?) {
+                    (Some(a), Some(b)) => cancel(cx, &mut o, op, a, b)?,
+                    _ => None,
+                }
+                .filter(|&e| smaller(cx, e, n)),
+            },
         }
     } else {
         match (cx.const_val(node.a), cx.const_val(node.b)) {
@@ -105,6 +123,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let e = match e {
         Some(e) if e != n => e,
         _ => {
+            // What a narrowing built for nothing.
+            discard(r, cx, before);
             count(r).noop += 1;
             return Ok(Step::Normal(fin));
         }
@@ -129,6 +149,28 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             Ok(Step::Normal(fin))
         }
     }
+}
+
+/// A truncation or slice `extract<lo, k>(x)` pushed into `x` (see `casts`), when that is
+/// another node: a map that is no bijection at `x`'s width can be one of the bits the slice
+/// reads (`trunc<17>(2x² + x)` is `2t² + t` over `t = trunc<17>(x)`, a bijection of `t`).
+fn narrowed(cx: &mut Context, o: &mut Calls<'_, '_, '_>, s: u32) -> Result<Option<u32>, Stop> {
+    let node = cx.node(s);
+    if node.op != OpCode::Extract {
+        return Ok(None);
+    }
+    let Some((e, fin)) = super::casts::narrowed(o.r, cx, node.a, node.b as u16, node.width)? else {
+        return Ok(None);
+    };
+    o.fin = o.fin.and(fin);
+    Ok((e != s).then_some(e))
+}
+
+/// Whether `e` is a smaller tree than `n`: a comparison of narrowed sides is a comparison of
+/// subterms of new nodes, committed only when it is smaller (which also orders it).
+fn smaller(cx: &Context, e: u32, n: u32) -> bool {
+    let size = |i: u32| cx.tree_size(cx.handle(i)).unwrap_or(u32::MAX);
+    size(e) < size(n)
 }
 
 fn truth(o: &mut Calls<'_, '_, '_>, cx: &mut Context, v: bool) -> Result<u32, Stop> {

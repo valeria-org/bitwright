@@ -154,6 +154,39 @@ one dependency of some output bit not recovered yet, and a pivot of it. Those fa
 with the inner value unknown, so the answer holds for every value, not only the ones it takes in
 context.
 
+A product of two values that both vary reads, at bit `k`, only the bits of each that can reach
+it (none of `x`'s from bit `k` on in `(x << 1)·x`, and in a square `x·x` none from bit `k` on
+past bit 0), and a factor known odd passes the other's pivot through. So permutation
+polynomials are bijections to it: `2x² + x` is `x_k` flipped by lower bits at every bit `k`.
+Below a truncation, a comparison is also tried at the truncated width, where a map can be a
+bijection of the bits it reads:
+
+```rust
+use bitwright::engine::Engine;
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::standard();
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::new(17)?);
+for (input, simplified) in [
+    ("2 * x * x + x == 2 * y * y + y", "x == y"),
+    ("x * (2 * x + 1) == y * (2 * y + 1)", "x == y"),
+    // 2·72115² + 72115 = 5 modulo 2^17.
+    ("2 * x * x + x == 5", "x == 72115"),
+    // x² + x is always even: no bijection, nothing cancelled.
+    ("x * x + x == y * y + y", "x * x + x == y * y + y"),
+] {
+    let e = cx.parse(input, &o)?;
+    let want = cx.parse(simplified, &o)?;
+    assert_eq!(engine.simplify(&mut cx, e)?.expr, want, "{input}");
+}
+let o = ParseOptions::width(Width::W64);
+let e = cx.parse("trunc<17>(2 * a * a + a) == trunc<17>(2 * b * b + b)", &o)?;
+let want = cx.parse("trunc<17>(a) == trunc<17>(b)", &o)?;
+assert_eq!(engine.simplify(&mut cx, e)?.expr, want);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 That covers xorshift steps like `x ^ (x << 13)`; the mixer's `S`, whose low half reads only the
 high half, which it leaves alone; T-functions, where bit `i` reads only lower bits; and block
 maps, such as a pointer encoding whose low bits are a bijection of the pointer's low bits and

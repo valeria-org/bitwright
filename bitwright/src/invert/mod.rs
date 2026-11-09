@@ -27,7 +27,10 @@
 //! of `x ^ (x >> 4)` has two). The hole's bits are their own pivots; `~` keeps them, and `^` keeps
 //! the pivots of each operand that the other does not read; `+`, `-` and negation keep those no
 //! carry from the bits below reads either; a product with a factor that does not vary, with `t`
-//! low bits known zero and the next known one, moves them up by `t`; `&` and `|` pass an
+//! low bits known zero and the next known one, moves them up by `t`; a product of two factors
+//! that both vary reads each only up to the bit the other's known-zero low bits leave (a square
+//! below its own bit), and passes one factor's pivots through when the other is known odd, so
+//! permutation polynomials such as `2x² + x` are bijections; `&` and `|` pass an
 //! operand's bit through where the other's is known to be 1 (resp. 0); shifts and rotations by
 //! constants, casts and `concat` re-index; a select by a condition that does not vary keeps the
 //! pivots both arms share; a bit the facts pin depends on nothing. The facts are computed afresh
@@ -368,6 +371,84 @@ fn carry_chain(a: &Bits, c: Option<&Bits>) -> Bits {
     out
 }
 
+/// When node `i` is `a + a` (`2a`) or `a − ~a` (`2a + 1`), as the linear pass writes them: the
+/// low bit of the result.
+fn doubled(cx: &Context, i: u32) -> Option<bool> {
+    let n = cx.node(i);
+    match n.op {
+        OpCode::Add if n.a == n.b => Some(false),
+        OpCode::Sub if cx.node(n.b).op == OpCode::Not && cx.node(n.b).a == n.a => Some(true),
+        _ => None,
+    }
+}
+
+/// The facts `f` of a node `i` that [`doubled`] reads as `(a << 1) | low`, met with what that
+/// says given the facts `fa` of `a`: the facts of a node are computed from its operands' one by
+/// one, which do not see that the two are one value (`x + x` is even).
+fn doubled_facts(cx: &Context, i: u32, f: Facts, fa: &Facts) -> Facts {
+    let Some(low) = doubled(cx, i) else {
+        return f;
+    };
+    let w = cx.width_of(i);
+    let one = BitVec::one(w);
+    let shl = |v: &BitVec| BitVec::bin_unchecked(BinOp::Shl, v, &one);
+    let (z, o) = (shl(&fa.known().known_zero()), shl(&fa.known().known_one()));
+    let (z, o) = if low {
+        (z, BitVec::bin_unchecked(BinOp::Or, &o, &one))
+    } else {
+        (BitVec::bin_unchecked(BinOp::Or, &z, &one), o)
+    };
+    KnownBits::new(z, o)
+        .and_then(|k| f.meet_known(&k))
+        .unwrap_or(f)
+}
+
+/// A product `a · c` of two values that both vary, with `t = [ta, tc]` low bits known zero
+/// (`a = 2^ta·a'`, `c = 2^tc·c'`): bit `k` reads `a`'s bits up to `k − tc` and `c`'s up to
+/// `k − ta`. Column `k` is `a_0·c_k ⊕ a_k·c_0` plus terms and carries of lower bits, so with
+/// `a` known odd (`odd[0]`), a pivot of `c_k` that nothing else there reads is one of bit `k`,
+/// and the same the other way. A `square` `a · a` is `a'^2 · 2^(2ta)`, and `(2^j·h + l)^2` is
+/// `l^2` modulo `2^(j+1)` for `j ≥ 1`: its bit `2ta + j` reads `a`'s bits below `ta + j` alone,
+/// and its bit `2ta` is `a_ta`. So `2x² + x` (`(x << 1) · x + x`) is a bijection: bit `k` is
+/// `x_k` flipped by lower bits.
+fn product(a: &Bits, c: &Bits, t: [usize; 2], odd: [bool; 2], square: bool) -> Bits {
+    let w = a.dep.len();
+    let prefix = |d: &[u128]| {
+        let mut acc = 0u128;
+        d.iter()
+            .map(|&x| {
+                acc |= x;
+                acc
+            })
+            .collect::<Vec<u128>>()
+    };
+    let (pa, pc) = (prefix(&a.dep), prefix(&c.dep));
+    // The dependencies of bits `0..=i` (none when `i` is below 0).
+    let upto = |p: &[u128], i: usize, less: usize| i.checked_sub(less).map_or(0, |j| p[j]);
+    let [ta, tc] = t;
+    let mut out = Bits::opaque(vec![0; w]);
+    for k in 0..w {
+        if square {
+            if k == 2 * ta {
+                out.dep[k] = a.dep[ta];
+                out.piv[k] = a.piv[ta];
+            } else if k > 2 * ta {
+                out.dep[k] = upto(&pa, k, ta + 1);
+            }
+            continue;
+        }
+        out.dep[k] = upto(&pa, k, tc) | upto(&pc, k, ta);
+        let below = upto(&pa, k, 1) | upto(&pc, k, 1);
+        if odd[0] {
+            out.piv[k] |= c.piv[k] & !(below | a.dep[k]);
+        }
+        if odd[1] {
+            out.piv[k] |= a.piv[k] & !(below | c.dep[k]);
+        }
+    }
+    out
+}
+
 /// The bits of node `i` from its operands' (`b`) and facts (`f`).
 fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) -> Bits {
     let n = cx.node(i);
@@ -389,6 +470,8 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
         OpCode::Const | OpCode::Sym => Bits::opaque(vec![0; w]),
         OpCode::Not => b[&n.a].clone(),
         OpCode::Neg => carry_chain(&b[&n.a], None),
+        // `a + a` is `a << 1` (the linear pass writes it so), and `a − ~a` is `(a << 1) | 1`.
+        _ if doubled(cx, i).is_some() => pick(n.a, &|k| k.checked_sub(1)),
         OpCode::Add | OpCode::Sub => carry_chain(&b[&n.a], Some(&b[&n.b])),
         OpCode::Mul => {
             // With a factor `m` that does not vary and has `t` low bits known zero, the product
@@ -397,9 +480,14 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
             let fixed = |m: u32| b[&m].all() == 0;
             let (y, m) = if fixed(n.b) { (n.a, n.b) } else { (n.b, n.a) };
             if !fixed(m) {
-                let mut out = carry_chain(&b[&n.a], Some(&b[&n.b]));
-                out.piv.iter_mut().for_each(|p| *p = 0);
-                return out;
+                let tz = |c: u32| f[&c].known().trailing_known_zeros() as usize;
+                return product(
+                    &b[&n.a],
+                    &b[&n.b],
+                    [tz(n.a), tz(n.b)],
+                    [known(n.a, 0) == Some(true), known(n.b, 0) == Some(true)],
+                    n.a == n.b,
+                );
             }
             let t = f[&m].known().trailing_known_zeros() as usize;
             let base = carry_chain(&b[&y], None);
@@ -576,6 +664,7 @@ fn recover_levels<O: Oracle>(
         let kids: Vec<Facts> = n.children().map(|c| facts[&c]).collect();
         let refs: Vec<&Facts> = kids.iter().collect();
         let f = cx.transfer_local(i, &refs);
+        let f = doubled_facts(cx, i, f, &kids[0]);
         let mut nb = node_bits(cx, i, &bits, &facts);
         // A bit the facts pin depends on nothing and flips with nothing.
         let known = f.known().known();
