@@ -54,6 +54,19 @@ impl Same {
     }
 }
 
+/// Sorts `v` and moves its distinct values to the front: how many there are.
+fn sorted_distinct(v: &mut [u32]) -> usize {
+    v.sort_unstable();
+    let mut kept = 0;
+    for i in 0..v.len() {
+        if kept == 0 || v[i] != v[kept - 1] {
+            v[kept] = v[i];
+            kept += 1;
+        }
+    }
+    kept
+}
+
 struct Demand {
     memo: Memo,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
@@ -126,6 +139,33 @@ fn by_residues(
 /// The most low bits read by residues.
 const RESIDUE_BITS: u32 = 4;
 
+/// The constant equal to `c` on the low prefix `m` (`2^k − 1`, `k` below the width) with the
+/// fewest significant bits: `c`'s residue modulo `2^k`, extended with zeros or with its sign,
+/// whichever is the smaller in magnitude (zeros on a tie). `None` when `m` is no such prefix
+/// or `c` already is that residue, either way extended; and when the residue is 0, which is
+/// the facts' to fold (a product with it is known zero there, under the host's
+/// [`fold_known`](crate::engine::Hooks::fold_known)) or `dropped_constant`'s (a sum).
+fn prefix_residue(c: &BitVec, m: &BitVec) -> Option<BitVec> {
+    let w = c.width();
+    let k = crate::facts::known::count_ones(m);
+    if k == 0 || k >= u32::from(w.bits()) || low_prefix(m) != *m {
+        return None;
+    }
+    let kw = Width::new(k as u16).ok()?;
+    let t = c.trunc(kw).ok()?;
+    let (u, s) = (t.zext(w).ok()?, t.sext(w).ok()?);
+    if t.is_zero() || *c == u || *c == s {
+        return None;
+    }
+    // A negative residue `t` is `−(2^k − t)`, the smaller when `2^k − t <u t`.
+    let neg = BitVec::un_unchecked(UnOp::Neg, &t);
+    if t.msb() && BitVec::cmp_unchecked(crate::CmpOp::Ult, &neg, &t) {
+        Some(s)
+    } else {
+        Some(u)
+    }
+}
+
 fn subset(a: &BitVec, b: &BitVec) -> bool {
     bv_and(a, &bv_not(b)).is_zero()
 }
@@ -163,6 +203,15 @@ fn simplify(
         stop_at(cx, st, x);
         Ok(x)
     };
+    // A constant read on a low prefix only is its residue there: `x · 0x200001` under
+    // `& 0x1ffff` is `x · 1`, an inverse modulo `2^17` that is none at the full width.
+    if let Some(c) = cx.const_val(x)
+        && let Some(c2) = prefix_residue(&c, m)
+    {
+        let v = r.build(cx, |cx| cx.mk_const(&c2))?;
+        st.memo.insert(Key(x, *m), v);
+        return Ok(v);
+    }
     if st.visits > st.cap || cx.const_val(x).is_some() {
         let v = stop(cx, st)?;
         st.memo.insert(Key(x, *m), v);
@@ -320,8 +369,14 @@ fn simplify(
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
             // a constant addend with none of the demanded bits goes (`63 - ~y`
             // is `y + 64`, which is `y` on the low six bits).
+            let ones = |j: u32| cx.const_val(j).is_some_and(|k| k.is_ones());
             match dropped_constant(cx, node.op, a, b, &p) {
                 Some(t) => t,
+                // A factor that is −1 on the prefix (`0x3ffff` read by `& 0x1ffff`) negates.
+                None if node.op == OpCode::Mul && (ones(a) || ones(b)) => {
+                    let t = if ones(a) { b } else { a };
+                    r.build(cx, |cx| cx.c_un(UnOp::Neg, t))?
+                }
                 None => bin(r, cx, op, a, b)?,
             }
         }
@@ -603,11 +658,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             if r.demanded_same.map.contains_key(&key) {
                 continue;
             }
-            let at = r.demanded_same.leaves.len() as u32;
+            // Each leaf once. A range holds what the hits below it copied, the leaves of each
+            // operand; operands share leaves in a DAG, so a range kept with its repeats was
+            // the sum of its operands' ranges, and on a ripple chain the ranges doubled at
+            // every level (2^48 at 48 bits). The leaves are read as a set.
+            let at = r.demanded_same.leaves.len();
             r.demanded_same
                 .leaves
                 .extend_from_slice(&st.stops[from as usize..to as usize]);
-            r.demanded_same.map.insert(key, (at, to - from));
+            let kept = sorted_distinct(&mut r.demanded_same.leaves[at..]);
+            r.demanded_same.leaves.truncate(at + kept);
+            r.demanded_same.map.insert(key, (at as u32, kept as u32));
         }
     }
     st.memo.clear();

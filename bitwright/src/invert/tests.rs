@@ -876,6 +876,87 @@ fn regions_are_injective_and_solve_exactly() {
     assert!(solved > 2000, "{solved} solved");
 }
 
+/// A random polynomial in `x`: products of values that both vary (`x·x`, `(x << s)·x`,
+/// `(x − ~x)·x`, that is `(2x + 1)·x`), sums and differences of them, and constant multiples.
+fn poly_expr(rng: &mut Rng, cx: &mut Context, x: Expr, w: u16, depth: u32) -> Expr {
+    let wd = width(w);
+    if depth == 0 || rng.chance(1, 4) {
+        return match rng.below(6) {
+            0 | 1 => x,
+            2 => {
+                let s = cx.constant_u64(wd, 1 + rng.below(2)).unwrap();
+                cx.bin(BinOp::Shl, x, s).unwrap()
+            }
+            3 => cx.bin(BinOp::Add, x, x).unwrap(),
+            4 => {
+                let n = cx.un(UnOp::Not, x).unwrap();
+                cx.bin(BinOp::Sub, x, n).unwrap()
+            }
+            _ => cx.constant_u64(wd, rng.next() & ((1 << w) - 1)).unwrap(),
+        };
+    }
+    let a = poly_expr(rng, cx, x, w, depth - 1);
+    let b = poly_expr(rng, cx, x, w, depth - 1);
+    match rng.below(5) {
+        0 | 1 => cx.bin(BinOp::Mul, a, b).unwrap(),
+        2 => cx.bin(BinOp::Add, a, b).unwrap(),
+        3 => cx.bin(BinOp::Sub, a, b).unwrap(),
+        _ => {
+            let k = cx.constant_u64(wd, rng.next() & ((1 << w) - 1)).unwrap();
+            cx.bin(BinOp::Mul, a, k).unwrap()
+        }
+    }
+}
+
+/// Polynomials, permutation polynomials among them (`2x² + x`): every injectivity claim and
+/// every solution checked at every value.
+#[test]
+fn polynomials_are_injective_and_solve_exactly() {
+    let mut rng = Rng(0x7a1a_00a1);
+    let (mut proved, mut solved) = (0, 0);
+    for i in 0..1500 {
+        let w = 2 + (i % 7) as u16;
+        let mut cx = Context::new();
+        let x = cx.symbol("x", width(w)).unwrap();
+        let depth = 1 + rng.below(3) as u32;
+        let e = poly_expr(&mut rng, &mut cx, x, w, depth);
+        let t = cx.prove(Query::Injective { e, of: x }).unwrap();
+        let image: Vec<BitVec> = (0..1u64 << w)
+            .map(|xv| eval(&mut cx, e, &[("x", val(w, xv))]))
+            .collect();
+        if t == Truth::True {
+            proved += 1;
+            let mut seen = image.clone();
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), 1 << w, "claimed injective: {}", cx.display(e));
+        }
+        let ei = cx.id(e).unwrap();
+        for _ in 0..4 {
+            let c = val(w, rng.below(1 << w));
+            match solve_eq(&mut cx, &mut plain(), ei, &c).unwrap() {
+                None => {}
+                Some(Solved::Const(false)) => {
+                    assert!(!image.contains(&c), "{} == {c:?}", cx.display(e));
+                    solved += 1;
+                }
+                Some(Solved::Eq(v, s)) => {
+                    let vh = cx.handle(v);
+                    for xv in 0..1u64 << w {
+                        let lhs = image[xv as usize] == c;
+                        let rhs = eval(&mut cx, vh, &[("x", val(w, xv))]) == s;
+                        assert_eq!(lhs, rhs, "{} == {c:?} at x={xv}", cx.display(e));
+                    }
+                    solved += 1;
+                }
+                Some(Solved::Const(true)) => panic!("{} == {c:?} claimed always", cx.display(e)),
+            }
+        }
+    }
+    assert!(proved > 100, "{proved} proved");
+    assert!(solved > 400, "{solved} solved");
+}
+
 /// A rotation count wider than 64 bits is reduced modulo the width exactly, not saturated:
 /// counts from `2^64` up, or from just below it, rotate by 0 at some `y`, where
 /// `x ^ (rot(x, count) & m)` is `x & !m`, so it is no layer over `x`.

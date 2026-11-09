@@ -19,13 +19,20 @@
 //! that differs from the form at inputs the points miss is refuted, and one the prover does not
 //! decide within its caps (a ripple chain of 48 bits or more) is left as it is, and so is every
 //! region holding it.
+//!
+//! Below a `concat`, the region is instead read through slices: `+ − neg`, `concat`, `extract`,
+//! `zext`, `sext` and `<u` as well, down to atoms of the `concat`'s own width. A sum split at a
+//! boundary of any width, its two halves added apart and the carry between them written out
+//! (`concat(extract<17, 47>(x) + extract<17, 47>(y) + zext<47>(c), trunc<17>(s))`, with `s` the
+//! 18-bit sum of the low halves and `c` its top bit), is fitted, proved and becomes `x + y`.
+//! Such a region is read only when it takes a slice and adds.
 
 use super::{Counts, Fin, PassKind, Runner, Step, Stop, finish, linear, worth_building};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
 use crate::hash::IdMap;
-use crate::ops::{BinOp, UnOp};
+use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::prove::{self, Outcome, Unknown};
 use crate::{BitVec, Error, SymbolKey};
 
@@ -96,6 +103,25 @@ fn interior(cx: &Context, i: u32) -> bool {
     }
 }
 
+/// Whether `i` is interior to a region read through slices (below a `concat`): the bitwise
+/// region's operators, and `+ − neg`, `concat`, `extract`, `zext`, `sext` and `<u` of at most
+/// 64 bits, whose values a lane holds.
+fn sliced(cx: &Context, i: u32) -> bool {
+    let n = cx.node(i);
+    let small = |j: u32| cx.wid(j) <= 64;
+    match n.op {
+        OpCode::Add
+        | OpCode::Sub
+        | OpCode::Neg
+        | OpCode::Concat
+        | OpCode::Extract
+        | OpCode::Zext
+        | OpCode::Sext => small(i) && small(n.a),
+        OpCode::Ult => small(n.a),
+        _ => interior(cx, i),
+    }
+}
+
 /// The region below `n` into `s.order`, `s.atoms` and `s.consts`: whether it is within the
 /// caps, holds no node left undecided, and either a bitwise operator reads a shift or it is
 /// only shifts of an atom (`a << 1` is written `a + a`, which needs no constant), and which of
@@ -103,7 +129,11 @@ fn interior(cx: &Context, i: u32) -> bool {
 /// (which the bitwise pass decides) or one shifted, `g << k`, affine only when `g` is an atom's
 /// complement or a constant (forms the other passes give) or when only its lowest bit is kept
 /// (`k = W − 1`, where the form is no smaller than a minimal `g << k`).
-fn walk(cx: &Context, n: u32, s: &mut Scratch) -> (bool, bool, u32) {
+///
+/// With `slices`, the region is read through [`sliced`] nodes instead, down to atoms of `n`'s
+/// width only, and fits when it both takes a slice (an `extract`) and adds (`+ −` or `<u`, a
+/// carry written out); never a chain.
+fn walk(cx: &Context, n: u32, s: &mut Scratch, slices: bool) -> (bool, bool, u32) {
     s.seen.begin(cx.len());
     s.order.clear();
     s.atoms.clear();
@@ -112,6 +142,8 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch) -> (bool, bool, u32) {
     s.stack.push((n, false));
     let mut reached = 0u32;
     let (mut carried, mut bitwise) = (false, false);
+    let (mut sliced_any, mut added) = (false, false);
+    let w = cx.wid(n);
     while let Some((i, expanded)) = s.stack.pop() {
         if expanded {
             s.order.push(i);
@@ -131,9 +163,13 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch) -> (bool, bool, u32) {
             }
             continue;
         }
-        if !interior(cx, i) {
+        if !(if slices {
+            sliced(cx, i)
+        } else {
+            interior(cx, i)
+        }) {
             s.atoms.push(i);
-            if s.atoms.len() > MAX_ATOMS {
+            if s.atoms.len() > MAX_ATOMS || (slices && cx.wid(i) != w) {
                 return (false, false, reached);
             }
             continue;
@@ -143,7 +179,13 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch) -> (bool, bool, u32) {
         }
         s.stack.push((i, true));
         let node = cx.node(i);
-        if node.op == OpCode::Shl {
+        if slices {
+            sliced_any |= node.op == OpCode::Extract;
+            added |= matches!(node.op, OpCode::Add | OpCode::Sub | OpCode::Ult);
+            for c in node.children() {
+                s.stack.push((c, false));
+            }
+        } else if node.op == OpCode::Shl {
             s.stack.push((node.a, false));
         } else {
             bitwise = true;
@@ -156,6 +198,9 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch) -> (bool, bool, u32) {
     s.consts.sort_unstable();
     s.consts.dedup();
     s.consts.truncate(MAX_CONSTS);
+    if slices {
+        return (sliced_any && added && !s.atoms.is_empty(), false, reached);
+    }
     (
         (carried || !bitwise) && !s.atoms.is_empty(),
         !bitwise,
@@ -228,10 +273,12 @@ fn evaluate(cx: &Context, s: &mut Scratch, mask: u64, lanes: core::ops::Range<us
             s.rows[j * LANES + k] = lane_value(t, j, k, mask, &s.consts);
         }
     }
-    let bits = 64 - u64::from(mask.leading_zeros());
     for (row, &i) in s.order.iter().enumerate() {
         let row = t + row;
         let n = cx.node(i);
+        // The node's own width: a region read through slices mixes them.
+        let bits = u64::from(n.width);
+        let mask = u64::MAX >> (64 - bits);
         let (done, rest) = s.rows.split_at_mut(row * LANES);
         let out = &mut rest[lanes.clone()];
         // An operand's values: its row, or a constant (lane-independent).
@@ -258,6 +305,35 @@ fn evaluate(cx: &Context, s: &mut Scratch, mask: u64, lanes: core::ops::Range<us
                         .for_each(|(o, &x)| *o = (x << c) & mask),
                     Err(x) if c < bits => out.fill((x << c) & mask),
                     _ => out.fill(0),
+                }
+            }
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::Neg
+            | OpCode::Concat
+            | OpCode::Extract
+            | OpCode::Zext
+            | OpCode::Sext
+            | OpCode::Ult => {
+                let at = |x: u32, k: usize| match operand(x) {
+                    Ok(a) => a[k - lanes.start],
+                    Err(c) => c,
+                };
+                let wa = u64::from(cx.wid(n.a));
+                for k in lanes.clone() {
+                    let x = at(n.a, k);
+                    let v = match n.op {
+                        OpCode::Add => x.wrapping_add(at(n.b, k)),
+                        OpCode::Sub => x.wrapping_sub(at(n.b, k)),
+                        OpCode::Neg => x.wrapping_neg(),
+                        // The low part is narrower than the 64 bits of the whole.
+                        OpCode::Concat => (x << cx.wid(n.b)) | at(n.b, k),
+                        OpCode::Extract => x >> n.b,
+                        OpCode::Sext if x >> (wa - 1) & 1 == 1 => x | !(u64::MAX >> (64 - wa)),
+                        OpCode::Ult => u64::from(x < at(n.b, k)),
+                        _ => x,
+                    };
+                    out[k - lanes.start] = v & mask;
                 }
             }
             op => {
@@ -321,15 +397,27 @@ fn copy(
         let a = operand(scx, &map, node.a)?;
         let e = match node.op {
             OpCode::Not => scx.c_un(UnOp::Not, a)?,
+            OpCode::Neg => scx.c_un(UnOp::Neg, a)?,
+            OpCode::Extract => scx.c_extract(a, node.b as u16, node.width)?,
+            OpCode::Zext => scx.c_zext(a, node.width)?,
+            OpCode::Sext => scx.c_sext(a, node.width)?,
             op => {
                 let b = operand(scx, &map, node.b)?;
-                let bop = match op {
-                    OpCode::And => BinOp::And,
-                    OpCode::Or => BinOp::Or,
-                    OpCode::Xor => BinOp::Xor,
-                    _ => BinOp::Shl,
-                };
-                scx.c_bin(bop, a, b)?
+                match op {
+                    OpCode::Concat => scx.c_concat(a, b)?,
+                    OpCode::Ult => scx.c_cmp(CmpOp::Ult, a, b)?,
+                    op => {
+                        let bop = match op {
+                            OpCode::And => BinOp::And,
+                            OpCode::Or => BinOp::Or,
+                            OpCode::Xor => BinOp::Xor,
+                            OpCode::Add => BinOp::Add,
+                            OpCode::Sub => BinOp::Sub,
+                            _ => BinOp::Shl,
+                        };
+                        scx.c_bin(bop, a, b)?
+                    }
+                }
             }
         };
         map.push(e);
@@ -450,10 +538,11 @@ fn fit(r: &mut Runner<'_, '_>, cx: &Context, mask: u64) -> Result<Option<(u64, V
 /// The carries pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let bits = cx.wid(n);
-    if bits > 64 || !interior(cx, n) {
+    let slices = cx.node(n).op == OpCode::Concat;
+    if bits > 64 || !(slices || interior(cx, n)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let (fits, chain, reached) = walk(cx, n, &mut r.carries);
+    let (fits, chain, reached) = walk(cx, n, &mut r.carries, slices);
     r.meter.charge(Counter::PassWork, u64::from(reached))?;
     if !fits {
         return Ok(Step::Normal(Fin::FINAL));

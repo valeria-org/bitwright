@@ -2212,6 +2212,55 @@ fn demanded_obeys_fold_known() {
     assert_eq!(simplify(&eng, "(x * 16) & 0x0f", 8), "0:8");
 }
 
+#[test]
+fn demanded_keeps_each_leaf_once_across_a_phase_run() {
+    // A ripple chain read through `<< 1`: every level shares its operands' leaves, and the
+    // leaves a step keeps for the next ones held each level's operands' copies, so they
+    // doubled at every level (2^48 at 48 bits, past any memory). Kept once each, the run
+    // takes a moment.
+    let mut src = String::from("let a0 = x; let b0 = y; ");
+    for k in 0..48 {
+        src += &format!(
+            "let a{n} = a{k} ^ b{k}; let b{n} = (a{k} & b{k}) << 1; ",
+            n = k + 1
+        );
+    }
+    src += "a48 << 1";
+    let eng = engine(vec![Phase::Demanded]);
+    let mut cx = Context::new();
+    let e = cx
+        .parse(&src, &ParseOptions::width(Width::new(48).unwrap()))
+        .unwrap();
+    let before = dag(&mut cx, &[e]);
+    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+    let r = out.roots[0].expr;
+    assert!(dag(&mut cx, &[r]) < before);
+    assert!(equivalent(&mut cx, e, r, &mut Rng(48)));
+}
+
+#[test]
+fn demanded_reduces_constants_to_their_residues() {
+    let eng = engine(vec![Phase::Demanded]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    // `43 · 0xbe83 = 0x200001`: an inverse modulo 2^17 that is none at 64 bits.
+    same("(x * 0x200001) & 0x1ffff", "x & 0x1ffff");
+    same("((x * 0x200001) + y) & 0x1ffff", "(x + y) & 0x1ffff");
+    same("trunc<17>(x * 0x200001)", "trunc<17>(x)");
+    same("(x * 0x100000001) & 0xffffffff", "x & 0xffffffff");
+    // The residue extended with its sign when that is the smaller: `0x3ffff` is −1 there.
+    same("(x * 0x3ffff) & 0x1ffff", "-x & 0x1ffff");
+    // Read at every bit, or already a residue: unchanged.
+    same("x * 0x200001", "x * 0x200001");
+    same("(x + 0x1ffff) & 0x1ffff", "(x + 0x1ffff) & 0x1ffff");
+}
+
 fn dag(cx: &mut Context, roots: &[Expr]) -> u32 {
     match cx.dag_size(roots, u32::MAX).unwrap() {
         crate::Bounded::Exact(n) | crate::Bounded::AtLeast(n) => n,
@@ -2619,6 +2668,38 @@ fn casts_push_through_doubling_zero_lows_and_arithmetic_shifts() {
     same("trunc<32>(x >>s 8)", "extract<8, 32>(x)");
     same("extract<8, 8>(x >>s 60)", "sext<8>(extract<63, 1>(x))");
     same("extract<8, 8>(x >>s 52)", "sext<8>(extract<60, 4>(x))");
+}
+
+#[test]
+fn casts_split_sums_where_the_carry_is_decided() {
+    let eng = engine(vec![Phase::Casts]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    // Three 20-bit lanes, guard bits 20, 41 and 62 clear in both: nothing carries into a lane.
+    same(
+        "extract<21, 20>((x & 0x3ffffdffffefffff) + (y & 0x3ffffdffffefffff))",
+        "extract<21, 20>(x) + extract<21, 20>(y)",
+    );
+    // `a − b` is `a + ~b + 1`: a guard bit set in `a` and clear in `b` borrows nothing, one
+    // clear in `a` and set in `b` always borrows.
+    same(
+        "extract<21, 20>((x | 0x100000) - (y & ~0x100000))",
+        "extract<21, 20>(x) - extract<21, 20>(y)",
+    );
+    same(
+        "extract<21, 20>((x & ~0x100000) - (y | 0x100000))",
+        "extract<21, 20>(x) - extract<21, 20>(y) - 1",
+    );
+    // Undecided: unchanged.
+    same("extract<21, 20>(x + y)", "extract<21, 20>(x + y)");
+    // A shift straddling the slice: the operand's low bits, shifted at the narrow width.
+    same("trunc<8>(zext<16>(a:8) << 3)", "a:8 << 3");
 }
 
 // ----- shuffle ------------------------------------------------------------------------------------
@@ -4302,6 +4383,45 @@ fn monotone_is_sound_under_ranges() {
 }
 
 #[test]
+fn invert_cancels_and_solves_permutation_polynomials() {
+    let eng = Engine::standard();
+    // `2x² + x`, `x·(2x + 1)` and `4x³ + 2x² + 3x` are bijections (bit `k` is `x_k` flipped
+    // by lower bits); `x² + x` is not (it is always even).
+    check_to(&eng, "2 * x * x + x == 2 * y * y + y", "x == y", 17);
+    check_to(&eng, "x * (2 * x + 1) == y * (2 * y + 1)", "x == y", 17);
+    check_to(
+        &eng,
+        "4 * x * x * x + 2 * x * x + 3 * x == 4 * y * y * y + 2 * y * y + 3 * y",
+        "x == y",
+        64,
+    );
+    check_to(&eng, "2 * x * x + x == 2 * y * y + y", "x == y", 64);
+    check_to(&eng, "x * x + x == y * y + y", "x * x + x == y * y + y", 17);
+    // Solved: 2·72115² + 72115 = 5, and 2·0x26c89aff803319b3² + … = 5, modulo the width.
+    check_to(&eng, "2 * x * x + x == 5", "x == 72115", 17);
+    check_to(&eng, "2 * x * x + x == 5", "x == 0x26c89aff803319b3", 64);
+    // A truncation of a map that is a bijection only at the truncated width: compared there.
+    check_to(
+        &eng,
+        "trunc<17>(2 * x * x + x) == trunc<17>(2 * y * y + y)",
+        "trunc<17>(x) == trunc<17>(y)",
+        64,
+    );
+    check_to(
+        &eng,
+        "trunc<17>(x * 0x1234567 + 9) == 77",
+        "trunc<17>(x) == 110364",
+        64,
+    );
+    check_to(
+        &eng,
+        "trunc<17>(x * x + x) == trunc<17>(y * y + y)",
+        "trunc<17>(x * x + x) == trunc<17>(y * y + y)",
+        64,
+    );
+}
+
+#[test]
 fn invert_commits_like_a_rule_through_sharing() {
     // The hash stays live as another root; its comparison is solved anyway.
     let eng = Engine::standard();
@@ -5105,16 +5225,26 @@ fn carries_recovers_ripple_chains_constants_and_three_atoms() {
 fn carries_asks_a_region_past_its_caps_once() {
     // A 48-bit ripple chain is past the proof's caps; the region holding it, its double, is
     // larger still, and is not asked.
-    let eng = deobfuscator();
-    let mut cx = Context::new();
     let o = ParseOptions::width(Width::new(48).unwrap());
     let src = format!("{} << 1", ripple_sum("x", "y", 48));
-    let e = cx.parse(&src, &o).unwrap();
-    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
     let mut rng = Rng(48);
-    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let out = engine(vec![Phase::Carries])
+        .run(&mut cx, &[e], Run::default())
+        .unwrap();
+    assert_eq!(out.roots[0].expr, e);
     let c = out.stats.passes["carries"];
     assert_eq!((c.proved, c.unknown), (0, 1), "{c:?}");
+    // With the other passes, the demanded-bits pass rewrites the chain the shift reads only
+    // the low 47 bits of (146 nodes to 143): a chain of its own, past the caps too, asked once.
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let out = deobfuscator().run(&mut cx, &[e], Run::default()).unwrap();
+    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+    assert_eq!(out.stats.passes["demanded"].changed, 1);
+    let c = out.stats.passes["carries"];
+    assert_eq!((c.proved, c.unknown), (0, 2), "{c:?}");
 }
 
 #[cfg(feature = "prove")]
@@ -5271,6 +5401,87 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             assert_eq!(out.stats.passes["carries"].proofs, 0, "{w} bits: {src}");
         }
     }
+}
+
+/// A `w`-bit sum (or difference) split at bit `k`: the low halves added at `k + 1` bits, the
+/// high ones apart, plus the carry read at bit `carry` of the low sum (`k` is right; `None`
+/// drops it).
+#[cfg(feature = "prove")]
+fn split_sum(w: u16, k: u16, sub: bool, carry: Option<u16>) -> String {
+    let (h, op) = (w - k, if sub { "-" } else { "+" });
+    let c = carry.map_or(String::new(), |c| {
+        format!(" {op} zext<{h}>(extract<{c}, 1>(s))")
+    });
+    format!(
+        "let s = zext<{k1}>(trunc<{k}>(x)) {op} zext<{k1}>(trunc<{k}>(y)); \
+         concat(extract<{k}, {h}>(x) {op} extract<{k}, {h}>(y){c}, trunc<{k}>(s))",
+        k1 = k + 1
+    )
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recombines_sums_split_at_any_boundary() {
+    let eng = engine(vec![Phase::Carries]);
+    let same = |src: &str, want: &str| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse(src, &o).unwrap();
+        let want = cx.parse(want, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert_eq!(out.expr, want, "{src}: got {}", cx.display(out.expr));
+    };
+    same(&split_sum(64, 17, false, Some(17)), "x + y");
+    same(&split_sum(64, 32, false, Some(32)), "x + y");
+    same(&split_sum(64, 17, true, Some(17)), "x - y");
+    // The carry as the low sum's unsigned overflow.
+    same(
+        "let s = trunc<23>(x) + trunc<23>(y); \
+         concat(extract<23, 41>(x) + extract<23, 41>(y) + zext<41>(s <u trunc<23>(x)), s)",
+        "x + y",
+    );
+    // Without the carry, or with it read a bit too low, it is not the sum: unchanged.
+    for wrong in [
+        split_sum(64, 17, false, None),
+        split_sum(64, 17, false, Some(16)),
+    ] {
+        same(&wrong, &wrong);
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_is_sound_on_split_sums() {
+    // Every split point of every width from 4 to 10 bits, with the carry right, missing, or
+    // read a bit too low: every result is checked, and the right ones are the sum.
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0x5711);
+    let mut recombined = 0;
+    for w in 4u16..=10 {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        for k in 1..w {
+            for sub in [false, true] {
+                for carry in [Some(k), None, Some(k - 1)] {
+                    let src = split_sum(w, k, sub, carry);
+                    let mut cx = Context::new();
+                    let e = cx.parse(&src, &o).unwrap();
+                    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+                    let r = out.roots[0].expr;
+                    assert!(
+                        equivalent(&mut cx, e, r, &mut rng),
+                        "{src} became {}",
+                        cx.display(r)
+                    );
+                    if carry == Some(k) {
+                        let want = cx.parse(if sub { "x - y" } else { "x + y" }, &o).unwrap();
+                        assert_eq!(r, want, "{src}: got {}", cx.display(r));
+                        recombined += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(recombined, 2 * (3 + 4 + 5 + 6 + 7 + 8 + 9));
 }
 
 // ----- opaque constants (`mba::sweep`) -------------------------------------------
