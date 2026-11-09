@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.27.0
 
 Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.
 `tests/lifter_idioms.rs` checks each under every preset that runs what it needs.
