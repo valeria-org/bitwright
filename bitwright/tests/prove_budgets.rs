@@ -85,12 +85,14 @@ fn simplification_within_a_budget() {
     let first_done = rows.iter().position(|r| r.2.stopped.is_none()).unwrap();
     assert!(rows[first_done..].iter().all(|r| r.2.stopped.is_none()));
     assert!(first_done >= 2, "small budgets stop the engine: {rows:?}");
-    // On node visits, or on pass work where the MBA gate's certificates (the symbolic
-    // comparison charged at its cost) need more than the fuel gives.
+    // On node visits, on pass work where the MBA gate's certificates (the symbolic
+    // comparison charged at its cost) need more than the fuel gives, or on the MBA solver's
+    // calls (`fuel / 1024`) once the opaque-constant sweep has settled identities before the
+    // phases and the MBA phase is reached.
     assert!(
         rows[..first_done].iter().all(|r| matches!(
             r.2.stopped,
-            Some(Exhausted::NodeVisits | Exhausted::PassWork)
+            Some(Exhausted::NodeVisits | Exhausted::PassWork | Exhausted::MbaCalls)
         )),
         "{rows:?}"
     );
@@ -169,4 +171,20 @@ fn resumed_searches_report_their_marginal_cost() {
     assert_eq!(resumed.totals(), once.totals());
     assert!(resumed.last_propagations < once.last_propagations);
     assert_eq!(once.last_conflicts, 300);
+}
+
+/// A question is simplified with the opaque-constant sweep: a product of two forms that are
+/// constant though each reads a comparison's mask (`(m ^ c) + 2·(m & c) − m` is `c`, `(m | c) −
+/// (m & ~c)` is `c`) is folded before the circuit is built, and the question is decided with
+/// no circuit.
+#[cfg(feature = "mba")]
+#[test]
+fn hidden_constants_fold_before_the_circuit() {
+    let src = "let m = -zext<64>(x <u y); \
+         let k = ((m ^ 0x1234) + 2 * (m & 0x1234) - m) * ((m | 0x77) - (m & ~0x77)); \
+         (z ^ k) * (k + 3) == (z ^ 0x8762c) * 0x8762f";
+    let cfg = Config::default().with_max_conflicts(200).with_samples(64);
+    let (out, s) = ask(src, Width::W64, &cfg);
+    assert_eq!(label(&out), "proved");
+    assert!(s.simplification.decided && s.nodes == 0, "{s:?}");
 }

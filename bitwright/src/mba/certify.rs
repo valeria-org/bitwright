@@ -1088,10 +1088,11 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
             meter,
             0,
             false,
+            true,
         )?;
     }
     if report.verdict == Verdict::Unknown {
-        report = prove_at(a, b, meter, 0, false)?;
+        report = prove_at(a, b, meter, 0, false, true)?;
     }
     // Still open, and not for lack of budget: a polynomial question over registers read
     // through their low bits, compared as polynomials over symbols with those registers as
@@ -1127,13 +1128,326 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     Ok(report)
 }
 
-/// [`prove`] within `depth` splits; `lowered`: known bits were already read as arithmetic.
+/// The most changes of variable [`prove`] asks about (atoms tried, most read first).
+const CHANGE_TRIES: usize = 2;
+
+/// Whether a change of variable decided `a == b` (see [`changes_of_variable`]), into `report`;
+/// what the questions spent is added to it either way.
+fn changed<M: Meter>(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    meter: &mut M,
+    report: &mut Report,
+) -> Result<bool, M::Err> {
+    for change in changes_of_variable(a, b) {
+        let sub = prove_at(&change.a, &change.b, meter, 0, false, false)?;
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+        match sub.verdict {
+            Verdict::Proved => {
+                report.verdict = Verdict::Proved;
+                report.cert = sub.cert;
+                report.compositional = sub.compositional;
+                report.split = sub.split;
+                report.known_bits = sub.known_bits;
+                return Ok(true);
+            }
+            Verdict::Refuted => {
+                // Back to the original variable: its value is the inverse at the point.
+                let Some(p) = sub.counterexample else {
+                    return Ok(false);
+                };
+                let Some(x) = change.inverse.eval(&p) else {
+                    return Ok(false);
+                };
+                let mut orig = p;
+                orig[change.var as usize] = x;
+                report.verdict = Verdict::Refuted;
+                report.cert = sub.cert;
+                report.counterexample = Some(orig);
+                return Ok(true);
+            }
+            _ if sub.over_budget => return Ok(false),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// A question over a changed variable (see [`changes_of_variable`]).
+pub(crate) struct Change {
+    pub(crate) a: MbaExpr,
+    pub(crate) b: MbaExpr,
+    /// The variable replaced (its slot now holds the atom).
+    pub(crate) var: u32,
+    /// The original variable as a function of the new one (in its slot).
+    pub(crate) inverse: MbaExpr,
+}
+
+/// One link of a chain from an atom down to a variable: how a node is made from the one below.
+#[derive(Clone, Copy, Debug)]
+enum Link {
+    /// `u ^ c`.
+    Xor(BitVec),
+    /// `u + c` (and `u − c` as `u + (−c)`).
+    Add(BitVec),
+    /// `c − u`.
+    RevSub(BitVec),
+    /// `u · c` for an odd `c`.
+    Mul(BitVec),
+    /// `−u`.
+    Neg,
+    /// `~u`.
+    Not,
+}
+
+impl Link {
+    /// The node below, from the node `v` it makes: the inverse of the link.
+    fn undo(&self, out: &mut MbaExpr, v: u32) -> Option<u32> {
+        let w = out.nodes()[v as usize].width;
+        let konst = |out: &mut MbaExpr, c: BitVec| out.push(MOp::Const(c), &[]).ok();
+        match *self {
+            Link::Xor(c) => {
+                let k = konst(out, c)?;
+                out.push(MOp::Xor, &[v, k]).ok()
+            }
+            Link::Add(c) => {
+                let k = konst(out, BitVec::un_unchecked(UnOp::Neg, &c))?;
+                out.push(MOp::Add, &[v, k]).ok()
+            }
+            Link::RevSub(c) => {
+                let k = konst(out, c)?;
+                out.push(MOp::Sub, &[k, v]).ok()
+            }
+            Link::Mul(c) => {
+                let k = konst(out, crate::invert::mul_inverse(&c)?)?;
+                debug_assert_eq!(out.nodes()[k as usize].width, w);
+                out.push(MOp::Mul, &[v, k]).ok()
+            }
+            Link::Neg => out.push(MOp::Neg, &[v]).ok(),
+            Link::Not => out.push(MOp::Not, &[v]).ok(),
+        }
+    }
+}
+
+/// The question `a == b` with a variable `x` replaced by a bijection of an atom: for an
+/// arithmetic node read by a bitwise operator (an atom to the tests) that is a chain of
+/// invertible links over `x` alone (`^ c`, `+ c`, `− c`, `c −`, `· odd`, `−`, `~`), say
+/// `t = (x ^ c) + k`, both sides are rewritten over `t` in `x`'s slot: `x` is `(t − k) ^ c`, every
+/// node of the chain the matching inverse of `t`, the atom `t` itself. As `x ↦ t` is a bijection
+/// of the variable's values, the sides are equal everywhere exactly when the rewritten ones are,
+/// and an input where those differ gives one where these do (`x` the inverse at it).
+///
+/// The tests read an atom and the variable inside it as independent, so a side that reads both
+/// (`(x ^ c)·m` beside bitwise functions of `t`, or `k' − (x ^ c)`, which is `~t` when
+/// `k + k' = −1`) differs from its answer over them though not over `x`. Over `t` the chain reads
+/// `t` and its inverses: arithmetic of `t` alone, which the tests take as it is, and a semi-linear
+/// question over `t` is decided at its single bits. Candidates most read first.
+pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
+    let Some(w) = a.width() else {
+        return Vec::new();
+    };
+    if a.vars() != b.vars() || b.width() != Some(w) {
+        return Vec::new();
+    }
+    // Both sides in one hash-consed list, so a chain node of one is found in the other.
+    let mut nodes: Vec<MNode> = Vec::new();
+    let mut intern: HashMap<MNode, u32> = HashMap::new();
+    let mut roots = [0u32; 2];
+    for (side, m) in [a, b].into_iter().enumerate() {
+        let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
+        for n in m.nodes() {
+            let mut node = *n;
+            for k in 0..n.op.arity() {
+                node.args[k] = map[n.args[k] as usize];
+            }
+            if commutative(&node.op) && node.args[0] > node.args[1] {
+                node.args.swap(0, 1);
+            }
+            let id = *intern.entry(node).or_insert_with(|| {
+                nodes.push(node);
+                nodes.len() as u32 - 1
+            });
+            map.push(id);
+        }
+        let Some(&r) = map.last() else {
+            return Vec::new();
+        };
+        roots[side] = r;
+    }
+    let cst = constants(&nodes);
+    // Arithmetic nodes read by a bitwise operator, with how often.
+    let bitwise = |op: MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor);
+    let arith = |op: MOp| matches!(op, MOp::Add | MOp::Sub | MOp::Mul | MOp::Neg);
+    let mut reads: HashMap<u32, usize> = HashMap::new();
+    for n in &nodes {
+        if bitwise(n.op) || n.op == MOp::Not {
+            for &k in &n.args[..n.op.arity()] {
+                if arith(nodes[k as usize].op) && cst[k as usize].is_none() {
+                    *reads.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    // Each one's chain down to a variable, top first.
+    let chain = |top: u32| -> Option<(u32, Vec<(u32, Link)>)> {
+        let mut links = Vec::new();
+        let mut cur = top;
+        for _ in 0..16 {
+            let n = nodes[cur as usize];
+            if n.width != w {
+                return None;
+            }
+            let c = |k: usize| cst[n.args[k] as usize];
+            let (link, next) = match n.op {
+                MOp::Var(x) => return Some((x, links)),
+                MOp::Add => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::Add(k), n.args[1]),
+                    (None, Some(k)) => (Link::Add(k), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Sub => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::RevSub(k), n.args[1]),
+                    (None, Some(k)) => (Link::Add(BitVec::un_unchecked(UnOp::Neg, &k)), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Xor => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::Xor(k), n.args[1]),
+                    (None, Some(k)) => (Link::Xor(k), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Mul => match (c(0), c(1)) {
+                    (Some(k), None) | (None, Some(k)) if k.bit(0) == Some(true) => {
+                        let u = if c(0).is_some() { n.args[1] } else { n.args[0] };
+                        (Link::Mul(k), u)
+                    }
+                    _ => return None,
+                },
+                MOp::Neg => (Link::Neg, n.args[0]),
+                MOp::Not => (Link::Not, n.args[0]),
+                _ => return None,
+            };
+            links.push((cur, link));
+            cur = next;
+        }
+        None
+    };
+    let mut cands: Vec<(usize, u32)> = reads.iter().map(|(&k, &n)| (n, k)).collect();
+    cands.sort_by_key(|&(n, k)| (std::cmp::Reverse(n), k));
+    let mut out: Vec<Change> = Vec::new();
+    for (_, top) in cands {
+        if out.len() == CHANGE_TRIES {
+            break;
+        }
+        let Some((x, links)) = chain(top) else {
+            continue;
+        };
+        if out.iter().any(|c| c.var == x) || a.vars()[x as usize] != w {
+            continue;
+        }
+        let rebuild = |root: u32| -> Option<MbaExpr> {
+            let mut m = MbaExpr::new(a.vars().to_vec());
+            // The chain over `t`, top down: the atom is `t`, each node below the inverse of
+            // its link applied to the one above.
+            let mut map: HashMap<u32, u32> = HashMap::new();
+            let mut v = m.push(MOp::Var(x), &[]).ok()?;
+            for &(node, link) in &links {
+                map.insert(node, v);
+                v = link.undo(&mut m, v)?;
+            }
+            // `v` is now `x` as a function of `t`.
+            let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+            while let Some((i, expanded)) = stack.pop() {
+                if map.contains_key(&i) {
+                    continue;
+                }
+                let n = nodes[i as usize];
+                if let MOp::Var(y) = n.op
+                    && y == x
+                {
+                    map.insert(i, v);
+                    continue;
+                }
+                if !expanded {
+                    stack.push((i, true));
+                    for &k in &n.args[..n.op.arity()] {
+                        stack.push((k, false));
+                    }
+                    continue;
+                }
+                let args: Vec<u32> = n.args[..n.op.arity()].iter().map(|k| map[k]).collect();
+                let id = match n.op {
+                    MOp::Zext | MOp::Sext | MOp::Trunc => m.push_cast(n.op, args[0], n.width),
+                    op => m.push(op, &args),
+                }
+                .ok()?;
+                map.insert(i, id);
+            }
+            // The root must be the last node.
+            let r = map[&root];
+            if r as usize + 1 != m.nodes().len() {
+                let n = m.nodes()[r as usize];
+                let zero = m.push(MOp::Const(BitVec::zero(n.width)), &[]).ok()?;
+                m.push(MOp::Add, &[r, zero]).ok()?;
+            }
+            Some(m)
+        };
+        let (Some(ca), Some(cb)) = (rebuild(roots[0]), rebuild(roots[1])) else {
+            continue;
+        };
+        let mut inverse = MbaExpr::new(a.vars().to_vec());
+        let Some(mut v) = inverse.push(MOp::Var(x), &[]).ok() else {
+            continue;
+        };
+        let mut ok = true;
+        for &(_, link) in &links {
+            match link.undo(&mut inverse, v) {
+                Some(u) => v = u,
+                None => ok = false,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        out.push(Change {
+            a: ca,
+            b: cb,
+            var: x,
+            inverse,
+        });
+    }
+    out
+}
+
+/// What the cheapest direct test on `a` and `b` costs in node evaluations, when one applies
+/// and is not too big to run: a complete test, so one that runs decides the question.
+pub(crate) fn direct_cost(a: &MbaExpr, b: &MbaExpr) -> Option<u64> {
+    if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
+        return None;
+    }
+    let (pa, pb) = (profile(a)?, profile(b)?);
+    let p = plan(a, &pa, &pb)?;
+    let (qa, qb) = (Program::new(a, false)?, Program::new(b, false)?);
+    let per = (qa.len() + qb.len()) as u64;
+    let lane = match Kind::of(qa.widest().max(qb.widest())) {
+        Kind::N64 => 1,
+        Kind::N128 => 2,
+        Kind::Wide => 8,
+    };
+    (p.points <= MAX_POINTS && p.points.saturating_mul(per).saturating_mul(lane) <= MAX_EFFORT)
+        .then(|| p.points.saturating_mul(per))
+}
+
+/// [`prove`] within `depth` splits; `lowered`: known bits were already read as arithmetic;
+/// `change`: a change of variable may be tried (see [`changes_of_variable`]).
 fn prove_at<M: Meter>(
     a: &MbaExpr,
     b: &MbaExpr,
     meter: &mut M,
     depth: u32,
     lowered: bool,
+    change: bool,
 ) -> Result<Report, M::Err> {
     let mut report = Report::new();
     if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
@@ -1195,6 +1509,12 @@ fn prove_at<M: Meter>(
     if report.verdict != Verdict::Unknown || report.over_budget {
         return Ok(report);
     }
+    // The same question over an atom that is a bijection of one variable, in that variable's
+    // place (see `changes_of_variable`): before the readings below, which split and lower
+    // the question as it is and cost more.
+    if change && changed(a, b, meter, &mut report)? {
+        return Ok(report);
+    }
     // The same question with known bits read as arithmetic (equal functions, so a verdict on
     // them is one on `a` and `b`, at the same points); it splits too.
     if !lowered && (lowerable(a) || lowerable(b)) {
@@ -1208,7 +1528,7 @@ fn prove_at<M: Meter>(
         if la.is_some() || lb.is_some() {
             let la = la.unwrap_or_else(|| a.clone());
             let lb = lb.unwrap_or_else(|| b.clone());
-            let sub = prove_at(&la, &lb, meter, depth, true)?;
+            let sub = prove_at(&la, &lb, meter, depth, true, false)?;
             report.points += sub.points;
             report.over_budget |= sub.over_budget;
             report.internal += sub.internal;
@@ -1592,7 +1912,7 @@ fn split<M: Meter>(
             return Ok(());
         };
         let before = meter.left();
-        let sub = prove_at(&sa, &sb, meter, depth + 1, false)?;
+        let sub = prove_at(&sa, &sb, meter, depth + 1, false, false)?;
         spent = spent.saturating_add(before.saturating_sub(meter.left()));
         report.points += sub.points;
         report.over_budget |= sub.over_budget;
@@ -1654,6 +1974,14 @@ enum Ctx {
 enum Policy {
     /// Only where the fragment requires it (opaque nodes, arithmetic read bitwise).
     Minimal,
+    /// The atoms of [`Minimal`](Self::Minimal), each read as its class's bitwise
+    /// representative where it has one (see [`Linear`](Self::Linear)), operators with
+    /// constants included: equal to the atom at every input, over atoms of earlier classes,
+    /// so the skeleton has fewer independent atoms and stays semi-linear where it was. Two
+    /// atoms that are complements (`k − t` and `t + (−1 − k)`, both read bitwise) are one atom
+    /// and its complement: a semi-linear question over that one atom, which the single-bit
+    /// test decides, where as two independent atoms the skeletons differ.
+    Reps,
     /// The same atoms, read closer to their definitions: an atom whose class has a bitwise
     /// representative (a member that is a bitwise function of atoms of earlier classes and of
     /// variables, proved equal to it) is that function, and a bitwise function of atoms read
@@ -1981,6 +2309,7 @@ impl Compose {
         }
         for policy in [
             Policy::Minimal,
+            Policy::Reps,
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
@@ -2025,6 +2354,7 @@ impl Compose {
         }
         for policy in [
             Policy::Minimal,
+            Policy::Reps,
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
@@ -2978,7 +3308,7 @@ impl Compose {
                 }
                 let c = self.find(i);
                 match policy {
-                    Policy::Minimal | Policy::Linear => false,
+                    Policy::Minimal | Policy::Reps | Policy::Linear => false,
                     Policy::Classes => !root && self.abstracted[c as usize],
                     Policy::Everything => self.abstracted[c as usize],
                 }
@@ -2992,14 +3322,30 @@ impl Compose {
         let mut out: Vec<SkelNode> = Vec::new();
         let mut memo: HashMap<(u32, Ctx), u32> = HashMap::new();
         let mut stack: Vec<(u32, Ctx, bool)> = vec![(root, Ctx::Arith, false)];
+        // Under `Policy::Reps`, atoms read as their representative: the atom's skeleton is the
+        // representative's (whose leaves are of earlier classes, so this ends).
+        let mut alias: HashMap<u32, u32> = HashMap::new();
         while let Some((i, ctx, expanded)) = stack.pop() {
             if memo.contains_key(&(i, ctx)) {
                 continue;
             }
             let n = self.nodes[i as usize];
+            if expanded && let Some(&r) = alias.get(&i) {
+                let at = *memo.get(&(r, ctx))?;
+                memo.insert((i, ctx), at);
+                continue;
+            }
             if !expanded {
                 if let Some(c) = self.cst[i as usize] {
                     out.push(SkelNode::Const(c));
+                } else if policy == Policy::Reps
+                    && self.atom(i, ctx, i == root, policy)
+                    && let Some(r) = self.rep_of(i)
+                {
+                    alias.insert(i, r);
+                    stack.push((i, ctx, true));
+                    stack.push((r, ctx, false));
+                    continue;
                 } else if self.atom(i, ctx, i == root, policy) {
                     let c = self.find(i);
                     let v = match self.var_member[c as usize] {

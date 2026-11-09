@@ -10,6 +10,7 @@ use crate::mba::{
     Bindings, CacheEntry, CacheKey, Claim, LOWERING_VERSION, MOp, MbaAnswer, MbaConfig, MbaExpr,
     Reading, Refusal, Verdict, lift_id, lower_id, lower_id_reading, shared_nodes,
 };
+use crate::{BinOp, UnOp};
 
 /// Points for the always-on refutation check and for trusted sampling.
 const SAMPLE_POINTS: u32 = certify::SAMPLE_POINTS as u32;
@@ -45,16 +46,43 @@ fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Resul
     Ok(certify::refute(a, b, &points).is_none())
 }
 
-/// Pass work as a certificate's meter.
-struct Gate<'x, 'r, 'a>(&'x mut Runner<'r, 'a>);
+/// Pass work as a certificate's meter, at most `share` of it.
+struct Gate<'x, 'r, 'a> {
+    r: &'x mut Runner<'r, 'a>,
+    share: u64,
+}
+
+impl<'x, 'r, 'a> Gate<'x, 'r, 'a> {
+    /// A meter for the certificate of `a == b`: at most [`GATE_SHARE`] of the call's pass
+    /// work, or what a direct test of the pair costs (twice: with its casts taken out and
+    /// without) where that is more.
+    fn new(r: &'x mut Runner<'r, 'a>, a: &MbaExpr, b: &MbaExpr) -> Self {
+        let limit = r.meter.limit.pass_work;
+        let direct = certify::direct_cost(a, b).unwrap_or(0).saturating_mul(2);
+        let share = (limit / GATE_SHARE).max(GATE_SHARE_MIN).max(direct);
+        Gate { r, share }
+    }
+}
+
+/// One answer's certificate spends at most this fraction of the call's pass work (and at least
+/// [`GATE_SHARE_MIN`] units), unless a direct test, which decides when it runs, costs more.
+/// Without a share one answer the tests cannot decide took the whole call: a compositional
+/// test over two variables and 112 nodes spent 7.5M of a call's 8.4M units, undecided, and the
+/// phases after it had none left. A compositional proof can need much of a call (a sparse test
+/// on a skeleton over three 32-bit variables, 20M of 67M units), so the share is half.
+const GATE_SHARE: u64 = 2;
+
+/// See [`GATE_SHARE`].
+const GATE_SHARE_MIN: u64 = 1 << 20;
 
 impl certify::Meter for Gate<'_, '_, '_> {
     type Err = Stop;
     fn left(&self) -> u64 {
-        self.0.meter.left_in(|b| b.pass_work)
+        self.r.meter.left_in(|b| b.pass_work).min(self.share)
     }
     fn charge(&mut self, units: u64) -> Result<(), Stop> {
-        self.0
+        self.share = self.share.saturating_sub(units);
+        self.r
             .meter
             .charge(Counter::PassWork, units)
             .map_err(Stop::Exhausted)
@@ -68,7 +96,7 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
 /// than what is left is not started (reported as over budget).
 fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
-    let report = certify::prove(a, b, &mut Gate(r))?;
+    let report = certify::prove(a, b, &mut Gate::new(r, a, b))?;
     count(r).certificates.record(&report);
     Ok(report)
 }
@@ -191,6 +219,10 @@ fn sweep_inner(
     // that selector after both sides are proved constant. Keep this narrow: the sweep already
     // visits every node, while a side proof asks several readings.
     let mut case_attempts = 0usize;
+    // The varying nodes met so far by their samples, and the related pairs no proof was found
+    // for (see `Classes`).
+    let mut classes = Classes::default();
+    let mut unrelated = 0usize;
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
@@ -206,7 +238,24 @@ fn sweep_inner(
             }
         };
     }
+    // The node examined last, recorded in `r.swept` once the next one begins (unless the
+    // budget ended while it was asked about, which left it unexamined).
+    let mut pending: Option<u32> = None;
     'nodes: for &i in &order {
+        if let Some(p) = pending.take()
+            && !spent
+        {
+            r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+        }
+        // Examined by an earlier sweep of this call (of another root, or of a case's other
+        // side): its result is equal to it, and asking again finds what that sweep found.
+        if let Some(&done) = r.swept.get(&i) {
+            to.insert(i, done);
+            if done == i {
+                classes.note(&r.samples[&i], i);
+            }
+            continue;
+        }
         let node = cx.node(i);
         let mut kids = [0u32; 3];
         let mut changed = false;
@@ -226,11 +275,36 @@ fn sweep_inner(
         // A leaf is never taken (a symbol's samples follow what the host declared of it), nor
         // an extension operator (it may not be a function of its operands alone).
         if node.children().next().is_none() || node.op.as_ext().is_some() {
+            if cur == i {
+                classes.note(&r.samples[&i], i);
+            }
             continue;
         }
+        pending = Some(i);
         let vals = &r.samples[&i];
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
+            // A node the samples relate to one met before it (see `related`).
+            let found = match unrelated < SWEEP_UNRELATED {
+                true => classes.find(vals),
+                false => Vec::new(),
+            };
+            for (rep, relation, d) in found {
+                let rep = to.get(&rep).copied().unwrap_or(rep);
+                match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
+                    Related::Proved(e) => {
+                        to.insert(i, e);
+                        continue 'nodes;
+                    }
+                    Related::Written => {}
+                    Related::Open => {
+                        unrelated += 1;
+                        break;
+                    }
+                }
+            }
+            classes.note(&r.samples[&i], i);
+            let vals = &r.samples[&i];
             let top = !links.get(&i).copied().unwrap_or(false);
             let mut rewritten = None;
             if top
@@ -311,6 +385,14 @@ fn sweep_inner(
         if !decided && !refuted && mixed {
             let seen;
             (decided, refuted, seen) = asked!('nodes, readings_prove(r, cx, cfg, subject, &k));
+            // The candidate as it is written, where the reduced one was not decided: taking
+            // each operand on the bits its user reads writes one value read under several
+            // masks once per mask, each a variable of its own, and what the terms cancel
+            // through (the one value they all read) is gone.
+            if !decided && !refuted && subject != cur {
+                let again = asked!('nodes, readings_prove(r, cx, cfg, cur, &k));
+                decided = again.0;
+            }
             // the root, a constant some reading's free atoms refute, one case of
             // the condition it tests at a time (see `cases_prove`). The root only: inner
             // candidates are what the readings fold, and splitting each of them doubled the
@@ -332,8 +414,200 @@ fn sweep_inner(
             failures += 1;
         }
     }
+    if let Some(p) = pending
+        && !spent
+    {
+        r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+    }
     Ok(to.get(&root).copied().unwrap_or(root))
 }
+
+/// How the samples relate a node to one met before it: `rep + d`, `d − rep` or `rep ^ d`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Relation {
+    Sum,
+    Difference,
+    Xor,
+}
+
+/// The varying nodes of a sweep by their samples, up to a constant: the nodes met with each
+/// sequence of differences from the first sample (`v[j] − v[0]`; the first met with each
+/// `v[j] ^ v[0]`), each with its first sample. Two nodes a constant apart (added, or xored), or
+/// whose sum is constant, agree there; so do two that are equal, a constant of zero apart.
+#[derive(Default)]
+struct Classes {
+    sums: std::collections::HashMap<Box<[crate::BitVec]>, Vec<(u32, crate::BitVec)>>,
+    xors: std::collections::HashMap<Box<[crate::BitVec]>, (u32, crate::BitVec)>,
+}
+
+impl Classes {
+    fn key(vals: &[crate::BitVec], op: BinOp, flip: bool) -> Box<[crate::BitVec]> {
+        let first = &vals[0];
+        vals.iter()
+            .map(|v| match flip {
+                false => crate::BitVec::bin_unchecked(op, v, first),
+                true => crate::BitVec::bin_unchecked(op, first, v),
+            })
+            .collect()
+    }
+
+    /// Whether nodes of this width are kept: a narrow one takes few values, and agrees with
+    /// many others on every sample.
+    fn kept(vals: &[crate::BitVec]) -> bool {
+        vals.first()
+            .is_some_and(|v| v.width().bits() >= SWEEP_RELATED_BITS)
+    }
+
+    /// Records `i` (samples `vals`).
+    fn note(&mut self, vals: &[crate::BitVec], i: u32) {
+        if !Self::kept(vals) || vals.iter().all(|v| *v == vals[0]) {
+            return;
+        }
+        let class = self
+            .sums
+            .entry(Self::key(vals, BinOp::Sub, false))
+            .or_default();
+        if class.len() < SWEEP_CLASS {
+            class.push((i, vals[0]));
+        }
+        self.xors
+            .entry(Self::key(vals, BinOp::Xor, false))
+            .or_insert((i, vals[0]));
+    }
+
+    /// The nodes recorded that a node with samples `vals` is related to on every sample, how,
+    /// and the constant `d` of each relation: one equal to it, one that is its complement,
+    /// then the first met a constant from it, the first met whose sum with it is constant, the
+    /// first met a constant xored from it.
+    fn find(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
+        use crate::BitVec;
+        let mut found = Vec::new();
+        if !Self::kept(vals) {
+            return found;
+        }
+        let same = self.sums.get(&Self::key(vals, BinOp::Sub, false));
+        let opposite = self.sums.get(&Self::key(vals, BinOp::Sub, true));
+        let zero = BitVec::zero(vals[0].width());
+        if let Some(&(rep, _)) = same.and_then(|c| c.iter().find(|(_, first)| *first == vals[0])) {
+            found.push((rep, Relation::Sum, zero));
+        }
+        let sum = |first: &BitVec| BitVec::bin_unchecked(BinOp::Add, &vals[0], first);
+        if let Some(&(rep, first)) =
+            opposite.and_then(|c| c.iter().find(|(_, first)| sum(first).is_ones()))
+        {
+            found.push((rep, Relation::Difference, sum(&first)));
+        }
+        if let Some(&(rep, first)) = same.and_then(|c| c.first())
+            && first != vals[0]
+        {
+            let d = BitVec::bin_unchecked(BinOp::Sub, &vals[0], &first);
+            found.push((rep, Relation::Sum, d));
+        }
+        if let Some(&(rep, first)) = opposite.and_then(|c| c.first())
+            && !sum(&first).is_ones()
+        {
+            found.push((rep, Relation::Difference, sum(&first)));
+        }
+        if let Some((rep, first)) = self.xors.get(&Self::key(vals, BinOp::Xor, false)) {
+            let d = BitVec::bin_unchecked(BinOp::Xor, &vals[0], first);
+            found.push((*rep, Relation::Xor, d));
+        }
+        found
+    }
+}
+
+/// What [`related`] found of a node and the one its samples relate it to.
+enum Related {
+    /// Proved: the node written over the other.
+    Proved(u32),
+    /// The node is already written over the other.
+    Written,
+    /// No proof.
+    Open,
+}
+
+/// One value written twice. An obfuscator computes a value again where it reads it again:
+/// `(t ^ a) + b` here, `c − (t ^ a')` there, `~(e − (t ^ a))` in a third place, equal through the
+/// bits known of `t`. Each is its own atom to every reading above, so a sum over them that
+/// cancels is not seen to (the certificate takes atoms for independent), and no rule relates
+/// two nodes it is not looking at. The samples do: `cur`, which they show to be `rep + d`,
+/// `d − rep` or `rep ^ d` for a node `rep` met before it, is asked about as an opaque constant
+/// is (the difference of the two, whether it is zero), and written that way once proved. The
+/// sums above then read one atom, and the linear passes collect its terms.
+fn related(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    cur: u32,
+    rep: u32,
+    relation: Relation,
+    d: &crate::BitVec,
+) -> Result<Related, Stop> {
+    // Written over `rep` and constants alone: nothing to relate.
+    let node = cx.node(cur);
+    if cur == rep
+        || (node.children().any(|c| c == rep)
+            && node
+                .children()
+                .all(|c| c == rep || cx.const_val(c).is_some()))
+    {
+        return Ok(Related::Written);
+    }
+    let zero = crate::BitVec::zero(d.width());
+    let e = r.build(cx, |cx| {
+        let k = cx.mk_const(d)?;
+        match relation {
+            Relation::Sum if d.is_zero() => Ok(rep),
+            Relation::Sum => cx.c_bin(BinOp::Add, rep, k),
+            Relation::Difference if d.is_zero() => cx.c_un(UnOp::Neg, rep),
+            Relation::Difference if d.is_ones() => cx.c_un(UnOp::Not, rep),
+            Relation::Difference => cx.c_bin(BinOp::Sub, k, rep),
+            Relation::Xor => cx.c_bin(BinOp::Xor, rep, k),
+        }
+    })?;
+    if e == cur {
+        return Ok(Related::Written);
+    }
+    let op = match relation {
+        Relation::Xor => BinOp::Xor,
+        _ => BinOp::Sub,
+    };
+    let diff = r.build(cx, |cx| cx.c_bin(op, cur, e))?;
+    let proved = |v: crate::BitVec| match v.is_zero() {
+        true => Related::Proved(e),
+        false => Related::Open,
+    };
+    if let Some(v) = cx.const_val(diff) {
+        return Ok(proved(v));
+    }
+    let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS)?;
+    if let Some(v) = cx.const_val(subject) {
+        return Ok(proved(v));
+    }
+    if let Some(holds) = exhaustive(r, cx, subject, &zero)? {
+        count(r).opaque_exhausted += u64::from(holds);
+        return Ok(if holds {
+            Related::Proved(e)
+        } else {
+            Related::Open
+        });
+    }
+    let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero)?;
+    if decided {
+        count(r).opaque_proved += 1;
+        return Ok(Related::Proved(e));
+    }
+    Ok(Related::Open)
+}
+
+/// The related pairs a sweep asks about without a proof before it asks about no more.
+const SWEEP_UNRELATED: usize = 64;
+
+/// The most nodes a sweep keeps of those a constant apart.
+const SWEEP_CLASS: usize = 16;
+
+/// The narrowest node a sweep relates to another by its samples.
+const SWEEP_RELATED_BITS: u16 = 8;
 
 /// whether `root` is `k` at every point, decided by evaluating it at every value of
 /// the bits of its symbols that reach it, when those number at most [`EXHAUSTIVE_BITS`]: a byte
@@ -345,7 +619,7 @@ fn sweep_inner(
 /// more.
 fn exhaustive(
     r: &mut Runner<'_, '_>,
-    cx: &Context,
+    cx: &mut Context,
     root: u32,
     k: &crate::BitVec,
 ) -> Result<Option<bool>, Stop> {
@@ -463,14 +737,24 @@ fn exhaustive(
         }
     }
     let mut total: u32 = syms.iter().map(|(_, m)| m.count_ones()).sum();
+    // The bits set in every value enumerated, and whether the values are a node's (not the
+    // symbols'): a node may take fewer values than its unknown bits allow, so a value the root
+    // differs at decides nothing.
+    let (mut base, mut cut_at) = (0u64, false);
     let (order, at) = if total > EXHAUSTIVE_BITS {
         // too many symbol bits; a node every demanded path from them passes
         // through, with few bits of its own, is enumerated instead.
         let Some(cut) = bottleneck(cx, &order, &at, &demand) else {
             return Ok(None);
         };
-        syms = vec![(order[cut], demand[cut])];
-        total = demand[cut].count_ones();
+        // Over the values it can take: the bits known of it are those values' (a sum
+        // that is constant only for them is constant), and a value it never takes refutes
+        // nothing.
+        let [z, o] = super::known_words(r, cx, order[cut])?.0.unwrap_or([0, 0]);
+        syms = vec![(order[cut], demand[cut] & !(z | o))];
+        base = o & demand[cut];
+        cut_at = true;
+        total = syms[0].1.count_ones();
         above(cx, &order, order[cut])
     } else {
         (order, at)
@@ -494,7 +778,7 @@ fn exhaustive(
         for p in 0..points {
             let mut left = p;
             for &(s, m) in &syms {
-                let mut v = 0u64;
+                let mut v = base;
                 let mut mm = m;
                 while mm != 0 {
                     let b = mm & mm.wrapping_neg();
@@ -508,7 +792,7 @@ fn exhaustive(
             }
             run64(&prog, &mut vals);
             if Some(vals[at[&root]]) != ku {
-                return Ok(Some(false));
+                return Ok((!cut_at).then_some(false));
             }
         }
         return Ok(Some(true));
@@ -518,7 +802,7 @@ fn exhaustive(
         // Spread the point's bits over each symbol's bits that reach the root.
         let mut left = p;
         for &(s, m) in &syms {
-            let mut v = 0u64;
+            let mut v = base;
             let mut mm = m;
             while mm != 0 {
                 let b = mm & mm.wrapping_neg();
@@ -540,7 +824,7 @@ fn exhaustive(
                 .map_err(Stop::Error)?;
         }
         if vals[at[&root]] != *k {
-            return Ok(Some(false));
+            return Ok((!cut_at).then_some(false));
         }
     }
     Ok(Some(true))
@@ -1444,6 +1728,32 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     Ok(Some(cx.substitute_ids(&[n], &repl)?[0]))
 }
 
+/// Whether the fragment under `root` holds one the solver already declined in this call for
+/// its size (too many atoms, variables or bit classes): a fragment that holds it has as many,
+/// and the solver would spend the same steps finding that out. An obfuscated value read by a
+/// chain of operations asks once at the first of them where it asked at every one (27
+/// questions of 820 nodes in one measured question, 310,000 steps each, half the run's steps).
+fn outgrown(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> bool {
+    if r.mba_outgrown.is_empty() {
+        return false;
+    }
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    for &a in &bindings.atoms {
+        seen.insert(a, ());
+    }
+    let mut stack = vec![root];
+    while let Some(i) = stack.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if r.mba_outgrown.contains_key(&i) {
+            return true;
+        }
+        stack.extend(cx.node(i).children());
+    }
+    false
+}
+
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
 /// the answer replaces `n`.
 fn ask(
@@ -1479,6 +1789,10 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
+    if outgrown(r, cx, root, &bindings) {
+        count(r).unsupported += 1;
+        return Ok(Step::Normal(Fin::FINAL));
+    }
     let inner = r.inner;
     let prover_id = inner.mba.prover.as_ref().map_or("", |p| p.id());
     // The question's content hash, once (it hashes every node).
@@ -1551,6 +1865,9 @@ fn ask(
                     }
                     if a != MbaAnswer::Exhausted {
                         r.mba_answers.insert(key, a.clone());
+                    }
+                    if matches!(&a, MbaAnswer::Unsupported(why) if why.starts_with("too many")) {
+                        r.mba_outgrown.insert(root, ());
                     }
                     a
                 }

@@ -3058,8 +3058,10 @@ mod mba_service {
         }
     }
 
-    /// Right except at one input no sample reaches: `x + y + [x·K₁ = K₂]`, true only at
-    /// `x = K₂·K₁⁻¹`, a value that is not a constant of either side (nor a neighbour of one).
+    /// Right except where no sample reaches: `x + y + [x·K₁ + y = K₂]`, a relation between the
+    /// variables that no constant of either side (nor a neighbour of one) satisfies. Not over
+    /// `x` alone: `[x·K₁ = K₂]` is one point, which the certificates reach through a change of
+    /// variable to `x·K₁`, where it is the constant `K₂`.
     struct Subtle;
     impl MbaSolver for Subtle {
         fn id(&self) -> &str {
@@ -3084,7 +3086,8 @@ mod mba_service {
                 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(0x1234_5678_9abc_def1),
             );
             let xk = m.push(MOp::Mul, &[x, k1]).unwrap();
-            let d = m.push(MOp::Xor, &[xk, k2]).unwrap();
+            let xky = m.push(MOp::Add, &[xk, y]).unwrap();
+            let d = m.push(MOp::Xor, &[xky, k2]).unwrap();
             let nd = m.push(MOp::Neg, &[d]).unwrap();
             let o = m.push(MOp::Or, &[d, nd]).unwrap();
             let nz = m.push(MOp::LShr(w.bits() - 1), &[o]).unwrap();
@@ -5541,6 +5544,52 @@ mod opaque_constants {
             .unwrap();
         assert_eq!(out.roots[0].expr, want, "{}", cx.display(out.roots[0].expr));
         assert!(out.stats.mba.opaque_proved > 0);
+    }
+
+    /// Roots that share a hidden constant ask about it once: the sweep of the second reads what
+    /// the sweep of the first found, so the two together ask no more than the first alone.
+    #[test]
+    fn roots_share_what_a_sweep_found() {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        let srcs = [
+            format!("{PRIME} (0xcbf29ce484222325 ^ (p >>u 40)) * p + x"),
+            format!("{PRIME} (p >>u 40) + (y ^ p)"),
+        ];
+        let run = |which: &[usize]| {
+            let mut cx = Context::new();
+            let roots: Vec<_> = which
+                .iter()
+                .map(|&i| {
+                    cx.parse(&srcs[i], &ParseOptions::width(Width::W64))
+                        .unwrap()
+                })
+                .collect();
+            let out = eng
+                .run(
+                    &mut cx,
+                    &roots,
+                    Run::default().with_per_call(Budget::fuel(1 << 16)),
+                )
+                .unwrap();
+            let shown: Vec<_> = out
+                .roots
+                .iter()
+                .map(|r| cx.display(r.expr).to_string())
+                .collect();
+            (shown, out.stats.mba.opaque_asked)
+        };
+        let (first, second, both) = (run(&[0]), run(&[1]), run(&[0, 1]));
+        assert_eq!(both.0, [first.0.clone(), second.0.clone()].concat());
+        // `(y ^ p) + 1`, `p >> 40` being 1.
+        assert_eq!(second.0, ["-(y ^ 0xfffffefffffffe4c)"]);
+        assert!(first.1 > 0 && second.1 > 0);
+        assert_eq!(both.1, first.1, "{first:?} {second:?} {both:?}");
     }
 
     #[test]

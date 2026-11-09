@@ -201,7 +201,7 @@ pub(crate) fn lower_id(
     lim: &MbaLimits,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
     let (atoms, order) = scan(cx, root, lim)?;
-    build(cx, atoms, order)
+    build(cx, atoms, order, &[])
 }
 
 /// [`lower_id`] over `reading`'s narrower fragment: every other subterm (a cast,
@@ -214,21 +214,93 @@ pub(crate) fn lower_id_reading(
     lim: &MbaLimits,
     reading: Reading,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
-    let (atoms, order) = match reading {
+    let inside = |cx: &Context, i: u32, under: Option<&IdMap<u32, ()>>| match reading {
         Reading::Shallow => {
-            let under = under_bitwise(cx, root, lim)?;
-            scan_in(cx, root, lim, &|cx, i| {
-                in_reading(cx, i, Reading::SemiLinear)
-                    && (bitwise_or_const(cx, i) || !under.contains_key(&i))
-            })?
+            in_reading(cx, i, Reading::SemiLinear)
+                && (bitwise_or_const(cx, i) || under.is_none_or(|u| !u.contains_key(&i)))
         }
-        Reading::Cut(cut) => scan_in(cx, root, lim, &|cx, i| {
-            i != cut && in_reading(cx, i, Reading::SemiLinear)
-        })?,
-        Reading::CutWhole(cut) => scan_in(cx, root, lim, &|cx, i| i != cut && in_fragment(cx, i))?,
-        _ => scan_in(cx, root, lim, &|cx, i| in_reading(cx, i, reading))?,
+        Reading::Cut(cut) => i != cut && in_reading(cx, i, Reading::SemiLinear),
+        Reading::CutWhole(cut) => i != cut && in_fragment(cx, i),
+        _ => in_reading(cx, i, reading),
     };
-    build(cx, atoms, order)
+    let under = match reading {
+        Reading::Shallow => Some(under_bitwise(cx, root, lim)?),
+        _ => None,
+    };
+    let (atoms, order) = scan_in(cx, root, lim, &|cx, i| inside(cx, i, under.as_ref()))?;
+    // An atom that is its operand and a constant added (`a = t + k`, `a = k − t`), where the
+    // fragment reads `t` too: `t` is `a − k` (`k − a`), a sum over the atom, and nothing below
+    // `t` is read. The terms linear in `t` are then terms of `a`, which the bitwise operators
+    // read: one variable, where `t`'s own atoms beside `a` were two values no test relates.
+    let candidates: &[u32] = match reading {
+        Reading::Shallow => &atoms,
+        Reading::Cut(cut) | Reading::CutWhole(cut) if atoms.contains(&cut) => &[cut],
+        _ => &[],
+    };
+    let mut solved: Vec<Solved> = Vec::new();
+    for &a in candidates {
+        let Some((t, k, negated)) = offset(cx, a) else {
+            continue;
+        };
+        if t != root
+            && (order.contains(&t) || atoms.contains(&t))
+            && solved
+                .iter()
+                .all(|s| s.operand != t && s.atom != t && s.operand != a)
+        {
+            solved.push(Solved {
+                operand: t,
+                atom: a,
+                constant: k,
+                negated,
+            });
+        }
+    }
+    if solved.is_empty() {
+        return build(cx, atoms, order, &[]);
+    }
+    let (mut atoms, order) = scan_in(cx, root, lim, &|cx, i| {
+        solved.iter().all(|s| s.operand != i) && inside(cx, i, under.as_ref())
+    })?;
+    // An operand read only below what another one cut off is not read; an atom it left
+    // unread is no variable.
+    solved.retain(|s| atoms.contains(&s.operand) && atoms.contains(&s.atom));
+    atoms.retain(|a| solved.iter().all(|s| s.operand != *a));
+    build(cx, atoms, order, &solved)
+}
+
+/// Node `a` as `t + k` or (`true`) `k − t`, `k` a constant: `t`, `k`, and which. The negated
+/// operand may be written `−t` or `t · −1`.
+fn offset(cx: &Context, a: u32) -> Option<(u32, BitVec, bool)> {
+    // Operands are read only once the operator says they are nodes.
+    let n = cx.node(a);
+    if !matches!(n.op, OpCode::Add | OpCode::Sub) {
+        return None;
+    }
+    let (t, k) = match (n.op, cx.const_val(n.a), cx.const_val(n.b)) {
+        (OpCode::Add, None, Some(k)) => (n.a, k),
+        (OpCode::Add, Some(k), None) => (n.b, k),
+        (OpCode::Sub, Some(k), None) => return Some((n.b, k, true)),
+        _ => return None,
+    };
+    let m = cx.node(t);
+    match m.op {
+        OpCode::Neg => Some((m.a, k, true)),
+        OpCode::Mul => match (cx.const_val(m.a), cx.const_val(m.b)) {
+            (None, Some(c)) if c.is_ones() => Some((m.a, k, true)),
+            (Some(c), None) if c.is_ones() => Some((m.b, k, true)),
+            _ => Some((t, k, false)),
+        },
+        _ => Some((t, k, false)),
+    }
+}
+
+/// An atom's operand written over the atom: `atom − constant`, or `constant − atom` (`negated`).
+struct Solved {
+    operand: u32,
+    atom: u32,
+    constant: BitVec,
+    negated: bool,
 }
 
 /// the non-constant interior nodes of the semi-linear fragment below `root` that
@@ -298,8 +370,14 @@ fn under_bitwise(cx: &Context, root: u32, lim: &MbaLimits) -> Result<IdMap<u32, 
     Ok(under)
 }
 
-/// The expression over `atoms` that the fragment's nodes `order` (operands first) compute.
-fn build(cx: &Context, atoms: Vec<u32>, order: Vec<u32>) -> Result<(MbaExpr, Bindings), Refusal> {
+/// The expression over `atoms` that the fragment's nodes `order` (operands first) compute,
+/// each operand in `solved` written over its atom.
+fn build(
+    cx: &Context,
+    atoms: Vec<u32>,
+    order: Vec<u32>,
+    solved: &[Solved],
+) -> Result<(MbaExpr, Bindings), Refusal> {
     let mut m = MbaExpr::new(atoms.iter().map(|&a| cx.width_of(a)).collect());
     let mut at: IdMap<u32, u32> = IdMap::default();
     for (&a, k) in atoms.iter().zip(0u32..) {
@@ -307,6 +385,14 @@ fn build(cx: &Context, atoms: Vec<u32>, order: Vec<u32>) -> Result<(MbaExpr, Bin
             .push(MOp::Var(k), &[])
             .map_err(|e| Refusal::Unsupported(e.to_string()))?;
         at.insert(a, v);
+    }
+    for s in solved {
+        let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
+        let a = at[&s.atom];
+        let k = m.push(MOp::Const(s.constant), &[]).map_err(bad)?;
+        let args = if s.negated { [k, a] } else { [a, k] };
+        let v = m.push(MOp::Sub, &args).map_err(bad)?;
+        at.insert(s.operand, v);
     }
     for i in order {
         let n = cx.node(i);

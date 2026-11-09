@@ -95,10 +95,11 @@ pub struct Config {
     /// Keep a [`Certificate`] for a proof.
     pub certificate: bool,
     /// Simplify the question with bitwright's own engine before blasting it (the
-    /// deobfuscation strategy, with the MBA service when the `mba` feature is on): identities
-    /// the engine settles at the word level (products of MBA, say, which bit-level SAT finds
-    /// hard) are answered at once, and the rest is blasted smaller. Not with a certificate: a
-    /// certificate is of the question as asked, with its symbols' declared known bits.
+    /// deobfuscation strategy, with the MBA service and its opaque-constant sweep when the `mba`
+    /// feature is on): identities the engine settles at the word level (products of MBA, say,
+    /// which bit-level SAT finds hard) are answered at once, and the rest is blasted smaller.
+    /// Not with a certificate: a certificate is of the question as asked, with its symbols'
+    /// declared known bits.
     pub simplify: bool,
     /// The engine's budget for [`simplify`](Self::simplify): caps in the units of
     /// [`Budget`](crate::engine::Budget), counts of work and never time, so a question stops at
@@ -220,8 +221,8 @@ fn simplifier() -> &'static crate::engine::Engine {
     static ENGINE: std::sync::OnceLock<crate::engine::Engine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(|| {
         #[cfg(feature = "mba")]
-        let strategy =
-            crate::engine::Strategy::deobfuscate().with_mba(crate::mba::MbaConfig::default());
+        let strategy = crate::engine::Strategy::deobfuscate()
+            .with_mba(crate::mba::MbaConfig::default().with_opaque_sweep(true));
         #[cfg(not(feature = "mba"))]
         let strategy = crate::engine::Strategy::deobfuscate();
         crate::engine::Engine::builder()

@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+Slow questions from walks over an obfuscated driver (140 of them, each a quarter of a second or
+more): roots left at two thousand nodes with the budget gone, and equalities too large to blast.
+The causes found so far, none specific to those expressions.
+
+- **A sweep reads what an earlier one found.** The opaque-constant sweep ran once per root and
+  once per side of every case it split, and asked about the nodes they share each time, so a
+  call over a few roots with a common core spent its pass work on the same questions. What a
+  sweep finds for a node (the node itself where it finds nothing) is now kept for the call, and
+  a later sweep reads it.
+- **One certificate cannot take the whole budget.** The MBA gate's exact evidence was metered
+  only by what the call had left, so a single candidate whose compositional test ran long left
+  nothing for the phases after it. A certificate now gets half the call's pass work at most
+  (and never less than a direct test of the pair costs), and stops as undecided beyond it.
+- **A change of variable.** The certificates read an arithmetic node under a bitwise operator
+  as an atom, independent of the variable inside it, so an identity that holds only because
+  two atoms are related through that variable was not one to them: with `t = (x ^ c) + k`,
+  `(−1 − k) − (x ^ c)` is `~t`, and `(x ^ c)·d` is `(t − k)·d`. Where such an atom is a chain of
+  invertible links over one variable (`^ c`, `+ c`, `c −`, `· odd`, `−`, `~`), the question is
+  now also asked over the atom in the variable's place, the variable its inverse; a
+  counterexample there is mapped back. A side that differs at one input of `2^64`
+  (`x + (1 − ((d | −d) >> 63))` with `d = x·k₁ ^ k₂`) is refuted with that input. The
+  compositional test also tries each class's bitwise representative for its minimal atoms.
+- **The prover simplifies with the opaque-constant sweep.** `Config::simplify` ran the
+  deobfuscation strategy without it, so a question whose constants were hidden behind a
+  comparison's mask was blasted with its multipliers and came back `TooLarge`. It now runs
+  with the sweep.
+- **The sweep runs again between rounds**, over what the phases left: a constant that shows
+  only once a round has simplified what it reads was never asked about.
+- **Nodes the samples relate are asked to be related.** A varying node whose samples are an
+  earlier node's up to a constant (`rep + d`, `d − rep`, `rep ^ d`) is asked to be that,
+  exactly, and written so where proved.
+- **An atom and its offset are one variable.** A fragment that reads both `t` and `k − t` (or
+  `t + k`, `k − (−t)`, `t·−1 + k`) lowered them as two independent atoms; the lowering now
+  writes the operand through the atom (`t = k − a`), so identities that hold through the pair
+  are ones the solver and the certificates see.
+- **A fragment the solver declined for its size is not asked again from above.** Every node
+  over a root answered "too many atoms" was asked in turn, each lowering the same fragment
+  (27 questions of 820 nodes, 310,000 steps each, in one call); such roots are remembered for
+  the call and a fragment containing one is skipped.
+- **A bottleneck is enumerated over the values it can take.** The sweep's exhaustive check,
+  when it enumerates a narrow node instead of the symbols, took every value of the node's
+  demanded bits and called a mismatch a refutation, though the node may never take that
+  value. It now enumerates only the bits not known of the node, and a mismatch there leaves
+  the candidate to the readings. A candidate its demanded-bits form leaves open is also asked
+  as written.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths

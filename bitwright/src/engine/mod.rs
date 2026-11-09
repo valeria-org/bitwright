@@ -1263,6 +1263,16 @@ struct Runner<'r, 'a> {
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
+    /// The roots of fragments the MBA solver declined for their size in this call (see
+    /// `pass::mba::outgrown`).
+    #[cfg(feature = "mba")]
+    mba_outgrown: IdMap<u32, ()>,
+    /// The opaque-constant sweep's result for every node it examined in this call (the node
+    /// itself where it found nothing), so a sweep of another root or of one side of a case
+    /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
+    /// `pass::mba::sweep`).
+    #[cfg(feature = "mba")]
+    swept: IdMap<u32, u32>,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2325,6 +2335,10 @@ impl Engine {
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_outgrown: IdMap::default(),
+            #[cfg(feature = "mba")]
+            swept: IdMap::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -2582,24 +2596,35 @@ impl Runner<'_, '_> {
                 Err(stop) => return Err((cur, fin, stop)),
             }
         }
-        // The exact opaque-constant sweep is opt-in: it can spend work on failed candidate
-        // proofs before the ordinary phases reach their root.
+        cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        self.rounds(cx, cur, fin)
+    }
+
+    /// `cur` after the opaque-constant sweep (see `pass::mba::sweep`), where the MBA phase asks
+    /// for it. The sweep is opt-in: it can spend work on failed candidate proofs before the
+    /// ordinary phases reach their root. Run before the first round, and before each later one
+    /// on what the round before left: the phases expose constants the first sweep could not
+    /// prove (a fragment over fewer atoms once its operands are simplified), and a node an
+    /// earlier sweep examined is read from it, so only what a round made is asked about. A
+    /// budget keeps the root as it is.
+    fn sweep(&mut self, cx: &mut Context, cur: u32) -> Result<u32, Stop> {
         #[cfg(feature = "mba")]
-        if let Some(cfg) = inner.phases.iter().find_map(|p| match p {
+        if let Some(cfg) = self.inner.phases.iter().find_map(|p| match p {
             PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms || c.known_atoms => Some(c),
             _ => None,
         }) {
-            match pass::mba_sweep(self, cx, cfg, cur) {
+            return match pass::mba_sweep(self, cx, cfg, cur) {
                 Ok(r) => {
                     self.emit_stage(cx, Stage::Sweep, cur, r);
-                    cur = r;
+                    Ok(r)
                 }
-                Err(Stop::Exhausted(_)) => {}
-                Err(stop) => return Err((cur, fin, stop)),
-            }
+                Err(Stop::Exhausted(_)) => Ok(cur),
+                Err(stop) => Err(stop),
+            };
         }
-        cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-        self.rounds(cx, cur, fin)
+        let _ = cx;
+        Ok(cur)
     }
 
     /// with the MBA phase's noise forms, `cur` with its pieces that depend only on
@@ -2664,6 +2689,7 @@ impl Runner<'_, '_> {
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             if round > 0 {
+                cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
             let start = cur;
