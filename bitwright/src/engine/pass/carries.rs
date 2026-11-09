@@ -32,9 +32,22 @@
 //! a symbol of its own width in the proof and resized to the node's in the form.
 //!
 //! A sum that fits no such form but holds carries written as comparisons of low digits is
-//! handed to [`super::borrows`], which reads each carry as the high digits it completes.
+//! handed to [`super::borrows`], which reads each carry as the high digits it completes; so is
+//! the sum under a read of its low bits (`trunc<j>(s)`, `s & (2^j − 1)`, and `s << k`, which
+//! reads the low `W − k`: a high limb on its way into a word), at those bits, which may be
+//! few enough for a carry the whole sum is too wide for. Where that reads nothing, the value
+//! (the low read, or what of the sum is not known to be 0) is looked for as a slice of a word
+//! below it and proved ([`super::slices`]): the limb of a word some handler also computes
+//! whole.
+//!
+//! A limb read as the slice of a node there already may leave the DAG one node larger (the
+//! slice and its extension for one node freed): the limb code it frees is shared with the
+//! other limbs, each of which frees it only once all are read, and what reads the slice
+//! (a narrowing, a join of two slices) takes it away again.
 
-use super::{Counts, Fin, PassKind, Runner, Step, Stop, finish, linear, worth_building};
+use super::{
+    Counts, Fin, PassKind, Runner, Step, Stop, finish, finish_within, linear, worth_building,
+};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -99,6 +112,11 @@ pub(crate) struct Scratch {
     /// Nodes whose proof was not decided within the pass's caps: a region holding one is larger
     /// still, and is not read.
     undecided: IdMap<u32, ()>,
+    /// Values no slice of a word below them was proved equal to (see [`super::slices`]): not
+    /// asked again in the call.
+    pub(super) unfit: IdMap<u32, ()>,
+    /// The slice proofs of the call that were proved, and those left undecided at their caps.
+    pub(super) fits: (u32, u32),
 }
 
 fn interior(cx: &Context, i: u32) -> bool {
@@ -563,10 +581,86 @@ fn fit(r: &mut Runner<'_, '_>, cx: &Context, mask: u64) -> Result<Option<(u64, V
     Ok(affine(&r.carries, QUICK..LANES).then_some((konst, coeffs)))
 }
 
+/// The sum `s`, `j` and `k` when `n` reads the low `j` bits of `s` and no others, and holds
+/// them `k` bits up: a truncation of it or a mask of its low bits (`k = 0`), or its shift
+/// left by a constant `k` (a high limb on its way into a word, `hi << k | lo`).
+fn low_read(cx: &Context, n: u32) -> Option<(u32, u16, u16)> {
+    let node = cx.node(n);
+    let (s, j, k) = match node.op {
+        OpCode::Extract if node.b == 0 => (node.a, node.width, 0),
+        OpCode::And if node.width <= 64 => {
+            let (s, c) = match (cx.const_val(node.a), cx.const_val(node.b)) {
+                (Some(c), None) => (node.b, c.limbs()[0]),
+                (None, Some(c)) => (node.a, c.limbs()[0]),
+                _ => return None,
+            };
+            let j = c.trailing_ones() as u16;
+            if j == 0 || j >= node.width || c >> j != 0 {
+                return None;
+            }
+            (s, j, 0)
+        }
+        OpCode::Shl if node.width <= 64 => {
+            let k = cx.const_val(node.b)?.limbs()[0];
+            if k == 0 || k >= u64::from(node.width) {
+                return None;
+            }
+            (node.a, node.width - k as u16, k as u16)
+        }
+        _ => return None,
+    };
+    (cx.wid(s) <= 64 && matches!(cx.node(s).op, OpCode::Add | OpCode::Sub)).then_some((s, j, k))
+}
+
+/// How far a sum with its carries read may leave the DAG larger than what it frees (see
+/// [`finish_within`]): by one node where it is a slice of a node that was there, or the zero
+/// extension of one (a limb as the slice of its word, which every other reader of the limb's
+/// arithmetic becomes too); otherwise not at all, and only for a smaller tree.
+fn slack(cx: &Context, n: u32, e: u32, before: u32) -> u32 {
+    let mut outer = cx.node(e);
+    // (Held up as the limb was: `slice << k`.)
+    if outer.op == OpCode::Shl && cx.const_val(outer.b).is_some() {
+        outer = cx.node(outer.a);
+    }
+    let slice = if outer.op == OpCode::Zext {
+        cx.node(outer.a)
+    } else {
+        outer
+    };
+    if slice.op == OpCode::Extract && slice.a < before {
+        return 2;
+    }
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    u32::from(tree(n) != u32::MAX && tree(e) < tree(n))
+}
+
 /// The carries pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let bits = cx.wid(n);
     let op = cx.node(n).op;
+    // A sum read on its low bits only (`trunc<j>(s)`, `s & (2^j − 1)`): its carries are
+    // completed there, where `j` bits may be few enough for a carry the whole sum is too
+    // wide for; or it is the slice of a word below it.
+    if let Some((s, j, k)) = low_read(cx, n) {
+        let before = cx.len() as u32;
+        let mut own = Fin::FINAL;
+        if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, s, j)? {
+            let e = r.build(cx, |cx| super::slices::held(cx, e, bits, k))?;
+            let slack = slack(cx, n, e, before);
+            match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
+                Step::Normal(f) => own = f,
+                step => return Ok(step),
+            }
+        }
+        match super::slices::fitted(r, cx, n, s, j, k)? {
+            Ok(step) => return Ok(step),
+            Err(f) => own = own.and(f),
+        }
+        // Declined for a reason more budget or less sharing may lift: asked again.
+        if !own.done {
+            return Ok(Step::Normal(own));
+        }
+    }
     let slices = op == OpCode::Concat;
     // Where a sum's digits are joined without a `concat`: `hi << k | lo`, or a sum of them.
     let joined = matches!(op, OpCode::Or | OpCode::Xor | OpCode::Add | OpCode::Sub);
@@ -613,9 +707,24 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         // A sum of digits and the carries between them, written as comparisons.
         if matches!(op, OpCode::Add | OpCode::Sub) {
             let before = cx.len() as u32;
+            let mut own = Fin::FINAL;
             if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, n, bits)? {
-                return finish(r, cx, PassKind::Carries, n, e, before, &stops, fin);
+                let slack = slack(cx, n, e, before);
+                match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
+                    Step::Normal(f) => own = f,
+                    step => return Ok(step),
+                }
             }
+            // A limb held at a register's width: what of the sum is not known to be 0.
+            let (known, fk) = super::known_words(r, cx, n)?;
+            let j = known.map_or(bits, |[zero, _]| {
+                (64 - (!zero & mask).leading_zeros()) as u16
+            });
+            return Ok(match super::slices::fitted(r, cx, n, n, j, 0)? {
+                Ok(Step::To(e, f)) => Step::To(e, f.and(fk)),
+                Ok(Step::Normal(f)) => Step::Normal(f.and(fk)),
+                Err(f) => Step::Normal(own.and(f).and(fk)),
+            });
         }
         return Ok(Step::Normal(Fin::FINAL));
     };

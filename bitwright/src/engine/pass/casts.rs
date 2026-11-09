@@ -11,6 +11,9 @@
 //! The narrowing is computed for the whole region below the extract (bounded), and replaces the
 //! node only when that region gets strictly smaller: `trunc(zext(x) + zext(y))` becomes
 //! `x + y`, while `trunc(a + b)` over opaque operands stays as it is.
+//!
+//! A `concat` of two values that are neighbouring slices of one bitwise value once the upper
+//! one is pushed into it (`concat(hi(a) | hi(b), lo(a | b))`) is the slice that covers both.
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish};
 use crate::BitVec;

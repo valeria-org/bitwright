@@ -30,14 +30,36 @@ engine.
 - **A carry written as a comparison of low digits is read as the high digits it completes.**
   `[lo(P) <u lo(Q)] = hi(P) − hi(Q) − hi(P − Q)`, so `hi(a) + hi(b) + [lo(a + b) <u lo(a)]` is
   `hi(a + b)`. The carries pass rewrites a sum that fits no affine form this way where that
-  leaves it fewer terms and the DAG smaller. A side of the comparison that is no low digit is
-  read as one where its known bits put it below `2^k`, or where it is `k` bits wide with the
-  narrowing pushed into it.
+  leaves it fewer terms and the DAG smaller, and the sum under a read of its low bits
+  (`trunc<j>(s)`, `s & (2^j − 1)`) at those bits. A carry of values whose sum cannot wrap (by
+  the known bits) is read at any width. Each side of the comparison is read through its
+  truncations, masks and zero extensions; one that is no low digit is read as one where its
+  known bits put it below `2^k`, or where it is `k` bits wide with the narrowing pushed into
+  it. Terms that are one value written two ways (a shift beside a slice of the same bits, two
+  spellings of one linear form) count as one.
+- **A limb is the slice of the word it is a limb of.** A handler that computes in limbs
+  computes its lowest limb at the register's full width and masks it, so the word is a node
+  below every higher limb. Where a value's carries are not read as digits, the carries pass
+  looks for the value as `extract<o, j>(B)` of a wide node `B` below it, keeps the candidates
+  that agree at the verification samples, and commits the first that bitwright's prover proves
+  equal within the pass's caps: the top limb of `(w + k) ^ c` in limbs of 12, 12 and 8 bits,
+  ninety nodes of digits, carries and borrows, is `extract<24, 8>(w + k ^ c)`. The value is a
+  sum under a read of its low bits, a shift left among them (`hi << k | lo`, the limb on its
+  way back into a word, which then is the word), or what of a sum is not known to be 0. A
+  slice of a node already there commits also where it leaves the DAG one node larger: the
+  limb code it frees is shared with the other limbs, and what reads the slice takes it away
+  again.
+- **An XOR written as a sum is an XOR where its parts are shared.** The linear-MBA pass commits
+  its form also where the DAG only ties and the tree gets smaller: `a + b - 2·(a & b)` whose
+  `a + b` and `a & b` a carry also reads is `a ^ b`.
+- **`a + a` is a shift by one to the shuffle pass**, as the linear pass writes it:
+  `(hi + hi) | bit` of neighbouring bits of one value is one slice.
 - **Two neighbouring slices of one bitwise value are one slice.** The casts pass reads
   `concat(hi(a) | hi(b), lo(a | b))` as the slice of `a | b` that covers both.
 
-On that corpus the results have about 13 percent fewer DAG nodes on the local windows and 10 to
-11 percent fewer on the deep ones, and 22 of the 234 that ran out of budget now finish.
+On that corpus the results have 16 percent fewer DAG nodes on the local windows and 22 percent
+fewer on the deep ones, and 115 of the 234 that ran out of budget now finish (7 others now run
+out).
 
 ## 0.26.0
 

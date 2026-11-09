@@ -2,9 +2,10 @@
 //!
 //! For a node of at most [`MAX_WIDTH`] bits, every output bit is traced to a constant or to one
 //! bit of a *source* (an atom): through `&` with a constant, `|`, `^` and `+` of pieces whose
-//! traced bits do not overlap (so no carry and no cancellation can occur), shifts and rotations
-//! by constants, zero and sign extension, `extract`, `concat` and `bswap`. When every bit is
-//! traced, the node is re-emitted as the source itself, a rotation, a byte swap, one source in
+//! traced bits do not overlap (so no carry and no cancellation can occur), `a + a` (a shift by
+//! one, as the linear pass writes it), shifts and rotations by constants, zero and sign
+//! extension, `extract`, `concat` and `bswap`. When every bit is traced, the node is
+//! re-emitted as the source itself, a rotation, a byte swap, one source in
 //! place with constant bits (`(s & ~zeros) | ones`), or a `concat` of slices and constant runs,
 //! and replaced when that is smaller. Limb recompositions, shifted-and-masked byte shuffles and
 //! identity round trips collapse this way.
@@ -114,6 +115,14 @@ fn trace(cx: &Context, bits: &crate::hash::IdMap<u32, Bits>, i: u32) -> Bits {
             x.iter()
                 .zip(&m)
                 .map(|(p, k)| if *k == Prov::One { *p } else { Prov::Zero })
+                .collect()
+        }
+        // `a + a` is `a << 1` (the linear pass writes it so).
+        OpCode::Add if n.a == n.b => {
+            let a = get(n.a);
+            core::iter::once(Prov::Zero)
+                .chain(a.iter().copied())
+                .take(w as usize)
                 .collect()
         }
         OpCode::Or | OpCode::Xor | OpCode::Add => {

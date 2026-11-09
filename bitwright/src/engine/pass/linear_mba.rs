@@ -17,7 +17,8 @@
 //!   of atoms), when a conjunction of two or more atoms remains.
 //!
 //! Both have the input's signature and are linear MBAs, so they are equal to it. The result
-//! replaces the node when the DAG gets smaller.
+//! replaces the node when the DAG gets smaller, or stays the same size and the node becomes a
+//! smaller tree (an XOR written as a sum whose parts something else reads).
 //!
 //! *Extensions.* A fragment reaches through `sext` and `zext` of bitwise functions of narrower
 //! values (a lifter's `sext<64>(a & b)` over 32-bit `a`, `b`): the function is read over the
@@ -27,7 +28,7 @@
 //! atoms, which it builds; the commit rule's boundary stays at the narrow atoms, so they count.
 
 use super::{
-    Counts, Fin, Marks, PassKind, Runner, Step, Stop, bitwise, finish, linear, worth_building,
+    Counts, Fin, Marks, PassKind, Runner, Step, Stop, bitwise, finish_with, linear, worth_building,
 };
 use crate::BitVec;
 use crate::engine::budget::Counter;
@@ -632,7 +633,9 @@ fn solve(
         super::discard(r, cx, before);
         return Ok((Step::Normal(Fin::FINAL), None));
     };
-    if commit && let Some(f) = worth_building(r, cx, n, &reg.bounds, est + lifted)? {
+    // (A form that only ties may still commit below: one node fewer is asked of it here.)
+    let most = (est + lifted).saturating_sub(1);
+    if commit && let Some(f) = worth_building(r, cx, n, &reg.bounds, most)? {
         count(r).rejected_cost += 1;
         super::discard(r, cx, before);
         return Ok((Step::Normal(f), None));
@@ -685,7 +688,13 @@ fn solve(
         corners: sig.clone(),
         form: kind,
     });
-    let step = finish(
+    // The form is the cheapest of its kind and nothing writes it back as the sum it was, so
+    // it also commits where the DAG only ties and the tree gets smaller: `a + b - 2(a & b)`
+    // whose `a + b` and `a & b` something else reads (the carries of limb arithmetic) frees
+    // one node for the `a ^ b` it becomes, and every sum built on it then reads an XOR.
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    let tie = tree(n) != u32::MAX && tree(e) < tree(n);
+    let step = finish_with(
         r,
         cx,
         PassKind::LinearMba,
@@ -694,6 +703,7 @@ fn solve(
         before,
         &reg.bounds,
         Fin::FINAL,
+        tie,
     )?;
     Ok((step, None))
 }
