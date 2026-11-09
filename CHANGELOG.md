@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths
 (17, 20, 23, 34 bits inside 64-bit registers); none of them was specific to odd widths.
