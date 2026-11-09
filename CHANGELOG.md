@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **The demanded-bits pass no longer runs out of memory on shared chains.** Since 0.24.0 a
+  phase run keeps, for every operand a step found nothing to simplify under a mask, the leaves
+  its walk stopped at, and a later step copies them back. A range kept the copies its operands'
+  hits had made, repeats included, and operands in a DAG share leaves, so on a ripple chain
+  each level's range was the sum of its operands': 2^48 entries at 48 bits, a 16 GB
+  allocation from `simplify` on a 48-bit adder written out, read through `<< 1` (the heavy
+  test `carries_asks_a_region_past_its_caps_once` grew to 60 GB). Each range now keeps each
+  leaf once; they are read as a set, so the boundaries the commit rule sees are the same.
+  That run takes a second and 15 MB. A test outside the heavy set guards it, and the heavy
+  test now asserts what changed in 0.24.0 as well: the demanded-bits pass rewrites that chain
+  (146 nodes to 143), and the carries pass asks the rewritten chain once.
 - **Tooling.** Scheduled `nightly-deep` runs were being cancelled at the job's 60-minute limit,
   near the end of its second step (the two take about 65 minutes), and on 8 November one
   failed at once on a 504 from the z3 release download. The job may now run two hours, and

@@ -2212,6 +2212,32 @@ fn demanded_obeys_fold_known() {
     assert_eq!(simplify(&eng, "(x * 16) & 0x0f", 8), "0:8");
 }
 
+#[test]
+fn demanded_keeps_each_leaf_once_across_a_phase_run() {
+    // A ripple chain read through `<< 1`: every level shares its operands' leaves, and the
+    // leaves a step keeps for the next ones held each level's operands' copies, so they
+    // doubled at every level (2^48 at 48 bits, past any memory). Kept once each, the run
+    // takes a moment.
+    let mut src = String::from("let a0 = x; let b0 = y; ");
+    for k in 0..48 {
+        src += &format!(
+            "let a{n} = a{k} ^ b{k}; let b{n} = (a{k} & b{k}) << 1; ",
+            n = k + 1
+        );
+    }
+    src += "a48 << 1";
+    let eng = engine(vec![Phase::Demanded]);
+    let mut cx = Context::new();
+    let e = cx
+        .parse(&src, &ParseOptions::width(Width::new(48).unwrap()))
+        .unwrap();
+    let before = dag(&mut cx, &[e]);
+    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+    let r = out.roots[0].expr;
+    assert!(dag(&mut cx, &[r]) < before);
+    assert!(equivalent(&mut cx, e, r, &mut Rng(48)));
+}
+
 fn dag(cx: &mut Context, roots: &[Expr]) -> u32 {
     match cx.dag_size(roots, u32::MAX).unwrap() {
         crate::Bounded::Exact(n) | crate::Bounded::AtLeast(n) => n,
@@ -5105,16 +5131,26 @@ fn carries_recovers_ripple_chains_constants_and_three_atoms() {
 fn carries_asks_a_region_past_its_caps_once() {
     // A 48-bit ripple chain is past the proof's caps; the region holding it, its double, is
     // larger still, and is not asked.
-    let eng = deobfuscator();
-    let mut cx = Context::new();
     let o = ParseOptions::width(Width::new(48).unwrap());
     let src = format!("{} << 1", ripple_sum("x", "y", 48));
-    let e = cx.parse(&src, &o).unwrap();
-    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
     let mut rng = Rng(48);
-    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let out = engine(vec![Phase::Carries])
+        .run(&mut cx, &[e], Run::default())
+        .unwrap();
+    assert_eq!(out.roots[0].expr, e);
     let c = out.stats.passes["carries"];
     assert_eq!((c.proved, c.unknown), (0, 1), "{c:?}");
+    // With the other passes, the demanded-bits pass rewrites the chain the shift reads only
+    // the low 47 bits of (146 nodes to 143): a chain of its own, past the caps too, asked once.
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let out = deobfuscator().run(&mut cx, &[e], Run::default()).unwrap();
+    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+    assert_eq!(out.stats.passes["demanded"].changed, 1);
+    let c = out.stats.passes["carries"];
+    assert_eq!((c.proved, c.unknown), (0, 2), "{c:?}");
 }
 
 #[cfg(feature = "prove")]

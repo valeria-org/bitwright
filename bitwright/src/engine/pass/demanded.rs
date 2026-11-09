@@ -54,6 +54,19 @@ impl Same {
     }
 }
 
+/// Sorts `v` and moves its distinct values to the front: how many there are.
+fn sorted_distinct(v: &mut [u32]) -> usize {
+    v.sort_unstable();
+    let mut kept = 0;
+    for i in 0..v.len() {
+        if kept == 0 || v[i] != v[kept - 1] {
+            v[kept] = v[i];
+            kept += 1;
+        }
+    }
+    kept
+}
+
 struct Demand {
     memo: Memo,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
@@ -603,11 +616,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             if r.demanded_same.map.contains_key(&key) {
                 continue;
             }
-            let at = r.demanded_same.leaves.len() as u32;
+            // Each leaf once. A range holds what the hits below it copied, the leaves of each
+            // operand; operands share leaves in a DAG, so a range kept with its repeats was
+            // the sum of its operands' ranges, and on a ripple chain the ranges doubled at
+            // every level (2^48 at 48 bits). The leaves are read as a set.
+            let at = r.demanded_same.leaves.len();
             r.demanded_same
                 .leaves
                 .extend_from_slice(&st.stops[from as usize..to as usize]);
-            r.demanded_same.map.insert(key, (at, to - from));
+            let kept = sorted_distinct(&mut r.demanded_same.leaves[at..]);
+            r.demanded_same.leaves.truncate(at + kept);
+            r.demanded_same.map.insert(key, (at as u32, kept as u32));
         }
     }
     st.memo.clear();
