@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Tooling.** Scheduled `nightly-deep` runs were being cancelled at the job's 60-minute limit,
+  near the end of its second step (the two take about 65 minutes), and on 8 November one
+  failed at once on a 504 from the z3 release download. The job may now run two hours, and
+  both solver downloads retry.
+
 ## 0.25.0
 
 - **Orderings see through strictly monotone maps.** The invert pass cancelled and solved only

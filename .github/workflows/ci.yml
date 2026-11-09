@@ -68,19 +68,22 @@ jobs:
   nightly-deep:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The two heavy steps take about 65 minutes together (each runs the 20-minute heavy lib
+    # suite); at 60 the job was cancelled at its tail every night.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libgmp10
       # The SMT suites run once per solver: every script must be accepted by both. Both are
-      # pinned releases (Ubuntu's z3 4.8.12 runs for hours on some 512-bit queries).
+      # pinned releases (Ubuntu's z3 4.8.12 runs for hours on some 512-bit queries). The
+      # downloads retry: a release asset answers 504 now and then.
       - run: |
-          curl -sSfL -o z3.zip https://github.com/Z3Prover/z3/releases/download/z3-5.1.0/z3-5.1.0-x64-glibc-2.39.zip
+          curl -sSfL --retry 5 --retry-delay 10 -o z3.zip https://github.com/Z3Prover/z3/releases/download/z3-5.1.0/z3-5.1.0-x64-glibc-2.39.zip
           unzip -q z3.zip -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/z3-5.1.0-x64-glibc-2.39/bin" >> "$GITHUB_PATH"
           rm z3.zip
-          curl -sSfL -o bitwuzla.zip https://github.com/bitwuzla/bitwuzla/releases/download/0.9.1/Bitwuzla-Linux-x86_64-static.zip
+          curl -sSfL --retry 5 --retry-delay 10 -o bitwuzla.zip https://github.com/bitwuzla/bitwuzla/releases/download/0.9.1/Bitwuzla-Linux-x86_64-static.zip
           unzip -q bitwuzla.zip -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/Bitwuzla-Linux-x86_64-static/bin" >> "$GITHUB_PATH"
           rm bitwuzla.zip
