@@ -2178,6 +2178,50 @@ fn prove_decides_by_residues() {
     }
 }
 
+/// The residues compute with values of at most 128 bits, so an extension or a concatenation
+/// wider than that is a leaf to them, whatever it reads: cut to 128 bits, `sext<257>(x)` of a
+/// negative `x` was a large positive value, and `sext<257>(t·t) <=s sext<257>(x)` true.
+#[test]
+fn residues_read_no_value_over_128_bits() {
+    use crate::{Query, Truth};
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(3).unwrap());
+    for (a, b) in [
+        ("let t = sext<33>(x); sext<257>(t * t)", "sext<257>(x)"),
+        ("let t = sext<33>(x); zext<129>(t * t)", "sext<129>(x)"),
+        ("let t = sext<33>(x); sext<512>(t * t)", "zext<512>(x)"),
+        (
+            "let t = sext<100>(x); concat(t * t, t)",
+            "concat(sext<100>(x), zext<100>(x))",
+        ),
+    ] {
+        let (a, b) = (cx.parse(a, &o).unwrap(), cx.parse(b, &o).unwrap());
+        // Every value of `x`: what a proof says must hold at all of them.
+        let values: Vec<Vec<BitVec>> = (0..8u64)
+            .map(|v| {
+                let x = BitVec::wrapping_from_u64(Width::new(3).unwrap(), v);
+                cx.eval(&[a, b], &FnEnv(|_: &crate::SymbolKey, _| Some(x)))
+                    .unwrap()
+            })
+            .collect();
+        for op in CmpOpExt::ALL {
+            let truth = cx.prove(Query::Cmp(op, a, b)).unwrap();
+            if truth == Truth::Unknown {
+                continue;
+            }
+            for v in &values {
+                assert_eq!(
+                    BitVec::apply_cmp(op, &v[0], &v[1]).unwrap(),
+                    truth == Truth::True,
+                    "`{}` {op:?} `{}` proved {truth:?}",
+                    cx.display(a),
+                    cx.display(b)
+                );
+            }
+        }
+    }
+}
+
 /// Sign extension spelled with shifts or with xor and a subtraction, and bit tests through a
 /// mask: equivalent at every shift and mask at small widths, and recognized.
 #[test]

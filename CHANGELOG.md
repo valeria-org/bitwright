@@ -137,6 +137,17 @@ The driver's accounting, from the same reading:
   times) while they were still changing. Both are counted, in `Stats` and in a trace's `stats`
   line: the result is as valid as any, and simplifying it again may go further.
 
+A wrong answer of `Context::prove`, in 0.26.0 too, which the heavy facts suite came to once
+the doublings above had changed its random expressions:
+
+- **Residues of values over 128 bits.** The residue predicates behind `Context::prove` compute
+  with 128-bit values, and read an extension or a concatenation wider than that as an
+  operation, because its operands fit. Its value was cut to 128 bits, so `sext<257>(x)` of a
+  negative `x` was a large positive number, and `sext<257>(t * t) <=s sext<257>(x)` with
+  `t = sext<33>(x)` was proved true (at `x = 2` it is `4 <=s 2`). Such a node is a leaf to the
+  residues now. Only questions about expressions wider than 128 bits were answered so; the
+  compares pass reads no such node.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths
