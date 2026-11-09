@@ -97,16 +97,18 @@ fn lifted(
             *wide = true;
             r.build(cx, |cx| cx.c_extract(n.a, 0, w))?
         }
-        _ if room && let Some(op) = bin => {
-            let a = lifted(r, cx, n.a, w, seen, wide)?;
-            let b = lifted(r, cx, n.b, w, seen, wide)?;
-            r.build(cx, |cx| cx.c_bin(op, a, b))?
-        }
-        _ if room && let Some(op) = un => {
-            let a = lifted(r, cx, n.a, w, seen, wide)?;
-            r.build(cx, |cx| cx.c_un(op, a))?
-        }
-        _ => r.build(cx, |cx| cx.c_zext(x, w))?,
+        _ => match (bin, un) {
+            (Some(op), _) if room => {
+                let a = lifted(r, cx, n.a, w, seen, wide)?;
+                let b = lifted(r, cx, n.b, w, seen, wide)?;
+                r.build(cx, |cx| cx.c_bin(op, a, b))?
+            }
+            (_, Some(op)) if room => {
+                let a = lifted(r, cx, n.a, w, seen, wide)?;
+                r.build(cx, |cx| cx.c_un(op, a))?
+            }
+            _ => r.build(cx, |cx| cx.c_zext(x, w))?,
+        },
     };
     seen.push((x, v));
     Ok(v)
