@@ -279,6 +279,42 @@ impl Strategy {
         )
     }
 
+    /// For a decompiler or a lifter's everyday output, not obfuscated code: the standard
+    /// strategy plus the passes that recover what compilers emit, divisions by constants
+    /// (multiply-high sequences), byte swaps, rotations and bit-field moves (shuffles), and
+    /// with feature `prove` carry networks and bit counts spelled out (the SWAR population
+    /// count), but not the MBA passes: `[FactFold, Local(core), Linear, Xor, Casts, Division,
+    /// Invert, Compares, Bitwise, Carries, Shuffle, Demanded, Local(core)]`, up to 4 rounds.
+    pub fn decompile() -> Strategy {
+        let core = || Phase::Local {
+            groups: builtin()
+                .program
+                .groups()
+                .iter()
+                .map(|g| g.name.clone())
+                .collect(),
+        };
+        Strategy::new(
+            "decompile",
+            vec![
+                Phase::FactFold,
+                core(),
+                Phase::Linear,
+                Phase::Xor,
+                Phase::Casts,
+                Phase::Division,
+                Phase::Invert,
+                Phase::Compares,
+                Phase::Bitwise,
+                #[cfg(feature = "prove")]
+                Phase::Carries,
+                Phase::Shuffle,
+                Phase::Demanded,
+                core(),
+            ],
+        )
+    }
+
     /// For a compiler, which simplifies every value of every function: the standard phases
     /// without the demanded-bits pass, `[FactFold, Local(core), Linear, Xor, Casts, Invert,
     /// Compares, Bitwise, Local(core)]`, one round, with the passes deciding as if each node

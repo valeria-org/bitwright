@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.
+`tests/lifter_idioms.rs` checks each under every preset that runs what it needs.
+
+- **Bit counts.** `popcnt(x) + popcnt(~x)` is the width, `popcnt(x) == 0` is `x == 0` (and `!=`,
+  `== W` as all ones, `ctz` or `clz` equal to the width as zero), and the count of the bits
+  below the lowest set one, however its mask is spelled (`(x & -x) - 1`, `~x & (x - 1)`,
+  `~(x | -x)`), is `ctz(x)`. The SWAR population count is `popcnt(x)`: the carries pass reads a
+  right shift or a mask whose region is one value through arithmetic and constant shifts,
+  compares it at its 64 points with `popcnt`, `ctz` and `clz` of that value, and proves the
+  one that agrees (22 ms at 32 bits); so counted after a smear or a trailing mask, the same
+  shape is `clz(x)` or `ctz(x)`. `ctz(x) <u 3` stays: `(x & 7) != 0` is a larger tree, and the
+  engine only rewrites to smaller ones.
+- **Sign and overflow flags.** A sign test beside a sign bit taken as a slice
+  (`(x <s 0) ^ extract<W-1, 1>(y)`, and with `!=`, `==`, `&`, `|`) is one test of the
+  combination, so `SF ^ OF` of a subtraction is `x <s y` however each flag is spelled. The
+  branch-free absolute value (`((x >>s W-1) ^ x) - (x >>s W-1)`, or with the mask added first)
+  is `abs(x)`. `x + y <u x` is `~x <u y`, the carry-out test the facts decide (and `false` at
+  once when both are below half the range, for `Strategy::compile`'s single round).
+- **Selects.** A one-bit `((x ^ y) & c) ^ y` (the bitwise pass's form of `(c & x) | (~c & y)`)
+  is `select(c, x, y)`; both arms combined with one term by `&`, `|`, `*`, `-` or a shift
+  factor it out (`select(c, x & y, x & z)` is `x & select(c, y, z)`); and an arm one more or
+  one less than the other is the condition added (`select(c, x + 1, x)` is `x + zext(c)`).
+- **Declared facts.** A sign extension of a value whose sign bit is clear is its zero
+  extension, and through a truncation that drops only bits known zero, an equality with a
+  constant or another such truncation is one of the whole values: with `x` and `y` declared
+  below 256, `sext<64>(trunc<32>(x)) == x` is true and `trunc<8>(x) == 3` is `x == 3`.
+- **Arithmetic in halves.** `add`/`adc` and `sub`/`sbb` over separate halves
+  (`concat(a1 + b1 + zext(carry), a0 + b0)`) are the sum or difference of the concatenations,
+  and over the halves of two values (the low halves' sum already one truncation) are `x + y`
+  and `x - y`: by rules now, in every preset, in microseconds where the carries pass's proof
+  took 4 and 17 ms.
+- **Double-word shifts.** A word-sized window of two words, `concat(trunc<A>(h),
+  extract<A, W-A>(l))` (the shuffle pass's form of `shld`), is `extract<A, W>(concat(h, l))`.
+- **`Strategy::decompile()`**, for a decompiler's everyday output: the standard strategy plus
+  divisions by constants, carry networks and bit counts, and bit shuffles (byte swaps,
+  rotations, double-word shifts), without the MBA passes. `bitwright simplify --decompile` and
+  `lift --decompile`, and the Python preset `"decompile"`.
+- The rule `halves_sum_no_overflow` is gone: `x + y <u x` as a carry-out test decides it.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths

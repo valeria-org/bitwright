@@ -423,6 +423,29 @@ rule ult_not_const<W>(x: W, c: const W) { ~x <u c => k <u x let k: W = ~c }
 
 - `~p <u 5` → `250 <u p`
 
+#### `add_ult_operand` — rule
+
+A sum below an operand has carried out: `x + y <u x` is `~x <u y` (more than `x` can
+take), which facts about the two can decide. (With a constant `y`, the rules of
+`core.bounds` say it more simply.)
+
+```text
+rule add_ult_operand<W>(x: W, y: nonconst W) { x + y <u x => ~x <u y }
+```
+
+- `p + q <u p` → `~p <u q`
+
+#### `not_ult_small` — rule
+
+Below half the range, `~x` exceeds any `y`: the sum of two such values never carries
+out (decided here, not left to a later round's facts).
+
+```text
+rule not_ult_small<W>(x: W, y: W) { ~x <u y => false if zero_bits(x, smin_lit) && zero_bits(y, smin_lit) }
+```
+
+- `~(p & 127) <u (q & 127)` → `false`
+
 #### `ule_not_not` — rule
 
 Complementing reverses the order (unsigned less-or-equal).
@@ -691,6 +714,70 @@ rule or_signs<W>(x: W, y: W) { (x <s 0) | (y <s 0) => (x | y) <s 0 }
 
 - `(p <s 0) | (q <s 0)` → `(p | q) <s 0`
 
+#### `xor_sign_slice` — rule
+
+```text
+rule xor_sign_slice<W>(x: W, y: W) { (x <s 0) ^ extract<W - 1, 1>(y) => (x ^ y) <s 0 }
+```
+
+- `(p <s 0) ^ extract<7, 1>(q)` → `(p ^ q) <s 0`
+
+#### `ne_sign_slice` — rule
+
+```text
+rule ne_sign_slice<W>(x: W, y: W) { (x <s 0) != extract<W - 1, 1>(y) => (x ^ y) <s 0 }
+```
+
+- `(p <s 0) != extract<7, 1>(q)` → `(p ^ q) <s 0`
+
+#### `eq_sign_slice` — rule
+
+```text
+rule eq_sign_slice<W>(x: W, y: W) { (x <s 0) == extract<W - 1, 1>(y) => 0 <=s (x ^ y) }
+```
+
+- `(p <s 0) == extract<7, 1>(q)` → `0 <=s (p ^ q)`
+
+#### `and_sign_slice` — rule
+
+```text
+rule and_sign_slice<W>(x: W, y: W) { (x <s 0) & extract<W - 1, 1>(y) => (x & y) <s 0 }
+```
+
+- `(p <s 0) & extract<7, 1>(q)` → `(p & q) <s 0`
+
+#### `or_sign_slice` — rule
+
+```text
+rule or_sign_slice<W>(x: W, y: W) { (x <s 0) | extract<W - 1, 1>(y) => (x | y) <s 0 }
+```
+
+- `(p <s 0) | extract<7, 1>(q)` → `(p | q) <s 0`
+
+#### `abs_by_sign_mask` — rule
+
+The branch-free absolute value: flipped by the sign mask, then the mask subtracted.
+
+```text
+rule abs_by_sign_mask<W>(x: W) where 1 < W {
+        ((x >>s (W - 1)) ^ x) - (x >>s (W - 1)) => select(x <s 0, -x, x)
+    }
+```
+
+- `((p >>s 7) ^ p) - (p >>s 7)` → `select(p <s 0, -p, p)`
+
+#### `abs_by_sign_mask_add` — rule
+
+The same with the mask added first.
+
+```text
+rule abs_by_sign_mask_add<W>(x: W) where 1 < W {
+        (x + (x >>s (W - 1))) ^ (x >>s (W - 1)) => select(x <s 0, -x, x)
+    }
+```
+
+- `(p + (p >>s 7)) ^ (p >>s 7)` → `select(p <s 0, -p, p)`
+
 #### `lshr_sign_eq_one` — rule
 
 The sign bit shifted down is one when the value is negative.
@@ -898,6 +985,41 @@ rule sext_from_sign_word<W, U>(a: W) where W < U, U <= 2 * W {
 ```
 
 - `zext<16>(p) | (zext<16>(p >>s 7) << 8)` → `sext<16>(p)`
+
+#### `sext_nonnegative` — rule
+
+A sign extension of a value whose sign bit is clear is its zero extension.
+
+```text
+rule sext_nonnegative<W, U>(x: W) where W < U { sext<U>(x) => zext<U>(x) if zero_bits(x, smin_lit) }
+```
+
+- `sext<16>(p & 127)` → `zext<16>(p & 127)`
+
+#### `trunc_eq_const` — rule
+
+Through a truncation that drops only bits known zero, an equality with a constant is one
+of the whole value.
+
+```text
+rule trunc_eq_const<N, W>(x: W, c: const N) where N < W {
+        trunc<N>(x) == c => x == k if zero_bits(x, ~lowmask(N)) let k: W = zext<W>(c)
+    }
+```
+
+- `trunc<4>(p & 15) == 3:4` → `(p & 15) == 3`
+
+#### `trunc_eq_trunc` — rule
+
+Likewise between two truncations.
+
+```text
+rule trunc_eq_trunc<N, W>(x: W, y: W) where N < W {
+        trunc<N>(x) == trunc<N>(y) => x == y if zero_bits(x, ~lowmask(N)) && zero_bits(y, ~lowmask(N))
+    }
+```
+
+- `trunc<4>(p & 15) == trunc<4>(q & 15)` → `(p & 15) == (q & 15)`
 
 ### core.select
 
@@ -2459,6 +2581,122 @@ rule select_xor<W>(c: 1, x: W, y: W, z: W) { select(c, x ^ z, y ^ z) => select(c
 
 - `select(p <u q, p ^ r, q ^ r)` → `select(p <u q, p, q) ^ r`
 
+#### `select_and` — rule
+
+Both arms and the same term.
+
+```text
+rule select_and<W>(c: 1, x: W, y: W, z: W) { select(c, x & z, y & z) => select(c, x, y) & z }
+```
+
+- `select(r:1, p & s, q & s)` → `select(r:1, p, q) & s`
+
+#### `select_or` — rule
+
+Both arms or the same term.
+
+```text
+rule select_or<W>(c: 1, x: W, y: W, z: W) { select(c, x | z, y | z) => select(c, x, y) | z }
+```
+
+- `select(r:1, p | s, q | s)` → `select(r:1, p, q) | s`
+
+#### `select_mul` — rule
+
+Both arms multiply by the same term.
+
+```text
+rule select_mul<W>(c: 1, x: nonconst W, y: nonconst W, z: W) { select(c, x * z, y * z) => select(c, x, y) * z }
+```
+
+- `select(r:1, p * s, q * s)` → `select(r:1, p, q) * s`
+
+#### `select_sub` — rule
+
+Both arms subtract the same term.
+
+```text
+rule select_sub<W>(c: 1, x: W, y: W, z: W) { select(c, x - z, y - z) => select(c, x, y) - z }
+```
+
+- `select(r:1, p - s, q - s)` → `select(r:1, p, q) - s`
+
+#### `select_sub_from` — rule
+
+Both arms subtract from the same term.
+
+```text
+rule select_sub_from<W>(c: 1, x: W, y: W, z: W) { select(c, z - x, z - y) => z - select(c, x, y) }
+```
+
+- `select(r:1, s - p, s - q)` → `s - select(r:1, p, q)`
+
+#### `select_shl` — rule
+
+Both arms shift by the same amount.
+
+```text
+rule select_shl<W>(c: 1, x: W, y: W, z: W) { select(c, x << z, y << z) => select(c, x, y) << z }
+```
+
+- `select(r:1, p << s, q << s)` → `select(r:1, p, q) << s`
+
+#### `select_lshr` — rule
+
+```text
+rule select_lshr<W>(c: 1, x: W, y: W, z: W) { select(c, x >>u z, y >>u z) => select(c, x, y) >>u z }
+```
+
+- `select(r:1, p >>u s, q >>u s)` → `select(r:1, p, q) >>u s`
+
+#### `select_ashr` — rule
+
+```text
+rule select_ashr<W>(c: 1, x: W, y: W, z: W) { select(c, x >>s z, y >>s z) => select(c, x, y) >>s z }
+```
+
+- `select(r:1, p >>s s, q >>s s)` → `select(r:1, p, q) >>s s`
+
+#### `select_increment` — rule
+
+One more in the chosen arm: the condition, zero-extended, added.
+
+```text
+rule select_increment<W>(c: 1, x: W) where 1 < W { select(c, x + 1, x) => x + zext<W>(c) }
+```
+
+- `select(r:1, p + 1, p)` → `p + zext<8>(r:1)`
+
+#### `select_increment_else` — rule
+
+One more in the other arm.
+
+```text
+rule select_increment_else<W>(c: 1, x: W) where 1 < W { select(c, x, x + 1) => x + zext<W>(~c) }
+```
+
+- `select(r:1, p, p + 1)` → `p + zext<8>(~r:1)`
+
+#### `select_decrement` — rule
+
+One less in the chosen arm: the condition, zero-extended, subtracted.
+
+```text
+rule select_decrement<W>(c: 1, x: W) where 1 < W { select(c, x + ones, x) => x - zext<W>(c) }
+```
+
+- `select(r:1, p - 1, p)` → `p - zext<8>(r:1)`
+
+#### `select_decrement_else` — rule
+
+One less in the other arm.
+
+```text
+rule select_decrement_else<W>(c: 1, x: W) where 1 < W { select(c, x, x + ones) => x - zext<W>(~c) }
+```
+
+- `select(r:1, p, p - 1)` → `p - zext<8>(~r:1)`
+
 #### `select_swapped_add` — rule
 
 Swapped arms under one condition, combined commutatively: the minimum plus the
@@ -2607,6 +2845,16 @@ rule select_by_xor_mask<W>(c: 1, x: W, y: W) where 1 < W {
 ```
 
 - `q ^ ((p ^ q) & sext<8>(r:1))` → `select(r:1, p, q)`
+
+#### `select_by_xor_bit` — rule
+
+The same at one bit, where the mask is the condition.
+
+```text
+rule select_by_xor_bit(c: 1, x: 1, y: 1) { ((x ^ y) & c) ^ y => select(c, x, y) }
+```
+
+- `((p:1 ^ q:1) & r:1) ^ q:1` → `select(r:1, p:1, q:1)`
 
 #### `select_xor_zero` — rule
 
@@ -2998,18 +3246,6 @@ rule longer_shift_smaller<W>(x: W, a: const W, b: const W) {
 
 - `(p >>u 3) <=u (p >>u 1)` → `true`
 
-#### `halves_sum_no_overflow` — rule
-
-Halves of two values never overflow their sum.
-
-```text
-rule halves_sum_no_overflow<W>(x: W, y: W) where 1 < W {
-        ((x >>u 1) + (y >>u 1)) <u (x >>u 1) => false
-    }
-```
-
-- `((p >>u 1) + (q >>u 1)) <u (p >>u 1)` → `false`
-
 ### core.concat
 
 #### `concat_sign_shift` — rule
@@ -3138,6 +3374,68 @@ rule concat_or_zext<W, V>(x: W, y: V) { concat(x, 0) | zext<W + V>(y) => concat(
 
 - `concat(p, 0:4) | zext<12>(q:4)` → `concat(p, q:4)`
 
+#### `concat_add_carry` — rule
+
+The carry as `~a0 <u b0` (the form `core.compare` gives `a0 + b0 <u a0`; with a
+constant half it takes another).
+
+```text
+rule concat_add_carry<H, L>(a1: H, b1: H, a0: nonconst L, b0: nonconst L) where 1 < H, H + L <= 512 {
+        concat(a1 + b1 + zext<H>(~a0 <u b0), a0 + b0) => concat(a1, a0) + concat(b1, b0)
+    }
+```
+
+- `concat(p + q + zext<8>(~r <u s), r + s)` → `concat(p, r) + concat(q, s)`
+
+#### `concat_sub_borrow` — rule
+
+The borrow as `a0 <u b0`.
+
+```text
+rule concat_sub_borrow<H, L>(a1: H, b1: H, a0: L, b0: L) where 1 < H, H + L <= 512 {
+        concat(a1 - b1 - zext<H>(a0 <u b0), a0 - b0) => concat(a1, a0) - concat(b1, b0)
+    }
+```
+
+- `concat(p - q - zext<8>(r <u s), r - s)` → `concat(p, r) - concat(q, s)`
+
+#### `concat_add_slices` — rule
+
+The same split over two whole values, the low halves' sum already one truncation.
+
+```text
+rule concat_add_slices<H, L>(x: H + L, y: H + L) where 1 < H, H + L <= 512 {
+        concat(extract<L, H>(x) + extract<L, H>(y) + zext<H>(trunc<L>(x + y) <u trunc<L>(x)), trunc<L>(x + y))
+        => x + y
+    }
+```
+
+- `concat(extract<4, 4>(p) + extract<4, 4>(q) + zext<4>(trunc<4>(p + q) <u trunc<4>(p)), trunc<4>(p + q))` → `p + q`
+
+#### `concat_sub_slices` — rule
+
+```text
+rule concat_sub_slices<H, L>(x: H + L, y: H + L) where 1 < H, H + L <= 512 {
+        concat(extract<L, H>(x) - extract<L, H>(y) - zext<H>(trunc<L>(x) <u trunc<L>(y)), trunc<L>(x - y))
+        => x - y
+    }
+```
+
+- `concat(extract<4, 4>(p) - extract<4, 4>(q) - zext<4>(trunc<4>(p) <u trunc<4>(q)), trunc<4>(p - q))` → `p - q`
+
+#### `concat_window` — rule
+
+A word-sized window of two words (`shld`, `shrd`): the high word's low bits above the
+low word's high bits.
+
+```text
+rule concat_window<W, A>(h: W, l: W) where A < W, W + W <= 512 {
+        concat(trunc<A>(h), extract<A, W - A>(l)) => extract<A, W>(concat(h, l))
+    }
+```
+
+- `concat(trunc<3>(p), extract<3, 5>(q))` → `extract<3, 8>(concat(p, q))`
+
 ### core.single_bit
 
 #### `pow2_and_below` — rule
@@ -3150,6 +3448,88 @@ rule pow2_and_below<W>(s: W) { (one << s) & ((one << s) + ones) => 0 }
 ```
 
 - `(1 << (q & 7)) & ((1 << (q & 7)) - 1)` → `0`
+
+### core.bit_counts
+
+#### `popcnt_complement` — rule
+
+Every bit is set in `x` or in `~x`.
+
+```text
+rule popcnt_complement<W>(x: W) { popcnt(x) + popcnt(~x) => W }
+```
+
+- `popcnt(p) + popcnt(~p)` → `8`
+
+#### `popcnt_eq_zero` — rule
+
+No bit set is zero.
+
+```text
+rule popcnt_eq_zero<W>(x: W) { popcnt(x) == 0 => x == 0 }
+```
+
+- `popcnt(p) == 0` → `p == 0`
+
+#### `popcnt_ne_zero` — rule
+
+```text
+rule popcnt_ne_zero<W>(x: W) { popcnt(x) != 0 => x != 0 }
+```
+
+- `popcnt(p) != 0` → `p != 0`
+
+#### `popcnt_eq_width` — rule
+
+Every bit set is all ones.
+
+```text
+rule popcnt_eq_width<W>(x: W) { popcnt(x) == W => x == ones }
+```
+
+- `popcnt(p) == 8` → `p == 0xff`
+
+#### `ctz_eq_width` — rule
+
+As many trailing or leading zeros as bits: zero.
+
+```text
+rule ctz_eq_width<W>(x: W) { ctz(x) == W => x == 0 }
+```
+
+- `ctz(p) == 8` → `p == 0`
+
+#### `clz_eq_width` — rule
+
+```text
+rule clz_eq_width<W>(x: W) { clz(x) == W => x == 0 }
+```
+
+- `clz(p) == 8` → `p == 0`
+
+#### `popcnt_below_lowest` — rule
+
+```text
+rule popcnt_below_lowest<W>(x: W) { popcnt((x & -x) + ones) => ctz(x) }
+```
+
+- `popcnt((p & -p) - 1)` → `ctz(p)`
+
+#### `popcnt_trailing_mask` — rule
+
+```text
+rule popcnt_trailing_mask<W>(x: W) { popcnt(~x & (x + ones)) => ctz(x) }
+```
+
+- `popcnt(~p & (p - 1))` → `ctz(p)`
+
+#### `popcnt_not_or_neg` — rule
+
+```text
+rule popcnt_not_or_neg<W>(x: W) { popcnt(~(x | -x)) => ctz(x) }
+```
+
+- `popcnt(~(p | -p))` → `ctz(p)`
 
 ### core.float
 

@@ -5403,6 +5403,64 @@ fn carries_reads_shifts_of_one_atom_exactly() {
     }
 }
 
+/// The SWAR population count of `v` at `w` bits (Hacker's Delight), with the pair mask `m1`.
+#[cfg(feature = "prove")]
+fn swar(w: u16, v: &str, m1: u64) -> String {
+    let ones = u64::MAX >> (64 - w);
+    format!(
+        "let a = {v} - (({v} >>u 1) & {m1:#x}); let b = (a & {:#x}) + ((a >>u 2) & {:#x}); \
+         let c = (b + (b >>u 4)) & {:#x}; (c * {:#x}) >>u {}",
+        ones / 5,
+        ones / 5,
+        ones / 17,
+        ones / 255,
+        w - 8
+    )
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recognizes_bit_counts() {
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0xb17c);
+    for w in [16u16, 32, 64] {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let ones = u64::MAX >> (64 - w);
+        // Ones above the highest set bit: the smear, counted, is the leading zeros.
+        let mut smear = String::from("let s0 = x; ");
+        let mut k = 0;
+        while 1u32 << k < u32::from(w) {
+            smear += &format!(
+                "let s{n} = s{k} | (s{k} >>u {sh}); ",
+                n = k + 1,
+                sh = 1u32 << k
+            );
+            k += 1;
+        }
+        let clz = format!("{smear}let v = ~s{k}; {}", swar(w, "v", ones / 3));
+        let ctz = format!("let v = (x & -x) - 1; {}", swar(w, "v", ones / 3));
+        for (src, want) in [
+            (swar(w, "x", ones / 3), "popcnt(x)"),
+            (clz, "clz(x)"),
+            (ctz, "ctz(x)"),
+            // A wrong pair mask: no count, and left as it was.
+            (swar(w, "x", ones / 3 - 4), ""),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
+            if want.is_empty() {
+                assert_eq!(r, e, "{w} bits: {src} became {}", cx.display(r));
+            } else {
+                let want = cx.parse(want, &o).unwrap();
+                assert_eq!(r, want, "{w} bits: {src} became {}", cx.display(r));
+            }
+        }
+    }
+}
+
 /// A `w`-bit sum (or difference) split at bit `k`: the low halves added at `k + 1` bits, the
 /// high ones apart, plus the carry read at bit `carry` of the low sum (`k` is right; `None`
 /// drops it).
