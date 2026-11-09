@@ -194,7 +194,7 @@ let e = cx.parse(
 let out = engine.run(&mut cx, &[e], Default::default())?;
 assert!(out.stats.mba.calls + out.stats.mba.cache_hits > 0);
 // 2·x + y + (x & y): the same function of x and y at every bit.
-assert_eq!(cx.display(out.roots[0].expr).to_string(), "x + x + (x & y) + y");
+assert_eq!(cx.display(out.roots[0].expr).to_string(), "(x & y) + (x << 1) + y");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
