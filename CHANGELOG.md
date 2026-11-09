@@ -102,6 +102,15 @@ Defects in the driver and the normal forms, found reading the engine:
   counts once, and beside its complement it decides the chain. A chain found in order is
   remembered for the call, so are its parts, and so is one over 256 operands (every chain over
   it is, too): two 256-factor products in opposite orders take 0.30 M units of pass work.
+- **Uses of a node that took another's place.** The commit rule counted a node's uses as the
+  walk had rebuilt them so far: a node rebuilt over a rewrite below it had no user until its
+  users were rebuilt in turn, so one that several of them share looked like one a rewrite at the
+  first could free. It now counts the uses of the node it replaced until those users are
+  rebuilt over it, and is counted as live though the context held it before the call. With
+  `y` reducing to `p`, `(x & (y & z)) ^ popcnt(y & z)` keeps `x & (p & z)` over the shared
+  `p & z`; putting that chain in order (`p & x & z`) built a second copy of it. Over 400 random
+  DAGs of 200 nodes, results are smaller in 70 and larger in 7 with one root, and with four
+  roots over one shared term 43 results are larger than their input, from 73.
 - **Sums and xors over 64 terms.** A form of more than 64 terms is an atom of the forms over
   it, which keeps every node's form small, and so nothing cancelled through it:
   `(v0 + … + v69) - v0` was left as written, and so was the same sum minus itself in another

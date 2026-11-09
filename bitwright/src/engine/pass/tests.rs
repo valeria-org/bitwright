@@ -415,6 +415,34 @@ fn chains_are_written_one_way() {
     }
 }
 
+/// A node rebuilt over a rewrite below it will be used by every user of the node it replaced,
+/// though the walk has rebuilt only some of them yet: a rewrite at one user that would leave
+/// it to the others frees nothing. Here `y` is `p`; the pass that finds it then meets the chain
+/// `x op (p op z)` over the rebuilt `p op z`, and putting that chain in order would build
+/// `p op x` beside the `p op z` that `popcnt` keeps.
+#[test]
+fn a_rebuilt_node_counts_the_users_still_to_be_rebuilt() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for op in ["&", "|"] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::W32);
+            let written =
+                format!("let y = (p & q) | (p & ~q); let i = y {op} z; (x {op} i) ^ popcnt(i)");
+            let reduced = format!("let i = p {op} z; (x {op} i) ^ popcnt(i)");
+            let a = cx.parse(&written, &o).unwrap();
+            let b = cx.parse(&reduced, &o).unwrap();
+            let (_, nodes) = size(&mut cx, b);
+            let got = eng.simplify(&mut cx, a).unwrap().expr;
+            assert_eq!(size(&mut cx, got).1, nodes, "{op}: {}", cx.display(got));
+        }
+    }
+}
+
 #[test]
 fn linear_charges_pass_work() {
     let eng = engine(vec![Phase::Linear]);

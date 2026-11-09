@@ -1597,7 +1597,7 @@ impl Runner<'_, '_> {
         // Use counts are counted afresh in each phase run, on first need (a pass's commit rule,
         // a rule's `one_use`).
         self.uses_on = false;
-        self.live.clear();
+        self.live.begin();
         self.dead.clear();
         self.dead_log.clear();
         self.phase_start = cx.len() as u32;
@@ -1701,6 +1701,7 @@ impl Runner<'_, '_> {
                             } else {
                                 self.rewritten.insert((n, r), ());
                                 *pending.entry(n).or_default() += 1;
+                                self.live.replace(n, r);
                                 self.retire(cx, n);
                                 self.inherit_parent(n, r);
                                 stack.push(Frame::Finish(n, r, fin));
@@ -1752,7 +1753,9 @@ impl Runner<'_, '_> {
                             if !local {
                                 *pending.entry(n).or_default() += 1;
                             }
-                            // `n1` replaces `n`: `n` no longer counts as a user.
+                            // `n1` replaces `n`: `n` no longer counts as a user, and its
+                            // users will use `n1`.
+                            self.live.replace(n, n1);
                             self.retire(cx, n);
                             self.inherit_parent(n, n1);
                             stack.push(Frame::Finish(n, n1, own));
@@ -1781,6 +1784,7 @@ impl Runner<'_, '_> {
                                 self.rewritten.insert((n, r), ());
                                 *pending.entry(n).or_default() += 1;
                             }
+                            self.live.replace(n, r);
                             self.retire(cx, n);
                             self.inherit_parent(n, r);
                             stack.push(Frame::Finish(n, r, own.and(fin)));

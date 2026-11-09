@@ -568,7 +568,9 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// Use counts (parent edges) of the live DAG: counted once per phase run over the current
 /// version of every root of the call (nodes only replaced ones reach are not live), then kept
 /// up to date as nodes are created (counted) and replaced (uncounted, see `Runner::retire`). A
-/// node a counted node uses is counted too, so one replaced and then used again is live again.
+/// node a counted node uses is counted too, so one replaced and then used again is live again;
+/// and so is a node that takes another's place, which the arena may have held before the
+/// phase run, where no new node would count it.
 ///
 /// The roots other than the active one do not change while it is processed: their part is
 /// counted once per root ([`Live`]) and stands in every phase run in which none of the nodes
@@ -614,6 +616,15 @@ pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), S
         .rev()
         .filter(|&i| !r.dead.contains(i) && !r.live.counted(i))
         .collect();
+    let arrived = std::mem::take(&mut r.live.arrived);
+    stack.extend(
+        arrived
+            .iter()
+            .copied()
+            .filter(|&i| !r.dead.contains(i) && !r.live.counted(i)),
+    );
+    r.live.arrived = arrived;
+    r.live.arrived.clear();
     while let Some(i) = stack.pop() {
         if !r.live.count(i) {
             continue;
@@ -646,6 +657,11 @@ pub(crate) struct Others {
 /// The use counts and the set of nodes whose edges they count ("counted"), for the commit
 /// rule: when `base` is on, the other roots' part ([`Others`]) with this phase run's changes on
 /// top, else the changes alone. Answers as one [`Counts`] and one [`Marks`] would.
+///
+/// A node that takes the place of another in a phase run ([`replace`](Live::replace)) is not
+/// yet used by the users of the one it replaced: the walk rebuilds them later. Their uses
+/// count for it meanwhile, or a node shared by several users would look like one a single
+/// rewrite could free until the last of them was rebuilt.
 #[derive(Default)]
 pub(crate) struct Live {
     others: Others,
@@ -657,9 +673,47 @@ pub(crate) struct Live {
     stamp: Vec<u32>,
     delta: Vec<i32>,
     epoch: u32,
+    /// Per node replaced in this phase run, the node that took its place.
+    heirs: crate::hash::IdMap<u32, u32>,
+    /// The nodes that took another's place since the last count (see `refresh_uses`).
+    arrived: Vec<u32>,
 }
 
 impl Live {
+    /// The longest chain of replacements followed.
+    const MAX_HEIRS: usize = 16;
+
+    /// Starts a phase run: [`clear`](Live::clear), and no node has taken the place of another.
+    pub(crate) fn begin(&mut self) {
+        self.heirs.clear();
+        self.arrived.clear();
+        self.clear();
+    }
+
+    /// `new` takes the place of `old`: the uses of `old` (by users not rebuilt yet) count for
+    /// `new` too, now and as they are counted or stop counting. Not when the chain of
+    /// replacements from `new` is long or leads back to `old`.
+    pub(crate) fn replace(&mut self, old: u32, new: u32) {
+        self.arrived.push(new);
+        let mut at = new;
+        for _ in 0..Self::MAX_HEIRS {
+            if at == old {
+                return;
+            }
+            match self.heirs.get(&at) {
+                Some(&next) => at = next,
+                None => {
+                    let uses = self.uses(old).unwrap_or(0);
+                    self.heirs.insert(old, new);
+                    if uses > 0 {
+                        self.change(new, uses as i32);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     /// Empties it: nothing counted, no uses, the base off.
     pub(crate) fn clear(&mut self) {
         self.base = false;
@@ -688,18 +742,28 @@ impl Live {
         (self.stamp.get(i) == Some(&self.epoch)).then(|| self.delta[i])
     }
 
+    /// Changes the uses of `i` by `by`, and so those of the nodes that took its place.
     #[inline]
-    fn change(&mut self, i: u32, by: i32) {
-        let i = i as usize;
-        if i >= self.stamp.len() {
-            self.stamp.resize(i + 1, 0);
-            self.delta.resize(i + 1, 0);
+    fn change(&mut self, mut i: u32, by: i32) {
+        loop {
+            let at = i as usize;
+            if at >= self.stamp.len() {
+                self.stamp.resize(at + 1, 0);
+                self.delta.resize(at + 1, 0);
+            }
+            if self.stamp[at] != self.epoch {
+                self.stamp[at] = self.epoch;
+                self.delta[at] = 0;
+            }
+            self.delta[at] += by;
+            if self.heirs.is_empty() {
+                return;
+            }
+            match self.heirs.get(&i) {
+                Some(&next) => i = next,
+                None => return,
+            }
         }
-        if self.stamp[i] != self.epoch {
-            self.stamp[i] = self.epoch;
-            self.delta[i] = 0;
-        }
-        self.delta[i] += by;
     }
 
     /// The uses of `i`, if it has a count.

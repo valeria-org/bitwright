@@ -1070,8 +1070,13 @@ the pass's fragment, down to its *atoms*), and builds it through the builder.
 needs (those not already in the region or atoms, counted against the structure, not against which
 nodes happen to exist in the arena) are fewer than the nodes replacing the region frees. A node is
 freed when every use of it comes from freed nodes, with uses counted over the live DAG of the call
-(the current version of every root), kept up to date as nodes are created and replaced; the
-region is bounded (the nodes nearest the root), which only under-counts what is freed. Shared
+(the current version of every root), kept up to date as nodes are created and replaced. A node
+that takes another's place (its rewrite, or its rebuild over rewritten operands) counts the uses
+of the one it replaced until the walk has rebuilt those users over it, and is live though the
+arena held it before the phase: without that, a node several users share looked like one a
+rewrite at the first of them could free (`x & (p & z)` beside `popcnt(p & z)` was put in order
+as `p & x & z`, a second copy of the chain). The region is bounded (the nodes nearest the root),
+which only under-counts what is freed. Shared
 parts therefore never count as freed, so re-emitting a region that other roots still use is not a
 gain. Linear, xor and bitwise candidates are costed from their form before they are built, so a
 rejected candidate builds nothing. A rejection that happened only because of sharing is not final
