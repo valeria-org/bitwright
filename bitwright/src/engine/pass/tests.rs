@@ -3597,7 +3597,7 @@ fn linear_mba_emits_conjunctions_for_any_number_of_atoms() {
         (
             "3 * (x & ~y) + 2 * (~x & y) + 5 * (x & y) - (x | y)",
             64,
-            "x + x + (x & y) + y",
+            "(x & y) + (x << 1) + y",
         ),
         // Four atoms: the indicator form needs three or fewer, and a conjunction remains.
         ("(a | b) - (a ^ b) + (c & ~d) + (c & d)", 32, "(a & b) + c"),
@@ -4524,14 +4524,11 @@ fn linear_emissions() {
     for (src, want) in [
         ("-x - 1", "~x"),
         ("(y << 2) + 4", "~y * -4"),
-        ("-2 * y - 2", "let %0 = ~y;\n%0 + %0"),
-        ("2 * x + y", "x + x + y"),
+        ("-2 * y - 2", "y * -2 - 2"),
+        ("2 * x + y", "x * 2 + y"),
         ("5 - 3 * x", "5 - x * 3"),
         ("-(y * 3) - z * 5", "y * -3 - z * 5"),
-        (
-            "concat(trunc<62>(y), 3:2) - 6 * y - 5",
-            "let %0 = ~y;\n%0 + %0",
-        ),
+        ("concat(trunc<62>(y), 3:2) - 6 * y - 5", "~y << 1"),
     ] {
         let mut cx = Context::new();
         let o = ParseOptions::width(Width::W64);
@@ -5381,7 +5378,7 @@ fn carries_is_sound_on_mutated_networks() {
 fn carries_reads_shifts_of_one_atom_exactly() {
     // `a << k` is `2^k·a`, and 0 once the shifts reach the width: no proof needed, so none is
     // taken, and every result is equal to its input. (Inner shifts by more than 1 are their
-    // own form, so the chain is read whole; `a << 1` alone becomes `a + a`.)
+    // own form, so the chain is read whole; `a << 1` alone is left as it is.)
     let eng = engine(vec![Phase::Carries]);
     let mut rng = Rng(0x5e1f);
     for w in [8u16, 64] {
@@ -5390,7 +5387,7 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             ("(x << 2) << 3".to_string(), "x << 5".to_string()),
             ("((x << 3) << 2) << 1".into(), "x << 6".into()),
             (format!("(x << {}) << 3", w - 2), format!("0:{w}")),
-            ("x << 1".into(), "x + x".into()),
+            ("x << 1".into(), "x << 1".into()),
         ] {
             let mut cx = Context::new();
             let e = cx.parse(&src, &o).unwrap();

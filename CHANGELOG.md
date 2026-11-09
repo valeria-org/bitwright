@@ -66,6 +66,38 @@ Idioms of compiled and lifted code that every preset left as written, reported a
   work. The solver gains a search under assumptions that leaves the clauses satisfiable when
   the assumptions are refuted.
 
+Defects in the driver and the normal forms, found reading the engine:
+
+- **A doubling is `a << 1`.** The builder writes `a + a` as `a << 1`, as every other power of
+  two is a shift, so what reads shifts reads doublings: `(x >>u 1) + (x >>u 1)` is `x & -2`,
+  and with `+ (x & 1)` it is `x`. The linear pass emits a coefficient of 2 as a shift (it wrote
+  `a + a`), and the rules `and_double_const`, `or_double_const` and `xor_double_const` are gone
+  (the `shl` rules beside them cover the one form). Expressions that printed `x + x` print
+  `x << 1`, lifted ones included.
+- **Constants in the commit rule.** A rewrite is committed when it frees more nodes than it
+  builds, and a node with a use outside the rewritten region is not freed. A constant's uses
+  outside are no longer counted: whether an unrelated expression happens to hold the same
+  constant decided rewrites it has nothing to do with.
+- **Rule results declined for sharing are decided again.** A rule guarded by `one_use` that
+  declined while its operand had another use was remembered as declined for the call; it is
+  asked again once a later phase has dropped the other use.
+- **Rotations written as concatenations.** `concat(trunc<A>(x), extract<A, W-A>(x))`, the two
+  parts of one word swapped, is `rotr(x, A)` (the rule `concat_rotate`); it stayed a
+  concatenation.
+- **Right shifts in sums.** The linear pass reads `k·2^j·(x >>u j)` beside the low field
+  `x & (2^j − 1)` of the same `x` as `k·x − k·(x & (2^j − 1))`, so the two parts of a value
+  taken apart come together: `(x >>u 3) * 24 + (x & 7) * 3` is `x * 3`.
+- **Quotients under masks.** `(x >>u c) << c` becomes a mask only when the shift has no other
+  use (the rule `lshr_shl`): the mask saved nothing, and hid the quotient `q` of `q·8 + q·2`
+  from the division pass. That pass reads a multiply-high, or a shift or slice of one, under a
+  mask `−2^m` as the quotient shifted left: `umulhi(x, 0xcccccccd) & -32` is `udiv(x, 40) << 5`,
+  and the compiler's `x % 10`, `x - ((q << 3) + (q << 1))` with
+  `q = umulhi(x, 0xcccccccd) >>u 3`, is `urem(x, 10)`.
+- **Products in one order.** The linear pass writes a product of three or more values with its
+  factors in the context's order, multiplied left to right (up to 256 factors), so a product
+  is one node however it was parenthesized and ordered: `a*b*c - c*b*a` is 0 wherever the pass
+  runs, at 40 factors as at 3. It was 0 only through the MBA service, up to 8 atoms.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths

@@ -1075,12 +1075,13 @@ rule lshr_lshr<W>(x: W, a: const W, b: const W) {
 
 #### `lshr_shl` — rule
 
-Shifting right then left by the same amount clears the low bits.
+Shifting right then left by the same amount clears the low bits (a shift with another
+use stays: the mask would save nothing, and a quotient `q` in `q·8 + q·2` would be lost).
 
 ```text
 rule lshr_shl<W>(x: W, c: const W) {
         (x >>u c) << c => x & m
-        if c <u W
+        if (c <u W) && one_use(x >>u c)
         let m: W = ones << c
     }
 ```
@@ -2218,16 +2219,6 @@ rule and_shl_const<W>(x: W, k: const W, m: const W) {
 
 - `(p << 2) & 60` → `(p & 15) << 2`
 
-#### `and_double_const` — rule
-
-```text
-rule and_double_const<W>(x: W, m: const W) {
-        (x + x) & m => (x & c) << 1 if one_use(x + x) let c: W = m >>u 1
-    }
-```
-
-- `(p + p) & 30` → `(p & 15) << 1`
-
 #### `or_shl_const` — rule
 
 An or or xor moves too when it sets no bit the shift clears.
@@ -2249,26 +2240,6 @@ rule xor_shl_const<W>(x: W, k: const W, m: const W) {
 ```
 
 - `(p << 2) ^ 12` → `(p ^ 3) << 2`
-
-#### `or_double_const` — rule
-
-```text
-rule or_double_const<W>(x: W, m: const W) {
-        (x + x) | m => (x | c) << 1 if (m & 1) == 0 && one_use(x + x) let c: W = m >>u 1
-    }
-```
-
-- `(p + p) | 6` → `(p | 3) << 1`
-
-#### `xor_double_const` — rule
-
-```text
-rule xor_double_const<W>(x: W, m: const W) {
-        (x + x) ^ m => (x ^ c) << 1 if (m & 1) == 0 && one_use(x + x) let c: W = m >>u 1
-    }
-```
-
-- `(p + p) ^ 6` → `(p ^ 3) << 1`
 
 ### core.factor
 
@@ -3422,6 +3393,18 @@ rule concat_sub_slices<H, L>(x: H + L, y: H + L) where 1 < H, H + L <= 512 {
 ```
 
 - `concat(extract<4, 4>(p) - extract<4, 4>(q) - zext<4>(trunc<4>(p) <u trunc<4>(q)), trunc<4>(p - q))` → `p - q`
+
+#### `concat_rotate` — rule
+
+The two parts of one word, swapped: a rotation.
+
+```text
+rule concat_rotate<W, A>(x: W) where A < W {
+        concat(trunc<A>(x), extract<A, W - A>(x)) => rotr(x, A)
+    }
+```
+
+- `concat(trunc<3>(p), extract<3, 5>(p))` → `rotr(p, 3)`
 
 #### `concat_window` — rule
 

@@ -188,7 +188,7 @@ fn simplify_runs_the_engine() {
     let (code, out, _) = run(&["simplify", mba, "--standard"]);
     assert_eq!(
         (code, out.trim()),
-        (0, "let %0 = x | y;\n%0 + %0 - (~y & x) - (~x & y)")
+        (0, "((x | y) << 1) - (~y & x) - (~x & y)")
     );
     let (code, out, _) = run(&["simplify", mba, "--deobfuscate"]);
     assert_eq!((code, out.trim()), (0, "x + y"));
@@ -309,12 +309,10 @@ fn simplify_a_file_line_by_line() {
         assert_eq!(out, "# MBA\nx + y\n\nx + y\nx    # relies on 0\n");
     }
     // A result with bindings stays on its line.
+    let f = file("shared.txt", "(x | y) * (x | y)\n");
     let (code, out, _) = run(&["simplify", "--file", &f, "--standard"]);
     assert_eq!(code, 0);
-    assert_eq!(
-        out.lines().nth(3),
-        Some("let %0 = x | y; %0 + %0 - (~y & x) - (~x & y)")
-    );
+    assert_eq!(out.lines().next(), Some("let %0 = x | y; %0 * %0"));
     let bad = file("bad.txt", "x\nx +\n");
     let (code, _, err) = run(&["simplify", "--file", &bad]);
     assert_eq!(code, 2);

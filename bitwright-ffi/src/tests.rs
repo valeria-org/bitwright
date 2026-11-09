@@ -1324,7 +1324,7 @@ fn proofs_synthesis_memory_lifting_and_transformations() {
         BW_OK
     );
     assert_eq!(unsafe { CStr::from_ptr(name) }.to_str().unwrap(), "rax");
-    assert_eq!(cx.print(out), "rdi + rdi");
+    assert_eq!(cx.print(out), "rdi << 1");
     assert_ne!(
         unsafe { bw_lifted_get(l, 1, 5, null_mut(), null_mut(), null_mut()) },
         BW_OK

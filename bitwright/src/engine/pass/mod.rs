@@ -876,6 +876,8 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
 /// that stop being used; with `kept`, nodes in `r.scratch.kept` (reused by the replacement)
 /// stay. A truncated region gives a lower bound.
 ///
+/// A constant's uses from outside the region are never counted.
+///
 /// With `shared = false`, uses from outside the region are ignored: the count a context-free
 /// decision would make, used to tell whether a rejection depended on sharing.
 ///
@@ -898,8 +900,11 @@ fn dying_in(
     sc.dying.begin(cx.len());
     sc.decided.begin(cx.len());
     sc.dead.clear();
+    // A constant is counted as the region's own: whether some unrelated expression happens to
+    // use the same constant says nothing about this rewrite, and would make the decision
+    // depend on it (a constant rewrites nothing further, so nothing is undone by it).
     let uses = |sc: &Scratch, live: &Live, i: u32| {
-        if shared {
+        if shared && cx.node(i).op != OpCode::Const {
             live.uses(i)
         } else {
             sc.local.get(i)

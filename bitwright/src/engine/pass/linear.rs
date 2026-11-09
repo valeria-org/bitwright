@@ -169,14 +169,10 @@ fn count(plan: &Plan) -> u32 {
     let w = konst.width();
     let one = BitVec::one(w);
     let t = terms.len() as u32;
-    let two = BitVec::wrapping_from_u64(w, 2);
-    let doubled = |k: &BitVec| *k == two || BitVec::un_unchecked(UnOp::Neg, k) == two;
     let scaled = terms
         .iter()
-        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one && !doubled(k))
+        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one)
         .count() as u32;
-    // `a + a` is one node.
-    let doubles = terms.iter().filter(|(_, k, _)| doubled(k)).count() as u32;
     let nots = terms.iter().filter(|(_, _, not)| *not).count() as u32;
     let minus_one = BitVec::ones(w);
     // With no positive term and no constant, a negation only when every coefficient is −1.
@@ -186,7 +182,7 @@ fn count(plan: &Plan) -> u32 {
         (_, true) => u32::from(negation),
         _ => 2,
     };
-    2 * scaled + doubles + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
+    2 * scaled + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
 }
 
 /// What [`emit`] writes for `form`, terms in the given order: the cheapest of trading the
@@ -334,11 +330,8 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => merge_complements(cx, merge_signs(cx, get(r, node.a).add(&get(r, node.b)))),
-        OpCode::Sub => merge_complements(
-            cx,
-            merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
-        ),
+        OpCode::Add => merge(cx, get(r, node.a).add(&get(r, node.b))),
+        OpCode::Sub => merge(cx, get(r, node.a).add(&get(r, node.b).neg())),
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -379,7 +372,7 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
             if disjoint {
                 // The sum relies on what proved the operands disjoint.
-                let mut f = get(r, node.a).add(&get(r, node.b));
+                let mut f = merge(cx, get(r, node.a).add(&get(r, node.b)));
                 f.fin = f.fin.and(fina).and(finb);
                 f
             } else {
@@ -391,6 +384,58 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
         }
         _ => Form::atom(i, w),
     })
+}
+
+/// `form` with the terms that read one value two ways moved to one reading, so they cancel.
+fn merge(cx: &Context, form: Form) -> Form {
+    merge_fields(cx, merge_complements(cx, merge_signs(cx, form)))
+}
+
+/// `form` with each term `k·2^j·(x >>u j)` moved to `k·x − k·(x & (2^j − 1))` when the form
+/// has that low field of `x` as a term too: `(x >>u 3)·24 + (x & 7)·3` is `x·3`. Only then, as
+/// [`merge_signs`].
+fn merge_fields(cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut moves = Vec::new();
+    for &(a, k) in &form.terms {
+        let n = cx.node(a);
+        if n.op != OpCode::LShr {
+            continue;
+        }
+        let Some(j) = cx.const_val(n.b).and_then(|j| j.to_u64()) else {
+            continue;
+        };
+        if j == 0 || j >= u64::from(w.bits()) {
+            continue;
+        }
+        let j = j as u32;
+        let q = crate::facts::known::bv_lshr(&k, j);
+        if crate::facts::known::bv_shl(&q, j) != k {
+            continue;
+        }
+        let mask = crate::facts::known::low_mask(w, j);
+        let low = form.terms.iter().map(|t| t.0).find(|&t| {
+            let m = cx.node(t);
+            m.op == OpCode::And && m.a == n.a && cx.const_val(m.b) == Some(mask)
+        });
+        if let Some(low) = low {
+            moves.push((a, k, n.a, low, q));
+        }
+    }
+    if moves.is_empty() {
+        return form;
+    }
+    let fin = form.fin;
+    let mut f = form;
+    for (a, k, x, low, q) in moves {
+        let neg = |v: &BitVec| BitVec::un_unchecked(UnOp::Neg, v);
+        f = f.add(&Form::of(
+            BitVec::zero(w),
+            &[(a, neg(&k)), (x, q), (low, neg(&q))],
+        ));
+    }
+    f.fin = fin;
+    f
 }
 
 /// `form` with each term `k·sext(c)` of a 1-bit `c` (`0` or `−1`) moved to `−k·zext(c)` when
@@ -485,10 +530,6 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
             r.meter.charge(Counter::PassWork, 1)?;
             if *k == BitVec::one(w) {
                 return Ok(a);
-            }
-            // `a + a`: one node, where a shift needs its amount too.
-            if *k == BitVec::wrapping_from_u64(w, 2) {
-                return r.build(cx, |cx| cx.c_bin(BinOp::Add, a, a));
             }
             if crate::facts::known::count_ones(k) == 1 {
                 let sh = BitVec::apply_un(UnOp::Ctz, k).map_err(|e| Stop::Error(e.into()))?;
@@ -830,6 +871,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if !linear_op(op) || op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    if op == OpCode::Mul
+        && let Some(step) = sort_product(r, cx, n)?
+    {
+        return Ok(step);
+    }
     let form = form_of(r, cx, n)?;
     if form.is_atom_of(n) {
         return Ok(Step::Normal(form.fin));
@@ -843,6 +889,60 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         Step::Normal(f) => Step::Normal(f.and(merged)),
         s => s,
     })
+}
+
+/// The most factors of a product put in order.
+const MAX_SORTED_FACTORS: usize = 256;
+
+/// The product `n` of values (no constant among them) with its factors in the context's
+/// canonical order, multiplied left to right: one node for a product however it was
+/// parenthesized and ordered, so `a·b·c − c·b·a` cancels. `None` when `n` is that already, is
+/// not such a product, or has more than [`MAX_SORTED_FACTORS`] factors. The result is the size
+/// of `n` unless a partial product has another use, and nothing rewrites it back.
+fn sort_product(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let mut factors = Vec::new();
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        let node = cx.node(i);
+        if node.op == OpCode::Mul && !cx.is_const(node.a) && !cx.is_const(node.b) {
+            stack.push(node.b);
+            stack.push(node.a);
+        } else {
+            if factors.len() == MAX_SORTED_FACTORS {
+                return Ok(None);
+            }
+            factors.push(i);
+        }
+    }
+    if factors.len() < 3 {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, factors.len() as u64)?;
+    factors.sort_by(|&a, &b| cx.order(a, b));
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| {
+        let mut e = factors[0];
+        for &f in &factors[1..] {
+            e = cx.c_bin(BinOp::Mul, e, f)?;
+        }
+        Ok(e)
+    })?;
+    if e == n {
+        return Ok(None);
+    }
+    factors.dedup();
+    let step = super::finish_with(
+        r,
+        cx,
+        PassKind::Linear,
+        n,
+        e,
+        before,
+        &factors,
+        Fin::FINAL,
+        true,
+    )?;
+    Ok(matches!(step, Step::To(..)).then_some(step))
 }
 
 /// The linear pass at `n` over its form as computed.

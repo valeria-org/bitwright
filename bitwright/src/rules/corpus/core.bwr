@@ -468,11 +468,12 @@ group core.shift {
         let k: W = a + b
     }
 
-    /// Shifting right then left by the same amount clears the low bits.
+    /// Shifting right then left by the same amount clears the low bits (a shift with another
+    /// use stays: the mask would save nothing, and a quotient `q` in `q·8 + q·2` would be lost).
     #[example("(p >>u 3) << 3" => "p & 0xf8")]
     rule lshr_shl<W>(x: W, c: const W) {
         (x >>u c) << c => x & m
-        if c <u W
+        if (c <u W) && one_use(x >>u c)
         let m: W = ones << c
     }
 
@@ -937,10 +938,6 @@ group core.shift_canonical {
     rule and_shl_const<W>(x: W, k: const W, m: const W) {
         (x << k) & m => (x & c) << k if one_use(x << k) let c: W = m >>u k
     }
-    #[example("(p + p) & 30" => "(p & 15) << 1")]
-    rule and_double_const<W>(x: W, m: const W) {
-        (x + x) & m => (x & c) << 1 if one_use(x + x) let c: W = m >>u 1
-    }
     /// An or or xor moves too when it sets no bit the shift clears.
     #[example("(p << 2) | 12" => "(p | 3) << 2")]
     rule or_shl_const<W>(x: W, k: const W, m: const W) {
@@ -949,14 +946,6 @@ group core.shift_canonical {
     #[example("(p << 2) ^ 12" => "(p ^ 3) << 2")]
     rule xor_shl_const<W>(x: W, k: const W, m: const W) {
         (x << k) ^ m => (x ^ c) << k if (m & ~(ones << k)) == 0 && one_use(x << k) let c: W = m >>u k
-    }
-    #[example("(p + p) | 6" => "(p | 3) << 1")]
-    rule or_double_const<W>(x: W, m: const W) {
-        (x + x) | m => (x | c) << 1 if (m & 1) == 0 && one_use(x + x) let c: W = m >>u 1
-    }
-    #[example("(p + p) ^ 6" => "(p ^ 3) << 1")]
-    rule xor_double_const<W>(x: W, m: const W) {
-        (x + x) ^ m => (x ^ c) << 1 if (m & 1) == 0 && one_use(x + x) let c: W = m >>u 1
     }
 }
 
@@ -1357,6 +1346,11 @@ group core.concat {
     rule concat_sub_slices<H, L>(x: H + L, y: H + L) where 1 < H, H + L <= 512 {
         concat(extract<L, H>(x) - extract<L, H>(y) - zext<H>(trunc<L>(x) <u trunc<L>(y)), trunc<L>(x - y))
         => x - y
+    }
+    /// The two parts of one word, swapped: a rotation.
+    #[example("concat(trunc<3>(p), extract<3, 5>(p))" => "rotr(p, 3)")]
+    rule concat_rotate<W, A>(x: W) where A < W {
+        concat(trunc<A>(x), extract<A, W - A>(x)) => rotr(x, A)
     }
     /// A word-sized window of two words (`shld`, `shrd`): the high word's low bits above the
     /// low word's high bits.

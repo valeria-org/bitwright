@@ -1592,6 +1592,11 @@ impl Runner<'_, '_> {
             self.asks.clear();
             self.first.clear();
             self.demanded_same.clear();
+        } else {
+            // A rule's "no" from sharing (`one_use`) may be a "yes" once a phase since has
+            // dropped the other use: those results are decided again. What a cap declined
+            // stays declined for the call.
+            self.partial[phase].retain(|_, (_, fin)| fin.why.is_some());
         }
         let mut stack = core::mem::take(&mut self.stack);
         stack.clear();
