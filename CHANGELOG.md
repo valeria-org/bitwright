@@ -40,6 +40,23 @@ Idioms of compiled and lifted code that every preset left as written, reported a
   rotations, double-word shifts), without the MBA passes. `bitwright simplify --decompile` and
   `lift --decompile`, and the Python preset `"decompile"`.
 - The rule `halves_sum_no_overflow` is gone: `x + y <u x` as a carry-out test decides it.
+- **SAT sweeping** (`prove::Config::sweeping`, off by default). Before the first search, the
+  circuit is simulated on word-level assignments (boundary values, runs of ones, and values
+  related to the word before, such as `-x` beside `x`, so long carries occur); nodes that agree
+  everywhere, or disagree everywhere, are proved equivalent one pair at a time from the inputs
+  up, by a solver holding only the circuit's clauses, under assumptions (`a ∧ ¬b`, then
+  `¬a ∧ b`); a pair told apart refines the simulation with its counterexample and that point's
+  neighbours. The equivalences go to the search as clauses, and with a certificate the sweep's
+  own lemmas are logged first, so the certificate still checks independently (the sweep's
+  solver holds a subset of the question's clauses, in the same variables). The sweep takes at
+  most half of the first search's limits, counts in the question's totals, and is reported in
+  `Stats::sweeping`. Measured in propagations, without and with: the 64-bit prefix adder
+  against `x + y` 0.54 M and 0.29 M (54 ms and 18 ms), the 64-bit MBA rewriting of `x - y`
+  7.6 M and 0.56 M (2.1 s and 44 ms), the 32-bit SWAR population count against `popcnt`
+  148 k and 24 k; the shift-and-xor addition loop against `x + y`, whose carries no single
+  node holds, 28.7 M and 22.0 M at 64 bits; products not at all. The carries pass turns it on:
+  its proofs over the networks it tests take 46 % less pass work. The solver gains a search
+  under assumptions that leaves the clauses satisfiable when the assumptions are refuted.
 
 ## 0.26.0
 

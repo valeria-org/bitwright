@@ -42,6 +42,7 @@ mod relations;
 mod rule;
 mod sample_words;
 pub mod sat;
+mod sweep;
 #[cfg(test)]
 mod tests;
 
@@ -153,6 +154,20 @@ pub struct Config {
     /// the word program fixes from scoped assumptions as constrained inputs), the search
     /// decides the question instead. 0 (the default): never.
     pub exhaustive_inputs: u8,
+    /// Sweep the circuit before the first search: nodes that simulation shows equal (or
+    /// complementary) are proved so one pair at a time, from the inputs up, by a solver of
+    /// the circuit's clauses alone, and each equivalence is given to the search as clauses.
+    /// Two circuits for one function often share most of their inner nodes (a prefix adder
+    /// and `x + y` have the same carries), and a search over their miter alone rediscovers
+    /// each of them inside one refutation: swept, the 64-bit prefix adder against `x + y`
+    /// takes 0.29 M propagations instead of 0.54 M, the 32-bit SWAR population count against
+    /// `popcnt` 24 k instead of 148 k, and a 64-bit MBA rewriting of `x - y` 0.56 M instead of
+    /// 7.6 M. A circuit with nothing inside in common gains little (the sweep stops when its
+    /// candidates keep being told apart), and products not at all. The sweep takes at most
+    /// half of the first search's limits, its work counts in the question's totals, and with
+    /// a [`certificate`](Self::certificate) its lemmas are logged so the certificate still
+    /// checks. See [`Stats::sweeping`]. Off by default; the carries pass turns it on.
+    pub sweeping: bool,
 }
 
 impl Default for Config {
@@ -174,6 +189,7 @@ impl Default for Config {
             carry_save_multiplication: false,
             word_sampling: false,
             exhaustive_inputs: 0,
+            sweeping: false,
         }
     }
 }
@@ -195,6 +211,7 @@ setters!(Config {
     with_carry_save_multiplication: carry_save_multiplication: bool,
     with_word_sampling: word_sampling: bool,
     with_exhaustive_inputs: exhaustive_inputs: u8,
+    with_sweeping: sweeping: bool,
 });
 
 impl Config {
@@ -359,6 +376,9 @@ impl core::fmt::Display for Unknown {
 pub struct Stats {
     /// What simplifying the question took ([`Config::simplify`]).
     pub simplification: Simplification,
+    /// What sweeping the circuit did ([`Config::sweeping`]); its conflicts, decisions,
+    /// propagations and lemmas are also counted in the totals below.
+    pub sweeping: Sweeping,
     /// AIG nodes of the circuit (inputs and gates).
     pub nodes: usize,
     /// Assignments evaluated before search, on words or the circuit ([`Config::samples`]).
@@ -410,6 +430,24 @@ impl Stats {
             ..self
         }
     }
+}
+
+/// What sweeping a question's circuit did ([`Config::sweeping`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sweeping {
+    /// Whether the circuit was swept.
+    pub ran: bool,
+    /// Nodes proved equal to an earlier node, or its complement, or to a constant.
+    pub merged: u64,
+    /// Candidate pairs a counterexample told apart.
+    pub separated: u64,
+    /// Candidate pairs left undecided within their own conflict cap.
+    pub undecided: u64,
+    /// The sweep's conflicts.
+    pub conflicts: u64,
+    /// The sweep's propagations.
+    pub propagations: u64,
 }
 
 /// What simplifying a question with bitwright's own engine took ([`Config::simplify`]).
@@ -659,6 +697,10 @@ impl<'c> Blaster<'c> {
 struct Search {
     solver: Solver,
     cnf: Cnf,
+    /// The circuit, until the first search sweeps it ([`Config::sweeping`]).
+    sweep: Option<Box<sweep::Pending>>,
+    /// What the sweep cost, counted in the totals.
+    swept: sweep::Work,
 }
 
 /// A question, blasted and encoded once, then decided in as many steps as its caller likes: a
@@ -994,7 +1036,21 @@ impl Question {
         q.stats.lemmas = solver.lemmas;
         q.stats.fixed = solver.num_fixed();
         q.stats.propagations = solver.propagations;
-        q.search = Some(Box::new(Search { solver, cnf }));
+        let sweep = cfg.sweeping.then(|| {
+            Box::new(sweep::Pending {
+                words: b.symbols.iter().map(|(_, bits)| bits.clone()).collect(),
+                aig: core::mem::take(&mut b.g),
+                roots,
+                xor3: cfg.xor3_encoding,
+                certificate: cfg.certificate,
+            })
+        });
+        q.search = Some(Box::new(Search {
+            solver,
+            cnf,
+            sweep,
+            swept: sweep::Work::default(),
+        }));
         Ok(q)
     }
 
@@ -1011,32 +1067,58 @@ impl Question {
                 "a question neither decided nor open".into(),
             ));
         };
-        let before = (
-            s.solver.conflicts,
-            s.solver.decisions,
-            s.solver.propagations,
-            s.solver.lemmas,
-        );
-        let answer = s.solver.solve_within(limits);
-        self.stats.learned = s.solver.num_learnts();
-        self.stats.lemmas = s.solver.lemmas;
-        self.stats.fixed = s.solver.num_fixed();
-        self.stats.conflicts = s.solver.conflicts;
-        self.stats.decisions = s.solver.decisions;
-        self.stats.propagations = s.solver.propagations;
+        // The question's totals: its solver's and its sweep's.
+        let totals = |s: &Search| {
+            (
+                s.solver.conflicts + s.swept.conflicts,
+                s.solver.decisions + s.swept.decisions,
+                s.solver.propagations + s.swept.propagations,
+                s.solver.lemmas + s.swept.lemmas,
+            )
+        };
+        let before = totals(s);
         // A zero allowance pauses the question without searching.
-        if limits.conflicts != 0 && limits.propagations != 0 {
+        let searching = limits.conflicts != 0 && limits.propagations != 0;
+        let mut limits = limits;
+        if searching && let Some(p) = s.sweep.take() {
+            // At most half of this search's limits, the rest left to the search.
+            let share = Limits {
+                conflicts: limits.conflicts / 2,
+                propagations: limits.propagations / 2,
+            };
+            let w = sweep::sweep(&p, &s.cnf, &mut s.solver, share);
+            s.swept = w;
+            self.stats.sweeping = Sweeping {
+                ran: true,
+                merged: w.merged,
+                separated: w.separated,
+                undecided: w.undecided,
+                conflicts: w.conflicts,
+                propagations: w.propagations,
+            };
+            limits.conflicts -= w.conflicts.min(limits.conflicts - 1);
+            limits.propagations -= w.propagations.min(limits.propagations - 1);
+        }
+        let answer = s.solver.solve_within(limits);
+        let after = totals(s);
+        self.stats.learned = s.solver.num_learnts();
+        self.stats.lemmas = after.3;
+        self.stats.fixed = s.solver.num_fixed();
+        self.stats.conflicts = after.0;
+        self.stats.decisions = after.1;
+        self.stats.propagations = after.2;
+        if searching {
             self.stats.searches += 1;
-            self.stats.last_conflicts = s.solver.conflicts - before.0;
-            self.stats.last_decisions = s.solver.decisions - before.1;
-            self.stats.last_propagations = s.solver.propagations - before.2;
-            self.stats.last_lemmas = s.solver.lemmas - before.3;
+            self.stats.last_conflicts = after.0 - before.0;
+            self.stats.last_decisions = after.1 - before.1;
+            self.stats.last_propagations = after.2 - before.2;
+            self.stats.last_lemmas = after.3 - before.3;
         }
         let o = match answer {
             Answer::Unknown => {
                 return Ok(Outcome::Unknown(Unknown::Budget {
-                    conflicts: s.solver.conflicts,
-                    propagations: s.solver.propagations,
+                    conflicts: after.0,
+                    propagations: after.2,
                 }));
             }
             Answer::Unsat => {
