@@ -8,8 +8,10 @@
 //! rediscover each of those equivalences inside one large refutation. Proved separately and
 //! in order, from the inputs up, each is a small question once the ones below it are known:
 //! bit `i` of a sum reads only bits below it, so for arithmetic this order is low bits first.
-//! (A circuit with nothing inside in common, such as the shift-and-xor addition loop against
-//! `x + y`, whose carries no single node holds, gains little; the sweep then stops early.)
+//! A circuit with nothing inside in common, such as the shift-and-xor addition loop against
+//! `x + y`, whose carries no single node holds, gains little or loses: the simulation shows
+//! which kind a question is before any proof is tried ([`Shape::worth_proving`]), and the
+//! others are left to the search as they are.
 //!
 //! The circuit is simulated on bit-parallel assignments chosen per word of the question, not
 //! per bit: boundary values, random, sparse and dense values, runs of ones, and values
@@ -53,12 +55,14 @@ const SEPARATED_PER_MERGE: u64 = 4;
 /// The largest circuit swept (simulation keeps a word per node and word).
 const MAX_NODES: usize = 1 << 20;
 
-/// The circuit of a question, kept until its first search sweeps it.
+/// The circuit of a question, as its preparation hands it to the sweep.
 pub(super) struct Pending {
     pub(super) aig: Aig,
     pub(super) roots: Vec<L>,
     /// The bits of each word of the question (symbol), low bit first.
     pub(super) words: Vec<Vec<L>>,
+    /// The bits of the two sides, when the question is an equality.
+    pub(super) sides: Option<(Vec<L>, Vec<L>)>,
     pub(super) xor3: bool,
     pub(super) certificate: bool,
 }
@@ -66,6 +70,12 @@ pub(super) struct Pending {
 /// What a sweep did and cost.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Work {
+    /// Simulated, and its candidate pairs proved.
+    pub(super) ran: bool,
+    /// Simulated, and judged not worth proving ([`Shape::worth_proving`]).
+    pub(super) skipped: bool,
+    /// The classes the first simulation found joining the two sides.
+    pub(super) crossings: u64,
     pub(super) merged: u64,
     pub(super) separated: u64,
     pub(super) undecided: u64,
@@ -235,17 +245,10 @@ pub(super) fn sweep(p: &Pending, cnf: &Cnf, main: &mut Solver, limits: Limits) -
     if n > MAX_NODES || limits.conflicts == 0 || limits.propagations == 0 {
         return work;
     }
-    let mut s = Solver::new();
-    if p.certificate {
-        s.log_proof();
-    }
-    let scnf = Cnf::encode_with_xor3(&p.aig, &p.roots, &mut s, false, p.xor3);
-    if !scnf.same_variables(cnf) {
-        return work;
-    }
     // Candidates: the constant, then every node with a variable, in creation order (operands
-    // before their gates).
-    let lit = |node: usize| scnf.mapped_lit((node as u32) << 1);
+    // before their gates). The sweep's own encoding gives every node the variable the
+    // question's does (checked when it is made).
+    let lit = |node: usize| cnf.mapped_lit((node as u32) << 1);
     let cand: Vec<usize> = core::iter::once(0)
         .chain((1..n).filter(|&i| lit(i).is_some()))
         .collect();
@@ -270,6 +273,21 @@ pub(super) fn sweep(p: &Pending, cnf: &Cnf, main: &mut Solver, limits: Limits) -
             if pol[c] { !v } else { v }
         });
     }
+    let shape = shape(p, &cand, &sigs);
+    work.crossings = shape.cross as u64;
+    if !shape.worth_proving() {
+        work.skipped = true;
+        return work;
+    }
+    let mut s = Solver::new();
+    if p.certificate {
+        s.log_proof();
+    }
+    let scnf = Cnf::encode_with_xor3(&p.aig, &p.roots, &mut s, false, p.xor3);
+    if !scnf.same_variables(cnf) {
+        return work;
+    }
+    work.ran = true;
 
     let (c0, p0) = (s.conflicts, s.propagations);
     let (d0, l0) = (s.decisions, s.lemmas);
@@ -372,6 +390,88 @@ pub(super) fn sweep(p: &Pending, cnf: &Cnf, main: &mut Solver, limits: Limits) -
         main.import(s.take_proof().unwrap_or_default(), &eqs);
     }
     work
+}
+
+/// What the first simulation shows of the candidates, before any proof.
+#[derive(Debug, Default, Clone, Copy)]
+struct Shape {
+    /// Candidates in the cone of one side only (of all of them, without sides).
+    private: usize,
+    /// Classes other than the constants' holding candidates private to both sides (without
+    /// sides: holding two candidates or more).
+    cross: usize,
+    /// Candidates that look constant.
+    constant: usize,
+}
+
+/// The candidates private to a side per class joining the sides, at most, for a sweep to be
+/// worth its proofs.
+const PRIVATE_PER_CROSSING: usize = 10;
+
+/// The fewest classes joining the sides worth proving.
+const MIN_CROSSINGS: usize = 4;
+
+impl Shape {
+    /// Whether the merges the simulation promises are worth proving: at least
+    /// [`MIN_CROSSINGS`] classes joining the two sides, one per [`PRIVATE_PER_CROSSING`]
+    /// candidates private to a side or fewer. Measured on adders, bit counts, MBA rewritings
+    /// and products: the sweep paid wherever there was one class per 8 or fewer (prefix
+    /// adders 0.13, MBA rewritings of `x - y` 0.14, the SWAR count 0.27 to 0.42), and did not
+    /// at one per 10 or more (the shift-and-xor addition loop 0.06 at 16 bits, products 0.02 to
+    /// 0.03, where the proofs of hard pairs cost more than they save).
+    fn worth_proving(&self) -> bool {
+        self.cross >= MIN_CROSSINGS && self.cross * PRIVATE_PER_CROSSING >= self.private
+    }
+}
+
+/// The [`Shape`] of the candidates `cand` under the signatures `sigs`.
+fn shape(p: &Pending, cand: &[usize], sigs: &Sigs) -> Shape {
+    let n = p.aig.len();
+    // Bit 1: in the first side's cone; bit 2: in the second's.
+    let mut side = vec![0u8; n];
+    if let Some((a, b)) = &p.sides {
+        for (bit, roots) in [(1u8, a), (2u8, b)] {
+            let mut stack: Vec<usize> = roots.iter().map(|&l| (l >> 1) as usize).collect();
+            while let Some(i) = stack.pop() {
+                if side[i] & bit != 0 {
+                    continue;
+                }
+                side[i] |= bit;
+                if let Some((x, y)) = p.aig.gate(i) {
+                    stack.push((x >> 1) as usize);
+                    stack.push((y >> 1) as usize);
+                }
+            }
+        }
+    } else {
+        side.iter_mut().for_each(|s| *s = 3);
+    }
+    let private = |c: usize| matches!(side[cand[c]], 1 | 2);
+    let mut classes: HashMap<u64, Vec<usize>> = HashMap::new();
+    for c in 1..cand.len() {
+        classes.entry(sigs.key(c)).or_default().push(c);
+    }
+    let mut shape = Shape {
+        private: (1..cand.len())
+            .filter(|&c| if p.sides.is_some() { private(c) } else { true })
+            .count(),
+        ..Shape::default()
+    };
+    for members in classes.values() {
+        // Classes share keys only by collision; one key, one class is close enough to count.
+        if sigs.same(members[0], 0) {
+            shape.constant += members.len();
+            continue;
+        }
+        let crossing = if p.sides.is_some() {
+            members.iter().any(|&c| side[cand[c]] == 1)
+                && members.iter().any(|&c| side[cand[c]] == 2)
+        } else {
+            members.len() > 1
+        };
+        shape.cross += usize::from(crossing);
+    }
+    shape
 }
 
 /// Whether `clause` follows from the circuit's clauses in `s`: its negation is assumed, and

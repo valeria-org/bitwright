@@ -162,11 +162,19 @@ pub struct Config {
     /// each of them inside one refutation: swept, the 64-bit prefix adder against `x + y`
     /// takes 0.29 M propagations instead of 0.54 M, the 32-bit SWAR population count against
     /// `popcnt` 24 k instead of 148 k, and a 64-bit MBA rewriting of `x - y` 0.56 M instead of
-    /// 7.6 M. A circuit with nothing inside in common gains little (the sweep stops when its
-    /// candidates keep being told apart), and products not at all. The sweep takes at most
-    /// half of the first search's limits, its work counts in the question's totals, and with
-    /// a [`certificate`](Self::certificate) its lemmas are logged so the certificate still
-    /// checks. See [`Stats::sweeping`]. Off by default; the carries pass turns it on.
+    /// 7.6 M.
+    ///
+    /// The circuit is simulated first, and only swept when the simulation shows enough of
+    /// that sharing: classes of nodes that agree joining the two sides of an equality, at
+    /// least 4 and one per 10 nodes private to a side (a question that is no equality: classes
+    /// of two nodes or more, against all its nodes). Products, or the shift-and-xor addition
+    /// loop against `x + y`, show little and are not swept; the simulation is all they cost.
+    /// A sweep is part of preparing the question: it takes at most half of the configured
+    /// limits ([`max_conflicts`](Self::max_conflicts), [`max_propagations`](Self::max_propagations))
+    /// before any search, whatever the searches' own, so a question resumed in steps is swept
+    /// as one asked at once; its work counts in the question's totals as work done before the
+    /// first search; and with a [`certificate`](Self::certificate) its lemmas are logged so the
+    /// certificate still checks. See [`Stats::sweeping`]. On by default.
     pub sweeping: bool,
 }
 
@@ -189,7 +197,7 @@ impl Default for Config {
             carry_save_multiplication: false,
             word_sampling: false,
             exhaustive_inputs: 0,
-            sweeping: false,
+            sweeping: true,
         }
     }
 }
@@ -436,8 +444,14 @@ impl Stats {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sweeping {
-    /// Whether the circuit was swept.
+    /// Whether the circuit was swept: simulated, and its candidate pairs proved.
     pub ran: bool,
+    /// Whether the circuit was simulated and judged not worth sweeping: too few classes of
+    /// nodes that agree join the two sides of an equality (see [`Config::sweeping`]).
+    pub skipped: bool,
+    /// Classes of the first simulation that join the two sides of an equality (of a question
+    /// that is not one: classes of two nodes or more).
+    pub crossings: u64,
     /// Nodes proved equal to an earlier node, or its complement, or to a constant.
     pub merged: u64,
     /// Candidate pairs a counterexample told apart.
@@ -697,9 +711,7 @@ impl<'c> Blaster<'c> {
 struct Search {
     solver: Solver,
     cnf: Cnf,
-    /// The circuit, until the first search sweeps it ([`Config::sweeping`]).
-    sweep: Option<Box<sweep::Pending>>,
-    /// What the sweep cost, counted in the totals.
+    /// What the sweep cost ([`Config::sweeping`]), counted in the totals.
     swept: sweep::Work,
 }
 
@@ -1030,27 +1042,52 @@ impl Question {
                 }
             }
         }
-        q.stats.vars = solver.num_vars();
-        q.stats.clauses = cnf.emitted();
-        q.stats.learned = solver.num_learnts();
-        q.stats.lemmas = solver.lemmas;
-        q.stats.fixed = solver.num_fixed();
-        q.stats.propagations = solver.propagations;
-        let sweep = cfg.sweeping.then(|| {
-            Box::new(sweep::Pending {
+        // Swept once, as part of preparing the question: within half of the configured limits,
+        // whatever the searches' own, so a question resumed in steps is swept as one asked at
+        // once.
+        let mut swept = sweep::Work::default();
+        if cfg.sweeping {
+            // The two sides of an equality, whose inner nodes a sweep can merge across.
+            let sides = match b.cx.node(goal_node) {
+                n if n.op == OpCode::Eq => match (b.bits.get(&n.a), b.bits.get(&n.b)) {
+                    (Some(x), Some(y)) => Some((x.clone(), y.clone())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let pending = sweep::Pending {
+                sides,
                 words: b.symbols.iter().map(|(_, bits)| bits.clone()).collect(),
                 aig: core::mem::take(&mut b.g),
                 roots,
                 xor3: cfg.xor3_encoding,
                 certificate: cfg.certificate,
-            })
-        });
-        q.search = Some(Box::new(Search {
-            solver,
-            cnf,
-            sweep,
-            swept: sweep::Work::default(),
-        }));
+            };
+            let share = Limits {
+                conflicts: cfg.max_conflicts / 2,
+                propagations: cfg.max_propagations / 2,
+            };
+            swept = sweep::sweep(&pending, &cnf, &mut solver, share);
+            q.stats.sweeping = Sweeping {
+                ran: swept.ran,
+                skipped: swept.skipped,
+                crossings: swept.crossings,
+                merged: swept.merged,
+                separated: swept.separated,
+                undecided: swept.undecided,
+                conflicts: swept.conflicts,
+                propagations: swept.propagations,
+            };
+        }
+        q.stats.vars = solver.num_vars();
+        q.stats.clauses = cnf.emitted();
+        q.stats.learned = solver.num_learnts();
+        q.stats.lemmas = solver.lemmas + swept.lemmas;
+        q.stats.fixed = solver.num_fixed();
+        q.stats.conflicts = swept.conflicts;
+        q.stats.decisions = swept.decisions;
+        q.stats.propagations = solver.propagations + swept.propagations;
+        q.search = Some(Box::new(Search { solver, cnf, swept }));
         Ok(q)
     }
 
@@ -1079,26 +1116,6 @@ impl Question {
         let before = totals(s);
         // A zero allowance pauses the question without searching.
         let searching = limits.conflicts != 0 && limits.propagations != 0;
-        let mut limits = limits;
-        if searching && let Some(p) = s.sweep.take() {
-            // At most half of this search's limits, the rest left to the search.
-            let share = Limits {
-                conflicts: limits.conflicts / 2,
-                propagations: limits.propagations / 2,
-            };
-            let w = sweep::sweep(&p, &s.cnf, &mut s.solver, share);
-            s.swept = w;
-            self.stats.sweeping = Sweeping {
-                ran: true,
-                merged: w.merged,
-                separated: w.separated,
-                undecided: w.undecided,
-                conflicts: w.conflicts,
-                propagations: w.propagations,
-            };
-            limits.conflicts -= w.conflicts.min(limits.conflicts - 1);
-            limits.propagations -= w.propagations.min(limits.propagations - 1);
-        }
         let answer = s.solver.solve_within(limits);
         let after = totals(s);
         self.stats.learned = s.solver.num_learnts();

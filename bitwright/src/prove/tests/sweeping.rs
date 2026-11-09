@@ -130,15 +130,15 @@ fn ask(w: u16, a: &str, b: &str, sweeping: bool) -> (Outcome, Stats) {
     (out, q.stats())
 }
 
-/// Adders and subtractors as prefix trees and ripple chains: proved with certificates that
-/// check, with internal nodes merged, and the wide ones in less work than the search alone.
+/// Adders and subtractors as prefix trees: proved with certificates that check, with internal
+/// nodes merged, and the wide ones in less work than the search alone.
 #[test]
 fn adders_are_proved_with_merges_and_certificates() {
     for (w, src, sum) in [
-        (32u16, prefix(32, false, None), "x + y"),
+        (16u16, prefix(16, false, None), "x + y"),
+        (32, prefix(32, false, None), "x + y"),
         (64, prefix(64, false, None), "x + y"),
         (64, prefix(64, true, None), "x - y"),
-        (16, ripple(16), "x + y"),
     ] {
         let (plain, plain_stats) = ask(w, &src, sum, false);
         let (swept, stats) = ask(w, &src, sum, true);
@@ -158,6 +158,23 @@ fn adders_are_proved_with_merges_and_certificates() {
                 plain_stats.propagations
             );
         }
+    }
+}
+
+/// The shift-and-xor addition loop has no single node for its carries: the simulation shows
+/// too little shared with `x + y`, and the question is searched as it would be unswept, in the
+/// same work.
+#[test]
+fn circuits_with_little_in_common_are_not_swept() {
+    for (w, a, b) in [
+        (16u16, ripple(16), "x + y".to_string()),
+        (24, ripple(24), "x + y".to_string()),
+    ] {
+        let (out, stats) = ask(w, &a, &b, true);
+        let (plain, plain_stats) = ask(w, &a, &b, false);
+        assert!(matches!(out, Outcome::Proved(_)) && matches!(plain, Outcome::Proved(_)));
+        assert!(stats.sweeping.skipped && !stats.sweeping.ran, "{stats:?}");
+        assert_eq!(stats.propagations, plain_stats.propagations);
     }
 }
 
@@ -231,35 +248,43 @@ fn sweeping_agrees_with_search() {
     );
 }
 
-/// The sweep takes at most half of the first search's limits, and its work counts in the
-/// question's totals; a question resumed in steps ends with the answer, swept once.
+/// The sweep is part of preparing the question: within half of the configured limits, before
+/// any search, counted in the totals; a question resumed in steps is swept as one asked at once
+/// and ends with the same answer and totals.
 #[test]
 fn sweeping_stays_within_its_share() {
-    let mut cx = Context::new();
-    let o = ParseOptions::width(Width::W64);
-    let (a, b) = (
-        cx.parse(&prefix(64, false, None), &o).unwrap(),
-        cx.parse("x + y", &o).unwrap(),
-    );
-    let cfg = Config::default()
-        .with_simplify(false)
-        .with_samples(0)
-        .with_sweeping(true);
-    let mut q = Question::equal(&mut cx, a, b, &cfg).unwrap();
-    let step = Limits {
-        conflicts: u64::MAX,
-        propagations: 20_000,
+    let ask = |steps: bool| {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let (a, b) = (
+            cx.parse(&prefix(64, false, None), &o).unwrap(),
+            cx.parse("x + y", &o).unwrap(),
+        );
+        let cfg = Config::default()
+            .with_simplify(false)
+            .with_samples(0)
+            .with_max_propagations(200_000);
+        let mut q = Question::equal(&mut cx, a, b, &cfg).unwrap();
+        let prepared = q.stats();
+        assert!(prepared.sweeping.ran);
+        assert!(prepared.sweeping.propagations <= 100_000 + 1_000);
+        assert!(prepared.propagations >= prepared.sweeping.propagations);
+        let step = if steps {
+            Limits {
+                conflicts: 50,
+                propagations: u64::MAX,
+            }
+        } else {
+            Limits::conflicts(u64::MAX)
+        };
+        let mut out = q.solve(&mut cx, step).unwrap();
+        while let Outcome::Unknown(why) = &out {
+            assert!(why.is_budget());
+            out = q.solve(&mut cx, step).unwrap();
+        }
+        assert!(matches!(out, Outcome::Proved(_)));
+        assert_eq!(q.stats().sweeping, prepared.sweeping);
+        q.stats().totals()
     };
-    let mut out = q.solve(&mut cx, step).unwrap();
-    let first = q.stats();
-    assert!(first.sweeping.ran);
-    // A propagation call finishes the watch list it is on before it stops.
-    assert!(first.sweeping.propagations <= step.propagations / 2 + 1_000);
-    assert!(first.propagations >= first.sweeping.propagations);
-    while let Outcome::Unknown(why) = &out {
-        assert!(why.is_budget());
-        out = q.solve(&mut cx, step).unwrap();
-    }
-    assert!(matches!(out, Outcome::Proved(_)));
-    assert_eq!(q.stats().sweeping, first.sweeping);
+    assert_eq!(ask(true), ask(false));
 }

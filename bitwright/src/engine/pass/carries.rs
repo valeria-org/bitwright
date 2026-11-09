@@ -551,8 +551,7 @@ fn proved(
         .with_samples(0)
         .with_max_nodes(MAX_AIG_NODES)
         .with_max_conflicts(u64::MAX)
-        .with_max_propagations(propagations)
-        .with_sweeping(true);
+        .with_max_propagations(propagations);
     let (lhs, rhs) = (scx.handle(lhs), scx.handle(rhs));
     let mut q = prove::Question::equal(&mut scx, lhs, rhs, &cfg).map_err(Stop::Error)?;
     let out = q.solve(&mut scx, cfg.limits()).map_err(Stop::Error)?;
