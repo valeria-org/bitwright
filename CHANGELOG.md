@@ -93,10 +93,49 @@ Defects in the driver and the normal forms, found reading the engine:
   mask `−2^m` as the quotient shifted left: `umulhi(x, 0xcccccccd) & -32` is `udiv(x, 40) << 5`,
   and the compiler's `x % 10`, `x - ((q << 3) + (q << 1))` with
   `q = umulhi(x, 0xcccccccd) >>u 3`, is `urem(x, 10)`.
-- **Products in one order.** The linear pass writes a product of three or more values with its
-  factors in the context's order, multiplied left to right (up to 256 factors), so a product
-  is one node however it was parenthesized and ordered: `a*b*c - c*b*a` is 0 wherever the pass
-  runs, at 40 factors as at 3. It was 0 only through the MBA service, up to 8 atoms.
+- **Chains in one order.** A product of three or more values, and a chain of `&` or of `|`, is
+  written with its operands in the context's order, joined left to right (up to 256 operands),
+  so it is one node however it was parenthesized and ordered: `a*b*c - c*b*a` is 0 wherever the
+  linear pass runs, and `(v0 & … & v6) ^ (v6 & … & v0)` wherever the bitwise pass does, at 40
+  operands as at 3. The product was 0 only through the MBA service, up to 8 atoms; the `&` and
+  `|` chains only up to the six atoms a truth table reads. In a chain of `&` or `|` an operand
+  counts once, and beside its complement it decides the chain. A chain found in order is
+  remembered for the call, so are its parts, and so is one over 256 operands (every chain over
+  it is, too): two 256-factor products in opposite orders take 0.30 M units of pass work.
+- **Sums and xors over 64 terms.** A form of more than 64 terms is an atom of the forms over
+  it, which keeps every node's form small, and so nothing cancelled through it:
+  `(v0 + … + v69) - v0` was left as written, and so was the same sum minus itself in another
+  order. Such a sum now keeps its whole form (its terms, with the long sums among its atoms
+  taken apart in turn, up to 1024 terms), and a sum over it is read through it where a term of
+  one operand is inside a long sum of the other: 74 terms less one are the other 73, 70 less
+  the same 70 reversed are 0, and 200 less 100 of them are the other 100. The xor pass does the
+  same for xors. A sum in which nothing meets is not taken apart (a search of the whole form
+  for each term added), so a long sum of distinct terms costs what it did: 5000 terms take
+  0.3 % more pass work. A sum of more than 1024 terms is an atom and no more, as before, and
+  one with another use is not written out a second time.
+
+The driver's accounting, from the same reading:
+
+- **A quarantined pass stops.** A pass whose rewrite fails a width, verification or tripwire
+  check is quarantined for the call, as a rule is. That was recorded, and only the MBA phase and
+  the invert pass looked: the others went on rewriting. Every pass now stops, on every node and
+  root of the call, and what it would have decided is not final.
+- **Salvaging is charged.** A root a budget stops keeps the work of its stopped phase: the
+  nodes above what the phase finished are rebuilt over it, by a walk of the root that nothing
+  was charged for, once for every root after the stop. Reading a node the stopped phase had not
+  reached is now a node visit (the ones it had reached are charged already), and a node the
+  budget does not cover stays as it is. 48 roots over one shared sum of 1607 nodes, each
+  stopped at its first rewrite, were 2749 node visits and are 79 501; with 8 roots' worth of
+  visits, the roots after those are not read.
+- **The other roots are counted once.** The commit rule's use counts of the other roots of a
+  call are counted once per root and kept; every later phase run charged the count again as
+  pass work, for a walk it did not make. A small root beside one of 2399 nodes took 55 980
+  units and takes 48 767.
+- **`Stats::rounds_capped` and `Stats::reruns_capped`.** A run that ended at
+  `Strategy::max_rounds` with its last round still changing the root looked like one that had
+  settled, and so did a call that stopped running roots again for what they share (three
+  times) while they were still changing. Both are counted, in `Stats` and in a trace's `stats`
+  line: the result is as valid as any, and simplifying it again may go further.
 
 ## 0.26.0
 

@@ -66,6 +66,14 @@ pub struct Stats {
     pub salvaged: u64,
     /// Roots a passed deadline left unstarted.
     pub not_started: u64,
+    /// Runs of the strategy on a root that ended at [`Strategy::max_rounds`](super::Strategy)
+    /// with the last round still changing the root: one more might have changed it again, so
+    /// running the result again may go further (a root that settles earlier is not counted).
+    pub rounds_capped: u64,
+    /// Calls in which the roots whose results depend on what other roots share
+    /// ([`Sharing::Roots`](super::Sharing)) were still changing when they had been run again
+    /// as often as a call does (three times).
+    pub reruns_capped: u64,
 }
 
 impl Stats {
@@ -98,6 +106,8 @@ impl Stats {
             declined,
             salvaged,
             not_started,
+            rounds_capped,
+            reruns_capped,
         } = o;
         self.node_visits += node_visits;
         self.memo_hits += memo_hits;
@@ -128,6 +138,8 @@ impl Stats {
         self.declined += declined;
         self.salvaged += salvaged;
         self.not_started += not_started;
+        self.rounds_capped += rounds_capped;
+        self.reruns_capped += reruns_capped;
     }
 }
 

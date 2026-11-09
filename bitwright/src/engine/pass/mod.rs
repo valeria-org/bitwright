@@ -236,13 +236,17 @@ impl PassKind {
     }
 }
 
-/// Runs `kind` at `n`.
+/// Runs `kind` at `n`, unless a rewrite of its failed a postcondition earlier in the call: the
+/// pass is quarantined then, and the node's result not final.
 pub(super) fn step(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     kind: PassKind,
     n: u32,
 ) -> Result<Step, Stop> {
+    if r.quarantined_passes.contains(&kind) {
+        return Ok(Step::Normal(Fin::PROVISIONAL));
+    }
     r.stats.passes.entry(kind.name()).or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
     match kind {
@@ -569,16 +573,13 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// The roots other than the active one do not change while it is processed: their part is
 /// counted once per root ([`Live`]) and stands in every phase run in which none of the nodes
 /// they reach was retired (a count from scratch skips retired nodes, and what only they reach).
+/// Each count is a unit of pass work per node counted; a part that stands costs nothing.
 pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     if !r.uses_on {
         r.live.clear();
         r.scratch.seen.begin(cx.len());
-        let others = others_hold(r, cx);
+        let others = others_hold(r, cx)?;
         let mut stack: Vec<u32> = if others {
-            if let Err(e) = charge_each(&mut r.meter, r.live.others.nodes as u64) {
-                r.live.clear();
-                return Err(e.into());
-            }
             // (Off when the other roots reach nothing: then it adds nothing.)
             r.live.base = r.live.others.nodes > 0;
             r.live_roots.get(r.active).copied().into_iter().collect()
@@ -627,17 +628,6 @@ pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), S
         }
     }
     r.uses_upto = len;
-    Ok(())
-}
-
-/// Charges `n` units of pass work as `n` charges of one would: on failure, what was left is
-/// spent.
-fn charge_each(meter: &mut crate::engine::budget::Meter, n: u64) -> Result<(), Exhausted> {
-    if meter.charge(Counter::PassWork, n).is_err() {
-        for _ in 0..n {
-            meter.charge(Counter::PassWork, 1)?;
-        }
-    }
     Ok(())
 }
 
@@ -771,12 +761,14 @@ impl Live {
     }
 }
 
-/// Whether the other roots' part holds in this phase run, counting it first if it is for
-/// another root: no node the other roots reach was retired in the run.
-fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
+/// Whether the other roots' part holds in this phase run, counting it first (a unit of pass
+/// work per node) if it is for another root: no node the other roots reach was retired in the
+/// run.
+fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> Result<bool, Exhausted> {
     let o = &mut r.live.others;
     if o.active != Some(r.active) {
-        o.active = Some(r.active);
+        // (For no root until it is counted whole: a budget may stop the count.)
+        o.active = None;
         // (Sized as they grow: often the other roots reach nothing.)
         o.reach.clear();
         o.uses.begin(0);
@@ -792,14 +784,16 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
             if !o.reach.insert(i) {
                 continue;
             }
+            r.meter.charge(Counter::PassWork, 1)?;
             o.nodes += 1;
             for c in cx.node(i).children() {
                 o.uses.add(c);
                 stack.push(c);
             }
         }
+        o.active = Some(r.active);
     }
-    !r.dead_log.iter().any(|&d| o.reach.contains(d))
+    Ok(!r.dead_log.iter().any(|&d| o.reach.contains(d)))
 }
 
 /// The region of `n`: the nodes reachable from it without entering `atoms`, at most
@@ -1164,4 +1158,102 @@ pub(super) fn discard(r: &mut Runner<'_, '_>, cx: &Context, before: u32) {
     for i in before..cx.len() as u32 {
         r.retire(cx, i);
     }
+}
+
+/// The most operands of a chain put in order.
+pub(crate) const MAX_CHAIN: usize = 256;
+
+/// What [`sort_chain`] found a chain's node to be.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Chain {
+    /// As `sort_chain` writes its chain.
+    Sorted,
+    /// Of more than [`MAX_CHAIN`] operands.
+    Long,
+}
+
+/// The chain `n` of `·`, `&` or `|` over values (no constant among them) with its operands in
+/// the context's canonical order, joined left to right: one node for a chain however it was
+/// parenthesized and ordered, so `a·b·c − c·b·a` and `(a & b & … & g) ^ (g & … & b & a)`
+/// cancel. An operand of `&` or `|` is kept once, and one beside its complement decides the
+/// chain (0, or all-ones). The result is no larger than `n` unless a part of the chain has
+/// another use, and nothing rewrites it back, so it replaces `n` at the same size too.
+///
+/// `Step::Normal` when `n` is in order already, is not a chain of three operands or more, or
+/// has more than [`MAX_CHAIN`]. Both are remembered (`Runner::chains`): the chains a sorted
+/// one is made of are not read again, and a chain over a long one is long.
+pub(super) fn sort_chain(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+) -> Result<Step, Stop> {
+    let op = cx.node(n).op;
+    let bin = match op {
+        OpCode::Mul => crate::ops::BinOp::Mul,
+        OpCode::And => crate::ops::BinOp::And,
+        OpCode::Or => crate::ops::BinOp::Or,
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    if r.chains.contains_key(&n) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut operands = Vec::new();
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        let node = cx.node(i);
+        let inner = node.op == op && !cx.is_const(node.a) && !cx.is_const(node.b);
+        if inner && r.chains.get(&i) != Some(&Chain::Long) {
+            stack.push(node.b);
+            stack.push(node.a);
+        } else if inner || operands.len() == MAX_CHAIN {
+            r.chains.insert(n, Chain::Long);
+            r.meter.charge(Counter::PassWork, operands.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        } else {
+            operands.push(i);
+        }
+    }
+    if operands.len() < 3 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    r.meter.charge(Counter::PassWork, operands.len() as u64)?;
+    operands.sort_by(|&a, &b| cx.order(a, b));
+    // (Equal in the order is the same node.)
+    let mut atoms = operands.clone();
+    atoms.dedup();
+    let before = cx.len() as u32;
+    let w = cx.width_of(n);
+    let decided = op != OpCode::Mul && {
+        let mut ids = atoms.clone();
+        ids.sort_unstable();
+        atoms.iter().any(|&a| {
+            let node = cx.node(a);
+            node.op == OpCode::Not && ids.binary_search(&node.a).is_ok()
+        })
+    };
+    let mut links = Vec::new();
+    let e = r.build(cx, |cx| {
+        if decided {
+            return cx.mk_const(&match op {
+                OpCode::And => crate::BitVec::zero(w),
+                _ => crate::BitVec::ones(w),
+            });
+        }
+        // A product keeps a repeated factor; `&` and `|` do not.
+        let chain = if op == OpCode::Mul { &operands } else { &atoms };
+        let mut e = chain[0];
+        for &f in &chain[1..] {
+            e = cx.c_bin(bin, e, f)?;
+            links.push(e);
+        }
+        Ok(e)
+    })?;
+    for l in links {
+        r.chains.insert(l, Chain::Sorted);
+    }
+    if e == n {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    finish_with(r, cx, kind, n, e, before, &atoms, Fin::FINAL, true)
 }

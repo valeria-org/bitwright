@@ -80,9 +80,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let Some(op) = node.op.as_cmp() else {
         return Ok(Step::Normal(Fin::FINAL));
     };
-    if r.quarantined_passes.contains(&PassKind::Invert) {
-        return Ok(Step::Normal(Fin::PROVISIONAL));
-    }
     let before = cx.len() as u32;
     let mut o = Calls { r, fin: Fin::FINAL };
     let e = if op.is_commutative() {

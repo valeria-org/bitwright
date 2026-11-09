@@ -4,9 +4,9 @@
 //!
 //! The region below a node is its `& | ^ ~` and constant left shifts down to atoms (constants
 //! are leaves); it is read when a bitwise operator in it reads a shift (what carries are), or
-//! when it is only shifts of one atom, `a << k = 2^k·a` exactly (`a << 1` is written `a + a`,
-//! which needs no constant). Otherwise, read as a function `f` of its atoms, the only affine
-//! form it can be is `c = f(0, …, 0)`, `aᵢ = f(eᵢ) − c` (atom `i` 1, the others 0). The form
+//! when it is only shifts of one atom, `a << k = 2^k·a` exactly (one shift is its own form).
+//! Otherwise, read as a function `f` of its atoms, the only affine form it can be is
+//! `c = f(0, …, 0)`, `aᵢ = f(eᵢ) − c` (atom `i` 1, the others 0). The form
 //! is compared with `f` at a fixed set of points (boundary values, points near the region's
 //! constants, where a sum with one carries far, and seeded pseudo-random ones; a quarter of
 //! them first), which rejects almost every region that is not affine, a truncated or miswired
@@ -163,8 +163,8 @@ fn sliced(cx: &Context, i: u32) -> bool {
 
 /// The region below `n` into `s.order`, `s.atoms` and `s.consts`: whether it is within the
 /// caps, holds no node left undecided, and either a bitwise operator reads a shift or it is
-/// only shifts of an atom (`a << 1` is written `a + a`, which needs no constant), and which of
-/// the two (only shifts: a chain); with the nodes reached. Otherwise it is a bitwise function
+/// only shifts of an atom, and which of the two (only shifts: a chain); with the nodes
+/// reached. Otherwise it is a bitwise function
 /// (which the bitwise pass decides) or one shifted, `g << k`, affine only when `g` is an atom's
 /// complement or a constant (forms the other passes give) or when only its lowest bit is kept
 /// (`k = W − 1`, where the form is no smaller than a minimal `g << k`).
@@ -734,8 +734,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             let c = cx.const_val(cx.node(i).b);
             k.saturating_add(c.map_or(u64::from(bits), |v| v.limbs()[0]))
         });
-        // One shift by 2 or more is its own form (`a << k`); `a << 1` is written `a + a`.
-        if r.carries.order.len() == 1 && (2..u64::from(bits)).contains(&k) {
+        // One shift is its own form (`a << k`).
+        if r.carries.order.len() == 1 && (1..u64::from(bits)).contains(&k) {
             return Ok(Step::Normal(Fin::FINAL));
         }
         let coeff = if k < u64::from(bits) { 1u64 << k } else { 0 };

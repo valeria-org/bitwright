@@ -1261,6 +1261,8 @@ struct Runner<'r, 'a> {
     samples: IdMap<u32, Box<[BitVec]>>,
     /// The linear pass's forms, per node.
     linear: pass::forms::FormCache<pass::linear::Form>,
+    /// The linear pass's sums over its cap on terms, whole (see `pass::forms::Whole`).
+    linear_whole: pass::forms::Whole<pass::linear::Form>,
     /// The bitwise pass's truth tables, per node.
     bitwise: IdMap<u32, pass::bitwise::Info>,
     /// The bitwise pass's tables over up to six atoms, per node (read where three hide some).
@@ -1270,6 +1272,8 @@ struct Runner<'r, 'a> {
     bitwise_beyond: IdMap<u32, ()>,
     /// The xor pass's forms, per node.
     xor: pass::forms::FormCache<pass::xor::Form>,
+    /// The xor pass's xors over its cap on terms, whole.
+    xor_whole: pass::forms::Whole<pass::xor::Form>,
     /// The compares pass's descriptions, per node.
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
@@ -1279,6 +1283,9 @@ struct Runner<'r, 'a> {
     gf2_stack: Vec<(u32, bool)>,
     /// Residue tables, per node and number of low bits (see `pass::residue`).
     residues: IdMap<(u32, u32), Option<std::rc::Rc<pass::residue::Residues>>>,
+    /// The chains of `·`, `&` or `|` found in order, or of more operands than are put in
+    /// order (see `pass::sort_chain`).
+    chains: IdMap<u32, pass::Chain>,
     /// Passes quarantined for the call after a postcondition failure.
     quarantined_passes: Vec<pass::PassKind>,
     /// The passes' commit rule's scratch.
@@ -1491,15 +1498,23 @@ impl Runner<'_, '_> {
     /// `root` with what an interrupted walk of `phase` did kept: a node the walk finished is
     /// its result, a node it rewrote but did not finish (a `Finish` on the stack) is what the
     /// rewrite has become so far, and the nodes above are rebuilt over them. No rule or pass
-    /// runs; the walk visits each node below `root` once without charging it, and builds nodes
-    /// only within the budget's new nodes (a node it cannot rebuild stays as it was, operands
-    /// included). `None` when nothing changes.
+    /// runs. The nodes the walk had reached (the ones on its stack) are read for nothing: their
+    /// visits are charged already. Each node below them is a node visit, as in the walk, and
+    /// one the budget does not cover stays as it was, operands included: so does a node the
+    /// budget's new nodes cannot rebuild. `None` when nothing changes.
     fn salvage(&mut self, cx: &mut Context, phase: usize, root: u32) -> Option<(u32, Fin)> {
         self.stats.salvaged += 1;
         let mut rewrote: IdMap<u32, (u32, Fin)> = IdMap::default();
+        let mut reached: IdMap<u32, ()> = IdMap::default();
         for f in &self.stack {
-            if let Frame::Finish(n, t, own) = *f {
-                rewrote.entry(n).or_insert((t, own));
+            match *f {
+                Frame::Visit(n) => {
+                    reached.insert(n, ());
+                }
+                Frame::Finish(n, t, own) => {
+                    rewrote.entry(n).or_insert((t, own));
+                    reached.insert(t, ());
+                }
             }
         }
         // Each node's salvaged value, and the nodes whose value is being worked out (a node
@@ -1530,6 +1545,11 @@ impl Runner<'_, '_> {
             }
             let node = cx.node(n);
             if !expanded && open.insert(n, ()).is_none() {
+                if !reached.contains_key(&n) && self.meter.visit().is_err() {
+                    open.remove(&n);
+                    done.insert(n, (n, Fin::FINAL));
+                    continue;
+                }
                 work.push((n, true));
                 for c in node.children() {
                     if !done.contains_key(&c) && !open.contains_key(&c) {
@@ -2350,11 +2370,14 @@ impl Engine {
             bitwise_wide: IdMap::default(),
             bitwise_beyond: IdMap::default(),
             xor: Default::default(),
+            linear_whole: Default::default(),
+            xor_whole: Default::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),
             residues: IdMap::default(),
             gf2_atoms: Vec::new(),
             gf2_stack: Vec::new(),
+            chains: IdMap::default(),
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
@@ -2474,8 +2497,10 @@ impl Engine {
         // only other roots' parts used, simplified away since): those roots again, while that
         // changes something.
         if runner.live_roots.len() > 1 {
+            let mut settled = false;
             for _ in 0..3 {
                 if failure.is_some() || provisional.is_empty() {
+                    settled = true;
                     break;
                 }
                 runner.live.forget_others();
@@ -2534,8 +2559,13 @@ impl Engine {
                     }
                 }
                 if !changed {
+                    settled = true;
                     break;
                 }
+            }
+            // The cap, with a root rewritten since another's result was reached.
+            if !settled && failure.is_none() && provisional.iter().any(|p| p.2 != version) {
+                runner.stats.reruns_capped += 1;
             }
         }
         let spent = runner.meter.spent;
@@ -2694,7 +2724,7 @@ impl Runner<'_, '_> {
     }
 
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
-    /// nothing.
+    /// nothing or the strategy allows no more (`Stats::rounds_capped` counts those).
     fn rounds(
         &mut self,
         cx: &mut Context,
@@ -2751,9 +2781,10 @@ impl Runner<'_, '_> {
                 }
             }
             if cur == start {
-                break;
+                return Ok((cur, fin));
             }
         }
+        self.stats.rounds_capped += 1;
         Ok((cur, fin))
     }
 }

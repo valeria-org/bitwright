@@ -127,7 +127,8 @@ A deadline also means *stop now*: the root it stops is returned as the phases be
 (its stopped phase is not salvaged, which would walk that root's whole DAG again), and the roots
 after it are not started — `Stats::salvaged` and `Stats::not_started` say so. A budget stop is
 the other way around: every root keeps its own work, so a call with many roots salvages each of
-them.
+them. Salvaging is charged like the rest: reading a node the stopped phase had not reached is
+a node visit, and once those have run out, a root is kept no deeper than its phases got.
 
 Admission caps (`Admission`) decline roots that are too large before any work is done.
 
@@ -137,7 +138,9 @@ Admission caps (`Admission`) decline roots that are too large before any work is
 run ended (`Completed`, `BudgetTerminated`, `Declined`). `Outcome::stats` counts everything:
 visits, memo hits, candidates, no-match and guard-false declines, rewrites, rejections, each
 pass's calls and commits, and the MBA service's answers. Unproductive work is counted like
-productive work.
+productive work. `Stats::rounds_capped` counts the runs that ended at `Strategy::max_rounds`
+with the last round still changing the root: such a result is correct, and simplifying it
+again may go further.
 
 Results are memoized in the context: simplifying the same node again (or a larger expression
 containing it) is answered from the memo, as long as the engine, the host hooks and the
@@ -148,7 +151,8 @@ assumptions are the same.
 `Engine::run` takes several roots and processes them one after another, in one context: work
 on shared subexpressions is done once, and a rewrite is weighed against every root that uses
 a node. A rewrite held back only because another root shared its subterms is reconsidered once
-every root is done, when those roots may no longer use them. For many independent expressions (every instruction of a function, a dataset of
+every root is done, when those roots may no longer use them (up to three times; a call that
+stops there with roots still changing counts in `Stats::reruns_capped`). For many independent expressions (every instruction of a function, a dataset of
 obfuscated expressions), `Engine::run_each` simplifies each root on its own, as a call with
 that root alone would, on threads. Each root is copied into a context of its own
 (`Context::import`, which also moves expressions between contexts in general), simplified
