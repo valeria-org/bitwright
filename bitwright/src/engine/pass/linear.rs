@@ -2,13 +2,25 @@
 //!
 //! A node's *form* is computed from its operands' forms: `+`, `−`, negation, `~a = −a − 1`,
 //! multiplication by a constant, shifts left by a constant (scaling), `|`/`^` of operands the
-//! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1,
-//! except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads the first as
-//! `−zext(c)`.
-//! A form with more than [`MAX_TERMS`] terms is atomized. The form is re-emitted canonically
-//! (terms in the context's canonical order, positive coefficients first, power-of-two
-//! coefficients as shifts, the constant last), and the emission replaces the node only when
-//! the region above the atoms gets strictly smaller.
+//! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1.
+//! Terms that read one value two ways are moved to one reading where the sum has both, so
+//! they cancel ([`merge`]): `sext(c)` beside `zext(c)` of a 1-bit `c` is `−zext(c)`, an
+//! extension of `~t` beside that of `t` is a constant less it, and `2^j·(x >>u j)` beside the
+//! low field `x & (2^j − 1)` is `x` less that field.
+//!
+//! A form with more than [`MAX_TERMS`] terms is atomized: its node is an atom of the forms
+//! over it, which keeps every form small. Such a sum keeps its *whole* form
+//! ([`Whole`](super::forms::Whole), up to 1024 terms), and a sum in which a term meets one
+//! inside it is taken apart ([`sum_of`]), so terms cancel through sums of that length:
+//! `(v0 + … + v99) − v0` is the other 99 terms.
+//!
+//! The form is re-emitted canonically (terms in the context's canonical order, positive
+//! coefficients first, power-of-two coefficients as shifts, the constant last), and the
+//! emission replaces the node only when the region above the atoms gets strictly smaller.
+//!
+//! Around the forms: a sum of products with a common factor is factored ([`factor_sum`]), and
+//! a product of three or more values is written with its factors in the context's order
+//! ([`sort_chain`](super::sort_chain)), so two writings of one product are one atom.
 
 use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
 use crate::BitVec;
@@ -35,6 +47,16 @@ impl super::forms::Parts for Form {
 
     fn from_parts(konst: BitVec, terms: Vec<(u32, BitVec)>, fin: Fin) -> Form {
         Form { konst, terms, fin }
+    }
+}
+
+impl super::forms::Sum for Form {
+    fn join(a: &BitVec, b: &BitVec) -> BitVec {
+        BitVec::bin_unchecked(BinOp::Add, a, b)
+    }
+
+    fn scale(outer: &BitVec, inner: &BitVec) -> BitVec {
+        BitVec::bin_unchecked(BinOp::Mul, outer, inner)
     }
 }
 
@@ -169,14 +191,10 @@ fn count(plan: &Plan) -> u32 {
     let w = konst.width();
     let one = BitVec::one(w);
     let t = terms.len() as u32;
-    let two = BitVec::wrapping_from_u64(w, 2);
-    let doubled = |k: &BitVec| *k == two || BitVec::un_unchecked(UnOp::Neg, k) == two;
     let scaled = terms
         .iter()
-        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one && !doubled(k))
+        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one)
         .count() as u32;
-    // `a + a` is one node.
-    let doubles = terms.iter().filter(|(_, k, _)| doubled(k)).count() as u32;
     let nots = terms.iter().filter(|(_, _, not)| *not).count() as u32;
     let minus_one = BitVec::ones(w);
     // With no positive term and no constant, a negation only when every coefficient is −1.
@@ -186,7 +204,7 @@ fn count(plan: &Plan) -> u32 {
         (_, true) => u32::from(negation),
         _ => 2,
     };
-    2 * scaled + doubles + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
+    2 * scaled + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
 }
 
 /// What [`emit`] writes for `form`, terms in the given order: the cheapest of trading the
@@ -195,7 +213,7 @@ fn count(plan: &Plan) -> u32 {
 /// `~x`) or a power of two from 2 (`2·y + 2` is `~y·−2`, where the shift's amount would be a
 /// second constant); a constant 1 goes into a term of coefficient 1 beside another term
 /// (`a + t + 1` is `a − ~t`) or splits one of coefficient 2 (`2·t + 1` is `t − ~t`); and a
-/// constant −1 complements the negated rest (`−1 − 2·x` is `~(x + x)`).
+/// constant −1 complements the negated rest (`−1 − 2·x` is `~(x << 1)`).
 fn plan(form: &Form, order: &[(u32, BitVec)]) -> Plan {
     let w = form.konst.width();
     let neg = |k: &BitVec| BitVec::un_unchecked(UnOp::Neg, k);
@@ -305,40 +323,42 @@ pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Re
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        let f = compute(r, cx, i)?;
-        let f = if f.terms.len() > MAX_TERMS {
-            r.stats.passes.entry("linear").or_default().atomized += 1;
-            Form {
-                fin: f.fin,
-                ..Form::atom(i, cx.width_of(i))
-            }
-        } else {
-            f
+        let (f, met) = compute(r, cx, i)?;
+        if f.terms.len() <= MAX_TERMS {
+            r.linear.insert(i, f);
+            continue;
+        }
+        // Over the cap: an atom, which keeps its whole form for the sums over it.
+        r.stats.passes.entry("linear").or_default().atomized += 1;
+        let atom = Form {
+            fin: f.fin,
+            ..Form::atom(i, cx.width_of(i))
         };
-        r.linear.insert(i, f);
+        r.linear.insert(i, atom);
+        let mut read = 0;
+        r.linear_whole.keep(i, f, met, &mut read);
+        r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     }
     Ok(r.linear
         .get(root)
         .expect("the root's form was just computed"))
 }
 
-/// The form of `i` from its operands' (cached) forms.
-fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Stop> {
+/// The form of `i` from its operands' (cached) forms, and whether terms met in it (see
+/// [`sum_of`]).
+fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
     let get =
         |r: &Runner<'_, '_>, j: u32| r.linear.get(j).expect("operands' forms are computed first");
-    Ok(match node.op {
+    let form = match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => merge_complements(cx, merge_signs(cx, get(r, node.a).add(&get(r, node.b)))),
-        OpCode::Sub => merge_complements(
-            cx,
-            merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
-        ),
+        OpCode::Add => return sum_of(r, cx, &get(r, node.a), &get(r, node.b)),
+        OpCode::Sub => return sum_of(r, cx, &get(r, node.a), &get(r, node.b).neg()),
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -379,18 +399,88 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
             if disjoint {
                 // The sum relies on what proved the operands disjoint.
-                let mut f = get(r, node.a).add(&get(r, node.b));
+                let (mut f, met) = sum_of(r, cx, &get(r, node.a), &get(r, node.b))?;
                 f.fin = f.fin.and(fina).and(finb);
-                f
-            } else {
-                Form {
-                    fin: fina.and(finb).unchanged(),
-                    ..Form::atom(i, w)
-                }
+                return Ok((f, met));
+            }
+            Form {
+                fin: fina.and(finb).unchanged(),
+                ..Form::atom(i, w)
             }
         }
         _ => Form::atom(i, w),
+    };
+    Ok((form, false))
+}
+
+/// The sum of the forms `a` and `b` of a node's operands, and whether terms met in it: two
+/// terms of one atom, in the forms themselves or out of sight, one of them inside a sum over
+/// [`MAX_TERMS`] that is an atom here (see [`Whole`](super::forms::Whole)). Those sums are
+/// then taken apart, so the terms cancel: `(v0 + … + v99) − v0` is the other 99 terms.
+fn sum_of(r: &mut Runner<'_, '_>, cx: &Context, a: &Form, b: &Form) -> Result<(Form, bool), Stop> {
+    let f = merge(cx, a.add(b));
+    let met = f.terms.len() < a.terms.len() + b.terms.len();
+    let mut read = 0;
+    let whole = r.linear_whole.meeting(a, b, &f, &mut read);
+    r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
+    Ok(match whole {
+        // (`merge_fields` reads every term for each shifted one: within the cap only.)
+        Some(whole) if whole.terms.len() <= MAX_TERMS => (merge(cx, whole), true),
+        Some(whole) => (whole, true),
+        None => (f, met),
     })
+}
+
+/// `form` with the terms that read one value two ways moved to one reading, so they cancel.
+fn merge(cx: &Context, form: Form) -> Form {
+    merge_fields(cx, merge_complements(cx, merge_signs(cx, form)))
+}
+
+/// `form` with each term `k·2^j·(x >>u j)` moved to `k·x − k·(x & (2^j − 1))` when the form
+/// has that low field of `x` as a term too: `(x >>u 3)·24 + (x & 7)·3` is `x·3`. Only then, as
+/// [`merge_signs`].
+fn merge_fields(cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut moves = Vec::new();
+    for &(a, k) in &form.terms {
+        let n = cx.node(a);
+        if n.op != OpCode::LShr {
+            continue;
+        }
+        let Some(j) = cx.const_val(n.b).and_then(|j| j.to_u64()) else {
+            continue;
+        };
+        if j == 0 || j >= u64::from(w.bits()) {
+            continue;
+        }
+        let j = j as u32;
+        let q = crate::facts::known::bv_lshr(&k, j);
+        if crate::facts::known::bv_shl(&q, j) != k {
+            continue;
+        }
+        let mask = crate::facts::known::low_mask(w, j);
+        let low = form.terms.iter().map(|t| t.0).find(|&t| {
+            let m = cx.node(t);
+            m.op == OpCode::And && m.a == n.a && cx.const_val(m.b) == Some(mask)
+        });
+        if let Some(low) = low {
+            moves.push((a, k, n.a, low, q));
+        }
+    }
+    if moves.is_empty() {
+        return form;
+    }
+    let fin = form.fin;
+    let mut f = form;
+    for (a, k, x, low, q) in moves {
+        let neg = |v: &BitVec| BitVec::un_unchecked(UnOp::Neg, v);
+        f = f.add(&Form::of(
+            BitVec::zero(w),
+            &[(a, neg(&k)), (x, q), (low, neg(&q))],
+        ));
+    }
+    f.fin = fin;
+    f
 }
 
 /// `form` with each term `k·sext(c)` of a 1-bit `c` (`0` or `−1`) moved to `−k·zext(c)` when
@@ -486,10 +576,6 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
             if *k == BitVec::one(w) {
                 return Ok(a);
             }
-            // `a + a`: one node, where a shift needs its amount too.
-            if *k == BitVec::wrapping_from_u64(w, 2) {
-                return r.build(cx, |cx| cx.c_bin(BinOp::Add, a, a));
-            }
             if crate::facts::known::count_ones(k) == 1 {
                 let sh = BitVec::apply_un(UnOp::Ctz, k).map_err(|e| Stop::Error(e.into()))?;
                 return r.build(cx, |cx| {
@@ -556,6 +642,38 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
     }
 }
 
+/// The leaves of the tree of `op` at `n`, left to right, when there are at most `N`. It reads
+/// from the top and stops as soon as the nodes it holds must give more: a tree of `k` leaves
+/// takes `2k − 1` steps and a larger one at most `2N`, however deep it is. (Read by recursion
+/// to the bottom first, every node of a chain of 128 000 additions cost its depth, 29 s in
+/// all, and one of 80 000 overflowed a 2 MiB stack.)
+fn leaves<const N: usize>(cx: &Context, n: u32, op: OpCode) -> Option<([u32; N], usize)> {
+    let mut out = [0; N];
+    let mut len = 0;
+    // The nodes still to read, the next one last. Each gives at least one leaf, so `len + top`
+    // never passes `N`.
+    let mut todo = [0; N];
+    let mut top = 1;
+    *todo.first_mut()? = n;
+    while top > 0 {
+        top -= 1;
+        let i = todo[top];
+        let node = cx.node(i);
+        if node.op == op {
+            if len + top + 2 > N {
+                return None;
+            }
+            todo[top] = node.b;
+            todo[top + 1] = node.a;
+            top += 2;
+        } else {
+            out[len] = i;
+            len += 1;
+        }
+    }
+    Some((out, len))
+}
+
 /// multiplicative leaves of one term, bounded so factor search never turns a large
 /// product into pass work proportional to its tree.
 #[derive(Copy, Clone)]
@@ -567,26 +685,8 @@ struct Product {
 const MAX_PRODUCT_FACTORS: usize = 8;
 
 fn product(cx: &Context, n: u32) -> Option<Product> {
-    fn collect(cx: &Context, n: u32, out: &mut Product) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Mul {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.factors.len() {
-            out.factors[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Product {
-        factors: [0; MAX_PRODUCT_FACTORS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (factors, len) = leaves(cx, n, OpCode::Mul)?;
+    Some(Product { factors, len })
 }
 
 /// Additive terms of one sum, bounded for the same reason as [`Product`].
@@ -599,26 +699,8 @@ struct Sum {
 const MAX_SUM_TERMS: usize = 16;
 
 fn sum(cx: &Context, n: u32) -> Option<Sum> {
-    fn collect(cx: &Context, n: u32, out: &mut Sum) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Add {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.terms.len() {
-            out.terms[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Sum {
-        terms: [0; MAX_SUM_TERMS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (terms, len) = leaves(cx, n, OpCode::Add)?;
+    Some(Sum { terms, len })
 }
 
 /// A structurally shared factor and its position in every product, preferring a non-constant.
@@ -830,9 +912,21 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if !linear_op(op) || op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    // A product of values, its factors in order (see `sort_chain`).
+    let sorted = match op {
+        OpCode::Mul => match super::sort_chain(r, cx, PassKind::Linear, n)? {
+            Step::Normal(f) => f,
+            step => return Ok(step),
+        },
+        _ => Fin::FINAL,
+    };
     let form = form_of(r, cx, n)?;
     if form.is_atom_of(n) {
-        return Ok(Step::Normal(form.fin));
+        // A sum over the cap in which terms met is written out again, from its whole form.
+        return match r.linear_whole.met(n) {
+            Some(whole) => plain(r, cx, n, whole),
+            None => Ok(Step::Normal(form.fin.and(sorted))),
+        };
     }
     // Terms reading one condition, merged first (see `conditions`).
     let merged = match super::conditions::step(r, cx, n, &form)? {

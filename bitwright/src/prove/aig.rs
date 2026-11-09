@@ -55,6 +55,19 @@ impl Aig {
         self.nodes.len() == 1
     }
 
+    /// Node `n`'s operands, when it is a gate.
+    pub(super) fn gate(&self, n: usize) -> Option<(L, L)> {
+        match self.nodes[n] {
+            Node::And(a, b) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    /// Whether node `n` is an input.
+    pub(super) fn is_input(&self, n: usize) -> bool {
+        matches!(self.nodes[n], Node::Input)
+    }
+
     /// A new input.
     pub fn input(&mut self) -> L {
         self.nodes.push(Node::Input);
@@ -880,6 +893,12 @@ impl Cnf {
         let v = self.var[(l >> 1) as usize];
         debug_assert_ne!(v, NONE, "a node without a variable");
         Lit::new(v, l & 1 == 0)
+    }
+
+    /// Whether `other` gives every node the variable this does (an encoding of the same
+    /// graph and roots, in a fresh solver).
+    pub(super) fn same_variables(&self, other: &Cnf) -> bool {
+        self.var == other.var
     }
 
     pub(super) fn mapped_lit(&self, l: L) -> Option<Lit> {

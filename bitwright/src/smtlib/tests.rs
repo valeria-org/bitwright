@@ -1045,6 +1045,8 @@ fn solver_proves_the_built_in_rules(solver: Solver) {
         widest > 64
             || (nonlinear && widest >= 16)
             || ((name.contains("pdep") || name.contains("pext")) && widest > 32)
+            // Bit counts are exported as sums of bits, which z3 decides slowly past 32.
+            || (name.starts_with("core.bit_counts") && widest > 32)
             || (name.starts_with("core.float") && widest >= 24)
     };
     let mut gave_up = Vec::new();

@@ -23,6 +23,11 @@
 //! their minimum form. So masking that cancels over more atoms comes apart:
 //! `((a ^ m) & (b ^ n)) ^ ((a ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)` is `a & b`. Constants are
 //! atoms there, so a node of more than three atoms is read by classes first.
+//!
+//! *Chains.* A chain of `&` or of `|` over three operands or more is written with its operands
+//! in the context's order, each once ([`sort_chain`](super::sort_chain)): one node however it
+//! was parenthesized and ordered, also over more atoms than a table reads, so
+//! `(a & b & … & g) ^ (g & … & b & a)` is 0. An operand beside its complement decides the chain.
 
 use std::sync::OnceLock;
 
@@ -1125,7 +1130,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     }
-    Ok(Step::Normal(fin))
+    // A chain of `&` or `|` no table reads whole, its operands in order (see `sort_chain`).
+    if !matches!(cx.node(n).op, OpCode::And | OpCode::Or) {
+        return Ok(Step::Normal(fin));
+    }
+    Ok(match super::sort_chain(r, cx, PassKind::Bitwise, n)? {
+        Step::Normal(f) => Step::Normal(fin.and(f)),
+        done => done,
+    })
 }
 
 #[cfg(test)]

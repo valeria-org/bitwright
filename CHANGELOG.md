@@ -1,5 +1,179 @@
 # Changelog
 
+## Unreleased
+
+Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.
+`tests/lifter_idioms.rs` checks each under every preset that runs what it needs.
+
+- **Bit counts.** `popcnt(x) + popcnt(~x)` is the width, `popcnt(x) == 0` is `x == 0` (and `!=`,
+  `== W` as all ones, `ctz` or `clz` equal to the width as zero), and the count of the bits
+  below the lowest set one, however its mask is spelled (`(x & -x) - 1`, `~x & (x - 1)`,
+  `~(x | -x)`), is `ctz(x)`. The SWAR population count is `popcnt(x)`: the carries pass reads a
+  right shift or a mask whose region is one value through arithmetic and constant shifts,
+  compares it at its 64 points with `popcnt`, `ctz` and `clz` of that value, and proves the
+  one that agrees (22 ms at 32 bits); so counted after a smear or a trailing mask, the same
+  shape is `clz(x)` or `ctz(x)`. `ctz(x) <u 3` stays: `(x & 7) != 0` is a larger tree, and the
+  engine only rewrites to smaller ones.
+- **Sign and overflow flags.** A sign test beside a sign bit taken as a slice
+  (`(x <s 0) ^ extract<W-1, 1>(y)`, and with `!=`, `==`, `&`, `|`) is one test of the
+  combination, so `SF ^ OF` of a subtraction is `x <s y` however each flag is spelled. The
+  branch-free absolute value (`((x >>s W-1) ^ x) - (x >>s W-1)`, or with the mask added first)
+  is `abs(x)`. `x + y <u x` is `~x <u y`, the carry-out test the facts decide (and `false` at
+  once when both are below half the range, for `Strategy::compile`'s single round).
+- **Selects.** A one-bit `((x ^ y) & c) ^ y` (the bitwise pass's form of `(c & x) | (~c & y)`)
+  is `select(c, x, y)`; both arms combined with one term by `&`, `|`, `*`, `-` or a shift
+  factor it out (`select(c, x & y, x & z)` is `x & select(c, y, z)`); and an arm one more or
+  one less than the other is the condition added (`select(c, x + 1, x)` is `x + zext(c)`).
+- **Declared facts.** A sign extension of a value whose sign bit is clear is its zero
+  extension, and through a truncation that drops only bits known zero, an equality with a
+  constant or another such truncation is one of the whole values: with `x` and `y` declared
+  below 256, `sext<64>(trunc<32>(x)) == x` is true and `trunc<8>(x) == 3` is `x == 3`.
+- **Arithmetic in halves.** `add`/`adc` and `sub`/`sbb` over separate halves
+  (`concat(a1 + b1 + zext(carry), a0 + b0)`) are the sum or difference of the concatenations,
+  and over the halves of two values (the low halves' sum already one truncation) are `x + y`
+  and `x - y`: by rules now, in every preset, in microseconds where the carries pass's proof
+  took 4 and 17 ms.
+- **Double-word shifts.** A word-sized window of two words, `concat(trunc<A>(h),
+  extract<A, W-A>(l))` (the shuffle pass's form of `shld`), is `extract<A, W>(concat(h, l))`.
+- **`Strategy::decompile()`**, for a decompiler's everyday output: the standard strategy plus
+  divisions by constants, carry networks and bit counts, and bit shuffles (byte swaps,
+  rotations, double-word shifts), without the MBA passes. `bitwright simplify --decompile` and
+  `lift --decompile`, and the Python preset `"decompile"`.
+- The rule `halves_sum_no_overflow` is gone: `x + y <u x` as a carry-out test decides it.
+- **SAT sweeping** (`prove::Config::sweeping`, on by default), decided per question. While a
+  question is prepared, its circuit is simulated on word-level assignments (boundary values,
+  runs of ones, and values related to the word before, such as `-x` beside `x`, so long carries
+  occur); nodes that agree everywhere, or disagree everywhere, are candidates. The simulation
+  then decides whether to sweep: for an equality, it counts the candidate classes that join a
+  node only one side has to a node only the other has, and sweeps when there are at least 4,
+  and one for every 10 nodes private to a side. Otherwise the question is searched exactly as
+  it would be unswept, for the cost of the simulation (`Stats::sweeping.skipped`). When it
+  sweeps, the candidates are proved equivalent one pair at a time from the inputs up, by a
+  solver holding only the circuit's clauses, under assumptions (`a ∧ ¬b`, then `¬a ∧ b`); a
+  pair told apart refines the simulation with its counterexample and that point's neighbours.
+  The equivalences go to the search as clauses, and with a certificate the sweep's own lemmas
+  are logged first, so the certificate still checks independently (the sweep's solver holds a
+  subset of the question's clauses, in the same variables). The sweep takes at most half of
+  the configured limits, before any search, so a question solved in steps is swept as one
+  solved at once; it counts in the question's totals and is reported in `Stats::sweeping`
+  (`ran`, `skipped`, `crossings`, and the pairs merged, separated and undecided). Measured in
+  propagations, without and with: the 64-bit prefix adder against `x + y` 0.54 M and 0.29 M
+  (54 ms and 18 ms), the 64-bit MBA rewriting of `x - y` 7.6 M and 0.56 M (2.1 s and 44 ms),
+  the 32-bit SWAR population count against `popcnt` 148 k and 24 k. Skipped, and unchanged:
+  the shift-and-xor addition loop against `x + y`, whose carries no single node holds (at 64
+  bits a sweep would save a quarter of 28.7 M, at 16 bits it costs a quarter more), products,
+  and wrong adders. The carries pass's proofs over the networks it tests take 46 % less pass
+  work. The solver gains a search under assumptions that leaves the clauses satisfiable when
+  the assumptions are refuted.
+
+Defects in the driver and the normal forms, found reading the engine:
+
+- **A doubling is `a << 1`.** The builder writes `a + a` as `a << 1`, as every other power of
+  two is a shift, so what reads shifts reads doublings: `(x >>u 1) + (x >>u 1)` is `x & -2`,
+  and with `+ (x & 1)` it is `x`. The linear pass emits a coefficient of 2 as a shift (it wrote
+  `a + a`), and the rules `and_double_const`, `or_double_const` and `xor_double_const` are gone
+  (the `shl` rules beside them cover the one form). Expressions that printed `x + x` print
+  `x << 1`, lifted ones included.
+- **Constants in the commit rule.** A rewrite is committed when it frees more nodes than it
+  builds, and a node with a use outside the rewritten region is not freed. A constant's uses
+  outside are no longer counted: whether an unrelated expression happens to hold the same
+  constant decided rewrites it has nothing to do with.
+- **Rule results declined for sharing are decided again.** A rule guarded by `one_use` that
+  declined while its operand had another use was remembered as declined for the call; it is
+  asked again once a later phase has dropped the other use.
+- **Rotations written as concatenations.** `concat(trunc<A>(x), extract<A, W-A>(x))`, the two
+  parts of one word swapped, is `rotr(x, A)` (the rule `concat_rotate`); it stayed a
+  concatenation.
+- **Right shifts in sums.** The linear pass reads `k·2^j·(x >>u j)` beside the low field
+  `x & (2^j − 1)` of the same `x` as `k·x − k·(x & (2^j − 1))`, so the two parts of a value
+  taken apart come together: `(x >>u 3) * 24 + (x & 7) * 3` is `x * 3`.
+- **Quotients under masks.** `(x >>u c) << c` becomes a mask only when the shift has no other
+  use (the rule `lshr_shl`): the mask saved nothing, and hid the quotient `q` of `q·8 + q·2`
+  from the division pass. That pass reads a multiply-high, or a shift or slice of one, under a
+  mask `−2^m` as the quotient shifted left: `umulhi(x, 0xcccccccd) & -32` is `udiv(x, 40) << 5`,
+  and the compiler's `x % 10`, `x - ((q << 3) + (q << 1))` with
+  `q = umulhi(x, 0xcccccccd) >>u 3`, is `urem(x, 10)`.
+- **Chains in one order.** A product of three or more values, and a chain of `&` or of `|`, is
+  written with its operands in the context's order, joined left to right (up to 256 operands),
+  so it is one node however it was parenthesized and ordered: `a*b*c - c*b*a` is 0 wherever the
+  linear pass runs, and `(v0 & … & v6) ^ (v6 & … & v0)` wherever the bitwise pass does, at 40
+  operands as at 3. The product was 0 only through the MBA service, up to 8 atoms; the `&` and
+  `|` chains only up to the six atoms a truth table reads. In a chain of `&` or `|` an operand
+  counts once, and beside its complement it decides the chain. A chain found in order is
+  remembered for the call, so are its parts, and so is one over 256 operands (every chain over
+  it is, too): two 256-factor products in opposite orders take 0.30 M units of pass work.
+- **Uses of a node that took another's place.** The commit rule counted a node's uses as the
+  walk had rebuilt them so far: a node rebuilt over a rewrite below it had no user until its
+  users were rebuilt in turn, so one that several of them share looked like one a rewrite at the
+  first could free. It now counts the uses of the node it replaced until those users are
+  rebuilt over it, and is counted as live though the context held it before the call. With
+  `y` reducing to `p`, `(x & (y & z)) ^ popcnt(y & z)` keeps `x & (p & z)` over the shared
+  `p & z`; putting that chain in order (`p & x & z`) built a second copy of it. Over 400 random
+  DAGs of 200 nodes, results are smaller in 70 and larger in 7 with one root, and with four
+  roots over one shared term 43 results are larger than their input, from 73.
+- **Long sums and products in the linear pass's factoring.** `a·x + a·y` is factored over a
+  sum of up to 16 terms of up to 8 factors, and the pass read a sum's terms and a term's
+  factors by recursion to the bottom of the chain before that bound applied, at every node of
+  it. A left-nested sum of 80 000 terms, or `v0 * … * v79999 + x`, overflowed a 2 MiB thread
+  stack (the process aborts), and below that a sum cost the square of its length outside any
+  budget: 32 000 terms took 1.5 s and 128 000 took 29 s, each `Completed`. Both are read from
+  the top now, in at most 32 steps: 140 ms and 0.58 s, as a chain of subtractions takes, and
+  100 000 terms or factors on that stack. Results are the same.
+- **Conditions merged in one spelling, whatever the order of construction.** Where two terms
+  of a sum read one condition (`zext(c) - zext(~c)`), the linear pass merged them over the
+  spelling of the first term, and a form's terms are in the order their nodes were built:
+  `zext<8>(x <=s a) - zext<8>(a <s x)` with `a = udiv(1, x)` stayed as written when parsed and
+  became `1 - (zext<8>(a <s x) << 1)` once imported into another context
+  (`Context::import` builds operands right to left), so a result could change again when
+  simplified there. The spelling kept is now the one that is no complement, then the first in
+  the context's order. Of 4 000 000 random inputs per preset, three changed again in a fresh
+  context, each through this; none does now.
+- **Sums and xors over 64 terms.** A form of more than 64 terms is an atom of the forms over
+  it, which keeps every node's form small, and so nothing cancelled through it:
+  `(v0 + … + v69) - v0` was left as written, and so was the same sum minus itself in another
+  order. Such a sum now keeps its whole form (its terms, with the long sums among its atoms
+  taken apart in turn, up to 1024 terms), and a sum over it is read through it where a term of
+  one operand is inside a long sum of the other: 74 terms less one are the other 73, 70 less
+  the same 70 reversed are 0, and 200 less 100 of them are the other 100. The xor pass does the
+  same for xors. A sum in which nothing meets is not taken apart (a search of the whole form
+  for each term added), so a long sum of distinct terms costs what it did: 5000 terms take
+  0.3 % more pass work. A sum of more than 1024 terms is an atom and no more, as before, and
+  one with another use is not written out a second time.
+
+The driver's accounting, from the same reading:
+
+- **A quarantined pass stops.** A pass whose rewrite fails a width, verification or tripwire
+  check is quarantined for the call, as a rule is. That was recorded, and only the MBA phase and
+  the invert pass looked: the others went on rewriting. Every pass now stops, on every node and
+  root of the call, and what it would have decided is not final.
+- **Salvaging is charged.** A root a budget stops keeps the work of its stopped phase: the
+  nodes above what the phase finished are rebuilt over it, by a walk of the root that nothing
+  was charged for, once for every root after the stop. Reading a node the stopped phase had not
+  reached is now a node visit (the ones it had reached are charged already), and a node the
+  budget does not cover stays as it is. 48 roots over one shared sum of 1607 nodes, each
+  stopped at its first rewrite, were 2749 node visits and are 79 501; with 8 roots' worth of
+  visits, the roots after those are not read.
+- **The other roots are counted once.** The commit rule's use counts of the other roots of a
+  call are counted once per root and kept; every later phase run charged the count again as
+  pass work, for a walk it did not make. A small root beside one of 2399 nodes took 55 980
+  units and takes 48 767.
+- **`Stats::rounds_capped` and `Stats::reruns_capped`.** A run that ended at
+  `Strategy::max_rounds` with its last round still changing the root looked like one that had
+  settled, and so did a call that stopped running roots again for what they share (three
+  times) while they were still changing. Both are counted, in `Stats` and in a trace's `stats`
+  line: the result is as valid as any, and simplifying it again may go further.
+
+A wrong answer of `Context::prove`, in 0.26.0 too, which the heavy facts suite came to once
+the doublings above had changed its random expressions:
+
+- **Residues of values over 128 bits.** The residue predicates behind `Context::prove` compute
+  with 128-bit values, and read an extension or a concatenation wider than that as an
+  operation, because its operands fit. Its value was cut to 128 bits, so `sext<257>(x)` of a
+  negative `x` was a large positive number, and `sext<257>(t * t) <=s sext<257>(x)` with
+  `t = sext<33>(x)` was proved true (at `x = 2` it is `4 <=s 2`). Such a node is a leaf to the
+  residues now. Only questions about expressions wider than 128 bits were answered so; the
+  compares pass reads no such node.
+
 ## 0.26.0
 
 Four ways to hide arithmetic at a width boundary, found by probing obfuscations that mix widths

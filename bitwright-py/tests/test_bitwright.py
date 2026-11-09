@@ -598,10 +598,10 @@ def test_lifting(cx):
     assert rax is not None and str(rax.simplify()) == "rdi + rsi"
     p = bw.lift_pcode(cx, "(register, RAX, 8) = INT_MULT (register, RDI, 8) , (const, 0x2, 8)")
     rax = p.register("RAX")
-    assert rax is not None and str(rax.simplify()) == "RDI + RDI"
+    assert rax is not None and str(rax.simplify()) == "RDI << 1"
     ll = bw.lift_llvm(cx, "define i32 @f(i32 %a) {\n  %r = shl i32 %a, 1\n  ret i32 %r\n}\n")
     ret = ll.register("ret")
-    assert ret is not None and str(ret.simplify()) == "a + a"
+    assert ret is not None and str(ret.simplify()) == "a << 1"
 
 
 def test_transformations():

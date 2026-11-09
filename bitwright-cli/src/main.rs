@@ -58,7 +58,7 @@ commands:
         (isPowerOf2(C), (C1 & C2) == 0, C u< width(C), …), which is then verified as `prove`
         verifies. Exit 1 unless every transformation gets a verified precondition (or needs
         none).
-  lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard]
+  lift <file> [--from pcode|vex|llvm] [--function <name>] [--standard | --decompile]
        [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
         read lifted code (Ghidra p-code, pyvex's VEX IR, or an LLVM IR function; guessed from
         the file's extension, .pcode, .vex, .ll, without --from) and print each register it
@@ -74,7 +74,7 @@ commands:
         Exit 1 unless every pair is valid.
   explain <code>
         what a diagnostic code means, e.g. `bitwright explain BW0302`.
-  simplify <expr> [--width <n>] [--standard] [--assume <predicate>]... [--rules <file.bwr>]...
+  simplify <expr> [--width <n>] [--standard | --decompile] [--assume <predicate>]... [--rules <file.bwr>]...
            [--float-values] [--synth [--synth-conflicts <n>] [--synth-propagations <n>]]
            [--trace <out>]
   simplify --file <path> [--jobs <n>] [options as above]
@@ -85,7 +85,9 @@ commands:
         line read (blank lines and `#` comments as they are).
         Deobfuscates: the rules, the normal-form passes and the MBA service with the native
         normal-form solver, whose every answer bitwright proves itself. `--standard` runs only
-        the rules and the standard passes (`--deobfuscate`, the default, is accepted).
+        the rules and the standard passes, and `--decompile` those plus the passes for what
+        compilers emit (divisions by constants, byte swaps and shuffles, carry networks and bit
+        counts) without the MBA ones (`--deobfuscate`, the default, is accepted).
         `--rules` adds a rule file's rules after the built-in ones, vouched for by the ledger
         `<file.bwr>.proof` if there is one (as `check --ledger` writes it), else checked now:
         exit 1 unless every rule is sound. `--float-values` also applies the rules that hold
@@ -682,12 +684,16 @@ fn lift(rest: &[String]) -> Result<String, Fail> {
             "from",
             "function",
             "standard",
+            "decompile",
             "synth",
             "synth-conflicts",
             "synth-propagations",
         ],
-        &["standard", "synth"],
+        &["standard", "decompile", "synth"],
     )?;
+    if a.flag("standard") && a.flag("decompile") {
+        return Err(usage("--standard and --decompile exclude each other"));
+    }
     let synth = synth_config(&a)?;
     let path = a.one("file")?;
     let text = read(path)?;
@@ -718,6 +724,8 @@ fn lift(rest: &[String]) -> Result<String, Fail> {
     let mut builder = Engine::builder().builtin();
     let strategy = if a.flag("standard") {
         Strategy::standard()
+    } else if a.flag("decompile") {
+        Strategy::decompile()
     } else {
         let trust = MbaTrust::default().with_backend_certificates(false);
         builder = builder.mba_solver(Arc::new(NormalFormSolver::default()));
@@ -974,6 +982,7 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "width",
             "deobfuscate",
             "standard",
+            "decompile",
             "assume",
             "rules",
             "float-values",
@@ -984,11 +993,28 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
             "jobs",
             "trace",
         ],
-        &["deobfuscate", "standard", "float-values", "synth"],
+        &[
+            "deobfuscate",
+            "standard",
+            "decompile",
+            "float-values",
+            "synth",
+        ],
     )?;
     let synth = synth_config(&a)?;
-    if a.flag("standard") && a.flag("deobfuscate") {
-        return Err(usage("--standard and --deobfuscate exclude each other"));
+    if [
+        a.flag("standard"),
+        a.flag("deobfuscate"),
+        a.flag("decompile"),
+    ]
+    .iter()
+    .filter(|&&f| f)
+    .count()
+        > 1
+    {
+        return Err(usage(
+            "--standard, --decompile and --deobfuscate exclude each other",
+        ));
     }
     // One expression, or a file of them (one per line; blank lines and `#` comments kept).
     let file = a.value("file");
@@ -1057,6 +1083,8 @@ fn simplify(rest: &[String]) -> Result<String, Fail> {
     let mut builder = Engine::builder().builtin();
     let mut strategy = if a.flag("standard") {
         Strategy::standard()
+    } else if a.flag("decompile") {
+        Strategy::decompile()
     } else {
         // The MBA service with the native solver, on bitwright's own evidence only.
         let trust = MbaTrust::default().with_backend_certificates(false);

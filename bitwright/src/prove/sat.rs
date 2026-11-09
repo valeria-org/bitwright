@@ -913,33 +913,8 @@ impl Solver {
         let propagation_stop = p0.saturating_add(limits.propagations);
         loop {
             if let Some(confl) = self.propagate_until(propagation_stop) {
-                self.conflicts += 1;
-                self.here += 1;
-                if self.decision_level() == 0 {
-                    self.unsat = true;
-                    if let Some(p) = &mut self.proof {
-                        p.push(Step::Add(Vec::new()));
-                    }
+                if !self.learn(confl) {
                     return Answer::Unsat;
-                }
-                let (learnt, bt, lbd) = self.analyze(confl);
-                self.lemmas += 1;
-                self.cancel_until(bt);
-                if let Some(p) = &mut self.proof {
-                    p.push(Step::Add(learnt.clone()));
-                }
-                if learnt.len() == 1 {
-                    self.assign(learnt[0], None);
-                } else {
-                    let c = self.attach(&learnt, true, lbd);
-                    self.bump_clause(c);
-                    self.assign(learnt[0], Some(c));
-                }
-                self.var_inc /= 0.95;
-                self.cla_inc /= 0.999;
-                if self.conflicts >= self.next_reduce {
-                    self.next_reduce = self.conflicts + 2000 + 300 * (self.conflicts / 2000);
-                    self.reduce();
                 }
                 if self.conflicts - c0 >= limits.conflicts
                     || self.propagations - p0 >= limits.propagations
@@ -967,6 +942,146 @@ impl Solver {
                 self.assign(d, None);
             }
         }
+    }
+
+    /// Learns from the conflict `confl`: the first-UIP clause, logged, kept and asserted after
+    /// backjumping. `false` when the conflict is at the top level: the formula is
+    /// unsatisfiable, which is recorded.
+    fn learn(&mut self, confl: u32) -> bool {
+        self.conflicts += 1;
+        self.here += 1;
+        if self.decision_level() == 0 {
+            self.unsat = true;
+            if let Some(p) = &mut self.proof {
+                p.push(Step::Add(Vec::new()));
+            }
+            return false;
+        }
+        let (learnt, bt, lbd) = self.analyze(confl);
+        self.lemmas += 1;
+        self.cancel_until(bt);
+        if let Some(p) = &mut self.proof {
+            p.push(Step::Add(learnt.clone()));
+        }
+        if learnt.len() == 1 {
+            self.assign(learnt[0], None);
+        } else {
+            let c = self.attach(&learnt, true, lbd);
+            self.bump_clause(c);
+            self.assign(learnt[0], Some(c));
+        }
+        self.var_inc /= 0.95;
+        self.cla_inc /= 0.999;
+        if self.conflicts >= self.next_reduce {
+            self.next_reduce = self.conflicts + 2000 + 300 * (self.conflicts / 2000);
+            self.reduce();
+        }
+        true
+    }
+
+    /// Solves under `assumptions`, decided first and in order, within `limits` counted from
+    /// this call. [`Answer::Unsat`] when the clauses and the assumptions together are
+    /// contradictory; the clauses alone are then still satisfiable unless
+    /// [`is_unsat`](Self::is_unsat) says so. Assumptions are decisions, so every clause
+    /// learned on the way follows from the clauses alone: it is logged and kept, and once the
+    /// answer is `Unsat` the negation of the assumptions follows from them by unit propagation
+    /// ([`add_rup_clause`](Self::add_rup_clause) accepts it). The search starts at the top
+    /// level and ends there: unlike [`solve_within`](Self::solve_within), an unfinished call
+    /// is not resumed.
+    pub(super) fn solve_assuming(&mut self, assumptions: &[Lit], limits: Limits) -> Answer {
+        if self.unsat {
+            return Answer::Unsat;
+        }
+        if limits.conflicts == 0 || limits.propagations == 0 {
+            return Answer::Unknown;
+        }
+        for &l in assumptions {
+            while l.var() >= self.num_vars() {
+                self.new_var();
+            }
+        }
+        self.cancel_until(0);
+        let (c0, p0) = (self.conflicts, self.propagations);
+        let propagation_stop = p0.saturating_add(limits.propagations);
+        let answer = loop {
+            if let Some(confl) = self.propagate_until(propagation_stop) {
+                if !self.learn(confl) {
+                    break Answer::Unsat;
+                }
+                if self.conflicts - c0 >= limits.conflicts
+                    || self.propagations - p0 >= limits.propagations
+                {
+                    break Answer::Unknown;
+                }
+                continue;
+            }
+            if self.propagations - p0 >= limits.propagations {
+                break Answer::Unknown;
+            }
+            if self.here >= luby(self.restarts) * 100 {
+                self.restarts += 1;
+                self.here = 0;
+                self.cancel_until(0);
+                continue;
+            }
+            let level = self.decision_level() as usize;
+            let d = if let Some(&a) = assumptions.get(level) {
+                match self.value(a) {
+                    // Already true: an empty level keeps levels and assumptions aligned.
+                    Value::True => {
+                        self.trail_lim.push(self.trail.len());
+                        continue;
+                    }
+                    // Falsified by the assumptions before it (and the clauses).
+                    Value::False => break Answer::Unsat,
+                    Value::Unset => a,
+                }
+            } else {
+                match self.pick() {
+                    Some(d) => d,
+                    None => {
+                        break Answer::Sat(self.values.iter().map(|&v| v == Value::True).collect());
+                    }
+                }
+            };
+            self.decisions += 1;
+            self.trail_lim.push(self.trail.len());
+            self.assign(d, None);
+        };
+        self.cancel_until(0);
+        answer
+    }
+
+    /// Whether the clauses are known to be contradictory.
+    pub(super) fn is_unsat(&self) -> bool {
+        self.unsat
+    }
+
+    /// Adds `clauses` proved by another solver over a subset of these clauses (in the same
+    /// variables): `justification`'s additions, that proof's steps, are logged first. Each of
+    /// them followed by unit propagation from the other solver's clauses and the additions
+    /// before it, so it does from this solver's, a superset (its deletions are dropped: a
+    /// clause kept longer only helps propagation). `false` when the formula is now known
+    /// unsatisfiable.
+    pub(super) fn import(&mut self, justification: Vec<Step>, clauses: &[Vec<Lit>]) -> bool {
+        if let Some(p) = &mut self.proof {
+            p.extend(
+                justification
+                    .into_iter()
+                    .filter(|s| matches!(s, Step::Add(_))),
+            );
+        }
+        for c in clauses {
+            for &l in c {
+                while l.var() >= self.num_vars() {
+                    self.new_var();
+                }
+            }
+            if !self.add_incoming_clause(c, true, None) {
+                return false;
+            }
+        }
+        !self.unsat
     }
 }
 

@@ -165,6 +165,12 @@ impl Context {
                 }
             }
             BinOp::Add if self.is_zero(b) => return Ok(a),
+            // `a + a` is `a << 1`: one form for a doubling, the one the rules and passes read
+            // (as every other power of two is a shift).
+            BinOp::Add if a == b => {
+                let one = self.c_uint(w, 1)?;
+                return self.c_bin(BinOp::Shl, a, one);
+            }
             BinOp::Mul => {
                 if self.is_zero(b) {
                     return Ok(b);

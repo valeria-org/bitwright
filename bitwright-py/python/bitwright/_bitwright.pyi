@@ -406,12 +406,12 @@ class Outcome:
 
 @final
 class Engine:
-    """A simplifier: `"standard"`, `"deobfuscate"` or `"compile"`, with rule files and host
-    rewrites of your own."""
+    """A simplifier: `"standard"`, `"deobfuscate"`, `"decompile"` or `"compile"`, with rule
+    files and host rewrites of your own."""
 
     def __new__(
         cls,
-        preset: Literal["standard", "deobfuscate", "compile"] = "standard",
+        preset: Literal["standard", "deobfuscate", "decompile", "compile"] = "standard",
         *,
         rules: Sequence[str | tuple[str, str | None]] = ...,
         max_rounds: int | None = None,

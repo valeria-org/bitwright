@@ -188,7 +188,7 @@ fn simplify_runs_the_engine() {
     let (code, out, _) = run(&["simplify", mba, "--standard"]);
     assert_eq!(
         (code, out.trim()),
-        (0, "let %0 = x | y;\n%0 + %0 - (~y & x) - (~x & y)")
+        (0, "((x | y) << 1) - (~y & x) - (~x & y)")
     );
     let (code, out, _) = run(&["simplify", mba, "--deobfuscate"]);
     assert_eq!((code, out.trim()), (0, "x + y"));
@@ -309,12 +309,10 @@ fn simplify_a_file_line_by_line() {
         assert_eq!(out, "# MBA\nx + y\n\nx + y\nx    # relies on 0\n");
     }
     // A result with bindings stays on its line.
+    let f = file("shared.txt", "(x | y) * (x | y)\n");
     let (code, out, _) = run(&["simplify", "--file", &f, "--standard"]);
     assert_eq!(code, 0);
-    assert_eq!(
-        out.lines().nth(3),
-        Some("let %0 = x | y; %0 + %0 - (~y & x) - (~x & y)")
-    );
+    assert_eq!(out.lines().next(), Some("let %0 = x | y; %0 * %0"));
     let bad = file("bad.txt", "x\nx +\n");
     let (code, _, err) = run(&["simplify", "--file", &bad]);
     assert_eq!(code, 2);
@@ -413,12 +411,12 @@ fn synth_budgets_go_with_synth() {
 fn simplify_with_rules_of_your_own() {
     let src = "bitwright 1;
 group mine {
-    /// Every bit is set in x or in ~x.
-    #[example(\"popcnt(p:8) + popcnt(~p:8)\" => \"8:8\")]
-    rule popcnt_complement<W>(x: W) { popcnt(x) + popcnt(~x) => W }
+    /// Inclusion and exclusion: a bit set in both is counted in both.
+    #[example(\"popcnt(p:8 & q:8) + popcnt(p:8 | q:8)\" => \"popcnt(p:8) + popcnt(q:8)\")]
+    rule popcnt_and_or<W>(x: W, y: W) { popcnt(x & y) + popcnt(x | y) => popcnt(x) + popcnt(y) }
 }
 ";
-    let expr = "popcnt(x) + popcnt(~x)";
+    let expr = "popcnt(x | y) + popcnt(x & y)";
     let (code, out, _) = run(&["simplify", expr, "--width", "16"]);
     assert_eq!((code, out.trim()), (0, expr));
     let path = file("mine.bwr", src);
@@ -430,22 +428,25 @@ group mine {
             args.push("--standard");
         }
         let (code, out, err) = run(&args);
-        assert_eq!((code, out.trim()), (0, "16:16"), "{err}");
+        assert_eq!((code, out.trim()), (0, "popcnt(x) + popcnt(y)"), "{err}");
     }
     // With the ledger `check` writes next to it.
     assert_eq!(run(&["check", &path, "--ledger", &proof]).0, 0);
     let (code, out, err) = run(&["simplify", expr, "--width", "32", "--rules", &path]);
-    assert_eq!((code, out.trim()), (0, "32:32"), "{err}");
+    assert_eq!((code, out.trim()), (0, "popcnt(x) + popcnt(y)"), "{err}");
     // A stale ledger is refused.
     let changed = file(
         "mine2.bwr",
-        &src.replace("popcnt(x) + popcnt(~x) => W", "popcnt(~x) + popcnt(x) => W"),
+        &src.replace(
+            "popcnt(x & y) + popcnt(x | y) =>",
+            "popcnt(x | y) + popcnt(x & y) =>",
+        ),
     );
     std::fs::copy(&proof, format!("{changed}.proof")).unwrap();
     let (code, _, err) = run(&["simplify", expr, "--rules", &changed]);
     assert_eq!(code, 1);
     assert!(
-        err.contains("does not vouch for mine::popcnt_complement"),
+        err.contains("does not vouch for mine::popcnt_and_or"),
         "{err}"
     );
     // Unsound rules are refused, with the counterexample.

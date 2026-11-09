@@ -3417,10 +3417,14 @@ mod events {
     fn the_mba_service_says_what_vouched_for_its_answer() {
         let engine = Engine::builder()
             .builtin()
-            .strategy(Strategy::deobfuscate().with_mba(crate::mba::MbaConfig::default()))
+            .strategy(Strategy::new(
+                "mba",
+                vec![Phase::Mba(crate::mba::MbaConfig::default())],
+            ))
             .build()
             .unwrap();
-        let (_, ex) = explanations(&engine, INPUTS[0].0, 32);
+        // The service alone: in the presets, the linear passes take a linear MBA first.
+        let (_, ex) = explanations(&engine, "(x ^ y) + 2 * (x & y)", 32);
         let mba: Vec<_> = ex.iter().filter(|(b, _)| b == "mba").collect();
         assert!(
             matches!(
