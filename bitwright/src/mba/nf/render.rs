@@ -106,6 +106,42 @@ fn commutative(op: &MOp) -> bool {
     matches!(op, MOp::Add | MOp::Mul | MOp::And | MOp::Or | MOp::Xor)
 }
 
+/// Whether `c` is `v` at width `w` (`*c == BitVec::wrapping_from_u64(w, v)`, without building
+/// that value: coefficients are tested against 1 and 2 for every term emitted).
+#[inline]
+fn is_small(c: &BitVec, w: Width, v: u64) -> bool {
+    let v = match w.bits() {
+        bits if bits < 64 => v & ((1u64 << bits) - 1),
+        _ => v,
+    };
+    let l = c.limbs();
+    c.width() == w && l[0] == v && l[1..].iter().all(|&x| x == 0)
+}
+
+/// Whether `c` is all ones at width `w` (`*c == BitVec::ones(w)`).
+#[inline]
+fn is_ones(c: &BitVec, w: Width) -> bool {
+    match w.bits() {
+        bits if bits <= 64 => c.width() == w && c.limbs()[0] == u64::MAX >> (64 - bits),
+        _ => *c == BitVec::ones(w),
+    }
+}
+
+/// The position of the only set bit of `c`, if it has exactly one.
+#[inline]
+fn power_of_two(c: &BitVec) -> Option<u32> {
+    let mut at = None;
+    for (i, &l) in c.limbs().iter().enumerate() {
+        if l != 0 {
+            if at.is_some() || !l.is_power_of_two() {
+                return None;
+            }
+            at = Some(64 * i as u32 + l.trailing_zeros());
+        }
+    }
+    at
+}
+
 impl Builder {
     pub(crate) fn new(vars: Vec<Width>) -> Builder {
         Builder {
@@ -200,7 +236,7 @@ impl Builder {
         }
         let zero = |v: &Option<BitVec>| matches!(v, Some(x) if x.is_zero());
         let ones = |v: &Option<BitVec>| matches!(v, Some(x) if x.is_ones());
-        let one = |v: &Option<BitVec>| matches!(v, Some(x) if *x == BitVec::one(w));
+        let one = |v: &Option<BitVec>| matches!(v, Some(x) if is_small(x, w, 1));
         match op {
             MOp::Add | MOp::Or | MOp::Xor if zero(&cb) => return a,
             MOp::Add | MOp::Or | MOp::Xor if zero(&ca) => return b,
@@ -472,10 +508,11 @@ impl Builder {
         } else {
             *k
         };
-        if count_ones(&mag) != 1 || mag == BitVec::one(w) {
+        let j = power_of_two(&mag)?;
+        if is_small(&mag, w, 1) {
             return None;
         }
-        let n = if mag == BitVec::wrapping_from_u64(w, 2) {
+        let n = if is_small(&mag, w, 2) {
             BNode {
                 op: MOp::Add,
                 w,
@@ -483,7 +520,7 @@ impl Builder {
             }
         } else {
             BNode {
-                op: MOp::Shl(trailing_zeros(&mag) as u16),
+                op: MOp::Shl(j as u16),
                 w,
                 args: [t, 0],
             }
@@ -590,6 +627,18 @@ pub(crate) struct Render<'a> {
     narrow: Vec<Option<(u32, Width)>>,
     /// Whether a sign extension's parts are being rendered (see [`Render::sign_extensions`]).
     signing: bool,
+    /// What [`Render::sum`] reuses from one sum to the next.
+    sum_scratch: SumScratch,
+}
+
+/// The vectors of [`Render::sum`]: the terms merged by node, those with positive and with
+/// negative coefficients, and the constants the sum needs anyway.
+#[derive(Default)]
+struct SumScratch {
+    merged: Vec<(u32, BitVec)>,
+    pos: Vec<(u32, BitVec)>,
+    neg: Vec<(u32, BitVec)>,
+    needed: Vec<BitVec>,
 }
 
 /// The most decompositions [`Render::two_terms`] builds over up to three atoms, those whose
@@ -691,6 +740,7 @@ impl<'a> Render<'a> {
                 })
                 .collect(),
             signing: false,
+            sum_scratch: SumScratch::default(),
         }
     }
 
@@ -880,7 +930,7 @@ impl<'a> Render<'a> {
 
     /// `x & mask` (nothing for all-ones).
     fn masked(&mut self, x: u32, mask: &BitVec) -> u32 {
-        if mask.is_ones() {
+        if is_ones(mask, mask.width()) {
             return x;
         }
         let m = self.b.konst(mask);
@@ -897,14 +947,13 @@ impl<'a> Render<'a> {
     /// `k·t` for a coefficient `k` (positive in the signed sense): `t`, `t + t` (one node,
     /// where a shift needs its amount too), a shift, or a product.
     fn scaled(&mut self, t: u32, k: &BitVec) -> u32 {
-        if *k == BitVec::one(self.w) {
+        if is_small(k, self.w, 1) {
             return t;
         }
-        if *k == BitVec::wrapping_from_u64(self.w, 2) {
+        if is_small(k, self.w, 2) {
             return self.b.bin(MOp::Add, t, t);
         }
-        if count_ones(k) == 1 {
-            let s = trailing_zeros(k);
+        if let Some(s) = power_of_two(k) {
             return self.b.un(MOp::Shl(s as u16), t);
         }
         let c = self.b.konst(k);
@@ -919,8 +968,17 @@ impl<'a> Render<'a> {
         let w = self.w;
         self.spend(4 * s.terms.len() as u64 + 1);
         let mut acc: Option<u32> = None;
-        type Terms = Vec<(u32, BitVec)>;
-        let mut merged: Terms = Vec::with_capacity(s.terms.len());
+        // The vectors of the last sum, emptied: sums are emitted by the thousand.
+        let SumScratch {
+            mut merged,
+            mut pos,
+            mut neg,
+            mut needed,
+        } = core::mem::take(&mut self.sum_scratch);
+        merged.clear();
+        pos.clear();
+        neg.clear();
+        needed.clear();
         // Each node's position in `merged`, for sums too long to search (same order either way).
         let indexed = s.terms.len() > 8;
         let mut at: IdMap<u32, usize> = IdMap::default();
@@ -970,38 +1028,36 @@ impl<'a> Render<'a> {
                 _ => i += 1,
             }
         }
-        let (pos, mut neg): (Terms, Terms) = merged
-            .into_iter()
-            .filter(|(_, k)| !k.is_zero())
-            .partition(|(_, k)| !k.msb());
+        for &(t, k) in merged.iter().filter(|(_, k)| !k.is_zero()) {
+            match k.msb() {
+                false => pos.push((t, k)),
+                true => neg.push((t, k)),
+            }
+        }
         let mut k = s.konst.unwrap_or(BitVec::zero(w));
         // Only subtracted terms and no constant: a term with a coefficient other than −1 goes
         // first, a product by its negative coefficient, and the others are subtracted from it
         // (`t·−2 − ~y`, not `−~y − (t + t)`, whose `−~y` the rules read as `y + 1`).
         if pos.is_empty()
             && k.is_zero()
-            && let Some(i) = neg.iter().position(|(_, c)| *c != BitVec::ones(w))
+            && let Some(i) = neg.iter().position(|(_, c)| !is_ones(c, w))
         {
             neg.swap(0, i);
         }
         // Constants the sum needs whatever the signs: its constant and positive coefficients.
-        let trivial = |c: &BitVec| *c == BitVec::one(w) || count_ones(c) == 1;
-        let mut needed: Vec<BitVec> = pos
-            .iter()
-            .map(|(_, c)| *c)
-            .filter(|c| !trivial(c))
-            .collect();
+        let trivial = |c: &BitVec| is_small(c, w, 1) || power_of_two(c).is_some();
+        needed.extend(pos.iter().map(|(_, c)| *c).filter(|c| !trivial(c)));
         if !k.is_zero() {
             needed.push(k);
         }
-        for (t, c) in pos {
+        for &(t, c) in &pos {
             let x = self.scaled(t, &c);
             acc = Some(match acc {
                 None => x,
                 Some(a) => self.b.bin(MOp::Add, a, x),
             });
         }
-        for (t, c) in neg {
+        for &(t, c) in &neg {
             let nc = BitVec::un_unchecked(UnOp::Neg, &c);
             let reuse = !trivial(&nc) && needed.contains(&c) && !needed.contains(&nc);
             acc = Some(match acc {
@@ -1023,7 +1079,7 @@ impl<'a> Render<'a> {
                     let x = self.scaled(t, &nc);
                     self.b.bin(MOp::Sub, a, x)
                 }
-                None if nc == BitVec::one(w) => self.b.un(MOp::Neg, t),
+                None if is_small(&nc, w, 1) => self.b.un(MOp::Neg, t),
                 None => {
                     let m = self.b.konst(&c);
                     self.b.bin(MOp::Mul, t, m)
@@ -1033,6 +1089,12 @@ impl<'a> Render<'a> {
                 needed.push(if reuse { c } else { nc });
             }
         }
+        self.sum_scratch = SumScratch {
+            merged,
+            pos,
+            neg,
+            needed,
+        };
         match acc {
             None => self.b.konst(&k),
             Some(a) if k.is_zero() => a,
