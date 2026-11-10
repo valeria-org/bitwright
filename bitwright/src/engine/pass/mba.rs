@@ -2697,8 +2697,7 @@ pub(super) fn step(
     let out = ask(r, cx, cfg, n, n)?;
     // a fragment that reads slices of one rotated value, asked again with them
     // written as masks of that rotation (see [`sliced`]).
-    if cfg.noise_forms
-        && let Step::Normal(fin) = &out
+    if let Step::Normal(fin) = &out
         && fin.done
     {
         let before = cx.len() as u32;
@@ -2713,93 +2712,308 @@ pub(super) fn step(
     Ok(out)
 }
 
-/// the slice of one value a rotate or constant shift chain over node `i` is, as
-/// `(base, r, mask)` with `i == rotl(base, r) & mask` at `i`'s width (at most 64 bits): a left
-/// shift by `k` is the rotation by `k` with its low `k` bits cleared, a logical right shift the
-/// rotation by `-k` with its high `k` bits cleared. A node of no such chain is `(i, 0, ones)`.
-fn slice_of(cx: &Context, i: u32) -> (u32, u32, u64) {
+/// A node as bits of one rotation of another: `(rotl(base, rot) & mask) ^ flip`, at the
+/// node's width (at most 64 bits). Every node built over one value by shifts and rotations by
+/// constants, complements, and `& | ^` with constants or with another such node of the same
+/// rotation of the same value has this shape: each of its bits is 0, 1, a bit of the rotation
+/// or that bit's complement. A left shift by `k` is the rotation by `k` with its low `k` bits
+/// cleared, a logical right shift the rotation by `−k` with its high `k` bits cleared.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct Slice {
+    base: u32,
+    rot: u32,
+    mask: u64,
+    flip: u64,
+}
+
+/// The most operators one [`slice_of`] reads below a node.
+const SLICE_DEPTH: u32 = 48;
+
+/// Node `i` as a [`Slice`]; a node that is no such function of another is its own base, whole
+/// (`rot` 0, every bit, no flip).
+fn slice_of(cx: &Context, i: u32, memo: &mut crate::hash::IdMap<u32, Slice>, depth: u32) -> Slice {
     let w = u32::from(cx.width_of(i).bits());
-    if w > 64 {
-        return (i, 0, u64::MAX);
+    let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let whole = Slice {
+        base: i,
+        rot: 0,
+        mask: ones,
+        flip: 0,
+    };
+    if w > 64 || depth > SLICE_DEPTH {
+        return whole;
     }
-    let ones = u64::MAX >> (64 - w);
+    if let Some(&s) = memo.get(&i) {
+        return s;
+    }
     let n = cx.node(i);
-    let k = match n.op {
-        OpCode::RotL | OpCode::Shl | OpCode::LShr if cx.width_of(n.a) == cx.width_of(i) => cx
-            .const_val(n.b)
-            .and_then(|c| c.to_u64())
-            .filter(|&k| k > 0 && k < u64::from(w)),
-        _ => None,
-    };
-    let Some(k) = k else {
-        return (i, 0, ones);
-    };
-    let k = k as u32;
-    let rot = |m: u64, by: u32| match by % w {
+    let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
+    let rotl = |m: u64, by: u32| match by % w {
         0 => m,
         b => (m << b | m >> (w - b)) & ones,
     };
-    let (base, r, m) = slice_of(cx, n.a);
-    match n.op {
-        OpCode::RotL => (base, (r + k) % w, rot(m, k)),
-        OpCode::Shl => (base, (r + k) % w, rot(m, k) & (ones << k & ones)),
-        _ => (base, (r + w - k) % w, rot(m, w - k) & (ones >> k)),
-    }
+    // A shift or rotation count: a constant below the width, of an operand of the same width.
+    let count = |j: u32| {
+        konst(j)
+            .filter(|&k| k > 0 && k < u64::from(w))
+            .map(|k| k as u32)
+    };
+    let same_width = |j: u32| cx.width_of(j) == cx.width_of(i);
+    let s = match n.op {
+        OpCode::Not => {
+            let a = slice_of(cx, n.a, memo, depth + 1);
+            Slice {
+                flip: !a.flip & ones,
+                ..a
+            }
+        }
+        OpCode::And | OpCode::Or | OpCode::Xor => {
+            let (x, k) = match (konst(n.a), konst(n.b)) {
+                (None, Some(k)) => (n.a, Some(k)),
+                (Some(k), None) => (n.b, Some(k)),
+                _ => (n.a, None),
+            };
+            let a = slice_of(cx, x, memo, depth + 1);
+            // The other operand at each bit of the rotation: a constant's bit either way, or
+            // another slice of the same rotation.
+            let other = match k {
+                Some(k) => Some((0, k)),
+                None if konst(n.a).is_none() => {
+                    let b = slice_of(cx, n.b, memo, depth + 1);
+                    (b.base == a.base && b.rot == a.rot).then_some((b.mask, b.flip))
+                }
+                None => None,
+            };
+            match other {
+                Some((mb, fb)) => {
+                    let op = |p: u64, q: u64| match n.op {
+                        OpCode::And => p & q,
+                        OpCode::Or => p | q,
+                        _ => p ^ q,
+                    };
+                    // The value where the rotation's bit is 0, and where it is 1.
+                    let at0 = op(a.flip, fb);
+                    let at1 = op(a.flip ^ a.mask, fb ^ mb);
+                    Slice {
+                        mask: (at0 ^ at1) & ones,
+                        flip: at0 & ones,
+                        ..a
+                    }
+                }
+                None => whole,
+            }
+        }
+        OpCode::Shl if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + k) % w,
+                    mask: a.mask << k & ones,
+                    flip: a.flip << k & ones,
+                }
+            }
+            None => whole,
+        },
+        OpCode::LShr if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + w - k) % w,
+                    mask: a.mask >> k,
+                    flip: a.flip >> k,
+                }
+            }
+            None => whole,
+        },
+        OpCode::RotL | OpCode::RotR if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let k = if n.op == OpCode::RotL { k } else { w - k };
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + k) % w,
+                    mask: rotl(a.mask, k),
+                    flip: rotl(a.flip, k),
+                }
+            }
+            None => whole,
+        },
+        _ => whole,
+    };
+    memo.insert(i, s);
+    s
 }
 
-/// node `n`'s fragment (its MBA operators, down to their atoms) with each rotate
-/// or constant shift that cuts the same rotation of one value written as a mask of that
-/// rotation. `rotl(x, 32) >>u 30`, `rotl(x, 32) << 34` and `rotl(x, 2)` are the low 34 bits,
-/// the high 30 bits and the whole of `rotl(x, 2)`, but three unrelated atoms to the solver:
-/// obfuscators can write a rotate as such shifts beside the rotate itself in MBAs that cancel.
-/// `None` when no two slices are of one rotation of one value, or past `max_nodes`.
+/// node `n`'s fragment (its MBA operators, down to their atoms) with every part that reads
+/// one rotation of one value written over that rotation: `(rotl(x, r) & mask) ^ flip` (see
+/// [`Slice`]). `rotl(x, 32) >>u 30`, `rotl(x, 32) << 34` and `rotl(x, 2)` are the low 34
+/// bits, the high 30 bits and the whole of `rotl(x, 2)`, but three unrelated atoms to the
+/// solver: obfuscators write a rotate as such shifts beside the rotate itself in MBAs that
+/// cancel, and mask and complement the halves before they shift them.
+///
+/// A part whose low `k` bits are clear is also that many bits lower of the rotation by `k`
+/// less, shifted up (`rotl(x, 9) & 0x…42` is `(rotl(x, 8) & 0x…21) << 1`), and a product by a
+/// constant with low zero bits is its operand shifted up times the rest
+/// (`(x & m) · (c · 2^k)` is `((x & m) << k) · c`). Each part is read at the rotation the
+/// most parts of the fragment can be read at, so a term an obfuscator doubled, or a pass
+/// wrote as a shift, stays a multiple of the atom the other terms read.
+///
+/// `None` when no two parts read one rotation of one value, when the fragment is written
+/// that way already, or past `max_nodes`.
 fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate::Error> {
     use crate::ops::BinOp;
-    let mut groups: std::collections::BTreeMap<(u32, u32), Vec<(u32, u64)>> =
-        std::collections::BTreeMap::new();
+    /// One part of the fragment: the node; the slice its operand is (the node's own, for a
+    /// part that is no product); and for a product, its constant.
+    struct Part {
+        node: u32,
+        slice: Slice,
+        factor: Option<u64>,
+    }
+    let mut memo: crate::hash::IdMap<u32, Slice> = crate::hash::IdMap::default();
+    let mut parts: Vec<Part> = Vec::new();
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     let mut stack = vec![n];
     while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() {
+        if seen.insert(i, ()).is_some() || cx.const_val(i).is_some() {
             continue;
         }
         if seen.len() as u32 > max_nodes {
             return Ok(None);
         }
         let node = cx.node(i);
-        if matches!(node.op, OpCode::RotL | OpCode::Shl | OpCode::LShr) {
-            let (base, r, mask) = slice_of(cx, i);
-            if base != i {
-                groups.entry((base, r)).or_default().push((i, mask));
+        let slice = slice_of(cx, i, &mut memo, 0);
+        if slice.base != i {
+            if slice.mask | slice.flip != 0 {
+                parts.push(Part {
+                    node: i,
+                    slice,
+                    factor: None,
+                });
             }
         } else if mixed_op(node.op) {
+            if node.op == OpCode::Mul && cx.width_of(i).bits() <= 64 {
+                let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
+                let product = match (konst(node.a), konst(node.b)) {
+                    (None, Some(c)) => Some((node.a, c)),
+                    (Some(c), None) => Some((node.b, c)),
+                    _ => None,
+                };
+                if let Some((x, c)) = product
+                    && c != 0
+                    && c & 1 == 0
+                {
+                    parts.push(Part {
+                        node: i,
+                        slice: slice_of(cx, x, &mut memo, 0),
+                        factor: Some(c),
+                    });
+                }
+            }
             stack.extend(node.children());
         }
     }
-    let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
-    for ((base, r), slices) in groups.into_iter().filter(|(_, s)| s.len() >= 2) {
-        let w = cx.width_of(base).bits();
-        let ones = u64::MAX >> (64 - u32::from(w));
-        let whole = if r == 0 {
-            base
-        } else {
-            let k = cx.mk_const_u64(w, u64::from(r))?;
-            cx.c_bin(BinOp::RotL, base, k)?
-        };
-        for (i, mask) in slices {
-            let v = if mask == ones {
-                whole
-            } else {
-                let k = cx.mk_const_u64(w, mask)?;
-                cx.c_bin(BinOp::And, whole, k)?
-            };
-            repl.insert(i, v);
+    // The readings of a part: the slice at each rotation it can be read at, with the shift
+    // that makes the part of it (a product's operand shifted up by `k` of its constant's low
+    // zero bits, the rest of the constant a factor; any other part's slice `k` bits lower,
+    // shifted up).
+    let readings = |cx: &Context, p: &Part| -> Vec<(Slice, u32)> {
+        let w = u32::from(cx.width_of(p.node).bits());
+        let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let s = p.slice;
+        match p.factor {
+            Some(c) => (1..=c.trailing_zeros().min(w - 1))
+                .map(|k| {
+                    let up = Slice {
+                        rot: (s.rot + k) % w,
+                        mask: s.mask << k & ones,
+                        flip: s.flip << k & ones,
+                        ..s
+                    };
+                    (up, k)
+                })
+                .filter(|(up, _)| up.mask | up.flip != 0)
+                .collect(),
+            None => (0..=(s.mask | s.flip).trailing_zeros().min(w - 1))
+                .map(|k| {
+                    let down = Slice {
+                        rot: (s.rot + w - k) % w,
+                        mask: s.mask >> k,
+                        flip: s.flip >> k,
+                        ..s
+                    };
+                    (down, k)
+                })
+                .collect(),
+        }
+    };
+    // How many parts can be read at each rotation of each value.
+    let mut readers: std::collections::BTreeMap<(u32, u32), u32> =
+        std::collections::BTreeMap::new();
+    for p in &parts {
+        for (s, _) in readings(cx, p) {
+            *readers.entry((s.base, s.rot)).or_default() += 1;
         }
     }
-    if repl.is_empty() {
+    // A slice as a node over its rotation.
+    let over = |cx: &mut Context, s: &Slice| -> Result<u32, crate::Error> {
+        let w = cx.width_of(s.base).bits();
+        let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut v = match s.rot {
+            0 => s.base,
+            r => {
+                let k = cx.mk_const_u64(w, u64::from(r))?;
+                cx.c_bin(BinOp::RotL, s.base, k)?
+            }
+        };
+        if s.mask != ones {
+            let k = cx.mk_const_u64(w, s.mask)?;
+            v = cx.c_bin(BinOp::And, v, k)?;
+        }
+        if s.flip != 0 {
+            let k = cx.mk_const_u64(w, s.flip)?;
+            v = cx.c_bin(BinOp::Xor, v, k)?;
+        }
+        Ok(v)
+    };
+    let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+    // Whether some part is read through a shift or a rotation (else the fragment reads its
+    // values as they are, and there is nothing to relate).
+    let mut moved = false;
+    for p in &parts {
+        // The rotation the most parts read, the part's own first among equals.
+        let best = readings(cx, p)
+            .into_iter()
+            .map(|(s, k)| (readers.get(&(s.base, s.rot)).copied().unwrap_or(0), s, k))
+            .filter(|(votes, _, _)| *votes >= 2)
+            .min_by_key(|(votes, _, k)| (u32::MAX - votes, *k));
+        let Some((_, s, k)) = best else {
+            continue;
+        };
+        let w = cx.width_of(p.node).bits();
+        let x = over(cx, &s)?;
+        let v = match p.factor {
+            Some(c) => {
+                let rest = cx.mk_const_u64(w, c >> k)?;
+                cx.c_bin(BinOp::Mul, x, rest)?
+            }
+            None if k == 0 => x,
+            None => {
+                let by = cx.mk_const_u64(w, u64::from(k))?;
+                cx.c_bin(BinOp::Shl, x, by)?
+            }
+        };
+        moved |= s.rot != 0 || k != 0;
+        if v != p.node {
+            repl.insert(p.node, v);
+        }
+    }
+    if repl.is_empty() || !moved {
         return Ok(None);
     }
-    Ok(Some(cx.substitute_ids(&[n], &repl)?[0]))
+    let root = cx.substitute_ids(&[n], &repl)?[0];
+    Ok((root != n).then_some(root))
 }
 
 /// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
