@@ -159,11 +159,15 @@ fn proved(
     if undecided >= MAX_UNDECIDED + proofs {
         return Ok(Err(Fin::PROVISIONAL));
     }
-    count(r).proofs += 1;
+    // What a fresh context cannot hold (an extension operation: it has no registry) the
+    // prover is not asked about: not decided, under any budget.
     let mut scx = Context::new();
-    let both = scx
-        .import(cx, &[cx.handle(n), cx.handle(b)])
-        .map_err(Stop::Error)?;
+    let both = match scx.import(cx, &[cx.handle(n), cx.handle(b)]) {
+        Ok(both) => both,
+        Err(crate::Error::Unsupported(_)) => return Ok(Ok(false)),
+        Err(e) => return Err(Stop::Error(e)),
+    };
+    count(r).proofs += 1;
     let jw = Width::new(j).map_err(|e| Stop::Error(e.into()))?;
     let lhs = scx.extract(both[0], 0, jw).map_err(Stop::Error)?;
     let rhs = scx.extract(both[1], o, jw).map_err(Stop::Error)?;
