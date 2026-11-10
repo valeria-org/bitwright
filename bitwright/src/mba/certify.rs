@@ -3487,7 +3487,8 @@ impl Compose {
         let mut k = 0;
         while k < vm.slots.len() && defs.len() < 4 {
             if let Slot::Class(c) = vm.slots[k].0
-                && let Some(i) = (0..self.nodes.len() as u32)
+                // (a class is named by its first member: none comes before `c`)
+                && let Some(i) = (c..self.nodes.len() as u32)
                     .find(|&i| self.role[i as usize] == Role::Arith && self.find(i) == c)
                 && let Some(d) = self.linear_skeleton(i, vm)
             {
@@ -4852,11 +4853,12 @@ fn substitute_var(m: &MbaExpr, v: u32, by: &MbaExpr) -> Option<MbaExpr> {
     let mut out = MbaExpr::new(m.vars().to_vec());
     let mut map_by: Vec<u32> = Vec::with_capacity(by.nodes().len());
     for n in by.nodes() {
-        let args: Vec<u32> = n.args[..n.op.arity()]
-            .iter()
-            .map(|&a| map_by[a as usize])
-            .collect();
-        map_by.push(out.push(n.op, &args).ok()?);
+        let mut args = [0u32; 2];
+        let k = n.op.arity();
+        for (to, &a) in args.iter_mut().zip(&n.args[..k]) {
+            *to = map_by[a as usize];
+        }
+        map_by.push(out.push(n.op, &args[..k]).ok()?);
     }
     let by_root = *map_by.last()?;
     let mut map: Vec<u32> = vec![0; nodes.len()];
@@ -4868,11 +4870,12 @@ fn substitute_var(m: &MbaExpr, v: u32, by: &MbaExpr) -> Option<MbaExpr> {
         last = match n.op {
             MOp::Var(x) if x == v => by_root,
             op => {
-                let args: Vec<u32> = n.args[..op.arity()]
-                    .iter()
-                    .map(|&a| map[a as usize])
-                    .collect();
-                out.push(op, &args).ok()?
+                let mut args = [0u32; 2];
+                let k = op.arity();
+                for (to, &a) in args.iter_mut().zip(&n.args[..k]) {
+                    *to = map[a as usize];
+                }
+                out.push(op, &args[..k]).ok()?
             }
         };
         map[i] = last;
