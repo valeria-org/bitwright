@@ -105,8 +105,7 @@ impl core::hash::Hasher for TableHasher {
 }
 
 /// A table with [`TableHasher`].
-type HashMap<K, V> =
-    std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
+type HashMap<K, V> = std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
 
 /// Where each node of a hash-consed list is, by content: an open-addressed table of indices
 /// into the list. (A table keyed by the nodes themselves holds a copy of each, a hundred
@@ -1124,7 +1123,11 @@ thread_local! {
 /// The thread's lanes (new ones when it has none to give).
 fn take_lanes() -> Lanes<u64> {
     SCRATCH
-        .try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut s.lanes)).ok())
+        .try_with(|s| {
+            s.try_borrow_mut()
+                .map(|mut s| std::mem::take(&mut s.lanes))
+                .ok()
+        })
         .ok()
         .flatten()
         .unwrap_or_default()
@@ -1329,7 +1332,8 @@ fn constant_pool(ms: &[&MbaExpr]) -> Vec<BitVec> {
     const POOL: usize = 32;
     const STRETCH: usize = 16;
     let mut pool: Vec<BitVec> = Vec::with_capacity(POOL);
-    let mut held: HashMap<BitVec, ()> = HashMap::with_capacity_and_hasher(2 * POOL, Default::default());
+    let mut held: HashMap<BitVec, ()> =
+        HashMap::with_capacity_and_hasher(2 * POOL, Default::default());
     let mut rest: &mut [BitVec] = &mut consts;
     'fill: while !rest.is_empty() {
         let k = rest.len().min(STRETCH);
@@ -5036,7 +5040,12 @@ fn digests(prog: &Program, points: &[Vec<BitVec>], nodes: usize) -> Vec<Vec<u64>
             if n > 0 && nodes == prog.len() && (0..nodes).all(|i| prog.reg_of(i) == Some(i)) {
                 let nv = points.first().map_or(0, Vec::len);
                 let inputs: Vec<Vec<u64>> = (0..nv)
-                    .map(|v| points.iter().map(|p| <u64 as Lane>::from_bv(&p[v])).collect())
+                    .map(|v| {
+                        points
+                            .iter()
+                            .map(|p| <u64 as Lane>::from_bv(&p[v]))
+                            .collect()
+                    })
                     .collect();
                 let mut regs: Vec<Vec<u64>> = take_rows(nodes);
                 prog.run(&mut regs, &inputs, n);
