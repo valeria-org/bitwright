@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.0
 
 Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and
 tested for borrows, from a corpus of 58,530 windowed expressions of a devirtualizer's limb
