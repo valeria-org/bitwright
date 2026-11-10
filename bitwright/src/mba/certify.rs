@@ -1379,6 +1379,14 @@ fn next_word(state: &mut u64) -> u64 {
 /// some point); then points whose set bits lie at one position; then seeded random values.
 /// A filter that catches wrong answers early; never evidence.
 pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<Vec<BitVec>> {
+    let mut pts = fixed_points(vars, ms);
+    seeded_points(vars, seed, &mut pts);
+    pts
+}
+
+/// The first points of [`sample_points`], which do not depend on the seed: zero, all-ones, one
+/// and the signed minimum, the constants and their neighbours, the single positions.
+fn fixed_points(vars: &[Width], ms: &[&MbaExpr]) -> Vec<Vec<BitVec>> {
     let tt = tmp_t("sp.pool");
     let pool = constant_pool(ms);
     drop(tt);
@@ -1433,6 +1441,12 @@ pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<V
                 .collect(),
         );
     }
+    pts
+}
+
+/// The rest of [`sample_points`] after its [`fixed_points`]: seeded random values, up to
+/// [`SAMPLE_POINTS`] points in all.
+fn seeded_points(vars: &[Width], seed: u64, pts: &mut Vec<Vec<BitVec>>) {
     let mut state = seed;
     while pts.len() < SAMPLE_POINTS {
         pts.push(
@@ -1445,7 +1459,6 @@ pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<V
         );
     }
     pts.truncate(SAMPLE_POINTS);
-    pts
 }
 
 /// The first sample point where `a` and `b` differ, if any. `None` when they agree (or cannot
@@ -3005,21 +3018,43 @@ impl Compose {
         meter.charge(units)?;
         report.points += SAMPLE_POINTS as u64;
         drop(tt);
+        // The sample's first points do not depend on its seed, and the seed is a hash of the
+        // union of both sides, which costs more than evaluating the union at the sample. So
+        // the sides are compared at those points first: where they differ there, that point
+        // is the first of the whole sample where they do, and the refutation is the one the
+        // whole sample gives, without its seed or its other points.
+        let tq = std::time::Instant::now();
+        let (ra, rb) = (self.root_a as usize, self.root_b as usize);
+        let mut points = fixed_points(&self.vars, &[&all]);
+        let fixed = points.len();
+        let mut digests = digests(&prog, &points, self.nodes.len());
+        if let Some(p) = (0..fixed).find(|&p| digests[ra][p] != digests[rb][p]) {
+            // A real input where the sides differ.
+            tmp_time("C.sample", tq);
+            tmp_time("C.sample.fixed", tq);
+            report.verdict = Verdict::Refuted;
+            report.counterexample = Some(points[p].clone());
+            give_rows(&mut digests);
+            return Ok(());
+        }
         let tt = tmp_t("C.key");
         let seed = crate::hash::combine(all.key()[0], all.key()[1]);
         drop(tt);
-        let tq = std::time::Instant::now();
-        let points = sample_points(&self.vars, &[&all], seed);
-        tmp_time("C.sample.points", tq);
-        let tq2 = std::time::Instant::now();
-        let digests = digests(&prog, &points, self.nodes.len());
-        tmp_time("C.sample.digests", tq2);
+        seeded_points(&self.vars, seed, &mut points);
+        if points.len() > fixed {
+            // The other points' values, after the fixed points' in each row.
+            let mut rest = self::digests(&prog, &points[fixed..], self.nodes.len());
+            for (row, more) in digests.iter_mut().zip(&rest) {
+                row.extend_from_slice(more);
+            }
+            give_rows(&mut rest);
+        }
         tmp_time("C.sample", tq);
-        let (ra, rb) = (self.root_a as usize, self.root_b as usize);
-        if let Some(p) = (0..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
+        if let Some(p) = (fixed..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
             // A real input where the sides differ.
             report.verdict = Verdict::Refuted;
             report.counterexample = Some(points[p].clone());
+            give_rows(&mut digests);
             return Ok(());
         }
         let tt = tmp_t("C.keys");
