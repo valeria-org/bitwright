@@ -7,7 +7,13 @@
 //! - against a constant (`f(x) == c`): `x` is compared with the preimage `f⁻¹(c)`, through
 //!   every layer whose parameters are constants, and the comparison is a constant when `c` has
 //!   no preimage;
-//! - when neither of those decides it, truncations and slices (`extract<lo, k>(f(x))`) pushed
+//! - against a constant through an even multiplier (`x·c == k`, `x << t == k`): the low bits
+//!   of `x` are compared with the preimage of `k` without its low zeros, and the comparison is
+//!   a constant when `k` has none there;
+//! - some bits of a value against a constant (`(y | m) == k`, and `(y & c) == k` with `y` a
+//!   slice or a zero extension): the same bits of the value itself, `(x & c') == k'`, or the
+//!   slice of them where they are one run;
+//! - when none of those decides it, truncations and slices (`extract<lo, k>(f(x))`) pushed
 //!   into their operands and tried again at their own width, where a map that is no bijection at
 //!   the full width can be one of the bits read (`trunc<17>(2x² + x) == trunc<17>(2y² + y)` is
 //!   `trunc<17>(x) == trunc<17>(y)`): committed only when the result is a smaller tree;
@@ -92,11 +98,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 } else {
                     match solve(cx, &mut o, op, node.a, &c)? {
                         Some(e) => Some(e),
-                        None => match narrowed(cx, &mut o, node.a)? {
-                            Some(a) => solve(cx, &mut o, op, a, &c)?,
-                            None => None,
-                        }
-                        .filter(|&e| smaller(cx, e, n)),
+                        None => match halved(cx, &mut o, op, node.a, &c)? {
+                            Some(e) => Some(e),
+                            None => match masked(cx, &mut o, op, node.a, &c)? {
+                                Some(e) => Some(e),
+                                None => match narrowed(cx, &mut o, node.a)? {
+                                    Some(a) => solve(cx, &mut o, op, a, &c)?,
+                                    None => None,
+                                }
+                                .filter(|&e| smaller(cx, e, n)),
+                            },
+                        },
                     }
                 }
             }
@@ -146,6 +158,165 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             Ok(Step::Normal(fin))
         }
     }
+}
+
+/// `x·c op k` for an even constant `c = 2^t·d` (or `x << t op k`): the product's low `t`
+/// bits are zero, so the comparison is decided when `k`'s are not, and otherwise it is
+/// `trunc<w−t>(x)·d op k >> t` at `w − t` bits, where the odd `d` has an inverse:
+/// `trunc<w−t>(x) op (k >> t)·d⁻¹`. A dispatcher compares one state `x` with its cases through
+/// several such multipliers (`x·c₁ == k₁`, `x·c₂ == k₂`, …), and these are then comparisons of
+/// the same low bits of `x` with the same constants.
+fn halved(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    lhs: u32,
+    k: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let node = cx.node(lhs);
+    let w = node.width;
+    let zeros = |v: &BitVec| (0..w).take_while(|&i| v.bit(i) == Some(false)).count() as u16;
+    let (x, t, odd) = match node.op {
+        OpCode::Mul => {
+            let (x, c) = match (cx.const_val(node.a), cx.const_val(node.b)) {
+                (None, Some(c)) => (node.a, c),
+                (Some(c), None) => (node.b, c),
+                _ => return Ok(None),
+            };
+            (x, zeros(&c), Some(c))
+        }
+        OpCode::Shl => match cx.const_val(node.b).and_then(|c| c.to_u64()) {
+            Some(t) if t < u64::from(w) => (node.a, t as u16, None),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if t == 0 || t >= w {
+        return Ok(None);
+    }
+    o.r.meter.charge(Counter::PassWork, 1)?;
+    if zeros(k) < t {
+        return Ok(Some(truth(o, cx, op == CmpOp::Ne)?));
+    }
+    let m = w - t;
+    let width = crate::Width::new(m).map_err(|e| Stop::Error(e.into()))?;
+    let slice = |v: &BitVec| v.extract(t, width).map_err(|e| Stop::Error(e.into()));
+    let k = slice(k)?;
+    let odd = match odd {
+        Some(c) => Some(slice(&c)?),
+        None => None,
+    };
+    let narrow = o.r.build(cx, |cx| {
+        let low = cx.c_extract(x, 0, m)?;
+        match odd {
+            Some(d) if d != BitVec::one(width) => {
+                let d = cx.mk_const(&d)?;
+                cx.c_bin(BinOp::Mul, low, d)
+            }
+            _ => Ok(low),
+        }
+    })?;
+    Ok(Some(match solve(cx, o, op, narrow, &k)? {
+        Some(e) => e,
+        None => compare(o, cx, op, narrow, &k)?,
+    }))
+}
+
+/// `(y | m) op k` and `(y & c) op k` as a comparison of bits of the value `y` is a slice or
+/// a zero extension of: `(y | m) == k` reads the bits of `y` outside `m` (and is false when
+/// `k` lacks a bit of `m`), and bits of `extract<lo, n>(x)` are bits of `x`, so both are
+/// `(x & c') op k'` over the value itself (`extract<lo', n'>(x) op k'` where the bits are one
+/// run). One state read through slices of several widths (`extract<22, 29>(x) | m₁ == k₁`,
+/// `extract<22, 27>(x) | m₂ == k₂`) is then compared once. `None` when the comparison is that
+/// already.
+fn masked(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    lhs: u32,
+    k: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let node = cx.node(lhs);
+    let constant = |a: u32, b: u32| match (cx.const_val(a), cx.const_val(b)) {
+        (None, Some(c)) => Some((a, c)),
+        (Some(c), None) => Some((b, c)),
+        _ => None,
+    };
+    let and = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::And, a, b);
+    let not = |a: &BitVec| BitVec::un_unchecked(crate::ops::UnOp::Not, a);
+    // The value, the bits of it compared, and what they are compared with.
+    let (mut y, mut c, mut k, mut changed) = match node.op {
+        OpCode::Or => {
+            let Some((y, m)) = constant(node.a, node.b) else {
+                return Ok(None);
+            };
+            if and(k, &m) != m {
+                return Ok(Some(truth(o, cx, op == CmpOp::Ne)?));
+            }
+            (y, not(&m), and(k, &not(&m)), true)
+        }
+        OpCode::And => {
+            let Some((y, c)) = constant(node.a, node.b) else {
+                return Ok(None);
+            };
+            if !and(k, &not(&c)).is_zero() {
+                return Ok(Some(truth(o, cx, op == CmpOp::Ne)?));
+            }
+            (y, c, *k, false)
+        }
+        _ => return Ok(None),
+    };
+    o.r.meter.charge(Counter::PassWork, 1)?;
+    loop {
+        let n = cx.node(y);
+        match n.op {
+            OpCode::Extract => {
+                let wide = cx.width_of(n.a);
+                let at = BitVec::wrapping_from_u64(wide, u64::from(n.b));
+                let up = |v: &BitVec| -> Result<BitVec, Stop> {
+                    let z = v.zext(wide).map_err(|e| Stop::Error(e.into()))?;
+                    Ok(BitVec::bin_unchecked(BinOp::Shl, &z, &at))
+                };
+                (c, k) = (up(&c)?, up(&k)?);
+                y = n.a;
+            }
+            OpCode::Zext => {
+                let narrow = cx.width_of(n.a);
+                let low = |v: &BitVec| v.trunc(narrow).map_err(|e| Stop::Error(e.into()));
+                // The extension's high bits are zero.
+                let back = low(&k)?
+                    .zext(k.width())
+                    .map_err(|e| Stop::Error(e.into()))?;
+                if back != k {
+                    return Ok(Some(truth(o, cx, op == CmpOp::Ne)?));
+                }
+                (c, k) = (low(&c)?, low(&k)?);
+                y = n.a;
+            }
+            _ => break,
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    // One run of bits is a slice (the form a comparison of a field has); other bits are
+    // read under their mask.
+    let w = c.width().bits();
+    let set = |i: u16| c.bit(i) == Some(true);
+    let lo = (0..w).take_while(|&i| !set(i)).count() as u16;
+    let len = (lo..w).take_while(|&i| set(i)).count() as u16;
+    if len > 0 && (lo + len..w).all(|i| !set(i)) {
+        let width = crate::Width::new(len).map_err(|e| Stop::Error(e.into()))?;
+        let k = k.extract(lo, width).map_err(|e| Stop::Error(e.into()))?;
+        let field = o.r.build(cx, |cx| cx.c_extract(y, lo, len))?;
+        return Ok(Some(compare(o, cx, op, field, &k)?));
+    }
+    let bits = o.r.build(cx, |cx| {
+        let c = cx.mk_const(&c)?;
+        cx.c_bin(BinOp::And, y, c)
+    })?;
+    Ok(Some(compare(o, cx, op, bits, &k)?))
 }
 
 /// A truncation or slice `extract<lo, k>(x)` pushed into `x` (see `casts`), when that is
