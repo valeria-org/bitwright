@@ -3,6 +3,8 @@
 
 pub(crate) mod bitwise;
 #[cfg(feature = "prove")]
+mod borrows;
+#[cfg(feature = "prove")]
 pub(super) mod carries;
 mod cases;
 pub(super) mod casts;
@@ -24,6 +26,8 @@ mod poly;
 pub(crate) mod predicate;
 pub(super) mod residue;
 pub(super) mod shuffle;
+#[cfg(feature = "prove")]
+mod slices;
 #[cfg(test)]
 mod tests;
 pub(super) mod xor;
@@ -1102,17 +1106,34 @@ pub(super) fn shrinks(
     e: u32,
     atoms: &[u32],
 ) -> Result<Result<(), Fin>, Stop> {
-    pays(r, cx, n, e, atoms, false)
+    pays(r, cx, n, e, atoms, 0)
 }
 
-/// [`shrinks`], or with `tie` whether replacing `n` by `e` leaves the DAG no larger.
+/// Whether replacing `n` by `e` leaves the DAG no larger and makes `n` a strictly smaller tree:
+/// for a candidate nothing rewrites back, where rewrites that each only tie, because they share
+/// what they would free, together make the DAG smaller (two comparisons narrowed from the same
+/// wide operand). Each such step still decreases (DAG size, tree size), so they terminate.
+pub(super) fn ties_smaller(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Result<(), Fin>, Stop> {
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    let tie = tree(n) != u32::MAX && tree(e) < tree(n);
+    pays(r, cx, n, e, atoms, u32::from(tie))
+}
+
+/// Whether replacing `n` by `e` frees more nodes than it needs less `slack`: [`shrinks`]
+/// without any, with 1 also where the DAG stays the same size, with 2 where it grows by one.
 fn pays(
     r: &mut Runner<'_, '_>,
     cx: &Context,
     n: u32,
     e: u32,
     atoms: &[u32],
-    tie: bool,
+    slack: u32,
 ) -> Result<Result<(), Fin>, Stop> {
     if cx.node(e).op == OpCode::Const && cx.node(n).op != OpCode::Const {
         return Ok(Ok(()));
@@ -1122,7 +1143,7 @@ fn pays(
     let Some(new) = needed(r, cx, e)? else {
         return Ok(Err(Fin::FINAL));
     };
-    let gain = |freed: u32| new < freed || (tie && new == freed);
+    let gain = |freed: u32| new < freed.saturating_add(slack);
     if alone(r) {
         let freed = dying_in(r, cx, n, true, new.saturating_add(1), false)?;
         if gain(freed) {
@@ -1176,16 +1197,36 @@ pub(super) fn finish_with(
     fin: Fin,
     tie: bool,
 ) -> Result<Step, Stop> {
+    finish_within(r, cx, kind, n, e, before, atoms, fin, u32::from(tie))
+}
+
+/// [`finish`], committing a candidate that needs fewer nodes than replacing `n` frees plus
+/// `slack` (see [`pays`]). With 2 the DAG may grow by one node: only for a form no pass reads
+/// again as what it was and that the other readers of what it leaves behind are rewritten to
+/// as well (a limb as the slice of its word: the limb's arithmetic dies with its last
+/// reader), so the growth is at most one node a rewrite and none in the end.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn finish_within(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+    e: u32,
+    before: u32,
+    atoms: &[u32],
+    fin: Fin,
+    slack: u32,
+) -> Result<Step, Stop> {
     let name = kind.name();
     if e == n {
         r.explain = None;
         r.stats.passes.entry(name).or_default().noop += 1;
         return Ok(Step::Normal(fin));
     }
-    let pays = if tie {
-        pays(r, cx, n, e, atoms, true)?
-    } else {
+    let pays = if slack == 0 {
         shrinks(r, cx, n, e, atoms)?
+    } else {
+        pays(r, cx, n, e, atoms, slack)?
     };
     if let Err(more) = pays {
         // A rejection that only sharing caused is not final (see `shrinks`).

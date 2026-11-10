@@ -2,14 +2,15 @@
 //!
 //! For a node of at most [`MAX_WIDTH`] bits, every output bit is traced to a constant or to one
 //! bit of a *source* (an atom): through `&` with a constant, `|`, `^` and `+` of pieces whose
-//! traced bits do not overlap (so no carry and no cancellation can occur), shifts and rotations
-//! by constants, zero and sign extension, `extract`, `concat` and `bswap`. When every bit is
-//! traced, the node is re-emitted as the source itself, a rotation, a byte swap, one source in
+//! traced bits do not overlap (so no carry and no cancellation can occur), `a + a` (a shift by
+//! one, as the linear pass writes it), shifts and rotations by constants, zero and sign
+//! extension, `extract`, `concat` and `bswap`. When every bit is traced, the node is
+//! re-emitted as the source itself, a rotation, a byte swap, one source in
 //! place with constant bits (`(s & ~zeros) | ones`), or a `concat` of slices and constant runs,
 //! and replaced when that is smaller. Limb recompositions, shifted-and-masked byte shuffles and
 //! identity round trips collapse this way.
 
-use super::{Fin, PassKind, Runner, Step, Stop, finish};
+use super::{Fin, PassKind, Runner, Step, Stop};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -114,6 +115,14 @@ fn trace(cx: &Context, bits: &crate::hash::IdMap<u32, Bits>, i: u32) -> Bits {
             x.iter()
                 .zip(&m)
                 .map(|(p, k)| if *k == Prov::One { *p } else { Prov::Zero })
+                .collect()
+        }
+        // `a + a` is `a << 1` (the linear pass writes it so).
+        OpCode::Add if n.a == n.b => {
+            let a = get(n.a);
+            core::iter::once(Prov::Zero)
+                .chain(a.iter().copied())
+                .take(w as usize)
                 .collect()
         }
         OpCode::Or | OpCode::Xor | OpCode::Add => {
@@ -394,5 +403,34 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             })
             .collect(),
     });
-    finish(r, cx, PassKind::Shuffle, n, e, before, &atoms, Fin::FINAL)
+    let tie = node.op == OpCode::And && zext_slice(cx, e) && {
+        let tree = |i: u32| cx.meta[i as usize].tree;
+        tree(e) < tree(n)
+    };
+    super::finish_with(
+        r,
+        cx,
+        PassKind::Shuffle,
+        n,
+        e,
+        before,
+        &atoms,
+        Fin::FINAL,
+        tie,
+    )
+}
+
+/// Whether `e` is `zext<N>(extract<lo, k>(x))` with `x` not `N` bits wide: a mask keeping the
+/// low bits of a slice, as the narrower slice zero-extended. Nothing rewrites that back (the
+/// rule `zext_trunc` reads only a truncation of a value of the extension's own width), so the
+/// pass commits it on a tie as well, when it is a smaller tree: masks sharing their constant
+/// would otherwise each wait for the other to free it, as in the digit product
+/// `(trunc<13>(x) & 127) * (extract<7, 13>(y) & 127)`.
+fn zext_slice(cx: &Context, e: u32) -> bool {
+    let z = cx.node(e);
+    if z.op != OpCode::Zext {
+        return false;
+    }
+    let s = cx.node(z.a);
+    s.op == OpCode::Extract && cx.wid(s.a) != z.width
 }

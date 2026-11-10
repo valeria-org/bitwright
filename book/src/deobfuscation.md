@@ -15,7 +15,10 @@ for these (hash comparisons through invertible mixers are handled by the standar
   become `x + y`, `x - y` or whatever affine form they compute: the pass reads the form off
   the network's values, checks it at a fixed set of points, and commits it only when
   bitwright's own prover proves it equal within the pass's caps (feature `prove`, on by
-  default; shifts of one atom, `2^k·a`, need no proof).
+  default; shifts of one atom, `2^k·a`, need no proof). Arithmetic done in limbs, the carry
+  between them written as a comparison of the low ones, is read too: the high digits and the
+  carry are the high digit of the sum, and a limb that is a slice of a word computed below it
+  becomes that slice, when proved.
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature
   and emits the cheapest equivalent form it knows, if that is smaller.
