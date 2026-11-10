@@ -150,8 +150,8 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 7,947 nodes together
-(19,164) and the five `simplify` roots at 720 (1,186), all 16 `valid_under` questions are
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,887 nodes together
+(19,164) and the five `simplify` roots at 718 (1,186), all 16 `valid_under` questions are
 proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
 13, four out of budget). The questions also take less time than before these changes: 18%
 less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
@@ -277,6 +277,11 @@ less CPU over the set run back to back, none of them a quarter of a second, the 
   parity flag is spelled a bit at a time, `(b >>u 1 & 1) + (b & 1) + …` over a byte `b`, and
   its low bit was a sum of eight slices at one bit: it is `trunc<1>(popcnt(trunc<8>(x)))`,
   and the condition of every select in 41 of the 44 `forms_simplify` questions.
+- **Two complements around a slice are none.** `~extract<k, n>(~x)` is `extract<k, n>(x)`
+  (`not_extract_not`, `not_trunc_not`), and a select on a bit of a complement is the select
+  on the bit with its sides swapped (`select_bit_of_not`, `select_low_bit_of_not`). (Moving
+  every complement out of a slice instead left the sweep 3,400 nodes short on the same
+  questions: its candidates are truncations.)
 - **A select under the opposite comparison keeps one side.** `select(a != b, x, select(a == b,
   y, z))` is `select(a != b, x, y)`, and likewise in the chosen arm and under `==`
   (`select_then_ne_eq`, `select_else_ne_eq`, `select_then_eq_ne`, `select_else_eq_ne`); only

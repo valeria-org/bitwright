@@ -443,6 +443,20 @@ group core.casts {
     /// A sign extension of a value whose sign bit is clear is its zero extension.
     #[example("sext<16>(p & 127)" => "zext<16>(p & 127)")]
     rule sext_nonnegative<W, U>(x: W) where W < U { sext<U>(x) => zext<U>(x) if zero_bits(x, smin_lit) }
+    /// The complement of a slice of a complement is the slice.
+    #[example("~extract<3, 2>(~p)" => "extract<3, 2>(p)")]
+    rule not_extract_not<W, K, N>(x: W) where 0 < K, K + N <= W { ~extract<K, N>(~x) => extract<K, N>(x) }
+    #[example("~trunc<4>(~p)" => "trunc<4>(p)")]
+    rule not_trunc_not<W, N>(x: W) where N < W { ~trunc<N>(~x) => trunc<N>(x) }
+    /// A select on a bit of a complement is the select on the bit, its sides swapped.
+    #[example("select(extract<3, 1>(~p), q, r)" => "select(extract<3, 1>(p), r, q)")]
+    rule select_bit_of_not<W, K, U>(x: W, a: U, b: U) where 0 < K, K < W {
+        select(extract<K, 1>(~x), a, b) => select(extract<K, 1>(x), b, a)
+    }
+    #[example("select(trunc<1>(~p), q, r)" => "select(trunc<1>(p), r, q)")]
+    rule select_low_bit_of_not<W, U>(x: W, a: U, b: U) where 1 < W {
+        select(trunc<1>(~x), a, b) => select(trunc<1>(x), b, a)
+    }
     /// Through a truncation that drops only bits known zero, an equality with a constant is one
     /// of the whole value.
     #[example("trunc<4>(p & 15) == 3:4" => "(p & 15) == 3")]

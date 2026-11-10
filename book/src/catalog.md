@@ -1023,6 +1023,46 @@ rule sext_nonnegative<W, U>(x: W) where W < U { sext<U>(x) => zext<U>(x) if zero
 
 - `sext<16>(p & 127)` → `zext<16>(p & 127)`
 
+#### `not_extract_not` — rule
+
+The complement of a slice of a complement is the slice.
+
+```text
+rule not_extract_not<W, K, N>(x: W) where 0 < K, K + N <= W { ~extract<K, N>(~x) => extract<K, N>(x) }
+```
+
+- `~extract<3, 2>(~p)` → `extract<3, 2>(p)`
+
+#### `not_trunc_not` — rule
+
+```text
+rule not_trunc_not<W, N>(x: W) where N < W { ~trunc<N>(~x) => trunc<N>(x) }
+```
+
+- `~trunc<4>(~p)` → `trunc<4>(p)`
+
+#### `select_bit_of_not` — rule
+
+A select on a bit of a complement is the select on the bit, its sides swapped.
+
+```text
+rule select_bit_of_not<W, K, U>(x: W, a: U, b: U) where 0 < K, K < W {
+        select(extract<K, 1>(~x), a, b) => select(extract<K, 1>(x), b, a)
+    }
+```
+
+- `select(extract<3, 1>(~p), q, r)` → `select(extract<3, 1>(p), r, q)`
+
+#### `select_low_bit_of_not` — rule
+
+```text
+rule select_low_bit_of_not<W, U>(x: W, a: U, b: U) where 1 < W {
+        select(trunc<1>(~x), a, b) => select(trunc<1>(x), b, a)
+    }
+```
+
+- `select(trunc<1>(~p), q, r)` → `select(trunc<1>(p), r, q)`
+
 #### `trunc_eq_const` — rule
 
 Through a truncation that drops only bits known zero, an equality with a constant is one
