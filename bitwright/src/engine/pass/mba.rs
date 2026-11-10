@@ -1724,19 +1724,83 @@ fn sweep_cut_at(
         return Ok(None);
     }
     let size = m.nodes().len();
+    // A block that contains one the solver was asked about with the same node cut off, and
+    // ran out of its steps on (or does not take), is not asked about: the inner block is
+    // part of this question as it was asked, and the solver has no more steps for the whole
+    // than it had for the part. The sweep meets a tower of blocks operands first, each a
+    // top of its own chain of sums, and each fragment holds the ones below it whole: a
+    // tower of `k` blocks the solver cannot take was `k` questions of growing size. (Of
+    // 3,404 questions in 140 slow questions, 1,066 held a block declined at the same cut:
+    // asked all the same, none of those was answered; 333 of the others were.)
+    let over = over_declined(r, cx, n, c, &bindings.atoms);
+    if over && !tmp_off("BW_NO_CUT_OVER") {
+        tmp_time("sc.at=over", t0);
+        r.cut_declined.entry(c).or_default().insert(n, ());
+        return Ok(None);
+    }
     let t0 = std::time::Instant::now();
     if tmp_off("BW_PROF_CUT") {
         eprintln!("CUTAT n={n} c={c} atoms={:?}", bindings.atoms);
     }
     let answer = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)?;
     tmp_time("sc.at.answer", t0);
+    if over {
+        // (temporary) With `BW_NO_CUT_OVER`: what the questions not asked would have got.
+        tmp_time(
+            if matches!(answer, Cut::Proved(_)) {
+                "sc.over=answered"
+            } else {
+                "sc.over=not"
+            },
+            t0,
+        );
+    }
     if tmp_off("BW_PROF_CUT") {
-        eprintln!("CUTRES n={n} c={c} some={}", answer.is_some());
+        eprintln!(
+            "CUTRES n={n} c={c} some={}",
+            matches!(answer, Cut::Proved(_))
+        );
     }
-    if let Some(expr) = answer {
-        return Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?));
+    match answer {
+        Cut::Proved(expr) => Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?)),
+        Cut::Declined => {
+            r.cut_declined.entry(c).or_default().insert(n, ());
+            Ok(None)
+        }
+        Cut::Open => Ok(None),
     }
-    Ok(None)
+}
+
+/// Whether the block `n` with `c` cut off (the atoms of its lowering are `atoms`) is, or
+/// holds, a block the solver declined in this call with `c` cut off (`Runner::cut_declined`).
+/// A declined block's root is above its cut, so it is found only inside the fragment: not
+/// below the cut, nor below an atom.
+fn over_declined(r: &Runner<'_, '_>, cx: &Context, n: u32, c: u32, atoms: &[u32]) -> bool {
+    let Some(declined) = r.cut_declined.get(&c) else {
+        return false;
+    };
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        if i == c || atoms.contains(&i) || seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if declined.contains_key(&i) {
+            return true;
+        }
+        stack.extend(cx.node(i).children());
+    }
+    false
+}
+
+/// What [`cut_answer`] has of a noise block.
+enum Cut {
+    /// A smaller equivalent, proved.
+    Proved(MbaExpr),
+    /// The solver did not answer: it ran out of its steps, or does not take the block.
+    Declined,
+    /// An answer that is no smaller or not proved, or no steps left to ask with.
+    Open,
 }
 
 /// `m` with variable `v` replaced by zero.
@@ -1767,10 +1831,10 @@ fn cut_answer(
     size: usize,
     cfg: &MbaConfig,
     steps: u64,
-) -> Result<Option<MbaExpr>, Stop> {
+) -> Result<Cut, Stop> {
     let limit = steps.min(r.meter.left_in(|b| b.mba_steps));
     if limit == 0 {
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     let budget = cfg.budget.with_evidence(false).with_steps(limit);
     let t0 = std::time::Instant::now();
@@ -1796,20 +1860,27 @@ fn cut_answer(
         );
     }
     r.meter.charge(Counter::MbaSteps, spent)?;
-    let MbaAnswer::Simplified { expr, .. } = answer else {
-        tmp_time("ca=declined", t0);
-        tmp_prof("ca=declined", spent);
-        return Ok(None);
+    let expr = match answer {
+        MbaAnswer::Simplified { expr, .. } => expr,
+        MbaAnswer::Exhausted | MbaAnswer::Unsupported(_) => {
+            tmp_time("ca=declined", t0);
+            tmp_prof("ca=declined", spent);
+            return Ok(Cut::Declined);
+        }
+        MbaAnswer::NoSimpler => {
+            tmp_time("ca=nosimpler", t0);
+            return Ok(Cut::Open);
+        }
     };
     if expr.vars() != m.vars() || expr.width() != m.width() || expr.nodes().len() >= size {
         tmp_time("ca=notsmaller", t0);
         tmp_prof("ca=notsmaller", spent);
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     let t0 = std::time::Instant::now();
     if !sampled(r, m, &expr, m.key()[0])? {
         tmp_time("ca=sample.refuted", t0);
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     let s0 = r.meter.spent.mba_steps;
     let report = certify::prove(m, &expr, &mut Steps::new(r, SWEEP_SHARE))?;
@@ -1831,10 +1902,10 @@ fn cut_answer(
         r.meter.spent.mba_steps - s0,
     );
     if report.verdict != Verdict::Proved {
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     count(r).noise_blocks += 1;
-    Ok(Some(expr))
+    Ok(Cut::Proved(expr))
 }
 
 /// the sweep's readings of `subject` asked whether it is `k`: whether one proves it

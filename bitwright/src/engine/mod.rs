@@ -1332,6 +1332,11 @@ struct Runner<'r, 'a> {
     /// its samples showed (see `pass::mba::Witness`).
     #[cfg(feature = "mba")]
     witnesses: Vec<pass::mba::Witness>,
+    /// The blocks the opaque-constant sweep asked the solver about in this call with a node
+    /// cut off and got no answer to within its steps: the blocks' roots, by the cut (see
+    /// `pass::mba::sweep_cut_at`).
+    #[cfg(feature = "mba")]
+    cut_declined: IdMap<u32, IdMap<u32, ()>>,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2430,6 +2435,8 @@ impl Engine {
             swept: IdMap::default(),
             #[cfg(feature = "mba")]
             witnesses: Vec::new(),
+            #[cfg(feature = "mba")]
+            cut_declined: IdMap::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
