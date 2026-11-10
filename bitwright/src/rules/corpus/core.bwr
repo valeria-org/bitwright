@@ -1006,9 +1006,29 @@ group core.factor {
     /// Likewise over `^`.
     #[example("rotl(p, 3) ^ rotl(q, 3)" => "rotl(p ^ q, 3)")]
     rule rotl_xor<W>(x: W, y: W, s: W) { rotl(x, s) ^ rotl(y, s) => rotl(x ^ y, s) }
-    /// A rotation commutes with complement.
-    #[example("~rotl(~p, 3)" => "rotl(p, 3)")]
-    rule not_rotl_not<W>(x: W, s: W) { ~rotl(~x, s) => rotl(x, s) }
+    /// A rotation commutes with complement, which is kept outside it: a sum or a mask over
+    /// the rotated value reads it there, and two complements meet.
+    #[example("rotl(~p, 3)" => "~rotl(p, 3)")]
+    rule rotl_not<W>(x: W, s: W) { rotl(~x, s) => ~rotl(x, s) }
+    /// Likewise for a right rotation.
+    #[example("rotr(~p, q)" => "~rotr(p, q)")]
+    rule rotr_not<W>(x: W, s: W) { rotr(~x, s) => ~rotr(x, s) }
+    /// A constant under a rotation by a constant is rotated once and for all, so two
+    /// rotations around it are one.
+    #[example("rotl(p ^ 0x0f, 4)" => "rotl(p, 4) ^ 0xf0")]
+    rule rotl_xor_const<W>(x: W, c: const W, s: const W) {
+        rotl(x ^ c, s) => rotl(x, s) ^ rotl(c, s)
+    }
+    /// Likewise under `&`.
+    #[example("rotl(p & 0x0f, 4)" => "rotl(p, 4) & 0xf0")]
+    rule rotl_and_const<W>(x: W, c: const W, s: const W) {
+        rotl(x & c, s) => rotl(x, s) & rotl(c, s)
+    }
+    /// Likewise under `|`.
+    #[example("rotl(p | 0x0f, 4)" => "rotl(p, 4) | 0xf0")]
+    rule rotl_or_const<W>(x: W, c: const W, s: const W) {
+        rotl(x | c, s) => rotl(x, s) | rotl(c, s)
+    }
     /// Zero extension distributes over `&`.
     #[example("zext<16>(p) & zext<16>(q)" => "zext<16>(p & q)")]
     rule zext_and<W, U>(x: W, y: W) where W < U { zext<U>(x) & zext<U>(y) => zext<U>(x & y) }

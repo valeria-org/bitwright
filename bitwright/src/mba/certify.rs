@@ -499,6 +499,7 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         let a = n.args[0] as usize;
         let b = n.args[1] as usize;
         let narrow_var = matches!(nodes[a].op, MOp::Var(_)) && nodes[a].width < w;
+        let wide_var = matches!(nodes[a].op, MOp::Var(_)) && nodes[a].width > w;
         match n.op {
             MOp::Var(v) => {
                 local[i] = true;
@@ -509,6 +510,13 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 if let Some(u) = used.get_mut(v as usize) {
                     *u = true;
                 }
+            }
+            // Likewise the low bits of a variable wider than the question (as `decast` writes
+            // one under a truncation): a variable of the question's width.
+            MOp::Trunc if wide_var => {
+                local[i] = true;
+                deg[i] = 1;
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::Zext if narrow_var => {
                 local[i] = true;

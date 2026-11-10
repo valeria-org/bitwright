@@ -2407,15 +2407,63 @@ rule rotl_xor<W>(x: W, y: W, s: W) { rotl(x, s) ^ rotl(y, s) => rotl(x ^ y, s) }
 
 - `rotl(p, 3) ^ rotl(q, 3)` → `rotl(p ^ q, 3)`
 
-#### `not_rotl_not` — rule
+#### `rotl_not` — rule
 
-A rotation commutes with complement.
+A rotation commutes with complement, which is kept outside it: a sum or a mask over
+the rotated value reads it there, and two complements meet.
 
 ```text
-rule not_rotl_not<W>(x: W, s: W) { ~rotl(~x, s) => rotl(x, s) }
+rule rotl_not<W>(x: W, s: W) { rotl(~x, s) => ~rotl(x, s) }
 ```
 
-- `~rotl(~p, 3)` → `rotl(p, 3)`
+- `rotl(~p, 3)` → `~rotl(p, 3)`
+
+#### `rotr_not` — rule
+
+Likewise for a right rotation.
+
+```text
+rule rotr_not<W>(x: W, s: W) { rotr(~x, s) => ~rotr(x, s) }
+```
+
+- `rotr(~p, q)` → `~rotr(p, q)`
+
+#### `rotl_xor_const` — rule
+
+A constant under a rotation by a constant is rotated once and for all, so two
+rotations around it are one.
+
+```text
+rule rotl_xor_const<W>(x: W, c: const W, s: const W) {
+        rotl(x ^ c, s) => rotl(x, s) ^ rotl(c, s)
+    }
+```
+
+- `rotl(p ^ 0x0f, 4)` → `rotl(p, 4) ^ 0xf0`
+
+#### `rotl_and_const` — rule
+
+Likewise under `&`.
+
+```text
+rule rotl_and_const<W>(x: W, c: const W, s: const W) {
+        rotl(x & c, s) => rotl(x, s) & rotl(c, s)
+    }
+```
+
+- `rotl(p & 0x0f, 4)` → `rotl(p, 4) & 0xf0`
+
+#### `rotl_or_const` — rule
+
+Likewise under `|`.
+
+```text
+rule rotl_or_const<W>(x: W, c: const W, s: const W) {
+        rotl(x | c, s) => rotl(x, s) | rotl(c, s)
+    }
+```
+
+- `rotl(p | 0x0f, 4)` → `rotl(p, 4) | 0xf0`
 
 #### `zext_and` — rule
 
