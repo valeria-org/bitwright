@@ -150,8 +150,8 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 8,512 nodes together
-(19,164) and the five `simplify` roots at 733 (1,186), all 16 `valid_under` questions are
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,947 nodes together
+(19,164) and the five `simplify` roots at 720 (1,186), all 16 `valid_under` questions are
 proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
 13, four out of budget). The questions also take less time than before these changes: 18%
 less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
@@ -270,6 +270,13 @@ less CPU over the set run back to back, none of them a quarter of a second, the 
   multipliers and several widths; with this and the entry above, a measured one of 265 nodes
   whose seven-way tables each spelled their conditions differently is 199 nodes over the
   same eight conditions on three bits of one value.
+- **Bits of one value added up are a population count.** A sum whose terms each count bits
+  of one value with one coefficient (`extract<i, 1>(x)` extended, `x & 1`, `(x >>u i) & 1`,
+  the top bit shifted down, a `popcnt` of a field of `x`) is `c·popcnt(x & m)`, the bits a
+  slice of `x` where they are one run; three bits or more, no bit twice. The operand of a
+  parity flag is spelled a bit at a time, `(b >>u 1 & 1) + (b & 1) + …` over a byte `b`, and
+  its low bit was a sum of eight slices at one bit: it is `trunc<1>(popcnt(trunc<8>(x)))`,
+  and the condition of every select in 41 of the 44 `forms_simplify` questions.
 - **A select under the opposite comparison keeps one side.** `select(a != b, x, select(a == b,
   y, z))` is `select(a != b, x, y)`, and likewise in the chosen arm and under `==`
   (`select_then_ne_eq`, `select_else_ne_eq`, `select_then_eq_ne`, `select_else_eq_ne`); only

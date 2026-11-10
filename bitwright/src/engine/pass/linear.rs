@@ -20,8 +20,9 @@
 //! coefficients first, power-of-two coefficients as shifts, the constant last), and the
 //! emission replaces the node only when the region above the atoms gets strictly smaller.
 //!
-//! Around the forms: a sum of products with a common factor is factored ([`factor_sum`]), and
-//! a product of three or more values is written with its factors in the context's order
+//! Around the forms: a sum of products with a common factor is factored ([`factor_sum`]),
+//! terms that count bits of one value are one population count ([`bit_count`]), and a
+//! product of three or more values is written with its factors in the context's order
 //! ([`sort_chain`](super::sort_chain)), so two writings of one product are one atom.
 
 use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, within, worth_building};
@@ -943,6 +944,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             None => Ok(Step::Normal(form.fin.and(sorted))),
         };
     }
+    // Bits of one value counted, first (see `bit_count`).
+    if let Some(step @ Step::To(..)) = bit_count(r, cx, n, &form)? {
+        return Ok(step);
+    }
     // Terms reading one condition, merged first (see `conditions`).
     let merged = match super::conditions::step(r, cx, n, &form)? {
         Ok(s) => return Ok(s),
@@ -952,6 +957,166 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         Step::Normal(f) => Step::Normal(f.and(merged)),
         s => s,
     })
+}
+
+/// The fewest bits of one value [`bit_count`] writes as a population count.
+const COUNTED_BITS: u32 = 3;
+
+/// The term `t` as a count of bits of a value, at `t`'s width: the value and the bits (among
+/// its low 128). One bit (`extract<i, 1>(y)` extended, `y & 1`, `(y >>u i) & 1`, the top bit
+/// shifted down) or a population count of a field (`popcnt(y & m)`, extended or truncated);
+/// a bit of a slice or of a zero extension is a bit of its operand.
+fn counted(cx: &Context, t: u32) -> Option<(u32, u128)> {
+    let n = cx.node(t);
+    let w = u32::from(n.width);
+    let shift = |i: u32| cx.const_val(i).and_then(|k| k.to_u64());
+    let masked = |a: u32, b: u32| match (cx.const_val(a), cx.const_val(b)) {
+        (None, Some(k)) => Some((a, k.to_u128()?)),
+        (Some(k), None) => Some((b, k.to_u128()?)),
+        _ => None,
+    };
+    // A count of the bits `m` of `y`, before `y` is traced to the value it reads.
+    let bit = |i: u32| (i < 128).then(|| 1u128 << i);
+    let (mut y, mut m): (u32, u128) = match n.op {
+        OpCode::Extract if w == 1 => (n.a, bit(n.b)?),
+        OpCode::Extract | OpCode::Zext | OpCode::Popcnt => {
+            // A population count through a cast, or a bit extended.
+            let inner = match n.op {
+                OpCode::Popcnt => t,
+                OpCode::Extract if n.b != 0 => return None,
+                _ => n.a,
+            };
+            let e = cx.node(inner);
+            match e.op {
+                OpCode::Extract if e.width == 1 && n.op == OpCode::Zext => (e.a, bit(e.b)?),
+                OpCode::Popcnt => {
+                    if cx.wid(e.a) > 128 {
+                        return None;
+                    }
+                    let f = cx.node(e.a);
+                    let ones = u128::MAX >> (128 - u32::from(f.width));
+                    match (f.op == OpCode::And).then(|| masked(f.a, f.b)).flatten() {
+                        Some((v, k)) => (v, k & ones),
+                        None => (e.a, ones),
+                    }
+                }
+                _ => return None,
+            }
+        }
+        OpCode::And => {
+            let (v, k) = masked(n.a, n.b)?;
+            if k != 1 {
+                return None;
+            }
+            let s = cx.node(v);
+            match (s.op == OpCode::LShr).then(|| shift(s.b)).flatten() {
+                Some(k) if k < u64::from(w) => (s.a, bit(k as u32)?),
+                _ => (v, 1),
+            }
+        }
+        OpCode::LShr if w > 1 && shift(n.b) == Some(u64::from(w) - 1) => (n.a, bit(w - 1)?),
+        _ => return None,
+    };
+    loop {
+        let s = cx.node(y);
+        match s.op {
+            OpCode::Extract => {
+                if s.b >= 128 || m.leading_zeros() < s.b {
+                    return None;
+                }
+                m <<= s.b;
+                y = s.a;
+            }
+            // The extension's high bits are zero: they count nothing.
+            OpCode::Zext => {
+                m &= u128::MAX >> (128 - u32::from(cx.wid(s.a)).min(128));
+                y = s.a;
+            }
+            _ => break,
+        }
+    }
+    (m != 0).then_some((y, m))
+}
+
+/// The sum `n` (whose form is `form`) with its terms that count bits of one value, with one
+/// coefficient and no bit twice, written as one term: the population count of those bits
+/// (`Σ c·bitᵢ(x)` is `c·popcnt(x & m)`, the bits a slice of `x` where they are one run). The
+/// operand of a parity flag is spelled this way, a bit at a time, and its low bit is then a
+/// sum of eight slices at one bit. Three bits or more, from two terms or more.
+fn bit_count(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    if form.terms.len() < 2 {
+        return Ok(None);
+    }
+    // Per term: the value and the bits, where it counts some.
+    let bits: Vec<Option<(u32, u128)>> = form.terms.iter().map(|&(t, _)| counted(cx, t)).collect();
+    // The value and coefficient most such terms share.
+    let mut best: Option<(usize, u32, BitVec)> = None;
+    for (j, b) in bits.iter().enumerate() {
+        let Some((x, _)) = *b else { continue };
+        let k = form.terms[j].1;
+        let count = bits
+            .iter()
+            .zip(&form.terms)
+            .filter(|(b, t)| b.is_some_and(|(y, _)| y == x) && t.1 == k)
+            .count();
+        if best.as_ref().is_none_or(|(c, ..)| count > *c) {
+            best = Some((count, x, k));
+        }
+    }
+    let Some((_, x, k)) = best else {
+        return Ok(None);
+    };
+    // Its bits (a term with a bit already counted stays a term), and the other terms.
+    let (mut set, mut merged) = (0u128, 0usize);
+    let mut rest: Vec<(u32, BitVec)> = Vec::new();
+    for (b, &term) in bits.iter().zip(&form.terms) {
+        match *b {
+            Some((y, m)) if y == x && term.1 == k && set & m == 0 => {
+                set |= m;
+                merged += 1;
+            }
+            _ => rest.push(term),
+        }
+    }
+    if merged < 2 || set.count_ones() < COUNTED_BITS {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
+    let lo = set.trailing_zeros();
+    let span = 128 - set.leading_zeros() - lo;
+    let run = set >> lo == u128::MAX >> (128 - span);
+    if span > 64 && !run {
+        return Ok(None);
+    }
+    let w = form.konst.width();
+    let before = cx.len() as u32;
+    let count = r.build(cx, |cx| {
+        let mut field = cx.c_extract(x, lo as u16, span as u16)?;
+        if !run {
+            let mask = cx.mk_const_u64(cx.wid(field), (set >> lo) as u64)?;
+            field = cx.c_bin(BinOp::And, field, mask)?;
+        }
+        let p = cx.c_un(UnOp::Popcnt, field)?;
+        match cx.wid(p).cmp(&w.bits()) {
+            core::cmp::Ordering::Less => cx.c_zext(p, w.bits()),
+            core::cmp::Ordering::Equal => Ok(p),
+            core::cmp::Ordering::Greater => cx.c_extract(p, 0, w.bits()),
+        }
+    })?;
+    rest.push((count, k));
+    let mut f = Form::of(form.konst, &rest);
+    f.fin = form.fin;
+    let e = emit(r, cx, &f)?;
+    let mut leaves: Vec<u32> = rest.iter().map(|t| t.0).filter(|&t| t != count).collect();
+    leaves.push(x);
+    leaves.sort_unstable();
+    leaves.dedup();
+    finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some)
 }
 
 /// The linear pass at `n` over its form as computed.
