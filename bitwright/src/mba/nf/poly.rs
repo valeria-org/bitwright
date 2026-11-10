@@ -387,22 +387,6 @@ impl Terms {
         }
     }
 
-    /// Sets the coefficient of `m` to `c` (not zero).
-    fn insert(&mut self, m: Mono, c: BitVec) {
-        match self {
-            Terms::Few(v) => match Self::place(v, &m) {
-                Ok(i) => v[i].1 = c,
-                Err(i) if v.len() < FEW_TERMS => v.insert(i, (m, c)),
-                Err(_) => {
-                    self.spill().insert(m, c);
-                }
-            },
-            Terms::Many(t) => {
-                t.insert(m, c);
-            }
-        }
-    }
-
     fn remove(&mut self, m: &Mono) {
         match self {
             Terms::Few(v) => {
@@ -541,6 +525,39 @@ fn add(a: &BitVec, b: &BitVec) -> BitVec {
     BitVec::bin_unchecked(BinOp::Add, a, b)
 }
 
+/// The terms of `a + b`, or of `a − b`, both ascending: one pass over the two.
+fn merged(a: &[(Mono, BitVec)], b: &[(Mono, BitVec)], minus: bool) -> Vec<(Mono, BitVec)> {
+    let of = |c: &BitVec| match minus {
+        true => BitVec::un_unchecked(UnOp::Neg, c),
+        false => *c,
+    };
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            core::cmp::Ordering::Less => {
+                out.push(a[i].clone());
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                out.push((b[j].0.clone(), of(&b[j].1)));
+                j += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                let s = add(&a[i].1, &of(&b[j].1));
+                if !s.is_zero() {
+                    out.push((a[i].0.clone(), s));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend(a[i..].iter().cloned());
+    out.extend(b[j..].iter().map(|(m, c)| (m.clone(), of(c))));
+    out
+}
+
 fn mul(a: &BitVec, b: &BitVec) -> BitVec {
     BitVec::bin_unchecked(BinOp::Mul, a, b)
 }
@@ -554,11 +571,22 @@ fn v2_factorial(n: u32) -> u32 {
 /// leaves `c` as it is, `m = 0` gives 0).
 pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
     let w = c.width();
-    if m >= u32::from(w.bits()) {
+    let bits = u32::from(w.bits());
+    if m >= bits {
         return *c;
     }
     if m == 0 {
         return BitVec::zero(w);
+    }
+    if bits <= 64 {
+        // In one word (`0 < m < bits`).
+        let t = c.limbs()[0] & (u64::MAX >> (64 - m));
+        let r = if t > 1u64 << (m - 1) {
+            t.wrapping_sub(1u64 << m) & (u64::MAX >> (64 - bits))
+        } else {
+            t
+        };
+        return BitVec::from_canonical_u64(w, r);
     }
     let t = crate::facts::known::bv_and(c, &low_mask(w, m));
     let half = crate::facts::known::bv_shl(&BitVec::one(w), m - 1);
@@ -818,6 +846,12 @@ impl Poly {
     }
 
     pub(crate) fn add(&self, o: &Poly) -> Poly {
+        if let (Terms::Few(a), Terms::Few(b)) = (&self.terms, &o.terms) {
+            return Poly {
+                w: self.w,
+                terms: Terms::from_sorted(merged(a, b, false)),
+            };
+        }
         let (mut big, small) = if self.len() >= o.len() {
             (self.clone(), o)
         } else {
@@ -830,10 +864,11 @@ impl Poly {
     }
 
     pub(crate) fn scale(&self, k: &BitVec) -> Poly {
-        let mut out = Poly::zero(self.w);
-        for (m, c) in &self.terms {
-            out.add_term(m.clone(), &mul(c, k));
-        }
+        let mut out = self.clone();
+        out.terms.retain(|_, c| {
+            *c = mul(c, k);
+            !c.is_zero()
+        });
         out
     }
 
@@ -842,6 +877,12 @@ impl Poly {
     }
 
     pub(crate) fn sub(&self, o: &Poly) -> Poly {
+        if let (Terms::Few(a), Terms::Few(b)) = (&self.terms, &o.terms) {
+            return Poly {
+                w: self.w,
+                terms: Terms::from_sorted(merged(a, b, true)),
+            };
+        }
         self.add(&o.neg())
     }
 
@@ -974,9 +1015,17 @@ impl Poly {
 
     /// The one-position rule: a symbol of a class with the single position `j` takes only the
     /// values 0 and `2^j`, so `m^e = 2^{j(e−1)}·m`.
-    pub(crate) fn single_positions(&mut self, classes: &Classes) {
+    ///
+    /// Whether anything changed.
+    pub(crate) fn single_positions(&mut self, classes: &Classes) -> bool {
         let bits = u32::from(self.w.bits());
-        if (0..classes.len()).any(|c| classes.single(c).is_some()) {
+        let powered = |m: &Mono| {
+            m.iter()
+                .any(|&(s, e)| e > 1 && classes.single(usize::from(s.class)).is_some())
+        };
+        let any = (0..classes.len()).any(|c| classes.single(c).is_some())
+            && self.terms.keys().any(powered);
+        if any {
             let old = std::mem::take(&mut self.terms);
             for (m, c) in old {
                 let mut k = c;
@@ -994,6 +1043,7 @@ impl Poly {
                 self.add_term(out, &k);
             }
         }
+        any
     }
 
     /// Exact, cheap reductions, applied in place (also
@@ -1013,44 +1063,42 @@ impl Poly {
         let w = self.w;
         let bits = u32::from(w.bits());
         let top = self.degree();
-        for d in (0..=top).rev() {
-            let monos: Vec<Mono> = self
-                .terms
-                .keys()
-                .filter(|m| degree(m) == d)
-                .cloned()
-                .collect();
-            for m in monos {
-                let Some(c) = self.terms.get(&m).copied() else {
-                    continue;
-                };
+        // What the terms of one degree move into lower monomials: added once the degree is
+        // done (nothing of a degree moves into its own). The constant has nothing to reduce.
+        let mut moves: Vec<(Mono, BitVec)> = Vec::new();
+        for d in (1..=top).rev() {
+            self.terms.retain(|m, c| {
+                if degree(m) != d {
+                    return true;
+                }
                 let tau: u32 = m
                     .iter()
                     .map(|&(s, e)| u32::from(classes.low(usize::from(s.class))).saturating_mul(e))
                     .fold(0u32, u32::saturating_add);
                 if tau >= bits {
-                    self.terms.remove(&m);
-                    continue;
+                    return false;
                 }
                 let m1 = bits - tau;
                 let v: u32 = m.iter().map(|&(_, e)| v2_factorial(e)).sum();
                 let m2 = bits.saturating_sub(v);
                 if m1 <= m2 {
-                    let r = signed_rep(&c, m1);
-                    self.set(&m, r);
-                    continue;
+                    *c = signed_rep(c, m1);
+                    return !c.is_zero();
                 }
-                let r = signed_rep(&c, m2);
-                self.set(&m, r);
+                let r = signed_rep(c, m2);
                 // Move c − r (a multiple of 2^m2) times the lower terms of (x)_κ.
-                let moved = BitVec::bin_unchecked(BinOp::Sub, &c, &r);
-                if moved.is_zero() {
-                    continue;
+                let moved = BitVec::bin_unchecked(BinOp::Sub, c, &r);
+                if !moved.is_zero() {
+                    moves.push((m.clone(), moved));
                 }
+                *c = r;
+                !c.is_zero()
+            });
+            for (m, moved) in moves.drain(..) {
                 let rows: Vec<Vec<BitVec>> = m.iter().map(|&(_, e)| stirling1(e, w)).collect();
                 let mut idx: Vec<u32> = m.iter().map(|_| 1).collect();
                 loop {
-                    let is_top = idx.iter().zip(&m).all(|(&j, &(_, e))| j == e);
+                    let is_top = idx.iter().zip(m.iter()).all(|(&j, &(_, e))| j == e);
                     if !is_top {
                         let mut coef = BitVec::un_unchecked(UnOp::Neg, &moved);
                         let mut mono = Mono::new();
@@ -1241,14 +1289,6 @@ impl Poly {
             full.add_term(unmasked, &c);
         }
         full.add(&rest)
-    }
-
-    fn set(&mut self, m: &Mono, c: BitVec) {
-        if c.is_zero() {
-            self.terms.remove(m);
-        } else {
-            self.terms.insert(m.clone(), c);
-        }
     }
 }
 

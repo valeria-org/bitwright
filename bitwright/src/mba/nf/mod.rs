@@ -1304,8 +1304,10 @@ fn sext_of(g: &Bits, pos: u16, classes: &Classes) -> Poly {
 fn key_form(p: &Poly, classes: &Classes) -> Poly {
     let mut k = p.clone();
     k.reduce_core(classes);
-    k.single_positions(classes);
-    k.reduce_core(classes);
+    // Reduced already unless the one-position rule changed something.
+    if k.single_positions(classes) {
+        k.reduce_core(classes);
+    }
     k
 }
 
