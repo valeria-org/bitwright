@@ -12,6 +12,7 @@ mod index;
 mod poly;
 mod render;
 mod synth;
+mod word;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -949,7 +950,7 @@ impl Pass<'_> {
         let tz = |p: &Poly| {
             p.terms()
                 .values()
-                .map(crate::facts::known::trailing_zeros)
+                .map(self::word::trailing_zeros)
                 .min()
                 .unwrap_or(u32::from(w.bits()))
         };
@@ -957,13 +958,13 @@ impl Pass<'_> {
         if k == 0 {
             return Ok(None);
         }
-        let amount = BitVec::wrapping_from_u64(w, u64::from(k));
+        let amount = self::word::small(w, u64::from(k));
         let half = |p: &Poly| {
             let mut q = Poly::zero(w);
             for (m, c) in p.terms() {
                 q.add_term(
                     m.clone(),
-                    &BitVec::bin_unchecked(crate::ops::BinOp::AShr, c, &amount),
+                    &self::word::bin(crate::ops::BinOp::AShr, c, &amount),
                 );
             }
             q
@@ -983,7 +984,7 @@ impl Pass<'_> {
         let Some(r) = Bits::bin(bop, &x, &y) else {
             return Ok(None);
         };
-        let scale = crate::facts::known::bv_shl(&BitVec::one(w), k);
+        let scale = self::word::bv_shl(&self::word::one(w), k);
         Ok(Some(Form::Poly(r.to_poly(&self.classes).scale(&scale))))
     }
 
@@ -1070,7 +1071,7 @@ impl Pass<'_> {
             MOp::Neg => Form::Poly(self.poly(a, tally)?.neg()),
             MOp::Shl(k) => {
                 let x = self.poly(a, tally)?;
-                let s = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(k));
+                let s = self::word::bv_shl(&self::word::one(w), u32::from(k));
                 Form::Poly(x.scale(&s))
             }
             MOp::Mul => match (self.cst[a as usize], self.cst[b as usize]) {
@@ -1158,7 +1159,7 @@ fn class_constants(p: &MbaExpr, live: &[bool], cst: &[Option<BitVec>], w: Width)
         // atom it is can be zero in the classes above (see `Pass::visit`).
         if live[i] && n.width == w && cst[i].is_none() && n.op == MOp::Zext {
             let nw = p.nodes()[n.args[0] as usize].width;
-            consts.push(crate::facts::known::low_mask(w, u32::from(nw.bits())));
+            consts.push(self::word::low_mask(w, u32::from(nw.bits())));
         }
     }
     consts
@@ -1170,7 +1171,7 @@ fn class_constants(p: &MbaExpr, live: &[bool], cst: &[Option<BitVec>], w: Width)
 /// a narrow variable as `(Z ^ 2^s) − 2^s`, whose form this is; so are the forms of bitwise
 /// operations over such forms ([`sext_of`]). The position `s` and `g`.
 fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
-    use crate::facts::known::{bv_and, bv_not, low_mask};
+    use self::word::{bv_and, bv_not, low_mask};
     let w = p.width();
     let n = classes.len();
     if n < 2 || p.degree() > 1 {
@@ -1221,7 +1222,7 @@ fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
         if usize::from(sym.class) != s {
             continue;
         }
-        let neg = BitVec::un_unchecked(crate::ops::UnOp::Neg, c);
+        let neg = self::word::un(crate::ops::UnOp::Neg, c);
         g.add_term(
             Mono::of(
                 Sym {
@@ -1251,7 +1252,7 @@ fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
     let mut body = q.clone();
     body.add_term(
         Mono::new(),
-        &BitVec::un_unchecked(crate::ops::UnOp::Neg, &konst),
+        &self::word::un(crate::ops::UnOp::Neg, &konst),
     );
     if body != expect {
         return None;
@@ -1279,11 +1280,11 @@ fn sext_of(g: &Bits, pos: u16, classes: &Classes) -> Poly {
             if k == 0 {
                 continue;
             }
-            let kv = BitVec::wrapping_from_i128(w, sign * i128::from(k));
+            let kv = self::word::signed(w, sign * i128::from(k));
             if q == 0 {
                 out.add_term(
                     Mono::new(),
-                    &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &kv, classes.mask(c)),
+                    &self::word::bin(crate::ops::BinOp::Mul, &kv, classes.mask(c)),
                 );
                 continue;
             }
@@ -1322,13 +1323,13 @@ fn key_form(p: &Poly, classes: &Classes) -> Poly {
 /// flipping known bits adds a constant; above them the result is `p`, `~p`, zeros or ones. For
 /// example `−2·(x & 1) | 1` is `1 − 2·(x & 1)`.
 fn known_bits(op: MOp, p: &Poly, classes: &Classes, k: &BitVec) -> Option<Poly> {
-    use crate::facts::known::{bv_and, bv_not, bv_or};
+    use self::word::{bv_and, bv_not, bv_or};
     let w = p.width();
     let j = p.known_low_bits(classes);
     if j == 0 {
         return None;
     }
-    let low = crate::facts::known::low_mask(w, j);
+    let low = self::word::low_mask(w, j);
     // The known bits, and `k` inside and above them.
     let r = bv_and(&p.konst(), &low);
     let kl = bv_and(k, &low);
@@ -1417,7 +1418,7 @@ fn canonical(p: &MbaExpr, live: &[bool]) -> (Vec<u32>, u32) {
         if let MOp::Shl(k) | MOp::LShr(k) = n.op
             && l
         {
-            let v = BitVec::wrapping_from_u64(n.width, u64::from(k));
+            let v = self::word::small(n.width, u64::from(k));
             if !consts.contains(&v) {
                 consts.push(v);
                 distinct += 1;
@@ -1863,7 +1864,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
         let mut rest = d.clone();
         rest.add_term(
             m.clone(),
-            &BitVec::un_unchecked(crate::ops::UnOp::Neg, alpha),
+            &self::word::un(crate::ops::UnOp::Neg, alpha),
         );
         let mut r = Poly::sym(
             w,
@@ -1922,7 +1923,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
                 .map_err(|()| Decline::Exhausted)?;
         }
         for base in std::iter::once(nf).chain(&n.alts) {
-            for c in [BitVec::one(w), BitVec::ones(w)] {
+            for c in [self::word::one(w), BitVec::ones(w)] {
                 let e = finish(&base.add(&zero.scale(&c)));
                 if e != *nf && !alts.contains(&e) {
                     alts.push(e);
@@ -1964,7 +1965,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
     if !relations.is_empty() && nf.len() <= 32 {
         let small: Vec<BitVec> = [1i128, -1, 2, -2]
             .iter()
-            .map(|&k| BitVec::wrapping_from_i128(w, k))
+            .map(|&k| self::word::signed(w, k))
             .collect();
         let mut combos: Vec<Poly> = Vec::new();
         for (i, r) in relations.iter().enumerate() {
@@ -2002,7 +2003,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
                     matches!(m.as_slice(), [(s, 1)] if s.class == whole
                         && s.set.count_ones() == 1
                         && s.set & masked == 0)
-                        && *c != BitVec::one(w)
+                        && *c != self::word::one(w)
                         && *c != BitVec::ones(w)
                 });
                 if loose || Bits::from_linear(&g.expand_full(&n.classes), &n.classes).is_none() {
@@ -2049,7 +2050,7 @@ fn eliminate_var(p: &Poly, a: u32, d: &Poly, vars: u32, whole: u16) -> Option<Po
     let mut rest = d.clone();
     rest.add_term(
         m.clone(),
-        &BitVec::un_unchecked(crate::ops::UnOp::Neg, alpha),
+        &self::word::un(crate::ops::UnOp::Neg, alpha),
     );
     let r = Poly::sym(
         w,
@@ -2183,25 +2184,25 @@ fn drop_dependent_atoms(
             [] => {}
             [(s, 1)] => {
                 let v = &mut val[usize::from(s.class).min(n - 1)][index(s.set)];
-                *v = BitVec::bin_unchecked(crate::ops::BinOp::Add, v, c);
+                *v = self::word::bin(crate::ops::BinOp::Add, v, c);
             }
             _ => return Ok(()),
         }
     }
     let prec = |c: usize| {
-        crate::facts::known::low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)))
+        self::word::low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)))
     };
     for (c, v) in val.iter_mut().enumerate() {
         for b in 0..k {
             for q in 0..1usize << k {
                 if q >> b & 1 == 1 {
-                    v[q] = BitVec::bin_unchecked(crate::ops::BinOp::Add, &v[q], &v[q ^ 1 << b]);
+                    v[q] = self::word::bin(crate::ops::BinOp::Add, &v[q], &v[q ^ 1 << b]);
                 }
             }
         }
         let lm = prec(c);
         for x in v.iter_mut() {
-            *x = crate::facts::known::bv_and(x, &lm);
+            *x = self::word::bv_and(x, &lm);
         }
     }
     // Greedily, atoms the values over the occurring patterns do not depend on, in any class.
@@ -2259,7 +2260,7 @@ fn drop_dependent_atoms(
             for q in 0..1usize << kk {
                 if q >> b & 1 == 1 {
                     coef[q] =
-                        BitVec::bin_unchecked(crate::ops::BinOp::Sub, &coef[q], &coef[q ^ 1 << b]);
+                        self::word::bin(crate::ops::BinOp::Sub, &coef[q], &coef[q ^ 1 << b]);
                 }
             }
         }
@@ -2267,7 +2268,7 @@ fn drop_dependent_atoms(
         // class's positions.
         fresh.add_term(
             Mono::new(),
-            &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &coef[0], classes.mask(c)),
+            &self::word::bin(crate::ops::BinOp::Mul, &coef[0], classes.mask(c)),
         );
         for (q, x) in coef.iter().enumerate().skip(1) {
             let s = keep
@@ -2422,7 +2423,7 @@ fn prune_null_conjunctions(
         let report = certify_within(&e, &zero, work);
         tally.certificates.record(&report);
         if report.verdict == Verdict::Proved {
-            nf.add_term(m, &BitVec::un_unchecked(crate::ops::UnOp::Neg, &c));
+            nf.add_term(m, &self::word::un(crate::ops::UnOp::Neg, &c));
             nulls.push(sym);
             tally.null_parts += 1;
         }
@@ -2446,7 +2447,7 @@ fn prune_null(
     let d = nf.degree();
     let v = d - d.count_ones();
     let t = u32::from(w.bits()).saturating_sub(v);
-    let divisible = |c: &BitVec| crate::facts::known::trailing_zeros(c) >= t;
+    let divisible = |c: &BitVec| self::word::trailing_zeros(c) >= t;
     let cand: Vec<(poly::Mono, BitVec)> = nf
         .terms()
         .iter()
@@ -2491,7 +2492,7 @@ fn prune_null(
         tally.certificates.record(&report);
         if report.verdict == Verdict::Proved {
             for (m, c) in &g {
-                nf.add_term(m.clone(), &BitVec::un_unchecked(crate::ops::UnOp::Neg, c));
+                nf.add_term(m.clone(), &self::word::un(crate::ops::UnOp::Neg, c));
             }
             tally.null_parts += 1;
         }

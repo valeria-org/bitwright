@@ -10,7 +10,7 @@
 use super::classes::Classes;
 use super::poly::{Mono, Poly, Sym};
 use crate::BitVec;
-use crate::facts::known::{bv_and, low_mask};
+use super::word::{bv_and, low_mask};
 use crate::ops::BinOp;
 
 /// The most atoms one bitwise function may depend on (a table has 2^s entries).
@@ -196,11 +196,11 @@ impl Bits {
                 if k == 0 {
                     continue;
                 }
-                let kv = BitVec::wrapping_from_i128(w, i128::from(k));
+                let kv = super::word::signed(w, i128::from(k));
                 if q == 0 {
                     out.add_term(
                         Mono::new(),
-                        &BitVec::bin_unchecked(BinOp::Mul, &kv, classes.mask(c)),
+                        &super::word::bin(BinOp::Mul, &kv, classes.mask(c)),
                     );
                     continue;
                 }
@@ -235,7 +235,7 @@ impl Bits {
             let k = if inside.is_zero() {
                 BitVec::zero(w)
             } else if inside == *classes.mask(c) {
-                BitVec::one(w)
+                super::word::one(w)
             } else {
                 return None;
             };
@@ -243,8 +243,8 @@ impl Bits {
             let lm = low_mask(w, prec);
             let mut t = vec![0u64; words(s)];
             for (q, d) in g.iter().enumerate() {
-                let v = bv_and(&BitVec::bin_unchecked(BinOp::Add, &k, d), &lm);
-                if v == BitVec::one(w) {
+                let v = bv_and(&super::word::bin(BinOp::Add, &k, d), &lm);
+                if v == super::word::one(w) {
                     set(&mut t, q);
                 } else if !v.is_zero() {
                     return None;
@@ -265,7 +265,7 @@ impl Bits {
         }
         let (_, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
-        let one = BitVec::one(w);
+        let one = super::word::one(w);
         let mut out = Vec::with_capacity(deltas.len());
         for (c, g) in deltas.iter().enumerate() {
             let lm = low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)));
@@ -275,7 +275,7 @@ impl Bits {
                 let d = bv_and(d, &lm);
                 moved |= !d.is_zero();
                 fits[0] &= d.is_zero() || d == one;
-                let v = bv_and(&BitVec::bin_unchecked(BinOp::Add, &one, &d), &lm);
+                let v = bv_and(&super::word::bin(BinOp::Add, &one, &d), &lm);
                 fits[1] &= v.is_zero() || v == one;
             }
             if fits == [false, false] {
@@ -405,14 +405,14 @@ fn corner_sums(p: &Poly, classes: &Classes) -> Option<(Vec<u32>, Vec<Vec<BitVec>
             .filter(|&(_, &a)| sym.set >> a & 1 == 1)
             .fold(0usize, |q, (j, _)| q | 1 << j);
         let slot = gamma.get_mut(usize::from(sym.class))?.get_mut(q)?;
-        *slot = BitVec::bin_unchecked(BinOp::Add, slot, c);
+        *slot = super::word::bin(BinOp::Add, slot, c);
     }
     // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
     for g in gamma.iter_mut() {
         for b in 0..s {
             for q in 0..1usize << s {
                 if q >> b & 1 == 1 {
-                    g[q] = BitVec::bin_unchecked(BinOp::Add, &g[q], &g[q ^ 1 << b]);
+                    g[q] = super::word::bin(BinOp::Add, &g[q], &g[q ^ 1 << b]);
                 }
             }
         }

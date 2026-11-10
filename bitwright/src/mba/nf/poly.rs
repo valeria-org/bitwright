@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::{self, Entry};
 
 use super::classes::{Classes, FULL};
-use crate::facts::known::low_mask;
+use super::word::low_mask;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
@@ -522,13 +522,13 @@ pub(crate) struct Poly {
 }
 
 fn add(a: &BitVec, b: &BitVec) -> BitVec {
-    BitVec::bin_unchecked(BinOp::Add, a, b)
+    super::word::bin(BinOp::Add, a, b)
 }
 
 /// The terms of `a + b`, or of `a − b`, both ascending: one pass over the two.
 fn merged(a: &[(Mono, BitVec)], b: &[(Mono, BitVec)], minus: bool) -> Vec<(Mono, BitVec)> {
     let of = |c: &BitVec| match minus {
-        true => BitVec::un_unchecked(UnOp::Neg, c),
+        true => super::word::un(UnOp::Neg, c),
         false => *c,
     };
     let mut out = Vec::with_capacity(a.len() + b.len());
@@ -559,7 +559,7 @@ fn merged(a: &[(Mono, BitVec)], b: &[(Mono, BitVec)], minus: bool) -> Vec<(Mono,
 }
 
 fn mul(a: &BitVec, b: &BitVec) -> BitVec {
-    BitVec::bin_unchecked(BinOp::Mul, a, b)
+    super::word::bin(BinOp::Mul, a, b)
 }
 
 /// `v₂(n!)` (Legendre).
@@ -588,12 +588,12 @@ pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
         };
         return BitVec::from_canonical_u64(w, r);
     }
-    let t = crate::facts::known::bv_and(c, &low_mask(w, m));
-    let half = crate::facts::known::bv_shl(&BitVec::one(w), m - 1);
+    let t = super::word::bv_and(c, &low_mask(w, m));
+    let half = super::word::bv_shl(&super::word::one(w), m - 1);
     if BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &half, &t) {
         // t − 2^m, mod 2^W.
-        let full = crate::facts::known::bv_shl(&BitVec::one(w), m);
-        BitVec::bin_unchecked(BinOp::Sub, &t, &full)
+        let full = super::word::bv_shl(&super::word::one(w), m);
+        super::word::bin(BinOp::Sub, &t, &full)
     } else {
         t
     }
@@ -602,14 +602,14 @@ pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
 /// The signed Stirling numbers of the first kind `s(e, j)`, `j = 0..=e`, mod 2^W:
 /// `(x)_e = Σ_j s(e, j)·x^j`.
 fn stirling1(e: u32, w: Width) -> Vec<BitVec> {
-    let mut row = vec![BitVec::one(w)];
+    let mut row = vec![super::word::one(w)];
     for n in 0..e {
         // s(n+1, k) = s(n, k−1) − n·s(n, k).
-        let nn = BitVec::wrapping_from_u64(w, u64::from(n));
+        let nn = super::word::small(w, u64::from(n));
         let mut next = vec![BitVec::zero(w); row.len() + 1];
         for (k, s) in row.iter().enumerate() {
             next[k + 1] = add(&next[k + 1], s);
-            next[k] = BitVec::bin_unchecked(BinOp::Sub, &next[k], &mul(&nn, s));
+            next[k] = super::word::bin(BinOp::Sub, &next[k], &mul(&nn, s));
         }
         row = next;
     }
@@ -639,7 +639,7 @@ impl Poly {
 
     /// A symbol, coefficient 1.
     pub(crate) fn sym(w: Width, s: Sym) -> Poly {
-        Poly::term(w, Mono::of(s, 1), &BitVec::one(w))
+        Poly::term(w, Mono::of(s, 1), &super::word::one(w))
     }
 
     pub(crate) fn width(&self) -> Width {
@@ -741,7 +741,7 @@ impl Poly {
             .filter(|(m, _)| !m.is_empty())
             .map(|(m, c)| {
                 m.iter()
-                    .fold(crate::facts::known::trailing_zeros(c), |k, &(s, e)| {
+                    .fold(super::word::trailing_zeros(c), |k, &(s, e)| {
                         let low = u32::from(classes.low(usize::from(s.class)));
                         k.saturating_add(low.saturating_mul(e))
                     })
@@ -758,7 +758,7 @@ impl Poly {
     /// modulo `2^(W − v₂(d))`, which then fixes `c·d'` for every other term). `None` otherwise,
     /// or when `def` mentions `a` or is a constant.
     pub(crate) fn substitute(&self, a: u32, def: &Poly) -> Option<Poly> {
-        use crate::facts::known::{bv_lshr, trailing_zeros};
+        use super::word::{bv_lshr, trailing_zeros};
         let bits = u32::from(self.w.bits());
         if a >= 64 || def.atoms() >> a & 1 == 1 || def.w != self.w {
             return None;
@@ -794,7 +794,7 @@ impl Poly {
     /// equal to it: `None` past `limit` monomials.
     pub(crate) fn replace(&self, s: Sym, r: &Poly, limit: usize) -> Option<Poly> {
         let mut out = Poly::zero(self.w);
-        let mut powers: Vec<Poly> = vec![Poly::constant(BitVec::one(self.w))];
+        let mut powers: Vec<Poly> = vec![Poly::constant(super::word::one(self.w))];
         for (m, c) in &self.terms {
             let e = m.iter().find(|&&(t, _)| t == s).map_or(0, |&(_, e)| e);
             let rest: Mono = m.iter().copied().filter(|&(t, _)| t != s).collect();
@@ -821,7 +821,7 @@ impl Poly {
         self.terms
             .iter()
             .filter(|(m, _)| !m.is_empty())
-            .min_by_key(|(_, c)| crate::facts::known::trailing_zeros(c))
+            .min_by_key(|(_, c)| super::word::trailing_zeros(c))
     }
 
     /// The terms whose degree satisfies `keep`.
@@ -945,7 +945,7 @@ impl Poly {
                 }
                 match rest.entry(Graded(mono_mul(&qm, n))) {
                     Entry::Occupied(mut e) => {
-                        let r = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        let r = super::word::bin(BinOp::Sub, e.get(), &v);
                         if r.is_zero() {
                             e.remove();
                         } else {
@@ -953,7 +953,7 @@ impl Poly {
                         }
                     }
                     Entry::Vacant(e) => {
-                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                        e.insert(super::word::un(UnOp::Neg, &v));
                     }
                 }
             }
@@ -996,7 +996,7 @@ impl Poly {
                 }
                 match rest.entry(Graded(mono_mul(&qm, n))) {
                     Entry::Occupied(mut e) => {
-                        let x = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        let x = super::word::bin(BinOp::Sub, e.get(), &v);
                         if x.is_zero() {
                             e.remove();
                         } else {
@@ -1004,7 +1004,7 @@ impl Poly {
                         }
                     }
                     Entry::Vacant(e) => {
-                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                        e.insert(super::word::un(UnOp::Neg, &v));
                     }
                 }
             }
@@ -1034,7 +1034,7 @@ impl Poly {
                     match classes.single(usize::from(s.class)) {
                         Some(j) if e > 1 => {
                             let sh = u32::from(j).saturating_mul(e - 1).min(bits);
-                            k = crate::facts::known::bv_shl(&k, sh);
+                            k = super::word::bv_shl(&k, sh);
                             out.push((s, 1));
                         }
                         _ => out.push((s, e)),
@@ -1087,7 +1087,7 @@ impl Poly {
                 }
                 let r = signed_rep(c, m2);
                 // Move c − r (a multiple of 2^m2) times the lower terms of (x)_κ.
-                let moved = BitVec::bin_unchecked(BinOp::Sub, c, &r);
+                let moved = super::word::bin(BinOp::Sub, c, &r);
                 if !moved.is_zero() {
                     moves.push((m.clone(), moved));
                 }
@@ -1100,7 +1100,7 @@ impl Poly {
                 loop {
                     let is_top = idx.iter().zip(m.iter()).all(|(&j, &(_, e))| j == e);
                     if !is_top {
-                        let mut coef = BitVec::un_unchecked(UnOp::Neg, &moved);
+                        let mut coef = super::word::un(UnOp::Neg, &moved);
                         let mut mono = Mono::new();
                         for (k, &(s, _)) in m.iter().enumerate() {
                             coef = mul(&coef, &rows[k][idx[k] as usize]);
@@ -1295,12 +1295,12 @@ impl Poly {
 /// The inverse of an odd value mod 2^W (Newton's iteration).
 pub(crate) fn odd_inverse(a: &BitVec) -> BitVec {
     let w = a.width();
-    let two = BitVec::wrapping_from_u64(w, 2);
+    let two = super::word::small(w, 2);
     let mut x = *a; // correct to 3 bits for odd a
     for _ in 0..10 {
         // x = x·(2 − a·x)
         let ax = mul(a, &x);
-        x = mul(&x, &BitVec::bin_unchecked(BinOp::Sub, &two, &ax));
+        x = mul(&x, &super::word::bin(BinOp::Sub, &two, &ax));
     }
     x
 }
