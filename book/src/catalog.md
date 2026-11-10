@@ -1115,6 +1115,21 @@ rule lshr_shl<W>(x: W, c: const W) {
 
 - `(p >>u 3) << 3` → `p & 0xf8`
 
+#### `lshr_add_shl` — rule
+
+A sum shifted back: the constant's low bits carry nothing into what is kept.
+
+```text
+rule lshr_add_shl<W>(x: W, c: const W, k: const W) {
+        ((x << c) + k) >>u c => (x + j) & m
+        if c <u W
+        let j: W = k >>u c
+        let m: W = ones >>u c
+    }
+```
+
+- `((p << 3) + 0x1d) >>u 3` → `(p + 3) & 0x1f`
+
 #### `rotl_rotl` — rule
 
 Two rotations by constants.

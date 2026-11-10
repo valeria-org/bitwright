@@ -171,7 +171,9 @@ a quarter of a second, the median 75 ms.
   `rotl(x ^ c, s)`, `rotl(x & c, s)`, `rotl(x | c, s)`. Nested rotation layers with a mask or
   a key between them then meet (`rotl(rotl(rotl(p, 46) ^ k, 26) & m, 56)` is `p & m'`). The
   rule `not_rotl_not` is gone, shadowed by `rotl_not`. `(x | c) − c` written as an addition
-  is `x & ~c` (`add_or_const`), also where `x | c` has other readers.
+  is `x & ~c` (`add_or_const`), also where `x | c` has other readers. A sum shifted back,
+  `((x << c) + k) >>u c`, is `(x + (k >>u c)) & m` (`lshr_add_shl`): the constant's low bits
+  carry nothing into what is kept.
 - **Slices of one rotation are read as that rotation.** A fragment whose parts are bits of
   one value under shifts, rotations, masks and complements (`t << 13`, `t >>u 51`, `~(t << 13)
   & m`, products of those by `2^k·c`) is asked again with each part written over the
@@ -203,6 +205,13 @@ a quarter of a second, the median 75 ms.
   before the tests that evaluate points. A form with carries under a constant mask is read
   by the mask's fields where its low bits are a form too (`(x & m)·c & −256`: the product's
   low byte depends on the few bits of `x` the mask keeps there).
+- **Sides that read a value the same way are compared without the reading.** `(s >> 8) & 9`
+  against `(t >> 8) & 9` holds exactly when `s` and `t` agree on bits 8 and 11, and without
+  the right shift each side is a function of the low bits of its variables, which the
+  bit-serial test follows through every carry. From the roots inward, the steps both sides
+  share (a right shift, `& | ^` with one constant, a complement, a cast) are taken off when a
+  right shift is among them. That test also reads a variable wider than the sides through
+  its truncation.
 - **One leaf under masks is a symbol to the symbolic comparison.** A bitwise function of one
   leaf and constants is `f(0)` plus the leaf under the bits it sets less the leaf under the
   bits it clears, whatever spelled it: `m − (~t & m)` and `t & m` are one polynomial. A

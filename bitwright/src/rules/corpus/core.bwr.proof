@@ -328,6 +328,7 @@ core.select_idioms::select_then_same 3e14ac3677bacd3456c15dc7cc69b3f5 rule exhau
 core.select_idioms::select_xor 32bb7d6beaca4bbf55281740a1b44600 rule exhaustive(inst=5,maxw=5,cases=74896,fired=74896) sampled(inst=22,cases=1408,fired=1408)
 core.select_idioms::select_xor_zero 9d24a83ba9de57c908a46ea70bbad04b rule exhaustive(inst=6,maxw=6,cases=10920,fired=10920) sampled(inst=22,cases=1408,fired=1408)
 core.select_idioms::select_zero_sum d50779b01e4873e3cc52811221686d84 rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
+core.shift::lshr_add_shl b6b393096bed8dce3c5a3f4c4b7016ef rule exhaustive(inst=5,maxw=5,cases=37448,fired=6372) sampled(inst=22,cases=1408,fired=370)
 core.shift::lshr_lshr 87af211bb3c75865cff47a3b491ddba9 rule exhaustive(inst=5,maxw=5,cases=37448,fired=702) sampled(inst=22,cases=1408,fired=86)
 core.shift::lshr_shl acb5bed8182090538bf353f97592f974 rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=386)
 core.shift::rotl_rotl 212c7db1879190f843986b16418f0f33 rule exhaustive(inst=5,maxw=5,cases=37448,fired=37448) sampled(inst=22,cases=1408,fired=1408)

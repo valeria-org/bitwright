@@ -1501,6 +1501,18 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         }
         return Ok(report);
     }
+    // Sides that read the same bits of a value the same way (`(s >> 8) & 9` of each) are
+    // equal exactly when the values agree on those bits (see `peeled`): without the right
+    // shift each is a function of the low bits of its variables, which the tests follow.
+    if let Some((pa, pb)) = peeled(a, b) {
+        let sub = prove(&pa, &pb, meter)?;
+        if sub.verdict != Verdict::Unknown {
+            return Ok(sub);
+        }
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+    }
     if da.is_some() || db.is_some() {
         report = prove_at(
             da.as_ref().unwrap_or(a),
@@ -1549,6 +1561,102 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         report.internal += 1;
     }
     Ok(report)
+}
+
+/// `a` and `b` without what both read their values through, when that includes a right
+/// shift: the two values, each under the mask of the bits read. From the roots inward, while
+/// both sides apply the same step (a right shift by one count, `&`, `|` or `^` with one
+/// constant, a complement, a cast to one width), the bits of the operand that reach the root
+/// are followed; each step is a one-to-one function of those bits, so the sides are equal at
+/// an input exactly when the two operands agree there on the mask (a proof of either is one of
+/// the other, and so is a counterexample). `None` when no right shift is passed, or nothing is
+/// left to compare.
+fn peeled(a: &MbaExpr, b: &MbaExpr) -> Option<(MbaExpr, MbaExpr)> {
+    let (na, nb) = (a.nodes(), b.nodes());
+    let (mut ia, mut ib) = (na.len().checked_sub(1)?, nb.len().checked_sub(1)?);
+    let w = na[ia].width;
+    if w != nb[ib].width || w.bits() > 64 || a.vars() != b.vars() {
+        return None;
+    }
+    let ones = |w: Width| {
+        if w.bits() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << w.bits()) - 1
+        }
+    };
+    let konst = |n: &[MNode], i: u32| match n[i as usize].op {
+        MOp::Const(c) => c.to_u64(),
+        _ => None,
+    };
+    // An operand and a constant, in either order.
+    let with = |n: &[MNode], i: usize| -> Option<(usize, u64)> {
+        let [x, y] = n[i].args;
+        match (konst(n, x), konst(n, y)) {
+            (None, Some(c)) => Some((x as usize, c)),
+            (Some(c), None) => Some((y as usize, c)),
+            _ => None,
+        }
+    };
+    let (mut mask, mut shifted) = (ones(w), false);
+    loop {
+        let (x, y) = (na[ia], nb[ib]);
+        if x.width != y.width || x.width.bits() > 64 {
+            break;
+        }
+        match (x.op, y.op) {
+            (MOp::LShr(j), MOp::LShr(k)) if j == k => {
+                mask = mask << j & ones(x.width);
+                shifted = true;
+                (ia, ib) = (x.args[0] as usize, y.args[0] as usize);
+            }
+            (MOp::Not, MOp::Not) => (ia, ib) = (x.args[0] as usize, y.args[0] as usize),
+            (MOp::Trunc, MOp::Trunc) | (MOp::Zext, MOp::Zext) => {
+                let (p, q) = (x.args[0] as usize, y.args[0] as usize);
+                if na[p].width != nb[q].width || na[p].width.bits() > 64 {
+                    break;
+                }
+                mask &= ones(na[p].width);
+                (ia, ib) = (p, q);
+            }
+            (MOp::And | MOp::Or | MOp::Xor, op) if op == x.op => {
+                let (Some((p, c)), Some((q, d))) = (with(na, ia), with(nb, ib)) else {
+                    break;
+                };
+                if c != d {
+                    break;
+                }
+                mask &= match op {
+                    MOp::And => c,
+                    MOp::Or => !c,
+                    _ => u64::MAX,
+                };
+                (ia, ib) = (p, q);
+            }
+            _ => break,
+        }
+    }
+    if !shifted || mask == 0 {
+        return None;
+    }
+    // Each side up to its operand, under the mask.
+    let under = |m: &MbaExpr, at: usize| -> Option<MbaExpr> {
+        let mut out = MbaExpr::new(m.vars().to_vec());
+        for n in &m.nodes()[..=at] {
+            match n.op {
+                MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(n.op, n.args[0], n.width),
+                _ => out.push(n.op, &n.args[..n.op.arity()]),
+            }
+            .ok()?;
+        }
+        let w = m.nodes()[at].width;
+        let k = out
+            .push(MOp::Const(BitVec::wrapping_from_u64(w, mask)), &[])
+            .ok()?;
+        out.push(MOp::And, &[at as u32, k]).ok()?;
+        Some(out)
+    };
+    Some((under(a, ia)?, under(b, ib)?))
 }
 
 /// The most bits of variables [`bit_linear`] takes.
@@ -4635,7 +4743,8 @@ enum Serial {
 /// (`(y + y) & y & −y` is 0: no bit of `y` both follows a set bit and has none below it). Up to
 /// [`CARRY_BITS`] bits of state and six variables; charged as node evaluations. A variable
 /// narrower than the width read only through a zero extension (as `decast` writes narrow
-/// variables) is one whose bits above its width are 0.
+/// variables) is one whose bits above its width are 0, and one wider read only through a
+/// truncation is read at the positions the sides have.
 pub(crate) fn carries<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -4646,7 +4755,7 @@ pub(crate) fn carries<M: Meter>(
         return Ok(false);
     };
     let t = a.vars().len();
-    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 || a.vars().iter().any(|&v| v > w) {
+    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 {
         return Ok(false);
     }
     // Both sides as one circuit (live nodes only, equal ones once: they share their state).
@@ -4674,6 +4783,16 @@ pub(crate) fn carries<M: Meter>(
                     return Ok(false);
                 };
                 circuit.push(Serial::VarBelow(v, arg.width.bits()));
+                map[i] = circuit.len() - 1;
+                continue;
+            }
+            // The low bits of a variable wider than the sides (as `decast` writes one under
+            // a truncation): the variable, read at the positions there are.
+            if n.op == MOp::Trunc {
+                let MOp::Var(v) = m.nodes()[n.args[0] as usize].op else {
+                    return Ok(false);
+                };
+                circuit.push(Serial::Var(v));
                 map[i] = circuit.len() - 1;
                 continue;
             }

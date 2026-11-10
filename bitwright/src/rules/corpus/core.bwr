@@ -492,6 +492,15 @@ group core.shift {
         let m: W = ones << c
     }
 
+    /// A sum shifted back: the constant's low bits carry nothing into what is kept.
+    #[example("((p << 3) + 0x1d) >>u 3" => "(p + 3) & 0x1f")]
+    rule lshr_add_shl<W>(x: W, c: const W, k: const W) {
+        ((x << c) + k) >>u c => (x + j) & m
+        if c <u W
+        let j: W = k >>u c
+        let m: W = ones >>u c
+    }
+
     /// Two rotations by constants.
     #[example("rotl(rotl(p, 3), 7)" => "rotl(p, 2)")]
     rule rotl_rotl<W>(x: W, a: const W, b: const W) {
