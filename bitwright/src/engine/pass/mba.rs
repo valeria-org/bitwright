@@ -2214,11 +2214,25 @@ fn cases_fold(
             return Ok(None);
         }
     }
+    // Each side swept and proved before the other is swept: a first side left unproved
+    // ends the attempt, and the second side's sweep with it (548 of the 654 blocks whose
+    // sides were constant at the samples and not proved ended at the first side, after
+    // both were swept). What proves a side does not read the other's sweep: the nodes below
+    // it are all examined by its own.
     let mut values = [crate::BitVec::zero(cx.width_of(n)); 2];
     for (which, (slot, side)) in values.iter_mut().zip(&mut sides).enumerate() {
         let t0 = std::time::Instant::now();
         let snap = tmp_snapshot();
-        *side = sweep_inner(r, cx, cfg, *side, false)?;
+        // A side an earlier sweep of this call examined (the side of a block below this
+        // one, where the condition fixes what the two differ in) is that sweep's result:
+        // every node below it was examined before it, and a sweep would only walk them.
+        *side = match r.swept.get(side) {
+            Some(&done) => {
+                tmp_time("cf.side_swept", t0);
+                done
+            }
+            None => sweep_inner(r, cx, cfg, *side, false)?,
+        };
         tmp_nested(&snap);
         tmp_time("cf.sweep_side", t0);
         if let Some(k) = cx.const_val(*side) {
@@ -2242,10 +2256,8 @@ fn cases_fold(
             return Ok(None);
         }
         *slot = k;
-    }
-    for (which, (side, k)) in sides.into_iter().zip(values).enumerate() {
         let t0 = std::time::Instant::now();
-        let proved = cx.const_val(side).is_some() || readings_prove(r, cx, cfg, side, &k, SWEEP_SHARE)?.0;
+        let proved = readings_prove(r, cx, cfg, *side, &k, SWEEP_SHARE)?.0;
         tmp_time("cf.readings", t0);
         if !proved {
             tmp_time(
