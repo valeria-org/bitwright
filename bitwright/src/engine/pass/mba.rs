@@ -3559,6 +3559,17 @@ fn kept_steps() -> u64 {
         .unwrap_or(KEPT_STEPS)
 }
 
+/// One question to the solver takes at most this fraction of the call's solver steps (and at
+/// least [`SOLVE_SHARE_MIN`]). The solver's own limit is a million steps whatever the call
+/// has, so in a call of two million one question that ran out took half of them, a fragment
+/// holding it took the other half, and the rounds after had none. Of the answers committed
+/// in 140 measured questions none took more than a quarter of its call's steps; 26 questions
+/// that took more than that ended with nothing (out of steps, not smaller, or unproved).
+const SOLVE_SHARE: u64 = 4;
+
+/// See [`SOLVE_SHARE`].
+const SOLVE_SHARE_MIN: u64 = 1 << 16;
+
 /// The solver steps from which a fragment with no simpler form is kept from the questions
 /// above it (see [`holds_kept`]).
 const KEPT_STEPS: u64 = 1 << 12;
@@ -3656,8 +3667,20 @@ fn ask(
                     // The solver works within its own limit and what is left of the run's
                     // account of its steps, and is charged the steps it spent. With nothing
                     // left the question is not asked: over budget, so not final.
-                    let limit = cfg.budget.steps.min(r.meter.left_in(|b| b.mba_steps));
-                    if limit == 0 {
+                    //
+                    // One question takes at most a share of the call's steps (see
+                    // `SOLVE_SHARE`), and one the solver ran out of steps on is not asked
+                    // again in this call with no more of them: the answer is the same.
+                    let share = match tmp_off("BW_NO_SOLVE_SHARE") {
+                        true => u64::MAX,
+                        false => (r.meter.limit.mba_steps / SOLVE_SHARE).max(SOLVE_SHARE_MIN),
+                    };
+                    let limit = cfg
+                        .budget
+                        .steps
+                        .min(share)
+                        .min(r.meter.left_in(|b| b.mba_steps));
+                    if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
@@ -3699,6 +3722,11 @@ fn ask(
                         );
                     }
                     r.meter.charge(Counter::MbaSteps, spent)?;
+                    if a == MbaAnswer::Exhausted && !tmp_off("BW_NO_SOLVE_SHARE") {
+                        // A fragment that holds this one is no smaller a question.
+                        r.mba_exhausted.insert(key, limit);
+                        r.mba_kept.insert(root, ());
+                    }
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
                         // Run short within what the account left it: more budget might
                         // decide.

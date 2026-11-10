@@ -1312,6 +1312,10 @@ struct Runner<'r, 'a> {
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
+    /// Questions the solver ran out of steps on in this call, each with the steps it had (see
+    /// `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_exhausted: IdMap<crate::mba::CacheKey, u64>,
     /// The roots of fragments the MBA phase asked about in this call and kept as they are:
     /// declined by the solver for their size, answered with nothing that would make the DAG
     /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
@@ -2430,6 +2434,8 @@ impl Engine {
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_exhausted: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_kept: IdMap::default(),
             #[cfg(feature = "mba")]

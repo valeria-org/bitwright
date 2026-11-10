@@ -170,40 +170,93 @@ fn scan_in0(
     lim: &MbaLimits,
     in_fragment: &dyn Fn(&Context, u32) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
-    let mut atoms: Vec<u32> = Vec::new();
-    let mut order: Vec<u32> = Vec::new();
-    let mut seen: IdMap<u32, ()> = IdMap::default();
-    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
-    while let Some((i, expanded)) = stack.pop() {
-        if expanded {
-            order.push(i);
-            continue;
-        }
-        if seen.insert(i, ()).is_some() {
-            continue;
-        }
-        if cx.node(i).width > lim.max_width {
-            return Err(Refusal::TooWide);
-        }
-        if seen.len() as u32 > lim.max_nodes {
-            return Err(Refusal::TooLarge);
-        }
-        if i != root && !in_fragment(cx, i) {
-            atoms.push(i);
-            if atoms.len() as u32 > lim.max_vars {
-                return Err(Refusal::TooManyVars);
+    Dense::with(&SEEN, cx.len(), |seen| {
+        let mut atoms: Vec<u32> = Vec::new();
+        let mut order: Vec<u32> = Vec::new();
+        let mut met = 0u32;
+        let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                order.push(i);
+                continue;
             }
-            continue;
+            if seen.insert(i, 0) {
+                continue;
+            }
+            met += 1;
+            if cx.node(i).width > lim.max_width {
+                return Err(Refusal::TooWide);
+            }
+            if met > lim.max_nodes {
+                return Err(Refusal::TooLarge);
+            }
+            if !in_fragment(cx, i) {
+                if i == root {
+                    return Err(Refusal::Unsupported("not an MBA operator".into()));
+                }
+                atoms.push(i);
+                if atoms.len() as u32 > lim.max_vars {
+                    return Err(Refusal::TooManyVars);
+                }
+                continue;
+            }
+            stack.push((i, true));
+            for c in cx.node(i).children() {
+                stack.push((c, false));
+            }
         }
-        if !in_fragment(cx, i) {
-            return Err(Refusal::Unsupported("not an MBA operator".into()));
+        Ok((atoms, order))
+    })
+}
+
+/// A map from arena indices to `u32` that is emptied in constant time: a slot holds its value
+/// while its stamp is the current generation. The lowering walks one fragment per reading of
+/// every candidate, and a hash map built and dropped for each was most of what a walk cost.
+#[derive(Default)]
+struct Dense {
+    stamp: Vec<u32>,
+    value: Vec<u32>,
+    generation: u32,
+}
+
+thread_local! {
+    static SEEN: std::cell::RefCell<Dense> = std::cell::RefCell::new(Dense::default());
+    static AT: std::cell::RefCell<Dense> = std::cell::RefCell::new(Dense::default());
+}
+
+impl Dense {
+    /// Runs `f` with the thread's map `key`, empty and sized for `len` indices.
+    fn with<R>(
+        key: &'static std::thread::LocalKey<std::cell::RefCell<Dense>>,
+        len: usize,
+        f: impl FnOnce(&mut Dense) -> R,
+    ) -> R {
+        let mut d = key.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if d.generation == u32::MAX {
+            d.stamp.clear();
+            d.generation = 0;
         }
-        stack.push((i, true));
-        for c in cx.node(i).children() {
-            stack.push((c, false));
+        d.generation += 1;
+        if d.stamp.len() < len {
+            d.stamp.resize(len, 0);
+            d.value.resize(len, 0);
         }
+        let out = f(&mut d);
+        key.with(|c| *c.borrow_mut() = d);
+        out
     }
-    Ok((atoms, order))
+
+    /// Sets `i` to `v`; whether it had a value.
+    fn insert(&mut self, i: u32, v: u32) -> bool {
+        let had = self.stamp[i as usize] == self.generation;
+        self.stamp[i as usize] = self.generation;
+        self.value[i as usize] = v;
+        had
+    }
+
+    fn get(&self, i: u32) -> Option<u32> {
+        (self.stamp[i as usize] == self.generation).then(|| self.value[i as usize])
+    }
 }
 
 /// Lowers the fragment rooted at `root` (arena index); non-fragment subterms become variables.
@@ -442,8 +495,19 @@ fn build0(
     order: Vec<u32>,
     solved: &[Solved],
 ) -> Result<(MbaExpr, Bindings), Refusal> {
+    Dense::with(&AT, cx.len(), |at| build_in(cx, atoms, order, solved, at))
+}
+
+fn build_in(
+    cx: &Context,
+    atoms: Vec<u32>,
+    order: Vec<u32>,
+    solved: &[Solved],
+    at: &mut Dense,
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    // An operand of a fragment's node is one of its atoms or an earlier node of it.
+    let unmet = || Refusal::Unsupported("an operand outside the fragment".into());
     let mut m = MbaExpr::new(atoms.iter().map(|&a| cx.width_of(a)).collect());
-    let mut at: IdMap<u32, u32> = IdMap::default();
     for (&a, k) in atoms.iter().zip(0u32..) {
         let v = m
             .push(MOp::Var(k), &[])
@@ -452,7 +516,7 @@ fn build0(
     }
     for s in solved {
         let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
-        let a = at[&s.atom];
+        let a = at.get(s.atom).ok_or_else(unmet)?;
         let k = m.push(MOp::Const(s.constant), &[]).map_err(bad)?;
         let args = if s.negated { [k, a] } else { [a, k] };
         let v = m.push(MOp::Sub, &args).map_err(bad)?;
@@ -460,7 +524,7 @@ fn build0(
     }
     for i in order {
         let n = cx.node(i);
-        let arg = |k: u32| at[&k];
+        let arg = |k: u32| at.get(k).unwrap_or(u32::MAX);
         let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
         let v = match n.op {
             OpCode::Const => m.push(
