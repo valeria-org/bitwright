@@ -401,10 +401,10 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
     const ANY: i32 = i32::MIN;
     let mut shift = vec![0i32; nodes.len()];
     let mut deg = vec![0u32; nodes.len()];
-    let mut vdeg: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
+    // Per node, a row of `nv` degrees (one table, not a vector per node); rows start at zero.
+    let mut vdeg: Vec<u32> = vec![0; nodes.len() * nv];
     let (mut poly, mut uniform, mut bitwise) = (true, true, false);
     let mut used = vec![false; nv];
-    let zeros = vec![0u32; nv];
     for (i, n) in nodes.iter().enumerate() {
         if !live[i] {
             continue;
@@ -412,7 +412,6 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         if cst[i].is_some() {
             local[i] = true;
             shift[i] = ANY;
-            vdeg[i] = zeros.clone();
             continue;
         }
         // A variable narrower than the question is read through casts, which say what its
@@ -429,19 +428,17 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
             MOp::Var(v) => {
                 local[i] = true;
                 deg[i] = 1;
-                let mut d = zeros.clone();
-                if let Some(x) = d.get_mut(v as usize) {
-                    *x = 1;
+                if (v as usize) < nv {
+                    vdeg[i * nv + v as usize] = 1;
                 }
                 if let Some(u) = used.get_mut(v as usize) {
                     *u = true;
                 }
-                vdeg[i] = d;
             }
             MOp::Zext if narrow_var => {
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = vdeg[a].clone();
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::And | MOp::Or | MOp::Xor => {
                 bitwise = true;
@@ -465,7 +462,6 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 };
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = zeros.clone();
             }
             // a shift of a bitwise function is one, at another offset (its
             // vacated bits are constants). Not at the corners, and not without bitwise
@@ -485,33 +481,32 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 };
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = zeros.clone();
             }
             MOp::Not | MOp::Neg | MOp::Shl(_) => {
                 local[i] = matches!(n.op, MOp::Not) && local[a];
                 shift[i] = shift[a];
                 deg[i] = deg[a];
-                vdeg[i] = vdeg[a].clone();
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::Add | MOp::Sub => {
                 deg[i] = deg[a].max(deg[b]);
-                vdeg[i] = vdeg[a]
-                    .iter()
-                    .zip(&vdeg[b])
-                    .map(|(x, y)| *x.max(y))
-                    .collect();
+                // Operands are earlier nodes: their rows lie before this one's.
+                let (before, row) = vdeg.split_at_mut(i * nv);
+                for (j, d) in row[..nv].iter_mut().enumerate() {
+                    *d = before[a * nv + j].max(before[b * nv + j]);
+                }
             }
             MOp::Mul => {
                 deg[i] = deg[a].saturating_add(deg[b]).min(DEGREE_CAP);
-                vdeg[i] = vdeg[a]
-                    .iter()
-                    .zip(&vdeg[b])
-                    .map(|(x, y)| x.saturating_add(*y).min(DEGREE_CAP))
-                    .collect();
+                let (before, row) = vdeg.split_at_mut(i * nv);
+                for (j, d) in row[..nv].iter_mut().enumerate() {
+                    *d = before[a * nv + j]
+                        .saturating_add(before[b * nv + j])
+                        .min(DEGREE_CAP);
+                }
             }
             MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
                 poly = false;
-                vdeg[i] = zeros.clone();
             }
         }
     }
@@ -522,7 +517,7 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         uniform,
         bitwise,
         degree: deg[root],
-        var_degree: std::mem::take(&mut vdeg[root]),
+        var_degree: vdeg[root * nv..(root + 1) * nv].to_vec(),
         used,
     })
 }
