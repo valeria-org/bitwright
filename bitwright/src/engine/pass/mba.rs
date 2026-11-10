@@ -1582,12 +1582,26 @@ fn sweep_cut(
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
-    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default()) {
-        if let Some(e) = sweep_cut_at(r, cx, cfg, n, c)? {
+    let t0 = std::time::Instant::now();
+    let cuts = shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default());
+    tmp_time("sc.shared", t0);
+    tmp_prof("sc.shared.cuts", cuts.len() as u64);
+    for c in cuts {
+        let t0 = std::time::Instant::now();
+        let got = sweep_cut_at(r, cx, cfg, n, c)?;
+        tmp_time("sc.at", t0);
+        if let Some(e) = got {
+            tmp_time("sc=some.cut", t0);
             return Ok(Some(e));
         }
     }
-    drop_noise(r, cx, cfg, n)
+    let t0 = std::time::Instant::now();
+    let got = drop_noise(r, cx, cfg, n)?;
+    tmp_time("sc.drop", t0);
+    if got.is_some() {
+        tmp_time("sc=some.drop", t0);
+    }
+    Ok(got)
 }
 
 /// the block `n` with each atom it does not depend on written as zero, read with
@@ -1602,13 +1616,28 @@ fn drop_noise(
     cfg: &MbaConfig,
     n: u32,
 ) -> Result<Option<u32>, Stop> {
-    let Ok((m, bindings)) = lower_id_reading(cx, n, &cfg.limits, Reading::Shallow) else {
+    let t0 = std::time::Instant::now();
+    let lowered = lower_id_reading(cx, n, &cfg.limits, Reading::Shallow);
+    tmp_time("dn.lower", t0);
+    let Ok((m, bindings)) = lowered else {
+        tmp_time("dn=refused", t0);
         return Ok(None);
     };
 
     if m.nodes().len() < SWEEP_CUT_NODES || m.vars().len() > SWEEP_DROP_VARS || !m.shape().mixed {
+        tmp_time(
+            if m.nodes().len() < SWEEP_CUT_NODES {
+                "dn=small"
+            } else if m.vars().len() > SWEEP_DROP_VARS {
+                "dn=vars"
+            } else {
+                "dn=notmixed"
+            },
+            t0,
+        );
         return Ok(None);
     }
+    let t0 = std::time::Instant::now();
     let mut read = m;
     for (v, &atom) in bindings.atoms.iter().enumerate() {
         if let (Some(kb), _) = super::known(r, cx, atom)?
@@ -1618,16 +1647,38 @@ fn drop_noise(
             read = m2;
         }
     }
+    tmp_time("dn.known", t0);
     let mut dropped = false;
     for v in 0..read.vars().len() as u32 {
+        let t0 = std::time::Instant::now();
         let Some(m0) = with_constant(&read, v) else {
             continue;
         };
-        if !sampled(r, &read, &m0, read.key()[0])? {
+        let agree = sampled(r, &read, &m0, read.key()[0])?;
+        tmp_time("dn.sampled", t0);
+        if !agree {
             continue;
         }
+        let t0 = std::time::Instant::now();
+        let s0 = r.meter.spent.mba_steps;
         let report = certify::prove(&read, &m0, &mut Steps::new(r, SWEEP_SHARE))?;
         count(r).certificates.record(&report);
+        tmp_time(
+            if report.verdict == Verdict::Proved {
+                "dn.cert=proved"
+            } else {
+                "dn.cert=open"
+            },
+            t0,
+        );
+        tmp_prof(
+            if report.verdict == Verdict::Proved {
+                "dn.cert=proved"
+            } else {
+                "dn.cert=open"
+            },
+            r.meter.spent.mba_steps - s0,
+        );
         if report.verdict == Verdict::Proved {
             read = m0;
             dropped = true;
@@ -1651,15 +1702,38 @@ fn sweep_cut_at(
     n: u32,
     c: u32,
 ) -> Result<Option<u32>, Stop> {
-    let Ok((m, bindings)) = lower_id_reading(cx, n, &cfg.limits, Reading::CutWhole(c)) else {
+    let t0 = std::time::Instant::now();
+    let lowered = lower_id_reading(cx, n, &cfg.limits, Reading::CutWhole(c));
+    tmp_time("sc.at.lower", t0);
+    let Ok((m, bindings)) = lowered else {
+        tmp_time("sc.at=refused", t0);
         return Ok(None);
     };
 
     if m.nodes().len() < SWEEP_CUT_NODES || m.vars().len() > SWEEP_CUT_VARS || !m.shape().mixed {
+        tmp_time(
+            if m.nodes().len() < SWEEP_CUT_NODES {
+                "sc.at=small"
+            } else if m.vars().len() > SWEEP_CUT_VARS {
+                "sc.at=vars"
+            } else {
+                "sc.at=notmixed"
+            },
+            t0,
+        );
         return Ok(None);
     }
     let size = m.nodes().len();
-    if let Some(expr) = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)? {
+    let t0 = std::time::Instant::now();
+    if tmp_off("BW_PROF_CUT") {
+        eprintln!("CUTAT n={n} c={c} atoms={:?}", bindings.atoms);
+    }
+    let answer = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)?;
+    tmp_time("sc.at.answer", t0);
+    if tmp_off("BW_PROF_CUT") {
+        eprintln!("CUTRES n={n} c={c} some={}", answer.is_some());
+    }
+    if let Some(expr) = answer {
         return Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?));
     }
     Ok(None)
@@ -1699,21 +1773,63 @@ fn cut_answer(
         return Ok(None);
     }
     let budget = cfg.budget.with_evidence(false).with_steps(limit);
+    let t0 = std::time::Instant::now();
     let (answer, spent) = r.inner.mba.solver.solve_counted(m, &budget);
     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
+    tmp_time("ca.solve", t0);
+    tmp_prof("ca.solve", spent);
+    if tmp_off("BW_PROF_CUT") {
+        let kind = match &answer {
+            MbaAnswer::Simplified { expr, .. } => format!("simplified:{}", expr.nodes().len()),
+            MbaAnswer::NoSimpler => "nosimpler".into(),
+            MbaAnswer::Unsupported(why) => format!("unsupported:{why}"),
+            MbaAnswer::Exhausted => "exhausted".into(),
+        };
+        eprintln!(
+            "CUT key={:x}{:x} nodes={} vars={} w={:?} limit={limit} spent={spent} us={} answer={kind}",
+            m.key()[0],
+            m.key()[1],
+            m.nodes().len(),
+            m.vars().len(),
+            m.width().map(|w| w.bits()),
+            t0.elapsed().as_micros(),
+        );
+    }
     r.meter.charge(Counter::MbaSteps, spent)?;
     let MbaAnswer::Simplified { expr, .. } = answer else {
+        tmp_time("ca=declined", t0);
+        tmp_prof("ca=declined", spent);
         return Ok(None);
     };
-    if expr.vars() != m.vars()
-        || expr.width() != m.width()
-        || expr.nodes().len() >= size
-        || !sampled(r, m, &expr, m.key()[0])?
-    {
+    if expr.vars() != m.vars() || expr.width() != m.width() || expr.nodes().len() >= size {
+        tmp_time("ca=notsmaller", t0);
+        tmp_prof("ca=notsmaller", spent);
         return Ok(None);
     }
+    let t0 = std::time::Instant::now();
+    if !sampled(r, m, &expr, m.key()[0])? {
+        tmp_time("ca=sample.refuted", t0);
+        return Ok(None);
+    }
+    let s0 = r.meter.spent.mba_steps;
     let report = certify::prove(m, &expr, &mut Steps::new(r, SWEEP_SHARE))?;
     count(r).certificates.record(&report);
+    tmp_time(
+        if report.verdict == Verdict::Proved {
+            "ca.cert=proved"
+        } else {
+            "ca.cert=open"
+        },
+        t0,
+    );
+    tmp_prof(
+        if report.verdict == Verdict::Proved {
+            "ca.cert=proved"
+        } else {
+            "ca.cert=open"
+        },
+        r.meter.spent.mba_steps - s0,
+    );
     if report.verdict != Verdict::Proved {
         return Ok(None);
     }
@@ -2050,14 +2166,22 @@ fn cases_fold(
     n: u32,
     attempts: &mut usize,
 ) -> Result<Option<u32>, Stop> {
-    let Some((c, t, f)) = r.build(cx, |cx| super::context::sides(cx, n))? else {
+    let tall = std::time::Instant::now();
+    let got = r.build(cx, |cx| super::context::sides(cx, n))?;
+    tmp_time("cf.sides", tall);
+    let Some((c, t, f)) = got else {
+        tmp_time("cf=none.sides", tall);
         return Ok(None);
     };
     *attempts += 1;
     let mut sides = [t, f];
     let mut values = [crate::BitVec::zero(cx.width_of(n)); 2];
-    for (slot, side) in values.iter_mut().zip(&mut sides) {
+    for (which, (slot, side)) in values.iter_mut().zip(&mut sides).enumerate() {
+        let t0 = std::time::Instant::now();
+        let snap = tmp_snapshot();
         *side = sweep_inner(r, cx, cfg, *side, false)?;
+        tmp_nested(&snap);
+        tmp_time("cf.sweep_side", t0);
         if let Some(k) = cx.const_val(*side) {
             *slot = k;
             continue;
@@ -2068,12 +2192,24 @@ fn cases_fold(
             return Ok(None);
         };
         if samples.iter().any(|v| *v != k) {
+            tmp_time(
+                if which == 0 {
+                    "cf=none.side0_varies"
+                } else {
+                    "cf=none.side1_varies"
+                },
+                tall,
+            );
             return Ok(None);
         }
         *slot = k;
     }
     for (side, k) in sides.into_iter().zip(values) {
-        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, &k, SWEEP_SHARE)?.0 {
+        let t0 = std::time::Instant::now();
+        let proved = cx.const_val(side).is_some() || readings_prove(r, cx, cfg, side, &k, SWEEP_SHARE)?.0;
+        tmp_time("cf.readings", t0);
+        if !proved {
+            tmp_time("cf=none.readings", tall);
             return Ok(None);
         }
     }
@@ -2083,10 +2219,47 @@ fn cases_fold(
         cx.c_select(c, t, f)
     })?;
     if e == n {
+        tmp_time("cf=none.same", tall);
         return Ok(None);
     }
+    tmp_time("cf=some", tall);
     count(r).piecewise_blocks += 1;
     Ok(Some(e))
+}
+
+/// (temporary) The wall-time categories as they stand, to attribute what a nested sweep adds.
+fn tmp_snapshot() -> std::collections::BTreeMap<&'static str, (u64, std::time::Duration)> {
+    TMP_TIME.with(|p| p.borrow().clone())
+}
+
+/// (temporary) What every wall-time category gained since `before`, under `cf>` and its name.
+fn tmp_nested(before: &std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>) {
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<&'static str, &'static str>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    TMP_TIME.with(|p| {
+        let mut p = p.borrow_mut();
+        let now: Vec<(&'static str, (u64, std::time::Duration))> =
+            p.iter().map(|(k, v)| (*k, *v)).collect();
+        for (k, (n, d)) in now {
+            if k.starts_with("cf>") {
+                continue;
+            }
+            let (n0, d0) = before.get(k).copied().unwrap_or_default();
+            if n == n0 {
+                continue;
+            }
+            let name = NAMES.with(|m| {
+                *m.borrow_mut()
+                    .entry(k)
+                    .or_insert_with(|| Box::leak(format!("cf>{k}").into_boxed_str()))
+            });
+            let e = p.entry(name).or_default();
+            e.0 += n - n0;
+            e.1 += d - d0;
+        }
+    });
 }
 
 /// whether `n` is `k` one case of a condition at a time: the condition its selects
