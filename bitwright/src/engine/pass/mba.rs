@@ -57,10 +57,12 @@ impl<'x, 'r, 'a> Gate<'x, 'r, 'a> {
     /// A meter for the certificate of `a == b`: at most [`GATE_SHARE`] of the call's pass
     /// work, or what a direct test of the pair costs (twice: with its casts taken out and
     /// without) where that is more.
-    fn new(r: &'x mut Runner<'r, 'a>, a: &MbaExpr, b: &MbaExpr) -> Self {
+    fn new(r: &'x mut Runner<'r, 'a>, a: &MbaExpr, b: &MbaExpr, part: u64) -> Self {
         let limit = r.meter.limit.pass_work;
         let direct = certify::direct_cost(a, b).unwrap_or(0).saturating_mul(2);
-        let share = (limit / GATE_SHARE).max(GATE_SHARE_MIN).max(direct);
+        let share = (limit / part)
+            .max(GATE_SHARE_MIN / (part / GATE_SHARE))
+            .max(direct);
         Gate { r, share }
     }
 }
@@ -96,8 +98,13 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// take far longer), over abstracted atoms when a side leaves the polynomial fragment. Charged
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
 /// than what is left is not started (reported as over budget).
-fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
-    let report = certify::prove(a, b, &mut Gate::new(r, a, b))?;
+fn exact(
+    r: &mut Runner<'_, '_>,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    part: u64,
+) -> Result<certify::Report, Stop> {
+    let report = certify::prove(a, b, &mut Gate::new(r, a, b, part))?;
     count(r).certificates.record(&report);
     Ok(report)
 }
@@ -2694,23 +2701,47 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let out = ask(r, cx, cfg, n, n)?;
-    // a fragment that reads slices of one rotated value, asked again with them
-    // written as masks of that rotation (see [`sliced`]).
+    let out = ask(r, cx, cfg, n, n, None)?;
     if let Step::Normal(fin) = &out
         && fin.done
     {
+        // a fragment that reads slices of one rotated value, asked again with them
+        // written as masks of that rotation (see [`sliced`]).
         let before = cx.len() as u32;
-        if let Some(root) = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))? {
-            let again = ask(r, cx, cfg, n, root)?;
+        let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
+        if let Some(root) = slices {
+            let again = ask(r, cx, cfg, n, root, None)?;
             if matches!(again, Step::To(..)) {
                 return Ok(again);
+            }
+        }
+        // And with a value most of its terms read cut off as one atom: an obfuscator writes
+        // `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of its own, and the whole question is
+        // then over what `t` is made of, where the cut one is over `t` alone.
+        for root in slices.into_iter().chain([n]) {
+            let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
+            for c in cuts {
+                let again = ask(r, cx, cfg, n, root, Some(c))?;
+                if matches!(again, Step::To(..)) {
+                    return Ok(again);
+                }
             }
         }
         discard(r, cx, before);
     }
     Ok(out)
 }
+
+/// The most shared values the MBA phase cuts a fragment at, one question each.
+const CUTS: usize = 2;
+
+/// The solver steps one of those questions takes. (At four times this, the questions that
+/// ran out left 140 measured calls twice the nodes; at a quarter, they answered half as many.)
+const CUT_STEPS: u64 = 1 << 14;
+
+/// The share of the call's pass work the certificate of a retried question's answer takes
+/// (see [`GATE_SHARE`]): one in this many.
+const RETRY_GATE_SHARE: u64 = 32;
 
 /// A node as bits of one rotation of another: `(rotl(base, rot) & mask) ^ flip`, at the
 /// node's width (at most 64 bits). Every node built over one value by shifts and rotations by
@@ -2873,6 +2904,9 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     }
     let mut memo: crate::hash::IdMap<u32, Slice> = crate::hash::IdMap::default();
     let mut parts: Vec<Part> = Vec::new();
+    // How many parts can be read at each rotation of each value.
+    let mut readers: std::collections::BTreeMap<(u32, u32), u32> =
+        std::collections::BTreeMap::new();
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     let mut stack = vec![n];
     while let Some(i) = stack.pop() {
@@ -2892,7 +2926,11 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
                     factor: None,
                 });
             }
-        } else if mixed_op(node.op) {
+            continue;
+        }
+        // Read as it is: one reader of itself, unrotated.
+        *readers.entry((i, 0)).or_default() += 1;
+        if mixed_op(node.op) {
             if node.op == OpCode::Mul && cx.width_of(i).bits() <= 64 {
                 let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
                 let product = match (konst(node.a), konst(node.b)) {
@@ -2923,7 +2961,7 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
         let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
         let s = p.slice;
         match p.factor {
-            Some(c) => (1..=c.trailing_zeros().min(w - 1))
+            Some(c) => (0..=c.trailing_zeros().min(w - 1))
                 .map(|k| {
                     let up = Slice {
                         rot: (s.rot + k) % w,
@@ -2948,9 +2986,6 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
                 .collect(),
         }
     };
-    // How many parts can be read at each rotation of each value.
-    let mut readers: std::collections::BTreeMap<(u32, u32), u32> =
-        std::collections::BTreeMap::new();
     for p in &parts {
         for (s, _) in readings(cx, p) {
             *readers.entry((s.base, s.rot)).or_default() += 1;
@@ -2991,6 +3026,9 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
         let Some((_, s, k)) = best else {
             continue;
         };
+        if p.factor.is_some() && k == 0 {
+            continue;
+        }
         let w = cx.width_of(p.node).bits();
         let x = over(cx, &s)?;
         let v = match p.factor {
@@ -3073,9 +3111,22 @@ fn ask(
     cfg: &MbaConfig,
     n: u32,
     root: u32,
+    cut: Option<u32>,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
-    let (m, bindings) = match lower_id(cx, root, &cfg.limits) {
+    // The whole fragment, or its semi-linear reading with the node `cut` an atom (and an
+    // operand that is the atom less a constant written over it, see `lower_id_over`).
+    let lowered = match cut {
+        None => lower_id(cx, root, &cfg.limits),
+        Some(c) => lower_id_over(
+            cx,
+            root,
+            &cfg.limits,
+            Some(Reading::Cut(c)),
+            &crate::hash::IdMap::default(),
+        ),
+    };
+    let (m, bindings) = match lowered {
         Ok(x) => x,
         Err(why) => {
             count(r).refused(&why);
@@ -3161,6 +3212,10 @@ fn ask(
                         .budget
                         .steps
                         .min(share)
+                        .min(match cut {
+                            Some(_) => CUT_STEPS,
+                            None => u64::MAX,
+                        })
                         .min(r.meter.left_in(|b| b.mba_steps));
                     if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
@@ -3227,7 +3282,15 @@ fn ask(
                         discard(r, cx, before);
                         return Ok(Step::Normal(fin));
                     }
-                    let own = exact(r, &m, &expr)?;
+                    // A question asked again another way (slices, a cut) proves its answer
+                    // within a smaller share: the node's own question had the large one, and
+                    // two retries that each took half the call's pass work left the root as
+                    // it was (eleven of 140 measured questions).
+                    let part = match cut.is_some() || root != n {
+                        true => RETRY_GATE_SHARE,
+                        false => GATE_SHARE,
+                    };
+                    let own = exact(r, &m, &expr, part)?;
                     if own.verdict == Verdict::Refuted {
                         count(r).refuted += 1;
                         discard(r, cx, before);
