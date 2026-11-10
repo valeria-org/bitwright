@@ -1218,26 +1218,26 @@ fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
         }
         let neg = BitVec::un_unchecked(crate::ops::UnOp::Neg, c);
         g.add_term(
-            vec![(
+            Mono::of(
                 Sym {
                     set: sym.set,
                     class: FULL,
                 },
                 1,
-            )],
+            ),
             &neg,
         );
         expect.add_term(m.clone(), c);
         for c2 in 0..n {
             if classes.low(c2) < pos {
                 expect.add_term(
-                    vec![(
+                    Mono::of(
                         Sym {
                             set: sym.set,
                             class: c2 as u16,
                         },
                         1,
-                    )],
+                    ),
                     &neg,
                 );
             }
@@ -1245,14 +1245,14 @@ fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
     }
     let mut body = q.clone();
     body.add_term(
-        Vec::new(),
+        Mono::new(),
         &BitVec::un_unchecked(crate::ops::UnOp::Neg, &konst),
     );
     if body != expect {
         return None;
     }
     if k {
-        g.add_term(Vec::new(), &BitVec::ones(w));
+        g.add_term(Mono::new(), &BitVec::ones(w));
     }
     let f = Bits::from_linear(&g.expand_full(classes), classes)?;
     f.uniform().then_some((pos, f))
@@ -1277,7 +1277,7 @@ fn sext_of(g: &Bits, pos: u16, classes: &Classes) -> Poly {
             let kv = BitVec::wrapping_from_i128(w, sign * i128::from(k));
             if q == 0 {
                 out.add_term(
-                    Vec::new(),
+                    Mono::new(),
                     &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &kv, classes.mask(c)),
                 );
                 continue;
@@ -1286,13 +1286,13 @@ fn sext_of(g: &Bits, pos: u16, classes: &Classes) -> Poly {
                 .filter(|&j| q >> j & 1 == 1)
                 .fold(0u64, |m, j| m | 1u64 << g.support[j]);
             out.add_term(
-                vec![(
+                Mono::of(
                     Sym {
                         set,
                         class: c as u16,
                     },
                     1,
-                )],
+                ),
                 &kv,
             );
         }
@@ -2249,7 +2249,7 @@ fn drop_dependent_atoms(
         // What the dropped atoms contribute where the kept ones are all 0: a constant in the
         // class's positions.
         fresh.add_term(
-            Vec::new(),
+            Mono::new(),
             &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &coef[0], classes.mask(c)),
         );
         for (q, x) in coef.iter().enumerate().skip(1) {
@@ -2259,13 +2259,13 @@ fn drop_dependent_atoms(
                 .filter(|&(t, _)| q >> t & 1 == 1)
                 .fold(0u64, |s, (_, &i)| s | 1 << u[i]);
             fresh.add_term(
-                vec![(
+                Mono::of(
                     poly::Sym {
                         set: s,
                         class: c as u16,
                     },
                     1,
-                )],
+                ),
                 x,
             );
         }

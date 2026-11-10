@@ -1671,17 +1671,17 @@ impl<'a> Render<'a> {
                 if base.is_zero() {
                     continue;
                 }
-                q.add_term(vec![(Sym { set, class: FULL }, 1)], base);
+                q.add_term(Mono::of(Sym { set, class: FULL }, 1), base);
                 let nb = BitVec::un_unchecked(UnOp::Neg, base);
                 for c in 0..n {
                     q.add_term(
-                        vec![(
+                        Mono::of(
                             Sym {
                                 set,
                                 class: c as u16,
                             },
                             1,
-                        )],
+                        ),
                         &nb,
                     );
                 }
@@ -1773,24 +1773,24 @@ impl<'a> Render<'a> {
                 for c2 in 0..n {
                     if c2 == s {
                         expect.add_term(
-                            vec![(
+                            Mono::of(
                                 Sym {
                                     set: *set,
                                     class: s as u16,
                                 },
                                 1,
-                            )],
+                            ),
                             c,
                         );
                     } else if self.classes.low(c2) < pos {
                         expect.add_term(
-                            vec![(
+                            Mono::of(
                                 Sym {
                                     set: *set,
                                     class: c2 as u16,
                                 },
                                 1,
-                            )],
+                            ),
                             &neg,
                         );
                     }
@@ -1860,13 +1860,13 @@ impl<'a> Render<'a> {
                         break;
                     }
                     g.add_term(
-                        vec![(
+                        Mono::of(
                             Sym {
                                 set: *set,
                                 class: FULL,
                             },
                             1,
-                        )],
+                        ),
                         &a,
                     );
                 }
@@ -1904,7 +1904,7 @@ impl<'a> Render<'a> {
         if exts.is_empty() {
             return Vec::new();
         }
-        let mut sum = if rest.terms().keys().all(Vec::is_empty) {
+        let mut sum = if rest.terms().keys().all(|m| m.is_empty()) {
             Sum {
                 terms: Vec::new(),
                 konst: (!rest.konst().is_zero()).then(|| rest.konst()),
@@ -2093,20 +2093,20 @@ impl<'a> Render<'a> {
                         let set = 1u64 << support[j];
                         for c in 0..n {
                             rest.add_term(
-                                vec![(
+                                Mono::of(
                                     Sym {
                                         set,
                                         class: c as u16,
                                     },
                                     1,
-                                )],
+                                ),
                                 &nb,
                             );
                         }
                         terms.push((self.atom(support[j])?, *b));
                     }
                     if !with_konst {
-                        rest.add_term(Vec::new(), &neg_konst);
+                        rest.add_term(Mono::new(), &neg_konst);
                     }
                     let form = if sign.is_ones() { rest.neg() } else { rest };
                     let Some(f) = Bits::from_linear(&form, self.classes) else {
@@ -2219,7 +2219,7 @@ impl<'a> Render<'a> {
             // position): `ps = h + extra + d'` with `h`'s constant `g0`.
             let dp = sub(&sub(&kp, &g0), &extra);
             let mut h = ps;
-            h.add_term(Vec::new(), &sub(&g0, &kp));
+            h.add_term(Mono::new(), &sub(&g0, &kp));
             let Some(f) = Bits::from_linear(&h, self.classes) else {
                 continue;
             };
@@ -2763,7 +2763,7 @@ impl<'a> Render<'a> {
                 )
             };
             // g = −m₀ + Σ m_T·AND_T.
-            rest.add_term(Vec::new(), &kg(m[0]));
+            rest.add_term(Mono::new(), &kg(m[0]));
             for (q, &v) in m.iter().enumerate().skip(1) {
                 if v == 0 {
                     continue;
@@ -2772,7 +2772,7 @@ impl<'a> Render<'a> {
                     .iter()
                     .filter(|&&(b, _)| q >> b & 1 == 1)
                     .fold(0u64, |s, &(_, a)| s | 1 << support[a]);
-                rest.add_term(vec![(Sym { set, class }, 1)], &neg(&kg(v)));
+                rest.add_term(Mono::of(Sym { set, class }, 1), &neg(&kg(v)));
             }
             let Some(r) = self.two_terms_by(&rest, false) else {
                 continue;
@@ -2854,7 +2854,7 @@ impl<'a> Render<'a> {
         if !konst.is_zero() {
             for (i, q) in parts.iter().enumerate() {
                 let mut qk = q.clone();
-                qk.add_term(Vec::new(), &konst);
+                qk.add_term(Mono::new(), &konst);
                 let sums = self.linear_sums(&qk);
                 let Some(si) = self.cheapest(sums) else {
                     continue;
@@ -3044,17 +3044,17 @@ impl<'a> Render<'a> {
                         )
                     };
                     // f = −m_∅ + Σ m_T·AND_T.
-                    rest.add_term(Vec::new(), &sv(m[0]));
+                    rest.add_term(Mono::new(), &sv(m[0]));
                     for (q, &v) in m.iter().enumerate().skip(1) {
                         if v != 0 {
                             rest.add_term(
-                                vec![(
+                                Mono::of(
                                     Sym {
                                         set: set_of(q),
                                         class,
                                     },
                                     1,
-                                )],
+                                ),
                                 &sv(-v),
                             );
                         }

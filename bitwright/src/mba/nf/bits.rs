@@ -8,7 +8,7 @@
 //! function.
 
 use super::classes::Classes;
-use super::poly::{Poly, Sym};
+use super::poly::{Mono, Poly, Sym};
 use crate::BitVec;
 use crate::facts::known::{bv_and, low_mask};
 use crate::ops::BinOp;
@@ -199,7 +199,7 @@ impl Bits {
                 let kv = BitVec::wrapping_from_i128(w, i128::from(k));
                 if q == 0 {
                     out.add_term(
-                        Vec::new(),
+                        Mono::new(),
                         &BitVec::bin_unchecked(BinOp::Mul, &kv, classes.mask(c)),
                     );
                     continue;
@@ -211,7 +211,7 @@ impl Bits {
                     set,
                     class: c as u16,
                 };
-                out.add_term(vec![(sym, 1)], &kv);
+                out.add_term(Mono::of(sym, 1), &kv);
             }
         }
         out
