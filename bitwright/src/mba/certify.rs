@@ -911,6 +911,31 @@ fn run<M: Meter>(
     test(meter, a, b, plan, report, true)
 }
 
+/// [`run`], evaluating in `lanes`.
+fn run_lanes<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    plan: &Plan,
+    report: &mut Report,
+    lanes: &mut Lanes<u64>,
+) -> Result<Run, M::Err> {
+    let tt = tmp_t("r.prog");
+    let progs = Program::new(a, false).zip(Program::new(b, false));
+    drop(tt);
+    let mut tested = Tested::default();
+    test_with(
+        meter,
+        [a, b],
+        progs.as_ref(),
+        plan,
+        report,
+        true,
+        &mut tested,
+        Some(lanes),
+    )
+}
+
 /// [`run`]; without `symbolic`, the planned test alone.
 fn test<M: Meter>(
     meter: &mut M,
@@ -921,10 +946,94 @@ fn test<M: Meter>(
     symbolic: bool,
 ) -> Result<Run, M::Err> {
     let tt = tmp_t("r.prog");
-    let (Some(pa), Some(pb)) = (Program::new(a, false), Program::new(b, false)) else {
+    let progs = Program::new(a, false).zip(Program::new(b, false));
+    drop(tt);
+    let mut tested = Tested::default();
+    test_with(
+        meter,
+        [a, b],
+        progs.as_ref(),
+        plan,
+        report,
+        symbolic,
+        &mut tested,
+        None,
+    )
+}
+
+/// What testing one pair of expressions found that does not depend on the budget, kept while
+/// the same pair may be tested again (a later policy that builds the same skeletons): how the
+/// symbolic comparison ended and how the evaluation did. A test of the pair again makes the
+/// same decisions on what is left of the budget and the same charges, and takes its answers
+/// from here instead of working them out again.
+#[derive(Default)]
+struct Tested {
+    symbolic: SymbolicSeen,
+    /// The evaluation, once it ran to its end: the number of points of each block (each
+    /// charged before it was evaluated), and the first point where the sides differ, if any.
+    evaluated: Option<(Vec<u32>, Option<Vec<BitVec>>)>,
+}
+
+/// What is known of [`symbolic_equal`] on one pair, whatever its limit: its work goes up
+/// check by check the same way under every limit, and it stops at the first check past its own.
+#[derive(Default, Clone, Copy)]
+enum SymbolicSeen {
+    #[default]
+    Unasked,
+    /// It ended within its limit, after this much work, with this answer: so it does within
+    /// any limit that is at least the work, and under a smaller one it is stopped.
+    Ended(u64, bool),
+    /// It was stopped by this limit (the largest tried): so it is by any limit up to it.
+    Stopped(u64),
+}
+
+impl SymbolicSeen {
+    /// [`symbolic_equal`] on `a` and `b` within `limit`: whether it proved them equal, and
+    /// its work when it ended within the limit, or some amount above the limit when it was
+    /// stopped (callers read no more of it than that).
+    fn equal(&mut self, a: &MbaExpr, b: &MbaExpr, limit: u64) -> (bool, u64) {
+        match *self {
+            SymbolicSeen::Ended(work, equal) if work <= limit => return (equal, work),
+            SymbolicSeen::Ended(work, _) => return (false, work),
+            SymbolicSeen::Stopped(l) if limit <= l => return (false, l.saturating_add(1)),
+            _ => {}
+        }
+        let mut work = 0u64;
+        let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+        *self = if work > limit {
+            SymbolicSeen::Stopped(limit)
+        } else {
+            SymbolicSeen::Ended(work, equal)
+        };
+        (equal, work)
+    }
+}
+
+/// Lanes kept from one evaluation to the next: the variables' columns and the registers of
+/// both sides.
+#[derive(Default)]
+struct Lanes<L> {
+    cols: Vec<Vec<L>>,
+    ra: Vec<Vec<L>>,
+    rb: Vec<Vec<L>>,
+}
+
+/// [`test`] on sides already compiled (`None`: one has no nodes), with what earlier tests of
+/// the same pair found (`tested`), in `lanes` when the caller keeps some.
+#[allow(clippy::too_many_arguments)]
+fn test_with<M: Meter>(
+    meter: &mut M,
+    [a, b]: [&MbaExpr; 2],
+    progs: Option<&(Program, Program)>,
+    plan: &Plan,
+    report: &mut Report,
+    symbolic: bool,
+    tested: &mut Tested,
+    lanes: Option<&mut Lanes<u64>>,
+) -> Result<Run, M::Err> {
+    let Some((pa, pb)) = progs else {
         return Ok(Run::TooBig);
     };
-    drop(tt);
     let kind = Kind::of(pa.widest().max(pb.widest()));
     let per = (pa.len() + pb.len()) as u64;
     let lane = match kind {
@@ -945,9 +1054,8 @@ fn test<M: Meter>(
     // it takes at least a unit per node.
     let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() / SYMBOLIC_RATE);
     if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
-        let mut work = 0;
         let tt = tmp_t("r.sym");
-        let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
+        let (equal, work) = tested.symbolic.equal(a, b, cap);
         drop(tt);
         meter.charge(work.min(cap) * SYMBOLIC_RATE)?;
         if equal {
@@ -958,15 +1066,48 @@ fn test<M: Meter>(
             return Ok(Run::OverBudget);
         }
     }
+    // The evaluation again: charged block by block as it was, with the answer it gave.
+    if let Some((blocks, differ)) = &tested.evaluated {
+        for &n in blocks {
+            meter.charge(per * u64::from(n))?;
+            report.points += u64::from(n);
+        }
+        return Ok(match differ {
+            Some(point) => Run::Differ(point.clone()),
+            None => Run::Equal(plan.cert),
+        });
+    }
     let width = a.width().map_or(1, |w| w.bits());
     let _tt = tmp_t("r.eval");
-    match kind {
-        Kind::N64 => run_in::<u64, M>(meter, a, &pa, &pb, plan, width, report),
-        Kind::N128 => run_in::<u128, M>(meter, a, &pa, &pb, plan, width, report),
-        Kind::Wide => run_in::<Wide, M>(meter, a, &pa, &pb, plan, width, report),
-    }
+    let mut blocks: Vec<u32> = Vec::new();
+    let ran = match (kind, lanes) {
+        (Kind::N64, Some(l)) => {
+            run_in::<u64, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::N64, None) => {
+            let l = &mut Lanes::default();
+            run_in::<u64, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::N128, _) => {
+            let l = &mut Lanes::default();
+            run_in::<u128, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::Wide, _) => {
+            let l = &mut Lanes::default();
+            run_in::<Wide, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+    }?;
+    let differ = match &ran {
+        Run::Differ(point) => Some(point.clone()),
+        _ => None,
+    };
+    tested.evaluated = Some((blocks, differ));
+    Ok(ran)
 }
 
+/// Evaluates the plan's points on both sides, a block at a time, in `lanes`; the points of
+/// each block charged are added to `blocks`.
+#[allow(clippy::too_many_arguments)]
 fn run_in<L: Lane, M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -975,22 +1116,31 @@ fn run_in<L: Lane, M: Meter>(
     plan: &Plan,
     width: u16,
     report: &mut Report,
+    lanes: &mut Lanes<L>,
+    blocks: &mut Vec<u32>,
 ) -> Result<Run, M::Err> {
     let vars = a.vars();
     let masks: Vec<L::M> = vars.iter().map(|&w| L::mask(w)).collect();
-    let mut cols: Vec<Vec<L>> = vec![Vec::with_capacity(BLOCK); vars.len()];
-    let (mut ra, mut rb): (Vec<Vec<L>>, Vec<Vec<L>>) = (Vec::new(), Vec::new());
+    let Lanes { cols, ra, rb } = lanes;
+    // A column of zeros per variable: one the plan does not use stays 0, whatever an earlier
+    // evaluation left in the lanes.
+    cols.resize_with(vars.len(), Vec::new);
+    for c in cols.iter_mut() {
+        c.clear();
+        c.resize(BLOCK, L::default());
+    }
     let mut points = Points::new(plan, width);
     let per = (pa.len() + pb.len()) as u64;
     loop {
-        let n = points.fill(&mut cols, &plan.used, vars, &masks);
+        let n = points.fill(cols, &plan.used, vars, &masks);
         if n == 0 {
             return Ok(Run::Equal(plan.cert));
         }
         meter.charge(per * n as u64)?;
         report.points += n as u64;
-        pa.run(&mut ra, &cols, n);
-        pb.run(&mut rb, &cols, n);
+        blocks.push(n as u32);
+        pa.run(ra, cols, n);
+        pb.run(rb, cols, n);
         let (x, y) = (&ra[pa.root()][..n], &rb[pb.root()][..n]);
         if let Some(p) = (0..n).find(|&p| x[p] != y[p]) {
             let point = vars
@@ -2297,6 +2447,31 @@ struct Compose {
     /// check reads (those there were when it was last set up; nodes added since have none
     /// to it).
     checked: Option<usize>,
+    /// Lanes for the skeletons' evaluations (the sample check and the tests), kept from one
+    /// to the next.
+    lanes: Lanes<u64>,
+}
+
+/// A pair of skeletons one comparison built, with what it found: a later policy that builds
+/// the same pair for the same two nodes (nothing was paired in between) is compared from here.
+struct Pair {
+    sx: Vec<SkelNode>,
+    sy: Vec<SkelNode>,
+    slots: Vec<(Slot, Width)>,
+    /// `None`: the skeletons are not both polynomial expressions at the nodes' width.
+    built: Option<Built>,
+}
+
+/// The skeletons of a [`Pair`] as expressions, and what does not depend on the budget.
+struct Built {
+    a: MbaExpr,
+    b: MbaExpr,
+    progs: Option<(Program, Program)>,
+    /// They agree with their nodes at the sample.
+    agreed: bool,
+    /// The cheapest direct test, if any applies (asked only of skeletons that agree).
+    plan: Option<Plan>,
+    tested: Tested,
 }
 
 /// A node's width and its sample values, as a table key (hashed four words abreast).
@@ -2414,6 +2589,7 @@ impl Compose {
             points: Vec::new(),
             digests: Vec::new(),
             checked: None,
+            lanes: Lanes::default(),
         };
         c.mark_forced();
         c.add_complements();
@@ -2655,6 +2831,7 @@ impl Compose {
             return Ok(());
         }
         drop(tt);
+        let mut seen: Vec<Pair> = Vec::new();
         for policy in [
             Policy::Minimal,
             Policy::Reps,
@@ -2664,7 +2841,7 @@ impl Compose {
         ] {
             let (a, b) = (self.root_a, self.root_b);
             let tq = std::time::Instant::now();
-            let cmp = self.compare(meter, report, a, b, policy)?;
+            let cmp = self.compare(meter, report, a, b, policy, &mut seen)?;
             tmp_time("C.roots", tq);
             match cmp {
                 (Some(Verdict::Proved), _) => {
@@ -2703,6 +2880,7 @@ impl Compose {
                 && ni.width == nm.width
                 && self.find(ni.args[0]) == self.find(nm.args[0]));
         }
+        let mut seen: Vec<Pair> = Vec::new();
         for policy in [
             Policy::Minimal,
             Policy::Reps,
@@ -2710,7 +2888,7 @@ impl Compose {
             Policy::Classes,
             Policy::Everything,
         ] {
-            if self.compare(meter, report, i, m, policy)?.0 == Some(Verdict::Proved) {
+            if self.compare(meter, report, i, m, policy, &mut seen)?.0 == Some(Verdict::Proved) {
                 return Ok(true);
             }
         }
@@ -2720,6 +2898,11 @@ impl Compose {
     /// Compares the skeletons of nodes `x` and `y` under `policy` with a direct test. `Refuted`
     /// (with the input where they differ, in the original variables) only when no atom got a
     /// variable of its own: then the skeletons equal the expressions at every input.
+    ///
+    /// `seen` holds the pairs of skeletons already compared for these two nodes (by earlier
+    /// policies, with nothing paired in between). A policy that builds one of them again is
+    /// compared from what was found then: the same decisions on what is left of the budget,
+    /// the same charges, the same answer.
     fn compare<M: Meter>(
         &mut self,
         meter: &mut M,
@@ -2727,6 +2910,25 @@ impl Compose {
         x: u32,
         y: u32,
         policy: Policy,
+        seen: &mut Vec<Pair>,
+    ) -> Result<Compared, M::Err> {
+        let mut lanes = std::mem::take(&mut self.lanes);
+        let out = self.compare_in(meter, report, x, y, policy, seen, &mut lanes);
+        self.lanes = lanes;
+        out
+    }
+
+    /// [`Compose::compare`], evaluating in `lanes`.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_in<M: Meter>(
+        &mut self,
+        meter: &mut M,
+        report: &mut Report,
+        x: u32,
+        y: u32,
+        policy: Policy,
+        seen: &mut Vec<Pair>,
+        lanes: &mut Lanes<u64>,
     ) -> Result<Compared, M::Err> {
         let mut vm = VarMap::default();
         let tq = std::time::Instant::now();
@@ -2745,35 +2947,45 @@ impl Compose {
         let (Some(sx), Some(sy)) = (sx, sy) else {
             return Ok((None, None));
         };
-        let tq = std::time::Instant::now();
         let w = self.nodes[x as usize].width;
-        let (Some(a), Some(b)) = (vm.expr(&sx, w), vm.expr(&sy, w)) else {
+        let at = seen
+            .iter()
+            .position(|p| p.slots == vm.slots && p.sx == sx && p.sy == sy);
+        let pair = match at {
+            Some(at) => &mut seen[at],
+            None => {
+                let built = self.built(&vm, &sx, &sy, x, y, lanes);
+                seen.push(Pair {
+                    sx,
+                    sy,
+                    slots: vm.slots.clone(),
+                    built,
+                });
+                let last = seen.len() - 1;
+                &mut seen[last]
+            }
+        };
+        let Some(Built {
+            a,
+            b,
+            progs,
+            agreed,
+            plan,
+            tested,
+        }) = pair.built.as_mut()
+        else {
             return Ok((None, None));
         };
-        tmp_time("c.expr", tq);
-        let tq = std::time::Instant::now();
-        let (Some(pa), Some(pb)) = (profile(&a), profile(&b)) else {
-            return Ok((None, None));
-        };
-        tmp_time("c.profile", tq);
-        if !(pa.poly && pb.poly) {
-            return Ok((None, None));
-        }
-        let tq = std::time::Instant::now();
-        let agreed = self.agrees(&vm, [(&a, x), (&b, y)]);
-        tmp_time("c.agrees", tq);
+        let (a, b): (&MbaExpr, &MbaExpr) = (a, b);
         // A skeleton is its side's value wherever its variables take their nodes' values: at
         // the sample it must be. One that is not would be a bug; decline.
-        if !agreed {
+        if !*agreed {
             report.internal += 1;
             return Ok((None, None));
         }
-        let tq = std::time::Instant::now();
-        let planned = plan(&a, &pa, &pb);
-        tmp_time("c.plan", tq);
-        let Some(p) = planned else {
+        let Some(p) = plan.as_ref() else {
             let tq = std::time::Instant::now();
-            let sym = symbolic(meter, &a, &b, report)?;
+            let sym = symbolic_seen(meter, a, b, report, &mut tested.symbolic)?;
             tmp_time("c.symbolic", tq);
             if sym {
                 report.cert = Some(Cert::Symbolic);
@@ -2781,18 +2993,27 @@ impl Compose {
             }
             if policy == Policy::Linear {
                 let tq = std::time::Instant::now();
-                let e = self.eliminate(meter, report, &mut vm, [a, b], w);
+                let e = self.eliminate(meter, report, &mut vm, [a, b], w, lanes);
                 tmp_time("c.eliminate", tq);
                 return e;
             }
             return Ok((None, None));
         };
         let tq = std::time::Instant::now();
-        let direct = run(meter, &a, &b, &p, report)?;
+        let direct = test_with(
+            meter,
+            [a, b],
+            progs.as_ref(),
+            p,
+            report,
+            true,
+            tested,
+            Some(lanes),
+        )?;
         tmp_time("c.run", tq);
         if matches!(direct, Run::TooBig | Run::OverBudget) {
             let tq = std::time::Instant::now();
-            let sym = symbolic(meter, &a, &b, report)?;
+            let sym = symbolic_seen(meter, a, b, report, &mut tested.symbolic)?;
             tmp_time("c.symbolic", tq);
             if sym {
                 report.cert = Some(Cert::Symbolic);
@@ -2804,7 +3025,7 @@ impl Compose {
             && matches!(direct, Run::Differ(_) | Run::TooBig)
         {
             let tq = std::time::Instant::now();
-            let e = self.eliminate(meter, report, &mut vm, [a, b], w);
+            let e = self.eliminate(meter, report, &mut vm, [a, b], w, lanes);
             tmp_time("c.eliminate", tq);
             return e;
         }
@@ -2828,12 +3049,57 @@ impl Compose {
         })
     }
 
+    /// The skeletons `sx` and `sy` of nodes `x` and `y` as expressions over `vm`'s variables,
+    /// compiled, checked against the sample and planned: what a comparison of them needs that
+    /// the budget has no part in. `None` unless both are polynomial expressions.
+    fn built(
+        &mut self,
+        vm: &VarMap,
+        sx: &[SkelNode],
+        sy: &[SkelNode],
+        x: u32,
+        y: u32,
+        lanes: &mut Lanes<u64>,
+    ) -> Option<Built> {
+        let tq = std::time::Instant::now();
+        let w = self.nodes[x as usize].width;
+        let (a, b) = (vm.expr(sx, w)?, vm.expr(sy, w)?);
+        tmp_time("c.expr", tq);
+        let tq = std::time::Instant::now();
+        let (pa, pb) = (profile(&a)?, profile(&b)?);
+        tmp_time("c.profile", tq);
+        if !(pa.poly && pb.poly) {
+            return None;
+        }
+        let tq = std::time::Instant::now();
+        let progs = Program::new(&a, false).zip(Program::new(&b, false));
+        let agreed = self.agrees(vm, [(&a, x), (&b, y)], progs.as_ref(), lanes);
+        tmp_time("c.agrees", tq);
+        let tq = std::time::Instant::now();
+        let plan = if agreed { plan(&a, &pa, &pb) } else { None };
+        tmp_time("c.plan", tq);
+        Some(Built {
+            a,
+            b,
+            progs,
+            agreed,
+            plan,
+            tested: Tested::default(),
+        })
+    }
+
     /// Whether the skeletons agree with their nodes at the sample (when its values are kept):
     /// each variable of `vm` takes its node's or class's value at each point. A value the
     /// sample did not keep (a node the evaluation left out) checks nothing. Evaluated a batch
     /// of points at a time where that computes what [`MbaExpr::eval`] does, else point by
     /// point (debug builds check that both agree).
-    fn agrees(&mut self, vm: &VarMap, sides: [(&MbaExpr, u32); 2]) -> bool {
+    fn agrees(
+        &mut self,
+        vm: &VarMap,
+        sides: [(&MbaExpr, u32); 2],
+        progs: Option<&(Program, Program)>,
+        lanes: &mut Lanes<u64>,
+    ) -> bool {
         let Some(kept) = self.checked else {
             return true;
         };
@@ -2846,7 +3112,7 @@ impl Compose {
             })
             .collect();
         let (points, digests) = (&self.points, &self.digests[..kept]);
-        match self.agrees_batched(vm, sides, points, digests, &class_root) {
+        match self.agrees_batched(vm, sides, progs, points, digests, &class_root, lanes) {
             Some(ok) => {
                 debug_assert_eq!(
                     ok,
@@ -2907,13 +3173,17 @@ impl Compose {
     /// and those are the first `n` points). `None` where it might not compute what
     /// [`MbaExpr::eval`] does: an original variable without a value or of another width, a
     /// skeleton whose variables are not the map's, a cast, or anything wider than 64 bits.
+    /// `progs`: the skeletons compiled (`None`: one has no nodes).
+    #[allow(clippy::too_many_arguments)]
     fn agrees_batched(
         &self,
         vm: &VarMap,
         sides: [(&MbaExpr, u32); 2],
+        progs: Option<&(Program, Program)>,
         points: &[Vec<BitVec>],
         digests: &[Vec<u64>],
         class_root: &[u32],
+        lanes: &mut Lanes<u64>,
     ) -> Option<bool> {
         let mut n = points.len();
         for (&(slot, sw), &c) in vm.slots.iter().zip(class_root) {
@@ -2931,8 +3201,9 @@ impl Compose {
                 Slot::Class(_) => n = n.min(digests.get(c as usize).map_or(0, Vec::len)),
             }
         }
-        let mut progs = Vec::with_capacity(sides.len());
-        for (skel, node) in sides {
+        let compiled = progs.map(|(pa, pb)| [pa, pb]);
+        let mut progs: [Option<(&Program, u32, Width)>; 2] = [None, None];
+        for (side, (skel, node)) in sides.into_iter().enumerate() {
             let w = self.nodes[node as usize].width;
             let fits = skel.width() == Some(w)
                 && skel.vars().len() == vm.slots.len()
@@ -2948,31 +3219,38 @@ impl Compose {
             if !fits {
                 return None;
             }
-            let prog = Program::new(skel, false)?;
+            let prog = compiled?[side];
             if prog.widest() > 64 {
                 return None;
             }
-            progs.push((prog, node, w));
+            progs[side] = Some((prog, node, w));
         }
         // Each variable's values at the first `n` points, as lanes (a class's value reduced to
         // the variable's width, as `BitVec::wrapping_from_u64` does).
-        let inputs: Vec<Vec<u64>> = vm
-            .slots
-            .iter()
-            .zip(class_root)
-            .map(|(&(slot, sw), &c)| match slot {
-                Slot::Orig(v) => points[..n]
-                    .iter()
-                    .map(|p| <u64 as Lane>::from_bv(&p[v as usize]))
-                    .collect(),
+        let Lanes {
+            cols: inputs,
+            ra: regs,
+            ..
+        } = lanes;
+        if inputs.len() < vm.slots.len() {
+            inputs.resize_with(vm.slots.len(), Vec::new);
+        }
+        for ((&(slot, sw), &c), col) in vm.slots.iter().zip(class_root).zip(inputs.iter_mut()) {
+            col.clear();
+            match slot {
+                Slot::Orig(v) => col.extend(
+                    points[..n]
+                        .iter()
+                        .map(|p| <u64 as Lane>::from_bv(&p[v as usize])),
+                ),
                 Slot::Class(_) => {
                     let m = <u64 as Lane>::mask(sw);
-                    digests[c as usize][..n].iter().map(|&x| x & m).collect()
+                    col.extend(digests[c as usize][..n].iter().map(|&x| x & m));
                 }
-            })
-            .collect();
-        let mut regs: Vec<Vec<u64>> = Vec::new();
-        for (prog, node, w) in &progs {
+            }
+        }
+        let inputs = &inputs[..vm.slots.len()];
+        for (prog, node, w) in progs.iter().flatten() {
             let Some(want) = digests.get(*node as usize) else {
                 continue;
             };
@@ -2980,7 +3258,7 @@ impl Compose {
             if upto == 0 {
                 continue;
             }
-            prog.run(&mut regs, &inputs, upto);
+            prog.run(regs, inputs, upto);
             let m = <u64 as Lane>::mask(*w);
             let got = &regs[prog.root()][..upto];
             if got.iter().zip(&want[..upto]).any(|(&g, &d)| g != d & m) {
@@ -3001,8 +3279,9 @@ impl Compose {
         meter: &mut M,
         report: &mut Report,
         vm: &mut VarMap,
-        sides: [MbaExpr; 2],
+        sides: [&MbaExpr; 2],
         w: Width,
+        lanes: &mut Lanes<u64>,
     ) -> Result<Compared, M::Err> {
         // The definitions of the atoms with class variables (arithmetic ones), skeletons first,
         // so every expression has the final variables.
@@ -3032,7 +3311,7 @@ impl Compose {
         if vm.slots.iter().any(|&(_, sw)| sw != w) {
             return Ok((None, None));
         }
-        let (Some(mut a), Some(mut b)) = (widen(&a0, n), widen(&b0, n)) else {
+        let (Some(mut a), Some(mut b)) = (widen(a0, n), widen(b0, n)) else {
             return Ok((None, None));
         };
         let defs: Vec<(u32, MbaExpr)> = defs
@@ -3087,7 +3366,7 @@ impl Compose {
                 drop(tt2);
                 let _tt2 = tmp_t("e.loop.run");
                 let linear = match plan(side, &ps, &pt) {
-                    Some(p) => match run(meter, side, &t, &p, report)? {
+                    Some(p) => match run_lanes(meter, side, &t, &p, report, lanes)? {
                         Run::Equal(_) => true,
                         Run::Differ(_) => false,
                         Run::TooBig | Run::OverBudget => symbolic(meter, side, &t, report)?,
@@ -3122,7 +3401,7 @@ impl Compose {
                 (None, None)
             });
         };
-        Ok(match run(meter, &a, &b, &p, report)? {
+        Ok(match run_lanes(meter, &a, &b, &p, report, lanes)? {
             Run::Equal(cert) => {
                 report.cert = Some(cert);
                 (Some(Verdict::Proved), None)
@@ -4345,10 +4624,20 @@ fn symbolic<M: Meter>(
     b: &MbaExpr,
     report: &mut Report,
 ) -> Result<bool, M::Err> {
+    symbolic_seen(meter, a, b, report, &mut SymbolicSeen::Unasked)
+}
+
+/// [`symbolic`], with what earlier comparisons of the same pair found (see [`Tested`]).
+fn symbolic_seen<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    report: &mut Report,
+    seen: &mut SymbolicSeen,
+) -> Result<bool, M::Err> {
     let limit = meter.left() / SYMBOLIC_RATE;
-    let mut work = 0u64;
     let tt = tmp_t("s.symbolic");
-    let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+    let (equal, work) = seen.equal(a, b, limit);
     drop(tt);
     if work > limit {
         report.over_budget = true;
@@ -4406,7 +4695,7 @@ struct Expansion {
 }
 
 /// A skeleton node before its variables are numbered.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum SkelNode {
     Const(BitVec),
     Var(u32),
