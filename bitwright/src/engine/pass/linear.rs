@@ -1069,6 +1069,150 @@ pub(super) fn by_groups(
     finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
 }
 
+/// The most terms of a sum [`by_factor`] reads, and the most factors of one of them.
+#[cfg(feature = "mba")]
+const FACTOR_TERMS: usize = 48;
+#[cfg(feature = "mba")]
+const FACTOR_LEAVES: usize = 8;
+
+/// The product `t` as a constant times its non-constant factors (sorted), read through
+/// products, negations and left shifts by a constant, shared or not; `None` past
+/// [`FACTOR_LEAVES`] factors.
+#[cfg(feature = "mba")]
+fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
+    let w = cx.width_of(t);
+    let mut k = BitVec::one(w);
+    let mut out: Vec<u32> = Vec::new();
+    let mut todo = vec![t];
+    let mut steps = 0usize;
+    while let Some(i) = todo.pop() {
+        steps += 1;
+        if steps > 4 * FACTOR_LEAVES {
+            return None;
+        }
+        let node = cx.node(i);
+        match node.op {
+            OpCode::Const => {
+                k = BitVec::bin_unchecked(BinOp::Mul, &k, &cx.const_val(i)?);
+            }
+            OpCode::Mul => todo.extend([node.a, node.b]),
+            OpCode::Neg => {
+                k = BitVec::un_unchecked(UnOp::Neg, &k);
+                todo.push(node.a);
+            }
+            OpCode::Shl if cx.const_val(node.b).is_some() => {
+                let scale =
+                    BitVec::bin_unchecked(BinOp::Shl, &BitVec::one(w), &cx.const_val(node.b)?);
+                k = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                todo.push(node.a);
+            }
+            _ => {
+                if out.len() == FACTOR_LEAVES {
+                    return None;
+                }
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    Some((k, out))
+}
+
+/// the sum `n` whose every term is a product with the same non-constant factors
+/// (`Σ (cᵢ·f)·tᵢ`: an obfuscator scales an MBA by a value, each coefficient spelled as a
+/// product of its own with it, `(f·a)·t₁ − (f·b)·t₂ + …`) written as `f · Σ cᵢ·tᵢ`, the inner
+/// sum simplified by `part` (the MBA phase). The whole is a polynomial over what `f` is made
+/// of, where the inner sum is linear over the atoms of the `tᵢ` alone. `None` when the terms
+/// share no factor.
+#[cfg(feature = "mba")]
+pub(super) fn by_factor(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    if form.terms.len() < 2 || form.terms.len() > FACTOR_TERMS || !form.konst.is_zero() {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
+    let mut products: Vec<(BitVec, Vec<u32>)> = Vec::with_capacity(form.terms.len());
+    // The factors every term has (a multiset: sorted, repeats kept).
+    let mut common: Option<Vec<u32>> = None;
+    for &(t, k) in &form.terms {
+        let Some((c, factors)) = scaled_factors(cx, t) else {
+            return Ok(None);
+        };
+        common = Some(match common {
+            None => factors.clone(),
+            Some(old) => {
+                let mut left = factors.clone();
+                old.into_iter()
+                    .filter(|f| match left.iter().position(|x| x == f) {
+                        Some(j) => {
+                            left.swap_remove(j);
+                            true
+                        }
+                        None => false,
+                    })
+                    .collect()
+            }
+        });
+        if common.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(None);
+        }
+        products.push((BitVec::bin_unchecked(BinOp::Mul, &k, &c), factors));
+    }
+    let Some(common) = common else {
+        return Ok(None);
+    };
+    let w = form.konst.width();
+    let before = cx.len() as u32;
+    let mut konst = BitVec::zero(w);
+    let mut terms: Vec<(u32, BitVec)> = Vec::with_capacity(products.len());
+    for (k, mut factors) in products {
+        for f in &common {
+            if let Some(j) = factors.iter().position(|x| x == f) {
+                factors.remove(j);
+            }
+        }
+        let mut rest: Option<u32> = None;
+        for f in factors {
+            rest = Some(match rest {
+                None => f,
+                Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Mul, a, f))?,
+            });
+        }
+        match rest {
+            Some(x) => terms.push((x, k)),
+            None => konst = BitVec::bin_unchecked(BinOp::Add, &konst, &k),
+        }
+    }
+    let s = emit(r, cx, &Form::of(konst, &terms))?;
+    let inner = part(r, cx, s)?.unwrap_or(s);
+    let mut e = inner;
+    for &f in &common {
+        e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, f, e))?;
+    }
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
+}
+
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
 /// themselves bitwise (constants aside), or `e` itself when it is not bitwise; `None` past a
 /// few hundred nodes.

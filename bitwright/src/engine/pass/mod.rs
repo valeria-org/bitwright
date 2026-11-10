@@ -363,6 +363,16 @@ pub(super) fn mba_step(
     if let Some(step @ Step::To(..)) = linear::by_sums(r, cx, n, &mut part)? {
         return Ok(step);
     }
+    let mut small =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
+            Ok(match mba::step_part(r, cx, cfg, s)? {
+                Step::To(e, _) => Some(e),
+                Step::Normal(_) => None,
+            })
+        };
+    if let Some(step @ Step::To(..)) = linear::by_factor(r, cx, n, &mut small)? {
+        return Ok(step);
+    }
     Ok(match linear::by_groups(r, cx, n, &mut part)? {
         Some(step @ Step::To(..)) => step,
         _ => whole,

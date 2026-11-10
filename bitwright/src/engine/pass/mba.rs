@@ -2701,7 +2701,7 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let out = ask(r, cx, cfg, n, n, None)?;
+    let out = ask(r, cx, cfg, n, n, None, u64::MAX)?;
     if let Step::Normal(fin) = &out
         && fin.done
     {
@@ -2710,7 +2710,7 @@ pub(super) fn step(
         let before = cx.len() as u32;
         let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
         if let Some(root) = slices {
-            let again = ask(r, cx, cfg, n, root, None)?;
+            let again = ask(r, cx, cfg, n, root, None, u64::MAX)?;
             if matches!(again, Step::To(..)) {
                 return Ok(again);
             }
@@ -2721,7 +2721,7 @@ pub(super) fn step(
         for root in slices.into_iter().chain([n]) {
             let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
             for c in cuts {
-                let again = ask(r, cx, cfg, n, root, Some(c))?;
+                let again = ask(r, cx, cfg, n, root, Some(c), CUT_STEPS)?;
                 if matches!(again, Step::To(..)) {
                     return Ok(again);
                 }
@@ -2730,6 +2730,24 @@ pub(super) fn step(
         discard(r, cx, before);
     }
     Ok(out)
+}
+
+/// The MBA phase at `n`, a part of a question written another way (a sum with its common
+/// factor taken out): the node's own question alone, within the steps a retried one takes
+/// (see [`CUT_STEPS`]). What an obfuscator scaled is a small question; what is not takes the
+/// steps the questions after it need.
+pub(super) fn step_part(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<Step, Stop> {
+    let poly = r.inner.mba.solver.polynomial_fragments();
+    let op = cx.node(n).op;
+    if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    ask(r, cx, cfg, n, n, None, CUT_STEPS)
 }
 
 /// The most shared values the MBA phase cuts a fragment at, one question each.
@@ -3112,6 +3130,7 @@ fn ask(
     n: u32,
     root: u32,
     cut: Option<u32>,
+    cap: u64,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
     // The whole fragment, or its semi-linear reading with the node `cut` an atom (and an
@@ -3212,10 +3231,7 @@ fn ask(
                         .budget
                         .steps
                         .min(share)
-                        .min(match cut {
-                            Some(_) => CUT_STEPS,
-                            None => u64::MAX,
-                        })
+                        .min(cap)
                         .min(r.meter.left_in(|b| b.mba_steps));
                     if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
