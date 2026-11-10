@@ -277,6 +277,8 @@ enum Map {
     Zext,
     /// Sign extension of `t`.
     Sext,
+    /// The low bits of `t`, as a narrower value.
+    Trunc,
 }
 
 /// The operand node `e` is a function of, and the function, if it is one of `Map`'s.
@@ -288,6 +290,7 @@ fn peel(cx: &Context, e: u32) -> Option<(u32, Map)> {
         OpCode::Not => return Some((n.a, Map::Reflect(BitVec::ones(w)))),
         OpCode::Zext => return Some((n.a, Map::Zext)),
         OpCode::Sext => return Some((n.a, Map::Sext)),
+        OpCode::Extract if n.b == 0 => return Some((n.a, Map::Trunc)),
         OpCode::Add | OpCode::Sub | OpCode::Xor | OpCode::And | OpCode::Or => {}
         _ => return None,
     }
@@ -379,6 +382,33 @@ fn preimage(m: Map, s: &Set, w: Width, tw: Width) -> Option<Set> {
             }
             for (lo, hi) in intersect(s, &parts) {
                 out.push((lo.trunc(tw).ok()?, hi.trunc(tw).ok()?));
+            }
+        }
+        Map::Trunc => {
+            if s.is_empty() {
+                return Some(out);
+            }
+            if *s == full(w) {
+                return Some(full(tw));
+            }
+            // One copy of `s` for every value of the bits the truncation drops.
+            let copies = 1u64
+                .checked_shl(u32::from(tw.bits() - w.bits()))
+                .filter(|&c| c.saturating_mul(s.len() as u64) <= MAX_INTERVALS as u64)?;
+            let step = BitVec::bin_unchecked(
+                BinOp::Shl,
+                &one(tw),
+                &BitVec::wrapping_from_u64(tw, u64::from(w.bits())),
+            );
+            let mut base = BitVec::zero(tw);
+            for _ in 0..copies {
+                for (lo, hi) in s {
+                    out.push((
+                        add(&lo.zext(tw).ok()?, &base),
+                        add(&hi.zext(tw).ok()?, &base),
+                    ));
+                }
+                base = add(&base, &step);
             }
         }
     }

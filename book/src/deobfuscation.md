@@ -3,7 +3,7 @@
 Obfuscators hide simple operations behind *mixed boolean-arithmetic* (MBA) identities, such as
 `x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back;
 code lifted from a binary also has the compiler's own disguises, such as divisions by constants
-done with multiplications. `Strategy::deobfuscate()` adds four passes to the standard strategy
+done with multiplications. `Strategy::deobfuscate()` adds five passes to the standard strategy
 for these (hash comparisons through invertible mixers are handled by the standard strategy; see
 [Invertibility](invertibility.md)):
 
@@ -25,6 +25,12 @@ for these (hash comparisons through invertible mixers are handled by the standar
 - **Shuffle.** Values assembled from slices of other values (extracts, shifts, masks, concats,
   ors of disjoint parts) are traced bit by bit, and re-emitted as the rotation, byte swap,
   extension or plain slice they are.
+- **Words.** Arithmetic done digit by digit (a virtual machine's handlers working on limbs of
+  its registers, a multi-precision routine) is read as arithmetic on the words: the digits of
+  the operands and the carries between them, a product by a constant spread over the limbs, a
+  constant added limb by limb. Every node is read as an integer form over `floor(x / 2^k)`
+  terms kept in one shape, in which the digits cancel; nothing is matched and nothing is
+  proved (see [below](#limb-arithmetic)).
 
 ```rust
 use bitwright::engine::{Engine, Strategy};
@@ -48,6 +54,48 @@ for (obfuscated, plain) in [
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Limb arithmetic
+
+A virtual machine that keeps a 32-bit value as limbs of 12 and 20 bits adds two of them limb by
+limb: the low limbs at the register's width, and the high limbs with the carry out of the low
+ones, which it takes by comparing the low limb of the sum with an operand's. A product by a
+constant is done on each limb with its own shift of the constant, and a constant is added in
+two parts. The pass reads each of these as the operation on the whole value:
+
+```rust
+use bitwright::engine::{Engine, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::builder().builtin().strategy(Strategy::deobfuscate()).build()?;
+let mut cx = Context::new();
+for (limbs, width, word) in [
+    // The high limb of a sum: the operands' high limbs and the carry of the low ones.
+    (
+        "trunc<20>((a:32 >>u 12) + (b:32 >>u 12) + zext<32>((a + b & 4095) <u (a & 4095)))",
+        20,
+        "extract<12, 20>(a + b)",
+    ),
+    // A product by a constant, limb by limb.
+    ("(x & 0xffff) * 0x1234567 + (x >>u 16) * 0x45670000", 32, "x * 0x1234567"),
+    // A constant added in two parts: the low one to the word, the high one to a slice of it.
+    ("extract<16, 16>(x:32 * 5 + 0x1234) + 0xab", 16, "extract<16, 16>(x * 5 + 0xab1234)"),
+] {
+    let e = cx.parse(limbs, &ParseOptions::width(Width::new(width)?))?;
+    let out = engine.simplify(&mut cx, e)?;
+    assert_eq!(cx.display(out.expr).to_string(), word);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Each node's unsigned value is written as a sum of terms over the integers, among them
+`floor(F / 2^k)` of such sums: a slice is two floors, a sum that wraps is itself less `2^w`
+times a floor, and `x <u y` is `−floor((x − y) / 2^k)`. Three identities keep every floor in one
+shape, and in that shape the carry above is `floor((a + b) / 2^k) − floor(a / 2^k) −
+floor(b / 2^k)`: the digits of `a` and `b` cancel against it, and what is left is the slice of
+`a + b`. A chain of such operations collapses one after the other. The result is written back
+from the root down, each node for all its users at once, wherever that leaves the expression
+smaller; where it does not, nothing changes.
 
 ## Divisions by constants
 

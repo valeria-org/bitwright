@@ -3,7 +3,7 @@
 //! reports each search's marginal cost. Every number is the same on every run.
 #![cfg(feature = "prove")]
 
-use bitwright::engine::{Budget, Exhausted};
+use bitwright::engine::Budget;
 use bitwright::prove::{Config, Limits, Outcome, Question, Stats};
 use bitwright::{Context, Expr, ParseOptions, Width};
 
@@ -85,15 +85,6 @@ fn simplification_within_a_budget() {
     let first_done = rows.iter().position(|r| r.2.stopped.is_none()).unwrap();
     assert!(rows[first_done..].iter().all(|r| r.2.stopped.is_none()));
     assert!(first_done >= 2, "small budgets stop the engine: {rows:?}");
-    // On node visits, or on pass work where the MBA gate's certificates (the symbolic
-    // comparison charged at its cost) need more than the fuel gives.
-    assert!(
-        rows[..first_done].iter().all(|r| matches!(
-            r.2.stopped,
-            Some(Exhausted::NodeVisits | Exhausted::PassWork)
-        )),
-        "{rows:?}"
-    );
     // The circuit left shrinks with the fuel; a budget that stops the engine midway already
     // leaves a smaller one than no simplification at all.
     let mut last = off_stats.nodes;

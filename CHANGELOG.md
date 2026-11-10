@@ -61,6 +61,62 @@ On that corpus the results have 16 percent fewer DAG nodes on the local windows 
 fewer on the deep ones, and 115 of the 234 that ran out of budget now finish (7 others now run
 out).
 
+Limb arithmetic read as arithmetic on the words, on the same corpus: what the comparisons
+above leave, the digits themselves.
+
+- **A new pass, `Words` (`Phase::Words`, phase name `words`), reads arithmetic done digit by
+  digit as arithmetic on the words.** `Strategy::deobfuscate()` runs it after `Demanded`.
+  Every node of at most 64 bits is read as an integer form `c + Σ kᵢ·tᵢ` whose terms are
+  nodes, `floor(F / 2^k)` of forms, ANDs of forms and choices: a slice is two floors, a sum
+  that may wrap is itself less `2^w` times a floor, `x <u y` is `−floor((x − y) / 2^k)`.
+  Identities of the integers keep every floor in one shape, and in that shape the digits of
+  the operands cancel against the carries between them by collecting terms: nothing is
+  matched against a pattern of limb code, and nothing is proved.
+  `trunc<20>((a >>u 12) + (b >>u 12) + zext<32>((a + b & 4095) <u (a & 4095)))` is
+  `extract<12, 20>(a + b)`; three limbs, the carry into the third written through the carry
+  into the second (`[b1 = all ones] & c0 | [s1 <u a1]`), are `extract<16, 16>(a + b)`, and
+  the same of a difference with its borrows, the comparisons spelled `x <u y` or as a
+  virtual machine's handlers do (`~((x == y) | (y <u x))`); `(x & 0xffff) * 0x1234567 +
+  (x >>u 16) * 0x45670000` is `x * 0x1234567`; `extract<16, 16>(x * 5 + 0x1234) + 0xab` is
+  `extract<16, 16>(x * 5 + 0xab1234)`; an XOR spelled `x + y − 2·(x & y)` in limbs is the
+  slice of `x ^ y`; a register chosen between the low half of one value and the high half of
+  another, limb by limb, is the limbs of the value chosen.
+- **What is written back is decided on the whole root.** The limbs of a word share their
+  carries, so no limb alone frees them. From the root down, each node's form is written out
+  again (the floors of one form as slices of that one word, any part that a node below
+  already is as that node), at its width and at the low bits of it that are read, sized
+  against what the root reaches without the node, and the node is replaced for all its users
+  at once where the root's DAG gets smaller. The result replaces the root by the commit
+  rule, and is asked again until nothing is found. A root of more than 1024 nodes is left to
+  its operands.
+- **Each of its rewrites is compared with the root at the verification points first**, as
+  the application of a rule linked without a proof is (`Verify::unproven_points`): the
+  derivation does not rest on that, but a defect of the pass would be seen there, and the
+  pass set aside for the call.
+- **Its work is charged to the pass-work budget**, a unit for two scratch nodes or terms, and
+  is capped at 2^23 a root and 2^26 a call, so that the pass alone does not use up a call's
+  budget.
+- **A range test of a truncation is a range test of the value.** The compares pass reads a
+  set of values of `trunc<k>(x)` as one of `x` (a copy for every value of the bits dropped),
+  as it does through a mask, so a test the invert pass made at the width both sides fit in
+  still joins the others of the value: a NaN test narrowed to `0x7f800000 <u trunc<31>(x)`
+  combines with the float comparisons of `x` as before (`ja` after `ucomiss` is
+  `fp.lt.f32(y, x)`).
+
+On that corpus, with the pass the results have 25.2 percent fewer DAG nodes than without it
+(5,262,215 against 7,032,940): 10.5 percent fewer on the local windows, 27.1 percent on the
+deep ones. 37,427 of the 58,530 results are smaller and 953 larger (by 3 nodes at the median,
+39 at most, 4,240 together against 1,774,965 saved): where the pass leaves a shape the other
+passes do less with than with the one it replaced. Among those looked at: products of an XOR
+in limbs by a constant, XORs of three or more values computed in different orders, and
+values chosen limb by limb between a constant and a register, none of which it reads whole.
+24 of the 123 that ran out of budget now finish, and 34 others now run out (29 on the MBA
+service's steps), each with a smaller result than it had. Simplifying a sample of 3,000 of
+them takes about a third longer with the pass (1.28 and 1.37 times the processor time, two
+runs side by side on a loaded machine). In a run of the corpus with a check added for the
+purpose, every replacement of a node was compared with the node at the engine's verification
+points: 582,393 replacements, no difference.
+
 Found by looking for inputs that break the engine and the provers: random DAGs over a few
 narrow symbols at widths from 1 to 512 bits, every result, every fact and every answer of the
 provers checked at every assignment of the symbols; the same with symbols as wide as the

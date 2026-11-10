@@ -30,6 +30,7 @@ pub(super) mod shuffle;
 mod slices;
 #[cfg(test)]
 mod tests;
+pub(super) mod words;
 pub(super) mod xor;
 
 use super::{Accept, By, Fin, Reject, Runner, Sharing, Step, Stop};
@@ -217,6 +218,8 @@ pub(crate) enum PassKind {
     /// Carry and borrow networks, proved by the native prover.
     #[cfg(feature = "prove")]
     Carries,
+    /// Limb arithmetic read as arithmetic on the words.
+    Words,
 }
 
 impl PassKind {
@@ -236,6 +239,7 @@ impl PassKind {
             PassKind::Mba => "mba",
             #[cfg(feature = "prove")]
             PassKind::Carries => "carries",
+            PassKind::Words => "words",
         }
     }
 }
@@ -267,6 +271,7 @@ pub(super) fn step(
         PassKind::Division => division::step(r, cx, n),
         #[cfg(feature = "prove")]
         PassKind::Carries => carries::step(r, cx, n),
+        PassKind::Words => words::step(r, cx, n),
         // Dispatched with its configuration by the engine.
         PassKind::Mba => Ok(Step::Normal(Fin::FINAL)),
     }
@@ -1240,7 +1245,11 @@ pub(super) fn finish_within(
         discard(r, cx, before);
         return Ok(Step::Normal(fin.and(more)));
     }
-    match r.accept(cx, By::Pass(name), true, n, e, fin.rel)? {
+    // The words pass replaces a whole root by what a chain of identities gives: its rewrites
+    // are compared at the verification points as an unproven rule's are (zero, all ones and
+    // seeded values; `Verify::unproven_points`), and a difference there quarantines it.
+    let proven = kind != PassKind::Words;
+    match r.accept(cx, By::Pass(name), proven, n, e, fin.rel)? {
         Accept::Yes => {
             r.stats.passes.entry(name).or_default().changed += 1;
             Ok(Step::To(e, fin))

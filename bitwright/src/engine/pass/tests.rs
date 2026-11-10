@@ -1248,6 +1248,9 @@ fn compares_fixtures() {
     same("(x + 3 <u 5) & (x == 1)", "x == 1", 8);
     same("((x & 0x7f) == 0) & (x <u 0x80)", "x == 0", 8);
     same("(~x <u 10) | (x <u 10)", "x - 246 <=u 19", 8);
+    // A truncation's values are the value's, a copy for each value of the bits dropped.
+    same("(3 <u trunc<7>(x)) & (x <u 100)", "x - 4 <=u 95", 8);
+    same("(trunc<7>(x) == 5) & (x <s 0)", "x == -123", 8);
     same("((x ^ 0x80) <u 0x10) | (x - 0x90 <u 0x10)", "x <=s 0x9f", 8);
     same("(-x == 3) & (x == 5)", "false", 8);
     same("((x | 0x80) == 0x85) ^ (x == 5)", "x == 0x85", 8);
@@ -1458,6 +1461,19 @@ fn peeled_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
         let low = cx.constant(&low).unwrap();
         let smin = cx.constant(&BitVec::smin(width)).unwrap();
         let v = || Width::new(w - 1).unwrap();
+        // A truncation of `x`, compared at its own width.
+        if w > 1 && g.rng.chance(1, 6) {
+            let j = 1 + g.rng.below(u64::from(w) - 1) as u16;
+            let t = cx.trunc(x, Width::new(j).unwrap()).unwrap();
+            let op = CmpOpExt::ALL[g.rng.below(10) as usize];
+            let c = g.constant(j);
+            let c = cx.constant(&c).unwrap();
+            return if g.rng.chance(1, 2) {
+                cx.cmp(op, t, c).unwrap()
+            } else {
+                cx.cmp(op, c, t).unwrap()
+            };
+        }
         let t = match g.rng.below(11) {
             0 => x,
             1 => cx.bin(BinOp::Add, x, k).unwrap(),
@@ -5598,13 +5614,13 @@ fn limb_slice_fixtures() {
             "a ^ b",
         ),
         // The sum of two digits carries: its high digit is not 0, and this is no slice of
-        // `x` (it was taken for one).
+        // `x` (it was taken for one). It is the slice less that carry (the words pass).
         (
             "extract<14, 16>(x - zext<32>(a:14) - zext<32>(b:14)) \
              + zext<16>(trunc<14>(x) <u (a:14 + b:14))"
                 .into(),
             32,
-            "zext<16>(trunc<14>(x) <u a + b) + extract<14, 16>(x - zext<32>(a) - zext<32>(b))",
+            "extract<14, 16>(x) - zext<16>(extract<14, 1>(zext<15>(b) + zext<15>(a)))",
         ),
     ] {
         assert_eq!(simplify(&eng, &src, w), want, "{src}");
