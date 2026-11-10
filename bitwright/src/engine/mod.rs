@@ -178,7 +178,10 @@ pub struct Strategy {
     pub name: Cow<'static, str>,
     /// The phases of a round.
     pub phases: Vec<Phase>,
-    /// The most rounds (at least 1).
+    /// The most rounds that change a root (at least 1). A round that changed nothing may be
+    /// followed by rounds over the same root in which the MBA phase asks the questions it had
+    /// cut short, and one such round may follow the last (see the solver's steps in
+    /// `docs/design.md`).
     pub max_rounds: u8,
     /// Whether rules marked `#[float_values]` apply: identities that hold for floats as
     /// values, every NaN one value (`x · 1 = x` for every `x`, where the product of a NaN with
