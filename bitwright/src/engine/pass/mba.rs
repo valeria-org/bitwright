@@ -8,7 +8,7 @@ use crate::hash::combine;
 use crate::mba::certify;
 use crate::mba::{
     Bindings, CacheEntry, CacheKey, Claim, LOWERING_VERSION, MOp, MbaAnswer, MbaConfig, MbaExpr,
-    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_reading, shared_nodes,
+    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_over, lower_id_reading, shared_nodes,
 };
 use crate::{BinOp, UnOp};
 
@@ -228,7 +228,17 @@ fn sweep_inner(
     let mut spent = false;
     macro_rules! asked {
         ($l:lifetime, $e:expr) => {
-            match $e {
+            asked!($l, "other", $e)
+        };
+        ($l:lifetime, $what:literal, $e:expr) => {{
+            let s0 = r.meter.spent.mba_steps;
+            let w0 = r.meter.spent.pass_work;
+            let got = $e;
+            tmp_prof($what, r.meter.spent.mba_steps - s0);
+            TMP_WORK.with(|p| {
+                *p.borrow_mut().entry($what).or_default() += r.meter.spent.pass_work - w0
+            });
+            match got {
                 Ok(v) => v,
                 Err(Stop::Exhausted(_)) => {
                     spent = true;
@@ -236,7 +246,7 @@ fn sweep_inner(
                 }
                 Err(e) => return Err(e),
             }
-        };
+        }};
     }
     // The node examined last, recorded in `r.swept` once the next one begins (unless the
     // budget ended while it was asked about, which left it unexamined).
@@ -285,13 +295,13 @@ fn sweep_inner(
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
             // A node the samples relate to one met before it (see `related`).
-            let found = match unrelated < SWEEP_UNRELATED {
+            let found = match unrelated < SWEEP_UNRELATED && !tmp_off("BW_NO_RELATED") {
                 true => classes.find(vals),
                 false => Vec::new(),
             };
             for (rep, relation, d) in found {
                 let rep = to.get(&rep).copied().unwrap_or(rep);
-                match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
+                match asked!('nodes, "related", related(r, cx, cfg, cur, rep, relation, &d)) {
                     Related::Proved(e) => {
                         to.insert(i, e);
                         continue 'nodes;
@@ -315,11 +325,12 @@ fn sweep_inner(
             {
                 rewritten = asked!(
                     'nodes,
+                    "cases_fold",
                     cases_fold(r, cx, cfg, cur, &mut case_attempts)
                 );
             }
             if rewritten.is_none() && top {
-                rewritten = asked!('nodes, sweep_cut(r, cx, cfg, cur));
+                rewritten = asked!('nodes, "sweep_cut", sweep_cut(r, cx, cfg, cur));
             }
             if let Some(e) = rewritten {
                 to.insert(i, e);
@@ -373,7 +384,7 @@ fn sweep_inner(
                 } else {
                     refuted = true;
                 }
-            } else if let Some(holds) = asked!('nodes, exhaustive(r, cx, subject, &k)) {
+            } else if let Some(holds) = asked!('nodes, "exhaustive", exhaustive(r, cx, subject, &k)) {
                 if holds {
                     decided = true;
                     count(r).opaque_exhausted += 1;
@@ -384,13 +395,13 @@ fn sweep_inner(
         }
         if !decided && !refuted && mixed {
             let seen;
-            (decided, refuted, seen) = asked!('nodes, readings_prove(r, cx, cfg, subject, &k));
+            (decided, refuted, seen) = asked!('nodes, "readings", readings_prove(r, cx, cfg, subject, &k));
             // The candidate as it is written, where the reduced one was not decided: taking
             // each operand on the bits its user reads writes one value read under several
             // masks once per mask, each a variable of its own, and what the terms cancel
             // through (the one value they all read) is gone.
-            if !decided && !refuted && subject != cur {
-                let again = asked!('nodes, readings_prove(r, cx, cfg, cur, &k));
+            if !decided && !refuted && subject != cur && !tmp_off("BW_NO_WRITTEN") {
+                let again = asked!('nodes, "readings_written", readings_prove(r, cx, cfg, cur, &k));
                 decided = again.0;
             }
             // the root, a constant some reading's free atoms refute, one case of
@@ -398,7 +409,7 @@ fn sweep_inner(
             // candidates are what the readings fold, and splitting each of them doubled the
             // sweep's time on the slow retries for no other constant.
             if !decided && !refuted && seen && cfg.known_atoms && i == root {
-                decided = asked!('nodes, cases_prove(r, cx, cfg, subject, &k));
+                decided = asked!('nodes, "cases_prove", cases_prove(r, cx, cfg, subject, &k));
                 if decided {
                     count(r).opaque_cases += 1;
                 }
@@ -419,7 +430,43 @@ fn sweep_inner(
     {
         r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
     }
+    tmp_prof_dump(root);
     Ok(to.get(&root).copied().unwrap_or(root))
+}
+
+thread_local! {
+    static TMP_PROF: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, u64)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn tmp_prof(what: &'static str, steps: u64) {
+    TMP_PROF.with(|p| {
+        let mut p = p.borrow_mut();
+        let e = p.entry(what).or_default();
+        e.0 += 1;
+        e.1 += steps;
+    });
+}
+
+fn tmp_prof_dump(root: u32) {
+    if std::env::var_os("BW_PROF").is_some() {
+        TMP_PROF.with(|p| eprintln!("sweep of {root}: {:?}", p.borrow()));
+        TMP_WORK.with(|p| eprintln!("sweep work of {root}: {:?}", p.borrow()));
+    }
+}
+
+thread_local! {
+    static TMP_WORK: std::cell::RefCell<std::collections::BTreeMap<&'static str, u64>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+thread_local! {
+    static TMP_UNDEC: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+pub(crate) fn tmp_off(name: &str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 /// How the samples relate a node to one met before it: `rep + d`, `d − rep` or `rep ^ d`.
@@ -615,8 +662,9 @@ const SWEEP_RELATED_BITS: u16 = 8;
 /// `m`'s bits of `x`. The bits that reach the root are what the demanded-bits transfers below let
 /// through from the root down (each a superset); a symbol's other bits are taken as zero, which
 /// no node can tell from any other value. Charged to the MBA solver's steps as the sweep's
-/// certificates are, within [`EXHAUSTIVE_SHARE`]. `None` when it does not apply or would cost
-/// more.
+/// certificates are, within [`EXHAUSTIVE_SHARE`], for the points it evaluates: an enumeration
+/// that would not fit is not begun, and one that meets a difference stops there. `None` when it
+/// does not apply or would cost more.
 fn exhaustive(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -750,10 +798,13 @@ fn exhaustive(
         // Over the values it can take: the bits known of it are those values' (a sum
         // that is constant only for them is constant), and a value it never takes refutes
         // nothing.
-        let [z, o] = super::known_words(r, cx, order[cut])?.0.unwrap_or([0, 0]);
+        let [z, o] = match tmp_off("BW_OLD_EXH") {
+            true => [0, 0],
+            false => super::known_words(r, cx, order[cut])?.0.unwrap_or([0, 0]),
+        };
         syms = vec![(order[cut], demand[cut] & !(z | o))];
         base = o & demand[cut];
-        cut_at = true;
+        cut_at = !tmp_off("BW_OLD_EXH");
         total = syms[0].1.count_ones();
         above(cx, &order, order[cut])
     } else {
@@ -764,42 +815,18 @@ fn exhaustive(
     let prog = program64(cx, &order, &at, &inputs);
     // A word program's evaluation costs a fraction of a generic one's (measured, see
     // [`WORD_EVALS`]); charged as that many generic evaluations.
-    let work = points
-        .saturating_mul(order.len() as u64)
-        .div_ceil(if prog.is_some() { WORD_EVALS } else { 1 });
+    let rate = if prog.is_some() { WORD_EVALS } else { 1 };
+    let cost = |n: u64| n.saturating_mul(order.len() as u64).div_ceil(rate);
     let mut meter = Steps::new(r, EXHAUSTIVE_SHARE);
-    if work > certify::Meter::left(&meter) {
+    if cost(points) > certify::Meter::left(&meter) {
         return Ok(None);
     }
-    certify::Meter::charge(&mut meter, work)?;
-    if let Some(prog) = prog {
-        let mut vals: Vec<u64> = vec![0; order.len()];
-        let ku = k.to_u64();
-        for p in 0..points {
-            let mut left = p;
-            for &(s, m) in &syms {
-                let mut v = base;
-                let mut mm = m;
-                while mm != 0 {
-                    let b = mm & mm.wrapping_neg();
-                    if left & 1 == 1 {
-                        v |= b;
-                    }
-                    left >>= 1;
-                    mm &= mm - 1;
-                }
-                vals[at[&s]] = v;
-            }
-            run64(&prog, &mut vals);
-            if Some(vals[at[&root]]) != ku {
-                return Ok((!cut_at).then_some(false));
-            }
-        }
-        return Ok(Some(true));
-    }
+    let ku = k.to_u64();
+    let mut words: Vec<u64> = vec![0; order.len()];
     let mut vals: Vec<BitVec> = vec![BitVec::zero(crate::Width::W1); order.len()];
-    for p in 0..points {
-        // Spread the point's bits over each symbol's bits that reach the root.
+    // Whether the root is `k` at point `p`, its bits spread over each input's bits that reach
+    // the root.
+    let mut agrees = |p: u64| -> Result<bool, Stop> {
         let mut left = p;
         for &(s, m) in &syms {
             let mut v = base;
@@ -812,7 +839,14 @@ fn exhaustive(
                 left >>= 1;
                 mm &= mm - 1;
             }
-            vals[at[&s]] = BitVec::wrapping_from_u64(cx.width_of(s), v);
+            match prog {
+                Some(_) => words[at[&s]] = v,
+                None => vals[at[&s]] = BitVec::wrapping_from_u64(cx.width_of(s), v),
+            }
+        }
+        if let Some(prog) = &prog {
+            run64(prog, &mut words);
+            return Ok(Some(words[at[&root]]) == ku);
         }
         for (idx, &i) in order.iter().enumerate() {
             if inputs.contains(&i) {
@@ -823,12 +857,58 @@ fn exhaustive(
                 .eval_node(i, |j| vals[at[&j]], |_, w| Some(BitVec::zero(w)))
                 .map_err(Stop::Error)?;
         }
-        if vals[at[&root]] != *k {
-            return Ok((!cut_at).then_some(false));
+        Ok(vals[at[&root]] == *k)
+    };
+    // A value the root differs at: of the symbols a refutation, of a node no answer.
+    let differs = (!cut_at).then_some(false);
+    // The points a candidate that is not `k` most often differs at, before the enumeration is
+    // paid for: each bit alone, all of them, and a few mixed. The samples leave candidates that
+    // are `k` unless some one bit is set, and counting up from zero reaches an input's top bit
+    // only at half the points (87 of 98 enumerations in one measured question ended there, and
+    // were four fifths of its sweep's steps).
+    if total > EXHAUSTIVE_SCREEN_BITS {
+        let mixed = (1..=EXHAUSTIVE_MIXED)
+            .map(|j: u64| j.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - total));
+        let probes = (0..total)
+            .map(|j| 1u64 << j)
+            .chain(std::iter::once(points - 1))
+            .chain(mixed);
+        certify::Meter::charge(&mut meter, cost(u64::from(total) + 1 + EXHAUSTIVE_MIXED))?;
+        for p in probes {
+            if !agrees(p)? {
+                return Ok(differs);
+            }
         }
+    }
+    let mut start = 0u64;
+    while start < points {
+        let n = EXHAUSTIVE_BLOCK.min(points - start);
+        certify::Meter::charge(&mut meter, cost(n))?;
+        for p in start..start + n {
+            if !agrees(p)? {
+                if std::env::var_os("BW_PROF").is_some() {
+                    eprintln!(
+                        "miss root={root} cut={cut_at} total={total} p={p:#x} nodes={} syms={:?}",
+                        order.len(),
+                        syms.iter().map(|(s, m)| (*s, format!("{m:#x}"))).collect::<Vec<_>>()
+                    );
+                }
+                return Ok(differs);
+            }
+        }
+        start += n;
     }
     Ok(Some(true))
 }
+
+/// The fewest bits [`exhaustive`] screens an enumeration of (fewer are as cheap to enumerate).
+const EXHAUSTIVE_SCREEN_BITS: u32 = 6;
+
+/// The mixed points of [`exhaustive`]'s screen.
+const EXHAUSTIVE_MIXED: u64 = 16;
+
+/// The points [`exhaustive`] is charged for at a time.
+const EXHAUSTIVE_BLOCK: u64 = 1 << 10;
 
 /// the node of `order` (operands first, the root last) that every demanded path
 /// from the symbols to the root passes through, nearest the symbols with at most
@@ -1113,7 +1193,7 @@ fn sweep_cut(
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
-    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS) {
+    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default()) {
         if let Some(e) = sweep_cut_at(r, cx, cfg, n, c)? {
             return Ok(Some(e));
         }
@@ -1254,7 +1334,23 @@ fn cut_answer(
 
 /// the sweep's readings of `subject` asked whether it is `k`: whether one proves it
 /// (`decided`), whether its whole fragment is refuted (`refuted`), and whether some narrower
-/// reading was refuted over its free atoms (a constant only through how its atoms relate).
+/// reading was refuted over its free atoms (a constant only through how its atoms relate) or
+/// the readings were cut short.
+///
+/// A candidate below `subject` whose readings were asked in this call and decided nothing is
+/// an atom to every reading here (`Runner::mba_undecided`). The sweep meets a constant's
+/// operands first, and an obfuscator builds one constant from another: where the lower one
+/// stays open, each node above it that the samples hold constant holds its fragment whole,
+/// and the certificates would spend a share on the same question at every one of them (ten
+/// links of one chain in a measured question, a share each; nine tenths of what the sweeps
+/// of 140 questions spent went to certificates that decided nothing, most of it this way).
+/// What an upper constant is beyond the open one, the readings over it as an atom still
+/// prove; a `subject` that is itself open is not asked again.
+///
+/// The readings are asked cheapest first, and they end at the first whose certificate takes
+/// most of its share and leaves the question open: the ones after it are larger. (Of 22,555
+/// proofs in the sweeps of those questions, six came after such a reading of the same
+/// candidate; half of what the undecided certificates spent did.)
 fn readings_prove(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1263,8 +1359,19 @@ fn readings_prove(
     k: &crate::BitVec,
 ) -> Result<(bool, bool, bool), Stop> {
     let (mut decided, mut refuted, mut seen) = (false, false, false);
-    let mut readings: Vec<(u64, Option<Reading>, MbaExpr, Bindings)> = Vec::new();
-    let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS);
+    // Each reading with its cost, and whether a refutation of it is one of `subject` (the
+    // whole fragment, no open candidate cut out of it).
+    let mut readings: Vec<(u64, Option<Reading>, bool, MbaExpr, Bindings)> = Vec::new();
+    let none = crate::hash::IdMap::default();
+    let open = if tmp_off("BW_NO_OPAQUE") {
+        &none
+    } else {
+        &r.mba_undecided
+    };
+    if open.contains_key(&subject) {
+        return Ok((false, false, false));
+    }
+    let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, open);
     let kinds = [Reading::SemiLinear, Reading::Shallow, Reading::Linear];
     let all = std::iter::once(None)
         .chain(kinds.into_iter().map(Some))
@@ -1273,14 +1380,11 @@ fn readings_prove(
                 .flat_map(|c| [Some(Reading::Cut(c)), Some(Reading::CutWhole(c))]),
         );
     for reading in all {
-        let lowered = match reading {
-            None => lower_id(cx, subject, &cfg.limits),
-            Some(rd) => lower_id_reading(cx, subject, &cfg.limits, rd),
-        };
+        let lowered = lower_id_over(cx, subject, &cfg.limits, reading, open);
         let Ok((m, bindings)) = lowered else {
             continue;
         };
-        if readings.iter().any(|(_, _, o, _)| *o == m) {
+        if readings.iter().any(|(_, _, _, o, _)| *o == m) {
             continue;
         }
         let t = m.vars().len().min(32) as u32;
@@ -1288,15 +1392,19 @@ fn readings_prove(
             Some(Reading::Linear) => 1u64 << t,
             _ => 64 * ((1u64 << t) - 1),
         };
+        let whole = reading.is_none() && bindings.atoms.iter().all(|a| !open.contains_key(a));
         readings.push((
             points.saturating_mul(m.nodes().len() as u64),
             reading,
+            whole,
             m,
             bindings,
         ));
     }
-    readings.sort_by_key(|(cost, _, _, _)| *cost);
-    'readings: for (cost, reading, m, bindings) in readings {
+    // Whether a certificate was asked and left the question open.
+    let mut open_asked = false;
+    readings.sort_by_key(|(cost, _, _, _, _)| *cost);
+    'readings: for (cost, reading, whole, m, bindings) in readings {
         if cost > SWEEP_SHARE {
             break;
         }
@@ -1314,18 +1422,101 @@ fn readings_prove(
         let mut known = false;
         loop {
             count(r).opaque_asked += 1;
-            let report = certify::prove(&m, &c, &mut Steps::new(r, SWEEP_SHARE))?;
+            let s0 = r.meter.spent.mba_steps;
+            let mut meter = Steps::new(r, SWEEP_SHARE);
+            let report = certify::prove(&m, &c, &mut meter)?;
+            // The certificate took most of its share and left the question open: the readings
+            // not yet asked are larger, and theirs would too. (Not the same reading asked
+            // again through its atoms' known bits: that is one more question of this
+            // reading, and the next reading has its own.)
+            let burned = !known && meter.share < SWEEP_SHARE / 2 && !tmp_off("BW_NO_BURN");
             count(r).certificates.record(&report);
+            {
+                let kind = match reading {
+                    None => 0,
+                    Some(Reading::SemiLinear) => 1,
+                    Some(Reading::Shallow) => 2,
+                    Some(Reading::Linear) => 3,
+                    Some(Reading::Cut(_)) => 4,
+                    _ => 5,
+                };
+                let verdict = match (report.verdict, report.over_budget) {
+                    (Verdict::Proved, _) => 0,
+                    (Verdict::Refuted, _) => 1,
+                    (_, true) => 2,
+                    _ => 3,
+                };
+                const L: [[&str; 4]; 6] = [
+                    ["rd.whole.proved", "rd.whole.refuted", "rd.whole.over", "rd.whole.unknown"],
+                    ["rd.semi.proved", "rd.semi.refuted", "rd.semi.over", "rd.semi.unknown"],
+                    ["rd.shallow.proved", "rd.shallow.refuted", "rd.shallow.over", "rd.shallow.unknown"],
+                    ["rd.linear.proved", "rd.linear.refuted", "rd.linear.over", "rd.linear.unknown"],
+                    ["rd.cut.proved", "rd.cut.refuted", "rd.cut.over", "rd.cut.unknown"],
+                    ["rd.cutw.proved", "rd.cutw.refuted", "rd.cutw.over", "rd.cutw.unknown"],
+                ];
+                tmp_prof(L[kind][verdict], r.meter.spent.mba_steps - s0);
+                if known {
+                    tmp_prof("rd.KNOWN-retry", r.meter.spent.mba_steps - s0);
+                }
+                if verdict >= 2 {
+                    let nested = TMP_UNDEC.with(|u| {
+                        let u = u.borrow();
+                        let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+                        let mut stack: Vec<u32> = cx.node(subject).children().collect();
+                        while let Some(i) = stack.pop() {
+                            if seen.insert(i, ()).is_some() {
+                                continue;
+                            }
+                            if u.contains(&i) {
+                                return true;
+                            }
+                            stack.extend(cx.node(i).children());
+                        }
+                        false
+                    });
+                    tmp_prof(
+                        if nested { "und.NESTED" } else { "und.FRESH" },
+                        r.meter.spent.mba_steps - s0,
+                    );
+                }
+                if verdict >= 2
+                    && r.meter.spent.mba_steps - s0 > 4000
+                    && std::env::var_os("BW_PROF3").is_some()
+                {
+                    let o = crate::PrintOptions::default()
+                        .with_max_nodes(usize::MAX)
+                        .with_max_chars(usize::MAX)
+                        .with_symbol_widths(true);
+                    eprintln!(
+                        "UNDECIDED subject={subject} kind={kind} k={k:?} vars={} nodes={}\n{}\n",
+                        m.vars().len(),
+                        m.nodes().len(),
+                        cx.display_with(cx.handle(subject), o)
+                    );
+                }
+                if std::env::var_os("BW_PROF2").is_some() {
+                    eprintln!(
+                        "cert verdict={verdict} subject={subject} kind={kind} vars={} nodes={} steps={} cost={cost} comp={} test={} direct={}",
+                        m.vars().len(),
+                        m.nodes().len(),
+                        r.meter.spent.mba_steps - s0,
+                        u8::from(report.compositional),
+                        report.cert.map_or("none", certify::Cert::name),
+                        certify::direct_cost(&m, &c).map_or(0, |d| d / 32),
+                    );
+                }
+            }
             match report.verdict {
                 Verdict::Proved => {
                     decided = true;
                     break 'readings;
                 }
-                Verdict::Refuted if reading.is_none() => {
+                Verdict::Refuted if whole => {
                     refuted = true;
                     break 'readings;
                 }
                 Verdict::Refuted if !known => {
+                    open_asked = true;
                     seen = true;
                     if !cfg.known_atoms {
                         break;
@@ -1339,8 +1530,23 @@ fn readings_prove(
                         None => break,
                     }
                 }
-                _ => break,
+                _ => {
+                    open_asked = true;
+                    if burned {
+                        // What the readings left unasked might have been refuted over their
+                        // free atoms: the root's cases are tried as if one was.
+                        seen = true;
+                        break 'readings;
+                    }
+                    break;
+                }
             }
+        }
+    }
+    if !decided && !refuted {
+        TMP_UNDEC.with(|u| u.borrow_mut().insert(subject));
+        if open_asked {
+            r.mba_undecided.insert(subject, ());
         }
     }
     Ok((decided, refuted, seen))
@@ -1620,7 +1826,25 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    let (s0, w0, st0) = (
+        r.meter.spent.mba_steps,
+        r.meter.spent.pass_work,
+        r.stats.mba,
+    );
     let out = ask(r, cx, cfg, n, n)?;
+    if std::env::var_os("BW_PROF4").is_some() && r.meter.spent.mba_steps - s0 > 50_000 {
+        let st = r.stats.mba;
+        eprintln!(
+            "asked n={n} steps={} work={} to={} proof_unknown={} not_smaller={} refuted={} simplified={}",
+            r.meter.spent.mba_steps - s0,
+            r.meter.spent.pass_work - w0,
+            matches!(out, Step::To(..)),
+            st.proof_unknown - st0.proof_unknown,
+            st.not_smaller - st0.not_smaller,
+            st.refuted - st0.refuted,
+            st.simplified - st0.simplified,
+        );
+    }
     // a fragment that reads slices of one rotated value, asked again with them
     // written as masks of that rotation (see [`sliced`]).
     if cfg.noise_forms
@@ -1728,31 +1952,50 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     Ok(Some(cx.substitute_ids(&[n], &repl)?[0]))
 }
 
-/// Whether the fragment under `root` holds one the solver already declined in this call for
-/// its size (too many atoms, variables or bit classes): a fragment that holds it has as many,
-/// and the solver would spend the same steps finding that out. An obfuscated value read by a
-/// chain of operations asks once at the first of them where it asked at every one (27
-/// questions of 820 nodes in one measured question, 310,000 steps each, half the run's steps).
-fn outgrown(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> bool {
-    if r.mba_outgrown.is_empty() {
+/// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
+/// this call and kept as it is (`Runner::mba_kept`): the solver declined it for its size (too
+/// many atoms, variables or bit classes), or its answer would not have made the DAG smaller,
+/// or the gate could not prove it. The larger fragment is then not asked. It has as many
+/// atoms as the one inside it; the solver would pay for the inner fragment's normal form
+/// again, at a cost that grows with the fragment; and what kept the inner answer back (its
+/// nodes are shared, its normal form is as large, no certificate decides it) keeps back an
+/// answer that holds it. An obfuscated value read by a chain of operations asks once at the
+/// first of them where it asked at every one (27 questions of 820 nodes in one measured
+/// question, 310,000 steps each, half the run's steps), and so do fragments that share a core
+/// whose answer was no smaller (five of 110 to 197 nodes in another, 2.5 million steps and no
+/// rewrite). `root` itself is asked again: the call remembers its answer, and what kept it
+/// back may be gone in a later round.
+fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> bool {
+    if r.mba_kept.is_empty() {
         return false;
     }
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     for &a in &bindings.atoms {
         seen.insert(a, ());
     }
-    let mut stack = vec![root];
+    let mut stack: Vec<u32> = cx.node(root).children().collect();
     while let Some(i) = stack.pop() {
         if seen.insert(i, ()).is_some() {
             continue;
         }
-        if r.mba_outgrown.contains_key(&i) {
+        if r.mba_kept.contains_key(&i) {
             return true;
         }
         stack.extend(cx.node(i).children());
     }
     false
 }
+
+fn kept_steps() -> u64 {
+    std::env::var("BW_KEPT_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(KEPT_STEPS)
+}
+
+/// The solver steps from which a fragment with no simpler form is kept from the questions
+/// above it (see [`holds_kept`]).
+const KEPT_STEPS: u64 = 1 << 12;
 
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
 /// the answer replaces `n`.
@@ -1789,7 +2032,7 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    if outgrown(r, cx, root, &bindings) {
+    if !tmp_off("BW_NO_OUTGROWN") && holds_kept(r, cx, root, &bindings) {
         count(r).unsupported += 1;
         return Ok(Step::Normal(Fin::FINAL));
     }
@@ -1856,6 +2099,23 @@ fn ask(
                         .with_steps(limit);
                     let (a, spent) = inner.mba.solver.solve_counted(&m, &budget);
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
+                    if std::env::var_os("BW_PROF4").is_some() {
+                        let what = match &a {
+                            MbaAnswer::Simplified { expr, .. } => {
+                                format!("simplified->{}", expr.nodes().len())
+                            }
+                            MbaAnswer::NoSimpler => "nosimpler".to_string(),
+                            MbaAnswer::Unsupported(why) => format!("unsupported({why})"),
+                            MbaAnswer::Exhausted => "exhausted".to_string(),
+                            #[allow(unreachable_patterns)]
+                            _ => "other".to_string(),
+                        };
+                        eprintln!(
+                            "ask n={n} root={root} nodes={} vars={} steps={spent} {what}",
+                            shape.nodes,
+                            m.vars().len()
+                        );
+                    }
                     r.meter.charge(Counter::MbaSteps, spent)?;
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
                         // Run short within what the account left it: more budget might
@@ -1866,8 +2126,13 @@ fn ask(
                     if a != MbaAnswer::Exhausted {
                         r.mba_answers.insert(key, a.clone());
                     }
-                    if matches!(&a, MbaAnswer::Unsupported(why) if why.starts_with("too many")) {
-                        r.mba_outgrown.insert(root, ());
+                    let kept = match &a {
+                        MbaAnswer::Unsupported(why) => why.starts_with("too many"),
+                        MbaAnswer::NoSimpler => spent >= kept_steps(),
+                        _ => false,
+                    };
+                    if kept {
+                        r.mba_kept.insert(root, ());
                     }
                     a
                 }
@@ -1891,6 +2156,7 @@ fn ask(
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
+                        r.mba_kept.insert(root, ());
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
                         discard(r, cx, before);
@@ -1933,6 +2199,7 @@ fn ask(
                             Fin::capped(Exhausted::PassWork)
                         } else {
                             r.mba_unproved.insert(key, ());
+                            r.mba_kept.insert(root, ());
                             Fin::FINAL
                         };
                         return Ok(Step::Normal(fin));
@@ -1997,6 +2264,7 @@ fn ask(
         count(r).simplified += 1;
     } else if e != n {
         count(r).not_smaller += 1;
+        r.mba_kept.insert(root, ());
     }
     Ok(out)
 }

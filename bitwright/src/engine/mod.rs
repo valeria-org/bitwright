@@ -1263,10 +1263,16 @@ struct Runner<'r, 'a> {
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
-    /// The roots of fragments the MBA solver declined for their size in this call (see
-    /// `pass::mba::outgrown`).
+    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
+    /// declined by the solver for their size, answered with nothing that would make the DAG
+    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
     #[cfg(feature = "mba")]
-    mba_outgrown: IdMap<u32, ()>,
+    mba_kept: IdMap<u32, ()>,
+    /// The opaque-constant candidates whose readings were asked in this call and decided
+    /// nothing: atoms to the readings of every candidate above them (see
+    /// `pass::mba::readings_prove`).
+    #[cfg(feature = "mba")]
+    mba_undecided: IdMap<u32, ()>,
     /// The opaque-constant sweep's result for every node it examined in this call (the node
     /// itself where it found nothing), so a sweep of another root or of one side of a case
     /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
@@ -2336,7 +2342,9 @@ impl Engine {
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
             #[cfg(feature = "mba")]
-            mba_outgrown: IdMap::default(),
+            mba_kept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_undecided: IdMap::default(),
             #[cfg(feature = "mba")]
             swept: IdMap::default(),
             live: pass::Live::default(),
@@ -2689,7 +2697,9 @@ impl Runner<'_, '_> {
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             if round > 0 {
-                cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                if std::env::var_os("BW_NO_RESWEEP").is_none() {
+                    cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                }
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
             let start = cur;

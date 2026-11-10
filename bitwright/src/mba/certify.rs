@@ -1075,6 +1075,10 @@ pub(crate) fn refute(a: &MbaExpr, b: &MbaExpr, points: &[Vec<BitVec>]) -> Option
 /// found to differ. Expressions over different variables or of different widths are not
 /// compared (`Unknown`).
 pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result<Report, M::Err> {
+    // Sums and differences that are bitwise functions, read as such (equal expressions, see
+    // `raise_disjoint`): every test below then takes them for what they are.
+    let (ra, rb) = (raise_disjoint(a), raise_disjoint(b));
+    let (a, b) = (ra.as_ref().unwrap_or(a), rb.as_ref().unwrap_or(b));
     // casts are atoms to the tests below, so a side that spells a value through
     // the low half of another is unrelated to it there, and the tests spend their work on
     // abstractions that cannot decide. Sides with casts are compared without them first
@@ -1680,6 +1684,100 @@ pub(crate) fn lower_known_bits(m: &MbaExpr) -> Option<MbaExpr> {
             },
         };
         facts.push(f);
+        map.push(r);
+    }
+    changed.then_some(out)
+}
+
+/// `m` with every sum of two bitwise terms that can share no set bit read as their `|`, and
+/// every difference `a − b` of two where `b` can have a bit only where `a` has it read as
+/// `a ^ b`: no carry and no borrow, so the same value at every input. A bitwise term here is
+/// a constant or a node made by `& | ^ ~` (or by a sum or difference so read), also through a
+/// zero extension or a truncation; the bits are what those operators, the constants and the
+/// constant shifts fix.
+///
+/// The arena's normal forms and the obfuscators both write such a function with `+` and `−`
+/// (`(~x & m) + k` for `(~x & m) | k`, `c − (x & m)` for `c ^ (x & m)`), and under a mask it is
+/// then arithmetic under a bitwise operator: an atom to the tests, unrelated to `x`, where
+/// the bitwise function is a term they decide at single bit positions. A sum with an operand
+/// that is no bitwise term stays a sum (`(x << 4) + (y & 15)` is linear as it is). `None`
+/// when there is none.
+pub(crate) fn raise_disjoint(m: &MbaExpr) -> Option<MbaExpr> {
+    use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_or, bv_shl};
+    let nodes = m.nodes();
+    // The known-zero and known-one bits of each node, and whether it is a bitwise term.
+    let mut bits: Vec<(BitVec, BitVec)> = Vec::with_capacity(nodes.len());
+    let mut term: Vec<bool> = Vec::with_capacity(nodes.len());
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for n in nodes {
+        let at = |k: usize| bits[n.args[k] as usize];
+        let terms = |k: usize| term[n.args[k] as usize];
+        let or = |(za, oa): (BitVec, BitVec), (zb, ob): (BitVec, BitVec)| {
+            (bv_and(&za, &zb), bv_or(&oa, &ob))
+        };
+        let xor = |(za, oa): (BitVec, BitVec), (zb, ob): (BitVec, BitVec)| {
+            (
+                bv_or(&bv_and(&za, &zb), &bv_and(&oa, &ob)),
+                bv_or(&bv_and(&za, &ob), &bv_and(&oa, &zb)),
+            )
+        };
+        let unknown = (BitVec::zero(n.width), BitVec::zero(n.width));
+        let ones = BitVec::ones(n.width);
+        let (op, known, is_term) = match n.op {
+            MOp::Const(v) => (n.op, (bv_not(&v), v), true),
+            MOp::Not => (n.op, (at(0).1, at(0).0), true),
+            MOp::And => {
+                let ((za, oa), (zb, ob)) = (at(0), at(1));
+                (n.op, (bv_or(&za, &zb), bv_and(&oa, &ob)), true)
+            }
+            MOp::Or => (n.op, or(at(0), at(1)), true),
+            MOp::Xor => (n.op, xor(at(0), at(1)), true),
+            MOp::Zext => {
+                let (z, o) = at(0);
+                let low = BitVec::ones(z.width()).zext(n.width).ok()?;
+                let z = bv_or(&z.zext(n.width).ok()?, &bv_not(&low));
+                (n.op, (z, o.zext(n.width).ok()?), terms(0))
+            }
+            MOp::Trunc => {
+                let (z, o) = at(0);
+                let known = (z.trunc(n.width).ok()?, o.trunc(n.width).ok()?);
+                (n.op, known, terms(0))
+            }
+            MOp::Shl(k) => {
+                let (z, o) = at(0);
+                let k = u32::from(k);
+                let low = bv_not(&bv_shl(&ones, k));
+                (n.op, (bv_or(&bv_shl(&z, k), &low), bv_shl(&o, k)), false)
+            }
+            MOp::LShr(k) => {
+                let (z, o) = at(0);
+                let k = u32::from(k);
+                let high = bv_not(&bv_lshr(&ones, k));
+                (n.op, (bv_or(&bv_lshr(&z, k), &high), bv_lshr(&o, k)), false)
+            }
+            // No bit set in both: no carry.
+            MOp::Add if terms(0) && terms(1) && bv_or(&at(0).0, &at(1).0).is_ones() => {
+                (MOp::Or, or(at(0), at(1)), true)
+            }
+            // The subtrahend's bits all among the minuend's: no borrow.
+            MOp::Sub if terms(0) && terms(1) && bv_or(&at(0).1, &at(1).0).is_ones() => {
+                (MOp::Xor, xor(at(0), at(1)), true)
+            }
+            _ => (n.op, unknown, false),
+        };
+        changed |= op != n.op;
+        let args: Vec<u32> = n.args[..n.op.arity()]
+            .iter()
+            .map(|&x| map[x as usize])
+            .collect();
+        let r = match op {
+            MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(op, args[0], n.width).ok()?,
+            op => out.push(op, &args).ok()?,
+        };
+        bits.push(known);
+        term.push(is_term);
         map.push(r);
     }
     changed.then_some(out)

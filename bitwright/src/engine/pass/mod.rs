@@ -466,6 +466,34 @@ pub(super) fn disjoint(
     Ok((d, fa, fb))
 }
 
+/// Whether the facts prove that every bit `b` may have set is one `a` has set (of one width),
+/// so that `a − b` borrows nothing and is `a ^ b`; with what the facts of each relied on.
+pub(super) fn within(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<(bool, Fin, Fin), Stop> {
+    let bits = cx.width_of(a).bits();
+    if bits <= 64 {
+        let (ka, fa) = known_words(r, cx, a)?;
+        let (kb, fb) = known_words(r, cx, b)?;
+        let mask = u64::MAX >> (64 - bits);
+        let w = matches!((ka, kb), (Some([_, oa]), Some([zb, _])) if !oa & !zb & mask == 0);
+        return Ok((w, fa, fb));
+    }
+    let (ka, fa) = known(r, cx, a)?;
+    let (kb, fb) = known(r, cx, b)?;
+    let w = match (ka, kb) {
+        (Some(x), Some(y)) => {
+            let free = crate::facts::known::bv_not(&x.known_one());
+            crate::facts::known::bv_and(&free, &y.maybe_one()).is_zero()
+        }
+        _ => false,
+    };
+    Ok((w, fa, fb))
+}
+
 /// a constant whose bits are all among the lowest four, and a product or sum whose
 /// residues show those bits zero for every input (`(z·z + z) | 1`, the left operand even), are
 /// disjoint; `None` when the operands are not of that shape.

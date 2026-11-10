@@ -201,6 +201,19 @@ rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }
 
 - `(p & 0xf0) + (q & 15)` → `(p & 0xf0) | (q & 15)`
 
+#### `sub_within` — rule
+
+A subtraction without borrows is a xor: the subtrahend has bits only where the
+constant has them. (From all ones it is the complement, which the linear pass reads.)
+
+```text
+rule sub_within<W>(x: W, c: const W) {
+        c - x => x ^ c if zero_bits(x, ~c) && c != ones
+    }
+```
+
+- `0xf7 - (p & 0x35)` → `(p & 0x35) ^ 0xf7`
+
 #### `mul_pow2` — rule
 
 Multiplying by a power of two is a shift.

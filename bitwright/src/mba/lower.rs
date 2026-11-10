@@ -214,17 +214,38 @@ pub(crate) fn lower_id_reading(
     lim: &MbaLimits,
     reading: Reading,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
-    let inside = |cx: &Context, i: u32, under: Option<&IdMap<u32, ()>>| match reading {
-        Reading::Shallow => {
-            in_reading(cx, i, Reading::SemiLinear)
-                && (bitwise_or_const(cx, i) || under.is_none_or(|u| !u.contains_key(&i)))
-        }
-        Reading::Cut(cut) => i != cut && in_reading(cx, i, Reading::SemiLinear),
-        Reading::CutWhole(cut) => i != cut && in_fragment(cx, i),
-        _ => in_reading(cx, i, reading),
+    lower_id_over(cx, root, lim, Some(reading), &IdMap::default())
+}
+
+/// [`lower_id`] (no reading) or [`lower_id_reading`] with every node of `opaque` below `root`
+/// an atom whatever its operator: the fragment ends there. An identity of the result holds for
+/// any values of those nodes, so for theirs.
+pub(crate) fn lower_id_over(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    reading: Option<Reading>,
+    opaque: &IdMap<u32, ()>,
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    let free = |i: u32| i == root || !opaque.contains_key(&i);
+    let Some(reading) = reading else {
+        let (atoms, order) = scan_in(cx, root, lim, &|cx, i| free(i) && in_fragment(cx, i))?;
+        return build(cx, atoms, order, &[]);
+    };
+    let inside = |cx: &Context, i: u32, under: Option<&IdMap<u32, ()>>| {
+        free(i)
+            && match reading {
+                Reading::Shallow => {
+                    in_reading(cx, i, Reading::SemiLinear)
+                        && (bitwise_or_const(cx, i) || under.is_none_or(|u| !u.contains_key(&i)))
+                }
+                Reading::Cut(cut) => i != cut && in_reading(cx, i, Reading::SemiLinear),
+                Reading::CutWhole(cut) => i != cut && in_fragment(cx, i),
+                _ => in_reading(cx, i, reading),
+            }
     };
     let under = match reading {
-        Reading::Shallow => Some(under_bitwise(cx, root, lim)?),
+        Reading::Shallow => Some(under_bitwise(cx, root, lim, opaque)?),
         _ => None,
     };
     let (atoms, order) = scan_in(cx, root, lim, &|cx, i| inside(cx, i, under.as_ref()))?;
@@ -256,7 +277,7 @@ pub(crate) fn lower_id_reading(
             });
         }
     }
-    if solved.is_empty() {
+    if solved.is_empty() || std::env::var_os("BW_NO_SOLVED").is_some() {
         return build(cx, atoms, order, &[]);
     }
     let (mut atoms, order) = scan_in(cx, root, lim, &|cx, i| {
@@ -305,8 +326,17 @@ struct Solved {
 
 /// the non-constant interior nodes of the semi-linear fragment below `root` that
 /// two or more of its nodes read, most read first (at most `n`): where a [`Reading::Cut`] may
-/// cut.
-pub(crate) fn shared_nodes(cx: &Context, root: u32, lim: &MbaLimits, n: usize) -> Vec<u32> {
+/// cut. The fragment ends at the nodes of `opaque` below `root` (see [`lower_id_over`]).
+pub(crate) fn shared_nodes(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    n: usize,
+    opaque: &IdMap<u32, ()>,
+) -> Vec<u32> {
+    let inside = |i: u32| {
+        (i == root || !opaque.contains_key(&i)) && in_reading(cx, i, Reading::SemiLinear)
+    };
     let mut users: IdMap<u32, u32> = IdMap::default();
     let mut seen: IdMap<u32, ()> = IdMap::default();
     let mut stack = vec![root];
@@ -314,7 +344,7 @@ pub(crate) fn shared_nodes(cx: &Context, root: u32, lim: &MbaLimits, n: usize) -
         if seen.insert(i, ()).is_some() || seen.len() as u32 > lim.max_nodes {
             continue;
         }
-        if !in_reading(cx, i, Reading::SemiLinear) {
+        if !inside(i) {
             continue;
         }
         for c in cx.node(i).children() {
@@ -324,9 +354,7 @@ pub(crate) fn shared_nodes(cx: &Context, root: u32, lim: &MbaLimits, n: usize) -
     }
     let mut v: Vec<(u32, u32)> = users
         .into_iter()
-        .filter(|&(i, k)| {
-            k >= 2 && cx.const_val(i).is_none() && in_reading(cx, i, Reading::SemiLinear)
-        })
+        .filter(|&(i, k)| k >= 2 && cx.const_val(i).is_none() && inside(i))
         .filter(|&(i, _)| cx.node(i).op != OpCode::Not)
         .map(|(i, k)| (k, i))
         .collect();
@@ -343,8 +371,13 @@ fn bitwise_or_const(cx: &Context, i: u32) -> bool {
 }
 
 /// The nodes of the semi-linear fragment below `root` that a bitwise operator of it reads
-/// (directly, or through other bitwise operators).
-fn under_bitwise(cx: &Context, root: u32, lim: &MbaLimits) -> Result<IdMap<u32, ()>, Refusal> {
+/// (directly, or through other bitwise operators); the fragment ends at the nodes of `opaque`.
+fn under_bitwise(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    opaque: &IdMap<u32, ()>,
+) -> Result<IdMap<u32, ()>, Refusal> {
     let mut under: IdMap<u32, ()> = IdMap::default();
     let mut seen: IdMap<(u32, bool), ()> = IdMap::default();
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
@@ -360,7 +393,10 @@ fn under_bitwise(cx: &Context, root: u32, lim: &MbaLimits) -> Result<IdMap<u32, 
         }
         let bitwise = bitwise_or_const(cx, i);
         // Arithmetic read by a bitwise operator is an atom: nothing below it is read here.
-        if (bw && !bitwise) || !in_reading(cx, i, Reading::SemiLinear) {
+        if (bw && !bitwise)
+            || (i != root && opaque.contains_key(&i))
+            || !in_reading(cx, i, Reading::SemiLinear)
+        {
             continue;
         }
         for c in cx.node(i).children() {

@@ -84,6 +84,13 @@ group core.arith {
     #[example("(p & 0xf0) + (q & 15)" => "(p & 0xf0) | (q & 15)")]
     rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }
 
+    /// A subtraction without borrows is a xor: the subtrahend has bits only where the
+    /// constant has them. (From all ones it is the complement, which the linear pass reads.)
+    #[example("0xf7 - (p & 0x35)" => "(p & 0x35) ^ 0xf7")]
+    rule sub_within<W>(x: W, c: const W) {
+        c - x => x ^ c if zero_bits(x, ~c) && c != ones
+    }
+
     /// Multiplying by a power of two is a shift.
     #[example("p * 8" => "p << 3")]
     rule mul_pow2<W>(x: W, c: const W) { x * c => x << k if is_pow2(c) let k: W = ctz(c) }

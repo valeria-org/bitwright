@@ -43,7 +43,9 @@ pub use threaded::ThreadedSolver;
 pub(crate) use decast::decast;
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
-pub(crate) use lower::{Reading, fits_nodes, lift_id, lower_id, lower_id_reading, shared_nodes};
+pub(crate) use lower::{
+    Reading, fits_nodes, lift_id, lower_id, lower_id_over, lower_id_reading, shared_nodes,
+};
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
     MemoryCache, NoCache, SignatureSolver, Verdict,

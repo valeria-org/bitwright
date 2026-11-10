@@ -5606,4 +5606,34 @@ mod opaque_constants {
             .unwrap();
         assert_eq!(r, want, "{}", cx.display(r));
     }
+
+    /// What the sweep takes from facts that hold only under the run's assumptions, the result
+    /// relies on them for: the guard above is false wherever `x` is assumed not to be `k`.
+    #[test]
+    fn what_the_sweep_takes_from_an_assumption_is_relied_on() {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        let o = ParseOptions::width(Width::W64);
+        let mut cx = Context::new();
+        let e = cx
+            .parse("zext<64>(x == 0x1234567) + 5 + (y & (z | y)) - y", &o)
+            .unwrap();
+        let p = cx.parse("x != 0x1234567", &o).unwrap();
+        let mut a = crate::Assumptions::new();
+        let id = a.assume_true(&mut cx, p).unwrap();
+        let out = eng
+            .run(&mut cx, &[e], Run::default().with_assumptions(&a))
+            .unwrap();
+        let r = out.roots[0];
+        assert_eq!(cx.display(r.expr).to_string(), "5:64");
+        assert!(r.relies_on.may_use(id), "{:?}", r.relies_on);
+        // With no assumption the guard stays, and nothing is relied on.
+        let free = eng.run(&mut cx, &[e], Run::default()).unwrap().roots[0];
+        assert!(cx.as_const(free.expr).unwrap().is_none() && free.relies_on.is_none());
+    }
 }

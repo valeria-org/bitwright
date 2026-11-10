@@ -2,15 +2,16 @@
 //!
 //! A node's *form* is computed from its operands' forms: `+`, `−`, negation, `~a = −a − 1`,
 //! multiplication by a constant, shifts left by a constant (scaling), `|`/`^` of operands the
-//! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1,
-//! except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads the first as
-//! `−zext(c)`.
+//! facts prove disjoint (both are `+` then), `^` of operands one of which the facts prove to
+//! have bits only where the other has them (a `−` then). Anything else is an *atom* with
+//! coefficient 1, except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads
+//! the first as `−zext(c)`.
 //! A form with more than [`MAX_TERMS`] terms is atomized. The form is re-emitted canonically
 //! (terms in the context's canonical order, positive coefficients first, power-of-two
 //! coefficients as shifts, the constant last), and the emission replaces the node only when
 //! the region above the atoms gets strictly smaller.
 
-use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
+use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, within, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, Node, OpCode};
@@ -381,12 +382,24 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
                 // The sum relies on what proved the operands disjoint.
                 let mut f = get(r, node.a).add(&get(r, node.b));
                 f.fin = f.fin.and(fina).and(finb);
-                f
-            } else {
-                Form {
-                    fin: fina.and(finb).unchanged(),
-                    ..Form::atom(i, w)
+                return Ok(f);
+            }
+            // A xor that only clears bits its other operand has set is their difference
+            // (`c ^ t` with `t ⊆ c` is `c − t`: no borrow), so a sum cancels through it as it
+            // does through the subtraction the rules write that way (`sub_within`).
+            if node.op == OpCode::Xor {
+                for (whole, part) in [(node.a, node.b), (node.b, node.a)] {
+                    let (inside, finw, finp) = within(r, cx, whole, part)?;
+                    if inside {
+                        let mut f = get(r, whole).add(&get(r, part).neg());
+                        f.fin = f.fin.and(finw).and(finp);
+                        return Ok(f);
+                    }
                 }
+            }
+            Form {
+                fin: fina.and(finb).unchanged(),
+                ..Form::atom(i, w)
             }
         }
         _ => Form::atom(i, w),

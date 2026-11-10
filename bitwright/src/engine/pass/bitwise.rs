@@ -898,6 +898,105 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
     finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
 }
 
+/// The most nodes a one-atom region walks.
+const ONE_ATOM_REGION: usize = 64;
+
+/// The bitwise pass at `n` for a function of one atom and any constants: `(x & a) ^ b`, when
+/// that is smaller. Each bit of such a function is 0, 1, the atom's bit or its complement,
+/// whatever the constants are, so its value at 0 (`b`) and where that differs from its value
+/// at all-ones (`a`) say what it is; the classes of [`masked`] (at most [`MAX_MASKS`]
+/// constants, two tables) are not needed.
+fn one_atom_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let w = cx.width_of(n);
+    // The region, operands first; its one atom and its constants.
+    let mut order: Vec<u32> = Vec::new();
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    let (mut atom, mut consts, mut ops) = (None, Vec::new(), 0u32);
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            order.push(i);
+            continue;
+        }
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if seen.len() > ONE_ATOM_REGION {
+            r.meter.charge(Counter::PassWork, seen.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+        let node = cx.node(i);
+        if bitwise_op(node.op) {
+            ops += 1;
+            stack.push((i, true));
+            stack.extend(node.children().map(|c| (c, false)));
+        } else if cx.const_val(i).is_some() {
+            consts.push(i);
+        } else if atom.is_some_and(|a| a != i) {
+            r.meter.charge(Counter::PassWork, seen.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        } else {
+            atom = Some(i);
+        }
+    }
+    r.meter.charge(Counter::PassWork, 2 * seen.len() as u64)?;
+    let Some(x) = atom else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    // The function at `x = v`.
+    let at = |v: BitVec| -> BitVec {
+        let mut vals: crate::hash::IdMap<u32, BitVec> = crate::hash::IdMap::default();
+        vals.insert(x, v);
+        for &c in &consts {
+            vals.insert(c, cx.const_val(c).unwrap_or(BitVec::zero(w)));
+        }
+        for &i in &order {
+            let node = cx.node(i);
+            let v = match node.op {
+                OpCode::Not => BitVec::un_unchecked(UnOp::Not, &vals[&node.a]),
+                OpCode::And => BitVec::bin_unchecked(BinOp::And, &vals[&node.a], &vals[&node.b]),
+                OpCode::Or => BitVec::bin_unchecked(BinOp::Or, &vals[&node.a], &vals[&node.b]),
+                _ => BitVec::bin_unchecked(BinOp::Xor, &vals[&node.a], &vals[&node.b]),
+            };
+            vals.insert(i, v);
+        }
+        vals[&n]
+    };
+    let b = at(BitVec::zero(w));
+    let a = BitVec::bin_unchecked(BinOp::Xor, &b, &at(BitVec::ones(w)));
+    // The nodes the form adds: a constant alone, else `& a` unless every bit follows the
+    // atom, and `^ b` (`~` for all ones) unless no bit is flipped or set.
+    let is_old = |v: &BitVec| consts.iter().any(|&c| cx.const_val(c).as_ref() == Some(v));
+    let estimate = if a.is_zero() {
+        1
+    } else {
+        let masked = if a.is_ones() { 0 } else { 1 + u32::from(!is_old(&a)) };
+        let flipped = match (b.is_zero(), b.is_ones()) {
+            (true, _) => 0,
+            (_, true) => 1,
+            _ => 1 + u32::from(!is_old(&b)),
+        };
+        masked + flipped
+    };
+    if estimate >= ops {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut bounds = vec![x];
+    bounds.extend(&consts);
+    if let Some(f) = worth_building(r, cx, n, &bounds, estimate)? {
+        r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
+        return Ok(Step::Normal(Fin::FINAL.and(f)));
+    }
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| {
+        let ka = cx.mk_const(&a)?;
+        let kb = cx.mk_const(&b)?;
+        let masked = cx.c_bin(BinOp::And, x, ka)?;
+        cx.c_bin(BinOp::Xor, masked, kb)
+    })?;
+    finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
+}
+
 /// Writes the function `tt` of `atoms` (at most three, sorted by index) at `n` as its minimum
 /// form, when that is smaller; `fin` is what the node's candidates declined so far contribute.
 fn write(
@@ -1106,7 +1205,13 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     // More than three atoms (constants included): `n` is an atom itself, read first by classes
     // of bit positions, where the constants are not atoms.
     let first = if atoms == [n] {
-        masked_step(r, cx, n)?
+        match masked_step(r, cx, n)? {
+            Step::Normal(f) => match one_atom_step(r, cx, n)? {
+                Step::Normal(g) => Step::Normal(f.and(g)),
+                done => done,
+            },
+            done => done,
+        }
     } else {
         write(r, cx, n, &atoms, tt, Fin::FINAL)?
     };
