@@ -115,9 +115,9 @@ An XOR is read as one term of its operands, however many and in whatever order a
 and a slice of it is the XOR of the slices: the limbs of an XOR of 3 registers or of 100 are
 the limbs of one value. It is also read as the sum `x + y − 2·(x & y)`, which is how code that
 has no XOR instruction spells it and what the carries of arithmetic done on it belong to; a
-root is asked with each reading and the smaller answer kept. Chains of ANDs and of ORs are
-read with their operands in one order as well, so the same operation written twice in two
-orders is one value.
+root is asked with each reading, and the one that leaves it smaller once nothing more is
+found is kept. Chains of ANDs and of ORs are read with their operands in one order as well,
+so the same operation written twice in two orders is one value.
 
 ## Divisions by constants
 

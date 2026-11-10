@@ -337,6 +337,16 @@ impl Build {
         }
     }
 
+    /// Builds the scratch node `e` in the context.
+    pub(super) fn write(
+        &self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        e: u32,
+    ) -> Result<u32, Stop> {
+        r.build(cx, |cx| self.export(cx, e))
+    }
+
     /// Builds what `root` reaches in the context.
     fn export(&self, cx: &mut Context, root: u32) -> Result<u32, crate::Error> {
         let mut made: IdMap<u32, u32> = IdMap::default();
@@ -1517,16 +1527,5 @@ impl<'a> Search<'a> {
         self.pay(r)?;
         let now = self.cur[last];
         Ok((now != first).then_some((now, size)))
-    }
-
-    /// Builds the scratch node `e` in the context.
-    pub(super) fn export(
-        &mut self,
-        r: &mut Runner<'_, '_>,
-        cx: &mut Context,
-        e: u32,
-    ) -> Result<u32, Stop> {
-        let b = &*self.b;
-        r.build(cx, |cx| b.export(cx, e))
     }
 }

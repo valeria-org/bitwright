@@ -809,13 +809,34 @@ impl Algebra {
             return Ok(acc.unwrap_or_default());
         }
         let top = (1i128 << p) - 1;
+        let mut mods: Vec<Form> = Vec::with_capacity(ops.len());
+        for o in ops {
+            mods.push(self.modulo(o, p)?);
+        }
+        // One operand and constants that are together one run of ones (all ones, a
+        // complement): the operand and a slice of it, which is what the sums make of it. No
+        // atom comes of it, so the operand is not taken for a complement nor for the word it
+        // is a truncation of.
+        let ones = mods
+            .iter()
+            .filter(|f| f.is_const())
+            .fold(0i128, |k, f| k ^ f.c);
+        let mut others = mods.iter().filter(|f| !f.is_const());
+        if let (Some(f), None) = (others.next(), others.next())
+            && ones != 0
+            && (ones >> ones.trailing_zeros()) & ((ones >> ones.trailing_zeros()) + 1) == 0
+        {
+            let f = f.clone();
+            let and = self.band(p, &f, &Form::konst(ones))?;
+            let sum = self.shift(&f, ones)?;
+            return self.add(&sum, &and, -2);
+        }
         // The operands as the values they have modulo `2^p`, the constants apart, and how
         // many bits the XOR has.
         let (mut k, mut neg) = (0i128, false);
         let mut exact: Vec<Form> = Vec::with_capacity(ops.len());
         let mut q = 1;
-        for o in ops {
-            let mut f = self.modulo(o, p)?;
+        for mut f in mods {
             // `2^p − 1 − x` is the complement of `x`: the form whose first atom is positive
             // stays.
             if !f.is_const() && f.t[0].1 < 0 {

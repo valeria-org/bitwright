@@ -47,6 +47,13 @@
 //! slices of the other arm are then slices of the one choice, whatever digits of the constant
 //! each limb is chosen against.
 //!
+//! Of a root's answers the smallest is taken, the sums' of two as small. An answer is asked
+//! in turn, and the sums find in several steps what they find, so where the atoms' answer
+//! is the smaller both are followed to where nothing more is found (the sums' with the sums
+//! alone, as before there were atoms) and the smaller end is taken: what the atoms read
+//! better at a root's first question is not taken for what the sums read better in the
+//! end.
+//!
 //! What is written back is decided on the whole expression ([`write`]). From the root down,
 //! each node's form is written out as nodes again (floors of one form as slices of that one
 //! word, `x + y − 2·(x & y)` as `x ^ y`, any part that a node below already is as that node),
@@ -89,9 +96,10 @@ const MAX_LARGE: u32 = 4096;
 /// The most work of the pass's questions in a call (see `write`): past it none is asked, so
 /// the pass alone does not use up a call's budget.
 const MAX_WORK: u64 = 1 << 26;
-/// What a root's second question may take beyond twice the work of its first (see `ask`).
+/// What a root's later questions may each take beyond twice the work of its first (see
+/// `answers`).
 const SECOND_SLACK: u64 = 1 << 14;
-/// The most work of second questions whose answers were not taken, in a call: past it none
+/// The most work of later questions whose answers were not taken, in a call: past it none
 /// is asked (the plain forms are not what reads the call's XORs).
 const MAX_LOST: u64 = 1 << 23;
 
@@ -108,8 +116,11 @@ pub(crate) struct State {
     quiet: IdMap<u32, Fin>,
     large: u32,
     work: u64,
-    /// The work of second questions whose answers were not taken (see `ask`).
+    /// The work of later questions whose answers were not taken (see `answers`).
     lost: u64,
+    /// The root the sums' answer was taken for last: the sums are asked there whatever the
+    /// atoms read (see `ask`).
+    sums_at: Option<u32>,
     /// Whether the pass asks in this round: only in one over a root the other phases left as
     /// it was (see the engine's `rounds`). What it writes is a reading of the whole root, and
     /// written while the other phases were still at work it took the forms their questions
@@ -125,7 +136,88 @@ impl State {
         self.covered.clear();
         self.asked.clear();
         self.large = 0;
+        self.sums_at = None;
     }
+}
+
+/// What the questions at a root found (see `answers`).
+struct Answers {
+    first: Leg,
+    values: Option<Leg>,
+    sums: Option<Leg>,
+    /// The atoms' answer is the values'.
+    second: bool,
+    fin: Fin,
+}
+
+impl Answers {
+    /// The atoms' answer: the smaller of the two, the values' of two as small. The
+    /// question, the root and the size of its DAG.
+    fn atoms(&self) -> Option<(&Leg, u32, u32)> {
+        let l = match &self.values {
+            Some(v) if self.second => v,
+            _ => &self.first,
+        };
+        l.found.map(|f| (l, f.0, f.1))
+    }
+
+    /// The sums' answer.
+    fn sums(&self) -> Option<(&Leg, u32, u32)> {
+        let l = self.sums.as_ref()?;
+        l.found.map(|f| (l, f.0, f.1))
+    }
+
+    /// The smallest answer, the sums' of two as small.
+    fn least(&self) -> Option<(&Leg, u32, u32)> {
+        match (self.atoms(), self.sums()) {
+            (Some(a), Some(s)) => Some(if s.2 <= a.2 { s } else { a }),
+            (a, s) => s.or(a),
+        }
+    }
+
+    /// Whether `l` is the sums' question.
+    fn of_sums(&self, l: &Leg) -> bool {
+        self.sums.as_ref().is_some_and(|s| core::ptr::eq(s, l))
+    }
+}
+
+/// What a question found: the root in its scratch DAG and the size of its DAG, when it is
+/// another than the root asked.
+struct Leg {
+    build: write::Build,
+    found: Option<(u32, u32)>,
+    work: u64,
+    fin: Fin,
+    forked: bool,
+    wordy: bool,
+}
+
+/// One question: the search over `nodes` with the forms of `lift`, in `build`, within
+/// `limit` of work when one is given.
+fn leg(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    mut lift: lift::Lift,
+    mut build: write::Build,
+    nodes: Vec<u32>,
+    limit: Option<u64>,
+) -> Result<Leg, Stop> {
+    let mut search = write::Search::new(&mut lift, &mut build, nodes);
+    if let Some(limit) = limit {
+        search.limit(limit);
+    }
+    let found = search.run(r, cx);
+    let work = search.work();
+    r.words.work += work;
+    let found = found?;
+    Ok(Leg {
+        build,
+        found,
+        work,
+        fin: lift.fin.unwrap_or(Fin::FINAL),
+        forked: lift.alg.forked(),
+        wordy: lift.alg.wordy(),
+    })
 }
 
 /// Whether the walk asks `n` before it walks `n`'s operands (see [`first`]).
@@ -216,6 +308,168 @@ pub(crate) fn first(
     })
 }
 
+/// The questions at a root over `nodes`, the first in `build`. A root is asked up to three
+/// times, each with its own kind of forms (see `form`): with XORs as atoms over the words
+/// truncations are of; where that took an operand for what is not its value, with them over
+/// the values; and where arithmetic was done on XORs (or `with_sums`: the root is the sums'
+/// own answer), with XORs as sums without twice the AND, as before there were atoms.
+/// Bitwise code is read by the atoms, arithmetic on an XOR by the sums, and which operands
+/// read better depends on what is done with the truncations. (A later question may take
+/// about twice the work of the first: where it would take more, its forms are the ones
+/// that grow, though the sums' question is cut short at times where they do not. And once
+/// the questions not taken have cost a call [`MAX_LOST`], only the first is asked.)
+fn answers(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    build: write::Build,
+    nodes: Vec<u32>,
+    with_sums: bool,
+) -> Result<Answers, Stop> {
+    let first = leg(r, cx, lift::Lift::default(), build, nodes.clone(), None)?;
+    let mut fin = first.fin;
+    let allow = 2 * first.work + SECOND_SLACK;
+    let mut forked = first.forked || with_sums;
+    let mut values = None;
+    if first.wordy && r.words.lost < MAX_LOST {
+        let l = leg(
+            r,
+            cx,
+            lift::Lift::values(),
+            write::Build::default(),
+            nodes.clone(),
+            Some(allow),
+        )?;
+        fin = fin.and(l.fin);
+        forked |= l.forked;
+        values = Some(l);
+    }
+    let mut sums = None;
+    if forked && r.words.lost < MAX_LOST {
+        let l = leg(
+            r,
+            cx,
+            lift::Lift::plain(),
+            write::Build::default(),
+            nodes,
+            // (At their own answer the sums are asked as before there were atoms.)
+            (!with_sums).then_some(allow),
+        )?;
+        fin = fin.and(l.fin);
+        if l.found.is_none() {
+            r.words.lost += l.work;
+        }
+        sums = Some(l);
+    }
+    let size = |l: &Leg| l.found.map(|f| f.1);
+    let second = match (size(&first), values.as_ref().and_then(size)) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(a), Some(v)) => v <= a,
+    };
+    if let Some(v) = &values
+        && !second
+    {
+        r.words.lost += v.work;
+    }
+    Ok(Answers {
+        first,
+        values,
+        sums,
+        second,
+        fin,
+    })
+}
+
+/// The root the answers come to from `e`, a node made for the question that is no one's
+/// yet: asked until nothing is found, with the sums alone (`alone`) or with every kind of
+/// forms, the smallest answer taken (and the sums asked on at a root that is their own
+/// answer, as `ask` does). The roots on the way are made in the context and are no one's
+/// either. Each has a smaller DAG than the one before, as the commit rule has it of the
+/// roots that are taken: an answer that is not smaller once the context has built it is
+/// not followed, so the answers end.
+fn chase(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    mut e: u32,
+    alone: bool,
+    fin: &mut Fin,
+) -> Result<u32, Stop> {
+    let mut with_sums = false;
+    // The root `e` is the answer at, and the size of its DAG.
+    let mut from: Option<(u32, usize)> = None;
+    while !matches!(cx.node(e).op, OpCode::Const | OpCode::Sym) {
+        let nodes = match cone(r, cx, e)? {
+            Ok(nodes) if from.is_none_or(|(_, size)| nodes.len() < size) => nodes,
+            _ => {
+                if let Some((before, _)) = from {
+                    e = before;
+                }
+                break;
+            }
+        };
+        if r.words.work >= MAX_WORK {
+            break;
+        }
+        from = Some((e, nodes.len()));
+        if alone {
+            let l = leg(
+                r,
+                cx,
+                lift::Lift::plain(),
+                write::Build::default(),
+                nodes,
+                None,
+            )?;
+            *fin = fin.and(l.fin);
+            let Some((root, _)) = l.found else {
+                break;
+            };
+            e = l.build.write(r, cx, root)?;
+        } else {
+            let a = answers(r, cx, write::Build::default(), nodes, with_sums)?;
+            *fin = fin.and(a.fin);
+            let Some((l, root, _)) = a.least() else {
+                // (Nothing is found at `e`, which no later question changes.)
+                r.words.quiet.insert(e, a.fin);
+                break;
+            };
+            with_sums = a.of_sums(l);
+            e = l.build.write(r, cx, root)?;
+        }
+    }
+    Ok(e)
+}
+
+/// The size of the DAG of `e`, a root an answer was written as; `or` where it is too large
+/// to be asked.
+fn dag(r: &mut Runner<'_, '_>, cx: &Context, e: u32, or: u32) -> Result<u32, Stop> {
+    Ok(match cone(r, cx, e)? {
+        Ok(nodes) => nodes.len() as u32,
+        Err(_) => or,
+    })
+}
+
+/// The nodes made since there were `before` that `e` does not reach are no one's: they do
+/// not count as uses of their operands (as a refused candidate's do not; see `discard`).
+fn unused(r: &mut Runner<'_, '_>, cx: &Context, before: u32, e: u32) -> Result<(), Stop> {
+    let len = cx.len() as u32;
+    r.meter
+        .charge(Counter::PassWork, u64::from(len.saturating_sub(before)))?;
+    let mut reached: IdMap<u32, ()> = IdMap::default();
+    let mut stack = vec![e];
+    while let Some(i) = stack.pop() {
+        if i >= before && reached.insert(i, ()).is_none() {
+            stack.extend(cx.node(i).children());
+        }
+    }
+    for i in before..len {
+        if !reached.contains_key(&i) {
+            r.retire(cx, i);
+        }
+    }
+    Ok(())
+}
+
 /// The search at root `n` over `nodes`, and whether it found anything (which the commit rule
 /// may still refuse).
 fn ask(
@@ -227,80 +481,68 @@ fn ask(
 ) -> Result<(Step, bool), Stop> {
     let before = cx.len() as u32;
     // The forms are read anew for each root: what is found depends on the nodes under it
-    // and nothing else. A root is asked up to three times, each with its own kind of forms
-    // (see `form`): with XORs as atoms over the words truncations are of; where that took
-    // an operand for what is not its value, with them over the values; and where
-    // arithmetic was done on XORs, with XORs as sums without twice the AND, as before
-    // there were atoms. Bitwise code is read by the atoms, arithmetic on an XOR by the
-    // sums, and which operands read better depends on what is done with the truncations.
-    // The smallest root is taken; of two as small, the later one's. (A later question may
-    // take about twice the work of the first: where it would take more, its forms are the
-    // ones that grow. And once the questions not taken have cost a call [`MAX_LOST`], only
-    // the first is asked.)
-    let mut lift = lift::Lift::default();
-    let mut search = write::Search::new(&mut lift, build, nodes.clone());
-    let found = search.run(r, cx);
-    r.words.work += search.work();
-    let found = found?;
-    let mut fin = search.lift.fin.unwrap_or(Fin::FINAL);
-    let allow = 2 * search.work() + SECOND_SLACK;
-    let mut forked = search.lift.alg.forked();
-    let (mut lift2, mut lift3) = (lift::Lift::values(), lift::Lift::plain());
-    let (mut scratch2, mut scratch3) = (write::Build::default(), write::Build::default());
-    let mut later = [None, None];
-    if search.lift.alg.wordy() && r.words.lost < MAX_LOST {
-        let mut second = write::Search::new(&mut lift2, &mut scratch2, nodes.clone());
-        second.limit(allow);
-        let other = second.run(r, cx);
-        r.words.work += second.work();
-        let other = other?;
-        fin = fin.and(second.lift.fin.unwrap_or(Fin::FINAL));
-        forked |= second.lift.alg.forked();
-        later[0] = Some((second, other));
-    }
-    if forked && r.words.lost < MAX_LOST {
-        let mut third = write::Search::new(&mut lift3, &mut scratch3, nodes);
-        third.limit(allow);
-        let other = third.run(r, cx);
-        r.words.work += third.work();
-        let other = other?;
-        fin = fin.and(third.lift.fin.unwrap_or(Fin::FINAL));
-        later[1] = Some((third, other));
-    }
-    let mut pick = None;
-    let mut least = found.map(|f| f.1);
-    for (i, leg) in later.iter().enumerate() {
-        if let Some((_, Some((_, size)))) = leg
-            && least.is_none_or(|x| *size <= x)
-        {
-            (pick, least) = (Some(i), Some(*size));
+    // and nothing else. The smallest answer is taken, the sums' of two as small, and the
+    // root the sums' answer is, is asked with the sums as well whatever the atoms read
+    // there: a root nothing but sums read is read as before there were atoms, each step of
+    // it.
+    //
+    // Where the atoms' answer is the smaller one, the smallest is not known yet: an answer
+    // is asked in turn, and the sums find in several steps what they find, each from the
+    // root the one before left, where the atoms' smaller root may be one nothing more is
+    // found from. So both are followed to where nothing is found, the sums' answer with the
+    // sums alone (what was done before there were atoms) and the atoms' with every kind,
+    // and the end with the smaller DAG is taken, the atoms' of two as small. What was made
+    // on the way to the other is no one's.
+    let with_sums = r.words.sums_at.take() == Some(n);
+    let a = answers(r, cx, core::mem::take(build), nodes, with_sums)?;
+    let mut fin = a.fin;
+    let out = match (a.atoms(), a.sums()) {
+        (Some((la, ra, sa)), Some((ls, rs, ss))) if sa < ss => {
+            // (The questions on the way to the end that is not taken are questions whose
+            // answers were not taken.)
+            let es = ls.build.write(r, cx, rs)?;
+            let asked = r.words.work;
+            let es = chase(r, cx, es, true, &mut fin)?;
+            let of_sums = r.words.work - asked;
+            let (asked, lost) = (r.words.work, r.words.lost);
+            let ea = la.build.write(r, cx, ra)?;
+            let ea = chase(r, cx, ea, false, &mut fin)?;
+            let e = if dag(r, cx, es, ss)? < dag(r, cx, ea, sa)? {
+                r.words.lost = lost + (r.words.work - asked);
+                es
+            } else {
+                r.words.lost += ls.work + of_sums;
+                ea
+            };
+            unused(r, cx, before, e)?;
+            (
+                finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
+                true,
+            )
         }
-    }
-    for (i, leg) in later.iter().enumerate() {
-        if let Some((s, _)) = leg
-            && pick != Some(i)
-        {
-            r.words.lost += s.work();
-        }
-    }
-    let e = match pick.and_then(|i| later[i].take()) {
-        Some((mut taken, Some((root, _)))) => taken.export(r, cx, root)?,
-        _ => {
-            let Some((root, _)) = found else {
+        _ => match a.least() {
+            Some((l, root, _)) => {
+                let e = l.build.write(r, cx, root)?;
+                let step = finish(r, cx, PassKind::Words, n, e, before, &[], fin)?;
+                if let Step::To(e, _) = step
+                    && a.of_sums(l)
+                {
+                    r.words.sums_at = Some(e);
+                }
+                (step, true)
+            }
+            None => {
                 r.stats
                     .passes
                     .entry(PassKind::Words.name())
                     .or_default()
                     .noop += 1;
-                return Ok((Step::Normal(fin), false));
-            };
-            search.export(r, cx, root)?
-        }
+                (Step::Normal(fin), false)
+            }
+        },
     };
-    Ok((
-        finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
-        true,
-    ))
+    *build = a.first.build;
+    Ok(out)
 }
 
 /// The pass at `n` once its operands are walked: what [`first`] found for it. A node that was

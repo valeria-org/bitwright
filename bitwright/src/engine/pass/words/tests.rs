@@ -283,6 +283,18 @@ fn words_fixtures() {
             32,
             "0:32",
         ),
+        // An XOR of one value with a run of ones is the value and a slice of it, whichever
+        // of the value's terms comes first and with whatever sign.
+        (
+            "zext<8>(-2 <=u (trunc<2>(a:64 - b:64) ^ 1))".to_string(),
+            8,
+            "zext<8>(extract<1, 1>(a - b))",
+        ),
+        (
+            "zext<8>(-2 <=u (trunc<2>(b:64 - a:64) ^ 1))".to_string(),
+            8,
+            "zext<8>(extract<1, 1>(b - a))",
+        ),
         // No digits and nothing that cancels: as it was.
         (
             "a * b + (a >>u 3 ^ b)".to_string(),
