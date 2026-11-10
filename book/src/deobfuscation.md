@@ -80,6 +80,20 @@ for (limbs, width, word) in [
     ("(x & 0xffff) * 0x1234567 + (x >>u 16) * 0x45670000", 32, "x * 0x1234567"),
     // A constant added in two parts: the low one to the word, the high one to a slice of it.
     ("extract<16, 16>(x:32 * 5 + 0x1234) + 0xab", 16, "extract<16, 16>(x * 5 + 0xab1234)"),
+    // Three registers XORed limb by limb, each limb in its own order.
+    (
+        "((a:32 & 4095) ^ (b:32 & 4095) ^ (c:32 & 4095)) \
+         | (((c >>u 12) ^ (a >>u 12) ^ (b >>u 12)) << 12)",
+        32,
+        "a ^ b ^ c",
+    ),
+    // A register or a constant, chosen limb by limb.
+    (
+        "zext<32>(select(t:1, 113, trunc<12>(r:32))) \
+         | (zext<32>(select(t, 0x352ac, extract<12, 20>(r))) << 12)",
+        32,
+        "select(t, 0x352ac071, r)",
+    ),
 ] {
     let e = cx.parse(limbs, &ParseOptions::width(Width::new(width)?))?;
     let out = engine.simplify(&mut cx, e)?;
@@ -96,6 +110,14 @@ floor(b / 2^k)`: the digits of `a` and `b` cancel against it, and what is left i
 `a + b`. A chain of such operations collapses one after the other. The result is written back
 from the root down, each node for all its users at once, wherever that leaves the expression
 smaller; where it does not, nothing changes.
+
+An XOR is read as one term of its operands, however many and in whatever order and grouping,
+and a slice of it is the XOR of the slices: the limbs of an XOR of 3 registers or of 100 are
+the limbs of one value. It is also read as the sum `x + y − 2·(x & y)`, which is how code that
+has no XOR instruction spells it and what the carries of arithmetic done on it belong to; a
+root is asked with each reading, and the one that leaves it smaller once nothing more is
+found is kept. Chains of ANDs and of ORs are read with their operands in one order as well,
+so the same operation written twice in two orders is one value.
 
 ## Divisions by constants
 

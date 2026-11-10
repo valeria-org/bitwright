@@ -337,6 +337,16 @@ impl Build {
         }
     }
 
+    /// Builds the scratch node `e` in the context.
+    pub(super) fn write(
+        &self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        e: u32,
+    ) -> Result<u32, Stop> {
+        r.build(cx, |cx| self.export(cx, e))
+    }
+
     /// Builds what `root` reaches in the context.
     fn export(&self, cx: &mut Context, root: u32) -> Result<u32, crate::Error> {
         let mut made: IdMap<u32, u32> = IdMap::default();
@@ -456,6 +466,10 @@ pub(super) struct Search<'a> {
     node_of: IdMap<(FormId, u16), u32>,
     /// The first node that is the atom.
     atom_of: IdMap<AtomId, u32>,
+    /// The nodes that are XOR atoms: how many operands, the atom, the node and how many of
+    /// the atom's low bits it is (all of them, or as many as its width); the longest first,
+    /// then by structure.
+    xors: Vec<(u32, AtomId, u32, u32)>,
     /// Per width `m`, the first node wider than `m` whose form modulo `2^m` is the key.
     wide: IdMap<u32, IdMap<FormId, u32>>,
     // What one candidate has written so far.
@@ -472,10 +486,12 @@ pub(super) struct Search<'a> {
     absorbed: bool,
     nest: u32,
     variant: Variant,
-    /// Scratch nodes made and terms handled, charged to the meter as they come.
+    /// Scratch nodes made and terms handled, charged to the meter as they come; and how
+    /// many the question may take.
     charged: u64,
     spent: u64,
     total: u64,
+    allow: u64,
 }
 
 impl<'a> Search<'a> {
@@ -497,6 +513,7 @@ impl<'a> Search<'a> {
             first_of: IdMap::default(),
             node_of: IdMap::default(),
             atom_of: IdMap::default(),
+            xors: Vec::new(),
             wide: IdMap::default(),
             below: 0,
             written: IdMap::default(),
@@ -511,6 +528,7 @@ impl<'a> Search<'a> {
             charged: 0,
             spent: 0,
             total: 0,
+            allow: MAX_WORK,
         }
     }
 
@@ -523,12 +541,17 @@ impl<'a> Search<'a> {
         self.charged = now;
         self.total += due;
         r.meter.charge(Counter::PassWork, due.div_ceil(PER_UNIT))?;
-        Ok(self.total < MAX_WORK)
+        Ok(self.total < self.allow)
     }
 
     /// The work of the question so far.
     pub(super) fn work(&self) -> u64 {
         self.total
+    }
+
+    /// The question is given up at `allow` work, where that is less than a question's own.
+    pub(super) fn limit(&mut self, allow: u64) {
+        self.allow = allow.min(MAX_WORK);
     }
 
     /// Reads the facts and the form of every node, and what each is.
@@ -538,22 +561,51 @@ impl<'a> Search<'a> {
             self.lift.learn(r, cx, n)?;
         }
         self.lift.alg.work = 0;
+        let mut listed: IdMap<(AtomId, u32), ()> = IdMap::default();
         for i in 0..self.cone.len() {
             let n = self.cone[i];
-            self.lift.read(cx, n);
+            // (Past the allowance a node is the atom it is.)
+            if self.lift.alg.work < self.allow {
+                self.lift.read(cx, n);
+            }
             let w = cx.node(n).width;
             let f = self.lift.value(cx, n).unwrap_or_default();
+            // (What of an atom is below `2^w`, where the node is that.)
+            let mut low = None;
             if u32::from(w) <= 64 && self.lift.has(n) {
                 let reduced = self.lift.alg.reduce(&f, u32::from(w));
                 if let Ok(id) = self.lift.alg.intern(&reduced) {
                     self.node_of.entry((id, w)).or_insert(i as u32);
                 }
+                low = reduced.single();
             }
-            if let Some(a) = f.single() {
-                self.atom_of.entry(a).or_insert(i as u32);
+            let own = f.single();
+            if let Some(a) = own
+                && !self.atom_of.contains_key(&a)
+            {
+                self.atom_of.insert(a, i as u32);
+            }
+            for (a, bits) in [
+                (own, u32::MAX),
+                (low.filter(|&a| Some(a) != own), u32::from(w)),
+            ] {
+                if let Some(a) = a
+                    && let Atom::Xor(_, li) = self.lift.alg.atom(a)
+                    && listed.insert((a, bits), ()).is_none()
+                {
+                    let len = self.lift.alg.xor_list(li).0.len() as u32;
+                    self.xors.push((len, a, i as u32, bits));
+                }
             }
             self.forms.push(f);
         }
+        let mut xors = core::mem::take(&mut self.xors);
+        xors.sort_by(|x, y| {
+            y.0.cmp(&x.0)
+                .then(self.lift.alg.order(x.1, y.1))
+                .then(y.3.cmp(&x.3))
+        });
+        self.xors = xors;
         self.pay(r)?;
         Ok(())
     }
@@ -710,6 +762,7 @@ impl<'a> Search<'a> {
         if self.variant.words {
             self.words(r, cx, &mut f, m, &mut parts)?;
         }
+        self.choices(r, cx, &mut f, m, &mut parts)?;
         for &(a, c) in &f.t {
             let c = c as u128 & mask;
             if c == 0 {
@@ -779,6 +832,15 @@ impl<'a> Search<'a> {
                 let Atom::And(p, gi, hi) = self.lift.alg.atom(a) else {
                     continue;
                 };
+                // `λ·(G ^ H) + λ·(G & H)` is `λ·(G | H)`, of the values the AND was asked of.
+                if let Some(x) = self.lift.alg.xor_of(a)
+                    && f.coeff(x) == c
+                    && let Some((g, h)) = self.lift.alg.whole(a).cloned()
+                {
+                    found = Some((OpCode::Or, c, f.without(a).without(x), g, h));
+                    break;
+                }
+                // (An AND of `p` bits is of the operands modulo `2^p`.)
                 if u32::from(p) < m {
                     continue;
                 }
@@ -800,8 +862,8 @@ impl<'a> Search<'a> {
                     let Ok(rest) = self
                         .lift
                         .alg
-                        .add(f, &g, -lam)
-                        .and_then(|x| self.lift.alg.add(&x, &h, -lam))
+                        .sum(f, &g, -lam)
+                        .and_then(|x| self.lift.alg.sum(&x, &h, -lam))
                     else {
                         continue;
                     };
@@ -823,6 +885,76 @@ impl<'a> Search<'a> {
             let (ge, he) = (self.form(r, cx, &g, m)?, self.form(r, cx, &h, m)?);
             parts.push((self.b.op(kind, m, [ge, he, 0]), lam as u128 & mask));
             *f = rest;
+        }
+    }
+
+    /// Terms `λ·(c ? 0 : B)` or `λ·(c ? A : 0)` of `f` with `λ·P·C` beside them (`C` the
+    /// form of `c`, all its terms) taken out as the choice with the constant arm it was read
+    /// from: `λ·(c ? P : B)`, or `λ·(c ? A : −P)` and `λ·P` more in the constant.
+    fn choices(
+        &mut self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        f: &mut Form,
+        m: u32,
+        parts: &mut Vec<(u32, u128)>,
+    ) -> H<()> {
+        let mask = low(m);
+        loop {
+            let mut found = None;
+            for &(s, lam) in &f.t {
+                let Atom::Sel(ci, ai, bi) = self.lift.alg.atom(s) else {
+                    continue;
+                };
+                let (c, a, b) = (
+                    self.lift.alg.form(ci).clone(),
+                    self.lift.alg.form(ai).clone(),
+                    self.lift.alg.form(bi).clone(),
+                );
+                let none = |x: &Form| x.is_const() && x.c == 0;
+                if none(&a) == none(&b) {
+                    continue;
+                }
+                let Some(&(a0, c0)) = c.t.first() else {
+                    continue;
+                };
+                let have = f.coeff(a0);
+                let Some(unit) = lam.checked_mul(c0) else {
+                    continue;
+                };
+                if have == 0 || have % unit != 0 {
+                    continue;
+                }
+                let p = have / unit;
+                let Some(lp) = lam.checked_mul(p) else {
+                    continue;
+                };
+                let Ok(rest) = self.lift.alg.sum(f, &c, -lp) else {
+                    continue;
+                };
+                let rest = rest.without(s);
+                if rest.t.len() + c.t.len() + 1 != f.t.len() {
+                    continue;
+                }
+                found = Some((lam, p, lp, rest, c, a, b));
+                break;
+            }
+            let Some((lam, p, lp, mut rest, c, a, b)) = found else {
+                return Ok(());
+            };
+            let (x, y) = if a.is_const() {
+                (Form::konst(p), b)
+            } else {
+                rest.c = rest.c.wrapping_add(lp);
+                (a, Form::konst(-p))
+            };
+            let ce = self.form(r, cx, &c, 1)?;
+            let (xe, ye) = (self.form(r, cx, &x, m)?, self.form(r, cx, &y, m)?);
+            parts.push((
+                self.b.op(OpCode::Select, m, [ce, xe, ye]),
+                lam as u128 & mask,
+            ));
+            *f = self.lift.alg.reduce(&rest, m);
         }
     }
 
@@ -858,7 +990,7 @@ impl<'a> Search<'a> {
             let rf = self.lift.alg.form(ri).clone();
             let mut joined = false;
             for fam in &mut fams {
-                let Ok(d) = self.lift.alg.add(&fam.0, &rf, -1) else {
+                let Ok(d) = self.lift.alg.sum(&fam.0, &rf, -1) else {
                     continue;
                 };
                 let step = 1i128 << k;
@@ -905,8 +1037,8 @@ impl<'a> Search<'a> {
                 let next = self
                     .lift
                     .alg
-                    .add(&g, &own, -c)
-                    .and_then(|x| self.lift.alg.add(&x, &q, -c));
+                    .sum(&g, &own, -c)
+                    .and_then(|x| self.lift.alg.sum(&x, &q, -c));
                 match next {
                     Ok(x) => g = x,
                     Err(_) => ok = false,
@@ -970,13 +1102,13 @@ impl<'a> Search<'a> {
                                 c: 0,
                                 t: vec![(b, 1)],
                             };
-                            if let Ok(with) = self.lift.alg.add(&qf, &one, x) {
+                            if let Ok(with) = self.lift.alg.sum(&qf, &one, x) {
                                 qf = with;
                             }
                         }
                         let moved =
                             self.lift.alg.add(&e, &qf, 1i128 << kmax).and_then(|e2| {
-                                Ok((e2, self.lift.alg.add(&g, &qf, -(total as i128))?))
+                                Ok((e2, self.lift.alg.sum(&g, &qf, -(total as i128))?))
                             });
                         if let Ok((e2, g2)) = moved {
                             e = e2;
@@ -992,7 +1124,7 @@ impl<'a> Search<'a> {
                 let g0 = g.coeff(a0);
                 if g0 != 0
                     && g0 % e0c == 0
-                    && let Ok(cand) = self.lift.alg.add(&g, &e, -(g0 / e0c))
+                    && let Ok(cand) = self.lift.alg.sum(&g, &e, -(g0 / e0c))
                 {
                     let cand = self.lift.alg.reduce(&cand, m);
                     if cand.t.len() < g.t.len() {
@@ -1165,6 +1297,64 @@ impl<'a> Search<'a> {
                 let e = self.b.op(OpCode::And, q, [xe, ye, 0]);
                 self.b.resize(e, p)
             }
+            Atom::Xor(q0, li) => {
+                let q = u32::from(q0).min(p);
+                let (ops, mut k) = {
+                    let (ops, k) = self.lift.alg.xor_list(li);
+                    (ops.to_vec(), k)
+                };
+                // The operands not written yet.
+                let mut left: IdMap<FormId, ()> = ops.iter().map(|&i| (i, ())).collect();
+                let mut pieces: Vec<u32> = Vec::new();
+                // The XORs of some of the operands that nodes below are, the longest first
+                // (they are in that order).
+                let mut from = 0;
+                while !left.is_empty() {
+                    let mut part = None;
+                    let mut seen = 0u64;
+                    for idx in from..self.xors.len() {
+                        let (len, b, j, bits) = self.xors[idx];
+                        seen += 1;
+                        if b == a || j >= self.below || len as usize > left.len() || q > bits {
+                            continue;
+                        }
+                        let Atom::Xor(_, l2) = self.lift.alg.atom(b) else {
+                            continue;
+                        };
+                        let (o2, k2) = self.lift.alg.xor_list(l2);
+                        seen += o2.len() as u64;
+                        if o2.iter().all(|i| left.contains_key(i)) {
+                            part = Some((idx, j, o2.to_vec(), k2));
+                            break;
+                        }
+                    }
+                    self.spent += seen;
+                    let Some((idx, j, o2, k2)) = part else {
+                        break;
+                    };
+                    for i in &o2 {
+                        left.remove(i);
+                    }
+                    k ^= k2;
+                    pieces.push(self.b.resize(self.cur[j as usize], q));
+                    from = idx + 1;
+                }
+                for i in ops {
+                    if left.contains_key(&i) {
+                        let f = self.lift.alg.form(i).clone();
+                        pieces.push(self.form(r, cx, &f, q)?);
+                    }
+                }
+                let k = k as u128 & low(q);
+                if k != 0 {
+                    pieces.push(self.konst(r, cx, k, q)?);
+                }
+                let mut acc = pieces[0];
+                for &e in &pieces[1..] {
+                    acc = self.b.op(OpCode::Xor, q, [acc, e, 0]);
+                }
+                self.b.resize(acc, p)
+            }
             Atom::Sel(ci, ai, bi) => {
                 let c = self.lift.alg.form(ci).clone();
                 let (x, y) = (
@@ -1228,12 +1418,13 @@ impl<'a> Search<'a> {
 
     /// The search: from the root down, each node is written anew from its form, at its width
     /// and at the bits of it that are read, and replaced where that leaves the root's DAG
-    /// smaller. The root as it is in the end, in the scratch DAG, when anything changed.
+    /// smaller. The root as it is in the end, in the scratch DAG, with the size of its DAG,
+    /// when anything changed.
     pub(super) fn run(
         &mut self,
         r: &mut Runner<'_, '_>,
         cx: &mut Context,
-    ) -> Result<Option<u32>, Stop> {
+    ) -> Result<Option<(u32, u32)>, Stop> {
         self.prepare(r, cx)?;
         self.rebuild(cx, 0, None);
         for (j, &s) in self.cur.iter().enumerate() {
@@ -1335,17 +1526,6 @@ impl<'a> Search<'a> {
         }
         self.pay(r)?;
         let now = self.cur[last];
-        Ok((now != first).then_some(now))
-    }
-
-    /// Builds the scratch node `e` in the context.
-    pub(super) fn export(
-        &mut self,
-        r: &mut Runner<'_, '_>,
-        cx: &mut Context,
-        e: u32,
-    ) -> Result<u32, Stop> {
-        let b = &*self.b;
-        r.build(cx, |cx| b.export(cx, e))
+        Ok((now != first).then_some((now, size)))
     }
 }

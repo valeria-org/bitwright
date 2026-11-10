@@ -55,6 +55,97 @@
   The layout is unchanged (values up to 512 bits stay `Copy`); a `BitVec`'s hash is that of
   its width and active limbs, no longer the derived one.
 
+Operations of many operands in the words pass, and the forms 0.28.0 names as not read whole.
+On the corpus of 0.28.0, and on 592 expressions written for the purpose: one operation (XOR,
+sum, AND, OR) over 2 to 128 operands, written twice in two orders and groupings and
+compared, subtracted, sliced and masked; and a word made handler by handler in limbs from as
+many operands (XORs spelled `x + y − 2·(x & y)`, sums, differences, and the three mixed),
+its high limb read alone, against the same chain in another order, and against the word
+written as nodes.
+
+- **An XOR is one value however it was grouped.** The words pass read `x ^ y` as `x + y −
+  2·(x & y)`, a different form for each grouping of three values or more: two orders of one
+  XOR were not seen equal from 4 operands on, and a word XORed in limbs was not read from 5
+  (62 nodes left where 10 are the answer, 2,664 at 128 operands). An XOR is now also a term
+  of its own: of its operands as integers, any number of them, each once and in one order,
+  the operands of an XOR among them its own and two of one gone. A slice of it is the XOR of
+  the slices, so the limbs of an XOR are slices of the one term; an AND has the relation
+  `2·(x & y) = x + y − (x ^ y)` with it, and every sum is kept at the member of its class
+  with the fewest terms, so the XOR spelled as a sum is the same term, `(x ^ y) + 2·(x & y)`
+  is `x + y` and `(x ^ y) + (x & y)` is `x | y`. `trunc<20>(((a >>u 12) ^ (b >>u 12)) ^ (c
+  >>u 12))` is `extract<12, 20>(a ^ b ^ c)`.
+- **A root is asked with each reading of its XORs, and the smallest answer is kept.**
+  Bitwise code is read by the terms; arithmetic done on an XOR in limbs is read by the sum,
+  whose carries are the arithmetic's; and the operands of a term that are truncations of
+  wider words read better as the words where sums are made of them, and as the values where
+  they are not. So a root is asked with the terms over the words, with them over the values
+  where that differs, and with the sums (the forms the pass had) where arithmetic was done
+  on an XOR. Of two answers as small the sums' is taken, and the root that is the sums'
+  answer is asked with the sums again, so a root with nothing of the kind under it is read
+  as before. Where the terms' answer is the smaller, the smallest is not known yet: the sums
+  find what they find in several steps, each from the root the one before left, and the
+  terms' smaller root is not always one anything more is found from. Both answers are then
+  followed to where nothing more is found (the sums' with the sums alone, the terms' with
+  every reading) and the end with the smaller DAG is taken. A later question may take about
+  twice the work of the first, and once those not taken have cost a call 2^23 only the
+  first is asked.
+- **A chain of ANDs or of ORs is read with its operands in one order**, each once, whatever
+  the order and the grouping it was written in (three operands or more, through at most 256
+  nodes): `(a & b & c) ^ (c & (b & a))` is 0. Two orders of one chain were not always seen
+  equal: from 4 operands of an OR on under `==`, from 6 of an AND.
+- **A value chosen limb by limb between a register and a constant is the limbs of one
+  choice.** With the XOR terms a choice against a constant is taken apart, `c ? K : b` being
+  `K·c + (c ? 0 : b)` and `c ? a : K` being `K − K·c + (c ? a : 0)`: each limb's choice
+  against its own digits of the constant is then a slice of the one choice against 0, and
+  the floor of a choice against a constant is the choice between the floors. Written back,
+  the constant and the choice against 0 are the choice with the constant again.
+  `zext<32>(select(t, 113, trunc<12>(r))) | (zext<32>(select(t, 0x352ac, extract<12,
+  20>(r))) << 12)` is `select(t, 0x352ac071, r)`.
+- **A form may have 256 terms.** It had 40 at most, so a sum of 48 values was not one form:
+  two orders of it were not seen equal under `==` or a mask, nor was a sum of as many made in
+  limbs seen to be the word. A root with a form of more than 40 terms is asked with the
+  forms of 40 too.
+- **A refusal for depth is not counted against the next.** The algebra bounds how deep its
+  functions call one another, at 48. A call refused at the bound did not give its level
+  back, so each refusal lowered the bound for the rest of the root, and after 48 of them
+  every node was read as a value of its own. Found while the XOR terms were written.
+- **Writing an XOR of many operands is charged to the meter**, and looks for the XORs of
+  some of its operands that are already nodes in one pass over them (the longest first).
+
+Of the 592 expressions, two (a minimum of 96 and of 128 values written as nested `select`s)
+are refused by the parser for their depth, as before. Of the 590 others, every one of one
+operation in two orders is now seen to be one value, at every size, and a word XORed or
+added in limbs is read at every size, alone and against the word written as nodes. Two such
+chains in two orders are seen to be one value up to 48 operands (XOR) and 96 (sums); beyond
+that a part of each is read. Chains that mix sums, differences and XORs are read up to 10
+operands, as before, and six of them (24, 64 and 96 operands) are larger than before, by 1
+to 20 nodes; no other is larger.
+
+On the corpus the results have 6.8 percent fewer DAG nodes than with 0.28.0 (5,296,890
+against 5,681,862): 0.7 percent fewer on the local windows, 7.7 percent on the deep ones.
+19,309 of the 58,530 are smaller and 632 larger (by 3 nodes at the median, 81 at most,
+3,733 together against 388,705 saved); the same 10 run out of budget. The forms 0.28.0
+names as not read whole now are in the examples looked at: products of an XOR in limbs by a
+constant (35 nodes to 24, 35 to 22 and 23 to 21), XORs of several values in different
+orders (24 to 10), and a value chosen limb by limb between a constant and a register (52 to
+17; a second example of it, 38 nodes, is as before). The numbers are of the build before
+the last change, by which the work of the answers that are followed and not taken counts
+with the questions not taken: of the 57,672 results the build with it was run on, 46 are
+larger than there, by 401 nodes together, and none is smaller.
+
+The 632 larger ones, by the first rewrite at which the two runs of a call differ: in 541
+(2,928 nodes) this pass's answer is the smaller one and another pass ends larger after it,
+the result of a call depending on the path the passes take; in 32 (560 nodes) this pass's
+own answer is larger, the sums' question having been cut short by its allowance in the
+three looked at; in 17 (87) the two answers are as large and differ in form; in 35 (147)
+one of the two runs has no answer of this pass at that point; and in 7 (11) the runs
+differ first in another pass.
+
+Simplifying a sample of 3,000 of the corpus takes 1.21, 1.36 and 1.42 times the processor
+time it took (three runs of each, one after the other, on a loaded machine): a root is
+asked up to three times where it was asked once, and where two answers disagree both are
+asked on. The 590 expressions take 0.81 to 0.85 times theirs.
+
 ## 0.28.0
 
 Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and

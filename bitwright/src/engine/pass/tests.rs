@@ -5675,13 +5675,10 @@ fn limb_slice_fixtures() {
         // the words are XORs once nothing reads their sums.
         (xor_limbs(&["a", "b", "c"]), 32, "extract<25, 7>(b ^ c ^ a)"),
         // Three limbs: the carry into the third is no comparison of two low digits, and the
-        // limb is found as the slice of the word and proved. (The word is left as the handler
-        // spells its XOR with a constant, `x + c - 2·(x & c)` with the constants folded.)
-        (
-            three,
-            32,
-            "extract<24, 8>(w + 0x7e15514f + (w + 0x2c51a7e3 & 0x51c3a96c) * -2)",
-        ),
+        // limb is found as the slice of the word and proved. The handler spells its XOR with
+        // a constant `x + c - 2·(x & c)`, the constants folded: the words pass reads it as
+        // the XOR.
+        (three, 32, "extract<24, 8>(w + 0x2c51a7e3 ^ 0x51c3a96c)"),
         // A digit that is no truncation of the sum's operand: a value below `2^k`, and a mask
         // under the sum.
         (
