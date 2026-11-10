@@ -1063,6 +1063,28 @@ rule select_low_bit_of_not<W, U>(x: W, a: U, b: U) where 1 < W {
 
 - `select(trunc<1>(~p), q, r)` → `select(trunc<1>(p), r, q)`
 
+#### `zext_and_zext` — rule
+
+A mask inside the narrower of two zero extensions is taken at the operand's width.
+
+```text
+rule zext_and_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(zext<U>(a) & c) => zext<V>(a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
+```
+
+- `zext<16>(zext<8>(p:4) & 5)` → `zext<16>(p:4 & 5)`
+
+#### `zext_and_not_zext` — rule
+
+```text
+rule zext_and_not_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(~zext<U>(a) & c) => zext<V>(~a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
+```
+
+- `zext<16>(~zext<8>(p:4) & 5)` → `zext<16>(~p:4 & 5)`
+
 #### `trunc_eq_const` — rule
 
 Through a truncation that drops only bits known zero, an equality with a constant is one
@@ -3405,6 +3427,21 @@ rule concat_sign_shift<W>(x: W) where W + W <= 512 { concat(x >>s (W - 1), x) =>
 ```
 
 - `concat(p >>s 7, p)` → `sext<16>(p)`
+
+#### `concat_slice_and_bit_in_place` — rule
+
+A slice and the low bit of one value, extended and put back where they were, are the
+value under a mask.
+
+```text
+rule concat_slice_and_bit_in_place<W, A, K, N>(y: W)
+        where 1 < K, K + N <= W, N < A, W < A + K, A + K <= 512 {
+        concat(zext<A>(extract<K, N>(y)), zext<K>(trunc<1>(y))) => zext<A + K>(y & m)
+        let m: W = 1 | (lowmask(N) << K)
+    }
+```
+
+- `concat(zext<12>(extract<4, 2>(p)), zext<4>(trunc<1>(p)))` → `zext<16>(p & 0x31)`
 
 #### `concat_hi_add` — rule
 

@@ -457,6 +457,15 @@ group core.casts {
     rule select_low_bit_of_not<W, U>(x: W, a: U, b: U) where 1 < W {
         select(trunc<1>(~x), a, b) => select(trunc<1>(x), b, a)
     }
+    /// A mask inside the narrower of two zero extensions is taken at the operand's width.
+    #[example("zext<16>(zext<8>(p:4) & 5)" => "zext<16>(p:4 & 5)")]
+    rule zext_and_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(zext<U>(a) & c) => zext<V>(a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
+    #[example("zext<16>(~zext<8>(p:4) & 5)" => "zext<16>(~p:4 & 5)")]
+    rule zext_and_not_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(~zext<U>(a) & c) => zext<V>(~a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
     /// Through a truncation that drops only bits known zero, an equality with a constant is one
     /// of the whole value.
     #[example("trunc<4>(p & 15) == 3:4" => "(p & 15) == 3")]
@@ -1360,6 +1369,14 @@ group core.concat {
     /// extension.
     #[example("concat(p >>s 7, p)" => "sext<16>(p)")]
     rule concat_sign_shift<W>(x: W) where W + W <= 512 { concat(x >>s (W - 1), x) => sext<W + W>(x) }
+    /// A slice and the low bit of one value, extended and put back where they were, are the
+    /// value under a mask.
+    #[example("concat(zext<12>(extract<4, 2>(p)), zext<4>(trunc<1>(p)))" => "zext<16>(p & 0x31)")]
+    rule concat_slice_and_bit_in_place<W, A, K, N>(y: W)
+        where 1 < K, K + N <= W, N < A, W < A + K, A + K <= 512 {
+        concat(zext<A>(extract<K, N>(y)), zext<K>(trunc<1>(y))) => zext<A + K>(y & m)
+        let m: W = 1 | (lowmask(N) << K)
+    }
     /// A constant added to the high part of a value is added to the value, shifted.
     #[example("concat(extract<4, 4>(p) + 1, trunc<4>(p))" => "p + 16")]
     rule concat_hi_add<H, L>(x: H + L, c: const H) where H + L <= 512 {

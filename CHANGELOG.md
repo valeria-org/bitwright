@@ -150,8 +150,8 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 7,526 nodes together
-(19,164) and the five `simplify` roots at 706 (1,186), all 16 `valid_under` questions are
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,478 nodes together
+(19,164) and the five `simplify` roots at 702 (1,186), all 16 `valid_under` questions are
 proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
 13, four out of budget). The questions also take less time than before these changes: 18%
 less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
@@ -284,6 +284,11 @@ less CPU over the set run back to back, none of them a quarter of a second, the 
   sign test of a value rotated or shifted left by a constant is the bit that lands on top
   (`rotl(x, 56) <s 0`, the sign of the low byte, is `extract<7, 1>(x)`), which then meets the
   other readings of that bit.
+- **Extensions and slices written twice.** A mask inside the narrower of two zero extensions
+  is taken at the operand's width, `zext<64>(~zext<32>(e) & 5)` as `zext<64>(~e & 5)`
+  (`zext_and_zext`, `zext_and_not_zext`), and a slice and the low bit of one value, extended
+  and concatenated back where they were, are the value under a mask
+  (`concat_slice_and_bit_in_place`).
 - **Two complements around a slice are none.** `~extract<k, n>(~x)` is `extract<k, n>(x)`
   (`not_extract_not`, `not_trunc_not`), and a select on a bit of a complement is the select
   on the bit with its sides swapped (`select_bit_of_not`, `select_low_bit_of_not`). (Moving
