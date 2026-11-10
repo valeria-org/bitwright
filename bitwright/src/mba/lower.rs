@@ -406,8 +406,31 @@ pub(crate) fn shared_nodes(
     n: usize,
     opaque: &IdMap<u32, ()>,
 ) -> Vec<u32> {
-    let inside =
-        |i: u32| (i == root || !opaque.contains_key(&i)) && in_reading(cx, i, Reading::SemiLinear);
+    shared_in(cx, root, lim, n, opaque, false)
+}
+
+/// [`shared_nodes`] of the whole fragment below `root`, casts and slices included: where a
+/// [`Reading::CutWhole`] may cut (a value read once as it is and once through a truncation or
+/// an extension is shared here and not there).
+pub(crate) fn shared_nodes_whole(cx: &Context, root: u32, lim: &MbaLimits, n: usize) -> Vec<u32> {
+    shared_in(cx, root, lim, n, &IdMap::default(), true)
+}
+
+fn shared_in(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    n: usize,
+    opaque: &IdMap<u32, ()>,
+    whole: bool,
+) -> Vec<u32> {
+    let inside = |i: u32| {
+        (i == root || !opaque.contains_key(&i))
+            && match whole {
+                true => in_fragment(cx, i),
+                false => in_reading(cx, i, Reading::SemiLinear),
+            }
+    };
     let mut users: IdMap<u32, u32> = IdMap::default();
     let mut seen: IdMap<u32, ()> = IdMap::default();
     let mut stack = vec![root];

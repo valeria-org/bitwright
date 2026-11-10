@@ -9,7 +9,7 @@ use crate::mba::certify;
 use crate::mba::{
     Bindings, CacheEntry, CacheKey, Claim, LOWERING_VERSION, MOp, MbaAnswer, MbaConfig, MbaExpr,
     Reading, Refusal, Verdict, lift_id, lower_id, lower_id_over, lower_id_reading, lower_id_whole,
-    shared_nodes,
+    shared_nodes, shared_nodes_whole,
 };
 use crate::{BinOp, UnOp};
 
@@ -2873,6 +2873,28 @@ pub(super) fn step(
     cfg: &MbaConfig,
     n: u32,
 ) -> Result<Step, Stop> {
+    step_with(r, cx, cfg, n, false)
+}
+
+/// The MBA phase at `n`, one side of a case split (see `cases::by_cases`): [`step`], asked
+/// also with the values its nodes share through casts cut off (see below). The side reads
+/// what the select's sides were made of, which other nodes read too.
+pub(super) fn step_side(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<Step, Stop> {
+    step_with(r, cx, cfg, n, true)
+}
+
+fn step_with(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    side: bool,
+) -> Result<Step, Stop> {
     // A solver that takes polynomials is also asked at constant left shifts (the arena spells
     // `2^k·t` as `t << k`).
     let poly = r.inner.mba.solver.polynomial_fragments();
@@ -2880,9 +2902,13 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    let unshrunk = count(r).not_smaller;
     let out = ask(r, cx, cfg, n, n, None, depth(r))?;
+    // An answer that was not smaller for what the fragment shares with others is no answer
+    // either: the readings below keep a shared value as it is.
+    let unshrunk = count(r).not_smaller != unshrunk;
     if let Step::Normal(fin) = &out
-        && fin.done
+        && (fin.done || unshrunk)
     {
         // a fragment that reads slices of one rotated value, asked again with them
         // written as masks of that rotation (see [`sliced`]), within the steps of a retried
@@ -2929,6 +2955,27 @@ pub(super) fn step(
                     n,
                     root,
                     Some(Reading::Cut(c)),
+                    Cap::Steps(CUT_STEPS),
+                )?;
+                if matches!(again, Step::To(..)) {
+                    return Ok(again);
+                }
+            }
+        }
+        // And with a value several of its nodes read through casts too cut off, the casts
+        // kept: `(zext(t) | k) + zext(t & k)` is `zext(t) + k` over `t`, where the whole
+        // question is over what `t` is made of and its answer writes `t` another way. Only
+        // for a fragment whose answer did that, or a side of a case split: asked of every
+        // fragment kept from its question, 140 measured calls took 15% longer.
+        if unshrunk || side {
+            for c in shared_nodes_whole(cx, n, &cfg.limits, CUTS) {
+                let again = ask(
+                    r,
+                    cx,
+                    cfg,
+                    n,
+                    n,
+                    Some(Reading::CutWhole(c)),
                     Cap::Steps(CUT_STEPS),
                 )?;
                 if matches!(again, Step::To(..)) {

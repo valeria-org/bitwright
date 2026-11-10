@@ -45,7 +45,7 @@ pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
 pub(crate) use lower::{
     Reading, fits_nodes, lift_id, lower_id, lower_id_over, lower_id_reading, lower_id_whole,
-    shared_nodes,
+    shared_nodes, shared_nodes_whole,
 };
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
