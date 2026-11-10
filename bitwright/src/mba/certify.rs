@@ -1486,6 +1486,21 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     // (equal expressions, see `decast`), and as they are only when that does not decide.
     let (da, db) = (super::decast::decast(a), super::decast::decast(b));
     let mut report = Report::new();
+    // First, sides that are each a constant plus a multiple of every bit of the variables,
+    // compared as that (see `bit_linear`): it decides where it applies, for a pass over each
+    // side. A sum of products of bitwise functions of one value by constants is one whatever
+    // its carries, and the tests below take it for an atom under a mask.
+    if let Some(found) = bit_linear(meter, da.as_ref().unwrap_or(a), db.as_ref().unwrap_or(b))? {
+        report.cert = Some(Cert::Symbolic);
+        match found {
+            None => report.verdict = Verdict::Proved,
+            Some(point) => {
+                report.verdict = Verdict::Refuted;
+                report.counterexample = Some(point);
+            }
+        }
+        return Ok(report);
+    }
     if da.is_some() || db.is_some() {
         report = prove_at(
             da.as_ref().unwrap_or(a),
@@ -1515,22 +1530,6 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         {
             report.verdict = Verdict::Proved;
             report.cert = Some(Cert::Symbolic);
-        }
-    }
-    // Still open: sides that are each a constant plus a multiple of every bit of the
-    // variables, compared as that (see `bit_linear`). A sum of products of bitwise functions
-    // of one value by constants is one whatever its carries, and the tests above take it for
-    // an atom under a mask.
-    if report.verdict == Verdict::Unknown
-        && let Some(found) = bit_linear(meter, da.as_ref().unwrap_or(a), db.as_ref().unwrap_or(b))?
-    {
-        report.cert = Some(Cert::Symbolic);
-        match found {
-            None => report.verdict = Verdict::Proved,
-            Some(point) => {
-                report.verdict = Verdict::Refuted;
-                report.counterexample = Some(point);
-            }
         }
     }
     // A refutation comes with an input where the sides differ; one without would be a bug
@@ -1653,7 +1652,7 @@ impl BitAffine {
 /// combine to it, its complement or a constant. Two forms are the same function exactly when
 /// their constants and multiples are the same (at zero, and at each single variable bit), so
 /// the comparison decides, at 64 bits or fewer and up to [`LINEAR_BITS`] bits of variables.
-/// One unit of work per node and 16 variable bits.
+/// One unit of work per node read and 16 variable bits.
 fn bit_linear<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -1669,17 +1668,25 @@ fn bit_linear<M: Meter>(
     if bits == 0 || bits > LINEAR_BITS {
         return Ok(None);
     }
-    let cost = ((a.nodes().len() + b.nodes().len()) * (bits / 16 + 1)) as u64;
-    if cost > meter.left() {
+    // Charged for the nodes it reads: it gives up at the first without a form.
+    let per = (bits / 16 + 1) as u64;
+    if (a.nodes().len() + b.nodes().len()) as u64 * per > meter.left() {
         return Ok(None);
     }
-    meter.charge(cost)?;
+    let read = std::cell::Cell::new(0u64);
     let wn = usize::from(w.bits());
     let ones = if wn == 64 { u64::MAX } else { (1u64 << wn) - 1 };
     let form = |m: &MbaExpr| -> Option<BitLinear> {
         let nodes = m.nodes();
+        let live = live(m);
         let mut forms: Vec<Option<BitLinear>> = Vec::with_capacity(nodes.len());
-        for n in nodes {
+        for (at, n) in nodes.iter().enumerate() {
+            // A node the root does not read is not read here either.
+            if !live[at] {
+                forms.push(None);
+                continue;
+            }
+            read.set(read.get() + 1);
             let arg = |j: usize| forms[n.args[j] as usize].as_ref();
             let zip = |x: &BitLinear, y: &BitLinear, f: fn(u64, u64) -> u64| BitLinear {
                 k: f(x.k, y.k) & ones,
@@ -1772,13 +1779,22 @@ fn bit_linear<M: Meter>(
                 }
                 MOp::Zext | MOp::Sext | MOp::Trunc => None,
             })();
-            forms.push(f);
+            // The root reads it, so has no form either.
+            forms.push(Some(f?));
         }
         forms.pop().flatten()
     };
-    let (Some(fa), Some(fb)) = (form(a), form(b)) else {
+    // The shorter side first: an answer is a few nodes, and where it has no form the
+    // question's is not computed.
+    let swap = a.nodes().len() > b.nodes().len();
+    let (first, second) = if swap { (b, a) } else { (a, b) };
+    let f1 = form(first);
+    let f2 = f1.as_ref().and_then(|_| form(second));
+    meter.charge(read.get() * per)?;
+    let (Some(f1), Some(f2)) = (f1, f2) else {
         return Ok(None);
     };
+    let (fa, fb) = if swap { (f2, f1) } else { (f1, f2) };
     if fa == fb {
         return Ok(Some(None));
     }
@@ -4852,8 +4868,10 @@ impl SymPoly {
 
 /// Whether `a` and `b` are the same polynomial over symbols: variables; the conjunctions of the
 /// leaves of a bitwise function whose constants are 0 or all-ones, which it is read as by its
-/// integer expansion (`x | y` is `x + y − (x & y)`, every bit alike); and any other bitwise
-/// subterm, one symbol by its structure. Equal polynomials are equal functions, whatever the
+/// integer expansion (`x | y` is `x + y − (x & y)`, every bit alike); one leaf under a mask,
+/// for a bitwise function of that leaf and constants (`f(0)` plus the leaf under the bits it
+/// sets, less the leaf under the bits it clears); and any other bitwise subterm, one symbol by
+/// its structure. Equal polynomials are equal functions, whatever the
 /// symbols' values (so for their actual ones); unequal ones decide nothing. `None` past
 /// [`SYMBOLIC_TERMS`], or once `work` is past `limit`. Work: one unit per monomial operation.
 pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u64) -> Option<bool> {
@@ -5001,6 +5019,56 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                                 .collect();
                             set.sort_unstable();
                             p.add_term(vec![symbol(1, set)], &c);
+                        }
+                        Some(p)
+                    } else if let ([l], true) = (&leaves[..], w.bits() <= 64) {
+                        // One leaf under constants: each bit is a constant, the leaf's bit or
+                        // its complement, so the value is `f(0)` plus the leaf's bits that set
+                        // one less those that clear one. The leaf under each of the two masks
+                        // is a symbol (the leaf itself under every bit), whatever spelled it:
+                        // `m − (~t & m)` and `t & m` are one polynomial.
+                        let ones = if w.bits() == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << w.bits()) - 1
+                        };
+                        let mut at: HashMap<u32, (u64, u64)> = HashMap::default();
+                        let mut order: Vec<u32> = seen.keys().copied().collect();
+                        order.sort_unstable();
+                        for &k in &order {
+                            let m = nodes[k as usize];
+                            let v = if let Some(c) = cst[k as usize] {
+                                let c = c.to_u64()?;
+                                (c, c)
+                            } else if k == *l {
+                                (0, ones)
+                            } else {
+                                let x = |a: usize| at.get(&m.args[a]).copied();
+                                match m.op {
+                                    MOp::Not => {
+                                        let a = x(0)?;
+                                        (!a.0 & ones, !a.1 & ones)
+                                    }
+                                    MOp::And => (x(0)?.0 & x(1)?.0, x(0)?.1 & x(1)?.1),
+                                    MOp::Or => (x(0)?.0 | x(1)?.0, x(0)?.1 | x(1)?.1),
+                                    _ => (x(0)?.0 ^ x(1)?.0, x(0)?.1 ^ x(1)?.1),
+                                }
+                            };
+                            at.insert(k, v);
+                        }
+                        let (f0, f1) = *at.get(&(i as u32))?;
+                        let leaf = match nodes[*l as usize].op {
+                            MOp::Var(v) => symbol(0, vec![v]),
+                            _ => symbol(2, vec![*l]),
+                        };
+                        let mut p = SymPoly::constant(BitVec::wrapping_from_u64(w, f0));
+                        for (mask, c) in [(f1 & !f0, BitVec::one(w)), (f0 & !f1, BitVec::ones(w))] {
+                            if mask == ones {
+                                p = p.add(polys[*l as usize].as_ref()?, &c);
+                            } else if mask != 0 {
+                                let key = vec![leaf, mask as u32, (mask >> 32) as u32];
+                                p.add_term(vec![symbol(3, key)], &c);
+                            }
                         }
                         Some(p)
                     } else {
