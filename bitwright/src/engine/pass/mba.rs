@@ -3199,8 +3199,9 @@ fn with_known_bits(
 /// The fewest nodes a block [`sweep_cut`] asks about has.
 const SWEEP_CUT_NODES: usize = 16;
 
-/// The most atoms a block [`sweep_cut`] asks about has.
-const SWEEP_CUT_VARS: usize = 4;
+/// The most atoms a block [`sweep_cut`] asks about has. (With four, the solver was asked
+/// about several hundred more blocks in 140 measured questions and answered none of them.)
+const SWEEP_CUT_VARS: usize = 3;
 
 /// The solver steps one [`sweep_cut`] question takes.
 const SWEEP_CUT_STEPS: u64 = 1 << 12;

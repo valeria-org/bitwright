@@ -3679,11 +3679,12 @@ mod mba_service {
         let s = Arc::new(Steady(1000, AtomicU64::new(0)));
         let out = ask(s.clone(), 1000 * calls - 1);
         assert_eq!(out.stats.mba.steps, 1000 * calls - 1);
-        // A solver that does not count is charged its whole limit.
+        // A solver that does not count is charged its whole limit, and one question's limit
+        // is a quarter of the account where that is less than the solver's own.
         let limit = MbaConfig::default().budget.steps;
         let c = Arc::new(Counting(AtomicU64::new(0)));
         let out = ask(c.clone(), 2 * limit);
-        assert_eq!(c.0.load(Ordering::Relaxed), 2);
+        assert_eq!(c.0.load(Ordering::Relaxed), 4);
         assert_eq!(out.stats.mba.steps, 2 * limit);
         // The normal-form solver counts its steps, and a remembered answer is charged what
         // finding it cost: the same run in a fresh context, answered from the solver's memory,

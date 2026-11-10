@@ -47,6 +47,77 @@ The causes found so far, none specific to those expressions.
   value. It now enumerates only the bits not known of the node, and a mismatch there leaves
   the candidate to the readings. A candidate its demanded-bits form leaves open is also asked
   as written.
+- **A subtraction that borrows nothing is a xor.** `c − t` with `t`'s bits all among `c`'s
+  (`0xff − (x & 0x0f)`) was arithmetic under a bitwise operator, an atom to the bitwise and
+  xor passes and to the certificates. The rule `sub_within` writes it `t ^ c`; the linear pass
+  reads `c ^ t` with `t ⊆ c` back as the difference, so no cancellation through a sum is
+  lost; the certificates read sums and differences of bitwise terms that can carry or borrow
+  nothing as `|` and `^` before any test; and the bitwise pass writes a function of one atom
+  and any number of constants as `(x & a) ^ b`, from its values at 0 and at all ones.
+- **What was asked and kept is not asked from above.** A fragment whose answer would not make
+  the DAG smaller, or was not proved, or took the solver four thousand steps to find nothing
+  simpler, or ran it out of steps, is remembered for the call as the ones declined for size
+  were, and a fragment that holds one is not asked (five fragments of 110 to 197 nodes over
+  one such core, 2.5 million steps and no rewrite, in one call). In the sweep, a candidate
+  whose readings decided nothing is an atom to the readings of every candidate above it, and
+  the readings of one candidate end at the first whose certificate takes most of its share
+  and leaves the question open.
+- **One question to the solver takes a share of the call's steps.** The solver's own limit is
+  a million steps whatever the call has: in a call of two million, one question that ran out
+  took half of them and the rounds after it had none. A question now gets a quarter of the
+  call's solver steps at most, and one that ran out is not asked again in the call with no
+  more of them. No answer committed in the 140 questions took more than that.
+
+How long those questions take, on the same 140: what follows cut their total from 85 s of
+CPU to under 25 s (each question in its own process, the engine's tables already built),
+with more of them simplified further than before.
+
+- **The sweep keeps the inputs its enumerations miss at.** An enumeration that ends where the
+  candidate is not its constant now keeps that input for the call, and every later candidate
+  and related pair is evaluated there before anything else is asked of it. An obfuscator
+  builds one value from another, and a chain of them that are constant but for one value of a
+  16-bit field was enumerated up to that value at every link: of 6.6 billion node evaluations
+  spent in enumerations that ended in a miss, all but five million repeated a point an
+  earlier candidate had already missed at.
+- **An enumeration evaluates its points a block at a time.** The word program ran once per
+  point, with a table lookup per input and an operator dispatch per node; it now runs once
+  per block of up to 1,024 points, one loop per instruction over its operands' lanes, with
+  constants folded into the instructions. The walk that finds which symbol bits reach a
+  candidate is one pass down from it over a bitmap, stops as soon as more than sixteen bits
+  reach it with no node left that could be a bottleneck, and reuses its buffers across calls.
+  Same answers, same charges.
+- **The sweep's reductions share what they find.** Every candidate is first taken on the bits
+  its users read (`demanded::reduced`), and each call walked the whole of what the calls
+  below it had walked. What one finds for a node under a mask is kept for the call, up to
+  where the visit cap cut a walk short.
+- **One value under several masks stays one value.** Those reductions replaced a sum's
+  constant by its residue on the bits read, so `t + k` under `& 0xff` and under `& 0xffff`
+  became two sums, each an atom of its own to a certificate, and what cancels through
+  `t + k` was gone. For a pair the samples relate by a sum or a difference the constant now
+  stays as it is: the first one added to that operand in the call that agrees with it on the
+  bits read. (A pair related by a xor is still read with the residues, which is the form the
+  bitwise tests decide there.)
+- **A node is not asked to be related to what its operand was not.** Where `f(a)` could not
+  be proved to be `rep + d`, `g(f(a))` was asked next, about the same `rep`, and failed for
+  the same reason at the cost of a full certificate; the skip counts toward the sweep's cap
+  on pairs left open. Of 3,230 such questions in the 140, five had been proved.
+- **A block's cases are read at the samples first.** `cases_fold` built both sides of a
+  condition and swept each before it looked at whether the block is constant on either: now
+  the samples that fall on each side say so first, the first side is proved before the
+  second is swept, and a side an earlier sweep examined is not walked again (4,364 side
+  sweeps became 881, for four more folds). A sum with a node cut off is not asked of the
+  solver when it holds a block the solver declined at the same cut (1,066 questions, none of
+  which had an answer), and an atom a block is seen to read at one input is not tried as
+  noise with the 64-point sample.
+- **A fragment is lowered once where two readings are the same.** A fragment that is
+  semi-linear as it is has one lowering for the whole and the semi-linear reading, and one
+  per cut; the walk and the build keep their node tables in a dense map emptied in constant
+  time instead of a hash map built per reading.
+- **What the sweep changes under assumptions is reported as relying on them.** The sweep
+  folds on facts (known bits, the values a bottleneck can take) without recording which
+  constraints they came from, and a root it changed reported an empty
+  `RootOutcome::relies_on`: `zext(x == k) + 5 + …` folded to `5` under the assumption
+  `x != k` and said it held everywhere. Such a root now reports every constraint of the run.
 
 ## 0.27.0
 
