@@ -2953,7 +2953,11 @@ fn step_with(
         return Ok(Step::Normal(Fin::FINAL));
     }
     let unshrunk = count(r).not_smaller;
+    let held = count(r).unsupported;
     let out = ask(r, cx, cfg, n, n, None, depth(r))?;
+    // Whether the question was not one the solver answers whole: it holds a fragment kept
+    // as it is (see `holds_kept`), or the solver declined it for its size.
+    let held = count(r).unsupported != held;
     // An answer that was not smaller for what the fragment shares with others is no answer
     // either: the readings below keep a shared value as it is.
     let unshrunk = count(r).not_smaller != unshrunk;
@@ -2982,12 +2986,16 @@ fn step_with(
                 again => return Ok(again),
             }
         }
-        // A fragment too large to lower whole (more variables than a question takes), with
-        // the arithmetic its bitwise operators read as atoms (see [`Reading::Shallow`]): a sum
-        // of bitwise functions of values that are sums and products themselves is a linear
-        // MBA over those values. (Asked of every fragment, the answers over atoms took the
-        // place of the whole fragment's and three of 47 measured constants were not found.)
-        if !asks(r, cx, cfg, n)? {
+        // A fragment too large to lower whole (more variables than a question takes), or one
+        // not answered whole for what it holds, with the arithmetic its bitwise operators
+        // read as atoms (see [`Reading::Shallow`]): a sum of bitwise functions of values that
+        // are sums and products themselves is a linear MBA over those values. An obfuscator
+        // writes `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a`
+        // and a `b` that are products of one value: read whole it is a question about that
+        // value, costly and declined, and every sum that holds it was then not asked at all.
+        // (Asked of every fragment, the answers over atoms took the place of the whole
+        // fragment's and three of 47 measured constants were not found.)
+        if !asks(r, cx, cfg, n)? || held {
             match ask(
                 r,
                 cx,
@@ -3544,7 +3552,14 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    match holds_kept(r, cx, root, &bindings) {
+    // (Not the reading over atoms where it is another question than the whole fragment's: it
+    // is asked where that one is not, within the steps of a retried question, and what made
+    // the fragment it holds costly is arithmetic this reading does not look into.)
+    let kept = match reading {
+        Some(Reading::Shallow) if crate::mba::cuts(cx, &bindings) => None,
+        _ => holds_kept(r, cx, root, &bindings),
+    };
+    match kept {
         Some(Kept::Whole) => {
             count(r).unsupported += 1;
             return Ok(Step::Normal(Fin::FINAL));

@@ -111,6 +111,27 @@ fn a_piece_that_depends_on_one_condition_is_read_as_its_cases() {
 }
 
 #[test]
+fn a_root_that_folds_on_one_side_of_a_condition_is_split_there() {
+    // A flag picks between two masked values, and the root computes with the one picked: where
+    // the flag does not hold `v` is a constant (the second mask is inside the one OR-ed in),
+    // and its product is one too. As a whole the root is a function of both sides, with four
+    // selects no pass merges.
+    let text = "let c = trunc<1>(popcnt(trunc<8>(x))); \
+                let v = select(c, y & 0x69e43e1d87026070 ^ 0x6df4fe7fafa6eb74, \
+                               y & 0x3137485047f16073 ^ 0x7d3fcb754ffbebfb) | 0x7dff7df74ff36877; \
+                (v * 0x7025cd5ebcd9f501 + select(c, y, 7) * select(c, 3, y)) ^ select(c, rotl(y, 5), 9)";
+    let (out, agrees) = noise_forms(text, true);
+    assert!(agrees, "{out}");
+    // The product where the flag does not hold, and neither mask of that side left.
+    assert!(out.contains("0xdbae57ffb7fdf6ff"), "{out}");
+    assert!(!out.contains("0x3137485047f16073"), "{out}");
+    assert!(out.matches("select(").count() < 4, "{out}");
+    // Without the noise forms the root is not read on either side.
+    let plain = noise_forms(text, false).0;
+    assert!(plain.contains("0x3137485047f16073"), "{plain}");
+}
+
+#[test]
 fn a_condition_and_its_complement_are_one_case() {
     // `s` is 0 wherever `c` and its complement disagree, as they always do; read as two
     // conditions, the cases where both or neither hold make it `k`.

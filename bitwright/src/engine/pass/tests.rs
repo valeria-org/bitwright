@@ -2486,6 +2486,75 @@ fn sign_extension_and_bit_test_idioms() {
     }
 }
 
+/// `context::join` writes a select of two expressions with the choice further down: equal to
+/// the select for random pairs, and one skeleton over the choice of what differs where the
+/// sides are that skeleton.
+#[cfg(feature = "mba")]
+#[test]
+fn joined_cases_are_the_select() {
+    let mut g = generator(0x7015);
+    let mut rng = Rng(77);
+    let mut merged = 0;
+    for i in 0..600 {
+        let mut cx = Context::new();
+        let w = [8u16, 16, 32, 64][i % 4];
+        let c = cx.symbol("p", Width::W1).unwrap();
+        let (t, _) = g.expr(&mut cx, w, 3);
+        // The other side: an unrelated expression, or the first with one of its symbols
+        // complemented (one skeleton, the choice at that symbol).
+        let first = cx.symbols_in(&[t]).unwrap().first().map(|&s| {
+            let (key, width) = (
+                cx.symbol_key(s).unwrap().clone(),
+                cx.symbol_width(s).unwrap(),
+            );
+            cx.symbol(key, width).unwrap()
+        });
+        let f = match (i % 3, first) {
+            (0, _) | (_, None) => g.expr(&mut cx, w, 3).0,
+            (_, Some(sym)) => {
+                let not = cx.un(UnOp::Not, sym).unwrap();
+                let mut repl: crate::hash::IdMap<u32, u32> = Default::default();
+                repl.insert(cx.id(sym).unwrap(), cx.id(not).unwrap());
+                let ti = cx.id(t).unwrap();
+                let fi = cx.substitute_ids(&[ti], &repl).unwrap()[0];
+                cx.handle(fi)
+            }
+        };
+        let want = cx.select(c, t, f).unwrap();
+        let (ci, ti, fi) = (cx.id(c).unwrap(), cx.id(t).unwrap(), cx.id(f).unwrap());
+        let j = super::context::join(&mut cx, ci, ti, fi).unwrap();
+        let j = cx.handle(j);
+        assert!(
+            equivalent(&mut cx, want, j, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(want),
+            cx.display(j)
+        );
+        merged += u64::from(j != want);
+    }
+    assert!(merged > 200, "{merged}");
+    // One skeleton over two constants: the choice is between the constants.
+    let mut cx = Context::new();
+    let c = cx.symbol("p", Width::W1).unwrap();
+    let a = cx.symbol("a", Width::W64).unwrap();
+    let b = cx.symbol("b", Width::W64).unwrap();
+    let side = |cx: &mut Context, k: u64| {
+        let k = cx.constant_u64(Width::W64, k).unwrap();
+        let m = cx.bin(BinOp::Mul, a, k).unwrap();
+        let r = cx.bin(BinOp::RotL, m, k).unwrap();
+        cx.bin(BinOp::Add, r, b).unwrap()
+    };
+    let (t, f) = (side(&mut cx, 3), side(&mut cx, 5));
+    let (ci, ti, fi) = (cx.id(c).unwrap(), cx.id(t).unwrap(), cx.id(f).unwrap());
+    let j = super::context::join(&mut cx, ci, ti, fi).unwrap();
+    // The sum is written once; a rotation keeps its amount, so two amounts stay two
+    // rotations under the choice.
+    assert_eq!(
+        cx.display(cx.handle(j)).to_string(),
+        "select(p, rotl(a * 3, 3), rotl(a * 5, 5)) + b"
+    );
+}
+
 /// Case splits on condition masks: random linear and bitwise expressions reading `sext(c)`,
 /// `-zext(c)` or a sign mask are equivalent after the split, exhaustively at small widths.
 #[test]

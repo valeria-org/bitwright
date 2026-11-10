@@ -27,6 +27,23 @@
   masks is a comparison of two forms, a few hundred evaluations. The question above folds to
   its constant at its own fuel, in three quarters of the time it took to stop at 312 nodes;
   all 47 `engine` roots of the set are constants.
+- **A settled root is read on either side of its condition** (`MbaConfig::noise_forms`). An
+  obfuscator picks between two masked values by a flag (the parity of a byte, in the
+  measured set) and computes with the one picked. With the flag fixed one of the two is a
+  constant and everything computed from it folds, but the root as a whole is a function of
+  both, and no pass reads it one case at a time. The root the rounds settle on is now split
+  on the condition its selects test most, each side is swept and given one round, and the
+  two are written as one expression again with the choice as far down as they agree
+  (`select(c, a * k1 + b, a * k2 + b)` is `a * select(c, k1, k2) + b`). The smallest of the
+  settled root, the select of the sides and the joined form is the result, so none is larger
+  than before: 41 of the 44 `forms_simplify` roots of the set are smaller, 7,391 nodes to
+  6,407 in all, for 15% more time on those questions (the 140 take the same time within
+  what repeated runs differ by). A run whose budget ends on the sides reports that.
+- **A fragment not answered whole is asked over its atoms.** A sum like
+  `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a` and a `b` that are
+  products of one value is a question about that value when read whole: costly, declined,
+  and every sum holding it was then not asked at all. Such a fragment is now asked with the
+  arithmetic under its bitwise operators as atoms, within the steps of a retried question.
 
 ## 0.28.0
 

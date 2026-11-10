@@ -2786,7 +2786,88 @@ impl Runner<'_, '_> {
             cur = swept;
         }
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-        self.rounds(cx, cur, fin)
+        let settled = self.rounds(cx, cur, fin);
+        #[cfg(feature = "mba")]
+        if let Ok((u, ufin)) = settled
+            && inner
+                .phases
+                .iter()
+                .any(|p| matches!(p, PhaseImpl::Mba(c) if c.noise_forms))
+        {
+            return self.split(cx, u, ufin);
+        }
+        settled
+    }
+
+    /// With the MBA phase's noise forms, the root `u` the rounds settled on, read once more on
+    /// either side of the condition its selects test most (see `pass::split_cases`): each side
+    /// with what that case fixes put in, swept and simplified by the rounds as a root is, and
+    /// the two written as one expression again with the choice as far down as they agree
+    /// (`pass::join_cases`). The smallest of the three is the result: `u`, the select of the
+    /// sides, or the sides joined.
+    ///
+    /// An obfuscator picks between two masked values by a flag and computes with the one
+    /// picked: with the flag fixed one of them is a constant, and everything computed from it
+    /// folds, where the root as a whole is a function of both. In 140 measured calls every one
+    /// of 41 such roots was a constant or a fraction of its size on one side. Asked of the
+    /// root before the rounds, the sides came out larger than the settled root's sides in
+    /// every one of them: the rounds fold what the two sides share once.
+    ///
+    /// The sides take one round that changes them (and the deeper one it may ask for): what
+    /// the condition fixed folds in it, and the rounds after it changed nothing measured and
+    /// took as long again. A budget that runs out on the sides keeps the smallest so far, and
+    /// is the reason the run ended.
+    #[cfg(feature = "mba")]
+    fn split(
+        &mut self,
+        cx: &mut Context,
+        u: u32,
+        ufin: Fin,
+    ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        let e = match pass::split_cases(self, cx, u, true) {
+            Ok(Some(e)) => e,
+            Ok(None) | Err(Stop::Exhausted(_)) => return Ok((u, ufin)),
+            Err(stop) => return Err((u, ufin, stop)),
+        };
+        self.emit_stage(cx, Stage::Cases, u, e);
+        let sides = |me: &mut Self, cx: &mut Context| {
+            let (mut cur, mut fin) = (e, ufin);
+            let swept = me.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+            if swept != cur {
+                fin = fin.and(Fin::relying(me.assumed()));
+                cur = swept;
+            }
+            cur = me.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+            me.rounds_within(cx, cur, fin, SIDE_ROUNDS)
+        };
+        let (s, sfin, stop) = match sides(self, cx) {
+            Ok((s, f)) => (s, f, None),
+            Err((s, f, stop)) => (s, f, Some(stop)),
+        };
+        let joined = match pass::join_cases(self, cx, s) {
+            Ok(joined) => joined,
+            Err(Stop::Exhausted(_)) => None,
+            Err(stop) => return Err((u, ufin, stop)),
+        };
+        let size = |cx: &mut Context, i: u32| match cx.dag_size(&[cx.handle(i)], 1 << 22) {
+            Ok(crate::expr::Bounded::Exact(n)) => n,
+            _ => u32::MAX,
+        };
+        let mut best = (u, ufin, size(cx, u));
+        for cand in [Some(s), joined].into_iter().flatten() {
+            let n = size(cx, cand);
+            if n < best.2 {
+                best = (cand, sfin, n);
+            }
+        }
+        // (The last root an observer was told of is the sides': it is told of the result.)
+        if best.0 != s {
+            self.emit_stage(cx, Stage::Cases, s, best.0);
+        }
+        match stop {
+            None => Ok((best.0, best.1)),
+            Some(stop) => Err((best.0, best.1, stop)),
+        }
     }
 
     /// Every constraint of the run's assumptions: what a result of the opaque-constant sweep
@@ -2853,7 +2934,7 @@ impl Runner<'_, '_> {
             };
             // And the root itself, where it is one value on either side of the condition
             // its selects test most (see `pass::split_cases`).
-            return match pass::split_cases(self, cx, cur) {
+            return match pass::split_cases(self, cx, cur, false) {
                 Ok(Some(p)) => {
                     self.emit_stage(cx, Stage::Cases, cur, p);
                     Ok(p)
@@ -2909,11 +2990,22 @@ impl Runner<'_, '_> {
     fn rounds(
         &mut self,
         cx: &mut Context,
+        cur: u32,
+        fin: Fin,
+    ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        let max = self.inner.strategy.max_rounds.max(1);
+        self.rounds_within(cx, cur, fin, max)
+    }
+
+    /// [`rounds`](Self::rounds), at most `max` of them that change the root.
+    fn rounds_within(
+        &mut self,
+        cx: &mut Context,
         mut cur: u32,
         mut fin: Fin,
+        max: u8,
     ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
         let inner = self.inner;
-        let max = inner.strategy.max_rounds.max(1);
         #[cfg(feature = "mba")]
         {
             self.mba_depth = 0;
@@ -3028,6 +3120,10 @@ impl Runner<'_, '_> {
         Ok((cur, fin))
     }
 }
+
+/// The rounds that change them the sides of a split root take (see `Runner::split`).
+#[cfg(feature = "mba")]
+const SIDE_ROUNDS: u8 = 1;
 
 /// Whether `n1`, the rebuild of `n` over new operands `kids`, is `n`'s operator over them (in
 /// any order: the constructors sort commutative operands), not a fold the constructors made.

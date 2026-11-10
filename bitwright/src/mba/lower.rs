@@ -102,6 +102,13 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
     }
 }
 
+/// Whether a narrower reading's atoms `bindings` include a node the whole fragment reads
+/// through (arithmetic under a bitwise operator, a value cut off): otherwise the reading is
+/// the whole fragment's.
+pub(crate) fn cuts(cx: &Context, bindings: &Bindings) -> bool {
+    bindings.atoms.iter().any(|&a| in_fragment(cx, a))
+}
+
 /// Whether the fragment rooted at `root` is one [`lower_id`] takes (rooted at a fragment
 /// operator, within `lim`): its interior nodes, operands first, when it is.
 pub(crate) fn fits_nodes(cx: &Context, root: u32, lim: &MbaLimits) -> Result<Vec<u32>, Refusal> {

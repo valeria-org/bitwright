@@ -1647,6 +1647,15 @@ pub mod mba {
     fewer steps are left than a small certificate takes, the sweep's certificates are charged
     as pass work (32,768 units each at most, an eighth of the call's pass work in all), so a
     call out of solver steps still folds what a comparison of two forms decides.
+    A fragment that is not answered whole (it holds one kept as it is, or the solver declined
+    it for its size) is asked with the arithmetic under its bitwise operators as atoms, where
+    that is another question: a linear MBA over values that are products of one value.
+    With the noise forms, the root the rounds settle on is read once more on either side of
+    the condition its selects test most: each side with what that case fixes put in, swept
+    and given one round, and the two written as one expression again with the choice as far
+    down as they agree. The smallest of the settled root, the select of the sides and the
+    sides joined is the result. (Split before the rounds, every one of 41 measured roots
+    came out larger: the rounds fold what the sides share once.)
     A node's own question also runs within 65,536 steps while the rounds have others to ask
     (times eight in each round after one that changed nothing, up to the quarter): 570 of 601
     answers committed in those runs took fewer, and the questions that take a quarter and
