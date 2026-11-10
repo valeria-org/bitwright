@@ -2880,7 +2880,7 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let out = ask(r, cx, cfg, n, n, None, u64::MAX)?;
+    let out = ask(r, cx, cfg, n, n, None, depth(r))?;
     if let Step::Normal(fin) = &out
         && fin.done
     {
@@ -2892,7 +2892,26 @@ pub(super) fn step(
         let before = cx.len() as u32;
         let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
         if let Some(root) = slices {
-            let again = ask(r, cx, cfg, n, root, None, CUT_STEPS)?;
+            let again = ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))?;
+            if matches!(again, Step::To(..)) {
+                return Ok(again);
+            }
+        }
+        // A fragment too large to lower whole (more variables than a question takes), with
+        // the arithmetic its bitwise operators read as atoms (see [`Reading::Shallow`]): a sum
+        // of bitwise functions of values that are sums and products themselves is a linear
+        // MBA over those values. (Asked of every fragment, the answers over atoms took the
+        // place of the whole fragment's and three of 47 measured constants were not found.)
+        if !asks(r, cx, cfg, n)? {
+            let again = ask(
+                r,
+                cx,
+                cfg,
+                n,
+                n,
+                Some(Reading::Shallow),
+                Cap::Steps(CUT_STEPS),
+            )?;
             if matches!(again, Step::To(..)) {
                 return Ok(again);
             }
@@ -2903,7 +2922,15 @@ pub(super) fn step(
         for root in slices.into_iter().chain([n]) {
             let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
             for c in cuts {
-                let again = ask(r, cx, cfg, n, root, Some(c), CUT_STEPS)?;
+                let again = ask(
+                    r,
+                    cx,
+                    cfg,
+                    n,
+                    root,
+                    Some(Reading::Cut(c)),
+                    Cap::Steps(CUT_STEPS),
+                )?;
                 if matches!(again, Step::To(..)) {
                     return Ok(again);
                 }
@@ -2929,8 +2956,39 @@ pub(super) fn step_part(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    ask(r, cx, cfg, n, n, None, CUT_STEPS)
+    ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))
 }
+
+/// The steps a question takes at most, besides the call's share (see [`SOLVE_SHARE`]).
+#[derive(Copy, Clone)]
+enum Cap {
+    /// A question asked another way, or a part of one: these steps, and its answer then is
+    /// what it is.
+    Steps(u64),
+    /// A node's own question: these steps in this round, and more in a later one (see
+    /// [`depth`]).
+    Depth(u64),
+}
+
+/// The steps a node's own question takes in this round: [`DEPTH_STEPS`] in the rounds until one
+/// changes nothing, then [`DEPTH_FACTOR`] times as many in each round after one that changed
+/// nothing, up to the question's share of the call (see [`SOLVE_SHARE`]).
+///
+/// The questions that fold an obfuscated value are small ones (of the answers committed in 140
+/// measured calls, 570 of 601 took under 65,536 steps and 395 under 16,384), and the ones the
+/// solver runs out of steps on are found among them in no order. Asked at the full share where
+/// they stand, a few of those took the steps of a call before the rest of it was asked
+/// anything; asked this way, a call spends what it has on the cheapest questions first.
+fn depth(r: &Runner<'_, '_>) -> Cap {
+    let times = DEPTH_FACTOR.checked_pow(u32::from(r.mba_depth));
+    Cap::Depth(times.map_or(u64::MAX, |t| DEPTH_STEPS.saturating_mul(t)))
+}
+
+/// See [`depth`].
+const DEPTH_STEPS: u64 = 1 << 16;
+
+/// See [`depth`].
+const DEPTH_FACTOR: u64 = 8;
 
 /// The most shared values the MBA phase cuts a fragment at, one question each.
 const CUTS: usize = 2;
@@ -3270,10 +3328,15 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
 /// whose answer was no smaller (five of 110 to 197 nodes in another, 2.5 million steps and no
 /// rewrite). `root` itself is asked again: the call remembers its answer, and what kept it
 /// back may be gone in a later round.
-fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> bool {
-    if r.mba_kept.is_empty() {
-        return false;
+///
+/// One whose question ran out of steps at this round's depth (`Runner::mba_shallow`) keeps the
+/// larger fragment back for the round only: [`Kept::Shallow`], where nothing below is kept
+/// for the call.
+fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> Option<Kept> {
+    if r.mba_kept.is_empty() && r.mba_shallow.is_empty() {
+        return None;
     }
+    let mut found = None;
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     for &a in &bindings.atoms {
         seen.insert(a, ());
@@ -3284,11 +3347,22 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
             continue;
         }
         if r.mba_kept.contains_key(&i) {
-            return true;
+            return Some(Kept::Whole);
+        }
+        if r.mba_shallow.contains_key(&i) {
+            found = Some(Kept::Shallow);
         }
         stack.extend(cx.node(i).children());
     }
-    false
+    found
+}
+
+/// What [`holds_kept`] found below a fragment's root.
+enum Kept {
+    /// A fragment kept as it is for the call.
+    Whole,
+    /// One whose question a deeper round asks again.
+    Shallow,
 }
 
 /// One question to the solver takes at most this fraction of the call's solver steps (and at
@@ -3314,19 +3388,20 @@ fn ask(
     cfg: &MbaConfig,
     n: u32,
     root: u32,
-    cut: Option<u32>,
-    cap: u64,
+    reading: Option<Reading>,
+    cap: Cap,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
-    // The whole fragment, or its semi-linear reading with the node `cut` an atom (and an
-    // operand that is the atom less a constant written over it, see `lower_id_over`).
-    let lowered = match cut {
+    // The whole fragment, or a narrower reading of it: semi-linear with a node cut off as
+    // an atom (and an operand that is the atom less a constant written over it, see
+    // `lower_id_over`), or with the arithmetic under its bitwise operators atoms.
+    let lowered = match reading {
         None => lower_id(cx, root, &cfg.limits),
-        Some(c) => lower_id_over(
+        Some(_) => lower_id_over(
             cx,
             root,
             &cfg.limits,
-            Some(Reading::Cut(c)),
+            reading,
             &crate::hash::IdMap::default(),
         ),
     };
@@ -3355,9 +3430,18 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    if holds_kept(r, cx, root, &bindings) {
-        count(r).unsupported += 1;
-        return Ok(Step::Normal(Fin::FINAL));
+    match holds_kept(r, cx, root, &bindings) {
+        Some(Kept::Whole) => {
+            count(r).unsupported += 1;
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+        // No smaller a question than the one inside it that ran out of steps at this round's
+        // depth: asked when that one has been.
+        Some(Kept::Shallow) => {
+            r.mba_deeper = true;
+            return Ok(Step::Normal(Fin::PROVISIONAL));
+        }
+        None => {}
     }
     let inner = r.inner;
     let prover_id = inner.mba.prover.as_ref().map_or("", |p| p.id());
@@ -3412,14 +3496,22 @@ fn ask(
                     // `SOLVE_SHARE`), and one the solver ran out of steps on is not asked
                     // again in this call with no more of them: the answer is the same.
                     let share = (r.meter.limit.mba_steps / SOLVE_SHARE).max(SOLVE_SHARE_MIN);
-                    let limit = cfg
-                        .budget
-                        .steps
-                        .min(share)
-                        .min(cap)
-                        .min(r.meter.left_in(|b| b.mba_steps));
+                    let full = cfg.budget.steps.min(share);
+                    let (steps, deepens) = match cap {
+                        Cap::Steps(s) => (s, false),
+                        Cap::Depth(s) => (s, s < full),
+                    };
+                    let limit = full.min(steps).min(r.meter.left_in(|b| b.mba_steps));
+                    // Whether a deeper round asks this question with more steps than it has
+                    // here: running out of these is not the call's budget running out.
+                    let shallow = deepens && limit == steps;
                     if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
+                        if shallow {
+                            r.mba_shallow.insert(root, ());
+                            r.mba_deeper = true;
+                            return Ok(Step::Normal(Fin::PROVISIONAL));
+                        }
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
                     r.meter.charge(Counter::MbaCalls, 1)?;
@@ -3434,8 +3526,14 @@ fn ask(
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
                     r.meter.charge(Counter::MbaSteps, spent)?;
                     if a == MbaAnswer::Exhausted {
-                        // A fragment that holds this one is no smaller a question.
                         r.mba_exhausted.insert(key, limit);
+                        if shallow {
+                            count(r).exhausted += 1;
+                            r.mba_shallow.insert(root, ());
+                            r.mba_deeper = true;
+                            return Ok(Step::Normal(Fin::PROVISIONAL));
+                        }
+                        // A fragment that holds this one is no smaller a question.
                         r.mba_kept.insert(root, ());
                     }
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
@@ -3487,7 +3585,7 @@ fn ask(
                     // within a smaller share: the node's own question had the large one, and
                     // two retries that each took half the call's pass work left the root as
                     // it was (eleven of 140 measured questions).
-                    let part = match cut.is_some() || root != n {
+                    let part = match reading.is_some() || root != n {
                         true => RETRY_GATE_SHARE,
                         false => GATE_SHARE,
                     };

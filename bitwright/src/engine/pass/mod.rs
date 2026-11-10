@@ -433,7 +433,17 @@ pub(super) fn mba_first(
         None => true,
         Some(&p) => !mba::asks(r, cx, cfg, p)?,
     };
-    if !top || !mba::asks(r, cx, cfg, n)? {
+    // A sum too large to ask whole is still taken apart first (see `linear::by_groups`), at
+    // the top of its chain: its terms asked one at a time are the questions of the groups
+    // they belong to, each a part of an identity that only the group shows.
+    let sum_top = matches!(cx.node(n).op, OpCode::Add | OpCode::Sub)
+        && r.chain_parent.get(&n).is_none_or(|&p| {
+            !matches!(
+                cx.node(p).op,
+                OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl
+            )
+        });
+    if !top || !(mba::asks(r, cx, cfg, n)? || sum_top) {
         r.first.insert(n, None);
         return Ok(None);
     }

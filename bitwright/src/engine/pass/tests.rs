@@ -3552,7 +3552,10 @@ mod mba_service {
 
     #[test]
     fn answers_are_cached_and_calls_budgeted() {
-        let solver = Arc::new(Counting(AtomicU64::new(0)));
+        // (A solver that counts its steps: one charged its whole limit has its fragments kept
+        // from the questions above them in the run that asked, which a cached answer does
+        // not say.)
+        let solver = Arc::new(Steady(1000, AtomicU64::new(0)));
         let cache = Arc::new(MemoryCache::new(1024));
         let eng = Engine::builder()
             .builtin()
@@ -3562,11 +3565,11 @@ mod mba_service {
             .build()
             .unwrap();
         let (_, out, _) = run(&eng, NONLINEAR);
-        let first = solver.0.load(Ordering::Relaxed);
+        let first = solver.1.load(Ordering::Relaxed);
         assert!(first > 0 && out.stats.mba.no_simpler > 0);
         // A fresh context: answered from the cache.
         let (_, out, _) = run(&eng, NONLINEAR);
-        assert_eq!(solver.0.load(Ordering::Relaxed), first);
+        assert_eq!(solver.1.load(Ordering::Relaxed), first);
         assert!(out.stats.mba.cache_hits > 0);
         // The call budget.
         let eng = mba_engine(Arc::new(Counting(AtomicU64::new(0))), MbaTrust::default());
@@ -3635,6 +3638,24 @@ mod mba_service {
         }
     }
 
+    /// Runs out of steps with fewer than the first field; the second is the most it was given.
+    struct Hungry(u64, AtomicU64);
+    impl MbaSolver for Hungry {
+        fn id(&self) -> &str {
+            "test.hungry"
+        }
+        fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+            self.solve_counted(p, budget).0
+        }
+        fn solve_counted(&self, _: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+            self.1.fetch_max(budget.steps, Ordering::Relaxed);
+            match budget.steps < self.0 {
+                true => (MbaAnswer::Exhausted, budget.steps),
+                false => (MbaAnswer::NoSimpler, self.0),
+            }
+        }
+    }
+
     /// Several MBA questions, one per summand.
     const MANY: &str = "((x ^ y) + 2 * (x & y)) * ((x | z) - (x & z)) \
                         + ((y ^ z) + 2 * (y & z)) * ((y | x) + (y & x)) \
@@ -3682,13 +3703,29 @@ mod mba_service {
         let s = Arc::new(Steady(1000, AtomicU64::new(0)));
         let out = ask(s.clone(), 1000 * calls - 1);
         assert_eq!(out.stats.mba.steps, 1000 * calls - 1);
-        // A solver that does not count is charged its whole limit, and one question's limit
-        // is a quarter of the account where that is less than the solver's own.
+        // A solver that does not count is charged its whole limit: what a question takes
+        // while the rounds have others to ask (65,536 steps).
         let limit = MbaConfig::default().budget.steps;
         let c = Arc::new(Counting(AtomicU64::new(0)));
         let out = ask(c.clone(), 2 * limit);
-        assert_eq!(c.0.load(Ordering::Relaxed), 4);
-        assert_eq!(out.stats.mba.steps, 2 * limit);
+        let asked = c.0.load(Ordering::Relaxed);
+        assert!(asked >= 3 && asked << 16 < 2 * limit, "{asked}");
+        assert_eq!(out.stats.mba.steps, asked << 16);
+        // A question that ran out of those is asked again once a round changes nothing, and
+        // its limit then is a quarter of the account where that is less than the solver's
+        // own.
+        let h = Arc::new(Hungry(300_000, AtomicU64::new(0)));
+        let out = ask(h.clone(), 2 * limit);
+        assert_eq!(h.1.load(Ordering::Relaxed), limit / 2);
+        assert_eq!(out.roots[0].end, End::Completed);
+        // One that runs out of that too: the run says so.
+        let h = Arc::new(Hungry(limit, AtomicU64::new(0)));
+        let out = ask(h.clone(), 2 * limit);
+        assert_eq!(h.1.load(Ordering::Relaxed), limit / 2);
+        assert_eq!(
+            out.roots[0].end,
+            End::BudgetTerminated(crate::engine::Exhausted::MbaSteps)
+        );
         // The normal-form solver counts its steps, and a remembered answer is charged what
         // finding it cost: the same run in a fresh context, answered from the solver's memory,
         // spends the same and gives the same.
@@ -3766,9 +3803,15 @@ mod mba_service {
         };
         let (_, out, _) = run(&with(lax), NONLINEAR);
         assert!(out.roots[0].changed && out.stats.mba.simplified > 0);
-        let (_, out, _) = run(&with(strict), NONLINEAR);
-        assert!(!out.roots[0].changed, "a laxly accepted answer was reused");
-        assert_eq!(out.stats.mba.simplified, 0);
+        // (The strict engine still takes the factor two of the terms share out of them: no
+        // answer of the solver's.)
+        let (cx, out, _) = run(&with(strict), NONLINEAR);
+        assert_eq!(
+            out.stats.mba.simplified, 0,
+            "a laxly accepted answer was reused"
+        );
+        let text = cx.display(out.roots[0].expr).to_string();
+        assert!(!text.contains("9e3779b97f4a7c15"), "{text}");
     }
 
     struct Panicky;

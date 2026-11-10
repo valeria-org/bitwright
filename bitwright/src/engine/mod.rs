@@ -1321,6 +1321,18 @@ struct Runner<'r, 'a> {
     /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
     #[cfg(feature = "mba")]
     mba_kept: IdMap<u32, ()>,
+    /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
+    /// rounds ask within a few steps each until one changes nothing, and only then deeper.
+    #[cfg(feature = "mba")]
+    mba_depth: u8,
+    /// Whether a question of this round ran out of steps at that depth (or was not asked for
+    /// holding one that did), so a deeper round has something to ask.
+    #[cfg(feature = "mba")]
+    mba_deeper: bool,
+    /// The roots of the fragments whose questions ran out of steps at this round's depth:
+    /// a fragment holding one is not asked at this depth either (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_shallow: IdMap<u32, ()>,
     /// The opaque-constant candidates whose readings were asked in this call and decided
     /// nothing: atoms to the readings of every candidate above them (see
     /// `pass::mba::readings_prove`).
@@ -2439,6 +2451,12 @@ impl Engine {
             #[cfg(feature = "mba")]
             mba_kept: IdMap::default(),
             #[cfg(feature = "mba")]
+            mba_depth: 0,
+            #[cfg(feature = "mba")]
+            mba_deeper: false,
+            #[cfg(feature = "mba")]
+            mba_shallow: IdMap::default(),
+            #[cfg(feature = "mba")]
             mba_undecided: IdMap::default(),
             #[cfg(feature = "mba")]
             swept: IdMap::default(),
@@ -2819,6 +2837,23 @@ impl Runner<'_, '_> {
         }
     }
 
+    /// Whether questions of the MBA phase wait for a deeper round (see `pass::mba::depth`),
+    /// which the next round then is: one step deeper, or at the full depth (`full`).
+    fn deepen(&mut self, full: bool) -> bool {
+        #[cfg(feature = "mba")]
+        if self.mba_deeper {
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+            self.mba_depth = match full {
+                true => u8::MAX,
+                false => self.mba_depth.saturating_add(1),
+            };
+            return true;
+        }
+        let _ = full;
+        false
+    }
+
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
     /// nothing or the strategy allows no more (`Stats::rounds_capped` counts those).
     fn rounds(
@@ -2828,9 +2863,22 @@ impl Runner<'_, '_> {
         mut fin: Fin,
     ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
         let inner = self.inner;
-        for round in 0..inner.strategy.max_rounds.max(1) {
+        let max = inner.strategy.max_rounds.max(1);
+        #[cfg(feature = "mba")]
+        {
+            self.mba_depth = 0;
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+        }
+        // The rounds that changed the root, and every round (the number an observer sees).
+        let (mut changed, mut round) = (0u8, 0u8);
+        // Whether this round is over the root the one before it left as it was, with deeper
+        // questions; and whether it is the one round past the strategy's last, with the
+        // deepest (see below).
+        let (mut again, mut extra) = (false, false);
+        loop {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
-            if round > 0 {
+            if round > 0 && !again {
                 let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
                 if swept != cur {
                     fin = fin.and(Fin::relying(self.assumed()));
@@ -2838,7 +2886,7 @@ impl Runner<'_, '_> {
                 }
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
-            let start = cur;
+            let (start, before) = (cur, fin);
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 let spent0 = self.meter.spent;
                 self.phase_name = p.name();
@@ -2881,9 +2929,32 @@ impl Runner<'_, '_> {
                     Err(stop) => return Err((cur, fin, stop)),
                 }
             }
-            if cur == start {
+            round = round.saturating_add(1);
+            let same = cur == start;
+            changed += u8::from(!same);
+            let last = extra || changed >= max;
+            // The MBA phase's questions that ran out of steps at the depth this round asked
+            // them (see `pass::mba::depth`) are asked deeper once the rounds have nothing left
+            // to do at this one: in a round over the same root where this one changed nothing
+            // (without the sweeps, and with that round's word on the root in place of this
+            // one's), and in one round past the strategy's last, at the full depth, where the
+            // rounds were still changing it.
+            if !extra && (same || last) && self.deepen(!same) {
+                if same {
+                    fin = before;
+                } else {
+                    extra = true;
+                }
+                again = same;
+                continue;
+            }
+            if same {
                 return Ok((cur, fin));
             }
+            if last {
+                break;
+            }
+            again = false;
         }
         self.stats.rounds_capped += 1;
         Ok((cur, fin))
