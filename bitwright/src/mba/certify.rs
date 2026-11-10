@@ -108,10 +108,75 @@ impl core::hash::Hasher for TableHasher {
 type HashMap<K, V> =
     std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
 
-/// A table of nodes with room for `nodes` of them (an entry is over a hundred bytes: growing
-/// the table as it fills moved every entry several times).
-fn node_table(nodes: usize) -> HashMap<MNode, u32> {
-    HashMap::with_capacity_and_hasher(nodes, Default::default())
+/// Where each node of a hash-consed list is, by content: an open-addressed table of indices
+/// into the list. (A table keyed by the nodes themselves holds a copy of each, a hundred
+/// bytes an entry, and building it was most of putting two sides in one list.)
+#[derive(Debug)]
+struct NodeTable {
+    /// A node's index plus one; 0: empty. A power of two, at most half full.
+    slots: Vec<u32>,
+}
+
+impl NodeTable {
+    /// A table with room for `nodes` nodes before it grows.
+    fn with_room(nodes: usize) -> NodeTable {
+        NodeTable {
+            slots: vec![0; (2 * nodes.max(8)).next_power_of_two()],
+        }
+    }
+
+    fn slot_of(&self, node: &MNode) -> usize {
+        use core::hash::{Hash, Hasher};
+        let mut h = TableHasher::default();
+        node.hash(&mut h);
+        h.finish() as usize & (self.slots.len() - 1)
+    }
+
+    /// The index of `node` in `nodes`, if it is there.
+    fn get(&self, nodes: &[MNode], node: &MNode) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut at = self.slot_of(node);
+        loop {
+            match self.slots[at] {
+                0 => return None,
+                k if nodes[k as usize - 1] == *node => return Some(k - 1),
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    /// Records node `i` of `nodes` (one that is not in the table).
+    fn insert(&mut self, nodes: &[MNode], i: u32) {
+        if 2 * (nodes.len() + 1) > self.slots.len() {
+            // Twice the room, every node put again.
+            self.slots = vec![0; (4 * nodes.len().max(8)).next_power_of_two()];
+            for k in 0..nodes.len() as u32 {
+                self.place(nodes, k);
+            }
+        } else {
+            self.place(nodes, i);
+        }
+    }
+
+    fn place(&mut self, nodes: &[MNode], i: u32) {
+        let mask = self.slots.len() - 1;
+        let mut at = self.slot_of(&nodes[i as usize]);
+        while self.slots[at] != 0 {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = i + 1;
+    }
+
+    /// The index of `node` in `nodes`, added at the end if it is not there.
+    fn intern(&mut self, nodes: &mut Vec<MNode>, node: MNode) -> u32 {
+        if let Some(i) = self.get(nodes, &node) {
+            return i;
+        }
+        nodes.push(node);
+        let i = nodes.len() as u32 - 1;
+        self.insert(nodes, i);
+        i
+    }
 }
 
 /// The most points one test evaluates, whatever the budget.
@@ -1586,7 +1651,7 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
     // Both sides in one hash-consed list, so a chain node of one is found in the other.
     let total = a.nodes().len() + b.nodes().len();
     let mut nodes: Vec<MNode> = Vec::with_capacity(total);
-    let mut intern: HashMap<MNode, u32> = node_table(total);
+    let mut intern = NodeTable::with_room(total);
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
         let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -1598,11 +1663,7 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
             if commutative(&node.op) && node.args[0] > node.args[1] {
                 node.args.swap(0, 1);
             }
-            let id = *intern.entry(node).or_insert_with(|| {
-                nodes.push(node);
-                nodes.len() as u32 - 1
-            });
-            map.push(id);
+            map.push(intern.intern(&mut nodes, node));
         }
         let Some(&r) = map.last() else {
             return Vec::new();
@@ -2637,7 +2698,7 @@ struct Compose {
     /// The two sides' nodes come first; the others are synthetic (complements of atoms,
     /// bitwise forms found at the sample), evaluated and paired like them but on neither side.
     sides: usize,
-    intern: HashMap<MNode, u32>,
+    intern: NodeTable,
     /// Per class root: its bitwise representative, if any (see [`Policy::Linear`]).
     rep: Vec<Option<u32>>,
     /// The sample points, and per node a digest of its value at each (the value itself up to
@@ -2741,7 +2802,7 @@ impl Compose {
         // Room for both sides and the nodes added to them (complements, bitwise forms).
         let total = a.nodes().len() + b.nodes().len();
         let mut nodes: Vec<MNode> = Vec::with_capacity(total + total / 2);
-        let mut intern: HashMap<MNode, u32> = node_table(total + total / 2);
+        let mut intern = NodeTable::with_room(total + total / 2);
         let mut roots = [0u32; 2];
         for (side, m) in [a, b].into_iter().enumerate() {
             let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -2753,11 +2814,7 @@ impl Compose {
                 if commutative(&node.op) && node.args[0] > node.args[1] {
                     node.args.swap(0, 1);
                 }
-                let id = *intern.entry(node).or_insert_with(|| {
-                    nodes.push(node);
-                    nodes.len() as u32 - 1
-                });
-                map.push(id);
+                map.push(intern.intern(&mut nodes, node));
             }
             roots[side] = map.last().copied().unwrap_or(0);
         }
@@ -2812,7 +2869,7 @@ impl Compose {
         if commutative(&node.op) && node.args[0] > node.args[1] {
             node.args.swap(0, 1);
         }
-        if let Some(&i) = self.intern.get(&node) {
+        if let Some(i) = self.intern.get(&self.nodes, &node) {
             return i;
         }
         let i = self.nodes.len() as u32;
@@ -2839,7 +2896,7 @@ impl Compose {
         self.abstracted.push(false);
         self.var_member.push(None);
         self.forced.push(false);
-        self.intern.insert(node, i);
+        self.intern.insert(&self.nodes, i);
         i
     }
 
@@ -4651,7 +4708,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     // Both sides in one hash-consed table, so equal subterms are one symbol.
     let tsc = std::time::Instant::now();
     let total = a.nodes().len() + b.nodes().len();
-    let mut canon: HashMap<MNode, u32> = node_table(total);
+    let mut canon = NodeTable::with_room(total);
     let mut nodes: Vec<MNode> = Vec::with_capacity(total);
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
@@ -4664,11 +4721,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
             if commutative(&k.op) && k.args[0] > k.args[1] {
                 k.args.swap(0, 1);
             }
-            let id = *canon.entry(k).or_insert_with(|| {
-                nodes.push(k);
-                nodes.len() as u32 - 1
-            });
-            map.push(id);
+            map.push(canon.intern(&mut nodes, k));
         }
         roots[side] = *map.last()?;
     }
