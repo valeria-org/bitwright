@@ -1517,6 +1517,22 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
             report.cert = Some(Cert::Symbolic);
         }
     }
+    // Still open: sides that are each a constant plus a multiple of every bit of the
+    // variables, compared as that (see `bit_linear`). A sum of products of bitwise functions
+    // of one value by constants is one whatever its carries, and the tests above take it for
+    // an atom under a mask.
+    if report.verdict == Verdict::Unknown
+        && let Some(found) = bit_linear(meter, da.as_ref().unwrap_or(a), db.as_ref().unwrap_or(b))?
+    {
+        report.cert = Some(Cert::Symbolic);
+        match found {
+            None => report.verdict = Verdict::Proved,
+            Some(point) => {
+                report.verdict = Verdict::Refuted;
+                report.counterexample = Some(point);
+            }
+        }
+    }
     // A refutation comes with an input where the sides differ; one without would be a bug
     // (decided nothing).
     if report.verdict == Verdict::Refuted
@@ -1534,6 +1550,246 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         report.internal += 1;
     }
     Ok(report)
+}
+
+/// The most bits of variables [`bit_linear`] takes.
+const LINEAR_BITS: usize = 256;
+
+/// A value as `k + Σ dᵢ·bᵢ` over the bits `bᵢ` of the variables, modulo `2^w`.
+#[derive(Clone, PartialEq, Eq)]
+struct BitLinear {
+    k: u64,
+    d: Vec<u64>,
+}
+
+/// A value each bit of which is a constant, a bit of a variable or its complement: bit `j` is
+/// `alpha[j] ^ b` for the variable bit `b = src[j]` where `has[j]`, else `alpha[j]`.
+struct BitAffine {
+    alpha: u64,
+    has: u64,
+    src: [u16; 64],
+}
+
+impl BitLinear {
+    /// The form as a [`BitAffine`], when each variable bit it reads sets or clears one bit
+    /// of its own and the constant left has none of those: no carry, so every bit is the
+    /// constant's or one variable bit's (`k + 2^p·b` with bit `p` of `k` clear is `k | b << p`;
+    /// `k − 2^p·b` is `(k − 2^p) + 2^p·~b`).
+    fn affine(&self, ones: u64) -> Option<BitAffine> {
+        let mut out = BitAffine {
+            alpha: 0,
+            has: 0,
+            src: [0; 64],
+        };
+        let mut k = self.k;
+        for (i, &d) in self.d.iter().enumerate() {
+            if d == 0 {
+                continue;
+            }
+            let neg = d.wrapping_neg() & ones;
+            let (p, minus) = if d.is_power_of_two() {
+                (d.trailing_zeros(), false)
+            } else if neg.is_power_of_two() {
+                (neg.trailing_zeros(), true)
+            } else {
+                return None;
+            };
+            let bit = 1u64 << p;
+            if out.has & bit != 0 {
+                return None;
+            }
+            out.has |= bit;
+            out.src[p as usize] = i as u16;
+            if minus {
+                out.alpha |= bit;
+                k = k.wrapping_sub(bit) & ones;
+            }
+        }
+        // The top bit's multiple is its own negation: the bit is the variable bit's
+        // complement where the constant has it set.
+        let top = ones ^ (ones >> 1);
+        if out.has & k & top != 0 {
+            out.alpha |= top;
+            k ^= top;
+        }
+        if k & out.has != 0 {
+            return None;
+        }
+        out.alpha |= k;
+        Some(out)
+    }
+}
+
+impl BitAffine {
+    fn linear(&self, bits: usize, ones: u64) -> BitLinear {
+        let mut out = BitLinear {
+            k: self.alpha & ones,
+            d: vec![0; bits],
+        };
+        let mut left = self.has & ones;
+        while left != 0 {
+            let p = left.trailing_zeros();
+            left &= left - 1;
+            let bit = 1u64 << p;
+            let d = &mut out.d[self.src[p as usize] as usize];
+            // `1 ^ b` is `1 − b`.
+            *d = match self.alpha & bit != 0 {
+                true => d.wrapping_sub(bit),
+                false => d.wrapping_add(bit),
+            } & ones;
+        }
+        out
+    }
+}
+
+/// Whether `a` and `b` are equal, where each is a constant plus a multiple of every bit of
+/// the variables modulo the width: `None` when a side is not read as one, `Some(None)` when
+/// they are equal, `Some(Some(point))` with an input where they differ.
+///
+/// Sums, differences, negations, complements, left shifts and products by a constant keep
+/// such a form whatever it is. `& | ^` and a right shift take operands every bit of which is a
+/// constant, a variable bit or its complement (a form that sets or clears one bit for each
+/// variable bit it reads, with no carry), and give one: two bits over the same variable bit
+/// combine to it, its complement or a constant. Two forms are the same function exactly when
+/// their constants and multiples are the same (at zero, and at each single variable bit), so
+/// the comparison decides, at 64 bits or fewer and up to [`LINEAR_BITS`] bits of variables.
+/// One unit of work per node and 16 variable bits.
+fn bit_linear<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+) -> Result<Option<Option<Vec<BitVec>>>, M::Err> {
+    let (Some(w), Some(wb)) = (a.width(), b.width()) else {
+        return Ok(None);
+    };
+    if w != wb || w.bits() > 64 || a.vars() != b.vars() {
+        return Ok(None);
+    }
+    let bits = a.vars().len() * usize::from(w.bits());
+    if bits == 0 || bits > LINEAR_BITS {
+        return Ok(None);
+    }
+    let cost = ((a.nodes().len() + b.nodes().len()) * (bits / 16 + 1)) as u64;
+    if cost > meter.left() {
+        return Ok(None);
+    }
+    meter.charge(cost)?;
+    let wn = usize::from(w.bits());
+    let ones = if wn == 64 { u64::MAX } else { (1u64 << wn) - 1 };
+    let form = |m: &MbaExpr| -> Option<BitLinear> {
+        let nodes = m.nodes();
+        let mut forms: Vec<Option<BitLinear>> = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let arg = |j: usize| forms[n.args[j] as usize].as_ref();
+            let zip = |x: &BitLinear, y: &BitLinear, f: fn(u64, u64) -> u64| BitLinear {
+                k: f(x.k, y.k) & ones,
+                d: x.d
+                    .iter()
+                    .zip(&y.d)
+                    .map(|(&p, &q)| f(p, q) & ones)
+                    .collect(),
+            };
+            let scale = |x: &BitLinear, c: u64| BitLinear {
+                k: x.k.wrapping_mul(c) & ones,
+                d: x.d.iter().map(|&p| p.wrapping_mul(c) & ones).collect(),
+            };
+            let konst = |x: &BitLinear| x.d.iter().all(|&p| p == 0).then_some(x.k);
+            let f = (|| match n.op {
+                _ if n.width != w => None,
+                MOp::Const(c) => Some(BitLinear {
+                    k: c.to_u64()? & ones,
+                    d: vec![0; bits],
+                }),
+                MOp::Var(v) => {
+                    let mut d = vec![0; bits];
+                    for j in 0..wn {
+                        d[v as usize * wn + j] = 1u64 << j;
+                    }
+                    Some(BitLinear { k: 0, d })
+                }
+                MOp::Add => Some(zip(arg(0)?, arg(1)?, u64::wrapping_add)),
+                MOp::Sub => Some(zip(arg(0)?, arg(1)?, u64::wrapping_sub)),
+                MOp::Neg => Some(scale(arg(0)?, u64::MAX)),
+                // `~x` is `−x − 1`.
+                MOp::Not => {
+                    let mut x = scale(arg(0)?, u64::MAX);
+                    x.k = x.k.wrapping_sub(1) & ones;
+                    Some(x)
+                }
+                MOp::Shl(s) => Some(scale(arg(0)?, 1u64.checked_shl(u32::from(s))?)),
+                MOp::Mul => {
+                    let (x, y) = (arg(0)?, arg(1)?);
+                    match (konst(x), konst(y)) {
+                        (Some(c), _) => Some(scale(y, c)),
+                        (_, Some(c)) => Some(scale(x, c)),
+                        _ => None,
+                    }
+                }
+                MOp::LShr(s) => {
+                    let x = arg(0)?.affine(ones)?;
+                    let s = u32::from(s);
+                    let mut out = BitAffine {
+                        alpha: x.alpha.checked_shr(s)?,
+                        has: x.has.checked_shr(s)?,
+                        src: [0; 64],
+                    };
+                    for j in 0..wn.saturating_sub(s as usize) {
+                        out.src[j] = x.src[j + s as usize];
+                    }
+                    Some(out.linear(bits, ones))
+                }
+                MOp::And | MOp::Or | MOp::Xor => {
+                    let (x, y) = (arg(0)?.affine(ones)?, arg(1)?.affine(ones)?);
+                    let mut out = BitAffine {
+                        alpha: 0,
+                        has: 0,
+                        src: [0; 64],
+                    };
+                    let op = |p: bool, q: bool| match n.op {
+                        MOp::And => p & q,
+                        MOp::Or => p | q,
+                        _ => p ^ q,
+                    };
+                    for j in 0..wn {
+                        let bit = 1u64 << j;
+                        let (hx, hy) = (x.has & bit != 0, y.has & bit != 0);
+                        let (ax, ay) = (x.alpha & bit != 0, y.alpha & bit != 0);
+                        if hx && hy && x.src[j] != y.src[j] {
+                            return None;
+                        }
+                        // The bit where the variable bit is 0, and where it is 1.
+                        let at0 = op(ax, ay);
+                        let at1 = op(ax ^ hx, ay ^ hy);
+                        if at0 {
+                            out.alpha |= bit;
+                        }
+                        if at0 != at1 {
+                            out.has |= bit;
+                            out.src[j] = if hx { x.src[j] } else { y.src[j] };
+                        }
+                    }
+                    Some(out.linear(bits, ones))
+                }
+                MOp::Zext | MOp::Sext | MOp::Trunc => None,
+            })();
+            forms.push(f);
+        }
+        forms.pop().flatten()
+    };
+    let (Some(fa), Some(fb)) = (form(a), form(b)) else {
+        return Ok(None);
+    };
+    if fa == fb {
+        return Ok(Some(None));
+    }
+    // Where they differ: at zero, or at the one variable bit whose multiples do.
+    let mut point = vec![BitVec::zero(w); a.vars().len()];
+    if fa.k == fb.k
+        && let Some(i) = (0..bits).find(|&i| fa.d[i] != fb.d[i])
+    {
+        point[i / wn] = BitVec::wrapping_from_u64(w, 1u64 << (i % wn));
+    }
+    Ok(Some(Some(point)))
 }
 
 /// The most changes of variable [`prove`] asks about (atoms tried, most read first).

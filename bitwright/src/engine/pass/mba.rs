@@ -2885,11 +2885,14 @@ pub(super) fn step(
         && fin.done
     {
         // a fragment that reads slices of one rotated value, asked again with them
-        // written as masks of that rotation (see [`sliced`]).
+        // written as masks of that rotation (see [`sliced`]), within the steps of a retried
+        // question: the answers taken in 140 measured questions took under 9,000 steps, and
+        // without the limit thirteen that took the node's own share left eleven of those
+        // questions out of steps.
         let before = cx.len() as u32;
         let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
         if let Some(root) = slices {
-            let again = ask(r, cx, cfg, n, root, None, u64::MAX)?;
+            let again = ask(r, cx, cfg, n, root, None, CUT_STEPS)?;
             if matches!(again, Step::To(..)) {
                 return Ok(again);
             }
@@ -3123,6 +3126,9 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
                     factor: None,
                 });
             }
+            // What the part is a slice of is read too: a value of the fragment's own
+            // (`(a & b) ^ k`, over two slices of another value) has parts below it.
+            stack.push(slice.base);
             continue;
         }
         // Read as it is: one reader of itself, unrotated.
