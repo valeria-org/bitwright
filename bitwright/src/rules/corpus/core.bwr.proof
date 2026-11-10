@@ -1,6 +1,7 @@
 # bitwright proof ledger v2. Generated; do not edit.
 core.arith::add_and_or 231e32f29079f031059e35c9ff2c7c8d identity exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
 core.arith::add_disjoint c21668d593d2958761d618170fb36e1a rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=991)
+core.arith::add_or_const 3c1e6782a4200517a4bb77bc73d13e51 rule exhaustive(inst=5,maxw=5,cases=37448,fired=1364) sampled(inst=22,cases=1408,fired=51)
 core.arith::add_xor_and 91a74de0aba7b7ddb91240edcadabeb2 identity exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
 core.arith::mul_pow2 6496ccdcfe6d1bf9444d7f829bb87e6a rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=891)
 core.arith::neg_not 15e193fa568fc257d7e9a277953b4ad3 rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)

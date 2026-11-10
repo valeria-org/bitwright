@@ -326,10 +326,13 @@ pub(super) fn mba_step(
     let additive = |op: OpCode| matches!(op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl);
     if let Some(&p) = r.chain_parent.get(&n) {
         let (op, up) = (cx.node(n).op, cx.node(p).op);
-        // A cast between a link and its user is part of the user's fragment (`zext(t ^ k)`
-        // beside other terms): the link is covered by the question above the cast.
+        // A truncation between a link and its user is part of the user's fragment
+        // (`trunc(a + b) + c` is one sum at the narrow width): the link is covered by the
+        // question above it. Not an extension or a slice: the question above reads the link
+        // through a mask or a shift, where the link's own is a sum at its width
+        // (`zext<64>(s) + k` with `s` a 32-bit MBA that is a constant only modulo `2^32`).
         let (p, up) = match up {
-            OpCode::Zext | OpCode::Sext | OpCode::Extract => match r.chain_parent.get(&p) {
+            OpCode::Extract if cx.node(p).b == 0 => match r.chain_parent.get(&p) {
                 Some(&q) => (q, cx.node(q).op),
                 None => (p, up),
             },

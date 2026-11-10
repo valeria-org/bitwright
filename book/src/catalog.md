@@ -161,6 +161,20 @@ rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }
 
 - `(p | q) - p` → `q & ~p`
 
+#### `add_or_const` — rule
+
+Likewise the bits a constant did not set, the subtraction written as an addition.
+
+```text
+rule add_or_const<W>(x: W, c: const W, k: const W) {
+        (x | c) + k => x & m
+        if c + k == 0
+        let m: W = ~c
+    }
+```
+
+- `(p | 0xf0) + 0x10` → `p & 0x0f`
+
 #### `neg_not` — rule
 
 `-~x = x + 1`.
