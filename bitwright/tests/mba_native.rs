@@ -942,3 +942,21 @@ fn extensions_of_narrow_variables_are_read_and_written() {
         assert_eq!(out.stats.mba.refuted, 0, "`{src}`");
     }
 }
+
+/// A coefficient may be the sign bit of a 128-bit word, `i128::MIN` as a signed number: its
+/// size is taken without negating it. `abs` of it panicked where overflow is checked (a debug
+/// build), and wrapped elsewhere to a negative size that passed for a small one.
+#[test]
+fn a_coefficient_of_the_128_bit_sign_bit_has_a_size() {
+    let o = ParseOptions::width(Width::new(128).unwrap());
+    let mut cx = Context::new();
+    let e = cx
+        .parse(
+            "zext<128>((~sext<128>(ctz(trunc<24>(zext<128>(d:2)))) | sext<128>(d:2)) \
+             * concat(b:1, 32767:127) != 0xfffff)",
+            &o,
+        )
+        .unwrap();
+    let out = native().run(&mut cx, &[e], Run::default()).unwrap();
+    assert_equivalent(&mut cx, e, out.roots[0].expr, "the product");
+}

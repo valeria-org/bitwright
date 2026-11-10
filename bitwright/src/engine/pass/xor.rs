@@ -351,32 +351,44 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, St
     }
 }
 
-/// The xor pass at `n`.
+/// The xor pass at `n`. What a candidate it declines contributes stays in the result (see the
+/// linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    let mut declined = Fin::FINAL;
     // A linear map of one atom through shifts and rotations (see `gf2`).
     if matches!(
         op,
         OpCode::Xor | OpCode::RotL | OpCode::RotR | OpCode::Shl | OpCode::LShr
-    ) && let Some(Step::To(x, fin)) = super::gf2::step(r, cx, n)?
-    {
-        return Ok(Step::To(x, fin));
+    ) {
+        match super::gf2::step(r, cx, n)? {
+            Some(Step::Normal(f)) => declined = f,
+            Some(step) => return Ok(step),
+            None => {}
+        }
     }
     if !xor_op(op) || op == OpCode::Const {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(declined));
     }
     let form = form_of(r, cx, n)?;
-    if let Some(step @ Step::To(..)) = merge_extract_pair(r, cx, n, &form)? {
-        return Ok(step);
+    match merge_extract_pair(r, cx, n, &form)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
     }
-    if form.is_atom_of(n) {
+    let last = if form.is_atom_of(n) {
         // An xor over the cap in which terms met is written out again, from its whole form.
-        return match r.xor_whole.met(n) {
-            Some(whole) => plain(r, cx, n, whole),
-            None => Ok(Step::Normal(form.fin)),
-        };
-    }
-    plain(r, cx, n, form)
+        match r.xor_whole.met(n) {
+            Some(whole) => plain(r, cx, n, whole)?,
+            None => Step::Normal(form.fin),
+        }
+    } else {
+        plain(r, cx, n, form)?
+    };
+    Ok(match last {
+        Step::Normal(f) => Step::Normal(f.and(declined)),
+        step => step,
+    })
 }
 
 /// The xor pass at `n` over its form as computed.

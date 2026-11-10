@@ -956,19 +956,25 @@ impl Question {
             let why = Unknown::TooLarge { nodes: b.g.len() };
             return decided(q, Outcome::Unknown(why));
         }
-        // Every symbol of the question, with its bits if the circuit reads it.
+        // Every symbol of the question, with its bits if the circuit reads it. (Marked by
+        // symbol index: a search of the list per symbol took 12 s on a question of 64 000
+        // symbols that simplification had already decided.)
+        let mut listed = vec![false; b.cx.symbol_count()];
         for (s, bits) in &b.symbols {
             let h = b.cx.handle(*s);
-            let key =
+            let id =
                 b.cx.symbol_id(h)?
-                    .and_then(|id| b.cx.symbol_key(id))
+                    .ok_or_else(|| Error::Contract("a symbol without its key".into()))?;
+            let key =
+                b.cx.symbol_key(id)
                     .cloned()
                     .ok_or_else(|| Error::Contract("a symbol without its key".into()))?;
+            listed[id.index() as usize] = true;
             q.symbols.push((key, b.cx.width_of(*s), bits.clone()));
         }
         for id in b.cx.symbols_in(&[q.root])? {
-            if let (Some(k), Some(w)) = (b.cx.symbol_key(id).cloned(), b.cx.symbol_width(id))
-                && !q.symbols.iter().any(|(kk, _, _)| *kk == k)
+            if !core::mem::replace(&mut listed[id.index() as usize], true)
+                && let (Some(k), Some(w)) = (b.cx.symbol_key(id).cloned(), b.cx.symbol_width(id))
             {
                 let bits =
                     b.cx.find_symbol(&k)
@@ -1187,8 +1193,12 @@ impl Question {
     /// `Refuted(ce)`, checked by bitwright's evaluator: a solver or blaster bug cannot produce a
     /// false refutation unnoticed.
     fn refuted(&self, cx: &mut Context, ce: Model) -> Result<Outcome, Error> {
-        let env =
-            crate::FnEnv(|k: &SymbolKey, _| ce.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v));
+        // (By key, the first value given for one: a model lists every symbol of the question.)
+        let mut env: std::collections::HashMap<SymbolKey, BitVec> =
+            std::collections::HashMap::with_capacity(ce.len());
+        for (k, v) in &ce {
+            env.entry(k.clone()).or_insert(*v);
+        }
         let v = cx.eval(&[self.root], &env)?[0];
         if v.is_zero() {
             Ok(Outcome::Refuted(ce))
@@ -1204,9 +1214,11 @@ impl Question {
 /// Simplification can omit original symbols: supply values consistent with their declarations
 /// before replaying the original constrained predicate.
 fn complete_model(cx: &mut Context, root: Expr, model: &mut Model) -> Result<(), Error> {
+    let mut given: std::collections::HashSet<SymbolKey> =
+        model.iter().map(|(k, _)| k.clone()).collect();
     for id in cx.symbols_in(&[root])? {
         let key = cx.symbol_key(id).unwrap().clone();
-        if !model.iter().any(|(k, _)| *k == key) {
+        if given.insert(key.clone()) {
             let symbol = cx.find_symbol(&key).unwrap();
             let value = cx.declared_known(symbol)?.map_or_else(
                 || BitVec::zero(cx.symbol_width(id).unwrap()),

@@ -1969,8 +1969,10 @@ impl<'a> Render<'a> {
             let class = usize::from(sym.class);
             let k = sym.set.count_ones();
             if k >= 2 {
+                // (`unsigned_abs`: at a precision of 128 bits the coefficient may be `i128::MIN`,
+                // whose `abs` overflows.)
                 let v = super::poly::signed_rep(c, prec(class)).to_i128();
-                if v.is_none_or(|v| v.abs() > 1i128 << (k - 1).min(64)) {
+                if v.is_none_or(|v| v.unsigned_abs() > 1u128 << (k - 1).min(64)) {
                     return None;
                 }
             }
