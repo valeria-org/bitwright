@@ -950,7 +950,8 @@ fn test<M: Meter>(
     let progs = Program::new(a, false).zip(Program::new(b, false));
     drop(tt);
     let mut tested = Tested::default();
-    test_with(
+    let mut lanes = take_lanes();
+    let ran = test_with(
         meter,
         [a, b],
         progs.as_ref(),
@@ -958,8 +959,10 @@ fn test<M: Meter>(
         report,
         symbolic,
         &mut tested,
-        None,
-    )
+        Some(&mut lanes),
+    );
+    give_lanes(lanes);
+    ran
 }
 
 /// What testing one pair of expressions found that does not depend on the budget, kept while
@@ -1017,6 +1020,84 @@ struct Lanes<L> {
     cols: Vec<Vec<L>>,
     ra: Vec<Vec<L>>,
     rb: Vec<Vec<L>>,
+}
+
+/// What the certificates on a thread hand from one to the next instead of allocating it again:
+/// the lanes of their evaluations and the rows of a sample. A certificate evaluates dozens of
+/// small programs, and each took a vector per register and per variable, and each sample a
+/// vector per node.
+struct Scratch {
+    lanes: Lanes<u64>,
+    rows: Vec<Vec<u64>>,
+}
+
+/// The most vectors a thread keeps in its [`Scratch`], of each kind (a lane is at most
+/// [`BLOCK`] words, a row [`SAMPLE_POINTS`]).
+const SCRATCH_VECTORS: usize = 2048;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = const {
+        std::cell::RefCell::new(Scratch {
+            lanes: Lanes {
+                cols: Vec::new(),
+                ra: Vec::new(),
+                rb: Vec::new(),
+            },
+            rows: Vec::new(),
+        })
+    };
+}
+
+/// The thread's lanes (new ones when it has none to give).
+fn take_lanes() -> Lanes<u64> {
+    SCRATCH
+        .try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut s.lanes)).ok())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Hands lanes back to the thread, unless they grew past what it keeps.
+fn give_lanes(lanes: Lanes<u64>) {
+    if lanes.cols.len() + lanes.ra.len() + lanes.rb.len() > SCRATCH_VECTORS {
+        return;
+    }
+    let _ = SCRATCH.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.lanes = lanes;
+        }
+    });
+}
+
+/// Up to `n` empty rows the thread kept.
+fn take_rows(n: usize) -> Vec<Vec<u64>> {
+    SCRATCH
+        .try_with(|s| {
+            s.try_borrow_mut()
+                .map(|mut s| {
+                    let keep = s.rows.len().saturating_sub(n);
+                    s.rows.split_off(keep)
+                })
+                .ok()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Hands rows back to the thread, emptied, up to what it keeps.
+fn give_rows(rows: &mut Vec<Vec<u64>>) {
+    let _ = SCRATCH.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            for mut row in rows.drain(..) {
+                if s.rows.len() >= SCRATCH_VECTORS {
+                    break;
+                }
+                row.clear();
+                s.rows.push(row);
+            }
+        }
+    });
 }
 
 /// [`test`] on sides already compiled (`None`: one has no nodes), with what earlier tests of
@@ -1804,7 +1885,7 @@ fn prove_at_inner<M: Meter>(
         cmp.prove(meter, &mut report)?;
         drop(tt);
         let tt = tmp_t("A.cdrop");
-        drop(cmp);
+        cmp.recycle();
         drop(tt);
         tmp_stage(top, meter, &mut mark, 2);
     }
@@ -2548,9 +2629,6 @@ struct Compose {
     /// check reads (those there were when it was last set up; nodes added since have none
     /// to it).
     checked: Option<usize>,
-    /// Lanes for the skeletons' evaluations (the sample check and the tests), kept from one
-    /// to the next.
-    lanes: Lanes<u64>,
 }
 
 /// A pair of skeletons one comparison built, with what it found: a later policy that builds
@@ -2692,7 +2770,6 @@ impl Compose {
             points: Vec::new(),
             digests: Vec::new(),
             checked: None,
-            lanes: Lanes::default(),
         };
         c.mark_forced();
         c.add_complements();
@@ -3015,10 +3092,15 @@ impl Compose {
         policy: Policy,
         seen: &mut Vec<Pair>,
     ) -> Result<Compared, M::Err> {
-        let mut lanes = std::mem::take(&mut self.lanes);
+        let mut lanes = take_lanes();
         let out = self.compare_in(meter, report, x, y, policy, seen, &mut lanes);
-        self.lanes = lanes;
+        give_lanes(lanes);
         out
+    }
+
+    /// Ends the comparison: its sample's rows go back to the thread.
+    fn recycle(mut self) {
+        give_rows(&mut self.digests);
     }
 
     /// [`Compose::compare`], evaluating in `lanes`.
@@ -4869,7 +4951,7 @@ fn digests(prog: &Program, points: &[Vec<BitVec>], nodes: usize) -> Vec<Vec<u64>
                 let inputs: Vec<Vec<u64>> = (0..nv)
                     .map(|v| points.iter().map(|p| <u64 as Lane>::from_bv(&p[v])).collect())
                     .collect();
-                let mut regs: Vec<Vec<u64>> = Vec::new();
+                let mut regs: Vec<Vec<u64>> = take_rows(nodes);
                 prog.run(&mut regs, &inputs, n);
                 if regs.len() == nodes && regs.iter().all(|r| r.len() == n) {
                     return regs;
