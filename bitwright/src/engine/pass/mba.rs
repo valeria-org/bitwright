@@ -1961,9 +1961,13 @@ fn run_lanes(prog: &[Ins], lanes: &mut [u64], width: usize) {
 
 /// Word-program evaluations ([`run_lanes`]) charged as one generic node evaluation
 /// (`Context::eval_node`). On representative reconstructed addresses (44 and 71 nodes, 4,096
-/// points) a word program ran 4 to 38 times as fast as the generic evaluator, about 20 times
-/// typically; this charges the low end.
-const WORD_EVALS: u64 = 8;
+/// points) a word program run point by point was 4 to 38 times as fast as the generic
+/// evaluator, and run a block of points at a time it is about twenty times as fast again
+/// (the same enumerations took a twentieth of the time); this charges the low end of the
+/// two together. Charged at the point-by-point rate, enumerations that take a millisecond
+/// were declined for their cost, and six of 140 measured questions ran out of steps a
+/// third of the way from where they now finish.
+const WORD_EVALS: u64 = 64;
 
 /// The most bits [`exhaustive`] enumerates.
 const EXHAUSTIVE_BITS: u32 = 16;
