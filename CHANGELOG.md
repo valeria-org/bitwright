@@ -2,6 +2,121 @@
 
 ## Unreleased
 
+Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and
+tested for borrows, from a corpus of 58,530 windowed expressions of a devirtualizer's limb
+engine.
+
+- **A comparison is made at the width both sides fit in.** The invert pass compared truncations
+  at their own width only where the full width decided nothing else. Where the known bits bound
+  both sides of any comparison to `k` low bits, it now compares their low `k` bits, the
+  narrowing pushed into each side, and a signed order becomes the unsigned one (both sign bits
+  are zero): `(x & 0x1fffff) <u (y & 0x1fffff)` is `trunc<21>(x) <u trunc<21>(y)`. It commits
+  where the DAG gets no larger and, on a tie, the tree gets smaller, so a digit shared by two
+  comparisons no longer holds both back.
+- **A zero difference spelled with a negation is equality** (`eq_neg_add_zero`,
+  `ne_neg_add_zero`): `-a + b == 0` is `a == b`. The linear pass writes `-a + b` as `b - a` only
+  where that frees the negation, so the borrow test `~((-a + b == 0) | (b <u a))`, which shares
+  it, stayed; it is `a <u b` now.
+- **A zero difference in the low bits is equality of the low bits** (`eq_trunc_sub_zero`,
+  `ne_trunc_sub_zero`): `trunc<14>(a - b) == 0` is `trunc<14>(a) == trunc<14>(b)`.
+- **A mask that is a slice is written as one on a tie.** The shuffle pass commits
+  `zext(extract(x))` for a mask of a narrower slice also where the DAG only ties and the tree
+  gets smaller: the masks of one digit share their constant, and each alone freed nothing.
+- **A sum split into digits with a shift is read like one split with `concat`.** The carries
+  pass reads `(hi << k) | lo` (or `+`, `^`, `-`) and constant `>>u` slices as it reads `concat`
+  and `extract`, where the region also compares (the carry written `lo(s) <u lo(x)`), and its
+  atoms may be of any width up to 64 bits: `((x >>u 21) + (y >>u 21) + zext(carry) << 21) |
+  (x + y & 0x1fffff)` is `x + y`.
+- **A carry written as a comparison of low digits is read as the high digits it completes.**
+  `[lo(P) <u lo(Q)] = hi(P) − hi(Q) − hi(P − Q)`, so `hi(a) + hi(b) + [lo(a + b) <u lo(a)]` is
+  `hi(a + b)`. The carries pass rewrites a sum that fits no affine form this way where that
+  leaves it fewer terms and the DAG smaller, and the sum under a read of its low bits
+  (`trunc<j>(s)`, `s & (2^j − 1)`) at those bits. A carry of values whose sum cannot wrap (by
+  the known bits) is read at any width. Each side of the comparison is read through its
+  truncations, masks and zero extensions; one that is no low digit is read as one where its
+  known bits put it below `2^k`, or where it is `k` bits wide with the narrowing pushed into
+  it. Terms that are one value written two ways (a shift beside a slice of the same bits, two
+  spellings of one linear form) count as one.
+- **A limb is the slice of the word it is a limb of.** A handler that computes in limbs
+  computes its lowest limb at the register's full width and masks it, so the word is a node
+  below every higher limb. Where a value's carries are not read as digits, the carries pass
+  looks for the value as `extract<o, j>(B)` of a wide node `B` below it, keeps the candidates
+  that agree at the verification samples, and commits the first that bitwright's prover proves
+  equal within the pass's caps: the top limb of `(w + k) ^ c` in limbs of 12, 12 and 8 bits,
+  ninety nodes of digits, carries and borrows, is `extract<24, 8>(w + k ^ c)`. The value is a
+  sum under a read of its low bits, a shift left among them (`hi << k | lo`, the limb on its
+  way back into a word, which then is the word), or what of a sum is not known to be 0. A
+  slice of a node already there commits also where it leaves the DAG one node larger: the
+  limb code it frees is shared with the other limbs, and what reads the slice takes it away
+  again.
+- **An XOR written as a sum is an XOR where its parts are shared.** The linear-MBA pass commits
+  its form also where the DAG only ties and the tree gets smaller: `a + b - 2·(a & b)` whose
+  `a + b` and `a & b` a carry also reads is `a ^ b`.
+- **`a + a` is a shift by one to the shuffle pass**, as the linear pass writes it:
+  `(hi + hi) | bit` of neighbouring bits of one value is one slice.
+- **Two neighbouring slices of one bitwise value are one slice.** The casts pass reads
+  `concat(hi(a) | hi(b), lo(a | b))` as the slice of `a | b` that covers both.
+
+On that corpus the results have 16 percent fewer DAG nodes on the local windows and 22 percent
+fewer on the deep ones, and 115 of the 234 that ran out of budget now finish (7 others now run
+out).
+
+Limb arithmetic read as arithmetic on the words, on the same corpus: what the comparisons
+above leave, the digits themselves.
+
+- **A new pass, `Words` (`Phase::Words`, phase name `words`), reads arithmetic done digit by
+  digit as arithmetic on the words.** `Strategy::deobfuscate()` runs it after `Demanded`.
+  Every node of at most 64 bits is read as an integer form `c + Σ kᵢ·tᵢ` whose terms are
+  nodes, `floor(F / 2^k)` of forms, ANDs of forms and choices: a slice is two floors, a sum
+  that may wrap is itself less `2^w` times a floor, `x <u y` is `−floor((x − y) / 2^k)`.
+  Identities of the integers keep every floor in one shape, and in that shape the digits of
+  the operands cancel against the carries between them by collecting terms: nothing is
+  matched against a pattern of limb code, and nothing is proved.
+  `trunc<20>((a >>u 12) + (b >>u 12) + zext<32>((a + b & 4095) <u (a & 4095)))` is
+  `extract<12, 20>(a + b)`; three limbs, the carry into the third written through the carry
+  into the second (`[b1 = all ones] & c0 | [s1 <u a1]`), are `extract<16, 16>(a + b)`, and
+  the same of a difference with its borrows, the comparisons spelled `x <u y` or as a
+  virtual machine's handlers do (`~((x == y) | (y <u x))`); `(x & 0xffff) * 0x1234567 +
+  (x >>u 16) * 0x45670000` is `x * 0x1234567`; `extract<16, 16>(x * 5 + 0x1234) + 0xab` is
+  `extract<16, 16>(x * 5 + 0xab1234)`; an XOR spelled `x + y − 2·(x & y)` in limbs is the
+  slice of `x ^ y`; a register chosen between the low half of one value and the high half of
+  another, limb by limb, is the limbs of the value chosen.
+- **What is written back is decided on the whole root.** The limbs of a word share their
+  carries, so no limb alone frees them. From the root down, each node's form is written out
+  again (the floors of one form as slices of that one word, any part that a node below
+  already is as that node), at its width and at the low bits of it that are read, sized
+  against what the root reaches without the node, and the node is replaced for all its users
+  at once where the root's DAG gets smaller. The result replaces the root by the commit
+  rule, and is asked again until nothing is found. A root of more than 1024 nodes is left to
+  its operands.
+- **Each of its rewrites is compared with the root at the verification points first**, as
+  the application of a rule linked without a proof is (`Verify::unproven_points`): the
+  derivation does not rest on that, but a defect of the pass would be seen there, and the
+  pass set aside for the call.
+- **Its work is charged to the pass-work budget**, a unit for two scratch nodes or terms, and
+  is capped at 2^23 a root and 2^26 a call, so that the pass alone does not use up a call's
+  budget.
+- **A range test of a truncation is a range test of the value.** The compares pass reads a
+  set of values of `trunc<k>(x)` as one of `x` (a copy for every value of the bits dropped),
+  as it does through a mask, so a test the invert pass made at the width both sides fit in
+  still joins the others of the value: a NaN test narrowed to `0x7f800000 <u trunc<31>(x)`
+  combines with the float comparisons of `x` as before (`ja` after `ucomiss` is
+  `fp.lt.f32(y, x)`).
+
+On that corpus, with the pass the results have 25.2 percent fewer DAG nodes than without it
+(5,262,215 against 7,032,940): 10.5 percent fewer on the local windows, 27.1 percent on the
+deep ones. 37,427 of the 58,530 results are smaller and 953 larger (by 3 nodes at the median,
+39 at most, 4,240 together against 1,774,965 saved): where the pass leaves a shape the other
+passes do less with than with the one it replaced. Among those looked at: products of an XOR
+in limbs by a constant, XORs of three or more values computed in different orders, and
+values chosen limb by limb between a constant and a register, none of which it reads whole.
+24 of the 123 that ran out of budget now finish, and 34 others now run out (29 on the MBA
+service's steps), each with a smaller result than it had. Simplifying a sample of 3,000 of
+them takes about a third longer with the pass (1.28 and 1.37 times the processor time, two
+runs side by side on a loaded machine). In a run of the corpus with a check added for the
+purpose, every replacement of a node was compared with the node at the engine's verification
+points: 582,393 replacements, no difference.
+
 Found by looking for inputs that break the engine and the provers: random DAGs over a few
 narrow symbols at widths from 1 to 512 bits, every result, every fact and every answer of the
 provers checked at every assignment of the symbols; the same with symbols as wide as the

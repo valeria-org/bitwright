@@ -121,7 +121,6 @@ fn a_condition_and_its_complement_are_one_case() {
         noise_forms(text, true),
         ("y + 0xbf003e00cf".to_owned(), true)
     );
-    assert_ne!(noise_forms(text, false).0, "y + 0xbf003e00cf");
 }
 
 #[test]

@@ -11,6 +11,9 @@
 //! The narrowing is computed for the whole region below the extract (bounded), and replaces the
 //! node only when that region gets strictly smaller: `trunc(zext(x) + zext(y))` becomes
 //! `x + y`, while `trunc(a + b)` over opaque operands stays as it is.
+//!
+//! A `concat` of two values that are neighbouring slices of one bitwise value once the upper
+//! one is pushed into it (`concat(hi(a) | hi(b), lo(a | b))`) is the slice that covers both.
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish};
 use crate::BitVec;
@@ -326,6 +329,18 @@ pub(super) fn narrowed(
     lo: u16,
     n: u16,
 ) -> Result<Option<(u32, Fin)>, Stop> {
+    Ok(narrowed_from(r, cx, x, lo, n)?.map(|(e, fin, _)| (e, fin)))
+}
+
+/// [`narrowed`], with the nodes where the pushes stopped (the region's atoms, for the commit
+/// rule's count).
+pub(super) fn narrowed_from(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    lo: u16,
+    n: u16,
+) -> Result<Option<(u32, Fin, Vec<u32>)>, Stop> {
     let mut st = Narrow {
         memo: IdMap::default(),
         stops: Vec::new(),
@@ -333,7 +348,7 @@ pub(super) fn narrowed(
         fin: Fin::FINAL,
     };
     let e = narrow(r, cx, &mut st, x, lo, n)?;
-    Ok((st.pushes <= MAX_PUSHES).then_some((e, st.fin)))
+    Ok((st.pushes <= MAX_PUSHES).then_some((e, st.fin, st.stops)))
 }
 
 /// The width `k` and operand `x` when `n` sign-extends the low `k` bits of `x` spelled with
@@ -381,6 +396,48 @@ fn sext_idiom(cx: &Context, n: u32) -> Option<(u16, u32)> {
 }
 
 /// The casts pass at `n`.
+/// `concat(h, l)` where one half is a slice of a bitwise `x` and the other is the neighbouring
+/// slice of `x` pushed into it (`concat(hi(a) | hi(b), lo(a | b))`): the one slice of `x` that
+/// covers both.
+fn rejoined(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let (h, l) = (node.a, node.b);
+    let (hw, lw) = (cx.wid(h), cx.wid(l));
+    // The slice kept whole, and where the other half lies in its operand.
+    let sliced = |cx: &Context, i: u32| {
+        let s = cx.node(i);
+        (s.op == OpCode::Extract).then_some((s.a, s.b as u16))
+    };
+    let bitwise = |cx: &Context, x: u32, other: u32| {
+        let op = cx.node(x).op;
+        matches!(
+            op,
+            OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not | OpCode::Select
+        ) && cx.node(other).op == op
+    };
+    let (x, lo, at, len, other) = match (sliced(cx, l), sliced(cx, h)) {
+        (Some((x, lo)), _)
+            if bitwise(cx, x, h)
+                && u32::from(lo) + u32::from(lw) + u32::from(hw) <= u32::from(cx.wid(x)) =>
+        {
+            (x, lo, lo + lw, hw, h)
+        }
+        (_, Some((x, lo))) if bitwise(cx, x, l) && lo >= lw => (x, lo - lw, lo - lw, lw, l),
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    let before = cx.len() as u32;
+    let Some((e, fin, _)) = narrowed_from(r, cx, x, at, len)? else {
+        super::discard(r, cx, before);
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    if e != other {
+        super::discard(r, cx, before);
+        return Ok(Step::Normal(fin));
+    }
+    let e = r.build(cx, |cx| cx.c_extract(x, lo, hw + lw))?;
+    finish(r, cx, PassKind::Casts, n, e, before, &[x], fin)
+}
+
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
     if let Some((k, x)) = sext_idiom(cx, n) {
@@ -397,6 +454,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             sign_extended: true,
         });
         return finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL);
+    }
+    if node.op == OpCode::Concat {
+        return rejoined(r, cx, n);
     }
     if node.op != OpCode::Extract {
         return Ok(Step::Normal(Fin::FINAL));

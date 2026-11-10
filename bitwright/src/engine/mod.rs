@@ -120,6 +120,17 @@ pub enum Phase {
     /// among the built-in strategies.
     #[cfg(feature = "prove")]
     Carries,
+    /// Limb arithmetic read as arithmetic on the words: digits of wide values computed apart,
+    /// with the carries and borrows between them written as comparisons of the digits below
+    /// (`(a >>u k) + (b >>u k) + zext(trunc<k>(a + b) <u trunc<k>(a))`), products by constants
+    /// and XORs done digit by digit, and constants added limb by limb become slices of the
+    /// word-level operation (`(a + b) >>u k`). Every node is read as an integer form over
+    /// floors `floor(x / 2^k)` kept in one shape, in which the digits' terms cancel; each step
+    /// is an identity of the integers, and nothing is proved or matched. The forms are written
+    /// back from the root down, each node for all its users at once and at the bits of it
+    /// that are read, wherever the root's DAG gets smaller (see the pass's module). Only
+    /// [`Strategy::deobfuscate`] runs it among the built-in strategies.
+    Words,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -145,6 +156,7 @@ impl Phase {
             Phase::Division => "division",
             #[cfg(feature = "prove")]
             Phase::Carries => "carries",
+            Phase::Words => "words",
             #[cfg(feature = "mba")]
             Phase::Mba(_) => "mba",
         }
@@ -245,9 +257,9 @@ impl Strategy {
     }
 
     /// The standard strategy plus the deobfuscation passes (divisions by constants, carry
-    /// networks with feature `prove`, linear MBA and bit shuffles): `[FactFold, Local(core),
-    /// Linear, Xor, Casts, Division, Invert, Compares, Bitwise, Carries, LinearMba, Shuffle,
-    /// Demanded, Local(core)]`, up to 4 rounds.
+    /// networks with feature `prove`, linear MBA, bit shuffles and limb arithmetic):
+    /// `[FactFold, Local(core), Linear, Xor, Casts, Division, Invert, Compares, Bitwise,
+    /// Carries, LinearMba, Shuffle, Demanded, Words, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -274,6 +286,7 @@ impl Strategy {
                 Phase::LinearMba,
                 Phase::Shuffle,
                 Phase::Demanded,
+                Phase::Words,
                 core(),
             ],
         )
@@ -896,6 +909,10 @@ impl EngineBuilder {
                     id = combine(id, 14);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Carries));
                 }
+                Phase::Words => {
+                    id = combine(id, 15);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Words));
+                }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {
                     use core::hash::{Hash, Hasher};
@@ -1300,6 +1317,8 @@ struct Runner<'r, 'a> {
     /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
     /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
     demanded_same: pass::demanded::Same,
+    /// The words pass's forms and marks.
+    words: pass::words::State,
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
@@ -1612,6 +1631,7 @@ impl Runner<'_, '_> {
             self.asks.clear();
             self.first.clear();
             self.demanded_same.clear();
+            self.words.begin();
         } else {
             // A rule's "no" from sharing (`one_use`) may be a "yes" once a phase since has
             // dropped the other use: those results are decided again. What a cap declined
@@ -1704,6 +1724,14 @@ impl Runner<'_, '_> {
                     {
                         self.explain = None;
                         first = pass::demanded::first(self, cx, n)?;
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Words)
+                    ) && pass::words::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::words::first(self, cx, n)?;
                     }
                     if let Some((r, fin)) = first {
                         stack.pop();
@@ -2401,6 +2429,7 @@ impl Engine {
             carries: Default::default(),
             demanded: Default::default(),
             demanded_same: Default::default(),
+            words: Default::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]

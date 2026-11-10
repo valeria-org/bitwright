@@ -25,7 +25,25 @@
 //! boundary of any width, its two halves added apart and the carry between them written out
 //! (`concat(extract<17, 47>(x) + extract<17, 47>(y) + zext<47>(c), trunc<17>(s))`, with `s` the
 //! 18-bit sum of the low halves and `c` its top bit), is fitted, proved and becomes `x + y`.
-//! Such a region is read only when it takes a slice and adds.
+//! Such a region is read only when it takes a slice and adds. The halves joined with a shift
+//! instead (`(hi << k) | lo`, `+`, `^` or `-` for the `concat`, a constant `>>u` for a slice)
+//! are read the same way where the plain reading fits nothing, and only when the region also
+//! compares (the carry written `lo(s) <u lo(x)`). Atoms are of any width up to 64 bits, each
+//! a symbol of its own width in the proof and resized to the node's in the form.
+//!
+//! A sum that fits no such form but holds carries written as comparisons of low digits is
+//! handed to [`super::borrows`], which reads each carry as the high digits it completes; so is
+//! the sum under a read of its low bits (`trunc<j>(s)`, `s & (2^j − 1)`, and `s << k`, which
+//! reads the low `W − k`: a high limb on its way into a word), at those bits, which may be
+//! few enough for a carry the whole sum is too wide for. Where that reads nothing, the value
+//! (the low read, or what of the sum is not known to be 0) is looked for as a slice of a word
+//! below it and proved ([`super::slices`]): the limb of a word some handler also computes
+//! whole.
+//!
+//! A limb read as the slice of a node there already may leave the DAG one node larger (the
+//! slice and its extension for one node freed): the limb code it frees is shared with the
+//! other limbs, each of which frees it only once all are read, and what reads the slice
+//! (a narrowing, a join of two slices) takes it away again.
 //!
 //! A right shift by a constant or a mask whose region is one value through `& | ^ ~ + − neg *`
 //! and constant shifts (at least [`MIN_COUNT_REGION`] nodes, multiplying, or shifting right and
@@ -34,7 +52,9 @@
 //! proves it: the SWAR population count is `popcnt(x)`, and counted after a smear or a mask of
 //! the trailing zeros, `clz(x)` or `ctz(x)`.
 
-use super::{Counts, Fin, PassKind, Runner, Step, Stop, finish, linear, worth_building};
+use super::{
+    Counts, Fin, PassKind, Runner, Step, Stop, finish, finish_within, linear, worth_building,
+};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, OpCode};
@@ -103,6 +123,11 @@ pub(crate) struct Scratch {
     /// Nodes whose proof was not decided within the pass's caps: a region holding one is larger
     /// still, and is not read.
     undecided: IdMap<u32, ()>,
+    /// Values no slice of a word below them was proved equal to (see [`super::slices`]): not
+    /// asked again in the call.
+    pub(super) unfit: IdMap<u32, ()>,
+    /// The slice proofs of the call that were proved, and those left undecided at their caps.
+    pub(super) fits: (u32, u32),
 }
 
 fn interior(cx: &Context, i: u32) -> bool {
@@ -157,6 +182,7 @@ fn sliced(cx: &Context, i: u32) -> bool {
         | OpCode::Zext
         | OpCode::Sext => small(i) && small(n.a),
         OpCode::Ult => small(n.a),
+        OpCode::LShr => small(i) && cx.is_const(n.b),
         _ => interior(cx, i),
     }
 }
@@ -170,12 +196,14 @@ fn sliced(cx: &Context, i: u32) -> bool {
 /// (`k = W − 1`, where the form is no smaller than a minimal `g << k`).
 ///
 /// In [`Mode::Slices`], the region is read through [`sliced`] nodes instead, down to atoms of
-/// `n`'s width only, and fits when it both takes a slice (an `extract`) and adds (`+ −` or
-/// `<u`, a carry written out); never a chain. In [`Mode::Counts`], through [`counted`] nodes
+/// at most 64 bits, and fits when it both takes a slice (an `extract`, a constant `>>u`) and
+/// adds (`+ −` or `<u`, a carry written out), and where its halves are joined without a
+/// `concat` also compares; never a chain. In [`Mode::Counts`], through [`counted`] nodes
 /// down to one atom of `n`'s width, and fits when it multiplies, or shifts right and adds (how
 /// bits are counted in parallel), over at least [`MIN_COUNT_REGION`] nodes.
 fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) {
     let slices = mode == Mode::Slices;
+    let joined = slices && cx.node(n).op != OpCode::Concat;
     s.seen.begin(cx.len());
     s.order.clear();
     s.atoms.clear();
@@ -184,7 +212,7 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
     s.stack.push((n, false));
     let mut reached = 0u32;
     let (mut carried, mut bitwise) = (false, false);
-    let (mut sliced_any, mut added) = (false, false);
+    let (mut sliced_any, mut added, mut compared) = (false, false, false);
     let (mut multiplied, mut lowered) = (false, false);
     let w = cx.wid(n);
     while let Some((i, expanded)) = s.stack.pop() {
@@ -213,7 +241,10 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
         }) {
             s.atoms.push(i);
             let most = if mode == Mode::Counts { 1 } else { MAX_ATOMS };
-            if s.atoms.len() > most || (mode != Mode::Bitwise && cx.wid(i) != w) {
+            if s.atoms.len() > most
+                || (slices && cx.wid(i) > 64)
+                || (mode == Mode::Counts && cx.wid(i) != w)
+            {
                 return (false, false, reached);
             }
             continue;
@@ -235,8 +266,9 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
                 }
             }
         } else if slices {
-            sliced_any |= node.op == OpCode::Extract;
+            sliced_any |= matches!(node.op, OpCode::Extract | OpCode::LShr);
             added |= matches!(node.op, OpCode::Add | OpCode::Sub | OpCode::Ult);
+            compared |= node.op == OpCode::Ult;
             for c in node.children() {
                 s.stack.push((c, false));
             }
@@ -254,7 +286,8 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
     s.consts.dedup();
     s.consts.truncate(MAX_CONSTS);
     if slices {
-        return (sliced_any && added && !s.atoms.is_empty(), false, reached);
+        let fits = sliced_any && added && (compared || !joined) && !s.atoms.is_empty();
+        return (fits, false, reached);
     }
     if mode == Mode::Counts {
         let fits = s.atoms.len() == 1
@@ -317,7 +350,7 @@ fn lane_value(t: usize, j: usize, k: usize, mask: u64, consts: &[u64]) -> u64 {
 
 /// Evaluates the region (left by [`walk`]) at `lanes`, the rows assigned and sized when they
 /// start at 0 (atoms in `s.atoms`' order): the root's values are the last row.
-fn evaluate(cx: &Context, s: &mut Scratch, mask: u64, lanes: core::ops::Range<usize>) {
+fn evaluate(cx: &Context, s: &mut Scratch, lanes: core::ops::Range<usize>) {
     let t = s.atoms.len();
     if lanes.start == 0 {
         s.rows.clear();
@@ -330,8 +363,10 @@ fn evaluate(cx: &Context, s: &mut Scratch, mask: u64, lanes: core::ops::Range<us
         }
     }
     for j in 0..t {
+        // An atom's values are of its own width: a region read through slices mixes them.
+        let own = u64::MAX >> (64 - u64::from(cx.wid(s.atoms[j])));
         for k in lanes.clone() {
-            s.rows[j * LANES + k] = lane_value(t, j, k, mask, &s.consts);
+            s.rows[j * LANES + k] = lane_value(t, j, k, own, &s.consts);
         }
     }
     for (row, &i) in s.order.iter().enumerate() {
@@ -445,6 +480,15 @@ enum Verdict {
     Unpaid,
 }
 
+/// `a` at `to` bits: truncated, or zero-extended.
+fn resized(cx: &mut Context, a: u32, to: u16) -> Result<u32, Error> {
+    match cx.wid(a) {
+        w if w > to => cx.c_extract(a, 0, to),
+        w if w < to => cx.c_zext(a, to),
+        _ => Ok(a),
+    }
+}
+
 /// The region (left by [`walk`] and [`evaluate`]) and the form `konst + Σ coeffs[j]·atom j`
 /// built in `scx`, atom `j` the fresh symbol `j`.
 /// What a region is proved equal to.
@@ -464,8 +508,8 @@ fn copy(
     target: Target<'_>,
 ) -> Result<(u32, u32), Error> {
     let mut map: Vec<u32> = Vec::with_capacity(s.atoms.len() + s.order.len());
-    for j in 0..s.atoms.len() {
-        let e = scx.symbol(SymbolKey::from(j as u64), w)?;
+    for (j, &a) in s.atoms.iter().enumerate() {
+        let e = scx.symbol(SymbolKey::from(j as u64), cx.width_of(a))?;
         map.push(scx.id(e)?);
     }
     let operand = |scx: &mut Context, map: &[u32], x: u32| -> Result<u32, Error> {
@@ -515,7 +559,8 @@ fn copy(
             for (j, &k) in coeffs.iter().enumerate() {
                 if k != 0 {
                     let k = scx.mk_const(&BitVec::wrapping_from_u64(w, k))?;
-                    let term = scx.c_bin(BinOp::Mul, map[j], k)?;
+                    let x = resized(scx, map[j], w.bits())?;
+                    let term = scx.c_bin(BinOp::Mul, x, k)?;
                     rhs = scx.c_bin(BinOp::Add, rhs, term)?;
                 }
             }
@@ -598,7 +643,7 @@ fn fit(r: &mut Runner<'_, '_>, cx: &Context, mask: u64) -> Result<Option<(u64, V
         Counter::PassWork,
         (rows * QUICK as u64).div_ceil(LANES_PER_UNIT),
     )?;
-    evaluate(cx, &mut r.carries, mask, 0..QUICK);
+    evaluate(cx, &mut r.carries, 0..QUICK);
     let s = &r.carries;
     let f = (t + s.order.len() - 1) * LANES;
     let konst = s.rows[f];
@@ -621,7 +666,7 @@ fn fit(r: &mut Runner<'_, '_>, cx: &Context, mask: u64) -> Result<Option<(u64, V
         Counter::PassWork,
         (rows * (LANES - QUICK) as u64).div_ceil(LANES_PER_UNIT),
     )?;
-    evaluate(cx, &mut r.carries, mask, QUICK..LANES);
+    evaluate(cx, &mut r.carries, QUICK..LANES);
     Ok(affine(&r.carries, QUICK..LANES).then_some((konst, coeffs)))
 }
 
@@ -651,7 +696,7 @@ fn fit_count(r: &mut Runner<'_, '_>, cx: &Context, bits: u16) -> Result<Option<U
         Counter::PassWork,
         (rows * QUICK as u64).div_ceil(LANES_PER_UNIT),
     )?;
-    evaluate(cx, &mut r.carries, mask, 0..QUICK);
+    evaluate(cx, &mut r.carries, 0..QUICK);
     let Some(op) = [UnOp::Popcnt, UnOp::Ctz, UnOp::Clz]
         .into_iter()
         .find(|&op| agree(&r.carries, op, 0..QUICK))
@@ -662,7 +707,7 @@ fn fit_count(r: &mut Runner<'_, '_>, cx: &Context, bits: u16) -> Result<Option<U
         Counter::PassWork,
         (rows * (LANES - QUICK) as u64).div_ceil(LANES_PER_UNIT),
     )?;
-    evaluate(cx, &mut r.carries, mask, QUICK..LANES);
+    evaluate(cx, &mut r.carries, QUICK..LANES);
     Ok(agree(&r.carries, op, QUICK..LANES).then_some(op))
 }
 
@@ -701,58 +746,173 @@ fn ends_count(cx: &Context, n: u32) -> bool {
     matches!(node.op, OpCode::LShr | OpCode::And) && cx.is_const(node.b)
 }
 
+/// The sum `s`, `j` and `k` when `n` reads the low `j` bits of `s` and no others, and holds
+/// them `k` bits up: a truncation of it or a mask of its low bits (`k = 0`), or its shift
+/// left by a constant `k` (a high limb on its way into a word, `hi << k | lo`).
+fn low_read(cx: &Context, n: u32) -> Option<(u32, u16, u16)> {
+    let node = cx.node(n);
+    let (s, j, k) = match node.op {
+        OpCode::Extract if node.b == 0 => (node.a, node.width, 0),
+        OpCode::And if node.width <= 64 => {
+            let (s, c) = match (cx.const_val(node.a), cx.const_val(node.b)) {
+                (Some(c), None) => (node.b, c.limbs()[0]),
+                (None, Some(c)) => (node.a, c.limbs()[0]),
+                _ => return None,
+            };
+            let j = c.trailing_ones() as u16;
+            if j == 0 || j >= node.width || c >> j != 0 {
+                return None;
+            }
+            (s, j, 0)
+        }
+        OpCode::Shl if node.width <= 64 => {
+            let k = cx.const_val(node.b)?.limbs()[0];
+            if k == 0 || k >= u64::from(node.width) {
+                return None;
+            }
+            (node.a, node.width - k as u16, k as u16)
+        }
+        _ => return None,
+    };
+    (cx.wid(s) <= 64 && matches!(cx.node(s).op, OpCode::Add | OpCode::Sub)).then_some((s, j, k))
+}
+
+/// How far a sum with its carries read may leave the DAG larger than what it frees (see
+/// [`finish_within`]): by one node where it is a slice of a node that was there, or the zero
+/// extension of one (a limb as the slice of its word, which every other reader of the limb's
+/// arithmetic becomes too); otherwise not at all, and only for a smaller tree.
+fn slack(cx: &Context, n: u32, e: u32, before: u32) -> u32 {
+    let mut outer = cx.node(e);
+    // (Held up as the limb was: `slice << k`.)
+    if outer.op == OpCode::Shl && cx.const_val(outer.b).is_some() {
+        outer = cx.node(outer.a);
+    }
+    let slice = if outer.op == OpCode::Zext {
+        cx.node(outer.a)
+    } else {
+        outer
+    };
+    if slice.op == OpCode::Extract && slice.a < before {
+        return 2;
+    }
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    u32::from(tree(n) != u32::MAX && tree(e) < tree(n))
+}
+
 /// The carries pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let bits = cx.wid(n);
-    let slices = cx.node(n).op == OpCode::Concat;
+    let op = cx.node(n).op;
+    // A sum read on its low bits only (`trunc<j>(s)`, `s & (2^j − 1)`): its carries are
+    // completed there, where `j` bits may be few enough for a carry the whole sum is too
+    // wide for; or it is the slice of a word below it.
+    if let Some((s, j, k)) = low_read(cx, n) {
+        let before = cx.len() as u32;
+        let mut own = Fin::FINAL;
+        if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, s, j)? {
+            let e = r.build(cx, |cx| super::slices::held(cx, e, bits, k))?;
+            let slack = slack(cx, n, e, before);
+            match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
+                Step::Normal(f) => own = f,
+                step => return Ok(step),
+            }
+        }
+        match super::slices::fitted(r, cx, n, s, j, k)? {
+            Ok(step) => return Ok(step),
+            Err(f) => own = own.and(f),
+        }
+        // Declined for a reason more budget or less sharing may lift: asked again.
+        if !own.done {
+            return Ok(Step::Normal(own));
+        }
+    }
+    let slices = op == OpCode::Concat;
+    // Where a sum's digits are joined without a `concat`: `hi << k | lo`, or a sum of them.
+    let joined = matches!(op, OpCode::Or | OpCode::Xor | OpCode::Add | OpCode::Sub);
     if bits > 64 {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    if !(slices || interior(cx, n)) {
+    if !(slices || joined || interior(cx, n)) {
         if ends_count(cx, n) {
             return step_count(r, cx, n);
         }
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let mode = if slices { Mode::Slices } else { Mode::Bitwise };
-    let (fits, chain, reached) = walk(cx, n, &mut r.carries, mode);
-    r.meter.charge(Counter::PassWork, u64::from(reached))?;
-    if !fits {
-        if ends_count(cx, n) {
-            return step_count(r, cx, n);
-        }
-        return Ok(Step::Normal(Fin::FINAL));
-    }
-    // The canonical order of the atoms, independent of node indices: the points do not depend
-    // on how the input was built.
-    r.carries.atoms.sort_by(|a, b| cx.order(*a, *b));
     let mask = u64::MAX >> (64 - bits);
     // The form, and whether it is exact by construction.
-    let (konst, coeffs, exact) = if chain {
-        // Shifts of one atom: `a << k` is `2^k·a`, and 0 once `k` reaches the width.
-        let k = r.carries.order.iter().fold(0u64, |k, &i| {
-            let c = cx.const_val(cx.node(i).b);
-            k.saturating_add(c.map_or(u64::from(bits), |v| v.limbs()[0]))
-        });
-        // One shift is its own form (`a << k`).
-        if r.carries.order.len() == 1 && (1..u64::from(bits)).contains(&k) {
-            return Ok(Step::Normal(Fin::FINAL));
+    let mut found = None;
+    if slices || interior(cx, n) {
+        let mode = if slices { Mode::Slices } else { Mode::Bitwise };
+        let (fits, chain, reached) = walk(cx, n, &mut r.carries, mode);
+        r.meter.charge(Counter::PassWork, u64::from(reached))?;
+        if fits {
+            // The canonical order of the atoms, independent of node indices: the points do
+            // not depend on how the input was built.
+            r.carries.atoms.sort_by(|a, b| cx.order(*a, *b));
+            if chain {
+                // Shifts of one atom: `a << k` is `2^k·a`, and 0 once `k` reaches the width.
+                let k = r.carries.order.iter().fold(0u64, |k, &i| {
+                    let c = cx.const_val(cx.node(i).b);
+                    k.saturating_add(c.map_or(u64::from(bits), |v| v.limbs()[0]))
+                });
+                // One shift is its own form (`a << k`).
+                if r.carries.order.len() == 1 && (1..u64::from(bits)).contains(&k) {
+                    return Ok(Step::Normal(Fin::FINAL));
+                }
+                let coeff = if k < u64::from(bits) { 1u64 << k } else { 0 };
+                found = Some((0, vec![coeff], true));
+            } else {
+                found = fit(r, cx, mask)?.map(|(konst, coeffs)| (konst, coeffs, false));
+            }
         }
-        let coeff = if k < u64::from(bits) { 1u64 << k } else { 0 };
-        (0, vec![coeff], true)
-    } else {
-        match fit(r, cx, mask)? {
-            Some((konst, coeffs)) => (konst, coeffs, false),
-            None => return Ok(Step::Normal(Fin::FINAL)),
+    }
+    if found.is_none() && joined {
+        let (fits, _, reached) = walk(cx, n, &mut r.carries, Mode::Slices);
+        r.meter.charge(Counter::PassWork, u64::from(reached))?;
+        if fits {
+            r.carries.atoms.sort_by(|a, b| cx.order(*a, *b));
+            found = fit(r, cx, mask)?.map(|(konst, coeffs)| (konst, coeffs, false));
         }
+    }
+    let Some((konst, coeffs, exact)) = found else {
+        // A sum of digits and the carries between them, written as comparisons.
+        if matches!(op, OpCode::Add | OpCode::Sub) {
+            let before = cx.len() as u32;
+            let mut own = Fin::FINAL;
+            if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, n, bits)? {
+                let slack = slack(cx, n, e, before);
+                match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
+                    Step::Normal(f) => own = f,
+                    step => return Ok(step),
+                }
+            }
+            // A limb held at a register's width: what of the sum is not known to be 0.
+            let (known, fk) = super::known_words(r, cx, n)?;
+            let j = known.map_or(bits, |[zero, _]| {
+                (64 - (!zero & mask).leading_zeros()) as u16
+            });
+            return Ok(match super::slices::fitted(r, cx, n, n, j, 0)? {
+                Ok(Step::To(e, f)) => Step::To(e, f.and(fk)),
+                Ok(Step::Normal(f)) => Step::Normal(f.and(fk)),
+                Err(f) => Step::Normal(own.and(f).and(fk)),
+            });
+        }
+        if ends_count(cx, n) {
+            return step_count(r, cx, n);
+        }
+        return Ok(Step::Normal(Fin::FINAL));
     };
     let w = cx.width_of(n);
     let atoms = r.carries.atoms.clone();
-    let terms: Vec<(u32, BitVec)> = atoms
-        .iter()
-        .zip(&coeffs)
-        .map(|(&a, &k)| (a, BitVec::wrapping_from_u64(w, k)))
-        .collect();
+    let before = cx.len() as u32;
+    // An atom of another width enters the form truncated or zero-extended.
+    let mut terms: Vec<(u32, BitVec)> = Vec::with_capacity(atoms.len());
+    for (&a, &k) in atoms.iter().zip(&coeffs) {
+        if k != 0 {
+            let x = r.build(cx, |cx| resized(cx, a, bits))?;
+            terms.push((x, BitVec::wrapping_from_u64(w, k)));
+        }
+    }
     let form = linear::Form::of(BitVec::wrapping_from_u64(w, konst), &terms);
     // Cheap before expensive: a form the commit rule would refuse is not proved.
     if let Some(fin) = worth_building(r, cx, n, &atoms, linear::estimate(&form))? {
@@ -769,7 +929,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             Verdict::Unpaid => return Ok(Step::Normal(Fin::capped(Exhausted::PassWork))),
         }
     }
-    let before = cx.len() as u32;
     let e = linear::emit(r, cx, &form)?;
     r.explain_with(|| crate::engine::Explanation::Carries {
         konst: BitVec::wrapping_from_u64(w, konst),
