@@ -270,6 +270,53 @@ rule eq_sub_zero<W>(a: W, b: W) { (a - b) == 0 => a == b }
 
 - `p - q == 0` → `p == q`
 
+#### `eq_neg_add_zero` — rule
+
+A zero difference spelled with a negation is equality (the linear pass writes `-a + b`
+as `b - a` only where that frees the negation, so not where it is shared, as the borrow
+tests of limb arithmetic share it: `~((-a + b == 0) | (b <u a))`).
+
+```text
+rule eq_neg_add_zero<W>(a: W, b: W) { -a + b == 0 => a == b }
+```
+
+- `-p + q == 0` → `p == q`
+
+#### `ne_neg_add_zero` — rule
+
+A nonzero difference spelled with a negation is inequality.
+
+```text
+rule ne_neg_add_zero<W>(a: W, b: W) { -a + b != 0 => a != b }
+```
+
+- `-p + q != 0` → `p != q`
+
+#### `eq_trunc_sub_zero` — rule
+
+A zero difference in the low bits is equality of the low bits (`sub_trunc_pair` writes
+`trunc(a) - trunc(b)` as `trunc(a - b)`, out of `eq_sub_zero`'s reach).
+
+```text
+rule eq_trunc_sub_zero<W, N>(a: W, b: W) where N < W {
+        trunc<N>(a - b) == 0 => trunc<N>(a) == trunc<N>(b)
+    }
+```
+
+- `trunc<4>(p - q) == 0` → `trunc<4>(p) == trunc<4>(q)`
+
+#### `ne_trunc_sub_zero` — rule
+
+A nonzero difference in the low bits is inequality of the low bits.
+
+```text
+rule ne_trunc_sub_zero<W, N>(a: W, b: W) where N < W {
+        trunc<N>(a - b) != 0 => trunc<N>(a) != trunc<N>(b)
+    }
+```
+
+- `trunc<4>(p - q) != 0` → `trunc<4>(p) != trunc<4>(q)`
+
 #### `eq_xor_zero` — rule
 
 A zero xor is equality.

@@ -2907,7 +2907,7 @@ fn step_with(
     // An answer that was not smaller for what the fragment shares with others is no answer
     // either: the readings below keep a shared value as it is.
     let unshrunk = count(r).not_smaller != unshrunk;
-    if let Step::Normal(fin) = &out
+    if let Step::Normal(fin) = out
         && (fin.done || unshrunk)
     {
         // a fragment that reads slices of one rotated value, asked again with them
@@ -2916,11 +2916,20 @@ fn step_with(
         // without the limit thirteen that took the node's own share left eleven of those
         // questions out of steps.
         let before = cx.len() as u32;
+        // What a question asked another way declines for what the fragment shares
+        // contributes to the result (see the linear pass's `step`). Not where it ran out of
+        // the steps or the certificate share it is given: those are its own by design (see
+        // [`Cap::Steps`]), and its answer within them is what it is.
+        let kept = |fin: Fin, f: Fin| match f.why {
+            None => fin.and(f),
+            Some(_) => fin,
+        };
+        let mut fin = fin;
         let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
         if let Some(root) = slices {
-            let again = ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))?;
-            if matches!(again, Step::To(..)) {
-                return Ok(again);
+            match ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))? {
+                Step::Normal(f) => fin = kept(fin, f),
+                again => return Ok(again),
             }
         }
         // A fragment too large to lower whole (more variables than a question takes), with
@@ -2929,7 +2938,7 @@ fn step_with(
         // MBA over those values. (Asked of every fragment, the answers over atoms took the
         // place of the whole fragment's and three of 47 measured constants were not found.)
         if !asks(r, cx, cfg, n)? {
-            let again = ask(
+            match ask(
                 r,
                 cx,
                 cfg,
@@ -2937,9 +2946,9 @@ fn step_with(
                 n,
                 Some(Reading::Shallow),
                 Cap::Steps(CUT_STEPS),
-            )?;
-            if matches!(again, Step::To(..)) {
-                return Ok(again);
+            )? {
+                Step::Normal(f) => fin = kept(fin, f),
+                again => return Ok(again),
             }
         }
         // And with a value most of its terms read cut off as one atom: an obfuscator writes
@@ -2948,7 +2957,7 @@ fn step_with(
         for root in slices.into_iter().chain([n]) {
             let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
             for c in cuts {
-                let again = ask(
+                match ask(
                     r,
                     cx,
                     cfg,
@@ -2956,9 +2965,9 @@ fn step_with(
                     root,
                     Some(Reading::Cut(c)),
                     Cap::Steps(CUT_STEPS),
-                )?;
-                if matches!(again, Step::To(..)) {
-                    return Ok(again);
+                )? {
+                    Step::Normal(f) => fin = kept(fin, f),
+                    again => return Ok(again),
                 }
             }
         }
@@ -2969,7 +2978,7 @@ fn step_with(
         // fragment kept from its question, 140 measured calls took 15% longer.
         if unshrunk || side {
             for c in shared_nodes_whole(cx, n, &cfg.limits, CUTS) {
-                let again = ask(
+                match ask(
                     r,
                     cx,
                     cfg,
@@ -2977,13 +2986,14 @@ fn step_with(
                     n,
                     Some(Reading::CutWhole(c)),
                     Cap::Steps(CUT_STEPS),
-                )?;
-                if matches!(again, Step::To(..)) {
-                    return Ok(again);
+                )? {
+                    Step::Normal(f) => fin = kept(fin, f),
+                    again => return Ok(again),
                 }
             }
         }
         discard(r, cx, before);
+        return Ok(Step::Normal(fin));
     }
     Ok(out)
 }

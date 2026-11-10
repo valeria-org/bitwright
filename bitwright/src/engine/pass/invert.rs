@@ -141,6 +141,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             (None, None) => cancel_order(cx, &mut o, op, node.a, node.b)?,
         }
     };
+    let e = match e {
+        Some(e) => Some(e),
+        None => fitted(cx, &mut o, op, n, node.a, node.b)?,
+    };
     let fin = o.fin;
     let e = match e {
         Some(e) if e != n => e,
@@ -379,6 +383,71 @@ fn narrowed(cx: &mut Context, o: &mut Calls<'_, '_, '_>, s: u32) -> Result<Optio
     };
     o.fin = o.fin.and(fin);
     Ok((e != s).then_some(e))
+}
+
+/// The fewest low bits `i` fits in: its width less its high bits known zero.
+fn fits(cx: &mut Context, o: &mut Calls<'_, '_, '_>, i: u32) -> Result<u16, Stop> {
+    let w = cx.wid(i);
+    Ok(match o.facts(cx, i)? {
+        Some(f) => w - f.known().leading_known_zeros() as u16,
+        None => w,
+    })
+}
+
+/// `a op b` (the comparison `n`) at the low `k` bits both sides fit in, when that is fewer than
+/// their width: each side's truncation pushed into it (see `casts`), so
+/// `(x & 0x1fffff) <u (y & 0x1fffff)` is `trunc<21>(x) <u trunc<21>(y)` and
+/// `trunc<16>(x & 0x3fff) == trunc<16>(y & 0x3fff)` is `trunc<14>(x) == trunc<14>(y)`. A value
+/// below `2^k` is `zext(trunc<k>(v))`, which is injective and increasing, so equality and the
+/// unsigned orders carry over; with `k` less than the width both sides are nonnegative, so a
+/// signed order is the unsigned one. The narrow sides are new nodes that may stand beside the
+/// wide ones they read, so this is committed by the passes' rule, only when the DAG gets no
+/// larger (a tie only for a smaller tree: comparisons of one shared wide operand narrow one at
+/// a time, as `y` in `(y & m) <u (x & m)` and `(y & m) <u (z & m)`): a narrowed `<u` beside
+/// the `==` of the same wide operands would split the pair the compares pass joins
+/// (`(a == b) | (a <u b)`), so it waits for that join.
+fn fitted(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    n: u32,
+    a: u32,
+    b: u32,
+) -> Result<Option<u32>, Stop> {
+    let w = cx.wid(a);
+    if w <= 1 {
+        return Ok(None);
+    }
+    let k = fits(cx, o, a)?.max(fits(cx, o, b)?).max(1);
+    if k >= w {
+        return Ok(None);
+    }
+    let Some((x, fx, mut atoms)) = super::casts::narrowed_from(o.r, cx, a, 0, k)? else {
+        return Ok(None);
+    };
+    let Some((y, fy, more)) = super::casts::narrowed_from(o.r, cx, b, 0, k)? else {
+        return Ok(None);
+    };
+    o.fin = o.fin.and(fx).and(fy);
+    atoms.extend(more);
+    atoms.sort_unstable();
+    atoms.dedup();
+    let op = match op {
+        CmpOp::Slt => CmpOp::Ult,
+        CmpOp::Sle => CmpOp::Ule,
+        op => op,
+    };
+    let e = o.r.build(cx, |cx| cx.c_cmp(op, x, y))?;
+    if e == n {
+        return Ok(None);
+    }
+    match super::ties_smaller(o.r, cx, n, e, &atoms)? {
+        Ok(()) => Ok(Some(e)),
+        Err(more) => {
+            o.fin = o.fin.and(more);
+            Ok(None)
+        }
+    }
 }
 
 /// Whether `e` is a smaller tree than `n`: a comparison of narrowed sides is a comparison of

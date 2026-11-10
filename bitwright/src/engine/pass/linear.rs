@@ -853,6 +853,8 @@ fn without_factor(
 /// `a·x + a·y + …` written as `a·(x + y + …)`, including where products group more factors.
 /// The commit rule keeps the rewrite only when it shrinks the live DAG. Factoring the whole
 /// bounded sum avoids rejecting an intermediate pair when its product is shared elsewhere.
+/// `None` when `n` is no such sum; a `Normal` step is what the candidates it declined
+/// contribute.
 fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
     let Some(sum) = sum(cx, n) else {
         return Ok(None);
@@ -871,11 +873,13 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         *slot = p;
     }
     let products = &products[..sum.len];
-    if let Some(step @ Step::To(..)) = complementary_products(r, cx, n, products)? {
-        return Ok(Some(step));
-    }
+    let declined = match complementary_products(r, cx, n, products)? {
+        Some(Step::Normal(f)) => f,
+        Some(step) => return Ok(Some(step)),
+        None => Fin::FINAL,
+    };
     let Some((factor, positions)) = common_factor(cx, products) else {
-        return Ok(None);
+        return Ok(Some(Step::Normal(declined)));
     };
     let before = cx.len() as u32;
     let mut rest = None;
@@ -887,7 +891,7 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         });
     }
     let Some(rest) = rest else {
-        return Ok(None);
+        return Ok(Some(Step::Normal(declined)));
     };
     let factored = r.build(cx, |cx| cx.c_bin(BinOp::Mul, factor, rest))?;
     let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS];
@@ -900,62 +904,79 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
             }
         }
     }
-    Ok(Some(finish(
-        r,
-        cx,
-        PassKind::Linear,
-        n,
-        factored,
-        before,
-        &atoms[..count],
-        Fin::FINAL,
-    )?))
+    Ok(Some(
+        match finish(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            factored,
+            before,
+            &atoms[..count],
+            Fin::FINAL,
+        )? {
+            Step::Normal(f) => Step::Normal(f.and(declined)),
+            step => step,
+        },
+    ))
 }
 
-/// The linear pass at `n`.
+/// The linear pass at `n`. It tries several candidates in turn, and what each one it declines
+/// contributes stays in the result: a candidate rejected only because a part of the node has
+/// another user is not rejected for good (the user may go), whichever candidate it was. Kept
+/// of the last candidate alone, the node was remembered as final in a form the next call, in a
+/// context without that memory, rewrote.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
-    if let Some(step @ Step::To(..)) = factor_sum(r, cx, n)? {
-        return Ok(step);
-    }
+    let mut declined = match factor_sum(r, cx, n)? {
+        Some(Step::Normal(f)) => f,
+        Some(step) => return Ok(step),
+        None => Fin::FINAL,
+    };
     // A case split on a condition mask the node reads, first (see `cases`).
     let before = cx.len() as u32;
-    if let Some((e, f)) = super::cases::split(r, cx, n)?
-        && let Step::To(x, fin) = finish(r, cx, PassKind::Linear, n, e, before, &[], f)?
-    {
-        return Ok(Step::To(x, fin));
+    if let Some((e, f)) = super::cases::split(r, cx, n)? {
+        match finish(r, cx, PassKind::Linear, n, e, before, &[], f)? {
+            Step::Normal(f) => declined = declined.and(f),
+            step => return Ok(step),
+        }
     }
     if !linear_op(op) || op == OpCode::Const {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(declined));
     }
     // A product of values, its factors in order (see `sort_chain`).
-    let sorted = match op {
-        OpCode::Mul => match super::sort_chain(r, cx, PassKind::Linear, n)? {
-            Step::Normal(f) => f,
+    if op == OpCode::Mul {
+        match super::sort_chain(r, cx, PassKind::Linear, n)? {
+            Step::Normal(f) => declined = declined.and(f),
             step => return Ok(step),
-        },
-        _ => Fin::FINAL,
-    };
+        }
+    }
     let form = form_of(r, cx, n)?;
-    if form.is_atom_of(n) {
+    let last = if form.is_atom_of(n) {
         // A sum over the cap in which terms met is written out again, from its whole form.
-        return match r.linear_whole.met(n) {
-            Some(whole) => plain(r, cx, n, whole),
-            None => Ok(Step::Normal(form.fin.and(sorted))),
-        };
-    }
-    // Bits of one value counted, first (see `bit_count`).
-    if let Some(step @ Step::To(..)) = bit_count(r, cx, n, &form)? {
-        return Ok(step);
-    }
-    // Terms reading one condition, merged first (see `conditions`).
-    let merged = match super::conditions::step(r, cx, n, &form)? {
-        Ok(s) => return Ok(s),
-        Err(f) => f,
+        match r.linear_whole.met(n) {
+            Some(whole) => plain(r, cx, n, whole)?,
+            None => Step::Normal(form.fin),
+        }
+    } else {
+        // Bits of one value counted, first (see `bit_count`).
+        match bit_count(r, cx, n, &form)? {
+            Some(Step::Normal(f)) => declined = declined.and(f),
+            Some(step) => return Ok(step),
+            None => {}
+        }
+        // Terms reading one condition, merged first (see `conditions`).
+        match super::conditions::step(r, cx, n, &form)? {
+            Ok(step) => step,
+            Err(f) => {
+                declined = declined.and(f);
+                plain(r, cx, n, form)?
+            }
+        }
     };
-    Ok(match plain(r, cx, n, form)? {
-        Step::Normal(f) => Step::Normal(f.and(merged)),
-        s => s,
+    Ok(match last {
+        Step::Normal(f) => Step::Normal(f.and(declined)),
+        step => step,
     })
 }
 

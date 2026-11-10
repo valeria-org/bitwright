@@ -428,6 +428,7 @@ fn custom_strategy(names: &[String]) -> Result<Strategy, String> {
             "invert" => Phase::Invert,
             "division" => Phase::Division,
             "carries" => Phase::Carries,
+            "words" => Phase::Words,
             "mba" => Phase::Mba(
                 MbaConfig::default()
                     .with_trust(MbaTrust::default().with_backend_certificates(false)),

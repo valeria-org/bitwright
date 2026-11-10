@@ -1312,19 +1312,22 @@ fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
     finish(r, cx, PassKind::Bitwise, n, e, before, &narrow, Fin::FINAL)
 }
 
-/// The bitwise pass at `n`.
+/// The bitwise pass at `n`. What a candidate it declines contributes stays in the result (see
+/// the linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if !bitwise_op(cx.node(n).op) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    if let done @ Step::To(..) = hoist_cast(r, cx, n)? {
-        return Ok(done);
-    }
-    if let done @ Step::To(..) = rotation(r, cx, n)? {
-        return Ok(done);
-    }
+    let hoisted = match hoist_cast(r, cx, n)? {
+        Step::Normal(f) => f,
+        done => return Ok(done),
+    };
+    let hoisted = match rotation(r, cx, n)? {
+        Step::Normal(f) => hoisted.and(f),
+        done => return Ok(done),
+    };
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(hoisted));
     };
     // More than three atoms (constants included): `n` is an atom itself, read first by classes
     // of bit positions, where the constants are not atoms.
@@ -1340,7 +1343,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         write(r, cx, n, &atoms, tt, Fin::FINAL)?
     };
     let mut fin = match first {
-        Step::Normal(f) => f,
+        Step::Normal(f) => f.and(hoisted),
         done => return Ok(done),
     };
     // An atom that is a bitwise region of its own may hide that `n` reads three atoms or fewer

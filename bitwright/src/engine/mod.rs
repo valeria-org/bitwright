@@ -120,6 +120,17 @@ pub enum Phase {
     /// among the built-in strategies.
     #[cfg(feature = "prove")]
     Carries,
+    /// Limb arithmetic read as arithmetic on the words: digits of wide values computed apart,
+    /// with the carries and borrows between them written as comparisons of the digits below
+    /// (`(a >>u k) + (b >>u k) + zext(trunc<k>(a + b) <u trunc<k>(a))`), products by constants
+    /// and XORs done digit by digit, and constants added limb by limb become slices of the
+    /// word-level operation (`(a + b) >>u k`). Every node is read as an integer form over
+    /// floors `floor(x / 2^k)` kept in one shape, in which the digits' terms cancel; each step
+    /// is an identity of the integers, and nothing is proved or matched. The forms are written
+    /// back from the root down, each node for all its users at once and at the bits of it
+    /// that are read, wherever the root's DAG gets smaller (see the pass's module). Only
+    /// [`Strategy::deobfuscate`] runs it among the built-in strategies.
+    Words,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -145,6 +156,7 @@ impl Phase {
             Phase::Division => "division",
             #[cfg(feature = "prove")]
             Phase::Carries => "carries",
+            Phase::Words => "words",
             #[cfg(feature = "mba")]
             Phase::Mba(_) => "mba",
         }
@@ -248,9 +260,9 @@ impl Strategy {
     }
 
     /// The standard strategy plus the deobfuscation passes (divisions by constants, carry
-    /// networks with feature `prove`, linear MBA and bit shuffles): `[FactFold, Local(core),
-    /// Linear, Xor, Casts, Division, Invert, Compares, Bitwise, Carries, LinearMba, Shuffle,
-    /// Demanded, Local(core)]`, up to 4 rounds.
+    /// networks with feature `prove`, linear MBA, bit shuffles and limb arithmetic):
+    /// `[FactFold, Local(core), Linear, Xor, Casts, Division, Invert, Compares, Bitwise,
+    /// Carries, LinearMba, Shuffle, Demanded, Words, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -277,6 +289,7 @@ impl Strategy {
                 Phase::LinearMba,
                 Phase::Shuffle,
                 Phase::Demanded,
+                Phase::Words,
                 core(),
             ],
         )
@@ -899,6 +912,10 @@ impl EngineBuilder {
                     id = combine(id, 14);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Carries));
                 }
+                Phase::Words => {
+                    id = combine(id, 15);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Words));
+                }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {
                     use core::hash::{Hash, Hasher};
@@ -1309,6 +1326,8 @@ struct Runner<'r, 'a> {
     reduced: [pass::demanded::Memo; 2],
     /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
     sum_constants: IdMap<(u32, u8), Vec<u32>>,
+    /// The words pass's forms and marks.
+    words: pass::words::State,
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
@@ -1665,6 +1684,7 @@ impl Runner<'_, '_> {
             self.asks.clear();
             self.first.clear();
             self.demanded_same.clear();
+            self.words.begin();
         } else {
             // A rule's "no" from sharing (`one_use`) may be a "yes" once a phase since has
             // dropped the other use: those results are decided again. What a cap declined
@@ -1736,32 +1756,52 @@ impl Runner<'_, '_> {
                         continue;
                     }
                     let mba = !local && self.is_mba(phase);
-                    // In the MBA phase the question at the top of a fragment is asked first,
-                    // over the fragment as it is (see `pass::mba_first`); a rewrite is taken
-                    // as a pass's is below, with nothing to wait on.
+                    // A question asked before the operands are walked, over the node as it is.
+                    // In the MBA phase, the one at the top of a fragment (see
+                    // `pass::mba_first`); in the demanded-bits phase, the one of a tall node
+                    // that observes an operand (see `pass::demanded::first`). A rewrite is
+                    // taken as a pass's is below, with nothing to wait on.
+                    let mut first: Option<(u32, Fin)> = None;
                     #[cfg(feature = "mba")]
                     if mba && !self.first.contains_key(&n) {
                         self.explain = None;
                         let inner = self.inner;
-                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
-                            && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
-                        {
-                            stack.pop();
-                            if pending.contains_key(&r) {
-                                self.stats.cycles_cut += 1;
-                                self.retire(cx, n);
-                                self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
-                            } else {
-                                self.rewritten.insert((n, r), ());
-                                *pending.entry(n).or_default() += 1;
-                                self.live.replace(n, r);
-                                self.retire(cx, n);
-                                self.inherit_parent(n, r);
-                                stack.push(Frame::Finish(n, r, fin));
-                                stack.push(Frame::Visit(r));
-                            }
-                            continue;
+                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase] {
+                            first = pass::mba_first(self, cx, cfg, n)?;
                         }
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Demanded)
+                    ) && pass::demanded::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::demanded::first(self, cx, n)?;
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Words)
+                    ) && pass::words::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::words::first(self, cx, n)?;
+                    }
+                    if let Some((r, fin)) = first {
+                        stack.pop();
+                        if pending.contains_key(&r) {
+                            self.stats.cycles_cut += 1;
+                            self.retire(cx, n);
+                            self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
+                        } else {
+                            self.rewritten.insert((n, r), ());
+                            *pending.entry(n).or_default() += 1;
+                            self.live.replace(n, r);
+                            self.retire(cx, n);
+                            self.inherit_parent(n, r);
+                            stack.push(Frame::Finish(n, r, fin));
+                            stack.push(Frame::Visit(r));
+                        }
+                        continue;
                     }
                     let mut waiting = false;
                     for c in node.children() {
@@ -2442,6 +2482,7 @@ impl Engine {
             carries: Default::default(),
             demanded: Default::default(),
             demanded_same: Default::default(),
+            words: Default::default(),
             #[cfg(feature = "mba")]
             reduced: Default::default(),
             sum_constants: IdMap::default(),
@@ -2873,6 +2914,7 @@ impl Runner<'_, '_> {
             self.mba_deeper = false;
             self.mba_shallow.clear();
         }
+        self.words.turn = false;
         // The rounds that changed the root, and every round (the number an observer sees).
         let (mut changed, mut round) = (0u8, 0u8);
         // Whether this round is over the root the one before it left as it was, with deeper
@@ -2942,19 +2984,36 @@ impl Runner<'_, '_> {
             // (without the sweeps, and with that round's word on the root in place of this
             // one's), and in one round past the strategy's last, at the full depth, where the
             // rounds were still changing it.
-            if !extra && (same || last) && self.deepen(!same) {
-                if same {
-                    fin = before;
-                } else {
-                    extra = true;
-                }
-                again = same;
-                continue;
-            }
+            //
+            // The words pass asks the same way, after them: in a round over a root the other
+            // phases left as it was (see `pass::words::State::turn`), and in that one round
+            // past the last.
+            let words = !self.words.turn
+                && inner
+                    .phases
+                    .iter()
+                    .any(|p| matches!(p, PhaseImpl::Pass(pass::PassKind::Words)));
+            self.words.turn = false;
             if same {
+                if self.deepen(false) {
+                    (fin, again) = (before, true);
+                    continue;
+                }
+                if words {
+                    self.words.turn = true;
+                    (fin, again) = (before, true);
+                    continue;
+                }
                 return Ok((cur, fin));
             }
             if last {
+                // (Both are asked for: neither short-circuits the other.)
+                let deeper = !extra && self.deepen(true);
+                if !extra && (deeper || words) {
+                    self.words.turn = words;
+                    (extra, again) = (true, false);
+                    continue;
+                }
                 break;
             }
             again = false;
