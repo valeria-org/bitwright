@@ -102,6 +102,13 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
     }
 }
 
+/// Whether a narrower reading's atoms `bindings` include a node the whole fragment reads
+/// through (arithmetic under a bitwise operator, a value cut off): otherwise the reading is
+/// the whole fragment's.
+pub(crate) fn cuts(cx: &Context, bindings: &Bindings) -> bool {
+    bindings.atoms.iter().any(|&a| in_fragment(cx, a))
+}
+
 /// Whether the fragment rooted at `root` is one [`lower_id`] takes (rooted at a fragment
 /// operator, within `lim`): its interior nodes, operands first, when it is.
 pub(crate) fn fits_nodes(cx: &Context, root: u32, lim: &MbaLimits) -> Result<Vec<u32>, Refusal> {
@@ -159,10 +166,13 @@ fn scan_in(
     in_fragment: &dyn Fn(&Context, u32) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
     Dense::with(&SEEN, cx.len(), |seen| {
-        let mut atoms: Vec<u32> = Vec::new();
-        let mut order: Vec<u32> = Vec::new();
+        // (Sized for the fragments most questions have: grown a push at a time, the three
+        // were a quarter of what a scan cost.)
+        let mut atoms: Vec<u32> = Vec::with_capacity(16);
+        let mut order: Vec<u32> = Vec::with_capacity(64);
         let mut met = 0u32;
-        let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+        let mut stack: Vec<(u32, bool)> = Vec::with_capacity(64);
+        stack.push((root, false));
         while let Some((i, expanded)) = stack.pop() {
             if expanded {
                 order.push(i);
@@ -520,7 +530,10 @@ fn build_in(
 ) -> Result<(MbaExpr, Bindings), Refusal> {
     // An operand of a fragment's node is one of its atoms or an earlier node of it.
     let unmet = || Refusal::Unsupported("an operand outside the fragment".into());
-    let mut m = MbaExpr::new(atoms.iter().map(|&a| cx.width_of(a)).collect());
+    // (Room for a node per atom and per node of the fragment, two per operand written over an
+    // atom, and the few a slice or a shift adds.)
+    let room = atoms.len() + 2 * solved.len() + order.len() + 8;
+    let mut m = MbaExpr::with_capacity(atoms.iter().map(|&a| cx.width_of(a)).collect(), room);
     for (&a, k) in atoms.iter().zip(0u32..) {
         let v = m
             .push(MOp::Var(k), &[])

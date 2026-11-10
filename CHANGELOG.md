@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+- **A relation between two nodes is proved on the expression as written first.** The
+  opaque-constant sweep proves a node equal to an earlier one plus a constant on their
+  difference with each operand taken on the bits its user reads. That writes one value read
+  under several masks once per mask, a sum with a constant as a sum of its own for each, and
+  a relation that is a bitwise identity over the value was then one over several carry
+  chains: half the proofs of a measured call took a thousand solver steps or more, and the
+  ones the readings could not find took their whole share. The difference as written is now
+  read first, within an eighth of that share. A question asked with an eighth of the usual
+  fuel went from 312 nodes to 80 in half the time, and the 44 `forms_simplify` questions of
+  the same set take a third less time (13% less CPU over the 140; the 16 proofs of that set
+  take a tenth more, their relations being the ones the reduction proves).
+- **The MBA phase leaves the sweep a part of the solver's steps.** Where the opaque-constant
+  sweep runs, the phase's questions stop a sixteenth of the call's steps short. What a round
+  leaves is often a sum the sweep's certificates decide in a few hundred steps, and the
+  solver's last questions of the round had taken every step: the question above stops at 42
+  nodes with the part kept.
+- **With the solver's steps gone, the sweep's certificates are pass work.** A certificate of
+  the opaque-constant sweep is charged to the call's MBA solver steps, and with none left
+  the sweep asked nothing more, whatever the call still had of pass work (four fifths of it,
+  in the question above). Once fewer steps are left than a small certificate takes, the
+  sweep's certificates are charged as pass work, as the gate's are: 32,768 units each at
+  most and an eighth of the call's pass work in all. What decides a sum over one value under
+  masks is a comparison of two forms, a few hundred evaluations. The question above folds to
+  its constant at its own fuel, in three quarters of the time it took to stop at 312 nodes;
+  all 47 `engine` roots of the set are constants.
+- **A settled root is read on either side of its condition** (`MbaConfig::noise_forms`). An
+  obfuscator picks between two masked values by a flag (the parity of a byte, in the
+  measured set) and computes with the one picked. With the flag fixed one of the two is a
+  constant and everything computed from it folds, but the root as a whole is a function of
+  both, and no pass reads it one case at a time. The root the rounds settle on is now split
+  on the condition its selects test most, each side is swept and given one round, and the
+  two are written as one expression again with the choice as far down as they agree
+  (`select(c, a * k1 + b, a * k2 + b)` is `a * select(c, k1, k2) + b`). The smallest of the
+  settled root, the select of the sides and the joined form is the result, so none is larger
+  than before: 41 of the 44 `forms_simplify` roots of the set are smaller, 7,391 nodes to
+  6,407 in all, for 15% more time on those questions (the 140 take the same time within
+  what repeated runs differ by). A run whose budget ends on the sides reports that.
+- **A fragment not answered whole is asked over its atoms.** A sum like
+  `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a` and a `b` that are
+  products of one value is a question about that value when read whole: costly, declined,
+  and every sum holding it was then not asked at all. Such a fragment is now asked with the
+  arithmetic under its bitwise operators as atoms, within the steps of a retried question.
+- **Values of one or two words take a short path.** A `BitVec` holds eight limbs whatever
+  its width, and equality, the hash, `is_zero`, `is_ones`, the conversions and the
+  constructors read or wrote all eight: for the 64-bit values of a measured set, a tenth of
+  the time. They read the active limbs now (one word at 64 bits and below); a slice, a
+  concatenation and a sign extension within 128 bits are native; the internal hasher takes a
+  small field in one round; and three buffers that grew a push at a time are sized once (a
+  question's scan, its lowered form, and a node's samples, whose operands are looked up once
+  a node, not once a point). 140 measured calls take 3 to 5% less time with the same results.
+  The layout is unchanged (values up to 512 bits stay `Copy`); a `BitVec`'s hash is that of
+  its width and active limbs, no longer the derived one.
+
 Operations of many operands in the words pass, and the forms 0.28.0 names as not read whole.
 On the corpus of 0.28.0, and on 592 expressions written for the purpose: one operation (XOR,
 sum, AND, OR) over 2 to 128 operands, written twice in two orders and groupings and

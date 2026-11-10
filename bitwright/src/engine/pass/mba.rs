@@ -237,10 +237,19 @@ fn sweep_inner(
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
+    // The node examined last, recorded in `r.swept` once the next one begins (unless the
+    // budget ended while it was asked about, which left it unexamined).
+    let mut pending: Option<u32> = None;
     macro_rules! asked {
         ($l:lifetime, $e:expr) => {
             match $e {
                 Ok(v) => v,
+                // Out of solver steps: the node is left unexamined, and the ones after it
+                // are still asked what a certificate on pass work decides.
+                Err(Stop::Exhausted(Exhausted::MbaSteps)) => {
+                    pending = None;
+                    continue $l;
+                }
                 Err(Stop::Exhausted(_)) => {
                     spent = true;
                     continue $l;
@@ -249,9 +258,6 @@ fn sweep_inner(
             }
         };
     }
-    // The node examined last, recorded in `r.swept` once the next one begins (unless the
-    // budget ended while it was asked about, which left it unexamined).
-    let mut pending: Option<u32> = None;
     'nodes: for &i in &order {
         if let Some(p) = pending.take()
             && !spent
@@ -654,6 +660,20 @@ fn related(
             Related::Open
         });
     }
+    // The difference as it is written first, within a small share: taking each operand on
+    // the bits its user reads writes one value read under several masks once per mask (a sum
+    // with a constant becomes a sum of its own for each), and a relation that is a bitwise
+    // identity over that value, which a cut at it shows at once, is then one over several
+    // carry chains. Of the relations proved in a measured call, the readings of the reduced
+    // difference took a thousand steps for half of them and the whole share for the ones
+    // they could not prove.
+    if subject != diff {
+        let (first, _, _) = readings_prove(r, cx, cfg, diff, &zero, RELATED_FIRST_SHARE)?;
+        if first {
+            count(r).opaque_proved += 1;
+            return Ok(Related::Proved(e));
+        }
+    }
     let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE)?;
     if decided {
         count(r).opaque_proved += 1;
@@ -661,6 +681,12 @@ fn related(
     }
     Ok(Related::Open)
 }
+
+/// The share of the readings of a relation's difference as written, before those of its
+/// reduction take [`SWEEP_SHARE`] (see [`related`]). At an eighth, one measured call asked
+/// with an eighth of the usual fuel went from 312 nodes to 80 in half the time, and 44
+/// others took a third less time; at a quarter and at a thirty-second it stopped at 186.
+const RELATED_FIRST_SHARE: u64 = SWEEP_SHARE / 8;
 
 /// The most nodes kept per node of those it was not proved related to (see `sweep_inner`).
 const SWEEP_UNPROVED: usize = 8;
@@ -2488,13 +2514,31 @@ fn readings_prove(
         let mut known = false;
         loop {
             count(r).opaque_asked += 1;
-            let mut meter = Steps::new(r, share);
-            let report = certify::prove(&m, &c, &mut meter)?;
+            // With the call's solver steps gone (fewer left than such a certificate's
+            // share), a certificate is charged as pass work, as
+            // the gate's are, within a small share and a part of the call's pass work in
+            // all (see `BORROW_SHARE`): what decides a sum over one value under masks is a
+            // comparison of two forms, a few hundred evaluations.
+            let steps = r.meter.left_in(|b| b.mba_steps);
+            let (report, rest, share) = if steps.saturating_mul(EVALS_PER_STEP) < BORROW_SHARE {
+                let room = (r.meter.limit.pass_work / BORROW_PART).saturating_sub(r.sweep_borrowed);
+                let share = share.min(BORROW_SHARE).min(room);
+                let before = r.meter.spent.pass_work;
+                let mut meter = Gate { r, share };
+                let report = certify::prove(&m, &c, &mut meter);
+                let rest = meter.share;
+                r.sweep_borrowed += r.meter.spent.pass_work - before;
+                (report?, rest, share)
+            } else {
+                let mut meter = Steps::new(r, share);
+                let report = certify::prove(&m, &c, &mut meter)?;
+                (report, meter.share, share)
+            };
             // The certificate took most of its share and left the question open: the readings
             // not yet asked are larger, and theirs would too. (Not the same reading asked
             // again through its atoms' known bits: that is one more question of this
             // reading, and the next reading has its own.)
-            let burned = !known && meter.share < share / 2;
+            let burned = !known && rest < share / 2;
             count(r).certificates.record(&report);
             match report.verdict {
                 Verdict::Proved => {
@@ -2804,6 +2848,12 @@ const SWEEP_CUT_NODES: usize = 16;
 /// about several hundred more blocks in 140 measured questions and answered none of them.)
 const SWEEP_CUT_VARS: usize = 3;
 
+/// The pass work one certificate of the sweep takes once the call's solver steps are gone
+/// (see [`readings_prove`]), and the part of the call's pass work all of them take: one in
+/// [`BORROW_PART`].
+const BORROW_SHARE: u64 = 1 << 15;
+const BORROW_PART: u64 = 8;
+
 /// The solver steps one [`sweep_cut`] question takes.
 const SWEEP_CUT_STEPS: u64 = 1 << 12;
 
@@ -2903,7 +2953,11 @@ fn step_with(
         return Ok(Step::Normal(Fin::FINAL));
     }
     let unshrunk = count(r).not_smaller;
+    let held = count(r).unsupported;
     let out = ask(r, cx, cfg, n, n, None, depth(r))?;
+    // Whether the question was not one the solver answers whole: it holds a fragment kept
+    // as it is (see `holds_kept`), or the solver declined it for its size.
+    let held = count(r).unsupported != held;
     // An answer that was not smaller for what the fragment shares with others is no answer
     // either: the readings below keep a shared value as it is.
     let unshrunk = count(r).not_smaller != unshrunk;
@@ -2932,12 +2986,16 @@ fn step_with(
                 again => return Ok(again),
             }
         }
-        // A fragment too large to lower whole (more variables than a question takes), with
-        // the arithmetic its bitwise operators read as atoms (see [`Reading::Shallow`]): a sum
-        // of bitwise functions of values that are sums and products themselves is a linear
-        // MBA over those values. (Asked of every fragment, the answers over atoms took the
-        // place of the whole fragment's and three of 47 measured constants were not found.)
-        if !asks(r, cx, cfg, n)? {
+        // A fragment too large to lower whole (more variables than a question takes), or one
+        // not answered whole for what it holds, with the arithmetic its bitwise operators
+        // read as atoms (see [`Reading::Shallow`]): a sum of bitwise functions of values that
+        // are sums and products themselves is a linear MBA over those values. An obfuscator
+        // writes `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a`
+        // and a `b` that are products of one value: read whole it is a question about that
+        // value, costly and declined, and every sum that holds it was then not asked at all.
+        // (Asked of every fragment, the answers over atoms took the place of the whole
+        // fragment's and three of 47 measured constants were not found.)
+        if !asks(r, cx, cfg, n)? || held {
             match ask(
                 r,
                 cx,
@@ -3433,6 +3491,13 @@ const SOLVE_SHARE: u64 = 4;
 /// See [`SOLVE_SHARE`].
 const SOLVE_SHARE_MIN: u64 = 1 << 16;
 
+/// The part of a call's solver steps the MBA phase's questions leave to the sweep that runs
+/// after the round: one in this many. What a round leaves is often a sum the sweep's
+/// certificates decide in a few hundred steps (one value under masks, the constant it adds up
+/// to), where the solver's last questions of the round had taken every step: a call asked
+/// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
+const SWEEP_RESERVE: u64 = 16;
+
 /// The solver steps from which a fragment with no simpler form is kept from the questions
 /// above it (see [`holds_kept`]).
 const KEPT_STEPS: u64 = 1 << 12;
@@ -3487,7 +3552,14 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    match holds_kept(r, cx, root, &bindings) {
+    // (Not the reading over atoms where it is another question than the whole fragment's: it
+    // is asked where that one is not, within the steps of a retried question, and what made
+    // the fragment it holds costly is arithmetic this reading does not look into.)
+    let kept = match reading {
+        Some(Reading::Shallow) if crate::mba::cuts(cx, &bindings) => None,
+        _ => holds_kept(r, cx, root, &bindings),
+    };
+    match kept {
         Some(Kept::Whole) => {
             count(r).unsupported += 1;
             return Ok(Step::Normal(Fin::FINAL));
@@ -3558,7 +3630,14 @@ fn ask(
                         Cap::Steps(s) => (s, false),
                         Cap::Depth(s) => (s, s < full),
                     };
-                    let limit = full.min(steps).min(r.meter.left_in(|b| b.mba_steps));
+                    // (Where a sweep runs after the round, the phase leaves it a part of
+                    // the call's steps, see `SWEEP_RESERVE`.)
+                    let reserve = match cfg.opaque_sweep || cfg.noise_forms || cfg.known_atoms {
+                        true => r.meter.limit.mba_steps / SWEEP_RESERVE,
+                        false => 0,
+                    };
+                    let left = r.meter.left_in(|b| b.mba_steps).saturating_sub(reserve);
+                    let limit = full.min(steps).min(left);
                     // Whether a deeper round asks this question with more steps than it has
                     // here: running out of these is not the call's budget running out.
                     let shallow = deepens && limit == steps;

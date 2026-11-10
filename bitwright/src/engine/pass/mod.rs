@@ -308,11 +308,16 @@ pub(super) fn cut_cases(
 /// say when to split: `select(c, t, f)` is `root` whatever the arms are. (At random inputs a
 /// condition like `x != y` holds every time, so the root looks like one constant and is not;
 /// the arm for the other case is read at the same inputs with the condition put in.)
+///
+/// A `settled` root (one the rounds have nothing left to do on) is split whatever the samples
+/// say: the caller simplifies the arms and keeps the result only where it is smaller (see
+/// `Runner::split`).
 #[cfg(feature = "mba")]
 pub(super) fn split_cases(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     root: u32,
+    settled: bool,
 ) -> Result<Option<u32>, Stop> {
     let before = cx.len() as u32;
     let Some((c, t, f)) = r.build(cx, |cx| context::sides(cx, root))? else {
@@ -325,7 +330,7 @@ pub(super) fn split_cases(
         return Ok(None);
     }
     for side in [t, f] {
-        if cx.const_val(side).is_some() {
+        if settled || cx.const_val(side).is_some() {
             continue;
         }
         r.sample(cx, side)?;
@@ -336,6 +341,22 @@ pub(super) fn split_cases(
         }
     }
     let e = r.build(cx, |cx| cx.c_select(c, t, f))?;
+    Ok((e != root).then_some(e))
+}
+
+/// A root that is a select, with the choice written as far down as its arms agree (see
+/// `context::join`): `None` when it is no select, or that is the root itself.
+#[cfg(feature = "mba")]
+pub(super) fn join_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<u32>, Stop> {
+    let n = cx.node(root);
+    if n.op != OpCode::Select {
+        return Ok(None);
+    }
+    let e = r.build(cx, |cx| context::join(cx, n.a, n.b, n.c))?;
     Ok((e != root).then_some(e))
 }
 
