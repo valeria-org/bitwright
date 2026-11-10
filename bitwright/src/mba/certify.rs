@@ -1652,7 +1652,7 @@ impl BitAffine {
 /// combine to it, its complement or a constant. Two forms are the same function exactly when
 /// their constants and multiples are the same (at zero, and at each single variable bit), so
 /// the comparison decides, at 64 bits or fewer and up to [`LINEAR_BITS`] bits of variables.
-/// One unit of work per node read and 16 variable bits.
+/// One unit of work per node read and 16 variable bits, where it decides.
 fn bit_linear<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -1668,7 +1668,8 @@ fn bit_linear<M: Meter>(
     if bits == 0 || bits > LINEAR_BITS {
         return Ok(None);
     }
-    // Charged for the nodes it reads: it gives up at the first without a form.
+    // A unit per node read and 16 variable bits; it gives up at the first node without a
+    // form.
     let per = (bits / 16 + 1) as u64;
     if (a.nodes().len() + b.nodes().len()) as u64 * per > meter.left() {
         return Ok(None);
@@ -1790,10 +1791,12 @@ fn bit_linear<M: Meter>(
     let (first, second) = if swap { (b, a) } else { (a, b) };
     let f1 = form(first);
     let f2 = f1.as_ref().and_then(|_| form(second));
-    meter.charge(read.get() * per)?;
+    // Charged where it decides: giving up is a walk to the first node without a form, within
+    // what the meter had left for the whole.
     let (Some(f1), Some(f2)) = (f1, f2) else {
         return Ok(None);
     };
+    meter.charge(read.get() * per)?;
     let (fa, fb) = if swap { (f2, f1) } else { (f1, f2) };
     if fa == fb {
         return Ok(Some(None));

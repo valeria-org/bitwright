@@ -1069,7 +1069,7 @@ pub(super) fn by_groups(
     finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
 }
 
-/// The most terms of a sum [`by_factor`] reads, and the most factors of one of them.
+/// The most terms of a sum [`common_factors`] reads, and the most factors of one of them.
 #[cfg(feature = "mba")]
 const FACTOR_TERMS: usize = 48;
 #[cfg(feature = "mba")]
@@ -1118,19 +1118,17 @@ fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
     Some((k, out))
 }
 
-/// the sum `n` whose every term is a product with the same non-constant factors
-/// (`Σ (cᵢ·f)·tᵢ`: an obfuscator scales an MBA by a value, each coefficient spelled as a
-/// product of its own with it, `(f·a)·t₁ − (f·b)·t₂ + …`) written as `f · Σ cᵢ·tᵢ`, the inner
-/// sum simplified by `part` (the MBA phase). The whole is a polynomial over what `f` is made
-/// of, where the inner sum is linear over the atoms of the `tᵢ` alone. `None` when the terms
-/// share no factor.
+/// The sum `n` whose every term is a product with the same non-constant factors
+/// (`Σ (cᵢ·f)·tᵢ`), as those factors and the sum without them, `Σ cᵢ·tᵢ` (built): the
+/// products are read through negations, constants and shared subproducts, so a coefficient
+/// spelled as a product of its own with the factor (`(f·a)·t₁ − (f·b)·t₂`) is seen. `None`
+/// when the terms share no factor.
 #[cfg(feature = "mba")]
-pub(super) fn by_factor(
+fn common_factors(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     n: u32,
-    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
-) -> Result<Option<Step>, Stop> {
+) -> Result<Option<(Vec<u32>, u32, Fin)>, Stop> {
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
@@ -1170,7 +1168,6 @@ pub(super) fn by_factor(
         return Ok(None);
     };
     let w = form.konst.width();
-    let before = cx.len() as u32;
     let mut konst = BitVec::zero(w);
     let mut terms: Vec<(u32, BitVec)> = Vec::with_capacity(products.len());
     for (k, mut factors) in products {
@@ -1192,9 +1189,24 @@ pub(super) fn by_factor(
         }
     }
     let s = emit(r, cx, &Form::of(konst, &terms))?;
-    let inner = part(r, cx, s)?.unwrap_or(s);
+    Ok(Some((common, s, form.fin)))
+}
+
+/// `inner` times each of `common`, committed for `n` by the commit rule (as `kind`'s).
+#[cfg(feature = "mba")]
+#[allow(clippy::too_many_arguments)]
+fn commit_factored(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+    common: &[u32],
+    inner: u32,
+    before: u32,
+    fin: Fin,
+) -> Result<Step, Stop> {
     let mut e = inner;
-    for &f in &common {
+    for &f in common {
         e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, f, e))?;
     }
     let mut stops = Vec::new();
@@ -1210,7 +1222,32 @@ pub(super) fn by_factor(
             todo.extend(cx.node(i).children());
         }
     }
-    finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
+    finish(r, cx, kind, n, e, before, &stops, fin)
+}
+
+/// the sum `n` whose every term is a product with the same non-constant factors
+/// (an obfuscator scales an MBA by a value, each coefficient spelled as a product of its own
+/// with it) written as the factors times the sum without them, that inner sum simplified by
+/// `part` (the MBA phase). The whole is a polynomial over what the factor is made of, where
+/// the inner sum is linear over the atoms of its terms alone. `None` when the terms share no
+/// factor.
+#[cfg(feature = "mba")]
+pub(super) fn by_factor(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    let before = cx.len() as u32;
+    let Some((common, s, fin)) = common_factors(r, cx, n)? else {
+        return Ok(None);
+    };
+    // The factor is taken out also where `part` leaves the inner sum as it is, when that
+    // is smaller: the linear pass's `factor_sum` reads a negated or shared subproduct as a
+    // factor of its own, and (tried there on every sum, before the MBA phase has asked about
+    // it) taking the factor out first left 23 of 140 measured questions larger.
+    let inner = part(r, cx, s)?.unwrap_or(s);
+    commit_factored(r, cx, PassKind::Mba, n, &common, inner, before, fin).map(Some)
 }
 
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not

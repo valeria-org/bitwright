@@ -3280,16 +3280,17 @@ mod mba_service {
     #[test]
     fn a_rewrite_cycle_is_cut() {
         // `c = (x & 1)·(x & -2)` alone is smaller as `(x & 1)·(x ^ 1)`, and the context remembers
-        // that; next to `(x & -2)²`, which keeps `x & -2` alive, it is the other way round. So the
-        // answer for the sum brings back `c`, whose remembered answer rebuilds the sum, which is
-        // still being worked out.
+        // that; next to `(x & -2) ^ 5`, which keeps `x & -2` alive, it is the other way round. So
+        // the answer for the sum brings back `c`, whose remembered answer rebuilds the sum, which
+        // is still being worked out. (Not next to `(x & -2)²`: the two products then share a
+        // factor, and the sum with it taken out is smaller than either spelling.)
         let o = ParseOptions::width(Width::W8);
         let mut cx = Context::new();
         let n = cx
-            .parse("((x & 1) * (x ^ 1)) + ((x & -2) * (x & -2))", &o)
+            .parse("((x & 1) * (x ^ 1)) + ((x & -2) ^ 5)", &o)
             .unwrap();
         let r = cx
-            .parse("((x & 1) * (x & -2)) + ((x & -2) * (x & -2))", &o)
+            .parse("((x & 1) * (x & -2)) + ((x & -2) ^ 5)", &o)
             .unwrap();
         let c = cx.parse("(x & 1) * (x & -2)", &o).unwrap();
         let c1 = cx.parse("(x & 1) * (x ^ 1)", &o).unwrap();
@@ -3461,11 +3462,13 @@ mod mba_service {
     const NONLINEAR: &str =
         "(x ^ y) + 2 * (x & y) + x * y - (x & y) * (x | y) - (x & ~y) * (~x & y)";
 
-    /// `x + y`, through a relation between `(x + y) >> 1` and `x + y` that no native
+    /// `x + y`, through a relation between `(x + y) * 2 >> 1` and `x + y` that no native
     /// certificate sees (a right shift of arithmetic is an atom, independent of its operand).
     /// a right shift of a bitwise function is not an atom (`(x >> 1) * 2 + (x & 1)`
-    /// is proved `x`), so the relation goes through a sum.
-    const NOT_NATIVE: &str = "((x + y) >>u 1) * 2 + ((x + y) & 1)";
+    /// is proved `x`), so the relation goes through a sum; and not through a shift of the sum
+    /// itself beside a mask of it, which the phase reads as two slices of one value
+    /// (`((x + y) >> 1) * 2 + ((x + y) & 1)` is proved `x + y` that way).
+    const NOT_NATIVE: &str = "(((x + y) * 2) >>u 1) + ((x + y) & (-1 ^ (-1 >>u 1)))";
 
     fn run(eng: &Engine, src: &str) -> (Context, crate::engine::Outcome, Expr) {
         let mut cx = Context::new();
