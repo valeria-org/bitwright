@@ -455,7 +455,7 @@ fn sweep_inner(
             subject = asked!(
                 'nodes,
                 "reduced",
-                super::demanded::reduced(r, cx, cur, SWEEP_DEMAND_VISITS)
+                super::demanded::reduced(r, cx, cur, SWEEP_DEMAND_VISITS, true)
             );
             if let Some(v) = cx.const_val(subject) {
                 if v == k {
@@ -628,21 +628,30 @@ enum Relation {
 /// sequence of differences from the first sample (`v[j] − v[0]`; the first met with each
 /// `v[j] ^ v[0]`), each with its first sample. Two nodes a constant apart (added, or xored), or
 /// whose sum is constant, agree there; so do two that are equal, a constant of zero apart.
+///
+/// A sequence is kept as a 128-bit digest of its values, not the values: two sequences that
+/// collide name a pair that is not related, which costs the proof that fails and no answer.
 #[derive(Default)]
 struct Classes {
-    sums: std::collections::HashMap<Box<[crate::BitVec]>, Vec<(u32, crate::BitVec)>>,
-    xors: std::collections::HashMap<Box<[crate::BitVec]>, (u32, crate::BitVec)>,
+    sums: crate::hash::IdMap<[u64; 2], Vec<(u32, crate::BitVec)>>,
+    xors: crate::hash::IdMap<[u64; 2], (u32, crate::BitVec)>,
 }
 
 impl Classes {
-    fn key(vals: &[crate::BitVec], op: BinOp, flip: bool) -> Box<[crate::BitVec]> {
+    fn key(vals: &[crate::BitVec], op: BinOp, flip: bool) -> [u64; 2] {
         let first = &vals[0];
-        vals.iter()
-            .map(|v| match flip {
+        let mut h = [u64::from(first.width().bits()), 0x9e37_79b9_7f4a_7c15];
+        for v in vals {
+            let d = match flip {
                 false => crate::BitVec::bin_unchecked(op, v, first),
                 true => crate::BitVec::bin_unchecked(op, first, v),
-            })
-            .collect()
+            };
+            for &l in d.limbs() {
+                h[0] = combine(h[0], l);
+                h[1] = combine(h[1] ^ l, h[0]);
+            }
+        }
+        h
     }
 
     /// Whether nodes of this width are kept: a narrow one takes few values, and agrees with
@@ -797,7 +806,8 @@ fn related(
     }
     tmp_time("rel.build", t0);
     let t0 = std::time::Instant::now();
-    let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS)?;
+    let whole_sums = relation != Relation::Xor || tmp_off("BW_XOR_WHOLE");
+    let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS, whole_sums)?;
     tmp_time("rel.reduced", t0);
     if let Some(v) = cx.const_val(subject) {
         tmp_time(

@@ -1303,7 +1303,7 @@ struct Runner<'r, 'a> {
     /// What the opaque-constant sweep's reductions of its candidates found, per node and
     /// demanded mask, for the call (see `pass::demanded::reduced`).
     #[cfg(feature = "mba")]
-    reduced: pass::demanded::Memo,
+    reduced: [pass::demanded::Memo; 2],
     /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
     sum_constants: IdMap<(u32, u8), Vec<u32>>,
     /// The MBA solver's answers in this call, by question.

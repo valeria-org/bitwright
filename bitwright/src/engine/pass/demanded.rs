@@ -76,6 +76,8 @@ struct Demand {
     /// simplifications (`None` for the pass's own steps): each was found with every operand
     /// below it read in full, so more visits would not change it.
     whole: Option<Vec<(Key, u32)>>,
+    /// Whether a sum's constant stays one constant under every mask (see [`same_on`]).
+    whole_sums: bool,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
     cap: u32,
     stops: Vec<u32>,
@@ -420,9 +422,7 @@ fn simplify(
             // agrees with it on the prefix, not its residue there, which differs from mask to
             // mask (`t + k` under `& 0xff` and under `& 0xffff` would be two sums, each an atom
             // of its own to a certificate, and what cancels through `t + k` is gone).
-            let whole_sum = st.whole.is_some()
-                && node.op != OpCode::Mul
-                && std::env::var_os("BW_SUM_RESIDUE").is_none();
+            let whole_sum = st.whole_sums && node.op != OpCode::Mul;
             let (ka, kb) = (cx.const_val(node.a), cx.const_val(node.b));
             let (a, b) = match (whole_sum, ka, kb) {
                 (true, None, Some(k)) => {
@@ -644,12 +644,15 @@ pub(super) fn reduced(
     cx: &mut Context,
     x: u32,
     cap: u32,
+    whole_sums: bool,
 ) -> Result<u32, Stop> {
     let w = cx.width_of(x);
+    let which = usize::from(whole_sums);
     let mut st = Demand {
         memo: Memo::default(),
-        base: std::mem::take(&mut r.reduced),
+        base: std::mem::take(&mut r.reduced[which]),
         whole: Some(Vec::new()),
+        whole_sums,
         cap,
         stops: Vec::new(),
         visits: 0,
@@ -668,7 +671,7 @@ pub(super) fn reduced(
     if out.is_ok() {
         base.extend(st.whole.take().unwrap_or_default());
     }
-    r.reduced = base;
+    r.reduced[which] = base;
     out
 }
 
@@ -725,6 +728,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let mut st = Demand {
         base: Memo::default(),
         whole: None,
+        whole_sums: false,
         memo: std::mem::take(&mut r.demanded),
         cap: MAX_VISITS.min(super::region_cap(r)),
         stops: Vec::new(),
