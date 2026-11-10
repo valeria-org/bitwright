@@ -1337,6 +1337,9 @@ struct Runner<'r, 'a> {
     /// `pass::mba::sweep_cut_at`).
     #[cfg(feature = "mba")]
     cut_declined: IdMap<u32, IdMap<u32, ()>>,
+    /// The opaque-constant sweep's enumerations' buffers (see `pass::mba::Exhaust`).
+    #[cfg(feature = "mba")]
+    exhaust: pass::mba::Exhaust,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2437,6 +2440,8 @@ impl Engine {
             witnesses: Vec::new(),
             #[cfg(feature = "mba")]
             cut_declined: IdMap::default(),
+            #[cfg(feature = "mba")]
+            exhaust: Default::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,

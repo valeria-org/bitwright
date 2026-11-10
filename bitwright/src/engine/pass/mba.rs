@@ -950,197 +950,206 @@ fn exhaustive(
     root: u32,
     k: &crate::BitVec,
 ) -> Result<Option<bool>, Stop> {
+    // The call's buffers, taken for the decision (nothing below asks another).
+    let mut sc = std::mem::take(&mut r.exhaust);
+    let out = exhaustive_in(r, cx, &mut sc, root, k);
+    r.exhaust = sc;
+    out
+}
+
+/// [`exhaustive`], over the call's buffers.
+fn exhaustive_in(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    sc: &mut Exhaust,
+    root: u32,
+    k: &crate::BitVec,
+) -> Result<Option<bool>, Stop> {
     use crate::BitVec;
-    // The DAG below `root`, operands first; every node at most 64 bits.
-    let mut order: Vec<u32> = Vec::new();
-    let mut at: crate::hash::IdMap<u32, usize> = crate::hash::IdMap::default();
-    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
-    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
-    while let Some((i, expanded)) = stack.pop() {
-        if expanded {
-            at.insert(i, order.len());
-            order.push(i);
-            continue;
+    // The DAG below `root`, operands first, every node at most 64 bits; and the bits of each
+    // node that reach the root, from the root down.
+    let swept = sc.sweep(cx, root);
+    match swept {
+        Swept::Wide | Swept::Open => return Ok(None),
+        // Not met with (a node is made after its operands): the same by a walk from the root.
+        Swept::Unordered => {
+            if !sc.walk(cx, root) {
+                return Ok(None);
+            }
+            sc.demands(cx);
         }
-        if seen.insert(i, ()).is_some() {
-            continue;
-        }
-        if cx.width_of(i).bits() > 64 {
-            return Ok(None);
-        }
-        stack.push((i, true));
-        for c in cx.node(i).children() {
-            stack.push((c, false));
-        }
+        Swept::Whole => {}
     }
-    // The bits of each node that reach the root, from the root down.
-    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-    let konst = |j: u32| cx.const_val(j).and_then(|v| v.to_u64());
-    let mut demand: Vec<u64> = vec![0; order.len()];
-    demand[at[&root]] = ones(cx.width_of(root).bits());
-    for idx in (0..order.len()).rev() {
-        let i = order[idx];
-        let m = demand[idx];
-        if m == 0 {
-            continue;
-        }
-        let n = cx.node(i);
-        let w = cx.width_of(i).bits();
-        let low_prefix = ones(64 - m.leading_zeros() as u16);
-        let mut give = |c: u32, d: u64| {
-            let wc = cx.width_of(c).bits();
-            demand[at[&c]] |= d & ones(wc);
-        };
-        match n.op {
-            OpCode::And | OpCode::Or => {
-                for (c, o) in [(n.a, n.b), (n.b, n.a)] {
-                    let d = match (konst(o), n.op) {
-                        (Some(k), OpCode::And) => m & k,
-                        (Some(k), _) => m & !k,
-                        _ => m,
-                    };
-                    give(c, d);
-                }
-            }
-            OpCode::Xor => {
-                give(n.a, m);
-                give(n.b, m);
-            }
-            OpCode::Not => give(n.a, m),
-            OpCode::Add | OpCode::Sub | OpCode::Mul => {
-                give(n.a, low_prefix);
-                give(n.b, low_prefix);
-            }
-            OpCode::Neg => give(n.a, low_prefix),
-            OpCode::Shl | OpCode::LShr if konst(n.b).is_some_and(|s| s < u64::from(w)) => {
-                let s = konst(n.b).unwrap_or(0);
-                give(
-                    n.a,
-                    if n.op == OpCode::Shl {
-                        m >> s
-                    } else {
-                        (m << s) & ones(w)
-                    },
-                );
-                give(n.b, u64::MAX);
-            }
-            OpCode::Zext => give(n.a, m),
-            OpCode::Extract => give(n.a, m << n.b),
-            // a rotate by a constant moves the demand the other way; a `concat`
-            // splits it between its halves.
-            OpCode::RotL | OpCode::RotR if konst(n.b).is_some() && w <= 64 && w > 0 => {
-                let s = (konst(n.b).unwrap_or(0) % u64::from(w)) as u32;
-                let rot = |v: u64, by: u32, left: bool| {
-                    let by = by % u32::from(w);
-                    if by == 0 {
-                        return v;
-                    }
-                    let v = v & ones(w);
-                    if left {
-                        ((v << by) | (v >> (u32::from(w) - by))) & ones(w)
-                    } else {
-                        ((v >> by) | (v << (u32::from(w) - by))) & ones(w)
-                    }
-                };
-                give(n.a, rot(m, s, n.op == OpCode::RotR));
-                give(n.b, u64::MAX);
-            }
-            OpCode::Concat => {
-                let wl = cx.width_of(n.b).bits();
-                give(n.b, m & ones(wl));
-                give(n.a, if wl >= 64 { 0 } else { m >> wl });
-            }
-            _ => {
-                for c in n.children() {
-                    give(c, u64::MAX);
-                }
-            }
-        }
+    let mut total: u32 = sc.syms.iter().map(|(_, m)| m.count_ones()).sum();
+    // The points of an enumeration over several symbols are numbered by the symbols' bits in
+    // the order a walk from the root meets the symbols.
+    if total <= EXHAUSTIVE_BITS && swept == Swept::Whole && sc.syms.len() > 1 {
+        sc.walk(cx, root);
+        sc.demands(cx);
     }
-    let mut syms: Vec<(u32, u64)> = Vec::new();
-    for (idx, &i) in order.iter().enumerate() {
-        if cx.node(i).op == OpCode::Sym {
-            syms.push((i, demand[idx]));
-        }
-    }
-    let mut total: u32 = syms.iter().map(|(_, m)| m.count_ones()).sum();
     // The bits set in every value enumerated, and whether the values are a node's (not the
     // symbols'): a node may take fewer values than its unknown bits allow, so a value the root
     // differs at decides nothing.
     let (mut base, mut cut_at) = (0u64, false);
-    let (order, at) = if total > EXHAUSTIVE_BITS {
+    let mut cut: Option<usize> = None;
+    if total > EXHAUSTIVE_BITS {
         // too many symbol bits; a node every demanded path from them passes
         // through, with few bits of its own, is enumerated instead.
-        let Some(cut) = bottleneck(cx, &order, &at, &demand) else {
+        let Some(c) = bottleneck(&sc.below, &sc.demand, &mut sc.live, &mut sc.over) else {
             return Ok(None);
         };
+        let t0 = std::time::Instant::now();
         // Over the values it can take: the bits known of it are those values' (a sum
         // that is constant only for them is constant), and a value it never takes refutes
         // nothing.
         let [z, o] = match tmp_off("BW_OLD_EXH") {
             true => [0, 0],
-            false => super::known_words(r, cx, order[cut])?.0.unwrap_or([0, 0]),
+            false => super::known_words(r, cx, sc.order[c])?.0.unwrap_or([0, 0]),
         };
-        syms = vec![(order[cut], demand[cut] & !(z | o))];
-        base = o & demand[cut];
+        tmp_time("exh.known", t0);
+        sc.syms.clear();
+        sc.syms.push((c as u32, sc.demand[c] & !(z | o)));
+        base = o & sc.demand[c];
         cut_at = !tmp_off("BW_OLD_EXH");
-        total = syms[0].1.count_ones();
-        above(cx, &order, order[cut])
-    } else {
-        (order, at)
-    };
+        total = sc.syms[0].1.count_ones();
+        cut = Some(c);
+    }
+    let t0 = std::time::Instant::now();
+    sc.above(cut);
     let points = 1u64 << total;
-    let inputs: Vec<u32> = syms.iter().map(|(s, _)| *s).collect();
-    let prog = program64(cx, &order, &at, &inputs);
+    let word = sc.program(cx, base);
     // A word program's evaluation costs a fraction of a generic one's (measured, see
     // [`WORD_EVALS`]); charged as that many generic evaluations.
-    let rate = if prog.is_some() { WORD_EVALS } else { 1 };
-    let cost = |n: u64| n.saturating_mul(order.len() as u64).div_ceil(rate);
+    let rate = if word { WORD_EVALS } else { 1 };
+    let len = sc.kept.len();
+    let cost = |n: u64| n.saturating_mul(len as u64).div_ceil(rate);
     let mut meter = Steps::new(r, EXHAUSTIVE_SHARE);
     if cost(points) > certify::Meter::left(&meter) {
+        tmp_time("exh.eval", t0);
         return Ok(None);
     }
     let ku = k.to_u64();
-    let mut words: Vec<u64> = vec![0; order.len()];
-    let mut vals: Vec<BitVec> = vec![BitVec::zero(crate::Width::W1); order.len()];
-    // Whether the root is `k` at point `p`, its bits spread over each input's bits that reach
-    // the root.
-    let mut agrees = |p: u64| -> Result<bool, Stop> {
-        let mut left = p;
-        for &(s, m) in &syms {
-            let mut v = base;
-            let mut mm = m;
-            while mm != 0 {
-                let b = mm & mm.wrapping_neg();
-                if left & 1 == 1 {
-                    v |= b;
-                }
-                left >>= 1;
-                mm &= mm - 1;
-            }
-            match prog {
-                Some(_) => words[at[&s]] = v,
-                None => vals[at[&s]] = BitVec::wrapping_from_u64(cx.width_of(s), v),
-            }
-        }
-        if let Some(prog) = &prog {
-            run64(prog, &mut words);
-            return Ok(Some(words[at[&root]]) == ku);
-        }
-        for (idx, &i) in order.iter().enumerate() {
-            if inputs.contains(&i) {
-                continue;
-            }
-            // A symbol that is no input: zero, as in [`program64`].
-            vals[idx] = cx
-                .eval_node(i, |j| vals[at[&j]], |_, w| Some(BitVec::zero(w)))
-                .map_err(Stop::Error)?;
-        }
-        Ok(vals[at[&root]] == *k)
-    };
-    // A value the root differs at: of the symbols a refutation, of a node no answer.
-    let differs = (!cut_at).then_some(false);
     // The point the enumeration ended at, where the root differs.
+    let missed = if word {
+        sc.lanes_for(points);
+        first_miss(&mut meter, total, &cost, |span| {
+            Ok(match span {
+                Span::At(points) => sc.miss_at(points, base, ku),
+                Span::From(start, count) => sc.miss_from(start, count, base, ku),
+            })
+        })
+    } else {
+        let sc = &*sc;
+        let mut vals: Vec<BitVec> = vec![BitVec::zero(crate::Width::W1); len];
+        // Whether the root is `k` at point `p`, its bits spread over each input's bits that
+        // reach the root.
+        let mut agrees = |p: u64| -> Result<bool, Stop> {
+            let mut left = p;
+            for &(place, m) in &sc.syms {
+                let v = base | spread(&mut left, m);
+                let s = sc.order[place as usize];
+                vals[sc.slot[place as usize] as usize] =
+                    BitVec::wrapping_from_u64(cx.width_of(s), v);
+            }
+            for (slot, &place) in sc.kept.iter().enumerate() {
+                if sc.input[place as usize] {
+                    continue;
+                }
+                // A symbol that is no input: zero, as in the word program.
+                vals[slot] = cx
+                    .eval_node(
+                        sc.order[place as usize],
+                        |j| vals[sc.slot[sc.place[j as usize] as usize] as usize],
+                        |_, w| Some(BitVec::zero(w)),
+                    )
+                    .map_err(Stop::Error)?;
+            }
+            Ok(vals[len - 1] == *k)
+        };
+        first_miss(&mut meter, total, &cost, |span| {
+            match span {
+                Span::At(points) => {
+                    for &p in points {
+                        if !agrees(p)? {
+                            return Ok(Some(p));
+                        }
+                    }
+                }
+                Span::From(start, count) => {
+                    for p in start..start + count {
+                        if !agrees(p)? {
+                            return Ok(Some(p));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        })
+    };
+    tmp_time("exh.eval", t0);
+    let Some(p) = missed? else {
+        return Ok(Some(true));
+    };
+    if tmp_off("BW_PROF") {
+        eprintln!(
+            "miss root={root} cut={cut_at} total={total} p={p:#x} nodes={len} syms={:?}",
+            sc.syms
+                .iter()
+                .map(|(s, m)| (sc.order[*s as usize], format!("{m:#x}")))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The symbols' values there are an input the root is not `k` at: kept, for the candidates
+    // after this one that differ there too (an obfuscator builds one value from another, and
+    // a chain of them that are `k` but for one value of a 16-bit field was enumerated up to
+    // that value at every link).
+    if !cut_at {
+        let mut left = p;
+        let fixed = sc
+            .syms
+            .iter()
+            .map(|&(place, m)| {
+                let s = sc.order[place as usize];
+                let v = spread(&mut left, m);
+                (s, BitVec::wrapping_from_u64(cx.width_of(s), v))
+            })
+            .collect();
+        note_witness(r, cx, fixed);
+    }
+    // A value the root differs at: of the symbols a refutation, of a node no answer.
+    Ok((!cut_at).then_some(false))
+}
+
+/// The low bits of `left`, one for each bit of `m` from its lowest, at `m`'s bits; they are
+/// taken from `left`.
+fn spread(left: &mut u64, m: u64) -> u64 {
+    let (mut v, mut mm) = (0u64, m);
+    while mm != 0 {
+        if *left & 1 == 1 {
+            v |= mm & mm.wrapping_neg();
+        }
+        *left >>= 1;
+        mm &= mm - 1;
+    }
+    v
+}
+
+/// The points [`first_miss`] asks about at once: the ones listed, or `.1` of them from `.0` up.
+enum Span<'a> {
+    At(&'a [u64]),
+    From(u64, u64),
+}
+
+/// The first point of [`exhaustive`]'s enumeration of `2^total` that `miss` finds in a span
+/// (the first of the span the root is not `k` at), each span charged to `meter` by `cost`
+/// before it is asked about.
+fn first_miss(
+    meter: &mut Steps<'_, '_, '_>,
+    total: u32,
+    cost: &dyn Fn(u64) -> u64,
+    mut miss: impl FnMut(Span<'_>) -> Result<Option<u64>, Stop>,
+) -> Result<Option<u64>, Stop> {
+    let points = 1u64 << total;
     let mut missed: Option<u64> = None;
     // The points a candidate that is not `k` most often differs at, before the enumeration is
     // paid for: each bit alone, all of them, and a few mixed. The samples leave candidates that
@@ -1150,65 +1159,27 @@ fn exhaustive(
     if total > EXHAUSTIVE_SCREEN_BITS {
         let mixed = (1..=EXHAUSTIVE_MIXED)
             .map(|j: u64| j.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - total));
-        let probes = (0..total)
+        let mut probes = [0u64; (EXHAUSTIVE_BITS as usize) + 1 + (EXHAUSTIVE_MIXED as usize)];
+        let mut count = 0usize;
+        for p in (0..total)
             .map(|j| 1u64 << j)
             .chain(std::iter::once(points - 1))
-            .chain(mixed);
-        certify::Meter::charge(&mut meter, cost(u64::from(total) + 1 + EXHAUSTIVE_MIXED))?;
-        for p in probes {
-            if !agrees(p)? {
-                missed = Some(p);
-                break;
-            }
+            .chain(mixed)
+        {
+            probes[count] = p;
+            count += 1;
         }
+        certify::Meter::charge(meter, cost(u64::from(total) + 1 + EXHAUSTIVE_MIXED))?;
+        missed = miss(Span::At(&probes[..count]))?;
     }
     let mut start = 0u64;
     while missed.is_none() && start < points {
         let n = EXHAUSTIVE_BLOCK.min(points - start);
-        certify::Meter::charge(&mut meter, cost(n))?;
-        for p in start..start + n {
-            if !agrees(p)? {
-                missed = Some(p);
-                break;
-            }
-        }
+        certify::Meter::charge(meter, cost(n))?;
+        missed = miss(Span::From(start, n))?;
         start += n;
     }
-    let Some(p) = missed else {
-        return Ok(Some(true));
-    };
-    if tmp_off("BW_PROF") {
-        eprintln!(
-            "miss root={root} cut={cut_at} total={total} p={p:#x} nodes={} syms={:?}",
-            order.len(),
-            syms.iter()
-                .map(|(s, m)| (*s, format!("{m:#x}")))
-                .collect::<Vec<_>>()
-        );
-    }
-    // The symbols' values there are an input the root is not `k` at: kept, for the candidates
-    // after this one that differ there too (an obfuscator builds one value from another, and
-    // a chain of them that are `k` but for one value of a 16-bit field was enumerated up to
-    // that value at every link).
-    if !cut_at {
-        let fixed = syms
-            .iter()
-            .scan(p, |left, &(s, m)| {
-                let mut v = 0u64;
-                let mut mm = m;
-                while mm != 0 {
-                    if *left & 1 == 1 {
-                        v |= mm & mm.wrapping_neg();
-                    }
-                    *left >>= 1;
-                    mm &= mm - 1;
-                }
-                Some((s, BitVec::wrapping_from_u64(cx.width_of(s), v)))
-            })
-            .collect();
-        note_witness(r, cx, fixed);
-    }
-    Ok(differs)
+    Ok(missed)
 }
 
 /// An input at which a candidate of the opaque-constant sweep was found to differ from what
@@ -1318,263 +1289,960 @@ const EXHAUSTIVE_MIXED: u64 = 16;
 /// The points [`exhaustive`] is charged for at a time.
 const EXHAUSTIVE_BLOCK: u64 = 1 << 10;
 
-/// the node of `order` (operands first, the root last) that every demanded path
+/// No place: of a node that is not evaluated.
+const NO_PLACE: u32 = u32::MAX;
+
+/// A node of the DAG below [`exhaustive`]'s root, with its operands' places in that DAG's order.
+type Placed = (crate::expr::Node, [u32; 3]);
+
+/// [`exhaustive`]'s working storage, the call's. A sweep asks it of thousands of candidates
+/// over one DAG, each time of the DAG below the candidate, and most enumerate nothing: tables
+/// keyed by node, built for each, were most of what those cost. What is kept per node while the
+/// DAG is read is in tables over the arena that are left clear (or stamped, never cleared), and
+/// everything after is indexed by a node's place among those read.
+#[derive(Default)]
+pub(crate) struct Exhaust {
+    /// Per arena node: whether the sweep under way has met it and not yet reached it (a bit
+    /// each, and a bit for each word of those that has one set), and the bits of it found to
+    /// reach the root so far. All zero between sweeps.
+    marks: Vec<u64>,
+    heads: Vec<u64>,
+    reach: Vec<u64>,
+    /// Per arena node: its place in `order`, of the nodes in it.
+    place: Vec<u32>,
+    /// Per arena node: the walk that met it last.
+    met: Vec<u32>,
+    walk: u32,
+    stack: Vec<(u32, bool)>,
+    /// The DAG below the root, operands first (the root last).
+    order: Vec<u32>,
+    /// Each node of `order`, with its operands' places.
+    below: Vec<Placed>,
+    /// The bits of each that reach the root.
+    demand: Vec<u64>,
+    /// The places enumerated (the symbols, or a bottleneck), with the bits enumerated of each.
+    syms: Vec<(u32, u64)>,
+    /// Of [`bottleneck`]: whether a place is on a demanded path from a symbol to the root, and
+    /// the steps of those paths that begin to pass over places at each place, less those that
+    /// cease to.
+    live: Vec<bool>,
+    over: Vec<u32>,
+    /// The places evaluated (all, or those the root reads without passing below a
+    /// bottleneck), and each place's index among them ([`NO_PLACE`] of the others).
+    kept: Vec<u32>,
+    slot: Vec<u32>,
+    /// Whether a place is enumerated.
+    input: Vec<bool>,
+    /// The places evaluated as a program over words (see [`Exhaust::program`]).
+    prog: Vec<Ins>,
+    /// Per place evaluated: whether its value is the same at every point (1; 2 when an
+    /// instruction reads it as lanes), and the value.
+    fixed: Vec<(u8, u64)>,
+    /// Per place evaluated: the place whose lanes hold its values (its own, or those of the
+    /// operand it is at every point: a zero extension's), and the root's.
+    home: Vec<u32>,
+    root: usize,
+    /// The places enumerated that take more than one value: index among those evaluated and
+    /// the bits enumerated.
+    inputs: Vec<(u32, u64)>,
+    /// For each of `inputs`, its bits at the first `most` points.
+    spreads: Vec<u64>,
+    /// The values of every place evaluated at the `width` points of a pass, a place's side by
+    /// side; `most` is the widest pass of the enumeration under way.
+    lanes: Vec<u64>,
+    width: usize,
+    most: usize,
+}
+
+/// What [`Exhaust::sweep`] came to.
+#[derive(PartialEq)]
+enum Swept {
+    /// The whole DAG.
+    Whole,
+    /// A node of more than 64 bits.
+    Wide,
+    /// More bits of the symbols than are enumerated, and no bottleneck.
+    Open,
+    /// An operand numbered after its user.
+    Unordered,
+}
+
+/// The bits of each operand of `n` that reach its bits `m` (a superset; of the operand's width
+/// or more), given to `give` by the operand's index. `konst` is an operand's value where it is
+/// a constant, `wide` its width.
+fn demanded(
+    n: &crate::expr::Node,
+    m: u64,
+    konst: impl Fn(usize) -> Option<u64>,
+    wide: impl Fn(usize) -> u16,
+    mut give: impl FnMut(usize, u64),
+) {
+    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let w = n.width;
+    let low_prefix = ones(64 - m.leading_zeros() as u16);
+    match n.op {
+        OpCode::And | OpCode::Or => {
+            for (c, o) in [(0, 1), (1, 0)] {
+                let d = match (konst(o), n.op) {
+                    (Some(k), OpCode::And) => m & k,
+                    (Some(k), _) => m & !k,
+                    _ => m,
+                };
+                give(c, d);
+            }
+        }
+        OpCode::Xor => {
+            give(0, m);
+            give(1, m);
+        }
+        OpCode::Not => give(0, m),
+        OpCode::Add | OpCode::Sub | OpCode::Mul => {
+            give(0, low_prefix);
+            give(1, low_prefix);
+        }
+        OpCode::Neg => give(0, low_prefix),
+        OpCode::Shl | OpCode::LShr if konst(1).is_some_and(|s| s < u64::from(w)) => {
+            let s = konst(1).unwrap_or(0);
+            give(
+                0,
+                if n.op == OpCode::Shl {
+                    m >> s
+                } else {
+                    (m << s) & ones(w)
+                },
+            );
+            give(1, u64::MAX);
+        }
+        OpCode::Zext => give(0, m),
+        OpCode::Extract => give(0, m << n.b),
+        // a rotate by a constant moves the demand the other way; a `concat`
+        // splits it between its halves.
+        OpCode::RotL | OpCode::RotR if konst(1).is_some() && w <= 64 && w > 0 => {
+            let s = (konst(1).unwrap_or(0) % u64::from(w)) as u32;
+            let rot = |v: u64, by: u32, left: bool| {
+                let by = by % u32::from(w);
+                if by == 0 {
+                    return v;
+                }
+                let v = v & ones(w);
+                if left {
+                    ((v << by) | (v >> (u32::from(w) - by))) & ones(w)
+                } else {
+                    ((v >> by) | (v << (u32::from(w) - by))) & ones(w)
+                }
+            };
+            give(0, rot(m, s, n.op == OpCode::RotR));
+            give(1, u64::MAX);
+        }
+        OpCode::Concat => {
+            let wl = wide(1);
+            give(1, m & ones(wl));
+            give(0, if wl >= 64 { 0 } else { m >> wl });
+        }
+        _ => {
+            for j in 0..n.op.arity() {
+                give(j, u64::MAX);
+            }
+        }
+    }
+}
+
+/// The value of a constant node of at most 64 bits (which is stored in the node).
+fn word_of(cx: &Context, i: u32, n: &crate::expr::Node) -> Option<u64> {
+    if n.op != OpCode::Const {
+        return None;
+    }
+    if n.aux & crate::expr::AUX_POOLED != 0 {
+        return cx.const_val(i).and_then(|v| v.to_u64());
+    }
+    Some(u64::from(n.a) | (u64::from(n.b) << 32))
+}
+
+impl Exhaust {
+    /// The DAG below `root` into `order` and `below`, operands first, with the bits of each
+    /// node that reach the root in `demand`, and the symbols with theirs. A node is numbered
+    /// after its operands, so from the highest number down every node comes after its users,
+    /// with all the bits they read of it: one pass, no walk. Stops short at a node of more than
+    /// 64 bits, and where no enumeration can follow: more than [`EXHAUSTIVE_BITS`] bits of the
+    /// symbols already reach the root, and no node reached so far but the root has as few of
+    /// its own. (A [`bottleneck`] is such a node on every demanded path from the symbols to the
+    /// root; a node not yet reached is not on the path that gave a symbol its bits.)
+    fn sweep(&mut self, cx: &Context, root: u32) -> Swept {
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let len = cx.nodes.len();
+        if self.reach.len() < len {
+            self.reach.resize(len, 0);
+            self.place.resize(len, 0);
+            self.marks.resize(len.div_ceil(64), 0);
+            self.heads.resize(len.div_ceil(64).div_ceil(64), 0);
+        }
+        let Exhaust {
+            marks,
+            heads,
+            reach,
+            place,
+            order,
+            below,
+            demand,
+            syms,
+            ..
+        } = self;
+        order.clear();
+        below.clear();
+        demand.clear();
+        syms.clear();
+        // The highest node marked at or below word `at`, unmarked.
+        fn next(marks: &mut [u64], heads: &mut [u64], at: &mut usize) -> u32 {
+            if marks[*at] == 0 {
+                let mut h = *at / 64;
+                let mut word = heads[h] & (u64::MAX >> (63 - *at % 64));
+                while word == 0 {
+                    h -= 1;
+                    word = heads[h];
+                }
+                *at = h * 64 + 63 - word.leading_zeros() as usize;
+            }
+            let bit = 63 - marks[*at].leading_zeros();
+            marks[*at] &= !(1u64 << bit);
+            if marks[*at] == 0 {
+                heads[*at / 64] &= !(1u64 << (*at % 64));
+            }
+            (*at * 64) as u32 + bit
+        }
+        let mut at = root as usize / 64;
+        marks[at] |= 1u64 << (root % 64);
+        heads[at / 64] |= 1u64 << (at % 64);
+        reach[root as usize] = ones(cx.node(root).width);
+        // The nodes marked, the symbols' bits that reach the root so far, and whether a node
+        // that could be a bottleneck was met.
+        let (mut marked, mut bits, mut narrow) = (1usize, 0u32, false);
+        let mut out = Swept::Whole;
+        'nodes: while marked > 0 {
+            let i = next(marks, heads, &mut at);
+            marked -= 1;
+            let n = cx.node(i);
+            let m = std::mem::take(&mut reach[i as usize]);
+            if n.width > 64 {
+                out = Swept::Wide;
+                break;
+            }
+            order.push(i);
+            below.push((n, [0; 3]));
+            demand.push(m);
+            let kids = [n.a, n.b, n.c];
+            let arity = n.op.arity();
+            for &c in &kids[..arity] {
+                if c >= i {
+                    out = Swept::Unordered;
+                    break 'nodes;
+                }
+                let (word, bit) = (c as usize / 64, 1u64 << (c % 64));
+                marked += usize::from(marks[word] & bit == 0);
+                marks[word] |= bit;
+                heads[word / 64] |= 1u64 << (word % 64);
+            }
+            if m == 0 || arity == 0 {
+                continue;
+            }
+            narrow |= i != root && m.count_ones() <= EXHAUSTIVE_BITS;
+            demanded(
+                &n,
+                m,
+                |j| word_of(cx, kids[j], &cx.node(kids[j])),
+                |j| cx.node(kids[j]).width,
+                |j, d| {
+                    let c = cx.node(kids[j]);
+                    let had = reach[kids[j] as usize];
+                    let now = had | (d & ones(c.width));
+                    if c.op == OpCode::Sym {
+                        bits += now.count_ones() - had.count_ones();
+                    }
+                    reach[kids[j] as usize] = now;
+                },
+            );
+            if bits > EXHAUSTIVE_BITS && !narrow {
+                out = Swept::Open;
+                break;
+            }
+        }
+        while marked > 0 {
+            let i = next(marks, heads, &mut at);
+            reach[i as usize] = 0;
+            marked -= 1;
+        }
+        if out != Swept::Whole {
+            return out;
+        }
+        order.reverse();
+        below.reverse();
+        demand.reverse();
+        for (p, &i) in order.iter().enumerate() {
+            place[i as usize] = p as u32;
+        }
+        for (p, (n, kids)) in below.iter_mut().enumerate() {
+            for (k, c) in n.children().enumerate() {
+                kids[k] = place[c as usize];
+            }
+            if n.op == OpCode::Sym {
+                syms.push((p as u32, demand[p]));
+            }
+        }
+        out
+    }
+
+    /// The DAG below `root` into `order` and `below`, operands first, in the order a walk from
+    /// the root leaves its nodes; `false` at a node of more than 64 bits.
+    fn walk(&mut self, cx: &Context, root: u32) -> bool {
+        if self.met.len() < cx.nodes.len() {
+            self.met.resize(cx.nodes.len(), 0);
+        }
+        if self.place.len() < cx.nodes.len() {
+            self.place.resize(cx.nodes.len(), 0);
+        }
+        self.walk = self.walk.wrapping_add(1);
+        if self.walk == 0 {
+            self.met.fill(0);
+            self.walk = 1;
+        }
+        let walk = self.walk;
+        self.order.clear();
+        self.below.clear();
+        self.stack.clear();
+        self.stack.push((root, false));
+        while let Some((i, expanded)) = self.stack.pop() {
+            let n;
+            if expanded {
+                n = cx.node(i);
+            } else {
+                if self.met[i as usize] == walk {
+                    continue;
+                }
+                self.met[i as usize] = walk;
+                n = cx.node(i);
+                if n.width > 64 {
+                    return false;
+                }
+                if n.op.arity() != 0 {
+                    self.stack.push((i, true));
+                    for c in n.children() {
+                        if self.met[c as usize] != walk {
+                            self.stack.push((c, false));
+                        }
+                    }
+                    continue;
+                }
+            }
+            let mut kids = [0u32; 3];
+            for (k, c) in n.children().enumerate() {
+                kids[k] = self.place[c as usize];
+            }
+            self.place[i as usize] = self.order.len() as u32;
+            self.order.push(i);
+            self.below.push((n, kids));
+        }
+        true
+    }
+
+    /// The bits of each node of a [`walk`](Exhaust::walk) that reach the root, from the root
+    /// down, and the symbols with theirs.
+    fn demands(&mut self, cx: &Context) {
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let (order, below, demand) = (&self.order, &self.below, &mut self.demand);
+        let last = below.len() - 1;
+        demand.clear();
+        demand.resize(below.len(), 0);
+        demand[last] = ones(below[last].0.width);
+        for idx in (0..=last).rev() {
+            let m = demand[idx];
+            if m == 0 {
+                continue;
+            }
+            let (n, kids) = &below[idx];
+            demanded(
+                n,
+                m,
+                |j| word_of(cx, order[kids[j] as usize], &below[kids[j] as usize].0),
+                |j| below[kids[j] as usize].0.width,
+                |j, d| demand[kids[j] as usize] |= d & ones(below[kids[j] as usize].0.width),
+            );
+        }
+        self.syms.clear();
+        for (idx, (n, _)) in below.iter().enumerate() {
+            if n.op == OpCode::Sym {
+                self.syms.push((idx as u32, demand[idx]));
+            }
+        }
+    }
+
+    /// The places evaluated into `kept` and `slot`: every place, or with a bottleneck at `cut`
+    /// the ones the root reads without passing below it.
+    fn above(&mut self, cut: Option<usize>) {
+        let n = self.below.len();
+        self.kept.clear();
+        self.slot.clear();
+        let Some(cut) = cut else {
+            self.kept.extend(0..n as u32);
+            self.slot.extend(0..n as u32);
+            return;
+        };
+        // Users first: a place read is marked before it is reached.
+        self.slot.resize(n, NO_PLACE);
+        self.slot[n - 1] = 0;
+        for p in (0..n).rev() {
+            if self.slot[p] == NO_PLACE || p == cut {
+                continue;
+            }
+            let (node, kids) = self.below[p];
+            for &c in &kids[..node.op.arity()] {
+                self.slot[c as usize] = 0;
+            }
+        }
+        for p in 0..n {
+            if self.slot[p] != NO_PLACE {
+                self.slot[p] = self.kept.len() as u32;
+                self.kept.push(p as u32);
+            }
+        }
+    }
+
+    /// The places evaluated (operands first, every node at most 64 bits) as a program over
+    /// `u64` words, each instruction with its node's width mask; `false` when an operator is
+    /// not one it evaluates. A place enumerated is given its words before each run; a value
+    /// that is the same at every point (a constant, a symbol past a bottleneck, a place
+    /// enumerated with no bit unknown, which is `base`) is an instruction's operand where the
+    /// instruction has a form that takes one, and is written out once otherwise.
+    fn program(&mut self, cx: &Context, base: u64) -> bool {
+        use crate::{BinOp, CmpOp, UnOp};
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let Exhaust {
+            order,
+            below,
+            syms,
+            kept,
+            slot,
+            input,
+            prog,
+            fixed,
+            home,
+            inputs,
+            ..
+        } = self;
+        prog.clear();
+        inputs.clear();
+        fixed.clear();
+        fixed.resize(kept.len(), (0, 0));
+        home.clear();
+        home.extend(0..kept.len() as u32);
+        input.clear();
+        input.resize(below.len(), false);
+        for &(p, m) in syms.iter() {
+            input[p as usize] = true;
+            let s = slot[p as usize];
+            if m == 0 {
+                fixed[s as usize] = (1, base);
+            } else {
+                inputs.push((s, m));
+            }
+        }
+        // An operand read as lanes: one that is the same at every point is written out.
+        fn lane(fixed: &mut [(u8, u64)], s: u32) -> u32 {
+            if fixed[s as usize].0 == 1 {
+                fixed[s as usize].0 = 2;
+            }
+            s
+        }
+        let known = |fixed: &[(u8, u64)], s: u32| {
+            let (is, v) = fixed[s as usize];
+            (is != 0).then_some(v)
+        };
+        for (s, &p) in kept.iter().enumerate() {
+            if input[p as usize] {
+                continue;
+            }
+            let (n, kids) = below[p as usize];
+            let (w, mask) = (u32::from(n.width), ones(n.width));
+            if w == 0 {
+                return false;
+            }
+            let wide = |j: usize| below[kids[j] as usize].0.width;
+            let arg = |j: usize| home[slot[kids[j] as usize] as usize];
+            // A node that is its operand `j` at every point: the operand's lanes, or its value.
+            macro_rules! same {
+                ($j:expr) => {{
+                    let a = arg($j);
+                    match known(fixed, a) {
+                        Some(v) => fixed[s] = (1, v),
+                        None => home[s] = a,
+                    }
+                    continue;
+                }};
+            }
+            let ins = |kind: Kind, sh: u32, a: u32, b: u32, c: u32, k: u64| Ins {
+                kind,
+                sh,
+                dst: s as u32,
+                a,
+                b,
+                c,
+                mask,
+                k,
+            };
+            let one = |fixed: &mut [(u8, u64)], kind: Kind, sh: u32, k: u64| {
+                ins(kind, sh, lane(fixed, arg(0)), 0, 0, k)
+            };
+            let two = |fixed: &mut [(u8, u64)], kind: Kind, sh: u32| {
+                ins(kind, sh, lane(fixed, arg(0)), lane(fixed, arg(1)), 0, 0)
+            };
+            let i = match n.op {
+                // A symbol past a bottleneck cut that is no input reaches the root only through
+                // a node with no demanded bits: any value, zero as the uncut enumeration gives it.
+                OpCode::Sym => {
+                    fixed[s] = (1, 0);
+                    continue;
+                }
+                OpCode::Const => {
+                    let Some(v) = word_of(cx, order[p as usize], &n) else {
+                        return false;
+                    };
+                    fixed[s] = (1, v & mask);
+                    continue;
+                }
+                OpCode::Zext => same!(0),
+                OpCode::Sext => one(fixed, Kind::Sext, u32::from(wide(0)), 0),
+                OpCode::Extract => one(fixed, Kind::Extract, u32::from(n.b as u16), 0),
+                OpCode::Select => {
+                    let (c, t, f) = (
+                        lane(fixed, arg(0)),
+                        lane(fixed, arg(1)),
+                        lane(fixed, arg(2)),
+                    );
+                    ins(Kind::Select, 0, c, t, f, 0)
+                }
+                // `concat(hi, lo)`, shifted by the low half's width.
+                OpCode::Concat if wide(1) >= 64 => same!(1),
+                OpCode::Concat => two(fixed, Kind::Concat, u32::from(wide(1))),
+                op => {
+                    if let Some(u) = op.as_un() {
+                        match u {
+                            UnOp::Not => one(fixed, Kind::Not, 0, 0),
+                            UnOp::Neg => one(fixed, Kind::Neg, 0, 0),
+                            _ => return false,
+                        }
+                    } else if let Some(b) = op.as_bin() {
+                        let (x, y) = (known(fixed, arg(0)), known(fixed, arg(1)));
+                        // The other operand's lanes, with the known one as the instruction's.
+                        let with = |fixed: &mut [(u8, u64)], kind: Kind, plain: Kind| match (x, y) {
+                            (_, Some(y)) => ins(kind, 0, lane(fixed, arg(0)), 0, 0, y),
+                            (Some(x), _) => ins(kind, 0, lane(fixed, arg(1)), 0, 0, x),
+                            _ => two(fixed, plain, 0),
+                        };
+                        match (b, y) {
+                            (BinOp::Add, _) => with(fixed, Kind::AddK, Kind::Add),
+                            (BinOp::Mul, _) => with(fixed, Kind::MulK, Kind::Mul),
+                            (BinOp::And, _) => with(fixed, Kind::AndK, Kind::And),
+                            (BinOp::Or, _) => with(fixed, Kind::OrK, Kind::Or),
+                            (BinOp::Xor, _) => with(fixed, Kind::XorK, Kind::Xor),
+                            (BinOp::Sub, Some(y)) => one(fixed, Kind::AddK, 0, y.wrapping_neg()),
+                            (BinOp::Sub, None) => match x {
+                                Some(x) => ins(Kind::RSubK, 0, lane(fixed, arg(1)), 0, 0, x),
+                                None => two(fixed, Kind::Sub, 0),
+                            },
+                            // A count of the width or more leaves nothing.
+                            (BinOp::Shl | BinOp::LShr, Some(y)) if y >= u64::from(w) => {
+                                fixed[s] = (1, 0);
+                                continue;
+                            }
+                            (BinOp::Shl, Some(y)) => one(fixed, Kind::ShlK, y as u32, 0),
+                            (BinOp::LShr, Some(y)) => one(fixed, Kind::LShrK, y as u32, 0),
+                            (BinOp::AShr, Some(y)) => {
+                                one(fixed, Kind::AShrK, y.min(u64::from(w) - 1) as u32, 0)
+                            }
+                            (BinOp::RotL | BinOp::RotR, Some(y)) => {
+                                let by = (y % u64::from(w)) as u32;
+                                let by = if b == BinOp::RotR { (w - by) % w } else { by };
+                                match by {
+                                    0 => same!(0),
+                                    _ => one(fixed, Kind::RotK, by, 0),
+                                }
+                            }
+                            (BinOp::Shl, None) => two(fixed, Kind::Shl, 0),
+                            (BinOp::LShr, None) => two(fixed, Kind::LShr, 0),
+                            (BinOp::AShr, None) => two(fixed, Kind::AShr, 0),
+                            (BinOp::RotL, None) => two(fixed, Kind::RotL, 0),
+                            (BinOp::RotR, None) => two(fixed, Kind::RotR, 0),
+                            _ => return false,
+                        }
+                    } else {
+                        let Some(c) = op.as_cmp() else {
+                            return false;
+                        };
+                        let (x, y) = (known(fixed, arg(0)), known(fixed, arg(1)));
+                        let wa = u32::from(wide(0));
+                        match (c, x, y) {
+                            (CmpOp::Eq, _, Some(y)) => one(fixed, Kind::EqK, 0, y),
+                            (CmpOp::Ne, _, Some(y)) => one(fixed, Kind::NeK, 0, y),
+                            (CmpOp::Eq, Some(x), _) => {
+                                ins(Kind::EqK, 0, lane(fixed, arg(1)), 0, 0, x)
+                            }
+                            (CmpOp::Ne, Some(x), _) => {
+                                ins(Kind::NeK, 0, lane(fixed, arg(1)), 0, 0, x)
+                            }
+                            (CmpOp::Eq, ..) => two(fixed, Kind::Eq, 0),
+                            (CmpOp::Ne, ..) => two(fixed, Kind::Ne, 0),
+                            (CmpOp::Ult, ..) => two(fixed, Kind::Ult, 0),
+                            (CmpOp::Ule, ..) => two(fixed, Kind::Ule, 0),
+                            (CmpOp::Slt, ..) => two(fixed, Kind::Slt, wa),
+                            (CmpOp::Sle, ..) => two(fixed, Kind::Sle, wa),
+                        }
+                    }
+                }
+            };
+            prog.push(i);
+        }
+        // The root's lanes are read at every point.
+        self.root = lane(fixed, home[kept.len() - 1]) as usize;
+        true
+    }
+
+    /// Sets the most points a pass of the program evaluates, for an enumeration of `points`.
+    fn lanes_for(&mut self, points: u64) {
+        let len = self.kept.len();
+        let fit = (EXHAUSTIVE_LANE_WORDS / len).clamp(1, EXHAUSTIVE_LANES);
+        // A power of two, as `points` is: a block is whole passes.
+        let most = (1usize << fit.ilog2()).min(usize::try_from(points).unwrap_or(usize::MAX));
+        self.most = most;
+        self.width = 0;
+        if self.lanes.len() < len * most {
+            self.lanes.resize(len * most, 0);
+        }
+        // The inputs' bits at the first `most` points: at a point `p + l` past a multiple `p`
+        // of `most`, an input's are its bits at `p` with its bits at `l`. Counted up in the
+        // inputs' bits (`(v | !m) + 1 & m` is the next value of the bits `m`, zero after the
+        // last, when the next input counts).
+        self.spreads.clear();
+        self.spreads.resize(self.inputs.len() * most, 0);
+        for l in 1..most {
+            let mut carry = true;
+            for (j, &(_, m)) in self.inputs.iter().enumerate() {
+                let was = self.spreads[j * most + l - 1];
+                let now = if carry {
+                    (was | !m).wrapping_add(1) & m
+                } else {
+                    was
+                };
+                carry &= now == 0;
+                self.spreads[j * most + l] = now;
+            }
+        }
+    }
+
+    /// Lays the lanes out for passes of `width` points (at most `most`), with the values that
+    /// are the same at every point written out.
+    fn pass_of(&mut self, width: usize) {
+        if self.width == width {
+            return;
+        }
+        self.width = width;
+        for (s, &(is, v)) in self.fixed.iter().enumerate() {
+            if is == 2 {
+                self.lanes[s * width..][..width].fill(v);
+            }
+        }
+    }
+
+    /// The first lane of the first `valid` at which the root is not `k`, after a pass.
+    fn differs(&self, valid: usize, k: Option<u64>) -> Option<usize> {
+        let Some(k) = k else {
+            return Some(0);
+        };
+        let root = &self.lanes[self.root * self.width..][..valid];
+        if root.iter().fold(0, |any, &x| any | (x ^ k)) == 0 {
+            return None;
+        }
+        root.iter().position(|&x| x != k)
+    }
+
+    /// The first of `points` the root is not `k` at.
+    fn miss_at(&mut self, points: &[u64], base: u64, k: Option<u64>) -> Option<u64> {
+        // A pass no wider than the points: a pass's cost is its width's.
+        let width = points.len().min(self.most);
+        self.pass_of(width);
+        for pass in points.chunks(width) {
+            for l in 0..width {
+                // A short pass evaluates its last point again.
+                let mut left = pass[l.min(pass.len() - 1)];
+                for &(s, m) in &self.inputs {
+                    self.lanes[s as usize * width + l] = base | spread(&mut left, m);
+                }
+            }
+            run_lanes(&self.prog, &mut self.lanes, width);
+            if let Some(l) = self.differs(pass.len(), k) {
+                return Some(pass[l]);
+            }
+        }
+        None
+    }
+
+    /// The first of the `count` points from `start` up the root is not `k` at; `start` is a
+    /// multiple of `most`.
+    fn miss_from(&mut self, start: u64, count: u64, base: u64, k: Option<u64>) -> Option<u64> {
+        let width = self.most;
+        self.pass_of(width);
+        let (mut p, end) = (start, start + count);
+        while p < end {
+            let mut left = p;
+            for (j, &(s, m)) in self.inputs.iter().enumerate() {
+                let at = base | spread(&mut left, m);
+                let out = &mut self.lanes[s as usize * width..][..width];
+                for (o, &low) in out.iter_mut().zip(&self.spreads[j * width..][..width]) {
+                    *o = at | low;
+                }
+            }
+            run_lanes(&self.prog, &mut self.lanes, width);
+            let valid = (end - p).min(width as u64) as usize;
+            if let Some(l) = self.differs(valid, k) {
+                return Some(p + l as u64);
+            }
+            p += width as u64;
+        }
+        None
+    }
+}
+
+/// The most points one pass of a word program evaluates ([`run_lanes`]): a block
+/// ([`EXHAUSTIVE_BLOCK`]), and a power of two. An instruction's operator is read once a pass,
+/// which is most of what a narrow pass costs: on programs of 30 to 2,000 instructions a point
+/// took 0.33 to 0.40 ns an instruction at 64 points a pass, 0.25 to 0.29 ns at 256, and a
+/// little less at 1,024.
+const EXHAUSTIVE_LANES: usize = EXHAUSTIVE_BLOCK as usize;
+
+/// The words of lanes a pass works in while it can, fewer points at once for a longer program:
+/// past a few megabytes a pass was slower for being wider.
+const EXHAUSTIVE_LANE_WORDS: usize = 1 << 17;
+
+/// the place of `below` (operands first, the root last) that every demanded path
 /// from the symbols to the root passes through, nearest the symbols with at most
 /// [`EXHAUSTIVE_BITS`] demanded bits; not the root or a symbol. The root is a function of its
 /// demanded bits alone. A reconstructed address can take a few bits of sums over `k - t` and
 /// `t + k'`: 22 bits of the two symbols in `t` reach them, 11 bits of `t`.
 fn bottleneck(
-    cx: &Context,
-    order: &[u32],
-    at: &crate::hash::IdMap<u32, usize>,
+    below: &[Placed],
     demand: &[u64],
+    live: &mut Vec<bool>,
+    over: &mut Vec<u32>,
 ) -> Option<usize> {
-    let n = order.len();
+    let n = below.len();
     let root = n.checked_sub(1)?;
-    let mut idom = vec![usize::MAX; n];
-    let mut depth = vec![0u32; n];
-    let meet = |idom: &[usize], depth: &[u32], mut a: usize, mut b: usize| {
-        while a != b {
-            if depth[a] >= depth[b] {
-                a = idom[a];
-            } else {
-                b = idom[b];
-            }
-        }
-        a
-    };
-    idom[root] = root;
-    // Parents first: every operand comes after each node that reads it.
-    for idx in (0..n).rev() {
-        if idom[idx] == usize::MAX || demand[idx] == 0 {
+    live.clear();
+    live.resize(n, false);
+    over.clear();
+    over.resize(n + 1, 0);
+    // A place is on a demanded path from a symbol to the root when it has demanded bits and is
+    // a symbol or reads a place that is on one. A step of such a path, from a place to one it
+    // reads, passes over the places between the two in the order; a symbol's path begins below
+    // every place, so passes over all before the symbol. `over` takes one at the first place a
+    // step passes over and gives one back past the last.
+    for (p, (node, kids)) in below.iter().enumerate() {
+        if demand[p] == 0 {
             continue;
         }
-        if idx != root {
-            depth[idx] = depth[idom[idx]] + 1;
-        }
-        for c in cx.node(order[idx]).children() {
-            let ci = at[&c];
-            if demand[ci] == 0 {
-                continue;
-            }
-            idom[ci] = match idom[ci] {
-                usize::MAX => idx,
-                d => meet(&idom, &depth, d, idx),
-            };
-        }
-    }
-    let mut cut: Option<usize> = None;
-    for (idx, &i) in order.iter().enumerate() {
-        if cx.node(i).op == OpCode::Sym && demand[idx] != 0 && idom[idx] != usize::MAX {
-            cut = Some(match cut {
-                None => idx,
-                Some(c) => meet(&idom, &depth, c, idx),
-            });
-        }
-    }
-    let mut c = cut?;
-    loop {
-        if c == root {
-            return None;
-        }
-        if cx.node(order[c]).op != OpCode::Sym && demand[c].count_ones() <= EXHAUSTIVE_BITS {
-            return Some(c);
-        }
-        c = idom[c];
-    }
-}
-
-/// `order` with only the nodes the root reads without passing below `cut`, and their indices.
-#[allow(clippy::type_complexity)]
-fn above(cx: &Context, order: &[u32], cut: u32) -> (Vec<u32>, crate::hash::IdMap<u32, usize>) {
-    let mut keep: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
-    let mut stack: Vec<u32> = order.last().copied().into_iter().collect();
-    while let Some(i) = stack.pop() {
-        if keep.insert(i, ()).is_some() || i == cut {
+        if node.op == OpCode::Sym {
+            live[p] = true;
+            over[0] = over[0].wrapping_add(1);
+            over[p] = over[p].wrapping_sub(1);
             continue;
         }
-        stack.extend(cx.node(i).children());
+        for &c in &kids[..node.op.arity()] {
+            let c = c as usize;
+            if live[c] {
+                live[p] = true;
+                over[c + 1] = over[c + 1].wrapping_add(1);
+                over[p] = over[p].wrapping_sub(1);
+            }
+        }
     }
-    let order: Vec<u32> = order
-        .iter()
-        .copied()
-        .filter(|i| keep.contains_key(i))
-        .collect();
-    let at = order.iter().enumerate().map(|(k, i)| (*i, k)).collect();
-    (order, at)
+    // A place on a demanded path that no step passes over is on every one of them (a path
+    // that missed it would step over it); the first such is the nearest the symbols.
+    let mut open = 0u32;
+    for p in 0..root {
+        open = open.wrapping_add(over[p]);
+        if open == 0
+            && live[p]
+            && below[p].0.op != OpCode::Sym
+            && demand[p].count_ones() <= EXHAUSTIVE_BITS
+        {
+            return Some(p);
+        }
+    }
+    None
 }
 
-/// one node of a word program ([`program64`]): operands are indices of earlier
-/// nodes, and every value is kept masked to its node's width.
+/// What an instruction of a word program computes ([`Ins`]); the forms in `K` take the
+/// instruction's own word for an operand that is the same at every point, or its count for a
+/// shift by one.
 #[derive(Clone, Copy)]
-enum Op64 {
-    Keep,
-    Const(u64),
-    Bin(crate::BinOp, usize, usize),
-    Not(usize),
-    Neg(usize),
-    Zext(usize),
-    Sext(usize, u16),
-    Extract(usize, u16),
-    Cmp(crate::CmpOp, usize, usize, u16),
-    Select(usize, usize, usize),
-    /// `concat(hi, lo)`, with the low half's width.
-    Concat(usize, usize, u16),
+enum Kind {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+    RotL,
+    RotR,
+    AddK,
+    /// `k - a`.
+    RSubK,
+    MulK,
+    AndK,
+    OrK,
+    XorK,
+    ShlK,
+    LShrK,
+    AShrK,
+    /// A rotate left by `sh`, neither zero nor the width.
+    RotK,
+    Not,
+    Neg,
+    /// From `sh` bits.
+    Sext,
+    /// From bit `sh` up.
+    Extract,
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    /// Of `sh` bits.
+    Slt,
+    Sle,
+    EqK,
+    NeK,
+    /// `a`'s low bit picks `b` or `c`.
+    Select,
+    /// `a` above the `sh` bits of `b`.
+    Concat,
 }
 
-/// `order` (operands first, every node at most 64 bits) as a program over `u64` words, with
-/// each node's width mask; `None` when an operator is not one it evaluates. An input's word
-/// (a symbol's, or a cut node's) is set before each run.
-fn program64(
-    cx: &Context,
-    order: &[u32],
-    at: &crate::hash::IdMap<u32, usize>,
-    inputs: &[u32],
-) -> Option<Vec<(Op64, u64)>> {
-    use crate::{BinOp, CmpOp, UnOp};
-    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-    let mut prog = Vec::with_capacity(order.len());
-    for &i in order {
-        let n = cx.node(i);
-        let w = cx.width_of(i).bits();
-        let arg = |j: u32| at.get(&j).copied();
-        let op = match n.op {
-            _ if inputs.contains(&i) => Op64::Keep,
-            // A symbol past a bottleneck cut that is no input reaches the root only through a
-            // node with no demanded bits: any value, zero as the uncut enumeration gives it.
-            OpCode::Sym => Op64::Const(0),
-            OpCode::Const => Op64::Const(cx.const_val(i)?.to_u64()?),
-            OpCode::Zext => Op64::Zext(arg(n.a)?),
-            OpCode::Sext => Op64::Sext(arg(n.a)?, cx.width_of(n.a).bits()),
-            OpCode::Extract => Op64::Extract(arg(n.a)?, n.b as u16),
-            OpCode::Select => Op64::Select(arg(n.a)?, arg(n.b)?, arg(n.c)?),
-            OpCode::Concat => Op64::Concat(arg(n.a)?, arg(n.b)?, cx.width_of(n.b).bits()),
-            op => {
-                if let Some(u) = op.as_un() {
-                    match u {
-                        UnOp::Not => Op64::Not(arg(n.a)?),
-                        UnOp::Neg => Op64::Neg(arg(n.a)?),
-                        _ => return None,
-                    }
-                } else if let Some(b) = op.as_bin() {
-                    match b {
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::And
-                        | BinOp::Or
-                        | BinOp::Xor
-                        | BinOp::Shl
-                        | BinOp::LShr
-                        | BinOp::AShr
-                        | BinOp::RotL
-                        | BinOp::RotR => Op64::Bin(b, arg(n.a)?, arg(n.b)?),
-                        _ => return None,
-                    }
-                } else {
-                    let c = op.as_cmp()?;
-                    match c {
-                        CmpOp::Eq
-                        | CmpOp::Ne
-                        | CmpOp::Ult
-                        | CmpOp::Ule
-                        | CmpOp::Slt
-                        | CmpOp::Sle => Op64::Cmp(c, arg(n.a)?, arg(n.b)?, cx.width_of(n.a).bits()),
-                    }
-                }
-            }
-        };
-        prog.push((op, ones(w)));
+/// One instruction of a word program ([`Exhaust::program`]): the place it computes and its
+/// operands' are indices among the places evaluated, operands before, and every value is kept
+/// masked to its node's width.
+#[derive(Clone, Copy)]
+struct Ins {
+    kind: Kind,
+    sh: u32,
+    dst: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    mask: u64,
+    k: u64,
+}
+
+/// Runs a word program at `width` points at once: `lanes` holds `width` words for each place
+/// (the inputs' and the fixed values' already set), and each instruction is one loop over its
+/// operands' lanes, its operator read once.
+fn run_lanes(prog: &[Ins], lanes: &mut [u64], width: usize) {
+    #[inline(always)]
+    fn one(v: &mut [u64], n: usize, d: u32, a: u32) -> (&mut [u64], &[u64]) {
+        let (lo, hi) = v.split_at_mut(d as usize * n);
+        (&mut hi[..n], &lo[a as usize * n..][..n])
     }
-    Some(prog)
-}
-
-/// Runs a word program over `vals` (the symbols' words already set).
-fn run64(prog: &[(Op64, u64)], vals: &mut [u64]) {
-    use crate::{BinOp, CmpOp};
-    let sext = |v: u64, w: u16| -> i64 {
-        let sh = 64 - u32::from(w);
+    #[inline(always)]
+    fn two(v: &mut [u64], n: usize, d: u32, a: u32, b: u32) -> (&mut [u64], &[u64], &[u64]) {
+        let (lo, hi) = v.split_at_mut(d as usize * n);
+        (
+            &mut hi[..n],
+            &lo[a as usize * n..][..n],
+            &lo[b as usize * n..][..n],
+        )
+    }
+    let sext = |v: u64, w: u32| -> i64 {
+        let sh = 64 - w;
         ((v << sh) as i64) >> sh
     };
-    for (idx, &(op, mask)) in prog.iter().enumerate() {
-        let w = 64 - mask.leading_zeros();
-        let v = match op {
-            Op64::Keep => continue,
-            Op64::Const(c) => c,
-            Op64::Not(a) => !vals[a],
-            Op64::Neg(a) => vals[a].wrapping_neg(),
-            Op64::Zext(a) => vals[a],
-            Op64::Sext(a, wa) => sext(vals[a], wa) as u64,
-            Op64::Extract(a, lo) => vals[a] >> lo,
-            Op64::Select(c, t, f) => {
-                if vals[c] & 1 == 1 {
-                    vals[t]
-                } else {
-                    vals[f]
+    for i in prog {
+        let (m, k, sh) = (i.mask, i.k, i.sh);
+        let w = 64 - m.leading_zeros();
+        macro_rules! un {
+            (|$x:ident| $e:expr) => {{
+                let (o, a) = one(lanes, width, i.dst, i.a);
+                for (o, &$x) in o.iter_mut().zip(a) {
+                    *o = ($e) & m;
                 }
-            }
-            Op64::Concat(hi, lo, wl) => {
-                if wl >= 64 {
-                    vals[lo]
-                } else {
-                    (vals[hi] << wl) | vals[lo]
+            }};
+        }
+        macro_rules! bin {
+            (|$x:ident, $y:ident| $e:expr) => {{
+                let (o, a, b) = two(lanes, width, i.dst, i.a, i.b);
+                for ((o, &$x), &$y) in o.iter_mut().zip(a).zip(b) {
+                    *o = ($e) & m;
                 }
-            }
-            Op64::Cmp(c, a, b, wa) => {
-                let (x, y) = (vals[a], vals[b]);
-                u64::from(match c {
-                    CmpOp::Eq => x == y,
-                    CmpOp::Ne => x != y,
-                    CmpOp::Ult => x < y,
-                    CmpOp::Ule => x <= y,
-                    CmpOp::Slt => sext(x, wa) < sext(y, wa),
-                    CmpOp::Sle => sext(x, wa) <= sext(y, wa),
+            }};
+        }
+        match i.kind {
+            Kind::Add => bin!(|x, y| x.wrapping_add(y)),
+            Kind::Sub => bin!(|x, y| x.wrapping_sub(y)),
+            Kind::Mul => bin!(|x, y| x.wrapping_mul(y)),
+            Kind::And => bin!(|x, y| x & y),
+            Kind::Or => bin!(|x, y| x | y),
+            Kind::Xor => bin!(|x, y| x ^ y),
+            Kind::Shl => bin!(|x, y| if y >= u64::from(w) { 0 } else { x << y }),
+            Kind::LShr => bin!(|x, y| if y >= u64::from(w) { 0 } else { x >> y }),
+            Kind::AShr => bin!(|x, y| (sext(x, w) >> y.min(u64::from(w) - 1)) as u64),
+            Kind::RotL | Kind::RotR => {
+                let right = matches!(i.kind, Kind::RotR);
+                bin!(|x, y| {
+                    let by = (y % u64::from(w)) as u32;
+                    let by = if right { (w - by) % w } else { by };
+                    if by == 0 {
+                        x
+                    } else {
+                        (x << by) | (x >> (w - by))
+                    }
                 })
             }
-            Op64::Bin(b, a, c) => {
-                let (x, y) = (vals[a], vals[c]);
-                match b {
-                    BinOp::Add => x.wrapping_add(y),
-                    BinOp::Sub => x.wrapping_sub(y),
-                    BinOp::Mul => x.wrapping_mul(y),
-                    BinOp::And => x & y,
-                    BinOp::Or => x | y,
-                    BinOp::Xor => x ^ y,
-                    BinOp::Shl => {
-                        if y >= u64::from(w) {
-                            0
-                        } else {
-                            x << y
-                        }
-                    }
-                    BinOp::LShr => {
-                        if y >= u64::from(w) {
-                            0
-                        } else {
-                            x >> y
-                        }
-                    }
-                    BinOp::RotL | BinOp::RotR if w > 0 => {
-                        let by = (y % u64::from(w)) as u32;
-                        let by = if b == BinOp::RotR { (w - by) % w } else { by };
-                        if by == 0 {
-                            x
-                        } else {
-                            (x << by) | (x >> (w - by))
-                        }
-                    }
-                    _ => {
-                        let s = sext(x, w as u16);
-                        (s >> y.min(u64::from(w) - 1)) as u64
-                    }
+            Kind::AddK => un!(|x| x.wrapping_add(k)),
+            Kind::RSubK => un!(|x| k.wrapping_sub(x)),
+            Kind::MulK => un!(|x| x.wrapping_mul(k)),
+            Kind::AndK => un!(|x| x & k),
+            Kind::OrK => un!(|x| x | k),
+            Kind::XorK => un!(|x| x ^ k),
+            Kind::ShlK => un!(|x| x << sh),
+            Kind::LShrK => un!(|x| x >> sh),
+            Kind::AShrK => un!(|x| (sext(x, w) >> sh) as u64),
+            Kind::RotK => un!(|x| (x << sh) | (x >> (w - sh))),
+            Kind::Not => un!(|x| !x),
+            Kind::Neg => un!(|x| x.wrapping_neg()),
+            Kind::Sext => un!(|x| sext(x, sh) as u64),
+            Kind::Extract => un!(|x| x >> sh),
+            Kind::Eq => bin!(|x, y| u64::from(x == y)),
+            Kind::Ne => bin!(|x, y| u64::from(x != y)),
+            Kind::Ult => bin!(|x, y| u64::from(x < y)),
+            Kind::Ule => bin!(|x, y| u64::from(x <= y)),
+            Kind::Slt => bin!(|x, y| u64::from(sext(x, sh) < sext(y, sh))),
+            Kind::Sle => bin!(|x, y| u64::from(sext(x, sh) <= sext(y, sh))),
+            Kind::EqK => un!(|x| u64::from(x == k)),
+            Kind::NeK => un!(|x| u64::from(x != k)),
+            Kind::Concat => bin!(|x, y| (x << sh) | y),
+            Kind::Select => {
+                let (lo, hi) = lanes.split_at_mut(i.dst as usize * width);
+                let o = &mut hi[..width];
+                let c = &lo[i.a as usize * width..][..width];
+                let t = &lo[i.b as usize * width..][..width];
+                let f = &lo[i.c as usize * width..][..width];
+                for (((o, &c), &t), &f) in o.iter_mut().zip(c).zip(t).zip(f) {
+                    let pick = (c & 1).wrapping_neg();
+                    *o = ((t & pick) | (f & !pick)) & m;
                 }
             }
-        };
-        vals[idx] = v & mask;
+        }
     }
 }
 
-/// Word-program evaluations ([`run64`]) charged as one generic node evaluation
+/// Word-program evaluations ([`run_lanes`]) charged as one generic node evaluation
 /// (`Context::eval_node`). On representative reconstructed addresses (44 and 71 nodes, 4,096
 /// points) a word program ran 4 to 38 times as fast as the generic evaluator, about 20 times
 /// typically; this charges the low end.
