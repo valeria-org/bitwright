@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.29.0
 
 - **A relation between two nodes is proved on the expression as written first.** The
   opaque-constant sweep proves a node equal to an earlier one plus a constant on their
