@@ -93,6 +93,9 @@ struct Demand {
     /// The identities found (a node unchanged under a mask), each with the range of `stops`
     /// its walk pushed: kept for the phase run once the step is done (see [`Same`]).
     identities: Vec<(Key, u32, u32)>,
+    /// Whether a sum was read as a xor (see [`carried`]): the result is then taken at the
+    /// same size too.
+    ties: bool,
 }
 
 impl Demand {
@@ -443,8 +446,23 @@ fn simplify(
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
             // a constant addend with none of the demanded bits goes (`63 - ~y`
             // is `y + 64`, which is `y` on the low six bits).
+            // A constant addend whose every carry on the prefix is known flips known bits of
+            // the other operand: a xor there (see `carried`).
+            let flipped = match (node.op, dropped_constant(cx, node.op, a, b, &p)) {
+                (OpCode::Mul, _) | (_, Some(_)) => None,
+                // Over the operand as it is written: the same on the prefix, and the xor is
+                // then one node for one (the operand read under the prefix is new nodes
+                // wherever a constant below it has another residue there).
+                _ => {
+                    let (ta, tb) = (
+                        if cx.const_val(a).is_some() { a } else { node.a },
+                        if cx.const_val(b).is_some() { b } else { node.b },
+                    );
+                    carried(r, cx, st, x, ta, tb, &p)?
+                }
+            };
             let ones = |j: u32| cx.const_val(j).is_some_and(|k| k.is_ones());
-            match dropped_constant(cx, node.op, a, b, &p) {
+            match dropped_constant(cx, node.op, a, b, &p).or(flipped) {
                 Some(t) => t,
                 // A factor that is −1 on the prefix (`0x3ffff` read by `& 0x1ffff`) negates.
                 None if node.op == OpCode::Mul && (ones(a) || ones(b)) => {
@@ -618,6 +636,85 @@ fn clears_known_zeros(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> Result<Op
     Ok(t.values.iter().all(|&v| v & cleared == 0).then_some(x))
 }
 
+/// `t ^ k'` when `a op b` (an `add` or `sub` of at most 64 bits) is `t` plus or minus a
+/// constant, or a constant less `t`, and on the prefix `p` every carry (or borrow) is known
+/// from the bits known of `t`: the result then differs from `t` in fixed bits there. An obfuscator writes `t ^ k'` as
+/// `t + k` over a `t` it knows bits of (`t + 0x7ff0` where bit 4 of `t` is set and bit 15
+/// clear is `t ^ 0x8010`), and a value written both ways is two unrelated atoms to the MBA
+/// phase. A carry is known where the constant's bit equals the carry in (it goes on
+/// whatever `t` has there) or `t`'s bit is known. Marks the simplification as one that
+/// commits at the same size: the xor is what `add_disjoint` and the masks keep, and nothing
+/// writes it back as a sum. `x` is the sum itself, which must have no other reader.
+fn carried(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Demand,
+    x: u32,
+    a: u32,
+    b: u32,
+    p: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let w = p.width();
+    if w.bits() > 64 {
+        return Ok(None);
+    }
+    let op = cx.node(x).op;
+    // `t + k`, or `k − t`: the same walk with a borrow.
+    let (t, k, from) = match (op, cx.const_val(a), cx.const_val(b)) {
+        (OpCode::Add, None, Some(k)) => (a, k, false),
+        (OpCode::Add, Some(k), None) => (b, k, false),
+        (OpCode::Sub, None, Some(k)) => (a, BitVec::un_unchecked(UnOp::Neg, &k), false),
+        (OpCode::Sub, Some(k), None) => (b, k, true),
+        _ => return Ok(None),
+    };
+    let (pw, kw) = (p.limbs()[0], k.limbs()[0]);
+    let (known, fin) = known_words(r, cx, t)?;
+    let Some([zero, one]) = known else {
+        return Ok(None);
+    };
+    let n = 64 - pw.leading_zeros();
+    let (mut carry, mut flips) = (false, 0u64);
+    for j in 0..n {
+        let bit = 1u64 << j;
+        let kj = kw & bit != 0;
+        // The sum's bit is `t ^ k ^ carry`, and so is the difference's with its borrow.
+        if kj != carry {
+            flips |= bit;
+        }
+        // A carry out is the constant's bit where the carry in is the same, else `t`'s bit;
+        // a borrow out is the borrow in where the constant's bit differs from it (none
+        // under a set bit, one under a clear bit that already owes), else `t`'s bit.
+        // (The last bit's goes nowhere.)
+        let settled = if from { kj != carry } else { kj == carry };
+        if !settled && j + 1 < n {
+            if (zero | one) & bit == 0 {
+                return Ok(None);
+            }
+            carry = one & bit != 0;
+        }
+    }
+    // A sum that changes nothing on the prefix is the dropped constant's case.
+    if flips & pw == 0 && !from {
+        return Ok(None);
+    }
+    // Only a sum this reader alone reads: one read under several masks is one value to all
+    // of them (`t + k` under `& 0xff` and under `& 0xffff` flips other bits of `t` under
+    // each, and what cancelled through the sum would be gone).
+    super::refresh_uses(r, cx)?;
+    if r.live.uses(x) != Some(1) || r.live_roots.contains(&x) {
+        return Ok(None);
+    }
+    st.fin = st.fin.and(fin);
+    st.ties = true;
+    // The operand is read as it is: a leaf of the result. So is the constant, which stands
+    // where the sum's did (the commit rule counts a new constant and no old one).
+    st.stops.push(t);
+    let kx = BitVec::from_canonical_u64(w, flips & pw);
+    let c = r.build(cx, |cx| cx.mk_const(&kx))?;
+    st.stops.push(c);
+    Ok(Some(r.build(cx, |cx| cx.c_bin(BinOp::Xor, t, c))?))
+}
+
 /// `t` when `a op b` (an `add` or `sub`) is `t` plus a constant with none of the
 /// bits of the prefix `p`; `k - ~t` is `t + (k + 1)`.
 fn dropped_constant(cx: &Context, op: OpCode, a: u32, b: u32, p: &BitVec) -> Option<u32> {
@@ -661,6 +758,7 @@ pub(super) fn reduced(
         root: x,
         xors: Vec::new(),
         identities: Vec::new(),
+        ties: false,
     };
     let out = simplify(r, cx, &mut st, x, &BitVec::ones(w));
     // What this simplification found is kept for the call's later ones, up to where the cap
@@ -738,6 +836,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         root: operand,
         xors: Vec::new(),
         identities: Vec::new(),
+        ties: false,
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
     // The operands this step found nothing to simplify under their masks are remembered for
@@ -784,5 +883,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         operand: cx.handle(operand),
         mask,
     });
-    finish(r, cx, PassKind::Demanded, n, e, before, &st.stops, fin)
+    let tie = st.ties;
+    super::finish_with(r, cx, PassKind::Demanded, n, e, before, &st.stops, fin, tie)
 }
