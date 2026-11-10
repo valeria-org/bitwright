@@ -1640,6 +1640,16 @@ pub mod mba {
     committed in 140 measured runs had taken more than a quarter. A question the solver ran
     out of steps on is not asked again in the run with no more of them, nor is a fragment
     that holds it. With nothing left a question is not asked, and the node is not final. (`docs/proposals/solver-budget.md` has the measurements.)
+    A node's own question also runs within 65,536 steps while the rounds have others to ask
+    (times eight in each round after one that changed nothing, up to the quarter): 570 of 601
+    answers committed in those runs took fewer, and the questions that take a quarter and
+    answer nothing are found among them in no order. One that ran out at that depth is
+    provisional, not out of budget; a fragment holding it waits with it. The round that asks
+    deeper walks the same root, so it runs without the sweeps and its finality replaces the
+    round's before it; where the strategy's rounds end still changing the root, one more
+    round asks at the full depth. (A first depth of 16,384 took partial answers in place of
+    whole-fragment ones and left ten of the 140 larger; deepening inside one phase run spent
+    the budget before the later rounds.)
   - *Memo.* The engine asks about nested fragments bottom-up, and asks some again as the DAG
     around them changes. The solver remembers its last `NfOptions::memo` answers (1,024 by
     default) by question and budget, keeping each question to compare on use (a hash

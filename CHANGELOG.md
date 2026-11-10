@@ -150,11 +150,11 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 8,924 nodes together
-(19,164), all 16 `valid_under` questions are proved (3) and every one of the 27 equalities is
-decided, 14 proved and 13 refuted (10 and 13, four out of budget). The questions also take
-less time than before these changes: 15% less CPU over the set run back to back, none of them
-a quarter of a second, the median 75 ms.
+folds with half of theirs), the 44 `forms_simplify` roots are left at 8,512 nodes together
+(19,164) and the five `simplify` roots at 733 (1,186), all 16 `valid_under` questions are
+proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
+13, four out of budget). The questions also take less time than before these changes: 18%
+less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
 
 - **A question narrower than its operands is read without its casts.** `trunc<32>(x ^ y) +
   2·trunc<32>(x & y) − trunc<32>(x) − trunc<32>(y)` over 64-bit `x` and `y` left the normal
@@ -232,6 +232,48 @@ a quarter of a second, the median 75 ms.
   every time: a root that is one constant where it holds and another where it does not looked
   like the first, and no proof of that exists. Each side is read at the same inputs with the
   condition put in, and the root becomes a `select` of the two, which the phases fold.
+- **Cheap questions first.** A node's own question to the solver takes 65,536 steps while
+  the rounds have other questions to ask, and its quarter of the call's steps only in a round
+  after one that changed nothing (over the same root, without the sweeps; or in one round
+  past the strategy's last where the rounds were still changing it). Of the answers committed
+  in the 140 questions, 570 of 601 took fewer steps than that; the questions the solver runs
+  out of steps on stand among them in no order, and a few of those, asked at the full share
+  where they stood, took a call's steps before the rest of it was asked anything. A question
+  cut short this way is not a budget running out: the root ends `Completed` when the deeper
+  round answers it.
+- **A sum too large to ask is taken apart first.** A sum with more variables than a question
+  takes was skipped, and its terms were then asked one at a time (in one measured call the
+  terms of one linear MBA were most of 33 declined questions that took 785,000 of its two
+  million steps). Such a sum is now read by its groups of terms before its operands are
+  walked, and a fragment too large to lower whole is asked with the arithmetic under its
+  bitwise operators as atoms (`Σ cᵢ·fᵢ(A, B, …)` over sums and products `A`, `B` is linear
+  over them).
+- **A factor is taken out of the terms that share it.** The factoring above needed every term
+  of the sum to have the factor. The terms with the factor most of them have are now written
+  as the factor times their sum without it, beside the rest: `y + (f·a)·t₁ − (f·b)·t₂`.
+- **Selects on one condition that read one value are split together.** `(v | k) + (v & k)` is
+  `v + k`, and with `v` a select and `v & k` written into its sides the two terms read two
+  selects no test relates. An operation over two selects on one condition whose sides read a
+  common value is `select(c, E1, E0)` when the MBA phase simplifies each side. A side, and a
+  fragment whose own answer was not smaller for what it shares, is asked also with the values
+  its nodes share through casts cut off (`(zext(t) | k) + zext(t & k)` is `zext(t) + k` over
+  `t`, where the whole question's answer writes `t` another way).
+- **An equality with an even multiple is an equality of low bits.** The invert pass solved
+  `x·c == k` for an odd `c`. With `c = 2^t·d` the product's low `t` bits are zero, so the
+  comparison is false when `k`'s are not, and otherwise it is `trunc<w−t>(x) == (k >> t)·d⁻¹`
+  (`x << t == k` likewise): `x·0x1a8bfbc8 == 392` at 32 bits is `trunc<29>(x) == 0xde0c079`.
+- **A comparison of some bits of a value is written over the value.** `(y | m) == k` reads the
+  bits of `y` outside `m` (and is false when `k` lacks a bit of `m`), and the bits of a slice
+  or a zero extension are bits of its operand: `(extract<lo, n>(x) | m) == k` and
+  `(extract<lo, n>(x) & c) == k` are `(x & c') == k'`, or `extract<lo', n'>(x) == k'` where
+  the bits are one run. A dispatcher compares one state with its cases through several
+  multipliers and several widths; with this and the entry above, a measured one of 265 nodes
+  whose seven-way tables each spelled their conditions differently is 199 nodes over the
+  same eight conditions on three bits of one value.
+- **A select under the opposite comparison keeps one side.** `select(a != b, x, select(a == b,
+  y, z))` is `select(a != b, x, y)`, and likewise in the chosen arm and under `==`
+  (`select_then_ne_eq`, `select_else_ne_eq`, `select_then_eq_ne`, `select_else_eq_ne`); only
+  the same condition repeated was read so.
 
 ## 0.27.0
 
