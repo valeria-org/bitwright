@@ -31,7 +31,7 @@ fn guarded_examples_are_reached_by_the_default_engine() {
             count += 1;
         }
     }
-    assert_eq!(count, 35);
+    assert_eq!(count, 37);
 }
 
 #[test]

@@ -202,6 +202,8 @@ core.guarded_recovery::split_mask_add 5d82cae63e20c5d7a97a08ac2977290f rule exha
 core.guarded_recovery::split_mask_increment c20405c68570202ee3a38ecaf47a2a14 rule exhaustive(inst=5,maxw=5,cases=37448,fired=1364) sampled(inst=22,cases=1408,fired=49)
 core.guarded_recovery::split_mask_or_or 3ebe1198631e1087ddabb16a6b70547c rule exhaustive(inst=4,maxw=4,cases=69904,fired=69904) sampled(inst=22,cases=1408,fired=1408)
 core.guarded_recovery::split_mask_sub b6194d1b7fc8b679a724698c0ade0002 rule exhaustive(inst=4,maxw=4,cases=69904,fired=4680) sampled(inst=22,cases=1408,fired=42)
+core.guarded_recovery::variable_shift_rotate_left d5ee66e67b2fdf085b2a5699e46138f1 rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=895)
+core.guarded_recovery::variable_shift_rotate_right 85485ccc688f35a25ba2e210a18d5308 rule exhaustive(inst=6,maxw=6,cases=5460,fired=642) sampled(inst=22,cases=1408,fired=898)
 core.guarded_recovery::xor_complement_mask 960927c6017b6c83bf53419b598bc6e7 rule exhaustive(inst=5,maxw=5,cases=37448,fired=1364) sampled(inst=22,cases=1408,fired=36)
 core.guarded_recovery::xor_zext_lowmask 2b2f0ea31c4fc44a521c08b0e23352ae rule exhaustive(inst=15,maxw=6,cases=114,fired=114) sampled(inst=361,cases=23104,fired=23104)
 core.guarded_recovery_canonical::sle_neg_zero 7ac0936c5fb77be524554960e952feb1 rule exhaustive(inst=6,maxw=6,cases=126,fired=120) sampled(inst=22,cases=1408,fired=1357)

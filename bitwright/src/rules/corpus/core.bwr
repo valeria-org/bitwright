@@ -814,6 +814,16 @@ group core.guarded_recovery {
         (x >>u a) | (x << b) => rotr(x, a)
         if (a <u W) && (b <u W) && (a + b == W)
     }
+    /// The two shifts of a rotation by a count below the width (at zero the left shift by
+    /// the whole width gives nothing, and the value is itself).
+    #[example("((p & 15) >>u (q & 7)) | ((p & 15) << (8 - (q & 7)))" => "rotr(p & 15, q & 7)")]
+    rule variable_shift_rotate_right<W>(x: W, s: W) {
+        (x >>u s) | (x << (W - s)) => rotr(x, s) if proves(s <u W)
+    }
+    #[example("((p & 15) << (q & 7)) | ((p & 15) >>u (8 - (q & 7)))" => "rotl(p & 15, q & 7)")]
+    rule variable_shift_rotate_left<W>(x: W, s: W) {
+        (x << s) | (x >>u (W - s)) => rotl(x, s) if proves(s <u W)
+    }
     #[example("zext<16>(p) ^ 255:16" => "zext<16>(~p)")]
     rule xor_zext_lowmask<W, U>(x: W) where W < U {
         zext<U>(x) ^ lowmask(W) => zext<U>(~x)

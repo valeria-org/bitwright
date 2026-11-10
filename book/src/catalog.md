@@ -1985,6 +1985,29 @@ rule complementary_shift_rotate<W>(x: W, a: const W, b: const W) {
 
 - `(p >>u 3) | (p << 5)` → `rotr(p, 3)`
 
+#### `variable_shift_rotate_right` — rule
+
+The two shifts of a rotation by a count below the width (at zero the left shift by
+the whole width gives nothing, and the value is itself).
+
+```text
+rule variable_shift_rotate_right<W>(x: W, s: W) {
+        (x >>u s) | (x << (W - s)) => rotr(x, s) if proves(s <u W)
+    }
+```
+
+- `((p & 15) >>u (q & 7)) | ((p & 15) << (8 - (q & 7)))` → `rotr(p & 15, q & 7)`
+
+#### `variable_shift_rotate_left` — rule
+
+```text
+rule variable_shift_rotate_left<W>(x: W, s: W) {
+        (x << s) | (x >>u (W - s)) => rotl(x, s) if proves(s <u W)
+    }
+```
+
+- `((p & 15) << (q & 7)) | ((p & 15) >>u (8 - (q & 7)))` → `rotl(p & 15, q & 7)`
+
 #### `xor_zext_lowmask` — rule
 
 ```text

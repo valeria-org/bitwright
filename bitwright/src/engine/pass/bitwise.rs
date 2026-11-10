@@ -1048,6 +1048,118 @@ fn write(
 /// The most nodes of a bitwise tree [`hoist_cast`] reads.
 const HOIST_NODES: usize = 64;
 
+/// The low bits of values as a sum of multiples of the low bits of atoms, modulo a power of
+/// two (see [`low_form`]).
+#[derive(Default)]
+struct Low {
+    konst: u64,
+    terms: Vec<(u32, u64)>,
+}
+
+/// The most nodes [`low_form`] reads for one sum.
+const LOW_NODES: usize = 64;
+
+/// Adds `k` times the low `bits` bits of node `i` to `out`, modulo `2^bits` (at most 63):
+/// through sums, products and left shifts by constants, and through truncations, extensions
+/// and masks that keep those bits; anything else is an atom. `false` past [`LOW_NODES`].
+fn low_form(cx: &Context, i: u32, k: u64, bits: u16, out: &mut Low) -> bool {
+    let m = (1u64 << bits) - 1;
+    let mut todo = vec![(i, k & m)];
+    let mut seen = 0usize;
+    while let Some((i, k)) = todo.pop() {
+        seen += 1;
+        if seen > LOW_NODES {
+            return false;
+        }
+        if k == 0 {
+            continue;
+        }
+        let n = cx.node(i);
+        let low = |c: u32| {
+            cx.const_val(c)
+                .map(|v| v.limbs().first().copied().unwrap_or(0) & m)
+        };
+        let keeps = |x: u32| cx.wid(x) >= bits;
+        match n.op {
+            OpCode::Const => {
+                out.konst = out.konst.wrapping_add(k.wrapping_mul(low(i).unwrap_or(0))) & m
+            }
+            OpCode::Add => todo.extend([(n.a, k), (n.b, k)]),
+            OpCode::Sub => todo.extend([(n.a, k), (n.b, k.wrapping_neg() & m)]),
+            OpCode::Neg => todo.push((n.a, k.wrapping_neg() & m)),
+            OpCode::Mul if low(n.b).is_some() => {
+                todo.push((n.a, k.wrapping_mul(low(n.b).unwrap_or(0)) & m))
+            }
+            OpCode::Mul if low(n.a).is_some() => {
+                todo.push((n.b, k.wrapping_mul(low(n.a).unwrap_or(0)) & m))
+            }
+            OpCode::Shl
+                if cx
+                    .const_val(n.b)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|s| s < 64) =>
+            {
+                let s = cx.const_val(n.b).and_then(|v| v.to_u64()).unwrap_or(0);
+                todo.push((n.a, (k << s) & m));
+            }
+            OpCode::Extract if n.b == 0 => todo.push((n.a, k)),
+            OpCode::Zext | OpCode::Sext if keeps(n.a) => todo.push((n.a, k)),
+            OpCode::And if low(n.b) == Some(m) => todo.push((n.a, k)),
+            OpCode::And if low(n.a) == Some(m) => todo.push((n.b, k)),
+            _ => match out.terms.iter_mut().find(|t| t.0 == i) {
+                Some(t) => t.1 = t.1.wrapping_add(k) & m,
+                None => out.terms.push((i, k)),
+            },
+        }
+    }
+    true
+}
+
+/// `x << a | x >>u b` (or joined by `^`: the halves share no bit) with counts below the width
+/// whose sum is the width or nothing: `rotl(x, a)`. The counts are compared at the width's
+/// logarithm as sums of multiples of what they are made of ([`low_form`]), so two spellings
+/// of one count meet (`trunc<6>(u·83)` and `trunc<6>(u·109)`, extended, at 64 bits: `u·192`
+/// has no low six bits). Constant counts are a rule's.
+fn rotation(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let w = node.width;
+    if !matches!(node.op, OpCode::Or | OpCode::Xor) || !w.is_power_of_two() || w < 2 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let (l, s) = match (cx.node(node.a).op, cx.node(node.b).op) {
+        (OpCode::Shl, OpCode::LShr) => (cx.node(node.a), cx.node(node.b)),
+        (OpCode::LShr, OpCode::Shl) => (cx.node(node.b), cx.node(node.a)),
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    let (x, a, b) = (l.a, l.b, s.b);
+    if s.a != x || cx.const_val(a).is_some() || cx.const_val(b).is_some() {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    r.meter.charge(Counter::PassWork, 1)?;
+    // Both counts below the width.
+    let bits = w.trailing_zeros() as u16;
+    let mut fin = Fin::FINAL;
+    for count in [a, b] {
+        let (f, g) = super::facts(r, cx, count)?;
+        fin = fin.and(g);
+        let below = f.is_some_and(|f| (bits..w).all(|i| f.known.known_zero().bit(i) == Some(true)));
+        if !below {
+            return Ok(Step::Normal(fin));
+        }
+    }
+    // And their sum nothing at the low bits.
+    let mut sum = Low::default();
+    if !(low_form(cx, a, 1, bits, &mut sum) && low_form(cx, b, 1, bits, &mut sum))
+        || sum.konst != 0
+        || sum.terms.iter().any(|&(_, k)| k != 0)
+    {
+        return Ok(Step::Normal(fin));
+    }
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| cx.c_bin(BinOp::RotL, x, a))?;
+    finish(r, cx, PassKind::Bitwise, n, e, before, &[x, a], fin)
+}
+
 /// A bitwise tree (`& | ^ ~`) whose leaves are extensions of one kind from one width `W`, and
 /// constants, is the extension of the tree over the operands: `zext(a) & ~zext(b)` is
 /// `zext(a & ~b)`, `~zext(a) & lowmask(W)` is `zext(~a)`, `sext(a) | sext(b)` is `sext(a | b)`.
@@ -1206,6 +1318,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         return Ok(Step::Normal(Fin::FINAL));
     }
     if let done @ Step::To(..) = hoist_cast(r, cx, n)? {
+        return Ok(done);
+    }
+    if let done @ Step::To(..) = rotation(r, cx, n)? {
         return Ok(done);
     }
     let Some((atoms, tt)) = info_of(r, cx, n)? else {

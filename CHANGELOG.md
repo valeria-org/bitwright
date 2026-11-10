@@ -150,8 +150,8 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 7,478 nodes together
-(19,164) and the five `simplify` roots at 702 (1,186), all 16 `valid_under` questions are
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,468 nodes together
+(19,164) and the five `simplify` roots at 658 (1,186), all 16 `valid_under` questions are
 proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
 13, four out of budget). The questions also take less time than before these changes: 18%
 less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
@@ -289,6 +289,12 @@ less CPU over the set run back to back, none of them a quarter of a second, the 
   (`zext_and_zext`, `zext_and_not_zext`), and a slice and the low bit of one value, extended
   and concatenated back where they were, are the value under a mask
   (`concat_slice_and_bit_in_place`).
+- **Rotations by a variable count.** `(x << s) | (x >>u (W − s))` with `s` proved below the
+  width is `rotl(x, s)` (`variable_shift_rotate_left`, and `_right`): at zero the shift by the
+  whole width gives nothing. And where the two counts are spelled apart, `x << a | x >>u b` is
+  `rotl(x, a)` when both are below the width and the low bits of `a + b` are zero as a sum of
+  multiples of what the counts are made of (`trunc<6>(u·83)` and `trunc<6>(u·109)`, extended,
+  at 64 bits: `u·192` has no low six bits).
 - **Two complements around a slice are none.** `~extract<k, n>(~x)` is `extract<k, n>(x)`
   (`not_extract_not`, `not_trunc_not`), and a select on a bit of a complement is the select
   on the bit with its sides swapped (`select_bit_of_not`, `select_low_bit_of_not`). (Moving
