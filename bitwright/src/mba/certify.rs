@@ -1248,29 +1248,41 @@ fn constant_pool(ms: &[&MbaExpr]) -> Vec<BitVec> {
             _ => None,
         })
         .collect();
-    consts.sort();
-    consts.dedup();
-    // The first `POOL` distinct values in this order: later constants cannot change them, so
-    // the walk ends when the pool is full (with many constants it was quadratic in all of
-    // them, for entries that were then cut off).
+    // The first `POOL` distinct values, the constants taken in increasing order: later
+    // constants cannot change them, so the walk ends when the pool is full (with many
+    // constants it was quadratic in all of them, for entries that were then cut off). A
+    // constant met twice adds nothing the second time, and few constants are needed, so they
+    // are put in order a stretch at a time: the smallest `STRETCH` of those left, sorted.
     const POOL: usize = 32;
+    const STRETCH: usize = 16;
     let mut pool: Vec<BitVec> = Vec::with_capacity(POOL);
-    'fill: for c in consts {
-        let one = BitVec::one(c.width());
-        for v in [
-            c,
-            BitVec::bin_unchecked(BinOp::Add, &c, &one),
-            BitVec::bin_unchecked(BinOp::Sub, &c, &one),
-            BitVec::un_unchecked(UnOp::Neg, &c),
-            BitVec::un_unchecked(UnOp::Not, &c),
-        ] {
-            if !pool.contains(&v) {
-                pool.push(v);
-                if pool.len() == POOL {
-                    break 'fill;
+    let mut held: HashMap<BitVec, ()> = HashMap::with_capacity_and_hasher(2 * POOL, Default::default());
+    let mut rest: &mut [BitVec] = &mut consts;
+    'fill: while !rest.is_empty() {
+        let k = rest.len().min(STRETCH);
+        if k < rest.len() {
+            rest.select_nth_unstable(k - 1);
+        }
+        let (stretch, later) = std::mem::take(&mut rest).split_at_mut(k);
+        stretch.sort_unstable();
+        for c in stretch.iter() {
+            let one = BitVec::one(c.width());
+            for v in [
+                *c,
+                BitVec::bin_unchecked(BinOp::Add, c, &one),
+                BitVec::bin_unchecked(BinOp::Sub, c, &one),
+                BitVec::un_unchecked(UnOp::Neg, c),
+                BitVec::un_unchecked(UnOp::Not, c),
+            ] {
+                if held.insert(v, ()).is_none() {
+                    pool.push(v);
+                    if pool.len() == POOL {
+                        break 'fill;
+                    }
                 }
             }
         }
+        rest = later;
     }
     pool
 }
