@@ -1616,12 +1616,16 @@ pub mod mba {
     A question's time is bounded by its budget: a step costs 230 to 930 instructions on
     average (40 to 100 ns), and one question's steps up to 30 times that on generated inputs,
     so tens to hundreds of milliseconds at the default `2^20`. In the engine a call runs within
-    the least of `MbaBudget::steps` and what is left of the run's `Budget::mba_steps` (4 per
-    unit of fuel, 2^24 by default; a step costs about as much as two to three units of pass
-    work), and is charged the steps it spent (`MbaSolver::solve_counted`; a remembered answer
-    the steps finding it cost, so a charge never depends on the solver's memory; a solver that
-    does not count is charged its limit). With nothing left a question is not asked, and the
-    node is not final. (`docs/proposals/solver-budget.md` has the measurements.)
+    the least of `MbaBudget::steps`, a quarter of the run's `Budget::mba_steps` (4 per unit of
+    fuel, 2^24 by default; never less than 2^16; a step costs about as much as two to three
+    units of pass work) and what is left of them, and is charged the steps it spent
+    (`MbaSolver::solve_counted`; a remembered answer the steps finding it cost, so a charge
+    never depends on the solver's memory; a solver that does not count is charged its limit).
+    The quarter keeps one question from taking a small run whole: at the solver's own limit a
+    question that ran out took half of a two-million-step run, and none of the answers
+    committed in 140 measured runs had taken more than a quarter. A question the solver ran
+    out of steps on is not asked again in the run with no more of them, nor is a fragment
+    that holds it. With nothing left a question is not asked, and the node is not final. (`docs/proposals/solver-budget.md` has the measurements.)
   - *Memo.* The engine asks about nested fragments bottom-up, and asks some again as the DAG
     around them changes. The solver remembers its last `NfOptions::memo` answers (1,024 by
     default) by question and budget, keeping each question to compare on use (a hash
