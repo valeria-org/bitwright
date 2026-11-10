@@ -44,6 +44,16 @@
   products of one value is a question about that value when read whole: costly, declined,
   and every sum holding it was then not asked at all. Such a fragment is now asked with the
   arithmetic under its bitwise operators as atoms, within the steps of a retried question.
+- **Values of one or two words take a short path.** A `BitVec` holds eight limbs whatever
+  its width, and equality, the hash, `is_zero`, `is_ones`, the conversions and the
+  constructors read or wrote all eight: for the 64-bit values of a measured set, a tenth of
+  the time. They read the active limbs now (one word at 64 bits and below); a slice, a
+  concatenation and a sign extension within 128 bits are native; the internal hasher takes a
+  small field in one round; and three buffers that grew a push at a time are sized once (a
+  question's scan, its lowered form, and a node's samples, whose operands are looked up once
+  a node, not once a point). 140 measured calls take 3 to 5% less time with the same results.
+  The layout is unchanged (values up to 512 bits stay `Copy`); a `BitVec`'s hash is that of
+  its width and active limbs, no longer the derived one.
 
 ## 0.28.0
 

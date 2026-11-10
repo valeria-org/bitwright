@@ -49,6 +49,16 @@ impl Hasher for IdHasher {
     fn write(&mut self, bytes: &[u8]) {
         self.0 = self::bytes(self.0, bytes);
     }
+    // (A key's small fields are a word each, as its indices are: through `write` a byte or a
+    // 16-bit field was two rounds of the mixer, its length and then its value.)
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.0 = combine(self.0, u64::from(i));
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = combine(self.0, u64::from(i));
+    }
     #[inline]
     fn write_u32(&mut self, i: u32) {
         self.0 = combine(self.0, u64::from(i));

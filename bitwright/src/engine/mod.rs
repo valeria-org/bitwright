@@ -2233,18 +2233,32 @@ impl Runner<'_, '_> {
                 let v = point_value(seed, w, k);
                 declared.map_or(v, |d| d.fit(&v))
             };
-            let vals: Result<Vec<BitVec>, Error> = (0..points)
-                .map(|k| cx.eval_node(i, |j| samples[&j][k], |_, w| Some(point(w, k))))
-                .collect();
-            match vals {
-                Ok(v) => {
-                    samples.insert(i, v.into_boxed_slice());
-                }
-                Err(e) => {
-                    out = Err(Stop::Error(e));
-                    break;
+            // The operands' samples, looked up once for the node (not once per point), and
+            // the node's in a vector of its final size.
+            let mut kids: [(u32, &[BitVec]); 3] = [(u32::MAX, &[]); 3];
+            for (slot, c) in cx.node(i).children().enumerate() {
+                kids[slot] = (c, &samples[&c]);
+            }
+            let at = |j: u32, k: usize| match kids.iter().find(|(c, _)| *c == j) {
+                Some((_, vals)) => vals[k],
+                None => samples[&j][k],
+            };
+            let mut vals: Vec<BitVec> = Vec::with_capacity(points);
+            let mut failed = None;
+            for k in 0..points {
+                match cx.eval_node(i, |j| at(j, k), |_, w| Some(point(w, k))) {
+                    Ok(v) => vals.push(v),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
                 }
             }
+            if let Some(e) = failed {
+                out = Err(Stop::Error(e));
+                break;
+            }
+            samples.insert(i, vals.into_boxed_slice());
         }
         self.samples = samples;
         out

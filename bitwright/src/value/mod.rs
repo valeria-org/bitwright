@@ -90,10 +90,44 @@ impl TryFrom<u16> for Width {
 }
 
 /// An exact `W`-bit value, `W` in `1..=512`.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone)]
 pub struct BitVec {
     width: Width,
     limbs: Limbs,
+}
+
+// A value's limbs above its width are zero (its canonical form), so equality and the hash read
+// the active ones only: one word for the widths most values have, where the derived ones read
+// all eight (a tenth of a measured run's time went to comparing, hashing, building and testing
+// values a limb at a time).
+impl PartialEq for BitVec {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.width != other.width {
+            return false;
+        }
+        if self.width.bits() <= 64 {
+            self.limbs[0] == other.limbs[0]
+        } else {
+            self.limbs() == other.limbs()
+        }
+    }
+}
+
+impl Eq for BitVec {}
+
+impl core::hash::Hash for BitVec {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        state.write_u16(self.width.bits());
+        if self.width.bits() <= 64 {
+            state.write_u64(self.limbs[0]);
+        } else {
+            for &l in self.limbs() {
+                state.write_u64(l);
+            }
+        }
+    }
 }
 
 impl BitVec {
@@ -117,10 +151,11 @@ impl BitVec {
 
     #[inline]
     fn from_u128_masked(width: Width, v: u128) -> Self {
+        // (At 128 bits and above, the two limbs are the value as it is.)
+        let v = v & narrow::mask(width.bits());
         let mut limbs = [0; MAX_LIMBS];
         limbs[0] = v as u64;
         limbs[1] = (v >> 64) as u64;
-        mask_top(&mut limbs, width.bits());
         BitVec { width, limbs }
     }
 
@@ -139,6 +174,9 @@ impl BitVec {
 
     /// All ones (`-1` as a signed value).
     pub fn ones(width: Width) -> Self {
+        if width.bits() <= 128 {
+            return Self::from_u128_masked(width, u128::MAX);
+        }
         BitVec {
             width,
             limbs: wide::ones(width.bits()),
@@ -202,6 +240,9 @@ impl BitVec {
 
     /// `v` in two's complement, sign-extended or truncated to `width` bits.
     pub fn wrapping_from_i128(width: Width, v: i128) -> Self {
+        if width.bits() <= 128 {
+            return Self::from_u128_masked(width, v as u128);
+        }
         let fill = if v < 0 { u64::MAX } else { 0 };
         let mut limbs = [fill; MAX_LIMBS];
         limbs[0] = v as u64;
@@ -258,12 +299,15 @@ impl BitVec {
 
     /// The unsigned value, if it fits in a `u64`.
     pub fn to_u64(&self) -> Option<u64> {
+        if self.width.bits() <= 64 {
+            return Some(self.limbs[0]);
+        }
         self.to_u128().and_then(|v| u64::try_from(v).ok())
     }
 
     /// The unsigned value, if it fits in a `u128`.
     pub fn to_u128(&self) -> Option<u128> {
-        if self.limbs[2..].iter().any(|&x| x != 0) {
+        if self.width.bits() > 128 && self.limbs[2..].iter().any(|&x| x != 0) {
             return None;
         }
         Some(u128::from(self.limbs[0]) | (u128::from(self.limbs[1]) << 64))
@@ -303,12 +347,19 @@ impl BitVec {
 
     /// Whether the value is zero.
     pub fn is_zero(&self) -> bool {
+        if self.width.bits() <= 64 {
+            return self.limbs[0] == 0;
+        }
         wide::is_zero(&self.limbs)
     }
 
     /// Whether every bit is set.
     pub fn is_ones(&self) -> bool {
-        self.limbs == wide::ones(self.width.bits())
+        let w = self.width.bits();
+        if w <= 128 {
+            return self.low_u128() == narrow::mask(w);
+        }
+        self.limbs == wide::ones(w)
     }
 
     // ----- operators ----------------------------------------------------------------------
@@ -380,6 +431,10 @@ impl BitVec {
     /// Sign extension to `to`, which must be at least as wide (equal width is the identity).
     pub fn sext(&self, to: Width) -> Result<BitVec, WidthError> {
         self.check_widen(to)?;
+        if to.bits() <= 128 {
+            let v = narrow::signed(self.low_u128(), self.width.bits());
+            return Ok(Self::from_u128_masked(to, v as u128));
+        }
         Ok(BitVec {
             width: to,
             limbs: wide::sext(&self.limbs, self.width.bits(), to.bits()),
@@ -411,6 +466,9 @@ impl BitVec {
                 len: len.bits(),
             });
         }
+        if w <= 128 {
+            return Ok(Self::from_u128_masked(len, self.low_u128() >> lo));
+        }
         Ok(BitVec {
             width: len,
             limbs: wide::extract(&self.limbs, lo, len.bits()),
@@ -427,6 +485,10 @@ impl BitVec {
                 hi: hi.width.bits(),
                 lo: lo.width.bits(),
             })?;
+        if total <= 128 {
+            let v = (hi.low_u128() << lo.width.bits()) | lo.low_u128();
+            return Ok(Self::from_u128_masked(width, v));
+        }
         Ok(BitVec {
             width,
             limbs: wide::concat(&hi.limbs, &lo.limbs, lo.width.bits()),
