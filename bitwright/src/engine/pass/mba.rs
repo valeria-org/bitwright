@@ -182,6 +182,7 @@ fn sweep_inner(
     root: u32,
     fold_cases: bool,
 ) -> Result<u32, Stop> {
+    let tq_walk = std::time::Instant::now();
     // The DAG below `root`, operands first.
     let mut order: Vec<u32> = Vec::new();
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
@@ -200,7 +201,11 @@ fn sweep_inner(
         }
     }
     r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    tmp_time("SW.order", tq_walk);
+    let tq_walk = std::time::Instant::now();
     r.sample(cx, root)?;
+    tmp_time("SW.sample", tq_walk);
+    let tq_walk = std::time::Instant::now();
     // links of a chain of sums, every user of which is a sum too: a noise block is
     // asked about only at the top of its chain (see `sweep_cut`).
     let mut links: crate::hash::IdMap<u32, bool> = crate::hash::IdMap::default();
@@ -211,6 +216,7 @@ fn sweep_inner(
             *all &= additive;
         }
     }
+    tmp_time("SW.links", tq_walk);
     // Each node rebuilt over its operands' results (the constructors fold what constants make
     // trivial: `t & 0`, a product with zero), then asked about.
     let mut to: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
@@ -651,6 +657,12 @@ impl Classes {
         if !Self::kept(vals) || vals.iter().all(|v| *v == vals[0]) {
             return;
         }
+        let tq = std::time::Instant::now();
+        self.note_inner(vals, i);
+        tmp_time("SW.classes.note", tq);
+    }
+
+    fn note_inner(&mut self, vals: &[crate::BitVec], i: u32) {
         let class = self
             .sums
             .entry(Self::key(vals, BinOp::Sub, false))
@@ -668,6 +680,13 @@ impl Classes {
     /// then the first met a constant from it, the first met whose sum with it is constant, the
     /// first met a constant xored from it.
     fn find(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
+        let tq = std::time::Instant::now();
+        let out = self.find_inner(vals);
+        tmp_time("SW.classes.find", tq);
+        out
+    }
+
+    fn find_inner(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
         use crate::BitVec;
         let mut found = Vec::new();
         if !Self::kept(vals) {
@@ -2397,9 +2416,9 @@ fn held_points(r: &mut Runner<'_, '_>, cx: &Context, points: usize) -> Result<Ve
     let Some(a) = r.assumptions else {
         return Ok(vec![true; points]);
     };
-    let all = a
-        .constraints()
-        .fold(Reliance::NONE, |rel, (id, _, _)| rel.union(Reliance::of(id)));
+    let all = a.constraints().fold(Reliance::NONE, |rel, (id, _, _)| {
+        rel.union(Reliance::of(id))
+    });
     r.constraints_hold(cx, all, points)
 }
 
