@@ -746,12 +746,16 @@ impl<'a> Render<'a> {
 
     /// The bit from which every conjunction of the atoms in `set` is zero, if one of them is
     /// a zero extension (its operand's width).
-    fn zero_from(&self, set: u64) -> Option<u16> {
-        (0..64u32)
-            .filter(|&a| set >> a & 1 == 1)
-            .filter_map(|a| self.narrow.get(a as usize).copied().flatten())
-            .map(|(_, n)| n.bits())
-            .min()
+    fn zero_from(&self, mut set: u64) -> Option<u16> {
+        let mut from: Option<u16> = None;
+        while set != 0 {
+            let a = set.trailing_zeros() as usize;
+            if let Some((_, n)) = self.narrow.get(a).copied().flatten() {
+                from = Some(from.map_or(n.bits(), |f| f.min(n.bits())));
+            }
+            set &= set - 1;
+        }
+        from
     }
 
     /// Renders an atom's definition: with the decompositions a peel's rest gets (no groups,
@@ -1770,7 +1774,9 @@ impl<'a> Render<'a> {
         if self.hopeless(p.atoms()) || !self.spend(p.len() as u64 * self.classes.len() as u64) {
             return out;
         }
-        let plain = Bits::from_linear(&p.expand_full(self.classes), self.classes);
+        // The form over masked symbols alone: for this test, and for the decompositions below.
+        let expanded = p.expand_full(self.classes);
+        let plain = Bits::from_linear(&expanded, self.classes);
         if let Some(f) = &plain {
             for n in self.bits(f) {
                 out.push(Sum {
@@ -1835,13 +1841,13 @@ impl<'a> Render<'a> {
             }
         }
         if n > 1
-            && let Some(s) = self.affine_bits(p)
+            && let Some(s) = self.affine_bits(p, &expanded)
         {
             out.push(s);
         }
-        out.extend(self.scaled_bits(p, plain.is_some()));
+        out.extend(self.scaled_bits(&expanded, plain.is_some()));
         out.extend(self.two_terms(p));
-        out.extend(self.sign_extensions(p));
+        out.extend(self.sign_extensions(p, &expanded));
         if top && self.peeling == 0 {
             out.extend(self.split_off(p));
         }
@@ -1867,14 +1873,16 @@ impl<'a> Render<'a> {
     /// `sext(trunc(2·Z))`): `Z[lo] − Z[j]` over `Z = zext(a)` of `j + 1` bits is `sext(a)`
     /// (`decast` writes `sext(a)` as `(Z ^ 2^j) − 2^j`, which the classes read that way). The
     /// rest of the form is rendered as usual; one candidate, with the extensions added.
-    fn sign_extensions(&mut self, p: &Poly) -> Vec<Sum> {
+    ///
+    /// `expanded` is `p` over masked symbols alone ([`Poly::expand_full`]).
+    fn sign_extensions(&mut self, p: &Poly, expanded: &Poly) -> Vec<Sum> {
         let w = self.w;
         let wb = u32::from(w.bits());
         let n = self.classes.len();
         if self.signing || n < 2 || p.degree() > 1 || !self.spend(p.len() as u64 * n as u64) {
             return Vec::new();
         }
-        let mut rest = p.expand_full(self.classes);
+        let mut rest = expanded.clone();
         let single = |m: &Mono| -> Option<Sym> {
             match m.as_slice() {
                 [(sym, 1)] if sym.class != FULL => Some(*sym),
@@ -2074,7 +2082,9 @@ impl<'a> Render<'a> {
     /// atom, for at most three atoms with such terms. Each choice is checked on the tables'
     /// corner sums before anything is built. For example `2·(x & ~4) + (p & ~4) −
     /// (x & p & ~4) + (x & p & 4) + 4` is `x + ((x ^ 4) | p)`.
-    fn affine_bits(&mut self, p: &Poly) -> Option<Sum> {
+    ///
+    /// `q` is `p` over masked symbols alone ([`Poly::expand_full`]).
+    fn affine_bits(&mut self, p: &Poly, q: &Poly) -> Option<Sum> {
         let w = self.w;
         let n = self.classes.len();
         let single = |m: &Mono| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() == 1);
@@ -2084,7 +2094,6 @@ impl<'a> Render<'a> {
         {
             return None;
         }
-        let q = p.expand_full(self.classes);
         let prec = |c: usize| u32::from(w.bits()) - u32::from(self.classes.low(c));
         let atoms = q.atoms();
         let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
@@ -2281,10 +2290,11 @@ impl<'a> Render<'a> {
     /// `(x ^ k)·1111`, and `k + (x & ~3) − 2·(x & k & ~3)` is `(x & ~3) ^ k` even when no
     /// bitwise operand has `k`'s bits. `plain` says the form is itself a bitwise function
     /// (then `s = 1` is not tried again).
-    fn scaled_bits(&mut self, p: &Poly, plain: bool) -> Vec<Sum> {
+    ///
+    /// `q` is the form over masked symbols alone ([`Poly::expand_full`]).
+    fn scaled_bits(&mut self, q: &Poly, plain: bool) -> Vec<Sum> {
         let w = self.w;
         let n = self.classes.len();
-        let q = p.expand_full(self.classes);
         let atoms = q.atoms();
         if atoms == 0 || atoms.count_ones() > 5 || !self.spend(q.len() as u64 + n as u64) {
             return Vec::new();
@@ -4002,8 +4012,18 @@ impl<'a> Render<'a> {
             .filter(|&&q| !d[q].is_zero())
             .fold(0u32, |m, &q| m | 1 << q);
         for tt in 0..1u32 << (1 << s) {
-            let table = [u64::from(tt)];
-            let a = mobius(&table, s);
+            // The table's Möbius coefficients (at most eight entries: no vector).
+            let mut a = [0i64; 8];
+            for (p, slot) in a.iter_mut().enumerate().take(1 << s) {
+                *slot = i64::from(tt >> p & 1);
+            }
+            for b in 0..s {
+                for p in 0..1usize << s {
+                    if p >> b & 1 == 1 {
+                        a[p] -= a[p ^ 1 << b];
+                    }
+                }
+            }
             let present = wide
                 .iter()
                 .filter(|&&q| a[q] != 0)
