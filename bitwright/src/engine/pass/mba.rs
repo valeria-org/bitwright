@@ -8,7 +8,8 @@ use crate::hash::combine;
 use crate::mba::certify;
 use crate::mba::{
     Bindings, CacheEntry, CacheKey, Claim, LOWERING_VERSION, MOp, MbaAnswer, MbaConfig, MbaExpr,
-    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_over, lower_id_reading, shared_nodes,
+    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_over, lower_id_reading, lower_id_whole,
+    shared_nodes,
 };
 use crate::{BinOp, UnOp};
 
@@ -2556,9 +2557,19 @@ fn readings_prove(
             cuts.into_iter()
                 .flat_map(|c| [Some(Reading::Cut(c)), Some(Reading::CutWhole(c))]),
         );
+    // A fragment that is semi-linear as it is has one lowering for the whole and the
+    // semi-linear reading, and one per cut.
+    let mut semi = false;
     for reading in all {
         let tl = std::time::Instant::now();
-        let lowered = lower_id_over(cx, subject, &cfg.limits, reading, open);
+        let lowered = match reading {
+            None => lower_id_whole(cx, subject, &cfg.limits, open).map(|(m, bindings, s)| {
+                semi = s;
+                (m, bindings)
+            }),
+            Some(Reading::SemiLinear | Reading::CutWhole(_)) if semi => continue,
+            _ => lower_id_over(cx, subject, &cfg.limits, reading, open),
+        };
         let kind = match reading {
             None => 0,
             Some(Reading::SemiLinear) => 1,

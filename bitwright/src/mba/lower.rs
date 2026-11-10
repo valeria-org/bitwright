@@ -360,6 +360,25 @@ pub(crate) fn lower_id_over(
     build(cx, atoms, order, &solved)
 }
 
+/// [`lower_id_over`] with no reading, and whether the fragment is semi-linear as it is (every
+/// node of it one [`Reading::SemiLinear`] takes): the semi-linear reading is then this one, and
+/// each cut of the whole fragment is the semi-linear cut at the same node, so a caller that
+/// has this need not lower those.
+pub(crate) fn lower_id_whole(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    opaque: &IdMap<u32, ()>,
+) -> Result<(MbaExpr, Bindings, bool), Refusal> {
+    let free = |i: u32| i == root || !opaque.contains_key(&i);
+    let (atoms, order) = scan_in(cx, root, lim, &|cx, i| free(i) && in_fragment(cx, i))?;
+    let semi = order
+        .iter()
+        .all(|&i| in_reading(cx, i, Reading::SemiLinear));
+    let (m, bindings) = build(cx, atoms, order, &[])?;
+    Ok((m, bindings, semi))
+}
+
 /// Node `a` as `t + k` or (`true`) `k − t`, `k` a constant: `t`, `k`, and which. The negated
 /// operand may be written `−t` or `t · −1`.
 fn offset(cx: &Context, a: u32) -> Option<(u32, BitVec, bool)> {
