@@ -150,7 +150,7 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 9,209 nodes together
+folds with half of theirs), the 44 `forms_simplify` roots are left at 8,924 nodes together
 (19,164), all 16 `valid_under` questions are proved (3) and every one of the 27 equalities is
 decided, 14 proved and 13 refuted (10 and 13, four out of budget). The questions also take
 less time than before these changes: 15% less CPU over the set run back to back, none of them
@@ -200,7 +200,9 @@ a quarter of a second, the median 75 ms.
   products by constants and shifts, and through `& | ^` where each bit of an operand is a
   constant, a variable bit or its complement; two forms are one function exactly when they
   are the same, so the comparison decides (with an input where they differ), and it runs
-  before the tests that evaluate points.
+  before the tests that evaluate points. A form with carries under a constant mask is read
+  by the mask's fields where its low bits are a form too (`(x & m)·c & −256`: the product's
+  low byte depends on the few bits of `x` the mask keeps there).
 - **One leaf under masks is a symbol to the symbolic comparison.** A bitwise function of one
   leaf and constants is `f(0)` plus the leaf under the bits it sets less the leaf under the
   bits it clears, whatever spelled it: `m − (~t & m)` and `t & m` are one polynomial. A

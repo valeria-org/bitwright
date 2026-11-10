@@ -1619,6 +1619,80 @@ impl BitLinear {
     }
 }
 
+/// The most variable bits [`BitLinear::low`] takes the residues of a form over.
+const LOW_BITS: usize = 10;
+
+/// The most runs of ones [`BitLinear::masked`] takes a mask apart into.
+const MASK_RUNS: usize = 8;
+
+impl BitLinear {
+    /// The form's value modulo `2^n` (its low `n` bits) as a form, when it is one: the
+    /// multiples that are not 0 modulo `2^n` belong to at most [`LOW_BITS`] variable bits,
+    /// and over every value of those the residue is a constant plus one term for each (no
+    /// carry out of the low bits that depends on two of them at once). A product of a masked
+    /// value by a constant has such a residue wherever the mask keeps few low bits.
+    fn low(&self, n: usize, wn: usize, ones: u64) -> Option<BitLinear> {
+        if n >= wn {
+            return Some(self.clone());
+        }
+        let m = (1u64 << n) - 1;
+        let at: Vec<usize> = (0..self.d.len()).filter(|&i| self.d[i] & m != 0).collect();
+        if at.len() > LOW_BITS {
+            return None;
+        }
+        let base = self.k & m;
+        let each: Vec<u64> = at
+            .iter()
+            .map(|&i| (self.k.wrapping_add(self.d[i]) & m).wrapping_sub(base) & ones)
+            .collect();
+        for set in 0u32..1 << at.len() {
+            let (mut sum, mut form) = (self.k, base);
+            for (j, &i) in at.iter().enumerate() {
+                if set >> j & 1 == 1 {
+                    sum = sum.wrapping_add(self.d[i]);
+                    form = form.wrapping_add(each[j]);
+                }
+            }
+            if sum & m != form & ones {
+                return None;
+            }
+        }
+        let mut out = BitLinear {
+            k: base,
+            d: vec![0; self.d.len()],
+        };
+        for (j, &i) in at.iter().enumerate() {
+            out.d[i] = each[j];
+        }
+        Some(out)
+    }
+
+    /// The form under the constant mask `c`, as a form: for each run of ones `[a, b)` of the
+    /// mask, the low `b` bits less the low `a` bits (see [`low`](BitLinear::low)).
+    fn masked(&self, c: u64, wn: usize, ones: u64) -> Option<BitLinear> {
+        let mut out = BitLinear {
+            k: 0,
+            d: vec![0; self.d.len()],
+        };
+        let (mut left, mut runs) = (c & ones, 0);
+        while left != 0 {
+            runs += 1;
+            if runs > MASK_RUNS {
+                return None;
+            }
+            let a = left.trailing_zeros() as usize;
+            let b = a + (left >> a).trailing_ones() as usize;
+            let (hi, lo) = (self.low(b, wn, ones)?, self.low(a, wn, ones)?);
+            out.k = out.k.wrapping_add(hi.k).wrapping_sub(lo.k) & ones;
+            for (o, (h, l)) in out.d.iter_mut().zip(hi.d.iter().zip(&lo.d)) {
+                *o = o.wrapping_add(*h).wrapping_sub(*l) & ones;
+            }
+            left = if b >= 64 { 0 } else { left >> b << b };
+        }
+        Some(out)
+    }
+}
+
 impl BitAffine {
     fn linear(&self, bits: usize, ones: u64) -> BitLinear {
         let mut out = BitLinear {
@@ -1649,7 +1723,9 @@ impl BitAffine {
 /// such a form whatever it is. `& | ^` and a right shift take operands every bit of which is a
 /// constant, a variable bit or its complement (a form that sets or clears one bit for each
 /// variable bit it reads, with no carry), and give one: two bits over the same variable bit
-/// combine to it, its complement or a constant. Two forms are the same function exactly when
+/// combine to it, its complement or a constant. A form with carries under `& | ^` with a
+/// constant is read by the mask's fields, where its low bits are a form (a product by a
+/// constant with its low byte masked off: `(x & m)·c & −256`). Two forms are the same function exactly when
 /// their constants and multiples are the same (at zero, and at each single variable bit), so
 /// the comparison decides, at 64 bits or fewer and up to [`LINEAR_BITS`] bits of variables.
 /// One unit of work per node read and 16 variable bits, where it decides.
@@ -1747,7 +1823,30 @@ fn bit_linear<M: Meter>(
                     Some(out.linear(bits, ones))
                 }
                 MOp::And | MOp::Or | MOp::Xor => {
-                    let (x, y) = (arg(0)?.affine(ones)?, arg(1)?.affine(ones)?);
+                    let (fx, fy) = (arg(0)?, arg(1)?);
+                    let (Some(x), Some(y)) = (fx.affine(ones), fy.affine(ones)) else {
+                        // A form with carries, under a constant: its fields (see `masked`).
+                        let (l, c) = match (konst(fx), konst(fy)) {
+                            (None, Some(c)) => (fx, c),
+                            (Some(c), None) => (fy, c),
+                            _ => return None,
+                        };
+                        let m = l.masked(c, wn, ones)?;
+                        let k = BitLinear {
+                            k: c,
+                            d: vec![0; bits],
+                        };
+                        return Some(match n.op {
+                            MOp::And => m,
+                            // `x | c` is `x − (x & c) + c`; `x ^ c` is `x + c − 2·(x & c)`.
+                            MOp::Or => zip(&zip(l, &m, u64::wrapping_sub), &k, u64::wrapping_add),
+                            _ => zip(
+                                &zip(l, &k, u64::wrapping_add),
+                                &scale(&m, 2),
+                                u64::wrapping_sub,
+                            ),
+                        });
+                    };
                     let mut out = BitAffine {
                         alpha: 0,
                         has: 0,
