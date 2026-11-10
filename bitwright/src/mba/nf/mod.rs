@@ -1376,7 +1376,8 @@ fn live(p: &MbaExpr) -> Vec<bool> {
 /// Per node: a representative among structurally equal nodes (commutative operands in either
 /// order), and the number of distinct live nodes.
 fn canonical(p: &MbaExpr, live: &[bool]) -> (Vec<u32>, u32) {
-    let mut intern: HashMap<MNode, u32> = HashMap::new();
+    let mut intern: crate::hash::IdMap<MNode, u32> = crate::hash::IdMap::default();
+    intern.reserve(p.nodes().len());
     let mut canon = Vec::with_capacity(p.nodes().len());
     let mut distinct = 0;
     for (i, n) in p.nodes().iter().enumerate() {
@@ -1425,7 +1426,8 @@ fn canonical(p: &MbaExpr, live: &[bool]) -> (Vec<u32>, u32) {
 /// The input subterm at `i`, copied as it is.
 fn verbatim(p: &MbaExpr, i: u32) -> Option<MbaExpr> {
     let mut b = Builder::new(p.vars().to_vec());
-    let mut map: HashMap<u32, u32> = HashMap::new();
+    // Per node below `i` that it uses: its node in the builder.
+    let mut map: Vec<u32> = vec![0; i as usize + 1];
     let nodes = p.nodes();
     // The nodes below i, operands first.
     let mut need = vec![false; i as usize + 1];
@@ -1443,7 +1445,7 @@ fn verbatim(p: &MbaExpr, i: u32) -> Option<MbaExpr> {
             continue;
         }
         let n = &nodes[j];
-        let arg = |k: usize| map[&n.args[k]];
+        let arg = |k: usize| map[n.args[k] as usize];
         let id = match n.op {
             MOp::Const(v) => b.konst(&v),
             MOp::Var(v) => b.var(v),
@@ -1451,9 +1453,9 @@ fn verbatim(p: &MbaExpr, i: u32) -> Option<MbaExpr> {
             op if op.arity() == 1 => b.un(op, arg(0)),
             op => b.bin(op, arg(0), arg(1)),
         };
-        map.insert(j as u32, id);
+        map[j] = id;
     }
-    b.finish(map[&i])
+    b.finish(map[i as usize])
 }
 
 /// A question's normal form, ready to render.

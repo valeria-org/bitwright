@@ -6,7 +6,7 @@ use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
 /// An operator of the MBA fragment.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MOp {
     /// A constant.
@@ -64,10 +64,53 @@ impl MOp {
     fn bitwise(&self) -> bool {
         matches!(self, MOp::And | MOp::Or | MOp::Xor)
     }
+
+    /// The operator's number (its place among the operators), and a variable's index or a
+    /// shift's amount.
+    fn tag(&self) -> (u8, u32) {
+        match *self {
+            MOp::Const(_) => (0, 0),
+            MOp::Var(i) => (1, i),
+            MOp::Add => (2, 0),
+            MOp::Sub => (3, 0),
+            MOp::Mul => (4, 0),
+            MOp::Neg => (5, 0),
+            MOp::And => (6, 0),
+            MOp::Or => (7, 0),
+            MOp::Xor => (8, 0),
+            MOp::Not => (9, 0),
+            MOp::Shl(k) => (10, u32::from(k)),
+            MOp::LShr(k) => (11, u32::from(k)),
+            MOp::Zext => (12, 0),
+            MOp::Sext => (13, 0),
+            MOp::Trunc => (14, 0),
+        }
+    }
+
+    /// Hashes the operator with `more` (under 2^24) in one word; a constant's width and limbs
+    /// after it.
+    fn hash_with<H: Hasher>(&self, more: u64, state: &mut H) {
+        let (tag, extra) = self.tag();
+        state.write_u64(u64::from(tag) | more << 8 | u64::from(extra) << 32);
+        if let MOp::Const(v) = self {
+            state.write_u16(v.width().bits());
+            for &l in v.limbs() {
+                state.write_u64(l);
+            }
+        }
+    }
+}
+
+/// Hashed as one word (and a constant's limbs): operators and nodes key the maps that intern
+/// them in every pass over an expression. This is not the content hash ([`MbaExpr::key`]).
+impl Hash for MOp {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash_with(0, state);
+    }
 }
 
 /// A node: operator, result width, operand indices (earlier nodes).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MNode {
     /// The operator.
@@ -76,6 +119,14 @@ pub struct MNode {
     pub width: Width,
     /// Operand node indices (unused ones are 0).
     pub args: [u32; 2],
+}
+
+/// Hashed as two words (and a constant's limbs), see [`MOp`]'s.
+impl Hash for MNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.op.hash_with(u64::from(self.width.bits()), state);
+        state.write_u64(u64::from(self.args[0]) | u64::from(self.args[1]) << 32);
+    }
 }
 
 /// Why a node could not be added.
@@ -122,10 +173,37 @@ impl PartialEq for MbaExpr {
 impl Eq for MbaExpr {}
 
 impl Hash for MbaExpr {
-    // The derived hash's: the variables, then the nodes.
+    // The variables, then the nodes.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.vars.hash(state);
         self.nodes.hash(state);
+    }
+}
+
+/// The limbs of a value in the key's stream: every limb of the widest value.
+const KEY_LIMBS: usize = Width::W512.bits() as usize / 64;
+
+/// The two running words of [`MbaExpr::key`], each byte of the stream folded into both.
+struct KeyHasher(u64, u64);
+
+impl KeyHasher {
+    fn new() -> KeyHasher {
+        KeyHasher(0x6d62_615f_6578_7072, 0x6269_7477_7269_6768)
+    }
+
+    #[inline]
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = crate::hash::combine(self.0, u64::from(b));
+            self.1 = crate::hash::combine(self.1 ^ 0x5555, u64::from(b).rotate_left(29));
+        }
+    }
+
+    /// A length or an operator's number: a `usize` in the stream, as the derived hashes
+    /// wrote it.
+    #[inline]
+    fn word(&mut self, x: u64) {
+        self.bytes(&(x as usize).to_ne_bytes());
     }
 }
 
@@ -289,20 +367,38 @@ impl MbaExpr {
     }
 
     fn key_uncached(&self) -> [u64; 2] {
-        struct H(u64, u64);
-        impl Hasher for H {
-            fn finish(&self) -> u64 {
-                self.0
-            }
-            fn write(&mut self, bytes: &[u8]) {
-                for &b in bytes {
-                    self.0 = crate::hash::combine(self.0, u64::from(b));
-                    self.1 = crate::hash::combine(self.1 ^ 0x5555, u64::from(b).rotate_left(29));
-                }
-            }
+        // The key is a hash of a fixed stream of bytes: the one `#[derive(Hash)]` gave for the
+        // variables and then the nodes when the key was defined (lengths and operator numbers
+        // as `usize`, a constant's every limb), written out here so that the key does not
+        // follow how nodes hash for maps. Keys seed samples and name cache entries: the
+        // stream must not change.
+        let mut h = KeyHasher::new();
+        h.word(self.vars.len() as u64);
+        for w in &self.vars {
+            h.bytes(&w.bits().to_ne_bytes());
         }
-        let mut h = H(0x6d62_615f_6578_7072, 0x6269_7477_7269_6768);
-        self.hash(&mut h);
+        h.word(self.nodes.len() as u64);
+        for n in &self.nodes {
+            let (tag, extra) = n.op.tag();
+            h.word(u64::from(tag));
+            match n.op {
+                MOp::Const(v) => {
+                    h.bytes(&v.width().bits().to_ne_bytes());
+                    h.word(KEY_LIMBS as u64);
+                    let limbs = v.limbs();
+                    for i in 0..KEY_LIMBS {
+                        h.bytes(&limbs.get(i).copied().unwrap_or(0).to_ne_bytes());
+                    }
+                }
+                MOp::Var(_) => h.bytes(&extra.to_ne_bytes()),
+                MOp::Shl(_) | MOp::LShr(_) => h.bytes(&(extra as u16).to_ne_bytes()),
+                _ => {}
+            }
+            h.bytes(&n.width.bits().to_ne_bytes());
+            h.word(n.args.len() as u64);
+            h.bytes(&n.args[0].to_ne_bytes());
+            h.bytes(&n.args[1].to_ne_bytes());
+        }
         [h.0, h.1]
     }
 
@@ -420,5 +516,126 @@ impl MbaExpr {
                 self.eval(&vals)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The operators and a node as they were when the key was defined, with the derived
+    /// hashes whose stream the key is.
+    #[allow(dead_code)]
+    #[derive(Hash)]
+    enum KeyOp {
+        Const(BitVec),
+        Var(u32),
+        Add,
+        Sub,
+        Mul,
+        Neg,
+        And,
+        Or,
+        Xor,
+        Not,
+        Shl(u16),
+        LShr(u16),
+        Zext,
+        Sext,
+        Trunc,
+    }
+
+    #[derive(Hash)]
+    struct KeyNode {
+        op: KeyOp,
+        width: Width,
+        args: [u32; 2],
+    }
+
+    impl Hasher for KeyHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.bytes(bytes);
+        }
+    }
+
+    fn derived_key(m: &MbaExpr) -> [u64; 2] {
+        let nodes: Vec<KeyNode> = m
+            .nodes()
+            .iter()
+            .map(|n| KeyNode {
+                op: match n.op {
+                    MOp::Const(v) => KeyOp::Const(v),
+                    MOp::Var(i) => KeyOp::Var(i),
+                    MOp::Add => KeyOp::Add,
+                    MOp::Sub => KeyOp::Sub,
+                    MOp::Mul => KeyOp::Mul,
+                    MOp::Neg => KeyOp::Neg,
+                    MOp::And => KeyOp::And,
+                    MOp::Or => KeyOp::Or,
+                    MOp::Xor => KeyOp::Xor,
+                    MOp::Not => KeyOp::Not,
+                    MOp::Shl(k) => KeyOp::Shl(k),
+                    MOp::LShr(k) => KeyOp::LShr(k),
+                    MOp::Zext => KeyOp::Zext,
+                    MOp::Sext => KeyOp::Sext,
+                    MOp::Trunc => KeyOp::Trunc,
+                },
+                width: n.width,
+                args: n.args,
+            })
+            .collect();
+        let mut h = KeyHasher::new();
+        m.vars().to_vec().hash(&mut h);
+        nodes.hash(&mut h);
+        [h.0, h.1]
+    }
+
+    #[test]
+    fn the_key_is_the_derived_hash_of_variables_and_nodes() {
+        for bits in [1u16, 7, 8, 32, 64, 65, 128, 200, 512] {
+            let w = Width::new(bits).unwrap();
+            let narrow = Width::new(bits.div_ceil(2)).unwrap();
+            let mut m = MbaExpr::new(vec![w, narrow, w]);
+            assert_eq!(m.key(), derived_key(&m));
+            let x = m.push(MOp::Var(0), &[]).unwrap();
+            let z = m.push(MOp::Var(2), &[]).unwrap();
+            let k = m.push(MOp::Const(BitVec::ones(w)), &[]).unwrap();
+            let one = m.push(MOp::Const(BitVec::one(w)), &[]).unwrap();
+            let mut last = x;
+            for op in [MOp::Add, MOp::Sub, MOp::Mul, MOp::And, MOp::Or, MOp::Xor] {
+                last = m.push(op, &[last, z]).unwrap();
+                last = m.push(op, &[k, last]).unwrap();
+                assert_eq!(m.key(), derived_key(&m));
+            }
+            for op in [MOp::Neg, MOp::Not, MOp::Shl(0), MOp::LShr(bits - 1)] {
+                last = m.push(op, &[last]).unwrap();
+            }
+            last = m.push(MOp::Add, &[last, one]).unwrap();
+            if narrow != w {
+                let y = m.push(MOp::Var(1), &[]).unwrap();
+                let t = m.push_cast(MOp::Trunc, last, narrow).unwrap();
+                let u = m.push(MOp::Xor, &[t, y]).unwrap();
+                let s = m.push_cast(MOp::Sext, u, w).unwrap();
+                let e = m.push_cast(MOp::Zext, y, w).unwrap();
+                m.push(MOp::Or, &[s, e]).unwrap();
+            }
+            assert_eq!(m.key(), derived_key(&m), "at {bits} bits");
+        }
+        // Equal nodes hash alike for maps, whatever the map's hasher.
+        let w = Width::W64;
+        let mut m = MbaExpr::new(vec![w]);
+        let x = m.push(MOp::Var(0), &[]).unwrap();
+        let a = m.push(MOp::Shl(3), &[x]).unwrap();
+        let b = m.push(MOp::Shl(3), &[x]).unwrap();
+        let hash = |n: &MNode| {
+            let mut h = KeyHasher::new();
+            n.hash(&mut h);
+            [h.0, h.1]
+        };
+        assert_eq!(hash(&m.nodes()[a as usize]), hash(&m.nodes()[b as usize]));
+        assert_ne!(hash(&m.nodes()[a as usize]), hash(&m.nodes()[x as usize]));
     }
 }
