@@ -2628,7 +2628,6 @@ impl Engine {
             }
         }
         let spent = runner.meter.spent;
-        pass::mba::tmp_time_dump();
         if let Some(a) = allowance {
             a.spend(&spent);
         }
@@ -2713,16 +2712,12 @@ impl Runner<'_, '_> {
                 Err(stop) => return Err((cur, fin, stop)),
             }
         }
-        let t0 = std::time::Instant::now();
         let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
-        pass::mba::tmp_time("T.sweep0", t0);
         if swept != cur {
             fin = fin.and(Fin::relying(self.assumed()));
             cur = swept;
         }
-        let t0 = std::time::Instant::now();
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-        pass::mba::tmp_time("T.cases0", t0);
         self.rounds(cx, cur, fin)
     }
 
@@ -2826,16 +2821,12 @@ impl Runner<'_, '_> {
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             if round > 0 {
-                let t0 = std::time::Instant::now();
                 let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
                 if swept != cur {
                     fin = fin.and(Fin::relying(self.assumed()));
                     cur = swept;
                 }
-                pass::mba::tmp_time("T.resweep", t0);
-                let t0 = std::time::Instant::now();
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-                pass::mba::tmp_time("T.recases", t0);
             }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
@@ -2848,9 +2839,7 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
-                let t0 = std::time::Instant::now();
                 let ran = self.local(cx, phase, cur);
-                pass::mba::tmp_time(p.name(), t0);
                 match ran {
                     Ok((r, f)) => {
                         cur = r;

@@ -158,9 +158,7 @@ fn scan_in(
     lim: &MbaLimits,
     in_fragment: &dyn Fn(&Context, u32) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
-    let tq = std::time::Instant::now();
     let out = scan_in0(cx, root, lim, in_fragment);
-    crate::mba::certify::tmp_time("lo.scan", tq);
     out
 }
 
@@ -311,9 +309,7 @@ pub(crate) fn lower_id_over(
     };
     let under = match reading {
         Reading::Shallow => {
-            let tq = std::time::Instant::now();
             let u = under_bitwise(cx, root, lim, opaque);
-            crate::mba::certify::tmp_time("lo.under", tq);
             Some(u?)
         }
         _ => None,
@@ -502,9 +498,7 @@ fn build(
     order: Vec<u32>,
     solved: &[Solved],
 ) -> Result<(MbaExpr, Bindings), Refusal> {
-    let tq = std::time::Instant::now();
     let out = build0(cx, atoms, order, solved);
-    crate::mba::certify::tmp_time("lo.build", tq);
     out
 }
 
