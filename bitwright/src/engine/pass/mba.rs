@@ -307,7 +307,7 @@ fn sweep_inner(
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
             // A node the samples relate to one met before it (see `related`).
-            let found = match unrelated < tmp_unrel() && !tmp_off("BW_NO_RELATED") {
+            let found = match unrelated < SWEEP_UNRELATED && !tmp_off("BW_NO_RELATED") {
                 true => classes.find(vals),
                 false => Vec::new(),
             };
@@ -329,14 +329,18 @@ fn sweep_inner(
                 let rep0 = rep;
                 // An operand of this node was asked to be related to `rep` and no proof was
                 // found: this one, built on it, is not asked.
-                if tainted.contains(&rep0) && !tmp_off("BW_NO_TAINT") {
+                if tainted.contains(&rep0) {
                     unrelated += 1;
                     break;
                 }
                 let rep = to.get(&rep).copied().unwrap_or(rep);
                 let t0 = std::time::Instant::now();
                 let st0 = r.meter.spent.mba_steps;
-                let got = asked!('nodes, "related", related(r, cx, cfg, cur, rep, relation, &d));
+                let got = asked!(
+                    'nodes,
+                    "related",
+                    related(r, cx, cfg, cur, rep, relation, &d)
+                );
                 let is_t = tainted.contains(&rep0);
                 if tmp_off("BW_PROF6") && !matches!(got, Related::Written) {
                     let sig = |r: &Runner<'_, '_>, j: u32| {
@@ -598,20 +602,6 @@ pub(crate) fn tmp_time_dump() {
     }
 }
 
-fn tmp_unrel() -> usize {
-    thread_local! {
-        static V: usize = std::env::var("BW_UNREL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(SWEEP_UNRELATED);
-    }
-    V.with(|v| *v)
-}
-
-fn tmp_rel_share() -> u64 {
-    thread_local! {
-        static V: u64 = std::env::var("BW_REL_SHARE").ok().and_then(|v| v.parse::<u32>().ok()).map_or(SWEEP_SHARE, |b| 1u64 << b);
-    }
-    V.with(|v| *v)
-}
-
 pub(crate) fn tmp_off(name: &str) -> bool {
     std::env::var_os(name).is_some()
 }
@@ -806,7 +796,7 @@ fn related(
     }
     tmp_time("rel.build", t0);
     let t0 = std::time::Instant::now();
-    let whole_sums = relation != Relation::Xor || tmp_off("BW_XOR_WHOLE");
+    let whole_sums = relation != Relation::Xor;
     let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS, whole_sums)?;
     tmp_time("rel.reduced", t0);
     if let Some(v) = cx.const_val(subject) {
@@ -819,24 +809,6 @@ fn related(
             t0,
         );
         return Ok(proved(v));
-    }
-    if let Ok(want) = std::env::var("BW_DUMPSIG") {
-        r.sample(cx, cur)?;
-        let sig = r.samples.get(&cur).map_or(0u64, |v| {
-            v.iter().fold(0u64, |h, x| {
-                crate::hash::combine(h, x.to_u64().unwrap_or(0))
-            })
-        });
-        if format!("{sig:016x}") == want {
-            let o = crate::PrintOptions::default()
-                .with_max_nodes(usize::MAX)
-                .with_max_chars(usize::MAX)
-                .with_symbol_widths(true);
-            eprintln!(
-                "DUMPSIG subject:\n{}\n",
-                cx.display_with(cx.handle(subject), o)
-            );
-        }
     }
     let t0 = std::time::Instant::now();
     let exh = exhaustive(r, cx, subject, &zero)?;
@@ -859,7 +831,7 @@ fn related(
     }
     let t0 = std::time::Instant::now();
     TMP_REL.with(|c| c.set(true));
-    let asked = readings_prove(r, cx, cfg, subject, &zero, tmp_rel_share());
+    let asked = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE);
     TMP_REL.with(|c| c.set(false));
     let (decided, _, _) = asked?;
     tmp_time(
@@ -874,66 +846,7 @@ fn related(
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
     }
-    if std::env::var_os("BW_PROF5").is_some() {
-        let hit = tmp_random_refute(cx, diff, 3000);
-        eprintln!("OPENCHK cur={cur} rep={rep} rel={relation:?} refuted_at={hit:?}");
-    }
     Ok(Related::Open)
-}
-
-/// TEMP: the first of `tries` structured random inputs at which `n` is not zero.
-fn tmp_random_refute(cx: &Context, n: u32, tries: u64) -> Option<u64> {
-    let mut order: Vec<u32> = Vec::new();
-    let mut seen: crate::hash::IdMap<u32, usize> = crate::hash::IdMap::default();
-    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
-    while let Some((i, expanded)) = stack.pop() {
-        if expanded {
-            seen.insert(i, order.len());
-            order.push(i);
-            continue;
-        }
-        if seen.contains_key(&i) {
-            continue;
-        }
-        seen.insert(i, usize::MAX);
-        stack.push((i, true));
-        for c in cx.node(i).children() {
-            if !seen.contains_key(&c) {
-                stack.push((c, false));
-            }
-        }
-    }
-    let mut vals: Vec<crate::BitVec> = vec![crate::BitVec::zero(crate::Width::W1); order.len()];
-    for t in 0..tries {
-        for (idx, &i) in order.iter().enumerate() {
-            let seed = cx.meta[i as usize].shash;
-            let declared = cx.declared_at(i);
-            let v = cx.eval_node(
-                i,
-                |j| vals[seen[&j]],
-                |_, w| {
-                    let v = crate::engine::point_value(seed, w, 1000 + t as usize);
-                    // structure: every third point keeps a low field, every third a high one
-                    let bits = u32::from(w.bits());
-                    let keep = 1 + (t as u32 / 3) % bits.max(1);
-                    let v = match t % 3 {
-                        0 => v,
-                        1 => crate::facts::known::bv_lshr(&v, bits - keep),
-                        _ => crate::facts::known::bv_shl(&v, bits - keep),
-                    };
-                    Some(declared.map_or(v, |d| d.fit(&v)))
-                },
-            );
-            match v {
-                Ok(v) => vals[idx] = v,
-                Err(_) => return None,
-            }
-        }
-        if !vals[seen[&n]].is_zero() {
-            return Some(t);
-        }
-    }
-    None
 }
 
 /// The related pairs a sweep asks about without a proof before it asks about no more.
