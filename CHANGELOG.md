@@ -11,7 +11,13 @@
   ones the readings could not find took their whole share. The difference as written is now
   read first, within an eighth of that share. A question asked with an eighth of the usual
   fuel went from 312 nodes to 80 in half the time, and the 44 `forms_simplify` questions of
-  the same set take a third less time (13% less CPU over the 140).
+  the same set take a third less time (13% less CPU over the 140; the 16 proofs of that set
+  take a tenth more, their relations being the ones the reduction proves).
+- **The MBA phase leaves the sweep a part of the solver's steps.** Where the opaque-constant
+  sweep runs, the phase's questions stop a sixteenth of the call's steps short. What a round
+  leaves is often a sum the sweep's certificates decide in a few hundred steps, and the
+  solver's last questions of the round had taken every step: the question above stops at 42
+  nodes with the part kept.
 
 ## 0.28.0
 

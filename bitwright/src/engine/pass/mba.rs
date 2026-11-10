@@ -3453,6 +3453,13 @@ const SOLVE_SHARE: u64 = 4;
 /// See [`SOLVE_SHARE`].
 const SOLVE_SHARE_MIN: u64 = 1 << 16;
 
+/// The part of a call's solver steps the MBA phase's questions leave to the sweep that runs
+/// after the round: one in this many. What a round leaves is often a sum the sweep's
+/// certificates decide in a few hundred steps (one value under masks, the constant it adds up
+/// to), where the solver's last questions of the round had taken every step: a call asked
+/// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
+const SWEEP_RESERVE: u64 = 16;
+
 /// The solver steps from which a fragment with no simpler form is kept from the questions
 /// above it (see [`holds_kept`]).
 const KEPT_STEPS: u64 = 1 << 12;
@@ -3578,7 +3585,14 @@ fn ask(
                         Cap::Steps(s) => (s, false),
                         Cap::Depth(s) => (s, s < full),
                     };
-                    let limit = full.min(steps).min(r.meter.left_in(|b| b.mba_steps));
+                    // (Where a sweep runs after the round, the phase leaves it a part of
+                    // the call's steps, see `SWEEP_RESERVE`.)
+                    let reserve = match cfg.opaque_sweep || cfg.noise_forms || cfg.known_atoms {
+                        true => r.meter.limit.mba_steps / SWEEP_RESERVE,
+                        false => 0,
+                    };
+                    let left = r.meter.left_in(|b| b.mba_steps).saturating_sub(reserve);
+                    let limit = full.min(steps).min(left);
                     // Whether a deeper round asks this question with more steps than it has
                     // here: running out of these is not the call's budget running out.
                     let shallow = deepens && limit == steps;
