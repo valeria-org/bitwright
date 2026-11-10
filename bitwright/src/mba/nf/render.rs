@@ -8,6 +8,7 @@ use crate::hash::IdMap;
 
 use super::bits::{self, Bits, anf, mobius, table8};
 use super::classes::{Classes, FULL};
+use super::index::Index;
 use super::poly::{Mono, Poly, Sym};
 use super::synth;
 use crate::engine::pass::bitwise::{T, min_forms, subtables};
@@ -25,9 +26,10 @@ struct BNode {
     args: [u32; 2],
 }
 
-/// Hashed as one word and a constant's significant limbs (interning hashes every node built).
-impl core::hash::Hash for BNode {
-    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+impl BNode {
+    /// A hash of the node (interning hashes every node built): one word mixed, and a
+    /// constant's significant limbs.
+    fn hash(&self) -> u64 {
         let (tag, extra) = match self.op {
             MOp::Const(_) => (0u64, 0u64),
             MOp::Var(i) => (1, u64::from(i)),
@@ -45,16 +47,16 @@ impl core::hash::Hash for BNode {
             MOp::Sext => (13, 0),
             MOp::Trunc => (14, 0),
         };
-        // The operands spread over the word, the rest (under 2^56) folded in: the hasher mixes
-        // what it is given.
+        // The operands spread over the word, the rest (under 2^56) folded in.
         let args = u64::from(self.args[0]) | u64::from(self.args[1]) << 32;
         let meta = tag | u64::from(self.w.bits()) << 8 | extra << 24;
-        h.write_u64(args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta);
+        let mut h = args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta;
         if let MOp::Const(v) = &self.op {
             for &l in v.limbs() {
-                h.write_u64(l);
+                h = crate::hash::combine(h, l);
             }
         }
+        crate::hash::mix64(h)
     }
 }
 
@@ -63,7 +65,8 @@ impl core::hash::Hash for BNode {
 pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
-    memo: IdMap<BNode, u32>,
+    /// The nodes by [`BNode::hash`].
+    memo: Index,
     /// What the walks over a candidate's nodes reuse (see [`Walk`]).
     walk: core::cell::RefCell<Walk>,
     /// Costs of candidates already costed, by root ([`NO_COST`] for one not costed; nodes
@@ -108,22 +111,21 @@ impl Builder {
         Builder {
             vars,
             nodes: Vec::new(),
-            memo: IdMap::default(),
+            memo: Index::with_capacity(0),
             walk: Default::default(),
             costs: Default::default(),
         }
     }
 
     fn intern(&mut self, n: BNode) -> u32 {
-        let next = self.nodes.len() as u32;
-        match self.memo.entry(n) {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(next);
-                self.nodes.push(n);
-                next
-            }
+        let h = n.hash();
+        if let Some(i) = self.memo.find(h, |i| self.nodes[i as usize] == n) {
+            return i;
         }
+        let next = self.nodes.len() as u32;
+        self.memo.insert(h, next);
+        self.nodes.push(n);
+        next
     }
 
     pub(crate) fn width(&self, n: u32) -> Width {
@@ -486,7 +488,7 @@ impl Builder {
                 args: [t, 0],
             }
         };
-        self.memo.get(&n).copied()
+        self.memo.find(n.hash(), |i| self.nodes[i as usize] == n)
     }
 
     /// The candidate rooted at `root` as an expression.

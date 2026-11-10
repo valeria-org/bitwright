@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use super::index::Index;
 use crate::mba::expr::{MOp, MbaExpr};
 use crate::{BitVec, Width};
 
@@ -144,73 +145,6 @@ impl Reach {
         *self.ids.get_mut(n)? = x;
         self.len += 1;
         Some(())
-    }
-}
-
-/// Entries by a hash of their values: open addressing with linear probing, a slot holding the
-/// hash and the entry ([`FREE`] when empty). The values themselves stay with the caller, who
-/// never adds an entry whose values the index already has: a lookup offers the entries whose
-/// hash matches until one is taken.
-struct Index {
-    slots: Vec<(u64, u32)>,
-    len: usize,
-}
-
-/// An empty slot of an [`Index`].
-const FREE: u32 = u32::MAX;
-
-impl Index {
-    /// An index with room for `n` entries before it grows.
-    fn with_capacity(n: usize) -> Index {
-        Index {
-            slots: vec![(0, FREE); (2 * n).next_power_of_two().max(16)],
-            len: 0,
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    /// The entry with hash `h` that `is` accepts.
-    fn find(&self, h: u64, is: impl Fn(u32) -> bool) -> Option<u32> {
-        let mask = self.slots.len() - 1;
-        let mut at = h as usize & mask;
-        loop {
-            let (g, i) = self.slots[at];
-            if i == FREE {
-                return None;
-            }
-            if g == h && is(i) {
-                return Some(i);
-            }
-            at = (at + 1) & mask;
-        }
-    }
-
-    /// Adds entry `i` with hash `h`.
-    fn insert(&mut self, h: u64, i: u32) {
-        if 2 * (self.len + 1) > self.slots.len() {
-            let old = core::mem::take(&mut self.slots);
-            self.slots = vec![(0, FREE); 2 * old.len()];
-            for (g, j) in old {
-                if j != FREE {
-                    self.place(g, j);
-                }
-            }
-        }
-        self.place(h, i);
-        self.len += 1;
-    }
-
-    fn place(&mut self, h: u64, i: u32) {
-        let mask = self.slots.len() - 1;
-        let mut at = h as usize & mask;
-        while self.slots[at].1 != FREE {
-            at = (at + 1) & mask;
-        }
-        self.slots[at] = (h, i);
     }
 }
 

@@ -8,6 +8,7 @@
 
 mod bits;
 mod classes;
+mod index;
 mod poly;
 mod render;
 mod synth;
