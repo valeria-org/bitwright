@@ -237,10 +237,19 @@ fn sweep_inner(
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
+    // The node examined last, recorded in `r.swept` once the next one begins (unless the
+    // budget ended while it was asked about, which left it unexamined).
+    let mut pending: Option<u32> = None;
     macro_rules! asked {
         ($l:lifetime, $e:expr) => {
             match $e {
                 Ok(v) => v,
+                // Out of solver steps: the node is left unexamined, and the ones after it
+                // are still asked what a certificate on pass work decides.
+                Err(Stop::Exhausted(Exhausted::MbaSteps)) => {
+                    pending = None;
+                    continue $l;
+                }
                 Err(Stop::Exhausted(_)) => {
                     spent = true;
                     continue $l;
@@ -249,9 +258,6 @@ fn sweep_inner(
             }
         };
     }
-    // The node examined last, recorded in `r.swept` once the next one begins (unless the
-    // budget ended while it was asked about, which left it unexamined).
-    let mut pending: Option<u32> = None;
     'nodes: for &i in &order {
         if let Some(p) = pending.take()
             && !spent
@@ -2508,13 +2514,31 @@ fn readings_prove(
         let mut known = false;
         loop {
             count(r).opaque_asked += 1;
-            let mut meter = Steps::new(r, share);
-            let report = certify::prove(&m, &c, &mut meter)?;
+            // With the call's solver steps gone (fewer left than such a certificate's
+            // share), a certificate is charged as pass work, as
+            // the gate's are, within a small share and a part of the call's pass work in
+            // all (see `BORROW_SHARE`): what decides a sum over one value under masks is a
+            // comparison of two forms, a few hundred evaluations.
+            let steps = r.meter.left_in(|b| b.mba_steps);
+            let (report, rest, share) = if steps.saturating_mul(EVALS_PER_STEP) < BORROW_SHARE {
+                let room = (r.meter.limit.pass_work / BORROW_PART).saturating_sub(r.sweep_borrowed);
+                let share = share.min(BORROW_SHARE).min(room);
+                let before = r.meter.spent.pass_work;
+                let mut meter = Gate { r, share };
+                let report = certify::prove(&m, &c, &mut meter);
+                let rest = meter.share;
+                r.sweep_borrowed += r.meter.spent.pass_work - before;
+                (report?, rest, share)
+            } else {
+                let mut meter = Steps::new(r, share);
+                let report = certify::prove(&m, &c, &mut meter)?;
+                (report, meter.share, share)
+            };
             // The certificate took most of its share and left the question open: the readings
             // not yet asked are larger, and theirs would too. (Not the same reading asked
             // again through its atoms' known bits: that is one more question of this
             // reading, and the next reading has its own.)
-            let burned = !known && meter.share < share / 2;
+            let burned = !known && rest < share / 2;
             count(r).certificates.record(&report);
             match report.verdict {
                 Verdict::Proved => {
@@ -2823,6 +2847,12 @@ const SWEEP_CUT_NODES: usize = 16;
 /// The most atoms a block [`sweep_cut`] asks about has. (With four, the solver was asked
 /// about several hundred more blocks in 140 measured questions and answered none of them.)
 const SWEEP_CUT_VARS: usize = 3;
+
+/// The pass work one certificate of the sweep takes once the call's solver steps are gone
+/// (see [`readings_prove`]), and the part of the call's pass work all of them take: one in
+/// [`BORROW_PART`].
+const BORROW_SHARE: u64 = 1 << 15;
+const BORROW_PART: u64 = 8;
 
 /// The solver steps one [`sweep_cut`] question takes.
 const SWEEP_CUT_STEPS: u64 = 1 << 12;

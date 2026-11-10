@@ -18,6 +18,15 @@
   leaves is often a sum the sweep's certificates decide in a few hundred steps, and the
   solver's last questions of the round had taken every step: the question above stops at 42
   nodes with the part kept.
+- **With the solver's steps gone, the sweep's certificates are pass work.** A certificate of
+  the opaque-constant sweep is charged to the call's MBA solver steps, and with none left
+  the sweep asked nothing more, whatever the call still had of pass work (four fifths of it,
+  in the question above). Once fewer steps are left than a small certificate takes, the
+  sweep's certificates are charged as pass work, as the gate's are: 32,768 units each at
+  most and an eighth of the call's pass work in all. What decides a sum over one value under
+  masks is a comparison of two forms, a few hundred evaluations. The question above folds to
+  its constant at its own fuel, in three quarters of the time it took to stop at 312 nodes;
+  all 47 `engine` roots of the set are constants.
 
 ## 0.28.0
 

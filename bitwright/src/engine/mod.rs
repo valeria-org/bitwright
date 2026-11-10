@@ -1366,6 +1366,10 @@ struct Runner<'r, 'a> {
     /// `pass::mba::sweep`).
     #[cfg(feature = "mba")]
     swept: IdMap<u32, u32>,
+    /// The pass work the sweep's certificates took once the call's MBA solver steps were
+    /// gone (see `pass::mba::readings_prove`).
+    #[cfg(feature = "mba")]
+    sweep_borrowed: u64,
     /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
     /// its samples showed (see `pass::mba::Witness`).
     #[cfg(feature = "mba")]
@@ -2504,6 +2508,8 @@ impl Engine {
             mba_undecided: IdMap::default(),
             #[cfg(feature = "mba")]
             swept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            sweep_borrowed: 0,
             #[cfg(feature = "mba")]
             witnesses: Vec::new(),
             #[cfg(feature = "mba")]

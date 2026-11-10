@@ -1642,6 +1642,11 @@ pub mod mba {
     committed in 140 measured runs had taken more than a quarter. A question the solver ran
     out of steps on is not asked again in the run with no more of them, nor is a fragment
     that holds it. With nothing left a question is not asked, and the node is not final. (`docs/proposals/solver-budget.md` has the measurements.)
+    Where the opaque-constant sweep runs, the phase's questions stop a sixteenth of the
+    call's steps short, which the sweep after the round has for its certificates; and once
+    fewer steps are left than a small certificate takes, the sweep's certificates are charged
+    as pass work (32,768 units each at most, an eighth of the call's pass work in all), so a
+    call out of solver steps still folds what a comparison of two forms decides.
     A node's own question also runs within 65,536 steps while the rounds have others to ask
     (times eight in each round after one that changed nothing, up to the quarter): 570 of 601
     answers committed in those runs took fewer, and the questions that take a quarter and
