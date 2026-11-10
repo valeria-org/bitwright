@@ -14,8 +14,7 @@
 //! (or refutes) before it is used.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry as MapEntry;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use crate::mba::expr::{MOp, MbaExpr};
 use crate::{BitVec, Width};
@@ -94,14 +93,28 @@ pub(crate) struct Entry {
 
 pub(crate) type Values = [u64; PROBES];
 
-/// A 128-bit digest of values at the probes (the tables' key).
-fn digest(v: &Values) -> [u64; 2] {
-    let mut h = [0x6a09_e667_f3bc_c908u64, 0xbb67_ae85_84ca_a73b];
-    for &x in v {
-        h[0] = crate::hash::combine(h[0], x);
-        h[1] = crate::hash::combine(h[1] ^ 0x5555, x.rotate_left(29));
+/// A hash of values at the probes truncated by `mask`. It only lays out the indexes: an entry
+/// is found by its values, compared in full. Four short chains, so that one probe's
+/// multiplication does not wait for the previous probe's.
+fn fold(v: &Values, mask: u64) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = [
+        0x6a09_e667_f3bc_c908u64,
+        0xbb67_ae85_84ca_a73b,
+        0x3c6e_f372_fe94_f82b,
+        0xa54f_f53a_5f1d_36f1,
+    ];
+    for x in v.chunks_exact(4) {
+        for k in 0..4 {
+            h[k] = (h[k].rotate_left(27) ^ (x[k] & mask)).wrapping_mul(K);
+        }
     }
-    h
+    crate::hash::mix64(h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48))
+}
+
+/// Whether two value vectors agree at the bits of `mask`.
+fn same(a: &Values, b: &Values, mask: u64) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x ^ y) & mask == 0)
 }
 
 /// The distinct entries an expression uses, itself included (at most [`MAX_SIZE`]).
@@ -134,8 +147,72 @@ impl Reach {
     }
 }
 
-/// Entries by digest of their values.
-type Index = HashMap<[u64; 2], u32>;
+/// Entries by a hash of their values: open addressing with linear probing, a slot holding the
+/// hash and the entry ([`FREE`] when empty). The values themselves stay with the caller, who
+/// never adds an entry whose values the index already has: a lookup offers the entries whose
+/// hash matches until one is taken.
+struct Index {
+    slots: Vec<(u64, u32)>,
+    len: usize,
+}
+
+/// An empty slot of an [`Index`].
+const FREE: u32 = u32::MAX;
+
+impl Index {
+    /// An index with room for `n` entries before it grows.
+    fn with_capacity(n: usize) -> Index {
+        Index {
+            slots: vec![(0, FREE); (2 * n).next_power_of_two().max(16)],
+            len: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The entry with hash `h` that `is` accepts.
+    fn find(&self, h: u64, is: impl Fn(u32) -> bool) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut at = h as usize & mask;
+        loop {
+            let (g, i) = self.slots[at];
+            if i == FREE {
+                return None;
+            }
+            if g == h && is(i) {
+                return Some(i);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Adds entry `i` with hash `h`.
+    fn insert(&mut self, h: u64, i: u32) {
+        if 2 * (self.len + 1) > self.slots.len() {
+            let old = core::mem::take(&mut self.slots);
+            self.slots = vec![(0, FREE); 2 * old.len()];
+            for (g, j) in old {
+                if j != FREE {
+                    self.place(g, j);
+                }
+            }
+        }
+        self.place(h, i);
+        self.len += 1;
+    }
+
+    fn place(&mut self, h: u64, i: u32) {
+        let mask = self.slots.len() - 1;
+        let mut at = h as usize & mask;
+        while self.slots[at].1 != FREE {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = (h, i);
+    }
+}
 
 /// The table: entries in order of size, each the first of its values at the probes.
 pub(crate) struct Table {
@@ -143,8 +220,9 @@ pub(crate) struct Table {
     sizes: Vec<u8>,
     reach: Vec<Reach>,
     values: Vec<Values>,
-    /// Per width below 64: the first entry by values truncated to the width.
-    narrow: Mutex<HashMap<u16, Arc<Index>>>,
+    /// Per width below 64: the first entry of each value vector truncated to the width, built
+    /// when the width is first asked for.
+    narrow: [OnceLock<Index>; 64],
     /// At 64 bits and wider: the entry by its values.
     wide: Index,
 }
@@ -176,8 +254,8 @@ impl Table {
             sizes: Vec::new(),
             reach: Vec::new(),
             values: Vec::new(),
-            narrow: Mutex::new(HashMap::new()),
-            wide: HashMap::new(),
+            narrow: [const { OnceLock::new() }; 64],
+            wide: Index::with_capacity(1 << 15),
         };
         let zero = [0u64; PROBES];
         let mut by_size: Vec<Vec<u32>> = vec![Vec::new(); usize::from(max_size) + 1];
@@ -240,15 +318,20 @@ impl Table {
     /// more distinct subexpressions takes the new form instead (its operands are all of
     /// smaller sizes, so nothing refers to it yet).
     fn add(&mut self, e: Entry, size: u8, v: Values) -> Option<u32> {
-        let parts: Vec<&Reach> = e.args[..e.op.arity()]
-            .iter()
-            .map(|&a| &self.reach[a as usize])
-            .collect();
-        match self.wide.entry(digest(&v)) {
-            MapEntry::Occupied(slot) => {
-                let j = *slot.get();
+        let arity = e.op.arity();
+        // The operands' entries (a leaf has none).
+        let operand = |k: usize| match k < arity {
+            true => self.reach[e.args[k] as usize],
+            false => Reach::default(),
+        };
+        let operands = [operand(0), operand(1)];
+        let parts = [&operands[0], &operands[1]];
+        let parts = &parts[..arity];
+        let h = fold(&v, u64::MAX);
+        match self.wide.find(h, |j| self.values[j as usize] == v) {
+            Some(j) => {
                 if self.sizes[j as usize] == size
-                    && let Some(r) = Reach::of(j, &parts)
+                    && let Some(r) = Reach::of(j, parts)
                     && r.len < self.reach[j as usize].len
                 {
                     self.entries[j as usize] = e;
@@ -256,10 +339,10 @@ impl Table {
                 }
                 None
             }
-            MapEntry::Vacant(slot) => {
+            None => {
                 let i = self.entries.len() as u32;
-                let r = Reach::of(i, &parts)?;
-                slot.insert(i);
+                let r = Reach::of(i, parts)?;
+                self.wide.insert(h, i);
                 self.entries.push(e);
                 self.sizes.push(size);
                 self.reach.push(r);
@@ -309,26 +392,26 @@ impl Table {
     /// The smallest entry with these values at `bits` bits (values already truncated).
     pub(crate) fn lookup(&self, bits: u16, v: &Values) -> Option<u32> {
         if bits >= 64 {
-            return self.wide.get(&digest(v)).copied();
+            return self
+                .wide
+                .find(fold(v, u64::MAX), |j| self.values[j as usize] == *v);
         }
-        let index = {
-            let mut narrow = self.narrow.lock().ok()?;
-            match narrow.get(&bits) {
-                Some(ix) => ix.clone(),
-                None => {
-                    let mask = (1u64 << bits) - 1;
-                    let mut ix = Index::new();
-                    for (i, full) in self.values.iter().enumerate() {
-                        ix.entry(digest(&full.map(|x| x & mask)))
-                            .or_insert(i as u32);
-                    }
-                    let ix = Arc::new(ix);
-                    narrow.insert(bits, ix.clone());
-                    ix
+        let mask = (1u64 << bits) - 1;
+        let index = self.narrow[usize::from(bits)].get_or_init(|| {
+            // Entries in order: the first of each truncated value vector is the one kept.
+            let mut ix = Index::with_capacity(self.values.len());
+            for (i, full) in self.values.iter().enumerate() {
+                let h = fold(full, mask);
+                if ix
+                    .find(h, |j| same(&self.values[j as usize], full, mask))
+                    .is_none()
+                {
+                    ix.insert(h, i as u32);
                 }
             }
-        };
-        index.get(&digest(v)).copied()
+            ix
+        });
+        index.find(fold(v, mask), |j| same(&self.values[j as usize], v, mask))
     }
 
     /// Entry `i` as an expression over `atoms` variables of width `w` (`None` if it uses a
