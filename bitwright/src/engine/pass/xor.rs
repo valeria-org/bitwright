@@ -3,10 +3,12 @@
 //! A node's form is computed from its operands' forms: `^`, `~x = x ⊕ ones`, `&` with a
 //! constant (masks every term), `|` with a constant (`x | c = (x & ~c) ⊕ c`), and `|` of
 //! operands the facts prove disjoint. Anything else is an atom with mask all-ones. Forms over
-//! [`MAX_TERMS`] atoms are atomized. The form is re-emitted canonically (atoms in the context's
-//! order, a full mask as the bare atom, the constant last, an all-ones constant as `~`) and
-//! replaces the node only when the region above the atoms gets strictly smaller. Cancels
-//! boolean (xor) masking.
+//! [`MAX_TERMS`] atoms are atomized; such an xor keeps its whole form
+//! ([`Whole`](super::forms::Whole), up to 1024 terms), and an xor in which a term meets one
+//! inside it is taken apart ([`sum_of`]), so terms cancel through xors of that length. The
+//! form is re-emitted canonically (atoms in the context's order, a full mask as the bare atom,
+//! the constant last, an all-ones constant as `~`) and replaces the node only when the region
+//! above the atoms gets strictly smaller. Cancels boolean (xor) masking.
 
 use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
 use crate::BitVec;
@@ -33,6 +35,16 @@ impl super::forms::Parts for Form {
 
     fn from_parts(konst: BitVec, terms: Vec<(u32, BitVec)>, fin: Fin) -> Form {
         Form { konst, terms, fin }
+    }
+}
+
+impl super::forms::Sum for Form {
+    fn join(a: &BitVec, b: &BitVec) -> BitVec {
+        bv_xor(a, b)
+    }
+
+    fn scale(outer: &BitVec, inner: &BitVec) -> BitVec {
+        bv_and(outer, inner)
     }
 }
 
@@ -136,33 +148,39 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        let f = compute(r, cx, i)?;
-        let f = if f.terms.len() > MAX_TERMS {
-            r.stats.passes.entry("xor").or_default().atomized += 1;
-            Form {
-                fin: f.fin,
-                ..Form::atom(i, cx.width_of(i))
-            }
-        } else {
-            f
+        let (f, met) = compute(r, cx, i)?;
+        if f.terms.len() <= MAX_TERMS {
+            r.xor.insert(i, f);
+            continue;
+        }
+        // Over the cap: an atom, which keeps its whole form for the xors over it.
+        r.stats.passes.entry("xor").or_default().atomized += 1;
+        let atom = Form {
+            fin: f.fin,
+            ..Form::atom(i, cx.width_of(i))
         };
-        r.xor.insert(i, f);
+        r.xor.insert(i, atom);
+        let mut read = 0;
+        r.xor_whole.keep(i, f, met, &mut read);
+        r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     }
     Ok(r.xor.get(root).expect("the root's form was just computed"))
 }
 
-fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Stop> {
+/// The form of `i` from its operands' (cached) forms, and whether terms met in it (see
+/// [`sum_of`]).
+fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
     let get =
         |r: &Runner<'_, '_>, j: u32| r.xor.get(j).expect("operands' forms are computed first");
-    Ok(match node.op {
+    let form = match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Xor => get(r, node.a).xor(&get(r, node.b)),
+        OpCode::Xor => return sum_of(r, &get(r, node.a), &get(r, node.b)),
         OpCode::Not => get(r, node.a).xor_const(&BitVec::ones(w)),
         OpCode::And => match (cx.const_val(node.a), cx.const_val(node.b)) {
             (Some(m), _) => get(r, node.b).mask(&m),
@@ -176,18 +194,34 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
                 let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
                 if disjoint {
                     // The form relies on what proved the operands disjoint.
-                    let mut f = get(r, node.a).xor(&get(r, node.b));
+                    let (mut f, met) = sum_of(r, &get(r, node.a), &get(r, node.b))?;
                     f.fin = f.fin.and(fina).and(finb);
-                    f
-                } else {
-                    Form {
-                        fin: fina.and(finb).unchanged(),
-                        ..Form::atom(i, w)
-                    }
+                    return Ok((f, met));
+                }
+                Form {
+                    fin: fina.and(finb).unchanged(),
+                    ..Form::atom(i, w)
                 }
             }
         },
         _ => Form::atom(i, w),
+    };
+    Ok((form, false))
+}
+
+/// The xor of the forms `a` and `b` of a node's operands, and whether terms met in it: two
+/// terms of one atom, in the forms themselves or out of sight, one of them inside an xor over
+/// [`MAX_TERMS`] that is an atom here (see [`Whole`](super::forms::Whole)). Those xors are
+/// then taken apart, so the terms cancel: `(v0 ^ … ^ v99) ^ v0` is the other 99 terms.
+fn sum_of(r: &mut Runner<'_, '_>, a: &Form, b: &Form) -> Result<(Form, bool), Stop> {
+    let f = a.xor(b);
+    let met = f.terms.len() < a.terms.len() + b.terms.len();
+    let mut read = 0;
+    let whole = r.xor_whole.meeting(a, b, &f, &mut read);
+    r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
+    Ok(match whole {
+        Some(whole) => (whole, true),
+        None => (f, met),
     })
 }
 
@@ -317,27 +351,48 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, St
     }
 }
 
-/// The xor pass at `n`.
+/// The xor pass at `n`. What a candidate it declines contributes stays in the result (see the
+/// linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    let mut declined = Fin::FINAL;
     // A linear map of one atom through shifts and rotations (see `gf2`).
     if matches!(
         op,
         OpCode::Xor | OpCode::RotL | OpCode::RotR | OpCode::Shl | OpCode::LShr
-    ) && let Some(Step::To(x, fin)) = super::gf2::step(r, cx, n)?
-    {
-        return Ok(Step::To(x, fin));
+    ) {
+        match super::gf2::step(r, cx, n)? {
+            Some(Step::Normal(f)) => declined = f,
+            Some(step) => return Ok(step),
+            None => {}
+        }
     }
     if !xor_op(op) || op == OpCode::Const {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(declined));
     }
     let form = form_of(r, cx, n)?;
-    if let Some(step @ Step::To(..)) = merge_extract_pair(r, cx, n, &form)? {
-        return Ok(step);
+    match merge_extract_pair(r, cx, n, &form)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
     }
-    if form.is_atom_of(n) {
-        return Ok(Step::Normal(form.fin));
-    }
+    let last = if form.is_atom_of(n) {
+        // An xor over the cap in which terms met is written out again, from its whole form.
+        match r.xor_whole.met(n) {
+            Some(whole) => plain(r, cx, n, whole)?,
+            None => Step::Normal(form.fin),
+        }
+    } else {
+        plain(r, cx, n, form)?
+    };
+    Ok(match last {
+        Step::Normal(f) => Step::Normal(f.and(declined)),
+        step => step,
+    })
+}
+
+/// The xor pass at `n` over its form as computed.
+fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result<Step, Stop> {
     let mut atoms: Vec<u32> = form.terms.iter().map(|t| t.0).collect();
     atoms.sort_unstable();
     // Upper bound (it follows `emit`): a constant and an and per partial mask (masks covering

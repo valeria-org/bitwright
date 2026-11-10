@@ -910,6 +910,8 @@ fn stats(out: &mut String, s: &Stats) {
         declined,
         salvaged,
         not_started,
+        rounds_capped,
+        reruns_capped,
     } = s;
     let mut o = Obj::new(out);
     for (k, v) in [
@@ -951,6 +953,8 @@ fn stats(out: &mut String, s: &Stats) {
     o.num("declined", *declined);
     o.num("salvaged", *salvaged);
     o.num("not_started", *not_started);
+    o.num("rounds_capped", *rounds_capped);
+    o.num("reruns_capped", *reruns_capped);
     o.end();
 }
 

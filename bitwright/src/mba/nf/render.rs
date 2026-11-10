@@ -8,10 +8,11 @@ use crate::hash::IdMap;
 
 use super::bits::{self, Bits, anf, mobius, table8};
 use super::classes::{Classes, FULL};
+use super::index::Index;
 use super::poly::{Mono, Poly, Sym};
 use super::synth;
+use super::word::{bv_and, bv_not, bv_or, bv_xor, count_ones, low_mask, trailing_zeros};
 use crate::engine::pass::bitwise::{T, min_forms, subtables};
-use crate::facts::known::{bv_and, bv_not, bv_or, bv_xor, count_ones, low_mask, trailing_zeros};
 use crate::mba::certify;
 use crate::mba::expr::{MNode, MOp, MbaExpr};
 use crate::mba::solve::Verdict;
@@ -25,9 +26,10 @@ struct BNode {
     args: [u32; 2],
 }
 
-/// Hashed as two words and a constant's significant limbs (interning hashes every node built).
-impl core::hash::Hash for BNode {
-    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+impl BNode {
+    /// A hash of the node (interning hashes every node built): one word mixed, and a
+    /// constant's significant limbs.
+    fn hash(&self) -> u64 {
         let (tag, extra) = match self.op {
             MOp::Const(_) => (0u64, 0u64),
             MOp::Var(i) => (1, u64::from(i)),
@@ -45,13 +47,16 @@ impl core::hash::Hash for BNode {
             MOp::Sext => (13, 0),
             MOp::Trunc => (14, 0),
         };
-        h.write_u64(tag | u64::from(self.w.bits()) << 8 | extra << 24);
-        h.write_u64(u64::from(self.args[0]) | u64::from(self.args[1]) << 32);
+        // The operands spread over the word, the rest (under 2^56) folded in.
+        let args = u64::from(self.args[0]) | u64::from(self.args[1]) << 32;
+        let meta = tag | u64::from(self.w.bits()) << 8 | extra << 24;
+        let mut h = args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta;
         if let MOp::Const(v) = &self.op {
             for &l in v.limbs() {
-                h.write_u64(l);
+                h = crate::hash::combine(h, l);
             }
         }
+        crate::hash::mix64(h)
     }
 }
 
@@ -60,12 +65,31 @@ impl core::hash::Hash for BNode {
 pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
-    memo: IdMap<BNode, u32>,
-    /// [`Builder::reach`]'s visited marks: a stamp per node, current when equal to the epoch.
-    marks: core::cell::RefCell<(Vec<u32>, u32)>,
-    /// Costs of candidates already costed (nodes never change once interned).
-    costs: core::cell::RefCell<IdMap<u32, Cost>>,
+    /// The nodes by [`BNode::hash`].
+    memo: Index,
+    /// What the walks over a candidate's nodes reuse (see [`Walk`]).
+    walk: core::cell::RefCell<Walk>,
+    /// Costs of candidates already costed, by root ([`NO_COST`] for one not costed; nodes
+    /// never change once interned).
+    costs: core::cell::RefCell<Vec<Cost>>,
 }
+
+/// The scratch of [`Builder::reach`], [`Builder::cost`] and [`Builder::finish`]: candidates
+/// are walked by the thousand.
+#[derive(Clone, Debug, Default)]
+struct Walk {
+    /// Visited marks: a stamp per node, current when equal to the epoch.
+    stamp: Vec<u32>,
+    epoch: u32,
+    stack: Vec<(u32, bool)>,
+    /// The nodes of the last walk, operands first.
+    order: Vec<u32>,
+    /// Per node of the last candidate finished: its index in the expression.
+    place: Vec<u32>,
+}
+
+/// No cost yet (see [`Builder::cost`]).
+const NO_COST: Cost = (u32::MAX, u32::MAX);
 
 /// A candidate's cost: nodes, then operator weight.
 pub(crate) type Cost = (u32, u32);
@@ -82,25 +106,62 @@ fn commutative(op: &MOp) -> bool {
     matches!(op, MOp::Add | MOp::Mul | MOp::And | MOp::Or | MOp::Xor)
 }
 
+/// Whether `c` is `v` at width `w` (`*c == super::word::small(w, v)`, without building
+/// that value: coefficients are tested against 1 and 2 for every term emitted).
+#[inline]
+fn is_small(c: &BitVec, w: Width, v: u64) -> bool {
+    let v = match w.bits() {
+        bits if bits < 64 => v & ((1u64 << bits) - 1),
+        _ => v,
+    };
+    let l = c.limbs();
+    c.width() == w && l[0] == v && l[1..].iter().all(|&x| x == 0)
+}
+
+/// Whether `c` is all ones at width `w` (`*c == BitVec::ones(w)`).
+#[inline]
+fn is_ones(c: &BitVec, w: Width) -> bool {
+    match w.bits() {
+        bits if bits <= 64 => c.width() == w && c.limbs()[0] == u64::MAX >> (64 - bits),
+        _ => *c == BitVec::ones(w),
+    }
+}
+
+/// The position of the only set bit of `c`, if it has exactly one.
+#[inline]
+fn power_of_two(c: &BitVec) -> Option<u32> {
+    let mut at = None;
+    for (i, &l) in c.limbs().iter().enumerate() {
+        if l != 0 {
+            if at.is_some() || !l.is_power_of_two() {
+                return None;
+            }
+            at = Some(64 * i as u32 + l.trailing_zeros());
+        }
+    }
+    at
+}
+
 impl Builder {
     pub(crate) fn new(vars: Vec<Width>) -> Builder {
         Builder {
             vars,
             nodes: Vec::new(),
-            memo: IdMap::default(),
-            marks: Default::default(),
+            memo: Index::with_capacity(0),
+            walk: Default::default(),
             costs: Default::default(),
         }
     }
 
     fn intern(&mut self, n: BNode) -> u32 {
-        if let Some(&i) = self.memo.get(&n) {
+        let h = n.hash();
+        if let Some(i) = self.memo.find(h, |i| self.nodes[i as usize] == n) {
             return i;
         }
+        let next = self.nodes.len() as u32;
+        self.memo.insert(h, next);
         self.nodes.push(n);
-        let i = self.nodes.len() as u32 - 1;
-        self.memo.insert(n, i);
-        i
+        next
     }
 
     pub(crate) fn width(&self, n: u32) -> Width {
@@ -142,10 +203,10 @@ impl Builder {
         }
         if let Some(v) = self.cval(a) {
             let r = match op {
-                MOp::Neg => BitVec::un_unchecked(UnOp::Neg, &v),
-                MOp::Not => BitVec::un_unchecked(UnOp::Not, &v),
-                MOp::Shl(k) => crate::facts::known::bv_shl(&v, u32::from(k)),
-                MOp::LShr(k) => crate::facts::known::bv_lshr(&v, u32::from(k)),
+                MOp::Neg => super::word::un(UnOp::Neg, &v),
+                MOp::Not => super::word::un(UnOp::Not, &v),
+                MOp::Shl(k) => super::word::bv_shl(&v, u32::from(k)),
+                MOp::LShr(k) => super::word::bv_lshr(&v, u32::from(k)),
                 _ => v,
             };
             return self.konst(&r);
@@ -170,12 +231,12 @@ impl Builder {
                 MOp::Or => BinOp::Or,
                 _ => BinOp::Xor,
             };
-            let v = BitVec::bin_unchecked(r, &x, &y);
+            let v = super::word::bin(r, &x, &y);
             return self.konst(&v);
         }
         let zero = |v: &Option<BitVec>| matches!(v, Some(x) if x.is_zero());
         let ones = |v: &Option<BitVec>| matches!(v, Some(x) if x.is_ones());
-        let one = |v: &Option<BitVec>| matches!(v, Some(x) if *x == BitVec::one(w));
+        let one = |v: &Option<BitVec>| matches!(v, Some(x) if is_small(x, w, 1));
         match op {
             MOp::Add | MOp::Or | MOp::Xor if zero(&cb) => return a,
             MOp::Add | MOp::Or | MOp::Xor if zero(&ca) => return b,
@@ -184,7 +245,7 @@ impl Builder {
             // As the context builds it: `a − c` is `a + (−c)`, whose constant is its own node.
             MOp::Sub if cb.is_some() => {
                 let c = cb
-                    .map(|c| BitVec::un_unchecked(UnOp::Neg, &c))
+                    .map(|c| super::word::un(UnOp::Neg, &c))
                     .unwrap_or(BitVec::zero(w));
                 let n = self.konst(&c);
                 return self.bin(MOp::Add, a, n);
@@ -289,8 +350,20 @@ impl Builder {
 
     /// The nodes `root` uses, operands first.
     pub(crate) fn reach(&self, root: u32) -> Vec<u32> {
-        let mut marks = self.marks.borrow_mut();
-        let (stamp, epoch) = &mut *marks;
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        walk.order.clone()
+    }
+
+    /// Fills `walk.order` with the nodes `root` uses, operands first.
+    fn walk_from(&self, walk: &mut Walk, root: u32) {
+        let Walk {
+            stamp,
+            epoch,
+            stack,
+            order,
+            ..
+        } = walk;
         *epoch = epoch.wrapping_add(1);
         if *epoch == 0 {
             stamp.fill(0);
@@ -299,24 +372,33 @@ impl Builder {
         if stamp.len() < self.nodes.len() {
             stamp.resize(self.nodes.len(), 0);
         }
-        let mut out = Vec::new();
-        let mut stack = vec![(root, false)];
+        order.clear();
+        stack.clear();
+        stack.push((root, false));
         while let Some((i, done)) = stack.pop() {
             if done {
-                out.push(i);
+                order.push(i);
                 continue;
             }
             let fresh = core::mem::replace(&mut stamp[i as usize], *epoch) != *epoch;
             if !fresh {
                 continue;
             }
-            stack.push((i, true));
-            let n = self.nodes[i as usize];
-            for &k in n.args[..n.op.arity()].iter().rev() {
-                stack.push((k, false));
+            let n = &self.nodes[i as usize];
+            match n.op.arity() {
+                // A leaf is done as it is met.
+                0 => order.push(i),
+                1 => {
+                    stack.push((i, true));
+                    stack.push((n.args[0], false));
+                }
+                _ => {
+                    stack.push((i, true));
+                    stack.push((n.args[1], false));
+                    stack.push((n.args[0], false));
+                }
             }
         }
-        out
     }
 
     /// The cost of the candidate rooted at `root`: its nodes, counting a shift's amount as the
@@ -326,47 +408,67 @@ impl Builder {
     /// `x − 1` or `−(~x)` to `x + 1` while the inner node stays for other uses, then operator
     /// weight.
     pub(crate) fn cost(&self, root: u32) -> Cost {
-        if let Some(&c) = self.costs.borrow().get(&root) {
+        if let Some(&c) = self.costs.borrow().get(root as usize)
+            && c != NO_COST
+        {
             return c;
         }
         let c = self.cost_of(root);
-        self.costs.borrow_mut().insert(root, c);
+        let mut costs = self.costs.borrow_mut();
+        if costs.len() < self.nodes.len() {
+            costs.resize(self.nodes.len(), NO_COST);
+        }
+        costs[root as usize] = c;
         c
     }
 
     fn cost_of(&self, root: u32) -> Cost {
-        let r = self.reach(root);
-        let weight: u32 = r.iter().map(|&i| weight(&self.nodes[i as usize].op)).sum();
-        let unstable = r
-            .iter()
-            .filter(|&&i| {
-                let n = self.nodes[i as usize];
-                n.op == MOp::Sub && {
-                    let m = self.nodes[n.args[1] as usize];
-                    m.op == MOp::And && m.args.contains(&n.args[0])
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        let r = &walk.order;
+        let mut weight = 0u32;
+        let mut unstable = 0u32;
+        // Whether a shift, or a `~(−x)` or `−(~x)`, is among the nodes: only then do the
+        // constants matter.
+        let (mut shifts, mut sites) = (false, false);
+        for &i in r {
+            let n = &self.nodes[i as usize];
+            weight += self::weight(&n.op);
+            match n.op {
+                MOp::Sub => {
+                    let m = &self.nodes[n.args[1] as usize];
+                    unstable += u32::from(m.op == MOp::And && m.args.contains(&n.args[0]));
                 }
-            })
-            .count() as u32;
-        let mut consts: Vec<BitVec> = r
-            .iter()
-            .filter_map(|&i| match self.nodes[i as usize].op {
-                MOp::Const(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        let mut amounts = 0u32;
-        for &i in &r {
-            let n = self.nodes[i as usize];
-            if let MOp::Shl(k) | MOp::LShr(k) = n.op {
-                let v = BitVec::wrapping_from_u64(n.w, u64::from(k));
-                if !consts.contains(&v) {
-                    consts.push(v);
-                    amounts += 1;
-                }
+                MOp::Shl(_) | MOp::LShr(_) => shifts = true,
+                MOp::Not => sites |= self.nodes[n.args[0] as usize].op == MOp::Neg,
+                MOp::Neg => sites |= self.nodes[n.args[0] as usize].op == MOp::Not,
+                _ => {}
             }
         }
-        let one = r.first().map(|&i| BitVec::one(self.nodes[i as usize].w));
-        let rewritten = one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(&r));
+        let (mut amounts, mut rewritten) = (0u32, false);
+        if shifts || sites {
+            let mut consts: Vec<BitVec> = r
+                .iter()
+                .filter_map(|&i| match self.nodes[i as usize].op {
+                    MOp::Const(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            for &i in r {
+                let n = &self.nodes[i as usize];
+                if let MOp::Shl(k) | MOp::LShr(k) = n.op {
+                    let v = super::word::small(n.w, u64::from(k));
+                    if !consts.contains(&v) {
+                        consts.push(v);
+                        amounts += 1;
+                    }
+                }
+            }
+            let one = r
+                .first()
+                .map(|&i| super::word::one(self.nodes[i as usize].w));
+            rewritten = one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(r));
+        }
         (
             r.len() as u32 + amounts + unstable + u32::from(rewritten),
             weight,
@@ -377,7 +479,7 @@ impl Builder {
     /// elsewhere in the candidate too.
     fn rewrites_shared(&self, r: &[u32]) -> bool {
         let inner = |n: &BNode| -> Option<u32> {
-            let m = self.nodes[n.args[0] as usize];
+            let m = &self.nodes[n.args[0] as usize];
             matches!((n.op, m.op), (MOp::Not, MOp::Neg) | (MOp::Neg, MOp::Not)).then_some(n.args[0])
         };
         let sites: Vec<u32> = r
@@ -389,7 +491,7 @@ impl Builder {
         }
         let mut users = 0usize;
         for &i in r {
-            let n = self.nodes[i as usize];
+            let n = &self.nodes[i as usize];
             users += n.args[..n.op.arity()]
                 .iter()
                 .filter(|a| sites.contains(a))
@@ -403,14 +505,15 @@ impl Builder {
     fn multiple(&self, t: u32, k: &BitVec) -> Option<u32> {
         let w = self.width(t);
         let mag = if k.msb() {
-            BitVec::un_unchecked(UnOp::Neg, k)
+            super::word::un(UnOp::Neg, k)
         } else {
             *k
         };
-        if count_ones(&mag) != 1 || mag == BitVec::one(w) {
+        let j = power_of_two(&mag)?;
+        if is_small(&mag, w, 1) {
             return None;
         }
-        let n = if mag == BitVec::wrapping_from_u64(w, 2) {
+        let n = if is_small(&mag, w, 2) {
             BNode {
                 op: MOp::Add,
                 w,
@@ -418,27 +521,33 @@ impl Builder {
             }
         } else {
             BNode {
-                op: MOp::Shl(trailing_zeros(&mag) as u16),
+                op: MOp::Shl(j as u16),
                 w,
                 args: [t, 0],
             }
         };
-        self.memo.get(&n).copied()
+        self.memo.find(n.hash(), |i| self.nodes[i as usize] == n)
     }
 
     /// The candidate rooted at `root` as an expression.
     pub(crate) fn finish(&self, root: u32) -> Option<MbaExpr> {
-        let mut m = MbaExpr::new(self.vars.clone());
-        let mut map: HashMap<u32, u32> = HashMap::new();
-        for i in self.reach(root) {
-            let n = self.nodes[i as usize];
-            let args: Vec<u32> = n.args[..n.op.arity()].iter().map(|a| map[a]).collect();
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        let Walk { order, place, .. } = &mut *walk;
+        if place.len() < self.nodes.len() {
+            place.resize(self.nodes.len(), 0);
+        }
+        let mut m = MbaExpr::with_capacity(self.vars.clone(), order.len());
+        for &i in order.iter() {
+            let n = &self.nodes[i as usize];
+            // Operands come first in the walk: their places are this candidate's.
+            let args = [place[n.args[0] as usize], place[n.args[1] as usize]];
             let id = match n.op {
                 MOp::Zext | MOp::Sext | MOp::Trunc => m.push_cast(n.op, args[0], n.w),
-                op => m.push(op, &args),
+                op => m.push(op, &args[..op.arity()]),
             }
             .ok()?;
-            map.insert(i, id);
+            place[i as usize] = id;
         }
         Some(m)
     }
@@ -466,11 +575,14 @@ pub(crate) fn structural(a: &MbaExpr, b: &MbaExpr) -> core::cmp::Ordering {
         };
         (tag, k, c, n.width.bits(), n.args)
     };
-    let (ka, kb): (Vec<_>, Vec<_>) = (
-        a.nodes().iter().map(key).collect(),
-        b.nodes().iter().map(key).collect(),
-    );
-    ka.cmp(&kb)
+    // As the sequences of the nodes' keys compare: the first difference, then the lengths.
+    for (x, y) in a.nodes().iter().zip(b.nodes()) {
+        let o = key(x).cmp(&key(y));
+        if o.is_ne() {
+            return o;
+        }
+    }
+    a.nodes().len().cmp(&b.nodes().len())
 }
 
 /// Emission of normal forms into a builder, with the atoms' renderings imported on use.
@@ -516,6 +628,18 @@ pub(crate) struct Render<'a> {
     narrow: Vec<Option<(u32, Width)>>,
     /// Whether a sign extension's parts are being rendered (see [`Render::sign_extensions`]).
     signing: bool,
+    /// What [`Render::sum`] reuses from one sum to the next.
+    sum_scratch: SumScratch,
+}
+
+/// The vectors of [`Render::sum`]: the terms merged by node, those with positive and with
+/// negative coefficients, and the constants the sum needs anyway.
+#[derive(Default)]
+struct SumScratch {
+    merged: Vec<(u32, BitVec)>,
+    pos: Vec<(u32, BitVec)>,
+    neg: Vec<(u32, BitVec)>,
+    needed: Vec<BitVec>,
 }
 
 /// The most decompositions [`Render::two_terms`] builds over up to three atoms, those whose
@@ -617,17 +741,22 @@ impl<'a> Render<'a> {
                 })
                 .collect(),
             signing: false,
+            sum_scratch: SumScratch::default(),
         }
     }
 
     /// The bit from which every conjunction of the atoms in `set` is zero, if one of them is
     /// a zero extension (its operand's width).
-    fn zero_from(&self, set: u64) -> Option<u16> {
-        (0..64u32)
-            .filter(|&a| set >> a & 1 == 1)
-            .filter_map(|a| self.narrow.get(a as usize).copied().flatten())
-            .map(|(_, n)| n.bits())
-            .min()
+    fn zero_from(&self, mut set: u64) -> Option<u16> {
+        let mut from: Option<u16> = None;
+        while set != 0 {
+            let a = set.trailing_zeros() as usize;
+            if let Some((_, n)) = self.narrow.get(a).copied().flatten() {
+                from = Some(from.map_or(n.bits(), |f| f.min(n.bits())));
+            }
+            set &= set - 1;
+        }
+        from
     }
 
     /// Renders an atom's definition: with the decompositions a peel's rest gets (no groups,
@@ -806,7 +935,7 @@ impl<'a> Render<'a> {
 
     /// `x & mask` (nothing for all-ones).
     fn masked(&mut self, x: u32, mask: &BitVec) -> u32 {
-        if mask.is_ones() {
+        if is_ones(mask, mask.width()) {
             return x;
         }
         let m = self.b.konst(mask);
@@ -823,14 +952,13 @@ impl<'a> Render<'a> {
     /// `k·t` for a coefficient `k` (positive in the signed sense): `t`, `t + t` (one node,
     /// where a shift needs its amount too), a shift, or a product.
     fn scaled(&mut self, t: u32, k: &BitVec) -> u32 {
-        if *k == BitVec::one(self.w) {
+        if is_small(k, self.w, 1) {
             return t;
         }
-        if *k == BitVec::wrapping_from_u64(self.w, 2) {
+        if is_small(k, self.w, 2) {
             return self.b.bin(MOp::Add, t, t);
         }
-        if count_ones(k) == 1 {
-            let s = trailing_zeros(k);
+        if let Some(s) = power_of_two(k) {
             return self.b.un(MOp::Shl(s as u16), t);
         }
         let c = self.b.konst(k);
@@ -845,8 +973,17 @@ impl<'a> Render<'a> {
         let w = self.w;
         self.spend(4 * s.terms.len() as u64 + 1);
         let mut acc: Option<u32> = None;
-        type Terms = Vec<(u32, BitVec)>;
-        let mut merged: Terms = Vec::with_capacity(s.terms.len());
+        // The vectors of the last sum, emptied: sums are emitted by the thousand.
+        let SumScratch {
+            mut merged,
+            mut pos,
+            mut neg,
+            mut needed,
+        } = core::mem::take(&mut self.sum_scratch);
+        merged.clear();
+        pos.clear();
+        neg.clear();
+        needed.clear();
         // Each node's position in `merged`, for sums too long to search (same order either way).
         let indexed = s.terms.len() > 8;
         let mut at: IdMap<u32, usize> = IdMap::default();
@@ -857,7 +994,7 @@ impl<'a> Render<'a> {
                 merged.iter().position(|(u, _)| *u == t)
             };
             match found {
-                Some(j) => merged[j].1 = BitVec::bin_unchecked(BinOp::Add, &merged[j].1, &k),
+                Some(j) => merged[j].1 = super::word::bin(BinOp::Add, &merged[j].1, &k),
                 None => {
                     if indexed {
                         at.insert(t, merged.len());
@@ -883,9 +1020,9 @@ impl<'a> Render<'a> {
                     let one = if k.msb() {
                         BitVec::ones(w)
                     } else {
-                        BitVec::one(w)
+                        super::word::one(w)
                     };
-                    merged[j].1 = BitVec::bin_unchecked(BinOp::Add, &merged[j].1, &one);
+                    merged[j].1 = super::word::bin(BinOp::Add, &merged[j].1, &one);
                     merged.remove(i);
                     if indexed {
                         at.clear();
@@ -896,39 +1033,37 @@ impl<'a> Render<'a> {
                 _ => i += 1,
             }
         }
-        let (pos, mut neg): (Terms, Terms) = merged
-            .into_iter()
-            .filter(|(_, k)| !k.is_zero())
-            .partition(|(_, k)| !k.msb());
+        for &(t, k) in merged.iter().filter(|(_, k)| !k.is_zero()) {
+            match k.msb() {
+                false => pos.push((t, k)),
+                true => neg.push((t, k)),
+            }
+        }
         let mut k = s.konst.unwrap_or(BitVec::zero(w));
         // Only subtracted terms and no constant: a term with a coefficient other than −1 goes
         // first, a product by its negative coefficient, and the others are subtracted from it
         // (`t·−2 − ~y`, not `−~y − (t + t)`, whose `−~y` the rules read as `y + 1`).
         if pos.is_empty()
             && k.is_zero()
-            && let Some(i) = neg.iter().position(|(_, c)| *c != BitVec::ones(w))
+            && let Some(i) = neg.iter().position(|(_, c)| !is_ones(c, w))
         {
             neg.swap(0, i);
         }
         // Constants the sum needs whatever the signs: its constant and positive coefficients.
-        let trivial = |c: &BitVec| *c == BitVec::one(w) || count_ones(c) == 1;
-        let mut needed: Vec<BitVec> = pos
-            .iter()
-            .map(|(_, c)| *c)
-            .filter(|c| !trivial(c))
-            .collect();
+        let trivial = |c: &BitVec| is_small(c, w, 1) || power_of_two(c).is_some();
+        needed.extend(pos.iter().map(|(_, c)| *c).filter(|c| !trivial(c)));
         if !k.is_zero() {
             needed.push(k);
         }
-        for (t, c) in pos {
+        for &(t, c) in &pos {
             let x = self.scaled(t, &c);
             acc = Some(match acc {
                 None => x,
                 Some(a) => self.b.bin(MOp::Add, a, x),
             });
         }
-        for (t, c) in neg {
-            let nc = BitVec::un_unchecked(UnOp::Neg, &c);
+        for &(t, c) in &neg {
+            let nc = super::word::un(UnOp::Neg, &c);
             let reuse = !trivial(&nc) && needed.contains(&c) && !needed.contains(&nc);
             acc = Some(match acc {
                 Some(a) if reuse => {
@@ -949,7 +1084,7 @@ impl<'a> Render<'a> {
                     let x = self.scaled(t, &nc);
                     self.b.bin(MOp::Sub, a, x)
                 }
-                None if nc == BitVec::one(w) => self.b.un(MOp::Neg, t),
+                None if is_small(&nc, w, 1) => self.b.un(MOp::Neg, t),
                 None => {
                     let m = self.b.konst(&c);
                     self.b.bin(MOp::Mul, t, m)
@@ -959,6 +1094,12 @@ impl<'a> Render<'a> {
                 needed.push(if reuse { c } else { nc });
             }
         }
+        self.sum_scratch = SumScratch {
+            merged,
+            pos,
+            neg,
+            needed,
+        };
         match acc {
             None => self.b.konst(&k),
             Some(a) if k.is_zero() => a,
@@ -972,20 +1113,28 @@ impl<'a> Render<'a> {
     /// The cheapest of `cands` (node count, weight, structure).
     pub(crate) fn best(&self, cands: &[u32]) -> Option<u32> {
         let mut best: Option<(u32, Cost)> = None;
+        // The best so far as an expression, once a tie has asked for it.
+        let mut held: Option<Option<MbaExpr>> = None;
         for &c in cands {
             let cost = self.b.cost(c);
-            best = match best {
-                None => Some((c, cost)),
-                Some((_, bc)) if cost < bc => Some((c, cost)),
+            match best {
+                None => best = Some((c, cost)),
+                Some((_, bc)) if cost < bc => {
+                    best = Some((c, cost));
+                    held = None;
+                }
                 Some((b, bc)) if cost == bc && b != c => {
-                    let (x, y) = (self.b.finish(c), self.b.finish(b));
-                    match (x, y) {
-                        (Some(x), Some(y)) if structural(&x, &y).is_lt() => Some((c, cost)),
-                        _ => Some((b, bc)),
+                    let x = self.b.finish(c);
+                    let y = held.get_or_insert_with(|| self.b.finish(b));
+                    if let (Some(x), Some(y)) = (x, y.as_ref())
+                        && structural(&x, y).is_lt()
+                    {
+                        best = Some((c, cost));
+                        held = Some(Some(x));
                     }
                 }
-                keep => keep,
-            };
+                _ => {}
+            }
         }
         best.map(|(c, _)| c)
     }
@@ -1055,7 +1204,7 @@ impl<'a> Render<'a> {
         let a = mobius(t, s);
         let mut sum = Sum {
             terms: Vec::new(),
-            konst: Some(BitVec::wrapping_from_i128(w, -i128::from(a[0]))),
+            konst: Some(super::word::signed(w, -i128::from(a[0]))),
         };
         for (q, &k) in a.iter().enumerate().skip(1) {
             if k == 0 {
@@ -1065,8 +1214,7 @@ impl<'a> Render<'a> {
                 .filter(|&j| q >> j & 1 == 1)
                 .fold(0u64, |m, j| m | 1u64 << support[j]);
             if let Some(c) = self.conj(set) {
-                sum.terms
-                    .push((c, BitVec::wrapping_from_i128(w, i128::from(k))));
+                sum.terms.push((c, super::word::signed(w, i128::from(k))));
             }
         }
         out.push(self.sum(&sum));
@@ -1626,11 +1774,13 @@ impl<'a> Render<'a> {
         if self.hopeless(p.atoms()) || !self.spend(p.len() as u64 * self.classes.len() as u64) {
             return out;
         }
-        let plain = Bits::from_linear(&p.expand_full(self.classes), self.classes);
+        // The form over masked symbols alone: for this test, and for the decompositions below.
+        let expanded = p.expand_full(self.classes);
+        let plain = Bits::from_linear(&expanded, self.classes);
         if let Some(f) = &plain {
             for n in self.bits(f) {
                 out.push(Sum {
-                    terms: vec![(n, BitVec::one(w))],
+                    terms: vec![(n, super::word::one(w))],
                     konst: None,
                 });
             }
@@ -1671,17 +1821,17 @@ impl<'a> Render<'a> {
                 if base.is_zero() {
                     continue;
                 }
-                q.add_term(vec![(Sym { set, class: FULL }, 1)], base);
-                let nb = BitVec::un_unchecked(UnOp::Neg, base);
+                q.add_term(Mono::of(Sym { set, class: FULL }, 1), base);
+                let nb = super::word::un(UnOp::Neg, base);
                 for c in 0..n {
                     q.add_term(
-                        vec![(
+                        Mono::of(
                             Sym {
                                 set,
                                 class: c as u16,
                             },
                             1,
-                        )],
+                        ),
                         &nb,
                     );
                 }
@@ -1691,13 +1841,13 @@ impl<'a> Render<'a> {
             }
         }
         if n > 1
-            && let Some(s) = self.affine_bits(p)
+            && let Some(s) = self.affine_bits(p, &expanded)
         {
             out.push(s);
         }
-        out.extend(self.scaled_bits(p, plain.is_some()));
+        out.extend(self.scaled_bits(&expanded, plain.is_some()));
         out.extend(self.two_terms(p));
-        out.extend(self.sign_extensions(p));
+        out.extend(self.sign_extensions(p, &expanded));
         if top && self.peeling == 0 {
             out.extend(self.split_off(p));
         }
@@ -1723,14 +1873,16 @@ impl<'a> Render<'a> {
     /// `sext(trunc(2·Z))`): `Z[lo] − Z[j]` over `Z = zext(a)` of `j + 1` bits is `sext(a)`
     /// (`decast` writes `sext(a)` as `(Z ^ 2^j) − 2^j`, which the classes read that way). The
     /// rest of the form is rendered as usual; one candidate, with the extensions added.
-    fn sign_extensions(&mut self, p: &Poly) -> Vec<Sum> {
+    ///
+    /// `expanded` is `p` over masked symbols alone ([`Poly::expand_full`]).
+    fn sign_extensions(&mut self, p: &Poly, expanded: &Poly) -> Vec<Sum> {
         let w = self.w;
         let wb = u32::from(w.bits());
         let n = self.classes.len();
         if self.signing || n < 2 || p.degree() > 1 || !self.spend(p.len() as u64 * n as u64) {
             return Vec::new();
         }
-        let mut rest = p.expand_full(self.classes);
+        let mut rest = expanded.clone();
         let single = |m: &Mono| -> Option<Sym> {
             match m.as_slice() {
                 [(sym, 1)] if sym.class != FULL => Some(*sym),
@@ -1769,28 +1921,28 @@ impl<'a> Render<'a> {
             }
             let mut expect = Poly::zero(w);
             for (set, c) in &signs {
-                let neg = BitVec::un_unchecked(UnOp::Neg, c);
+                let neg = super::word::un(UnOp::Neg, c);
                 for c2 in 0..n {
                     if c2 == s {
                         expect.add_term(
-                            vec![(
+                            Mono::of(
                                 Sym {
                                     set: *set,
                                     class: s as u16,
                                 },
                                 1,
-                            )],
+                            ),
                             c,
                         );
                     } else if self.classes.low(c2) < pos {
                         expect.add_term(
-                            vec![(
+                            Mono::of(
                                 Sym {
                                     set: *set,
                                     class: c2 as u16,
                                 },
                                 1,
-                            )],
+                            ),
                             &neg,
                         );
                     }
@@ -1831,7 +1983,7 @@ impl<'a> Render<'a> {
             // coefficient has the fewest factors of two.
             let d: Vec<(u64, BitVec)> = signs
                 .iter()
-                .map(|(set, c)| (*set, BitVec::un_unchecked(UnOp::Neg, c)))
+                .map(|(set, c)| (*set, super::word::un(UnOp::Neg, c)))
                 .collect();
             let Some(tz) = d.iter().map(|(_, c)| trailing_zeros(c)).min() else {
                 continue;
@@ -1843,30 +1995,27 @@ impl<'a> Render<'a> {
             // Exact division by `k`: the odd part's inverse, and the factors of two shifted out
             // arithmetically (`−2 / 2` is `−1`, the coefficient of a bitwise function; its
             // logical shift is not).
-            let by = BitVec::wrapping_from_u64(w, u64::from(tz));
-            for k in [*pivot, BitVec::un_unchecked(UnOp::Neg, pivot)] {
-                let shifted = BitVec::bin_unchecked(BinOp::AShr, &k, &by);
+            let by = super::word::small(w, u64::from(tz));
+            for k in [*pivot, super::word::un(UnOp::Neg, pivot)] {
+                let shifted = super::word::bin(BinOp::AShr, &k, &by);
                 let inv = super::poly::odd_inverse(&shifted);
                 let mut g = Poly::zero(w);
                 let mut exact = true;
                 for (set, dc) in &d {
-                    let a = BitVec::bin_unchecked(
-                        BinOp::Mul,
-                        &BitVec::bin_unchecked(BinOp::AShr, dc, &by),
-                        &inv,
-                    );
-                    if BitVec::bin_unchecked(BinOp::Mul, &a, &k) != *dc {
+                    let a =
+                        super::word::bin(BinOp::Mul, &super::word::bin(BinOp::AShr, dc, &by), &inv);
+                    if super::word::bin(BinOp::Mul, &a, &k) != *dc {
                         exact = false;
                         break;
                     }
                     g.add_term(
-                        vec![(
+                        Mono::of(
                             Sym {
                                 set: *set,
                                 class: FULL,
                             },
                             1,
-                        )],
+                        ),
                         &a,
                     );
                 }
@@ -1898,13 +2047,13 @@ impl<'a> Render<'a> {
             exts.push((e, k));
             rest = rest.sub(&part);
             for (m, c) in above {
-                rest.add_term(m, &BitVec::un_unchecked(UnOp::Neg, &c));
+                rest.add_term(m, &super::word::un(UnOp::Neg, &c));
             }
         }
         if exts.is_empty() {
             return Vec::new();
         }
-        let mut sum = if rest.terms().keys().all(Vec::is_empty) {
+        let mut sum = if rest.terms().keys().all(|m| m.is_empty()) {
             Sum {
                 terms: Vec::new(),
                 konst: (!rest.konst().is_zero()).then(|| rest.konst()),
@@ -1930,7 +2079,9 @@ impl<'a> Render<'a> {
     /// atom, for at most three atoms with such terms. Each choice is checked on the tables'
     /// corner sums before anything is built. For example `2·(x & ~4) + (p & ~4) −
     /// (x & p & ~4) + (x & p & 4) + 4` is `x + ((x ^ 4) | p)`.
-    fn affine_bits(&mut self, p: &Poly) -> Option<Sum> {
+    ///
+    /// `q` is `p` over masked symbols alone ([`Poly::expand_full`]).
+    fn affine_bits(&mut self, p: &Poly, q: &Poly) -> Option<Sum> {
         let w = self.w;
         let n = self.classes.len();
         let single = |m: &Mono| matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() == 1);
@@ -1940,7 +2091,6 @@ impl<'a> Render<'a> {
         {
             return None;
         }
-        let q = p.expand_full(self.classes);
         let prec = |c: usize| u32::from(w.bits()) - u32::from(self.classes.low(c));
         let atoms = q.atoms();
         let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
@@ -1969,8 +2119,10 @@ impl<'a> Render<'a> {
             let class = usize::from(sym.class);
             let k = sym.set.count_ones();
             if k >= 2 {
+                // (`unsigned_abs`: at a precision of 128 bits the coefficient may be `i128::MIN`,
+                // whose `abs` overflows.)
                 let v = super::poly::signed_rep(c, prec(class)).to_i128();
-                if v.is_none_or(|v| v.abs() > 1i128 << (k - 1).min(64)) {
+                if v.is_none_or(|v| v.unsigned_abs() > 1u128 << (k - 1).min(64)) {
                     return None;
                 }
             }
@@ -1988,23 +2140,23 @@ impl<'a> Render<'a> {
         let top = (0..n)
             .max_by_key(|&c| (prec(c), core::cmp::Reverse(c)))
             .unwrap_or(0);
-        let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
-        let add = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Add, a, b);
-        let low = |c: usize| crate::facts::known::low_mask(w, prec(c));
+        let sub = |a: &BitVec, b: &BitVec| super::word::bin(BinOp::Sub, a, b);
+        let add = |a: &BitVec, b: &BitVec| super::word::bin(BinOp::Add, a, b);
+        let low = |c: usize| super::word::low_mask(w, prec(c));
         // `v ∈ {−1, 0, 1}`, and `v ∈ {0, 1}`, modulo class `c`'s precision.
         let within_one = |v: &BitVec, c: usize| {
             let v = bv_and(v, &low(c));
-            v.is_zero() || v == BitVec::one(w) || v == low(c)
+            v.is_zero() || v == super::word::one(w) || v == low(c)
         };
         let bit = |v: &BitVec, c: usize| {
             let v = bv_and(v, &low(c));
-            v.is_zero() || v == BitVec::one(w)
+            v.is_zero() || v == super::word::one(w)
         };
         let mut choices: Vec<(usize, Vec<BitVec>)> = Vec::new();
         for &j in &singles {
             let mut betas: Vec<BitVec> = Vec::new();
             for d in [0i128, -1, 1] {
-                let b = sub(&gamma[top][1 << j], &BitVec::wrapping_from_i128(w, d));
+                let b = sub(&gamma[top][1 << j], &super::word::signed(w, d));
                 let b = super::poly::signed_rep(&b, prec(top));
                 if (0..n).all(|c| within_one(&sub(&gamma[c][1 << j], &b), c)) && !betas.contains(&b)
                 {
@@ -2030,11 +2182,15 @@ impl<'a> Render<'a> {
         // Per class: the constant's bit there, for the form and for its negation.
         let konst = q.konst();
         let class_bit = |v: &BitVec, c: usize| {
-            self.classes
-                .bit(v, c)
-                .map(|b| if b { BitVec::one(w) } else { BitVec::zero(w) })
+            self.classes.bit(v, c).map(|b| {
+                if b {
+                    super::word::one(w)
+                } else {
+                    BitVec::zero(w)
+                }
+            })
         };
-        let neg_konst = BitVec::un_unchecked(UnOp::Neg, &konst);
+        let neg_konst = super::word::un(UnOp::Neg, &konst);
         let kbits: [Vec<Option<BitVec>>; 2] = [
             (0..n).map(|c| class_bit(&konst, c)).collect(),
             (0..n).map(|c| class_bit(&neg_konst, c)).collect(),
@@ -2059,7 +2215,10 @@ impl<'a> Render<'a> {
                 if !with_konst && konst.is_zero() {
                     continue;
                 }
-                for (sign, kb) in [(BitVec::one(w), &kbits[0]), (BitVec::ones(w), &kbits[1])] {
+                for (sign, kb) in [
+                    (super::word::one(w), &kbits[0]),
+                    (BitVec::ones(w), &kbits[1]),
+                ] {
                     // The table of `±(form − Σ βᵢ·xᵢ)` in each class: its constant's bit plus
                     // the corner sums, each 0 or 1.
                     let fits = (0..n).all(|c| {
@@ -2072,11 +2231,8 @@ impl<'a> Render<'a> {
                             return false;
                         };
                         (0..entries).all(|p| {
-                            let d = BitVec::bin_unchecked(
-                                BinOp::Mul,
-                                &sign,
-                                &sub(&corner[c][p], &bsum[p]),
-                            );
+                            let d =
+                                super::word::bin(BinOp::Mul, &sign, &sub(&corner[c][p], &bsum[p]));
                             bit(&add(&k0, &d), c)
                         })
                     });
@@ -2089,24 +2245,24 @@ impl<'a> Render<'a> {
                         if b.is_zero() {
                             continue;
                         }
-                        let nb = BitVec::un_unchecked(UnOp::Neg, b);
+                        let nb = super::word::un(UnOp::Neg, b);
                         let set = 1u64 << support[j];
                         for c in 0..n {
                             rest.add_term(
-                                vec![(
+                                Mono::of(
                                     Sym {
                                         set,
                                         class: c as u16,
                                     },
                                     1,
-                                )],
+                                ),
                                 &nb,
                             );
                         }
                         terms.push((self.atom(support[j])?, *b));
                     }
                     if !with_konst {
-                        rest.add_term(Vec::new(), &neg_konst);
+                        rest.add_term(Mono::new(), &neg_konst);
                     }
                     let form = if sign.is_ones() { rest.neg() } else { rest };
                     let Some(f) = Bits::from_linear(&form, self.classes) else {
@@ -2137,10 +2293,11 @@ impl<'a> Render<'a> {
     /// `(x ^ k)·1111`, and `k + (x & ~3) − 2·(x & k & ~3)` is `(x & ~3) ^ k` even when no
     /// bitwise operand has `k`'s bits. `plain` says the form is itself a bitwise function
     /// (then `s = 1` is not tried again).
-    fn scaled_bits(&mut self, p: &Poly, plain: bool) -> Vec<Sum> {
+    ///
+    /// `q` is the form over masked symbols alone ([`Poly::expand_full`]).
+    fn scaled_bits(&mut self, q: &Poly, plain: bool) -> Vec<Sum> {
         let w = self.w;
         let n = self.classes.len();
-        let q = p.expand_full(self.classes);
         let atoms = q.atoms();
         if atoms == 0 || atoms.count_ones() > 5 || !self.spend(q.len() as u64 + n as u64) {
             return Vec::new();
@@ -2167,13 +2324,13 @@ impl<'a> Render<'a> {
             if !v.bit(0).unwrap_or(false) {
                 continue;
             }
-            for k in [v, BitVec::un_unchecked(UnOp::Neg, &v)] {
-                if !scales.contains(&k) && !(plain && k == BitVec::one(w)) {
+            for k in [v, super::word::un(UnOp::Neg, &v)] {
+                if !scales.contains(&k) && !(plain && k == super::word::one(w)) {
                     scales.push(k);
                 }
             }
         }
-        let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
+        let sub = |a: &BitVec, b: &BitVec| super::word::bin(BinOp::Sub, a, b);
         let mut out = Vec::new();
         for k in scales {
             if !self.spend(q.len() as u64 + ((n as u64) << atoms.count_ones())) {
@@ -2185,7 +2342,7 @@ impl<'a> Render<'a> {
             };
             let kp = ps.konst();
             // The top position: complementing `g` there adds `2^(W−1)`, whatever `g`'s value.
-            let top = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(w.bits()) - 1);
+            let top = super::word::bv_shl(&super::word::one(w), u32::from(w.bits()) - 1);
             let flipped = bv_xor(&kp, &top);
             let (mut g0, mut extra) = (BitVec::zero(w), BitVec::zero(w));
             for (c, &([zero, one], moved)) in zv.iter().enumerate() {
@@ -2219,7 +2376,7 @@ impl<'a> Render<'a> {
             // position): `ps = h + extra + d'` with `h`'s constant `g0`.
             let dp = sub(&sub(&kp, &g0), &extra);
             let mut h = ps;
-            h.add_term(Vec::new(), &sub(&g0, &kp));
+            h.add_term(Mono::new(), &sub(&g0, &kp));
             let Some(f) = Bits::from_linear(&h, self.classes) else {
                 continue;
             };
@@ -2227,7 +2384,7 @@ impl<'a> Render<'a> {
             let Some(g) = self.best(&renderings) else {
                 continue;
             };
-            let d = BitVec::bin_unchecked(BinOp::Mul, &k, &dp);
+            let d = super::word::bin(BinOp::Mul, &k, &dp);
             out.push(Sum {
                 terms: vec![(g, k)],
                 konst: (!d.is_zero()).then_some(d),
@@ -2265,8 +2422,8 @@ impl<'a> Render<'a> {
                 .filter(|&(_, &a)| set >> a & 1 == 1)
                 .fold(0usize, |q, (j, _)| q | 1 << j)
         };
-        let add = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Add, a, b);
-        let sub = |a: &BitVec, b: &BitVec| BitVec::bin_unchecked(BinOp::Sub, a, b);
+        let add = |a: &BitVec, b: &BitVec| super::word::bin(BinOp::Add, a, b);
+        let sub = |a: &BitVec, b: &BitVec| super::word::bin(BinOp::Sub, a, b);
         let mut d = vec![BitVec::zero(w); corners];
         for (m, c) in p.terms() {
             match m.as_slice() {
@@ -2462,13 +2619,13 @@ impl<'a> Render<'a> {
             };
             let scale = |k: &BitVec| {
                 let m = if k.msb() {
-                    BitVec::un_unchecked(UnOp::Neg, k)
+                    super::word::un(UnOp::Neg, k)
                 } else {
                     *k
                 };
-                if m == BitVec::one(w) {
+                if m == super::word::one(w) {
                     0
-                } else if m == BitVec::wrapping_from_u64(w, 2) {
+                } else if m == super::word::small(w, 2) {
                     1
                 } else {
                     2
@@ -2696,7 +2853,7 @@ impl<'a> Render<'a> {
                         .enumerate()
                         .filter(|&(_, &a)| sym.set >> a & 1 == 1)
                         .fold(0usize, |q, (j, _)| q | 1 << j);
-                    d[q] = BitVec::bin_unchecked(BinOp::Add, &d[q], c);
+                    d[q] = super::word::bin(BinOp::Add, &d[q], c);
                 }
                 _ => return Vec::new(),
             }
@@ -2704,14 +2861,14 @@ impl<'a> Render<'a> {
         for b in 0..3 {
             for q in 0..8 {
                 if q >> b & 1 == 1 {
-                    d[q] = BitVec::bin_unchecked(BinOp::Add, &d[q], &d[q ^ 1 << b]);
+                    d[q] = super::word::bin(BinOp::Add, &d[q], &d[q ^ 1 << b]);
                 }
             }
         }
         let konst = p.konst();
         let u: Vec<BitVec> = d
             .iter()
-            .map(|x| BitVec::bin_unchecked(BinOp::Sub, &konst, x))
+            .map(|x| super::word::bin(BinOp::Sub, &konst, x))
             .collect();
         let mut splits: Vec<Split> = Vec::new();
         let forms = min_forms();
@@ -2723,12 +2880,12 @@ impl<'a> Render<'a> {
                 }
                 let g = |q: usize| t >> ((q >> i & 1) | (q >> j & 1) << 1) & 1 == 1;
                 for k in [1i128, -1, 2, -2] {
-                    let k = BitVec::wrapping_from_i128(w, k);
+                    let k = super::word::signed(w, k);
                     let mut vals: Vec<BitVec> = Vec::with_capacity(4);
                     for (q, v) in u.iter().enumerate() {
                         // `k·g` is `−k` at a corner where `g` holds: the rest is `u + k·g`.
                         let r = if g(q) {
-                            BitVec::bin_unchecked(BinOp::Add, v, &k)
+                            super::word::bin(BinOp::Add, v, &k)
                         } else {
                             *v
                         };
@@ -2754,16 +2911,11 @@ impl<'a> Render<'a> {
             // `g`'s terms (its integer conjunction form) times `k`, taken from the form.
             let m = mobius(&[u64::from(t)], 2);
             let mut rest = p.clone();
-            let neg = |c: &BitVec| BitVec::un_unchecked(UnOp::Neg, c);
-            let kg = |v: i64| {
-                BitVec::bin_unchecked(
-                    BinOp::Mul,
-                    &k,
-                    &BitVec::wrapping_from_i128(w, i128::from(v)),
-                )
-            };
+            let neg = |c: &BitVec| super::word::un(UnOp::Neg, c);
+            let kg =
+                |v: i64| super::word::bin(BinOp::Mul, &k, &super::word::signed(w, i128::from(v)));
             // g = −m₀ + Σ m_T·AND_T.
-            rest.add_term(Vec::new(), &kg(m[0]));
+            rest.add_term(Mono::new(), &kg(m[0]));
             for (q, &v) in m.iter().enumerate().skip(1) {
                 if v == 0 {
                     continue;
@@ -2772,7 +2924,7 @@ impl<'a> Render<'a> {
                     .iter()
                     .filter(|&&(b, _)| q >> b & 1 == 1)
                     .fold(0u64, |s, &(_, a)| s | 1 << support[a]);
-                rest.add_term(vec![(Sym { set, class }, 1)], &neg(&kg(v)));
+                rest.add_term(Mono::of(Sym { set, class }, 1), &neg(&kg(v)));
             }
             let Some(r) = self.two_terms_by(&rest, false) else {
                 continue;
@@ -2844,7 +2996,7 @@ impl<'a> Render<'a> {
             for s in parts {
                 t.terms.extend(s.terms.iter().copied());
                 if let Some(c) = s.konst {
-                    k = BitVec::bin_unchecked(BinOp::Add, &k, &c);
+                    k = super::word::bin(BinOp::Add, &k, &c);
                 }
             }
             t.konst = (!k.is_zero()).then_some(k);
@@ -2854,7 +3006,7 @@ impl<'a> Render<'a> {
         if !konst.is_zero() {
             for (i, q) in parts.iter().enumerate() {
                 let mut qk = q.clone();
-                qk.add_term(Vec::new(), &konst);
+                qk.add_term(Mono::new(), &konst);
                 let sums = self.linear_sums(&qk);
                 let Some(si) = self.cheapest(sums) else {
                     continue;
@@ -2919,7 +3071,7 @@ impl<'a> Render<'a> {
             }
             // The scale: from the atom's lone term, or where it has none (`x & d`), from its
             // term with the fewest atoms, whose coefficient in the function is ±1, ±2 or ±4.
-            let neg = |c: &BitVec| BitVec::un_unchecked(UnOp::Neg, c);
+            let neg = |c: &BitVec| super::word::un(UnOp::Neg, c);
             let scales: Vec<BitVec> = match coef.get(&bit) {
                 Some(&c) => vec![c, neg(&c)],
                 None => {
@@ -2933,11 +3085,11 @@ impl<'a> Render<'a> {
                     };
                     let mut v = vec![c, neg(&c)];
                     for sh in 1..=2u32 {
-                        if crate::facts::known::trailing_zeros(&c) >= sh {
-                            let half = BitVec::bin_unchecked(
+                        if super::word::trailing_zeros(&c) >= sh {
+                            let half = super::word::bin(
                                 BinOp::AShr,
                                 &c,
-                                &BitVec::wrapping_from_u64(w, u64::from(sh)),
+                                &super::word::small(w, u64::from(sh)),
                             );
                             v.push(half);
                             v.push(neg(&half));
@@ -2963,11 +3115,8 @@ impl<'a> Render<'a> {
                     }
                     let c = coef.get(&set_of(q)).copied().unwrap_or(BitVec::zero(w));
                     match (-4i64..=4).find(|&v| {
-                        BitVec::bin_unchecked(
-                            BinOp::Mul,
-                            &s,
-                            &BitVec::wrapping_from_i128(w, i128::from(v)),
-                        ) == c
+                        super::word::bin(BinOp::Mul, &s, &super::word::signed(w, i128::from(v)))
+                            == c
                     }) {
                         Some(v) => *slot = v,
                         None => {
@@ -3037,24 +3186,20 @@ impl<'a> Render<'a> {
                     }
                     let mut rest = p.clone();
                     let sv = |v: i64| {
-                        BitVec::bin_unchecked(
-                            BinOp::Mul,
-                            &s,
-                            &BitVec::wrapping_from_i128(w, i128::from(v)),
-                        )
+                        super::word::bin(BinOp::Mul, &s, &super::word::signed(w, i128::from(v)))
                     };
                     // f = −m_∅ + Σ m_T·AND_T.
-                    rest.add_term(Vec::new(), &sv(m[0]));
+                    rest.add_term(Mono::new(), &sv(m[0]));
                     for (q, &v) in m.iter().enumerate().skip(1) {
                         if v != 0 {
                             rest.add_term(
-                                vec![(
+                                Mono::of(
                                     Sym {
                                         set: set_of(q),
                                         class,
                                     },
                                     1,
-                                )],
+                                ),
                                 &sv(-v),
                             );
                         }
@@ -3096,8 +3241,8 @@ impl<'a> Render<'a> {
         for &(t, c) in &s.terms {
             let n = self.b.nodes[t as usize];
             if n.op == MOp::Not {
-                terms.push((n.args[0], BitVec::un_unchecked(UnOp::Neg, &c)));
-                k = BitVec::bin_unchecked(BinOp::Sub, &k, &c);
+                terms.push((n.args[0], super::word::un(UnOp::Neg, &c)));
+                k = super::word::bin(BinOp::Sub, &k, &c);
                 changed = true;
             } else {
                 terms.push((t, c));
@@ -3116,7 +3261,7 @@ impl<'a> Render<'a> {
             let (t, c) = s.terms[i];
             for nt in self.complement(t) {
                 let mut terms = s.terms.clone();
-                terms[i] = (nt, BitVec::un_unchecked(UnOp::Neg, &c));
+                terms[i] = (nt, super::word::un(UnOp::Neg, &c));
                 out.push(Sum { terms, konst: None });
             }
         }
@@ -3177,7 +3322,7 @@ impl<'a> Render<'a> {
         let Some(k) = s.konst.filter(|k| !k.is_zero()) else {
             return out;
         };
-        let neg = |c: &BitVec| BitVec::un_unchecked(UnOp::Neg, c);
+        let neg = |c: &BitVec| super::word::un(UnOp::Neg, c);
         if k == BitVec::ones(w) && !s.terms.is_empty() {
             let flipped = Sum {
                 terms: s.terms.iter().map(|&(t, c)| (t, neg(&c))).collect(),
@@ -3193,11 +3338,11 @@ impl<'a> Render<'a> {
             let inner = self.sum(&best);
             let n = self.b.un(MOp::Not, inner);
             out.push(Sum {
-                terms: vec![(n, BitVec::one(w))],
+                terms: vec![(n, super::word::one(w))],
                 konst: None,
             });
         }
-        let twice = BitVec::bin_unchecked(BinOp::Add, &k, &k);
+        let twice = super::word::bin(BinOp::Add, &k, &k);
         if let Some(i) = s.terms.iter().position(|(_, c)| *c == twice) {
             let t = s.terms[i].0;
             for nt in self.complement(t) {
@@ -3215,12 +3360,12 @@ impl<'a> Render<'a> {
     fn factored(&mut self, s: &Sum) -> Vec<Sum> {
         let w = self.w;
         let mut out = Vec::new();
-        let neg = |c: &BitVec| BitVec::un_unchecked(UnOp::Neg, c);
+        let neg = |c: &BitVec| super::word::un(UnOp::Neg, c);
         let rep = |c: &BitVec| if c.msb() { neg(c) } else { *c };
         let mut seen: Vec<BitVec> = Vec::new();
         for &(_, c) in &s.terms {
             let r = rep(&c);
-            if r == BitVec::one(w) || seen.contains(&r) {
+            if r == super::word::one(w) || seen.contains(&r) {
                 continue;
             }
             seen.push(r);
@@ -3236,7 +3381,7 @@ impl<'a> Render<'a> {
                     (
                         t,
                         if d == r {
-                            BitVec::one(w)
+                            super::word::one(w)
                         } else {
                             BitVec::ones(w)
                         },
@@ -3269,8 +3414,8 @@ impl<'a> Render<'a> {
             };
             let Some(m) = [1i128, -1, 2, -2]
                 .iter()
-                .map(|&m| BitVec::wrapping_from_i128(w, m))
-                .find(|m| BitVec::bin_unchecked(BinOp::Mul, &r, m) == k)
+                .map(|&m| super::word::signed(w, m))
+                .find(|m| super::word::bin(BinOp::Mul, &r, m) == k)
             else {
                 continue;
             };
@@ -3311,7 +3456,7 @@ impl<'a> Render<'a> {
         }
         let prec = |c: usize| u32::from(w.bits()) - u32::from(self.classes.low(c));
         let same = |a: &BitVec, b: &BitVec, m: u32| {
-            let lm = crate::facts::known::low_mask(w, m);
+            let lm = super::word::low_mask(w, m);
             bv_and(a, &lm) == bv_and(b, &lm)
         };
         let mut groups: Vec<Vec<usize>> = Vec::new();
@@ -3377,7 +3522,7 @@ impl<'a> Render<'a> {
                 let part = &options[g][k];
                 t.terms.extend(part.terms.iter().copied());
                 if let Some(c) = part.konst {
-                    t.konst = Some(BitVec::bin_unchecked(
+                    t.konst = Some(super::word::bin(
                         BinOp::Add,
                         &t.konst.unwrap_or(BitVec::zero(w)),
                         &c,
@@ -3476,7 +3621,7 @@ impl<'a> Render<'a> {
             return Vec::new();
         }
         let w = self.w;
-        let one = BitVec::one(w);
+        let one = super::word::one(w);
         let lin = p.part(|d| d <= 1);
         let nl = p.part(|d| d >= 2);
         // The linear part's cheapest decompositions: which is best depends on what it joins
@@ -3690,7 +3835,7 @@ impl<'a> Render<'a> {
             let args = args?;
             let x = match e.op {
                 synth::Op::Var(v) => self.atom(*ids.get(usize::from(v))?)?,
-                synth::Op::One => self.b.konst(&BitVec::one(self.w)),
+                synth::Op::One => self.b.konst(&super::word::one(self.w)),
                 op if args.len() == 1 => self.b.un(op.mop()?, args[0]),
                 op => self.b.bin(op.mop()?, args[0], *args.get(1)?),
             };
@@ -3781,7 +3926,7 @@ impl<'a> Render<'a> {
                     .fold(0usize, |q, (j, _)| q | 1 << j);
                 for (p, vp) in v.iter_mut().enumerate() {
                     if p & q == q {
-                        *vp = BitVec::bin_unchecked(BinOp::Add, vp, k);
+                        *vp = super::word::bin(BinOp::Add, vp, k);
                     }
                 }
             }
@@ -3794,8 +3939,7 @@ impl<'a> Render<'a> {
             for &base in &distinct {
                 let mut sum = Sum {
                     terms: Vec::new(),
-                    konst: (!base.is_zero())
-                        .then(|| BitVec::bin_unchecked(BinOp::Mul, &base, mask)),
+                    konst: (!base.is_zero()).then(|| super::word::bin(BinOp::Mul, &base, mask)),
                 };
                 for &val in distinct.iter().filter(|&&x| x != base) {
                     let mut tt = 0u8;
@@ -3807,7 +3951,7 @@ impl<'a> Render<'a> {
                     let g = self.min_form(tt, &atoms)?;
                     let x = self.masked(g, mask);
                     sum.terms
-                        .push((x, BitVec::bin_unchecked(BinOp::Sub, &val, &base)));
+                        .push((x, super::word::bin(BinOp::Sub, &val, &base)));
                 }
                 options.push(sum);
             }
@@ -3858,8 +4002,18 @@ impl<'a> Render<'a> {
             .filter(|&&q| !d[q].is_zero())
             .fold(0u32, |m, &q| m | 1 << q);
         for tt in 0..1u32 << (1 << s) {
-            let table = [u64::from(tt)];
-            let a = mobius(&table, s);
+            // The table's Möbius coefficients (at most eight entries: no vector).
+            let mut a = [0i64; 8];
+            for (p, slot) in a.iter_mut().enumerate().take(1 << s) {
+                *slot = i64::from(tt >> p & 1);
+            }
+            for b in 0..s {
+                for p in 0..1usize << s {
+                    if p >> b & 1 == 1 {
+                        a[p] -= a[p ^ 1 << b];
+                    }
+                }
+            }
             let present = wide
                 .iter()
                 .filter(|&&q| a[q] != 0)
@@ -3874,38 +4028,35 @@ impl<'a> Render<'a> {
             else {
                 continue;
             };
-            let aq = BitVec::wrapping_from_i128(w, i128::from(a[pivot]));
+            let aq = super::word::signed(w, i128::from(a[pivot]));
             let v = a[pivot].trailing_zeros();
-            if crate::facts::known::trailing_zeros(&d[pivot]) < v {
+            if super::word::trailing_zeros(&d[pivot]) < v {
                 continue;
             }
             // c = (d / 2^v)·u⁻¹ mod 2^(W−v), u the odd part of a.
             let inv = match inverses.iter().find(|(k, _)| *k == a[pivot]) {
                 Some((_, x)) => *x,
                 None => {
-                    let u = crate::facts::known::bv_lshr(&aq, v);
+                    let u = super::word::bv_lshr(&aq, v);
                     let x = super::poly::odd_inverse(&u);
                     inverses.push((a[pivot], x));
                     x
                 }
             };
-            let dv = crate::facts::known::bv_lshr(&d[pivot], v);
-            let c0 = BitVec::bin_unchecked(BinOp::Mul, &dv, &inv);
+            let dv = super::word::bv_lshr(&d[pivot], v);
+            let c0 = super::word::bin(BinOp::Mul, &dv, &inv);
             let step =
-                crate::facts::known::bv_shl(&BitVec::one(w), u32::from(w.bits()).saturating_sub(v));
+                super::word::bv_shl(&super::word::one(w), u32::from(w.bits()).saturating_sub(v));
             let mut chosen: Option<BitVec> = None;
             for j in 0..1u64 << v.min(3) {
-                let c = BitVec::bin_unchecked(
+                let c = super::word::bin(
                     BinOp::Add,
                     &c0,
-                    &BitVec::bin_unchecked(BinOp::Mul, &step, &BitVec::wrapping_from_u64(w, j)),
+                    &super::word::bin(BinOp::Mul, &step, &super::word::small(w, j)),
                 );
                 let fits = wide.iter().all(|&q| {
-                    BitVec::bin_unchecked(
-                        BinOp::Mul,
-                        &c,
-                        &BitVec::wrapping_from_i128(w, i128::from(a[q])),
-                    ) == d[q]
+                    super::word::bin(BinOp::Mul, &c, &super::word::signed(w, i128::from(a[q])))
+                        == d[q]
                 });
                 if fits {
                     chosen = Some(c);
@@ -3920,28 +4071,20 @@ impl<'a> Render<'a> {
                 continue;
             };
             let gm = self.masked(g, mask);
-            let a0 = BitVec::wrapping_from_i128(w, i128::from(a[0]));
+            let a0 = super::word::signed(w, i128::from(a[0]));
             let mut sum = Sum {
                 terms: vec![(gm, c)],
-                konst: Some(BitVec::un_unchecked(
+                konst: Some(super::word::un(
                     UnOp::Neg,
-                    &BitVec::bin_unchecked(
-                        BinOp::Mul,
-                        &BitVec::bin_unchecked(BinOp::Mul, &c, &a0),
-                        mask,
-                    ),
+                    &super::word::bin(BinOp::Mul, &super::word::bin(BinOp::Mul, &c, &a0), mask),
                 )),
             };
             for (j, &x) in atoms.iter().enumerate() {
                 let q = 1usize << j;
-                let r = BitVec::bin_unchecked(
+                let r = super::word::bin(
                     BinOp::Sub,
                     &d[q],
-                    &BitVec::bin_unchecked(
-                        BinOp::Mul,
-                        &c,
-                        &BitVec::wrapping_from_i128(w, i128::from(a[q])),
-                    ),
+                    &super::word::bin(BinOp::Mul, &c, &super::word::signed(w, i128::from(a[q]))),
                 );
                 if !r.is_zero() {
                     let xm = self.masked(x, mask);
@@ -3964,7 +4107,7 @@ impl<'a> Render<'a> {
                 Some(a) => self.b.bin(MOp::Mul, a, p),
             });
         }
-        Some(acc.unwrap_or_else(|| self.b.konst(&BitVec::one(self.w))))
+        Some(acc.unwrap_or_else(|| self.b.konst(&super::word::one(self.w))))
     }
 
     /// A polynomial in one atom `x`, of degree 4 or more, that is `a·(x + s)^k + b` as a
@@ -4054,14 +4197,14 @@ impl<'a> Render<'a> {
                 x
             } else {
                 self.sum(&Sum {
-                    terms: vec![(x, BitVec::one(w))],
-                    konst: Some(BitVec::wrapping_from_u64(w, s)),
+                    terms: vec![(x, super::word::one(w))],
+                    konst: Some(super::word::small(w, s)),
                 })
             };
             let y = self.power(base, k);
-            let b = BitVec::wrapping_from_u64(w, b);
+            let b = super::word::small(w, b);
             return Some(self.sum(&Sum {
-                terms: vec![(y, BitVec::wrapping_from_u64(w, a))],
+                terms: vec![(y, super::word::small(w, a))],
                 konst: (!b.is_zero()).then_some(b),
             }));
         }

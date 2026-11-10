@@ -26,10 +26,11 @@ const PHASES = [
   ["linear_mba", "linear MBA", "Linear combinations of bitwise functions, read off their values at the corners."],
   ["shuffle", "shuffle", "Values assembled from bit slices become the source, a rotation, a byte swap or a concat."],
   ["demanded", "demanded", "Operands observed only through some bits are simplified under those bits."],
+  ["words", "words", "Arithmetic done limb by limb, the carries written as comparisons, read as arithmetic on the words."],
   ["mba", "MBA", "The MBA service: fragments lowered, solved, proved by certificate, and lifted back."],
 ];
 const STRATEGIES = {
-  deobfuscate: ["fact_fold", "local", "linear", "xor", "casts", "division", "invert", "compares", "bitwise", "carries", "linear_mba", "shuffle", "demanded", "mba", "local"],
+  deobfuscate: ["fact_fold", "local", "linear", "xor", "casts", "division", "invert", "compares", "bitwise", "carries", "linear_mba", "shuffle", "demanded", "words", "mba", "local"],
   standard: ["fact_fold", "local", "linear", "xor", "casts", "invert", "compares", "bitwise", "demanded", "local"],
 };
 

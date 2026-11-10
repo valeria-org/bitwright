@@ -164,9 +164,6 @@ pub(crate) fn decast_narrow(p: &MbaExpr) -> Option<(MbaExpr, bool)> {
 fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
     let w = p.width()?;
     let nodes = p.nodes();
-    if nodes.iter().any(|n| n.width > w) {
-        return None;
-    }
     let narrow = if narrowing {
         narrow_registers(p, w)
     } else {
@@ -190,7 +187,7 @@ fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
     let wb = w.bits();
     let mut exact_of =
         |m: &mut MbaExpr, low: &[u32], zf: &[Option<u16>], i: usize, nw: Width| -> Option<u32> {
-            if nw == w || zf[i].is_some_and(|z| z <= nw.bits()) {
+            if nw >= w || zf[i].is_some_and(|z| z <= nw.bits()) {
                 return Some(low[i]);
             }
             if let Some(e) = exact[i] {
@@ -220,10 +217,10 @@ fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
         let a = n.args[0] as usize;
         let b = n.args[1] as usize;
         let (v, z): (u32, Option<u16>) = match n.op {
-            MOp::Const(c) => (
-                m.push(MOp::Const(c.zext(w).ok()?), &[]).ok()?,
-                Some(bit_length(&c)),
-            ),
+            MOp::Const(c) => {
+                let c = if nw > w { c.trunc(w) } else { c.zext(w) }.ok()?;
+                (m.push(MOp::Const(c), &[]).ok()?, Some(bit_length(&c)))
+            }
             MOp::Var(k) => {
                 let x = m.push(MOp::Var(k), &[]).ok()?;
                 match narrow[i] {
@@ -233,6 +230,8 @@ fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
                         (m.push_cast(MOp::Zext, t, w).ok()?, Some(nn.bits()))
                     }
                     None if nw == w => (x, None),
+                    // A variable wider than the root, of which only the low bits are read.
+                    None if nw > w => (m.push_cast(MOp::Trunc, x, w).ok()?, None),
                     None => (m.push_cast(MOp::Zext, x, w).ok()?, Some(nw.bits())),
                 }
             }
@@ -262,7 +261,12 @@ fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
                     _ => None,
                 },
             ),
+            // A left shift of a node wider than the root by the root's width or more leaves
+            // nothing in the low bits.
+            MOp::Shl(k) if k >= wb => (m.push(MOp::Const(BitVec::zero(w)), &[]).ok()?, Some(0)),
             MOp::Neg | MOp::Not | MOp::Shl(_) => (m.push(n.op, &[low[a]]).ok()?, None),
+            // A right shift of a node wider than the root reads bits the low form lacks.
+            MOp::LShr(_) if nodes[a].width > w => return None,
             MOp::LShr(k) => {
                 let e = exact_of(&mut m, &low, &zeros_from, a, nodes[a].width)?;
                 (
@@ -273,6 +277,9 @@ fn decast_in(p: &MbaExpr, narrowing: bool) -> Option<(MbaExpr, bool)> {
             // The low bits of a truncation are its operand's; what is known zero of the
             // operand's low form below the truncation's width stays known.
             MOp::Trunc => (low[a], zeros_from[a].filter(|&z| z <= nw.bits())),
+            // An extension of a node as wide as the root or wider: the low bits are the
+            // operand's.
+            MOp::Zext | MOp::Sext if nodes[a].width >= w => (low[a], zeros_from[a]),
             MOp::Zext => (
                 exact_of(&mut m, &low, &zeros_from, a, nodes[a].width)?,
                 Some(nodes[a].width.bits()),

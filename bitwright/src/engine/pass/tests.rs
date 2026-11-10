@@ -198,25 +198,413 @@ fn linear_cancels_additive_masking() {
     assert!(!eng.simplify(&mut cx, e).unwrap().changed);
 }
 
+/// `n` symbols `s0`, `s1`, … of width `w`.
+fn symbols(cx: &mut Context, n: usize, w: Width) -> Vec<Expr> {
+    (0..n)
+        .map(|i| cx.symbol(format!("s{i}").as_str(), w).unwrap())
+        .collect()
+}
+
+/// `terms` joined by `op`, left to right.
+fn chain(cx: &mut Context, op: BinOp, terms: &[Expr]) -> Expr {
+    terms[1..]
+        .iter()
+        .fold(terms[0], |e, &t| cx.bin(op, e, t).unwrap())
+}
+
+/// The symbols under `e`, and its distinct nodes.
+fn size(cx: &mut Context, e: Expr) -> (usize, u32) {
+    let nodes = match cx.dag_size(&[e], u32::MAX).unwrap() {
+        crate::Bounded::Exact(n) | crate::Bounded::AtLeast(n) => n,
+    };
+    (cx.symbols_in(&[e]).unwrap().len(), nodes)
+}
+
+/// A sum over a pass's cap on terms is an atom of the forms over it, and terms still cancel
+/// through it: in the linear pass's sums and in the xor pass's xors, at a width whose forms
+/// are kept as words and at one over 64 bits.
 #[test]
-fn linear_atomizes_huge_forms() {
-    let eng = engine(vec![Phase::Linear]);
-    let mut cx = Context::new();
-    let w = Width::W16;
-    let mut e = cx.constant_u64(w, 0).unwrap();
-    let mut syms = Vec::new();
-    for i in 0..(super::linear::MAX_TERMS + 10) {
-        let s = cx.symbol(format!("s{i}").as_str(), w).unwrap();
-        syms.push(s);
-        e = cx.bin(BinOp::Add, e, s).unwrap();
+fn terms_cancel_through_sums_over_the_cap() {
+    for (phase, name, add, sub, bits) in [
+        (Phase::Linear, "linear", BinOp::Add, BinOp::Sub, 16),
+        (Phase::Xor, "xor", BinOp::Xor, BinOp::Xor, 16),
+        (Phase::Linear, "linear", BinOp::Add, BinOp::Sub, 200),
+        (Phase::Xor, "xor", BinOp::Xor, BinOp::Xor, 200),
+    ] {
+        let eng = engine(vec![phase]);
+        let w = Width::new(bits).unwrap();
+        let mut rng = Rng(1);
+        // One of 74 terms: the other 73 are left, as one sum.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 74, w);
+        let all = chain(&mut cx, add, &s);
+        let e = cx.bin(sub, all, s[0]).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0].expr;
+        assert!(out.stats.passes[name].atomized > 0);
+        assert_eq!(size(&mut cx, r), (73, 73 + 72), "{name}");
+        assert!(equivalent(&mut cx, e, r, &mut rng));
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r], Run::default()).unwrap();
+        assert!(!again.roots[0].changed, "{name}: not idempotent");
+        // The same 70 terms in the other order: nothing is left.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 70, w);
+        let a = chain(&mut cx, add, &s);
+        let back: Vec<Expr> = s.iter().rev().copied().collect();
+        let b = chain(&mut cx, add, &back);
+        let e = cx.bin(sub, a, b).unwrap();
+        let zero = cx.constant_u64(w, 0).unwrap();
+        assert_eq!(eng.simplify(&mut cx, e).unwrap().expr, zero, "{name}");
+        // 100 of 200 terms, through three sums over the cap, one inside the other.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 200, w);
+        let a = chain(&mut cx, add, &s);
+        let even: Vec<Expr> = s.iter().step_by(2).copied().collect();
+        let b = chain(&mut cx, add, &even);
+        let e = cx.bin(sub, a, b).unwrap();
+        let r = eng.simplify(&mut cx, e).unwrap().expr;
+        assert_eq!(size(&mut cx, r), (100, 100 + 99), "{name}");
+        assert!(equivalent(&mut cx, e, r, &mut rng));
+        // A sum with another use is not taken apart: its terms would be built a second time.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 70, w);
+        let a = chain(&mut cx, add, &s);
+        let d = cx.bin(sub, a, s[0]).unwrap();
+        let e = cx.bin(BinOp::Mul, d, a).unwrap();
+        assert!(!eng.simplify(&mut cx, e).unwrap().changed, "{name}");
+        // Over `MAX_WHOLE_TERMS` terms a sum keeps no whole form: it is an atom and no more.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, super::forms::MAX_WHOLE_TERMS + 76, w);
+        let a = chain(&mut cx, add, &s);
+        let e = cx.bin(sub, a, s[0]).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(!out.roots[0].changed, "{name}");
+        assert_eq!(out.roots[0].end, End::Completed);
     }
-    // (Σ s) - s0: the sum is over the cap, so it is an atom and nothing cancels, but the
-    // result is still correct.
-    let e2 = cx.bin(BinOp::Sub, e, syms[0]).unwrap();
-    let out = eng.run(&mut cx, &[e2], Run::default()).unwrap();
-    assert!(out.stats.passes["linear"].atomized > 0);
-    let mut rng = Rng(1);
-    assert!(equivalent(&mut cx, e2, out.roots[0].expr, &mut rng));
+}
+
+/// Random sums and xors of hundreds of terms over a pool of symbols, built in pieces that
+/// repeat terms (sums over the cap as operands of sums, scaled, masked, negated and
+/// complemented): the results are equivalent, and a second run changes nothing.
+#[test]
+fn long_sums_are_sound_and_idempotent() {
+    for (phase, linear) in [(Phase::Linear, true), (Phase::Xor, false)] {
+        let eng = engine(vec![phase]);
+        let mut g = generator(0x10_9500);
+        let mut rng = Rng(5);
+        let add = if linear { BinOp::Add } else { BinOp::Xor };
+        let mut changed = 0;
+        for i in 0..32 {
+            let mut cx = Context::new();
+            let bits = [8, 16, 64, 100][i % 4];
+            let pool = symbols(
+                &mut cx,
+                40 + g.rng.below(200) as usize,
+                Width::new(bits).unwrap(),
+            );
+            let mut e: Option<Expr> = None;
+            for _ in 0..2 + g.rng.below(5) {
+                let terms: Vec<Expr> = (0..1 + g.rng.below(150))
+                    .map(|_| pool[g.rng.below(pool.len() as u64) as usize])
+                    .collect();
+                let mut piece = chain(&mut cx, add, &terms);
+                match g.rng.below(4) {
+                    0 => {
+                        let k = g.constant(bits);
+                        let k = cx.constant(&k).unwrap();
+                        let op = if linear { BinOp::Mul } else { BinOp::And };
+                        piece = cx.bin(op, piece, k).unwrap();
+                    }
+                    1 => {
+                        let op = if linear { UnOp::Neg } else { UnOp::Not };
+                        piece = cx.un(op, piece).unwrap();
+                    }
+                    _ => {}
+                }
+                e = Some(match e {
+                    None => piece,
+                    Some(e) if linear && g.rng.chance(1, 2) => {
+                        cx.bin(BinOp::Sub, e, piece).unwrap()
+                    }
+                    Some(e) => cx.bin(add, e, piece).unwrap(),
+                });
+            }
+            let e = e.unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0];
+            assert_eq!(r.end, End::Completed);
+            assert_eq!(out.stats.rejected, 0);
+            assert!(equivalent(&mut cx, e, r.expr, &mut rng), "case {i}");
+            changed += u64::from(r.changed);
+            cx.memo.clear();
+            let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+            assert!(!again.roots[0].changed, "case {i}: not idempotent");
+        }
+        assert!(changed > 8, "{changed}");
+    }
+}
+
+/// Whole forms are read only where terms meet: a long sum of distinct terms costs what it did,
+/// 36 units a node (taking each sum over the cap apart at every node above it would be 16 more).
+#[test]
+fn a_long_sum_of_distinct_terms_costs_what_it_did() {
+    for (phase, add) in [(Phase::Linear, BinOp::Add), (Phase::Xor, BinOp::Xor)] {
+        let eng = engine(vec![phase]);
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 4000, Width::W32);
+        let e = chain(&mut cx, add, &s);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(!out.roots[0].changed);
+        assert!(out.stats.pass_work < 40 * 4000, "{}", out.stats.pass_work);
+    }
+}
+
+/// A chain of `·`, `&` or `|` is one node however it was ordered and parenthesized, also over
+/// more operands than the bitwise tables read: two writings of one chain cancel.
+#[test]
+fn chains_are_written_one_way() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (op, minus) in [("&", "^"), ("|", "^"), ("*", "-")] {
+            for n in [3, 7, 9, 40] {
+                let v: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+                let join = |v: &[String]| v.join(&format!(" {op} "));
+                let back: Vec<String> = v.iter().rev().cloned().collect();
+                // `v0 op (v1 op (…))`.
+                let nested = back[1..]
+                    .iter()
+                    .fold(back[0].clone(), |e, x| format!("{x} {op} ({e})"));
+                for other in [join(&back), nested] {
+                    let src = format!("({}) {minus} ({other})", join(&v));
+                    assert_eq!(simplify(&eng, &src, 32), "0:32", "{op} of {n}");
+                }
+            }
+        }
+        // An operand of `&` or `|` counts once, and beside its complement it decides the chain.
+        for (src, want) in [
+            (
+                "(a & b & c & d & e & f & g & a) ^ (g & f & e & d & c & b & a)",
+                "0:32",
+            ),
+            ("a & b & c & d & e & f & g & ~d", "0:32"),
+            ("a | b | c | d | e | f | g | ~d", "-1:32"),
+        ] {
+            assert_eq!(simplify(&eng, src, 32), want, "{src}");
+        }
+        // Over `MAX_CHAIN` operands a chain is as written above the ones put in order: the
+        // result is still the chain's value, and stable.
+        let mut rng = Rng(7);
+        for op in [BinOp::And, BinOp::Or, BinOp::Mul] {
+            let mut cx = Context::new();
+            let s = symbols(&mut cx, super::MAX_CHAIN + 44, Width::W32);
+            let back: Vec<Expr> = s.iter().rev().copied().collect();
+            let e = chain(&mut cx, op, &back);
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert_eq!(out.roots[0].end, End::Completed);
+            assert!(equivalent(&mut cx, e, r, &mut rng));
+            cx.memo.clear();
+            let again = eng.run(&mut cx, &[r], Run::default()).unwrap();
+            assert!(!again.roots[0].changed, "{op:?}: not stable");
+        }
+    }
+}
+
+/// A node rebuilt over a rewrite below it will be used by every user of the node it replaced,
+/// though the walk has rebuilt only some of them yet: a rewrite at one user that would leave
+/// it to the others frees nothing. Here `y` is `p`; the pass that finds it then meets the chain
+/// `x op (p op z)` over the rebuilt `p op z`, and putting that chain in order would build
+/// `p op x` beside the `p op z` that `popcnt` keeps.
+#[test]
+fn a_rebuilt_node_counts_the_users_still_to_be_rebuilt() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for op in ["&", "|"] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::W32);
+            let written =
+                format!("let y = (p & q) | (p & ~q); let i = y {op} z; (x {op} i) ^ popcnt(i)");
+            let reduced = format!("let i = p {op} z; (x {op} i) ^ popcnt(i)");
+            let a = cx.parse(&written, &o).unwrap();
+            let b = cx.parse(&reduced, &o).unwrap();
+            let (_, nodes) = size(&mut cx, b);
+            let got = eng.simplify(&mut cx, a).unwrap().expr;
+            assert_eq!(size(&mut cx, got).1, nodes, "{op}: {}", cx.display(got));
+        }
+    }
+}
+
+/// Factoring reads a sum's terms and a term's factors from the top, and no more of them than
+/// it may factor: a sum of 100 000 terms, and a product of as many factors under a sum, are
+/// simplified on a stack of the size a thread gets by default. Read by recursion to the bottom
+/// of the chain, each overflowed it.
+#[test]
+fn factoring_reads_long_sums_and_products_from_the_top() {
+    let run = || {
+        let eng = engine(vec![Phase::Linear]);
+        for op in [BinOp::Add, BinOp::Mul] {
+            let mut cx = Context::new();
+            let s = symbols(&mut cx, 100_000, Width::W64);
+            let mut e = chain(&mut cx, op, &s);
+            if op == BinOp::Mul {
+                let x = cx.symbol("x", Width::W64).unwrap();
+                e = cx.bin(BinOp::Add, e, x).unwrap();
+            }
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert_eq!(out.roots[0].end, End::Completed, "{op:?}");
+        }
+    };
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Terms that read one condition are merged over the same spelling of it however the nodes
+/// were built. A form's terms are in the order of their nodes, `Context::import` builds
+/// operands right to left and the parser left to right; `zext(c) - zext(~c)` is
+/// `2·zext(c) - 1` or `1 - 2·zext(~c)`, and over a `1` the sum already reads only the second
+/// is smaller than it. Merged over the first term, the sum was left as written or not by the
+/// order its nodes were built in, so a result changed again once imported.
+#[test]
+fn conditions_merge_whatever_the_order_of_construction() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for src in [
+            "let a = udiv(1, x); zext<8>(x <=s a) - zext<8>(a <s x)",
+            "let a = udiv(1, x); zext<8>(a <s x) - zext<8>(x <=s a)",
+            "let a = udiv(1, x); zext<8>(x <u a) - zext<8>(a <=u x)",
+            "let a = udiv(1, x); zext<8>(x != a) - zext<8>(x == a)",
+        ] {
+            let mut parsed = Context::new();
+            let e = parsed.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+            let mut imported = Context::new();
+            let i = imported.import(&parsed, &[e]).unwrap()[0];
+            let (e, i) = (
+                eng.simplify(&mut parsed, e).unwrap().expr,
+                eng.simplify(&mut imported, i).unwrap().expr,
+            );
+            assert_eq!(
+                parsed.display(e).to_string(),
+                imported.display(i).to_string(),
+                "{src}"
+            );
+        }
+    }
+}
+
+/// A pass tries several candidates at a node, and one declined only because a part of the node
+/// has another user is declined for now: the node's result is not final, whichever candidate
+/// it was. The linear pass tries a case split on a condition mask first; of these two inputs
+/// it declined the split of `sext(b) + 2^31 ^ 2^31` and of `concat(a, 7) - (sext(c) << 2)`
+/// while the sum had another user, then remembered the node as final by its last candidate
+/// alone, and the other user went. So the result changed again in a context without that
+/// memory.
+#[test]
+fn a_candidate_declined_for_sharing_is_decided_again() {
+    // (A symbol's width at its first use: `b:1`.)
+    let cases = [
+        (
+            32,
+            "let %0 = sext<32>(b:1); let %1 = %0 + 0x80000000; \
+             concat(trunc<17>(~(sext<32>(a:4) ^ sext<32>(extract<25, 1>(select((%1 ^ 0x80000000) \
+             & (%1 ^ %0) <s 0, select(%0 <s 0, 0x80000000:32, 0x7fffffff), %1))))), \
+             extract<7, 15>(zext<32>(b) * -1))",
+        ),
+        (
+            7,
+            "let %0 = sext<7>(a:3); let %1 = sext<7>(udiv(%0, 7) * %0 != %0 << 4) << 2; \
+             let %2 = concat(a, 7:4); let %3 = %2 - %1; \
+             let %4 = smulhi((concat(-1:4, a) << 4) - select((%1 ^ %2) & (%3 ^ %2) <s 0, \
+             select(%2 <s 0, -64:7, 63), %3), concat(a, -1:4)); \
+             zext<7>((%0 - %4 ^ %0) & (%4 ^ %0) <s 0)",
+        ),
+    ];
+    for strategy in [
+        Strategy::standard(),
+        Strategy::decompile(),
+        Strategy::deobfuscate(),
+    ] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (width, src) in cases {
+            let mut cx = Context::new();
+            let e = cx
+                .parse(src, &ParseOptions::width(Width::new(width).unwrap()))
+                .unwrap();
+            let r = eng.simplify(&mut cx, e).unwrap().expr;
+            let mut fresh = Context::new();
+            let again = fresh.import(&cx, &[r]).unwrap()[0];
+            let out = eng.run(&mut fresh, &[again], Run::default()).unwrap();
+            assert!(
+                !out.roots[0].changed,
+                "{} became {}",
+                cx.display(r),
+                fresh.display(out.roots[0].expr)
+            );
+        }
+    }
+}
+
+/// Under `(e << k) | s` nested thousands of times only the last levels reach the result: the
+/// ones a shift has moved out of the word are dropped. The walk is operands first, and each of
+/// those levels was simplified under the mask of the level above before the walk reached the
+/// top, a window of levels rebuilt at every one (3000 levels: 6 s and 126 655 nodes built).
+/// The node at the top is asked first, and the levels out of its reach are not walked.
+#[test]
+fn a_deep_chain_of_shifts_is_asked_at_its_top() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let n = 3000;
+        let s = symbols(&mut cx, n, Width::W64);
+        let mut e = s[0];
+        for (i, &t) in s.iter().enumerate().skip(1) {
+            let k = cx.constant_u64(Width::W64, 1 + i as u64 % 3).unwrap();
+            let shifted = cx.bin(BinOp::Shl, e, k).unwrap();
+            e = cx.bin(BinOp::Or, shifted, t).unwrap();
+        }
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(r.end, End::Completed);
+        for k in 0..8u64 {
+            let env = FnEnv(|key: &crate::SymbolKey, w| {
+                let h = format!("{key:?}")
+                    .bytes()
+                    .fold(k, |h, c| (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3));
+                Some(BitVec::wrapping_from_u64(w, h))
+            });
+            let v = cx.eval(&[e, r.expr], &env).unwrap();
+            assert_eq!(v[0], v[1]);
+        }
+        // 64 bits at one to three a level: 33 levels at most are read.
+        let (read, nodes) = size(&mut cx, r.expr);
+        assert!(read <= 34 && nodes < 110, "{read} symbols, {nodes} nodes");
+        let built = out.stats.new_nodes;
+        assert!(built < 10_000, "{built} nodes built");
+    }
 }
 
 #[test]
@@ -860,6 +1248,9 @@ fn compares_fixtures() {
     same("(x + 3 <u 5) & (x == 1)", "x == 1", 8);
     same("((x & 0x7f) == 0) & (x <u 0x80)", "x == 0", 8);
     same("(~x <u 10) | (x <u 10)", "x - 246 <=u 19", 8);
+    // A truncation's values are the value's, a copy for each value of the bits dropped.
+    same("(3 <u trunc<7>(x)) & (x <u 100)", "x - 4 <=u 95", 8);
+    same("(trunc<7>(x) == 5) & (x <s 0)", "x == -123", 8);
     same("((x ^ 0x80) <u 0x10) | (x - 0x90 <u 0x10)", "x <=s 0x9f", 8);
     same("(-x == 3) & (x == 5)", "false", 8);
     same("((x | 0x80) == 0x85) ^ (x == 5)", "x == 0x85", 8);
@@ -1070,6 +1461,19 @@ fn peeled_expr(g: &mut Gen, cx: &mut Context, w: u16, depth: u32) -> Expr {
         let low = cx.constant(&low).unwrap();
         let smin = cx.constant(&BitVec::smin(width)).unwrap();
         let v = || Width::new(w - 1).unwrap();
+        // A truncation of `x`, compared at its own width.
+        if w > 1 && g.rng.chance(1, 6) {
+            let j = 1 + g.rng.below(u64::from(w) - 1) as u16;
+            let t = cx.trunc(x, Width::new(j).unwrap()).unwrap();
+            let op = CmpOpExt::ALL[g.rng.below(10) as usize];
+            let c = g.constant(j);
+            let c = cx.constant(&c).unwrap();
+            return if g.rng.chance(1, 2) {
+                cx.cmp(op, t, c).unwrap()
+            } else {
+                cx.cmp(op, c, t).unwrap()
+            };
+        }
         let t = match g.rng.below(11) {
             0 => x,
             1 => cx.bin(BinOp::Add, x, k).unwrap(),
@@ -1982,6 +2386,50 @@ fn prove_decides_by_residues() {
     }
 }
 
+/// The residues compute with values of at most 128 bits, so an extension or a concatenation
+/// wider than that is a leaf to them, whatever it reads: cut to 128 bits, `sext<257>(x)` of a
+/// negative `x` was a large positive value, and `sext<257>(t·t) <=s sext<257>(x)` true.
+#[test]
+fn residues_read_no_value_over_128_bits() {
+    use crate::{Query, Truth};
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(3).unwrap());
+    for (a, b) in [
+        ("let t = sext<33>(x); sext<257>(t * t)", "sext<257>(x)"),
+        ("let t = sext<33>(x); zext<129>(t * t)", "sext<129>(x)"),
+        ("let t = sext<33>(x); sext<512>(t * t)", "zext<512>(x)"),
+        (
+            "let t = sext<100>(x); concat(t * t, t)",
+            "concat(sext<100>(x), zext<100>(x))",
+        ),
+    ] {
+        let (a, b) = (cx.parse(a, &o).unwrap(), cx.parse(b, &o).unwrap());
+        // Every value of `x`: what a proof says must hold at all of them.
+        let values: Vec<Vec<BitVec>> = (0..8u64)
+            .map(|v| {
+                let x = BitVec::wrapping_from_u64(Width::new(3).unwrap(), v);
+                cx.eval(&[a, b], &FnEnv(|_: &crate::SymbolKey, _| Some(x)))
+                    .unwrap()
+            })
+            .collect();
+        for op in CmpOpExt::ALL {
+            let truth = cx.prove(Query::Cmp(op, a, b)).unwrap();
+            if truth == Truth::Unknown {
+                continue;
+            }
+            for v in &values {
+                assert_eq!(
+                    BitVec::apply_cmp(op, &v[0], &v[1]).unwrap(),
+                    truth == Truth::True,
+                    "`{}` {op:?} `{}` proved {truth:?}",
+                    cx.display(a),
+                    cx.display(b)
+                );
+            }
+        }
+    }
+}
+
 /// Sign extension spelled with shifts or with xor and a subtraction, and bit tests through a
 /// mask: equivalent at every shift and mask at small widths, and recognized.
 #[test]
@@ -2036,6 +2484,75 @@ fn sign_extension_and_bit_test_idioms() {
             }
         }
     }
+}
+
+/// `context::join` writes a select of two expressions with the choice further down: equal to
+/// the select for random pairs, and one skeleton over the choice of what differs where the
+/// sides are that skeleton.
+#[cfg(feature = "mba")]
+#[test]
+fn joined_cases_are_the_select() {
+    let mut g = generator(0x7015);
+    let mut rng = Rng(77);
+    let mut merged = 0;
+    for i in 0..600 {
+        let mut cx = Context::new();
+        let w = [8u16, 16, 32, 64][i % 4];
+        let c = cx.symbol("p", Width::W1).unwrap();
+        let (t, _) = g.expr(&mut cx, w, 3);
+        // The other side: an unrelated expression, or the first with one of its symbols
+        // complemented (one skeleton, the choice at that symbol).
+        let first = cx.symbols_in(&[t]).unwrap().first().map(|&s| {
+            let (key, width) = (
+                cx.symbol_key(s).unwrap().clone(),
+                cx.symbol_width(s).unwrap(),
+            );
+            cx.symbol(key, width).unwrap()
+        });
+        let f = match (i % 3, first) {
+            (0, _) | (_, None) => g.expr(&mut cx, w, 3).0,
+            (_, Some(sym)) => {
+                let not = cx.un(UnOp::Not, sym).unwrap();
+                let mut repl: crate::hash::IdMap<u32, u32> = Default::default();
+                repl.insert(cx.id(sym).unwrap(), cx.id(not).unwrap());
+                let ti = cx.id(t).unwrap();
+                let fi = cx.substitute_ids(&[ti], &repl).unwrap()[0];
+                cx.handle(fi)
+            }
+        };
+        let want = cx.select(c, t, f).unwrap();
+        let (ci, ti, fi) = (cx.id(c).unwrap(), cx.id(t).unwrap(), cx.id(f).unwrap());
+        let j = super::context::join(&mut cx, ci, ti, fi).unwrap();
+        let j = cx.handle(j);
+        assert!(
+            equivalent(&mut cx, want, j, &mut rng),
+            "W={w}: {} vs {}",
+            cx.display(want),
+            cx.display(j)
+        );
+        merged += u64::from(j != want);
+    }
+    assert!(merged > 200, "{merged}");
+    // One skeleton over two constants: the choice is between the constants.
+    let mut cx = Context::new();
+    let c = cx.symbol("p", Width::W1).unwrap();
+    let a = cx.symbol("a", Width::W64).unwrap();
+    let b = cx.symbol("b", Width::W64).unwrap();
+    let side = |cx: &mut Context, k: u64| {
+        let k = cx.constant_u64(Width::W64, k).unwrap();
+        let m = cx.bin(BinOp::Mul, a, k).unwrap();
+        let r = cx.bin(BinOp::RotL, m, k).unwrap();
+        cx.bin(BinOp::Add, r, b).unwrap()
+    };
+    let (t, f) = (side(&mut cx, 3), side(&mut cx, 5));
+    let (ci, ti, fi) = (cx.id(c).unwrap(), cx.id(t).unwrap(), cx.id(f).unwrap());
+    let j = super::context::join(&mut cx, ci, ti, fi).unwrap();
+    // The sum is written once; a rotation keeps its amount, so two amounts stay two
+    // rotations under the choice.
+    assert_eq!(
+        cx.display(cx.handle(j)).to_string(),
+        "select(p, rotl(a * 3, 3), rotl(a * 5, 5)) + b"
+    );
 }
 
 /// Case splits on condition masks: random linear and bitwise expressions reading `sext(c)`,
@@ -2947,16 +3464,17 @@ mod mba_service {
     #[test]
     fn a_rewrite_cycle_is_cut() {
         // `c = (x & 1)·(x & -2)` alone is smaller as `(x & 1)·(x ^ 1)`, and the context remembers
-        // that; next to `(x & -2)²`, which keeps `x & -2` alive, it is the other way round. So the
-        // answer for the sum brings back `c`, whose remembered answer rebuilds the sum, which is
-        // still being worked out.
+        // that; next to `(x & -2) ^ 5`, which keeps `x & -2` alive, it is the other way round. So
+        // the answer for the sum brings back `c`, whose remembered answer rebuilds the sum, which
+        // is still being worked out. (Not next to `(x & -2)²`: the two products then share a
+        // factor, and the sum with it taken out is smaller than either spelling.)
         let o = ParseOptions::width(Width::W8);
         let mut cx = Context::new();
         let n = cx
-            .parse("((x & 1) * (x ^ 1)) + ((x & -2) * (x & -2))", &o)
+            .parse("((x & 1) * (x ^ 1)) + ((x & -2) ^ 5)", &o)
             .unwrap();
         let r = cx
-            .parse("((x & 1) * (x & -2)) + ((x & -2) * (x & -2))", &o)
+            .parse("((x & 1) * (x & -2)) + ((x & -2) ^ 5)", &o)
             .unwrap();
         let c = cx.parse("(x & 1) * (x & -2)", &o).unwrap();
         let c1 = cx.parse("(x & 1) * (x ^ 1)", &o).unwrap();
@@ -3058,8 +3576,10 @@ mod mba_service {
         }
     }
 
-    /// Right except at one input no sample reaches: `x + y + [x·K₁ = K₂]`, true only at
-    /// `x = K₂·K₁⁻¹`, a value that is not a constant of either side (nor a neighbour of one).
+    /// Right except where no sample reaches: `x + y + [x·K₁ + y = K₂]`, a relation between the
+    /// variables that no constant of either side (nor a neighbour of one) satisfies. Not over
+    /// `x` alone: `[x·K₁ = K₂]` is one point, which the certificates reach through a change of
+    /// variable to `x·K₁`, where it is the constant `K₂`.
     struct Subtle;
     impl MbaSolver for Subtle {
         fn id(&self) -> &str {
@@ -3084,7 +3604,8 @@ mod mba_service {
                 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(0x1234_5678_9abc_def1),
             );
             let xk = m.push(MOp::Mul, &[x, k1]).unwrap();
-            let d = m.push(MOp::Xor, &[xk, k2]).unwrap();
+            let xky = m.push(MOp::Add, &[xk, y]).unwrap();
+            let d = m.push(MOp::Xor, &[xky, k2]).unwrap();
             let nd = m.push(MOp::Neg, &[d]).unwrap();
             let o = m.push(MOp::Or, &[d, nd]).unwrap();
             let nz = m.push(MOp::LShr(w.bits() - 1), &[o]).unwrap();
@@ -3125,11 +3646,13 @@ mod mba_service {
     const NONLINEAR: &str =
         "(x ^ y) + 2 * (x & y) + x * y - (x & y) * (x | y) - (x & ~y) * (~x & y)";
 
-    /// `x + y`, through a relation between `(x + y) >> 1` and `x + y` that no native
+    /// `x + y`, through a relation between `(x + y) * 2 >> 1` and `x + y` that no native
     /// certificate sees (a right shift of arithmetic is an atom, independent of its operand).
     /// a right shift of a bitwise function is not an atom (`(x >> 1) * 2 + (x & 1)`
-    /// is proved `x`), so the relation goes through a sum.
-    const NOT_NATIVE: &str = "((x + y) >>u 1) * 2 + ((x + y) & 1)";
+    /// is proved `x`), so the relation goes through a sum; and not through a shift of the sum
+    /// itself beside a mask of it, which the phase reads as two slices of one value
+    /// (`((x + y) >> 1) * 2 + ((x + y) & 1)` is proved `x + y` that way).
+    const NOT_NATIVE: &str = "(((x + y) * 2) >>u 1) + ((x + y) & (-1 ^ (-1 >>u 1)))";
 
     fn run(eng: &Engine, src: &str) -> (Context, crate::engine::Outcome, Expr) {
         let mut cx = Context::new();
@@ -3213,7 +3736,10 @@ mod mba_service {
 
     #[test]
     fn answers_are_cached_and_calls_budgeted() {
-        let solver = Arc::new(Counting(AtomicU64::new(0)));
+        // (A solver that counts its steps: one charged its whole limit has its fragments kept
+        // from the questions above them in the run that asked, which a cached answer does
+        // not say.)
+        let solver = Arc::new(Steady(1000, AtomicU64::new(0)));
         let cache = Arc::new(MemoryCache::new(1024));
         let eng = Engine::builder()
             .builtin()
@@ -3223,11 +3749,11 @@ mod mba_service {
             .build()
             .unwrap();
         let (_, out, _) = run(&eng, NONLINEAR);
-        let first = solver.0.load(Ordering::Relaxed);
+        let first = solver.1.load(Ordering::Relaxed);
         assert!(first > 0 && out.stats.mba.no_simpler > 0);
         // A fresh context: answered from the cache.
         let (_, out, _) = run(&eng, NONLINEAR);
-        assert_eq!(solver.0.load(Ordering::Relaxed), first);
+        assert_eq!(solver.1.load(Ordering::Relaxed), first);
         assert!(out.stats.mba.cache_hits > 0);
         // The call budget.
         let eng = mba_engine(Arc::new(Counting(AtomicU64::new(0))), MbaTrust::default());
@@ -3296,6 +3822,24 @@ mod mba_service {
         }
     }
 
+    /// Runs out of steps with fewer than the first field; the second is the most it was given.
+    struct Hungry(u64, AtomicU64);
+    impl MbaSolver for Hungry {
+        fn id(&self) -> &str {
+            "test.hungry"
+        }
+        fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+            self.solve_counted(p, budget).0
+        }
+        fn solve_counted(&self, _: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+            self.1.fetch_max(budget.steps, Ordering::Relaxed);
+            match budget.steps < self.0 {
+                true => (MbaAnswer::Exhausted, budget.steps),
+                false => (MbaAnswer::NoSimpler, self.0),
+            }
+        }
+    }
+
     /// Several MBA questions, one per summand.
     const MANY: &str = "((x ^ y) + 2 * (x & y)) * ((x | z) - (x & z)) \
                         + ((y ^ z) + 2 * (y & z)) * ((y | x) + (y & x)) \
@@ -3303,8 +3847,8 @@ mod mba_service {
 
     #[test]
     fn the_solvers_steps_are_an_account_of_the_run() {
-        assert_eq!(Budget::fuel(1000).mba_steps, 8000);
-        assert_eq!(Budget::default().mba_steps, 1 << 25);
+        assert_eq!(Budget::fuel(1000).mba_steps, 4000);
+        assert_eq!(Budget::default().mba_steps, 1 << 24);
         let ask = |solver: Arc<dyn MbaSolver>, steps: u64| {
             let eng = mba_engine(solver, MbaTrust::default());
             let mut cx = Context::new();
@@ -3343,12 +3887,29 @@ mod mba_service {
         let s = Arc::new(Steady(1000, AtomicU64::new(0)));
         let out = ask(s.clone(), 1000 * calls - 1);
         assert_eq!(out.stats.mba.steps, 1000 * calls - 1);
-        // A solver that does not count is charged its whole limit.
+        // A solver that does not count is charged its whole limit: what a question takes
+        // while the rounds have others to ask (65,536 steps).
         let limit = MbaConfig::default().budget.steps;
         let c = Arc::new(Counting(AtomicU64::new(0)));
         let out = ask(c.clone(), 2 * limit);
-        assert_eq!(c.0.load(Ordering::Relaxed), 2);
-        assert_eq!(out.stats.mba.steps, 2 * limit);
+        let asked = c.0.load(Ordering::Relaxed);
+        assert!(asked >= 3 && asked << 16 < 2 * limit, "{asked}");
+        assert_eq!(out.stats.mba.steps, asked << 16);
+        // A question that ran out of those is asked again once a round changes nothing, and
+        // its limit then is a quarter of the account where that is less than the solver's
+        // own.
+        let h = Arc::new(Hungry(300_000, AtomicU64::new(0)));
+        let out = ask(h.clone(), 2 * limit);
+        assert_eq!(h.1.load(Ordering::Relaxed), limit / 2);
+        assert_eq!(out.roots[0].end, End::Completed);
+        // One that runs out of that too: the run says so.
+        let h = Arc::new(Hungry(limit, AtomicU64::new(0)));
+        let out = ask(h.clone(), 2 * limit);
+        assert_eq!(h.1.load(Ordering::Relaxed), limit / 2);
+        assert_eq!(
+            out.roots[0].end,
+            End::BudgetTerminated(crate::engine::Exhausted::MbaSteps)
+        );
         // The normal-form solver counts its steps, and a remembered answer is charged what
         // finding it cost: the same run in a fresh context, answered from the solver's memory,
         // spends the same and gives the same.
@@ -3426,9 +3987,15 @@ mod mba_service {
         };
         let (_, out, _) = run(&with(lax), NONLINEAR);
         assert!(out.roots[0].changed && out.stats.mba.simplified > 0);
-        let (_, out, _) = run(&with(strict), NONLINEAR);
-        assert!(!out.roots[0].changed, "a laxly accepted answer was reused");
-        assert_eq!(out.stats.mba.simplified, 0);
+        // (The strict engine still takes the factor two of the terms share out of them: no
+        // answer of the solver's.)
+        let (cx, out, _) = run(&with(strict), NONLINEAR);
+        assert_eq!(
+            out.stats.mba.simplified, 0,
+            "a laxly accepted answer was reused"
+        );
+        let text = cx.display(out.roots[0].expr).to_string();
+        assert!(!text.contains("9e3779b97f4a7c15"), "{text}");
     }
 
     struct Panicky;
@@ -3495,281 +4062,6 @@ mod mba_service {
             out.roots[0].end,
             End::BudgetTerminated(crate::engine::Exhausted::PassWork)
         );
-    }
-
-    /// The normal-form solver, counting the questions put to it.
-    struct Asked(crate::mba::NormalFormSolver, AtomicU64);
-    impl MbaSolver for Asked {
-        fn id(&self) -> &str {
-            "test.counting"
-        }
-        fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
-            self.solve_counted(p, budget).0
-        }
-        fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
-            self.1.fetch_add(1, Ordering::Relaxed);
-            self.0.solve_counted(p, budget)
-        }
-        fn polynomial_fragments(&self) -> bool {
-            true
-        }
-    }
-
-    /// The results of `roots` (one call) and the questions put to the solver, with the rule
-    /// that declines questions no answer to which could be committed, or (`all`) without.
-    fn limb_asked(roots: &[&str], all: bool) -> (Vec<String>, u64) {
-        let solver = Arc::new(Asked(
-            crate::mba::NormalFormSolver::default(),
-            AtomicU64::new(0),
-        ));
-        let eng = mba_engine(
-            solver.clone(),
-            MbaTrust::default().with_backend_certificates(false),
-        );
-        let mut cx = Context::new();
-        let o = ParseOptions::width(Width::W32);
-        let es: Vec<Expr> = roots.iter().map(|s| cx.parse(s, &o).unwrap()).collect();
-        super::super::mba::ASK_ALL.set(all);
-        let out = eng.run(&mut cx, &es, Run::default());
-        super::super::mba::ASK_ALL.set(false);
-        let out = out.unwrap();
-        assert!(out.roots.iter().all(|r| r.end == End::Completed));
-        let texts = out
-            .roots
-            .iter()
-            .map(|r| cx.display(r.expr).to_string())
-            .collect();
-        (texts, solver.1.load(Ordering::Relaxed))
-    }
-
-    #[test]
-    fn limb_questions_that_pay_are_asked() {
-        // The comparison's other side reads what the sum reads, so replacing the sum frees
-        // itself, or itself and one node: the answer is an atom, a constant, or one operator
-        // over the atoms, and is found with the rule as without it.
-        for (src, gone) in [
-            // `x`: the difference goes.
-            (
-                "(((x | y) + (x & y)) - y) <u (((x | y) + (x & y)) * z)",
-                " - y",
-            ),
-            // 0.
-            (
-                "(((x ^ y) + 2 * (x & y)) - (x + y)) <u (((x ^ y) + 2 * (x & y)) * (x + y) * z)",
-                " - ",
-            ),
-            // `x + y`: the doubled conjunction goes.
-            ("((x ^ y) + 2 * (x & y)) <u ((x ^ y) * (x & y) * z)", "2"),
-        ] {
-            let (with, _) = limb_asked(&[src], false);
-            let (without, _) = limb_asked(&[src], true);
-            assert_eq!(with, without, "{src}");
-            assert!(!with[0].contains(gone), "{src}: {}", with[0]);
-        }
-    }
-
-    #[test]
-    fn limb_questions_that_cannot_pay_are_not_asked() {
-        // The products are read by both sides, so replacing a side frees it alone, and it is
-        // no atom, constant or node below it: no answer could be committed, none is asked
-        // for, and the result is what it is with every question asked. The same where the
-        // answer is one operator (`x ^ y`) for the one node freed: no smaller.
-        for src in [
-            "((x & y) * 5 + (x | y) * 3) <u ((x & y) * 5 ^ (x | y) * 3)",
-            "((x | y) - (x & y)) <u ((x | y) * (x & y) * z)",
-        ] {
-            let (with, asked) = limb_asked(&[src], false);
-            let (without, all) = limb_asked(&[src], true);
-            assert_eq!(with, without, "{src}");
-            assert!(asked < all, "{src}: {asked} of {all}");
-        }
-        // Sums of limb code that share their terms with the carries beside them, generated:
-        // the same results, fewer questions.
-        let ops = ["&", "|", "^"];
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = |n: u64| {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (seed >> 33) % n
-        };
-        let (mut asked, mut all) = (0, 0);
-        for _ in 0..40 {
-            let v = ["x", "y", "z"];
-            let term = |next: &mut dyn FnMut(u64) -> u64| {
-                format!(
-                    "({} {} {})",
-                    v[next(3) as usize],
-                    ops[next(3) as usize],
-                    v[next(3) as usize]
-                )
-            };
-            let (a, b, c) = (term(&mut next), term(&mut next), term(&mut next));
-            let k = 1 + next(4);
-            let sum = format!("{a} + {b}");
-            let low = format!("({sum} - {k} * {c})");
-            // A word, a limb of it, a carry out of the limb, and a mask of the word beside.
-            let e = format!(
-                "({low} & 0x3fff) + zext<32>(trunc<14>({sum}) <u trunc<14>({a})) \
-                 + (({sum}) & {c}) * 2 + ({low} >>u 14)"
-            );
-            let (with, n) = limb_asked(&[&e], false);
-            let (without, m) = limb_asked(&[&e], true);
-            assert_eq!(with, without, "{e}");
-            assert!(n <= m, "{e}: {n} of {m}");
-            asked += n;
-            all += m;
-        }
-        assert!(asked < all, "{asked} of {all}");
-    }
-
-    /// [`limb_asked`] with `cannot_pay` deciding at most `most` freed nodes, with (`free`) or
-    /// without the forms compared where the atoms are free.
-    fn limb_ruled(roots: &[&str], most: u32, free: bool) -> (Vec<String>, u64) {
-        super::super::mba::PAY_RULE.set((most, free));
-        let out = std::panic::catch_unwind(|| limb_asked(roots, false));
-        super::super::mba::PAY_RULE.set((u32::MAX, true));
-        out.unwrap()
-    }
-
-    #[test]
-    fn limb_questions_of_three_freed_nodes() {
-        // An answer of two nodes for three freed (`(x + y) ^ z`, `(x + y) * z`: the sum of
-        // `x ^ y` and twice `x & y` goes with its product) is found with the rule as without.
-        for (src, gone) in [
-            (
-                "(((x ^ y) + 2 * (x & y)) ^ z) <u ((x ^ y) * (x & y) * (z * 2))",
-                "2",
-            ),
-            (
-                "(((x ^ y) + 2 * (x & y)) * z) <u ((x ^ y) * (x & y) + (z * 2))",
-                "2",
-            ),
-        ] {
-            let (all, _) = limb_asked(&[src], true);
-            let (with, _) = limb_ruled(&[src], 3, true);
-            assert_eq!(with, all, "{src}");
-            assert!(!with[0].contains(gone), "{src}: {}", with[0]);
-        }
-        // Three freed nodes and no form of two over what stays (a sum of four terms the other
-        // side reads too; a sum and a constant, where the constant is one of the three): not
-        // asked, with the results of every question asked and of the rule for two.
-        for src in [
-            "((x | y) + (x & y) + 7) <u ((x | y) * (x & y) * z)",
-            "(((x & y) * 5 + (x | y) * 3) + (x ^ y) * 7 + z) \
-             <u ((x & y) * 5 ^ (x | y) * 3 ^ (x ^ y) * 7)",
-            "((x & y) + (x | z) + (y ^ z) + x) <u ((x & y) * (x | z) * (y ^ z))",
-            "(((x & y) * 5 ^ (x | y) * 3) + z + 1) <u ((x & y) * 5 + (x | y) * 3)",
-        ] {
-            let (all, _) = limb_asked(&[src], true);
-            let (two, asked_two) = limb_ruled(&[src], 2, false);
-            let (three, asked_three) = limb_ruled(&[src], 3, false);
-            assert_eq!(two, all, "{src}");
-            assert_eq!(three, all, "{src}");
-            assert!(
-                asked_three < asked_two,
-                "{src}: {asked_three} of {asked_two}"
-            );
-        }
-    }
-
-    #[test]
-    fn limb_forms_that_agree_by_the_atoms_relations_are_no_answers() {
-        // `x <u y` implies `x <=u y` and excludes `x == y`, and the lesser of two is one of
-        // them: the conjunctions are a node below them, or zero, at every point, which no
-        // identity over the comparisons as atoms says. Compared where the atoms are free, no
-        // form agrees and the question is not asked; the results are those of asking.
-        for src in [
-            "(zext<32>(x <u y) & zext<32>(x <=u y)) \
-             <u (zext<32>(x <u y) * zext<32>(x <=u y) * z)",
-            "(zext<32>(x <u y) & zext<32>(x == y)) <u (zext<32>(x <u y) * zext<32>(x == y) + z)",
-            "((select(x <u y, x, y) ^ x) & (select(x <u y, x, y) ^ y)) \
-             <u ((select(x <u y, x, y) ^ x) * (select(x <u y, x, y) ^ y) * z)",
-        ] {
-            let (all, _) = limb_asked(&[src], true);
-            let (bound, asked_bound) = limb_ruled(&[src], 3, false);
-            let (free, asked_free) = limb_ruled(&[src], 3, true);
-            assert_eq!(bound, all, "{src}");
-            assert_eq!(free, all, "{src}");
-            assert!(
-                asked_free < asked_bound,
-                "{src}: {asked_free} of {asked_bound}"
-            );
-        }
-        // A comparison and its negation stay related (`~` of one is built as the other):
-        // their sum is 1, found with the rule as without.
-        let src = "(zext<32>(x <u y) + zext<32>(y <=u x)) <u (zext<32>(x <u y) * z)";
-        let (all, _) = limb_asked(&[src], true);
-        let (free, _) = limb_ruled(&[src], 3, true);
-        assert_eq!(free, all, "{src}");
-    }
-
-    #[test]
-    fn limb_forms_of_two_nodes_are_all_tried() {
-        // Generated: a form of two nodes over three values the other side keeps alive, spelled
-        // so that three nodes go with it. Whatever the solver makes of it, the rule changes
-        // no result (it asks wherever a form of two nodes agrees).
-        let unary = ["~", "-"];
-        let binary = ["+", "-", "*", "&", "|", "^"];
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |n: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % n
-        };
-        let mut declined = 0;
-        for _ in 0..60 {
-            let (p, q) = (binary[next(6) as usize], binary[next(6) as usize]);
-            let k = 3 + 2 * next(40);
-            let inner = match next(4) {
-                0 => format!("((x ^ y) + 2 * (x & y)) {p} z"),
-                1 => format!("((x | y) - (x & y)) {p} (z + {k})"),
-                2 => format!("{}((x | y) + (x & y))", unary[next(2) as usize]),
-                _ => format!("((x & y) + (x | y)) {p} {k}"),
-            };
-            let src = format!("(({inner}) {q} w) <u ((x ^ y) * (x & y) * (x | y) * (z + {k}) + w)");
-            let (all, asked_all) = limb_asked(&[&src], true);
-            let (with, asked) = limb_ruled(&[&src], 3, true);
-            assert_eq!(with, all, "{src}");
-            declined += asked_all - asked;
-        }
-        assert!(declined > 0);
-    }
-
-    #[test]
-    fn limb_sums_by_parts_do_not_depend_on_earlier_candidates() {
-        // A sum whose groups of terms are simplified one by one is committed by what it reads
-        // of the sum it replaces: a candidate built before (and left in the arena) changes
-        // nothing.
-        for (src, left) in [
-            (
-                "((a ^ b) + 2 * (a & b)) + ((c | d) - (c & d)) + (a ^ b) * (c | d)",
-                "(a + b) + (c ^ d) + (a ^ b) * (c | d)",
-            ),
-            (
-                "((a | b) + (a & b)) + 3 * ((c ^ d) + 2 * (c & d)) + (a & b) * (c & d)",
-                "(a + b) + 3 * (c + d) + (a & b) * (c & d)",
-            ),
-        ] {
-            let eng = mba_engine(
-                Arc::new(crate::mba::NormalFormSolver::default()),
-                MbaTrust::default().with_backend_certificates(false),
-            );
-            let o = ParseOptions::width(Width::W32);
-            let mut fresh = Context::new();
-            let e = fresh.parse(src, &o).unwrap();
-            let want = eng.simplify(&mut fresh, e).unwrap();
-            let mut used = Context::new();
-            used.parse(left, &o).unwrap();
-            let e = used.parse(src, &o).unwrap();
-            let got = eng.simplify(&mut used, e).unwrap();
-            assert_eq!(
-                fresh.display(want.expr).to_string(),
-                used.display(got.expr).to_string(),
-                "{src}"
-            );
-        }
     }
 }
 
@@ -3872,7 +4164,7 @@ fn linear_mba_emits_conjunctions_for_any_number_of_atoms() {
         (
             "3 * (x & ~y) + 2 * (~x & y) + 5 * (x & y) - (x | y)",
             64,
-            "x + x + (x & y) + y",
+            "(x & y) + (x << 1) + y",
         ),
         // Four atoms: the indicator form needs three or fewer, and a conjunction remains.
         ("(a | b) - (a ^ b) + (c & ~d) + (c & d)", 32, "(a & b) + c"),
@@ -4790,7 +5082,7 @@ fn invert_obeys_budgets_and_the_host_veto() {
 }
 
 /// The linear pass takes a constant into a term (`k·a + k = −k·~a`) when that is smaller,
-/// doubles as `a + a`, starts a sum of subtractions from its constant or a product by a
+/// doubles as `a << 1`, starts a sum of subtractions from its constant or a product by a
 /// negative coefficient, reads `concat(trunc(x), c)` as `x·2^|c| + c`, and a constant always
 /// replaces what it folds.
 #[test]
@@ -4799,14 +5091,11 @@ fn linear_emissions() {
     for (src, want) in [
         ("-x - 1", "~x"),
         ("(y << 2) + 4", "~y * -4"),
-        ("-2 * y - 2", "let %0 = ~y;\n%0 + %0"),
-        ("2 * x + y", "x + x + y"),
+        ("-2 * y - 2", "y * -2 - 2"),
+        ("2 * x + y", "x * 2 + y"),
         ("5 - 3 * x", "5 - x * 3"),
         ("-(y * 3) - z * 5", "y * -3 - z * 5"),
-        (
-            "concat(trunc<62>(y), 3:2) - 6 * y - 5",
-            "let %0 = ~y;\n%0 + %0",
-        ),
+        ("concat(trunc<62>(y), 3:2) - 6 * y - 5", "~y << 1"),
     ] {
         let mut cx = Context::new();
         let o = ParseOptions::width(Width::W64);
@@ -5634,8 +5923,9 @@ fn limb_slice_fixtures() {
         // the words are XORs once nothing reads their sums.
         (xor_limbs(&["a", "b", "c"]), 32, "extract<25, 7>(b ^ c ^ a)"),
         // Three limbs: the carry into the third is no comparison of two low digits, and the
-        // limb is found as the slice of the word and proved. (The word, which the handler
-        // spells `x + c - 2·(x & c)` with the constants folded, is the XOR with the constant.)
+        // limb is found as the slice of the word and proved. The handler spells its XOR with
+        // a constant `x + c - 2·(x & c)`, the constants folded: the words pass reads it as
+        // the XOR.
         (three, 32, "extract<24, 8>(w + 0x2c51a7e3 ^ 0x51c3a96c)"),
         // A digit that is no truncation of the sum's operand: a value below `2^k`, and a mask
         // under the sum.
@@ -5688,14 +5978,13 @@ fn limb_slice_fixtures() {
             "a ^ b",
         ),
         // The sum of two digits carries: its high digit is not 0, and this is no slice of
-        // `x` (it was taken for one). It is the high digit of `x` less that carry (read in
-        // the late stage of the rounds: the sum gets no fewer terms).
+        // `x` (it was taken for one). It is the slice less that carry (the words pass).
         (
             "extract<14, 16>(x - zext<32>(a:14) - zext<32>(b:14)) \
              + zext<16>(trunc<14>(x) <u (a:14 + b:14))"
                 .into(),
             32,
-            "extract<14, 16>(x) - extract<14, 16>(zext<32>(a) + zext<32>(b))",
+            "extract<14, 16>(x) - zext<16>(extract<14, 1>(zext<15>(b) + zext<15>(a)))",
         ),
     ] {
         assert_eq!(simplify(&eng, &src, w), want, "{src}");
@@ -6234,7 +6523,7 @@ fn limb_shifted_word_fixtures() {
              - trunc<10>(%0 & (%0 >>u 5))",
             10,
             "let %0 = x * 27445;\n\
-             extract<6, 10>(%0 + (%0 << 5)) - trunc<10>(%0 & %0 >>u 5)",
+             extract<6, 10>(x * -11819) - trunc<10>(%0 & %0 >>u 5)",
         ),
         // The piece below the limb's top cut from a 32-bit product over the sign extension.
         (
@@ -7156,27 +7445,20 @@ fn limb_shifted_fixtures() {
             "let q = zext<12>(b:9); \
              zext<12>(q + extract<24, 12>(a:64) <u q) + extract<36, 12>(a)",
             12,
-            "extract<36, 12>((zext<64>(b) << 24) + a)",
+            "extract<12, 12>(zext<24>(b) + extract<24, 24>(a))",
         ),
         // Against the word's digit.
         (
             "let s = extract<20, 17>(a:64); \
              zext<9>(zext<17>(b:10) + s <u s) + extract<37, 9>(a)",
             9,
-            "extract<37, 9>((zext<64>(b) << 20) + a)",
-        ),
-        // The value a digit of another word: that word masked.
-        (
-            "let s = extract<16, 16>(a:64); \
-             zext<16>(extract<16, 16>(c:64) + s <u s) + extract<32, 16>(a)",
-            16,
-            "extract<32, 16>((c & 0xffff0000) + a)",
+            "extract<17, 9>(zext<26>(b) + extract<20, 26>(a))",
         ),
         // The borrow of the digit less the value.
         (
             "extract<22, 10>(x:32) - zext<10>(extract<10, 12>(x) <u d:12)",
             10,
-            "extract<22, 10>(x - (zext<32>(d) << 10))",
+            "extract<12, 10>(extract<10, 22>(x) - zext<22>(d))",
         ),
         // The limb and its carry out, joined by a concatenation and by a shift.
         (
@@ -7197,7 +7479,7 @@ fn limb_shifted_fixtures() {
             "zext<10>(zext<16>(extract<11, 11>(x:32) + e:11) <u extract<11, 16>(x & 0x3fffff)) \
              + extract<22, 10>(x)",
             10,
-            "extract<22, 10>((zext<32>(e) << 11) + x)",
+            "extract<11, 10>(zext<21>(e) + extract<11, 21>(x))",
         ),
         // A constant added limb by limb (11, 11 and 10 bits; 837 and 434 are its digits),
         // the middle limb's carry out compared in such a register.
@@ -7811,7 +8093,7 @@ fn limb_join_fixtures() {
             "extract<18, 14>(zext<64>(x:32 & 0x3ffff) * 0x38d35 + sext<64>(x) * 0x2f680000 \
              + zext<64>(extract<18, 32>(sext<64>(x)) & 0x3ffff) * 0xe34d40000 + zext<64>(y:32))",
             14,
-            "extract<18, 14>(sext<64>(x) * 0x2f6b8d35 + zext<64>(y))",
+            "extract<18, 14>(x * 0x2f6b8d35 + y)",
         ),
     ] {
         assert_eq!(simplify(&eng, src, w), want, "{src}");
@@ -8063,8 +8345,7 @@ fn limb_mask_fixtures() {
              zext<6>((s + 0x2d5c1 & 0x3ffffff) <u ((x ^ 0x2d5c1) & 0x3ffffff)) \
              + extract<26, 6>(y + z) + zext<6>((s + 9 & 0x3ffffff) <u 0x3fd2a48) - 1",
             6,
-            "let %0 = x & 0x2d5c1;\n\
-             extract<26, 6>(x + y - (%0 + %0) + z + 9) - extract<26, 6>(x)",
+            "extract<26, 6>(y + z + (x ^ 0x2d5c1) + 0xfffd2a48) - extract<26, 6>(x)",
         ),
     ] {
         assert_eq!(simplify(&eng, src, w), want, "{src}");
@@ -8098,11 +8379,11 @@ fn limb_digit_fixtures() {
              + (a * 333 >>u 11) + zext<32>(z:32 & 0x3fffff <u q))"
                 .to_string(),
             10,
-            // (The borrow against `z` is read last, in the late stage of the rounds: the
-            // high digit of the product it leaves meets the one that is there.)
-            "trunc<10>(x) * 97 + extract<11, 10>(zext<32>(extract<11, 11>(x)) * 1021) \
-             + extract<11, 10>(x) * 333 + extract<22, 10>(z) + trunc<10>(y) \
-             - extract<22, 10>(z - (x & 2047) * 0xa6bfd)",
+            // (With the words pass: the word of the two low digits' product is read first.)
+            "let %0 = extract<11, 21>(x);\n\
+             extract<11, 10>(%0 * 1021) + extract<22, 10>(x * 0x184a6bfd \
+             + zext<32>(%0) * 0xffe01800 + 0x3fffff - (z & 0x3fffff)) \
+             + extract<22, 10>(x) * 3 + trunc<10>(y)",
         ),
         (high, 6, "extract<26, 6>(x * 0x6786a2b7)"),
     ] {
@@ -8347,7 +8628,7 @@ fn limb_root_fixtures() {
             32,
             "let %0 = x & 8191;\n\
              let %1 = (x >>u 7) * (y >>u 9) \
-             + zext<32>(extract<26, 6>(%0 * (y & 8191) + (%0 * (y >>u 13 & 8191) << 13)));\n\
+             + zext<32>(extract<26, 6>(%0 * (y & 8191) + (%0 * zext<32>(extract<13, 13>(y)) << 13)));\n\
              (%1 & 63) * v + (%1 & 7 ^ u)",
         ),
     ] {
@@ -8880,7 +9161,7 @@ fn carries_is_sound_on_mutated_networks() {
 fn carries_reads_shifts_of_one_atom_exactly() {
     // `a << k` is `2^k·a`, and 0 once the shifts reach the width: no proof needed, so none is
     // taken, and every result is equal to its input. (Inner shifts by more than 1 are their
-    // own form, so the chain is read whole; `a << 1` alone becomes `a + a`.)
+    // own form, so the chain is read whole; `a << 1` alone is left as it is.)
     let eng = engine(vec![Phase::Carries]);
     let mut rng = Rng(0x5e1f);
     for w in [8u16, 64] {
@@ -8889,7 +9170,7 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             ("(x << 2) << 3".to_string(), "x << 5".to_string()),
             ("((x << 3) << 2) << 1".into(), "x << 6".into()),
             (format!("(x << {}) << 3", w - 2), format!("0:{w}")),
-            ("x << 1".into(), "x + x".into()),
+            ("x << 1".into(), "x << 1".into()),
         ] {
             let mut cx = Context::new();
             let e = cx.parse(&src, &o).unwrap();
@@ -8898,6 +9179,64 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             assert_eq!(cx.display(r).to_string(), want, "{w} bits: {src}");
             assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
             assert_eq!(out.stats.passes["carries"].proofs, 0, "{w} bits: {src}");
+        }
+    }
+}
+
+/// The SWAR population count of `v` at `w` bits (Hacker's Delight), with the pair mask `m1`.
+#[cfg(feature = "prove")]
+fn swar(w: u16, v: &str, m1: u64) -> String {
+    let ones = u64::MAX >> (64 - w);
+    format!(
+        "let a = {v} - (({v} >>u 1) & {m1:#x}); let b = (a & {:#x}) + ((a >>u 2) & {:#x}); \
+         let c = (b + (b >>u 4)) & {:#x}; (c * {:#x}) >>u {}",
+        ones / 5,
+        ones / 5,
+        ones / 17,
+        ones / 255,
+        w - 8
+    )
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recognizes_bit_counts() {
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0xb17c);
+    for w in [16u16, 32, 64] {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let ones = u64::MAX >> (64 - w);
+        // Ones above the highest set bit: the smear, counted, is the leading zeros.
+        let mut smear = String::from("let s0 = x; ");
+        let mut k = 0;
+        while 1u32 << k < u32::from(w) {
+            smear += &format!(
+                "let s{n} = s{k} | (s{k} >>u {sh}); ",
+                n = k + 1,
+                sh = 1u32 << k
+            );
+            k += 1;
+        }
+        let clz = format!("{smear}let v = ~s{k}; {}", swar(w, "v", ones / 3));
+        let ctz = format!("let v = (x & -x) - 1; {}", swar(w, "v", ones / 3));
+        for (src, want) in [
+            (swar(w, "x", ones / 3), "popcnt(x)"),
+            (clz, "clz(x)"),
+            (ctz, "ctz(x)"),
+            // A wrong pair mask: no count, and left as it was.
+            (swar(w, "x", ones / 3 - 4), ""),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
+            if want.is_empty() {
+                assert_eq!(r, e, "{w} bits: {src} became {}", cx.display(r));
+            } else {
+                let want = cx.parse(want, &o).unwrap();
+                assert_eq!(r, want, "{w} bits: {src} became {}", cx.display(r));
+            }
         }
     }
 }
@@ -9042,6 +9381,52 @@ mod opaque_constants {
         assert!(out.stats.mba.opaque_proved > 0);
     }
 
+    /// Roots that share a hidden constant ask about it once: the sweep of the second reads what
+    /// the sweep of the first found, so the two together ask no more than the first alone.
+    #[test]
+    fn roots_share_what_a_sweep_found() {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        let srcs = [
+            format!("{PRIME} (0xcbf29ce484222325 ^ (p >>u 40)) * p + x"),
+            format!("{PRIME} (p >>u 40) + (y ^ p)"),
+        ];
+        let run = |which: &[usize]| {
+            let mut cx = Context::new();
+            let roots: Vec<_> = which
+                .iter()
+                .map(|&i| {
+                    cx.parse(&srcs[i], &ParseOptions::width(Width::W64))
+                        .unwrap()
+                })
+                .collect();
+            let out = eng
+                .run(
+                    &mut cx,
+                    &roots,
+                    Run::default().with_per_call(Budget::fuel(1 << 16)),
+                )
+                .unwrap();
+            let shown: Vec<_> = out
+                .roots
+                .iter()
+                .map(|r| cx.display(r.expr).to_string())
+                .collect();
+            (shown, out.stats.mba.opaque_asked)
+        };
+        let (first, second, both) = (run(&[0]), run(&[1]), run(&[0, 1]));
+        assert_eq!(both.0, [first.0.clone(), second.0.clone()].concat());
+        // `(y ^ p) + 1`, `p >> 40` being 1.
+        assert_eq!(second.0, ["-(y ^ 0xfffffefffffffe4c)"]);
+        assert!(first.1 > 0 && second.1 > 0);
+        assert_eq!(both.1, first.1, "{first:?} {second:?} {both:?}");
+    }
+
     #[test]
     fn a_guard_that_reads_constant_at_the_samples_is_not_folded() {
         // `x == k` is false at every sample point: the sum reads as 5, and is not.
@@ -9055,5 +9440,35 @@ mod opaque_constants {
             )
             .unwrap();
         assert_eq!(r, want, "{}", cx.display(r));
+    }
+
+    /// What the sweep takes from facts that hold only under the run's assumptions, the result
+    /// relies on them for: the guard above is false wherever `x` is assumed not to be `k`.
+    #[test]
+    fn what_the_sweep_takes_from_an_assumption_is_relied_on() {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        let o = ParseOptions::width(Width::W64);
+        let mut cx = Context::new();
+        let e = cx
+            .parse("zext<64>(x == 0x1234567) + 5 + (y & (z | y)) - y", &o)
+            .unwrap();
+        let p = cx.parse("x != 0x1234567", &o).unwrap();
+        let mut a = crate::Assumptions::new();
+        let id = a.assume_true(&mut cx, p).unwrap();
+        let out = eng
+            .run(&mut cx, &[e], Run::default().with_assumptions(&a))
+            .unwrap();
+        let r = out.roots[0];
+        assert_eq!(cx.display(r.expr).to_string(), "5:64");
+        assert!(r.relies_on.may_use(id), "{:?}", r.relies_on);
+        // With no assumption the guard stays, and nothing is relied on.
+        let free = eng.run(&mut cx, &[e], Run::default()).unwrap().roots[0];
+        assert!(cx.as_const(free.expr).unwrap().is_none() && free.relies_on.is_none());
     }
 }

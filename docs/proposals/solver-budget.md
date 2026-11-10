@@ -357,13 +357,6 @@ than brings back at about the same instructions. It is a new `Budget` field and 
 variant; the C API's `bw_budget` is a fixed struct, so it gains the field with a new
 `BW_ABI_VERSION`, and Python a keyword.
 
-**Since changed** (limb arithmetic, see the changelog): the account is `8 · fuel` (2^25 at the
-default) and `MbaBudget::steps` is 2^22. The questions limb code leaves above a recovered word
-(68 to 87 nodes over 8 atoms, products by constants, slices and `concat`s under a wide sum)
-take 1.2 to 2.9 million steps to answer, about ten of them in an expression; with 2^20 and
-`4 · fuel`, 24 of 3,450 such expressions ended on the solver's limits, with 2^22 and
-`4 · fuel` eight ran out of the account. The measurements above are of the values before.
-
 If the budget should not grow a field, **charge the steps to pass work at 4 units each, each call
 within what is left (bound 4)**: the same bound with no API change, but pass work then pays for
 the solver too, so it changes more small-fuel results (CoBRA 66,115 and 57,518 solved with sym),

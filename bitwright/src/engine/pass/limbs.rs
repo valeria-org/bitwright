@@ -762,6 +762,34 @@ pub(super) fn step(
     n: u32,
     form: &Form,
 ) -> Result<Result<Step, Fin>, Stop> {
+    // Nothing joins where every term is a value read whole: no term moves bits of another
+    // value (an extension, a slice, a shift or a mask, a `concat`, a bitwise function of
+    // such), and no coefficient leaves low bits of its term unread. A long sum of plain
+    // terms pays a unit for 32 of them here, not one a term at every node.
+    let terms = form.parts().1;
+    r.meter
+        .charge(Counter::PassWork, terms.len() as u64 / 32 + 1)?;
+    let moves = |t: u32| {
+        matches!(
+            cx.node(t).op,
+            OpCode::Zext
+                | OpCode::Sext
+                | OpCode::Extract
+                | OpCode::Concat
+                | OpCode::Shl
+                | OpCode::LShr
+                | OpCode::AShr
+                | OpCode::And
+                | OpCode::Or
+                | OpCode::Xor
+        )
+    };
+    if !terms
+        .iter()
+        .any(|t| moves(t.0) || t.1.bit(0) == Some(false))
+    {
+        return Ok(Err(Fin::FINAL));
+    }
     let before = cx.len() as u32;
     let Some((f, leaves)) = joined(r, cx, form, cx.wid(n))? else {
         return Ok(Err(Fin::FINAL));

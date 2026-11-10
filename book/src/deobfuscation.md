@@ -3,7 +3,7 @@
 Obfuscators hide simple operations behind *mixed boolean-arithmetic* (MBA) identities, such as
 `x + y = (x ^ y) + 2·(x & y)`, and behind bit shuffles that take a value apart and put it back;
 code lifted from a binary also has the compiler's own disguises, such as divisions by constants
-done with multiplications. `Strategy::deobfuscate()` adds four passes to the standard strategy
+done with multiplications. `Strategy::deobfuscate()` adds five passes to the standard strategy
 for these (hash comparisons through invertible mixers are handled by the standard strategy; see
 [Invertibility](invertibility.md)):
 
@@ -24,15 +24,20 @@ for these (hash comparisons through invertible mixers are handled by the standar
   product of the word; and a limb that is a slice of a word computed below it, or of that
   word plus a constant the handler added limb by limb, becomes that slice, when proved. A sum
   several readers read through truncations of their own is read once, at the root, on the
-  bits that reach it. `Strategy::deobfuscate()` runs up to 12 rounds, a chain of handlers
-  being read one handler a round, and then a late stage for the readings that pay only over
-  the whole expression.
+  bits that reach it. Readings that pay only over the whole expression are taken in a late
+  stage of the rounds, after the words pass has asked.
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature
   and emits the cheapest equivalent form it knows, if that is smaller.
 - **Shuffle.** Values assembled from slices of other values (extracts, shifts, masks, concats,
   ors of disjoint parts) are traced bit by bit, and re-emitted as the rotation, byte swap,
   extension or plain slice they are.
+- **Words.** Arithmetic done digit by digit (a virtual machine's handlers working on limbs of
+  its registers, a multi-precision routine) is read as arithmetic on the words: the digits of
+  the operands and the carries between them, a product by a constant spread over the limbs, a
+  constant added limb by limb. Every node is read as an integer form over `floor(x / 2^k)`
+  terms kept in one shape, in which the digits cancel; nothing is matched and nothing is
+  proved (see [below](#limb-arithmetic)).
 
 ```rust
 use bitwright::engine::{Engine, Strategy};
@@ -56,6 +61,70 @@ for (obfuscated, plain) in [
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+## Limb arithmetic
+
+A virtual machine that keeps a 32-bit value as limbs of 12 and 20 bits adds two of them limb by
+limb: the low limbs at the register's width, and the high limbs with the carry out of the low
+ones, which it takes by comparing the low limb of the sum with an operand's. A product by a
+constant is done on each limb with its own shift of the constant, and a constant is added in
+two parts. The pass reads each of these as the operation on the whole value:
+
+```rust
+use bitwright::engine::{Engine, Strategy};
+use bitwright::{Context, ParseOptions, Width};
+
+let engine = Engine::builder().builtin().strategy(Strategy::deobfuscate()).build()?;
+let mut cx = Context::new();
+for (limbs, width, word) in [
+    // The high limb of a sum: the operands' high limbs and the carry of the low ones.
+    (
+        "trunc<20>((a:32 >>u 12) + (b:32 >>u 12) + zext<32>((a + b & 4095) <u (a & 4095)))",
+        20,
+        "extract<12, 20>(a + b)",
+    ),
+    // A product by a constant, limb by limb.
+    ("(x & 0xffff) * 0x1234567 + (x >>u 16) * 0x45670000", 32, "x * 0x1234567"),
+    // A constant added in two parts: the low one to the word, the high one to a slice of it.
+    ("extract<16, 16>(x:32 * 5 + 0x1234) + 0xab", 16, "extract<16, 16>(x * 5 + 0xab1234)"),
+    // Three registers XORed limb by limb, each limb in its own order.
+    (
+        "((a:32 & 4095) ^ (b:32 & 4095) ^ (c:32 & 4095)) \
+         | (((c >>u 12) ^ (a >>u 12) ^ (b >>u 12)) << 12)",
+        32,
+        "a ^ b ^ c",
+    ),
+    // A register or a constant, chosen limb by limb.
+    (
+        "zext<32>(select(t:1, 113, trunc<12>(r:32))) \
+         | (zext<32>(select(t, 0x352ac, extract<12, 20>(r))) << 12)",
+        32,
+        "select(t, 0x352ac071, r)",
+    ),
+] {
+    let e = cx.parse(limbs, &ParseOptions::width(Width::new(width)?))?;
+    let out = engine.simplify(&mut cx, e)?;
+    assert_eq!(cx.display(out.expr).to_string(), word);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Each node's unsigned value is written as a sum of terms over the integers, among them
+`floor(F / 2^k)` of such sums: a slice is two floors, a sum that wraps is itself less `2^w`
+times a floor, and `x <u y` is `−floor((x − y) / 2^k)`. Three identities keep every floor in one
+shape, and in that shape the carry above is `floor((a + b) / 2^k) − floor(a / 2^k) −
+floor(b / 2^k)`: the digits of `a` and `b` cancel against it, and what is left is the slice of
+`a + b`. A chain of such operations collapses one after the other. The result is written back
+from the root down, each node for all its users at once, wherever that leaves the expression
+smaller; where it does not, nothing changes.
+
+An XOR is read as one term of its operands, however many and in whatever order and grouping,
+and a slice of it is the XOR of the slices: the limbs of an XOR of 3 registers or of 100 are
+the limbs of one value. It is also read as the sum `x + y − 2·(x & y)`, which is how code that
+has no XOR instruction spells it and what the carries of arithmetic done on it belong to; a
+root is asked with each reading, and the one that leaves it smaller once nothing more is
+found is kept. Chains of ANDs and of ORs are read with their operands in one order as well,
+so the same operation written twice in two orders is one value.
 
 ## Divisions by constants
 
@@ -205,7 +274,7 @@ let e = cx.parse(
 let out = engine.run(&mut cx, &[e], Default::default())?;
 assert!(out.stats.mba.calls + out.stats.mba.cache_hits > 0);
 // 2·x + y + (x & y): the same function of x and y at every bit.
-assert_eq!(cx.display(out.roots[0].expr).to_string(), "x + x + (x & y) + y");
+assert_eq!(cx.display(out.roots[0].expr).to_string(), "(x & y) + (x << 1) + y");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

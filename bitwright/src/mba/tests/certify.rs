@@ -1048,3 +1048,156 @@ fn a_one_leaf_expansion_is_its_leaf() {
     let p = r.counterexample.expect("a counterexample");
     assert_ne!(q.eval(&p), side(true).eval(&p));
 }
+
+/// An identity over one variable whose atoms are arithmetic of it: with `s = x ^ c`,
+/// `t = s + k` and `u = (−1 − k) − s` (which is `~t`), `(t & m)·a + (u & n)·b + s·d` is
+/// `(t & m)·(a + d) + (t & ~m)·d + (~t & n)·b − k·d`. Read with `t`, `u` and `s` as
+/// independent it is no identity; over `t` in `x`'s place it is semi-linear.
+#[test]
+fn a_change_of_variable_proves_what_the_atoms_hide() {
+    let w = Width::W64;
+    let vars = [w];
+    let (c, k1) = (0x5bd1_e995_1234_5677i128, 0x1b87_3593_cafe_f00di128);
+    let (m, n) = (0x00ff_ff00_f0f0_0f0fi128, 0x0f0f_0f0f_ffff_0000i128);
+    let (a, b, d) = (0x1234_5678_9abci128, -77i128, 0x0bad_cafei128);
+    let s = || xor(V(0), k(w, c));
+    let t = || add(s(), k(w, k1));
+    let u = || sub(k(w, -1 - k1), s());
+    let f = [
+        mul(and(t(), k(w, m)), k(w, a)),
+        mul(and(u(), k(w, n)), k(w, b)),
+        mul(s(), k(w, d)),
+    ]
+    .into_iter()
+    .reduce(add)
+    .unwrap();
+    let g = |off: i128| {
+        [
+            mul(and(t(), k(w, m)), k(w, a + d)),
+            mul(and(t(), k(w, !m)), k(w, d)),
+            mul(and(not(t()), k(w, n)), k(w, b)),
+            k(w, off - k1 * d),
+        ]
+        .into_iter()
+        .reduce(add)
+        .unwrap()
+    };
+    let (f, good, bad) = (f.expr(&vars), g(0).expr(&vars), g(1).expr(&vars));
+    let changes = certify::changes_of_variable(&f, &good);
+    assert!(!changes.is_empty());
+    assert!(changes.iter().all(|ch| ch.var == 0));
+    let r = check(&f, &good, true);
+    assert_eq!(r.verdict, Verdict::Proved);
+    let r = check(&f, &bad, false);
+    assert_eq!(r.verdict, Verdict::Refuted);
+}
+
+/// A side that differs from the other at one input of 2⁶⁴ (where `x·k₁ = k₂`, the test for
+/// zero written as `(d | −d) >> 63`) is refuted, with that input: over `d` in `x`'s place the
+/// difference sits at zero, where every test looks.
+#[test]
+fn a_change_of_variable_finds_the_one_point() {
+    let w = Width::W64;
+    let vars = [w];
+    let (k1, k2) = (0x9e37_79b9_7f4a_7c15u64, 0x0123_4567_89ab_cdefu64);
+    let d = || {
+        xor(
+            mul(V(0), C(BitVec::wrapping_from_u64(w, k1))),
+            C(BitVec::wrapping_from_u64(w, k2)),
+        )
+    };
+    let nonzero = un(MOp::LShr(63), or(d(), neg(d())));
+    let a = add(V(0), sub(k(w, 1), nonzero)).expr(&vars);
+    let b = V(0).expr(&vars);
+    let r = check(&a, &b, false);
+    assert_eq!(r.verdict, Verdict::Refuted);
+    let p = r.counterexample.unwrap();
+    assert_eq!(p[0].to_u64().unwrap().wrapping_mul(k1), k2);
+}
+
+/// Every change of variable is one: at width 8, over random chains of invertible links and
+/// sides that read the chain's nodes bitwise and arithmetically, the inverse is a bijection of
+/// the variable's values, each rewritten side at `t` is the side at the inverse of `t`, and
+/// so the rewritten pair is equal exactly when the pair is. The verdicts agree with the truth.
+#[test]
+fn changes_of_variable_are_bijections() {
+    let w = Width::new(8).unwrap();
+    let vars = [w, w];
+    let mut rng = crate::testutil::Rng(0x00c0_ffee_5eed);
+    let (mut seen, mut equal) = (0, 0);
+    for round in 0..400 {
+        let konst = |rng: &mut crate::testutil::Rng| k(w, rng.below(256) as i128);
+        // The chain's nodes, bottom up from the variable.
+        let mut chain = vec![V(0)];
+        for _ in 0..1 + rng.below(4) {
+            let below = chain.last().unwrap().clone();
+            chain.push(match rng.below(6) {
+                0 => xor(below, konst(&mut rng)),
+                1 => add(below, konst(&mut rng)),
+                2 => sub(konst(&mut rng), below),
+                3 => mul(below, k(w, (rng.below(128) * 2 + 1) as i128)),
+                4 => neg(below),
+                _ => not(below),
+            });
+        }
+        let side = |rng: &mut crate::testutil::Rng| {
+            let mut terms = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let node = chain[rng.below(chain.len() as u64) as usize].clone();
+                let other = if rng.chance(1, 3) {
+                    V(1)
+                } else {
+                    konst(rng)
+                };
+                let f = match rng.below(4) {
+                    0 => and(node, other),
+                    1 => or(node, other),
+                    2 => xor(not(node), other),
+                    _ => node,
+                };
+                terms.push(mul(f, konst(rng)));
+            }
+            terms.into_iter().reduce(add).unwrap()
+        };
+        let a = side(&mut rng);
+        let b = if round % 2 == 0 {
+            // The same function, its top atom's uses rewritten: t is (t & m) + (t & ~m).
+            let m = rng.below(256) as i128;
+            let top = chain.last().unwrap().clone();
+            let zero = sub(
+                add(and(top.clone(), k(w, m)), and(top.clone(), k(w, !m))),
+                top,
+            );
+            add(a.clone(), mul(zero, konst(&mut rng)))
+        } else {
+            side(&mut rng)
+        };
+        let (a, b) = (a.expr(&vars), b.expr(&vars));
+        let truth = equal_everywhere(&a, &b);
+        equal += usize::from(truth);
+        for ch in certify::changes_of_variable(&a, &b) {
+            seen += 1;
+            assert_eq!(ch.var, 0);
+            assert_eq!((ch.a.vars(), ch.b.vars()), (a.vars(), b.vars()));
+            for y in [0u64, 0x5a] {
+                let mut hit = [false; 256];
+                for t in 0..256u64 {
+                    let p = vec![
+                        BitVec::wrapping_from_u64(w, t),
+                        BitVec::wrapping_from_u64(w, y),
+                    ];
+                    let x = ch.inverse.eval(&p).unwrap();
+                    let at = vec![x, p[1]];
+                    assert_eq!(ch.a.eval(&p), a.eval(&at), "round {round}: {a:?}");
+                    assert_eq!(ch.b.eval(&p), b.eval(&at), "round {round}: {b:?}");
+                    let slot = &mut hit[x.to_u64().unwrap() as usize];
+                    assert!(!*slot, "round {round}: not a bijection");
+                    *slot = true;
+                }
+            }
+            assert_eq!(equal_everywhere(&ch.a, &ch.b), truth, "round {round}");
+        }
+        check(&a, &b, truth);
+    }
+    assert!(seen > 200 && equal > 100, "{seen} changes, {equal} equal");
+}

@@ -573,3 +573,72 @@ fn ordering_is_width_then_unsigned_value() {
     v.sort();
     assert_eq!(v, vec![BitVec::zero(w), lo, BitVec::ones(w)]);
 }
+
+/// The paths for the widths most values have (one word, two words) agree with the limbs:
+/// every value is canonical (no bit at or above its width), the tests and conversions read
+/// what the limbs hold, and equality and the hash are those of the width and active limbs.
+#[test]
+fn narrow_paths_agree_with_the_limbs() {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let hash = |v: &BitVec| {
+        let mut std = std::collections::hash_map::DefaultHasher::new();
+        v.hash(&mut std);
+        (std.finish(), crate::hash::IdBuild.hash_one(v))
+    };
+    let mut rng = Rng(0x6e61_7272_6f77);
+    let widths = [1u16, 2, 7, 8, 63, 64, 65, 100, 127, 128, 129, 200, 512];
+    for &w in &widths {
+        let width = Width::new(w).unwrap();
+        let n = wide::nlimbs(w);
+        let mut seen: Vec<BitVec> = vec![BitVec::zero(width), BitVec::ones(width)];
+        for _ in 0..200 {
+            seen.push(biased(&mut rng, width));
+        }
+        // What the casts and the constructors build, at this width and its neighbours.
+        for i in 0..40 {
+            let v = seen[2 + i];
+            let len = Width::new(1 + rng.below(u64::from(w)) as u16).unwrap();
+            let lo = rng.below(u64::from(w - len.bits()) + 1) as u16;
+            let part = v.extract(lo, len).unwrap();
+            assert_eq!(
+                part.raw(),
+                &wide::extract(v.raw(), lo, len.bits()),
+                "{v} {lo} {len:?}"
+            );
+            if let Ok(to) = Width::new(w + len.bits()) {
+                let both = BitVec::concat(&v, &part).unwrap();
+                assert_eq!(both.raw(), &wide::concat(v.raw(), part.raw(), len.bits()));
+                assert_eq!(
+                    v.sext(to).unwrap().raw(),
+                    &wide::sext(v.raw(), w, to.bits())
+                );
+                assert_eq!(both.width(), to);
+            }
+            let x = rng.next() as i64 as i128;
+            seen.push(BitVec::wrapping_from_i128(width, x));
+            seen.push(BitVec::wrapping_from_u128(width, x as u128));
+        }
+        assert_eq!(BitVec::ones(width).raw(), &wide::ones(w));
+        for v in &seen {
+            let raw = v.raw();
+            assert!(raw[n..].iter().all(|&l| l == 0), "{v}");
+            assert!(w % 64 == 0 || raw[n - 1] >> (w % 64) == 0, "{v}");
+            assert_eq!(v.is_zero(), raw.iter().all(|&l| l == 0), "{v}");
+            assert_eq!(v.is_ones(), raw == &wide::ones(w), "{v}");
+            let fits = raw[2..].iter().all(|&l| l == 0);
+            let low = u128::from(raw[0]) | u128::from(raw[1]) << 64;
+            assert_eq!(v.to_u128(), fits.then_some(low), "{v}");
+            assert_eq!(v.to_u64(), (fits && raw[1] == 0).then_some(raw[0]), "{v}");
+        }
+        for a in &seen {
+            for b in seen.iter().take(40) {
+                assert_eq!(a == b, a.raw() == b.raw(), "{a} {b}");
+                assert!(a != b || hash(a) == hash(b), "{a} {b}");
+            }
+            // The same limbs at another width are another value.
+            if let Ok(other) = Width::new(w + 1) {
+                assert_ne!(*a, a.zext(other).unwrap());
+            }
+        }
+    }
+}

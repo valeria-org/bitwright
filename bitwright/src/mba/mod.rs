@@ -43,7 +43,10 @@ pub use threaded::ThreadedSolver;
 pub(crate) use decast::decast;
 pub use expr::{MNode, MOp, MbaError, MbaExpr, Shape};
 pub use lower::{Bindings, MbaLimits, Refusal, lift, lower};
-pub(crate) use lower::{Reading, fits_nodes, lift_id, lower_id, lower_id_reading, shared_nodes};
+pub(crate) use lower::{
+    Reading, cuts, fits_nodes, lift_id, lower_id, lower_id_over, lower_id_reading, lower_id_whole,
+    shared_nodes, shared_nodes_whole,
+};
 pub use solve::{
     CacheEntry, CacheKey, Claim, EquivalenceProver, MbaAnswer, MbaBudget, MbaCacheStore, MbaSolver,
     MemoryCache, NoCache, SignatureSolver, Verdict,
@@ -91,7 +94,11 @@ pub struct MbaConfig {
     /// slices (`x >>u k`, `x << k`) are asked as masks of one rotation where a fragment reads
     /// several (see `engine::pass::mba`); a root is read with what its conditions fix put into
     /// the operands they guard, and a piece that depends on one or two conditions alone is
-    /// written as the table of its values (see `engine::pass::context`). Off unless asked.
+    /// written as the table of its values (see `engine::pass::context`). The root the rounds
+    /// settle on is read once more on either side of the condition its selects test most,
+    /// each side simplified in turn, and the smaller of the two forms is the result: an
+    /// obfuscator picks between two masked values by a flag, and with the flag fixed what is
+    /// computed from one of them folds. Off unless asked.
     pub noise_forms: bool,
     /// the opaque-constant sweep asks a narrower reading its free atoms refute again
     /// with their known bits written out (`(v & unknown) | ones`), proves a root constant one

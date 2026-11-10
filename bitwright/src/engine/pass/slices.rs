@@ -338,10 +338,16 @@ impl Word {
     }
 }
 
+/// What [`asked`] gives of a question put to the prover: the outcome, the AIG nodes built,
+/// the propagations taken, and the nodes the copy had fresh symbols for.
+type Asked = (Outcome, u64, u64, Vec<u32>);
+
 /// What the prover says of bits `[lo, lo + len)` of `s` and `extract<o, len>` of `word`
 /// being equal, over a scratch copy of both, within `propagations`: with the AIG nodes built,
 /// the propagations taken, and the nodes the copy has fresh symbols for (the highest
-/// [`opaque`] nodes below the two but those of `uncut`; none without it).
+/// [`opaque`] nodes below the two but those of `uncut`; none without it). `None` for what a
+/// fresh context cannot hold (an extension operation: it has no registry): the prover is
+/// not asked, under any budget.
 fn asked(
     cx: &Context,
     (s, lo): (u32, u16),
@@ -349,7 +355,7 @@ fn asked(
     len: u16,
     uncut: Option<&IdMap<u32, ()>>,
     propagations: u64,
-) -> Result<(Outcome, u64, u64, Vec<u32>), crate::Error> {
+) -> Result<Option<Asked>, crate::Error> {
     let mut scx = Context::new();
     let mut pre: Vec<(u32, u32)> = Vec::new();
     if let Some(uncut) = uncut {
@@ -381,7 +387,11 @@ fn asked(
         .chain(word.operands())
         .map(|i| cx.handle(i))
         .collect();
-    let both = scx.import_mapped(cx, &roots, &pre)?;
+    let both = match scx.import_mapped(cx, &roots, &pre) {
+        Ok(both) => both,
+        Err(crate::Error::Unsupported(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let jw = Width::new(len)?;
     let lhs = scx.extract(both[0], lo, jw)?;
     let (a, b) = (
@@ -439,12 +449,12 @@ fn asked(
         nodes += n;
         stats.propagations += p;
     }
-    Ok((
+    Ok(Some((
         out,
         nodes as u64,
         stats.propagations,
         pre.into_iter().map(|(i, _)| i).collect(),
-    ))
+    )))
 }
 
 /// What a question came to.
@@ -531,7 +541,7 @@ fn proved(
         if propagations == 0 {
             return Ok(Err(Fin::capped(crate::engine::Exhausted::PassWork)));
         }
-        let (out, nodes, taken, fresh) = asked(
+        let Some((out, nodes, taken, fresh)) = asked(
             cx,
             (s, lo),
             (word, o),
@@ -539,7 +549,10 @@ fn proved(
             cut.then_some(&r.carries.uncut),
             propagations,
         )
-        .map_err(Stop::Error)?;
+        .map_err(Stop::Error)?
+        else {
+            return Ok(Ok(Said::Undecided));
+        };
         let cost = nodes
             .saturating_add(taken.saturating_mul(PROPAGATION_RATE))
             .min(left);

@@ -2,16 +2,30 @@
 //!
 //! A node's *form* is computed from its operands' forms: `+`, `−`, negation, `~a = −a − 1`,
 //! multiplication by a constant, shifts left by a constant (scaling), `|`/`^` of operands the
-//! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1,
-//! except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads the first as
-//! `−zext(c)`. Terms that are the limbs of one word, their coefficients doubling from bit to
-//! bit, are one term of the word (see `limbs`).
-//! A form with more than [`MAX_TERMS`] terms is atomized. The form is re-emitted canonically
-//! (terms in the context's canonical order, positive coefficients first, power-of-two
-//! coefficients as shifts, the constant last), and the emission replaces the node only when
-//! the region above the atoms gets strictly smaller.
+//! facts prove disjoint (both are `+` then), `^` of operands one of which the facts prove to
+//! have bits only where the other has them (a `−` then). Anything else is an *atom* with
+//! coefficient 1.
+//! Terms that read one value two ways are moved to one reading where the sum has both, so
+//! they cancel ([`merge`]): `sext(c)` beside `zext(c)` of a 1-bit `c` is `−zext(c)`, an
+//! extension of `~t` beside that of `t` is a constant less it, and `2^j·(x >>u j)` beside the
+//! low field `x & (2^j − 1)` is `x` less that field.
+//!
+//! A form with more than [`MAX_TERMS`] terms is atomized: its node is an atom of the forms
+//! over it, which keeps every form small. Such a sum keeps its *whole* form
+//! ([`Whole`](super::forms::Whole), up to 1024 terms), and a sum in which a term meets one
+//! inside it is taken apart ([`sum_of`]), so terms cancel through sums of that length:
+//! `(v0 + … + v99) − v0` is the other 99 terms.
+//!
+//! The form is re-emitted canonically (terms in the context's canonical order, positive
+//! coefficients first, power-of-two coefficients as shifts, the constant last), and the
+//! emission replaces the node only when the region above the atoms gets strictly smaller.
+//!
+//! Around the forms: a sum of products with a common factor is factored ([`factor_sum`]),
+//! terms that count bits of one value are one population count ([`bit_count`]), and a
+//! product of three or more values is written with its factors in the context's order
+//! ([`sort_chain`](super::sort_chain)), so two writings of one product are one atom.
 
-use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, worth_building};
+use super::{Fin, PassKind, Runner, Step, Stop, disjoint, finish, within, worth_building};
 use crate::BitVec;
 use crate::engine::budget::Counter;
 use crate::expr::{Context, Node, OpCode};
@@ -36,6 +50,16 @@ impl super::forms::Parts for Form {
 
     fn from_parts(konst: BitVec, terms: Vec<(u32, BitVec)>, fin: Fin) -> Form {
         Form { konst, terms, fin }
+    }
+}
+
+impl super::forms::Sum for Form {
+    fn join(a: &BitVec, b: &BitVec) -> BitVec {
+        BitVec::bin_unchecked(BinOp::Add, a, b)
+    }
+
+    fn scale(outer: &BitVec, inner: &BitVec) -> BitVec {
+        BitVec::bin_unchecked(BinOp::Mul, outer, inner)
     }
 }
 
@@ -170,14 +194,10 @@ fn count(plan: &Plan) -> u32 {
     let w = konst.width();
     let one = BitVec::one(w);
     let t = terms.len() as u32;
-    let two = BitVec::wrapping_from_u64(w, 2);
-    let doubled = |k: &BitVec| *k == two || BitVec::un_unchecked(UnOp::Neg, k) == two;
     let scaled = terms
         .iter()
-        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one && !doubled(k))
+        .filter(|(_, k, _)| *k != one && BitVec::un_unchecked(UnOp::Neg, k) != one)
         .count() as u32;
-    // `a + a` is one node.
-    let doubles = terms.iter().filter(|(_, k, _)| doubled(k)).count() as u32;
     let nots = terms.iter().filter(|(_, _, not)| *not).count() as u32;
     let minus_one = BitVec::ones(w);
     // With no positive term and no constant, a negation only when every coefficient is −1.
@@ -187,7 +207,7 @@ fn count(plan: &Plan) -> u32 {
         (_, true) => u32::from(negation),
         _ => 2,
     };
-    2 * scaled + doubles + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
+    2 * scaled + t.saturating_sub(1) + nots + konst + u32::from(plan.not)
 }
 
 /// What [`emit`] writes for `form`, terms in the given order: the cheapest of trading the
@@ -196,7 +216,7 @@ fn count(plan: &Plan) -> u32 {
 /// `~x`) or a power of two from 2 (`2·y + 2` is `~y·−2`, where the shift's amount would be a
 /// second constant); a constant 1 goes into a term of coefficient 1 beside another term
 /// (`a + t + 1` is `a − ~t`) or splits one of coefficient 2 (`2·t + 1` is `t − ~t`); and a
-/// constant −1 complements the negated rest (`−1 − 2·x` is `~(x + x)`).
+/// constant −1 complements the negated rest (`−1 − 2·x` is `~(x << 1)`).
 fn plan(form: &Form, order: &[(u32, BitVec)]) -> Plan {
     let w = form.konst.width();
     let neg = |k: &BitVec| BitVec::un_unchecked(UnOp::Neg, k);
@@ -306,43 +326,42 @@ pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Re
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        let f = compute(r, cx, i)?;
-        let f = if f.terms.len() > MAX_TERMS {
-            r.stats.passes.entry("linear").or_default().atomized += 1;
-            Form {
-                fin: f.fin,
-                ..Form::atom(i, cx.width_of(i))
-            }
-        } else {
-            f
+        let (f, met) = compute(r, cx, i)?;
+        if f.terms.len() <= MAX_TERMS {
+            r.linear.insert(i, f);
+            continue;
+        }
+        // Over the cap: an atom, which keeps its whole form for the sums over it.
+        r.stats.passes.entry("linear").or_default().atomized += 1;
+        let atom = Form {
+            fin: f.fin,
+            ..Form::atom(i, cx.width_of(i))
         };
-        r.linear.insert(i, f);
+        r.linear.insert(i, atom);
+        let mut read = 0;
+        r.linear_whole.keep(i, f, met, &mut read);
+        r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     }
     Ok(r.linear
         .get(root)
         .expect("the root's form was just computed"))
 }
 
-/// The form of `i` from its operands' (cached) forms.
-fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Stop> {
+/// The form of `i` from its operands' (cached) forms, and whether terms met in it (see
+/// [`sum_of`]).
+fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
     let get =
         |r: &Runner<'_, '_>, j: u32| r.linear.get(j).expect("operands' forms are computed first");
-    Ok(match node.op {
+    let form = match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => {
-            let f = merge_signs(cx, get(r, node.a).add(&get(r, node.b)));
-            merge_masks(r, cx, merge_complements(cx, f))
-        }
-        OpCode::Sub => {
-            let f = merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg()));
-            merge_masks(r, cx, merge_complements(cx, f))
-        }
+        OpCode::Add => return sum_of(r, cx, &get(r, node.a), &get(r, node.b)),
+        OpCode::Sub => return sum_of(r, cx, &get(r, node.a), &get(r, node.b).neg()),
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -383,18 +402,101 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
             if disjoint {
                 // The sum relies on what proved the operands disjoint.
-                let mut f = get(r, node.a).add(&get(r, node.b));
+                let (mut f, met) = sum_of(r, cx, &get(r, node.a), &get(r, node.b))?;
                 f.fin = f.fin.and(fina).and(finb);
-                f
-            } else {
-                Form {
-                    fin: fina.and(finb).unchanged(),
-                    ..Form::atom(i, w)
+                return Ok((f, met));
+            }
+            // A xor that only clears bits its other operand has set is their difference
+            // (`c ^ t` with `t ⊆ c` is `c − t`: no borrow), so a sum cancels through it as it
+            // does through the subtraction the rules write that way (`sub_within`).
+            if node.op == OpCode::Xor {
+                for (whole, part) in [(node.a, node.b), (node.b, node.a)] {
+                    let (inside, finw, finp) = within(r, cx, whole, part)?;
+                    if inside {
+                        let (mut f, met) = sum_of(r, cx, &get(r, whole), &get(r, part).neg())?;
+                        f.fin = f.fin.and(finw).and(finp);
+                        return Ok((f, met));
+                    }
                 }
+            }
+            Form {
+                fin: fina.and(finb).unchanged(),
+                ..Form::atom(i, w)
             }
         }
         _ => Form::atom(i, w),
+    };
+    Ok((form, false))
+}
+
+/// The sum of the forms `a` and `b` of a node's operands, and whether terms met in it: two
+/// terms of one atom, in the forms themselves or out of sight, one of them inside a sum over
+/// [`MAX_TERMS`] that is an atom here (see [`Whole`](super::forms::Whole)). Those sums are
+/// then taken apart, so the terms cancel: `(v0 + … + v99) − v0` is the other 99 terms.
+fn sum_of(r: &mut Runner<'_, '_>, cx: &Context, a: &Form, b: &Form) -> Result<(Form, bool), Stop> {
+    let f = merge_masks(r, cx, merge(cx, a.add(b)));
+    let met = f.terms.len() < a.terms.len() + b.terms.len();
+    let mut read = 0;
+    let whole = r.linear_whole.meeting(a, b, &f, &mut read);
+    r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
+    Ok(match whole {
+        // (`merge_fields` reads every term for each shifted one: within the cap only.)
+        Some(whole) if whole.terms.len() <= MAX_TERMS => (merge(cx, whole), true),
+        Some(whole) => (whole, true),
+        None => (f, met),
     })
+}
+
+/// `form` with the terms that read one value two ways moved to one reading, so they cancel.
+fn merge(cx: &Context, form: Form) -> Form {
+    merge_fields(cx, merge_complements(cx, merge_signs(cx, form)))
+}
+
+/// `form` with each term `k·2^j·(x >>u j)` moved to `k·x − k·(x & (2^j − 1))` when the form
+/// has that low field of `x` as a term too: `(x >>u 3)·24 + (x & 7)·3` is `x·3`. Only then, as
+/// [`merge_signs`].
+fn merge_fields(cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut moves = Vec::new();
+    for &(a, k) in &form.terms {
+        let n = cx.node(a);
+        if n.op != OpCode::LShr {
+            continue;
+        }
+        let Some(j) = cx.const_val(n.b).and_then(|j| j.to_u64()) else {
+            continue;
+        };
+        if j == 0 || j >= u64::from(w.bits()) {
+            continue;
+        }
+        let j = j as u32;
+        let q = crate::facts::known::bv_lshr(&k, j);
+        if crate::facts::known::bv_shl(&q, j) != k {
+            continue;
+        }
+        let mask = crate::facts::known::low_mask(w, j);
+        let low = form.terms.iter().map(|t| t.0).find(|&t| {
+            let m = cx.node(t);
+            m.op == OpCode::And && m.a == n.a && cx.const_val(m.b) == Some(mask)
+        });
+        if let Some(low) = low {
+            moves.push((a, k, n.a, low, q));
+        }
+    }
+    if moves.is_empty() {
+        return form;
+    }
+    let fin = form.fin;
+    let mut f = form;
+    for (a, k, x, low, q) in moves {
+        let neg = |v: &BitVec| BitVec::un_unchecked(UnOp::Neg, v);
+        f = f.add(&Form::of(
+            BitVec::zero(w),
+            &[(a, neg(&k)), (x, q), (low, neg(&q))],
+        ));
+    }
+    f.fin = fin;
+    f
 }
 
 /// `form` with each term `k·sext(c)` of a 1-bit `c` (`0` or `−1`) moved to `−k·zext(c)` when
@@ -714,10 +816,6 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
             if *k == BitVec::one(w) {
                 return Ok(a);
             }
-            // `a + a`: one node, where a shift needs its amount too.
-            if *k == BitVec::wrapping_from_u64(w, 2) {
-                return r.build(cx, |cx| cx.c_bin(BinOp::Add, a, a));
-            }
             if crate::facts::known::count_ones(k) == 1 {
                 let sh = BitVec::apply_un(UnOp::Ctz, k).map_err(|e| Stop::Error(e.into()))?;
                 return r.build(cx, |cx| {
@@ -784,6 +882,38 @@ pub(super) fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Res
     }
 }
 
+/// The leaves of the tree of `op` at `n`, left to right, when there are at most `N`. It reads
+/// from the top and stops as soon as the nodes it holds must give more: a tree of `k` leaves
+/// takes `2k − 1` steps and a larger one at most `2N`, however deep it is. (Read by recursion
+/// to the bottom first, every node of a chain of 128 000 additions cost its depth, 29 s in
+/// all, and one of 80 000 overflowed a 2 MiB stack.)
+fn leaves<const N: usize>(cx: &Context, n: u32, op: OpCode) -> Option<([u32; N], usize)> {
+    let mut out = [0; N];
+    let mut len = 0;
+    // The nodes still to read, the next one last. Each gives at least one leaf, so `len + top`
+    // never passes `N`.
+    let mut todo = [0; N];
+    let mut top = 1;
+    *todo.first_mut()? = n;
+    while top > 0 {
+        top -= 1;
+        let i = todo[top];
+        let node = cx.node(i);
+        if node.op == op {
+            if len + top + 2 > N {
+                return None;
+            }
+            todo[top] = node.b;
+            todo[top + 1] = node.a;
+            top += 2;
+        } else {
+            out[len] = i;
+            len += 1;
+        }
+    }
+    Some((out, len))
+}
+
 /// multiplicative leaves of one term, bounded so factor search never turns a large
 /// product into pass work proportional to its tree.
 #[derive(Copy, Clone)]
@@ -795,26 +925,8 @@ struct Product {
 const MAX_PRODUCT_FACTORS: usize = 8;
 
 fn product(cx: &Context, n: u32) -> Option<Product> {
-    fn collect(cx: &Context, n: u32, out: &mut Product) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Mul {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.factors.len() {
-            out.factors[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Product {
-        factors: [0; MAX_PRODUCT_FACTORS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (factors, len) = leaves(cx, n, OpCode::Mul)?;
+    Some(Product { factors, len })
 }
 
 /// Additive terms of one sum, bounded for the same reason as [`Product`].
@@ -827,26 +939,8 @@ struct Sum {
 const MAX_SUM_TERMS: usize = 16;
 
 fn sum(cx: &Context, n: u32) -> Option<Sum> {
-    fn collect(cx: &Context, n: u32, out: &mut Sum) -> Option<()> {
-        let node = cx.node(n);
-        if node.op == OpCode::Add {
-            collect(cx, node.a, out)?;
-            collect(cx, node.b, out)
-        } else if out.len < out.terms.len() {
-            out.terms[out.len] = n;
-            out.len += 1;
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    let mut out = Sum {
-        terms: [0; MAX_SUM_TERMS],
-        len: 0,
-    };
-    collect(cx, n, &mut out)?;
-    Some(out)
+    let (terms, len) = leaves(cx, n, OpCode::Add)?;
+    Some(Sum { terms, len })
 }
 
 /// A structurally shared factor and its position in every product, preferring a non-constant.
@@ -983,6 +1077,8 @@ fn without_factor(
 /// `a·x + a·y + …` written as `a·(x + y + …)`, including where products group more factors.
 /// The commit rule keeps the rewrite only when it shrinks the live DAG. Factoring the whole
 /// bounded sum avoids rejecting an intermediate pair when its product is shared elsewhere.
+/// `None` when `n` is no such sum; a `Normal` step is what the candidates it declined
+/// contribute.
 fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
     let Some(sum) = sum(cx, n) else {
         return Ok(None);
@@ -1001,11 +1097,13 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         *slot = p;
     }
     let products = &products[..sum.len];
-    if let Some(step @ Step::To(..)) = complementary_products(r, cx, n, products)? {
-        return Ok(Some(step));
-    }
+    let declined = match complementary_products(r, cx, n, products)? {
+        Some(Step::Normal(f)) => f,
+        Some(step) => return Ok(Some(step)),
+        None => Fin::FINAL,
+    };
     let Some((factor, positions)) = common_factor(cx, products) else {
-        return Ok(None);
+        return Ok(Some(Step::Normal(declined)));
     };
     let before = cx.len() as u32;
     let mut rest = None;
@@ -1017,7 +1115,7 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         });
     }
     let Some(rest) = rest else {
-        return Ok(None);
+        return Ok(Some(Step::Normal(declined)));
     };
     let factored = r.build(cx, |cx| cx.c_bin(BinOp::Mul, factor, rest))?;
     let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS];
@@ -1030,67 +1128,262 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
             }
         }
     }
-    Ok(Some(finish(
-        r,
-        cx,
-        PassKind::Linear,
-        n,
-        factored,
-        before,
-        &atoms[..count],
-        Fin::FINAL,
-    )?))
+    Ok(Some(
+        match finish(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            factored,
+            before,
+            &atoms[..count],
+            Fin::FINAL,
+        )? {
+            Step::Normal(f) => Step::Normal(f.and(declined)),
+            step => step,
+        },
+    ))
 }
 
-/// The linear pass at `n`.
+/// The linear pass at `n`. It tries several candidates in turn, and what each one it declines
+/// contributes stays in the result: a candidate rejected only because a part of the node has
+/// another user is not rejected for good (the user may go), whichever candidate it was. Kept
+/// of the last candidate alone, the node was remembered as final in a form the next call, in a
+/// context without that memory, rewrote.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
-    if let Some(step @ Step::To(..)) = factor_sum(r, cx, n)? {
-        return Ok(step);
-    }
+    let mut declined = match factor_sum(r, cx, n)? {
+        Some(Step::Normal(f)) => f,
+        Some(step) => return Ok(step),
+        None => Fin::FINAL,
+    };
     // A case split on a condition mask the node reads, first (see `cases`).
     let before = cx.len() as u32;
-    if let Some((e, f)) = super::cases::split(r, cx, n)?
-        && let Step::To(x, fin) = finish(r, cx, PassKind::Linear, n, e, before, &[], f)?
-    {
-        return Ok(Step::To(x, fin));
-    }
-    if !linear_op(op) || op == OpCode::Const {
-        return Ok(Step::Normal(Fin::FINAL));
-    }
-    let form = form_of(r, cx, n)?;
-    if form.is_atom_of(n) {
-        return Ok(Step::Normal(form.fin));
-    }
-    // Terms reading one condition, merged first (see `conditions`).
-    let merged = match super::conditions::step(r, cx, n, &form)? {
-        Ok(s) => return Ok(s),
-        Err(f) => f,
-    };
-    // Limbs of one word, joined (see `limbs`).
-    let joined = match super::limbs::step(r, cx, n, &form)? {
-        Ok(s) => return Ok(s),
-        Err(f) => f,
-    };
-    // A slice of a sum plus a constant, the constant taken into the sum (see `limbs`).
-    let sliced = match super::limbs::folded(r, cx, n, &form)? {
-        Ok(s) => return Ok(s),
-        Err(f) => f,
-    };
-    // A sum that spells an XOR or an OR with a constant (see `masked`).
-    let before = cx.len() as u32;
-    let mut folded = Fin::FINAL;
-    if let Some((f, leaves)) = masked(r, cx, &form)? {
-        let e = emit(r, cx, &f)?;
-        match finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin)? {
-            Step::To(x, fin) => return Ok(Step::To(x, fin)),
-            Step::Normal(fin) => folded = fin,
+    if let Some((e, f)) = super::cases::split(r, cx, n)? {
+        match finish(r, cx, PassKind::Linear, n, e, before, &[], f)? {
+            Step::Normal(f) => declined = declined.and(f),
+            step => return Ok(step),
         }
     }
-    Ok(match plain(r, cx, n, form)? {
-        Step::Normal(f) => Step::Normal(f.and(merged).and(joined).and(sliced).and(folded)),
-        s => s,
+    if !linear_op(op) || op == OpCode::Const {
+        return Ok(Step::Normal(declined));
+    }
+    // A product of values, its factors in order (see `sort_chain`).
+    if op == OpCode::Mul {
+        match super::sort_chain(r, cx, PassKind::Linear, n)? {
+            Step::Normal(f) => declined = declined.and(f),
+            step => return Ok(step),
+        }
+    }
+    let form = form_of(r, cx, n)?;
+    let last = if form.is_atom_of(n) {
+        // A sum over the cap in which terms met is written out again, from its whole form.
+        match r.linear_whole.met(n) {
+            Some(whole) => plain(r, cx, n, whole)?,
+            None => Step::Normal(form.fin),
+        }
+    } else {
+        // Bits of one value counted, first (see `bit_count`).
+        match bit_count(r, cx, n, &form)? {
+            Some(Step::Normal(f)) => declined = declined.and(f),
+            Some(step) => return Ok(step),
+            None => {}
+        }
+        // Terms reading one condition, merged first (see `conditions`).
+        match super::conditions::step(r, cx, n, &form)? {
+            Ok(step) => step,
+            Err(f) => {
+                declined = declined.and(f);
+                // Limbs of one word, joined (see `limbs`).
+                match super::limbs::step(r, cx, n, &form)? {
+                    Ok(s) => return Ok(s),
+                    Err(f) => declined = declined.and(f),
+                }
+                // A slice of a sum plus a constant, the constant taken into the sum (see
+                // `limbs`).
+                match super::limbs::folded(r, cx, n, &form)? {
+                    Ok(s) => return Ok(s),
+                    Err(f) => declined = declined.and(f),
+                }
+                // A sum that spells an XOR or an OR with a constant (see `masked`).
+                let before = cx.len() as u32;
+                if let Some((f, leaves)) = masked(r, cx, &form)? {
+                    let e = emit(r, cx, &f)?;
+                    match finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin)? {
+                        Step::To(x, fin) => return Ok(Step::To(x, fin)),
+                        Step::Normal(fin) => declined = declined.and(fin),
+                    }
+                }
+                plain(r, cx, n, form)?
+            }
+        }
+    };
+    Ok(match last {
+        Step::Normal(f) => Step::Normal(f.and(declined)),
+        step => step,
     })
+}
+
+/// The fewest bits of one value [`bit_count`] writes as a population count.
+const COUNTED_BITS: u32 = 3;
+
+/// The term `t` as a count of bits of a value, at `t`'s width: the value and the bits (among
+/// its low 128). One bit (`extract<i, 1>(y)` extended, `y & 1`, `(y >>u i) & 1`, the top bit
+/// shifted down) or a population count of a field (`popcnt(y & m)`, extended or truncated);
+/// a bit of a slice or of a zero extension is a bit of its operand.
+fn counted(cx: &Context, t: u32) -> Option<(u32, u128)> {
+    let n = cx.node(t);
+    let w = u32::from(n.width);
+    let shift = |i: u32| cx.const_val(i).and_then(|k| k.to_u64());
+    let masked = |a: u32, b: u32| match (cx.const_val(a), cx.const_val(b)) {
+        (None, Some(k)) => Some((a, k.to_u128()?)),
+        (Some(k), None) => Some((b, k.to_u128()?)),
+        _ => None,
+    };
+    // A count of the bits `m` of `y`, before `y` is traced to the value it reads.
+    let bit = |i: u32| (i < 128).then(|| 1u128 << i);
+    // (A truncation of a population count to one bit is that count, not a bit of a value.)
+    let truncated_count = n.op == OpCode::Extract && n.b == 0 && cx.node(n.a).op == OpCode::Popcnt;
+    let (mut y, mut m): (u32, u128) = match n.op {
+        OpCode::Extract if w == 1 && !truncated_count => (n.a, bit(n.b)?),
+        OpCode::Extract | OpCode::Zext | OpCode::Popcnt => {
+            // A population count through a cast, or a bit extended.
+            let inner = match n.op {
+                OpCode::Popcnt => t,
+                OpCode::Extract if n.b != 0 => return None,
+                _ => n.a,
+            };
+            let e = cx.node(inner);
+            match e.op {
+                OpCode::Extract if e.width == 1 && n.op == OpCode::Zext => (e.a, bit(e.b)?),
+                OpCode::Popcnt => {
+                    if cx.wid(e.a) > 128 {
+                        return None;
+                    }
+                    let f = cx.node(e.a);
+                    let ones = u128::MAX >> (128 - u32::from(f.width));
+                    match (f.op == OpCode::And).then(|| masked(f.a, f.b)).flatten() {
+                        Some((v, k)) => (v, k & ones),
+                        None => (e.a, ones),
+                    }
+                }
+                _ => return None,
+            }
+        }
+        OpCode::And => {
+            let (v, k) = masked(n.a, n.b)?;
+            if k != 1 {
+                return None;
+            }
+            let s = cx.node(v);
+            match (s.op == OpCode::LShr).then(|| shift(s.b)).flatten() {
+                Some(k) if k < u64::from(w) => (s.a, bit(k as u32)?),
+                _ => (v, 1),
+            }
+        }
+        OpCode::LShr if w > 1 && shift(n.b) == Some(u64::from(w) - 1) => (n.a, bit(w - 1)?),
+        _ => return None,
+    };
+    loop {
+        let s = cx.node(y);
+        match s.op {
+            OpCode::Extract => {
+                if s.b >= 128 || m.leading_zeros() < s.b {
+                    return None;
+                }
+                m <<= s.b;
+                y = s.a;
+            }
+            // The extension's high bits are zero: they count nothing.
+            OpCode::Zext => {
+                m &= u128::MAX >> (128 - u32::from(cx.wid(s.a)).min(128));
+                y = s.a;
+            }
+            _ => break,
+        }
+    }
+    (m != 0).then_some((y, m))
+}
+
+/// The sum `n` (whose form is `form`) with its terms that count bits of one value, with one
+/// coefficient and no bit twice, written as one term: the population count of those bits
+/// (`Σ c·bitᵢ(x)` is `c·popcnt(x & m)`, the bits a slice of `x` where they are one run). The
+/// operand of a parity flag is spelled this way, a bit at a time, and its low bit is then a
+/// sum of eight slices at one bit. Three bits or more, from two terms or more.
+fn bit_count(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    if form.terms.len() < 2 {
+        return Ok(None);
+    }
+    // Per term: the value and the bits, where it counts some.
+    let bits: Vec<Option<(u32, u128)>> = form.terms.iter().map(|&(t, _)| counted(cx, t)).collect();
+    // The value and coefficient most such terms share.
+    let mut best: Option<(usize, u32, BitVec)> = None;
+    for (j, b) in bits.iter().enumerate() {
+        let Some((x, _)) = *b else { continue };
+        let k = form.terms[j].1;
+        let count = bits
+            .iter()
+            .zip(&form.terms)
+            .filter(|(b, t)| b.is_some_and(|(y, _)| y == x) && t.1 == k)
+            .count();
+        if best.as_ref().is_none_or(|(c, ..)| count > *c) {
+            best = Some((count, x, k));
+        }
+    }
+    let Some((_, x, k)) = best else {
+        return Ok(None);
+    };
+    // Its bits (a term with a bit already counted stays a term), and the other terms.
+    let (mut set, mut merged) = (0u128, 0usize);
+    let mut rest: Vec<(u32, BitVec)> = Vec::new();
+    for (b, &term) in bits.iter().zip(&form.terms) {
+        match *b {
+            Some((y, m)) if y == x && term.1 == k && set & m == 0 => {
+                set |= m;
+                merged += 1;
+            }
+            _ => rest.push(term),
+        }
+    }
+    if merged < 2 || set.count_ones() < COUNTED_BITS {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
+    let lo = set.trailing_zeros();
+    let span = 128 - set.leading_zeros() - lo;
+    let run = set >> lo == u128::MAX >> (128 - span);
+    if span > 64 && !run {
+        return Ok(None);
+    }
+    let w = form.konst.width();
+    let before = cx.len() as u32;
+    let count = r.build(cx, |cx| {
+        let mut field = cx.c_extract(x, lo as u16, span as u16)?;
+        if !run {
+            let mask = cx.mk_const_u64(cx.wid(field), (set >> lo) as u64)?;
+            field = cx.c_bin(BinOp::And, field, mask)?;
+        }
+        let p = cx.c_un(UnOp::Popcnt, field)?;
+        match cx.wid(p).cmp(&w.bits()) {
+            core::cmp::Ordering::Less => cx.c_zext(p, w.bits()),
+            core::cmp::Ordering::Equal => Ok(p),
+            core::cmp::Ordering::Greater => cx.c_extract(p, 0, w.bits()),
+        }
+    })?;
+    rest.push((count, k));
+    let mut f = Form::of(form.konst, &rest);
+    f.fin = form.fin;
+    let e = emit(r, cx, &f)?;
+    let mut leaves: Vec<u32> = rest.iter().map(|t| t.0).filter(|&t| t != count).collect();
+    leaves.push(x);
+    leaves.sort_unstable();
+    leaves.dedup();
+    finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some)
 }
 
 /// The linear pass at `n` over its form as computed.
@@ -1114,28 +1407,23 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
 }
 
-/// the sum `n` taken apart into groups of terms whose bitwise parts share no
-/// atom (the operands of `& | ^` that are not themselves bitwise), each group with several
-/// terms simplified alone by `part` (the MBA phase), and the sum built again from the results;
-/// `None` when the sum has one group or no group changes. An identity hidden in a sum beside
-/// other terms (`(z | k) − (z & k) − (z ^ k)`, nothing, next to a polynomial in `x` and `y`;
-/// `(t ^ k) + 2 (t & k)`, which is `t + k`, of a sum `t`) is then decided on its own atoms.
+/// The sum `konst + Σ coeff·term` taken apart into groups of terms whose bitwise parts share
+/// no atom, each group with several terms simplified alone by `part`: the sum of the results,
+/// or `None` when there is one group or no group changes (what was built is then retired).
 #[cfg(feature = "mba")]
-pub(super) fn by_groups(
+fn grouped(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
-    n: u32,
+    konst: &BitVec,
+    terms: &[(u32, BitVec)],
+    fin: Fin,
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
-) -> Result<Option<Step>, Stop> {
-    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+) -> Result<Option<(Form, Fin)>, Stop> {
+    if terms.len() < 3 {
         return Ok(None);
     }
-    let form = form_of(r, cx, n)?;
-    if form.terms.len() < 3 {
-        return Ok(None);
-    }
-    let mut sets = Vec::with_capacity(form.terms.len());
-    for &(a, _) in &form.terms {
+    let mut sets = Vec::with_capacity(terms.len());
+    for &(a, _) in terms {
         match bitwise_atoms(cx, a) {
             Some(s) => sets.push(s),
             None => return Ok(None),
@@ -1166,14 +1454,14 @@ pub(super) fn by_groups(
     if groups.len() < 2 || groups.values().all(|g| g.len() < 2) {
         return Ok(None);
     }
-    let w = form.konst.width();
+    let w = konst.width();
     let before = cx.len() as u32;
-    let mut total = Form::of(form.konst, &[]);
-    let mut fin = form.fin;
+    let mut total = Form::of(*konst, &[]);
+    let mut fin = fin;
     let mut changed = false;
     for idx in groups.values() {
-        let terms: Vec<(u32, BitVec)> = idx.iter().map(|&i| form.terms[i]).collect();
-        let mut f = Form::of(BitVec::zero(w), &terms);
+        let part_terms: Vec<(u32, BitVec)> = idx.iter().map(|&i| terms[i]).collect();
+        let mut f = Form::of(BitVec::zero(w), &part_terms);
         if idx.len() >= 2 {
             let s = emit(r, cx, &f)?;
             if let Some(e) = part(r, cx, s)?
@@ -1190,25 +1478,240 @@ pub(super) fn by_groups(
         super::discard(r, cx, before);
         return Ok(None);
     }
-    let e = emit(r, cx, &total)?;
-    let stops = stops_of(r, cx, n, e)?;
-    finish_part(r, cx, n, e, before, &stops, fin).map(Some)
+    Ok(Some((total, fin)))
 }
 
-/// The nodes `n` reads that a rewrite `e` of it reads: the atoms the commit rule counts `e`
-/// over. A node of `e` that `n` does not read counts as new whether or not the arena holds it
-/// already (a candidate built and discarded earlier leaves its nodes there: stopping at every
-/// node from before the rewrite made the decision depend on what had been tried before).
+/// the sum `n` taken apart into groups of terms whose bitwise parts share no
+/// atom (the operands of `& | ^` that are not themselves bitwise), each group with several
+/// terms simplified alone by `part` (the MBA phase), and the sum built again from the results;
+/// `None` when the sum has one group or no group changes. An identity hidden in a sum beside
+/// other terms (`(z | k) − (z & k) − (z ^ k)`, nothing, next to a polynomial in `x` and `y`;
+/// `(t ^ k) + 2 (t & k)`, which is `t + k`, of a sum `t`) is then decided on its own atoms.
 #[cfg(feature = "mba")]
-fn stops_of(r: &mut Runner<'_, '_>, cx: &Context, n: u32, e: u32) -> Result<Vec<u32>, Stop> {
-    let mut below = crate::hash::IdMap::<u32, ()>::default();
-    let mut todo = vec![n];
+pub(super) fn by_groups(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    let before = cx.len() as u32;
+    let Some((total, fin)) = grouped(r, cx, &form.konst, &form.terms, form.fin, part)? else {
+        return Ok(None);
+    };
+    let e = emit(r, cx, &total)?;
+    // The nodes from before the rewrite that it reads.
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
     while let Some(i) = todo.pop() {
-        if below.insert(i, ()).is_some() {
+        if seen.insert(i, ()).is_some() {
             continue;
         }
-        r.meter.charge(Counter::PassWork, 1)?;
-        todo.extend(cx.node(i).children());
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
+}
+
+/// The most terms of a sum [`common_factors`] reads, and the most factors of one of them.
+#[cfg(feature = "mba")]
+const FACTOR_TERMS: usize = 48;
+#[cfg(feature = "mba")]
+const FACTOR_LEAVES: usize = 8;
+
+/// The product `t` as a constant times its non-constant factors (sorted), read through
+/// products, negations and left shifts by a constant, shared or not; `None` past
+/// [`FACTOR_LEAVES`] factors.
+#[cfg(feature = "mba")]
+fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
+    let w = cx.width_of(t);
+    let mut k = BitVec::one(w);
+    let mut out: Vec<u32> = Vec::new();
+    let mut todo = vec![t];
+    let mut steps = 0usize;
+    while let Some(i) = todo.pop() {
+        steps += 1;
+        if steps > 4 * FACTOR_LEAVES {
+            return None;
+        }
+        let node = cx.node(i);
+        match node.op {
+            OpCode::Const => {
+                k = BitVec::bin_unchecked(BinOp::Mul, &k, &cx.const_val(i)?);
+            }
+            OpCode::Mul => todo.extend([node.a, node.b]),
+            OpCode::Neg => {
+                k = BitVec::un_unchecked(UnOp::Neg, &k);
+                todo.push(node.a);
+            }
+            OpCode::Shl if cx.const_val(node.b).is_some() => {
+                let scale =
+                    BitVec::bin_unchecked(BinOp::Shl, &BitVec::one(w), &cx.const_val(node.b)?);
+                k = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                todo.push(node.a);
+            }
+            _ => {
+                if out.len() == FACTOR_LEAVES {
+                    return None;
+                }
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    Some((k, out))
+}
+
+/// The sum `n` with terms that are products with the same non-constant factors
+/// (`Σ (cᵢ·f)·tᵢ + rest`), as those factors, the sum of those terms without them, `Σ cᵢ·tᵢ`
+/// (built), and the rest of the sum: the products are read through negations, constants and
+/// shared subproducts, so a coefficient spelled as a product of its own with the factor
+/// (`(f·a)·t₁ − (f·b)·t₂`) is seen. The terms are the ones with the factor most of them have
+/// (an obfuscator scales an MBA by a value and adds the result to something else); `None`
+/// when no two terms share one.
+#[cfg(feature = "mba")]
+fn common_factors(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<Factored>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    if form.terms.len() < 2 || form.terms.len() > FACTOR_TERMS {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
+    // Each term's factors (none for one past the limits), and how many terms have each.
+    let mut products: Vec<Option<(BitVec, Vec<u32>)>> = Vec::with_capacity(form.terms.len());
+    let mut terms_with: Vec<(u32, u32)> = Vec::new();
+    for &(t, k) in &form.terms {
+        let p = scaled_factors(cx, t).map(|(c, f)| (BitVec::bin_unchecked(BinOp::Mul, &k, &c), f));
+        if let Some((_, factors)) = &p {
+            for (j, f) in factors.iter().enumerate() {
+                if factors[..j].contains(f) {
+                    continue;
+                }
+                match terms_with.iter_mut().find(|(x, _)| x == f) {
+                    Some((_, count)) => *count += 1,
+                    None => terms_with.push((*f, 1)),
+                }
+            }
+        }
+        products.push(p);
+    }
+    // The factor in the most terms (the first made among equals).
+    let Some(&(factor, count)) = terms_with
+        .iter()
+        .max_by_key(|&&(f, count)| (count, core::cmp::Reverse(f)))
+    else {
+        return Ok(None);
+    };
+    if count < 2 {
+        return Ok(None);
+    }
+    // What the terms with it have in common (a multiset: sorted, repeats kept), and the
+    // other terms.
+    let mut common: Option<Vec<u32>> = None;
+    let mut rest: Vec<(u32, BitVec)> = Vec::new();
+    for (p, &term) in products.iter_mut().zip(&form.terms) {
+        match p {
+            Some((_, factors)) if factors.contains(&factor) => {
+                common = Some(match common {
+                    None => factors.clone(),
+                    Some(old) => {
+                        let mut left = factors.clone();
+                        old.into_iter()
+                            .filter(|f| match left.iter().position(|x| x == f) {
+                                Some(j) => {
+                                    left.swap_remove(j);
+                                    true
+                                }
+                                None => false,
+                            })
+                            .collect()
+                    }
+                });
+            }
+            _ => {
+                *p = None;
+                rest.push(term);
+            }
+        }
+    }
+    let Some(common) = common else {
+        return Ok(None);
+    };
+    let w = form.konst.width();
+    let mut konst = BitVec::zero(w);
+    let mut terms: Vec<(u32, BitVec)> = Vec::with_capacity(products.len());
+    for (k, mut factors) in products.into_iter().flatten() {
+        for f in &common {
+            if let Some(j) = factors.iter().position(|x| x == f) {
+                factors.remove(j);
+            }
+        }
+        let mut left: Option<u32> = None;
+        for f in factors {
+            left = Some(match left {
+                None => f,
+                Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Mul, a, f))?,
+            });
+        }
+        match left {
+            Some(x) => terms.push((x, k)),
+            None => konst = BitVec::bin_unchecked(BinOp::Add, &konst, &k),
+        }
+    }
+    let inner = emit(r, cx, &Form::of(konst, &terms))?;
+    Ok(Some(Factored {
+        common,
+        inner,
+        rest: Form::of(form.konst, &rest),
+        fin: form.fin,
+    }))
+}
+
+/// A sum with the factors some of its terms share taken out of them (see
+/// [`common_factors`]): `common · inner + rest`.
+#[cfg(feature = "mba")]
+struct Factored {
+    common: Vec<u32>,
+    inner: u32,
+    rest: Form,
+    fin: Fin,
+}
+
+/// `inner` times each of `common`, plus `rest`, committed for `n` by the commit rule (as
+/// `kind`'s).
+#[cfg(feature = "mba")]
+#[allow(clippy::too_many_arguments)]
+fn commit_factored(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+    common: &[u32],
+    inner: u32,
+    rest: &Form,
+    before: u32,
+    fin: Fin,
+) -> Result<Step, Stop> {
+    let mut e = inner;
+    for &f in common {
+        e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, f, e))?;
+    }
+    if !rest.terms.is_empty() || !rest.konst.is_zero() {
+        let other = emit(r, cx, rest)?;
+        e = r.build(cx, |cx| cx.c_bin(BinOp::Add, e, other))?;
     }
     let mut stops = Vec::new();
     let mut seen = crate::hash::IdMap::<u32, ()>::default();
@@ -1217,30 +1720,44 @@ fn stops_of(r: &mut Runner<'_, '_>, cx: &Context, n: u32, e: u32) -> Result<Vec<
         if seen.insert(i, ()).is_some() {
             continue;
         }
-        if below.contains_key(&i) {
+        if i < before {
             stops.push(i);
         } else {
             todo.extend(cx.node(i).children());
         }
     }
-    Ok(stops)
+    finish(r, cx, kind, n, e, before, &stops, fin)
 }
 
-/// [`finish`] for a sum rewritten part by part, which may leave the DAG one node larger (see
-/// `finish_within`): each part is the solver's answer, which nothing reads again as the sum
-/// it was, and the other sums that share a part's terms are rewritten to the same answer, so
-/// what the rewrite leaves behind dies with its last reader.
+/// the sum `n` with terms that are products with the same non-constant factors
+/// (an obfuscator scales an MBA by a value, each coefficient spelled as a product of its own
+/// with it, and adds the result to other terms) written as the factors times the sum of those
+/// terms without them, plus the rest, that inner sum simplified by `part` (the MBA phase). The
+/// whole is a polynomial over what the factor is made of, where the inner sum is linear over
+/// the atoms of its terms alone. `None` when no two terms share a factor.
 #[cfg(feature = "mba")]
-fn finish_part(
+pub(super) fn by_factor(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     n: u32,
-    e: u32,
-    before: u32,
-    stops: &[u32],
-    fin: Fin,
-) -> Result<Step, Stop> {
-    super::finish_within(r, cx, PassKind::Mba, n, e, before, stops, fin, 2)
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    let before = cx.len() as u32;
+    let Some(Factored {
+        common,
+        inner: s,
+        rest,
+        fin,
+    }) = common_factors(r, cx, n)?
+    else {
+        return Ok(None);
+    };
+    // The factor is taken out also where `part` leaves the inner sum as it is, when that
+    // is smaller: the linear pass's `factor_sum` reads a negated or shared subproduct as a
+    // factor of its own, and (tried there on every sum, before the MBA phase has asked about
+    // it) taking the factor out first left 23 of 140 measured questions larger.
+    let inner = part(r, cx, s)?.unwrap_or(s);
+    commit_factored(r, cx, PassKind::Mba, n, &common, inner, &rest, before, fin).map(Some)
 }
 
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
@@ -1354,7 +1871,33 @@ pub(super) fn by_sums(
     }
     let before = cx.len() as u32;
     let s = emit(r, cx, &Form::of(konst, &terms))?;
-    let e = part(r, cx, s)?.unwrap_or(s);
-    let stops = stops_of(r, cx, n, e)?;
-    finish_part(r, cx, n, e, before, &stops, form.fin).map(Some)
+    // Whole; or, where that is no simpler, a group of its terms at a time, the sums still
+    // atoms (`A + p·q + B − (A & B)` with `A` a sum of products: the whole is a polynomial over
+    // what `A` is made of, the group `A + B − (A & B)` is `A | B` over two values).
+    let e = match part(r, cx, s)? {
+        Some(e) => e,
+        None => {
+            // (The whole sum is retired first: what it built would count as readers of the
+            // groups' nodes.)
+            super::discard(r, cx, before);
+            match grouped(r, cx, &konst, &terms, form.fin, part)? {
+                Some((total, _)) => emit(r, cx, &total)?,
+                None => emit(r, cx, &Form::of(konst, &terms))?,
+            }
+        }
+    };
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
 }

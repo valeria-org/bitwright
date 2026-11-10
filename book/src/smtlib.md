@@ -49,7 +49,7 @@ let script = smtlib::import(
      (assert (bvult twice #x10))",
 )?;
 let twice = script.definition("twice").unwrap();
-assert_eq!(cx.display(twice).to_string(), "x + x");
+assert_eq!(cx.display(twice).to_string(), "x << 1");
 assert_eq!(script.assertions.len(), 1);
 # Ok::<(), bitwright::Error>(())
 ```

@@ -8,8 +8,10 @@ use crate::hash::combine;
 use crate::mba::certify;
 use crate::mba::{
     Bindings, CacheEntry, CacheKey, Claim, LOWERING_VERSION, MOp, MbaAnswer, MbaConfig, MbaExpr,
-    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_reading, shared_nodes,
+    Reading, Refusal, Verdict, lift_id, lower_id, lower_id_over, lower_id_reading, lower_id_whole,
+    shared_nodes, shared_nodes_whole,
 };
+use crate::{BinOp, UnOp};
 
 /// Points for the always-on refutation check and for trusted sampling.
 const SAMPLE_POINTS: u32 = certify::SAMPLE_POINTS as u32;
@@ -45,52 +47,50 @@ fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Resul
     Ok(certify::refute(a, b, &points).is_none())
 }
 
-#[cfg(test)]
-thread_local! {
-    /// For tests: every question is put to the solver, also one no answer to which could be
-    /// committed (the phase without `pass::cannot_pay`).
-    pub(crate) static ASK_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// For tests: the most freed nodes `pass::cannot_pay` decides (as built: any), and
-    /// whether it compares forms where the atoms are free (as built: yes).
-    pub(crate) static PAY_RULE: std::cell::Cell<(u32, bool)> =
-        const { std::cell::Cell::new((u32::MAX, true)) };
-}
-
-/// Whether [`ASK_ALL`] is set (never outside tests).
-fn ask_all() -> bool {
-    #[cfg(test)]
-    return ASK_ALL.get();
-    #[cfg(not(test))]
-    false
-}
-
-/// [`PAY_RULE`] (as built outside tests).
-fn pay_rule() -> (u32, bool) {
-    #[cfg(test)]
-    return PAY_RULE.get();
-    #[cfg(not(test))]
-    (u32::MAX, true)
-}
-
-/// The pass work one certificate of the gate may take ([`exact`]) once the certificates that
-/// proved nothing have taken [`GATE_MISSED`] in the call: what remains of a test larger than
-/// this is then not run. A certificate's tests are each bounded (`certify::MAX_EFFORT`), but
-/// an answer no test decides goes through several, and took 18 to 32 million units where
-/// limb arithmetic asks hundreds of questions an expression: three such answers were the pass
-/// work of a whole call (2^26). Of 2,400 answers the gate proved on limb expressions, one
-/// took more than this (13.9 million); the next took 4.7 million.
-const GATE_SHARE: u64 = 1 << 23;
-
-/// The pass work undecided certificates may take in a call before the next ones are held to
-/// [`GATE_SHARE`]: until then a certificate takes what it needs of what the call has left (a
-/// product of a sum by a sign squared, at 32 bits, is proved in 20 to 30 million units).
-const GATE_MISSED: u64 = 1 << 24;
-
-/// Pass work as a certificate's meter, within a share.
+/// Pass work as a certificate's meter, at most `share` of it.
 struct Gate<'x, 'r, 'a> {
     r: &'x mut Runner<'r, 'a>,
     share: u64,
 }
+
+impl<'x, 'r, 'a> Gate<'x, 'r, 'a> {
+    /// A meter for the certificate of `a == b`: at most [`GATE_SHARE`] of the call's pass
+    /// work, and at most [`GATE_MISSED_SHARE`] once the certificates that proved nothing have
+    /// taken [`GATE_MISSED`] in the call; or what a direct test of the pair costs (twice:
+    /// with its casts taken out and without) where that is more.
+    fn new(r: &'x mut Runner<'r, 'a>, a: &MbaExpr, b: &MbaExpr, part: u64) -> Self {
+        let limit = r.meter.limit.pass_work;
+        let direct = certify::direct_cost(a, b).unwrap_or(0).saturating_mul(2);
+        let mut share = (limit / part).max(GATE_SHARE_MIN / (part / GATE_SHARE));
+        if r.mba_missed >= GATE_MISSED {
+            share = share.min(GATE_MISSED_SHARE);
+        }
+        Gate {
+            r,
+            share: share.max(direct),
+        }
+    }
+}
+
+/// The pass work undecided certificates may take in a call before the next ones are held to
+/// [`GATE_MISSED_SHARE`]. An answer no test decides goes through several of them, and where
+/// limb arithmetic asks hundreds of questions an expression, two such answers at half the
+/// call's pass work each were the whole of it.
+const GATE_MISSED: u64 = 1 << 24;
+
+/// See [`GATE_MISSED`].
+const GATE_MISSED_SHARE: u64 = 1 << 23;
+
+/// One answer's certificate spends at most this fraction of the call's pass work (and at least
+/// [`GATE_SHARE_MIN`] units), unless a direct test, which decides when it runs, costs more.
+/// Without a share one answer the tests cannot decide took the whole call: a compositional
+/// test over two variables and 112 nodes spent 7.5M of a call's 8.4M units, undecided, and the
+/// phases after it had none left. A compositional proof can need much of a call (a sparse test
+/// on a skeleton over three 32-bit variables, 20M of 67M units), so the share is half.
+const GATE_SHARE: u64 = 2;
+
+/// See [`GATE_SHARE`].
+const GATE_SHARE_MIN: u64 = 1 << 20;
 
 impl certify::Meter for Gate<'_, '_, '_> {
     type Err = Stop;
@@ -111,30 +111,20 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// grid, exhaustive evaluation; equal polynomials over symbols first where that test would
 /// take far longer), over abstracted atoms when a side leaves the polynomial fragment. Charged
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
-/// than what is left is not started (reported as over budget). Also whether the report is
-/// the same under any larger budget: it ran within its share ([`GATE_SHARE`]), not within
-/// what the call had left.
+/// than what is left is not started (reported as over budget).
 fn exact(
     r: &mut Runner<'_, '_>,
     a: &MbaExpr,
     b: &MbaExpr,
-) -> Result<(certify::Report, bool), Stop> {
-    let left = r.meter.left_in(|b| b.pass_work);
-    let share = if r.mba_missed >= GATE_MISSED {
-        GATE_SHARE
-    } else {
-        u64::MAX
-    };
-    // (The same under any larger budget: within its share, or with nothing held back and
-    // nothing left over.)
-    let stable = left >= share;
+    part: u64,
+) -> Result<certify::Report, Stop> {
     let before = r.meter.spent.pass_work;
-    let report = certify::prove(a, b, &mut Gate { r, share })?;
+    let report = certify::prove(a, b, &mut Gate::new(r, a, b, part))?;
     if report.verdict != crate::mba::Verdict::Proved {
         r.mba_missed += r.meter.spent.pass_work - before;
     }
     count(r).certificates.record(&report);
-    Ok((report, stable))
+    Ok(report)
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::MbaStats {
@@ -255,13 +245,29 @@ fn sweep_inner(
     // that selector after both sides are proved constant. Keep this narrow: the sweep already
     // visits every node, while a side proof asks several readings.
     let mut case_attempts = 0usize;
+    // The varying nodes met so far by their samples, and the related pairs no proof was found
+    // for (see `Classes`).
+    let mut classes = Classes::default();
+    let mut unrelated = 0usize;
+    // For each node, the nodes it or one below it was asked to be related to with no proof
+    // found (see `related`).
+    let mut unproved: crate::hash::IdMap<u32, Vec<u32>> = crate::hash::IdMap::default();
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
+    // The node examined last, recorded in `r.swept` once the next one begins (unless the
+    // budget ended while it was asked about, which left it unexamined).
+    let mut pending: Option<u32> = None;
     macro_rules! asked {
         ($l:lifetime, $e:expr) => {
             match $e {
                 Ok(v) => v,
+                // Out of solver steps: the node is left unexamined, and the ones after it
+                // are still asked what a certificate on pass work decides.
+                Err(Stop::Exhausted(Exhausted::MbaSteps)) => {
+                    pending = None;
+                    continue $l;
+                }
                 Err(Stop::Exhausted(_)) => {
                     spent = true;
                     continue $l;
@@ -271,6 +277,20 @@ fn sweep_inner(
         };
     }
     'nodes: for &i in &order {
+        if let Some(p) = pending.take()
+            && !spent
+        {
+            r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+        }
+        // Examined by an earlier sweep of this call (of another root, or of a case's other
+        // side): its result is equal to it, and asking again finds what that sweep found.
+        if let Some(&done) = r.swept.get(&i) {
+            to.insert(i, done);
+            if done == i {
+                classes.note(&r.samples[&i], i);
+            }
+            continue;
+        }
         let node = cx.node(i);
         let mut kids = [0u32; 3];
         let mut changed = false;
@@ -290,11 +310,65 @@ fn sweep_inner(
         // A leaf is never taken (a symbol's samples follow what the host declared of it), nor
         // an extension operator (it may not be a function of its operands alone).
         if node.children().next().is_none() || node.op.as_ext().is_some() {
+            if cur == i {
+                classes.note(&r.samples[&i], i);
+            }
             continue;
         }
+        pending = Some(i);
         let vals = &r.samples[&i];
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
+            // A node the samples relate to one met before it (see `related`).
+            let found = match unrelated < SWEEP_UNRELATED {
+                true => classes.find(vals),
+                false => Vec::new(),
+            };
+            // What the nodes below this one were not proved related to.
+            let mut below: Vec<u32> = Vec::new();
+            for c in cx.node(cur).children() {
+                for &x in unproved.get(&c).map_or(&[][..], |v| v) {
+                    if !below.contains(&x) && below.len() < SWEEP_UNPROVED {
+                        below.push(x);
+                    }
+                }
+            }
+            if !below.is_empty() {
+                unproved.insert(cur, below.clone());
+            }
+            let reps: Vec<u32> = found.iter().map(|f| f.0).collect();
+            for (rep, relation, d) in found {
+                // A node below this one was asked to be related to `rep` (or to a node the
+                // samples relate to it as they do this one) and no proof was found: this one,
+                // built on it, would be asked the same thing through it, and is not. Where
+                // `f(a)` could not be proved to be `rep + d`, `g(f(a))` failed for the same
+                // reason at the cost of a full certificate (of 5,030 such questions in 140
+                // measured calls, 124 had been proved). It counts as a pair left open.
+                if below.contains(&rep) {
+                    unrelated += 1;
+                    break;
+                }
+                let rep = to.get(&rep).copied().unwrap_or(rep);
+                match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
+                    Related::Proved(e) => {
+                        to.insert(i, e);
+                        continue 'nodes;
+                    }
+                    Related::Written => {}
+                    Related::Open => {
+                        unrelated += 1;
+                        let v = unproved.entry(cur).or_default();
+                        for &x in &reps {
+                            if !v.contains(&x) && v.len() < SWEEP_UNPROVED {
+                                v.push(x);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            classes.note(&r.samples[&i], i);
+            let vals = &r.samples[&i];
             let top = !links.get(&i).copied().unwrap_or(false);
             let mut rewritten = None;
             if top
@@ -303,9 +377,7 @@ fn sweep_inner(
                 && case_attempts < SWEEP_CASE_BLOCKS
                 && exactly_two(vals)
             {
-                rewritten = asked!(
-                    'nodes,
-                    cases_fold(r, cx, cfg, cur, &mut case_attempts)
+                rewritten = asked!('nodes, cases_fold(r, cx, cfg, cur, &mut case_attempts)
                 );
             }
             if rewritten.is_none() && top {
@@ -323,8 +395,20 @@ fn sweep_inner(
         // block, a compare) is taken too, for the known bits and the enumeration only. A masked
         // dispatch selector can pick an arm by `select(extract<13, 1>(…), a, b)`, the bit 1 over
         // 13 bits of one word.
-        let predicate = cx.width_of(cur).bits() == 1;
+        //
+        // And a truncation, for the same: the low bits of a product that only a few bits of
+        // its operands reach are a shift count an obfuscator computes, constant where the
+        // product is not. Not a slice above the low bits: those are the fields of one value,
+        // read together again by what joins them, and with some of them folded and others
+        // not, the value under the rest is rewritten on the bits they read and what proved
+        // the whole no longer applies (six of 47 measured constants were lost that way).
+        let predicate =
+            cx.width_of(cur).bits() == 1 || (op == OpCode::Extract && cx.node(cur).b == 0);
         if !all_constant && (!(mixed || predicate) || failures >= SWEEP_FAILURES) {
+            continue;
+        }
+        // Not `k` at an input an earlier candidate differed at: no constant.
+        if !all_constant && asked!('nodes, witnessed(r, cx, cur, &k)) {
             continue;
         }
         // Over constants alone it is that value. Otherwise its fragment is read several ways:
@@ -352,9 +436,7 @@ fn sweep_inner(
         // what is left, and a few bits of symbols left are enumerated.
         let mut subject = cur;
         if !decided {
-            subject = asked!(
-                'nodes,
-                super::demanded::reduced(r, cx, cur, SWEEP_DEMAND_VISITS)
+            subject = asked!('nodes, super::demanded::reduced(r, cx, cur, SWEEP_DEMAND_VISITS, true)
             );
             if let Some(v) = cx.const_val(subject) {
                 if v == k {
@@ -374,7 +456,16 @@ fn sweep_inner(
         }
         if !decided && !refuted && mixed {
             let seen;
-            (decided, refuted, seen) = asked!('nodes, readings_prove(r, cx, cfg, subject, &k));
+            (decided, refuted, seen) =
+                asked!('nodes, readings_prove(r, cx, cfg, subject, &k, SWEEP_SHARE));
+            // The candidate as it is written, where the reduced one was not decided: taking
+            // each operand on the bits its user reads writes one value read under several
+            // masks once per mask, each a variable of its own, and what the terms cancel
+            // through (the one value they all read) is gone.
+            if !decided && !refuted && subject != cur {
+                let again = asked!('nodes, readings_prove(r, cx, cfg, cur, &k, SWEEP_SHARE));
+                decided = again.0;
+            }
             // the root, a constant some reading's free atoms refute, one case of
             // the condition it tests at a time (see `cases_prove`). The root only: inner
             // candidates are what the readings fold, and splitting each of them doubled the
@@ -396,8 +487,236 @@ fn sweep_inner(
             failures += 1;
         }
     }
+    if let Some(p) = pending
+        && !spent
+    {
+        r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+    }
     Ok(to.get(&root).copied().unwrap_or(root))
 }
+
+/// How the samples relate a node to one met before it: `rep + d`, `d − rep` or `rep ^ d`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Relation {
+    Sum,
+    Difference,
+    Xor,
+}
+
+/// The varying nodes of a sweep by their samples, up to a constant: the nodes met with each
+/// sequence of differences from the first sample (`v[j] − v[0]`; the first met with each
+/// `v[j] ^ v[0]`), each with its first sample. Two nodes a constant apart (added, or xored), or
+/// whose sum is constant, agree there; so do two that are equal, a constant of zero apart.
+///
+/// A sequence is kept as a 128-bit digest of its values, not the values: two sequences that
+/// collide name a pair that is not related, which costs the proof that fails and no answer.
+#[derive(Default)]
+struct Classes {
+    sums: crate::hash::IdMap<[u64; 2], Vec<(u32, crate::BitVec)>>,
+    xors: crate::hash::IdMap<[u64; 2], (u32, crate::BitVec)>,
+}
+
+impl Classes {
+    fn key(vals: &[crate::BitVec], op: BinOp, flip: bool) -> [u64; 2] {
+        let first = &vals[0];
+        let mut h = [u64::from(first.width().bits()), 0x9e37_79b9_7f4a_7c15];
+        for v in vals {
+            let d = match flip {
+                false => crate::BitVec::bin_unchecked(op, v, first),
+                true => crate::BitVec::bin_unchecked(op, first, v),
+            };
+            for &l in d.limbs() {
+                h[0] = combine(h[0], l);
+                h[1] = combine(h[1] ^ l, h[0]);
+            }
+        }
+        h
+    }
+
+    /// Whether nodes of this width are kept: a narrow one takes few values, and agrees with
+    /// many others on every sample.
+    fn kept(vals: &[crate::BitVec]) -> bool {
+        vals.first()
+            .is_some_and(|v| v.width().bits() >= SWEEP_RELATED_BITS)
+    }
+
+    /// Records `i` (samples `vals`).
+    fn note(&mut self, vals: &[crate::BitVec], i: u32) {
+        if !Self::kept(vals) || vals.iter().all(|v| *v == vals[0]) {
+            return;
+        }
+        let class = self
+            .sums
+            .entry(Self::key(vals, BinOp::Sub, false))
+            .or_default();
+        if class.len() < SWEEP_CLASS {
+            class.push((i, vals[0]));
+        }
+        self.xors
+            .entry(Self::key(vals, BinOp::Xor, false))
+            .or_insert((i, vals[0]));
+    }
+
+    /// The nodes recorded that a node with samples `vals` is related to on every sample, how,
+    /// and the constant `d` of each relation: one equal to it, one that is its complement,
+    /// then the first met a constant from it, the first met whose sum with it is constant, the
+    /// first met a constant xored from it.
+    fn find(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
+        use crate::BitVec;
+        let mut found = Vec::new();
+        if !Self::kept(vals) {
+            return found;
+        }
+        let same = self.sums.get(&Self::key(vals, BinOp::Sub, false));
+        let opposite = self.sums.get(&Self::key(vals, BinOp::Sub, true));
+        let zero = BitVec::zero(vals[0].width());
+        if let Some(&(rep, _)) = same.and_then(|c| c.iter().find(|(_, first)| *first == vals[0])) {
+            found.push((rep, Relation::Sum, zero));
+        }
+        let sum = |first: &BitVec| BitVec::bin_unchecked(BinOp::Add, &vals[0], first);
+        if let Some(&(rep, first)) =
+            opposite.and_then(|c| c.iter().find(|(_, first)| sum(first).is_ones()))
+        {
+            found.push((rep, Relation::Difference, sum(&first)));
+        }
+        if let Some(&(rep, first)) = same.and_then(|c| c.first())
+            && first != vals[0]
+        {
+            let d = BitVec::bin_unchecked(BinOp::Sub, &vals[0], &first);
+            found.push((rep, Relation::Sum, d));
+        }
+        if let Some(&(rep, first)) = opposite.and_then(|c| c.first())
+            && !sum(&first).is_ones()
+        {
+            found.push((rep, Relation::Difference, sum(&first)));
+        }
+        if let Some((rep, first)) = self.xors.get(&Self::key(vals, BinOp::Xor, false)) {
+            let d = BitVec::bin_unchecked(BinOp::Xor, &vals[0], first);
+            found.push((*rep, Relation::Xor, d));
+        }
+        found
+    }
+}
+
+/// What [`related`] found of a node and the one its samples relate it to.
+enum Related {
+    /// Proved: the node written over the other.
+    Proved(u32),
+    /// The node is already written over the other.
+    Written,
+    /// No proof.
+    Open,
+}
+
+/// One value written twice. An obfuscator computes a value again where it reads it again:
+/// `(t ^ a) + b` here, `c − (t ^ a')` there, `~(e − (t ^ a))` in a third place, equal through the
+/// bits known of `t`. Each is its own atom to every reading above, so a sum over them that
+/// cancels is not seen to (the certificate takes atoms for independent), and no rule relates
+/// two nodes it is not looking at. The samples do: `cur`, which they show to be `rep + d`,
+/// `d − rep` or `rep ^ d` for a node `rep` met before it, is asked about as an opaque constant
+/// is (the difference of the two, whether it is zero), and written that way once proved. The
+/// sums above then read one atom, and the linear passes collect its terms.
+fn related(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    cur: u32,
+    rep: u32,
+    relation: Relation,
+    d: &crate::BitVec,
+) -> Result<Related, Stop> {
+    // Written over `rep` and constants alone: nothing to relate.
+    let node = cx.node(cur);
+    if cur == rep
+        || (node.children().any(|c| c == rep)
+            && node
+                .children()
+                .all(|c| c == rep || cx.const_val(c).is_some()))
+    {
+        return Ok(Related::Written);
+    }
+    let zero = crate::BitVec::zero(d.width());
+    let e = r.build(cx, |cx| {
+        let k = cx.mk_const(d)?;
+        match relation {
+            Relation::Sum if d.is_zero() => Ok(rep),
+            Relation::Sum => cx.c_bin(BinOp::Add, rep, k),
+            Relation::Difference if d.is_zero() => cx.c_un(UnOp::Neg, rep),
+            Relation::Difference if d.is_ones() => cx.c_un(UnOp::Not, rep),
+            Relation::Difference => cx.c_bin(BinOp::Sub, k, rep),
+            Relation::Xor => cx.c_bin(BinOp::Xor, rep, k),
+        }
+    })?;
+    if e == cur {
+        return Ok(Related::Written);
+    }
+    let op = match relation {
+        Relation::Xor => BinOp::Xor,
+        _ => BinOp::Sub,
+    };
+    let diff = r.build(cx, |cx| cx.c_bin(op, cur, e))?;
+    let proved = |v: crate::BitVec| match v.is_zero() {
+        true => Related::Proved(e),
+        false => Related::Open,
+    };
+    if let Some(v) = cx.const_val(diff) {
+        return Ok(proved(v));
+    }
+    if witnessed(r, cx, diff, &zero)? {
+        return Ok(Related::Open);
+    }
+    let whole_sums = relation != Relation::Xor;
+    let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS, whole_sums)?;
+    if let Some(v) = cx.const_val(subject) {
+        return Ok(proved(v));
+    }
+    if let Some(holds) = exhaustive(r, cx, subject, &zero)? {
+        count(r).opaque_exhausted += u64::from(holds);
+        return Ok(if holds {
+            Related::Proved(e)
+        } else {
+            Related::Open
+        });
+    }
+    // The difference as it is written first, within a small share: taking each operand on
+    // the bits its user reads writes one value read under several masks once per mask (a sum
+    // with a constant becomes a sum of its own for each), and a relation that is a bitwise
+    // identity over that value, which a cut at it shows at once, is then one over several
+    // carry chains. Of the relations proved in a measured call, the readings of the reduced
+    // difference took a thousand steps for half of them and the whole share for the ones
+    // they could not prove.
+    if subject != diff {
+        let (first, _, _) = readings_prove(r, cx, cfg, diff, &zero, RELATED_FIRST_SHARE)?;
+        if first {
+            count(r).opaque_proved += 1;
+            return Ok(Related::Proved(e));
+        }
+    }
+    let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE)?;
+    if decided {
+        count(r).opaque_proved += 1;
+        return Ok(Related::Proved(e));
+    }
+    Ok(Related::Open)
+}
+
+/// The share of the readings of a relation's difference as written, before those of its
+/// reduction take [`SWEEP_SHARE`] (see [`related`]). At an eighth, one measured call asked
+/// with an eighth of the usual fuel went from 312 nodes to 80 in half the time, and 44
+/// others took a third less time; at a quarter and at a thirty-second it stopped at 186.
+const RELATED_FIRST_SHARE: u64 = SWEEP_SHARE / 8;
+
+/// The most nodes kept per node of those it was not proved related to (see `sweep_inner`).
+const SWEEP_UNPROVED: usize = 8;
+
+/// The related pairs a sweep asks about without a proof before it asks about no more.
+const SWEEP_UNRELATED: usize = 64;
+
+/// The most nodes a sweep keeps of those a constant apart.
+const SWEEP_CLASS: usize = 16;
+
+/// The narrowest node a sweep relates to another by its samples.
+const SWEEP_RELATED_BITS: u16 = 8;
 
 /// whether `root` is `k` at every point, decided by evaluating it at every value of
 /// the bits of its symbols that reach it, when those number at most [`EXHAUSTIVE_BITS`]: a byte
@@ -405,472 +724,1470 @@ fn sweep_inner(
 /// `m`'s bits of `x`. The bits that reach the root are what the demanded-bits transfers below let
 /// through from the root down (each a superset); a symbol's other bits are taken as zero, which
 /// no node can tell from any other value. Charged to the MBA solver's steps as the sweep's
-/// certificates are, within [`EXHAUSTIVE_SHARE`]. `None` when it does not apply or would cost
-/// more.
+/// certificates are, within [`EXHAUSTIVE_SHARE`], for the points it evaluates: an enumeration
+/// that would not fit is not begun, and one that meets a difference stops there. `None` when it
+/// does not apply or would cost more.
 fn exhaustive(
     r: &mut Runner<'_, '_>,
-    cx: &Context,
+    cx: &mut Context,
+    root: u32,
+    k: &crate::BitVec,
+) -> Result<Option<bool>, Stop> {
+    // The call's buffers, taken for the decision (nothing below asks another).
+    let mut sc = std::mem::take(&mut r.exhaust);
+    let out = exhaustive_in(r, cx, &mut sc, root, k);
+    r.exhaust = sc;
+    out
+}
+
+/// [`exhaustive`], over the call's buffers.
+fn exhaustive_in(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    sc: &mut Exhaust,
     root: u32,
     k: &crate::BitVec,
 ) -> Result<Option<bool>, Stop> {
     use crate::BitVec;
-    // The DAG below `root`, operands first; every node at most 64 bits.
-    let mut order: Vec<u32> = Vec::new();
-    let mut at: crate::hash::IdMap<u32, usize> = crate::hash::IdMap::default();
-    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
-    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
-    while let Some((i, expanded)) = stack.pop() {
-        if expanded {
-            at.insert(i, order.len());
-            order.push(i);
-            continue;
+    // The DAG below `root`, operands first, every node at most 64 bits; and the bits of each
+    // node that reach the root, from the root down.
+    let swept = sc.sweep(cx, root);
+    match swept {
+        Swept::Wide | Swept::Open => return Ok(None),
+        // Not met with (a node is made after its operands): the same by a walk from the root.
+        Swept::Unordered => {
+            if !sc.walk(cx, root) {
+                return Ok(None);
+            }
+            sc.demands(cx);
         }
-        if seen.insert(i, ()).is_some() {
-            continue;
-        }
-        if cx.width_of(i).bits() > 64 {
-            return Ok(None);
-        }
-        stack.push((i, true));
-        for c in cx.node(i).children() {
-            stack.push((c, false));
-        }
+        Swept::Whole => {}
     }
-    // The bits of each node that reach the root, from the root down.
-    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-    let konst = |j: u32| cx.const_val(j).and_then(|v| v.to_u64());
-    let mut demand: Vec<u64> = vec![0; order.len()];
-    demand[at[&root]] = ones(cx.width_of(root).bits());
-    for idx in (0..order.len()).rev() {
-        let i = order[idx];
-        let m = demand[idx];
-        if m == 0 {
-            continue;
-        }
-        let n = cx.node(i);
-        let w = cx.width_of(i).bits();
-        let low_prefix = ones(64 - m.leading_zeros() as u16);
-        let mut give = |c: u32, d: u64| {
-            let wc = cx.width_of(c).bits();
-            demand[at[&c]] |= d & ones(wc);
-        };
-        match n.op {
-            OpCode::And | OpCode::Or => {
-                for (c, o) in [(n.a, n.b), (n.b, n.a)] {
-                    let d = match (konst(o), n.op) {
-                        (Some(k), OpCode::And) => m & k,
-                        (Some(k), _) => m & !k,
-                        _ => m,
-                    };
-                    give(c, d);
-                }
-            }
-            OpCode::Xor => {
-                give(n.a, m);
-                give(n.b, m);
-            }
-            OpCode::Not => give(n.a, m),
-            OpCode::Add | OpCode::Sub | OpCode::Mul => {
-                give(n.a, low_prefix);
-                give(n.b, low_prefix);
-            }
-            OpCode::Neg => give(n.a, low_prefix),
-            OpCode::Shl | OpCode::LShr if konst(n.b).is_some_and(|s| s < u64::from(w)) => {
-                let s = konst(n.b).unwrap_or(0);
-                give(
-                    n.a,
-                    if n.op == OpCode::Shl {
-                        m >> s
-                    } else {
-                        (m << s) & ones(w)
-                    },
-                );
-                give(n.b, u64::MAX);
-            }
-            OpCode::Zext => give(n.a, m),
-            OpCode::Extract => give(n.a, m << n.b),
-            // a rotate by a constant moves the demand the other way; a `concat`
-            // splits it between its halves.
-            OpCode::RotL | OpCode::RotR if konst(n.b).is_some() && w <= 64 && w > 0 => {
-                let s = (konst(n.b).unwrap_or(0) % u64::from(w)) as u32;
-                let rot = |v: u64, by: u32, left: bool| {
-                    let by = by % u32::from(w);
-                    if by == 0 {
-                        return v;
-                    }
-                    let v = v & ones(w);
-                    if left {
-                        ((v << by) | (v >> (u32::from(w) - by))) & ones(w)
-                    } else {
-                        ((v >> by) | (v << (u32::from(w) - by))) & ones(w)
-                    }
-                };
-                give(n.a, rot(m, s, n.op == OpCode::RotR));
-                give(n.b, u64::MAX);
-            }
-            OpCode::Concat => {
-                let wl = cx.width_of(n.b).bits();
-                give(n.b, m & ones(wl));
-                give(n.a, if wl >= 64 { 0 } else { m >> wl });
-            }
-            _ => {
-                for c in n.children() {
-                    give(c, u64::MAX);
-                }
-            }
-        }
+    let total: u32 = sc.syms.iter().map(|(_, m)| m.count_ones()).sum();
+    // The points of an enumeration over several symbols are numbered by the symbols' bits in
+    // the order a walk from the root meets the symbols.
+    if total <= EXHAUSTIVE_BITS && swept == Swept::Whole && sc.syms.len() > 1 {
+        sc.walk(cx, root);
+        sc.demands(cx);
     }
-    let mut syms: Vec<(u32, u64)> = Vec::new();
-    for (idx, &i) in order.iter().enumerate() {
-        if cx.node(i).op == OpCode::Sym {
-            syms.push((i, demand[idx]));
+    // Too many symbol bits: places every demanded path from them passes through, with few
+    // bits of their own, are enumerated instead. First one place, over the values the bits
+    // known of it leave; then, where the root differs at one of those (a value the place may
+    // never take), several places nearer the symbols.
+    if total > EXHAUSTIVE_BITS {
+        let one = bottleneck(&sc.below, &sc.demand, &mut sc.live, &mut sc.over);
+        if let Some(c) = one {
+            // Over the values it can take: the bits known of it are those values' (a sum
+            // that is constant only for them is constant), and a value it never takes
+            // refutes nothing.
+            let [z, o] = super::known_words(r, cx, sc.order[c])?.0.unwrap_or([0, 0]);
+            sc.syms.clear();
+            sc.syms.push((c as u32, sc.demand[c] & !(z | o)));
+            sc.bases.clear();
+            sc.bases.push(o & sc.demand[c]);
+            sc.above(Some(c));
+            match enumerated(r, cx, sc, k)? {
+                Some(None) => return Ok(Some(true)),
+                Some(Some(_)) => {}
+                None => return Ok(None),
+            }
         }
-    }
-    let mut total: u32 = syms.iter().map(|(_, m)| m.count_ones()).sum();
-    let (order, at) = if total > EXHAUSTIVE_BITS {
-        // too many symbol bits; a node every demanded path from them passes
-        // through, with few bits of its own, is enumerated instead.
-        let Some(cut) = bottleneck(cx, &order, &at, &demand) else {
+        let Some(mut front) = frontier(&sc.below, &sc.demand, &mut sc.over) else {
             return Ok(None);
         };
-        syms = vec![(order[cut], demand[cut])];
-        total = demand[cut].count_ones();
-        above(cx, &order, order[cut])
-    } else {
-        (order, at)
-    };
-    let points = 1u64 << total;
-    let inputs: Vec<u32> = syms.iter().map(|(s, _)| *s).collect();
-    let prog = program64(cx, &order, &at, &inputs);
-    // A word program's evaluation costs a fraction of a generic one's (measured, see
-    // [`WORD_EVALS`]); charged as that many generic evaluations.
-    let work = points
-        .saturating_mul(order.len() as u64)
-        .div_ceil(if prog.is_some() { WORD_EVALS } else { 1 });
-    let mut meter = Steps::new(r, EXHAUSTIVE_SHARE);
-    if work > certify::Meter::left(&meter) {
+        // The one place again: no more an answer.
+        if let ([(p, _)], Some(c)) = (&front[..], one)
+            && *p as usize == c
+        {
+            return Ok(None);
+        }
+        sc.bases.clear();
+        for (p, m) in front.iter_mut() {
+            let [z, o] = match sc.below[*p as usize].0.op {
+                OpCode::Sym => [0, 0],
+                _ => super::known_words(r, cx, sc.order[*p as usize])?
+                    .0
+                    .unwrap_or([0, 0]),
+            };
+            sc.bases.push(o & *m);
+            *m &= !(z | o);
+        }
+        sc.syms = front;
+        sc.above_inputs();
+        // A value the root differs at: of places that may not take it together, no answer.
+        return Ok(match enumerated(r, cx, sc, k)? {
+            Some(None) => Some(true),
+            _ => None,
+        });
+    }
+    sc.bases.clear();
+    sc.above(None);
+    let Some(missed) = enumerated(r, cx, sc, k)? else {
         return Ok(None);
-    }
-    certify::Meter::charge(&mut meter, work)?;
-    if let Some(prog) = prog {
-        let mut vals: Vec<u64> = vec![0; order.len()];
-        let ku = k.to_u64();
-        for p in 0..points {
-            let mut left = p;
-            for &(s, m) in &syms {
-                let mut v = 0u64;
-                let mut mm = m;
-                while mm != 0 {
-                    let b = mm & mm.wrapping_neg();
-                    if left & 1 == 1 {
-                        v |= b;
-                    }
-                    left >>= 1;
-                    mm &= mm - 1;
-                }
-                vals[at[&s]] = v;
-            }
-            run64(&prog, &mut vals);
-            if Some(vals[at[&root]]) != ku {
-                return Ok(Some(false));
-            }
-        }
+    };
+    let Some(p) = missed else {
         return Ok(Some(true));
-    }
-    let mut vals: Vec<BitVec> = vec![BitVec::zero(crate::Width::W1); order.len()];
-    for p in 0..points {
-        // Spread the point's bits over each symbol's bits that reach the root.
-        let mut left = p;
-        for &(s, m) in &syms {
-            let mut v = 0u64;
-            let mut mm = m;
-            while mm != 0 {
-                let b = mm & mm.wrapping_neg();
-                if left & 1 == 1 {
-                    v |= b;
-                }
-                left >>= 1;
-                mm &= mm - 1;
-            }
-            vals[at[&s]] = BitVec::wrapping_from_u64(cx.width_of(s), v);
-        }
-        for (idx, &i) in order.iter().enumerate() {
-            if inputs.contains(&i) {
-                continue;
-            }
-            // A symbol that is no input: zero, as in [`program64`].
-            vals[idx] = cx
-                .eval_node(i, |j| vals[at[&j]], |_, w| Some(BitVec::zero(w)))
-                .map_err(Stop::Error)?;
-        }
-        if vals[at[&root]] != *k {
-            return Ok(Some(false));
-        }
-    }
-    Ok(Some(true))
+    };
+    // The symbols' values there are an input the root is not `k` at: kept, for the candidates
+    // after this one that differ there too (an obfuscator builds one value from another, and
+    // a chain of them that are `k` but for one value of a 16-bit field was enumerated up to
+    // that value at every link).
+    let mut left = p;
+    let fixed = sc
+        .syms
+        .iter()
+        .map(|&(place, m)| {
+            let s = sc.order[place as usize];
+            let v = spread(&mut left, m);
+            (s, BitVec::wrapping_from_u64(cx.width_of(s), v))
+        })
+        .collect();
+    note_witness(r, cx, fixed);
+    // A value of the symbols the root differs at: a refutation.
+    Ok(Some(false))
 }
 
-/// the node of `order` (operands first, the root last) that every demanded path
+/// The enumeration of [`exhaustive`] over the places of `sc.syms`, each at its base (of
+/// `sc.bases`, zero where there is none) with every value of its bits there, of the places
+/// `sc.kept`: the first point the root is not `k` at (`Some(None)` when it is `k` at all of
+/// them), or `None` when the points would cost more than [`EXHAUSTIVE_SHARE`] or the steps
+/// left.
+fn enumerated(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    sc: &mut Exhaust,
+    k: &crate::BitVec,
+) -> Result<Option<Option<u64>>, Stop> {
+    use crate::BitVec;
+    let total: u32 = sc.syms.iter().map(|(_, m)| m.count_ones()).sum();
+    let points = 1u64 << total;
+    let word = sc.program(cx);
+    // A word program's evaluation costs a fraction of a generic one's (measured, see
+    // [`WORD_EVALS`]); charged as that many generic evaluations.
+    let rate = if word { WORD_EVALS } else { 1 };
+    let len = sc.kept.len();
+    let cost = |n: u64| n.saturating_mul(len as u64).div_ceil(rate);
+    let mut meter = Steps::new(r, EXHAUSTIVE_SHARE);
+    if cost(points) > certify::Meter::left(&meter) {
+        return Ok(None);
+    }
+    let ku = k.to_u64();
+    // The point the enumeration ended at, where the root differs.
+    let missed = if word {
+        sc.lanes_for(points);
+        first_miss(&mut meter, total, &cost, |span| {
+            Ok(match span {
+                Span::At(points) => sc.miss_at(points, ku),
+                Span::From(start, count) => sc.miss_from(start, count, ku),
+            })
+        })
+    } else {
+        let sc = &*sc;
+        let mut vals: Vec<BitVec> = vec![BitVec::zero(crate::Width::W1); len];
+        // Whether the root is `k` at point `p`, its bits spread over each input's bits that
+        // reach the root.
+        let mut agrees = |p: u64| -> Result<bool, Stop> {
+            let mut left = p;
+            for (j, &(place, m)) in sc.syms.iter().enumerate() {
+                let v = sc.bases.get(j).copied().unwrap_or(0) | spread(&mut left, m);
+                let s = sc.order[place as usize];
+                vals[sc.slot[place as usize] as usize] =
+                    BitVec::wrapping_from_u64(cx.width_of(s), v);
+            }
+            for (slot, &place) in sc.kept.iter().enumerate() {
+                if sc.input[place as usize] {
+                    continue;
+                }
+                // A symbol that is no input: zero, as in the word program.
+                vals[slot] = cx
+                    .eval_node(
+                        sc.order[place as usize],
+                        |j| vals[sc.slot[sc.place[j as usize] as usize] as usize],
+                        |_, w| Some(BitVec::zero(w)),
+                    )
+                    .map_err(Stop::Error)?;
+            }
+            Ok(vals[len - 1] == *k)
+        };
+        first_miss(&mut meter, total, &cost, |span| {
+            match span {
+                Span::At(points) => {
+                    for &p in points {
+                        if !agrees(p)? {
+                            return Ok(Some(p));
+                        }
+                    }
+                }
+                Span::From(start, count) => {
+                    for p in start..start + count {
+                        if !agrees(p)? {
+                            return Ok(Some(p));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        })
+    };
+    Ok(Some(missed?))
+}
+
+/// The low bits of `left`, one for each bit of `m` from its lowest, at `m`'s bits; they are
+/// taken from `left`.
+fn spread(left: &mut u64, m: u64) -> u64 {
+    let (mut v, mut mm) = (0u64, m);
+    while mm != 0 {
+        if *left & 1 == 1 {
+            v |= mm & mm.wrapping_neg();
+        }
+        *left >>= 1;
+        mm &= mm - 1;
+    }
+    v
+}
+
+/// The points [`first_miss`] asks about at once: the ones listed, or `.1` of them from `.0` up.
+enum Span<'a> {
+    At(&'a [u64]),
+    From(u64, u64),
+}
+
+/// The first point of [`exhaustive`]'s enumeration of `2^total` that `miss` finds in a span
+/// (the first of the span the root is not `k` at), each span charged to `meter` by `cost`
+/// before it is asked about.
+fn first_miss(
+    meter: &mut Steps<'_, '_, '_>,
+    total: u32,
+    cost: &dyn Fn(u64) -> u64,
+    mut miss: impl FnMut(Span<'_>) -> Result<Option<u64>, Stop>,
+) -> Result<Option<u64>, Stop> {
+    let points = 1u64 << total;
+    let mut missed: Option<u64> = None;
+    // The points a candidate that is not `k` most often differs at, before the enumeration is
+    // paid for: each bit alone, all of them, and a few mixed. The samples leave candidates that
+    // are `k` unless some one bit is set, and counting up from zero reaches an input's top bit
+    // only at half the points (87 of 98 enumerations in one measured question ended there, and
+    // were four fifths of its sweep's steps).
+    if total > EXHAUSTIVE_SCREEN_BITS {
+        let mixed = (1..=EXHAUSTIVE_MIXED)
+            .map(|j: u64| j.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - total));
+        let mut probes = [0u64; (EXHAUSTIVE_BITS as usize) + 1 + (EXHAUSTIVE_MIXED as usize)];
+        let mut count = 0usize;
+        for p in (0..total)
+            .map(|j| 1u64 << j)
+            .chain(std::iter::once(points - 1))
+            .chain(mixed)
+        {
+            probes[count] = p;
+            count += 1;
+        }
+        certify::Meter::charge(meter, cost(u64::from(total) + 1 + EXHAUSTIVE_MIXED))?;
+        missed = miss(Span::At(&probes[..count]))?;
+    }
+    let mut start = 0u64;
+    while missed.is_none() && start < points {
+        let n = EXHAUSTIVE_BLOCK.min(points - start);
+        certify::Meter::charge(meter, cost(n))?;
+        missed = miss(Span::From(start, n))?;
+        start += n;
+    }
+    Ok(missed)
+}
+
+/// An input at which a candidate of the opaque-constant sweep was found to differ from what
+/// its samples showed: the symbols it fixes (every other symbol has its value at one of the
+/// verification points), and the nodes evaluated at it so far. The samples are few, and a value
+/// that is constant but for one input of `2^16` is constant on all of them; what tells it
+/// from a constant is that input, and it tells the same of every node built on that value.
+#[derive(Default)]
+pub(crate) struct Witness {
+    fixed: crate::hash::IdMap<u32, crate::BitVec>,
+    point: usize,
+    vals: crate::hash::IdMap<u32, crate::BitVec>,
+}
+
+/// The most witnesses a call keeps.
+const WITNESSES: usize = 32;
+
+/// Keeps the input that gives the symbols `fixed` their values there as a witness of the call.
+fn note_witness(r: &mut Runner<'_, '_>, cx: &Context, fixed: Vec<(u32, crate::BitVec)>) {
+    if r.witnesses.len() >= WITNESSES {
+        return;
+    }
+    // A symbol's value agrees with what the host declared of it, as its samples do.
+    let fixed: crate::hash::IdMap<u32, crate::BitVec> = fixed
+        .into_iter()
+        .map(|(s, v)| (s, cx.declared_at(s).map_or(v, |d| d.fit(&v))))
+        .collect();
+    if r.witnesses.iter().any(|w| w.fixed == fixed) {
+        return;
+    }
+    r.witnesses.push(Witness {
+        fixed,
+        point: 2 + r.witnesses.len(),
+        vals: crate::hash::IdMap::default(),
+    });
+}
+
+/// Whether `n` is not `k` at one of the call's witnesses (each node is evaluated once at
+/// each, charged as pass work).
+fn witnessed(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    k: &crate::BitVec,
+) -> Result<bool, Stop> {
+    for w in 0..r.witnesses.len() {
+        let mut wit = std::mem::take(&mut r.witnesses[w]);
+        let mut work = 0u64;
+        let mut out = Ok(());
+        let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if wit.vals.contains_key(&i) {
+                continue;
+            }
+            if !expanded {
+                stack.push((i, true));
+                for c in cx.node(i).children() {
+                    if !wit.vals.contains_key(&c) {
+                        stack.push((c, false));
+                    }
+                }
+                continue;
+            }
+            work += 1;
+            let v = match wit.fixed.get(&i) {
+                Some(v) => Ok(*v),
+                None => {
+                    let seed = cx.meta[i as usize].shash;
+                    let declared = cx.declared_at(i);
+                    cx.eval_node(
+                        i,
+                        |j| wit.vals[&j],
+                        |_, w| {
+                            let v = crate::engine::point_value(seed, w, wit.point);
+                            Some(declared.map_or(v, |d| d.fit(&v)))
+                        },
+                    )
+                }
+            };
+            match v {
+                Ok(v) => {
+                    wit.vals.insert(i, v);
+                }
+                Err(e) => {
+                    out = Err(Stop::Error(e));
+                    break;
+                }
+            }
+        }
+        let differs = wit.vals.get(&n).is_some_and(|v| v != k);
+        r.witnesses[w] = wit;
+        r.meter.charge(Counter::PassWork, work)?;
+        out?;
+        if differs {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The fewest bits [`exhaustive`] screens an enumeration of (fewer are as cheap to enumerate).
+const EXHAUSTIVE_SCREEN_BITS: u32 = 6;
+
+/// The mixed points of [`exhaustive`]'s screen.
+const EXHAUSTIVE_MIXED: u64 = 16;
+
+/// The points [`exhaustive`] is charged for at a time.
+const EXHAUSTIVE_BLOCK: u64 = 1 << 10;
+
+/// No place: of a node that is not evaluated.
+const NO_PLACE: u32 = u32::MAX;
+
+/// A node of the DAG below [`exhaustive`]'s root, with its operands' places in that DAG's order.
+type Placed = (crate::expr::Node, [u32; 3]);
+
+/// [`exhaustive`]'s working storage, the call's. A sweep asks it of thousands of candidates
+/// over one DAG, each time of the DAG below the candidate, and most enumerate nothing: tables
+/// keyed by node, built for each, were most of what those cost. What is kept per node while the
+/// DAG is read is in tables over the arena that are left clear (or stamped, never cleared), and
+/// everything after is indexed by a node's place among those read.
+#[derive(Default)]
+pub(crate) struct Exhaust {
+    /// Per arena node: whether the sweep under way has met it and not yet reached it (a bit
+    /// each, and a bit for each word of those that has one set), and the bits of it found to
+    /// reach the root so far. All zero between sweeps.
+    marks: Vec<u64>,
+    heads: Vec<u64>,
+    reach: Vec<u64>,
+    /// Per arena node: its place in `order`, of the nodes in it.
+    place: Vec<u32>,
+    /// Per arena node: the walk that met it last.
+    met: Vec<u32>,
+    walk: u32,
+    stack: Vec<(u32, bool)>,
+    /// The DAG below the root, operands first (the root last).
+    order: Vec<u32>,
+    /// Each node of `order`, with its operands' places.
+    below: Vec<Placed>,
+    /// The bits of each that reach the root.
+    demand: Vec<u64>,
+    /// The places enumerated (the symbols, a bottleneck, or a cut of several places), with the
+    /// bits enumerated of each; and for each, the bits set in every value enumerated of it
+    /// (none, for all zero).
+    syms: Vec<(u32, u64)>,
+    bases: Vec<u64>,
+    /// Of [`bottleneck`]: whether a place is on a demanded path from a symbol to the root, and
+    /// the steps of those paths that begin to pass over places at each place, less those that
+    /// cease to.
+    live: Vec<bool>,
+    over: Vec<u32>,
+    /// The places evaluated (all, or those the root reads without passing below a
+    /// bottleneck), and each place's index among them ([`NO_PLACE`] of the others).
+    kept: Vec<u32>,
+    slot: Vec<u32>,
+    /// Whether a place is enumerated.
+    input: Vec<bool>,
+    /// The places evaluated as a program over words (see [`Exhaust::program`]).
+    prog: Vec<Ins>,
+    /// Per place evaluated: whether its value is the same at every point (1; 2 when an
+    /// instruction reads it as lanes), and the value.
+    fixed: Vec<(u8, u64)>,
+    /// Per place evaluated: the place whose lanes hold its values (its own, or those of the
+    /// operand it is at every point: a zero extension's), and the root's.
+    home: Vec<u32>,
+    root: usize,
+    /// The places enumerated that take more than one value: index among those evaluated, the
+    /// bits enumerated and the bits set in every value.
+    inputs: Vec<(u32, u64, u64)>,
+    /// For each of `inputs`, its bits at the first `most` points.
+    spreads: Vec<u64>,
+    /// The values of every place evaluated at the `width` points of a pass, a place's side by
+    /// side; `most` is the widest pass of the enumeration under way.
+    lanes: Vec<u64>,
+    width: usize,
+    most: usize,
+}
+
+/// What [`Exhaust::sweep`] came to.
+#[derive(PartialEq)]
+enum Swept {
+    /// The whole DAG.
+    Whole,
+    /// A node of more than 64 bits.
+    Wide,
+    /// More bits of the symbols than are enumerated, and no bottleneck.
+    Open,
+    /// An operand numbered after its user.
+    Unordered,
+}
+
+/// The bits of each operand of `n` that reach its bits `m` (a superset; of the operand's width
+/// or more), given to `give` by the operand's index. `konst` is an operand's value where it is
+/// a constant, `wide` its width.
+fn demanded(
+    n: &crate::expr::Node,
+    m: u64,
+    konst: impl Fn(usize) -> Option<u64>,
+    wide: impl Fn(usize) -> u16,
+    mut give: impl FnMut(usize, u64),
+) {
+    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let w = n.width;
+    let low_prefix = ones(64 - m.leading_zeros() as u16);
+    match n.op {
+        OpCode::And | OpCode::Or => {
+            for (c, o) in [(0, 1), (1, 0)] {
+                let d = match (konst(o), n.op) {
+                    (Some(k), OpCode::And) => m & k,
+                    (Some(k), _) => m & !k,
+                    _ => m,
+                };
+                give(c, d);
+            }
+        }
+        OpCode::Xor => {
+            give(0, m);
+            give(1, m);
+        }
+        OpCode::Not => give(0, m),
+        OpCode::Add | OpCode::Sub | OpCode::Mul => {
+            give(0, low_prefix);
+            give(1, low_prefix);
+        }
+        OpCode::Neg => give(0, low_prefix),
+        OpCode::Shl | OpCode::LShr if konst(1).is_some_and(|s| s < u64::from(w)) => {
+            let s = konst(1).unwrap_or(0);
+            give(
+                0,
+                if n.op == OpCode::Shl {
+                    m >> s
+                } else {
+                    (m << s) & ones(w)
+                },
+            );
+            give(1, u64::MAX);
+        }
+        OpCode::Zext => give(0, m),
+        // A `select` reads its condition, and of its arms the bits read of it.
+        OpCode::Select => {
+            give(0, 1);
+            give(1, m);
+            give(2, m);
+        }
+        OpCode::Extract => give(0, m << n.b),
+        // a rotate by a constant moves the demand the other way; a `concat`
+        // splits it between its halves.
+        OpCode::RotL | OpCode::RotR if konst(1).is_some() && w <= 64 && w > 0 => {
+            let s = (konst(1).unwrap_or(0) % u64::from(w)) as u32;
+            let rot = |v: u64, by: u32, left: bool| {
+                let by = by % u32::from(w);
+                if by == 0 {
+                    return v;
+                }
+                let v = v & ones(w);
+                if left {
+                    ((v << by) | (v >> (u32::from(w) - by))) & ones(w)
+                } else {
+                    ((v >> by) | (v << (u32::from(w) - by))) & ones(w)
+                }
+            };
+            give(0, rot(m, s, n.op == OpCode::RotR));
+            give(1, u64::MAX);
+        }
+        OpCode::Concat => {
+            let wl = wide(1);
+            give(1, m & ones(wl));
+            give(0, if wl >= 64 { 0 } else { m >> wl });
+        }
+        _ => {
+            for j in 0..n.op.arity() {
+                give(j, u64::MAX);
+            }
+        }
+    }
+}
+
+/// The value of a constant node of at most 64 bits (which is stored in the node).
+fn word_of(cx: &Context, i: u32, n: &crate::expr::Node) -> Option<u64> {
+    if n.op != OpCode::Const {
+        return None;
+    }
+    if n.aux & crate::expr::AUX_POOLED != 0 {
+        return cx.const_val(i).and_then(|v| v.to_u64());
+    }
+    Some(u64::from(n.a) | (u64::from(n.b) << 32))
+}
+
+impl Exhaust {
+    /// The DAG below `root` into `order` and `below`, operands first, with the bits of each
+    /// node that reach the root in `demand`, and the symbols with theirs. A node is numbered
+    /// after its operands, so from the highest number down every node comes after its users,
+    /// with all the bits they read of it: one pass, no walk. Stops short at a node of more than
+    /// 64 bits, and where no enumeration can follow: more than [`EXHAUSTIVE_BITS`] bits of the
+    /// symbols already reach the root, and no node reached so far but the root has as few of
+    /// its own. (A [`bottleneck`] is such a node on every demanded path from the symbols to the
+    /// root; a node not yet reached is not on the path that gave a symbol its bits.)
+    fn sweep(&mut self, cx: &Context, root: u32) -> Swept {
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let len = cx.nodes.len();
+        if self.reach.len() < len {
+            self.reach.resize(len, 0);
+            self.place.resize(len, 0);
+            self.marks.resize(len.div_ceil(64), 0);
+            self.heads.resize(len.div_ceil(64).div_ceil(64), 0);
+        }
+        let Exhaust {
+            marks,
+            heads,
+            reach,
+            place,
+            order,
+            below,
+            demand,
+            syms,
+            ..
+        } = self;
+        order.clear();
+        below.clear();
+        demand.clear();
+        syms.clear();
+        // The highest node marked at or below word `at`, unmarked.
+        fn next(marks: &mut [u64], heads: &mut [u64], at: &mut usize) -> u32 {
+            if marks[*at] == 0 {
+                let mut h = *at / 64;
+                let mut word = heads[h] & (u64::MAX >> (63 - *at % 64));
+                while word == 0 {
+                    h -= 1;
+                    word = heads[h];
+                }
+                *at = h * 64 + 63 - word.leading_zeros() as usize;
+            }
+            let bit = 63 - marks[*at].leading_zeros();
+            marks[*at] &= !(1u64 << bit);
+            if marks[*at] == 0 {
+                heads[*at / 64] &= !(1u64 << (*at % 64));
+            }
+            (*at * 64) as u32 + bit
+        }
+        let mut at = root as usize / 64;
+        marks[at] |= 1u64 << (root % 64);
+        heads[at / 64] |= 1u64 << (at % 64);
+        reach[root as usize] = ones(cx.node(root).width);
+        // The nodes marked, the symbols' bits that reach the root so far, and whether a node
+        // that could be a bottleneck was met.
+        let (mut marked, mut bits, mut narrow) = (1usize, 0u32, false);
+        let mut out = Swept::Whole;
+        'nodes: while marked > 0 {
+            let i = next(marks, heads, &mut at);
+            marked -= 1;
+            let n = cx.node(i);
+            let m = std::mem::take(&mut reach[i as usize]);
+            if n.width > 64 {
+                out = Swept::Wide;
+                break;
+            }
+            order.push(i);
+            below.push((n, [0; 3]));
+            demand.push(m);
+            let kids = [n.a, n.b, n.c];
+            let arity = n.op.arity();
+            for &c in &kids[..arity] {
+                if c >= i {
+                    out = Swept::Unordered;
+                    break 'nodes;
+                }
+                let (word, bit) = (c as usize / 64, 1u64 << (c % 64));
+                marked += usize::from(marks[word] & bit == 0);
+                marks[word] |= bit;
+                heads[word / 64] |= 1u64 << (word % 64);
+            }
+            if m == 0 || arity == 0 {
+                continue;
+            }
+            narrow |= i != root && m.count_ones() <= EXHAUSTIVE_BITS;
+            demanded(
+                &n,
+                m,
+                |j| word_of(cx, kids[j], &cx.node(kids[j])),
+                |j| cx.node(kids[j]).width,
+                |j, d| {
+                    let c = cx.node(kids[j]);
+                    let had = reach[kids[j] as usize];
+                    let now = had | (d & ones(c.width));
+                    if c.op == OpCode::Sym {
+                        bits += now.count_ones() - had.count_ones();
+                    }
+                    reach[kids[j] as usize] = now;
+                },
+            );
+            if bits > EXHAUSTIVE_BITS && !narrow {
+                out = Swept::Open;
+                break;
+            }
+        }
+        while marked > 0 {
+            let i = next(marks, heads, &mut at);
+            reach[i as usize] = 0;
+            marked -= 1;
+        }
+        if out != Swept::Whole {
+            return out;
+        }
+        order.reverse();
+        below.reverse();
+        demand.reverse();
+        for (p, &i) in order.iter().enumerate() {
+            place[i as usize] = p as u32;
+        }
+        for (p, (n, kids)) in below.iter_mut().enumerate() {
+            for (k, c) in n.children().enumerate() {
+                kids[k] = place[c as usize];
+            }
+            if n.op == OpCode::Sym {
+                syms.push((p as u32, demand[p]));
+            }
+        }
+        out
+    }
+
+    /// The DAG below `root` into `order` and `below`, operands first, in the order a walk from
+    /// the root leaves its nodes; `false` at a node of more than 64 bits.
+    fn walk(&mut self, cx: &Context, root: u32) -> bool {
+        if self.met.len() < cx.nodes.len() {
+            self.met.resize(cx.nodes.len(), 0);
+        }
+        if self.place.len() < cx.nodes.len() {
+            self.place.resize(cx.nodes.len(), 0);
+        }
+        self.walk = self.walk.wrapping_add(1);
+        if self.walk == 0 {
+            self.met.fill(0);
+            self.walk = 1;
+        }
+        let walk = self.walk;
+        self.order.clear();
+        self.below.clear();
+        self.stack.clear();
+        self.stack.push((root, false));
+        while let Some((i, expanded)) = self.stack.pop() {
+            let n;
+            if expanded {
+                n = cx.node(i);
+            } else {
+                if self.met[i as usize] == walk {
+                    continue;
+                }
+                self.met[i as usize] = walk;
+                n = cx.node(i);
+                if n.width > 64 {
+                    return false;
+                }
+                if n.op.arity() != 0 {
+                    self.stack.push((i, true));
+                    for c in n.children() {
+                        if self.met[c as usize] != walk {
+                            self.stack.push((c, false));
+                        }
+                    }
+                    continue;
+                }
+            }
+            let mut kids = [0u32; 3];
+            for (k, c) in n.children().enumerate() {
+                kids[k] = self.place[c as usize];
+            }
+            self.place[i as usize] = self.order.len() as u32;
+            self.order.push(i);
+            self.below.push((n, kids));
+        }
+        true
+    }
+
+    /// The bits of each node of a [`walk`](Exhaust::walk) that reach the root, from the root
+    /// down, and the symbols with theirs.
+    fn demands(&mut self, cx: &Context) {
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let (order, below, demand) = (&self.order, &self.below, &mut self.demand);
+        let last = below.len() - 1;
+        demand.clear();
+        demand.resize(below.len(), 0);
+        demand[last] = ones(below[last].0.width);
+        for idx in (0..=last).rev() {
+            let m = demand[idx];
+            if m == 0 {
+                continue;
+            }
+            let (n, kids) = &below[idx];
+            demanded(
+                n,
+                m,
+                |j| word_of(cx, order[kids[j] as usize], &below[kids[j] as usize].0),
+                |j| below[kids[j] as usize].0.width,
+                |j, d| demand[kids[j] as usize] |= d & ones(below[kids[j] as usize].0.width),
+            );
+        }
+        self.syms.clear();
+        for (idx, (n, _)) in below.iter().enumerate() {
+            if n.op == OpCode::Sym {
+                self.syms.push((idx as u32, demand[idx]));
+            }
+        }
+    }
+
+    /// The places evaluated into `kept` and `slot`: every place, or with a bottleneck at `cut`
+    /// the ones the root reads without passing below it.
+    fn above(&mut self, cut: Option<usize>) {
+        let n = self.below.len();
+        self.kept.clear();
+        self.slot.clear();
+        let Some(cut) = cut else {
+            self.kept.extend(0..n as u32);
+            self.slot.extend(0..n as u32);
+            return;
+        };
+        // Users first: a place read is marked before it is reached.
+        self.slot.resize(n, NO_PLACE);
+        self.slot[n - 1] = 0;
+        for p in (0..n).rev() {
+            if self.slot[p] == NO_PLACE || p == cut {
+                continue;
+            }
+            let (node, kids) = self.below[p];
+            for &c in &kids[..node.op.arity()] {
+                self.slot[c as usize] = 0;
+            }
+        }
+        for p in 0..n {
+            if self.slot[p] != NO_PLACE {
+                self.slot[p] = self.kept.len() as u32;
+                self.kept.push(p as u32);
+            }
+        }
+    }
+
+    /// [`above`](Exhaust::above) with the places of `syms` for the cut (see [`frontier`]): the
+    /// places the root reads without passing below one of them.
+    fn above_inputs(&mut self) {
+        let n = self.below.len();
+        self.kept.clear();
+        self.slot.clear();
+        self.input.clear();
+        self.input.resize(n, false);
+        for &(p, _) in &self.syms {
+            self.input[p as usize] = true;
+        }
+        self.slot.resize(n, NO_PLACE);
+        self.slot[n - 1] = 0;
+        for p in (0..n).rev() {
+            if self.slot[p] == NO_PLACE || self.input[p] {
+                continue;
+            }
+            let (node, kids) = self.below[p];
+            for &c in &kids[..node.op.arity()] {
+                self.slot[c as usize] = 0;
+            }
+        }
+        for p in 0..n {
+            if self.slot[p] != NO_PLACE {
+                self.slot[p] = self.kept.len() as u32;
+                self.kept.push(p as u32);
+            }
+        }
+    }
+
+    /// The places evaluated (operands first, every node at most 64 bits) as a program over
+    /// `u64` words, each instruction with its node's width mask; `false` when an operator is
+    /// not one it evaluates. A place enumerated is given its words before each run; a value
+    /// that is the same at every point (a constant, a symbol past a bottleneck, a place
+    /// enumerated with no bit unknown, which is its base) is an instruction's operand where the
+    /// instruction has a form that takes one, and is written out once otherwise.
+    fn program(&mut self, cx: &Context) -> bool {
+        use crate::{BinOp, CmpOp, UnOp};
+        let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let Exhaust {
+            order,
+            below,
+            syms,
+            bases,
+            kept,
+            slot,
+            input,
+            prog,
+            fixed,
+            home,
+            inputs,
+            ..
+        } = self;
+        prog.clear();
+        inputs.clear();
+        fixed.clear();
+        fixed.resize(kept.len(), (0, 0));
+        home.clear();
+        home.extend(0..kept.len() as u32);
+        input.clear();
+        input.resize(below.len(), false);
+        for (j, &(p, m)) in syms.iter().enumerate() {
+            input[p as usize] = true;
+            let s = slot[p as usize];
+            let base = bases.get(j).copied().unwrap_or(0);
+            if m == 0 {
+                fixed[s as usize] = (1, base);
+            } else {
+                inputs.push((s, m, base));
+            }
+        }
+        // An operand read as lanes: one that is the same at every point is written out.
+        fn lane(fixed: &mut [(u8, u64)], s: u32) -> u32 {
+            if fixed[s as usize].0 == 1 {
+                fixed[s as usize].0 = 2;
+            }
+            s
+        }
+        let known = |fixed: &[(u8, u64)], s: u32| {
+            let (is, v) = fixed[s as usize];
+            (is != 0).then_some(v)
+        };
+        for (s, &p) in kept.iter().enumerate() {
+            if input[p as usize] {
+                continue;
+            }
+            let (n, kids) = below[p as usize];
+            let (w, mask) = (u32::from(n.width), ones(n.width));
+            if w == 0 {
+                return false;
+            }
+            let wide = |j: usize| below[kids[j] as usize].0.width;
+            let arg = |j: usize| home[slot[kids[j] as usize] as usize];
+            // A node that is its operand `j` at every point: the operand's lanes, or its value.
+            macro_rules! same {
+                ($j:expr) => {{
+                    let a = arg($j);
+                    match known(fixed, a) {
+                        Some(v) => fixed[s] = (1, v),
+                        None => home[s] = a,
+                    }
+                    continue;
+                }};
+            }
+            let ins = |kind: Kind, sh: u32, a: u32, b: u32, c: u32, k: u64| Ins {
+                kind,
+                sh,
+                dst: s as u32,
+                a,
+                b,
+                c,
+                mask,
+                k,
+            };
+            let one = |fixed: &mut [(u8, u64)], kind: Kind, sh: u32, k: u64| {
+                ins(kind, sh, lane(fixed, arg(0)), 0, 0, k)
+            };
+            let two = |fixed: &mut [(u8, u64)], kind: Kind, sh: u32| {
+                ins(kind, sh, lane(fixed, arg(0)), lane(fixed, arg(1)), 0, 0)
+            };
+            let i = match n.op {
+                // A symbol past a bottleneck cut that is no input reaches the root only through
+                // a node with no demanded bits: any value, zero as the uncut enumeration gives it.
+                OpCode::Sym => {
+                    fixed[s] = (1, 0);
+                    continue;
+                }
+                OpCode::Const => {
+                    let Some(v) = word_of(cx, order[p as usize], &n) else {
+                        return false;
+                    };
+                    fixed[s] = (1, v & mask);
+                    continue;
+                }
+                OpCode::Zext => same!(0),
+                OpCode::Sext => one(fixed, Kind::Sext, u32::from(wide(0)), 0),
+                OpCode::Extract => one(fixed, Kind::Extract, u32::from(n.b as u16), 0),
+                OpCode::Select => {
+                    let (c, t, f) = (
+                        lane(fixed, arg(0)),
+                        lane(fixed, arg(1)),
+                        lane(fixed, arg(2)),
+                    );
+                    ins(Kind::Select, 0, c, t, f, 0)
+                }
+                // `concat(hi, lo)`, shifted by the low half's width.
+                OpCode::Concat if wide(1) >= 64 => same!(1),
+                OpCode::Concat => two(fixed, Kind::Concat, u32::from(wide(1))),
+                op => {
+                    if let Some(u) = op.as_un() {
+                        match u {
+                            UnOp::Not => one(fixed, Kind::Not, 0, 0),
+                            UnOp::Neg => one(fixed, Kind::Neg, 0, 0),
+                            _ => return false,
+                        }
+                    } else if let Some(b) = op.as_bin() {
+                        let (x, y) = (known(fixed, arg(0)), known(fixed, arg(1)));
+                        // The other operand's lanes, with the known one as the instruction's.
+                        let with = |fixed: &mut [(u8, u64)], kind: Kind, plain: Kind| match (x, y) {
+                            (_, Some(y)) => ins(kind, 0, lane(fixed, arg(0)), 0, 0, y),
+                            (Some(x), _) => ins(kind, 0, lane(fixed, arg(1)), 0, 0, x),
+                            _ => two(fixed, plain, 0),
+                        };
+                        match (b, y) {
+                            (BinOp::Add, _) => with(fixed, Kind::AddK, Kind::Add),
+                            (BinOp::Mul, _) => with(fixed, Kind::MulK, Kind::Mul),
+                            (BinOp::And, _) => with(fixed, Kind::AndK, Kind::And),
+                            (BinOp::Or, _) => with(fixed, Kind::OrK, Kind::Or),
+                            (BinOp::Xor, _) => with(fixed, Kind::XorK, Kind::Xor),
+                            (BinOp::Sub, Some(y)) => one(fixed, Kind::AddK, 0, y.wrapping_neg()),
+                            (BinOp::Sub, None) => match x {
+                                Some(x) => ins(Kind::RSubK, 0, lane(fixed, arg(1)), 0, 0, x),
+                                None => two(fixed, Kind::Sub, 0),
+                            },
+                            // A count of the width or more leaves nothing.
+                            (BinOp::Shl | BinOp::LShr, Some(y)) if y >= u64::from(w) => {
+                                fixed[s] = (1, 0);
+                                continue;
+                            }
+                            (BinOp::Shl, Some(y)) => one(fixed, Kind::ShlK, y as u32, 0),
+                            (BinOp::LShr, Some(y)) => one(fixed, Kind::LShrK, y as u32, 0),
+                            (BinOp::AShr, Some(y)) => {
+                                one(fixed, Kind::AShrK, y.min(u64::from(w) - 1) as u32, 0)
+                            }
+                            (BinOp::RotL | BinOp::RotR, Some(y)) => {
+                                let by = (y % u64::from(w)) as u32;
+                                let by = if b == BinOp::RotR { (w - by) % w } else { by };
+                                match by {
+                                    0 => same!(0),
+                                    _ => one(fixed, Kind::RotK, by, 0),
+                                }
+                            }
+                            (BinOp::Shl, None) => two(fixed, Kind::Shl, 0),
+                            (BinOp::LShr, None) => two(fixed, Kind::LShr, 0),
+                            (BinOp::AShr, None) => two(fixed, Kind::AShr, 0),
+                            (BinOp::RotL, None) => two(fixed, Kind::RotL, 0),
+                            (BinOp::RotR, None) => two(fixed, Kind::RotR, 0),
+                            _ => return false,
+                        }
+                    } else {
+                        let Some(c) = op.as_cmp() else {
+                            return false;
+                        };
+                        let (x, y) = (known(fixed, arg(0)), known(fixed, arg(1)));
+                        let wa = u32::from(wide(0));
+                        match (c, x, y) {
+                            (CmpOp::Eq, _, Some(y)) => one(fixed, Kind::EqK, 0, y),
+                            (CmpOp::Ne, _, Some(y)) => one(fixed, Kind::NeK, 0, y),
+                            (CmpOp::Eq, Some(x), _) => {
+                                ins(Kind::EqK, 0, lane(fixed, arg(1)), 0, 0, x)
+                            }
+                            (CmpOp::Ne, Some(x), _) => {
+                                ins(Kind::NeK, 0, lane(fixed, arg(1)), 0, 0, x)
+                            }
+                            (CmpOp::Eq, ..) => two(fixed, Kind::Eq, 0),
+                            (CmpOp::Ne, ..) => two(fixed, Kind::Ne, 0),
+                            (CmpOp::Ult, ..) => two(fixed, Kind::Ult, 0),
+                            (CmpOp::Ule, ..) => two(fixed, Kind::Ule, 0),
+                            (CmpOp::Slt, ..) => two(fixed, Kind::Slt, wa),
+                            (CmpOp::Sle, ..) => two(fixed, Kind::Sle, wa),
+                        }
+                    }
+                }
+            };
+            prog.push(i);
+        }
+        // The root's lanes are read at every point.
+        self.root = lane(fixed, home[kept.len() - 1]) as usize;
+        true
+    }
+
+    /// Sets the most points a pass of the program evaluates, for an enumeration of `points`.
+    fn lanes_for(&mut self, points: u64) {
+        let len = self.kept.len();
+        let fit = (EXHAUSTIVE_LANE_WORDS / len).clamp(1, EXHAUSTIVE_LANES);
+        // A power of two, as `points` is: a block is whole passes.
+        let most = (1usize << fit.ilog2()).min(usize::try_from(points).unwrap_or(usize::MAX));
+        self.most = most;
+        self.width = 0;
+        if self.lanes.len() < len * most {
+            self.lanes.resize(len * most, 0);
+        }
+        // The inputs' bits at the first `most` points: at a point `p + l` past a multiple `p`
+        // of `most`, an input's are its bits at `p` with its bits at `l`. Counted up in the
+        // inputs' bits (`(v | !m) + 1 & m` is the next value of the bits `m`, zero after the
+        // last, when the next input counts).
+        self.spreads.clear();
+        self.spreads.resize(self.inputs.len() * most, 0);
+        for l in 1..most {
+            let mut carry = true;
+            for (j, &(_, m, _)) in self.inputs.iter().enumerate() {
+                let was = self.spreads[j * most + l - 1];
+                let now = if carry {
+                    (was | !m).wrapping_add(1) & m
+                } else {
+                    was
+                };
+                carry &= now == 0;
+                self.spreads[j * most + l] = now;
+            }
+        }
+    }
+
+    /// Lays the lanes out for passes of `width` points (at most `most`), with the values that
+    /// are the same at every point written out.
+    fn pass_of(&mut self, width: usize) {
+        if self.width == width {
+            return;
+        }
+        self.width = width;
+        for (s, &(is, v)) in self.fixed.iter().enumerate() {
+            if is == 2 {
+                self.lanes[s * width..][..width].fill(v);
+            }
+        }
+    }
+
+    /// The first lane of the first `valid` at which the root is not `k`, after a pass.
+    fn differs(&self, valid: usize, k: Option<u64>) -> Option<usize> {
+        let Some(k) = k else {
+            return Some(0);
+        };
+        let root = &self.lanes[self.root * self.width..][..valid];
+        if root.iter().fold(0, |any, &x| any | (x ^ k)) == 0 {
+            return None;
+        }
+        root.iter().position(|&x| x != k)
+    }
+
+    /// The first of `points` the root is not `k` at.
+    fn miss_at(&mut self, points: &[u64], k: Option<u64>) -> Option<u64> {
+        // A pass no wider than the points: a pass's cost is its width's.
+        let width = points.len().min(self.most);
+        self.pass_of(width);
+        for pass in points.chunks(width) {
+            for l in 0..width {
+                // A short pass evaluates its last point again.
+                let mut left = pass[l.min(pass.len() - 1)];
+                for &(s, m, base) in &self.inputs {
+                    self.lanes[s as usize * width + l] = base | spread(&mut left, m);
+                }
+            }
+            run_lanes(&self.prog, &mut self.lanes, width);
+            if let Some(l) = self.differs(pass.len(), k) {
+                return Some(pass[l]);
+            }
+        }
+        None
+    }
+
+    /// The first of the `count` points from `start` up the root is not `k` at; `start` is a
+    /// multiple of `most`.
+    fn miss_from(&mut self, start: u64, count: u64, k: Option<u64>) -> Option<u64> {
+        let width = self.most;
+        self.pass_of(width);
+        let (mut p, end) = (start, start + count);
+        while p < end {
+            let mut left = p;
+            for (j, &(s, m, base)) in self.inputs.iter().enumerate() {
+                let at = base | spread(&mut left, m);
+                let out = &mut self.lanes[s as usize * width..][..width];
+                for (o, &low) in out.iter_mut().zip(&self.spreads[j * width..][..width]) {
+                    *o = at | low;
+                }
+            }
+            run_lanes(&self.prog, &mut self.lanes, width);
+            let valid = (end - p).min(width as u64) as usize;
+            if let Some(l) = self.differs(valid, k) {
+                return Some(p + l as u64);
+            }
+            p += width as u64;
+        }
+        None
+    }
+}
+
+/// The most points one pass of a word program evaluates ([`run_lanes`]): a block
+/// ([`EXHAUSTIVE_BLOCK`]), and a power of two. An instruction's operator is read once a pass,
+/// which is most of what a narrow pass costs: on programs of 30 to 2,000 instructions a point
+/// took 0.33 to 0.40 ns an instruction at 64 points a pass, 0.25 to 0.29 ns at 256, and a
+/// little less at 1,024.
+const EXHAUSTIVE_LANES: usize = EXHAUSTIVE_BLOCK as usize;
+
+/// The words of lanes a pass works in while it can, fewer points at once for a longer program:
+/// past a few megabytes a pass was slower for being wider.
+const EXHAUSTIVE_LANE_WORDS: usize = 1 << 17;
+
+/// the place of `below` (operands first, the root last) that every demanded path
 /// from the symbols to the root passes through, nearest the symbols with at most
 /// [`EXHAUSTIVE_BITS`] demanded bits; not the root or a symbol. The root is a function of its
 /// demanded bits alone. A reconstructed address can take a few bits of sums over `k - t` and
 /// `t + k'`: 22 bits of the two symbols in `t` reach them, 11 bits of `t`.
 fn bottleneck(
-    cx: &Context,
-    order: &[u32],
-    at: &crate::hash::IdMap<u32, usize>,
+    below: &[Placed],
     demand: &[u64],
+    live: &mut Vec<bool>,
+    over: &mut Vec<u32>,
 ) -> Option<usize> {
-    let n = order.len();
+    let n = below.len();
     let root = n.checked_sub(1)?;
-    let mut idom = vec![usize::MAX; n];
-    let mut depth = vec![0u32; n];
-    let meet = |idom: &[usize], depth: &[u32], mut a: usize, mut b: usize| {
-        while a != b {
-            if depth[a] >= depth[b] {
-                a = idom[a];
-            } else {
-                b = idom[b];
-            }
-        }
-        a
-    };
-    idom[root] = root;
-    // Parents first: every operand comes after each node that reads it.
-    for idx in (0..n).rev() {
-        if idom[idx] == usize::MAX || demand[idx] == 0 {
+    live.clear();
+    live.resize(n, false);
+    over.clear();
+    over.resize(n + 1, 0);
+    // A place is on a demanded path from a symbol to the root when it has demanded bits and is
+    // a symbol or reads a place that is on one. A step of such a path, from a place to one it
+    // reads, passes over the places between the two in the order; a symbol's path begins below
+    // every place, so passes over all before the symbol. `over` takes one at the first place a
+    // step passes over and gives one back past the last.
+    for (p, (node, kids)) in below.iter().enumerate() {
+        if demand[p] == 0 {
             continue;
         }
-        if idx != root {
-            depth[idx] = depth[idom[idx]] + 1;
+        if node.op == OpCode::Sym {
+            live[p] = true;
+            over[0] = over[0].wrapping_add(1);
+            over[p] = over[p].wrapping_sub(1);
+            continue;
         }
-        for c in cx.node(order[idx]).children() {
-            let ci = at[&c];
-            if demand[ci] == 0 {
+        for &c in &kids[..node.op.arity()] {
+            let c = c as usize;
+            if live[c] {
+                live[p] = true;
+                over[c + 1] = over[c + 1].wrapping_add(1);
+                over[p] = over[p].wrapping_sub(1);
+            }
+        }
+    }
+    // A place on a demanded path that no step passes over is on every one of them (a path
+    // that missed it would step over it); the first such is the nearest the symbols.
+    let mut open = 0u32;
+    for p in 0..root {
+        open = open.wrapping_add(over[p]);
+        if open == 0
+            && live[p]
+            && below[p].0.op != OpCode::Sym
+            && demand[p].count_ones() <= EXHAUSTIVE_BITS
+        {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// The most bits [`exhaustive`] enumerates of a cut of several places (see [`frontier`]), and
+/// the most places it reads to find one. A cut is tried after an enumeration over one place
+/// failed, and a deeper one costs its points whether or not it decides.
+const FRONTIER_BITS: u32 = 10;
+const FRONTIER_STEPS: usize = 256;
+
+/// places of `below` (operands first, the root last) that every demanded path from
+/// the symbols to the root passes through one of, with at most [`FRONTIER_BITS`] demanded
+/// bits between them: each with those bits. The root is a function of the demanded bits of
+/// such places alone, so one that is `k` at every value of them is `k`; they are taken as
+/// free, where the places may take fewer values together, so a value the root differs at
+/// decides nothing. (A [`bottleneck`] is one place; a shift count read from the low bits of a
+/// product of a value two unrelated conditions each give one bit of has none that takes only
+/// the values it can.)
+///
+/// The cut starts at the root's operands and moves toward the symbols a place at a time (the
+/// place whose operands add the fewest bits first), while that adds no bits or leaves the
+/// cut within the limit: the values the root takes over a cut nearer the symbols are among
+/// those it takes over one above it, so the deepest cut that can be enumerated decides the
+/// most. `mark` is scratch.
+fn frontier(below: &[Placed], demand: &[u64], mark: &mut Vec<u32>) -> Option<Vec<(u32, u64)>> {
+    let n = below.len();
+    let root = n.checked_sub(1)?;
+    // 0: not reached; 1: in the cut; 2: above it.
+    mark.clear();
+    mark.resize(n, 0);
+    let bits = |p: usize| demand[p].count_ones() as i64;
+    let leaf = |p: usize| matches!(below[p].0.op, OpCode::Sym | OpCode::Const);
+    let mut front: Vec<usize> = Vec::new();
+    let mut total = 0i64;
+    // Moves the cut below `p`: the bits that adds.
+    let open = |mark: &mut [u32], front: &mut Vec<usize>, p: usize| -> i64 {
+        let (node, kids) = &below[p];
+        let mut delta = if mark[p] == 1 { -bits(p) } else { 0 };
+        mark[p] = 2;
+        front.retain(|&q| q != p);
+        for &c in &kids[..node.op.arity()] {
+            let c = c as usize;
+            if mark[c] == 0 && below[c].0.op != OpCode::Const {
+                mark[c] = 1;
+                front.push(c);
+                delta += bits(c);
+            }
+        }
+        delta
+    };
+    total += open(mark, &mut front, root);
+    for _ in 0..FRONTIER_STEPS {
+        // The place of the cut whose operands add the fewest bits; the nearest the root of
+        // those.
+        let mut best: Option<(i64, usize)> = None;
+        for &p in &front {
+            if leaf(p) {
                 continue;
             }
-            idom[ci] = match idom[ci] {
-                usize::MAX => idx,
-                d => meet(&idom, &depth, d, idx),
-            };
-        }
-    }
-    let mut cut: Option<usize> = None;
-    for (idx, &i) in order.iter().enumerate() {
-        if cx.node(i).op == OpCode::Sym && demand[idx] != 0 && idom[idx] != usize::MAX {
-            cut = Some(match cut {
-                None => idx,
-                Some(c) => meet(&idom, &depth, c, idx),
-            });
-        }
-    }
-    let mut c = cut?;
-    loop {
-        if c == root {
-            return None;
-        }
-        if cx.node(order[c]).op != OpCode::Sym && demand[c].count_ones() <= EXHAUSTIVE_BITS {
-            return Some(c);
-        }
-        c = idom[c];
-    }
-}
-
-/// `order` with only the nodes the root reads without passing below `cut`, and their indices.
-#[allow(clippy::type_complexity)]
-fn above(cx: &Context, order: &[u32], cut: u32) -> (Vec<u32>, crate::hash::IdMap<u32, usize>) {
-    let mut keep: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
-    let mut stack: Vec<u32> = order.last().copied().into_iter().collect();
-    while let Some(i) = stack.pop() {
-        if keep.insert(i, ()).is_some() || i == cut {
-            continue;
-        }
-        stack.extend(cx.node(i).children());
-    }
-    let order: Vec<u32> = order
-        .iter()
-        .copied()
-        .filter(|i| keep.contains_key(i))
-        .collect();
-    let at = order.iter().enumerate().map(|(k, i)| (*i, k)).collect();
-    (order, at)
-}
-
-/// one node of a word program ([`program64`]): operands are indices of earlier
-/// nodes, and every value is kept masked to its node's width.
-#[derive(Clone, Copy)]
-enum Op64 {
-    Keep,
-    Const(u64),
-    Bin(crate::BinOp, usize, usize),
-    Not(usize),
-    Neg(usize),
-    Zext(usize),
-    Sext(usize, u16),
-    Extract(usize, u16),
-    Cmp(crate::CmpOp, usize, usize, u16),
-    Select(usize, usize, usize),
-    /// `concat(hi, lo)`, with the low half's width.
-    Concat(usize, usize, u16),
-}
-
-/// `order` (operands first, every node at most 64 bits) as a program over `u64` words, with
-/// each node's width mask; `None` when an operator is not one it evaluates. An input's word
-/// (a symbol's, or a cut node's) is set before each run.
-fn program64(
-    cx: &Context,
-    order: &[u32],
-    at: &crate::hash::IdMap<u32, usize>,
-    inputs: &[u32],
-) -> Option<Vec<(Op64, u64)>> {
-    use crate::{BinOp, CmpOp, UnOp};
-    let ones = |w: u16| if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-    let mut prog = Vec::with_capacity(order.len());
-    for &i in order {
-        let n = cx.node(i);
-        let w = cx.width_of(i).bits();
-        let arg = |j: u32| at.get(&j).copied();
-        let op = match n.op {
-            _ if inputs.contains(&i) => Op64::Keep,
-            // A symbol past a bottleneck cut that is no input reaches the root only through a
-            // node with no demanded bits: any value, zero as the uncut enumeration gives it.
-            OpCode::Sym => Op64::Const(0),
-            OpCode::Const => Op64::Const(cx.const_val(i)?.to_u64()?),
-            OpCode::Zext => Op64::Zext(arg(n.a)?),
-            OpCode::Sext => Op64::Sext(arg(n.a)?, cx.width_of(n.a).bits()),
-            OpCode::Extract => Op64::Extract(arg(n.a)?, n.b as u16),
-            OpCode::Select => Op64::Select(arg(n.a)?, arg(n.b)?, arg(n.c)?),
-            OpCode::Concat => Op64::Concat(arg(n.a)?, arg(n.b)?, cx.width_of(n.b).bits()),
-            op => {
-                if let Some(u) = op.as_un() {
-                    match u {
-                        UnOp::Not => Op64::Not(arg(n.a)?),
-                        UnOp::Neg => Op64::Neg(arg(n.a)?),
-                        _ => return None,
-                    }
-                } else if let Some(b) = op.as_bin() {
-                    match b {
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::And
-                        | BinOp::Or
-                        | BinOp::Xor
-                        | BinOp::Shl
-                        | BinOp::LShr
-                        | BinOp::AShr
-                        | BinOp::RotL
-                        | BinOp::RotR => Op64::Bin(b, arg(n.a)?, arg(n.b)?),
-                        _ => return None,
-                    }
-                } else {
-                    let c = op.as_cmp()?;
-                    match c {
-                        CmpOp::Eq
-                        | CmpOp::Ne
-                        | CmpOp::Ult
-                        | CmpOp::Ule
-                        | CmpOp::Slt
-                        | CmpOp::Sle => Op64::Cmp(c, arg(n.a)?, arg(n.b)?, cx.width_of(n.a).bits()),
-                    }
+            let (node, kids) = &below[p];
+            let mut delta = -bits(p);
+            let mut met = [usize::MAX; 3];
+            for (j, &c) in kids[..node.op.arity()].iter().enumerate() {
+                let c = c as usize;
+                if mark[c] == 0 && below[c].0.op != OpCode::Const && !met.contains(&c) {
+                    met[j] = c;
+                    delta += bits(c);
                 }
             }
+            if best.is_none_or(|(d, q)| delta < d || (delta == d && p > q)) {
+                best = Some((delta, p));
+            }
+        }
+        let Some((delta, p)) = best else {
+            break;
         };
-        prog.push((op, ones(w)));
+        if delta > 0 && total + delta > i64::from(FRONTIER_BITS) {
+            break;
+        }
+        total += open(mark, &mut front, p);
     }
-    Some(prog)
+    if total > i64::from(FRONTIER_BITS) {
+        return None;
+    }
+    front.sort_unstable();
+    Some(front.into_iter().map(|p| (p as u32, demand[p])).collect())
 }
 
-/// Runs a word program over `vals` (the symbols' words already set).
-fn run64(prog: &[(Op64, u64)], vals: &mut [u64]) {
-    use crate::{BinOp, CmpOp};
-    let sext = |v: u64, w: u16| -> i64 {
-        let sh = 64 - u32::from(w);
+/// What an instruction of a word program computes ([`Ins`]); the forms in `K` take the
+/// instruction's own word for an operand that is the same at every point, or its count for a
+/// shift by one.
+#[derive(Clone, Copy)]
+enum Kind {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+    RotL,
+    RotR,
+    AddK,
+    /// `k - a`.
+    RSubK,
+    MulK,
+    AndK,
+    OrK,
+    XorK,
+    ShlK,
+    LShrK,
+    AShrK,
+    /// A rotate left by `sh`, neither zero nor the width.
+    RotK,
+    Not,
+    Neg,
+    /// From `sh` bits.
+    Sext,
+    /// From bit `sh` up.
+    Extract,
+    Eq,
+    Ne,
+    Ult,
+    Ule,
+    /// Of `sh` bits.
+    Slt,
+    Sle,
+    EqK,
+    NeK,
+    /// `a`'s low bit picks `b` or `c`.
+    Select,
+    /// `a` above the `sh` bits of `b`.
+    Concat,
+}
+
+/// One instruction of a word program ([`Exhaust::program`]): the place it computes and its
+/// operands' are indices among the places evaluated, operands before, and every value is kept
+/// masked to its node's width.
+#[derive(Clone, Copy)]
+struct Ins {
+    kind: Kind,
+    sh: u32,
+    dst: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    mask: u64,
+    k: u64,
+}
+
+/// Runs a word program at `width` points at once: `lanes` holds `width` words for each place
+/// (the inputs' and the fixed values' already set), and each instruction is one loop over its
+/// operands' lanes, its operator read once.
+fn run_lanes(prog: &[Ins], lanes: &mut [u64], width: usize) {
+    #[inline(always)]
+    fn one(v: &mut [u64], n: usize, d: u32, a: u32) -> (&mut [u64], &[u64]) {
+        let (lo, hi) = v.split_at_mut(d as usize * n);
+        (&mut hi[..n], &lo[a as usize * n..][..n])
+    }
+    #[inline(always)]
+    fn two(v: &mut [u64], n: usize, d: u32, a: u32, b: u32) -> (&mut [u64], &[u64], &[u64]) {
+        let (lo, hi) = v.split_at_mut(d as usize * n);
+        (
+            &mut hi[..n],
+            &lo[a as usize * n..][..n],
+            &lo[b as usize * n..][..n],
+        )
+    }
+    let sext = |v: u64, w: u32| -> i64 {
+        let sh = 64 - w;
         ((v << sh) as i64) >> sh
     };
-    for (idx, &(op, mask)) in prog.iter().enumerate() {
-        let w = 64 - mask.leading_zeros();
-        let v = match op {
-            Op64::Keep => continue,
-            Op64::Const(c) => c,
-            Op64::Not(a) => !vals[a],
-            Op64::Neg(a) => vals[a].wrapping_neg(),
-            Op64::Zext(a) => vals[a],
-            Op64::Sext(a, wa) => sext(vals[a], wa) as u64,
-            Op64::Extract(a, lo) => vals[a] >> lo,
-            Op64::Select(c, t, f) => {
-                if vals[c] & 1 == 1 {
-                    vals[t]
-                } else {
-                    vals[f]
+    for i in prog {
+        let (m, k, sh) = (i.mask, i.k, i.sh);
+        let w = 64 - m.leading_zeros();
+        macro_rules! un {
+            (|$x:ident| $e:expr) => {{
+                let (o, a) = one(lanes, width, i.dst, i.a);
+                for (o, &$x) in o.iter_mut().zip(a) {
+                    *o = ($e) & m;
                 }
-            }
-            Op64::Concat(hi, lo, wl) => {
-                if wl >= 64 {
-                    vals[lo]
-                } else {
-                    (vals[hi] << wl) | vals[lo]
+            }};
+        }
+        macro_rules! bin {
+            (|$x:ident, $y:ident| $e:expr) => {{
+                let (o, a, b) = two(lanes, width, i.dst, i.a, i.b);
+                for ((o, &$x), &$y) in o.iter_mut().zip(a).zip(b) {
+                    *o = ($e) & m;
                 }
-            }
-            Op64::Cmp(c, a, b, wa) => {
-                let (x, y) = (vals[a], vals[b]);
-                u64::from(match c {
-                    CmpOp::Eq => x == y,
-                    CmpOp::Ne => x != y,
-                    CmpOp::Ult => x < y,
-                    CmpOp::Ule => x <= y,
-                    CmpOp::Slt => sext(x, wa) < sext(y, wa),
-                    CmpOp::Sle => sext(x, wa) <= sext(y, wa),
+            }};
+        }
+        match i.kind {
+            Kind::Add => bin!(|x, y| x.wrapping_add(y)),
+            Kind::Sub => bin!(|x, y| x.wrapping_sub(y)),
+            Kind::Mul => bin!(|x, y| x.wrapping_mul(y)),
+            Kind::And => bin!(|x, y| x & y),
+            Kind::Or => bin!(|x, y| x | y),
+            Kind::Xor => bin!(|x, y| x ^ y),
+            Kind::Shl => bin!(|x, y| if y >= u64::from(w) { 0 } else { x << y }),
+            Kind::LShr => bin!(|x, y| if y >= u64::from(w) { 0 } else { x >> y }),
+            Kind::AShr => bin!(|x, y| (sext(x, w) >> y.min(u64::from(w) - 1)) as u64),
+            Kind::RotL | Kind::RotR => {
+                let right = matches!(i.kind, Kind::RotR);
+                bin!(|x, y| {
+                    let by = (y % u64::from(w)) as u32;
+                    let by = if right { (w - by) % w } else { by };
+                    if by == 0 {
+                        x
+                    } else {
+                        (x << by) | (x >> (w - by))
+                    }
                 })
             }
-            Op64::Bin(b, a, c) => {
-                let (x, y) = (vals[a], vals[c]);
-                match b {
-                    BinOp::Add => x.wrapping_add(y),
-                    BinOp::Sub => x.wrapping_sub(y),
-                    BinOp::Mul => x.wrapping_mul(y),
-                    BinOp::And => x & y,
-                    BinOp::Or => x | y,
-                    BinOp::Xor => x ^ y,
-                    BinOp::Shl => {
-                        if y >= u64::from(w) {
-                            0
-                        } else {
-                            x << y
-                        }
-                    }
-                    BinOp::LShr => {
-                        if y >= u64::from(w) {
-                            0
-                        } else {
-                            x >> y
-                        }
-                    }
-                    BinOp::RotL | BinOp::RotR if w > 0 => {
-                        let by = (y % u64::from(w)) as u32;
-                        let by = if b == BinOp::RotR { (w - by) % w } else { by };
-                        if by == 0 {
-                            x
-                        } else {
-                            (x << by) | (x >> (w - by))
-                        }
-                    }
-                    _ => {
-                        let s = sext(x, w as u16);
-                        (s >> y.min(u64::from(w) - 1)) as u64
-                    }
+            Kind::AddK => un!(|x| x.wrapping_add(k)),
+            Kind::RSubK => un!(|x| k.wrapping_sub(x)),
+            Kind::MulK => un!(|x| x.wrapping_mul(k)),
+            Kind::AndK => un!(|x| x & k),
+            Kind::OrK => un!(|x| x | k),
+            Kind::XorK => un!(|x| x ^ k),
+            Kind::ShlK => un!(|x| x << sh),
+            Kind::LShrK => un!(|x| x >> sh),
+            Kind::AShrK => un!(|x| (sext(x, w) >> sh) as u64),
+            Kind::RotK => un!(|x| (x << sh) | (x >> (w - sh))),
+            Kind::Not => un!(|x| !x),
+            Kind::Neg => un!(|x| x.wrapping_neg()),
+            Kind::Sext => un!(|x| sext(x, sh) as u64),
+            Kind::Extract => un!(|x| x >> sh),
+            Kind::Eq => bin!(|x, y| u64::from(x == y)),
+            Kind::Ne => bin!(|x, y| u64::from(x != y)),
+            Kind::Ult => bin!(|x, y| u64::from(x < y)),
+            Kind::Ule => bin!(|x, y| u64::from(x <= y)),
+            Kind::Slt => bin!(|x, y| u64::from(sext(x, sh) < sext(y, sh))),
+            Kind::Sle => bin!(|x, y| u64::from(sext(x, sh) <= sext(y, sh))),
+            Kind::EqK => un!(|x| u64::from(x == k)),
+            Kind::NeK => un!(|x| u64::from(x != k)),
+            Kind::Concat => bin!(|x, y| (x << sh) | y),
+            Kind::Select => {
+                let (lo, hi) = lanes.split_at_mut(i.dst as usize * width);
+                let o = &mut hi[..width];
+                let c = &lo[i.a as usize * width..][..width];
+                let t = &lo[i.b as usize * width..][..width];
+                let f = &lo[i.c as usize * width..][..width];
+                for (((o, &c), &t), &f) in o.iter_mut().zip(c).zip(t).zip(f) {
+                    let pick = (c & 1).wrapping_neg();
+                    *o = ((t & pick) | (f & !pick)) & m;
                 }
             }
-        };
-        vals[idx] = v & mask;
+        }
     }
 }
 
-/// Word-program evaluations ([`run64`]) charged as one generic node evaluation
+/// Word-program evaluations ([`run_lanes`]) charged as one generic node evaluation
 /// (`Context::eval_node`). On representative reconstructed addresses (44 and 71 nodes, 4,096
-/// points) a word program ran 4 to 38 times as fast as the generic evaluator, about 20 times
-/// typically; this charges the low end.
-const WORD_EVALS: u64 = 8;
+/// points) a word program run point by point was 4 to 38 times as fast as the generic
+/// evaluator, and run a block of points at a time it is about twenty times as fast again
+/// (the same enumerations took a twentieth of the time); this charges the low end of the
+/// two together. Charged at the point-by-point rate, enumerations that take a millisecond
+/// were declined for their cost, and six of 140 measured questions ran out of steps a
+/// third of the way from where they now finish.
+const WORD_EVALS: u64 = 64;
 
 /// The most bits [`exhaustive`] enumerates.
 const EXHAUSTIVE_BITS: u32 = 16;
@@ -893,7 +2210,7 @@ fn sweep_cut(
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
-    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS) {
+    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default()) {
         if let Some(e) = sweep_cut_at(r, cx, cfg, n, c)? {
             return Ok(Some(e));
         }
@@ -931,10 +2248,18 @@ fn drop_noise(
     }
     let mut dropped = false;
     for v in 0..read.vars().len() as u32 {
+        // One input first: a block whose value there changes when the atom is zero reads
+        // the atom, and no certificate proves the drop. (Nearly every atom is read: the
+        // refutation sample of 64 points, built and evaluated for each, was three quarters
+        // of the time spent here.)
+        if reads_var(r, &read, v)? {
+            continue;
+        }
         let Some(m0) = with_constant(&read, v) else {
             continue;
         };
-        if !sampled(r, &read, &m0, read.key()[0])? {
+        let agree = sampled(r, &read, &m0, read.key()[0])?;
+        if !agree {
             continue;
         }
         let report = certify::prove(&read, &m0, &mut Steps::new(r, SWEEP_SHARE))?;
@@ -949,6 +2274,31 @@ fn drop_noise(
     }
     count(r).noise_atoms += 1;
     Ok(Some(r.build(cx, |cx| lift_id(cx, &read, &bindings))?))
+}
+
+/// Whether `m` is seen to read variable `v`: its value at one input (pseudo-random, splitmix64
+/// of each variable's index) differs from its value there with `v` zero. Charged as pass work.
+/// A filter, never evidence: `false` says nothing.
+fn reads_var(r: &mut Runner<'_, '_>, m: &MbaExpr, v: u32) -> Result<bool, Stop> {
+    let Some(&width) = m.vars().get(v as usize) else {
+        return Ok(false);
+    };
+    charge(r, m, m, 1)?;
+    let mut at: Vec<crate::BitVec> = m
+        .vars()
+        .iter()
+        .zip(0u64..)
+        .map(|(&w, i)| {
+            let mut z = i.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            crate::BitVec::wrapping_from_u64(w, z ^ (z >> 31))
+        })
+        .collect();
+    let with = m.eval(&at);
+    at[v as usize] = crate::BitVec::zero(width);
+    let without = m.eval(&at);
+    Ok(matches!((with, without), (Some(a), Some(b)) if a != b))
 }
 
 /// The most atoms [`drop_noise`] reads a block over.
@@ -970,10 +2320,60 @@ fn sweep_cut_at(
         return Ok(None);
     }
     let size = m.nodes().len();
-    if let Some(expr) = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)? {
-        return Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?));
+    // A block that contains one the solver was asked about with the same node cut off, and
+    // ran out of its steps on (or does not take), is not asked about: the inner block is
+    // part of this question as it was asked, and the solver has no more steps for the whole
+    // than it had for the part. The sweep meets a tower of blocks operands first, each a
+    // top of its own chain of sums, and each fragment holds the ones below it whole: a
+    // tower of `k` blocks the solver cannot take was `k` questions of growing size. (Of
+    // 3,404 questions in 140 slow questions, 1,066 held a block declined at the same cut:
+    // asked all the same, none of those was answered; 333 of the others were.)
+    let over = over_declined(r, cx, n, c, &bindings.atoms);
+    if over {
+        r.cut_declined.entry(c).or_default().insert(n, ());
+        return Ok(None);
     }
-    Ok(None)
+    let answer = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)?;
+    match answer {
+        Cut::Proved(expr) => Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?)),
+        Cut::Declined => {
+            r.cut_declined.entry(c).or_default().insert(n, ());
+            Ok(None)
+        }
+        Cut::Open => Ok(None),
+    }
+}
+
+/// Whether the block `n` with `c` cut off (the atoms of its lowering are `atoms`) is, or
+/// holds, a block the solver declined in this call with `c` cut off (`Runner::cut_declined`).
+/// A declined block's root is above its cut, so it is found only inside the fragment: not
+/// below the cut, nor below an atom.
+fn over_declined(r: &Runner<'_, '_>, cx: &Context, n: u32, c: u32, atoms: &[u32]) -> bool {
+    let Some(declined) = r.cut_declined.get(&c) else {
+        return false;
+    };
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        if i == c || atoms.contains(&i) || seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if declined.contains_key(&i) {
+            return true;
+        }
+        stack.extend(cx.node(i).children());
+    }
+    false
+}
+
+/// What [`cut_answer`] has of a noise block.
+enum Cut {
+    /// A smaller equivalent, proved.
+    Proved(MbaExpr),
+    /// The solver did not answer: it ran out of its steps, or does not take the block.
+    Declined,
+    /// An answer that is no smaller or not proved, or no steps left to ask with.
+    Open,
 }
 
 /// `m` with variable `v` replaced by zero.
@@ -1004,47 +2404,75 @@ fn cut_answer(
     size: usize,
     cfg: &MbaConfig,
     steps: u64,
-) -> Result<Option<MbaExpr>, Stop> {
+) -> Result<Cut, Stop> {
     let limit = steps.min(r.meter.left_in(|b| b.mba_steps));
     if limit == 0 {
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     let budget = cfg.budget.with_evidence(false).with_steps(limit);
     let (answer, spent) = r.inner.mba.solver.solve_counted(m, &budget);
     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
     r.meter.charge(Counter::MbaSteps, spent)?;
-    let MbaAnswer::Simplified { expr, .. } = answer else {
-        return Ok(None);
+    let expr = match answer {
+        MbaAnswer::Simplified { expr, .. } => expr,
+        MbaAnswer::Exhausted | MbaAnswer::Unsupported(_) => {
+            return Ok(Cut::Declined);
+        }
+        MbaAnswer::NoSimpler => {
+            return Ok(Cut::Open);
+        }
     };
-    if expr.vars() != m.vars()
-        || expr.width() != m.width()
-        || expr.nodes().len() >= size
-        || !sampled(r, m, &expr, m.key()[0])?
-    {
-        return Ok(None);
+    if expr.vars() != m.vars() || expr.width() != m.width() || expr.nodes().len() >= size {
+        return Ok(Cut::Open);
+    }
+    if !sampled(r, m, &expr, m.key()[0])? {
+        return Ok(Cut::Open);
     }
     let report = certify::prove(m, &expr, &mut Steps::new(r, SWEEP_SHARE))?;
     count(r).certificates.record(&report);
     if report.verdict != Verdict::Proved {
-        return Ok(None);
+        return Ok(Cut::Open);
     }
     count(r).noise_blocks += 1;
-    Ok(Some(expr))
+    Ok(Cut::Proved(expr))
 }
 
 /// the sweep's readings of `subject` asked whether it is `k`: whether one proves it
 /// (`decided`), whether its whole fragment is refuted (`refuted`), and whether some narrower
-/// reading was refuted over its free atoms (a constant only through how its atoms relate).
+/// reading was refuted over its free atoms (a constant only through how its atoms relate) or
+/// the readings were cut short.
+///
+/// A candidate below `subject` whose readings were asked in this call and decided nothing is
+/// an atom to every reading here (`Runner::mba_undecided`). The sweep meets a constant's
+/// operands first, and an obfuscator builds one constant from another: where the lower one
+/// stays open, each node above it that the samples hold constant holds its fragment whole,
+/// and the certificates would spend a share on the same question at every one of them (ten
+/// links of one chain in a measured question, a share each; nine tenths of what the sweeps
+/// of 140 questions spent went to certificates that decided nothing, most of it this way).
+/// What an upper constant is beyond the open one, the readings over it as an atom still
+/// prove; a `subject` that is itself open is not asked again.
+///
+/// The readings are asked cheapest first, and they end at the first whose certificate takes
+/// most of its share and leaves the question open: the ones after it are larger. (Of 22,555
+/// proofs in the sweeps of those questions, six came after such a reading of the same
+/// candidate; half of what the undecided certificates spent did.)
 fn readings_prove(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     cfg: &MbaConfig,
     subject: u32,
     k: &crate::BitVec,
+    share: u64,
 ) -> Result<(bool, bool, bool), Stop> {
     let (mut decided, mut refuted, mut seen) = (false, false, false);
-    let mut readings: Vec<(u64, Option<Reading>, MbaExpr, Bindings)> = Vec::new();
-    let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS);
+    // Each reading with its cost, and whether a refutation of it is one of `subject` (the
+    // whole fragment, no open candidate cut out of it).
+    let mut readings: Vec<(u64, bool, MbaExpr, Bindings)> = Vec::new();
+    let open = &r.mba_undecided;
+    if open.contains_key(&subject) {
+        return Ok((false, false, false));
+    }
+    let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, open);
     let kinds = [Reading::SemiLinear, Reading::Shallow, Reading::Linear];
     let all = std::iter::once(None)
         .chain(kinds.into_iter().map(Some))
@@ -1052,10 +2480,17 @@ fn readings_prove(
             cuts.into_iter()
                 .flat_map(|c| [Some(Reading::Cut(c)), Some(Reading::CutWhole(c))]),
         );
+    // A fragment that is semi-linear as it is has one lowering for the whole and the
+    // semi-linear reading, and one per cut.
+    let mut semi = false;
     for reading in all {
         let lowered = match reading {
-            None => lower_id(cx, subject, &cfg.limits),
-            Some(rd) => lower_id_reading(cx, subject, &cfg.limits, rd),
+            None => lower_id_whole(cx, subject, &cfg.limits, open).map(|(m, bindings, s)| {
+                semi = s;
+                (m, bindings)
+            }),
+            Some(Reading::SemiLinear | Reading::CutWhole(_)) if semi => continue,
+            _ => lower_id_over(cx, subject, &cfg.limits, reading, open),
         };
         let Ok((m, bindings)) = lowered else {
             continue;
@@ -1068,16 +2503,19 @@ fn readings_prove(
             Some(Reading::Linear) => 1u64 << t,
             _ => 64 * ((1u64 << t) - 1),
         };
+        let whole = reading.is_none() && bindings.atoms.iter().all(|a| !open.contains_key(a));
         readings.push((
             points.saturating_mul(m.nodes().len() as u64),
-            reading,
+            whole,
             m,
             bindings,
         ));
     }
+    // Whether a certificate was asked and left the question open.
+    let mut open_asked = false;
     readings.sort_by_key(|(cost, _, _, _)| *cost);
-    'readings: for (cost, reading, m, bindings) in readings {
-        if cost > SWEEP_SHARE {
+    'readings: for (cost, whole, m, bindings) in readings {
+        if cost > share {
             break;
         }
         let mut c = MbaExpr::new(m.vars().to_vec());
@@ -1094,18 +2532,43 @@ fn readings_prove(
         let mut known = false;
         loop {
             count(r).opaque_asked += 1;
-            let report = certify::prove(&m, &c, &mut Steps::new(r, SWEEP_SHARE))?;
+            // With the call's solver steps gone (fewer left than such a certificate's
+            // share), a certificate is charged as pass work, as
+            // the gate's are, within a small share and a part of the call's pass work in
+            // all (see `BORROW_SHARE`): what decides a sum over one value under masks is a
+            // comparison of two forms, a few hundred evaluations.
+            let steps = r.meter.left_in(|b| b.mba_steps);
+            let (report, rest, share) = if steps.saturating_mul(EVALS_PER_STEP) < BORROW_SHARE {
+                let room = (r.meter.limit.pass_work / BORROW_PART).saturating_sub(r.sweep_borrowed);
+                let share = share.min(BORROW_SHARE).min(room);
+                let before = r.meter.spent.pass_work;
+                let mut meter = Gate { r, share };
+                let report = certify::prove(&m, &c, &mut meter);
+                let rest = meter.share;
+                r.sweep_borrowed += r.meter.spent.pass_work - before;
+                (report?, rest, share)
+            } else {
+                let mut meter = Steps::new(r, share);
+                let report = certify::prove(&m, &c, &mut meter)?;
+                (report, meter.share, share)
+            };
+            // The certificate took most of its share and left the question open: the readings
+            // not yet asked are larger, and theirs would too. (Not the same reading asked
+            // again through its atoms' known bits: that is one more question of this
+            // reading, and the next reading has its own.)
+            let burned = !known && rest < share / 2;
             count(r).certificates.record(&report);
             match report.verdict {
                 Verdict::Proved => {
                     decided = true;
                     break 'readings;
                 }
-                Verdict::Refuted if reading.is_none() => {
+                Verdict::Refuted if whole => {
                     refuted = true;
                     break 'readings;
                 }
                 Verdict::Refuted if !known => {
+                    open_asked = true;
                     seen = true;
                     if !cfg.known_atoms {
                         break;
@@ -1119,9 +2582,21 @@ fn readings_prove(
                         None => break,
                     }
                 }
-                _ => break,
+                _ => {
+                    open_asked = true;
+                    if burned {
+                        // What the readings left unasked might have been refuted over their
+                        // free atoms: the root's cases are tried as if one was.
+                        seen = true;
+                        break 'readings;
+                    }
+                    break;
+                }
             }
         }
+    }
+    if !decided && !refuted && open_asked {
+        r.mba_undecided.insert(subject, ());
     }
     Ok((decided, refuted, seen))
 }
@@ -1139,6 +2614,7 @@ fn exactly_two(values: &[crate::BitVec]) -> bool {
 
 /// A varying block proved constant on each side of its most-used condition, reconstructed as a
 /// select of those constants. Sampling only admits a candidate; each side needs exact evidence.
+/// `attempts` counts the blocks whose sides were built.
 fn cases_fold(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1146,14 +2622,60 @@ fn cases_fold(
     n: u32,
     attempts: &mut usize,
 ) -> Result<Option<u32>, Stop> {
-    let Some((c, t, f)) = r.build(cx, |cx| super::context::sides(cx, n))? else {
+    let Some(c) = r.build(cx, |cx| super::context::most_tested(cx, n))? else {
+        return Ok(None);
+    };
+    // The samples first, before a side is built or swept: a side that varies at them is not
+    // proved constant, and its sweep keeps its value (wherever the run's assumptions hold,
+    // so only the samples where they do are read), so it varies after its sweep as before.
+    // (Of 3,404 blocks with a condition in 140 slow questions, 2,658 were swept to find a
+    // side that varied at the samples it began with: five sixths of the time spent here.)
+    //
+    // Before the sides are built, the block's own samples: where `c` holds the first side
+    // is `n`, elsewhere the second is (`context::sides_on`), so a block with two values
+    // where `c` holds, or two where it does not, has a side with both.
+    r.sample(cx, n)?;
+    r.sample(cx, c)?;
+    let points = r.samples[&n].len();
+    let held = held_points(r, cx, points)?;
+    let (vn, vc) = (&r.samples[&n], &r.samples[&c]);
+    let where_c = |holds: bool| -> Vec<bool> {
+        let at = |(held, c): (&bool, &crate::BitVec)| *held && c.is_zero() != holds;
+        held.iter().zip(vc.iter()).map(at).collect()
+    };
+    if varies_at(vn, &where_c(true)) || varies_at(vn, &where_c(false)) {
+        return Ok(None);
+    }
+    let got = r.build(cx, |cx| super::context::sides_on(cx, n, c))?;
+    let Some((t, f)) = got else {
         return Ok(None);
     };
     *attempts += 1;
     let mut sides = [t, f];
+    // Then each side's samples (those where the other case holds too).
+    for side in sides {
+        if cx.const_val(side).is_some() {
+            continue;
+        }
+        r.sample(cx, side)?;
+        if varies_at(&r.samples[&side], &held) {
+            return Ok(None);
+        }
+    }
+    // Each side swept and proved before the other is swept: a first side left unproved
+    // ends the attempt, and the second side's sweep with it (548 of the 654 blocks whose
+    // sides were constant at the samples and not proved ended at the first side, after
+    // both were swept). What proves a side does not read the other's sweep: the nodes below
+    // it are all examined by its own.
     let mut values = [crate::BitVec::zero(cx.width_of(n)); 2];
     for (slot, side) in values.iter_mut().zip(&mut sides) {
-        *side = sweep_inner(r, cx, cfg, *side, false)?;
+        // A side an earlier sweep of this call examined (the side of a block below this
+        // one, where the condition fixes what the two differ in) is that sweep's result:
+        // every node below it was examined before it, and a sweep would only walk them.
+        *side = match r.swept.get(side) {
+            Some(&done) => done,
+            None => sweep_inner(r, cx, cfg, *side, false)?,
+        };
         if let Some(k) = cx.const_val(*side) {
             *slot = k;
             continue;
@@ -1167,9 +2689,8 @@ fn cases_fold(
             return Ok(None);
         }
         *slot = k;
-    }
-    for (side, k) in sides.into_iter().zip(values) {
-        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, &k)?.0 {
+        let proved = readings_prove(r, cx, cfg, *side, &k, SWEEP_SHARE)?.0;
+        if !proved {
             return Ok(None);
         }
     }
@@ -1183,6 +2704,26 @@ fn cases_fold(
     }
     count(r).piecewise_blocks += 1;
     Ok(Some(e))
+}
+
+/// Whether every constraint of the run's assumptions holds, at each of the `points` sample
+/// points (all of them without assumptions): where a rewrite that relies on them keeps a
+/// node's value.
+fn held_points(r: &mut Runner<'_, '_>, cx: &Context, points: usize) -> Result<Vec<bool>, Stop> {
+    use crate::facts::Reliance;
+    let Some(a) = r.assumptions else {
+        return Ok(vec![true; points]);
+    };
+    let all = a.constraints().fold(Reliance::NONE, |rel, (id, _, _)| {
+        rel.union(Reliance::of(id))
+    });
+    r.constraints_hold(cx, all, points)
+}
+
+/// Whether `vals` differ at two of the sample points `at` keeps.
+fn varies_at(vals: &[crate::BitVec], at: &[bool]) -> bool {
+    let mut kept = vals.iter().zip(at).filter(|(_, at)| **at).map(|(v, _)| v);
+    kept.next().is_some_and(|k| kept.any(|v| v != k))
 }
 
 /// whether `n` is `k` one case of a condition at a time: the condition its selects
@@ -1214,7 +2755,7 @@ fn cases_prove(
         }
     }
     for side in [t, f] {
-        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, k)?.0 {
+        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, k, SWEEP_SHARE)?.0 {
             return Ok(false);
         }
     }
@@ -1321,8 +2862,15 @@ fn with_known_bits(
 /// The fewest nodes a block [`sweep_cut`] asks about has.
 const SWEEP_CUT_NODES: usize = 16;
 
-/// The most atoms a block [`sweep_cut`] asks about has.
-const SWEEP_CUT_VARS: usize = 4;
+/// The most atoms a block [`sweep_cut`] asks about has. (With four, the solver was asked
+/// about several hundred more blocks in 140 measured questions and answered none of them.)
+const SWEEP_CUT_VARS: usize = 3;
+
+/// The pass work one certificate of the sweep takes once the call's solver steps are gone
+/// (see [`readings_prove`]), and the part of the call's pass work all of them take: one in
+/// [`BORROW_PART`].
+const BORROW_SHARE: u64 = 1 << 15;
+const BORROW_PART: u64 = 8;
 
 /// The solver steps one [`sweep_cut`] question takes.
 const SWEEP_CUT_STEPS: u64 = 1 << 12;
@@ -1386,14 +2934,34 @@ impl certify::Meter for Steps<'_, '_, '_> {
     }
 }
 
-/// The MBA phase at `n`: a node of the expression, or (`part`) a part of a sum written again
-/// to be asked alone (`linear::by_sums`, `by_groups`).
+/// The MBA phase at `n`.
 pub(super) fn step(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     cfg: &MbaConfig,
     n: u32,
-    part: bool,
+) -> Result<Step, Stop> {
+    step_with(r, cx, cfg, n, false)
+}
+
+/// The MBA phase at `n`, one side of a case split (see `cases::by_cases`): [`step`], asked
+/// also with the values its nodes share through casts cut off (see below). The side reads
+/// what the select's sides were made of, which other nodes read too.
+pub(super) fn step_side(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<Step, Stop> {
+    step_with(r, cx, cfg, n, true)
+}
+
+fn step_with(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    side: bool,
 ) -> Result<Step, Stop> {
     // A solver that takes polynomials is also asked at constant left shifts (the arena spells
     // `2^k·t` as `t << k`).
@@ -1402,142 +2970,582 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let (out, declined) = ask(r, cx, cfg, n, n, part)?;
-    // a fragment that reads slices of one rotated value, asked again with them
-    // written as masks of that rotation (see [`sliced`]); also after a question that was not
-    // asked because no answer could pay, as after its answer.
-    if cfg.noise_forms
-        && let Step::Normal(fin) = &out
-        && (fin.done || declined)
+    let unshrunk = count(r).not_smaller;
+    let held = count(r).unsupported;
+    let out = ask(r, cx, cfg, n, n, None, depth(r))?;
+    // Whether the question was not one the solver answers whole: it holds a fragment kept
+    // as it is (see `holds_kept`), or the solver declined it for its size.
+    let held = count(r).unsupported != held;
+    // An answer that was not smaller for what the fragment shares with others is no answer
+    // either: the readings below keep a shared value as it is.
+    let unshrunk = count(r).not_smaller != unshrunk;
+    if let Step::Normal(fin) = out
+        && (fin.done || unshrunk)
     {
+        // a fragment that reads slices of one rotated value, asked again with them
+        // written as masks of that rotation (see [`sliced`]), within the steps of a retried
+        // question: the answers taken in 140 measured questions took under 9,000 steps, and
+        // without the limit thirteen that took the node's own share left eleven of those
+        // questions out of steps.
         let before = cx.len() as u32;
-        if let Some(root) = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))? {
-            let (again, _) = ask(r, cx, cfg, n, root, part)?;
-            if matches!(again, Step::To(..)) {
-                return Ok(again);
+        // What a question asked another way declines for what the fragment shares
+        // contributes to the result (see the linear pass's `step`). Not where it ran out of
+        // the steps or the certificate share it is given: those are its own by design (see
+        // [`Cap::Steps`]), and its answer within them is what it is.
+        let kept = |fin: Fin, f: Fin| match f.why {
+            None => fin.and(f),
+            Some(_) => fin,
+        };
+        let mut fin = fin;
+        let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
+        if let Some(root) = slices {
+            match ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))? {
+                Step::Normal(f) => fin = kept(fin, f),
+                again => return Ok(again),
+            }
+        }
+        // A fragment too large to lower whole (more variables than a question takes), or one
+        // not answered whole for what it holds, with the arithmetic its bitwise operators
+        // read as atoms (see [`Reading::Shallow`]): a sum of bitwise functions of values that
+        // are sums and products themselves is a linear MBA over those values. An obfuscator
+        // writes `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a`
+        // and a `b` that are products of one value: read whole it is a question about that
+        // value, costly and declined, and every sum that holds it was then not asked at all.
+        // (Asked of every fragment, the answers over atoms took the place of the whole
+        // fragment's and three of 47 measured constants were not found.)
+        if !asks(r, cx, cfg, n)? || held {
+            match ask(
+                r,
+                cx,
+                cfg,
+                n,
+                n,
+                Some(Reading::Shallow),
+                Cap::Steps(CUT_STEPS),
+            )? {
+                Step::Normal(f) => fin = kept(fin, f),
+                again => return Ok(again),
+            }
+        }
+        // And with a value most of its terms read cut off as one atom: an obfuscator writes
+        // `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of its own, and the whole question is
+        // then over what `t` is made of, where the cut one is over `t` alone.
+        for root in slices.into_iter().chain([n]) {
+            let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
+            for c in cuts {
+                match ask(
+                    r,
+                    cx,
+                    cfg,
+                    n,
+                    root,
+                    Some(Reading::Cut(c)),
+                    Cap::Steps(CUT_STEPS),
+                )? {
+                    Step::Normal(f) => fin = kept(fin, f),
+                    again => return Ok(again),
+                }
+            }
+        }
+        // And with a value several of its nodes read through casts too cut off, the casts
+        // kept: `(zext(t) | k) + zext(t & k)` is `zext(t) + k` over `t`, where the whole
+        // question is over what `t` is made of and its answer writes `t` another way. Only
+        // for a fragment whose answer did that, or a side of a case split: asked of every
+        // fragment kept from its question, 140 measured calls took 15% longer.
+        if unshrunk || side {
+            for c in shared_nodes_whole(cx, n, &cfg.limits, CUTS) {
+                match ask(
+                    r,
+                    cx,
+                    cfg,
+                    n,
+                    n,
+                    Some(Reading::CutWhole(c)),
+                    Cap::Steps(CUT_STEPS),
+                )? {
+                    Step::Normal(f) => fin = kept(fin, f),
+                    again => return Ok(again),
+                }
             }
         }
         discard(r, cx, before);
+        return Ok(Step::Normal(fin));
     }
     Ok(out)
 }
 
-/// the slice of one value a rotate or constant shift chain over node `i` is, as
-/// `(base, r, mask)` with `i == rotl(base, r) & mask` at `i`'s width (at most 64 bits): a left
-/// shift by `k` is the rotation by `k` with its low `k` bits cleared, a logical right shift the
-/// rotation by `-k` with its high `k` bits cleared. A node of no such chain is `(i, 0, ones)`.
-fn slice_of(cx: &Context, i: u32) -> (u32, u32, u64) {
-    let w = u32::from(cx.width_of(i).bits());
-    if w > 64 {
-        return (i, 0, u64::MAX);
+/// The MBA phase at `n`, a part of a question written another way (a sum with its common
+/// factor taken out): the node's own question alone, within the steps a retried one takes
+/// (see [`CUT_STEPS`]). What an obfuscator scaled is a small question; what is not takes the
+/// steps the questions after it need.
+pub(super) fn step_part(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<Step, Stop> {
+    let poly = r.inner.mba.solver.polynomial_fragments();
+    let op = cx.node(n).op;
+    if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
+        return Ok(Step::Normal(Fin::FINAL));
     }
-    let ones = u64::MAX >> (64 - w);
+    ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))
+}
+
+/// The steps a question takes at most, besides the call's share (see [`SOLVE_SHARE`]).
+#[derive(Copy, Clone)]
+enum Cap {
+    /// A question asked another way, or a part of one: these steps, and its answer then is
+    /// what it is.
+    Steps(u64),
+    /// A node's own question: these steps in this round, and more in a later one (see
+    /// [`depth`]).
+    Depth(u64),
+}
+
+/// The steps a node's own question takes in this round: [`DEPTH_STEPS`] in the rounds until one
+/// changes nothing, then [`DEPTH_FACTOR`] times as many in each round after one that changed
+/// nothing, up to the question's share of the call (see [`SOLVE_SHARE`]).
+///
+/// The questions that fold an obfuscated value are small ones (of the answers committed in 140
+/// measured calls, 570 of 601 took under 65,536 steps and 395 under 16,384), and the ones the
+/// solver runs out of steps on are found among them in no order. Asked at the full share where
+/// they stand, a few of those took the steps of a call before the rest of it was asked
+/// anything; asked this way, a call spends what it has on the cheapest questions first.
+fn depth(r: &Runner<'_, '_>) -> Cap {
+    let times = DEPTH_FACTOR.checked_pow(u32::from(r.mba_depth));
+    Cap::Depth(times.map_or(u64::MAX, |t| DEPTH_STEPS.saturating_mul(t)))
+}
+
+/// See [`depth`].
+const DEPTH_STEPS: u64 = 1 << 16;
+
+/// See [`depth`].
+const DEPTH_FACTOR: u64 = 8;
+
+/// The most shared values the MBA phase cuts a fragment at, one question each.
+const CUTS: usize = 2;
+
+/// The solver steps one of those questions takes. (At four times this, the questions that
+/// ran out left 140 measured calls twice the nodes; at a quarter, they answered half as many.)
+const CUT_STEPS: u64 = 1 << 14;
+
+/// The share of the call's pass work the certificate of a retried question's answer takes
+/// (see [`GATE_SHARE`]): one in this many.
+const RETRY_GATE_SHARE: u64 = 32;
+
+/// A node as bits of one rotation of another: `(rotl(base, rot) & mask) ^ flip`, at the
+/// node's width (at most 64 bits). Every node built over one value by shifts and rotations by
+/// constants, complements, and `& | ^` with constants or with another such node of the same
+/// rotation of the same value has this shape: each of its bits is 0, 1, a bit of the rotation
+/// or that bit's complement. A left shift by `k` is the rotation by `k` with its low `k` bits
+/// cleared, a logical right shift the rotation by `−k` with its high `k` bits cleared.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct Slice {
+    base: u32,
+    rot: u32,
+    mask: u64,
+    flip: u64,
+}
+
+/// The most operators one [`slice_of`] reads below a node.
+const SLICE_DEPTH: u32 = 48;
+
+/// Node `i` as a [`Slice`]; a node that is no such function of another is its own base, whole
+/// (`rot` 0, every bit, no flip).
+fn slice_of(cx: &Context, i: u32, memo: &mut crate::hash::IdMap<u32, Slice>, depth: u32) -> Slice {
+    let w = u32::from(cx.width_of(i).bits());
+    let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let whole = Slice {
+        base: i,
+        rot: 0,
+        mask: ones,
+        flip: 0,
+    };
+    if w > 64 || depth > SLICE_DEPTH {
+        return whole;
+    }
+    if let Some(&s) = memo.get(&i) {
+        return s;
+    }
     let n = cx.node(i);
-    let k = match n.op {
-        OpCode::RotL | OpCode::Shl | OpCode::LShr if cx.width_of(n.a) == cx.width_of(i) => cx
-            .const_val(n.b)
-            .and_then(|c| c.to_u64())
-            .filter(|&k| k > 0 && k < u64::from(w)),
-        _ => None,
-    };
-    let Some(k) = k else {
-        return (i, 0, ones);
-    };
-    let k = k as u32;
-    let rot = |m: u64, by: u32| match by % w {
+    let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
+    let rotl = |m: u64, by: u32| match by % w {
         0 => m,
         b => (m << b | m >> (w - b)) & ones,
     };
-    let (base, r, m) = slice_of(cx, n.a);
-    match n.op {
-        OpCode::RotL => (base, (r + k) % w, rot(m, k)),
-        OpCode::Shl => (base, (r + k) % w, rot(m, k) & (ones << k & ones)),
-        _ => (base, (r + w - k) % w, rot(m, w - k) & (ones >> k)),
-    }
+    // A shift or rotation count: a constant below the width, of an operand of the same width.
+    let count = |j: u32| {
+        konst(j)
+            .filter(|&k| k > 0 && k < u64::from(w))
+            .map(|k| k as u32)
+    };
+    let same_width = |j: u32| cx.width_of(j) == cx.width_of(i);
+    let s = match n.op {
+        OpCode::Not => {
+            let a = slice_of(cx, n.a, memo, depth + 1);
+            Slice {
+                flip: !a.flip & ones,
+                ..a
+            }
+        }
+        OpCode::And | OpCode::Or | OpCode::Xor => {
+            let (x, k) = match (konst(n.a), konst(n.b)) {
+                (None, Some(k)) => (n.a, Some(k)),
+                (Some(k), None) => (n.b, Some(k)),
+                _ => (n.a, None),
+            };
+            let a = slice_of(cx, x, memo, depth + 1);
+            // The other operand at each bit of the rotation: a constant's bit either way, or
+            // another slice of the same rotation.
+            let other = match k {
+                Some(k) => Some((0, k)),
+                None if konst(n.a).is_none() => {
+                    let b = slice_of(cx, n.b, memo, depth + 1);
+                    (b.base == a.base && b.rot == a.rot).then_some((b.mask, b.flip))
+                }
+                None => None,
+            };
+            match other {
+                Some((mb, fb)) => {
+                    let op = |p: u64, q: u64| match n.op {
+                        OpCode::And => p & q,
+                        OpCode::Or => p | q,
+                        _ => p ^ q,
+                    };
+                    // The value where the rotation's bit is 0, and where it is 1.
+                    let at0 = op(a.flip, fb);
+                    let at1 = op(a.flip ^ a.mask, fb ^ mb);
+                    Slice {
+                        mask: (at0 ^ at1) & ones,
+                        flip: at0 & ones,
+                        ..a
+                    }
+                }
+                None => whole,
+            }
+        }
+        OpCode::Shl if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + k) % w,
+                    mask: a.mask << k & ones,
+                    flip: a.flip << k & ones,
+                }
+            }
+            None => whole,
+        },
+        OpCode::LShr if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + w - k) % w,
+                    mask: a.mask >> k,
+                    flip: a.flip >> k,
+                }
+            }
+            None => whole,
+        },
+        OpCode::RotL | OpCode::RotR if same_width(n.a) => match count(n.b) {
+            Some(k) => {
+                let k = if n.op == OpCode::RotL { k } else { w - k };
+                let a = slice_of(cx, n.a, memo, depth + 1);
+                Slice {
+                    base: a.base,
+                    rot: (a.rot + k) % w,
+                    mask: rotl(a.mask, k),
+                    flip: rotl(a.flip, k),
+                }
+            }
+            None => whole,
+        },
+        _ => whole,
+    };
+    memo.insert(i, s);
+    s
 }
 
-/// node `n`'s fragment (its MBA operators, down to their atoms) with each rotate
-/// or constant shift that cuts the same rotation of one value written as a mask of that
-/// rotation. `rotl(x, 32) >>u 30`, `rotl(x, 32) << 34` and `rotl(x, 2)` are the low 34 bits,
-/// the high 30 bits and the whole of `rotl(x, 2)`, but three unrelated atoms to the solver:
-/// obfuscators can write a rotate as such shifts beside the rotate itself in MBAs that cancel.
-/// `None` when no two slices are of one rotation of one value, or past `max_nodes`.
+/// node `n`'s fragment (its MBA operators, down to their atoms) with every part that reads
+/// one rotation of one value written over that rotation: `(rotl(x, r) & mask) ^ flip` (see
+/// [`Slice`]). `rotl(x, 32) >>u 30`, `rotl(x, 32) << 34` and `rotl(x, 2)` are the low 34
+/// bits, the high 30 bits and the whole of `rotl(x, 2)`, but three unrelated atoms to the
+/// solver: obfuscators write a rotate as such shifts beside the rotate itself in MBAs that
+/// cancel, and mask and complement the halves before they shift them.
+///
+/// A part whose low `k` bits are clear is also that many bits lower of the rotation by `k`
+/// less, shifted up (`rotl(x, 9) & 0x…42` is `(rotl(x, 8) & 0x…21) << 1`), and a product by a
+/// constant with low zero bits is its operand shifted up times the rest
+/// (`(x & m) · (c · 2^k)` is `((x & m) << k) · c`). Each part is read at the rotation the
+/// most parts of the fragment can be read at, so a term an obfuscator doubled, or a pass
+/// wrote as a shift, stays a multiple of the atom the other terms read.
+///
+/// `None` when no two parts read one rotation of one value, when the fragment is written
+/// that way already, or past `max_nodes`.
 fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate::Error> {
     use crate::ops::BinOp;
-    let mut groups: std::collections::BTreeMap<(u32, u32), Vec<(u32, u64)>> =
+    /// One part of the fragment: the node; the slice its operand is (the node's own, for a
+    /// part that is no product); and for a product, its constant.
+    struct Part {
+        node: u32,
+        slice: Slice,
+        factor: Option<u64>,
+    }
+    let mut memo: crate::hash::IdMap<u32, Slice> = crate::hash::IdMap::default();
+    let mut parts: Vec<Part> = Vec::new();
+    // How many parts can be read at each rotation of each value.
+    let mut readers: std::collections::BTreeMap<(u32, u32), u32> =
         std::collections::BTreeMap::new();
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     let mut stack = vec![n];
     while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() {
+        if seen.insert(i, ()).is_some() || cx.const_val(i).is_some() {
             continue;
         }
         if seen.len() as u32 > max_nodes {
             return Ok(None);
         }
         let node = cx.node(i);
-        if matches!(node.op, OpCode::RotL | OpCode::Shl | OpCode::LShr) {
-            let (base, r, mask) = slice_of(cx, i);
-            if base != i {
-                groups.entry((base, r)).or_default().push((i, mask));
+        let slice = slice_of(cx, i, &mut memo, 0);
+        if slice.base != i {
+            if slice.mask | slice.flip != 0 {
+                parts.push(Part {
+                    node: i,
+                    slice,
+                    factor: None,
+                });
             }
-        } else if mixed_op(node.op) {
+            // What the part is a slice of is read too: a value of the fragment's own
+            // (`(a & b) ^ k`, over two slices of another value) has parts below it.
+            stack.push(slice.base);
+            continue;
+        }
+        // Read as it is: one reader of itself, unrotated.
+        *readers.entry((i, 0)).or_default() += 1;
+        if mixed_op(node.op) {
+            if node.op == OpCode::Mul && cx.width_of(i).bits() <= 64 {
+                let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
+                let product = match (konst(node.a), konst(node.b)) {
+                    (None, Some(c)) => Some((node.a, c)),
+                    (Some(c), None) => Some((node.b, c)),
+                    _ => None,
+                };
+                if let Some((x, c)) = product
+                    && c != 0
+                    && c & 1 == 0
+                {
+                    parts.push(Part {
+                        node: i,
+                        slice: slice_of(cx, x, &mut memo, 0),
+                        factor: Some(c),
+                    });
+                }
+            }
             stack.extend(node.children());
         }
     }
-    let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
-    for ((base, r), slices) in groups.into_iter().filter(|(_, s)| s.len() >= 2) {
-        let w = cx.width_of(base).bits();
-        let ones = u64::MAX >> (64 - u32::from(w));
-        let whole = if r == 0 {
-            base
-        } else {
-            let k = cx.mk_const_u64(w, u64::from(r))?;
-            cx.c_bin(BinOp::RotL, base, k)?
-        };
-        for (i, mask) in slices {
-            let v = if mask == ones {
-                whole
-            } else {
-                let k = cx.mk_const_u64(w, mask)?;
-                cx.c_bin(BinOp::And, whole, k)?
-            };
-            repl.insert(i, v);
+    // The readings of a part: the slice at each rotation it can be read at, with the shift
+    // that makes the part of it (a product's operand shifted up by `k` of its constant's low
+    // zero bits, the rest of the constant a factor; any other part's slice `k` bits lower,
+    // shifted up).
+    let readings = |cx: &Context, p: &Part| -> Vec<(Slice, u32)> {
+        let w = u32::from(cx.width_of(p.node).bits());
+        let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let s = p.slice;
+        match p.factor {
+            Some(c) => (0..=c.trailing_zeros().min(w - 1))
+                .map(|k| {
+                    let up = Slice {
+                        rot: (s.rot + k) % w,
+                        mask: s.mask << k & ones,
+                        flip: s.flip << k & ones,
+                        ..s
+                    };
+                    (up, k)
+                })
+                .filter(|(up, _)| up.mask | up.flip != 0)
+                .collect(),
+            None => (0..=(s.mask | s.flip).trailing_zeros().min(w - 1))
+                .map(|k| {
+                    let down = Slice {
+                        rot: (s.rot + w - k) % w,
+                        mask: s.mask >> k,
+                        flip: s.flip >> k,
+                        ..s
+                    };
+                    (down, k)
+                })
+                .collect(),
+        }
+    };
+    for p in &parts {
+        for (s, _) in readings(cx, p) {
+            *readers.entry((s.base, s.rot)).or_default() += 1;
         }
     }
-    if repl.is_empty() {
+    // A slice as a node over its rotation.
+    let over = |cx: &mut Context, s: &Slice| -> Result<u32, crate::Error> {
+        let w = cx.width_of(s.base).bits();
+        let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let mut v = match s.rot {
+            0 => s.base,
+            r => {
+                let k = cx.mk_const_u64(w, u64::from(r))?;
+                cx.c_bin(BinOp::RotL, s.base, k)?
+            }
+        };
+        if s.mask != ones {
+            let k = cx.mk_const_u64(w, s.mask)?;
+            v = cx.c_bin(BinOp::And, v, k)?;
+        }
+        if s.flip != 0 {
+            let k = cx.mk_const_u64(w, s.flip)?;
+            v = cx.c_bin(BinOp::Xor, v, k)?;
+        }
+        Ok(v)
+    };
+    let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+    // Whether some part is read through a shift or a rotation (else the fragment reads its
+    // values as they are, and there is nothing to relate).
+    let mut moved = false;
+    for p in &parts {
+        // The rotation the most parts read, the part's own first among equals.
+        let best = readings(cx, p)
+            .into_iter()
+            .map(|(s, k)| (readers.get(&(s.base, s.rot)).copied().unwrap_or(0), s, k))
+            .filter(|(votes, _, _)| *votes >= 2)
+            .min_by_key(|(votes, _, k)| (u32::MAX - votes, *k));
+        let Some((_, s, k)) = best else {
+            continue;
+        };
+        if p.factor.is_some() && k == 0 {
+            continue;
+        }
+        let w = cx.width_of(p.node).bits();
+        let x = over(cx, &s)?;
+        let v = match p.factor {
+            Some(c) => {
+                let rest = cx.mk_const_u64(w, c >> k)?;
+                cx.c_bin(BinOp::Mul, x, rest)?
+            }
+            None if k == 0 => x,
+            None => {
+                let by = cx.mk_const_u64(w, u64::from(k))?;
+                cx.c_bin(BinOp::Shl, x, by)?
+            }
+        };
+        moved |= s.rot != 0 || k != 0;
+        if v != p.node {
+            repl.insert(p.node, v);
+        }
+    }
+    if repl.is_empty() || !moved {
         return Ok(None);
     }
-    Ok(Some(cx.substitute_ids(&[n], &repl)?[0]))
+    let root = cx.substitute_ids(&[n], &repl)?[0];
+    Ok((root != n).then_some(root))
 }
 
+/// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
+/// this call and kept as it is (`Runner::mba_kept`): the solver declined it for its size (too
+/// many atoms, variables or bit classes), or its answer would not have made the DAG smaller,
+/// or the gate could not prove it. The larger fragment is then not asked. It has as many
+/// atoms as the one inside it; the solver would pay for the inner fragment's normal form
+/// again, at a cost that grows with the fragment; and what kept the inner answer back (its
+/// nodes are shared, its normal form is as large, no certificate decides it) keeps back an
+/// answer that holds it. An obfuscated value read by a chain of operations asks once at the
+/// first of them where it asked at every one (27 questions of 820 nodes in one measured
+/// question, 310,000 steps each, half the run's steps), and so do fragments that share a core
+/// whose answer was no smaller (five of 110 to 197 nodes in another, 2.5 million steps and no
+/// rewrite). `root` itself is asked again: the call remembers its answer, and what kept it
+/// back may be gone in a later round.
+///
+/// One whose question ran out of steps at this round's depth (`Runner::mba_shallow`) keeps the
+/// larger fragment back for the round only: [`Kept::Shallow`], where nothing below is kept
+/// for the call.
+fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> Option<Kept> {
+    if r.mba_kept.is_empty() && r.mba_shallow.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    for &a in &bindings.atoms {
+        seen.insert(a, ());
+    }
+    let mut stack: Vec<u32> = cx.node(root).children().collect();
+    while let Some(i) = stack.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if r.mba_kept.contains_key(&i) {
+            return Some(Kept::Whole);
+        }
+        if r.mba_shallow.contains_key(&i) {
+            found = Some(Kept::Shallow);
+        }
+        stack.extend(cx.node(i).children());
+    }
+    found
+}
+
+/// What [`holds_kept`] found below a fragment's root.
+enum Kept {
+    /// A fragment kept as it is for the call.
+    Whole,
+    /// One whose question a deeper round asks again.
+    Shallow,
+}
+
+/// One question to the solver takes at most this fraction of the call's solver steps (and at
+/// least [`SOLVE_SHARE_MIN`]). The solver's own limit is a million steps whatever the call
+/// has, so in a call of two million one question that ran out took half of them, a fragment
+/// holding it took the other half, and the rounds after had none. Of the answers committed
+/// in 140 measured questions none took more than a quarter of its call's steps; 26 questions
+/// that took more than that ended with nothing (out of steps, not smaller, or unproved).
+const SOLVE_SHARE: u64 = 4;
+
+/// See [`SOLVE_SHARE`].
+const SOLVE_SHARE_MIN: u64 = 1 << 16;
+
+/// The part of a call's solver steps the MBA phase's questions leave to the sweep that runs
+/// after the round: one in this many. What a round leaves is often a sum the sweep's
+/// certificates decide in a few hundred steps (one value under masks, the constant it adds up
+/// to), where the solver's last questions of the round had taken every step: a call asked
+/// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
+const SWEEP_RESERVE: u64 = 16;
+
+/// The solver steps from which a fragment with no simpler form is kept from the questions
+/// above it (see [`holds_kept`]).
+const KEPT_STEPS: u64 = 1 << 12;
+
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
-/// the answer replaces `n`. Also whether the question was not put because no answer to it
-/// could be committed (see `pass::cannot_pay`).
+/// the answer replaces `n`.
 fn ask(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     cfg: &MbaConfig,
     n: u32,
     root: u32,
-    part: bool,
-) -> Result<(Step, bool), Stop> {
-    let mut declined = false;
-    let out = ask_inner(r, cx, cfg, n, root, part, &mut declined)?;
-    Ok((out, declined))
-}
-
-fn ask_inner(
-    r: &mut Runner<'_, '_>,
-    cx: &mut Context,
-    cfg: &MbaConfig,
-    n: u32,
-    root: u32,
-    part: bool,
-    declined: &mut bool,
+    reading: Option<Reading>,
+    cap: Cap,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
-    let (m, bindings) = match lower_id(cx, root, &cfg.limits) {
+    // The whole fragment, or a narrower reading of it: semi-linear with a node cut off as
+    // an atom (and an operand that is the atom less a constant written over it, see
+    // `lower_id_over`), or with the arithmetic under its bitwise operators atoms.
+    let lowered = match reading {
+        None => lower_id(cx, root, &cfg.limits),
+        Some(_) => lower_id_over(
+            cx,
+            root,
+            &cfg.limits,
+            reading,
+            &crate::hash::IdMap::default(),
+        ),
+    };
+    let (m, bindings) = match lowered {
         Ok(x) => x,
         Err(why) => {
             count(r).refused(&why);
@@ -1562,6 +3570,26 @@ fn ask_inner(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
+    // (Not the reading over atoms where it is another question than the whole fragment's: it
+    // is asked where that one is not, within the steps of a retried question, and what made
+    // the fragment it holds costly is arithmetic this reading does not look into.)
+    let kept = match reading {
+        Some(Reading::Shallow) if crate::mba::cuts(cx, &bindings) => None,
+        _ => holds_kept(r, cx, root, &bindings),
+    };
+    match kept {
+        Some(Kept::Whole) => {
+            count(r).unsupported += 1;
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+        // No smaller a question than the one inside it that ran out of steps at this round's
+        // depth: asked when that one has been.
+        Some(Kept::Shallow) => {
+            r.mba_deeper = true;
+            return Ok(Step::Normal(Fin::PROVISIONAL));
+        }
+        None => {}
+    }
     let inner = r.inner;
     let prover_id = inner.mba.prover.as_ref().map_or("", |p| p.id());
     // The question's content hash, once (it hashes every node).
@@ -1607,40 +3635,37 @@ fn ask_inner(
                     a
                 }
                 None => {
-                    // A question no answer to which could be committed is not asked (see
-                    // `cannot_pay`; of the questions limb arithmetic asks, half).
-                    let cannot = if ask_all() {
-                        None
-                    } else {
-                        // A part of a sum written again is no node of the expression: what
-                        // replacing it frees is counted among candidates built and discarded
-                        // (an answer refused for one part changes the count for the next), so
-                        // there the rule stays as narrow as it was. An answer taken on a
-                        // solver's word or on samples need be no identity over the atoms.
-                        let (most, free) = pay_rule();
-                        super::cannot_pay(
-                            r,
-                            cx,
-                            n,
-                            &bindings.atoms,
-                            if part { most.min(2) } else { most },
-                            free && !part
-                                && root == n
-                                && !cfg.trust.backend_certificates
-                                && !cfg.trust.sampled,
-                        )?
-                    };
-                    if let Some(fin) = cannot {
-                        count(r).not_smaller += 1;
-                        *declined = true;
-                        return Ok(Step::Normal(fin));
-                    }
                     // The solver works within its own limit and what is left of the run's
                     // account of its steps, and is charged the steps it spent. With nothing
                     // left the question is not asked: over budget, so not final.
-                    let limit = cfg.budget.steps.min(r.meter.left_in(|b| b.mba_steps));
-                    if limit == 0 {
+                    //
+                    // One question takes at most a share of the call's steps (see
+                    // `SOLVE_SHARE`), and one the solver ran out of steps on is not asked
+                    // again in this call with no more of them: the answer is the same.
+                    let share = (r.meter.limit.mba_steps / SOLVE_SHARE).max(SOLVE_SHARE_MIN);
+                    let full = cfg.budget.steps.min(share);
+                    let (steps, deepens) = match cap {
+                        Cap::Steps(s) => (s, false),
+                        Cap::Depth(s) => (s, s < full),
+                    };
+                    // (Where a sweep runs after the round, the phase leaves it a part of
+                    // the call's steps, see `SWEEP_RESERVE`.)
+                    let reserve = match cfg.opaque_sweep || cfg.noise_forms || cfg.known_atoms {
+                        true => r.meter.limit.mba_steps / SWEEP_RESERVE,
+                        false => 0,
+                    };
+                    let left = r.meter.left_in(|b| b.mba_steps).saturating_sub(reserve);
+                    let limit = full.min(steps).min(left);
+                    // Whether a deeper round asks this question with more steps than it has
+                    // here: running out of these is not the call's budget running out.
+                    let shallow = deepens && limit == steps;
+                    if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
+                        if shallow {
+                            r.mba_shallow.insert(root, ());
+                            r.mba_deeper = true;
+                            return Ok(Step::Normal(Fin::PROVISIONAL));
+                        }
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
                     r.meter.charge(Counter::MbaCalls, 1)?;
@@ -1654,16 +3679,34 @@ fn ask_inner(
                     let (a, spent) = inner.mba.solver.solve_counted(&m, &budget);
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
                     r.meter.charge(Counter::MbaSteps, spent)?;
+                    if a == MbaAnswer::Exhausted {
+                        r.mba_exhausted.insert(key, limit);
+                        if shallow {
+                            count(r).exhausted += 1;
+                            r.mba_shallow.insert(root, ());
+                            r.mba_deeper = true;
+                            return Ok(Step::Normal(Fin::PROVISIONAL));
+                        }
+                        // A fragment that holds this one is no smaller a question.
+                        r.mba_kept.insert(root, ());
+                    }
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
                         // Run short within what the account left it: more budget might
                         // decide.
                         count(r).exhausted += 1;
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
-                    // (Also one that ran short of the solver's whole limit for a question:
-                    // asked again in this call, in the next round or at another node, it
-                    // would run as long and run short again.)
-                    r.mba_answers.insert(key, a.clone());
+                    if a != MbaAnswer::Exhausted {
+                        r.mba_answers.insert(key, a.clone());
+                    }
+                    let kept = match &a {
+                        MbaAnswer::Unsupported(why) => why.starts_with("too many"),
+                        MbaAnswer::NoSimpler => spent >= KEPT_STEPS,
+                        _ => false,
+                    };
+                    if kept {
+                        r.mba_kept.insert(root, ());
+                    }
                     a
                 }
             };
@@ -1673,17 +3716,8 @@ fn ask_inner(
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    // Always: a cheap refutation check (of the question and its answer:
-                    // made once for a question of the call).
-                    let agreed = match r.mba_agreed.get(&key) {
-                        Some(&agreed) => agreed,
-                        None => {
-                            let agreed = sampled(r, &m, &expr, mk[0])?;
-                            r.mba_agreed.insert(key, agreed);
-                            agreed
-                        }
-                    };
-                    if !agreed {
+                    // Always: a cheap refutation check.
+                    if !sampled(r, &m, &expr, mk[0])? {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
@@ -1695,24 +3729,28 @@ fn ask_inner(
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
+                        r.mba_kept.insert(root, ());
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
                         discard(r, cx, before);
                         return Ok(Step::Normal(fin));
                     }
-                    // An answer the gate proved earlier in this call, which the commit rule
-                    // then refused: the same answer, proved as it was (as a host's cache
-                    // would have it).
-                    if let Some(&vouched) = r.mba_proved.get(&key) {
-                        evidence = vouched;
-                    } else {
-                        let (own, stable) = exact(r, &m, &expr)?;
-                        if own.verdict == Verdict::Refuted {
-                            count(r).refuted += 1;
-                            discard(r, cx, before);
-                            return Ok(Step::Normal(Fin::FINAL));
-                        }
-                        let by = if own.verdict == Verdict::Proved {
+                    // A question asked again another way (slices, a cut) proves its answer
+                    // within a smaller share: the node's own question had the large one, and
+                    // two retries that each took half the call's pass work left the root as
+                    // it was (eleven of 140 measured questions).
+                    let part = match reading.is_some() || root != n {
+                        true => RETRY_GATE_SHARE,
+                        false => GATE_SHARE,
+                    };
+                    let own = exact(r, &m, &expr, part)?;
+                    if own.verdict == Verdict::Refuted {
+                        count(r).refuted += 1;
+                        discard(r, cx, before);
+                        return Ok(Step::Normal(Fin::FINAL));
+                    }
+                    let by =
+                        if own.verdict == Verdict::Proved {
                             Some("certificate")
                         } else if inner.mba.prover.as_ref().is_some_and(|p| {
                             p.prove_equal(&m, &expr, &cfg.budget) == Verdict::Proved
@@ -1725,26 +3763,27 @@ fn ask_inner(
                         } else {
                             None
                         };
-                        let Some(by) = by else {
-                            count(r).proof_unknown += 1;
-                            discard(r, cx, before);
-                            // A certificate skipped for lack of budget might decide with
-                            // more: not final. One that ran within its share is the same
-                            // under any budget.
-                            let fin = if own.over_budget && !stable {
-                                Fin::capped(Exhausted::PassWork)
-                            } else {
-                                r.mba_unproved.insert(key, ());
-                                Fin::FINAL
-                            };
-                            return Ok(Step::Normal(fin));
-                        };
+                    let proved = by.is_some();
+                    if let Some(by) = by {
                         let test = own
                             .cert
                             .filter(|_| by == "certificate")
                             .map(crate::mba::certify::Cert::name);
                         evidence = (by, test, own.points);
-                        r.mba_proved.insert(key, evidence);
+                    }
+                    if !proved {
+                        count(r).proof_unknown += 1;
+                        discard(r, cx, before);
+                        // A certificate skipped for lack of budget might decide with more:
+                        // not final.
+                        let fin = if own.over_budget {
+                            Fin::capped(Exhausted::PassWork)
+                        } else {
+                            r.mba_unproved.insert(key, ());
+                            r.mba_kept.insert(root, ());
+                            Fin::FINAL
+                        };
+                        return Ok(Step::Normal(fin));
                     }
                     inner
                         .mba
@@ -1806,6 +3845,7 @@ fn ask_inner(
         count(r).simplified += 1;
     } else if e != n {
         count(r).not_smaller += 1;
+        r.mba_kept.insert(root, ());
     }
     Ok(out)
 }

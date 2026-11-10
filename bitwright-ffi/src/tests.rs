@@ -615,7 +615,7 @@ fn runs_with_budgets_and_assumptions() {
         assert_eq!(bw_assume(a, cx.0, small, true, null_mut()), BW_OK);
         let b = bw_budget_default();
         assert_eq!(b.mba_calls, 1 << 12);
-        assert_eq!(b.mba_steps, 1 << 25);
+        assert_eq!(b.mba_steps, 1 << 24);
         assert_eq!(
             bw_engine_run(engine, cx.0, roots.as_ptr(), 3, &b, a, outs.as_mut_ptr()),
             BW_OK
@@ -1324,7 +1324,7 @@ fn proofs_synthesis_memory_lifting_and_transformations() {
         BW_OK
     );
     assert_eq!(unsafe { CStr::from_ptr(name) }.to_str().unwrap(), "rax");
-    assert_eq!(cx.print(out), "rdi + rdi");
+    assert_eq!(cx.print(out), "rdi << 1");
     assert_ne!(
         unsafe { bw_lifted_get(l, 1, 5, null_mut(), null_mut(), null_mut()) },
         BW_OK

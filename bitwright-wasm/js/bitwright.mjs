@@ -257,7 +257,7 @@ export async function instantiate(bytes) {
     // names). Options: `deobfuscate` (default true), `assume`, a list of 1-bit predicates, and
     // `phases`, a list of phase names to run instead of a built-in strategy (`fact_fold`,
     // `local`, `linear`, `xor`, `casts`, `division`, `invert`, `compares`, `bitwise`, `carries`,
-    // `linear_mba`, `shuffle`, `demanded`, `mba`).
+    // `linear_mba`, `shuffle`, `demanded`, `words`, `mba`).
     // `rules` is a `.bwr` program of your own linked after the built-in rules: checked by the
     // soundness checker first (an unsound rule is an error), or with `trusted: true` linked
     // without checking, every application sampled.

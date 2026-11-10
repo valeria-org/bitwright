@@ -18,6 +18,7 @@ mod sampling;
 mod sat_families;
 mod scoped_facts;
 mod sums;
+mod sweeping;
 
 #[test]
 fn preparation_stats_include_propagation_and_zero_work_preserves_them() {
@@ -484,6 +485,37 @@ fn proofs_and_refutations() {
     let m = satisfy(&mut cx, q, &cfg).unwrap().unwrap().unwrap();
     let env = crate::FnEnv(|k: &SymbolKey, _| m.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v));
     assert_eq!(cx.eval(&[q], &env).unwrap()[0], BitVec::from_bool(true));
+}
+
+/// A counterexample gives every symbol of the question a value, once, the ones the question
+/// as simplified no longer reads included, and is checked against all of them. (Each of those
+/// was a search of a list per symbol: a question of 64 000 symbols that simplification had
+/// already decided took 12 s to answer.)
+#[test]
+fn a_counterexample_lists_every_symbol_once() {
+    let mut cx = Context::new();
+    let w = Width::W8;
+    let n = 4000;
+    let mut e = cx.symbol("s0", w).unwrap();
+    for i in 1..n {
+        let s = cx.symbol(format!("s{i}").as_str(), w).unwrap();
+        e = cx.bin(BinOp::Add, e, s).unwrap();
+    }
+    let one = cx.one(w).unwrap();
+    let other = cx.bin(BinOp::Add, e, one).unwrap();
+    for simplify in [true, false] {
+        let cfg = Config {
+            simplify,
+            ..Config::default()
+        };
+        let Outcome::Refuted(model) = equal(&mut cx, e, other, &cfg).unwrap() else {
+            panic!("not refuted (simplify: {simplify})");
+        };
+        let mut keys: Vec<&SymbolKey> = model.iter().map(|m| &m.0).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!((model.len(), keys.len()), (n, n), "simplify: {simplify}");
+    }
 }
 
 /// Evaluates `e`'s circuit on 64 assignments of `syms` at once (bit `j` of each symbol's word

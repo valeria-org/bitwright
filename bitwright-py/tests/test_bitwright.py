@@ -208,7 +208,7 @@ def test_engines_budgets_and_outcomes(cx):
     assert engine.run([]) == []
     b = bw.Budget(mba_calls=None, rewrites=10)
     assert b.mba_calls is None and b.rewrites == 10 and b.node_visits == 1 << 22
-    assert b.mba_steps == 1 << 25 and bw.Budget(mba_steps=5).mba_steps == 5
+    assert b.mba_steps == 1 << 24 and bw.Budget(mba_steps=5).mba_steps == 5
     assert bw.Budget.unlimited().node_visits is None
     with pytest.raises(TypeError):
         bw.Budget(node_vists=1)  # type: ignore[call-arg]
@@ -598,10 +598,10 @@ def test_lifting(cx):
     assert rax is not None and str(rax.simplify()) == "rdi + rsi"
     p = bw.lift_pcode(cx, "(register, RAX, 8) = INT_MULT (register, RDI, 8) , (const, 0x2, 8)")
     rax = p.register("RAX")
-    assert rax is not None and str(rax.simplify()) == "RDI + RDI"
+    assert rax is not None and str(rax.simplify()) == "RDI << 1"
     ll = bw.lift_llvm(cx, "define i32 @f(i32 %a) {\n  %r = shl i32 %a, 1\n  ret i32 %r\n}\n")
     ret = ll.register("ret")
-    assert ret is not None and str(ret.simplify()) == "a + a"
+    assert ret is not None and str(ret.simplify()) == "a << 1"
 
 
 def test_transformations():

@@ -23,6 +23,11 @@
 //! their minimum form. So masking that cancels over more atoms comes apart:
 //! `((a ^ m) & (b ^ n)) ^ ((a ^ m) & n) ^ (m & (b ^ n)) ^ (m & n)` is `a & b`. Constants are
 //! atoms there, so a node of more than three atoms is read by classes first.
+//!
+//! *Chains.* A chain of `&` or of `|` over three operands or more is written with its operands
+//! in the context's order, each once ([`sort_chain`](super::sort_chain)): one node however it
+//! was parenthesized and ordered, also over more atoms than a table reads, so
+//! `(a & b & … & g) ^ (g & … & b & a)` is 0. An operand beside its complement decides the chain.
 
 use std::sync::OnceLock;
 
@@ -898,6 +903,109 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
     finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
 }
 
+/// The most nodes a one-atom region walks.
+const ONE_ATOM_REGION: usize = 64;
+
+/// The bitwise pass at `n` for a function of one atom and any constants: `(x & a) ^ b`, when
+/// that is smaller. Each bit of such a function is 0, 1, the atom's bit or its complement,
+/// whatever the constants are, so its value at 0 (`b`) and where that differs from its value
+/// at all-ones (`a`) say what it is; the classes of [`masked`] (at most [`MAX_MASKS`]
+/// constants, two tables) are not needed.
+fn one_atom_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let w = cx.width_of(n);
+    // The region, operands first; its one atom and its constants.
+    let mut order: Vec<u32> = Vec::new();
+    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    let (mut atom, mut consts, mut ops) = (None, Vec::new(), 0u32);
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            order.push(i);
+            continue;
+        }
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if seen.len() > ONE_ATOM_REGION {
+            r.meter.charge(Counter::PassWork, seen.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        }
+        let node = cx.node(i);
+        if bitwise_op(node.op) {
+            ops += 1;
+            stack.push((i, true));
+            stack.extend(node.children().map(|c| (c, false)));
+        } else if cx.const_val(i).is_some() {
+            consts.push(i);
+        } else if atom.is_some_and(|a| a != i) {
+            r.meter.charge(Counter::PassWork, seen.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        } else {
+            atom = Some(i);
+        }
+    }
+    r.meter.charge(Counter::PassWork, 2 * seen.len() as u64)?;
+    let Some(x) = atom else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    // The function at `x = v`.
+    let at = |v: BitVec| -> BitVec {
+        let mut vals: crate::hash::IdMap<u32, BitVec> = crate::hash::IdMap::default();
+        vals.insert(x, v);
+        for &c in &consts {
+            vals.insert(c, cx.const_val(c).unwrap_or(BitVec::zero(w)));
+        }
+        for &i in &order {
+            let node = cx.node(i);
+            let v = match node.op {
+                OpCode::Not => BitVec::un_unchecked(UnOp::Not, &vals[&node.a]),
+                OpCode::And => BitVec::bin_unchecked(BinOp::And, &vals[&node.a], &vals[&node.b]),
+                OpCode::Or => BitVec::bin_unchecked(BinOp::Or, &vals[&node.a], &vals[&node.b]),
+                _ => BitVec::bin_unchecked(BinOp::Xor, &vals[&node.a], &vals[&node.b]),
+            };
+            vals.insert(i, v);
+        }
+        vals[&n]
+    };
+    let b = at(BitVec::zero(w));
+    let a = BitVec::bin_unchecked(BinOp::Xor, &b, &at(BitVec::ones(w)));
+    // The nodes the form adds: a constant alone, else `& a` unless every bit follows the
+    // atom, and `^ b` (`~` for all ones) unless no bit is flipped or set.
+    let is_old = |v: &BitVec| consts.iter().any(|&c| cx.const_val(c).as_ref() == Some(v));
+    let estimate = if a.is_zero() {
+        1
+    } else {
+        let masked = if a.is_ones() {
+            0
+        } else {
+            1 + u32::from(!is_old(&a))
+        };
+        let flipped = match (b.is_zero(), b.is_ones()) {
+            (true, _) => 0,
+            (_, true) => 1,
+            _ => 1 + u32::from(!is_old(&b)),
+        };
+        masked + flipped
+    };
+    if estimate >= ops {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut bounds = vec![x];
+    bounds.extend(&consts);
+    if let Some(f) = worth_building(r, cx, n, &bounds, estimate)? {
+        r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
+        return Ok(Step::Normal(Fin::FINAL.and(f)));
+    }
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| {
+        let ka = cx.mk_const(&a)?;
+        let kb = cx.mk_const(&b)?;
+        let masked = cx.c_bin(BinOp::And, x, ka)?;
+        cx.c_bin(BinOp::Xor, masked, kb)
+    })?;
+    finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
+}
+
 /// Writes the function `tt` of `atoms` (at most three, sorted by index) at `n` as its minimum
 /// form, when that is smaller; `fin` is what the node's candidates declined so far contribute.
 fn write(
@@ -939,6 +1047,118 @@ fn write(
 
 /// The most nodes of a bitwise tree [`hoist_cast`] reads.
 const HOIST_NODES: usize = 64;
+
+/// The low bits of values as a sum of multiples of the low bits of atoms, modulo a power of
+/// two (see [`low_form`]).
+#[derive(Default)]
+struct Low {
+    konst: u64,
+    terms: Vec<(u32, u64)>,
+}
+
+/// The most nodes [`low_form`] reads for one sum.
+const LOW_NODES: usize = 64;
+
+/// Adds `k` times the low `bits` bits of node `i` to `out`, modulo `2^bits` (at most 63):
+/// through sums, products and left shifts by constants, and through truncations, extensions
+/// and masks that keep those bits; anything else is an atom. `false` past [`LOW_NODES`].
+fn low_form(cx: &Context, i: u32, k: u64, bits: u16, out: &mut Low) -> bool {
+    let m = (1u64 << bits) - 1;
+    let mut todo = vec![(i, k & m)];
+    let mut seen = 0usize;
+    while let Some((i, k)) = todo.pop() {
+        seen += 1;
+        if seen > LOW_NODES {
+            return false;
+        }
+        if k == 0 {
+            continue;
+        }
+        let n = cx.node(i);
+        let low = |c: u32| {
+            cx.const_val(c)
+                .map(|v| v.limbs().first().copied().unwrap_or(0) & m)
+        };
+        let keeps = |x: u32| cx.wid(x) >= bits;
+        match n.op {
+            OpCode::Const => {
+                out.konst = out.konst.wrapping_add(k.wrapping_mul(low(i).unwrap_or(0))) & m
+            }
+            OpCode::Add => todo.extend([(n.a, k), (n.b, k)]),
+            OpCode::Sub => todo.extend([(n.a, k), (n.b, k.wrapping_neg() & m)]),
+            OpCode::Neg => todo.push((n.a, k.wrapping_neg() & m)),
+            OpCode::Mul if low(n.b).is_some() => {
+                todo.push((n.a, k.wrapping_mul(low(n.b).unwrap_or(0)) & m))
+            }
+            OpCode::Mul if low(n.a).is_some() => {
+                todo.push((n.b, k.wrapping_mul(low(n.a).unwrap_or(0)) & m))
+            }
+            OpCode::Shl
+                if cx
+                    .const_val(n.b)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|s| s < 64) =>
+            {
+                let s = cx.const_val(n.b).and_then(|v| v.to_u64()).unwrap_or(0);
+                todo.push((n.a, (k << s) & m));
+            }
+            OpCode::Extract if n.b == 0 => todo.push((n.a, k)),
+            OpCode::Zext | OpCode::Sext if keeps(n.a) => todo.push((n.a, k)),
+            OpCode::And if low(n.b) == Some(m) => todo.push((n.a, k)),
+            OpCode::And if low(n.a) == Some(m) => todo.push((n.b, k)),
+            _ => match out.terms.iter_mut().find(|t| t.0 == i) {
+                Some(t) => t.1 = t.1.wrapping_add(k) & m,
+                None => out.terms.push((i, k)),
+            },
+        }
+    }
+    true
+}
+
+/// `x << a | x >>u b` (or joined by `^`: the halves share no bit) with counts below the width
+/// whose sum is the width or nothing: `rotl(x, a)`. The counts are compared at the width's
+/// logarithm as sums of multiples of what they are made of ([`low_form`]), so two spellings
+/// of one count meet (`trunc<6>(u·83)` and `trunc<6>(u·109)`, extended, at 64 bits: `u·192`
+/// has no low six bits). Constant counts are a rule's.
+fn rotation(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let w = node.width;
+    if !matches!(node.op, OpCode::Or | OpCode::Xor) || !w.is_power_of_two() || w < 2 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let (l, s) = match (cx.node(node.a).op, cx.node(node.b).op) {
+        (OpCode::Shl, OpCode::LShr) => (cx.node(node.a), cx.node(node.b)),
+        (OpCode::LShr, OpCode::Shl) => (cx.node(node.b), cx.node(node.a)),
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    let (x, a, b) = (l.a, l.b, s.b);
+    if s.a != x || cx.const_val(a).is_some() || cx.const_val(b).is_some() {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    r.meter.charge(Counter::PassWork, 1)?;
+    // Both counts below the width.
+    let bits = w.trailing_zeros() as u16;
+    let mut fin = Fin::FINAL;
+    for count in [a, b] {
+        let (f, g) = super::facts(r, cx, count)?;
+        fin = fin.and(g);
+        let below = f.is_some_and(|f| (bits..w).all(|i| f.known.known_zero().bit(i) == Some(true)));
+        if !below {
+            return Ok(Step::Normal(fin));
+        }
+    }
+    // And their sum nothing at the low bits.
+    let mut sum = Low::default();
+    if !(low_form(cx, a, 1, bits, &mut sum) && low_form(cx, b, 1, bits, &mut sum))
+        || sum.konst != 0
+        || sum.terms.iter().any(|&(_, k)| k != 0)
+    {
+        return Ok(Step::Normal(fin));
+    }
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| cx.c_bin(BinOp::RotL, x, a))?;
+    finish(r, cx, PassKind::Bitwise, n, e, before, &[x, a], fin)
+}
 
 /// A bitwise tree (`& | ^ ~`) whose leaves are extensions of one kind from one width `W`, and
 /// constants, is the extension of the tree over the operands: `zext(a) & ~zext(b)` is
@@ -1092,26 +1312,38 @@ fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
     finish(r, cx, PassKind::Bitwise, n, e, before, &narrow, Fin::FINAL)
 }
 
-/// The bitwise pass at `n`.
+/// The bitwise pass at `n`. What a candidate it declines contributes stays in the result (see
+/// the linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if !bitwise_op(cx.node(n).op) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    if let done @ Step::To(..) = hoist_cast(r, cx, n)? {
-        return Ok(done);
-    }
+    let hoisted = match hoist_cast(r, cx, n)? {
+        Step::Normal(f) => f,
+        done => return Ok(done),
+    };
+    let hoisted = match rotation(r, cx, n)? {
+        Step::Normal(f) => hoisted.and(f),
+        done => return Ok(done),
+    };
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(hoisted));
     };
     // More than three atoms (constants included): `n` is an atom itself, read first by classes
     // of bit positions, where the constants are not atoms.
     let first = if atoms == [n] {
-        masked_step(r, cx, n)?
+        match masked_step(r, cx, n)? {
+            Step::Normal(f) => match one_atom_step(r, cx, n)? {
+                Step::Normal(g) => Step::Normal(f.and(g)),
+                done => done,
+            },
+            done => done,
+        }
     } else {
         write(r, cx, n, &atoms, tt, Fin::FINAL)?
     };
     let mut fin = match first {
-        Step::Normal(f) => f,
+        Step::Normal(f) => f.and(hoisted),
         done => return Ok(done),
     };
     // An atom that is a bitwise region of its own may hide that `n` reads three atoms or fewer
@@ -1125,7 +1357,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     }
-    Ok(Step::Normal(fin))
+    // A chain of `&` or `|` no table reads whole, its operands in order (see `sort_chain`).
+    if !matches!(cx.node(n).op, OpCode::And | OpCode::Or) {
+        return Ok(Step::Normal(fin));
+    }
+    Ok(match super::sort_chain(r, cx, PassKind::Bitwise, n)? {
+        Step::Normal(f) => Step::Normal(fin.and(f)),
+        done => done,
+    })
 }
 
 #[cfg(test)]

@@ -113,7 +113,7 @@ impl Classes {
     pub(crate) fn bit(&self, v: &BitVec, c: usize) -> Option<bool> {
         let v = BitVec::wrapping_from_limbs(self.width, v.limbs());
         let m = &self.masks[c];
-        let inside = crate::facts::known::bv_and(&v, m);
+        let inside = super::word::bv_and(&v, m);
         if inside.is_zero() {
             Some(false)
         } else if inside == *m {

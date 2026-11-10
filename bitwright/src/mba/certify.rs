@@ -41,14 +41,139 @@
 //! verdict is the test's either way, at a fraction of the work when the polynomials are equal.
 //! `Refuted` always comes with a concrete input where the two sides differ.
 
-use std::collections::HashMap;
-
 use super::batch::{BLOCK, Kind, Lane, Program, Wide};
 use super::expr::{MNode, MOp, MbaExpr};
 use super::solve::Verdict;
 use crate::engine::CertStats;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
+
+/// The hasher of the certificates' own lookup tables (hash-consed nodes, node indices,
+/// automaton states): a multiply per word, where the default hasher took most of the time of
+/// building a table of nodes. Its output never reaches a result: no table is walked in hash
+/// order (the ones whose keys are read are sorted first).
+#[derive(Default, Clone, Copy, Debug)]
+struct TableHasher(u64);
+
+impl TableHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl core::hash::Hasher for TableHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        crate::hash::mix64(self.0)
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+/// A table with [`TableHasher`].
+type HashMap<K, V> = std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
+
+/// Where each node of a hash-consed list is, by content: an open-addressed table of indices
+/// into the list. (A table keyed by the nodes themselves holds a copy of each, a hundred
+/// bytes an entry, and building it was most of putting two sides in one list.)
+#[derive(Debug)]
+struct NodeTable {
+    /// A node's index plus one; 0: empty. A power of two, at most half full.
+    slots: Vec<u32>,
+}
+
+impl NodeTable {
+    /// A table with room for `nodes` nodes before it grows.
+    fn with_room(nodes: usize) -> NodeTable {
+        NodeTable {
+            slots: vec![0; (2 * nodes.max(8)).next_power_of_two()],
+        }
+    }
+
+    fn slot_of(&self, node: &MNode) -> usize {
+        use core::hash::{Hash, Hasher};
+        let mut h = TableHasher::default();
+        node.hash(&mut h);
+        h.finish() as usize & (self.slots.len() - 1)
+    }
+
+    /// The index of `node` in `nodes`, if it is there.
+    fn get(&self, nodes: &[MNode], node: &MNode) -> Option<u32> {
+        let mask = self.slots.len() - 1;
+        let mut at = self.slot_of(node);
+        loop {
+            match self.slots[at] {
+                0 => return None,
+                k if nodes[k as usize - 1] == *node => return Some(k - 1),
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    /// Records node `i` of `nodes` (one that is not in the table).
+    fn insert(&mut self, nodes: &[MNode], i: u32) {
+        if 2 * (nodes.len() + 1) > self.slots.len() {
+            // Twice the room, every node put again.
+            self.slots = vec![0; (4 * nodes.len().max(8)).next_power_of_two()];
+            for k in 0..nodes.len() as u32 {
+                self.place(nodes, k);
+            }
+        } else {
+            self.place(nodes, i);
+        }
+    }
+
+    fn place(&mut self, nodes: &[MNode], i: u32) {
+        let mask = self.slots.len() - 1;
+        let mut at = self.slot_of(&nodes[i as usize]);
+        while self.slots[at] != 0 {
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = i + 1;
+    }
+
+    /// The index of `node` in `nodes`, added at the end if it is not there.
+    fn intern(&mut self, nodes: &mut Vec<MNode>, node: MNode) -> u32 {
+        if let Some(i) = self.get(nodes, &node) {
+            return i;
+        }
+        nodes.push(node);
+        let i = nodes.len() as u32 - 1;
+        self.insert(nodes, i);
+        i
+    }
+}
 
 /// The most points one test evaluates, whatever the budget.
 pub(crate) const MAX_POINTS: u64 = 1 << 24;
@@ -273,12 +398,20 @@ pub(crate) fn constants(nodes: &[MNode]) -> Vec<Option<BitVec>> {
     let mut cst: Vec<Option<BitVec>> = Vec::with_capacity(nodes.len());
     for n in nodes {
         let k = n.op.arity();
-        let a = if k > 0 { cst[n.args[0] as usize] } else { None };
-        let b = if k > 1 { cst[n.args[1] as usize] } else { None };
+        let a = if k > 0 {
+            cst[n.args[0] as usize].as_ref()
+        } else {
+            None
+        };
+        let b = if k > 1 {
+            cst[n.args[1] as usize].as_ref()
+        } else {
+            None
+        };
         let v = if matches!(n.op, MOp::Var(_)) || (k > 0 && a.is_none()) || (k > 1 && b.is_none()) {
             None
         } else {
-            apply(n, a.as_ref(), b.as_ref())
+            apply(n, a, b)
         };
         cst.push(v);
     }
@@ -343,10 +476,10 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
     const ANY: i32 = i32::MIN;
     let mut shift = vec![0i32; nodes.len()];
     let mut deg = vec![0u32; nodes.len()];
-    let mut vdeg: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
+    // Per node, a row of `nv` degrees (one table, not a vector per node); rows start at zero.
+    let mut vdeg: Vec<u32> = vec![0; nodes.len() * nv];
     let (mut poly, mut uniform, mut bitwise) = (true, true, false);
     let mut used = vec![false; nv];
-    let zeros = vec![0u32; nv];
     for (i, n) in nodes.iter().enumerate() {
         if !live[i] {
             continue;
@@ -354,7 +487,6 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         if cst[i].is_some() {
             local[i] = true;
             shift[i] = ANY;
-            vdeg[i] = zeros.clone();
             continue;
         }
         // A variable narrower than the question is read through casts, which say what its
@@ -367,23 +499,29 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         let a = n.args[0] as usize;
         let b = n.args[1] as usize;
         let narrow_var = matches!(nodes[a].op, MOp::Var(_)) && nodes[a].width < w;
+        let wide_var = matches!(nodes[a].op, MOp::Var(_)) && nodes[a].width > w;
         match n.op {
             MOp::Var(v) => {
                 local[i] = true;
                 deg[i] = 1;
-                let mut d = zeros.clone();
-                if let Some(x) = d.get_mut(v as usize) {
-                    *x = 1;
+                if (v as usize) < nv {
+                    vdeg[i * nv + v as usize] = 1;
                 }
                 if let Some(u) = used.get_mut(v as usize) {
                     *u = true;
                 }
-                vdeg[i] = d;
+            }
+            // Likewise the low bits of a variable wider than the question (as `decast` writes
+            // one under a truncation): a variable of the question's width.
+            MOp::Trunc if wide_var => {
+                local[i] = true;
+                deg[i] = 1;
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::Zext if narrow_var => {
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = vdeg[a].clone();
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::And | MOp::Or | MOp::Xor => {
                 bitwise = true;
@@ -407,7 +545,6 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 };
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = zeros.clone();
             }
             // a shift of a bitwise function is one, at another offset (its
             // vacated bits are constants). Not at the corners, and not without bitwise
@@ -427,33 +564,32 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
                 };
                 local[i] = true;
                 deg[i] = 1;
-                vdeg[i] = zeros.clone();
             }
             MOp::Not | MOp::Neg | MOp::Shl(_) => {
                 local[i] = matches!(n.op, MOp::Not) && local[a];
                 shift[i] = shift[a];
                 deg[i] = deg[a];
-                vdeg[i] = vdeg[a].clone();
+                vdeg.copy_within(a * nv..(a + 1) * nv, i * nv);
             }
             MOp::Add | MOp::Sub => {
                 deg[i] = deg[a].max(deg[b]);
-                vdeg[i] = vdeg[a]
-                    .iter()
-                    .zip(&vdeg[b])
-                    .map(|(x, y)| *x.max(y))
-                    .collect();
+                // Operands are earlier nodes: their rows lie before this one's.
+                let (before, row) = vdeg.split_at_mut(i * nv);
+                for (j, d) in row[..nv].iter_mut().enumerate() {
+                    *d = before[a * nv + j].max(before[b * nv + j]);
+                }
             }
             MOp::Mul => {
                 deg[i] = deg[a].saturating_add(deg[b]).min(DEGREE_CAP);
-                vdeg[i] = vdeg[a]
-                    .iter()
-                    .zip(&vdeg[b])
-                    .map(|(x, y)| x.saturating_add(*y).min(DEGREE_CAP))
-                    .collect();
+                let (before, row) = vdeg.split_at_mut(i * nv);
+                for (j, d) in row[..nv].iter_mut().enumerate() {
+                    *d = before[a * nv + j]
+                        .saturating_add(before[b * nv + j])
+                        .min(DEGREE_CAP);
+                }
             }
             MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc | MOp::Const(_) => {
                 poly = false;
-                vdeg[i] = zeros.clone();
             }
         }
     }
@@ -464,7 +600,7 @@ pub(crate) fn profile(m: &MbaExpr) -> Option<Profile> {
         uniform,
         bitwise,
         degree: deg[root],
-        var_degree: std::mem::take(&mut vdeg[root]),
+        var_degree: vdeg[root * nv..(root + 1) * nv].to_vec(),
         used,
     })
 }
@@ -853,6 +989,29 @@ fn run<M: Meter>(
     test(meter, a, b, plan, report, true)
 }
 
+/// [`run`], evaluating in `lanes`.
+fn run_lanes<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    plan: &Plan,
+    report: &mut Report,
+    lanes: &mut Lanes<u64>,
+) -> Result<Run, M::Err> {
+    let progs = Program::new(a, false).zip(Program::new(b, false));
+    let mut tested = Tested::default();
+    test_with(
+        meter,
+        [a, b],
+        progs.as_ref(),
+        plan,
+        report,
+        true,
+        &mut tested,
+        Some(lanes),
+    )
+}
+
 /// [`run`]; without `symbolic`, the planned test alone.
 fn test<M: Meter>(
     meter: &mut M,
@@ -862,7 +1021,176 @@ fn test<M: Meter>(
     report: &mut Report,
     symbolic: bool,
 ) -> Result<Run, M::Err> {
-    let (Some(pa), Some(pb)) = (Program::new(a, false), Program::new(b, false)) else {
+    let progs = Program::new(a, false).zip(Program::new(b, false));
+    let mut tested = Tested::default();
+    let mut lanes = take_lanes();
+    let ran = test_with(
+        meter,
+        [a, b],
+        progs.as_ref(),
+        plan,
+        report,
+        symbolic,
+        &mut tested,
+        Some(&mut lanes),
+    );
+    give_lanes(lanes);
+    ran
+}
+
+/// What testing one pair of expressions found that does not depend on the budget, kept while
+/// the same pair may be tested again (a later policy that builds the same skeletons): how the
+/// symbolic comparison ended and how the evaluation did. A test of the pair again makes the
+/// same decisions on what is left of the budget and the same charges, and takes its answers
+/// from here instead of working them out again.
+#[derive(Default)]
+struct Tested {
+    symbolic: SymbolicSeen,
+    /// The evaluation, once it ran to its end: the number of points of each block (each
+    /// charged before it was evaluated), and the first point where the sides differ, if any.
+    evaluated: Option<(Vec<u32>, Option<Vec<BitVec>>)>,
+}
+
+/// What is known of [`symbolic_equal`] on one pair, whatever its limit: its work goes up
+/// check by check the same way under every limit, and it stops at the first check past its own.
+#[derive(Default, Clone, Copy)]
+enum SymbolicSeen {
+    #[default]
+    Unasked,
+    /// It ended within its limit, after this much work, with this answer: so it does within
+    /// any limit that is at least the work, and under a smaller one it is stopped.
+    Ended(u64, bool),
+    /// It was stopped by this limit (the largest tried): so it is by any limit up to it.
+    Stopped(u64),
+}
+
+impl SymbolicSeen {
+    /// [`symbolic_equal`] on `a` and `b` within `limit`: whether it proved them equal, and
+    /// its work when it ended within the limit, or some amount above the limit when it was
+    /// stopped (callers read no more of it than that).
+    fn equal(&mut self, a: &MbaExpr, b: &MbaExpr, limit: u64) -> (bool, u64) {
+        match *self {
+            SymbolicSeen::Ended(work, equal) if work <= limit => return (equal, work),
+            SymbolicSeen::Ended(work, _) => return (false, work),
+            SymbolicSeen::Stopped(l) if limit <= l => return (false, l.saturating_add(1)),
+            _ => {}
+        }
+        let mut work = 0u64;
+        let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+        *self = if work > limit {
+            SymbolicSeen::Stopped(limit)
+        } else {
+            SymbolicSeen::Ended(work, equal)
+        };
+        (equal, work)
+    }
+}
+
+/// Lanes kept from one evaluation to the next: the variables' columns and the registers of
+/// both sides.
+#[derive(Default)]
+struct Lanes<L> {
+    cols: Vec<Vec<L>>,
+    ra: Vec<Vec<L>>,
+    rb: Vec<Vec<L>>,
+}
+
+/// What the certificates on a thread hand from one to the next instead of allocating it again:
+/// the lanes of their evaluations and the rows of a sample. A certificate evaluates dozens of
+/// small programs, and each took a vector per register and per variable, and each sample a
+/// vector per node.
+struct Scratch {
+    lanes: Lanes<u64>,
+    rows: Vec<Vec<u64>>,
+}
+
+/// The most vectors a thread keeps in its [`Scratch`], of each kind (a lane is at most
+/// [`BLOCK`] words, a row [`SAMPLE_POINTS`]).
+const SCRATCH_VECTORS: usize = 2048;
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = const {
+        std::cell::RefCell::new(Scratch {
+            lanes: Lanes {
+                cols: Vec::new(),
+                ra: Vec::new(),
+                rb: Vec::new(),
+            },
+            rows: Vec::new(),
+        })
+    };
+}
+
+/// The thread's lanes (new ones when it has none to give).
+fn take_lanes() -> Lanes<u64> {
+    SCRATCH
+        .try_with(|s| {
+            s.try_borrow_mut()
+                .map(|mut s| std::mem::take(&mut s.lanes))
+                .ok()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Hands lanes back to the thread, unless they grew past what it keeps.
+fn give_lanes(lanes: Lanes<u64>) {
+    if lanes.cols.len() + lanes.ra.len() + lanes.rb.len() > SCRATCH_VECTORS {
+        return;
+    }
+    let _ = SCRATCH.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.lanes = lanes;
+        }
+    });
+}
+
+/// Up to `n` empty rows the thread kept.
+fn take_rows(n: usize) -> Vec<Vec<u64>> {
+    SCRATCH
+        .try_with(|s| {
+            s.try_borrow_mut()
+                .map(|mut s| {
+                    let keep = s.rows.len().saturating_sub(n);
+                    s.rows.split_off(keep)
+                })
+                .ok()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Hands rows back to the thread, emptied, up to what it keeps.
+fn give_rows(rows: &mut Vec<Vec<u64>>) {
+    let _ = SCRATCH.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            for mut row in rows.drain(..) {
+                if s.rows.len() >= SCRATCH_VECTORS {
+                    break;
+                }
+                row.clear();
+                s.rows.push(row);
+            }
+        }
+    });
+}
+
+/// [`test`] on sides already compiled (`None`: one has no nodes), with what earlier tests of
+/// the same pair found (`tested`), in `lanes` when the caller keeps some.
+#[allow(clippy::too_many_arguments)]
+fn test_with<M: Meter>(
+    meter: &mut M,
+    [a, b]: [&MbaExpr; 2],
+    progs: Option<&(Program, Program)>,
+    plan: &Plan,
+    report: &mut Report,
+    symbolic: bool,
+    tested: &mut Tested,
+    lanes: Option<&mut Lanes<u64>>,
+) -> Result<Run, M::Err> {
+    let Some((pa, pb)) = progs else {
         return Ok(Run::TooBig);
     };
     let kind = Kind::of(pa.widest().max(pb.widest()));
@@ -885,8 +1213,7 @@ fn test<M: Meter>(
     // it takes at least a unit per node.
     let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() / SYMBOLIC_RATE);
     if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
-        let mut work = 0;
-        let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
+        let (equal, work) = tested.symbolic.equal(a, b, cap);
         meter.charge(work.min(cap) * SYMBOLIC_RATE)?;
         if equal {
             return Ok(Run::Equal(Cert::Symbolic));
@@ -896,14 +1223,47 @@ fn test<M: Meter>(
             return Ok(Run::OverBudget);
         }
     }
-    let width = a.width().map_or(1, |w| w.bits());
-    match kind {
-        Kind::N64 => run_in::<u64, M>(meter, a, &pa, &pb, plan, width, report),
-        Kind::N128 => run_in::<u128, M>(meter, a, &pa, &pb, plan, width, report),
-        Kind::Wide => run_in::<Wide, M>(meter, a, &pa, &pb, plan, width, report),
+    // The evaluation again: charged block by block as it was, with the answer it gave.
+    if let Some((blocks, differ)) = &tested.evaluated {
+        for &n in blocks {
+            meter.charge(per * u64::from(n))?;
+            report.points += u64::from(n);
+        }
+        return Ok(match differ {
+            Some(point) => Run::Differ(point.clone()),
+            None => Run::Equal(plan.cert),
+        });
     }
+    let width = a.width().map_or(1, |w| w.bits());
+    let mut blocks: Vec<u32> = Vec::new();
+    let ran = match (kind, lanes) {
+        (Kind::N64, Some(l)) => {
+            run_in::<u64, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::N64, None) => {
+            let l = &mut Lanes::default();
+            run_in::<u64, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::N128, _) => {
+            let l = &mut Lanes::default();
+            run_in::<u128, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+        (Kind::Wide, _) => {
+            let l = &mut Lanes::default();
+            run_in::<Wide, M>(meter, a, pa, pb, plan, width, report, l, &mut blocks)
+        }
+    }?;
+    let differ = match &ran {
+        Run::Differ(point) => Some(point.clone()),
+        _ => None,
+    };
+    tested.evaluated = Some((blocks, differ));
+    Ok(ran)
 }
 
+/// Evaluates the plan's points on both sides, a block at a time, in `lanes`; the points of
+/// each block charged are added to `blocks`.
+#[allow(clippy::too_many_arguments)]
 fn run_in<L: Lane, M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -912,22 +1272,31 @@ fn run_in<L: Lane, M: Meter>(
     plan: &Plan,
     width: u16,
     report: &mut Report,
+    lanes: &mut Lanes<L>,
+    blocks: &mut Vec<u32>,
 ) -> Result<Run, M::Err> {
     let vars = a.vars();
     let masks: Vec<L::M> = vars.iter().map(|&w| L::mask(w)).collect();
-    let mut cols: Vec<Vec<L>> = vec![Vec::with_capacity(BLOCK); vars.len()];
-    let (mut ra, mut rb): (Vec<Vec<L>>, Vec<Vec<L>>) = (Vec::new(), Vec::new());
+    let Lanes { cols, ra, rb } = lanes;
+    // A column of zeros per variable: one the plan does not use stays 0, whatever an earlier
+    // evaluation left in the lanes.
+    cols.resize_with(vars.len(), Vec::new);
+    for c in cols.iter_mut() {
+        c.clear();
+        c.resize(BLOCK, L::default());
+    }
     let mut points = Points::new(plan, width);
     let per = (pa.len() + pb.len()) as u64;
     loop {
-        let n = points.fill(&mut cols, &plan.used, vars, &masks);
+        let n = points.fill(cols, &plan.used, vars, &masks);
         if n == 0 {
             return Ok(Run::Equal(plan.cert));
         }
         meter.charge(per * n as u64)?;
         report.points += n as u64;
-        pa.run(&mut ra, &cols, n);
-        pb.run(&mut rb, &cols, n);
+        blocks.push(n as u32);
+        pa.run(ra, cols, n);
+        pb.run(rb, cols, n);
         let (x, y) = (&ra[pa.root()][..n], &rb[pb.root()][..n]);
         if let Some(p) = (0..n).find(|&p| x[p] != y[p]) {
             let point = vars
@@ -953,24 +1322,43 @@ fn constant_pool(ms: &[&MbaExpr]) -> Vec<BitVec> {
             _ => None,
         })
         .collect();
-    consts.sort();
-    consts.dedup();
-    let mut pool: Vec<BitVec> = Vec::new();
-    for c in consts {
-        let one = BitVec::one(c.width());
-        for v in [
-            c,
-            BitVec::bin_unchecked(BinOp::Add, &c, &one),
-            BitVec::bin_unchecked(BinOp::Sub, &c, &one),
-            BitVec::un_unchecked(UnOp::Neg, &c),
-            BitVec::un_unchecked(UnOp::Not, &c),
-        ] {
-            if !pool.contains(&v) {
-                pool.push(v);
+    // The first `POOL` distinct values, the constants taken in increasing order: later
+    // constants cannot change them, so the walk ends when the pool is full (with many
+    // constants it was quadratic in all of them, for entries that were then cut off). A
+    // constant met twice adds nothing the second time, and few constants are needed, so they
+    // are put in order a stretch at a time: the smallest `STRETCH` of those left, sorted.
+    const POOL: usize = 32;
+    const STRETCH: usize = 16;
+    let mut pool: Vec<BitVec> = Vec::with_capacity(POOL);
+    let mut held: HashMap<BitVec, ()> =
+        HashMap::with_capacity_and_hasher(2 * POOL, Default::default());
+    let mut rest: &mut [BitVec] = &mut consts;
+    'fill: while !rest.is_empty() {
+        let k = rest.len().min(STRETCH);
+        if k < rest.len() {
+            rest.select_nth_unstable(k - 1);
+        }
+        let (stretch, later) = std::mem::take(&mut rest).split_at_mut(k);
+        stretch.sort_unstable();
+        for c in stretch.iter() {
+            let one = BitVec::one(c.width());
+            for v in [
+                *c,
+                BitVec::bin_unchecked(BinOp::Add, c, &one),
+                BitVec::bin_unchecked(BinOp::Sub, c, &one),
+                BitVec::un_unchecked(UnOp::Neg, c),
+                BitVec::un_unchecked(UnOp::Not, c),
+            ] {
+                if held.insert(v, ()).is_none() {
+                    pool.push(v);
+                    if pool.len() == POOL {
+                        break 'fill;
+                    }
+                }
             }
         }
+        rest = later;
     }
-    pool.truncate(32);
     pool
 }
 
@@ -989,6 +1377,14 @@ fn next_word(state: &mut u64) -> u64 {
 /// some point); then points whose set bits lie at one position; then seeded random values.
 /// A filter that catches wrong answers early; never evidence.
 pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<Vec<BitVec>> {
+    let mut pts = fixed_points(vars, ms);
+    seeded_points(vars, seed, &mut pts);
+    pts
+}
+
+/// The first points of [`sample_points`], which do not depend on the seed: zero, all-ones, one
+/// and the signed minimum, the constants and their neighbours, the single positions.
+fn fixed_points(vars: &[Width], ms: &[&MbaExpr]) -> Vec<Vec<BitVec>> {
     let pool = constant_pool(ms);
     let fit = |c: &BitVec, w: Width| BitVec::wrapping_from_limbs(w, c.limbs());
     let mut pts: Vec<Vec<BitVec>> = Vec::with_capacity(SAMPLE_POINTS);
@@ -1041,19 +1437,24 @@ pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<V
                 .collect(),
         );
     }
+    pts
+}
+
+/// The rest of [`sample_points`] after its [`fixed_points`]: seeded random values, up to
+/// [`SAMPLE_POINTS`] points in all.
+fn seeded_points(vars: &[Width], seed: u64, pts: &mut Vec<Vec<BitVec>>) {
     let mut state = seed;
     while pts.len() < SAMPLE_POINTS {
         pts.push(
             vars.iter()
                 .map(|&w| {
-                    let limbs: Vec<u64> = (0..8).map(|_| next_word(&mut state)).collect();
+                    let limbs: [u64; 8] = std::array::from_fn(|_| next_word(&mut state));
                     BitVec::wrapping_from_limbs(w, &limbs)
                 })
                 .collect(),
         );
     }
     pts.truncate(SAMPLE_POINTS);
-    pts
 }
 
 /// The first sample point where `a` and `b` differ, if any. `None` when they agree (or cannot
@@ -1075,12 +1476,43 @@ pub(crate) fn refute(a: &MbaExpr, b: &MbaExpr, points: &[Vec<BitVec>]) -> Option
 /// found to differ. Expressions over different variables or of different widths are not
 /// compared (`Unknown`).
 pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result<Report, M::Err> {
+    // Sums and differences that are bitwise functions, read as such (equal expressions, see
+    // `raise_disjoint`): every test below then takes them for what they are.
+    let (ra, rb) = (raise_disjoint(a), raise_disjoint(b));
+    let (a, b) = (ra.as_ref().unwrap_or(a), rb.as_ref().unwrap_or(b));
     // casts are atoms to the tests below, so a side that spells a value through
     // the low half of another is unrelated to it there, and the tests spend their work on
     // abstractions that cannot decide. Sides with casts are compared without them first
     // (equal expressions, see `decast`), and as they are only when that does not decide.
     let (da, db) = (super::decast::decast(a), super::decast::decast(b));
     let mut report = Report::new();
+    // First, sides that are each a constant plus a multiple of every bit of the variables,
+    // compared as that (see `bit_linear`): it decides where it applies, for a pass over each
+    // side. A sum of products of bitwise functions of one value by constants is one whatever
+    // its carries, and the tests below take it for an atom under a mask.
+    if let Some(found) = bit_linear(meter, da.as_ref().unwrap_or(a), db.as_ref().unwrap_or(b))? {
+        report.cert = Some(Cert::Symbolic);
+        match found {
+            None => report.verdict = Verdict::Proved,
+            Some(point) => {
+                report.verdict = Verdict::Refuted;
+                report.counterexample = Some(point);
+            }
+        }
+        return Ok(report);
+    }
+    // Sides that read the same bits of a value the same way (`(s >> 8) & 9` of each) are
+    // equal exactly when the values agree on those bits (see `peeled`): without the right
+    // shift each is a function of the low bits of its variables, which the tests follow.
+    if let Some((pa, pb)) = peeled(a, b) {
+        let sub = prove(&pa, &pb, meter)?;
+        if sub.verdict != Verdict::Unknown {
+            return Ok(sub);
+        }
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+    }
     if da.is_some() || db.is_some() {
         report = prove_at(
             da.as_ref().unwrap_or(a),
@@ -1088,10 +1520,11 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
             meter,
             0,
             false,
+            true,
         )?;
     }
     if report.verdict == Verdict::Unknown {
-        report = prove_at(a, b, meter, 0, false)?;
+        report = prove_at(a, b, meter, 0, false, true)?;
     }
     // Still open, and not for lack of budget: a polynomial question over registers read
     // through their low bits, compared as polynomials over symbols with those registers as
@@ -1117,7 +1550,10 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         && report
             .counterexample
             .as_ref()
-            .is_none_or(|p| a.eval(p).is_none() || a.eval(p) == b.eval(p))
+            .is_none_or(|p| match a.eval(p) {
+                None => true,
+                va => va == b.eval(p),
+            })
     {
         debug_assert!(false, "a refutation without a counterexample");
         report.verdict = Verdict::Unknown;
@@ -1127,13 +1563,778 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     Ok(report)
 }
 
-/// [`prove`] within `depth` splits; `lowered`: known bits were already read as arithmetic.
+/// `a` and `b` without what both read their values through, when that includes a right
+/// shift: the two values, each under the mask of the bits read. From the roots inward, while
+/// both sides apply the same step (a right shift by one count, `&`, `|` or `^` with one
+/// constant, a complement, a cast to one width), the bits of the operand that reach the root
+/// are followed; each step is a one-to-one function of those bits, so the sides are equal at
+/// an input exactly when the two operands agree there on the mask (a proof of either is one of
+/// the other, and so is a counterexample). `None` when no right shift is passed, or nothing is
+/// left to compare.
+fn peeled(a: &MbaExpr, b: &MbaExpr) -> Option<(MbaExpr, MbaExpr)> {
+    let (na, nb) = (a.nodes(), b.nodes());
+    let (mut ia, mut ib) = (na.len().checked_sub(1)?, nb.len().checked_sub(1)?);
+    let w = na[ia].width;
+    if w != nb[ib].width || w.bits() > 64 || a.vars() != b.vars() {
+        return None;
+    }
+    let ones = |w: Width| {
+        if w.bits() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << w.bits()) - 1
+        }
+    };
+    let konst = |n: &[MNode], i: u32| match n[i as usize].op {
+        MOp::Const(c) => c.to_u64(),
+        _ => None,
+    };
+    // An operand and a constant, in either order.
+    let with = |n: &[MNode], i: usize| -> Option<(usize, u64)> {
+        let [x, y] = n[i].args;
+        match (konst(n, x), konst(n, y)) {
+            (None, Some(c)) => Some((x as usize, c)),
+            (Some(c), None) => Some((y as usize, c)),
+            _ => None,
+        }
+    };
+    let (mut mask, mut shifted) = (ones(w), false);
+    loop {
+        let (x, y) = (na[ia], nb[ib]);
+        if x.width != y.width || x.width.bits() > 64 {
+            break;
+        }
+        match (x.op, y.op) {
+            (MOp::LShr(j), MOp::LShr(k)) if j == k => {
+                mask = mask << j & ones(x.width);
+                shifted = true;
+                (ia, ib) = (x.args[0] as usize, y.args[0] as usize);
+            }
+            (MOp::Not, MOp::Not) => (ia, ib) = (x.args[0] as usize, y.args[0] as usize),
+            (MOp::Trunc, MOp::Trunc) | (MOp::Zext, MOp::Zext) => {
+                let (p, q) = (x.args[0] as usize, y.args[0] as usize);
+                if na[p].width != nb[q].width || na[p].width.bits() > 64 {
+                    break;
+                }
+                mask &= ones(na[p].width);
+                (ia, ib) = (p, q);
+            }
+            (MOp::And | MOp::Or | MOp::Xor, op) if op == x.op => {
+                let (Some((p, c)), Some((q, d))) = (with(na, ia), with(nb, ib)) else {
+                    break;
+                };
+                if c != d {
+                    break;
+                }
+                mask &= match op {
+                    MOp::And => c,
+                    MOp::Or => !c,
+                    _ => u64::MAX,
+                };
+                (ia, ib) = (p, q);
+            }
+            _ => break,
+        }
+    }
+    if !shifted || mask == 0 {
+        return None;
+    }
+    // Each side up to its operand, under the mask.
+    let under = |m: &MbaExpr, at: usize| -> Option<MbaExpr> {
+        let mut out = MbaExpr::new(m.vars().to_vec());
+        for n in &m.nodes()[..=at] {
+            match n.op {
+                MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(n.op, n.args[0], n.width),
+                _ => out.push(n.op, &n.args[..n.op.arity()]),
+            }
+            .ok()?;
+        }
+        let w = m.nodes()[at].width;
+        let k = out
+            .push(MOp::Const(BitVec::wrapping_from_u64(w, mask)), &[])
+            .ok()?;
+        out.push(MOp::And, &[at as u32, k]).ok()?;
+        Some(out)
+    };
+    Some((under(a, ia)?, under(b, ib)?))
+}
+
+/// The most bits of variables [`bit_linear`] takes.
+const LINEAR_BITS: usize = 256;
+
+/// A value as `k + Σ dᵢ·bᵢ` over the bits `bᵢ` of the variables, modulo `2^w`.
+#[derive(Clone, PartialEq, Eq)]
+struct BitLinear {
+    k: u64,
+    d: Vec<u64>,
+}
+
+/// A value each bit of which is a constant, a bit of a variable or its complement: bit `j` is
+/// `alpha[j] ^ b` for the variable bit `b = src[j]` where `has[j]`, else `alpha[j]`.
+struct BitAffine {
+    alpha: u64,
+    has: u64,
+    src: [u16; 64],
+}
+
+impl BitLinear {
+    /// The form as a [`BitAffine`], when each variable bit it reads sets or clears one bit
+    /// of its own and the constant left has none of those: no carry, so every bit is the
+    /// constant's or one variable bit's (`k + 2^p·b` with bit `p` of `k` clear is `k | b << p`;
+    /// `k − 2^p·b` is `(k − 2^p) + 2^p·~b`).
+    fn affine(&self, ones: u64) -> Option<BitAffine> {
+        let mut out = BitAffine {
+            alpha: 0,
+            has: 0,
+            src: [0; 64],
+        };
+        let mut k = self.k;
+        for (i, &d) in self.d.iter().enumerate() {
+            if d == 0 {
+                continue;
+            }
+            let neg = d.wrapping_neg() & ones;
+            let (p, minus) = if d.is_power_of_two() {
+                (d.trailing_zeros(), false)
+            } else if neg.is_power_of_two() {
+                (neg.trailing_zeros(), true)
+            } else {
+                return None;
+            };
+            let bit = 1u64 << p;
+            if out.has & bit != 0 {
+                return None;
+            }
+            out.has |= bit;
+            out.src[p as usize] = i as u16;
+            if minus {
+                out.alpha |= bit;
+                k = k.wrapping_sub(bit) & ones;
+            }
+        }
+        // The top bit's multiple is its own negation: the bit is the variable bit's
+        // complement where the constant has it set.
+        let top = ones ^ (ones >> 1);
+        if out.has & k & top != 0 {
+            out.alpha |= top;
+            k ^= top;
+        }
+        if k & out.has != 0 {
+            return None;
+        }
+        out.alpha |= k;
+        Some(out)
+    }
+}
+
+/// The most variable bits [`BitLinear::low`] takes the residues of a form over.
+const LOW_BITS: usize = 10;
+
+/// The most runs of ones [`BitLinear::masked`] takes a mask apart into.
+const MASK_RUNS: usize = 8;
+
+impl BitLinear {
+    /// The form's value modulo `2^n` (its low `n` bits) as a form, when it is one: the
+    /// multiples that are not 0 modulo `2^n` belong to at most [`LOW_BITS`] variable bits,
+    /// and over every value of those the residue is a constant plus one term for each (no
+    /// carry out of the low bits that depends on two of them at once). A product of a masked
+    /// value by a constant has such a residue wherever the mask keeps few low bits.
+    fn low(&self, n: usize, wn: usize, ones: u64) -> Option<BitLinear> {
+        if n >= wn {
+            return Some(self.clone());
+        }
+        let m = (1u64 << n) - 1;
+        let at: Vec<usize> = (0..self.d.len()).filter(|&i| self.d[i] & m != 0).collect();
+        if at.len() > LOW_BITS {
+            return None;
+        }
+        let base = self.k & m;
+        let each: Vec<u64> = at
+            .iter()
+            .map(|&i| (self.k.wrapping_add(self.d[i]) & m).wrapping_sub(base) & ones)
+            .collect();
+        for set in 0u32..1 << at.len() {
+            let (mut sum, mut form) = (self.k, base);
+            for (j, &i) in at.iter().enumerate() {
+                if set >> j & 1 == 1 {
+                    sum = sum.wrapping_add(self.d[i]);
+                    form = form.wrapping_add(each[j]);
+                }
+            }
+            if sum & m != form & ones {
+                return None;
+            }
+        }
+        let mut out = BitLinear {
+            k: base,
+            d: vec![0; self.d.len()],
+        };
+        for (j, &i) in at.iter().enumerate() {
+            out.d[i] = each[j];
+        }
+        Some(out)
+    }
+
+    /// The form under the constant mask `c`, as a form: for each run of ones `[a, b)` of the
+    /// mask, the low `b` bits less the low `a` bits (see [`low`](BitLinear::low)).
+    fn masked(&self, c: u64, wn: usize, ones: u64) -> Option<BitLinear> {
+        let mut out = BitLinear {
+            k: 0,
+            d: vec![0; self.d.len()],
+        };
+        let (mut left, mut runs) = (c & ones, 0);
+        while left != 0 {
+            runs += 1;
+            if runs > MASK_RUNS {
+                return None;
+            }
+            let a = left.trailing_zeros() as usize;
+            let b = a + (left >> a).trailing_ones() as usize;
+            let (hi, lo) = (self.low(b, wn, ones)?, self.low(a, wn, ones)?);
+            out.k = out.k.wrapping_add(hi.k).wrapping_sub(lo.k) & ones;
+            for (o, (h, l)) in out.d.iter_mut().zip(hi.d.iter().zip(&lo.d)) {
+                *o = o.wrapping_add(*h).wrapping_sub(*l) & ones;
+            }
+            left = if b >= 64 { 0 } else { left >> b << b };
+        }
+        Some(out)
+    }
+}
+
+impl BitAffine {
+    fn linear(&self, bits: usize, ones: u64) -> BitLinear {
+        let mut out = BitLinear {
+            k: self.alpha & ones,
+            d: vec![0; bits],
+        };
+        let mut left = self.has & ones;
+        while left != 0 {
+            let p = left.trailing_zeros();
+            left &= left - 1;
+            let bit = 1u64 << p;
+            let d = &mut out.d[self.src[p as usize] as usize];
+            // `1 ^ b` is `1 − b`.
+            *d = match self.alpha & bit != 0 {
+                true => d.wrapping_sub(bit),
+                false => d.wrapping_add(bit),
+            } & ones;
+        }
+        out
+    }
+}
+
+/// Whether `a` and `b` are equal, where each is a constant plus a multiple of every bit of
+/// the variables modulo the width: `None` when a side is not read as one, `Some(None)` when
+/// they are equal, `Some(Some(point))` with an input where they differ.
+///
+/// Sums, differences, negations, complements, left shifts and products by a constant keep
+/// such a form whatever it is. `& | ^` and a right shift take operands every bit of which is a
+/// constant, a variable bit or its complement (a form that sets or clears one bit for each
+/// variable bit it reads, with no carry), and give one: two bits over the same variable bit
+/// combine to it, its complement or a constant. A form with carries under `& | ^` with a
+/// constant is read by the mask's fields, where its low bits are a form (a product by a
+/// constant with its low byte masked off: `(x & m)·c & −256`). Two forms are the same function exactly when
+/// their constants and multiples are the same (at zero, and at each single variable bit), so
+/// the comparison decides, at 64 bits or fewer and up to [`LINEAR_BITS`] bits of variables.
+/// One unit of work per node read and 16 variable bits, where it decides.
+fn bit_linear<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+) -> Result<Option<Option<Vec<BitVec>>>, M::Err> {
+    let (Some(w), Some(wb)) = (a.width(), b.width()) else {
+        return Ok(None);
+    };
+    if w != wb || w.bits() > 64 || a.vars() != b.vars() {
+        return Ok(None);
+    }
+    let bits = a.vars().len() * usize::from(w.bits());
+    if bits == 0 || bits > LINEAR_BITS {
+        return Ok(None);
+    }
+    // A unit per node read and 16 variable bits; it gives up at the first node without a
+    // form.
+    let per = (bits / 16 + 1) as u64;
+    if (a.nodes().len() + b.nodes().len()) as u64 * per > meter.left() {
+        return Ok(None);
+    }
+    let read = std::cell::Cell::new(0u64);
+    let wn = usize::from(w.bits());
+    let ones = if wn == 64 { u64::MAX } else { (1u64 << wn) - 1 };
+    let form = |m: &MbaExpr| -> Option<BitLinear> {
+        let nodes = m.nodes();
+        let live = live(m);
+        let mut forms: Vec<Option<BitLinear>> = Vec::with_capacity(nodes.len());
+        for (at, n) in nodes.iter().enumerate() {
+            // A node the root does not read is not read here either.
+            if !live[at] {
+                forms.push(None);
+                continue;
+            }
+            read.set(read.get() + 1);
+            let arg = |j: usize| forms[n.args[j] as usize].as_ref();
+            let zip = |x: &BitLinear, y: &BitLinear, f: fn(u64, u64) -> u64| BitLinear {
+                k: f(x.k, y.k) & ones,
+                d: x.d
+                    .iter()
+                    .zip(&y.d)
+                    .map(|(&p, &q)| f(p, q) & ones)
+                    .collect(),
+            };
+            let scale = |x: &BitLinear, c: u64| BitLinear {
+                k: x.k.wrapping_mul(c) & ones,
+                d: x.d.iter().map(|&p| p.wrapping_mul(c) & ones).collect(),
+            };
+            let konst = |x: &BitLinear| x.d.iter().all(|&p| p == 0).then_some(x.k);
+            let f = (|| match n.op {
+                _ if n.width != w => None,
+                MOp::Const(c) => Some(BitLinear {
+                    k: c.to_u64()? & ones,
+                    d: vec![0; bits],
+                }),
+                MOp::Var(v) => {
+                    let mut d = vec![0; bits];
+                    for j in 0..wn {
+                        d[v as usize * wn + j] = 1u64 << j;
+                    }
+                    Some(BitLinear { k: 0, d })
+                }
+                MOp::Add => Some(zip(arg(0)?, arg(1)?, u64::wrapping_add)),
+                MOp::Sub => Some(zip(arg(0)?, arg(1)?, u64::wrapping_sub)),
+                MOp::Neg => Some(scale(arg(0)?, u64::MAX)),
+                // `~x` is `−x − 1`.
+                MOp::Not => {
+                    let mut x = scale(arg(0)?, u64::MAX);
+                    x.k = x.k.wrapping_sub(1) & ones;
+                    Some(x)
+                }
+                MOp::Shl(s) => Some(scale(arg(0)?, 1u64.checked_shl(u32::from(s))?)),
+                MOp::Mul => {
+                    let (x, y) = (arg(0)?, arg(1)?);
+                    match (konst(x), konst(y)) {
+                        (Some(c), _) => Some(scale(y, c)),
+                        (_, Some(c)) => Some(scale(x, c)),
+                        _ => None,
+                    }
+                }
+                MOp::LShr(s) => {
+                    let x = arg(0)?.affine(ones)?;
+                    let s = u32::from(s);
+                    let mut out = BitAffine {
+                        alpha: x.alpha.checked_shr(s)?,
+                        has: x.has.checked_shr(s)?,
+                        src: [0; 64],
+                    };
+                    for j in 0..wn.saturating_sub(s as usize) {
+                        out.src[j] = x.src[j + s as usize];
+                    }
+                    Some(out.linear(bits, ones))
+                }
+                MOp::And | MOp::Or | MOp::Xor => {
+                    let (fx, fy) = (arg(0)?, arg(1)?);
+                    let (Some(x), Some(y)) = (fx.affine(ones), fy.affine(ones)) else {
+                        // A form with carries, under a constant: its fields (see `masked`).
+                        let (l, c) = match (konst(fx), konst(fy)) {
+                            (None, Some(c)) => (fx, c),
+                            (Some(c), None) => (fy, c),
+                            _ => return None,
+                        };
+                        let m = l.masked(c, wn, ones)?;
+                        let k = BitLinear {
+                            k: c,
+                            d: vec![0; bits],
+                        };
+                        return Some(match n.op {
+                            MOp::And => m,
+                            // `x | c` is `x − (x & c) + c`; `x ^ c` is `x + c − 2·(x & c)`.
+                            MOp::Or => zip(&zip(l, &m, u64::wrapping_sub), &k, u64::wrapping_add),
+                            _ => zip(
+                                &zip(l, &k, u64::wrapping_add),
+                                &scale(&m, 2),
+                                u64::wrapping_sub,
+                            ),
+                        });
+                    };
+                    let mut out = BitAffine {
+                        alpha: 0,
+                        has: 0,
+                        src: [0; 64],
+                    };
+                    let op = |p: bool, q: bool| match n.op {
+                        MOp::And => p & q,
+                        MOp::Or => p | q,
+                        _ => p ^ q,
+                    };
+                    for j in 0..wn {
+                        let bit = 1u64 << j;
+                        let (hx, hy) = (x.has & bit != 0, y.has & bit != 0);
+                        let (ax, ay) = (x.alpha & bit != 0, y.alpha & bit != 0);
+                        if hx && hy && x.src[j] != y.src[j] {
+                            return None;
+                        }
+                        // The bit where the variable bit is 0, and where it is 1.
+                        let at0 = op(ax, ay);
+                        let at1 = op(ax ^ hx, ay ^ hy);
+                        if at0 {
+                            out.alpha |= bit;
+                        }
+                        if at0 != at1 {
+                            out.has |= bit;
+                            out.src[j] = if hx { x.src[j] } else { y.src[j] };
+                        }
+                    }
+                    Some(out.linear(bits, ones))
+                }
+                MOp::Zext | MOp::Sext | MOp::Trunc => None,
+            })();
+            // The root reads it, so has no form either.
+            forms.push(Some(f?));
+        }
+        forms.pop().flatten()
+    };
+    // The shorter side first: an answer is a few nodes, and where it has no form the
+    // question's is not computed.
+    let swap = a.nodes().len() > b.nodes().len();
+    let (first, second) = if swap { (b, a) } else { (a, b) };
+    let f1 = form(first);
+    let f2 = f1.as_ref().and_then(|_| form(second));
+    // Charged where it decides: giving up is a walk to the first node without a form, within
+    // what the meter had left for the whole.
+    let (Some(f1), Some(f2)) = (f1, f2) else {
+        return Ok(None);
+    };
+    meter.charge(read.get() * per)?;
+    let (fa, fb) = if swap { (f2, f1) } else { (f1, f2) };
+    if fa == fb {
+        return Ok(Some(None));
+    }
+    // Where they differ: at zero, or at the one variable bit whose multiples do.
+    let mut point = vec![BitVec::zero(w); a.vars().len()];
+    if fa.k == fb.k
+        && let Some(i) = (0..bits).find(|&i| fa.d[i] != fb.d[i])
+    {
+        point[i / wn] = BitVec::wrapping_from_u64(w, 1u64 << (i % wn));
+    }
+    Ok(Some(Some(point)))
+}
+
+/// The most changes of variable [`prove`] asks about (atoms tried, most read first).
+const CHANGE_TRIES: usize = 2;
+
+/// Whether a change of variable decided `a == b` (see [`changes_of_variable`]), into `report`;
+/// what the questions spent is added to it either way.
+fn changed<M: Meter>(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    meter: &mut M,
+    report: &mut Report,
+) -> Result<bool, M::Err> {
+    for change in changes_of_variable(a, b) {
+        let sub = prove_at(&change.a, &change.b, meter, 0, false, false)?;
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+        match sub.verdict {
+            Verdict::Proved => {
+                report.verdict = Verdict::Proved;
+                report.cert = sub.cert;
+                report.compositional = sub.compositional;
+                report.split = sub.split;
+                report.known_bits = sub.known_bits;
+                return Ok(true);
+            }
+            Verdict::Refuted => {
+                // Back to the original variable: its value is the inverse at the point.
+                let Some(p) = sub.counterexample else {
+                    return Ok(false);
+                };
+                let Some(x) = change.inverse.eval(&p) else {
+                    return Ok(false);
+                };
+                let mut orig = p;
+                orig[change.var as usize] = x;
+                report.verdict = Verdict::Refuted;
+                report.cert = sub.cert;
+                report.counterexample = Some(orig);
+                return Ok(true);
+            }
+            _ if sub.over_budget => return Ok(false),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// A question over a changed variable (see [`changes_of_variable`]).
+pub(crate) struct Change {
+    pub(crate) a: MbaExpr,
+    pub(crate) b: MbaExpr,
+    /// The variable replaced (its slot now holds the atom).
+    pub(crate) var: u32,
+    /// The original variable as a function of the new one (in its slot).
+    pub(crate) inverse: MbaExpr,
+}
+
+/// One link of a chain from an atom down to a variable: how a node is made from the one below.
+#[derive(Clone, Copy, Debug)]
+enum Link {
+    /// `u ^ c`.
+    Xor(BitVec),
+    /// `u + c` (and `u − c` as `u + (−c)`).
+    Add(BitVec),
+    /// `c − u`.
+    RevSub(BitVec),
+    /// `u · c` for an odd `c`.
+    Mul(BitVec),
+    /// `−u`.
+    Neg,
+    /// `~u`.
+    Not,
+}
+
+impl Link {
+    /// The node below, from the node `v` it makes: the inverse of the link.
+    fn undo(&self, out: &mut MbaExpr, v: u32) -> Option<u32> {
+        let w = out.nodes()[v as usize].width;
+        let konst = |out: &mut MbaExpr, c: BitVec| out.push(MOp::Const(c), &[]).ok();
+        match *self {
+            Link::Xor(c) => {
+                let k = konst(out, c)?;
+                out.push(MOp::Xor, &[v, k]).ok()
+            }
+            Link::Add(c) => {
+                let k = konst(out, BitVec::un_unchecked(UnOp::Neg, &c))?;
+                out.push(MOp::Add, &[v, k]).ok()
+            }
+            Link::RevSub(c) => {
+                let k = konst(out, c)?;
+                out.push(MOp::Sub, &[k, v]).ok()
+            }
+            Link::Mul(c) => {
+                let k = konst(out, crate::invert::mul_inverse(&c)?)?;
+                debug_assert_eq!(out.nodes()[k as usize].width, w);
+                out.push(MOp::Mul, &[v, k]).ok()
+            }
+            Link::Neg => out.push(MOp::Neg, &[v]).ok(),
+            Link::Not => out.push(MOp::Not, &[v]).ok(),
+        }
+    }
+}
+
+/// The question `a == b` with a variable `x` replaced by a bijection of an atom: for an
+/// arithmetic node read by a bitwise operator (an atom to the tests) that is a chain of
+/// invertible links over `x` alone (`^ c`, `+ c`, `− c`, `c −`, `· odd`, `−`, `~`), say
+/// `t = (x ^ c) + k`, both sides are rewritten over `t` in `x`'s slot: `x` is `(t − k) ^ c`, every
+/// node of the chain the matching inverse of `t`, the atom `t` itself. As `x ↦ t` is a bijection
+/// of the variable's values, the sides are equal everywhere exactly when the rewritten ones are,
+/// and an input where those differ gives one where these do (`x` the inverse at it).
+///
+/// The tests read an atom and the variable inside it as independent, so a side that reads both
+/// (`(x ^ c)·m` beside bitwise functions of `t`, or `k' − (x ^ c)`, which is `~t` when
+/// `k + k' = −1`) differs from its answer over them though not over `x`. Over `t` the chain reads
+/// `t` and its inverses: arithmetic of `t` alone, which the tests take as it is, and a semi-linear
+/// question over `t` is decided at its single bits. Candidates most read first.
+pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
+    let Some(w) = a.width() else {
+        return Vec::new();
+    };
+    if a.vars() != b.vars() || b.width() != Some(w) {
+        return Vec::new();
+    }
+    // Both sides in one hash-consed list, so a chain node of one is found in the other.
+    let total = a.nodes().len() + b.nodes().len();
+    let mut nodes: Vec<MNode> = Vec::with_capacity(total);
+    let mut intern = NodeTable::with_room(total);
+    let mut roots = [0u32; 2];
+    for (side, m) in [a, b].into_iter().enumerate() {
+        let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
+        for n in m.nodes() {
+            let mut node = *n;
+            for k in 0..n.op.arity() {
+                node.args[k] = map[n.args[k] as usize];
+            }
+            if commutative(&node.op) && node.args[0] > node.args[1] {
+                node.args.swap(0, 1);
+            }
+            map.push(intern.intern(&mut nodes, node));
+        }
+        let Some(&r) = map.last() else {
+            return Vec::new();
+        };
+        roots[side] = r;
+    }
+    let cst = constants(&nodes);
+    // Arithmetic nodes read by a bitwise operator, with how often.
+    let bitwise = |op: MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor);
+    let arith = |op: MOp| matches!(op, MOp::Add | MOp::Sub | MOp::Mul | MOp::Neg);
+    let mut reads: HashMap<u32, usize> = HashMap::default();
+    for n in &nodes {
+        if bitwise(n.op) || n.op == MOp::Not {
+            for &k in &n.args[..n.op.arity()] {
+                if arith(nodes[k as usize].op) && cst[k as usize].is_none() {
+                    *reads.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    // Each one's chain down to a variable, top first.
+    let chain = |top: u32| -> Option<(u32, Vec<(u32, Link)>)> {
+        let mut links = Vec::new();
+        let mut cur = top;
+        for _ in 0..16 {
+            let n = nodes[cur as usize];
+            if n.width != w {
+                return None;
+            }
+            let c = |k: usize| cst[n.args[k] as usize];
+            let (link, next) = match n.op {
+                MOp::Var(x) => return Some((x, links)),
+                MOp::Add => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::Add(k), n.args[1]),
+                    (None, Some(k)) => (Link::Add(k), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Sub => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::RevSub(k), n.args[1]),
+                    (None, Some(k)) => (Link::Add(BitVec::un_unchecked(UnOp::Neg, &k)), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Xor => match (c(0), c(1)) {
+                    (Some(k), None) => (Link::Xor(k), n.args[1]),
+                    (None, Some(k)) => (Link::Xor(k), n.args[0]),
+                    _ => return None,
+                },
+                MOp::Mul => match (c(0), c(1)) {
+                    (Some(k), None) | (None, Some(k)) if k.bit(0) == Some(true) => {
+                        let u = if c(0).is_some() { n.args[1] } else { n.args[0] };
+                        (Link::Mul(k), u)
+                    }
+                    _ => return None,
+                },
+                MOp::Neg => (Link::Neg, n.args[0]),
+                MOp::Not => (Link::Not, n.args[0]),
+                _ => return None,
+            };
+            links.push((cur, link));
+            cur = next;
+        }
+        None
+    };
+    let mut cands: Vec<(usize, u32)> = reads.iter().map(|(&k, &n)| (n, k)).collect();
+    cands.sort_by_key(|&(n, k)| (std::cmp::Reverse(n), k));
+    let mut out: Vec<Change> = Vec::new();
+    for (_, top) in cands {
+        if out.len() == CHANGE_TRIES {
+            break;
+        }
+        let Some((x, links)) = chain(top) else {
+            continue;
+        };
+        if out.iter().any(|c| c.var == x) || a.vars()[x as usize] != w {
+            continue;
+        }
+        let rebuild = |root: u32| -> Option<MbaExpr> {
+            let mut m = MbaExpr::new(a.vars().to_vec());
+            // The chain over `t`, top down: the atom is `t`, each node below the inverse of
+            // its link applied to the one above.
+            let mut map: HashMap<u32, u32> = HashMap::default();
+            let mut v = m.push(MOp::Var(x), &[]).ok()?;
+            for &(node, link) in &links {
+                map.insert(node, v);
+                v = link.undo(&mut m, v)?;
+            }
+            // `v` is now `x` as a function of `t`.
+            let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+            while let Some((i, expanded)) = stack.pop() {
+                if map.contains_key(&i) {
+                    continue;
+                }
+                let n = nodes[i as usize];
+                if let MOp::Var(y) = n.op
+                    && y == x
+                {
+                    map.insert(i, v);
+                    continue;
+                }
+                if !expanded {
+                    stack.push((i, true));
+                    for &k in &n.args[..n.op.arity()] {
+                        stack.push((k, false));
+                    }
+                    continue;
+                }
+                let args: Vec<u32> = n.args[..n.op.arity()].iter().map(|k| map[k]).collect();
+                let id = match n.op {
+                    MOp::Zext | MOp::Sext | MOp::Trunc => m.push_cast(n.op, args[0], n.width),
+                    op => m.push(op, &args),
+                }
+                .ok()?;
+                map.insert(i, id);
+            }
+            // The root must be the last node.
+            let r = map[&root];
+            if r as usize + 1 != m.nodes().len() {
+                let n = m.nodes()[r as usize];
+                let zero = m.push(MOp::Const(BitVec::zero(n.width)), &[]).ok()?;
+                m.push(MOp::Add, &[r, zero]).ok()?;
+            }
+            Some(m)
+        };
+        let (Some(ca), Some(cb)) = (rebuild(roots[0]), rebuild(roots[1])) else {
+            continue;
+        };
+        let mut inverse = MbaExpr::new(a.vars().to_vec());
+        let Some(mut v) = inverse.push(MOp::Var(x), &[]).ok() else {
+            continue;
+        };
+        let mut ok = true;
+        for &(_, link) in &links {
+            match link.undo(&mut inverse, v) {
+                Some(u) => v = u,
+                None => ok = false,
+            }
+        }
+        if !ok {
+            continue;
+        }
+        out.push(Change {
+            a: ca,
+            b: cb,
+            var: x,
+            inverse,
+        });
+    }
+    out
+}
+
+/// What the cheapest direct test on `a` and `b` costs in node evaluations, when one applies
+/// and is not too big to run: a complete test, so one that runs decides the question.
+pub(crate) fn direct_cost(a: &MbaExpr, b: &MbaExpr) -> Option<u64> {
+    if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
+        return None;
+    }
+    let (pa, pb) = (profile(a)?, profile(b)?);
+    let p = plan(a, &pa, &pb)?;
+    let (qa, qb) = (Program::new(a, false)?, Program::new(b, false)?);
+    let per = (qa.len() + qb.len()) as u64;
+    let lane = match Kind::of(qa.widest().max(qb.widest())) {
+        Kind::N64 => 1,
+        Kind::N128 => 2,
+        Kind::Wide => 8,
+    };
+    (p.points <= MAX_POINTS && p.points.saturating_mul(per).saturating_mul(lane) <= MAX_EFFORT)
+        .then(|| p.points.saturating_mul(per))
+}
+
+/// [`prove`] within `depth` splits; `lowered`: known bits were already read as arithmetic;
+/// `change`: a change of variable may be tried (see [`changes_of_variable`]).
 fn prove_at<M: Meter>(
     a: &MbaExpr,
     b: &MbaExpr,
     meter: &mut M,
     depth: u32,
     lowered: bool,
+    change: bool,
 ) -> Result<Report, M::Err> {
     let mut report = Report::new();
     if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
@@ -1180,19 +2381,28 @@ fn prove_at<M: Meter>(
         }
     }
     if compose {
-        Compose::new(a, b).prove(meter, &mut report)?;
+        let mut cmp = Compose::new(a, b);
+        cmp.prove(meter, &mut report)?;
+        cmp.recycle();
     }
     // Arithmetic read bitwise without products, which the atoms left open: bit-serially,
     // exactly.
-    if compose
+    let carried = compose
         && report.verdict == Verdict::Unknown
         && !report.over_budget
-        && carries(meter, a, b, &mut report)?
-    {
+        && carries(meter, a, b, &mut report)?;
+    if carried {
         return Ok(report);
     }
     // Undecided for lack of budget: more budget may decide it directly; nothing more is spent.
     if report.verdict != Verdict::Unknown || report.over_budget {
+        return Ok(report);
+    }
+    // The same question over an atom that is a bijection of one variable, in that variable's
+    // place (see `changes_of_variable`): before the readings below, which split and lower
+    // the question as it is and cost more.
+    let ch = change && changed(a, b, meter, &mut report)?;
+    if ch {
         return Ok(report);
     }
     // The same question with known bits read as arithmetic (equal functions, so a verdict on
@@ -1208,7 +2418,7 @@ fn prove_at<M: Meter>(
         if la.is_some() || lb.is_some() {
             let la = la.unwrap_or_else(|| a.clone());
             let lb = lb.unwrap_or_else(|| b.clone());
-            let sub = prove_at(&la, &lb, meter, depth, true)?;
+            let sub = prove_at(&la, &lb, meter, depth, true, false)?;
             report.points += sub.points;
             report.over_budget |= sub.over_budget;
             report.internal += sub.internal;
@@ -1360,6 +2570,199 @@ pub(crate) fn lower_known_bits(m: &MbaExpr) -> Option<MbaExpr> {
             },
         };
         facts.push(f);
+        map.push(r);
+    }
+    changed.then_some(out)
+}
+
+/// `m` with every sum of two bitwise terms that can share no set bit read as their `|`, and
+/// every difference `a − b` of two where `b` can have a bit only where `a` has it read as
+/// `a ^ b`: no carry and no borrow, so the same value at every input. A bitwise term here is
+/// a constant or a node made by `& | ^ ~` (or by a sum or difference so read), also through a
+/// zero extension or a truncation; the bits are what those operators, the constants and the
+/// constant shifts fix.
+///
+/// The arena's normal forms and the obfuscators both write such a function with `+` and `−`
+/// (`(~x & m) + k` for `(~x & m) | k`, `c − (x & m)` for `c ^ (x & m)`), and under a mask it is
+/// then arithmetic under a bitwise operator: an atom to the tests, unrelated to `x`, where
+/// the bitwise function is a term they decide at single bit positions. A sum with an operand
+/// that is no bitwise term stays a sum (`(x << 4) + (y & 15)` is linear as it is). `None`
+/// when there is none.
+pub(crate) fn raise_disjoint(m: &MbaExpr) -> Option<MbaExpr> {
+    // Every certificate asks this of both sides first; up to 64 bits the known bits are
+    // machine words.
+    if m.nodes().iter().all(|n| n.width.bits() <= 64) {
+        let raised = raise_disjoint_words(m);
+        debug_assert_eq!(
+            raised,
+            raise_disjoint_any(m),
+            "sums read over words differ from sums read over values"
+        );
+        return raised;
+    }
+    raise_disjoint_any(m)
+}
+
+/// [`raise_disjoint`] when no node is wider than 64 bits: the same known bits, as words, and
+/// the expression rebuilt only when a sum or difference is read otherwise.
+fn raise_disjoint_words(m: &MbaExpr) -> Option<MbaExpr> {
+    let nodes = m.nodes();
+    let word = |v: &BitVec| <u64 as Lane>::from_bv(v);
+    // The known-zero and known-one bits of each node, and whether it is a bitwise term.
+    let mut bits: Vec<(u64, u64)> = Vec::with_capacity(nodes.len());
+    let mut term: Vec<bool> = Vec::with_capacity(nodes.len());
+    // Per node: 0 as it is, 1 read as `|`, 2 read as `^`.
+    let mut read: Vec<u8> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for n in nodes {
+        let at = |k: usize| bits[n.args[k] as usize];
+        let terms = |k: usize| term[n.args[k] as usize];
+        let or = |(za, oa): (u64, u64), (zb, ob): (u64, u64)| (za & zb, oa | ob);
+        let xor = |(za, oa): (u64, u64), (zb, ob): (u64, u64)| {
+            ((za & zb) | (oa & ob), (za & ob) | (oa & zb))
+        };
+        let width = n.width.bits();
+        let ones = <u64 as Lane>::mask(n.width);
+        let (as_op, known, is_term) = match n.op {
+            MOp::Const(v) => (0, (!word(&v) & ones, word(&v)), true),
+            MOp::Not => (0, (at(0).1, at(0).0), true),
+            MOp::And => {
+                let ((za, oa), (zb, ob)) = (at(0), at(1));
+                (0, (za | zb, oa & ob), true)
+            }
+            MOp::Or => (0, or(at(0), at(1)), true),
+            MOp::Xor => (0, xor(at(0), at(1)), true),
+            MOp::Zext => {
+                let (z, o) = at(0);
+                let low = <u64 as Lane>::mask(nodes[n.args[0] as usize].width);
+                (0, (z | (ones & !low), o), terms(0))
+            }
+            MOp::Trunc => {
+                let (z, o) = at(0);
+                (0, (z & ones, o & ones), terms(0))
+            }
+            MOp::Shl(k) => {
+                let (z, o) = at(0);
+                let shl = |x: u64| if k >= width { 0 } else { (x << k) & ones };
+                let low = !shl(ones) & ones;
+                (0, (shl(z) | low, shl(o)), false)
+            }
+            MOp::LShr(k) => {
+                let (z, o) = at(0);
+                let lshr = |x: u64| if k >= width { 0 } else { x >> k };
+                let high = !lshr(ones) & ones;
+                (0, (lshr(z) | high, lshr(o)), false)
+            }
+            // No bit set in both: no carry.
+            MOp::Add if terms(0) && terms(1) && (at(0).0 | at(1).0) == ones => {
+                (1, or(at(0), at(1)), true)
+            }
+            // The subtrahend's bits all among the minuend's: no borrow.
+            MOp::Sub if terms(0) && terms(1) && (at(0).1 | at(1).0) == ones => {
+                (2, xor(at(0), at(1)), true)
+            }
+            _ => (0, (0, 0), false),
+        };
+        changed |= as_op != 0;
+        bits.push(known);
+        term.push(is_term);
+        read.push(as_op);
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    for (n, &as_op) in nodes.iter().zip(&read) {
+        let op = match as_op {
+            1 => MOp::Or,
+            2 => MOp::Xor,
+            _ => n.op,
+        };
+        match op {
+            MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(op, n.args[0], n.width).ok()?,
+            op => out.push(op, &n.args[..n.op.arity()]).ok()?,
+        };
+    }
+    Some(out)
+}
+
+/// [`raise_disjoint`] at any width.
+fn raise_disjoint_any(m: &MbaExpr) -> Option<MbaExpr> {
+    use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_or, bv_shl};
+    let nodes = m.nodes();
+    // The known-zero and known-one bits of each node, and whether it is a bitwise term.
+    let mut bits: Vec<(BitVec, BitVec)> = Vec::with_capacity(nodes.len());
+    let mut term: Vec<bool> = Vec::with_capacity(nodes.len());
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for n in nodes {
+        let at = |k: usize| bits[n.args[k] as usize];
+        let terms = |k: usize| term[n.args[k] as usize];
+        let or = |(za, oa): (BitVec, BitVec), (zb, ob): (BitVec, BitVec)| {
+            (bv_and(&za, &zb), bv_or(&oa, &ob))
+        };
+        let xor = |(za, oa): (BitVec, BitVec), (zb, ob): (BitVec, BitVec)| {
+            (
+                bv_or(&bv_and(&za, &zb), &bv_and(&oa, &ob)),
+                bv_or(&bv_and(&za, &ob), &bv_and(&oa, &zb)),
+            )
+        };
+        let unknown = (BitVec::zero(n.width), BitVec::zero(n.width));
+        let ones = BitVec::ones(n.width);
+        let (op, known, is_term) = match n.op {
+            MOp::Const(v) => (n.op, (bv_not(&v), v), true),
+            MOp::Not => (n.op, (at(0).1, at(0).0), true),
+            MOp::And => {
+                let ((za, oa), (zb, ob)) = (at(0), at(1));
+                (n.op, (bv_or(&za, &zb), bv_and(&oa, &ob)), true)
+            }
+            MOp::Or => (n.op, or(at(0), at(1)), true),
+            MOp::Xor => (n.op, xor(at(0), at(1)), true),
+            MOp::Zext => {
+                let (z, o) = at(0);
+                let low = BitVec::ones(z.width()).zext(n.width).ok()?;
+                let z = bv_or(&z.zext(n.width).ok()?, &bv_not(&low));
+                (n.op, (z, o.zext(n.width).ok()?), terms(0))
+            }
+            MOp::Trunc => {
+                let (z, o) = at(0);
+                let known = (z.trunc(n.width).ok()?, o.trunc(n.width).ok()?);
+                (n.op, known, terms(0))
+            }
+            MOp::Shl(k) => {
+                let (z, o) = at(0);
+                let k = u32::from(k);
+                let low = bv_not(&bv_shl(&ones, k));
+                (n.op, (bv_or(&bv_shl(&z, k), &low), bv_shl(&o, k)), false)
+            }
+            MOp::LShr(k) => {
+                let (z, o) = at(0);
+                let k = u32::from(k);
+                let high = bv_not(&bv_lshr(&ones, k));
+                (n.op, (bv_or(&bv_lshr(&z, k), &high), bv_lshr(&o, k)), false)
+            }
+            // No bit set in both: no carry.
+            MOp::Add if terms(0) && terms(1) && bv_or(&at(0).0, &at(1).0).is_ones() => {
+                (MOp::Or, or(at(0), at(1)), true)
+            }
+            // The subtrahend's bits all among the minuend's: no borrow.
+            MOp::Sub if terms(0) && terms(1) && bv_or(&at(0).1, &at(1).0).is_ones() => {
+                (MOp::Xor, xor(at(0), at(1)), true)
+            }
+            _ => (n.op, unknown, false),
+        };
+        changed |= op != n.op;
+        let args: Vec<u32> = n.args[..n.op.arity()]
+            .iter()
+            .map(|&x| map[x as usize])
+            .collect();
+        let r = match op {
+            MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(op, args[0], n.width).ok()?,
+            op => out.push(op, &args).ok()?,
+        };
+        bits.push(known);
+        term.push(is_term);
         map.push(r);
     }
     changed.then_some(out)
@@ -1592,7 +2995,7 @@ fn split<M: Meter>(
             return Ok(());
         };
         let before = meter.left();
-        let sub = prove_at(&sa, &sb, meter, depth + 1, false)?;
+        let sub = prove_at(&sa, &sb, meter, depth + 1, false, false)?;
         spent = spent.saturating_add(before.saturating_sub(meter.left()));
         report.points += sub.points;
         report.over_budget |= sub.over_budget;
@@ -1654,6 +3057,14 @@ enum Ctx {
 enum Policy {
     /// Only where the fragment requires it (opaque nodes, arithmetic read bitwise).
     Minimal,
+    /// The atoms of [`Minimal`](Self::Minimal), each read as its class's bitwise
+    /// representative where it has one (see [`Linear`](Self::Linear)), operators with
+    /// constants included: equal to the atom at every input, over atoms of earlier classes,
+    /// so the skeleton has fewer independent atoms and stays semi-linear where it was. Two
+    /// atoms that are complements (`k − t` and `t + (−1 − k)`, both read bitwise) are one atom
+    /// and its complement: a semi-linear question over that one atom, which the single-bit
+    /// test decides, where as two independent atoms the skeletons differ.
+    Reps,
     /// The same atoms, read closer to their definitions: an atom whose class has a bitwise
     /// representative (a member that is a bitwise function of atoms of earlier classes and of
     /// variables, proved equal to it) is that function, and a bitwise function of atoms read
@@ -1688,16 +3099,63 @@ struct Compose {
     /// The two sides' nodes come first; the others are synthetic (complements of atoms,
     /// bitwise forms found at the sample), evaluated and paired like them but on neither side.
     sides: usize,
-    intern: HashMap<MNode, u32>,
+    intern: NodeTable,
     /// Per class root: its bitwise representative, if any (see [`Policy::Linear`]).
     rep: Vec<Option<u32>>,
-    /// The sample points and every node's values there, when those fit in 64 bits: each
-    /// skeleton is checked against its side's values before a test decides on it.
-    sample: Option<SampleValues>,
+    /// The sample points, and per node a digest of its value at each (the value itself up to
+    /// 64 bits).
+    points: Vec<Vec<BitVec>>,
+    digests: Vec<Vec<u64>>,
+    /// When the values fit in 64 bits, each skeleton is checked against its side's values
+    /// before a test decides on it ([`Compose::agrees`]): the number of nodes whose values the
+    /// check reads (those there were when it was last set up; nodes added since have none
+    /// to it).
+    checked: Option<usize>,
 }
 
-/// Sample points, and per node its values at them.
-type SampleValues = (Vec<Vec<BitVec>>, Vec<Vec<u64>>);
+/// A pair of skeletons one comparison built, with what it found: a later policy that builds
+/// the same pair for the same two nodes (nothing was paired in between) is compared from here.
+struct Pair {
+    sx: Vec<SkelNode>,
+    sy: Vec<SkelNode>,
+    slots: Vec<(Slot, Width)>,
+    /// `None`: the skeletons are not both polynomial expressions at the nodes' width.
+    built: Option<Built>,
+}
+
+/// The skeletons of a [`Pair`] as expressions, and what does not depend on the budget.
+struct Built {
+    a: MbaExpr,
+    b: MbaExpr,
+    progs: Option<(Program, Program)>,
+    /// They agree with their nodes at the sample.
+    agreed: bool,
+    /// The cheapest direct test, if any applies (asked only of skeletons that agree).
+    plan: Option<Plan>,
+    tested: Tested,
+}
+
+/// A node's width and its sample values, as a table key (hashed four words abreast).
+#[derive(PartialEq, Eq)]
+struct RowKey<'a>(u16, &'a [u64]);
+
+impl core::hash::Hash for RowKey<'_> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = [u64::from(self.0), 1, 2, 3];
+        let (fours, rest) = self.1.as_chunks::<4>();
+        for c in fours {
+            for (x, &d) in h.iter_mut().zip(c) {
+                *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
+            }
+        }
+        for (x, &d) in h.iter_mut().zip(rest) {
+            *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
+        }
+        state.write_u64(h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48));
+        state.write_usize(self.1.len());
+    }
+}
 
 /// The most distinct leaves of a bitwise function expanded by [`Policy::Linear`] (a table of
 /// `2^k` entries), and of a bitwise form looked for at the sample.
@@ -1707,10 +3165,45 @@ fn commutative(op: &MOp) -> bool {
     matches!(op, MOp::Add | MOp::Mul | MOp::And | MOp::Or | MOp::Xor)
 }
 
+/// The index of node `i` read in `ctx`, in a table with two entries per node.
+#[inline]
+fn read_slot(i: u32, ctx: Ctx) -> usize {
+    2 * i as usize + usize::from(ctx == Ctx::Bitwise)
+}
+
+/// The skeleton node built for each node and context, by [`read_slot`].
+struct SkelMemo(Vec<u32>);
+
+impl SkelMemo {
+    const NONE: u32 = u32::MAX;
+
+    fn new(nodes: usize) -> SkelMemo {
+        SkelMemo(vec![Self::NONE; 2 * nodes])
+    }
+
+    #[inline]
+    fn contains(&self, i: u32, ctx: Ctx) -> bool {
+        self.0[read_slot(i, ctx)] != Self::NONE
+    }
+
+    #[inline]
+    fn get(&self, i: u32, ctx: Ctx) -> Option<u32> {
+        let v = self.0[read_slot(i, ctx)];
+        (v != Self::NONE).then_some(v)
+    }
+
+    #[inline]
+    fn insert(&mut self, i: u32, ctx: Ctx, at: u32) {
+        self.0[read_slot(i, ctx)] = at;
+    }
+}
+
 impl Compose {
     fn new(a: &MbaExpr, b: &MbaExpr) -> Compose {
-        let mut nodes: Vec<MNode> = Vec::new();
-        let mut intern: HashMap<MNode, u32> = HashMap::new();
+        // Room for both sides and the nodes added to them (complements, bitwise forms).
+        let total = a.nodes().len() + b.nodes().len();
+        let mut nodes: Vec<MNode> = Vec::with_capacity(total + total / 2);
+        let mut intern = NodeTable::with_room(total + total / 2);
         let mut roots = [0u32; 2];
         for (side, m) in [a, b].into_iter().enumerate() {
             let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -1722,11 +3215,7 @@ impl Compose {
                 if commutative(&node.op) && node.args[0] > node.args[1] {
                     node.args.swap(0, 1);
                 }
-                let id = *intern.entry(node).or_insert_with(|| {
-                    nodes.push(node);
-                    nodes.len() as u32 - 1
-                });
-                map.push(id);
+                map.push(intern.intern(&mut nodes, node));
             }
             roots[side] = map.last().copied().unwrap_or(0);
         }
@@ -1756,7 +3245,9 @@ impl Compose {
             sides: len,
             intern,
             rep: Vec::new(),
-            sample: None,
+            points: Vec::new(),
+            digests: Vec::new(),
+            checked: None,
         };
         c.mark_forced();
         c.add_complements();
@@ -1779,7 +3270,7 @@ impl Compose {
         if commutative(&node.op) && node.args[0] > node.args[1] {
             node.args.swap(0, 1);
         }
-        if let Some(&i) = self.intern.get(&node) {
+        if let Some(i) = self.intern.get(&self.nodes, &node) {
             return i;
         }
         let i = self.nodes.len() as u32;
@@ -1806,7 +3297,7 @@ impl Compose {
         self.abstracted.push(false);
         self.var_member.push(None);
         self.forced.push(false);
-        self.intern.insert(node, i);
+        self.intern.insert(&self.nodes, i);
         i
     }
 
@@ -1828,10 +3319,10 @@ impl Compose {
     /// Marks the nodes abstracted wherever they are read (opaque nodes, arithmetic read by a
     /// bitwise operator) and the operands of opaque nodes (definitions compared on their own).
     fn mark_forced(&mut self) {
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::new();
+        let mut seen = vec![false; 2 * self.nodes.len()];
         let mut stack = vec![(self.root_a, Ctx::Arith), (self.root_b, Ctx::Arith)];
         while let Some((i, ctx)) = stack.pop() {
-            if seen.insert((i, ctx), ()).is_some() {
+            if std::mem::replace(&mut seen[read_slot(i, ctx)], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -1906,71 +3397,94 @@ impl Compose {
         }
         meter.charge(units)?;
         report.points += SAMPLE_POINTS as u64;
-        let seed = crate::hash::combine(all.key()[0], all.key()[1]);
-        let points = sample_points(&self.vars, &[&all], seed);
-        let mut digests = digests(&prog, &points, self.nodes.len());
+        // The sample's first points do not depend on its seed, and the seed is a hash of the
+        // union of both sides, which costs more than evaluating the union at the sample. So
+        // the sides are compared at those points first: where they differ there, that point
+        // is the first of the whole sample where they do, and the refutation is the one the
+        // whole sample gives, without its seed or its other points.
         let (ra, rb) = (self.root_a as usize, self.root_b as usize);
-        if let Some(p) = (0..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
+        let mut points = fixed_points(&self.vars, &[&all]);
+        let fixed = points.len();
+        let mut digests = digests(&prog, &points, self.nodes.len());
+        if let Some(p) = (0..fixed).find(|&p| digests[ra][p] != digests[rb][p]) {
             // A real input where the sides differ.
             report.verdict = Verdict::Refuted;
             report.counterexample = Some(points[p].clone());
+            give_rows(&mut digests);
+            return Ok(());
+        }
+        let seed = crate::hash::combine(all.key()[0], all.key()[1]);
+        seeded_points(&self.vars, seed, &mut points);
+        if points.len() > fixed {
+            // The other points' values, after the fixed points' in each row.
+            let mut rest = self::digests(&prog, &points[fixed..], self.nodes.len());
+            for (row, more) in digests.iter_mut().zip(&rest) {
+                row.extend_from_slice(more);
+            }
+            give_rows(&mut rest);
+        }
+        if let Some(p) = (fixed..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
+            // A real input where the sides differ.
+            report.verdict = Verdict::Refuted;
+            report.counterexample = Some(points[p].clone());
+            give_rows(&mut digests);
             return Ok(());
         }
         let values = prog.widest() <= 64;
+        self.points = points;
+        self.digests = digests;
         if values {
-            self.sample = Some((points.clone(), digests.clone()));
+            self.checked = Some(self.digests.len());
         }
-        // Group nodes by width and sample values; pair within groups, operands first.
-        let key = |i: usize| {
-            let mut h = u64::from(self.nodes[i].width.bits());
-            for &d in &digests[i] {
-                h = crate::hash::combine(h, d);
+        // Group nodes by width and sample values; pair within groups, operands first. Only
+        // the groups of the forced nodes are paired: per node its group, if it has one.
+        const NO_GROUP: u32 = u32::MAX;
+        let (group, count) = {
+            let row = |i: usize| RowKey(self.nodes[i].width.bits(), &self.digests[i]);
+            let mut ids: HashMap<RowKey<'_>, u32> = HashMap::default();
+            for i in (0..self.nodes.len()).filter(|&i| self.forced[i]) {
+                let next = ids.len() as u32;
+                ids.entry(row(i)).or_insert(next);
             }
-            h
+            let group: Vec<u32> = (0..self.nodes.len())
+                .map(|i| ids.get(&row(i)).copied().unwrap_or(NO_GROUP))
+                .collect();
+            (group, ids.len())
         };
-        let keys: Vec<u64> = (0..self.nodes.len()).map(key).collect();
-        let wanted: std::collections::HashSet<u64> = (0..self.nodes.len())
-            .filter(|&i| self.forced[i])
-            .map(|i| keys[i])
-            .collect();
-        let mut groups: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new(); count];
         for i in 0..self.nodes.len() as u32 {
-            let k = keys[i as usize];
-            if self.role[i as usize] == Role::Const || !wanted.contains(&k) {
+            let g = group[i as usize];
+            if self.role[i as usize] == Role::Const || g == NO_GROUP {
                 continue;
             }
-            let peers = groups.entry(k).or_default().clone();
-            let mut tries = 0;
-            for m in peers {
-                if digests[m as usize] != digests[i as usize] {
-                    continue;
-                }
+            let peers = std::mem::take(&mut groups[g as usize]);
+            for (tries, &m) in peers.iter().enumerate() {
                 if self.find(m) == self.find(i) {
                     break;
                 }
                 if tries >= PAIR_TRIES {
                     break;
                 }
-                tries += 1;
                 if self.equal_defs(meter, report, i, m)? {
                     self.union(i, m);
                     break;
                 }
             }
-            groups.entry(k).or_default().push(i);
+            groups[g as usize] = peers;
+            groups[g as usize].push(i);
         }
         // Atoms that are bitwise functions of the leaves of their definitions, at 64 bits or
         // fewer (where a digest is the value).
         self.compute_reps();
         if values {
-            self.bitwise_forms(meter, report, &mut digests)?;
+            self.bitwise_forms(meter, report)?;
             self.compute_reps();
-            self.sample = Some((points.clone(), digests.clone()));
+            self.checked = Some(self.digests.len());
         }
         // Every class agrees at the sample (a pairing that does not is a bug: decline).
         for i in 0..self.nodes.len() as u32 {
             let r = self.find(i);
-            if digests[r as usize] != digests[i as usize] {
+            if self.digests[r as usize] != self.digests[i as usize] {
                 report.internal += 1;
                 return Ok(());
             }
@@ -1979,14 +3493,16 @@ impl Compose {
             report.verdict = Verdict::Proved;
             return Ok(());
         }
+        let mut seen: Vec<Pair> = Vec::new();
         for policy in [
             Policy::Minimal,
+            Policy::Reps,
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
         ] {
             let (a, b) = (self.root_a, self.root_b);
-            match self.compare(meter, report, a, b, policy)? {
+            match self.compare(meter, report, a, b, policy, &mut seen)? {
                 (Some(Verdict::Proved), _) => {
                     report.verdict = Verdict::Proved;
                     return Ok(());
@@ -2023,13 +3539,15 @@ impl Compose {
                 && ni.width == nm.width
                 && self.find(ni.args[0]) == self.find(nm.args[0]));
         }
+        let mut seen: Vec<Pair> = Vec::new();
         for policy in [
             Policy::Minimal,
+            Policy::Reps,
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
         ] {
-            if self.compare(meter, report, i, m, policy)?.0 == Some(Verdict::Proved) {
+            if self.compare(meter, report, i, m, policy, &mut seen)?.0 == Some(Verdict::Proved) {
                 return Ok(true);
             }
         }
@@ -2039,6 +3557,11 @@ impl Compose {
     /// Compares the skeletons of nodes `x` and `y` under `policy` with a direct test. `Refuted`
     /// (with the input where they differ, in the original variables) only when no atom got a
     /// variable of its own: then the skeletons equal the expressions at every input.
+    ///
+    /// `seen` holds the pairs of skeletons already compared for these two nodes (by earlier
+    /// policies, with nothing paired in between). A policy that builds one of them again is
+    /// compared from what was found then: the same decisions on what is left of the budget,
+    /// the same charges, the same answer.
     fn compare<M: Meter>(
         &mut self,
         meter: &mut M,
@@ -2046,6 +3569,30 @@ impl Compose {
         x: u32,
         y: u32,
         policy: Policy,
+        seen: &mut Vec<Pair>,
+    ) -> Result<Compared, M::Err> {
+        let mut lanes = take_lanes();
+        let out = self.compare_in(meter, report, x, y, policy, seen, &mut lanes);
+        give_lanes(lanes);
+        out
+    }
+
+    /// Ends the comparison: its sample's rows go back to the thread.
+    fn recycle(mut self) {
+        give_rows(&mut self.digests);
+    }
+
+    /// [`Compose::compare`], evaluating in `lanes`.
+    #[allow(clippy::too_many_arguments)]
+    fn compare_in<M: Meter>(
+        &mut self,
+        meter: &mut M,
+        report: &mut Report,
+        x: u32,
+        y: u32,
+        policy: Policy,
+        seen: &mut Vec<Pair>,
+        lanes: &mut Lanes<u64>,
     ) -> Result<Compared, M::Err> {
         let mut vm = VarMap::default();
         let (sx, sy) = if policy == Policy::Linear {
@@ -2063,41 +3610,76 @@ impl Compose {
             return Ok((None, None));
         };
         let w = self.nodes[x as usize].width;
-        let (Some(a), Some(b)) = (vm.expr(&sx, w), vm.expr(&sy, w)) else {
+        let at = seen
+            .iter()
+            .position(|p| p.slots == vm.slots && p.sx == sx && p.sy == sy);
+        let pair = match at {
+            Some(at) => &mut seen[at],
+            None => {
+                let built = self.built(&vm, &sx, &sy, x, y, lanes);
+                seen.push(Pair {
+                    sx,
+                    sy,
+                    slots: vm.slots.clone(),
+                    built,
+                });
+                let last = seen.len() - 1;
+                &mut seen[last]
+            }
+        };
+        let Some(Built {
+            a,
+            b,
+            progs,
+            agreed,
+            plan,
+            tested,
+        }) = pair.built.as_mut()
+        else {
             return Ok((None, None));
         };
-        let (Some(pa), Some(pb)) = (profile(&a), profile(&b)) else {
-            return Ok((None, None));
-        };
-        if !(pa.poly && pb.poly) {
-            return Ok((None, None));
-        }
+        let (a, b): (&MbaExpr, &MbaExpr) = (a, b);
         // A skeleton is its side's value wherever its variables take their nodes' values: at
         // the sample it must be. One that is not would be a bug; decline.
-        if !self.agrees(&vm, [(&a, x), (&b, y)]) {
+        if !*agreed {
             report.internal += 1;
             return Ok((None, None));
         }
-        let Some(p) = plan(&a, &pa, &pb) else {
-            if symbolic(meter, &a, &b, report)? {
+        let Some(p) = plan.as_ref() else {
+            let sym = symbolic_seen(meter, a, b, report, &mut tested.symbolic)?;
+            if sym {
                 report.cert = Some(Cert::Symbolic);
                 return Ok((Some(Verdict::Proved), None));
             }
             if policy == Policy::Linear {
-                return self.eliminate(meter, report, &mut vm, [a, b], w);
+                let e = self.eliminate(meter, report, &mut vm, [a, b], w, lanes);
+                return e;
             }
             return Ok((None, None));
         };
-        let direct = run(meter, &a, &b, &p, report)?;
-        if matches!(direct, Run::TooBig | Run::OverBudget) && symbolic(meter, &a, &b, report)? {
-            report.cert = Some(Cert::Symbolic);
-            return Ok((Some(Verdict::Proved), None));
+        let direct = test_with(
+            meter,
+            [a, b],
+            progs.as_ref(),
+            p,
+            report,
+            true,
+            tested,
+            Some(lanes),
+        )?;
+        if matches!(direct, Run::TooBig | Run::OverBudget) {
+            let sym = symbolic_seen(meter, a, b, report, &mut tested.symbolic)?;
+            if sym {
+                report.cert = Some(Cert::Symbolic);
+                return Ok((Some(Verdict::Proved), None));
+            }
         }
         if policy == Policy::Linear
             && vm.abstracted
             && matches!(direct, Run::Differ(_) | Run::TooBig)
         {
-            return self.eliminate(meter, report, &mut vm, [a, b], w);
+            let e = self.eliminate(meter, report, &mut vm, [a, b], w, lanes);
+            return e;
         }
         Ok(match direct {
             Run::Equal(cert) => {
@@ -2119,13 +3701,50 @@ impl Compose {
         })
     }
 
+    /// The skeletons `sx` and `sy` of nodes `x` and `y` as expressions over `vm`'s variables,
+    /// compiled, checked against the sample and planned: what a comparison of them needs that
+    /// the budget has no part in. `None` unless both are polynomial expressions.
+    fn built(
+        &mut self,
+        vm: &VarMap,
+        sx: &[SkelNode],
+        sy: &[SkelNode],
+        x: u32,
+        y: u32,
+        lanes: &mut Lanes<u64>,
+    ) -> Option<Built> {
+        let w = self.nodes[x as usize].width;
+        let (a, b) = (vm.expr(sx, w)?, vm.expr(sy, w)?);
+        let (pa, pb) = (profile(&a)?, profile(&b)?);
+        if !(pa.poly && pb.poly) {
+            return None;
+        }
+        let progs = Program::new(&a, false).zip(Program::new(&b, false));
+        let agreed = self.agrees(vm, [(&a, x), (&b, y)], progs.as_ref(), lanes);
+        let plan = if agreed { plan(&a, &pa, &pb) } else { None };
+        Some(Built {
+            a,
+            b,
+            progs,
+            agreed,
+            plan,
+            tested: Tested::default(),
+        })
+    }
+
     /// Whether the skeletons agree with their nodes at the sample (when its values are kept):
     /// each variable of `vm` takes its node's or class's value at each point. A value the
     /// sample did not keep (a node the evaluation left out) checks nothing. Evaluated a batch
     /// of points at a time where that computes what [`MbaExpr::eval`] does, else point by
     /// point (debug builds check that both agree).
-    fn agrees(&mut self, vm: &VarMap, sides: [(&MbaExpr, u32); 2]) -> bool {
-        let Some((points, digests)) = self.sample.take() else {
+    fn agrees(
+        &mut self,
+        vm: &VarMap,
+        sides: [(&MbaExpr, u32); 2],
+        progs: Option<&(Program, Program)>,
+        lanes: &mut Lanes<u64>,
+    ) -> bool {
+        let Some(kept) = self.checked else {
             return true;
         };
         let class_root: Vec<u32> = vm
@@ -2136,19 +3755,18 @@ impl Compose {
                 Slot::Orig(_) => 0,
             })
             .collect();
-        let ok = match self.agrees_batched(vm, sides, &points, &digests, &class_root) {
+        let (points, digests) = (&self.points, &self.digests[..kept]);
+        match self.agrees_batched(vm, sides, progs, points, digests, &class_root, lanes) {
             Some(ok) => {
                 debug_assert_eq!(
                     ok,
-                    self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
+                    self.agrees_pointwise(vm, sides, points, digests, &class_root),
                     "the batched sample check differs from the pointwise one"
                 );
                 ok
             }
-            None => self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
-        };
-        self.sample = Some((points, digests));
-        ok
+            None => self.agrees_pointwise(vm, sides, points, digests, &class_root),
+        }
     }
 
     /// [`Compose::agrees`] point by point, with [`MbaExpr::eval`]: it stops at the first point
@@ -2199,13 +3817,17 @@ impl Compose {
     /// and those are the first `n` points). `None` where it might not compute what
     /// [`MbaExpr::eval`] does: an original variable without a value or of another width, a
     /// skeleton whose variables are not the map's, a cast, or anything wider than 64 bits.
+    /// `progs`: the skeletons compiled (`None`: one has no nodes).
+    #[allow(clippy::too_many_arguments)]
     fn agrees_batched(
         &self,
         vm: &VarMap,
         sides: [(&MbaExpr, u32); 2],
+        progs: Option<&(Program, Program)>,
         points: &[Vec<BitVec>],
         digests: &[Vec<u64>],
         class_root: &[u32],
+        lanes: &mut Lanes<u64>,
     ) -> Option<bool> {
         let mut n = points.len();
         for (&(slot, sw), &c) in vm.slots.iter().zip(class_root) {
@@ -2223,8 +3845,9 @@ impl Compose {
                 Slot::Class(_) => n = n.min(digests.get(c as usize).map_or(0, Vec::len)),
             }
         }
-        let mut progs = Vec::with_capacity(sides.len());
-        for (skel, node) in sides {
+        let compiled = progs.map(|(pa, pb)| [pa, pb]);
+        let mut progs: [Option<(&Program, u32, Width)>; 2] = [None, None];
+        for (side, (skel, node)) in sides.into_iter().enumerate() {
             let w = self.nodes[node as usize].width;
             let fits = skel.width() == Some(w)
                 && skel.vars().len() == vm.slots.len()
@@ -2240,31 +3863,38 @@ impl Compose {
             if !fits {
                 return None;
             }
-            let prog = Program::new(skel, false)?;
+            let prog = compiled?[side];
             if prog.widest() > 64 {
                 return None;
             }
-            progs.push((prog, node, w));
+            progs[side] = Some((prog, node, w));
         }
         // Each variable's values at the first `n` points, as lanes (a class's value reduced to
         // the variable's width, as `BitVec::wrapping_from_u64` does).
-        let inputs: Vec<Vec<u64>> = vm
-            .slots
-            .iter()
-            .zip(class_root)
-            .map(|(&(slot, sw), &c)| match slot {
-                Slot::Orig(v) => points[..n]
-                    .iter()
-                    .map(|p| <u64 as Lane>::from_bv(&p[v as usize]))
-                    .collect(),
+        let Lanes {
+            cols: inputs,
+            ra: regs,
+            ..
+        } = lanes;
+        if inputs.len() < vm.slots.len() {
+            inputs.resize_with(vm.slots.len(), Vec::new);
+        }
+        for ((&(slot, sw), &c), col) in vm.slots.iter().zip(class_root).zip(inputs.iter_mut()) {
+            col.clear();
+            match slot {
+                Slot::Orig(v) => col.extend(
+                    points[..n]
+                        .iter()
+                        .map(|p| <u64 as Lane>::from_bv(&p[v as usize])),
+                ),
                 Slot::Class(_) => {
                     let m = <u64 as Lane>::mask(sw);
-                    digests[c as usize][..n].iter().map(|&x| x & m).collect()
+                    col.extend(digests[c as usize][..n].iter().map(|&x| x & m));
                 }
-            })
-            .collect();
-        let mut regs: Vec<Vec<u64>> = Vec::new();
-        for (prog, node, w) in &progs {
+            }
+        }
+        let inputs = &inputs[..vm.slots.len()];
+        for (prog, node, w) in progs.iter().flatten() {
             let Some(want) = digests.get(*node as usize) else {
                 continue;
             };
@@ -2272,7 +3902,7 @@ impl Compose {
             if upto == 0 {
                 continue;
             }
-            prog.run(&mut regs, &inputs, upto);
+            prog.run(regs, inputs, upto);
             let m = <u64 as Lane>::mask(*w);
             let got = &regs[prog.root()][..upto];
             if got.iter().zip(&want[..upto]).any(|(&g, &d)| g != d & m) {
@@ -2293,8 +3923,9 @@ impl Compose {
         meter: &mut M,
         report: &mut Report,
         vm: &mut VarMap,
-        sides: [MbaExpr; 2],
+        sides: [&MbaExpr; 2],
         w: Width,
+        lanes: &mut Lanes<u64>,
     ) -> Result<Compared, M::Err> {
         // The definitions of the atoms with class variables (arithmetic ones), skeletons first,
         // so every expression has the final variables.
@@ -2302,7 +3933,8 @@ impl Compose {
         let mut k = 0;
         while k < vm.slots.len() && defs.len() < 4 {
             if let Slot::Class(c) = vm.slots[k].0
-                && let Some(i) = (0..self.nodes.len() as u32)
+                // (a class is named by its first member: none comes before `c`)
+                && let Some(i) = (c..self.nodes.len() as u32)
                     .find(|&i| self.role[i as usize] == Role::Arith && self.find(i) == c)
                 && let Some(d) = self.linear_skeleton(i, vm)
             {
@@ -2323,7 +3955,7 @@ impl Compose {
         if vm.slots.iter().any(|&(_, sw)| sw != w) {
             return Ok((None, None));
         }
-        let (Some(mut a), Some(mut b)) = (widen(&a0, n), widen(&b0, n)) else {
+        let (Some(mut a), Some(mut b)) = (widen(a0, n), widen(b0, n)) else {
             return Ok((None, None));
         };
         let defs: Vec<(u32, MbaExpr)> = defs
@@ -2373,7 +4005,7 @@ impl Compose {
                     continue;
                 }
                 let linear = match plan(side, &ps, &pt) {
-                    Some(p) => match run(meter, side, &t, &p, report)? {
+                    Some(p) => match run_lanes(meter, side, &t, &p, report, lanes)? {
                         Run::Equal(_) => true,
                         Run::Differ(_) => false,
                         Run::TooBig | Run::OverBudget => symbolic(meter, side, &t, report)?,
@@ -2406,7 +4038,7 @@ impl Compose {
                 (None, None)
             });
         };
-        Ok(match run(meter, &a, &b, &p, report)? {
+        Ok(match run_lanes(meter, &a, &b, &p, report, lanes)? {
             Run::Equal(cert) => {
                 report.cert = Some(cert);
                 (Some(Verdict::Proved), None)
@@ -2427,10 +4059,10 @@ impl Compose {
     /// constants and atoms.
     fn bitwise_leaves(&self, k: u32) -> Vec<u32> {
         let mut out = Vec::new();
-        let mut seen: HashMap<u32, ()> = HashMap::new();
+        let mut seen = vec![false; self.nodes.len()];
         let mut stack = vec![k];
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if std::mem::replace(&mut seen[i as usize], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -2481,14 +4113,14 @@ impl Compose {
     fn def_leaves(&mut self, y: u32) -> Option<Vec<u32>> {
         let mut out: Vec<u32> = Vec::new();
         let mut classes: Vec<u32> = Vec::new();
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::new();
+        let mut seen = vec![false; 2 * self.nodes.len()];
         let n = self.nodes[y as usize];
         let mut stack: Vec<(u32, Ctx)> = n.args[..n.op.arity()]
             .iter()
             .map(|&k| (k, Ctx::Arith))
             .collect();
         while let Some((i, ctx)) = stack.pop() {
-            if seen.insert((i, ctx), ()).is_some() {
+            if std::mem::replace(&mut seen[read_slot(i, ctx)], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -2524,9 +4156,9 @@ impl Compose {
             .copied()
             .filter(|&l| self.role[l as usize] == Role::Arith)
             .collect();
-        let mut seen: HashMap<u32, ()> = HashMap::new();
+        let mut seen = vec![false; self.nodes.len()];
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if std::mem::replace(&mut seen[i as usize], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -2546,13 +4178,12 @@ impl Compose {
     /// Bitwise forms: for each atom (arithmetic read bitwise) whose bits at every sample point
     /// are one function of the bits of the leaves of its definition, that function as nodes
     /// (its algebraic normal form), paired with the atom once proved equal (`(e − 1 & d) − e`
-    /// is `~(e − 1) | d`). `digests` are values here (64 bits or fewer), and grow with the
+    /// is `~(e − 1) | d`). The digests are values here (64 bits or fewer), and grow with the
     /// nodes.
     fn bitwise_forms<M: Meter>(
         &mut self,
         meter: &mut M,
         report: &mut Report,
-        digests: &mut Vec<Vec<u64>>,
     ) -> Result<(), M::Err> {
         let atoms: Vec<u32> = (0..self.sides as u32)
             .filter(|&i| self.forced[i as usize] && self.role[i as usize] == Role::Arith)
@@ -2568,6 +4199,7 @@ impl Compose {
                 continue;
             }
             let w = self.nodes[y as usize].width;
+            let digests = &self.digests;
             let points = digests[y as usize].len();
             let units = (points * leaves.len()) as u64;
             if units > meter.left() {
@@ -2598,8 +4230,10 @@ impl Compose {
                 continue;
             }
             let root = self.anf_nodes(ones, &leaves, w);
-            self.extend_digests(digests);
-            if digests[root as usize] != digests[y as usize] || self.find(root) == self.find(y) {
+            self.extend_digests();
+            if self.digests[root as usize] != self.digests[y as usize]
+                || self.find(root) == self.find(y)
+            {
                 continue;
             }
             if self.equal_defs(meter, report, y, root)? {
@@ -2669,9 +4303,9 @@ impl Compose {
 
     /// Digests (values, at 64 bits or fewer) of the nodes added since they were computed: only
     /// constants and `& | ^ ~` are added.
-    fn extend_digests(&self, digests: &mut Vec<Vec<u64>>) {
-        let points = digests.first().map_or(0, Vec::len);
-        for i in digests.len()..self.nodes.len() {
+    fn extend_digests(&mut self) {
+        let points = self.digests.first().map_or(0, Vec::len);
+        for i in self.digests.len()..self.nodes.len() {
             let n = self.nodes[i];
             let bits = n.width.bits();
             let mask = if bits >= 64 {
@@ -2679,6 +4313,7 @@ impl Compose {
             } else {
                 (1u64 << bits) - 1
             };
+            let digests = &self.digests;
             let col = |k: u32, p: usize| digests[k as usize].get(p).copied().unwrap_or(0);
             let v: Vec<u64> = (0..points)
                 .map(|p| match n.op {
@@ -2690,7 +4325,7 @@ impl Compose {
                     _ => 0,
                 })
                 .collect();
-            digests.push(v);
+            self.digests.push(v);
         }
     }
 
@@ -2702,7 +4337,7 @@ impl Compose {
         // The leaves, by class, and the internal nodes in post-order.
         let mut leaves: Vec<(u32, u32)> = Vec::new();
         let mut post: Vec<u32> = Vec::new();
-        let mut state: HashMap<u32, bool> = HashMap::new();
+        let mut state = vec![false; self.nodes.len()];
         let mut stack: Vec<(u32, bool)> = vec![(i, false)];
         let mut atom = false;
         while let Some((k, done)) = stack.pop() {
@@ -2710,10 +4345,9 @@ impl Compose {
                 post.push(k);
                 continue;
             }
-            if state.contains_key(&k) {
+            if std::mem::replace(&mut state[k as usize], true) {
                 continue;
             }
-            state.insert(k, true);
             let n = self.nodes[k as usize];
             match self.role[k as usize] {
                 Role::Const => {
@@ -2762,7 +4396,7 @@ impl Compose {
                 .filter(|e| e >> j & 1 == 1)
                 .fold(0u64, |t, e| t | 1 << e)
         };
-        let mut table: HashMap<u32, u64> = HashMap::new();
+        let mut table: HashMap<u32, u64> = HashMap::default();
         for &n in &post {
             let node = self.nodes[n as usize];
             let v = match self.role[n as usize] {
@@ -2841,24 +4475,24 @@ impl Compose {
             Expand(u32, usize),
         }
         let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::new();
+        let mut memo = SkelMemo::new(self.nodes.len());
         let mut plans: Vec<Expansion> = Vec::new();
         let mut stack = vec![Item::Visit(root, Ctx::Arith)];
         while let Some(item) = stack.pop() {
             match item {
                 Item::Visit(i, ctx) => {
-                    if memo.contains_key(&(i, ctx)) {
+                    if memo.contains(i, ctx) {
                         continue;
                     }
                     let n = self.nodes[i as usize];
                     if let Some(c) = self.cst[i as usize] {
                         out.push(SkelNode::Const(c));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     if let MOp::Var(x) = n.op {
                         out.push(SkelNode::Var(vm.orig(x, n.width)));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     let role = self.role[i as usize];
@@ -2879,7 +4513,7 @@ impl Compose {
                             None => vm.class(c, n.width),
                         };
                         out.push(SkelNode::Var(v));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     if role == Role::Bitwise
@@ -2910,22 +4544,22 @@ impl Compose {
                     };
                     let mut args = [0u32; 2];
                     for (k, &a) in n.args[..n.op.arity()].iter().enumerate() {
-                        args[k] = *memo.get(&(a, sub))?;
+                        args[k] = memo.get(a, sub)?;
                     }
                     out.push(SkelNode::Op(n.op, args));
-                    memo.insert((i, ctx), out.len() as u32 - 1);
+                    memo.insert(i, ctx, out.len() as u32 - 1);
                 }
                 Item::Alias(i, r) => {
-                    let v = *memo.get(&(r, Ctx::Bitwise))?;
-                    memo.insert((i, Ctx::Bitwise), v);
+                    let v = memo.get(r, Ctx::Bitwise)?;
+                    memo.insert(i, Ctx::Bitwise, v);
                 }
                 Item::Expand(i, e) => {
                     let plan = &plans[e];
                     let mut acc: Option<u32> = None;
                     for (c, reads) in &plan.terms {
-                        let mut t = *memo.get(&reads[0])?;
+                        let mut t = memo.get(reads[0].0, reads[0].1)?;
                         for r in &reads[1..] {
-                            let x = *memo.get(r)?;
+                            let x = memo.get(r.0, r.1)?;
                             out.push(SkelNode::Op(MOp::And, [t, x]));
                             t = out.len() as u32 - 1;
                         }
@@ -2958,11 +4592,11 @@ impl Compose {
                             }
                         }
                     };
-                    memo.insert((i, Ctx::Arith), result);
+                    memo.insert(i, Ctx::Arith, result);
                 }
             }
         }
-        let r = *memo.get(&(root, Ctx::Arith))? as usize;
+        let r = memo.get(root, Ctx::Arith)? as usize;
         out.truncate(r + 1);
         Some(out)
     }
@@ -2978,7 +4612,7 @@ impl Compose {
                 }
                 let c = self.find(i);
                 match policy {
-                    Policy::Minimal | Policy::Linear => false,
+                    Policy::Minimal | Policy::Reps | Policy::Linear => false,
                     Policy::Classes => !root && self.abstracted[c as usize],
                     Policy::Everything => self.abstracted[c as usize],
                 }
@@ -2989,29 +4623,51 @@ impl Compose {
     /// The skeleton of node `root` (read as a term): atoms become variables of `vm`, one per
     /// class (the class's own variable when it has one).
     fn skeleton(&mut self, root: u32, policy: Policy, vm: &mut VarMap) -> Option<Vec<SkelNode>> {
-        let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::new();
-        let mut stack: Vec<(u32, Ctx, bool)> = vec![(root, Ctx::Arith, false)];
+        let mut out: Vec<SkelNode> = Vec::with_capacity(16);
+        let mut memo = SkelMemo::new(self.nodes.len());
+        let mut stack: Vec<(u32, Ctx, bool)> = Vec::with_capacity(16);
+        stack.push((root, Ctx::Arith, false));
+        // Under `Policy::Reps`, atoms read as their representative: the atom's skeleton is the
+        // representative's (whose leaves are of earlier classes, so this ends).
+        let mut alias: HashMap<u32, u32> = HashMap::default();
         while let Some((i, ctx, expanded)) = stack.pop() {
-            if memo.contains_key(&(i, ctx)) {
+            if memo.contains(i, ctx) {
                 continue;
             }
-            let n = self.nodes[i as usize];
+            // (The node's fields are read where they are: a node is 96 bytes, copied per
+            // visit otherwise.)
+            let (width, args_of) = {
+                let n = &self.nodes[i as usize];
+                (n.width, n.args)
+            };
+            if expanded && let Some(&r) = alias.get(&i) {
+                let at = memo.get(r, ctx)?;
+                memo.insert(i, ctx, at);
+                continue;
+            }
             if !expanded {
                 if let Some(c) = self.cst[i as usize] {
                     out.push(SkelNode::Const(c));
+                } else if policy == Policy::Reps
+                    && self.atom(i, ctx, i == root, policy)
+                    && let Some(r) = self.rep_of(i)
+                {
+                    alias.insert(i, r);
+                    stack.push((i, ctx, true));
+                    stack.push((r, ctx, false));
+                    continue;
                 } else if self.atom(i, ctx, i == root, policy) {
                     let c = self.find(i);
                     let v = match self.var_member[c as usize] {
                         Some(vi) => match self.nodes[vi as usize].op {
-                            MOp::Var(x) => vm.orig(x, n.width),
+                            MOp::Var(x) => vm.orig(x, width),
                             _ => return None,
                         },
-                        None => vm.class(c, n.width),
+                        None => vm.class(c, width),
                     };
                     out.push(SkelNode::Var(v));
-                } else if let MOp::Var(x) = n.op {
-                    let v = vm.orig(x, n.width);
+                } else if let MOp::Var(x) = self.nodes[i as usize].op {
+                    let v = vm.orig(x, width);
                     out.push(SkelNode::Var(v));
                 } else {
                     let sub = match self.role[i as usize] {
@@ -3020,12 +4676,13 @@ impl Compose {
                         _ => Ctx::Arith,
                     };
                     stack.push((i, ctx, true));
-                    for &k in &n.args[..n.op.arity()] {
+                    let arity = self.nodes[i as usize].op.arity();
+                    for &k in &args_of[..arity] {
                         stack.push((k, sub, false));
                     }
                     continue;
                 }
-                memo.insert((i, ctx), out.len() as u32 - 1);
+                memo.insert(i, ctx, out.len() as u32 - 1);
                 continue;
             }
             let sub = match self.role[i as usize] {
@@ -3033,15 +4690,16 @@ impl Compose {
                 Role::Not => ctx,
                 _ => Ctx::Arith,
             };
+            let op = self.nodes[i as usize].op;
             let mut args = [0u32; 2];
-            for (k, &a) in n.args[..n.op.arity()].iter().enumerate() {
-                args[k] = *memo.get(&(a, sub))?;
+            for (k, &a) in args_of[..op.arity()].iter().enumerate() {
+                args[k] = memo.get(a, sub)?;
             }
-            out.push(SkelNode::Op(n.op, args));
-            memo.insert((i, ctx), out.len() as u32 - 1);
+            out.push(SkelNode::Op(op, args));
+            memo.insert(i, ctx, out.len() as u32 - 1);
         }
         // The root is the last node built for it.
-        let r = *memo.get(&(root, Ctx::Arith))? as usize;
+        let r = memo.get(root, Ctx::Arith)? as usize;
         out.truncate(r + 1);
         Some(out)
     }
@@ -3085,7 +4743,8 @@ enum Serial {
 /// (`(y + y) & y & −y` is 0: no bit of `y` both follows a set bit and has none below it). Up to
 /// [`CARRY_BITS`] bits of state and six variables; charged as node evaluations. A variable
 /// narrower than the width read only through a zero extension (as `decast` writes narrow
-/// variables) is one whose bits above its width are 0.
+/// variables) is one whose bits above its width are 0, and one wider read only through a
+/// truncation is read at the positions the sides have.
 pub(crate) fn carries<M: Meter>(
     meter: &mut M,
     a: &MbaExpr,
@@ -3096,14 +4755,14 @@ pub(crate) fn carries<M: Meter>(
         return Ok(false);
     };
     let t = a.vars().len();
-    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 || a.vars().iter().any(|&v| v > w) {
+    if b.width() != Some(w) || a.vars() != b.vars() || t > 6 {
         return Ok(false);
     }
     // Both sides as one circuit (live nodes only, equal ones once: they share their state).
     let mut circuit: Vec<Serial> = Vec::new();
     let mut state = 0u32;
     let mut roots = [0usize; 2];
-    let mut interned: HashMap<(MOp, [usize; 2]), usize> = HashMap::new();
+    let mut interned: HashMap<(MOp, [usize; 2]), usize> = HashMap::default();
     for (side, m) in [a, b].into_iter().enumerate() {
         let live = live(m);
         let mut map: Vec<usize> = vec![usize::MAX; m.nodes().len()];
@@ -3124,6 +4783,16 @@ pub(crate) fn carries<M: Meter>(
                     return Ok(false);
                 };
                 circuit.push(Serial::VarBelow(v, arg.width.bits()));
+                map[i] = circuit.len() - 1;
+                continue;
+            }
+            // The low bits of a variable wider than the sides (as `decast` writes one under
+            // a truncation): the variable, read at the positions there are.
+            if n.op == MOp::Trunc {
+                let MOp::Var(v) = m.nodes()[n.args[0] as usize].op else {
+                    return Ok(false);
+                };
+                circuit.push(Serial::Var(v));
                 map[i] = circuit.len() - 1;
                 continue;
             }
@@ -3272,7 +4941,7 @@ pub(crate) fn carries<M: Meter>(
         }
         meter.charge(units)?;
         report.points += layer.len() as u64 * inputs;
-        let mut next: HashMap<u64, (u64, u64)> = HashMap::new();
+        let mut next: HashMap<u64, (u64, u64)> = HashMap::default();
         for &st in &layer {
             for x in 0..inputs {
                 let mut out = st;
@@ -3420,8 +5089,10 @@ impl SymPoly {
 
 /// Whether `a` and `b` are the same polynomial over symbols: variables; the conjunctions of the
 /// leaves of a bitwise function whose constants are 0 or all-ones, which it is read as by its
-/// integer expansion (`x | y` is `x + y − (x & y)`, every bit alike); and any other bitwise
-/// subterm, one symbol by its structure. Equal polynomials are equal functions, whatever the
+/// integer expansion (`x | y` is `x + y − (x & y)`, every bit alike); one leaf under a mask,
+/// for a bitwise function of that leaf and constants (`f(0)` plus the leaf under the bits it
+/// sets, less the leaf under the bits it clears); and any other bitwise subterm, one symbol by
+/// its structure. Equal polynomials are equal functions, whatever the
 /// symbols' values (so for their actual ones); unequal ones decide nothing. `None` past
 /// [`SYMBOLIC_TERMS`], or once `work` is past `limit`. Work: one unit per monomial operation.
 pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u64) -> Option<bool> {
@@ -3430,8 +5101,9 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
         return None;
     }
     // Both sides in one hash-consed table, so equal subterms are one symbol.
-    let mut canon: HashMap<MNode, u32> = HashMap::new();
-    let mut nodes: Vec<MNode> = Vec::new();
+    let total = a.nodes().len() + b.nodes().len();
+    let mut canon = NodeTable::with_room(total);
+    let mut nodes: Vec<MNode> = Vec::with_capacity(total);
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
         let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -3443,18 +5115,14 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
             if commutative(&k.op) && k.args[0] > k.args[1] {
                 k.args.swap(0, 1);
             }
-            let id = *canon.entry(k).or_insert_with(|| {
-                nodes.push(k);
-                nodes.len() as u32 - 1
-            });
-            map.push(id);
+            map.push(canon.intern(&mut nodes, k));
         }
         roots[side] = *map.last()?;
     }
     let cst = constants(&nodes);
     let bitwise = |op: &MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor | MOp::Not);
     // Symbols: variables by index, conjunctions by their leaf set, others by node.
-    let mut symbols: HashMap<(u8, Vec<u32>), u32> = HashMap::new();
+    let mut symbols: HashMap<(u8, Vec<u32>), u32> = HashMap::default();
     let mut symbol = |kind: u8, key: Vec<u32>| {
         let n = symbols.len() as u32;
         *symbols.entry((kind, key)).or_insert(n)
@@ -3462,18 +5130,20 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     let mut polys: Vec<Option<SymPoly>> = vec![None; nodes.len()];
     for i in 0..nodes.len() {
         let n = nodes[i];
-        let arg = |k: usize| polys[n.args[k] as usize].clone();
+        // The operands' polynomials, read in place (a copy of each per use was most of the
+        // comparison's time on sums).
+        let arg = |k: usize| polys[n.args[k] as usize].as_ref();
         let p = if let Some(c) = cst[i] {
             SymPoly::constant(c)
         } else {
             match n.op {
                 MOp::Var(v) => SymPoly::symbol(symbol(0, vec![v]), w),
-                MOp::Add => arg(0)?.add(&arg(1)?, &BitVec::one(w)),
-                MOp::Sub => arg(0)?.add(&arg(1)?, &BitVec::ones(w)),
-                MOp::Neg => SymPoly::constant(BitVec::zero(w)).add(&arg(0)?, &BitVec::ones(w)),
+                MOp::Add => arg(0)?.add(arg(1)?, &BitVec::one(w)),
+                MOp::Sub => arg(0)?.add(arg(1)?, &BitVec::ones(w)),
+                MOp::Neg => SymPoly::constant(BitVec::zero(w)).add(arg(0)?, &BitVec::ones(w)),
                 MOp::Shl(k) => {
                     let s = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(k));
-                    SymPoly::constant(BitVec::zero(w)).add(&arg(0)?, &s)
+                    SymPoly::constant(BitVec::zero(w)).add(arg(0)?, &s)
                 }
                 MOp::Mul => {
                     let (x, y) = (arg(0)?, arg(1)?);
@@ -3481,14 +5151,14 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                     if *work > limit {
                         return None;
                     }
-                    x.mul(&y)?
+                    x.mul(y)?
                 }
                 MOp::And | MOp::Or | MOp::Xor | MOp::Not => {
                     // The bitwise function's leaves: variables and non-bitwise subterms.
                     let mut leaves: Vec<u32> = Vec::new();
                     let mut uniform = true;
                     let mut stack = vec![i as u32];
-                    let mut seen: HashMap<u32, ()> = HashMap::new();
+                    let mut seen: HashMap<u32, ()> = HashMap::default();
                     while let Some(k) = stack.pop() {
                         if seen.insert(k, ()).is_some() {
                             continue;
@@ -3511,7 +5181,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                         } else {
                             (1u64 << (1u32 << t)) - 1
                         };
-                        let mut table: HashMap<u32, u64> = HashMap::new();
+                        let mut table: HashMap<u32, u64> = HashMap::default();
                         let mut order: Vec<u32> = seen.keys().copied().collect();
                         order.sort_unstable();
                         for &k in &order {
@@ -3572,6 +5242,56 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                             p.add_term(vec![symbol(1, set)], &c);
                         }
                         Some(p)
+                    } else if let ([l], true) = (&leaves[..], w.bits() <= 64) {
+                        // One leaf under constants: each bit is a constant, the leaf's bit or
+                        // its complement, so the value is `f(0)` plus the leaf's bits that set
+                        // one less those that clear one. The leaf under each of the two masks
+                        // is a symbol (the leaf itself under every bit), whatever spelled it:
+                        // `m − (~t & m)` and `t & m` are one polynomial.
+                        let ones = if w.bits() == 64 {
+                            u64::MAX
+                        } else {
+                            (1u64 << w.bits()) - 1
+                        };
+                        let mut at: HashMap<u32, (u64, u64)> = HashMap::default();
+                        let mut order: Vec<u32> = seen.keys().copied().collect();
+                        order.sort_unstable();
+                        for &k in &order {
+                            let m = nodes[k as usize];
+                            let v = if let Some(c) = cst[k as usize] {
+                                let c = c.to_u64()?;
+                                (c, c)
+                            } else if k == *l {
+                                (0, ones)
+                            } else {
+                                let x = |a: usize| at.get(&m.args[a]).copied();
+                                match m.op {
+                                    MOp::Not => {
+                                        let a = x(0)?;
+                                        (!a.0 & ones, !a.1 & ones)
+                                    }
+                                    MOp::And => (x(0)?.0 & x(1)?.0, x(0)?.1 & x(1)?.1),
+                                    MOp::Or => (x(0)?.0 | x(1)?.0, x(0)?.1 | x(1)?.1),
+                                    _ => (x(0)?.0 ^ x(1)?.0, x(0)?.1 ^ x(1)?.1),
+                                }
+                            };
+                            at.insert(k, v);
+                        }
+                        let (f0, f1) = *at.get(&(i as u32))?;
+                        let leaf = match nodes[*l as usize].op {
+                            MOp::Var(v) => symbol(0, vec![v]),
+                            _ => symbol(2, vec![*l]),
+                        };
+                        let mut p = SymPoly::constant(BitVec::wrapping_from_u64(w, f0));
+                        for (mask, c) in [(f1 & !f0, BitVec::one(w)), (f0 & !f1, BitVec::ones(w))] {
+                            if mask == ones {
+                                p = p.add(polys[*l as usize].as_ref()?, &c);
+                            } else if mask != 0 {
+                                let key = vec![leaf, mask as u32, (mask >> 32) as u32];
+                                p.add_term(vec![symbol(3, key)], &c);
+                            }
+                        }
+                        Some(p)
                     } else {
                         None
                     };
@@ -3606,9 +5326,19 @@ fn symbolic<M: Meter>(
     b: &MbaExpr,
     report: &mut Report,
 ) -> Result<bool, M::Err> {
+    symbolic_seen(meter, a, b, report, &mut SymbolicSeen::Unasked)
+}
+
+/// [`symbolic`], with what earlier comparisons of the same pair found (see [`Tested`]).
+fn symbolic_seen<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+    report: &mut Report,
+    seen: &mut SymbolicSeen,
+) -> Result<bool, M::Err> {
     let limit = meter.left() / SYMBOLIC_RATE;
-    let mut work = 0u64;
-    let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+    let (equal, work) = seen.equal(a, b, limit);
     if work > limit {
         report.over_budget = true;
     }
@@ -3624,11 +5354,12 @@ fn substitute_var(m: &MbaExpr, v: u32, by: &MbaExpr) -> Option<MbaExpr> {
     let mut out = MbaExpr::new(m.vars().to_vec());
     let mut map_by: Vec<u32> = Vec::with_capacity(by.nodes().len());
     for n in by.nodes() {
-        let args: Vec<u32> = n.args[..n.op.arity()]
-            .iter()
-            .map(|&a| map_by[a as usize])
-            .collect();
-        map_by.push(out.push(n.op, &args).ok()?);
+        let mut args = [0u32; 2];
+        let k = n.op.arity();
+        for (to, &a) in args.iter_mut().zip(&n.args[..k]) {
+            *to = map_by[a as usize];
+        }
+        map_by.push(out.push(n.op, &args[..k]).ok()?);
     }
     let by_root = *map_by.last()?;
     let mut map: Vec<u32> = vec![0; nodes.len()];
@@ -3640,11 +5371,12 @@ fn substitute_var(m: &MbaExpr, v: u32, by: &MbaExpr) -> Option<MbaExpr> {
         last = match n.op {
             MOp::Var(x) if x == v => by_root,
             op => {
-                let args: Vec<u32> = n.args[..op.arity()]
-                    .iter()
-                    .map(|&a| map[a as usize])
-                    .collect();
-                out.push(op, &args).ok()?
+                let mut args = [0u32; 2];
+                let k = op.arity();
+                for (to, &a) in args.iter_mut().zip(&n.args[..k]) {
+                    *to = map[a as usize];
+                }
+                out.push(op, &args[..k]).ok()?
             }
         };
         map[i] = last;
@@ -3665,7 +5397,7 @@ struct Expansion {
 }
 
 /// A skeleton node before its variables are numbered.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum SkelNode {
     Const(BitVec),
     Var(u32),
@@ -3726,7 +5458,28 @@ impl VarMap {
 /// up to 64 bits). Equal values give equal digests.
 fn digests(prog: &Program, points: &[Vec<BitVec>], nodes: usize) -> Vec<Vec<u64>> {
     match Kind::of(prog.widest()) {
-        Kind::N64 => digests_in::<u64>(prog, points, nodes, |x| *x),
+        Kind::N64 => {
+            // The values are the digests: when every node has its own register in order (a
+            // program that kept every node), the registers themselves, not a copy of each.
+            let n = points.len();
+            if n > 0 && nodes == prog.len() && (0..nodes).all(|i| prog.reg_of(i) == Some(i)) {
+                let nv = points.first().map_or(0, Vec::len);
+                let inputs: Vec<Vec<u64>> = (0..nv)
+                    .map(|v| {
+                        points
+                            .iter()
+                            .map(|p| <u64 as Lane>::from_bv(&p[v]))
+                            .collect()
+                    })
+                    .collect();
+                let mut regs: Vec<Vec<u64>> = take_rows(nodes);
+                prog.run(&mut regs, &inputs, n);
+                if regs.len() == nodes && regs.iter().all(|r| r.len() == n) {
+                    return regs;
+                }
+            }
+            digests_in::<u64>(prog, points, nodes, |x| *x)
+        }
         Kind::N128 => digests_in::<u128>(prog, points, nodes, |x| {
             crate::hash::combine(*x as u64, (*x >> 64) as u64)
         }),

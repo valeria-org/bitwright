@@ -17,6 +17,12 @@
 //! inputs are only conditions (at most [`MAX_CASES`] of them), evaluates it for each value of
 //! those conditions, and writes it as the table of those constants: `select(c, v1, v0)`, or
 //! `v` where the cases agree.
+//!
+//! And a root is often far simpler on one side of a condition than it is as a whole: with a
+//! flag that picks between two masked values fixed, one of them is a constant and everything
+//! computed from it folds. [`sides_on`] is the root on either side, and [`join`] writes the
+//! two sides (once the engine has simplified each) as one expression again, the choice as
+//! far down as the sides agree (see `Runner::strategy`).
 
 use crate::Error;
 use crate::expr::{Context, OpCode};
@@ -278,7 +284,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
 
 /// The condition `root` is split on by [`sides`]: the one most of its selects (and `zext(c)`
 /// factors) test, a condition and its complement counted as one, when one is tested twice.
-fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
+pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
     let order = cx.post_order_ids(&[root]);
     let mut uses: IdMap<u32, u32> = IdMap::default();
     for &i in &order {
@@ -313,11 +319,18 @@ pub(super) fn sides(cx: &mut Context, root: u32) -> Result<Option<(u32, u32, u32
     let Some(c) = most_tested(cx, root)? else {
         return Ok(None);
     };
+    Ok(sides_on(cx, root, c)?.map(|(t, f)| (c, t, f)))
+}
+
+/// [`sides`] on the condition `c`: `root` where `c` holds and where it does not, at an input
+/// where `c` holds the first is `root`'s value, at any other the second. `None` when neither
+/// differs from `root`.
+pub(super) fn sides_on(cx: &mut Context, root: u32, c: u32) -> Result<Option<(u32, u32)>, Error> {
     let (mut ft, mut ff) = (Vec::new(), Vec::new());
     fixes(cx, c, true, &mut ft, 0);
     fixes(cx, c, false, &mut ff, 0);
     let (t, f) = (put(cx, root, &ft)?, put(cx, root, &ff)?);
-    Ok((t != root || f != root).then_some((c, t, f)))
+    Ok((t != root || f != root).then_some((t, f)))
 }
 
 /// The most conditions a piece [`cut`] reads as a table may depend on.
@@ -539,4 +552,80 @@ fn table(
     let set = table(cx, vars, value, j + 1, case | 1 << j)?;
     let unset = table(cx, vars, value, j + 1, case)?;
     cx.c_select(vars[j], set, unset)
+}
+
+/// The most pairs of nodes [`join`] merges.
+const MAX_JOINED: usize = 4096;
+
+/// The deepest [`join`] follows two sides.
+const MAX_JOIN_DEPTH: u32 = 512;
+
+/// `select(c, t, f)` with the choice written as far down as the two sides are one operator
+/// over operands of the same widths: `select(c, a * k1 + b, a * k2 + b)` is
+/// `a * select(c, k1, k2) + b`. Equal to the select at every input: where `c` holds every
+/// merged operand is `t`'s, elsewhere `f`'s. A shift or a rotation keeps its amount (two
+/// amounts are two operations), and at most [`MAX_JOINED`] pairs of nodes are merged; past
+/// that, and where the sides differ in operator, the select is written.
+pub(super) fn join(cx: &mut Context, c: u32, t: u32, f: u32) -> Result<u32, Error> {
+    fn go(
+        cx: &mut Context,
+        c: u32,
+        (x, y): (u32, u32),
+        memo: &mut std::collections::HashMap<(u32, u32), u32>,
+        depth: u32,
+    ) -> Result<u32, Error> {
+        if x == y {
+            return Ok(x);
+        }
+        if let Some(&m) = memo.get(&(x, y)) {
+            return Ok(m);
+        }
+        let (nx, ny) = (cx.node(x), cx.node(y));
+        let plain = nx.op.as_un().is_some()
+            || nx.op.as_bin().is_some()
+            || nx.op.as_cmp().is_some()
+            || matches!(
+                nx.op,
+                OpCode::Zext | OpCode::Sext | OpCode::Extract | OpCode::Concat | OpCode::Select
+            );
+        let kx: Vec<u32> = nx.children().collect();
+        let mut ky: Vec<u32> = ny.children().collect();
+        // A commutative operator's operands, paired so that equal ones meet.
+        if nx.op.as_bin().is_some_and(BinOp::is_commutative)
+            && ky.len() == 2
+            && kx[0] != ky[0]
+            && kx[1] != ky[1]
+            && (kx[0] == ky[1] || kx[1] == ky[0])
+        {
+            ky.swap(0, 1);
+        }
+        let amount = matches!(
+            nx.op,
+            OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
+        );
+        let same = plain
+            && nx.op == ny.op
+            && nx.width == ny.width
+            && nx.aux == ny.aux
+            && kx.len() == ky.len()
+            && (nx.op != OpCode::Extract || nx.b == ny.b)
+            && (!amount || kx[1] == ky[1])
+            && kx.iter().zip(&ky).all(|(&a, &b)| cx.wid(a) == cx.wid(b))
+            && memo.len() < MAX_JOINED
+            && depth < MAX_JOIN_DEPTH;
+        let out = if same {
+            // (An extract keeps its offset in the second field.)
+            let mut kids = [nx.a, nx.b, nx.c];
+            for (k, (&a, &b)) in kx.iter().zip(&ky).enumerate() {
+                kids[k] = go(cx, c, (a, b), memo, depth + 1)?;
+            }
+            cx.rebuild(x, kids)?
+        } else {
+            cx.c_select(c, x, y)?
+        };
+        memo.insert((x, y), out);
+        Ok(out)
+    }
+    let mut memo = std::collections::HashMap::new();
+    go(cx, c, (t, f), &mut memo, 0)
 }

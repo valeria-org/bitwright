@@ -118,7 +118,9 @@ enum V {
     Unknown,
 }
 
-/// Whether node `i` is an operation the programs interpret (its operands at most 128 bits).
+/// Whether node `i` is an operation the programs interpret: its operands and its result at
+/// most 128 bits (an extension or a concatenation is wider than what it reads, and a program's
+/// values are `u128`s: a wider one is a leaf).
 fn interpreted(cx: &Context, i: u32) -> bool {
     let node = cx.node(i);
     let op = node.op;
@@ -127,7 +129,7 @@ fn interpreted(cx: &Context, i: u32) -> bool {
         OpCode::Zext | OpCode::Sext | OpCode::Extract | OpCode::Concat | OpCode::Select => true,
         _ => op.as_un().is_some() || op.as_bin().is_some() || op.as_cmp().is_some(),
     };
-    ok && node.children().all(|c| cx.wid(c) <= 128)
+    ok && node.width <= 128 && node.children().all(|c| cx.wid(c) <= 128)
 }
 
 /// A predicate to decide: a 1-bit node, or one `Context::prove` asks about without building it.

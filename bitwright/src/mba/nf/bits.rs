@@ -8,9 +8,9 @@
 //! function.
 
 use super::classes::Classes;
-use super::poly::{Poly, Sym};
+use super::poly::{Mono, Poly, Sym};
+use super::word::{bv_and, low_mask};
 use crate::BitVec;
-use crate::facts::known::{bv_and, low_mask};
 use crate::ops::BinOp;
 
 /// The most atoms one bitwise function may depend on (a table has 2^s entries).
@@ -196,11 +196,11 @@ impl Bits {
                 if k == 0 {
                     continue;
                 }
-                let kv = BitVec::wrapping_from_i128(w, i128::from(k));
+                let kv = super::word::signed(w, i128::from(k));
                 if q == 0 {
                     out.add_term(
-                        Vec::new(),
-                        &BitVec::bin_unchecked(BinOp::Mul, &kv, classes.mask(c)),
+                        Mono::new(),
+                        &super::word::bin(BinOp::Mul, &kv, classes.mask(c)),
                     );
                     continue;
                 }
@@ -211,7 +211,7 @@ impl Bits {
                     set,
                     class: c as u16,
                 };
-                out.add_term(vec![(sym, 1)], &kv);
+                out.add_term(Mono::of(sym, 1), &kv);
             }
         }
         out
@@ -222,6 +222,9 @@ impl Bits {
     /// be 0 or all-ones in each class) and `Δ_c(p) = Σ_{∅≠S⊆p} γ_{c,S}`, `k_c + Δ_c(p)` must be 0
     /// or 1 modulo `2^(W − τ_c)` at every class corner `p`; it is the table's entry.
     pub(crate) fn from_linear(p: &Poly, classes: &Classes) -> Option<Bits> {
+        if classes.width().bits() <= 64 {
+            return Self::from_linear_64(p, classes);
+        }
         let (support, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
         let s = support.len();
@@ -232,7 +235,7 @@ impl Bits {
             let k = if inside.is_zero() {
                 BitVec::zero(w)
             } else if inside == *classes.mask(c) {
-                BitVec::one(w)
+                super::word::one(w)
             } else {
                 return None;
             };
@@ -240,8 +243,8 @@ impl Bits {
             let lm = low_mask(w, prec);
             let mut t = vec![0u64; words(s)];
             for (q, d) in g.iter().enumerate() {
-                let v = bv_and(&BitVec::bin_unchecked(BinOp::Add, &k, d), &lm);
-                if v == BitVec::one(w) {
+                let v = bv_and(&super::word::bin(BinOp::Add, &k, d), &lm);
+                if v == super::word::one(w) {
                     set(&mut t, q);
                 } else if !v.is_zero() {
                     return None;
@@ -257,9 +260,12 @@ impl Bits {
     /// corner, as in [`from_linear`](Self::from_linear)), and whether the atoms move it there
     /// (some `Δ_c(p)` is not 0). `None` if in some class neither value fits.
     pub(crate) fn zero_values(p: &Poly, classes: &Classes) -> Option<Vec<([bool; 2], bool)>> {
+        if classes.width().bits() <= 64 {
+            return Self::zero_values_64(p, classes);
+        }
         let (_, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
-        let one = BitVec::one(w);
+        let one = super::word::one(w);
         let mut out = Vec::with_capacity(deltas.len());
         for (c, g) in deltas.iter().enumerate() {
             let lm = low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)));
@@ -269,7 +275,7 @@ impl Bits {
                 let d = bv_and(d, &lm);
                 moved |= !d.is_zero();
                 fits[0] &= d.is_zero() || d == one;
-                let v = bv_and(&BitVec::bin_unchecked(BinOp::Add, &one, &d), &lm);
+                let v = bv_and(&super::word::bin(BinOp::Add, &one, &d), &lm);
                 fits[1] &= v.is_zero() || v == one;
             }
             if fits == [false, false] {
@@ -279,6 +285,100 @@ impl Bits {
         }
         Some(out)
     }
+
+    /// [`from_linear`](Self::from_linear) at widths up to 64: the same test in one word.
+    fn from_linear_64(p: &Poly, classes: &Classes) -> Option<Bits> {
+        let (support, deltas) = corner_sums_64(p, classes)?;
+        let bits = u32::from(classes.width().bits());
+        let s = support.len();
+        let konst = p.konst().limbs()[0];
+        let mut tables = Vec::with_capacity(classes.len());
+        for (c, g) in deltas.chunks_exact(1 << s).enumerate() {
+            let mask = classes.mask(c).limbs()[0];
+            let k = match konst & mask {
+                0 => 0u64,
+                inside if inside == mask => 1,
+                _ => return None,
+            };
+            // The low `W − τ_c` bits.
+            let lm = u64::MAX >> (64 - (bits - u32::from(classes.low(c))));
+            let mut t = vec![0u64; words(s)];
+            for (q, d) in g.iter().enumerate() {
+                match k.wrapping_add(*d) & lm {
+                    0 => {}
+                    1 => set(&mut t, q),
+                    _ => return None,
+                }
+            }
+            tables.push(t);
+        }
+        Some(Bits { support, tables }.prune())
+    }
+
+    /// [`zero_values`](Self::zero_values) at widths up to 64.
+    fn zero_values_64(p: &Poly, classes: &Classes) -> Option<Vec<([bool; 2], bool)>> {
+        let (support, deltas) = corner_sums_64(p, classes)?;
+        let bits = u32::from(classes.width().bits());
+        let mut out = Vec::with_capacity(classes.len());
+        for (c, g) in deltas.chunks_exact(1 << support.len()).enumerate() {
+            let lm = u64::MAX >> (64 - (bits - u32::from(classes.low(c))));
+            let mut fits = [true, true];
+            let mut moved = false;
+            for d in g {
+                let d = d & lm;
+                moved |= d != 0;
+                fits[0] &= d <= 1;
+                fits[1] &= d.wrapping_add(1) & lm <= 1;
+            }
+            if fits == [false, false] {
+                return None;
+            }
+            out.push((fits, moved));
+        }
+        Some(out)
+    }
+}
+
+/// [`corner_sums`] at widths up to 64, a word per sum: the sums modulo 2^64 (their readers
+/// mask them to a class's precision), class `c`'s in `[c << s..][..1 << s]`.
+fn corner_sums_64(p: &Poly, classes: &Classes) -> Option<(Vec<u32>, Vec<u64>)> {
+    if p.degree() > 1 {
+        return None;
+    }
+    let atoms = p.atoms();
+    if atoms.count_ones() as usize > MAX_SUPPORT {
+        return None;
+    }
+    let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
+    let s = support.len();
+    let n = classes.len();
+    let mut gamma = vec![0u64; n << s];
+    for (m, c) in p.terms() {
+        let Some(&(sym, _)) = m.first() else {
+            continue;
+        };
+        if usize::from(sym.class) >= n {
+            return None;
+        }
+        let q = support
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| sym.set >> a & 1 == 1)
+            .fold(0usize, |q, (j, _)| q | 1 << j);
+        let slot = &mut gamma[(usize::from(sym.class) << s) | q];
+        *slot = slot.wrapping_add(c.limbs()[0]);
+    }
+    // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
+    for g in gamma.chunks_exact_mut(1 << s) {
+        for b in 0..s {
+            for q in 0..1usize << s {
+                if q >> b & 1 == 1 {
+                    g[q] = g[q].wrapping_add(g[q ^ 1 << b]);
+                }
+            }
+        }
+    }
+    Some((support, gamma))
 }
 
 /// The support of a polynomial of degree at most 1 (ascending, at most [`MAX_SUPPORT`] atoms)
@@ -305,14 +405,14 @@ fn corner_sums(p: &Poly, classes: &Classes) -> Option<(Vec<u32>, Vec<Vec<BitVec>
             .filter(|&(_, &a)| sym.set >> a & 1 == 1)
             .fold(0usize, |q, (j, _)| q | 1 << j);
         let slot = gamma.get_mut(usize::from(sym.class))?.get_mut(q)?;
-        *slot = BitVec::bin_unchecked(BinOp::Add, slot, c);
+        *slot = super::word::bin(BinOp::Add, slot, c);
     }
     // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
     for g in gamma.iter_mut() {
         for b in 0..s {
             for q in 0..1usize << s {
                 if q >> b & 1 == 1 {
-                    g[q] = BitVec::bin_unchecked(BinOp::Add, &g[q], &g[q ^ 1 << b]);
+                    g[q] = super::word::bin(BinOp::Add, &g[q], &g[q ^ 1 << b]);
                 }
             }
         }

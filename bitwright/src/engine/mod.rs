@@ -120,6 +120,17 @@ pub enum Phase {
     /// among the built-in strategies.
     #[cfg(feature = "prove")]
     Carries,
+    /// Limb arithmetic read as arithmetic on the words: digits of wide values computed apart,
+    /// with the carries and borrows between them written as comparisons of the digits below
+    /// (`(a >>u k) + (b >>u k) + zext(trunc<k>(a + b) <u trunc<k>(a))`), products by constants
+    /// and XORs done digit by digit, and constants added limb by limb become slices of the
+    /// word-level operation (`(a + b) >>u k`). Every node is read as an integer form over
+    /// floors `floor(x / 2^k)` kept in one shape, in which the digits' terms cancel; each step
+    /// is an identity of the integers, and nothing is proved or matched. The forms are written
+    /// back from the root down, each node for all its users at once and at the bits of it
+    /// that are read, wherever the root's DAG gets smaller (see the pass's module). Only
+    /// [`Strategy::deobfuscate`] runs it among the built-in strategies.
+    Words,
     /// The MBA service: mixed Boolean-arithmetic fragments are lowered, simplified by the
     /// engine's MBA solver, checked by the evidence gate, and lifted back (see [`crate::mba`]).
     #[cfg(feature = "mba")]
@@ -145,6 +156,7 @@ impl Phase {
             Phase::Division => "division",
             #[cfg(feature = "prove")]
             Phase::Carries => "carries",
+            Phase::Words => "words",
             #[cfg(feature = "mba")]
             Phase::Mba(_) => "mba",
         }
@@ -178,7 +190,10 @@ pub struct Strategy {
     pub name: Cow<'static, str>,
     /// The phases of a round.
     pub phases: Vec<Phase>,
-    /// The most rounds (at least 1).
+    /// The most rounds that change a root (at least 1). A round that changed nothing may be
+    /// followed by rounds over the same root in which the MBA phase asks the questions it had
+    /// cut short, and one such round may follow the last (see the solver's steps in
+    /// `docs/design.md`).
     pub max_rounds: u8,
     /// Whether rules marked `#[float_values]` apply: identities that hold for floats as
     /// values, every NaN one value (`x · 1 = x` for every `x`, where the product of a NaN with
@@ -245,11 +260,9 @@ impl Strategy {
     }
 
     /// The standard strategy plus the deobfuscation passes (divisions by constants, carry
-    /// networks with feature `prove`, linear MBA and bit shuffles): `[FactFold, Local(core),
-    /// Linear, Xor, Casts, Division, Invert, Compares, Bitwise, Carries, LinearMba, Shuffle,
-    /// Demanded, Local(core)]`, up to 12 rounds: arithmetic done in limbs is read one handler
-    /// at a time, each on what the round before made of the handlers below it, and a chain
-    /// of them was still changing after 4.
+    /// networks with feature `prove`, linear MBA, bit shuffles and limb arithmetic):
+    /// `[FactFold, Local(core), Linear, Xor, Casts, Division, Invert, Compares, Bitwise,
+    /// Carries, LinearMba, Shuffle, Demanded, Words, Local(core)]`, up to 4 rounds.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -276,10 +289,46 @@ impl Strategy {
                 Phase::LinearMba,
                 Phase::Shuffle,
                 Phase::Demanded,
+                Phase::Words,
                 core(),
             ],
         )
-        .with_max_rounds(12)
+    }
+
+    /// For a decompiler or a lifter's everyday output, not obfuscated code: the standard
+    /// strategy plus the passes that recover what compilers emit, divisions by constants
+    /// (multiply-high sequences), byte swaps, rotations and bit-field moves (shuffles), and
+    /// with feature `prove` carry networks and bit counts spelled out (the SWAR population
+    /// count), but not the MBA passes: `[FactFold, Local(core), Linear, Xor, Casts, Division,
+    /// Invert, Compares, Bitwise, Carries, Shuffle, Demanded, Local(core)]`, up to 4 rounds.
+    pub fn decompile() -> Strategy {
+        let core = || Phase::Local {
+            groups: builtin()
+                .program
+                .groups()
+                .iter()
+                .map(|g| g.name.clone())
+                .collect(),
+        };
+        Strategy::new(
+            "decompile",
+            vec![
+                Phase::FactFold,
+                core(),
+                Phase::Linear,
+                Phase::Xor,
+                Phase::Casts,
+                Phase::Division,
+                Phase::Invert,
+                Phase::Compares,
+                Phase::Bitwise,
+                #[cfg(feature = "prove")]
+                Phase::Carries,
+                Phase::Shuffle,
+                Phase::Demanded,
+                core(),
+            ],
+        )
     }
 
     /// For a compiler, which simplifies every value of every function: the standard phases
@@ -863,6 +912,10 @@ impl EngineBuilder {
                     id = combine(id, 14);
                     phases.push(PhaseImpl::Pass(pass::PassKind::Carries));
                 }
+                Phase::Words => {
+                    id = combine(id, 15);
+                    phases.push(PhaseImpl::Pass(pass::PassKind::Words));
+                }
                 #[cfg(feature = "mba")]
                 Phase::Mba(cfg) => {
                     use core::hash::{Hash, Hasher};
@@ -1229,9 +1282,6 @@ struct Runner<'r, 'a> {
     host_quarantined: Vec<bool>,
     /// Results of this call that are not final (not memoized), per phase.
     partial: Vec<IdMap<u32, (u32, Fin)>>,
-    /// The comparisons `pass::cannot_pay` made in this call, per node.
-    #[cfg(feature = "mba")]
-    paid: IdMap<u32, Vec<pass::Paid>>,
     /// Candidate buffer, reused.
     cands: Vec<u32>,
     /// The walk's stack, reused across phases.
@@ -1240,6 +1290,8 @@ struct Runner<'r, 'a> {
     samples: IdMap<u32, Box<[BitVec]>>,
     /// The linear pass's forms, per node.
     linear: pass::forms::FormCache<pass::linear::Form>,
+    /// The linear pass's sums over its cap on terms, whole (see `pass::forms::Whole`).
+    linear_whole: pass::forms::Whole<pass::linear::Form>,
     /// The bitwise pass's truth tables, per node.
     bitwise: IdMap<u32, pass::bitwise::Info>,
     /// The bitwise pass's tables over up to six atoms, per node (read where three hide some).
@@ -1249,6 +1301,8 @@ struct Runner<'r, 'a> {
     bitwise_beyond: IdMap<u32, ()>,
     /// The xor pass's forms, per node.
     xor: pass::forms::FormCache<pass::xor::Form>,
+    /// The xor pass's xors over its cap on terms, whole.
+    xor_whole: pass::forms::Whole<pass::xor::Form>,
     /// The compares pass's descriptions, per node.
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
@@ -1258,6 +1312,9 @@ struct Runner<'r, 'a> {
     gf2_stack: Vec<(u32, bool)>,
     /// Residue tables, per node and number of low bits (see `pass::residue`).
     residues: IdMap<(u32, u32), Option<std::rc::Rc<pass::residue::Residues>>>,
+    /// The chains of `·`, `&` or `|` found in order, or of more operands than are put in
+    /// order (see `pass::sort_chain`).
+    chains: IdMap<u32, pass::Chain>,
     /// Passes quarantined for the call after a postcondition failure.
     quarantined_passes: Vec<pass::PassKind>,
     /// The passes' commit rule's scratch.
@@ -1272,24 +1329,72 @@ struct Runner<'r, 'a> {
     /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
     /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
     demanded_same: pass::demanded::Same,
+    /// What the opaque-constant sweep's reductions of its candidates found, per node and
+    /// demanded mask, for the call (see `pass::demanded::reduced`).
+    #[cfg(feature = "mba")]
+    reduced: [pass::demanded::Memo; 2],
+    /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
+    sum_constants: IdMap<(u32, u8), Vec<u32>>,
+    /// The words pass's forms and marks.
+    words: pass::words::State,
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
-    /// Questions whose answers the evidence gate proved in this call, with what vouched for
-    /// each (see `pass::mba::ask`).
+    /// Questions the solver ran out of steps on in this call, each with the steps it had (see
+    /// `pass::mba::ask`).
     #[cfg(feature = "mba")]
-    mba_proved: IdMap<crate::mba::CacheKey, (&'static str, Option<&'static str>, u64)>,
-    /// Whether the answer to a question agreed with it at the refutation sample, for the
-    /// questions answered in this call (see `pass::mba::ask`).
-    #[cfg(feature = "mba")]
-    mba_agreed: IdMap<crate::mba::CacheKey, bool>,
+    mba_exhausted: IdMap<crate::mba::CacheKey, u64>,
     /// The pass work the evidence gate's certificates that proved nothing have taken in this
     /// call (see `pass::mba::exact`).
     #[cfg(feature = "mba")]
     mba_missed: u64,
+    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
+    /// declined by the solver for their size, answered with nothing that would make the DAG
+    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
+    #[cfg(feature = "mba")]
+    mba_kept: IdMap<u32, ()>,
+    /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
+    /// rounds ask within a few steps each until one changes nothing, and only then deeper.
+    #[cfg(feature = "mba")]
+    mba_depth: u8,
+    /// Whether a question of this round ran out of steps at that depth (or was not asked for
+    /// holding one that did), so a deeper round has something to ask.
+    #[cfg(feature = "mba")]
+    mba_deeper: bool,
+    /// The roots of the fragments whose questions ran out of steps at this round's depth:
+    /// a fragment holding one is not asked at this depth either (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_shallow: IdMap<u32, ()>,
+    /// The opaque-constant candidates whose readings were asked in this call and decided
+    /// nothing: atoms to the readings of every candidate above them (see
+    /// `pass::mba::readings_prove`).
+    #[cfg(feature = "mba")]
+    mba_undecided: IdMap<u32, ()>,
+    /// The opaque-constant sweep's result for every node it examined in this call (the node
+    /// itself where it found nothing), so a sweep of another root or of one side of a case
+    /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
+    /// `pass::mba::sweep`).
+    #[cfg(feature = "mba")]
+    swept: IdMap<u32, u32>,
+    /// The pass work the sweep's certificates took once the call's MBA solver steps were
+    /// gone (see `pass::mba::readings_prove`).
+    #[cfg(feature = "mba")]
+    sweep_borrowed: u64,
+    /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
+    /// its samples showed (see `pass::mba::Witness`).
+    #[cfg(feature = "mba")]
+    witnesses: Vec<pass::mba::Witness>,
+    /// The blocks the opaque-constant sweep asked the solver about in this call with a node
+    /// cut off and got no answer to within its steps: the blocks' roots, by the cut (see
+    /// `pass::mba::sweep_cut_at`).
+    #[cfg(feature = "mba")]
+    cut_declined: IdMap<u32, IdMap<u32, ()>>,
+    /// The opaque-constant sweep's enumerations' buffers (see `pass::mba::Exhaust`).
+    #[cfg(feature = "mba")]
+    exhaust: pass::mba::Exhaust,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -1521,15 +1626,23 @@ impl Runner<'_, '_> {
     /// `root` with what an interrupted walk of `phase` did kept: a node the walk finished is
     /// its result, a node it rewrote but did not finish (a `Finish` on the stack) is what the
     /// rewrite has become so far, and the nodes above are rebuilt over them. No rule or pass
-    /// runs; the walk visits each node below `root` once without charging it, and builds nodes
-    /// only within the budget's new nodes (a node it cannot rebuild stays as it was, operands
-    /// included). `None` when nothing changes.
+    /// runs. The nodes the walk had reached (the ones on its stack) are read for nothing: their
+    /// visits are charged already. Each node below them is a node visit, as in the walk, and
+    /// one the budget does not cover stays as it was, operands included: so does a node the
+    /// budget's new nodes cannot rebuild. `None` when nothing changes.
     fn salvage(&mut self, cx: &mut Context, phase: usize, root: u32) -> Option<(u32, Fin)> {
         self.stats.salvaged += 1;
         let mut rewrote: IdMap<u32, (u32, Fin)> = IdMap::default();
+        let mut reached: IdMap<u32, ()> = IdMap::default();
         for f in &self.stack {
-            if let Frame::Finish(n, t, own) = *f {
-                rewrote.entry(n).or_insert((t, own));
+            match *f {
+                Frame::Visit(n) => {
+                    reached.insert(n, ());
+                }
+                Frame::Finish(n, t, own) => {
+                    rewrote.entry(n).or_insert((t, own));
+                    reached.insert(t, ());
+                }
             }
         }
         // Each node's salvaged value, and the nodes whose value is being worked out (a node
@@ -1560,6 +1673,11 @@ impl Runner<'_, '_> {
             }
             let node = cx.node(n);
             if !expanded && open.insert(n, ()).is_none() {
+                if !reached.contains_key(&n) && self.meter.visit().is_err() {
+                    open.remove(&n);
+                    done.insert(n, (n, Fin::FINAL));
+                    continue;
+                }
                 work.push((n, true));
                 for c in node.children() {
                     if !done.contains_key(&c) && !open.contains_key(&c) {
@@ -1669,7 +1787,7 @@ impl Runner<'_, '_> {
         // Use counts are counted afresh in each phase run, on first need (a pass's commit rule,
         // a rule's `one_use`).
         self.uses_on = false;
-        self.live.clear();
+        self.live.begin();
         self.dead.clear();
         self.dead_log.clear();
         self.phase_start = cx.len() as u32;
@@ -1684,6 +1802,12 @@ impl Runner<'_, '_> {
             self.asks.clear();
             self.first.clear();
             self.demanded_same.clear();
+            self.words.begin();
+        } else {
+            // A rule's "no" from sharing (`one_use`) may be a "yes" once a phase since has
+            // dropped the other use: those results are decided again. What a cap declined
+            // stays declined for the call.
+            self.partial[phase].retain(|_, (_, fin)| fin.why.is_some());
         }
     }
 
@@ -1761,31 +1885,52 @@ impl Runner<'_, '_> {
                         continue;
                     }
                     let mba = !local && self.is_mba(phase);
-                    // In the MBA phase the question at the top of a fragment is asked first,
-                    // over the fragment as it is (see `pass::mba_first`); a rewrite is taken
-                    // as a pass's is below, with nothing to wait on.
+                    // A question asked before the operands are walked, over the node as it is.
+                    // In the MBA phase, the one at the top of a fragment (see
+                    // `pass::mba_first`); in the demanded-bits phase, the one of a tall node
+                    // that observes an operand (see `pass::demanded::first`). A rewrite is
+                    // taken as a pass's is below, with nothing to wait on.
+                    let mut first: Option<(u32, Fin)> = None;
                     #[cfg(feature = "mba")]
                     if mba && !self.first.contains_key(&n) {
                         self.explain = None;
                         let inner = self.inner;
-                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
-                            && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
-                        {
-                            stack.pop();
-                            if pending.contains_key(&r) {
-                                self.stats.cycles_cut += 1;
-                                self.retire(cx, n);
-                                self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
-                            } else {
-                                self.rewritten.insert((n, r), ());
-                                *pending.entry(n).or_default() += 1;
-                                self.retire(cx, n);
-                                self.inherit_parent(n, r);
-                                stack.push(Frame::Finish(n, r, fin));
-                                stack.push(Frame::Visit(r));
-                            }
-                            continue;
+                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase] {
+                            first = pass::mba_first(self, cx, cfg, n)?;
                         }
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Demanded)
+                    ) && pass::demanded::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::demanded::first(self, cx, n)?;
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Words)
+                    ) && pass::words::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::words::first(self, cx, n)?;
+                    }
+                    if let Some((r, fin)) = first {
+                        stack.pop();
+                        if pending.contains_key(&r) {
+                            self.stats.cycles_cut += 1;
+                            self.retire(cx, n);
+                            self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
+                        } else {
+                            self.rewritten.insert((n, r), ());
+                            *pending.entry(n).or_default() += 1;
+                            self.live.replace(n, r);
+                            self.retire(cx, n);
+                            self.inherit_parent(n, r);
+                            stack.push(Frame::Finish(n, r, fin));
+                            stack.push(Frame::Visit(r));
+                        }
+                        continue;
                     }
                     let mut waiting = false;
                     for c in node.children() {
@@ -1830,7 +1975,9 @@ impl Runner<'_, '_> {
                             if !local {
                                 *pending.entry(n).or_default() += 1;
                             }
-                            // `n1` replaces `n`: `n` no longer counts as a user.
+                            // `n1` replaces `n`: `n` no longer counts as a user, and its
+                            // users will use `n1`.
+                            self.live.replace(n, n1);
                             self.retire(cx, n);
                             self.inherit_parent(n, n1);
                             stack.push(Frame::Finish(n, n1, own));
@@ -1859,6 +2006,7 @@ impl Runner<'_, '_> {
                                 self.rewritten.insert((n, r), ());
                                 *pending.entry(n).or_default() += 1;
                             }
+                            self.live.replace(n, r);
                             self.retire(cx, n);
                             self.inherit_parent(n, r);
                             stack.push(Frame::Finish(n, r, own.and(fin)));
@@ -2210,18 +2358,32 @@ impl Runner<'_, '_> {
                 let v = point_value(seed, w, k);
                 declared.map_or(v, |d| d.fit(&v))
             };
-            let vals: Result<Vec<BitVec>, Error> = (0..points)
-                .map(|k| cx.eval_node(i, |j| samples[&j][k], |_, w| Some(point(w, k))))
-                .collect();
-            match vals {
-                Ok(v) => {
-                    samples.insert(i, v.into_boxed_slice());
-                }
-                Err(e) => {
-                    out = Err(Stop::Error(e));
-                    break;
+            // The operands' samples, looked up once for the node (not once per point), and
+            // the node's in a vector of its final size.
+            let mut kids: [(u32, &[BitVec]); 3] = [(u32::MAX, &[]); 3];
+            for (slot, c) in cx.node(i).children().enumerate() {
+                kids[slot] = (c, &samples[&c]);
+            }
+            let at = |j: u32, k: usize| match kids.iter().find(|(c, _)| *c == j) {
+                Some((_, vals)) => vals[k],
+                None => samples[&j][k],
+            };
+            let mut vals: Vec<BitVec> = Vec::with_capacity(points);
+            let mut failed = None;
+            for k in 0..points {
+                match cx.eval_node(i, |j| at(j, k), |_, w| Some(point(w, k))) {
+                    Ok(v) => vals.push(v),
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
                 }
             }
+            if let Some(e) = failed {
+                out = Err(Stop::Error(e));
+                break;
+            }
+            samples.insert(i, vals.into_boxed_slice());
         }
         self.samples = samples;
         out
@@ -2440,8 +2602,6 @@ impl Engine {
             quarantined: Vec::new(),
             host_quarantined: Vec::new(),
             partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
-            #[cfg(feature = "mba")]
-            paid: IdMap::default(),
             cands: Vec::new(),
             stack: Vec::new(),
             samples: IdMap::default(),
@@ -2450,11 +2610,14 @@ impl Engine {
             bitwise_wide: IdMap::default(),
             bitwise_beyond: IdMap::default(),
             xor: Default::default(),
+            linear_whole: Default::default(),
+            xor_whole: Default::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),
             residues: IdMap::default(),
             gf2_atoms: Vec::new(),
             gf2_stack: Vec::new(),
+            chains: IdMap::default(),
             quarantined_passes: Vec::new(),
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
@@ -2462,16 +2625,38 @@ impl Engine {
             carries: Default::default(),
             demanded: Default::default(),
             demanded_same: Default::default(),
+            words: Default::default(),
+            #[cfg(feature = "mba")]
+            reduced: Default::default(),
+            sum_constants: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
             #[cfg(feature = "mba")]
-            mba_proved: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_agreed: IdMap::default(),
+            mba_exhausted: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_missed: 0,
+            #[cfg(feature = "mba")]
+            mba_kept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_depth: 0,
+            #[cfg(feature = "mba")]
+            mba_deeper: false,
+            #[cfg(feature = "mba")]
+            mba_shallow: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_undecided: IdMap::default(),
+            #[cfg(feature = "mba")]
+            swept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            sweep_borrowed: 0,
+            #[cfg(feature = "mba")]
+            witnesses: Vec::new(),
+            #[cfg(feature = "mba")]
+            cut_declined: IdMap::default(),
+            #[cfg(feature = "mba")]
+            exhaust: Default::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -2589,8 +2774,10 @@ impl Engine {
         // only other roots' parts used, simplified away since): those roots again, while that
         // changes something.
         if runner.live_roots.len() > 1 {
+            let mut settled = false;
             for _ in 0..3 {
                 if failure.is_some() || provisional.is_empty() {
+                    settled = true;
                     break;
                 }
                 runner.live.forget_others();
@@ -2649,8 +2836,13 @@ impl Engine {
                     }
                 }
                 if !changed {
+                    settled = true;
                     break;
                 }
+            }
+            // The cap, with a root rewritten since another's result was reached.
+            if !settled && failure.is_none() && provisional.iter().any(|p| p.2 != version) {
+                runner.stats.reruns_capped += 1;
             }
         }
         let spent = runner.meter.spent;
@@ -2714,7 +2906,7 @@ impl Runner<'_, '_> {
         #[cfg(feature = "mba")]
         let inner = self.inner;
         let mut cur = root;
-        let fin = Fin::FINAL;
+        let mut fin = Fin::FINAL;
         // with the MBA phase's noise forms, the root is read with what its
         // conditions fix put into the operands they guard first (see `pass::push_context`):
         // a case table's noise folds once its selector's bits are constants, and the budget is
@@ -2738,24 +2930,132 @@ impl Runner<'_, '_> {
                 Err(stop) => return Err((cur, fin, stop)),
             }
         }
-        // The exact opaque-constant sweep is opt-in: it can spend work on failed candidate
-        // proofs before the ordinary phases reach their root.
+        let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        if swept != cur {
+            fin = fin.and(Fin::relying(self.assumed()));
+            cur = swept;
+        }
+        cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        let settled = self.rounds(cx, cur, fin);
         #[cfg(feature = "mba")]
-        if let Some(cfg) = inner.phases.iter().find_map(|p| match p {
+        if let Ok((u, ufin)) = settled
+            && inner
+                .phases
+                .iter()
+                .any(|p| matches!(p, PhaseImpl::Mba(c) if c.noise_forms))
+        {
+            return self.split(cx, u, ufin);
+        }
+        settled
+    }
+
+    /// With the MBA phase's noise forms, the root `u` the rounds settled on, read once more on
+    /// either side of the condition its selects test most (see `pass::split_cases`): each side
+    /// with what that case fixes put in, swept and simplified by the rounds as a root is, and
+    /// the two written as one expression again with the choice as far down as they agree
+    /// (`pass::join_cases`). The smallest of the three is the result: `u`, the select of the
+    /// sides, or the sides joined.
+    ///
+    /// An obfuscator picks between two masked values by a flag and computes with the one
+    /// picked: with the flag fixed one of them is a constant, and everything computed from it
+    /// folds, where the root as a whole is a function of both. In 140 measured calls every one
+    /// of 41 such roots was a constant or a fraction of its size on one side. Asked of the
+    /// root before the rounds, the sides came out larger than the settled root's sides in
+    /// every one of them: the rounds fold what the two sides share once.
+    ///
+    /// The sides take one round that changes them (and the deeper one it may ask for): what
+    /// the condition fixed folds in it, and the rounds after it changed nothing measured and
+    /// took as long again. A budget that runs out on the sides keeps the smallest so far, and
+    /// is the reason the run ended.
+    #[cfg(feature = "mba")]
+    fn split(
+        &mut self,
+        cx: &mut Context,
+        u: u32,
+        ufin: Fin,
+    ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        let e = match pass::split_cases(self, cx, u, true) {
+            Ok(Some(e)) => e,
+            Ok(None) | Err(Stop::Exhausted(_)) => return Ok((u, ufin)),
+            Err(stop) => return Err((u, ufin, stop)),
+        };
+        self.emit_stage(cx, Stage::Cases, u, e);
+        let sides = |me: &mut Self, cx: &mut Context| {
+            let (mut cur, mut fin) = (e, ufin);
+            let swept = me.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+            if swept != cur {
+                fin = fin.and(Fin::relying(me.assumed()));
+                cur = swept;
+            }
+            cur = me.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+            me.rounds_within(cx, cur, fin, SIDE_ROUNDS, false)
+        };
+        let (s, sfin, stop) = match sides(self, cx) {
+            Ok((s, f)) => (s, f, None),
+            Err((s, f, stop)) => (s, f, Some(stop)),
+        };
+        let joined = match pass::join_cases(self, cx, s) {
+            Ok(joined) => joined,
+            Err(Stop::Exhausted(_)) => None,
+            Err(stop) => return Err((u, ufin, stop)),
+        };
+        let size = |cx: &mut Context, i: u32| match cx.dag_size(&[cx.handle(i)], 1 << 22) {
+            Ok(crate::expr::Bounded::Exact(n)) => n,
+            _ => u32::MAX,
+        };
+        let mut best = (u, ufin, size(cx, u));
+        for cand in [Some(s), joined].into_iter().flatten() {
+            let n = size(cx, cand);
+            if n < best.2 {
+                best = (cand, sfin, n);
+            }
+        }
+        // (The last root an observer was told of is the sides': it is told of the result.)
+        if best.0 != s {
+            self.emit_stage(cx, Stage::Cases, s, best.0);
+        }
+        match stop {
+            None => Ok((best.0, best.1)),
+            Some(stop) => Err((best.0, best.1, stop)),
+        }
+    }
+
+    /// Every constraint of the run's assumptions: what a result of the opaque-constant sweep
+    /// is taken to rely on. The sweep reads the facts of the nodes it folds (known bits, the
+    /// values a bottleneck can take) without recording which constraints they came from, so a
+    /// root it changed is reported as relying on all of them (an over-approximation, as
+    /// [`Reliance`] allows; none where the run has no assumptions).
+    fn assumed(&self) -> Reliance {
+        self.assumptions.map_or(Reliance::NONE, |a| {
+            a.constraints()
+                .fold(Reliance::NONE, |r, (id, _, _)| r | Reliance::of(id))
+        })
+    }
+
+    /// `cur` after the opaque-constant sweep (see `pass::mba::sweep`), where the MBA phase asks
+    /// for it. The sweep is opt-in: it can spend work on failed candidate proofs before the
+    /// ordinary phases reach their root. Run before the first round, and before each later one
+    /// on what the round before left: the phases expose constants the first sweep could not
+    /// prove (a fragment over fewer atoms once its operands are simplified), and a node an
+    /// earlier sweep examined is read from it, so only what a round made is asked about. A
+    /// budget keeps the root as it is.
+    fn sweep(&mut self, cx: &mut Context, cur: u32) -> Result<u32, Stop> {
+        #[cfg(feature = "mba")]
+        if let Some(cfg) = self.inner.phases.iter().find_map(|p| match p {
             PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms || c.known_atoms => Some(c),
             _ => None,
         }) {
-            match pass::mba_sweep(self, cx, cfg, cur) {
+            return match pass::mba_sweep(self, cx, cfg, cur) {
                 Ok(r) => {
                     self.emit_stage(cx, Stage::Sweep, cur, r);
-                    cur = r;
+                    Ok(r)
                 }
-                Err(Stop::Exhausted(_)) => {}
-                Err(stop) => return Err((cur, fin, stop)),
-            }
+                Err(Stop::Exhausted(_)) => Ok(cur),
+                Err(stop) => Err(stop),
+            };
         }
-        cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-        self.rounds(cx, cur, fin)
+        let _ = cx;
+        Ok(cur)
     }
 
     /// with the MBA phase's noise forms, `cur` with its pieces that depend only on
@@ -2774,7 +3074,17 @@ impl Runner<'_, '_> {
                 Ok(crate::expr::Bounded::Exact(n)) => n,
                 _ => return Ok(cur),
             };
-            return match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+            let cur = match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+                Ok(Some(p)) => {
+                    self.emit_stage(cx, Stage::Cases, cur, p);
+                    p
+                }
+                Ok(None) | Err(Stop::Exhausted(_)) => cur,
+                Err(stop) => return Err(stop),
+            };
+            // And the root itself, where it is one value on either side of the condition
+            // its selects test most (see `pass::split_cases`).
+            return match pass::split_cases(self, cx, cur, false) {
                 Ok(Some(p)) => {
                     self.emit_stage(cx, Stage::Cases, cur, p);
                     Ok(p)
@@ -2808,18 +3118,35 @@ impl Runner<'_, '_> {
         }
     }
 
+    /// Whether questions of the MBA phase wait for a deeper round (see `pass::mba::depth`),
+    /// which the next round then is: one step deeper, or at the full depth (`full`).
+    fn deepen(&mut self, full: bool) -> bool {
+        #[cfg(feature = "mba")]
+        if self.mba_deeper {
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+            self.mba_depth = match full {
+                true => u8::MAX,
+                false => self.mba_depth.saturating_add(1),
+            };
+            return true;
+        }
+        let _ = full;
+        false
+    }
+
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
-    /// nothing.
+    /// nothing or the strategy allows no more (`Stats::rounds_capped` counts those).
     ///
     /// The rounds have a late stage, for readings that pay by the commit rule and yet stand
     /// in the way of what the passes read better when they are taken first (a carry read as
     /// digits that meet nothing, before the slice of its word is proved). A pass leaves
     /// such a reading alone until `late` is set, and says so ([`hold`](Self::hold); the step
     /// at the root says whether its own would rewrite the root, `at_root`). Where a round
-    /// has changed nothing and a reading was so left in it, the flag is set and the rounds
-    /// go on: once for a root, and its rounds count among the strategy's. Every rewrite of
-    /// the stage is a rewrite as any other, under the commit rule, so the rounds end as
-    /// they do without it.
+    /// has changed nothing, the deeper questions and the words pass have had their turn
+    /// (see `rounds_within`) and a reading was so left in it, the flag is set and the
+    /// rounds go on: once for a root. Every rewrite of the stage is a rewrite as any other,
+    /// under the commit rule, so the rounds end as they do without it.
     ///
     /// What is asked again when the flag turns is what was not final: the nodes at which a
     /// reading was held back, and those above them. Results made under the flag are kept
@@ -2832,7 +3159,8 @@ impl Runner<'_, '_> {
     ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
         self.late = false;
         self.turned = None;
-        let out = self.turns(cx, cur, fin);
+        let max = self.inner.strategy.max_rounds.max(1);
+        let out = self.rounds_within(cx, cur, fin, max, true);
         self.late = false;
         // The stage's guard: its root is kept where it has fewer nodes than the root the
         // stage began from, or as many and fewer comparisons, and no cap declined in the
@@ -2860,21 +3188,42 @@ impl Runner<'_, '_> {
         }
     }
 
-    /// The rounds of [`rounds`](Self::rounds), the late stage among them.
-    fn turns(
+    /// [`rounds`](Self::rounds), at most `max` of them that change the root; with `late`,
+    /// the late stage among them.
+    fn rounds_within(
         &mut self,
         cx: &mut Context,
         mut cur: u32,
         mut fin: Fin,
+        max: u8,
+        late: bool,
     ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
         let inner = self.inner;
-        for round in 0..inner.strategy.max_rounds.max(1) {
+        #[cfg(feature = "mba")]
+        {
+            self.mba_depth = 0;
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+        }
+        self.words.turn = false;
+        // The rounds that changed the root, and every round (the number an observer sees).
+        let (mut changed, mut round) = (0u8, 0u8);
+        // Whether this round is over the root the one before it left as it was, with deeper
+        // questions; and whether it is the one round past the strategy's last, with the
+        // deepest (see below).
+        let (mut again, mut extra) = (false, false);
+        loop {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             self.held = false;
-            if round > 0 {
+            if round > 0 && !again {
+                let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                if swept != cur {
+                    fin = fin.and(Fin::relying(self.assumed()));
+                    cur = swept;
+                }
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
-            let start = cur;
+            let (start, before) = (cur, fin);
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 let spent0 = self.meter.spent;
                 self.settled = cur == start;
@@ -2888,8 +3237,25 @@ impl Runner<'_, '_> {
                 }
                 match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
-                        cur = r;
-                        fin = fin.and(f);
+                        // The demanded-bits pass commits a reader at a time, each counted
+                        // against the nodes it frees with the rest of the root as it was;
+                        // what several readers of one word are rewritten to can leave the
+                        // root larger than the phase found it (the limbs written twice, once
+                        // for the readers rewritten and once for those that were not). Such
+                        // a phase is given up: what the later phases read (the words pass,
+                        // whole) is the root as it was.
+                        let grew = r != cur
+                            && matches!(
+                                inner.phases[phase],
+                                PhaseImpl::Pass(pass::PassKind::Demanded)
+                            )
+                            && census(cx, r).0 > census(cx, cur).0;
+                        if grew {
+                            fin = fin.and(Fin::PROVISIONAL);
+                        } else {
+                            cur = r;
+                            fin = fin.and(f);
+                        }
                         self.emit_phase_end(cx, round, phase, cur, spent0, None);
                     }
                     // A budget keeps what the stopped phase did (see `salvage`). A
@@ -2918,54 +3284,102 @@ impl Runner<'_, '_> {
                     Err(stop) => return Err((cur, fin, stop)),
                 }
             }
-            if cur == start {
-                // The late stage, once: where a reading was left to it in this round, or the
-                // step at the root has said the readings it takes last would rewrite this
-                // root, the rounds go on with the flag set.
+            round = round.saturating_add(1);
+            let same = cur == start;
+            changed += u8::from(!same);
+            let last = extra || changed >= max;
+            // The MBA phase's questions that ran out of steps at the depth this round asked
+            // them (see `pass::mba::depth`) are asked deeper once the rounds have nothing left
+            // to do at this one: in a round over the same root where this one changed nothing
+            // (without the sweeps, and with that round's word on the root in place of this
+            // one's), and in one round past the strategy's last, at the full depth, where the
+            // rounds were still changing it.
+            //
+            // The words pass asks the same way, after them: in a round over a root the other
+            // phases left as it was (see `pass::words::State::turn`), and in that one round
+            // past the last.
+            let words = !self.words.turn
+                && inner
+                    .phases
+                    .iter()
+                    .any(|p| matches!(p, PhaseImpl::Pass(pass::PassKind::Words)));
+            self.words.turn = false;
+            if same {
+                if self.deepen(false) {
+                    (fin, again) = (before, true);
+                    continue;
+                }
+                if words {
+                    self.words.turn = true;
+                    (fin, again) = (before, true);
+                    continue;
+                }
+                // The late stage, once and last: where a reading was left to it in this
+                // round, or the step at the root has said the readings it takes last would
+                // rewrite this root, the rounds go on with the flag set.
                 #[cfg(feature = "prove")]
                 let latent = self.latent.contains_key(&cur);
                 #[cfg(not(feature = "prove"))]
                 let latent = false;
-                if !self.late && (self.held || latent) {
+                if late && !self.late && (self.held || latent) {
                     self.late = true;
                     self.turned = Some((cur, fin));
                     #[cfg(feature = "prove")]
                     self.rooted.clear();
+                    again = true;
+                    continue;
+                }
+                return Ok((cur, fin));
+            }
+            if last {
+                // (Both are asked for: neither short-circuits the other.)
+                let deeper = !extra && self.deepen(true);
+                if !extra && (deeper || words) {
+                    self.words.turn = words;
+                    (extra, again) = (true, false);
                     continue;
                 }
                 break;
             }
+            again = false;
         }
+        self.stats.rounds_capped += 1;
         Ok((cur, fin))
     }
 }
 
+/// The nodes of the DAG of `root`, and the comparisons among them.
+fn census(cx: &Context, root: u32) -> (usize, u32) {
+    let mut seen: IdMap<u32, ()> = IdMap::default();
+    let mut stack = vec![root];
+    let mut compares = 0u32;
+    while let Some(i) = stack.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        let node = cx.node(i);
+        compares += u32::from(matches!(
+            node.op,
+            crate::expr::OpCode::Eq
+                | crate::expr::OpCode::Ne
+                | crate::expr::OpCode::Ult
+                | crate::expr::OpCode::Ule
+                | crate::expr::OpCode::Slt
+                | crate::expr::OpCode::Sle
+        ));
+        stack.extend(node.children());
+    }
+    (seen.len(), compares)
+}
+
 /// Whether the DAG of `a` has fewer nodes than that of `b`, or as many and fewer comparisons.
 fn smaller(cx: &Context, a: u32, b: u32) -> bool {
-    let count = |root: u32| {
-        let mut seen: IdMap<u32, ()> = IdMap::default();
-        let mut stack = vec![root];
-        let mut compares = 0u32;
-        while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
-                continue;
-            }
-            let node = cx.node(i);
-            compares += u32::from(matches!(
-                node.op,
-                crate::expr::OpCode::Eq
-                    | crate::expr::OpCode::Ne
-                    | crate::expr::OpCode::Ult
-                    | crate::expr::OpCode::Ule
-                    | crate::expr::OpCode::Slt
-                    | crate::expr::OpCode::Sle
-            ));
-            stack.extend(node.children());
-        }
-        (seen.len(), compares)
-    };
-    count(a) < count(b)
+    census(cx, a) < census(cx, b)
 }
+
+/// The rounds that change them the sides of a split root take (see `Runner::split`).
+#[cfg(feature = "mba")]
+const SIDE_ROUNDS: u8 = 1;
 
 /// Whether `n1`, the rebuild of `n` over new operands `kids`, is `n`'s operator over them (in
 /// any order: the constructors sort commutative operands), not a fold the constructors made.
