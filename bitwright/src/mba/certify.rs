@@ -2288,13 +2288,16 @@ struct Compose {
     intern: HashMap<MNode, u32>,
     /// Per class root: its bitwise representative, if any (see [`Policy::Linear`]).
     rep: Vec<Option<u32>>,
-    /// The sample points and every node's values there, when those fit in 64 bits: each
-    /// skeleton is checked against its side's values before a test decides on it.
-    sample: Option<SampleValues>,
+    /// The sample points, and per node a digest of its value at each (the value itself up to
+    /// 64 bits).
+    points: Vec<Vec<BitVec>>,
+    digests: Vec<Vec<u64>>,
+    /// When the values fit in 64 bits, each skeleton is checked against its side's values
+    /// before a test decides on it ([`Compose::agrees`]): the number of nodes whose values the
+    /// check reads (those there were when it was last set up; nodes added since have none
+    /// to it).
+    checked: Option<usize>,
 }
-
-/// Sample points, and per node its values at them.
-type SampleValues = (Vec<Vec<BitVec>>, Vec<Vec<u64>>);
 
 /// The most distinct leaves of a bitwise function expanded by [`Policy::Linear`] (a table of
 /// `2^k` entries), and of a bitwise form looked for at the sample.
@@ -2386,7 +2389,9 @@ impl Compose {
             sides: len,
             intern,
             rep: Vec::new(),
-            sample: None,
+            points: Vec::new(),
+            digests: Vec::new(),
+            checked: None,
         };
         c.mark_forced();
         c.add_complements();
@@ -2545,7 +2550,7 @@ impl Compose {
         let points = sample_points(&self.vars, &[&all], seed);
         tmp_time("C.sample.points", tq);
         let tq2 = std::time::Instant::now();
-        let mut digests = digests(&prog, &points, self.nodes.len());
+        let digests = digests(&prog, &points, self.nodes.len());
         tmp_time("C.sample.digests", tq2);
         tmp_time("C.sample", tq);
         let (ra, rb) = (self.root_a as usize, self.root_b as usize);
@@ -2557,13 +2562,15 @@ impl Compose {
         }
         let tt = tmp_t("C.keys");
         let values = prog.widest() <= 64;
+        self.points = points;
+        self.digests = digests;
         if values {
-            self.sample = Some((points.clone(), digests.clone()));
+            self.checked = Some(self.digests.len());
         }
         // Group nodes by width and sample values; pair within groups, operands first.
         let key = |i: usize| {
             let mut h = u64::from(self.nodes[i].width.bits());
-            for &d in &digests[i] {
+            for &d in &self.digests[i] {
                 h = crate::hash::combine(h, d);
             }
             h
@@ -2584,7 +2591,7 @@ impl Compose {
             let peers = groups.entry(k).or_default().clone();
             let mut tries = 0;
             for m in peers {
-                if digests[m as usize] != digests[i as usize] {
+                if self.digests[m as usize] != self.digests[i as usize] {
                     continue;
                 }
                 if self.find(m) == self.find(i) {
@@ -2607,16 +2614,16 @@ impl Compose {
         let tq = std::time::Instant::now();
         self.compute_reps();
         if values {
-            self.bitwise_forms(meter, report, &mut digests)?;
+            self.bitwise_forms(meter, report)?;
             self.compute_reps();
-            self.sample = Some((points.clone(), digests.clone()));
+            self.checked = Some(self.digests.len());
         }
         tmp_time("C.bitwise_forms", tq);
         let tt = tmp_t("C.check");
         // Every class agrees at the sample (a pairing that does not is a bug: decline).
         for i in 0..self.nodes.len() as u32 {
             let r = self.find(i);
-            if digests[r as usize] != digests[i as usize] {
+            if self.digests[r as usize] != self.digests[i as usize] {
                 report.internal += 1;
                 return Ok(());
             }
@@ -2805,7 +2812,7 @@ impl Compose {
     /// of points at a time where that computes what [`MbaExpr::eval`] does, else point by
     /// point (debug builds check that both agree).
     fn agrees(&mut self, vm: &VarMap, sides: [(&MbaExpr, u32); 2]) -> bool {
-        let Some((points, digests)) = self.sample.take() else {
+        let Some(kept) = self.checked else {
             return true;
         };
         let class_root: Vec<u32> = vm
@@ -2816,19 +2823,18 @@ impl Compose {
                 Slot::Orig(_) => 0,
             })
             .collect();
-        let ok = match self.agrees_batched(vm, sides, &points, &digests, &class_root) {
+        let (points, digests) = (&self.points, &self.digests[..kept]);
+        match self.agrees_batched(vm, sides, points, digests, &class_root) {
             Some(ok) => {
                 debug_assert_eq!(
                     ok,
-                    self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
+                    self.agrees_pointwise(vm, sides, points, digests, &class_root),
                     "the batched sample check differs from the pointwise one"
                 );
                 ok
             }
-            None => self.agrees_pointwise(vm, sides, &points, &digests, &class_root),
-        };
-        self.sample = Some((points, digests));
-        ok
+            None => self.agrees_pointwise(vm, sides, points, digests, &class_root),
+        }
     }
 
     /// [`Compose::agrees`] point by point, with [`MbaExpr::eval`]: it stops at the first point
@@ -3234,13 +3240,12 @@ impl Compose {
     /// Bitwise forms: for each atom (arithmetic read bitwise) whose bits at every sample point
     /// are one function of the bits of the leaves of its definition, that function as nodes
     /// (its algebraic normal form), paired with the atom once proved equal (`(e − 1 & d) − e`
-    /// is `~(e − 1) | d`). `digests` are values here (64 bits or fewer), and grow with the
+    /// is `~(e − 1) | d`). The digests are values here (64 bits or fewer), and grow with the
     /// nodes.
     fn bitwise_forms<M: Meter>(
         &mut self,
         meter: &mut M,
         report: &mut Report,
-        digests: &mut Vec<Vec<u64>>,
     ) -> Result<(), M::Err> {
         let atoms: Vec<u32> = (0..self.sides as u32)
             .filter(|&i| self.forced[i as usize] && self.role[i as usize] == Role::Arith)
@@ -3256,6 +3261,7 @@ impl Compose {
                 continue;
             }
             let w = self.nodes[y as usize].width;
+            let digests = &self.digests;
             let points = digests[y as usize].len();
             let units = (points * leaves.len()) as u64;
             if units > meter.left() {
@@ -3286,8 +3292,10 @@ impl Compose {
                 continue;
             }
             let root = self.anf_nodes(ones, &leaves, w);
-            self.extend_digests(digests);
-            if digests[root as usize] != digests[y as usize] || self.find(root) == self.find(y) {
+            self.extend_digests();
+            if self.digests[root as usize] != self.digests[y as usize]
+                || self.find(root) == self.find(y)
+            {
                 continue;
             }
             if self.equal_defs(meter, report, y, root)? {
@@ -3357,9 +3365,9 @@ impl Compose {
 
     /// Digests (values, at 64 bits or fewer) of the nodes added since they were computed: only
     /// constants and `& | ^ ~` are added.
-    fn extend_digests(&self, digests: &mut Vec<Vec<u64>>) {
-        let points = digests.first().map_or(0, Vec::len);
-        for i in digests.len()..self.nodes.len() {
+    fn extend_digests(&mut self) {
+        let points = self.digests.first().map_or(0, Vec::len);
+        for i in self.digests.len()..self.nodes.len() {
             let n = self.nodes[i];
             let bits = n.width.bits();
             let mask = if bits >= 64 {
@@ -3367,6 +3375,7 @@ impl Compose {
             } else {
                 (1u64 << bits) - 1
             };
+            let digests = &self.digests;
             let col = |k: u32, p: usize| digests[k as usize].get(p).copied().unwrap_or(0);
             let v: Vec<u64> = (0..points)
                 .map(|p| match n.op {
@@ -3378,7 +3387,7 @@ impl Compose {
                     _ => 0,
                 })
                 .collect();
-            digests.push(v);
+            self.digests.push(v);
         }
     }
 
