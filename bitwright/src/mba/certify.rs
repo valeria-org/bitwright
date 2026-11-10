@@ -1515,7 +1515,10 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         && report
             .counterexample
             .as_ref()
-            .is_none_or(|p| a.eval(p).is_none() || a.eval(p) == b.eval(p))
+            .is_none_or(|p| match a.eval(p) {
+                None => true,
+                va => va == b.eval(p),
+            })
     {
         debug_assert!(false, "a refutation without a counterexample");
         report.verdict = Verdict::Unknown;
