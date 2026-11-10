@@ -148,6 +148,76 @@ large to blast where 4 were.
   `RootOutcome::relies_on`: `zext(x == k) + 5 + …` folded to `5` under the assumption
   `x != k` and said it held everywhere. Such a root now reports every constraint of the run.
 
+How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
+roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
+folds with half of theirs), the 44 `forms_simplify` roots are left at 9,218 nodes together
+(19,164), all 16 `valid_under` questions are proved (3) and every one of the 27 equalities is
+decided, 14 proved and 13 refuted (10 and 13, four out of budget). The questions also take
+less time than before these changes: 15% less CPU over the set run back to back, none of them
+a quarter of a second, the median 75 ms.
+
+- **A question narrower than its operands is read without its casts.** `trunc<32>(x ^ y) +
+  2·trunc<32>(x & y) − trunc<32>(x) − trunc<32>(y)` over 64-bit `x` and `y` left the normal
+  form and the certificates with four casts for atoms. The low bits of `+ − · ~ & | ^` and of
+  a left shift depend on the low bits of their operands, so such a question is computed at
+  its own width over the low bits of each wide variable, and those are variables to the
+  tests. (A right shift of a wider node still reads bits the question's width lacks.)
+- **A sum under an extension is asked at its own width.** `zext<64>(s) + k` with `s` a 32-bit
+  MBA was one question at 64 bits, where `s` is read through a mask and is a constant only
+  modulo `2^32`; the sum inside was taken as covered by it and never asked. Only a truncation
+  is transparent to a chain of sums now.
+- **Rotations keep complements and constants outside.** `rotl(~x, s)` is `~rotl(x, s)` (and
+  `rotr` likewise), and a constant under a rotation by a constant is rotated once:
+  `rotl(x ^ c, s)`, `rotl(x & c, s)`, `rotl(x | c, s)`. Nested rotation layers with a mask or
+  a key between them then meet (`rotl(rotl(rotl(p, 46) ^ k, 26) & m, 56)` is `p & m'`). The
+  rule `not_rotl_not` is gone, shadowed by `rotl_not`. `(x | c) − c` written as an addition
+  is `x & ~c` (`add_or_const`), also where `x | c` has other readers.
+- **Slices of one rotation are read as that rotation.** A fragment whose parts are bits of
+  one value under shifts, rotations, masks and complements (`t << 13`, `t >>u 51`, `~(t << 13)
+  & m`, products of those by `2^k·c`) is asked again with each part written over the
+  rotation most of them read, `(rotl(t, r) & mask) ^ flip`: one atom where the two halves of
+  a rotation were two. The value a part is a slice of is read too, where it is a node of the
+  fragment's own. With or without the noise forms.
+- **A fragment is asked again with a shared value cut off as one atom**, for the two values
+  most of its terms read: an obfuscator writes `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of
+  its own, and the whole question is over what `t` is made of. These questions and the
+  slices one take a small share of the solver's steps and of the certificates' work.
+- **A sum whose terms share a factor is asked without it.** `(f·a)·t₁ − (f·b)·t₂ + …`, an
+  MBA scaled by a value with each coefficient spelled as a product of its own with it, is a
+  polynomial over what `f` is made of; the sum with `f` taken out is linear over the atoms of
+  the terms. The products are read through negations, constants and shared subproducts.
+- **The sweep enumerates a cut of several places.** Where more than sixteen bits of the
+  symbols reach a candidate and no one node on every path decides it, the enumeration is over
+  several nodes that together cut the paths, as near the symbols as ten bits allow, each over
+  the values the bits known of it leave. A shift count taken from the low bits of a product
+  of a value that two unrelated conditions each give one bit of is constant, and is now seen
+  to be. A truncation the samples hold constant is asked about (for its known bits and the
+  enumeration, as a one-bit node is), and a `select` passes the bits read of it to its arms.
+- **Sides that are a constant plus a multiple of each variable bit are compared as that.** A
+  sum of products of bitwise functions of one value by constants is such a form whatever its
+  carries, and under a mask the tests took it for an atom: the answer `rotl(x, 13) ^ k` to a
+  150-node rotation MBA ending in a mask was found and not proved. The forms go through sums,
+  products by constants and shifts, and through `& | ^` where each bit of an operand is a
+  constant, a variable bit or its complement; two forms are one function exactly when they
+  are the same, so the comparison decides (with an input where they differ), and it runs
+  before the tests that evaluate points.
+- **One leaf under masks is a symbol to the symbolic comparison.** A bitwise function of one
+  leaf and constants is `f(0)` plus the leaf under the bits it sets less the leaf under the
+  bits it clears, whatever spelled it: `m − (~t & m)` and `t & m` are one polynomial. A
+  product of such a term with another value was proved by a sparse test over two variables,
+  1.6 million units of pass work for a 20-node question, four times in one call that then ran
+  out.
+- **A sum with a constant whose carries are all known is a xor**, under a mask: `t + k` (or
+  `k − t`) differs from `t` in fixed bits where every carry on the bits read is known from
+  the bits known of `t`. One value written twice, once through such a sum, was two
+  unrelated atoms to the MBA phase. Only for a sum with no other reader (one read under
+  several masks is one value to all of them), and taken at the same size.
+- **A root is split on the condition its selects test most**, with the noise forms, when each
+  side is one value at every sample point. At random inputs a condition like `x != y` holds
+  every time: a root that is one constant where it holds and another where it does not looked
+  like the first, and no proof of that exists. Each side is read at the same inputs with the
+  condition put in, and the root becomes a `select` of the two, which the phases fold.
+
 ## 0.27.0
 
 Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.

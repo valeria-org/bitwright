@@ -1358,9 +1358,23 @@ pub mod mba {
     before a test decides on it, and any refutation's counterexample is checked on the two
     sides; either failing would be a bug, and the question is declined (`CertStats::internal`,
     an assertion in debug builds).
+  - *Bit-linear*, first: a side that is a constant plus a multiple of each bit of the
+    variables, modulo the width, is read as that form. Sums, differences, negations,
+    complements, left shifts and products by a constant keep such a form whatever it is;
+    `& | ^` and a right shift take operands every bit of which is a constant, a variable bit
+    or its complement (a form that sets or clears one bit for each variable bit it reads, with
+    no carry) and give one. Two forms are the same function exactly when their constants and
+    multiples are the same (at zero and at each single variable bit), so where both sides have
+    one the comparison decides, with a counterexample when they differ: a 25-term sum of
+    masks of one rotated value by 64-bit constants, under a mask, against `rotl(x, 13) ^ k`.
+    At 64 bits or fewer and up to 256 bits of variables; it gives up at the first node with
+    no form and is charged (a unit per node read and 16 variable bits) only where it decides.
+    Reported as a symbolic certificate.
   - *Symbolic*: both sides are expanded as polynomials over symbols (variables, conjunctions
-    of the leaves of a bitwise function by its Möbius expansion, other bitwise subterms by
-    their structure; at most 4,096 monomials). Equal polynomials are equal functions whatever
+    of the leaves of a bitwise function by its Möbius expansion, one leaf under a mask for a
+    bitwise function of that leaf and constants (`f(0)` plus the leaf under the bits the
+    function sets less the leaf under the bits it clears, so `m − (~t & m)` and `t & m` are
+    one polynomial), other bitwise subterms by their structure; at most 4,096 monomials). Equal polynomials are equal functions whatever
     the symbols' values; unequal ones decide nothing (`(x & 1)² = x & 1` holds bit by bit, not
     as polynomials). It runs when no direct test fits a pair of polynomial sides (or the test
     is over its budget), and before a polynomial test that would take far longer: within half
