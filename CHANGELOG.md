@@ -153,6 +153,315 @@ and 48 of random phases. What did break:
   random cases reached it, all at 128 bits or more with the native MBA solver; their results
   in a release build were right.
 
+Slow questions from walks over an obfuscated driver (140 of them, each a quarter of a second or
+more): roots left at two thousand nodes with the budget gone, and equalities too large to blast.
+The causes found so far, none specific to those expressions.
+
+- **A sweep reads what an earlier one found.** The opaque-constant sweep ran once per root and
+  once per side of every case it split, and asked about the nodes they share each time, so a
+  call over a few roots with a common core spent its pass work on the same questions. What a
+  sweep finds for a node (the node itself where it finds nothing) is now kept for the call, and
+  a later sweep reads it.
+- **One certificate cannot take the whole budget.** The MBA gate's exact evidence was metered
+  only by what the call had left, so a single candidate whose compositional test ran long left
+  nothing for the phases after it. A certificate now gets half the call's pass work at most
+  (and never less than a direct test of the pair costs), and stops as undecided beyond it.
+- **A change of variable.** The certificates read an arithmetic node under a bitwise operator
+  as an atom, independent of the variable inside it, so an identity that holds only because
+  two atoms are related through that variable was not one to them: with `t = (x ^ c) + k`,
+  `(−1 − k) − (x ^ c)` is `~t`, and `(x ^ c)·d` is `(t − k)·d`. Where such an atom is a chain of
+  invertible links over one variable (`^ c`, `+ c`, `c −`, `· odd`, `−`, `~`), the question is
+  now also asked over the atom in the variable's place, the variable its inverse; a
+  counterexample there is mapped back. A side that differs at one input of `2^64`
+  (`x + (1 − ((d | −d) >> 63))` with `d = x·k₁ ^ k₂`) is refuted with that input. The
+  compositional test also tries each class's bitwise representative for its minimal atoms.
+- **The prover simplifies with the opaque-constant sweep.** `Config::simplify` ran the
+  deobfuscation strategy without it, so a question whose constants were hidden behind a
+  comparison's mask was blasted with its multipliers and came back `TooLarge`. It now runs
+  with the sweep.
+- **The sweep runs again between rounds**, over what the phases left: a constant that shows
+  only once a round has simplified what it reads was never asked about.
+- **Nodes the samples relate are asked to be related.** A varying node whose samples are an
+  earlier node's up to a constant (`rep + d`, `d − rep`, `rep ^ d`) is asked to be that,
+  exactly, and written so where proved.
+- **An atom and its offset are one variable.** A fragment that reads both `t` and `k − t` (or
+  `t + k`, `k − (−t)`, `t·−1 + k`) lowered them as two independent atoms; the lowering now
+  writes the operand through the atom (`t = k − a`), so identities that hold through the pair
+  are ones the solver and the certificates see.
+- **A fragment the solver declined for its size is not asked again from above.** Every node
+  over a root answered "too many atoms" was asked in turn, each lowering the same fragment
+  (27 questions of 820 nodes, 310,000 steps each, in one call); such roots are remembered for
+  the call and a fragment containing one is skipped.
+- **A bottleneck is enumerated over the values it can take.** The sweep's exhaustive check,
+  when it enumerates a narrow node instead of the symbols, took every value of the node's
+  demanded bits and called a mismatch a refutation, though the node may never take that
+  value. It now enumerates only the bits not known of the node, and a mismatch there leaves
+  the candidate to the readings. A candidate its demanded-bits form leaves open is also asked
+  as written.
+- **A subtraction that borrows nothing is a xor.** `c − t` with `t`'s bits all among `c`'s
+  (`0xff − (x & 0x0f)`) was arithmetic under a bitwise operator, an atom to the bitwise and
+  xor passes and to the certificates. The rule `sub_within` writes it `t ^ c`; the linear pass
+  reads `c ^ t` with `t ⊆ c` back as the difference, so no cancellation through a sum is
+  lost; the certificates read sums and differences of bitwise terms that can carry or borrow
+  nothing as `|` and `^` before any test; and the bitwise pass writes a function of one atom
+  and any number of constants as `(x & a) ^ b`, from its values at 0 and at all ones.
+- **What was asked and kept is not asked from above.** A fragment whose answer would not make
+  the DAG smaller, or was not proved, or took the solver four thousand steps to find nothing
+  simpler, or ran it out of steps, is remembered for the call as the ones declined for size
+  were, and a fragment that holds one is not asked (five fragments of 110 to 197 nodes over
+  one such core, 2.5 million steps and no rewrite, in one call). In the sweep, a candidate
+  whose readings decided nothing is an atom to the readings of every candidate above it, and
+  the readings of one candidate end at the first whose certificate takes most of its share
+  and leaves the question open.
+- **One question to the solver takes a share of the call's steps.** The solver's own limit is
+  a million steps whatever the call has: in a call of two million, one question that ran out
+  took half of them and the rounds after it had none. A question now gets a quarter of the
+  call's solver steps at most, and one that ran out is not asked again in the call with no
+  more of them. No answer committed in the 140 questions took more than that.
+
+How long those questions take, on the same 140: what follows cut their total CPU time to a
+fifth (86 s to 17 s, run back to back on a loaded machine, each question in its own process
+with the engine's tables already built). The median question went from 600 ms to 120 ms, and
+of the 128 that took a quarter of a second or more, five still do. More of them are
+simplified further than before: 19,164 nodes left over the 44 `forms_simplify` roots where
+there were 22,701, 23 of the 47 `engine` roots folded to a constant where 16 were, 10 of the
+27 equalities proved and 13 refuted where 5 and 10 were, none of the 43 prover questions too
+large to blast where 4 were.
+
+- **The sweep keeps the inputs its enumerations miss at.** An enumeration that ends where the
+  candidate is not its constant now keeps that input for the call, and every later candidate
+  and related pair is evaluated there before anything else is asked of it. An obfuscator
+  builds one value from another, and a chain of them that are constant but for one value of a
+  16-bit field was enumerated up to that value at every link: of 6.6 billion node evaluations
+  spent in enumerations that ended in a miss, all but five million repeated a point an
+  earlier candidate had already missed at.
+- **An enumeration evaluates its points a block at a time.** The word program ran once per
+  point, with a table lookup per input and an operator dispatch per node; it now runs once
+  per block of up to 1,024 points, one loop per instruction over its operands' lanes, with
+  constants folded into the instructions. The walk that finds which symbol bits reach a
+  candidate is one pass down from it over a bitmap, stops as soon as more than sixteen bits
+  reach it with no node left that could be a bottleneck, and reuses its buffers across calls.
+  Same answers; a point is charged an eighth of what it was, since the same enumerations take
+  a twentieth of the time (charged at the old rate, enumerations of a millisecond were
+  declined for their cost, and six of the 140 questions ran out of steps a third of the way
+  from where they now finish).
+- **A certificate costs half what it did**, with the same verdicts, counterexamples and
+  charges. What it charges for, the node evaluations, was under a tenth of its time; the
+  rest was bookkeeping nothing charged. The refutation sample's constant pool was built
+  from every constant and then cut to 32 (now it stops when full); the compositional test
+  rebuilt the two skeletons of a pair for each of its five policies (75,000 of 136,000
+  comparisons repeated a pair an earlier policy had built: now compared from what was
+  found, with the same charges); its node tables were hash maps keyed by whole nodes and
+  rehashed with a mixer chain per word; the sample was cloned and its rows hashed to group
+  nodes; sums were read as bitwise through wide values at 64 bits. The sample's
+  seed-independent points are compared before the seed is hashed, which is where all but
+  five of 13,621 sample refutations are found.
+- **The normal-form solver takes the same steps in 58% of the time**, with the same answer
+  and the same step count for every one of 9,742 recorded questions. A fifth of its time
+  outside its certificates was the allocator and a quarter touched tree maps: monomials now
+  hold their factors in place and a polynomial's terms are a sorted vector up to 64;
+  sums merge, and scaling and the reductions work in place; a candidate rendering is
+  walked, costed and finished without allocating, and its nodes are interned through a
+  small index; coefficient arithmetic takes one machine word up to 64 bits; the corner sums
+  of a bitwise function take a word each; a linear form is expanded once for its three
+  decompositions; the synthesis table's per-width indexes are built once per process behind
+  a cheap hash.
+- **The sweep's reductions share what they find.** Every candidate is first taken on the bits
+  its users read (`demanded::reduced`), and each call walked the whole of what the calls
+  below it had walked. What one finds for a node under a mask is kept for the call, up to
+  where the visit cap cut a walk short.
+- **One value under several masks stays one value.** Those reductions replaced a sum's
+  constant by its residue on the bits read, so `t + k` under `& 0xff` and under `& 0xffff`
+  became two sums, each an atom of its own to a certificate, and what cancels through
+  `t + k` was gone. For a pair the samples relate by a sum or a difference the constant now
+  stays as it is: the first one added to that operand in the call that agrees with it on the
+  bits read. (A pair related by a xor is still read with the residues, which is the form the
+  bitwise tests decide there.)
+- **A node is not asked to be related to what its operand was not.** Where `f(a)` could not
+  be proved to be `rep + d`, `g(f(a))` was asked next, about the same `rep`, and failed for
+  the same reason at the cost of a full certificate; the skip counts toward the sweep's cap
+  on pairs left open. Of 3,230 such questions in the 140, five had been proved.
+- **A block's cases are read at the samples first.** `cases_fold` built both sides of a
+  condition and swept each before it looked at whether the block is constant on either: now
+  the samples that fall on each side say so first, the first side is proved before the
+  second is swept, and a side an earlier sweep examined is not walked again (4,364 side
+  sweeps became 881, for four more folds). A sum with a node cut off is not asked of the
+  solver when it holds a block the solver declined at the same cut (1,066 questions, none of
+  which had an answer), and an atom a block is seen to read at one input is not tried as
+  noise with the 64-point sample.
+- **A fragment is lowered once where two readings are the same.** A fragment that is
+  semi-linear as it is has one lowering for the whole and the semi-linear reading, and one
+  per cut; the walk and the build keep their node tables in a dense map emptied in constant
+  time instead of a hash map built per reading.
+- **What the sweep changes under assumptions is reported as relying on them.** The sweep
+  folds on facts (known bits, the values a bottleneck can take) without recording which
+  constraints they came from, and a root it changed reported an empty
+  `RootOutcome::relies_on`: `zext(x == k) + 5 + …` folded to `5` under the assumption
+  `x != k` and said it held everywhere. Such a root now reports every constraint of the run.
+
+How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
+roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,422 nodes together
+(19,164) and the five `simplify` roots at 685 (1,186), all 16 `valid_under` questions are
+proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
+13, four out of budget). The questions also take less time than before these changes: 15%
+less CPU over the set run back to back, with the limb passes above in the strategy.
+
+- **A question narrower than its operands is read without its casts.** `trunc<32>(x ^ y) +
+  2·trunc<32>(x & y) − trunc<32>(x) − trunc<32>(y)` over 64-bit `x` and `y` left the normal
+  form and the certificates with four casts for atoms. The low bits of `+ − · ~ & | ^` and of
+  a left shift depend on the low bits of their operands, so such a question is computed at
+  its own width over the low bits of each wide variable, and those are variables to the
+  tests. (A right shift of a wider node still reads bits the question's width lacks.)
+- **A sum under an extension is asked at its own width.** `zext<64>(s) + k` with `s` a 32-bit
+  MBA was one question at 64 bits, where `s` is read through a mask and is a constant only
+  modulo `2^32`; the sum inside was taken as covered by it and never asked. Only a truncation
+  is transparent to a chain of sums now.
+- **Rotations keep complements and constants outside.** `rotl(~x, s)` is `~rotl(x, s)` (and
+  `rotr` likewise), and a constant under a rotation by a constant is rotated once:
+  `rotl(x ^ c, s)`, `rotl(x & c, s)`, `rotl(x | c, s)`. Nested rotation layers with a mask or
+  a key between them then meet (`rotl(rotl(rotl(p, 46) ^ k, 26) & m, 56)` is `p & m'`). The
+  rule `not_rotl_not` is gone, shadowed by `rotl_not`. `(x | c) − c` written as an addition
+  is `x & ~c` (`add_or_const`), also where `x | c` has other readers. A sum shifted back,
+  `((x << c) + k) >>u c`, is `(x + (k >>u c)) & m` (`lshr_add_shl`): the constant's low bits
+  carry nothing into what is kept.
+- **Slices of one rotation are read as that rotation.** A fragment whose parts are bits of
+  one value under shifts, rotations, masks and complements (`t << 13`, `t >>u 51`, `~(t << 13)
+  & m`, products of those by `2^k·c`) is asked again with each part written over the
+  rotation most of them read, `(rotl(t, r) & mask) ^ flip`: one atom where the two halves of
+  a rotation were two. The value a part is a slice of is read too, where it is a node of the
+  fragment's own. With or without the noise forms.
+- **A fragment is asked again with a shared value cut off as one atom**, for the two values
+  most of its terms read: an obfuscator writes `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of
+  its own, and the whole question is over what `t` is made of. These questions and the
+  slices one take a small share of the solver's steps and of the certificates' work.
+- **A sum whose terms share a factor is asked without it.** `(f·a)·t₁ − (f·b)·t₂ + …`, an
+  MBA scaled by a value with each coefficient spelled as a product of its own with it, is a
+  polynomial over what `f` is made of; the sum with `f` taken out is linear over the atoms of
+  the terms. The products are read through negations, constants and shared subproducts.
+- **The sweep enumerates a cut of several places.** Where more than sixteen bits of the
+  symbols reach a candidate and no one node on every path decides it, the enumeration is over
+  several nodes that together cut the paths, as near the symbols as ten bits allow, each over
+  the values the bits known of it leave. A shift count taken from the low bits of a product
+  of a value that two unrelated conditions each give one bit of is constant, and is now seen
+  to be. A truncation the samples hold constant is asked about (for its known bits and the
+  enumeration, as a one-bit node is), and a `select` passes the bits read of it to its arms.
+- **Sides that are a constant plus a multiple of each variable bit are compared as that.** A
+  sum of products of bitwise functions of one value by constants is such a form whatever its
+  carries, and under a mask the tests took it for an atom: the answer `rotl(x, 13) ^ k` to a
+  150-node rotation MBA ending in a mask was found and not proved. The forms go through sums,
+  products by constants and shifts, and through `& | ^` where each bit of an operand is a
+  constant, a variable bit or its complement; two forms are one function exactly when they
+  are the same, so the comparison decides (with an input where they differ), and it runs
+  before the tests that evaluate points. A form with carries under a constant mask is read
+  by the mask's fields where its low bits are a form too (`(x & m)·c & −256`: the product's
+  low byte depends on the few bits of `x` the mask keeps there).
+- **Sides that read a value the same way are compared without the reading.** `(s >> 8) & 9`
+  against `(t >> 8) & 9` holds exactly when `s` and `t` agree on bits 8 and 11, and without
+  the right shift each side is a function of the low bits of its variables, which the
+  bit-serial test follows through every carry. From the roots inward, the steps both sides
+  share (a right shift, `& | ^` with one constant, a complement, a cast) are taken off when a
+  right shift is among them. That test also reads a variable wider than the sides through
+  its truncation.
+- **One leaf under masks is a symbol to the symbolic comparison.** A bitwise function of one
+  leaf and constants is `f(0)` plus the leaf under the bits it sets less the leaf under the
+  bits it clears, whatever spelled it: `m − (~t & m)` and `t & m` are one polynomial. A
+  product of such a term with another value was proved by a sparse test over two variables,
+  1.6 million units of pass work for a 20-node question, four times in one call that then ran
+  out.
+- **A sum that spells another is asked a group at a time.** `A + p·q + B − (A & B)` with `A`
+  a sum of products is `(A | B) + p·q`, but the whole is a polynomial over everything `A` is
+  made of. Where the whole is no simpler, the terms that share an atom are asked together
+  with the spelled sums still atoms, as an identity beside unrelated terms already was.
+- **A sum with a constant whose carries are all known is a xor**, under a mask: `t + k` (or
+  `k − t`) differs from `t` in fixed bits where every carry on the bits read is known from
+  the bits known of `t`. One value written twice, once through such a sum, was two
+  unrelated atoms to the MBA phase. Only for a sum with no other reader (one read under
+  several masks is one value to all of them), and taken at the same size.
+- **A root is split on the condition its selects test most**, with the noise forms, when each
+  side is one value at every sample point. At random inputs a condition like `x != y` holds
+  every time: a root that is one constant where it holds and another where it does not looked
+  like the first, and no proof of that exists. Each side is read at the same inputs with the
+  condition put in, and the root becomes a `select` of the two, which the phases fold.
+- **The words pass asks once the other phases have settled.** It asked in every round, and
+  what it wrote of a root the MBA phase and the opaque-constant sweep were still folding took
+  the forms their questions read: on these 140 questions (no limb arithmetic in them) seven
+  of the 47 constants and four of the 16 proofs were lost, at half again the time. It now
+  asks in a round over a root the other phases left as it was, and in the one round past the
+  strategy's last; what it writes goes back to them.
+- **Cheap questions first.** A node's own question to the solver takes 65,536 steps while
+  the rounds have other questions to ask, and its quarter of the call's steps only in a round
+  after one that changed nothing (over the same root, without the sweeps; or in one round
+  past the strategy's last where the rounds were still changing it). Of the answers committed
+  in the 140 questions, 570 of 601 took fewer steps than that; the questions the solver runs
+  out of steps on stand among them in no order, and a few of those, asked at the full share
+  where they stood, took a call's steps before the rest of it was asked anything. A question
+  cut short this way is not a budget running out: the root ends `Completed` when the deeper
+  round answers it.
+- **A sum too large to ask is taken apart first.** A sum with more variables than a question
+  takes was skipped, and its terms were then asked one at a time (in one measured call the
+  terms of one linear MBA were most of 33 declined questions that took 785,000 of its two
+  million steps). Such a sum is now read by its groups of terms before its operands are
+  walked, and a fragment too large to lower whole is asked with the arithmetic under its
+  bitwise operators as atoms (`Σ cᵢ·fᵢ(A, B, …)` over sums and products `A`, `B` is linear
+  over them).
+- **A factor is taken out of the terms that share it.** The factoring above needed every term
+  of the sum to have the factor. The terms with the factor most of them have are now written
+  as the factor times their sum without it, beside the rest: `y + (f·a)·t₁ − (f·b)·t₂`.
+- **Selects on one condition that read one value are split together.** `(v | k) + (v & k)` is
+  `v + k`, and with `v` a select and `v & k` written into its sides the two terms read two
+  selects no test relates. An operation over two selects on one condition whose sides read a
+  common value is `select(c, E1, E0)` when the MBA phase simplifies each side. A side, and a
+  fragment whose own answer was not smaller for what it shares, is asked also with the values
+  its nodes share through casts cut off (`(zext(t) | k) + zext(t & k)` is `zext(t) + k` over
+  `t`, where the whole question's answer writes `t` another way).
+- **An equality with an even multiple is an equality of low bits.** The invert pass solved
+  `x·c == k` for an odd `c`. With `c = 2^t·d` the product's low `t` bits are zero, so the
+  comparison is false when `k`'s are not, and otherwise it is `trunc<w−t>(x) == (k >> t)·d⁻¹`
+  (`x << t == k` likewise): `x·0x1a8bfbc8 == 392` at 32 bits is `trunc<29>(x) == 0xde0c079`.
+- **A comparison of some bits of a value is written over the value.** `(y | m) == k` reads the
+  bits of `y` outside `m` (and is false when `k` lacks a bit of `m`), and the bits of a slice
+  or a zero extension are bits of its operand: `(extract<lo, n>(x) | m) == k` and
+  `(extract<lo, n>(x) & c) == k` are `(x & c') == k'`, or `extract<lo', n'>(x) == k'` where
+  the bits are one run. A dispatcher compares one state with its cases through several
+  multipliers and several widths; with this and the entry above, a measured one of 265 nodes
+  whose seven-way tables each spelled their conditions differently is 199 nodes over the
+  same eight conditions on three bits of one value.
+- **Bits of one value added up are a population count.** A sum whose terms each count bits
+  of one value with one coefficient (`extract<i, 1>(x)` extended, `x & 1`, `(x >>u i) & 1`,
+  the top bit shifted down, a `popcnt` of a field of `x`) is `c·popcnt(x & m)`, the bits a
+  slice of `x` where they are one run; three bits or more, no bit twice. The operand of a
+  parity flag is spelled a bit at a time, `(b >>u 1 & 1) + (b & 1) + …` over a byte `b`, and
+  its low bit was a sum of eight slices at one bit: it is `trunc<1>(popcnt(trunc<8>(x)))`,
+  and the condition of every select in 41 of the 44 `forms_simplify` questions.
+- **A flag kept in a byte is its bit.** `x == 1`, `x != 1`, `x == 0` and `x != 0` for an `x`
+  whose other bits the facts know zero are the low bit of `x` or its complement, with the
+  truncation pushed into `x`, where that is a smaller tree: `((zext<8>(a) & zext<8>(b)) ^ 1) &
+  zext<8>(c) != 1`, three conditions combined as bytes and tested, is `~(~(a & b) & c)`. And a
+  sign test of a value rotated or shifted left by a constant is the bit that lands on top
+  (`rotl(x, 56) <s 0`, the sign of the low byte, is `extract<7, 1>(x)`), which then meets the
+  other readings of that bit.
+- **Extensions and slices written twice.** A mask inside the narrower of two zero extensions
+  is taken at the operand's width, `zext<64>(~zext<32>(e) & 5)` as `zext<64>(~e & 5)`
+  (`zext_and_zext`, `zext_and_not_zext`), and a slice and the low bit of one value, extended
+  and concatenated back where they were, are the value under a mask
+  (`concat_slice_and_bit_in_place`).
+- **Rotations by a variable count.** `(x << s) | (x >>u (W − s))` with `s` proved below the
+  width is `rotl(x, s)` (`variable_shift_rotate_left`, and `_right`): at zero the shift by the
+  whole width gives nothing. And where the two counts are spelled apart, `x << a | x >>u b` is
+  `rotl(x, a)` when both are below the width and the low bits of `a + b` are zero as a sum of
+  multiples of what the counts are made of (`trunc<6>(u·83)` and `trunc<6>(u·109)`, extended,
+  at 64 bits: `u·192` has no low six bits).
+- **Two complements around a slice are none.** `~extract<k, n>(~x)` is `extract<k, n>(x)`
+  (`not_extract_not`, `not_trunc_not`), and a select on a bit of a complement is the select
+  on the bit with its sides swapped (`select_bit_of_not`, `select_low_bit_of_not`). (Moving
+  every complement out of a slice instead left the sweep 3,400 nodes short on the same
+  questions: its candidates are truncations.)
+- **A select under the opposite comparison keeps one side.** `select(a != b, x, select(a == b,
+  y, z))` is `select(a != b, x, y)`, and likewise in the chosen arm and under `==`
+  (`select_then_ne_eq`, `select_else_ne_eq`, `select_then_eq_ne`, `select_else_eq_ne`); only
+  the same condition repeated was read so.
+
 ## 0.27.0
 
 Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.

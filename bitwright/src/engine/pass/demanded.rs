@@ -150,6 +150,15 @@ fn sorted_distinct(v: &mut [u32]) -> usize {
 
 struct Demand {
     memo: Memo,
+    /// Results of earlier simplifications that this one reads and does not write (see
+    /// [`reduced`]); empty for the pass's own steps.
+    base: Memo,
+    /// The results found before the cap cut the walk short, where they are kept for later
+    /// simplifications (`None` for the pass's own steps): each was found with every operand
+    /// below it read in full, so more visits would not change it.
+    whole: Option<Vec<(Key, u32)>>,
+    /// Whether a sum's constant stays one constant under every mask (see [`same_on`]).
+    whole_sums: bool,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
     cap: u32,
     stops: Vec<u32>,
@@ -165,6 +174,49 @@ struct Demand {
     /// The identities found (a node unchanged under a mask), each with the range of `stops`
     /// its walk pushed: kept for the phase run once the step is done (see [`Same`]).
     identities: Vec<(Key, u32, u32)>,
+    /// Whether a sum was read as a xor (see [`carried`]): the result is then taken at the
+    /// same size too.
+    ties: bool,
+}
+
+impl Demand {
+    /// Remembers `v` as the result for `key`.
+    fn note(&mut self, key: Key, v: u32) {
+        self.memo.insert(key, v);
+        if self.visits <= self.cap
+            && let Some(whole) = &mut self.whole
+        {
+            whole.push((key, v));
+        }
+    }
+}
+
+/// The most constants kept per operand by [`same_on`].
+const SUM_CONSTANTS: usize = 8;
+
+/// The constant `kc` (value `k`) of a sum over the operand `key.0` (`key.1`: `t + k`, `t − k`
+/// or `k − t`), read on the prefix `p`: the first constant this call's reductions added to
+/// that operand so that agrees with `k` on `p`, else `kc` itself, which is then kept.
+fn same_on(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    key: (u32, u8),
+    kc: u32,
+    k: &BitVec,
+    p: &BitVec,
+) -> u32 {
+    let seen = r.sum_constants.entry(key).or_default();
+    for &c in seen.iter() {
+        if let Some(v) = cx.const_val(c)
+            && bv_and(&BitVec::bin_unchecked(BinOp::Xor, &v, k), p).is_zero()
+        {
+            return c;
+        }
+    }
+    if seen.len() < SUM_CONSTANTS {
+        seen.push(kc);
+    }
+    kc
 }
 
 /// The low prefix covering every bit of `m` (the bits arithmetic depends on).
@@ -263,7 +315,11 @@ fn simplify(
     if m.is_zero() {
         return r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)));
     }
-    if let Some(&v) = st.memo.get(&Key(x, *m)) {
+    if let Some(&v) = st
+        .memo
+        .get(&Key(x, *m))
+        .or_else(|| st.base.get(&Key(x, *m)))
+    {
         return Ok(v);
     }
     // Found nothing to simplify under this mask in an earlier step of the phase run: the same
@@ -272,7 +328,7 @@ fn simplify(
         let (from, len) = (from as usize, len as usize);
         st.stops
             .extend_from_slice(&r.demanded_same.leaves[from..from + len]);
-        st.memo.insert(Key(x, *m), x);
+        st.note(Key(x, *m), x);
         return Ok(x);
     }
     let stops0 = st.stops.len() as u32;
@@ -290,12 +346,12 @@ fn simplify(
         && let Some(c2) = prefix_residue(&c, m)
     {
         let v = r.build(cx, |cx| cx.mk_const(&c2))?;
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     if st.visits > st.cap || cx.const_val(x).is_some() {
         let v = stop(cx, st)?;
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     // Known demanded bits make the operand a constant: the value on them, if all are known.
@@ -321,14 +377,14 @@ fn simplify(
         if let Some(v) = fold.filter(|_| allowed) {
             st.fin = st.fin.and(fin);
             let c = r.build(cx, |cx| cx.mk_const(&v))?;
-            st.memo.insert(Key(x, *m), c);
+            st.note(Key(x, *m), c);
             return Ok(c);
         }
     }
     // Demanded bits among the lowest few: the residues of `x` decide them (a constant, or a
     // leaf equal to `x` there).
     if let Some(v) = by_residues(r, cx, x, m)? {
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     let bin = |r: &mut Runner<'_, '_>, cx: &mut Context, op: BinOp, a: u32, b: u32| {
@@ -342,7 +398,7 @@ fn simplify(
         && matches!(node.op, OpCode::Add | OpCode::Sub)
         && let Some(v) = merged(r, cx, st, x, m)?
     {
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     let v = match node.op {
@@ -445,13 +501,49 @@ fn simplify(
         }
         OpCode::Add | OpCode::Sub | OpCode::Mul => {
             let p = low_prefix(m);
-            let a = simplify(r, cx, st, node.a, &p)?;
-            let b = simplify(r, cx, st, node.b, &p)?;
+            // One value read under several masks stays one value in the sweep's reductions:
+            // a sum's constant is the first one added to that operand in this call that
+            // agrees with it on the prefix, not its residue there, which differs from mask to
+            // mask (`t + k` under `& 0xff` and under `& 0xffff` would be two sums, each an atom
+            // of its own to a certificate, and what cancels through `t + k` is gone).
+            let whole_sum = st.whole_sums && node.op != OpCode::Mul;
+            let (ka, kb) = (cx.const_val(node.a), cx.const_val(node.b));
+            let (a, b) = match (whole_sum, ka, kb) {
+                (true, None, Some(k)) => {
+                    let a = simplify(r, cx, st, node.a, &p)?;
+                    let kind = u8::from(node.op == OpCode::Sub);
+                    (a, same_on(r, cx, (a, kind), node.b, &k, &p))
+                }
+                (true, Some(k), None) => {
+                    let b = simplify(r, cx, st, node.b, &p)?;
+                    let kind = if node.op == OpCode::Sub { 2 } else { 0 };
+                    (same_on(r, cx, (b, kind), node.a, &k, &p), b)
+                }
+                _ => (
+                    simplify(r, cx, st, node.a, &p)?,
+                    simplify(r, cx, st, node.b, &p)?,
+                ),
+            };
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
             // a constant addend with none of the demanded bits goes (`63 - ~y`
             // is `y + 64`, which is `y` on the low six bits).
+            // A constant addend whose every carry on the prefix is known flips known bits of
+            // the other operand: a xor there (see `carried`).
+            let flipped = match (node.op, dropped_constant(cx, node.op, a, b, &p)) {
+                (OpCode::Mul, _) | (_, Some(_)) => None,
+                // Over the operand as it is written: the same on the prefix, and the xor is
+                // then one node for one (the operand read under the prefix is new nodes
+                // wherever a constant below it has another residue there).
+                _ => {
+                    let (ta, tb) = (
+                        if cx.const_val(a).is_some() { a } else { node.a },
+                        if cx.const_val(b).is_some() { b } else { node.b },
+                    );
+                    carried(r, cx, st, x, ta, tb, &p)?
+                }
+            };
             let ones = |j: u32| cx.const_val(j).is_some_and(|k| k.is_ones());
-            match dropped_constant(cx, node.op, a, b, &p) {
+            match dropped_constant(cx, node.op, a, b, &p).or(flipped) {
                 Some(t) => t,
                 // A factor that is −1 on the prefix (`0x3ffff` read by `& 0x1ffff`) negates.
                 None if node.op == OpCode::Mul && (ones(a) || ones(b)) => {
@@ -529,7 +621,7 @@ fn simplify(
         }
         _ => stop(cx, st)?,
     };
-    st.memo.insert(Key(x, *m), v);
+    st.note(Key(x, *m), v);
     if v == x && x < st.before {
         st.identities
             .push((Key(x, *m), stops0, st.stops.len() as u32));
@@ -625,6 +717,85 @@ fn clears_known_zeros(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> Result<Op
     Ok(t.values.iter().all(|&v| v & cleared == 0).then_some(x))
 }
 
+/// `t ^ k'` when `a op b` (an `add` or `sub` of at most 64 bits) is `t` plus or minus a
+/// constant, or a constant less `t`, and on the prefix `p` every carry (or borrow) is known
+/// from the bits known of `t`: the result then differs from `t` in fixed bits there. An obfuscator writes `t ^ k'` as
+/// `t + k` over a `t` it knows bits of (`t + 0x7ff0` where bit 4 of `t` is set and bit 15
+/// clear is `t ^ 0x8010`), and a value written both ways is two unrelated atoms to the MBA
+/// phase. A carry is known where the constant's bit equals the carry in (it goes on
+/// whatever `t` has there) or `t`'s bit is known. Marks the simplification as one that
+/// commits at the same size: the xor is what `add_disjoint` and the masks keep, and nothing
+/// writes it back as a sum. `x` is the sum itself, which must have no other reader.
+fn carried(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Demand,
+    x: u32,
+    a: u32,
+    b: u32,
+    p: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let w = p.width();
+    if w.bits() > 64 {
+        return Ok(None);
+    }
+    let op = cx.node(x).op;
+    // `t + k`, or `k − t`: the same walk with a borrow.
+    let (t, k, from) = match (op, cx.const_val(a), cx.const_val(b)) {
+        (OpCode::Add, None, Some(k)) => (a, k, false),
+        (OpCode::Add, Some(k), None) => (b, k, false),
+        (OpCode::Sub, None, Some(k)) => (a, BitVec::un_unchecked(UnOp::Neg, &k), false),
+        (OpCode::Sub, Some(k), None) => (b, k, true),
+        _ => return Ok(None),
+    };
+    let (pw, kw) = (p.limbs()[0], k.limbs()[0]);
+    let (known, fin) = known_words(r, cx, t)?;
+    let Some([zero, one]) = known else {
+        return Ok(None);
+    };
+    let n = 64 - pw.leading_zeros();
+    let (mut carry, mut flips) = (false, 0u64);
+    for j in 0..n {
+        let bit = 1u64 << j;
+        let kj = kw & bit != 0;
+        // The sum's bit is `t ^ k ^ carry`, and so is the difference's with its borrow.
+        if kj != carry {
+            flips |= bit;
+        }
+        // A carry out is the constant's bit where the carry in is the same, else `t`'s bit;
+        // a borrow out is the borrow in where the constant's bit differs from it (none
+        // under a set bit, one under a clear bit that already owes), else `t`'s bit.
+        // (The last bit's goes nowhere.)
+        let settled = if from { kj != carry } else { kj == carry };
+        if !settled && j + 1 < n {
+            if (zero | one) & bit == 0 {
+                return Ok(None);
+            }
+            carry = one & bit != 0;
+        }
+    }
+    // A sum that changes nothing on the prefix is the dropped constant's case.
+    if flips & pw == 0 && !from {
+        return Ok(None);
+    }
+    // Only a sum this reader alone reads: one read under several masks is one value to all
+    // of them (`t + k` under `& 0xff` and under `& 0xffff` flips other bits of `t` under
+    // each, and what cancelled through the sum would be gone).
+    super::refresh_uses(r, cx)?;
+    if r.live.uses(x) != Some(1) || r.live_roots.contains(&x) {
+        return Ok(None);
+    }
+    st.fin = st.fin.and(fin);
+    st.ties = true;
+    // The operand is read as it is: a leaf of the result. So is the constant, which stands
+    // where the sum's did (the commit rule counts a new constant and no old one).
+    st.stops.push(t);
+    let kx = BitVec::from_canonical_u64(w, flips & pw);
+    let c = r.build(cx, |cx| cx.mk_const(&kx))?;
+    st.stops.push(c);
+    Ok(Some(r.build(cx, |cx| cx.c_bin(BinOp::Xor, t, c))?))
+}
+
 /// `t` when `a op b` (an `add` or `sub`) is `t` plus a constant with none of the
 /// bits of the prefix `p`; `k - ~t` is `t + (k + 1)`.
 fn dropped_constant(cx: &Context, op: OpCode, a: u32, b: u32, p: &BitVec) -> Option<u32> {
@@ -651,10 +822,15 @@ pub(super) fn reduced(
     cx: &mut Context,
     x: u32,
     cap: u32,
+    whole_sums: bool,
 ) -> Result<u32, Stop> {
     let w = cx.width_of(x);
+    let which = usize::from(whole_sums);
     let mut st = Demand {
         memo: Memo::default(),
+        base: std::mem::take(&mut r.reduced[which]),
+        whole: Some(Vec::new()),
+        whole_sums,
         cap,
         stops: Vec::new(),
         visits: 0,
@@ -663,8 +839,19 @@ pub(super) fn reduced(
         root: x,
         xors: Vec::new(),
         identities: Vec::new(),
+        ties: false,
     };
-    simplify(r, cx, &mut st, x, &BitVec::ones(w))
+    let out = simplify(r, cx, &mut st, x, &BitVec::ones(w));
+    // What this simplification found is kept for the call's later ones, up to where the cap
+    // cut it short (an answer of more visits may differ). A node's value on a mask is fixed,
+    // so the answer is too; the sweep asks this of every candidate, operands first, and each
+    // walked the whole of what the ones below it had walked.
+    let mut base = std::mem::take(&mut st.base);
+    if out.is_ok() {
+        base.extend(st.whole.take().unwrap_or_default());
+    }
+    r.reduced[which] = base;
+    out
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
@@ -684,6 +871,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     let before = cx.len() as u32;
     let mut st = Demand {
+        base: Memo::default(),
+        whole: None,
+        whole_sums: false,
         memo: std::mem::take(&mut r.demanded),
         cap: MAX_VISITS.min(super::region_cap(r)),
         stops: Vec::new(),
@@ -693,6 +883,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         root: operand,
         xors: Vec::new(),
         identities: Vec::new(),
+        ties: false,
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
     if r.demanded_same.marking {
@@ -744,5 +935,6 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         operand: cx.handle(operand),
         mask,
     });
-    finish(r, cx, PassKind::Demanded, n, e, before, &st.stops, fin)
+    let tie = st.ties;
+    super::finish_with(r, cx, PassKind::Demanded, n, e, before, &st.stops, fin, tie)
 }

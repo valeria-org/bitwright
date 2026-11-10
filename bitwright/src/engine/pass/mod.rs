@@ -301,6 +301,44 @@ pub(super) fn cut_cases(
     r.build(cx, |cx| context::cut(cx, root, fuel))
 }
 
+/// `root` as a select on the condition its selects test most, each arm `root` with what that
+/// case fixes put in (`context::sides`), when each arm is one value at every sample point:
+/// what is left of a value an obfuscator mixed one condition through is a constant on either
+/// side of it, which the phases fold once the condition is gone from the arm. The samples only
+/// say when to split: `select(c, t, f)` is `root` whatever the arms are. (At random inputs a
+/// condition like `x != y` holds every time, so the root looks like one constant and is not;
+/// the arm for the other case is read at the same inputs with the condition put in.)
+#[cfg(feature = "mba")]
+pub(super) fn split_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<u32>, Stop> {
+    let before = cx.len() as u32;
+    let Some((c, t, f)) = r.build(cx, |cx| context::sides(cx, root))? else {
+        return Ok(None);
+    };
+    // Already split on it.
+    let node = cx.node(root);
+    if node.op == OpCode::Select && node.a == c {
+        discard(r, cx, before);
+        return Ok(None);
+    }
+    for side in [t, f] {
+        if cx.const_val(side).is_some() {
+            continue;
+        }
+        r.sample(cx, side)?;
+        let vals = &r.samples[&side];
+        if vals.iter().any(|v| *v != vals[0]) {
+            discard(r, cx, before);
+            return Ok(None);
+        }
+    }
+    let e = r.build(cx, |cx| cx.c_select(c, t, f))?;
+    Ok((e != root).then_some(e))
+}
+
 /// the opaque-constant sweep before the first phase (see `mba::sweep`).
 #[cfg(feature = "mba")]
 pub(super) fn mba_sweep(
@@ -335,10 +373,13 @@ pub(super) fn mba_step(
     let additive = |op: OpCode| matches!(op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl);
     if let Some(&p) = r.chain_parent.get(&n) {
         let (op, up) = (cx.node(n).op, cx.node(p).op);
-        // A cast between a link and its user is part of the user's fragment (`zext(t ^ k)`
-        // beside other terms): the link is covered by the question above the cast.
+        // A truncation between a link and its user is part of the user's fragment
+        // (`trunc(a + b) + c` is one sum at the narrow width): the link is covered by the
+        // question above it. Not an extension or a slice: the question above reads the link
+        // through a mask or a shift, where the link's own is a sum at its width
+        // (`zext<64>(s) + k` with `s` a 32-bit MBA that is a constant only modulo `2^32`).
         let (p, up) = match up {
-            OpCode::Zext | OpCode::Sext | OpCode::Extract => match r.chain_parent.get(&p) {
+            OpCode::Extract if cx.node(p).b == 0 => match r.chain_parent.get(&p) {
                 Some(&q) => (q, cx.node(q).op),
                 None => (p, up),
             },
@@ -373,6 +414,30 @@ pub(super) fn mba_step(
         Some(step) => return Ok(step),
         None => {}
     }
+    let mut small =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
+            Ok(match mba::step_part(r, cx, cfg, s)? {
+                Step::To(e, _) => Some(e),
+                Step::Normal(_) => None,
+            })
+        };
+    match linear::by_factor(r, cx, n, &mut small)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
+    }
+    let mut side =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
+            Ok(match mba::step_side(r, cx, cfg, s)? {
+                Step::To(e, _) => Some(e),
+                Step::Normal(_) => None,
+            })
+        };
+    match cases::by_cases(r, cx, n, &mut side)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
+    }
     Ok(match linear::by_groups(r, cx, n, &mut part)? {
         Some(Step::Normal(f)) => Step::Normal(declined.and(f)),
         Some(step) => step,
@@ -396,7 +461,17 @@ pub(super) fn mba_first(
         None => true,
         Some(&p) => !mba::asks(r, cx, cfg, p)?,
     };
-    if !top || !mba::asks(r, cx, cfg, n)? {
+    // A sum too large to ask whole is still taken apart first (see `linear::by_groups`), at
+    // the top of its chain: its terms asked one at a time are the questions of the groups
+    // they belong to, each a part of an identity that only the group shows.
+    let sum_top = matches!(cx.node(n).op, OpCode::Add | OpCode::Sub)
+        && r.chain_parent.get(&n).is_none_or(|&p| {
+            !matches!(
+                cx.node(p).op,
+                OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Shl
+            )
+        });
+    if !top || !(mba::asks(r, cx, cfg, n)? || sum_top) {
         r.first.insert(n, None);
         return Ok(None);
     }
@@ -482,6 +557,34 @@ pub(super) fn disjoint(
         _ => false,
     };
     Ok((d, fa, fb))
+}
+
+/// Whether the facts prove that every bit `b` may have set is one `a` has set (of one width),
+/// so that `a − b` borrows nothing and is `a ^ b`; with what the facts of each relied on.
+pub(super) fn within(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<(bool, Fin, Fin), Stop> {
+    let bits = cx.width_of(a).bits();
+    if bits <= 64 {
+        let (ka, fa) = known_words(r, cx, a)?;
+        let (kb, fb) = known_words(r, cx, b)?;
+        let mask = u64::MAX >> (64 - bits);
+        let w = matches!((ka, kb), (Some([_, oa]), Some([zb, _])) if !oa & !zb & mask == 0);
+        return Ok((w, fa, fb));
+    }
+    let (ka, fa) = known(r, cx, a)?;
+    let (kb, fb) = known(r, cx, b)?;
+    let w = match (ka, kb) {
+        (Some(x), Some(y)) => {
+            let free = crate::facts::known::bv_not(&x.known_one());
+            crate::facts::known::bv_and(&free, &y.maybe_one()).is_zero()
+        }
+        _ => false,
+    };
+    Ok((w, fa, fb))
 }
 
 /// a constant whose bits are all among the lowest four, and a product or sum whose
