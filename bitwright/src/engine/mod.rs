@@ -2839,8 +2839,7 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
-                let ran = self.local(cx, phase, cur);
-                match ran {
+                match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
                         cur = r;
                         fin = fin.and(f);

@@ -318,8 +318,7 @@ fn sweep_inner(
                     break;
                 }
                 let rep = to.get(&rep).copied().unwrap_or(rep);
-                let got = asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d));
-                match got {
+                match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
                     Related::Proved(e) => {
                         to.insert(i, e);
                         continue 'nodes;
@@ -507,10 +506,6 @@ impl Classes {
         if !Self::kept(vals) || vals.iter().all(|v| *v == vals[0]) {
             return;
         }
-        self.note_inner(vals, i);
-    }
-
-    fn note_inner(&mut self, vals: &[crate::BitVec], i: u32) {
         let class = self
             .sums
             .entry(Self::key(vals, BinOp::Sub, false))
@@ -528,11 +523,6 @@ impl Classes {
     /// then the first met a constant from it, the first met whose sum with it is constant, the
     /// first met a constant xored from it.
     fn find(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
-        let out = self.find_inner(vals);
-        out
-    }
-
-    fn find_inner(&self, vals: &[crate::BitVec]) -> Vec<(u32, Relation, crate::BitVec)> {
         use crate::BitVec;
         let mut found = Vec::new();
         if !Self::kept(vals) {
@@ -1990,16 +1980,12 @@ fn sweep_cut(
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
-    let cuts = shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default());
-    for c in cuts {
-        let got = sweep_cut_at(r, cx, cfg, n, c)?;
-        if let Some(e) = got {
+    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default()) {
+        if let Some(e) = sweep_cut_at(r, cx, cfg, n, c)? {
             return Ok(Some(e));
         }
     }
-    let got = drop_noise(r, cx, cfg, n)?;
-    if got.is_some() {}
-    Ok(got)
+    drop_noise(r, cx, cfg, n)
 }
 
 /// the block `n` with each atom it does not depend on written as zero, read with
@@ -2014,8 +2000,7 @@ fn drop_noise(
     cfg: &MbaConfig,
     n: u32,
 ) -> Result<Option<u32>, Stop> {
-    let lowered = lower_id_reading(cx, n, &cfg.limits, Reading::Shallow);
-    let Ok((m, bindings)) = lowered else {
+    let Ok((m, bindings)) = lower_id_reading(cx, n, &cfg.limits, Reading::Shallow) else {
         return Ok(None);
     };
 
@@ -2097,8 +2082,7 @@ fn sweep_cut_at(
     n: u32,
     c: u32,
 ) -> Result<Option<u32>, Stop> {
-    let lowered = lower_id_reading(cx, n, &cfg.limits, Reading::CutWhole(c));
-    let Ok((m, bindings)) = lowered else {
+    let Ok((m, bindings)) = lower_id_reading(cx, n, &cfg.limits, Reading::CutWhole(c)) else {
         return Ok(None);
     };
 
@@ -2877,8 +2861,7 @@ fn ask(
     root: u32,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
-    let lowered = lower_id(cx, root, &cfg.limits);
-    let (m, bindings) = match lowered {
+    let (m, bindings) = match lower_id(cx, root, &cfg.limits) {
         Ok(x) => x,
         Err(why) => {
             count(r).refused(&why);
@@ -2903,8 +2886,7 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    let held = holds_kept(r, cx, root, &bindings);
-    if held {
+    if holds_kept(r, cx, root, &bindings) {
         count(r).unsupported += 1;
         return Ok(Step::Normal(Fin::FINAL));
     }

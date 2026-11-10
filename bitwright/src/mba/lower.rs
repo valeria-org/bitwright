@@ -158,16 +158,6 @@ fn scan_in(
     lim: &MbaLimits,
     in_fragment: &dyn Fn(&Context, u32) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
-    let out = scan_in0(cx, root, lim, in_fragment);
-    out
-}
-
-fn scan_in0(
-    cx: &Context,
-    root: u32,
-    lim: &MbaLimits,
-    in_fragment: &dyn Fn(&Context, u32) -> bool,
-) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
     Dense::with(&SEEN, cx.len(), |seen| {
         let mut atoms: Vec<u32> = Vec::new();
         let mut order: Vec<u32> = Vec::new();
@@ -308,10 +298,7 @@ pub(crate) fn lower_id_over(
             }
     };
     let under = match reading {
-        Reading::Shallow => {
-            let u = under_bitwise(cx, root, lim, opaque);
-            Some(u?)
-        }
+        Reading::Shallow => Some(under_bitwise(cx, root, lim, opaque)?),
         _ => None,
     };
     let (atoms, order) = scan_in(cx, root, lim, &|cx, i| inside(cx, i, under.as_ref()))?;
@@ -493,16 +480,6 @@ fn under_bitwise(
 /// The expression over `atoms` that the fragment's nodes `order` (operands first) compute,
 /// each operand in `solved` written over its atom.
 fn build(
-    cx: &Context,
-    atoms: Vec<u32>,
-    order: Vec<u32>,
-    solved: &[Solved],
-) -> Result<(MbaExpr, Bindings), Refusal> {
-    let out = build0(cx, atoms, order, solved);
-    out
-}
-
-fn build0(
     cx: &Context,
     atoms: Vec<u32>,
     order: Vec<u32>,

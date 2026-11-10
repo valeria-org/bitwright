@@ -69,13 +69,10 @@ impl core::hash::Hasher for TableHasher {
     }
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(c);
-            self.add(u64::from_le_bytes(w));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut w = [0u8; 8];
             w[..rest.len()].copy_from_slice(rest);
@@ -1871,8 +1868,7 @@ fn prove_at<M: Meter>(
         return Ok(report);
     }
     if let Some(p) = direct {
-        let ran = run(meter, a, b, &p, &mut report)?;
-        match ran {
+        match run(meter, a, b, &p, &mut report)? {
             Run::Equal(cert) => {
                 report.verdict = Verdict::Proved;
                 report.cert = Some(cert);
@@ -2657,13 +2653,13 @@ impl core::hash::Hash for RowKey<'_> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         const K: u64 = 0x517c_c1b7_2722_0a95;
         let mut h = [u64::from(self.0), 1, 2, 3];
-        let mut chunks = self.1.chunks_exact(4);
-        for c in &mut chunks {
+        let (fours, rest) = self.1.as_chunks::<4>();
+        for c in fours {
             for (x, &d) in h.iter_mut().zip(c) {
                 *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
             }
         }
-        for (x, &d) in h.iter_mut().zip(chunks.remainder()) {
+        for (x, &d) in h.iter_mut().zip(rest) {
             *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
         }
         state.write_u64(h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48));
@@ -2972,15 +2968,13 @@ impl Compose {
                 continue;
             }
             let peers = std::mem::take(&mut groups[g as usize]);
-            let mut tries = 0;
-            for &m in &peers {
+            for (tries, &m) in peers.iter().enumerate() {
                 if self.find(m) == self.find(i) {
                     break;
                 }
                 if tries >= PAIR_TRIES {
                     break;
                 }
-                tries += 1;
                 if self.equal_defs(meter, report, i, m)? {
                     self.union(i, m);
                     break;
@@ -3018,8 +3012,7 @@ impl Compose {
             Policy::Everything,
         ] {
             let (a, b) = (self.root_a, self.root_b);
-            let cmp = self.compare(meter, report, a, b, policy, &mut seen)?;
-            match cmp {
+            match self.compare(meter, report, a, b, policy, &mut seen)? {
                 (Some(Verdict::Proved), _) => {
                     report.verdict = Verdict::Proved;
                     return Ok(());

@@ -85,7 +85,21 @@ with more of them simplified further than before.
   constants folded into the instructions. The walk that finds which symbol bits reach a
   candidate is one pass down from it over a bitmap, stops as soon as more than sixteen bits
   reach it with no node left that could be a bottleneck, and reuses its buffers across calls.
-  Same answers, same charges.
+  Same answers; a point is charged an eighth of what it was, since the same enumerations take
+  a twentieth of the time (charged at the old rate, enumerations of a millisecond were
+  declined for their cost, and six of the 140 questions ran out of steps a third of the way
+  from where they now finish).
+- **A certificate costs half what it did**, with the same verdicts, counterexamples and
+  charges. What it charges for, the node evaluations, was under a tenth of its time; the
+  rest was bookkeeping nothing charged. The refutation sample's constant pool was built
+  from every constant and then cut to 32 (now it stops when full); the compositional test
+  rebuilt the two skeletons of a pair for each of its five policies (75,000 of 136,000
+  comparisons repeated a pair an earlier policy had built: now compared from what was
+  found, with the same charges); its node tables were hash maps keyed by whole nodes and
+  rehashed with a mixer chain per word; the sample was cloned and its rows hashed to group
+  nodes; sums were read as bitwise through wide values at 64 bits. The sample's
+  seed-independent points are compared before the seed is hashed, which is where all but
+  five of 13,621 sample refutations are found.
 - **The sweep's reductions share what they find.** Every candidate is first taken on the bits
   its users read (`demanded::reduced`), and each call walked the whole of what the calls
   below it had walked. What one finds for a node under a mask is kept for the call, up to
