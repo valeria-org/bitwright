@@ -862,9 +862,11 @@ fn test<M: Meter>(
     report: &mut Report,
     symbolic: bool,
 ) -> Result<Run, M::Err> {
+    let tt = tmp_t("r.prog");
     let (Some(pa), Some(pb)) = (Program::new(a, false), Program::new(b, false)) else {
         return Ok(Run::TooBig);
     };
+    drop(tt);
     let kind = Kind::of(pa.widest().max(pb.widest()));
     let per = (pa.len() + pb.len()) as u64;
     let lane = match kind {
@@ -886,7 +888,9 @@ fn test<M: Meter>(
     let cap = (cost.saturating_mul(lane) / (2 * SYMBOLIC_UNIT)).min(meter.left() / SYMBOLIC_RATE);
     if symbolic && plan.cert != Cert::Exhaustive && cap >= per {
         let mut work = 0;
+        let tt = tmp_t("r.sym");
         let equal = symbolic_equal(a, b, cap, &mut work) == Some(true);
+        drop(tt);
         meter.charge(work.min(cap) * SYMBOLIC_RATE)?;
         if equal {
             return Ok(Run::Equal(Cert::Symbolic));
@@ -897,6 +901,7 @@ fn test<M: Meter>(
         }
     }
     let width = a.width().map_or(1, |w| w.bits());
+    let _tt = tmp_t("r.eval");
     match kind {
         Kind::N64 => run_in::<u64, M>(meter, a, &pa, &pb, plan, width, report),
         Kind::N128 => run_in::<u128, M>(meter, a, &pa, &pb, plan, width, report),
@@ -989,7 +994,9 @@ fn next_word(state: &mut u64) -> u64 {
 /// some point); then points whose set bits lie at one position; then seeded random values.
 /// A filter that catches wrong answers early; never evidence.
 pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<Vec<BitVec>> {
+    let tt = tmp_t("sp.pool");
     let pool = constant_pool(ms);
+    drop(tt);
     let fit = |c: &BitVec, w: Width| BitVec::wrapping_from_limbs(w, c.limbs());
     let mut pts: Vec<Vec<BitVec>> = Vec::with_capacity(SAMPLE_POINTS);
     for k in 0..4 {
@@ -1077,13 +1084,17 @@ pub(crate) fn refute(a: &MbaExpr, b: &MbaExpr, points: &[Vec<BitVec>]) -> Option
 pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result<Report, M::Err> {
     // Sums and differences that are bitwise functions, read as such (equal expressions, see
     // `raise_disjoint`): every test below then takes them for what they are.
+    let tt = tmp_t("P.raise");
     let (ra, rb) = (raise_disjoint(a), raise_disjoint(b));
+    drop(tt);
     let (a, b) = (ra.as_ref().unwrap_or(a), rb.as_ref().unwrap_or(b));
     // casts are atoms to the tests below, so a side that spells a value through
     // the low half of another is unrelated to it there, and the tests spend their work on
     // abstractions that cannot decide. Sides with casts are compared without them first
     // (equal expressions, see `decast`), and as they are only when that does not decide.
+    let tt = tmp_t("P.decast");
     let (da, db) = (super::decast::decast(a), super::decast::decast(b));
+    drop(tt);
     let mut report = Report::new();
     if da.is_some() || db.is_some() {
         report = prove_at(
@@ -1105,6 +1116,7 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
     // leave it open; over the narrow atoms the identity is one the comparison reads. Only the
     // comparison, which is cheap and only ever proves: an evaluation test over the atoms would
     // spend as much as the tests above and decide no more.
+    let _tt = tmp_t("P.tail");
     if report.verdict == Verdict::Unknown && !report.over_budget {
         let narrow = |m: &MbaExpr| super::decast::decast_narrow(m).filter(|(_, n)| *n);
         if let (Some((na, _)), Some((nb, _))) = (narrow(a), narrow(b))
@@ -1468,6 +1480,16 @@ thread_local! {
         const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
+struct TmpT(&'static str, std::time::Instant);
+impl Drop for TmpT {
+    fn drop(&mut self) {
+        tmp_time(self.0, self.1)
+    }
+}
+fn tmp_t(what: &'static str) -> TmpT {
+    TmpT(what, std::time::Instant::now())
+}
+
 pub(crate) fn tmp_time(what: &'static str, t0: std::time::Instant) {
     let d = t0.elapsed();
     TMP_TIME.with(|p| {
@@ -1513,6 +1535,7 @@ fn prove_at_inner<M: Meter>(
         report.verdict = Verdict::Proved;
         return Ok(report);
     }
+    let tt = tmp_t("A.prep");
     let (Some(pa), Some(pb)) = (profile(a), profile(b)) else {
         return Ok(report);
     };
@@ -1520,6 +1543,7 @@ fn prove_at_inner<M: Meter>(
     let mut compose = true;
     let poly = pa.poly && pb.poly;
     let direct = plan(a, &pa, &pb);
+    drop(tt);
     // A polynomial pair no test fits (or can afford, below): maybe the same polynomial.
     if direct.is_none() && poly && symbolic(meter, a, b, &mut report)? {
         tmp_stage(top, meter, &mut mark, 0);
@@ -1529,7 +1553,9 @@ fn prove_at_inner<M: Meter>(
     }
     tmp_stage(top, meter, &mut mark, 0);
     if let Some(p) = direct {
+        let tt = tmp_t("A.direct");
         let ran = run(meter, a, b, &p, &mut report)?;
+        drop(tt);
         tmp_stage(top, meter, &mut mark, 1);
         match ran {
             Run::Equal(cert) => {
@@ -1555,16 +1581,26 @@ fn prove_at_inner<M: Meter>(
         }
     }
     if compose {
-        Compose::new(a, b).prove(meter, &mut report)?;
+        let tt = tmp_t("A.cnew");
+        let mut cmp = Compose::new(a, b);
+        drop(tt);
+        let tt = tmp_t("A.compose");
+        cmp.prove(meter, &mut report)?;
+        drop(tt);
+        let tt = tmp_t("A.cdrop");
+        drop(cmp);
+        drop(tt);
         tmp_stage(top, meter, &mut mark, 2);
     }
     // Arithmetic read bitwise without products, which the atoms left open: bit-serially,
     // exactly.
-    if compose
+    let tt = tmp_t("A.carries");
+    let carried = compose
         && report.verdict == Verdict::Unknown
         && !report.over_budget
-        && carries(meter, a, b, &mut report)?
-    {
+        && carries(meter, a, b, &mut report)?;
+    drop(tt);
+    if carried {
         tmp_stage(top, meter, &mut mark, 3);
         return Ok(report);
     }
@@ -1576,7 +1612,10 @@ fn prove_at_inner<M: Meter>(
     // The same question over an atom that is a bijection of one variable, in that variable's
     // place (see `changes_of_variable`): before the readings below, which split and lower
     // the question as it is and cost more.
-    if change && changed(a, b, meter, &mut report)? {
+    let tt = tmp_t("A.changed");
+    let ch = change && changed(a, b, meter, &mut report)?;
+    drop(tt);
+    if ch {
         tmp_stage(top, meter, &mut mark, 4);
         return Ok(report);
     }
@@ -1590,8 +1629,11 @@ fn prove_at_inner<M: Meter>(
             return Ok(report);
         }
         meter.charge(units)?;
+        let tt = tmp_t("A.lowerkb");
         let (la, lb) = (lower_known_bits(a), lower_known_bits(b));
+        drop(tt);
         if la.is_some() || lb.is_some() {
+            let _tt = tmp_t("A.lowered");
             let la = la.unwrap_or_else(|| a.clone());
             let lb = lb.unwrap_or_else(|| b.clone());
             let sub = prove_at(&la, &lb, meter, depth, true, false)?;
@@ -1611,6 +1653,7 @@ fn prove_at_inner<M: Meter>(
         }
     }
     if depth < SPLIT_DEPTH {
+        let _tt = tmp_t("A.split");
         split(a, b, meter, depth, &mut report)?;
         tmp_stage(top, meter, &mut mark, 6);
     }
@@ -2375,6 +2418,7 @@ impl Compose {
     /// (structure, congruence, proofs of their definitions), then compares the skeletons.
     fn prove<M: Meter>(&mut self, meter: &mut M, report: &mut Report) -> Result<(), M::Err> {
         report.compositional = true;
+        let tt = tmp_t("C.all");
         // The sample, over the union of both sides.
         let mut all = MbaExpr::new(self.vars.clone());
         for n in &self.nodes {
@@ -2396,10 +2440,16 @@ impl Compose {
         }
         meter.charge(units)?;
         report.points += SAMPLE_POINTS as u64;
+        drop(tt);
+        let tt = tmp_t("C.key");
         let seed = crate::hash::combine(all.key()[0], all.key()[1]);
+        drop(tt);
         let tq = std::time::Instant::now();
         let points = sample_points(&self.vars, &[&all], seed);
+        tmp_time("C.sample.points", tq);
+        let tq2 = std::time::Instant::now();
         let mut digests = digests(&prog, &points, self.nodes.len());
+        tmp_time("C.sample.digests", tq2);
         tmp_time("C.sample", tq);
         let (ra, rb) = (self.root_a as usize, self.root_b as usize);
         if let Some(p) = (0..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
@@ -2408,6 +2458,7 @@ impl Compose {
             report.counterexample = Some(points[p].clone());
             return Ok(());
         }
+        let tt = tmp_t("C.keys");
         let values = prog.widest() <= 64;
         if values {
             self.sample = Some((points.clone(), digests.clone()));
@@ -2426,6 +2477,7 @@ impl Compose {
             .map(|i| keys[i])
             .collect();
         let mut groups: HashMap<u64, Vec<u32>> = HashMap::new();
+        drop(tt);
         let tq = std::time::Instant::now();
         for i in 0..self.nodes.len() as u32 {
             let k = keys[i as usize];
@@ -2463,6 +2515,7 @@ impl Compose {
             self.sample = Some((points.clone(), digests.clone()));
         }
         tmp_time("C.bitwise_forms", tq);
+        let tt = tmp_t("C.check");
         // Every class agrees at the sample (a pairing that does not is a bug: decline).
         for i in 0..self.nodes.len() as u32 {
             let r = self.find(i);
@@ -2475,6 +2528,7 @@ impl Compose {
             report.verdict = Verdict::Proved;
             return Ok(());
         }
+        drop(tt);
         for policy in [
             Policy::Minimal,
             Policy::Reps,
@@ -2827,6 +2881,7 @@ impl Compose {
     ) -> Result<Compared, M::Err> {
         // The definitions of the atoms with class variables (arithmetic ones), skeletons first,
         // so every expression has the final variables.
+        let tt = tmp_t("e.defs");
         let mut defs: Vec<(u32, Vec<SkelNode>)> = Vec::new();
         let mut k = 0;
         while k < vm.slots.len() && defs.len() < 4 {
@@ -2865,11 +2920,14 @@ impl Compose {
             z
         };
         let mut changed = false;
+        drop(tt);
+        let tt = tmp_t("e.loop");
         for (k, d) in &defs {
             for side in [&mut a, &mut b] {
                 if !side.nodes().iter().any(|m| m.op == MOp::Var(*k)) {
                     continue;
                 }
+                let tt2 = tmp_t("e.loop.prep");
                 let Some(s0) = substitute_var(side, *k, &zero) else {
                     continue;
                 };
@@ -2901,6 +2959,8 @@ impl Compose {
                 if !(ps.poly && pt.poly) {
                     continue;
                 }
+                drop(tt2);
+                let _tt2 = tmp_t("e.loop.run");
                 let linear = match plan(side, &ps, &pt) {
                     Some(p) => match run(meter, side, &t, &p, report)? {
                         Run::Equal(_) => true,
@@ -2918,9 +2978,11 @@ impl Compose {
                 }
             }
         }
+        drop(tt);
         if !changed {
             return Ok((None, None));
         }
+        let _tt = tmp_t("e.final");
         let (Some(pa), Some(pb)) = (profile(&a), profile(&b)) else {
             return Ok((None, None));
         };
@@ -3975,6 +4037,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
         return None;
     }
     // Both sides in one hash-consed table, so equal subterms are one symbol.
+    let tsc = std::time::Instant::now();
     let mut canon: HashMap<MNode, u32> = HashMap::new();
     let mut nodes: Vec<MNode> = Vec::new();
     let mut roots = [0u32; 2];
@@ -3997,6 +4060,8 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
         roots[side] = *map.last()?;
     }
     let cst = constants(&nodes);
+    tmp_time("s.canon", tsc);
+    let _tt = tmp_t("s.polys");
     let bitwise = |op: &MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor | MOp::Not);
     // Symbols: variables by index, conjunctions by their leaf set, others by node.
     let mut symbols: HashMap<(u8, Vec<u32>), u32> = HashMap::new();
@@ -4153,7 +4218,9 @@ fn symbolic<M: Meter>(
 ) -> Result<bool, M::Err> {
     let limit = meter.left() / SYMBOLIC_RATE;
     let mut work = 0u64;
+    let tt = tmp_t("s.symbolic");
     let equal = symbolic_equal(a, b, limit, &mut work) == Some(true);
+    drop(tt);
     if work > limit {
         report.over_budget = true;
     }
