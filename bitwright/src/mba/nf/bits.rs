@@ -222,6 +222,9 @@ impl Bits {
     /// be 0 or all-ones in each class) and `Δ_c(p) = Σ_{∅≠S⊆p} γ_{c,S}`, `k_c + Δ_c(p)` must be 0
     /// or 1 modulo `2^(W − τ_c)` at every class corner `p`; it is the table's entry.
     pub(crate) fn from_linear(p: &Poly, classes: &Classes) -> Option<Bits> {
+        if classes.width().bits() <= 64 {
+            return Self::from_linear_64(p, classes);
+        }
         let (support, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
         let s = support.len();
@@ -257,6 +260,9 @@ impl Bits {
     /// corner, as in [`from_linear`](Self::from_linear)), and whether the atoms move it there
     /// (some `Δ_c(p)` is not 0). `None` if in some class neither value fits.
     pub(crate) fn zero_values(p: &Poly, classes: &Classes) -> Option<Vec<([bool; 2], bool)>> {
+        if classes.width().bits() <= 64 {
+            return Self::zero_values_64(p, classes);
+        }
         let (_, deltas) = corner_sums(p, classes)?;
         let w = classes.width();
         let one = BitVec::one(w);
@@ -279,6 +285,100 @@ impl Bits {
         }
         Some(out)
     }
+
+    /// [`from_linear`](Self::from_linear) at widths up to 64: the same test in one word.
+    fn from_linear_64(p: &Poly, classes: &Classes) -> Option<Bits> {
+        let (support, deltas) = corner_sums_64(p, classes)?;
+        let bits = u32::from(classes.width().bits());
+        let s = support.len();
+        let konst = p.konst().limbs()[0];
+        let mut tables = Vec::with_capacity(classes.len());
+        for (c, g) in deltas.chunks_exact(1 << s).enumerate() {
+            let mask = classes.mask(c).limbs()[0];
+            let k = match konst & mask {
+                0 => 0u64,
+                inside if inside == mask => 1,
+                _ => return None,
+            };
+            // The low `W − τ_c` bits.
+            let lm = u64::MAX >> (64 - (bits - u32::from(classes.low(c))));
+            let mut t = vec![0u64; words(s)];
+            for (q, d) in g.iter().enumerate() {
+                match k.wrapping_add(*d) & lm {
+                    0 => {}
+                    1 => set(&mut t, q),
+                    _ => return None,
+                }
+            }
+            tables.push(t);
+        }
+        Some(Bits { support, tables }.prune())
+    }
+
+    /// [`zero_values`](Self::zero_values) at widths up to 64.
+    fn zero_values_64(p: &Poly, classes: &Classes) -> Option<Vec<([bool; 2], bool)>> {
+        let (support, deltas) = corner_sums_64(p, classes)?;
+        let bits = u32::from(classes.width().bits());
+        let mut out = Vec::with_capacity(classes.len());
+        for (c, g) in deltas.chunks_exact(1 << support.len()).enumerate() {
+            let lm = u64::MAX >> (64 - (bits - u32::from(classes.low(c))));
+            let mut fits = [true, true];
+            let mut moved = false;
+            for d in g {
+                let d = d & lm;
+                moved |= d != 0;
+                fits[0] &= d <= 1;
+                fits[1] &= d.wrapping_add(1) & lm <= 1;
+            }
+            if fits == [false, false] {
+                return None;
+            }
+            out.push((fits, moved));
+        }
+        Some(out)
+    }
+}
+
+/// [`corner_sums`] at widths up to 64, a word per sum: the sums modulo 2^64 (their readers
+/// mask them to a class's precision), class `c`'s in `[c << s..][..1 << s]`.
+fn corner_sums_64(p: &Poly, classes: &Classes) -> Option<(Vec<u32>, Vec<u64>)> {
+    if p.degree() > 1 {
+        return None;
+    }
+    let atoms = p.atoms();
+    if atoms.count_ones() as usize > MAX_SUPPORT {
+        return None;
+    }
+    let support: Vec<u32> = (0..64).filter(|&a| atoms >> a & 1 == 1).collect();
+    let s = support.len();
+    let n = classes.len();
+    let mut gamma = vec![0u64; n << s];
+    for (m, c) in p.terms() {
+        let Some(&(sym, _)) = m.first() else {
+            continue;
+        };
+        if usize::from(sym.class) >= n {
+            return None;
+        }
+        let q = support
+            .iter()
+            .enumerate()
+            .filter(|&(_, &a)| sym.set >> a & 1 == 1)
+            .fold(0usize, |q, (j, _)| q | 1 << j);
+        let slot = &mut gamma[(usize::from(sym.class) << s) | q];
+        *slot = slot.wrapping_add(c.limbs()[0]);
+    }
+    // Subset sums: Δ(p) = Σ_{S⊆p} γ_S.
+    for g in gamma.chunks_exact_mut(1 << s) {
+        for b in 0..s {
+            for q in 0..1usize << s {
+                if q >> b & 1 == 1 {
+                    g[q] = g[q].wrapping_add(g[q ^ 1 << b]);
+                }
+            }
+        }
+    }
+    Some((support, gamma))
 }
 
 /// The support of a polynomial of degree at most 1 (ascending, at most [`MAX_SUPPORT`] atoms)
