@@ -345,10 +345,12 @@ pub(super) fn mba_step(
     }
     r.stats.passes.entry("mba").or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
-    let whole = mba::step(r, cx, cfg, n)?;
-    if matches!(whole, Step::To(..)) {
-        return Ok(whole);
-    }
+    // What each candidate declined contributes stays in the result (see the linear pass's
+    // `step`).
+    let mut declined = match mba::step(r, cx, cfg, n)? {
+        Step::Normal(f) => f,
+        step => return Ok(step),
+    };
     // a sum whose groups of terms share no leaf, each asked alone.
     let mut part =
         |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
@@ -357,12 +359,15 @@ pub(super) fn mba_step(
                 Step::Normal(_) => None,
             })
         };
-    if let Some(step @ Step::To(..)) = linear::by_sums(r, cx, n, &mut part)? {
-        return Ok(step);
+    match linear::by_sums(r, cx, n, &mut part)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
     }
     Ok(match linear::by_groups(r, cx, n, &mut part)? {
-        Some(step @ Step::To(..)) => step,
-        _ => whole,
+        Some(Step::Normal(f)) => Step::Normal(declined.and(f)),
+        Some(step) => step,
+        None => Step::Normal(declined),
     })
 }
 

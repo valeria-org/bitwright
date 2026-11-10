@@ -508,6 +508,105 @@ fn conditions_merge_whatever_the_order_of_construction() {
     }
 }
 
+/// A pass tries several candidates at a node, and one declined only because a part of the node
+/// has another user is declined for now: the node's result is not final, whichever candidate
+/// it was. The linear pass tries a case split on a condition mask first; of these two inputs
+/// it declined the split of `sext(b) + 2^31 ^ 2^31` and of `concat(a, 7) - (sext(c) << 2)`
+/// while the sum had another user, then remembered the node as final by its last candidate
+/// alone, and the other user went. So the result changed again in a context without that
+/// memory.
+#[test]
+fn a_candidate_declined_for_sharing_is_decided_again() {
+    // (A symbol's width at its first use: `b:1`.)
+    let cases = [
+        (
+            32,
+            "let %0 = sext<32>(b:1); let %1 = %0 + 0x80000000; \
+             concat(trunc<17>(~(sext<32>(a:4) ^ sext<32>(extract<25, 1>(select((%1 ^ 0x80000000) \
+             & (%1 ^ %0) <s 0, select(%0 <s 0, 0x80000000:32, 0x7fffffff), %1))))), \
+             extract<7, 15>(zext<32>(b) * -1))",
+        ),
+        (
+            7,
+            "let %0 = sext<7>(a:3); let %1 = sext<7>(udiv(%0, 7) * %0 != %0 << 4) << 2; \
+             let %2 = concat(a, 7:4); let %3 = %2 - %1; \
+             let %4 = smulhi((concat(-1:4, a) << 4) - select((%1 ^ %2) & (%3 ^ %2) <s 0, \
+             select(%2 <s 0, -64:7, 63), %3), concat(a, -1:4)); \
+             zext<7>((%0 - %4 ^ %0) & (%4 ^ %0) <s 0)",
+        ),
+    ];
+    for strategy in [
+        Strategy::standard(),
+        Strategy::decompile(),
+        Strategy::deobfuscate(),
+    ] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (width, src) in cases {
+            let mut cx = Context::new();
+            let e = cx
+                .parse(src, &ParseOptions::width(Width::new(width).unwrap()))
+                .unwrap();
+            let r = eng.simplify(&mut cx, e).unwrap().expr;
+            let mut fresh = Context::new();
+            let again = fresh.import(&cx, &[r]).unwrap()[0];
+            let out = eng.run(&mut fresh, &[again], Run::default()).unwrap();
+            assert!(
+                !out.roots[0].changed,
+                "{} became {}",
+                cx.display(r),
+                fresh.display(out.roots[0].expr)
+            );
+        }
+    }
+}
+
+/// Under `(e << k) | s` nested thousands of times only the last levels reach the result: the
+/// ones a shift has moved out of the word are dropped. The walk is operands first, and each of
+/// those levels was simplified under the mask of the level above before the walk reached the
+/// top, a window of levels rebuilt at every one (3000 levels: 6 s and 126 655 nodes built).
+/// The node at the top is asked first, and the levels out of its reach are not walked.
+#[test]
+fn a_deep_chain_of_shifts_is_asked_at_its_top() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let n = 3000;
+        let s = symbols(&mut cx, n, Width::W64);
+        let mut e = s[0];
+        for (i, &t) in s.iter().enumerate().skip(1) {
+            let k = cx.constant_u64(Width::W64, 1 + i as u64 % 3).unwrap();
+            let shifted = cx.bin(BinOp::Shl, e, k).unwrap();
+            e = cx.bin(BinOp::Or, shifted, t).unwrap();
+        }
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0];
+        assert_eq!(r.end, End::Completed);
+        for k in 0..8u64 {
+            let env = FnEnv(|key: &crate::SymbolKey, w| {
+                let h = format!("{key:?}")
+                    .bytes()
+                    .fold(k, |h, c| (h ^ u64::from(c)).wrapping_mul(0x100_0000_01b3));
+                Some(BitVec::wrapping_from_u64(w, h))
+            });
+            let v = cx.eval(&[e, r.expr], &env).unwrap();
+            assert_eq!(v[0], v[1]);
+        }
+        // 64 bits at one to three a level: 33 levels at most are read.
+        let (read, nodes) = size(&mut cx, r.expr);
+        assert!(read <= 34 && nodes < 110, "{read} symbols, {nodes} nodes");
+        let built = out.stats.new_nodes;
+        assert!(built < 10_000, "{built} nodes built");
+    }
+}
+
 #[test]
 fn linear_charges_pass_work() {
     let eng = engine(vec![Phase::Linear]);

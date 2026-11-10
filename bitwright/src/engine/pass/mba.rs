@@ -1340,17 +1340,20 @@ pub(super) fn step(
     // a fragment that reads slices of one rotated value, asked again with them
     // written as masks of that rotation (see [`sliced`]).
     if cfg.noise_forms
-        && let Step::Normal(fin) = &out
+        && let Step::Normal(fin) = out
         && fin.done
     {
         let before = cx.len() as u32;
+        let mut fin = fin;
         if let Some(root) = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))? {
-            let again = ask(r, cx, cfg, n, root)?;
-            if matches!(again, Step::To(..)) {
-                return Ok(again);
+            match ask(r, cx, cfg, n, root)? {
+                // What the second question declined contributes to the result.
+                Step::Normal(f) => fin = fin.and(f),
+                again => return Ok(again),
             }
         }
         discard(r, cx, before);
+        return Ok(Step::Normal(fin));
     }
     Ok(out)
 }
