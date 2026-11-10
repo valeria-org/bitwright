@@ -155,6 +155,15 @@ impl MbaExpr {
         }
     }
 
+    /// [`MbaExpr::new`] with room for `nodes` nodes.
+    pub(crate) fn with_capacity(vars: Vec<Width>, nodes: usize) -> MbaExpr {
+        MbaExpr {
+            vars,
+            nodes: Vec::with_capacity(nodes),
+            key: std::sync::OnceLock::new(),
+        }
+    }
+
     /// The variables' widths.
     pub fn vars(&self) -> &[Width] {
         &self.vars

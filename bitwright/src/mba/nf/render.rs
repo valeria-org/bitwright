@@ -25,7 +25,7 @@ struct BNode {
     args: [u32; 2],
 }
 
-/// Hashed as two words and a constant's significant limbs (interning hashes every node built).
+/// Hashed as one word and a constant's significant limbs (interning hashes every node built).
 impl core::hash::Hash for BNode {
     fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
         let (tag, extra) = match self.op {
@@ -45,8 +45,11 @@ impl core::hash::Hash for BNode {
             MOp::Sext => (13, 0),
             MOp::Trunc => (14, 0),
         };
-        h.write_u64(tag | u64::from(self.w.bits()) << 8 | extra << 24);
-        h.write_u64(u64::from(self.args[0]) | u64::from(self.args[1]) << 32);
+        // The operands spread over the word, the rest (under 2^56) folded in: the hasher mixes
+        // what it is given.
+        let args = u64::from(self.args[0]) | u64::from(self.args[1]) << 32;
+        let meta = tag | u64::from(self.w.bits()) << 8 | extra << 24;
+        h.write_u64(args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta);
         if let MOp::Const(v) = &self.op {
             for &l in v.limbs() {
                 h.write_u64(l);
@@ -61,11 +64,29 @@ pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
     memo: IdMap<BNode, u32>,
-    /// [`Builder::reach`]'s visited marks: a stamp per node, current when equal to the epoch.
-    marks: core::cell::RefCell<(Vec<u32>, u32)>,
-    /// Costs of candidates already costed (nodes never change once interned).
-    costs: core::cell::RefCell<IdMap<u32, Cost>>,
+    /// What the walks over a candidate's nodes reuse (see [`Walk`]).
+    walk: core::cell::RefCell<Walk>,
+    /// Costs of candidates already costed, by root ([`NO_COST`] for one not costed; nodes
+    /// never change once interned).
+    costs: core::cell::RefCell<Vec<Cost>>,
 }
+
+/// The scratch of [`Builder::reach`], [`Builder::cost`] and [`Builder::finish`]: candidates
+/// are walked by the thousand.
+#[derive(Clone, Debug, Default)]
+struct Walk {
+    /// Visited marks: a stamp per node, current when equal to the epoch.
+    stamp: Vec<u32>,
+    epoch: u32,
+    stack: Vec<(u32, bool)>,
+    /// The nodes of the last walk, operands first.
+    order: Vec<u32>,
+    /// Per node of the last candidate finished: its index in the expression.
+    place: Vec<u32>,
+}
+
+/// No cost yet (see [`Builder::cost`]).
+const NO_COST: Cost = (u32::MAX, u32::MAX);
 
 /// A candidate's cost: nodes, then operator weight.
 pub(crate) type Cost = (u32, u32);
@@ -88,19 +109,21 @@ impl Builder {
             vars,
             nodes: Vec::new(),
             memo: IdMap::default(),
-            marks: Default::default(),
+            walk: Default::default(),
             costs: Default::default(),
         }
     }
 
     fn intern(&mut self, n: BNode) -> u32 {
-        if let Some(&i) = self.memo.get(&n) {
-            return i;
+        let next = self.nodes.len() as u32;
+        match self.memo.entry(n) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(next);
+                self.nodes.push(n);
+                next
+            }
         }
-        self.nodes.push(n);
-        let i = self.nodes.len() as u32 - 1;
-        self.memo.insert(n, i);
-        i
     }
 
     pub(crate) fn width(&self, n: u32) -> Width {
@@ -289,8 +312,20 @@ impl Builder {
 
     /// The nodes `root` uses, operands first.
     pub(crate) fn reach(&self, root: u32) -> Vec<u32> {
-        let mut marks = self.marks.borrow_mut();
-        let (stamp, epoch) = &mut *marks;
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        walk.order.clone()
+    }
+
+    /// Fills `walk.order` with the nodes `root` uses, operands first.
+    fn walk_from(&self, walk: &mut Walk, root: u32) {
+        let Walk {
+            stamp,
+            epoch,
+            stack,
+            order,
+            ..
+        } = walk;
         *epoch = epoch.wrapping_add(1);
         if *epoch == 0 {
             stamp.fill(0);
@@ -299,24 +334,33 @@ impl Builder {
         if stamp.len() < self.nodes.len() {
             stamp.resize(self.nodes.len(), 0);
         }
-        let mut out = Vec::new();
-        let mut stack = vec![(root, false)];
+        order.clear();
+        stack.clear();
+        stack.push((root, false));
         while let Some((i, done)) = stack.pop() {
             if done {
-                out.push(i);
+                order.push(i);
                 continue;
             }
             let fresh = core::mem::replace(&mut stamp[i as usize], *epoch) != *epoch;
             if !fresh {
                 continue;
             }
-            stack.push((i, true));
-            let n = self.nodes[i as usize];
-            for &k in n.args[..n.op.arity()].iter().rev() {
-                stack.push((k, false));
+            let n = &self.nodes[i as usize];
+            match n.op.arity() {
+                // A leaf is done as it is met.
+                0 => order.push(i),
+                1 => {
+                    stack.push((i, true));
+                    stack.push((n.args[0], false));
+                }
+                _ => {
+                    stack.push((i, true));
+                    stack.push((n.args[1], false));
+                    stack.push((n.args[0], false));
+                }
             }
         }
-        out
     }
 
     /// The cost of the candidate rooted at `root`: its nodes, counting a shift's amount as the
@@ -326,47 +370,66 @@ impl Builder {
     /// `x − 1` or `−(~x)` to `x + 1` while the inner node stays for other uses, then operator
     /// weight.
     pub(crate) fn cost(&self, root: u32) -> Cost {
-        if let Some(&c) = self.costs.borrow().get(&root) {
+        if let Some(&c) = self.costs.borrow().get(root as usize)
+            && c != NO_COST
+        {
             return c;
         }
         let c = self.cost_of(root);
-        self.costs.borrow_mut().insert(root, c);
+        let mut costs = self.costs.borrow_mut();
+        if costs.len() < self.nodes.len() {
+            costs.resize(self.nodes.len(), NO_COST);
+        }
+        costs[root as usize] = c;
         c
     }
 
     fn cost_of(&self, root: u32) -> Cost {
-        let r = self.reach(root);
-        let weight: u32 = r.iter().map(|&i| weight(&self.nodes[i as usize].op)).sum();
-        let unstable = r
-            .iter()
-            .filter(|&&i| {
-                let n = self.nodes[i as usize];
-                n.op == MOp::Sub && {
-                    let m = self.nodes[n.args[1] as usize];
-                    m.op == MOp::And && m.args.contains(&n.args[0])
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        let r = &walk.order;
+        let mut weight = 0u32;
+        let mut unstable = 0u32;
+        // Whether a shift, or a `~(−x)` or `−(~x)`, is among the nodes: only then do the
+        // constants matter.
+        let (mut shifts, mut sites) = (false, false);
+        for &i in r {
+            let n = &self.nodes[i as usize];
+            weight += self::weight(&n.op);
+            match n.op {
+                MOp::Sub => {
+                    let m = &self.nodes[n.args[1] as usize];
+                    unstable += u32::from(m.op == MOp::And && m.args.contains(&n.args[0]));
                 }
-            })
-            .count() as u32;
-        let mut consts: Vec<BitVec> = r
-            .iter()
-            .filter_map(|&i| match self.nodes[i as usize].op {
-                MOp::Const(v) => Some(v),
-                _ => None,
-            })
-            .collect();
-        let mut amounts = 0u32;
-        for &i in &r {
-            let n = self.nodes[i as usize];
-            if let MOp::Shl(k) | MOp::LShr(k) = n.op {
-                let v = BitVec::wrapping_from_u64(n.w, u64::from(k));
-                if !consts.contains(&v) {
-                    consts.push(v);
-                    amounts += 1;
-                }
+                MOp::Shl(_) | MOp::LShr(_) => shifts = true,
+                MOp::Not => sites |= self.nodes[n.args[0] as usize].op == MOp::Neg,
+                MOp::Neg => sites |= self.nodes[n.args[0] as usize].op == MOp::Not,
+                _ => {}
             }
         }
-        let one = r.first().map(|&i| BitVec::one(self.nodes[i as usize].w));
-        let rewritten = one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(&r));
+        let (mut amounts, mut rewritten) = (0u32, false);
+        if shifts || sites {
+            let mut consts: Vec<BitVec> = r
+                .iter()
+                .filter_map(|&i| match self.nodes[i as usize].op {
+                    MOp::Const(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            for &i in r {
+                let n = &self.nodes[i as usize];
+                if let MOp::Shl(k) | MOp::LShr(k) = n.op {
+                    let v = BitVec::wrapping_from_u64(n.w, u64::from(k));
+                    if !consts.contains(&v) {
+                        consts.push(v);
+                        amounts += 1;
+                    }
+                }
+            }
+            let one = r.first().map(|&i| BitVec::one(self.nodes[i as usize].w));
+            rewritten =
+                one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(r));
+        }
         (
             r.len() as u32 + amounts + unstable + u32::from(rewritten),
             weight,
@@ -377,7 +440,7 @@ impl Builder {
     /// elsewhere in the candidate too.
     fn rewrites_shared(&self, r: &[u32]) -> bool {
         let inner = |n: &BNode| -> Option<u32> {
-            let m = self.nodes[n.args[0] as usize];
+            let m = &self.nodes[n.args[0] as usize];
             matches!((n.op, m.op), (MOp::Not, MOp::Neg) | (MOp::Neg, MOp::Not)).then_some(n.args[0])
         };
         let sites: Vec<u32> = r
@@ -389,7 +452,7 @@ impl Builder {
         }
         let mut users = 0usize;
         for &i in r {
-            let n = self.nodes[i as usize];
+            let n = &self.nodes[i as usize];
             users += n.args[..n.op.arity()]
                 .iter()
                 .filter(|a| sites.contains(a))
@@ -428,17 +491,23 @@ impl Builder {
 
     /// The candidate rooted at `root` as an expression.
     pub(crate) fn finish(&self, root: u32) -> Option<MbaExpr> {
-        let mut m = MbaExpr::new(self.vars.clone());
-        let mut map: HashMap<u32, u32> = HashMap::new();
-        for i in self.reach(root) {
-            let n = self.nodes[i as usize];
-            let args: Vec<u32> = n.args[..n.op.arity()].iter().map(|a| map[a]).collect();
+        let mut walk = self.walk.borrow_mut();
+        self.walk_from(&mut walk, root);
+        let Walk { order, place, .. } = &mut *walk;
+        if place.len() < self.nodes.len() {
+            place.resize(self.nodes.len(), 0);
+        }
+        let mut m = MbaExpr::with_capacity(self.vars.clone(), order.len());
+        for &i in order.iter() {
+            let n = &self.nodes[i as usize];
+            // Operands come first in the walk: their places are this candidate's.
+            let args = [place[n.args[0] as usize], place[n.args[1] as usize]];
             let id = match n.op {
                 MOp::Zext | MOp::Sext | MOp::Trunc => m.push_cast(n.op, args[0], n.w),
-                op => m.push(op, &args),
+                op => m.push(op, &args[..op.arity()]),
             }
             .ok()?;
-            map.insert(i, id);
+            place[i as usize] = id;
         }
         Some(m)
     }
@@ -466,11 +535,14 @@ pub(crate) fn structural(a: &MbaExpr, b: &MbaExpr) -> core::cmp::Ordering {
         };
         (tag, k, c, n.width.bits(), n.args)
     };
-    let (ka, kb): (Vec<_>, Vec<_>) = (
-        a.nodes().iter().map(key).collect(),
-        b.nodes().iter().map(key).collect(),
-    );
-    ka.cmp(&kb)
+    // As the sequences of the nodes' keys compare: the first difference, then the lengths.
+    for (x, y) in a.nodes().iter().zip(b.nodes()) {
+        let o = key(x).cmp(&key(y));
+        if o.is_ne() {
+            return o;
+        }
+    }
+    a.nodes().len().cmp(&b.nodes().len())
 }
 
 /// Emission of normal forms into a builder, with the atoms' renderings imported on use.
@@ -972,20 +1044,28 @@ impl<'a> Render<'a> {
     /// The cheapest of `cands` (node count, weight, structure).
     pub(crate) fn best(&self, cands: &[u32]) -> Option<u32> {
         let mut best: Option<(u32, Cost)> = None;
+        // The best so far as an expression, once a tie has asked for it.
+        let mut held: Option<Option<MbaExpr>> = None;
         for &c in cands {
             let cost = self.b.cost(c);
-            best = match best {
-                None => Some((c, cost)),
-                Some((_, bc)) if cost < bc => Some((c, cost)),
+            match best {
+                None => best = Some((c, cost)),
+                Some((_, bc)) if cost < bc => {
+                    best = Some((c, cost));
+                    held = None;
+                }
                 Some((b, bc)) if cost == bc && b != c => {
-                    let (x, y) = (self.b.finish(c), self.b.finish(b));
-                    match (x, y) {
-                        (Some(x), Some(y)) if structural(&x, &y).is_lt() => Some((c, cost)),
-                        _ => Some((b, bc)),
+                    let x = self.b.finish(c);
+                    let y = held.get_or_insert_with(|| self.b.finish(b));
+                    if let (Some(x), Some(y)) = (x, y.as_ref())
+                        && structural(&x, y).is_lt()
+                    {
+                        best = Some((c, cost));
+                        held = Some(Some(x));
                     }
                 }
-                keep => keep,
-            };
+                _ => {}
+            }
         }
         best.map(|(c, _)| c)
     }
