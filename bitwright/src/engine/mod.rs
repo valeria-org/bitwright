@@ -190,7 +190,10 @@ pub struct Strategy {
     pub name: Cow<'static, str>,
     /// The phases of a round.
     pub phases: Vec<Phase>,
-    /// The most rounds (at least 1).
+    /// The most rounds that change a root (at least 1). A round that changed nothing may be
+    /// followed by rounds over the same root in which the MBA phase asks the questions it had
+    /// cut short, and one such round may follow the last (see the solver's steps in
+    /// `docs/design.md`).
     pub max_rounds: u8,
     /// Whether rules marked `#[float_values]` apply: identities that hold for floats as
     /// values, every NaN one value (`x · 1 = x` for every `x`, where the product of a NaN with
@@ -1317,6 +1320,12 @@ struct Runner<'r, 'a> {
     /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
     /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
     demanded_same: pass::demanded::Same,
+    /// What the opaque-constant sweep's reductions of its candidates found, per node and
+    /// demanded mask, for the call (see `pass::demanded::reduced`).
+    #[cfg(feature = "mba")]
+    reduced: [pass::demanded::Memo; 2],
+    /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
+    sum_constants: IdMap<(u32, u8), Vec<u32>>,
     /// The words pass's forms and marks.
     words: pass::words::State,
     /// The MBA solver's answers in this call, by question.
@@ -1325,6 +1334,50 @@ struct Runner<'r, 'a> {
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
+    /// Questions the solver ran out of steps on in this call, each with the steps it had (see
+    /// `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_exhausted: IdMap<crate::mba::CacheKey, u64>,
+    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
+    /// declined by the solver for their size, answered with nothing that would make the DAG
+    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
+    #[cfg(feature = "mba")]
+    mba_kept: IdMap<u32, ()>,
+    /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
+    /// rounds ask within a few steps each until one changes nothing, and only then deeper.
+    #[cfg(feature = "mba")]
+    mba_depth: u8,
+    /// Whether a question of this round ran out of steps at that depth (or was not asked for
+    /// holding one that did), so a deeper round has something to ask.
+    #[cfg(feature = "mba")]
+    mba_deeper: bool,
+    /// The roots of the fragments whose questions ran out of steps at this round's depth:
+    /// a fragment holding one is not asked at this depth either (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_shallow: IdMap<u32, ()>,
+    /// The opaque-constant candidates whose readings were asked in this call and decided
+    /// nothing: atoms to the readings of every candidate above them (see
+    /// `pass::mba::readings_prove`).
+    #[cfg(feature = "mba")]
+    mba_undecided: IdMap<u32, ()>,
+    /// The opaque-constant sweep's result for every node it examined in this call (the node
+    /// itself where it found nothing), so a sweep of another root or of one side of a case
+    /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
+    /// `pass::mba::sweep`).
+    #[cfg(feature = "mba")]
+    swept: IdMap<u32, u32>,
+    /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
+    /// its samples showed (see `pass::mba::Witness`).
+    #[cfg(feature = "mba")]
+    witnesses: Vec<pass::mba::Witness>,
+    /// The blocks the opaque-constant sweep asked the solver about in this call with a node
+    /// cut off and got no answer to within its steps: the blocks' roots, by the cut (see
+    /// `pass::mba::sweep_cut_at`).
+    #[cfg(feature = "mba")]
+    cut_declined: IdMap<u32, IdMap<u32, ()>>,
+    /// The opaque-constant sweep's enumerations' buffers (see `pass::mba::Exhaust`).
+    #[cfg(feature = "mba")]
+    exhaust: pass::mba::Exhaust,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2431,9 +2484,32 @@ impl Engine {
             demanded_same: Default::default(),
             words: Default::default(),
             #[cfg(feature = "mba")]
+            reduced: Default::default(),
+            sum_constants: IdMap::default(),
+            #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_exhausted: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_kept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_depth: 0,
+            #[cfg(feature = "mba")]
+            mba_deeper: false,
+            #[cfg(feature = "mba")]
+            mba_shallow: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_undecided: IdMap::default(),
+            #[cfg(feature = "mba")]
+            swept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            witnesses: Vec::new(),
+            #[cfg(feature = "mba")]
+            cut_declined: IdMap::default(),
+            #[cfg(feature = "mba")]
+            exhaust: Default::default(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -2674,7 +2750,7 @@ impl Runner<'_, '_> {
         #[cfg(feature = "mba")]
         let inner = self.inner;
         let mut cur = root;
-        let fin = Fin::FINAL;
+        let mut fin = Fin::FINAL;
         // with the MBA phase's noise forms, the root is read with what its
         // conditions fix put into the operands they guard first (see `pass::push_context`):
         // a case table's noise folds once its selector's bits are constants, and the budget is
@@ -2698,24 +2774,51 @@ impl Runner<'_, '_> {
                 Err(stop) => return Err((cur, fin, stop)),
             }
         }
-        // The exact opaque-constant sweep is opt-in: it can spend work on failed candidate
-        // proofs before the ordinary phases reach their root.
-        #[cfg(feature = "mba")]
-        if let Some(cfg) = inner.phases.iter().find_map(|p| match p {
-            PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms || c.known_atoms => Some(c),
-            _ => None,
-        }) {
-            match pass::mba_sweep(self, cx, cfg, cur) {
-                Ok(r) => {
-                    self.emit_stage(cx, Stage::Sweep, cur, r);
-                    cur = r;
-                }
-                Err(Stop::Exhausted(_)) => {}
-                Err(stop) => return Err((cur, fin, stop)),
-            }
+        let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        if swept != cur {
+            fin = fin.and(Fin::relying(self.assumed()));
+            cur = swept;
         }
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
         self.rounds(cx, cur, fin)
+    }
+
+    /// Every constraint of the run's assumptions: what a result of the opaque-constant sweep
+    /// is taken to rely on. The sweep reads the facts of the nodes it folds (known bits, the
+    /// values a bottleneck can take) without recording which constraints they came from, so a
+    /// root it changed is reported as relying on all of them (an over-approximation, as
+    /// [`Reliance`] allows; none where the run has no assumptions).
+    fn assumed(&self) -> Reliance {
+        self.assumptions.map_or(Reliance::NONE, |a| {
+            a.constraints()
+                .fold(Reliance::NONE, |r, (id, _, _)| r | Reliance::of(id))
+        })
+    }
+
+    /// `cur` after the opaque-constant sweep (see `pass::mba::sweep`), where the MBA phase asks
+    /// for it. The sweep is opt-in: it can spend work on failed candidate proofs before the
+    /// ordinary phases reach their root. Run before the first round, and before each later one
+    /// on what the round before left: the phases expose constants the first sweep could not
+    /// prove (a fragment over fewer atoms once its operands are simplified), and a node an
+    /// earlier sweep examined is read from it, so only what a round made is asked about. A
+    /// budget keeps the root as it is.
+    fn sweep(&mut self, cx: &mut Context, cur: u32) -> Result<u32, Stop> {
+        #[cfg(feature = "mba")]
+        if let Some(cfg) = self.inner.phases.iter().find_map(|p| match p {
+            PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms || c.known_atoms => Some(c),
+            _ => None,
+        }) {
+            return match pass::mba_sweep(self, cx, cfg, cur) {
+                Ok(r) => {
+                    self.emit_stage(cx, Stage::Sweep, cur, r);
+                    Ok(r)
+                }
+                Err(Stop::Exhausted(_)) => Ok(cur),
+                Err(stop) => Err(stop),
+            };
+        }
+        let _ = cx;
+        Ok(cur)
     }
 
     /// with the MBA phase's noise forms, `cur` with its pieces that depend only on
@@ -2734,7 +2837,17 @@ impl Runner<'_, '_> {
                 Ok(crate::expr::Bounded::Exact(n)) => n,
                 _ => return Ok(cur),
             };
-            return match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+            let cur = match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+                Ok(Some(p)) => {
+                    self.emit_stage(cx, Stage::Cases, cur, p);
+                    p
+                }
+                Ok(None) | Err(Stop::Exhausted(_)) => cur,
+                Err(stop) => return Err(stop),
+            };
+            // And the root itself, where it is one value on either side of the condition
+            // its selects test most (see `pass::split_cases`).
+            return match pass::split_cases(self, cx, cur) {
                 Ok(Some(p)) => {
                     self.emit_stage(cx, Stage::Cases, cur, p);
                     Ok(p)
@@ -2768,6 +2881,23 @@ impl Runner<'_, '_> {
         }
     }
 
+    /// Whether questions of the MBA phase wait for a deeper round (see `pass::mba::depth`),
+    /// which the next round then is: one step deeper, or at the full depth (`full`).
+    fn deepen(&mut self, full: bool) -> bool {
+        #[cfg(feature = "mba")]
+        if self.mba_deeper {
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+            self.mba_depth = match full {
+                true => u8::MAX,
+                false => self.mba_depth.saturating_add(1),
+            };
+            return true;
+        }
+        let _ = full;
+        false
+    }
+
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
     /// nothing or the strategy allows no more (`Stats::rounds_capped` counts those).
     fn rounds(
@@ -2777,12 +2907,31 @@ impl Runner<'_, '_> {
         mut fin: Fin,
     ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
         let inner = self.inner;
-        for round in 0..inner.strategy.max_rounds.max(1) {
+        let max = inner.strategy.max_rounds.max(1);
+        #[cfg(feature = "mba")]
+        {
+            self.mba_depth = 0;
+            self.mba_deeper = false;
+            self.mba_shallow.clear();
+        }
+        self.words.turn = false;
+        // The rounds that changed the root, and every round (the number an observer sees).
+        let (mut changed, mut round) = (0u8, 0u8);
+        // Whether this round is over the root the one before it left as it was, with deeper
+        // questions; and whether it is the one round past the strategy's last, with the
+        // deepest (see below).
+        let (mut again, mut extra) = (false, false);
+        loop {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
-            if round > 0 {
+            if round > 0 && !again {
+                let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                if swept != cur {
+                    fin = fin.and(Fin::relying(self.assumed()));
+                    cur = swept;
+                }
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
-            let start = cur;
+            let (start, before) = (cur, fin);
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 let spent0 = self.meter.spent;
                 self.phase_name = p.name();
@@ -2825,9 +2974,49 @@ impl Runner<'_, '_> {
                     Err(stop) => return Err((cur, fin, stop)),
                 }
             }
-            if cur == start {
+            round = round.saturating_add(1);
+            let same = cur == start;
+            changed += u8::from(!same);
+            let last = extra || changed >= max;
+            // The MBA phase's questions that ran out of steps at the depth this round asked
+            // them (see `pass::mba::depth`) are asked deeper once the rounds have nothing left
+            // to do at this one: in a round over the same root where this one changed nothing
+            // (without the sweeps, and with that round's word on the root in place of this
+            // one's), and in one round past the strategy's last, at the full depth, where the
+            // rounds were still changing it.
+            //
+            // The words pass asks the same way, after them: in a round over a root the other
+            // phases left as it was (see `pass::words::State::turn`), and in that one round
+            // past the last.
+            let words = !self.words.turn
+                && inner
+                    .phases
+                    .iter()
+                    .any(|p| matches!(p, PhaseImpl::Pass(pass::PassKind::Words)));
+            self.words.turn = false;
+            if same {
+                if self.deepen(false) {
+                    (fin, again) = (before, true);
+                    continue;
+                }
+                if words {
+                    self.words.turn = true;
+                    (fin, again) = (before, true);
+                    continue;
+                }
                 return Ok((cur, fin));
             }
+            if last {
+                // (Both are asked for: neither short-circuits the other.)
+                let deeper = !extra && self.deepen(true);
+                if !extra && (deeper || words) {
+                    self.words.turn = words;
+                    (extra, again) = (true, false);
+                    continue;
+                }
+                break;
+            }
+            again = false;
         }
         self.stats.rounds_capped += 1;
         Ok((cur, fin))

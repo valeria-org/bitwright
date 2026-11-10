@@ -59,6 +59,10 @@
 //! not rest on that, but a defect of the pass would be seen there and the pass set aside for
 //! the call.
 //!
+//! The pass asks in a round over a root the other phases left as it was (the engine's
+//! `rounds`), and what it writes goes back to them: its reading is of the whole root, and a
+//! root they are still folding is not yet the one to read.
+//!
 //! The reading uses the facts (bounds and known bits) of the nodes, so a result relies on
 //! what they relied on. Coefficients, shifts, the terms of a form, the nodes under a root and
 //! the work of one question are bounded ([`form`] and [`write`]): past a bound a node is the
@@ -106,6 +110,13 @@ pub(crate) struct State {
     work: u64,
     /// The work of second questions whose answers were not taken (see `ask`).
     lost: u64,
+    /// Whether the pass asks in this round: only in one over a root the other phases left as
+    /// it was (see the engine's `rounds`). What it writes is a reading of the whole root, and
+    /// written while the other phases were still at work it took the forms their questions
+    /// read: in 140 measured calls over obfuscated code (no limb arithmetic in them) seven of
+    /// 47 constants and four of 16 proofs the opaque-constant sweep finds in a later round
+    /// were lost, at half again the time.
+    pub(crate) turn: bool,
 }
 
 impl State {
@@ -119,7 +130,8 @@ impl State {
 
 /// Whether the walk asks `n` before it walks `n`'s operands (see [`first`]).
 pub(crate) fn asks_first(r: &Runner<'_, '_>, cx: &Context, n: u32) -> bool {
-    !r.words.covered.contains(n)
+    r.words.turn
+        && !r.words.covered.contains(n)
         && r.words.large < MAX_LARGE
         && r.words.work < MAX_WORK
         && !matches!(cx.node(n).op, OpCode::Const | OpCode::Sym)

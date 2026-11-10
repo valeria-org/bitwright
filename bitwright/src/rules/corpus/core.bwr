@@ -68,6 +68,14 @@ group core.arith {
     #[example("(p | q) - p" => "q & ~p")]
     rule sub_or<W>(x: W, y: W) { (x | y) - x => y & ~x }
 
+    /// Likewise the bits a constant did not set, the subtraction written as an addition.
+    #[example("(p | 0xf0) + 0x10" => "p & 0x0f")]
+    rule add_or_const<W>(x: W, c: const W, k: const W) {
+        (x | c) + k => x & m
+        if c + k == 0
+        let m: W = ~c
+    }
+
     /// `-~x = x + 1`.
     #[example("-(~p)" => "p + 1")]
     rule neg_not<W>(x: W) { -(~x) => x + 1 }
@@ -83,6 +91,13 @@ group core.arith {
     /// An add without carries is an or.
     #[example("(p & 0xf0) + (q & 15)" => "(p & 0xf0) | (q & 15)")]
     rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }
+
+    /// A subtraction without borrows is a xor: the subtrahend has bits only where the
+    /// constant has them. (From all ones it is the complement, which the linear pass reads.)
+    #[example("0xf7 - (p & 0x35)" => "(p & 0x35) ^ 0xf7")]
+    rule sub_within<W>(x: W, c: const W) {
+        c - x => x ^ c if zero_bits(x, ~c) && c != ones
+    }
 
     /// Multiplying by a power of two is a shift.
     #[example("p * 8" => "p << 3")]
@@ -451,6 +466,29 @@ group core.casts {
     /// A sign extension of a value whose sign bit is clear is its zero extension.
     #[example("sext<16>(p & 127)" => "zext<16>(p & 127)")]
     rule sext_nonnegative<W, U>(x: W) where W < U { sext<U>(x) => zext<U>(x) if zero_bits(x, smin_lit) }
+    /// The complement of a slice of a complement is the slice.
+    #[example("~extract<3, 2>(~p)" => "extract<3, 2>(p)")]
+    rule not_extract_not<W, K, N>(x: W) where 0 < K, K + N <= W { ~extract<K, N>(~x) => extract<K, N>(x) }
+    #[example("~trunc<4>(~p)" => "trunc<4>(p)")]
+    rule not_trunc_not<W, N>(x: W) where N < W { ~trunc<N>(~x) => trunc<N>(x) }
+    /// A select on a bit of a complement is the select on the bit, its sides swapped.
+    #[example("select(extract<3, 1>(~p), q, r)" => "select(extract<3, 1>(p), r, q)")]
+    rule select_bit_of_not<W, K, U>(x: W, a: U, b: U) where 0 < K, K < W {
+        select(extract<K, 1>(~x), a, b) => select(extract<K, 1>(x), b, a)
+    }
+    #[example("select(trunc<1>(~p), q, r)" => "select(trunc<1>(p), r, q)")]
+    rule select_low_bit_of_not<W, U>(x: W, a: U, b: U) where 1 < W {
+        select(trunc<1>(~x), a, b) => select(trunc<1>(x), b, a)
+    }
+    /// A mask inside the narrower of two zero extensions is taken at the operand's width.
+    #[example("zext<16>(zext<8>(p:4) & 5)" => "zext<16>(p:4 & 5)")]
+    rule zext_and_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(zext<U>(a) & c) => zext<V>(a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
+    #[example("zext<16>(~zext<8>(p:4) & 5)" => "zext<16>(~p:4 & 5)")]
+    rule zext_and_not_zext<W, U, V>(a: W, c: const U) where W < U, U < V {
+        zext<V>(~zext<U>(a) & c) => zext<V>(~a & k) if (c & ~lowmask(W)) == 0 let k: W = trunc<W>(c)
+    }
     /// Through a truncation that drops only bits known zero, an equality with a constant is one
     /// of the whole value.
     #[example("trunc<4>(p & 15) == 3:4" => "(p & 15) == 3")]
@@ -498,6 +536,15 @@ group core.shift {
         (x >>u c) << c => x & m
         if (c <u W) && one_use(x >>u c)
         let m: W = ones << c
+    }
+
+    /// A sum shifted back: the constant's low bits carry nothing into what is kept.
+    #[example("((p << 3) + 0x1d) >>u 3" => "(p + 3) & 0x1f")]
+    rule lshr_add_shl<W>(x: W, c: const W, k: const W) {
+        ((x << c) + k) >>u c => (x + j) & m
+        if c <u W
+        let j: W = k >>u c
+        let m: W = ones >>u c
     }
 
     /// Two rotations by constants.
@@ -790,6 +837,16 @@ group core.guarded_recovery {
         (x >>u a) | (x << b) => rotr(x, a)
         if (a <u W) && (b <u W) && (a + b == W)
     }
+    /// The two shifts of a rotation by a count below the width (at zero the left shift by
+    /// the whole width gives nothing, and the value is itself).
+    #[example("((p & 15) >>u (q & 7)) | ((p & 15) << (8 - (q & 7)))" => "rotr(p & 15, q & 7)")]
+    rule variable_shift_rotate_right<W>(x: W, s: W) {
+        (x >>u s) | (x << (W - s)) => rotr(x, s) if proves(s <u W)
+    }
+    #[example("((p & 15) << (q & 7)) | ((p & 15) >>u (8 - (q & 7)))" => "rotl(p & 15, q & 7)")]
+    rule variable_shift_rotate_left<W>(x: W, s: W) {
+        (x << s) | (x >>u (W - s)) => rotl(x, s) if proves(s <u W)
+    }
     #[example("zext<16>(p) ^ 255:16" => "zext<16>(~p)")]
     rule xor_zext_lowmask<W, U>(x: W) where W < U {
         zext<U>(x) ^ lowmask(W) => zext<U>(~x)
@@ -1022,9 +1079,29 @@ group core.factor {
     /// Likewise over `^`.
     #[example("rotl(p, 3) ^ rotl(q, 3)" => "rotl(p ^ q, 3)")]
     rule rotl_xor<W>(x: W, y: W, s: W) { rotl(x, s) ^ rotl(y, s) => rotl(x ^ y, s) }
-    /// A rotation commutes with complement.
-    #[example("~rotl(~p, 3)" => "rotl(p, 3)")]
-    rule not_rotl_not<W>(x: W, s: W) { ~rotl(~x, s) => rotl(x, s) }
+    /// A rotation commutes with complement, which is kept outside it: a sum or a mask over
+    /// the rotated value reads it there, and two complements meet.
+    #[example("rotl(~p, 3)" => "~rotl(p, 3)")]
+    rule rotl_not<W>(x: W, s: W) { rotl(~x, s) => ~rotl(x, s) }
+    /// Likewise for a right rotation.
+    #[example("rotr(~p, q)" => "~rotr(p, q)")]
+    rule rotr_not<W>(x: W, s: W) { rotr(~x, s) => ~rotr(x, s) }
+    /// A constant under a rotation by a constant is rotated once and for all, so two
+    /// rotations around it are one.
+    #[example("rotl(p ^ 0x0f, 4)" => "rotl(p, 4) ^ 0xf0")]
+    rule rotl_xor_const<W>(x: W, c: const W, s: const W) {
+        rotl(x ^ c, s) => rotl(x, s) ^ rotl(c, s)
+    }
+    /// Likewise under `&`.
+    #[example("rotl(p & 0x0f, 4)" => "rotl(p, 4) & 0xf0")]
+    rule rotl_and_const<W>(x: W, c: const W, s: const W) {
+        rotl(x & c, s) => rotl(x, s) & rotl(c, s)
+    }
+    /// Likewise under `|`.
+    #[example("rotl(p | 0x0f, 4)" => "rotl(p, 4) | 0xf0")]
+    rule rotl_or_const<W>(x: W, c: const W, s: const W) {
+        rotl(x | c, s) => rotl(x, s) | rotl(c, s)
+    }
     /// Zero extension distributes over `&`.
     #[example("zext<16>(p) & zext<16>(q)" => "zext<16>(p & q)")]
     rule zext_and<W, U>(x: W, y: W) where W < U { zext<U>(x) & zext<U>(y) => zext<U>(x & y) }
@@ -1135,6 +1212,25 @@ group core.select_idioms {
     /// The same condition again in the other arm.
     #[example("select(p <u q, r, select(p <u q, p, q))" => "select(p <u q, r, q)")]
     rule select_else_same<W>(c: 1, x: W, y: W, z: W) { select(c, x, select(c, y, z)) => select(c, x, z) }
+    /// The opposite comparison in the chosen arm: there it does not hold.
+    #[example("select(p != q, select(p == q, r, s), t)" => "select(p != q, s, t)")]
+    rule select_then_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, select(a == b, x, y), z) => select(a != b, y, z)
+    }
+    /// The opposite comparison in the other arm: there it holds.
+    #[example("select(p != q, r, select(p == q, s, t))" => "select(p != q, r, s)")]
+    rule select_else_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, x, select(a == b, y, z)) => select(a != b, x, y)
+    }
+    /// Likewise under an equality.
+    #[example("select(p == q, select(p != q, r, s), t)" => "select(p == q, s, t)")]
+    rule select_then_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, select(a != b, x, y), z) => select(a == b, y, z)
+    }
+    #[example("select(p == q, r, select(p != q, s, t))" => "select(p == q, r, s)")]
+    rule select_else_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, x, select(a != b, y, z)) => select(a == b, x, y)
+    }
     /// Choosing `x` when it equals `y`, else `y`: always `y` (`==` is commutative, so this is
     /// also `select(y == x, x, y)`).
     #[example("select(p == q, p, q)" => "q")]
@@ -1306,6 +1402,14 @@ group core.concat {
     /// extension.
     #[example("concat(p >>s 7, p)" => "sext<16>(p)")]
     rule concat_sign_shift<W>(x: W) where W + W <= 512 { concat(x >>s (W - 1), x) => sext<W + W>(x) }
+    /// A slice and the low bit of one value, extended and put back where they were, are the
+    /// value under a mask.
+    #[example("concat(zext<12>(extract<4, 2>(p)), zext<4>(trunc<1>(p)))" => "zext<16>(p & 0x31)")]
+    rule concat_slice_and_bit_in_place<W, A, K, N>(y: W)
+        where 1 < K, K + N <= W, N < A, W < A + K, A + K <= 512 {
+        concat(zext<A>(extract<K, N>(y)), zext<K>(trunc<1>(y))) => zext<A + K>(y & m)
+        let m: W = 1 | (lowmask(N) << K)
+    }
     /// A constant added to the high part of a value is added to the value, shifted.
     #[example("concat(extract<4, 4>(p) + 1, trunc<4>(p))" => "p + 16")]
     rule concat_hi_add<H, L>(x: H + L, c: const H) where H + L <= 512 {

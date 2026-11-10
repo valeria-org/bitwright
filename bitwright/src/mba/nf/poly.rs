@@ -7,10 +7,10 @@
 //! exact).
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
+use std::collections::btree_map::{self, Entry};
 
 use super::classes::{Classes, FULL};
-use crate::facts::known::low_mask;
+use super::word::low_mask;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
@@ -21,8 +21,394 @@ pub(crate) struct Sym {
     pub(crate) class: u16,
 }
 
-/// A product of symbols: ascending symbols with positive exponents. Empty for the constant.
-pub(crate) type Mono = Vec<(Sym, u32)>;
+/// The factors a monomial holds in place: almost every monomial is one symbol or a product of
+/// two.
+const FEW_FACTORS: usize = 2;
+
+/// A product of symbols: ascending symbols with positive exponents. Empty for the constant. It
+/// reads as the slice of its factors, and compares and hashes as that slice does; up to
+/// [`FEW_FACTORS`] factors need no allocation.
+#[derive(Clone, Debug)]
+pub(crate) struct Mono(Factors);
+
+#[derive(Clone, Debug)]
+enum Factors {
+    /// The first `.0` of `.1`.
+    Few(u8, [(Sym, u32); FEW_FACTORS]),
+    Many(Vec<(Sym, u32)>),
+}
+
+/// What an unused place of [`Factors::Few`] holds (never read).
+const NO_FACTOR: (Sym, u32) = (Sym { set: 0, class: 0 }, 0);
+
+impl Mono {
+    /// The empty monomial (the constant's).
+    pub(crate) const fn new() -> Mono {
+        Mono(Factors::Few(0, [NO_FACTOR; FEW_FACTORS]))
+    }
+
+    /// `s^e`.
+    pub(crate) const fn of(s: Sym, e: u32) -> Mono {
+        let mut at = [NO_FACTOR; FEW_FACTORS];
+        at[0] = (s, e);
+        Mono(Factors::Few(1, at))
+    }
+
+    /// Adds a factor at the end (the caller keeps the symbols ascending).
+    pub(crate) fn push(&mut self, f: (Sym, u32)) {
+        match &mut self.0 {
+            Factors::Few(n, at) => match at.get_mut(usize::from(*n)) {
+                Some(slot) => {
+                    *slot = f;
+                    *n += 1;
+                }
+                None => {
+                    let mut v = Vec::with_capacity(2 * FEW_FACTORS);
+                    v.extend_from_slice(at);
+                    v.push(f);
+                    self.0 = Factors::Many(v);
+                }
+            },
+            Factors::Many(v) => v.push(f),
+        }
+    }
+
+    /// The factors.
+    pub(crate) fn as_slice(&self) -> &[(Sym, u32)] {
+        match &self.0 {
+            Factors::Few(n, at) => &at[..usize::from(*n)],
+            Factors::Many(v) => v,
+        }
+    }
+}
+
+impl core::ops::Deref for Mono {
+    type Target = [(Sym, u32)];
+    fn deref(&self) -> &[(Sym, u32)] {
+        self.as_slice()
+    }
+}
+
+impl core::ops::DerefMut for Mono {
+    fn deref_mut(&mut self) -> &mut [(Sym, u32)] {
+        match &mut self.0 {
+            Factors::Few(n, at) => &mut at[..usize::from(*n)],
+            Factors::Many(v) => v,
+        }
+    }
+}
+
+impl PartialEq for Mono {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Mono {}
+
+impl Ord for Mono {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl PartialOrd for Mono {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl core::hash::Hash for Mono {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        self.as_slice().hash(h);
+    }
+}
+
+impl FromIterator<(Sym, u32)> for Mono {
+    fn from_iter<I: IntoIterator<Item = (Sym, u32)>>(factors: I) -> Mono {
+        let mut m = Mono::new();
+        for f in factors {
+            m.push(f);
+        }
+        m
+    }
+}
+
+impl<'a> IntoIterator for &'a Mono {
+    type Item = &'a (Sym, u32);
+    type IntoIter = core::slice::Iter<'a, (Sym, u32)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+/// The most terms kept as a sorted vector (see [`Terms`]).
+const FEW_TERMS: usize = 64;
+
+/// A polynomial's monomials with their coefficients, ascending by monomial: a sorted vector
+/// while there are few (nearly always: one allocation, and a clone is a copy), a tree beyond
+/// [`FEW_TERMS`], where inserting into a vector would cost its length. Which of the two holds
+/// the terms is not part of the value: equality and hashing read the terms.
+#[derive(Clone, Debug)]
+pub(crate) enum Terms {
+    Few(Vec<(Mono, BitVec)>),
+    Many(BTreeMap<Mono, BitVec>),
+}
+
+impl Default for Terms {
+    fn default() -> Terms {
+        Terms::Few(Vec::new())
+    }
+}
+
+impl PartialEq for Terms {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Terms::Few(a), Terms::Few(b)) => a == b,
+            _ => self.len() == other.len() && self.iter().eq(other.iter()),
+        }
+    }
+}
+
+impl Eq for Terms {}
+
+impl core::hash::Hash for Terms {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        h.write_usize(self.len());
+        for (m, c) in self.iter() {
+            m.hash(h);
+            c.limbs().hash(h);
+        }
+    }
+}
+
+/// The terms of a polynomial in ascending order of monomial.
+#[derive(Clone)]
+pub(crate) enum TermsIter<'a> {
+    Few(core::slice::Iter<'a, (Mono, BitVec)>),
+    Many(btree_map::Iter<'a, Mono, BitVec>),
+}
+
+impl<'a> Iterator for TermsIter<'a> {
+    type Item = (&'a Mono, &'a BitVec);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            TermsIter::Few(i) => i.next().map(|(m, c)| (m, c)),
+            TermsIter::Many(i) => i.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            TermsIter::Few(i) => i.size_hint(),
+            TermsIter::Many(i) => i.size_hint(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for TermsIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            TermsIter::Few(i) => i.next_back().map(|(m, c)| (m, c)),
+            TermsIter::Many(i) => i.next_back(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Terms {
+    type Item = (&'a Mono, &'a BitVec);
+    type IntoIter = TermsIter<'a>;
+    fn into_iter(self) -> TermsIter<'a> {
+        self.iter()
+    }
+}
+
+/// The terms of a polynomial by value, in ascending order of monomial.
+pub(crate) enum TermsIntoIter {
+    Few(std::vec::IntoIter<(Mono, BitVec)>),
+    Many(btree_map::IntoIter<Mono, BitVec>),
+}
+
+impl Iterator for TermsIntoIter {
+    type Item = (Mono, BitVec);
+    fn next(&mut self) -> Option<(Mono, BitVec)> {
+        match self {
+            TermsIntoIter::Few(i) => i.next(),
+            TermsIntoIter::Many(i) => i.next(),
+        }
+    }
+}
+
+impl IntoIterator for Terms {
+    type Item = (Mono, BitVec);
+    type IntoIter = TermsIntoIter;
+    fn into_iter(self) -> TermsIntoIter {
+        match self {
+            Terms::Few(v) => TermsIntoIter::Few(v.into_iter()),
+            Terms::Many(t) => TermsIntoIter::Many(t.into_iter()),
+        }
+    }
+}
+
+/// From terms in any order; of several with one monomial the last counts (as a map collects).
+impl FromIterator<(Mono, BitVec)> for Terms {
+    fn from_iter<I: IntoIterator<Item = (Mono, BitVec)>>(terms: I) -> Terms {
+        let mut v: Vec<(Mono, BitVec)> = terms.into_iter().collect();
+        if !v.is_sorted_by(|a, b| a.0 < b.0) {
+            // Stable: equal monomials stay in their order, and the last of each is kept.
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut kept: Vec<(Mono, BitVec)> = Vec::with_capacity(v.len());
+            for t in v {
+                match kept.last_mut() {
+                    Some(last) if last.0 == t.0 => *last = t,
+                    _ => kept.push(t),
+                }
+            }
+            v = kept;
+        }
+        Terms::from_sorted(v)
+    }
+}
+
+impl Terms {
+    /// From terms in strictly ascending order of monomial.
+    fn from_sorted(v: Vec<(Mono, BitVec)>) -> Terms {
+        if v.len() > FEW_TERMS {
+            Terms::Many(v.into_iter().collect())
+        } else {
+            Terms::Few(v)
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Terms::Few(v) => v.len(),
+            Terms::Many(t) => t.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn iter(&self) -> TermsIter<'_> {
+        match self {
+            Terms::Few(v) => TermsIter::Few(v.iter()),
+            Terms::Many(t) => TermsIter::Many(t.iter()),
+        }
+    }
+
+    pub(crate) fn keys(&self) -> impl DoubleEndedIterator<Item = &Mono> + Clone + '_ {
+        self.iter().map(|(m, _)| m)
+    }
+
+    pub(crate) fn values(&self) -> impl DoubleEndedIterator<Item = &BitVec> + Clone + '_ {
+        self.iter().map(|(_, c)| c)
+    }
+
+    /// Where `m` is among few terms, or where it would go.
+    #[inline]
+    fn place(v: &[(Mono, BitVec)], m: &Mono) -> Result<usize, usize> {
+        // Terms mostly arrive in ascending order: past the last one first.
+        match v.last() {
+            None => Err(0),
+            Some(last) => match last.0.cmp(m) {
+                core::cmp::Ordering::Less => Err(v.len()),
+                core::cmp::Ordering::Equal => Ok(v.len() - 1),
+                core::cmp::Ordering::Greater => v[..v.len() - 1].binary_search_by(|t| t.0.cmp(m)),
+            },
+        }
+    }
+
+    pub(crate) fn get(&self, m: &Mono) -> Option<&BitVec> {
+        match self {
+            Terms::Few(v) => Self::place(v, m).ok().map(|i| &v[i].1),
+            Terms::Many(t) => t.get(m),
+        }
+    }
+
+    pub(crate) fn contains_key(&self, m: &Mono) -> bool {
+        self.get(m).is_some()
+    }
+
+    /// The coefficient of the least monomial.
+    fn first(&self) -> Option<(&Mono, &BitVec)> {
+        match self {
+            Terms::Few(v) => v.first().map(|(m, c)| (m, c)),
+            Terms::Many(t) => t.iter().next(),
+        }
+    }
+
+    /// The tree, once there are too many terms for a vector.
+    fn spill(&mut self) -> &mut BTreeMap<Mono, BitVec> {
+        if let Terms::Few(v) = self {
+            *self = Terms::Many(core::mem::take(v).into_iter().collect());
+        }
+        match self {
+            Terms::Many(t) => t,
+            // Not reached: `self` was just made a tree.
+            Terms::Few(_) => unreachable!("spilled terms are a tree"),
+        }
+    }
+
+    /// Adds `c` (not zero) to the coefficient of `m`; a term whose coefficient becomes zero
+    /// goes.
+    fn add(&mut self, m: Mono, c: &BitVec) {
+        match self {
+            Terms::Few(v) => match Self::place(v, &m) {
+                Ok(i) => {
+                    let s = add(&v[i].1, c);
+                    if s.is_zero() {
+                        v.remove(i);
+                    } else {
+                        v[i].1 = s;
+                    }
+                }
+                Err(i) if v.len() < FEW_TERMS => v.insert(i, (m, *c)),
+                Err(_) => {
+                    self.spill().insert(m, *c);
+                }
+            },
+            Terms::Many(t) => match t.entry(m) {
+                Entry::Vacant(v) => {
+                    v.insert(*c);
+                }
+                Entry::Occupied(mut o) => {
+                    let s = add(o.get(), c);
+                    if s.is_zero() {
+                        o.remove();
+                    } else {
+                        *o.get_mut() = s;
+                    }
+                }
+            },
+        }
+    }
+
+    fn remove(&mut self, m: &Mono) {
+        match self {
+            Terms::Few(v) => {
+                if let Ok(i) = Self::place(v, m) {
+                    v.remove(i);
+                }
+            }
+            Terms::Many(t) => {
+                t.remove(m);
+            }
+        }
+    }
+
+    /// Keeps the terms `keep` accepts, in ascending order of monomial (it may change their
+    /// coefficients).
+    fn retain(&mut self, mut keep: impl FnMut(&Mono, &mut BitVec) -> bool) {
+        match self {
+            Terms::Few(v) => v.retain_mut(|(m, c)| keep(m, c)),
+            Terms::Many(t) => t.retain(|m, c| keep(m, c)),
+        }
+    }
+}
 
 /// The total degree of a monomial.
 pub(crate) fn degree(m: &Mono) -> u32 {
@@ -31,7 +417,7 @@ pub(crate) fn degree(m: &Mono) -> u32 {
 
 /// The product of two monomials.
 pub(crate) fn mono_mul(a: &Mono, b: &Mono) -> Mono {
-    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut out = Mono::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() || j < b.len() {
         match (a.get(i), b.get(j)) {
@@ -60,7 +446,7 @@ pub(crate) fn mono_mul(a: &Mono, b: &Mono) -> Mono {
 
 /// `a / b` when `b` divides `a` exponent-wise.
 pub(crate) fn mono_div(a: &Mono, b: &Mono) -> Option<Mono> {
-    let mut out = Vec::with_capacity(a.len());
+    let mut out = Mono::new();
     let mut j = 0;
     for &(s, e) in a {
         if let Some(&(t, f)) = b.get(j)
@@ -132,15 +518,48 @@ impl PartialOrd for Graded {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Poly {
     w: Width,
-    terms: BTreeMap<Mono, BitVec>,
+    terms: Terms,
 }
 
 fn add(a: &BitVec, b: &BitVec) -> BitVec {
-    BitVec::bin_unchecked(BinOp::Add, a, b)
+    super::word::bin(BinOp::Add, a, b)
+}
+
+/// The terms of `a + b`, or of `a − b`, both ascending: one pass over the two.
+fn merged(a: &[(Mono, BitVec)], b: &[(Mono, BitVec)], minus: bool) -> Vec<(Mono, BitVec)> {
+    let of = |c: &BitVec| match minus {
+        true => super::word::un(UnOp::Neg, c),
+        false => *c,
+    };
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            core::cmp::Ordering::Less => {
+                out.push(a[i].clone());
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                out.push((b[j].0.clone(), of(&b[j].1)));
+                j += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                let s = add(&a[i].1, &of(&b[j].1));
+                if !s.is_zero() {
+                    out.push((a[i].0.clone(), s));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend(a[i..].iter().cloned());
+    out.extend(b[j..].iter().map(|(m, c)| (m.clone(), of(c))));
+    out
 }
 
 fn mul(a: &BitVec, b: &BitVec) -> BitVec {
-    BitVec::bin_unchecked(BinOp::Mul, a, b)
+    super::word::bin(BinOp::Mul, a, b)
 }
 
 /// `v₂(n!)` (Legendre).
@@ -152,18 +571,29 @@ fn v2_factorial(n: u32) -> u32 {
 /// leaves `c` as it is, `m = 0` gives 0).
 pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
     let w = c.width();
-    if m >= u32::from(w.bits()) {
+    let bits = u32::from(w.bits());
+    if m >= bits {
         return *c;
     }
     if m == 0 {
         return BitVec::zero(w);
     }
-    let t = crate::facts::known::bv_and(c, &low_mask(w, m));
-    let half = crate::facts::known::bv_shl(&BitVec::one(w), m - 1);
+    if bits <= 64 {
+        // In one word (`0 < m < bits`).
+        let t = c.limbs()[0] & (u64::MAX >> (64 - m));
+        let r = if t > 1u64 << (m - 1) {
+            t.wrapping_sub(1u64 << m) & (u64::MAX >> (64 - bits))
+        } else {
+            t
+        };
+        return BitVec::from_canonical_u64(w, r);
+    }
+    let t = super::word::bv_and(c, &low_mask(w, m));
+    let half = super::word::bv_shl(&super::word::one(w), m - 1);
     if BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &half, &t) {
         // t − 2^m, mod 2^W.
-        let full = crate::facts::known::bv_shl(&BitVec::one(w), m);
-        BitVec::bin_unchecked(BinOp::Sub, &t, &full)
+        let full = super::word::bv_shl(&super::word::one(w), m);
+        super::word::bin(BinOp::Sub, &t, &full)
     } else {
         t
     }
@@ -172,14 +602,14 @@ pub(crate) fn signed_rep(c: &BitVec, m: u32) -> BitVec {
 /// The signed Stirling numbers of the first kind `s(e, j)`, `j = 0..=e`, mod 2^W:
 /// `(x)_e = Σ_j s(e, j)·x^j`.
 fn stirling1(e: u32, w: Width) -> Vec<BitVec> {
-    let mut row = vec![BitVec::one(w)];
+    let mut row = vec![super::word::one(w)];
     for n in 0..e {
         // s(n+1, k) = s(n, k−1) − n·s(n, k).
-        let nn = BitVec::wrapping_from_u64(w, u64::from(n));
+        let nn = super::word::small(w, u64::from(n));
         let mut next = vec![BitVec::zero(w); row.len() + 1];
         for (k, s) in row.iter().enumerate() {
             next[k + 1] = add(&next[k + 1], s);
-            next[k] = BitVec::bin_unchecked(BinOp::Sub, &next[k], &mul(&nn, s));
+            next[k] = super::word::bin(BinOp::Sub, &next[k], &mul(&nn, s));
         }
         row = next;
     }
@@ -190,13 +620,13 @@ impl Poly {
     pub(crate) fn zero(w: Width) -> Poly {
         Poly {
             w,
-            terms: BTreeMap::new(),
+            terms: Terms::default(),
         }
     }
 
     pub(crate) fn constant(v: BitVec) -> Poly {
         let mut p = Poly::zero(v.width());
-        p.add_term(Vec::new(), &v);
+        p.add_term(Mono::new(), &v);
         p
     }
 
@@ -209,14 +639,14 @@ impl Poly {
 
     /// A symbol, coefficient 1.
     pub(crate) fn sym(w: Width, s: Sym) -> Poly {
-        Poly::term(w, vec![(s, 1)], &BitVec::one(w))
+        Poly::term(w, Mono::of(s, 1), &super::word::one(w))
     }
 
     pub(crate) fn width(&self) -> Width {
         self.w
     }
 
-    pub(crate) fn terms(&self) -> &BTreeMap<Mono, BitVec> {
+    pub(crate) fn terms(&self) -> &Terms {
         &self.terms
     }
 
@@ -230,10 +660,11 @@ impl Poly {
 
     /// The constant term.
     pub(crate) fn konst(&self) -> BitVec {
-        self.terms
-            .get(&Vec::new())
-            .copied()
-            .unwrap_or(BitVec::zero(self.w))
+        // The empty monomial is the least.
+        match self.terms.first() {
+            Some((m, c)) if m.is_empty() => *c,
+            _ => BitVec::zero(self.w),
+        }
     }
 
     /// The largest total degree (0 for a constant).
@@ -309,11 +740,10 @@ impl Poly {
             .iter()
             .filter(|(m, _)| !m.is_empty())
             .map(|(m, c)| {
-                m.iter()
-                    .fold(crate::facts::known::trailing_zeros(c), |k, &(s, e)| {
-                        let low = u32::from(classes.low(usize::from(s.class)));
-                        k.saturating_add(low.saturating_mul(e))
-                    })
+                m.iter().fold(super::word::trailing_zeros(c), |k, &(s, e)| {
+                    let low = u32::from(classes.low(usize::from(s.class)));
+                    k.saturating_add(low.saturating_mul(e))
+                })
             })
             .min()
             .unwrap_or(bits)
@@ -327,7 +757,7 @@ impl Poly {
     /// modulo `2^(W − v₂(d))`, which then fixes `c·d'` for every other term). `None` otherwise,
     /// or when `def` mentions `a` or is a constant.
     pub(crate) fn substitute(&self, a: u32, def: &Poly) -> Option<Poly> {
-        use crate::facts::known::{bv_lshr, trailing_zeros};
+        use super::word::{bv_lshr, trailing_zeros};
         let bits = u32::from(self.w.bits());
         if a >= 64 || def.atoms() >> a & 1 == 1 || def.w != self.w {
             return None;
@@ -347,13 +777,13 @@ impl Poly {
         }
         let mut out = self.sub(&def.scale(&c));
         out.add_term(
-            vec![(
+            Mono::of(
                 Sym {
                     set: 1 << a,
                     class: FULL,
                 },
                 1,
-            )],
+            ),
             &c,
         );
         Some(out)
@@ -363,7 +793,7 @@ impl Poly {
     /// equal to it: `None` past `limit` monomials.
     pub(crate) fn replace(&self, s: Sym, r: &Poly, limit: usize) -> Option<Poly> {
         let mut out = Poly::zero(self.w);
-        let mut powers: Vec<Poly> = vec![Poly::constant(BitVec::one(self.w))];
+        let mut powers: Vec<Poly> = vec![Poly::constant(super::word::one(self.w))];
         for (m, c) in &self.terms {
             let e = m.iter().find(|&&(t, _)| t == s).map_or(0, |&(_, e)| e);
             let rest: Mono = m.iter().copied().filter(|&(t, _)| t != s).collect();
@@ -390,7 +820,7 @@ impl Poly {
         self.terms
             .iter()
             .filter(|(m, _)| !m.is_empty())
-            .min_by_key(|(_, c)| crate::facts::known::trailing_zeros(c))
+            .min_by_key(|(_, c)| super::word::trailing_zeros(c))
     }
 
     /// The terms whose degree satisfies `keep`.
@@ -411,22 +841,16 @@ impl Poly {
         if c.is_zero() {
             return;
         }
-        match self.terms.entry(m) {
-            std::collections::btree_map::Entry::Vacant(v) => {
-                v.insert(*c);
-            }
-            std::collections::btree_map::Entry::Occupied(mut o) => {
-                let s = add(o.get(), c);
-                if s.is_zero() {
-                    o.remove();
-                } else {
-                    *o.get_mut() = s;
-                }
-            }
-        }
+        self.terms.add(m, c);
     }
 
     pub(crate) fn add(&self, o: &Poly) -> Poly {
+        if let (Terms::Few(a), Terms::Few(b)) = (&self.terms, &o.terms) {
+            return Poly {
+                w: self.w,
+                terms: Terms::from_sorted(merged(a, b, false)),
+            };
+        }
         let (mut big, small) = if self.len() >= o.len() {
             (self.clone(), o)
         } else {
@@ -439,10 +863,11 @@ impl Poly {
     }
 
     pub(crate) fn scale(&self, k: &BitVec) -> Poly {
-        let mut out = Poly::zero(self.w);
-        for (m, c) in &self.terms {
-            out.add_term(m.clone(), &mul(c, k));
-        }
+        let mut out = self.clone();
+        out.terms.retain(|_, c| {
+            *c = mul(c, k);
+            !c.is_zero()
+        });
         out
     }
 
@@ -451,6 +876,12 @@ impl Poly {
     }
 
     pub(crate) fn sub(&self, o: &Poly) -> Poly {
+        if let (Terms::Few(a), Terms::Few(b)) = (&self.terms, &o.terms) {
+            return Poly {
+                w: self.w,
+                terms: Terms::from_sorted(merged(a, b, true)),
+            };
+        }
         self.add(&o.neg())
     }
 
@@ -513,7 +944,7 @@ impl Poly {
                 }
                 match rest.entry(Graded(mono_mul(&qm, n))) {
                     Entry::Occupied(mut e) => {
-                        let r = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        let r = super::word::bin(BinOp::Sub, e.get(), &v);
                         if r.is_zero() {
                             e.remove();
                         } else {
@@ -521,7 +952,7 @@ impl Poly {
                         }
                     }
                     Entry::Vacant(e) => {
-                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                        e.insert(super::word::un(UnOp::Neg, &v));
                     }
                 }
             }
@@ -564,7 +995,7 @@ impl Poly {
                 }
                 match rest.entry(Graded(mono_mul(&qm, n))) {
                     Entry::Occupied(mut e) => {
-                        let x = BitVec::bin_unchecked(BinOp::Sub, e.get(), &v);
+                        let x = super::word::bin(BinOp::Sub, e.get(), &v);
                         if x.is_zero() {
                             e.remove();
                         } else {
@@ -572,7 +1003,7 @@ impl Poly {
                         }
                     }
                     Entry::Vacant(e) => {
-                        e.insert(BitVec::un_unchecked(UnOp::Neg, &v));
+                        e.insert(super::word::un(UnOp::Neg, &v));
                     }
                 }
             }
@@ -583,18 +1014,26 @@ impl Poly {
 
     /// The one-position rule: a symbol of a class with the single position `j` takes only the
     /// values 0 and `2^j`, so `m^e = 2^{j(e−1)}·m`.
-    pub(crate) fn single_positions(&mut self, classes: &Classes) {
+    ///
+    /// Whether anything changed.
+    pub(crate) fn single_positions(&mut self, classes: &Classes) -> bool {
         let bits = u32::from(self.w.bits());
-        if (0..classes.len()).any(|c| classes.single(c).is_some()) {
+        let powered = |m: &Mono| {
+            m.iter()
+                .any(|&(s, e)| e > 1 && classes.single(usize::from(s.class)).is_some())
+        };
+        let any = (0..classes.len()).any(|c| classes.single(c).is_some())
+            && self.terms.keys().any(powered);
+        if any {
             let old = std::mem::take(&mut self.terms);
             for (m, c) in old {
                 let mut k = c;
-                let mut out: Mono = Vec::with_capacity(m.len());
-                for (s, e) in m {
+                let mut out = Mono::new();
+                for &(s, e) in &m {
                     match classes.single(usize::from(s.class)) {
                         Some(j) if e > 1 => {
                             let sh = u32::from(j).saturating_mul(e - 1).min(bits);
-                            k = crate::facts::known::bv_shl(&k, sh);
+                            k = super::word::bv_shl(&k, sh);
                             out.push((s, 1));
                         }
                         _ => out.push((s, e)),
@@ -603,6 +1042,7 @@ impl Poly {
                 self.add_term(out, &k);
             }
         }
+        any
     }
 
     /// Exact, cheap reductions, applied in place (also
@@ -622,47 +1062,45 @@ impl Poly {
         let w = self.w;
         let bits = u32::from(w.bits());
         let top = self.degree();
-        for d in (0..=top).rev() {
-            let monos: Vec<Mono> = self
-                .terms
-                .keys()
-                .filter(|m| degree(m) == d)
-                .cloned()
-                .collect();
-            for m in monos {
-                let Some(c) = self.terms.get(&m).copied() else {
-                    continue;
-                };
+        // What the terms of one degree move into lower monomials: added once the degree is
+        // done (nothing of a degree moves into its own). The constant has nothing to reduce.
+        let mut moves: Vec<(Mono, BitVec)> = Vec::new();
+        for d in (1..=top).rev() {
+            self.terms.retain(|m, c| {
+                if degree(m) != d {
+                    return true;
+                }
                 let tau: u32 = m
                     .iter()
                     .map(|&(s, e)| u32::from(classes.low(usize::from(s.class))).saturating_mul(e))
                     .fold(0u32, u32::saturating_add);
                 if tau >= bits {
-                    self.terms.remove(&m);
-                    continue;
+                    return false;
                 }
                 let m1 = bits - tau;
                 let v: u32 = m.iter().map(|&(_, e)| v2_factorial(e)).sum();
                 let m2 = bits.saturating_sub(v);
                 if m1 <= m2 {
-                    let r = signed_rep(&c, m1);
-                    self.set(&m, r);
-                    continue;
+                    *c = signed_rep(c, m1);
+                    return !c.is_zero();
                 }
-                let r = signed_rep(&c, m2);
-                self.set(&m, r);
+                let r = signed_rep(c, m2);
                 // Move c − r (a multiple of 2^m2) times the lower terms of (x)_κ.
-                let moved = BitVec::bin_unchecked(BinOp::Sub, &c, &r);
-                if moved.is_zero() {
-                    continue;
+                let moved = super::word::bin(BinOp::Sub, c, &r);
+                if !moved.is_zero() {
+                    moves.push((m.clone(), moved));
                 }
+                *c = r;
+                !c.is_zero()
+            });
+            for (m, moved) in moves.drain(..) {
                 let rows: Vec<Vec<BitVec>> = m.iter().map(|&(_, e)| stirling1(e, w)).collect();
                 let mut idx: Vec<u32> = m.iter().map(|_| 1).collect();
                 loop {
-                    let is_top = idx.iter().zip(&m).all(|(&j, &(_, e))| j == e);
+                    let is_top = idx.iter().zip(m.iter()).all(|(&j, &(_, e))| j == e);
                     if !is_top {
-                        let mut coef = BitVec::un_unchecked(UnOp::Neg, &moved);
-                        let mut mono: Mono = Vec::with_capacity(m.len());
+                        let mut coef = super::word::un(UnOp::Neg, &moved);
+                        let mut mono = Mono::new();
                         for (k, &(s, _)) in m.iter().enumerate() {
                             coef = mul(&coef, &rows[k][idx[k] as usize]);
                             mono.push((s, idx[k]));
@@ -715,7 +1153,7 @@ impl Poly {
                                 set: s.set,
                                 class: cl as u16,
                             };
-                            next.push((mono_mul(t, &vec![(sym, 1)]), *k));
+                            next.push((mono_mul(t, &Mono::of(sym, 1)), *k));
                         }
                     }
                     terms = next;
@@ -851,25 +1289,17 @@ impl Poly {
         }
         full.add(&rest)
     }
-
-    fn set(&mut self, m: &Mono, c: BitVec) {
-        if c.is_zero() {
-            self.terms.remove(m);
-        } else {
-            self.terms.insert(m.clone(), c);
-        }
-    }
 }
 
 /// The inverse of an odd value mod 2^W (Newton's iteration).
 pub(crate) fn odd_inverse(a: &BitVec) -> BitVec {
     let w = a.width();
-    let two = BitVec::wrapping_from_u64(w, 2);
+    let two = super::word::small(w, 2);
     let mut x = *a; // correct to 3 bits for odd a
     for _ in 0..10 {
         // x = x·(2 − a·x)
         let ax = mul(a, &x);
-        x = mul(&x, &BitVec::bin_unchecked(BinOp::Sub, &two, &ax));
+        x = mul(&x, &super::word::bin(BinOp::Sub, &two, &ax));
     }
     x
 }
@@ -888,7 +1318,7 @@ mod tests {
         };
         let mut p = Poly::zero(w);
         for _ in 0..n {
-            let mut m: Mono = Vec::new();
+            let mut m = Mono::new();
             for set in 1..4u64 {
                 let e = (next() % 3) as u32;
                 if e > 0 && degree(&m) + e <= 3 {
