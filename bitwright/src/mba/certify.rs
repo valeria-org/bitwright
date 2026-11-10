@@ -4465,7 +4465,23 @@ impl VarMap {
 /// up to 64 bits). Equal values give equal digests.
 fn digests(prog: &Program, points: &[Vec<BitVec>], nodes: usize) -> Vec<Vec<u64>> {
     match Kind::of(prog.widest()) {
-        Kind::N64 => digests_in::<u64>(prog, points, nodes, |x| *x),
+        Kind::N64 => {
+            // The values are the digests: when every node has its own register in order (a
+            // program that kept every node), the registers themselves, not a copy of each.
+            let n = points.len();
+            if n > 0 && nodes == prog.len() && (0..nodes).all(|i| prog.reg_of(i) == Some(i)) {
+                let nv = points.first().map_or(0, Vec::len);
+                let inputs: Vec<Vec<u64>> = (0..nv)
+                    .map(|v| points.iter().map(|p| <u64 as Lane>::from_bv(&p[v])).collect())
+                    .collect();
+                let mut regs: Vec<Vec<u64>> = Vec::new();
+                prog.run(&mut regs, &inputs, n);
+                if regs.len() == nodes && regs.iter().all(|r| r.len() == n) {
+                    return regs;
+                }
+            }
+            digests_in::<u64>(prog, points, nodes, |x| *x)
+        }
         Kind::N128 => digests_in::<u128>(prog, points, nodes, |x| {
             crate::hash::combine(*x as u64, (*x >> 64) as u64)
         }),
