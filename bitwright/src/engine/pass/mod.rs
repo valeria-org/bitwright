@@ -236,13 +236,17 @@ impl PassKind {
     }
 }
 
-/// Runs `kind` at `n`.
+/// Runs `kind` at `n`, unless a rewrite of its failed a postcondition earlier in the call: the
+/// pass is quarantined then, and the node's result not final.
 pub(super) fn step(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     kind: PassKind,
     n: u32,
 ) -> Result<Step, Stop> {
+    if r.quarantined_passes.contains(&kind) {
+        return Ok(Step::Normal(Fin::PROVISIONAL));
+    }
     r.stats.passes.entry(kind.name()).or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
     match kind {
@@ -592,21 +596,20 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// Use counts (parent edges) of the live DAG: counted once per phase run over the current
 /// version of every root of the call (nodes only replaced ones reach are not live), then kept
 /// up to date as nodes are created (counted) and replaced (uncounted, see `Runner::retire`). A
-/// node a counted node uses is counted too, so one replaced and then used again is live again.
+/// node a counted node uses is counted too, so one replaced and then used again is live again;
+/// and so is a node that takes another's place, which the arena may have held before the
+/// phase run, where no new node would count it.
 ///
 /// The roots other than the active one do not change while it is processed: their part is
 /// counted once per root ([`Live`]) and stands in every phase run in which none of the nodes
 /// they reach was retired (a count from scratch skips retired nodes, and what only they reach).
+/// Each count is a unit of pass work per node counted; a part that stands costs nothing.
 pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
     if !r.uses_on {
         r.live.clear();
         r.scratch.seen.begin(cx.len());
-        let others = others_hold(r, cx);
+        let others = others_hold(r, cx)?;
         let mut stack: Vec<u32> = if others {
-            if let Err(e) = charge_each(&mut r.meter, r.live.others.nodes as u64) {
-                r.live.clear();
-                return Err(e.into());
-            }
             // (Off when the other roots reach nothing: then it adds nothing.)
             r.live.base = r.live.others.nodes > 0;
             r.live_roots.get(r.active).copied().into_iter().collect()
@@ -641,6 +644,15 @@ pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), S
         .rev()
         .filter(|&i| !r.dead.contains(i) && !r.live.counted(i))
         .collect();
+    let arrived = std::mem::take(&mut r.live.arrived);
+    stack.extend(
+        arrived
+            .iter()
+            .copied()
+            .filter(|&i| !r.dead.contains(i) && !r.live.counted(i)),
+    );
+    r.live.arrived = arrived;
+    r.live.arrived.clear();
     while let Some(i) = stack.pop() {
         if !r.live.count(i) {
             continue;
@@ -655,17 +667,6 @@ pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), S
         }
     }
     r.uses_upto = len;
-    Ok(())
-}
-
-/// Charges `n` units of pass work as `n` charges of one would: on failure, what was left is
-/// spent.
-fn charge_each(meter: &mut crate::engine::budget::Meter, n: u64) -> Result<(), Exhausted> {
-    if meter.charge(Counter::PassWork, n).is_err() {
-        for _ in 0..n {
-            meter.charge(Counter::PassWork, 1)?;
-        }
-    }
     Ok(())
 }
 
@@ -684,6 +685,11 @@ pub(crate) struct Others {
 /// The use counts and the set of nodes whose edges they count ("counted"), for the commit
 /// rule: when `base` is on, the other roots' part ([`Others`]) with this phase run's changes on
 /// top, else the changes alone. Answers as one [`Counts`] and one [`Marks`] would.
+///
+/// A node that takes the place of another in a phase run ([`replace`](Live::replace)) is not
+/// yet used by the users of the one it replaced: the walk rebuilds them later. Their uses
+/// count for it meanwhile, or a node shared by several users would look like one a single
+/// rewrite could free until the last of them was rebuilt.
 #[derive(Default)]
 pub(crate) struct Live {
     others: Others,
@@ -695,9 +701,47 @@ pub(crate) struct Live {
     stamp: Vec<u32>,
     delta: Vec<i32>,
     epoch: u32,
+    /// Per node replaced in this phase run, the node that took its place.
+    heirs: crate::hash::IdMap<u32, u32>,
+    /// The nodes that took another's place since the last count (see `refresh_uses`).
+    arrived: Vec<u32>,
 }
 
 impl Live {
+    /// The longest chain of replacements followed.
+    const MAX_HEIRS: usize = 16;
+
+    /// Starts a phase run: [`clear`](Live::clear), and no node has taken the place of another.
+    pub(crate) fn begin(&mut self) {
+        self.heirs.clear();
+        self.arrived.clear();
+        self.clear();
+    }
+
+    /// `new` takes the place of `old`: the uses of `old` (by users not rebuilt yet) count for
+    /// `new` too, now and as they are counted or stop counting. Not when the chain of
+    /// replacements from `new` is long or leads back to `old`.
+    pub(crate) fn replace(&mut self, old: u32, new: u32) {
+        self.arrived.push(new);
+        let mut at = new;
+        for _ in 0..Self::MAX_HEIRS {
+            if at == old {
+                return;
+            }
+            match self.heirs.get(&at) {
+                Some(&next) => at = next,
+                None => {
+                    let uses = self.uses(old).unwrap_or(0);
+                    self.heirs.insert(old, new);
+                    if uses > 0 {
+                        self.change(new, uses as i32);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     /// Empties it: nothing counted, no uses, the base off.
     pub(crate) fn clear(&mut self) {
         self.base = false;
@@ -726,18 +770,28 @@ impl Live {
         (self.stamp.get(i) == Some(&self.epoch)).then(|| self.delta[i])
     }
 
+    /// Changes the uses of `i` by `by`, and so those of the nodes that took its place.
     #[inline]
-    fn change(&mut self, i: u32, by: i32) {
-        let i = i as usize;
-        if i >= self.stamp.len() {
-            self.stamp.resize(i + 1, 0);
-            self.delta.resize(i + 1, 0);
+    fn change(&mut self, mut i: u32, by: i32) {
+        loop {
+            let at = i as usize;
+            if at >= self.stamp.len() {
+                self.stamp.resize(at + 1, 0);
+                self.delta.resize(at + 1, 0);
+            }
+            if self.stamp[at] != self.epoch {
+                self.stamp[at] = self.epoch;
+                self.delta[at] = 0;
+            }
+            self.delta[at] += by;
+            if self.heirs.is_empty() {
+                return;
+            }
+            match self.heirs.get(&i) {
+                Some(&next) => i = next,
+                None => return,
+            }
         }
-        if self.stamp[i] != self.epoch {
-            self.stamp[i] = self.epoch;
-            self.delta[i] = 0;
-        }
-        self.delta[i] += by;
     }
 
     /// The uses of `i`, if it has a count.
@@ -799,12 +853,14 @@ impl Live {
     }
 }
 
-/// Whether the other roots' part holds in this phase run, counting it first if it is for
-/// another root: no node the other roots reach was retired in the run.
-fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
+/// Whether the other roots' part holds in this phase run, counting it first (a unit of pass
+/// work per node) if it is for another root: no node the other roots reach was retired in the
+/// run.
+fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> Result<bool, Exhausted> {
     let o = &mut r.live.others;
     if o.active != Some(r.active) {
-        o.active = Some(r.active);
+        // (For no root until it is counted whole: a budget may stop the count.)
+        o.active = None;
         // (Sized as they grow: often the other roots reach nothing.)
         o.reach.clear();
         o.uses.begin(0);
@@ -820,14 +876,16 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> bool {
             if !o.reach.insert(i) {
                 continue;
             }
+            r.meter.charge(Counter::PassWork, 1)?;
             o.nodes += 1;
             for c in cx.node(i).children() {
                 o.uses.add(c);
                 stack.push(c);
             }
         }
+        o.active = Some(r.active);
     }
-    !r.dead_log.iter().any(|&d| o.reach.contains(d))
+    Ok(!r.dead_log.iter().any(|&d| o.reach.contains(d)))
 }
 
 /// The region of `n`: the nodes reachable from it without entering `atoms`, at most
@@ -904,6 +962,8 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
 /// that stop being used; with `kept`, nodes in `r.scratch.kept` (reused by the replacement)
 /// stay. A truncated region gives a lower bound.
 ///
+/// A constant's uses from outside the region are never counted.
+///
 /// With `shared = false`, uses from outside the region are ignored: the count a context-free
 /// decision would make, used to tell whether a rejection depended on sharing.
 ///
@@ -926,8 +986,11 @@ fn dying_in(
     sc.dying.begin(cx.len());
     sc.decided.begin(cx.len());
     sc.dead.clear();
+    // A constant is counted as the region's own: whether some unrelated expression happens to
+    // use the same constant says nothing about this rewrite, and would make the decision
+    // depend on it (a constant rewrites nothing further, so nothing is undone by it).
     let uses = |sc: &Scratch, live: &Live, i: u32| {
-        if shared {
+        if shared && cx.node(i).op != OpCode::Const {
             live.uses(i)
         } else {
             sc.local.get(i)
@@ -1187,4 +1250,102 @@ pub(super) fn discard(r: &mut Runner<'_, '_>, cx: &Context, before: u32) {
     for i in before..cx.len() as u32 {
         r.retire(cx, i);
     }
+}
+
+/// The most operands of a chain put in order.
+pub(crate) const MAX_CHAIN: usize = 256;
+
+/// What [`sort_chain`] found a chain's node to be.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Chain {
+    /// As `sort_chain` writes its chain.
+    Sorted,
+    /// Of more than [`MAX_CHAIN`] operands.
+    Long,
+}
+
+/// The chain `n` of `·`, `&` or `|` over values (no constant among them) with its operands in
+/// the context's canonical order, joined left to right: one node for a chain however it was
+/// parenthesized and ordered, so `a·b·c − c·b·a` and `(a & b & … & g) ^ (g & … & b & a)`
+/// cancel. An operand of `&` or `|` is kept once, and one beside its complement decides the
+/// chain (0, or all-ones). The result is no larger than `n` unless a part of the chain has
+/// another use, and nothing rewrites it back, so it replaces `n` at the same size too.
+///
+/// `Step::Normal` when `n` is in order already, is not a chain of three operands or more, or
+/// has more than [`MAX_CHAIN`]. Both are remembered (`Runner::chains`): the chains a sorted
+/// one is made of are not read again, and a chain over a long one is long.
+pub(super) fn sort_chain(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+) -> Result<Step, Stop> {
+    let op = cx.node(n).op;
+    let bin = match op {
+        OpCode::Mul => crate::ops::BinOp::Mul,
+        OpCode::And => crate::ops::BinOp::And,
+        OpCode::Or => crate::ops::BinOp::Or,
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    if r.chains.contains_key(&n) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let mut operands = Vec::new();
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        let node = cx.node(i);
+        let inner = node.op == op && !cx.is_const(node.a) && !cx.is_const(node.b);
+        if inner && r.chains.get(&i) != Some(&Chain::Long) {
+            stack.push(node.b);
+            stack.push(node.a);
+        } else if inner || operands.len() == MAX_CHAIN {
+            r.chains.insert(n, Chain::Long);
+            r.meter.charge(Counter::PassWork, operands.len() as u64)?;
+            return Ok(Step::Normal(Fin::FINAL));
+        } else {
+            operands.push(i);
+        }
+    }
+    if operands.len() < 3 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    r.meter.charge(Counter::PassWork, operands.len() as u64)?;
+    operands.sort_by(|&a, &b| cx.order(a, b));
+    // (Equal in the order is the same node.)
+    let mut atoms = operands.clone();
+    atoms.dedup();
+    let before = cx.len() as u32;
+    let w = cx.width_of(n);
+    let decided = op != OpCode::Mul && {
+        let mut ids = atoms.clone();
+        ids.sort_unstable();
+        atoms.iter().any(|&a| {
+            let node = cx.node(a);
+            node.op == OpCode::Not && ids.binary_search(&node.a).is_ok()
+        })
+    };
+    let mut links = Vec::new();
+    let e = r.build(cx, |cx| {
+        if decided {
+            return cx.mk_const(&match op {
+                OpCode::And => crate::BitVec::zero(w),
+                _ => crate::BitVec::ones(w),
+            });
+        }
+        // A product keeps a repeated factor; `&` and `|` do not.
+        let chain = if op == OpCode::Mul { &operands } else { &atoms };
+        let mut e = chain[0];
+        for &f in &chain[1..] {
+            e = cx.c_bin(bin, e, f)?;
+            links.push(e);
+        }
+        Ok(e)
+    })?;
+    for l in links {
+        r.chains.insert(l, Chain::Sorted);
+    }
+    if e == n {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    finish_with(r, cx, kind, n, e, before, &atoms, Fin::FINAL, true)
 }

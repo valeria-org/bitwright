@@ -198,25 +198,314 @@ fn linear_cancels_additive_masking() {
     assert!(!eng.simplify(&mut cx, e).unwrap().changed);
 }
 
+/// `n` symbols `s0`, `s1`, … of width `w`.
+fn symbols(cx: &mut Context, n: usize, w: Width) -> Vec<Expr> {
+    (0..n)
+        .map(|i| cx.symbol(format!("s{i}").as_str(), w).unwrap())
+        .collect()
+}
+
+/// `terms` joined by `op`, left to right.
+fn chain(cx: &mut Context, op: BinOp, terms: &[Expr]) -> Expr {
+    terms[1..]
+        .iter()
+        .fold(terms[0], |e, &t| cx.bin(op, e, t).unwrap())
+}
+
+/// The symbols under `e`, and its distinct nodes.
+fn size(cx: &mut Context, e: Expr) -> (usize, u32) {
+    let nodes = match cx.dag_size(&[e], u32::MAX).unwrap() {
+        crate::Bounded::Exact(n) | crate::Bounded::AtLeast(n) => n,
+    };
+    (cx.symbols_in(&[e]).unwrap().len(), nodes)
+}
+
+/// A sum over a pass's cap on terms is an atom of the forms over it, and terms still cancel
+/// through it: in the linear pass's sums and in the xor pass's xors, at a width whose forms
+/// are kept as words and at one over 64 bits.
 #[test]
-fn linear_atomizes_huge_forms() {
-    let eng = engine(vec![Phase::Linear]);
-    let mut cx = Context::new();
-    let w = Width::W16;
-    let mut e = cx.constant_u64(w, 0).unwrap();
-    let mut syms = Vec::new();
-    for i in 0..(super::linear::MAX_TERMS + 10) {
-        let s = cx.symbol(format!("s{i}").as_str(), w).unwrap();
-        syms.push(s);
-        e = cx.bin(BinOp::Add, e, s).unwrap();
+fn terms_cancel_through_sums_over_the_cap() {
+    for (phase, name, add, sub, bits) in [
+        (Phase::Linear, "linear", BinOp::Add, BinOp::Sub, 16),
+        (Phase::Xor, "xor", BinOp::Xor, BinOp::Xor, 16),
+        (Phase::Linear, "linear", BinOp::Add, BinOp::Sub, 200),
+        (Phase::Xor, "xor", BinOp::Xor, BinOp::Xor, 200),
+    ] {
+        let eng = engine(vec![phase]);
+        let w = Width::new(bits).unwrap();
+        let mut rng = Rng(1);
+        // One of 74 terms: the other 73 are left, as one sum.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 74, w);
+        let all = chain(&mut cx, add, &s);
+        let e = cx.bin(sub, all, s[0]).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        let r = out.roots[0].expr;
+        assert!(out.stats.passes[name].atomized > 0);
+        assert_eq!(size(&mut cx, r), (73, 73 + 72), "{name}");
+        assert!(equivalent(&mut cx, e, r, &mut rng));
+        cx.memo.clear();
+        let again = eng.run(&mut cx, &[r], Run::default()).unwrap();
+        assert!(!again.roots[0].changed, "{name}: not idempotent");
+        // The same 70 terms in the other order: nothing is left.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 70, w);
+        let a = chain(&mut cx, add, &s);
+        let back: Vec<Expr> = s.iter().rev().copied().collect();
+        let b = chain(&mut cx, add, &back);
+        let e = cx.bin(sub, a, b).unwrap();
+        let zero = cx.constant_u64(w, 0).unwrap();
+        assert_eq!(eng.simplify(&mut cx, e).unwrap().expr, zero, "{name}");
+        // 100 of 200 terms, through three sums over the cap, one inside the other.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 200, w);
+        let a = chain(&mut cx, add, &s);
+        let even: Vec<Expr> = s.iter().step_by(2).copied().collect();
+        let b = chain(&mut cx, add, &even);
+        let e = cx.bin(sub, a, b).unwrap();
+        let r = eng.simplify(&mut cx, e).unwrap().expr;
+        assert_eq!(size(&mut cx, r), (100, 100 + 99), "{name}");
+        assert!(equivalent(&mut cx, e, r, &mut rng));
+        // A sum with another use is not taken apart: its terms would be built a second time.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 70, w);
+        let a = chain(&mut cx, add, &s);
+        let d = cx.bin(sub, a, s[0]).unwrap();
+        let e = cx.bin(BinOp::Mul, d, a).unwrap();
+        assert!(!eng.simplify(&mut cx, e).unwrap().changed, "{name}");
+        // Over `MAX_WHOLE_TERMS` terms a sum keeps no whole form: it is an atom and no more.
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, super::forms::MAX_WHOLE_TERMS + 76, w);
+        let a = chain(&mut cx, add, &s);
+        let e = cx.bin(sub, a, s[0]).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(!out.roots[0].changed, "{name}");
+        assert_eq!(out.roots[0].end, End::Completed);
     }
-    // (Σ s) - s0: the sum is over the cap, so it is an atom and nothing cancels, but the
-    // result is still correct.
-    let e2 = cx.bin(BinOp::Sub, e, syms[0]).unwrap();
-    let out = eng.run(&mut cx, &[e2], Run::default()).unwrap();
-    assert!(out.stats.passes["linear"].atomized > 0);
-    let mut rng = Rng(1);
-    assert!(equivalent(&mut cx, e2, out.roots[0].expr, &mut rng));
+}
+
+/// Random sums and xors of hundreds of terms over a pool of symbols, built in pieces that
+/// repeat terms (sums over the cap as operands of sums, scaled, masked, negated and
+/// complemented): the results are equivalent, and a second run changes nothing.
+#[test]
+fn long_sums_are_sound_and_idempotent() {
+    for (phase, linear) in [(Phase::Linear, true), (Phase::Xor, false)] {
+        let eng = engine(vec![phase]);
+        let mut g = generator(0x10_9500);
+        let mut rng = Rng(5);
+        let add = if linear { BinOp::Add } else { BinOp::Xor };
+        let mut changed = 0;
+        for i in 0..32 {
+            let mut cx = Context::new();
+            let bits = [8, 16, 64, 100][i % 4];
+            let pool = symbols(
+                &mut cx,
+                40 + g.rng.below(200) as usize,
+                Width::new(bits).unwrap(),
+            );
+            let mut e: Option<Expr> = None;
+            for _ in 0..2 + g.rng.below(5) {
+                let terms: Vec<Expr> = (0..1 + g.rng.below(150))
+                    .map(|_| pool[g.rng.below(pool.len() as u64) as usize])
+                    .collect();
+                let mut piece = chain(&mut cx, add, &terms);
+                match g.rng.below(4) {
+                    0 => {
+                        let k = g.constant(bits);
+                        let k = cx.constant(&k).unwrap();
+                        let op = if linear { BinOp::Mul } else { BinOp::And };
+                        piece = cx.bin(op, piece, k).unwrap();
+                    }
+                    1 => {
+                        let op = if linear { UnOp::Neg } else { UnOp::Not };
+                        piece = cx.un(op, piece).unwrap();
+                    }
+                    _ => {}
+                }
+                e = Some(match e {
+                    None => piece,
+                    Some(e) if linear && g.rng.chance(1, 2) => {
+                        cx.bin(BinOp::Sub, e, piece).unwrap()
+                    }
+                    Some(e) => cx.bin(add, e, piece).unwrap(),
+                });
+            }
+            let e = e.unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0];
+            assert_eq!(r.end, End::Completed);
+            assert_eq!(out.stats.rejected, 0);
+            assert!(equivalent(&mut cx, e, r.expr, &mut rng), "case {i}");
+            changed += u64::from(r.changed);
+            cx.memo.clear();
+            let again = eng.run(&mut cx, &[r.expr], Run::default()).unwrap();
+            assert!(!again.roots[0].changed, "case {i}: not idempotent");
+        }
+        assert!(changed > 8, "{changed}");
+    }
+}
+
+/// Whole forms are read only where terms meet: a long sum of distinct terms costs what it did,
+/// 36 units a node (taking each sum over the cap apart at every node above it would be 16 more).
+#[test]
+fn a_long_sum_of_distinct_terms_costs_what_it_did() {
+    for (phase, add) in [(Phase::Linear, BinOp::Add), (Phase::Xor, BinOp::Xor)] {
+        let eng = engine(vec![phase]);
+        let mut cx = Context::new();
+        let s = symbols(&mut cx, 4000, Width::W32);
+        let e = chain(&mut cx, add, &s);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert!(!out.roots[0].changed);
+        assert!(out.stats.pass_work < 40 * 4000, "{}", out.stats.pass_work);
+    }
+}
+
+/// A chain of `·`, `&` or `|` is one node however it was ordered and parenthesized, also over
+/// more operands than the bitwise tables read: two writings of one chain cancel.
+#[test]
+fn chains_are_written_one_way() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (op, minus) in [("&", "^"), ("|", "^"), ("*", "-")] {
+            for n in [3, 7, 9, 40] {
+                let v: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+                let join = |v: &[String]| v.join(&format!(" {op} "));
+                let back: Vec<String> = v.iter().rev().cloned().collect();
+                // `v0 op (v1 op (…))`.
+                let nested = back[1..]
+                    .iter()
+                    .fold(back[0].clone(), |e, x| format!("{x} {op} ({e})"));
+                for other in [join(&back), nested] {
+                    let src = format!("({}) {minus} ({other})", join(&v));
+                    assert_eq!(simplify(&eng, &src, 32), "0:32", "{op} of {n}");
+                }
+            }
+        }
+        // An operand of `&` or `|` counts once, and beside its complement it decides the chain.
+        for (src, want) in [
+            (
+                "(a & b & c & d & e & f & g & a) ^ (g & f & e & d & c & b & a)",
+                "0:32",
+            ),
+            ("a & b & c & d & e & f & g & ~d", "0:32"),
+            ("a | b | c | d | e | f | g | ~d", "-1:32"),
+        ] {
+            assert_eq!(simplify(&eng, src, 32), want, "{src}");
+        }
+        // Over `MAX_CHAIN` operands a chain is as written above the ones put in order: the
+        // result is still the chain's value, and stable.
+        let mut rng = Rng(7);
+        for op in [BinOp::And, BinOp::Or, BinOp::Mul] {
+            let mut cx = Context::new();
+            let s = symbols(&mut cx, super::MAX_CHAIN + 44, Width::W32);
+            let back: Vec<Expr> = s.iter().rev().copied().collect();
+            let e = chain(&mut cx, op, &back);
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert_eq!(out.roots[0].end, End::Completed);
+            assert!(equivalent(&mut cx, e, r, &mut rng));
+            cx.memo.clear();
+            let again = eng.run(&mut cx, &[r], Run::default()).unwrap();
+            assert!(!again.roots[0].changed, "{op:?}: not stable");
+        }
+    }
+}
+
+/// A node rebuilt over a rewrite below it will be used by every user of the node it replaced,
+/// though the walk has rebuilt only some of them yet: a rewrite at one user that would leave
+/// it to the others frees nothing. Here `y` is `p`; the pass that finds it then meets the chain
+/// `x op (p op z)` over the rebuilt `p op z`, and putting that chain in order would build
+/// `p op x` beside the `p op z` that `popcnt` keeps.
+#[test]
+fn a_rebuilt_node_counts_the_users_still_to_be_rebuilt() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for op in ["&", "|"] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::W32);
+            let written =
+                format!("let y = (p & q) | (p & ~q); let i = y {op} z; (x {op} i) ^ popcnt(i)");
+            let reduced = format!("let i = p {op} z; (x {op} i) ^ popcnt(i)");
+            let a = cx.parse(&written, &o).unwrap();
+            let b = cx.parse(&reduced, &o).unwrap();
+            let (_, nodes) = size(&mut cx, b);
+            let got = eng.simplify(&mut cx, a).unwrap().expr;
+            assert_eq!(size(&mut cx, got).1, nodes, "{op}: {}", cx.display(got));
+        }
+    }
+}
+
+/// Factoring reads a sum's terms and a term's factors from the top, and no more of them than
+/// it may factor: a sum of 100 000 terms, and a product of as many factors under a sum, are
+/// simplified on a stack of the size a thread gets by default. Read by recursion to the bottom
+/// of the chain, each overflowed it.
+#[test]
+fn factoring_reads_long_sums_and_products_from_the_top() {
+    let run = || {
+        let eng = engine(vec![Phase::Linear]);
+        for op in [BinOp::Add, BinOp::Mul] {
+            let mut cx = Context::new();
+            let s = symbols(&mut cx, 100_000, Width::W64);
+            let mut e = chain(&mut cx, op, &s);
+            if op == BinOp::Mul {
+                let x = cx.symbol("x", Width::W64).unwrap();
+                e = cx.bin(BinOp::Add, e, x).unwrap();
+            }
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            assert_eq!(out.roots[0].end, End::Completed, "{op:?}");
+        }
+    };
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(run)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Terms that read one condition are merged over the same spelling of it however the nodes
+/// were built. A form's terms are in the order of their nodes, `Context::import` builds
+/// operands right to left and the parser left to right; `zext(c) - zext(~c)` is
+/// `2·zext(c) - 1` or `1 - 2·zext(~c)`, and over a `1` the sum already reads only the second
+/// is smaller than it. Merged over the first term, the sum was left as written or not by the
+/// order its nodes were built in, so a result changed again once imported.
+#[test]
+fn conditions_merge_whatever_the_order_of_construction() {
+    for strategy in [Strategy::standard(), Strategy::deobfuscate()] {
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for src in [
+            "let a = udiv(1, x); zext<8>(x <=s a) - zext<8>(a <s x)",
+            "let a = udiv(1, x); zext<8>(a <s x) - zext<8>(x <=s a)",
+            "let a = udiv(1, x); zext<8>(x <u a) - zext<8>(a <=u x)",
+            "let a = udiv(1, x); zext<8>(x != a) - zext<8>(x == a)",
+        ] {
+            let mut parsed = Context::new();
+            let e = parsed.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+            let mut imported = Context::new();
+            let i = imported.import(&parsed, &[e]).unwrap()[0];
+            let (e, i) = (
+                eng.simplify(&mut parsed, e).unwrap().expr,
+                eng.simplify(&mut imported, i).unwrap().expr,
+            );
+            assert_eq!(
+                parsed.display(e).to_string(),
+                imported.display(i).to_string(),
+                "{src}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1982,6 +2271,50 @@ fn prove_decides_by_residues() {
     }
 }
 
+/// The residues compute with values of at most 128 bits, so an extension or a concatenation
+/// wider than that is a leaf to them, whatever it reads: cut to 128 bits, `sext<257>(x)` of a
+/// negative `x` was a large positive value, and `sext<257>(t·t) <=s sext<257>(x)` true.
+#[test]
+fn residues_read_no_value_over_128_bits() {
+    use crate::{Query, Truth};
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::new(3).unwrap());
+    for (a, b) in [
+        ("let t = sext<33>(x); sext<257>(t * t)", "sext<257>(x)"),
+        ("let t = sext<33>(x); zext<129>(t * t)", "sext<129>(x)"),
+        ("let t = sext<33>(x); sext<512>(t * t)", "zext<512>(x)"),
+        (
+            "let t = sext<100>(x); concat(t * t, t)",
+            "concat(sext<100>(x), zext<100>(x))",
+        ),
+    ] {
+        let (a, b) = (cx.parse(a, &o).unwrap(), cx.parse(b, &o).unwrap());
+        // Every value of `x`: what a proof says must hold at all of them.
+        let values: Vec<Vec<BitVec>> = (0..8u64)
+            .map(|v| {
+                let x = BitVec::wrapping_from_u64(Width::new(3).unwrap(), v);
+                cx.eval(&[a, b], &FnEnv(|_: &crate::SymbolKey, _| Some(x)))
+                    .unwrap()
+            })
+            .collect();
+        for op in CmpOpExt::ALL {
+            let truth = cx.prove(Query::Cmp(op, a, b)).unwrap();
+            if truth == Truth::Unknown {
+                continue;
+            }
+            for v in &values {
+                assert_eq!(
+                    BitVec::apply_cmp(op, &v[0], &v[1]).unwrap(),
+                    truth == Truth::True,
+                    "`{}` {op:?} `{}` proved {truth:?}",
+                    cx.display(a),
+                    cx.display(b)
+                );
+            }
+        }
+    }
+}
+
 /// Sign extension spelled with shifts or with xor and a subtraction, and bit tests through a
 /// mask: equivalent at every shift and mask at small widths, and recognized.
 #[test]
@@ -3600,7 +3933,7 @@ fn linear_mba_emits_conjunctions_for_any_number_of_atoms() {
         (
             "3 * (x & ~y) + 2 * (~x & y) + 5 * (x & y) - (x | y)",
             64,
-            "x + x + (x & y) + y",
+            "(x & y) + (x << 1) + y",
         ),
         // Four atoms: the indicator form needs three or fewer, and a conjunction remains.
         ("(a | b) - (a ^ b) + (c & ~d) + (c & d)", 32, "(a & b) + c"),
@@ -4518,7 +4851,7 @@ fn invert_obeys_budgets_and_the_host_veto() {
 }
 
 /// The linear pass takes a constant into a term (`k·a + k = −k·~a`) when that is smaller,
-/// doubles as `a + a`, starts a sum of subtractions from its constant or a product by a
+/// doubles as `a << 1`, starts a sum of subtractions from its constant or a product by a
 /// negative coefficient, reads `concat(trunc(x), c)` as `x·2^|c| + c`, and a constant always
 /// replaces what it folds.
 #[test]
@@ -4527,14 +4860,11 @@ fn linear_emissions() {
     for (src, want) in [
         ("-x - 1", "~x"),
         ("(y << 2) + 4", "~y * -4"),
-        ("-2 * y - 2", "let %0 = ~y;\n%0 + %0"),
-        ("2 * x + y", "x + x + y"),
+        ("-2 * y - 2", "y * -2 - 2"),
+        ("2 * x + y", "x * 2 + y"),
         ("5 - 3 * x", "5 - x * 3"),
         ("-(y * 3) - z * 5", "y * -3 - z * 5"),
-        (
-            "concat(trunc<62>(y), 3:2) - 6 * y - 5",
-            "let %0 = ~y;\n%0 + %0",
-        ),
+        ("concat(trunc<62>(y), 3:2) - 6 * y - 5", "~y << 1"),
     ] {
         let mut cx = Context::new();
         let o = ParseOptions::width(Width::W64);
@@ -5384,7 +5714,7 @@ fn carries_is_sound_on_mutated_networks() {
 fn carries_reads_shifts_of_one_atom_exactly() {
     // `a << k` is `2^k·a`, and 0 once the shifts reach the width: no proof needed, so none is
     // taken, and every result is equal to its input. (Inner shifts by more than 1 are their
-    // own form, so the chain is read whole; `a << 1` alone becomes `a + a`.)
+    // own form, so the chain is read whole; `a << 1` alone is left as it is.)
     let eng = engine(vec![Phase::Carries]);
     let mut rng = Rng(0x5e1f);
     for w in [8u16, 64] {
@@ -5393,7 +5723,7 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             ("(x << 2) << 3".to_string(), "x << 5".to_string()),
             ("((x << 3) << 2) << 1".into(), "x << 6".into()),
             (format!("(x << {}) << 3", w - 2), format!("0:{w}")),
-            ("x << 1".into(), "x + x".into()),
+            ("x << 1".into(), "x << 1".into()),
         ] {
             let mut cx = Context::new();
             let e = cx.parse(&src, &o).unwrap();
@@ -5402,6 +5732,64 @@ fn carries_reads_shifts_of_one_atom_exactly() {
             assert_eq!(cx.display(r).to_string(), want, "{w} bits: {src}");
             assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
             assert_eq!(out.stats.passes["carries"].proofs, 0, "{w} bits: {src}");
+        }
+    }
+}
+
+/// The SWAR population count of `v` at `w` bits (Hacker's Delight), with the pair mask `m1`.
+#[cfg(feature = "prove")]
+fn swar(w: u16, v: &str, m1: u64) -> String {
+    let ones = u64::MAX >> (64 - w);
+    format!(
+        "let a = {v} - (({v} >>u 1) & {m1:#x}); let b = (a & {:#x}) + ((a >>u 2) & {:#x}); \
+         let c = (b + (b >>u 4)) & {:#x}; (c * {:#x}) >>u {}",
+        ones / 5,
+        ones / 5,
+        ones / 17,
+        ones / 255,
+        w - 8
+    )
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_recognizes_bit_counts() {
+    let eng = engine(vec![Phase::Carries]);
+    let mut rng = Rng(0xb17c);
+    for w in [16u16, 32, 64] {
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let ones = u64::MAX >> (64 - w);
+        // Ones above the highest set bit: the smear, counted, is the leading zeros.
+        let mut smear = String::from("let s0 = x; ");
+        let mut k = 0;
+        while 1u32 << k < u32::from(w) {
+            smear += &format!(
+                "let s{n} = s{k} | (s{k} >>u {sh}); ",
+                n = k + 1,
+                sh = 1u32 << k
+            );
+            k += 1;
+        }
+        let clz = format!("{smear}let v = ~s{k}; {}", swar(w, "v", ones / 3));
+        let ctz = format!("let v = (x & -x) - 1; {}", swar(w, "v", ones / 3));
+        for (src, want) in [
+            (swar(w, "x", ones / 3), "popcnt(x)"),
+            (clz, "clz(x)"),
+            (ctz, "ctz(x)"),
+            // A wrong pair mask: no count, and left as it was.
+            (swar(w, "x", ones / 3 - 4), ""),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert!(equivalent(&mut cx, e, r, &mut rng), "{w} bits: {src}");
+            if want.is_empty() {
+                assert_eq!(r, e, "{w} bits: {src} became {}", cx.display(r));
+            } else {
+                let want = cx.parse(want, &o).unwrap();
+                assert_eq!(r, want, "{w} bits: {src} became {}", cx.display(r));
+            }
         }
     }
 }

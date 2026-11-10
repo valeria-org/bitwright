@@ -535,7 +535,7 @@ int main() {
     assert(m.load(slot, 8).raw() == v.raw());
 
     auto block = bw::lift(cx, bw::FrontEnd::Vex, "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1");
-    assert(block.reg("rax")->str() == "rdi + rdi");
+    assert(block.reg("rax")->str() == "rdi << 1");
 
     auto report = bw::verify_transforms("%r = select %c, %x, false\n=>\n%r = and %c, %x");
     assert(report.invalid == 1);
@@ -806,7 +806,7 @@ bw.simplify("(x & y) * (x | y) + (x & ~y) * (~x & y)", 64); // "x * y"
 bw.synthesize("((x + y) & 1) ^ (x & 1)", 32);               // "y & 1"
 bw.equivalent("x * 2", "x + x", 16);                         // "equivalent"
 bw.prove("%r = select %c, %x, false\n=>\n%r = and %c, %x");   // "INVALID …" and why
-bw.lift("vex", "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1"); // "rax = rdi + rdi\n"
+bw.lift("vex", "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1"); // "rax = rdi << 1\n"
 ```
 
 `validate` (translation validation), `infer` (preconditions) and `toSmtlib` complete it;

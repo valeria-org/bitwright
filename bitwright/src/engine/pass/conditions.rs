@@ -344,6 +344,18 @@ pub(super) fn may_merge(cx: &Context, x: u32) -> bool {
     false
 }
 
+/// The order in which the spellings `x` and `y` of one condition are kept: one that is no
+/// complement first (keeping `zext(c)` frees `~c` with `zext(~c)`), then the context's order.
+/// Not the order of the form's terms, which is the order the nodes were built in: the result
+/// would depend on it (`zext(c) − zext(¬c)` is `2·zext(c) − 1` or `1 − 2·zext(¬c)`, and only
+/// one of them may be smaller than the sum).
+fn spelling(cx: &Context, x: u32, y: u32) -> core::cmp::Ordering {
+    let complement = |c: u32| cx.node(c).op == OpCode::Not;
+    complement(x)
+        .cmp(&complement(y))
+        .then_with(|| cx.order(x, y))
+}
+
 /// `form` with every condition that two of its terms read replaced by one `zext` of it, and
 /// the nodes the new form reads that existed (the leaves for the commit rule); `None` when no
 /// two terms read one condition.
@@ -392,13 +404,21 @@ pub(super) fn merge(
             .filter_map(|(&(a, q), ri)| ri.filter(|x| x.key == *g).map(|x| (a, q, x)))
             .collect();
         // The condition's `zext`: an atom of the form, else built over a condition node the
-        // form reads, else over the threshold of a carry.
-        let (z, zpos) = if let Some(&(a, _, rd)) = members.iter().find(|m| m.2.zext) {
+        // form reads, else over the threshold of a carry. Of several spellings, the first in
+        // `spelling`'s order.
+        let kept = |zext: bool| {
+            members
+                .iter()
+                .filter(|m| m.2.zext == zext)
+                .filter_map(|m| m.2.cond.map(|c| (c, m.0, m.2.pos)))
+                .min_by(|x, y| spelling(cx, x.0, y.0))
+        };
+        let (z, zpos) = if let Some((_, a, pos)) = kept(true) {
             leaves.push(a);
-            (a, rd.pos)
-        } else if let Some((c, rd)) = members.iter().find_map(|m| m.2.cond.map(|c| (c, m.2))) {
+            (a, pos)
+        } else if let Some((c, _, pos)) = kept(false) {
             leaves.push(c);
-            (r.build(cx, |cx| cx.c_zext(c, w.bits()))?, rd.pos)
+            (r.build(cx, |cx| cx.c_zext(c, w.bits()))?, pos)
         } else {
             let Key::Below { x, j, t } = *g else {
                 return Ok(None);

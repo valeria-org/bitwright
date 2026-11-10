@@ -970,15 +970,97 @@ fn quotient_top(cx: &Context, n: u32) -> bool {
 
 /// The quotient at `n`: `udiv`/`sdiv` of the multiply-high's input by the divisor it proves.
 fn quotient(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
-    let w = cx.wid(n);
-    if !(2..=MAX_WIDTH).contains(&w) || !quotient_top(cx, n) {
-        return Ok(Step::Normal(Fin::FINAL));
-    }
-    let Some((input, signed)) = core(r, cx, n)? else {
+    let (d, fin) = match divisor(r, cx, n)? {
+        (Some(d), fin) => (d, fin),
+        (None, fin) => return Ok(Step::Normal(fin)),
+    };
+    let (x, dv, signed) = d;
+    let op = if signed { BinOp::SDiv } else { BinOp::UDiv };
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| {
+        let c = cx.mk_const(&dv)?;
+        cx.c_bin(op, x, c)
+    })?;
+    // A bare multiply-high is the size of its division: the division is the normal form.
+    let tie = matches!(cx.node(n).op, OpCode::UMulHi | OpCode::SMulHi);
+    r.explain_with(|| crate::engine::Explanation::Division {
+        dividend: cx.handle(x),
+        divisor: dv,
+        signed,
+    });
+    finish_with(r, cx, PassKind::Division, n, e, before, &[x], fin, tie)
+}
+
+/// The quotient under a mask at `n`: `h & −2^m` is `(h >>u m) << m`, and with `h >>u m` the
+/// quotient of `x` by `d` (the shift the rules folded into the mask its last step),
+/// `udiv(x, d) << m`. The two are the same size: the division is the normal form.
+fn masked_quotient(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let width = cx.width_of(n);
+    let Some(mask) = cx.const_val(node.b) else {
         return Ok(Step::Normal(Fin::FINAL));
     };
-    if cx.wid(input) != w {
+    // −2^m: the low m bits clear, the rest set.
+    let m = (1..u32::from(width.bits())).find(|&m| {
+        mask == BitVec::un_unchecked(crate::UnOp::Not, &crate::facts::known::low_mask(width, m))
+    });
+    let Some(m) = m else {
         return Ok(Step::Normal(Fin::FINAL));
+    };
+    if !matches!(
+        cx.node(node.a).op,
+        OpCode::UMulHi | OpCode::LShr | OpCode::Extract
+    ) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let h = node.a;
+    let probe = cx.len() as u32;
+    let shifted = r.build(cx, |cx| {
+        let k = cx.mk_const(&BitVec::wrapping_from_u64(width, u64::from(m)))?;
+        cx.c_bin(BinOp::LShr, h, k)
+    })?;
+    let found = divisor(r, cx, shifted);
+    // The shift was built to be read only.
+    super::discard(r, cx, probe);
+    let ((x, dv, signed), fin) = match found? {
+        (Some(d), fin) => (d, fin),
+        (None, fin) => return Ok(Step::Normal(fin)),
+    };
+    if signed {
+        return Ok(Step::Normal(fin.unchanged()));
+    }
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| {
+        let c = cx.mk_const(&dv)?;
+        let q = cx.c_bin(BinOp::UDiv, x, c)?;
+        let k = cx.mk_const(&BitVec::wrapping_from_u64(width, u64::from(m)))?;
+        cx.c_bin(BinOp::Shl, q, k)
+    })?;
+    r.explain_with(|| crate::engine::Explanation::Division {
+        dividend: cx.handle(x),
+        divisor: dv,
+        signed,
+    });
+    finish_with(r, cx, PassKind::Division, n, e, before, &[x], fin, true)
+}
+
+/// The division `n` is: the dividend, the divisor and whether it is signed (`None`, with what
+/// the answer relied on, when `n` is no quotient).
+#[allow(clippy::type_complexity)]
+fn divisor(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<(Option<(u32, BitVec, bool)>, Fin), Stop> {
+    let w = cx.wid(n);
+    if !(2..=MAX_WIDTH).contains(&w) || !quotient_top(cx, n) {
+        return Ok((None, Fin::FINAL));
+    }
+    let Some((input, signed)) = core(r, cx, n)? else {
+        return Ok((None, Fin::FINAL));
+    };
+    if cx.wid(input) != w {
+        return Ok((None, Fin::FINAL));
     }
     // Over every input first: a quotient proved there relies on no facts. Then over the
     // interval the facts bound the input to.
@@ -1006,7 +1088,7 @@ fn quotient(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
             .entry(PassKind::Division.name())
             .or_default()
             .noop += 1;
-        return Ok(Step::Normal(fin.unchanged()));
+        return Ok((None, fin.unchanged()));
     };
     let width = cx.width_of(n);
     // `udiv(x >>u j, d)` is `udiv(x, d·2^j)` (floor(floor(x / 2^j) / d) = floor(x / (2^j·d))).
@@ -1021,21 +1103,7 @@ fn quotient(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
             _ => (input, d),
         }
     };
-    let op = if signed { BinOp::SDiv } else { BinOp::UDiv };
-    let dv = dv.to_bits(width);
-    let before = cx.len() as u32;
-    let e = r.build(cx, |cx| {
-        let c = cx.mk_const(&dv)?;
-        cx.c_bin(op, x, c)
-    })?;
-    // A bare multiply-high is the size of its division: the division is the normal form.
-    let tie = matches!(cx.node(n).op, OpCode::UMulHi | OpCode::SMulHi);
-    r.explain_with(|| crate::engine::Explanation::Division {
-        dividend: cx.handle(x),
-        divisor: dv,
-        signed,
-    });
-    finish_with(r, cx, PassKind::Division, n, e, before, &[x], fin, tie)
+    Ok((Some((x, dv.to_bits(width), signed)), fin))
 }
 
 // ----- remainders ------------------------------------------------------------------------------
@@ -1185,6 +1253,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         | OpCode::Sext
         | OpCode::Extract
         | OpCode::Neg => quotient(r, cx, n),
+        OpCode::And => masked_quotient(r, cx, n),
         _ => Ok(Step::Normal(Fin::FINAL)),
     }
 }

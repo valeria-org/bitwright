@@ -1850,13 +1850,15 @@ fn compile(source: &str) -> PyResult<RuleProgram> {
 fn preset(name: &str) -> PyResult<Engine> {
     static DEOBFUSCATE: OnceLock<Engine> = OnceLock::new();
     static COMPILE: OnceLock<Engine> = OnceLock::new();
+    static DECOMPILE: OnceLock<Engine> = OnceLock::new();
     let cell = match name {
         "standard" => return Ok(Engine::standard()),
         "deobfuscate" => &DEOBFUSCATE,
         "compile" => &COMPILE,
+        "decompile" => &DECOMPILE,
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown preset {other:?} (\"standard\", \"deobfuscate\" or \"compile\")"
+                "unknown preset {other:?} (\"standard\", \"deobfuscate\", \"decompile\" or \"compile\")"
             )));
         }
     };
@@ -1905,6 +1907,7 @@ fn build(
             Strategy::deobfuscate().with_mba(MbaConfig::default().with_trust(trust))
         }
         "compile" => Strategy::compile(),
+        "decompile" => Strategy::decompile(),
         _ => Strategy::standard(),
     };
     let mut groups: Vec<String> = Vec::new();
@@ -1945,9 +1948,10 @@ fn build(
 
 /// A simplifier: `"standard"` (fact folding, the built-in rules, the normal-form passes),
 /// `"deobfuscate"` (also divisions by constants, carry networks, linear MBA, bit shuffles, and
-/// the MBA service with the native solver: the command line's `simplify`) or `"compile"` (for
-/// a compiler, which simplifies every value of every function), with rule files and host
-/// rewrites of your own.
+/// the MBA service with the native solver: the command line's `simplify`), `"decompile"` (the
+/// standard passes plus divisions by constants, carry networks and bit counts, and bit
+/// shuffles, without the MBA ones) or `"compile"` (for a compiler, which simplifies every value
+/// of every function), with rule files and host rewrites of your own.
 /// Immutable; shared freely.
 #[pyclass(frozen, name = "Engine", module = "bitwright")]
 #[derive(Debug)]
