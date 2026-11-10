@@ -617,8 +617,12 @@ impl Pass<'_> {
                     .collect();
                 let mut regs: Vec<Vec<u64>> = Vec::new();
                 prog.run(&mut regs, &inputs, points.len());
+                // Each kept node has a register of its own: its values move out.
                 let values = (0..self.p.nodes().len())
-                    .map(|i| prog.reg_of(i).map_or_else(Vec::new, |r| regs[r].clone()))
+                    .map(|i| {
+                        prog.reg_of(i)
+                            .map_or_else(Vec::new, |r| core::mem::take(&mut regs[r]))
+                    })
                     .collect();
                 Some((values, inputs))
             })();
@@ -1488,11 +1492,15 @@ struct Normal {
 
 /// The bit from which every conjunction of the atoms in `set` is zero, if one of them is a
 /// zero extension (`narrow`: per atom, its operand's width when it is one).
-fn zero_from(set: u64, narrow: &[Option<u16>]) -> Option<u16> {
-    (0..64u32)
-        .filter(|&a| set >> a & 1 == 1)
-        .filter_map(|a| narrow.get(a as usize).copied().flatten())
-        .min()
+fn zero_from(mut set: u64, narrow: &[Option<u16>]) -> Option<u16> {
+    let mut from: Option<u16> = None;
+    while set != 0 {
+        if let Some(z) = narrow.get(set.trailing_zeros() as usize).copied().flatten() {
+            from = Some(from.map_or(z, |f| f.min(z)));
+        }
+        set &= set - 1;
+    }
+    from
 }
 
 /// A normal form as rendered: unmasked symbols wherever the classes allow (the same function;
@@ -1805,6 +1813,10 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
     let w = n.w;
     let nf = &n.nf;
     let finish = |f: &Poly| finished(f, &n.classes, &n.nulls, &n.narrow);
+    // An atom's definition as rendered: finished on first need, for the three searches below.
+    let finished_defs: Vec<core::cell::OnceCell<Poly>> =
+        vec![core::cell::OnceCell::new(); n.defs.len()];
+    let finished_def = |a: usize, d: &Poly| finished_defs[a].get_or_init(|| finish(d)).clone();
     let mut alts: Vec<Poly> = n.alts.clone();
     let known = alts.len();
     // Unmasked symbols in finished forms: `FULL`, or the only class.
@@ -1818,7 +1830,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
         let (Def::Form(_) | Def::Complement(_), Some(d)) = (def, n.atom_nf[a].as_ref()) else {
             continue;
         };
-        let d = finish(d);
+        let d = finished_def(a, d);
         if eliminated == 2 {
             continue;
         }
@@ -1888,7 +1900,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
         if added == 4 || nf.len() > 16 {
             break;
         }
-        let d = finish(d);
+        let d = finished_def(a, d);
         let read = nf.terms().keys().any(|m| {
             m.iter()
                 .any(|&(s, _)| s.set >> a & 1 == 1 && s.set.count_ones() > 1)
@@ -1934,7 +1946,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
         .enumerate()
         .filter_map(|(a, def)| match (def, n.atom_nf[a].as_ref()) {
             (Def::Form(_) | Def::Complement(_), Some(d)) if a < 64 && reads(a) => {
-                let d = finish(d);
+                let d = finished_def(a, d);
                 let atom = Poly::sym(
                     w,
                     Sym {
@@ -2069,6 +2081,7 @@ fn sample_values(
         })
         .collect();
     let mut out = Vec::with_capacity(exprs.len());
+    let mut regs: Vec<Vec<u64>> = Vec::new();
     for e in exprs {
         let Some(prog) = crate::mba::batch::Program::new(e, false) else {
             return Ok(None);
@@ -2079,7 +2092,6 @@ fn sample_values(
         let units = (prog.len() * points.len()) as u64;
         work.charge(units.div_ceil(EVALS_PER_STEP))
             .map_err(|()| Decline::Exhausted)?;
-        let mut regs: Vec<Vec<u64>> = Vec::new();
         prog.run(&mut regs, &inputs, points.len());
         match regs.get(prog.root()) {
             Some(r) => out.push(r[..points.len()].to_vec()),
@@ -2359,7 +2371,8 @@ fn prune_null_conjunctions(
         })
         .collect();
     // An atom's values at the sample, from its rendering.
-    let atom_values = |a: u32, work: &mut Steps| -> Result<Option<Vec<u64>>, Decline> {
+    let mut regs: Vec<Vec<u64>> = Vec::new();
+    let mut atom_values = |a: u32, work: &mut Steps| -> Result<Option<Vec<u64>>, Decline> {
         let Some(e) = atom_exprs.get(a as usize) else {
             return Ok(None);
         };
@@ -2372,7 +2385,6 @@ fn prune_null_conjunctions(
         let units = (prog.len() * points.len()) as u64;
         work.charge(units.div_ceil(EVALS_PER_STEP))
             .map_err(|()| Decline::Exhausted)?;
-        let mut regs: Vec<Vec<u64>> = Vec::new();
         prog.run(&mut regs, &inputs, points.len());
         Ok(regs.get(prog.root()).map(|r| r[..points.len()].to_vec()))
     };
