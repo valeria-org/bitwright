@@ -2775,7 +2775,17 @@ impl Runner<'_, '_> {
                 Ok(crate::expr::Bounded::Exact(n)) => n,
                 _ => return Ok(cur),
             };
-            return match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+            let cur = match pass::cut_cases(self, cx, cur, 4 * u64::from(own)) {
+                Ok(Some(p)) => {
+                    self.emit_stage(cx, Stage::Cases, cur, p);
+                    p
+                }
+                Ok(None) | Err(Stop::Exhausted(_)) => cur,
+                Err(stop) => return Err(stop),
+            };
+            // And the root itself, where it is one value on either side of the condition
+            // its selects test most (see `pass::split_cases`).
+            return match pass::split_cases(self, cx, cur) {
                 Ok(Some(p)) => {
                     self.emit_stage(cx, Stage::Cases, cur, p);
                     Ok(p)

@@ -292,6 +292,44 @@ pub(super) fn cut_cases(
     r.build(cx, |cx| context::cut(cx, root, fuel))
 }
 
+/// `root` as a select on the condition its selects test most, each arm `root` with what that
+/// case fixes put in (`context::sides`), when each arm is one value at every sample point:
+/// what is left of a value an obfuscator mixed one condition through is a constant on either
+/// side of it, which the phases fold once the condition is gone from the arm. The samples only
+/// say when to split: `select(c, t, f)` is `root` whatever the arms are. (At random inputs a
+/// condition like `x != y` holds every time, so the root looks like one constant and is not;
+/// the arm for the other case is read at the same inputs with the condition put in.)
+#[cfg(feature = "mba")]
+pub(super) fn split_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<u32>, Stop> {
+    let before = cx.len() as u32;
+    let Some((c, t, f)) = r.build(cx, |cx| context::sides(cx, root))? else {
+        return Ok(None);
+    };
+    // Already split on it.
+    let node = cx.node(root);
+    if node.op == OpCode::Select && node.a == c {
+        discard(r, cx, before);
+        return Ok(None);
+    }
+    for side in [t, f] {
+        if cx.const_val(side).is_some() {
+            continue;
+        }
+        r.sample(cx, side)?;
+        let vals = &r.samples[&side];
+        if vals.iter().any(|v| *v != vals[0]) {
+            discard(r, cx, before);
+            return Ok(None);
+        }
+    }
+    let e = r.build(cx, |cx| cx.c_select(c, t, f))?;
+    Ok((e != root).then_some(e))
+}
+
 /// the opaque-constant sweep before the first phase (see `mba::sweep`).
 #[cfg(feature = "mba")]
 pub(super) fn mba_sweep(
