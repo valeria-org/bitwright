@@ -41,14 +41,72 @@
 //! verdict is the test's either way, at a fraction of the work when the polynomials are equal.
 //! `Refuted` always comes with a concrete input where the two sides differ.
 
-use std::collections::HashMap;
-
 use super::batch::{BLOCK, Kind, Lane, Program, Wide};
 use super::expr::{MNode, MOp, MbaExpr};
 use super::solve::Verdict;
 use crate::engine::CertStats;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
+
+/// The hasher of the certificates' own lookup tables (hash-consed nodes, node indices,
+/// automaton states): a multiply per word, where the default hasher took most of the time of
+/// building a table of nodes. Its output never reaches a result: no table is walked in hash
+/// order (the ones whose keys are read are sorted first).
+#[derive(Default, Clone, Copy, Debug)]
+struct TableHasher(u64);
+
+impl TableHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl core::hash::Hasher for TableHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        crate::hash::mix64(self.0)
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(c);
+            self.add(u64::from_le_bytes(w));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+/// A table with [`TableHasher`].
+type HashMap<K, V> =
+    std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
 
 /// The most points one test evaluates, whatever the budget.
 pub(crate) const MAX_POINTS: u64 = 1 << 24;
@@ -1275,7 +1333,7 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
     }
     // Both sides in one hash-consed list, so a chain node of one is found in the other.
     let mut nodes: Vec<MNode> = Vec::new();
-    let mut intern: HashMap<MNode, u32> = HashMap::new();
+    let mut intern: HashMap<MNode, u32> = HashMap::default();
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
         let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -1302,7 +1360,7 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
     // Arithmetic nodes read by a bitwise operator, with how often.
     let bitwise = |op: MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor);
     let arith = |op: MOp| matches!(op, MOp::Add | MOp::Sub | MOp::Mul | MOp::Neg);
-    let mut reads: HashMap<u32, usize> = HashMap::new();
+    let mut reads: HashMap<u32, usize> = HashMap::default();
     for n in &nodes {
         if bitwise(n.op) || n.op == MOp::Not {
             for &k in &n.args[..n.op.arity()] {
@@ -1372,7 +1430,7 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
             let mut m = MbaExpr::new(a.vars().to_vec());
             // The chain over `t`, top down: the atom is `t`, each node below the inverse of
             // its link applied to the one above.
-            let mut map: HashMap<u32, u32> = HashMap::new();
+            let mut map: HashMap<u32, u32> = HashMap::default();
             let mut v = m.push(MOp::Var(x), &[]).ok()?;
             for &(node, link) in &links {
                 map.insert(node, v);
@@ -2249,7 +2307,7 @@ fn commutative(op: &MOp) -> bool {
 impl Compose {
     fn new(a: &MbaExpr, b: &MbaExpr) -> Compose {
         let mut nodes: Vec<MNode> = Vec::new();
-        let mut intern: HashMap<MNode, u32> = HashMap::new();
+        let mut intern: HashMap<MNode, u32> = HashMap::default();
         let mut roots = [0u32; 2];
         for (side, m) in [a, b].into_iter().enumerate() {
             let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -2367,7 +2425,7 @@ impl Compose {
     /// Marks the nodes abstracted wherever they are read (opaque nodes, arithmetic read by a
     /// bitwise operator) and the operands of opaque nodes (definitions compared on their own).
     fn mark_forced(&mut self) {
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::new();
+        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::default();
         let mut stack = vec![(self.root_a, Ctx::Arith), (self.root_b, Ctx::Arith)];
         while let Some((i, ctx)) = stack.pop() {
             if seen.insert((i, ctx), ()).is_some() {
@@ -2482,7 +2540,7 @@ impl Compose {
             .filter(|&i| self.forced[i])
             .map(|i| keys[i])
             .collect();
-        let mut groups: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut groups: HashMap<u64, Vec<u32>> = HashMap::default();
         drop(tt);
         let tq = std::time::Instant::now();
         for i in 0..self.nodes.len() as u32 {
@@ -3024,7 +3082,7 @@ impl Compose {
     /// constants and atoms.
     fn bitwise_leaves(&self, k: u32) -> Vec<u32> {
         let mut out = Vec::new();
-        let mut seen: HashMap<u32, ()> = HashMap::new();
+        let mut seen: HashMap<u32, ()> = HashMap::default();
         let mut stack = vec![k];
         while let Some(i) = stack.pop() {
             if seen.insert(i, ()).is_some() {
@@ -3078,7 +3136,7 @@ impl Compose {
     fn def_leaves(&mut self, y: u32) -> Option<Vec<u32>> {
         let mut out: Vec<u32> = Vec::new();
         let mut classes: Vec<u32> = Vec::new();
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::new();
+        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::default();
         let n = self.nodes[y as usize];
         let mut stack: Vec<(u32, Ctx)> = n.args[..n.op.arity()]
             .iter()
@@ -3121,7 +3179,7 @@ impl Compose {
             .copied()
             .filter(|&l| self.role[l as usize] == Role::Arith)
             .collect();
-        let mut seen: HashMap<u32, ()> = HashMap::new();
+        let mut seen: HashMap<u32, ()> = HashMap::default();
         while let Some(i) = stack.pop() {
             if seen.insert(i, ()).is_some() {
                 continue;
@@ -3299,7 +3357,7 @@ impl Compose {
         // The leaves, by class, and the internal nodes in post-order.
         let mut leaves: Vec<(u32, u32)> = Vec::new();
         let mut post: Vec<u32> = Vec::new();
-        let mut state: HashMap<u32, bool> = HashMap::new();
+        let mut state: HashMap<u32, bool> = HashMap::default();
         let mut stack: Vec<(u32, bool)> = vec![(i, false)];
         let mut atom = false;
         while let Some((k, done)) = stack.pop() {
@@ -3359,7 +3417,7 @@ impl Compose {
                 .filter(|e| e >> j & 1 == 1)
                 .fold(0u64, |t, e| t | 1 << e)
         };
-        let mut table: HashMap<u32, u64> = HashMap::new();
+        let mut table: HashMap<u32, u64> = HashMap::default();
         for &n in &post {
             let node = self.nodes[n as usize];
             let v = match self.role[n as usize] {
@@ -3438,7 +3496,7 @@ impl Compose {
             Expand(u32, usize),
         }
         let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::new();
+        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::default();
         let mut plans: Vec<Expansion> = Vec::new();
         let mut stack = vec![Item::Visit(root, Ctx::Arith)];
         while let Some(item) = stack.pop() {
@@ -3587,11 +3645,11 @@ impl Compose {
     /// class (the class's own variable when it has one).
     fn skeleton(&mut self, root: u32, policy: Policy, vm: &mut VarMap) -> Option<Vec<SkelNode>> {
         let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::new();
+        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::default();
         let mut stack: Vec<(u32, Ctx, bool)> = vec![(root, Ctx::Arith, false)];
         // Under `Policy::Reps`, atoms read as their representative: the atom's skeleton is the
         // representative's (whose leaves are of earlier classes, so this ends).
-        let mut alias: HashMap<u32, u32> = HashMap::new();
+        let mut alias: HashMap<u32, u32> = HashMap::default();
         while let Some((i, ctx, expanded)) = stack.pop() {
             if memo.contains_key(&(i, ctx)) {
                 continue;
@@ -3716,7 +3774,7 @@ pub(crate) fn carries<M: Meter>(
     let mut circuit: Vec<Serial> = Vec::new();
     let mut state = 0u32;
     let mut roots = [0usize; 2];
-    let mut interned: HashMap<(MOp, [usize; 2]), usize> = HashMap::new();
+    let mut interned: HashMap<(MOp, [usize; 2]), usize> = HashMap::default();
     for (side, m) in [a, b].into_iter().enumerate() {
         let live = live(m);
         let mut map: Vec<usize> = vec![usize::MAX; m.nodes().len()];
@@ -3885,7 +3943,7 @@ pub(crate) fn carries<M: Meter>(
         }
         meter.charge(units)?;
         report.points += layer.len() as u64 * inputs;
-        let mut next: HashMap<u64, (u64, u64)> = HashMap::new();
+        let mut next: HashMap<u64, (u64, u64)> = HashMap::default();
         for &st in &layer {
             for x in 0..inputs {
                 let mut out = st;
@@ -4044,7 +4102,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     }
     // Both sides in one hash-consed table, so equal subterms are one symbol.
     let tsc = std::time::Instant::now();
-    let mut canon: HashMap<MNode, u32> = HashMap::new();
+    let mut canon: HashMap<MNode, u32> = HashMap::default();
     let mut nodes: Vec<MNode> = Vec::new();
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
@@ -4070,7 +4128,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     let _tt = tmp_t("s.polys");
     let bitwise = |op: &MOp| matches!(op, MOp::And | MOp::Or | MOp::Xor | MOp::Not);
     // Symbols: variables by index, conjunctions by their leaf set, others by node.
-    let mut symbols: HashMap<(u8, Vec<u32>), u32> = HashMap::new();
+    let mut symbols: HashMap<(u8, Vec<u32>), u32> = HashMap::default();
     let mut symbol = |kind: u8, key: Vec<u32>| {
         let n = symbols.len() as u32;
         *symbols.entry((kind, key)).or_insert(n)
@@ -4104,7 +4162,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                     let mut leaves: Vec<u32> = Vec::new();
                     let mut uniform = true;
                     let mut stack = vec![i as u32];
-                    let mut seen: HashMap<u32, ()> = HashMap::new();
+                    let mut seen: HashMap<u32, ()> = HashMap::default();
                     while let Some(k) = stack.pop() {
                         if seen.insert(k, ()).is_some() {
                             continue;
@@ -4127,7 +4185,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                         } else {
                             (1u64 << (1u32 << t)) - 1
                         };
-                        let mut table: HashMap<u32, u64> = HashMap::new();
+                        let mut table: HashMap<u32, u64> = HashMap::default();
                         let mut order: Vec<u32> = seen.keys().copied().collect();
                         order.sort_unstable();
                         for &k in &order {
