@@ -1137,51 +1137,83 @@ fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
     Some((k, out))
 }
 
-/// The sum `n` whose every term is a product with the same non-constant factors
-/// (`Σ (cᵢ·f)·tᵢ`), as those factors and the sum without them, `Σ cᵢ·tᵢ` (built): the
-/// products are read through negations, constants and shared subproducts, so a coefficient
-/// spelled as a product of its own with the factor (`(f·a)·t₁ − (f·b)·t₂`) is seen. `None`
-/// when the terms share no factor.
+/// The sum `n` with terms that are products with the same non-constant factors
+/// (`Σ (cᵢ·f)·tᵢ + rest`), as those factors, the sum of those terms without them, `Σ cᵢ·tᵢ`
+/// (built), and the rest of the sum: the products are read through negations, constants and
+/// shared subproducts, so a coefficient spelled as a product of its own with the factor
+/// (`(f·a)·t₁ − (f·b)·t₂`) is seen. The terms are the ones with the factor most of them have
+/// (an obfuscator scales an MBA by a value and adds the result to something else); `None`
+/// when no two terms share one.
 #[cfg(feature = "mba")]
 fn common_factors(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     n: u32,
-) -> Result<Option<(Vec<u32>, u32, Fin)>, Stop> {
+) -> Result<Option<Factored>, Stop> {
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
     let form = form_of(r, cx, n)?;
-    if form.terms.len() < 2 || form.terms.len() > FACTOR_TERMS || !form.konst.is_zero() {
+    if form.terms.len() < 2 || form.terms.len() > FACTOR_TERMS {
         return Ok(None);
     }
     r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
-    let mut products: Vec<(BitVec, Vec<u32>)> = Vec::with_capacity(form.terms.len());
-    // The factors every term has (a multiset: sorted, repeats kept).
-    let mut common: Option<Vec<u32>> = None;
+    // Each term's factors (none for one past the limits), and how many terms have each.
+    let mut products: Vec<Option<(BitVec, Vec<u32>)>> = Vec::with_capacity(form.terms.len());
+    let mut terms_with: Vec<(u32, u32)> = Vec::new();
     for &(t, k) in &form.terms {
-        let Some((c, factors)) = scaled_factors(cx, t) else {
-            return Ok(None);
-        };
-        common = Some(match common {
-            None => factors.clone(),
-            Some(old) => {
-                let mut left = factors.clone();
-                old.into_iter()
-                    .filter(|f| match left.iter().position(|x| x == f) {
-                        Some(j) => {
-                            left.swap_remove(j);
-                            true
-                        }
-                        None => false,
-                    })
-                    .collect()
+        let p = scaled_factors(cx, t).map(|(c, f)| (BitVec::bin_unchecked(BinOp::Mul, &k, &c), f));
+        if let Some((_, factors)) = &p {
+            for (j, f) in factors.iter().enumerate() {
+                if factors[..j].contains(f) {
+                    continue;
+                }
+                match terms_with.iter_mut().find(|(x, _)| x == f) {
+                    Some((_, count)) => *count += 1,
+                    None => terms_with.push((*f, 1)),
+                }
             }
-        });
-        if common.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(None);
         }
-        products.push((BitVec::bin_unchecked(BinOp::Mul, &k, &c), factors));
+        products.push(p);
+    }
+    // The factor in the most terms (the first made among equals).
+    let Some(&(factor, count)) = terms_with
+        .iter()
+        .max_by_key(|&&(f, count)| (count, core::cmp::Reverse(f)))
+    else {
+        return Ok(None);
+    };
+    if count < 2 {
+        return Ok(None);
+    }
+    // What the terms with it have in common (a multiset: sorted, repeats kept), and the
+    // other terms.
+    let mut common: Option<Vec<u32>> = None;
+    let mut rest: Vec<(u32, BitVec)> = Vec::new();
+    for (p, &term) in products.iter_mut().zip(&form.terms) {
+        match p {
+            Some((_, factors)) if factors.contains(&factor) => {
+                common = Some(match common {
+                    None => factors.clone(),
+                    Some(old) => {
+                        let mut left = factors.clone();
+                        old.into_iter()
+                            .filter(|f| match left.iter().position(|x| x == f) {
+                                Some(j) => {
+                                    left.swap_remove(j);
+                                    true
+                                }
+                                None => false,
+                            })
+                            .collect()
+                    }
+                });
+            }
+            _ => {
+                *p = None;
+                rest.push(term);
+            }
+        }
     }
     let Some(common) = common else {
         return Ok(None);
@@ -1189,29 +1221,45 @@ fn common_factors(
     let w = form.konst.width();
     let mut konst = BitVec::zero(w);
     let mut terms: Vec<(u32, BitVec)> = Vec::with_capacity(products.len());
-    for (k, mut factors) in products {
+    for (k, mut factors) in products.into_iter().flatten() {
         for f in &common {
             if let Some(j) = factors.iter().position(|x| x == f) {
                 factors.remove(j);
             }
         }
-        let mut rest: Option<u32> = None;
+        let mut left: Option<u32> = None;
         for f in factors {
-            rest = Some(match rest {
+            left = Some(match left {
                 None => f,
                 Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Mul, a, f))?,
             });
         }
-        match rest {
+        match left {
             Some(x) => terms.push((x, k)),
             None => konst = BitVec::bin_unchecked(BinOp::Add, &konst, &k),
         }
     }
-    let s = emit(r, cx, &Form::of(konst, &terms))?;
-    Ok(Some((common, s, form.fin)))
+    let inner = emit(r, cx, &Form::of(konst, &terms))?;
+    Ok(Some(Factored {
+        common,
+        inner,
+        rest: Form::of(form.konst, &rest),
+        fin: form.fin,
+    }))
 }
 
-/// `inner` times each of `common`, committed for `n` by the commit rule (as `kind`'s).
+/// A sum with the factors some of its terms share taken out of them (see
+/// [`common_factors`]): `common · inner + rest`.
+#[cfg(feature = "mba")]
+struct Factored {
+    common: Vec<u32>,
+    inner: u32,
+    rest: Form,
+    fin: Fin,
+}
+
+/// `inner` times each of `common`, plus `rest`, committed for `n` by the commit rule (as
+/// `kind`'s).
 #[cfg(feature = "mba")]
 #[allow(clippy::too_many_arguments)]
 fn commit_factored(
@@ -1221,12 +1269,17 @@ fn commit_factored(
     n: u32,
     common: &[u32],
     inner: u32,
+    rest: &Form,
     before: u32,
     fin: Fin,
 ) -> Result<Step, Stop> {
     let mut e = inner;
     for &f in common {
         e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, f, e))?;
+    }
+    if !rest.terms.is_empty() || !rest.konst.is_zero() {
+        let other = emit(r, cx, rest)?;
+        e = r.build(cx, |cx| cx.c_bin(BinOp::Add, e, other))?;
     }
     let mut stops = Vec::new();
     let mut seen = crate::hash::IdMap::<u32, ()>::default();
@@ -1244,12 +1297,12 @@ fn commit_factored(
     finish(r, cx, kind, n, e, before, &stops, fin)
 }
 
-/// the sum `n` whose every term is a product with the same non-constant factors
+/// the sum `n` with terms that are products with the same non-constant factors
 /// (an obfuscator scales an MBA by a value, each coefficient spelled as a product of its own
-/// with it) written as the factors times the sum without them, that inner sum simplified by
-/// `part` (the MBA phase). The whole is a polynomial over what the factor is made of, where
-/// the inner sum is linear over the atoms of its terms alone. `None` when the terms share no
-/// factor.
+/// with it, and adds the result to other terms) written as the factors times the sum of those
+/// terms without them, plus the rest, that inner sum simplified by `part` (the MBA phase). The
+/// whole is a polynomial over what the factor is made of, where the inner sum is linear over
+/// the atoms of its terms alone. `None` when no two terms share a factor.
 #[cfg(feature = "mba")]
 pub(super) fn by_factor(
     r: &mut Runner<'_, '_>,
@@ -1258,7 +1311,13 @@ pub(super) fn by_factor(
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
 ) -> Result<Option<Step>, Stop> {
     let before = cx.len() as u32;
-    let Some((common, s, fin)) = common_factors(r, cx, n)? else {
+    let Some(Factored {
+        common,
+        inner: s,
+        rest,
+        fin,
+    }) = common_factors(r, cx, n)?
+    else {
         return Ok(None);
     };
     // The factor is taken out also where `part` leaves the inner sum as it is, when that
@@ -1266,7 +1325,7 @@ pub(super) fn by_factor(
     // factor of its own, and (tried there on every sum, before the MBA phase has asked about
     // it) taking the factor out first left 23 of 140 measured questions larger.
     let inner = part(r, cx, s)?.unwrap_or(s);
-    commit_factored(r, cx, PassKind::Mba, n, &common, inner, before, fin).map(Some)
+    commit_factored(r, cx, PassKind::Mba, n, &common, inner, &rest, before, fin).map(Some)
 }
 
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
