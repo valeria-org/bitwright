@@ -45,6 +45,7 @@
 //! other limbs, each of which frees it only once all are read, and what reads the slice
 //! (a narrowing, a join of two slices) takes it away again.
 
+use super::slices::Read;
 use super::{
     Counts, Fin, PassKind, Runner, Step, Stop, finish, finish_within, linear, worth_building,
 };
@@ -94,6 +95,10 @@ const PROPAGATION_RATE: u64 = 4;
 /// near which a sum with `c` carries far (none of the other points need be).
 const MAX_CONSTS: usize = 4;
 
+/// The fewest bits of a value made with `|`, `^` or `concat` that is looked for as limbs joined
+/// into their word (see [`super::slices`]).
+const MIN_JOIN: u16 = 8;
+
 /// The walk's and evaluation's buffers, kept by the runner and reused, and what the call's
 /// proofs left undecided.
 #[derive(Default)]
@@ -115,8 +120,20 @@ pub(crate) struct Scratch {
     /// Values no slice of a word below them was proved equal to (see [`super::slices`]): not
     /// asked again in the call.
     pub(super) unfit: IdMap<u32, ()>,
-    /// The slice proofs of the call that were proved, and those left undecided at their caps.
-    pub(super) fits: (u32, u32),
+    /// Values for which a word that is no node agrees at the samples, left to the late stage
+    /// of the rounds (see [`super::slices`]): not looked at again before it.
+    pub(super) waiting: IdMap<u32, ()>,
+    /// The slice proofs of the call that were proved, and those left undecided at their caps:
+    /// of the reads the limbs are first looked for at, and of the others (see
+    /// [`super::slices::Read`]).
+    pub(super) fits: [(u32, u32); 2],
+    /// The sums and comparisons the slice proofs left undecided had of their own: the limb
+    /// code a question is not asked about again (see [`super::slices`]).
+    pub(super) hard: IdMap<u32, ()>,
+    /// The shapes of the questions left undecided (see [`super::slices`]).
+    pub(super) shapes: IdMap<u64, ()>,
+    /// The products a slice proof could not take for fresh symbols (see [`super::slices`]).
+    pub(super) uncut: IdMap<u32, ()>,
 }
 
 fn interior(cx: &Context, i: u32) -> bool {
@@ -616,7 +633,7 @@ fn low_read(cx: &Context, n: u32) -> Option<(u32, u16, u16)> {
 /// [`finish_within`]): by one node where it is a slice of a node that was there, or the zero
 /// extension of one (a limb as the slice of its word, which every other reader of the limb's
 /// arithmetic becomes too); otherwise not at all, and only for a smaller tree.
-fn slack(cx: &Context, n: u32, e: u32, before: u32) -> u32 {
+pub(super) fn slack(cx: &Context, n: u32, e: u32, before: u32) -> u32 {
     let mut outer = cx.node(e);
     // (Held up as the limb was: `slice << k`.)
     if outer.op == OpCode::Shl && cx.const_val(outer.b).is_some() {
@@ -644,7 +661,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if let Some((s, j, k)) = low_read(cx, n) {
         let before = cx.len() as u32;
         let mut own = Fin::FINAL;
-        if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, s, j)? {
+        if let Some((e, fin, stops, _)) = super::borrows::expanded(r, cx, s, j, false)? {
             let e = r.build(cx, |cx| super::slices::held(cx, e, bits, k))?;
             let slack = slack(cx, n, e, before);
             match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
@@ -652,13 +669,40 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 step => return Ok(step),
             }
         }
-        match super::slices::fitted(r, cx, n, s, j, k)? {
+        let read = Read {
+            n,
+            s,
+            lo: 0,
+            len: j,
+            k,
+            apart: false,
+        };
+        match super::slices::fitted(r, cx, read)? {
             Ok(step) => return Ok(step),
             Err(f) => own = own.and(f),
         }
         // Declined for a reason more budget or less sharing may lift: asked again.
         if !own.done {
             return Ok(Step::Normal(own));
+        }
+    }
+    // A slice of a sum above its low bits (the upper digits of a limb, read apart).
+    if op == OpCode::Extract {
+        let node = cx.node(n);
+        let s = node.a;
+        if node.b > 0 && cx.wid(s) <= 64 && matches!(cx.node(s).op, OpCode::Add | OpCode::Sub) {
+            let read = Read {
+                n,
+                s,
+                lo: node.b as u16,
+                len: bits,
+                k: 0,
+                apart: true,
+            };
+            return Ok(match super::slices::fitted(r, cx, read)? {
+                Ok(step) => step,
+                Err(f) => Step::Normal(f),
+            });
         }
     }
     let slices = op == OpCode::Concat;
@@ -705,28 +749,40 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     let Some((konst, coeffs, exact)) = found else {
         // A sum of digits and the carries between them, written as comparisons.
+        let mut own = Fin::FINAL;
         if matches!(op, OpCode::Add | OpCode::Sub) {
             let before = cx.len() as u32;
-            let mut own = Fin::FINAL;
-            if let Some((e, fin, stops)) = super::borrows::expanded(r, cx, n, bits)? {
+            if let Some((e, fin, stops, _)) = super::borrows::expanded(r, cx, n, bits, false)? {
                 let slack = slack(cx, n, e, before);
                 match finish_within(r, cx, PassKind::Carries, n, e, before, &stops, fin, slack)? {
                     Step::Normal(f) => own = f,
                     step => return Ok(step),
                 }
             }
-            // A limb held at a register's width: what of the sum is not known to be 0.
-            let (known, fk) = super::known_words(r, cx, n)?;
-            let j = known.map_or(bits, |[zero, _]| {
-                (64 - (!zero & mask).leading_zeros()) as u16
-            });
-            return Ok(match super::slices::fitted(r, cx, n, n, j, 0)? {
-                Ok(Step::To(e, f)) => Step::To(e, f.and(fk)),
-                Ok(Step::Normal(f)) => Step::Normal(f.and(fk)),
-                Err(f) => Step::Normal(own.and(f).and(fk)),
-            });
+        } else if bits < MIN_JOIN || !matches!(op, OpCode::Or | OpCode::Concat) {
+            // (`^` and a read of the value above its low zeros were measured: no gain.)
+            return Ok(Step::Normal(Fin::FINAL));
         }
-        return Ok(Step::Normal(Fin::FINAL));
+        // A limb held at a register's width, or limbs joined into a word (`lo | hi << k`):
+        // what of the value is not known to be 0.
+        let (known, fk) = super::known_words(r, cx, n)?;
+        let open = known.map_or(mask, |[zero, _]| !zero & mask);
+        if open == 0 {
+            return Ok(Step::Normal(own.and(fk)));
+        }
+        let read = Read {
+            n,
+            s: n,
+            lo: 0,
+            len: (64 - open.leading_zeros()) as u16,
+            k: 0,
+            apart: !matches!(op, OpCode::Add | OpCode::Sub),
+        };
+        return Ok(match super::slices::fitted(r, cx, read)? {
+            Ok(Step::To(e, f)) => Step::To(e, f.and(fk)),
+            Ok(Step::Normal(f)) => Step::Normal(f.and(fk)),
+            Err(f) => Step::Normal(own.and(f).and(fk)),
+        });
     };
     let w = cx.width_of(n);
     let atoms = r.carries.atoms.clone();

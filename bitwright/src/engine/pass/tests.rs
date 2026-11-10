@@ -3303,8 +3303,8 @@ mod mba_service {
 
     #[test]
     fn the_solvers_steps_are_an_account_of_the_run() {
-        assert_eq!(Budget::fuel(1000).mba_steps, 4000);
-        assert_eq!(Budget::default().mba_steps, 1 << 24);
+        assert_eq!(Budget::fuel(1000).mba_steps, 8000);
+        assert_eq!(Budget::default().mba_steps, 1 << 25);
         let ask = |solver: Arc<dyn MbaSolver>, steps: u64| {
             let eng = mba_engine(solver, MbaTrust::default());
             let mut cx = Context::new();
@@ -3495,6 +3495,281 @@ mod mba_service {
             out.roots[0].end,
             End::BudgetTerminated(crate::engine::Exhausted::PassWork)
         );
+    }
+
+    /// The normal-form solver, counting the questions put to it.
+    struct Asked(crate::mba::NormalFormSolver, AtomicU64);
+    impl MbaSolver for Asked {
+        fn id(&self) -> &str {
+            "test.counting"
+        }
+        fn solve(&self, p: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+            self.solve_counted(p, budget).0
+        }
+        fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            self.0.solve_counted(p, budget)
+        }
+        fn polynomial_fragments(&self) -> bool {
+            true
+        }
+    }
+
+    /// The results of `roots` (one call) and the questions put to the solver, with the rule
+    /// that declines questions no answer to which could be committed, or (`all`) without.
+    fn limb_asked(roots: &[&str], all: bool) -> (Vec<String>, u64) {
+        let solver = Arc::new(Asked(
+            crate::mba::NormalFormSolver::default(),
+            AtomicU64::new(0),
+        ));
+        let eng = mba_engine(
+            solver.clone(),
+            MbaTrust::default().with_backend_certificates(false),
+        );
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W32);
+        let es: Vec<Expr> = roots.iter().map(|s| cx.parse(s, &o).unwrap()).collect();
+        super::super::mba::ASK_ALL.set(all);
+        let out = eng.run(&mut cx, &es, Run::default());
+        super::super::mba::ASK_ALL.set(false);
+        let out = out.unwrap();
+        assert!(out.roots.iter().all(|r| r.end == End::Completed));
+        let texts = out
+            .roots
+            .iter()
+            .map(|r| cx.display(r.expr).to_string())
+            .collect();
+        (texts, solver.1.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn limb_questions_that_pay_are_asked() {
+        // The comparison's other side reads what the sum reads, so replacing the sum frees
+        // itself, or itself and one node: the answer is an atom, a constant, or one operator
+        // over the atoms, and is found with the rule as without it.
+        for (src, gone) in [
+            // `x`: the difference goes.
+            (
+                "(((x | y) + (x & y)) - y) <u (((x | y) + (x & y)) * z)",
+                " - y",
+            ),
+            // 0.
+            (
+                "(((x ^ y) + 2 * (x & y)) - (x + y)) <u (((x ^ y) + 2 * (x & y)) * (x + y) * z)",
+                " - ",
+            ),
+            // `x + y`: the doubled conjunction goes.
+            ("((x ^ y) + 2 * (x & y)) <u ((x ^ y) * (x & y) * z)", "2"),
+        ] {
+            let (with, _) = limb_asked(&[src], false);
+            let (without, _) = limb_asked(&[src], true);
+            assert_eq!(with, without, "{src}");
+            assert!(!with[0].contains(gone), "{src}: {}", with[0]);
+        }
+    }
+
+    #[test]
+    fn limb_questions_that_cannot_pay_are_not_asked() {
+        // The products are read by both sides, so replacing a side frees it alone, and it is
+        // no atom, constant or node below it: no answer could be committed, none is asked
+        // for, and the result is what it is with every question asked. The same where the
+        // answer is one operator (`x ^ y`) for the one node freed: no smaller.
+        for src in [
+            "((x & y) * 5 + (x | y) * 3) <u ((x & y) * 5 ^ (x | y) * 3)",
+            "((x | y) - (x & y)) <u ((x | y) * (x & y) * z)",
+        ] {
+            let (with, asked) = limb_asked(&[src], false);
+            let (without, all) = limb_asked(&[src], true);
+            assert_eq!(with, without, "{src}");
+            assert!(asked < all, "{src}: {asked} of {all}");
+        }
+        // Sums of limb code that share their terms with the carries beside them, generated:
+        // the same results, fewer questions.
+        let ops = ["&", "|", "^"];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let (mut asked, mut all) = (0, 0);
+        for _ in 0..40 {
+            let v = ["x", "y", "z"];
+            let term = |next: &mut dyn FnMut(u64) -> u64| {
+                format!(
+                    "({} {} {})",
+                    v[next(3) as usize],
+                    ops[next(3) as usize],
+                    v[next(3) as usize]
+                )
+            };
+            let (a, b, c) = (term(&mut next), term(&mut next), term(&mut next));
+            let k = 1 + next(4);
+            let sum = format!("{a} + {b}");
+            let low = format!("({sum} - {k} * {c})");
+            // A word, a limb of it, a carry out of the limb, and a mask of the word beside.
+            let e = format!(
+                "({low} & 0x3fff) + zext<32>(trunc<14>({sum}) <u trunc<14>({a})) \
+                 + (({sum}) & {c}) * 2 + ({low} >>u 14)"
+            );
+            let (with, n) = limb_asked(&[&e], false);
+            let (without, m) = limb_asked(&[&e], true);
+            assert_eq!(with, without, "{e}");
+            assert!(n <= m, "{e}: {n} of {m}");
+            asked += n;
+            all += m;
+        }
+        assert!(asked < all, "{asked} of {all}");
+    }
+
+    /// [`limb_asked`] with `cannot_pay` deciding at most `most` freed nodes, with (`free`) or
+    /// without the forms compared where the atoms are free.
+    fn limb_ruled(roots: &[&str], most: u32, free: bool) -> (Vec<String>, u64) {
+        super::super::mba::PAY_RULE.set((most, free));
+        let out = std::panic::catch_unwind(|| limb_asked(roots, false));
+        super::super::mba::PAY_RULE.set((u32::MAX, true));
+        out.unwrap()
+    }
+
+    #[test]
+    fn limb_questions_of_three_freed_nodes() {
+        // An answer of two nodes for three freed (`(x + y) ^ z`, `(x + y) * z`: the sum of
+        // `x ^ y` and twice `x & y` goes with its product) is found with the rule as without.
+        for (src, gone) in [
+            (
+                "(((x ^ y) + 2 * (x & y)) ^ z) <u ((x ^ y) * (x & y) * (z * 2))",
+                "2",
+            ),
+            (
+                "(((x ^ y) + 2 * (x & y)) * z) <u ((x ^ y) * (x & y) + (z * 2))",
+                "2",
+            ),
+        ] {
+            let (all, _) = limb_asked(&[src], true);
+            let (with, _) = limb_ruled(&[src], 3, true);
+            assert_eq!(with, all, "{src}");
+            assert!(!with[0].contains(gone), "{src}: {}", with[0]);
+        }
+        // Three freed nodes and no form of two over what stays (a sum of four terms the other
+        // side reads too; a sum and a constant, where the constant is one of the three): not
+        // asked, with the results of every question asked and of the rule for two.
+        for src in [
+            "((x | y) + (x & y) + 7) <u ((x | y) * (x & y) * z)",
+            "(((x & y) * 5 + (x | y) * 3) + (x ^ y) * 7 + z) \
+             <u ((x & y) * 5 ^ (x | y) * 3 ^ (x ^ y) * 7)",
+            "((x & y) + (x | z) + (y ^ z) + x) <u ((x & y) * (x | z) * (y ^ z))",
+            "(((x & y) * 5 ^ (x | y) * 3) + z + 1) <u ((x & y) * 5 + (x | y) * 3)",
+        ] {
+            let (all, _) = limb_asked(&[src], true);
+            let (two, asked_two) = limb_ruled(&[src], 2, false);
+            let (three, asked_three) = limb_ruled(&[src], 3, false);
+            assert_eq!(two, all, "{src}");
+            assert_eq!(three, all, "{src}");
+            assert!(
+                asked_three < asked_two,
+                "{src}: {asked_three} of {asked_two}"
+            );
+        }
+    }
+
+    #[test]
+    fn limb_forms_that_agree_by_the_atoms_relations_are_no_answers() {
+        // `x <u y` implies `x <=u y` and excludes `x == y`, and the lesser of two is one of
+        // them: the conjunctions are a node below them, or zero, at every point, which no
+        // identity over the comparisons as atoms says. Compared where the atoms are free, no
+        // form agrees and the question is not asked; the results are those of asking.
+        for src in [
+            "(zext<32>(x <u y) & zext<32>(x <=u y)) \
+             <u (zext<32>(x <u y) * zext<32>(x <=u y) * z)",
+            "(zext<32>(x <u y) & zext<32>(x == y)) <u (zext<32>(x <u y) * zext<32>(x == y) + z)",
+            "((select(x <u y, x, y) ^ x) & (select(x <u y, x, y) ^ y)) \
+             <u ((select(x <u y, x, y) ^ x) * (select(x <u y, x, y) ^ y) * z)",
+        ] {
+            let (all, _) = limb_asked(&[src], true);
+            let (bound, asked_bound) = limb_ruled(&[src], 3, false);
+            let (free, asked_free) = limb_ruled(&[src], 3, true);
+            assert_eq!(bound, all, "{src}");
+            assert_eq!(free, all, "{src}");
+            assert!(
+                asked_free < asked_bound,
+                "{src}: {asked_free} of {asked_bound}"
+            );
+        }
+        // A comparison and its negation stay related (`~` of one is built as the other):
+        // their sum is 1, found with the rule as without.
+        let src = "(zext<32>(x <u y) + zext<32>(y <=u x)) <u (zext<32>(x <u y) * z)";
+        let (all, _) = limb_asked(&[src], true);
+        let (free, _) = limb_ruled(&[src], 3, true);
+        assert_eq!(free, all, "{src}");
+    }
+
+    #[test]
+    fn limb_forms_of_two_nodes_are_all_tried() {
+        // Generated: a form of two nodes over three values the other side keeps alive, spelled
+        // so that three nodes go with it. Whatever the solver makes of it, the rule changes
+        // no result (it asks wherever a form of two nodes agrees).
+        let unary = ["~", "-"];
+        let binary = ["+", "-", "*", "&", "|", "^"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut declined = 0;
+        for _ in 0..60 {
+            let (p, q) = (binary[next(6) as usize], binary[next(6) as usize]);
+            let k = 3 + 2 * next(40);
+            let inner = match next(4) {
+                0 => format!("((x ^ y) + 2 * (x & y)) {p} z"),
+                1 => format!("((x | y) - (x & y)) {p} (z + {k})"),
+                2 => format!("{}((x | y) + (x & y))", unary[next(2) as usize]),
+                _ => format!("((x & y) + (x | y)) {p} {k}"),
+            };
+            let src = format!("(({inner}) {q} w) <u ((x ^ y) * (x & y) * (x | y) * (z + {k}) + w)");
+            let (all, asked_all) = limb_asked(&[&src], true);
+            let (with, asked) = limb_ruled(&[&src], 3, true);
+            assert_eq!(with, all, "{src}");
+            declined += asked_all - asked;
+        }
+        assert!(declined > 0);
+    }
+
+    #[test]
+    fn limb_sums_by_parts_do_not_depend_on_earlier_candidates() {
+        // A sum whose groups of terms are simplified one by one is committed by what it reads
+        // of the sum it replaces: a candidate built before (and left in the arena) changes
+        // nothing.
+        for (src, left) in [
+            (
+                "((a ^ b) + 2 * (a & b)) + ((c | d) - (c & d)) + (a ^ b) * (c | d)",
+                "(a + b) + (c ^ d) + (a ^ b) * (c | d)",
+            ),
+            (
+                "((a | b) + (a & b)) + 3 * ((c ^ d) + 2 * (c & d)) + (a & b) * (c & d)",
+                "(a + b) + 3 * (c + d) + (a & b) * (c & d)",
+            ),
+        ] {
+            let eng = mba_engine(
+                Arc::new(crate::mba::NormalFormSolver::default()),
+                MbaTrust::default().with_backend_certificates(false),
+            );
+            let o = ParseOptions::width(Width::W32);
+            let mut fresh = Context::new();
+            let e = fresh.parse(src, &o).unwrap();
+            let want = eng.simplify(&mut fresh, e).unwrap();
+            let mut used = Context::new();
+            used.parse(left, &o).unwrap();
+            let e = used.parse(src, &o).unwrap();
+            let got = eng.simplify(&mut used, e).unwrap();
+            assert_eq!(
+                fresh.display(want.expr).to_string(),
+                used.display(got.expr).to_string(),
+                "{src}"
+            );
+        }
     }
 }
 
@@ -4997,6 +5272,30 @@ fn masked_bitwise_fixtures() {
     }
 }
 
+/// The borrow of an XOR or an OR with a constant done in limbs (`x ^ c` written `x + c − 2·(x
+/// & c)`, its low limb compared with the sum's): the two low limbs differ by the conjunction,
+/// which stays below the limb's top bit, so the high digit of the sum less the borrow is the
+/// high digit of `x`.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_borrows_of_constant_masks() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        (
+            "extract<18, 14>(x:32 + 0x19766) \
+             + sext<14>(x + 0x19766 & 0x3ffff <u (x ^ 0x19766) & 0x3ffff)",
+            "extract<18, 14>(x)",
+        ),
+        (
+            "extract<18, 14>(x:32 + 0x19766) \
+             + sext<14>(x + 0x19766 & 0x3ffff <u (x | 0x19766) & 0x3ffff)",
+            "extract<18, 14>(x)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 32), want, "{src}");
+    }
+}
+
 /// Limb arithmetic: a sum or difference computed digit by digit, the carry between the digits
 /// written as a comparison of the low ones, is the sum or difference.
 #[cfg(feature = "prove")]
@@ -5023,6 +5322,230 @@ fn limb_carry_fixtures() {
         ),
     ] {
         assert_eq!(simplify(&eng, src, 64), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: a carry whose digits meet no term of its own sum (the sum has as many
+/// terms with the carry read, or more) is read at the root once the rounds have changed
+/// nothing, where the root so written needs no more nodes: the digits are slices of words
+/// that are there, or what reads the sum reads them.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_late_carry_fixtures() {
+    let eng = deobfuscator();
+    let carry = "zext<12>(trunc<20>(x:32 + y:32) <u trunc<20>(x))";
+    for (src, w, want) in [
+        // The borrow of `x - y` beside one of its three high digits: the two others.
+        (
+            "zext<12>(trunc<20>(x:32) <u trunc<20>(y:32)) + extract<20, 12>(y)".to_string(),
+            12,
+            "extract<20, 12>(x) - extract<20, 12>(x - y)",
+        ),
+        // The carry of `x + y` beside the high digit of `x`: the high digit of the word,
+        // which the `^` reads as well, less that of `y`.
+        (
+            format!("(extract<20, 12>(x:32) + {carry}) ^ extract<20, 12>(x + y)"),
+            12,
+            "let %0 = extract<20, 12>(x + y);\n%0 - extract<20, 12>(y) ^ %0",
+        ),
+        // What reads the sum reads the digit left over.
+        (
+            format!("(extract<20, 12>(x:32) + {carry}) * extract<20, 12>(y)"),
+            12,
+            "let %0 = extract<20, 12>(y);\n(extract<20, 12>(x + y) - %0) * %0",
+        ),
+        // The word's low limb beside its high one.
+        (
+            format!("zext<32>(extract<20, 12>(x:32) + {carry}) * (x + y & 0xfffff)"),
+            32,
+            "let %0 = x + y;\n\
+             (%0 & 0xfffff) * zext<32>(extract<20, 12>(%0) - extract<20, 12>(y))",
+        ),
+        // Two borrows, each way.
+        (
+            "zext<12>(trunc<20>(x:32) <u trunc<20>(y:32)) \
+             + zext<12>(trunc<20>(y) <u trunc<20>(x)) + extract<20, 12>(x * y)"
+                .to_string(),
+            12,
+            "extract<20, 12>(x * y) - extract<20, 12>(y - x) - extract<20, 12>(x - y)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, &src, w), want, "{src}");
+    }
+}
+
+/// A carry whose digits meet nothing, of words that are no nodes: read, it is three high
+/// digits for one comparison, and the root with them needs more nodes than it frees. The
+/// late stage leaves it (and ends: it rewrites nothing).
+#[cfg(feature = "prove")]
+#[test]
+fn limb_late_carries_do_not_grow() {
+    let eng = deobfuscator();
+    for (src, w) in [
+        (
+            "zext<32>(trunc<13>(x:32 * y:32) <u trunc<13>(z:32)) + v:32",
+            32,
+        ),
+        (
+            "zext<12>(trunc<20>(x:32 * y:32) <u trunc<20>(z:32 * v:32)) + u:12",
+            12,
+        ),
+        (
+            "zext<12>(trunc<20>(x:32 * y:32) <u trunc<20>(z:32)) + extract<20, 12>(z ^ v:32)",
+            12,
+        ),
+    ] {
+        let mut cx = Context::new();
+        let e = cx
+            .parse(src, &ParseOptions::width(Width::new(w).unwrap()))
+            .unwrap();
+        let before = dag(&mut cx, &[e]);
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(out.roots[0].end, End::Completed, "{src}");
+        let after = dag(&mut cx, &[out.roots[0].expr]);
+        assert!(
+            after <= before,
+            "{src}: {before} -> {after}: {}",
+            cx.display(out.roots[0].expr)
+        );
+        assert_eq!(
+            out.roots[0].expr, e,
+            "{src}: the carry stays as it is written"
+        );
+    }
+}
+
+/// Limb arithmetic: sums of carries and terms their digits may or may not meet, under a
+/// root that reads the sum with something else, stay equal to themselves: exhaustively.
+/// (Such a sum is read in the late stage of the rounds, whatever terms it is left.)
+#[cfg(feature = "prove")]
+#[test]
+fn limb_late_carries_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0031);
+    let mut rng = Rng(97);
+    let mut changed = 0;
+    for i in 0..900 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (6, &["a", "b"])
+        };
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            match g.below(5) {
+                0 => format!("({x} + {y})"),
+                1 => format!("({x} - {y})"),
+                2 => format!("({x} * {})", g.below(1 << w)),
+                3 => format!("({x} ^ {y})"),
+                _ => x,
+            }
+        };
+        let k = 1 + g.below(w - 1);
+        let mask = (1u64 << k) - 1;
+        // One carry or two, of sides that are related or not, and a term that is a high
+        // digit of one of the words, of another value, or none.
+        let mut s = String::new();
+        let mut words = Vec::new();
+        for _ in 0..1 + g.below(2) {
+            let p = value(&mut g);
+            let q = if g.chance(1, 2) {
+                value(&mut g)
+            } else {
+                format!("({p} + {})", value(&mut g))
+            };
+            let sign = if g.chance(1, 3) { '-' } else { '+' };
+            s += &format!(" {sign} zext<{w}>(({p} & {mask}) <u ({q} & {mask}))");
+            words.extend([p, q]);
+        }
+        let own = match g.below(4) {
+            0 => format!("({} >>u {k})", words[g.below(words.len() as u64) as usize]),
+            1 => format!("({} >>u {k})", value(&mut g)),
+            2 => value(&mut g),
+            _ => "0".to_string(),
+        };
+        let s = format!("({own}{s})");
+        let j = 1 + g.below(w - k);
+        let low = format!("zext<{w}>(trunc<{j}>({s}))");
+        let v = value(&mut g);
+        let src = match g.below(5) {
+            0 => low,
+            1 => format!("{low} * {v}"),
+            2 => format!("{low} ^ ({} >>u {k})", words[0]),
+            3 => format!("({low} << {k}) | ({} & {mask})", words[0]),
+            _ => format!("select(t:1, {low}, {v})"),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 300, "{changed}");
+}
+
+/// Low digits a handler computes apart from the word.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_anchor_fixtures() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        // The low digit at its own width, the multiplier reduced to it (0x2d4b1 is 177 modulo
+        // 2^9): the word is the one the high digit is of.
+        (
+            "let %0 = (x:32 ^ y:32) * 0x2d4b1; \
+             let %1 = (trunc<9>(x) ^ trunc<9>(y)) * 177; \
+             zext<9>(%1 + 301 <u %1) + extract<9, 9>(%0)",
+            "extract<9, 9>((x ^ y) * 0x2d4b1 + 301)",
+        ),
+        // The high digit of `-(b - a)`: the borrow of a negation is `low != 0`.
+        (
+            "let %0 = b:32 - a:32; let %1 = a - b & 4095; let %2 = a - b + c:32 & 4095; \
+             trunc<20>(%2 | (c >>u 12) - (%0 >>u 12) - zext<32>(%1 != 0) + zext<32>(%2 <u %1) << 12)",
+            "trunc<20>(a - b + c)",
+        ),
+        // A carry out of a middle digit: a constant added limb by limb, the digit of the
+        // constant (868 of 0xd9345) added to the word's own.
+        (
+            "zext<12>(extract<10, 10>(x:32 + 837) - 156 <u extract<10, 10>(x)) \
+             + extract<20, 12>(x)",
+            "extract<20, 12>(x + 0xd9345)",
+        ),
+        // Not where the digit of the difference may be all ones (the carry into the digit
+        // then makes the two equal): the comparison stays, the constant beside its slice
+        // taken into the slice's sum.
+        (
+            "zext<12>(extract<10, 10>(x:32 + 837) - 1 <u extract<10, 10>(x)) \
+             + extract<20, 12>(x)",
+            "zext<12>(extract<10, 10>(x + 0xfff45) <u extract<10, 10>(x)) + extract<20, 12>(x)",
+        ),
+        // The middle limb of `x - y`, a 64-bit word in limbs of 26 bits, its low limb
+        // computed in a 32-bit register: the digits are the 64-bit word's.
+        (
+            "let %4 = -trunc<32>(y:64); let %5 = %4 & 0x3ffffff; let %11 = %4 + trunc<32>(x:64); \
+             zext<32>(trunc<26>(-zext<32>(%5 != 0) + (-extract<26, 32>(y) + extract<26, 32>(x)) \
+             + zext<32>(%11 & 0x3ffffff <u %5)))",
+            "zext<32>(extract<26, 26>(x - y))",
+        ),
+        // The high limb of `(a ^ b) ^ c` written `x + c - 2·(x & c)`, the AND's digit read
+        // one bit lower and of a slice of `a ^ b` where the borrow's own digit is of the
+        // slices of `a` and `b`: one value, and it cancels.
+        (
+            "let %0 = a:32 ^ b:32; \
+             zext<32>(trunc<13>(zext<32>(extract<18, 13>(%0 + c:32)) \
+             - (c >>u 17 & zext<32>(extract<17, 13>(%0))) \
+             + sext<32>(%0 + c & 0x3ffff <u (%0 ^ c) & 0x3ffff)))",
+            "zext<32>(extract<18, 13>(a ^ b ^ c))",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 32), want, "{src}");
     }
 }
 
@@ -5111,14 +5634,9 @@ fn limb_slice_fixtures() {
         // the words are XORs once nothing reads their sums.
         (xor_limbs(&["a", "b", "c"]), 32, "extract<25, 7>(b ^ c ^ a)"),
         // Three limbs: the carry into the third is no comparison of two low digits, and the
-        // limb is found as the slice of the word and proved. (The word is left as the handler
-        // spells its XOR with a constant, `x + c - 2·(x & c)` with the constants folded.)
-        (
-            three,
-            32,
-            "let %0 = w + 0x2c51a7e3 & 0x51c3a96c;\n\
-             extract<24, 8>(w - (%0 + %0) + 0x7e15514f)",
-        ),
+        // limb is found as the slice of the word and proved. (The word, which the handler
+        // spells `x + c - 2·(x & c)` with the constants folded, is the XOR with the constant.)
+        (three, 32, "extract<24, 8>(w + 0x2c51a7e3 ^ 0x51c3a96c)"),
         // A digit that is no truncation of the sum's operand: a value below `2^k`, and a mask
         // under the sum.
         (
@@ -5170,13 +5688,14 @@ fn limb_slice_fixtures() {
             "a ^ b",
         ),
         // The sum of two digits carries: its high digit is not 0, and this is no slice of
-        // `x` (it was taken for one).
+        // `x` (it was taken for one). It is the high digit of `x` less that carry (read in
+        // the late stage of the rounds: the sum gets no fewer terms).
         (
             "extract<14, 16>(x - zext<32>(a:14) - zext<32>(b:14)) \
              + zext<16>(trunc<14>(x) <u (a:14 + b:14))"
                 .into(),
             32,
-            "zext<16>(trunc<14>(x) <u a + b) + extract<14, 16>(x - zext<32>(a) - zext<32>(b))",
+            "extract<14, 16>(x) - extract<14, 16>(zext<32>(a) + zext<32>(b))",
         ),
     ] {
         assert_eq!(simplify(&eng, &src, w), want, "{src}");
@@ -5198,6 +5717,682 @@ fn limb_slice_fixtures() {
             "extract<25, 7>(b ^ c ^ a ^ d ^ e)"
         );
     }
+}
+
+/// Limbs whose word is no node: a handler that adds a constant adds it limb by limb, so the
+/// node the low limb is masked from has only the constant's low digit; and a limb's raw sum
+/// read wider than the limb holds the carry out of its register.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_made_word_fixtures() {
+    let eng = deobfuscator();
+    // `x * 12123 + 46789` in limbs of 9 and 7 bits (46789 is 91 above 197): the high limb is
+    // its own digit of the product, the carry of the low limb's 197 and 91.
+    let high = "(p >>u 9) + zext<16>((p + 197 & 0x1ff) <u 197) + 91";
+    for (src, want) in [
+        (
+            format!("let p = x * 0x2f5b; trunc<7>({high})"),
+            "extract<9, 7>(x * 12123 - 18747)",
+        ),
+        // Read one bit wider, the sum has the carry out of the 16 bits: a slice of the word
+        // zero-extended.
+        (
+            format!("let p = x * 0x2f5b; trunc<8>({high})"),
+            "extract<9, 8>(zext<32>(x * 12123) + 46789)",
+        ),
+        // The same of the sum of two words.
+        (
+            "trunc<8>((a >>u 9) + (b >>u 9) + zext<16>((a + b & 0x1ff) <u (a & 0x1ff)))".into(),
+            "extract<9, 8>(zext<32>(a) + zext<32>(b))",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, &src, 16), want, "{src}");
+    }
+}
+
+/// Limbs of a word plus a constant, the constant added limb by limb (sometimes with the wrong
+/// low digit in the carry), read on any number of bits up to the register's: whatever word
+/// they are read as a slice of, the result is equal at every assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_made_words_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0020);
+    let mut rng = Rng(90);
+    let mut changed = 0;
+    let w = 7u64;
+    for _ in 0..400 {
+        let word = match g.below(3) {
+            0 => format!("(a:{w} * {})", g.below(1 << w) | 1),
+            1 => format!("(a:{w} + b:{w})"),
+            _ => format!("a:{w}"),
+        };
+        let k = 1 + g.below(w - 2);
+        let mask = (1u64 << k) - 1;
+        let c = g.below(1 << w);
+        let (c0, c1) = (c & mask, c >> k);
+        let seen = if g.chance(1, 4) {
+            g.below(mask + 1)
+        } else {
+            c0
+        };
+        let j = 1 + g.below(w);
+        let carry = format!("zext<{w}>((({word} + {c0}) & {mask}) <u {seen})");
+        let src = format!("trunc<{j}>(({word} >>u {k}) + {carry} + {c1})");
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 200, "{changed}");
+}
+
+/// The top limb of `(w + k) ^ c` in limbs of 12, 12 and 8 bits over the word `w` (an
+/// expression of 32 bits), as [`limb_slice_fixtures`] spells it.
+#[cfg(feature = "prove")]
+fn three_limbs(w: &str) -> String {
+    format!(
+        "let %20 = {w}; \
+         let %0 = %20 + 0x2c51a7e3; \
+         let %1 = trunc<16>(%0 & 4095); \
+         let %2 = (%20 >>u 12) + zext<32>(%1 <u trunc<16>(%20 & 4095)); \
+         let %3 = %2 + 0x2c51a; \
+         let %4 = trunc<16>(%3 & 4095); \
+         let %5 = zext<8>(%4 <u trunc<16>((%20 >>u 12) & 4095)); \
+         let %6 = %20 + 0x7e15514f; \
+         let %7 = trunc<16>(%6 & 4095); \
+         let %8 = %2 + zext<32>({c0}) + 0x7e154; \
+         let %9 = trunc<16>(%8 & 4095); \
+         let %10 = trunc<16>(%6 + (%0 & 0x51c3a96c) * -2 & 4095); \
+         let %11 = trunc<16>(%8 - (trunc<32>((zext<64>(%3) << 1) \
+         + zext<64>((%0 & 4095) >>u 11)) & 0xa3875) + sext<32>({b0}) & 4095); \
+         %5 + trunc<8>(zext<64>(%20 >>u 24) + 125) + zext<8>({c1}) \
+         - (((trunc<8>(%20 >>u 24) << 1) + (%5 << 1) + 88 | extract<11, 8>(%3 & 4095)) & 163) \
+         + sext<8>({b1})",
+        c0 = below("%7", "%1"),
+        b0 = below("%7", "%10"),
+        c1 = below("%9", "%4"),
+        b1 = below("%9", "%11"),
+    )
+}
+
+/// A limb is read back whatever computes its handler's operand: over a product of two
+/// variables as over a symbol (in a slice proof's copy the product is a fresh symbol).
+#[cfg(feature = "prove")]
+#[test]
+fn limb_slice_proofs_take_products_for_symbols() {
+    let eng = deobfuscator();
+    let run = |src: &str| {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+        let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(out.roots[0].end, End::Completed);
+        cx.display(out.roots[0].expr).to_string()
+    };
+    assert_eq!(
+        run(&three_limbs("w:32")),
+        "extract<24, 8>(w + 0x2c51a7e3 ^ 0x51c3a96c)"
+    );
+    assert_eq!(
+        run(&three_limbs("(a:32 * b:32)")),
+        "extract<24, 8>(a * b + 0x2c51a7e3 ^ 0x51c3a96c)"
+    );
+}
+
+/// A limb of two products by constants written digit by digit, joined to its word's low
+/// limb: the proof's two sides are one sum over the slices of the operands once their sums
+/// are written one way (the search alone does not decide it within the caps), and the limbs
+/// are the word.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_products_in_digits_are_read_back() {
+    let eng = deobfuscator();
+    let (k1, k2, m) = ("0x511bff07", "0x2c51a7e3", "0x3ffff");
+    let src = format!(
+        "let %0 = a:32 * {k1}; let %1 = b:32 * {k2}; let %2 = %0 + %1; let %3 = %2 + c:32; \
+         let %4 = extract<18, 14>((a & {m}) * {k1}) + trunc<14>((a >>u 18) * {k1}); \
+         let %5 = extract<18, 14>((b & {m}) * {k2}) + trunc<14>((b >>u 18) * {k2}); \
+         let %6 = %4 + %5 + zext<14>((%2 & {m}) <u (%0 & {m})) + extract<18, 14>(c) \
+         + zext<14>((%3 & {m}) <u (c & {m})); \
+         concat(%6, trunc<18>(%3))"
+    );
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &ParseOptions::width(Width::W32)).unwrap();
+    let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+    assert_eq!(out.roots[0].end, End::Completed);
+    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut Rng(81)));
+    assert_eq!(
+        cx.display(out.roots[0].expr).to_string(),
+        "b * 0x2c51a7e3 + a * 0x511bff07 + c"
+    );
+}
+
+/// Limb arithmetic: a word several limbs read stays one node for them all.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_word_fixtures() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        // Read under 7 bits and under 14: written once, under 14 (a copy for each reader, its
+        // constants reduced to that reader's bits, is `x * 7 - 59` beside `x * -249 + 4933`).
+        (
+            "let %0 = x * 0x511bff07 + (y << 14) + (z << 20) + 0x764d9345; \
+             trunc<8>((%0 & 127) * a + ((%0 & 16383) >>u 7) * b)",
+            "let %0 = x * -249 + 4933;\n\
+             trunc<8>(zext<32>(extract<7, 7>(%0)) * b + (%0 & 127) * a)",
+        ),
+        // The truncation of a sum reaches a value whose truncation something else reads: it
+        // is used, where narrowing the value again would build its `select` a second time
+        // (and the sum would stay 64 bits wide, no XOR).
+        (
+            "let %0 = select(c:1, p:64 >>u 32, q:64 >>u 32); \
+             let %1 = trunc<32>(%0); \
+             let %2 = a & %1; \
+             trunc<32>(zext<64>(a) + %0) - (%2 + %2)",
+            "extract<32, 32>(select(c, p, q)) ^ a",
+        ),
+        // A register read limb by limb, each limb through its own chain of `select`s, is the
+        // limbs of the one chain over the registers.
+        (
+            "let %0 = select(c:1, a, select(d:1, b, e)); \
+             (%0 >>u s) + zext<32>(select(c, trunc<16>(a & 16383), \
+             select(d, trunc<16>(b & 16383), trunc<16>(e & 16383)))) \
+             * select(c, a >>u 14, select(d, b >>u 14, e >>u 14))",
+            "let %0 = select(c, a, select(d, b, e));\n\
+             (%0 & 16383) * (%0 >>u 14) + (%0 >>u s)",
+        ),
+        // Without the chain over the registers: it is built, one for the two.
+        (
+            "zext<32>(select(c:1, trunc<16>(a & 16383), trunc<16>(b & 16383))) \
+             * select(c, a >>u 14, b >>u 14)",
+            "let %0 = select(c, a, b);\n\
+             (%0 & 16383) * (%0 >>u 14)",
+        ),
+        // An arm that masks the low bits beside one that zero-extends as many: one value.
+        (
+            "select(c:1, x & 255, zext<32>(v:8)) + zext<32>(select(c, trunc<8>(x), v)) * z",
+            "let %0 = zext<32>(select(c, trunc<8>(x), v));\n\
+             %0 * z + %0",
+        ),
+        // A word XORed with itself shifted by a count taken from it, each part selected
+        // apart: the arms are the same operations over one pair of words and the same slice
+        // of both, so they are done once over the selected word.
+        (
+            "let %1 = trunc<32>(p:64); \
+             let %2 = extract<32, 32>(q:64); \
+             let %3 = select(c:1, %1, %2); \
+             let %4 = %1 >>u concat(2:29, extract<29, 3>(p)); \
+             let %5 = %2 >>u concat(2:29, extract<61, 3>(q)); \
+             select(c, %4, %5) + %3 - (select(c, %4 & %1, %5 & %2) << 1)",
+            "let %0 = select(c, trunc<32>(p), extract<32, 32>(q));\n\
+             %0 >>u concat(2:29, extract<29, 3>(%0)) ^ %0",
+        ),
+        // A `select` that exists is used though the other arm's operation is shared (it costs
+        // nothing: the shift is done once more, on it, and once less, on an arm).
+        (
+            "let %5 = b >>u 14; \
+             let %6 = select(c:1, a >>u 14, %5); \
+             -select(c, a, b) * %6 + %5",
+            "let %0 = select(c, a, b);\n\
+             -%0 * (%0 >>u 14) + (b >>u 14)",
+        ),
+        // A limb of a register whose half is selected whole elsewhere is that limb of the
+        // half.
+        (
+            "zext<32>(select(c:1, extract<28, 4>(p:64), extract<60, 4>(q:64))) \
+             * select(c, trunc<32>(p), extract<32, 32>(q))",
+            "let %0 = select(c, trunc<32>(p), extract<32, 32>(q));\n\
+             zext<32>(extract<28, 4>(%0)) * %0",
+        ),
+        // A slice across the seam of the words the arms of a `select` join: the limbs on
+        // either side, and the low limbs nothing reads are gone.
+        (
+            "zext<32>(extract<22, 10>(select(c:1, concat(a:6, concat(b:11, x:15)), \
+             select(d:1, concat(e:6, concat(f:11, y:15)), g))))",
+            "zext<32>(select(c, concat(a, extract<7, 4>(b)), \
+             select(d, concat(e, extract<7, 4>(f)), extract<22, 10>(g))))",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 32), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: one word, however its readers spell it. A carry whose sides are another
+/// spelling of the word the sum holds the high digit of (its constant reduced to the limb's
+/// bits, or the product computed in digits) is read over that word; a carry under `~`; the
+/// top limb of `v ^ (v >>u s)` written as that of `v`; a constant added to a slice; and two
+/// sums below a root that are one word on the bits read of them.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_one_word_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        // The low limb with the constant reduced to it, beside the word's high digit.
+        (
+            "zext<8>(trunc<8>(x:16 * 0x35 + 93) <u trunc<8>(x * 0x35)) \
+             + extract<8, 8>(x * 0x6b35)",
+            8,
+            "extract<8, 8>(x * 27445 + 93)",
+        ),
+        // The low limb as a product in 6-bit digits of a 12-bit limb.
+        (
+            "let %0 = (x:16 & 0xfff) * 53 + (x & 63) * 2816; \
+             zext<8>(trunc<8>(%0 + 93) <u trunc<8>(%0)) + extract<8, 8>(x * 0x6b35)",
+            8,
+            "extract<8, 8>(x * 27445 + 93)",
+        ),
+        // One side written over the word already, the other over its reduced spelling: the
+        // difference is taken over the word.
+        (
+            "let %0 = (x:16 & 63) * 53; \
+             zext<4>(trunc<6>(x * 0x6b35 + y:16 * 64 + 29) <u trunc<6>(%0)) \
+             + extract<6, 4>(x * 0x6b35) - extract<6, 4>(y * 64 + 29)",
+            4,
+            "extract<6, 4>(x * 27445 + 29) - trunc<4>(y)",
+        ),
+        // The carry out of a middle limb under `~` (`a − ~c` is `a + c + 1`), and the
+        // constant taken into the word.
+        (
+            "let %0 = x:16 * 0x6b35; \
+             extract<12, 4>(%0) - ~zext<4>(extract<8, 4>(%0 + 0x35d) <u extract<8, 4>(%0))",
+            4,
+            "extract<12, 4>(x * 27445 + 4957)",
+        ),
+        // The top limb of a word XORed with itself shifted is the top limb of the word.
+        (
+            "((v:16 ^ (v >>u 9)) & 1023) * 0x6b35 + (v >>u 10) * 0xd400",
+            16,
+            "(v >>u 9 ^ v) * 27445",
+        ),
+        // A constant added to a slice of a sum is the sum's.
+        (
+            "extract<8, 8>(x:16 * 0x6b35 + 93) + 7",
+            8,
+            "extract<8, 8>(x * 27445 + 1885)",
+        ),
+        // Two readers, each with the constant reduced to its bits: one word.
+        (
+            "zext<8>(extract<4, 4>(x:16 * 0x35 + 5)) + extract<8, 8>(x * 0x6b35 + 5)",
+            8,
+            "let %0 = x * 27445 + 5;\n\
+             zext<8>(extract<4, 4>(%0)) + extract<8, 8>(%0)",
+        ),
+        // The product in digits, read below its limb's top, beside the product of the word.
+        (
+            "let %0 = (x:16 & 0xfff) * 53 + (x & 63) * 2816; \
+             zext<8>(extract<3, 5>(%0)) + extract<8, 8>(x * 0x6b35) * y:8",
+            8,
+            "let %0 = x * 27445;\n\
+             extract<8, 8>(%0) * y + zext<8>(extract<3, 5>(%0))",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: two sums written over other words at the root in one step, where what
+/// one is written as reads the other. `lo·K` is read on its low digit and is `lo·k0` there;
+/// `x·k0 + lo·(k1 << s) + c` is read on two digits and is `lo·K + hi·(k0 << d) + c` there,
+/// which reads `lo·K` on both: the second has to keep the first as it was, not as the first
+/// is written for its own readers. Equal at every value of `x`.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_one_word_keeps_what_it_reads() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x0b17_5eed);
+    let mut rng = Rng(53);
+    for i in 0..240 {
+        let (w, d) = match i % 3 {
+            0 => (8u64, 3u64),
+            1 => (8, 2),
+            _ => (12, 3 + g.below(2)),
+        };
+        let k0 = g.below(1 << d) | 1;
+        let k1 = 1 + g.below(3);
+        let c = g.below(1 << d);
+        let s = d + 1;
+        let lo = format!("(x:{w} & {})", (1u64 << d) - 1);
+        let hi = format!("zext<{w}>(extract<{d}, {d}>(x))");
+        let sum = format!("(x * {k0} + {lo} * {} + {c})", k1 << s);
+        let wide = 2 * w;
+        let src = format!(
+            "zext<{w}>(extract<{d}, {d}>({sum})) ^ (zext<{w}>(trunc<{d}>({lo} * {})) << {d}) \
+             ^ extract<{}, {w}>(zext<{wide}>({hi} * {}) + zext<{wide}>({lo} * {}) \
+             + zext<{wide}>({lo} * {k0}))",
+            k0 + (k1 << s),
+            2 * d,
+            k0 << d,
+            k1 << s
+        );
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+    }
+}
+
+/// Limb arithmetic: a product `x·k` in several spellings (its constant with other bits
+/// above some bit, or two limbs each under a constant of its own), a carry between two of
+/// them beside the high digit of a third, slices of them added and constants added to the
+/// slices, and the limbs of `a ^ (a >>u s)` with the top one written over `a`: each stays
+/// equal to itself at every assignment. The spellings agree on their low bits only, and
+/// the top limbs only for a shift that clears them, so a reading that took one for another
+/// on more bits would be caught.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_one_word_readings_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0031);
+    let mut rng = Rng(97);
+    let mut changed = 0;
+    let w: u64 = 7;
+    let mask = (1u64 << w) - 1;
+    for i in 0..900 {
+        let s = 1 + g.below(w - 1);
+        let x = match g.below(3) {
+            0 => "a:7".to_string(),
+            1 => format!("(a:7 ^ (a >>u {s}))"),
+            _ => "(a:7 + b:7)".to_string(),
+        };
+        let k = g.below(1 << w) | 1;
+        // `x·k` right on its low `m` bits: other bits above them in the constant, and the
+        // product as it is or in two limbs.
+        let spell = |g: &mut Rng, m: u64| {
+            let other = (k ^ (g.below(1 << w) << m)) & mask;
+            let h = m.div_ceil(2);
+            if m < 2 || g.chance(1, 2) {
+                format!("({x} * {other})")
+            } else {
+                let (lo, hi) = (other & ((1 << h) - 1), other >> h << h);
+                format!(
+                    "(({x} & {}) * {lo} + ({x} & {}) * {hi})",
+                    (1u64 << m) - 1,
+                    (1u64 << h) - 1
+                )
+            }
+        };
+        let (src, j) = match i % 3 {
+            // A carry between two spellings beside the high digit of the word.
+            0 => {
+                let at = 1 + g.below(w - 2);
+                let j = 1 + g.below(w - at);
+                let word = spell(&mut g, w);
+                let m = at + g.below(w - at + 1);
+                let q = spell(&mut g, m);
+                let d = if g.chance(1, 2) {
+                    format!("{}:7", g.below(1 << w))
+                } else {
+                    "b:7".to_string()
+                };
+                let p = match g.below(3) {
+                    0 => format!("({q} + {d})"),
+                    1 => format!("({word} + {d})"),
+                    _ => format!("({} + {d})", spell(&mut g, at)),
+                };
+                let (x, y) = if at > 1 && g.chance(1, 3) {
+                    let o = 1 + g.below(at - 1);
+                    let side = |v: &str| format!("extract<{o}, {}>({v})", at - o);
+                    (side(&p), side(&q))
+                } else {
+                    (format!("trunc<{at}>({p})"), format!("trunc<{at}>({q})"))
+                };
+                let (x, y) = if g.chance(1, 4) { (y, x) } else { (x, y) };
+                let high = |v: &str| format!("extract<{at}, {j}>({v})");
+                let carry = match g.below(4) {
+                    0 => format!("- ~zext<{j}>({x} <u {y})"),
+                    1 => format!("+ sext<{j}>({x} <u {y})"),
+                    _ => format!("+ zext<{j}>({x} <u {y})"),
+                };
+                let sign = if g.chance(1, 4) { '-' } else { '+' };
+                let mut src = format!("{} {carry}", high(&word));
+                if g.chance(1, 3) {
+                    src.push_str(&format!(" {sign} {}", high(&d)));
+                }
+                if g.chance(1, 3) {
+                    src.push_str(&format!(" + {}", g.below(1 << j)));
+                }
+                (src, j)
+            }
+            // Slices of two spellings, a constant added to each word and to each slice.
+            1 => {
+                let slice = |g: &mut Rng| {
+                    let lo = 1 + g.below(w - 2);
+                    let n = 1 + g.below(w - lo);
+                    let v = spell(g, lo + n);
+                    let c = g.below(1 << w);
+                    let e = format!("zext<7>(extract<{lo}, {n}>({v} + {c}))");
+                    if g.chance(1, 2) {
+                        format!("({e} + {})", g.below(1 << n))
+                    } else {
+                        e
+                    }
+                };
+                let (t, u) = (slice(&mut g), slice(&mut g));
+                let src = match g.below(3) {
+                    0 => format!("{t} + {u}"),
+                    1 => format!("{t} * b:7 + {u}"),
+                    _ => format!("{t} + ({} >>u {})", spell(&mut g, w), g.below(w)),
+                };
+                (src, w)
+            }
+            // The limbs of `a ^ (a >>u s)`, the top one written over `a`: the word only
+            // where the shift clears the top limb.
+            _ => {
+                let m = 1 + g.below(w - 1);
+                let top = (k << m) & mask;
+                let src = format!(
+                    "((a:7 ^ (a >>u {s})) & {}) * {k} + (a >>u {m}) * {top} + b:7",
+                    (1u64 << m) - 1
+                );
+                (src, w)
+            }
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(j as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 300, "{changed}");
+}
+
+/// Limb arithmetic: the step `T ^ (T << s)` in limbs, and one word in several spellings. The
+/// low limb of `T << s` is written `(T & 1) << s` and the carry of `T + (T << s)` compares
+/// with it: read over `T << s`, whose digit the sum holds in two pieces of `T`. The same
+/// with a piece cut from the word at another width, its constant reduced to the limb's
+/// bits; the high limb of a product written over the slices of the operands of an `^`; and
+/// the borrow of an XOR whose operand is a truncated product.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_shifted_word_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        // The high limb of `T + (T << 5) − 2·(T & (T << 5))` at 6 + 10 bits.
+        (
+            "let %0 = x:16 * 0x6b35; \
+             zext<10>(extract<1, 5>(%0)) + extract<6, 10>(%0) * 33 \
+             + zext<10>(trunc<6>(%0 + (%0 << 5)) <u trunc<6>((%0 & 1) << 5)) \
+             - trunc<10>(%0 & (%0 >>u 5))",
+            10,
+            "let %0 = x * 27445;\n\
+             extract<6, 10>(%0 + (%0 << 5)) - trunc<10>(%0 & %0 >>u 5)",
+        ),
+        // The piece below the limb's top cut from a 32-bit product over the sign extension.
+        (
+            "let %0 = x:16 * 0x6b35 + 9; \
+             zext<10>(extract<1, 5>(sext<32>(x) * 53 + 9)) + extract<6, 10>(%0) * 33 \
+             + zext<10>(trunc<6>(%0 + (%0 << 5)) <u trunc<6>((%0 & 1) << 5)) \
+             - trunc<10>(%0 & (%0 >>u 5))",
+            10,
+            "let %0 = x * 27445 + 9;\n\
+             extract<6, 10>(%0 + (%0 << 5)) - trunc<10>(%0 & %0 >>u 5)",
+        ),
+        // The high limb of `a ^ b` written over the slices of `a` and `b`.
+        (
+            "zext<16>(extract<6, 10>(a:16) ^ extract<6, 10>(b:16)) * 0xcd40 \
+             + ((a ^ b) & 63) * 0x6b35",
+            16,
+            "(a ^ b) * 27445",
+        ),
+        // The carry and the borrow of an XOR in limbs, one operand a truncated product.
+        (
+            "let %0 = trunc<16>(y:32 * 0x12345); \
+             extract<6, 10>(%0) + extract<6, 10>(b:16) - extract<5, 10>(%0 & b) \
+             + zext<10>(trunc<6>(%0 + b) <u trunc<6>(%0)) \
+             - zext<10>(trunc<6>(%0 + b) <u trunc<6>(%0 ^ b))",
+            10,
+            "extract<6, 10>(trunc<16>(y * 0x12345) ^ b)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: the readings of a word shifted left and of one word at several widths
+/// stay equal to their inputs at every assignment. A carry whose side is `(T & m) << s`,
+/// with masks that have the digit's bits and masks that lack one (the side is then no
+/// digit of `T << s`); pieces of `T` cut from a wider product whose constants agree with
+/// the word's on some low bits only; a bitwise function of two slices cut at the same and at
+/// different bits beside the function of the words; and the carries of an XOR and an OR in
+/// limbs over a truncated product.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_shifted_word_readings_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x5eed_0b17);
+    let mut rng = Rng(131);
+    let mut changed = 0;
+    let w: u64 = 7;
+    let mask = (1u64 << w) - 1;
+    for i in 0..800 {
+        let k = g.below(1 << w) | 1;
+        let c = g.below(1 << w);
+        let t = match g.below(3) {
+            0 => "a:7".to_string(),
+            1 => format!("(a:7 * {k} + {c})"),
+            _ => "(a:7 + b:7)".to_string(),
+        };
+        let at = 2 + g.below(w - 3);
+        let j = w - at;
+        let (src, bits) = match i % 4 {
+            // The carry of `T + (T << s)` against the masked low digit of `T << s`.
+            0 => {
+                let s = 1 + g.below(at - 1);
+                let digit = (1u64 << (at - s)) - 1;
+                let m = match g.below(4) {
+                    0 => digit,
+                    1 => digit | (g.below(1 << w) << (at - s)) & mask,
+                    2 => digit & !(1 << g.below(at - s)),
+                    _ => g.below(1 << w),
+                };
+                let d = match g.below(3) {
+                    0 => String::new(),
+                    1 => format!(" + {}", g.below(1 << w)),
+                    _ => " + b:7".to_string(),
+                };
+                let carry = format!(
+                    "zext<{j}>(trunc<{at}>({t} + ({t} << {s}){d}) <u trunc<{at}>(({t} & {m}) << {s}))"
+                );
+                let n = s.min(j);
+                let mut src = format!(
+                    "zext<{j}>(extract<{}, {n}>({t})) + extract<{at}, {j}>({t}) * {} + {carry}",
+                    at - s,
+                    (1 + (1u64 << s)) & ((1 << j) - 1)
+                );
+                if g.chance(1, 2) {
+                    src.push_str(&format!(" - trunc<{j}>({t} & ({t} >>u {s}))"));
+                }
+                (src, j)
+            }
+            // Pieces of one word at two widths: a wider product right on `m` low bits.
+            1 => {
+                let m = 1 + g.below(w);
+                let high = |g: &mut Rng, v: u64| (v ^ (g.below(1 << 5) << m)) & 0xfff;
+                let (kw, cw) = (high(&mut g, k), high(&mut g, c));
+                let ext = if g.chance(1, 2) { "sext" } else { "zext" };
+                let wide = format!("({ext}<12>(a:7) * {kw} + {cw})");
+                let word = format!("(a:7 * {k} + {c})");
+                let lo = g.below(at);
+                let carry = format!(
+                    "zext<{j}>(trunc<{at}>({word} + b:7) <u trunc<{at}>({}))",
+                    if g.chance(1, 2) { &wide } else { &word }
+                );
+                let src = format!(
+                    "extract<{at}, {j}>({word}) + {carry} \
+                     + zext<{j}>(extract<{lo}, {}>({wide})) * {} - zext<{j}>(extract<{lo}, {}>({word}))",
+                    (at - lo).min(j),
+                    1 + g.below(3),
+                    (at - lo).min(j)
+                );
+                (src, j)
+            }
+            // A bitwise function of two slices beside the function of the words.
+            2 => {
+                let op = ["^", "|", "&"][g.below(3) as usize];
+                let lo = at + g.below(2) - g.below(2);
+                let n = j - 1;
+                let src = format!(
+                    "zext<7>(extract<{at}, {n}>(a:7) {op} extract<{lo}, {n}>(b:7)) * {} \
+                     + ((a {op} b) & {}) * {k} + {c}",
+                    (k << at) & mask,
+                    (1u64 << at) - 1
+                );
+                (src, w)
+            }
+            // The carry and the borrow of an XOR or an OR in limbs over a truncated product.
+            _ => {
+                let p = format!("trunc<7>(zext<10>(a:7) * {})", k | (g.below(8) << w));
+                let (f, and, by) = if g.chance(1, 2) {
+                    ("^", format!("extract<{}, {j}>({p} & b:7)", at - 1), 1)
+                } else {
+                    ("|", format!("extract<{at}, {j}>({p} & b:7)"), 0)
+                };
+                let q = if g.chance(1, 4) {
+                    "b:7".to_string()
+                } else {
+                    p.clone()
+                };
+                let src = format!(
+                    "extract<{at}, {j}>({p}) + extract<{at}, {j}>(b:7) - {and} \
+                     + zext<{j}>(trunc<{at}>({p} + b) <u trunc<{at}>({q})) \
+                     - zext<{j}>(trunc<{at}>({p} + b) <u trunc<{at}>({p} {f} b)) + {}",
+                    g.below(2) * by
+                );
+                (src, j)
+            }
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(bits as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 400, "{changed}");
 }
 
 /// Limb arithmetic: sums of high digits and of carries written as comparisons of low digits,
@@ -5341,7 +6536,7 @@ fn limb_carries_are_sound() {
         let e = cx
             .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
             .unwrap_or_else(|err| panic!("{src}: {err}"));
-        let out = eng.simplify(&mut cx, e).unwrap();
+        let out = checked(&eng, &mut cx, e);
         assert!(
             equivalent(&mut cx, e, out.expr, &mut rng),
             "{src} vs {}",
@@ -5350,6 +6545,1898 @@ fn limb_carries_are_sound() {
         changed += u64::from(out.changed);
     }
     assert!(changed > 600, "{changed}");
+}
+
+/// Carries of digits computed in a register narrower than the word: the low digits from
+/// truncations of 7-bit values to 4 or 5 bits, the sum's high digits slices of the values
+/// themselves that reach past the register's width, the sum read on more bits than the
+/// register has above the digit. Checked at every assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_lifted_digits_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0005);
+    let mut rng = Rng(81);
+    let mut changed = 0;
+    for _ in 0..700 {
+        let w = 7u64;
+        let reg = 4 + g.below(2);
+        let k = 1 + g.below(reg - 1);
+        let mask = (1u64 << k) - 1;
+        let sym = |g: &mut Rng| ["a:7", "b:7"][g.below(2) as usize].to_string();
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            let c = g.below(1 << w);
+            match g.below(6) {
+                0 | 1 => x,
+                2 => format!("({x} + {y})"),
+                3 => format!("({x} - {y})"),
+                4 => format!("({x} ^ {c})"),
+                _ => format!("({x} + {c})"),
+            }
+        };
+        // A register's value and the word it is the low bits of.
+        let low = |g: &mut Rng, v: &str| match g.below(3) {
+            0 => (format!("trunc<{reg}>({v})"), v.to_string()),
+            1 => (format!("-trunc<{reg}>({v})"), format!("-({v})")),
+            _ => {
+                let u = value(g);
+                (
+                    format!("(trunc<{reg}>({v}) + trunc<{reg}>({u}))"),
+                    format!("({v} + {u})"),
+                )
+            }
+        };
+        let v = value(&mut g);
+        let (qr, q) = low(&mut g, &v);
+        let v = value(&mut g);
+        let (dr, d) = low(&mut g, &v);
+        let (pr, p) = if g.chance(3, 4) {
+            (format!("({qr} + {dr})"), format!("({q} + {d})"))
+        } else {
+            let v = value(&mut g);
+            low(&mut g, &v)
+        };
+        // The sum's width (the digits reach past the register), and what is read of it.
+        let m = (reg - k + 1 + g.below(w - reg)).min(w - k);
+        let j = 1 + g.below(m);
+        let high = |v: &str| format!("extract<{k}, {m}>({v})");
+        let mut src = String::new();
+        let mut term = |g: &mut Rng, t: String| {
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" {sign} {t}"));
+        };
+        let carry = if g.chance(1, 5) {
+            format!("zext<{m}>(({qr} & {mask}) != 0)")
+        } else {
+            format!("zext<{m}>(({pr} & {mask}) <u ({qr} & {mask}))")
+        };
+        term(&mut g, carry);
+        for v in [p.clone(), q.clone(), d.clone()] {
+            if g.chance(3, 4) {
+                term(&mut g, high(&v));
+            }
+        }
+        let src = format!("trunc<{j}>(0:{m}{src})");
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 350, "{changed}");
+}
+
+/// The reading of a carry by the sum of its sides with its carry out, at every assignment:
+/// with `P = Q + D` of `W` bits and `S = zext(Q) + zext(D)` at `W' > W` bits, `lo_k(P) <u
+/// lo_k(Q)` is `hi_k(S) − hi_k(Q) − hi_k(D)` on any `j` bits, every digit zero-extended. A
+/// borrow against that word, `lo_k(P) <u lo_k(Q ^ D)` (or `Q | D`), is `hi_k(S) − hi_k(Q ^
+/// D) − hi_k(2·zext(Q & D))` (or of `zext(Q & D)`) modulo `2^j` where `W' ≥ k + j`.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_wide_carry_identity() {
+    let mut rng = Rng(91);
+    for w in 2..=6u64 {
+        for k in 1..w {
+            for j in 1..=9u64 {
+                let mask = (1u64 << k) - 1;
+                // Digits of the values themselves, zero-extended to `j` bits.
+                let high = |v: &str| {
+                    let digit = format!("extract<{k}, {}>({v})", w - k);
+                    match j.cmp(&(w - k)) {
+                        core::cmp::Ordering::Less => format!("trunc<{j}>({digit})"),
+                        core::cmp::Ordering::Equal => digit,
+                        core::cmp::Ordering::Greater => format!("zext<{j}>({digit})"),
+                    }
+                };
+                for wide in [w + 1, k + j, 2 * w] {
+                    if wide <= w {
+                        continue;
+                    }
+                    // A digit of a `wide`-bit value at `j` bits.
+                    let digit = |v: &str| {
+                        if k + j <= wide {
+                            format!("extract<{k}, {j}>({v})")
+                        } else {
+                            format!("zext<{j}>(extract<{k}, {}>({v}))", wide - k)
+                        }
+                    };
+                    let (q, d) = (format!("q:{w}"), format!("d:{w}"));
+                    let s = format!("(zext<{wide}>({q}) + zext<{wide}>({d}))");
+                    let mut pairs = vec![(
+                        format!("zext<{j}>(({q} + {d} & {mask}) <u ({q} & {mask}))"),
+                        format!("{} - {} - {}", digit(&s), high(&q), high(&d)),
+                    )];
+                    if wide >= k + j {
+                        for (op, twice) in [("^", " * 2"), ("|", "")] {
+                            let and = format!("(zext<{wide}>({q} & {d}){twice})");
+                            pairs.push((
+                                format!(
+                                    "zext<{j}>(({q} + {d} & {mask}) <u (({q} {op} {d}) & {mask}))"
+                                ),
+                                format!(
+                                    "{} - {} - {}",
+                                    digit(&s),
+                                    high(&format!("({q} {op} {d})")),
+                                    digit(&and)
+                                ),
+                            ));
+                        }
+                    }
+                    for (carry, reading) in pairs {
+                        let mut cx = Context::new();
+                        let opts = ParseOptions::width(Width::new(j as u16).unwrap());
+                        let a = cx
+                            .parse(&carry, &opts)
+                            .unwrap_or_else(|e| panic!("{carry}: {e}"));
+                        let b = cx
+                            .parse(&reading, &opts)
+                            .unwrap_or_else(|e| panic!("{reading}: {e}"));
+                        assert!(equivalent(&mut cx, a, b, &mut rng), "{carry} vs {reading}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A sum that reads more bits of a carry than its sides have above the digit: the carry is
+/// read off the sum of the sides with its carry out.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_wide_carry_fixtures() {
+    let eng = deobfuscator();
+    // Two 16-bit registers added in limbs of 10 bits, the high sum kept at 16 bits: 7 bits
+    // of the sum of the registers with its carry out.
+    let high = "((x:16 >>u 10) + (y:16 >>u 10) + zext<16>((x + y & 1023) <u (x & 1023)))";
+    // The high limb of `x ^ y` written `x + y − 2·(x & y)`: its carry and its borrow.
+    let xor = "((x:16 >>u 10) + (y:16 >>u 10) - ((x & y) >>u 9) \
+               + zext<16>((x + y & 1023) <u (x & 1023)) \
+               - zext<16>((x + y & 1023) <u (x + y - (x & y) * 2 & 1023)))";
+    for (src, w, want) in [
+        (
+            high.to_string(),
+            16,
+            "extract<10, 16>(zext<32>(x) + zext<32>(y))",
+        ),
+        // A mask later, of more bits than a register has above the limb.
+        (
+            format!("trunc<7>({high})"),
+            16,
+            "extract<10, 7>(zext<32>(x) + zext<32>(y))",
+        ),
+        // The limbs joined: the sum itself.
+        (
+            format!("(zext<32>({high}) << 10) | zext<32>(x + y & 1023)"),
+            32,
+            "zext<32>(x) + zext<32>(y)",
+        ),
+        // The carry and the borrow of one word: the word goes, the limb stays.
+        (xor.to_string(), 16, "zext<16>(extract<10, 6>(x ^ y))"),
+        // A constant added in limbs of 14 and 18 bits, the high sum read on 19.
+        (
+            "trunc<19>((x:32 * 77 >>u 14) + zext<32>((x * 77 + 567 & 16383) <u 567))".to_string(),
+            32,
+            "extract<14, 19>(zext<64>(x * 77) + 567)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, &src, w), want, "{src}");
+    }
+}
+
+/// Sums that read a carry on more bits than its sides have above the digit, checked at every
+/// assignment: the high digits of two registers and the carry between them at up to twice
+/// the registers' width, with the borrow of an XOR or OR written as a sum and its and-term,
+/// a second carry out of the same or another word, read whole, truncated or masked.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_wide_carries_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0021);
+    let mut rng = Rng(92);
+    let mut changed = 0;
+    for i in 0..700 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (7, &["a", "b"])
+        };
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            let c = g.below(1 << w);
+            match g.below(7) {
+                0..=2 => x,
+                3 => format!("({x} ^ {y})"),
+                4 => format!("({x} + {c})"),
+                5 => format!("({x} * {c})"),
+                _ => format!("{c}:{w}"),
+            }
+        };
+        let k = 1 + g.below(w - 1);
+        let mask = (1u64 << k) - 1;
+        // The sum's width: more than the registers have above the digit.
+        let m = w - k + 1 + g.below(w + k);
+        let high = |v: &str| {
+            if m <= w - k {
+                format!("extract<{k}, {m}>({v})")
+            } else {
+                format!("zext<{m}>(extract<{k}, {}>({v}))", w - k)
+            }
+        };
+        let (q, d) = (value(&mut g), value(&mut g));
+        let p = format!("({q} + {d})");
+        let mut src = String::new();
+        // (`often`: in how many cases of four the term is there.)
+        let mut term = |g: &mut Rng, t: String, often: u64| {
+            if g.chance(often, 4) {
+                let sign = if g.chance(1, 6) { '-' } else { '+' };
+                src.push_str(&format!(" {sign} {t}"));
+            }
+        };
+        term(&mut g, high(&q), 3);
+        term(&mut g, high(&d), 3);
+        term(
+            &mut g,
+            format!("zext<{m}>(({p} & {mask}) <u ({q} & {mask}))"),
+            4,
+        );
+        // The borrow of `q ^ d` or `q | d` out of the same word, and its and-term.
+        if g.chance(1, 2) {
+            let (r, and) = match g.below(4) {
+                0 => (format!("({p} - ({q} & {d}) * 2)"), 1),
+                1 => (format!("({q} ^ {d})"), 1),
+                2 => (format!("({p} - ({q} & {d}))"), 0),
+                _ => (format!("({q} | {d})"), 0),
+            };
+            let ext = if g.chance(3, 4) { "sext" } else { "zext" };
+            term(
+                &mut g,
+                format!("{ext}<{m}>(({p} & {mask}) <u ({r} & {mask}))"),
+                4,
+            );
+            let digit = format!("extract<{}, {}>({q} & {d})", k - and, w - k + and);
+            let digit = if m == w - k + and {
+                digit
+            } else {
+                format!("zext<{m}>({digit})")
+            };
+            term(&mut g, format!("(0:{m} - {digit})"), 3);
+            // The next handler's carry, out of the word made of this one's result.
+            if g.chance(1, 2) {
+                let e = value(&mut g);
+                term(&mut g, high(&e), 3);
+                term(
+                    &mut g,
+                    format!("zext<{m}>(({r} + {e} & {mask}) <u ({e} & {mask}))"),
+                    4,
+                );
+            }
+        } else if g.chance(1, 3) {
+            // Another comparison of the same word, against anything.
+            let v = value(&mut g);
+            term(
+                &mut g,
+                format!("zext<{m}>(({p} & {mask}) <u ({v} & {mask}))"),
+                4,
+            );
+        }
+        let src = format!("0:{m}{src}");
+        let src = match g.below(4) {
+            0 | 1 => src,
+            2 => format!("trunc<{}>({src})", 1 + g.below(m)),
+            _ => format!("({src}) & {}", g.below(1 << m.min(16))),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 350, "{changed}");
+}
+
+/// Carries of middle digits: comparisons of one slice from above bit 0 of two values, a
+/// constant added to either, in sums with the high digits above them, checked at every
+/// assignment. The reading holds only where the difference's digit is not all ones, so half
+/// the differences are constants and the rest any value.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_middle_digits_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0004);
+    let mut rng = Rng(80);
+    let mut changed = 0;
+    for i in 0..900 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (5, &["a", "b"])
+        } else {
+            (7, &["a", "b"])
+        };
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            let c = g.below(1 << w);
+            match g.below(7) {
+                0 | 1 => x,
+                2 => format!("({x} + {y})"),
+                3 => format!("({x} ^ {y})"),
+                4 => format!("({x} * {c})"),
+                5 => format!("({x} & {c})"),
+                _ => format!("({x} + {c})"),
+            }
+        };
+        // The digit `[o, o + n)`, with bits above it (or, one time in eight, none).
+        let o = 1 + g.below(w - 2);
+        let n = if g.chance(1, 8) {
+            w - o
+        } else {
+            1 + g.below(w - o - 1)
+        };
+        let at = o + n;
+        let q = value(&mut g);
+        let d = if g.chance(1, 2) {
+            format!("{}:{w}", g.below(1 << w))
+        } else {
+            value(&mut g)
+        };
+        let p = if g.chance(3, 4) {
+            format!("({q} + {d})")
+        } else {
+            value(&mut g)
+        };
+        let side = |g: &mut Rng, v: &str| {
+            let s = format!("extract<{o}, {n}>({v})");
+            if g.chance(1, 3) {
+                format!("({s} + {})", g.below(1 << n))
+            } else {
+                s
+            }
+        };
+        let j = if at < w && g.chance(2, 3) {
+            w - at
+        } else {
+            1 + g.below(w)
+        };
+        let high = |v: &str| {
+            if at >= w {
+                format!("trunc<{j}>({v})")
+            } else if at + j <= w {
+                format!("extract<{at}, {j}>({v})")
+            } else {
+                format!("zext<{j}>(extract<{at}, {}>({v}))", w - at)
+            }
+        };
+        let mut src = String::new();
+        let mut term = |g: &mut Rng, t: String| {
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" {sign} {t}"));
+        };
+        let ext = if g.chance(1, 4) { "sext" } else { "zext" };
+        let (x, y) = (side(&mut g, &p), side(&mut g, &q));
+        let (x, y) = if g.chance(1, 4) { (y, x) } else { (x, y) };
+        term(&mut g, format!("{ext}<{j}>({x} <u {y})"));
+        for v in [p.clone(), q.clone(), d.clone()] {
+            if g.chance(2, 3) {
+                term(&mut g, high(&v));
+            }
+        }
+        let src = format!("0:{j}{src}");
+        let src = match g.below(3) {
+            0 => src,
+            1 => format!("trunc<{}>({src})", 1 + g.below(j)),
+            _ => format!("({src}) & {}", g.below(1 << j)),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 450, "{changed}");
+}
+
+/// Limb arithmetic: a narrow value added into the middle of a wide one. The identity first,
+/// at every offset and width in a 7-bit word and every assignment: the carry out of the
+/// digit `[o, o + n)` of `a` plus an `n`-bit `t`, written against `t` or against the digit,
+/// is the high digit of `a + (zext(t) << o)` less that of `a`, and the borrow of the digit
+/// less `t` the high digit of `a` less that of `a − (zext(t) << o)`. Then generated sums:
+/// such a comparison (a constant or other terms beside the slice, the sides swapped, a
+/// subtraction, a term on one side only, a constant added to the word; the sides in a
+/// register wider than the digit) with the high digits above the digit, simplified and
+/// checked at every assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_shifted_digits_are_sound() {
+    let mut rng = Rng(91);
+    let w = 7u64;
+    for o in 1..w - 1 {
+        for n in 1..w - o {
+            let (at, j) = (o + n, w - o - n);
+            let s = format!("extract<{o}, {n}>(a:{w})");
+            let q = format!("(zext<{w}>(t:{n}) << {o})");
+            let high = |v: &str| format!("extract<{at}, {j}>({v})");
+            let carry = format!("{} - {}", high(&format!("(a:{w} + {q})")), high("a"));
+            let borrow = format!("{} - {}", high("a"), high(&format!("(a:{w} - {q})")));
+            for (test, digits) in [
+                (format!("{s} + t:{n} <u t:{n}"), &carry),
+                (format!("{s} + t:{n} <u {s}"), &carry),
+                (format!("{s} <u t:{n}"), &borrow),
+            ] {
+                let mut cx = Context::new();
+                let opts = ParseOptions::width(Width::new(w as u16).unwrap());
+                let a = cx.parse(&format!("zext<{j}>({test})"), &opts).unwrap();
+                let b = cx.parse(digits, &opts).unwrap();
+                assert!(equivalent(&mut cx, a, b, &mut rng), "{test} vs {digits}");
+            }
+        }
+    }
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0021);
+    let mut changed = 0;
+    for i in 0..900 {
+        let w: u64 = if i % 3 == 0 { 6 } else { 7 };
+        // The digit `[o, o + n)`, with bits above it (or, one time in eight, none).
+        let o = 1 + g.below(w - 2);
+        let n = if g.chance(1, 8) {
+            w - o
+        } else {
+            1 + g.below(w - o - 1)
+        };
+        let at = o + n;
+        let word = match g.below(4) {
+            0 | 1 => format!("a:{w}"),
+            2 => format!("(a:{w} + {})", g.below(1 << w)),
+            _ => format!("(a:{w} * 3)"),
+        };
+        // An `n`-bit value that is no slice: of a 3-bit symbol, a constant, a product, a
+        // flag or another symbol beside it.
+        let fit = |v: &str, bits: u64| match bits.cmp(&n) {
+            core::cmp::Ordering::Less => format!("zext<{n}>({v})"),
+            core::cmp::Ordering::Equal => v.to_string(),
+            core::cmp::Ordering::Greater => format!("trunc<{n}>({v})"),
+        };
+        let narrow = |g: &mut Rng| {
+            let b = fit("b:3", 3);
+            match g.below(7) {
+                0..=2 => b,
+                3 => format!("({b} + {})", g.below(1 << n)),
+                4 => format!("({b} * {})", g.below(1 << n) | 1),
+                5 => fit(&format!("(c:4 <u {})", g.below(16)), 1),
+                _ => format!("({b} ^ {})", fit("c:4", 4)),
+            }
+        };
+        let s = format!("extract<{o}, {n}>({word})");
+        let (t, u) = (narrow(&mut g), narrow(&mut g));
+        let k = g.below(1 << n);
+        let (x, y) = match g.below(12) {
+            0 | 1 => (format!("{s} + {t}"), t.clone()),
+            2 => (format!("{s} + {t} + {k}"), t.clone()),
+            3 | 4 => (format!("{t} + {s}"), s.clone()),
+            5 => (format!("{s} + {t} + {k}"), format!("{s} + {u}")),
+            6 => (s.clone(), t.clone()),
+            7 => (format!("{s} + {k}"), t.clone()),
+            8 => (s.clone(), format!("{s} - {t}")),
+            9 => (format!("{s} + {t}"), u.clone()),
+            10 => (format!("{s} - {t}"), s.clone()),
+            _ => (
+                format!("extract<{o}, {n}>(({word} + {})) + {k}", g.below(1 << w)),
+                s.clone(),
+            ),
+        };
+        let (x, y) = if g.chance(1, 5) { (y, x) } else { (x, y) };
+        // One time in four in a register wider than the digit: the sides zero-extended, the
+        // word's slice also taken longer from under a mask (or, without one, with the bits
+        // above the digit: another comparison).
+        let (x, y) = if g.chance(1, 4) {
+            let m = n + 1 + g.below(2);
+            let mut held = |v: &str| {
+                if *v == s && o + m <= w && g.chance(1, 2) {
+                    if g.chance(3, 4) {
+                        format!("extract<{o}, {m}>({word} & {})", (1u64 << at) - 1)
+                    } else {
+                        format!("extract<{o}, {m}>({word})")
+                    }
+                } else {
+                    format!("zext<{m}>({v})")
+                }
+            };
+            (held(&x), held(&y))
+        } else {
+            (x, y)
+        };
+        let j = if at < w && g.chance(2, 3) {
+            w - at
+        } else {
+            1 + g.below(w)
+        };
+        let high = |v: &str| {
+            if at >= w {
+                format!("trunc<{j}>({v})")
+            } else if at + j <= w {
+                format!("extract<{at}, {j}>({v})")
+            } else {
+                format!("zext<{j}>(extract<{at}, {}>({v}))", w - at)
+            }
+        };
+        let mut src = String::new();
+        let mut term = |g: &mut Rng, t: String| {
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" {sign} {t}"));
+        };
+        let ext = if g.chance(1, 4) { "sext" } else { "zext" };
+        let test = format!("{ext}<{j}>({x} <u {y})");
+        let shifted = format!("(zext<{w}>({t}) << {o})");
+        if g.chance(1, 2) {
+            // As the limb code writes it: the carry beside the word's high digit, or the
+            // high digit less the borrow.
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" + {} {sign} {test}", high(&word)));
+        } else {
+            term(&mut g, test);
+            for v in [
+                word.clone(),
+                format!("({word} + {shifted})"),
+                format!("({word} - {shifted})"),
+            ] {
+                if g.chance(1, 2) {
+                    term(&mut g, high(&v));
+                }
+            }
+        }
+        let src = format!("0:{j}{src}");
+        let src = match g.below(3) {
+            0 => src,
+            1 => format!("trunc<{}>({src})", 1 + g.below(j)),
+            _ => format!("({src}) & {}", g.below(1 << j)),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 450, "{changed}");
+}
+
+/// Limb arithmetic: a narrow value added into the middle of a wide one, the carry out of the
+/// limb written against the value or against the word's digit, is a slice of the word plus
+/// the value shifted; the limb and its carry out are one slice.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_shifted_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        // The carry out of the limb `[24, 36)` against the value added.
+        (
+            "let q = zext<12>(b:9); \
+             zext<12>(q + extract<24, 12>(a:64) <u q) + extract<36, 12>(a)",
+            12,
+            "extract<36, 12>((zext<64>(b) << 24) + a)",
+        ),
+        // Against the word's digit.
+        (
+            "let s = extract<20, 17>(a:64); \
+             zext<9>(zext<17>(b:10) + s <u s) + extract<37, 9>(a)",
+            9,
+            "extract<37, 9>((zext<64>(b) << 20) + a)",
+        ),
+        // The value a digit of another word: that word masked.
+        (
+            "let s = extract<16, 16>(a:64); \
+             zext<16>(extract<16, 16>(c:64) + s <u s) + extract<32, 16>(a)",
+            16,
+            "extract<32, 16>((c & 0xffff0000) + a)",
+        ),
+        // The borrow of the digit less the value.
+        (
+            "extract<22, 10>(x:32) - zext<10>(extract<10, 12>(x) <u d:12)",
+            10,
+            "extract<22, 10>(x - (zext<32>(d) << 10))",
+        ),
+        // The limb and its carry out, joined by a concatenation and by a shift.
+        (
+            "let q = zext<12>(b:9); let m = q + extract<24, 12>(a:64); \
+             concat(zext<12>(m <u q) + extract<36, 12>(a), m)",
+            24,
+            "zext<24>(b) + extract<24, 24>(a)",
+        ),
+        (
+            "let m = d:12 + extract<10, 12>(x:32); \
+             zext<32>(m) | (zext<32>(zext<10>(m <u d) + extract<22, 10>(x)) << 12)",
+            32,
+            "zext<32>(zext<22>(d) + extract<10, 22>(x))",
+        ),
+        // The digits in a 16-bit register: the value's zero-extended, the word's a longer
+        // slice from under a mask.
+        (
+            "zext<10>(zext<16>(extract<11, 11>(x:32) + e:11) <u extract<11, 16>(x & 0x3fffff)) \
+             + extract<22, 10>(x)",
+            10,
+            "extract<22, 10>((zext<32>(e) << 11) + x)",
+        ),
+        // A constant added limb by limb (11, 11 and 10 bits; 837 and 434 are its digits),
+        // the middle limb's carry out compared in such a register.
+        (
+            "let m = x:32 * 0x2c51a7e3; \
+             zext<10>(zext<16>(extract<11, 11>(m + 837) + 434) <u extract<11, 16>(m & 0x3fffff)) \
+             + extract<22, 10>(m)",
+            10,
+            "extract<22, 10>(x * 0x2c51a7e3 + 0xd9345)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: the carry out of a middle limb written with the carry into it (the other
+/// operand's digit is all ones and a carry comes in, or the limb's sum wrapped) is the carry
+/// at the limb's upper boundary, and the top limb the high digit of the word.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_detector_fixtures() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        // A constant added limb by limb (13, 13 and 6 bits): 421 and 2860 are its digits.
+        (
+            "let m = x * 0x2c51a7e3; let h = m >>u 13; let c = (m + 421 & 8191) <u 421; \
+             let d = h + zext<32>(c) + 2860 & 8191; \
+             trunc<6>(zext<8>(extract<26, 6>(m)) \
+             + zext<8>((h + 1 & 8191 == 0) & c | (d <u 2860)))",
+            "extract<26, 6>(x * 0x2c51a7e3 + 0x16581a5)",
+        ),
+        // A negation in limbs of 15, 15 and 2 bits: its borrows are `!= 0`.
+        (
+            "let h = x >>u 15; let b = -x & 32767 != 0; \
+             let d = -(h + zext<32>(b)) & 32767; \
+             trunc<2>(sext<8>((~h & 32767 == 0) & b | (d != 0)) - trunc<8>(x >>u 30))",
+            "extract<30, 2>(-x)",
+        ),
+        // The top limb of `x + y` in limbs of 11, 11 and 10 bits, beside a third digit (no
+        // slice of one word).
+        (
+            "let s = x + y; let c = (s & 2047) <u (x & 2047); \
+             let m = (x >>u 11) + (y >>u 11) + zext<32>(c) & 2047; \
+             trunc<10>((x >>u 22) + (y >>u 22) + (z >>u 22) \
+             + zext<32>(((y >>u 11) + 1 & 2047 == 0) & c | (m <u (x >>u 11 & 2047))))",
+            "extract<22, 10>(x + y) + extract<22, 10>(z)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 32), want, "{src}");
+    }
+}
+
+/// Carry detectors with a carry in, generated: the words `q` and `d` and their sum, the limb
+/// `[o, o + n)`, the carry into it and the test of a digit in several spellings, some of
+/// them of another value (no detector then); every result is checked at every assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_detectors_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0007);
+    let mut rng = Rng(83);
+    let (mut changed, mut read) = (0, 0);
+    for i in 0..1200 {
+        let w: u64 = if i % 3 == 0 { 6 } else { 7 };
+        let sym = |g: &mut Rng| format!("{}:{w}", ["a", "b"][g.below(2) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            let c = g.below(1 << w);
+            match g.below(6) {
+                0 | 1 => x,
+                2 => format!("({x} + {y})"),
+                3 => format!("({x} ^ {y})"),
+                4 => format!("({x} * {c})"),
+                _ => format!("({x} + {c})"),
+            }
+        };
+        // The limbs `[0, o)` and `[o, o + n)`, with bits above them.
+        let o = 1 + g.below(w - 2);
+        let n = 1 + g.below(w - o - 1);
+        let at = o + n;
+        let (mo, mn) = ((1u64 << o) - 1, (1u64 << n) - 1);
+        let q = value(&mut g);
+        let d = if g.chance(1, 2) {
+            format!("{}:{w}", g.below(1 << at))
+        } else {
+            value(&mut g)
+        };
+        let p = format!("({q} + {d})");
+        // (One time in ten another value: the detector of no word.)
+        let wrong = |g: &mut Rng, v: &str| {
+            if g.chance(1, 10) {
+                value(g)
+            } else {
+                v.to_string()
+            }
+        };
+        let low = |g: &mut Rng, v: &str| {
+            if g.chance(1, 2) {
+                format!("({v} & {mo})")
+            } else {
+                format!("zext<{w}>(trunc<{o}>({v}))")
+            }
+        };
+        let hi = |v: &str| format!("({v} >>u {o})");
+        // The carry into the limb.
+        let other = if g.chance(1, 2) { q.clone() } else { d.clone() };
+        let (cp, cq) = (wrong(&mut g, &p), wrong(&mut g, &other));
+        let cin = format!("({} <u {})", low(&mut g, &cp), low(&mut g, &cq));
+        // The digit of `p` against that of one operand, the other's tested.
+        let (y, z) = if g.chance(1, 2) { (&q, &d) } else { (&d, &q) };
+        let tested = wrong(&mut g, z);
+        let dz = format!("extract<{o}, {n}>({tested})");
+        let test = match g.below(4) {
+            0 => format!("({dz} == {mn})"),
+            1 => format!("(((zext<{w}>({dz}) + 1) & {mn}) == 0)"),
+            2 => format!("((~{} & {mn}) == 0)", hi(&tested)),
+            _ => format!("((({} + 1) & {mn}) == 0)", hi(&tested)),
+        };
+        let x = match g.below(3) {
+            0 => format!("({} & {mn})", hi(&p)),
+            1 => format!("zext<{w}>(extract<{o}, {n}>({p}))"),
+            _ => format!("(({} + {} + zext<{w}>({cin})) & {mn})", hi(&q), hi(&d)),
+        };
+        let cmp = format!("({x} <u ({} & {mn}))", hi(y));
+        let det = if g.chance(1, 2) {
+            format!("(({test} & {cin}) | {cmp})")
+        } else {
+            format!("({cmp} | ({cin} & {test}))")
+        };
+        let j = if g.chance(2, 3) {
+            w - at
+        } else {
+            1 + g.below(w)
+        };
+        let high = |v: &str| {
+            if at + j <= w {
+                format!("extract<{at}, {j}>({v})")
+            } else {
+                format!("zext<{j}>(extract<{at}, {}>({v}))", w - at)
+            }
+        };
+        let mut src = String::new();
+        let mut term = |g: &mut Rng, t: String| {
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" {sign} {t}"));
+        };
+        let ext = if g.chance(1, 4) { "sext" } else { "zext" };
+        term(&mut g, format!("{ext}<{j}>({det})"));
+        for v in [&p, &q, &d] {
+            if g.chance(2, 3) {
+                term(&mut g, high(v));
+            }
+        }
+        let src = format!("0:{j}{src}");
+        let src = match g.below(3) {
+            0 => src,
+            1 => format!("trunc<{}>({src})", 1 + g.below(j)),
+            _ => format!("({src}) & {}", g.below(1 << j)),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+        read += u64::from(!cx.display(out.expr).to_string().contains("<u"));
+    }
+    // (614 are read without the detectors.)
+    assert!(changed > 600 && read > 630, "{changed} {read}");
+}
+
+/// Limb arithmetic: a limb that is no slice of one word (a third value's digit added in it)
+/// read for its carry-out detector as the digit of the word with that digit in its place; a
+/// top limb in a register wider than the word, beside the digit of a wider value with the
+/// word's low bits; a carry written `c <=u d` (of adding `2^n − c` to a digit) and one
+/// written `x & M != M` (the borrow of subtracting `M`).
+#[cfg(feature = "prove")]
+#[test]
+fn limb_detector_word_fixtures() {
+    let eng = deobfuscator();
+    for (src, want) in [
+        // `x + y + (e << 11)` in limbs of 11, 11 and 10 bits, `e` a digit of a third value.
+        (
+            "let s = x + y; let c = (s & 2047) <u (x & 2047); let e = z & 2047; \
+             let m = (x >>u 11) + (y >>u 11) + e + zext<32>(c) & 2047; \
+             trunc<10>((x >>u 22) + (y + (e << 11) >>u 22) \
+             + zext<32>(((y >>u 11) + e + 1 & 2047 == 0) & c | (m <u (x >>u 11 & 2047))))",
+            "extract<22, 10>(((z & 2047) << 11) + x + y)",
+        ),
+        // A constant added in limbs of 13, 13 and 6 bits, the top limb in an 8-bit register
+        // from the 64-bit product.
+        (
+            "let m = x * 0x2c51a7e3; let h = m >>u 13; let c = (m + 421 & 8191) <u 421; \
+             let d = h + zext<32>(c) + 2860 & 8191; \
+             zext<8>((h + 1 & 8191 == 0) & c | (d <u 2860)) \
+             + extract<26, 8>(zext<64>(x) * 0x2c51a7e3)",
+            "extract<26, 8>(zext<64>(x) * 0x2c51a7e3 + 0x16581a5)",
+        ),
+        // The borrow of subtracting 8191 from a low digit.
+        (
+            "let m = x * 0x2c51a7e3 + y; \
+             trunc<19>((m >>u 13) + (z >>u 13) - zext<32>((m & 8191) != 8191))",
+            "extract<13, 19>(z) + extract<13, 19>(x * 0x2c51a7e3 + y - 8191)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, 32), want, "{src}");
+    }
+}
+
+/// Carry detectors over limbs that are no slice of one word (a third value's digit beside
+/// the operands'), the digit's test in three spellings, the top limb in a register wider than
+/// the words (the digit of a wider value with the same low bits beside the carry), and
+/// carries spelled `c <=u d` and `x != M`: generated, every result checked at every
+/// assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_detector_words_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0019);
+    let mut rng = Rng(89);
+    let (mut changed, mut read) = (0, 0);
+    for i in 0..1500 {
+        let w: u64 = if i % 3 == 0 { 6 } else { 7 };
+        // A register wider than the words.
+        let ww = w + 1 + g.below(3);
+        let name = |g: &mut Rng| ["a", "b"][g.below(2) as usize];
+        // A value at the words' width, and the same at the register's (its low bits).
+        let value = |g: &mut Rng| {
+            let (x, y, c, kind) = (name(g), name(g), g.below(1 << w), g.below(6));
+            let at = |b: u64| {
+                let s = |v: &str| {
+                    if b == w {
+                        format!("{v}:{w}")
+                    } else {
+                        format!("zext<{b}>({v}:{w})")
+                    }
+                };
+                match kind {
+                    0 | 1 => s(x),
+                    2 => format!("({} + {})", s(x), s(y)),
+                    3 => format!("({} ^ {})", s(x), s(y)),
+                    4 => format!("({} * {c})", s(x)),
+                    _ => format!("({} + {c})", s(x)),
+                }
+            };
+            (at(w), at(ww))
+        };
+        let o = 1 + g.below(w - 2);
+        let n = 1 + g.below(w - o - 1);
+        let at = o + n;
+        let (mo, mn) = ((1u64 << o) - 1, (1u64 << n) - 1);
+        let j = if g.chance(2, 3) {
+            ww - at
+        } else {
+            1 + g.below(ww - at)
+        };
+        // The high digit from bit `k` of a value, of the word or of the register.
+        let high = |g: &mut Rng, v: &(String, String), k: u64| {
+            if g.chance(1, 2) {
+                format!("extract<{k}, {j}>({})", v.1)
+            } else if k + j <= w {
+                format!("extract<{k}, {j}>({})", v.0)
+            } else {
+                format!("zext<{j}>(extract<{k}, {}>({}))", w - k, v.0)
+            }
+        };
+        let mut src = String::new();
+        let mut term = |g: &mut Rng, t: String| {
+            let sign = if g.chance(1, 4) { '-' } else { '+' };
+            src.push_str(&format!(" {sign} {t}"));
+        };
+        let ext = if g.chance(1, 4) { "sext" } else { "zext" };
+        let q = value(&mut g);
+        if i % 4 == 3 {
+            // A carry in another spelling, beside the digits it is of.
+            let wide = |v: &(String, String), k: u64| {
+                (format!("({} + {k})", v.0), format!("({} + {k})", v.1))
+            };
+            let (carry, k, other) = match g.below(3) {
+                // `c <=u lo(q)`: the carry of adding `2^at − c`.
+                0 => {
+                    let c = 1 + g.below((1 << at) - 1);
+                    let carry = format!("({c}:{at} <=u trunc<{at}>({}))", q.0);
+                    (carry, at, wide(&q, (1 << at) - c))
+                }
+                // The same of a middle digit: nothing carries into it.
+                1 => {
+                    let c = 1 + g.below(mn);
+                    let carry = format!("({c}:{n} <=u extract<{o}, {n}>({}))", q.0);
+                    (carry, at, wide(&q, ((1 << n) - c) << o))
+                }
+                // `lo(q) != M`: the borrow of subtracting `M`.
+                _ => {
+                    let low = if g.chance(1, 2) {
+                        format!("({} & {mo})", q.0)
+                    } else {
+                        format!("zext<{w}>(trunc<{o}>({}))", q.0)
+                    };
+                    let m = (1u64 << w) - mo;
+                    (format!("({low} != {mo})"), o, wide(&q, m))
+                }
+            };
+            term(&mut g, format!("{ext}<{j}>({carry})"));
+            for v in [&q, &other] {
+                if g.chance(2, 3) {
+                    let t = high(&mut g, v, k);
+                    term(&mut g, t);
+                }
+            }
+        } else {
+            let d = if g.chance(1, 2) {
+                let c = g.below(1 << at);
+                (format!("{c}:{w}"), format!("{c}:{ww}"))
+            } else {
+                value(&mut g)
+            };
+            let p = (
+                format!("({} + {})", q.0, d.0),
+                format!("({} + {})", q.1, d.1),
+            );
+            // A third value's digit beside the limb's own, one time in two.
+            let third = g.chance(1, 2);
+            let e = if third {
+                format!("({}:{w} & {mn})", name(&mut g))
+            } else {
+                format!("0:{w}")
+            };
+            // (One time in ten another value: the detector of no word.)
+            let wrong = |g: &mut Rng, v: &str| {
+                if g.chance(1, 10) {
+                    value(g).0
+                } else {
+                    v.to_string()
+                }
+            };
+            let low = |v: &str| format!("({v} & {mo})");
+            let hi = |v: &str| format!("({v} >>u {o})");
+            let other = if g.chance(1, 2) { &q.0 } else { &d.0 };
+            let (cp, cq) = (wrong(&mut g, &p.0), wrong(&mut g, other));
+            let cin = format!("({} <u {})", low(&cp), low(&cq));
+            let (y, z) = if g.chance(1, 2) {
+                (&q.0, &d.0)
+            } else {
+                (&d.0, &q.0)
+            };
+            let tested = wrong(&mut g, z);
+            // The digit of the other operand plus the third's is all ones.
+            let test = match g.below(3) {
+                0 => format!("((({} + {e} + 1) & {mn}) == 0)", hi(&tested)),
+                1 => format!("(extract<{o}, {n}>({tested}) == ~trunc<{n}>({e}))"),
+                _ => format!("((({} + {e}) & {mn}) == {mn})", hi(&tested)),
+            };
+            let x = if g.chance(1, 2) {
+                format!("(({} + {e}) & {mn})", hi(&p.0))
+            } else {
+                format!(
+                    "(({} + {} + {e} + zext<{w}>({cin})) & {mn})",
+                    hi(&q.0),
+                    hi(&d.0)
+                )
+            };
+            let cmp = format!("({x} <u ({} & {mn}))", hi(y));
+            let det = if g.chance(1, 2) {
+                format!("(({test} & {cin}) | {cmp})")
+            } else {
+                format!("({cmp} | ({cin} & {test}))")
+            };
+            term(&mut g, format!("{ext}<{j}>({det})"));
+            // The word the limbs are of: with the third digit in its place.
+            let whole = if third {
+                (
+                    format!("({} + ({e} << {o}))", p.0),
+                    format!("({} + (zext<{ww}>({e}) << {o}))", p.1),
+                )
+            } else {
+                p
+            };
+            for v in [&whole, &q, &d] {
+                if g.chance(2, 3) {
+                    let t = high(&mut g, v, at);
+                    term(&mut g, t);
+                }
+            }
+        }
+        let src = format!("0:{j}{src}");
+        let src = match g.below(3) {
+            0 => src,
+            1 => format!("trunc<{}>({src})", 1 + g.below(j)),
+            _ => format!("({src}) & {}", g.below(1 << j)),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+        let text = cx.display(out.expr).to_string();
+        read += u64::from(!(text.contains("<u") || text.contains("<=u") || text.contains("!=")));
+    }
+    // (481 are read without the limbs' words, the wider words and the spellings.)
+    assert!(changed > 1100 && read > 500, "{changed} {read}");
+}
+
+/// Limb arithmetic: a carry whose difference the sum holds the high digit of in another
+/// spelling (the partial product a schoolbook product adds, shifted into place, beside the
+/// product of the word that a carry's side has become), and a carry between sides lifted
+/// above their digit beside the word's high digit (the difference is read modulo the digit).
+#[cfg(feature = "prove")]
+#[test]
+fn limb_difference_word_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        // `x * 9653` in digits of 5 bits (21, 13 and 9), its limb from bit 10: the sum of
+        // the low limbs is written as a product of the word right on 10 bits only, and the
+        // sum holds the partial products from bit 5 on.
+        (
+            "let %0 = x:16 & 31; let %1 = (x >>u 5) & 31; let %2 = %0 * 21 + (%0 * 13 << 5); \
+             trunc<5>(%0 * 9 + %1 * 13 + (x >>u 10) * 21 + (%0 * 13 >>u 5) + (%1 * 21 >>u 5) \
+             + zext<16>(x * 38325 & 1023 <u %2 & 1023) + zext<16>(%2 & 1023 <u %0 * 21))",
+            5,
+            "extract<10, 5>(x * 9653)",
+        ),
+        // The low limb at its own width, the constant added to it written as a difference
+        // (715 is -1333 modulo 2^11), beside the high digit of the word.
+        (
+            "zext<5>(77:11 - trunc<11>(x:16) * 715 <u trunc<11>(x) * 1333) \
+             + extract<11, 5>(x * 27957)",
+            5,
+            "extract<11, 5>(x * 27957 + 77)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: carries beside a high digit of a word that has the low bits of the
+/// carry's difference, shifted into place, of one of its sides, or of neither (a reading
+/// that took the word for the difference on more bits than the carry reads, or where it is
+/// no spelling of it, would be caught); chains of two carries; and carries between sides at
+/// the digit's own width beside the high digit of the word. Each stays equal to itself at
+/// every assignment.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_difference_words_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0041);
+    let mut rng = Rng(101);
+    let mut changed = 0;
+    let w: u64 = 7;
+    let mask = (1u64 << w) - 1;
+    for i in 0..900 {
+        let at = 2 + g.below(w - 3);
+        let j = 1 + g.below(w - at);
+        let x = match g.below(3) {
+            0 => "a:7".to_string(),
+            1 => format!("(a:7 ^ (a >>u {}))", 1 + g.below(w - 1)),
+            _ => "(a:7 + b:7)".to_string(),
+        };
+        // Anything above bit `at`, or (one time in six) a bit below it: no spelling then.
+        let noise = |g: &mut Rng| {
+            if g.chance(1, 6) {
+                1u64 << g.below(at)
+            } else {
+                (g.below(1 << w) << at) & mask
+            }
+        };
+        let carry = |g: &mut Rng, p: &str, q: &str| {
+            let (p, q) = (format!("trunc<{at}>({p})"), format!("trunc<{at}>({q})"));
+            match g.below(4) {
+                0 => format!("- sext<{j}>({p} <u {q})"),
+                1 => format!("- ~zext<{j}>({p} <u {q})"),
+                _ => format!("+ zext<{j}>({p} <u {q})"),
+            }
+        };
+        let src = if i % 3 < 2 {
+            // `P = Q + (A << s) + noise` in one spelling or another, the sum holding the
+            // digit of `A` from bit `at − s`.
+            let o = 1 + g.below(at);
+            let s = at - o;
+            let ka = g.below(1 << w) | 1;
+            let a = match g.below(3) {
+                0 => format!("({x} * {ka})"),
+                1 => format!("(({x} & {}) * {ka})", (1u64 << o) - 1),
+                _ => "b:7".to_string(),
+            };
+            let kq = g.below(1 << w);
+            let q = match g.below(3) {
+                0 => format!("({x} * {kq})"),
+                1 => format!("{kq}:7"),
+                _ => format!("(({x} & {}) * {kq})", (1u64 << at) - 1),
+            };
+            let up = (ka << s) & mask;
+            let p = match g.below(3) {
+                0 => format!("({q} + ({a} << {s}) + {x} * {})", noise(&mut g)),
+                1 => format!("({x} * {} + {q})", (up + noise(&mut g)) & mask),
+                _ => format!("({q} + ({a} << {s}))"),
+            };
+            let digit = if g.chance(1, 2) {
+                format!("extract<{o}, {j}>({a})")
+            } else {
+                format!("trunc<{j}>({a} >>u {o})")
+            };
+            let mut src = format!("{digit} {}", carry(&mut g, &p, &q));
+            // The sum before, with its own carry and its own digit.
+            if g.chance(1, 2) {
+                let kb = g.below(1 << w);
+                let r = format!("({q} - b:7 * {kb} + {x} * {})", noise(&mut g));
+                src.push_str(&format!(" {}", carry(&mut g, &q, &r)));
+                if g.chance(1, 2) {
+                    src.push_str(&format!(" + extract<{at}, {j}>(b * {kb})"));
+                }
+            }
+            if g.chance(1, 3) {
+                src.push_str(&format!(" + extract<{at}, {j}>({q})"));
+            }
+            src
+        } else {
+            // Sides at the digit's width, their difference a constant there (or not), beside
+            // the high digit of the word (or of another).
+            let kq = g.below(1 << at) | 1;
+            let kn = if g.chance(1, 5) {
+                g.below(1 << at)
+            } else {
+                (1u64 << at) - kq
+            };
+            let k = if g.chance(1, 5) {
+                g.below(1 << w)
+            } else {
+                kq | (g.below(1 << w) << at) & mask
+            };
+            let c = g.below(1 << at);
+            let t = format!("trunc<{at}>({x})");
+            format!(
+                "zext<{j}>({c}:{at} - {t} * {kn} <u {t} * {kq}) + extract<{at}, {j}>({x} * {k})"
+            )
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(j as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = eng.simplify(&mut cx, e).unwrap();
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 300, "{changed}");
+}
+
+/// Limb arithmetic: the limbs of one word, each under the coefficient of the one below shifted
+/// by that limb's width, are the word (a product by a constant computed limb by limb is the
+/// product of the word), in every spelling of a limb, modulo the bits read.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_join_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        // Two limbs of 18 and 14 bits; the high one as a shift, as a slice, and as a slice of
+        // the sign extension (whose high bits the coefficient's trailing zeros discard).
+        (
+            "(w & 0x3ffff) * 0x2f6b8d35 + (w >>u 18) * 0x34d40000",
+            32,
+            "w * 0x2f6b8d35",
+        ),
+        (
+            "(w & 0x3ffff) * 0x2f6b8d35 + zext<32>(extract<18, 14>(w)) * 0x34d40000",
+            32,
+            "w * 0x2f6b8d35",
+        ),
+        (
+            "(w & 0x3ffff) * 0x2f6b8d35 + extract<18, 32>(sext<64>(w)) * 0x34d40000",
+            32,
+            "w * 0x2f6b8d35",
+        ),
+        // Four digits, one of them a digit of a limb.
+        (
+            "(w & 127) * 11 + (w >>u 7 & 127) * 1408 + ((w >>u 14 & 0x3fff) & 127) * 180224 \
+             + zext<32>(extract<21, 11>(w)) * 0x1600000",
+            32,
+            "w * 11",
+        ),
+        // The word less its low limb is its high limb, in place.
+        ("w - (w & 0x1fff)", 32, "w & -8192"),
+        // A product of the word (its high part of the constant) beside the limbs' products.
+        (
+            "w * 0x2f6b8000 + (w & 0x1fff) * 3381 + (w >>u 13) * 0x1a6a000",
+            32,
+            "w * 0x2f6b8d35",
+        ),
+        // The word joined by a `concat`, a limb put together again from its pieces.
+        (
+            "concat(h:6, concat(m:13, l:13)) * 0x2f6b8000 + concat(zext<19>(h), m) * 0x1a6a000 \
+             + zext<32>(l) * 3381",
+            32,
+            "concat(h, concat(m, l)) * 0x2f6b8d35",
+        ),
+        // Modulo the bits read: the limbs of a 64-bit register's sum of which 32 are read.
+        (
+            "extract<18, 14>(zext<64>(x:32 & 0x3ffff) * 0x38d35 + sext<64>(x) * 0x2f680000 \
+             + zext<64>(extract<18, 32>(sext<64>(x)) & 0x3ffff) * 0xe34d40000 + zext<64>(y:32))",
+            14,
+            "extract<18, 14>(sext<64>(x) * 0x2f6b8d35 + zext<64>(y))",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: a limb's sum in a register wider than the limb, read by several users
+/// each through a truncation of its own that is wider than the limb, is read on the bits that
+/// reach the result, where its carry completes the high digit; every reader shares the limb.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_reader_fixtures() {
+    let eng = deobfuscator();
+    let limb = "((x >>u 18) + (y >>u 18) + zext<32>((x + y & 0x3ffff) <u (x & 0x3ffff)))";
+    for (src, w, want) in [
+        (
+            format!(
+                "trunc<14>(zext<32>(trunc<19>({limb})) * 3 + (zext<32>(trunc<31>({limb})) & v))"
+            ),
+            32,
+            "let %0 = extract<18, 14>(x + y);\n%0 * 3 + (trunc<14>(v) & %0)",
+        ),
+        // The readers of a handler's and-term: twice the high limb and a bit of the low one
+        // against the next digit, held up as a high limb is.
+        (
+            format!(
+                "(concat(trunc<31>({limb}), extract<17, 1>(x + y)) + 5 \
+                 & concat(trunc<18>({limb} + 77), extract<4, 14>(x + y))) << 18"
+            ),
+            32,
+            "let %0 = x + y;\n\
+             (zext<32>(extract<17, 14>(%0)) + 5 & zext<32>(extract<4, 14>(%0))) << 18",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, &src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: sums of the limbs of a word, each limb spelled every way the limbs pass
+/// reads one (a mask, a shift, a slice, a digit of a limb, a slice of the sign extension, the
+/// pieces of a `concat`), under coefficients that double from limb to limb or do not, read
+/// whole or under a truncation, a mask or a slice, stay equal to themselves: exhaustively.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_joins_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0002);
+    let mut rng = Rng(78);
+    let mut changed = 0;
+    for i in 0..1500 {
+        // Two symbols of 7 bits, or three of 4: every assignment is checked.
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (7, &["a", "b"])
+        };
+        let full = (1u64 << w) - 1;
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        // The word: a symbol, a sum, or two slices put together by a `concat`.
+        let x = match g.below(5) {
+            0 => {
+                let (p, q) = (sym(&mut g), sym(&mut g));
+                format!("({p} + {q})")
+            }
+            1 => {
+                let k = 1 + g.below(w - 1);
+                let (p, q) = (sym(&mut g), sym(&mut g));
+                let lo = g.below(k + 1);
+                format!("concat(extract<{lo}, {}>({p}), trunc<{k}>({q}))", w - k)
+            }
+            _ => sym(&mut g),
+        };
+        // Its limbs, between cuts.
+        let mut cuts = vec![0, w];
+        for _ in 0..1 + g.below(3) {
+            cuts.push(1 + g.below(w - 1));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let k0 = g.below(1 << w) | u64::from(g.chance(2, 3));
+        let mut src = format!("0:{w}");
+        for c in cuts.windows(2) {
+            let (lo, len) = (c[0], c[1] - c[0]);
+            // (A limb left out now and then.)
+            if g.chance(1, 8) {
+                continue;
+            }
+            let mask = (1u64 << len) - 1;
+            let limb = match g.below(6) {
+                0 if lo == 0 => format!("({x} & {mask})"),
+                1 => format!("zext<{w}>(extract<{lo}, {len}>({x}))"),
+                // Right as a limb only under a coefficient whose trailing zeros discard the
+                // sign's copies.
+                2 => format!("extract<{lo}, {w}>(sext<{}>({x}))", 2 * w),
+                3 => format!("(({x} & {}) >>u {lo})", (1u64 << (lo + len)) - 1),
+                4 => format!("zext<{w}>(trunc<{len}>({x} >>u {lo}))"),
+                _ => format!("(({x} >>u {lo}) & {mask})"),
+            };
+            // The coefficient of the lowest limb shifted to this one, mostly.
+            let k = if g.chance(4, 5) {
+                (k0 << lo) & full
+            } else {
+                g.below(1 << w)
+            };
+            src.push_str(&format!(" + {limb} * {k}"));
+        }
+        // The word itself, another value, a constant.
+        if g.chance(1, 3) {
+            src.push_str(&format!(" + {x} * {}", g.below(1 << w)));
+        }
+        if g.chance(1, 3) {
+            src.push_str(&format!(" - {}", sym(&mut g)));
+        }
+        if g.chance(1, 3) {
+            src.push_str(&format!(" + {}", g.below(1 << w)));
+        }
+        let src = match g.below(5) {
+            0 | 1 => src,
+            2 => format!("trunc<{}>({src})", 1 + g.below(w)),
+            3 => format!("({src}) & {}", g.below(1 << w)),
+            _ => {
+                let lo = g.below(w);
+                format!("extract<{lo}, {}>({src})", 1 + g.below(w - lo))
+            }
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 1200, "{changed}");
+}
+
+/// Limb arithmetic: a sum of high digits and a carry, read by two users each through a mask,
+/// a truncation or a shift of its own, under a result that reads a few bits of them, stays
+/// equal to itself: exhaustively. (The sum is simplified on the bits its users read between
+/// them, where its carry is read as high digits.)
+#[cfg(feature = "prove")]
+#[test]
+fn limb_readers_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0003);
+    let mut rng = Rng(79);
+    let mut changed = 0;
+    for i in 0..900 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (7, &["a", "b"])
+        };
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            match g.below(4) {
+                0 => format!("({x} + {y})"),
+                1 => format!("({x} * {})", g.below(1 << w)),
+                2 => format!("({x} ^ {y})"),
+                _ => x,
+            }
+        };
+        let k = 1 + g.below(w - 1);
+        let mask = (1u64 << k) - 1;
+        let (p, q) = (value(&mut g), value(&mut g));
+        // The high limb of `p + q` as a register holds it, or a sum that only looks like it.
+        let (cp, cq) = if g.chance(3, 4) {
+            (format!("({p} + {q})"), p.clone())
+        } else {
+            (value(&mut g), value(&mut g))
+        };
+        let sign = if g.chance(1, 4) { '-' } else { '+' };
+        let s = format!(
+            "(({p} >>u {k}) + ({q} >>u {k}) {sign} zext<{w}>(({cp} & {mask}) <u ({cq} & {mask})))"
+        );
+        let reader = |g: &mut Rng| match g.below(5) {
+            0 => format!("zext<{w}>(trunc<{}>({s}))", 1 + g.below(w)),
+            1 => format!("({s} & {})", g.below(1 << w)),
+            2 => format!("({s} << {})", g.below(w)),
+            3 => format!("({s} + {})", g.below(1 << w)),
+            _ => format!(
+                "concat(trunc<{}>({s}), extract<{}, 1>({p}))",
+                w - 1,
+                g.below(w)
+            ),
+        };
+        let (r1, r2) = (reader(&mut g), reader(&mut g));
+        let v = sym(&mut g);
+        let body = match g.below(4) {
+            0 => format!("{r1} + {r2}"),
+            1 => format!("({r1} & {r2})"),
+            2 => format!("{r1} * 3 + ({r2} & {v})"),
+            _ => format!("{r1} - ({r2} ^ {v})"),
+        };
+        let src = match g.below(5) {
+            0 => body,
+            1 | 2 => format!("trunc<{}>({body})", 1 + g.below(w - k)),
+            3 => format!("({body}) & {}", g.below(1 << w)),
+            _ => format!("({body}) << {}", 1 + g.below(w - 1)),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 600, "{changed}");
+}
+
+/// Limb arithmetic: an XOR or an OR with a constant written as a sum (`a + c − 2·(a & c)`,
+/// `a + c − (a & c)`, the constant folded into the sum around it) is read as what it spells,
+/// and meets the XOR itself in a carry's difference.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_mask_fixtures() {
+    let eng = deobfuscator();
+    for (src, w, want) in [
+        (
+            "x:32 * 77 + 0x5234 - 2 * (x * 77 + 0x4000 & 0x1234)",
+            32,
+            "x * 77 + 16384 ^ 4660",
+        ),
+        (
+            "x:32 * 77 + 0x5234 - (x * 77 + 0x4000 & 0x1234)",
+            32,
+            "x * 77 + 16384 | 4660",
+        ),
+        ("x:32 + 0x2d5 - 2 * (x & 0x2d5)", 32, "x ^ 725"),
+        (
+            "(x:32 + y:32 ^ 0x1234) + 2 * (x + y & 0x1234)",
+            32,
+            "x + y + 4660",
+        ),
+        // Two carries of one handler: the first against the XOR, the second against a
+        // constant, whose difference is the first's word less `2^26`.
+        (
+            "let s = x:32 + y:32 - 2 * (x & 0x2d5c1) + z:32; \
+             zext<6>((s + 0x2d5c1 & 0x3ffffff) <u ((x ^ 0x2d5c1) & 0x3ffffff)) \
+             + extract<26, 6>(y + z) + zext<6>((s + 9 & 0x3ffffff) <u 0x3fd2a48) - 1",
+            6,
+            "let %0 = x & 0x2d5c1;\n\
+             extract<26, 6>(x + y - (%0 + %0) + z + 9) - extract<26, 6>(x)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: the high digits of a product by a constant done digit by digit. A
+/// partial product shifted into place (`a·(c << 11)`) meets the product's own high digit
+/// (`a·c >> 11`), and the high limb of the schoolbook sum (the cross products modulo the
+/// limb, the partial products' high digits and the two carries of the low limb) is the high
+/// limb of the product of the word.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_digit_fixtures() {
+    let eng = deobfuscator();
+    let (k0, k1, k2) = (0x2b7u64, 0x1c35u64, 0x19u64);
+    let high = format!(
+        "let d0 = x:32 & 8191; let d1 = zext<32>(extract<13, 13>(x)); \
+         let p = (x & 0x3ffffff) * {k0}; let w = p + d0 * {}; let l = p & 0x3ffffff; \
+         trunc<6>(d1 * {} + d0 * {} + (x >>u 26) * {k0} + zext<32>(w & 0x3ffffff <u l) \
+         + (d1 * {k0} >>u 13) + (d0 * {k1} >>u 13) + zext<32>(l <u d0 * {k0}))",
+        k1 << 13,
+        k1 + (77 << 6),
+        k2 + (5 << 6),
+    );
+    for (src, w, want) in [
+        (
+            "let a = x:32 & 2047; let b = zext<32>(extract<11, 11>(x)); let p = a * 1021; \
+             let q = p + (a * 333 << 11) & 0x3fffff; \
+             trunc<10>((b * 333 + a * 97) + zext<32>(q <u p) + (b * 1021 >>u 11) + y:32 \
+             + (a * 333 >>u 11) + zext<32>(z:32 & 0x3fffff <u q))"
+                .to_string(),
+            10,
+            // (The borrow against `z` is read last, in the late stage of the rounds: the
+            // high digit of the product it leaves meets the one that is there.)
+            "trunc<10>(x) * 97 + extract<11, 10>(zext<32>(extract<11, 11>(x)) * 1021) \
+             + extract<11, 10>(x) * 333 + extract<22, 10>(z) + trunc<10>(y) \
+             - extract<22, 10>(z - (x & 2047) * 0xa6bfd)",
+        ),
+        (high, 6, "extract<26, 6>(x * 0x6786a2b7)"),
+    ] {
+        assert_eq!(simplify(&eng, &src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: sums over `a & c`, `a ^ c` and `a | c` for a constant `c`, beside the
+/// terms of `a` and a constant, under the coefficients that make them one another or not,
+/// stay equal to themselves: exhaustively.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_masks_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0004);
+    let mut rng = Rng(80);
+    let mut changed = 0;
+    for i in 0..1200 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (7, &["a", "b"])
+        };
+        let full = (1u64 << w) - 1;
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        // The value under the mask and its terms as a sum would spell them.
+        let (p, q) = (sym(&mut g), sym(&mut g));
+        let (k1, k2) = (g.below(1 << w), g.below(1 << w));
+        let (a, spelled): (String, Vec<(String, u64)>) = match g.below(5) {
+            0 => (format!("({p} + {q})"), vec![(p, 1), (q, 1)]),
+            1 => (
+                format!("({p} + {k1})"),
+                vec![(p, 1), (format!("1:{w}"), k1)],
+            ),
+            2 => (format!("({p} * {k1})"), vec![(p, k1)]),
+            3 => (
+                format!("({p} - {q} + {k2})"),
+                vec![(p, 1), (q, full), (format!("1:{w}"), k2)],
+            ),
+            _ => (p.clone(), vec![(p, 1)]),
+        };
+        let c = g.below(1 << w);
+        // `k·(a ^ c)` or `k·(a | c)` as a sum over `a & c`, mostly; a term changed or left
+        // out now and then.
+        let k = 1 + g.below(full);
+        let xor = g.chance(1, 2);
+        let near = |g: &mut Rng, v: u64| if g.chance(5, 6) { v } else { g.below(1 << w) };
+        let on_and = if xor { k.wrapping_mul(2) } else { k }.wrapping_neg() & full;
+        let mut src = format!("({a} & {c}) * {}", near(&mut g, on_and));
+        for (t, kt) in &spelled {
+            if g.chance(7, 8) {
+                let kt = near(&mut g, k.wrapping_mul(*kt) & full);
+                src.push_str(&format!(" + {t} * {kt}"));
+            }
+        }
+        if g.chance(5, 6) {
+            src.push_str(&format!(" + {}", near(&mut g, k.wrapping_mul(c) & full)));
+        }
+        // The XOR, the OR and the value themselves beside it.
+        for op in ["^", "|"] {
+            if g.chance(1, 3) {
+                let kt = near(&mut g, k.wrapping_neg() & full);
+                src.push_str(&format!(" + ({a} {op} {c}) * {kt}"));
+            }
+        }
+        if g.chance(1, 4) {
+            src.push_str(&format!(" - {}", sym(&mut g)));
+        }
+        let src = match g.below(4) {
+            0 | 1 => src,
+            2 => format!("trunc<{}>({src})", 1 + g.below(w)),
+            _ => {
+                let lo = g.below(w);
+                format!("extract<{lo}, {}>({src})", 1 + g.below(w - lo))
+            }
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 900, "{changed}");
+}
+
+/// Limb arithmetic: the high limb of a product by a constant done in digits (cross products,
+/// the partial products' high digits, the carries of the low limb), and high digits of sums
+/// whose constants differ by a multiple of the digit or whose coefficients are shifted into
+/// place, with a term changed or left out now and then, stay equal to themselves:
+/// exhaustively.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_digits_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0005);
+    let mut rng = Rng(81);
+    let mut changed = 0;
+    for i in 0..1200 {
+        // A word of 8 bits in digits of 2 or 3, or two of 6 in digits of 2.
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (6, &["a", "b"])
+        } else {
+            (8, &["a"])
+        };
+        let full = (1u64 << w) - 1;
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let k = if w == 8 { 2 + g.below(2) } else { 2 };
+        let (mask, mask2) = ((1u64 << k) - 1, (1u64 << (2 * k)) - 1);
+        let near = |g: &mut Rng, v: u64| if g.chance(7, 8) { v } else { g.below(1 << w) };
+        let x = sym(&mut g);
+        let j = 1 + g.below(w - 2 * k);
+        let src = if g.chance(2, 3) {
+            // The schoolbook high limb of `x·(k0 + k1·2^k + k2·4^k)`.
+            let (k0, k1, k2) = (g.below(mask + 1) | 1, g.below(mask + 1), g.below(mask + 1));
+            let d0 = format!("({x} & {mask})");
+            let d1 = match g.below(3) {
+                0 => format!("zext<{w}>(extract<{k}, {k}>({x}))"),
+                1 => format!("(({x} >>u {k}) & {mask})"),
+                _ => format!("(({x} & {mask2}) >>u {k})"),
+            };
+            let d2 = if g.chance(1, 2) {
+                format!("({x} >>u {})", 2 * k)
+            } else {
+                format!("extract<{}, {w}>(sext<{}>({x}))", 2 * k, 2 * w)
+            };
+            let p = format!("(({x} & {mask2}) * {})", near(&mut g, k0));
+            let cross = if g.chance(1, 2) {
+                format!("{d0} * {}", near(&mut g, (k1 << k) & full))
+            } else {
+                format!("({d0} * {k1} << {k})")
+            };
+            let (word, low) = (format!("({p} + {cross})"), format!("({p} & {mask2})"));
+            // Any multiple of the limb's size on a cross product's constant.
+            let above = |g: &mut Rng, v: u64| (v + (g.below(4) << j)) & full;
+            let mut terms = vec![
+                format!("{d1} * {}", above(&mut g, k1)),
+                format!("{d0} * {}", above(&mut g, k2)),
+                format!("{d2} * {}", near(&mut g, k0)),
+                format!("zext<{w}>(({word} & {mask2}) <u {low})"),
+                format!("(({d1} * {k0}) >>u {k})"),
+                format!("(({d0} * {}) >>u {k})", near(&mut g, k1)),
+                format!("zext<{w}>({low} <u ({d0} * {k0}))"),
+            ];
+            if g.chance(1, 6) {
+                terms.remove(g.below(terms.len() as u64) as usize);
+            }
+            if g.chance(1, 4) {
+                terms.push(sym(&mut g));
+            }
+            format!("trunc<{j}>({})", terms.join(" + "))
+        } else {
+            // A carry against a constant, beside high digits of the same sum under
+            // constants that differ above the digit, and of a product shifted into place.
+            let at = 2 * k;
+            let y = sym(&mut g);
+            let (c1, c2, t) = (g.below(1 << w), g.below(1 << at), 1 + g.below(at));
+            let v = match g.below(3) {
+                0 => format!("({x} + {y})"),
+                1 => format!("({x} * {})", g.below(1 << w) | 1),
+                _ => format!("({x} * {} << {t})", g.below(1 << (w - t))),
+            };
+            let high = |e: &str| format!("extract<{at}, {j}>({e})");
+            let d = c1.wrapping_sub(c2) & full;
+            let mut src = format!(
+                "zext<{j}>(({v} + {c1} & {mask2}) <u {c2}) + {}",
+                high(&format!("({v} + {})", near(&mut g, d)))
+            );
+            if g.chance(1, 2) {
+                let up = (d + (g.below(4) << at)) & full;
+                src.push_str(&format!(" - {}", high(&format!("({v} + {up})"))));
+            }
+            if g.chance(1, 2) {
+                let c = g.below(1 << (w - t));
+                let e = format!("({y} * {} + {})", c << t, g.below(1 << t));
+                src.push_str(&format!(" + {}", high(&e)));
+                if at - t + j <= w {
+                    src.push_str(&format!(
+                        " - extract<{}, {j}>({y} * {})",
+                        at - t,
+                        near(&mut g, c)
+                    ));
+                }
+            }
+            src
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 900, "{changed}");
+}
+
+/// Limb arithmetic: a limb's sum read by users that have no observer in common below the root
+/// (a product and a sum, the arms of a `select`), each through a truncation of its own. No
+/// user's rewrite pays while the others hold the sum; at the root the sum is read on the bits
+/// that reach the result, by every user at once (see `demanded::whole`).
+#[cfg(feature = "prove")]
+#[test]
+fn limb_root_fixtures() {
+    let eng = deobfuscator();
+    // The high limb of `x + y` with a third digit: no slice of one word.
+    let limb = "((x >>u 18) + (y >>u 18) + (z >>u 18) \
+                + zext<32>((x + y & 0x3ffff) <u (x & 0x3ffff)))";
+    // The carry of a product's digits beside a product nothing else reads narrowed: the
+    // reading keeps the sum's own terms as they are.
+    let (d, e) = ("(x & 0x1fff)", "((y >>u 13) & 0x1fff)");
+    let (p, q) = (format!("({d} * (y & 0x1fff))"), format!("({d} * {e})"));
+    let high = format!(
+        "(({q} >>u 13) + zext<32>((({p} + ({q} << 13)) & 0x3ffffff) <u {p}) \
+         + (x >>u 7) * (y >>u 9))"
+    );
+    for (src, w, want) in [
+        // Read under 14 bits and under 7, by a product each.
+        (
+            format!("trunc<14>({limb}) * v + zext<14>(trunc<7>({limb})) * u"),
+            14,
+            "let %0 = extract<18, 14>(z) + extract<18, 14>(x + y);\n%0 * v + (%0 & 127) * u",
+        ),
+        // By the arms of a `select`.
+        (
+            format!("select(c:1, trunc<14>({limb}), zext<14>(trunc<7>({limb})))"),
+            14,
+            "let %0 = extract<18, 14>(z) + extract<18, 14>(x + y);\nselect(c, %0, %0 & 127)",
+        ),
+        // At the register's width, under 6 bits and under 3.
+        (
+            format!("zext<32>(trunc<6>({high})) * v + (zext<32>(trunc<3>({high})) ^ u)"),
+            32,
+            "let %0 = x & 8191;\n\
+             let %1 = (x >>u 7) * (y >>u 9) \
+             + zext<32>(extract<26, 6>(%0 * (y & 8191) + (%0 * (y >>u 13 & 8191) << 13)));\n\
+             (%1 & 63) * v + (%1 & 7 ^ u)",
+        ),
+    ] {
+        assert_eq!(simplify(&eng, &src, w), want, "{src}");
+    }
+}
+
+/// Limb arithmetic: a sum of high digits, a carry and sometimes a term of its own, read by
+/// two users through a truncation, a mask or a shift each, under a root that is no observer
+/// (a sum, a product, a `select`, a comparison of them), stays equal to itself: exhaustively.
+/// (The sum is read at the root on the bits that reach the result.)
+#[cfg(feature = "prove")]
+#[test]
+fn limb_roots_are_sound() {
+    let eng = deobfuscator();
+    let mut g = Rng(0x11b5_0005);
+    let mut rng = Rng(81);
+    let mut changed = 0;
+    for i in 0..1200 {
+        let (w, syms): (u64, &[&str]) = if i % 3 == 0 {
+            (4, &["a", "b", "c"])
+        } else {
+            (6, &["a", "b"])
+        };
+        let sym = |g: &mut Rng| format!("{}:{w}", syms[g.below(syms.len() as u64) as usize]);
+        let value = |g: &mut Rng| {
+            let (x, y) = (sym(g), sym(g));
+            match g.below(4) {
+                0 => format!("({x} + {y})"),
+                1 => format!("({x} * {})", g.below(1 << w)),
+                2 => format!("({x} ^ {y})"),
+                _ => x,
+            }
+        };
+        let k = 1 + g.below(w - 1);
+        let mask = (1u64 << k) - 1;
+        let (p, q) = (value(&mut g), value(&mut g));
+        let (cp, cq) = if g.chance(3, 4) {
+            (format!("({p} + {q})"), p.clone())
+        } else {
+            (value(&mut g), value(&mut g))
+        };
+        let sign = if g.chance(1, 4) { '-' } else { '+' };
+        // A term the carry's digits meet nothing of.
+        let own = match g.below(4) {
+            0 => format!(" + {} * {}", value(&mut g), value(&mut g)),
+            1 => format!(" - ({} >>u {})", value(&mut g), g.below(w)),
+            _ => String::new(),
+        };
+        let s = format!(
+            "(({p} >>u {k}) + ({q} >>u {k}) {sign} \
+             zext<{w}>(({cp} & {mask}) <u ({cq} & {mask})){own})"
+        );
+        let reader = |g: &mut Rng| match g.below(6) {
+            0 => format!("zext<{w}>(trunc<{}>({s}))", 1 + g.below(w)),
+            1 => format!("({s} & {})", g.below(1 << w)),
+            2 => format!("({s} << {})", g.below(w)),
+            3 => format!("({s} + {})", g.below(1 << w)),
+            4 => format!("zext<{w}>(extract<{}, 1>({s}))", g.below(w)),
+            _ => format!(
+                "concat(trunc<{}>({s}), extract<{}, 1>({p}))",
+                w - 1,
+                g.below(w)
+            ),
+        };
+        let (r1, r2) = (reader(&mut g), reader(&mut g));
+        let v = sym(&mut g);
+        let src = match g.below(7) {
+            0 => format!("{r1} * {v} + {r2}"),
+            1 => format!("select(t:1, {r1}, {r2})"),
+            2 => format!("select({r1} <u {v}, {r2}, {v})"),
+            3 => format!("{r1} - ({r2} ^ {v})"),
+            4 => format!("({r1} << 1) + ({r2} >>u 1)"),
+            5 => format!("zext<{w}>({r1} == {r2}) + {r1}"),
+            _ => format!("select(t:1, {r1}, {v}) * {r2}"),
+        };
+        let mut cx = Context::new();
+        let e = cx
+            .parse(&src, &ParseOptions::width(Width::new(w as u16).unwrap()))
+            .unwrap_or_else(|err| panic!("{src}: {err}"));
+        let out = checked(&eng, &mut cx, e);
+        assert!(
+            equivalent(&mut cx, e, out.expr, &mut rng),
+            "{src} vs {}",
+            cx.display(out.expr)
+        );
+        changed += u64::from(out.changed);
+    }
+    assert!(changed > 800, "{changed}");
 }
 
 /// Limb arithmetic: comparisons of digits held in wider registers, and their borrow tests.
@@ -5542,6 +8629,16 @@ fn deobfuscator() -> Engine {
         .verify(Verify::strict())
         .build()
         .unwrap()
+}
+
+/// `e` simplified by `eng`, which verifies strictly: no candidate may have been rejected. A
+/// pass that builds a candidate unequal to its node is caught by the verifier, the result
+/// stays equal, and a test that compared results alone would take the pass for sound.
+#[cfg(feature = "prove")]
+fn checked(eng: &Engine, cx: &mut Context, e: Expr) -> crate::engine::RootOutcome {
+    let out = eng.run(cx, &[e], Run::default()).unwrap();
+    assert_eq!(out.stats.rejected, 0, "{}", cx.display(e));
+    out.roots[0]
 }
 
 #[cfg(feature = "prove")]

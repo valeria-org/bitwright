@@ -699,45 +699,58 @@ impl Context {
                 );
                 continue;
             }
-            let j = match n.op {
-                OpCode::Const => {
-                    let v = src
-                        .const_val(i)
-                        .ok_or_else(|| Error::Contract("a constant without a value".into()))?;
-                    self.mk_const(&v)?
-                }
-                OpCode::Sym => {
-                    let e = &src.symbols.entries[n.a as usize];
-                    let s = self.symbol(e.key.clone(), e.width)?;
-                    // With what the host declared of it: results from `src` may rely on it.
-                    if let Some(k) = e.known {
-                        match self.declared_known(s)? {
-                            None => self.declare_known(s, k)?,
-                            Some(have) if have == k => {}
-                            Some(_) => {
-                                return Err(Error::Unsupported(format!(
-                                    "symbol {} has other declared known bits in this context",
-                                    e.key
-                                )));
-                            }
-                        }
-                    }
-                    self.id(s)?
-                }
-                op => {
-                    if op.as_ext().is_some() {
-                        self.same_ext_op(src, n.aux)?;
-                    }
-                    let mut kids = [0u32; 3];
-                    for (k, c) in n.children().enumerate() {
-                        kids[k] = map[&c];
-                    }
-                    self.rebuild_node(n, src.fp_desc(i), kids)?
-                }
-            };
+            let mut kids = [0u32; 3];
+            for (k, c) in n.children().enumerate() {
+                kids[k] = map[&c];
+            }
+            let j = self.import_node(src, i, kids)?;
             map.insert(i, j);
         }
         Ok(ids.iter().map(|i| self.handle(map[i])).collect())
+    }
+
+    /// Node `i` of the context `src` over the copies `kids` of its operands in this one, as
+    /// [`import`](Self::import) copies it (a constant by its value, a symbol by its key with
+    /// what the host declared of it).
+    pub(crate) fn import_node(
+        &mut self,
+        src: &Context,
+        i: u32,
+        kids: [u32; 3],
+    ) -> Result<u32, Error> {
+        let n = src.node(i);
+        match n.op {
+            OpCode::Const => {
+                let v = src
+                    .const_val(i)
+                    .ok_or_else(|| Error::Contract("a constant without a value".into()))?;
+                self.mk_const(&v)
+            }
+            OpCode::Sym => {
+                let e = &src.symbols.entries[n.a as usize];
+                let s = self.symbol(e.key.clone(), e.width)?;
+                // With what the host declared of it: results from `src` may rely on it.
+                if let Some(k) = e.known {
+                    match self.declared_known(s)? {
+                        None => self.declare_known(s, k)?,
+                        Some(have) if have == k => {}
+                        Some(_) => {
+                            return Err(Error::Unsupported(format!(
+                                "symbol {} has other declared known bits in this context",
+                                e.key
+                            )));
+                        }
+                    }
+                }
+                self.id(s)
+            }
+            op => {
+                if op.as_ext().is_some() {
+                    self.same_ext_op(src, n.aux)?;
+                }
+                self.rebuild_node(n, src.fp_desc(i), kids)
+            }
+        }
     }
 
     /// Whether the extension operation at registry position `index` of `src` is at the same

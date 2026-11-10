@@ -61,12 +61,12 @@ let unmask = Engine::builder()
     .strategy(Strategy::new("unmask", vec![Phase::FactFold, Phase::Linear]))
     .build()?;
 let mut cx = Context::new();
-let e = cx.parse("(x + y) * 3 - 3 * y + ((z & 0xff) | (z & 0xff00))", &ParseOptions::width(Width::W32))?;
+let e = cx.parse("(x + y) * 3 - 3 * y + ((z | 0xff) & (z | 0xff00))", &ParseOptions::width(Width::W32))?;
 let out = unmask.simplify(&mut cx, e)?;
-assert_eq!(cx.display(out.expr).to_string(), "x * 3 + (z & 255 | z & 65280)");
+assert_eq!(cx.display(out.expr).to_string(), "x * 3 + ((z | 255) & (z | 65280))");
 // The standard strategy merges the masks too.
 let out = Engine::standard().simplify(&mut cx, e)?;
-assert_eq!(cx.display(out.expr).to_string(), "x * 3 + (z & 65535)");
+assert_eq!(cx.display(out.expr).to_string(), "x * 3 + z");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -316,9 +316,11 @@ Events also say where in the run they happen. Each distinct root's work begins w
 `Event::PhaseEnd`, and the end carries the root the phase left, the work it spent (in the units
 of `Budget`) and the limit that stopped it, if one did. `Event::Stage` reports a rewrite of the
 whole root made outside the phases: the MBA service's context push, case tables and
-opaque-constant sweep. `Event::Relied` follows a rewrite that holds only under some of the run's
-assumptions. Between them, the root never changes without an event saying so: from `Root`
-through each `Stage` and phase, the last root reported is the result.
+opaque-constant sweep, and the late stage of the rounds given up (the root goes back to the
+one the stage began from, where the stage left it no smaller). `Event::Relied` follows a
+rewrite that holds only under some of the run's assumptions. Between them, the root never
+changes without an event saying so: from `Root` through each `Stage` and phase, the last root
+reported is the result.
 
 They also say what almost happened. `Event::GuardFailed` follows a `GuardFalse` with the
 guard's predicate that did not hold (`disjoint`, `is_pow2`, `proves`, …) and the nodes bound to

@@ -45,16 +45,61 @@ fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Resul
     Ok(certify::refute(a, b, &points).is_none())
 }
 
-/// Pass work as a certificate's meter.
-struct Gate<'x, 'r, 'a>(&'x mut Runner<'r, 'a>);
+#[cfg(test)]
+thread_local! {
+    /// For tests: every question is put to the solver, also one no answer to which could be
+    /// committed (the phase without `pass::cannot_pay`).
+    pub(crate) static ASK_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// For tests: the most freed nodes `pass::cannot_pay` decides (as built: any), and
+    /// whether it compares forms where the atoms are free (as built: yes).
+    pub(crate) static PAY_RULE: std::cell::Cell<(u32, bool)> =
+        const { std::cell::Cell::new((u32::MAX, true)) };
+}
+
+/// Whether [`ASK_ALL`] is set (never outside tests).
+fn ask_all() -> bool {
+    #[cfg(test)]
+    return ASK_ALL.get();
+    #[cfg(not(test))]
+    false
+}
+
+/// [`PAY_RULE`] (as built outside tests).
+fn pay_rule() -> (u32, bool) {
+    #[cfg(test)]
+    return PAY_RULE.get();
+    #[cfg(not(test))]
+    (u32::MAX, true)
+}
+
+/// The pass work one certificate of the gate may take ([`exact`]) once the certificates that
+/// proved nothing have taken [`GATE_MISSED`] in the call: what remains of a test larger than
+/// this is then not run. A certificate's tests are each bounded (`certify::MAX_EFFORT`), but
+/// an answer no test decides goes through several, and took 18 to 32 million units where
+/// limb arithmetic asks hundreds of questions an expression: three such answers were the pass
+/// work of a whole call (2^26). Of 2,400 answers the gate proved on limb expressions, one
+/// took more than this (13.9 million); the next took 4.7 million.
+const GATE_SHARE: u64 = 1 << 23;
+
+/// The pass work undecided certificates may take in a call before the next ones are held to
+/// [`GATE_SHARE`]: until then a certificate takes what it needs of what the call has left (a
+/// product of a sum by a sign squared, at 32 bits, is proved in 20 to 30 million units).
+const GATE_MISSED: u64 = 1 << 24;
+
+/// Pass work as a certificate's meter, within a share.
+struct Gate<'x, 'r, 'a> {
+    r: &'x mut Runner<'r, 'a>,
+    share: u64,
+}
 
 impl certify::Meter for Gate<'_, '_, '_> {
     type Err = Stop;
     fn left(&self) -> u64 {
-        self.0.meter.left_in(|b| b.pass_work)
+        self.r.meter.left_in(|b| b.pass_work).min(self.share)
     }
     fn charge(&mut self, units: u64) -> Result<(), Stop> {
-        self.0
+        self.share = self.share.saturating_sub(units);
+        self.r
             .meter
             .charge(Counter::PassWork, units)
             .map_err(Stop::Exhausted)
@@ -66,11 +111,30 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// grid, exhaustive evaluation; equal polynomials over symbols first where that test would
 /// take far longer), over abstracted atoms when a side leaves the polynomial fragment. Charged
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
-/// than what is left is not started (reported as over budget).
-fn exact(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr) -> Result<certify::Report, Stop> {
-    let report = certify::prove(a, b, &mut Gate(r))?;
+/// than what is left is not started (reported as over budget). Also whether the report is
+/// the same under any larger budget: it ran within its share ([`GATE_SHARE`]), not within
+/// what the call had left.
+fn exact(
+    r: &mut Runner<'_, '_>,
+    a: &MbaExpr,
+    b: &MbaExpr,
+) -> Result<(certify::Report, bool), Stop> {
+    let left = r.meter.left_in(|b| b.pass_work);
+    let share = if r.mba_missed >= GATE_MISSED {
+        GATE_SHARE
+    } else {
+        u64::MAX
+    };
+    // (The same under any larger budget: within its share, or with nothing held back and
+    // nothing left over.)
+    let stable = left >= share;
+    let before = r.meter.spent.pass_work;
+    let report = certify::prove(a, b, &mut Gate { r, share })?;
+    if report.verdict != crate::mba::Verdict::Proved {
+        r.mba_missed += r.meter.spent.pass_work - before;
+    }
     count(r).certificates.record(&report);
-    Ok(report)
+    Ok((report, stable))
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::MbaStats {
@@ -1322,12 +1386,14 @@ impl certify::Meter for Steps<'_, '_, '_> {
     }
 }
 
-/// The MBA phase at `n`.
+/// The MBA phase at `n`: a node of the expression, or (`part`) a part of a sum written again
+/// to be asked alone (`linear::by_sums`, `by_groups`).
 pub(super) fn step(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     cfg: &MbaConfig,
     n: u32,
+    part: bool,
 ) -> Result<Step, Stop> {
     // A solver that takes polynomials is also asked at constant left shifts (the arena spells
     // `2^k·t` as `t << k`).
@@ -1336,16 +1402,17 @@ pub(super) fn step(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    let out = ask(r, cx, cfg, n, n)?;
+    let (out, declined) = ask(r, cx, cfg, n, n, part)?;
     // a fragment that reads slices of one rotated value, asked again with them
-    // written as masks of that rotation (see [`sliced`]).
+    // written as masks of that rotation (see [`sliced`]); also after a question that was not
+    // asked because no answer could pay, as after its answer.
     if cfg.noise_forms
         && let Step::Normal(fin) = &out
-        && fin.done
+        && (fin.done || declined)
     {
         let before = cx.len() as u32;
         if let Some(root) = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))? {
-            let again = ask(r, cx, cfg, n, root)?;
+            let (again, _) = ask(r, cx, cfg, n, root, part)?;
             if matches!(again, Step::To(..)) {
                 return Ok(again);
             }
@@ -1445,13 +1512,29 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
 }
 
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
-/// the answer replaces `n`.
+/// the answer replaces `n`. Also whether the question was not put because no answer to it
+/// could be committed (see `pass::cannot_pay`).
 fn ask(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     cfg: &MbaConfig,
     n: u32,
     root: u32,
+    part: bool,
+) -> Result<(Step, bool), Stop> {
+    let mut declined = false;
+    let out = ask_inner(r, cx, cfg, n, root, part, &mut declined)?;
+    Ok((out, declined))
+}
+
+fn ask_inner(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    root: u32,
+    part: bool,
+    declined: &mut bool,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
     let (m, bindings) = match lower_id(cx, root, &cfg.limits) {
@@ -1524,6 +1607,34 @@ fn ask(
                     a
                 }
                 None => {
+                    // A question no answer to which could be committed is not asked (see
+                    // `cannot_pay`; of the questions limb arithmetic asks, half).
+                    let cannot = if ask_all() {
+                        None
+                    } else {
+                        // A part of a sum written again is no node of the expression: what
+                        // replacing it frees is counted among candidates built and discarded
+                        // (an answer refused for one part changes the count for the next), so
+                        // there the rule stays as narrow as it was. An answer taken on a
+                        // solver's word or on samples need be no identity over the atoms.
+                        let (most, free) = pay_rule();
+                        super::cannot_pay(
+                            r,
+                            cx,
+                            n,
+                            &bindings.atoms,
+                            if part { most.min(2) } else { most },
+                            free && !part
+                                && root == n
+                                && !cfg.trust.backend_certificates
+                                && !cfg.trust.sampled,
+                        )?
+                    };
+                    if let Some(fin) = cannot {
+                        count(r).not_smaller += 1;
+                        *declined = true;
+                        return Ok(Step::Normal(fin));
+                    }
                     // The solver works within its own limit and what is left of the run's
                     // account of its steps, and is charged the steps it spent. With nothing
                     // left the question is not asked: over budget, so not final.
@@ -1549,9 +1660,10 @@ fn ask(
                         count(r).exhausted += 1;
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
-                    if a != MbaAnswer::Exhausted {
-                        r.mba_answers.insert(key, a.clone());
-                    }
+                    // (Also one that ran short of the solver's whole limit for a question:
+                    // asked again in this call, in the next round or at another node, it
+                    // would run as long and run short again.)
+                    r.mba_answers.insert(key, a.clone());
                     a
                 }
             };
@@ -1561,8 +1673,17 @@ fn ask(
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    // Always: a cheap refutation check.
-                    if !sampled(r, &m, &expr, mk[0])? {
+                    // Always: a cheap refutation check (of the question and its answer:
+                    // made once for a question of the call).
+                    let agreed = match r.mba_agreed.get(&key) {
+                        Some(&agreed) => agreed,
+                        None => {
+                            let agreed = sampled(r, &m, &expr, mk[0])?;
+                            r.mba_agreed.insert(key, agreed);
+                            agreed
+                        }
+                    };
+                    if !agreed {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
@@ -1579,14 +1700,19 @@ fn ask(
                         discard(r, cx, before);
                         return Ok(Step::Normal(fin));
                     }
-                    let own = exact(r, &m, &expr)?;
-                    if own.verdict == Verdict::Refuted {
-                        count(r).refuted += 1;
-                        discard(r, cx, before);
-                        return Ok(Step::Normal(Fin::FINAL));
-                    }
-                    let by =
-                        if own.verdict == Verdict::Proved {
+                    // An answer the gate proved earlier in this call, which the commit rule
+                    // then refused: the same answer, proved as it was (as a host's cache
+                    // would have it).
+                    if let Some(&vouched) = r.mba_proved.get(&key) {
+                        evidence = vouched;
+                    } else {
+                        let (own, stable) = exact(r, &m, &expr)?;
+                        if own.verdict == Verdict::Refuted {
+                            count(r).refuted += 1;
+                            discard(r, cx, before);
+                            return Ok(Step::Normal(Fin::FINAL));
+                        }
+                        let by = if own.verdict == Verdict::Proved {
                             Some("certificate")
                         } else if inner.mba.prover.as_ref().is_some_and(|p| {
                             p.prove_equal(&m, &expr, &cfg.budget) == Verdict::Proved
@@ -1599,26 +1725,26 @@ fn ask(
                         } else {
                             None
                         };
-                    let proved = by.is_some();
-                    if let Some(by) = by {
+                        let Some(by) = by else {
+                            count(r).proof_unknown += 1;
+                            discard(r, cx, before);
+                            // A certificate skipped for lack of budget might decide with
+                            // more: not final. One that ran within its share is the same
+                            // under any budget.
+                            let fin = if own.over_budget && !stable {
+                                Fin::capped(Exhausted::PassWork)
+                            } else {
+                                r.mba_unproved.insert(key, ());
+                                Fin::FINAL
+                            };
+                            return Ok(Step::Normal(fin));
+                        };
                         let test = own
                             .cert
                             .filter(|_| by == "certificate")
                             .map(crate::mba::certify::Cert::name);
                         evidence = (by, test, own.points);
-                    }
-                    if !proved {
-                        count(r).proof_unknown += 1;
-                        discard(r, cx, before);
-                        // A certificate skipped for lack of budget might decide with more:
-                        // not final.
-                        let fin = if own.over_budget {
-                            Fin::capped(Exhausted::PassWork)
-                        } else {
-                            r.mba_unproved.insert(key, ());
-                            Fin::FINAL
-                        };
-                        return Ok(Step::Normal(fin));
+                        r.mba_proved.insert(key, evidence);
                     }
                     inner
                         .mba

@@ -477,15 +477,19 @@ pub enum Stage {
     /// Pieces that depend only on a few conditions, written as tables of their values (MBA
     /// noise forms; before every round).
     Cases,
+    /// The late stage of the rounds given up: the root it began from, where the rounds left
+    /// a root that is no smaller (see `Runner::rounds`).
+    Late,
 }
 
 impl Stage {
-    /// A short name: `context`, `sweep` or `cases`.
+    /// A short name: `context`, `sweep`, `cases` or `late`.
     pub fn name(self) -> &'static str {
         match self {
             Stage::Context => "context",
             Stage::Sweep => "sweep",
             Stage::Cases => "cases",
+            Stage::Late => "late",
         }
     }
 }

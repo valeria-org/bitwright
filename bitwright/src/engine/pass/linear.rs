@@ -4,7 +4,8 @@
 //! multiplication by a constant, shifts left by a constant (scaling), `|`/`^` of operands the
 //! facts prove disjoint (both are `+` then). Anything else is an *atom* with coefficient 1,
 //! except that a sum with both `sext(c)` and `zext(c)` of a 1-bit `c` reads the first as
-//! `−zext(c)`.
+//! `−zext(c)`. Terms that are the limbs of one word, their coefficients doubling from bit to
+//! bit, are one term of the word (see `limbs`).
 //! A form with more than [`MAX_TERMS`] terms is atomized. The form is re-emitted canonically
 //! (terms in the context's canonical order, positive coefficients first, power-of-two
 //! coefficients as shifts, the constant last), and the emission replaces the node only when
@@ -77,7 +78,7 @@ impl Form {
             && self.terms[0].1 == BitVec::one(self.konst.width())
     }
 
-    fn scale(&self, k: &BitVec) -> Form {
+    pub(super) fn scale(&self, k: &BitVec) -> Form {
         let terms = self
             .terms
             .iter()
@@ -91,7 +92,7 @@ impl Form {
         }
     }
 
-    fn add(&self, o: &Form) -> Form {
+    pub(super) fn add(&self, o: &Form) -> Form {
         let mut terms = Vec::with_capacity(self.terms.len() + o.terms.len());
         let (mut i, mut j) = (0, 0);
         while i < self.terms.len() || j < o.terms.len() {
@@ -138,7 +139,7 @@ impl Form {
         f
     }
 
-    fn neg(&self) -> Form {
+    pub(super) fn neg(&self) -> Form {
         let w = self.konst.width();
         self.scale(&BitVec::ones(w))
     }
@@ -334,11 +335,14 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<Form, Sto
             terms: Vec::new(),
             fin: Fin::FINAL,
         },
-        OpCode::Add => merge_complements(cx, merge_signs(cx, get(r, node.a).add(&get(r, node.b)))),
-        OpCode::Sub => merge_complements(
-            cx,
-            merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg())),
-        ),
+        OpCode::Add => {
+            let f = merge_signs(cx, get(r, node.a).add(&get(r, node.b)));
+            merge_masks(r, cx, merge_complements(cx, f))
+        }
+        OpCode::Sub => {
+            let f = merge_signs(cx, get(r, node.a).add(&get(r, node.b).neg()));
+            merge_masks(r, cx, merge_complements(cx, f))
+        }
         OpCode::Neg => get(r, node.a).neg(),
         OpCode::Not => {
             let mut f = get(r, node.a).neg();
@@ -459,6 +463,230 @@ fn merge_complements(cx: &Context, form: Form) -> Form {
     }
     f.fin = fin;
     f
+}
+
+/// `a` and the constant node `c` when `i` is `a op c`.
+fn with_const(cx: &Context, i: u32) -> Option<(u32, u32)> {
+    let n = cx.node(i);
+    match (cx.is_const(n.a), cx.is_const(n.b)) {
+        (false, true) => Some((n.a, n.b)),
+        (true, false) => Some((n.b, n.a)),
+        _ => None,
+    }
+}
+
+/// `form` with each term `k·(a ^ c)` and `k·(a | c)`, `c` a constant, written over `a & c`
+/// when the form has that as a term too and gets no more terms by it: bit by bit `a ^ c` is
+/// `a + c − 2·(a & c)` and `a | c` is `a + c − (a & c)`, so `(a ^ c) + 2·(a & c)` is `a + c`,
+/// and a sum that spells an XOR with a constant (`x + y + c − 2·(x & c)`) meets the XOR
+/// itself. Only then, as [`merge_signs`]: the conjunction found in the arena is a term of the
+/// form, so the reading does not depend on what else was built.
+fn merge_masks(r: &Runner<'_, '_>, cx: &Context, form: Form) -> Form {
+    let w = form.konst.width();
+    let mut f = form;
+    // One term at a time, the first in the canonical order that the form allows (the result
+    // does not depend on node indices); each takes an XOR or an OR out of the form and puts
+    // in terms from below it only, so this ends.
+    loop {
+        let mut masks: Vec<(u32, BitVec)> = f
+            .terms
+            .iter()
+            .filter(|t| matches!(cx.node(t.0).op, OpCode::Xor | OpCode::Or))
+            .copied()
+            .collect();
+        if masks.is_empty() {
+            return f;
+        }
+        masks.sort_by(|a, b| cx.order(a.0, b.0));
+        let mut moved = None;
+        for (t, k) in masks {
+            let Some((a, c)) = with_const(cx, t) else {
+                continue;
+            };
+            let and = |x: u32, y: u32| cx.find(&Node::new(OpCode::And, w.bits(), x, y, 0));
+            let Some(m) = and(a, c).or_else(|| and(c, a)) else {
+                continue;
+            };
+            if f.terms.binary_search_by_key(&m, |t| t.0).is_err() {
+                continue;
+            }
+            let (Some(fa), Some(cv)) = (r.linear.get(a), cx.const_val(c)) else {
+                continue;
+            };
+            // `k·(a ^ c)` is `k·a + k·c − 2k·(a & c)`; `k·(a | c)` is `k·a + k·c − k·(a & c)`.
+            let minus_k = BitVec::un_unchecked(UnOp::Neg, &k);
+            let km = if cx.node(t).op == OpCode::Xor {
+                BitVec::bin_unchecked(BinOp::Add, &minus_k, &minus_k)
+            } else {
+                minus_k
+            };
+            let kc = BitVec::bin_unchecked(BinOp::Mul, &k, &cv);
+            let g = f
+                .add(&Form::of(kc, &[(t, minus_k), (m, km)]))
+                .add(&fa.scale(&k));
+            if g.terms.len() <= f.terms.len() {
+                moved = Some(g);
+                break;
+            }
+        }
+        match moved {
+            Some(g) => f = g,
+            None => return f,
+        }
+    }
+}
+
+/// `form` with a term `k·(a ^ c)` or `k·(a | c)`, `c` a constant, written over `a & c` (see
+/// [`merge_masks`]) where that leaves it fewer terms, the conjunction built if it is not
+/// there: `(a + c) − (a ^ c)` is `2·(a & c)`. For a form that is a question of its own (the
+/// difference of a carry's sides), not for the form of a node: what is built does not enter
+/// any other reading. `None` when no term is taken.
+#[cfg(feature = "prove")]
+pub(super) fn unmasked(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    form: &Form,
+) -> Result<Option<Form>, Stop> {
+    let mut f = form.clone();
+    let mut any = false;
+    // One term at a time, the first in the canonical order that the form allows; each takes
+    // an XOR or an OR out and leaves fewer terms, so this ends.
+    loop {
+        let mut masks: Vec<(u32, BitVec)> = f
+            .terms
+            .iter()
+            .filter(|t| matches!(cx.node(t.0).op, OpCode::Xor | OpCode::Or))
+            .copied()
+            .collect();
+        masks.sort_by(|a, b| cx.order(a.0, b.0));
+        let mut moved = None;
+        for (t, k) in masks {
+            let Some((a, c)) = with_const(cx, t) else {
+                continue;
+            };
+            let Some(cv) = cx.const_val(c) else {
+                continue;
+            };
+            let xor = cx.node(t).op == OpCode::Xor;
+            let m = r.build(cx, |cx| cx.c_bin(BinOp::And, a, c))?;
+            let (fa, fm) = (form_of(r, cx, a)?, form_of(r, cx, m)?);
+            r.meter.charge(
+                Counter::PassWork,
+                (fa.terms.len() + fm.terms.len()) as u64 + 1,
+            )?;
+            // `k·(a ^ c)` is `k·a + k·c − 2k·(a & c)`; `k·(a | c)` is `k·a + k·c − k·(a & c)`.
+            let minus_k = BitVec::un_unchecked(UnOp::Neg, &k);
+            let km = if xor {
+                BitVec::bin_unchecked(BinOp::Add, &minus_k, &minus_k)
+            } else {
+                minus_k
+            };
+            let kc = BitVec::bin_unchecked(BinOp::Mul, &k, &cv);
+            let g = f
+                .add(&Form::of(kc, &[(t, minus_k)]))
+                .add(&fm.scale(&km))
+                .add(&fa.scale(&k));
+            if g.terms.len() < f.terms.len() {
+                moved = Some(g);
+                break;
+            }
+        }
+        match moved {
+            Some(g) => {
+                f = g;
+                any = true;
+            }
+            None => return Ok(any.then_some(f)),
+        }
+    }
+}
+
+/// `form` with its terms that spell an XOR or an OR with a constant written as that: for a
+/// term `q·(a & c)`, `c` a constant, the form is `rest + k·(a ^ c)` with `k = −q/2` (either
+/// half), and `rest + k·(a | c)` with `k = −q` (see [`merge_masks`]), and is written so where
+/// that leaves it fewer terms (the terms of `a` cancel). With the nodes the commit rule's
+/// region stops at; `None` when nothing is spelled so.
+fn masked(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    form: &Form,
+) -> Result<Option<(Form, Vec<u32>)>, Stop> {
+    let w = form.konst.width();
+    let mut ands: Vec<u32> = form
+        .terms
+        .iter()
+        .map(|t| t.0)
+        .filter(|&t| cx.node(t).op == OpCode::And && with_const(cx, t).is_some())
+        .collect();
+    if ands.is_empty() {
+        return Ok(None);
+    }
+    ands.sort_by(|a, b| cx.order(*a, *b));
+    let mut f = form.clone();
+    let mut leaves: Vec<u32> = Vec::new();
+    let mut taken: Vec<u32> = Vec::new();
+    for m in ands {
+        let Ok(at) = f.terms.binary_search_by_key(&m, |t| t.0) else {
+            continue;
+        };
+        let q = f.terms[at].1;
+        let Some((a, c)) = with_const(cx, m) else {
+            continue;
+        };
+        let Some(cv) = cx.const_val(c) else {
+            continue;
+        };
+        let fa = form_of(r, cx, a)?;
+        r.meter
+            .charge(Counter::PassWork, fa.terms.len() as u64 + 1)?;
+        let minus_q = BitVec::un_unchecked(UnOp::Neg, &q);
+        let mut options = vec![(BinOp::Or, minus_q)];
+        if q.bit(0) == Some(false) && w.bits() > 1 {
+            let half = crate::facts::known::bv_lshr(&minus_q, 1);
+            let top = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(w.bits()) - 1);
+            options.push((BinOp::Xor, half));
+            options.push((BinOp::Xor, crate::facts::known::bv_or(&half, &top)));
+        }
+        let mut best: Option<(Form, BinOp, BitVec)> = None;
+        for (op, k) in options {
+            // `form − k·(a + c) − q·(a & c)`.
+            let minus_k = BitVec::un_unchecked(UnOp::Neg, &k);
+            let kc = BitVec::bin_unchecked(BinOp::Mul, &minus_k, &cv);
+            let rest = f
+                .add(&fa.scale(&minus_k))
+                .add(&Form::of(kc, &[(m, minus_q)]));
+            // (Only where the sum's constant is the one the identity gives it: `x − 2·(x &
+            // c)` is `(x ^ c) − c`, the spelling of a sign extension, and a constant left
+            // beside the XOR hides a wider one from the passes that read known bits.)
+            if rest.konst.is_zero()
+                && rest.terms.len() + 1 < f.terms.len()
+                && best
+                    .as_ref()
+                    .is_none_or(|b| rest.terms.len() < b.0.terms.len())
+            {
+                best = Some((rest, op, k));
+            }
+        }
+        let Some((rest, op, k)) = best else {
+            continue;
+        };
+        let atom = r.build(cx, |cx| cx.c_bin(op, a, c))?;
+        f = rest.add(&Form::of(BitVec::zero(w), &[(atom, k)]));
+        leaves.push(a);
+        taken.push(m);
+    }
+    if taken.is_empty() {
+        return Ok(None);
+    }
+    leaves.extend(
+        form.terms
+            .iter()
+            .map(|t| t.0)
+            .filter(|t| !taken.contains(t)),
+    );
+    leaves.sort_unstable();
+    leaves.dedup();
+    Ok(Some((f, leaves)))
 }
 
 /// Emits `form` canonically.
@@ -839,8 +1067,28 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         Ok(s) => return Ok(s),
         Err(f) => f,
     };
+    // Limbs of one word, joined (see `limbs`).
+    let joined = match super::limbs::step(r, cx, n, &form)? {
+        Ok(s) => return Ok(s),
+        Err(f) => f,
+    };
+    // A slice of a sum plus a constant, the constant taken into the sum (see `limbs`).
+    let sliced = match super::limbs::folded(r, cx, n, &form)? {
+        Ok(s) => return Ok(s),
+        Err(f) => f,
+    };
+    // A sum that spells an XOR or an OR with a constant (see `masked`).
+    let before = cx.len() as u32;
+    let mut folded = Fin::FINAL;
+    if let Some((f, leaves)) = masked(r, cx, &form)? {
+        let e = emit(r, cx, &f)?;
+        match finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin)? {
+            Step::To(x, fin) => return Ok(Step::To(x, fin)),
+            Step::Normal(fin) => folded = fin,
+        }
+    }
     Ok(match plain(r, cx, n, form)? {
-        Step::Normal(f) => Step::Normal(f.and(merged)),
+        Step::Normal(f) => Step::Normal(f.and(merged).and(joined).and(sliced).and(folded)),
         s => s,
     })
 }
@@ -943,7 +1191,25 @@ pub(super) fn by_groups(
         return Ok(None);
     }
     let e = emit(r, cx, &total)?;
-    // The nodes from before the rewrite that it reads.
+    let stops = stops_of(r, cx, n, e)?;
+    finish_part(r, cx, n, e, before, &stops, fin).map(Some)
+}
+
+/// The nodes `n` reads that a rewrite `e` of it reads: the atoms the commit rule counts `e`
+/// over. A node of `e` that `n` does not read counts as new whether or not the arena holds it
+/// already (a candidate built and discarded earlier leaves its nodes there: stopping at every
+/// node from before the rewrite made the decision depend on what had been tried before).
+#[cfg(feature = "mba")]
+fn stops_of(r: &mut Runner<'_, '_>, cx: &Context, n: u32, e: u32) -> Result<Vec<u32>, Stop> {
+    let mut below = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![n];
+    while let Some(i) = todo.pop() {
+        if below.insert(i, ()).is_some() {
+            continue;
+        }
+        r.meter.charge(Counter::PassWork, 1)?;
+        todo.extend(cx.node(i).children());
+    }
     let mut stops = Vec::new();
     let mut seen = crate::hash::IdMap::<u32, ()>::default();
     let mut todo = vec![e];
@@ -951,13 +1217,30 @@ pub(super) fn by_groups(
         if seen.insert(i, ()).is_some() {
             continue;
         }
-        if i < before {
+        if below.contains_key(&i) {
             stops.push(i);
         } else {
             todo.extend(cx.node(i).children());
         }
     }
-    finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
+    Ok(stops)
+}
+
+/// [`finish`] for a sum rewritten part by part, which may leave the DAG one node larger (see
+/// `finish_within`): each part is the solver's answer, which nothing reads again as the sum
+/// it was, and the other sums that share a part's terms are rewritten to the same answer, so
+/// what the rewrite leaves behind dies with its last reader.
+#[cfg(feature = "mba")]
+fn finish_part(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    e: u32,
+    before: u32,
+    stops: &[u32],
+    fin: Fin,
+) -> Result<Step, Stop> {
+    super::finish_within(r, cx, PassKind::Mba, n, e, before, stops, fin, 2)
 }
 
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
@@ -1072,18 +1355,6 @@ pub(super) fn by_sums(
     let before = cx.len() as u32;
     let s = emit(r, cx, &Form::of(konst, &terms))?;
     let e = part(r, cx, s)?.unwrap_or(s);
-    let mut stops = Vec::new();
-    let mut seen = crate::hash::IdMap::<u32, ()>::default();
-    let mut todo = vec![e];
-    while let Some(i) = todo.pop() {
-        if seen.insert(i, ()).is_some() {
-            continue;
-        }
-        if i < before {
-            stops.push(i);
-        } else {
-            todo.extend(cx.node(i).children());
-        }
-    }
-    finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
+    let stops = stops_of(r, cx, n, e)?;
+    finish_part(r, cx, n, e, before, &stops, form.fin).map(Some)
 }

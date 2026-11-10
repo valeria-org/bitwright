@@ -70,9 +70,11 @@ impl Budget {
     /// Caps on one call scaled by one number, in the proportions of [`Budget::default`] (which
     /// is `Budget::fuel(1 << 22)`): `fuel` node visits, candidates, rewrites, new nodes and
     /// e-nodes; `16·fuel` matcher steps, fact transfers, pass work and equality-saturation
-    /// work; `fuel / 1024` MBA solver calls (at least 1 unless `fuel` is 0) and `4·fuel` MBA
-    /// solver steps (a step costs about as much as two to three units of pass work, so the
-    /// solver spends about what the passes do). Like every budget,
+    /// work; `fuel / 1024` MBA solver calls (at least 1 unless `fuel` is 0) and `8·fuel` MBA
+    /// solver steps: by default eight questions at the solver's own limit for one
+    /// (`MbaBudget::steps`), a bound on what a run can spend there and not what one does (a
+    /// step costs about as much as two to three units of pass work; of 3,450 limb
+    /// expressions the ones that spent most took 17 to 21.5 million). Like every budget,
     /// a count of work units, never time: the same input stops at the same place on every run,
     /// and a run it stops keeps what it did ([`End::BudgetTerminated`](super::End)).
     pub const fn fuel(fuel: u64) -> Budget {
@@ -93,7 +95,7 @@ impl Budget {
             fact_work: wide,
             pass_work: wide,
             mba_calls: mba,
-            mba_steps: fuel.saturating_mul(4),
+            mba_steps: fuel.saturating_mul(8),
             eqsat_nodes: fuel,
             eqsat_work: wide,
         }
@@ -132,7 +134,7 @@ impl Budget {
 impl Default for Budget {
     /// Generous caps for one call, [`Budget::fuel`]`(1 << 22)`: 2^22 visits, candidates,
     /// rewrites and new nodes, 2^26 matcher steps, fact transfers and pass work, 4096 MBA
-    /// solver calls and 2^24 MBA solver steps.
+    /// solver calls and 2^25 MBA solver steps.
     fn default() -> Self {
         Budget::fuel(1 << 22)
     }

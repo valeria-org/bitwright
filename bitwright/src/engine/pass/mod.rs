@@ -17,6 +17,7 @@ mod division;
 pub(super) mod forms;
 mod gf2;
 pub(super) mod invert;
+mod limbs;
 pub(super) mod linear;
 pub(super) mod linear_mba;
 #[cfg(feature = "mba")]
@@ -37,6 +38,8 @@ use crate::engine::budget::Counter;
 use crate::engine::{Exhausted, Explanation};
 use crate::expr::{Context, OpCode};
 use crate::facts::{Facts, KnownBits, Reliance};
+#[cfg(feature = "mba")]
+use crate::{BitVec, Width};
 
 /// A set of node indices emptied in constant time (by a new epoch; a stamp of 0 is never
 /// current): the engine's per-node scratch, kept by the runner and reused instead of hash sets.
@@ -345,14 +348,14 @@ pub(super) fn mba_step(
     }
     r.stats.passes.entry("mba").or_default().calls += 1;
     r.meter.charge(Counter::PassWork, 1)?;
-    let whole = mba::step(r, cx, cfg, n)?;
+    let whole = mba::step(r, cx, cfg, n, false)?;
     if matches!(whole, Step::To(..)) {
         return Ok(whole);
     }
     // a sum whose groups of terms share no leaf, each asked alone.
     let mut part =
         |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
-            Ok(match mba::step(r, cx, cfg, s)? {
+            Ok(match mba::step(r, cx, cfg, s, true)? {
                 Step::To(e, _) => Some(e),
                 Step::Normal(_) => None,
             })
@@ -1029,6 +1032,901 @@ pub(super) fn worth_building(
     }))
 }
 
+/// The most nodes replacing `n` may free for [`cannot_pay`] to decide.
+#[cfg(feature = "mba")]
+const PAY_FREED: u32 = 3;
+
+/// The most operands [`two_operators`] pairs (a question with more is asked).
+#[cfg(feature = "mba")]
+const PAY_LEAVES: usize = 64;
+
+/// Whether no form over `atoms` can replace `n` under [`shrinks`], whatever the form is: so a
+/// question about `n` (the fragment between it and `atoms`) need not be put to a solver.
+/// Replacing `n` frees the nodes only `n` holds alive, `f` of them, and a form that is committed
+/// needs fewer nodes than that besides `atoms` and the nodes below `n` (or is a constant), a
+/// node below `n` that it keeps being one freed less. So with `f = 1` it is an atom or a node
+/// below `n`; with `f = 2` it may also be one operator over those that stay (every node the
+/// constructors `lift_id` calls can make: `~ − + · & | ^ << >>u`, an extension, a slice); with
+/// `f = 3` one operator may also read one of the two nodes that go with `n` (where the other
+/// still goes), and the form may have two nodes of its own over those that stay: two
+/// operators, or one and a constant ([`two_operators`]). Equal forms agree at the
+/// verification points, so when `n` is not a constant there and none of these forms agrees
+/// with it, no answer can be committed: `Some`, with what the decision contributes to the
+/// node's finality (sharing made it unless the nodes below `n` alone give the same count).
+/// `None` when more than `most` nodes (at most [`PAY_FREED`]) are freed, the region is not
+/// whole, or a form agrees: the question is asked.
+///
+/// With `free` (the question is of `n`'s own fragment, and only a proved answer is committed),
+/// a form that agrees at the verification points is compared again where the atoms take
+/// independent values ([`free_values`]): an answer is an identity over the atoms, so a form
+/// that agrees with `n` only because of how its atoms are related is none (a limb that is a
+/// slice of a word below it agrees with that slice at every point, and no solver's answer
+/// says so).
+///
+/// The count is of the expression as it is: for a node that is no part of it (a sum written
+/// again to be asked part by part) the callers keep `most` at 2 and `free` off, as the rule
+/// was when those parts' commits were measured.
+#[cfg(feature = "mba")]
+pub(super) fn cannot_pay(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    atoms: &[u32],
+    most: u32,
+    free: bool,
+) -> Result<Option<Fin>, Stop> {
+    region(r, cx, n, atoms)?;
+    let shared = !alone(r);
+    let most = most.min(PAY_FREED);
+    let freed = dying_in(r, cx, n, false, most + 1, shared)?;
+    if freed > most {
+        return Ok(None);
+    }
+    // The operands a form may have at no cost: the atoms and the nodes below `n`.
+    let cap = region_cap(r);
+    let mut leaves: Vec<u32> = Vec::new();
+    {
+        let sc = &mut r.scratch;
+        sc.seen.begin(cx.len());
+        sc.stack.clear();
+        sc.stack.push(n);
+        while let Some(i) = sc.stack.pop() {
+            if !sc.seen.insert(i) {
+                continue;
+            }
+            if i != n {
+                leaves.push(i);
+            }
+            if sc.atoms.contains(i) {
+                continue;
+            }
+            // A region cut short by its cap undercounts what is freed.
+            if !sc.region.contains(i) || leaves.len() as u32 >= cap {
+                return Ok(None);
+            }
+            sc.stack.extend(cx.node(i).children());
+        }
+        // (Atoms of a rewrite of `n` that `n` does not read are atoms of the form too.)
+        for &a in atoms {
+            if a != n && sc.seen.insert(a) {
+                leaves.push(a);
+            }
+        }
+    }
+    r.meter.charge(Counter::PassWork, leaves.len() as u64 + 1)?;
+    r.sample(cx, n)?;
+    for &a in atoms {
+        r.sample(cx, a)?;
+    }
+    // The nodes that stop being used with `n` (kept, they are not freed), and those that
+    // stay: `n` as it is is none of either.
+    let (dying, stay): (Vec<u32>, Vec<u32>) =
+        leaves.iter().partition(|&&i| r.scratch.decided.contains(i));
+    let mut one = stay.clone();
+    if freed == 3 {
+        // One operator pays for two freed nodes: it may read one node that goes with `n`
+        // if the other still goes then.
+        for &d in &dying {
+            r.scratch.kept.begin(cx.len());
+            r.scratch.kept.insert(d);
+            if dying_in(r, cx, n, true, 3, shared)? >= 2 {
+                one.push(d);
+            }
+        }
+    }
+    // The same comparison as one made earlier in the call (the node asked again in a later
+    // round, with the same nodes going and staying): its answer.
+    let known = r.paid.get(&n).and_then(|asked| {
+        asked
+            .iter()
+            .find(|p| {
+                p.free == free
+                    && p.freed == freed
+                    && *p.atoms == *atoms
+                    && *p.stay == *stay
+                    && *p.one == *one
+            })
+            .map(|p| p.found)
+    });
+    let found = match known {
+        Some(found) => found,
+        None => {
+            let forms = Forms {
+                n,
+                leaves: &leaves,
+                one: &one,
+                apart: one.len() - stay.len(),
+                stay: &stay,
+                freed,
+            };
+            // The forms of one node at most first, at the verification points (they are
+            // there); then every form where the atoms are free, if one agreed or two
+            // operators are to be tried (as many agree only by how the atoms are related as
+            // do not: half the search); at the verification points where no such values are.
+            let (mut found, work) = Forms {
+                freed: freed.min(2),
+                ..forms
+            }
+            .agree(&r.samples, cx);
+            r.meter.charge(Counter::PassWork, work)?;
+            if found || freed == 3 {
+                let values = if free {
+                    free_values(r, cx, n, atoms)?
+                } else {
+                    None
+                };
+                if values.is_some() || !found {
+                    let (again, work) = forms.agree(values.as_ref().unwrap_or(&r.samples), cx);
+                    r.meter.charge(Counter::PassWork, work)?;
+                    found = again;
+                }
+            }
+            r.paid.entry(n).or_default().push(Paid {
+                atoms: atoms.into(),
+                free,
+                freed,
+                stay: stay.into(),
+                one: one.into(),
+                found,
+            });
+            found
+        }
+    };
+    if found {
+        return Ok(None);
+    }
+    let lone = if shared {
+        dying_in(r, cx, n, false, most + 1, false)?
+    } else {
+        freed
+    };
+    Ok(Some(if lone == freed {
+        Fin::FINAL
+    } else {
+        Fin::PROVISIONAL
+    }))
+}
+
+/// A comparison [`cannot_pay`] made at a node: what decides it besides the node (the atoms,
+/// whether they took free values, the nodes freed, those that stay and those one operator
+/// may read), and whether a form agreed.
+#[cfg(feature = "mba")]
+pub(crate) struct Paid {
+    atoms: Box<[u32]>,
+    free: bool,
+    freed: u32,
+    stay: Box<[u32]>,
+    one: Box<[u32]>,
+    found: bool,
+}
+
+/// The forms [`cannot_pay`] compares with `n`: of no node of their own over `leaves`, of one
+/// over `one` (no two of the last `apart` under it), of two over `stay`; as many as `freed`
+/// allows.
+#[cfg(feature = "mba")]
+struct Forms<'a> {
+    n: u32,
+    leaves: &'a [u32],
+    one: &'a [u32],
+    apart: usize,
+    stay: &'a [u32],
+    freed: u32,
+}
+
+#[cfg(feature = "mba")]
+impl Forms<'_> {
+    /// Whether `n` is a constant at every point of `values` or a form agrees with it there,
+    /// and the work it took.
+    fn agree(&self, values: &crate::hash::IdMap<u32, Box<[BitVec]>>, cx: &Context) -> (bool, u64) {
+        let n = self.n;
+        let w = cx.wid(n);
+        let vn = &values[&n];
+        let mut work = self.leaves.len() as u64;
+        if vn.iter().all(|v| *v == vn[0])
+            || self
+                .leaves
+                .iter()
+                .any(|i| cx.wid(*i) == w && values[i] == *vn)
+        {
+            return (true, work);
+        }
+        if self.freed >= 2 {
+            let (found, more) = one_operator(values, cx, n, self.one, self.apart);
+            work += more;
+            if found {
+                return (true, work);
+            }
+        }
+        if self.freed >= 3 {
+            let (found, more) = two_operators(values, cx, n, self.stay);
+            work += more;
+            if found {
+                return (true, work);
+            }
+        }
+        (false, work)
+    }
+}
+
+/// The points [`free_values`] evaluates at.
+#[cfg(feature = "mba")]
+const FREE_POINTS: usize = 16;
+
+/// The values of `n` and of the nodes between it and `atoms` at [`FREE_POINTS`] points where
+/// the atoms take independent values (seeded by what they are): what an identity over the
+/// atoms holds at. Two atoms stay related: a comparison and its negation, because `~` of a
+/// comparison is built as the negated comparison, which is then the other atom. `None` where
+/// that cannot be evaluated (a node below `n` that is neither an atom nor computed from them),
+/// or an atom is one the constructors read through otherwise.
+#[cfg(feature = "mba")]
+#[allow(clippy::type_complexity)]
+fn free_values(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    atoms: &[u32],
+) -> Result<Option<crate::hash::IdMap<u32, Box<[BitVec]>>>, Stop> {
+    use crate::ops::{CmpOp, UnOp};
+    let mut values: crate::hash::IdMap<u32, Box<[BitVec]>> = Default::default();
+    for &a in atoms {
+        let node = cx.node(a);
+        if matches!(
+            node.op,
+            OpCode::Const
+                | OpCode::Not
+                | OpCode::Neg
+                | OpCode::Zext
+                | OpCode::Sext
+                | OpCode::Extract
+                | OpCode::Concat
+        ) {
+            return Ok(None);
+        }
+        let seed = cx.meta[a as usize].shash ^ 0x6672_6565_6174_6f6d;
+        let w = cx.width_of(a);
+        values.insert(
+            a,
+            (0..FREE_POINTS)
+                .map(|k| super::point_value(seed, w, k + 2))
+                .collect(),
+        );
+    }
+    for (at, &a) in atoms.iter().enumerate() {
+        let node = cx.node(a);
+        let Some(op) = node.op.as_cmp() else {
+            continue;
+        };
+        // (An equality of one bit with a constant is built as the bit or its complement.)
+        if matches!(op, CmpOp::Eq | CmpOp::Ne)
+            && cx.wid(node.a) == 1
+            && (cx.const_val(node.a).is_some() || cx.const_val(node.b).is_some())
+        {
+            return Ok(None);
+        }
+        let (not, swap) = op.negated().canonical();
+        let (x, y) = if swap {
+            (node.b, node.a)
+        } else {
+            (node.a, node.b)
+        };
+        let not = OpCode::from_cmp(not);
+        for &b in &atoms[at + 1..] {
+            let other = cx.node(b);
+            if other.op == not && other.a == x && other.b == y {
+                let flipped = values[&a]
+                    .iter()
+                    .map(|v| BitVec::un_unchecked(UnOp::Not, v))
+                    .collect();
+                values.insert(b, flipped);
+            }
+        }
+    }
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    while let Some((i, expanded)) = stack.pop() {
+        if values.contains_key(&i) {
+            continue;
+        }
+        if !expanded {
+            stack.push((i, true));
+            for c in cx.node(i).children() {
+                if !values.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        r.meter.charge(Counter::PassWork, FREE_POINTS as u64)?;
+        let at: Result<Box<[BitVec]>, crate::Error> = (0..FREE_POINTS)
+            .map(|k| cx.eval_node(i, |j| values[&j][k], |_, _| None))
+            .collect();
+        match at {
+            Ok(v) => values.insert(i, v),
+            Err(_) => return Ok(None),
+        };
+    }
+    Ok(Some(values))
+}
+
+/// Whether one operator over `leaves` agrees with `n` at every point of `samples` (see
+/// [`cannot_pay`]), and the work it took (a unit per candidate screened): no two of the last
+/// `apart` leaves under one operator. Values up to 64 bits are compared as words, at one
+/// seeded point first; a wider `n` is taken to have one.
+#[cfg(feature = "mba")]
+fn one_operator(
+    samples: &crate::hash::IdMap<u32, Box<[BitVec]>>,
+    cx: &Context,
+    n: u32,
+    leaves: &[u32],
+    apart: usize,
+) -> (bool, u64) {
+    let w = cx.wid(n);
+    let Ok(wn) = Width::new(w) else {
+        return (true, 0);
+    };
+    if w > 64 {
+        return (true, 0);
+    }
+    let mask = u64::MAX >> (64 - w);
+    let lane = |i: u32| -> Option<Vec<u64>> { samples[&i].iter().map(BitVec::to_u64).collect() };
+    let Some(t) = lane(n) else {
+        return (true, 0);
+    };
+    // The first two points are all zeros and all ones: screen at a seeded one.
+    let k = 2.min(t.len() - 1);
+    let mut work = 0u64;
+    let mut same: Vec<(Vec<u64>, bool)> = Vec::new();
+    for (at, &i) in leaves.iter().enumerate() {
+        let wi = cx.wid(i);
+        work += 1;
+        if wi > 64 {
+            // A slice of a wide value.
+            let vi = &samples[&i];
+            work += u64::from(wi - w);
+            if (0..=wi - w).any(|lo| {
+                vi.iter()
+                    .zip(samples[&n].iter())
+                    .all(|(v, x)| v.extract(lo, wn).ok().as_ref() == Some(x))
+            }) {
+                return (true, work);
+            }
+            continue;
+        }
+        let Some(v) = lane(i) else {
+            return (true, work);
+        };
+        let all =
+            |f: &dyn Fn(u64) -> u64| f(v[k]) == t[k] && v.iter().zip(&t).all(|(&x, &y)| f(x) == y);
+        if wi == w {
+            if all(&|x| !x & mask) || all(&|x| x.wrapping_neg() & mask) {
+                return (true, work);
+            }
+            same.push((v, at >= leaves.len() - apart));
+        } else if wi < w {
+            let sign = 1u64 << (wi - 1);
+            if all(&|x| x) || all(&|x| ((x ^ sign).wrapping_sub(sign)) & mask) {
+                return (true, work);
+            }
+        } else {
+            work += u64::from(wi - w);
+            if (0..=wi - w).any(|lo| all(&|x| (x >> lo) & mask)) {
+                return (true, work);
+            }
+        }
+    }
+    let shl = |x: u64, y: u64| if y < u64::from(w) { x << y } else { 0 };
+    let shr = |x: u64, y: u64| if y < u64::from(w) { x >> y } else { 0 };
+    let ops: [&dyn Fn(u64, u64) -> u64; 11] = [
+        &|x, y| x.wrapping_add(y),
+        &|x, y| x.wrapping_sub(y),
+        &|x, y| y.wrapping_sub(x),
+        &|x, y| x.wrapping_mul(y),
+        &|x, y| x & y,
+        &|x, y| x | y,
+        &|x, y| x ^ y,
+        &shl,
+        &|x, y| shl(y, x),
+        &shr,
+        &|x, y| shr(y, x),
+    ];
+    for (j, (a, x)) in same.iter().enumerate() {
+        for (b, y) in &same[j..] {
+            if *x && *y && !core::ptr::eq(a, b) {
+                continue;
+            }
+            work += 1;
+            for f in ops {
+                if f(a[k], b[k]) & mask == t[k]
+                    && a.iter()
+                        .zip(b)
+                        .zip(&t)
+                        .all(|((&x, &y), &z)| f(x, y) & mask == z)
+                {
+                    return (true, work);
+                }
+            }
+        }
+    }
+    (false, work)
+}
+
+/// A mask of the low `bits` bits.
+#[cfg(feature = "mba")]
+fn low_ones(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// `x`, a value of `bits` bits (1 to 64), sign-extended to 64.
+#[cfg(feature = "mba")]
+fn signed(x: u64, bits: u32) -> u64 {
+    let s = 64 - bits;
+    (((x << s) as i64) >> s) as u64
+}
+
+/// The operators of two operands of one width a form may have, by number, on values of
+/// `w` bits (the result is not masked): `+`, `−` both ways, `·`, `&`, `|`, `^`, `<<` and `>>u`
+/// both ways.
+#[cfg(feature = "mba")]
+fn bin_value(o: u8, x: u64, y: u64, w: u32) -> u64 {
+    let w = u64::from(w);
+    match o {
+        0 => x.wrapping_add(y),
+        1 => x.wrapping_sub(y),
+        2 => y.wrapping_sub(x),
+        3 => x.wrapping_mul(y),
+        4 => x & y,
+        5 => x | y,
+        6 => x ^ y,
+        7 if y < w => x << y,
+        8 if x < w => y << x,
+        9 if y < w => x >> y,
+        10 if x < w => y >> x,
+        _ => 0,
+    }
+}
+
+/// How many operators [`bin_value`] numbers.
+#[cfg(feature = "mba")]
+const BIN_VALUES: u8 = 11;
+
+/// The inverse of an odd `a` modulo `2^64`.
+#[cfg(feature = "mba")]
+fn odd_inverse(a: u64) -> u64 {
+    // (Correct to three bits; each step doubles them.)
+    let mut x = a;
+    for _ in 0..5 {
+        x = x.wrapping_mul(2u64.wrapping_sub(a.wrapping_mul(x)));
+    }
+    x
+}
+
+/// The operands of `n`'s width by their value at one verification point: open addressing,
+/// filled in the operands' order (so what it finds, and in which order, is the values' alone).
+#[cfg(feature = "mba")]
+struct ByValue {
+    slots: Vec<(u64, u32)>,
+    shift: u32,
+}
+
+#[cfg(feature = "mba")]
+impl ByValue {
+    fn new(values: impl ExactSizeIterator<Item = u64>) -> Self {
+        let size = (values.len() * 4).next_power_of_two().max(16);
+        let mut t = ByValue {
+            slots: vec![(0, u32::MAX); size],
+            shift: 64 - size.trailing_zeros(),
+        };
+        for (i, v) in values.enumerate() {
+            let mut at = t.home(v);
+            while t.slots[at].1 != u32::MAX {
+                at = (at + 1) & (size - 1);
+            }
+            t.slots[at] = (v, i as u32);
+        }
+        t
+    }
+
+    fn home(&self, v: u64) -> usize {
+        (v.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    /// The operands whose value is `v`.
+    fn of(&self, v: u64) -> impl Iterator<Item = usize> + '_ {
+        let mut at = self.home(v);
+        core::iter::from_fn(move || {
+            loop {
+                let (x, i) = self.slots[at];
+                if i == u32::MAX {
+                    return None;
+                }
+                at = (at + 1) & (self.slots.len() - 1);
+                if x == v {
+                    return Some(i as usize);
+                }
+            }
+        })
+    }
+
+    /// Whether an operand's value is `v`.
+    fn has(&self, v: u64) -> bool {
+        let mut at = self.home(v);
+        loop {
+            let (x, i) = self.slots[at];
+            if i == u32::MAX {
+                return false;
+            }
+            if x == v {
+                return true;
+            }
+            at = (at + 1) & (self.slots.len() - 1);
+        }
+    }
+}
+
+/// Whether a form of two nodes of its own over `leaves` agrees with `n` at every verification
+/// point (see [`cannot_pay`]; `n` is taken to have one where it or a leaf is wider than 64
+/// bits, or the leaves are more than [`PAY_LEAVES`]), and the work it took (a unit per
+/// candidate screened). The forms, `l` a leaf and `c` a constant that is no leaf:
+///
+/// - one operator and a constant: `l + c` (which `l − c` is), `c − l`, `l ^ c`, `l & c`,
+///   `l | c`, `l · c` (which `l << c` is), `l >>u c`, `c << l`, `c >>u l`. The constant is
+///   computed, not searched: from one point for the invertible operators; the least mask for
+///   `&` and `|`; for `·` from a point where `l` has the fewest trailing zeros (any other
+///   solution differs from it in bits no point reads), and so for a constant shifted by `l`
+///   from the point of the least count;
+/// - two operators of one operand over one leaf: `~` and `−` with an extension or a slice,
+///   either way round; a slice of the leaf extended by zeros or by its sign (which an
+///   extension of a slice and a slice across the end of an extension are: only the shortest
+///   slice that holds every value of `n` needs trying); a sign extension extended by zeros;
+/// - an operator of one operand over an operator of two over two leaves of one width;
+/// - an operator of two operands over a leaf and an operator over leaves, or over that
+///   operator twice. The inner values are enumerated; the leaf is looked up by its value at
+///   one point where the outer operator is invertible (`+ − ^`), and elsewhere taken from the
+///   few leaves the operator admits at every point (`r & l = n` needs `n ⊆ l`).
+///
+/// Values are compared as words, at one seeded point first: wider than 64 bits (`n` or a
+/// leaf), or with more than [`PAY_LEAVES`] leaves, a form is taken to agree.
+#[cfg(feature = "mba")]
+fn two_operators(
+    samples: &crate::hash::IdMap<u32, Box<[BitVec]>>,
+    cx: &Context,
+    n: u32,
+    leaves: &[u32],
+) -> (bool, u64) {
+    let w = u32::from(cx.wid(n));
+    if w > 64 || leaves.len() > PAY_LEAVES {
+        return (true, 0);
+    }
+    let lane = |i: u32| -> Option<Vec<u64>> { samples[&i].iter().map(BitVec::to_u64).collect() };
+    let Some(t) = lane(n) else {
+        return (true, 0);
+    };
+    let mask = low_ones(w);
+    // The first two points are all zeros and all ones: screen at a seeded one.
+    let k = 2.min(t.len() - 1);
+    let tk = t[k];
+    let mut work = leaves.len() as u64;
+    // The leaves of `n`'s width, and the others.
+    let mut same: Vec<Vec<u64>> = Vec::new();
+    let mut other: Vec<(u32, Vec<u64>)> = Vec::new();
+    for &i in leaves {
+        let wi = u32::from(cx.wid(i));
+        let v = if wi > 64 { None } else { lane(i) };
+        let Some(v) = v else {
+            return (true, work);
+        };
+        if wi == w {
+            same.push(v);
+        } else {
+            other.push((wi, v));
+        }
+    }
+    let all =
+        |f: &dyn Fn(usize) -> u64| f(k) & mask == tk && (0..t.len()).all(|i| f(i) & mask == t[i]);
+    let zeros = |x: u64| x.trailing_zeros().min(w);
+    // Every bit some value of `n` has; the fewest bits that hold every value of `n` as an
+    // unsigned number, and as a signed one.
+    let t_or = t.iter().fold(0, |a, &x| a | x);
+    let t_bits = (64 - t_or.leading_zeros()).max(1);
+    let t_signed = t
+        .iter()
+        .map(|&x| {
+            let v = signed(x, w);
+            65 - (v ^ (((v as i64) >> 63) as u64)).leading_zeros()
+        })
+        .max()
+        .unwrap_or(1)
+        .min(w);
+
+    // One operator and a constant.
+    for x in &same {
+        work += 4;
+        let (plus, from, xor) = (
+            t[0].wrapping_sub(x[0]),
+            t[0].wrapping_add(x[0]),
+            t[0] ^ x[0],
+        );
+        let or = t.iter().zip(x).fold(0, |a, (&y, &x)| a | (y & !x));
+        if all(&|i| x[i].wrapping_add(plus))
+            || all(&|i| from.wrapping_sub(x[i]))
+            || all(&|i| x[i] ^ xor)
+            || all(&|i| x[i] & t_or)
+            || all(&|i| x[i] | or)
+        {
+            return (true, work);
+        }
+        // (The point where the leaf has the fewest trailing zeros.)
+        if let Some(i) = (0..t.len()).min_by_key(|&i| zeros(x[i]))
+            && zeros(x[i]) < w
+        {
+            let z = zeros(x[i]);
+            let c = (t[i] >> z).wrapping_mul(odd_inverse(x[i] >> z));
+            if all(&|i| x[i].wrapping_mul(c)) {
+                return (true, work);
+            }
+        }
+        for c in 1..=(w - t_bits).min(w - 1) {
+            work += 1;
+            if all(&|i| x[i] >> c) {
+                return (true, work);
+            }
+        }
+        // (The point where the leaf, a count, is least.)
+        if let Some(i) = (0..t.len()).min_by_key(|&i| x[i])
+            && x[i] < u64::from(w)
+        {
+            let (left, right) = (t[i] >> x[i], (t[i] << x[i]) & mask);
+            if all(&|i| bin_value(8, x[i], left, w)) || all(&|i| bin_value(10, x[i], right, w)) {
+                return (true, work);
+            }
+        }
+    }
+
+    // Two operators of one operand over one leaf.
+    for (wl, x) in same
+        .iter()
+        .map(|x| (w, x))
+        .chain(other.iter().map(|(wl, x)| (*wl, x)))
+    {
+        let ml = low_ones(wl);
+        let sx = |v: u64| signed(v, wl);
+        if wl < w {
+            work += u64::from(w - wl) + 7;
+            if all(&|i| !x[i] & ml)
+                || all(&|i| x[i].wrapping_neg() & ml)
+                || all(&|i| !x[i])
+                || all(&|i| x[i].wrapping_neg())
+                || all(&|i| !sx(x[i]))
+                || all(&|i| sx(x[i].wrapping_neg() & ml))
+                || all(&|i| sx(x[i]).wrapping_neg())
+                || (wl + 1..w).any(|mid| all(&|i| sx(x[i]) & low_ones(mid)))
+            {
+                return (true, work);
+            }
+        }
+        if wl > w {
+            work += 3 * u64::from(wl - w + 1);
+            if (0..=wl - w).any(|lo| {
+                all(&|i| !(x[i] >> lo))
+                    || all(&|i| (x[i] >> lo).wrapping_neg())
+                    || all(&|i| (x[i].wrapping_neg() & ml) >> lo)
+            }) {
+                return (true, work);
+            }
+        }
+        // A slice of the leaf extended by zeros, and by its sign.
+        work += 2 * u64::from(wl);
+        if (0..wl).any(|lo| {
+            (lo + t_bits <= wl && all(&|i| (x[i] >> lo) & low_ones(t_bits)))
+                || (lo + t_signed <= wl
+                    && all(&|i| signed((x[i] >> lo) & low_ones(t_signed), t_signed)))
+        }) {
+            return (true, work);
+        }
+    }
+
+    // An operator of one operand over an operator of two over two leaves of another width.
+    for (j, (wl, a)) in other.iter().enumerate() {
+        let (wl, ml) = (*wl, low_ones(*wl));
+        for (_, b) in other[j..].iter().filter(|(wb, _)| *wb == wl) {
+            work += u64::from(BIN_VALUES) * u64::from(if wl < w { 2 } else { 1 + w / 8 });
+            for o in 0..BIN_VALUES {
+                let v = |i: usize| bin_value(o, a[i], b[i], wl) & ml;
+                let found = if wl < w {
+                    all(&v) || all(&|i| signed(v(i), wl))
+                } else {
+                    // Every slice at once: bit `lo` of `at` says that the slice from `lo`
+                    // is `n`'s value at the points so far (the screening point first).
+                    let mut at = low_ones(wl - w + 1);
+                    for i in core::iter::once(k).chain(0..t.len()) {
+                        let x = v(i);
+                        for j in 0..w {
+                            at &= if t[i] >> j & 1 == 1 {
+                                x >> j
+                            } else {
+                                !(x >> j)
+                            };
+                        }
+                        if at == 0 {
+                            break;
+                        }
+                    }
+                    at != 0
+                };
+                if found {
+                    return (true, work);
+                }
+            }
+        }
+    }
+
+    // An operator over a value `v` of one operator (`at` its value at the screening point)
+    // and a leaf, or over `v` twice, or of one operand. Without `v`: whether one may agree,
+    // by the screening point alone.
+    let by_value = ByValue::new(same.iter().map(|x| x[k]));
+    // The leaves an operator that is not invertible admits, as its right and its left operand.
+    let admits = |f: &dyn Fn(u64, u64) -> bool| -> Vec<usize> {
+        (0..same.len())
+            .filter(|&c| same[c].iter().zip(&t).all(|(&c, &y)| f(c, y)))
+            .collect()
+    };
+    let and = admits(&|c, y| y & !c == 0);
+    let or = admits(&|c, y| c & !y == 0);
+    let mul = admits(&|c, y| zeros(y) >= zeros(c));
+    let shl_by = admits(&|c, y| {
+        if c >= u64::from(w) {
+            y == 0
+        } else {
+            y & low_ones(c as u32) == 0
+        }
+    });
+    let shr_by = admits(&|c, y| {
+        if c >= u64::from(w) {
+            y == 0
+        } else {
+            y & !(mask >> c) == 0
+        }
+    });
+    let shl_of = admits(&|c, y| {
+        y == 0 || (c != 0 && zeros(y) >= zeros(c) && (c << (zeros(y) - zeros(c))) & mask == y)
+    });
+    let shr_of = admits(&|c, y| {
+        y == 0
+            || (c != 0
+                && y.leading_zeros() >= c.leading_zeros()
+                && c >> (y.leading_zeros() - c.leading_zeros()) == y)
+    });
+    let with: [(u8, &[usize]); 7] = [
+        (4, &and),
+        (5, &or),
+        (3, &mul),
+        (7, &shl_by),
+        (9, &shr_by),
+        (8, &shl_of),
+        (10, &shr_of),
+    ];
+    let over = |v: &dyn Fn(usize) -> u64| -> bool {
+        let agrees = |f: &dyn Fn(u64, usize) -> u64| -> bool { all(&|i| f(v(i), i)) };
+        if agrees(&|x, _| !x) || agrees(&|x, _| x.wrapping_neg()) {
+            return true;
+        }
+        if [0, 3, 7, 9]
+            .iter()
+            .any(|&o| agrees(&|x, _| bin_value(o, x, x, w)))
+        {
+            return true;
+        }
+        // `v + l`, `v − l`, `l − v`, `v ^ l`: the leaf's value is the others'.
+        let at = v(k);
+        let keys = [
+            tk.wrapping_sub(at) & mask,
+            at.wrapping_sub(tk) & mask,
+            tk.wrapping_add(at) & mask,
+            tk ^ at,
+        ];
+        for (o, key) in [0u8, 1, 2, 6].into_iter().zip(keys) {
+            for c in by_value.of(key) {
+                if agrees(&|x, i| bin_value(o, x, same[c][i], w)) {
+                    return true;
+                }
+            }
+        }
+        with.iter().any(|&(o, admitted)| {
+            admitted
+                .iter()
+                .any(|&c| agrees(&|x, i| bin_value(o, x, same[c][i], w)))
+        })
+    };
+    // Whether a value that is `at` at the screening point may pass `over`: what `over` tests,
+    // at that point alone (most values end here).
+    let admitted = with.iter().any(|(_, l)| !l.is_empty());
+    let may = |at: u64| -> bool {
+        !at & mask == tk
+            || at.wrapping_neg() & mask == tk
+            || at.wrapping_add(at) & mask == tk
+            || at.wrapping_mul(at) & mask == tk
+            || bin_value(7, at, at, w) & mask == tk
+            || bin_value(9, at, at, w) & mask == tk
+            || by_value.has(tk.wrapping_sub(at) & mask)
+            || by_value.has(at.wrapping_sub(tk) & mask)
+            || by_value.has(tk.wrapping_add(at) & mask)
+            || by_value.has(tk ^ at)
+            || (admitted
+                && with.iter().any(|&(o, l)| {
+                    l.iter()
+                        .any(|&c| bin_value(o, at, same[c][k], w) & mask == tk)
+                }))
+    };
+    // (A value that is zero at the screening point is common: a shift past the width.)
+    let zero = may(0);
+    let tried = |at: u64, v: &dyn Fn(usize) -> u64, work: &mut u64| -> bool {
+        *work += 1;
+        let at = at & mask;
+        debug_assert!(may(at) || !over(v));
+        (at != 0 || zero) && may(at) && over(v)
+    };
+    for x in &same {
+        if tried(!x[k], &|i| !x[i] & mask, &mut work)
+            || tried(
+                x[k].wrapping_neg(),
+                &|i| x[i].wrapping_neg() & mask,
+                &mut work,
+            )
+        {
+            return (true, work);
+        }
+    }
+    for (wl, x) in &other {
+        let wl = *wl;
+        let found = if wl < w {
+            tried(x[k], &|i| x[i], &mut work)
+                || tried(signed(x[k], wl), &|i| signed(x[i], wl) & mask, &mut work)
+        } else {
+            (0..=wl - w).any(|lo| tried(x[k] >> lo, &|i| (x[i] >> lo) & mask, &mut work))
+        };
+        if found {
+            return (true, work);
+        }
+    }
+    for (j, a) in same.iter().enumerate() {
+        for b in &same[j..] {
+            for o in 0..BIN_VALUES {
+                if tried(
+                    bin_value(o, a[k], b[k], w),
+                    &|i| bin_value(o, a[i], b[i], w) & mask,
+                    &mut work,
+                ) {
+                    return (true, work);
+                }
+            }
+        }
+    }
+    (false, work)
+}
+
 /// Whether replacing `n` by `e` (already built) makes the DAG strictly smaller: `e` needs fewer
 /// nodes than replacing `n` frees. `Err(fin)` when it does not, with what that contributes to
 /// the node's finality: a rejection that only sharing caused may flip once other users of the
@@ -1200,4 +2098,67 @@ pub(super) fn discard(r: &mut Runner<'_, '_>, cx: &Context, before: u32) {
     for i in before..cx.len() as u32 {
         r.retire(cx, i);
     }
+}
+
+/// [`discard`], but for the nodes `keep` reaches: for a pass that built two candidates and
+/// goes on with one.
+pub(super) fn discard_but(r: &mut Runner<'_, '_>, cx: &Context, before: u32, keep: u32) {
+    let mut kept = crate::hash::IdMap::default();
+    let mut stack = vec![keep];
+    while let Some(i) = stack.pop() {
+        if i >= before && kept.insert(i, ()).is_none() {
+            stack.extend(cx.node(i).children());
+        }
+    }
+    for i in before..cx.len() as u32 {
+        if !kept.contains_key(&i) {
+            r.retire(cx, i);
+        }
+    }
+}
+
+/// The nodes replacing `n` by `e` frees less the nodes it needs, as the commit rule counts
+/// them ([`pays`]): for a pass that chooses between two candidates. `None` when `e` needs more
+/// than the commit rule examines.
+pub(super) fn margin(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Option<i64>, Stop> {
+    region(r, cx, n, atoms)?;
+    r.meter.check()?;
+    let Some(new) = needed(r, cx, e)? else {
+        return Ok(None);
+    };
+    let shared = !alone(r);
+    let freed = dying_in(r, cx, n, true, u32::MAX, shared)?;
+    Ok(Some(i64::from(freed) - i64::from(new)))
+}
+
+/// [`margin`], and the same with the uses from outside the region of `n` ignored (what the
+/// commit rule would count were `n` alone): a candidate that pays only by the second is
+/// refused because of sharing.
+#[cfg(feature = "prove")]
+pub(super) fn margins(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Option<(i64, i64)>, Stop> {
+    region(r, cx, n, atoms)?;
+    r.meter.check()?;
+    let Some(new) = needed(r, cx, e)? else {
+        return Ok(None);
+    };
+    let lone = dying_in(r, cx, n, true, u32::MAX, false)?;
+    let freed = if alone(r) {
+        lone
+    } else {
+        dying_in(r, cx, n, true, u32::MAX, true)?
+    };
+    let new = i64::from(new);
+    Ok(Some((i64::from(freed) - new, i64::from(lone) - new)))
 }

@@ -13,8 +13,10 @@ use crate::{BitVec, Width};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct MbaBudget {
-    /// A work bound in the solver's own units, for one question. In the engine a question
-    /// runs within the least of this and what is left of the run's
+    /// A work bound in the solver's own units, for one question (2^22 by default: of the
+    /// questions limb arithmetic asks, the ones a limit of 2^20 cut short took 1.2 to 2.9
+    /// million steps to answer, about ten questions each in 21 of 3,450 expressions). In the
+    /// engine a question runs within the least of this and what is left of the run's
     /// [`Budget::mba_steps`](crate::engine::Budget::mba_steps).
     pub steps: u64,
     /// Whether answers should carry the solver's own evidence (default true). A caller that
@@ -27,7 +29,7 @@ pub struct MbaBudget {
 impl Default for MbaBudget {
     fn default() -> Self {
         MbaBudget {
-            steps: 1 << 20,
+            steps: 1 << 22,
             evidence: true,
         }
     }

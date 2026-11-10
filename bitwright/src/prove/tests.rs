@@ -17,6 +17,7 @@ mod relations;
 mod sampling;
 mod sat_families;
 mod scoped_facts;
+mod sums;
 
 #[test]
 fn preparation_stats_include_propagation_and_zero_work_preserves_them() {

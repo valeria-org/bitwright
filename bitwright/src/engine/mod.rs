@@ -247,7 +247,9 @@ impl Strategy {
     /// The standard strategy plus the deobfuscation passes (divisions by constants, carry
     /// networks with feature `prove`, linear MBA and bit shuffles): `[FactFold, Local(core),
     /// Linear, Xor, Casts, Division, Invert, Compares, Bitwise, Carries, LinearMba, Shuffle,
-    /// Demanded, Local(core)]`, up to 4 rounds.
+    /// Demanded, Local(core)]`, up to 12 rounds: arithmetic done in limbs is read one handler
+    /// at a time, each on what the round before made of the handlers below it, and a chain
+    /// of them was still changing after 4.
     pub fn deobfuscate() -> Strategy {
         let core = || Phase::Local {
             groups: builtin()
@@ -277,6 +279,7 @@ impl Strategy {
                 core(),
             ],
         )
+        .with_max_rounds(12)
     }
 
     /// For a compiler, which simplifies every value of every function: the standard phases
@@ -1117,6 +1120,11 @@ impl Memo {
     }
 }
 
+/// The most times the demanded-bits pass's step at the root is taken in one phase run (see
+/// `Runner::at_root`): each rewrites the root into a smaller one, which is asked again.
+#[cfg(feature = "prove")]
+const ROOT_STEPS: u32 = 4;
+
 /// Stops a phase.
 enum Stop {
     Exhausted(Exhausted),
@@ -1183,6 +1191,10 @@ impl Fin {
     }
 }
 
+/// What a slice pushed into its operand comes to (`casts::narrowed_from`): the node, what the
+/// pushes relied on, and the nodes they stopped at. `None` when the pushes were capped.
+type Narrowing = Option<(u32, Fin, Vec<u32>)>;
+
 enum Frame {
     Visit(u32),
     /// The result of the first node is the result of the second; the flag says what the first
@@ -1217,6 +1229,9 @@ struct Runner<'r, 'a> {
     host_quarantined: Vec<bool>,
     /// Results of this call that are not final (not memoized), per phase.
     partial: Vec<IdMap<u32, (u32, Fin)>>,
+    /// The comparisons `pass::cannot_pay` made in this call, per node.
+    #[cfg(feature = "mba")]
+    paid: IdMap<u32, Vec<pass::Paid>>,
     /// Candidate buffer, reused.
     cands: Vec<u32>,
     /// The walk's stack, reused across phases.
@@ -1263,6 +1278,18 @@ struct Runner<'r, 'a> {
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     #[cfg(feature = "mba")]
     mba_unproved: IdMap<crate::mba::CacheKey, ()>,
+    /// Questions whose answers the evidence gate proved in this call, with what vouched for
+    /// each (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_proved: IdMap<crate::mba::CacheKey, (&'static str, Option<&'static str>, u64)>,
+    /// Whether the answer to a question agreed with it at the refutation sample, for the
+    /// questions answered in this call (see `pass::mba::ask`).
+    #[cfg(feature = "mba")]
+    mba_agreed: IdMap<crate::mba::CacheKey, bool>,
+    /// The pass work the evidence gate's certificates that proved nothing have taken in this
+    /// call (see `pass::mba::exact`).
+    #[cfg(feature = "mba")]
+    mba_missed: u64,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -1282,6 +1309,31 @@ struct Runner<'r, 'a> {
     /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
     /// rebuilt, over its operands' results, into one a pass rewrote it from (see `local`).
     rewritten: IdMap<(u32, u32), ()>,
+    /// The roots at which the demanded-bits pass's step at the root found nothing in this
+    /// call, with what that decision contributes (see `at_root`).
+    #[cfg(feature = "prove")]
+    rooted: IdMap<u32, Fin>,
+    /// Whether the rounds are in their late stage (see `rounds`): a pass asks it before a
+    /// reading that may stand in the way of what the rounds read better (the step at the
+    /// root, for the readings that leave a sum no fewer terms).
+    late: bool,
+    /// Whether a pass left a reading to the late stage in the round under way (see `hold`).
+    held: bool,
+    /// The root, and what was known of it, when the late stage began.
+    turned: Option<(u32, Fin)>,
+    /// The roots at which the step at the root found nothing and said the readings it
+    /// leaves to the late stage would rewrite the root.
+    #[cfg(feature = "prove")]
+    latent: IdMap<u32, ()>,
+    /// Slices pushed into their operands, by node, low bit, length and whether a slice met
+    /// whole was pushed too (`casts::narrowed_from`, `casts::spelled`), kept for the call:
+    /// the answer is a function of the nodes and their facts, and the readings of limb
+    /// arithmetic ask for the same slices in every round.
+    narrows: IdMap<(u32, u16, u16, bool), Narrowing>,
+    /// Whether the phases of the round under way have left the root as the round found it,
+    /// up to the phase being run.
+    #[cfg_attr(not(feature = "prove"), allow(dead_code))]
+    settled: bool,
     /// In the MBA phase: the user through which the walk first reached each node (see
     /// `pass::mba_step`).
     chain_parent: IdMap<u32, u32>,
@@ -1368,11 +1420,25 @@ impl Runner<'_, '_> {
     }
 
     fn set(&mut self, cx: &mut Context, phase: usize, n: u32, r: u32, fin: Fin) {
-        if fin.done {
+        // (In the late stage of the rounds nothing is kept beyond the call: a stage that is
+        // given up leaves the memo as it found it.)
+        if fin.done && !self.late {
             cx.memo.phases[phase].insert(n, r, fin.rel);
         } else {
             self.partial[phase].insert(n, (r, fin));
         }
+    }
+
+    /// For a pass that leaves a reading to the late stage of the rounds (see `rounds`):
+    /// notes that there is one, and gives what that contributes to the node's finality. The
+    /// node is not final, so its phase asks it again in every round, and so once the stage
+    /// has begun (`late` is set then, and the reading is taken): nothing a phase found
+    /// final before the stage is asked again. The pass should find out cheaply that it
+    /// holds a reading back.
+    #[cfg_attr(not(feature = "prove"), allow(dead_code))]
+    pub(crate) fn hold(&mut self) -> Fin {
+        self.held = true;
+        Fin::PROVISIONAL
     }
 
     /// Whether `phase` is the MBA service.
@@ -1532,12 +1598,74 @@ impl Runner<'_, '_> {
 
     /// Normalizes `root` under a `Local` phase.
     fn local(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
-        // A root with a final result: what the walk would find at its first step, without
-        // preparing one (the preparation only matters to a walk that does work).
-        if let Some((r, rel)) = cx.memo.phases[phase].get(root) {
-            self.stats.memo_hits += 1;
-            return Ok((r, Fin::relying(rel)));
+        let out = self.walked(cx, phase, root)?;
+        // The step at the root, once the phases before this one and its own walk leave the
+        // root as the round found it: what the step reads (a limb's carries as the high
+        // digit of its word) the passes may still be about to read otherwise, or to show
+        // never reaches the root; it is taken where they have nothing left to do.
+        #[cfg(feature = "prove")]
+        if matches!(
+            self.inner.phases[phase],
+            PhaseImpl::Pass(pass::PassKind::Demanded)
+        ) && self.settled
+            && out.0 == root
+        {
+            return self.at_root(cx, phase, out);
         }
+        Ok(out)
+    }
+
+    /// The demanded-bits pass's step at the root of its walk (`pass::demanded::whole`), on the
+    /// walk's result `out`: what it rewrites the root into is walked as a root in its turn,
+    /// and asked again, at most [`ROOT_STEPS`] times.
+    ///
+    /// What the step does depends on the node being the root (the bits that reach the root
+    /// are read below it), so its result is no result of the phase for that node: it is not
+    /// memoized, and a root the phase has a final result for is asked all the same. A root
+    /// the step found nothing at is remembered for the call (for the stage of the rounds it
+    /// was asked in, see `rounds`).
+    #[cfg(feature = "prove")]
+    fn at_root(
+        &mut self,
+        cx: &mut Context,
+        phase: usize,
+        out: (u32, Fin),
+    ) -> Result<(u32, Fin), Stop> {
+        let (mut cur, mut fin) = out;
+        for _ in 0..ROOT_STEPS {
+            if let Some(&f) = self.rooted.get(&cur) {
+                return Ok((cur, fin.and(f)));
+            }
+            // (The walk may have been answered by the memo, or have left the root's uses as
+            // of another node's: counted afresh.)
+            self.begin(cx, phase, cur);
+            match pass::demanded::whole(self, cx, cur, self.late)? {
+                Step::Normal(f) => {
+                    let f = f.unchanged();
+                    self.rooted.insert(cur, f);
+                    // Whether the readings left to the late stage would rewrite this root:
+                    // asked here, in the phase, once for a root (see `rounds`).
+                    if !self.late {
+                        self.begin(cx, phase, cur);
+                        if pass::demanded::late(self, cx, cur)? {
+                            self.latent.insert(cur, ());
+                        }
+                    }
+                    return Ok((cur, fin.and(f)));
+                }
+                Step::To(e, f) => {
+                    self.rewritten.insert((cur, e), ());
+                    let (r, f2) = self.walked(cx, phase, e)?;
+                    fin = fin.and(f).and(f2);
+                    cur = r;
+                }
+            }
+        }
+        Ok((cur, fin))
+    }
+
+    /// Prepares a phase run on `root`.
+    fn begin(&mut self, cx: &Context, phase: usize, root: u32) {
         // Use counts are counted afresh in each phase run, on first need (a pass's commit rule,
         // a rule's `one_use`).
         self.uses_on = false;
@@ -1557,6 +1685,17 @@ impl Runner<'_, '_> {
             self.first.clear();
             self.demanded_same.clear();
         }
+    }
+
+    /// [`local`](Self::local)'s walk of `root`, prepared.
+    fn walked(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
+        // A root with a final result: what the walk would find at its first step, without
+        // preparing one (the preparation only matters to a walk that does work).
+        if let Some((r, rel)) = cx.memo.phases[phase].get(root) {
+            self.stats.memo_hits += 1;
+            return Ok((r, Fin::relying(rel)));
+        }
+        self.begin(cx, phase, root);
         let mut stack = core::mem::take(&mut self.stack);
         stack.clear();
         stack.push(Frame::Visit(root));
@@ -2301,6 +2440,8 @@ impl Engine {
             quarantined: Vec::new(),
             host_quarantined: Vec::new(),
             partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
+            #[cfg(feature = "mba")]
+            paid: IdMap::default(),
             cands: Vec::new(),
             stack: Vec::new(),
             samples: IdMap::default(),
@@ -2325,6 +2466,12 @@ impl Engine {
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_unproved: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_proved: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_agreed: IdMap::default(),
+            #[cfg(feature = "mba")]
+            mba_missed: 0,
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -2340,6 +2487,15 @@ impl Engine {
             },
             active: 0,
             rewritten: IdMap::default(),
+            #[cfg(feature = "prove")]
+            rooted: IdMap::default(),
+            late: false,
+            held: false,
+            turned: None,
+            #[cfg(feature = "prove")]
+            latent: IdMap::default(),
+            narrows: IdMap::default(),
+            settled: false,
             chain_parent: IdMap::default(),
             asks: IdMap::default(),
             first: IdMap::default(),
@@ -2654,7 +2810,58 @@ impl Runner<'_, '_> {
 
     /// [`strategy`](Self::strategy)'s rounds of its phases from `cur`, until a round changes
     /// nothing.
+    ///
+    /// The rounds have a late stage, for readings that pay by the commit rule and yet stand
+    /// in the way of what the passes read better when they are taken first (a carry read as
+    /// digits that meet nothing, before the slice of its word is proved). A pass leaves
+    /// such a reading alone until `late` is set, and says so ([`hold`](Self::hold); the step
+    /// at the root says whether its own would rewrite the root, `at_root`). Where a round
+    /// has changed nothing and a reading was so left in it, the flag is set and the rounds
+    /// go on: once for a root, and its rounds count among the strategy's. Every rewrite of
+    /// the stage is a rewrite as any other, under the commit rule, so the rounds end as
+    /// they do without it.
+    ///
+    /// What is asked again when the flag turns is what was not final: the nodes at which a
+    /// reading was held back, and those above them. Results made under the flag are kept
+    /// for the call only (see `set`).
     fn rounds(
+        &mut self,
+        cx: &mut Context,
+        cur: u32,
+        fin: Fin,
+    ) -> Result<(u32, Fin), (u32, Fin, Stop)> {
+        self.late = false;
+        self.turned = None;
+        let out = self.turns(cx, cur, fin);
+        self.late = false;
+        // The stage's guard: its root is kept where it has fewer nodes than the root the
+        // stage began from, or as many and fewer comparisons, and no cap declined in the
+        // stage what none had declined before it (a question the stage's readings pose and
+        // a limit leaves open would end a run that was complete as one cut short).
+        // Otherwise that root is the result, with what was known of it then: the outcome is
+        // what it would have been without the stage, but for the work charged (and
+        // reported, see `Stage::Late`).
+        let Some((start, known)) = self.turned.take() else {
+            return out;
+        };
+        let end = match &out {
+            Ok((r, _)) | Err((r, _, _)) => *r,
+        };
+        let capped = matches!(&out, Ok((_, f)) if f.why.is_some() && known.why.is_none());
+        if !capped && (end == start || smaller(cx, end, start)) {
+            return out;
+        }
+        if end != start {
+            self.emit_stage(cx, Stage::Late, end, start);
+        }
+        match out {
+            Ok(_) => Ok((start, known)),
+            Err((_, _, stop)) => Err((start, known, stop)),
+        }
+    }
+
+    /// The rounds of [`rounds`](Self::rounds), the late stage among them.
+    fn turns(
         &mut self,
         cx: &mut Context,
         mut cur: u32,
@@ -2663,12 +2870,14 @@ impl Runner<'_, '_> {
         let inner = self.inner;
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
+            self.held = false;
             if round > 0 {
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 let spent0 = self.meter.spent;
+                self.settled = cur == start;
                 self.phase_name = p.name();
                 if self.observing() {
                     self.emit(Event::PhaseBegin {
@@ -2710,11 +2919,52 @@ impl Runner<'_, '_> {
                 }
             }
             if cur == start {
+                // The late stage, once: where a reading was left to it in this round, or the
+                // step at the root has said the readings it takes last would rewrite this
+                // root, the rounds go on with the flag set.
+                #[cfg(feature = "prove")]
+                let latent = self.latent.contains_key(&cur);
+                #[cfg(not(feature = "prove"))]
+                let latent = false;
+                if !self.late && (self.held || latent) {
+                    self.late = true;
+                    self.turned = Some((cur, fin));
+                    #[cfg(feature = "prove")]
+                    self.rooted.clear();
+                    continue;
+                }
                 break;
             }
         }
         Ok((cur, fin))
     }
+}
+
+/// Whether the DAG of `a` has fewer nodes than that of `b`, or as many and fewer comparisons.
+fn smaller(cx: &Context, a: u32, b: u32) -> bool {
+    let count = |root: u32| {
+        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut stack = vec![root];
+        let mut compares = 0u32;
+        while let Some(i) = stack.pop() {
+            if seen.insert(i, ()).is_some() {
+                continue;
+            }
+            let node = cx.node(i);
+            compares += u32::from(matches!(
+                node.op,
+                crate::expr::OpCode::Eq
+                    | crate::expr::OpCode::Ne
+                    | crate::expr::OpCode::Ult
+                    | crate::expr::OpCode::Ule
+                    | crate::expr::OpCode::Slt
+                    | crate::expr::OpCode::Sle
+            ));
+            stack.extend(node.children());
+        }
+        (seen.len(), compares)
+    };
+    count(a) < count(b)
 }
 
 /// Whether `n1`, the rebuild of `n` over new operands `kids`, is `n`'s operator over them (in

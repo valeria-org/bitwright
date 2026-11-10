@@ -616,14 +616,63 @@ fn leaf(cx: &Context, i: u32) -> Info {
     let Some(op) = n.op.as_cmp() else {
         return Info::Opaque;
     };
+    // `a - (b + k) == -k` is `a == b` (the VM's `x <u y`, written `~((y - x == 0) | (y <u
+    // x))`, once a constant both sides added is folded into the equality alone).
+    let equal = |t: u32, c: &BitVec| {
+        matches!(op, CmpOp::Eq | CmpOp::Ne)
+            .then(|| difference(cx, t))
+            .flatten()
+            .filter(|(_, _, k)| *k == c.limbs()[0])
+            .map(|(a, b, _)| Info::Pair(a.min(b), a.max(b), pred_set(op)))
+    };
     match (cx.const_val(n.a), cx.const_val(n.b)) {
         (Some(_), Some(_)) => Info::Opaque,
-        (None, Some(c)) => Info::Values(n.a, interval_of(op, &c, true), None),
-        (Some(c), None) => Info::Values(n.b, interval_of(op, &c, false), None),
+        (None, Some(c)) => {
+            equal(n.a, &c).unwrap_or_else(|| Info::Values(n.a, interval_of(op, &c, true), None))
+        }
+        (Some(c), None) => {
+            equal(n.b, &c).unwrap_or_else(|| Info::Values(n.b, interval_of(op, &c, false), None))
+        }
         (None, None) if n.a == n.b => Info::Opaque,
         (None, None) if n.a < n.b => Info::Pair(n.a, n.b, pred_set(op)),
         (None, None) => Info::Pair(n.b, n.a, swap_set(pred_set(op))),
     }
+}
+
+/// `(a, b, k)` when `t` (of at most 64 bits) is `a - b + k`: a difference of two values, a
+/// constant added to it or to either of them (`a - (b + k)`; the constructors keep constants
+/// on the right of a sum).
+fn difference(cx: &Context, t: u32) -> Option<(u32, u32, u64)> {
+    let w = cx.wid(t);
+    if w > 64 {
+        return None;
+    }
+    // `x` without the constants added to it, and their sum.
+    let bare = |mut x: u32| {
+        let mut k = 0u64;
+        loop {
+            let node = cx.node(x);
+            // (Only a sum's second field is an operand.)
+            let added = (node.op == OpCode::Add)
+                .then(|| cx.const_val(node.b))
+                .flatten();
+            match added {
+                Some(c) => {
+                    k = k.wrapping_add(c.limbs()[0]);
+                    x = node.a;
+                }
+                None => return (x, k),
+            }
+        }
+    };
+    let (d, k) = bare(t);
+    let node = cx.node(d);
+    if node.op != OpCode::Sub {
+        return None;
+    }
+    let ((a, ka), (b, kb)) = (bare(node.a), bare(node.b));
+    let k = k.wrapping_add(ka).wrapping_sub(kb) & (u64::MAX >> (64 - w));
+    (a != b && !cx.is_const(a) && !cx.is_const(b)).then_some((a, b, k))
 }
 
 fn float_leaf(cx: &Context, i: u32) -> Info {

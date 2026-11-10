@@ -17,8 +17,16 @@ for these (hash comparisons through invertible mixers are handled by the standar
   bitwright's own prover proves it equal within the pass's caps (feature `prove`, on by
   default; shifts of one atom, `2^k·a`, need no proof). Arithmetic done in limbs, the carry
   between them written as a comparison of the low ones, is read too: the high digits and the
-  carry are the high digit of the sum, and a limb that is a slice of a word computed below it
-  becomes that slice, when proved.
+  carry are the high digit of the sum (also the carry out of a middle digit, of a digit
+  computed apart from its word or in another spelling of it, or in a register narrower than
+  the word; where the register is wider than the limb, of the sum with its carry out,
+  `zext(a) + zext(b)`); limbs of one word under the coefficients of a product are the
+  product of the word; and a limb that is a slice of a word computed below it, or of that
+  word plus a constant the handler added limb by limb, becomes that slice, when proved. A sum
+  several readers read through truncations of their own is read once, at the root, on the
+  bits that reach it. `Strategy::deobfuscate()` runs up to 12 rounds, a chain of handlers
+  being read one handler a round, and then a late stage for the readings that pay only over
+  the whole expression.
 - **Linear MBA.** A linear combination of bitwise functions of up to six atoms is determined by
   its values at the corners where every atom is 0 or all ones. The pass computes that signature
   and emits the cheapest equivalent form it knows, if that is smaller.

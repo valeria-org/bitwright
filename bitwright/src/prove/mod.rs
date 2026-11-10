@@ -42,6 +42,7 @@ mod relations;
 mod rule;
 mod sample_words;
 pub mod sat;
+mod sums;
 #[cfg(test)]
 mod tests;
 
@@ -153,6 +154,14 @@ pub struct Config {
     /// the word program fixes from scoped assumptions as constrained inputs), the search
     /// decides the question instead. 0 (the default): never.
     pub exhaustive_inputs: u8,
+    /// Write the sums of the question one way before blasting it: both sides read as linear
+    /// forms over slices of their values (carries of limbs as the high digits they stand
+    /// for), and built again in one order, so that what the two sides add up the same way is
+    /// one circuit and what cancels is gone. An equality at every input; not for a
+    /// [`certificate`](Self::certificate), which is of the question as asked. Opt-in: it
+    /// helps where the two sides are one arithmetic written twice (a limb against its word),
+    /// and changes the search elsewhere.
+    pub shared_sums: bool,
 }
 
 impl Default for Config {
@@ -174,6 +183,7 @@ impl Default for Config {
             carry_save_multiplication: false,
             word_sampling: false,
             exhaustive_inputs: 0,
+            shared_sums: false,
         }
     }
 }
@@ -195,6 +205,7 @@ setters!(Config {
     with_carry_save_multiplication: carry_save_multiplication: bool,
     with_word_sampling: word_sampling: bool,
     with_exhaustive_inputs: exhaustive_inputs: u8,
+    with_shared_sums: shared_sums: bool,
 });
 
 impl Config {
@@ -361,6 +372,10 @@ pub struct Stats {
     pub simplification: Simplification,
     /// AIG nodes of the circuit (inputs and gates).
     pub nodes: usize,
+    /// Whether the circuit is of the question with its sums written again
+    /// ([`Config::shared_sums`]), and not of the question as asked (where that changed
+    /// nothing, or made a circuit past [`Config::max_nodes`]).
+    pub rewritten: bool,
     /// Assignments evaluated before search, on words or the circuit ([`Config::samples`]).
     pub samples: u64,
     /// Variables of the clauses.
@@ -873,35 +888,52 @@ impl Question {
                 None => exhausted = true,
             }
         }
-        let constant_goal = cuts::constant_true(cx, goal_node);
-        let mut b = Blaster::new(cx, cfg.max_nodes);
-        b.selector_hints = cfg.selector_branching;
-        b.input_cancellation = cfg.input_cancellation;
-        b.join_factoring = cfg.join_factoring;
-        b.carry_save_multiplication = cfg.carry_save_multiplication;
-        if constant_goal {
-            b.bits.insert(goal_node, vec![aig::TRUE]);
-        }
-        let mut blasted = || -> Result<(L, Vec<L>), Error> {
-            let goal = b.blast(goal_node)?[0];
-            let mut extra = Vec::new();
-            for &c in &cons {
-                extra.push(b.blast(c)?[0]);
+        // The question as asked, where writing its sums again changes it.
+        let asked = goal_node;
+        if cfg.shared_sums && !cfg.certificate {
+            goal_node = sums::shared(cx, goal_node)?;
+            if cx
+                .const_val(goal_node)
+                .is_some_and(|value| !value.is_zero())
+            {
+                q.stats.rewritten = true;
+                return decided(q, Outcome::Proved(None));
             }
-            Ok((goal, extra))
-        };
-        let (goal, extra) = match blasted() {
-            Ok(r) => r,
-            Err(e) => {
-                let why = b.unknown(e)?;
-                return decided(q, Outcome::Unknown(why));
+        }
+        let (b, goal, extra) = loop {
+            let constant_goal = cuts::constant_true(cx, goal_node);
+            let mut b = Blaster::new(cx, cfg.max_nodes);
+            b.selector_hints = cfg.selector_branching;
+            b.input_cancellation = cfg.input_cancellation;
+            b.join_factoring = cfg.join_factoring;
+            b.carry_save_multiplication = cfg.carry_save_multiplication;
+            if constant_goal {
+                b.bits.insert(goal_node, vec![aig::TRUE]);
+            }
+            let mut blasted = || -> Result<(L, Vec<L>), Error> {
+                let goal = b.blast(goal_node)?[0];
+                let mut extra = Vec::new();
+                for &c in &cons {
+                    extra.push(b.blast(c)?[0]);
+                }
+                Ok((goal, extra))
+            };
+            match blasted() {
+                Ok((goal, extra)) if b.g.len() <= cfg.max_nodes => break (b, goal, extra),
+                // (Written again the circuit is too large: the question as asked, then.)
+                _ if goal_node != asked => goal_node = asked,
+                Ok(_) => {
+                    let why = Unknown::TooLarge { nodes: b.g.len() };
+                    return decided(q, Outcome::Unknown(why));
+                }
+                Err(e) => {
+                    let why = b.unknown(e)?;
+                    return decided(q, Outcome::Unknown(why));
+                }
             }
         };
         q.stats.nodes = b.g.len();
-        if b.g.len() > cfg.max_nodes {
-            let why = Unknown::TooLarge { nodes: b.g.len() };
-            return decided(q, Outcome::Unknown(why));
-        }
+        q.stats.rewritten = goal_node != asked;
         // Every symbol of the question, with its bits if the circuit reads it.
         for (s, bits) in &b.symbols {
             let h = b.cx.handle(*s);
