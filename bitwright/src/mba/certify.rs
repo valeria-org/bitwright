@@ -4199,18 +4199,20 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     let mut polys: Vec<Option<SymPoly>> = vec![None; nodes.len()];
     for i in 0..nodes.len() {
         let n = nodes[i];
-        let arg = |k: usize| polys[n.args[k] as usize].clone();
+        // The operands' polynomials, read in place (a copy of each per use was most of the
+        // comparison's time on sums).
+        let arg = |k: usize| polys[n.args[k] as usize].as_ref();
         let p = if let Some(c) = cst[i] {
             SymPoly::constant(c)
         } else {
             match n.op {
                 MOp::Var(v) => SymPoly::symbol(symbol(0, vec![v]), w),
-                MOp::Add => arg(0)?.add(&arg(1)?, &BitVec::one(w)),
-                MOp::Sub => arg(0)?.add(&arg(1)?, &BitVec::ones(w)),
-                MOp::Neg => SymPoly::constant(BitVec::zero(w)).add(&arg(0)?, &BitVec::ones(w)),
+                MOp::Add => arg(0)?.add(arg(1)?, &BitVec::one(w)),
+                MOp::Sub => arg(0)?.add(arg(1)?, &BitVec::ones(w)),
+                MOp::Neg => SymPoly::constant(BitVec::zero(w)).add(arg(0)?, &BitVec::ones(w)),
                 MOp::Shl(k) => {
                     let s = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(k));
-                    SymPoly::constant(BitVec::zero(w)).add(&arg(0)?, &s)
+                    SymPoly::constant(BitVec::zero(w)).add(arg(0)?, &s)
                 }
                 MOp::Mul => {
                     let (x, y) = (arg(0)?, arg(1)?);
@@ -4218,7 +4220,7 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
                     if *work > limit {
                         return None;
                     }
-                    x.mul(&y)?
+                    x.mul(y)?
                 }
                 MOp::And | MOp::Or | MOp::Xor | MOp::Not => {
                     // The bitwise function's leaves: variables and non-bitwise subterms.
