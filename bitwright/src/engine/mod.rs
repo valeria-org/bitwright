@@ -2683,7 +2683,7 @@ impl Runner<'_, '_> {
         #[cfg(feature = "mba")]
         let inner = self.inner;
         let mut cur = root;
-        let fin = Fin::FINAL;
+        let mut fin = Fin::FINAL;
         // with the MBA phase's noise forms, the root is read with what its
         // conditions fix put into the operands they guard first (see `pass::push_context`):
         // a case table's noise folds once its selector's bits are constants, and the budget is
@@ -2708,12 +2708,28 @@ impl Runner<'_, '_> {
             }
         }
         let t0 = std::time::Instant::now();
-        cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
         pass::mba::tmp_time("T.sweep0", t0);
+        if swept != cur {
+            fin = fin.and(Fin::relying(self.assumed()));
+            cur = swept;
+        }
         let t0 = std::time::Instant::now();
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
         pass::mba::tmp_time("T.cases0", t0);
         self.rounds(cx, cur, fin)
+    }
+
+    /// Every constraint of the run's assumptions: what a result of the opaque-constant sweep
+    /// is taken to rely on. The sweep reads the facts of the nodes it folds (known bits, the
+    /// values a bottleneck can take) without recording which constraints they came from, so a
+    /// root it changed is reported as relying on all of them (an over-approximation, as
+    /// [`Reliance`] allows; none where the run has no assumptions).
+    fn assumed(&self) -> Reliance {
+        self.assumptions.map_or(Reliance::NONE, |a| {
+            a.constraints()
+                .fold(Reliance::NONE, |r, (id, _, _)| r | Reliance::of(id))
+        })
     }
 
     /// `cur` after the opaque-constant sweep (see `pass::mba::sweep`), where the MBA phase asks
@@ -2806,7 +2822,11 @@ impl Runner<'_, '_> {
             if round > 0 {
                 let t0 = std::time::Instant::now();
                 if std::env::var_os("BW_NO_RESWEEP").is_none() {
-                    cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                    let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                    if swept != cur {
+                        fin = fin.and(Fin::relying(self.assumed()));
+                        cur = swept;
+                    }
                 }
                 pass::mba::tmp_time("T.resweep", t0);
                 let t0 = std::time::Instant::now();

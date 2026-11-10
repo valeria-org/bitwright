@@ -158,6 +158,18 @@ fn scan_in(
     lim: &MbaLimits,
     in_fragment: &dyn Fn(&Context, u32) -> bool,
 ) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
+    let tq = std::time::Instant::now();
+    let out = scan_in0(cx, root, lim, in_fragment);
+    crate::mba::certify::tmp_time("lo.scan", tq);
+    out
+}
+
+fn scan_in0(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    in_fragment: &dyn Fn(&Context, u32) -> bool,
+) -> Result<(Vec<u32>, Vec<u32>), Refusal> {
     let mut atoms: Vec<u32> = Vec::new();
     let mut order: Vec<u32> = Vec::new();
     let mut seen: IdMap<u32, ()> = IdMap::default();
@@ -245,7 +257,12 @@ pub(crate) fn lower_id_over(
             }
     };
     let under = match reading {
-        Reading::Shallow => Some(under_bitwise(cx, root, lim, opaque)?),
+        Reading::Shallow => {
+            let tq = std::time::Instant::now();
+            let u = under_bitwise(cx, root, lim, opaque);
+            crate::mba::certify::tmp_time("lo.under", tq);
+            Some(u?)
+        }
         _ => None,
     };
     let (atoms, order) = scan_in(cx, root, lim, &|cx, i| inside(cx, i, under.as_ref()))?;
@@ -408,6 +425,18 @@ fn under_bitwise(
 /// The expression over `atoms` that the fragment's nodes `order` (operands first) compute,
 /// each operand in `solved` written over its atom.
 fn build(
+    cx: &Context,
+    atoms: Vec<u32>,
+    order: Vec<u32>,
+    solved: &[Solved],
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    let tq = std::time::Instant::now();
+    let out = build0(cx, atoms, order, solved);
+    crate::mba::certify::tmp_time("lo.build", tq);
+    out
+}
+
+fn build0(
     cx: &Context,
     atoms: Vec<u32>,
     order: Vec<u32>,

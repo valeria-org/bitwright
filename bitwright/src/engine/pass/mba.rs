@@ -2670,6 +2670,7 @@ fn readings_prove(
     }
     let tq = std::time::Instant::now();
     let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, open);
+    tmp_time("rd.shared", tq);
     let kinds = [Reading::SemiLinear, Reading::Shallow, Reading::Linear];
     let all = std::iter::once(None)
         .chain(kinds.into_iter().map(Some))
@@ -2678,13 +2679,55 @@ fn readings_prove(
                 .flat_map(|c| [Some(Reading::Cut(c)), Some(Reading::CutWhole(c))]),
         );
     for reading in all {
+        let tl = std::time::Instant::now();
         let lowered = lower_id_over(cx, subject, &cfg.limits, reading, open);
+        let kind = match reading {
+            None => 0,
+            Some(Reading::SemiLinear) => 1,
+            Some(Reading::Shallow) => 2,
+            Some(Reading::Linear) => 3,
+            Some(Reading::Cut(_)) => 4,
+            _ => 5,
+        };
         let Ok((m, bindings)) = lowered else {
+            tmp_time(
+                [
+                    "L.whole.err",
+                    "L.semi.err",
+                    "L.shallow.err",
+                    "L.linear.err",
+                    "L.cut.err",
+                    "L.cutw.err",
+                ][kind],
+                tl,
+            );
             continue;
         };
         if readings.iter().any(|(_, _, _, o, _)| *o == m) {
+            tmp_time(
+                [
+                    "L.whole.dup",
+                    "L.semi.dup",
+                    "L.shallow.dup",
+                    "L.linear.dup",
+                    "L.cut.dup",
+                    "L.cutw.dup",
+                ][kind],
+                tl,
+            );
             continue;
         }
+        tmp_time(
+            [
+                "L.whole.new",
+                "L.semi.new",
+                "L.shallow.new",
+                "L.linear.new",
+                "L.cut.new",
+                "L.cutw.new",
+            ][kind],
+            tl,
+        );
         let t = m.vars().len().min(32) as u32;
         let points = match reading {
             Some(Reading::Linear) => 1u64 << t,
