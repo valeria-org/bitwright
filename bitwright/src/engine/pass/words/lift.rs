@@ -16,6 +16,8 @@ struct Known {
 
 /// How long a chain of sums an equality is read through.
 const MAX_CHAIN: u32 = 48;
+/// The most nodes of a chain of ANDs or of ORs whose operands are read in one order.
+const MAX_LINKS: usize = 256;
 
 /// The forms of a call's nodes.
 #[derive(Default)]
@@ -38,6 +40,20 @@ fn mask(w: u32) -> i128 {
 }
 
 impl Lift {
+    /// The forms with XORs as sums without twice the AND (see `Algebra::plain`).
+    pub(super) fn plain() -> Self {
+        let mut lift = Self::default();
+        lift.alg.plain = true;
+        lift
+    }
+
+    /// The forms with XORs over the values as they are (see `Algebra::values`).
+    pub(super) fn values() -> Self {
+        let mut lift = Self::default();
+        lift.alg.values = true;
+        lift
+    }
+
     /// Reads the facts of node `n` (of at most 64 bits), once.
     pub(super) fn learn(
         &mut self,
@@ -124,7 +140,32 @@ impl Lift {
             Err(Over) => self.leaf(cx, n).ok(),
         };
         if let Some(f) = f {
+            // The form has the node's value, so the node's bounds.
+            if let Some(iv) = self.range(cx, n) {
+                self.alg.bound(&f, iv);
+            }
             self.forms.insert(n, f);
+        }
+        // Arithmetic on an XOR is what the plain forms may read better.
+        let node = cx.node(n);
+        let operands = match node.op {
+            _ if self.alg.plain => [None, None],
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Ult
+            | OpCode::Ule
+            | OpCode::Slt
+            | OpCode::Sle
+            | OpCode::Eq
+            | OpCode::Ne => [Some(node.a), Some(node.b)],
+            OpCode::Neg => [Some(node.a), None],
+            _ => [None, None],
+        };
+        for x in operands.into_iter().flatten() {
+            if let Some(f) = self.forms.get(&x) {
+                self.alg.mark(f);
+            }
         }
     }
 
@@ -232,6 +273,12 @@ impl Lift {
                 if w == 1 || (bit(self.known(cx, node.a)) && bit(self.known(cx, node.b))) {
                     return self.gate(node.op, &a, &b);
                 }
+                if !self.alg.plain
+                    && node.op != OpCode::Xor
+                    && let Some(f) = self.chain(cx, n)?
+                {
+                    return Ok(f);
+                }
                 if node.op == OpCode::And {
                     return self.alg.band(w, &a, &b);
                 }
@@ -240,13 +287,15 @@ impl Lift {
                     (self.known(cx, node.a), self.known(cx, node.b)),
                     (Some(x), Some(y)) if (x.zero | y.zero) as i128 & full == full
                 );
-                let sum = self.alg.add(&a, &b, 1)?;
                 if apart {
-                    return Ok(sum);
+                    return self.alg.add(&a, &b, 1);
                 }
+                if node.op == OpCode::Xor {
+                    return self.alg.bxor(w, &[a, b]);
+                }
+                let sum = self.alg.add(&a, &b, 1)?;
                 let and = self.alg.band(w, &a, &b)?;
-                self.alg
-                    .add(&sum, &and, if node.op == OpCode::Or { -1 } else { -2 })
+                self.alg.add(&sum, &and, -1)
             }
             OpCode::Ult | OpCode::Ule | OpCode::Slt | OpCode::Sle | OpCode::Eq | OpCode::Ne => {
                 self.compare(cx, node.op, node.a, node.b)
@@ -266,6 +315,80 @@ impl Lift {
             }
             _ => self.leaf(cx, n),
         }
+    }
+
+    /// Whether node `x` is a link of a chain of `op` at `w` bits: that operation on two
+    /// values that are not constants nor single bits, nor, for an OR, without a bit in
+    /// common (which is their sum).
+    fn link(&self, cx: &Context, x: u32, op: OpCode, w: u32) -> bool {
+        let node = cx.node(x);
+        if node.op != op || u32::from(node.width) != w || w == 1 {
+            return false;
+        }
+        if cx.const_val(node.a).is_some() || cx.const_val(node.b).is_some() {
+            return false;
+        }
+        let (ka, kb) = (self.known(cx, node.a), self.known(cx, node.b));
+        let bit = |k: Option<Known>| k.is_some_and(|k| k.hi <= 1);
+        if bit(ka) && bit(kb) {
+            return false;
+        }
+        let full = mask(w);
+        !(op == OpCode::Or
+            && matches!((ka, kb), (Some(x), Some(y)) if (x.zero | y.zero) as i128 & full == full))
+    }
+
+    /// The form of the chain of ANDs or of ORs that ends at `n`, where it has three operands
+    /// or more: they are taken in one order (by structure), each once, whatever the order
+    /// and the grouping they were written in. (Through the nodes that were read: one that
+    /// was not is an operand.)
+    fn chain(&mut self, cx: &Context, n: u32) -> R<Option<Form>> {
+        let root = cx.node(n);
+        let (op, w) = (root.op, u32::from(root.width));
+        if !self.link(cx, n, op, w) {
+            return Ok(None);
+        }
+        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut leaves: Vec<u32> = Vec::new();
+        let mut stack = vec![root.b, root.a];
+        while let Some(x) = stack.pop() {
+            if seen.insert(x, ()).is_some() {
+                continue;
+            }
+            if seen.len() > MAX_LINKS {
+                return Ok(None);
+            }
+            if self.has(x) && self.link(cx, x, op, w) {
+                let node = cx.node(x);
+                stack.push(node.b);
+                stack.push(node.a);
+            } else {
+                leaves.push(x);
+            }
+        }
+        if leaves.len() < 3 {
+            return Ok(None);
+        }
+        let mut forms = Vec::with_capacity(leaves.len());
+        for &x in &leaves {
+            let f = self.value(cx, x)?;
+            forms.push((self.alg.place(&f)?, f));
+        }
+        forms.sort_by_key(|x| x.0);
+        forms.dedup_by_key(|x| x.0);
+        let mut acc = forms[0].1.clone();
+        for (_, f) in &forms[1..] {
+            let and = self.alg.band(w, &acc, f)?;
+            acc = match op {
+                OpCode::And => and,
+                _ => {
+                    let sum = self.alg.add(&acc, f, 1)?;
+                    self.alg.add(&sum, &and, -1)?
+                }
+            };
+        }
+        self.alg.fork();
+        Ok(Some(acc))
     }
 
     fn compare(&mut self, cx: &Context, op: OpCode, x: u32, y: u32) -> R<Form> {

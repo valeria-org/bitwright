@@ -117,6 +117,76 @@ runs side by side on a loaded machine). In a run of the corpus with a check adde
 purpose, every replacement of a node was compared with the node at the engine's verification
 points: 582,393 replacements, no difference.
 
+Operations of many operands, and the forms the words pass left undone. Besides the corpus,
+592 expressions written for the purpose: one operation (XOR, sum, AND, OR) over 2 to 128
+operands, written twice in two orders and groupings and compared, subtracted, sliced and
+masked; and a word made handler by handler in limbs from as many operands (XORs spelled
+`x + y − 2·(x & y)`, sums, differences, and the three mixed), its high limb read alone,
+against the same chain in another order, and against the word written as nodes.
+
+- **An XOR is one value however it was grouped.** The words pass read `x ^ y` as `x + y −
+  2·(x & y)`, a different form for each grouping of three values or more: two orders of one
+  XOR were not seen equal from 4 operands on, and a word XORed in limbs was not read from 5
+  (62 nodes left where 10 are the answer, 2,663 at 128 operands). An XOR is now also a term
+  of its own: of its operands as integers, any number of them, each once and in one order,
+  the operands of an XOR among them its own and two of one gone. A slice of it is the XOR of
+  the slices, so the limbs of an XOR are slices of the one term; an AND has the relation
+  `2·(x & y) = x + y − (x ^ y)` with it, and every sum is kept at the member of its class
+  with the fewest terms, so the XOR spelled as a sum is the same term, `(x ^ y) + 2·(x & y)`
+  is `x + y` and `(x ^ y) + (x & y)` is `x | y`. `trunc<20>(((a >>u 12) ^ (b >>u 12)) ^ (c
+  >>u 12))` is `extract<12, 20>(a ^ b ^ c)`.
+- **A root is asked with each reading of its XORs, and the smallest answer is kept.**
+  Bitwise code is read by the terms; arithmetic done on an XOR in limbs is read by the sum,
+  whose carries are the arithmetic's; and the operands of a term that are truncations of
+  wider words read better as the words where sums are made of them, and as the values where
+  they are not. So a root is asked with the terms over the words, with them over the values
+  where that differs, and with the sums (the forms the pass had) where arithmetic was done
+  on an XOR. Of two answers as small the later is taken, so a root with nothing of the kind
+  under it is read as before. A later question may take about twice the work of the first,
+  and once those not taken have cost a call 2^23 only the first is asked.
+- **A chain of ANDs or of ORs is read with its operands in one order**, each once, whatever
+  the order and the grouping it was written in (three operands or more, through at most 256
+  nodes): `(a & b & c) ^ (c & (b & a))` is 0. Two orders of one chain were not always seen
+  equal: from 4 operands of an OR on under `==`, from 6 of an AND.
+- **A value chosen limb by limb between a register and a constant is the limbs of one
+  choice.** With the XOR terms a choice against a constant is taken apart, `c ? K : b` being
+  `K·c + (c ? 0 : b)` and `c ? a : K` being `K − K·c + (c ? a : 0)`: each limb's choice
+  against its own digits of the constant is then a slice of the one choice against 0, and
+  the floor of a choice against a constant is the choice between the floors. Written back,
+  the constant and the choice against 0 are the choice with the constant again.
+  `zext<32>(select(t, 113, trunc<12>(r))) | (zext<32>(select(t, 0x352ac, extract<12,
+  20>(r))) << 12)` is `select(t, 0x352ac071, r)`.
+- **A form may have 256 terms.** It had 40 at most, so a sum of 48 values was not one form:
+  two orders of it were not seen equal under `==` or a mask, nor a sum in limbs from 96
+  operands on. A root with a form of more than 40 terms is asked with the forms of 40 too.
+- **A refusal for depth is not counted against the next.** The algebra bounds how deep its
+  functions call one another, at 48. A call refused at the bound did not give its level
+  back, so each refusal lowered the bound for the rest of the root, and after 48 of them
+  every node was read as a value of its own. Found while the XOR terms were written.
+- **Writing an XOR of many operands is charged to the meter**, and looks for the XORs of
+  some of its operands that are already nodes in one pass over them (the longest first).
+
+Of the 592 expressions, every one of one operation in two orders is now seen to be one
+value, at every size; none has a larger result than before, and together they take 37 s
+where they took 98 s. A word XORed in limbs is read up to 96 operands, a sum up to 128, and
+two such chains in two orders up to 64 (XOR) and 96 (sums). Beyond that a part of the chain
+is read: the XOR chain of 128 operands reaches the pass's cap on the work of a call (2^26).
+Chains that mix sums, differences and XORs are read up to 10 operands, as before.
+
+On the corpus the results have 5.2 percent fewer DAG nodes than before (4,990,879 against
+5,262,215): 0.7 percent fewer on the local windows, 5.9 percent on the deep ones. 17,936 of
+the 58,530 are smaller and 1,938 larger (by 3 nodes at the median, 271 at most, 15,370
+together against 286,706 saved). The forms named above as not read whole now are in the
+examples looked at: products of an XOR in limbs by a constant (52 nodes to 29, 54 to 31 and
+50 to 29), XORs of several values in different orders (28 to 10), and a value chosen limb
+by limb between a constant and a register (41 to 17; a second example of it, 54 nodes, is
+as before). The largest of the larger ones, 24 nodes before and 295 now, is a region the
+carries pass replaced by a slice that is 0, which it does not do with the form the words
+pass now leaves there; the others were not classified. 122 of the 133 that ran out of
+budget now finish and 2 others run out, both with smaller results. Simplifying a sample of
+3,000 takes 1.21 and 1.22 times the processor time (two runs side by side on a loaded
+machine).
+
 Found by looking for inputs that break the engine and the provers: random DAGs over a few
 narrow symbols at widths from 1 to 512 bits, every result, every fact and every answer of the
 provers checked at every assignment of the symbols; the same with symbols as wide as the

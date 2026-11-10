@@ -14,13 +14,12 @@
 //!
 //! - A node's unsigned value is written as a *form* `c + Σ kᵢ·tᵢ` over the integers, the `tᵢ`
 //!   being values of the expression, `floor(F / 2^k)` of a form, the AND of two forms modulo
-//!   `2^p`, and a choice between two forms ([`form`]).
+//!   `2^p`, the XOR of any number of forms, and a choice between two forms ([`form`]).
 //! - Every operator has such a form ([`lift`]). A slice is two floors; a sum that may wrap at
 //!   `w` bits is `S − 2^w·floor(S / 2^w)`, the floor dropped where the bounds of `S` say it is
-//!   0; `x ^ y` is `x + y − 2·(x & y)`; `x <u y` is `−floor((x − y) / 2^k)`; a carry or a
-//!   borrow written with the one below coming in (`[y = all ones] & c | [s <u x]`) is the sum
-//!   of the two; and a choice between two values a constant apart is the one plus the
-//!   constant where the condition holds.
+//!   0; `x <u y` is `−floor((x − y) / 2^k)`; a carry or a borrow written with the one below
+//!   coming in (`[y = all ones] & c | [s <u x]`) is the sum of the two; and a choice between
+//!   two values a constant apart is the one plus the constant where the condition holds.
 //! - Floors are kept in one shape: `floor((E + 2^k·Q) / 2^k) = floor(E / 2^k) + Q` moves every
 //!   multiple of `2^k` out, `floor((floor(E / 2^a) + R) / 2^k) = floor((E + 2^a·R) / 2^(a + k))`
 //!   joins a floor inside a floor, and `floor((−E − 1) / 2^k) = −floor(E / 2^k) − 1` fixes the
@@ -32,6 +31,21 @@
 //! does so by collecting terms. A chain of operations done in digits (several XORs each
 //! written `x + y − 2·(x & y)`, a product by a constant, a constant added limb by limb)
 //! collapses the same way, one operation after the other, into a slice of the word.
+//!
+//! An XOR has two forms, and a root is asked with each (see `ask`). As an *atom* of its
+//! operands (any number of them, each once and in one order, two of one gone) it is one
+//! value however it was grouped, and a slice of it is the XOR of the slices: bitwise code is
+//! read by that, of 3 values as of 100, in whatever order each place XORs them. An AND then
+//! has the relation `2·(x & y) = x + y − (x ^ y)` with the atom, and a form is kept at the
+//! member of its class with the fewest terms, so the XOR spelled `x + y − 2·(x & y)` is the
+//! same atom. As the *sum* `x + y − 2·(x & y)` it is what arithmetic done on an XOR is read
+//! by: its carries are the sum's. The operands of an atom that are truncations of wider words
+//! are in turn taken as the words (which the sums around them are of) and as the values. A
+//! chain of ANDs or of ORs is read with its operands in one order as well, and a sum is one
+//! form whatever its order: an operation of many operands is one value. With the atoms a
+//! choice against a constant is also taken apart, `c ? K : b` being `K·c + (c ? 0 : b)`: the
+//! slices of the other arm are then slices of the one choice, whatever digits of the constant
+//! each limb is chosen against.
 //!
 //! What is written back is decided on the whole expression ([`write`]). From the root down,
 //! each node's form is written out as nodes again (floors of one form as slices of that one
@@ -71,6 +85,11 @@ const MAX_LARGE: u32 = 4096;
 /// The most work of the pass's questions in a call (see `write`): past it none is asked, so
 /// the pass alone does not use up a call's budget.
 const MAX_WORK: u64 = 1 << 26;
+/// What a root's second question may take beyond twice the work of its first (see `ask`).
+const SECOND_SLACK: u64 = 1 << 14;
+/// The most work of second questions whose answers were not taken, in a call: past it none
+/// is asked (the plain forms are not what reads the call's XORs).
+const MAX_LOST: u64 = 1 << 23;
 
 /// The pass's state for a call.
 #[derive(Default)]
@@ -85,6 +104,8 @@ pub(crate) struct State {
     quiet: IdMap<u32, Fin>,
     large: u32,
     work: u64,
+    /// The work of second questions whose answers were not taken (see `ask`).
+    lost: u64,
 }
 
 impl State {
@@ -194,22 +215,76 @@ fn ask(
 ) -> Result<(Step, bool), Stop> {
     let before = cx.len() as u32;
     // The forms are read anew for each root: what is found depends on the nodes under it
-    // and nothing else.
+    // and nothing else. A root is asked up to three times, each with its own kind of forms
+    // (see `form`): with XORs as atoms over the words truncations are of; where that took
+    // an operand for what is not its value, with them over the values; and where
+    // arithmetic was done on XORs, with XORs as sums without twice the AND, as before
+    // there were atoms. Bitwise code is read by the atoms, arithmetic on an XOR by the
+    // sums, and which operands read better depends on what is done with the truncations.
+    // The smallest root is taken; of two as small, the later one's. (A later question may
+    // take about twice the work of the first: where it would take more, its forms are the
+    // ones that grow. And once the questions not taken have cost a call [`MAX_LOST`], only
+    // the first is asked.)
     let mut lift = lift::Lift::default();
-    let mut search = write::Search::new(&mut lift, build, nodes);
+    let mut search = write::Search::new(&mut lift, build, nodes.clone());
     let found = search.run(r, cx);
     r.words.work += search.work();
     let found = found?;
-    let fin = search.lift.fin.unwrap_or(Fin::FINAL);
-    let Some(root) = found else {
-        r.stats
-            .passes
-            .entry(PassKind::Words.name())
-            .or_default()
-            .noop += 1;
-        return Ok((Step::Normal(fin), false));
+    let mut fin = search.lift.fin.unwrap_or(Fin::FINAL);
+    let allow = 2 * search.work() + SECOND_SLACK;
+    let mut forked = search.lift.alg.forked();
+    let (mut lift2, mut lift3) = (lift::Lift::values(), lift::Lift::plain());
+    let (mut scratch2, mut scratch3) = (write::Build::default(), write::Build::default());
+    let mut later = [None, None];
+    if search.lift.alg.wordy() && r.words.lost < MAX_LOST {
+        let mut second = write::Search::new(&mut lift2, &mut scratch2, nodes.clone());
+        second.limit(allow);
+        let other = second.run(r, cx);
+        r.words.work += second.work();
+        let other = other?;
+        fin = fin.and(second.lift.fin.unwrap_or(Fin::FINAL));
+        forked |= second.lift.alg.forked();
+        later[0] = Some((second, other));
+    }
+    if forked && r.words.lost < MAX_LOST {
+        let mut third = write::Search::new(&mut lift3, &mut scratch3, nodes);
+        third.limit(allow);
+        let other = third.run(r, cx);
+        r.words.work += third.work();
+        let other = other?;
+        fin = fin.and(third.lift.fin.unwrap_or(Fin::FINAL));
+        later[1] = Some((third, other));
+    }
+    let mut pick = None;
+    let mut least = found.map(|f| f.1);
+    for (i, leg) in later.iter().enumerate() {
+        if let Some((_, Some((_, size)))) = leg
+            && least.is_none_or(|x| *size <= x)
+        {
+            (pick, least) = (Some(i), Some(*size));
+        }
+    }
+    for (i, leg) in later.iter().enumerate() {
+        if let Some((s, _)) = leg
+            && pick != Some(i)
+        {
+            r.words.lost += s.work();
+        }
+    }
+    let e = match pick.and_then(|i| later[i].take()) {
+        Some((mut taken, Some((root, _)))) => taken.export(r, cx, root)?,
+        _ => {
+            let Some((root, _)) = found else {
+                r.stats
+                    .passes
+                    .entry(PassKind::Words.name())
+                    .or_default()
+                    .noop += 1;
+                return Ok((Step::Normal(fin), false));
+            };
+            search.export(r, cx, root)?
+        }
     };
-    let e = search.export(r, cx, root)?;
     Ok((
         finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
         true,
