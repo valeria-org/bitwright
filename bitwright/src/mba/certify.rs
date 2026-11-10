@@ -2304,6 +2304,39 @@ fn commutative(op: &MOp) -> bool {
     matches!(op, MOp::Add | MOp::Mul | MOp::And | MOp::Or | MOp::Xor)
 }
 
+/// The index of node `i` read in `ctx`, in a table with two entries per node.
+#[inline]
+fn read_slot(i: u32, ctx: Ctx) -> usize {
+    2 * i as usize + usize::from(ctx == Ctx::Bitwise)
+}
+
+/// The skeleton node built for each node and context, by [`read_slot`].
+struct SkelMemo(Vec<u32>);
+
+impl SkelMemo {
+    const NONE: u32 = u32::MAX;
+
+    fn new(nodes: usize) -> SkelMemo {
+        SkelMemo(vec![Self::NONE; 2 * nodes])
+    }
+
+    #[inline]
+    fn contains(&self, i: u32, ctx: Ctx) -> bool {
+        self.0[read_slot(i, ctx)] != Self::NONE
+    }
+
+    #[inline]
+    fn get(&self, i: u32, ctx: Ctx) -> Option<u32> {
+        let v = self.0[read_slot(i, ctx)];
+        (v != Self::NONE).then_some(v)
+    }
+
+    #[inline]
+    fn insert(&mut self, i: u32, ctx: Ctx, at: u32) {
+        self.0[read_slot(i, ctx)] = at;
+    }
+}
+
 impl Compose {
     fn new(a: &MbaExpr, b: &MbaExpr) -> Compose {
         let mut nodes: Vec<MNode> = Vec::new();
@@ -2425,10 +2458,10 @@ impl Compose {
     /// Marks the nodes abstracted wherever they are read (opaque nodes, arithmetic read by a
     /// bitwise operator) and the operands of opaque nodes (definitions compared on their own).
     fn mark_forced(&mut self) {
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::default();
+        let mut seen = vec![false; 2 * self.nodes.len()];
         let mut stack = vec![(self.root_a, Ctx::Arith), (self.root_b, Ctx::Arith)];
         while let Some((i, ctx)) = stack.pop() {
-            if seen.insert((i, ctx), ()).is_some() {
+            if std::mem::replace(&mut seen[read_slot(i, ctx)], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -3082,10 +3115,10 @@ impl Compose {
     /// constants and atoms.
     fn bitwise_leaves(&self, k: u32) -> Vec<u32> {
         let mut out = Vec::new();
-        let mut seen: HashMap<u32, ()> = HashMap::default();
+        let mut seen = vec![false; self.nodes.len()];
         let mut stack = vec![k];
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if std::mem::replace(&mut seen[i as usize], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -3136,14 +3169,14 @@ impl Compose {
     fn def_leaves(&mut self, y: u32) -> Option<Vec<u32>> {
         let mut out: Vec<u32> = Vec::new();
         let mut classes: Vec<u32> = Vec::new();
-        let mut seen: HashMap<(u32, Ctx), ()> = HashMap::default();
+        let mut seen = vec![false; 2 * self.nodes.len()];
         let n = self.nodes[y as usize];
         let mut stack: Vec<(u32, Ctx)> = n.args[..n.op.arity()]
             .iter()
             .map(|&k| (k, Ctx::Arith))
             .collect();
         while let Some((i, ctx)) = stack.pop() {
-            if seen.insert((i, ctx), ()).is_some() {
+            if std::mem::replace(&mut seen[read_slot(i, ctx)], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -3179,9 +3212,9 @@ impl Compose {
             .copied()
             .filter(|&l| self.role[l as usize] == Role::Arith)
             .collect();
-        let mut seen: HashMap<u32, ()> = HashMap::default();
+        let mut seen = vec![false; self.nodes.len()];
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if std::mem::replace(&mut seen[i as usize], true) {
                 continue;
             }
             let n = self.nodes[i as usize];
@@ -3357,7 +3390,7 @@ impl Compose {
         // The leaves, by class, and the internal nodes in post-order.
         let mut leaves: Vec<(u32, u32)> = Vec::new();
         let mut post: Vec<u32> = Vec::new();
-        let mut state: HashMap<u32, bool> = HashMap::default();
+        let mut state = vec![false; self.nodes.len()];
         let mut stack: Vec<(u32, bool)> = vec![(i, false)];
         let mut atom = false;
         while let Some((k, done)) = stack.pop() {
@@ -3365,10 +3398,9 @@ impl Compose {
                 post.push(k);
                 continue;
             }
-            if state.contains_key(&k) {
+            if std::mem::replace(&mut state[k as usize], true) {
                 continue;
             }
-            state.insert(k, true);
             let n = self.nodes[k as usize];
             match self.role[k as usize] {
                 Role::Const => {
@@ -3496,24 +3528,24 @@ impl Compose {
             Expand(u32, usize),
         }
         let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::default();
+        let mut memo = SkelMemo::new(self.nodes.len());
         let mut plans: Vec<Expansion> = Vec::new();
         let mut stack = vec![Item::Visit(root, Ctx::Arith)];
         while let Some(item) = stack.pop() {
             match item {
                 Item::Visit(i, ctx) => {
-                    if memo.contains_key(&(i, ctx)) {
+                    if memo.contains(i, ctx) {
                         continue;
                     }
                     let n = self.nodes[i as usize];
                     if let Some(c) = self.cst[i as usize] {
                         out.push(SkelNode::Const(c));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     if let MOp::Var(x) = n.op {
                         out.push(SkelNode::Var(vm.orig(x, n.width)));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     let role = self.role[i as usize];
@@ -3534,7 +3566,7 @@ impl Compose {
                             None => vm.class(c, n.width),
                         };
                         out.push(SkelNode::Var(v));
-                        memo.insert((i, ctx), out.len() as u32 - 1);
+                        memo.insert(i, ctx, out.len() as u32 - 1);
                         continue;
                     }
                     if role == Role::Bitwise
@@ -3565,22 +3597,22 @@ impl Compose {
                     };
                     let mut args = [0u32; 2];
                     for (k, &a) in n.args[..n.op.arity()].iter().enumerate() {
-                        args[k] = *memo.get(&(a, sub))?;
+                        args[k] = memo.get(a, sub)?;
                     }
                     out.push(SkelNode::Op(n.op, args));
-                    memo.insert((i, ctx), out.len() as u32 - 1);
+                    memo.insert(i, ctx, out.len() as u32 - 1);
                 }
                 Item::Alias(i, r) => {
-                    let v = *memo.get(&(r, Ctx::Bitwise))?;
-                    memo.insert((i, Ctx::Bitwise), v);
+                    let v = memo.get(r, Ctx::Bitwise)?;
+                    memo.insert(i, Ctx::Bitwise, v);
                 }
                 Item::Expand(i, e) => {
                     let plan = &plans[e];
                     let mut acc: Option<u32> = None;
                     for (c, reads) in &plan.terms {
-                        let mut t = *memo.get(&reads[0])?;
+                        let mut t = memo.get(reads[0].0, reads[0].1)?;
                         for r in &reads[1..] {
-                            let x = *memo.get(r)?;
+                            let x = memo.get(r.0, r.1)?;
                             out.push(SkelNode::Op(MOp::And, [t, x]));
                             t = out.len() as u32 - 1;
                         }
@@ -3613,11 +3645,11 @@ impl Compose {
                             }
                         }
                     };
-                    memo.insert((i, Ctx::Arith), result);
+                    memo.insert(i, Ctx::Arith, result);
                 }
             }
         }
-        let r = *memo.get(&(root, Ctx::Arith))? as usize;
+        let r = memo.get(root, Ctx::Arith)? as usize;
         out.truncate(r + 1);
         Some(out)
     }
@@ -3645,19 +3677,19 @@ impl Compose {
     /// class (the class's own variable when it has one).
     fn skeleton(&mut self, root: u32, policy: Policy, vm: &mut VarMap) -> Option<Vec<SkelNode>> {
         let mut out: Vec<SkelNode> = Vec::new();
-        let mut memo: HashMap<(u32, Ctx), u32> = HashMap::default();
+        let mut memo = SkelMemo::new(self.nodes.len());
         let mut stack: Vec<(u32, Ctx, bool)> = vec![(root, Ctx::Arith, false)];
         // Under `Policy::Reps`, atoms read as their representative: the atom's skeleton is the
         // representative's (whose leaves are of earlier classes, so this ends).
         let mut alias: HashMap<u32, u32> = HashMap::default();
         while let Some((i, ctx, expanded)) = stack.pop() {
-            if memo.contains_key(&(i, ctx)) {
+            if memo.contains(i, ctx) {
                 continue;
             }
             let n = self.nodes[i as usize];
             if expanded && let Some(&r) = alias.get(&i) {
-                let at = *memo.get(&(r, ctx))?;
-                memo.insert((i, ctx), at);
+                let at = memo.get(r, ctx)?;
+                memo.insert(i, ctx, at);
                 continue;
             }
             if !expanded {
@@ -3696,7 +3728,7 @@ impl Compose {
                     }
                     continue;
                 }
-                memo.insert((i, ctx), out.len() as u32 - 1);
+                memo.insert(i, ctx, out.len() as u32 - 1);
                 continue;
             }
             let sub = match self.role[i as usize] {
@@ -3706,13 +3738,13 @@ impl Compose {
             };
             let mut args = [0u32; 2];
             for (k, &a) in n.args[..n.op.arity()].iter().enumerate() {
-                args[k] = *memo.get(&(a, sub))?;
+                args[k] = memo.get(a, sub)?;
             }
             out.push(SkelNode::Op(n.op, args));
-            memo.insert((i, ctx), out.len() as u32 - 1);
+            memo.insert(i, ctx, out.len() as u32 - 1);
         }
         // The root is the last node built for it.
-        let r = *memo.get(&(root, Ctx::Arith))? as usize;
+        let r = memo.get(root, Ctx::Arith)? as usize;
         out.truncate(r + 1);
         Some(out)
     }
