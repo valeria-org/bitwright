@@ -975,7 +975,11 @@ fn one_atom_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Ste
     let estimate = if a.is_zero() {
         1
     } else {
-        let masked = if a.is_ones() { 0 } else { 1 + u32::from(!is_old(&a)) };
+        let masked = if a.is_ones() {
+            0
+        } else {
+            1 + u32::from(!is_old(&a))
+        };
         let flipped = match (b.is_zero(), b.is_ones()) {
             (true, _) => 0,
             (_, true) => 1,

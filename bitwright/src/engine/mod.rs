@@ -1322,6 +1322,10 @@ struct Runner<'r, 'a> {
     /// `pass::mba::sweep`).
     #[cfg(feature = "mba")]
     swept: IdMap<u32, u32>,
+    /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
+    /// its samples showed (see `pass::mba::Witness`).
+    #[cfg(feature = "mba")]
+    witnesses: Vec<pass::mba::Witness>,
     /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
     /// edges they count, per phase run, computed on first need (`uses_on`).
     live: pass::Live,
@@ -2415,6 +2419,8 @@ impl Engine {
             mba_undecided: IdMap::default(),
             #[cfg(feature = "mba")]
             swept: IdMap::default(),
+            #[cfg(feature = "mba")]
+            witnesses: Vec::new(),
             live: pass::Live::default(),
             uses_on: false,
             uses_upto: 0,
@@ -2595,6 +2601,7 @@ impl Engine {
             }
         }
         let spent = runner.meter.spent;
+        pass::mba::tmp_time_dump();
         if let Some(a) = allowance {
             a.spend(&spent);
         }
@@ -2679,8 +2686,12 @@ impl Runner<'_, '_> {
                 Err(stop) => return Err((cur, fin, stop)),
             }
         }
+        let t0 = std::time::Instant::now();
         cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        pass::mba::tmp_time("T.sweep0", t0);
+        let t0 = std::time::Instant::now();
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        pass::mba::tmp_time("T.cases0", t0);
         self.rounds(cx, cur, fin)
     }
 
@@ -2772,10 +2783,14 @@ impl Runner<'_, '_> {
         for round in 0..inner.strategy.max_rounds.max(1) {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             if round > 0 {
+                let t0 = std::time::Instant::now();
                 if std::env::var_os("BW_NO_RESWEEP").is_none() {
                     cur = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
                 }
+                pass::mba::tmp_time("T.resweep", t0);
+                let t0 = std::time::Instant::now();
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                pass::mba::tmp_time("T.recases", t0);
             }
             let start = cur;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
@@ -2788,7 +2803,10 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
-                match self.local(cx, phase, cur) {
+                let t0 = std::time::Instant::now();
+                let ran = self.local(cx, phase, cur);
+                pass::mba::tmp_time(p.name(), t0);
+                match ran {
                     Ok((r, f)) => {
                         cur = r;
                         fin = fin.and(f);

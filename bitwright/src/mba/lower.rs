@@ -334,9 +334,8 @@ pub(crate) fn shared_nodes(
     n: usize,
     opaque: &IdMap<u32, ()>,
 ) -> Vec<u32> {
-    let inside = |i: u32| {
-        (i == root || !opaque.contains_key(&i)) && in_reading(cx, i, Reading::SemiLinear)
-    };
+    let inside =
+        |i: u32| (i == root || !opaque.contains_key(&i)) && in_reading(cx, i, Reading::SemiLinear);
     let mut users: IdMap<u32, u32> = IdMap::default();
     let mut seen: IdMap<u32, ()> = IdMap::default();
     let mut stack = vec![root];

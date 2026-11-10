@@ -233,7 +233,9 @@ fn sweep_inner(
         ($l:lifetime, $what:literal, $e:expr) => {{
             let s0 = r.meter.spent.mba_steps;
             let w0 = r.meter.spent.pass_work;
+            let t0 = std::time::Instant::now();
             let got = $e;
+            tmp_time($what, t0);
             tmp_prof($what, r.meter.spent.mba_steps - s0);
             TMP_WORK.with(|p| {
                 *p.borrow_mut().entry($what).or_default() += r.meter.spent.pass_work - w0
@@ -348,6 +350,10 @@ fn sweep_inner(
         if !all_constant && (!(mixed || predicate) || failures >= SWEEP_FAILURES) {
             continue;
         }
+        // Not `k` at an input an earlier candidate differed at: no constant.
+        if !all_constant && asked!('nodes, "witnessed", witnessed(r, cx, cur, &k)) {
+            continue;
+        }
         // Over constants alone it is that value. Otherwise its fragment is read several ways:
         // whole; semi-linear, semi-linear over bitwise functions of atoms, linear, and
         // semi-linear with a subterm many of its nodes read cut off as one atom (every other
@@ -384,7 +390,8 @@ fn sweep_inner(
                 } else {
                     refuted = true;
                 }
-            } else if let Some(holds) = asked!('nodes, "exhaustive", exhaustive(r, cx, subject, &k)) {
+            } else if let Some(holds) = asked!('nodes, "exhaustive", exhaustive(r, cx, subject, &k))
+            {
                 if holds {
                     decided = true;
                     count(r).opaque_exhausted += 1;
@@ -395,7 +402,8 @@ fn sweep_inner(
         }
         if !decided && !refuted && mixed {
             let seen;
-            (decided, refuted, seen) = asked!('nodes, "readings", readings_prove(r, cx, cfg, subject, &k));
+            (decided, refuted, seen) =
+                asked!('nodes, "readings", readings_prove(r, cx, cfg, subject, &k));
             // The candidate as it is written, where the reduced one was not decided: taking
             // each operand on the bits its user reads writes one value read under several
             // masks once per mask, each a variable of its own, and what the terms cancel
@@ -463,6 +471,34 @@ thread_local! {
 thread_local! {
     static TMP_UNDEC: std::cell::RefCell<std::collections::HashSet<u32>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    static TMP_TIME: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+pub(crate) fn tmp_time(what: &'static str, t0: std::time::Instant) {
+    let d = t0.elapsed();
+    TMP_TIME.with(|p| {
+        let mut p = p.borrow_mut();
+        let e = p.entry(what).or_default();
+        e.0 += 1;
+        e.1 += d;
+    });
+}
+
+pub(crate) fn tmp_time_dump() {
+    if std::env::var_os("BW_PROF").is_some() {
+        TMP_TIME.with(|p| {
+            let p = p.borrow();
+            let v: Vec<String> = p
+                .iter()
+                .map(|(k, (n, d))| format!("{k:?}: ({n}, {})", d.as_micros()))
+                .collect();
+            eprintln!("TIME {{{}}}", v.join(", "));
+        });
+    }
 }
 
 pub(crate) fn tmp_off(name: &str) -> bool {
@@ -591,6 +627,7 @@ fn related(
     d: &crate::BitVec,
 ) -> Result<Related, Stop> {
     // Written over `rep` and constants alone: nothing to relate.
+    let t0 = std::time::Instant::now();
     let node = cx.node(cur);
     if cur == rep
         || (node.children().any(|c| c == rep)
@@ -598,6 +635,7 @@ fn related(
                 .children()
                 .all(|c| c == rep || cx.const_val(c).is_some()))
     {
+        tmp_time("rel=written", t0);
         return Ok(Related::Written);
     }
     let zero = crate::BitVec::zero(d.width());
@@ -613,6 +651,7 @@ fn related(
         }
     })?;
     if e == cur {
+        tmp_time("rel=written2", t0);
         return Ok(Related::Written);
     }
     let op = match relation {
@@ -625,13 +664,40 @@ fn related(
         false => Related::Open,
     };
     if let Some(v) = cx.const_val(diff) {
+        tmp_time("rel=const", t0);
         return Ok(proved(v));
     }
+    if witnessed(r, cx, diff, &zero)? {
+        tmp_time("rel=open.witness", t0);
+        return Ok(Related::Open);
+    }
+    tmp_time("rel.build", t0);
+    let t0 = std::time::Instant::now();
     let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS)?;
+    tmp_time("rel.reduced", t0);
     if let Some(v) = cx.const_val(subject) {
+        tmp_time(
+            if v.is_zero() {
+                "rel=proved.reduced"
+            } else {
+                "rel=open.reduced"
+            },
+            t0,
+        );
         return Ok(proved(v));
     }
-    if let Some(holds) = exhaustive(r, cx, subject, &zero)? {
+    let t0 = std::time::Instant::now();
+    let exh = exhaustive(r, cx, subject, &zero)?;
+    tmp_time("rel.exhaustive", t0);
+    if let Some(holds) = exh {
+        tmp_time(
+            if holds {
+                "rel=proved.exh"
+            } else {
+                "rel=open.exh"
+            },
+            t0,
+        );
         count(r).opaque_exhausted += u64::from(holds);
         return Ok(if holds {
             Related::Proved(e)
@@ -639,7 +705,16 @@ fn related(
             Related::Open
         });
     }
+    let t0 = std::time::Instant::now();
     let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero)?;
+    tmp_time(
+        if decided {
+            "rel=proved.readings"
+        } else {
+            "rel=open.readings"
+        },
+        t0,
+    );
     if decided {
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
@@ -861,6 +936,8 @@ fn exhaustive(
     };
     // A value the root differs at: of the symbols a refutation, of a node no answer.
     let differs = (!cut_at).then_some(false);
+    // The point the enumeration ended at, where the root differs.
+    let mut missed: Option<u64> = None;
     // The points a candidate that is not `k` most often differs at, before the enumeration is
     // paid for: each bit alone, all of them, and a few mixed. The samples leave candidates that
     // are `k` unless some one bit is set, and counting up from zero reaches an input's top bit
@@ -876,29 +953,156 @@ fn exhaustive(
         certify::Meter::charge(&mut meter, cost(u64::from(total) + 1 + EXHAUSTIVE_MIXED))?;
         for p in probes {
             if !agrees(p)? {
-                return Ok(differs);
+                missed = Some(p);
+                break;
             }
         }
     }
     let mut start = 0u64;
-    while start < points {
+    while missed.is_none() && start < points {
         let n = EXHAUSTIVE_BLOCK.min(points - start);
         certify::Meter::charge(&mut meter, cost(n))?;
         for p in start..start + n {
             if !agrees(p)? {
-                if std::env::var_os("BW_PROF").is_some() {
-                    eprintln!(
-                        "miss root={root} cut={cut_at} total={total} p={p:#x} nodes={} syms={:?}",
-                        order.len(),
-                        syms.iter().map(|(s, m)| (*s, format!("{m:#x}"))).collect::<Vec<_>>()
-                    );
-                }
-                return Ok(differs);
+                missed = Some(p);
+                break;
             }
         }
         start += n;
     }
-    Ok(Some(true))
+    let Some(p) = missed else {
+        return Ok(Some(true));
+    };
+    if tmp_off("BW_PROF") {
+        eprintln!(
+            "miss root={root} cut={cut_at} total={total} p={p:#x} nodes={} syms={:?}",
+            order.len(),
+            syms.iter()
+                .map(|(s, m)| (*s, format!("{m:#x}")))
+                .collect::<Vec<_>>()
+        );
+    }
+    // The symbols' values there are an input the root is not `k` at: kept, for the candidates
+    // after this one that differ there too (an obfuscator builds one value from another, and
+    // a chain of them that are `k` but for one value of a 16-bit field was enumerated up to
+    // that value at every link).
+    if !cut_at {
+        let fixed = syms
+            .iter()
+            .scan(p, |left, &(s, m)| {
+                let mut v = 0u64;
+                let mut mm = m;
+                while mm != 0 {
+                    if *left & 1 == 1 {
+                        v |= mm & mm.wrapping_neg();
+                    }
+                    *left >>= 1;
+                    mm &= mm - 1;
+                }
+                Some((s, BitVec::wrapping_from_u64(cx.width_of(s), v)))
+            })
+            .collect();
+        note_witness(r, cx, fixed);
+    }
+    Ok(differs)
+}
+
+/// An input at which a candidate of the opaque-constant sweep was found to differ from what
+/// its samples showed: the symbols it fixes (every other symbol has its value at one of the
+/// verification points), and the nodes evaluated at it so far. The samples are few, and a value
+/// that is constant but for one input of `2^16` is constant on all of them; what tells it
+/// from a constant is that input, and it tells the same of every node built on that value.
+#[derive(Default)]
+pub(crate) struct Witness {
+    fixed: crate::hash::IdMap<u32, crate::BitVec>,
+    point: usize,
+    vals: crate::hash::IdMap<u32, crate::BitVec>,
+}
+
+/// The most witnesses a call keeps.
+const WITNESSES: usize = 32;
+
+/// Keeps the input that gives the symbols `fixed` their values there as a witness of the call.
+fn note_witness(r: &mut Runner<'_, '_>, cx: &Context, fixed: Vec<(u32, crate::BitVec)>) {
+    if r.witnesses.len() >= WITNESSES {
+        return;
+    }
+    // A symbol's value agrees with what the host declared of it, as its samples do.
+    let fixed: crate::hash::IdMap<u32, crate::BitVec> = fixed
+        .into_iter()
+        .map(|(s, v)| (s, cx.declared_at(s).map_or(v, |d| d.fit(&v))))
+        .collect();
+    if r.witnesses.iter().any(|w| w.fixed == fixed) {
+        return;
+    }
+    r.witnesses.push(Witness {
+        fixed,
+        point: 2 + r.witnesses.len(),
+        vals: crate::hash::IdMap::default(),
+    });
+}
+
+/// Whether `n` is not `k` at one of the call's witnesses (each node is evaluated once at
+/// each, charged as pass work).
+fn witnessed(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    k: &crate::BitVec,
+) -> Result<bool, Stop> {
+    for w in 0..r.witnesses.len() {
+        let mut wit = std::mem::take(&mut r.witnesses[w]);
+        let mut work = 0u64;
+        let mut out = Ok(());
+        let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if wit.vals.contains_key(&i) {
+                continue;
+            }
+            if !expanded {
+                stack.push((i, true));
+                for c in cx.node(i).children() {
+                    if !wit.vals.contains_key(&c) {
+                        stack.push((c, false));
+                    }
+                }
+                continue;
+            }
+            work += 1;
+            let v = match wit.fixed.get(&i) {
+                Some(v) => Ok(*v),
+                None => {
+                    let seed = cx.meta[i as usize].shash;
+                    let declared = cx.declared_at(i);
+                    cx.eval_node(
+                        i,
+                        |j| wit.vals[&j],
+                        |_, w| {
+                            let v = crate::engine::point_value(seed, w, wit.point);
+                            Some(declared.map_or(v, |d| d.fit(&v)))
+                        },
+                    )
+                }
+            };
+            match v {
+                Ok(v) => {
+                    wit.vals.insert(i, v);
+                }
+                Err(e) => {
+                    out = Err(Stop::Error(e));
+                    break;
+                }
+            }
+        }
+        let differs = wit.vals.get(&n).is_some_and(|v| v != k);
+        r.witnesses[w] = wit;
+        r.meter.charge(Counter::PassWork, work)?;
+        out?;
+        if differs {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The fewest bits [`exhaustive`] screens an enumeration of (fewer are as cheap to enumerate).
@@ -1447,12 +1651,42 @@ fn readings_prove(
                     _ => 3,
                 };
                 const L: [[&str; 4]; 6] = [
-                    ["rd.whole.proved", "rd.whole.refuted", "rd.whole.over", "rd.whole.unknown"],
-                    ["rd.semi.proved", "rd.semi.refuted", "rd.semi.over", "rd.semi.unknown"],
-                    ["rd.shallow.proved", "rd.shallow.refuted", "rd.shallow.over", "rd.shallow.unknown"],
-                    ["rd.linear.proved", "rd.linear.refuted", "rd.linear.over", "rd.linear.unknown"],
-                    ["rd.cut.proved", "rd.cut.refuted", "rd.cut.over", "rd.cut.unknown"],
-                    ["rd.cutw.proved", "rd.cutw.refuted", "rd.cutw.over", "rd.cutw.unknown"],
+                    [
+                        "rd.whole.proved",
+                        "rd.whole.refuted",
+                        "rd.whole.over",
+                        "rd.whole.unknown",
+                    ],
+                    [
+                        "rd.semi.proved",
+                        "rd.semi.refuted",
+                        "rd.semi.over",
+                        "rd.semi.unknown",
+                    ],
+                    [
+                        "rd.shallow.proved",
+                        "rd.shallow.refuted",
+                        "rd.shallow.over",
+                        "rd.shallow.unknown",
+                    ],
+                    [
+                        "rd.linear.proved",
+                        "rd.linear.refuted",
+                        "rd.linear.over",
+                        "rd.linear.unknown",
+                    ],
+                    [
+                        "rd.cut.proved",
+                        "rd.cut.refuted",
+                        "rd.cut.over",
+                        "rd.cut.unknown",
+                    ],
+                    [
+                        "rd.cutw.proved",
+                        "rd.cutw.refuted",
+                        "rd.cutw.over",
+                        "rd.cutw.unknown",
+                    ],
                 ];
                 tmp_prof(L[kind][verdict], r.meter.spent.mba_steps - s0);
                 if known {
