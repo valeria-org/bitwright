@@ -2159,6 +2159,7 @@ fn exactly_two(values: &[crate::BitVec]) -> bool {
 
 /// A varying block proved constant on each side of its most-used condition, reconstructed as a
 /// select of those constants. Sampling only admits a candidate; each side needs exact evidence.
+/// `attempts` counts the blocks whose sides were built.
 fn cases_fold(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -2167,14 +2168,52 @@ fn cases_fold(
     attempts: &mut usize,
 ) -> Result<Option<u32>, Stop> {
     let tall = std::time::Instant::now();
-    let got = r.build(cx, |cx| super::context::sides(cx, n))?;
-    tmp_time("cf.sides", tall);
-    let Some((c, t, f)) = got else {
+    let Some(c) = r.build(cx, |cx| super::context::most_tested(cx, n))? else {
+        tmp_time("cf=none.sides", tall);
+        return Ok(None);
+    };
+    // The samples first, before a side is built or swept: a side that varies at them is not
+    // proved constant, and its sweep keeps its value (wherever the run's assumptions hold,
+    // so only the samples where they do are read), so it varies after its sweep as before.
+    // (Of 3,404 blocks with a condition in 140 slow questions, 2,658 were swept to find a
+    // side that varied at the samples it began with: five sixths of the time spent here.)
+    //
+    // Before the sides are built, the block's own samples: where `c` holds the first side
+    // is `n`, elsewhere the second is (`context::sides_on`), so a block with two values
+    // where `c` holds, or two where it does not, has a side with both.
+    r.sample(cx, n)?;
+    r.sample(cx, c)?;
+    let points = r.samples[&n].len();
+    let held = held_points(r, cx, points)?;
+    let (vn, vc) = (&r.samples[&n], &r.samples[&c]);
+    let where_c = |holds: bool| -> Vec<bool> {
+        let at = |(held, c): (&bool, &crate::BitVec)| *held && c.is_zero() != holds;
+        held.iter().zip(vc.iter()).map(at).collect()
+    };
+    if varies_at(vn, &where_c(true)) || varies_at(vn, &where_c(false)) {
+        tmp_time("cf=none.split", tall);
+        return Ok(None);
+    }
+    let t0 = std::time::Instant::now();
+    let got = r.build(cx, |cx| super::context::sides_on(cx, n, c))?;
+    tmp_time("cf.sides", t0);
+    let Some((t, f)) = got else {
         tmp_time("cf=none.sides", tall);
         return Ok(None);
     };
     *attempts += 1;
     let mut sides = [t, f];
+    // Then each side's samples (those where the other case holds too).
+    for side in sides {
+        if cx.const_val(side).is_some() {
+            continue;
+        }
+        r.sample(cx, side)?;
+        if varies_at(&r.samples[&side], &held) {
+            tmp_time("cf=none.side_varies", tall);
+            return Ok(None);
+        }
+    }
     let mut values = [crate::BitVec::zero(cx.width_of(n)); 2];
     for (which, (slot, side)) in values.iter_mut().zip(&mut sides).enumerate() {
         let t0 = std::time::Instant::now();
@@ -2204,12 +2243,19 @@ fn cases_fold(
         }
         *slot = k;
     }
-    for (side, k) in sides.into_iter().zip(values) {
+    for (which, (side, k)) in sides.into_iter().zip(values).enumerate() {
         let t0 = std::time::Instant::now();
         let proved = cx.const_val(side).is_some() || readings_prove(r, cx, cfg, side, &k, SWEEP_SHARE)?.0;
         tmp_time("cf.readings", t0);
         if !proved {
-            tmp_time("cf=none.readings", tall);
+            tmp_time(
+                if which == 0 {
+                    "cf=none.readings0"
+                } else {
+                    "cf=none.readings1"
+                },
+                tall,
+            );
             return Ok(None);
         }
     }
@@ -2225,6 +2271,26 @@ fn cases_fold(
     tmp_time("cf=some", tall);
     count(r).piecewise_blocks += 1;
     Ok(Some(e))
+}
+
+/// Whether every constraint of the run's assumptions holds, at each of the `points` sample
+/// points (all of them without assumptions): where a rewrite that relies on them keeps a
+/// node's value.
+fn held_points(r: &mut Runner<'_, '_>, cx: &Context, points: usize) -> Result<Vec<bool>, Stop> {
+    use crate::facts::Reliance;
+    let Some(a) = r.assumptions else {
+        return Ok(vec![true; points]);
+    };
+    let all = a
+        .constraints()
+        .fold(Reliance::NONE, |rel, (id, _, _)| rel.union(Reliance::of(id)));
+    r.constraints_hold(cx, all, points)
+}
+
+/// Whether `vals` differ at two of the sample points `at` keeps.
+fn varies_at(vals: &[crate::BitVec], at: &[bool]) -> bool {
+    let mut kept = vals.iter().zip(at).filter(|(_, at)| **at).map(|(v, _)| v);
+    kept.next().is_some_and(|k| kept.any(|v| v != k))
 }
 
 /// (temporary) The wall-time categories as they stand, to attribute what a nested sweep adds.

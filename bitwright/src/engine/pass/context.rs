@@ -278,7 +278,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
 
 /// The condition `root` is split on by [`sides`]: the one most of its selects (and `zext(c)`
 /// factors) test, a condition and its complement counted as one, when one is tested twice.
-fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
+pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
     let order = cx.post_order_ids(&[root]);
     let mut uses: IdMap<u32, u32> = IdMap::default();
     for &i in &order {
@@ -313,11 +313,18 @@ pub(super) fn sides(cx: &mut Context, root: u32) -> Result<Option<(u32, u32, u32
     let Some(c) = most_tested(cx, root)? else {
         return Ok(None);
     };
+    Ok(sides_on(cx, root, c)?.map(|(t, f)| (c, t, f)))
+}
+
+/// [`sides`] on the condition `c`: `root` where `c` holds and where it does not, at an input
+/// where `c` holds the first is `root`'s value, at any other the second. `None` when neither
+/// differs from `root`.
+pub(super) fn sides_on(cx: &mut Context, root: u32, c: u32) -> Result<Option<(u32, u32)>, Error> {
     let (mut ft, mut ff) = (Vec::new(), Vec::new());
     fixes(cx, c, true, &mut ft, 0);
     fixes(cx, c, false, &mut ff, 0);
     let (t, f) = (put(cx, root, &ft)?, put(cx, root, &ff)?);
-    Ok((t != root || f != root).then_some((c, t, f)))
+    Ok((t != root || f != root).then_some((t, f)))
 }
 
 /// The most conditions a piece [`cut`] reads as a table may depend on.
