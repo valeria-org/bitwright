@@ -347,7 +347,7 @@ pub(crate) fn lower_id_over(
             });
         }
     }
-    if solved.is_empty() || std::env::var_os("BW_NO_SOLVED").is_some() {
+    if solved.is_empty() {
         return build(cx, atoms, order, &[]);
     }
     let (mut atoms, order) = scan_in(cx, root, lim, &|cx, i| {

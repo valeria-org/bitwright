@@ -307,7 +307,7 @@ fn sweep_inner(
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
             // A node the samples relate to one met before it (see `related`).
-            let found = match unrelated < SWEEP_UNRELATED && !tmp_off("BW_NO_RELATED") {
+            let found = match unrelated < SWEEP_UNRELATED {
                 true => classes.find(vals),
                 false => Vec::new(),
             };
@@ -486,7 +486,7 @@ fn sweep_inner(
             // each operand on the bits its user reads writes one value read under several
             // masks once per mask, each a variable of its own, and what the terms cancel
             // through (the one value they all read) is gone.
-            if !decided && !refuted && subject != cur && !tmp_off("BW_NO_WRITTEN") {
+            if !decided && !refuted && subject != cur {
                 let again = asked!('nodes, "readings_written", readings_prove(r, cx, cfg, cur, &k, SWEEP_SHARE));
                 decided = again.0;
             }
@@ -925,15 +925,12 @@ fn exhaustive_in(
         // Over the values it can take: the bits known of it are those values' (a sum
         // that is constant only for them is constant), and a value it never takes refutes
         // nothing.
-        let [z, o] = match tmp_off("BW_OLD_EXH") {
-            true => [0, 0],
-            false => super::known_words(r, cx, sc.order[c])?.0.unwrap_or([0, 0]),
-        };
+        let [z, o] = super::known_words(r, cx, sc.order[c])?.0.unwrap_or([0, 0]);
         tmp_time("exh.known", t0);
         sc.syms.clear();
         sc.syms.push((c as u32, sc.demand[c] & !(z | o)));
         base = o & sc.demand[c];
-        cut_at = !tmp_off("BW_OLD_EXH");
+        cut_at = true;
         total = sc.syms[0].1.count_ones();
         cut = Some(c);
     }
@@ -2265,7 +2262,7 @@ fn drop_noise(
         // the atom, and no certificate proves the drop. (Nearly every atom is read: the
         // refutation sample of 64 points, built and evaluated for each, was three quarters
         // of the time spent here.)
-        if !tmp_off("BW_NO_DROP_PROBE") && reads_var(r, &read, v)? {
+        if reads_var(r, &read, v)? {
             tmp_time("dn=probe", t0);
             continue;
         }
@@ -2376,34 +2373,14 @@ fn sweep_cut_at(
     // 3,404 questions in 140 slow questions, 1,066 held a block declined at the same cut:
     // asked all the same, none of those was answered; 333 of the others were.)
     let over = over_declined(r, cx, n, c, &bindings.atoms);
-    if over && !tmp_off("BW_NO_CUT_OVER") {
+    if over {
         tmp_time("sc.at=over", t0);
         r.cut_declined.entry(c).or_default().insert(n, ());
         return Ok(None);
     }
     let t0 = std::time::Instant::now();
-    if tmp_off("BW_PROF_CUT") {
-        eprintln!("CUTAT n={n} c={c} atoms={:?}", bindings.atoms);
-    }
     let answer = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)?;
     tmp_time("sc.at.answer", t0);
-    if over {
-        // (temporary) With `BW_NO_CUT_OVER`: what the questions not asked would have got.
-        tmp_time(
-            if matches!(answer, Cut::Proved(_)) {
-                "sc.over=answered"
-            } else {
-                "sc.over=not"
-            },
-            t0,
-        );
-    }
-    if tmp_off("BW_PROF_CUT") {
-        eprintln!(
-            "CUTRES n={n} c={c} some={}",
-            matches!(answer, Cut::Proved(_))
-        );
-    }
     match answer {
         Cut::Proved(expr) => Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?)),
         Cut::Declined => {
@@ -2485,23 +2462,6 @@ fn cut_answer(
     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
     tmp_time("ca.solve", t0);
     tmp_prof("ca.solve", spent);
-    if tmp_off("BW_PROF_CUT") {
-        let kind = match &answer {
-            MbaAnswer::Simplified { expr, .. } => format!("simplified:{}", expr.nodes().len()),
-            MbaAnswer::NoSimpler => "nosimpler".into(),
-            MbaAnswer::Unsupported(why) => format!("unsupported:{why}"),
-            MbaAnswer::Exhausted => "exhausted".into(),
-        };
-        eprintln!(
-            "CUT key={:x}{:x} nodes={} vars={} w={:?} limit={limit} spent={spent} us={} answer={kind}",
-            m.key()[0],
-            m.key()[1],
-            m.nodes().len(),
-            m.vars().len(),
-            m.width().map(|w| w.bits()),
-            t0.elapsed().as_micros(),
-        );
-    }
     r.meter.charge(Counter::MbaSteps, spent)?;
     let expr = match answer {
         MbaAnswer::Simplified { expr, .. } => expr,
@@ -2582,12 +2542,7 @@ fn readings_prove(
     // Each reading with its cost, and whether a refutation of it is one of `subject` (the
     // whole fragment, no open candidate cut out of it).
     let mut readings: Vec<(u64, Option<Reading>, bool, MbaExpr, Bindings)> = Vec::new();
-    let none = crate::hash::IdMap::default();
-    let open = if tmp_off("BW_NO_OPAQUE") {
-        &none
-    } else {
-        &r.mba_undecided
-    };
+    let open = &r.mba_undecided;
     if open.contains_key(&subject) {
         return Ok((false, false, false));
     }
@@ -2749,7 +2704,7 @@ fn readings_prove(
             // not yet asked are larger, and theirs would too. (Not the same reading asked
             // again through its atoms' known bits: that is one more question of this
             // reading, and the next reading has its own.)
-            let burned = !known && left_share < share / 2 && !tmp_off("BW_NO_BURN");
+            let burned = !known && left_share < share / 2;
             count(r).certificates.record(&report);
             {
                 let kind = match reading {
@@ -3475,13 +3430,6 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
     false
 }
 
-fn kept_steps() -> u64 {
-    std::env::var("BW_KEPT_STEPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(KEPT_STEPS)
-}
-
 /// One question to the solver takes at most this fraction of the call's solver steps (and at
 /// least [`SOLVE_SHARE_MIN`]). The solver's own limit is a million steps whatever the call
 /// has, so in a call of two million one question that ran out took half of them, a fragment
@@ -3536,7 +3484,7 @@ fn ask(
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
     let tq = std::time::Instant::now();
-    let held = !tmp_off("BW_NO_OUTGROWN") && holds_kept(r, cx, root, &bindings);
+    let held = holds_kept(r, cx, root, &bindings);
     tmp_time(if held { "ask.kept.yes" } else { "ask.kept.no" }, tq);
     if held {
         count(r).unsupported += 1;
@@ -3594,10 +3542,7 @@ fn ask(
                     // One question takes at most a share of the call's steps (see
                     // `SOLVE_SHARE`), and one the solver ran out of steps on is not asked
                     // again in this call with no more of them: the answer is the same.
-                    let share = match tmp_off("BW_NO_SOLVE_SHARE") {
-                        true => u64::MAX,
-                        false => (r.meter.limit.mba_steps / SOLVE_SHARE).max(SOLVE_SHARE_MIN),
-                    };
+                    let share = (r.meter.limit.mba_steps / SOLVE_SHARE).max(SOLVE_SHARE_MIN);
                     let limit = cfg
                         .budget
                         .steps
@@ -3645,7 +3590,7 @@ fn ask(
                         );
                     }
                     r.meter.charge(Counter::MbaSteps, spent)?;
-                    if a == MbaAnswer::Exhausted && !tmp_off("BW_NO_SOLVE_SHARE") {
+                    if a == MbaAnswer::Exhausted {
                         // A fragment that holds this one is no smaller a question.
                         r.mba_exhausted.insert(key, limit);
                         r.mba_kept.insert(root, ());
@@ -3661,7 +3606,7 @@ fn ask(
                     }
                     let kept = match &a {
                         MbaAnswer::Unsupported(why) => why.starts_with("too many"),
-                        MbaAnswer::NoSimpler => spent >= kept_steps(),
+                        MbaAnswer::NoSimpler => spent >= KEPT_STEPS,
                         _ => false,
                     };
                     if kept {

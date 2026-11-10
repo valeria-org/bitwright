@@ -2827,12 +2827,10 @@ impl Runner<'_, '_> {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             if round > 0 {
                 let t0 = std::time::Instant::now();
-                if std::env::var_os("BW_NO_RESWEEP").is_none() {
-                    let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
-                    if swept != cur {
-                        fin = fin.and(Fin::relying(self.assumed()));
-                        cur = swept;
-                    }
+                let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
+                if swept != cur {
+                    fin = fin.and(Fin::relying(self.assumed()));
+                    cur = swept;
                 }
                 pass::mba::tmp_time("T.resweep", t0);
                 let t0 = std::time::Instant::now();
