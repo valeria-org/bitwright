@@ -337,12 +337,20 @@ pub(crate) fn constants(nodes: &[MNode]) -> Vec<Option<BitVec>> {
     let mut cst: Vec<Option<BitVec>> = Vec::with_capacity(nodes.len());
     for n in nodes {
         let k = n.op.arity();
-        let a = if k > 0 { cst[n.args[0] as usize] } else { None };
-        let b = if k > 1 { cst[n.args[1] as usize] } else { None };
+        let a = if k > 0 {
+            cst[n.args[0] as usize].as_ref()
+        } else {
+            None
+        };
+        let b = if k > 1 {
+            cst[n.args[1] as usize].as_ref()
+        } else {
+            None
+        };
         let v = if matches!(n.op, MOp::Var(_)) || (k > 0 && a.is_none()) || (k > 1 && b.is_none()) {
             None
         } else {
-            apply(n, a.as_ref(), b.as_ref())
+            apply(n, a, b)
         };
         cst.push(v);
     }
