@@ -2839,6 +2839,52 @@ rule select_else_same<W>(c: 1, x: W, y: W, z: W) { select(c, x, select(c, y, z))
 
 - `select(p <u q, r, select(p <u q, p, q))` → `select(p <u q, r, q)`
 
+#### `select_then_ne_eq` — rule
+
+The opposite comparison in the chosen arm: there it does not hold.
+
+```text
+rule select_then_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, select(a == b, x, y), z) => select(a != b, y, z)
+    }
+```
+
+- `select(p != q, select(p == q, r, s), t)` → `select(p != q, s, t)`
+
+#### `select_else_ne_eq` — rule
+
+The opposite comparison in the other arm: there it holds.
+
+```text
+rule select_else_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, x, select(a == b, y, z)) => select(a != b, x, y)
+    }
+```
+
+- `select(p != q, r, select(p == q, s, t))` → `select(p != q, r, s)`
+
+#### `select_then_eq_ne` — rule
+
+Likewise under an equality.
+
+```text
+rule select_then_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, select(a != b, x, y), z) => select(a == b, y, z)
+    }
+```
+
+- `select(p == q, select(p != q, r, s), t)` → `select(p == q, s, t)`
+
+#### `select_else_eq_ne` — rule
+
+```text
+rule select_else_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, x, select(a != b, y, z)) => select(a == b, x, y)
+    }
+```
+
+- `select(p == q, r, select(p != q, s, t))` → `select(p == q, r, s)`
+
 #### `select_eq_then` — rule
 
 Choosing `x` when it equals `y`, else `y`: always `y` (`==` is commutative, so this is

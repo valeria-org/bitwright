@@ -1156,6 +1156,25 @@ group core.select_idioms {
     /// The same condition again in the other arm.
     #[example("select(p <u q, r, select(p <u q, p, q))" => "select(p <u q, r, q)")]
     rule select_else_same<W>(c: 1, x: W, y: W, z: W) { select(c, x, select(c, y, z)) => select(c, x, z) }
+    /// The opposite comparison in the chosen arm: there it does not hold.
+    #[example("select(p != q, select(p == q, r, s), t)" => "select(p != q, s, t)")]
+    rule select_then_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, select(a == b, x, y), z) => select(a != b, y, z)
+    }
+    /// The opposite comparison in the other arm: there it holds.
+    #[example("select(p != q, r, select(p == q, s, t))" => "select(p != q, r, s)")]
+    rule select_else_ne_eq<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a != b, x, select(a == b, y, z)) => select(a != b, x, y)
+    }
+    /// Likewise under an equality.
+    #[example("select(p == q, select(p != q, r, s), t)" => "select(p == q, s, t)")]
+    rule select_then_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, select(a != b, x, y), z) => select(a == b, y, z)
+    }
+    #[example("select(p == q, r, select(p != q, s, t))" => "select(p == q, r, s)")]
+    rule select_else_eq_ne<V, W>(a: V, b: V, x: W, y: W, z: W) {
+        select(a == b, x, select(a != b, y, z)) => select(a == b, x, y)
+    }
     /// Choosing `x` when it equals `y`, else `y`: always `y` (`==` is commutative, so this is
     /// also `select(y == x, x, y)`).
     #[example("select(p == q, p, q)" => "q")]
