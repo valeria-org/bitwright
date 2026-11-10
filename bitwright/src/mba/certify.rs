@@ -4249,9 +4249,10 @@ impl Compose {
     /// The skeleton of node `root` (read as a term): atoms become variables of `vm`, one per
     /// class (the class's own variable when it has one).
     fn skeleton(&mut self, root: u32, policy: Policy, vm: &mut VarMap) -> Option<Vec<SkelNode>> {
-        let mut out: Vec<SkelNode> = Vec::new();
+        let mut out: Vec<SkelNode> = Vec::with_capacity(16);
         let mut memo = SkelMemo::new(self.nodes.len());
-        let mut stack: Vec<(u32, Ctx, bool)> = vec![(root, Ctx::Arith, false)];
+        let mut stack: Vec<(u32, Ctx, bool)> = Vec::with_capacity(16);
+        stack.push((root, Ctx::Arith, false));
         // Under `Policy::Reps`, atoms read as their representative: the atom's skeleton is the
         // representative's (whose leaves are of earlier classes, so this ends).
         let mut alias: HashMap<u32, u32> = HashMap::default();
@@ -4259,7 +4260,12 @@ impl Compose {
             if memo.contains(i, ctx) {
                 continue;
             }
-            let n = self.nodes[i as usize];
+            // (The node's fields are read where they are: a node is 96 bytes, copied per
+            // visit otherwise.)
+            let (width, args_of) = {
+                let n = &self.nodes[i as usize];
+                (n.width, n.args)
+            };
             if expanded && let Some(&r) = alias.get(&i) {
                 let at = memo.get(r, ctx)?;
                 memo.insert(i, ctx, at);
@@ -4280,14 +4286,14 @@ impl Compose {
                     let c = self.find(i);
                     let v = match self.var_member[c as usize] {
                         Some(vi) => match self.nodes[vi as usize].op {
-                            MOp::Var(x) => vm.orig(x, n.width),
+                            MOp::Var(x) => vm.orig(x, width),
                             _ => return None,
                         },
-                        None => vm.class(c, n.width),
+                        None => vm.class(c, width),
                     };
                     out.push(SkelNode::Var(v));
-                } else if let MOp::Var(x) = n.op {
-                    let v = vm.orig(x, n.width);
+                } else if let MOp::Var(x) = self.nodes[i as usize].op {
+                    let v = vm.orig(x, width);
                     out.push(SkelNode::Var(v));
                 } else {
                     let sub = match self.role[i as usize] {
@@ -4296,7 +4302,8 @@ impl Compose {
                         _ => Ctx::Arith,
                     };
                     stack.push((i, ctx, true));
-                    for &k in &n.args[..n.op.arity()] {
+                    let arity = self.nodes[i as usize].op.arity();
+                    for &k in &args_of[..arity] {
                         stack.push((k, sub, false));
                     }
                     continue;
@@ -4309,11 +4316,12 @@ impl Compose {
                 Role::Not => ctx,
                 _ => Ctx::Arith,
             };
+            let op = self.nodes[i as usize].op;
             let mut args = [0u32; 2];
-            for (k, &a) in n.args[..n.op.arity()].iter().enumerate() {
+            for (k, &a) in args_of[..op.arity()].iter().enumerate() {
                 args[k] = memo.get(a, sub)?;
             }
-            out.push(SkelNode::Op(n.op, args));
+            out.push(SkelNode::Op(op, args));
             memo.insert(i, ctx, out.len() as u32 - 1);
         }
         // The root is the last node built for it.
