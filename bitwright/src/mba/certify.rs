@@ -2026,6 +2026,105 @@ pub(crate) fn lower_known_bits(m: &MbaExpr) -> Option<MbaExpr> {
 /// that is no bitwise term stays a sum (`(x << 4) + (y & 15)` is linear as it is). `None`
 /// when there is none.
 pub(crate) fn raise_disjoint(m: &MbaExpr) -> Option<MbaExpr> {
+    // Every certificate asks this of both sides first; up to 64 bits the known bits are
+    // machine words.
+    if m.nodes().iter().all(|n| n.width.bits() <= 64) {
+        let raised = raise_disjoint_words(m);
+        debug_assert_eq!(
+            raised,
+            raise_disjoint_any(m),
+            "sums read over words differ from sums read over values"
+        );
+        return raised;
+    }
+    raise_disjoint_any(m)
+}
+
+/// [`raise_disjoint`] when no node is wider than 64 bits: the same known bits, as words, and
+/// the expression rebuilt only when a sum or difference is read otherwise.
+fn raise_disjoint_words(m: &MbaExpr) -> Option<MbaExpr> {
+    let nodes = m.nodes();
+    let word = |v: &BitVec| <u64 as Lane>::from_bv(v);
+    // The known-zero and known-one bits of each node, and whether it is a bitwise term.
+    let mut bits: Vec<(u64, u64)> = Vec::with_capacity(nodes.len());
+    let mut term: Vec<bool> = Vec::with_capacity(nodes.len());
+    // Per node: 0 as it is, 1 read as `|`, 2 read as `^`.
+    let mut read: Vec<u8> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for n in nodes {
+        let at = |k: usize| bits[n.args[k] as usize];
+        let terms = |k: usize| term[n.args[k] as usize];
+        let or = |(za, oa): (u64, u64), (zb, ob): (u64, u64)| (za & zb, oa | ob);
+        let xor = |(za, oa): (u64, u64), (zb, ob): (u64, u64)| {
+            ((za & zb) | (oa & ob), (za & ob) | (oa & zb))
+        };
+        let width = n.width.bits();
+        let ones = <u64 as Lane>::mask(n.width);
+        let (as_op, known, is_term) = match n.op {
+            MOp::Const(v) => (0, (!word(&v) & ones, word(&v)), true),
+            MOp::Not => (0, (at(0).1, at(0).0), true),
+            MOp::And => {
+                let ((za, oa), (zb, ob)) = (at(0), at(1));
+                (0, (za | zb, oa & ob), true)
+            }
+            MOp::Or => (0, or(at(0), at(1)), true),
+            MOp::Xor => (0, xor(at(0), at(1)), true),
+            MOp::Zext => {
+                let (z, o) = at(0);
+                let low = <u64 as Lane>::mask(nodes[n.args[0] as usize].width);
+                (0, (z | (ones & !low), o), terms(0))
+            }
+            MOp::Trunc => {
+                let (z, o) = at(0);
+                (0, (z & ones, o & ones), terms(0))
+            }
+            MOp::Shl(k) => {
+                let (z, o) = at(0);
+                let shl = |x: u64| if k >= width { 0 } else { (x << k) & ones };
+                let low = !shl(ones) & ones;
+                (0, (shl(z) | low, shl(o)), false)
+            }
+            MOp::LShr(k) => {
+                let (z, o) = at(0);
+                let lshr = |x: u64| if k >= width { 0 } else { x >> k };
+                let high = !lshr(ones) & ones;
+                (0, (lshr(z) | high, lshr(o)), false)
+            }
+            // No bit set in both: no carry.
+            MOp::Add if terms(0) && terms(1) && (at(0).0 | at(1).0) == ones => {
+                (1, or(at(0), at(1)), true)
+            }
+            // The subtrahend's bits all among the minuend's: no borrow.
+            MOp::Sub if terms(0) && terms(1) && (at(0).1 | at(1).0) == ones => {
+                (2, xor(at(0), at(1)), true)
+            }
+            _ => (0, (0, 0), false),
+        };
+        changed |= as_op != 0;
+        bits.push(known);
+        term.push(is_term);
+        read.push(as_op);
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    for (n, &as_op) in nodes.iter().zip(&read) {
+        let op = match as_op {
+            1 => MOp::Or,
+            2 => MOp::Xor,
+            _ => n.op,
+        };
+        match op {
+            MOp::Zext | MOp::Sext | MOp::Trunc => out.push_cast(op, n.args[0], n.width).ok()?,
+            op => out.push(op, &n.args[..n.op.arity()]).ok()?,
+        };
+    }
+    Some(out)
+}
+
+/// [`raise_disjoint`] at any width.
+fn raise_disjoint_any(m: &MbaExpr) -> Option<MbaExpr> {
     use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_or, bv_shl};
     let nodes = m.nodes();
     // The known-zero and known-one bits of each node, and whether it is a bitwise term.
