@@ -108,6 +108,12 @@ impl core::hash::Hasher for TableHasher {
 type HashMap<K, V> =
     std::collections::HashMap<K, V, core::hash::BuildHasherDefault<TableHasher>>;
 
+/// A table of nodes with room for `nodes` of them (an entry is over a hundred bytes: growing
+/// the table as it fills moved every entry several times).
+fn node_table(nodes: usize) -> HashMap<MNode, u32> {
+    HashMap::with_capacity_and_hasher(nodes, Default::default())
+}
+
 /// The most points one test evaluates, whatever the budget.
 pub(crate) const MAX_POINTS: u64 = 1 << 24;
 
@@ -1477,8 +1483,9 @@ pub(crate) fn changes_of_variable(a: &MbaExpr, b: &MbaExpr) -> Vec<Change> {
         return Vec::new();
     }
     // Both sides in one hash-consed list, so a chain node of one is found in the other.
-    let mut nodes: Vec<MNode> = Vec::new();
-    let mut intern: HashMap<MNode, u32> = HashMap::default();
+    let total = a.nodes().len() + b.nodes().len();
+    let mut nodes: Vec<MNode> = Vec::with_capacity(total);
+    let mut intern: HashMap<MNode, u32> = node_table(total);
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
         let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -2534,8 +2541,10 @@ impl SkelMemo {
 
 impl Compose {
     fn new(a: &MbaExpr, b: &MbaExpr) -> Compose {
-        let mut nodes: Vec<MNode> = Vec::new();
-        let mut intern: HashMap<MNode, u32> = HashMap::default();
+        // Room for both sides and the nodes added to them (complements, bitwise forms).
+        let total = a.nodes().len() + b.nodes().len();
+        let mut nodes: Vec<MNode> = Vec::with_capacity(total + total / 2);
+        let mut intern: HashMap<MNode, u32> = node_table(total + total / 2);
         let mut roots = [0u32; 2];
         for (side, m) in [a, b].into_iter().enumerate() {
             let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
@@ -4439,8 +4448,9 @@ pub(crate) fn symbolic_equal(a: &MbaExpr, b: &MbaExpr, limit: u64, work: &mut u6
     }
     // Both sides in one hash-consed table, so equal subterms are one symbol.
     let tsc = std::time::Instant::now();
-    let mut canon: HashMap<MNode, u32> = HashMap::default();
-    let mut nodes: Vec<MNode> = Vec::new();
+    let total = a.nodes().len() + b.nodes().len();
+    let mut canon: HashMap<MNode, u32> = node_table(total);
+    let mut nodes: Vec<MNode> = Vec::with_capacity(total);
     let mut roots = [0u32; 2];
     for (side, m) in [a, b].into_iter().enumerate() {
         let mut map: Vec<u32> = Vec::with_capacity(m.nodes().len());
