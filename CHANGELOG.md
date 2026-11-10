@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+Found by looking for inputs that break the engine and the provers: random DAGs over a few
+narrow symbols at widths from 1 to 512 bits, every result, every fact and every answer of the
+provers checked at every assignment of the symbols; the same with symbols as wide as the
+expression and the native prover looking for a point between the samples; expressions 100 000
+levels deep and ladders of shared levels through every public operation; and the fuzz targets,
+half an hour each. No wrong result, fact or answer in 4 000 000 cases under five strategies
+and 48 of random phases. What did break:
+
+- **A result that changed again.** A pass tries several candidates at a node, and one declined
+  only because a part of the node has another user is declined for now, not for good: the
+  other user may go. The linear, xor, bitwise and compares passes and the MBA phase kept that
+  of their last candidate only, so a node whose first candidate was declined for sharing was
+  remembered as final, and once the other user was gone it stayed as written, in that context
+  only: `sext<32>(b) + 0x80000000 ^ 0x80000000` beside another use of the sum. Of 24 000
+  random expressions, the results of four changed again when simplified in a fresh context
+  (under each of the standard, decompile and deobfuscate strategies); of 1 660 000 after the
+  change, none.
+- **Deep chains of shifts.** Under `(e << k) | s` nested thousands of times only the last
+  levels reach the result, and the demanded-bits pass drops the rest. The walk is operands
+  first, so each level was simplified under the mask of the level above it, a window of
+  levels rebuilt and walked again at every one, before the walk reached the top: 3000 levels
+  took 6.4 s and built 126 655 nodes, 12 000 took 27 s, each `Completed`. A node 64 levels
+  or more above its leaves that observes an operand through a mask is now asked before its
+  operands are walked, and the levels out of its reach never are: 53 ms and 63 nodes, and
+  0.45 s at 12 000 levels. One question covers the nodes it read, so a deep expression with
+  nothing to drop is asked once per stretch of it.
+- **Questions of many symbols** (`prove::valid`, `prove::equal`). The symbols of a question,
+  and of its counterexample, were listed and looked up by a search of the list per symbol:
+  a question of 64 000 symbols that simplification had already decided took 12 s to answer,
+  one of 200 000 over two minutes. 0.13 s and 0.38 s.
+- **A panic in the MBA service at 128 bits.** A coefficient that is the sign bit of a 128-bit
+  word is `i128::MIN` as a signed number, and its `abs` overflows: a panic where overflow is
+  checked (debug builds), and elsewhere a negative size taken for a small one. 9 of 4 000 000
+  random cases reached it, all at 128 bits or more with the native MBA solver; their results
+  in a release build were right.
+
 ## 0.27.0
 
 Idioms of compiled and lifted code that every preset left as written, reported against 0.26.0.

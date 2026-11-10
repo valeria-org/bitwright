@@ -45,13 +45,94 @@ pub(crate) struct Same {
     /// Per (node, mask): the range of its leaves in `leaves`.
     map: IdMap<Key, (u32, u32)>,
     leaves: Vec<u32>,
+    /// The nodes asked before their operands were walked, and every node such a question
+    /// read (see [`first`]); `marking` while one is asked.
+    first: IdMap<u32, ()>,
+    marking: bool,
 }
 
 impl Same {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.leaves.clear();
+        self.first.clear();
+        self.marking = false;
     }
+}
+
+/// The height from which a node that observes an operand is asked before its operands are
+/// walked (see [`first`]): a deep expression, where levels may be out of every mask's reach.
+const FIRST_HEIGHT: u32 = 64;
+
+/// The operand `n` observes through a mask, and the mask: `x & k`, `x | k`, an extraction, a
+/// shift by a constant.
+fn observed(cx: &Context, n: u32) -> Option<(u32, BitVec)> {
+    let node = cx.node(n);
+    let w = cx.width_of(n);
+    match node.op {
+        OpCode::And | OpCode::Or => match (cx.const_val(node.a), cx.const_val(node.b)) {
+            (Some(k), None) | (None, Some(k)) => {
+                let x = if cx.const_val(node.a).is_some() {
+                    node.b
+                } else {
+                    node.a
+                };
+                let m = if node.op == OpCode::And {
+                    k
+                } else {
+                    bv_not(&k)
+                };
+                Some((x, m))
+            }
+            _ => None,
+        },
+        OpCode::Extract => {
+            let wa = cx.width_of(node.a);
+            let lo = BitVec::wrapping_from_u64(wa, u64::from(node.b));
+            let m = BitVec::bin_unchecked(BinOp::Shl, &low_mask(wa, u32::from(w.bits())), &lo);
+            Some((node.a, m))
+        }
+        OpCode::Shl | OpCode::LShr => cx.const_val(node.b).map(|k| {
+            let back = if node.op == OpCode::Shl {
+                BinOp::LShr
+            } else {
+                BinOp::Shl
+            };
+            (node.a, BitVec::bin_unchecked(back, &BitVec::ones(w), &k))
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the walk asks `n` before it walks `n`'s operands (see [`first`]).
+pub(crate) fn asks_first(r: &Runner<'_, '_>, cx: &Context, n: u32) -> bool {
+    cx.meta[n as usize].height >= FIRST_HEIGHT
+        && !r.demanded_same.first.contains_key(&n)
+        && observed(cx, n).is_some()
+}
+
+/// The pass at a tall node that observes an operand, before the walk has come to that operand:
+/// `Some` rewrite when it is taken, and the walk goes on from it. The walk is operands first,
+/// and so it simplified every level of a deep expression under the masks of the levels just
+/// above it before it reached the node whose mask leaves most of them unread: under
+/// `(e << k) | s` nested 3000 times only the last 64 bits' worth of levels reach the result,
+/// and each of the others was rebuilt over a window of 32 levels in turn, 6 s in all. Asked
+/// at the top first, the levels out of reach are never walked. One question covers what it
+/// read: the nodes in it are not asked first again, so a deep expression with nothing to drop
+/// is asked once per stretch of it, not once per node.
+pub(crate) fn first(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    r.demanded_same.first.insert(n, ());
+    r.demanded_same.marking = true;
+    let out = super::step(r, cx, PassKind::Demanded, n);
+    r.demanded_same.marking = false;
+    Ok(match out? {
+        Step::To(x, fin) => Some((x, fin)),
+        Step::Normal(_) => None,
+    })
 }
 
 /// Sorts `v` and moves its distinct values to the front: how many there are.
@@ -593,47 +674,13 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
 /// The demanded-bits pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
-    let w = cx.width_of(n);
     if let Some(x) = clears_known_zeros(r, cx, n)? {
         let before = cx.len() as u32;
         return finish(r, cx, PassKind::Demanded, n, x, before, &[x], Fin::FINAL);
     }
     // The operand observed through a mask, and the mask.
-    let (operand, mask): (u32, BitVec) = match node.op {
-        OpCode::And | OpCode::Or => match (cx.const_val(node.a), cx.const_val(node.b)) {
-            (Some(k), None) | (None, Some(k)) => {
-                let x = if cx.const_val(node.a).is_some() {
-                    node.b
-                } else {
-                    node.a
-                };
-                let m = if node.op == OpCode::And {
-                    k
-                } else {
-                    bv_not(&k)
-                };
-                (x, m)
-            }
-            _ => return Ok(Step::Normal(Fin::FINAL)),
-        },
-        OpCode::Extract => {
-            let wa = cx.width_of(node.a);
-            let lo = BitVec::wrapping_from_u64(wa, u64::from(node.b));
-            let m = BitVec::bin_unchecked(BinOp::Shl, &low_mask(wa, u32::from(w.bits())), &lo);
-            (node.a, m)
-        }
-        OpCode::Shl | OpCode::LShr => match cx.const_val(node.b) {
-            Some(k) => {
-                let back = if node.op == OpCode::Shl {
-                    BinOp::LShr
-                } else {
-                    BinOp::Shl
-                };
-                (node.a, BitVec::bin_unchecked(back, &BitVec::ones(w), &k))
-            }
-            None => return Ok(Step::Normal(Fin::FINAL)),
-        },
-        _ => return Ok(Step::Normal(Fin::FINAL)),
+    let Some((operand, mask)) = observed(cx, n) else {
+        return Ok(Step::Normal(Fin::FINAL));
     };
     let before = cx.len() as u32;
     let mut st = Demand {
@@ -648,6 +695,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         identities: Vec::new(),
     };
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
+    if r.demanded_same.marking {
+        for key in st.memo.keys() {
+            r.demanded_same.first.insert(key.0, ());
+        }
+    }
     // The operands this step found nothing to simplify under their masks are remembered for
     // the phase run (every mask over one shared chain re-walked it, once per mask, and asked
     // the facts again at every node): their values are fixed, so the answer is too. Not when

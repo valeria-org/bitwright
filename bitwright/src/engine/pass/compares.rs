@@ -1191,24 +1191,21 @@ fn exhaustive_mask_cases(
 /// The compares pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
-    if node.op == OpCode::Select
-        && let Some(step @ Step::To(..)) = arms_read(r, cx, n)?
-    {
-        return Ok(step);
+    if node.op == OpCode::Select {
+        // What `arms_read` declines contributes to the result (see the linear pass's `step`).
+        let declined = match arms_read(r, cx, n)? {
+            Some(Step::Normal(f)) => f,
+            Some(step) => return Ok(step),
+            None => Fin::FINAL,
+        };
+        return Ok(match order_step(r, cx, n)? {
+            Step::Normal(f) => Step::Normal(f.and(declined)),
+            step => step,
+        });
     }
-    if node.op == OpCode::Select && node.width > 1 {
-        return order_step(r, cx, n);
-    }
-    if node.width != 1
-        || !(boolean_op(node.op)
-            || node.op.as_cmp().is_some()
-            || float_cmp(node.op)
-            || node.op == OpCode::Select)
+    if node.width != 1 || !(boolean_op(node.op) || node.op.as_cmp().is_some() || float_cmp(node.op))
     {
         return Ok(Step::Normal(Fin::FINAL));
-    }
-    if node.op == OpCode::Select {
-        return order_step(r, cx, n);
     }
     if let Some(common) = exhaustive_mask_cases(r, cx, n)? {
         let before = cx.len() as u32;

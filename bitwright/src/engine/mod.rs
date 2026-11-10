@@ -1683,32 +1683,44 @@ impl Runner<'_, '_> {
                         continue;
                     }
                     let mba = !local && self.is_mba(phase);
-                    // In the MBA phase the question at the top of a fragment is asked first,
-                    // over the fragment as it is (see `pass::mba_first`); a rewrite is taken
-                    // as a pass's is below, with nothing to wait on.
+                    // A question asked before the operands are walked, over the node as it is.
+                    // In the MBA phase, the one at the top of a fragment (see
+                    // `pass::mba_first`); in the demanded-bits phase, the one of a tall node
+                    // that observes an operand (see `pass::demanded::first`). A rewrite is
+                    // taken as a pass's is below, with nothing to wait on.
+                    let mut first: Option<(u32, Fin)> = None;
                     #[cfg(feature = "mba")]
                     if mba && !self.first.contains_key(&n) {
                         self.explain = None;
                         let inner = self.inner;
-                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase]
-                            && let Some((r, fin)) = pass::mba_first(self, cx, cfg, n)?
-                        {
-                            stack.pop();
-                            if pending.contains_key(&r) {
-                                self.stats.cycles_cut += 1;
-                                self.retire(cx, n);
-                                self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
-                            } else {
-                                self.rewritten.insert((n, r), ());
-                                *pending.entry(n).or_default() += 1;
-                                self.live.replace(n, r);
-                                self.retire(cx, n);
-                                self.inherit_parent(n, r);
-                                stack.push(Frame::Finish(n, r, fin));
-                                stack.push(Frame::Visit(r));
-                            }
-                            continue;
+                        if let PhaseImpl::Mba(cfg) = &inner.phases[phase] {
+                            first = pass::mba_first(self, cx, cfg, n)?;
                         }
+                    }
+                    if matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::Demanded)
+                    ) && pass::demanded::asks_first(self, cx, n)
+                    {
+                        self.explain = None;
+                        first = pass::demanded::first(self, cx, n)?;
+                    }
+                    if let Some((r, fin)) = first {
+                        stack.pop();
+                        if pending.contains_key(&r) {
+                            self.stats.cycles_cut += 1;
+                            self.retire(cx, n);
+                            self.set(cx, phase, n, r, fin.and(Fin::PROVISIONAL));
+                        } else {
+                            self.rewritten.insert((n, r), ());
+                            *pending.entry(n).or_default() += 1;
+                            self.live.replace(n, r);
+                            self.retire(cx, n);
+                            self.inherit_parent(n, r);
+                            stack.push(Frame::Finish(n, r, fin));
+                            stack.push(Frame::Visit(r));
+                        }
+                        continue;
                     }
                     let mut waiting = false;
                     for c in node.children() {
