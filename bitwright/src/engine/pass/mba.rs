@@ -1651,6 +1651,14 @@ fn drop_noise(
     let mut dropped = false;
     for v in 0..read.vars().len() as u32 {
         let t0 = std::time::Instant::now();
+        // One input first: a block whose value there changes when the atom is zero reads
+        // the atom, and no certificate proves the drop. (Nearly every atom is read: the
+        // refutation sample of 64 points, built and evaluated for each, was three quarters
+        // of the time spent here.)
+        if !tmp_off("BW_NO_DROP_PROBE") && reads_var(r, &read, v)? {
+            tmp_time("dn=probe", t0);
+            continue;
+        }
         let Some(m0) = with_constant(&read, v) else {
             continue;
         };
@@ -1689,6 +1697,31 @@ fn drop_noise(
     }
     count(r).noise_atoms += 1;
     Ok(Some(r.build(cx, |cx| lift_id(cx, &read, &bindings))?))
+}
+
+/// Whether `m` is seen to read variable `v`: its value at one input (pseudo-random, splitmix64
+/// of each variable's index) differs from its value there with `v` zero. Charged as pass work.
+/// A filter, never evidence: `false` says nothing.
+fn reads_var(r: &mut Runner<'_, '_>, m: &MbaExpr, v: u32) -> Result<bool, Stop> {
+    let Some(&width) = m.vars().get(v as usize) else {
+        return Ok(false);
+    };
+    charge(r, m, m, 1)?;
+    let mut at: Vec<crate::BitVec> = m
+        .vars()
+        .iter()
+        .zip(0u64..)
+        .map(|(&w, i)| {
+            let mut z = i.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            crate::BitVec::wrapping_from_u64(w, z ^ (z >> 31))
+        })
+        .collect();
+    let with = m.eval(&at);
+    at[v as usize] = crate::BitVec::zero(width);
+    let without = m.eval(&at);
+    Ok(matches!((with, without), (Some(a), Some(b)) if a != b))
 }
 
 /// The most atoms [`drop_noise`] reads a block over.
