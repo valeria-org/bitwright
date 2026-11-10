@@ -189,12 +189,39 @@ mod tests {
             let vs = values(w);
             assert_eq!(one(w), BitVec::one(w));
             for v in [0u64, 1, 2, 3, 255, u64::MAX, 1 << 63] {
-                assert_eq!(small(w, v), BitVec::wrapping_from_u64(w, v), "{v} at {bits}");
+                assert_eq!(
+                    small(w, v),
+                    BitVec::wrapping_from_u64(w, v),
+                    "{v} at {bits}"
+                );
             }
-            for v in [0i128, 1, -1, 2, -2, 4, -4, i128::from(i64::MIN), i128::MAX, i128::MIN] {
-                assert_eq!(signed(w, v), BitVec::wrapping_from_i128(w, v), "{v} at {bits}");
+            for v in [
+                0i128,
+                1,
+                -1,
+                2,
+                -2,
+                4,
+                -4,
+                i128::from(i64::MIN),
+                i128::MAX,
+                i128::MIN,
+            ] {
+                assert_eq!(
+                    signed(w, v),
+                    BitVec::wrapping_from_i128(w, v),
+                    "{v} at {bits}"
+                );
             }
-            for k in [0u32, 1, 2, u32::from(bits) - 1, u32::from(bits), u32::from(bits) + 1, 600] {
+            for k in [
+                0u32,
+                1,
+                2,
+                u32::from(bits) - 1,
+                u32::from(bits),
+                u32::from(bits) + 1,
+                600,
+            ] {
                 assert_eq!(low_mask(w, k), known::low_mask(w, k), "{k} at {bits}");
             }
             for a in &vs {

@@ -11,8 +11,8 @@ use super::classes::{Classes, FULL};
 use super::index::Index;
 use super::poly::{Mono, Poly, Sym};
 use super::synth;
-use crate::engine::pass::bitwise::{T, min_forms, subtables};
 use super::word::{bv_and, bv_not, bv_or, bv_xor, count_ones, low_mask, trailing_zeros};
+use crate::engine::pass::bitwise::{T, min_forms, subtables};
 use crate::mba::certify;
 use crate::mba::expr::{MNode, MOp, MbaExpr};
 use crate::mba::solve::Verdict;
@@ -464,9 +464,10 @@ impl Builder {
                     }
                 }
             }
-            let one = r.first().map(|&i| super::word::one(self.nodes[i as usize].w));
-            rewritten =
-                one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(r));
+            let one = r
+                .first()
+                .map(|&i| super::word::one(self.nodes[i as usize].w));
+            rewritten = one.is_some_and(|one| !consts.contains(&one) && self.rewrites_shared(r));
         }
         (
             r.len() as u32 + amounts + unstable + u32::from(rewritten),
@@ -1213,8 +1214,7 @@ impl<'a> Render<'a> {
                 .filter(|&j| q >> j & 1 == 1)
                 .fold(0u64, |m, j| m | 1u64 << support[j]);
             if let Some(c) = self.conj(set) {
-                sum.terms
-                    .push((c, super::word::signed(w, i128::from(k))));
+                sum.terms.push((c, super::word::signed(w, i128::from(k))));
             }
         }
         out.push(self.sum(&sum));
@@ -2002,11 +2002,8 @@ impl<'a> Render<'a> {
                 let mut g = Poly::zero(w);
                 let mut exact = true;
                 for (set, dc) in &d {
-                    let a = super::word::bin(
-                        BinOp::Mul,
-                        &super::word::bin(BinOp::AShr, dc, &by),
-                        &inv,
-                    );
+                    let a =
+                        super::word::bin(BinOp::Mul, &super::word::bin(BinOp::AShr, dc, &by), &inv);
                     if super::word::bin(BinOp::Mul, &a, &k) != *dc {
                         exact = false;
                         break;
@@ -2183,9 +2180,13 @@ impl<'a> Render<'a> {
         // Per class: the constant's bit there, for the form and for its negation.
         let konst = q.konst();
         let class_bit = |v: &BitVec, c: usize| {
-            self.classes
-                .bit(v, c)
-                .map(|b| if b { super::word::one(w) } else { BitVec::zero(w) })
+            self.classes.bit(v, c).map(|b| {
+                if b {
+                    super::word::one(w)
+                } else {
+                    BitVec::zero(w)
+                }
+            })
         };
         let neg_konst = super::word::un(UnOp::Neg, &konst);
         let kbits: [Vec<Option<BitVec>>; 2] = [
@@ -2212,7 +2213,10 @@ impl<'a> Render<'a> {
                 if !with_konst && konst.is_zero() {
                     continue;
                 }
-                for (sign, kb) in [(super::word::one(w), &kbits[0]), (BitVec::ones(w), &kbits[1])] {
+                for (sign, kb) in [
+                    (super::word::one(w), &kbits[0]),
+                    (BitVec::ones(w), &kbits[1]),
+                ] {
                     // The table of `±(form − Σ βᵢ·xᵢ)` in each class: its constant's bit plus
                     // the corner sums, each 0 or 1.
                     let fits = (0..n).all(|c| {
@@ -2225,11 +2229,8 @@ impl<'a> Render<'a> {
                             return false;
                         };
                         (0..entries).all(|p| {
-                            let d = super::word::bin(
-                                BinOp::Mul,
-                                &sign,
-                                &sub(&corner[c][p], &bsum[p]),
-                            );
+                            let d =
+                                super::word::bin(BinOp::Mul, &sign, &sub(&corner[c][p], &bsum[p]));
                             bit(&add(&k0, &d), c)
                         })
                     });
@@ -2909,13 +2910,8 @@ impl<'a> Render<'a> {
             let m = mobius(&[u64::from(t)], 2);
             let mut rest = p.clone();
             let neg = |c: &BitVec| super::word::un(UnOp::Neg, c);
-            let kg = |v: i64| {
-                super::word::bin(
-                    BinOp::Mul,
-                    &k,
-                    &super::word::signed(w, i128::from(v)),
-                )
-            };
+            let kg =
+                |v: i64| super::word::bin(BinOp::Mul, &k, &super::word::signed(w, i128::from(v)));
             // g = −m₀ + Σ m_T·AND_T.
             rest.add_term(Mono::new(), &kg(m[0]));
             for (q, &v) in m.iter().enumerate().skip(1) {
@@ -3117,11 +3113,8 @@ impl<'a> Render<'a> {
                     }
                     let c = coef.get(&set_of(q)).copied().unwrap_or(BitVec::zero(w));
                     match (-4i64..=4).find(|&v| {
-                        super::word::bin(
-                            BinOp::Mul,
-                            &s,
-                            &super::word::signed(w, i128::from(v)),
-                        ) == c
+                        super::word::bin(BinOp::Mul, &s, &super::word::signed(w, i128::from(v)))
+                            == c
                     }) {
                         Some(v) => *slot = v,
                         None => {
@@ -3191,11 +3184,7 @@ impl<'a> Render<'a> {
                     }
                     let mut rest = p.clone();
                     let sv = |v: i64| {
-                        super::word::bin(
-                            BinOp::Mul,
-                            &s,
-                            &super::word::signed(w, i128::from(v)),
-                        )
+                        super::word::bin(BinOp::Mul, &s, &super::word::signed(w, i128::from(v)))
                     };
                     // f = −m_∅ + Σ m_T·AND_T.
                     rest.add_term(Mono::new(), &sv(m[0]));
@@ -3948,8 +3937,7 @@ impl<'a> Render<'a> {
             for &base in &distinct {
                 let mut sum = Sum {
                     terms: Vec::new(),
-                    konst: (!base.is_zero())
-                        .then(|| super::word::bin(BinOp::Mul, &base, mask)),
+                    konst: (!base.is_zero()).then(|| super::word::bin(BinOp::Mul, &base, mask)),
                 };
                 for &val in distinct.iter().filter(|&&x| x != base) {
                     let mut tt = 0u8;
@@ -4065,11 +4053,8 @@ impl<'a> Render<'a> {
                     &super::word::bin(BinOp::Mul, &step, &super::word::small(w, j)),
                 );
                 let fits = wide.iter().all(|&q| {
-                    super::word::bin(
-                        BinOp::Mul,
-                        &c,
-                        &super::word::signed(w, i128::from(a[q])),
-                    ) == d[q]
+                    super::word::bin(BinOp::Mul, &c, &super::word::signed(w, i128::from(a[q])))
+                        == d[q]
                 });
                 if fits {
                     chosen = Some(c);
@@ -4089,11 +4074,7 @@ impl<'a> Render<'a> {
                 terms: vec![(gm, c)],
                 konst: Some(super::word::un(
                     UnOp::Neg,
-                    &super::word::bin(
-                        BinOp::Mul,
-                        &super::word::bin(BinOp::Mul, &c, &a0),
-                        mask,
-                    ),
+                    &super::word::bin(BinOp::Mul, &super::word::bin(BinOp::Mul, &c, &a0), mask),
                 )),
             };
             for (j, &x) in atoms.iter().enumerate() {
@@ -4101,11 +4082,7 @@ impl<'a> Render<'a> {
                 let r = super::word::bin(
                     BinOp::Sub,
                     &d[q],
-                    &super::word::bin(
-                        BinOp::Mul,
-                        &c,
-                        &super::word::signed(w, i128::from(a[q])),
-                    ),
+                    &super::word::bin(BinOp::Mul, &c, &super::word::signed(w, i128::from(a[q]))),
                 );
                 if !r.is_zero() {
                     let xm = self.masked(x, mask);

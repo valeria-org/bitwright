@@ -1250,10 +1250,7 @@ fn sign_view(p: &Poly, classes: &Classes) -> Option<(u16, Bits)> {
         }
     }
     let mut body = q.clone();
-    body.add_term(
-        Mono::new(),
-        &self::word::un(crate::ops::UnOp::Neg, &konst),
-    );
+    body.add_term(Mono::new(), &self::word::un(crate::ops::UnOp::Neg, &konst));
     if body != expect {
         return None;
     }
@@ -1862,10 +1859,7 @@ fn more_forms(n: &Normal, work: &mut Steps) -> Result<Vec<Poly>, Decline> {
         }
         // v = α⁻¹·(n − (d − α·v)).
         let mut rest = d.clone();
-        rest.add_term(
-            m.clone(),
-            &self::word::un(crate::ops::UnOp::Neg, alpha),
-        );
+        rest.add_term(m.clone(), &self::word::un(crate::ops::UnOp::Neg, alpha));
         let mut r = Poly::sym(
             w,
             Sym {
@@ -2042,16 +2036,13 @@ fn eliminate_var(p: &Poly, a: u32, d: &Poly, vars: u32, whole: u16) -> Option<Po
         matches!(m.as_slice(), [(s, 1)] if s.set.count_ones() == 1
             && s.set.trailing_zeros() < vars
             && (s.class == whole || s.class == FULL)
-            && p.terms().contains_key(*m))
+            && p.terms().contains_key(m))
             && c.bit(0) == Some(true)
     })?;
     let v = m[0].0;
     // v = α⁻¹·(a − (d − α·v)).
     let mut rest = d.clone();
-    rest.add_term(
-        m.clone(),
-        &self::word::un(crate::ops::UnOp::Neg, alpha),
-    );
+    rest.add_term(m.clone(), &self::word::un(crate::ops::UnOp::Neg, alpha));
     let r = Poly::sym(
         w,
         Sym {
@@ -2189,9 +2180,7 @@ fn drop_dependent_atoms(
             _ => return Ok(()),
         }
     }
-    let prec = |c: usize| {
-        self::word::low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)))
-    };
+    let prec = |c: usize| self::word::low_mask(w, u32::from(w.bits()) - u32::from(classes.low(c)));
     for (c, v) in val.iter_mut().enumerate() {
         for b in 0..k {
             for q in 0..1usize << k {
@@ -2259,8 +2248,7 @@ fn drop_dependent_atoms(
         for b in 0..kk {
             for q in 0..1usize << kk {
                 if q >> b & 1 == 1 {
-                    coef[q] =
-                        self::word::bin(crate::ops::BinOp::Sub, &coef[q], &coef[q ^ 1 << b]);
+                    coef[q] = self::word::bin(crate::ops::BinOp::Sub, &coef[q], &coef[q ^ 1 << b]);
                 }
             }
         }

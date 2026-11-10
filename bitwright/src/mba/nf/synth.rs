@@ -105,7 +105,7 @@ fn fold(v: &Values, mask: u64) -> u64 {
         0x3c6e_f372_fe94_f82b,
         0xa54f_f53a_5f1d_36f1,
     ];
-    for x in v.chunks_exact(4) {
+    for x in v.as_chunks::<4>().0 {
         for k in 0..4 {
             h[k] = (h[k].rotate_left(27) ^ (x[k] & mask)).wrapping_mul(K);
         }

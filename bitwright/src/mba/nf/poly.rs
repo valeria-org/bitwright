@@ -740,11 +740,10 @@ impl Poly {
             .iter()
             .filter(|(m, _)| !m.is_empty())
             .map(|(m, c)| {
-                m.iter()
-                    .fold(super::word::trailing_zeros(c), |k, &(s, e)| {
-                        let low = u32::from(classes.low(usize::from(s.class)));
-                        k.saturating_add(low.saturating_mul(e))
-                    })
+                m.iter().fold(super::word::trailing_zeros(c), |k, &(s, e)| {
+                    let low = u32::from(classes.low(usize::from(s.class)));
+                    k.saturating_add(low.saturating_mul(e))
+                })
             })
             .min()
             .unwrap_or(bits)

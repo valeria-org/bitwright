@@ -9,8 +9,8 @@
 
 use super::classes::Classes;
 use super::poly::{Mono, Poly, Sym};
-use crate::BitVec;
 use super::word::{bv_and, low_mask};
+use crate::BitVec;
 use crate::ops::BinOp;
 
 /// The most atoms one bitwise function may depend on (a table has 2^s entries).

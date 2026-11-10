@@ -68,9 +68,14 @@ The causes found so far, none specific to those expressions.
   call's solver steps at most, and one that ran out is not asked again in the call with no
   more of them. No answer committed in the 140 questions took more than that.
 
-How long those questions take, on the same 140: what follows cut their total from 85 s of
-CPU to under 25 s (each question in its own process, the engine's tables already built),
-with more of them simplified further than before.
+How long those questions take, on the same 140: what follows cut their total CPU time to a
+fifth (86 s to 17 s, run back to back on a loaded machine, each question in its own process
+with the engine's tables already built). The median question went from 600 ms to 120 ms, and
+of the 128 that took a quarter of a second or more, five still do. More of them are
+simplified further than before: 19,164 nodes left over the 44 `forms_simplify` roots where
+there were 22,701, 23 of the 47 `engine` roots folded to a constant where 16 were, 10 of the
+27 equalities proved and 13 refuted where 5 and 10 were, none of the 43 prover questions too
+large to blast where 4 were.
 
 - **The sweep keeps the inputs its enumerations miss at.** An enumeration that ends where the
   candidate is not its constant now keeps that input for the call, and every later candidate
@@ -100,6 +105,16 @@ with more of them simplified further than before.
   nodes; sums were read as bitwise through wide values at 64 bits. The sample's
   seed-independent points are compared before the seed is hashed, which is where all but
   five of 13,621 sample refutations are found.
+- **The normal-form solver takes the same steps in 58% of the time**, with the same answer
+  and the same step count for every one of 9,742 recorded questions. A fifth of its time
+  outside its certificates was the allocator and a quarter touched tree maps: monomials now
+  hold their factors in place and a polynomial's terms are a sorted vector up to 64;
+  sums merge, and scaling and the reductions work in place; a candidate rendering is
+  walked, costed and finished without allocating, and its nodes are interned through a
+  small index; coefficient arithmetic takes one machine word up to 64 bits; the corner sums
+  of a bitwise function take a word each; a linear form is expanded once for its three
+  decompositions; the synthesis table's per-width indexes are built once per process behind
+  a cheap hash.
 - **The sweep's reductions share what they find.** Every candidate is first taken on the bits
   its users read (`demanded::reduced`), and each call walked the whole of what the calls
   below it had walked. What one finds for a node under a mask is kept for the call, up to
