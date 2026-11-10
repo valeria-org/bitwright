@@ -960,8 +960,12 @@ fn constant_pool(ms: &[&MbaExpr]) -> Vec<BitVec> {
         .collect();
     consts.sort();
     consts.dedup();
-    let mut pool: Vec<BitVec> = Vec::new();
-    for c in consts {
+    // The first `POOL` distinct values in this order: later constants cannot change them, so
+    // the walk ends when the pool is full (with many constants it was quadratic in all of
+    // them, for entries that were then cut off).
+    const POOL: usize = 32;
+    let mut pool: Vec<BitVec> = Vec::with_capacity(POOL);
+    'fill: for c in consts {
         let one = BitVec::one(c.width());
         for v in [
             c,
@@ -972,10 +976,12 @@ fn constant_pool(ms: &[&MbaExpr]) -> Vec<BitVec> {
         ] {
             if !pool.contains(&v) {
                 pool.push(v);
+                if pool.len() == POOL {
+                    break 'fill;
+                }
             }
         }
     }
-    pool.truncate(32);
     pool
 }
 
@@ -1053,7 +1059,7 @@ pub(crate) fn sample_points(vars: &[Width], ms: &[&MbaExpr], seed: u64) -> Vec<V
         pts.push(
             vars.iter()
                 .map(|&w| {
-                    let limbs: Vec<u64> = (0..8).map(|_| next_word(&mut state)).collect();
+                    let limbs: [u64; 8] = std::array::from_fn(|_| next_word(&mut state));
                     BitVec::wrapping_from_limbs(w, &limbs)
                 })
                 .collect(),
