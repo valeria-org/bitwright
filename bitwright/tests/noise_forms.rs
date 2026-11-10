@@ -52,14 +52,14 @@ fn a_rotate_spelled_as_its_shifts_beside_it_is_read_as_one_value() {
                 let b = hi & 0x8d49e7e8b8753b4a; \
                 (~(lo ^ 0x72b61817478ac4b5) & hi) * 3 + (lo & 0x72b61817478ac4b5 | hi) \
                 + (rotl(t, 2) & 0x8d49e7e8b8753b4a) - (a + a) - (b + b)";
-    assert_eq!(
-        noise_forms(text, true),
-        ("rotl(x + 0xd7ae41bcb1c1992c, 2)".to_owned(), true)
-    );
-    assert_ne!(
-        noise_forms(text, false).0,
-        "rotl(x + 0xd7ae41bcb1c1992c, 2)"
-    );
+    // The MBA phase reads the slices of one rotation as that rotation whatever its
+    // configuration: with the noise forms or without.
+    for forms in [true, false] {
+        assert_eq!(
+            noise_forms(text, forms),
+            ("rotl(x + 0xd7ae41bcb1c1992c, 2)".to_owned(), true)
+        );
+    }
 }
 
 #[test]
