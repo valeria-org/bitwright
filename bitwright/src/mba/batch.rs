@@ -443,26 +443,24 @@ impl Program {
     }
 
     /// Evaluates `n` points: `inputs[v][p]` is variable `v` at point `p`; afterwards
-    /// `regs[r][p]` is register `r` at point `p`. `regs` is resized as needed.
+    /// `regs[r][..n]` is register `r` at those points. `regs` is resized as needed.
     pub(crate) fn run<L: Lane>(&self, regs: &mut Vec<Vec<L>>, inputs: &[Vec<L>], n: usize) {
         if regs.len() < self.ins.len() {
             regs.resize_with(self.ins.len(), Vec::new);
         }
         for (r, ins) in self.ins.iter().enumerate() {
             let (lo, hi) = regs.split_at_mut(r);
+            // Each register is written once, in full: nothing is filled in first.
             let out = &mut hi[0];
-            if out.len() < n {
-                out.resize(n, L::default());
-            }
-            let out = &mut out[..n];
+            out.clear();
             let m = L::mask(ins.w);
             let a = || &lo[ins.a as usize][..n];
             let b = || &lo[ins.b as usize][..n];
             match ins.op {
-                Op::Const(c) => out.fill(L::from_bv(&self.consts[c as usize])),
+                Op::Const(c) => out.resize(n, L::from_bv(&self.consts[c as usize])),
                 Op::Var(v) => match inputs.get(v as usize) {
-                    Some(col) if col.len() >= n => out.copy_from_slice(&col[..n]),
-                    _ => out.fill(L::default()),
+                    Some(col) if col.len() >= n => out.extend_from_slice(&col[..n]),
+                    _ => out.resize(n, L::default()),
                 },
                 Op::Add => zip2(out, a(), b(), |x, y| L::add(x, y, m)),
                 Op::Sub => zip2(out, a(), b(), |x, y| L::sub(x, y, m)),
@@ -517,16 +515,14 @@ impl Program {
     }
 }
 
+/// `out` (empty) becomes `f` of each lane of `a`.
 #[inline]
-fn zip1<L: Copy>(out: &mut [L], a: &[L], f: impl Fn(L) -> L) {
-    for (o, &x) in out.iter_mut().zip(a) {
-        *o = f(x);
-    }
+fn zip1<L: Copy>(out: &mut Vec<L>, a: &[L], f: impl Fn(L) -> L) {
+    out.extend(a.iter().map(|&x| f(x)));
 }
 
+/// `out` (empty) becomes `f` of each pair of lanes of `a` and `b`.
 #[inline]
-fn zip2<L: Copy>(out: &mut [L], a: &[L], b: &[L], f: impl Fn(L, L) -> L) {
-    for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
-        *o = f(x, y);
-    }
+fn zip2<L: Copy>(out: &mut Vec<L>, a: &[L], b: &[L], f: impl Fn(L, L) -> L) {
+    out.extend(a.iter().zip(b).map(|(&x, &y)| f(x, y)));
 }
