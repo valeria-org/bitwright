@@ -150,7 +150,7 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 9,218 nodes together
+folds with half of theirs), the 44 `forms_simplify` roots are left at 9,209 nodes together
 (19,164), all 16 `valid_under` questions are proved (3) and every one of the 27 equalities is
 decided, 14 proved and 13 refuted (10 and 13, four out of budget). The questions also take
 less time than before these changes: 15% less CPU over the set run back to back, none of them
@@ -207,6 +207,10 @@ a quarter of a second, the median 75 ms.
   product of such a term with another value was proved by a sparse test over two variables,
   1.6 million units of pass work for a 20-node question, four times in one call that then ran
   out.
+- **A sum that spells another is asked a group at a time.** `A + p·q + B − (A & B)` with `A`
+  a sum of products is `(A | B) + p·q`, but the whole is a polynomial over everything `A` is
+  made of. Where the whole is no simpler, the terms that share an atom are asked together
+  with the spelled sums still atoms, as an identity beside unrelated terms already was.
 - **A sum with a constant whose carries are all known is a xor**, under a mask: `t + k` (or
   `k − t`) differs from `t` in fixed bits where every carry on the bits read is known from
   the bits known of `t`. One value written twice, once through such a sum, was two

@@ -975,28 +975,23 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
 }
 
-/// the sum `n` taken apart into groups of terms whose bitwise parts share no
-/// atom (the operands of `& | ^` that are not themselves bitwise), each group with several
-/// terms simplified alone by `part` (the MBA phase), and the sum built again from the results;
-/// `None` when the sum has one group or no group changes. An identity hidden in a sum beside
-/// other terms (`(z | k) − (z & k) − (z ^ k)`, nothing, next to a polynomial in `x` and `y`;
-/// `(t ^ k) + 2 (t & k)`, which is `t + k`, of a sum `t`) is then decided on its own atoms.
+/// The sum `konst + Σ coeff·term` taken apart into groups of terms whose bitwise parts share
+/// no atom, each group with several terms simplified alone by `part`: the sum of the results,
+/// or `None` when there is one group or no group changes (what was built is then retired).
 #[cfg(feature = "mba")]
-pub(super) fn by_groups(
+fn grouped(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
-    n: u32,
+    konst: &BitVec,
+    terms: &[(u32, BitVec)],
+    fin: Fin,
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
-) -> Result<Option<Step>, Stop> {
-    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+) -> Result<Option<(Form, Fin)>, Stop> {
+    if terms.len() < 3 {
         return Ok(None);
     }
-    let form = form_of(r, cx, n)?;
-    if form.terms.len() < 3 {
-        return Ok(None);
-    }
-    let mut sets = Vec::with_capacity(form.terms.len());
-    for &(a, _) in &form.terms {
+    let mut sets = Vec::with_capacity(terms.len());
+    for &(a, _) in terms {
         match bitwise_atoms(cx, a) {
             Some(s) => sets.push(s),
             None => return Ok(None),
@@ -1027,14 +1022,14 @@ pub(super) fn by_groups(
     if groups.len() < 2 || groups.values().all(|g| g.len() < 2) {
         return Ok(None);
     }
-    let w = form.konst.width();
+    let w = konst.width();
     let before = cx.len() as u32;
-    let mut total = Form::of(form.konst, &[]);
-    let mut fin = form.fin;
+    let mut total = Form::of(*konst, &[]);
+    let mut fin = fin;
     let mut changed = false;
     for idx in groups.values() {
-        let terms: Vec<(u32, BitVec)> = idx.iter().map(|&i| form.terms[i]).collect();
-        let mut f = Form::of(BitVec::zero(w), &terms);
+        let part_terms: Vec<(u32, BitVec)> = idx.iter().map(|&i| terms[i]).collect();
+        let mut f = Form::of(BitVec::zero(w), &part_terms);
         if idx.len() >= 2 {
             let s = emit(r, cx, &f)?;
             if let Some(e) = part(r, cx, s)?
@@ -1051,6 +1046,30 @@ pub(super) fn by_groups(
         super::discard(r, cx, before);
         return Ok(None);
     }
+    Ok(Some((total, fin)))
+}
+
+/// the sum `n` taken apart into groups of terms whose bitwise parts share no
+/// atom (the operands of `& | ^` that are not themselves bitwise), each group with several
+/// terms simplified alone by `part` (the MBA phase), and the sum built again from the results;
+/// `None` when the sum has one group or no group changes. An identity hidden in a sum beside
+/// other terms (`(z | k) − (z & k) − (z ^ k)`, nothing, next to a polynomial in `x` and `y`;
+/// `(t ^ k) + 2 (t & k)`, which is `t + k`, of a sum `t`) is then decided on its own atoms.
+#[cfg(feature = "mba")]
+pub(super) fn by_groups(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    let before = cx.len() as u32;
+    let Some((total, fin)) = grouped(r, cx, &form.konst, &form.terms, form.fin, part)? else {
+        return Ok(None);
+    };
     let e = emit(r, cx, &total)?;
     // The nodes from before the rewrite that it reads.
     let mut stops = Vec::new();
@@ -1361,7 +1380,21 @@ pub(super) fn by_sums(
     }
     let before = cx.len() as u32;
     let s = emit(r, cx, &Form::of(konst, &terms))?;
-    let e = part(r, cx, s)?.unwrap_or(s);
+    // Whole; or, where that is no simpler, a group of its terms at a time, the sums still
+    // atoms (`A + p·q + B − (A & B)` with `A` a sum of products: the whole is a polynomial over
+    // what `A` is made of, the group `A + B − (A & B)` is `A | B` over two values).
+    let e = match part(r, cx, s)? {
+        Some(e) => e,
+        None => {
+            // (The whole sum is retired first: what it built would count as readers of the
+            // groups' nodes.)
+            super::discard(r, cx, before);
+            match grouped(r, cx, &konst, &terms, form.fin, part)? {
+                Some((total, _)) => emit(r, cx, &total)?,
+                None => emit(r, cx, &Form::of(konst, &terms))?,
+            }
+        }
+    };
     let mut stops = Vec::new();
     let mut seen = crate::hash::IdMap::<u32, ()>::default();
     let mut todo = vec![e];
