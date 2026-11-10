@@ -1453,7 +1453,59 @@ fn prove_at<M: Meter>(
     lowered: bool,
     change: bool,
 ) -> Result<Report, M::Err> {
+    let top = TMP_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v == 0
+    });
+    let out = prove_at_inner(a, b, meter, depth, lowered, change, top);
+    TMP_DEPTH.with(|d| d.set(d.get() - 1));
+    out
+}
+
+thread_local! {
+    pub(crate) static TMP_TIME: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+pub(crate) fn tmp_time(what: &'static str, t0: std::time::Instant) {
+    let d = t0.elapsed();
+    TMP_TIME.with(|p| {
+        let mut p = p.borrow_mut();
+        let e = p.entry(what).or_default();
+        e.0 += 1;
+        e.1 += d;
+    });
+}
+
+thread_local! {
+    pub(crate) static TMP_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(crate) static TMP_STAGE: std::cell::RefCell<[u64; 8]> = const { std::cell::RefCell::new([0; 8]) };
+}
+
+pub(crate) const TMP_STAGES: [&str; 8] = [
+    "symbolic", "direct", "compose", "carries", "changed", "lowered", "split", "?",
+];
+
+fn tmp_stage<M: Meter>(top: bool, meter: &M, mark: &mut u64, stage: usize) {
+    if top {
+        let now = meter.left();
+        TMP_STAGE.with(|s| s.borrow_mut()[stage] += mark.saturating_sub(now));
+        *mark = now;
+    }
+}
+
+fn prove_at_inner<M: Meter>(
+    a: &MbaExpr,
+    b: &MbaExpr,
+    meter: &mut M,
+    depth: u32,
+    lowered: bool,
+    change: bool,
+    top: bool,
+) -> Result<Report, M::Err> {
     let mut report = Report::new();
+    let mut mark = meter.left();
     if a.vars() != b.vars() || a.width().is_none() || a.width() != b.width() {
         return Ok(report);
     }
@@ -1470,12 +1522,16 @@ fn prove_at<M: Meter>(
     let direct = plan(a, &pa, &pb);
     // A polynomial pair no test fits (or can afford, below): maybe the same polynomial.
     if direct.is_none() && poly && symbolic(meter, a, b, &mut report)? {
+        tmp_stage(top, meter, &mut mark, 0);
         report.verdict = Verdict::Proved;
         report.cert = Some(Cert::Symbolic);
         return Ok(report);
     }
+    tmp_stage(top, meter, &mut mark, 0);
     if let Some(p) = direct {
-        match run(meter, a, b, &p, &mut report)? {
+        let ran = run(meter, a, b, &p, &mut report)?;
+        tmp_stage(top, meter, &mut mark, 1);
+        match ran {
             Run::Equal(cert) => {
                 report.verdict = Verdict::Proved;
                 report.cert = Some(cert);
@@ -1494,11 +1550,13 @@ fn prove_at<M: Meter>(
                     report.cert = Some(Cert::Symbolic);
                     return Ok(report);
                 }
+                tmp_stage(top, meter, &mut mark, 0);
             }
         }
     }
     if compose {
         Compose::new(a, b).prove(meter, &mut report)?;
+        tmp_stage(top, meter, &mut mark, 2);
     }
     // Arithmetic read bitwise without products, which the atoms left open: bit-serially,
     // exactly.
@@ -1507,8 +1565,10 @@ fn prove_at<M: Meter>(
         && !report.over_budget
         && carries(meter, a, b, &mut report)?
     {
+        tmp_stage(top, meter, &mut mark, 3);
         return Ok(report);
     }
+    tmp_stage(top, meter, &mut mark, 3);
     // Undecided for lack of budget: more budget may decide it directly; nothing more is spent.
     if report.verdict != Verdict::Unknown || report.over_budget {
         return Ok(report);
@@ -1517,8 +1577,10 @@ fn prove_at<M: Meter>(
     // place (see `changes_of_variable`): before the readings below, which split and lower
     // the question as it is and cost more.
     if change && changed(a, b, meter, &mut report)? {
+        tmp_stage(top, meter, &mut mark, 4);
         return Ok(report);
     }
+    tmp_stage(top, meter, &mut mark, 4);
     // The same question with known bits read as arithmetic (equal functions, so a verdict on
     // them is one on `a` and `b`, at the same points); it splits too.
     if !lowered && (lowerable(a) || lowerable(b)) {
@@ -1533,6 +1595,7 @@ fn prove_at<M: Meter>(
             let la = la.unwrap_or_else(|| a.clone());
             let lb = lb.unwrap_or_else(|| b.clone());
             let sub = prove_at(&la, &lb, meter, depth, true, false)?;
+            tmp_stage(top, meter, &mut mark, 5);
             report.points += sub.points;
             report.over_budget |= sub.over_budget;
             report.internal += sub.internal;
@@ -1549,6 +1612,7 @@ fn prove_at<M: Meter>(
     }
     if depth < SPLIT_DEPTH {
         split(a, b, meter, depth, &mut report)?;
+        tmp_stage(top, meter, &mut mark, 6);
     }
     Ok(report)
 }
@@ -2333,8 +2397,10 @@ impl Compose {
         meter.charge(units)?;
         report.points += SAMPLE_POINTS as u64;
         let seed = crate::hash::combine(all.key()[0], all.key()[1]);
+        let tq = std::time::Instant::now();
         let points = sample_points(&self.vars, &[&all], seed);
         let mut digests = digests(&prog, &points, self.nodes.len());
+        tmp_time("C.sample", tq);
         let (ra, rb) = (self.root_a as usize, self.root_b as usize);
         if let Some(p) = (0..points.len()).find(|&p| digests[ra][p] != digests[rb][p]) {
             // A real input where the sides differ.
@@ -2360,6 +2426,7 @@ impl Compose {
             .map(|i| keys[i])
             .collect();
         let mut groups: HashMap<u64, Vec<u32>> = HashMap::new();
+        let tq = std::time::Instant::now();
         for i in 0..self.nodes.len() as u32 {
             let k = keys[i as usize];
             if self.role[i as usize] == Role::Const || !wanted.contains(&k) {
@@ -2387,12 +2454,15 @@ impl Compose {
         }
         // Atoms that are bitwise functions of the leaves of their definitions, at 64 bits or
         // fewer (where a digest is the value).
+        tmp_time("C.pairs", tq);
+        let tq = std::time::Instant::now();
         self.compute_reps();
         if values {
             self.bitwise_forms(meter, report, &mut digests)?;
             self.compute_reps();
             self.sample = Some((points.clone(), digests.clone()));
         }
+        tmp_time("C.bitwise_forms", tq);
         // Every class agrees at the sample (a pairing that does not is a bug: decline).
         for i in 0..self.nodes.len() as u32 {
             let r = self.find(i);
@@ -2413,7 +2483,10 @@ impl Compose {
             Policy::Everything,
         ] {
             let (a, b) = (self.root_a, self.root_b);
-            match self.compare(meter, report, a, b, policy)? {
+            let tq = std::time::Instant::now();
+            let cmp = self.compare(meter, report, a, b, policy)?;
+            tmp_time("C.roots", tq);
+            match cmp {
                 (Some(Verdict::Proved), _) => {
                     report.verdict = Verdict::Proved;
                     return Ok(());
@@ -2476,6 +2549,7 @@ impl Compose {
         policy: Policy,
     ) -> Result<Compared, M::Err> {
         let mut vm = VarMap::default();
+        let tq = std::time::Instant::now();
         let (sx, sy) = if policy == Policy::Linear {
             (
                 self.linear_skeleton(x, &mut vm),
@@ -2487,45 +2561,72 @@ impl Compose {
                 self.skeleton(y, policy, &mut vm),
             )
         };
+        tmp_time("c.skeleton", tq);
         let (Some(sx), Some(sy)) = (sx, sy) else {
             return Ok((None, None));
         };
+        let tq = std::time::Instant::now();
         let w = self.nodes[x as usize].width;
         let (Some(a), Some(b)) = (vm.expr(&sx, w), vm.expr(&sy, w)) else {
             return Ok((None, None));
         };
+        tmp_time("c.expr", tq);
+        let tq = std::time::Instant::now();
         let (Some(pa), Some(pb)) = (profile(&a), profile(&b)) else {
             return Ok((None, None));
         };
+        tmp_time("c.profile", tq);
         if !(pa.poly && pb.poly) {
             return Ok((None, None));
         }
+        let tq = std::time::Instant::now();
+        let agreed = self.agrees(&vm, [(&a, x), (&b, y)]);
+        tmp_time("c.agrees", tq);
         // A skeleton is its side's value wherever its variables take their nodes' values: at
         // the sample it must be. One that is not would be a bug; decline.
-        if !self.agrees(&vm, [(&a, x), (&b, y)]) {
+        if !agreed {
             report.internal += 1;
             return Ok((None, None));
         }
-        let Some(p) = plan(&a, &pa, &pb) else {
-            if symbolic(meter, &a, &b, report)? {
+        let tq = std::time::Instant::now();
+        let planned = plan(&a, &pa, &pb);
+        tmp_time("c.plan", tq);
+        let Some(p) = planned else {
+            let tq = std::time::Instant::now();
+            let sym = symbolic(meter, &a, &b, report)?;
+            tmp_time("c.symbolic", tq);
+            if sym {
                 report.cert = Some(Cert::Symbolic);
                 return Ok((Some(Verdict::Proved), None));
             }
             if policy == Policy::Linear {
-                return self.eliminate(meter, report, &mut vm, [a, b], w);
+                let tq = std::time::Instant::now();
+                let e = self.eliminate(meter, report, &mut vm, [a, b], w);
+                tmp_time("c.eliminate", tq);
+                return e;
             }
             return Ok((None, None));
         };
+        let tq = std::time::Instant::now();
         let direct = run(meter, &a, &b, &p, report)?;
-        if matches!(direct, Run::TooBig | Run::OverBudget) && symbolic(meter, &a, &b, report)? {
-            report.cert = Some(Cert::Symbolic);
-            return Ok((Some(Verdict::Proved), None));
+        tmp_time("c.run", tq);
+        if matches!(direct, Run::TooBig | Run::OverBudget) {
+            let tq = std::time::Instant::now();
+            let sym = symbolic(meter, &a, &b, report)?;
+            tmp_time("c.symbolic", tq);
+            if sym {
+                report.cert = Some(Cert::Symbolic);
+                return Ok((Some(Verdict::Proved), None));
+            }
         }
         if policy == Policy::Linear
             && vm.abstracted
             && matches!(direct, Run::Differ(_) | Run::TooBig)
         {
-            return self.eliminate(meter, report, &mut vm, [a, b], w);
+            let tq = std::time::Instant::now();
+            let e = self.eliminate(meter, report, &mut vm, [a, b], w);
+            tmp_time("c.eliminate", tq);
+            return e;
         }
         Ok(match direct {
             Run::Equal(cert) => {

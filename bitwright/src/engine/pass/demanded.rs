@@ -69,6 +69,13 @@ fn sorted_distinct(v: &mut [u32]) -> usize {
 
 struct Demand {
     memo: Memo,
+    /// Results of earlier simplifications that this one reads and does not write (see
+    /// [`reduced`]); empty for the pass's own steps.
+    base: Memo,
+    /// The results found before the cap cut the walk short, where they are kept for later
+    /// simplifications (`None` for the pass's own steps): each was found with every operand
+    /// below it read in full, so more visits would not change it.
+    whole: Option<Vec<(Key, u32)>>,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
     cap: u32,
     stops: Vec<u32>,
@@ -84,6 +91,46 @@ struct Demand {
     /// The identities found (a node unchanged under a mask), each with the range of `stops`
     /// its walk pushed: kept for the phase run once the step is done (see [`Same`]).
     identities: Vec<(Key, u32, u32)>,
+}
+
+impl Demand {
+    /// Remembers `v` as the result for `key`.
+    fn note(&mut self, key: Key, v: u32) {
+        self.memo.insert(key, v);
+        if self.visits <= self.cap
+            && let Some(whole) = &mut self.whole
+        {
+            whole.push((key, v));
+        }
+    }
+}
+
+/// The most constants kept per operand by [`same_on`].
+const SUM_CONSTANTS: usize = 8;
+
+/// The constant `kc` (value `k`) of a sum over the operand `key.0` (`key.1`: `t + k`, `t − k`
+/// or `k − t`), read on the prefix `p`: the first constant this call's reductions added to
+/// that operand so that agrees with `k` on `p`, else `kc` itself, which is then kept.
+fn same_on(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    key: (u32, u8),
+    kc: u32,
+    k: &BitVec,
+    p: &BitVec,
+) -> u32 {
+    let seen = r.sum_constants.entry(key).or_default();
+    for &c in seen.iter() {
+        if let Some(v) = cx.const_val(c)
+            && bv_and(&BitVec::bin_unchecked(BinOp::Xor, &v, k), p).is_zero()
+        {
+            return c;
+        }
+    }
+    if seen.len() < SUM_CONSTANTS {
+        seen.push(kc);
+    }
+    kc
 }
 
 /// The low prefix covering every bit of `m` (the bits arithmetic depends on).
@@ -182,7 +229,11 @@ fn simplify(
     if m.is_zero() {
         return r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)));
     }
-    if let Some(&v) = st.memo.get(&Key(x, *m)) {
+    if let Some(&v) = st
+        .memo
+        .get(&Key(x, *m))
+        .or_else(|| st.base.get(&Key(x, *m)))
+    {
         return Ok(v);
     }
     // Found nothing to simplify under this mask in an earlier step of the phase run: the same
@@ -191,7 +242,7 @@ fn simplify(
         let (from, len) = (from as usize, len as usize);
         st.stops
             .extend_from_slice(&r.demanded_same.leaves[from..from + len]);
-        st.memo.insert(Key(x, *m), x);
+        st.note(Key(x, *m), x);
         return Ok(x);
     }
     let stops0 = st.stops.len() as u32;
@@ -209,12 +260,12 @@ fn simplify(
         && let Some(c2) = prefix_residue(&c, m)
     {
         let v = r.build(cx, |cx| cx.mk_const(&c2))?;
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     if st.visits > st.cap || cx.const_val(x).is_some() {
         let v = stop(cx, st)?;
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     // Known demanded bits make the operand a constant: the value on them, if all are known.
@@ -240,14 +291,14 @@ fn simplify(
         if let Some(v) = fold.filter(|_| allowed) {
             st.fin = st.fin.and(fin);
             let c = r.build(cx, |cx| cx.mk_const(&v))?;
-            st.memo.insert(Key(x, *m), c);
+            st.note(Key(x, *m), c);
             return Ok(c);
         }
     }
     // Demanded bits among the lowest few: the residues of `x` decide them (a constant, or a
     // leaf equal to `x` there).
     if let Some(v) = by_residues(r, cx, x, m)? {
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     let bin = |r: &mut Runner<'_, '_>, cx: &mut Context, op: BinOp, a: u32, b: u32| {
@@ -261,7 +312,7 @@ fn simplify(
         && matches!(node.op, OpCode::Add | OpCode::Sub)
         && let Some(v) = merged(r, cx, st, x, m)?
     {
-        st.memo.insert(Key(x, *m), v);
+        st.note(Key(x, *m), v);
         return Ok(v);
     }
     let v = match node.op {
@@ -364,8 +415,31 @@ fn simplify(
         }
         OpCode::Add | OpCode::Sub | OpCode::Mul => {
             let p = low_prefix(m);
-            let a = simplify(r, cx, st, node.a, &p)?;
-            let b = simplify(r, cx, st, node.b, &p)?;
+            // One value read under several masks stays one value in the sweep's reductions:
+            // a sum's constant is the first one added to that operand in this call that
+            // agrees with it on the prefix, not its residue there, which differs from mask to
+            // mask (`t + k` under `& 0xff` and under `& 0xffff` would be two sums, each an atom
+            // of its own to a certificate, and what cancels through `t + k` is gone).
+            let whole_sum = st.whole.is_some()
+                && node.op != OpCode::Mul
+                && std::env::var_os("BW_SUM_RESIDUE").is_none();
+            let (ka, kb) = (cx.const_val(node.a), cx.const_val(node.b));
+            let (a, b) = match (whole_sum, ka, kb) {
+                (true, None, Some(k)) => {
+                    let a = simplify(r, cx, st, node.a, &p)?;
+                    let kind = u8::from(node.op == OpCode::Sub);
+                    (a, same_on(r, cx, (a, kind), node.b, &k, &p))
+                }
+                (true, Some(k), None) => {
+                    let b = simplify(r, cx, st, node.b, &p)?;
+                    let kind = if node.op == OpCode::Sub { 2 } else { 0 };
+                    (same_on(r, cx, (b, kind), node.a, &k, &p), b)
+                }
+                _ => (
+                    simplify(r, cx, st, node.a, &p)?,
+                    simplify(r, cx, st, node.b, &p)?,
+                ),
+            };
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
             // a constant addend with none of the demanded bits goes (`63 - ~y`
             // is `y + 64`, which is `y` on the low six bits).
@@ -448,7 +522,7 @@ fn simplify(
         }
         _ => stop(cx, st)?,
     };
-    st.memo.insert(Key(x, *m), v);
+    st.note(Key(x, *m), v);
     if v == x && x < st.before {
         st.identities
             .push((Key(x, *m), stops0, st.stops.len() as u32));
@@ -574,6 +648,8 @@ pub(super) fn reduced(
     let w = cx.width_of(x);
     let mut st = Demand {
         memo: Memo::default(),
+        base: std::mem::take(&mut r.reduced),
+        whole: Some(Vec::new()),
         cap,
         stops: Vec::new(),
         visits: 0,
@@ -583,7 +659,17 @@ pub(super) fn reduced(
         xors: Vec::new(),
         identities: Vec::new(),
     };
-    simplify(r, cx, &mut st, x, &BitVec::ones(w))
+    let out = simplify(r, cx, &mut st, x, &BitVec::ones(w));
+    // What this simplification found is kept for the call's later ones, up to where the cap
+    // cut it short (an answer of more visits may differ). A node's value on a mask is fixed,
+    // so the answer is too; the sweep asks this of every candidate, operands first, and each
+    // walked the whole of what the ones below it had walked.
+    let mut base = std::mem::take(&mut st.base);
+    if out.is_ok() {
+        base.extend(st.whole.take().unwrap_or_default());
+    }
+    r.reduced = base;
+    out
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
@@ -637,6 +723,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     let before = cx.len() as u32;
     let mut st = Demand {
+        base: Memo::default(),
+        whole: None,
         memo: std::mem::take(&mut r.demanded),
         cap: MAX_VISITS.min(super::region_cap(r)),
         stops: Vec::new(),

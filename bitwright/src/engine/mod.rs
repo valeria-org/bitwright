@@ -1300,6 +1300,12 @@ struct Runner<'r, 'a> {
     /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
     /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
     demanded_same: pass::demanded::Same,
+    /// What the opaque-constant sweep's reductions of its candidates found, per node and
+    /// demanded mask, for the call (see `pass::demanded::reduced`).
+    #[cfg(feature = "mba")]
+    reduced: pass::demanded::Memo,
+    /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
+    sum_constants: IdMap<(u32, u8), Vec<u32>>,
     /// The MBA solver's answers in this call, by question.
     #[cfg(feature = "mba")]
     mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
@@ -2409,6 +2415,9 @@ impl Engine {
             carries: Default::default(),
             demanded: Default::default(),
             demanded_same: Default::default(),
+            #[cfg(feature = "mba")]
+            reduced: Default::default(),
+            sum_constants: IdMap::default(),
             #[cfg(feature = "mba")]
             mba_answers: IdMap::default(),
             #[cfg(feature = "mba")]

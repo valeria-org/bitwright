@@ -223,6 +223,10 @@ fn sweep_inner(
     // for (see `Classes`).
     let mut classes = Classes::default();
     let mut unrelated = 0usize;
+    let mut taint: crate::hash::IdMap<u32, Vec<u32>> = crate::hash::IdMap::default();
+    if tmp_off("BW_PROF6") {
+        eprintln!("SWEEPBEGIN root={root}");
+    }
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
@@ -297,13 +301,70 @@ fn sweep_inner(
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
             // A node the samples relate to one met before it (see `related`).
-            let found = match unrelated < SWEEP_UNRELATED && !tmp_off("BW_NO_RELATED") {
+            let found = match unrelated < tmp_unrel() && !tmp_off("BW_NO_RELATED") {
                 true => classes.find(vals),
                 false => Vec::new(),
             };
+            let mut tainted: Vec<u32> = Vec::new();
+            for c in cx.node(cur).children() {
+                if let Some(v) = taint.get(&c) {
+                    for &x in v {
+                        if !tainted.contains(&x) && tainted.len() < 8 {
+                            tainted.push(x);
+                        }
+                    }
+                }
+            }
+            if !tainted.is_empty() {
+                taint.insert(cur, tainted.clone());
+            }
+            let reps: Vec<u32> = found.iter().map(|f| f.0).collect();
             for (rep, relation, d) in found {
+                let rep0 = rep;
+                // An operand of this node was asked to be related to `rep` and no proof was
+                // found: this one, built on it, is not asked.
+                if tainted.contains(&rep0) && !tmp_off("BW_NO_TAINT") {
+                    unrelated += 1;
+                    break;
+                }
                 let rep = to.get(&rep).copied().unwrap_or(rep);
-                match asked!('nodes, "related", related(r, cx, cfg, cur, rep, relation, &d)) {
+                let t0 = std::time::Instant::now();
+                let st0 = r.meter.spent.mba_steps;
+                let got = asked!('nodes, "related", related(r, cx, cfg, cur, rep, relation, &d));
+                let is_t = tainted.contains(&rep0);
+                if tmp_off("BW_PROF6") && !matches!(got, Related::Written) {
+                    let sig = |r: &Runner<'_, '_>, j: u32| {
+                        r.samples.get(&j).map_or(0u64, |v| {
+                            v.iter().fold(0u64, |h, x| {
+                                crate::hash::combine(h, x.to_u64().unwrap_or(0))
+                            })
+                        })
+                    };
+                    eprintln!(
+                        "RELEV root={root} out={} steps={} tainted={} cur={:016x} rep={:016x} rel={relation:?} i={i}",
+                        if matches!(got, Related::Open) {
+                            "O"
+                        } else {
+                            "P"
+                        },
+                        r.meter.spent.mba_steps - st0,
+                        u8::from(is_t),
+                        sig(r, i),
+                        sig(r, rep0),
+                    );
+                }
+                tmp_time(
+                    match (&got, is_t) {
+                        (Related::Proved(_), true) => "REL.tainted.proved",
+                        (Related::Proved(_), false) => "REL.fresh.proved",
+                        (Related::Written, true) => "REL.tainted.written",
+                        (Related::Written, false) => "REL.fresh.written",
+                        (Related::Open, true) => "REL.tainted.open",
+                        (Related::Open, false) => "REL.fresh.open",
+                    },
+                    t0,
+                );
+                match got {
                     Related::Proved(e) => {
                         to.insert(i, e);
                         continue 'nodes;
@@ -311,6 +372,12 @@ fn sweep_inner(
                     Related::Written => {}
                     Related::Open => {
                         unrelated += 1;
+                        let v = taint.entry(cur).or_default();
+                        for &x in &reps {
+                            if !v.contains(&x) && v.len() < 8 {
+                                v.push(x);
+                            }
+                        }
                         break;
                     }
                 }
@@ -367,7 +434,7 @@ fn sweep_inner(
         // a node whose bits are all known is that value, which no reading needs
         // proving (`~(x & k) >>u 42` over a 32-bit `x` keeps only `k`'s bits).
         if !decided
-            && let (Some(kb), _) = asked!('nodes, super::known(r, cx, cur))
+            && let (Some(kb), _) = asked!('nodes, "known", super::known(r, cx, cur))
             && kb.known().is_ones()
             && kb.known_one() == k
         {
@@ -381,6 +448,7 @@ fn sweep_inner(
         if !decided {
             subject = asked!(
                 'nodes,
+                "reduced",
                 super::demanded::reduced(r, cx, cur, SWEEP_DEMAND_VISITS)
             );
             if let Some(v) = cx.const_val(subject) {
@@ -403,13 +471,13 @@ fn sweep_inner(
         if !decided && !refuted && mixed {
             let seen;
             (decided, refuted, seen) =
-                asked!('nodes, "readings", readings_prove(r, cx, cfg, subject, &k));
+                asked!('nodes, "readings", readings_prove(r, cx, cfg, subject, &k, SWEEP_SHARE));
             // The candidate as it is written, where the reduced one was not decided: taking
             // each operand on the bits its user reads writes one value read under several
             // masks once per mask, each a variable of its own, and what the terms cancel
             // through (the one value they all read) is gone.
             if !decided && !refuted && subject != cur && !tmp_off("BW_NO_WRITTEN") {
-                let again = asked!('nodes, "readings_written", readings_prove(r, cx, cfg, cur, &k));
+                let again = asked!('nodes, "readings_written", readings_prove(r, cx, cfg, cur, &k, SWEEP_SHARE));
                 decided = again.0;
             }
             // the root, a constant some reading's free atoms refute, one case of
@@ -474,22 +542,45 @@ thread_local! {
 }
 
 thread_local! {
-    static TMP_TIME: std::cell::RefCell<std::collections::BTreeMap<&'static str, (u64, std::time::Duration)>> =
-        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+    static TMP_REL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn tmp_time(what: &'static str, t0: std::time::Instant) {
-    let d = t0.elapsed();
-    TMP_TIME.with(|p| {
-        let mut p = p.borrow_mut();
-        let e = p.entry(what).or_default();
-        e.0 += 1;
-        e.1 += d;
-    });
+pub(crate) use certify::{TMP_TIME, tmp_time};
+
+#[allow(clippy::type_complexity)]
+mod tmp_dup {
+    thread_local! {
+        pub(super) static TMP_DUP: std::cell::RefCell<(std::collections::HashMap<([u64; 2], [u64; 2]), ()>, [u64; 3], [u64; 3])> =
+            std::cell::RefCell::new((std::collections::HashMap::new(), [0; 3], [0; 3]));
+    }
+}
+use tmp_dup::TMP_DUP;
+
+thread_local! {
+    static TMP_STAGES: std::cell::RefCell<[[[u64; 8]; 4]; 2]> = const { std::cell::RefCell::new([[[0; 8]; 4]; 2]) };
 }
 
 pub(crate) fn tmp_time_dump() {
     if std::env::var_os("BW_PROF").is_some() {
+        TMP_DUP.with(|d| {
+            let d = d.borrow();
+            eprintln!(
+                "CERTDUP calls={} dup={} dup_undecided={} steps={} dupsteps={} dup_undecided_steps={}",
+                d.1[0], d.1[1], d.1[2], d.2[0], d.2[1], d.2[2]
+            );
+        });
+        TMP_STAGES.with(|t| {
+            let t = t.borrow();
+            for (rel, name) in ["const", "related"].iter().enumerate() {
+                for (v, vn) in ["proved", "refuted", "over", "unknown"].iter().enumerate() {
+                    let parts: Vec<String> = (0..8)
+                        .filter(|&k| t[rel][v][k] > 0)
+                        .map(|k| format!("{}={}", certify::TMP_STAGES[k], t[rel][v][k]))
+                        .collect();
+                    eprintln!("STAGES {name} {vn} {}", parts.join(" "));
+                }
+            }
+        });
         TMP_TIME.with(|p| {
             let p = p.borrow();
             let v: Vec<String> = p
@@ -499,6 +590,20 @@ pub(crate) fn tmp_time_dump() {
             eprintln!("TIME {{{}}}", v.join(", "));
         });
     }
+}
+
+fn tmp_unrel() -> usize {
+    thread_local! {
+        static V: usize = std::env::var("BW_UNREL").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(SWEEP_UNRELATED);
+    }
+    V.with(|v| *v)
+}
+
+fn tmp_rel_share() -> u64 {
+    thread_local! {
+        static V: u64 = std::env::var("BW_REL_SHARE").ok().and_then(|v| v.parse::<u32>().ok()).map_or(SWEEP_SHARE, |b| 1u64 << b);
+    }
+    V.with(|v| *v)
 }
 
 pub(crate) fn tmp_off(name: &str) -> bool {
@@ -686,6 +791,24 @@ fn related(
         );
         return Ok(proved(v));
     }
+    if let Ok(want) = std::env::var("BW_DUMPSIG") {
+        r.sample(cx, cur)?;
+        let sig = r.samples.get(&cur).map_or(0u64, |v| {
+            v.iter().fold(0u64, |h, x| {
+                crate::hash::combine(h, x.to_u64().unwrap_or(0))
+            })
+        });
+        if format!("{sig:016x}") == want {
+            let o = crate::PrintOptions::default()
+                .with_max_nodes(usize::MAX)
+                .with_max_chars(usize::MAX)
+                .with_symbol_widths(true);
+            eprintln!(
+                "DUMPSIG subject:\n{}\n",
+                cx.display_with(cx.handle(subject), o)
+            );
+        }
+    }
     let t0 = std::time::Instant::now();
     let exh = exhaustive(r, cx, subject, &zero)?;
     tmp_time("rel.exhaustive", t0);
@@ -706,7 +829,10 @@ fn related(
         });
     }
     let t0 = std::time::Instant::now();
-    let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero)?;
+    TMP_REL.with(|c| c.set(true));
+    let asked = readings_prove(r, cx, cfg, subject, &zero, tmp_rel_share());
+    TMP_REL.with(|c| c.set(false));
+    let (decided, _, _) = asked?;
     tmp_time(
         if decided {
             "rel=proved.readings"
@@ -719,7 +845,66 @@ fn related(
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
     }
+    if std::env::var_os("BW_PROF5").is_some() {
+        let hit = tmp_random_refute(cx, diff, 3000);
+        eprintln!("OPENCHK cur={cur} rep={rep} rel={relation:?} refuted_at={hit:?}");
+    }
     Ok(Related::Open)
+}
+
+/// TEMP: the first of `tries` structured random inputs at which `n` is not zero.
+fn tmp_random_refute(cx: &Context, n: u32, tries: u64) -> Option<u64> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut seen: crate::hash::IdMap<u32, usize> = crate::hash::IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            seen.insert(i, order.len());
+            order.push(i);
+            continue;
+        }
+        if seen.contains_key(&i) {
+            continue;
+        }
+        seen.insert(i, usize::MAX);
+        stack.push((i, true));
+        for c in cx.node(i).children() {
+            if !seen.contains_key(&c) {
+                stack.push((c, false));
+            }
+        }
+    }
+    let mut vals: Vec<crate::BitVec> = vec![crate::BitVec::zero(crate::Width::W1); order.len()];
+    for t in 0..tries {
+        for (idx, &i) in order.iter().enumerate() {
+            let seed = cx.meta[i as usize].shash;
+            let declared = cx.declared_at(i);
+            let v = cx.eval_node(
+                i,
+                |j| vals[seen[&j]],
+                |_, w| {
+                    let v = crate::engine::point_value(seed, w, 1000 + t as usize);
+                    // structure: every third point keeps a low field, every third a high one
+                    let bits = u32::from(w.bits());
+                    let keep = 1 + (t as u32 / 3) % bits.max(1);
+                    let v = match t % 3 {
+                        0 => v,
+                        1 => crate::facts::known::bv_lshr(&v, bits - keep),
+                        _ => crate::facts::known::bv_shl(&v, bits - keep),
+                    };
+                    Some(declared.map_or(v, |d| d.fit(&v)))
+                },
+            );
+            match v {
+                Ok(v) => vals[idx] = v,
+                Err(_) => return None,
+            }
+        }
+        if !vals[seen[&n]].is_zero() {
+            return Some(t);
+        }
+    }
+    None
 }
 
 /// The related pairs a sweep asks about without a proof before it asks about no more.
@@ -1561,6 +1746,7 @@ fn readings_prove(
     cfg: &MbaConfig,
     subject: u32,
     k: &crate::BitVec,
+    share: u64,
 ) -> Result<(bool, bool, bool), Stop> {
     let (mut decided, mut refuted, mut seen) = (false, false, false);
     // Each reading with its cost, and whether a refutation of it is one of `subject` (the
@@ -1575,6 +1761,7 @@ fn readings_prove(
     if open.contains_key(&subject) {
         return Ok((false, false, false));
     }
+    let tq = std::time::Instant::now();
     let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, open);
     let kinds = [Reading::SemiLinear, Reading::Shallow, Reading::Linear];
     let all = std::iter::once(None)
@@ -1605,11 +1792,12 @@ fn readings_prove(
             bindings,
         ));
     }
+    tmp_time("rd.setup", tq);
     // Whether a certificate was asked and left the question open.
     let mut open_asked = false;
     readings.sort_by_key(|(cost, _, _, _, _)| *cost);
     'readings: for (cost, reading, whole, m, bindings) in readings {
-        if cost > SWEEP_SHARE {
+        if cost > share {
             break;
         }
         let mut c = MbaExpr::new(m.vars().to_vec());
@@ -1627,13 +1815,68 @@ fn readings_prove(
         loop {
             count(r).opaque_asked += 1;
             let s0 = r.meter.spent.mba_steps;
-            let mut meter = Steps::new(r, SWEEP_SHARE);
+            let mut meter = Steps::new(r, share);
+            certify::TMP_STAGE.with(|s| *s.borrow_mut() = [0; 8]);
+            let tc0 = std::time::Instant::now();
             let report = certify::prove(&m, &c, &mut meter)?;
+            let left_share = meter.share;
+            tmp_time(
+                match (
+                    TMP_REL.with(|c| c.get()),
+                    report.verdict,
+                    report.over_budget,
+                ) {
+                    (true, Verdict::Proved, _) => "cert.rel.proved",
+                    (true, Verdict::Refuted, _) => "cert.rel.refuted",
+                    (true, _, true) => "cert.rel.over",
+                    (true, _, _) => "cert.rel.unknown",
+                    (false, Verdict::Proved, _) => "cert.const.proved",
+                    (false, Verdict::Refuted, _) => "cert.const.refuted",
+                    (false, _, true) => "cert.const.over",
+                    (false, _, _) => "cert.const.unknown",
+                },
+                tc0,
+            );
+            {
+                let key = (m.key(), c.key());
+                let spent = r.meter.spent.mba_steps - s0;
+                let undecided = report.verdict == Verdict::Unknown;
+                TMP_DUP.with(|d| {
+                    let mut d = d.borrow_mut();
+                    let seen = d.0.insert(key, ()).is_some();
+                    d.1[0] += 1;
+                    d.2[0] += spent;
+                    if seen {
+                        d.1[1] += 1;
+                        d.2[1] += spent;
+                        if undecided {
+                            d.1[2] += 1;
+                            d.2[2] += spent;
+                        }
+                    }
+                });
+            }
+            {
+                let rel = TMP_REL.with(|c| c.get());
+                let v = match (report.verdict, report.over_budget) {
+                    (Verdict::Proved, _) => 0,
+                    (Verdict::Refuted, _) => 1,
+                    (_, true) => 2,
+                    _ => 3,
+                };
+                let st = certify::TMP_STAGE.with(|s| *s.borrow());
+                TMP_STAGES.with(|t| {
+                    let mut t = t.borrow_mut();
+                    for k in 0..8 {
+                        t[usize::from(rel)][v][k] += st[k];
+                    }
+                });
+            }
             // The certificate took most of its share and left the question open: the readings
             // not yet asked are larger, and theirs would too. (Not the same reading asked
             // again through its atoms' known bits: that is one more question of this
             // reading, and the next reading has its own.)
-            let burned = !known && meter.share < SWEEP_SHARE / 2 && !tmp_off("BW_NO_BURN");
+            let burned = !known && left_share < share / 2 && !tmp_off("BW_NO_BURN");
             count(r).certificates.record(&report);
             {
                 let kind = match reading {
@@ -1730,7 +1973,8 @@ fn readings_prove(
                 }
                 if std::env::var_os("BW_PROF2").is_some() {
                     eprintln!(
-                        "cert verdict={verdict} subject={subject} kind={kind} vars={} nodes={} steps={} cost={cost} comp={} test={} direct={}",
+                        "cert verdict={verdict} rel={} subject={subject} kind={kind} vars={} nodes={} steps={} cost={cost} comp={} test={} direct={}",
+                        u8::from(TMP_REL.with(|c| c.get())),
                         m.vars().len(),
                         m.nodes().len(),
                         r.meter.spent.mba_steps - s0,
@@ -1829,7 +2073,7 @@ fn cases_fold(
         *slot = k;
     }
     for (side, k) in sides.into_iter().zip(values) {
-        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, &k)?.0 {
+        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, &k, SWEEP_SHARE)?.0 {
             return Ok(None);
         }
     }
@@ -1874,7 +2118,7 @@ fn cases_prove(
         }
     }
     for side in [t, f] {
-        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, k)?.0 {
+        if cx.const_val(side).is_none() && !readings_prove(r, cx, cfg, side, k, SWEEP_SHARE)?.0 {
             return Ok(false);
         }
     }
@@ -2065,7 +2309,10 @@ pub(super) fn step(
         r.meter.spent.pass_work,
         r.stats.mba,
     );
-    let out = ask(r, cx, cfg, n, n)?;
+    let tq = std::time::Instant::now();
+    let out = ask(r, cx, cfg, n, n);
+    tmp_time("ask", tq);
+    let out = out?;
     if std::env::var_os("BW_PROF4").is_some() && r.meter.spent.mba_steps - s0 > 50_000 {
         let st = r.stats.mba;
         eprintln!(
@@ -2241,7 +2488,10 @@ fn ask(
     root: u32,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
-    let (m, bindings) = match lower_id(cx, root, &cfg.limits) {
+    let tq = std::time::Instant::now();
+    let lowered = lower_id(cx, root, &cfg.limits);
+    tmp_time("ask.lower", tq);
+    let (m, bindings) = match lowered {
         Ok(x) => x,
         Err(why) => {
             count(r).refused(&why);
@@ -2266,7 +2516,10 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    if !tmp_off("BW_NO_OUTGROWN") && holds_kept(r, cx, root, &bindings) {
+    let tq = std::time::Instant::now();
+    let held = !tmp_off("BW_NO_OUTGROWN") && holds_kept(r, cx, root, &bindings);
+    tmp_time(if held { "ask.kept.yes" } else { "ask.kept.no" }, tq);
+    if held {
         count(r).unsupported += 1;
         return Ok(Step::Normal(Fin::FINAL));
     }
@@ -2331,7 +2584,17 @@ fn ask(
                         .budget
                         .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates)
                         .with_steps(limit);
+                    let tq = std::time::Instant::now();
                     let (a, spent) = inner.mba.solver.solve_counted(&m, &budget);
+                    tmp_time(
+                        match &a {
+                            MbaAnswer::Simplified { .. } => "ask.solve.simplified",
+                            MbaAnswer::NoSimpler => "ask.solve.nosimpler",
+                            MbaAnswer::Unsupported(_) => "ask.solve.unsupported",
+                            _ => "ask.solve.exhausted",
+                        },
+                        tq,
+                    );
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
                     if std::env::var_os("BW_PROF4").is_some() {
                         let what = match &a {
@@ -2396,7 +2659,9 @@ fn ask(
                         discard(r, cx, before);
                         return Ok(Step::Normal(fin));
                     }
+                    let tq = std::time::Instant::now();
                     let own = exact(r, &m, &expr)?;
+                    tmp_time("ask.exact", tq);
                     if own.verdict == Verdict::Refuted {
                         count(r).refuted += 1;
                         discard(r, cx, before);
