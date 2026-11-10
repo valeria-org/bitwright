@@ -2299,6 +2299,28 @@ struct Compose {
     checked: Option<usize>,
 }
 
+/// A node's width and its sample values, as a table key (hashed four words abreast).
+#[derive(PartialEq, Eq)]
+struct RowKey<'a>(u16, &'a [u64]);
+
+impl core::hash::Hash for RowKey<'_> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = [u64::from(self.0), 1, 2, 3];
+        let mut chunks = self.1.chunks_exact(4);
+        for c in &mut chunks {
+            for (x, &d) in h.iter_mut().zip(c) {
+                *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
+            }
+        }
+        for (x, &d) in h.iter_mut().zip(chunks.remainder()) {
+            *x = (x.rotate_left(5) ^ d).wrapping_mul(K);
+        }
+        state.write_u64(h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48));
+        state.write_usize(self.1.len());
+    }
+}
+
 /// The most distinct leaves of a bitwise function expanded by [`Policy::Linear`] (a table of
 /// `2^k` entries), and of a bitwise form looked for at the sample.
 const LINEAR_LEAVES: usize = 5;
@@ -2567,33 +2589,32 @@ impl Compose {
         if values {
             self.checked = Some(self.digests.len());
         }
-        // Group nodes by width and sample values; pair within groups, operands first.
-        let key = |i: usize| {
-            let mut h = u64::from(self.nodes[i].width.bits());
-            for &d in &self.digests[i] {
-                h = crate::hash::combine(h, d);
+        // Group nodes by width and sample values; pair within groups, operands first. Only
+        // the groups of the forced nodes are paired: per node its group, if it has one.
+        const NO_GROUP: u32 = u32::MAX;
+        let (group, count) = {
+            let row = |i: usize| RowKey(self.nodes[i].width.bits(), &self.digests[i]);
+            let mut ids: HashMap<RowKey<'_>, u32> = HashMap::default();
+            for i in (0..self.nodes.len()).filter(|&i| self.forced[i]) {
+                let next = ids.len() as u32;
+                ids.entry(row(i)).or_insert(next);
             }
-            h
+            let group: Vec<u32> = (0..self.nodes.len())
+                .map(|i| ids.get(&row(i)).copied().unwrap_or(NO_GROUP))
+                .collect();
+            (group, ids.len())
         };
-        let keys: Vec<u64> = (0..self.nodes.len()).map(key).collect();
-        let wanted: std::collections::HashSet<u64> = (0..self.nodes.len())
-            .filter(|&i| self.forced[i])
-            .map(|i| keys[i])
-            .collect();
-        let mut groups: HashMap<u64, Vec<u32>> = HashMap::default();
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new(); count];
         drop(tt);
         let tq = std::time::Instant::now();
         for i in 0..self.nodes.len() as u32 {
-            let k = keys[i as usize];
-            if self.role[i as usize] == Role::Const || !wanted.contains(&k) {
+            let g = group[i as usize];
+            if self.role[i as usize] == Role::Const || g == NO_GROUP {
                 continue;
             }
-            let peers = groups.entry(k).or_default().clone();
+            let peers = std::mem::take(&mut groups[g as usize]);
             let mut tries = 0;
-            for m in peers {
-                if self.digests[m as usize] != self.digests[i as usize] {
-                    continue;
-                }
+            for &m in &peers {
                 if self.find(m) == self.find(i) {
                     break;
                 }
@@ -2606,7 +2627,8 @@ impl Compose {
                     break;
                 }
             }
-            groups.entry(k).or_default().push(i);
+            groups[g as usize] = peers;
+            groups[g as usize].push(i);
         }
         // Atoms that are bitwise functions of the leaves of their definitions, at 64 bits or
         // fewer (where a digest is the value).
