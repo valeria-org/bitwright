@@ -13,6 +13,8 @@
 //! - some bits of a value against a constant (`(y | m) == k`, and `(y & c) == k` with `y` a
 //!   slice or a zero extension): the same bits of the value itself, `(x & c') == k'`, or the
 //!   slice of them where they are one run;
+//! - a value the facts leave one bit of against 0 or 1: that bit or its complement, the
+//!   truncation pushed into the value, when that is a smaller tree;
 //! - when none of those decides it, truncations and slices (`extract<lo, k>(f(x))`) pushed
 //!   into their operands and tried again at their own width, where a map that is no bijection at
 //!   the full width can be one of the bits read (`trunc<17>(2x² + x) == trunc<17>(2y² + y)` is
@@ -26,6 +28,8 @@
 //!
 //! At `a <u b`, `a <=u b`, `a <s b` and `a <=s b` (see `crate::invert::monotone`):
 //!
+//! - a sign test of a value rotated or shifted left by a constant: the bit of the value that
+//!   lands on top, or its complement (`rotl(x, 56) <s 0` is `extract<7, 1>(x)`);
 //! - both sides one strictly monotone layer over different operands (`f(x) <u f(y)`), or
 //!   `select` trees whose leaves all are: the operands (the trees over the inner values) are
 //!   compared instead, in the order the layer is monotone from, swapped for a decreasing layer,
@@ -102,11 +106,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             Some(e) => Some(e),
                             None => match masked(cx, &mut o, op, node.a, &c)? {
                                 Some(e) => Some(e),
-                                None => match narrowed(cx, &mut o, node.a)? {
-                                    Some(a) => solve(cx, &mut o, op, a, &c)?,
-                                    None => None,
-                                }
-                                .filter(|&e| smaller(cx, e, n)),
+                                None => match flag(cx, &mut o, op, n, node.a, &c)? {
+                                    Some(e) => Some(e),
+                                    None => match narrowed(cx, &mut o, node.a)? {
+                                        Some(a) => solve(cx, &mut o, op, a, &c)?,
+                                        None => None,
+                                    }
+                                    .filter(|&e| smaller(cx, e, n)),
+                                },
                             },
                         },
                     }
@@ -123,8 +130,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     } else {
         match (cx.const_val(node.a), cx.const_val(node.b)) {
-            (_, Some(c)) => solve_order(cx, &mut o, op, node.a, &c, false)?,
-            (Some(c), None) => solve_order(cx, &mut o, op, node.b, &c, true)?,
+            (_, Some(c)) => match sign_bit(cx, &mut o, op, node.a, &c, false)? {
+                Some(e) => Some(e),
+                None => solve_order(cx, &mut o, op, node.a, &c, false)?,
+            },
+            (Some(c), None) => match sign_bit(cx, &mut o, op, node.b, &c, true)? {
+                Some(e) => Some(e),
+                None => solve_order(cx, &mut o, op, node.b, &c, true)?,
+            },
             (None, None) => cancel_order(cx, &mut o, op, node.a, node.b)?,
         }
     };
@@ -317,6 +330,40 @@ fn masked(
         cx.c_bin(BinOp::And, y, c)
     })?;
     Ok(Some(compare(o, cx, op, bits, &k)?))
+}
+
+/// `x op k` for `k` 0 or 1 and an `x` whose other bits the facts know zero: the low bit of
+/// `x` or its complement, the truncation pushed into `x`, when that is a smaller tree than
+/// the comparison `n`. A flag kept in a byte and tested there (`((zext<8>(a) & zext<8>(b)) ^ 1)
+/// & zext<8>(c) != 1`) is then the one-bit function it computes (`~(~(a & b) & c)`).
+fn flag(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    n: u32,
+    lhs: u32,
+    k: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let w = k.width();
+    let one = *k == BitVec::one(w);
+    if w.bits() < 2 || !(one || k.is_zero()) {
+        return Ok(None);
+    }
+    let Some(f) = o.facts(cx, lhs)? else {
+        return Ok(None);
+    };
+    let high = BitVec::un_unchecked(crate::ops::UnOp::Not, &BitVec::one(w));
+    if BitVec::bin_unchecked(BinOp::And, &f.known.known_zero(), &high) != high {
+        return Ok(None);
+    }
+    let low = o.r.build(cx, |cx| cx.c_extract(lhs, 0, 1))?;
+    let low = narrowed(cx, o, low)?.unwrap_or(low);
+    // `x == 1` and `x != 0` are the bit; `x != 1` and `x == 0` its complement.
+    let e = match (op == CmpOp::Eq) == one {
+        true => low,
+        false => o.r.build(cx, |cx| cx.c_un(crate::ops::UnOp::Not, low))?,
+    };
+    Ok(smaller(cx, e, n).then_some(e))
 }
 
 /// A truncation or slice `extract<lo, k>(x)` pushed into `x` (see `casts`), when that is
@@ -519,6 +566,49 @@ fn cancel_order(
         return Ok(None);
     }
     Ok(Some(o.r.build(cx, |cx| cx.c_cmp(order.cmp(strict), x, y))?))
+}
+
+/// A sign test of a value rotated or shifted left by a constant (`rotl(x, k) <s 0`,
+/// `0 <=s x << k`, spelled either way): the bit of `x` that lands on top, or its complement.
+/// (The sign of the low byte is `rotl(x, 56) <s 0`, bit 7.)
+fn sign_bit(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    lhs: u32,
+    c: &BitVec,
+    const_left: bool,
+) -> Result<Option<u32>, Stop> {
+    // `x <s 0` and `x <=s −1` hold for a set top bit; `0 <=s x` and `−1 <s x` for a clear one.
+    let negative = match (op, const_left) {
+        (CmpOp::Slt, false) if c.is_zero() => true,
+        (CmpOp::Sle, false) if c.is_ones() => true,
+        (CmpOp::Sle, true) if c.is_zero() => false,
+        (CmpOp::Slt, true) if c.is_ones() => false,
+        _ => return Ok(None),
+    };
+    let node = cx.node(lhs);
+    let w = u64::from(node.width);
+    let Some(k) = (matches!(node.op, OpCode::RotL | OpCode::RotR | OpCode::Shl))
+        .then(|| cx.const_val(node.b).and_then(|k| k.to_u64()))
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let bit = match node.op {
+        OpCode::Shl if k >= w => return Ok(None),
+        OpCode::RotR => (w - 1 + k % w) % w,
+        _ => (w - 1 + w - k % w) % w,
+    };
+    o.r.meter.charge(Counter::PassWork, 1)?;
+    let x = node.a;
+    Ok(Some(o.r.build(cx, |cx| {
+        let b = cx.c_extract(x, bit as u16, 1)?;
+        match negative {
+            true => Ok(b),
+            false => cx.c_un(crate::ops::UnOp::Not, b),
+        }
+    })?))
 }
 
 /// `f(x) op c` (or `c op f(x)`, with `const_left`) as a comparison of `x` with a threshold, or

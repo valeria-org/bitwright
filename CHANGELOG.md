@@ -150,8 +150,8 @@ large to blast where 4 were.
 
 How far those questions fold, on the same 140. After what follows, 46 of the 47 `engine`
 roots are a constant (23 before; the last one is asked with an eighth of the others' fuel and
-folds with half of theirs), the 44 `forms_simplify` roots are left at 7,887 nodes together
-(19,164) and the five `simplify` roots at 718 (1,186), all 16 `valid_under` questions are
+folds with half of theirs), the 44 `forms_simplify` roots are left at 7,526 nodes together
+(19,164) and the five `simplify` roots at 706 (1,186), all 16 `valid_under` questions are
 proved (3) and every one of the 27 equalities is decided, 14 proved and 13 refuted (10 and
 13, four out of budget). The questions also take less time than before these changes: 18%
 less CPU over the set run back to back, none of them a quarter of a second, the median 76 ms.
@@ -277,6 +277,13 @@ less CPU over the set run back to back, none of them a quarter of a second, the 
   parity flag is spelled a bit at a time, `(b >>u 1 & 1) + (b & 1) + …` over a byte `b`, and
   its low bit was a sum of eight slices at one bit: it is `trunc<1>(popcnt(trunc<8>(x)))`,
   and the condition of every select in 41 of the 44 `forms_simplify` questions.
+- **A flag kept in a byte is its bit.** `x == 1`, `x != 1`, `x == 0` and `x != 0` for an `x`
+  whose other bits the facts know zero are the low bit of `x` or its complement, with the
+  truncation pushed into `x`, where that is a smaller tree: `((zext<8>(a) & zext<8>(b)) ^ 1) &
+  zext<8>(c) != 1`, three conditions combined as bytes and tested, is `~(~(a & b) & c)`. And a
+  sign test of a value rotated or shifted left by a constant is the bit that lands on top
+  (`rotl(x, 56) <s 0`, the sign of the low byte, is `extract<7, 1>(x)`), which then meets the
+  other readings of that bit.
 - **Two complements around a slice are none.** `~extract<k, n>(~x)` is `extract<k, n>(x)`
   (`not_extract_not`, `not_trunc_not`), and a select on a bit of a complement is the select
   on the bit with its sides swapped (`select_bit_of_not`, `select_low_bit_of_not`). (Moving

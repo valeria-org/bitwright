@@ -977,8 +977,10 @@ fn counted(cx: &Context, t: u32) -> Option<(u32, u128)> {
     };
     // A count of the bits `m` of `y`, before `y` is traced to the value it reads.
     let bit = |i: u32| (i < 128).then(|| 1u128 << i);
+    // (A truncation of a population count to one bit is that count, not a bit of a value.)
+    let truncated_count = n.op == OpCode::Extract && n.b == 0 && cx.node(n.a).op == OpCode::Popcnt;
     let (mut y, mut m): (u32, u128) = match n.op {
-        OpCode::Extract if w == 1 => (n.a, bit(n.b)?),
+        OpCode::Extract if w == 1 && !truncated_count => (n.a, bit(n.b)?),
         OpCode::Extract | OpCode::Zext | OpCode::Popcnt => {
             // A population count through a cast, or a bit extended.
             let inner = match n.op {
