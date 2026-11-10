@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **A relation between two nodes is proved on the expression as written first.** The
+  opaque-constant sweep proves a node equal to an earlier one plus a constant on their
+  difference with each operand taken on the bits its user reads. That writes one value read
+  under several masks once per mask, a sum with a constant as a sum of its own for each, and
+  a relation that is a bitwise identity over the value was then one over several carry
+  chains: half the proofs of a measured call took a thousand solver steps or more, and the
+  ones the readings could not find took their whole share. The difference as written is now
+  read first, within an eighth of that share. A question asked with an eighth of the usual
+  fuel went from 312 nodes to 80 in half the time, and the 44 `forms_simplify` questions of
+  the same set take a third less time (13% less CPU over the 140).
+
 ## 0.28.0
 
 Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and

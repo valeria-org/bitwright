@@ -654,6 +654,20 @@ fn related(
             Related::Open
         });
     }
+    // The difference as it is written first, within a small share: taking each operand on
+    // the bits its user reads writes one value read under several masks once per mask (a sum
+    // with a constant becomes a sum of its own for each), and a relation that is a bitwise
+    // identity over that value, which a cut at it shows at once, is then one over several
+    // carry chains. Of the relations proved in a measured call, the readings of the reduced
+    // difference took a thousand steps for half of them and the whole share for the ones
+    // they could not prove.
+    if subject != diff {
+        let (first, _, _) = readings_prove(r, cx, cfg, diff, &zero, RELATED_FIRST_SHARE)?;
+        if first {
+            count(r).opaque_proved += 1;
+            return Ok(Related::Proved(e));
+        }
+    }
     let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE)?;
     if decided {
         count(r).opaque_proved += 1;
@@ -661,6 +675,12 @@ fn related(
     }
     Ok(Related::Open)
 }
+
+/// The share of the readings of a relation's difference as written, before those of its
+/// reduction take [`SWEEP_SHARE`] (see [`related`]). At an eighth, one measured call asked
+/// with an eighth of the usual fuel went from 312 nodes to 80 in half the time, and 44
+/// others took a third less time; at a quarter and at a thirty-second it stopped at 186.
+const RELATED_FIRST_SHARE: u64 = SWEEP_SHARE / 8;
 
 /// The most nodes kept per node of those it was not proved related to (see `sweep_inner`).
 const SWEEP_UNPROVED: usize = 8;
