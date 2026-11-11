@@ -51,6 +51,10 @@ pub struct Config {
     /// `(x | -x) >>u 63` is `x != 0`, and a sum with a correction where a value is zero has
     /// no smaller writing without one. The enumeration is about a third larger with them.
     pub comparisons: bool,
+    /// Whether candidates may hold `select(c, a, b)`, `c` a candidate that is 0 or 1 at
+    /// every sample (a comparison, or what has a comparison's values: `1 >>u x` is `x == 0`),
+    /// read as `c != 0`. On by default: the smaller of two values is `select(x <u y, x, y)`.
+    pub selects: bool,
 }
 
 impl Default for Config {
@@ -64,6 +68,7 @@ impl Default for Config {
             restarts: 8,
             max_vars: 4,
             comparisons: true,
+            selects: true,
         }
     }
 }
@@ -77,6 +82,7 @@ setters!(Config {
     with_restarts: restarts: usize,
     with_max_vars: max_vars: usize,
     with_comparisons: comparisons: bool,
+    with_selects: selects: bool,
 });
 
 const UNARY: [UnOp; 2] = [UnOp::Not, UnOp::Neg];
@@ -116,6 +122,8 @@ enum Term {
     Bin(BinOp, u32, u32),
     /// A comparison, zero-extended to the target's width.
     Cmp(CmpOp, u32, u32),
+    /// `select(c != 0, a, b)`.
+    Sel(u32, u32, u32),
 }
 
 /// Values of width `w` in the low bits of a `u64`, and the operators on them, as bitwright
@@ -228,8 +236,17 @@ impl Search<'_> {
     fn add(&mut self, t: Term, size: u8, row: Vec<u64>) -> Option<u32> {
         let h = hash(&row);
         if let Some(list) = self.seen.get(&h)
-            && list.iter().any(|&k| self.row(k) == &row[..])
+            && let Some(&k) = list.iter().find(|&&k| self.row(k) == &row[..])
         {
+            // A comparison takes the place of a term of its size with its values that is
+            // none (`x == 0` of `1 >>u x`): it reads as what it is, and as a select's
+            // condition it is the condition. (Nothing is built over a term of this size yet.)
+            if matches!(t, Term::Cmp(..))
+                && self.sizes[k as usize] == size
+                && matches!(self.terms[k as usize], Term::Un(..) | Term::Bin(..))
+            {
+                self.terms[k as usize] = t;
+            }
             return None;
         }
         let k = self.terms.len() as u32;
@@ -251,10 +268,11 @@ impl Search<'_> {
         target: &[u64],
         max_size: u8,
         max_terms: usize,
-        comparisons: bool,
+        (comparisons, selects): (bool, bool),
         refuted: &mut dyn FnMut(u32, &Search<'_>) -> Result<bool, Error>,
     ) -> Result<Step, Error> {
-        match self.enumerate(leaves, target, max_size, max_terms, comparisons, refuted)? {
+        let grammar = (comparisons, selects);
+        match self.enumerate(leaves, target, max_size, max_terms, grammar, refuted)? {
             Step::Candidate => Ok(Step::Candidate),
             Step::Exhausted => self.pairs(target, refuted),
         }
@@ -332,7 +350,7 @@ impl Search<'_> {
         target: &[u64],
         max_size: u8,
         max_terms: usize,
-        comparisons: bool,
+        (comparisons, selects): (bool, bool),
         refuted: &mut dyn FnMut(u32, &Search<'_>) -> Result<bool, Error>,
     ) -> Result<Step, Error> {
         let n = self.n();
@@ -439,6 +457,52 @@ impl Search<'_> {
                     }
                 }
             }
+            if !selects {
+                continue;
+            }
+            // Selects: a condition of size `ci` (two nodes at least: no leaf is one), arms
+            // of sizes `j` and `size − 1 − ci − j`.
+            for ci in 2..size.saturating_sub(2) {
+                let conds: Vec<u32> = self.by_size[ci as usize]
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        let row = self.row(c);
+                        row.iter().all(|&v| v <= 1) && row.iter().any(|&v| v != row[0])
+                    })
+                    .collect();
+                if conds.is_empty() {
+                    continue;
+                }
+                let rest = size - 1 - ci;
+                for j in 1..rest {
+                    let left: Vec<u32> = self.by_size[j as usize].clone();
+                    let right: Vec<u32> = self.by_size[(rest - j) as usize].clone();
+                    for &c in &conds {
+                        for &a in &left {
+                            for &b in &right {
+                                if a == b {
+                                    continue;
+                                }
+                                let (rc, ra, rb) = (self.row(c), self.row(a), self.row(b));
+                                let row: Vec<u64> = (0..n)
+                                    .map(|p| if rc[p] != 0 { ra[p] } else { rb[p] })
+                                    .collect();
+                                let is_target = row[..] == target[..];
+                                if let Some(k) = self.add(Term::Sel(c, a, b), size, row)
+                                    && is_target
+                                    && !refuted(k, self)?
+                                {
+                                    return Ok(Step::Candidate);
+                                }
+                                if self.terms.len() >= max_terms {
+                                    return Ok(Step::Exhausted);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(Step::Exhausted)
     }
@@ -466,6 +530,28 @@ impl Search<'_> {
                 );
                 let c = cx.cmp(op, a, b)?;
                 cx.zext(c, width)?
+            }
+            Term::Sel(c, a, b) => {
+                // The condition as one bit: the comparison itself, or the term against 0.
+                let cond = match self.terms[c as usize] {
+                    Term::Cmp(op, x, y) => {
+                        let (x, y) = (
+                            self.build(cx, vars, width, x)?,
+                            self.build(cx, vars, width, y)?,
+                        );
+                        cx.cmp(op, x, y)?
+                    }
+                    _ => {
+                        let t = self.build(cx, vars, width, c)?;
+                        let zero = cx.zero(width)?;
+                        cx.cmp(CmpOp::Ne, t, zero)?
+                    }
+                };
+                let (a, b) = (
+                    self.build(cx, vars, width, a)?,
+                    self.build(cx, vars, width, b)?,
+                );
+                cx.select(cond, a, b)?
             }
         })
     }
@@ -673,7 +759,7 @@ pub fn synthesize_report(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Repo
                 &target,
                 limit,
                 cfg.max_terms,
-                cfg.comparisons,
+                (cfg.comparisons, cfg.selects),
                 &mut check,
             )?
         };
@@ -778,6 +864,29 @@ mod tests {
         assert!(!text.contains("!=") && !text.contains("=="), "{text}");
     }
 
+    /// Selects are candidates: the smaller of two values written without a branch is the
+    /// select, and so is a value replaced where another is zero.
+    #[test]
+    fn selects_are_candidates() {
+        for (src, want) in [
+            ("y ^ ((x ^ y) & -zext<64>(x <u y))", "select(x <u y, x, y)"),
+            ("y ^ ((x ^ y) & -zext<64>(x <s y))", "select(x <s y, x, y)"),
+            (
+                "(x & -zext<64>(z != 0)) | (y & (zext<64>(z != 0) - 1))",
+                "select(z == 0, y, x)",
+            ),
+        ] {
+            assert_eq!(synth(src, Width::W64).as_deref(), Some(want), "{src}");
+        }
+        // Without them, no select.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let e = cx.parse("y ^ ((x ^ y) & -zext<64>(x <u y))", &o).unwrap();
+        let out = synthesize(&mut cx, e, &Config::default().with_selects(false)).unwrap();
+        let text = out.map(|o| cx.display(o).to_string()).unwrap_or_default();
+        assert!(!text.contains("select"), "{text}");
+    }
+
     /// A sum with a correction where a value is zero, and a value with a flag in bits it has
     /// clear, under noise the engine leaves: each is two terms of the enumeration joined, of
     /// more nodes together than the enumeration reaches.
@@ -786,7 +895,7 @@ mod tests {
         for (src, want) in [
             (
                 "x1 - 2 - zext<64>((x0 == 0) | (x1 == 0))",
-                "x1 - zext<64>(x0 << x1 == x0) - 2",
+                "x1 - 2 - zext<64>(x0 << x1 == x0)",
             ),
             (
                 "(x & 0xffffff00) | zext<64>((x & ~1) == 2)",

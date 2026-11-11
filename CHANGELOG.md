@@ -230,8 +230,13 @@ chapter, *Solving*).
   (`t + c`, `t − c`, `c − t`, `t ^ c`; the other is looked up, not searched for). An answer
   of up to twice the enumeration's size is found where its top is one of these: `x1 − 2 −
   zext((x0 == 0) | (x1 == 0))` and `(x & 0xffffff00) | zext((x & ~1) == 2)`, of 11 and 9
-  nodes, are found under noise at the default size of 7, in about a second each. `select`
-  is not a candidate operator.
+  nodes, are found under noise at the default size of 7, in about a second each.
+- **Selects are candidates** (`synth::Config::selects`, on by default): `select(c, a, b)`
+  with `c` a candidate that is 0 or 1 at every sample. `y ^ ((x ^ y) & −zext(x <u y))` is
+  `select(x <u y, x, y)`. A comparison takes the place of a term of its size with its
+  values (`x == 0` of `1 >>u x`), so conditions read as comparisons. A search that finds
+  nothing takes the time it took: the terms kept are bounded by `max_terms` either way,
+  so with more operators fewer of the largest terms are reached.
 - **The constants a slice implies are candidates' constants**: bits `[lo, lo + n)` of a
   value give `2^n − 1`, that mask in place and `lo`, so `zext<64>(trunc<8>(x ^ y) ^
   trunc<8>(y))` is `x & 255`, which mentions no 255.
