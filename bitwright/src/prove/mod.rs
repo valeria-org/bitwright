@@ -184,6 +184,15 @@ pub struct Config {
     /// helps where the two sides are one arithmetic written twice (a limb against its word),
     /// and changes the search elsewhere.
     pub shared_sums: bool,
+    /// Read the divisions by constants that a compiler wrote as products by magic numbers
+    /// (`trunc((zext(x) · M) >>u k)`, a multiply-high and a shift, the signed forms) as the
+    /// divisions they are, before the question is blasted: the simplifier's division pass
+    /// alone, for a question asked without the simplifier ([`simplify`](Self::simplify)
+    /// reads them already). A multiplier's circuit against a divider's is beyond a search
+    /// (the 32-bit quotient by 10 is undecided after 200,000 conflicts); read, both sides
+    /// are one division. An equality at every input; not for a
+    /// [`certificate`](Self::certificate). Opt-in.
+    pub divisions: bool,
     /// Sweep the circuit before the first search: nodes that simulation shows equal (or
     /// complementary) are proved so one pair at a time, from the inputs up, by a solver of
     /// the circuit's clauses alone, and each equivalence is given to the search as clauses.
@@ -230,6 +239,7 @@ impl Default for Config {
             word_sampling: false,
             exhaustive_inputs: 0,
             shared_sums: false,
+            divisions: false,
             sweeping: true,
         }
     }
@@ -255,6 +265,7 @@ setters!(Config {
     with_word_sampling: word_sampling: bool,
     with_exhaustive_inputs: exhaustive_inputs: u8,
     with_shared_sums: shared_sums: bool,
+    with_divisions: divisions: bool,
     with_sweeping: sweeping: bool,
 });
 
@@ -298,6 +309,20 @@ fn simplifier_of(strict: bool, proved: bool) -> &'static crate::engine::Engine {
             (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
         }
         strategy.words_proved = proved;
+        crate::engine::Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap_or_else(|_| crate::engine::Engine::standard())
+    })
+}
+
+/// The division pass alone ([`Config::divisions`]).
+fn divisions_only() -> &'static crate::engine::Engine {
+    static ENGINE: std::sync::OnceLock<crate::engine::Engine> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let strategy =
+            crate::engine::Strategy::new("divisions", vec![crate::engine::Phase::Division]);
         crate::engine::Engine::builder()
             .builtin()
             .strategy(strategy)
@@ -1001,6 +1026,20 @@ impl Question {
             // A result that relies on constraints holds where they do, which is all a proof
             // under them needs.
             goal_node = s;
+        }
+        if cfg.divisions && !cfg.simplify && !cfg.certificate {
+            let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
+            let run = match assumptions {
+                Some(a) => run.with_assumptions(a),
+                None => run,
+            };
+            let goal = cx.handle(goal_node);
+            let out = divisions_only().run(cx, &[goal], run)?.roots[0];
+            goal_node = cx.id(out.expr)?;
+            if cx.const_val(goal_node).is_some_and(|v| !v.is_zero()) {
+                q.stats.rewritten = true;
+                return decided(q, Outcome::Proved(None));
+            }
         }
         let mut word_sampled = false;
         if (cfg.word_sampling || cfg.sample_mode == SampleMode::Words)

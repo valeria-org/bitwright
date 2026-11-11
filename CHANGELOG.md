@@ -153,7 +153,18 @@ chapter, *Solving*).
   results it gave.
 - **A tiny simplification does not pay for the context's size.** The runner's per-node
   tables cost what they hold: a five-node expression in a context of four million nodes
-  took 19 ms and takes 14 µs.
+  took 19 ms and takes 19 µs. In a context of at most 16,384 nodes they are the dense
+  tables they were (a hash map there cost the MBA datasets up to 40 % of their time).
+- **A linear MBA of five or six variables is read whole.** The linear-MBA pass looked at
+  fragments of at most 256 nodes, and a sum of twelve bitwise functions of five variables
+  written out has 600: such a sum was solved only where its parts happened to cancel
+  first. It reads fragments of up to 2,048 nodes. Of the 1,000 expressions of CoBRA's
+  `simba/e1_5vars` set 869 were solved, in 31 ms at the median; all are, in 9 ms.
+- **The limb pass's wide integers cost what machine integers do where the values are
+  small**: sums, products, shifts and comparisons of values of at most 64 or 128 bits take
+  the machine's own, forms are hashed as two words, and a bound over the bits of an AND is
+  added up a run of equal bits at a time. With 0.29.0's readings on the 256-bit integers
+  the MBA datasets took 10 to 25 % longer than 0.29.0; they take what it does within 2 %.
 - **Results are kept per engine and assumption set** (four sets): changing either no longer
   drops what the other had found.
 - **An equality of two linear MBAs is decided by the signature of their difference**, also
@@ -191,7 +202,37 @@ chapter, *Solving*).
   returned as a rule file and its ledger. Measured on the slow log it gains nothing over the
   passes it was learned from; `Remembered` is the memory that pays there.
 
+**The prover**
+
+- **Fixed: shared sums could ask another question** (`Config::shared_sums`, in 0.29.0). The
+  carry of a comparison is an exact quotient of three low sums as numbers. Added up as a
+  64-bit form, a slice cut at another's end has its upper part under the coefficient times
+  a power of two, which wraps where the coefficient is large (near `2^43`, cut at bit 21):
+  the quotient was then off by a multiple of `2^(64 − k)`, which a limb kept in a register
+  wider than the limb reads, and a true limb identity at a 44-bit split was written again
+  as a false one (reported from 23-bit limb products as "the prover's counterexample does
+  not refute"). The sum is taken per bit in 128 bits; no carry is given up for it. A slice
+  whose low sum cannot be kept as a number is left as a value.
+- **Divisions by constants read without the simplifier** (`Config::divisions`, opt-in): the
+  simplifier's division pass alone, for a question asked with `simplify` off. With the
+  simplifier (the default) `trunc<32>((zext<64>(x) · 0xcccccccd) >>u 35) == udiv(x, 10)`,
+  its 64-bit form and the quotient by 10,000 are proved without a search; without it they
+  are a multiplier against a divider, undecided after 200,000 conflicts, and with the
+  option they are proved as before.
+
+**Synthesis**
+
+- **Comparisons are candidates** (`synth::Config::comparisons`, on by default): `== != <u
+  <s`, each the value 0 or 1 at the target's width. `(x | −x) >>u 63` is `zext(x != 0)` and
+  `((~x & y) | ((~x | y) & (x − y))) >>u 63` is `zext(x <u y)`.
+- **The constants a slice implies are candidates' constants**: bits `[lo, lo + n)` of a
+  value give `2^n − 1`, that mask in place and `lo`, so `zext<64>(trunc<8>(x ^ y) ^
+  trunc<8>(y))` is `x & 255`, which mentions no 255.
+
 **Around it**
+
+- **The features `mba`, `smtlib` and `eqsat` are on by default** (with `check`, which was).
+  A build that wants the core alone says `default-features = false`.
 
 - **The solver in C and Python** (`bw_solver_*`, `bitwright.Solver`).
 - **Transformation verification asks one solver** for the rounds of a search and of a

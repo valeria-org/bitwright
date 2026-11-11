@@ -347,7 +347,11 @@ fn limb64(rng: &mut Rng, k: u16, steps: usize) -> (String, String) {
 /// above the limb is then the word's bits above too, read as they are).
 fn limb64_read(rng: &mut Rng, k: u16, steps: usize, j: u16) -> (String, String) {
     let operand = |rng: &mut Rng| {
-        let v = if rng.next().is_multiple_of(2) { "x" } else { "y" };
+        let v = if rng.next().is_multiple_of(2) {
+            "x"
+        } else {
+            "y"
+        };
         let c = (rng.next() | 1 << 43) >> (rng.next() % 24);
         let d = [21u16, 23, 25][(rng.next() % 3) as usize];
         match rng.next() % 7 {
@@ -439,5 +443,47 @@ fn a_wide_limb_of_products_is_its_words_slice_written_again() {
                 v[1]
             );
         }
+    }
+}
+
+/// A quotient by a constant as a compiler writes it (the product by a magic number in a
+/// register twice as wide, shifted) is the division: the prover's simplifier reads it, and
+/// no search is needed. Without the simplifier the question is the multiplier's circuit
+/// against the divider's, which a search of 2,000 conflicts does not decide; with
+/// [`Config::divisions`] the divisions are read all the same.
+#[test]
+fn a_quotient_by_a_magic_number_is_the_division() {
+    for (magic, quotient, w) in [
+        (
+            "trunc<32>((zext<64>(x:32) * 0xcccccccd) >>u 35)",
+            "udiv(x:32, 10)",
+            32,
+        ),
+        (
+            "trunc<64>((zext<128>(x:64) * 0xcccccccccccccccd) >>u 67)",
+            "udiv(x:64, 10)",
+            64,
+        ),
+        (
+            "trunc<64>((zext<128>(x:64) * 0x346dc5d63886594b) >>u 75)",
+            "udiv(x:64, 10000)",
+            64,
+        ),
+    ] {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let (a, b) = (
+            cx.parse(magic, &o).unwrap(),
+            cx.parse(quotient, &o).unwrap(),
+        );
+        let cfg = Config::default().with_max_conflicts(2_000);
+        let out = equal(&mut cx, a, b, &cfg).unwrap();
+        assert!(matches!(out, Outcome::Proved(_)), "{magic}: {out:?}");
+        let bare = cfg.with_simplify(false);
+        let out = equal(&mut cx, a, b, &bare).unwrap();
+        assert!(matches!(out, Outcome::Unknown(_)), "{magic}: {out:?}");
+        // Nor is it needed with the divisions read.
+        let out = equal(&mut cx, a, b, &bare.with_divisions(true)).unwrap();
+        assert!(matches!(out, Outcome::Proved(_)), "{magic}: {out:?}");
     }
 }

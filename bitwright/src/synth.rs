@@ -693,7 +693,10 @@ mod tests {
     fn a_slice_is_its_mask() {
         for (src, want) in [
             ("zext<64>(trunc<8>(x:64 ^ y) ^ trunc<8>(y))", "x & 255"),
-            ("zext<64>(trunc<8>(x:64)) + zext<64>(trunc<8>(~x))", "255:64"),
+            (
+                "zext<64>(trunc<8>(x:64)) + zext<64>(trunc<8>(~x))",
+                "255:64",
+            ),
             (
                 "zext<64>(extract<8, 8>(x:64 ^ y) ^ extract<8, 8>(y)) << 8",
                 "x & 65280",
