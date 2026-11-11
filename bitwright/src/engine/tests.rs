@@ -4114,3 +4114,67 @@ fn an_expression_under_a_mask_agrees_on_the_mask() {
     }
     assert!(changed > 50, "{changed}");
 }
+
+/// A root is asked as it would be alone, whatever roots the call has before it: a sum of two
+/// products that is one product, after its products as roots of their own (each as small as
+/// its normal form, and kept as it is).
+#[cfg(feature = "mba")]
+#[test]
+fn a_root_is_asked_as_alone_after_roots_that_were_kept() {
+    let mba = crate::mba::MbaConfig::default().with_opaque_sweep(true);
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate().with_mba(mba))
+        .build()
+        .unwrap();
+    for w in [Width::W32, Width::W64] {
+        let o = ParseOptions::width(w);
+        let sum = "(x & y) * (x | y) + (x & ~y) * (~x & y)";
+        let mut cx = Context::new();
+        let roots: Vec<Expr> = ["(x & y) * (x | y)", "(x & ~y) * (~x & y)", sum]
+            .iter()
+            .map(|t| cx.parse(t, &o).unwrap())
+            .collect();
+        let out = engine.run(&mut cx, &roots, Run::default()).unwrap();
+        assert_eq!(cx.display(out.roots[2].expr).to_string(), "x * y");
+    }
+}
+
+/// A select between a shift and its operand on the shift's count is the shift (a count of
+/// zero leaves the operand): as flags, as the values, and with the count tested at its own
+/// width; one on another value keeps its select.
+#[cfg(feature = "mba")]
+#[test]
+fn a_select_on_a_shift_count_is_the_shift() {
+    let mba = crate::mba::MbaConfig::default().with_opaque_sweep(true);
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate().with_mba(mba))
+        .build()
+        .unwrap();
+    for (src, want) in [
+        (
+            "select((y & 63) != 0, x << (y & 63) == 0, x == 0)",
+            "x << (y & 63) == 0",
+        ),
+        ("select(c != 0, x << c, x)", "x << c"),
+        ("select(c == 0, x, x >>u c)", "x >>u c"),
+        (
+            "select(trunc<6>(y) != 0, x << (y & 63), x)",
+            "x << (y & 63)",
+        ),
+        (
+            "select(z != 0, x << (y & 63) == 0, x == 0)",
+            "select(z != 0, x << (y & 63), x) == 0",
+        ),
+        (
+            "select(trunc<6>(y) != 0, x << (y & 127), x)",
+            "select(trunc<6>(y) != 0, x << (y & 127), x)",
+        ),
+    ] {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+        let out = engine.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(cx.display(out.roots[0].expr).to_string(), want, "{src}");
+    }
+}

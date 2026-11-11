@@ -1137,3 +1137,31 @@ fn shifted_powers_come_back_from_their_expansion() {
         }
     }
 }
+
+/// A remembered answer serves the budget it was found with and no other: under another the
+/// solver sizes its work otherwise and may answer otherwise, so what a shared solver says
+/// would depend on which budget asked first.
+#[test]
+fn the_memo_serves_an_answer_at_its_own_budget_only() {
+    let width = Width::new(64).unwrap();
+    let (x, y) = (V(0), V(1));
+    let e = add(
+        mul(and(x.clone(), y.clone()), or(x.clone(), y.clone())),
+        mul(and(x.clone(), not(y.clone())), and(not(x), y)),
+    );
+    let p = e.expr(&[width, width]);
+    let small = MbaBudget::default();
+    let large = MbaBudget::default().with_steps(2 * small.steps);
+    let s = NormalFormSolver::new(NfOptions::default());
+    let first = s.solve_counted(&p, &small);
+    assert_eq!(s.stats().memo_hits, 0);
+    // Another budget, larger or smaller than the answer's: asked anew.
+    let _ = s.solve_counted(&p, &large);
+    let tight = MbaBudget::default().with_steps(first.1 + 1);
+    let _ = s.solve_counted(&p, &tight);
+    assert_eq!(s.stats().memo_hits, 0);
+    // Its own: remembered, with what it cost.
+    let small_again = s.solve_counted(&p, &small);
+    assert_eq!(s.stats().memo_hits, 1);
+    assert_eq!(small_again.1, first.1);
+}

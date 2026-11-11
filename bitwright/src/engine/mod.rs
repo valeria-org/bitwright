@@ -2887,6 +2887,13 @@ impl Runner<'_, '_> {
         let inner = self.inner;
         let mut cur = root;
         let mut fin = Fin::FINAL;
+        // What the MBA phase kept as it is, is kept from the questions above it in the root
+        // it was asked in. Another root of the call is asked as it would be alone: a product
+        // that is a root and as small as its normal form would keep the sum of two such
+        // products, a later root, from being asked at all, and that sum is one product.
+        // (The call still remembers the answers: a fragment two roots share is asked once.)
+        #[cfg(feature = "mba")]
+        self.mba.kept.clear();
         // with the MBA phase's noise forms, the root is read with what its
         // conditions fix put into the operands they guard first (see `pass::push_context`):
         // a case table's noise folds once its selector's bits are constants, and the budget is

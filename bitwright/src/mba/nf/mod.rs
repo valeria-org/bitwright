@@ -207,15 +207,18 @@ pub struct NormalFormSolver {
     memo: Mutex<Memo>,
 }
 
-/// A remembered question: its content hash and whether evidence was asked for.
-type MemoKey = ([u64; 2], bool);
+/// A remembered question: its content hash, whether evidence was asked for, and the step
+/// budget it was asked with (a question asked with two budgets has an answer for each).
+type MemoKey = ([u64; 2], bool, u64);
 
 /// Answers by question, oldest forgotten first. An entry keeps its question, which must equal
 /// the one asked (a hash collision is a miss, never someone else's answer), the steps the
-/// answer cost and the step budget it was found within: an answer serves any budget of at
-/// least the steps it cost, a question that ran short any budget no larger than the one it
-/// ran short of (a host whose per-call budget shrinks as it is spent asks with a different
-/// limit each time).
+/// answer cost and the step budget it was found within. An answer serves that budget and no
+/// other: the solver sizes some of its work by the steps it has left (the certificates'
+/// tests, the forms rendered after the normal form's own, the fixed point), so under another
+/// budget, even one that covers what the answer cost, the question may be answered
+/// otherwise (proved where it was sampled), and a shared solver's answers would depend on
+/// which budget asked first.
 #[derive(Debug, Default)]
 struct Memo {
     answers: HashMap<MemoKey, (MbaExpr, MbaAnswer, u64, u64)>,
@@ -226,14 +229,7 @@ impl Memo {
     /// The answer to `p` within `budget`, and the steps finding it cost.
     fn get(&self, key: &MemoKey, p: &MbaExpr, budget: &MbaBudget) -> Option<(MbaAnswer, u64)> {
         let (q, a, steps, limit) = self.answers.get(key)?;
-        if q != p {
-            return None;
-        }
-        let serves = match a {
-            MbaAnswer::Exhausted => budget.steps <= *limit,
-            _ => budget.steps >= *steps,
-        };
-        serves.then(|| (a.clone(), *steps))
+        (q == p && budget.steps == *limit).then(|| (a.clone(), *steps))
     }
 
     fn put(
@@ -328,7 +324,7 @@ impl MbaSolver for NormalFormSolver {
             calls: 1,
             ..NfStats::default()
         };
-        let key = (p.key(), budget.evidence);
+        let key = (p.key(), budget.evidence, budget.steps);
         let remembered = self.memo.lock().ok().and_then(|m| m.get(&key, p, budget));
         let (answer, steps) = match remembered {
             Some(a) => {

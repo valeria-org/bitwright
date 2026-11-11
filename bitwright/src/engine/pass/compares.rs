@@ -1564,9 +1564,9 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
 ///
 /// - arms that read `c` (a flag a `setcc` and a carry both spell): `t` with `c` true and `f`
 ///   with `c` false, when they come out alike (`select(c, zext(c), zext(c) + 1)` is 1);
-/// - a flag (1 bit) chosen by a test of `p` against a constant `k`: the arm taken when
-///   `p != k`, when with `p` at `k` it is the other arm (a shift's flags by its count,
-///   `count != 0 ? r == 0 : x == 0`, with `x << 0` being `x`).
+/// - a value chosen by a test of `p` against a constant `k`: the arm taken when `p != k`,
+///   when with `p` at `k` it is the other arm (a shift's flags by its count, `count != 0 ?
+///   r == 0 : x == 0`, with `x << 0` being `x`; the shift's result itself likewise).
 ///
 /// Only one value: a select with its arms rewritten is no smaller, and the commit rule would
 /// take it on one run and not another.
@@ -1591,10 +1591,12 @@ fn one_value(
             return Ok(Some(t2));
         }
     }
-    // A flag's value only: on wider values the arm in place of the select shares less with
-    // the code around it.
+    // (Of any width: the arm in place of the select is the select's nodes fewer, and the
+    // commit rule weighs what it shares with the code around it. A shift's flags are often
+    // met after their select has been taken out of the comparisons, `select(count != 0, x
+    // << count, x) == 0`.)
     let cn = cx.node(c);
-    if cx.wid(t) != 1 || !matches!(cn.op, OpCode::Eq | OpCode::Ne) {
+    if !matches!(cn.op, OpCode::Eq | OpCode::Ne) {
         return Ok(None);
     }
     let (p, k) = match (cx.const_val(cn.a), cx.const_val(cn.b)) {
@@ -1603,10 +1605,46 @@ fn one_value(
         _ => return Ok(None),
     };
     let (held, other) = if cn.op == OpCode::Eq { (t, f) } else { (f, t) };
-    if !reads(cx, other, p) {
+    // The value tested, and the same value as the arm may spell it: a test of the low bits
+    // `trunc<n>(y)` is of `y & (2^n − 1)` too (the count of a shift, tested at its own
+    // width and used at the word's).
+    let mut repl = crate::hash::IdMap::default();
+    if reads(cx, other, p) {
+        repl.insert(p, k);
+    }
+    let pn = cx.node(p);
+    if pn.op == OpCode::Extract
+        && pn.b == 0
+        && pn.width < 64
+        && let Some(kv) = cx.const_val(k).and_then(|v| v.to_u64())
+    {
+        let (y, low) = (pn.a, (1u64 << pn.width) - 1);
+        let mut seen = crate::hash::IdMap::<u32, ()>::default();
+        let mut todo = vec![other];
+        let mut masks = Vec::new();
+        while let Some(v) = todo.pop() {
+            if v < y || seen.insert(v, ()).is_some() || seen.len() > MAX_ARM {
+                continue;
+            }
+            let vn = cx.node(v);
+            let masked =
+                |a: u32, b: u32| a == y && cx.const_val(b).and_then(|c| c.to_u64()) == Some(low);
+            if vn.op == OpCode::And && (masked(vn.a, vn.b) || masked(vn.b, vn.a)) {
+                masks.push(v);
+                continue;
+            }
+            todo.extend(vn.children());
+        }
+        for m in masks {
+            let to = r.build(cx, |cx| cx.mk_const_u64(cx.wid(m), kv))?;
+            repl.insert(m, to);
+        }
+    }
+    if repl.is_empty() {
         return Ok(None);
     }
-    Ok((with(r, cx, other, p, k)? == held).then_some(other))
+    let at = r.build(cx, |cx| Ok(cx.substitute_ids(&[other], &repl)?[0]))?;
+    Ok((at == held).then_some(other))
 }
 
 fn order_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Fixed: the normal-form solver's memo served an answer another budget would not
+  give.** A remembered answer served any budget of at least the steps it had cost, but the
+  solver sizes some of its work by the steps it has left (the certificates' tests, the
+  forms rendered after the normal form's own, the fixed point): asked with 1,048,576 steps
+  a question was answered `Sampled`, with twice as many `Proved`, and a solver that had
+  been asked one way first gave that answer to the other. Threads sharing a solver fill
+  the memo in any order, so a program's results differed from run to run. An answer now
+  serves the budget it was found with, and a question asked with two budgets has an
+  answer for each. On CoBRA's datasets and a deobfuscator's slow questions no answer
+  changes and the solver does the same work.
+- **Fixed: a root was not asked as it would be alone after roots the MBA phase kept.**
+  A fragment kept as it is (as small as its normal form, declined, or unproved) keeps the
+  fragments that hold it from being asked, and that was for the call: with `(x & y)·(x |
+  y)` and `(x & ~y)·(~x & y)` as roots before it, their sum, which is `x·y`, was never
+  asked. What is kept is kept within the root it was asked in.
+- **A select between a shift and its operand on the shift's count is the shift**, of any
+  width: `select(c != 0, x << c, x)` is `x << c`, and so `select((y & 63) != 0, x << (y &
+  63) == 0, x == 0)` is `x << (y & 63) == 0` again (the select is taken out of the
+  comparisons before the pass that read it as a flag meets it, and that pass read flags
+  only). A test of the low bits at their own width is of the masked value too: with
+  `trunc<6>(y) != 0` for the condition the same. A select on another value keeps its
+  select.
 - **A root that is a linear MBA whole is read as one before the first round**
   (`Stage::Whole`; `Strategy::whole_first`, on by default). The linear-MBA pass's step is
   taken at the root before the phases walk it, by the pass's own commit rule: one question
