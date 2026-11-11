@@ -34,6 +34,23 @@ pub(crate) use node::{AUX_POOLED, Node, OpCode};
 pub(crate) use symbols::{SymEntry, SymbolTable};
 pub use symbols::{SymbolId, SymbolKey};
 
+/// A state of a context to come back to ([`Context::checkpoint`], [`Context::rollback`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    tag: NonZeroU32,
+    nodes: u32,
+    wide: usize,
+    symbols: u32,
+}
+
+impl Checkpoint {
+    /// The number of nodes the context held: a handle with a lower
+    /// [`index`](Expr::index) is from before the checkpoint.
+    pub fn nodes(&self) -> u32 {
+        self.nodes
+    }
+}
+
 /// A handle to an expression node.
 ///
 /// A handle is valid only in the context, and the context generation, that created it. Using it
@@ -309,6 +326,9 @@ pub struct Context {
     eval_plan: Option<Box<eval::Plan>>,
     pub(crate) facts: crate::facts::FactCache,
     pub(crate) memo: crate::engine::Memo,
+    /// What a store of results tells the engine's run in progress, and what the run reports
+    /// back to it (see `engine::Remembered`).
+    pub(crate) sweep: crate::engine::SweepNotes,
     #[cfg(feature = "eqsat")]
     pub(crate) eqsat_memo: crate::eqsat::Memo,
     /// The extension operations this context can build.
@@ -360,6 +380,7 @@ impl Context {
             eval_plan: None,
             facts: self.facts.clone(),
             memo: self.memo.clone(),
+            sweep: Default::default(),
             #[cfg(feature = "eqsat")]
             eqsat_memo: self.eqsat_memo.clone(),
             registry: self.registry.clone(),
@@ -393,6 +414,7 @@ impl Context {
             eval_plan: None,
             facts: crate::facts::FactCache::default(),
             memo: crate::engine::Memo::default(),
+            sweep: Default::default(),
             #[cfg(feature = "eqsat")]
             eqsat_memo: crate::eqsat::Memo::default(),
             registry: None,
@@ -487,6 +509,98 @@ impl Context {
         self.retired.rotate_right(1);
         self.retired[0] = self.tag.get();
         self.tag = fresh_tag();
+    }
+
+    /// The state to come back to with [`rollback`](Self::rollback): what the context holds
+    /// now.
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            tag: self.tag,
+            nodes: self.nodes.len() as u32,
+            wide: self.wide_consts.len(),
+            symbols: self.symbols.entries.len() as u32,
+        }
+    }
+
+    /// Removes every node and symbol created since `at` and gives their memory back to the
+    /// context: the expressions of a query against a state that stays (a path condition and
+    /// what it is built from), without the context growing with each query.
+    ///
+    /// Handles created before the checkpoint stay valid and mean what they meant. **Handles
+    /// created after it must not be used again**: one is refused ([`Error::ForeignExpr`])
+    /// until the context has grown past its index, and names another node after that, which
+    /// no check can tell. Drop everything that holds such handles first (a
+    /// [`Solver`](crate::solve::Solver) does with
+    /// [`forget_since`](crate::solve::Solver::forget_since)).
+    ///
+    /// What the library remembers of the removed nodes goes with them; of the others, the
+    /// facts stay, and the simplifier's remembered results are dropped (they may name
+    /// removed nodes). An error, and nothing changes, when the checkpoint is of another
+    /// context, of before a [`clear`](Self::clear), or of a state this context has already
+    /// been rolled back past.
+    pub fn rollback(&mut self, at: Checkpoint) -> Result<(), Error> {
+        let (nodes, symbols) = (at.nodes as usize, at.symbols as usize);
+        if at.tag != self.tag
+            || nodes > self.nodes.len()
+            || at.wide > self.wide_consts.len()
+            || symbols > self.symbols.entries.len()
+        {
+            return Err(Error::Contract(
+                "a checkpoint of another context or of a state already rolled back past".into(),
+            ));
+        }
+        if nodes == self.nodes.len() && symbols == self.symbols.entries.len() {
+            return Ok(());
+        }
+        let seed = self.config.hash_seed;
+        for i in nodes..self.nodes.len() {
+            let hash = combine(seed, self.meta[i].shash);
+            if let Ok(entry) = self.interner.find_entry(hash, |&j| j as usize == i) {
+                entry.remove();
+            }
+        }
+        self.nodes.truncate(nodes);
+        self.meta.truncate(nodes);
+        self.wide_consts.truncate(at.wide);
+        for e in self.symbols.entries.drain(symbols..) {
+            self.symbols.index.remove(&e.key);
+        }
+        self.dag_cache.clear();
+        if let Some(plan) = &mut self.eval_plan {
+            plan.clear();
+        }
+        let widths = &self.nodes;
+        (self.facts).truncate(nodes, |i| {
+            Width::new(widths[i as usize].width).unwrap_or(Width::W1)
+        });
+        self.memo.clear();
+        #[cfg(feature = "eqsat")]
+        self.eqsat_memo.clear();
+        Ok(())
+    }
+
+    /// Forgets the results the engine keeps for the expressions of this context (what it made
+    /// of each node the last times it ran), and nothing else: the next run simplifies as in a
+    /// context that had only been built.
+    ///
+    /// A result is kept for a node, whatever the root it was found under, and the passes that
+    /// read a node's surroundings (how often it is used, which of its bits are read) may make
+    /// something else of it under another root. So in a context that lives long, what the
+    /// engine makes of an expression can depend on the expressions it was given before that
+    /// share parts with it: always an equal expression, not always the same one. A host that
+    /// wants results that depend less on what came before calls this between its questions,
+    /// and pays for the results it would have had.
+    ///
+    /// Less, not never. The passes count a node's uses over the nodes of the expression and
+    /// the nodes the run creates, and a node an earlier run left in the context is not created
+    /// again, so the count of what it uses can differ. For the same result as in a context of
+    /// its own, a question is asked between a [`checkpoint`](Self::checkpoint) and a
+    /// [`rollback`](Self::rollback), which removes what it built (the result is taken out
+    /// first, as text or by [`import`](Self::import) into another context).
+    pub fn forget_results(&mut self) {
+        self.memo.clear();
+        #[cfg(feature = "eqsat")]
+        self.eqsat_memo.clear();
     }
 
     /// Makes room for at least `additional` more nodes without reallocating (a host that knows
@@ -603,7 +717,7 @@ impl Context {
     }
 
     /// The structural hash of a (non-constant, non-symbol) node from its children's hashes.
-    fn structural_hash(&self, n: &Node) -> u64 {
+    fn node_hash(&self, n: &Node) -> u64 {
         let mut h = combine(u64::from(n.op as u8), u64::from(n.width));
         if n.op.as_ext().is_some() {
             // The operation by name and revision, not by registry position.
@@ -679,7 +793,7 @@ impl Context {
 
     /// Interns a canonical non-constant, non-symbol node.
     pub(crate) fn mk(&mut self, n: Node) -> Result<u32, Error> {
-        let shash = self.structural_hash(&n);
+        let shash = self.node_hash(&n);
         let nodes = &self.nodes;
         if let Some(&i) = self
             .interner
@@ -694,7 +808,7 @@ impl Context {
     pub(crate) fn find(&self, n: &Node) -> Option<u32> {
         let nodes = &self.nodes;
         self.interner
-            .find(self.table_hash(self.structural_hash(n)), |&i| {
+            .find(self.table_hash(self.node_hash(n)), |&i| {
                 nodes[i as usize] == *n
             })
             .copied()
@@ -851,6 +965,85 @@ impl Context {
     /// The width of an expression.
     pub fn width(&self, e: Expr) -> Result<Width, Error> {
         Ok(self.width_of(self.id(e)?))
+    }
+
+    /// The structural hash of an expression: a function of the expression alone (its
+    /// operators, widths, constants and symbol keys), the same in every context and
+    /// whatever was built before it, under one [`HASH_VERSION`](crate::HASH_VERSION). Equal
+    /// expressions hash alike; as with any hash, different ones may too. A fresh symbol
+    /// ([`fresh_symbol`](Self::fresh_symbol)) hashes by its number, which is of its context.
+    pub fn structural_hash(&self, e: Expr) -> Result<u64, Error> {
+        Ok(self.meta[self.id(e)? as usize].shash)
+    }
+
+    /// The hash of each root's shape: its operators and widths with every constant read as
+    /// "a constant of its width" and every symbol as "a symbol of its width", and the
+    /// operands of a commutative operator in no order. Expressions that differ only in
+    /// constants, in which symbols they read, or in the order construction gave such
+    /// operands (it depends on both) have one shape: the key under which what was learned
+    /// from one is looked up for the others. A function of the expression alone, under one
+    /// [`HASH_VERSION`](crate::HASH_VERSION).
+    pub fn shape_hashes(&mut self, roots: &[Expr]) -> Result<Vec<u64>, Error> {
+        let ids = self.ids(roots)?;
+        let mut shape: crate::hash::IdMap<u32, u64> = Default::default();
+        Ok(ids
+            .iter()
+            .map(|&i| self.shape_into(i, &mut shape))
+            .collect())
+    }
+
+    /// The shape hash of node `n` ([`shape_hashes`](Self::shape_hashes)), with `memo` holding
+    /// the shapes of the nodes met: what a caller asks next of the same memo costs what is
+    /// new below it.
+    pub(crate) fn shape_into(&self, n: u32, memo: &mut crate::hash::IdMap<u32, u64>) -> u64 {
+        let mut stack = vec![(n, false)];
+        while let Some((i, ready)) = stack.pop() {
+            if memo.contains_key(&i) {
+                continue;
+            }
+            let node = self.node(i);
+            if !ready {
+                stack.push((i, true));
+                stack.extend(node.children().map(|c| (c, false)));
+                continue;
+            }
+            // A different stream from the structural hash: the two never mean the same.
+            let mut h = combine(
+                0x7368_6170_6521,
+                combine(u64::from(node.op as u8), u64::from(node.width)),
+            );
+            match node.op {
+                OpCode::Const | OpCode::Sym => {}
+                OpCode::Extract => {
+                    h = combine(h, u64::from(node.b));
+                    h = combine(h, memo[&node.a]);
+                }
+                _ => {
+                    if node.op.as_ext().is_some() {
+                        let op = self.registry.as_deref().map_or(0, |r| r.hash_at(node.aux));
+                        h = combine(h, op);
+                    }
+                    if node.op.is_fp() {
+                        h = combine(h, u64::from(node.aux));
+                        if node.op == OpCode::FConvert {
+                            h = combine(h, u64::from(node.b));
+                        }
+                    }
+                    let commutative = node.op.as_bin().is_some_and(BinOp::is_commutative)
+                        || matches!(node.op, OpCode::Eq | OpCode::Ne);
+                    if commutative {
+                        let (a, b) = (memo[&node.a], memo[&node.b]);
+                        h = combine(combine(h, a.min(b)), a.max(b));
+                    } else {
+                        for c in node.children() {
+                            h = combine(h, memo[&c]);
+                        }
+                    }
+                }
+            }
+            memo.insert(i, h);
+        }
+        memo[&n]
     }
 
     /// A read-only view of an expression's top node.

@@ -24,6 +24,7 @@ mod diag;
 pub(crate) mod eval;
 pub mod ir;
 pub mod lean;
+pub mod lean_import;
 mod ledger;
 pub(crate) mod matcher;
 pub(crate) mod order;

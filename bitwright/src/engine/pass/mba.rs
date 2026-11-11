@@ -13,6 +13,49 @@ use crate::mba::{
 };
 use crate::{BinOp, UnOp};
 
+/// The MBA phase's state for a call: what it asked, and how deep it goes.
+#[derive(Default)]
+pub(crate) struct State {
+    /// The MBA solver's answers in this call, by question.
+    pub(crate) answers: crate::hash::IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
+    /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
+    pub(crate) unproved: crate::hash::IdMap<crate::mba::CacheKey, ()>,
+    /// Questions the solver ran out of steps on in this call, each with the steps it had (see
+    /// `pass::mba::ask`).
+    pub(crate) exhausted: crate::hash::IdMap<crate::mba::CacheKey, u64>,
+    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
+    /// declined by the solver for their size, answered with nothing that would make the DAG
+    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
+    pub(crate) kept: crate::hash::IdMap<u32, ()>,
+    /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
+    /// rounds ask within a few steps each until one changes nothing, and only then deeper.
+    pub(crate) depth: u8,
+    /// Whether a question of this round ran out of steps at that depth (or was not asked for
+    /// holding one that did), so a deeper round has something to ask.
+    pub(crate) deeper: bool,
+    /// The roots of the fragments whose questions ran out of steps at this round's depth:
+    /// a fragment holding one is not asked at this depth either (see `pass::mba::ask`).
+    pub(crate) shallow: crate::hash::IdMap<u32, ()>,
+    /// The opaque-constant candidates whose readings were asked in this call and decided
+    /// nothing: atoms to the readings of every candidate above them (see
+    /// `pass::mba::readings_prove`).
+    pub(crate) undecided: crate::hash::IdMap<u32, ()>,
+    /// The opaque-constant sweep's result for every node it examined in this call (the node
+    /// itself where it found nothing), so a sweep of another root or of one side of a case
+    /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
+    /// `pass::mba::sweep`).
+    pub(crate) swept: crate::hash::IdMap<u32, u32>,
+    /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
+    /// its samples showed (see `pass::mba::Witness`).
+    pub(crate) witnesses: Vec<Witness>,
+    /// The blocks the opaque-constant sweep asked the solver about in this call with a node
+    /// cut off and got no answer to within its steps: the blocks' roots, by the cut (see
+    /// `pass::mba::sweep_cut_at`).
+    pub(crate) cut_declined: crate::hash::IdMap<u32, crate::hash::IdMap<u32, ()>>,
+    /// The opaque-constant sweep's enumerations' buffers (see `pass::mba::Exhaust`).
+    pub(crate) exhaust: Exhaust,
+}
+
 /// Points for the always-on refutation check and for trusted sampling.
 const SAMPLE_POINTS: u32 = certify::SAMPLE_POINTS as u32;
 
@@ -222,6 +265,7 @@ fn sweep_inner(
     // Each node rebuilt over its operands' results (the constructors fold what constants make
     // trivial: `t & 0`, a product with zero), then asked about.
     let mut to: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+    let mut shapes: crate::hash::IdMap<u32, u64> = crate::hash::IdMap::default();
     let mut failures = 0usize;
     // A varying noise block that has one value on each side of a selector is reconstructed as
     // that selector after both sides are proved constant. Keep this narrow: the sweep already
@@ -249,18 +293,19 @@ fn sweep_inner(
             }
         };
     }
-    // The node examined last, recorded in `r.swept` once the next one begins (unless the
+    // The node examined last, recorded in `r.mba.swept` once the next one begins (unless the
     // budget ended while it was asked about, which left it unexamined).
     let mut pending: Option<u32> = None;
     'nodes: for &i in &order {
         if let Some(p) = pending.take()
             && !spent
         {
-            r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+            r.mba.swept.insert(p, to.get(&p).copied().unwrap_or(p));
         }
         // Examined by an earlier sweep of this call (of another root, or of a case's other
         // side): its result is equal to it, and asking again finds what that sweep found.
-        if let Some(&done) = r.swept.get(&i) {
+        if let Some(&done) = r.mba.swept.get(&i) {
+            r.emit_part(cx, crate::engine::Stage::Sweep, i, done);
             to.insert(i, done);
             if done == i {
                 classes.note(&r.samples[&i], i);
@@ -327,6 +372,7 @@ fn sweep_inner(
                 let rep = to.get(&rep).copied().unwrap_or(rep);
                 match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
                     Related::Proved(e) => {
+                        r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
                         to.insert(i, e);
                         continue 'nodes;
                     }
@@ -360,6 +406,7 @@ fn sweep_inner(
                 rewritten = asked!('nodes, sweep_cut(r, cx, cfg, cur));
             }
             if let Some(e) = rewritten {
+                r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
                 to.insert(i, e);
             }
             continue;
@@ -430,6 +477,14 @@ fn sweep_inner(
                 }
             }
         }
+        // A shape whose questions a store of results has only ever seen fail is not asked
+        // again (the store's caller chose that; see `Remembered`). Not counted as a failure:
+        // it cost nothing.
+        let shape = cx.sweep.wanted().then(|| cx.shape_into(cur, &mut shapes));
+        if !decided && !refuted && mixed && shape.is_some_and(|s| cx.sweep.fruitless(s)) {
+            count(r).opaque_skipped += 1;
+            continue;
+        }
         if !decided && !refuted && mixed {
             let seen;
             (decided, refuted, seen) =
@@ -453,11 +508,20 @@ fn sweep_inner(
                 }
             }
         }
+        if mixed
+            && !all_constant
+            && let Some(s) = shape
+        {
+            cx.sweep.note(s, decided);
+        }
         if decided {
             if !all_constant {
                 count(r).opaque_proved += 1;
             }
             let e = asked!('nodes, r.build(cx, |cx| cx.mk_const(&k)));
+            // (Of the candidate as the constants found below it left it: that is what was
+            // proved, and what a replay of the parts in order comes to.)
+            r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
             to.insert(i, e);
         } else if !refuted {
             failures += 1;
@@ -466,7 +530,7 @@ fn sweep_inner(
     if let Some(p) = pending
         && !spent
     {
-        r.swept.insert(p, to.get(&p).copied().unwrap_or(p));
+        r.mba.swept.insert(p, to.get(&p).copied().unwrap_or(p));
     }
     Ok(to.get(&root).copied().unwrap_or(root))
 }
@@ -690,9 +754,9 @@ fn exhaustive(
     k: &crate::BitVec,
 ) -> Result<Option<bool>, Stop> {
     // The call's buffers, taken for the decision (nothing below asks another).
-    let mut sc = std::mem::take(&mut r.exhaust);
+    let mut sc = std::mem::take(&mut r.mba.exhaust);
     let out = exhaustive_in(r, cx, &mut sc, root, k);
-    r.exhaust = sc;
+    r.mba.exhaust = sc;
     out
 }
 
@@ -967,7 +1031,7 @@ const WITNESSES: usize = 32;
 
 /// Keeps the input that gives the symbols `fixed` their values there as a witness of the call.
 fn note_witness(r: &mut Runner<'_, '_>, cx: &Context, fixed: Vec<(u32, crate::BitVec)>) {
-    if r.witnesses.len() >= WITNESSES {
+    if r.mba.witnesses.len() >= WITNESSES {
         return;
     }
     // A symbol's value agrees with what the host declared of it, as its samples do.
@@ -975,12 +1039,12 @@ fn note_witness(r: &mut Runner<'_, '_>, cx: &Context, fixed: Vec<(u32, crate::Bi
         .into_iter()
         .map(|(s, v)| (s, cx.declared_at(s).map_or(v, |d| d.fit(&v))))
         .collect();
-    if r.witnesses.iter().any(|w| w.fixed == fixed) {
+    if r.mba.witnesses.iter().any(|w| w.fixed == fixed) {
         return;
     }
-    r.witnesses.push(Witness {
+    r.mba.witnesses.push(Witness {
         fixed,
-        point: 2 + r.witnesses.len(),
+        point: 2 + r.mba.witnesses.len(),
         vals: crate::hash::IdMap::default(),
     });
 }
@@ -993,8 +1057,8 @@ fn witnessed(
     n: u32,
     k: &crate::BitVec,
 ) -> Result<bool, Stop> {
-    for w in 0..r.witnesses.len() {
-        let mut wit = std::mem::take(&mut r.witnesses[w]);
+    for w in 0..r.mba.witnesses.len() {
+        let mut wit = std::mem::take(&mut r.mba.witnesses[w]);
         let mut work = 0u64;
         let mut out = Ok(());
         let mut stack: Vec<(u32, bool)> = vec![(n, false)];
@@ -1038,7 +1102,7 @@ fn witnessed(
             }
         }
         let differs = wit.vals.get(&n).is_some_and(|v| v != k);
-        r.witnesses[w] = wit;
+        r.mba.witnesses[w] = wit;
         r.meter.charge(Counter::PassWork, work)?;
         out?;
         if differs {
@@ -2286,14 +2350,14 @@ fn sweep_cut_at(
     // asked all the same, none of those was answered; 333 of the others were.)
     let over = over_declined(r, cx, n, c, &bindings.atoms);
     if over {
-        r.cut_declined.entry(c).or_default().insert(n, ());
+        r.mba.cut_declined.entry(c).or_default().insert(n, ());
         return Ok(None);
     }
     let answer = cut_answer(r, &m, size, cfg, SWEEP_CUT_STEPS)?;
     match answer {
         Cut::Proved(expr) => Ok(Some(r.build(cx, |cx| lift_id(cx, &expr, &bindings))?)),
         Cut::Declined => {
-            r.cut_declined.entry(c).or_default().insert(n, ());
+            r.mba.cut_declined.entry(c).or_default().insert(n, ());
             Ok(None)
         }
         Cut::Open => Ok(None),
@@ -2305,7 +2369,7 @@ fn sweep_cut_at(
 /// A declined block's root is above its cut, so it is found only inside the fragment: not
 /// below the cut, nor below an atom.
 fn over_declined(r: &Runner<'_, '_>, cx: &Context, n: u32, c: u32, atoms: &[u32]) -> bool {
-    let Some(declined) = r.cut_declined.get(&c) else {
+    let Some(declined) = r.mba.cut_declined.get(&c) else {
         return false;
     };
     let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
@@ -2424,7 +2488,7 @@ fn readings_prove(
     // Each reading with its cost, and whether a refutation of it is one of `subject` (the
     // whole fragment, no open candidate cut out of it).
     let mut readings: Vec<(u64, bool, MbaExpr, Bindings)> = Vec::new();
-    let open = &r.mba_undecided;
+    let open = &r.mba.undecided;
     if open.contains_key(&subject) {
         return Ok((false, false, false));
     }
@@ -2534,7 +2598,7 @@ fn readings_prove(
         }
     }
     if !decided && !refuted && open_asked {
-        r.mba_undecided.insert(subject, ());
+        r.mba.undecided.insert(subject, ());
     }
     Ok((decided, refuted, seen))
 }
@@ -2610,7 +2674,7 @@ fn cases_fold(
         // A side an earlier sweep of this call examined (the side of a block below this
         // one, where the condition fixes what the two differ in) is that sweep's result:
         // every node below it was examined before it, and a sweep would only walk them.
-        *side = match r.swept.get(side) {
+        *side = match r.mba.swept.get(side) {
             Some(&done) => done,
             None => sweep_inner(r, cx, cfg, *side, false)?,
         };
@@ -3037,7 +3101,7 @@ enum Cap {
 /// they stand, a few of those took the steps of a call before the rest of it was asked
 /// anything; asked this way, a call spends what it has on the cheapest questions first.
 fn depth(r: &Runner<'_, '_>) -> Cap {
-    let times = DEPTH_FACTOR.checked_pow(u32::from(r.mba_depth));
+    let times = DEPTH_FACTOR.checked_pow(u32::from(r.mba.depth));
     Cap::Depth(times.map_or(u64::MAX, |t| DEPTH_STEPS.saturating_mul(t)))
 }
 
@@ -3390,7 +3454,7 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
 /// larger fragment back for the round only: [`Kept::Shallow`], where nothing below is kept
 /// for the call.
 fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> Option<Kept> {
-    if r.mba_kept.is_empty() && r.mba_shallow.is_empty() {
+    if r.mba.kept.is_empty() && r.mba.shallow.is_empty() {
         return None;
     }
     let mut found = None;
@@ -3403,10 +3467,10 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
         if seen.insert(i, ()).is_some() {
             continue;
         }
-        if r.mba_kept.contains_key(&i) {
+        if r.mba.kept.contains_key(&i) {
             return Some(Kept::Whole);
         }
-        if r.mba_shallow.contains_key(&i) {
+        if r.mba.shallow.contains_key(&i) {
             found = Some(Kept::Shallow);
         }
         stack.extend(cx.node(i).children());
@@ -3495,7 +3559,7 @@ fn ask(
         // No smaller a question than the one inside it that ran out of steps at this round's
         // depth: asked when that one has been.
         Some(Kept::Shallow) => {
-            r.mba_deeper = true;
+            r.mba.deeper = true;
             return Ok(Step::Normal(Fin::PROVISIONAL));
         }
         None => {}
@@ -3520,7 +3584,7 @@ fn ask(
     ]);
     // An answer the gate could not prove earlier in this call (not for lack of budget): the
     // same question would get the same answer and the same verdict.
-    if r.mba_unproved.contains_key(&key) {
+    if r.mba.unproved.contains_key(&key) {
         return Ok(Step::Normal(Fin::FINAL));
     }
     // What vouched for the answer (for an explanation): an answer from the cache was proved
@@ -3539,7 +3603,7 @@ fn ask(
         _ => {
             // A question asked earlier in this call whose answer was not committed then (not
             // smaller, say): the same answer (every answer but running short is complete).
-            let answer = match r.mba_answers.get(&key).cloned() {
+            let answer = match r.mba.answers.get(&key).cloned() {
                 Some(a) => {
                     count(r).cache_hits += 1;
                     a
@@ -3562,11 +3626,11 @@ fn ask(
                     // Whether a deeper round asks this question with more steps than it has
                     // here: running out of these is not the call's budget running out.
                     let shallow = deepens && limit == steps;
-                    if limit == 0 || r.mba_exhausted.get(&key).is_some_and(|&l| limit <= l) {
+                    if limit == 0 || r.mba.exhausted.get(&key).is_some_and(|&l| limit <= l) {
                         count(r).exhausted += 1;
                         if shallow {
-                            r.mba_shallow.insert(root, ());
-                            r.mba_deeper = true;
+                            r.mba.shallow.insert(root, ());
+                            r.mba.deeper = true;
                             return Ok(Step::Normal(Fin::PROVISIONAL));
                         }
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
@@ -3583,15 +3647,15 @@ fn ask(
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
                     r.meter.charge(Counter::MbaSteps, spent)?;
                     if a == MbaAnswer::Exhausted {
-                        r.mba_exhausted.insert(key, limit);
+                        r.mba.exhausted.insert(key, limit);
                         if shallow {
                             count(r).exhausted += 1;
-                            r.mba_shallow.insert(root, ());
-                            r.mba_deeper = true;
+                            r.mba.shallow.insert(root, ());
+                            r.mba.deeper = true;
                             return Ok(Step::Normal(Fin::PROVISIONAL));
                         }
                         // A fragment that holds this one is no smaller a question.
-                        r.mba_kept.insert(root, ());
+                        r.mba.kept.insert(root, ());
                     }
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
                         // Run short within what the account left it: more budget might
@@ -3600,7 +3664,7 @@ fn ask(
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
                     if a != MbaAnswer::Exhausted {
-                        r.mba_answers.insert(key, a.clone());
+                        r.mba.answers.insert(key, a.clone());
                     }
                     let kept = match &a {
                         MbaAnswer::Unsupported(why) => why.starts_with("too many"),
@@ -3608,7 +3672,7 @@ fn ask(
                         _ => false,
                     };
                     if kept {
-                        r.mba_kept.insert(root, ());
+                        r.mba.kept.insert(root, ());
                     }
                     a
                 }
@@ -3632,7 +3696,7 @@ fn ask(
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
-                        r.mba_kept.insert(root, ());
+                        r.mba.kept.insert(root, ());
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
                         discard(r, cx, before);
@@ -3682,8 +3746,8 @@ fn ask(
                         let fin = if own.over_budget {
                             Fin::capped(Exhausted::PassWork)
                         } else {
-                            r.mba_unproved.insert(key, ());
-                            r.mba_kept.insert(root, ());
+                            r.mba.unproved.insert(key, ());
+                            r.mba.kept.insert(root, ());
                             Fin::FINAL
                         };
                         return Ok(Step::Normal(fin));
@@ -3748,7 +3812,7 @@ fn ask(
         count(r).simplified += 1;
     } else if e != n {
         count(r).not_smaller += 1;
-        r.mba_kept.insert(root, ());
+        r.mba.kept.insert(root, ());
     }
     Ok(out)
 }

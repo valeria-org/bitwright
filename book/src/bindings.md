@@ -260,6 +260,56 @@ the other comparison methods build 1-bit expressions. `>>` is the logical shift.
 to its `Context` without owning it, so the context must outlive it; `Engine` is cheap to copy and
 thread-safe.
 
+## Solving
+
+The solver of the [Solving](solving.md) chapter is `bitwright.Solver` in Python and the
+`bw_solver_*` functions in C:
+
+```python
+import bitwright as bw
+
+cx = bw.Context()
+x = cx.symbol("x", 16)
+s = bw.Solver(cx.parse("x * 3 == y", 16), cx.parse("y <u 10", 16))
+big = cx.parse("x >u 0x8000", 16)
+assert s.check(big) is True  # an assumption is of one check
+assert s.value(x) > 0x8000 and (s.value(x) * 3) & 0xFFFF < 10
+s.push()
+s.add(cx.parse("y == 0", 16))
+assert s.check(big) is False
+assert ("assumption", 0) in s.core()
+s.pop()
+assert s.check() is True
+```
+
+```c
+#include <assert.h>
+#include <stddef.h>
+
+#include "bitwright.h"
+
+int main(void) {
+    bw_context *cx = bw_context_new();
+    bw_expr path, question, x;
+    assert(bw_parse(cx, "x * 3 == y", 16, &path) == BW_OK);
+    assert(bw_parse(cx, "x >u 0x8000", 16, &question) == BW_OK);
+    assert(bw_symbol(cx, "x", 16, &x) == BW_OK);
+
+    bw_solver *s = bw_solver_new();
+    assert(bw_solver_assert(s, cx, path, NULL) == BW_OK);
+    int answer;
+    assert(bw_solver_check(s, cx, &question, 1, &answer) == BW_OK);
+    assert(answer == BW_SAT); /* or BW_UNSAT, or BW_UNKNOWN */
+    bw_value v;
+    assert(bw_solver_value(s, cx, x, &v) == BW_OK);
+    assert(v.limbs[0] > 0x8000);
+
+    bw_solver_free(s);
+    bw_context_free(cx);
+    return 0;
+}
+```
+
 ## Floating point
 
 The three bindings build, print, inspect and evaluate the operations of the

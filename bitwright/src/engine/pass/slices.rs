@@ -22,8 +22,8 @@
 use super::{Fin, PassKind, Runner, Step, Stop, finish_within};
 use crate::Width;
 use crate::engine::budget::Counter;
+use crate::engine::oracle::{EqualityCaps, EqualityVerdict};
 use crate::expr::{Context, OpCode};
-use crate::prove::{self, Outcome, Unknown};
 
 /// The most nodes walked below a value.
 const MAX_CONE: usize = 512;
@@ -171,43 +171,36 @@ fn proved(
     let jw = Width::new(j).map_err(|e| Stop::Error(e.into()))?;
     let lhs = scx.extract(both[0], 0, jw).map_err(Stop::Error)?;
     let rhs = scx.extract(both[1], o, jw).map_err(Stop::Error)?;
-    let cfg = prove::Config::default()
-        .with_simplify(false)
-        .with_certificate(false)
-        // (A candidate that only agrees at the few verification samples is refuted by these
-        // before any search.)
-        .with_samples(256)
-        .with_max_nodes(MAX_AIG_NODES)
-        .with_max_conflicts(u64::MAX)
-        .with_max_propagations(propagations);
-    let mut q = prove::Question::equal(&mut scx, lhs, rhs, &cfg).map_err(Stop::Error)?;
-    let out = q.solve(&mut scx, cfg.limits()).map_err(Stop::Error)?;
-    let stats = q.stats();
-    let nodes = match &out {
-        Outcome::Unknown(Unknown::TooLarge { nodes }) => *nodes,
-        _ => stats.nodes,
+    // (A candidate that only agrees at the few verification samples is refuted by the
+    // samples before any search.)
+    let caps = EqualityCaps {
+        samples: 256,
+        max_nodes: MAX_AIG_NODES,
+        max_propagations: propagations,
     };
+    let out = (crate::circuit_equality())(&mut scx, lhs, rhs, &caps).map_err(Stop::Error)?;
+    let nodes = out.nodes;
     let cost = (nodes as u64)
-        .saturating_add(stats.propagations.saturating_mul(PROPAGATION_RATE))
+        .saturating_add(out.propagations.saturating_mul(PROPAGATION_RATE))
         .min(left);
     r.meter.charge(Counter::PassWork, cost)?;
     let c = count(r);
-    Ok(match out {
-        Outcome::Proved(_) => {
+    Ok(match out.verdict {
+        EqualityVerdict::Proved => {
             c.proved += 1;
             r.carries.fits.0 += 1;
             Ok(true)
         }
-        Outcome::Refuted(_) => {
+        EqualityVerdict::Refuted => {
             c.refuted += 1;
             Ok(false)
         }
         // Stopped short of the pass's own cap: more pass work may decide it.
-        Outcome::Unknown(Unknown::Budget { .. }) if propagations < PROPAGATIONS => {
+        EqualityVerdict::Budget if propagations < PROPAGATIONS => {
             c.unknown += 1;
             Err(Fin::capped(crate::engine::Exhausted::PassWork))
         }
-        Outcome::Unknown(_) => {
+        EqualityVerdict::Budget | EqualityVerdict::Unknown => {
             c.unknown += 1;
             r.carries.fits.1 += 1;
             Ok(false)

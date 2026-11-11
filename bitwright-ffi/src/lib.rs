@@ -28,6 +28,7 @@ use bw::{
 
 mod compiler;
 mod more;
+mod solver;
 #[cfg(test)]
 mod tests;
 

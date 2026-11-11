@@ -54,7 +54,9 @@ its proofs succeeds; the evidence counts the assignments proved and those left o
 solver has a conflict budget, `with_proof_conflicts`).
 
 `prove::rule` asks about one assignment, with a certificate on request: the clauses and a DRUP
-proof, checked by an independent checker. `prove::rule_all_widths` proves every assignment up
+proof, checked by an independent checker (`Certificate::lrat` gives the same proof as LRAT,
+each learned clause with the clauses it follows from, for a checker that does no search).
+`prove::rule_all_widths` proves every assignment up
 to a bound, and settles a rule of bitwise operations on its parameters and the constants 0 and
 all ones for every width at once: bit `i` of each side is one Boolean function of bit `i` of
 the parameters, the same at every position and every width, so width 1 decides it.
@@ -191,8 +193,10 @@ the `where` constraints), the guard a hypothesis, the proof `sorry` for you to w
 Lean covers every width at once, which neither the checker nor the prover can. `--at 8` writes
 each rule instead at the widest widths up to 8 it admits, proved by `bv_decide`, whose
 certificates Lean's kernel checks: an oracle that shares nothing with bitwright. Division is
-SMT-LIB's (`BitVec.smtUDiv`); floating point, bit counts, `pdep` and `pext`, which Lean's core
-`BitVec` lacks, leave a rule out with a comment.
+SMT-LIB's (`BitVec.smtUDiv`), and the counts are `BitVec.clz`, `BitVec.ctz` and `BitVec.cpop`;
+floating point, byte swaps, `pdep` and `pext`, which Lean's core `BitVec` lacks, leave a rule
+out with a comment (and a population count leaves it out of the instances for `bv_decide`,
+which does not read one yet).
 
 ```text
 $ bitwright lean --at 8 > rules8.lean && lean rules8.lean

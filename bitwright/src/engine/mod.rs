@@ -13,11 +13,18 @@
 //! # Ok::<(), bitwright::Error>(())
 //! ```
 
+mod analysis;
 pub(crate) mod budget;
+mod derive;
 mod dispatch;
 mod explain;
 pub(crate) mod host;
+#[cfg(feature = "check")]
+mod learn;
+#[cfg(feature = "prove")]
+pub(crate) mod oracle;
 pub(crate) mod pass;
+mod remember;
 mod stats;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -28,9 +35,19 @@ use std::sync::{Arc, OnceLock};
 
 use core::fmt;
 
+pub use analysis::{BitwiseForm, LinearForm, PredicateForm, XorForm};
 pub use budget::{Admission, Allowance, Budget, Cap, Clock, Deadline, Exhausted};
+#[cfg(feature = "prove")]
+pub use derive::Checked;
+#[cfg(feature = "mba")]
+pub(crate) use derive::corners_equal_given;
+pub use derive::{Derivation, Rewritten, Stretch};
 pub use explain::{Explanation, Peel, Source};
 pub use host::{Rewrite, Site};
+#[cfg(feature = "check")]
+pub use learn::{LearnConfig, Learned, learn};
+pub use remember::Remembered;
+pub(crate) use remember::SweepNotes;
 pub use stats::{
     By, CertStats, Detail, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus,
     RuleCounts, Stage, Stats,
@@ -209,6 +226,13 @@ pub struct Strategy {
     /// passes. A region cut short counts fewer nodes freed, so fewer rewrites commit; never a
     /// wrong one. 1024 by default.
     pub max_region: u32,
+    /// Whether the limb-arithmetic pass ([`Phase::Words`]) writes a result only once a
+    /// circuit and a search have proved it equal to what it replaces (with the feature
+    /// `prove`; without it, never). The pass derives its results by identities of the
+    /// integers and compares them at sample points; this asks for a proof that does not
+    /// rest on the pass, and drops the results the search cannot prove within its caps.
+    /// Off by default.
+    pub words_proved: bool,
 }
 
 impl Strategy {
@@ -221,7 +245,14 @@ impl Strategy {
             float_values: false,
             sharing: Sharing::Roots,
             max_region: pass::REGION_CAP,
+            words_proved: false,
         }
+    }
+
+    /// Sets [`words_proved`](Self::words_proved).
+    pub fn with_words_proved(mut self, yes: bool) -> Strategy {
+        self.words_proved = yes;
+        self
     }
 
     /// Sets [`float_values`](Self::float_values).
@@ -1083,14 +1114,20 @@ pub struct Outcome {
 }
 
 /// Completed per-phase results (with the constraints each relied on), kept in the context across
-/// calls and dropped whenever anything that can change a result changes (the engine, host hooks,
-/// assumptions).
+/// calls. Results are of what can change them (the engine, host hooks, assumptions): a call
+/// under others starts another set, and the few sets used last are kept, so alternating
+/// between two engines, or between a path condition and none, loses nothing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Memo {
     epoch: u128,
     assumptions: Option<Assumptions>,
     phases: Vec<PhaseMemo>,
+    /// The sets not in use, most recently used last.
+    others: Vec<(u128, Option<Assumptions>, Vec<PhaseMemo>)>,
 }
+
+/// The sets of results kept besides the one in use.
+const MEMO_SETS: usize = 3;
 
 /// One phase's final results: the result node of every node visited, and the constraints a
 /// result relied on, where it relied on any (only under assumptions).
@@ -1165,10 +1202,94 @@ impl Memo {
         let same = self.epoch == epoch
             && self.assumptions.as_ref() == assumptions
             && self.phases.len() == phases;
-        if !same {
-            self.epoch = epoch;
-            self.assumptions = assumptions.cloned();
-            self.phases = (0..phases).map(|_| PhaseMemo::default()).collect();
+        if same {
+            return;
+        }
+        // The set in use steps aside (an empty one is not worth a place).
+        let old = (
+            core::mem::replace(&mut self.epoch, epoch),
+            core::mem::replace(&mut self.assumptions, assumptions.cloned()),
+            core::mem::take(&mut self.phases),
+        );
+        let kept = |(e, a, p): &(u128, Option<Assumptions>, Vec<PhaseMemo>)| {
+            *e == epoch && a.as_ref() == assumptions && p.len() == phases
+        };
+        self.phases = match self.others.iter().position(kept) {
+            Some(at) => self.others.remove(at).2,
+            None => (0..phases).map(|_| PhaseMemo::default()).collect(),
+        };
+        if !old.2.is_empty() {
+            if self.others.len() == MEMO_SETS {
+                self.others.remove(0);
+            }
+            self.others.push(old);
+        }
+    }
+}
+
+impl<'r, 'a> Runner<'r, 'a> {
+    /// A runner at the start of a call over the roots `ids`.
+    fn new(
+        inner: &'r Inner,
+        meter: Meter<'a>,
+        observer: Option<&'a mut dyn Observer>,
+        hooks: Option<&'a dyn Hooks>,
+        assumptions: Option<&'r Assumptions>,
+        ids: &[u32],
+    ) -> Self {
+        Runner {
+            inner,
+            meter,
+            stats: Stats::default(),
+            observer,
+            hooks,
+            assumptions,
+            quarantined: Vec::new(),
+            host_quarantined: Vec::new(),
+            partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
+            cands: Vec::new(),
+            stack: Vec::new(),
+            samples: IdMap::default(),
+            compares: IdMap::default(),
+            shuffle: IdMap::default(),
+            residues: IdMap::default(),
+            chains: IdMap::default(),
+            quarantined_passes: Vec::new(),
+            scratch: pass::Scratch::default(),
+            linear_mba: Default::default(),
+            #[cfg(feature = "prove")]
+            carries: Default::default(),
+            words: Default::default(),
+            #[cfg(feature = "mba")]
+            mba: Default::default(),
+            active: 0,
+            rewritten: IdMap::default(),
+            chain_parent: IdMap::default(),
+            asks: IdMap::default(),
+            first: IdMap::default(),
+            detail: Detail::Events,
+            phase_name: "",
+            explain: None,
+            linear: Default::default(),
+            xor: Default::default(),
+            bitwise: Default::default(),
+            gf2: Default::default(),
+            demanded: Default::default(),
+            life: pass::Liveness {
+                live: pass::Live::default(),
+                uses_on: false,
+                uses_upto: 0,
+                phase_start: 0,
+                dead: pass::Marks::default(),
+                dead_log: Vec::new(),
+                live_roots: {
+                    let mut seen: IdMap<u32, ()> = IdMap::default();
+                    ids.iter()
+                        .copied()
+                        .filter(|&i| seen.insert(i, ()).is_none())
+                        .collect()
+                },
+            },
         }
     }
 }
@@ -1279,28 +1400,10 @@ struct Runner<'r, 'a> {
     stack: Vec<Frame>,
     /// Sampled verification: the values of every node evaluated so far at each point.
     samples: IdMap<u32, Box<[BitVec]>>,
-    /// The linear pass's forms, per node.
-    linear: pass::forms::FormCache<pass::linear::Form>,
-    /// The linear pass's sums over its cap on terms, whole (see `pass::forms::Whole`).
-    linear_whole: pass::forms::Whole<pass::linear::Form>,
-    /// The bitwise pass's truth tables, per node.
-    bitwise: IdMap<u32, pass::bitwise::Info>,
-    /// The bitwise pass's tables over up to six atoms, per node (read where three hide some).
-    bitwise_wide: IdMap<u32, pass::bitwise::Wide>,
-    /// Nodes whose bitwise region is beyond the bitwise pass's reading with constants (see
-    /// `pass::bitwise`): so is every region above them.
-    bitwise_beyond: IdMap<u32, ()>,
-    /// The xor pass's forms, per node.
-    xor: pass::forms::FormCache<pass::xor::Form>,
-    /// The xor pass's xors over its cap on terms, whole.
-    xor_whole: pass::forms::Whole<pass::xor::Form>,
     /// The compares pass's descriptions, per node.
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
     shuffle: IdMap<u32, pass::shuffle::Bits>,
-    /// The single atom the linear map below each node reads, if one (see `pass::gf2`).
-    gf2_atoms: Vec<u32>,
-    gf2_stack: Vec<(u32, bool)>,
     /// Residue tables, per node and number of low bits (see `pass::residue`).
     residues: IdMap<(u32, u32), Option<std::rc::Rc<pass::residue::Residues>>>,
     /// The chains of `·`, `&` or `|` found in order, or of more operands than are put in
@@ -1315,83 +1418,11 @@ struct Runner<'r, 'a> {
     /// The carries pass's scratch.
     #[cfg(feature = "prove")]
     carries: pass::carries::Scratch,
-    /// The demanded-bits pass's memo, empty between calls.
-    demanded: pass::demanded::Memo,
-    /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
-    /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
-    demanded_same: pass::demanded::Same,
-    /// What the opaque-constant sweep's reductions of its candidates found, per node and
-    /// demanded mask, for the call (see `pass::demanded::reduced`).
-    #[cfg(feature = "mba")]
-    reduced: [pass::demanded::Memo; 2],
-    /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
-    sum_constants: IdMap<(u32, u8), Vec<u32>>,
     /// The words pass's forms and marks.
     words: pass::words::State,
-    /// The MBA solver's answers in this call, by question.
+    /// The MBA phase's questions and answers in this call.
     #[cfg(feature = "mba")]
-    mba_answers: IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
-    /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
-    #[cfg(feature = "mba")]
-    mba_unproved: IdMap<crate::mba::CacheKey, ()>,
-    /// Questions the solver ran out of steps on in this call, each with the steps it had (see
-    /// `pass::mba::ask`).
-    #[cfg(feature = "mba")]
-    mba_exhausted: IdMap<crate::mba::CacheKey, u64>,
-    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
-    /// declined by the solver for their size, answered with nothing that would make the DAG
-    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
-    #[cfg(feature = "mba")]
-    mba_kept: IdMap<u32, ()>,
-    /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
-    /// rounds ask within a few steps each until one changes nothing, and only then deeper.
-    #[cfg(feature = "mba")]
-    mba_depth: u8,
-    /// Whether a question of this round ran out of steps at that depth (or was not asked for
-    /// holding one that did), so a deeper round has something to ask.
-    #[cfg(feature = "mba")]
-    mba_deeper: bool,
-    /// The roots of the fragments whose questions ran out of steps at this round's depth:
-    /// a fragment holding one is not asked at this depth either (see `pass::mba::ask`).
-    #[cfg(feature = "mba")]
-    mba_shallow: IdMap<u32, ()>,
-    /// The opaque-constant candidates whose readings were asked in this call and decided
-    /// nothing: atoms to the readings of every candidate above them (see
-    /// `pass::mba::readings_prove`).
-    #[cfg(feature = "mba")]
-    mba_undecided: IdMap<u32, ()>,
-    /// The opaque-constant sweep's result for every node it examined in this call (the node
-    /// itself where it found nothing), so a sweep of another root or of one side of a case
-    /// reads the nodes it shares with an earlier sweep instead of asking about them again (see
-    /// `pass::mba::sweep`).
-    #[cfg(feature = "mba")]
-    swept: IdMap<u32, u32>,
-    /// Inputs at which a candidate of the opaque-constant sweep was found to differ from what
-    /// its samples showed (see `pass::mba::Witness`).
-    #[cfg(feature = "mba")]
-    witnesses: Vec<pass::mba::Witness>,
-    /// The blocks the opaque-constant sweep asked the solver about in this call with a node
-    /// cut off and got no answer to within its steps: the blocks' roots, by the cut (see
-    /// `pass::mba::sweep_cut_at`).
-    #[cfg(feature = "mba")]
-    cut_declined: IdMap<u32, IdMap<u32, ()>>,
-    /// The opaque-constant sweep's enumerations' buffers (see `pass::mba::Exhaust`).
-    #[cfg(feature = "mba")]
-    exhaust: pass::mba::Exhaust,
-    /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
-    /// edges they count, per phase run, computed on first need (`uses_on`).
-    live: pass::Live,
-    uses_on: bool,
-    /// Arena nodes whose edges `live` already counts.
-    uses_upto: u32,
-    /// The arena length when the current phase run began.
-    phase_start: u32,
-    /// Nodes replaced (or built and discarded) in the current phase run: not parents.
-    dead: pass::Marks,
-    /// The nodes `dead` took in the current phase run, in order.
-    dead_log: Vec<u32>,
-    /// The current version of every distinct root of the call (for use counts).
-    live_roots: Vec<u32>,
+    mba: pass::mba::State,
     /// Which entry of `live_roots` is being processed.
     active: usize,
     /// The rewrites passes made in this call, from and to: in a pass's phase a node is not
@@ -1413,6 +1444,18 @@ struct Runner<'r, 'a> {
     /// The reasoning of the pass step under way, for the `Explain` event after its rewrite
     /// (recorded only under [`Detail::Explain`]).
     explain: Option<Explanation>,
+    /// The linear pass's forms.
+    linear: pass::forms::Forms<pass::linear::Form>,
+    /// The xor pass's forms.
+    xor: pass::forms::Forms<pass::xor::Form>,
+    /// The bitwise pass's descriptions.
+    bitwise: pass::bitwise::State,
+    /// The GF(2) pass's scratch.
+    gf2: pass::gf2::State,
+    /// The demanded-bits pass's results for the call.
+    demanded: pass::demanded::State,
+    /// What is live in the call: the use counts, the nodes retired, the roots.
+    life: pass::Liveness,
 }
 
 impl Runner<'_, '_> {
@@ -1425,6 +1468,18 @@ impl Runner<'_, '_> {
     /// Whether an observer receives events (the structural events are built only then).
     fn observing(&self) -> bool {
         self.observer.is_some()
+    }
+
+    /// Reports a part of a stage's rewrite (see [`Event::Part`]).
+    #[cfg_attr(not(feature = "mba"), allow(dead_code))]
+    pub(crate) fn emit_part(&mut self, cx: &Context, stage: Stage, before: u32, after: u32) {
+        if before != after && self.observing() {
+            self.emit(Event::Part {
+                stage,
+                before: cx.handle(before),
+                after: cx.handle(after),
+            });
+        }
     }
 
     /// Reports a stage's rewrite of the root, when it changed it.
@@ -1518,24 +1573,24 @@ impl Runner<'_, '_> {
         let mut stack = vec![n];
         let mut orphans: Vec<u32> = Vec::new();
         while let Some(n) = stack.pop() {
-            if !self.dead.insert(n) {
+            if !self.life.dead.insert(n) {
                 continue;
             }
-            self.dead_log.push(n);
-            if !self.live.uncount(n) {
+            self.life.dead_log.push(n);
+            if !self.life.live.uncount(n) {
                 continue;
             }
-            if !self.uses_on {
+            if !self.life.uses_on {
                 continue;
             }
             orphans.clear();
             for c in cx.node(n).children() {
-                if self.live.dec(c) == Some(0) {
+                if self.life.live.dec(c) == Some(0) {
                     orphans.push(c);
                 }
             }
             for &c in &orphans {
-                if self.live.counted(c) && !self.live_roots.contains(&c) {
+                if self.life.live.counted(c) && !self.life.live_roots.contains(&c) {
                     stack.push(c);
                 }
             }
@@ -1668,12 +1723,12 @@ impl Runner<'_, '_> {
         }
         // Use counts are counted afresh in each phase run, on first need (a pass's commit rule,
         // a rule's `one_use`).
-        self.uses_on = false;
-        self.live.begin();
-        self.dead.clear();
-        self.dead_log.clear();
-        self.phase_start = cx.len() as u32;
-        if let Some(slot) = self.live_roots.get_mut(self.active) {
+        self.life.uses_on = false;
+        self.life.live.begin();
+        self.life.dead.clear();
+        self.life.dead_log.clear();
+        self.life.phase_start = cx.len() as u32;
+        if let Some(slot) = self.life.live_roots.get_mut(self.active) {
             *slot = root;
         }
         if !matches!(self.inner.phases[phase], PhaseImpl::Local(..)) {
@@ -1683,7 +1738,7 @@ impl Runner<'_, '_> {
             self.chain_parent.clear();
             self.asks.clear();
             self.first.clear();
-            self.demanded_same.clear();
+            self.demanded.same.clear();
             self.words.begin();
         } else {
             // A rule's "no" from sharing (`one_use`) may be a "yes" once a phase since has
@@ -1795,7 +1850,7 @@ impl Runner<'_, '_> {
                         } else {
                             self.rewritten.insert((n, r), ());
                             *pending.entry(n).or_default() += 1;
-                            self.live.replace(n, r);
+                            self.life.live.replace(n, r);
                             self.retire(cx, n);
                             self.inherit_parent(n, r);
                             stack.push(Frame::Finish(n, r, fin));
@@ -1848,7 +1903,7 @@ impl Runner<'_, '_> {
                             }
                             // `n1` replaces `n`: `n` no longer counts as a user, and its
                             // users will use `n1`.
-                            self.live.replace(n, n1);
+                            self.life.live.replace(n, n1);
                             self.retire(cx, n);
                             self.inherit_parent(n, n1);
                             stack.push(Frame::Finish(n, n1, own));
@@ -1877,7 +1932,7 @@ impl Runner<'_, '_> {
                                 self.rewritten.insert((n, r), ());
                                 *pending.entry(n).or_default() += 1;
                             }
-                            self.live.replace(n, r);
+                            self.life.live.replace(n, r);
                             self.retire(cx, n);
                             self.inherit_parent(n, r);
                             stack.push(Frame::Finish(n, r, own.and(fin)));
@@ -1940,8 +1995,8 @@ impl Runner<'_, '_> {
             if one_use {
                 pass::refresh_uses(self, cx)?;
             }
-            let live = core::mem::take(&mut self.live);
-            let roots = core::mem::take(&mut self.live_roots);
+            let live = core::mem::take(&mut self.life.live);
+            let roots = core::mem::take(&mut self.life.live_roots);
             let mut once = |_: &Context, i: u32| live.uses(i) == Some(1) && !roots.contains(&i);
             let mut env = ApplyEnv {
                 assumptions: self.assumptions,
@@ -1967,8 +2022,8 @@ impl Runner<'_, '_> {
                 shared,
                 failed: env.failed,
             };
-            self.live = live;
-            self.live_roots = roots;
+            self.life.live = live;
+            self.life.live_roots = roots;
             let r = r?;
             self.meter.spent.match_steps += u64::from(steps - env.steps);
             self.meter.spent.fact_work += cx.facts.work - work0;
@@ -2449,89 +2504,14 @@ impl Engine {
             Some(a) => per_call.min(&a.remaining()),
             None => per_call,
         };
-        let mut runner = Runner {
+        let mut runner = Runner::new(
             inner,
-            meter: Meter::new(limit, deadline),
-            stats: Stats::default(),
+            Meter::new(limit, deadline),
             observer,
             hooks,
             assumptions,
-            quarantined: Vec::new(),
-            host_quarantined: Vec::new(),
-            partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
-            cands: Vec::new(),
-            stack: Vec::new(),
-            samples: IdMap::default(),
-            linear: Default::default(),
-            bitwise: IdMap::default(),
-            bitwise_wide: IdMap::default(),
-            bitwise_beyond: IdMap::default(),
-            xor: Default::default(),
-            linear_whole: Default::default(),
-            xor_whole: Default::default(),
-            compares: IdMap::default(),
-            shuffle: IdMap::default(),
-            residues: IdMap::default(),
-            gf2_atoms: Vec::new(),
-            gf2_stack: Vec::new(),
-            chains: IdMap::default(),
-            quarantined_passes: Vec::new(),
-            scratch: pass::Scratch::default(),
-            linear_mba: Default::default(),
-            #[cfg(feature = "prove")]
-            carries: Default::default(),
-            demanded: Default::default(),
-            demanded_same: Default::default(),
-            words: Default::default(),
-            #[cfg(feature = "mba")]
-            reduced: Default::default(),
-            sum_constants: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_answers: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_unproved: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_exhausted: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_kept: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_depth: 0,
-            #[cfg(feature = "mba")]
-            mba_deeper: false,
-            #[cfg(feature = "mba")]
-            mba_shallow: IdMap::default(),
-            #[cfg(feature = "mba")]
-            mba_undecided: IdMap::default(),
-            #[cfg(feature = "mba")]
-            swept: IdMap::default(),
-            #[cfg(feature = "mba")]
-            witnesses: Vec::new(),
-            #[cfg(feature = "mba")]
-            cut_declined: IdMap::default(),
-            #[cfg(feature = "mba")]
-            exhaust: Default::default(),
-            live: pass::Live::default(),
-            uses_on: false,
-            uses_upto: 0,
-            phase_start: 0,
-            dead: pass::Marks::default(),
-            dead_log: Vec::new(),
-            live_roots: {
-                let mut seen: IdMap<u32, ()> = IdMap::default();
-                ids.iter()
-                    .copied()
-                    .filter(|&i| seen.insert(i, ()).is_none())
-                    .collect()
-            },
-            active: 0,
-            rewritten: IdMap::default(),
-            chain_parent: IdMap::default(),
-            asks: IdMap::default(),
-            first: IdMap::default(),
-            detail: Detail::Events,
-            phase_name: "",
-            explain: None,
-        };
+            &ids,
+        );
         if let Some(o) = runner.observer.as_deref() {
             runner.detail = o.detail();
         }
@@ -2607,7 +2587,7 @@ impl Engine {
                     (r, end, rel)
                 }
             };
-            if let Some(slot) = runner.live_roots.get_mut(runner.active) {
+            if let Some(slot) = runner.life.live_roots.get_mut(runner.active) {
                 *slot = out.0;
             }
             version += u64::from(out.0 != root);
@@ -2617,14 +2597,14 @@ impl Engine {
         // Once every root is done, sharing that kept a rewrite back may be gone (a subterm
         // only other roots' parts used, simplified away since): those roots again, while that
         // changes something.
-        if runner.live_roots.len() > 1 {
+        if runner.life.live_roots.len() > 1 {
             let mut settled = false;
             for _ in 0..3 {
                 if failure.is_some() || provisional.is_empty() {
                     settled = true;
                     break;
                 }
-                runner.live.forget_others();
+                runner.life.live.forget_others();
                 let mut changed = false;
                 for (root, k, seen) in std::mem::take(&mut provisional) {
                     // Nothing rewritten since this root's result was reached: the live roots
@@ -2667,7 +2647,7 @@ impl Engine {
                             _ => &mut runner.stats.budget_terminated,
                         };
                         slot[usize::from(r != root)] += 1;
-                        if let Some(slot) = runner.live_roots.get_mut(k) {
+                        if let Some(slot) = runner.life.live_roots.get_mut(k) {
                             *slot = r;
                         }
                     } else if end != End::Completed {
@@ -2885,12 +2865,12 @@ impl Runner<'_, '_> {
     /// which the next round then is: one step deeper, or at the full depth (`full`).
     fn deepen(&mut self, full: bool) -> bool {
         #[cfg(feature = "mba")]
-        if self.mba_deeper {
-            self.mba_deeper = false;
-            self.mba_shallow.clear();
-            self.mba_depth = match full {
+        if self.mba.deeper {
+            self.mba.deeper = false;
+            self.mba.shallow.clear();
+            self.mba.depth = match full {
                 true => u8::MAX,
-                false => self.mba_depth.saturating_add(1),
+                false => self.mba.depth.saturating_add(1),
             };
             return true;
         }
@@ -2910,9 +2890,9 @@ impl Runner<'_, '_> {
         let max = inner.strategy.max_rounds.max(1);
         #[cfg(feature = "mba")]
         {
-            self.mba_depth = 0;
-            self.mba_deeper = false;
-            self.mba_shallow.clear();
+            self.mba.depth = 0;
+            self.mba.deeper = false;
+            self.mba.shallow.clear();
         }
         self.words.turn = false;
         // The rounds that changed the root, and every round (the number an observer sees).

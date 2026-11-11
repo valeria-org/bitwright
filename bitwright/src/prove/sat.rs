@@ -71,6 +71,100 @@ pub enum Answer {
     Unknown,
 }
 
+/// A SAT search behind a circuit that grows ([`Incremental`](super::Incremental)): bitwright's
+/// own [`Solver`], or another one a host links in (CaDiCaL, through the `bitwright-cadical`
+/// crate). Variables are numbered from 0 in the order they are made. A backend can be sent to
+/// another thread, so that what holds one can.
+pub trait Backend: core::fmt::Debug + Send {
+    /// A new variable.
+    fn new_var(&mut self) -> Var;
+
+    /// Adds a clause.
+    fn add_clause(&mut self, lits: &[Lit]);
+
+    /// Adds a clause, with two of its literals to watch first if the search can use the
+    /// hint. The default ignores it.
+    fn add_clause_watching(&mut self, lits: &[Lit], watches: [Lit; 2]) {
+        let _ = watches;
+        self.add_clause(lits);
+    }
+
+    /// Whether the clauses and `assumptions` hold together, within `limits` of search
+    /// counted from this call (a search that counts otherwise honours them as it can). The
+    /// assumptions are of this call only; what the search learned stays.
+    fn solve_assuming(&mut self, assumptions: &[Lit], limits: Limits) -> Answer;
+
+    /// After `solve_assuming` answered `Unsat`: assumptions of that call that conflict with
+    /// the clauses (none when the clauses alone are contradictory).
+    fn failed_assumptions(&self) -> Vec<Lit>;
+
+    /// Conflicts of every search so far.
+    fn conflicts(&self) -> u64;
+
+    /// Propagations of every search so far (0 from a search that does not count them).
+    fn propagations(&self) -> u64;
+}
+
+impl Backend for Solver {
+    fn new_var(&mut self) -> Var {
+        Solver::new_var(self)
+    }
+
+    fn add_clause(&mut self, lits: &[Lit]) {
+        Solver::add_clause(self, lits);
+    }
+
+    fn add_clause_watching(&mut self, lits: &[Lit], watches: [Lit; 2]) {
+        Solver::add_clause_watching(self, lits, watches);
+    }
+
+    fn solve_assuming(&mut self, assumptions: &[Lit], limits: Limits) -> Answer {
+        Solver::solve_assuming(self, assumptions, limits)
+    }
+
+    fn failed_assumptions(&self) -> Vec<Lit> {
+        self.failed.clone()
+    }
+
+    fn conflicts(&self) -> u64 {
+        self.conflicts
+    }
+
+    fn propagations(&self) -> u64 {
+        self.propagations
+    }
+}
+
+impl<B: Backend + ?Sized> Backend for Box<B> {
+    fn new_var(&mut self) -> Var {
+        (**self).new_var()
+    }
+
+    fn add_clause(&mut self, lits: &[Lit]) {
+        (**self).add_clause(lits);
+    }
+
+    fn add_clause_watching(&mut self, lits: &[Lit], watches: [Lit; 2]) {
+        (**self).add_clause_watching(lits, watches);
+    }
+
+    fn solve_assuming(&mut self, assumptions: &[Lit], limits: Limits) -> Answer {
+        (**self).solve_assuming(assumptions, limits)
+    }
+
+    fn failed_assumptions(&self) -> Vec<Lit> {
+        (**self).failed_assumptions()
+    }
+
+    fn conflicts(&self) -> u64 {
+        (**self).conflicts()
+    }
+
+    fn propagations(&self) -> u64 {
+        (**self).propagations()
+    }
+}
+
 /// The most work one call of [`Solver::solve_within`] may do, counted from the call's start.
 /// Both counters are deterministic: the same clauses and limits give the same answer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -148,6 +242,9 @@ pub struct Solver {
     seen: Vec<u8>,
     /// The formula is already contradictory (an empty clause, or a top-level conflict).
     unsat: bool,
+    /// After [`solve_assuming`](Self::solve_assuming) answered `Unsat`: assumptions that are
+    /// contradictory with the clauses (none when the clauses alone are).
+    failed: Vec<Lit>,
     proof: Option<Vec<Step>>,
     /// Restarts so far (the index into the Luby sequence).
     restarts: u32,
@@ -210,6 +307,7 @@ impl Solver {
             phase: Vec::new(),
             seen: Vec::new(),
             unsat: false,
+            failed: Vec::new(),
             proof: None,
             restarts: 0,
             here: 0,
@@ -989,6 +1087,7 @@ impl Solver {
     /// level and ends there: unlike [`solve_within`](Self::solve_within), an unfinished call
     /// is not resumed.
     pub(super) fn solve_assuming(&mut self, assumptions: &[Lit], limits: Limits) -> Answer {
+        self.failed.clear();
         if self.unsat {
             return Answer::Unsat;
         }
@@ -1033,7 +1132,10 @@ impl Solver {
                         continue;
                     }
                     // Falsified by the assumptions before it (and the clauses).
-                    Value::False => break Answer::Unsat,
+                    Value::False => {
+                        self.analyze_final(a);
+                        break Answer::Unsat;
+                    }
                     Value::Unset => a,
                 }
             } else {
@@ -1050,6 +1152,44 @@ impl Solver {
         };
         self.cancel_until(0);
         answer
+    }
+
+    /// `a`, an assumption found false at its turn, and the assumptions decided before it
+    /// that its falsity follows from: walked back along the reasons from `a`'s variable to
+    /// the decisions, which under assumptions are assumptions.
+    fn analyze_final(&mut self, a: Lit) {
+        self.failed.push(a);
+        let Some(&start) = self.trail_lim.first() else {
+            // False at the top level: by the clauses alone, whatever else is assumed.
+            return;
+        };
+        self.seen[a.var() as usize] = 1;
+        for i in (start..self.trail.len()).rev() {
+            let l = self.trail[i];
+            let v = l.var() as usize;
+            if self.seen[v] == 0 {
+                continue;
+            }
+            self.seen[v] = 0;
+            match self.reason[v] {
+                None => {
+                    if l != a {
+                        self.failed.push(l);
+                    }
+                }
+                Some(c) => {
+                    for k in 0..self.lits(c).len() {
+                        let q = self.lits(c)[k].var() as usize;
+                        // (Not the implied literal itself: it is done, and a mark left on
+                        // it would outlive this walk.)
+                        if q != v && self.level[q] > 0 {
+                            self.seen[q] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.seen[a.var() as usize] = 0;
     }
 
     /// Whether the clauses are known to be contradictory.

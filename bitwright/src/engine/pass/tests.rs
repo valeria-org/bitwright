@@ -6588,3 +6588,29 @@ mod opaque_constants {
         assert!(cx.as_const(free.expr).unwrap().is_none() && free.relies_on.is_none());
     }
 }
+
+/// Two linear MBAs that are one function are equal, also where each side is as small as it
+/// gets and neither is rewritten into the other: their difference has a zero signature.
+#[test]
+fn an_equality_of_linear_mbas_is_decided_by_the_signature_of_their_difference() {
+    for eng in [Engine::standard(), deobfuscator()] {
+        for (src, want) in [
+            // Disjoint terms: a sum is an or.
+            ("(a^b^c^d) + (a&b&c&d) == ((a^b^c^d) | (a&b&c&d))", "1:1"),
+            ("(a^b^c^d) + (a&b&c&d) != ((a^b^c^d) | (a&b&c&d))", "0:1"),
+            (
+                "(a&b&c) + (a|b|c|d) + (a^d) == (a|b|c|d) + (a|d) - (a&d) + (a&b&c)",
+                "1:1",
+            ),
+            // Atoms that are not symbols.
+            ("(x*y ^ z>>u 3) + 2*(x*y & z>>u 3) == x*y + (z>>u 3)", "1:1"),
+        ] {
+            check_to(&eng, src, want, 32);
+            check_to(&eng, src, want, 64);
+        }
+        // Not the same function: left as it is (a corner where they differ decides nothing
+        // about atoms that may never take it).
+        let e = simplify(&eng, "(a^b^c^d) + (a&b&c) == ((a^b^c^d) | (a&b&c))", 32);
+        assert!(e.contains("=="), "{e}");
+    }
+}

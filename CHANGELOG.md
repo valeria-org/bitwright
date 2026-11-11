@@ -1,5 +1,208 @@
 # Changelog
 
+## Unreleased
+
+bitwright becomes a solver that also simplifies (see `docs/design.md` §0 and the book's new
+chapter, *Solving*).
+
+**Solving**
+
+- **A solver session** (`bitwright::solve`, feature `prove`): `Solver` keeps an assertion
+  stack with `push` and `pop`, and answers `check`, `check_assuming` and `check_within` (a
+  deadline) with a model (`model`, `value`) or an unsatisfiable core (`unsat_core`: sound, not
+  minimal). A check answers from constants, independent slices, the last model, remembered
+  answers, a quick search on a circuit the solver keeps, then the prover; `decided_by` says
+  which.
+- **A model at the level of words before any circuit** (`solve::Config::probes`,
+  `DecidedBy::Probe`): the last model is repaired by solving each false predicate for one
+  symbol through the operators that can be undone, then a few assignments are tried; what
+  comes of it is evaluated. A new 64-bit equation that took 157 µs to blast and search takes
+  2 µs, a push, an assertion, a check and a pop 2 µs where they took 121 µs, and a check on a
+  path condition of 400 steps 84 µs where it took 344 µs.
+- **Products and divisions as unknowns** (`solve::Config::abstraction`, off by default;
+  `DecidedBy::Abstraction`): a question the quick search leaves open is asked with each
+  product, quotient and remainder of two unknowns as an unknown, defined when a model gets
+  it wrong. On the limb-arithmetic sets here it decides nothing the other stages do not and
+  costs up to twice their time, which is why it is off.
+- **Symbols that are not constrained are taken out** (`solve::Config::unconstrained`, off
+  by default): a symbol that occurs once under a sum, an exclusive or, a product by an odd
+  constant or an equality frees that term, and the model gives it its value back. Off
+  because the simplifier decides some questions by the form of their terms: of 18 large
+  equivalence questions one is no longer decided with it on.
+- **A local search after the assignments** (`solve::Config::local_search`, rounds; off by
+  default): a walk that repairs a false predicate or changes one of its symbols at random.
+  On 200 limb slices 16 rounds find two more models and cost each unsatisfiable question
+  40 µs more than its 60, which is why it is off.
+- **The store learns what the quick search needs** (`solve::Config::learn_budgets`, off by
+  default): `Answers` keeps, per shape of question, the most conflicts the kept circuit took
+  to decide one, and with the option a shape decided several times is given a few times
+  that. On the limb sets no shape recurs often enough for it to change anything.
+- **The quick search has 1,000 conflicts** (200 before): on three sets of limb-arithmetic
+  questions together, 579 ms where 200 conflicts took 1,218 ms.
+- **Fixed: a kept circuit stopped answering once it had 50,000 gates.** A question's
+  allowance of gates was counted from an empty circuit, so every later check of a long
+  session went to the prover. A kept circuit that is mostly of predicates no longer asked
+  is now started again.
+- **What an answer rests on** (`Solver::tier`, `(get-info :tier)`, `(get-info :decided-by)`):
+  a model that was evaluated; unsatisfiable by folding, by the circuit and the search alone,
+  after the simplifier, from an earlier answer, or from remembered hashes.
+- **One circuit and one search for many questions** (`prove::Incremental`): each predicate is
+  blasted and encoded once, the search keeps what it learns, and an unsatisfiable answer
+  names the predicates the last conflict went through. A path condition of 400 steps costs
+  0.4 ms a check where posing each question anew cost 9.5 ms.
+- **The SAT search behind a trait** (`prove::Backend`), with bitwright's own as the default
+  and CaDiCaL in the new `bitwright-cadical` crate (not a default member of the workspace: it
+  builds a C++ solver). `solve::Config::backend` gives the long searches to it.
+- **Definitions are solved before the prover is asked** (`solve::Config::solve_equations`):
+  `x == t` puts `t` for `x` in the rest of its slice, and the model gives `x` its value back.
+- **Answers that outlive the process** (`solve::Answers`): what checks answered, by the
+  hashes of the questions, as text the host keeps; a model from them is checked before use.
+- **Results that outlive the process** (`engine::Remembered`, `Engine::run_remembering`):
+  an expression the engine has simplified, or a part it took down to a few nodes, is replaced
+  by the result when it appears again, in any context or run. A second pass over the 96
+  simplification questions of a deobfuscator's slow log takes 8% of the first.
+- **A full store of results makes room, and stores merge** (`Remembered::with_max_entries`,
+  `Remembered::merge`): the eighth of the entries used longest ago is dropped when the
+  store is full (it stopped learning before), and the stores of two runs are one.
+- **A rollback for long sessions** (`Context::checkpoint`, `Context::rollback`,
+  `Solver::forget_since`): what a question built is removed when it is answered, and the
+  context stays the size of the state that lasts.
+- **Proofs as LRAT** (`prove::lrat`, `Certificate::lrat`): every learned clause with the
+  clauses it follows from, in the order unit propagation uses them, read off the DRUP proof
+  as it is checked; `lrat::check` verifies such a proof without any search and shares no
+  code with the solver or the DRUP checker, and `lrat::to_text` writes the format other
+  checkers read.
+- **The limb-arithmetic pass can be made to prove what it writes**
+  (`Strategy::words_proved`, `prove::Config::proved_words`, `solve --proved-words`): a result
+  replaces a root only once a circuit and a search have proved the two equal. Of 24 hard
+  limb questions it keeps 20, where leaving the pass out keeps 13.
+- **The engine's passes ask a prover through an interface**: the two passes that prove their
+  candidates no longer name the prover, which the crate hands them.
+- **`mba::decide`**: [`mba::equal`] with facts (expressions known to be zero, used where they
+  are bitwise functions of the parts: two fields with no bit in common make a sum a
+  disjunction) and with a witness when the sides differ (values of the symbols, evaluated).
+- **`prove::Config::strict`**: the prover's simplifier without the limb-arithmetic pass, the
+  one that commits what it derives without a proof.
+
+**SMT-LIB**
+
+- **Scripts run as a solver** (`smtlib::run`, `smtlib::Session`, `bitwright solve`): `push`,
+  `pop`, `check-sat`, `check-sat-assuming`, `get-model`, `get-value`, `get-unsat-core`,
+  `get-unsat-assumptions`, `get-assertions`, `get-info`, `get-option`, `set-option`,
+  `get-proof`, `echo`, `reset`, `reset-assertions`. A `Session` is fed a script in pieces and
+  answers each command when it is complete: `bitwright solve -` drives through a pipe.
+- **The importer reads more**: `define-fun` with parameters, `define-const`, `define-sort`
+  and `declare-sort` without parameters, `(! t :named n)`, the overflow predicates,
+  uninterpreted functions (a symbol per application and a constraint per pair of them),
+  and rounding-mode variables (a term is read once for each mode).
+- **Arrays are compared, chosen and constant**: `=` and `distinct` over arrays (a Boolean
+  with the constraints of extensionality), `ite` over arrays, `(as const …)`, and stores into
+  any of them.
+- **Quantifiers where a witness or a small domain decides them**: an asserted `exists` and a
+  denied `forall` bind new symbols at any width; elsewhere a quantifier is read once for each
+  value of up to 12 bits of variables, and a wider one is refused.
+- **Bit-vectors above 512 bits in a session**, up to 65,536: read as limbs, for the bitwise
+  operators, sums, differences, products, orders, shifts, rotations, `concat`, `extract`,
+  the extensions, `ite`, and the divisions and remainders (a bit of the quotient at a
+  time). On 38 scripts at 513 to 2,048 bits the values and answers are z3's.
+- **A rounding mode chosen by a condition** (`(ite c RTP r)`), as the mode of an operation
+  or compared with another: read once for each mode, like a rounding-mode variable.
+- **`solve --gates <n>`**: the most gates a check's circuit may have (4,000,000 by default).
+  A question of 320 stores at unknown addresses, each read back, needs more and was
+  answered `unknown`; with 16,000,000 it is answered.
+- **Integers where bit-vectors bound them**: `bv2nat` (`ubv_to_int`, `sbv_to_int`),
+  numerals, `+ - * abs`, `div` and `mod` by a constant that is not zero, the comparisons,
+  `ite` and `int2bv`, each read as a bit-vector wide enough that nothing wraps. An integer
+  variable has no range and is refused. 11 of 13 scripts give z3's answers and values; the
+  other two are identities z3 does not answer in a minute.
+- **Fixed: terms first read by `get-value` or `check-sat-assuming`** (an application of a
+  function, a read of a compared array) were answered before the constraints that tie them
+  to the others were asserted.
+- **What SMT-LIB leaves unspecified is open in a session**: the zero that `fp.min` and
+  `fp.max` return for zeros of different signs, and `fp.to_ubv`/`fp.to_sbv` of a NaN, an
+  infinity or a value out of range, were bitwright's own definitions, so a script could be
+  answered `unsat` where the standard has a model.
+- **`(exit)` ends a script.** The importer read the commands after it.
+- **Fixed: an assertion read as a definition while it constrained its own constant.** The
+  exporter's float-bits pattern `(ite (fp.isNaN T) (= c NAN) (= (to_fp c) T))` was read as the
+  definition of `c` also when `T` or `NAN` read `c`, which dropped the constraint: an
+  unsatisfiable script could import as satisfiable.
+
+**Lean**
+
+- **Theorems as rules, in the core** (`rules::lean_import`, `bitwright lean-rules`): the
+  importer moved from the WebAssembly crate; it refuses a statement whose proof is `sorry`,
+  reads a comparison stated `= true` or `= false` (and writes the rule for its negation too),
+  and `--verify` runs `lean` on the file first. With `solve::Config::simplifier`
+  (`solve --rules`) the rules take part in solving.
+- **Rules that count bits are stated** (`bitwright lean`): `clz`, `ctz` and `popcnt` as Lean
+  4.29's `BitVec.clz`, `BitVec.ctz` and `BitVec.cpop` (a population count only in the
+  statement for every width: `bv_decide` does not read one yet). At 8 bits Lean proves 373
+  of the 375 built-in rules it is given, `clz` and `ctz` among them.
+- **Cores as theorems** (`prove::lean_theorem`, `Solver::lean_theorem`, `(get-proof)`): the
+  conflicting assertions as a Lean 4 theorem with the proof `by bv_decide`.
+
+**The engine**
+
+- **Limb arithmetic is read back on words of up to 128 bits** (64 before). A sum, a
+  difference or an exclusive or written in limbs, with its carries and borrows, is the
+  word's own operation at any split of a word of 65 to 128 bits: a 128-bit sum in two
+  64-bit halves is `x + y`, and the high digit of a 67-bit sum with its carry as a
+  comparison is `extract<12, 55>(x + y)`. The pass computes in 256-bit integers for this; a
+  question with no node above 64 bits is read within the bounds it had, and gives the
+  results it gave.
+- **A tiny simplification does not pay for the context's size.** The runner's per-node
+  tables cost what they hold: a five-node expression in a context of four million nodes
+  took 19 ms and takes 14 µs.
+- **Results are kept per engine and assumption set** (four sets): changing either no longer
+  drops what the other had found.
+- **An equality of two linear MBAs is decided by the signature of their difference**, also
+  where neither side is rewritten into the other: `(s + t) == (s | t)` for disjoint `s` and
+  `t` is true.
+- **`Context::structural_hash`, `Context::shape_hashes`, `HASH_VERSION`**: an expression's
+  hash, and the hash of its shape (constants, symbols and the order of commutative operands
+  forgotten), as public, versioned functions of the expression alone.
+- **`mba::equal`**: whether two expressions are equal by the MBA procedures alone.
+- **The analyses without the rewriting** (`Engine::linear_form`, `xor_form`,
+  `bitwise_form`, `predicate_form`, `under_mask`): an expression as the sum of constant
+  multiples of terms, as the exclusive or of masked terms, as a truth table over at most
+  three terms on each class of bit positions; a predicate as a set of values of one term or
+  of relations of two; and an expression as it is where only some of its bits are read. What
+  the linear, xor, bitwise, comparison and demanded-bits passes read, with the context's
+  facts, each exact on a randomized test.
+- **A rolled-back question is answered as in a context of its own**: documented and tested.
+  What an earlier simplification leaves in a context can change the next one's result
+  where they share parts (the passes count the nodes a run creates as uses); between a
+  checkpoint and a rollback it cannot.
+- **`Context::forget_results`**: drops what the engine remembers of its earlier runs in the
+  context, for a host that wants a result to depend less on the expressions simplified
+  before.
+- **A simplification with its steps** (`Engine::derive`, `engine::Derivation`): every rewrite
+  with the rule or pass that made it, grouped by phase. `Derivation::check` proves each step
+  again without the engine (polynomial arithmetic, the corners of a linear MBA, or the circuit
+  and the search) and says what it could not; `Derivation::lean` writes the steps as Lean
+  theorems. The opaque-constant sweep reports the parts its rewrite of a root is made of
+  (`Event::Part`: each subexpression it proved constant or equal to another), so a sweep is
+  steps like any phase. On a deobfuscator's slow log 97% of 8,297 steps are proved and 192
+  of 199 phase transitions are accounted for by their steps; no question is certified end
+  to end yet.
+- **Rules from what passes did** (`engine::learn`, feature `check`): a pass's step with the
+  shared subexpressions as parameters, kept when the checker finds it sound and it is proved;
+  returned as a rule file and its ledger. Measured on the slow log it gains nothing over the
+  passes it was learned from; `Remembered` is the memory that pays there.
+
+**Around it**
+
+- **The solver in C and Python** (`bw_solver_*`, `bitwright.Solver`).
+- **Transformation verification asks one solver** for the rounds of a search and of a
+  minimisation.
+- **A ledger vouches for a rule by its content** (`Ledger::vouches_for`,
+  `Ledger::vouches_for_content`, `Ledger::merge`): a rule checked under one name is vouched
+  for in another file or group or under another name, since its hash is of the rule alone.
+- **`CheckConfig::with_require_proofs`**: a rule the native prover left undecided at some
+  width is then inconclusive, for admitting rules nobody reviewed. Off by default.
+- **A fuzz target for the prover** (`prove_dag`).
+
 ## 0.28.0
 
 Comparisons of limb arithmetic: digits of a wide number held in wider registers, compared and

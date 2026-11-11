@@ -5,7 +5,7 @@ the operators a processor has (arithmetic, bitwise logic, shifts and rotations, 
 extensions and extracts, bit counts), and IEEE 754 floating point in any format, on the
 bit-vectors that hold the encodings. It is for tools that reason about such expressions, for
 example binary analyzers, deobfuscators, decompilers and lifters, and it can be used from C,
-C++ and Python as well as Rust. It gives you three things:
+C++ and Python as well as Rust. It gives you four things:
 
 - **Exact values.** Every operator has total semantics: the SMT-LIB QF_BV definition, including
   division by zero and shifts past the width. Any expression has exactly one value for every
@@ -19,6 +19,11 @@ C++ and Python as well as Rust. It gives you three things:
   tables of three or fewer atoms, comparison lattices, linear mixed boolean-arithmetic). Every
   simplifier run is bounded by budgets you choose, and termination is guaranteed by
   construction.
+
+- **Answers.** Whether a set of constraints can hold together, with a model when it can and
+  the constraints that conflict when it cannot: a solver with an assertion stack
+  ([`solve`](https://docs.rs/bitwright/latest/bitwright/solve/index.html)), which also runs
+  SMT-LIB 2 scripts ([SMT-LIB](smtlib.md#solving)).
 
 For deobfuscation, bitwright undoes mixed boolean-arithmetic, linear and nonlinear, with its
 own solver and proofs; folds opaque predicates from what is known about their operands; brings

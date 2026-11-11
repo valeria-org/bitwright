@@ -70,3 +70,10 @@ path = "fuzz_targets/fp_dag.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "prove_dag"
+path = "fuzz_targets/prove_dag.rs"
+test = false
+doc = false
+bench = false

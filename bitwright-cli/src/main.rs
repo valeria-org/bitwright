@@ -28,6 +28,32 @@ commands:
         rule that never fires at all because another rule or a pass always gets there first.
   lint <file.bwr>
         compile and print every diagnostic; exit 1 on errors.
+  solve <file.smt2 | -> [--timeout <ms>] [--conflicts <n>] [--gates <n>] [--quick-conflicts <n>]
+        [--no-simplify] [--no-quick] [--strict] [--proved-words] [--cadical] [--answers <file>]
+        [--rules <file.bwr>]...
+        run an SMT-LIB 2 script as a solver (`-`: from standard input, each command answered
+        as it arrives, so a program may drive it through a pipe): `sat`,
+        `unsat` or `unknown` for each check-sat, models, values and unsatisfiable cores as
+        the script asks, `(error ...)` for a command that fails. --conflicts is the
+        search budget of a check (unlimited without it) and --gates the most gates its
+        circuit may have (4,000,000 without it; a check that needs more answers `unknown`); --no-simplify answers with the
+        circuit alone, --no-quick without the quick attempt before the simplifier
+        (--quick-conflicts is that attempt's budget). --timeout answers `unknown` for a check
+        still searching after that many milliseconds. --cadical gives the long searches
+        to CaDiCaL (in a build with the `cadical` feature). --strict simplifies without the
+        limb-arithmetic pass, the one that commits what it derived without a proof, and
+        --proved-words with that pass writing only what a circuit and a search prove. --answers keeps what the
+        checks answered in <file> (read at the start if it is there, written at the end): a
+        question answered in one run is answered from it in the next. --rules links a rule
+        file's rules into solving (vouched for as for `simplify`): a simplifier with them
+        runs on what a check has left before the prover is asked.
+  lean-rules <file.lean> [--verify]
+        Lean 4 theorems about BitVec as a rule file: each `theorem`, `lemma` or `example`
+        whose statement is an equation of bit-vector terms (under hypotheses that are
+        comparisons) becomes a rule, and each one not read, or whose proof is `sorry`, a
+        comment saying why. --verify runs `lean` on the file first and stops unless it
+        checks without error or `sorry`. Check the result as any rule file (`bitwright
+        check`), then use it with `simplify --rules` or `solve --rules`.
   smt <file.bwr> [--rule <group::name>] [--widths <w,...>]
         print each rule's soundness obligation as SMT-LIB 2.6, separated by (reset), for
         example `bitwright smt rules.bwr | z3 -in` or `| bitwuzla`: every answer must be
@@ -214,6 +240,8 @@ fn run(args: &[String]) -> Result<String, Fail> {
         "check" => check(rest),
         "lint" => lint(rest),
         "smt" => smt(rest),
+        "solve" => solve(rest),
+        "lean-rules" => lean_rules(rest),
         "catalog" => catalog(rest),
         "lean" => lean(rest),
         "prove" => prove(rest),
@@ -481,6 +509,190 @@ fn assignments(rule: &Rule, given: Option<&[u16]>) -> Vec<Vec<u16>> {
     let mut domain: Vec<u16> = (1..=16).collect();
     domain.extend([24, 32, 48, 64, 128, 256, 512]);
     admitted_over(rule, &domain, 3)
+}
+
+fn solve(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(
+        rest,
+        &[
+            "conflicts",
+            "quick-conflicts",
+            "timeout",
+            "no-simplify",
+            "no-quick",
+            "cadical",
+            "answers",
+            "rules",
+            "strict",
+            "proved-words",
+            "gates",
+        ],
+        &[
+            "no-simplify",
+            "no-quick",
+            "cadical",
+            "strict",
+            "proved-words",
+        ],
+    )?;
+    let path = a.one("script")?;
+    let mut prover = bitwright::prove::Config::default()
+        .with_simplify(!a.flag("no-simplify"))
+        .with_strict(a.flag("strict"))
+        .with_proved_words(a.flag("proved-words"));
+    if let Some(n) = a.value("conflicts") {
+        let n = n
+            .parse::<u64>()
+            .map_err(|_| usage(format!("bad --conflicts {n}")))?;
+        prover = prover.with_max_conflicts(n);
+    }
+    if let Some(n) = a.value("gates") {
+        let n = n
+            .parse::<usize>()
+            .map_err(|_| usage(format!("bad --gates {n}")))?;
+        prover = prover.with_max_nodes(n);
+    }
+    let mut cfg = bitwright::solve::Config::default().with_prove(prover);
+    if a.flag("no-quick") {
+        cfg = cfg.with_quick(None);
+    } else if let Some(n) = a.value("quick-conflicts") {
+        let n = n
+            .parse::<u64>()
+            .map_err(|_| usage(format!("bad --quick-conflicts {n}")))?;
+        let quick = bitwright::solve::Config::quick_default().with_max_conflicts(n);
+        cfg = cfg.with_quick(Some(quick));
+    }
+    /// Milliseconds since the command started.
+    struct Elapsed(std::time::Instant);
+    impl bitwright::engine::Clock for Elapsed {
+        fn now_ticks(&self) -> u64 {
+            self.0.elapsed().as_millis() as u64
+        }
+    }
+    // Rule files (the host's, or theorems from Lean: `bitwright lean-rules`) take part in
+    // solving: a simplifier with them runs before the prover.
+    let mut programs = Vec::new();
+    for file in a.values("rules") {
+        programs.push(vouched_rules(file)?);
+    }
+    if !programs.is_empty() {
+        // (Only then: linking the built-in rules is most of what a small script costs.)
+        let mut linked = Engine::builder().builtin();
+        let mut groups = Vec::new();
+        for (program, ledger) in programs {
+            groups.extend(program.groups().iter().map(|g| g.name.clone()));
+            linked = linked.program(program, &ledger);
+        }
+        let groups: Vec<&str> = groups.iter().map(String::as_str).collect();
+        let engine = linked
+            .strategy(Strategy::deobfuscate().with_rule_groups(&groups))
+            .build()
+            .map_err(|e| Fail::Err(2, format!("{e}")))?;
+        cfg = cfg.with_simplifier(Some(engine));
+    }
+    if a.flag("cadical") {
+        #[cfg(feature = "cadical")]
+        {
+            cfg = cfg.with_backend(Some(bitwright_cadical::backend()));
+        }
+        #[cfg(not(feature = "cadical"))]
+        return Err(Fail::Err(
+            2,
+            "--cadical needs a build with the `cadical` feature".into(),
+        ));
+    }
+    let limit = (a.value("timeout"))
+        .map(|ms| {
+            ms.parse::<u64>()
+                .map_err(|_| usage(format!("bad --timeout {ms}")))
+        })
+        .transpose()?;
+    let clock = Elapsed(std::time::Instant::now());
+    let mut cx = bitwright::Context::new();
+    let mut session = bitwright::smtlib::Session::new(&mut cx, &cfg);
+    if let Some(ms) = limit {
+        session = session.with_time_limit(&clock, ms);
+    }
+    let fail = |e: bitwright::Error| Fail::Err(2, format!("{path}: {e}"));
+    // Answers kept in a file between runs: read if it is there, written back at the end.
+    let store = a.value("answers");
+    if let Some(file) = store {
+        let known = match std::fs::read_to_string(file) {
+            Ok(text) => bitwright::solve::Answers::from_text(&text)
+                .map_err(|e| Fail::Err(2, format!("{file}: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bitwright::solve::Answers::new(),
+            Err(e) => return Err(Fail::Err(2, format!("{file}: {e}"))),
+        };
+        session = session.with_answers(known);
+    }
+    let save = |session: &bitwright::smtlib::Session<'_>| -> Result<(), Fail> {
+        if let (Some(file), Some(answers)) = (store, session.answers()) {
+            std::fs::write(file, answers.to_text())
+                .map_err(|e| Fail::Err(2, format!("{file}: {e}")))?;
+        }
+        Ok(())
+    };
+    if path != "-" {
+        // A file: checked whole before any command runs.
+        let src = read(path)?;
+        let mut out = String::new();
+        session.script(&src, &mut out).map_err(fail)?;
+        save(&session)?;
+        return Ok(out);
+    }
+    // Standard input: each command answered as it arrives, for a program on the other end
+    // of a pipe that reads an answer before it writes the next command.
+    use std::io::{BufRead, Write};
+    let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+    let mut line = String::new();
+    let mut out = String::new();
+    loop {
+        line.clear();
+        let n = (stdin.lock().read_line(&mut line)).map_err(|e| Fail::Err(2, format!("-: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        session.feed(&line, &mut out).map_err(fail)?;
+        if !out.is_empty() {
+            let mut o = stdout.lock();
+            (o.write_all(out.as_bytes()).and_then(|()| o.flush()))
+                .map_err(|e| Fail::Err(2, format!("-: {e}")))?;
+            out.clear();
+        }
+        if session.exited() {
+            break;
+        }
+    }
+    save(&session)?;
+    if session.pending() {
+        return Err(Fail::Err(2, "-: the input ends inside a command".into()));
+    }
+    Ok(String::new())
+}
+
+fn lean_rules(rest: &[String]) -> Result<String, Fail> {
+    let a = Args::parse(rest, &["verify"], &["verify"])?;
+    let path = a.one("Lean file")?;
+    let src = read(path)?;
+    if a.flag("verify") {
+        // Lean itself: the statements are theorems only if the file checks.
+        let run = std::process::Command::new("lean")
+            .arg(path)
+            .output()
+            .map_err(|e| Fail::Err(2, format!("lean: {e}")))?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        if !run.status.success() || said.contains("sorry") || said.contains("error") {
+            return Err(Fail::Err(
+                1,
+                format!("{path}: Lean does not accept every proof:\n{said}"),
+            ));
+        }
+    }
+    Ok(bitwright::rules::lean_import::to_bwr(&src))
 }
 
 fn smt(rest: &[String]) -> Result<String, Fail> {

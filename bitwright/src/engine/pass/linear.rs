@@ -43,6 +43,13 @@ pub(crate) struct Form {
     pub(super) fin: Fin,
 }
 
+impl Form {
+    /// The constant and the terms (atom, coefficient).
+    pub(crate) fn konst_terms(&self) -> (&BitVec, &[(u32, BitVec)]) {
+        (&self.konst, &self.terms)
+    }
+}
+
 impl super::forms::Parts for Form {
     fn parts(&self) -> (&BitVec, &[(u32, BitVec)], Fin) {
         (&self.konst, &self.terms, self.fin)
@@ -305,21 +312,25 @@ fn linear_op(op: OpCode) -> bool {
 }
 
 /// The form of `root`, computing (iteratively) and caching the forms below it.
-pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, Stop> {
+pub(in crate::engine) fn form_of(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Form, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.linear.contains(i) {
+        if r.linear.cache.contains(i) {
             continue;
         }
         let node = cx.node(i);
         if !linear_op(node.op) {
-            r.linear.insert(i, Form::atom(i, cx.width_of(i)));
+            r.linear.cache.insert(i, Form::atom(i, cx.width_of(i)));
             continue;
         }
         if !expanded {
             stack.push((i, true));
             for c in node.children() {
-                if !r.linear.contains(c) {
+                if !r.linear.cache.contains(c) {
                     stack.push((c, false));
                 }
             }
@@ -328,7 +339,7 @@ pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Re
         r.meter.charge(Counter::PassWork, 1)?;
         let (f, met) = compute(r, cx, i)?;
         if f.terms.len() <= MAX_TERMS {
-            r.linear.insert(i, f);
+            r.linear.cache.insert(i, f);
             continue;
         }
         // Over the cap: an atom, which keeps its whole form for the sums over it.
@@ -337,12 +348,13 @@ pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Re
             fin: f.fin,
             ..Form::atom(i, cx.width_of(i))
         };
-        r.linear.insert(i, atom);
+        r.linear.cache.insert(i, atom);
         let mut read = 0;
-        r.linear_whole.keep(i, f, met, &mut read);
+        r.linear.whole.keep(i, f, met, &mut read);
         r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     }
     Ok(r.linear
+        .cache
         .get(root)
         .expect("the root's form was just computed"))
 }
@@ -352,8 +364,12 @@ pub(super) fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Re
 fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
-    let get =
-        |r: &Runner<'_, '_>, j: u32| r.linear.get(j).expect("operands' forms are computed first");
+    let get = |r: &Runner<'_, '_>, j: u32| {
+        r.linear
+            .cache
+            .get(j)
+            .expect("operands' forms are computed first")
+    };
     let form = match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),
@@ -437,7 +453,7 @@ fn sum_of(r: &mut Runner<'_, '_>, cx: &Context, a: &Form, b: &Form) -> Result<(F
     let f = merge(cx, a.add(b));
     let met = f.terms.len() < a.terms.len() + b.terms.len();
     let mut read = 0;
-    let whole = r.linear_whole.meeting(a, b, &f, &mut read);
+    let whole = r.linear.whole.meeting(a, b, &f, &mut read);
     r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     Ok(match whole {
         // (`merge_fields` reads every term for each shifted one: within the cap only.)
@@ -954,7 +970,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let form = form_of(r, cx, n)?;
     let last = if form.is_atom_of(n) {
         // A sum over the cap in which terms met is written out again, from its whole form.
-        match r.linear_whole.met(n) {
+        match r.linear.whole.met(n) {
             Some(whole) => plain(r, cx, n, whole)?,
             None => Step::Normal(form.fin),
         }

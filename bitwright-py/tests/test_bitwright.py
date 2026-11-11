@@ -926,6 +926,34 @@ def test_lowering_and_raising(cx):
         lw.define(8, bw.Context().symbol("f", 64))
 
 
+def test_solver():
+    cx = bw.Context()
+    x, y = cx.symbol("x", 16), cx.symbol("y", 16)
+    s = bw.Solver(cx.parse("x * 3 == y", 16), cx.parse("y <u 10", 16))
+    assert len(s) == 2 and bw.Solver().check() is True
+    big = cx.parse("x >u 0x8000", 16)
+    assert s.check(big) is True
+    assert (s.value(x) * 3) & 0xFFFF == s.value(y) and s.value(x) > 0x8000
+    s.push()
+    assert s.add(cx.parse("y == 0", 16)) == 2
+    assert s.check(big) is False
+    core = s.core()
+    assert ("assumption", 0) in core and ("assertion", 0) in core
+    with pytest.raises(ValueError):
+        s.value(x)
+    s.pop()
+    assert s.check() is True
+    with pytest.raises(ValueError):
+        s.core()
+    with pytest.raises(bw.BitwrightError):
+        s.pop()
+    # A wide assertion; an expression of another context.
+    with pytest.raises(bw.BitwrightError):
+        s.add(x)
+    with pytest.raises(ValueError):
+        s.add(bw.Context().symbol("z", 1))
+
+
 def test_version():
     assert bw.__version__.count(".") == 2
 

@@ -1262,3 +1262,138 @@ fn declared_known_bits_are_checked_and_carried() {
         .unwrap();
     assert!(conflicting.import(&cx, &[sum]).is_err());
 }
+
+/// The structural hash is of the expression alone; the shape hash forgets constants, which
+/// symbols are read, and the order of commutative operands.
+#[test]
+fn hashes_are_of_the_expression_and_of_its_shape() {
+    let o = crate::ParseOptions::width(Width::W64);
+    let (mut a, mut b) = (Context::new(), Context::new());
+    // The same expression in two contexts, the second after other work.
+    b.parse("(q * 7) ^ (r + 1)", &o).unwrap();
+    let src = "((x ^ 0x5bd1e995) * 0x9e3779b1 + (y & 0xff)) >>u 3";
+    let (ea, eb) = (a.parse(src, &o).unwrap(), b.parse(src, &o).unwrap());
+    assert_eq!(
+        a.structural_hash(ea).unwrap(),
+        b.structural_hash(eb).unwrap()
+    );
+    let shape = |cx: &mut Context, s: &str| {
+        let e = cx.parse(s, &o).unwrap();
+        cx.shape_hashes(&[e]).unwrap()[0]
+    };
+    let base = shape(&mut a, src);
+    assert_eq!(base, shape(&mut b, src));
+    // Other constants, other symbols: one shape, many expressions.
+    let mut hashes = std::collections::HashSet::new();
+    for k in 0..200u64 {
+        let other = format!(
+            "((s{k} ^ {}) * {} + (t{k} & {})) >>u {}",
+            k.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1,
+            k * 2 + 3,
+            k + 1,
+            k % 60 + 1,
+        );
+        let e = a.parse(&other, &o).unwrap();
+        hashes.insert(a.structural_hash(e).unwrap());
+        assert_eq!(a.shape_hashes(&[e]).unwrap()[0], base, "{other}");
+    }
+    assert_eq!(hashes.len(), 200);
+    // Another operator, width or structure is another shape.
+    for other in [
+        "((x ^ 0x5bd1e995) * 0x9e3779b1 + (y | 0xff)) >>u 3",
+        "((x ^ 0x5bd1e995) * 0x9e3779b1 + (y & 0xff)) >>s 3",
+        "((x ^ 0x5bd1e995) * 0x9e3779b1 - (y & 0xff)) >>u 3",
+        "(x ^ 0x5bd1e995) * 0x9e3779b1 >>u 3",
+    ] {
+        assert_ne!(shape(&mut a, other), base, "{other}");
+    }
+    let narrow = crate::ParseOptions::width(Width::W32);
+    let e = a.parse("(x32 ^ 5) * 3", &narrow).unwrap();
+    let f = a.parse("(x ^ 5) * 3", &o).unwrap();
+    let hs = a.shape_hashes(&[e, f]).unwrap();
+    assert_ne!(hs[0], hs[1]);
+}
+
+/// A rollback removes what was built since the checkpoint and nothing else: the survivors
+/// keep their handles, values, facts and sharing, and what is built again afterwards is as
+/// if built for the first time.
+#[test]
+fn rollback_removes_what_was_built_since_the_checkpoint() {
+    use crate::engine::Engine;
+    let o = crate::ParseOptions::width(Width::W64);
+    let wide = crate::ParseOptions::width(Width::new(200).unwrap());
+    let mut cx = Context::new();
+    let kept = [
+        cx.parse("(x & 0xff) * 3 + (y ^ 0x1234)", &o).unwrap(),
+        cx.parse(
+            "(w + 0x123456789abcdef0123456789abcdef0123456789) * w",
+            &wide,
+        )
+        .unwrap(),
+    ];
+    let engine = Engine::standard();
+    let simplified = engine.simplify(&mut cx, kept[0]).unwrap().expr;
+    let facts_before = cx.facts(kept[0]).unwrap();
+    let text: Vec<String> = kept.iter().map(|&e| cx.display(e).to_string()).collect();
+    let at = cx.checkpoint();
+    let (nodes, symbols) = (cx.len(), cx.symbol_count());
+    for round in 0..50u64 {
+        // Narrow and wide constants, new symbols, facts and simplifier results: all since.
+        let q = cx
+            .parse(
+                &format!(
+                    "((x + t{round}) * {} ^ y) >>u {}",
+                    round * 2 + 1,
+                    round % 60
+                ),
+                &o,
+            )
+            .unwrap();
+        let big = cx
+            .parse(
+                &format!(
+                    "w * (w + 0x{:x}00000000000000000000000000000000001)",
+                    round + 1
+                ),
+                &wide,
+            )
+            .unwrap();
+        cx.facts(q).unwrap();
+        engine.simplify(&mut cx, q).unwrap();
+        engine.simplify(&mut cx, big).unwrap();
+        assert!(cx.len() > nodes);
+        cx.rollback(at).unwrap();
+        assert_eq!(
+            (cx.len(), cx.symbol_count()),
+            (nodes, symbols),
+            "round {round}"
+        );
+        // A handle from after the checkpoint is refused while nothing has taken its index.
+        assert!(matches!(cx.width(q), Err(Error::ForeignExpr)));
+        // The survivors are what they were.
+        for (&e, t) in kept.iter().zip(&text) {
+            assert_eq!(&cx.display(e).to_string(), t);
+        }
+        assert_eq!(cx.facts(kept[0]).unwrap(), facts_before);
+        assert_eq!(engine.simplify(&mut cx, kept[0]).unwrap().expr, simplified);
+        // Built again, an expression is found again (one node, not two), and a removed
+        // symbol's name is free at any width.
+        let again = cx.parse("(x & 0xff) * 3", &o).unwrap();
+        assert!(again.index() < at.nodes());
+        let t = cx.symbol(format!("t{round}").as_str(), Width::W8).unwrap();
+        assert!(t.index() >= at.nodes());
+        cx.rollback(at).unwrap();
+    }
+    // Rolling back to where the context is does nothing; a checkpoint from beyond, from
+    // another context or from before a clear is refused.
+    cx.rollback(at).unwrap();
+    let later = {
+        cx.parse("x + 99", &o).unwrap();
+        cx.checkpoint()
+    };
+    cx.rollback(at).unwrap();
+    assert!(cx.rollback(later).is_err());
+    assert!(Context::new().rollback(at).is_err());
+    cx.clear();
+    assert!(cx.rollback(at).is_err());
+}

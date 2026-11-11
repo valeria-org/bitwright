@@ -618,12 +618,43 @@ fn refines(cx: &mut Context, src: &Side, tgt: &Side) -> Result<Expr, Error> {
 
 /// A model of `q`, or `None` when there is none, or why it is not decided. With a
 /// certificate asked for, an unsatisfiable `q` is accepted only with a DRUP proof that the
-/// independent checker verifies.
+/// independent checker verifies, and each question is posed anew; without, `solver` answers
+/// (a search's rounds and a minimisation ask many questions about one encoding: it keeps
+/// the circuit and what the searches learn from one to the next).
 fn satisfy(
     cx: &mut Context,
     q: Expr,
     pcfg: &prove::Config,
+    solver: &mut crate::solve::Solver,
 ) -> Result<Result<Option<Model>, String>, Error> {
+    use crate::solve::Status;
+    if !pcfg.certificate {
+        solver.push();
+        solver.assert(cx, q)?;
+        let status = solver.check(cx);
+        let answer = match status {
+            Ok(Status::Sat) => {
+                // Every symbol of the question, at its value in the model.
+                let mut model = Vec::new();
+                for id in cx.symbols_in(&[q])? {
+                    let (Some(key), Some(w)) = (cx.symbol_key(id).cloned(), cx.symbol_width(id))
+                    else {
+                        continue;
+                    };
+                    let e = cx.symbol(key.clone(), w)?;
+                    if let Some(v) = solver.value(cx, e)? {
+                        model.push((key, v));
+                    }
+                }
+                Ok(Ok(Some(model)))
+            }
+            Ok(Status::Unsat) => Ok(Ok(None)),
+            Ok(Status::Unknown(why)) => Ok(Err(why.to_string())),
+            Err(e) => Err(e),
+        };
+        solver.pop(1)?;
+        return answer;
+    }
     let nq = cx.un(UnOp::Not, q)?;
     Ok(match prove::valid(cx, nq, pcfg)? {
         prove::Outcome::Proved(cert) => {
@@ -654,6 +685,7 @@ struct Search<'a> {
     src_choices: bool,
     rounds: usize,
     pcfg: prove::Config,
+    solver: crate::solve::Solver,
 }
 
 enum Found {
@@ -699,6 +731,10 @@ impl Search<'_> {
             pcfg: prove::Config::default()
                 .with_max_conflicts(cfg.conflicts)
                 .with_certificate(cfg.certify),
+            solver: crate::solve::Solver::new(
+                crate::solve::Config::default()
+                    .with_prove(prove::Config::default().with_max_conflicts(cfg.conflicts)),
+            ),
         })
     }
 
@@ -706,7 +742,7 @@ impl Search<'_> {
     fn find(&mut self, extra: Expr) -> Result<Found, Error> {
         for _ in 0..=self.rounds {
             let q = self.cx.bin(BinOp::And, self.base, extra)?;
-            let model = match satisfy(&mut self.cx, q, &self.pcfg)? {
+            let model = match satisfy(&mut self.cx, q, &self.pcfg, &mut self.solver)? {
                 Ok(None) => return Ok(Found::None),
                 Ok(Some(m)) => m,
                 Err(why) => return Err(Error::Unsupported(format!("unknown: {why}"))),
@@ -728,7 +764,7 @@ impl Search<'_> {
             )?
             .body(&self.t.src, true)?;
             let phi = refines(&mut self.cx, &src_s, &tgt_c)?;
-            let answer = match satisfy(&mut self.cx, phi, &self.pcfg)? {
+            let answer = match satisfy(&mut self.cx, phi, &self.pcfg, &mut self.solver)? {
                 Ok(None) => return Ok(Found::Point(pt)),
                 Ok(Some(m)) => m,
                 Err(why) => return Err(Error::Unsupported(format!("unknown: {why}"))),

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ffi", "bitwright-ref", "bitwright-wasm"]
+members = ["bitwright", "bitwright-bench", "bitwright-cadical", "bitwright-cli", "bitwright-ffi", "bitwright-ref", "bitwright-wasm"]
+# Not the CaDiCaL back end: it builds a C++ solver, which nothing else here needs.
+default-members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ffi", "bitwright-ref", "bitwright-wasm"]
 
 [workspace.package]
 version = "0.28.0"

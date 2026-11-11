@@ -28,6 +28,13 @@ pub(crate) struct Form {
     fin: Fin,
 }
 
+impl Form {
+    /// The constant and the terms (atom, mask).
+    pub(crate) fn konst_terms(&self) -> (&BitVec, &[(u32, BitVec)]) {
+        (&self.konst, &self.terms)
+    }
+}
+
 impl super::forms::Parts for Form {
     fn parts(&self) -> (&BitVec, &[(u32, BitVec)], Fin) {
         (&self.konst, &self.terms, self.fin)
@@ -127,21 +134,25 @@ fn xor_op(op: OpCode) -> bool {
     )
 }
 
-fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, Stop> {
+pub(in crate::engine) fn form_of(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Form, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.xor.contains(i) {
+        if r.xor.cache.contains(i) {
             continue;
         }
         let node = cx.node(i);
         if !xor_op(node.op) {
-            r.xor.insert(i, Form::atom(i, cx.width_of(i)));
+            r.xor.cache.insert(i, Form::atom(i, cx.width_of(i)));
             continue;
         }
         if !expanded {
             stack.push((i, true));
             for c in node.children() {
-                if !r.xor.contains(c) {
+                if !r.xor.cache.contains(c) {
                     stack.push((c, false));
                 }
             }
@@ -150,7 +161,7 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
         r.meter.charge(Counter::PassWork, 1)?;
         let (f, met) = compute(r, cx, i)?;
         if f.terms.len() <= MAX_TERMS {
-            r.xor.insert(i, f);
+            r.xor.cache.insert(i, f);
             continue;
         }
         // Over the cap: an atom, which keeps its whole form for the xors over it.
@@ -159,12 +170,15 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
             fin: f.fin,
             ..Form::atom(i, cx.width_of(i))
         };
-        r.xor.insert(i, atom);
+        r.xor.cache.insert(i, atom);
         let mut read = 0;
-        r.xor_whole.keep(i, f, met, &mut read);
+        r.xor.whole.keep(i, f, met, &mut read);
         r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     }
-    Ok(r.xor.get(root).expect("the root's form was just computed"))
+    Ok(r.xor
+        .cache
+        .get(root)
+        .expect("the root's form was just computed"))
 }
 
 /// The form of `i` from its operands' (cached) forms, and whether terms met in it (see
@@ -172,8 +186,12 @@ fn form_of(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Result<Form, 
 fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
     let node = cx.node(i);
     let w = cx.width_of(i);
-    let get =
-        |r: &Runner<'_, '_>, j: u32| r.xor.get(j).expect("operands' forms are computed first");
+    let get = |r: &Runner<'_, '_>, j: u32| {
+        r.xor
+            .cache
+            .get(j)
+            .expect("operands' forms are computed first")
+    };
     let form = match node.op {
         OpCode::Const => Form {
             konst: cx.const_val(i).unwrap_or(BitVec::zero(w)),
@@ -217,7 +235,7 @@ fn sum_of(r: &mut Runner<'_, '_>, a: &Form, b: &Form) -> Result<(Form, bool), St
     let f = a.xor(b);
     let met = f.terms.len() < a.terms.len() + b.terms.len();
     let mut read = 0;
-    let whole = r.xor_whole.meeting(a, b, &f, &mut read);
+    let whole = r.xor.whole.meeting(a, b, &f, &mut read);
     r.meter.charge(Counter::PassWork, read / MAX_TERMS as u64)?;
     Ok(match whole {
         Some(whole) => (whole, true),
@@ -378,7 +396,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     let last = if form.is_atom_of(n) {
         // An xor over the cap in which terms met is written out again, from its whole form.
-        match r.xor_whole.met(n) {
+        match r.xor.whole.met(n) {
             Some(whole) => plain(r, cx, n, whole)?,
             None => Step::Normal(form.fin),
         }

@@ -53,6 +53,12 @@ pub struct CheckConfig {
     pub proofs: u32,
     /// The SAT solver's conflict budget per proof.
     pub proof_conflicts: u64,
+    /// Whether [`Verdict::Sound`] needs those proofs: with it, a rule the prover left undecided
+    /// at some width assignment, or proved at none while its exhaustive tier is not complete,
+    /// is [`Verdict::Inconclusive`]. Without it (the default) an undecided proof is recorded in
+    /// the evidence and does not change the verdict. For admitting a rule nobody reviewed (a
+    /// learned or imported one), where sampling above the exhaustive widths is not enough.
+    pub require_proofs: bool,
 }
 
 impl Default for CheckConfig {
@@ -68,6 +74,7 @@ impl Default for CheckConfig {
             seed: 0x5eed_cafe,
             proofs: 0,
             proof_conflicts: 100_000,
+            require_proofs: false,
         }
     }
 }
@@ -80,6 +87,7 @@ setters!(CheckConfig {
     with_seed: seed: u64,
     with_proofs: proofs: u32,
     with_proof_conflicts: proof_conflicts: u64,
+    with_require_proofs: require_proofs: bool,
 });
 
 impl CheckConfig {
@@ -716,7 +724,11 @@ pub fn check_rule(rule: &Rule, cfg: &CheckConfig) -> RuleCheck {
         }
     }
     let proved_all = ev.proved_instances > 0 && ev.unproved_instances == 0;
-    let verdict = verdict.unwrap_or(if ev.exhaustive_instances == 0 && proved_all {
+    let verdict = verdict.unwrap_or(if cfg.require_proofs && ev.unproved_instances > 0 {
+        Verdict::Inconclusive("the native prover left a width assignment undecided")
+    } else if cfg.require_proofs && ev.proved_instances == 0 && !ev.complete {
+        Verdict::Inconclusive("no width assignment was proved")
+    } else if ev.exhaustive_instances == 0 && proved_all {
         Verdict::Sound
     } else if ev.exhaustive_instances == 0 {
         Verdict::Inconclusive("no admitted width assignment is small enough to check exhaustively")

@@ -3,6 +3,7 @@
 //! forms. Every function here is an identity of the integers; see the module above for what
 //! they are used for.
 
+use super::int::Int;
 use core::cmp::Ordering;
 
 use crate::hash::{IdMap, combine};
@@ -17,10 +18,50 @@ pub(super) struct Over;
 
 pub(super) type R<T> = Result<T, Over>;
 
+std::thread_local! {
+    /// Whether the question in progress has a node of more than 64 bits (see [`Wide`]).
+    static WIDE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The bounds of a question's arithmetic, set for its duration: a word of up to 64 bits is
+/// read within the bounds the pass was made with (coefficients below two to the 100,
+/// shifts up to 96), and a wider one within bounds that hold a word of 128 bits. A question
+/// of narrow words is read exactly as before there were wide ones.
+pub(super) struct Wide(bool);
+
+impl Wide {
+    /// Sets the bounds for a question with (or without) a node of more than 64 bits, until
+    /// the value is dropped.
+    pub(super) fn set(on: bool) -> Wide {
+        Wide(WIDE.with(|w| w.replace(on)))
+    }
+}
+
+impl Drop for Wide {
+    fn drop(&mut self) {
+        WIDE.with(|w| w.set(self.0));
+    }
+}
+
+fn wide() -> bool {
+    WIDE.with(core::cell::Cell::get)
+}
+
 /// Coefficients stay below this in magnitude.
-const BIG: i128 = 1 << 100;
+fn big() -> Int {
+    Int::pow2(if wide() { 228 } else { 100 })
+}
+
 /// The widest shift of a floor, and the most bits of an AND.
-pub(super) const MAX_SHIFT: u32 = 96;
+pub(super) fn max_shift() -> u32 {
+    if wide() { 224 } else { 96 }
+}
+
+/// The bits a power of two may have where it becomes a coefficient.
+pub(super) fn room() -> u32 {
+    if wide() { 228 } else { 100 }
+}
+
 /// The most terms of a form.
 const MAX_TERMS: usize = 40;
 /// The most atoms and forms of a call.
@@ -30,37 +71,38 @@ const MAX_DEPTH: u32 = 48;
 /// How deep the search for bounds goes, and how many ways it tries at each level.
 const BOUND_DEPTH: u8 = 3;
 
-fn ck(c: i128) -> R<i128> {
-    if c > -BIG && c < BIG {
+fn ck(c: Int) -> R<Int> {
+    let big = big();
+    if c > -big && c < big {
         Ok(c)
     } else {
         Err(Over)
     }
 }
 
-fn mul(a: i128, b: i128) -> R<i128> {
+fn mul(a: Int, b: Int) -> R<Int> {
     a.checked_mul(b).ok_or(Over).and_then(ck)
 }
 
-fn plus(a: i128, b: i128) -> R<i128> {
+fn plus(a: Int, b: Int) -> R<Int> {
     a.checked_add(b).ok_or(Over).and_then(ck)
 }
 
 /// The number of bits of a value that is not negative.
-pub(super) fn bit_len(v: i128) -> u32 {
+pub(super) fn bit_len(v: Int) -> u32 {
     debug_assert!(v >= 0);
-    128 - v.leading_zeros()
+    256 - v.leading_zeros()
 }
 
 /// `c + Σ kᵢ·aᵢ`: the terms in the atoms' order, no coefficient zero.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub(super) struct Form {
-    pub(super) c: i128,
-    pub(super) t: Vec<(AtomId, i128)>,
+    pub(super) c: Int,
+    pub(super) t: Vec<(AtomId, Int)>,
 }
 
 impl Form {
-    pub(super) fn konst(c: i128) -> Form {
+    pub(super) fn konst(c: Int) -> Form {
         Form { c, t: Vec::new() }
     }
 
@@ -71,13 +113,16 @@ impl Form {
     /// The atom when the form is one atom (coefficient 1, constant 0).
     pub(super) fn single(&self) -> Option<AtomId> {
         match self.t[..] {
-            [(a, 1)] if self.c == 0 => Some(a),
+            [(a, k)] if k == 1 && self.c == 0 => Some(a),
             _ => None,
         }
     }
 
-    pub(super) fn coeff(&self, a: AtomId) -> i128 {
-        self.t.iter().find(|x| x.0 == a).map_or(0, |x| x.1)
+    pub(super) fn coeff(&self, a: AtomId) -> Int {
+        self.t
+            .iter()
+            .find(|x| x.0 == a)
+            .map_or(Int::from(0), |x| x.1)
     }
 
     /// The form without atom `a`.
@@ -101,24 +146,27 @@ pub(super) enum Atom {
     Sel(FormId, FormId, FormId),
 }
 
+/// What a bit of each of two operands may be: the least and the most of either.
+type Bits = ((Int, Int), (Int, Int));
+
 /// Bounds of a value: `None` is no bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Iv {
-    pub(super) lo: Option<i128>,
-    pub(super) hi: Option<i128>,
+    pub(super) lo: Option<Int>,
+    pub(super) hi: Option<Int>,
 }
 
 impl Iv {
     pub(super) const ALL: Iv = Iv { lo: None, hi: None };
 
-    pub(super) fn new(lo: i128, hi: i128) -> Iv {
+    pub(super) fn new(lo: Int, hi: Int) -> Iv {
         Iv {
             lo: Some(lo),
             hi: Some(hi),
         }
     }
 
-    pub(super) fn point(c: i128) -> Iv {
+    pub(super) fn point(c: Int) -> Iv {
         Iv::new(c, c)
     }
 
@@ -143,8 +191,8 @@ impl Iv {
         }
     }
 
-    fn scaled(self, c: i128) -> Iv {
-        let m = |x: Option<i128>| x.and_then(|x| x.checked_mul(c));
+    fn scaled(self, c: Int) -> Iv {
+        let m = |x: Option<Int>| x.and_then(|x| x.checked_mul(c));
         if c >= 0 {
             Iv {
                 lo: m(self.lo),
@@ -174,12 +222,12 @@ impl Iv {
     }
 
     /// Whether the value is known to lie in `[lo, hi]`.
-    pub(super) fn within(self, lo: i128, hi: i128) -> bool {
+    pub(super) fn within(self, lo: Int, hi: Int) -> bool {
         self.lo.is_some_and(|x| x >= lo) && self.hi.is_some_and(|x| x <= hi)
     }
 
     /// The one value, when the bounds meet.
-    fn value(self) -> Option<i128> {
+    fn value(self) -> Option<Int> {
         match (self.lo, self.hi) {
             (Some(a), Some(b)) if a == b => Some(a),
             _ => None,
@@ -235,12 +283,12 @@ impl Algebra {
     }
 
     fn hash_of(&self, f: &Form) -> u64 {
-        let mut h = combine(0x666f_726d, f.c as u64);
-        h = combine(h, (f.c >> 64) as u64);
+        let mut h = combine(0x666f_726d, f.c.low_u64());
+        h = combine(h, (f.c >> 64).low_u64());
         for &(a, c) in &f.t {
             h = combine(h, self.key[a as usize].1);
-            h = combine(h, c as u64);
-            h = combine(h, (c >> 64) as u64);
+            h = combine(h, c.low_u64());
+            h = combine(h, (c >> 64).low_u64());
         }
         h
     }
@@ -291,20 +339,20 @@ impl Algebra {
     pub(super) fn leaf(&mut self, n: u32, shash: u64, iv: Iv) -> R<Form> {
         let a = self.make(Atom::Leaf(n), combine(0x6c65_6166, shash), iv)?;
         Ok(Form {
-            c: 0,
-            t: vec![(a, 1)],
+            c: Int::from(0),
+            t: vec![(a, Int::from(1))],
         })
     }
 
     fn one(a: AtomId) -> Form {
         Form {
-            c: 0,
-            t: vec![(a, 1)],
+            c: Int::from(0),
+            t: vec![(a, Int::from(1))],
         }
     }
 
     /// `x + m·y`.
-    pub(super) fn add(&mut self, x: &Form, y: &Form, m: i128) -> R<Form> {
+    pub(super) fn add(&mut self, x: &Form, y: &Form, m: Int) -> R<Form> {
         if m == 0 {
             return Ok(x.clone());
         }
@@ -347,7 +395,7 @@ impl Algebra {
         })
     }
 
-    pub(super) fn scale(&mut self, x: &Form, m: i128) -> R<Form> {
+    pub(super) fn scale(&mut self, x: &Form, m: Int) -> R<Form> {
         if m == 0 {
             return Ok(Form::default());
         }
@@ -358,7 +406,7 @@ impl Algebra {
         Ok(Form { c: mul(x.c, m)?, t })
     }
 
-    pub(super) fn shift(&mut self, x: &Form, c: i128) -> R<Form> {
+    pub(super) fn shift(&mut self, x: &Form, c: Int) -> R<Form> {
         Ok(Form {
             c: plus(x.c, c)?,
             t: x.t.clone(),
@@ -368,16 +416,16 @@ impl Algebra {
     /// The form with every coefficient the residue modulo `2^p` nearest 0 (`2^(p−1)` itself
     /// stays), and the constant in `[0, 2^p)`: equal to the form modulo `2^p`.
     pub(super) fn reduce(&mut self, f: &Form, p: u32) -> Form {
-        if p > MAX_SHIFT {
+        if p > max_shift() {
             return f.clone();
         }
-        let m = (1i128 << p) - 1;
-        let half = 1i128 << (p - 1);
+        let m = (Int::ONE << p) - 1;
+        let half = Int::ONE << (p - 1);
         let mut t = Vec::with_capacity(f.t.len());
         for &(a, c) in &f.t {
             let mut r = c & m;
             if r > half {
-                r -= 1 << p;
+                r -= Int::ONE << p;
             }
             if r != 0 {
                 t.push((a, r));
@@ -428,12 +476,12 @@ impl Algebra {
                 continue;
             };
             // (An operand is read by its low `p` bits: an atom that is wider, as those.)
-            let top = (1i128 << p) - 1;
+            let top = (Int::ONE << u32::from(p)) - 1;
             let mut ops = [self.form(xi).clone(), self.form(yi).clone()];
-            let mut ivs = [Iv::point(0); 2];
+            let mut ivs = [Iv::point(Int::from(0)); 2];
             for (z, iz) in ops.iter_mut().zip(&mut ivs) {
                 *iz = self.interval_at(z, depth + 1);
-                if !iz.within(0, top)
+                if !iz.within(Int::from(0), top)
                     && z.single().is_some()
                     && depth + 1 < BOUND_DEPTH
                     && let Ok(low) = self.wrap(z, u32::from(p), None)
@@ -444,7 +492,7 @@ impl Algebra {
             }
             let [x, y] = ops;
             let [ix, iy] = ivs;
-            if !ix.within(0, top) || !iy.within(0, top) {
+            if !ix.within(Int::from(0), top) || !iy.within(Int::from(0), top) {
                 continue;
             }
             tried += 1;
@@ -454,11 +502,11 @@ impl Algebra {
             let lead = |z: &Form| match z.t.first() {
                 Some(&(a0, z0)) => {
                     let c = f.coeff(a0);
-                    if c % z0 == 0 { c / z0 } else { 0 }
+                    if c % z0 == 0 { c / z0 } else { Int::from(0) }
                 }
-                None => 0,
+                None => Int::from(0),
             };
-            let half = if g % 2 == 0 { -(g / 2) } else { 0 };
+            let half = if g % 2 == 0 { -(g / 2) } else { Int::from(0) };
             let mut cands = [(lead(&x), lead(&y)), (-g, -g), (half, half)];
             cands.sort_unstable();
             for (k, &(al, be)) in cands.iter().enumerate() {
@@ -473,56 +521,65 @@ impl Algebra {
                     continue;
                 }
                 let ir = self.interval_at(&rest, depth + 1);
-                let (xh, yh) = (ix.hi.unwrap_or(0), iy.hi.unwrap_or(0));
+                let (xh, yh) = (ix.hi.unwrap_or(Int::from(0)), iy.hi.unwrap_or(Int::from(0)));
                 let bits = bit_len(xh).max(bit_len(yh));
-                let (mut lo, mut hi) = (Some(0i128), Some(0i128));
+                let (mut lo, mut hi) = (Some(Int::ZERO), Some(Int::ZERO));
+                // (The least and most of a bit depend on what the operands' bits may be,
+                // which is the same from one bit to the next nearly always.)
+                let mut last: Option<(Bits, (Int, Int))> = None;
                 for i in 0..bits {
                     // The bit of a constant is the bit it has; one above the value's highest
                     // is 0.
-                    let of = |z: &Form, zh: i128| -> (i128, i128) {
+                    let of = |z: &Form, zh: Int| -> (Int, Int) {
                         if z.is_const() {
-                            let b = (z.c >> i) & 1;
+                            let b = (z.c >> i) & Int::from(1);
                             (b, b)
                         } else if bit_len(zh) <= i {
-                            (0, 0)
+                            (Int::from(0), Int::from(0))
                         } else {
-                            (0, 1)
+                            (Int::from(0), Int::from(1))
                         }
                     };
                     let ((x0, x1), (y0, y1)) = (of(&x, xh), of(&y, yh));
-                    let (mut least, mut most) = (i128::MAX, i128::MIN);
-                    for xb in [x0, x1] {
-                        for yb in [y0, y1] {
-                            let v = al
-                                .checked_mul(xb)
-                                .zip(be.checked_mul(yb))
-                                .and_then(|(a, b)| a.checked_add(b))
-                                .and_then(|s| s.checked_add(g * (xb & yb)));
-                            match v {
-                                Some(v) => {
-                                    least = least.min(v);
-                                    most = most.max(v);
-                                }
-                                None => {
-                                    least = i128::MIN;
-                                    most = i128::MAX;
+                    let key = ((x0, x1), (y0, y1));
+                    let (mut least, mut most) = (Int::MAX, Int::MIN);
+                    if let Some((k, found)) = last
+                        && k == key
+                    {
+                        (least, most) = found;
+                    } else {
+                        for xb in [x0, x1] {
+                            for yb in [y0, y1] {
+                                let v = al
+                                    .checked_mul(xb)
+                                    .zip(be.checked_mul(yb))
+                                    .and_then(|(a, b)| a.checked_add(b))
+                                    .and_then(|s| s.checked_add(g * (xb & yb)));
+                                match v {
+                                    Some(v) => {
+                                        least = least.min(v);
+                                        most = most.max(v);
+                                    }
+                                    None => {
+                                        least = Int::MIN;
+                                        most = Int::MAX;
+                                    }
                                 }
                             }
                         }
+                        last = Some((key, (least, most)));
                     }
-                    let at = |acc: Option<i128>, v: i128| {
-                        acc.and_then(|a| v.checked_mul(1i128 << i).and_then(|v| a.checked_add(v)))
+                    let at = |acc: Option<Int>, v: Int| {
+                        acc.and_then(|a| {
+                            v.checked_mul(Int::ONE << i).and_then(|v| a.checked_add(v))
+                        })
                     };
-                    lo = if least == i128::MIN {
+                    lo = if least == Int::MIN {
                         None
                     } else {
                         at(lo, least)
                     };
-                    hi = if most == i128::MAX {
-                        None
-                    } else {
-                        at(hi, most)
-                    };
+                    hi = if most == Int::MAX { None } else { at(hi, most) };
                 }
                 iv = iv.meet(ir.plus(Iv { lo, hi }));
             }
@@ -533,10 +590,10 @@ impl Algebra {
             let Atom::Floor(ri, k) = self.atom(a) else {
                 continue;
             };
-            if g % (1i128 << k) != 0 {
+            if g % (Int::ONE << u32::from(k)) != 0 {
                 continue;
             }
-            let lam = -(g >> k);
+            let lam = -(g >> u32::from(k));
             let r = self.form(ri).clone();
             let Ok(rest) = self.add(f, &r, -lam) else {
                 continue;
@@ -547,7 +604,7 @@ impl Algebra {
                 break;
             }
             let ir = self.interval_at(&rest, depth + 1);
-            let digit = Iv::new(0, (1i128 << k) - 1).scaled(lam);
+            let digit = Iv::new(Int::from(0), (Int::ONE << u32::from(k)) - 1).scaled(lam);
             iv = iv.meet(ir.plus(digit));
         }
         // A digit: `λ·(floor(R / 2^a) − 2^(b − a)·floor(R / 2^b))` lies in `λ·[0, 2^(b − a) − 1]`.
@@ -560,10 +617,10 @@ impl Algebra {
                 let Atom::Floor(rj, a) = self.atom(lo) else {
                     continue;
                 };
-                if rj != ri || a >= b || g % (1i128 << (b - a)) != 0 {
+                if rj != ri || a >= b || g % (Int::ONE << u32::from(b - a)) != 0 {
                     continue;
                 }
-                let lam = -(g >> (b - a));
+                let lam = -(g >> u32::from(b - a));
                 let Ok(rest) = self.add(f, &Self::one(lo), -lam) else {
                     continue;
                 };
@@ -573,7 +630,7 @@ impl Algebra {
                     break 'digits;
                 }
                 let ir = self.interval_at(&rest, depth + 1);
-                let digit = Iv::new(0, (1i128 << (b - a)) - 1).scaled(lam);
+                let digit = Iv::new(Int::from(0), (Int::ONE << u32::from(b - a)) - 1).scaled(lam);
                 iv = iv.meet(ir.plus(digit));
             }
         }
@@ -602,20 +659,20 @@ impl Algebra {
         if k == 0 {
             return Ok(f.clone());
         }
-        if k > MAX_SHIFT {
+        if k > max_shift() {
             return Err(Over);
         }
         // floor((E + 2^k·Q) / 2^k) = floor(E / 2^k) + Q: every coefficient leaves its multiple
         // of 2^k outside, and keeps the residue nearest 0.
-        let m = (1i128 << k) - 1;
-        let half = 1i128 << (k - 1);
+        let m = (Int::ONE << k) - 1;
+        let half = Int::ONE << (k - 1);
         let mut out = Form::konst(f.c >> k);
-        let mut rest: Vec<(AtomId, i128)> = Vec::new();
+        let mut rest: Vec<(AtomId, Int)> = Vec::new();
         for &(a, c) in &f.t {
             let (mut q, mut r) = (c >> k, c & m);
             if r > half {
-                q += 1;
-                r -= 1 << k;
+                q += Int::from(1);
+                r -= Int::ONE << k;
             }
             if q != 0 {
                 out.t.push((a, q));
@@ -645,19 +702,19 @@ impl Algebra {
         // floor((−E − 1) / 2^k) = −floor(E / 2^k) − 1: the form whose first atom is positive
         // stays.
         if r.t[0].1 < 0 {
-            let e = self.scale(&r, -1)?;
-            let e = self.shift(&e, -1)?;
+            let e = self.scale(&r, Int::from(-1))?;
+            let e = self.shift(&e, Int::from(-1))?;
             let neg = self.floor(&e, k, None)?;
-            let out = self.shift(&out, -1)?;
-            return self.add(&out, &neg, -1);
+            let out = self.shift(&out, Int::from(-1))?;
+            return self.add(&out, &neg, Int::from(-1));
         }
         let mut iv = self.interval(&r);
         if let Some(h) = hint
             && whole
         {
             // `f` lies in the hint, and `r` is `floor((f − 2^K·q) / 2^t)`.
-            let base = out.c.checked_mul(1i128 << shift);
-            let of = |x: Option<i128>| {
+            let base = out.c.checked_mul(Int::ONE << shift);
+            let of = |x: Option<Int>| {
                 x.zip(base)
                     .and_then(|(x, b)| x.checked_sub(b))
                     .map(|x| x >> t)
@@ -677,7 +734,7 @@ impl Algebra {
             && let (Some(l), Some(h)) = (self.bounds(a).lo, self.bounds(a).hi)
             && h == l + 1
         {
-            let at = |x: i128| mul(ra, x).and_then(|p| plus(r.c, p)).map(|v| v >> k);
+            let at = |x: Int| mul(ra, x).and_then(|p| plus(r.c, p)).map(|v| v >> k);
             let (v0, v1) = (at(l)?, at(h)?);
             let d = v1 - v0;
             let out = self.shift(&out, plus(v0, -mul(d, l)?)?)?;
@@ -691,9 +748,9 @@ impl Algebra {
         if let Some((a, e, ak)) = inner {
             let e = self.form(e).clone();
             let others = r.without(a);
-            let g = self.add(&e, &others, 1i128 << ak)?;
+            let g = self.add(&e, &others, Int::ONE << ak)?;
             let fl = self.floor(&g, ak + k, None)?;
-            return self.add(&out, &fl, 1);
+            return self.add(&out, &fl, Int::from(1));
         }
         // The floor of an AND with a constant is the AND of the floor.
         if let Some(a) = r.single()
@@ -708,32 +765,32 @@ impl Algebra {
                 }
                 let fx = self.floor(&x, k, None)?;
                 let and = self.band(q - k, &fx, &Form::konst(y.c >> k))?;
-                return self.add(&out, &and, 1);
+                return self.add(&out, &and, Int::from(1));
             }
         }
         let ri = self.intern(&r)?;
         let hash = combine(combine(0x666c_6f6f, self.hashes[ri as usize]), u64::from(k));
         let a = self.make(Atom::Floor(ri, k as u8), hash, fl)?;
-        self.add(&out, &Self::one(a), 1)
+        self.add(&out, &Self::one(a), Int::from(1))
     }
 
     /// Bits `[lo, lo + len)` of `f`: `floor(f / 2^lo) − 2^len·floor(f / 2^(lo + len))`.
     pub(super) fn slice(&mut self, f: &Form, lo: u32, len: u32, hint: Option<Iv>) -> R<Form> {
-        if len > MAX_SHIFT {
+        if len > max_shift() {
             return Err(Over);
         }
         let a = self.floor(f, lo, hint)?;
         let b = self.floor(f, lo + len, hint)?;
-        self.add(&a, &b, -(1i128 << len))
+        self.add(&a, &b, -(Int::ONE << len))
     }
 
     /// `f` modulo `2^w`: `f − 2^w·floor(f / 2^w)`.
     pub(super) fn wrap(&mut self, f: &Form, w: u32, hint: Option<Iv>) -> R<Form> {
-        if w > MAX_SHIFT {
+        if w > max_shift() {
             return Err(Over);
         }
         let fl = self.floor(f, w, hint)?;
-        self.add(f, &fl, -(1i128 << w))
+        self.add(f, &fl, -(Int::ONE << w))
     }
 
     // ----- and --------------------------------------------------------------------------
@@ -754,7 +811,7 @@ impl Algebra {
             }
             let r = self.form(ri).clone();
             let q = f.without(a);
-            let Ok(e) = self.add(&r, &q, 1i128 << k) else {
+            let Ok(e) = self.add(&r, &q, Int::ONE << k) else {
                 continue;
             };
             out.push((k, e));
@@ -774,7 +831,7 @@ impl Algebra {
         if p == 0 {
             return Ok(Form::default());
         }
-        if p > MAX_SHIFT {
+        if p > max_shift() {
             return Err(Over);
         }
         let (mut x, mut y) = (self.reduce(x, p), self.reduce(y, p));
@@ -794,7 +851,7 @@ impl Algebra {
             let run = c >> lo;
             if run & (run + 1) == 0 {
                 let s = self.slice(&x, lo, bit_len(run), None)?;
-                return self.scale(&s, 1i128 << lo);
+                return self.scale(&s, Int::ONE << lo);
             }
         }
         if x == y {
@@ -825,7 +882,7 @@ impl Algebra {
         } else {
             (xi, yi, hx, hy)
         };
-        let mut hi = (1i128 << p) - 1;
+        let mut hi = (Int::ONE << p) - 1;
         for i in [ix, iy] {
             if let (Some(l), Some(h)) = (i.lo, i.hi)
                 && l >= 0
@@ -834,7 +891,7 @@ impl Algebra {
             }
         }
         let hash = combine(combine(combine(0x0061_6e64, u64::from(p)), hx), hy);
-        let a = self.make(Atom::And(p as u8, xi, yi), hash, Iv::new(0, hi))?;
+        let a = self.make(Atom::And(p as u8, xi, yi), hash, Iv::new(Int::from(0), hi))?;
         Ok(Self::one(a))
     }
 
@@ -849,7 +906,7 @@ impl Algebra {
         }
         if f.c == 0 {
             match f.t[..] {
-                [(a, 1)] => {
+                [(a, k)] if k == 1 => {
                     if let Atom::Floor(e, k) = self.atom(a) {
                         return Some((Some(self.form(e).clone()), u32::from(k), None));
                     }
@@ -866,7 +923,7 @@ impl Algebra {
                         && kb > ka
                     {
                         let len = u32::from(kb - ka);
-                        if cb == -(1i128 << len) {
+                        if cb == -(Int::ONE << len) {
                             return Some((Some(self.form(ea).clone()), u32::from(ka), Some(len)));
                         }
                     }
@@ -881,7 +938,7 @@ impl Algebra {
                 continue;
             };
             let len = u32::from(k);
-            if c != -(1i128 << len) {
+            if c != -(Int::ONE << len) {
                 continue;
             }
             let g = f.without(a);
@@ -907,7 +964,7 @@ impl Algebra {
         if a == b {
             return Ok(a.clone());
         }
-        let d = self.add(a, b, -1)?;
+        let d = self.add(a, b, Int::from(-1))?;
         if d.is_const() {
             return self.add(b, c, d.c);
         }
@@ -928,7 +985,8 @@ impl Algebra {
             let fits = |s: &(Option<Form>, u32, Option<u32>), iv: Iv| {
                 s.0.is_none()
                     || s.2 == len
-                    || (s.2.is_none() && len.is_some_and(|l| iv.within(0, (1i128 << l) - 1)))
+                    || (s.2.is_none()
+                        && len.is_some_and(|l| iv.within(Int::from(0), (Int::ONE << l) - 1)))
             };
             let (fa, fb) = (fits(&sa, ia), fits(&sb, ib));
             if (k > 0 || len.is_some()) && fa && fb {

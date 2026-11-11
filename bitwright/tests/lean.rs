@@ -67,7 +67,10 @@ fn statements() {
     assert!(rule_theorem(half).contains("(x.smtUDiv (2#(W)))"));
     assert!(rule_theorem(neg_one).contains("(x * (-(1#(W))))"));
     // What Lean's core BitVec cannot say is left out.
-    assert!(rule_theorem(ctz_zero).starts_with("-- t::ctz_zero: not stated"));
+    // Counts are Lean's; `bv_decide` does not read a population count, so an instance for
+    // it is left out.
+    assert!(rule_theorem(ctz_zero).contains("((x.cpop) + ((~~~x).cpop))"));
+    assert!(rule_instance(ctz_zero, &[8]).is_none());
     assert!(rule_instance(mask, &[2]).is_none(), "2 < W");
 }
 
@@ -80,10 +83,10 @@ fn builtin_rules_are_stated() {
     let skipped: Vec<&str> = all.lines().filter(|l| l.contains(": not stated")).collect();
     let rules: usize = programs.iter().map(|p| p.rules().len()).sum();
     assert_eq!(theorems + skipped.len(), rules);
-    // Only floating point, pdep/pext and bit counts are left out.
+    // Only floating point, pdep/pext and byte swaps are left out.
     for l in &skipped {
         assert!(
-            l.contains("floating point") || l.contains("pdep") || l.contains("bit count"),
+            l.contains("floating point") || l.contains("pdep") || l.contains("byte swap"),
             "{l}"
         );
     }

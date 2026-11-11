@@ -19,7 +19,6 @@ use bw::{Context, ParseOptions, Width};
 
 mod compiler;
 mod lean;
-mod lean_in;
 
 /// A buffer of `len` bytes, for JavaScript to fill (freed with `bw_dealloc(ptr, len)`).
 #[unsafe(no_mangle)]
@@ -329,7 +328,7 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
         }
         RULES => Ok(rule_catalog()),
         CHECK_RULES => check_rules(a),
-        LEAN_TO_RULES => Ok(lean_in::to_bwr(a)),
+        LEAN_TO_RULES => Ok(bw::rules::lean_import::to_bwr(a)),
         FROM_SMTLIB => {
             // The script's definitions, or its assertions conjoined, as expression text with
             // the symbols' widths; `b` names one definition.

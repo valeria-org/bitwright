@@ -28,7 +28,10 @@
 //!   [`engine::Rewrite`].
 //! - `mba` (feature `mba`): the MBA service with an evidence gate and bitwright's own solvers;
 //!   `eqsat` (feature `eqsat`): a bounded equality-saturation search; `smtlib` (feature
-//!   `smtlib`): SMT-LIB export, import and rule obligations.
+//!   `smtlib`): SMT-LIB export, import and rule obligations, and, with `prove`, a script run
+//!   as a solver (`smtlib::run`).
+//! - `solve` (feature `prove`): a solver session: an assertion stack with `push` and `pop`,
+//!   checks with models, checks under assumptions and unsatisfiable cores.
 //!
 //! ```
 //! use bitwright::{BinOp, BitVec, Width};
@@ -106,6 +109,8 @@ pub mod rules;
 #[cfg(feature = "smtlib")]
 pub mod smtlib;
 #[cfg(feature = "prove")]
+pub mod solve;
+#[cfg(feature = "prove")]
 pub mod synth;
 #[cfg(test)]
 mod testutil;
@@ -156,6 +161,9 @@ mod book {
     #[cfg(feature = "eqsat")]
     #[doc = include_str!("../../book/src/eqsat.md")]
     struct Eqsat;
+    #[cfg(all(feature = "prove", feature = "mba"))]
+    #[doc = include_str!("../../book/src/solving.md")]
+    struct Solving;
     #[cfg(feature = "smtlib")]
     #[doc = include_str!("../../book/src/smtlib.md")]
     struct Smtlib;
@@ -172,13 +180,21 @@ mod value;
 pub use error::{Error, ParseError, ValueError, WidthError};
 pub use expr::traps;
 pub use expr::{
-    ArenaCounters, Bounded, Context, ContextConfig, Env, Expr, ExprMap, ExprSet, FnEnv, Mark,
-    Substitution, SymbolId, SymbolKey, View,
+    ArenaCounters, Bounded, Checkpoint, Context, ContextConfig, Env, Expr, ExprMap, ExprSet, FnEnv,
+    Mark, Substitution, SymbolId, SymbolKey, View,
 };
 pub use facts::{
     Assumptions, ConstraintId, Facts, KnownBits, Proof, Query, Reliance, SRange, Truth, URange,
 };
 pub use fp::{FpFormat, RoundingMode};
+pub use hash::HASH_VERSION;
 pub use ops::{BinOp, CmpOp, CmpOpExt, UnOp};
 pub use text::{ParseOptions, PrintOptions};
 pub use value::{BitVec, Width};
+
+/// The prover the engine's passes ask ([`engine::oracle`]): the crate ties the two together
+/// here, so that neither names the other.
+#[cfg(feature = "prove")]
+pub(crate) fn circuit_equality() -> engine::oracle::EqualityProver {
+    prove::circuit_equality
+}

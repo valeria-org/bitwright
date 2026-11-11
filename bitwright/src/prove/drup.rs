@@ -27,8 +27,11 @@ struct Db {
     qhead: usize,
     /// Level-0 units (clauses of one literal), kept apart from the watches.
     units: Vec<usize>,
-    /// The database is contradictory at level 0.
-    top_conflict: bool,
+    /// The database is contradictory at level 0: the clause that is false there.
+    top_conflict: Option<usize>,
+    /// Marks for [`Db::explain`], by variable: marked when equal to `stamp`.
+    seen: Vec<u32>,
+    stamp: u32,
 }
 
 impl Db {
@@ -49,6 +52,7 @@ impl Db {
         while self.vals.len() <= v as usize {
             self.vals.push(V::U);
             self.reason.push(None);
+            self.seen.push(0);
             self.watches.push(Vec::new());
             self.watches.push(Vec::new());
         }
@@ -80,16 +84,16 @@ impl Db {
         i
     }
 
-    /// Propagates from `qhead`: `true` on a conflict.
-    fn propagate(&mut self) -> bool {
+    /// Propagates from `qhead`: the clause that became false, on a conflict.
+    fn propagate(&mut self) -> Option<usize> {
         while self.qhead < self.trail.len() {
             let p = self.trail[self.qhead];
             self.qhead += 1;
             let ws = core::mem::take(&mut self.watches[p.0 as usize]);
             let mut keep = Vec::with_capacity(ws.len());
-            let mut conflict = false;
+            let mut conflict = None;
             for (n, &ci) in ws.iter().enumerate() {
-                if conflict {
+                if conflict.is_some() {
                     keep.extend_from_slice(&ws[n..]);
                     break;
                 }
@@ -125,17 +129,50 @@ impl Db {
                 }
                 keep.push(ci);
                 match self.val(first) {
-                    V::F => conflict = true,
+                    V::F => conflict = Some(ci),
                     V::U => self.set(first, Some(ci)),
                     V::T => {}
                 }
             }
             self.watches[p.0 as usize].extend(keep);
-            if conflict {
-                return true;
+            if conflict.is_some() {
+                return conflict;
             }
         }
-        false
+        None
+    }
+
+    /// The clauses that make `from` false (a clause, when `conflict`) or true (the literals
+    /// of `from`, otherwise) by unit propagation from what is assumed, in an order in which
+    /// each is unit when its turn comes; the false clause last. The literals of `assumed`
+    /// (the clause being checked) that are false need no clause: the check assumes them so.
+    fn explain(&mut self, from: &[Lit], conflict: Option<usize>, assumed: &[Lit]) -> Vec<usize> {
+        let mut given: Vec<u32> = (assumed.iter())
+            .filter(|&&l| self.val(l) == V::F)
+            .map(|l| l.var())
+            .collect();
+        given.sort_unstable();
+        self.stamp += 1;
+        for l in from {
+            self.seen[l.var() as usize] = self.stamp;
+        }
+        let mut used = Vec::new();
+        for k in (0..self.trail.len()).rev() {
+            let v = self.trail[k].var() as usize;
+            if self.seen[v] != self.stamp || given.binary_search(&(v as u32)).is_ok() {
+                continue;
+            }
+            if let Some(r) = self.reason[v] {
+                used.push(r);
+                for i in 0..self.clauses[r].len() {
+                    let u = self.clauses[r][i].var() as usize;
+                    self.seen[u] = self.stamp;
+                }
+            }
+        }
+        used.reverse();
+        used.extend(conflict);
+        used
     }
 
     /// Level 0 afresh: every live unit, then propagation.
@@ -145,7 +182,7 @@ impl Db {
             self.reason[l.var() as usize] = None;
         }
         self.qhead = 0;
-        self.top_conflict = false;
+        self.top_conflict = None;
         let units: Vec<usize> = self
             .units
             .iter()
@@ -156,37 +193,42 @@ impl Db {
             let l = self.clauses[i][0];
             match self.val(l) {
                 V::F => {
-                    self.top_conflict = true;
+                    self.top_conflict = Some(i);
                     return;
                 }
                 V::U => self.set(l, Some(i)),
                 V::T => {}
             }
         }
-        if self.propagate() {
-            self.top_conflict = true;
-        }
+        self.top_conflict = self.propagate();
     }
 
-    /// Whether `c` follows by reverse unit propagation.
-    fn rup(&mut self, c: &[Lit]) -> bool {
-        if self.top_conflict {
-            return true;
+    /// Whether `c` follows by reverse unit propagation: the clauses that show it
+    /// ([`explain`](Self::explain)), or `None`.
+    fn rup(&mut self, c: &[Lit]) -> Option<Vec<usize>> {
+        if let Some(ci) = self.top_conflict {
+            let lits = self.clauses[ci].clone();
+            return Some(self.explain(&lits, Some(ci), c));
         }
         let mark = self.trail.len();
-        let mut conflict = false;
+        let mut hints = None;
         for &l in c {
             match self.val(l) {
                 V::T => {
-                    conflict = true;
+                    // True already: by the clauses that made it so (or, for a clause with
+                    // a literal and its complement, by nothing).
+                    hints = Some(self.explain(&[l], None, c));
                     break;
                 }
                 V::U => self.set(!l, None),
                 V::F => {}
             }
         }
-        if !conflict {
-            conflict = self.propagate();
+        if hints.is_none()
+            && let Some(ci) = self.propagate()
+        {
+            let lits = self.clauses[ci].clone();
+            hints = Some(self.explain(&lits, Some(ci), c));
         }
         // Back to level 0.
         for l in self.trail.drain(mark..) {
@@ -194,23 +236,39 @@ impl Db {
             self.reason[l.var() as usize] = None;
         }
         self.qhead = mark;
-        conflict
+        hints
     }
 }
 
 /// Checks a DRUP proof of the unsatisfiability of `cnf`: `Ok` when every added clause follows
 /// by reverse unit propagation and the empty clause is added; else the first failing step.
 pub fn check(cnf: &[Vec<Lit>], proof: &[Step]) -> Result<(), String> {
-    check_steps(cnf, proof, true)
+    check_steps(cnf, proof, true, None)
+}
+
+/// [`check`], writing down for every added clause the clauses it follows from: the proof as
+/// LRAT steps ([`super::lrat`]), which a checker verifies without searching for them.
+pub(super) fn check_to_lrat(
+    cnf: &[Vec<Lit>],
+    proof: &[Step],
+) -> Result<Vec<super::lrat::Step>, String> {
+    let mut out = Vec::new();
+    check_steps(cnf, proof, true, Some(&mut out))?;
+    Ok(out)
 }
 
 /// Test preprocessing and interrupted search transcripts without claiming UNSAT.
 #[cfg(test)]
 pub(super) fn check_prefix(cnf: &[Vec<Lit>], proof: &[Step]) -> Result<(), String> {
-    check_steps(cnf, proof, false)
+    check_steps(cnf, proof, false, None)
 }
 
-fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), String> {
+fn check_steps(
+    cnf: &[Vec<Lit>],
+    proof: &[Step],
+    complete: bool,
+    mut lrat: Option<&mut Vec<super::lrat::Step>>,
+) -> Result<(), String> {
     let mut db = Db {
         clauses: Vec::new(),
         alive: Vec::new(),
@@ -221,7 +279,9 @@ fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), S
         trail: Vec::new(),
         qhead: 0,
         units: Vec::new(),
-        top_conflict: false,
+        top_conflict: None,
+        seen: Vec::new(),
+        stamp: 0,
     };
     for c in cnf {
         if c.is_empty() {
@@ -233,10 +293,18 @@ fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), S
     for (n, step) in proof.iter().enumerate() {
         match step {
             Step::Add(c) => {
-                if !db.rup(c) {
+                let Some(hints) = db.rup(c) else {
                     return Err(format!(
                         "step {n}: {c:?} does not follow by unit propagation"
                     ));
+                };
+                // A clause's number is its place among the clauses, from one.
+                if let Some(out) = lrat.as_deref_mut() {
+                    out.push(super::lrat::Step::Add {
+                        id: db.clauses.len() as u64 + 1,
+                        clause: c.clone(),
+                        hints: hints.iter().map(|&h| h as u64 + 1).collect(),
+                    });
                 }
                 if c.is_empty() {
                     return Ok(());
@@ -244,7 +312,7 @@ fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), S
                 let i = db.add(c.clone());
                 if c.len() == 1 || db.clauses[i].len() == 1 {
                     db.reset_top();
-                } else if !db.top_conflict {
+                } else if db.top_conflict.is_none() {
                     // The new clause may propagate at level 0.
                     let (a, b) = (db.clauses[i][0], db.clauses[i][1]);
                     if db.val(a) == V::F || db.val(b) == V::F {
@@ -260,6 +328,9 @@ fn check_steps(cnf: &[Vec<Lit>], proof: &[Step], complete: bool) -> Result<(), S
                     && let Some(i) = list.pop()
                 {
                     db.alive[i] = false;
+                    if let Some(out) = lrat.as_deref_mut() {
+                        out.push(super::lrat::Step::Delete { id: i as u64 + 1 });
+                    }
                     // A deleted reason changes level 0: recompute it.
                     if db.reason.contains(&Some(i)) {
                         db.reset_top();

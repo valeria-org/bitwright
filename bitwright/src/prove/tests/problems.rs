@@ -341,6 +341,10 @@ fn smtlib_bitvector_array_boolean_and_float_scripts_have_known_verdicts() {
             Outcome::Proved(Some(certificate)) => {
                 assert!(!expected_sat, "{name}: unexpected UNSAT");
                 certificate.check().unwrap();
+                if certificate.exhaustion.is_none() {
+                    let steps = certificate.lrat().unwrap();
+                    crate::prove::lrat::check(&certificate.clauses, &steps).unwrap();
+                }
             }
             other => panic!("{name}: {other:?}"),
         }
@@ -351,10 +355,10 @@ fn smtlib_bitvector_array_boolean_and_float_scripts_have_known_verdicts() {
 #[test]
 fn unsupported_smt_theories_are_refused_instead_of_partially_imported() {
     for script in [
-        "(assert (forall ((x (_ BitVec 8))) (= x x)))",
-        "(declare-fun f ((_ BitVec 8)) (_ BitVec 8)) (assert (= (f #x00) #x01))",
-        "(declare-const a (Array (_ BitVec 4) (_ BitVec 8))) (declare-const b (Array (_ BitVec 4) (_ BitVec 8))) (assert (= a b))",
-        "(declare-const rm RoundingMode) (declare-const x Float32) (assert (fp.eq (fp.add rm x x) x))",
+        "(assert (forall ((x (_ BitVec 64))) (= x x)))",
+        "(declare-const i Int)",
+        "(declare-fun f ((Array (_ BitVec 4) (_ BitVec 8))) (_ BitVec 8))",
+        "(declare-const m (Array (_ BitVec 4) RoundingMode))",
     ] {
         assert!(
             crate::smtlib::import(&mut Context::new(), script).is_err(),

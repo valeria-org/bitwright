@@ -16,6 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 bitwright = { path = "../bitwright", features = ["check", "smtlib", "mba"] }
+bitwright-cadical = { path = "../bitwright-cadical", optional = true }
+
+[features]
+## `bitwright solve --cadical`: CaDiCaL for the long SAT searches (builds the C++ solver).
+cadical = ["dep:bitwright-cadical"]
 
 [lints]
 workspace = true

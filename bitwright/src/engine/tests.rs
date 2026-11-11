@@ -6,7 +6,7 @@
 use super::*;
 use crate::facts::{Facts, KnownBits, Query, SRange, Truth, URange};
 use crate::testutil::{Gen, Rng};
-use crate::{BinOp, FnEnv, ParseOptions, SymbolKey};
+use crate::{BinOp, CmpOpExt, FnEnv, ParseOptions, SymbolKey};
 
 /// The dispatch net of the engine's first `Local` phase.
 fn net(engine: &Engine) -> &DispatchNet {
@@ -3082,10 +3082,15 @@ mod events {
         let mut cx = Context::new();
         let e = cx.parse(text, &ParseOptions::width(Width::W64)).unwrap();
         let (log, out) = logged(&engine, &mut cx, &[e], None);
+        // (After the root, and the parts the sweep found: see `Event::Part`.)
+        let first = (log.0.iter()).find(|ev| !matches!(ev, Ev::Root(..) | Ev::Other));
         assert!(
-            matches!(log.0.get(1), Some(Ev::Stage(Stage::Sweep, before, _)) if *before == e),
-            "the sweep rewrites the input before the first phase: {:?}",
-            log.0.get(1)
+            matches!(first, Some(Ev::Stage(Stage::Sweep, before, _)) if *before == e),
+            "the sweep rewrites the input before the first phase: {first:?}"
+        );
+        assert!(
+            matches!(log.0.get(1), Some(Ev::Other)),
+            "its parts come first"
         );
         check_structure(&engine, &log, out.roots[0].expr);
     }
@@ -3472,4 +3477,637 @@ mod events {
             assert!(balanced(l), "{l}");
         }
     }
+}
+
+/// Results are kept per engine and per assumption set: going back to one used before finds
+/// its results, where a single set would be dropped and walked again on every change.
+#[test]
+fn results_survive_a_change_of_engine_or_assumptions() {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W32);
+    let e = cx
+        .parse("((x & y) + (x | y)) * 3 + (z ^ z) + (x >>u 4)", &o)
+        .unwrap();
+    let small = cx.parse("x <u 16", &o).unwrap();
+    let mut under = crate::facts::Assumptions::new();
+    under.assume_true(&mut cx, small).unwrap();
+    let standard = Engine::standard();
+    let deobfuscate = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    let mut visits = |engine: &Engine, a: Option<&crate::facts::Assumptions>| {
+        let run = Run {
+            assumptions: a,
+            ..Run::default()
+        };
+        let out = engine.run(&mut cx, &[e], run).unwrap();
+        (out.roots[0].expr, out.stats.node_visits)
+    };
+    let first = [
+        visits(&standard, None),
+        visits(&deobfuscate, None),
+        visits(&standard, Some(&under)),
+        visits(&deobfuscate, Some(&under)),
+    ];
+    assert!(first.iter().all(|&(_, v)| v > 0), "{first:?}");
+    // Under `x < 16` the shift is zero: the sets do differ.
+    assert_ne!(first[0].0, first[2].0);
+    // What a repeat costs with nothing in between (the deobfuscation strategy's whole-root
+    // phases look at a root again; the walks are remembered).
+    let repeat = [
+        visits(&deobfuscate, Some(&under)).1,
+        visits(&deobfuscate, None).1,
+    ];
+    for _ in 0..2 {
+        let again = [
+            visits(&standard, None),
+            visits(&deobfuscate, None),
+            visits(&standard, Some(&under)),
+            visits(&deobfuscate, Some(&under)),
+        ];
+        let want = [0, repeat[1], 0, repeat[0]];
+        for ((a, f), w) in again.iter().zip(&first).zip(want) {
+            assert_eq!((a.0, a.1), (f.0, w), "{again:?} after {first:?}");
+            assert!(a.1 < f.1);
+        }
+    }
+}
+
+/// A store of results: a hit is the result, wherever and whenever; what does not fit (another
+/// engine, another version, a symbol at another width, a run under assumptions) is no hit and
+/// no harm.
+#[test]
+fn remembered_results_are_found_again_and_only_where_they_hold() {
+    let o = ParseOptions::width(Width::W32);
+    let standard = Engine::standard();
+    let src = "((a & b) + (a | b) - a) * 5 + ((a ^ 0x33) + 9 - 9 ^ 0x33) + (b << 3)";
+    let mut memory = Remembered::new();
+    let mut cx = Context::new();
+    let e = cx.parse(src, &o).unwrap();
+    let plain = standard.simplify(&mut cx, e).unwrap().expr;
+    let plain_text = cx.display(plain).to_string();
+    let first = (standard.run_remembering(&mut cx, &[e], Run::default(), &mut memory)).unwrap();
+    assert_eq!(first.roots[0].expr, plain);
+    assert!(first.roots[0].changed && !memory.is_empty() && memory.hits() == 0);
+    // The same text, whatever order the entries were learned in; and back from it.
+    let text = memory.to_text();
+    let mut back = Remembered::from_text(&text).unwrap();
+    assert_eq!(back.to_text(), text);
+    // Another context, the expression inside a larger one: found, nothing left to rewrite.
+    let mut other = Context::new();
+    other.parse("(q * 3) ^ r", &o).unwrap();
+    let again = other.parse(&format!("({src}) - c"), &o).unwrap();
+    let out = (standard.run_remembering(&mut other, &[again], Run::default(), &mut back)).unwrap();
+    assert_eq!(back.hits(), 1);
+    assert_eq!(
+        other.display(out.roots[0].expr).to_string(),
+        format!("{plain_text} - c")
+    );
+    assert!(out.roots[0].changed);
+    // The result is equal to what was given, at any point.
+    let env = FnEnv(|k: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, k.structural_hash() | 1)));
+    let v = other.eval(&[again, out.roots[0].expr], &env).unwrap();
+    assert_eq!(v[0], v[1]);
+    // A context where a symbol has another width: the entry does not read there.
+    let mut narrow = Context::new();
+    narrow.symbol("a", Width::W8).unwrap();
+    let wide = narrow.parse("zext<32>(a) + 1", &o).unwrap();
+    let hits = back.hits();
+    standard
+        .run_remembering(&mut narrow, &[wide], Run::default(), &mut back)
+        .unwrap();
+    assert_eq!(back.hits(), hits);
+    // Another engine does not read the store, nor write to it.
+    let deobfuscate = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    let (len, hits) = (back.len(), back.hits());
+    let mut cx2 = Context::new();
+    let e2 = cx2.parse(src, &o).unwrap();
+    deobfuscate
+        .run_remembering(&mut cx2, &[e2], Run::default(), &mut back)
+        .unwrap();
+    assert_eq!((back.len(), back.hits()), (len, hits));
+    // Under assumptions nothing is read or kept: a result may hold only under them.
+    let small = cx2.parse("a <u 4", &o).unwrap();
+    let mut under = crate::facts::Assumptions::new();
+    under.assume_true(&mut cx2, small).unwrap();
+    let run = Run {
+        assumptions: Some(&under),
+        ..Run::default()
+    };
+    let mut fresh = Remembered::new();
+    standard
+        .run_remembering(&mut cx2, &[e2], run, &mut fresh)
+        .unwrap();
+    assert!(fresh.is_empty());
+    // A store of another version is an empty store; other text is an error.
+    let old = text.replacen(env!("CARGO_PKG_VERSION"), "0.0.1", 1);
+    assert!(Remembered::from_text(&old).unwrap().is_empty());
+    assert!(Remembered::from_text("something else").is_err());
+    assert!(Remembered::from_text(&text[..text.len() - 4]).is_err());
+}
+
+/// A derivation's steps are equalities another prover can check, its stretches follow one
+/// another from the expression to the result, and a step that is not an equality is found.
+#[cfg(feature = "prove")]
+#[test]
+fn a_derivation_is_checked_without_the_engine() {
+    let o = ParseOptions::width(Width::W16);
+    let cfg = crate::prove::Config::default();
+    let deobfuscate = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    for src in [
+        "((x & y) + (x | y)) * 3 + (z ^ z)",
+        "((x ^ 0x5a) + 3 - 3) ^ 0x5a",
+        "(x ^ y) + 2 * (x & y) + (x | z) - (x & z) - (x ^ z)",
+        "((x << 8) | (x >>u 8)) & 0xff00 ^ ((x * 3 + y) - x - x - x)",
+        "select(x <u 4, x & 3, x) + (y - y)",
+    ] {
+        for engine in [Engine::standard(), deobfuscate.clone()] {
+            let mut cx = Context::new();
+            let e = cx.parse(src, &o).unwrap();
+            // A result the context already holds is derived afresh, and left as it was.
+            let plain = engine.simplify(&mut cx, e).unwrap();
+            let (out, d) = engine.derive(&mut cx, e, Run::default()).unwrap();
+            assert_eq!(out.expr, plain.expr, "{src}");
+            assert_eq!(engine.simplify(&mut cx, e).unwrap().expr, plain.expr);
+            assert_eq!(d.steps.is_empty(), !out.changed, "{src}");
+            let report = d.check(&cfg).unwrap();
+            assert!(report.continuous, "{src}: {report:?}");
+            assert_eq!(report.proved + report.unproved.len(), d.steps.len());
+            assert_eq!(
+                report.explained + report.whole + report.open.len(),
+                d.stretches.len()
+            );
+            // At 16 bits the search proves every step and every stretch one way or another.
+            assert!(report.certified(), "{src}: {report:?}\n{d:#?}");
+            // The steps as Lean theorems: one each, or a comment saying why not.
+            let lean = d.lean("t").unwrap();
+            assert_eq!(lean.matches("-- Step ").count(), d.steps.len());
+            // A step changed into something that is not an equality is not proved, and
+            // its stretch is no longer explained by its steps (the stretch's two ends are
+            // still equal, and proved so as wholes).
+            if let Some(first) = d.steps.first() {
+                let mut forged = d.clone();
+                forged.steps[0].after = format!("({}) + 1", first.after);
+                let again = forged.check(&cfg).unwrap();
+                assert!(again.unproved.contains(&0), "{src}");
+                assert!(again.explained < report.explained && again.sound < report.sound);
+            }
+        }
+    }
+}
+
+/// What a pass worked out is a rule afterwards: learned from a derivation, checked, and
+/// matched by an engine that has no such pass.
+#[cfg(feature = "check")]
+#[test]
+fn a_pass_step_becomes_a_rule() {
+    let o = ParseOptions::width(Width::W64);
+    let deobfuscate = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    // A linear MBA over two large subexpressions, which only the linear-MBA pass undoes.
+    let (s, t) = ("(a * 0x9e3779b1 >>u 7)", "(b ^ a << 3)");
+    let src = format!("({s} | {t}) + ({s} & {t}) - 2 * ({s} & ~{t}) + 3 * ({s} ^ {t})");
+    let mut cx = Context::new();
+    let e = cx.parse(&src, &o).unwrap();
+    let (out, derivation) = deobfuscate.derive(&mut cx, e, Run::default()).unwrap();
+    assert!(out.changed);
+    let learned = learn(&[&derivation], &LearnConfig::default()).unwrap();
+    assert!(learned.kept >= 1 && learned.generic >= 1, "{learned:#?}");
+    // The rules are a rule file like any other: they compile, and the checker vouches.
+    let program = crate::rules::RuleProgram::compile(&learned.rules).unwrap();
+    let checks = crate::check::check_program(&program, &crate::check::CheckConfig::default());
+    assert!(checks.iter().all(|c| c.is_sound()), "{}", learned.rules);
+    let ledger = learned.ledger.clone();
+    // An engine of rules alone (no pass that knows linear MBA), with the learned ones: the
+    // same shape over other subexpressions, at another width, is now rewritten.
+    let with = Engine::builder()
+        .builtin()
+        .program(program, &ledger)
+        .strategy(Strategy::standard().with_rule_groups(&["learned"]))
+        .build()
+        .unwrap();
+    let narrow = ParseOptions::width(Width::W16);
+    let other = "(p * q | r) + (p * q & r) - 2 * (p * q & ~r) + 3 * (p * q ^ r)";
+    let mut cx = Context::new();
+    let e = cx.parse(other, &narrow).unwrap();
+    let plain = Engine::standard().simplify(&mut cx, e).unwrap().expr;
+    let better = with.simplify(&mut cx, e).unwrap().expr;
+    assert!(
+        cx.tree_size(better).unwrap() < cx.tree_size(plain).unwrap(),
+        "{} against {}\n{}",
+        cx.display(better),
+        cx.display(plain),
+        learned.rules
+    );
+    let env = FnEnv(|k: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, k.structural_hash())));
+    let v = cx.eval(&[e, better], &env).unwrap();
+    assert_eq!(v[0], v[1]);
+}
+
+/// Forgetting the engine's results leaves the context as it was built: the same answer, found
+/// again.
+#[test]
+fn forgotten_results_are_found_again() {
+    let o = ParseOptions::width(Width::W64);
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    let mut cx = Context::new();
+    let e = cx.parse("(x ^ y) + 2 * (x & y) - y", &o).unwrap();
+    let mut steps = RuleCensus::default();
+    let first = (engine.run(&mut cx, &[e], Run::default().with_observer(&mut steps))).unwrap();
+    let nodes = cx.len();
+    // From memory: nothing is rewritten.
+    let mut again = RuleCensus::default();
+    engine
+        .run(&mut cx, &[e], Run::default().with_observer(&mut again))
+        .unwrap();
+    cx.forget_results();
+    let mut anew = RuleCensus::default();
+    let second = (engine.run(&mut cx, &[e], Run::default().with_observer(&mut anew))).unwrap();
+    assert_eq!(first.roots[0].expr, second.roots[0].expr);
+    assert_eq!(cx.len(), nodes);
+    let applied = |c: &RuleCensus| c.rules.values().map(|r| r.applied).sum::<u64>();
+    assert!(applied(&steps) > 0 && applied(&again) == 0 && applied(&anew) == applied(&steps));
+}
+
+/// A full store makes room by dropping what was used longest ago, and two stores merge.
+#[test]
+fn a_full_store_forgets_the_oldest_and_stores_merge() {
+    let o = ParseOptions::width(Width::W32);
+    let engine = Engine::builder().builtin().build().unwrap();
+    let question = |k: u32| format!("(x ^ {k}) + 2 * (x & {k}) - {k} + (y * y * {})", k + 7);
+    let mut memory = (Remembered::new().with_max_entries(8).with_min_tree(8)).with_per_run(0);
+    let mut cx = Context::new();
+    for k in 1..=8 {
+        let e = cx.parse(&question(k), &o).unwrap();
+        (engine.run_remembering(&mut cx, &[e], Run::default(), &mut memory)).unwrap();
+    }
+    assert_eq!(memory.len(), 8);
+    // The first is found again (and so is the newest now); a ninth makes room without it.
+    let mut other = Context::new();
+    let first = other.parse(&question(1), &o).unwrap();
+    (engine.run_remembering(&mut other, &[first], Run::default(), &mut memory)).unwrap();
+    assert_eq!(memory.hits(), 1);
+    let ninth = other.parse(&question(9), &o).unwrap();
+    (engine.run_remembering(&mut other, &[ninth], Run::default(), &mut memory)).unwrap();
+    assert_eq!(memory.len(), 8);
+    let mut third = Context::new();
+    for (k, hit) in [(1, true), (2, false), (9, true)] {
+        let before = memory.hits();
+        let e = third.parse(&question(k), &o).unwrap();
+        let mut probe = memory.clone();
+        (engine.run_remembering(&mut third, &[e], Run::default(), &mut probe)).unwrap();
+        assert_eq!(probe.hits() > before, hit, "question {k}");
+    }
+    // Two stores as one; not with a store of another engine.
+    let mut a = Remembered::new().with_min_tree(8).with_per_run(0);
+    let mut b = Remembered::new().with_min_tree(8).with_per_run(0);
+    let (mut c1, mut c2) = (Context::new(), Context::new());
+    let (e1, e2) = (
+        c1.parse(&question(1), &o).unwrap(),
+        c2.parse(&question(2), &o).unwrap(),
+    );
+    (engine.run_remembering(&mut c1, &[e1], Run::default(), &mut a)).unwrap();
+    (engine.run_remembering(&mut c2, &[e2], Run::default(), &mut b)).unwrap();
+    assert!(a.merge(&b));
+    assert_eq!(a.len(), 2);
+    let again = c1.parse(&question(2), &o).unwrap();
+    let out = (engine.run_remembering(&mut c1, &[again], Run::default(), &mut a)).unwrap();
+    assert_eq!((a.hits(), out.stats.rewrites), (1, 0));
+    let deobfuscate = (Engine::builder().builtin())
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    let mut d = Remembered::new().with_min_tree(8).with_per_run(0);
+    let e3 = c2.parse(&question(3), &o).unwrap();
+    (deobfuscate.run_remembering(&mut c2, &[e3], Run::default(), &mut d)).unwrap();
+    assert!(!a.merge(&d) && a.len() == 2);
+}
+
+/// The analyses on their own are exact: an expression equals the sum, and the exclusive or,
+/// that the engine reads it as, at every value.
+#[test]
+fn the_forms_of_an_expression_are_the_expression() {
+    let engine = Engine::standard();
+    let mut g = generator(0xf0_4a55);
+    let (mut sums, mut xors, mut tables) = (0, 0, 0);
+    for _ in 0..300 {
+        let mut cx = Context::new();
+        let w = 1 + g.rng.below(6) as u16;
+        // Three expressions, joined as a sum or as an exclusive or in turn.
+        let (a, b, c) = (
+            g.expr(&mut cx, w, 3).0,
+            g.expr(&mut cx, w, 3).0,
+            g.expr(&mut cx, w, 3).0,
+        );
+        let width = cx.width(a).unwrap();
+        let three = cx.constant(&BitVec::wrapping_from_u64(width, 3)).unwrap();
+        let e = if g.rng.below(2) == 0 {
+            let b3 = cx.bin(BinOp::Mul, b, three).unwrap();
+            let ab = cx.bin(BinOp::Add, a, b3).unwrap();
+            cx.bin(BinOp::Sub, ab, c).unwrap()
+        } else {
+            let bm = cx.bin(BinOp::And, b, three).unwrap();
+            let nc = cx.un(crate::UnOp::Not, c).unwrap();
+            let ab = cx.bin(BinOp::Xor, a, bm).unwrap();
+            cx.bin(BinOp::Xor, ab, nc).unwrap()
+        };
+        let linear = engine.linear_form(&mut cx, e).unwrap();
+        let mut sum = cx.constant(&linear.constant).unwrap();
+        for (c, t) in &linear.terms {
+            let c = cx.constant(c).unwrap();
+            let p = cx.bin(BinOp::Mul, c, *t).unwrap();
+            sum = cx.bin(BinOp::Add, sum, p).unwrap();
+        }
+        assert!(equivalent(&mut cx, e, sum, &mut g.rng), "{}", cx.display(e));
+        sums += usize::from(linear.terms.len() > 1);
+        let xor = engine.xor_form(&mut cx, e).unwrap();
+        let mut acc = cx.constant(&xor.constant).unwrap();
+        for (m, t) in &xor.terms {
+            let m = cx.constant(m).unwrap();
+            let p = cx.bin(BinOp::And, m, *t).unwrap();
+            acc = cx.bin(BinOp::Xor, acc, p).unwrap();
+        }
+        assert!(equivalent(&mut cx, e, acc, &mut g.rng), "{}", cx.display(e));
+        xors += usize::from(xor.terms.len() > 1);
+        assert_eq!(cx.width(sum).unwrap(), width);
+        // A bitwise function of two of the parts and a constant, by its tables: the
+        // disjunction, over the classes, of the minterms of the class's table under its mask.
+        let m = cx
+            .constant(&BitVec::wrapping_from_u64(width, g.rng.below(64)))
+            .unwrap();
+        let am = cx.bin(BinOp::And, a, m).unwrap();
+        let nb = cx.un(crate::UnOp::Not, b).unwrap();
+        let bw = cx.bin(BinOp::Xor, am, nb).unwrap();
+        let bw = cx.bin(BinOp::Or, bw, a).unwrap();
+        if let Some(form) = engine.bitwise_form(&mut cx, bw).unwrap() {
+            tables += 1;
+            let mut acc = cx.constant(&BitVec::zero(width)).unwrap();
+            for (mask, table) in &form.classes {
+                let mask = cx.constant(mask).unwrap();
+                for p in 0..1u8 << form.terms.len() {
+                    if table >> p & 1 == 0 {
+                        continue;
+                    }
+                    let mut minterm = mask;
+                    for (k, &t) in form.terms.iter().enumerate() {
+                        let lit = if p >> k & 1 == 1 {
+                            t
+                        } else {
+                            cx.un(crate::UnOp::Not, t).unwrap()
+                        };
+                        minterm = cx.bin(BinOp::And, minterm, lit).unwrap();
+                    }
+                    acc = cx.bin(BinOp::Or, acc, minterm).unwrap();
+                }
+            }
+            assert!(
+                equivalent(&mut cx, bw, acc, &mut g.rng),
+                "{}",
+                cx.display(bw)
+            );
+        }
+    }
+    assert!(tables > 20, "{tables}");
+    // Both were exercised on forms of several terms.
+    assert!(sums > 20 && xors > 20, "{sums} {xors}");
+}
+
+/// The three readings of a linear MBA agree: what the pass makes of one is equal to it by the
+/// MBA service's procedures and by the checker's corner evaluation, which share no code with
+/// the pass or with each other; and an expression that is not equal is equal by none.
+#[cfg(all(feature = "mba", feature = "prove"))]
+#[test]
+fn the_linear_mba_implementations_agree() {
+    use crate::mba::{self, MbaBudget, MbaLimits, Verdict};
+    let o = ParseOptions::width(Width::W64);
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::new("t", vec![Phase::LinearMba]))
+        .build()
+        .unwrap();
+    let mut rng = Rng(0x11ea_4b0a);
+    let atoms = ["x", "y", "z", "(p * q)"];
+    let bitwise = |rng: &mut Rng| {
+        let (a, b) = (atoms[rng.below(4) as usize], atoms[rng.below(4) as usize]);
+        match rng.below(7) {
+            0 => a.to_string(),
+            1 => format!("({a} & {b})"),
+            2 => format!("({a} | {b})"),
+            3 => format!("({a} ^ {b})"),
+            4 => format!("~({a} & {b})"),
+            5 => format!("({a} & ~{b})"),
+            _ => format!("~({a} ^ {b})"),
+        }
+    };
+    let (mut rewritten, mut refused) = (0, 0);
+    let (limits, budget) = (MbaLimits::default(), MbaBudget::default());
+    for round in 0..200 {
+        let mut src = String::from("0");
+        for _ in 0..2 + rng.below(6) {
+            let c = rng.below(1 << 20) as i64 - (1 << 19);
+            src = format!("{src} + {c} * {}", bitwise(&mut rng));
+        }
+        let mut cx = Context::new();
+        let e = cx.parse(&src, &o).unwrap();
+        let out = engine.simplify(&mut cx, e).unwrap().expr;
+        if out != e {
+            rewritten += 1;
+            assert_eq!(
+                mba::equal(&mut cx, e, out, &limits, &budget).unwrap(),
+                Verdict::Proved,
+                "round {round}: {src}"
+            );
+            assert!(
+                super::derive::corners_equal(&cx, e, out).unwrap(),
+                "round {round}: {src}"
+            );
+        }
+        // One term more: equal by neither.
+        let extra = cx
+            .parse(&format!("{src} + ({})", bitwise(&mut rng)), &o)
+            .unwrap();
+        let by_service = mba::equal(&mut cx, e, extra, &limits, &budget).unwrap();
+        let by_corners = super::derive::corners_equal(&cx, e, extra).unwrap();
+        assert_eq!(
+            by_service == Verdict::Proved,
+            by_corners,
+            "round {round}: {src}"
+        );
+        refused += usize::from(!by_corners);
+    }
+    assert!(rewritten > 50 && refused > 100, "{rewritten} {refused}");
+}
+
+/// A question asked between a checkpoint and a rollback is answered as in a context of its
+/// own, whatever was asked before it in the same context.
+#[cfg(feature = "mba")]
+#[test]
+fn a_rolled_back_context_answers_as_a_fresh_one() {
+    let o = ParseOptions::width(Width::W64);
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate())
+        .build()
+        .unwrap();
+    // Questions that share parts: the same sums and conjunctions under other constants.
+    let question = |k: u64| {
+        format!(
+            "((x ^ y) + 2 * (x & y)) * {k} + ((x | z) - (x & ~z)) * (y ^ {}) \
+             - (~(x & y) & (x | y)) * {} + ((x + y) ^ z) * ((x & z) + {k})",
+            k + 3,
+            k * 7 + 1
+        )
+    };
+    let alone: Vec<String> = (1..12)
+        .map(|k| {
+            let mut cx = Context::new();
+            let e = cx.parse(&question(k), &o).unwrap();
+            let out = engine.simplify(&mut cx, e).unwrap().expr;
+            cx.display(out).to_string()
+        })
+        .collect();
+    let mut shared = Context::new();
+    // A symbol and a part every question has, made once and kept.
+    let kept = shared.parse("(x ^ y) + 2 * (x & y)", &o).unwrap();
+    for (n, k) in (1..12).enumerate() {
+        let at = shared.checkpoint();
+        let e = shared.parse(&question(k), &o).unwrap();
+        let out = engine.simplify(&mut shared, e).unwrap().expr;
+        assert_eq!(shared.display(out).to_string(), alone[n], "question {k}");
+        shared.rollback(at).unwrap();
+    }
+    // What was there before the questions is still there.
+    assert_eq!(shared.display(kept).to_string(), "(x & y) * 2 + (x ^ y)");
+}
+
+/// A predicate is the set of values, or the set of relations, the comparison analysis reads
+/// it as.
+#[test]
+fn the_form_of_a_predicate_is_the_predicate() {
+    let engine = Engine::standard();
+    let o = ParseOptions::width(Width::new(5).unwrap());
+    let mut rng = Rng(0x9e_d1ca);
+    let (mut values, mut relations) = (0, 0);
+    for round in 0..300 {
+        let two = round % 2 == 1;
+        let atom = |rng: &mut Rng| {
+            let op = ["<u", "<=u", ">u", ">=u", "<s", ">=s", "==", "!="][rng.below(8) as usize];
+            let rhs = if two {
+                "y".to_string()
+            } else {
+                rng.below(32).to_string()
+            };
+            if two && rng.below(2) == 0 {
+                format!("(y {op} x)")
+            } else {
+                format!("(x {op} {rhs})")
+            }
+        };
+        let mut src = atom(&mut rng);
+        for _ in 0..1 + rng.below(3) {
+            let join = ["&", "|", "^"][rng.below(3) as usize];
+            let not = if rng.below(3) == 0 { "~" } else { "" };
+            src = format!("({src} {join} {not}{})", atom(&mut rng));
+        }
+        let mut cx = Context::new();
+        let e = cx.parse(&src, &o).unwrap();
+        let rebuilt = match engine.predicate_form(&mut cx, e).unwrap() {
+            PredicateForm::Constant(b) => cx.bool(b).unwrap(),
+            PredicateForm::Values { of, intervals } => {
+                values += 1;
+                let mut acc = cx.bool(false).unwrap();
+                for (lo, hi) in &intervals {
+                    let (lo, hi) = (cx.constant(lo).unwrap(), cx.constant(hi).unwrap());
+                    let above = cx.cmp(CmpOpExt::Uge, of, lo).unwrap();
+                    let below = cx.cmp(CmpOpExt::Ule, of, hi).unwrap();
+                    let within = cx.bin(BinOp::And, above, below).unwrap();
+                    acc = cx.bin(BinOp::Or, acc, within).unwrap();
+                }
+                acc
+            }
+            PredicateForm::Relation {
+                left,
+                right,
+                relations: set,
+            } => {
+                relations += 1;
+                let mut acc = cx.bool(false).unwrap();
+                // Equal; then each way of being below or above, unsigned and signed.
+                let ways = [
+                    (CmpOpExt::Eq, CmpOpExt::Eq),
+                    (CmpOpExt::Ult, CmpOpExt::Slt),
+                    (CmpOpExt::Ult, CmpOpExt::Sgt),
+                    (CmpOpExt::Ugt, CmpOpExt::Slt),
+                    (CmpOpExt::Ugt, CmpOpExt::Sgt),
+                ];
+                for (k, (unsigned, signed)) in ways.into_iter().enumerate() {
+                    if set >> k & 1 == 1 {
+                        let u = cx.cmp(unsigned, left, right).unwrap();
+                        let s = cx.cmp(signed, left, right).unwrap();
+                        let both = cx.bin(BinOp::And, u, s).unwrap();
+                        acc = cx.bin(BinOp::Or, acc, both).unwrap();
+                    }
+                }
+                acc
+            }
+            _ => continue,
+        };
+        assert!(equivalent(&mut cx, e, rebuilt, &mut rng), "{src}");
+    }
+    assert!(values > 50 && relations > 50, "{values} {relations}");
+}
+
+/// What an expression is made into under a mask agrees with it on the mask's bits.
+#[test]
+fn an_expression_under_a_mask_agrees_on_the_mask() {
+    let engine = Engine::standard();
+    let mut g = generator(0xde_3a4d);
+    let mut changed = 0;
+    for _ in 0..400 {
+        let mut cx = Context::new();
+        let w = 2 + g.rng.below(5) as u16;
+        let (a, b) = (g.expr(&mut cx, w, 3).0, g.expr(&mut cx, w, 3).0);
+        let width = cx.width(a).unwrap();
+        // Parts that reach only some bits: a shift, a mask, a sum.
+        let k = cx
+            .constant(&BitVec::wrapping_from_u64(width, 1 + g.rng.below(2)))
+            .unwrap();
+        let hi = cx.bin(BinOp::Shl, b, k).unwrap();
+        let e = match g.rng.below(3) {
+            0 => cx.bin(BinOp::Add, a, hi).unwrap(),
+            1 => cx.bin(BinOp::Xor, a, hi).unwrap(),
+            _ => cx.bin(BinOp::Or, hi, a).unwrap(),
+        };
+        let mask = BitVec::wrapping_from_u64(width, g.rng.below(1 << w));
+        let out = engine.under_mask(&mut cx, e, &mask).unwrap();
+        changed += usize::from(out != e);
+        let m = cx.constant(&mask).unwrap();
+        let (x, y) = (
+            cx.bin(BinOp::And, e, m).unwrap(),
+            cx.bin(BinOp::And, out, m).unwrap(),
+        );
+        assert!(
+            equivalent(&mut cx, x, y, &mut g.rng),
+            "{} under {mask:?}",
+            cx.display(e)
+        );
+    }
+    assert!(changed > 50, "{changed}");
 }

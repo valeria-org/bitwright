@@ -74,9 +74,13 @@ assert.ok(bw.checkRules("bitwright 1;\ngroup g { rule t<W>(x: W) { x + => x } }"
 // Lean theorems as rules.
 const fromLean = bw.leanToRules(`
 theorem and_or {w : Nat} (x y : BitVec w) : (x &&& y) + (x ||| y) = x + y := by bv_decide
-theorem masked (x : BitVec 32) (h : x.ult 16#32) : x &&& 0xff#32 = x := by sorry
-theorem notBV (a b : Bool) : a = b := sorry
+theorem masked (x : BitVec 32) (h : x.ult 16#32) : x &&& 0xff#32 = x := by bv_decide
+theorem notBV (a b : Bool) : a = b := by rfl
+theorem wishful {w : Nat} (x : BitVec w) : x * 3 = x := by sorry
 `);
+// A statement whose proof is `sorry` is a claim, not a theorem: no rule.
+assert.match(fromLean, /wishful: not translated: its proof is `sorry`/);
+assert.ok(!fromLean.includes("rule wishful"));
 assert.match(fromLean, /rule and_or<W>\(x: W, y: W\) \{\n\s+\(x & y\) \+ \(x \| y\) => x \+ y/);
 assert.match(fromLean, /rule masked\(x: 32\) \{\n\s+x & 0xff => x\n\s+if proves\(x <u 16\)/);
 assert.match(fromLean, /notBV: not translated/);

@@ -4,8 +4,9 @@
 //! written anew that is a node of the expression already is that node, and sizes are counted
 //! there: only the DAG that is kept is built in the context.
 
-use super::form::{Atom, AtomId, Form, FormId};
-use super::lift::Lift;
+use super::form::{Atom, AtomId, Form, FormId, room};
+use super::int::Int;
+use super::lift::{Lift, WORD};
 use crate::engine::budget::Counter;
 use crate::engine::{Runner, Stop};
 use crate::expr::{Context, OpCode};
@@ -543,7 +544,7 @@ impl<'a> Search<'a> {
             self.lift.read(cx, n);
             let w = cx.node(n).width;
             let f = self.lift.value(cx, n).unwrap_or_default();
-            if u32::from(w) <= 64 && self.lift.has(n) {
+            if u32::from(w) <= WORD && self.lift.has(n) {
                 let reduced = self.lift.alg.reduce(&f, u32::from(w));
                 if let Ok(id) = self.lift.alg.intern(&reduced) {
                     self.node_of.entry((id, w)).or_insert(i as u32);
@@ -685,7 +686,7 @@ impl<'a> Search<'a> {
                 let mut by: IdMap<FormId, u32> = IdMap::default();
                 for i in 0..self.cone.len() {
                     let w = u32::from(cx.node(self.cone[i]).width);
-                    if w > m && w <= 64 && !cx.is_const(self.cone[i]) {
+                    if w > m && w <= WORD && !cx.is_const(self.cone[i]) {
                         let g = self.forms[i].clone();
                         let g = self.lift.alg.reduce(&g, m);
                         if let Ok(k) = self.lift.alg.intern(&g) {
@@ -711,7 +712,7 @@ impl<'a> Search<'a> {
             self.words(r, cx, &mut f, m, &mut parts)?;
         }
         for &(a, c) in &f.t {
-            let c = c as u128 & mask;
+            let c = c.low_u128() & mask;
             if c == 0 {
                 continue;
             }
@@ -739,7 +740,7 @@ impl<'a> Search<'a> {
                 Some(a) => self.b.op(OpCode::Add, m, [a, t, 0]),
             });
         }
-        let c = f.c as u128 & mask;
+        let c = f.c.low_u128() & mask;
         if c != 0 {
             let k = self.konst(r, cx, c, m)?;
             acc = Some(match acc {
@@ -787,13 +788,13 @@ impl<'a> Search<'a> {
                     self.lift.alg.form(hi).clone(),
                 );
                 let n0 = f.t.len();
-                let mut best: Option<(OpCode, i128, Form)> = None;
+                let mut best: Option<(OpCode, Int, Form)> = None;
                 let mut cands = vec![(OpCode::Or, -c)];
                 if c % 2 == 0 {
                     cands.insert(0, (OpCode::Xor, -(c / 2)));
                     // (`−2λ` is the coefficient modulo `2^m` for a second λ.)
-                    if m < 100 {
-                        cands.insert(1, (OpCode::Xor, -(c / 2) + (1i128 << (m - 1))));
+                    if m < room() {
+                        cands.insert(1, (OpCode::Xor, -(c / 2) + (Int::ONE << (m - 1))));
                     }
                 }
                 for (kind, lam) in cands {
@@ -821,7 +822,7 @@ impl<'a> Search<'a> {
                 return Ok(());
             };
             let (ge, he) = (self.form(r, cx, &g, m)?, self.form(r, cx, &h, m)?);
-            parts.push((self.b.op(kind, m, [ge, he, 0]), lam as u128 & mask));
+            parts.push((self.b.op(kind, m, [ge, he, 0]), lam.low_u128() & mask));
             *f = rest;
         }
     }
@@ -858,10 +859,10 @@ impl<'a> Search<'a> {
             let rf = self.lift.alg.form(ri).clone();
             let mut joined = false;
             for fam in &mut fams {
-                let Ok(d) = self.lift.alg.add(&fam.0, &rf, -1) else {
+                let Ok(d) = self.lift.alg.add(&fam.0, &rf, Int::from(-1)) else {
                     continue;
                 };
-                let step = 1i128 << k;
+                let step = Int::ONE << k;
                 if d.c % step == 0 && d.t.iter().all(|x| x.1 % step == 0) {
                     fam.1.push((a, k, d));
                     joined = true;
@@ -877,11 +878,11 @@ impl<'a> Search<'a> {
         fams.sort_by_key(|fam| fam.0.single().is_some());
         for (e0, members) in fams {
             // (An earlier family may have taken a floor away, or changed how often it is there.)
-            let mem: Vec<(AtomId, i128, u32, &Form)> = members
+            let mem: Vec<(AtomId, Int, u32, &Form)> = members
                 .iter()
                 .filter_map(|(a, k, d)| {
                     let c = f.coeff(*a);
-                    (c as u128 & mask != 0).then_some((*a, c, *k, d))
+                    (c.low_u128() & mask != 0).then_some((*a, c, *k, d))
                 })
                 .collect();
             if mem.is_empty() {
@@ -899,8 +900,8 @@ impl<'a> Search<'a> {
                     t: d.t.iter().map(|x| (x.0, x.1 >> k)).collect(),
                 };
                 let own = Form {
-                    c: 0,
-                    t: vec![(a, 1)],
+                    c: Int::from(0),
+                    t: vec![(a, Int::from(1))],
                 };
                 let next = self
                     .lift
@@ -921,63 +922,65 @@ impl<'a> Search<'a> {
             // 2^k·Q) / 2^k) = floor(E / 2^k) + Q.
             if self.variant.absorb {
                 let total = mem.iter().fold(0u128, |s, x| {
-                    s.wrapping_add((x.1 as u128).wrapping_shl(kmax - x.2))
+                    s.wrapping_add(x.1.low_u128().wrapping_shl(kmax - x.2))
                 }) & mask;
                 let tz = total.trailing_zeros();
                 if total != 0 && tz < m {
                     let bits = m - tz;
                     let inv = inverse(total >> tz) & low(bits);
                     // (The constant goes with them: a constant added limb by limb.)
-                    let part = |gb: u128| -> i128 {
+                    let part = |gb: u128| -> Int {
                         if gb == 0 || gb.trailing_zeros() < tz {
-                            return 0;
+                            return Int::from(0);
                         }
-                        let mut x = ((gb >> tz).wrapping_mul(inv) & low(bits)) as i128;
-                        if bits < 127 && x >= 1i128 << (bits - 1) {
-                            x -= 1i128 << bits;
+                        let mut x = Int::from((gb >> tz).wrapping_mul(inv) & low(bits));
+                        if x >= Int::ONE << (bits - 1) {
+                            x -= Int::ONE << bits;
                         }
                         x
                     };
-                    let mut q: Vec<(AtomId, i128)> = Vec::new();
+                    let mut q: Vec<(AtomId, Int)> = Vec::new();
                     for &(b, _) in &e.t {
-                        let x = part(g.coeff(b) as u128 & mask);
+                        let x = part(g.coeff(b).low_u128() & mask);
                         if x != 0 {
                             q.push((b, x));
                         }
                     }
-                    let qc = part(g.c as u128 & mask);
+                    let qc = part(g.c.low_u128() & mask);
                     // And what takes the high part of an atom of E away: with `−2^j·floor(t /
                     // 2^j)` in it, the word has the low `j` bits of `t` where it had `t` (the
                     // half of a register that is the operand).
-                    let mut cut: Vec<(AtomId, i128)> = Vec::new();
+                    let mut cut: Vec<(AtomId, Int)> = Vec::new();
                     for &(b, gb) in &g.t {
                         if let Atom::Floor(ri, j) = self.lift.alg.atom(b)
                             && let Some(t) = self.lift.alg.form(ri).single()
                             && u32::from(j) >= kmax
-                            && u32::from(j) - kmax < 100
+                            && u32::from(j) - kmax < room()
                         {
-                            let x = part(gb as u128 & mask);
-                            let whole = e.coeff(t).checked_mul(1i128 << (u32::from(j) - kmax));
+                            let x = part(gb.low_u128() & mask);
+                            let whole = e.coeff(t).checked_mul(Int::ONE << (u32::from(j) - kmax));
                             if x != 0 && whole.is_some_and(|w| w != 0 && x == -w) {
                                 cut.push((b, x));
                             }
                         }
                     }
-                    if (!q.is_empty() || qc != 0 || !cut.is_empty()) && bits < 100 && kmax < 100 {
+                    if (!q.is_empty() || qc != 0 || !cut.is_empty())
+                        && bits < room()
+                        && kmax < room()
+                    {
                         let mut qf = Form { c: qc, t: q };
                         for (b, x) in cut {
                             let one = Form {
-                                c: 0,
-                                t: vec![(b, 1)],
+                                c: Int::from(0),
+                                t: vec![(b, Int::from(1))],
                             };
                             if let Ok(with) = self.lift.alg.add(&qf, &one, x) {
                                 qf = with;
                             }
                         }
-                        let moved =
-                            self.lift.alg.add(&e, &qf, 1i128 << kmax).and_then(|e2| {
-                                Ok((e2, self.lift.alg.add(&g, &qf, -(total as i128))?))
-                            });
+                        let moved = self.lift.alg.add(&e, &qf, Int::ONE << kmax).and_then(|e2| {
+                            Ok((e2, self.lift.alg.add(&g, &qf, -Int::from(total))?))
+                        });
                         if let Ok((e2, g2)) = moved {
                             e = e2;
                             g = self.lift.alg.reduce(&g2, m);
@@ -987,7 +990,7 @@ impl<'a> Search<'a> {
                 }
             }
             // E itself, where the rest holds a multiple of it.
-            let mut lam = 0i128;
+            let mut lam = Int::ZERO;
             if let Some(&(a0, e0c)) = e.t.first() {
                 let g0 = g.coeff(a0);
                 if g0 != 0
@@ -1006,11 +1009,12 @@ impl<'a> Search<'a> {
             // as it was before the slice of `t` in it went into the floors around it.
             let mut drop = 0u32;
             let kmin = mem.iter().map(|x| x.2).min().unwrap_or(0);
-            let odd = e.t.iter().filter(|x| x.1 & 1 != 0).count();
+            let odd = e.t.iter().filter(|x| x.1 & Int::from(1) != 0).count();
             if lam == 0
                 && kmin > 0
                 && odd == 1
-                && let Some(&(t, 1)) = e.t.iter().find(|x| x.1 & 1 != 0)
+                && let Some(&(t, one)) = e.t.iter().find(|x| x.1 & Int::from(1) != 0)
+                && one == 1
             {
                 let others = e.t.iter().filter(|x| x.0 != t);
                 let j = others
@@ -1020,30 +1024,30 @@ impl<'a> Search<'a> {
                     .unwrap_or(0)
                     .min(kmin);
                 if j > 0 {
-                    let below = e.c.rem_euclid(1i128 << j);
+                    let below = e.c.rem_euclid(Int::ONE << j);
                     let inner = Form {
                         c: below,
-                        t: vec![(t, 1)],
+                        t: vec![(t, Int::from(1))],
                     };
                     let rest = Form {
                         c: (e.c - below) >> j,
                         t: others.map(|x| (x.0, x.1 >> j)).collect(),
                     };
                     let up = self.lift.alg.floor(&inner, j, None);
-                    if let Ok(e2) = up.and_then(|fl| self.lift.alg.add(&fl, &rest, 1)) {
+                    if let Ok(e2) = up.and_then(|fl| self.lift.alg.add(&fl, &rest, Int::from(1))) {
                         e = e2;
                         drop = j;
                     }
                 }
             }
             let ie = self.lift.alg.interval(&e);
-            let reach = |c: i128, k: u32| k + m - (c as u128 & mask).trailing_zeros().min(m);
+            let reach = |c: Int, k: u32| k + m - (c.low_u128() & mask).trailing_zeros().min(m);
             let mut top = mem
                 .iter()
                 .map(|x| reach(x.1, x.2 - drop))
                 .max()
                 .unwrap_or(0);
-            if lam as u128 & mask != 0 {
+            if lam.low_u128() & mask != 0 {
                 top = top.max(reach(lam, 0));
             }
             if let Some(b) = ie.bits() {
@@ -1055,11 +1059,11 @@ impl<'a> Search<'a> {
             // The weight of each bit of E.
             let wts: Vec<u128> = (0..top)
                 .map(|b| {
-                    let mut w = (lam as u128).wrapping_shl(b);
+                    let mut w = lam.low_u128().wrapping_shl(b);
                     for x in &mem {
                         let k = x.2 - drop;
                         if k <= b {
-                            w = w.wrapping_add((x.1 as u128).wrapping_shl(b - k));
+                            w = w.wrapping_add(x.1.low_u128().wrapping_shl(b - k));
                         }
                     }
                     w & mask
@@ -1141,7 +1145,7 @@ impl<'a> Search<'a> {
                     let inner = self.form(r, cx, &rf, k + b)?;
                     let e = self.b.extract(inner, k, b);
                     self.b.resize(e, p)
-                } else if iv.within(-1, 0) {
+                } else if iv.within(Int::from(-1), Int::from(0)) {
                     // A borrow: one bit, as its sign.
                     let inner = self.form(r, cx, &rf, k + 1)?;
                     let e = self.b.extract(inner, k, 1);
@@ -1215,7 +1219,7 @@ impl<'a> Search<'a> {
             // `2^d − 1 − x`).
             let mut f = self.lift.alg.reduce(&f, d);
             if f.c >> (d - 1) != 0 {
-                f.c -= 1i128 << d;
+                f.c -= Int::ONE << d;
             }
             f
         };
@@ -1248,7 +1252,7 @@ impl<'a> Search<'a> {
             let n = self.cone[i];
             let node = cx.node(n);
             let w = u32::from(node.width);
-            if matches!(node.op, OpCode::Const | OpCode::Sym) || w > 64 {
+            if matches!(node.op, OpCode::Const | OpCode::Sym) || w > WORD {
                 continue;
             }
             // (The marks and the demand are of the root as it is now.)

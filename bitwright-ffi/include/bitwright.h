@@ -736,6 +736,45 @@ size_t bw_smt_import_count(const bw_smt_import *imp, int part /* bw_smt_part */)
 bw_status bw_smt_import_get(const bw_smt_import *imp, int part, size_t i, bw_expr *e,
                             const char **name);
 
+/* ----- solving ----------------------------------------------------------------------------- */
+
+/* A solver: 1-bit predicates asserted on a stack, and whether they hold together. It holds
+ * expressions of one context, the one every call is given. */
+typedef struct bw_solver bw_solver;
+
+/* A check's answer. */
+#define BW_UNSAT 0
+#define BW_SAT 1
+#define BW_UNKNOWN 2
+
+bw_solver *bw_solver_new(void);
+void bw_solver_free(bw_solver *s);
+
+/* Asserts the 1-bit `p`. `index` (may be NULL) receives its position among the assertions,
+ * which is how a core names it. */
+bw_status bw_solver_assert(bw_solver *s, bw_context *cx, bw_expr p, uint32_t *index);
+
+/* Opens a scope; `bw_solver_pop` closes the `scopes` innermost ones and drops the assertions
+ * made in them (an error, and nothing changes, when fewer are open). */
+bw_status bw_solver_push(bw_solver *s);
+bw_status bw_solver_pop(bw_solver *s, uint32_t scopes);
+
+/* Whether the assertions and the `n` 1-bit `assumptions` (of this check only) hold together:
+ * `answer` receives BW_SAT, BW_UNSAT or BW_UNKNOWN. */
+bw_status bw_solver_check(bw_solver *s, bw_context *cx, const bw_expr *assumptions, size_t n,
+                          int *answer);
+
+/* After BW_SAT: the value of `e` in the model (a symbol the model leaves open reads as zero). */
+bw_status bw_solver_value(bw_solver *s, bw_context *cx, bw_expr e, bw_value *out);
+
+/* After BW_UNSAT: assertions and assumptions that do not hold together. `len` receives their
+ * number, and the first `capacity` are written to `core`: an assertion as its position, an
+ * assumption as its position in the check's `assumptions` with BW_CORE_ASSUMPTION set. Sound,
+ * not minimal. */
+#define BW_CORE_ASSUMPTION 0x80000000u
+bw_status bw_solver_core(bw_solver *s, bw_context *cx, uint32_t *core, size_t capacity,
+                         size_t *len);
+
 /* ----- proofs and synthesis ----------------------------------------------------------------- */
 
 typedef enum bw_equivalence {
