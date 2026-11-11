@@ -233,6 +233,11 @@ pub struct Strategy {
     /// rest on the pass, and drops the results the search cannot prove within its caps.
     /// Off by default.
     pub words_proved: bool,
+    /// Whether a root is read whole as a linear MBA before the first round, where the
+    /// strategy has the linear-MBA pass ([`Stage::Whole`]): one question of the root's
+    /// signature in place of one of every sum below it. On by default; off, the pass finds
+    /// the same forms from the operands up, in its phase.
+    pub whole_first: bool,
 }
 
 impl Strategy {
@@ -246,7 +251,14 @@ impl Strategy {
             sharing: Sharing::Roots,
             max_region: pass::REGION_CAP,
             words_proved: false,
+            whole_first: true,
         }
+    }
+
+    /// Sets [`whole_first`](Self::whole_first).
+    pub fn with_whole_first(mut self, yes: bool) -> Strategy {
+        self.whole_first = yes;
+        self
     }
 
     /// Sets [`words_proved`](Self::words_proved).
@@ -2904,6 +2916,37 @@ impl Runner<'_, '_> {
             cur = swept;
         }
         cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
+        // A root that is a linear MBA whole is read as one before the phases walk it: its
+        // signature is one question, where the walk asks one of every sum below the root
+        // (each over the nodes under it) and of the bitwise functions under those, to find
+        // the same answer once the parts are in their forms. (A sum of twelve bitwise
+        // functions of five variables: 9 ms by the walk.) The rewrite is the pass's own, by
+        // its commit rule; where it declines, the phases run as they do.
+        let whole = match self.inner.strategy.whole_first {
+            true => (self.inner.phases.iter())
+                .position(|p| matches!(p, PhaseImpl::Pass(pass::PassKind::LinearMba))),
+            false => None,
+        };
+        if let Some(phase) = whole {
+            // (To an observer a stage, as the sweep is: the phases' events are of the
+            // rounds, in their order.)
+            self.begin(cx, phase, cur);
+            let observer = self.observer.take();
+            let step = pass::step(self, cx, pass::PassKind::LinearMba, cur);
+            self.observer = observer;
+            match step {
+                Ok(Step::To(e, f)) => {
+                    self.rewritten.insert((cur, e), ());
+                    // (Its one part is its step, as a sweep's parts are its steps.)
+                    self.emit_part(cx, Stage::Whole, cur, e);
+                    self.emit_stage(cx, Stage::Whole, cur, e);
+                    fin = fin.and(f);
+                    cur = e;
+                }
+                Ok(Step::Normal(_)) | Err(Stop::Exhausted(_)) => {}
+                Err(stop) => return Err((cur, fin, stop)),
+            }
+        }
         let settled = self.rounds(cx, cur, fin);
         #[cfg(feature = "mba")]
         if let Ok((u, ufin)) = settled

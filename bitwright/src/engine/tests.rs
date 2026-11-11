@@ -3672,9 +3672,11 @@ fn a_derivation_is_checked_without_the_engine() {
 #[test]
 fn a_pass_step_becomes_a_rule() {
     let o = ParseOptions::width(Width::W64);
+    // (The pass's step in its phase, on the forms the rules leave: a step of the root read
+    // whole is of the input as written, which the rules rewrite before a rule for it matches.)
     let deobfuscate = Engine::builder()
         .builtin()
-        .strategy(Strategy::deobfuscate())
+        .strategy(Strategy::deobfuscate().with_whole_first(false))
         .build()
         .unwrap();
     // A linear MBA over two large subexpressions, which only the linear-MBA pass undoes.
@@ -3728,7 +3730,8 @@ fn forgotten_results_are_found_again() {
         .build()
         .unwrap();
     let mut cx = Context::new();
-    let e = cx.parse("(x ^ y) + 2 * (x & y) - y", &o).unwrap();
+    // (A product: no linear MBA whole, which a stage would read without a rule.)
+    let e = (cx.parse("((x ^ y) + 2 * (x & y) - y) * (z + 0 | z)", &o)).unwrap();
     let mut steps = RuleCensus::default();
     let first = (engine.run(&mut cx, &[e], Run::default().with_observer(&mut steps))).unwrap();
     let nodes = cx.len();

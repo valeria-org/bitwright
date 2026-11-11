@@ -35,7 +35,9 @@ test("every run has a header, phases, a result and counters", () => {
     assert.ok(run.phases.length > 0);
     assert.ok(run.result, "a result line");
     assert.ok(run.stats, "a stats line");
-    assert.equal(run.steps.filter((s) => s.kind !== "fold" && s.kind !== "stage").length, run.stats.rewrites);
+    // (A root read whole as a linear MBA is a stage that is one rewrite of the pass's.)
+    const rewrite = (s) => s.kind !== "fold" && (s.kind !== "stage" || s.name === "whole");
+    assert.equal(run.steps.filter(rewrite).length, run.stats.rewrites);
   }
 });
 
@@ -60,6 +62,8 @@ test("every rewrite is placed in the whole expression, which ends at the result"
     if (!last || !run.result) continue;
     // After the last rewrite, the root is the result (up to the constructors' order).
     const end = run.phaseRuns.filter((p) => p.steps.length).at(-1)?.after;
+    // (A run whose only steps are a stage's has no phase run to end at.)
+    if (end === undefined) continue;
     assert.equal(run.sizes.key(end), run.sizes.key(run.result.expr));
   }
 });
