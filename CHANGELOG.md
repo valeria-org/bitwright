@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.1
 
 - **Fixed: the normal-form solver's memo served an answer another budget would not
   give.** A remembered answer served any budget of at least the steps it had cost, but the
