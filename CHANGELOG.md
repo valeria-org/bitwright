@@ -225,6 +225,13 @@ chapter, *Solving*).
 - **Comparisons are candidates** (`synth::Config::comparisons`, on by default): `== != <u
   <s`, each the value 0 or 1 at the target's width. `(x | −x) >>u 63` is `zext(x != 0)` and
   `((~x & y) | ((~x | y) & (x − y))) >>u 63` is `zext(x <u y)`.
+- **Two terms of the enumeration make an answer**: where no term has the target's values,
+  each term `t` is tried with the term that has the values of what is left of the target
+  (`t + c`, `t − c`, `c − t`, `t ^ c`; the other is looked up, not searched for). An answer
+  of up to twice the enumeration's size is found where its top is one of these: `x1 − 2 −
+  zext((x0 == 0) | (x1 == 0))` and `(x & 0xffffff00) | zext((x & ~1) == 2)`, of 11 and 9
+  nodes, are found under noise at the default size of 7, in about a second each. `select`
+  is not a candidate operator.
 - **The constants a slice implies are candidates' constants**: bits `[lo, lo + n)` of a
   value give `2^n − 1`, that mask in place and `lo`, so `zext<64>(trunc<8>(x ^ y) ^
   trunc<8>(y))` is `x & 255`, which mentions no 255.

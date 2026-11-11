@@ -98,6 +98,9 @@ const BINARY: [BinOp; 11] = [
 /// more node (`a <=u b` is `1 ^ (b <u a)`).
 const COMPARE: [CmpOp; 4] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Ult, CmpOp::Slt];
 
+/// The most pairs of terms tried as a candidate in one round (see `Search::pairs`).
+const MAX_PAIRS: usize = 64;
+
 fn commutative(op: BinOp) -> bool {
     matches!(
         op,
@@ -239,7 +242,91 @@ impl Search<'_> {
     }
 
     /// Enumerates by size until a term behaves like `target` (skipping the ones in `refuted`).
+    /// Enumerates by size until a term behaves like `target` (skipping the ones in
+    /// `refuted`); then, where none does, looks for two of the terms whose sum, difference
+    /// or exclusive or does ([`pairs`](Self::pairs)).
     fn run(
+        &mut self,
+        leaves: &[Term],
+        target: &[u64],
+        max_size: u8,
+        max_terms: usize,
+        comparisons: bool,
+        refuted: &mut dyn FnMut(u32, &Search<'_>) -> Result<bool, Error>,
+    ) -> Result<Step, Error> {
+        match self.enumerate(leaves, target, max_size, max_terms, comparisons, refuted)? {
+            Step::Candidate => Ok(Step::Candidate),
+            Step::Exhausted => self.pairs(target, refuted),
+        }
+    }
+
+    /// Two enumerated terms that make the target together: `t + c`, `t − c`, `c − t` or
+    /// `t ^ c`. For each term `t` the other is looked up by the values it must have, so an
+    /// answer of twice the enumeration's size is found where its top is one of these: a sum
+    /// with a correction (`x − 2 − zext(x == 0 | y == 0)`), a value with a flag in bits it
+    /// has clear. The smallest pairs are tried first, at most [`MAX_PAIRS`] of them.
+    fn pairs(
+        &mut self,
+        target: &[u64],
+        refuted: &mut dyn FnMut(u32, &Search<'_>) -> Result<bool, Error>,
+    ) -> Result<Step, Error> {
+        let n = self.n();
+        let count = self.terms.len() as u32;
+        let mut found: Vec<(u8, Term)> = Vec::new();
+        let mut row = vec![0u64; n];
+        for t in 0..count {
+            for op in [BinOp::Add, BinOp::Sub, BinOp::Xor] {
+                // `c` with `t op c` the target; and for a difference, with `c − t` it too.
+                for flip in [false, true] {
+                    if flip && op != BinOp::Sub {
+                        continue;
+                    }
+                    for (p, slot) in row.iter_mut().enumerate() {
+                        let (tv, want) = (self.row(t)[p], target[p]);
+                        *slot = match (op, flip) {
+                            (BinOp::Add, _) => self.lanes.bin(BinOp::Sub, want, tv),
+                            (BinOp::Sub, false) => self.lanes.bin(BinOp::Sub, tv, want),
+                            (BinOp::Sub, true) => self.lanes.bin(BinOp::Add, want, tv),
+                            _ => want ^ tv,
+                        };
+                    }
+                    let Some(list) = self.seen.get(&hash(&row)) else {
+                        continue;
+                    };
+                    let Some(&c) = list.iter().find(|&&k| self.row(k) == &row[..]) else {
+                        continue;
+                    };
+                    // (A commutative pair once.)
+                    if op != BinOp::Sub && c < t {
+                        continue;
+                    }
+                    let size = self.sizes[t as usize]
+                        .saturating_add(self.sizes[c as usize])
+                        .saturating_add(1);
+                    let term = if flip {
+                        Term::Bin(op, c, t)
+                    } else {
+                        Term::Bin(op, t, c)
+                    };
+                    found.push((size, term));
+                }
+            }
+        }
+        found.sort_by_key(|f| f.0);
+        for (size, term) in found.into_iter().take(MAX_PAIRS) {
+            // (Not among the terms of the enumeration: nothing is built over it.)
+            let k = self.terms.len() as u32;
+            self.terms.push(term);
+            self.sizes.push(size);
+            self.values.extend_from_slice(target);
+            if !refuted(k, self)? {
+                return Ok(Step::Candidate);
+            }
+        }
+        Ok(Step::Exhausted)
+    }
+
+    fn enumerate(
         &mut self,
         leaves: &[Term],
         target: &[u64],
@@ -575,7 +662,8 @@ pub fn synthesize_report(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Repo
                         Ok(false)
                     }
                     Outcome::Unknown(why) => {
-                        unproved = Some((cand, why));
+                        // (The first is the smallest.)
+                        unproved.get_or_insert((cand, why));
                         Ok(true)
                     }
                 }
@@ -679,13 +767,35 @@ mod tests {
         ] {
             assert_eq!(synth(src, Width::W64).as_deref(), Some(want), "{src}");
         }
-        // Without them, nothing as small.
+        // Without them, no comparison.
         let mut cx = Context::new();
         let e = cx
             .parse("(x | -x) >>u 63", &ParseOptions::width(Width::W64))
             .unwrap();
         let cfg = Config::default().with_comparisons(false);
-        assert!(synthesize(&mut cx, e, &cfg).unwrap().is_none());
+        let out = synthesize(&mut cx, e, &cfg).unwrap();
+        let text = out.map(|o| cx.display(o).to_string()).unwrap_or_default();
+        assert!(!text.contains("!=") && !text.contains("=="), "{text}");
+    }
+
+    /// A sum with a correction where a value is zero, and a value with a flag in bits it has
+    /// clear, under noise the engine leaves: each is two terms of the enumeration joined, of
+    /// more nodes together than the enumeration reaches.
+    #[test]
+    fn two_terms_make_an_answer_beyond_the_enumeration() {
+        for (src, want) in [
+            (
+                "x1 - 2 - zext<64>((x0 == 0) | (x1 == 0))",
+                "x1 - zext<64>(x0 << x1 == x0) - 2",
+            ),
+            (
+                "(x & 0xffffff00) | zext<64>((x & ~1) == 2)",
+                "(x & 0xffffff00) + zext<64>(x >>u 1 == 1)",
+            ),
+        ] {
+            let noisy = format!("(({src}) ^ (y & ~y)) + (y - y)");
+            assert_eq!(synth(&noisy, Width::W64).as_deref(), Some(want), "{src}");
+        }
     }
 
     /// A slice extended back is a mask, whose constant the target does not mention.
