@@ -40,7 +40,7 @@ use crate::ops::{BinOp, UnOp};
 pub(crate) const MAX_ATOMS: usize = 6;
 
 /// The most fragment nodes examined per candidate.
-const MAX_REGION: usize = 256;
+const MAX_REGION: usize = 2048;
 
 /// The fragment below `root`: its atoms (in the context's canonical order), its interior nodes
 /// in post-order, and whether it mixes linear and bitwise operators.
@@ -516,6 +516,57 @@ pub(super) fn normal(
     n: u32,
 ) -> Result<Option<u32>, Stop> {
     Ok(solve(r, cx, n, false)?.1)
+}
+
+/// Whether `a` and `b` are equal for every value of the symbols because their difference is a
+/// linear MBA whose signature is zero: at every corner of its atoms it is 0, so every
+/// coefficient of its form is, whatever the atoms are. `false` decides nothing (the
+/// difference is no mixed fragment, has too many atoms, or is not zero at some corner, which
+/// atoms that depend on each other may never reach).
+///
+/// The two sides of such an equality are often each as small as they get (`s + t` and
+/// `s | t` for disjoint `s` and `t`), so that neither is rewritten into the other and only
+/// their difference shows that they are the same function.
+pub(super) fn equal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<bool, Stop> {
+    // What this builds (the difference, the atoms lifted to its width) is of this test
+    // only: retired whatever the answer, so that it never counts as a use of the operands.
+    let before = cx.len() as u32;
+    let zero = difference_is_zero(r, cx, a, b);
+    super::discard(r, cx, before);
+    zero
+}
+
+fn difference_is_zero(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<bool, Stop> {
+    let n = r.build(cx, |cx| cx.c_bin(crate::BinOp::Sub, a, b))?;
+    let op = cx.node(n).op;
+    if !(is_linear(op) || is_bitwise(op)) || !interior(cx, n, Mode::Linear) {
+        return Ok(false);
+    }
+    let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
+        return Ok(false);
+    };
+    if !reg.mixed || reg.bounds.is_empty() {
+        return Ok(false);
+    }
+    lift(r, cx, &mut reg, cx.width_of(n).bits())?;
+    let t = reg.atoms.len();
+    if t > MAX_ATOMS {
+        return Ok(false);
+    }
+    r.meter
+        .charge(Counter::PassWork, (reg.order.len() << t) as u64)?;
+    let sig = signature(cx, &reg, n, &mut r.linear_mba);
+    Ok(sig.iter().all(BitVec::is_zero))
 }
 
 /// [`step`] when `commit`; else the form alone ([`normal`]).

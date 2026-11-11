@@ -1,6 +1,7 @@
 //! The words pass: soundness (exhaustive over narrow symbols), what it reads, that it reaches a
 //! fixed point, and that it does not depend on how an expression was built.
 
+use super::int::Int;
 use crate::engine::tests::{equivalent, generator};
 use crate::engine::{End, Engine, Phase, Run, Strategy};
 use crate::hash::IdMap;
@@ -675,7 +676,7 @@ fn forms_have_the_values_of_their_nodes() {
                     .unwrap();
                 at.insert(n, v);
             }
-            let leaf = |n: u32| at[&n].to_u128().map_or(0, |v| v as i128);
+            let leaf = |n: u32| at[&n].to_u128().map_or(Int::ZERO, Int::from);
             for &n in &ids {
                 if cx.node(n).width > 64 {
                     continue;
@@ -827,6 +828,161 @@ fn a_root_over_the_bound_is_left_to_its_operands() {
         &text[..200.min(text.len())]
     );
     assert!(!text.contains("<u"));
+}
+
+/// With `words_proved`, the pass writes what a circuit and a search prove, the same results
+/// where they do; and nothing where no prover is given a chance (a propagation cap of the
+/// pass's own stands in the way only of the large).
+#[cfg(feature = "prove")]
+#[test]
+fn words_writes_only_what_is_proved_when_asked_to() {
+    let plain = engine(vec![Phase::Words]);
+    let proved = Engine::builder()
+        .builtin()
+        .strategy(Strategy::new("t", vec![Phase::Words]).with_words_proved(true))
+        .build()
+        .unwrap();
+    for (src, w) in [
+        (
+            "trunc<20>((a:32 >>u 12) + (b:32 >>u 12) + zext<32>((a + b & 4095) <u (a & 4095)))",
+            20,
+        ),
+        (
+            "trunc<20>((a:32 >>u 12) - (b:32 >>u 12) - zext<32>((a & 4095) <u (b & 4095)))",
+            20,
+        ),
+        (
+            "(a >>u 12) + (b >>u 12) + zext<32>((a + b & 4095) <u (a & 4095))",
+            32,
+        ),
+    ] {
+        let (want, got) = (simplify(&plain, src, w), simplify(&proved, src, w));
+        assert_eq!(want, got, "{src}");
+        assert_ne!(got.len(), src.len(), "{src}: rewritten");
+    }
+    assert_eq!(simplify(&proved, &xor_high(), 32), "extract<25, 7>(a ^ b)");
+}
+
+/// Words of 65 to 128 bits in limbs at any split: read back as the word's own arithmetic, and
+/// every result equal to what it replaces (at sampled values, and where a carry is dropped
+/// or a limb is wrong, left as it was or still equal).
+#[test]
+fn words_reads_limbs_of_wide_words() {
+    let eng = engine(vec![Phase::Words]);
+    let mut rng = Rng(0x71de_0128);
+    let (mut read, mut wrong_kept) = (0, 0);
+    for round in 0..120 {
+        let w = 65 + rng.below(64) as u16;
+        let k = 2 + rng.below(u64::from(w) - 3) as u16;
+        let h = w - k;
+        let (lo, hi) = (
+            |v: &str| format!("trunc<{k}>({v})"),
+            |v: &str| format!("extract<{k}, {h}>({v})"),
+        );
+        let carry = format!(
+            "zext<{h}>(extract<{k}, 1>(zext<{}>({}) + zext<{}>({})))",
+            k + 1,
+            lo("x"),
+            k + 1,
+            lo("y")
+        );
+        let borrow = format!("zext<{h}>({} <u {})", lo("x"), lo("y"));
+        // A sum, a difference, an exclusive or (its low limb as a sum); and each with the
+        // carry or the borrow left out, which is another function.
+        let (src, want) = match round % 6 {
+            0 => (
+                format!(
+                    "concat({} + {} + {carry}, {} + {})",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                Some("x + y"),
+            ),
+            1 => (
+                format!(
+                    "concat({} - {} - {borrow}, {} - {})",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                Some("x - y"),
+            ),
+            2 => (
+                format!(
+                    "concat({} ^ {}, {} + {} - 2 * ({} & {}))",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                // (The limbs become exclusive ors; joining them is another pass's.)
+                Some("^"),
+            ),
+            3 => (
+                format!(
+                    "concat({} + {}, {} + {})",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                None,
+            ),
+            4 => (
+                format!(
+                    "concat({} - {}, {} - {})",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                None,
+            ),
+            _ => (
+                format!(
+                    "concat({} + {} + {borrow}, {} + {})",
+                    hi("x"),
+                    hi("y"),
+                    lo("x"),
+                    lo("y")
+                ),
+                None,
+            ),
+        };
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(w).unwrap());
+        let e = cx.parse(&src, &o).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap().expr;
+        assert!(equivalent(&mut cx, e, out, &mut rng), "w={w} k={k}: {src}");
+        match want {
+            Some("^") => {
+                let text = cx.display(out).to_string();
+                assert!(
+                    !text.contains(" + ") && !text.contains(" * "),
+                    "w={w} k={k}: {text}"
+                );
+                read += 1;
+            }
+            Some(text) => {
+                assert_eq!(cx.display(out).to_string(), text, "w={w} k={k}: {src}");
+                read += 1;
+            }
+            None => {
+                let text = cx.display(out).to_string();
+                assert!(
+                    !matches!(text.as_str(), "x + y" | "x - y"),
+                    "w={w} k={k}: {src}"
+                );
+                wrong_kept += 1;
+            }
+        }
+    }
+    assert_eq!((read, wrong_kept), (60, 60));
 }
 
 /// A word made handler by handler in limbs of `k` and `32 − k` bits: each operand after the

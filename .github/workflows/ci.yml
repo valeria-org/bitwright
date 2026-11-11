@@ -118,7 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_expr, compile_rules, smt_import, simplify_dag, constrain_dag, mba_solve, fp_dag]
+        target: [parse_expr, compile_rules, smt_import, simplify_dag, constrain_dag, mba_solve, fp_dag, prove_dag]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

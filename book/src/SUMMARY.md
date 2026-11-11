@@ -18,6 +18,7 @@
 - [Deobfuscation and MBA](deobfuscation.md)
 - [Invertibility](invertibility.md)
 - [Equality saturation](eqsat.md)
+- [Solving](solving.md)
 - [SMT-LIB](smtlib.md)
 - [The command line](cli.md)
 - [C, C++, Python and JavaScript](bindings.md)

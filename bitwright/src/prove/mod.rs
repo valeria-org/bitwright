@@ -38,6 +38,9 @@ pub mod drup;
 mod exhaustion;
 pub mod finite;
 mod fp;
+mod incremental;
+mod lean;
+pub mod lrat;
 mod relations;
 mod rule;
 mod sample_words;
@@ -54,12 +57,17 @@ use crate::hash::IdMap;
 use crate::{BitVec, SymbolKey, Width};
 
 pub use exhaustion::Exhaustion;
+/// What an [`Incremental`] answers.
+pub use incremental::Answer as IncrementalAnswer;
+pub use incremental::Incremental;
+pub(crate) use lean::lean_equation;
+pub use lean::lean_theorem;
 pub use rule::{RuleOutcome, WidthReport, rule, rule_all_widths};
 
 use aig::{Aig, Cnf, L};
 use blast::Bits;
-pub use sat::Limits;
 use sat::{Answer, Lit, Solver, Step};
+pub use sat::{Backend, Limits};
 
 /// How assignments are selected before SAT search. Sampling can find a concrete
 /// counterexample. Complete ordered enumeration on the word path can also prove validity;
@@ -103,6 +111,18 @@ pub struct Config {
     /// Not with a certificate: a certificate is of the question as asked, with its symbols'
     /// declared known bits.
     pub simplify: bool,
+    /// Simplify without the one pass of the engine that commits rewrites it has derived but
+    /// neither proved nor matched against a proved rule: the limb-arithmetic pass
+    /// ([`Phase::Words`](crate::engine::Phase), integer identities checked at sample points).
+    /// An answer then rests only on proved rules, passes that are decision procedures or
+    /// prove what they commit, and the search. Off by default: that pass is what decides
+    /// limb multiplications no search finishes.
+    pub strict: bool,
+    /// Whether the simplifier's limb-arithmetic pass writes a result only once a circuit and
+    /// a search have proved it ([`Strategy::words_proved`](crate::engine::Strategy)): between
+    /// the default, which takes the pass's derivations as they are, and
+    /// [`strict`](Self::strict), which leaves the pass out.
+    pub proved_words: bool,
     /// The engine's budget for [`simplify`](Self::simplify): caps in the units of
     /// [`Budget`](crate::engine::Budget), counts of work and never time, so a question stops at
     /// the same place on every run. [`Budget::default`](crate::engine::Budget::default) (the
@@ -164,6 +184,15 @@ pub struct Config {
     /// helps where the two sides are one arithmetic written twice (a limb against its word),
     /// and changes the search elsewhere.
     pub shared_sums: bool,
+    /// Read the divisions by constants that a compiler wrote as products by magic numbers
+    /// (`trunc((zext(x) · M) >>u k)`, a multiply-high and a shift, the signed forms) as the
+    /// divisions they are, before the question is blasted: the simplifier's division pass
+    /// alone, for a question asked without the simplifier ([`simplify`](Self::simplify)
+    /// reads them already). A multiplier's circuit against a divider's is beyond a search
+    /// (the 32-bit quotient by 10 is undecided after 200,000 conflicts); read, both sides
+    /// are one division. An equality at every input; not for a
+    /// [`certificate`](Self::certificate). Opt-in.
+    pub divisions: bool,
     /// Sweep the circuit before the first search: nodes that simulation shows equal (or
     /// complementary) are proved so one pair at a time, from the inputs up, by a solver of
     /// the circuit's clauses alone, and each equivalence is given to the search as clauses.
@@ -196,6 +225,8 @@ impl Default for Config {
             max_nodes: 4_000_000,
             certificate: false,
             simplify: true,
+            strict: false,
+            proved_words: false,
             simplify_budget: crate::engine::Budget::default(),
             samples: 256,
             sample_mode: SampleMode::Random,
@@ -208,6 +239,7 @@ impl Default for Config {
             word_sampling: false,
             exhaustive_inputs: 0,
             shared_sums: false,
+            divisions: false,
             sweeping: true,
         }
     }
@@ -219,6 +251,8 @@ setters!(Config {
     with_max_nodes: max_nodes: usize,
     with_certificate: certificate: bool,
     with_simplify: simplify: bool,
+    with_strict: strict: bool,
+    with_proved_words: proved_words: bool,
     with_simplify_budget: simplify_budget: crate::engine::Budget,
     with_samples: samples: u32,
     with_sample_mode: sample_mode: SampleMode,
@@ -231,6 +265,7 @@ setters!(Config {
     with_word_sampling: word_sampling: bool,
     with_exhaustive_inputs: exhaustive_inputs: u8,
     with_shared_sums: shared_sums: bool,
+    with_divisions: divisions: bool,
     with_sweeping: sweeping: bool,
 });
 
@@ -252,21 +287,59 @@ impl Config {
     }
 }
 
-/// The engine that simplifies questions (see [`Config::simplify`]).
-fn simplifier() -> &'static crate::engine::Engine {
-    static ENGINE: std::sync::OnceLock<crate::engine::Engine> = std::sync::OnceLock::new();
-    ENGINE.get_or_init(|| {
+/// The engine that simplifies questions (see [`Config::simplify`]): the deobfuscation
+/// strategy, and with `strict` without the pass that commits rewrites it has derived but
+/// neither proved nor matched against a proved rule ([`Phase::Words`](crate::engine::Phase)),
+/// or with `proved` with that pass writing only what a circuit and a search prove
+/// ([`Config::proved_words`]).
+fn simplifier_of(strict: bool, proved: bool) -> &'static crate::engine::Engine {
+    static ENGINES: [std::sync::OnceLock<crate::engine::Engine>; 3] = [
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+        std::sync::OnceLock::new(),
+    ];
+    let which = if strict { 1 } else { 2 * usize::from(proved) };
+    ENGINES[which].get_or_init(|| {
         #[cfg(feature = "mba")]
-        let strategy = crate::engine::Strategy::deobfuscate()
+        let mut strategy = crate::engine::Strategy::deobfuscate()
             .with_mba(crate::mba::MbaConfig::default().with_opaque_sweep(true));
         #[cfg(not(feature = "mba"))]
-        let strategy = crate::engine::Strategy::deobfuscate();
+        let mut strategy = crate::engine::Strategy::deobfuscate();
+        if strict {
+            (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
+        }
+        strategy.words_proved = proved;
         crate::engine::Engine::builder()
             .builtin()
             .strategy(strategy)
             .build()
             .unwrap_or_else(|_| crate::engine::Engine::standard())
     })
+}
+
+/// The division pass alone ([`Config::divisions`]).
+fn divisions_only() -> &'static crate::engine::Engine {
+    static ENGINE: std::sync::OnceLock<crate::engine::Engine> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let strategy =
+            crate::engine::Strategy::new("divisions", vec![crate::engine::Phase::Division]);
+        crate::engine::Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap_or_else(|_| crate::engine::Engine::standard())
+    })
+}
+
+/// `p` as the prover's simplifier leaves it within [`Config::simplify_budget`]: an expression
+/// equal to `p` at every value of the symbols, which is what the prover builds its circuit
+/// of. Asked again of an expression a question was posed about, it costs a lookup.
+pub fn simplified(cx: &mut Context, p: Expr, cfg: &Config) -> Result<Expr, Error> {
+    let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
+    Ok(simplifier_of(cfg.strict, cfg.proved_words)
+        .run(cx, &[p], run)?
+        .roots[0]
+        .expr)
 }
 
 /// Clauses and a DRUP proof that they are unsatisfiable, or, for a proof by complete
@@ -291,7 +364,13 @@ impl Certificate {
     pub fn check(&self) -> Result<(), String> {
         match &self.exhaustion {
             Some(exhaustion) => exhaustion.check(),
-            None => drup::check(&self.clauses, &self.proof),
+            None => {
+                drup::check(&self.clauses, &self.proof)?;
+                // In the tests, every proof checked is checked as LRAT too.
+                #[cfg(test)]
+                lrat::check(&self.clauses, &self.lrat()?)?;
+                Ok(())
+            }
         }
     }
 
@@ -306,6 +385,17 @@ impl Certificate {
             s.push_str("0\n");
         }
         s
+    }
+
+    /// The proof as LRAT ([`lrat`]): every learned clause with the clauses it follows from,
+    /// found by checking the DRUP proof, for a checker that does no search (the text is
+    /// [`lrat::to_text`], beside [`dimacs`](Self::dimacs)). An error when the proof does not
+    /// check, or is one by enumeration.
+    pub fn lrat(&self) -> Result<Vec<lrat::Step>, String> {
+        match &self.exhaustion {
+            Some(_) => Err("a proof by enumeration has no clauses".into()),
+            None => lrat::from_drup(&self.clauses, &self.proof),
+        }
     }
 
     /// The proof in DRAT's text format (additions, and deletions prefixed `d`).
@@ -361,6 +451,9 @@ pub enum Unknown {
     /// Something the prover does not reason about (an extension operation without an
     /// expansion, say). The same under any budget.
     Unsupported(String),
+    /// A caller's deadline passed ([`crate::solve::Solver::check_within`]): more time may
+    /// decide it. Unlike the budgets, this depends on timing.
+    Deadline,
 }
 
 impl Unknown {
@@ -380,6 +473,7 @@ impl core::fmt::Display for Unknown {
                 f,
                 "no answer within {conflicts} conflicts ({propagations} propagations)"
             ),
+            Unknown::Deadline => write!(f, "the deadline passed"),
             Unknown::TooLarge { nodes } => {
                 write!(f, "the circuit is too large ({nodes} nodes built)")
             }
@@ -541,6 +635,28 @@ impl<'c> Blaster<'c> {
             max_nodes,
             too_large: false,
         }
+    }
+
+    /// A blaster that goes on from a circuit built before: its graph, the bits of the nodes
+    /// blasted and the symbols met ([`into_parts`](Self::into_parts)).
+    pub(crate) fn resume(
+        cx: &'c mut Context,
+        g: Aig,
+        bits: IdMap<u32, Bits>,
+        symbols: Vec<(u32, Bits)>,
+        max_nodes: usize,
+    ) -> Blaster<'c> {
+        Blaster {
+            g,
+            bits,
+            symbols,
+            ..Blaster::new(cx, max_nodes)
+        }
+    }
+
+    /// The circuit, to [`resume`](Self::resume) from.
+    pub(crate) fn into_parts(self) -> (Aig, IdMap<u32, Bits>, Vec<(u32, Bits)>) {
+        (self.g, self.bits, self.symbols)
     }
 
     /// The bits of node `root`.
@@ -890,7 +1006,9 @@ impl Question {
                 None => run,
             };
             let goal = cx.handle(goal_node);
-            let out = simplifier().run(cx, &[goal], run)?.roots[0];
+            let out = simplifier_of(cfg.strict, cfg.proved_words)
+                .run(cx, &[goal], run)?
+                .roots[0];
             let s = cx.id(out.expr)?;
             let proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
             q.stats.simplification = Simplification {
@@ -908,6 +1026,20 @@ impl Question {
             // A result that relies on constraints holds where they do, which is all a proof
             // under them needs.
             goal_node = s;
+        }
+        if cfg.divisions && !cfg.simplify && !cfg.certificate {
+            let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
+            let run = match assumptions {
+                Some(a) => run.with_assumptions(a),
+                None => run,
+            };
+            let goal = cx.handle(goal_node);
+            let out = divisions_only().run(cx, &[goal], run)?.roots[0];
+            goal_node = cx.id(out.expr)?;
+            if cx.const_val(goal_node).is_some_and(|v| !v.is_zero()) {
+                q.stats.rewritten = true;
+                return decided(q, Outcome::Proved(None));
+            }
         }
         let mut word_sampled = false;
         if (cfg.word_sampling || cfg.sample_mode == SampleMode::Words)
@@ -1331,5 +1463,38 @@ pub fn satisfy(
         Outcome::Proved(_) => Ok(None),
         Outcome::Refuted(m) => Ok(Some(m)),
         Outcome::Unknown(why) => Err(why),
+    })
+}
+
+/// The prover the engine's passes are given ([`crate::engine::oracle`]): the circuit and the
+/// search alone, without the simplifier (which is the engine that asks).
+pub(crate) fn circuit_equality(
+    cx: &mut Context,
+    a: Expr,
+    b: Expr,
+    caps: &crate::engine::oracle::EqualityCaps,
+) -> Result<crate::engine::oracle::EqualityAnswer, Error> {
+    use crate::engine::oracle::{EqualityAnswer, EqualityVerdict};
+    let cfg = Config::default()
+        .with_simplify(false)
+        .with_certificate(false)
+        .with_samples(caps.samples)
+        .with_max_nodes(caps.max_nodes)
+        .with_max_conflicts(u64::MAX)
+        .with_max_propagations(caps.max_propagations);
+    let mut q = Question::equal(cx, a, b, &cfg)?;
+    let out = q.solve(cx, cfg.limits())?;
+    let stats = q.stats();
+    let (verdict, nodes) = match out {
+        Outcome::Proved(_) => (EqualityVerdict::Proved, stats.nodes),
+        Outcome::Refuted(_) => (EqualityVerdict::Refuted, stats.nodes),
+        Outcome::Unknown(Unknown::Budget { .. }) => (EqualityVerdict::Budget, stats.nodes),
+        Outcome::Unknown(Unknown::TooLarge { nodes }) => (EqualityVerdict::Unknown, nodes),
+        Outcome::Unknown(_) => (EqualityVerdict::Unknown, stats.nodes),
+    };
+    Ok(EqualityAnswer {
+        verdict,
+        nodes,
+        propagations: stats.propagations,
     })
 }

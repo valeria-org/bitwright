@@ -6,12 +6,15 @@
 [![book](https://img.shields.io/badge/book-read%20online-blue)](https://valeria-org.github.io/bitwright/)
 [![MSRV](https://img.shields.io/badge/rustc-1.88+-orange.svg)](#stability)
 
-Hash-consed fixed-width bit-vector expressions for Rust: exact evaluation, bit-level facts, and
-verified simplification.
+A solver and simplifier for fixed-width bit-vector expressions, in Rust: exact evaluation,
+bit-level facts, verified simplification, and satisfiability with models.
 
 bitwright is for tools that reason about machine integers: binary analyzers, deobfuscators,
-decompilers and lifters. It simplifies their expressions with predictable cost and without
-guessing: a rewrite preserves the value of the expression at every input, or it does not happen.
+decompilers and lifters. It decides their questions at the level of words first (the facts, the
+normal forms and the decision procedures for what obfuscators write), and falls back on a
+circuit and a SAT search for the rest; and it simplifies their expressions with predictable
+cost and without guessing: a rewrite preserves the value of the expression at every input, or
+it does not happen.
 
 ```rust
 use bitwright::engine::Engine;
@@ -52,6 +55,11 @@ fn main() -> Result<(), bitwright::Error> {
   and any other), under all five rounding modes, exact and total (the canonical NaN, saturating
   conversions), in software: evaluation, expressions, facts and SMT-LIB, checked against an
   independent implementation on every input of every format up to 8 bits.
+- **A solver**: an assertion stack with `push` and `pop`, checks with models, checks under
+  assumptions and unsatisfiable cores (`bitwright::solve`), and SMT-LIB 2 scripts run as a
+  solver, whole or command by command through a pipe (`bitwright solve`). A check answers
+  independent constraints apart, remembers answers, and tries the cheap ways before the
+  simplifier and the search.
 - **Bit-level facts**: known bits, an unsigned strided interval (the values `lo`, `lo + stride`,
   …, `hi`) and a signed range, each tightening the others, tri-state proofs, and
   constraints you assume (a path condition, an invariant), with the ones each result relies on
@@ -112,8 +120,8 @@ round trips, choices on comparisons and tests); their answers are compared as SM
 | 40 floats, binary64 | 10,686 | **10,305**, 0.11 ms | 10,707, 0.20 ms | 11,659, 0.15 ms |
 
 bitwright's answer is the smallest of the three for all 800 bit-vector DAGs and for 392 of the
-400 floating-point ones. The solvers are built to decide satisfiability, which bitwright
-does not do, and they simplify toward that, not toward small expressions: z3 splits bitwise
+400 floating-point ones. The solvers simplify toward deciding satisfiability, not toward
+small expressions: z3 splits bitwise
 operations with constants into slices of bits, and Bitwuzla writes `|` and `−` with `&`, `~`
 and `+`, so their answers are almost always larger than the input. On 40 bit-vector nodes
 bitwright and Bitwuzla take about the same time; on 400, Bitwuzla is 2.3 times faster. On floats
@@ -162,11 +170,16 @@ text to the answer, parsing included.
 
 | Tool | Solved | The ground truth exactly | Median | 95th percentile |
 |-|-:|-:|-:|-:|
-| bitwright, `NormalFormSolver` | **75,737 (100 %)** | **49,856** | **0.21 ms** | **3.4 ms** |
+| bitwright, `NormalFormSolver` | **75,579 (99.8 %)** | **50,638** | **0.27 ms** | **3.3 ms** |
 | CoBRA (C++, af44b8a) | 64,396 (85.0 %) | 47,797 | 1.4 ms | 171 ms |
 
-bitwright proves each of its answers itself; this is the configuration the command line's
-`simplify` runs.
+bitwright proves each of its answers itself, at every input; this is the configuration the
+command line's `simplify` runs. Every answer is equal to its input (none wrong, none failed);
+the 158 not counted as solved are a few nodes larger than the ground truth (a third of them by
+one node), and 21,500 answers are smaller than it. Earlier releases reported every expression
+solved: some of those answers rested on assumptions bitwright no longer makes. Each sum of
+bitwise functions of five variables (`simba/e1_5vars`, 1,000 expressions) is solved, in 9 ms at
+the median. CoBRA's row was measured on another machine and is not run again here.
 
 ## Installation
 
@@ -179,10 +192,13 @@ features:
 
 | Feature | Default | Adds |
 |-|-|-|
-| `check` | yes | the rule soundness checker, evidence and proof ledgers |
-| `smtlib` | no | SMT-LIB export and import, rule obligations for any SMT solver |
-| `mba` | no | the MBA service: lowering, the native normal-form solver, solver and prover traits, the evidence gate and its certificates |
-| `eqsat` | no | a bounded equality-saturation search for alternative expressions |
+| `check` | yes | the rule soundness checker, evidence and proof ledgers; with it `prove`, the prover and the solver (`bitwright::solve`) |
+| `smtlib` | yes | SMT-LIB export and import, scripts run as a solver session, rule obligations for any SMT solver |
+| `mba` | yes | the MBA service: lowering, the native normal-form solver, solver and prover traits, the evidence gate and its certificates |
+| `eqsat` | yes | a bounded equality-saturation search for alternative expressions |
+
+Every feature is on by default; `default-features = false` leaves the core (expressions, facts,
+the engine and its rules) and takes back what it is given.
 
 ## Documentation
 

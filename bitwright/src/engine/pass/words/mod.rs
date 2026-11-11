@@ -70,12 +70,18 @@
 //! `rounds`), and what it writes goes back to them: its reading is of the whole root, and a
 //! root they are still folding is not yet the one to read.
 //!
+//! Words of up to 128 bits are read. The integers the pass computes in have 256 bits
+//! ([`int`]): a word, a coefficient and a shift on top of it need more than 128. A question
+//! with no node above 64 bits is read within the bounds the pass was made with for 64-bit
+//! words, so that it finds what it found; a wider one within bounds that hold its words.
+//!
 //! The reading uses the facts (bounds and known bits) of the nodes, so a result relies on
 //! what they relied on. Coefficients, shifts, the terms of a form, the nodes under a root and
 //! the work of one question are bounded ([`form`] and [`write`]): past a bound a node is the
 //! value it is, or the question is not asked, which no budget changes.
 
 mod form;
+mod int;
 mod lift;
 #[cfg(test)]
 mod tests;
@@ -470,6 +476,31 @@ fn unused(r: &mut Runner<'_, '_>, cx: &Context, before: u32, e: u32) -> Result<(
     Ok(())
 }
 
+/// The answer `e` for `n` under the commit rule, and whether it stands as found: with
+/// [`Strategy::words_proved`](crate::engine::Strategy::words_proved), an answer no circuit
+/// and search prove is not one.
+fn committed(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    e: u32,
+    before: u32,
+    fin: Fin,
+) -> Result<(Step, bool), Stop> {
+    if r.inner.strategy.words_proved && e != n && !proved(r, cx, n, e)? {
+        r.stats
+            .passes
+            .entry(PassKind::Words.name())
+            .or_default()
+            .noop += 1;
+        return Ok((Step::Normal(fin), false));
+    }
+    Ok((
+        finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
+        true,
+    ))
+}
+
 /// The search at root `n` over `nodes`, and whether it found anything (which the commit rule
 /// may still refuse).
 fn ask(
@@ -480,6 +511,9 @@ fn ask(
     nodes: Vec<u32>,
 ) -> Result<(Step, bool), Stop> {
     let before = cx.len() as u32;
+    // A question with a node of more than 64 bits is read within the wider bounds.
+    let wide = nodes.iter().any(|&i| cx.node(i).width > 64);
+    let _bounds = form::Wide::set(wide);
     // The forms are read anew for each root: what is found depends on the nodes under it
     // and nothing else. The smallest answer is taken, the sums' of two as small, and the
     // root the sums' answer is, is asked with the sums as well whatever the atoms read
@@ -515,21 +549,18 @@ fn ask(
                 ea
             };
             unused(r, cx, before, e)?;
-            (
-                finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
-                true,
-            )
+            committed(r, cx, n, e, before, fin)?
         }
         _ => match a.least() {
             Some((l, root, _)) => {
                 let e = l.build.write(r, cx, root)?;
-                let step = finish(r, cx, PassKind::Words, n, e, before, &[], fin)?;
+                let (step, found) = committed(r, cx, n, e, before, fin)?;
                 if let Step::To(e, _) = step
                     && a.of_sums(l)
                 {
                     r.words.sums_at = Some(e);
                 }
-                (step, true)
+                (step, found)
             }
             None => {
                 r.stats
@@ -543,6 +574,45 @@ fn ask(
     };
     *build = a.first.build;
     Ok(out)
+}
+
+/// The gates of a proof's circuit and the propagations of its search, at most
+/// ([`Strategy::words_proved`](crate::engine::Strategy::words_proved)).
+#[cfg(feature = "prove")]
+const PROOF_NODES: usize = 1 << 18;
+/// See [`PROOF_NODES`].
+#[cfg(feature = "prove")]
+const PROOF_PROPAGATIONS: u64 = 1 << 23;
+
+/// Whether what the pass made of `n` is proved equal to it, by a prover that knows nothing
+/// of the pass: a circuit of both and a search, over a scratch copy.
+#[cfg(feature = "prove")]
+fn proved(r: &mut Runner<'_, '_>, cx: &Context, n: u32, e: u32) -> Result<bool, Stop> {
+    use crate::engine::oracle::{EqualityCaps, EqualityVerdict};
+    let mut scx = Context::new();
+    let both = match scx.import(cx, &[cx.handle(n), cx.handle(e)]) {
+        Ok(both) => both,
+        // (An extension operation: a scratch context has no registry.)
+        Err(crate::Error::Unsupported(_)) => return Ok(false),
+        Err(e) => return Err(Stop::Error(e)),
+    };
+    let caps = EqualityCaps {
+        samples: 64,
+        max_nodes: PROOF_NODES,
+        max_propagations: PROOF_PROPAGATIONS,
+    };
+    let out =
+        (crate::circuit_equality())(&mut scx, both[0], both[1], &caps).map_err(Stop::Error)?;
+    let left = r.meter.left_in(|b| b.pass_work);
+    r.meter
+        .charge(Counter::PassWork, (out.nodes as u64).min(left))?;
+    Ok(out.verdict == EqualityVerdict::Proved)
+}
+
+/// Without a prover nothing is proved.
+#[cfg(not(feature = "prove"))]
+fn proved(_: &mut Runner<'_, '_>, _: &Context, _: u32, _: u32) -> Result<bool, Stop> {
+    Ok(false)
 }
 
 /// The pass at `n` once its operands are walked: what [`first`] found for it. A node that was

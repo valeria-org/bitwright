@@ -8,6 +8,7 @@
 //! [`Algebra::plain`] and [`Algebra::values`]): an atom over the words truncations are of, an
 //! atom over the values as they are, or the sum `x + y − 2·(x & y)`.
 
+use super::int::Int;
 use core::cmp::Ordering;
 
 use crate::hash::{IdMap, combine};
@@ -22,10 +23,50 @@ pub(super) struct Over;
 
 pub(super) type R<T> = Result<T, Over>;
 
+std::thread_local! {
+    /// Whether the question in progress has a node of more than 64 bits (see [`Wide`]).
+    static WIDE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// The bounds of a question's arithmetic, set for its duration: a word of up to 64 bits is
+/// read within the bounds the pass was made with (coefficients below two to the 100,
+/// shifts up to 96), and a wider one within bounds that hold a word of 128 bits. A question
+/// of narrow words is read exactly as before there were wide ones.
+pub(super) struct Wide(bool);
+
+impl Wide {
+    /// Sets the bounds for a question with (or without) a node of more than 64 bits, until
+    /// the value is dropped.
+    pub(super) fn set(on: bool) -> Wide {
+        Wide(WIDE.with(|w| w.replace(on)))
+    }
+}
+
+impl Drop for Wide {
+    fn drop(&mut self) {
+        WIDE.with(|w| w.set(self.0));
+    }
+}
+
+fn wide() -> bool {
+    WIDE.with(core::cell::Cell::get)
+}
+
 /// Coefficients stay below this in magnitude.
-const BIG: i128 = 1 << 100;
+fn big() -> Int {
+    Int::pow2(if wide() { 228 } else { 100 })
+}
+
 /// The widest shift of a floor, and the most bits of an AND.
-pub(super) const MAX_SHIFT: u32 = 96;
+pub(super) fn max_shift() -> u32 {
+    if wide() { 224 } else { 96 }
+}
+
+/// The bits a power of two may have where it becomes a coefficient.
+pub(super) fn room() -> u32 {
+    if wide() { 228 } else { 100 }
+}
+
 /// The most terms of a form; and of a plain one (see `Algebra::plain`): a form with more
 /// has the root asked with the plain forms too.
 const MAX_TERMS: usize = 256;
@@ -48,37 +89,51 @@ const XOR: u8 = 2;
 const AND: u8 = 3;
 const FLOOR: u8 = 4;
 
-fn ck(c: i128) -> R<i128> {
-    if c > -BIG && c < BIG {
+fn ck(c: Int) -> R<Int> {
+    // (Within the bounds of narrow words, which those of wide ones hold.)
+    if let Some(v) = c.to_i128()
+        && v.unsigned_abs() < 1 << 100
+    {
+        return Ok(c);
+    }
+    let big = big();
+    if c > -big && c < big {
         Ok(c)
     } else {
         Err(Over)
     }
 }
 
-fn mul(a: i128, b: i128) -> R<i128> {
+fn mul(a: impl Into<Int>, b: Int) -> R<Int> {
+    let a = a.into();
+    if b == Int::ONE {
+        return ck(a);
+    }
+    if a == Int::ONE {
+        return ck(b);
+    }
     a.checked_mul(b).ok_or(Over).and_then(ck)
 }
 
-fn plus(a: i128, b: i128) -> R<i128> {
+fn plus(a: Int, b: Int) -> R<Int> {
     a.checked_add(b).ok_or(Over).and_then(ck)
 }
 
 /// The number of bits of a value that is not negative.
-pub(super) fn bit_len(v: i128) -> u32 {
+pub(super) fn bit_len(v: Int) -> u32 {
     debug_assert!(v >= 0);
-    128 - v.leading_zeros()
+    256 - v.leading_zeros()
 }
 
 /// `c + Σ kᵢ·aᵢ`: the terms in the atoms' order, no coefficient zero.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub(super) struct Form {
-    pub(super) c: i128,
-    pub(super) t: Vec<(AtomId, i128)>,
+    pub(super) c: Int,
+    pub(super) t: Vec<(AtomId, Int)>,
 }
 
 impl Form {
-    pub(super) fn konst(c: i128) -> Form {
+    pub(super) fn konst(c: Int) -> Form {
         Form { c, t: Vec::new() }
     }
 
@@ -89,13 +144,16 @@ impl Form {
     /// The atom when the form is one atom (coefficient 1, constant 0).
     pub(super) fn single(&self) -> Option<AtomId> {
         match self.t[..] {
-            [(a, 1)] if self.c == 0 => Some(a),
+            [(a, k)] if k == 1 && self.c == 0 => Some(a),
             _ => None,
         }
     }
 
-    pub(super) fn coeff(&self, a: AtomId) -> i128 {
-        self.t.iter().find(|x| x.0 == a).map_or(0, |x| x.1)
+    pub(super) fn coeff(&self, a: AtomId) -> Int {
+        self.t
+            .iter()
+            .find(|x| x.0 == a)
+            .map_or(Int::from(0), |x| x.1)
     }
 
     /// The form without atom `a`.
@@ -126,21 +184,22 @@ pub(super) enum Atom {
 /// Bounds of a value: `None` is no bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Iv {
-    pub(super) lo: Option<i128>,
-    pub(super) hi: Option<i128>,
+    pub(super) lo: Option<Int>,
+    pub(super) hi: Option<Int>,
 }
 
 impl Iv {
     pub(super) const ALL: Iv = Iv { lo: None, hi: None };
 
-    pub(super) fn new(lo: i128, hi: i128) -> Iv {
+    pub(super) fn new(lo: impl Into<Int>, hi: Int) -> Iv {
         Iv {
-            lo: Some(lo),
+            lo: Some(lo.into()),
             hi: Some(hi),
         }
     }
 
-    pub(super) fn point(c: i128) -> Iv {
+    pub(super) fn point(c: impl Into<Int>) -> Iv {
+        let c = c.into();
         Iv::new(c, c)
     }
 
@@ -165,8 +224,11 @@ impl Iv {
         }
     }
 
-    fn scaled(self, c: i128) -> Iv {
-        let m = |x: Option<i128>| x.and_then(|x| x.checked_mul(c));
+    fn scaled(self, c: Int) -> Iv {
+        if c == Int::ONE {
+            return self;
+        }
+        let m = |x: Option<Int>| x.and_then(|x| x.checked_mul(c));
         if c >= 0 {
             Iv {
                 lo: m(self.lo),
@@ -196,12 +258,13 @@ impl Iv {
     }
 
     /// Whether the value is known to lie in `[lo, hi]`.
-    pub(super) fn within(self, lo: i128, hi: i128) -> bool {
+    pub(super) fn within(self, lo: impl Into<Int>, hi: Int) -> bool {
+        let lo = lo.into();
         self.lo.is_some_and(|x| x >= lo) && self.hi.is_some_and(|x| x <= hi)
     }
 
     /// The one value, when the bounds meet.
-    fn value(self) -> Option<i128> {
+    fn value(self) -> Option<Int> {
         match (self.lo, self.hi) {
             (Some(a), Some(b)) if a == b => Some(a),
             _ => None,
@@ -254,8 +317,8 @@ pub(super) struct Algebra {
     /// Terms handled, for the meter.
     pub(super) work: u64,
     /// The operands of the XOR atoms (in their order: by structure) and their constants.
-    lists: Vec<(Vec<FormId>, i128)>,
-    list_ids: IdMap<(Vec<FormId>, i128), u32>,
+    lists: Vec<(Vec<FormId>, Int)>,
+    list_ids: IdMap<(Vec<FormId>, Int), u32>,
     /// Per AND atom of two bits or more, the values it was first asked of (see `band`): it
     /// is their AND as they are.
     whole: IdMap<AtomId, (Form, Form)>,
@@ -319,12 +382,12 @@ impl Algebra {
     }
 
     fn hash_of(&self, f: &Form) -> u64 {
-        let mut h = combine(0x666f_726d, f.c as u64);
-        h = combine(h, (f.c >> 64) as u64);
+        let mut h = combine(0x666f_726d, f.c.low_u64());
+        h = combine(h, (f.c >> 64).low_u64());
         for &(a, c) in &f.t {
             h = combine(h, self.key[a as usize].1);
-            h = combine(h, c as u64);
-            h = combine(h, (c >> 64) as u64);
+            h = combine(h, c.low_u64());
+            h = combine(h, (c >> 64).low_u64());
         }
         h
     }
@@ -379,27 +442,28 @@ impl Algebra {
     pub(super) fn leaf(&mut self, n: u32, shash: u64, iv: Iv) -> R<Form> {
         let a = self.make(Atom::Leaf(n), combine(0x6c65_6166, shash), iv)?;
         Ok(Form {
-            c: 0,
-            t: vec![(a, 1)],
+            c: Int::from(0),
+            t: vec![(a, Int::from(1))],
         })
     }
 
     fn one(a: AtomId) -> Form {
         Form {
-            c: 0,
-            t: vec![(a, 1)],
+            c: Int::from(0),
+            t: vec![(a, Int::from(1))],
         }
     }
 
     /// `x + m·y`.
-    pub(super) fn add(&mut self, x: &Form, y: &Form, m: i128) -> R<Form> {
+    pub(super) fn add(&mut self, x: &Form, y: &Form, m: impl Into<Int>) -> R<Form> {
         let f = self.sum(x, y, m)?;
         self.settle(f)
     }
 
     /// `x + m·y`, as the terms come: for what takes a form apart term by term (the sum is
     /// the same value, and need not be the form [`add`](Self::add) gives).
-    pub(super) fn sum(&mut self, x: &Form, y: &Form, m: i128) -> R<Form> {
+    pub(super) fn sum(&mut self, x: &Form, y: &Form, m: impl Into<Int>) -> R<Form> {
+        let m = m.into();
         if m == 0 {
             return Ok(x.clone());
         }
@@ -445,13 +509,14 @@ impl Algebra {
         })
     }
 
-    pub(super) fn scale(&mut self, x: &Form, m: i128) -> R<Form> {
+    pub(super) fn scale(&mut self, x: &Form, m: impl Into<Int>) -> R<Form> {
         let f = self.scaled(x, m)?;
         self.settle(f)
     }
 
     /// `m·x`, as the terms come.
-    fn scaled(&mut self, x: &Form, m: i128) -> R<Form> {
+    fn scaled(&mut self, x: &Form, m: impl Into<Int>) -> R<Form> {
+        let m = m.into();
         if m == 0 {
             return Ok(Form::default());
         }
@@ -529,7 +594,7 @@ impl Algebra {
 
     /// `f` where its value is known to lie in `[0, 2^p)`.
     fn exact(&mut self, f: &Form, p: u32) -> Option<Form> {
-        let top = (1i128 << p) - 1;
+        let top = (Int::ONE << p) - 1;
         if f.is_const() {
             return Some(Form::konst(f.c & top));
         }
@@ -547,7 +612,7 @@ impl Algebra {
             return Err(Over);
         }
         let w = self.wrap(f, p, None)?;
-        if self.interval(&w).within(0, (1i128 << p) - 1) {
+        if self.interval(&w).within(0, (Int::ONE << p) - 1) {
             Ok(w)
         } else {
             Err(Over)
@@ -573,7 +638,7 @@ impl Algebra {
         };
         let (ops, k) = self.lists[li as usize].clone();
         // The parts `u` begins, each with its constant.
-        let mut parts: Vec<(Vec<FormId>, i128)> = Vec::new();
+        let mut parts: Vec<(Vec<FormId>, Int)> = Vec::new();
         if let Atom::Xor(_, l2) = self.atom(u) {
             let (inner, k2) = self.lists[l2 as usize].clone();
             if !inner.is_empty() && inner.iter().all(|i| ops.contains(i)) {
@@ -582,7 +647,7 @@ impl Algebra {
         }
         for &i in &ops {
             if self.form(i).t.first().is_some_and(|t| t.0 == u) {
-                parts.push((vec![i], 0));
+                parts.push((vec![i], Int::ZERO));
             }
         }
         let mut out = Vec::new();
@@ -685,13 +750,13 @@ impl Algebra {
 
     /// Of the forms `f − m·(2·a − d)` in which a term of the relation is gone, the best (see
     /// [`settle`](Self::settle)): its `m`. None when there is none.
-    fn best_move(&self, f: &Form, a: AtomId, d: &Form) -> Option<i128> {
+    fn best_move(&self, f: &Form, a: AtomId, d: &Form) -> Option<Int> {
         let g = f.coeff(a);
-        let cs: Vec<(i128, i128, u8)> =
+        let cs: Vec<(Int, Int, u8)> =
             d.t.iter()
                 .map(|&(t, dt)| (f.coeff(t), dt, self.key[t as usize].0))
                 .collect();
-        let mut ms: Vec<i128> = Vec::with_capacity(cs.len() + 1);
+        let mut ms: Vec<Int> = Vec::with_capacity(cs.len() + 1);
         if g % 2 == 0 {
             ms.push(g / 2);
         }
@@ -700,23 +765,23 @@ impl Algebra {
                 ms.push(-(c / dt));
             }
         }
-        let mut best: Option<((u32, u32, i128, bool), i128)> = None;
+        let mut best: Option<((u32, u32, Int, bool), Int)> = None;
         for m in ms {
-            let Some(ga) = m.checked_mul(2).and_then(|x| g.checked_sub(x)) else {
+            let Some(ga) = m.checked_mul(Int::from(2)).and_then(|x| g.checked_sub(x)) else {
                 continue;
             };
             let (mut terms, mut xors, mut over) = (2 * u32::from(ga != 0), 0u32, false);
             for &(c, dt, rank) in &cs {
                 match m.checked_mul(dt).and_then(|x| c.checked_add(x)) {
-                    Some(0) => {}
-                    Some(v) if v > -BIG && v < BIG => {
+                    Some(v) if v == 0 => {}
+                    Some(v) if v > -big() && v < big() => {
                         terms += if rank == AND { 2 } else { 1 };
                         xors += u32::from(rank == XOR);
                     }
                     _ => over = true,
                 }
             }
-            if over || ga <= -BIG || ga >= BIG {
+            if over || ga <= -big() || ga >= big() {
                 continue;
             }
             let key = (terms, xors, ga.abs(), ga < 0);
@@ -734,14 +799,14 @@ impl Algebra {
 
     /// The value of `f` where each node has the value `leaf` gives (for the tests).
     #[cfg(test)]
-    pub(super) fn eval(&self, f: &Form, leaf: &dyn Fn(u32) -> i128) -> i128 {
+    pub(super) fn eval(&self, f: &Form, leaf: &dyn Fn(u32) -> Int) -> Int {
         let of = |i: FormId| self.eval(self.form(i), leaf);
         let mut v = f.c;
         for &(a, c) in &f.t {
             v += c * match self.atom(a) {
                 Atom::Leaf(n) => leaf(n),
-                Atom::Floor(ri, k) => of(ri) >> k,
-                Atom::And(p, xi, yi) => of(xi) & of(yi) & ((1i128 << p) - 1),
+                Atom::Floor(ri, k) => of(ri) >> u32::from(k),
+                Atom::And(p, xi, yi) => of(xi) & of(yi) & ((Int::ONE << u32::from(p)) - 1),
                 Atom::Sel(ci, ai, bi) => {
                     if of(ci) != 0 {
                         of(ai)
@@ -762,7 +827,7 @@ impl Algebra {
     // ----- xor --------------------------------------------------------------------------
 
     /// The operands and the constant of the XOR atoms' list `li`.
-    pub(super) fn xor_list(&self, li: u32) -> (&[FormId], i128) {
+    pub(super) fn xor_list(&self, li: u32) -> (&[FormId], Int) {
         let (ops, k) = &self.lists[li as usize];
         (ops, *k)
     }
@@ -779,7 +844,7 @@ impl Algebra {
         if p == 0 {
             return Ok(Form::default());
         }
-        if p > MAX_SHIFT {
+        if p > max_shift() {
             return Err(Over);
         }
         if p == 1 {
@@ -808,7 +873,7 @@ impl Algebra {
             }
             return Ok(acc.unwrap_or_default());
         }
-        let top = (1i128 << p) - 1;
+        let top = (Int::ONE << p) - 1;
         let mut mods: Vec<Form> = Vec::with_capacity(ops.len());
         for o in ops {
             mods.push(self.modulo(o, p)?);
@@ -820,7 +885,7 @@ impl Algebra {
         let ones = mods
             .iter()
             .filter(|f| f.is_const())
-            .fold(0i128, |k, f| k ^ f.c);
+            .fold(Int::ZERO, |k, f| k ^ f.c);
         let mut others = mods.iter().filter(|f| !f.is_const());
         if let (Some(f), None) = (others.next(), others.next())
             && ones != 0
@@ -833,7 +898,7 @@ impl Algebra {
         }
         // The operands as the values they have modulo `2^p`, the constants apart, and how
         // many bits the XOR has.
-        let (mut k, mut neg) = (0i128, false);
+        let (mut k, mut neg) = (Int::ZERO, false);
         let mut exact: Vec<Form> = Vec::with_capacity(ops.len());
         let mut q = 1;
         for mut f in mods {
@@ -853,10 +918,10 @@ impl Algebra {
         }
         if k == top {
             neg = !neg;
-            k = 0;
+            k = Int::ZERO;
         }
         q = q.max(bit_len(k));
-        let low = (1i128 << q) - 1;
+        let low = (Int::ONE << q) - 1;
         // An operand is taken without its multiples of `2^q` where that is not negative: the
         // word a truncation is of, as arithmetic takes it (the XOR of the words has the XOR
         // of the truncations in its low `q` bits). The operands of an XOR among them are
@@ -889,12 +954,12 @@ impl Algebra {
             }
         }
         // A constant that is one run of ones is taken with slices, as `band` takes it.
-        let mut run = 0i128;
+        let mut run = Int::ZERO;
         if k != 0 {
             let r = k >> k.trailing_zeros();
             if r & (r + 1) == 0 {
                 run = k;
-                k = 0;
+                k = Int::ZERO;
             }
         }
         let core = if list.is_empty() {
@@ -925,7 +990,7 @@ impl Algebra {
     /// `e`; and `e` always where the operands are the values (see `values`).
     fn rep(&mut self, e: &Form, q: u32) -> Form {
         let r = self.reduce(e, q);
-        if r == *e || !self.interval(&r).within(0, (1i128 << MAX_SHIFT) - 1) {
+        if r == *e || !self.interval(&r).within(0, (Int::ONE << max_shift()) - 1) {
             return e.clone();
         }
         self.wordy |= self.linking == 0;
@@ -934,7 +999,7 @@ impl Algebra {
 
     /// The XOR of operands that are all the same floor, or the same slice, of forms: that
     /// floor or slice of the XOR of the forms (with `k`, shifted to where they are).
-    fn hoisted(&mut self, p: u32, list: &[FormId], k: i128) -> R<Option<Form>> {
+    fn hoisted(&mut self, p: u32, list: &[FormId], k: Int) -> R<Option<Form>> {
         let mut common: Option<(u32, Option<u32>)> = None;
         let mut inner: Vec<Form> = Vec::with_capacity(list.len() + 1);
         for &i in list {
@@ -958,10 +1023,10 @@ impl Algebra {
         };
         // (What of the constant is above the slice is beside it.)
         let width = len.unwrap_or(p).min(p);
-        if lo + width > MAX_SHIFT {
+        if lo + width > max_shift() {
             return Ok(None);
         }
-        let low = (1i128 << width) - 1;
+        let low = (Int::ONE << width) - 1;
         inner.push(Form::konst((k & low) << lo));
         let x = self.bxor(lo + width, &inner)?;
         let out = match len {
@@ -974,17 +1039,17 @@ impl Algebra {
 
     /// The atom of the XOR of the operands `list` (values that are not negative, in order,
     /// each once, two at least or one and a constant) and `k`: of them as integers.
-    fn xor_atom(&mut self, list: Vec<FormId>, k: i128) -> R<Form> {
+    fn xor_atom(&mut self, list: Vec<FormId>, k: Int) -> R<Form> {
         let mut q = if k == 0 { 1 } else { bit_len(k) };
         for &i in &list {
             let f = self.form(i).clone();
             q = q.max(self.range(&f).bits().ok_or(Over)?);
         }
-        if q > MAX_SHIFT {
+        if q > max_shift() {
             return Err(Over);
         }
-        let mut hash = combine(combine(0x0078_6f72, u64::from(q)), k as u64);
-        hash = combine(hash, (k >> 64) as u64);
+        let mut hash = combine(combine(0x0078_6f72, u64::from(q)), k.low_u64());
+        hash = combine(hash, (k >> 64).low_u64());
         for &i in &list {
             hash = combine(hash, self.hashes[i as usize]);
         }
@@ -1001,13 +1066,17 @@ impl Algebra {
                 li
             }
         };
-        let a = self.make(Atom::Xor(q as u8, li), hash, Iv::new(0, (1i128 << q) - 1))?;
+        let a = self.make(
+            Atom::Xor(q as u8, li),
+            hash,
+            Iv::new(0, (Int::ONE << q) - 1),
+        )?;
         Ok(Self::one(a))
     }
 
-    pub(super) fn shift(&mut self, x: &Form, c: i128) -> R<Form> {
+    pub(super) fn shift(&mut self, x: &Form, c: impl Into<Int>) -> R<Form> {
         Ok(Form {
-            c: plus(x.c, c)?,
+            c: plus(x.c, c.into())?,
             t: x.t.clone(),
         })
     }
@@ -1015,16 +1084,16 @@ impl Algebra {
     /// The form with every coefficient the residue modulo `2^p` nearest 0 (`2^(p−1)` itself
     /// stays), and the constant in `[0, 2^p)`: equal to the form modulo `2^p`.
     pub(super) fn reduce(&mut self, f: &Form, p: u32) -> Form {
-        if p > MAX_SHIFT {
+        if p > max_shift() {
             return f.clone();
         }
-        let m = (1i128 << p) - 1;
-        let half = 1i128 << (p - 1);
+        let m = (Int::ONE << p) - 1;
+        let half = Int::ONE << (p - 1);
         let mut t = Vec::with_capacity(f.t.len());
         for &(a, c) in &f.t {
             let mut r = c & m;
             if r > half {
-                r -= 1 << p;
+                r -= Int::ONE << p;
             }
             if r != 0 {
                 t.push((a, r));
@@ -1093,11 +1162,11 @@ impl Algebra {
             // the values it was asked of, whole. Else an operand is read by its low `p`
             // bits: an atom that is wider, as those.
             let xor = self.xor_of(m).filter(|&a| f.coeff(a) != 0);
-            let dl = xor.map_or(0, |a| f.coeff(a));
+            let dl = xor.map_or(Int::ZERO, |a| f.coeff(a));
             let whole = xor.and_then(|_| self.whole.get(&m).cloned());
             let top = match whole {
-                Some(_) => (1i128 << MAX_SHIFT) - 1,
-                None => (1i128 << p) - 1,
+                Some(_) => (Int::ONE << max_shift()) - 1,
+                None => (Int::ONE << u32::from(p)) - 1,
             };
             let known = whole.is_some();
             let mut ops = match whole {
@@ -1122,7 +1191,7 @@ impl Algebra {
             }
             let [x, y] = ops;
             let [ix, iy] = ivs;
-            if !ix.within(0, top) || !iy.within(0, top) {
+            if !ix.within(Int::from(0), top) || !iy.within(Int::from(0), top) {
                 continue;
             }
             tried += 1;
@@ -1132,11 +1201,11 @@ impl Algebra {
             let lead = |z: &Form| match z.t.first() {
                 Some(&(a0, z0)) => {
                     let c = f.coeff(a0);
-                    if c % z0 == 0 { c / z0 } else { 0 }
+                    if c % z0 == 0 { c / z0 } else { Int::from(0) }
                 }
-                None => 0,
+                None => Int::from(0),
             };
-            let half = if g % 2 == 0 { -(g / 2) } else { 0 };
+            let half = if g % 2 == 0 { -(g / 2) } else { Int::from(0) };
             let mut cands = [(lead(&x), lead(&y)), (-g, -g), (half, half)];
             cands.sort_unstable();
             for (k, &(al, be)) in cands.iter().enumerate() {
@@ -1154,57 +1223,66 @@ impl Algebra {
                     continue;
                 }
                 let ir = self.interval_at(&rest, depth + 1);
-                let (xh, yh) = (ix.hi.unwrap_or(0), iy.hi.unwrap_or(0));
+                let (xh, yh) = (ix.hi.unwrap_or(Int::from(0)), iy.hi.unwrap_or(Int::from(0)));
                 let bits = bit_len(xh).max(bit_len(yh));
-                let (mut lo, mut hi) = (Some(0i128), Some(0i128));
-                for i in 0..bits {
-                    // The bit of a constant is the bit it has; one above the value's highest
-                    // is 0.
-                    let of = |z: &Form, zh: i128| -> (i128, i128) {
-                        if z.is_const() {
-                            let b = (z.c >> i) & 1;
-                            (b, b)
-                        } else if bit_len(zh) <= i {
-                            (0, 0)
-                        } else {
-                            (0, 1)
-                        }
-                    };
-                    let ((x0, x1), (y0, y1)) = (of(&x, xh), of(&y, yh));
-                    let (mut least, mut most) = (i128::MAX, i128::MIN);
+                let (mut lo, mut hi) = (Some(Int::ZERO), Some(Int::ZERO));
+                // The least and most of a bit depend on what the operands' bits may be, which
+                // is the same from one bit to the next nearly always: the bits are taken a
+                // run at a time, a run of bits `[from, to)` weighing `2^to − 2^from`.
+                let (xl, yl) = (bit_len(xh), bit_len(yh));
+                // The bit of a constant is the bit it has; one above the value's highest is
+                // 0.
+                let of = |z: &Form, len: u32, i: u32| -> (bool, bool) {
+                    if z.is_const() {
+                        let b = (z.c >> i).low_u64() & 1 == 1;
+                        (b, b)
+                    } else {
+                        (false, len > i)
+                    }
+                };
+                let corners = |(x0, x1): (bool, bool), (y0, y1): (bool, bool)| {
+                    let (mut least, mut most) = (Int::MAX, Int::MIN);
                     for xb in [x0, x1] {
                         for yb in [y0, y1] {
-                            let v = al
-                                .checked_mul(xb)
-                                .zip(be.checked_mul(yb))
-                                .and_then(|(a, b)| a.checked_add(b))
-                                .and_then(|s| s.checked_add(g * (xb & yb)))
-                                .and_then(|s| s.checked_add(dl * (xb ^ yb)));
+                            let mut v = Some(Int::ZERO);
+                            for (on, c) in [(xb, al), (yb, be), (xb & yb, g), (xb ^ yb, dl)] {
+                                if on {
+                                    v = v.and_then(|s| s.checked_add(c));
+                                }
+                            }
                             match v {
                                 Some(v) => {
                                     least = least.min(v);
                                     most = most.max(v);
                                 }
                                 None => {
-                                    least = i128::MIN;
-                                    most = i128::MAX;
+                                    least = Int::MIN;
+                                    most = Int::MAX;
                                 }
                             }
                         }
                     }
-                    let at = |acc: Option<i128>, v: i128| {
-                        acc.and_then(|a| v.checked_mul(1i128 << i).and_then(|v| a.checked_add(v)))
+                    (least, most)
+                };
+                let mut from = 0;
+                while from < bits {
+                    let key = (of(&x, xl, from), of(&y, yl, from));
+                    let mut to = from + 1;
+                    while to < bits && (of(&x, xl, to), of(&y, yl, to)) == key {
+                        to += 1;
+                    }
+                    let (least, most) = corners(key.0, key.1);
+                    let weight = (Int::ONE << to) - (Int::ONE << from);
+                    let at = |acc: Option<Int>, v: Int| {
+                        acc.and_then(|a| v.checked_mul(weight).and_then(|v| a.checked_add(v)))
                     };
-                    lo = if least == i128::MIN {
+                    lo = if least == Int::MIN {
                         None
                     } else {
                         at(lo, least)
                     };
-                    hi = if most == i128::MAX {
-                        None
-                    } else {
-                        at(hi, most)
-                    };
+                    hi = if most == Int::MAX { None } else { at(hi, most) };
+                    from = to;
                 }
                 iv = iv.meet(ir.plus(Iv { lo, hi }));
             }
@@ -1215,10 +1293,10 @@ impl Algebra {
             let Atom::Floor(ri, k) = self.atom(a) else {
                 continue;
             };
-            if g % (1i128 << k) != 0 {
+            if g % (Int::ONE << u32::from(k)) != 0 {
                 continue;
             }
-            let lam = -(g >> k);
+            let lam = -(g >> u32::from(k));
             let r = self.form(ri).clone();
             let Ok(rest) = self.sum(f, &r, -lam) else {
                 continue;
@@ -1232,7 +1310,7 @@ impl Algebra {
                 break;
             }
             let ir = self.interval_at(&rest, depth + 1);
-            let digit = Iv::new(0, (1i128 << k) - 1).scaled(lam);
+            let digit = Iv::new(Int::from(0), (Int::ONE << u32::from(k)) - 1).scaled(lam);
             iv = iv.meet(ir.plus(digit));
         }
         // A digit: `λ·(floor(R / 2^a) − 2^(b − a)·floor(R / 2^b))` lies in `λ·[0, 2^(b − a) − 1]`.
@@ -1245,10 +1323,10 @@ impl Algebra {
                 let Atom::Floor(rj, a) = self.atom(lo) else {
                     continue;
                 };
-                if rj != ri || a >= b || g % (1i128 << (b - a)) != 0 {
+                if rj != ri || a >= b || g % (Int::ONE << u32::from(b - a)) != 0 {
                     continue;
                 }
-                let lam = -(g >> (b - a));
+                let lam = -(g >> u32::from(b - a));
                 let Ok(rest) = self.sum(f, &Self::one(lo), -lam) else {
                     continue;
                 };
@@ -1259,7 +1337,7 @@ impl Algebra {
                     break 'digits;
                 }
                 let ir = self.interval_at(&rest, depth + 1);
-                let digit = Iv::new(0, (1i128 << (b - a)) - 1).scaled(lam);
+                let digit = Iv::new(Int::from(0), (Int::ONE << u32::from(b - a)) - 1).scaled(lam);
                 iv = iv.meet(ir.plus(digit));
             }
         }
@@ -1290,20 +1368,20 @@ impl Algebra {
         if k == 0 {
             return Ok(f.clone());
         }
-        if k > MAX_SHIFT {
+        if k > max_shift() {
             return Err(Over);
         }
         // floor((E + 2^k·Q) / 2^k) = floor(E / 2^k) + Q: every coefficient leaves its multiple
         // of 2^k outside, and keeps the residue nearest 0.
-        let m = (1i128 << k) - 1;
-        let half = 1i128 << (k - 1);
+        let m = (Int::ONE << k) - 1;
+        let half = Int::ONE << (k - 1);
         let mut out = Form::konst(f.c >> k);
-        let mut rest: Vec<(AtomId, i128)> = Vec::new();
+        let mut rest: Vec<(AtomId, Int)> = Vec::new();
         for &(a, c) in &f.t {
             let (mut q, mut r) = (c >> k, c & m);
             if r > half {
-                q += 1;
-                r -= 1 << k;
+                q += Int::from(1);
+                r -= Int::ONE << k;
             }
             if q != 0 {
                 out.t.push((a, q));
@@ -1343,19 +1421,19 @@ impl Algebra {
         // floor((−E − 1) / 2^k) = −floor(E / 2^k) − 1: the form whose first atom is positive
         // stays.
         if r.t[0].1 < 0 {
-            let e = self.scale(&r, -1)?;
-            let e = self.shift(&e, -1)?;
+            let e = self.scale(&r, Int::from(-1))?;
+            let e = self.shift(&e, Int::from(-1))?;
             let neg = self.floor(&e, k, None)?;
-            let out = self.shift(&out, -1)?;
-            return self.add(&out, &neg, -1);
+            let out = self.shift(&out, Int::from(-1))?;
+            return self.add(&out, &neg, Int::from(-1));
         }
         let mut iv = self.interval(&r);
         if let Some(h) = hint
             && whole
         {
             // `f` lies in the hint, and `r` is `floor((f − 2^K·q) / 2^t)`.
-            let base = out.c.checked_mul(1i128 << shift);
-            let of = |x: Option<i128>| {
+            let base = out.c.checked_mul(Int::ONE << shift);
+            let of = |x: Option<Int>| {
                 x.zip(base)
                     .and_then(|(x, b)| x.checked_sub(b))
                     .map(|x| x >> t)
@@ -1375,7 +1453,7 @@ impl Algebra {
             && let (Some(l), Some(h)) = (self.bounds(a).lo, self.bounds(a).hi)
             && h == l + 1
         {
-            let at = |x: i128| mul(ra, x).and_then(|p| plus(r.c, p)).map(|v| v >> k);
+            let at = |x: Int| mul(ra, x).and_then(|p| plus(r.c, p)).map(|v| v >> k);
             let (v0, v1) = (at(l)?, at(h)?);
             let d = v1 - v0;
             let out = self.shift(&out, plus(v0, -mul(d, l)?)?)?;
@@ -1389,9 +1467,9 @@ impl Algebra {
         if let Some((a, e, ak)) = inner {
             let e = self.form(e).clone();
             let others = r.without(a);
-            let g = self.add(&e, &others, 1i128 << ak)?;
+            let g = self.add(&e, &others, Int::ONE << ak)?;
             let fl = self.floor(&g, ak + k, None)?;
-            return self.add(&out, &fl, 1);
+            return self.add(&out, &fl, Int::from(1));
         }
         // The floor of an AND with a constant is the AND of the floor.
         if let Some(a) = r.single()
@@ -1406,7 +1484,7 @@ impl Algebra {
                 }
                 let fx = self.floor(&x, k, None)?;
                 let and = self.band(q - k, &fx, &Form::konst(y.c >> k))?;
-                return self.add(&out, &and, 1);
+                return self.add(&out, &and, Int::from(1));
             }
         }
         // The floor of an XOR of values: those below `2^k` are not in it.
@@ -1431,26 +1509,26 @@ impl Algebra {
         let ri = self.intern(&r)?;
         let hash = combine(combine(0x666c_6f6f, self.hashes[ri as usize]), u64::from(k));
         let a = self.make(Atom::Floor(ri, k as u8), hash, fl)?;
-        self.add(&out, &Self::one(a), 1)
+        self.add(&out, &Self::one(a), Int::from(1))
     }
 
     /// Bits `[lo, lo + len)` of `f`: `floor(f / 2^lo) − 2^len·floor(f / 2^(lo + len))`.
     pub(super) fn slice(&mut self, f: &Form, lo: u32, len: u32, hint: Option<Iv>) -> R<Form> {
-        if len > MAX_SHIFT {
+        if len > max_shift() {
             return Err(Over);
         }
         let a = self.floor(f, lo, hint)?;
         let b = self.floor(f, lo + len, hint)?;
-        self.add(&a, &b, -(1i128 << len))
+        self.add(&a, &b, -(Int::ONE << len))
     }
 
     /// `f` modulo `2^w`: `f − 2^w·floor(f / 2^w)`.
     pub(super) fn wrap(&mut self, f: &Form, w: u32, hint: Option<Iv>) -> R<Form> {
-        if w > MAX_SHIFT {
+        if w > max_shift() {
             return Err(Over);
         }
         let fl = self.floor(f, w, hint)?;
-        self.add(f, &fl, -(1i128 << w))
+        self.add(f, &fl, -(Int::ONE << w))
     }
 
     // ----- and --------------------------------------------------------------------------
@@ -1471,7 +1549,7 @@ impl Algebra {
             }
             let r = self.form(ri).clone();
             let q = f.without(a);
-            let Ok(e) = self.add(&r, &q, 1i128 << k) else {
+            let Ok(e) = self.add(&r, &q, Int::ONE << k) else {
                 continue;
             };
             out.push((k, e));
@@ -1504,8 +1582,8 @@ impl Algebra {
     /// is below `2^p` (the words truncations are of, as arithmetic takes them); else the
     /// two as they are modulo `2^p`, where they are known to be.
     fn operands(&mut self, p: u32, x: &Form, y: &Form) -> Option<(Form, Form)> {
-        let top = (1i128 << p) - 1;
-        let big = (1i128 << MAX_SHIFT) - 1;
+        let top = (Int::ONE << p) - 1;
+        let big = (Int::ONE << max_shift()) - 1;
         if !self.values {
             let (rx, ry) = (self.reduce(x, p), self.reduce(y, p));
             let (ix, iy) = (self.interval(&rx), self.interval(&ry));
@@ -1521,7 +1599,7 @@ impl Algebra {
         if p == 0 {
             return Ok(Form::default());
         }
-        if p > MAX_SHIFT {
+        if p > max_shift() {
             return Err(Over);
         }
         let (mut x, mut y) = (self.reduce(x, p), self.reduce(y, p));
@@ -1541,7 +1619,7 @@ impl Algebra {
             let run = c >> lo;
             if run & (run + 1) == 0 {
                 let s = self.slice(&x, lo, bit_len(run), None)?;
-                return self.scale(&s, 1i128 << lo);
+                return self.scale(&s, Int::ONE << lo);
             }
         }
         if x == y {
@@ -1572,7 +1650,7 @@ impl Algebra {
         } else {
             (xi, yi, hx, hy)
         };
-        let mut hi = (1i128 << p) - 1;
+        let mut hi = (Int::ONE << p) - 1;
         for i in [ix, iy] {
             if let (Some(l), Some(h)) = (i.lo, i.hi)
                 && l >= 0
@@ -1581,7 +1659,7 @@ impl Algebra {
             }
         }
         let hash = combine(combine(combine(0x0061_6e64, u64::from(p)), hx), hy);
-        let a = self.make(Atom::And(p as u8, xi, yi), hash, Iv::new(0, hi))?;
+        let a = self.make(Atom::And(p as u8, xi, yi), hash, Iv::new(Int::from(0), hi))?;
         Ok(Self::one(a))
     }
 
@@ -1596,7 +1674,7 @@ impl Algebra {
         }
         if f.c == 0 {
             match f.t[..] {
-                [(a, 1)] => {
+                [(a, k)] if k == 1 => {
                     if let Atom::Floor(e, k) = self.atom(a) {
                         return Some((Some(self.form(e).clone()), u32::from(k), None));
                     }
@@ -1613,7 +1691,7 @@ impl Algebra {
                         && kb > ka
                     {
                         let len = u32::from(kb - ka);
-                        if cb == -(1i128 << len) {
+                        if cb == -(Int::ONE << len) {
                             return Some((Some(self.form(ea).clone()), u32::from(ka), Some(len)));
                         }
                     }
@@ -1628,7 +1706,7 @@ impl Algebra {
                 continue;
             };
             let len = u32::from(k);
-            if c != -(1i128 << len) {
+            if c != -(Int::ONE << len) {
                 continue;
             }
             let g = f.without(a);
@@ -1693,7 +1771,7 @@ impl Algebra {
         if a == b {
             return Ok(a.clone());
         }
-        let d = self.add(a, b, -1)?;
+        let d = self.add(a, b, Int::from(-1))?;
         if d.is_const() {
             return self.add(b, c, d.c);
         }
@@ -1733,7 +1811,8 @@ impl Algebra {
             let fits = |s: &(Option<Form>, u32, Option<u32>), iv: Iv| {
                 s.0.is_none()
                     || s.2 == len
-                    || (s.2.is_none() && len.is_some_and(|l| iv.within(0, (1i128 << l) - 1)))
+                    || (s.2.is_none()
+                        && len.is_some_and(|l| iv.within(Int::from(0), (Int::ONE << l) - 1)))
             };
             let (fa, fb) = (fits(&sa, ia), fits(&sb, ib));
             if (k > 0 || len.is_some()) && fa && fb {

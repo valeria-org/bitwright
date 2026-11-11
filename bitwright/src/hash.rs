@@ -6,9 +6,14 @@
 
 use core::hash::{BuildHasher, Hasher};
 
-/// Version of the structural hash. Bumped whenever [`mix64`] or [`combine`] change.
-#[allow(dead_code)]
-pub(crate) const HASH_VERSION: u32 = 1;
+/// The version of the hashes of expressions ([`Context::structural_hash`] and
+/// [`Context::shape_hashes`]): bumped whenever a hash of some expression changes (the mixer,
+/// what is hashed, an operator's code). A hash kept outside the process is of a version, and
+/// of no use under another.
+///
+/// [`Context::structural_hash`]: crate::Context::structural_hash
+/// [`Context::shape_hashes`]: crate::Context::shape_hashes
+pub const HASH_VERSION: u32 = 1;
 
 /// The SplitMix64 finalizer: a bijective avalanche mix of one word.
 #[inline]

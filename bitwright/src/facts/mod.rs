@@ -599,6 +599,8 @@ struct BaseFacts {
     slot: Vec<u32>,
     narrow: Vec<[u64; 7]>,
     wide: Vec<Facts>,
+    /// The nodes with an entry.
+    live: usize,
 }
 
 impl BaseFacts {
@@ -648,6 +650,7 @@ impl BaseFacts {
                 None => {
                     self.wide.push(f);
                     self.slot[i] = self.wide.len() as u32;
+                    self.live += 1;
                 }
             }
             return;
@@ -658,6 +661,7 @@ impl BaseFacts {
             None => {
                 self.narrow.push(x);
                 self.slot[i] = self.narrow.len() as u32;
+                self.live += 1;
             }
         }
     }
@@ -675,6 +679,34 @@ impl BaseFacts {
         self.slot.clear();
         self.narrow.clear();
         self.wide.clear();
+        self.live = 0;
+    }
+
+    /// Forgets the nodes `len` and above, at the cost of what is forgotten: their entries
+    /// are left behind in the tables, which are packed again (`width_of` a node's width) once
+    /// more than half of their entries belong to no node.
+    fn truncate(&mut self, len: usize, width_of: impl Fn(u32) -> Width) {
+        if len >= self.slot.len() {
+            return;
+        }
+        self.live -= self.slot[len..].iter().filter(|&&s| s != 0).count();
+        self.slot.truncate(len);
+        if self.narrow.len() + self.wide.len() <= 2 * self.live.max(64) {
+            return;
+        }
+        let (mut narrow, mut wide) = (Vec::new(), Vec::new());
+        for (i, s) in self.slot.iter_mut().enumerate() {
+            let Some(k) = s.checked_sub(1) else { continue };
+            if width_of(i as u32).bits() > 64 {
+                wide.push(self.wide[k as usize]);
+                *s = wide.len() as u32;
+            } else {
+                narrow.push(self.narrow[k as usize]);
+                *s = narrow.len() as u32;
+            }
+        }
+        self.narrow = narrow;
+        self.wide = wide;
     }
 }
 
@@ -709,6 +741,15 @@ impl FactCache {
 
     pub(crate) fn clear(&mut self) {
         self.base.clear();
+        self.overlay.clear();
+        self.overlay_key = None;
+        self.pending = None;
+    }
+
+    /// Forgets the nodes `len` and above (a rollback): their facts, and everything under
+    /// assumptions, which may be about them.
+    pub(crate) fn truncate(&mut self, len: usize, width_of: impl Fn(u32) -> Width) {
+        self.base.truncate(len, width_of);
         self.overlay.clear();
         self.overlay_key = None;
         self.pending = None;

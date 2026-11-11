@@ -35,7 +35,8 @@ z3's rotations by a term (`ext_rotate_left`, `ext_rotate_right`). Booleans becom
 expressions. A chain of `let`s, each in the body of the one before (z3 prints large terms so),
 may be as long as the script: only other nesting is bounded. Arrays from bit-vectors to bit-vectors (QF_ABV) become
 [memories](memory.md): `select` a load, `store` a store, resolved as the memory chapter
-describes (equality of arrays is refused). Anything else is an error, never a guess, and the
+describes; arrays that are compared, chosen by `ite` or constant are read element by element
+(see the session below). Anything else is an error, never a guess, and the
 reader is iterative and bounded, so hostile input cannot exhaust the stack.
 
 ```rust
@@ -53,6 +54,69 @@ assert_eq!(cx.display(twice).to_string(), "x << 1");
 assert_eq!(script.assertions.len(), 1);
 # Ok::<(), bitwright::Error>(())
 ```
+
+## Solving
+
+With the `prove` feature, `smtlib::run` runs a script as a solver, on a
+[`solve::Solver`](https://docs.rs/bitwright/latest/bitwright/solve/struct.Solver.html): the
+importer's declarations, definitions and assertions, and `push`, `pop`, `check-sat`,
+`check-sat-assuming`, `get-model`, `get-value`, `get-unsat-core`, `get-unsat-assumptions`,
+`get-info`, `set-option`, `echo`, `reset`, `reset-assertions` and `exit`, each answered as the
+standard prescribes. `bitwright solve` is the same from the shell:
+
+```text
+$ bitwright solve - <<'EOF'
+(declare-const x (_ BitVec 64))
+(assert (= (bvmul (bvxor x #xd3220fb78e33751f) #xd3220fb78e33751f) #x0000000000001234))
+(check-sat)
+(get-value (x))
+(push)
+(assert (! (bvult x #x0000000000010000) :named small))
+(check-sat)
+(get-unsat-core)
+EOF
+sat
+((x #x5a01246bd1cb6653))
+unsat
+(small)
+```
+
+A check answers by the stages the chapter [Solving](solving.md) describes, on a circuit the
+session keeps from one check to the next, and a core is sound but not minimal. Beyond the
+quantifier-free theories the session reads:
+
+- **Uninterpreted functions and sorts** a script declares: a symbol for each application and
+  a constraint for each pair of them.
+- **Arrays that are compared, chosen and constant**: `(= a b)` and `distinct` over arrays,
+  `(ite c a b)`, `((as const (Array I E)) v)` and stores into any of them. An equality is a
+  Boolean with the constraints of extensionality: an index where the two differ when it is
+  false, agreement at every index the script reads or writes when it is true.
+- **Quantifiers** where they can be decided by what is already there: an asserted `exists`
+  and a denied `forall` take new symbols for their variables, at any width, and a quantifier
+  anywhere else is read once for each value of its variables, up to 12 bits of them. A wider
+  one is refused.
+
+- **Bit-vectors above 512 bits**, up to 65,536: read as limbs of 256 bits, for the operators
+  that are limb by limb (the bitwise ones, `ite`, `=`, `distinct`), a chain of carries
+  (`bvadd`, `bvsub`, `bvneg`, the orders), a choice of limbs (shifts, rotations, `concat`,
+  `extract`, the extensions, `repeat`), a sum of limb products (`bvmul`) or the schoolbook
+  division (`bvudiv`, `bvurem`, `bvsdiv`, `bvsrem`, `bvsmod`: a circuit of as many steps as
+  bits, which answers at values and is slow to reason about). A function, an array or a
+  quantifier over them is refused. `get-model`
+  and `get-value` print them whole. (A value of the library still holds 512 bits at most,
+  so `smtlib::import` refuses them as before: it lists each name with one expression.)
+
+A term that `get-value` or `check-sat-assuming` reads for the first time (an application, a
+read of a compared array) is tied to the others before it is answered.
+
+- **Integers where a bit-vector bounds them**: `(bv2nat x)`, numerals, sums, differences,
+  products, `div` and `mod` by a constant that is not zero, comparisons, `ite` and
+  `((_ int2bv n) i)`. Each is read as a bit-vector wide enough that nothing it computes
+  wraps (up to 512 bits), so the arithmetic is the integers' own. A variable of sort `Int`
+  has no such bound and is refused, as is a division by anything else.
+
+A command that needs what is not read answers `(error "…")` and the script goes on. The 65 scripts this was measured on are answered as z3 and Bitwuzla
+answer them.
 
 ## Rule obligations
 
@@ -86,7 +150,7 @@ per obligation; every answer must be `unsat`.
 
 ## Solvers
 
-bitwright never runs a solver itself. Its nightly tests run every kind of script it writes
+bitwright runs no other solver itself. Its nightly tests run every kind of script it writes
 through both z3 and bitwuzla: exported expressions evaluated at random points, every built-in
 rule proved at widths up to 512, simplification results proved equal to their inputs (with
 extension calls as uninterpreted functions), and rewrites proved under the constraints they rely

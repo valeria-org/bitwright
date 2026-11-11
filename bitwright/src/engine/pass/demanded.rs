@@ -120,7 +120,7 @@ fn observed(cx: &Context, n: u32) -> Option<(u32, BitVec)> {
 /// Whether the walk asks `n` before it walks `n`'s operands (see [`first`]).
 pub(crate) fn asks_first(r: &Runner<'_, '_>, cx: &Context, n: u32) -> bool {
     cx.meta[n as usize].height >= FIRST_HEIGHT
-        && !r.demanded_same.first.contains_key(&n)
+        && !r.demanded.same.first.contains_key(&n)
         && observed(cx, n).is_some()
 }
 
@@ -138,10 +138,10 @@ pub(crate) fn first(
     cx: &mut Context,
     n: u32,
 ) -> Result<Option<(u32, Fin)>, Stop> {
-    r.demanded_same.first.insert(n, ());
-    r.demanded_same.marking = true;
+    r.demanded.same.first.insert(n, ());
+    r.demanded.same.marking = true;
     let out = super::step(r, cx, PassKind::Demanded, n);
-    r.demanded_same.marking = false;
+    r.demanded.same.marking = false;
     Ok(match out? {
         Step::To(x, fin) => Some((x, fin)),
         Step::Normal(_) => None,
@@ -309,7 +309,7 @@ fn same_on(
     k: &BitVec,
     p: &BitVec,
 ) -> u32 {
-    let seen = r.sum_constants.entry(key).or_default();
+    let seen = r.demanded.sum_constants.entry(key).or_default();
     for &c in seen.iter() {
         if let Some(v) = cx.const_val(c)
             && bv_and(&BitVec::bin_unchecked(BinOp::Xor, &v, k), p).is_zero()
@@ -437,10 +437,10 @@ fn simplify(
     }
     // Found nothing to simplify under this mask in an earlier step of the phase run: the same
     // leaves as then.
-    if let Some(&(from, len)) = r.demanded_same.map.get(&Key(x, *m)) {
+    if let Some(&(from, len)) = r.demanded.same.map.get(&Key(x, *m)) {
         let (from, len) = (from as usize, len as usize);
         st.stops
-            .extend_from_slice(&r.demanded_same.leaves[from..from + len]);
+            .extend_from_slice(&r.demanded.same.leaves[from..from + len]);
         st.note(Key(x, *m), x);
         return Ok(x);
     }
@@ -781,7 +781,7 @@ fn simplify(
     };
     st.note(Key(x, *m), v);
     // (Not above a sum with carries: what it is read as depends on its other users.)
-    if v == x && x < st.before && r.demanded_same.carried.get(&x) != Some(&true) {
+    if v == x && x < st.before && r.demanded.same.carried.get(&x) != Some(&true) {
         st.identities
             .push((Key(x, *m), stops0, st.stops.len() as u32));
     }
@@ -972,7 +972,7 @@ fn carried(
     // of them (`t + k` under `& 0xff` and under `& 0xffff` flips other bits of `t` under
     // each, and what cancelled through the sum would be gone).
     super::refresh_uses(r, cx)?;
-    if r.live.uses(x) != Some(1) || r.live_roots.contains(&x) {
+    if r.life.live.uses(x) != Some(1) || r.life.live_roots.contains(&x) {
         return Ok(None);
     }
     st.fin = st.fin.and(fin);
@@ -1018,7 +1018,7 @@ pub(super) fn reduced(
     let which = usize::from(whole_sums);
     let mut st = Demand {
         memo: Memo::default(),
-        base: std::mem::take(&mut r.reduced[which]),
+        base: std::mem::take(&mut r.demanded.reduced[which]),
         whole: Some(Vec::new()),
         whole_sums,
         cap,
@@ -1041,7 +1041,7 @@ pub(super) fn reduced(
     if out.is_ok() {
         base.extend(st.whole.take().unwrap_or_default());
     }
-    r.reduced[which] = base;
+    r.demanded.reduced[which] = base;
     out
 }
 
@@ -1085,34 +1085,34 @@ fn carries(cx: &Context, i: u32) -> bool {
 fn over_carries(r: &mut Runner<'_, '_>, cx: &Context, x: u32) -> Result<bool, Stop> {
     let mut stack = vec![(x, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.demanded_same.carried.contains_key(&i) {
+        if r.demanded.same.carried.contains_key(&i) {
             continue;
         }
         if carries(cx, i) {
-            r.demanded_same.carried.insert(i, true);
+            r.demanded.same.carried.insert(i, true);
             continue;
         }
         if !reads_through(cx, i) {
-            r.demanded_same.carried.insert(i, false);
+            r.demanded.same.carried.insert(i, false);
             continue;
         }
         let node = cx.node(i);
         if expanded {
             let any = node
                 .children()
-                .any(|c| r.demanded_same.carried.get(&c) == Some(&true));
-            r.demanded_same.carried.insert(i, any);
+                .any(|c| r.demanded.same.carried.get(&c) == Some(&true));
+            r.demanded.same.carried.insert(i, any);
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
         stack.push((i, true));
         for c in node.children() {
-            if !r.demanded_same.carried.contains_key(&c) {
+            if !r.demanded.same.carried.contains_key(&c) {
                 stack.push((c, false));
             }
         }
     }
-    Ok(r.demanded_same.carried.get(&x) == Some(&true))
+    Ok(r.demanded.same.carried.get(&x) == Some(&true))
 }
 
 /// For each node below `operand` that the simplification reads through to, the bits of it
@@ -1185,7 +1185,7 @@ fn unions(
     for &x in order.iter().rev() {
         // A node read by something outside, or by a node that is not read through, is read
         // whole.
-        if r.live.uses(x).unwrap_or(0) > inside.get(&x).copied().unwrap_or(0) {
+        if r.life.live.uses(x).unwrap_or(0) > inside.get(&x).copied().unwrap_or(0) {
             read.insert(x, BitVec::ones(cx.width_of(x)));
         }
         if !reads_through(cx, x) {
@@ -2021,6 +2021,33 @@ fn taken(
     super::finish_with(r, cx, PassKind::Demanded, root, e, before, &atoms, fin, tie)
 }
 
+/// A node equal to `x` on the bits of `m`, as the pass simplifies an operand of which only
+/// those bits are read: the pass's analysis on its own (see `Engine::under_mask`).
+pub(in crate::engine) fn under_mask(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    m: &BitVec,
+) -> Result<u32, Stop> {
+    let mut st = Demand {
+        memo: Memo::default(),
+        base: Memo::default(),
+        whole: None,
+        whole_sums: false,
+        cap: MAX_VISITS,
+        stops: Vec::new(),
+        visits: 0,
+        fin: Fin::FINAL,
+        before: cx.len() as u32,
+        root: x,
+        xors: Vec::new(),
+        identities: Vec::new(),
+        union: IdMap::default(),
+        ties: false,
+    };
+    simplify(r, cx, &mut st, x, m)
+}
+
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
     r.stats.passes.entry("demanded").or_default()
 }
@@ -2041,7 +2068,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         base: Memo::default(),
         whole: None,
         whole_sums: false,
-        memo: std::mem::take(&mut r.demanded),
+        memo: std::mem::take(&mut r.demanded.memo),
         cap: MAX_VISITS.min(super::region_cap(r)),
         stops: Vec::new(),
         visits: 0,
@@ -2059,9 +2086,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     unions(r, cx, &mut st, operand, &mask)?;
     let union = std::mem::take(&mut st.union);
     let x2 = simplify(r, cx, &mut st, operand, &mask)?;
-    if r.demanded_same.marking {
+    if r.demanded.same.marking {
         for key in st.memo.keys() {
-            r.demanded_same.first.insert(key.0, ());
+            r.demanded.same.first.insert(key.0, ());
         }
     }
     // The operands this step found nothing to simplify under their masks are remembered for
@@ -2071,20 +2098,21 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     // simplifications, whose nodes a rejection retires.
     if st.visits <= st.cap {
         for &(key, from, to) in &st.identities {
-            if r.demanded_same.map.contains_key(&key) {
+            if r.demanded.same.map.contains_key(&key) {
                 continue;
             }
             // Each leaf once. A range holds what the hits below it copied, the leaves of each
             // operand; operands share leaves in a DAG, so a range kept with its repeats was
             // the sum of its operands' ranges, and on a ripple chain the ranges doubled at
             // every level (2^48 at 48 bits). The leaves are read as a set.
-            let at = r.demanded_same.leaves.len();
-            r.demanded_same
+            let at = r.demanded.same.leaves.len();
+            r.demanded
+                .same
                 .leaves
                 .extend_from_slice(&st.stops[from as usize..to as usize]);
-            let kept = sorted_distinct(&mut r.demanded_same.leaves[at..]);
-            r.demanded_same.leaves.truncate(at + kept);
-            r.demanded_same.map.insert(key, (at as u32, kept as u32));
+            let kept = sorted_distinct(&mut r.demanded.same.leaves[at..]);
+            r.demanded.same.leaves.truncate(at + kept);
+            r.demanded.same.map.insert(key, (at as u32, kept as u32));
         }
     }
     st.memo.clear();
@@ -2139,7 +2167,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         let keep = rebuilt(r, cx, x2)?;
         super::discard_but(r, cx, before, keep);
     }
-    r.demanded = std::mem::take(&mut st.memo);
+    r.demanded.memo = std::mem::take(&mut st.memo);
     if x2 == operand {
         count(r).noop += 1;
         return Ok(Step::Normal(fin));
@@ -2150,4 +2178,20 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         mask,
     });
     super::finish_with(r, cx, PassKind::Demanded, n, e, before, &stops, fin, tie)
+}
+
+/// The pass's state for a call.
+#[derive(Default)]
+pub(crate) struct State {
+    /// The demanded-bits pass's memo, empty between calls.
+    pub(crate) memo: Memo,
+    /// The operands the demanded-bits pass found nothing to simplify under a mask, for the
+    /// phase run (a node's value is fixed, so neither is the answer; see `demanded::step`).
+    pub(crate) same: Same,
+    /// What the opaque-constant sweep's reductions of its candidates found, per node and
+    /// demanded mask, for the call (see `pass::demanded::reduced`).
+    #[cfg(feature = "mba")]
+    pub(crate) reduced: [Memo; 2],
+    /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
+    pub(crate) sum_constants: IdMap<(u32, u8), Vec<u32>>,
 }

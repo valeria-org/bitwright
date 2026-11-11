@@ -50,7 +50,7 @@ fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
     const NONE: u32 = u32::MAX - 1;
     // (Not a node: arenas stay below it.)
     const UNKNOWN: u32 = u32::MAX - 2;
-    let memo = &mut r.gf2_atoms;
+    let memo = &mut r.gf2.atoms;
     if memo.len() < cx.len() {
         memo.resize(cx.len(), UNKNOWN);
     }
@@ -59,8 +59,8 @@ fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
     if let Some(a) = known(memo, n) {
         return a;
     }
-    let mut stack = std::mem::take(&mut r.gf2_stack);
-    let memo = &mut r.gf2_atoms;
+    let mut stack = std::mem::take(&mut r.gf2.stack);
+    let memo = &mut r.gf2.atoms;
     stack.clear();
     stack.push((n, false));
     let w = cx.wid(n);
@@ -99,8 +99,8 @@ fn one_atom(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> u32 {
         }
         set(memo, i, atom);
     }
-    r.gf2_stack = stack;
-    known(&r.gf2_atoms, n).unwrap_or(MANY)
+    r.gf2.stack = stack;
+    known(&r.gf2.atoms, n).unwrap_or(MANY)
 }
 
 /// The one atom below `n` and the nodes between (ascending), if the expression is a linear map
@@ -290,4 +290,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         &[x],
         super::Fin::FINAL,
     )?))
+}
+
+/// The pass's scratch for a call.
+#[derive(Default)]
+pub(crate) struct State {
+    /// The single atom the linear map below each node reads, if one (see `pass::gf2`).
+    pub(crate) atoms: Vec<u32>,
+    pub(crate) stack: Vec<(u32, bool)>,
 }

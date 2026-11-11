@@ -15,7 +15,7 @@ mod context;
 pub(super) mod demanded;
 mod division;
 pub(super) mod forms;
-mod gf2;
+pub(crate) mod gf2;
 pub(super) mod invert;
 mod limbs;
 pub(super) mod linear;
@@ -40,134 +40,233 @@ use crate::engine::{Exhausted, Explanation};
 use crate::expr::{Context, OpCode};
 use crate::facts::{Facts, KnownBits, Reliance};
 
-/// A set of node indices emptied in constant time (by a new epoch; a stamp of 0 is never
-/// current): the engine's per-node scratch, kept by the runner and reused instead of hash sets.
-/// It grows to any index it is given.
-pub(crate) struct Marks {
+/// A value per node index, for the engine's per-node scratch: emptied in constant time, and
+/// costing what it holds, not what the context holds. A query of a few nodes in a context of
+/// millions touches a few entries, so those are kept in a hash map; once it holds more than a
+/// fraction of the context's nodes it becomes a dense table (a stamp per index, emptied by a
+/// new epoch; a stamp of 0 is never current), whose size is then paid for by what filled it.
+pub(crate) struct Slots<T> {
+    few: crate::hash::IdMap<u32, T>,
     stamp: Vec<u32>,
+    val: Vec<T>,
     epoch: u32,
+    dense: bool,
+    /// The context's node count when last begun: what the dense table is sized for.
+    len: usize,
 }
 
-impl Default for Marks {
+impl<T> Default for Slots<T> {
     fn default() -> Self {
-        Marks {
+        Slots {
+            few: Default::default(),
             stamp: Vec::new(),
+            val: Vec::new(),
             epoch: 1,
+            // (Dense until it is known to be of a large context: see `begin` and `set_slow`.)
+            dense: true,
+            len: 0,
         }
     }
 }
 
-impl Marks {
-    /// Empties the set, sized for indices below `len`.
+impl<T: Copy + Default> Slots<T> {
+    /// The entries a hash map holds before the table turns dense: at least this many, and
+    /// one in this many of the context's nodes.
+    const FEW: usize = 1024;
+    const FRACTION: usize = 32;
+    /// A context of at most this many nodes gets the dense table at once.
+    const SMALL: usize = 1 << 14;
+
+    /// Empties it, for indices below `len` (it grows to any index it is given).
     pub(crate) fn begin(&mut self, len: usize) {
-        if self.stamp.len() < len {
-            self.stamp.resize(len, 0);
-        }
+        self.len = self.len.max(len);
         self.clear();
+        // A small context is cheaper as a table from the start: the table is no larger than
+        // the map would grow, and indexing it does not hash. (A table kept for that reason
+        // is given up when the context has outgrown it.)
+        if self.len <= Self::SMALL {
+            self.dense = true;
+        } else if self.dense && self.stamp.len() <= Self::SMALL {
+            self.dense = false;
+            self.few.clear();
+        }
     }
 
-    /// Empties the set.
+    /// Empties it.
     pub(crate) fn clear(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.stamp.fill(0);
-            self.epoch = 1;
-        }
-    }
-
-    /// Adds `i`: whether it was not in the set.
-    #[inline]
-    pub(crate) fn insert(&mut self, i: u32) -> bool {
-        let i = i as usize;
-        if i >= self.stamp.len() {
-            self.stamp.resize(i + 1, 0);
-        }
-        let fresh = self.stamp[i] != self.epoch;
-        self.stamp[i] = self.epoch;
-        fresh
-    }
-
-    /// Removes `i`: whether it was in the set.
-    #[inline]
-    pub(crate) fn remove(&mut self, i: u32) -> bool {
-        match self.stamp.get_mut(i as usize) {
-            Some(s) if *s == self.epoch => {
-                *s = 0;
-                true
+        if self.dense {
+            self.epoch = self.epoch.wrapping_add(1);
+            if self.epoch == 0 {
+                self.stamp.fill(0);
+                self.epoch = 1;
             }
-            _ => false,
+        } else {
+            self.few.clear();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: u32) -> Option<T> {
+        if self.dense {
+            let i = i as usize;
+            (self.stamp.get(i) == Some(&self.epoch)).then(|| self.val[i])
+        } else {
+            self.few.get(&i).copied()
         }
     }
 
     #[inline]
     pub(crate) fn contains(&self, i: u32) -> bool {
-        self.stamp.get(i as usize) == Some(&self.epoch)
-    }
-}
-
-/// Counts per node index, emptied in constant time like [`Marks`]; an index not counted since
-/// then has none (which is not a count of 0).
-pub(crate) struct Counts {
-    stamp: Vec<u32>,
-    val: Vec<u32>,
-    epoch: u32,
-}
-
-impl Default for Counts {
-    fn default() -> Self {
-        Counts {
-            stamp: Vec::new(),
-            val: Vec::new(),
-            epoch: 1,
+        if self.dense {
+            self.stamp.get(i as usize) == Some(&self.epoch)
+        } else {
+            self.few.contains_key(&i)
         }
     }
-}
 
-impl Counts {
-    /// Empties the counts, sized for indices below `len`.
-    pub(crate) fn begin(&mut self, len: usize) {
-        if self.stamp.len() < len {
-            self.stamp.resize(len, 0);
-            self.val.resize(len, 0);
+    /// Sets `i`'s value: whether it had none.
+    #[inline]
+    pub(crate) fn set(&mut self, i: u32, v: T) -> bool {
+        let at = i as usize;
+        if self.dense && at < self.stamp.len() {
+            let fresh = self.stamp[at] != self.epoch;
+            self.stamp[at] = self.epoch;
+            self.val[at] = v;
+            return fresh;
+        }
+        self.set_slow(i, v)
+    }
+
+    #[inline(never)]
+    fn set_slow(&mut self, i: u32, v: T) -> bool {
+        // A table that was dense for a small context, given an index beyond one: what it
+        // holds goes to the map, as in a context that was large from the start.
+        if self.dense && self.stamp.len() <= Self::SMALL && i as usize >= Self::SMALL {
+            self.dense = false;
+            self.few.clear();
+            for (at, s) in self.stamp.iter_mut().enumerate() {
+                if *s == self.epoch {
+                    self.few.insert(at as u32, self.val[at]);
+                }
+                *s = 0;
+            }
+        }
+        if !self.dense {
+            if self.few.len() < Self::FEW.max(self.len / Self::FRACTION) {
+                return self.few.insert(i, v).is_none();
+            }
+            self.densify();
+        }
+        let at = i as usize;
+        if at >= self.stamp.len() {
+            let to = (at + 1).max(self.len).max(self.stamp.len() * 2);
+            self.stamp.resize(to, 0);
+            self.val.resize(to, T::default());
+        }
+        let fresh = self.stamp[at] != self.epoch;
+        self.stamp[at] = self.epoch;
+        self.val[at] = v;
+        fresh
+    }
+
+    #[cold]
+    fn densify(&mut self) {
+        self.dense = true;
+        let top = self.few.keys().max().map_or(0, |&m| m as usize + 1);
+        let to = top.max(self.len);
+        if self.stamp.len() < to {
+            self.stamp.resize(to, 0);
+            self.val.resize(to, T::default());
         }
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.stamp.fill(0);
             self.epoch = 1;
         }
+        for (i, v) in self.few.drain() {
+            self.stamp[i as usize] = self.epoch;
+            self.val[i as usize] = v;
+        }
+    }
+
+    /// Removes `i`'s value: whether it had one.
+    #[inline]
+    pub(crate) fn remove(&mut self, i: u32) -> bool {
+        if self.dense {
+            match self.stamp.get_mut(i as usize) {
+                Some(s) if *s == self.epoch => {
+                    *s = 0;
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            self.few.remove(&i).is_some()
+        }
+    }
+}
+
+/// A set of node indices emptied in constant time: the engine's per-node scratch, kept by the
+/// runner and reused instead of hash sets. It grows to any index it is given.
+#[derive(Default)]
+pub(crate) struct Marks(Slots<()>);
+
+impl Marks {
+    /// Empties the set, sized for indices below `len`.
+    pub(crate) fn begin(&mut self, len: usize) {
+        self.0.begin(len);
+    }
+
+    /// Empties the set.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Adds `i`: whether it was not in the set.
+    #[inline]
+    pub(crate) fn insert(&mut self, i: u32) -> bool {
+        self.0.set(i, ())
+    }
+
+    /// Removes `i`: whether it was in the set.
+    #[inline]
+    pub(crate) fn remove(&mut self, i: u32) -> bool {
+        self.0.remove(i)
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, i: u32) -> bool {
+        self.0.contains(i)
+    }
+}
+
+/// Counts per node index, emptied in constant time like [`Marks`]; an index not counted since
+/// then has none (which is not a count of 0).
+#[derive(Default)]
+pub(crate) struct Counts(Slots<u32>);
+
+impl Counts {
+    /// Empties the counts, sized for indices below `len`.
+    pub(crate) fn begin(&mut self, len: usize) {
+        self.0.begin(len);
     }
 
     #[inline]
     pub(crate) fn get(&self, i: u32) -> Option<u32> {
-        let i = i as usize;
-        (self.stamp.get(i) == Some(&self.epoch)).then(|| self.val[i])
+        self.0.get(i)
     }
 
     /// Counts one more for `i`.
     #[inline]
     pub(crate) fn add(&mut self, i: u32) {
-        let i = i as usize;
-        if i >= self.stamp.len() {
-            self.stamp.resize(i + 1, 0);
-            self.val.resize(i + 1, 0);
-        }
-        if self.stamp[i] != self.epoch {
-            self.stamp[i] = self.epoch;
-            self.val[i] = 0;
-        }
-        self.val[i] += 1;
+        let n = self.0.get(i).unwrap_or(0);
+        self.0.set(i, n + 1);
     }
 
     /// Sets `i`'s count to `v`.
     #[inline]
     pub(crate) fn set(&mut self, i: u32, v: u32) {
-        let i = i as usize;
-        if i >= self.stamp.len() {
-            self.stamp.resize(i + 1, 0);
-            self.val.resize(i + 1, 0);
-        }
-        self.stamp[i] = self.epoch;
-        self.val[i] = v;
+        self.0.set(i, v);
     }
 }
 
@@ -716,68 +815,73 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
 /// they reach was retired (a count from scratch skips retired nodes, and what only they reach).
 /// Each count is a unit of pass work per node counted; a part that stands costs nothing.
 pub(super) fn refresh_uses(r: &mut Runner<'_, '_>, cx: &Context) -> Result<(), Stop> {
-    if !r.uses_on {
-        r.live.clear();
+    if !r.life.uses_on {
+        r.life.live.clear();
         r.scratch.seen.begin(cx.len());
         let others = others_hold(r, cx)?;
         let mut stack: Vec<u32> = if others {
             // (Off when the other roots reach nothing: then it adds nothing.)
-            r.live.base = r.live.others.nodes > 0;
-            r.live_roots.get(r.active).copied().into_iter().collect()
+            r.life.live.base = r.life.live.others.nodes > 0;
+            r.life
+                .live_roots
+                .get(r.active)
+                .copied()
+                .into_iter()
+                .collect()
         } else {
-            r.live_roots.clone()
+            r.life.live_roots.clone()
         };
         while let Some(i) = stack.pop() {
-            if (others && r.live.others.reach.contains(i))
+            if (others && r.life.live.others.reach.contains(i))
                 || !r.scratch.seen.insert(i)
-                || r.dead.contains(i)
+                || r.life.dead.contains(i)
             {
                 continue;
             }
             if let Err(e) = r.meter.charge(Counter::PassWork, 1) {
                 // Nothing counted yet (`uses` is still off): keep the counted set consistent.
-                r.live.clear();
+                r.life.live.clear();
                 return Err(e.into());
             }
             for c in cx.node(i).children() {
-                r.live.add(c);
+                r.life.live.add(c);
                 stack.push(c);
             }
-            r.live.count(i);
+            r.life.live.count(i);
         }
-        r.uses_on = true;
-        r.uses_upto = r.phase_start;
+        r.life.uses_on = true;
+        r.life.uses_upto = r.life.phase_start;
     }
     let len = cx.len() as u32;
-    let from = r.uses_upto.min(len);
+    let from = r.life.uses_upto.min(len);
     r.meter.charge(Counter::PassWork, u64::from(len - from))?;
     let mut stack: Vec<u32> = (from..len)
         .rev()
-        .filter(|&i| !r.dead.contains(i) && !r.live.counted(i))
+        .filter(|&i| !r.life.dead.contains(i) && !r.life.live.counted(i))
         .collect();
-    let arrived = std::mem::take(&mut r.live.arrived);
+    let arrived = std::mem::take(&mut r.life.live.arrived);
     stack.extend(
         arrived
             .iter()
             .copied()
-            .filter(|&i| !r.dead.contains(i) && !r.live.counted(i)),
+            .filter(|&i| !r.life.dead.contains(i) && !r.life.live.counted(i)),
     );
-    r.live.arrived = arrived;
-    r.live.arrived.clear();
+    r.life.live.arrived = arrived;
+    r.life.live.arrived.clear();
     while let Some(i) = stack.pop() {
-        if !r.live.count(i) {
+        if !r.life.live.count(i) {
             continue;
         }
-        r.dead.remove(i);
+        r.life.dead.remove(i);
         r.meter.charge(Counter::PassWork, 1)?;
         for c in cx.node(i).children() {
-            r.live.add(c);
-            if !r.live.counted(c) {
+            r.life.live.add(c);
+            if !r.life.live.counted(c) {
                 stack.push(c);
             }
         }
     }
-    r.uses_upto = len;
+    r.life.uses_upto = len;
     Ok(())
 }
 
@@ -808,10 +912,8 @@ pub(crate) struct Live {
     /// Counted nodes outside the base, and base nodes no longer counted.
     counted: Marks,
     uncounted: Marks,
-    /// Changes of the use counts (signed), stamped as in [`Counts`].
-    stamp: Vec<u32>,
-    delta: Vec<i32>,
-    epoch: u32,
+    /// Changes of the use counts (signed).
+    delta: Slots<i32>,
     /// Per node replaced in this phase run, the node that took its place.
     heirs: crate::hash::IdMap<u32, u32>,
     /// The nodes that took another's place since the last count (see `refresh_uses`).
@@ -858,11 +960,7 @@ impl Live {
         self.base = false;
         self.counted.clear();
         self.uncounted.clear();
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.stamp.fill(0);
-            self.epoch = 1;
-        }
+        self.delta.clear();
     }
 
     /// Drops the other roots' part (they changed: it is counted again when next needed).
@@ -877,24 +975,15 @@ impl Live {
 
     #[inline]
     fn delta(&self, i: u32) -> Option<i32> {
-        let i = i as usize;
-        (self.stamp.get(i) == Some(&self.epoch)).then(|| self.delta[i])
+        self.delta.get(i)
     }
 
     /// Changes the uses of `i` by `by`, and so those of the nodes that took its place.
     #[inline]
     fn change(&mut self, mut i: u32, by: i32) {
         loop {
-            let at = i as usize;
-            if at >= self.stamp.len() {
-                self.stamp.resize(at + 1, 0);
-                self.delta.resize(at + 1, 0);
-            }
-            if self.stamp[at] != self.epoch {
-                self.stamp[at] = self.epoch;
-                self.delta[at] = 0;
-            }
-            self.delta[at] += by;
+            let d = self.delta.get(i).unwrap_or(0);
+            self.delta.set(i, d + by);
             if self.heirs.is_empty() {
                 return;
             }
@@ -968,7 +1057,7 @@ impl Live {
 /// work per node) if it is for another root: no node the other roots reach was retired in the
 /// run.
 fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> Result<bool, Exhausted> {
-    let o = &mut r.live.others;
+    let o = &mut r.life.live.others;
     if o.active != Some(r.active) {
         // (For no root until it is counted whole: a budget may stop the count.)
         o.active = None;
@@ -977,6 +1066,7 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> Result<bool, Exhausted> 
         o.uses.begin(0);
         o.nodes = 0;
         let mut stack: Vec<u32> = r
+            .life
             .live_roots
             .iter()
             .enumerate()
@@ -996,7 +1086,7 @@ fn others_hold(r: &mut Runner<'_, '_>, cx: &Context) -> Result<bool, Exhausted> 
         }
         o.active = Some(r.active);
     }
-    Ok(!r.dead_log.iter().any(|&d| o.reach.contains(d)))
+    Ok(!r.life.dead_log.iter().any(|&d| o.reach.contains(d)))
 }
 
 /// The region of `n`: the nodes reachable from it without entering `atoms`, at most
@@ -1013,9 +1103,9 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
         atoms.iter().fold(0x7265_6769_6f6e_u64, |h, &a| {
             crate::hash::combine(h, u64::from(a))
         }),
-        r.uses_on,
-        r.dead_log.len(),
-        r.phase_start,
+        r.life.uses_on,
+        r.life.dead_log.len(),
+        r.life.phase_start,
     );
     if r.scratch.region_for == Some(key) {
         return Ok(());
@@ -1039,7 +1129,7 @@ fn region(r: &mut Runner<'_, '_>, cx: &Context, n: u32, atoms: &[u32]) -> Result
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        if r.uses_on && r.live.uses(i) == Some(0) {
+        if r.life.uses_on && r.life.live.uses(i) == Some(0) {
             sc.zeros.push(i);
         }
         size += 1;
@@ -1116,7 +1206,7 @@ fn dying_in(
         for k in 0..sc.zeros.len() {
             let z = sc.zeros[k];
             if !(kept && sc.kept.contains(z))
-                && uses(sc, &r.live, z) == Some(0)
+                && uses(sc, &r.life.live, z) == Some(0)
                 && sc.decided.insert(z)
             {
                 sc.dead.push(z);
@@ -1137,7 +1227,7 @@ fn dying_in(
             if sc.decided.contains(c) || (kept && sc.kept.contains(c)) {
                 continue;
             }
-            if sc.dying.get(c).unwrap_or(0) >= uses(sc, &r.live, c).unwrap_or(u32::MAX) {
+            if sc.dying.get(c).unwrap_or(0) >= uses(sc, &r.life.live, c).unwrap_or(u32::MAX) {
                 sc.decided.insert(c);
                 sc.dead.push(c);
             }
@@ -1563,4 +1653,23 @@ pub(super) fn sort_chain(
         return Ok(Step::Normal(Fin::FINAL));
     }
     finish_with(r, cx, kind, n, e, before, &atoms, Fin::FINAL, true)
+}
+
+/// What is live in a call: the use counts of the live DAG and how far they are counted, the
+/// nodes retired, and the call's roots.
+pub(crate) struct Liveness {
+    /// Use counts (parent edges of live nodes) for the passes' commit rule, and the nodes whose
+    /// edges they count, per phase run, computed on first need (`uses_on`).
+    pub(crate) live: Live,
+    pub(crate) uses_on: bool,
+    /// Arena nodes whose edges `live` already counts.
+    pub(crate) uses_upto: u32,
+    /// The arena length when the current phase run began.
+    pub(crate) phase_start: u32,
+    /// Nodes replaced (or built and discarded) in the current phase run: not parents.
+    pub(crate) dead: Marks,
+    /// The nodes `dead` took in the current phase run, in order.
+    pub(crate) dead_log: Vec<u32>,
+    /// The current version of every distinct root of the call (for use counts).
+    pub(crate) live_roots: Vec<u32>,
 }

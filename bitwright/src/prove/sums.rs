@@ -74,6 +74,9 @@ struct Atom {
     len: u16,
 }
 
+/// A 64-bit form as a number: its constant, and what each bit `(value, bit)` counts.
+type Number = (u64, Vec<((u32, u16), i128)>);
+
 /// `konst + Σ coeff·atom` modulo `2^n`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Form {
@@ -207,6 +210,41 @@ impl Form {
                 break;
             }
         }
+    }
+}
+
+impl Form {
+    /// The form as a number, for a 64-bit form read as one (its coefficients two's-complement
+    /// numbers, as [`Norm::split`] leaves them): the constant, and what each bit of each
+    /// value counts. `None` where that leaves 128 bits.
+    fn number(&self) -> Option<Number> {
+        let mut bits: Vec<((u32, u16), i128)> = Vec::new();
+        for &(a, c) in &self.terms {
+            for b in 0..a.len {
+                bits.push(((a.base, a.lo + b), i128::from(c as i64) << b));
+            }
+        }
+        bits.sort_unstable_by_key(|b| b.0);
+        let mut out: Vec<((u32, u16), i128)> = Vec::with_capacity(bits.len());
+        for (at, v) in bits {
+            match out.last_mut() {
+                Some((last, sum)) if *last == at => *sum = sum.checked_add(v)?,
+                _ => out.push((at, v)),
+            }
+        }
+        out.retain(|b| b.1 != 0);
+        Some((self.konst, out))
+    }
+
+    /// [`tidy`](Self::tidy) for a 64-bit form read as a number: whether it is still that
+    /// number. Tidying keeps a form modulo `2^n`, and a slice cut at another's end has its
+    /// upper part under the coefficient times a power of two, which wraps modulo `2^64`
+    /// where the coefficient is large (`c` near `2^43` cut at bit 21): the residue is kept
+    /// and the number is another, of which a quotient by `2^k` says nothing.
+    fn tidy_number(&mut self) -> bool {
+        let before = self.number();
+        self.tidy();
+        before.is_some() && before == self.number()
     }
 }
 
@@ -664,8 +702,9 @@ impl Norm<'_> {
 
     /// `f = g + 2^k·h` (as numbers, modulo `2^f.n`): `g` what `f` has below bit `k`, each
     /// term's bits below under its coefficient's representative in `[−2^(k−1), 2^(k−1))`, the
-    /// constant's in `[0, 2^k)`; both as 64-bit forms (`g` a number, not a residue).
-    fn split(&self, f: &Form, k: u16) -> (Form, Form) {
+    /// constant's in `[0, 2^k)`; both as 64-bit forms (`g` a number, not a residue). `None`
+    /// where `g` cannot be written as one (see [`Form::tidy_number`]).
+    fn split(&self, f: &Form, k: u16) -> Option<(Form, Form)> {
         let (mut g, mut h) = (Form::zero(64), Form::zero(64));
         let lowc = f.konst & ones(k);
         g.konst = lowc;
@@ -705,7 +744,9 @@ impl Norm<'_> {
         }
         // Merging may leave a coefficient out of range again.
         for _ in 0..8 {
-            g.tidy();
+            if !g.tidy_number() {
+                return None;
+            }
             let terms = core::mem::take(&mut g.terms);
             let mut moved = false;
             for (t, c) in terms {
@@ -717,9 +758,11 @@ impl Norm<'_> {
                 break;
             }
         }
-        g.tidy();
+        if !g.tidy_number() {
+            return None;
+        }
         h.tidy();
-        (g, h)
+        Some((g, h))
     }
 
     /// `⌊g / 2^k⌋` for a sum `g` of low terms (a number, as [`split`](Self::split) leaves
@@ -829,7 +872,9 @@ impl Norm<'_> {
         if t.lo == 0 {
             z = f;
         } else {
-            let (g, h) = self.split(&f, t.lo);
+            let Some((g, h)) = self.split(&f, t.lo) else {
+                return Ok(None);
+            };
             let Some(c) = self.carry_of(&g, t.lo)? else {
                 return Ok(None);
             };
@@ -840,7 +885,9 @@ impl Norm<'_> {
         if read <= t.len {
             return Ok(Some(z));
         }
-        let (g, _) = self.split(&z, t.len);
+        let Some((g, _)) = self.split(&z, t.len) else {
+            return Ok(None);
+        };
         let Some(c) = self.carry_of(&g, t.len)? else {
             return Ok(None);
         };
@@ -872,24 +919,59 @@ impl Norm<'_> {
         let mut fd = fp.clone();
         fd.add(&fq, u64::MAX);
         fd.tidy();
-        let (gp, gq, gd) = (
-            self.split(&fp, k).0,
-            self.split(&fq, k).0,
-            self.split(&fd, k).0,
-        );
-        let mut e = Form::zero(64);
-        e.add(&gq, 1);
-        e.add(&gd, 1);
-        e.add(&gp, u64::MAX);
-        e.tidy();
-        let exact = |c: u64| c.trailing_zeros() >= u32::from(k);
-        if !exact(e.konst) || e.terms.iter().any(|t| !exact(t.1)) {
+        let (Some((gp, _)), Some((gq, _)), Some((gd, _))) =
+            (self.split(&fp, k), self.split(&fq, k), self.split(&fd, k))
+        else {
+            return Ok(None);
+        };
+        // The exact quotient is of the number `G_q + G_d − G_p`, so it is taken of the number:
+        // what each bit of each value counts in the three, added up in 128 bits. (As a
+        // 64-bit form the sum is only kept modulo `2^64`: a slice cut at another's end has
+        // its upper part under the coefficient times a power of two, and with a coefficient
+        // near `2^43` cut at bit 21 that wraps; the quotient of what is left by `2^k` is then
+        // off by a multiple of `2^(64 − k)`, which a limb read on more bits than that sees.)
+        let mut out = Form::zero(64);
+        let (Some(np), Some(nq), Some(nd)) = (gp.number(), gq.number(), gd.number()) else {
+            return Ok(None);
+        };
+        let exact = |c: i128| c.trailing_zeros() >= u32::from(k);
+        let konst = i128::from(nq.0) + i128::from(nd.0) - i128::from(np.0);
+        if !exact(konst) {
             return Ok(None);
         }
-        let mut out = Form::zero(64);
-        out.konst = ((e.konst as i64) >> k) as u64;
-        out.terms
-            .extend(e.terms.iter().map(|&(a, c)| (a, ((c as i64) >> k) as u64)));
+        out.konst = (konst >> k) as u64;
+        let mut bits: Vec<((u32, u16), i128)> = Vec::new();
+        bits.extend(nq.1.iter().chain(&nd.1).copied());
+        bits.extend(np.1.iter().map(|&(at, v)| (at, -v)));
+        bits.sort_unstable_by_key(|b| b.0);
+        let mut i = 0;
+        while i < bits.len() {
+            let (at, mut sum) = bits[i];
+            i += 1;
+            while i < bits.len() && bits[i].0 == at {
+                let Some(s) = sum.checked_add(bits[i].1) else {
+                    return Ok(None);
+                };
+                sum = s;
+                i += 1;
+            }
+            if !exact(sum) {
+                return Ok(None);
+            }
+            // (Kept modulo `2^64` from here: the carry is added to forms of at most 64 bits.)
+            let c = (sum >> k) as u64;
+            if c != 0 {
+                let atom = Atom {
+                    base: at.0,
+                    lo: at.1,
+                    len: 1,
+                };
+                out.terms.push((atom, c));
+            }
+        }
+        // (Bits under `c`, `2c`, `4c` are one slice again.)
+        out.tidy();
+
         for (g, sign) in [(gp, 1), (gq, u64::MAX), (gd, u64::MAX)] {
             let Some(c) = self.carry_of(&g, k)? else {
                 return Ok(None);

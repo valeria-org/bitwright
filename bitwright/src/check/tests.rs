@@ -1411,4 +1411,77 @@ fn native_proofs_settle_rules_too_wide_to_enumerate() {
         (c.evidence.proved_instances, c.evidence.unproved_instances),
         (3, 0)
     );
+    // Proofs required: the same rule passes, and so does one its exhaustive tier covers whole.
+    let strict = CheckConfig::default()
+        .with_proofs(3)
+        .with_require_proofs(true);
+    assert!(check_rule(&p.rules()[0], &strict).is_sound());
+    let fixed = program("rule tiny(x: 4) { x ^ x => 0 }");
+    assert!(check_rule(&fixed.rules()[0], &strict).is_sound());
+    // A rule the prover cannot decide within its budget is sound by sampling, as before, and
+    // inconclusive when proofs are required; so is any rule when none was asked for.
+    let p = program("rule hard<W>(x: W, y: W, z: W) { (x * y) + (x * z) => x * (y + z) }");
+    let starved = CheckConfig::default()
+        .with_proofs(3)
+        .with_proof_conflicts(1);
+    let c = check_rule(&p.rules()[0], &starved);
+    assert!(c.is_sound(), "{:?}", c.verdict);
+    assert!(c.evidence.unproved_instances > 0, "{}", c.evidence);
+    let c = check_rule(&p.rules()[0], &starved.with_require_proofs(true));
+    assert!(
+        matches!(c.verdict, Verdict::Inconclusive(_)),
+        "{:?}",
+        c.verdict
+    );
+    let c = check_rule(
+        &p.rules()[0],
+        &CheckConfig::default().with_require_proofs(true),
+    );
+    assert!(
+        matches!(c.verdict, Verdict::Inconclusive(_)),
+        "{:?}",
+        c.verdict
+    );
+}
+
+/// A ledger vouches for a rule by what the rule is: checked under one name, it is vouched
+/// for under any, and a rule that differs is not.
+#[test]
+fn a_ledger_vouches_by_content() {
+    let checked = RuleProgram::compile(
+        "bitwright 1;\n\ngroup a {\n    rule absorb<W>(x: W, y: W) { x & (x | y) => x }\n}\n",
+    )
+    .unwrap();
+    let checks = check_program(&checked, &CheckConfig::default());
+    let ledger = Ledger::from_checks(&checks);
+    // The same rule in another group, under another name and other parameter names.
+    let renamed = RuleProgram::compile(
+        "bitwright 1;\n\ngroup b {\n    /// Elsewhere.\n    rule other<W>(p: W, q: W) { p & (p | q) => p }\n}\n",
+    )
+    .unwrap();
+    let rule = &renamed.rules()[0];
+    assert_ne!(rule.name, checked.rules()[0].name);
+    assert!(ledger.vouches_for(&rule.name, rule.id) && ledger.vouches_for_content(rule.id));
+    // So an engine takes it on that ledger.
+    crate::engine::Engine::builder()
+        .program(renamed, &ledger)
+        .build()
+        .unwrap();
+    // A different rule under the checked rule's name is not vouched for.
+    let different = RuleProgram::compile(
+        "bitwright 1;\n\ngroup a {\n    rule absorb<W>(x: W, y: W) { x & (x | y) => y }\n}\n",
+    )
+    .unwrap();
+    let rule = &different.rules()[0];
+    assert!(!ledger.vouches_for(&rule.name, rule.id));
+    assert!(
+        crate::engine::Engine::builder()
+            .program(different, &ledger)
+            .build()
+            .is_err()
+    );
+    // Two ledgers as one.
+    let mut both = Ledger::default();
+    both.merge(&ledger);
+    assert!(both.vouches_for_content(checked.rules()[0].id));
 }

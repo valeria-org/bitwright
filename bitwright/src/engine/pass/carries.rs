@@ -58,10 +58,10 @@ use super::{
 };
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
+use crate::engine::oracle::{EqualityCaps, EqualityVerdict};
 use crate::expr::{Context, OpCode};
 use crate::hash::IdMap;
 use crate::ops::{BinOp, CmpOp, UnOp};
-use crate::prove::{self, Outcome, Unknown};
 use crate::{BitVec, Error, SymbolKey};
 
 /// The most atoms.
@@ -607,41 +607,34 @@ fn proved(
     let w = cx.width_of(n);
     let mut scx = Context::new();
     let (lhs, rhs) = copy(cx, &r.carries, &mut scx, w, target).map_err(Stop::Error)?;
-    let cfg = prove::Config::default()
-        .with_simplify(false)
-        .with_certificate(false)
-        .with_samples(0)
-        .with_max_nodes(MAX_AIG_NODES)
-        .with_max_conflicts(u64::MAX)
-        .with_max_propagations(propagations);
-    let (lhs, rhs) = (scx.handle(lhs), scx.handle(rhs));
-    let mut q = prove::Question::equal(&mut scx, lhs, rhs, &cfg).map_err(Stop::Error)?;
-    let out = q.solve(&mut scx, cfg.limits()).map_err(Stop::Error)?;
-    let stats = q.stats();
-    let nodes = match &out {
-        Outcome::Unknown(Unknown::TooLarge { nodes }) => *nodes,
-        _ => stats.nodes,
+    let caps = EqualityCaps {
+        samples: 0,
+        max_nodes: MAX_AIG_NODES,
+        max_propagations: propagations,
     };
+    let (lhs, rhs) = (scx.handle(lhs), scx.handle(rhs));
+    let out = (crate::circuit_equality())(&mut scx, lhs, rhs, &caps).map_err(Stop::Error)?;
+    let nodes = out.nodes;
     let cost = (nodes as u64)
-        .saturating_add(stats.propagations.saturating_mul(PROPAGATION_RATE))
+        .saturating_add(out.propagations.saturating_mul(PROPAGATION_RATE))
         .min(left);
     r.meter.charge(Counter::PassWork, cost)?;
     let c = count(r);
-    Ok(match out {
-        Outcome::Proved(_) => {
+    Ok(match out.verdict {
+        EqualityVerdict::Proved => {
             c.proved += 1;
             Verdict::Proved
         }
-        Outcome::Refuted(_) => {
+        EqualityVerdict::Refuted => {
             c.refuted += 1;
             Verdict::No
         }
         // Stopped short of the pass's own cap: more pass work may decide it.
-        Outcome::Unknown(Unknown::Budget { .. }) if propagations < PROPAGATIONS => {
+        EqualityVerdict::Budget if propagations < PROPAGATIONS => {
             c.unknown += 1;
             Verdict::Unpaid
         }
-        Outcome::Unknown(_) => {
+        EqualityVerdict::Budget | EqualityVerdict::Unknown => {
             c.unknown += 1;
             r.carries.undecided.insert(n, ());
             Verdict::No

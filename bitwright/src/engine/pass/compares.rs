@@ -900,7 +900,11 @@ fn combine(cx: &Context, op: OpCode, a: &Info, b: Option<&Info>) -> Info {
     }
 }
 
-fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop> {
+pub(in crate::engine) fn info_of(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    root: u32,
+) -> Result<Info, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
         if r.compares.contains_key(&i) {
@@ -1366,6 +1370,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             {
                 let before = cx.len() as u32;
                 let c = bool_const(r, cx, same == (node.op == OpCode::Eq))?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
+            if matches!(node.op, OpCode::Eq | OpCode::Ne)
+                && cx.wid(node.a) > 1
+                && super::linear_mba::equal(r, cx, node.a, node.b)?
+            {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, node.op == OpCode::Eq)?;
                 return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
             }
             if let Some(b) = residue_decide(r, cx, n)? {

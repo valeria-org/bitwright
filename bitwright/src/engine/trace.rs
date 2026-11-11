@@ -703,6 +703,8 @@ impl Observer for Trace {
             } => Rec::NotSmaller(self.who(by), node, candidate, added, freed, shared),
             Event::Folded { node, after } => Rec::Folded(node, after),
             Event::Root { index, root, again } => Rec::Root(index, root, again),
+            // (A stage's parts are for a derivation; the trace has the stage.)
+            Event::Part { .. } => return,
             Event::Stage {
                 stage,
                 before,
@@ -1016,6 +1018,8 @@ fn mba_stats(out: &mut String, m: &MbaStats) {
         certificates,
         opaque_asked,
         opaque_proved,
+        // (Not part of a trace: a run records what it did, and a store's advice is not it.)
+        opaque_skipped: _,
         opaque_known,
         opaque_exhausted,
         opaque_cases,

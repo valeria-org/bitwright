@@ -1,0 +1,18 @@
+[package]
+name = "bitwright-cadical"
+description = "CaDiCaL as the SAT search of bitwright's solver."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+bitwright = { path = "../bitwright", features = ["prove"] }
+# The C++ solver, built from source by the crate (a C++ compiler is needed).
+cadical = "0.1"
+
+[lints]
+workspace = true

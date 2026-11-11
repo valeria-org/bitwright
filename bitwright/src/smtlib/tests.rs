@@ -333,8 +333,15 @@ fn import_rejects_what_it_does_not_model_without_panicking() {
         "(declare-const x (_ BitVec 513))",
         "(declare-const x (_ BitVec 99999999999))",
         "(declare-const x Int)",
-        "(declare-fun f ((_ BitVec 8)) (_ BitVec 8))",
-        "(define-fun f ((a (_ BitVec 8))) (_ BitVec 8) a)",
+        "(declare-fun f ((Array (_ BitVec 8) (_ BitVec 8))) (_ BitVec 8))",
+        "(declare-fun f ((_ BitVec 8)) (_ BitVec 8)) (define-fun a () (_ BitVec 8) (f #b1))",
+        "(declare-fun f ((_ BitVec 8)) (_ BitVec 8)) (declare-const f Bool)",
+        "(define-sort Word (X) (_ BitVec 8))",
+        "(define-sort Bool () (_ BitVec 8))",
+        "(define-fun f ((a (_ BitVec 8))) (_ BitVec 8) a) (define-fun g () (_ BitVec 8) (f))",
+        "(define-fun f ((a (_ BitVec 8))) (_ BitVec 8) a) (define-fun g () (_ BitVec 8) (f #b1))",
+        "(define-fun f ((a (_ BitVec 8))) (_ BitVec 4) a) (define-fun g () (_ BitVec 4) (f #x01))",
+        "(define-fun f ((a (_ BitVec 8))) (_ BitVec 8) (f a)) (define-fun g () (_ BitVec 8) (f #x01))",
         "(declare-const x (_ BitVec 8)) (declare-const x (_ BitVec 8))",
         "(assert y)",
         "(declare-const x (_ BitVec 8)) (assert x)",
@@ -833,10 +840,11 @@ fn floating_point_scripts_import() {
     assert_eq!(v("chain"), BitVec::from_bool(true));
     assert_eq!(v("wide").to_f64(), Some(1.0));
     assert_eq!(im.assertions.len(), 1);
-    // Rounding-mode variables are not supported (the modes are constants).
+    // A rounding-mode variable is a 3-bit symbol, asserted to be one of the five modes.
     let mut cx = Context::new();
-    let err = import(&mut cx, "(declare-const m RoundingMode)").unwrap_err();
-    assert!(err.to_string().contains("rounding-mode"), "{err}");
+    let im = import(&mut cx, "(declare-const m RoundingMode)").unwrap();
+    assert_eq!((im.symbols.len(), im.assertions.len()), (1, 1));
+    assert_eq!(cx.width(im.symbols[0].1).unwrap().bits(), 3);
 }
 
 // ----- rule obligations -------------------------------------------------------------------------
@@ -1501,14 +1509,170 @@ fn arrays_import_as_memory() {
             )),
         }
     }
+}
+
+/// Arrays beyond declared ones: chosen by `ite`, constant, stored into, and compared
+/// (extensionality). The answers are z3's.
+#[test]
+fn arrays_are_compared_chosen_and_constant() {
+    let header = "(set-logic QF_ABV)
+        (declare-const x (_ BitVec 8)) (declare-const y (_ BitVec 8))
+        (declare-const v (_ BitVec 8)) (declare-const w (_ BitVec 8))
+        (declare-const p Bool)
+        (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+        (declare-const b (Array (_ BitVec 8) (_ BitVec 8)))
+        (declare-const c (Array (_ BitVec 8) (_ BitVec 8)))";
+    let cases: &[(&str, &str)] = &[
+        (
+            "(assert (= b (store a x #x01))) (assert (not (= (select b x) #x01))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= b (store a x #x01))) (assert (not (= (select b y) (select a y)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (= b (store a x #x01))) (assert (distinct x y)) (assert (not (= (select b y) (select a y)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= b (store a x v))) (assert (= b (store a x w))) (assert (distinct v w)) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= b (store a x v))) (assert (= b (store a y w))) (assert (distinct v w)) (check-sat)",
+            "sat",
+        ),
+        ("(assert (not (= a b))) (check-sat)", "sat"),
+        ("(assert (not (= a a))) (check-sat)", "unsat"),
+        (
+            "(assert (not (= (store a x v) (store a x v)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (distinct x y)) (assert (not (= (store (store a x v) y w) (store (store a y w) x v)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (store (store a x v) y w) (store (store a y w) x v)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (= a b)) (assert (= b c)) (assert (not (= a c))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= a b)) (assert (= b c)) (assert (distinct (select a x) (select c x))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (select (ite p a b) x) (ite p (select a x) (select b x))))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= c (store (ite p a b) x v))) (assert p) (assert (distinct x y)) (assert (distinct (select c y) (select a y))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (select ((as const (Array (_ BitVec 8) (_ BitVec 8))) #x07) x) #x07))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= a (store ((as const (Array (_ BitVec 8) (_ BitVec 8))) #x00) x #x05))) (assert (= (select a y) #x05)) (assert (distinct x y)) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= a ((as const (Array (_ BitVec 8) (_ BitVec 8))) v))) (assert (= (select a x) #x09)) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (= a ((as const (Array (_ BitVec 8) (_ BitVec 8))) v))) (assert (distinct (select a x) (select a y))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (store a x (select a x)) a))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (or (= a b) (= a c))) (assert (distinct (select a x) (select b x))) (assert (distinct (select a x) (select c x))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (or (= a b) (= a c))) (assert (distinct (select a x) (select b x))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (= a b)) (push 1) (assert (distinct (select a x) (select b x))) (check-sat) (pop 1) (check-sat) (assert (distinct (select a y) (select b y))) (check-sat)",
+            "unsat sat unsat",
+        ),
+        (
+            "(assert (distinct (select a x) (select b x))) (check-sat) (assert (= a b)) (check-sat)",
+            "sat unsat",
+        ),
+        (
+            "(assert (distinct a b c)) (assert (= (store a x v) (store b x v))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (= (ite p a b) c)) (assert (not p)) (assert (distinct (select b x) (select c x))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= b (store (store a x (select a y)) y (select a x)))) (assert (= c (store (store b x (select b y)) y (select b x)))) (assert (not (= a c))) (check-sat)",
+            "unsat",
+        ),
+    ];
+    let cfg = crate::solve::Config::default();
+    for (body, expected) in cases {
+        let mut out = String::new();
+        run(
+            &mut Context::new(),
+            &format!("{header}{body}"),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>().join(" "),
+            *expected,
+            "{body}"
+        );
+    }
+    // A read first made by `get-value` has the value the equality gives it, and an
+    // equality first read as an assumption is part of that question.
+    let mut out = String::new();
+    let script = format!(
+        "{header}
+         (assert (= a ((as const (Array (_ BitVec 8) (_ BitVec 8))) #x09)))
+         (assert (= (select b x) #x01))
+         (check-sat)
+         (get-value ((select a #x44)))
+         (check-sat-assuming ((= a b)))
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+         (assert (= (f x) #x07))
+         (check-sat)
+         (get-value ((f x) (= (f y) (f x))))
+         (check-sat-assuming ((= x y) (distinct (f y) #x07)))"
+    );
+    run(&mut Context::new(), &script, &cfg, &mut out).unwrap();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[..3],
+        ["sat", "(((select a #x44) #x09))", "unsat"],
+        "{out}"
+    );
+    assert_eq!(lines[3], "sat", "{out}");
+    assert!(lines[4].starts_with("(((f x) #x07) "), "{out}");
+    assert_eq!(lines[5], "unsat", "{out}");
+    // Sorts are checked.
     let err = crate::smtlib::import(
         &mut Context::new(),
         "(declare-fun m () (Array (_ BitVec 8) (_ BitVec 8)))
-         (declare-fun n () (Array (_ BitVec 8) (_ BitVec 8)))
+         (declare-fun n () (Array (_ BitVec 16) (_ BitVec 8)))
          (assert (= m n))",
     )
     .unwrap_err();
-    assert!(err.to_string().contains("equality of arrays"), "{err}");
+    assert!(err.to_string().contains("different sorts"), "{err}");
 }
 
 /// A symbol's declared known bits are stated in the script (a result may rely on them), and
@@ -1533,4 +1697,808 @@ fn declared_known_bits_are_asserted() {
     let mut back = Context::new();
     let imported = import(&mut back, &export(&mut cx, &[e]).unwrap()).unwrap();
     assert_eq!(imported.assertions.len(), 1);
+}
+
+#[test]
+fn exit_ends_the_script() {
+    let mut cx = Context::new();
+    let s = import(
+        &mut cx,
+        "(declare-const x (_ BitVec 8))
+         (assert (= x #x01))
+         (check-sat)
+         (exit)
+         (declare-const y (_ BitVec 8))
+         (assert (= x #x02))",
+    )
+    .unwrap();
+    assert_eq!(s.symbols.len(), 1);
+    assert_eq!(s.assertions.len(), 1);
+    // The text after it must still be well formed, and `exit` takes no argument.
+    assert!(import(&mut Context::new(), "(exit) (assert").is_err());
+    assert!(import(&mut Context::new(), "(exit 1)").is_err());
+}
+
+/// The exporter's float-bits pattern is a definition of `c` only when neither `T` nor `NAN`
+/// reads `c`. Read as one when they do, the constraint was dropped and each of these
+/// unsatisfiable scripts had a model.
+#[test]
+fn a_float_bits_assertion_that_reads_its_constant_stays_an_assertion() {
+    for script in [
+        "(declare-const c (_ BitVec 32))
+         (assert (ite (fp.isNaN (fp.add RNE ((_ to_fp 8 24) c) ((_ to_fp 8 24) #x3f800000)))
+                      (= c #x7fc00000)
+                      (= ((_ to_fp 8 24) c)
+                         (fp.add RNE ((_ to_fp 8 24) c) ((_ to_fp 8 24) #x3f800000)))))
+         (assert (= c #x00000000))",
+        "(declare-const x Float32)
+         (declare-const c (_ BitVec 32))
+         (assert (ite (fp.isNaN x) (= c (bvnot c)) (= ((_ to_fp 8 24) c) x)))
+         (assert (fp.isNaN x))",
+    ] {
+        let mut cx = Context::new();
+        let s = import(&mut cx, script).unwrap();
+        assert_eq!(s.assertions.len(), 2, "{script}");
+        assert!(s.symbols.iter().any(|(n, _)| n == "c"), "{script}");
+        let mut all = s.assertions[0];
+        for &a in &s.assertions[1..] {
+            all = cx.bin(crate::BinOp::And, all, a).unwrap();
+        }
+        assert!(
+            matches!(
+                crate::prove::satisfy(&mut cx, all, &crate::prove::Config::default()),
+                Ok(Ok(None))
+            ),
+            "{script}"
+        );
+    }
+    // The pattern as exported, `c` read by neither side, is still its definition.
+    let mut cx = Context::new();
+    let s = import(
+        &mut cx,
+        "(declare-const x Float32)
+         (declare-const c (_ BitVec 32))
+         (assert (ite (fp.isNaN (fp.neg x)) (= c #x7fc00000) (= ((_ to_fp 8 24) c) (fp.neg x))))",
+    )
+    .unwrap();
+    assert!(s.assertions.is_empty());
+    assert!(s.symbols.iter().all(|(n, _)| n != "c"));
+}
+
+/// The overflow predicates against exact integer arithmetic, on every pair of operands at
+/// widths 1 to 5.
+#[test]
+fn overflow_predicates_are_exact() {
+    const OPS: [&str; 7] = [
+        "bvuaddo", "bvsaddo", "bvusubo", "bvssubo", "bvumulo", "bvsmulo", "bvsdivo",
+    ];
+    for w in 1..=5u16 {
+        let mut script = format!(
+            "(declare-const a (_ BitVec {w}))(declare-const b (_ BitVec {w}))\
+             (define-fun nego () Bool (bvnego a))"
+        );
+        for op in OPS {
+            script.push_str(&format!("(define-fun {op} () Bool ({op} a b))"));
+        }
+        let mut cx = Context::new();
+        let s = import(&mut cx, &script).unwrap();
+        let width = Width::new(w).unwrap();
+        let roots: Vec<Expr> = (["nego"].iter().chain(&OPS))
+            .map(|n| s.definition(n).unwrap())
+            .collect();
+        let signed = |v: i64| if v >= 1 << (w - 1) { v - (1 << w) } else { v };
+        let (umax, smin, smax) = ((1i64 << w) - 1, -(1i64 << (w - 1)), (1i64 << (w - 1)) - 1);
+        let out = |v: i64| v < smin || v > smax;
+        for a in 0..=umax {
+            for b in 0..=umax {
+                let env: BTreeMap<SymbolKey, BitVec> = [("a", a), ("b", b)]
+                    .into_iter()
+                    .map(|(n, v)| {
+                        (
+                            SymbolKey::from(n),
+                            BitVec::from_u64(width, v as u64).unwrap(),
+                        )
+                    })
+                    .collect();
+                let got: Vec<bool> = (cx.eval(&roots, &env).unwrap().iter())
+                    .map(|v| !v.is_zero())
+                    .collect();
+                let (sa, sb) = (signed(a), signed(b));
+                let want = [
+                    sa == smin,
+                    a + b > umax,
+                    out(sa + sb),
+                    a < b,
+                    out(sa - sb),
+                    a * b > umax,
+                    out(sa * sb),
+                    sa == smin && sb == -1,
+                ];
+                assert_eq!(got, want, "width {w}, a = {a}, b = {b}");
+            }
+        }
+    }
+}
+
+fn session(script: &str) -> String {
+    let mut out = String::new();
+    run(
+        &mut Context::new(),
+        script,
+        &crate::solve::Config::default(),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+#[test]
+fn a_session_answers_checks_models_and_cores() {
+    // Scopes: assertions and declarations go with them, and a name may come back wider.
+    assert_eq!(
+        session(
+            "(set-logic QF_BV)
+             (declare-const x (_ BitVec 8))
+             (assert (bvult x #x10))
+             (push 1)
+             (declare-const y (_ BitVec 8))
+             (assert (= (bvadd x y) #xff))
+             (assert (bvult y #x10))
+             (check-sat)
+             (pop 1)
+             (check-sat)
+             (declare-const y (_ BitVec 16))
+             (assert (= y #x1234))
+             (check-sat)
+             (get-value (y ((_ extract 3 0) y)))
+             (pop 1)
+             (check-sat)"
+        ),
+        "unsat\nsat\nsat\n((y #x1234) (((_ extract 3 0) y) #x4))\n\
+         (error \"unsupported: pop 1 with 0 scopes open\")\nsat\n"
+    );
+    // A function with parameters, applied twice and inside another; named assertions and
+    // assumptions in a core.
+    assert_eq!(
+        session(
+            "(define-fun mix ((v (_ BitVec 32)) (k (_ BitVec 32))) (_ BitVec 32)
+               (bvmul (bvxor v k) #x9e3779b1))
+             (define-fun twice ((v (_ BitVec 32))) (_ BitVec 32) (mix (mix v #x00000001) #x00000002))
+             (declare-const x (_ BitVec 32))
+             (declare-const p Bool)
+             (assert (! (= (twice x) (twice #x0000002a)) :named same))
+             (assert (! (not (= x #x0000002a)) :named differs))
+             (assert (! (=> p (bvugt x #x00000000)) :named unused))
+             (check-sat)
+             (get-unsat-core)
+             (get-model)
+             (reset-assertions)
+             (assert (= x #x00000007))
+             (check-sat-assuming (p (bvult x #x00000005)))
+             (get-unsat-assumptions)
+             (check-sat-assuming (p))
+             (get-value (p x))
+             (get-model)"
+        ),
+        "unsat\n(same differs)\n(error \"unsupported: no model: the last check was not sat\")\n\
+         unsat\n((bvult x #x00000005))\nsat\n((p true) (x #x00000007))\n\
+         (\n  (define-fun x () (_ BitVec 32) #x00000007)\n  (define-fun p () Bool true)\n)\n"
+    );
+    // A failing command answers an error and the script goes on; `exit` ends it.
+    assert_eq!(
+        session(
+            "(set-option :print-success true)
+             (declare-const q Int)
+             (declare-const b (_ BitVec 3))
+             (assert (= b #b101))
+             (set-option :print-success false)
+             (check-sat)
+             (get-value (b))
+             (echo \"done\")
+             (get-info :name)
+             (exit)
+             (check-sat)"
+        ),
+        "success\n(error \"unsupported: a variable of sort Int (integers are read where a \
+         bit-vector bounds them) (at bytes 63..66)\")\n\
+         success\nsuccess\nsat\n((b #b101))\n\"done\"\n(:name \"bitwright\")\n"
+    );
+    // A float's value is its bits; a reset forgets the declarations too.
+    assert_eq!(
+        session(
+            "(declare-const f Float32)
+             (assert (= f (fp.add RNE ((_ to_fp 8 24) #x3f800000) ((_ to_fp 8 24) #x3f800000))))
+             (check-sat)
+             (get-value (f))
+             (reset)
+             (declare-const f (_ BitVec 4))
+             (assert (= f #xa))
+             (check-sat)
+             (get-model)"
+        ),
+        "sat\n((f (fp #b0 #b10000000 #b00000000000000000000000)))\nsat\n\
+         (\n  (define-fun f () (_ BitVec 4) #xa)\n)\n"
+    );
+}
+
+/// What SMT-LIB leaves unspecified is open in a session (z3 answers each of these the same
+/// way), while every specified case keeps its value.
+#[test]
+fn a_session_leaves_unspecified_float_results_open() {
+    let x = "(declare-const x Float32)";
+    let ubv = "((_ fp.to_ubv 8) RNE x)";
+    for (script, want) in [
+        // Either zero, but one zero for one order of the operands.
+        (
+            "(assert (fp.isPositive (fp.min (_ +zero 8 24) (_ -zero 8 24))))".to_string(),
+            "sat",
+        ),
+        (
+            "(assert (fp.isNegative (fp.min (_ +zero 8 24) (_ -zero 8 24))))".to_string(),
+            "sat",
+        ),
+        (
+            "(assert (fp.isNegative (fp.max (_ -zero 8 24) (_ +zero 8 24))))".to_string(),
+            "sat",
+        ),
+        (
+            "(assert (not (fp.isZero (fp.min (_ +zero 8 24) (_ -zero 8 24)))))".to_string(),
+            "unsat",
+        ),
+        (
+            "(assert (fp.isNegative (fp.min (_ +zero 8 24) (_ +zero 8 24))))".to_string(),
+            "unsat",
+        ),
+        (
+            format!(
+                "{x}(declare-const y Float32)(assert (= x (_ +zero 8 24)))\
+                 (assert (= y (_ -zero 8 24)))\
+                 (assert (not (= (fp.min x y) (fp.min (_ +zero 8 24) (_ -zero 8 24)))))"
+            ),
+            "unsat",
+        ),
+        // A NaN, an infinity and a value out of range convert to anything.
+        (
+            format!("{x}(assert (fp.isNaN x))(assert (= {ubv} #x55))"),
+            "sat",
+        ),
+        (
+            format!("{x}(assert (fp.isInfinite x))(assert (= {ubv} #x55))"),
+            "sat",
+        ),
+        (
+            format!("{x}(assert (fp.gt x ((_ to_fp 8 24) RNE 1000.0)))(assert (= {ubv} #x55))"),
+            "sat",
+        ),
+        (
+            format!("{x}(assert (= x ((_ to_fp 8 24) RNE (- 1.0))))(assert (= {ubv} #x77))"),
+            "sat",
+        ),
+        (
+            format!("{x}(assert (fp.isNaN x))(assert (not (= {ubv} {ubv})))"),
+            "unsat",
+        ),
+        // In range, to the last value that rounds into it.
+        (
+            format!("{x}(assert (= x ((_ to_fp 8 24) RNE 3.7)))(assert (not (= {ubv} #x04)))"),
+            "unsat",
+        ),
+        (
+            format!("{x}(assert (= x ((_ to_fp 8 24) RNE 255.4)))(assert (not (= {ubv} #xff)))"),
+            "unsat",
+        ),
+        (
+            format!("{x}(assert (= x ((_ to_fp 8 24) RNE 255.5)))(assert (= {ubv} #x11))"),
+            "sat",
+        ),
+        (
+            format!("{x}(assert (= x ((_ to_fp 8 24) RNE (- 0.25))))(assert (not (= {ubv} #x00)))"),
+            "unsat",
+        ),
+        (
+            format!(
+                "{x}(assert (= x ((_ to_fp 8 24) RNE (- 128.4))))\
+                 (assert (not (= ((_ fp.to_sbv 8) RNE x) #x80)))"
+            ),
+            "unsat",
+        ),
+        (
+            format!(
+                "{x}(assert (= x ((_ to_fp 8 24) RNE (- 128.6))))\
+                 (assert (= ((_ fp.to_sbv 8) RNE x) #x33))"
+            ),
+            "sat",
+        ),
+        // A target wider than the format's range: every finite value converts.
+        (
+            "(declare-const h Float16)(assert (fp.geq h (_ +zero 5 11)))\
+             (assert (not (fp.isInfinite h)))\
+             (assert (= ((_ fp.to_ubv 64) RTZ h) #xffffffffffffffff))"
+                .to_string(),
+            "unsat",
+        ),
+    ] {
+        assert_eq!(
+            session(&format!("{script}(check-sat)")),
+            format!("{want}\n"),
+            "{script}"
+        );
+    }
+    // The importer alone keeps bitwright's definitions: no symbol stands for a result.
+    let mut cx = Context::new();
+    let s = import(
+        &mut cx,
+        "(define-fun m () Float32 (fp.min (_ +zero 8 24) (_ -zero 8 24)))",
+    );
+    assert!(
+        cx.as_const(s.unwrap().definition("m").unwrap())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_session_fed_in_pieces_answers_each_command_once_complete() {
+    let mut cx = Context::new();
+    let cfg = crate::solve::Config::default();
+    let whole = "(declare-const |a b| (_ BitVec 8)) ; a ( in a comment\n\
+                 (assert (= |a b| #x2a))(check-sat)(echo \"a ) and a \"\" in a string\")\n\
+                 (get-value (|a b|))(exit)(check-sat)";
+    let mut expected = String::new();
+    run(&mut Context::new(), whole, &cfg, &mut expected).unwrap();
+    // Cut anywhere: the answers are the same.
+    for cut in [1, 2, 3, 7, 16, 64] {
+        let mut s = Session::new(&mut cx, &cfg);
+        let mut out = String::new();
+        let bytes = whole.as_bytes();
+        for piece in bytes.chunks(cut) {
+            s.feed(core::str::from_utf8(piece).unwrap(), &mut out)
+                .unwrap();
+        }
+        assert_eq!(out, expected, "cut every {cut}");
+        assert!(s.exited() && !s.pending());
+        assert_eq!(s.summary().sat, 1);
+    }
+    // A command that is not well formed is an error of its own; the next one runs.
+    let mut s = Session::new(&mut cx, &cfg);
+    let mut out = String::new();
+    s.feed("(assert #b2) ) (check-sat)", &mut out).unwrap();
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert!(out.ends_with("sat\n") && out.starts_with("(error"), "{out}");
+    assert_eq!(s.summary().errors, 2);
+    s.feed("(check-sat", &mut out).unwrap();
+    assert!(s.pending());
+}
+
+#[test]
+fn uninterpreted_functions_are_functions_and_nothing_more() {
+    let d = "(declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (declare-fun p ((_ BitVec 8) Bool) Bool)
+             (define-sort Byte () (_ BitVec 8))
+             (declare-const x Byte)(declare-const y Byte)(declare-const z Byte)";
+    for (body, want) in [
+        // Equal arguments, equal results; through any number of applications.
+        ("(assert (= x y))(assert (not (= (f x) (f y))))", "unsat"),
+        (
+            "(assert (= (f x) y))(assert (= (f y) z))(assert (= x z))\
+          (assert (not (= (f (f (f x))) y)))",
+            "unsat",
+        ),
+        (
+            "(assert (p x true))(assert (not (p y true)))(assert (= x y))",
+            "unsat",
+        ),
+        // Nothing else is known of them.
+        ("(assert (not (= (f x) (f y))))", "sat"),
+        ("(assert (p x true))(assert (not (p x false)))", "sat"),
+        // Three values of f need three arguments.
+        (
+            "(assert (distinct (f #x00) (f #x01) (f x)))(assert (bvult x #x02))",
+            "unsat",
+        ),
+        (
+            "(assert (distinct (f #x00) (f #x01) (f x)))(assert (bvult x #x03))",
+            "sat",
+        ),
+    ] {
+        assert_eq!(
+            session(&format!("{d}{body}(check-sat)")),
+            format!("{want}\n"),
+            "{body}"
+        );
+    }
+    // An application made in a scope is forgotten with it; one from before is not.
+    assert_eq!(
+        session(&format!(
+            "{d}(assert (= (f x) #x05))(push)(assert (= (f y) #x06))(assert (= x y))(check-sat)
+             (pop)(check-sat)(get-value ((f x)))(assert (= (f z) #x07))(assert (= z x))
+             (check-sat)(get-assertions)"
+        )),
+        "unsat\nsat\n(((f x) #x05))\nunsat\n((= (f x) #x05)\n (= (f z) #x07)\n (= z x))\n"
+    );
+    // The importer alone states the function's meaning as assertions of its own.
+    let mut cx = Context::new();
+    let s = import(&mut cx, &format!("{d}(assert (= (f x) (f y)))")).unwrap();
+    assert_eq!(s.assertions.len(), 2);
+}
+
+/// A rounding-mode variable is one of the five modes, and a term reads it as whichever it is
+/// (z3 and Bitwuzla answer each of these the same way).
+#[test]
+fn a_rounding_mode_variable_is_one_of_five() {
+    let d = "(declare-const a Float32)(declare-const b Float32)\
+             (declare-const r RoundingMode)(declare-const q RoundingMode)";
+    let third = "(fp.div RNE ((_ to_fp 8 24) RNE 1.0) ((_ to_fp 8 24) RNE 3.0))";
+    let by_r = "(fp.div r ((_ to_fp 8 24) RNE 1.0) ((_ to_fp 8 24) RNE 3.0))";
+    for (body, want) in [
+        // One variable is one mode; two may be two.
+        (
+            "(assert (not (= (fp.add r a b) (fp.add r b a))))".to_string(),
+            "unsat",
+        ),
+        (
+            "(assert (not (= (fp.add r a b) (fp.add q a b))))".to_string(),
+            "sat",
+        ),
+        (
+            "(assert (= r q))(assert (not (= (fp.add r a b) (fp.add q a b))))".to_string(),
+            "unsat",
+        ),
+        // The nearest float to a third is above it: only rounding down gives less.
+        (
+            format!("(assert (fp.lt {by_r} {third}))(assert (not (or (= r RTZ) (= r RTN))))"),
+            "unsat",
+        ),
+        (format!("(assert (fp.lt {by_r} {third}))"), "sat"),
+        (format!("(assert (fp.gt {by_r} {third}))"), "unsat"),
+        // Five modes, no sixth.
+        (
+            "(declare-const c RoundingMode)(declare-const d RoundingMode)\
+             (declare-const e RoundingMode)(assert (distinct r q c d e))"
+                .to_string(),
+            "sat",
+        ),
+        (
+            "(declare-const c RoundingMode)(declare-const d RoundingMode)\
+             (declare-const e RoundingMode)(declare-const f RoundingMode)\
+             (assert (distinct r q c d e f))"
+                .to_string(),
+            "unsat",
+        ),
+        // Through an indexed conversion, and through a `let`.
+        (
+            "(assert (= a ((_ to_fp 8 24) RNE 2.5)))(assert (= ((_ fp.to_ubv 8) r a) #x03))\
+             (assert (not (or (= r RTP) (= r RNA))))"
+                .to_string(),
+            "unsat",
+        ),
+        (
+            "(assert (let ((m r)) (not (= (fp.mul m a b) (fp.mul r a b)))))".to_string(),
+            "unsat",
+        ),
+    ] {
+        assert_eq!(
+            session(&format!("{d}{body}(check-sat)")),
+            format!("{want}\n"),
+            "{body}"
+        );
+    }
+    // A model names the mode.
+    assert_eq!(
+        session(&format!(
+            "{d}(assert (fp.lt {by_r} {third}))(assert (not (= r RTZ)))(check-sat)(get-value (r))"
+        )),
+        "sat\n((r RTN))\n"
+    );
+}
+
+/// Quantifiers: an asserted `exists` or a denied `forall` has a witness of any width, and
+/// one anywhere else is read once for each value of a small domain. The answers are z3's.
+#[test]
+fn quantifiers_are_witnessed_or_expanded() {
+    let header = "(set-logic BV)
+        (declare-const x (_ BitVec 8)) (declare-const y (_ BitVec 8))
+        (declare-const u (_ BitVec 64))";
+    let cases: &[(&str, &str)] = &[
+        (
+            "(assert (forall ((z (_ BitVec 8))) (= (bvand z x) #x00))) (assert (not (= x #x00))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (exists ((z (_ BitVec 8))) (= (bvmul z #x02) (bvor x #x01)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (exists ((z (_ BitVec 8))) (= (bvmul z #x03) x))) (assert (= x #x07)) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (forall ((z (_ BitVec 8))) (= (bvand z x) (bvand x z)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (not (forall ((z (_ BitVec 64))) (= (bvmul z u) z)))) (assert (= u #x0000000000000001)) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (forall ((z (_ BitVec 64))) (= (bvmul z u) z)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (exists ((z (_ BitVec 64))) (and (= (bvadd z z) u) (= ((_ extract 0 0) u) #b1)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (forall ((z (_ BitVec 4))) (exists ((t (_ BitVec 4))) (= (bvadd z t) #x0)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (exists ((t (_ BitVec 4))) (forall ((z (_ BitVec 4))) (= (bvadd z t) #x0)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (or (= x #x01) (forall ((z (_ BitVec 8))) (bvule z x)))) (assert (distinct x #x01)) (assert (distinct x #xff)) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (or (= x #x01) (forall ((z (_ BitVec 8))) (bvule z x)))) (assert (distinct x #x01)) (check-sat) (get-value (x))",
+            "sat ((x #xff))",
+        ),
+        (
+            "(assert (forall ((b Bool) (z (_ BitVec 4))) (=> b (= (bvxor z z) #x0)))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (exists ((a (_ BitVec 64)) (b (_ BitVec 64))) (and (= (bvadd a b) u) (= (bvsub a b) #x0000000000000004)))) (assert (= u #x0000000000000007)) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (exists ((z (_ BitVec 8))) (let ((q (bvadd z #x01))) (and (= q x) (bvult q z))))) (check-sat) (get-value (x))",
+            "sat ((x #x00))",
+        ),
+        (
+            "(assert (forall ((z (_ BitVec 8))) (! (= (bvor z x) z) :pattern ((bvor z x))))) (assert (distinct x #x00)) (check-sat)",
+            "unsat",
+        ),
+    ];
+    let cfg = crate::solve::Config::default();
+    for (body, expected) in cases {
+        let mut out = String::new();
+        run(
+            &mut Context::new(),
+            &format!("{header}{body}"),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>().join(" "),
+            *expected,
+            "{body}"
+        );
+    }
+    // A wide domain that needs every value is refused, not guessed.
+    let err = crate::smtlib::import(
+        &mut Context::new(),
+        "(declare-const u (_ BitVec 64))
+         (assert (forall ((z (_ BitVec 64))) (= (bvand z u) #x0000000000000000)))",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("quantifier"), "{err}");
+}
+
+/// What z3 prints for the divisions in `bit_vectors_above_512_bits_are_read_as_limbs`.
+const WIDE_DIVISIONS: &str = "sat (((bvurem a b) #x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000061d9)  ((bvsrem a b) #xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff28098)  ((bvsmod a b) #x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001c2db)  ((bvudiv a (_ bv0 520)) #xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)  (((_ extract 31 0) (bvudiv a b)) #x6fb6191a)  (((_ extract 31 0) (bvsdiv a b)) #xc8c55945))";
+
+/// Bit-vectors above 512 bits are read as limbs: the operators that are limb by limb, a chain
+/// of carries or a choice of limbs. The answers and the values are z3's.
+#[test]
+fn bit_vectors_above_512_bits_are_read_as_limbs() {
+    let header = "(set-logic QF_BV)
+        (declare-const x (_ BitVec 600)) (declare-const y (_ BitVec 600))";
+    let cases: &[(&str, &str)] = &[
+        (
+            "(assert (= (bvlshr x (_ bv599 600)) (_ bv1 600))) (assert (= ((_ extract 7 0) x) #x5a))",
+            "sat",
+        ),
+        ("(assert (bvult x y)) (assert (bvslt y x))", "sat"),
+        (
+            "(assert (= (bvadd x y) (_ bv12345678901234567890123456789012345678901234567890 600))) (assert (= x (bvmul y (_ bv3 600))))",
+            "unsat",
+        ),
+        ("(assert (not (= (bvadd x y) (bvadd y x))))", "unsat"),
+        (
+            "(assert (not (= (concat ((_ extract 599 300) x) ((_ extract 299 0) x)) x)))",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (bvadd (bvxor x y) (bvshl (bvand x y) (_ bv1 600))) (bvadd x y))))",
+            "unsat",
+        ),
+        ("(assert (bvult x y)) (assert (bvult y x))", "unsat"),
+        (
+            "(assert (not (= (bvshl x (_ bv3 600)) (bvmul x (_ bv8 600)))))",
+            "unsat",
+        ),
+        (
+            "(assert (bvslt x (_ bv0 600))) (assert (= ((_ extract 599 599) x) #b0))",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (bvsub x y) (bvadd x (bvneg y)))))",
+            "unsat",
+        ),
+        ("(assert (= (bvadd x x) (_ bv1 600)))", "unsat"),
+    ];
+    let cfg = crate::solve::Config::default();
+    for (body, expected) in cases {
+        let mut out = String::new();
+        run(
+            &mut Context::new(),
+            &format!("{header}{body}(check-sat)"),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.trim(), *expected, "{body}");
+    }
+    // Every operator at values: what z3 prints.
+    let script = "(set-logic QF_BV) (declare-const x (_ BitVec 600)) (declare-const y (_ BitVec 600)) (declare-const s (_ BitVec 600)) (assert (= x ((_ repeat 75) #xa7))) (assert (= y (concat ((_ repeat 37) #x3c5e) #x12))) (assert (= s (_ bv77 600))) (check-sat) (get-value ((bvadd x y) (bvsub x y) (bvmul x y) (bvneg x) (bvshl x y) (bvlshr x s) (bvashr x s) (bvult x y) (bvsle x y) ((_ extract 598 3) x) ((_ extract 700 250) (concat x y)) ((_ sign_extend 300) x) ((_ rotate_left 131) x) (ite (bvult x y) (bvadd x x) (bvxor x y)) ((_ extract 63 0) (bvmul x (bvadd y y))) (bvcomp x y) (bvxnor x y)))";
+    let expected = "sat (((bvadd x y) #xe405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405e405b9)  ((bvsub x y) #x6b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b496b4995)  ((bvmul x y) #x43e269078e2cb351d876fd9c22c147e66d0b9230b755dc7b01a026c54bea710f9634bb59e07f05a42ac94fee75139a38bf5de48309a82ecd53f279179e3cc361e8870dac32d157f67d1bbe)  ((bvneg x) #x585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585859)  ((bvshl x y) #x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000)  ((bvlshr x s) #x000000000000000000053d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d)  ((bvashr x s) #xfffffffffffffffffffd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d)  ((bvult x y) false)  ((bvsle x y) true)  (((_ extract 598 3) x) #x4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4)  (((_ extract 700 250) (concat x y)) #b0011110100111101001111010011110100111101001111010011110100111101001111010011110100111101001111010011100111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111100011110001011110001111000101111000111100010111)  (((_ sign_extend 300) x) #xfffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7)  (((_ rotate_left 131) x) #x3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d)  ((ite (bvult x y) (bvadd x x) (bvxor x y)) #x9bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf99bf9b5)  (((_ extract 63 0) (bvmul x (bvadd y y))) #x5865a2afecfa377c)  ((bvcomp x y) #b0)  ((bvxnor x y) #x64066406640664066406640664066406640664066406640664066406640664066406640664066406640664066406640664066406640664066406640664066406640664066406640664064a))";
+    let mut out = String::new();
+    run(&mut Context::new(), script, &cfg, &mut out).unwrap();
+    let squeeze = |s: &str| s.split_whitespace().collect::<String>();
+    assert_eq!(squeeze(&out), squeeze(expected));
+    // Divisions, by the schoolbook: quotient and remainder of values, a divisor of zero,
+    // and the signed ones (the values are z3's).
+    let script = "(declare-const a (_ BitVec 520)) (declare-const b (_ BitVec 520))
+        (assert (= a (concat #xf1 ((_ repeat 64) #xa7)))) (assert (= b (_ bv1000003 520)))
+        (check-sat)
+        (get-value ((bvurem a b) (bvsrem a b) (bvsmod a b) (bvudiv a (_ bv0 520))
+                    ((_ extract 31 0) (bvudiv a b)) ((_ extract 31 0) (bvsdiv a b))))";
+    let mut out = String::new();
+    run(&mut Context::new(), script, &cfg, &mut out).unwrap();
+    assert_eq!(squeeze(&out), squeeze(WIDE_DIVISIONS), "{out}");
+}
+
+/// A rounding mode chosen by a condition, as an operand and compared. The answers are z3's.
+#[test]
+fn rounding_modes_are_chosen_by_conditions() {
+    let header = "(set-logic QF_BVFP)
+        (declare-const a Float32) (declare-const b Float32)
+        (declare-const r RoundingMode) (declare-const q RoundingMode)
+        (declare-const c Bool) (declare-const x (_ BitVec 32))";
+    let cases: &[(&str, &str)] = &[
+        (
+            "(assert (not (= (fp.add (ite c RTP RTN) a b) (ite c (fp.add RTP a b) (fp.add RTN a b))))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= (ite c RTP RTN) RTP)) (assert (not c)) (check-sat)",
+            "unsat",
+        ),
+        ("(assert (= (ite c RTP r) RTN)) (check-sat)", "sat"),
+        (
+            "(assert (not (= (fp.mul (ite c r RTZ) a b) (ite c (fp.mul r a b) (fp.mul RTZ a b))))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= (fp.sqrt (ite c (ite (= x #x00000001) RNA r) q) a) (fp.sqrt (ite c (ite (= x #x00000001) RNA r) q) a)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (distinct (fp.div (ite c RTP RTN) a b) (fp.div RTN a b))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (not (= ((_ to_fp 8 24) (ite c RTP RTN) x) (ite c ((_ to_fp 8 24) RTP x) ((_ to_fp 8 24) RTN x))))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (distinct ((_ fp.to_ubv 8) (ite c RTP RTN) a) ((_ fp.to_ubv 8) RTN a))) (assert (fp.lt a ((_ to_fp 8 24) RNE 3.0))) (assert (fp.gt a ((_ to_fp 8 24) RNE 2.0))) (check-sat)",
+            "sat",
+        ),
+        (
+            "(assert (distinct (fp.div (ite c RTP RTN) a b) (fp.div RTN a b))) (assert (not c)) (check-sat)",
+            "unsat",
+        ),
+    ];
+    let cfg = crate::solve::Config::default();
+    for (body, expected) in cases {
+        let mut out = String::new();
+        run(
+            &mut Context::new(),
+            &format!("{header}{body}"),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.trim(), *expected, "{body}");
+    }
+}
+
+/// Integers where bit-vectors bound them: `bv2nat`, numerals, arithmetic, quotients and
+/// remainders by constants, comparisons, `int2bv`. The answers and values are z3's (which
+/// does not answer the two identities within a minute; they are unsatisfiable).
+#[test]
+fn integers_are_read_where_bit_vectors_bound_them() {
+    let header = "(set-logic ALL)
+        (declare-const x (_ BitVec 8)) (declare-const y (_ BitVec 8))
+        (declare-const w (_ BitVec 32))";
+    let cases: &[(&str, &str)] = &[
+        ("(assert (>= (bv2nat x) 256)) (check-sat)", "unsat"),
+        (
+            "(assert (= (+ (bv2nat x) (bv2nat y)) 300)) (assert (= x #xc8)) (check-sat) (get-value ((bv2nat y) (- (bv2nat x) (bv2nat y)) (* (bv2nat x) (bv2nat y))))",
+            "sat (((bv2nat y) 100) ((- (bv2nat x) (bv2nat y)) 100) ((* (bv2nat x) (bv2nat y)) 20000))",
+        ),
+        (
+            "(assert (not (= ((_ int2bv 8) (mod (+ (bv2nat x) (bv2nat y)) 256)) (bvadd x y)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (not (= ((_ int2bv 8) (bv2nat x)) x))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (= x #xf7)) (check-sat) (get-value ((div (bv2nat x) 10) (mod (bv2nat x) 10) (div (- (bv2nat x)) 10) (mod (- (bv2nat x)) 10) (div (bv2nat x) (- 7)) (mod (bv2nat x) (- 7)) (abs (- 5 (bv2nat x)))))",
+            "sat (((div (bv2nat x) 10) 24) ((mod (bv2nat x) 10) 7) ((div (- (bv2nat x)) 10) (- 25)) ((mod (- (bv2nat x)) 10) 3) ((div (bv2nat x) (- 7)) (- 35)) ((mod (bv2nat x) (- 7)) 2) ((abs (- 5 (bv2nat x))) 242))",
+        ),
+        (
+            "(assert (not (= ((_ int2bv 8) (div (* (bv2nat x) (bv2nat y)) 256)) ((_ extract 15 8) (bvmul ((_ zero_extend 8) x) ((_ zero_extend 8) y)))))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(assert (< 3 (bv2nat x) (bv2nat y) 6)) (check-sat) (get-value (x y))",
+            "sat ((x #x04) (y #x05))",
+        ),
+        (
+            "(assert (distinct (bv2nat x) (bv2nat y) 0 255)) (assert (bvult x #x02)) (assert (bvugt y #xfd)) (check-sat) (get-value (x y))",
+            "sat ((x #x01) (y #xfe))",
+        ),
+        (
+            "(assert (= (ite (bvult x y) (bv2nat x) (- (bv2nat y))) (- 200))) (check-sat) (get-value (y))",
+            "sat ((y #xc8))",
+        ),
+        (
+            "(assert (= (* (bv2nat w) (bv2nat w)) 18446744065119617025)) (check-sat) (get-value (w))",
+            "sat ((w #xffffffff))",
+        ),
+        (
+            "(assert (not (= ((_ int2bv 8) (- (bv2nat x))) (bvneg x)))) (check-sat)",
+            "unsat",
+        ),
+        (
+            "(define-fun n ((a (_ BitVec 8))) Int (+ (bv2nat a) 1)) (assert (let ((k (n x))) (and (> k 250) (= (mod k 2) 0)))) (check-sat) (get-value ((n x)))",
+            "sat (((n x) 256))",
+        ),
+        (
+            "(assert (= (mod (bv2nat x) 2) 1)) (assert (= ((_ extract 0 0) x) #b0)) (check-sat)",
+            "unsat",
+        ),
+    ];
+    let cfg = crate::solve::Config::default();
+    let squeeze = |s: &str| s.split_whitespace().collect::<String>();
+    for (body, expected) in cases {
+        let mut out = String::new();
+        run(
+            &mut Context::new(),
+            &format!("{header}{body}"),
+            &cfg,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(squeeze(&out), squeeze(expected), "{body}");
+    }
+    // An integer variable has no range, and a division by an unknown no meaning to give.
+    for (script, why) in [
+        ("(declare-const i Int)", "a variable of sort Int"),
+        (
+            "(declare-const x (_ BitVec 8)) (assert (= (div 7 (bv2nat x)) 1))",
+            "by anything but a constant",
+        ),
+    ] {
+        let mut out = String::new();
+        run(&mut Context::new(), script, &cfg, &mut out).unwrap();
+        assert!(out.contains(why), "{out}");
+    }
 }

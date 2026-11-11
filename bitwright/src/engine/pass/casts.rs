@@ -83,7 +83,7 @@ fn live_slice(
         return Ok(None);
     }
     super::refresh_uses(r, cx)?;
-    Ok(r.live.uses(e).is_some_and(|u| u > 0).then_some(e))
+    Ok(r.life.live.uses(e).is_some_and(|u| u > 0).then_some(e))
 }
 
 /// Whether the low `lo` bits of `i` are known zero (so a sum or product with it carries
@@ -249,7 +249,7 @@ pub(super) fn live_word(r: &mut Runner<'_, '_>, cx: &Context, x: u32) -> Result<
         return Ok(None);
     };
     super::refresh_uses(r, cx)?;
-    Ok(r.live.uses(e).is_some_and(|u| u > 0).then_some(e))
+    Ok(r.life.live.uses(e).is_some_and(|u| u > 0).then_some(e))
 }
 
 /// `extract<lo, n>(x)`, narrowed as far as the rules above allow.
@@ -836,7 +836,7 @@ impl Hoist {
             return Ok(false);
         };
         super::refresh_uses(r, cx)?;
-        Ok(r.live.uses(s).is_some_and(|u| u > 0))
+        Ok(r.life.live.uses(s).is_some_and(|u| u > 0))
     }
 
     /// A `select` on the condition that exists, that something live reads, and whose two
@@ -887,7 +887,7 @@ impl Hoist {
             let word = crate::expr::Node::new(OpCode::Select, w, self.c, p, q);
             if let Some(s) = cx.find(&word).filter(|&s| s != self.n) {
                 super::refresh_uses(r, cx)?;
-                if r.live.uses(s).is_some_and(|u| u > 0) {
+                if r.life.live.uses(s).is_some_and(|u| u > 0) {
                     return Ok(Some((s, o)));
                 }
             }

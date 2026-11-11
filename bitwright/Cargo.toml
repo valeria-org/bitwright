@@ -21,14 +21,14 @@ all-features = true
 hashbrown = { version = "0.17", default-features = false }
 
 [features]
-default = ["check"]
+default = ["check", "mba", "smtlib", "eqsat"]
 ## The rule soundness checker (`bitwright::check`); it proves rules with the native prover.
 check = ["prove"]
 ## The native prover (`bitwright::prove`): bit-blasting, a CDCL SAT solver, DRUP certificates.
 prove = []
 ## The MBA service (`bitwright::mba`, `Phase::Mba`) with the native signature solver.
 mba = []
-## The equality-saturation search service (`bitwright::eqsat`), default off.
+## The equality-saturation search service (`bitwright::eqsat`).
 eqsat = []
 ## SMT-LIB 2.6 export of expressions and rule obligations, and import of a QF_BV subset.
 smtlib = []

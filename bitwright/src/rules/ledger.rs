@@ -72,10 +72,32 @@ impl Ledger {
         out
     }
 
-    /// Whether the ledger vouches for this rule (same content hash).
+    /// Whether the ledger vouches for this rule: an entry of the rule's content hash, under
+    /// its name or any other. The hash is of the normalized rule (its sides, guard and
+    /// widths: no names, positions or docs), so the same rule in another file or group, or
+    /// renamed, was checked when any spelling of it was.
     pub fn vouches_for(&self, name: &str, id: RuleId) -> bool {
-        self.entries
-            .get(name)
-            .is_some_and(|(i, _, _)| *i == id.to_string())
+        let id = id.to_string();
+        (self.entries.get(name)).is_some_and(|(i, _, _)| *i == id)
+            || self.vouches_for_content_text(&id)
+    }
+
+    /// Whether some entry is of this content hash.
+    pub fn vouches_for_content(&self, id: RuleId) -> bool {
+        self.vouches_for_content_text(&id.to_string())
+    }
+
+    fn vouches_for_content_text(&self, id: &str) -> bool {
+        self.entries.values().any(|(i, _, _)| i == id)
+    }
+
+    /// Adds the entries of `other` (ledgers of two rule files as one). An entry of the same
+    /// name stays this ledger's.
+    pub fn merge(&mut self, other: &Ledger) {
+        for (name, e) in &other.entries {
+            self.entries
+                .entry(name.clone())
+                .or_insert_with(|| e.clone());
+        }
     }
 }

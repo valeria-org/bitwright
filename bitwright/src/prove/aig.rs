@@ -5,7 +5,7 @@
 
 use crate::hash::IdMap;
 
-use super::sat::{Lit, Solver};
+use super::sat::{Backend, Lit, Solver};
 
 /// An AIG literal: `2·node` (the node's value) or `2·node + 1` (its negation). Node 0 is the
 /// constant false.
@@ -622,6 +622,10 @@ pub struct Cnf {
     pub clauses: Vec<Vec<Lit>>,
     keep: bool,
     emitted: usize,
+    /// Scratch of [`extend`](Self::extend), per node and zero between calls: the uses of a
+    /// node within the cone being encoded, and whether it needs a variable.
+    uses: Vec<u32>,
+    need: Vec<bool>,
 }
 
 const NONE: u32 = u32::MAX;
@@ -654,24 +658,77 @@ impl Cnf {
         keep: bool,
         xor3: bool,
     ) -> Cnf {
+        let mut cnf = Cnf::empty(keep);
+        cnf.extend(aig, roots, solver, xor3);
+        cnf
+    }
+
+    /// An encoding of nothing yet (see [`extend`](Self::extend)).
+    pub(super) fn empty(keep: bool) -> Cnf {
+        Cnf {
+            var: Vec::new(),
+            clauses: Vec::new(),
+            keep,
+            emitted: 0,
+            uses: Vec::new(),
+            need: Vec::new(),
+        }
+    }
+
+    /// Clauses for every gate `roots` reach that has none yet, added to `solver`: the
+    /// encoding grows with the graph, at the cost of what is new. A node encoded before is
+    /// an input of what is encoded now (its variable is its meaning), so the gates chosen for
+    /// one call's cone are chosen as for a graph that ended there.
+    pub(super) fn extend<S: Backend + ?Sized>(
+        &mut self,
+        aig: &Aig,
+        roots: &[L],
+        solver: &mut S,
+        xor3: bool,
+    ) {
         let n = aig.nodes.len();
+        self.var.resize(n, NONE);
+        self.uses.resize(n, 0);
+        self.need.resize(n, false);
+        // The cone: the nodes without a variable that the roots reach through such nodes,
+        // highest first (a node comes after its operands).
+        let mut cone: Vec<u32> = Vec::new();
+        {
+            let mut stack: Vec<u32> = roots.iter().map(|r| r >> 1).collect();
+            while let Some(i) = stack.pop() {
+                // `need` marks the visited here; it is reset below, before its own use.
+                if self.var[i as usize] != NONE || self.need[i as usize] {
+                    continue;
+                }
+                self.need[i as usize] = true;
+                cone.push(i);
+                if let Node::And(a, b) = aig.nodes[i as usize] {
+                    stack.extend([a >> 1, b >> 1]);
+                }
+            }
+            for &i in &cone {
+                self.need[i as usize] = false;
+            }
+            cone.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        let var = &self.var;
+        let (uses, need) = (&mut self.uses, &mut self.need);
         // Uses of each node within the cone (a root counts as a use, so it keeps its
-        // variable): nodes come after their operands, so one pass down from the top counts them.
-        let mut uses = vec![0u32; n];
+        // variable): one pass down from the top counts them.
         for &r in roots {
             uses[(r >> 1) as usize] += 2;
         }
-        for i in (1..n).rev() {
-            if uses[i] > 0
-                && let Node::And(a, b) = aig.nodes[i]
-            {
+        for &i in &cone {
+            if let Node::And(a, b) = aig.nodes[i as usize] {
                 uses[(a >> 1) as usize] += 1;
                 uses[(b >> 1) as usize] += 1;
             }
         }
+        let uses = &*uses;
         let private_inner = |l: L| -> Option<(L, L)> {
-            match aig.nodes[(l >> 1) as usize] {
-                Node::And(a, b) if uses[(l >> 1) as usize] == 1 => Some((a, b)),
+            let at = (l >> 1) as usize;
+            match aig.nodes[at] {
+                Node::And(a, b) if uses[at] == 1 && var[at] == NONE => Some((a, b)),
                 _ => None,
             }
         };
@@ -680,8 +737,11 @@ impl Cnf {
         // selected gates still set `need`, so genuinely observed internals retain
         // their own variables and definitions.
         let inner = |l: L| -> Option<(L, L)> {
-            match aig.nodes[(l >> 1) as usize] {
-                Node::And(a, b) => Some((a, b)),
+            let at = (l >> 1) as usize;
+            match aig.nodes[at] {
+                // (Not through a node encoded before: its operands may have no variable of
+                // their own, and it is an input here.)
+                Node::And(a, b) if var[at] == NONE => Some((a, b)),
                 _ => None,
             }
         };
@@ -738,14 +798,14 @@ impl Cnf {
         let special = |a, b| gate2(a, b).or_else(|| majority(a, b));
         // Which nodes get a variable, and how each is encoded: from the top down, a node's
         // users are decided before it.
-        let mut need = vec![false; n];
         for &r in roots {
             need[(r >> 1) as usize] = true;
         }
         let mut gates: Vec<(u32, Gate)> = Vec::new();
         let mut leaves: Vec<L> = Vec::new();
         let mut stack = Vec::new();
-        for i in (1..n).rev() {
+        for &i in &cone {
+            let i = i as usize;
             if !need[i] {
                 continue;
             }
@@ -799,16 +859,30 @@ impl Cnf {
             }
             gates.push((i as u32, gate));
         }
-        let mut cnf = Cnf {
-            var: vec![NONE; n],
-            clauses: Vec::new(),
-            keep,
-            emitted: 0,
-        };
-        for (i, _) in need.iter().enumerate().filter(|(_, n)| **n) {
-            cnf.var[i] = solver.new_var();
+        // The variables, lowest node first; then the scratch is zero again: what was
+        // touched is the cone, its operands and the roots.
+        let new: Vec<u32> = (cone.iter().rev().copied())
+            .filter(|&i| need[i as usize])
+            .collect();
+        for &i in &cone {
+            if let Node::And(a, b) = aig.nodes[i as usize] {
+                for l in [a, b] {
+                    self.uses[(l >> 1) as usize] = 0;
+                    self.need[(l >> 1) as usize] = false;
+                }
+            }
+            self.uses[i as usize] = 0;
+            self.need[i as usize] = false;
         }
-        if need[0] {
+        for &r in roots {
+            self.uses[(r >> 1) as usize] = 0;
+            self.need[(r >> 1) as usize] = false;
+        }
+        for &i in &new {
+            self.var[i as usize] = solver.new_var();
+        }
+        let cnf = self;
+        if new.first() == Some(&0) {
             let f = cnf.lit(FALSE);
             cnf.push(solver, &[!f]);
         }
@@ -872,7 +946,6 @@ impl Cnf {
                 }
             }
         }
-        cnf
     }
 
     /// The number of clauses given to the solver.
@@ -880,7 +953,7 @@ impl Cnf {
         self.emitted
     }
 
-    fn push(&mut self, solver: &mut Solver, c: &[Lit]) {
+    fn push<S: Backend + ?Sized>(&mut self, solver: &mut S, c: &[Lit]) {
         self.emitted += 1;
         if self.keep {
             self.clauses.push(c.to_vec());

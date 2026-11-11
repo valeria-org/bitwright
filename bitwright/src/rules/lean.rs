@@ -15,9 +15,11 @@
 //! that shares nothing with bitwright.
 //!
 //! Division follows SMT-LIB (`x / 0` is all ones: `BitVec.smtUDiv`, `BitVec.smtSDiv`), as
-//! bitwright's operators do. Operators Lean's core `BitVec` does not have (bit counts, byte
-//! swaps, bit reversal, `pdep`, `pext`, floating point) leave the rule out, with a comment
-//! saying so.
+//! bitwright's operators do; the counts are `BitVec.clz`, `BitVec.ctz` and `BitVec.cpop`
+//! (Lean 4.29), as wide as their operand like bitwright's. Operators Lean's core `BitVec` does
+//! not have (byte swaps, `pdep`, `pext`, floating point) leave the rule out, with a comment
+//! saying so, and so does a population count in an instance for `bv_decide`, which does not
+//! read one yet.
 
 use core::fmt::Write as _;
 
@@ -225,7 +227,14 @@ impl Out<'_> {
                 match op {
                     UnOp::Not => format!("(~~~{a})"),
                     UnOp::Neg => format!("(-{a})"),
-                    _ => self.no("a bit count, byte swap or bit reversal"),
+                    // Counts as wide as their operand, the width for zero: as bitwright's.
+                    // (Stated for every width; `bv_decide` does not read it yet, so an
+                    // instance it is to prove is left out.)
+                    UnOp::Popcnt if self.vals.is_none() => format!("({a}.cpop)"),
+                    UnOp::Popcnt => self.no("a bit count"),
+                    UnOp::Clz => format!("({a}.clz)"),
+                    UnOp::Ctz => format!("({a}.ctz)"),
+                    _ => self.no("a byte swap"),
                 }
             }
             RNode::Bin(op, a, b) => {

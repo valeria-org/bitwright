@@ -306,7 +306,7 @@ fn bitwise_op(op: OpCode) -> bool {
 fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop> {
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.bitwise.contains_key(&i) {
+        if r.bitwise.info.contains_key(&i) {
             continue;
         }
         let node = cx.node(i);
@@ -318,20 +318,23 @@ fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop
             }
         };
         if !bitwise_op(node.op) {
-            r.bitwise.insert(i, leaf(i));
+            r.bitwise.info.insert(i, leaf(i));
             continue;
         }
         if !expanded {
             stack.push((i, true));
             for c in node.children() {
-                if !r.bitwise.contains_key(&c) {
+                if !r.bitwise.info.contains_key(&c) {
                     stack.push((c, false));
                 }
             }
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        let kids: Vec<Info> = node.children().map(|c| r.bitwise[&c].clone()).collect();
+        let kids: Vec<Info> = node
+            .children()
+            .map(|c| r.bitwise.info[&c].clone())
+            .collect();
         let info = if kids.iter().any(Option::is_none) {
             None
         } else {
@@ -366,9 +369,9 @@ fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop
         } else {
             info
         };
-        r.bitwise.insert(i, info);
+        r.bitwise.info.insert(i, info);
     }
-    Ok(r.bitwise[&root].clone())
+    Ok(r.bitwise.info[&root].clone())
 }
 
 /// Table `tt` with its variables `a < b` exchanged (a delta swap of the entries that differ).
@@ -478,10 +481,10 @@ fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
     if !bitwise_op(cx.node(i).op) {
         return Some(wide_leaf(cx, i));
     }
-    if let Some(&w) = r.bitwise_wide.get(&i) {
+    if let Some(&w) = r.bitwise.wide.get(&i) {
         return Some(w);
     }
-    match r.bitwise.get(&i) {
+    match r.bitwise.info.get(&i) {
         Some(Some((atoms, tt)))
             if atoms[..] != [i] && atoms.iter().all(|&a| !bitwise_op(cx.node(a).op)) =>
         {
@@ -505,7 +508,7 @@ fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop
     }
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
-        if r.bitwise_wide.contains_key(&i) {
+        if r.bitwise.wide.contains_key(&i) {
             continue;
         }
         let node = cx.node(i);
@@ -526,9 +529,9 @@ fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop
         } else {
             known(node.b)
         };
-        r.bitwise_wide.insert(i, wide_op(cx, i, a, b));
+        r.bitwise.wide.insert(i, wide_op(cx, i, a, b));
     }
-    Ok(r.bitwise_wide[&root])
+    Ok(r.bitwise.wide[&root])
 }
 
 /// Builds the minimum form of `tt` over `atoms` (in the order the table's variables use).
@@ -579,9 +582,20 @@ pub(crate) struct Masked {
     ops: u32,
 }
 
+impl Masked {
+    /// The atoms, and each class of bit positions with the first root's table there.
+    pub(crate) fn atoms_classes(&self) -> (&[u32], impl Iterator<Item = (&BitVec, u8)>) {
+        (&self.atoms, self.classes.iter().map(|(m, t)| (m, t[0])))
+    }
+}
+
 /// The masked description of `roots` (of one width), if their bitwise region below has at most
 /// three atoms and [`MAX_MASKS`] constants.
-fn masked(r: &mut Runner<'_, '_>, cx: &Context, roots: &[u32]) -> Result<Option<Masked>, Stop> {
+pub(in crate::engine) fn masked(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    roots: &[u32],
+) -> Result<Option<Masked>, Stop> {
     /// A region node: an atom (its index), a constant (its index), or an operator over slots.
     #[derive(Clone, Copy)]
     enum Slot {
@@ -628,7 +642,7 @@ fn masked(r: &mut Runner<'_, '_>, cx: &Context, roots: &[u32]) -> Result<Option<
             continue;
         }
         visits += 1;
-        if visits > MAX_MASKED_REGION || r.bitwise_beyond.contains_key(&i) {
+        if visits > MAX_MASKED_REGION || r.bitwise.beyond.contains_key(&i) {
             break true;
         }
         if !bitwise_op(node.op) {
@@ -660,7 +674,7 @@ fn masked(r: &mut Runner<'_, '_>, cx: &Context, roots: &[u32]) -> Result<Option<
     if beyond {
         // So are the regions above a lone root (they contain its region).
         if let [n] = roots {
-            r.bitwise_beyond.insert(*n, ());
+            r.bitwise.beyond.insert(*n, ());
         }
         r.meter.charge(Counter::PassWork, visits as u64)?;
         return Ok(None);
@@ -688,7 +702,7 @@ fn masked(r: &mut Runner<'_, '_>, cx: &Context, roots: &[u32]) -> Result<Option<
     }
     if splits.len() > MAX_MASKS {
         if let [n] = roots {
-            r.bitwise_beyond.insert(*n, ());
+            r.bitwise.beyond.insert(*n, ());
         }
         return Ok(None);
     }
@@ -1429,4 +1443,16 @@ mod tests {
             assert_eq!(p.tt, tt, "{to:?}");
         }
     }
+}
+
+/// The pass's state for a call.
+#[derive(Default)]
+pub(crate) struct State {
+    /// The bitwise pass's truth tables, per node.
+    pub(crate) info: crate::hash::IdMap<u32, Info>,
+    /// The bitwise pass's tables over up to six atoms, per node (read where three hide some).
+    pub(crate) wide: crate::hash::IdMap<u32, Wide>,
+    /// Nodes whose bitwise region is beyond the bitwise pass's reading with constants (see
+    /// `pass::bitwise`): so is every region above them.
+    pub(crate) beyond: crate::hash::IdMap<u32, ()>,
 }

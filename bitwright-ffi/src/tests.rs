@@ -87,6 +87,7 @@ fn the_header_declares_every_entry_point_and_matches_the_tables() {
     let source = [
         include_str!("lib.rs"),
         include_str!("more.rs"),
+        include_str!("solver.rs"),
         include_str!("compiler.rs"),
     ]
     .concat();
@@ -2268,5 +2269,74 @@ mod compiler {
             assert!(!bw_lowering_get(null(), 0, &mut e));
             assert_eq!(bw_lowering_input_count(null()), 0);
         }
+    }
+}
+
+#[test]
+fn the_solver_checks_scopes_values_and_cores() {
+    use crate::solver::*;
+    let cx = Cx::new();
+    let s = bw_solver_new();
+    let (a, b) = (cx.parse("x * 3 == y", 16), cx.parse("y <u 10", 16));
+    let (c, d) = (cx.parse("x >u 0x8000", 16), cx.parse("y == 0", 16));
+    let (x, y) = (cx.sym("x", 16), cx.sym("y", 16));
+    let mut answer = -1;
+    unsafe {
+        let mut at = 99;
+        assert_eq!(bw_solver_assert(s, cx.0, a, &mut at), BW_OK);
+        assert_eq!(at, 0);
+        assert_eq!(bw_solver_assert(s, cx.0, b, null_mut()), BW_OK);
+        // A wide assertion, a NULL solver and a handle of another context are errors.
+        assert_eq!(bw_solver_assert(s, cx.0, x, null_mut()), BW_ERR_UNSUPPORTED);
+        assert_eq!(
+            bw_solver_assert(null_mut(), cx.0, a, null_mut()),
+            BW_ERR_INVALID_ARGUMENT
+        );
+        let other = Cx::new();
+        let foreign = other.parse("z == 1", 16);
+        assert_ne!(bw_solver_assert(s, cx.0, foreign, null_mut()), BW_OK);
+        // Satisfiable under an assumption, with a model that satisfies it.
+        assert_eq!(bw_solver_check(s, cx.0, &c, 1, &mut answer), BW_OK);
+        assert_eq!(answer, 1);
+        let zero = BwValue {
+            width: 16,
+            limbs: [0; 8],
+        };
+        let (mut vx, mut vy) = (zero, zero);
+        assert_eq!(bw_solver_value(s, cx.0, x, &mut vx), BW_OK);
+        assert_eq!(bw_solver_value(s, cx.0, y, &mut vy), BW_OK);
+        assert_eq!(vx.limbs[0].wrapping_mul(3) & 0xffff, vy.limbs[0]);
+        assert!(vx.limbs[0] > 0x8000 && vy.limbs[0] < 10);
+        // In a scope with `y == 0`, the assumption cannot hold: the core names it and the
+        // assertions it conflicts with.
+        assert_eq!(bw_solver_push(s), BW_OK);
+        assert_eq!(bw_solver_assert(s, cx.0, d, null_mut()), BW_OK);
+        assert_eq!(bw_solver_check(s, cx.0, &c, 1, &mut answer), BW_OK);
+        assert_eq!(answer, 0);
+        assert_ne!(bw_solver_value(s, cx.0, x, &mut vx), BW_OK);
+        assert!(last_error().contains("no model"));
+        let (mut core, mut len) = ([0u32; 2], 0usize);
+        assert_eq!(
+            bw_solver_core(s, cx.0, core.as_mut_ptr(), 2, &mut len),
+            BW_OK
+        );
+        assert!((3..=4).contains(&len), "{len}");
+        assert_eq!(core[0], 0);
+        let mut whole = vec![0u32; len];
+        assert_eq!(
+            bw_solver_core(s, cx.0, whole.as_mut_ptr(), len, &mut len),
+            BW_OK
+        );
+        assert_eq!(whole.last(), Some(&0x8000_0000));
+        assert_eq!(bw_solver_core(s, cx.0, null_mut(), 0, &mut len), BW_OK);
+        // Out of the scope the assertions hold again; popping too far is an error.
+        assert_eq!(bw_solver_pop(s, 1), BW_OK);
+        assert_ne!(bw_solver_pop(s, 1), BW_OK);
+        assert_eq!(bw_solver_check(s, cx.0, null(), 0, &mut answer), BW_OK);
+        assert_eq!(answer, 1);
+        assert_ne!(bw_solver_core(s, cx.0, null_mut(), 0, &mut len), BW_OK);
+        assert_ne!(bw_solver_check(s, cx.0, null(), 0, null_mut()), BW_OK);
+        bw_solver_free(s);
+        bw_solver_free(null_mut());
     }
 }

@@ -9,8 +9,15 @@
 //! `zeroExtend` (`setWidth`), `signExtend`, `extractLsb'`, `extractLsb`, `rotateLeft`,
 //! `rotateRight`, `sshiftRight'`, `smtUDiv`, `smtSDiv`, `srem`, `ult ule slt sle`, `==`,
 //! `!=`, `BitVec.ofBool`, `BitVec.ofNat`, `BitVec.allOnes`, `intMin`, `intMax`,
-//! `if … then … else`, `bif`, `decide`, literals `5#w`, `0x1f#32`, `(5 : BitVec w)`.
-//! Anything else makes that theorem a comment saying what was not understood.
+//! `if … then … else`, `bif`, `decide`, literals `5#w`, `0x1f#32`, `(5 : BitVec w)`. A
+//! statement is an equation of bit-vector terms, or a comparison stated `= true` or `= false`.
+//! Anything else makes that theorem a comment saying what was not understood; so does a proof
+//! that is, or contains, `sorry`: such a statement is a claim, not a theorem.
+//!
+//! This reads source text, not Lean's checked environment: what it calls proved is what the
+//! file says is. A caller that needs more runs Lean on the file first (`bitwright lean-rules
+//! --verify` does), and bitwright's own rule checker on the result, which tests every rule
+//! exhaustively at small widths whatever its origin.
 
 use std::fmt::Write as _;
 
@@ -652,8 +659,23 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
                 p.describe()
             ));
         }
-        let rhs = p.binary(3)?;
-        if lhs.boolean || rhs.boolean {
+        // A comparison stated true or false is a rule too: `p = true` is `p => true`.
+        let truth = match p.peek() {
+            Some(Tok::Ident(t)) if lhs.boolean && (t == "true" || t == "false") => {
+                let t = t.clone();
+                p.at += 1;
+                Some(t)
+            }
+            _ => None,
+        };
+        let rhs = match &truth {
+            Some(t) => T {
+                text: t.clone(),
+                boolean: true,
+            },
+            None => p.binary(3)?,
+        };
+        if truth.is_none() && (lhs.boolean || rhs.boolean) {
             return Err("an equation of Booleans (write it over `BitVec.ofBool` values)".into());
         }
         if !p.eat_sym(":=") && p.peek().is_some() {
@@ -697,29 +719,80 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
         } else {
             format!("\n        if {}", hyps.join(" && "))
         };
-        let s = format!(
+        let mut s = format!(
             "    /// From Lean: `{kw} {name}`.\n    rule {name}{generics}({}){wher} {{\n        {} => {}{guard}\n    }}\n",
             params.join(", "),
             strip_outer(&lhs.text),
             strip_outer(&rhs.text)
         );
+        // A comparison stated true or false says as much of its negation, which is the
+        // form the other way round and is not rewritten to it: a rule for that one too.
+        if let Some(t) = &truth
+            && let Some(negation) = negated(&strip_outer(&lhs.text))
+        {
+            let opposite = if t == "true" { "false" } else { "true" };
+            let _ = write!(
+                s,
+                "    /// From Lean: `{kw} {name}`, of the negation.\n    rule {name}_negated{generics}({}){wher} {{\n        {negation} => {opposite}{guard}\n    }}\n",
+                params.join(", "),
+            );
+        }
         Ok(s)
     })();
-    // Skip to the next declaration.
+    // Skip to the next declaration: the proof, which must not give up.
     let mut i = p.at.max(*at + 1);
+    let mut admitted = false;
     while i < toks.len() {
-        if let Tok::Ident(k) = &toks[i]
-            && matches!(k.as_str(), "theorem" | "lemma" | "example")
-        {
-            break;
+        if let Tok::Ident(k) = &toks[i] {
+            if matches!(k.as_str(), "theorem" | "lemma" | "example") {
+                break;
+            }
+            admitted |= matches!(k.as_str(), "sorry" | "admit" | "sorryAx");
         }
         i += 1;
     }
     *at = i;
     Decl {
         name: decl_name,
-        text: r,
+        text: match r {
+            Ok(_) if admitted => Err("its proof is `sorry`: nothing was proved".into()),
+            r => r,
+        },
     }
+}
+
+/// The negation of a comparison `a op b` (its operator outside any parentheses), as the
+/// comparison it is: `a <u b` is not `b <=u a`, `a == b` is not `a != b`.
+fn negated(cmp: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let bytes = cmp.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 => {
+                for (op, other, swap) in [
+                    (" <=u ", "<u", true),
+                    (" <u ", "<=u", true),
+                    (" <=s ", "<s", true),
+                    (" <s ", "<=s", true),
+                    (" == ", "!=", false),
+                    (" != ", "==", false),
+                ] {
+                    if cmp[i..].starts_with(op) {
+                        let (a, b) = (&cmp[..i], &cmp[i + op.len()..]);
+                        return Some(if swap {
+                            format!("{b} {other} {a}")
+                        } else {
+                            format!("{a} {other} {b}")
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `(x)` as `x`.
@@ -743,7 +816,27 @@ fn strip_outer(s: &str) -> String {
     s.to_string()
 }
 
-/// Lean source as a `.bwr` program (group `lean`), with a comment for each theorem not read.
+/// Lean source as a `.bwr` program (group `lean`), with a comment for each theorem not read:
+/// see the [module](self) for what is read and what the result may be trusted for.
+///
+/// ```
+/// let lean = "
+///     theorem add_sub_cancel {w : Nat} (x y : BitVec w) : x + y - y = x := by bv_omega
+///     theorem and_or_absorb (x y : BitVec 32) : x &&& (x ||| y) = x := by bv_decide
+///     theorem wishful {w : Nat} (x : BitVec w) : x * 3 = x := by sorry";
+/// let rules = bitwright::rules::lean_import::to_bwr(lean);
+/// assert!(rules.contains("rule add_sub_cancel<W>(x: W, y: W)"));
+/// assert!(rules.contains("// wishful: not translated: its proof is `sorry`"));
+/// let program = bitwright::rules::RuleProgram::compile(&rules).unwrap();
+/// assert_eq!(program.rules().len(), 2);
+///
+/// // A comparison stated true gives a rule for it and one for its negation.
+/// let lean = "theorem umod_ult {w : Nat} (x y : BitVec w) (h : y != 0#w) :
+///     (x % y).ult y = true := by sorry_free_proof";
+/// let rules = bitwright::rules::lean_import::to_bwr(lean);
+/// assert!(rules.contains("urem(x, y) <u y => true"));
+/// assert!(rules.contains("y <=u urem(x, y) => false"));
+/// ```
 pub fn to_bwr(src: &str) -> String {
     let toks = lex(src);
     let mut at = 0;

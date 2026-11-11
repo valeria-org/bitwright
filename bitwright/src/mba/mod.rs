@@ -119,6 +119,152 @@ setters!(MbaConfig {
 /// The version of the lowering (part of every cache key).
 pub(crate) const LOWERING_VERSION: u64 = 1;
 
+/// What [`decide`] makes of two expressions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Decided {
+    /// Equal at every value (at every value the facts allow, when facts were given).
+    Equal,
+    /// Different at these values of the symbols, at which the facts hold: evaluated, not
+    /// inferred.
+    Differ(Vec<(crate::SymbolKey, crate::BitVec)>),
+    /// Not decided here.
+    Unknown,
+}
+
+/// The points [`decide`] evaluates at in search of a witness, besides the corners.
+const WITNESS_SAMPLES: u64 = 64;
+
+/// [`equal`] as a decision procedure: with facts, and with a witness.
+///
+/// `zeros` are expressions known to be zero. Where they are bitwise functions of the same
+/// parts as the two sides (the conjunction of two parts that share no bit, a part under the
+/// complement of its mask), two linear MBAs over those parts are equal under them exactly
+/// when they agree wherever the facts can hold, which is tested; other facts are only used
+/// to rule witnesses out. A difference is reported with values of the symbols at which the
+/// two sides evaluate differently and every fact is zero, looked for where every symbol is
+/// zero or all ones and at a few other points: not finding one decides nothing.
+///
+/// ```
+/// use bitwright::mba::{self, Decided, MbaBudget, MbaLimits};
+/// use bitwright::{Context, ParseOptions, Width};
+///
+/// let mut cx = Context::new();
+/// let o = ParseOptions::width(Width::W64);
+/// let (limits, budget) = (MbaLimits::default(), MbaBudget::default());
+/// // Two fields of a word, by their masks: no bit in common, so a sum is a disjunction.
+/// let (s, t) = (cx.parse("x * y", &o)?, cx.parse("z >>u 3", &o)?);
+/// let sum = cx.parse("x * y + (z >>u 3)", &o)?;
+/// let or = cx.parse("x * y | (z >>u 3)", &o)?;
+/// let overlap = cx.bin(bitwright::BinOp::And, s, t)?;
+/// assert!(matches!(mba::decide(&mut cx, sum, or, &[], &limits, &budget)?, Decided::Differ(_)));
+/// assert_eq!(mba::decide(&mut cx, sum, or, &[overlap], &limits, &budget)?, Decided::Equal);
+/// # Ok::<(), bitwright::Error>(())
+/// ```
+pub fn decide(
+    cx: &mut crate::Context,
+    a: crate::Expr,
+    b: crate::Expr,
+    zeros: &[crate::Expr],
+    limits: &MbaLimits,
+    budget: &MbaBudget,
+) -> Result<Decided, crate::Error> {
+    if a == b {
+        return Ok(Decided::Equal);
+    }
+    // For every value: the procedures, when the difference is in their fragment.
+    if matches!(equal(cx, a, b, limits, budget), Ok(Verdict::Proved)) {
+        return Ok(Decided::Equal);
+    }
+    // Under the facts: the corners they leave.
+    if !zeros.is_empty() && crate::engine::corners_equal_given(cx, a, b, zeros)? {
+        return Ok(Decided::Equal);
+    }
+    // A witness: values of the symbols, at which the facts hold and the sides differ.
+    let mut roots = vec![a, b];
+    roots.extend_from_slice(zeros);
+    let mut symbols = Vec::new();
+    for id in cx.symbols_in(&roots)? {
+        if let (Some(k), Some(w)) = (cx.symbol_key(id).cloned(), cx.symbol_width(id)) {
+            symbols.push((k, w));
+        }
+    }
+    let corners = 1u64 << symbols.len().min(10);
+    for point in 0..corners + WITNESS_SAMPLES {
+        let model: Vec<(crate::SymbolKey, crate::BitVec)> = (symbols.iter().enumerate())
+            .map(|(j, (k, w))| {
+                let v = if point < corners {
+                    if point >> (j % 10) & 1 == 1 {
+                        crate::BitVec::ones(*w)
+                    } else {
+                        crate::BitVec::zero(*w)
+                    }
+                } else {
+                    let h = crate::hash::mix64(
+                        k.structural_hash() ^ point.wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    );
+                    crate::BitVec::wrapping_from_limbs(
+                        *w,
+                        &[h, h.rotate_left(17), !h, h.rotate_left(41)],
+                    )
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        let Ok(values) = cx.eval(&roots, &model[..]) else {
+            break;
+        };
+        if values[0] != values[1] && values[2..].iter().all(crate::BitVec::is_zero) {
+            return Ok(Decided::Differ(model));
+        }
+    }
+    Ok(Decided::Unknown)
+}
+
 #[cfg(test)]
 #[rustfmt::skip] // Published source omits this test module; dependency formatting must not traverse it.
 mod tests;
+
+/// Whether `a` and `b` are equal for every value of their symbols, by the MBA procedures
+/// alone: no engine, no circuit, no search. Their difference is lowered to an MBA
+/// expression (sums, products and bitwise operations over atoms: every other subterm is a
+/// variable) and tested against zero by the native prover, which decides linear and
+/// semi-linear MBA and polynomials of low degree completely within `budget`.
+///
+/// [`Verdict::Proved`] is a proof for every value of the atoms, so of the expressions;
+/// [`Verdict::Refuted`] is of the atoms as free variables, which they may not be (two atoms
+/// may be related): together with [`Verdict::Unknown`] it means "not decided here". An error
+/// when the difference is not in the fragment or is over `limits`.
+///
+/// ```
+/// use bitwright::mba::{self, MbaBudget, MbaLimits, Verdict};
+/// use bitwright::{Context, ParseOptions, Width};
+///
+/// let mut cx = Context::new();
+/// let o = ParseOptions::width(Width::W64);
+/// // Products of bitwise terms over an atom that is not a symbol (a quotient).
+/// let a = cx.parse("(udiv(p, 7) ^ q) * (udiv(p, 7) & q) + (udiv(p, 7) & q) * (udiv(p, 7) & q)", &o)?;
+/// let b = cx.parse("(udiv(p, 7) | q) * (udiv(p, 7) & q)", &o)?;
+/// let (limits, budget) = (MbaLimits::default(), MbaBudget::default());
+/// assert_eq!(mba::equal(&mut cx, a, b, &limits, &budget)?, Verdict::Proved);
+/// let c = cx.parse("(udiv(p, 7) | q) * (udiv(p, 7) ^ q)", &o)?;
+/// assert_ne!(mba::equal(&mut cx, a, c, &limits, &budget)?, Verdict::Proved);
+/// # Ok::<(), bitwright::Error>(())
+/// ```
+pub fn equal(
+    cx: &mut crate::Context,
+    a: crate::Expr,
+    b: crate::Expr,
+    limits: &MbaLimits,
+    budget: &MbaBudget,
+) -> Result<Verdict, crate::Error> {
+    let difference = cx.bin(crate::BinOp::Sub, a, b)?;
+    let (lowered, _) = lower(cx, difference, limits)?;
+    let Some(width) = lowered.width() else {
+        return Ok(Verdict::Unknown);
+    };
+    let mut zero = MbaExpr::new(lowered.vars().to_vec());
+    zero.push(MOp::Const(crate::BitVec::zero(width)), &[])
+        .map_err(|e| crate::Error::Unsupported(format!("{e:?}")))?;
+    Ok(NativeProver::new().prove_equal(&lowered, &zero, budget))
+}

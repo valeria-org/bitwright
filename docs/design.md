@@ -11,11 +11,60 @@ bitwright is a Rust library for **fixed-width bit-vector expressions**. It provi
 - bit-level facts (known bits, an unsigned strided interval, a signed range) and tri-state proofs;
 - a directed simplifier built from normal-form passes plus a small rule corpus;
 - a rule language (`.bwr`) with a mandatory, machine-checked soundness gate;
-- optional services, off by default: MBA (mixed boolean-arithmetic) simplification with pluggable
+- optional services (Cargo features, on by default; nothing of them runs unless asked for): MBA (mixed boolean-arithmetic) simplification with pluggable
   solvers, and a bounded equality-saturation search.
 
 The intended users are binary-analysis tools, deobfuscators, decompilers, lifters, and anyone who needs
 to simplify or reason about machine-integer expressions with predictable cost.
+
+---
+
+## 0. Direction: a solver first
+
+This section is later than the rest of the document and takes precedence over it where they
+disagree. Sections 1 to 14 describe the simplifier bitwright began as; it stays, as one product
+of a solver.
+
+**The goal.** An SMT-LIB 2 solver for the questions deobfuscation asks, which also returns
+readable simplified expressions. Word-level decision procedures answer first; bit-blasting and
+CDCL are the complete fallback; what one hard question taught is reused on the next. Losing to
+general solvers on general QF_BV is acceptable; losing on obfuscated code is not.
+
+**The layers**, each depending only on those below it:
+
+| Layer | What it holds |
+|---|---|
+| clients | compiler-transformation verification, lifters, the bindings, the CLI |
+| front ends | the SMT-LIB session (`smtlib::run`, `smtlib::Session`), the Rust API (`solve::Solver`), bitwright text |
+| solver core | the assertion stack, the schedule of a check, the answer cache, models and cores |
+| reasoning | the word-level procedures as analyses (linear and MBA forms, facts, invertibility), and satisfiability-preserving preprocessing with model reconstruction |
+| back end | the circuit, CNF and the SAT search, incremental, behind a trait |
+| substrate | the term store, values, the evaluator |
+| database | remembered answers, strategies, and guarded lemmas in the rule language |
+| proof | attribution of every step, certificates by tier, Lean export and import |
+
+**Two classes of transformation** over one term store, never confused. *Value-preserving*
+simplification is the product of sections 6 to 9 and obeys principle 1 as written.
+*Satisfiability-preserving* preprocessing (solving an equation for a variable, dropping an
+unconstrained one, narrowing a width) is the solver's alone; each such step records how to
+complete a model of what it produced into a model of what it was given. A pass declares which
+it is.
+
+**The schedule of a check** replaces "simplify first". In order: constants; independent
+slices; the last model; remembered answers; a quick attempt on the circuit; the simplifier and
+the full search. Each stage is bounded, and the stage that decided is reported.
+
+**Determinism** (principle 2) is kept per input and database snapshot: learned state is an
+immutable, content-addressed input of a run, and what a run learns is journalled for the next
+snapshot. A deadline is the one thing that depends on time, and only ever stops work.
+
+**Trust.** Every answer carries how it is known: a model checked by evaluation, a rule trace
+that replays, a typed witness of a pass, a SAT certificate, or sampling. An entry known only
+by sampling is a candidate the question that uses it must prove.
+
+**What the simplifier-era text gets wrong today.** "bitwright never runs a solver itself" and
+"does not decide satisfiability" no longer hold. The 512-bit ceiling, the absence of Boolean
+and array sorts, and the engine's size-only commit rule are limits to lift, not decisions.
 
 ---
 
@@ -1730,7 +1779,7 @@ pub mod mba {
 
 ---
 
-## 10. Equality-saturation search service (feature `eqsat`, default off)
+## 10. Equality-saturation search service (feature `eqsat`)
 
 **Position.** A bounded *alternative-expression search* over immutable graphs. It is **not** a phase
 and never runs inside `Engine::run`. The host decides when (output or checkpoint boundaries, never

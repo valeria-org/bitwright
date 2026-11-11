@@ -33,6 +33,7 @@ use pyo3::types::{PyBytes, PyDict, PyInt, PyString, PyTuple};
 
 mod compiler;
 mod more;
+mod solver;
 
 create_exception!(
     bitwright,
@@ -2239,6 +2240,7 @@ fn _bitwright(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyExpr>()?;
     m.add_class::<PyEngine>()?;
     m.add_class::<PyAssumptions>()?;
+    m.add_class::<solver::PySolver>()?;
     m.add_class::<PyBudget>()?;
     m.add_class::<Facts>()?;
     m.add_class::<Outcome>()?;

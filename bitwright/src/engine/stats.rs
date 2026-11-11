@@ -183,6 +183,9 @@ pub struct MbaStats {
     pub opaque_asked: u64,
     /// those a certificate proved constant.
     pub opaque_proved: u64,
+    /// Candidates of the opaque-constant sweep not asked about: a store of results had only
+    /// seen questions of their shape fail ([`Remembered`](crate::engine::Remembered)).
+    pub opaque_skipped: u64,
     /// those whose known bits are all known (no certificate needed).
     pub opaque_known: u64,
     /// those evaluated at every value of the few bits they read.
@@ -218,6 +221,7 @@ impl MbaStats {
             certificates,
             opaque_asked,
             opaque_proved,
+            opaque_skipped,
             opaque_known,
             opaque_exhausted,
             opaque_cases,
@@ -227,6 +231,7 @@ impl MbaStats {
         } = o;
         self.opaque_asked += opaque_asked;
         self.opaque_proved += opaque_proved;
+        self.opaque_skipped += opaque_skipped;
         self.opaque_known += opaque_known;
         self.opaque_exhausted += opaque_exhausted;
         self.opaque_cases += opaque_cases;
@@ -581,6 +586,17 @@ pub enum Event<'a> {
         ///
         /// [`Sharing::Roots`]: super::Sharing::Roots
         again: bool,
+    },
+    /// A part of the [`Stage`](Event::Stage) that follows: a subexpression of the root the
+    /// stage found equal to something else (the opaque-constant sweep: to a constant), which
+    /// its rewrite of the root is made of.
+    Part {
+        /// Which stage.
+        stage: Stage,
+        /// The subexpression.
+        before: Expr,
+        /// What it is equal to.
+        after: Expr,
     },
     /// A rewrite of the whole root outside the phases.
     Stage {

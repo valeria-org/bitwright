@@ -32,11 +32,15 @@ mod export;
 mod fp;
 mod import;
 mod obligation;
+#[cfg(feature = "prove")]
+mod session;
 #[cfg(test)]
 mod tests;
 
 pub use import::{Import, import};
 pub use obligation::rule_obligation;
+#[cfg(feature = "prove")]
+pub use session::{Session, Summary, run, run_within};
 
 use crate::error::Error;
 use crate::expr::{Context, Expr};

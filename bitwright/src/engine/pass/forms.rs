@@ -293,3 +293,21 @@ impl<F: Sum> Whole<F> {
         self.met.get(&i).and_then(|()| self.forms.get(i))
     }
 }
+
+/// A pass's forms for a call: the cache of the forms of nodes, and the whole forms of the
+/// sums that are kept beyond the cap on terms.
+pub(crate) struct Forms<F> {
+    /// The linear pass's forms, per node.
+    pub(crate) cache: FormCache<F>,
+    /// The linear pass's sums over its cap on terms, whole (see `pass::forms::Whole`).
+    pub(crate) whole: Whole<F>,
+}
+
+impl<F> Default for Forms<F> {
+    fn default() -> Self {
+        Forms {
+            cache: Default::default(),
+            whole: Default::default(),
+        }
+    }
+}
