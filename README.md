@@ -170,15 +170,15 @@ text to the answer, parsing included.
 
 | Tool | Solved | The ground truth exactly | Median | 95th percentile |
 |-|-:|-:|-:|-:|
-| bitwright, `NormalFormSolver` | **75,579 (99.8 %)** | **50,638** | **0.27 ms** | **3.3 ms** |
+| bitwright, `NormalFormSolver` | **75,661 (99.9 %)** | **50,542** | **0.09 ms** | **1.8 ms** |
 | CoBRA (C++, af44b8a) | 64,396 (85.0 %) | 47,797 | 1.4 ms | 171 ms |
 
 bitwright proves each of its answers itself, at every input; this is the configuration the
 command line's `simplify` runs. Every answer is equal to its input (none wrong, none failed);
-the 158 not counted as solved are a few nodes larger than the ground truth (a third of them by
-one node), and 21,500 answers are smaller than it. Earlier releases reported every expression
+the 76 not counted as solved are a few nodes larger than the ground truth (44 of them by one
+node), and 21,573 answers are smaller than it. Earlier releases reported every expression
 solved: some of those answers rested on assumptions bitwright no longer makes. Each sum of
-bitwise functions of five variables (`simba/e1_5vars`, 1,000 expressions) is solved, in 9 ms at
+bitwise functions of five variables (`simba/e1_5vars`, 1,000 expressions) is solved, in 0.5 ms at
 the median. CoBRA's row was measured on another machine and is not run again here.
 
 ## Installation

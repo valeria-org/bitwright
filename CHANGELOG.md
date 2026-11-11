@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **A root that is a linear MBA whole is read as one before the first round**
+  (`Stage::Whole`; `Strategy::whole_first`, on by default). The linear-MBA pass's step is
+  taken at the root before the phases walk it, by the pass's own commit rule: one question
+  of the root's signature, where the walk asked one of every sum below the root, and of
+  the bitwise functions under those, to find the same form once the parts were in theirs.
+  On CoBRA's MBA datasets the median goes from 0.28 ms to 0.09 ms, the 95th percentile
+  from 3.6 ms to 1.8 ms and the whole run from 67 s to 34 s; a sum of bitwise functions of
+  five variables takes 0.47 ms where it took 9 ms. 75,661 of the 75,737 scored expressions
+  are solved (75,579 before): 102 more, and 20 that were, no longer (the form found from
+  the root is a node or two larger than the one the walk found). To an observer the step
+  is a stage with one part; it counts among the run's rewrites. Rules are learned from the
+  pass's steps in its phase, not from this one (a step of the input as written is rewritten
+  by the rules before a rule for it would match).
+
 ## 0.30.0
 
 bitwright becomes a solver that also simplifies (see `docs/design.md` §0 and the book's new
