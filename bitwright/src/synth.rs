@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::prove::{self, Outcome};
-use crate::{BinOp, BitVec, Context, Error, Expr, SymbolKey, UnOp, View, Width};
+use crate::{BinOp, BitVec, CmpOp, Context, Error, Expr, SymbolKey, UnOp, View, Width};
 
 /// How far to search.
 #[derive(Clone, Debug)]
@@ -46,6 +46,11 @@ pub struct Config {
     pub restarts: usize,
     /// At most this many variables.
     pub max_vars: usize,
+    /// Whether candidates may hold comparisons (`== != <u <s`, each the value 0 or 1 at the
+    /// target's width; a comparison counts one node, its extension none). On by default:
+    /// `(x | -x) >>u 63` is `x != 0`, and a sum with a correction where a value is zero has
+    /// no smaller writing without one. The enumeration is about a third larger with them.
+    pub comparisons: bool,
 }
 
 impl Default for Config {
@@ -58,6 +63,7 @@ impl Default for Config {
             propagations: u64::MAX,
             restarts: 8,
             max_vars: 4,
+            comparisons: true,
         }
     }
 }
@@ -70,6 +76,7 @@ setters!(Config {
     with_propagations: propagations: u64,
     with_restarts: restarts: usize,
     with_max_vars: max_vars: usize,
+    with_comparisons: comparisons: bool,
 });
 
 const UNARY: [UnOp; 2] = [UnOp::Not, UnOp::Neg];
@@ -87,6 +94,10 @@ const BINARY: [BinOp; 11] = [
     BinOp::URem,
 ];
 
+/// The comparisons of candidates: the others are these with the operands exchanged, or one
+/// more node (`a <=u b` is `1 ^ (b <u a)`).
+const COMPARE: [CmpOp; 4] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Ult, CmpOp::Slt];
+
 fn commutative(op: BinOp) -> bool {
     matches!(
         op,
@@ -100,6 +111,8 @@ enum Term {
     Const(u64),
     Un(UnOp, u32),
     Bin(BinOp, u32, u32),
+    /// A comparison, zero-extended to the target's width.
+    Cmp(CmpOp, u32, u32),
 }
 
 /// Values of width `w` in the low bits of a `u64`, and the operators on them, as bitwright
@@ -121,6 +134,17 @@ impl Lanes {
             UnOp::Not => !a & self.mask,
             _ => a.wrapping_neg() & self.mask,
         }
+    }
+
+    fn cmp(&self, op: CmpOp, a: u64, b: u64) -> u64 {
+        u64::from(match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Ult => a < b,
+            CmpOp::Ule => a <= b,
+            CmpOp::Slt => self.sx(a) < self.sx(b),
+            CmpOp::Sle => self.sx(a) <= self.sx(b),
+        })
     }
 
     fn bin(&self, op: BinOp, a: u64, b: u64) -> u64 {
@@ -221,6 +245,7 @@ impl Search<'_> {
         target: &[u64],
         max_size: u8,
         max_terms: usize,
+        comparisons: bool,
         refuted: &mut dyn FnMut(u32, &Search<'_>) -> Result<bool, Error>,
     ) -> Result<Step, Error> {
         let n = self.n();
@@ -293,6 +318,39 @@ impl Search<'_> {
                         }
                     }
                 }
+                if !comparisons {
+                    continue;
+                }
+                for op in COMPARE {
+                    let symmetric = matches!(op, CmpOp::Eq | CmpOp::Ne);
+                    if symmetric && i > j {
+                        continue;
+                    }
+                    for &a in &left {
+                        for &b in &right {
+                            if symmetric && i == j && b < a {
+                                continue;
+                            }
+                            let ra = self.row(a);
+                            let rb = self.row(b);
+                            let row: Vec<u64> = ra
+                                .iter()
+                                .zip(rb)
+                                .map(|(&x, &y)| self.lanes.cmp(op, x, y))
+                                .collect();
+                            let is_target = row[..] == target[..];
+                            if let Some(k) = self.add(Term::Cmp(op, a, b), size, row)
+                                && is_target
+                                && !refuted(k, self)?
+                            {
+                                return Ok(Step::Candidate);
+                            }
+                            if self.terms.len() >= max_terms {
+                                return Ok(Step::Exhausted);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(Step::Exhausted)
@@ -314,21 +372,51 @@ impl Search<'_> {
                 );
                 cx.bin(op, a, b)?
             }
+            Term::Cmp(op, a, b) => {
+                let (a, b) = (
+                    self.build(cx, vars, width, a)?,
+                    self.build(cx, vars, width, b)?,
+                );
+                let c = cx.cmp(op, a, b)?;
+                cx.zext(c, width)?
+            }
         })
     }
 }
 
-/// The constants `e` mentions (at its width), besides 0, 1 and all ones.
+/// The constants `e` mentions (at its width), besides 0, 1 and all ones; then the ones its
+/// slices and extensions imply: bits `[lo, lo + n)` of a value of the target's width are
+/// `(x >>u lo) & (2^n − 1)`, and `x & mask` in place, so the count and both masks are
+/// candidates' constants (`zext<64>(trunc<8>(x))` is `x & 255`, which mentions no 255).
 fn constants(cx: &mut Context, e: Expr, w: Width) -> Result<Vec<u64>, Error> {
     let mut out = Vec::new();
+    let mut implied = Vec::new();
+    let bits = w.bits();
     for x in cx.post_order(&[e])? {
-        if cx.width(x)? != w {
-            continue;
+        let xw = cx.width(x)?;
+        match cx.view(x)? {
+            View::Const(c) if xw == w => {
+                if let Some(v) = c.to_u64()
+                    && !out.contains(&v)
+                {
+                    out.push(v);
+                }
+            }
+            View::Extract { lo, src } if cx.width(src)? == w && xw.bits() < 64 => {
+                let low = (1u64 << xw.bits()) - 1;
+                implied.extend([low, low << lo, u64::from(lo)]);
+            }
+            View::Zext(a) | View::Sext(a) if xw == w => {
+                let n = cx.width(a)?.bits();
+                if n > 1 && n < bits {
+                    implied.push((1u64 << n) - 1);
+                }
+            }
+            _ => {}
         }
-        if let View::Const(c) = cx.view(x)?
-            && let Some(v) = c.to_u64()
-            && !out.contains(&v)
-        {
+    }
+    for v in implied {
+        if v != 0 && !out.contains(&v) {
             out.push(v);
         }
     }
@@ -492,7 +580,14 @@ pub fn synthesize_report(cx: &mut Context, e: Expr, cfg: &Config) -> Result<Repo
                     }
                 }
             };
-            s.run(&leaves, &target, limit, cfg.max_terms, &mut check)?
+            s.run(
+                &leaves,
+                &target,
+                limit,
+                cfg.max_terms,
+                cfg.comparisons,
+                &mut check,
+            )?
         };
         if let Some(f) = found {
             return Ok(Report {
@@ -564,6 +659,48 @@ mod tests {
         );
         // Already minimal.
         assert_eq!(synth("x + y", Width::W32), None);
+    }
+
+    /// Comparisons are candidates: a value's being zero spelled in arithmetic is the
+    /// comparison, and a correction where two values meet is written with one.
+    #[test]
+    fn comparisons_are_candidates() {
+        for (src, want) in [
+            ("(x | -x) >>u 63", "zext<64>(x != 0)"),
+            ("((x ^ y) | -(x ^ y)) >>u 63", "zext<64>(x != y)"),
+            (
+                "((~x & y) | ((~x | y) & (x - y))) >>u 63",
+                "zext<64>(x <u y)",
+            ),
+            (
+                "((x - y) ^ ((x ^ y) & ((x - y) ^ x))) >>u 63",
+                "zext<64>(x <s y)",
+            ),
+        ] {
+            assert_eq!(synth(src, Width::W64).as_deref(), Some(want), "{src}");
+        }
+        // Without them, nothing as small.
+        let mut cx = Context::new();
+        let e = cx
+            .parse("(x | -x) >>u 63", &ParseOptions::width(Width::W64))
+            .unwrap();
+        let cfg = Config::default().with_comparisons(false);
+        assert!(synthesize(&mut cx, e, &cfg).unwrap().is_none());
+    }
+
+    /// A slice extended back is a mask, whose constant the target does not mention.
+    #[test]
+    fn a_slice_is_its_mask() {
+        for (src, want) in [
+            ("zext<64>(trunc<8>(x:64 ^ y) ^ trunc<8>(y))", "x & 255"),
+            ("zext<64>(trunc<8>(x:64)) + zext<64>(trunc<8>(~x))", "255:64"),
+            (
+                "zext<64>(extract<8, 8>(x:64 ^ y) ^ extract<8, 8>(y)) << 8",
+                "x & 65280",
+            ),
+        ] {
+            assert_eq!(synth(src, Width::W64).as_deref(), Some(want), "{src}");
+        }
     }
 
     #[test]

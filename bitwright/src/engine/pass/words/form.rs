@@ -90,6 +90,12 @@ const AND: u8 = 3;
 const FLOOR: u8 = 4;
 
 fn ck(c: Int) -> R<Int> {
+    // (Within the bounds of narrow words, which those of wide ones hold.)
+    if let Some(v) = c.to_i128()
+        && v.unsigned_abs() < 1 << 100
+    {
+        return Ok(c);
+    }
     let big = big();
     if c > -big && c < big {
         Ok(c)
@@ -99,7 +105,14 @@ fn ck(c: Int) -> R<Int> {
 }
 
 fn mul(a: impl Into<Int>, b: Int) -> R<Int> {
-    a.into().checked_mul(b).ok_or(Over).and_then(ck)
+    let a = a.into();
+    if b == Int::ONE {
+        return ck(a);
+    }
+    if a == Int::ONE {
+        return ck(b);
+    }
+    a.checked_mul(b).ok_or(Over).and_then(ck)
 }
 
 fn plus(a: Int, b: Int) -> R<Int> {
@@ -168,9 +181,6 @@ pub(super) enum Atom {
     Xor(u8, u32),
 }
 
-/// What a bit of each of two operands may be: the least and the most of either.
-type Bits = ((Int, Int), (Int, Int));
-
 /// Bounds of a value: `None` is no bound.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Iv {
@@ -215,6 +225,9 @@ impl Iv {
     }
 
     fn scaled(self, c: Int) -> Iv {
+        if c == Int::ONE {
+            return self;
+        }
         let m = |x: Option<Int>| x.and_then(|x| x.checked_mul(c));
         if c >= 0 {
             Iv {
@@ -1213,56 +1226,55 @@ impl Algebra {
                 let (xh, yh) = (ix.hi.unwrap_or(Int::from(0)), iy.hi.unwrap_or(Int::from(0)));
                 let bits = bit_len(xh).max(bit_len(yh));
                 let (mut lo, mut hi) = (Some(Int::ZERO), Some(Int::ZERO));
-                // (The least and most of a bit depend on what the operands' bits may be,
-                // which is the same from one bit to the next nearly always.)
-                let mut last: Option<(Bits, (Int, Int))> = None;
-                for i in 0..bits {
-                    // The bit of a constant is the bit it has; one above the value's highest
-                    // is 0.
-                    let of = |z: &Form, zh: Int| -> (Int, Int) {
-                        if z.is_const() {
-                            let b = (z.c >> i) & Int::from(1);
-                            (b, b)
-                        } else if bit_len(zh) <= i {
-                            (Int::from(0), Int::from(0))
-                        } else {
-                            (Int::from(0), Int::from(1))
-                        }
-                    };
-                    let ((x0, x1), (y0, y1)) = (of(&x, xh), of(&y, yh));
-                    let key = ((x0, x1), (y0, y1));
-                    let (mut least, mut most) = (Int::MAX, Int::MIN);
-                    if let Some((k, found)) = last
-                        && k == key
-                    {
-                        (least, most) = found;
+                // The least and most of a bit depend on what the operands' bits may be, which
+                // is the same from one bit to the next nearly always: the bits are taken a
+                // run at a time, a run of bits `[from, to)` weighing `2^to − 2^from`.
+                let (xl, yl) = (bit_len(xh), bit_len(yh));
+                // The bit of a constant is the bit it has; one above the value's highest is
+                // 0.
+                let of = |z: &Form, len: u32, i: u32| -> (bool, bool) {
+                    if z.is_const() {
+                        let b = (z.c >> i).low_u64() & 1 == 1;
+                        (b, b)
                     } else {
-                        for xb in [x0, x1] {
-                            for yb in [y0, y1] {
-                                let v = al
-                                    .checked_mul(xb)
-                                    .zip(be.checked_mul(yb))
-                                    .and_then(|(a, b)| a.checked_add(b))
-                                    .and_then(|s| s.checked_add(g * (xb & yb)))
-                                    .and_then(|s| s.checked_add(dl * (xb ^ yb)));
-                                match v {
-                                    Some(v) => {
-                                        least = least.min(v);
-                                        most = most.max(v);
-                                    }
-                                    None => {
-                                        least = Int::MIN;
-                                        most = Int::MAX;
-                                    }
+                        (false, len > i)
+                    }
+                };
+                let corners = |(x0, x1): (bool, bool), (y0, y1): (bool, bool)| {
+                    let (mut least, mut most) = (Int::MAX, Int::MIN);
+                    for xb in [x0, x1] {
+                        for yb in [y0, y1] {
+                            let mut v = Some(Int::ZERO);
+                            for (on, c) in [(xb, al), (yb, be), (xb & yb, g), (xb ^ yb, dl)] {
+                                if on {
+                                    v = v.and_then(|s| s.checked_add(c));
+                                }
+                            }
+                            match v {
+                                Some(v) => {
+                                    least = least.min(v);
+                                    most = most.max(v);
+                                }
+                                None => {
+                                    least = Int::MIN;
+                                    most = Int::MAX;
                                 }
                             }
                         }
-                        last = Some((key, (least, most)));
                     }
+                    (least, most)
+                };
+                let mut from = 0;
+                while from < bits {
+                    let key = (of(&x, xl, from), of(&y, yl, from));
+                    let mut to = from + 1;
+                    while to < bits && (of(&x, xl, to), of(&y, yl, to)) == key {
+                        to += 1;
+                    }
+                    let (least, most) = corners(key.0, key.1);
+                    let weight = (Int::ONE << to) - (Int::ONE << from);
                     let at = |acc: Option<Int>, v: Int| {
-                        acc.and_then(|a| {
-                            v.checked_mul(Int::ONE << i).and_then(|v| a.checked_add(v))
-                        })
+                        acc.and_then(|a| v.checked_mul(weight).and_then(|v| a.checked_add(v)))
                     };
                     lo = if least == Int::MIN {
                         None
@@ -1270,6 +1282,7 @@ impl Algebra {
                         at(lo, least)
                     };
                     hi = if most == Int::MAX { None } else { at(hi, most) };
+                    from = to;
                 }
                 iv = iv.meet(ir.plus(Iv { lo, hi }));
             }

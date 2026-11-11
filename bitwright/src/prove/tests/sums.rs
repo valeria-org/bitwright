@@ -236,3 +236,208 @@ fn a_product_in_limbs_is_its_words_with_shared_sums() {
     let out = equal(&mut cx, a, b, &cfg).unwrap();
     assert!(matches!(out, Outcome::Proved(_)), "{out:?}");
 }
+
+/// A random 64-bit expression over `x:64` and `y:64` in the shapes of [`term`], with
+/// constants and shifts of every size.
+fn term64(rng: &mut Rng, depth: u32) -> String {
+    let pick = |rng: &mut Rng, n: u64| rng.next() % n;
+    let konst = |rng: &mut Rng| match rng.next() % 4 {
+        0 => rng.next() % 16,
+        1 => 1u64 << (rng.next() % 64),
+        2 => rng.next() >> (rng.next() % 64),
+        _ => (rng.next() | 1 << 43) & ((1 << 44) - 1),
+    };
+    if depth == 0 {
+        return match pick(rng, 5) {
+            0 | 1 => "x:64".into(),
+            2 | 3 => "y:64".into(),
+            _ => format!("{:#x}:64", konst(rng)),
+        };
+    }
+    let sub = |rng: &mut Rng| term64(rng, depth - 1);
+    let k = 1 + pick(rng, 62);
+    let limb = [21, 22, 23, 25, 32, 44, 46, 50][pick(rng, 8) as usize];
+    match pick(rng, 16) {
+        0 | 1 => format!("({} + {})", sub(rng), sub(rng)),
+        2 | 3 => format!("({} - {})", sub(rng), sub(rng)),
+        4 => format!("(~{})", sub(rng)),
+        5 | 6 => format!("({} * {:#x}:64)", sub(rng), konst(rng)),
+        7 => format!("({} << {k}:64)", sub(rng)),
+        8 => format!("({} >>u {k}:64)", sub(rng)),
+        9 => format!("({} & {:#x}:64)", sub(rng), (1u64 << limb) - 1),
+        10 => format!(
+            "({} >>u {limb}:64 & {:#x}:64)",
+            sub(rng),
+            (1u64 << limb) - 1
+        ),
+        11 => format!("zext<64>(trunc<{limb}>({}))", sub(rng)),
+        12 => format!(
+            "zext<64>(extract<{}, {}>({}))",
+            limb.min(23),
+            limb.min(23),
+            sub(rng)
+        ),
+        13 => format!(
+            "zext<64>(trunc<{limb}>({}) <u trunc<{limb}>({}))",
+            sub(rng),
+            sub(rng)
+        ),
+        14 => format!(
+            "zext<64>(({} & {m:#x}:64) <u ({} & {m:#x}:64))",
+            sub(rng),
+            sub(rng),
+            m = (1u64 << limb) - 1
+        ),
+        _ => format!("zext<64>(extract<{k}, {}>({}))", 64 - k, sub(rng)),
+    }
+}
+
+/// [`shared_sums_are_the_question_asked`] at 64 bits, at sampled values.
+#[test]
+fn shared_sums_are_the_question_asked_of_words() {
+    let mut rng = Rng(0x5eed_0064);
+    for i in 0..12_000u64 {
+        let depth = 1 + (i % 5) as u32;
+        let (l, r) = (term64(&mut rng, depth), term64(&mut rng, depth));
+        let lo = (rng.next() % 60) as u16;
+        let len = 1 + (rng.next() % u64::from(64 - lo)) as u16;
+        let (l, r) = (
+            format!("extract<{lo}, {len}>({l})"),
+            format!("extract<{lo}, {len}>({r})"),
+        );
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(len).unwrap());
+        let (a, b) = (cx.parse(&l, &o).unwrap(), cx.parse(&r, &o).unwrap());
+        let (ai, bi) = (cx.id(a).unwrap(), cx.id(b).unwrap());
+        let asked = cx.c_cmp(crate::CmpOp::Eq, ai, bi).unwrap();
+        let again = crate::prove::sums::shared(&mut cx, asked).unwrap();
+        let (asked, again) = (cx.handle(asked), cx.handle(again));
+        let mut points = Rng(i);
+        for p in 0..64u64 {
+            let mut at = |s: u64| match (p + s) % 8 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1u64 << (points.next() % 64),
+                3 => (1u64 << (points.next() % 64)).wrapping_sub(1),
+                _ => points.next(),
+            };
+            let (x, y) = (at(0), at(3));
+            let env = crate::FnEnv(|k: &SymbolKey, w: Width| {
+                let named = |n: &str| matches!(k, SymbolKey::Str(s) if &**s == n);
+                Some(BitVec::wrapping_from_u64(w, if named("x") { x } else { y }))
+            });
+            let v = cx.eval(&[asked, again], &env).unwrap();
+            assert!(
+                v[0] == v[1],
+                "{l} == {r}\nwritten again: {}\nat x = {x:#x}, y = {y:#x}",
+                cx.display(again)
+            );
+        }
+    }
+}
+
+/// [`limb`] at 64 bits with a split at bit 33 or above, over `x` and `y`, whose operands are
+/// digits of the words under coefficients up to `2^44`: the low sums of the carries have
+/// slices that overlap under such coefficients.
+fn limb64(rng: &mut Rng, k: u16, steps: usize) -> (String, String) {
+    limb64_read(rng, k, steps, 64 - k)
+}
+
+/// [`limb64`] with the limb kept in a register of `j` bits (`64 − k`, or all 64: what is
+/// above the limb is then the word's bits above too, read as they are).
+fn limb64_read(rng: &mut Rng, k: u16, steps: usize, j: u16) -> (String, String) {
+    let operand = |rng: &mut Rng| {
+        let v = if rng.next().is_multiple_of(2) { "x" } else { "y" };
+        let c = (rng.next() | 1 << 43) >> (rng.next() % 24);
+        let d = [21u16, 23, 25][(rng.next() % 3) as usize];
+        match rng.next() % 7 {
+            0 => format!("{v}:64"),
+            1 => format!("({v}:64 * {c:#x}:64)"),
+            2 => format!("(({v}:64 & {:#x}:64) * {c:#x}:64)", (1u64 << d) - 1),
+            3 => format!(
+                "(({v}:64 >>u {d}:64 & {:#x}:64) * {c:#x}:64)",
+                (1u64 << d) - 1
+            ),
+            4 => format!("(zext<64>(extract<{d}, {d}>({v}:64)) * {c:#x}:64)"),
+            5 => format!("(({v}:64 & {:#x}:64) * {c:#x}:64)", (1u64 << (2 * d)) - 1),
+            _ => format!("{:#x}:64", rng.next()),
+        }
+    };
+    let lo = |e: &str| format!("trunc<{k}>({e})");
+    let hi = |e: &str| match j {
+        64 => format!("({e} >>u {k}:64)"),
+        _ => format!("extract<{k}, {j}>({e})"),
+    };
+    let mut word = operand(rng);
+    let mut high = hi(&word);
+    for _ in 0..steps {
+        let t = operand(rng);
+        if rng.next().is_multiple_of(2) {
+            let next = format!("({word} + {t})");
+            high = format!(
+                "({high} + {} + zext<{j}>({} <u {}))",
+                hi(&t),
+                lo(&next),
+                lo(&t)
+            );
+            word = next;
+        } else {
+            let next = format!("({word} - {t})");
+            high = format!(
+                "({high} - {} - zext<{j}>({} <u {}))",
+                hi(&t),
+                lo(&word),
+                lo(&next)
+            );
+            word = next;
+        }
+    }
+    (high, hi(&word))
+}
+
+/// A limb above bit 33 to 50 of sums of products by large constants is its word's slice,
+/// and the question written again says so at every sampled value: a carry's low sums are
+/// numbers, and one whose coefficient wrapped when a slice was cut is not taken for one.
+#[test]
+fn a_wide_limb_of_products_is_its_words_slice_written_again() {
+    let mut rng = Rng(0x5eed_2343);
+    for i in 0..1500u64 {
+        let k = [33u16, 40, 44, 46, 50][(i % 5) as usize];
+        // (In a register of its own width, and in one of 64 bits.)
+        let j = if i % 2 == 0 { 64 - k } else { 64 };
+        let (l, r) = match j {
+            64 => limb64_read(&mut rng, k, 1 + (i % 4) as usize, 64),
+            _ => limb64(&mut rng, k, 1 + (i % 4) as usize),
+        };
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(j).unwrap());
+        let (a, b) = (cx.parse(&l, &o).unwrap(), cx.parse(&r, &o).unwrap());
+        let (ai, bi) = (cx.id(a).unwrap(), cx.id(b).unwrap());
+        let asked = cx.c_cmp(crate::CmpOp::Eq, ai, bi).unwrap();
+        let again = crate::prove::sums::shared(&mut cx, asked).unwrap();
+        let (asked, again) = (cx.handle(asked), cx.handle(again));
+        let mut points = Rng(i);
+        for p in 0..64u64 {
+            let mut at = |s: u64| match (p + s) % 8 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1u64 << (points.next() % 64),
+                3 => (1u64 << (points.next() % 64)).wrapping_sub(1),
+                _ => points.next(),
+            };
+            let (x, y) = (at(0), at(3));
+            let env = crate::FnEnv(|k: &SymbolKey, w: Width| {
+                let named = |n: &str| matches!(k, SymbolKey::Str(s) if &**s == n);
+                Some(BitVec::wrapping_from_u64(w, if named("x") { x } else { y }))
+            });
+            let v = cx.eval(&[asked, again], &env).unwrap();
+            assert!(
+                v[0] == v[1],
+                "{l} == {r}\nwritten again: {}\nat x = {x:#x}, y = {y:#x}: {} against {}",
+                cx.display(again),
+                v[0],
+                v[1]
+            );
+        }
+    }
+}
