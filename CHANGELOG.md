@@ -15,6 +15,15 @@
   is a stage with one part; it counts among the run's rewrites. Rules are learned from the
   pass's steps in its phase, not from this one (a step of the input as written is rewritten
   by the rules before a rule for it would match).
+- **The normal-form solver builds half as many two-term decompositions** of a linear form
+  over up to three atoms (4 of the best estimated where it built 8, 3 forms of each
+  function where it tried 5, 4 pairs sharing a subterm and 4 with a coefficient taken out
+  where there were 8), and a linear form that is one bitwise function is rendered as that
+  without the searches for sums. On CoBRA's datasets 80 answers of 76,080 change size (41
+  smaller, 39 larger), four more are solved, and the run takes 5 % less (the 95th
+  percentile 1.6 ms where it was 1.7 ms); a deobfuscator's slow questions take 13 % less.
+  Building a quarter as many takes 9 % less and leaves 368 answers larger, which is why
+  it is a half.
 
 ## 0.30.0
 

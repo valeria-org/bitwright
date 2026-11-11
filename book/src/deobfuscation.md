@@ -310,8 +310,8 @@ for a later call with more budget. It remembers its recent answers (`NfOptions::
 saves time when the engine asks again and never changes an answer. It is the default solver
 (the command line's `simplify` uses it too); `SignatureSolver` answers linear MBA only, at a
 fraction of the cost on code that is not obfuscated. Of the 76,080 expressions of CoBRA's MBA datasets, 75,737 have a ground
-truth that agrees with their input: it brings 75,661 of them (99.9 %) to the ground truth's size
-or less, 21,573 smaller, and leaves the rest a few nodes larger (it writes only what it proves
+truth that agrees with their input: it brings 75,665 of them (99.9 %) to the ground truth's size
+or less, 21,564 smaller, and leaves the rest a few nodes larger (it writes only what it proves
 at every input).
 CoBRA itself reaches 85.0 % of them. See `compare/` in the repository.
 

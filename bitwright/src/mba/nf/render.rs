@@ -644,7 +644,7 @@ struct SumScratch {
 
 /// The most decompositions [`Render::two_terms`] builds over up to three atoms, those whose
 /// estimated size is smallest.
-const TWO_TERMS_BUILT: usize = 8;
+const TWO_TERMS_BUILT: usize = 4;
 
 /// The most decompositions of a polynomial's linear part tried beside its nonlinear part.
 const LINEAR_JOINED: usize = 8;
@@ -652,15 +652,15 @@ const LINEAR_JOINED: usize = 8;
 /// The best estimated decompositions [`Render::two_terms`] also tries with other forms of
 /// their functions, and the most forms of a lone function.
 const TWO_TERMS_PAIRED: usize = 3;
-const TWO_TERMS_FORMS: usize = 5;
+const TWO_TERMS_FORMS: usize = 3;
 
 /// The cheapest decompositions [`Render::two_terms`] also weighs with a shared coefficient
 /// taken out.
-const TWO_TERMS_FACTORED: usize = 8;
+const TWO_TERMS_FACTORED: usize = 4;
 
 /// The most pairs of minimum forms sharing a subterm [`Render::two_terms`] builds per
 /// decomposition.
-const TWO_TERMS_SHARED: usize = 8;
+const TWO_TERMS_SHARED: usize = 4;
 
 /// The most splits [`Render::split_off`] decomposes further.
 const SPLITS: usize = 2;
@@ -781,14 +781,18 @@ impl<'a> Render<'a> {
         let Some(bar) = self.bar else {
             return false;
         };
+        self.floor(set).is_some_and(|floor| floor >= bar)
+    }
+
+    /// The fewest nodes a rendering of a form over the atoms in `set` has (see
+    /// [`hopeless`](Self::hopeless)). `None` where an atom has no rendering.
+    fn floor(&mut self, set: u64) -> Option<u32> {
         if let Some(&floor) = self.floors.get(&set) {
-            return floor >= bar;
+            return Some(floor);
         }
         let mut roots: Vec<u32> = Vec::new();
         for a in (0..64u32).filter(|&a| set >> a & 1 == 1) {
-            let Some(n) = self.atom(a) else {
-                return false;
-            };
+            let n = self.atom(a)?;
             if !roots.contains(&n) {
                 roots.push(n);
             }
@@ -809,7 +813,7 @@ impl<'a> Render<'a> {
             .count();
         let floor = union.len() as u32 + tops.saturating_sub(1) as u32;
         self.floors.insert(set, floor);
-        floor >= bar
+        Some(floor)
     }
 
     /// Spends `n` steps; false once past the limit (then callers stop generating candidates).
@@ -1784,6 +1788,12 @@ impl<'a> Render<'a> {
                     konst: None,
                 });
             }
+        }
+        // A bitwise function, rendered: no sum of several is cheaper than its one term, and
+        // the searches for them are most of a rendering's work.
+        if plain.is_some() && !out.is_empty() {
+            self.built += out.len() as u64;
+            return out;
         }
         out.extend(self.grouped(p));
         let n = self.classes.len();
