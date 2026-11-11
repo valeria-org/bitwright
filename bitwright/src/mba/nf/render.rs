@@ -2561,44 +2561,44 @@ impl<'a> Render<'a> {
             if no > 2 || ni > 2 {
                 continue;
             }
-            let out: Vec<BitVec> = out_i[..no].iter().map(|&i| all[usize::from(i)]).collect();
-            let inside: Vec<BitVec> = inside_i[..ni]
-                .iter()
-                .map(|&i| all[usize::from(i)])
-                .collect();
+            // (In arrays: this runs for each of up to 254 tables, at most eight corners.)
             // `a` moves a value inside onto one outside.
-            let mut coefs: Vec<BitVec> = Vec::new();
-            for x in &out {
-                for y in &inside {
-                    let a = sub(x, y);
-                    if !a.is_zero() {
-                        distinct(&mut coefs, &a);
+            let zero = BitVec::zero(w);
+            let (mut coefs, mut nc) = ([zero; 4], 0usize);
+            for &xi in &out_i[..no] {
+                for &yi in &inside_i[..ni] {
+                    let a = sub(&all[usize::from(xi)], &all[usize::from(yi)]);
+                    if !a.is_zero() && !coefs[..nc].contains(&a) {
+                        coefs[nc] = a;
+                        nc += 1;
                     }
                 }
             }
-            for a in coefs {
-                let r: Vec<BitVec> = (0..corners)
-                    .map(|q| {
-                        if g >> q & 1 == 1 {
-                            add(&u[q], &a)
-                        } else {
-                            u[q]
-                        }
-                    })
-                    .collect();
-                let mut vals = Vec::new();
-                for v in &r {
-                    distinct(&mut vals, v);
+            for &a in &coefs[..nc] {
+                let mut r = [zero; 8];
+                // The distinct values, in the order the corners take them (three say more
+                // than two).
+                let (mut vals, mut nv) = ([zero; 3], 0usize);
+                for q in 0..corners {
+                    r[q] = if g >> q & 1 == 1 {
+                        add(&u[q], &a)
+                    } else {
+                        u[q]
+                    };
+                    if nv < 3 && !vals[..nv].contains(&r[q]) {
+                        vals[nv] = r[q];
+                        nv += 1;
+                    }
                 }
                 // `u = c − a·[g] − b·[h]`, so the form is `c + a·g + b·h`.
-                match vals.as_slice() {
-                    [c] => found.push((g, a, None, *c)),
+                match vals[..nv] {
+                    [c] => found.push((g, a, None, c)),
                     [x, y] => {
                         for (c, other) in [(x, y), (y, x)] {
                             let h = (0..corners)
-                                .filter(|&q| r[q] == *other)
+                                .filter(|&q| r[q] == other)
                                 .fold(0u64, |t, q| t | 1 << q);
-                            found.push((g, a, Some((h, sub(c, other))), *c));
+                            found.push((g, a, Some((h, sub(&c, &other))), c));
                         }
                     }
                     _ => {}

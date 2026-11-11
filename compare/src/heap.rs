@@ -15,7 +15,10 @@ pub struct Counting;
 
 fn grow(n: usize) {
     let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    // (Most allocations are below the peak: the read is cheaper than the update.)
+    if live > PEAK.load(Ordering::Relaxed) {
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: every method forwards to `System` with its own arguments and returns what `System`
