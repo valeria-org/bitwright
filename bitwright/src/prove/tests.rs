@@ -17,6 +17,7 @@ mod relations;
 mod sampling;
 mod sat_families;
 mod scoped_facts;
+mod sums;
 mod sweeping;
 
 #[test]

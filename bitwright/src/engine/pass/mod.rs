@@ -17,6 +17,7 @@ mod division;
 pub(super) mod forms;
 pub(crate) mod gf2;
 pub(super) mod invert;
+mod limbs;
 pub(super) mod linear;
 pub(super) mod linear_mba;
 #[cfg(feature = "mba")]
@@ -407,11 +408,16 @@ pub(super) fn cut_cases(
 /// say when to split: `select(c, t, f)` is `root` whatever the arms are. (At random inputs a
 /// condition like `x != y` holds every time, so the root looks like one constant and is not;
 /// the arm for the other case is read at the same inputs with the condition put in.)
+///
+/// A `settled` root (one the rounds have nothing left to do on) is split whatever the samples
+/// say: the caller simplifies the arms and keeps the result only where it is smaller (see
+/// `Runner::split`).
 #[cfg(feature = "mba")]
 pub(super) fn split_cases(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     root: u32,
+    settled: bool,
 ) -> Result<Option<u32>, Stop> {
     let before = cx.len() as u32;
     let Some((c, t, f)) = r.build(cx, |cx| context::sides(cx, root))? else {
@@ -424,7 +430,7 @@ pub(super) fn split_cases(
         return Ok(None);
     }
     for side in [t, f] {
-        if cx.const_val(side).is_some() {
+        if settled || cx.const_val(side).is_some() {
             continue;
         }
         r.sample(cx, side)?;
@@ -435,6 +441,22 @@ pub(super) fn split_cases(
         }
     }
     let e = r.build(cx, |cx| cx.c_select(c, t, f))?;
+    Ok((e != root).then_some(e))
+}
+
+/// A root that is a select, with the choice written as far down as its arms agree (see
+/// `context::join`): `None` when it is no select, or that is the root itself.
+#[cfg(feature = "mba")]
+pub(super) fn join_cases(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<u32>, Stop> {
+    let n = cx.node(root);
+    if n.op != OpCode::Select {
+        return Ok(None);
+    }
+    let e = r.build(cx, |cx| context::join(cx, n.a, n.b, n.c))?;
     Ok((e != root).then_some(e))
 }
 
@@ -1470,6 +1492,69 @@ pub(super) fn discard(r: &mut Runner<'_, '_>, cx: &Context, before: u32) {
     for i in before..cx.len() as u32 {
         r.retire(cx, i);
     }
+}
+
+/// [`discard`], but for the nodes `keep` reaches: for a pass that built two candidates and
+/// goes on with one.
+pub(super) fn discard_but(r: &mut Runner<'_, '_>, cx: &Context, before: u32, keep: u32) {
+    let mut kept = crate::hash::IdMap::default();
+    let mut stack = vec![keep];
+    while let Some(i) = stack.pop() {
+        if i >= before && kept.insert(i, ()).is_none() {
+            stack.extend(cx.node(i).children());
+        }
+    }
+    for i in before..cx.len() as u32 {
+        if !kept.contains_key(&i) {
+            r.retire(cx, i);
+        }
+    }
+}
+
+/// The nodes replacing `n` by `e` frees less the nodes it needs, as the commit rule counts
+/// them ([`pays`]): for a pass that chooses between two candidates. `None` when `e` needs more
+/// than the commit rule examines.
+pub(super) fn margin(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Option<i64>, Stop> {
+    region(r, cx, n, atoms)?;
+    r.meter.check()?;
+    let Some(new) = needed(r, cx, e)? else {
+        return Ok(None);
+    };
+    let shared = !alone(r);
+    let freed = dying_in(r, cx, n, true, u32::MAX, shared)?;
+    Ok(Some(i64::from(freed) - i64::from(new)))
+}
+
+/// [`margin`], and the same with the uses from outside the region of `n` ignored (what the
+/// commit rule would count were `n` alone): a candidate that pays only by the second is
+/// refused because of sharing.
+#[cfg(feature = "prove")]
+pub(super) fn margins(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    e: u32,
+    atoms: &[u32],
+) -> Result<Option<(i64, i64)>, Stop> {
+    region(r, cx, n, atoms)?;
+    r.meter.check()?;
+    let Some(new) = needed(r, cx, e)? else {
+        return Ok(None);
+    };
+    let lone = dying_in(r, cx, n, true, u32::MAX, false)?;
+    let freed = if alone(r) {
+        lone
+    } else {
+        dying_in(r, cx, n, true, u32::MAX, true)?
+    };
+    let new = i64::from(new);
+    Ok(Some((i64::from(freed) - new, i64::from(lone) - new)))
 }
 
 /// The most operands of a chain put in order.

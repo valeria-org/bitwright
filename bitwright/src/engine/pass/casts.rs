@@ -4,16 +4,25 @@
 //!   only on the low bits of its operands), and through `& | ^ ~` and `select` for any `lo`;
 //! - through shifts by a constant (an arithmetic shift fills with the sign bit), zero and
 //!   sign extensions, and `concat`, by re-indexing (or becoming the constant 0, or the
-//!   extension of the part that remains);
+//!   extension of the part that remains); across the seam of a `concat` only in an arm of a
+//!   `select` (the limbs on either side of it; elsewhere the slice of the joined word is
+//!   what the limb passes read);
 //! - above bit `lo` through `a + a` (the bits one lower), and through `+ − *` where an operand's
 //!   low `lo` bits are known zero (nothing carries in from below).
 //!
 //! The narrowing is computed for the whole region below the extract (bounded), and replaces the
 //! node only when that region gets strictly smaller: `trunc(zext(x) + zext(y))` becomes
-//! `x + y`, while `trunc(a + b)` over opaque operands stays as it is.
+//! `x + y`, while `trunc(a + b)` over opaque operands stays as it is. Where it reaches a node
+//! whose slice something else already reads, it uses that slice: narrowing the node again
+//! would build it a second time, which pays for neither reader while the other holds it.
 //!
 //! A `concat` of two values that are neighbouring slices of one bitwise value once the upper
 //! one is pushed into it (`concat(hi(a) | hi(b), lo(a | b))`) is the slice that covers both.
+//!
+//! The other way, `select(c, F(a), F(b))` is `F(select(c, a, b))` where the two arms are the
+//! same operations over operands that differ in a pair or two, and doing them once makes the
+//! DAG smaller: a register read limb by limb, each limb through its own `select`, is the limbs
+//! of the selected register.
 
 use super::{Fin, PassKind, Runner, Step, Stop, finish};
 use crate::BitVec;
@@ -33,6 +42,48 @@ struct Narrow {
     pushes: u32,
     /// What the facts a push relied on contribute to the node's finality.
     fin: Fin,
+    /// The extract the narrowing is of (its own node), where a slice some other node already
+    /// reads is used as it is (see [`live_slice`]).
+    own: Option<u32>,
+    /// Whether a slice met whole is pushed into its operand like one asked for (see
+    /// [`spelled`]).
+    whole: bool,
+    /// How many `select`s the narrowing is in an arm of.
+    arms: u32,
+}
+
+/// The node `extract<lo, n>(x)` where it exists and something live reads it, other than
+/// `own`: a narrowing that reaches `x` uses it, where pushing on would build the slice a
+/// second time (the low half of a word two limbs read, each of which alone frees nothing by
+/// narrowing it).
+fn live_slice(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    own: u32,
+    x: u32,
+    lo: u16,
+    n: u16,
+) -> Result<Option<u32>, Stop> {
+    if matches!(
+        cx.node(x).op,
+        OpCode::Extract | OpCode::Zext | OpCode::Sext | OpCode::Concat | OpCode::Const
+    ) {
+        return Ok(None);
+    }
+    let Some(e) = cx.find(&crate::expr::Node::new(
+        OpCode::Extract,
+        n,
+        x,
+        u32::from(lo),
+        0,
+    )) else {
+        return Ok(None);
+    };
+    if e == own {
+        return Ok(None);
+    }
+    super::refresh_uses(r, cx)?;
+    Ok(r.life.live.uses(e).is_some_and(|u| u > 0).then_some(e))
 }
 
 /// Whether the low `lo` bits of `i` are known zero (so a sum or product with it carries
@@ -104,6 +155,103 @@ fn carry_in(
     Ok((c, fin))
 }
 
+/// `x` read whole by a caller that compares spellings ([`spelled`]): a slice is pushed into
+/// its operand like one asked for, and the operands of the operators a slice passes through
+/// at any bit (`& | ^ ~`, extensions) are read the same way. `None` for anything else.
+fn respelled(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Narrow,
+    x: u32,
+) -> Result<Option<u32>, Stop> {
+    let node = cx.node(x);
+    let w = node.width;
+    let bin = match node.op {
+        OpCode::And => Some(BinOp::And),
+        OpCode::Or => Some(BinOp::Or),
+        OpCode::Xor => Some(BinOp::Xor),
+        _ => None,
+    };
+    if bin.is_none()
+        && !matches!(
+            node.op,
+            OpCode::Extract | OpCode::Not | OpCode::Zext | OpCode::Sext
+        )
+    {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, 1)?;
+    st.pushes += 1;
+    if st.pushes > MAX_PUSHES {
+        return Ok(None);
+    }
+    let v = match (node.op, bin) {
+        (OpCode::Extract, _) => narrow(r, cx, st, node.a, node.b as u16, w)?,
+        (_, Some(op)) => {
+            let a = narrow(r, cx, st, node.a, 0, w)?;
+            let b = narrow(r, cx, st, node.b, 0, w)?;
+            r.build(cx, |cx| cx.c_bin(op, a, b))?
+        }
+        (OpCode::Not, _) => {
+            let a = narrow(r, cx, st, node.a, 0, w)?;
+            r.build(cx, |cx| cx.c_un(UnOp::Not, a))?
+        }
+        _ => {
+            let wa = cx.wid(node.a);
+            let a = narrow(r, cx, st, node.a, 0, wa)?;
+            let sext = node.op == OpCode::Sext;
+            r.build(cx, |cx| {
+                if sext {
+                    cx.c_sext(a, w)
+                } else {
+                    cx.c_zext(a, w)
+                }
+            })?
+        }
+    };
+    Ok(Some(v))
+}
+
+/// The width `x` is a sum of zero extensions from (of sums and differences of them, at most
+/// `depth` deep): `zext(a) + zext(b)` of two values of one width.
+pub(super) fn zext_sum(cx: &Context, x: u32, depth: u32) -> Option<u16> {
+    let node = cx.node(x);
+    match node.op {
+        OpCode::Zext => Some(cx.wid(node.a)),
+        OpCode::Add | OpCode::Sub if depth > 0 => {
+            let (a, b) = (
+                zext_sum(cx, node.a, depth - 1)?,
+                zext_sum(cx, node.b, depth - 1)?,
+            );
+            (a == b).then_some(a)
+        }
+        _ => None,
+    }
+}
+
+/// The sum `a + b` at the operands' own width where `x` is `zext(a) + zext(b)`, the sum of
+/// the two with its carry out, and that sum is a node something live reads: the word the
+/// limbs beside the carry are of.
+#[cfg(feature = "prove")]
+pub(super) fn live_word(r: &mut Runner<'_, '_>, cx: &Context, x: u32) -> Result<Option<u32>, Stop> {
+    let node = cx.node(x);
+    let (a, b) = (cx.node(node.a), cx.node(node.b));
+    if node.op != OpCode::Add
+        || a.op != OpCode::Zext
+        || b.op != OpCode::Zext
+        || cx.wid(a.a) != cx.wid(b.a)
+    {
+        return Ok(None);
+    }
+    let m = cx.wid(a.a);
+    let find = |p: u32, q: u32| cx.find(&crate::expr::Node::new(OpCode::Add, m, p, q, 0));
+    let Some(e) = find(a.a, b.a).or_else(|| find(b.a, a.a)) else {
+        return Ok(None);
+    };
+    super::refresh_uses(r, cx)?;
+    Ok(r.life.live.uses(e).is_some_and(|u| u > 0).then_some(e))
+}
+
 /// `extract<lo, n>(x)`, narrowed as far as the rules above allow.
 fn narrow(
     r: &mut Runner<'_, '_>,
@@ -118,8 +266,21 @@ fn narrow(
     }
     let w = cx.wid(x);
     if lo == 0 && n == w {
+        if st.whole
+            && let Some(v) = respelled(r, cx, st, x)?
+        {
+            st.memo.insert((x, lo, n), v);
+            return Ok(v);
+        }
         st.stops.push(x);
         return Ok(x);
+    }
+    if let Some(own) = st.own
+        && let Some(e) = live_slice(r, cx, own, x, lo, n)?
+    {
+        st.stops.push(e);
+        st.memo.insert((x, lo, n), e);
+        return Ok(e);
     }
     r.meter.charge(Counter::PassWork, 1)?;
     r.meter.check()?;
@@ -155,6 +316,13 @@ fn narrow(
                 let sub = node.op == OpCode::Sub;
                 let (carry, f) = carry_in(r, cx, node.a, node.b, lo, sub)?;
                 match carry {
+                    // A sum of values zero-extended from one width (the sum with its carry
+                    // out) read below the carry is the sum at that width: its low bits.
+                    None if zext_sum(cx, x, 4).is_some_and(|m| lo + n <= m && m < w) => {
+                        let m = zext_sum(cx, x, 4).unwrap_or(w);
+                        let low = narrow(r, cx, st, x, 0, m)?;
+                        r.build(cx, |cx| cx.c_extract(low, lo, n))?
+                    }
                     None => {
                         st.fin = st.fin.and(f.unchanged());
                         stop(r, cx, st)?
@@ -218,8 +386,10 @@ fn narrow(
                 r.build(cx, |cx| cx.c_un(UnOp::Not, a))?
             }
             OpCode::Select => {
+                st.arms += 1;
                 let t = narrow(r, cx, st, node.b, lo, n)?;
                 let f = narrow(r, cx, st, node.c, lo, n)?;
+                st.arms -= 1;
                 let c = node.a;
                 st.stops.push(c);
                 r.build(cx, |cx| cx.c_select(c, t, f))?
@@ -303,6 +473,32 @@ fn narrow(
                     narrow(r, cx, st, node.b, lo, n)?
                 } else if lo >= wl {
                     narrow(r, cx, st, node.a, lo - wl, n)?
+                } else if st.arms > 0 {
+                    // In an arm of a `select`, across the seam: the low bits of the upper
+                    // part over the high bits of the lower, each re-indexed where it is a
+                    // join or a slice itself and left as a slice otherwise (the word the
+                    // arm joins is not what the `select`'s reader reads).
+                    let part = |r: &mut Runner<'_, '_>,
+                                cx: &mut Context,
+                                st: &mut Narrow,
+                                p: u32,
+                                plo: u16,
+                                pn: u16|
+                     -> Result<u32, Stop> {
+                        if matches!(
+                            cx.node(p).op,
+                            OpCode::Concat | OpCode::Extract | OpCode::Zext | OpCode::Sext
+                        ) || cx.const_val(p).is_some()
+                        {
+                            narrow(r, cx, st, p, plo, pn)
+                        } else {
+                            st.stops.push(p);
+                            r.build(cx, |cx| cx.c_extract(p, plo, pn))
+                        }
+                    };
+                    let hi = part(r, cx, st, node.a, 0, lo + n - wl)?;
+                    let low = part(r, cx, st, node.b, lo, wl - lo)?;
+                    r.build(cx, |cx| cx.c_concat(hi, low))?
                 } else {
                     stop(r, cx, st)?
                 }
@@ -332,6 +528,29 @@ pub(super) fn narrowed(
     Ok(narrowed_from(r, cx, x, lo, n)?.map(|(e, fin, _)| (e, fin)))
 }
 
+/// [`narrowed`] as the pass itself writes it where slices are already there: a slice
+/// something else reads is used (see [`live_slice`]).
+#[cfg(feature = "prove")]
+pub(super) fn narrowed_live(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    lo: u16,
+    n: u16,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    let mut st = Narrow {
+        memo: IdMap::default(),
+        stops: Vec::new(),
+        pushes: 0,
+        fin: Fin::FINAL,
+        own: Some(u32::MAX),
+        whole: false,
+        arms: 0,
+    };
+    let e = narrow(r, cx, &mut st, x, lo, n)?;
+    Ok((st.pushes <= MAX_PUSHES).then_some((e, st.fin)))
+}
+
 /// [`narrowed`], with the nodes where the pushes stopped (the region's atoms, for the commit
 /// rule's count).
 pub(super) fn narrowed_from(
@@ -341,14 +560,52 @@ pub(super) fn narrowed_from(
     lo: u16,
     n: u16,
 ) -> Result<Option<(u32, Fin, Vec<u32>)>, Stop> {
+    pushed(r, cx, x, lo, n, false)
+}
+
+/// [`narrowed_from`] for a caller that compares spellings: a slice met whole on the way (the
+/// operand of another operation) is pushed into its operand like one asked for, so that
+/// `hi(a ^ b) & c` and `(hi(a) ^ hi(b)) & c` are one node.
+#[cfg(feature = "prove")]
+pub(super) fn spelled(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    lo: u16,
+    n: u16,
+) -> Result<Option<(u32, Fin, Vec<u32>)>, Stop> {
+    pushed(r, cx, x, lo, n, true)
+}
+
+/// [`narrowed_from`] (or [`spelled`], with `whole`), asked once in a call: the pushes read
+/// the nodes and their facts and nothing of what is live, so an answer that is final is the
+/// answer every time.
+fn pushed(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    lo: u16,
+    n: u16,
+    whole: bool,
+) -> Result<Option<(u32, Fin, Vec<u32>)>, Stop> {
+    if let Some(known) = r.narrows.get(&(x, lo, n, whole)) {
+        return Ok(known.clone());
+    }
     let mut st = Narrow {
         memo: IdMap::default(),
         stops: Vec::new(),
         pushes: 0,
         fin: Fin::FINAL,
+        own: None,
+        whole,
+        arms: 0,
     };
     let e = narrow(r, cx, &mut st, x, lo, n)?;
-    Ok((st.pushes <= MAX_PUSHES).then_some((e, st.fin, st.stops)))
+    let out = (st.pushes <= MAX_PUSHES).then_some((e, st.fin, st.stops));
+    if out.as_ref().is_none_or(|o| o.1.done) {
+        r.narrows.insert((x, lo, n, whole), out.clone());
+    }
+    Ok(out)
 }
 
 /// The width `k` and operand `x` when `n` sign-extends the low `k` bits of `x` spelled with
@@ -438,6 +695,352 @@ fn rejoined(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
     finish(r, cx, PassKind::Casts, n, e, before, &[x], fin)
 }
 
+/// The most operations of a `select`'s arms read as the same.
+const MAX_HOIST: usize = 32;
+
+/// The most `select`s one hoist builds.
+const MAX_BASES: usize = 2;
+
+/// How a pair of nodes, one of each arm of a `select`, is read.
+#[derive(Clone, Copy)]
+enum Paired {
+    /// One operation on both sides, over the pairs of its operands.
+    Node,
+    /// A zero extension of the pair of these: one side masks the low `k` bits of a wider value,
+    /// the other zero-extends a `k`-bit value (one value written two ways).
+    Zext(u32, u32),
+    /// Two values with nothing in common: the `select` is of them.
+    Leaf,
+    /// The same slice of the two values of a `select` that exists and something live reads:
+    /// that `select`, and where the slice starts.
+    Slice(u32, u16),
+}
+
+/// The two arms of a `select` read side by side (see [`hoisted`]).
+struct Hoist {
+    /// The `select` and its condition.
+    n: u32,
+    c: u32,
+    /// Whether a pair whose `select` exists and something live reads is taken as it is.
+    live: bool,
+    seen: IdMap<(u32, u32), Paired>,
+    /// The pairs with nothing in common, in the order met.
+    leaves: Vec<(u32, u32)>,
+    /// The `select`s found that pairs are slices of.
+    found: Vec<u32>,
+    /// Operations read as the same.
+    ops: usize,
+}
+
+/// Whether a pair of nodes of `op` may be one operation over their operands' pairs: an integer
+/// operation, whose value is a function of its operands alone.
+fn pairable(op: OpCode) -> bool {
+    op.as_un().is_some()
+        || op.as_bin().is_some()
+        || op.as_cmp().is_some()
+        || matches!(
+            op,
+            OpCode::Zext | OpCode::Sext | OpCode::Extract | OpCode::Concat | OpCode::Select
+        )
+}
+
+/// The low `k` bits of `x` when `i` is `x & (2^k − 1)`, `k` below its width.
+fn low_mask_of(cx: &Context, i: u32) -> Option<(u32, u16)> {
+    let p = cx.node(i);
+    if p.op != OpCode::And || p.width > 64 {
+        return None;
+    }
+    let (x, k) = match (cx.const_val(p.a), cx.const_val(p.b)) {
+        (None, Some(k)) => (p.a, k.limbs()[0]),
+        (Some(k), None) => (p.b, k.limbs()[0]),
+        _ => return None,
+    };
+    let bits = k.trailing_ones() as u16;
+    (bits > 0 && bits < p.width && k >> bits == 0).then_some((x, bits))
+}
+
+impl Hoist {
+    /// Reads `a` and `b` (of one width) side by side.
+    fn pair(
+        &mut self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        a: u32,
+        b: u32,
+    ) -> Result<(), Stop> {
+        if a == b || self.seen.contains_key(&(a, b)) {
+            return Ok(());
+        }
+        r.meter.charge(Counter::PassWork, 1)?;
+        if let Some((s, o)) = self.wider(r, cx, a, b)? {
+            self.seen.insert((a, b), Paired::Slice(s, o));
+            self.found.push(s);
+            self.ops += 1;
+            return Ok(());
+        }
+        let (na, nb) = (cx.node(a), cx.node(b));
+        let (ka, kb) = ([na.a, na.b, na.c], [nb.a, nb.b, nb.c]);
+        let arity = na.op.arity();
+        // One operation with the same parameters, over operands of the same widths.
+        let same = na.op == nb.op
+            && pairable(na.op)
+            && na.width == nb.width
+            && (0..3).all(|s| {
+                if s < arity {
+                    cx.wid(ka[s]) == cx.wid(kb[s])
+                } else {
+                    ka[s] == kb[s]
+                }
+            });
+        if self.ops < MAX_HOIST && !(self.live && self.exists(r, cx, a, b)?) {
+            if same {
+                self.seen.insert((a, b), Paired::Node);
+                self.ops += 1;
+                for s in 0..arity {
+                    self.pair(r, cx, ka[s], kb[s])?;
+                }
+                return Ok(());
+            }
+            let mixed = match (na.op, nb.op) {
+                (OpCode::And, OpCode::Zext) => low_mask_of(cx, a)
+                    .filter(|&(_, k)| k == cx.wid(nb.a))
+                    .map(|(x, k)| (Some(x), None, k)),
+                (OpCode::Zext, OpCode::And) => low_mask_of(cx, b)
+                    .filter(|&(_, k)| k == cx.wid(na.a))
+                    .map(|(y, k)| (None, Some(y), k)),
+                _ => None,
+            };
+            if let Some((x, y, k)) = mixed {
+                let a2 = match x {
+                    Some(x) => r.build(cx, |cx| cx.c_extract(x, 0, k))?,
+                    None => na.a,
+                };
+                let b2 = match y {
+                    Some(y) => r.build(cx, |cx| cx.c_extract(y, 0, k))?,
+                    None => nb.a,
+                };
+                self.seen.insert((a, b), Paired::Zext(a2, b2));
+                self.ops += 1;
+                return self.pair(r, cx, a2, b2);
+            }
+        }
+        self.seen.insert((a, b), Paired::Leaf);
+        self.leaves.push((a, b));
+        Ok(())
+    }
+
+    /// Whether `select(c, a, b)` exists and something live reads it.
+    fn exists(&self, r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32) -> Result<bool, Stop> {
+        let word = crate::expr::Node::new(OpCode::Select, cx.wid(a), self.c, a, b);
+        let Some(s) = cx.find(&word).filter(|&s| s != self.n) else {
+            return Ok(false);
+        };
+        super::refresh_uses(r, cx)?;
+        Ok(r.life.live.uses(s).is_some_and(|u| u > 0))
+    }
+
+    /// A `select` on the condition that exists, that something live reads, and whose two
+    /// values `a` and `b` are the same slice of, with where the slice starts: the values are
+    /// looked for at the byte, 16-, 32- and 64-bit boundaries around `a` (a limb read out of
+    /// a register whose half is selected whole elsewhere).
+    fn wider(
+        &self,
+        r: &mut Runner<'_, '_>,
+        cx: &Context,
+        a: u32,
+        b: u32,
+    ) -> Result<Option<(u32, u16)>, Stop> {
+        let (na, nb) = (cx.node(a), cx.node(b));
+        if na.op != OpCode::Extract || nb.op != OpCode::Extract {
+            return Ok(None);
+        }
+        let (x, i, len) = (na.a, na.b as u16, na.width);
+        let (y, j) = (nb.a, nb.b as u16);
+        // The slice `[lo, lo + w)` of `v`, where it is a node.
+        let slice = |v: u32, lo: u16, w: u16| {
+            if lo == 0 && w == cx.wid(v) {
+                Some(v)
+            } else {
+                cx.find(&crate::expr::Node::new(
+                    OpCode::Extract,
+                    w,
+                    v,
+                    u32::from(lo),
+                    0,
+                ))
+            }
+        };
+        for w in [8u16, 16, 32, 64] {
+            let (lp, o) = (i - i % w, i % w);
+            if w <= len || o + len > w || j < o {
+                continue;
+            }
+            let lq = j - o;
+            if u32::from(lp) + u32::from(w) > u32::from(cx.wid(x))
+                || u32::from(lq) + u32::from(w) > u32::from(cx.wid(y))
+            {
+                continue;
+            }
+            let (Some(p), Some(q)) = (slice(x, lp, w), slice(y, lq, w)) else {
+                continue;
+            };
+            let word = crate::expr::Node::new(OpCode::Select, w, self.c, p, q);
+            if let Some(s) = cx.find(&word).filter(|&s| s != self.n) {
+                super::refresh_uses(r, cx)?;
+                if r.life.live.uses(s).is_some_and(|u| u > 0) {
+                    return Ok(Some((s, o)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The pair `(a, b)` over the `select`s of the leaves (`of`).
+    fn build(
+        &self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        of: &IdMap<(u32, u32), u32>,
+        memo: &mut IdMap<(u32, u32), u32>,
+        a: u32,
+        b: u32,
+    ) -> Result<u32, Stop> {
+        if a == b {
+            return Ok(a);
+        }
+        if let Some(&v) = memo.get(&(a, b)) {
+            return Ok(v);
+        }
+        let v = match self.seen[&(a, b)] {
+            Paired::Leaf => of[&(a, b)],
+            Paired::Slice(s, o) => {
+                let len = cx.wid(a);
+                r.build(cx, |cx| cx.c_extract(s, o, len))?
+            }
+            Paired::Zext(a2, b2) => {
+                let w = cx.wid(a);
+                let low = self.build(r, cx, of, memo, a2, b2)?;
+                r.build(cx, |cx| cx.c_zext(low, w))?
+            }
+            Paired::Node => {
+                let (na, nb) = (cx.node(a), cx.node(b));
+                let (mut kids, kb) = ([na.a, na.b, na.c], [nb.a, nb.b, nb.c]);
+                for s in 0..na.op.arity() {
+                    kids[s] = self.build(r, cx, of, memo, kids[s], kb[s])?;
+                }
+                r.build(cx, |cx| cx.rebuild(a, kids))?
+            }
+        };
+        memo.insert((a, b), v);
+        Ok(v)
+    }
+}
+
+/// `select(c, F(a), F(b))` as `F(select(c, a, b))`: the two arms are read side by side, and
+/// where they are the same operations over operands that differ only in a few pairs (at most
+/// [`MAX_BASES`], a pair that is the same slice of both values of another counting with it),
+/// the operations are done once, over the `select`s of those pairs. A register read limb by
+/// limb, each limb its own chain of `select`s over slices of the registers, is the limbs of
+/// the one chain over the registers themselves; a word shifted by a count taken from itself,
+/// selected after the shift, is the shift of the selected word.
+///
+/// The arms are read as far as they agree, where that makes the DAG smaller; otherwise down to
+/// pairs whose `select` exists and something live reads.
+fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let (c, a, b) = (node.a, node.b, node.c);
+    let start = cx.len() as u32;
+    let mut fin = Fin::FINAL;
+    // What the first reading ended at: the second is tried where it ends elsewhere.
+    let mut first: Option<Hoist> = None;
+    for live in [false, true] {
+        let mut h = Hoist {
+            n,
+            c,
+            live,
+            seen: IdMap::default(),
+            leaves: Vec::new(),
+            found: Vec::new(),
+            ops: 0,
+        };
+        h.pair(r, cx, a, b)?;
+        if h.ops == 0
+            || first
+                .as_ref()
+                .is_some_and(|t| t.leaves == h.leaves && t.found == h.found)
+        {
+            continue;
+        }
+        // A slice of a value: the value, and where the slice is.
+        let view = |cx: &Context, v: u32| {
+            let p = cx.node(v);
+            if p.op == OpCode::Extract {
+                (p.a, p.b as u16, p.width)
+            } else {
+                (v, 0, p.width)
+            }
+        };
+        // The leaves that are the same slice of both values of a wider leaf (the widest
+        // such), and how far into it.
+        let slice_of = |cx: &Context, (x, y): (u32, u32)| {
+            let ((vx, i, len), (vy, j, _)) = (view(cx, x), view(cx, y));
+            h.leaves
+                .iter()
+                .filter_map(|&(p, q)| {
+                    let ((vp, lp, wp), (vq, lq, _)) = (view(cx, p), view(cx, q));
+                    (vp == vx
+                        && vq == vy
+                        && wp > len
+                        && i >= lp
+                        && j >= lq
+                        && i - lp == j - lq
+                        && i - lp + len <= wp)
+                        .then(|| (wp, (p, q), i - lp))
+                })
+                .max_by_key(|s| s.0)
+        };
+        let bases: Vec<(u32, u32)> = h
+            .leaves
+            .iter()
+            .copied()
+            .filter(|&l| slice_of(cx, l).is_none())
+            .collect();
+        if bases.len() > MAX_BASES {
+            first = Some(h);
+            continue;
+        }
+        let mut of: IdMap<(u32, u32), u32> = IdMap::default();
+        // What the candidate is built over: the condition, the pairs, and a pair's `select`
+        // itself where it exists and something live reads it (it is there either way).
+        let mut atoms = vec![c];
+        for &(x, y) in &bases {
+            let there = h.exists(r, cx, x, y)?;
+            let s = r.build(cx, |cx| cx.c_select(c, x, y))?;
+            of.insert((x, y), s);
+            if there {
+                atoms.push(s);
+            } else {
+                atoms.extend([x, y]);
+            }
+        }
+        for &l in &h.leaves {
+            if let Some((_, base, o)) = slice_of(cx, l) {
+                let (s, len) = (of[&base], cx.wid(l.0));
+                of.insert(l, r.build(cx, |cx| cx.c_extract(s, o, len))?);
+            }
+        }
+        atoms.extend(&h.found);
+        let e = h.build(r, cx, &of, &mut IdMap::default(), a, b)?;
+        match finish(r, cx, PassKind::Casts, n, e, start, &atoms, fin)? {
+            Step::Normal(f) => fin = f,
+            step => return Ok(step),
+        }
+        first = Some(h);
+    }
+    super::discard(r, cx, start);
+    Ok(Step::Normal(fin))
+}
+
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
     if let Some((k, x)) = sext_idiom(cx, n) {
@@ -458,6 +1061,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if node.op == OpCode::Concat {
         return rejoined(r, cx, n);
     }
+    if node.op == OpCode::Select {
+        return hoisted(r, cx, n);
+    }
     if node.op != OpCode::Extract {
         return Ok(Step::Normal(Fin::FINAL));
     }
@@ -467,6 +1073,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         stops: Vec::new(),
         pushes: 0,
         fin: Fin::FINAL,
+        own: Some(n),
+        whole: false,
+        arms: 0,
     };
     let e = narrow(r, cx, &mut st, node.a, node.b as u16, node.width)?;
     if st.pushes > MAX_PUSHES {

@@ -534,6 +534,24 @@ impl Rem<i32> for Int {
     }
 }
 
+impl core::ops::BitXor for Int {
+    type Output = Int;
+    fn bitxor(self, o: Int) -> Int {
+        Int([
+            self.0[0] ^ o.0[0],
+            self.0[1] ^ o.0[1],
+            self.0[2] ^ o.0[2],
+            self.0[3] ^ o.0[3],
+        ])
+    }
+}
+
+impl core::ops::BitXorAssign for Int {
+    fn bitxor_assign(&mut self, o: Int) {
+        *self = *self ^ o;
+    }
+}
+
 impl core::ops::Not for Int {
     type Output = Int;
     fn not(self) -> Int {

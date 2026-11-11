@@ -202,6 +202,341 @@ chapter, *Solving*).
 - **`CheckConfig::with_require_proofs`**: a rule the native prover left undecided at some
   width is then inconclusive, for admitting rules nobody reviewed. Off by default.
 - **A fuzz target for the prover** (`prove_dag`).
+## 0.29.0
+
+- **A relation between two nodes is proved on the expression as written first.** The
+  opaque-constant sweep proves a node equal to an earlier one plus a constant on their
+  difference with each operand taken on the bits its user reads. That writes one value read
+  under several masks once per mask, a sum with a constant as a sum of its own for each, and
+  a relation that is a bitwise identity over the value was then one over several carry
+  chains: half the proofs of a measured call took a thousand solver steps or more, and the
+  ones the readings could not find took their whole share. The difference as written is now
+  read first, within an eighth of that share. A question asked with an eighth of the usual
+  fuel went from 312 nodes to 80 in half the time, and the 44 `forms_simplify` questions of
+  the same set take a third less time (13% less CPU over the 140; the 16 proofs of that set
+  take a tenth more, their relations being the ones the reduction proves).
+- **The MBA phase leaves the sweep a part of the solver's steps.** Where the opaque-constant
+  sweep runs, the phase's questions stop a sixteenth of the call's steps short. What a round
+  leaves is often a sum the sweep's certificates decide in a few hundred steps, and the
+  solver's last questions of the round had taken every step: the question above stops at 42
+  nodes with the part kept.
+- **With the solver's steps gone, the sweep's certificates are pass work.** A certificate of
+  the opaque-constant sweep is charged to the call's MBA solver steps, and with none left
+  the sweep asked nothing more, whatever the call still had of pass work (four fifths of it,
+  in the question above). Once fewer steps are left than a small certificate takes, the
+  sweep's certificates are charged as pass work, as the gate's are: 32,768 units each at
+  most and an eighth of the call's pass work in all. What decides a sum over one value under
+  masks is a comparison of two forms, a few hundred evaluations. The question above folds to
+  its constant at its own fuel, in three quarters of the time it took to stop at 312 nodes;
+  all 47 `engine` roots of the set are constants.
+- **A settled root is read on either side of its condition** (`MbaConfig::noise_forms`). An
+  obfuscator picks between two masked values by a flag (the parity of a byte, in the
+  measured set) and computes with the one picked. With the flag fixed one of the two is a
+  constant and everything computed from it folds, but the root as a whole is a function of
+  both, and no pass reads it one case at a time. The root the rounds settle on is now split
+  on the condition its selects test most, each side is swept and given one round, and the
+  two are written as one expression again with the choice as far down as they agree
+  (`select(c, a * k1 + b, a * k2 + b)` is `a * select(c, k1, k2) + b`). The smallest of the
+  settled root, the select of the sides and the joined form is the result, so none is larger
+  than before: 41 of the 44 `forms_simplify` roots of the set are smaller, 7,391 nodes to
+  6,407 in all, for 15% more time on those questions (the 140 take the same time within
+  what repeated runs differ by). A run whose budget ends on the sides reports that.
+- **A fragment not answered whole is asked over its atoms.** A sum like
+  `(a & b) + (b & c) - 2·(a & b & c)`, which is `(a ^ c) & b`, over an `a` and a `b` that are
+  products of one value is a question about that value when read whole: costly, declined,
+  and every sum holding it was then not asked at all. Such a fragment is now asked with the
+  arithmetic under its bitwise operators as atoms, within the steps of a retried question.
+- **Values of one or two words take a short path.** A `BitVec` holds eight limbs whatever
+  its width, and equality, the hash, `is_zero`, `is_ones`, the conversions and the
+  constructors read or wrote all eight: for the 64-bit values of a measured set, a tenth of
+  the time. They read the active limbs now (one word at 64 bits and below); a slice, a
+  concatenation and a sign extension within 128 bits are native; the internal hasher takes a
+  small field in one round; and three buffers that grew a push at a time are sized once (a
+  question's scan, its lowered form, and a node's samples, whose operands are looked up once
+  a node, not once a point). 140 measured calls take 3 to 5% less time with the same results.
+  The layout is unchanged (values up to 512 bits stay `Copy`); a `BitVec`'s hash is that of
+  its width and active limbs, no longer the derived one.
+
+Operations of many operands in the words pass, and the forms 0.28.0 names as not read whole.
+On the corpus of 0.28.0, and on 592 expressions written for the purpose: one operation (XOR,
+sum, AND, OR) over 2 to 128 operands, written twice in two orders and groupings and
+compared, subtracted, sliced and masked; and a word made handler by handler in limbs from as
+many operands (XORs spelled `x + y − 2·(x & y)`, sums, differences, and the three mixed),
+its high limb read alone, against the same chain in another order, and against the word
+written as nodes.
+
+- **An XOR is one value however it was grouped.** The words pass read `x ^ y` as `x + y −
+  2·(x & y)`, a different form for each grouping of three values or more: two orders of one
+  XOR were not seen equal from 4 operands on, and a word XORed in limbs was not read from 5
+  (62 nodes left where 10 are the answer, 2,664 at 128 operands). An XOR is now also a term
+  of its own: of its operands as integers, any number of them, each once and in one order,
+  the operands of an XOR among them its own and two of one gone. A slice of it is the XOR of
+  the slices, so the limbs of an XOR are slices of the one term; an AND has the relation
+  `2·(x & y) = x + y − (x ^ y)` with it, and every sum is kept at the member of its class
+  with the fewest terms, so the XOR spelled as a sum is the same term, `(x ^ y) + 2·(x & y)`
+  is `x + y` and `(x ^ y) + (x & y)` is `x | y`. `trunc<20>(((a >>u 12) ^ (b >>u 12)) ^ (c
+  >>u 12))` is `extract<12, 20>(a ^ b ^ c)`.
+- **A root is asked with each reading of its XORs, and the smallest answer is kept.**
+  Bitwise code is read by the terms; arithmetic done on an XOR in limbs is read by the sum,
+  whose carries are the arithmetic's; and the operands of a term that are truncations of
+  wider words read better as the words where sums are made of them, and as the values where
+  they are not. So a root is asked with the terms over the words, with them over the values
+  where that differs, and with the sums (the forms the pass had) where arithmetic was done
+  on an XOR. Of two answers as small the sums' is taken, and the root that is the sums'
+  answer is asked with the sums again, so a root with nothing of the kind under it is read
+  as before. Where the terms' answer is the smaller, the smallest is not known yet: the sums
+  find what they find in several steps, each from the root the one before left, and the
+  terms' smaller root is not always one anything more is found from. Both answers are then
+  followed to where nothing more is found (the sums' with the sums alone, the terms' with
+  every reading) and the end with the smaller DAG is taken. A later question may take about
+  twice the work of the first, and once those not taken have cost a call 2^23 only the
+  first is asked.
+- **A chain of ANDs or of ORs is read with its operands in one order**, each once, whatever
+  the order and the grouping it was written in (three operands or more, through at most 256
+  nodes): `(a & b & c) ^ (c & (b & a))` is 0. Two orders of one chain were not always seen
+  equal: from 4 operands of an OR on under `==`, from 6 of an AND.
+- **A value chosen limb by limb between a register and a constant is the limbs of one
+  choice.** With the XOR terms a choice against a constant is taken apart, `c ? K : b` being
+  `K·c + (c ? 0 : b)` and `c ? a : K` being `K − K·c + (c ? a : 0)`: each limb's choice
+  against its own digits of the constant is then a slice of the one choice against 0, and
+  the floor of a choice against a constant is the choice between the floors. Written back,
+  the constant and the choice against 0 are the choice with the constant again.
+  `zext<32>(select(t, 113, trunc<12>(r))) | (zext<32>(select(t, 0x352ac, extract<12,
+  20>(r))) << 12)` is `select(t, 0x352ac071, r)`.
+- **A form may have 256 terms.** It had 40 at most, so a sum of 48 values was not one form:
+  two orders of it were not seen equal under `==` or a mask, nor was a sum of as many made in
+  limbs seen to be the word. A root with a form of more than 40 terms is asked with the
+  forms of 40 too.
+- **A refusal for depth is not counted against the next.** The algebra bounds how deep its
+  functions call one another, at 48. A call refused at the bound did not give its level
+  back, so each refusal lowered the bound for the rest of the root, and after 48 of them
+  every node was read as a value of its own. Found while the XOR terms were written.
+- **Writing an XOR of many operands is charged to the meter**, and looks for the XORs of
+  some of its operands that are already nodes in one pass over them (the longest first).
+
+Of the 592 expressions, two (a minimum of 96 and of 128 values written as nested `select`s)
+are refused by the parser for their depth, as before. Of the 590 others, every one of one
+operation in two orders is now seen to be one value, at every size, and a word XORed or
+added in limbs is read at every size, alone and against the word written as nodes. Two such
+chains in two orders are seen to be one value up to 48 operands (XOR) and 96 (sums); beyond
+that a part of each is read. Chains that mix sums, differences and XORs are read up to 10
+operands, as before, and six of them (24, 64 and 96 operands) are larger than before, by 1
+to 20 nodes; no other is larger.
+
+On the corpus the results have 6.8 percent fewer DAG nodes than with 0.28.0 (5,296,890
+against 5,681,862): 0.7 percent fewer on the local windows, 7.7 percent on the deep ones.
+19,309 of the 58,530 are smaller and 632 larger (by 3 nodes at the median, 81 at most,
+3,733 together against 388,705 saved); the same 10 run out of budget. The forms 0.28.0
+names as not read whole now are in the examples looked at: products of an XOR in limbs by a
+constant (35 nodes to 24, 35 to 22 and 23 to 21), XORs of several values in different
+orders (24 to 10), and a value chosen limb by limb between a constant and a register (52 to
+17; a second example of it, 38 nodes, is as before). The numbers are of the build before
+the last change, by which the work of the answers that are followed and not taken counts
+with the questions not taken: of the 57,672 results the build with it was run on, 46 are
+larger than there, by 401 nodes together, and none is smaller.
+
+The 632 larger ones, by the first rewrite at which the two runs of a call differ: in 541
+(2,928 nodes) this pass's answer is the smaller one and another pass ends larger after it,
+the result of a call depending on the path the passes take; in 32 (560 nodes) this pass's
+own answer is larger, the sums' question having been cut short by its allowance in the
+three looked at; in 17 (87) the two answers are as large and differ in form; in 35 (147)
+one of the two runs has no answer of this pass at that point; and in 7 (11) the runs
+differ first in another pass.
+
+Simplifying a sample of 3,000 of the corpus takes 1.21, 1.36 and 1.42 times the processor
+time it took (three runs of each, one after the other, on a loaded machine): a root is
+asked up to three times where it was asked once, and where two answers disagree both are
+asked on. The 590 expressions take 0.81 to 0.85 times theirs.
+
+More readings of limb arithmetic in the passes that run before the words pass (the carries
+pass's slice fit and the borrows it reads, the linear and demanded-bits passes), on the same
+corpus: a line of work begun before that pass, merged with it.
+
+- **A word several limbs read under different masks stays one node.** The demanded pass wrote
+  an operand once per mask it was read under, so a word read under 7 and under 14 bits became
+  two, each with its constants reduced to its reader's bits (`x * 7 - 59` beside
+  `x * -249 + 4933`). It now simplifies the operand a second time with each such node read
+  under the union of its masks, and takes that where it frees no fewer nodes.
+- **A narrowing uses a slice that is already there.** Where the casts pass, pushing an
+  `extract` in, reaches a node whose slice something else already reads, it stops at that
+  slice: `trunc<32>(zext<64>(a) + s)` beside `trunc<32>(s)` is `a + trunc<32>(s)`, where
+  narrowing `s` again built it a second time and paid for neither reader.
+- **Operations common to both arms of a `select` are done once.** `select(c, F(a), F(b))` is
+  `F(select(c, a, b))` where the arms are the same operations over operands that differ in a
+  pair or two (a pair that is the same slice of both values of another counts with it), and
+  the DAG gets smaller. A register read limb by limb, each limb through its own chain of
+  `select`s over slices of the registers, is the limbs of one chain over the registers.
+- **Limbs of one word in a linear form are the word.** `lo(W)·K + hi(W)·(K << k)` is `W·K`:
+  the linear pass reads each term that is some bits of a value (a mask, a shift, a slice, a
+  digit of a digit, the bits a `concat` or an extension passes on) as coefficients on those
+  bits, adds the coefficients of all terms over one value bit by bit, and writes the bits
+  again as the fewest slices. Any number of limbs join, in any spelling, and so do
+  `W - lo(W)` and a product of the word beside a product of one limb. An identity of the
+  integers modulo the form's width: nothing is proved.
+- **Limbs are joined modulo the bits that are read.** The demanded pass joins the limbs of a
+  sum under a mask at the mask's width, and reads a carry at the width of the union of its
+  readers' masks, where the sum's own width allowed neither.
+- **A carry is read against the word a low digit was computed apart from.** A handler
+  computes a low digit at the digit's own width, the word's constants reduced to it
+  (`trunc<9>(x) * 177` for the low 9 bits of `x * 0x2d4b1`). Where a sum holds a high digit
+  of a word and a carry of such a digit, the digit is read as the word's low bits:
+  `zext(t + 301 <u t) + extract<9, 9>(x * 0x2d4b1)` with `t` that digit is
+  `extract<9, 9>(x * 0x2d4b1 + 301)`.
+- **`low != 0` is the borrow of a negation**: `hi(a) - hi(-b) - [lo(b) != 0]`-shaped sums are
+  read like the ones with `<u`.
+- **The slice fit reads more shapes.** A slice of a sum above its low bits, and a value put
+  together with `|` or `concat` read whole, are looked for as slices of a wide node like a
+  sum under a read of its low bits; a value whose cone holds such a slice counts as limb
+  code. The proofs of these have an allowance of undecided ones of their own.
+- **A difference compared with its own constant** (`a - (b + k) == -k`) is `a == b`.
+- **A carry out of a middle digit is read.** A comparison of the bits `[o, o + n)` of two
+  values, a constant added to either, is the comparison of their low `o + n` bits unless the
+  digit of their difference is all ones and a carry comes into it; where a bit of that digit
+  is known 0 the carries pass reads it so. A constant added limb by limb writes its carries
+  this way: `zext(extract<10, 10>(x + 837) - 156 <u extract<10, 10>(x)) + extract<20, 12>(x)`
+  is `extract<20, 12>(x + 0xd9345)`.
+- **Digits computed in a register narrower than the word are the word's.** Where the sides of
+  a carry are truncations of wider values, the sum reads more bits than the register has
+  above the digit, and the sum holds a high digit of a value that wide, the carry is read at
+  that width: the middle limb of a 64-bit `x - y` in limbs of 26 bits, its low limb computed
+  in 32 bits, is `extract<26, 26>(x - y)`.
+- **Digit terms that are one value written two ways meet in more spellings.** A partial
+  product shifted into place beside the product's own high digit (the zeros all the
+  coefficients of a form end in are dropped and the slice read that much lower); a slice of
+  a sum beside the slice of the same sum under a constant that differs above the digit; a
+  slice of a bitwise value under another operation beside that operation over the slices
+  (`hi(a ^ b) & c` and `(hi(a) ^ hi(b)) & c`); the limbs of one word held apart by the two
+  sides of a carry, joined in their difference.
+- **The terms beside one high digit are taken into its word.** `A + hi_k(P)` is
+  `hi_k(P + (A << k))`: where a sum is left a high digit and terms that are limbs of the
+  same word once shifted (the cross products of a schoolbook high limb), it is the slice of
+  the joined word: the high limb of a product by a constant in 13-bit digits is
+  `extract<26, 6>(x * K)`.
+- **An XOR or an OR with a constant written as a sum is read as one.** In a linear form that
+  holds `a & c` for a constant `c`, a term over `a ^ c` or `a | c` is written over `a & c`
+  (`a ^ c = a + c - 2·(a & c)`), so a carry whose two sides are the sum and the XOR has a
+  difference that cancels; and `a + c - 2·(a & c)` alone is `a ^ c`.
+- **A sum is read on the bits that reach the root.** A rewrite replaces a node by an equal
+  one, so a limb's sum read through two truncations was read at neither: each reader's
+  rewrite pays only once the other has let the sum go. After its walk the demanded pass now
+  takes the root, computes the bits of every node below it that reach it, reads each sum
+  with carries on those bits, costs each reading at its sum, and commits the root written
+  over the readings where that is smaller. Taken where the round left the root unchanged.
+- **A slice across the seam of a `concat` is narrowed in an arm of a `select`**:
+  `extract<22, 10>(select(c, concat(a:6, concat(b:11, x)), g))` is
+  `select(c, concat(a, extract<7, 4>(b)), extract<22, 10>(g))`, and `x` is no longer read.
+- **Slice proofs: products as fresh symbols, and questions that are not asked twice.** In the
+  scratch copy a slice proof is asked on, the highest products and variable shifts below
+  the two sides are fresh symbols (an identity over a free symbol holds at the product's
+  values; a copy that is refuted is asked again as it is). The proofs use the prover's
+  carry-save multiplication and three-input XOR encodings. A second candidate is not asked
+  after an undecided one, nor a question most of whose own sums and comparisons an undecided
+  question had, nor a shape left undecided in an earlier round.
+- **A slice proof is first asked with its sums written one way on both sides.** The search
+  does not see through sums: `(a + b) + c` against `a + (b + c)` at 21 bits costs it a
+  hundred thousand propagations, and a limb against its word is that question. The prover
+  has an option, `prove::Config::shared_sums` (off by default), that reads both sides of a
+  question as linear forms over slices, slices of sums as high digits and one carry,
+  comparisons of low digits as carries, and writes them again in one order; the slice fit
+  asks each question so first (2^14 propagations), then as it stands. One question in ten
+  is decided by the form alone.
+- **A carry-out detector with a carry in is the carry at the limb's upper boundary.**
+  `[b + 1 & M == 0] & c | [lo(s) <u a]` (the limb below is all ones and a carry comes in, or
+  the limb's own sum wrapped), the test of a middle limb's carry in an addition of three
+  limbs or more, is `[lo_m(P) <u lo_m(Y)]` at the upper boundary `m` of the limb, and is
+  read as the high digits like any carry: the top limb of a constant added in limbs of 13,
+  13 and 6 bits is `extract<26, 6>(x + k)`. The limb's own sum is read for it as a slice of
+  a word with its other terms beside it, whatever the sum itself is left; a carry whose sum
+  reads more bits than its sides have is read at the width of a wider word the sum holds a
+  high digit of (the top limb in a register wider than the word); and `x & M != M` is the
+  borrow of subtracting 1.
+- **The borrow of an XOR or an OR with a constant done in limbs is read.** The low limb of
+  `x ^ c` (written `x + c − 2·(x & c)`) compared with that of `x + c` is a borrow whose two
+  sides differ by `2·(x & c)`; the difference was left as `x + c − (x ^ c)`, a term with a
+  high digit of its own, once the sum had become the XOR. It is read through the
+  conjunction: `extract<18, 14>(x + c) − [lo(x + c) <u lo(x ^ c)]` is `extract<18, 14>(x)`
+  for a `c` below the limb's top bit.
+- **A carry read on more bits than its sides have is read off the sum with its carry out.**
+  A register wider than the limb keeps the carry out of the word: `(a >>u 10) + (b >>u 10) +
+  [lo(a + b) <u lo(a)]` on all 16 bits of a 16-bit register is no slice of `a + b`. With `S
+  = zext(Q) + zext(P − Q)` the comparison is `hi(S) − hi(Q) − hi(P − Q)` of the integers, on
+  any number of bits and with no fact needed. The carries of one word are read together
+  (the borrow of an XOR written `a + b − 2·(a & b)` against the same `S`, where the
+  difference is the conjunction), so a chain of such handlers telescopes; a window on a
+  limb's raw sum, 70 nodes of carries and borrows, becomes two slices. A slice of `zext(a) +
+  zext(b)` below the carry is the slice of `a + b`.
+- **A carry is read over the word its sum holds a digit of, where its sides are another
+  spelling of that word.** `[lo(P) <u lo(Q)]` depends on `P` and `Q` modulo `2^k` only. A
+  product computed digit by digit (`lo26(x)·k0 + lo13(x)·(k1 << 13)`, the product modulo
+  2^26) or with its constant reduced to the limb's bits is congruent to the product the high
+  limb is a digit of; the carry is read against that one, and the sum's own digit stands
+  for the carry's. The congruence is of the two linear forms with limbs joined, not a
+  comparison of spellings. `x·K + C` in limbs of 17 and 15 bits, 60 nodes, is `x·K + C`.
+- **One word at the root.** A sum that reaches the root on its low bits only is written over
+  another sum of its width that is read on more bits where the two are congruent there (the
+  product with its constant reduced to 20 bits beside the same product at 30): the limbs
+  of `X·K + C` are then slices of one node, and their `concat` is a shift.
+- **A constant beside a slice goes into the sum the slice is of** (`extract<lo, n>(B) + c` is
+  `extract<lo, n>(B + (c << lo))`) where that is smaller; a sum with a carry under `~` (`a −
+  ~c`, the way `a + c + 1` is written) is read; and the top limb of a product is joined
+  with the rest where it is written over `v` for a word `X = v ^ (v >>u s)` (the two agree
+  on the bits the shift leaves 0).
+- **A narrow value added into the middle of a word is that word's sum.** `extract<o, n>(a) +
+  t <u t`, the carry out of a digit to which a value that is no slice of anything was added,
+  is the carry out of bit `o + n` of `a + (zext(t) << o)`: nothing carries into the digit,
+  the shifted value being 0 below it. `zext<14>(zext<14>(b) + extract<32, 14>(a) <u
+  zext<14>(b)) + extract<46, 14>(a)` is `extract<46, 14>(a + (zext<64>(b) << 32))`. Digits
+  compared in a register wider than they are, are compared at their own width.
+- **A limb is read as the slice of a word that is no node.** The proved slice fit looked for
+  a value as a slice of a node below it. A handler that adds a constant adds it limb by
+  limb, so the node the low limb is masked from has only the constant's low digit, and a
+  window that reads a limb's raw sum past its register reads a word nobody computed. The
+  fit now also tries `extract<o, n>(B + C)` for a wide node `B`, the constant found at one
+  sample and checked at the rest, and `extract<o, n>(zext(a) ± zext(b) + C)` for a slice
+  past `B`'s width, each proved before it is taken (within 2^12 propagations: nine in ten
+  of those proved take none). Such a word is made in the late stage only: made below, it
+  stands in the way of the slice of a node above. `x·K + C` in limbs of 9 and 7 bits is
+  `extract<9, 7>(x·K + C)`.
+- **More spellings of a carry's sides and of its difference meet.** A side written `(T & 1)
+  << 13` is the low digit of `T << 13` (a word XORed with its own shift, in limbs); a carry
+  is read over the word whose high digit the sum holds for its difference (`P − Q` in
+  whatever spelling, where the sum holds the partial product shifted into place); the
+  difference is taken modulo the bits the carry depends on where a side's digit is a term
+  of the sum; `(t + s) − (t ^ s)` is `2·(t & s)` over `t` as it is written, where pushing a
+  slice into a product had hidden it; and `hi(a) ^ hi(b)` beside `lo(a ^ b)` is `a ^ b`
+  again.
+- **An undecided certificate does not take the call's pass work.** One answer's certificate
+  takes at most half of a call's pass work, and two answers no test decided were then the
+  whole of it where limb arithmetic asks hundreds of questions an expression. Once the
+  certificates that proved nothing have taken 2^24 units in a call, each further one is
+  held to 2^23 (or what a direct test costs, as before).
+- **A slice pushed into its operand is pushed once in a call.** The readings of limb
+  arithmetic ask for the same slices of the same nodes in every round and from three passes;
+  the answer reads the nodes and their facts only, and is kept.
+- **The rounds have a late stage.** A reading that leaves a sum as many terms as it had (a
+  carry written as the high digits it is, with nothing in the sum for them to cancel) is
+  worth taking only where the whole expression gets smaller by it, and taken early it stands
+  in the way of what the rounds read better (a limb proved a slice of its word one handler
+  up). Once a round has changed nothing, the deeper questions and the words pass have had
+  their turn, and a pass has left such a reading, the rounds go on with a flag set; under
+  it the step at the root takes those readings together, costed over the whole root, and
+  the stage's root is kept only if it is smaller than the one the stage began from, and
+  only if no limit declined in the stage a question that none had declined before it
+  (`Stage::Late` in `Event::Stage` says when it was given up).
+- **A demanded-bits phase that leaves the root larger is given up.** The pass commits one
+  reader at a time, each counted against the nodes it frees with the rest of the root as
+  it was; several readers of one word rewritten that way can leave the root larger than
+  the phase found it, and the words pass then reads less of it. The root the phase began
+  from is kept.
+
+On the corpus the results have 8.0 percent fewer DAG nodes with these readings than without
+them (4,933,096 against 5,363,041): 2.3 percent fewer on the local windows, 8.9 percent on
+the deep ones. 25,259 of the 58,530 are smaller and 6,442 larger (by 6 nodes at the median,
+336 at most, 86,061 together against 516,006 saved): a reading taken in the rounds, before
+the words pass asks, can leave it a root it reads less of. The windows with a carry left as
+a number go from 16,059 to 14,501, and 3 run out of budget where 10 did (other ones). Every
+result is equal to its input at 256 sampled points. The processor time is the same within
+what two runs differ by (0.95 times, one run of each on a loaded machine).
 
 ## 0.28.0
 

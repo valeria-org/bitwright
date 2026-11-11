@@ -5,7 +5,7 @@ members = ["bitwright", "bitwright-bench", "bitwright-cadical", "bitwright-cli",
 default-members = ["bitwright", "bitwright-bench", "bitwright-cli", "bitwright-ffi", "bitwright-ref", "bitwright-wasm"]
 
 [workspace.package]
-version = "0.28.0"
+version = "0.29.0"
 edition = "2024"
 rust-version = "1.88"
 license = "PolyForm-Noncommercial-1.0.0"

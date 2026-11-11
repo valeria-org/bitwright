@@ -1,10 +1,12 @@
 //! The words pass: soundness (exhaustive over narrow symbols), what it reads, that it reaches a
 //! fixed point, and that it does not depend on how an expression was built.
 
+use super::int::Int;
 use crate::engine::tests::{equivalent, generator};
 use crate::engine::{End, Engine, Phase, Run, Strategy};
+use crate::hash::IdMap;
 use crate::testutil::Rng;
-use crate::{Context, ParseOptions, Width};
+use crate::{BitVec, Context, Expr, ParseOptions, SymbolKey, Width};
 
 fn engine(phases: Vec<Phase>) -> Engine {
     Engine::builder()
@@ -199,6 +201,100 @@ fn words_fixtures() {
             "~concat(zext<48>(extract<16, 17>(x)), trunc<16>(x)) & 0x100050040".to_string(),
             64,
             "-1 - x & 0x100050040",
+        ),
+        // An XOR with twice the AND of the two is their sum; with the AND, their OR.
+        ("(a:32 ^ b:32) + (a & b) * 2".to_string(), 32, "a + b"),
+        ("(a:32 ^ b:32) + (a & b)".to_string(), 32, "a | b"),
+        // XORs of three values, grouped two ways, are one value;
+        (
+            "((a:32 ^ b:32) ^ c:32) - (b ^ (c ^ a))".to_string(),
+            32,
+            "0:32",
+        ),
+        // in limbs they are the limbs of the one XOR,
+        (
+            "trunc<20>(((a:32 >>u 12) ^ (b:32 >>u 12)) ^ (c:32 >>u 12))".to_string(),
+            20,
+            "extract<12, 20>(a ^ c ^ b)",
+        ),
+        (
+            "((a:32 & 4095) ^ (b:32 & 4095) ^ (c:32 & 4095)) \
+             | (((a >>u 12) ^ (b >>u 12) ^ (c >>u 12)) << 12)"
+                .to_string(),
+            32,
+            "a ^ c ^ b",
+        ),
+        // and an AND of two of them with the third has its relation with it.
+        (
+            "(a:32 ^ b:32 ^ c:32) + 2 * ((a ^ b) & c) - (a ^ b) - c".to_string(),
+            32,
+            "0:32",
+        ),
+        // A product of an XOR by a constant, the XOR and the product both done limb by limb.
+        (
+            "((a:32 & 0xffff) ^ (b:32 & 0xffff)) * 0x1234567 \
+             + ((a >>u 16) ^ (b >>u 16)) * 0x45670000"
+                .to_string(),
+            32,
+            "(a ^ b) * 0x1234567",
+        ),
+        (
+            "((a:32 & 0xffff) ^ (b:32 & 0xffff) ^ (c:32 & 0xffff)) * 0x1234567 \
+             + ((c >>u 16) ^ (a >>u 16) ^ (b >>u 16)) * 0x45670000"
+                .to_string(),
+            32,
+            "(a ^ c ^ b) * 0x1234567",
+        ),
+        // Two of one value cancel, under truncations.
+        (
+            "trunc<16>(x:32 ^ y:32) ^ trunc<16>(y) ^ trunc<16>(z:32)".to_string(),
+            16,
+            "trunc<16>(z) ^ trunc<16>(x)",
+        ),
+        // A value chosen limb by limb between a constant and a register is the limbs of the
+        // one choice: each limb is chosen against its own digits of the constant.
+        (
+            "zext<32>(select(c:1, 113, trunc<12>(r:32))) \
+             | (zext<32>(select(c, 0x352ac, extract<12, 20>(r))) << 12)"
+                .to_string(),
+            32,
+            "select(c, 0x352ac071, r)",
+        ),
+        (
+            "select(c:1, 0x352ac071, r:32) - (zext<32>(select(c, 113, trunc<12>(r))) \
+             | (zext<32>(select(c, 0x352ac, extract<12, 20>(r))) << 12))"
+                .to_string(),
+            32,
+            "0:32",
+        ),
+        (
+            "extract<12, 20>(select(c:1, r:32, 0x352ac071)) - select(c, extract<12, 20>(r), 0x352ac)"
+                .to_string(),
+            20,
+            "0:20",
+        ),
+        // ANDs and ORs of three, grouped two ways.
+        (
+            "(a:32 & b:32 & c:32) ^ (c & (b & a))".to_string(),
+            32,
+            "0:32",
+        ),
+        (
+            "(a:32 | b:32 | c:32) - (c | (a | b))".to_string(),
+            32,
+            "0:32",
+        ),
+        // An XOR of one value with a run of ones is the value and a slice of it, whichever
+        // of the value's terms comes first and with whatever sign.
+        (
+            "zext<8>(-2 <=u (trunc<2>(a:64 - b:64) ^ 1))".to_string(),
+            8,
+            "zext<8>(extract<1, 1>(a - b))",
+        ),
+        (
+            "zext<8>(-2 <=u (trunc<2>(b:64 - a:64) ^ 1))".to_string(),
+            8,
+            "zext<8>(extract<1, 1>(b - a))",
         ),
         // No digits and nothing that cancels: as it was.
         (
@@ -456,23 +552,167 @@ fn chain_text(g: &mut Rng) -> (String, u16) {
     }
 }
 
+/// `ops` joined by `op` in a random order and association.
+fn tree(g: &mut Rng, ops: &[String], op: &str) -> String {
+    let mut xs = ops.to_vec();
+    for i in (1..xs.len()).rev() {
+        xs.swap(i, g.below(i as u64 + 1) as usize);
+    }
+    while xs.len() > 1 {
+        let i = g.below(xs.len() as u64 - 1) as usize;
+        let joined = format!("({} {op} {})", xs[i], xs[i + 1]);
+        xs.splice(i..i + 2, [joined]);
+    }
+    xs.remove(0)
+}
+
+/// Bitwise operations of several values in random orders, mixed with sums, masks, shifts and
+/// constants, over 3-bit symbols in 6-bit registers: XORs and ANDs of the same operands
+/// written in different orders, an XOR spelled `x + y − 2·(x & y)` beside the one written
+/// `^`, complements, and slices of them.
+fn bitwise_text(g: &mut Rng) -> (String, u16) {
+    let sym = |g: &mut Rng| format!("zext<6>({}:3)", ["a", "b", "c", "d"][g.below(4) as usize]);
+    let value = |g: &mut Rng| {
+        let x = sym(g);
+        match g.below(8) {
+            0..=2 => x,
+            3 => format!("({x} << {})", g.below(4)),
+            4 => format!("({x} + {})", sym(g)),
+            5 => format!("({x} * {})", g.below(64)),
+            6 => format!("~{x}"),
+            _ => format!("{}:6", g.below(64)),
+        }
+    };
+    let n = 2 + g.below(4) as usize;
+    let ops: Vec<String> = (0..n).map(|_| value(g)).collect();
+    let word = |g: &mut Rng, ops: &[String]| {
+        let op = ["^", "^", "&", "|"][g.below(4) as usize];
+        match g.below(4) {
+            // Spelled as sums: `x + y − 2·(x & y)`, `x + y − (x & y)`.
+            0 => {
+                let mut x = ops[0].clone();
+                for o in &ops[1..] {
+                    let k = if g.chance(1, 4) { 1 } else { 2 };
+                    x = format!("({x} + {o} - ({x} & {o}) * {k})");
+                }
+                x
+            }
+            _ => tree(g, ops, op),
+        }
+    };
+    let (x, y) = (word(g, &ops), word(g, &ops));
+    let k = 1 + g.below(5);
+    match g.below(7) {
+        0 => (format!("{x} - {y}"), 6),
+        1 => (format!("({x} >>u {k}) - ({y} >>u {k})"), 6),
+        2 => (format!("{x} + {y} * {}", g.below(64)), 6),
+        3 => (format!("({x} & {}) ^ ({y} & {})", sym(g), sym(g)), 6),
+        4 => (format!("trunc<{k}>({x}) ^ trunc<{k}>({y})"), k as u16),
+        5 => (format!("({x} ^ {}) + ({y} | {})", g.below(64), sym(g)), 6),
+        _ => (format!("{x} == {y}"), 1),
+    }
+}
+
+/// Every node's form has the node's value, at every assignment of the symbols: the reading
+/// and the algebra, apart from what is written back; with each of the three kinds of forms a
+/// root is asked with.
+#[test]
+fn forms_have_the_values_of_their_nodes() {
+    let mut g = generator(0x3074_0005);
+    for i in 0..1600 {
+        let mut cx = Context::new();
+        let e = if i % 4 == 0 {
+            let w = 1 + g.rng.below(6) as u16;
+            g.expr(&mut cx, w, 5).0
+        } else {
+            let (src, w) = match i % 4 {
+                1 => limb_text(&mut g.rng),
+                2 => chain_text(&mut g.rng),
+                _ => bitwise_text(&mut g.rng),
+            };
+            cx.parse(&src, &ParseOptions::width(Width::new(w).unwrap()))
+                .unwrap()
+        };
+        let order: Vec<Expr> = cx.post_order(&[e]).unwrap();
+        let ids: Vec<u32> = order.iter().map(|&x| cx.id(x).unwrap()).collect();
+        let mut lift = match i % 3 {
+            0 => super::lift::Lift::default(),
+            1 => super::lift::Lift::values(),
+            _ => super::lift::Lift::plain(),
+        };
+        for &n in &ids {
+            lift.read(&cx, n);
+        }
+        let syms = cx.symbols_in(&[e]).unwrap();
+        let keys: Vec<(SymbolKey, Width)> = syms
+            .iter()
+            .map(|&s| {
+                (
+                    cx.symbol_key(s).unwrap().clone(),
+                    cx.symbol_width(s).unwrap(),
+                )
+            })
+            .collect();
+        let bits: u32 = keys.iter().map(|(_, w)| u32::from(w.bits())).sum();
+        let cases: u64 = if bits <= 12 { 1 << bits } else { 512 };
+        for case in 0..cases {
+            let mut rest = if bits <= 12 { case } else { g.rng.next() };
+            let vals: Vec<(SymbolKey, BitVec)> = keys
+                .iter()
+                .map(|(k, w)| {
+                    let v = rest & ((1u64 << w.bits()) - 1);
+                    rest = rest.rotate_right(u32::from(w.bits()));
+                    (k.clone(), BitVec::wrapping_from_u64(*w, v))
+                })
+                .collect();
+            let mut at: IdMap<u32, BitVec> = IdMap::default();
+            for &n in &ids {
+                let v = cx
+                    .eval_node(
+                        n,
+                        |j| at[&j],
+                        |k, _| vals.iter().find(|(kk, _)| kk == k).map(|(_, v)| *v),
+                    )
+                    .unwrap();
+                at.insert(n, v);
+            }
+            let leaf = |n: u32| at[&n].to_u128().map_or(Int::ZERO, Int::from);
+            for &n in &ids {
+                if cx.node(n).width > 64 {
+                    continue;
+                }
+                let f = lift.value(&cx, n).unwrap();
+                let (got, want) = (lift.alg.eval(&f, &leaf), leaf(n));
+                assert_eq!(
+                    got,
+                    want,
+                    "{} (in {}) at {vals:?}",
+                    cx.display(cx.handle(n)),
+                    cx.display(e)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn words_is_sound_and_idempotent() {
     let eng = engine(vec![Phase::Words]);
     let mut g = generator(0x3074_0001);
     let mut rng = Rng(5);
     let mut changed = 0;
-    for i in 0..3200 {
+    for i in 0..4000 {
         let mut cx = Context::new();
-        // Limb code, right and wrong; and every operator the pass reads, in any mixture.
-        let e = if i % 4 == 0 {
+        // Limb code, right and wrong; bitwise code in several orders; and every operator the
+        // pass reads, in any mixture.
+        let e = if i % 5 == 0 {
             let w = 1 + g.rng.below(6) as u16;
             g.expr(&mut cx, w, 5).0
         } else {
-            let (src, w) = if i % 4 == 3 {
-                chain_text(&mut g.rng)
-            } else {
-                limb_text(&mut g.rng)
+            let (src, w) = match i % 5 {
+                3 => chain_text(&mut g.rng),
+                4 => bitwise_text(&mut g.rng),
+                _ => limb_text(&mut g.rng),
             };
             cx.parse(&src, &ParseOptions::width(Width::new(w).unwrap()))
                 .unwrap()
@@ -511,12 +751,12 @@ fn words_is_sound_among_the_other_passes() {
         .unwrap();
     let mut g = Rng(0x3074_0002);
     let mut rng = Rng(6);
-    for i in 0..600 {
+    for i in 0..800 {
         let mut cx = Context::new();
-        let (src, w) = if i % 3 == 2 {
-            chain_text(&mut g)
-        } else {
-            limb_text(&mut g)
+        let (src, w) = match i % 4 {
+            2 => chain_text(&mut g),
+            3 => bitwise_text(&mut g),
+            _ => limb_text(&mut g),
         };
         let e = cx
             .parse(&src, &ParseOptions::width(Width::new(w).unwrap()))
@@ -743,4 +983,131 @@ fn words_reads_limbs_of_wide_words() {
         }
     }
     assert_eq!((read, wrong_kept), (60, 60));
+}
+
+/// A word made handler by handler in limbs of `k` and `32 − k` bits: each operand after the
+/// first joins it by XOR (`x`, written `w + o − 2·(w & o)`), by addition (`a`) or by
+/// subtraction (`s`), with the carries and borrows between the limbs. The handlers, and the
+/// high limb as a 32-bit value.
+fn limbs(ops: &[String], kinds: &[u8], k: u32) -> (String, String) {
+    fn add(lets: &mut Vec<String>, e: String) -> String {
+        lets.push(e);
+        format!("%{}", lets.len() - 1)
+    }
+    let m = (1u64 << k) - 1;
+    let mut lets: Vec<String> = Vec::new();
+    let mut word = ops[0].clone();
+    let mut low = add(&mut lets, format!("{word} & {m}"));
+    let mut high = add(&mut lets, format!("{word} >>u {k}"));
+    for (o, kind) in ops[1..].iter().zip(kinds) {
+        let ol = add(&mut lets, format!("{o} & {m}"));
+        match kind {
+            b'a' => {
+                let s = add(&mut lets, format!("{word} + {o}"));
+                let sl = add(&mut lets, format!("{s} & {m}"));
+                let carry = below(&sl, &low);
+                high = add(
+                    &mut lets,
+                    format!("{high} + ({o} >>u {k}) + zext<32>({carry})"),
+                );
+                (word, low) = (s, sl);
+            }
+            b's' => {
+                let s = add(&mut lets, format!("{word} - {o}"));
+                let sl = add(&mut lets, format!("{s} & {m}"));
+                let borrow = below(&low, &ol);
+                high = add(
+                    &mut lets,
+                    format!("{high} - ({o} >>u {k}) - zext<32>({borrow})"),
+                );
+                (word, low) = (s, sl);
+            }
+            _ => {
+                let a = add(&mut lets, format!("{word} & {o}"));
+                let s = add(&mut lets, format!("{word} + {o}"));
+                let x = add(&mut lets, format!("{s} + {a} * -2"));
+                let sl = add(&mut lets, format!("{s} & {m}"));
+                let xl = add(&mut lets, format!("{x} & {m}"));
+                let carry = format!("zext<32>({})", below(&sl, &low));
+                let borrow = format!("sext<32>({})", below(&sl, &xl));
+                let both = format!(
+                    "trunc<32>((zext<64>({high}) << 1) + zext<64>({low} >>u {}))",
+                    k - 1
+                );
+                high = add(
+                    &mut lets,
+                    format!(
+                        "-({o} >>u {} & {both}) + ({high} + ({o} >>u {k}) + {carry}) + {borrow}",
+                        k - 1
+                    ),
+                );
+                (word, low) = (x, xl);
+            }
+        }
+    }
+    let text = lets
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("let %{i} = {e}; "))
+        .collect();
+    (text, high)
+}
+
+/// One operation over many values is one value, whatever the order and the grouping it was
+/// written in: of 3 operands as of 100.
+#[test]
+fn many_operands_in_any_order_are_one_value() {
+    let eng = engine(vec![Phase::Words]);
+    let mut g = Rng(0x6d61_6e79);
+    for n in [3, 5, 12, 40, 100] {
+        let ops: Vec<String> = (0..n).map(|i| format!("v{i}:32")).collect();
+        for op in ["^", "+", "&", "|"] {
+            let (t, u) = (tree(&mut g, &ops, op), tree(&mut g, &ops, op));
+            assert_eq!(
+                simplify(&eng, &format!("{t} - {u}"), 32),
+                "0:32",
+                "{op} of {n}"
+            );
+            assert_eq!(
+                simplify(&eng, &format!("{t} == {u}"), 1),
+                "1:1",
+                "{op} of {n}"
+            );
+            // In a slice of the two, and under a mask.
+            let slices = format!("extract<7, 25>({t}) - extract<7, 25>({u})");
+            assert_eq!(simplify(&eng, &slices, 25), "0:25", "{op} of {n}");
+            let masked = format!("({t} & m:32) - ({u} & m:32)");
+            assert_eq!(simplify(&eng, &masked, 32), "0:32", "{op} of {n}");
+        }
+    }
+}
+
+/// A word made in limbs from many operands is read as the word: the high limb is the slice
+/// of the word the operations make, whatever order that one is written in.
+#[test]
+fn a_word_made_in_limbs_of_many_operands_is_the_word() {
+    let eng = engine(vec![Phase::Words]);
+    let mut g = Rng(0x6c69_6d62);
+    for (kind, op, sizes) in [
+        (b'x', "^", [2usize, 3, 5, 9, 24]),
+        (b'a', "+", [2, 3, 5, 9, 60]),
+    ] {
+        for n in sizes {
+            for k in [7, 18] {
+                let ops: Vec<String> = (0..n).map(|i| format!("v{i}:32")).collect();
+                let (lets, high) = limbs(&ops, &vec![kind; n - 1], k);
+                let w = 32 - k;
+                let word = tree(&mut g, &ops, op);
+                let src = format!("{lets}trunc<{w}>({high}) - extract<{k}, {w}>({word})");
+                let zero = format!("0:{w}");
+                assert_eq!(simplify(&eng, &src, w as u16), zero, "{op} of {n} at {k}");
+            }
+        }
+    }
+    // The operations mixed: the word is the operands joined in the handlers' order.
+    let ops: Vec<String> = (0..7).map(|i| format!("v{i}:32")).collect();
+    let (lets, high) = limbs(&ops, b"axsxas", 12);
+    let word = "((((((v0:32 + v1:32) ^ v2:32) - v3:32) ^ v4:32) + v5:32) - v6:32)";
+    let src = format!("{lets}trunc<20>({high}) - extract<12, 20>({word})");
+    assert_eq!(simplify(&eng, &src, 20), "0:20");
 }

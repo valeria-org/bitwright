@@ -528,7 +528,7 @@ mod tests {
     #[allow(dead_code)]
     #[derive(Hash)]
     enum KeyOp {
-        Const(BitVec),
+        Const(KeyValue),
         Var(u32),
         Add,
         Sub,
@@ -543,6 +543,14 @@ mod tests {
         Zext,
         Sext,
         Trunc,
+    }
+
+    /// A value as it was hashed then: its width and every limb of the widest (a `BitVec`
+    /// hashes its active limbs now).
+    #[derive(Hash)]
+    struct KeyValue {
+        width: Width,
+        limbs: [u64; KEY_LIMBS],
     }
 
     #[derive(Hash)]
@@ -567,7 +575,14 @@ mod tests {
             .iter()
             .map(|n| KeyNode {
                 op: match n.op {
-                    MOp::Const(v) => KeyOp::Const(v),
+                    MOp::Const(v) => {
+                        let mut limbs = [0u64; KEY_LIMBS];
+                        limbs[..v.limbs().len()].copy_from_slice(v.limbs());
+                        KeyOp::Const(KeyValue {
+                            width: v.width(),
+                            limbs,
+                        })
+                    }
                     MOp::Var(i) => KeyOp::Var(i),
                     MOp::Add => KeyOp::Add,
                     MOp::Sub => KeyOp::Sub,
