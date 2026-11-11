@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.0
 
 bitwright becomes a solver that also simplifies (see `docs/design.md` §0 and the book's new
 chapter, *Solving*).
