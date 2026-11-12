@@ -66,6 +66,13 @@ pub struct Split {
     /// condition its selects test (`c → p[c:=1]` and `¬c → p[c:=0]`): each half is a
     /// question of its own, so 2 means up to four cases. 0: never.
     pub cases: u8,
+    /// Ask the lowest hubs first, and each hub above with those proved below it written as
+    /// constants: every block of noise is then proved once, however many hubs and
+    /// questions lie above it, and a hub above is small when it is asked. The hubs are then
+    /// the nodes where a value that varies meets one that cancels it, not the topmost
+    /// constant ones. Without it (the default) a hub is asked as written first, which is
+    /// one proof where the engine folds it whole, and shares nothing below.
+    pub bottom_up: bool,
     /// Ask a question whole first, and cut it only when that does not decide it (a
     /// simplification is its own answer, so an [`Ask::simplify`] is then never cut). A
     /// question the engine settles by itself costs what it costs today, and its hubs are
@@ -88,6 +95,7 @@ impl Default for Split {
             nested: true,
             terms: true,
             cases: 1,
+            bottom_up: false,
             whole_first: true,
             points: 64,
             min_nodes: 4,
@@ -106,6 +114,16 @@ impl Split {
         Split::default().with_whole_first(false)
     }
 
+    /// For questions that share most of their structure (the words of one machine state,
+    /// say): hubs first and from the bottom ([`eager`](Self::eager) with
+    /// [`bottom_up`](Self::bottom_up)). A block of noise is proved once for every hub and
+    /// question above it. On a deobfuscator's walk of 714 such questions, 97% of whose
+    /// nodes an earlier question had, it took a third of the work of asking each hub as
+    /// written.
+    pub fn shared() -> Split {
+        Split::eager().with_bottom_up(true)
+    }
+
     /// No cut: every question is asked whole, as [`prove::valid_under`] or
     /// [`Engine::run`](crate::engine::Engine::run) would be in a context of its own.
     pub fn none() -> Split {
@@ -114,6 +132,7 @@ impl Split {
             nested: false,
             terms: false,
             cases: 0,
+            bottom_up: false,
             whole_first: false,
             points: 64,
             min_nodes: 4,
@@ -126,6 +145,7 @@ setters!(Split {
     with_nested: nested: bool,
     with_terms: terms: bool,
     with_cases: cases: u8,
+    with_bottom_up: bottom_up: bool,
     with_whole_first: whole_first: bool,
     with_points: points: u32,
     with_min_nodes: min_nodes: u32,
@@ -770,6 +790,19 @@ fn hubs_below(cx: &Context, s: &Sampled, from: &[u32], split: &Split) -> Vec<u32
             stack.extend(n.children());
             continue;
         }
+        if split.bottom_up {
+            // Where something that varies is cancelled; above that, constants meet.
+            let meets = n.children().any(|c| s.get(&c).is_some_and(|x| !x.0));
+            if !meets {
+                stack.extend(n.children());
+            } else if cx
+                .tree_size(cx.handle(i))
+                .is_ok_and(|t| t >= split.min_nodes)
+            {
+                hubs.push(i);
+            }
+            continue;
+        }
         let mut inner = n.children().filter(|&c| cx.node(c).op != OpCode::Const);
         match (inner.next(), inner.next()) {
             (Some(only), None) if cancels(only) => stack.push(only),
@@ -1405,7 +1438,7 @@ impl Session {
         job.state = State::Pending;
         let base = job.base;
         if let Plan::Hub { below, proofs, .. } = &mut job.plan {
-            below.clear();
+            below.truncate(job.base);
             *proofs = [None, None];
         }
         if let Plan::Ask {
@@ -1584,29 +1617,44 @@ impl Session {
         }
         let split = self.config.split;
         let wanted = st.graph.jobs[parent].wanted.clone();
-        for h in hubs_below(&st.cx, &st.sampled, from, &split) {
-            let key = Key {
-                what: What::Hub,
-                root: h,
-                assume: Arc::from([]),
-                k: None,
-            };
-            let new = !st.graph.by_key.contains_key(&key);
-            let stored = st.done.contains_key(&key);
-            let j = self.job(st, key, &wanted);
-            if new && stored {
-                st.stats.tasks_stored += 1;
-            } else if new {
-                st.stats.hubs += 1;
-                if let Plan::Hub { k, .. } = &mut st.graph.jobs[j].plan {
-                    *k = st.sampled[&h].1;
+        let mut made: Vec<usize> = Vec::new();
+        let mut work: Vec<(usize, Vec<u32>)> = vec![(parent, from.to_vec())];
+        while let Some((parent, from)) = work.pop() {
+            for h in hubs_below(&st.cx, &st.sampled, &from, &split) {
+                let key = Key {
+                    what: What::Hub,
+                    root: h,
+                    assume: Arc::from([]),
+                    k: None,
+                };
+                let new = !st.graph.by_key.contains_key(&key);
+                let stored = st.done.contains_key(&key);
+                let j = self.job(st, key, &wanted);
+                if new && stored {
+                    st.stats.tasks_stored += 1;
+                } else if new {
+                    st.stats.hubs += 1;
+                    if let Plan::Hub { k, .. } = &mut st.graph.jobs[j].plan {
+                        *k = st.sampled[&h].1;
+                    }
+                    made.push(j);
+                    if split.bottom_up {
+                        // The hubs below it are part of its plan.
+                        work.push((j, st.cx.node(h).children().collect()));
+                    }
+                }
+                self.depend(st, parent, j);
+                match &mut st.graph.jobs[parent].plan {
+                    Plan::Ask { hubs, .. } => hubs.push(j),
+                    Plan::Hub { below, .. } => below.push(j),
+                    Plan::Leaf => {}
                 }
             }
-            self.depend(st, parent, j);
-            match &mut st.graph.jobs[parent].plan {
-                Plan::Ask { hubs, .. } => hubs.push(j),
-                Plan::Hub { below, .. } => below.push(j),
-                Plan::Leaf => {}
+        }
+        // Ready once everything below each is attached.
+        for j in made {
+            if split.bottom_up {
+                st.graph.jobs[j].base = st.graph.jobs[j].deps.len();
             }
             self.ready_if(st, j);
         }
@@ -1732,6 +1780,12 @@ impl Session {
                             _ => false,
                         })
                     };
+                    let bottom_up = self.config.split.bottom_up;
+                    if stage == 0 && bottom_up {
+                        // Its hubs below are done: asked once, with them replaced.
+                        st.graph.jobs[j].stage = 2;
+                        continue;
+                    }
                     if stage == 0 {
                         // As written: where the engine folds the noise by itself, one
                         // proof serves for all that is below.
@@ -1754,7 +1808,7 @@ impl Session {
                         continue;
                     }
                     let pairs = self.substitution(st, &below);
-                    if stage == 2 && !pairs.is_empty() {
+                    if stage == 2 && (bottom_up || !pairs.is_empty()) {
                         let hub = self.substituted(st, key.root, &pairs)?;
                         if st.cx.const_val(hub) == Some(k) {
                             // Folded by the constants below it.

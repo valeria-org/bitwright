@@ -17,7 +17,7 @@
 //!   --batch DIR       a consumer's exported questions, one by one and through `bitwright::batch`
 //!                     (`--mode before|whole|split`, `--threads N`, `--shared-symbols`, `--warm`)
 //!   --walk DIR        a walk's exported questions, a directory per boundary, each a batch
-//!                     (`--mode whole|split|eager`, `--threads N`, `--no-deep`, `--answers FILE`)
+//!                     (`--mode whole|split|eager|shared`, `--threads N`, `--no-deep`, `--answers FILE`)
 //!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches

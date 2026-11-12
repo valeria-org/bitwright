@@ -128,7 +128,7 @@ fn add(total: &mut Stats, s: &Stats) {
     total.flushes += s.flushes;
 }
 
-/// `bitwright-bench --walk DIR [--mode whole|split|eager] [--threads N] [--no-deep]
+/// `bitwright-bench --walk DIR [--mode whole|split|eager|shared] [--threads N] [--no-deep]
 /// [--answers FILE]`.
 pub fn main(args: &[String]) -> ExitCode {
     let mut dir = String::new();
@@ -154,6 +154,7 @@ pub fn main(args: &[String]) -> ExitCode {
     let split = match mode.as_str() {
         "whole" => Split::none(),
         "eager" => Split::eager(),
+        "shared" => Split::shared(),
         _ => Split::default(),
     };
     let mut boundaries: Vec<_> = match std::fs::read_dir(&dir) {

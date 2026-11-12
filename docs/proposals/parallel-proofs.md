@@ -233,6 +233,45 @@ Reading them:
   than copies, but a fork has the base's node order and whatever the base remembers, which is
   what the answers must not depend on; the batch copies.
 
+## A real walk (added after 0.31.0)
+
+The consumer then exported one walk with its own symbol keys: 714 "is this stack word a
+constant?" questions over 26 boundaries, median 1,801 nodes, 97.2% of each question's nodes
+already asked about. `bitwright-bench --walk DIR` asks each boundary as one batch of one
+session, and again with the walk's deep fuel what stays open. The walk's own decisions
+(stock proof, hubs by hand, retries; one thread) took 23.5 s and found 655 constants. The
+machine was at load 14 to 48 on 20 cores; each configuration was run once.
+
+| | 1 thread | 4 threads | 8 threads | CPU at 8 | Peak at 8 | Constants |
+|---|---|---|---|---|---|---|
+| `Split::none()` | 14.9 s | | 4.1 s | 22.9 s | 164 MB | 632 |
+| default (whole first) | 31.7 s | 11.2 s | 7.2 s | 41.0 s | 225 MB | 674 |
+| `Split::eager()` | 30.2 s | 9.6 s | 7.1 s | 38.6 s | 205 MB | 674 |
+| `Split::shared()` (hubs first, from the bottom) | 9.5 s | 2.4 s | 1.9 s | 6.7 s | 123 MB | 674 |
+
+Answers and costs were byte-identical at 1, 4 and 8 threads in every row, and the three
+split rows give the same answers as each other.
+
+- **Sharing is the larger part of the gain, once hubs are asked from the bottom.** A profile
+  of `eager` showed 63% of the time in hub proofs the engine folds alone, 1,159 of them at
+  14 ms each: a topmost hub is nearly its whole question, so asking it as written reaches
+  nothing the questions share. `Split::bottom_up` asks the nodes where a varying value is
+  cancelled, lowest first, and each hub above with those below written as constants: 1,393
+  such proofs at 4 ms, and 1,170 tasks served from the store. On one thread that is 9.5 s
+  against 30.2 s (and against the walk's 23.5 s); threads take it to 1.9 s.
+- **Failing fast.** With `shared`, 11% of task time goes to 24 hubs that only sample
+  constant and are refuted by the search, and under 2% to hubs left undecided; each is
+  stored, so no sibling repeats it. The 27 questions that vary are answered from the
+  samples at no cost.
+- **Against the walk's answers**: 655 constants agree in value. 16 questions the walk calls
+  `Varies` are `Constant` here; they carry path facts (`#47705 != 0`, `#47705 >=
+  0x7ffffffeffff`) under which they are constant, and all 674 constants were also evaluated
+  at up to 20,000 assignments satisfying each question's facts without a disagreement.
+  3 the walk left `Unknown` are constants. 13 the walk calls `Varies` or `Atom` are
+  `Unknown` here: `Ask::constant` does not answer "equal to an atom" (`Ask::equal` does).
+- This does not carry over to the earlier stand-in questions, where hubs seldom fold on
+  their own: `shared` is for questions that overlap as these do.
+
 ## Moving a consumer to it
 
 | Consumer layer | What replaces it |
@@ -240,7 +279,7 @@ Reading them:
 | Budget-exact memo around `NormalFormSolver` | Nothing: delete it from 0.30.1 on. |
 | Avoiding the process-wide simplifier in `prove` | `prove::valid_under_with(.., &Simplifiers)`, or a `Session`, which owns its engines. |
 | A context per question | One context per boundary; `session.run(&mut cx, &asks)`. |
-| Hand-rolled hub splitting | `Config::split`: `Split::eager()` where whole questions fail and hubs fold, the default otherwise. `Config::hub` bounds a hub's proof apart from a question's. |
+| Hand-rolled hub splitting | `Config::split`: `Split::shared()` for the words of one state (questions that share most of their nodes), the default otherwise. `Config::hub` bounds a hub's proof apart from a question's. |
 | Its own memo of questions | The session's store, across calls; `Reply::source` and `Session::stats` say what it served. |
 | Background retry threads, abandoned proofs | `Ask::cancellable(&cancel)`; `Reply::cost` of an `Answer::Cancelled` is what was spent. A larger budget is another session (a `Config` is fixed for its session). |
 | "Is it a constant?" by simplifying and looking | `Ask::constant(e)`: `Constant(value)`, `Varies(two assignments)` or `Unknown`. "Equal to a given atom" is `Ask::equal(e, atom)`. |
@@ -252,12 +291,8 @@ memory (`store_nodes`).
 ## Not verified
 
 - Wall-clock scaling on an idle machine; every timing above was taken under heavy load.
-- The consumer's regime (whole question fails, hubs fold). A benchmark of it needs data:
-  one directory per boundary, one file per question in the format of the earlier export
-  (`# kind`, `# config`, `# result`, `## root N`, `## assume == V`, bitwright text with symbol
-  widths), **with symbols keeping the walk's own keys and not renamed per question**. Three
-  or four boundaries of about 600 questions show the sharing; one whole walk shows the
-  store's growth and eviction.
+- One walk has been measured (above). It is one round's worth per boundary, without the
+  questions under 2 ms; the store never reached its limit, so eviction was not exercised.
 - Case splits and term regrouping are tested on constructed inputs; on the exported
   questions one chain was regrouped and no case split was needed.
 - The long suites (`--ignored`), the Python and WebAssembly bindings and the book were not

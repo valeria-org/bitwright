@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Hubs from the bottom** (`batch::Split::bottom_up`, `Split::shared()`). The hubs are the
+  nodes where a value that varies is cancelled, asked lowest first, and each hub above with
+  those proved below it written as constants; a block of noise is then proved once for
+  every hub and question above it. On a deobfuscator's walk of 714 "is this word a
+  constant?" questions that share 97% of their nodes, one thread takes 9.5 s where asking
+  each hub as written takes 30.2 s, and eight threads 1.9 s, with the same answers. Off by
+  default: where hubs seldom fold on their own it asks more than it saves.
+- `bitwright-bench --walk DIR` replays a walk exported with a directory per boundary.
+
 ## 0.31.0
 
 - **Batches of questions on the caller's threads** (`bitwright::batch`, feature `prove`). A

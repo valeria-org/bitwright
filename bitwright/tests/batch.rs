@@ -115,7 +115,12 @@ fn answers_and_costs_do_not_depend_on_threads_order_or_the_store() {
     let forward = |n: usize| (0..n).collect::<Vec<_>>();
     let reverse = |n: usize| (0..n).rev().collect::<Vec<_>>();
     let rotated = |n: usize| (0..n).map(|k| (k * 5 + 3) % n).collect::<Vec<_>>();
-    for split in [Split::default(), Split::eager(), Split::none()] {
+    for split in [
+        Split::default(),
+        Split::eager(),
+        Split::shared(),
+        Split::none(),
+    ] {
         let base = Config::default().with_prove(small()).with_split(split);
         let want = replies(base.with_threads(1), &forward, 1);
         // The answers, once: sound and as expected.
@@ -226,7 +231,7 @@ fn a_hub_that_only_samples_constant_is_not_substituted() {
     // 0 at every sample, 1 at one value of `x` that no sample is.
     let rare = "zext<64>(x * 3 == 0x123456789abcde01)";
     let e = cx.parse(&format!("0x40 + {rare} + {NOISE}"), &o).unwrap();
-    for split in [Split::default(), Split::eager()] {
+    for split in [Split::default(), Split::eager(), Split::shared()] {
         let session = Session::new(Config::default().with_split(split));
         let reply = session.run(&mut cx, &[Ask::constant(e)]).unwrap().remove(0);
         let Answer::Varies(models) = &reply.answer else {
@@ -305,6 +310,37 @@ fn an_undecided_question_is_split_on_the_condition_its_selects_test() {
         panic!("{:?}", reply.answer);
     };
     assert!(value_at(&mut cx, wrong, model).is_zero());
+}
+
+#[test]
+fn from_the_bottom_a_block_of_noise_is_proved_once_for_every_hub_above_it() {
+    let mut cx = Context::new();
+    let o = w64();
+    // Each question's constant is hidden by its own product with one shared block.
+    let roots: Vec<Expr> = (0..30)
+        .map(|k| {
+            let t = format!(
+                "{} + {NOISE} * (z + {k}) + ({NOISE2} & (w ^ {k}))",
+                0x100 + k
+            );
+            cx.parse(&t, &o).unwrap()
+        })
+        .collect();
+    let asks: Vec<Ask<'_>> = roots.iter().map(|&e| Ask::constant(e)).collect();
+    let config = Config::default().with_threads(4);
+    let top_down = Session::new(config.with_split(Split::eager()));
+    let bottom_up = Session::new(config.with_split(Split::shared()));
+    let a = top_down.run(&mut cx, &asks).unwrap();
+    let b = bottom_up.run(&mut cx, &asks).unwrap();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        let want = Answer::Constant(BitVec::from_u64(Width::W64, 0x100 + k as u64).unwrap());
+        assert_eq!((&x.answer, &y.answer), (&want, &want));
+    }
+    // From the top, every question has hubs of its own; from the bottom the two blocks
+    // are asked once and what is above them folds by construction.
+    let (top, bottom) = (top_down.stats(), bottom_up.stats());
+    assert!(top.tasks_solved >= 30, "{top:?}");
+    assert!(bottom.tasks_solved <= 4, "{bottom:?}");
 }
 
 #[test]
