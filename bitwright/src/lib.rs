@@ -86,6 +86,8 @@ macro_rules! setters {
     };
 }
 
+#[cfg(feature = "prove")]
+pub mod batch;
 #[cfg(feature = "check")]
 pub mod check;
 pub mod engine;

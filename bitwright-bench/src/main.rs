@@ -14,6 +14,8 @@
 //!   --metric M        compare `instructions` (default when available), `cpu`, or `wall`
 //!   --fail-on-regression   exit 1 if a benchmark got slower beyond the threshold
 //!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
+//!   --batch DIR       a consumer's exported questions, one by one and through `bitwright::batch`
+//!                     (`--mode before|whole|split`, `--threads N`, `--shared-symbols`, `--warm`)
 //!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches
@@ -36,6 +38,7 @@ mod corpus_diff;
 mod counter;
 mod keyed_mixers;
 mod prover_budgets;
+mod questions;
 mod suites;
 mod workload;
 
@@ -179,6 +182,9 @@ fn parse_args() -> Result<Options, String> {
 fn main() -> ExitCode {
     // Internal workers are separate processes for a meaningful per-fixture memory peak.
     let worker: Vec<String> = std::env::args().skip(1).collect();
+    if worker.iter().any(|a| a == "--batch") {
+        return questions::main(&worker);
+    }
     if worker.first().is_some_and(|a| a == "--mixer-case") {
         if worker.len() < 4
             || worker[4..].iter().any(|arg| {
