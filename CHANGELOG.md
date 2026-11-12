@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.2
 
 - **Fixed: a slice at bit 64 or above of a wider value panicked in the MBA sweep.** The
   demanded bits of an `extract` operand were its user's shifted by the offset, a shift of 64
