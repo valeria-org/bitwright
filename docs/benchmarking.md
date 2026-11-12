@@ -191,33 +191,34 @@ whose facts are measured. It runs with the counters paused.
 
 ## Reference numbers
 
-bitwright 0.11.0, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
+bitwright 0.30.2, `cargo run --release -p bitwright-bench` (Rust 1.98, Linux, one performance
 core of an Intel Core Ultra 7 265). Times are the fastest of 7 runs of the thread's CPU time;
 instructions are the median.
 
 | Operation | CPU time | Instructions |
 |-|-|-|
-| A 64-bit value operation (add, mul, udiv, shl) | 8 ns | 149 to 161 |
-| A 512-bit multiplication / division | 23 ns / 17 ns | 508 / 436 |
-| A binary32 operation (add, mul, div, sqrt, fma) | 17 to 21 ns | 325 to 459 |
-| A binary64 operation (add, mul, div, sqrt, fma) | 17 to 30 ns | 406 to 635 |
-| A binary128 operation (add, mul, div, sqrt, fma) | 55 to 95 ns | 1,470 to 2,060 |
-| Building a node (hash-consing and canonicalization) | 48 ns | 992 |
-| Evaluating a node / a floating-point node | 27 ns / 46 ns | 442 / 777 |
-| The facts of a node, computed (known bits and ranges) | 0.21 to 0.23 µs up to 128 bits, 0.43 µs at 512 | 2,610 to 2,990 up to 128 bits, 6,580 at 512 |
-| The facts of a floating-point node, computed | 0.18 µs | 3,160 |
+| A 64-bit value operation (add, mul, udiv, shl) | 7 to 8 ns | 132 to 148 |
+| A 512-bit multiplication / division | 24 ns / 19 ns | 511 / 445 |
+| A binary32 operation (add, mul, div, sqrt, fma) | 18 to 21 ns | 325 to 459 |
+| A binary64 operation (add, mul, div, sqrt, fma) | 18 to 30 ns | 406 to 635 |
+| A binary128 operation (add, mul, div, sqrt, fma) | 55 to 94 ns | 1,470 to 2,060 |
+| Building a node (hash-consing and canonicalization) | 44 ns | 890 |
+| Evaluating a node / a floating-point node | 2 ns / 32 ns | 67 / 561 |
+| The facts of a node, computed (known bits and ranges) | 0.11 to 0.16 µs up to 128 bits, 0.39 µs at 512 | 1,730 to 2,530 up to 128 bits, 6,160 at 512 |
+| The facts of a floating-point node, computed | 0.17 µs | 3,110 |
 | A cached fact query | 28 ns | 380 |
-| Parsing a 60-node expression | 16 µs | 281,000 |
-| Simplifying a random 40-node expression (20 in one call) | 0.15 ms | 2.2 M |
-| Simplifying a random 40-node floating-point expression (20 in one call) | 42 µs | 758,000 |
-| Simplifying in a fresh three-node context | 3.8 µs | 69,300 |
-| Deobfuscating a linear MBA expression (native solver) | 0.32 ms | 3.7 M |
-| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 0.38 ms | 9.1 M |
-| Building an engine (linking the built-in rules) | 9.0 µs | 141,700 |
-| SMT-LIB export / import, per node | 0.27 / 0.53 µs | 7,530 / 13,240 |
+| Parsing a 60-node expression | 16 µs | 278,000 |
+| Simplifying a random 40-node expression (20 in one call) | 0.24 ms | 3.1 M |
+| Simplifying a random 40-node floating-point expression (20 in one call) | 55 µs | 888,000 |
+| Simplifying in a fresh three-node context | 4.4 µs | 74,100 |
+| Deobfuscating a linear MBA expression (native solver) | 0.43 ms | 4.6 M |
+| Deobfuscating a nonlinear MBA expression (native solver, 64 bits) | 0.11 ms | 1.2 M |
+| An SSA function of 200 instructions, `Strategy::compile()` / run again | 0.59 ms / 27 µs | 8.2 M / 521,000 |
+| Building an engine (linking the built-in rules) | 13 µs | 173,300 |
+| SMT-LIB export / import, per node | 0.30 / 0.76 µs | 7,500 / 15,840 |
 
-On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 125 to 82
-nodes and 20 nonlinear ones from 141 to 16 (the signature solver: 91 and 57).
+On the suite's MBA inputs the native solver shrinks 20 linear MBA expressions from 126 to 70
+nodes and 20 nonlinear ones from 141 to 16 (the signature solver: 76 and 79).
 
 ## Corpus diff
 
@@ -263,7 +264,7 @@ operators SMT-LIB has natively and on random floating-point DAGs, and on 651 ide
 seven fact sets (`compare/facts/`: bit-vector algebra, number theory, orders, slices, bit
 tricks, canonical forms, floating point). It is its own Cargo workspace and needs the other engines
 installed; its README has the setup. The top-level README reports both comparisons
-([Performance](../README.md#performance)).
+([Benchmarks](../README.md#benchmarks)).
 
 ## Keyed mixers and fingerprints
 
