@@ -960,3 +960,31 @@ fn a_coefficient_of_the_128_bit_sign_bit_has_a_size() {
     let out = native().run(&mut cx, &[e], Run::default()).unwrap();
     assert_equivalent(&mut cx, e, out.roots[0].expr, "the product");
 }
+
+/// A byte sign mask of a 128-bit vector, lane by lane, equals the concatenation of the lanes'
+/// sign bits. The sweep's demanded bits pass an `extract` at bit 64 or above of the wide vector
+/// (a regression: the operand's mask was shifted by the offset, which overflowed).
+#[test]
+fn lanes_above_bit_64_of_a_wide_symbol() {
+    let mut cx = Context::new();
+    cx.symbol("x", Width::new(128).unwrap()).unwrap();
+    let lane = |i: u32| match i {
+        0 => "trunc<8>(x)".to_string(),
+        _ => format!("extract<{}, 8>(x)", 8 * i),
+    };
+    let mask = (0..16u32)
+        .map(|i| format!("zext<64>({} <s 0:8) << {i}:64", lane(i)))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let signs = (1..16u32).fold("extract<7, 1>(x)".to_string(), |low, i| {
+        format!("concat(extract<{}, 1>(x), {low})", 8 * i + 7)
+    });
+    let o = ParseOptions::width(Width::new(64).unwrap());
+    let a = cx.parse(&mask, &o).unwrap();
+    let b = cx.parse(&format!("zext<64>({signs})"), &o).unwrap();
+    let out = bitwright::prove::equal(&mut cx, a, b, &bitwright::prove::Config::default());
+    assert!(
+        matches!(out, Ok(bitwright::prove::Outcome::Proved(_))),
+        "{out:?}"
+    );
+}
