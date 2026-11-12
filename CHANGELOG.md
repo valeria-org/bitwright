@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.1
 
 - **Hubs from the bottom** (`batch::Split::bottom_up`, `Split::shared()`). The hubs are the
   nodes where a value that varies is cancelled, asked lowest first, and each hub above with

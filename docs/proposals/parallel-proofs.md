@@ -233,7 +233,7 @@ Reading them:
   than copies, but a fork has the base's node order and whatever the base remembers, which is
   what the answers must not depend on; the batch copies.
 
-## A real walk (added after 0.31.0)
+## A real walk (0.31.1)
 
 The consumer then exported one walk with its own symbol keys: 714 "is this stack word a
 constant?" questions over 26 boundaries, median 1,801 nodes, 97.2% of each question's nodes
