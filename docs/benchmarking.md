@@ -265,6 +265,13 @@ writes one line per question (answer and cost), which must not change with `--th
 Each mode is its own process, so its peak memory is its own. The questions are not in the
 repository; `docs/proposals/parallel-proofs.md` has the numbers measured on one such set.
 
+`--walk DIR` replays a walk exported with a directory per boundary (`# kind: constant`,
+`# deep fuel: N`, `# result`, `# ms`, symbols with one key in every file): each boundary is
+one batch of `Ask::constant` in a context of its own, one session lasts the walk, and what
+stays open is asked again of a second session with the deep fuel (`--no-deep`: not).
+`--mode whole|split|eager` and `--threads N` are as above; the report compares each answer
+with the walk's own.
+
 ## Comparing with other engines
 
 `bitwright-bench` measures bitwright against itself. [`compare/`](../compare/README.md)

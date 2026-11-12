@@ -16,6 +16,8 @@
 //!   --corpus-diff     print how the MBA defaults differ from the signature solver's results
 //!   --batch DIR       a consumer's exported questions, one by one and through `bitwright::batch`
 //!                     (`--mode before|whole|split`, `--threads N`, `--shared-symbols`, `--warm`)
+//!   --walk DIR        a walk's exported questions, a directory per boundary, each a batch
+//!                     (`--mode whole|split|eager`, `--threads N`, `--no-deep`, `--answers FILE`)
 //!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
 //!   --mixers          staged mixer/fingerprint CSV (fixed budgets; FILTERs select cases)
 //!   --escalate        with --mixers: try small witnesses, then resume open native searches
@@ -40,6 +42,7 @@ mod keyed_mixers;
 mod prover_budgets;
 mod questions;
 mod suites;
+mod walk;
 mod workload;
 
 use std::process::ExitCode;
@@ -182,6 +185,9 @@ fn parse_args() -> Result<Options, String> {
 fn main() -> ExitCode {
     // Internal workers are separate processes for a meaningful per-fixture memory peak.
     let worker: Vec<String> = std::env::args().skip(1).collect();
+    if worker.iter().any(|a| a == "--walk") {
+        return walk::main(&worker);
+    }
     if worker.iter().any(|a| a == "--batch") {
         return questions::main(&worker);
     }
