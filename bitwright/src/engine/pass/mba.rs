@@ -1305,7 +1305,9 @@ fn demanded(
             give(1, m);
             give(2, m);
         }
-        OpCode::Extract => give(0, m << n.b),
+        // An operand of more than 64 bits keeps its low 64 in the mask: a slice at 64 or above
+        // reads none of them (the sweep stops at that operand).
+        OpCode::Extract => give(0, m.checked_shl(n.b).unwrap_or(0)),
         // a rotate by a constant moves the demand the other way; a `concat`
         // splits it between its halves.
         OpCode::RotL | OpCode::RotR if konst(1).is_some() && w <= 64 && w > 0 => {

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: a slice at bit 64 or above of a wider value panicked in the MBA sweep.** The
+  demanded bits of an `extract` operand were its user's shifted by the offset, a shift of 64
+  or more where overflow is checked (a debug build): proving a 128-bit vector's byte sign
+  mask equal to the concatenation of its sign bits panicked there. Elsewhere the shift
+  wrapped and demanded the wrong low bits of an operand the sweep then stopped at, so no
+  answer changes. Such a slice now demands none of the operand's low 64 bits.
+
 ## 0.30.1
 
 - **Fixed: the normal-form solver's memo served an answer another budget would not
