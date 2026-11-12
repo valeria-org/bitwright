@@ -1,10 +1,10 @@
 # Batches of questions, split and shared, on the caller's threads
 
-Status: implemented on branch `claude/parallel-proofs` as `bitwright::batch` (feature `prove`).
-The first three sections are the design note written before the implementation; the rest is
-what was built, what it measures, and how a consumer moves to it. It would be version 0.31.0:
-new public items only (`batch`, `prove::Simplifiers`, `prove::valid_under_with`,
-`Question::valid_under_with`), no existing signature or answer changed.
+Status: released in 0.31.0 as `bitwright::batch` (feature `prove`). The first three sections
+are the design note written before the implementation; the rest is what was built, what it
+measures, and how a consumer moves to it. New public items only (`batch`,
+`prove::Simplifiers`, `prove::valid_under_with`, `Question::valid_under_with`), no existing
+signature or answer changed.
 
 ## What was asked, and what the code says about it
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.0
 
 - **Batches of questions on the caller's threads** (`bitwright::batch`, feature `prove`). A
   `Session` answers simplifications, constants and validity proofs about expressions of one
