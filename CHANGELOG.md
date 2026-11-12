@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Batches of questions on the caller's threads** (`bitwright::batch`, feature `prove`). A
+  `Session` answers simplifications, constants and validity proofs about expressions of one
+  context, in the order asked, on up to `Config::threads` threads that live for the call. A
+  question is decided in a context of its own, so its answer and its cost (`Reply::cost`,
+  counts of work) are the same asked alone, in any batch and order, on any number of
+  threads, and whatever the session's store holds; the store keeps answers with their
+  costs and is emptied whole past `Config::store_nodes`. With `Split`, a question is cut
+  at its hubs (nodes with one value at 64 samples above something that varies), each asked
+  once for every question that contains it and replaced only when proved constant; chains of
+  `+` and `^` are regrouped by the symbols their terms read; an undecided proof is split on
+  a condition its selects test. `Ask::cancellable` stops a question, and the tasks only it
+  needs, and reports what was spent. See `docs/proposals/parallel-proofs.md` for the design
+  and for what it measures: on a deobfuscator's exported questions the gain is from threads,
+  and asking hubs first (`Split::eager`) costs more than it saves where the engine folds a
+  question whole.
+- **The prover's engines can be the caller's** (`prove::Simplifiers`,
+  `prove::valid_under_with`, `Question::valid_under_with`). The entry points that take none
+  still share one set for the process; no answer changes.
+- `bitwright-bench --batch DIR` replays exported questions one by one and through a batch.
+
 ## 0.30.2
 
 - **Fixed: a slice at bit 64 or above of a wider value panicked in the MBA sweep.** The

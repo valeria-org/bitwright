@@ -287,48 +287,137 @@ impl Config {
     }
 }
 
-/// The engine that simplifies questions (see [`Config::simplify`]): the deobfuscation
-/// strategy, and with `strict` without the pass that commits rewrites it has derived but
-/// neither proved nor matched against a proved rule ([`Phase::Words`](crate::engine::Phase)),
-/// or with `proved` with that pass writing only what a circuit and a search prove
-/// ([`Config::proved_words`]).
-fn simplifier_of(strict: bool, proved: bool) -> &'static crate::engine::Engine {
-    static ENGINES: [std::sync::OnceLock<crate::engine::Engine>; 3] = [
-        std::sync::OnceLock::new(),
-        std::sync::OnceLock::new(),
-        std::sync::OnceLock::new(),
-    ];
-    let which = if strict { 1 } else { 2 * usize::from(proved) };
-    ENGINES[which].get_or_init(|| {
-        #[cfg(feature = "mba")]
-        let mut strategy = crate::engine::Strategy::deobfuscate()
-            .with_mba(crate::mba::MbaConfig::default().with_opaque_sweep(true));
-        #[cfg(not(feature = "mba"))]
-        let mut strategy = crate::engine::Strategy::deobfuscate();
-        if strict {
-            (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
-        }
-        strategy.words_proved = proved;
-        crate::engine::Engine::builder()
-            .builtin()
-            .strategy(strategy)
-            .build()
-            .unwrap_or_else(|_| crate::engine::Engine::standard())
-    })
+/// The engines that simplify questions (see [`Config::simplify`]), owned by whoever asks:
+/// the deobfuscation strategy with the MBA service, built when first needed, and with them
+/// the one thing they remember, the MBA solver's memo. The entry points of this module that
+/// take none use one such set for the process; a caller that wants nothing shared with the
+/// rest of the process (its statistics, its memory) makes its own and asks through
+/// [`Question::valid_under_with`], [`valid_under_with`] or a [`batch::Session`](crate::batch),
+/// which owns one. Answers are the same either way: the solver's memo returns what solving
+/// again would, at the same cost.
+pub struct Simplifiers {
+    /// As asked for, strict, and with the limb pass proved.
+    engines: [std::sync::OnceLock<crate::engine::Engine>; 3],
+    divisions: std::sync::OnceLock<crate::engine::Engine>,
+    /// The MBA phase, when not the prover's own.
+    #[cfg(feature = "mba")]
+    mba: Option<crate::mba::MbaConfig>,
+    #[cfg(feature = "mba")]
+    solver: Option<std::sync::Arc<dyn crate::mba::MbaSolver>>,
 }
 
-/// The division pass alone ([`Config::divisions`]).
-fn divisions_only() -> &'static crate::engine::Engine {
-    static ENGINE: std::sync::OnceLock<crate::engine::Engine> = std::sync::OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let strategy =
-            crate::engine::Strategy::new("divisions", vec![crate::engine::Phase::Division]);
-        crate::engine::Engine::builder()
-            .builtin()
-            .strategy(strategy)
-            .build()
-            .unwrap_or_else(|_| crate::engine::Engine::standard())
-    })
+impl core::fmt::Debug for Simplifiers {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Simplifiers").finish_non_exhaustive()
+    }
+}
+
+impl Default for Simplifiers {
+    fn default() -> Self {
+        Simplifiers::new()
+    }
+}
+
+impl Simplifiers {
+    /// Engines of the prover's own configuration: the MBA service with its opaque-constant
+    /// sweep, and a normal-form solver of their own.
+    pub const fn new() -> Simplifiers {
+        Simplifiers {
+            engines: [
+                std::sync::OnceLock::new(),
+                std::sync::OnceLock::new(),
+                std::sync::OnceLock::new(),
+            ],
+            divisions: std::sync::OnceLock::new(),
+            #[cfg(feature = "mba")]
+            mba: None,
+            #[cfg(feature = "mba")]
+            solver: None,
+        }
+    }
+
+    /// With this configuration of the MBA phase instead of the prover's own (the default
+    /// with the opaque-constant sweep). It changes what simplification makes of a question,
+    /// so which questions are decided before the search.
+    #[cfg(feature = "mba")]
+    pub fn with_mba(mut self, mba: crate::mba::MbaConfig) -> Self {
+        self.mba = Some(mba);
+        self
+    }
+
+    /// With this MBA solver instead of a [`NormalFormSolver`](crate::mba::NormalFormSolver)
+    /// of their own.
+    #[cfg(feature = "mba")]
+    pub fn with_mba_solver(mut self, solver: std::sync::Arc<dyn crate::mba::MbaSolver>) -> Self {
+        self.solver = Some(solver);
+        self
+    }
+
+    /// The engine for [`Config::strict`] and [`Config::proved_words`] as given: with `strict`
+    /// without the pass that commits rewrites it has derived but neither proved nor matched
+    /// against a proved rule ([`Phase::Words`](crate::engine::Phase)), or with `proved` with
+    /// that pass writing only what a circuit and a search prove.
+    pub fn engine(&self, strict: bool, proved: bool) -> &crate::engine::Engine {
+        let which = if strict { 1 } else { 2 * usize::from(proved) };
+        self.engines[which].get_or_init(|| {
+            #[cfg(feature = "mba")]
+            let mut strategy = crate::engine::Strategy::deobfuscate().with_mba(
+                (self.mba)
+                    .unwrap_or_else(|| crate::mba::MbaConfig::default().with_opaque_sweep(true)),
+            );
+            #[cfg(not(feature = "mba"))]
+            let mut strategy = crate::engine::Strategy::deobfuscate();
+            if strict {
+                (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
+            }
+            strategy.words_proved = proved;
+            let builder = crate::engine::Engine::builder()
+                .builtin()
+                .strategy(strategy);
+            #[cfg(feature = "mba")]
+            let builder = match &self.solver {
+                Some(s) => builder.mba_solver(s.clone()),
+                None => builder,
+            };
+            builder
+                .build()
+                .unwrap_or_else(|_| crate::engine::Engine::standard())
+        })
+    }
+
+    /// The division pass alone ([`Config::divisions`]).
+    fn divisions_only(&self) -> &crate::engine::Engine {
+        self.divisions.get_or_init(|| {
+            let strategy =
+                crate::engine::Strategy::new("divisions", vec![crate::engine::Phase::Division]);
+            crate::engine::Engine::builder()
+                .builtin()
+                .strategy(strategy)
+                .build()
+                .unwrap_or_else(|_| crate::engine::Engine::standard())
+        })
+    }
+}
+
+/// The engines of the entry points that are given none.
+static PROCESS: Simplifiers = Simplifiers::new();
+
+/// What a question is built with besides its configuration.
+#[derive(Copy, Clone)]
+pub(crate) struct Env<'a> {
+    /// The engines that simplify it.
+    pub(crate) simplifiers: &'a Simplifiers,
+    /// Stops the simplification, and has the question answer [`Unknown::Deadline`].
+    pub(crate) deadline: Option<crate::engine::Deadline<'a>>,
+}
+
+impl Env<'static> {
+    fn process() -> Self {
+        Env {
+            simplifiers: &PROCESS,
+            deadline: None,
+        }
+    }
 }
 
 /// `p` as the prover's simplifier leaves it within [`Config::simplify_budget`]: an expression
@@ -336,7 +425,8 @@ fn divisions_only() -> &'static crate::engine::Engine {
 /// of. Asked again of an expression a question was posed about, it costs a lookup.
 pub fn simplified(cx: &mut Context, p: Expr, cfg: &Config) -> Result<Expr, Error> {
     let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
-    Ok(simplifier_of(cfg.strict, cfg.proved_words)
+    Ok(PROCESS
+        .engine(cfg.strict, cfg.proved_words)
         .run(cx, &[p], run)?
         .roots[0]
         .expr)
@@ -949,6 +1039,34 @@ impl Question {
         pairs: &[finite::CheckedPair],
         cfg: &Config,
     ) -> Result<Question, Error> {
+        Self::build(cx, p, assumptions, pairs, cfg, Env::process())
+    }
+
+    /// [`valid_under`](Self::valid_under), simplified by the caller's engines and not the
+    /// process's: the same question, answer and statistics.
+    pub fn valid_under_with(
+        cx: &mut Context,
+        p: Expr,
+        assumptions: Option<&Assumptions>,
+        cfg: &Config,
+        simplifiers: &Simplifiers,
+    ) -> Result<Question, Error> {
+        let env = Env {
+            simplifiers,
+            deadline: None,
+        };
+        Self::build(cx, p, assumptions, &[], cfg, env)
+    }
+
+    /// The question, built with `env`.
+    pub(crate) fn build(
+        cx: &mut Context,
+        p: Expr,
+        assumptions: Option<&Assumptions>,
+        pairs: &[finite::CheckedPair],
+        cfg: &Config,
+        env: Env<'_>,
+    ) -> Result<Question, Error> {
         let pi = cx.id(p)?;
         if cx.wid(pi) != 1 {
             return Err(crate::WidthError::Mismatch {
@@ -1005,8 +1123,13 @@ impl Question {
                 Some(a) => run.with_assumptions(a),
                 None => run,
             };
+            let run = match env.deadline {
+                Some(d) => run.with_deadline(d),
+                None => run,
+            };
             let goal = cx.handle(goal_node);
-            let out = simplifier_of(cfg.strict, cfg.proved_words)
+            let out = (env.simplifiers)
+                .engine(cfg.strict, cfg.proved_words)
                 .run(cx, &[goal], run)?
                 .roots[0];
             let s = cx.id(out.expr)?;
@@ -1023,6 +1146,10 @@ impl Question {
             if proved {
                 return decided(q, Outcome::Proved(None));
             }
+            // Stopped by its caller: what is left would be built and searched for nobody.
+            if out.end == crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline) {
+                return decided(q, Outcome::Unknown(Unknown::Deadline));
+            }
             // A result that relies on constraints holds where they do, which is all a proof
             // under them needs.
             goal_node = s;
@@ -1034,7 +1161,11 @@ impl Question {
                 None => run,
             };
             let goal = cx.handle(goal_node);
-            let out = divisions_only().run(cx, &[goal], run)?.roots[0];
+            let out = env
+                .simplifiers
+                .divisions_only()
+                .run(cx, &[goal], run)?
+                .roots[0];
             goal_node = cx.id(out.expr)?;
             if cx.const_val(goal_node).is_some_and(|v| !v.is_zero()) {
                 q.stats.rewritten = true;
@@ -1439,6 +1570,18 @@ pub fn valid_under(
     cfg: &Config,
 ) -> Result<Outcome, Error> {
     Question::valid_under(cx, p, assumptions, cfg)?.solve(cx, cfg.limits())
+}
+
+/// [`valid_under`], simplified by the caller's engines and not the process's
+/// ([`Simplifiers`]): the same answer.
+pub fn valid_under_with(
+    cx: &mut Context,
+    p: Expr,
+    assumptions: Option<&Assumptions>,
+    cfg: &Config,
+    simplifiers: &Simplifiers,
+) -> Result<Outcome, Error> {
+    Question::valid_under_with(cx, p, assumptions, cfg, simplifiers)?.solve(cx, cfg.limits())
 }
 
 /// Whether `a` and `b` (of one width) are equal for every value of their symbols agreeing with

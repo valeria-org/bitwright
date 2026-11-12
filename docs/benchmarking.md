@@ -250,6 +250,21 @@ answers whenever they change.
 
 Every row is asked twice, and the report fails if the two reports differ in answer or in work.
 
+## Exported questions, one by one and in a batch
+
+`cargo run --release -p bitwright-bench -- --batch DIR` replays a directory of questions a
+consumer exported (one file each: `# kind`, `# config`, `## root N`, `## assume == V` blocks
+of bitwright text with symbol widths) and prints wall and CPU seconds, peak memory, the
+answers by kind and the session's counters. `--mode before` asks each in a context of its
+own on one thread; `--mode whole` and `--mode split` (with `--whole-first`, `--no-nested`,
+`--no-terms`, `--cases N`) ask them through `bitwright::batch` on `--threads N`.
+`--variants N` asks every question N times with a constant added to its roots (siblings over
+one body), `--constant` asks engine questions as "is it a constant?", `--warm` asks the
+batch twice and checks the second answers and costs against the first, and `--answers FILE`
+writes one line per question (answer and cost), which must not change with `--threads`.
+Each mode is its own process, so its peak memory is its own. The questions are not in the
+repository; `docs/proposals/parallel-proofs.md` has the numbers measured on one such set.
+
 ## Comparing with other engines
 
 `bitwright-bench` measures bitwright against itself. [`compare/`](../compare/README.md)
