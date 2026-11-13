@@ -324,7 +324,7 @@ identical at 1 and 8 threads. Run once each on one core, 0.31.1 took 5.6 s (its 
 questions asked again with the deep fuel) and this 4.6 s; on eight threads 1.9 s and 1.75 s
 (CPU 6.5 s and 5.6 s).
 
-## The placement questions themselves (after 0.31.2)
+## The placement questions themselves (0.31.3)
 
 0.31.2 placed none of the consumer's open addresses. It then exported one walk's placement
 questions: 1,197, of which its walk placed 864 at a constant, 53 at several places, 23 at an

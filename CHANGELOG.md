@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.3
 
 - **Batch: a hub that is constant because of the assumptions, where no sample shows it.**
   A hub asked without assumptions and not proved (refuted where the assumptions fail, say)
