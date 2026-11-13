@@ -709,3 +709,66 @@ fn answers_under_assumptions_do_not_depend_on_threads_order_or_the_store() {
         }
     }
 }
+
+#[test]
+fn a_hub_left_undecided_is_split_in_cases_once_for_the_questions_above_it() {
+    let mut cx = Context::new();
+    // 0 whichever way the condition falls, as in the test of a question's cases.
+    let body = "(select(z <u 5, x * y, y + z) * select(z <u 5, y + z, x * y) - (y + z) * (x * y))";
+    let es: Vec<Expr> = [0x7000u64, 0x7008]
+        .iter()
+        .map(|lane| {
+            cx.parse(&format!("{lane} + {body} * (p + {lane})"), &w64())
+                .unwrap()
+        })
+        .collect();
+    let prove = prove::Config::default()
+        .with_simplify(false)
+        .with_sweeping(false)
+        .with_max_conflicts(100);
+    let asks: Vec<Ask<'_>> = es.iter().map(|&e| Ask::constant(e)).collect();
+    for (cases, constant) in [(0, false), (1, true)] {
+        let config = Config::default()
+            .with_prove(prove)
+            .with_split(Split::shared().with_cases(cases));
+        let session = Session::new(config);
+        let got = session.run(&mut cx, &asks).unwrap();
+        for (r, lane) in got.iter().zip([0x7000u64, 0x7008]) {
+            let want = Answer::Constant(BitVec::from_u64(Width::W64, lane).unwrap());
+            assert_eq!(r.answer == want, constant, "{cases} cases: {:?}", r.answer);
+        }
+        assert_eq!(
+            session.stats().case_splits,
+            u64::from(cases),
+            "{cases} cases"
+        );
+    }
+}
+
+#[test]
+fn a_hub_refuted_where_the_assumptions_fail_is_asked_again_under_them() {
+    let mut cx = Context::new();
+    let o = w64();
+    // 1 only where `x` is 3 and `r` below 16: no sample or probe is there, so the node
+    // looks constant everywhere, and the proof of that is refuted at such values.
+    let rare = "zext<64>((r <u 0x10) & (x == 3))";
+    let e = cx
+        .parse(&format!("0xffffcffe00000b40 + {rare} * (y * z + p)"), &o)
+        .unwrap();
+    let mut path = Assumptions::new();
+    let below = cx.parse("r <u 0x10", &o).unwrap();
+    let zero = BitVec::from_u64(Width::W1, 0).unwrap();
+    path.assume(&mut cx, below, Facts::constant(&zero)).unwrap();
+    let session = Session::new(placement_config());
+    let asks = [Ask::constant(e), Ask::constant(e).under(&path)];
+    let got = session.run(&mut cx, &asks).unwrap();
+    // Without the assumption it is no constant, whatever the limits leave of the answer.
+    assert!(
+        !matches!(got[0].answer, Answer::Constant(_)),
+        "{:?}",
+        got[0].answer
+    );
+    let lane = BitVec::from_u64(Width::W64, 0xffff_cffe_0000_0b40).unwrap();
+    assert_eq!(got[1].answer, Answer::Constant(lane));
+    assert!(session.stats().hubs_assumed > 0, "{:?}", session.stats());
+}

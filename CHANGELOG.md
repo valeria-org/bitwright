@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Batch: a hub that is constant because of the assumptions, where no sample shows it.**
+  A hub asked without assumptions and not proved (refuted where the assumptions fail, say)
+  is asked again under the assumptions of the question or hub above it, when it reads a
+  symbol they read. 0.31.2 found such a node only when a sample or probe moved it; on a
+  deobfuscator's addresses what moves them is a corner of several symbols at once.
+- **Batch: case splits for hubs, with the case as an assumption.** A hub whose proof stops
+  at its limits is split as a question is (`Split::cases`), once for every question above
+  it. Each case is asked under its condition as one more assumption, no longer as
+  `¬c | p[c:=1]`, so the engine has the condition as a fact and what is constant in the
+  case is a hub of its own. Without selects, the condition is the smallest comparison of a
+  claim built with `&`, `|`, `^` and `~`. `Split::cases` is 2 by default (was 1).
+- A view of assumptions that hold at fewer than an eighth of the sample points, or that
+  was searched for, no longer chooses hubs (everything looks constant there); it still
+  gives the candidate.
+- On 1,197 exported placement questions ("is this address one constant under the path's
+  facts?") `Split::shared()` at the consumer's limits now proves 919 constants, 53 of them
+  among the 215 its walk could not place, where 0.31.2 proved 864 and none of those.
+  Answers and costs are the same on 1 and 8 threads.
+- `bitwright-bench --walk` takes `--cases N`.
+
 ## 0.31.2
 
 - **Batch: constants under assumptions that random samples do not meet.** Where no sample

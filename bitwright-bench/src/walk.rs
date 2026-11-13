@@ -126,6 +126,7 @@ fn add(total: &mut Stats, s: &Stats) {
     total.tasks_stored += s.tasks_stored;
     total.hubs += s.hubs;
     total.hubs_proved += s.hubs_proved;
+    total.hubs_assumed += s.hubs_assumed;
     total.regrouped += s.regrouped;
     total.case_splits += s.case_splits;
     total.store_nodes += s.store_nodes;
@@ -133,13 +134,14 @@ fn add(total: &mut Stats, s: &Stats) {
     total.flushes += s.flushes;
 }
 
-/// `bitwright-bench --walk DIR [--mode whole|split|eager|shared] [--threads N] [--no-deep]
-/// [--answers FILE]`.
+/// `bitwright-bench --walk DIR [--mode whole|split|eager|shared] [--threads N] [--cases N]
+/// [--no-deep] [--answers FILE]`.
 pub fn main(args: &[String]) -> ExitCode {
     let mut dir = String::new();
     let mut mode = "split".to_string();
     let mut threads = 1usize;
     let mut deep = true;
+    let mut cases: Option<u8> = None;
     let mut answers_file = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -149,6 +151,7 @@ pub fn main(args: &[String]) -> ExitCode {
             "--mode" => mode = next(),
             "--threads" => threads = next().parse().unwrap_or(1),
             "--no-deep" => deep = false,
+            "--cases" => cases = next().parse().ok(),
             "--answers" => answers_file = Some(next()),
             other => {
                 eprintln!("unknown option `{other}`");
@@ -161,6 +164,10 @@ pub fn main(args: &[String]) -> ExitCode {
         "eager" => Split::eager(),
         "shared" => Split::shared(),
         _ => Split::default(),
+    };
+    let split = match cases {
+        Some(n) => split.with_cases(n),
+        None => split,
     };
     let mut boundaries: Vec<_> = match std::fs::read_dir(&dir) {
         Ok(d) => (d.filter_map(|e| e.ok().map(|e| e.path())))

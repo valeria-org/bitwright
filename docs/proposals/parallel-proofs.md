@@ -322,12 +322,60 @@ constants (`0xffff9ffc000018f0`, under `s != 0` and `s <u 0x7ffffffeffff`; evalu
 20,000 assignments satisfying the facts without a disagreement). Answers and costs are
 identical at 1 and 8 threads. Run once each on one core, 0.31.1 took 5.6 s (its 13 open
 questions asked again with the deep fuel) and this 4.6 s; on eight threads 1.9 s and 1.75 s
-(CPU 6.5 s and 5.6 s). No hub under assumptions arose on this walk: what changed there
-comes from the searched assignments.
+(CPU 6.5 s and 5.6 s).
 
-Not verified here: the consumer's 252 placement questions themselves. Whether what moves
-them is found by the probes, and whether the node that hides the comparison is small, is a
-guess from its description until they are exported.
+## The placement questions themselves (after 0.31.2)
+
+0.31.2 placed none of the consumer's open addresses. It then exported one walk's placement
+questions: 1,197, of which its walk placed 864 at a constant, 53 at several places, 23 at an
+atom, left 42 undecided with differing samples, and 215 unplaced though one value at its
+four random samples. Replayed with `bitwright-bench --walk`, 0.31.2 proved the 864 and none
+of the 215. The first of them (746 nodes; `r9 != 0`, `r9 >= 16`) showed why:
+
+- **The nodes that are constant because of the facts looked constant everywhere.** They
+  move only where `r9 < 16` and two or three other symbols are 0 or 1 at once, which no
+  sample or probe is. Asked without assumptions they were refuted there, at `r9 = 0`, and
+  dropped. They are now asked again under the assumptions of what is above them.
+- **What was left is a case analysis.** One 1-bit node says "one of four cases holds", the
+  cases told apart by the low bit of two symbols and each with an equality of products
+  that holds in its case only. One search does not do it in 2,000 conflicts. A hub's proof
+  that stops at its limits is now split as a question's is, and a case is asked under its
+  condition as an assumption: the engine has the bit as a fact, and the equality is a hub
+  of that case. Two levels (`Split::cases`, now the default) prove it, in 0.3 s for the
+  whole question at the consumer's limits.
+- **A view of few points chose no hubs.** The case "the low byte is zero" holds at one
+  sample, all zeros, where every node is constant: such a view (under an eighth of the
+  points, or one a search fixed the symbols of) now only gives the candidate. Before this,
+  30 questions of the earlier walk were lost to it at stock fuel.
+
+With this, `Split::shared()` on that export, 8 threads, load 20 to 90 on 20 cores, once:
+919 constants, 275 that vary, 3 unknown, in 2.1 s (CPU 4.5 s, peak 178 MB); one thread
+4.7 s; the same answers and costs on both.
+
+| The walk's 215 unplaced addresses | |
+|---|---|
+| Constant, the value it sampled | 31 |
+| Constant, another value | 22 |
+| Varies | 162 |
+
+- The 31 include the loads of the handler the consumer asked about (`placements_n015`).
+- The 22 are node `n016`, the other side of the same branch: their facts say `r9 != 0` and
+  `r9 < 16`, the exporter's random samples have `r9 >= 16`, and the address is another
+  lane under the facts.
+- Of the 162 that vary, 143 carry no fact at all and differ between all symbols zero and
+  any random assignment (the low byte of a stack word is zero in one and not in the
+  other). Under what was exported they are not constants; if the walk knows that byte is
+  nonzero, the fact did not reach the file.
+- All 919 constants were evaluated at up to 300 assignments satisfying each question's
+  facts (drawn with small, large and one-bit values among the random ones) without a
+  disagreement. That check was run on the answers before the last change to views; the
+  final answers give the same 919 constants.
+- The earlier walk is unchanged in its answers (676 constants, 38 that vary), with 44 of
+  its hubs now asked under assumptions. On one core at load 90, once: 0.31.1 took 7.9 s of
+  CPU and this 6.4 s.
+
+Not verified: other walks; whether the two open targets close in the consumer (it has to
+run this); the three still unknown (the walk calls them `Varies`).
 
 ## Moving a consumer to it
 

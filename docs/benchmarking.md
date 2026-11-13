@@ -267,6 +267,7 @@ repository; `docs/proposals/parallel-proofs.md` has the numbers measured on one 
 
 `--walk DIR` replays a walk exported with a directory per boundary (`# kind: constant`,
 with `# result:` what the exporter decided, or `# sampled:` the value it saw at its samples;
+`--cases N` sets `Split::cases`;
 `# deep fuel: N`, `# result`, `# ms`, symbols with one key in every file): each boundary is
 one batch of `Ask::constant` in a context of its own, one session lasts the walk, and what
 stays open is asked again of a second session with the deep fuel (`--no-deep`: not).

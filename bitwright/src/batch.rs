@@ -69,9 +69,13 @@ pub struct Split {
     /// Regroup a chain of `+` or of `^` by the symbols its terms read, where that brings
     /// terms together whose sum is constant at the samples: the group is then a hub.
     pub terms: bool,
-    /// How many times a validity question that stays undecided is split in two on a
-    /// condition its selects test (`c → p[c:=1]` and `¬c → p[c:=0]`): each half is a
-    /// question of its own, so 2 means up to four cases. 0: never.
+    /// How many times a proof that stops at its limits (a question's, or a hub's) is split
+    /// in two on a condition it tests: the one most of its selects test or, without
+    /// selects, the smallest comparison of a claim built with `&`, `|`, `^` and `~`. Each
+    /// half is a question of its own, asked under the condition (or its negation) as one
+    /// more assumption, with the condition written as its value: what is constant in that
+    /// case is found and proved as under any assumption. 2 (the default) means up to four
+    /// cases; 0: never.
     pub cases: u8,
     /// Ask the lowest hubs first, and each hub above with those proved below it written as
     /// constants: every block of noise is then proved once, however many hubs and
@@ -100,14 +104,14 @@ pub struct Split {
 }
 
 impl Default for Split {
-    /// Proofs asked whole first; then hubs, nested, with terms regrouped and one case
-    /// split, from 64 points.
+    /// Proofs asked whole first; then hubs, nested, with terms regrouped and two levels of
+    /// case split, from 64 points.
     fn default() -> Self {
         Split {
             hubs: true,
             nested: true,
             terms: true,
-            cases: 1,
+            cases: 2,
             bottom_up: false,
             whole_first: true,
             assumed: true,
@@ -485,8 +489,8 @@ enum What {
     LeafHub,
     /// ...or a question's.
     LeafConstant,
-    /// The root is a hub: is it its constant?
-    Hub,
+    /// The root is a hub: is it its constant? With the case splits already made above it.
+    Hub(u8),
     /// The questions as asked: planned, split.
     AskSimplify,
     AskConstant,
@@ -496,6 +500,16 @@ enum What {
 
 /// A question's constraints, in the order given: their expressions in the store's context.
 type Assumed = Arc<[(u32, Facts)]>;
+
+impl What {
+    /// The case splits made above the task.
+    fn depth(self) -> u8 {
+        match self {
+            What::Hub(d) | What::AskValid(d) => d,
+            _ => 0,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
@@ -596,6 +610,12 @@ enum Plan {
         below: Vec<usize>,
         /// Its proofs: as written, and with the hubs below it replaced.
         proofs: [Option<usize>; 2],
+        /// The hubs below it that were not proved were asked again under its assumptions.
+        again: bool,
+        /// What its last proof was of: itself, with the hubs below it replaced.
+        asked: u32,
+        /// The two cases it was split in, when that proof stopped at its limits.
+        cases: Option<(usize, usize)>,
     },
     Ask {
         /// Of a constant question: the value at the samples and the point it was read at.
@@ -607,6 +627,8 @@ enum Plan {
         search: bool,
         found: Option<usize>,
         read: bool,
+        /// Its hubs that were not proved were asked again under its assumptions.
+        again: bool,
         /// The root with its chains regrouped.
         root: u32,
         /// The topmost hubs below it.
@@ -800,6 +822,16 @@ fn sample(
     points: u32,
 ) -> Result<Watched, Error> {
     sample_where(cx, known, roots, watch, points, None)
+}
+
+impl View {
+    /// Whether the view can tell what is constant because of the assumptions from what
+    /// varies: not when it is the store's own, when a search fixed the assumptions'
+    /// symbols (nothing over them varies then), or when they hold at a few points only.
+    fn tells(&self) -> bool {
+        let held = self.holds.iter().filter(|&&h| h).count();
+        !self.all && !self.searched && held * 8 >= self.holds.len()
+    }
 }
 
 /// Where [`sample_where`] counts: the points at which a set of assumptions holds.
@@ -1146,8 +1178,9 @@ fn regroup(
     Ok(map.len() as u64)
 }
 
-/// The condition the selects below `root` test most (ties: by the nodes' own hashes, which
-/// no context changes).
+/// The condition to split the claim `root` on: the one the selects below it test most
+/// or, when it has no select, the smallest comparison among the claims it is made of by
+/// `&`, `|`, `^` and `~` (ties: by the nodes' own hashes, which no context changes).
 fn condition(cx: &mut Context, root: u32) -> Option<u32> {
     let mut count: HashMap<u32, u32> = HashMap::new();
     for i in cx.post_order_ids(&[root]) {
@@ -1156,13 +1189,35 @@ fn condition(cx: &mut Context, root: u32) -> Option<u32> {
             *count.entry(n.a).or_default() += 1;
         }
     }
-    count
+    let tested = count
         .into_iter()
         .max_by_key(|&(c, n)| {
             let h = cx.structural_hash(cx.handle(c)).unwrap_or(0);
             (n, h, cx.tree_size(cx.handle(c)).unwrap_or(0))
         })
-        .map(|(c, _)| c)
+        .map(|(c, _)| c);
+    if tested.is_some() {
+        return tested;
+    }
+    let mut atoms: Vec<u32> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(i) = stack.pop() {
+        if cx.wid(i) != 1 || !seen.insert(i) {
+            continue;
+        }
+        let n = cx.node(i);
+        match n.op {
+            OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not => stack.extend(n.children()),
+            OpCode::Const | OpCode::Sym => {}
+            _ if i != root => atoms.push(i),
+            _ => {}
+        }
+    }
+    atoms.into_iter().min_by_key(|&c| {
+        let h = cx.structural_hash(cx.handle(c)).unwrap_or(0);
+        (cx.tree_size(cx.handle(c)).unwrap_or(0), h)
+    })
 }
 
 /// A task for a worker: a context of its own holding the root and the constraints.
@@ -1535,10 +1590,13 @@ impl Session {
         };
         let plan = match key.what {
             What::LeafSimplify | What::LeafValid | What::LeafHub | What::LeafConstant => Plan::Leaf,
-            What::Hub => Plan::Hub {
+            What::Hub(_) => Plan::Hub {
                 k: BitVec::zero(Width::W1),
                 below: Vec::new(),
                 proofs: [None, None],
+                again: false,
+                asked: key.root,
+                cases: None,
             },
             _ => Plan::Ask {
                 candidate: None,
@@ -1546,6 +1604,7 @@ impl Session {
                 search: false,
                 found: None,
                 read: false,
+                again: false,
                 root: key.root,
                 hubs: Vec::new(),
                 first: None,
@@ -1597,9 +1656,18 @@ impl Session {
         job.waiting = 0;
         job.state = State::Pending;
         let base = job.base;
-        if let Plan::Hub { below, proofs, .. } = &mut job.plan {
+        if let Plan::Hub {
+            below,
+            proofs,
+            again,
+            cases,
+            ..
+        } = &mut job.plan
+        {
             below.truncate(job.base);
             *proofs = [None, None];
+            *again = false;
+            *cases = None;
         }
         if let Plan::Ask {
             rest,
@@ -1608,11 +1676,12 @@ impl Session {
             hubs,
             found,
             read,
+            again,
             ..
         } = &mut job.plan
         {
             (*rest, *cases, *first) = (None, None, None);
-            (*found, *read) = (None, false);
+            (*found, *read, *again) = (None, false, false);
             hubs.truncate(base);
         }
         if st.graph.tops.contains(&j) {
@@ -1905,8 +1974,9 @@ impl Session {
             // Under the parent's assumptions, where they do not hold everywhere: a hub
             // there is asked under them, unless it is one everywhere.
             let assume = st.graph.jobs[parent].key.assume.clone();
+            let depth = st.graph.jobs[parent].key.what.depth();
             self.sample_under(st, &assume, &from, &[])?;
-            let under = split.assumed && st.views.get(&assume).is_some_and(|v| !v.all);
+            let under = split.assumed && st.views.get(&assume).is_some_and(View::tells);
             let found = match under {
                 true => hubs_below(&st.cx, &st.views[&assume].sampled, &from, &split),
                 false => hubs_below(&st.cx, &st.sampled, &from, &split),
@@ -1920,7 +1990,7 @@ impl Session {
                     false => (assume.clone(), st.views[&assume].sampled[&h].1),
                 };
                 let key = Key {
-                    what: What::Hub,
+                    what: What::Hub(depth),
                     root: h,
                     assume: assumed,
                     k: None,
@@ -1956,6 +2026,137 @@ impl Session {
                 st.graph.jobs[j].base = st.graph.jobs[j].deps.len();
             }
             self.ready_if(st, j);
+        }
+        Ok(())
+    }
+
+    /// Two questions for the claim `pred` of the task `j`, which its proof left undecided:
+    /// where a condition it tests holds, and where it does not. The condition is an
+    /// assumption of each (so what is constant because of it is found and proved as under
+    /// any other), and is written as its value in the claim. `None` when `pred` tests none.
+    fn split_cases(
+        &self,
+        st: &mut Store,
+        j: usize,
+        pred: u32,
+        depth: u8,
+    ) -> Result<Option<(usize, usize)>, Error> {
+        let Some(c) = condition(&mut st.cx, pred) else {
+            return Ok(None);
+        };
+        let assume = st.graph.jobs[j].key.assume.clone();
+        let mut halves = [0usize; 2];
+        for (h, value) in halves.iter_mut().zip([true, false]) {
+            let b = st.cx.bool(value)?;
+            let fixed = st
+                .cx
+                .substitute(&[st.cx.handle(pred)], &[(st.cx.handle(c), b)])?[0];
+            let bit = BitVec::wrapping_from_limbs(Width::W1, &[u64::from(value)]);
+            let mut under = assume.to_vec();
+            under.push((c, Facts::constant(&bit)));
+            let key = Key {
+                what: What::AskValid(depth + 1),
+                root: st.cx.id(fixed)?,
+                assume: under.into(),
+                k: None,
+            };
+            let new = !st.graph.by_key.contains_key(&key);
+            if new && st.done.contains_key(&key) {
+                st.stats.tasks_stored += 1;
+            }
+            let wanted = st.graph.jobs[j].wanted.clone();
+            let child = self.job(st, key, &wanted);
+            if new {
+                self.plan_asks(st, &[child])?;
+            }
+            self.depend(st, j, child);
+            *h = child;
+        }
+        st.stats.case_splits += 1;
+        Ok(Some((halves[0], halves[1])))
+    }
+
+    /// The hubs below `j` (a question or a hub, asked under assumptions) that were asked
+    /// without assumptions and not proved, asked under `j`'s: a node that is constant
+    /// because of the assumptions can look constant everywhere, when what moves it is a
+    /// corner no sample or probe is in. Only those that read a symbol the assumptions read.
+    fn ask_again(&self, st: &mut Store, j: usize) -> Result<(), Error> {
+        let split = self.config.split;
+        let assume = st.graph.jobs[j].key.assume.clone();
+        let hubs = match &mut st.graph.jobs[j].plan {
+            Plan::Hub { below, again, .. } => {
+                *again = true;
+                below.clone()
+            }
+            Plan::Ask { hubs, again, .. } => {
+                *again = true;
+                hubs.clone()
+            }
+            Plan::Leaf => Vec::new(),
+        };
+        if assume.is_empty() || !split.assumed || !st.views.contains_key(&assume) {
+            return Ok(());
+        }
+        let es: Vec<u32> = assume.iter().map(|x| x.0).collect();
+        let theirs: HashSet<SymbolKey> = (symbols_below(&mut st.cx, &es)?.into_iter())
+            .map(|x| x.0)
+            .collect();
+        let wanted = st.graph.jobs[j].wanted.clone();
+        for d in hubs {
+            let hub = &st.graph.jobs[d];
+            let open = match &hub.state {
+                State::Done(e) => !matches!(e.res, Res::Constant(_)),
+                _ => false,
+            };
+            let What::Hub(depth) = hub.key.what else {
+                continue;
+            };
+            if !hub.key.assume.is_empty() || !open {
+                continue;
+            }
+            let h = hub.key.root;
+            if !(symbols_below(&mut st.cx, &[h])?.iter()).any(|x| theirs.contains(&x.0)) {
+                continue;
+            }
+            // Its value where the assumptions hold.
+            self.sample_under(st, &assume, &[h], &[])?;
+            let seen = match st.views.get(&assume) {
+                Some(v) if !v.all => v.sampled.get(&h),
+                _ => st.sampled.get(&h),
+            };
+            let Some(&(true, value, _)) = seen else {
+                continue;
+            };
+            let key = Key {
+                what: What::Hub(depth),
+                root: h,
+                assume: assume.clone(),
+                k: None,
+            };
+            let new = !st.graph.by_key.contains_key(&key);
+            let stored = st.done.contains_key(&key);
+            let again = self.job(st, key, &wanted);
+            if new && stored {
+                st.stats.tasks_stored += 1;
+            } else if new {
+                st.stats.hubs += 1;
+                st.stats.hubs_assumed += 1;
+                if let Plan::Hub { k, .. } = &mut st.graph.jobs[again].plan {
+                    *k = value;
+                }
+                if split.bottom_up {
+                    let kids: Vec<u32> = st.cx.node(h).children().collect();
+                    self.plan_hubs(st, again, &kids)?;
+                    st.graph.jobs[again].base = st.graph.jobs[again].deps.len();
+                }
+                self.ready_if(st, again);
+            }
+            self.depend(st, j, again);
+            match &mut st.graph.jobs[j].plan {
+                Plan::Ask { hubs, .. } => hubs.push(again),
+                Plan::Hub { below, .. } => below.push(again),
+                Plan::Leaf => {}
+            }
         }
         Ok(())
     }
@@ -2072,8 +2273,16 @@ impl Session {
                         wanted: st.graph.jobs[j].wanted.clone(),
                     })));
                 }
-                Plan::Hub { k, below, proofs } => {
-                    let (k, below, proofs) = (*k, below.clone(), *proofs);
+                Plan::Hub {
+                    k,
+                    below,
+                    proofs,
+                    again,
+                    asked,
+                    cases,
+                } => {
+                    let (k, below, proofs, again) = (*k, below.clone(), *proofs, *again);
+                    let (asked, cases) = (*asked, *cases);
                     let proved_by = |st: &Store, l: Option<usize>| {
                         l.is_some_and(|l| match &st.graph.jobs[l].state {
                             State::Done(e) => matches!(e.res, Res::Proved),
@@ -2105,6 +2314,10 @@ impl Session {
                         st.graph.jobs[j].stage = 2;
                         continue;
                     }
+                    if stage == 2 && !again {
+                        self.ask_again(st, j)?;
+                        continue;
+                    }
                     let pairs = self.substitution(st, &below);
                     if stage == 2 && (bottom_up || !pairs.is_empty()) {
                         let hub = self.substituted(st, key.root, &pairs)?;
@@ -2114,14 +2327,47 @@ impl Session {
                         } else {
                             let l =
                                 self.leaf(st, j, What::LeafHub, hub, key.assume.clone(), Some(k));
-                            if let Plan::Hub { proofs, .. } = &mut st.graph.jobs[j].plan {
+                            if let Plan::Hub { proofs, asked, .. } = &mut st.graph.jobs[j].plan {
                                 proofs[1] = Some(l);
+                                *asked = hub;
                             }
                             st.graph.jobs[j].stage = 3;
                             continue;
                         }
                     }
                     proved |= proved_by(st, proofs[1]);
+                    let depth = key.what.depth();
+                    let stopped = (proofs[1].or(proofs[0])).is_some_and(|l| {
+                        matches!(
+                            &st.graph.jobs[l].state,
+                            State::Done(e) if matches!(
+                                e.res,
+                                Res::Unknown(Unknown::Budget { .. } | Unknown::TooLarge { .. })
+                            )
+                        )
+                    });
+                    if !proved && stage < 4 && stopped && depth < self.config.split.cases {
+                        // "It is its constant", in two cases.
+                        let pred = match st.cx.wid(asked) {
+                            1 if k.is_zero() => st.cx.c_un(UnOp::Not, asked)?,
+                            1 => asked,
+                            _ => {
+                                let konst = st.cx.mk_const(&k)?;
+                                st.cx.c_cmp(CmpOp::Eq, asked, konst)?
+                            }
+                        };
+                        if let Some(halves) = self.split_cases(st, j, pred, depth)? {
+                            if let Plan::Hub { cases, .. } = &mut st.graph.jobs[j].plan {
+                                *cases = Some(halves);
+                            }
+                            st.graph.jobs[j].stage = 4;
+                            continue;
+                        }
+                    }
+                    if let Some((a, b)) = cases {
+                        let done = |d: usize| matches!(&st.graph.jobs[d].state, State::Done(e) if matches!(e.res, Res::Proved));
+                        proved |= done(a) && done(b);
+                    }
                     let parts = self.parts(st, j);
                     let res = match proved {
                         true => Res::Constant(k),
@@ -2148,10 +2394,11 @@ impl Session {
                     search,
                     found,
                     read,
+                    again,
                 } => {
                     let (candidate, fallback, root, pred) = (*candidate, *fallback, *root, *pred);
                     let (rest, cases, first) = (*rest, *cases, *first);
-                    let (search, found, read) = (*search, *found, *read);
+                    let (search, found, read, again) = (*search, *found, *read, *again);
                     let hubs = hubs.clone();
                     let done = |st: &Store, d: usize| match &st.graph.jobs[d].state {
                         State::Done(e) => Ok(e.clone()),
@@ -2263,6 +2510,10 @@ impl Session {
                         }
                         continue;
                     }
+                    if stage == 2 && !again {
+                        self.ask_again(st, j)?;
+                        continue;
+                    }
                     if stage == 2 {
                         let pairs = self.substitution(st, &hubs);
                         let left = self.substituted(st, root, &pairs)?;
@@ -2309,42 +2560,10 @@ impl Session {
                             res,
                             Res::Unknown(Unknown::Budget { .. } | Unknown::TooLarge { .. })
                         )
-                        && let Some(c) = condition(&mut st.cx, pred)
+                        && let Some(halves) = self.split_cases(st, j, pred, depth)?
                     {
-                        // Two questions: where the condition holds, and where it does not.
-                        let mut halves = [0usize; 2];
-                        for (h, value) in halves.iter_mut().zip([true, false]) {
-                            let b = st.cx.bool(value)?;
-                            let fixed = st
-                                .cx
-                                .substitute(&[st.cx.handle(pred)], &[(st.cx.handle(c), b)])?[0];
-                            let guard = match value {
-                                true => st.cx.c_un(UnOp::Not, c)?,
-                                false => c,
-                            };
-                            let fixed = st.cx.id(fixed)?;
-                            let half = st.cx.c_bin(BinOp::Or, guard, fixed)?;
-                            let key = Key {
-                                what: What::AskValid(depth + 1),
-                                root: half,
-                                assume: key.assume.clone(),
-                                k: None,
-                            };
-                            let new = !st.graph.by_key.contains_key(&key);
-                            if new && st.done.contains_key(&key) {
-                                st.stats.tasks_stored += 1;
-                            }
-                            let wanted = st.graph.jobs[j].wanted.clone();
-                            let child = self.job(st, key, &wanted);
-                            if new {
-                                self.plan_asks(st, &[child])?;
-                            }
-                            self.depend(st, j, child);
-                            *h = child;
-                        }
-                        st.stats.case_splits += 1;
                         if let Plan::Ask { cases, .. } = &mut st.graph.jobs[j].plan {
-                            *cases = Some((halves[0], halves[1]));
+                            *cases = Some(halves);
                         }
                         st.graph.jobs[j].stage = 4;
                         continue;
