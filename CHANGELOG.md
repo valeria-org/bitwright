@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **Batch: constants under assumptions that random samples do not meet.** Where no sample
+  point satisfies a question's assumptions (a symbol held below a bound, an equality), a
+  session now searches for an assignment that does and reads the candidate there, instead
+  of answering `Unknown(Unsupported("no sample satisfies the assumptions"))`; assumptions
+  that cannot hold together are said to be so. The search only chooses where to look: a
+  `Constant` is still proved, and a `Varies` is two assignments that satisfy the
+  assumptions.
+- **Batch: hubs under assumptions** (`Split::assumed`, on by default). A node with one
+  value wherever the assumptions hold, which moves where they do not (at a sample that
+  fails them, or with an assumed symbol at 0, 1, all ones or next to a constant the
+  assumptions mention), is asked under them and replaced in the questions asked under the
+  same assumptions: a comparison they decide, hidden in arithmetic, is a small proof of
+  its own. `Stats::hubs_assumed` counts them. On the walk measured for 0.31.1 the 13
+  questions left `Unknown` are now decided (11 vary, 2 are constants), and nothing else
+  changes.
+- Batch answers of questions under assumptions may differ from 0.31.1 where that left them
+  undecided, and their costs differ; the entry points outside `batch` are unchanged.
+- `bitwright-bench --walk` reads `# sampled: V` where a file has no `# result:`.
+
 ## 0.31.1
 
 - **Hubs from the bottom** (`batch::Split::bottom_up`, `Split::shared()`). The hubs are the

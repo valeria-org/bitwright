@@ -17,6 +17,13 @@
 //! the hub to it or the search proved the equality, never because the samples agreed. A hub
 //! is one task however many questions contain it, and its answer is kept in the store.
 //!
+//! A question asked [under assumptions](Ask::under) is sampled where they hold. Where no
+//! point satisfies them (a symbol held below a bound, say) an assignment that does is
+//! searched for, and the question's value read there; the search only chooses where to
+//! look, as the samples do. A node with one value wherever the assumptions hold, which
+//! moves where they do not, is a hub of those assumptions ([`Split::assumed`]): it is asked
+//! under them, and replaced only in questions and hubs asked under the same.
+//!
 //! ```
 //! use bitwright::batch::{Answer, Ask, Config, Session};
 //! use bitwright::{BitVec, Context, ParseOptions, Width};
@@ -79,6 +86,12 @@ pub struct Split {
     /// neither asked nor stored: right for questions that share little, or that the
     /// engine folds whole. [`Split::eager`] asks the hubs first. On by default.
     pub whole_first: bool,
+    /// Under a question's assumptions, also ask the nodes that have one value wherever the
+    /// assumptions hold though they vary elsewhere, each under those assumptions, and
+    /// replace those proved in the questions asked under the same assumptions: a
+    /// comparison the assumptions decide, hidden in arithmetic, is then a small proof of
+    /// its own and not part of every question above it. On by default.
+    pub assumed: bool,
     /// Assignments of the symbols every node is evaluated at to find hubs (at least 2; the
     /// first two are all zeros and all ones).
     pub points: u32,
@@ -97,6 +110,7 @@ impl Default for Split {
             cases: 1,
             bottom_up: false,
             whole_first: true,
+            assumed: true,
             points: 64,
             min_nodes: 4,
         }
@@ -134,6 +148,7 @@ impl Split {
             cases: 0,
             bottom_up: false,
             whole_first: false,
+            assumed: false,
             points: 64,
             min_nodes: 4,
         }
@@ -147,6 +162,7 @@ setters!(Split {
     with_cases: cases: u8,
     with_bottom_up: bottom_up: bool,
     with_whole_first: whole_first: bool,
+    with_assumed: assumed: bool,
     with_points: points: u32,
     with_min_nodes: min_nodes: u32,
 });
@@ -163,6 +179,15 @@ pub struct Config {
     /// How every task is decided: the search's limits, the simplifier's budget
     /// ([`prove::Config::simplify_budget`], also the budget of a [`Ask::simplify`]), and
     /// the rest. Certificates are not kept: a split question's proof is of its parts.
+    ///
+    /// The limits are each proof's, not the question's: a question cut in parts makes
+    /// several proofs (its hubs', unless [`hub`](Self::hub) says otherwise, the search for
+    /// an assignment its assumptions hold at, its own), each within
+    /// [`max_conflicts`](prove::Config::max_conflicts) and
+    /// [`max_propagations`](prove::Config::max_propagations), whichever is reached first,
+    /// and each swept first within half of them again. An
+    /// [`Unknown::Budget`] answer carries what the question's last
+    /// proof did, sweep included; [`Reply::cost`] is the sum over all of them.
     pub prove: prove::Config,
     /// The MBA phase of the session's engines, when not the prover's own (the default with
     /// the opaque-constant sweep).
@@ -437,6 +462,9 @@ pub struct Stats {
     pub case_splits: u64,
     /// Tasks stopped by a [`Cancel`].
     pub cancelled: u64,
+    /// Of `hubs`, those that are one only under their question's assumptions
+    /// ([`Split::assumed`]).
+    pub hubs_assumed: u64,
     /// Nodes of the store's context now.
     pub store_nodes: u64,
     /// Answers the store holds now.
@@ -466,13 +494,16 @@ enum What {
     AskValid(u8),
 }
 
+/// A question's constraints, in the order given: their expressions in the store's context.
+type Assumed = Arc<[(u32, Facts)]>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     what: What,
     /// A node of the store's context.
     root: u32,
     /// The constraints, in the order given: their expressions in the store's context.
-    assume: Arc<[(u32, Facts)]>,
+    assume: Assumed,
     /// Of a proof that the root is a constant: which.
     k: Option<BitVec>,
 }
@@ -571,6 +602,11 @@ enum Plan {
         /// `None` with `fallback`: no sample satisfied the assumptions.
         candidate: Option<(BitVec, u32)>,
         fallback: bool,
+        /// No sample satisfied the assumptions: an assignment that does is searched for
+        /// first (`found`, the task that does), and the candidate read there.
+        search: bool,
+        found: Option<usize>,
+        read: bool,
         /// The root with its chains regrouped.
         root: u32,
         /// The topmost hubs below it.
@@ -620,6 +656,8 @@ struct Store {
     registry: Option<Arc<crate::ext::Registry>>,
     /// What the samples say of the context's nodes.
     sampled: Sampled,
+    /// Per set of assumptions that does not hold at every point: where it holds.
+    views: HashMap<Assumed, View>,
     next_id: u64,
     stats: Stats,
     graph: Graph,
@@ -631,6 +669,7 @@ impl Store {
         cx.registry = src.registry.clone();
         self.cx = cx;
         self.sampled = Sampled::default();
+        self.views.clear();
         self.done.clear();
         self.config = Some(src.config().clone());
         self.registry = src.registry.clone();
@@ -652,6 +691,36 @@ impl Store {
 /// What the samples say of a node: whether it had one value at every point, its value at
 /// the first, and whether something below it (or itself) varies. A function of the node.
 type Sampled = IdMap<u32, (bool, BitVec, bool)>;
+
+/// The sample points at which a set of assumptions holds, and what they say of the nodes
+/// there. A function of the assumptions.
+#[derive(Debug, Default)]
+struct View {
+    /// Symbols held at one value at every point: an assignment found by search, when the
+    /// assumptions hold at no point otherwise.
+    fixed: Model,
+    /// Per point, whether the assumptions hold there.
+    holds: Vec<bool>,
+    /// They hold at every point, with nothing fixed: the samples are the store's own.
+    all: bool,
+    /// `fixed` came from a search.
+    searched: bool,
+    /// Assignments at which the assumptions may turn ([`probes`]).
+    probes: Vec<Model>,
+    /// The nodes that move at a point where the assumptions do not hold, or at a probe.
+    moves: HashSet<u32>,
+    sampled: Sampled,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Looked {
+    /// At some point, as the view says.
+    Holds,
+    /// At no point: an assignment is to be searched for.
+    Search,
+    /// At no point, with the assignment a search found.
+    Nowhere,
+}
 
 /// The nodes whose value at every point was asked for.
 type Watched = IdMap<u32, Vec<BitVec>>;
@@ -679,6 +748,11 @@ fn point_value(key: &SymbolKey, w: Width, known: Option<crate::KnownBits>, p: u3
             BitVec::wrapping_from_limbs(w, &limbs)
         }
     };
+    declared(v, known)
+}
+
+/// `v` with the bits a declaration fixes.
+fn declared(v: BitVec, known: Option<crate::KnownBits>) -> BitVec {
     match known {
         Some(k) => {
             let v = BitVec::bin_unchecked(BinOp::Or, &v, &k.known_one());
@@ -725,7 +799,38 @@ fn sample(
     watch: &[u32],
     points: u32,
 ) -> Result<Watched, Error> {
-    let mut watched: Watched = watch.iter().map(|&i| (i, Vec::new())).collect();
+    sample_where(cx, known, roots, watch, points, None)
+}
+
+/// Where [`sample_where`] counts: the points at which a set of assumptions holds.
+struct Where<'a> {
+    fixed: &'a [(SymbolKey, BitVec)],
+    /// Per point; every point when `None`.
+    holds: Option<&'a [bool]>,
+    probes: &'a [Model],
+    /// The nodes with another value at a point that is not counted, or at a probe.
+    moves: &'a mut HashSet<u32>,
+}
+
+/// [`sample`] where a set of assumptions holds: with the symbols `fixed` held at their
+/// values and only the points `holds` counted (a node's first value is at the first of
+/// them). The values of `watch` are at every point, then at every probe.
+fn sample_where(
+    cx: &mut Context,
+    known: &mut Sampled,
+    roots: &[u32],
+    watch: &[u32],
+    points: u32,
+    at_view: Option<Where<'_>>,
+) -> Result<Watched, Error> {
+    let n = points.max(2) as usize;
+    let (fixed, holds, probes, mut moves) = match at_view {
+        Some(w) => (w.fixed, w.holds, w.probes, Some(w.moves)),
+        None => (&[][..], None, &[][..], None),
+    };
+    let total = n + probes.len();
+    let blank = BitVec::zero(Width::W1);
+    let mut watched: Watched = watch.iter().map(|&i| (i, vec![blank; total])).collect();
     // A node is sampled with everything below it.
     let missing: Vec<u32> = (roots.iter().copied())
         .filter(|i| !known.contains_key(i))
@@ -739,25 +844,44 @@ fn sample(
     let symbols = symbols_below(cx, &missing)?;
     let mut first: Vec<BitVec> = Vec::new();
     let mut konst = vec![true; order.len()];
+    let mut moved = vec![false; order.len()];
     let at: IdMap<u32, usize> = order.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-    for p in 0..points.max(2) {
-        let env: HashMap<SymbolKey, BitVec> = symbols
+    // The points that count first: the others are compared with them.
+    let counts = |p: usize| p < n && holds.is_none_or(|h| h.get(p).copied().unwrap_or(false));
+    let turn = (0..total)
+        .filter(|&p| counts(p))
+        .chain((0..total).filter(|&p| !counts(p)));
+    for p in turn {
+        let mut env: HashMap<SymbolKey, BitVec> = symbols
             .iter()
-            .map(|(key, w, known)| (key.clone(), point_value(key, *w, *known, p)))
+            .map(|(key, w, known)| (key.clone(), point_value(key, *w, *known, p as u32)))
             .collect();
+        let probe = probes.get(p.wrapping_sub(n)).map_or(&[][..], |m| &m[..]);
+        for (key, v) in fixed.iter().chain(probe) {
+            if let Some(slot) = env.get_mut(key) {
+                *slot = *v;
+            }
+        }
         let vals = cx.eval(&handles, &env)?;
         for (&w, kept) in &mut watched {
             if let Some(&k) = at.get(&w) {
-                kept.push(vals[k]);
+                kept[p] = vals[k];
             }
         }
-        if p == 0 {
+        if !counts(p) {
+            for (k, v) in vals.iter().enumerate() {
+                moved[k] |= first.get(k).is_some_and(|f| f != v);
+            }
+        } else if first.is_empty() {
             first = vals;
         } else {
             for (k, v) in vals.iter().enumerate() {
                 konst[k] &= *v == first[k];
             }
         }
+    }
+    if first.is_empty() {
+        return Ok(watched);
     }
     for (k, &i) in order.iter().enumerate() {
         // (Operands come first in the order.)
@@ -767,8 +891,39 @@ fn sample(
                 .children()
                 .any(|c| known.get(&c).is_some_and(|x| x.2));
         known.insert(i, (konst[k], first[k], varies));
+        if let Some(m) = moves.as_deref_mut()
+            && moved[k]
+        {
+            m.insert(i);
+        }
     }
     Ok(watched)
+}
+
+/// Assignments at which a comparison of the assumptions `es` may turn: one of their
+/// symbols (the first eight by key) at 0, 1, all ones, or next to a constant they mention,
+/// the others as at a point of their own. A node that is constant wherever the assumptions
+/// hold and moves at one of these is constant because of them.
+fn probes(cx: &mut Context, es: &[u32]) -> Result<Vec<Model>, Error> {
+    let mut consts: Vec<BitVec> = (cx.post_order_ids(es).into_iter())
+        .filter_map(|i| cx.const_val(i))
+        .collect();
+    consts.sort_by(|a, b| (a.width(), a.limbs()).cmp(&(b.width(), b.limbs())));
+    consts.dedup();
+    let mut out = Vec::new();
+    for (key, w, known) in symbols_below(cx, es)?.into_iter().take(8) {
+        let one = BitVec::wrapping_from_limbs(w, &[1]);
+        let mut values = vec![BitVec::zero(w), one, BitVec::ones(w)];
+        for c in consts.iter().filter(|c| c.width() == w).take(6) {
+            values.push(BitVec::bin_unchecked(BinOp::Sub, c, &one));
+            values.push(*c);
+            values.push(BitVec::bin_unchecked(BinOp::Add, c, &one));
+        }
+        for v in values {
+            out.push(vec![(key.clone(), declared(v, known))]);
+        }
+    }
+    Ok(out)
 }
 
 /// The hubs nearest below the nodes `from` (those themselves, when they are hubs). A hub
@@ -1098,6 +1253,7 @@ impl Session {
                 config: None,
                 registry: None,
                 sampled: Sampled::default(),
+                views: HashMap::new(),
                 next_id: 0,
                 stats: Stats::default(),
                 graph: Graph::default(),
@@ -1128,6 +1284,7 @@ impl Session {
         let mut st = self.lock();
         st.cx = Context::new();
         st.sampled = Sampled::default();
+        st.views.clear();
         st.done.clear();
         st.config = None;
         st.stats.flushes += 1;
@@ -1386,6 +1543,9 @@ impl Session {
             _ => Plan::Ask {
                 candidate: None,
                 fallback: false,
+                search: false,
+                found: None,
+                read: false,
                 root: key.root,
                 hubs: Vec::new(),
                 first: None,
@@ -1446,10 +1606,13 @@ impl Session {
             cases,
             first,
             hubs,
+            found,
+            read,
             ..
         } = &mut job.plan
         {
             (*rest, *cases, *first) = (None, None, None);
+            (*found, *read) = (None, false);
             hubs.truncate(base);
         }
         if st.graph.tops.contains(&j) {
@@ -1520,76 +1683,55 @@ impl Session {
             )?;
             st.stats.regrouped += n;
         }
-        // A constant question's value is read where its assumptions hold.
-        let mut watch: Vec<u32> = Vec::new();
-        let mut all = roots.clone();
-        for &k in &constants {
-            watch.push(roots[k]);
-            for (e, _) in st.graph.jobs[asks[k]].key.assume.iter() {
-                watch.push(*e);
-                all.push(*e);
-            }
-        }
-        let store = &mut *st;
-        let watched = sample(
-            &mut store.cx,
-            &mut store.sampled,
-            &all,
-            &watch,
-            split.points,
-        )?;
-        for &k in &constants {
-            let j = asks[k];
-            let assume = st.graph.jobs[j].key.assume.clone();
-            let values = &watched[&roots[k]];
-            let holds = |p: usize| assume.iter().all(|(e, f)| f.contains(&watched[e][p]));
-            let mut at: Option<usize> = None;
-            let mut varies: Option<(usize, usize)> = None;
-            for p in 0..values.len() {
-                if !holds(p) {
-                    continue;
-                }
-                match at {
-                    None => at = Some(p),
-                    Some(q) if values[q] != values[p] => {
-                        varies = Some((q, p));
-                        break;
-                    }
-                    Some(_) => {}
-                }
-            }
-            if let Some((p, q)) = varies {
-                // Two values where the assumptions hold: evaluated, so decided.
-                let mut near = vec![st.graph.jobs[j].key.root];
-                near.extend(assume.iter().map(|x| x.0));
-                let a = point_model(&mut st.cx, &near, p as u32)?;
-                let b = point_model(&mut st.cx, &near, q as u32)?;
-                let entry = st.entry(Res::Varies(Box::new((a, b))), Cost::default(), Vec::new());
-                self.finish(st, j, entry);
-                continue;
-            }
-            if let Plan::Ask {
-                candidate,
-                fallback,
-                ..
-            } = &mut st.graph.jobs[j].plan
-            {
-                match at {
-                    Some(p) => *candidate = Some((values[p], p as u32)),
-                    None => *fallback = true,
-                }
-            }
-        }
         for (k, &j) in asks.iter().enumerate() {
             if let Plan::Ask { root, .. } = &mut st.graph.jobs[j].plan {
                 *root = roots[k];
             }
         }
+        let store = &mut *st;
+        sample(&mut store.cx, &mut store.sampled, &roots, &[], split.points)?;
+        // Where each set of assumptions holds: a constant question's value is read there,
+        // and a hub may be one there only.
+        let mut groups: Vec<(Assumed, Vec<usize>)> = Vec::new();
+        for (k, &j) in asks.iter().enumerate() {
+            let key = &st.graph.jobs[j].key;
+            let constant = key.what == What::AskConstant;
+            if !constant && (key.assume.is_empty() || !split.hubs || !split.assumed) {
+                continue;
+            }
+            match groups.iter_mut().find(|g| g.0 == key.assume) {
+                Some(g) => g.1.push(k),
+                None => groups.push((key.assume.clone(), vec![k])),
+            }
+        }
+        for (assume, members) in groups {
+            if self.look(st, &assume, None)? == Looked::Search {
+                for &k in &members {
+                    if let Plan::Ask { search, .. } = &mut st.graph.jobs[asks[k]].plan {
+                        *search = true;
+                    }
+                }
+                continue;
+            }
+            let constant: Vec<usize> = (members.iter().copied())
+                .filter(|k| constants.contains(k))
+                .collect();
+            if constant.is_empty() {
+                continue;
+            }
+            let watch: Vec<u32> = constant.iter().map(|&k| roots[k]).collect();
+            let watched = self.sample_under(st, &assume, &watch, &watch)?;
+            for &k in &constant {
+                self.read(st, asks[k], &watched[&roots[k]])?;
+            }
+        }
         if split.hubs {
-            // A proof asked whole first makes its hubs' tasks only if it must.
+            // A proof asked whole first makes its hubs' tasks only if it must; one whose
+            // assumptions are searched for, once that is done.
             for (&j, &root) in asks.iter().zip(&roots) {
-                if !self.whole_first(st, j) {
-                    self.plan_hubs(st, j, &[root]);
+                let searching = matches!(st.graph.jobs[j].plan, Plan::Ask { search: true, .. });
+                if !searching && !self.whole_first(st, j) {
+                    self.plan_hubs(st, j, &[root])?;
                     st.graph.jobs[j].base = st.graph.jobs[j].deps.len();
                 }
             }
@@ -1597,6 +1739,146 @@ impl Session {
         let n = st.graph.jobs.len();
         for j in 0..n {
             self.ready_if(st, j);
+        }
+        Ok(())
+    }
+
+    /// Where the assumptions `assume` hold among the sample points, kept as their view:
+    /// with the symbols of `found` (an assignment a search returned) held at its values,
+    /// when given.
+    fn look(
+        &self,
+        st: &mut Store,
+        assume: &Assumed,
+        found: Option<&Model>,
+    ) -> Result<Looked, Error> {
+        if assume.is_empty() {
+            return Ok(Looked::Holds);
+        }
+        if let Some(v) = st.views.get(assume) {
+            // (A view that was searched for is reached through its search, whose cost is
+            // then every such question's.)
+            return Ok(match v.searched && found.is_none() {
+                true => Looked::Search,
+                false => Looked::Holds,
+            });
+        }
+        let es: Vec<u32> = assume.iter().map(|x| x.0).collect();
+        let points = self.config.split.points;
+        let n = points.max(2) as usize;
+        let store = &mut *st;
+        let probes = probes(&mut store.cx, &es)?;
+        let mut scratch = (Sampled::default(), HashSet::new());
+        let at_view = Where {
+            fixed: found.map_or(&[][..], |m| &m[..]),
+            holds: None,
+            probes: &probes,
+            moves: &mut scratch.1,
+        };
+        let cx = &mut store.cx;
+        let watched = sample_where(cx, &mut scratch.0, &es, &es, points, Some(at_view))?;
+        let at = |p: usize| assume.iter().all(|(e, f)| f.contains(&watched[e][p]));
+        let holds: Vec<bool> = (0..n).map(at).collect();
+        if !holds.iter().any(|&h| h) {
+            return Ok(match found {
+                None => Looked::Search,
+                Some(_) => Looked::Nowhere,
+            });
+        }
+        let view = View {
+            fixed: found.cloned().unwrap_or_default(),
+            all: found.is_none() && (0..n + probes.len()).all(at),
+            searched: found.is_some(),
+            holds,
+            probes,
+            moves: HashSet::new(),
+            sampled: Sampled::default(),
+        };
+        st.views.insert(assume.clone(), view);
+        Ok(Looked::Holds)
+    }
+
+    /// Samples the nodes below `roots`, at every point and where `assume` holds: the
+    /// values of `watch` at every point of the assumptions' view.
+    fn sample_under(
+        &self,
+        st: &mut Store,
+        assume: &Assumed,
+        roots: &[u32],
+        watch: &[u32],
+    ) -> Result<Watched, Error> {
+        let points = self.config.split.points;
+        let store = &mut *st;
+        let everywhere = sample(&mut store.cx, &mut store.sampled, roots, watch, points)?;
+        match store.views.get_mut(assume) {
+            Some(v) if !v.all => {
+                let at_view = Where {
+                    fixed: &v.fixed,
+                    holds: Some(&v.holds),
+                    probes: &v.probes,
+                    moves: &mut v.moves,
+                };
+                sample_where(
+                    &mut store.cx,
+                    &mut v.sampled,
+                    roots,
+                    watch,
+                    points,
+                    Some(at_view),
+                )
+            }
+            _ => Ok(everywhere),
+        }
+    }
+
+    /// The assignment at point `p` for the question `key`: its symbols' values there, with
+    /// what the view of its assumptions holds fixed.
+    fn point(&self, st: &mut Store, key: &Key, p: u32) -> Result<Model, Error> {
+        let mut near = vec![key.root];
+        near.extend(key.assume.iter().map(|x| x.0));
+        let mut model = point_model(&mut st.cx, &near, p)?;
+        if let Some(v) = st.views.get(&key.assume) {
+            for (k, value) in &v.fixed {
+                if let Some(slot) = model.iter_mut().find(|x| x.0 == *k) {
+                    slot.1 = *value;
+                }
+            }
+        }
+        Ok(model)
+    }
+
+    /// A constant question's candidate from the values of its root at every point of its
+    /// assumptions' view: its value where they hold, or its answer when it has two there.
+    fn read(&self, st: &mut Store, j: usize, values: &[BitVec]) -> Result<(), Error> {
+        let key = st.graph.jobs[j].key.clone();
+        let held: Vec<usize> = match st.views.get(&key.assume) {
+            Some(v) => (0..v.holds.len()).filter(|&p| v.holds[p]).collect(),
+            None => (0..values.len()).collect(),
+        };
+        let at = held.first().copied();
+        let other = held
+            .iter()
+            .copied()
+            .find(|&p| Some(values[p]) != at.map(|q| values[q]));
+        if let (Some(p), Some(q)) = (at, other) {
+            // Two values where the assumptions hold: evaluated, so decided.
+            let a = self.point(st, &key, p as u32)?;
+            let b = self.point(st, &key, q as u32)?;
+            let parts = self.parts(st, j);
+            let entry = st.entry(Res::Varies(Box::new((a, b))), Cost::default(), parts);
+            self.finish(st, j, entry);
+            return Ok(());
+        }
+        if let Plan::Ask {
+            candidate,
+            fallback,
+            ..
+        } = &mut st.graph.jobs[j].plan
+        {
+            match at {
+                Some(p) => *candidate = Some((values[p], p as u32)),
+                None => *fallback = true,
+            }
         }
         Ok(())
     }
@@ -1611,20 +1893,36 @@ impl Session {
     /// Makes the tasks of the hubs nearest below the nodes `from` and has `parent` (a
     /// question, or a hub that was not proved as written) wait for them, from the samples
     /// `s` of those nodes.
-    fn plan_hubs(&self, st: &mut Store, parent: usize, from: &[u32]) {
+    fn plan_hubs(&self, st: &mut Store, parent: usize, from: &[u32]) -> Result<(), Error> {
         if matches!(st.graph.jobs[parent].state, State::Done(_)) {
-            return;
+            return Ok(());
         }
         let split = self.config.split;
         let wanted = st.graph.jobs[parent].wanted.clone();
         let mut made: Vec<usize> = Vec::new();
         let mut work: Vec<(usize, Vec<u32>)> = vec![(parent, from.to_vec())];
         while let Some((parent, from)) = work.pop() {
-            for h in hubs_below(&st.cx, &st.sampled, &from, &split) {
+            // Under the parent's assumptions, where they do not hold everywhere: a hub
+            // there is asked under them, unless it is one everywhere.
+            let assume = st.graph.jobs[parent].key.assume.clone();
+            self.sample_under(st, &assume, &from, &[])?;
+            let under = split.assumed && st.views.get(&assume).is_some_and(|v| !v.all);
+            let found = match under {
+                true => hubs_below(&st.cx, &st.views[&assume].sampled, &from, &split),
+                false => hubs_below(&st.cx, &st.sampled, &from, &split),
+            };
+            for h in found {
+                let everywhere = !under
+                    || (st.sampled.get(&h).is_some_and(|x| x.0)
+                        && !st.views[&assume].moves.contains(&h));
+                let (assumed, value) = match everywhere {
+                    true => (Arc::from([]), st.sampled[&h].1),
+                    false => (assume.clone(), st.views[&assume].sampled[&h].1),
+                };
                 let key = Key {
                     what: What::Hub,
                     root: h,
-                    assume: Arc::from([]),
+                    assume: assumed,
                     k: None,
                 };
                 let new = !st.graph.by_key.contains_key(&key);
@@ -1634,8 +1932,9 @@ impl Session {
                     st.stats.tasks_stored += 1;
                 } else if new {
                     st.stats.hubs += 1;
+                    st.stats.hubs_assumed += u64::from(!everywhere);
                     if let Plan::Hub { k, .. } = &mut st.graph.jobs[j].plan {
-                        *k = st.sampled[&h].1;
+                        *k = value;
                     }
                     made.push(j);
                     if split.bottom_up {
@@ -1658,6 +1957,7 @@ impl Session {
             }
             self.ready_if(st, j);
         }
+        Ok(())
     }
 
     /// The proved constants to write for the tasks `deps` of a hub or a question.
@@ -1711,7 +2011,7 @@ impl Session {
         j: usize,
         what: What,
         root: u32,
-        assume: Arc<[(u32, Facts)]>,
+        assume: Assumed,
         k: Option<BitVec>,
     ) -> usize {
         let key = Key {
@@ -1789,7 +2089,8 @@ impl Session {
                     if stage == 0 {
                         // As written: where the engine folds the noise by itself, one
                         // proof serves for all that is below.
-                        let l = self.leaf(st, j, What::LeafHub, key.root, Arc::from([]), Some(k));
+                        let l =
+                            self.leaf(st, j, What::LeafHub, key.root, key.assume.clone(), Some(k));
                         if let Plan::Hub { proofs, .. } = &mut st.graph.jobs[j].plan {
                             proofs[0] = Some(l);
                         }
@@ -1800,10 +2101,7 @@ impl Session {
                     if stage == 1 && !proved && self.config.split.nested {
                         // The hubs below it first, then.
                         let kids: Vec<u32> = st.cx.node(key.root).children().collect();
-                        let store = &mut *st;
-                        let points = self.config.split.points;
-                        sample(&mut store.cx, &mut store.sampled, &kids, &[], points)?;
-                        self.plan_hubs(st, j, &kids);
+                        self.plan_hubs(st, j, &kids)?;
                         st.graph.jobs[j].stage = 2;
                         continue;
                     }
@@ -1814,7 +2112,8 @@ impl Session {
                             // Folded by the constants below it.
                             proved = true;
                         } else {
-                            let l = self.leaf(st, j, What::LeafHub, hub, Arc::from([]), Some(k));
+                            let l =
+                                self.leaf(st, j, What::LeafHub, hub, key.assume.clone(), Some(k));
                             if let Plan::Hub { proofs, .. } = &mut st.graph.jobs[j].plan {
                                 proofs[1] = Some(l);
                             }
@@ -1846,14 +2145,61 @@ impl Session {
                     pred,
                     rest,
                     cases,
+                    search,
+                    found,
+                    read,
                 } => {
                     let (candidate, fallback, root, pred) = (*candidate, *fallback, *root, *pred);
                     let (rest, cases, first) = (*rest, *cases, *first);
+                    let (search, found, read) = (*search, *found, *read);
                     let hubs = hubs.clone();
                     let done = |st: &Store, d: usize| match &st.graph.jobs[d].state {
                         State::Done(e) => Ok(e.clone()),
                         _ => Err(Error::Contract("a task ready before its parts".into())),
                     };
+                    if stage == 0 && search && !read {
+                        let Some(l) = found else {
+                            // An assignment that satisfies the assumptions: what refutes
+                            // "false" under them.
+                            let no = st.cx.bool(false)?;
+                            let no = st.cx.id(no)?;
+                            let l = self.leaf(st, j, What::LeafValid, no, key.assume.clone(), None);
+                            if let Plan::Ask { found, .. } = &mut st.graph.jobs[j].plan {
+                                *found = Some(l);
+                            }
+                            continue;
+                        };
+                        let constant = key.what == What::AskConstant;
+                        let held = match &done(st, l)?.res {
+                            Res::Refuted(m) => {
+                                self.look(st, &key.assume, Some(m))? == Looked::Holds
+                            }
+                            Res::Proved if constant => {
+                                let why = "the assumptions cannot hold together".into();
+                                let parts = self.parts(st, j);
+                                let res = Res::Unknown(Unknown::Unsupported(why));
+                                let entry = st.entry(res, Cost::default(), parts);
+                                self.finish(st, j, entry);
+                                return Ok(Step::Settled);
+                            }
+                            _ => false,
+                        };
+                        if constant && held {
+                            let watched = self.sample_under(st, &key.assume, &[root], &[root])?;
+                            self.read(st, j, &watched[&root])?;
+                            if matches!(st.graph.jobs[j].state, State::Done(_)) {
+                                return Ok(Step::Settled);
+                            }
+                        }
+                        if let Plan::Ask { read, fallback, .. } = &mut st.graph.jobs[j].plan {
+                            *read = true;
+                            *fallback |= constant && !held;
+                        }
+                        if self.config.split.hubs && !self.whole_first(st, j) {
+                            self.plan_hubs(st, j, &[root])?;
+                        }
+                        continue;
+                    }
                     if stage == 0 {
                         if self.whole_first(st, j) {
                             // The question as asked, before any cut.
@@ -1907,10 +2253,7 @@ impl Session {
                             return Ok(Step::Settled);
                         }
                         if self.config.split.hubs {
-                            let store = &mut *st;
-                            let points = self.config.split.points;
-                            sample(&mut store.cx, &mut store.sampled, &[root], &[], points)?;
-                            self.plan_hubs(st, j, &[root]);
+                            self.plan_hubs(st, j, &[root])?;
                             st.graph.jobs[j].stage = 2;
                         } else {
                             if let Plan::Ask { rest, .. } = &mut st.graph.jobs[j].plan {
@@ -2056,7 +2399,7 @@ impl Session {
                 match st.cx.const_val(expr) {
                     Some(v) => Res::Constant(v),
                     None => Res::Unknown(Unknown::Unsupported(
-                        "no sample satisfies the assumptions".into(),
+                        "no assignment that satisfies the assumptions was found".into(),
                     )),
                 }
             }
@@ -2072,7 +2415,7 @@ impl Session {
                 if v == k || !holds {
                     return Err(unsound());
                 }
-                let other = point_model(&mut st.cx, &near, p)?;
+                let other = self.point(st, key, p)?;
                 Res::Varies(Box::new((other, m)))
             }
             (What::AskValid(_), Res::Refuted(mut m)) => {

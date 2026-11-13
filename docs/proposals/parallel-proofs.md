@@ -272,6 +272,63 @@ split rows give the same answers as each other.
 - This does not carry over to the earlier stand-in questions, where hubs seldom fold on
   their own: `shared` is for questions that overlap as these do.
 
+## Constants under assumptions (after 0.31.1)
+
+The consumer's next kind of question is where a memory access lands: "is this address one
+constant, given the path's facts?". It reported 252 left open in one walk, 159 as "no sample
+satisfies the assumptions" and 93 at the search's limits, and that a hundred times the
+limits changed nothing. Its questions were not exported; what follows was found on
+constructed questions of the shape it described and on the walk above.
+
+- **The limits were in force.** The consumer's `propagations=20000` is the limit that
+  binds: its replies' `Budget { propagations }` read just over 20,000 (or 30,000: a proof
+  is swept first within half its limits, and the payload counts both). A search of 2,000,000
+  propagations takes about 0.1 s, which is why a hundred times the limits still returned
+  quickly. `Config::prove` now says what the limits are of, and what a reply reports.
+- **"No sample satisfies" was the sampler's limit, not the assumptions'.** The 64 points
+  are all zeros, all ones and 62 keyed values. A fact such as `s <u 0x7ffffffeffff` holds
+  at none of the keyed ones, and `s != 0` beside it excludes the first: two such facts are
+  on 13 questions of the walk above, the 13 it left `Unknown`. A session now asks the prover
+  for an assignment (what refutes `false` under the assumptions; one task per set of
+  assumptions, stored), holds the symbols it gives at their values, and samples the rest
+  as before. The candidate is read there and proved as any other; two values there are a
+  `Varies`; assumptions the prover shows contradictory are reported as such.
+- **Hubs under assumptions.** A hub was a node constant at every point, asked without
+  assumptions, so a node that is constant only because of the path's facts was never
+  one, and its question was left to one search of everything. Each set of assumptions now
+  has a *view*: the points where it holds, and probes, where one of its symbols is 0, 1,
+  all ones or next to a constant the assumptions mention and the others are random. A
+  node with one value in the view that moves outside it is asked under the assumptions,
+  and replaced only below questions and hubs asked under the same set; one that does not
+  move is a hub as before, shared by every question. Without the probes such a node is
+  easily taken for an unconditional hub: all zeros is often the only point where a
+  comparison of a symbol with a small constant turns, and there a product hides it.
+- **Determinism.** A view is a function of its assumptions (the points are fixed and the
+  assignment is one task's stored answer), so a hub's plan is still a function of its
+  node and assumptions. A question whose view was searched for depends on that task
+  whether or not the store had it, so it costs the same either way. The test of
+  `tests/batch.rs` for this runs seven such questions in three orders, on 1 to 32 threads,
+  warm, emptied, alone, with a sibling cancelled and one call after another.
+
+On constructed addresses that hide `r <u 2` as the borrow of `r - 2`, under `r != 0` and
+`r >= 16`: with the consumer's limits, three of three are proved with no conflict (the
+engine folds the small hub under the assumptions), where without `Split::assumed` one of
+the three stays at the limits and the others take 33 and 270 conflicts.
+
+On the walk above, `Split::shared()`, same machine at load 2 (not comparable with the table
+above, taken at load 14 to 48): 676 constants and 38 that vary, none unknown; the 701
+answers 0.31.1 decided are unchanged, and the 13 it left open are 11 `Varies` and 2
+constants (`0xffff9ffc000018f0`, under `s != 0` and `s <u 0x7ffffffeffff`; evaluated at
+20,000 assignments satisfying the facts without a disagreement). Answers and costs are
+identical at 1 and 8 threads. Run once each on one core, 0.31.1 took 5.6 s (its 13 open
+questions asked again with the deep fuel) and this 4.6 s; on eight threads 1.9 s and 1.75 s
+(CPU 6.5 s and 5.6 s). No hub under assumptions arose on this walk: what changed there
+comes from the searched assignments.
+
+Not verified here: the consumer's 252 placement questions themselves. Whether what moves
+them is found by the probes, and whether the node that hides the comparison is small, is a
+guess from its description until they are exported.
+
 ## Moving a consumer to it
 
 | Consumer layer | What replaces it |

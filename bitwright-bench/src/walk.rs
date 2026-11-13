@@ -5,7 +5,8 @@
 //! nodes=N fuel=N`, `# deep fuel: N` (the budget of the retry for what stays open),
 //! `# result: Constant(0x…) | Atom(#k) | Varies | Unknown`, `# ms: N` (what the walk's own
 //! decision took), then `## root 0` and `## assume == V` blocks of bitwright text. A symbol
-//! has one key in every file.
+//! has one key in every file. A file without a result may say `# sampled: 0x…`, the value
+//! at the exporter's samples: it is then compared as `Constant(0x…)`.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -39,7 +40,11 @@ fn number(text: &str, key: &str) -> Option<u64> {
 fn read(name: String, text: &str) -> Option<Question> {
     let mut q = Question {
         name,
-        result: field(text, "# result:")?.to_string(),
+        result: match (field(text, "# result:"), field(text, "# sampled:")) {
+            (Some(r), _) => r.to_string(),
+            (None, Some(v)) => format!("Constant({})", v.split(':').next().unwrap_or(v)),
+            (None, None) => return None,
+        },
         ms: field(text, "# ms:")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
@@ -318,7 +323,7 @@ pub fn main(args: &[String]) -> ExitCode {
     let held = 100.0 * (1.0 - stats.nodes_new as f64 / stats.nodes_asked.max(1) as f64);
     println!(
         "nodes asked={} new={} ({held:.1}% already held); asks stored={} repeated={}; \
-         tasks solved={} stored={}; hubs={} proved={}; regrouped={} case splits={}; \
+         tasks solved={} stored={}; hubs={} (under assumptions {}) proved={}; regrouped={} case splits={}; \
          store nodes={} answers={} flushes={}",
         stats.nodes_asked,
         stats.nodes_new,
@@ -327,6 +332,7 @@ pub fn main(args: &[String]) -> ExitCode {
         stats.tasks_solved,
         stats.tasks_stored,
         stats.hubs,
+        stats.hubs_assumed,
         stats.hubs_proved,
         stats.regrouped,
         stats.case_splits,

@@ -494,3 +494,218 @@ fn a_symbol_declared_otherwise_is_another_question() {
     assert_eq!(narrow.source, Source::Solved);
     assert_eq!(session.stats().flushes, 1);
 }
+
+/// `r <u 2` as the borrow of `r - 2`, in arithmetic: 0 wherever `r` is at least 2.
+const BORROW: &str =
+    "(((~r & 2) | ((~r | 2) & ((r ^ 0xfffffffffffffffe) + 2 * (r & 0xfffffffffffffffe)))) >>u 63)";
+
+/// Addresses that are one constant where `r` is at least 16, as a path would know, and
+/// move where it is 0 or 1; then questions under a range no random sample is in.
+fn placements(cx: &mut Context) -> (Vec<Expr>, Vec<usize>, [Assumptions; 3]) {
+    let o = w64();
+    let bit = |v: u64| Facts::constant(&BitVec::from_u64(Width::W1, v).unwrap());
+    let mut path = Assumptions::new();
+    for t in ["r == 0", "r <u 0x10"] {
+        let e = cx.parse(t, &o).unwrap();
+        path.assume(cx, e, bit(0)).unwrap();
+    }
+    let mut range = Assumptions::new();
+    for (t, v) in [("x == 0", 0), ("x <u 0x7ffffffeffff", 1)] {
+        let e = cx.parse(t, &o).unwrap();
+        range.assume(cx, e, bit(v)).unwrap();
+    }
+    let mut never = Assumptions::new();
+    for (t, v) in [("x <u 0x10", 1), ("x <u 0x20", 0)] {
+        let e = cx.parse(t, &o).unwrap();
+        never.assume(cx, e, bit(v)).unwrap();
+    }
+    let texts = [
+        // Under `path`.
+        format!("0xffffcffe00000b40 + {BORROW} * (x * y + z) * 8 + {NOISE} * z"),
+        format!("0xffffcffe00000b48 + (((x | {BORROW}) * z * y) ^ (x * (z * y))) + {NOISE}"),
+        format!(
+            "0xffffcffe00000b50 + select((x & 0xff) != 0, ((x + {BORROW}) * (y * z)) - x * y * z, (0 - {BORROW}) & (y * y * z))"
+        ),
+        format!("0xffffcffe00000b58 + {BORROW} * y + x"),
+        // Under `range`.
+        format!("7 + (x >>u 47) * (y * z) + {NOISE2}"),
+        "(x >>u 46) + y".to_string(),
+        // Under `never`.
+        "x + 1".to_string(),
+    ];
+    let es = texts.iter().map(|t| cx.parse(t, &o).unwrap()).collect();
+    (es, vec![0, 0, 0, 0, 1, 1, 2], [path, range, never])
+}
+
+fn placement_config() -> Config {
+    let prove = small().with_max_propagations(20_000);
+    Config::default()
+        .with_prove(prove)
+        .with_split(Split::shared())
+}
+
+/// Whether `model` satisfies the constraints `texts` (each with the value it must have).
+fn satisfies(cx: &mut Context, model: &[(SymbolKey, BitVec)], texts: &[(&str, u64)]) -> bool {
+    texts.iter().all(|&(t, v)| {
+        let e = cx.parse(t, &w64()).unwrap();
+        value_at(cx, e, model) == BitVec::from_u64(Width::W1, v).unwrap()
+    })
+}
+
+#[test]
+fn a_node_constant_under_the_assumptions_is_a_proof_of_its_own() {
+    let mut cx = Context::new();
+    let (es, _, [path, ..]) = placements(&mut cx);
+    let session = Session::new(placement_config());
+    let asks: Vec<Ask<'_>> = es[..4]
+        .iter()
+        .map(|&e| Ask::constant(e).under(&path))
+        .collect();
+    let got = session.run(&mut cx, &asks).unwrap();
+    for (k, lane) in [0xb40u64, 0xb48, 0xb50].into_iter().enumerate() {
+        let want = BitVec::from_u64(Width::W64, 0xffff_cffe_0000_0000 + lane).unwrap();
+        assert_eq!(got[k].answer, Answer::Constant(want), "question {k}");
+    }
+    assert!(matches!(got[3].answer, Answer::Varies(_)), "{:?}", got[3]);
+    let stats = session.stats();
+    assert!(stats.hubs_assumed > 0, "{stats:?}");
+    // What was proved under the assumptions serves no question asked without them, or
+    // under others: there the addresses move.
+    let mut weaker = Assumptions::new();
+    let nonzero = cx.parse("r == 0", &w64()).unwrap();
+    let zero = BitVec::from_u64(Width::W1, 0).unwrap();
+    weaker
+        .assume(&mut cx, nonzero, Facts::constant(&zero))
+        .unwrap();
+    for &e in &es[..3] {
+        let asks = [Ask::constant(e), Ask::constant(e).under(&weaker)];
+        for (reply, facts) in session
+            .run(&mut cx, &asks)
+            .unwrap()
+            .iter()
+            .zip([&[][..], &[("r == 0", 0)][..]])
+        {
+            match &reply.answer {
+                Answer::Varies(models) => {
+                    for m in [&models.0, &models.1] {
+                        assert!(satisfies(&mut cx, m, facts), "{m:?}");
+                    }
+                    assert_ne!(
+                        value_at(&mut cx, e, &models.0),
+                        value_at(&mut cx, e, &models.1)
+                    );
+                }
+                Answer::Unknown(_) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    // Without such hubs the second is left to one search, which the limits stop.
+    let plain = placement_config();
+    let plain = plain.with_split(plain.split.with_assumed(false));
+    let session = Session::new(plain);
+    let reply = session.run(&mut cx, &asks[1..2]).unwrap().remove(0);
+    let Answer::Unknown(prove::Unknown::Budget { propagations, .. }) = reply.answer else {
+        panic!("{:?}", reply.answer);
+    };
+    // The limits are each proof's: what the last one did is in the answer (its search, to
+    // the limit, and the sweep before it, to half the limit), what all of them did in the
+    // cost.
+    assert!((20_000..31_000).contains(&propagations), "{propagations}");
+    assert!(reply.cost.propagations >= propagations && reply.cost.tasks > 1);
+}
+
+#[test]
+fn where_no_sample_satisfies_the_assumptions_an_assignment_is_searched_for() {
+    let mut cx = Context::new();
+    let (es, _, [_, range, never]) = placements(&mut cx);
+    let facts = [("x == 0", 0), ("x <u 0x7ffffffeffff", 1)];
+    for split in [Split::default(), Split::shared(), Split::none()] {
+        let session = Session::new(placement_config().with_split(split));
+        let asks = [
+            Ask::constant(es[4]).under(&range),
+            Ask::constant(es[5]).under(&range),
+            Ask::constant(es[6]).under(&never),
+        ];
+        let got = session.run(&mut cx, &asks).unwrap();
+        let seven = BitVec::from_u64(Width::W64, 7).unwrap();
+        assert_eq!(got[0].answer, Answer::Constant(seven), "{split:?}");
+        // The search only chose where to read the value: the constant is proved.
+        let k = cx.constant(&seven).unwrap();
+        let claim = cx.cmp(bitwright::CmpOp::Eq, es[4], k).unwrap();
+        let direct = prove::valid_under(&mut cx, claim, Some(&range), &prove::Config::default());
+        assert!(matches!(direct.unwrap(), prove::Outcome::Proved(_)));
+        let Answer::Varies(models) = &got[1].answer else {
+            panic!("{split:?}: {:?}", got[1].answer);
+        };
+        for m in [&models.0, &models.1] {
+            assert!(satisfies(&mut cx, m, &facts), "{m:?}");
+        }
+        assert_ne!(
+            value_at(&mut cx, es[5], &models.0),
+            value_at(&mut cx, es[5], &models.1)
+        );
+        let Answer::Unknown(prove::Unknown::Unsupported(why)) = &got[2].answer else {
+            panic!("{split:?}: {:?}", got[2].answer);
+        };
+        assert!(why.contains("cannot hold"), "{why}");
+    }
+}
+
+#[test]
+fn answers_under_assumptions_do_not_depend_on_threads_order_or_the_store() {
+    let run = |config: Config, order: &[usize], runs: usize, cancel_last: bool| {
+        let mut cx = Context::new();
+        let (es, which, facts) = placements(&mut cx);
+        let cancel = Cancel::new();
+        let mut asks: Vec<Ask<'_>> = order
+            .iter()
+            .map(|&k| Ask::constant(es[k]).under(&facts[which[k]]))
+            .collect();
+        if cancel_last {
+            // Someone else's question over the same parts, given up before it starts.
+            asks.push(Ask::constant(es[1]).under(&facts[1]).cancellable(&cancel));
+            cancel.cancel();
+        }
+        let session = Session::new(config);
+        let mut got = Vec::new();
+        for _ in 0..runs {
+            got = session.run(&mut cx, &asks).unwrap();
+        }
+        let mut out = vec![String::new(); es.len()];
+        for (&k, r) in order.iter().zip(&got) {
+            out[k] = shown(&cx, r);
+        }
+        out
+    };
+    let all: Vec<usize> = (0..7).collect();
+    let reverse: Vec<usize> = (0..7).rev().collect();
+    let rotated: Vec<usize> = (0..7).map(|k| (k * 3 + 2) % 7).collect();
+    for split in [Split::default(), Split::eager(), Split::shared()] {
+        let base = placement_config().with_split(split);
+        let want = run(base.with_threads(1), &all, 1, false);
+        for threads in [1, 2, 8, 32] {
+            for order in [&all, &reverse, &rotated] {
+                let got = run(base.with_threads(threads), order, 1, false);
+                assert_eq!(got, want, "{split:?}, {threads} threads, {order:?}");
+            }
+        }
+        assert_eq!(run(base.with_threads(8), &reverse, 3, false), want, "warm");
+        let tiny = base.with_threads(4).with_store_nodes(0);
+        assert_eq!(run(tiny, &rotated, 3, false), want, "{split:?}, emptied");
+        assert_eq!(run(base.with_threads(4), &all, 1, true), want, "cancelled");
+        for k in 0..7 {
+            let got = run(base, &[k], 1, false);
+            assert_eq!(got[k], want[k], "{split:?}, question {k} alone");
+        }
+        // A question whose assumptions were searched for in an earlier call costs the same.
+        let mut cx = Context::new();
+        let (es, which, facts) = placements(&mut cx);
+        let session = Session::new(base.with_threads(2));
+        for k in [4, 5] {
+            let ask = Ask::constant(es[k]).under(&facts[which[k]]);
+            let reply = session.run(&mut cx, &[ask]).unwrap().remove(0);
+            assert_eq!(shown(&cx, &reply), want[k], "{split:?}, question {k} later");
+        }
+    }
+}
