@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.2
 
 - **Batch: constants under assumptions that random samples do not meet.** Where no sample
   point satisfies a question's assumptions (a symbol held below a bound, an equality), a

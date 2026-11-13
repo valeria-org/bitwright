@@ -272,7 +272,7 @@ split rows give the same answers as each other.
 - This does not carry over to the earlier stand-in questions, where hubs seldom fold on
   their own: `shared` is for questions that overlap as these do.
 
-## Constants under assumptions (after 0.31.1)
+## Constants under assumptions (0.31.2)
 
 The consumer's next kind of question is where a memory access lands: "is this address one
 constant, given the path's facts?". It reported 252 left open in one walk, 159 as "no sample
