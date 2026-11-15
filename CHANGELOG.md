@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.4
 
 - **MBA phase: two spellings of one slice of a rotated value cancel.** The phase reads the
   parts of a fragment that are bits of one rotation of one value (`t >>u 57 & k`,
