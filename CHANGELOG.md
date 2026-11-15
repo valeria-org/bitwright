@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+- **Normal-form solver: the low bits of a sum.** `p & k` over a polynomial `p` and a
+  constant `k` with no bit from position `j` on is read as an atom that is `p`'s low `j`
+  bits: `p` without the masked conjunctions whose bit class lies from `j` on (multiples of
+  `2^j`), every coefficient modulo `2^j`. A linear MBA with constant masks that a caller
+  reads as a 32-bit value was an atom rendered at 64 bits, with every class and every
+  coefficient of the high half in it.
+- **Normal-form solver: one product a multiplier.** A degree-1 form over several bit
+  classes is also rendered by coefficient: `Σ_k k·(Σ ±(AND_S & M))`, each conjunction
+  under the mask of all its classes that take `k` or `−k`, coefficients compared modulo
+  their class's precision (and modulo `2^j` under a low read). A sum of eight products of
+  masked bitwise functions of two values over five bit classes is three products
+  (48 nodes to 32).
+- **Certificates: an atom the sides also add.** A skeleton now also reads an arithmetic
+  subterm that a bitwise operator reads somewhere as one variable wherever it is read
+  (`Policy::Shared`), through its class's representative: `p & (… + (p & y) − p)` over a
+  `p = x + 608`, and `−609 − x` for `~p`, are questions over `p`. Before, `p` was a
+  variable under the bitwise operators and `x + 608` where it was added, and the skeletons
+  differed.
+- **Certificates: constants on left shifts, and low reads.** A question left open is asked
+  again with each `(t << k) op c` (`op` bitwise) read inside the shift, `((t op (c >> k))
+  << k) + low`; and `s & k = t & k` (`k` with no bit from `j` on) is proved by
+  `s·2^(W−j) = t·2^(W−j)`. Both only ever prove.
+- **Demanded bits: masks and operands that became constants.** Under a demanded mask `m`,
+  `a & k` over an operand written anew is `a' & (k & m)`, and over the operand as it is
+  where nothing else reads the masked value too; `a & b` and `a | b` whose
+  operand the demanded bits made a constant are the other operand, or the constant.
+  `((t >>u 26 & 0x2441201) · 0xceed791241c52709 + y) & 0x7f` is `(bit 26 of t · 9 + y) &
+  0x7f`, where only the multiplier was reduced and the result, no smaller, was dropped.
+- On a devirtualizer's documents (four functions, `tests/masked_sums.rs` holds their
+  expressions): two 49- and 54-node masked sums over sums are 28 nodes each, a 48-node
+  masked sum read as 32 bits is 32, and eight 37-node sums of products read on seven bits
+  are 24.
+
 ## 0.31.4
 
 - **MBA phase: two spellings of one slice of a rotated value cancel.** The phase reads the

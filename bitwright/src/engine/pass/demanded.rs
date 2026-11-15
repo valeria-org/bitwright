@@ -571,6 +571,18 @@ fn simplify(
                     simplify(r, cx, st, a, m)?
                 } else {
                     let a2 = simplify(r, cx, st, a, &bv_and(m, &k))?;
+                    // Over an operand written anew the mask is new too, and is the bits of
+                    // it that are read: `(t & 0x2441201) · c` under `& 0x7f` reads bit 0 of
+                    // `t`, and `t & 1` says so to what reads the result next. Over the
+                    // operand as it is, only where nothing else reads the masked value (it
+                    // stays one node for its other readers): the narrower mask is then a
+                    // constant for a constant, smaller where the candidate has it already.
+                    let narrow = bv_and(m, &k);
+                    let k = if a2 != a || (narrow != k && read_once(r, cx, x)?) {
+                        narrow
+                    } else {
+                        k
+                    };
                     let kc = r.build(cx, |cx| cx.mk_const(&k))?;
                     bin(r, cx, BinOp::And, a2, kc)?
                 }
@@ -578,7 +590,16 @@ fn simplify(
             _ => {
                 let a = simplify(r, cx, st, node.a, m)?;
                 let b = simplify(r, cx, st, node.b, m)?;
-                bin(r, cx, BinOp::And, a, b)?
+                // An operand the demanded bits made a constant: with every demanded bit
+                // set the other operand is the result there, and with none of them zero is.
+                match (konst(cx, a), konst(cx, b)) {
+                    (Some(k), None) if subset(m, &k) => b,
+                    (None, Some(k)) if subset(m, &k) => a,
+                    (Some(k), None) | (None, Some(k)) if bv_and(m, &k).is_zero() => {
+                        r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)))?
+                    }
+                    _ => bin(r, cx, BinOp::And, a, b)?,
+                }
             }
         },
         OpCode::Or => match (konst(cx, node.a), konst(cx, node.b)) {
@@ -601,7 +622,15 @@ fn simplify(
             _ => {
                 let a = simplify(r, cx, st, node.a, m)?;
                 let b = simplify(r, cx, st, node.b, m)?;
-                bin(r, cx, BinOp::Or, a, b)?
+                // As for `&`: an operand that became a constant with none of the demanded
+                // bits leaves the other, and one with all of them is the result.
+                match (konst(cx, a), konst(cx, b)) {
+                    (Some(k), None) if bv_and(m, &k).is_zero() => b,
+                    (None, Some(k)) if bv_and(m, &k).is_zero() => a,
+                    (Some(k), None) if subset(m, &k) => a,
+                    (None, Some(k)) if subset(m, &k) => b,
+                    _ => bin(r, cx, BinOp::Or, a, b)?,
+                }
             }
         },
         // under the mask, `a ^ k` is `a` where `k` has none of its bits and `~a`
@@ -786,6 +815,12 @@ fn simplify(
             .push((Key(x, *m), stops0, st.stops.len() as u32));
     }
     Ok(v)
+}
+
+/// Whether `x` has one reader and is no root: what it is read as is that reader's alone.
+fn read_once(r: &mut Runner<'_, '_>, cx: &Context, x: u32) -> Result<bool, Stop> {
+    super::refresh_uses(r, cx)?;
+    Ok(r.life.live.uses(x) == Some(1) && !r.life.live_roots.contains(&x))
 }
 
 /// Records `x` as a node the simplification stops at: a node it built itself is no leaf of the

@@ -1544,6 +1544,26 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
             report.cert = Some(Cert::Symbolic);
         }
     }
+    // Still open: sides that read the low bits of two values through one mask (`s & k` of
+    // each, `k` with no bit from position `j` on) are equal when the values agree modulo
+    // `2^j`, which is when `s·2^(W−j)` of each are equal: products by a constant, in the
+    // fragment the polynomial tests decide whatever the values are above `j`. Under the mask
+    // the two values are atoms of their own to the tests above, unrelated wherever they
+    // differ above `j`. Only ever proves.
+    if report.verdict == Verdict::Unknown
+        && !report.over_budget
+        && let Some((la, lb)) = low_read(a, b)
+    {
+        let sub = prove_at(&la, &lb, meter, SPLIT_DEPTH, true, false)?;
+        report.points += sub.points;
+        report.over_budget |= sub.over_budget;
+        report.internal += sub.internal;
+        if sub.verdict == Verdict::Proved {
+            report.verdict = Verdict::Proved;
+            report.cert = sub.cert;
+            report.compositional = sub.compositional;
+        }
+    }
     // A refutation comes with an input where the sides differ; one without would be a bug
     // (decided nothing).
     if report.verdict == Verdict::Refuted
@@ -1561,6 +1581,56 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
         report.internal += 1;
     }
     Ok(report)
+}
+
+/// For `a = s & k` and `b = t & k` with one constant `k` that has no bit from position `j`
+/// on (`j` below the width): `s << (W − j)` and `t << (W − j)`, equal exactly when `s` and
+/// `t` agree on their low `j` bits, and then so do `a` and `b`. `None` for other sides.
+fn low_read(a: &MbaExpr, b: &MbaExpr) -> Option<(MbaExpr, MbaExpr)> {
+    let w = a.width()?;
+    if b.width() != Some(w) || a.vars() != b.vars() {
+        return None;
+    }
+    // The root's operand and its constant.
+    let parts = |m: &MbaExpr| -> Option<(u32, BitVec)> {
+        let nodes = m.nodes();
+        let root = nodes.last()?;
+        if root.op != MOp::And {
+            return None;
+        }
+        let cst = constants(nodes);
+        match (cst[root.args[0] as usize], cst[root.args[1] as usize]) {
+            (None, Some(k)) => Some((root.args[0], k)),
+            (Some(k), None) => Some((root.args[1], k)),
+            _ => None,
+        }
+    };
+    let ((sa, ka), (sb, kb)) = (parts(a)?, parts(b)?);
+    if ka != kb {
+        return None;
+    }
+    let j = (ka.limbs().iter().enumerate())
+        .filter(|&(_, &l)| l != 0)
+        .map(|(i, &l)| i as u32 * 64 + 64 - l.leading_zeros())
+        .max()?;
+    let bits = u32::from(w.bits());
+    if j >= bits {
+        return None;
+    }
+    let shifted = |m: &MbaExpr, s: u32| -> Option<MbaExpr> {
+        let mut out = MbaExpr::new(m.vars().to_vec());
+        for n in &m.nodes()[..=s as usize] {
+            match n.op {
+                MOp::Zext | MOp::Sext | MOp::Trunc => {
+                    out.push_cast(n.op, n.args[0], n.width).ok()?
+                }
+                op => out.push(op, &n.args[..op.arity()]).ok()?,
+            };
+        }
+        out.push(MOp::Shl((bits - j) as u16), &[s]).ok()?;
+        Some(out)
+    };
+    Some((shifted(a, sa)?, shifted(b, sb)?))
 }
 
 /// `a` and `b` without what both read their values through, when that includes a right
@@ -2385,6 +2455,32 @@ fn prove_at<M: Meter>(
         cmp.prove(meter, &mut report)?;
         cmp.recycle();
     }
+    // The same question with the constants bitwise operators put on left shifts read inside
+    // the shifts (equal expressions, see `shifts_inward`), over atoms again: before the
+    // readings below, which cost more.
+    if compose
+        && depth == 0
+        && !lowered
+        && report.verdict == Verdict::Unknown
+        && !report.over_budget
+    {
+        let (sa, sb) = (shifts_inward(a), shifts_inward(b));
+        if sa.is_some() || sb.is_some() {
+            let (sa, sb) = (sa.as_ref().unwrap_or(a), sb.as_ref().unwrap_or(b));
+            let mut sub = Report::new();
+            let mut cmp = Compose::new(sa, sb);
+            cmp.prove(meter, &mut sub)?;
+            cmp.recycle();
+            report.points += sub.points;
+            report.over_budget |= sub.over_budget;
+            report.internal += sub.internal;
+            if sub.verdict == Verdict::Proved {
+                report.verdict = Verdict::Proved;
+                report.cert = sub.cert;
+                return Ok(report);
+            }
+        }
+    }
     // Arithmetic read bitwise without products, which the atoms left open: bit-serially,
     // exactly.
     let carried = compose
@@ -2437,6 +2533,72 @@ fn prove_at<M: Meter>(
         split(a, b, meter, depth, &mut report)?;
     }
     Ok(report)
+}
+
+/// `m` with each bitwise operation of a left shift and a constant read inside the shift:
+/// `(t << k) & c` as `(t & (c >> k)) << k`, and `(t << k) | c` and `(t << k) ^ c` as
+/// `((t | (c >> k)) << k) + low` and `((t ^ (c >> k)) << k) + low` with `low` the low `k`
+/// bits of `c` (the shifted value has none of them, so the sum carries nothing). Equal
+/// expressions. A shift read by a bitwise operator is an atom to the tests; inside the shift
+/// the operator reads `t`, and where `t` is a bitwise function the shift is a product of one
+/// by a constant, which they follow. `None` when there is none.
+pub(crate) fn shifts_inward(m: &MbaExpr) -> Option<MbaExpr> {
+    use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_shl};
+    let nodes = m.nodes();
+    let cst = constants(nodes);
+    let mut out = MbaExpr::new(m.vars().to_vec());
+    let mut map: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut changed = false;
+    for (i, n) in nodes.iter().enumerate() {
+        let rewritten = (|| {
+            if !matches!(n.op, MOp::And | MOp::Or | MOp::Xor) || cst[i].is_some() {
+                return None;
+            }
+            let (s, c) = (0..2).find_map(|k| {
+                let (s, c) = (n.args[k] as usize, n.args[1 - k] as usize);
+                match (nodes[s].op, cst[c]) {
+                    (MOp::Shl(by), Some(v)) if cst[s].is_none() => Some(((s, by), v)),
+                    _ => None,
+                }
+            })?;
+            let (s, by) = s;
+            let w = n.width;
+            if nodes[s].width != w || by == 0 || by >= w.bits() {
+                return None;
+            }
+            let ones = BitVec::ones(w);
+            let low = bv_and(&c, &bv_not(&bv_shl(&ones, u32::from(by))));
+            let inner = out.push(MOp::Const(bv_lshr(&c, u32::from(by))), &[]).ok()?;
+            let t = map[nodes[s].args[0] as usize];
+            let read = out.push(n.op, &[t, inner]).ok()?;
+            let shifted = out.push(MOp::Shl(by), &[read]).ok()?;
+            if n.op == MOp::And || low.is_zero() {
+                return Some(shifted);
+            }
+            let low = out.push(MOp::Const(low), &[]).ok()?;
+            out.push(MOp::Add, &[shifted, low]).ok()
+        })();
+        let at = match rewritten {
+            Some(at) => {
+                changed = true;
+                at
+            }
+            None => {
+                let mut args = [0u32; 2];
+                for (k, a) in args.iter_mut().enumerate().take(n.op.arity()) {
+                    *a = map[n.args[k] as usize];
+                }
+                match n.op {
+                    MOp::Zext | MOp::Sext | MOp::Trunc => {
+                        out.push_cast(n.op, args[0], n.width).ok()?
+                    }
+                    op => out.push(op, &args[..op.arity()]).ok()?,
+                }
+            }
+        };
+        map.push(at);
+    }
+    changed.then_some(out)
 }
 
 /// Whether `m` has a bitwise operation with exactly one constant operand (see
@@ -3078,6 +3240,13 @@ enum Policy {
     Classes,
     /// Also the root, when its class is abstracted somewhere.
     Everything,
+    /// The atoms of [`Minimal`](Self::Minimal), each an atom wherever it is read below the
+    /// root: a value a bitwise operator reads that the same side also adds or scales
+    /// (`(p & x) + (p | y) − p` over a `p` that is a sum) is one variable in both places.
+    /// Read as its definition where it is added, as `Minimal` does, it is unrelated there to
+    /// the variable it is under the bitwise operators, and the skeletons differ; with every
+    /// abstracted class an atom (`Classes`) the sums compared are atoms themselves.
+    Shared,
 }
 
 /// Both sides in one hash-consed DAG, with classes of nodes proved equal.
@@ -3111,6 +3280,8 @@ struct Compose {
     /// check reads (those there were when it was last set up; nodes added since have none
     /// to it).
     checked: Option<usize>,
+    /// The classes [`Policy::Shared`] reads as atoms in the comparison under way.
+    shared: Vec<u32>,
 }
 
 /// A pair of skeletons one comparison built, with what it found: a later policy that builds
@@ -3248,6 +3419,7 @@ impl Compose {
             points: Vec::new(),
             digests: Vec::new(),
             checked: None,
+            shared: Vec::new(),
         };
         c.mark_forced();
         c.add_complements();
@@ -3500,6 +3672,7 @@ impl Compose {
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
+            Policy::Shared,
         ] {
             let (a, b) = (self.root_a, self.root_b);
             match self.compare(meter, report, a, b, policy, &mut seen)? {
@@ -3546,6 +3719,7 @@ impl Compose {
             Policy::Linear,
             Policy::Classes,
             Policy::Everything,
+            Policy::Shared,
         ] {
             if self.compare(meter, report, i, m, policy, &mut seen)?.0 == Some(Verdict::Proved) {
                 return Ok(true);
@@ -3572,7 +3746,18 @@ impl Compose {
         seen: &mut Vec<Pair>,
     ) -> Result<Compared, M::Err> {
         let mut lanes = take_lanes();
+        // `Policy::Shared` reads an atom through its class's representative as the classes
+        // stand now (the representatives the other policies read are those of the whole
+        // pairing, set once it is over, and are left as they are).
+        let reps = (policy == Policy::Shared).then(|| {
+            let reps = std::mem::take(&mut self.rep);
+            self.compute_reps();
+            reps
+        });
         let out = self.compare_in(meter, report, x, y, policy, seen, &mut lanes);
+        if let Some(reps) = reps {
+            self.rep = reps;
+        }
         give_lanes(lanes);
         out
     }
@@ -3595,6 +3780,25 @@ impl Compose {
         lanes: &mut Lanes<u64>,
     ) -> Result<Compared, M::Err> {
         let mut vm = VarMap::default();
+        if policy == Policy::Shared {
+            // The classes that are atoms as the fragment requires it, from the skeletons
+            // that policy builds.
+            self.shared.clear();
+            let mut probe = VarMap::default();
+            if self.skeleton(x, Policy::Minimal, &mut probe).is_none()
+                || self.skeleton(y, Policy::Minimal, &mut probe).is_none()
+            {
+                return Ok((None, None));
+            }
+            for &(slot, _) in &probe.slots {
+                if let Slot::Class(c) = slot {
+                    self.shared.push(c);
+                }
+            }
+            if self.shared.is_empty() {
+                return Ok((None, None));
+            }
+        }
         let (sx, sy) = if policy == Policy::Linear {
             (
                 self.linear_skeleton(x, &mut vm),
@@ -4615,6 +4819,9 @@ impl Compose {
                     Policy::Minimal | Policy::Reps | Policy::Linear => false,
                     Policy::Classes => !root && self.abstracted[c as usize],
                     Policy::Everything => self.abstracted[c as usize],
+                    // (Not a bitwise member of such a class: it is what the class is read
+                    // as, see `Policy::Reps`.)
+                    Policy::Shared => role == Role::Arith && !root && self.shared.contains(&c),
                 }
             }
         }
@@ -4648,7 +4855,7 @@ impl Compose {
             if !expanded {
                 if let Some(c) = self.cst[i as usize] {
                     out.push(SkelNode::Const(c));
-                } else if policy == Policy::Reps
+                } else if matches!(policy, Policy::Reps | Policy::Shared)
                     && self.atom(i, ctx, i == root, policy)
                     && let Some(r) = self.rep_of(i)
                 {
