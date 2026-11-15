@@ -445,6 +445,9 @@ enum Def {
     Complement(u32),
     /// `a >> k` of an input subterm `a`, rendered from `a`'s normal form.
     Shift(u16, u32),
+    /// The low `k` bits of an input subterm `a` (zero from bit `k` on), rendered from the part
+    /// of `a`'s normal form those bits depend on (see [`Pass::low_read`]).
+    Low(u16, u32),
 }
 
 /// What identifies an atom: equal keys are equal functions of the variables.
@@ -456,6 +459,8 @@ enum AtomKey {
     Form(Poly),
     /// `a >> k` by `k` and `a`'s normal form.
     Shift(u16, Poly),
+    /// The low `k` bits of `a` by `k` and the part of `a`'s normal form they depend on.
+    Low(u16, Poly),
 }
 
 /// The state of one question.
@@ -648,6 +653,10 @@ impl Pass<'_> {
             Def::Verbatim(i) | Def::Form(i) => col(i),
             Def::Complement(i) => col(i).map(|v| v.iter().map(|x| !x & mask).collect()),
             Def::Shift(k, i) => col(i).map(|v| v.iter().map(|x| x >> k).collect()),
+            Def::Low(k, i) => {
+                let low = if k >= 64 { u64::MAX } else { (1u64 << k) - 1 };
+                col(i).map(|v| v.iter().map(|x| x & low).collect())
+            }
         })
     }
 
@@ -754,6 +763,13 @@ impl Pass<'_> {
                         .import(&verbatim(self.p, j).ok_or_else(internal)?)
                         .ok_or_else(internal)?;
                     b.un(MOp::LShr(k), x)
+                }
+                Def::Low(k, j) => {
+                    let x = b
+                        .import(&verbatim(self.p, j).ok_or_else(internal)?)
+                        .ok_or_else(internal)?;
+                    let low = b.konst(&self::word::low_mask(self.w, u32::from(k)));
+                    b.bin(MOp::And, x, low)
                 }
             };
             ins.push(x);
@@ -984,6 +1000,85 @@ impl Pass<'_> {
         Ok(Some(Form::Poly(r.to_poly(&self.classes).scale(&scale))))
     }
 
+    /// `a & b` where one operand is a constant with no bit from position `j` on (`j` below
+    /// the width) and the other a polynomial: the polynomial's low `j` bits as an atom, and
+    /// the constant's node. The low `j` bits of a sum of products depend only on those of
+    /// its terms (reduction modulo `2^j` is a ring homomorphism), a masked conjunction whose
+    /// class lies from `j` on is a multiple of `2^j`, and so is `2^j·c`: so those bits are
+    /// the bits of the polynomial without the monomials that hold such a conjunction, each
+    /// coefficient taken modulo `2^j`. The atom is that polynomial's low `j` bits, which are
+    /// the operand's, and is rendered from it: `(x·0x100000007 + (y & 0xff00000000)) &
+    /// 0xffffffff` is `(x·7) & 0xffffffff`. `None` where a class straddles `j` (the constant
+    /// itself splits the classes at its own bits, so none does when it is `2^j − 1`), or
+    /// the bits depend on every term as it is.
+    fn low_read(
+        &mut self,
+        a: u32,
+        b: u32,
+        tally: &mut NfStats,
+    ) -> Result<Option<(Bits, u32)>, Decline> {
+        let (x, kn, k) = match (self.cst[a as usize], self.cst[b as usize]) {
+            (None, Some(k)) => (a, b, k),
+            (Some(k), None) => (b, a, k),
+            _ => return Ok(None),
+        };
+        let Some(Form::Poly(p)) = &self.forms[x as usize] else {
+            return Ok(None);
+        };
+        let bits = u32::from(self.w.bits());
+        // One more than the constant's highest set position.
+        let j = (k.limbs().iter().enumerate())
+            .filter(|&(_, &l)| l != 0)
+            .map(|(i, &l)| i as u32 * 64 + 64 - l.leading_zeros())
+            .max()
+            .unwrap_or(0);
+        if j == 0 || j >= bits {
+            return Ok(None);
+        }
+        let low = self::word::low_mask(self.w, j);
+        let n = self.classes.len();
+        // Every class below `j` or from it on.
+        let below: Vec<bool> = (0..n).map(|c| u32::from(self.classes.low(c)) < j).collect();
+        for (c, &is_below) in below.iter().enumerate() {
+            let inside = self::word::bv_and(self.classes.mask(c), &low);
+            if is_below && inside != *self.classes.mask(c) {
+                return Ok(None);
+            }
+        }
+        let p = p.clone();
+        self.charge(p.len() as u64)?;
+        let mut q = Poly::zero(self.w);
+        let mut changed = false;
+        for (m, c) in p.terms() {
+            let high = m
+                .iter()
+                .any(|(s, _)| s.class != FULL && !below[usize::from(s.class)]);
+            let c2 = self::word::bv_and(c, &low);
+            changed |= high || c2 != *c;
+            if !high {
+                q.add_term(m.clone(), &c2);
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let key = self.key_form(&q);
+        let j = j as u16;
+        let at = self.atom(
+            AtomKey::Low(j, key.clone()),
+            Def::Low(j, x),
+            Some(key),
+            tally,
+        )?;
+        let mut f = Bits::atom(n, at);
+        for (c, &is_below) in below.iter().enumerate() {
+            if !is_below {
+                f.tables[c] = vec![0];
+            }
+        }
+        Ok(Some((f, kn)))
+    }
+
     /// The normal form of live node `i` from its operands' forms.
     fn visit(&mut self, i: u32, tally: &mut NfStats) -> Result<Option<Form>, Decline> {
         let n = self.p.nodes()[i as usize];
@@ -1033,7 +1128,14 @@ impl Pass<'_> {
                         return Ok(Some(Form::Poly(sext_of(&h, sa, &self.classes))));
                     }
                 }
-                let (x, y) = (self.bitwise(a, tally)?, self.bitwise(b, tally)?);
+                let low = match n.op {
+                    MOp::And => self.low_read(a, b, tally)?,
+                    _ => None,
+                };
+                let (x, y) = match low {
+                    Some((x, k)) => (x, self.bitwise(k, tally)?),
+                    None => (self.bitwise(a, tally)?, self.bitwise(b, tally)?),
+                };
                 self.charge((x.tables.len() as u64) << (x.support.len() + y.support.len()))?;
                 match Bits::bin(op, &x, &y) {
                     Some(f) => Form::Bits(f),
@@ -1501,6 +1603,19 @@ fn zero_from(mut set: u64, narrow: &[Option<u16>]) -> Option<u16> {
 /// `nulls` are masked conjunctions known to be zero, and so is any conjunction with a zero
 /// extension in a class from its operand's width on), then the one-position rule.
 fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym], narrow: &[Option<u16>]) -> Poly {
+    finished_below(f, classes, nulls, narrow, None)
+}
+
+/// [`finished`] for a form read on its low `below` bits only (see [`Pass::low_read`]): a
+/// conjunction in a class from there on is a multiple of `2^below`, nothing to those bits,
+/// so a symbol is unmasked as if it were zero there.
+fn finished_below(
+    f: &Poly,
+    classes: &Classes,
+    nulls: &[poly::Sym],
+    narrow: &[Option<u16>],
+    below: Option<u16>,
+) -> Poly {
     // With one class an unmasked symbol is that class's (substitution writes unmasked atoms):
     // one symbol either way.
     let mut f = if classes.len() <= 1 {
@@ -1512,6 +1627,7 @@ fn finished(f: &Poly, classes: &Classes, nulls: &[poly::Sym], narrow: &[Option<u
     let null = |s: &poly::Sym| {
         nulls.contains(s)
             || zero_from(s.set, narrow).is_some_and(|z| z <= classes.low(usize::from(s.class)))
+            || below.is_some_and(|z| z <= classes.low(usize::from(s.class)))
     };
     let mut f = f.declass(classes, DECLASS_LIMIT, &null);
     f.single_positions(classes);
@@ -1625,6 +1741,7 @@ fn normalize(
                 let arg = nodes[n.args[0] as usize];
                 (n.op == MOp::Zext && matches!(arg.op, MOp::Var(_))).then(|| arg.width.bits())
             }
+            Def::Low(k, _) => Some(k),
             _ => None,
         })
         .collect();
@@ -1643,8 +1760,12 @@ fn normalize(
                 m
             }
             Def::Verbatim(i) => verbatim(p, i).ok_or_else(internal)?,
-            Def::Form(i) | Def::Complement(i) | Def::Shift(_, i) => {
-                let form = finish(pass.atom_nf[a].as_ref().ok_or_else(internal)?);
+            Def::Form(i) | Def::Complement(i) | Def::Shift(_, i) | Def::Low(_, i) => {
+                let nf = pass.atom_nf[a].as_ref().ok_or_else(internal)?;
+                let form = match *def {
+                    Def::Low(k, _) => finished_below(nf, &pass.classes, &[], &narrow, Some(k)),
+                    _ => finish(nf),
+                };
                 // Without the searches meant for a question's own form.
                 let mut r = Render::new(
                     p.vars().to_vec(),
@@ -1654,6 +1775,9 @@ fn normalize(
                     work.left,
                 )
                 .for_atom();
+                if let Def::Low(k, _) = *def {
+                    r = r.read_below(k);
+                }
                 // The subterm as it is: a rendering of the form replaces it only with fewer
                 // nodes.
                 let as_is = verbatim(p, i)
@@ -1688,6 +1812,13 @@ fn normalize(
                         let mut b = Builder::new(p.vars().to_vec());
                         let x = b.import(&body).ok_or_else(internal)?;
                         let y = b.un(MOp::LShr(k), x);
+                        b.finish(y).ok_or_else(internal)?
+                    }
+                    Def::Low(k, _) => {
+                        let mut b = Builder::new(p.vars().to_vec());
+                        let x = b.import(&body).ok_or_else(internal)?;
+                        let low = b.konst(&self::word::low_mask(w, u32::from(k)));
+                        let y = b.bin(MOp::And, x, low);
                         b.finish(y).ok_or_else(internal)?
                     }
                     _ => body,

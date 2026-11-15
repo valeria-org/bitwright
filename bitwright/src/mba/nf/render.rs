@@ -628,6 +628,9 @@ pub(crate) struct Render<'a> {
     narrow: Vec<Option<(u32, Width)>>,
     /// Whether a sign extension's parts are being rendered (see [`Render::sign_extensions`]).
     signing: bool,
+    /// When only the bits below this position of the rendering are read (the body of a
+    /// low-read atom, see [`Render::read_below`]): a coefficient counts modulo it.
+    below: Option<u16>,
     /// What [`Render::sum`] reuses from one sum to the next.
     sum_scratch: SumScratch,
 }
@@ -741,8 +744,16 @@ impl<'a> Render<'a> {
                 })
                 .collect(),
             signing: false,
+            below: None,
             sum_scratch: SumScratch::default(),
         }
+    }
+
+    /// Renders a form of which only the bits below position `k` are read: coefficients that
+    /// agree modulo `2^k` are one multiplier (`c` and `2^k − c` are `c` and `−c`).
+    pub(crate) fn read_below(mut self, k: u16) -> Self {
+        self.below = Some(k);
+        self
     }
 
     /// The bit from which every conjunction of the atoms in `set` is zero, if one of them is
@@ -1796,6 +1807,7 @@ impl<'a> Render<'a> {
             return out;
         }
         out.extend(self.grouped(p));
+        out.extend(self.by_coefficient(&expanded));
         let n = self.classes.len();
         if n > 1
             && p.terms()
@@ -3444,6 +3456,104 @@ impl<'a> Render<'a> {
             out.push(Sum { terms, konst: None });
         }
         out
+    }
+
+    /// A degree-≤1 form over masked symbols, by coefficient: `Σ_k k·(Σ ±(AND_S & M))` over the
+    /// distinct coefficients `k` up to sign, each conjunction under the mask of all its
+    /// classes that take `k` (or `−k`, subtracted). A coefficient counts modulo its class's
+    /// precision (a class from position `τ` on reads it modulo `2^(W−τ)`), so the groups are
+    /// formed from the most precise class down and a group's multiplier is its first
+    /// member's. Where an obfuscator spread two or three multipliers over many classes this
+    /// is as many products, each of a sum of masked conjunctions: `k·(x & M₁) + k·(x & M₂) −
+    /// k·(x & y & M₃)` is `k·((x & (M₁ | M₂)) − (x & y & M₃))`. `None` unless that is fewer
+    /// products than the form has terms.
+    fn by_coefficient(&mut self, p: &Poly) -> Option<Sum> {
+        let w = self.w;
+        let n = self.classes.len();
+        if n <= 1 || p.degree() > 1 || !self.spend(p.len() as u64 * 4) {
+            return None;
+        }
+        // The terms, most precise class first (then by set, for a fixed order).
+        let mut terms: Vec<(u16, u64, BitVec)> = Vec::with_capacity(p.len());
+        for (m, c) in p.terms() {
+            let Some(&(s, _)) = m.first() else {
+                continue;
+            };
+            if s.class == FULL {
+                return None;
+            }
+            terms.push((s.class, s.set, *c));
+        }
+        terms.sort_by_key(|&(c, set, _)| (self.classes.low(usize::from(c)), set));
+        let top = u32::from(self.below.unwrap_or(w.bits()));
+        let same = |a: &BitVec, b: &BitVec, c: u16| {
+            let prec = top.saturating_sub(u32::from(self.classes.low(usize::from(c))));
+            let lm = super::word::low_mask(w, prec);
+            prec == 0 || bv_and(a, &lm) == bv_and(b, &lm)
+        };
+        // Per group: its multiplier, and per (set, subtracted) the mask.
+        type Members = Vec<((u64, bool), BitVec)>;
+        let mut groups: Vec<(BitVec, Members)> = Vec::new();
+        for &(class, set, k) in &terms {
+            if same(&k, &BitVec::zero(w), class) {
+                continue;
+            }
+            let mask = *self.classes.mask(usize::from(class));
+            let found = groups.iter_mut().find_map(|(g, members)| {
+                let neg = super::word::un(UnOp::Neg, g);
+                if same(&k, g, class) {
+                    Some((members, false))
+                } else if same(&k, &neg, class) {
+                    Some((members, true))
+                } else {
+                    None
+                }
+            });
+            match found {
+                Some((members, sub)) => {
+                    match members.iter_mut().find(|(key, _)| *key == (set, sub)) {
+                        Some((_, m)) => *m = bv_or(m, &mask),
+                        None => members.push(((set, sub), mask)),
+                    }
+                }
+                None => groups.push((k, vec![((set, false), mask)])),
+            }
+        }
+        let products = groups.len();
+        if products == 0 || products >= terms.len() {
+            return None;
+        }
+        let one = super::word::one(w);
+        let minus = super::word::un(UnOp::Neg, &one);
+        let ones = BitVec::ones(w);
+        // The positions that are not read (see `Render::read_below`).
+        let unread = super::word::bv_not(&super::word::low_mask(w, top));
+        let mut out = Sum {
+            terms: Vec::with_capacity(products),
+            konst: Some(p.konst()),
+        };
+        for (k, members) in &groups {
+            let mut inner = Sum::default();
+            for &((set, sub), mask) in members {
+                let c = self.conj(set)?;
+                // (Every class that is read: no mask.)
+                let mask = if bv_or(&mask, &unread) == ones {
+                    ones
+                } else {
+                    mask
+                };
+                let x = self.masked(c, &mask);
+                inner.terms.push((x, if sub { minus } else { one }));
+            }
+            match inner.terms[..] {
+                [(x, _)] => out.terms.push((x, *k)),
+                _ => {
+                    let x = self.sum(&inner);
+                    out.terms.push((x, *k));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// The decompositions of a degree-≤1 form over groups of classes: unmasked terms are one
