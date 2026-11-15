@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.5
 
 - **Normal-form solver: the low bits of a sum.** `p & k` over a polynomial `p` and a
   constant `k` with no bit from position `j` on is read as an atom that is `p`'s low `j`
