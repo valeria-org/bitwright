@@ -1,0 +1,52 @@
+# kind: constant
+# config: prove conflicts=2000 propagations=20000 nodes=200000 simplify=true fuel=16384
+# deep fuel: 524288
+# sampled: 0x0
+# ms: 0
+# nodes: 478
+## root 0
+let %0 = ~#12:64 & 0xffffcffea206b607;
+let %1 = ~(%0 & 0xffffcffe000a6d5e);
+let %2 = #12 ^ 0xa20cdb59;
+let %3 = ~%0 & 0x3001fff592a1;
+let %4 = #12 & 0x3001fff592a1 & 0x30015df949f8;
+let %5 = #12 & 0x30015df949f8;
+let %6 = ~(%5 & 0xffffcffe000a6d5e);
+let %7 = %2 * 0xb85810873bee9068 + %1 * 0x47a7ef78c4116f98 + %3 * 0xb85810873bee9068 + %4 * 0x47a7ef78c4116f98 + %6 * 0x47a7ef78c4116f98 + #249740:64;
+let %8 = trunc<32>(%2 * 0xffffdffdfdbffedf + %3 * 0xffffdffdfdbffedf);
+let %9 = trunc<32>(%1 * 0xffffdffdfdbffedf + %4 * 0xffffdffdfdbffedf + %6 * 0xffffdffdfdbffedf);
+let %10 = zext<64>(%9 * 0x54b9d1db + %8 * 0xab462e25);
+let %11 = %1 * 0x11e8341293e03e00 + %2 * 0xee17cbed6c1fc200 + %3 * 0xee17cbed6c1fc200 + %4 * 0x11e8341293e03e00 + %6 * 0x11e8341293e03e00 + (%7 << (zext<64>(trunc<8>(%8 * 0xdb8d2f54 + %9 * 0x2472d0ac)) & 63) | %7 >>u (zext<64>(trunc<8>(%10 << 2) * -1) & 63));
+let %12 = zext<64>(trunc<32>((%10 << 3) + %10));
+let %13 = %11 >>u (zext<64>(trunc<8>((%12 << 1) + %12)) & 63);
+let %14 = ~%13;
+let %15 = %11 << (zext<64>(trunc<8>(%8 * 0x1e0d98d9 + %9 * 0xe1f26727)) & 63);
+let %16 = %15 & 0x7747675e08aac5bf;
+let %17 = %5 & 0x3001fff592a1;
+let %18 = ~(#12 & 0xffffcffe000a6d5e & 0x30015df949f8);
+let %19 = %17 * 0x9a114904117fb9e0 + %2 * 0x65eeb6fbee804620 + %1 * 0x9a114904117fb9e0 + %18 * 0x9a114904117fb9e0 + %3 * 0x65eeb6fbee804620 & 0x7747675e08aac5bf;
+let %20 = %17 * 0x65eeb6fbee804621 + %2 * 0x9a114904117fb9df + %1 * 0x65eeb6fbee804621 + %18 * 0x65eeb6fbee804621 + %3 * 0x9a114904117fb9df & 0x88b898a1f7553a40;
+let %21 = ~(%2 * 0xa9030e6b4cd3c76 + %17 * 0xf56fcf194b32c38a + %1 * 0xf56fcf194b32c38a + %18 * 0xf56fcf194b32c38a + %3 * 0xa9030e6b4cd3c76 + (~(%2 * 0xf35e31abfa62c1f6 + %17 * 0xca1ce54059d3e0a + %1 * 0xca1ce54059d3e0a + %18 * 0xca1ce54059d3e0a + %3 * 0xf35e31abfa62c1f6 & (%19 | %20)) & ~(~%19 & (~%20 & %2 * 0xca1ce54059d3e09 + %17 * 0xf35e31abfa62c1f7 + %1 * 0xf35e31abfa62c1f7 + %18 * 0xf35e31abfa62c1f7 + %3 * 0xca1ce54059d3e09))) & %17 * 0xd6450a00643a02d3 + %2 * 0x29baf5ff9bc5fd2d + %1 * 0xd6450a00643a02d3 + %18 * 0xd6450a00643a02d3 + %3 * 0x29baf5ff9bc5fd2d);
+let %22 = %21 + (%17 * 0xdbfdd6bb687b992c + %2 * 0x24022944978466d4 + %1 * 0xdbfdd6bb687b992c + %18 * 0xdbfdd6bb687b992c + %3 * 0x24022944978466d4) & ((%15 | %13) + zext<64>(trunc<32>(%2 * 0x36728500d285e83b + %17 * 0xc98d7aff2d7a17c5 + %1 * 0xc98d7aff2d7a17c5 + %18 * 0xc98d7aff2d7a17c5 + %3 * 0x36728500d285e83b) * 0x19f4b0f3) + 0xea00b727740fb274 | %21 + (%2 * 0xe0a1e13899152011 + %17 * 0x1f5e1ec766eadfef + %1 * 0x1f5e1ec766eadfef + %18 * 0x1f5e1ec766eadfef + %3 * 0xe0a1e13899152011));
+let %23 = ~%15;
+let %24 = %13 & 0xea00b727740fb274;
+let %25 = %14 & (%15 | 0x15ff48d88bf04d8b);
+let %26 = ~(%14 & 0x15ff48d88bf04d8b) & ~%24;
+let %27 = (%15 | 0x88b898a1f7553a40) & %13;
+let %28 = %23 & %14 & 0x7747675e08aac5bf;
+let %29 = %13 ^ 0x88b898a1f7553a40;
+let %30 = %24 & 0x88b898a1f7553a40;
+let %31 = %26 & 0x88b898a1f7553a40;
+let %32 = (~(%14 & ~%16 & 0xea00b727740fb274) & ~((%16 | %13) & 0x15ff48d88bf04d8b)) * %22 * 0xb6db6db6db6db6db + ((%15 ^ %13) & 0x88b898a1f7553a40 & 0xea00b727740fb274) * %22 * 0xb6db6db6db6db6db + ~((%23 & %24 | %25) & 0x88b898a1f7553a40) * %22 * 0xb6db6db6db6db6db + ~(%16 & %26) * %22 * 0xb6db6db6db6db6db + %22 * (~%27 & ~%28 & 0x15ff48d88bf04d8b | (%28 | %27) & 0xea00b727740fb274) * 0x6db6db6db6db6db7 + %22 * (%29 & %15 ^ 0x15ff48d88bf04d8b) * 0x6db6db6db6db6db7 + (~(%30 & %15) & (%30 | %15)) * %22 * 0x6db6db6db6db6db7 + (%15 & %13 & 0x88b898a1f7553a40 & 0x15ff48d88bf04d8b) * %22 * 0x9249249249249249 + %22 * (%25 ^ 0x7747675e08aac5bf) * 0x9249249249249249 + %22 * (%29 & 0x15ff48d88bf04d8b | %15) * 0x9249249249249249 + ~(~(%15 & 0x15ff48d88bf04d8b) & (%13 & 0x88b898a1f7553a40)) * %22 * 0x9249249249249249 + %22 * 0x2492492492492492 * (~(%31 & %15) & (%31 | %15)) + (~(%23 & 0x88b898a1f7553a40) & %24) * 0xb6db6db6db6db6dc * %22 + %22 * 0xdb6db6db6db6db6e * (~(~(%15 & 0xea00b727740fb274) & (~(%23 & 0x15ff48d88bf04d8b) & 0x7747675e08aac5bf)) & (%14 & ~((%15 ^ 0x15ff48d88bf04d8b) & 0x88b898a1f7553a40)));
+let %33 = %32 << (zext<64>(trunc<8>(%9 * 0x131e5a3f + %8 * 0xece1a5c1)) & 63);
+let %34 = %32 >>u (zext<64>(trunc<8>(%9 * 0x783f0a01 + %8 * 0x87c0f5ff)) & 63);
+let %35 = %33 ^ %34;
+let %36 = ~%33;
+let %37 = ~(~%34 & %33) & ~(%36 & %34);
+let %38 = %17 * 0xe7432b0928563edf + %2 * 0x18bcd4f6d7a9c121 + %1 * 0xe7432b0928563edf + %18 * 0xe7432b0928563edf + %3 * 0x18bcd4f6d7a9c121 + (%33 | %34);
+let %39 = ~(%2 * 0x1fe73e30a8480f31 + %17 * 0xe018c1cf57b7f0cf + %1 * 0xe018c1cf57b7f0cf + %18 * 0xe018c1cf57b7f0cf + %3 * 0x1fe73e30a8480f31 & %38) & ~(~%38 & %17 * 0x1fe73e30a8480f32 + %2 * 0xe018c1cf57b7f0ce + %1 * 0x1fe73e30a8480f32 + %18 * 0x1fe73e30a8480f32 + %3 * 0xe018c1cf57b7f0ce);
+let %40 = ~((~(%35 & 0x7747675e08aac5bf) & ~(%37 & 0x88b898a1f7553a40)) * %39 + %39 * (%35 ^ 0x88b898a1f7553a40)) + (((%36 ^ %33) & (%34 ^ 0x88b898a1f7553a40) ^ %33) * 0x9ebe33545fdfa31a + (%35 & 0x88b898a1f7553a40 | %37 & 0x7747675e08aac5bf) * 0x9ebe33545fdfa31a) + 1;
+let %41 = ~%40;
+let %42 = ~(%41 + %41 * %40 * 0x2492492492492492 + %40 * (%41 * 0xdb6db6db6db6db6e)) + 0x9ebe33545fdfa31a;
+let %43 = ((~%42 | 0xe018c1cf57b7f0ce) & (%42 | 0x1fe73e30a8480f31)) + 0xe7432b0928563edf;
+trunc<8>(zext<64>(~trunc<32>(%43) >>u 5 & 65) * zext<64>(trunc<32>(%43 >>u 31) >>u 7 & 3))

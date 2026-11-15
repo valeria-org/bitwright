@@ -9475,6 +9475,7 @@ mod opaque_constants {
 
 /// Two linear MBAs that are one function are equal, also where each side is as small as it
 /// gets and neither is rewritten into the other: their difference has a zero signature.
+#[cfg(feature = "prove")]
 #[test]
 fn an_equality_of_linear_mbas_is_decided_by_the_signature_of_their_difference() {
     for eng in [Engine::standard(), deobfuscator()] {

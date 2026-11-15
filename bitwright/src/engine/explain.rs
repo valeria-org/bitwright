@@ -132,7 +132,9 @@ pub enum Explanation {
         /// The atoms the fragment is a function of (the solver's variables, in order).
         atoms: Vec<Expr>,
         /// What vouched for the answer: `certificate` (bitwright's own), `prover`, `backend`
-        /// (the solver's own claim), `sampled`, or `cache` (an answer found before).
+        /// (the solver's own claim), `sampled`, `cache` (an answer found before), or `slices`
+        /// (the fragment with the slices of one rotated value written over that rotation,
+        /// equal by construction: no solver answered).
         evidence: &'static str,
         /// Which test of bitwright's certificate decided, when it did (`signature`,
         /// `single_bit`, `sparse`, `grid`, `exhaustive`, `symbolic`, `carries`).

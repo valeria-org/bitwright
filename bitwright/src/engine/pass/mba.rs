@@ -3070,11 +3070,23 @@ fn step_with(
             Some(_) => fin,
         };
         let mut fin = fin;
-        let slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
+        let mut slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
         if let Some(root) = slices {
             match ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))? {
                 Step::Normal(f) => fin = kept(fin, f),
                 again => return Ok(again),
+            }
+            // The fragment over that rotation is the answer where writing it made it smaller
+            // and left the solver no question: `(x >>u 57 & 0x74) - (rotl(x, 7) & 0x74)` is
+            // one slice less itself, a constant the builder folds, and a constant is no
+            // fragment to ask about.
+            match sliced_itself(r, cx, cfg, n, root, before)? {
+                Some(Step::Normal(f)) => {
+                    fin = kept(fin, f);
+                    slices = None;
+                }
+                Some(to) => return Ok(to),
+                None => {}
             }
         }
         // A fragment too large to lower whole (more variables than a question takes), or one
@@ -3519,6 +3531,57 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     }
     let root = cx.substitute_ids(&[n], &repl)?[0];
     Ok((root != n).then_some(root))
+}
+
+/// Commits `root`, node `n`'s fragment as [`sliced`] wrote it (built from arena index
+/// `before` on), where that alone makes the DAG smaller: the parts that were one slice of one
+/// rotation are one node, and what the builder folds over it is gone. `None` when it is no
+/// smaller (nothing is retired: the readings asked next are over `root`), else the step: a
+/// rejection has retired `root`'s nodes.
+///
+/// [`sliced`] rewrites by construction (each part is the bits its [`Slice`] says); the two
+/// are compared at the run's sample points as a lifted answer is.
+fn sliced_itself(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    root: u32,
+    before: u32,
+) -> Result<Option<Step>, Stop> {
+    let Ok((_, bindings)) = lower_id(cx, n, &cfg.limits) else {
+        return Ok(None);
+    };
+    if !super::margin(r, cx, n, root, &bindings.atoms)?.is_some_and(|m| m > 0) {
+        return Ok(None);
+    }
+    r.sample(cx, n)?;
+    r.sample(cx, root)?;
+    if r.samples[&n] != r.samples[&root] {
+        count(r).refuted += 1;
+        discard(r, cx, before);
+        return Ok(Some(Step::Normal(Fin::FINAL)));
+    }
+    r.explain_with(|| crate::engine::Explanation::Mba {
+        atoms: bindings.atoms.iter().map(|&a| cx.handle(a)).collect(),
+        evidence: "slices",
+        test: None,
+        points: 0,
+    });
+    let out = finish(
+        r,
+        cx,
+        PassKind::Mba,
+        n,
+        root,
+        before,
+        &bindings.atoms,
+        Fin::FINAL,
+    )?;
+    if matches!(out, Step::To(..)) {
+        count(r).simplified += 1;
+    }
+    Ok(Some(out))
 }
 
 /// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
