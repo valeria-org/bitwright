@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **MBA phase: two spellings of one slice of a rotated value cancel.** The phase reads the
+  parts of a fragment that are bits of one rotation of one value (`t >>u 57 & k`,
+  `rotl(t, 7) & 0x74`, `t << 7`) over that rotation and asks the solver about the result.
+  Where writing them that way already made the fragment smaller (`(t >>u 57 & k) -
+  (rotl(t, 7) & 0x74)` is one node less itself, which the builder folds to 0) nothing was
+  left to ask, and the fragment stayed as it was. It is now committed as rewritten, under
+  the commit rule and compared at the run's sample points (`Explanation::Mba` with
+  evidence `slices`). An obfuscator's opaque predicate multiplies a value by
+  `(difference · c) | 1`: the 64 by 64 bit product is then a product by 1. Thirteen
+  exported questions of one such family, undecided at 200 million propagations, simplify
+  to their constants and are proved in 30 to 180 ms at 2,000 conflicts and 20,000
+  propagations (the engine needs 131,072 units of fuel for them).
+
 ## 0.31.3
 
 - **Batch: a hub that is constant because of the assumptions, where no sample shows it.**
