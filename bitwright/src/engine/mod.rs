@@ -2567,7 +2567,7 @@ impl Engine {
         // threads, say), it does everything.
         std::thread::scope(|s| {
             for _ in 1..threads {
-                if std::thread::Builder::new().spawn_scoped(s, work).is_err() {
+                if crate::threads::builder().spawn_scoped(s, work).is_err() {
                     break;
                 }
             }

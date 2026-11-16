@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **The threads Bitwright starts have a deep stack:** 512 MiB, or 16 MiB where addresses have
+  32 bits, reserved and committed only as deep as a run goes. That covers a batch's helpers,
+  a phase run's (`run_each`), an exhaustive sample's, a threaded MBA solver's and a rule
+  check's. The demanded-bits pass recurses as deep as the expression it reads. On sums a VM
+  built (a devirtualizer's walk over vgk.sys) it went about 950 frames deep and overflowed a
+  helper's default 2 MiB, which aborts the process. The calling thread works too, so a caller
+  gives its own threads as much.
+
 ## 0.31.6
 
 - **MBA phase: a sum of products multiplied out over a factor affine in one value.** A sum

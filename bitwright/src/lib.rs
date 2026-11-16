@@ -176,6 +176,7 @@ mod book {
     struct Stability;
 }
 pub mod text;
+mod threads;
 pub mod translate;
 mod value;
 

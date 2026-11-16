@@ -808,7 +808,7 @@ pub fn check_program(program: &RuleProgram, cfg: &CheckConfig) -> Vec<RuleCheck>
         let mut handles = Vec::new();
         for part in rules.chunks(chunk) {
             let work = move || part.iter().map(|r| check_rule(r, cfg)).collect::<Vec<_>>();
-            match std::thread::Builder::new().spawn_scoped(s, work) {
+            match crate::threads::builder().spawn_scoped(s, work) {
                 Ok(h) => handles.push(h),
                 // No thread to be had: this part on the calling thread.
                 Err(_) => out.extend(part.iter().map(|r| check_rule(r, cfg))),
