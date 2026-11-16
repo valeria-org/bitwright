@@ -1564,6 +1564,21 @@ pub(crate) fn prove<M: Meter>(a: &MbaExpr, b: &MbaExpr, meter: &mut M) -> Result
             report.compositional = sub.compositional;
         }
     }
+    // Still open: sides that are each a constant plus, at every bit position, a multiple of
+    // every product of the variables' bits there (see `bit_tables`). A sum of masked bitwise
+    // functions of several values is one, and so is a bitwise function of such sums where
+    // they carry nothing: under a bitwise operator the sum is an atom to the tests above,
+    // unrelated to the bitwise function it is. Last, and only to prove: what the tests above
+    // decide they decide as before, at the cost they had, and a question they left open
+    // that this one would refute stays open (the readings of an opaque constant ask the
+    // next one of a reading left open, and take a refuted one for what the fragment is).
+    if report.verdict == Verdict::Unknown
+        && !report.over_budget
+        && bit_tables(meter, da.as_ref().unwrap_or(a), db.as_ref().unwrap_or(b))? == Some(None)
+    {
+        report.verdict = Verdict::Proved;
+        report.cert = Some(Cert::Symbolic);
+    }
     // A refutation comes with an input where the sides differ; one without would be a bug
     // (decided nothing).
     if report.verdict == Verdict::Refuted
@@ -2084,6 +2099,267 @@ fn bit_linear<M: Meter>(
         && let Some(i) = (0..bits).find(|&i| fa.d[i] != fb.d[i])
     {
         point[i / wn] = BitVec::wrapping_from_u64(w, 1u64 << (i % wn));
+    }
+    Ok(Some(Some(point)))
+}
+
+/// The most variables [`bit_tables`] takes: a form has `2^n − 1` multiples a bit position.
+const TABLE_VARS: usize = 5;
+
+/// A value as `k + Σ_j Σ_T c[j][T]·Π_{v ∈ T} x_v[j]` modulo `2^w`: at every bit position `j`,
+/// a multiple of each product of the variables' bits at that position (`T` a non-empty set
+/// of variables, `c` indexed by `j·(2^n − 1) + T − 1`). The products are independent
+/// functions of the bits, so a value has at most one such form.
+#[derive(Clone, PartialEq, Eq)]
+struct BitTables {
+    k: u64,
+    c: Vec<u64>,
+}
+
+/// A value each bit of which is a function of the variables' bits at one position: bit `i`
+/// is the truth table `.0` (bit `a` of it for the assignment `a`, one bit a variable) read at
+/// position `.1`. A constant bit is the table of all zeros or all ones.
+type BitFunctions = [(u32, u8); 64];
+
+impl BitTables {
+    /// The form as [`BitFunctions`], when it carries nothing: what each position adds
+    /// (`g_j(a) = Σ_{T ⊆ a} c[j][T]`) is zero or one power of two `2^t` (or `−2^t`, where
+    /// the constant has bit `t`), and no two positions take the same `t`. Then bit `t` is
+    /// the constant's, flipped where `g_j` is not zero, and every other bit the constant's.
+    fn functions(&self, n: usize, wn: usize, ones: u64) -> Option<BitFunctions> {
+        let (size, full) = (1usize << n, ((1u64 << (1u32 << n)) - 1) as u32);
+        let mut out: BitFunctions = [(0, 0); 64];
+        for (i, bit) in out.iter_mut().enumerate().take(wn) {
+            if self.k >> i & 1 == 1 {
+                bit.0 = full;
+            }
+        }
+        let mut taken = 0u64;
+        let mut g = [0u64; 1 << TABLE_VARS];
+        for j in 0..wn {
+            let row = &self.c[j * (size - 1)..(j + 1) * (size - 1)];
+            if row.iter().all(|&c| c == 0) {
+                continue;
+            }
+            g[0] = 0;
+            g[1..size].copy_from_slice(row);
+            for v in 0..n {
+                for a in 0..size {
+                    if a >> v & 1 == 1 {
+                        g[a] = g[a].wrapping_add(g[a ^ (1 << v)]) & ones;
+                    }
+                }
+            }
+            let Some(&first) = g[..size].iter().find(|&&x| x != 0) else {
+                continue;
+            };
+            let t = first.trailing_zeros() as usize;
+            let set = self.k >> t & 1 == 1;
+            let step = match set {
+                false => 1u64 << t,
+                true => (1u64 << t).wrapping_neg() & ones,
+            };
+            if taken >> t & 1 == 1 || g[..size].iter().any(|&x| x != 0 && x != step) {
+                return None;
+            }
+            taken |= 1 << t;
+            let mut table = 0u32;
+            for (a, &x) in g[..size].iter().enumerate() {
+                if set != (x != 0) {
+                    table |= 1 << a;
+                }
+            }
+            out[t] = (table, j as u8);
+        }
+        Some(out)
+    }
+
+    /// The form of [`BitFunctions`]: bit `i` adds `2^i` times its table, written over the
+    /// products of the bits it reads (`f(a) = Σ_{T ⊆ a} m[T]`).
+    fn of(bits: &BitFunctions, n: usize, wn: usize, ones: u64) -> BitTables {
+        let size = 1usize << n;
+        let mut out = BitTables {
+            k: 0,
+            c: vec![0; wn * (size - 1)],
+        };
+        let mut m = [0u64; 1 << TABLE_VARS];
+        for (i, &(table, at)) in bits.iter().enumerate().take(wn) {
+            if table == 0 {
+                continue;
+            }
+            for (a, x) in m[..size].iter_mut().enumerate() {
+                *x = u64::from(table >> a & 1);
+            }
+            for v in 0..n {
+                for a in 0..size {
+                    if a >> v & 1 == 1 {
+                        m[a] = m[a].wrapping_sub(m[a ^ (1 << v)]);
+                    }
+                }
+            }
+            out.k |= m[0] << i;
+            let row = &mut out.c[usize::from(at) * (size - 1)..][..size - 1];
+            for (c, &x) in row.iter_mut().zip(&m[1..size]) {
+                *c = c.wrapping_add(x << i) & ones;
+            }
+        }
+        out
+    }
+}
+
+/// Whether `a` and `b` are equal, where each is read as [`BitTables`]: `None` when a side is
+/// not, `Some(None)` when they are equal, `Some(Some(point))` with an input where they
+/// differ.
+///
+/// Sums, differences, negations, complements, left shifts and products by a constant keep
+/// such a form whatever it is. `& | ^` and a right shift take operands that carry nothing
+/// ([`BitTables::functions`]: every bit a function of the variables' bits at one position)
+/// and that read the same position at each bit, and give one. So a sum of products of masked
+/// bitwise functions of several values by constants has a form, and a bitwise function of it
+/// has one where the sum is a bitwise function itself (`(x ^ y) & m | k`, written as thirty
+/// masked terms): what [`bit_linear`] decides for functions of single bits, with several
+/// values' bits read together. A value has at most one form, so the comparison decides, at
+/// 64 bits or fewer and up to [`TABLE_VARS`] variables. One unit of work per node read and
+/// 16 multiples of a form, where it decides.
+fn bit_tables<M: Meter>(
+    meter: &mut M,
+    a: &MbaExpr,
+    b: &MbaExpr,
+) -> Result<Option<Option<Vec<BitVec>>>, M::Err> {
+    let (Some(w), Some(wb)) = (a.width(), b.width()) else {
+        return Ok(None);
+    };
+    let n = a.vars().len();
+    if w != wb || w.bits() > 64 || a.vars() != b.vars() || n == 0 || n > TABLE_VARS {
+        return Ok(None);
+    }
+    let wn = usize::from(w.bits());
+    let size = 1usize << n;
+    let terms = wn * (size - 1);
+    let per = (terms / 16 + 1) as u64;
+    if (a.nodes().len() + b.nodes().len()) as u64 * per > meter.left() {
+        return Ok(None);
+    }
+    let read = std::cell::Cell::new(0u64);
+    let ones = if wn == 64 { u64::MAX } else { (1u64 << wn) - 1 };
+    let form = |m: &MbaExpr| -> Option<BitTables> {
+        let nodes = m.nodes();
+        let live = live(m);
+        let mut forms: Vec<Option<BitTables>> = Vec::with_capacity(nodes.len());
+        for (at, node) in nodes.iter().enumerate() {
+            // A node the root does not read is not read here either.
+            if !live[at] {
+                forms.push(None);
+                continue;
+            }
+            read.set(read.get() + 1);
+            let arg = |j: usize| forms[node.args[j] as usize].as_ref();
+            let zip = |x: &BitTables, y: &BitTables, f: fn(u64, u64) -> u64| BitTables {
+                k: f(x.k, y.k) & ones,
+                c: (x.c.iter().zip(&y.c))
+                    .map(|(&p, &q)| f(p, q) & ones)
+                    .collect(),
+            };
+            let scale = |x: &BitTables, by: u64| BitTables {
+                k: x.k.wrapping_mul(by) & ones,
+                c: x.c.iter().map(|&p| p.wrapping_mul(by) & ones).collect(),
+            };
+            let konst = |x: &BitTables| x.c.iter().all(|&p| p == 0).then_some(x.k);
+            let f = (|| match node.op {
+                _ if node.width != w => None,
+                MOp::Const(c) => Some(BitTables {
+                    k: c.to_u64()? & ones,
+                    c: vec![0; terms],
+                }),
+                MOp::Var(v) => {
+                    let mut c = vec![0; terms];
+                    for j in 0..wn {
+                        c[j * (size - 1) + (1usize << v) - 1] = 1u64 << j;
+                    }
+                    Some(BitTables { k: 0, c })
+                }
+                MOp::Add => Some(zip(arg(0)?, arg(1)?, u64::wrapping_add)),
+                MOp::Sub => Some(zip(arg(0)?, arg(1)?, u64::wrapping_sub)),
+                MOp::Neg => Some(scale(arg(0)?, u64::MAX)),
+                // `~x` is `−x − 1`.
+                MOp::Not => {
+                    let mut x = scale(arg(0)?, u64::MAX);
+                    x.k = x.k.wrapping_sub(1) & ones;
+                    Some(x)
+                }
+                MOp::Shl(s) => Some(scale(arg(0)?, 1u64.checked_shl(u32::from(s))?)),
+                MOp::Mul => {
+                    let (x, y) = (arg(0)?, arg(1)?);
+                    match (konst(x), konst(y)) {
+                        (Some(c), _) => Some(scale(y, c)),
+                        (_, Some(c)) => Some(scale(x, c)),
+                        _ => None,
+                    }
+                }
+                MOp::LShr(s) => {
+                    let x = arg(0)?.functions(n, wn, ones)?;
+                    let s = usize::from(s).min(wn);
+                    let mut out: BitFunctions = [(0, 0); 64];
+                    out[..wn - s].copy_from_slice(&x[s..wn]);
+                    Some(BitTables::of(&out, n, wn, ones))
+                }
+                MOp::And | MOp::Or | MOp::Xor => {
+                    let x = arg(0)?.functions(n, wn, ones)?;
+                    let y = arg(1)?.functions(n, wn, ones)?;
+                    let full = ((1u64 << (1u32 << n)) - 1) as u32;
+                    let fixed = |t: u32| t == 0 || t == full;
+                    let mut out: BitFunctions = [(0, 0); 64];
+                    for j in 0..wn {
+                        let ((tx, px), (ty, py)) = (x[j], y[j]);
+                        // Two functions of the bits at different positions are none of one.
+                        if !fixed(tx) && !fixed(ty) && px != py {
+                            return None;
+                        }
+                        let table = match node.op {
+                            MOp::And => tx & ty,
+                            MOp::Or => tx | ty,
+                            _ => tx ^ ty,
+                        };
+                        out[j] = (table, if fixed(tx) { py } else { px });
+                    }
+                    Some(BitTables::of(&out, n, wn, ones))
+                }
+                MOp::Zext | MOp::Sext | MOp::Trunc => None,
+            })();
+            // The root reads it, so has no form either.
+            forms.push(Some(f?));
+        }
+        forms.pop().flatten()
+    };
+    // The shorter side first: an answer is a few nodes, and where it has no form the
+    // question's is not computed.
+    let swap = a.nodes().len() > b.nodes().len();
+    let (first, second) = if swap { (b, a) } else { (a, b) };
+    let f1 = form(first);
+    let f2 = f1.as_ref().and_then(|_| form(second));
+    // Charged where it decides: giving up is a walk to the first node without a form, within
+    // what the meter had left for the whole.
+    let (Some(f1), Some(f2)) = (f1, f2) else {
+        return Ok(None);
+    };
+    meter.charge(read.get() * per)?;
+    let (fa, fb) = if swap { (f2, f1) } else { (f1, f2) };
+    if fa == fb {
+        return Ok(Some(None));
+    }
+    // Where they differ: at zero, or at the first position and set of variables whose
+    // multiples do, with those variables' bits there set (the multiples of every smaller set
+    // at that position agree, so the difference there is that of this one).
+    let mut point = vec![BitVec::zero(w); n];
+    if fa.k == fb.k
+        && let Some(i) = (0..terms).find(|&i| fa.c[i] != fb.c[i])
+    {
+        let (j, set) = (i / (size - 1), i % (size - 1) + 1);
+        for (v, x) in point.iter_mut().enumerate() {
+            if set >> v & 1 == 1 {
+                *x = BitVec::wrapping_from_u64(w, 1u64 << j);
+            }
+        }
     }
     Ok(Some(Some(point)))
 }
@@ -5938,6 +6214,176 @@ mod point_tests {
 }
 
 // right shifts of bitwise functions in the polynomial fragment.
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    /// A bitwise function of the variables, as a tree: a leaf is a variable (`Ok`) or a
+    /// constant (`Err`).
+    enum Tree {
+        Leaf(Result<u32, u64>),
+        Not(Box<Tree>),
+        Bin(MOp, Box<Tree>, Box<Tree>),
+    }
+
+    fn tree(state: &mut u64, vars: u32, depth: u32) -> Tree {
+        let r = next_word(state);
+        if depth == 0 || r.is_multiple_of(8) {
+            return Tree::Leaf(match r >> 8 & 3 {
+                0 => Err(next_word(state)),
+                _ => Ok((r >> 16) as u32 % vars),
+            });
+        }
+        let mut sub = || Box::new(tree(state, vars, depth - 1));
+        match r >> 8 & 7 {
+            0 => Tree::Not(sub()),
+            1 | 2 => Tree::Bin(MOp::And, sub(), sub()),
+            3 | 4 => Tree::Bin(MOp::Or, sub(), sub()),
+            _ => Tree::Bin(MOp::Xor, sub(), sub()),
+        }
+    }
+
+    /// `t` in `m`: as it is, or (`spell`) each operator written with sums of its operands by
+    /// an identity chosen by `state`, times a constant and its inverse in places.
+    fn emit(m: &mut MbaExpr, w: Width, t: &Tree, spell: bool, state: &mut u64) -> u32 {
+        let k = |m: &mut MbaExpr, v: u64| {
+            m.push(MOp::Const(BitVec::wrapping_from_u64(w, v)), &[])
+                .unwrap()
+        };
+        match t {
+            Tree::Leaf(Ok(v)) => m.push(MOp::Var(*v), &[]).unwrap(),
+            Tree::Leaf(Err(c)) => k(m, *c),
+            Tree::Not(x) => {
+                let x = emit(m, w, x, spell, state);
+                if spell && next_word(state) & 1 == 1 {
+                    // `~x = −x − 1`.
+                    let n = m.push(MOp::Neg, &[x]).unwrap();
+                    let one = k(m, 1);
+                    m.push(MOp::Sub, &[n, one]).unwrap()
+                } else {
+                    m.push(MOp::Not, &[x]).unwrap()
+                }
+            }
+            Tree::Bin(op, x, y) => {
+                let (x, y) = (emit(m, w, x, spell, state), emit(m, w, y, spell, state));
+                if !spell {
+                    return m.push(*op, &[x, y]).unwrap();
+                }
+                let and = m.push(MOp::And, &[x, y]).unwrap();
+                let or = m.push(MOp::Or, &[x, y]).unwrap();
+                let xor = m.push(MOp::Xor, &[x, y]).unwrap();
+                let sum = m.push(MOp::Add, &[x, y]).unwrap();
+                match (*op, next_word(state) % 3) {
+                    (op, 0) => m.push(op, &[x, y]).unwrap(),
+                    // `x & y = (x | y) − (x ^ y)`, or its low bit beside the rest of it
+                    // shifted down and up again.
+                    (MOp::And, 1) => m.push(MOp::Sub, &[or, xor]).unwrap(),
+                    (MOp::And, _) => {
+                        let one = k(m, 1);
+                        let low = m.push(MOp::And, &[and, one]).unwrap();
+                        let rest = m.push(MOp::LShr(1), &[and]).unwrap();
+                        let rest = m.push(MOp::Shl(1), &[rest]).unwrap();
+                        m.push(MOp::Add, &[rest, low]).unwrap()
+                    }
+                    // `x | y = (x ^ y) + (x & y)`, or `x + y − (x & y)`.
+                    (MOp::Or, 1) => m.push(MOp::Add, &[xor, and]).unwrap(),
+                    (MOp::Or, _) => m.push(MOp::Sub, &[sum, and]).unwrap(),
+                    // `x ^ y = (x | y) − (x & y)`, or `3·(x + y) − 6·(x & y)` times the
+                    // inverse of 3.
+                    (_, 1) => m.push(MOp::Sub, &[or, and]).unwrap(),
+                    _ => {
+                        let (three, six) = (k(m, 3), k(m, 6));
+                        let a = m.push(MOp::Mul, &[sum, three]).unwrap();
+                        let b = m.push(MOp::Mul, &[and, six]).unwrap();
+                        let d = m.push(MOp::Sub, &[a, b]).unwrap();
+                        let inverse = k(m, 0xaaaa_aaaa_aaaa_aaab);
+                        m.push(MOp::Mul, &[d, inverse]).unwrap()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `a` and `b` agree at every input (`vars` variables of `w` bits).
+    fn agree(a: &MbaExpr, b: &MbaExpr, w: Width, vars: u32) -> bool {
+        let bits = u32::from(w.bits());
+        (0..1u64 << (bits * vars)).all(|p| {
+            let point: Vec<BitVec> = (0..vars)
+                .map(|v| BitVec::wrapping_from_u64(w, p >> (bits * v)))
+                .collect();
+            a.eval(&point) == b.eval(&point)
+        })
+    }
+
+    /// Bitwise functions written with sums of their parts have forms, and the forms say what
+    /// evaluation at every input says: equal where the spelling is of the same tree, and
+    /// otherwise equal or not as the two trees are, with an input where they differ.
+    #[test]
+    fn spelled_bitwise_functions_are_compared_as_evaluation_compares_them() {
+        let mut state = 0x7461_626c_6573_u64;
+        let (mut proved, mut refuted) = (0, 0);
+        for round in 0..240 {
+            let (w, vars) = match round % 3 {
+                0 => (Width::new(6).unwrap(), 2),
+                1 => (Width::new(4).unwrap(), 3),
+                _ => (Width::new(5).unwrap(), 2),
+            };
+            let t = tree(&mut state, vars, 3);
+            // Every fourth round against another tree.
+            let u = (round % 4 == 3).then(|| tree(&mut state, vars, 3));
+            let mut a = MbaExpr::new(vec![w; vars as usize]);
+            emit(&mut a, w, &t, false, &mut state);
+            let mut b = MbaExpr::new(vec![w; vars as usize]);
+            emit(&mut b, w, u.as_ref().unwrap_or(&t), true, &mut state);
+            let found = bit_tables(&mut Steps::new(1 << 24), &a, &b)
+                .unwrap_or_else(|()| panic!("out of steps"))
+                .unwrap_or_else(|| panic!("no form in round {round}"));
+            match found {
+                None => {
+                    assert!(agree(&a, &b, w, vars), "proved in round {round}");
+                    proved += 1;
+                }
+                Some(point) => {
+                    assert_ne!(a.eval(&point), b.eval(&point), "round {round}");
+                    assert!(u.is_some(), "one tree refuted in round {round}");
+                    refuted += 1;
+                }
+            }
+        }
+        assert!(proved >= 180 && refuted >= 20, "{proved} {refuted}");
+    }
+
+    #[test]
+    fn a_sum_that_carries_has_no_bitwise_form() {
+        // `(x + y) & x`: the sum's bits are no function of the bits at one position.
+        let w = Width::W64;
+        let mut a = MbaExpr::new(vec![w, w]);
+        let (x, y) = (
+            a.push(MOp::Var(0), &[]).unwrap(),
+            a.push(MOp::Var(1), &[]).unwrap(),
+        );
+        let s = a.push(MOp::Add, &[x, y]).unwrap();
+        a.push(MOp::And, &[s, x]).unwrap();
+        assert_eq!(bit_tables(&mut Steps::new(1 << 24), &a, &a), Ok(None));
+        // Two bits at one target: `(x & 1) + (y & 1)` under `|`.
+        let mut b = MbaExpr::new(vec![w, w]);
+        let (x, y) = (
+            b.push(MOp::Var(0), &[]).unwrap(),
+            b.push(MOp::Var(1), &[]).unwrap(),
+        );
+        let one = b
+            .push(MOp::Const(BitVec::wrapping_from_u64(w, 1)), &[])
+            .unwrap();
+        let (p, q) = (
+            b.push(MOp::And, &[x, one]).unwrap(),
+            b.push(MOp::And, &[y, one]).unwrap(),
+        );
+        let s = b.push(MOp::Add, &[p, q]).unwrap();
+        b.push(MOp::Or, &[s, x]).unwrap();
+        assert_eq!(bit_tables(&mut Steps::new(1 << 24), &b, &b), Ok(None));
+    }
+}
+
 #[cfg(test)]
 mod shift_tests {
     use super::*;

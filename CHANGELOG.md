@@ -9,6 +9,23 @@
   built (a devirtualizer's walk over vgk.sys) it went about 950 frames deep and overflowed a
   helper's default 2 MiB, which aborts the process. The calling thread works too, so a caller
   gives its own threads as much.
+- **Certificates: bit tables.** A question the other tests leave open is read, side by
+  side, as a constant plus, at every bit position, a multiple of each product of the
+  variables' bits there (`k + Σ_j Σ_T c[j][T]·Π_{v ∈ T} x_v[j]`, up to five variables at 64
+  bits or fewer). Sums, differences, complements, left shifts and products by constants keep
+  such a form; `& | ^` and a right shift take operands that carry nothing (every bit a
+  function of the variables' bits at one position) and give one. The products are
+  independent functions, so a value has at most one form and two sides that have forms are
+  compared exactly. Thirty-one products of
+  masked bitwise functions of two values add up to `(x ^ y) & m | k`; under `&` with
+  another function of the two values the sum was an atom to the tests, unrelated to them,
+  and the solver's answer was not proved. Asked last and only to prove, so every question
+  the tests decided is decided as before, at the cost it had, and one they left open stays
+  open unless it is proved.
+- On a devirtualizer's documents (`tests/sums_under_bitwise.rs` holds three of the
+  expressions): eleven named computations of 162 to 202 operations in one function, each a
+  few bits of such a sum under `&` and `^`, are constants or one masked value (273 nodes to
+  1, 289 to 5).
 
 ## 0.31.6
 
