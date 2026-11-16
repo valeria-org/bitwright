@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.7
 
 - **Faster, with the same results:** a run over a large expression, and the prover's
   circuits. Nothing a call answers changes, and neither does what it charges: the result,
