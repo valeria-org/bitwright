@@ -547,6 +547,19 @@ pub(super) fn mba_step(
         Some(step) => return Ok(step),
         None => {}
     }
+    // a sum of products with factors affine in one value, multiplied out over them.
+    let mut cofactor =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
+            Ok(match mba::step_cofactor(r, cx, cfg, s)? {
+                Step::To(e, _) => Some(e),
+                Step::Normal(_) => None,
+            })
+        };
+    match linear::by_multiplicand(r, cx, n, &mut cofactor)? {
+        Some(Step::Normal(f)) => declined = declined.and(f),
+        Some(step) => return Ok(step),
+        None => {}
+    }
     let mut side =
         |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
             Ok(match mba::step_side(r, cx, cfg, s)? {

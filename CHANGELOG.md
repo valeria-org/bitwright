@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+- **MBA phase: a sum of products multiplied out over a factor affine in one value.** A sum
+  whose products each have a factor `αᵢ·t + βᵢ` over one value `t` (any subterm: an atom of
+  the linear forms, or a sum of several, up to an odd scale) is written
+  `t·Σ αᵢ·gᵢ + (Σ βᵢ·gᵢ + rest)`, and the phase asks about the two cofactor sums: first
+  with the arithmetic their bitwise operators read as atoms, then whole, each within the
+  steps of a retried question. The result is committed under the commit rule. An
+  obfuscator multiplies a linear MBA term by term with values derived from one value:
+  `(c₁·t + k₁)·(~r ^ y) + (c₂·t + k₂)·(~r & ~y) + ~y·(c₃·(y & r) + k₃)` over a
+  `y = k − t`. Whole, that is a polynomial over what `t` is made of (one bitwise function
+  per bit run of a constant `t` is xored with), which the solver answered only within
+  most of a question's steps, or not at all where a part of it had taken too many and the
+  fragment was kept from it; the cofactor sums are linear MBAs over `r` and `y` alone,
+  and an `r` the sum does not depend on is gone from each. `x·a + x·~a` is the smallest
+  case (`a + ~a` is `−1`).
+- Nine exported questions of one function of a devirtualizer's walk
+  (`tests/multiplied_out.rs`), undecided at 200 million propagations and by Z3 in a
+  minute, simplify to their constants and are proved in 40 to 70 ms at 2,000 conflicts
+  and 20,000 propagations (the engine on 131,072 units of fuel or more). Six questions of
+  the same function that are not constants stay unproved; three of them are shown to
+  differ at a witness.
+
 ## 0.31.5
 
 - **Normal-form solver: the low bits of a sum.** `p & k` over a polynomial `p` and a
