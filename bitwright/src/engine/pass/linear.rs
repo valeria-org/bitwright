@@ -2003,14 +2003,16 @@ fn bitwise_atoms(cx: &Context, e: u32) -> Option<Vec<u32>> {
     if !bitwise(cx.node(e).op) {
         return Some(vec![e]);
     }
-    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut seen = super::Lease::new(cx.len());
+    let mut met = 0usize;
     let mut out = Vec::new();
     let mut todo = vec![e];
     while let Some(i) = todo.pop() {
-        if seen.insert(i, ()).is_some() {
+        if seen.insert(i, 0) {
             continue;
         }
-        if seen.len() > MAX_SEEN {
+        met += 1;
+        if met > MAX_SEEN {
             return None;
         }
         let node = cx.node(i);

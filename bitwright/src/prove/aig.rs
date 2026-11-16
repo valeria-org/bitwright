@@ -27,7 +27,83 @@ enum Node {
 #[derive(Debug)]
 pub struct Aig {
     nodes: Vec<Node>,
-    hash: IdMap<(L, L), L>,
+    gates: Gates,
+}
+
+/// The structural hash of the gates: an open-addressed table of `(hash, node)` slots (node 0,
+/// the constant, marks an empty slot), probed linearly. A gate's operands are read from the
+/// graph's nodes, so a slot is two words and the table grows without reading a gate again. A
+/// prover question builds one graph and drops it: a general hash map, grown from empty and
+/// hashing each pair three times over, was a third of what a small question cost.
+#[derive(Debug)]
+struct Gates {
+    slots: Vec<(u32, u32)>,
+    len: usize,
+}
+
+impl Gates {
+    /// The slots of an empty table (a power of two).
+    const INITIAL: usize = 1 << 10;
+
+    fn new() -> Gates {
+        Gates {
+            slots: vec![(0, 0); Self::INITIAL],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn hash(a: L, b: L) -> u32 {
+        let x = (u64::from(a) << 32 | u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        ((x ^ x >> 32).wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as u32
+    }
+
+    /// The gate `a ∧ b` of `nodes`, or the slot it goes in and its hash.
+    #[inline]
+    fn find(&self, nodes: &[Node], a: L, b: L) -> Result<L, (usize, u32)> {
+        let h = Self::hash(a, b);
+        let mask = self.slots.len() - 1;
+        let mut at = h as usize & mask;
+        loop {
+            let (sh, n) = self.slots[at];
+            if n == 0 {
+                return Err((at, h));
+            }
+            if sh == h
+                && let Node::And(x, y) = nodes[n as usize]
+                && x == a
+                && y == b
+            {
+                return Ok(n << 1);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Puts node `n` (hash `h`) in the empty slot `at`, as [`find`](Self::find) gave them.
+    #[inline]
+    fn insert(&mut self, at: usize, h: u32, n: u32) {
+        self.slots[at] = (h, n);
+        self.len += 1;
+        // At most half full.
+        if self.len * 2 > self.slots.len() {
+            let old = std::mem::take(&mut self.slots);
+            // (Four times while it is small: most graphs are of some ten thousand gates, and
+            // are then moved three times, not seven.)
+            let times = if old.len() < 1 << 18 { 4 } else { 2 };
+            self.slots = vec![(0, 0); old.len() * times];
+            let mask = self.slots.len() - 1;
+            for (h, n) in old {
+                if n != 0 {
+                    let mut at = h as usize & mask;
+                    while self.slots[at].1 != 0 {
+                        at = (at + 1) & mask;
+                    }
+                    self.slots[at] = (h, n);
+                }
+            }
+        }
+    }
 }
 
 impl Default for Aig {
@@ -41,7 +117,7 @@ impl Aig {
     pub fn new() -> Aig {
         Aig {
             nodes: vec![Node::Const],
-            hash: IdMap::default(),
+            gates: Gates::new(),
         }
     }
 
@@ -83,13 +159,15 @@ impl Aig {
         if a == TRUE || a == b {
             return b;
         }
-        if let Some(&g) = self.hash.get(&(a, b)) {
-            return g;
+        match self.gates.find(&self.nodes, a, b) {
+            Ok(g) => g,
+            Err((at, h)) => {
+                self.nodes.push(Node::And(a, b));
+                let n = (self.nodes.len() - 1) as u32;
+                self.gates.insert(at, h, n);
+                n << 1
+            }
         }
-        self.nodes.push(Node::And(a, b));
-        let g = ((self.nodes.len() - 1) as u32) << 1;
-        self.hash.insert((a, b), g);
-        g
     }
 
     /// `a ∨ b`.

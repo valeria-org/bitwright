@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Faster, with the same results:** a run over a large expression, and the prover's
+  circuits. Nothing a call answers changes, and neither does what it charges: the result,
+  the counters and where a budget stops it are what they were.
+  - The MBA phase reads every candidate's fragment (up to 2,048 nodes) several ways: for the
+    slices of one rotated value, for the nodes several terms share, for what a kept fragment
+    holds. Each walk built hash maps from empty and dropped them. They are tables the thread
+    keeps now, emptied in constant time (dense for a context of up to a million nodes, 8
+    bytes a node each, and a map past that while a walk holds few). The same tables serve
+    the substitution that writes the slices, the carries pass's cones and the linear pass's
+    atoms.
+  - The slices of a node and the shared nodes of a fragment are read once per call. The
+    rounds ask the same nodes again (133,000 slice walks for 30,000 nodes in one measured
+    call), and the arena only grows, so the second answer is the first.
+  - The limb pass looked each value up by a search of the values, under a count over the
+    terms for every value: quadratic in the terms of a sum, and most of the pass's time on a
+    sum of a few hundred terms.
+  - The prover's and-inverter graph keeps its gates in an open-addressed table of two words
+    a gate, in place of a general hash map that hashed each pair three times over and was
+    grown from empty for every question.
+  - One run of the deobfuscation strategy with the MBA phase over a devirtualizer's
+    11,647-node expression (a SHA-256 round function under a select), with all of its fuel
+    spent: 38 s to 5.8 s. Over 57 such expressions: 657 s to 122 s.
+
 - **The threads Bitwright starts have a deep stack:** 512 MiB, or 16 MiB where addresses have
   32 bits, reserved and committed only as deep as a run goes. That covers a batch's helpers,
   a phase run's (`run_each`), an exhaustive sample's, a threaded MBA solver's and a rule

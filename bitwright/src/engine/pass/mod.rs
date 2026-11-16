@@ -53,6 +53,8 @@ pub(crate) struct Slots<T> {
     dense: bool,
     /// The context's node count when last begun: what the dense table is sized for.
     len: usize,
+    /// A context of at most this many nodes gets the dense table at once.
+    small: usize,
 }
 
 impl<T> Default for Slots<T> {
@@ -65,8 +67,15 @@ impl<T> Default for Slots<T> {
             // (Dense until it is known to be of a large context: see `begin` and `set_slow`.)
             dense: true,
             len: 0,
+            small: Self::SMALL,
         }
     }
+}
+
+impl<T> Slots<T> {
+    /// A context of at most this many nodes gets the dense table at once, unless the table
+    /// was made for larger ones (a [`Lease`]).
+    const SMALL: usize = 1 << 14;
 }
 
 impl<T: Copy + Default> Slots<T> {
@@ -74,8 +83,6 @@ impl<T: Copy + Default> Slots<T> {
     /// one in this many of the context's nodes.
     const FEW: usize = 1024;
     const FRACTION: usize = 32;
-    /// A context of at most this many nodes gets the dense table at once.
-    const SMALL: usize = 1 << 14;
 
     /// Empties it, for indices below `len` (it grows to any index it is given).
     pub(crate) fn begin(&mut self, len: usize) {
@@ -84,9 +91,9 @@ impl<T: Copy + Default> Slots<T> {
         // A small context is cheaper as a table from the start: the table is no larger than
         // the map would grow, and indexing it does not hash. (A table kept for that reason
         // is given up when the context has outgrown it.)
-        if self.len <= Self::SMALL {
+        if self.len <= self.small {
             self.dense = true;
-        } else if self.dense && self.stamp.len() <= Self::SMALL {
+        } else if self.dense && self.stamp.len() <= self.small {
             self.dense = false;
             self.few.clear();
         }
@@ -141,7 +148,7 @@ impl<T: Copy + Default> Slots<T> {
     fn set_slow(&mut self, i: u32, v: T) -> bool {
         // A table that was dense for a small context, given an index beyond one: what it
         // holds goes to the map, as in a context that was large from the start.
-        if self.dense && self.stamp.len() <= Self::SMALL && i as usize >= Self::SMALL {
+        if self.dense && self.stamp.len() <= self.small && i as usize >= self.small {
             self.dense = false;
             self.few.clear();
             for (at, s) in self.stamp.iter_mut().enumerate() {
@@ -203,6 +210,74 @@ impl<T: Copy + Default> Slots<T> {
         } else {
             self.few.remove(&i).is_some()
         }
+    }
+}
+
+thread_local! {
+    /// The tables no [`Lease`] holds.
+    static FREE: core::cell::RefCell<Vec<Slots<u32>>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// A number per node index for one walk: one of the thread's [`Slots`], empty when taken and
+/// kept for the next taker when dropped. For a walk outside the runner (or one that holds
+/// several tables at once), in place of a hash map built, grown and dropped each time: the
+/// walks made at every candidate of a call spent most of their time in those.
+///
+/// Such a walk reads up to a few thousand nodes and is made tens of thousands of times in a
+/// call, so the table is dense for any context of up to [`Lease::SMALL`] nodes (a few tables
+/// of 8 bytes a node for the thread), and only past that a map while it holds few.
+pub(crate) struct Lease(Slots<u32>);
+
+impl Lease {
+    /// See [`Lease`].
+    const SMALL: usize = 1 << 20;
+
+    /// An empty table for a context of `len` nodes (it grows to any index it is given).
+    pub(crate) fn new(len: usize) -> Lease {
+        let mut s = FREE
+            .with(|f| f.borrow_mut().pop())
+            .unwrap_or_else(|| Slots {
+                small: Self::SMALL,
+                ..Slots::default()
+            });
+        s.begin(len);
+        Lease(s)
+    }
+
+    /// Sets `i`'s number: whether it had one.
+    #[inline]
+    pub(crate) fn insert(&mut self, i: u32, v: u32) -> bool {
+        !self.0.set(i, v)
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: u32) -> Option<u32> {
+        self.0.get(i)
+    }
+
+    #[inline]
+    #[cfg_attr(not(feature = "prove"), allow(dead_code))]
+    pub(crate) fn contains(&self, i: u32) -> bool {
+        self.0.contains(i)
+    }
+
+    /// Adds one to `i`'s number (as if 0 where it has none): whether it had one.
+    #[inline]
+    #[cfg_attr(not(feature = "mba"), allow(dead_code))]
+    pub(crate) fn bump(&mut self, i: u32) -> bool {
+        match self.0.get(i) {
+            Some(v) => !self.0.set(i, v + 1),
+            None => !self.0.set(i, 1),
+        }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let s = core::mem::take(&mut self.0);
+        // (Not kept by a thread that is ending.)
+        let _ = FREE.try_with(|f| f.borrow_mut().push(s));
     }
 }
 

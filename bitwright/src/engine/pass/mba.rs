@@ -60,6 +60,34 @@ pub(crate) struct State {
     /// The pass work the sweep's certificates took once the call's MBA solver steps were
     /// gone (see `pass::mba::readings_prove`).
     pub(crate) sweep_borrowed: u64,
+    /// What [`sliced`] made of each node it was asked about in this call (by the node and the
+    /// size limit). The arena only grows, so a node's fragment is the same every time and the
+    /// nodes written for it are there already: the walk asks the same nodes in every round,
+    /// four times and more in a measured call, and the second answer made no node.
+    pub(crate) sliced: crate::hash::IdMap<(u32, u32), Option<u32>>,
+    /// The shared nodes of each fragment asked for in this call with no node kept out of it
+    /// (see [`shared`]): by the root, the size limit, how many, and whether casts are read.
+    pub(crate) shared: crate::hash::IdMap<(u32, u32, u32, bool), Vec<u32>>,
+}
+
+/// [`shared_nodes`] of `root` (with `whole`, [`shared_nodes_whole`]), read once per call: the
+/// list is a function of the nodes below `root`, which do not change.
+fn shared(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    cfg: &MbaConfig,
+    root: u32,
+    n: usize,
+    whole: bool,
+) -> Vec<u32> {
+    r.mba
+        .shared
+        .entry((root, cfg.limits.max_nodes, n as u32, whole))
+        .or_insert_with(|| match whole {
+            true => shared_nodes_whole(cx, root, &cfg.limits, n),
+            false => shared_nodes(cx, root, &cfg.limits, n, &Default::default()),
+        })
+        .clone()
 }
 
 /// Points for the always-on refutation check and for trusted sampling.
@@ -2282,7 +2310,7 @@ fn sweep_cut(
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
-    for c in shared_nodes(cx, n, &cfg.limits, SWEEP_CUTS, &Default::default()) {
+    for c in shared(r, cx, cfg, n, SWEEP_CUTS, false) {
         if let Some(e) = sweep_cut_at(r, cx, cfg, n, c)? {
             return Ok(Some(e));
         }
@@ -2540,11 +2568,14 @@ fn readings_prove(
     // Each reading with its cost, and whether a refutation of it is one of `subject` (the
     // whole fragment, no open candidate cut out of it).
     let mut readings: Vec<(u64, bool, MbaExpr, Bindings)> = Vec::new();
-    let open = &r.mba.undecided;
-    if open.contains_key(&subject) {
+    if r.mba.undecided.contains_key(&subject) {
         return Ok((false, false, false));
     }
-    let cuts = shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, open);
+    let cuts = match r.mba.undecided.is_empty() {
+        true => shared(r, cx, cfg, subject, SWEEP_CUTS, false),
+        false => shared_nodes(cx, subject, &cfg.limits, SWEEP_CUTS, &r.mba.undecided),
+    };
+    let open = &r.mba.undecided;
     let kinds = [Reading::SemiLinear, Reading::Shallow, Reading::Linear];
     let all = std::iter::once(None)
         .chain(kinds.into_iter().map(Some))
@@ -3070,7 +3101,16 @@ fn step_with(
             Some(_) => fin,
         };
         let mut fin = fin;
-        let mut slices = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
+        let asked = (n, cfg.limits.max_nodes);
+        let mut slices = match r.mba.sliced.get(&asked).copied() {
+            // (Through `build` all the same: it checks the budget, and makes no node.)
+            Some(known) => r.build(cx, |_| Ok(known))?,
+            None => {
+                let made = r.build(cx, |cx| sliced(cx, n, cfg.limits.max_nodes))?;
+                r.mba.sliced.insert(asked, made);
+                made
+            }
+        };
         if let Some(root) = slices {
             match ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))? {
                 Step::Normal(f) => fin = kept(fin, f),
@@ -3116,7 +3156,7 @@ fn step_with(
         // `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of its own, and the whole question is
         // then over what `t` is made of, where the cut one is over `t` alone.
         for root in slices.into_iter().chain([n]) {
-            let cuts = shared_nodes(cx, root, &cfg.limits, CUTS, &Default::default());
+            let cuts = shared(r, cx, cfg, root, CUTS, false);
             for c in cuts {
                 match ask(
                     r,
@@ -3138,7 +3178,7 @@ fn step_with(
         // for a fragment whose answer did that, or a side of a case split: asked of every
         // fragment kept from its question, 140 measured calls took 15% longer.
         if unshrunk || side {
-            for c in shared_nodes_whole(cx, n, &cfg.limits, CUTS) {
+            for c in shared(r, cx, cfg, n, CUTS, true) {
                 match ask(
                     r,
                     cx,
@@ -3261,12 +3301,72 @@ struct Slice {
     flip: u64,
 }
 
+/// The slices [`slice_of`] has read in one walk, by node.
+struct SliceMemo {
+    at: super::Lease,
+    slices: Vec<Slice>,
+}
+
+impl SliceMemo {
+    fn new(cx: &Context) -> SliceMemo {
+        SliceMemo {
+            at: super::Lease::new(cx.len()),
+            slices: Vec::with_capacity(64),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: u32) -> Option<Slice> {
+        self.at.get(i).map(|k| self.slices[k as usize])
+    }
+
+    #[inline]
+    fn insert(&mut self, i: u32, s: Slice) {
+        self.at.insert(i, self.slices.len() as u32);
+        self.slices.push(s);
+    }
+}
+
+/// How many parts of a fragment can be read at each rotation of each value. (Most are read
+/// unrotated, one count per node met: those are in a leased table.)
+struct Readers {
+    whole: super::Lease,
+    rotated: crate::hash::IdMap<(u32, u32), u32>,
+}
+
+impl Readers {
+    fn new(cx: &Context) -> Readers {
+        Readers {
+            whole: super::Lease::new(cx.len()),
+            rotated: crate::hash::IdMap::default(),
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, base: u32, rot: u32) {
+        if rot == 0 {
+            self.whole.bump(base);
+        } else {
+            *self.rotated.entry((base, rot)).or_default() += 1;
+        }
+    }
+
+    #[inline]
+    fn get(&self, base: u32, rot: u32) -> u32 {
+        if rot == 0 {
+            self.whole.get(base).unwrap_or(0)
+        } else {
+            self.rotated.get(&(base, rot)).copied().unwrap_or(0)
+        }
+    }
+}
+
 /// The most operators one [`slice_of`] reads below a node.
 const SLICE_DEPTH: u32 = 48;
 
 /// Node `i` as a [`Slice`]; a node that is no such function of another is its own base, whole
 /// (`rot` 0, every bit, no flip).
-fn slice_of(cx: &Context, i: u32, memo: &mut crate::hash::IdMap<u32, Slice>, depth: u32) -> Slice {
+fn slice_of(cx: &Context, i: u32, memo: &mut SliceMemo, depth: u32) -> Slice {
     let w = u32::from(cx.width_of(i).bits());
     let ones = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
     let whole = Slice {
@@ -3278,7 +3378,7 @@ fn slice_of(cx: &Context, i: u32, memo: &mut crate::hash::IdMap<u32, Slice>, dep
     if w > 64 || depth > SLICE_DEPTH {
         return whole;
     }
-    if let Some(&s) = memo.get(&i) {
+    if let Some(s) = memo.get(i) {
         return s;
     }
     let n = cx.node(i);
@@ -3406,18 +3506,25 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
         slice: Slice,
         factor: Option<u64>,
     }
-    let mut memo: crate::hash::IdMap<u32, Slice> = crate::hash::IdMap::default();
+    // (Leased tables, not hash maps and an ordered one: the walk is made at every candidate
+    // of a call and reads up to `max_nodes` nodes each time, and the maps were most of its
+    // cost.)
+    let mut memo = SliceMemo::new(cx);
     let mut parts: Vec<Part> = Vec::new();
     // How many parts can be read at each rotation of each value.
-    let mut readers: std::collections::BTreeMap<(u32, u32), u32> =
-        std::collections::BTreeMap::new();
-    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut readers = Readers::new(cx);
+    let mut seen = super::Lease::new(cx.len());
+    let mut met = 0u32;
     let mut stack = vec![n];
     while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() || cx.const_val(i).is_some() {
+        if seen.insert(i, 0) {
             continue;
         }
-        if seen.len() as u32 > max_nodes {
+        met += 1;
+        if cx.const_val(i).is_some() {
+            continue;
+        }
+        if met > max_nodes {
             return Ok(None);
         }
         let node = cx.node(i);
@@ -3436,7 +3543,7 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
             continue;
         }
         // Read as it is: one reader of itself, unrotated.
-        *readers.entry((i, 0)).or_default() += 1;
+        readers.add(i, 0);
         if mixed_op(node.op) {
             if node.op == OpCode::Mul && cx.width_of(i).bits() <= 64 {
                 let konst = |j: u32| cx.const_val(j).and_then(|c| c.to_u64());
@@ -3495,7 +3602,7 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     };
     for p in &parts {
         for (s, _) in readings(cx, p) {
-            *readers.entry((s.base, s.rot)).or_default() += 1;
+            readers.add(s.base, s.rot);
         }
     }
     // A slice as a node over its rotation.
@@ -3527,7 +3634,7 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
         // The rotation the most parts read, the part's own first among equals.
         let best = readings(cx, p)
             .into_iter()
-            .map(|(s, k)| (readers.get(&(s.base, s.rot)).copied().unwrap_or(0), s, k))
+            .map(|(s, k)| (readers.get(s.base, s.rot), s, k))
             .filter(|(votes, _, _)| *votes >= 2)
             .min_by_key(|(votes, _, k)| (u32::MAX - votes, *k));
         let Some((_, s, k)) = best else {
@@ -3634,13 +3741,13 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
         return None;
     }
     let mut found = None;
-    let mut seen: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut seen = super::Lease::new(cx.len());
     for &a in &bindings.atoms {
-        seen.insert(a, ());
+        seen.insert(a, 0);
     }
     let mut stack: Vec<u32> = cx.node(root).children().collect();
     while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() {
+        if seen.insert(i, 0) {
             continue;
         }
         if r.mba.kept.contains_key(&i) {

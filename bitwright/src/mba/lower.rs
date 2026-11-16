@@ -1,6 +1,7 @@
 //! Lowering from the arena into an [`MbaExpr`], and lifting back.
 
 use super::expr::{MNode, MOp, MbaExpr};
+use crate::engine::pass::Lease;
 use crate::error::Error;
 use crate::expr::{Context, Expr, OpCode};
 use crate::hash::IdMap;
@@ -295,12 +296,12 @@ pub(crate) fn lower_id_over(
         let (atoms, order) = scan_in(cx, root, lim, &|cx, i| free(i) && in_fragment(cx, i))?;
         return build(cx, atoms, order, &[]);
     };
-    let inside = |cx: &Context, i: u32, under: Option<&IdMap<u32, ()>>| {
+    let inside = |cx: &Context, i: u32, under: Option<&Lease>| {
         free(i)
             && match reading {
                 Reading::Shallow => {
                     in_reading(cx, i, Reading::SemiLinear)
-                        && (bitwise_or_const(cx, i) || under.is_none_or(|u| !u.contains_key(&i)))
+                        && (bitwise_or_const(cx, i) || under.is_none_or(|u| !is_under(u, i)))
                 }
                 Reading::Cut(cut) => i != cut && in_reading(cx, i, Reading::SemiLinear),
                 Reading::CutWhole(cut) => i != cut && in_fragment(cx, i),
@@ -441,23 +442,35 @@ fn shared_in(
                 false => in_reading(cx, i, Reading::SemiLinear),
             }
     };
-    let mut users: IdMap<u32, u32> = IdMap::default();
-    let mut seen: IdMap<u32, ()> = IdMap::default();
+    // (Leased tables: this is asked of every candidate, and hash maps grown from empty for
+    // each were a quarter of a large expression's run. The order the users are listed in is
+    // of no account: they are sorted, and no two are equal.)
+    let mut users = Lease::new(cx.len());
+    let mut used: Vec<u32> = Vec::new();
+    let mut seen = Lease::new(cx.len());
+    let mut met = 0u32;
     let mut stack = vec![root];
     while let Some(i) = stack.pop() {
-        if seen.insert(i, ()).is_some() || seen.len() as u32 > lim.max_nodes {
+        if seen.insert(i, 0) {
+            continue;
+        }
+        met += 1;
+        if met > lim.max_nodes {
             continue;
         }
         if !inside(i) {
             continue;
         }
         for c in cx.node(i).children() {
-            *users.entry(c).or_default() += 1;
+            if !users.bump(c) {
+                used.push(c);
+            }
             stack.push(c);
         }
     }
-    let mut v: Vec<(u32, u32)> = users
+    let mut v: Vec<(u32, u32)> = used
         .into_iter()
+        .map(|i| (i, users.get(i).unwrap_or(0)))
         .filter(|&(i, k)| k >= 2 && cx.const_val(i).is_none() && inside(i))
         .filter(|&(i, _)| cx.node(i).op != OpCode::Not)
         .map(|(i, k)| (k, i))
@@ -476,24 +489,27 @@ fn bitwise_or_const(cx: &Context, i: u32) -> bool {
 
 /// The nodes of the semi-linear fragment below `root` that a bitwise operator of it reads
 /// (directly, or through other bitwise operators); the fragment ends at the nodes of `opaque`.
+///
+/// A node's number in the table says how it was met: 1 as it is, 2 under a bitwise operator
+/// ([`is_under`]), 3 both ways.
 fn under_bitwise(
     cx: &Context,
     root: u32,
     lim: &MbaLimits,
     opaque: &IdMap<u32, ()>,
-) -> Result<IdMap<u32, ()>, Refusal> {
-    let mut under: IdMap<u32, ()> = IdMap::default();
-    let mut seen: IdMap<(u32, bool), ()> = IdMap::default();
+) -> Result<Lease, Refusal> {
+    let mut seen = Lease::new(cx.len());
+    let mut met = 0u32;
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, bw)) = stack.pop() {
-        if seen.insert((i, bw), ()).is_some() {
+        let (was, way) = (seen.get(i).unwrap_or(0), 1 << u32::from(bw));
+        if was & way != 0 {
             continue;
         }
-        if seen.len() as u32 > lim.max_nodes.saturating_mul(2) {
+        seen.insert(i, was | way);
+        met += 1;
+        if met > lim.max_nodes.saturating_mul(2) {
             return Err(Refusal::TooLarge);
-        }
-        if bw {
-            under.insert(i, ());
         }
         let bitwise = bitwise_or_const(cx, i);
         // Arithmetic read by a bitwise operator is an atom: nothing below it is read here.
@@ -507,7 +523,12 @@ fn under_bitwise(
             stack.push((c, bitwise));
         }
     }
-    Ok(under)
+    Ok(seen)
+}
+
+/// Whether [`under_bitwise`] met `i` under a bitwise operator.
+fn is_under(under: &Lease, i: u32) -> bool {
+    under.get(i).is_some_and(|way| way & 2 != 0)
 }
 
 /// The expression over `atoms` that the fragment's nodes `order` (operands first) compute,

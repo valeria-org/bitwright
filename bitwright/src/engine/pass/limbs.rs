@@ -566,13 +566,29 @@ pub(super) fn joined_over(
     let mut bases: Vec<u32> = all.iter().map(|p| p.base).collect();
     bases.sort_by(|a, b| cx.order(*a, *b));
     bases.dedup();
-    let at = |b: u32| bases.iter().position(|&x| x == b).unwrap_or(0);
-    let shared = (0..bases.len()).any(|b| {
-        read.iter()
-            .filter(|t| all[t.2.clone()].iter().any(|p| at(p.base) == b))
-            .count()
-            > 1
-    });
+    // (Where each value is in `bases`, in a table: found by a search of `bases` for every
+    // piece, under a count over the terms for every value, a sum of a few hundred terms took
+    // most of the pass's time here.)
+    let mut index = super::Lease::new(cx.len());
+    for (k, &b) in bases.iter().enumerate() {
+        index.insert(b, k as u32);
+    }
+    let at = |b: u32| index.get(b).unwrap_or(0) as usize;
+    // Whether two terms read one value.
+    let shared = {
+        let mut readers = vec![0u32; bases.len()];
+        let mut last = vec![usize::MAX; bases.len()];
+        for (x, t) in read.iter().enumerate() {
+            for p in &all[t.2.clone()] {
+                let b = at(p.base);
+                if last[b] != x {
+                    last[b] = x;
+                    readers[b] += 1;
+                }
+            }
+        }
+        readers.iter().any(|&k| k > 1)
+    };
     if !shared && tops.is_empty() && read.iter().all(|t| !t.2.is_empty()) {
         discard(r, cx, before);
         return Ok(None);
@@ -588,14 +604,17 @@ pub(super) fn joined_over(
         }
     }
     let mut found: Vec<Run> = Vec::new();
+    // The pieces of each value, in the order the terms read them.
+    let mut on_base: Vec<Vec<(Piece, u64)>> = vec![Vec::new(); bases.len()];
+    for t in &read {
+        for p in &all[t.2.clone()] {
+            on_base[at(p.base)].push((*p, shl(t.1, p.at)));
+        }
+    }
     for (b, &base) in bases.iter().enumerate() {
-        let on: Vec<(Piece, u64)> = read
-            .iter()
-            .flat_map(|t| all[t.2.clone()].iter().map(|p| (*p, shl(t.1, p.at))))
-            .filter(|(p, _)| p.base == base)
-            .collect();
+        let on = &on_base[b];
         let first = found.len();
-        runs(base, &on, j, &mut found);
+        runs(base, on, j, &mut found);
         for run in &mut found[first..] {
             run.of = b;
         }

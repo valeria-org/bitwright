@@ -166,8 +166,8 @@ struct Cone {
 
 fn cone(cx: &Context, n: u32) -> Cone {
     let mut nodes = vec![n];
-    let mut seen = IdMap::default();
-    seen.insert(n, ());
+    let mut seen = super::Lease::new(cx.len());
+    seen.insert(n, 0);
     let mut cuts: Vec<u16> = Vec::new();
     let mut compares = false;
     let mut at = 0;
@@ -201,7 +201,7 @@ fn cone(cx: &Context, n: u32) -> Cone {
             _ => {}
         }
         for c in node.children() {
-            if seen.insert(c, ()).is_none() {
+            if !seen.insert(c, 0) {
                 nodes.push(c);
             }
         }
@@ -223,16 +223,16 @@ fn cone(cx: &Context, n: u32) -> Cone {
 }
 
 /// Whether a comparison is below `i`, among the nodes of `below` (a cone's).
-fn holds_compare(cx: &Context, i: u32, memo: &mut IdMap<u32, bool>) -> bool {
-    if let Some(&v) = memo.get(&i) {
-        return v;
+fn holds_compare(cx: &Context, i: u32, memo: &mut super::Lease) -> bool {
+    if let Some(v) = memo.get(i) {
+        return v != 0;
     }
     // (Marked first: the DAG has no cycles, and a node met again while open is below itself
     // in no way.)
-    memo.insert(i, false);
+    memo.insert(i, 0);
     let node = cx.node(i);
     let v = node.op == OpCode::Ult || node.children().any(|c| holds_compare(cx, c, memo));
-    memo.insert(i, v);
+    memo.insert(i, u32::from(v));
     v
 }
 
@@ -242,13 +242,15 @@ fn holds_compare(cx: &Context, i: u32, memo: &mut IdMap<u32, bool>) -> bool {
 /// the candidate at most four cones' worth is walked: a node of the cone further down counts
 /// as the question's own.)
 fn own(cx: &Context, cone: &Cone, below: &[u32]) -> (Vec<u32>, u64) {
-    let mut seen: IdMap<u32, ()> = IdMap::default();
+    let mut seen = super::Lease::new(cx.len());
+    let mut met = 0usize;
     let mut stack = below.to_vec();
     while let Some(i) = stack.pop() {
-        if seen.len() >= 4 * MAX_CONE {
+        if met >= 4 * MAX_CONE {
             break;
         }
-        if seen.insert(i, ()).is_none() {
+        if !seen.insert(i, 0) {
+            met += 1;
             stack.extend(cx.node(i).children());
         }
     }
@@ -260,10 +262,10 @@ fn own(cx: &Context, cone: &Cone, below: &[u32]) -> (Vec<u32>, u64) {
             matches!(
                 cx.node(*i).op,
                 OpCode::Add | OpCode::Sub | OpCode::Ult | OpCode::Eq
-            ) && !seen.contains_key(i)
+            ) && !seen.contains(*i)
         })
         .collect();
-    (nodes, (seen.len() + cone.nodes.len()) as u64)
+    (nodes, (met + cone.nodes.len()) as u64)
 }
 
 /// Whether a proof copies `i` as a fresh symbol (see the module): a product, or a shift by a
@@ -361,11 +363,11 @@ fn asked(
     if let Some(uncut) = uncut {
         // The highest opaque nodes below the two, in the order a walk meets them. (Keys no
         // symbol of the context has: the copy shares its symbols.)
-        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut seen = super::Lease::new(cx.len());
         let mut stack: Vec<u32> = word.operands().skip(1).chain([word.a, s]).collect();
         let mut key = 0u64;
         while let Some(i) = stack.pop() {
-            if seen.insert(i, ()).is_some() {
+            if seen.insert(i, 0) {
                 continue;
             }
             if !opaque(cx, i) || uncut.contains_key(&i) {
@@ -744,7 +746,7 @@ fn made(
     // The sum read without its constants: the same over another constant is no other word
     // (and so a word made is never made again from its own slice).
     let base = terms(cx, s).0;
-    let mut memo = IdMap::default();
+    let mut memo = super::Lease::new(cx.len());
     let tree = |i: u32| cx.meta[i as usize].tree;
     // (size, the word, its offset)
     let mut found: Vec<(u32, Word, u16)> = Vec::new();
@@ -910,7 +912,7 @@ pub(super) fn fitted(
     offsets.sort_unstable();
     offsets.dedup();
     let mut fits: Vec<Fit> = Vec::new();
-    let mut memo = IdMap::default();
+    let mut memo = super::Lease::new(cx.len());
     for &b in &cone.nodes {
         let bw = cx.wid(b);
         if b == n || !word(cx.node(b).op) || bw > 64 {
