@@ -3177,6 +3177,34 @@ pub(super) fn step_part(
     ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))
 }
 
+/// The MBA phase at `n`, one of the two cofactor sums of a sum multiplied out over a factor
+/// its products share (see `linear::by_multiplicand`): asked with the arithmetic its
+/// bitwise operators read as atoms first ([`Reading::Shallow`]), then whole, each within the
+/// steps a retried question takes (see [`CUT_STEPS`]). The sum is linear over the atoms of
+/// its terms, which is the first question; the whole one is over what those atoms are made
+/// of, and is the same question where they are variables.
+pub(super) fn step_cofactor(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+) -> Result<Step, Stop> {
+    let poly = r.inner.mba.solver.polynomial_fragments();
+    let op = cx.node(n).op;
+    if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let shallow = Some(Reading::Shallow);
+    let fin = match ask(r, cx, cfg, n, n, shallow, Cap::Steps(CUT_STEPS))? {
+        Step::Normal(f) => f,
+        to => return Ok(to),
+    };
+    Ok(match ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))? {
+        Step::Normal(f) => Step::Normal(fin.and(f)),
+        to => to,
+    })
+}
+
 /// The steps a question takes at most, besides the call's share (see [`SOLVE_SHARE`]).
 #[derive(Copy, Clone)]
 enum Cap {

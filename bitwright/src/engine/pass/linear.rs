@@ -1776,6 +1776,223 @@ pub(super) fn by_factor(
     commit_factored(r, cx, PassKind::Mba, n, &common, inner, &rest, before, fin).map(Some)
 }
 
+/// The most terms of a value the factors of [`by_multiplicand`] are read over.
+#[cfg(feature = "mba")]
+const BASE_TERMS: usize = 8;
+
+/// The non-constant part of `form` as `α · base`, `base`'s terms: the coefficients divided
+/// by the power of two they share and by the odd part of the first of them, which is 1 in
+/// `base`, so two forms that differ by a constant and an odd scale have one `base`. `None`
+/// for a constant or a form of more than [`BASE_TERMS`] terms.
+#[cfg(feature = "mba")]
+fn scaled_base(form: &Form) -> Option<(BitVec, Vec<(u32, BitVec)>)> {
+    use crate::facts::known::{bv_lshr, bv_shl, trailing_zeros};
+    let (_, k0) = *form.terms.first()?;
+    if form.terms.len() > BASE_TERMS {
+        return None;
+    }
+    let shared = form.terms.iter().map(|(_, k)| trailing_zeros(k)).min()?;
+    let odd = bv_lshr(&k0, trailing_zeros(&k0));
+    // (Most factors are the value itself or the value and a constant: no division.)
+    if shared == 0 && odd == BitVec::one(odd.width()) {
+        return Some((odd, form.terms.clone()));
+    }
+    let inverse = crate::invert::mul_inverse(&odd)?;
+    let base = (form.terms.iter())
+        .map(|(a, k)| {
+            let k = BitVec::bin_unchecked(BinOp::Mul, &bv_lshr(k, shared), &inverse);
+            (*a, k)
+        })
+        .collect();
+    Some((bv_shl(&odd, shared), base))
+}
+
+/// A value the factors of a sum's products are read over (see [`by_multiplicand`]).
+#[cfg(feature = "mba")]
+struct Base {
+    /// Its terms (see [`scaled_base`]).
+    terms: Vec<(u32, BitVec)>,
+    /// How many products have a factor over it.
+    products: u32,
+    /// Whether one of those factors is not the value itself.
+    other: bool,
+}
+
+/// A product of a sum, as [`by_multiplicand`] reads it.
+#[cfg(feature = "mba")]
+struct Multiplied {
+    /// Its constant.
+    konst: BitVec,
+    /// Its other factors.
+    factors: Vec<u32>,
+    /// Of each factor the value it is affine in (its place among the [`Base`]s) with the
+    /// scale and the offset (`α`, `β`); `None` for a factor over no one value.
+    affine: Vec<Option<(usize, BitVec, BitVec)>>,
+}
+
+/// the sum `n` with the products that have a factor affine in one value `t`
+/// (`(αᵢ·t + βᵢ)·gᵢ`, each with its coefficient) multiplied out over that factor:
+/// `t·Σ αᵢ·gᵢ + (Σ βᵢ·gᵢ + rest)`, each of the two sums simplified by `part` (the MBA
+/// phase). `t` is the value most products have such a factor over, an atom of the linear
+/// forms or a sum of several (see [`scaled_base`]); a factor that is `t` itself is one of
+/// them (`α = 1`, `β = 0`).
+///
+/// An obfuscator multiplies a linear MBA term by term with values it derives from one
+/// value: `(c₁·t + k₁)·(~r ^ y) + (c₂·t + k₂)·(~r & ~y) + ~y·(c₃·(y & r) + k₃)` over a
+/// `y = k − t`. The whole is a polynomial over what `t` is made of, a question as large as
+/// `t` is; the two cofactor sums are linear MBAs over the atoms of the `gᵢ` alone, and a
+/// variable every `gᵢ` reads (`r`) that the sum does not depend on is gone from each.
+/// `x·a + x·~a` is the smallest case: the cofactor sum `a + ~a` is `−1`.
+///
+/// The two sums are `n` by the ring laws alone, whatever `part` makes of them, and the
+/// result is committed by the commit rule. `None` when fewer than two products have a
+/// factor over one value, or every such factor is the value itself (see [`by_factor`]).
+#[cfg(feature = "mba")]
+pub(super) fn by_multiplicand(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let form = form_of(r, cx, n)?;
+    if form.terms.len() < 2 || form.terms.len() > FACTOR_TERMS {
+        return Ok(None);
+    }
+    // (Read only where two terms are products of values: most sums have none.)
+    let product = |t: u32| {
+        let node = cx.node(t);
+        node.op == OpCode::Mul && !cx.is_const(node.a) && !cx.is_const(node.b)
+    };
+    if form.terms.iter().filter(|(t, _)| product(*t)).count() < 2 {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
+    let w = form.konst.width();
+    let one = BitVec::one(w);
+    // The values the factors are read over.
+    let mut bases: Vec<Base> = Vec::new();
+    let mut products: Vec<Option<Multiplied>> = Vec::with_capacity(form.terms.len());
+    let mut fin = form.fin;
+    for &(t, _) in &form.terms {
+        let Some((c, factors)) = scaled_factors(cx, t).filter(|(_, f)| f.len() >= 2) else {
+            products.push(None);
+            continue;
+        };
+        let mut affine: Vec<Option<(usize, BitVec, BitVec)>> = Vec::with_capacity(factors.len());
+        for &f in &factors {
+            let ff = form_of(r, cx, f)?;
+            r.meter.charge(Counter::PassWork, ff.terms.len() as u64)?;
+            let Some((alpha, base)) = scaled_base(&ff) else {
+                affine.push(None);
+                continue;
+            };
+            fin = fin.and(ff.fin);
+            let other = alpha != one || !ff.konst.is_zero();
+            let at = match bases.iter().position(|b| b.terms == base) {
+                Some(at) => at,
+                None => {
+                    bases.push(Base {
+                        terms: base,
+                        products: 0,
+                        other: false,
+                    });
+                    bases.len() - 1
+                }
+            };
+            let first = !affine.iter().any(|x| x.is_some_and(|(b, ..)| b == at));
+            bases[at].products += u32::from(first);
+            bases[at].other |= other;
+            affine.push(Some((at, alpha, ff.konst)));
+        }
+        products.push(Some(Multiplied {
+            konst: c,
+            factors,
+            affine,
+        }));
+    }
+    // The value most products have a factor over (the first met among equals).
+    let Some(at) = (0..bases.len())
+        .filter(|&i| bases[i].products >= 2 && bases[i].other)
+        .max_by_key(|&i| (bases[i].products, core::cmp::Reverse(i)))
+    else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let base = emit(r, cx, &Form::of(BitVec::zero(w), &bases[at].terms))?;
+    // `base · scaled + offset`: the cofactors by their factors' scales, and by their offsets
+    // with the terms that have no factor over the value.
+    let mut scaled = Form::of(BitVec::zero(w), &[]);
+    let mut offset = Form::of(form.konst, &[]);
+    for (p, &(term, k)) in products.into_iter().zip(&form.terms) {
+        let split = p.and_then(|p| {
+            let j = (p.affine.iter()).position(|a| a.is_some_and(|(b, ..)| b == at))?;
+            let (_, alpha, beta) = p.affine[j]?;
+            Some((p.konst, p.factors, j, alpha, beta))
+        });
+        let Some((c, factors, j, alpha, beta)) = split else {
+            offset = offset.add(&Form::of(BitVec::zero(w), &[(term, k)]));
+            continue;
+        };
+        let mut rest: Option<u32> = None;
+        for (i, &f) in factors.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            rest = Some(match rest {
+                None => f,
+                Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Mul, a, f))?,
+            });
+        }
+        let Some(rest) = rest else {
+            super::discard(r, cx, before);
+            return Ok(None);
+        };
+        let g = form_of(r, cx, rest)?;
+        let k = BitVec::bin_unchecked(BinOp::Mul, &k, &c);
+        scaled = scaled.add(&g.scale(&BitVec::bin_unchecked(BinOp::Mul, &k, &alpha)));
+        offset = offset.add(&g.scale(&BitVec::bin_unchecked(BinOp::Mul, &k, &beta)));
+    }
+    fin = fin.and(scaled.fin).and(offset.fin);
+    let mut simplified = |r: &mut Runner<'_, '_>, cx: &mut Context, f: &Form| {
+        let e = emit(r, cx, f)?;
+        if f.terms.is_empty() {
+            return Ok::<u32, Stop>(e);
+        }
+        Ok(part(r, cx, e)?.unwrap_or(e))
+    };
+    let a = simplified(r, cx, &scaled)?;
+    let b = simplified(r, cx, &offset)?;
+    // `base · a + b`, as one sum: a cofactor sum that is a constant scales `base`, whose
+    // terms then meet the ones of `b`.
+    let product = match cx.const_val(a) {
+        Some(c) => form_of(r, cx, base)?.scale(&c),
+        None => {
+            let m = r.build(cx, |cx| cx.c_bin(BinOp::Mul, base, a))?;
+            form_of(r, cx, m)?
+        }
+    };
+    let total = product.add(&form_of(r, cx, b)?);
+    fin = fin.and(total.fin);
+    let e = emit(r, cx, &total)?;
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if i < before {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
+}
+
 /// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
 /// themselves bitwise (constants aside), or `e` itself when it is not bitwise; `None` past a
 /// few hundred nodes.

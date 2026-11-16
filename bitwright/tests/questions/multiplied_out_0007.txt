@@ -1,0 +1,49 @@
+# kind: constant
+# config: prove conflicts=2000 propagations=20000 nodes=200000 simplify=true fuel=16384
+# deep fuel: 524288
+# sampled: 0x0
+# ms: 0
+# nodes: 234
+# atom #3: Reg(3, 0)
+# atom #8: Reg(8, 0)
+# atom #15: Reg(15, 0)
+# atom #7052: Stack(-2104)
+# atom #7063: Stack(-1904)
+# atom #7064: Stack(-1872)
+# atom #7630: Event { node: 2, seq: 4194304, res: 0 }
+## root 0
+let %0 = #7630:64 + 0x8ee2ac4793b2d847;
+let %1 = %0 ^ 0x39d278f033475355;
+let %2 = umulhi(%0 * %1 ^ umulhi(%0, %1), 10);
+let %3 = ~(~%0 & 0xc62d870fccb8acaa) & ~(%0 & 0x39d278f033475355);
+let %4 = %3 * 0x8ee2ac4793b2d847 + %3 * #7630 ^ trunc<64>(concat(umulhi(%0, %3), %0 * %3) >>u 64);
+let %5 = trunc<64>(concat(umulhi(%4, 10), %4 * 10) >>u 64);
+let %6 = (trunc<8>(%5 - 4 >>u 63) ^ 1) & zext<8>(%5 * -1 + 4 != 0) != 0;
+let %7 = ~%5;
+let %8 = ~(%7 & 0x10775f79dfff86bd) & 0xefe9adf66feb7fff;
+let %9 = %8 << 31;
+let %10 = %8 >>u 33;
+let %11 = (%5 | 0x8c4f54812500098) & 0xbfd7fdf8dff7effc;
+let %12 = ~((~(~(%5 & 0x606719e7130605ab) & ~(%7 & 0x9f98e618ecf9fa54) & #15:64) & ~(~#15 & (%5 ^ 0x9f98e618ecf9fa54))) * %11 + %11 * (%5 ^ #15 ^ 0x9f98e618ecf9fa54)) + 1;
+let %13 = %12 << 31;
+let %14 = %12 >>u 33;
+let %15 = select(%6, %9 | %10, %13 | %14) + 0x18bcd4f6d7a9c121;
+let %16 = ~(~%15 & 0xe018c1cf57b7f0ce) & ~(%15 & 0x1fe73e30a8480f31);
+let %17 = select(%6, %10, %14);
+let %18 = select(%6, %9, %13);
+let %19 = ~(%16 * (~(~(~%17 & %18) & ~(~%18 & %17) & #7052:64) & ~(~#7052 & select(%6, %9 ^ %10, %13 ^ %14))) + %16 * (%18 ^ #7052 ^ %17));
+let %20 = %19 + 0x6141ccaba0205ce7;
+let %21 = %20 & #3:64;
+let %22 = ~%20;
+let %23 = %20 * #3;
+let %24 = ~#3;
+let %25 = %24 & %22;
+let %26 = ~%21;
+let %27 = select((%2 == 0) | (%2 == 1) | (%2 == 2) | (%2 == 3) | (%2 == 4), %19 * 0xb6db6db6db6db6dc + %20 * %21 * 0x9249249249249249 + %20 * (%22 ^ #3) * 0x9249249249249249 + %23 * 0x6db6db6db6db6db7 + %23 * 0xb6db6db6db6db6db + %20 * (%25 | %21) * 0x6db6db6db6db6db7 + %26 * %20 * 0xb6db6db6db6db6db + (%19 * 0x2492492492492492 + 0x2d5aea181b6477be) * (%24 & %20) + (%19 * 0xdb6db6db6db6db6e + 0xd2a515e7e49b8842) * (%26 & ~%25) + 0xa54a2bcfc9371084, #7063:64) + 0x9ebe33545fdfa31a;
+let %28 = ((%27 | 0x1fe73e30a8480f31) & (~%27 | 0xe018c1cf57b7f0ce)) + 0xe7432b0928563edf;
+let %29 = (~(~(%28 << 33) & ~(%28 >>u 31)) | 0xfffb7af7ffbffff7) * 0x1b04c2327baeae81;
+let %30 = (#8:64 ^ 0xffff6ffa00001a70) & 0xa0b578f6b6d926b;
+let %31 = trunc<32>(%29 * %30 + ~%30 * %29);
+let %32 = trunc<32>(#7064:64);
+let %33 = %32 >>u 31;
+%31 * 0xbeb8dcfe + %33 + (%31 * 0x85e8dbf3 + %32 >>u 31 ^ %33) == 0

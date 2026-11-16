@@ -1,0 +1,38 @@
+# kind: constant
+# config: prove conflicts=2000 propagations=20000 nodes=200000 simplify=true fuel=16384
+# deep fuel: 524288
+# sampled: 0x0
+# ms: 0
+# nodes: 168
+# atom #3: Reg(3, 0)
+# atom #15: Reg(15, 0)
+# atom #7052: Stack(-2104)
+# atom #7630: Event { node: 2, seq: 4194304, res: 0 }
+## root 0
+let %0 = #7630:64 + 0x8ee2ac4793b2d847;
+let %1 = ~(~%0 & 0xc62d870fccb8acaa) & ~(%0 & 0x39d278f033475355);
+let %2 = %1 * 0x8ee2ac4793b2d847 + %1 * #7630 ^ trunc<64>(concat(umulhi(%0, %1), %0 * %1) >>u 64);
+let %3 = trunc<64>(concat(umulhi(%2, 10), %2 * 10) >>u 64);
+let %4 = zext<8>(%3 * -1 + 4 != 0) != 0;
+let %5 = ~(~%3 & 0x10775f79dfff86bd) & 0xefe9adf66feb7fff;
+let %6 = %5 << 31;
+let %7 = %5 >>u 33;
+let %8 = (%3 | 0x8c4f54812500098) & 0xbfd7fdf8dff7effc;
+let %9 = %3 ^ #15:64 ^ 0x9f98e618ecf9fa54;
+let %10 = ~(%8 * (~(~#15 & (%3 ^ 0x9f98e618ecf9fa54)) & ~(%9 & #15)) + %8 * %9) + 1;
+let %11 = %10 << 31;
+let %12 = %10 >>u 33;
+let %13 = select(%4, %6 | %7, %11 | %12) + 0x18bcd4f6d7a9c121;
+let %14 = ~(%13 & 0x1fe73e30a8480f31) & ~(~%13 & 0xe018c1cf57b7f0ce);
+let %15 = select(%4, %7, %12);
+let %16 = select(%4, %6, %11);
+let %17 = ~(%14 * (~(~(~%15 & %16) & ~(~%16 & %15) & #7052:64) & ~(~#7052 & select(%4, %6 ^ %7, %11 ^ %12))) + %14 * (%16 ^ #7052 ^ %15));
+let %18 = %17 + 0x6141ccaba0205ce7;
+let %19 = %18 * #3:64;
+let %20 = ~%18;
+let %21 = %20 ^ #3;
+let %22 = %21 & #3;
+let %23 = %20 & %21;
+let %24 = ~%22;
+let %25 = %17 * 0xb6db6db6db6db6dc + (%17 * 0x2492492492492492 + 0x2d5aea181b6477be) * (~#3 & %18) + %19 * 0xb6db6db6db6db6db + %19 * 0x6db6db6db6db6db7 + %18 * %21 * 0x9249249249249249 + %18 * %22 * 0x9249249249249249 + %18 * (%22 | %23) * 0x6db6db6db6db6db7 + %24 * %18 * 0xb6db6db6db6db6db + (%17 * 0xdb6db6db6db6db6e + 0xd2a515e7e49b8842) * (~%23 & %24) + 0x44085f242916b39e;
+trunc<32>(((%25 | 0x1fe73e30a8480f31) & (~%25 | 0xe018c1cf57b7f0ce)) + 0xe7432b0928563edf) >>u 20 & 1
