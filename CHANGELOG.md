@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.6
 
 - **MBA phase: a sum of products multiplied out over a factor affine in one value.** A sum
   whose products each have a factor `αᵢ·t + βᵢ` over one value `t` (any subterm: an atom of
