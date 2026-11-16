@@ -922,20 +922,28 @@ impl Context {
             return Ok(roots.to_vec());
         }
         let order = self.post_order_ids_pruned(roots, |e| repl.contains_key(&e.index()));
-        let mut new = repl.clone();
+        // What each node becomes: a replaced node what `repl` says, a node walked what it was
+        // rebuilt into (itself where no operand changed), in a leased table. (The walk is of
+        // everything below the roots, and a copy of `repl` grown to that was a hash map of
+        // the whole expression for every substitution.)
+        let mut new = crate::engine::pass::Lease::new(self.len());
+        let became = |new: &crate::engine::pass::Lease, c: u32| match new.get(c) {
+            Some(r) => r,
+            None => repl[&c],
+        };
         for i in order {
             let n = self.node(i);
             let mut kids = [n.a, n.b, n.c];
             let mut changed = false;
             for (k, c) in n.children().enumerate() {
-                let nc = new[&c];
+                let nc = became(&new, c);
                 changed |= nc != c;
                 kids[k] = nc;
             }
             let r = if changed { self.rebuild(i, kids)? } else { i };
             new.insert(i, r);
         }
-        Ok(roots.iter().map(|r| new[r]).collect())
+        Ok(roots.iter().map(|&r| became(&new, r)).collect())
     }
 }
 
