@@ -84,7 +84,7 @@ impl<S: MbaSolver + 'static> MbaSolver for ThreadedSolver<S> {
         // One state per question, decided once: whoever moves it out of RUNNING first wins.
         let state = Arc::new(AtomicU8::new(RUNNING));
         let st = state.clone();
-        let spawned = std::thread::Builder::new()
+        let spawned = crate::threads::builder()
             .name("bitwright-mba".into())
             .spawn(move || {
                 // A panic in the solver is an answer, not a lost question.

@@ -288,7 +288,7 @@ pub(in crate::prove) fn stripes(total: u64, stripe: u64, work: impl Fn(u64, u64)
     std::thread::scope(|scope| {
         for _ in 1..threads {
             // A target without threads still finishes every stripe on the calling thread.
-            if std::thread::Builder::new()
+            if crate::threads::builder()
                 .spawn_scoped(scope, worker)
                 .is_err()
             {
