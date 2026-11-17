@@ -109,7 +109,7 @@ and array sorts, and the engine's size-only commit rule are limits to lift, not 
 ## 2. Workspace, features, dependencies
 
 ```text
-bitwright/                       workspace; edition 2024; rust-version 1.88; PolyForm-Noncommercial-1.0.0
+bitwright/                       workspace; edition 2024; rust-version 1.100; PolyForm-Noncommercial-1.0.0
 ├─ bitwright/                    the library (published)
 │  ├─ src/value/                 Width, BitVec, u64/u128/wide kernels
 │  ├─ src/ops.rs                 operator kinds, typing, semantics metadata
@@ -1887,7 +1887,7 @@ casts, compares), each with new admission tests.
 
 ## 11. Stability
 
-- The crate stays 0.x until the API has been used in production for a release cycle. MSRV 1.88; raising
+- The crate stays 0.x until the API has been used in production for a release cycle. MSRV 1.100; raising
   it is a minor-version change. `cargo-semver-checks` runs in CI.
 - Every public enum and configuration struct is `#[non_exhaustive]`, and so is every record the
   library returns (outcomes, reports, diagnostics, the rule IR). The one exception is a closed

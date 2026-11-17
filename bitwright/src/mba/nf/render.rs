@@ -19,44 +19,80 @@ use crate::mba::solve::Verdict;
 use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BOp {
+    ConstSmall = 0,
+    ConstWide,
+    Var,
+    Add,
+    Sub,
+    Mul,
+    Neg,
+    And,
+    Or,
+    Xor,
+    Not,
+    Shl,
+    LShr,
+    Zext,
+    Sext,
+    Trunc,
+}
+
+impl BOp {
+    fn arity(self) -> usize {
+        match self {
+            BOp::ConstSmall | BOp::ConstWide | BOp::Var => 0,
+            BOp::Neg | BOp::Not | BOp::Shl | BOp::LShr | BOp::Zext | BOp::Sext | BOp::Trunc => 1,
+            _ => 2,
+        }
+    }
+
+    fn from_mop(op: &MOp) -> (BOp, u16) {
+        match *op {
+            MOp::Const(_) => (BOp::ConstSmall, 0),
+            MOp::Var(_) => (BOp::Var, 0),
+            MOp::Add => (BOp::Add, 0),
+            MOp::Sub => (BOp::Sub, 0),
+            MOp::Mul => (BOp::Mul, 0),
+            MOp::Neg => (BOp::Neg, 0),
+            MOp::And => (BOp::And, 0),
+            MOp::Or => (BOp::Or, 0),
+            MOp::Xor => (BOp::Xor, 0),
+            MOp::Not => (BOp::Not, 0),
+            MOp::Shl(k) => (BOp::Shl, k),
+            MOp::LShr(k) => (BOp::LShr, k),
+            MOp::Zext => (BOp::Zext, 0),
+            MOp::Sext => (BOp::Sext, 0),
+            MOp::Trunc => (BOp::Trunc, 0),
+        }
+    }
+}
+
+/// Compact 16-byte builder node (instead of 88-byte inline `MOp` / `BitVec`).
+/// - `ConstSmall`: `args` holds `[lo32, hi32]` of a 64-bit canonical value.
+/// - `ConstWide`: `args[0]` indexes `Builder::wide_consts`.
+/// - `Var`: `args[0]` holds the variable index.
+/// - `Shl` / `LShr`: `shift` holds the shift count, `args[0]` the operand.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct BNode {
-    op: MOp,
+    op: BOp,
+    shift: u16,
     w: Width,
     args: [u32; 2],
 }
 
+const _: () = assert!(core::mem::size_of::<BNode>() == 16);
+
 impl BNode {
-    /// A hash of the node (interning hashes every node built): one word mixed, and a
-    /// constant's significant limbs.
+    /// A hash of the node (interning hashes every node built): one word mixed.
+    #[inline]
     fn hash(&self) -> u64 {
-        let (tag, extra) = match self.op {
-            MOp::Const(_) => (0u64, 0u64),
-            MOp::Var(i) => (1, u64::from(i)),
-            MOp::Add => (2, 0),
-            MOp::Sub => (3, 0),
-            MOp::Mul => (4, 0),
-            MOp::Neg => (5, 0),
-            MOp::And => (6, 0),
-            MOp::Or => (7, 0),
-            MOp::Xor => (8, 0),
-            MOp::Not => (9, 0),
-            MOp::Shl(k) => (10, u64::from(k)),
-            MOp::LShr(k) => (11, u64::from(k)),
-            MOp::Zext => (12, 0),
-            MOp::Sext => (13, 0),
-            MOp::Trunc => (14, 0),
-        };
-        // The operands spread over the word, the rest (under 2^56) folded in.
         let args = u64::from(self.args[0]) | u64::from(self.args[1]) << 32;
-        let meta = tag | u64::from(self.w.bits()) << 8 | extra << 24;
-        let mut h = args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta;
-        if let MOp::Const(v) = &self.op {
-            for &l in v.limbs() {
-                h = crate::hash::combine(h, l);
-            }
-        }
-        crate::hash::mix64(h)
+        let meta =
+            u64::from(self.op as u8) | u64::from(self.w.bits()) << 8 | u64::from(self.shift) << 24;
+        crate::hash::mix64(args.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ meta)
     }
 }
 
@@ -65,6 +101,8 @@ impl BNode {
 pub(crate) struct Builder {
     vars: Vec<Width>,
     nodes: Vec<BNode>,
+    wide_consts: Vec<BitVec>,
+    wide_memo: IdMap<BitVec, u32>,
     /// The nodes by [`BNode::hash`].
     memo: Index,
     /// What the walks over a candidate's nodes reuse (see [`Walk`]).
@@ -94,10 +132,10 @@ const NO_COST: Cost = (u32::MAX, u32::MAX);
 /// A candidate's cost: nodes, then operator weight.
 pub(crate) type Cost = (u32, u32);
 
-fn weight(op: &MOp) -> u32 {
+fn weight(op: BOp) -> u32 {
     match op {
-        MOp::Var(_) => 0,
-        MOp::Mul => 4,
+        BOp::Var => 0,
+        BOp::Mul => 4,
         _ => 1,
     }
 }
@@ -147,6 +185,8 @@ impl Builder {
         Builder {
             vars,
             nodes: Vec::new(),
+            wide_consts: Vec::new(),
+            wide_memo: IdMap::default(),
             memo: Index::with_capacity(0),
             walk: Default::default(),
             costs: Default::default(),
@@ -168,27 +208,55 @@ impl Builder {
         self.nodes[n as usize].w
     }
 
-    fn cval(&self, n: u32) -> Option<BitVec> {
-        match self.nodes[n as usize].op {
-            MOp::Const(v) => Some(v),
+    fn cval_of(&self, n: &BNode) -> Option<BitVec> {
+        match n.op {
+            BOp::ConstSmall => {
+                let x = u64::from(n.args[0]) | (u64::from(n.args[1]) << 32);
+                Some(BitVec::wrapping_from_u64(n.w, x))
+            }
+            BOp::ConstWide => self.wide_consts.get(n.args[0] as usize).copied(),
             _ => None,
         }
+    }
+
+    fn cval(&self, n: u32) -> Option<BitVec> {
+        self.cval_of(&self.nodes[n as usize])
     }
 
     pub(crate) fn var(&mut self, v: u32) -> u32 {
         let w = self.vars[v as usize];
         self.intern(BNode {
-            op: MOp::Var(v),
+            op: BOp::Var,
+            shift: 0,
             w,
-            args: [0; 2],
+            args: [v, 0],
         })
     }
 
     pub(crate) fn konst(&mut self, c: &BitVec) -> u32 {
+        let w = c.width();
+        if let Some(x) = c.to_u64() {
+            return self.intern(BNode {
+                op: BOp::ConstSmall,
+                shift: 0,
+                w,
+                args: [x as u32, (x >> 32) as u32],
+            });
+        }
+        let idx = match self.wide_memo.get(c) {
+            Some(&i) => i,
+            None => {
+                let i = self.wide_consts.len() as u32;
+                self.wide_consts.push(*c);
+                self.wide_memo.insert(*c, i);
+                i
+            }
+        };
         self.intern(BNode {
-            op: MOp::Const(*c),
-            w: c.width(),
-            args: [0; 2],
+            op: BOp::ConstWide,
+            shift: 0,
+            w,
+            args: [idx, 0],
         })
     }
 
@@ -196,8 +264,9 @@ impl Builder {
     pub(crate) fn un(&mut self, op: MOp, a: u32) -> u32 {
         let w = self.width(a);
         let na = self.nodes[a as usize];
+        let (bop, shift) = BOp::from_mop(&op);
         match op {
-            MOp::Neg | MOp::Not if na.op == op => return na.args[0],
+            MOp::Neg | MOp::Not if na.op == bop => return na.args[0],
             MOp::Shl(0) | MOp::LShr(0) => return a,
             _ => {}
         }
@@ -212,7 +281,8 @@ impl Builder {
             return self.konst(&r);
         }
         self.intern(BNode {
-            op,
+            op: bop,
+            shift,
             w,
             args: [a, 0],
         })
@@ -267,7 +337,7 @@ impl Builder {
         if op == MOp::Xor {
             let neg_under_not = |b: &Builder, i: u32| {
                 let n = b.nodes[i as usize];
-                (n.op == MOp::Not && b.nodes[n.args[0] as usize].op == MOp::Neg)
+                (n.op == BOp::Not && b.nodes[n.args[0] as usize].op == BOp::Neg)
                     .then_some(n.args[0])
             };
             if let Some(x) = neg_under_not(self, a) {
@@ -284,8 +354,10 @@ impl Builder {
         } else {
             (a, b)
         };
+        let (bop, shift) = BOp::from_mop(&op);
         self.intern(BNode {
-            op,
+            op: bop,
+            shift,
             w,
             args: [a, b],
         })
@@ -299,7 +371,7 @@ impl Builder {
         if na.w == w {
             return a;
         }
-        if let MOp::Const(v) = na.op {
+        if let Some(v) = self.cval_of(&na) {
             let r = match op {
                 MOp::Zext => v.zext(w),
                 MOp::Sext => v.sext(w),
@@ -310,7 +382,7 @@ impl Builder {
             }
         }
         match (op, na.op) {
-            (MOp::Trunc, MOp::Zext | MOp::Sext | MOp::Trunc) => {
+            (MOp::Trunc, BOp::Zext | BOp::Sext | BOp::Trunc) => {
                 let x = na.args[0];
                 let xw = self.width(x);
                 if xw == w {
@@ -320,12 +392,14 @@ impl Builder {
                     return self.cast(MOp::Trunc, x, w);
                 }
             }
-            (MOp::Zext, MOp::Zext) | (MOp::Sext, MOp::Sext) => return self.cast(op, na.args[0], w),
-            (MOp::Sext, MOp::Zext) => return self.cast(MOp::Zext, na.args[0], w),
+            (MOp::Zext, BOp::Zext) | (MOp::Sext, BOp::Sext) => return self.cast(op, na.args[0], w),
+            (MOp::Sext, BOp::Zext) => return self.cast(MOp::Zext, na.args[0], w),
             _ => {}
         }
+        let (bop, shift) = BOp::from_mop(&op);
         self.intern(BNode {
-            op,
+            op: bop,
+            shift,
             w,
             args: [a, 0],
         })
@@ -433,15 +507,15 @@ impl Builder {
         let (mut shifts, mut sites) = (false, false);
         for &i in r {
             let n = &self.nodes[i as usize];
-            weight += self::weight(&n.op);
+            weight += self::weight(n.op);
             match n.op {
-                MOp::Sub => {
+                BOp::Sub => {
                     let m = &self.nodes[n.args[1] as usize];
-                    unstable += u32::from(m.op == MOp::And && m.args.contains(&n.args[0]));
+                    unstable += u32::from(m.op == BOp::And && m.args.contains(&n.args[0]));
                 }
-                MOp::Shl(_) | MOp::LShr(_) => shifts = true,
-                MOp::Not => sites |= self.nodes[n.args[0] as usize].op == MOp::Neg,
-                MOp::Neg => sites |= self.nodes[n.args[0] as usize].op == MOp::Not,
+                BOp::Shl | BOp::LShr => shifts = true,
+                BOp::Not => sites |= self.nodes[n.args[0] as usize].op == BOp::Neg,
+                BOp::Neg => sites |= self.nodes[n.args[0] as usize].op == BOp::Not,
                 _ => {}
             }
         }
@@ -449,15 +523,12 @@ impl Builder {
         if shifts || sites {
             let mut consts: Vec<BitVec> = r
                 .iter()
-                .filter_map(|&i| match self.nodes[i as usize].op {
-                    MOp::Const(v) => Some(v),
-                    _ => None,
-                })
+                .filter_map(|&i| self.cval_of(&self.nodes[i as usize]))
                 .collect();
             for &i in r {
                 let n = &self.nodes[i as usize];
-                if let MOp::Shl(k) | MOp::LShr(k) = n.op {
-                    let v = super::word::small(n.w, u64::from(k));
+                if matches!(n.op, BOp::Shl | BOp::LShr) {
+                    let v = super::word::small(n.w, u64::from(n.shift));
                     if !consts.contains(&v) {
                         consts.push(v);
                         amounts += 1;
@@ -479,8 +550,11 @@ impl Builder {
     /// elsewhere in the candidate too.
     fn rewrites_shared(&self, r: &[u32]) -> bool {
         let inner = |n: &BNode| -> Option<u32> {
+            if !matches!(n.op, BOp::Not | BOp::Neg) {
+                return None;
+            }
             let m = &self.nodes[n.args[0] as usize];
-            matches!((n.op, m.op), (MOp::Not, MOp::Neg) | (MOp::Neg, MOp::Not)).then_some(n.args[0])
+            matches!((n.op, m.op), (BOp::Not, BOp::Neg) | (BOp::Neg, BOp::Not)).then_some(n.args[0])
         };
         let sites: Vec<u32> = r
             .iter()
@@ -515,13 +589,15 @@ impl Builder {
         }
         let n = if is_small(&mag, w, 2) {
             BNode {
-                op: MOp::Add,
+                op: BOp::Add,
+                shift: 0,
                 w,
                 args: [t, t],
             }
         } else {
             BNode {
-                op: MOp::Shl(j as u16),
+                op: BOp::Shl,
+                shift: j as u16,
                 w,
                 args: [t, 0],
             }
@@ -541,10 +617,30 @@ impl Builder {
         for &i in order.iter() {
             let n = &self.nodes[i as usize];
             // Operands come first in the walk: their places are this candidate's.
-            let args = [place[n.args[0] as usize], place[n.args[1] as usize]];
             let id = match n.op {
-                MOp::Zext | MOp::Sext | MOp::Trunc => m.push_cast(n.op, args[0], n.w),
-                op => m.push(op, &args[..op.arity()]),
+                BOp::ConstSmall | BOp::ConstWide => {
+                    let v = self.cval_of(n)?;
+                    m.push(MOp::Const(v), &[])
+                }
+                BOp::Var => m.push(MOp::Var(n.args[0]), &[]),
+                BOp::Zext => m.push_cast(MOp::Zext, place[n.args[0] as usize], n.w),
+                BOp::Sext => m.push_cast(MOp::Sext, place[n.args[0] as usize], n.w),
+                BOp::Trunc => m.push_cast(MOp::Trunc, place[n.args[0] as usize], n.w),
+                BOp::Neg => m.push(MOp::Neg, &[place[n.args[0] as usize]]),
+                BOp::Not => m.push(MOp::Not, &[place[n.args[0] as usize]]),
+                BOp::Shl => m.push(MOp::Shl(n.shift), &[place[n.args[0] as usize]]),
+                BOp::LShr => m.push(MOp::LShr(n.shift), &[place[n.args[0] as usize]]),
+                BOp::Add | BOp::Sub | BOp::Mul | BOp::And | BOp::Or | BOp::Xor => {
+                    let mop = match n.op {
+                        BOp::Add => MOp::Add,
+                        BOp::Sub => MOp::Sub,
+                        BOp::Mul => MOp::Mul,
+                        BOp::And => MOp::And,
+                        BOp::Or => MOp::Or,
+                        _ => MOp::Xor,
+                    };
+                    m.push(mop, &[place[n.args[0] as usize], place[n.args[1] as usize]])
+                }
             }
             .ok()?;
             place[i as usize] = id;
@@ -1860,6 +1956,7 @@ impl<'a> Render<'a> {
             }
             if q != *p {
                 out.extend(self.grouped(&q));
+                out.extend(self.cobra_sums(&q));
             }
         }
         if n > 1
@@ -1869,6 +1966,7 @@ impl<'a> Render<'a> {
         }
         out.extend(self.scaled_bits(&expanded, plain.is_some()));
         out.extend(self.two_terms(p));
+        out.extend(self.cobra_sums(p));
         out.extend(self.sign_extensions(p, &expanded));
         if top && self.peeling == 0 {
             out.extend(self.split_off(p));
@@ -2797,6 +2895,163 @@ impl<'a> Render<'a> {
         self.cheapest(sums)
     }
 
+    /// Renders one CoBRA [`BasisOp`](crate::cobra::BasisOp) over `support` atom indices.
+    fn cobra_basis_op(&mut self, op: &crate::cobra::BasisOp, support: &[u32]) -> Option<u32> {
+        op.lower(&mut CobraGates { r: self, support }).ok()
+    }
+
+    /// CoBRA change-of-basis decompositions for arbitrary-coefficient multi-term linear and
+    /// semi-linear (masked `BitClass`) polynomials of degree at most 1.
+    fn cobra_sums(&mut self, p: &Poly) -> Vec<Sum> {
+        let w = self.w;
+        let wb = u32::from(w.bits());
+        let n = self.classes.len();
+        if p.degree() > 1 || p.atoms() == 0 {
+            return Vec::new();
+        }
+
+        // Partition degree-1 monomials into unmasked (`FULL` or single-class) and per-class maps.
+        let mut full_map: BTreeMap<u64, BitVec> = BTreeMap::new();
+        let mut class_maps: Vec<BTreeMap<u64, BitVec>> = vec![BTreeMap::new(); n];
+        for (m, c) in p.terms() {
+            match m.as_slice() {
+                [] => {}
+                [(sym, 1)] if sym.class == FULL || n == 1 => {
+                    let e = full_map.entry(sym.set).or_insert_with(|| BitVec::zero(w));
+                    *e = super::word::bin(BinOp::Add, e, c);
+                }
+                [(sym, 1)] => {
+                    let cid = usize::from(sym.class);
+                    if cid >= n {
+                        return Vec::new();
+                    }
+                    let e = class_maps[cid]
+                        .entry(sym.set)
+                        .or_insert_with(|| BitVec::zero(w));
+                    *e = super::word::bin(BinOp::Add, e, c);
+                }
+                _ => return Vec::new(),
+            }
+        }
+        full_map.retain(|_, v| !v.is_zero());
+        for cm in &mut class_maps {
+            cm.retain(|_, v| !v.is_zero());
+        }
+
+        // Merge classes that share identical conjunction-coefficient maps into one mask.
+        let mut groups: Vec<(BitVec, u16, BTreeMap<u64, BitVec>)> = Vec::new();
+        for (cid, cm) in class_maps.into_iter().enumerate() {
+            if cm.is_empty() {
+                continue;
+            }
+            let mask = *self.classes.mask(cid);
+            let low = self.classes.low(cid);
+            if let Some(g) = groups.iter_mut().find(|(_, _, m)| *m == cm) {
+                g.0 = bv_or(&g.0, &mask);
+                g.1 = g.1.min(low);
+            } else {
+                groups.push((mask, low, cm));
+            }
+        }
+        if groups.len() + usize::from(!full_map.is_empty()) > 8 {
+            return Vec::new();
+        }
+
+        type CobraTerms = (Vec<u32>, Vec<(crate::cobra::BasisOp, BitVec)>);
+        let decompose_map =
+            |this: &mut Self, map: &BTreeMap<u64, BitVec>, prec: u32| -> Option<CobraTerms> {
+                let atoms = map.keys().fold(0u64, |acc, &set| acc | set);
+                let s = atoms.count_ones() as usize;
+                if s == 0 || s > crate::cobra::MAX_COBRA_ATOMS {
+                    return None;
+                }
+                if !this.spend(((1u64 << s) * 8) + map.len() as u64) {
+                    return None;
+                }
+                let support: Vec<u32> = (0..64).filter(|&a| (atoms >> a) & 1 == 1).collect();
+                let mut alpha = vec![BitVec::zero(w); 1usize << s];
+                for (&set, c) in map {
+                    let q = support
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &a)| (set >> a) & 1 == 1)
+                        .fold(0usize, |q, (j, _)| q | (1 << j));
+                    alpha[q] = super::word::bin(BinOp::Add, &alpha[q], c);
+                }
+                // What the decomposition reads is charged as it goes, within what is left (one
+                // past the limit where that runs out, so the rendering reports it).
+                let allow = this.limit.saturating_sub(this.work);
+                let mut left = allow;
+                let terms = crate::cobra::decompose(s, w, prec, &alpha, &mut left);
+                let short = u64::from(terms.is_none() && left == 0);
+                if !this.spend(allow - left + short) {
+                    return None;
+                }
+                Some((support, terms?))
+            };
+
+        let mut rem_konst = p.konst();
+        let mut all_terms: Vec<(u32, BitVec)> = Vec::new();
+
+        if !full_map.is_empty() {
+            let full_atoms = full_map.keys().fold(0u64, |acc, &set| acc | set);
+            if groups.is_empty() && full_atoms.count_ones() < 3 {
+                return Vec::new();
+            }
+            let Some((support, ops)) = decompose_map(self, &full_map, wb) else {
+                return Vec::new();
+            };
+            for (op, weight) in ops {
+                let Some(gn) = self.cobra_basis_op(&op, &support) else {
+                    return Vec::new();
+                };
+                all_terms.push((gn, weight));
+            }
+        }
+
+        for (mask, low, cm) in groups {
+            let prec = wb.saturating_sub(u32::from(low));
+            let Some((support, mut ops)) = decompose_map(self, &cm, prec) else {
+                return Vec::new();
+            };
+            // Masked constant trading: `(-c)·M + c·(B & M) = (-c)·((~B) & M)`.
+            if !rem_konst.is_zero() {
+                for (op, weight) in &mut ops {
+                    let neg_w = super::word::un(UnOp::Neg, weight);
+                    let contrib = super::word::bin(BinOp::Mul, &neg_w, &mask);
+                    if rem_konst == contrib {
+                        let inner = core::mem::replace(op, crate::cobra::BasisOp::Var(0));
+                        *op = match inner {
+                            crate::cobra::BasisOp::Not(b) => *b,
+                            other => crate::cobra::BasisOp::Not(Box::new(other)),
+                        };
+                        *weight = neg_w;
+                        rem_konst = BitVec::zero(w);
+                        break;
+                    }
+                }
+            }
+            for (op, weight) in ops {
+                let Some(gn) = self.cobra_basis_op(&op, &support) else {
+                    return Vec::new();
+                };
+                let mnode = self.masked(gn, &mask);
+                all_terms.push((mnode, weight));
+            }
+        }
+
+        if all_terms.is_empty() {
+            return Vec::new();
+        }
+        let base = Sum {
+            terms: all_terms,
+            konst: (!rem_konst.is_zero()).then_some(rem_konst),
+        };
+        let mut out = vec![base.clone()];
+        out.extend(self.factored(&base));
+        out
+    }
+
     /// Table `v` (over `support`, at most three atoms) as a function of table `u` (rendered
     /// `un`) and at most two of the atoms, the fewest that determine it: its minimum form over
     /// those atoms' nodes and `un`. `None` when no such set does (or `v` needs none of `u`).
@@ -3262,7 +3517,7 @@ impl<'a> Render<'a> {
         let mut terms = Vec::with_capacity(s.terms.len());
         for &(t, c) in &s.terms {
             let n = self.b.nodes[t as usize];
-            if n.op == MOp::Not {
+            if n.op == BOp::Not {
                 terms.push((n.args[0], super::word::un(UnOp::Neg, &c)));
                 k = super::word::bin(BinOp::Sub, &k, &c);
                 changed = true;
@@ -3296,12 +3551,12 @@ impl<'a> Render<'a> {
     /// it through the operator (`~(~a | b)` is `a & ~b`, `~(a ^ ~b)` is `a ^ b`), that too.
     fn complement(&mut self, t: u32) -> Vec<u32> {
         let n = self.b.nodes[t as usize];
-        let is_not = |b: &Builder, x: u32| b.nodes[x as usize].op == MOp::Not;
+        let is_not = |b: &Builder, x: u32| b.nodes[x as usize].op == BOp::Not;
         let arg = |b: &Builder, x: u32| b.nodes[x as usize].args[0];
         let mut out = Vec::with_capacity(2);
         match n.op {
-            MOp::Not => return vec![n.args[0]],
-            MOp::Xor => {
+            BOp::Not => return vec![n.args[0]],
+            BOp::Xor => {
                 let (a, c) = (n.args[0], n.args[1]);
                 if is_not(&self.b, a) {
                     let a0 = arg(&self.b, a);
@@ -3312,10 +3567,10 @@ impl<'a> Render<'a> {
                     return vec![self.b.bin(MOp::Xor, a, c0)];
                 }
             }
-            MOp::And | MOp::Or => {
+            BOp::And | BOp::Or => {
                 let (a, c) = (n.args[0], n.args[1]);
                 if is_not(&self.b, a) || is_not(&self.b, c) {
-                    let flip = if n.op == MOp::And { MOp::Or } else { MOp::And };
+                    let flip = if n.op == BOp::And { MOp::Or } else { MOp::And };
                     let na = if is_not(&self.b, a) {
                         arg(&self.b, a)
                     } else {
@@ -4389,4 +4644,39 @@ fn common_symbols(p: &Poly) -> Vec<Sym> {
         common.retain(|s| m.iter().any(|&(t, _)| t == *s));
     }
     common
+}
+
+/// The renderer's nodes as the gates of a CoBRA basis function over `support` (see
+/// `BasisOp::lower`): an atom outside the support and the empty clause are declined, and the
+/// complement of a function that is no table is the cheapest of its complements.
+struct CobraGates<'g, 'a> {
+    r: &'g mut Render<'a>,
+    support: &'g [u32],
+}
+
+impl crate::cobra::Gates for CobraGates<'_, '_> {
+    type Err = ();
+    fn input(&mut self, i: usize) -> Result<u32, ()> {
+        let a = *self.support.get(i).ok_or(())?;
+        self.r.atom(a).ok_or(())
+    }
+    fn table(&mut self, tt8: u8, args: [u32; 3]) -> Result<u32, ()> {
+        self.r.min_form(tt8, &args).ok_or(())
+    }
+    fn and(&mut self, a: u32, b: u32) -> Result<u32, ()> {
+        Ok(self.r.b.bin(MOp::And, a, b))
+    }
+    fn or(&mut self, a: u32, b: u32) -> Result<u32, ()> {
+        Ok(self.r.b.bin(MOp::Or, a, b))
+    }
+    fn not(&mut self, a: u32) -> Result<u32, ()> {
+        Ok(self.r.b.un(MOp::Not, a))
+    }
+    fn ones(&mut self) -> Result<u32, ()> {
+        Err(())
+    }
+    fn complement(&mut self, a: u32) -> Result<u32, ()> {
+        let comps = self.r.complement(a);
+        self.r.best(&comps).ok_or(())
+    }
 }

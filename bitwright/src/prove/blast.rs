@@ -694,6 +694,9 @@ fn fold_shift_correlations(a: &[L], s: &[L], left: bool, fill: L, result: &mut B
 /// A rotation by `s mod w`.
 pub fn rotate(g: &mut Aig, a: &[L], s: &[L], left: bool) -> Bits {
     let w = a.len();
+    if w <= 1 {
+        return a.to_vec();
+    }
     // The count modulo w.
     let r = if w.is_power_of_two() {
         let k = w.trailing_zeros() as usize;
@@ -701,17 +704,33 @@ pub fn rotate(g: &mut Aig, a: &[L], s: &[L], left: bool) -> Bits {
         r.resize(k.max(1), FALSE);
         r
     } else {
-        let wk = small(s.len(), w as u64);
-        let (_, r) = udivrem(g, s, &wk);
-        r
+        // Maintain an accumulator in `[0, w)` of `bw + 1` bits (`w < 2^bw`, so `acc + term < 2w < 2^(bw+1)`).
+        let bw = (usize::BITS - w.leading_zeros()) as usize;
+        let wk = small(bw + 1, w as u64);
+        let mut acc = vec![FALSE; bw + 1];
+        let mut weight = 1u64 % (w as u64);
+        for &si in s {
+            if si != FALSE && weight != 0 {
+                let term: Bits = (0..bw + 1)
+                    .map(|j| if (weight >> j) & 1 == 1 { si } else { FALSE })
+                    .collect();
+                let sum = add(g, &acc, &term);
+                let ge = ult(g, &sum, &wk) ^ 1;
+                let diff = sub(g, &sum, &wk);
+                acc = mux(g, ge, &diff, &sum);
+            }
+            weight = (weight * 2) % (w as u64);
+        }
+        acc.truncate(bw);
+        acc
     };
     let mut cur = a.to_vec();
     for (k, &bit) in r.iter().enumerate() {
-        if k >= 64 || (1u64 << k) as usize >= 2 * w {
+        if k >= 64 || (1u64 << k) as usize >= w {
             break;
         }
         let amt = (1usize << k) % w;
-        if amt == 0 {
+        if amt == 0 || bit == FALSE {
             continue;
         }
         let moved: Bits = (0..w)
@@ -794,41 +813,156 @@ pub fn bitrev(a: &[L]) -> Bits {
 
 /// The high half of the full product (sign or zero extended to twice the width).
 pub fn mulhi(g: &mut Aig, a: &[L], b: &[L], signed: bool) -> Bits {
+    mulhi_impl(g, a, b, signed, false)
+}
+
+/// [`mulhi`], compressing columns before one final carry-propagating addition.
+pub fn mulhi_carry_save(g: &mut Aig, a: &[L], b: &[L], signed: bool) -> Bits {
+    mulhi_impl(g, a, b, signed, true)
+}
+
+fn mulhi_impl(g: &mut Aig, a: &[L], b: &[L], signed: bool, carry_save: bool) -> Bits {
     let w = a.len();
-    let ext = |x: &[L]| -> Bits {
-        let fill = if signed {
-            *x.last().unwrap_or(&FALSE)
+    if w <= 1 {
+        // For w = 1: unsigned 1 * 1 = 1 (high bit 0), signed (-1) * (-1) = +1 = 0b01 (high bit 0).
+        return vec![FALSE; w];
+    }
+    // Unsigned multiplication by a constant benefits from signed-digit recoding at width 2w.
+    if !signed && (a.iter().all(|&l| l <= TRUE) || b.iter().all(|&l| l <= TRUE)) {
+        let mut a2 = a.to_vec();
+        let mut b2 = b.to_vec();
+        a2.resize(2 * w, FALSE);
+        b2.resize(2 * w, FALSE);
+        let p = if carry_save {
+            mul_carry_save(g, &a2, &b2)
         } else {
-            FALSE
+            mul(g, &a2, &b2)
         };
-        let mut v = x.to_vec();
-        v.resize(2 * w, fill);
-        v
-    };
-    let (a2, b2) = (ext(a), ext(b));
-    let p = mul(g, &a2, &b2);
-    p[w..].to_vec()
+        return p[w..].to_vec();
+    }
+    // Exact w × w partial-product array (Baugh–Wooley for signed): w² AND gates instead of 4w².
+    let tw = 2 * w;
+    if carry_save {
+        let mut columns = vec![Vec::new(); tw];
+        if signed {
+            columns[w].push(TRUE);
+            columns[tw - 1].push(TRUE);
+        }
+        for (j, &bj) in b.iter().enumerate() {
+            for (i, &ai) in a.iter().enumerate() {
+                let neg_term = signed && ((i == w - 1) != (j == w - 1));
+                let pp = g.and(ai, bj) ^ u32::from(neg_term);
+                if pp != FALSE {
+                    columns[i + j].push(pp);
+                }
+            }
+        }
+        let mut first = vec![FALSE; tw];
+        let mut second = vec![FALSE; tw];
+        for i in 0..tw {
+            let mut head = 0;
+            while columns[i].len() - head > 2 {
+                let (x, y, z) = (columns[i][head], columns[i][head + 1], columns[i][head + 2]);
+                head += 3;
+                let sum = if i + 1 == tw {
+                    let xy = g.xor_phase(x, y);
+                    g.xor_phase(xy, z)
+                } else {
+                    let xy = g.xor(x, y);
+                    g.xor(xy, z)
+                };
+                if sum != FALSE {
+                    columns[i].push(sum);
+                }
+                if i + 1 < tw {
+                    let carry = g.maj(x, y, z);
+                    if carry != FALSE {
+                        columns[i + 1].push(carry);
+                    }
+                }
+            }
+            if let Some(&l) = columns[i].get(head) {
+                first[i] = l;
+            }
+            if let Some(&l) = columns[i].get(head + 1) {
+                second[i] = l;
+            }
+        }
+        let p = add(g, &first, &second);
+        return p[w..].to_vec();
+    }
+    let mut acc = vec![FALSE; tw];
+    if signed {
+        acc[w] = TRUE;
+        acc[tw - 1] = TRUE;
+    }
+    for (j, &bj) in b.iter().enumerate() {
+        if !signed && bj == FALSE {
+            continue;
+        }
+        let mut part = vec![FALSE; tw];
+        let mut any = false;
+        for (i, &ai) in a.iter().enumerate() {
+            let neg_term = signed && ((i == w - 1) != (j == w - 1));
+            let pp = g.and(ai, bj) ^ u32::from(neg_term);
+            part[i + j] = pp;
+            any |= pp != FALSE;
+        }
+        if any {
+            acc = add(g, &acc, &part);
+        }
+    }
+    acc[w..].to_vec()
+}
+
+/// Advances the one-hot popcount state `oh` (`oh[j]` holds iff `c_i == j`) by bit `mi`.
+fn step_onehot(g: &mut Aig, oh: &mut Vec<L>, mi: L, max_len: usize) {
+    if mi == FALSE {
+        return;
+    }
+    if mi == TRUE {
+        if oh.len() < max_len {
+            oh.insert(0, FALSE);
+        } else {
+            oh.rotate_right(1);
+            oh[0] = FALSE;
+        }
+        return;
+    }
+    let old_len = oh.len();
+    if old_len < max_len {
+        let top = g.and(mi, oh[old_len - 1]);
+        oh.push(top);
+    }
+    for j in (1..old_len).rev() {
+        oh[j] = g.mux(mi, oh[j - 1], oh[j]);
+    }
+    oh[0] = g.and(oh[0], mi ^ 1);
 }
 
 /// Parallel bit deposit: bit `i` of the result is `m_i ∧ x_{c_i}`, `c_i` the number of set bits
 /// of `m` below `i`.
 pub fn pdep(g: &mut Aig, x: &[L], m: &[L]) -> Bits {
     let w = x.len();
-    let cw = (usize::BITS - w.leading_zeros()) as usize + 1;
     let mut out = Vec::with_capacity(w);
-    let mut c: Bits = vec![FALSE; cw];
-    for &mi in m.iter().take(w) {
-        // x at index c (a w-to-1 multiplexer).
+    let mut oh = Vec::with_capacity(w);
+    if w > 0 {
+        oh.push(TRUE);
+    }
+    for (i, &mi) in m.iter().take(w).enumerate() {
+        if mi == FALSE {
+            out.push(FALSE);
+            continue;
+        }
         let mut pick = FALSE;
-        for (j, &xj) in x.iter().enumerate() {
-            let at = eq(g, &c, &small(cw, j as u64));
-            let t = g.and(at, xj);
+        for (j, &at) in oh.iter().enumerate() {
+            let t = g.and(at, x[j]);
             pick = g.or(pick, t);
         }
         out.push(g.and(mi, pick));
-        let mut one = small(cw, 0);
-        one[0] = mi;
-        c = add(g, &c, &one);
+        if i + 1 < w {
+            step_onehot(g, &mut oh, mi, w);
+        }
     }
     out
 }
@@ -836,19 +970,26 @@ pub fn pdep(g: &mut Aig, x: &[L], m: &[L]) -> Bits {
 /// Parallel bit extract: bit `j` of the result is the OR over `i` of `x_i ∧ m_i ∧ (c_i = j)`.
 pub fn pext(g: &mut Aig, x: &[L], m: &[L]) -> Bits {
     let w = x.len();
-    let cw = (usize::BITS - w.leading_zeros()) as usize + 1;
     let mut out = vec![FALSE; w];
-    let mut c: Bits = vec![FALSE; cw];
+    let mut oh = Vec::with_capacity(w);
+    if w > 0 {
+        oh.push(TRUE);
+    }
     for i in 0..w {
-        let src = g.and(x[i], m[i]);
-        for (j, o) in out.iter_mut().enumerate() {
-            let at = eq(g, &c, &small(cw, j as u64));
-            let t = g.and(at, src);
-            *o = g.or(*o, t);
+        let mi = m[i];
+        if mi == FALSE {
+            continue;
         }
-        let mut one = small(cw, 0);
-        one[0] = m[i];
-        c = add(g, &c, &one);
+        let src = g.and(x[i], mi);
+        if src != FALSE {
+            for (j, &at) in oh.iter().enumerate() {
+                let t = g.and(at, src);
+                out[j] = g.or(out[j], t);
+            }
+        }
+        if i + 1 < w {
+            step_onehot(g, &mut oh, mi, w);
+        }
     }
     out
 }

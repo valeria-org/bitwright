@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.32.0
+
+- **Linear MBA over a basis of small bitwise functions.** The linear-MBA pass and the normal
+  form's renderer write a sum's conjunction coefficients over a basis of small bitwise
+  functions of its atoms (tables of two and three atoms, clauses, the disjunction of all of
+  them, and their complements; CoBRA, `src/cobra.rs`) where the conjunction basis writes them
+  as many products. The decomposition is metered, a unit per coefficient it reads, against
+  the pass's work or the renderer's limit, and both write a basis function through one
+  lowering.
+- **Known bits declared on a symbol hold in the solver.** `Solver` and `Incremental` assume
+  them, and withdraw the assumptions when a declaration changes; the models they give are
+  projected onto them; an exported Lean theorem carries them as hypotheses, named apart from
+  the symbols. Unsat cores are minimized through `Incremental`. Where nothing is declared, a
+  model is checked without looking up its symbols.
+- **Lean import.** `<`, `<=`, `>` and `>=` are unsigned comparisons; `BitVec.smtUDiv` and
+  `truncate` are read; a fixed-width literal wraps modulo 2^w. A conjunction is the 1-bit `&`
+  (an `if` condition is a value), and `++` associates left, at the precedence of `+`. Not
+  translated, and reported: `Nat` arithmetic on `toNat`, a `toNat` compared with a literal
+  past its width, a literal past 128 bits (one that did not parse was read as all ones).
+- **MBA phase: what a kept fragment keeps back.** A size cap, running out of steps or an
+  expensive "no simpler" answer keeps every larger fragment back; a form that is not smaller
+  or not proved keeps back only a root that wraps it alone. That check is one walk of the
+  fragment, not one per kept part.
+- **Fixes.** A link of an additive chain leaves its linear-MBA solve to the chain's top, and
+  a top that declines solves the links that waited for it: a sub-sum under a top that was
+  held back was never solved. The normal form counts a question's steps once: a re-normalize
+  was charged its earlier passes again and gave up early. A pass that runs out of steps keeps
+  its statistics. A rule's id keeps its guard apart from a trailing `let`, which could
+  collide. `FFma`'s first two operands commute in the termination order.
+- Also: the e-graph's constants, small and wide; bit-blasting of rotates, high multiplies and
+  `pdep`/`pext`; the SAT solver's buffers reused; rule checks on the 512 MiB helper threads.
+- **Rust 1.100.** The minimum supported Rust version is 1.100 (was 1.88).
+- **Behavior changes.** Every rule id changes (an id now hashes the counts of a rule's parts
+  and tags each part), so traces, certificates and the corpus's proofs name rules
+  differently. Results change where the basis writes a sum in fewer nodes than the
+  conjunction basis did, and where a sub-sum of a chain was left unsolved; the constant
+  through one condition in `tests/noise_forms.rs` is reached without `known_atoms` too. A
+  model from `Solver` or `Incremental` respects declared bits. The Lean importer reports the
+  forms above that it used to translate.
+
 ## 0.31.7
 
 - **Faster, with the same results:** a run over a large expression, and the prover's

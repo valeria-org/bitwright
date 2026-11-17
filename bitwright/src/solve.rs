@@ -363,8 +363,10 @@ pub struct Solver {
     answers: Option<Answers>,
     /// The circuit and search of the quick attempts, once one was made.
     circuit: Option<prove::Incremental<Box<dyn prove::Backend>>>,
-    /// The conflicts of the last quick attempt on it.
-    kept_conflicts: u64,
+    /// The conflicts of the last quick attempt on it, when the backend counts them.
+    kept_conflicts: Option<u64>,
+    /// The context's `declaration_revision` when `model` and `cache` were recorded.
+    declaration_revision: u64,
 }
 
 impl Solver {
@@ -569,6 +571,11 @@ impl Solver {
         asked: &[(CoreItem, Expr)],
         deadline: Option<Deadline<'_>>,
     ) -> Result<Decision, Error> {
+        if self.declaration_revision != cx.declaration_revision {
+            self.declaration_revision = cx.declaration_revision;
+            self.model = None;
+            self.cache = Cache::default();
+        }
         // Constants: one false assertion is a core by itself.
         let mut open: Vec<(CoreItem, Expr)> = Vec::with_capacity(asked.len());
         for &(item, e) in asked {
@@ -745,7 +752,8 @@ impl Solver {
             // is given a few times the most conflicts it ever took there, not the whole
             // quick budget, before the question goes on.
             if self.cfg.learn_budgets
-                && let Some(s) = seen.filter(|s| s.kept >= LEARNED_AFTER && s.later > 0)
+                && let Some(s) =
+                    seen.filter(|s| s.kept >= LEARNED_AFTER && s.later > 0 && s.conflicts > 0)
             {
                 kept_budget = Some(s.conflicts.saturating_mul(4).max(32));
             }
@@ -770,7 +778,7 @@ impl Solver {
                 self.cache.exact.insert(key, answer.clone());
             }
             if let (Some(answers), Some(name)) = (&mut self.answers, named) {
-                answers.learn(name, &answer, DecidedBy::Probe, 0);
+                answers.learn(name, &answer, DecidedBy::Probe, None);
             }
             return Ok((Ok(answer), DecidedBy::Probe, None));
         }
@@ -895,18 +903,9 @@ impl Solver {
                             found.push((key.clone(), v));
                         }
                     }
-                    // Complete over the slice's symbols: one the prover left open is zero.
-                    let mut m = Vec::new();
-                    for sym in cx.symbols_in(es)? {
-                        let (Some(k), Some(w)) =
-                            (cx.symbol_key(sym).cloned(), cx.symbol_width(sym))
-                        else {
-                            continue;
-                        };
-                        let v = (found.iter().find(|(f, _)| *f == k))
-                            .map_or_else(|| BitVec::zero(w), |&(_, v)| v);
-                        m.push((k, v));
-                    }
+                    // Complete over the slice's symbols: one the prover left open takes its
+                    // declared known-one bits (zero when unconstrained).
+                    let m = complete(cx, es, &found)?;
                     Some(m)
                 }
                 Ok(None) => None,
@@ -991,7 +990,9 @@ impl Solver {
         });
         let before = circuit.conflicts();
         let answer = circuit.solve(cx, es, quick.limits())?;
-        self.kept_conflicts = circuit.conflicts().saturating_sub(before);
+        self.kept_conflicts = circuit
+            .exact_conflicts()
+            .then(|| circuit.conflicts().saturating_sub(before));
         Ok(match answer {
             prove::IncrementalAnswer::Sat(ref m) if !holds(cx, es, m)? => None,
             prove::IncrementalAnswer::Unknown(_) => None,
@@ -1066,18 +1067,44 @@ impl Solver {
         if let Some(quick) = self.cfg.quick
             && self.cfg.minimize_cores
             && core.len() <= self.cfg.minimize_cores_up_to
+            && core.len() > 1
         {
+            let search: Box<dyn prove::Backend> = match &self.cfg.backend {
+                Some(make) => (make.0)(),
+                None => Box::new(prove::sat::Solver::new()),
+            };
+            let mut inc = prove::Incremental::on(
+                search,
+                quick.max_nodes.saturating_mul(core.len().max(1)).max(1),
+            )
+            .with_question_nodes(quick.max_nodes);
             let mut i = 0;
             while i < core.len() && core.len() > 1 {
-                let rest: Vec<Expr> = (core.iter().enumerate())
+                let rest_items: Vec<(CoreItem, Expr)> = (core.iter().enumerate())
                     .filter(|&(k, _)| k != i)
-                    .map(|(_, &(_, e))| e)
+                    .map(|(_, &pair)| pair)
                     .collect();
-                let all = conjunction(cx, &rest)?;
-                if matches!(prove::satisfy(cx, all, &quick)?, Ok(None)) {
-                    core.remove(i);
-                } else {
-                    i += 1;
+                let rest: Vec<Expr> = rest_items.iter().map(|&(_, e)| e).collect();
+                match inc.solve(cx, &rest, quick.limits())? {
+                    prove::IncrementalAnswer::Unsat(sub) => {
+                        let prev_before = core[..i].to_vec();
+                        core = sub.into_iter().map(|k| rest_items[k]).collect();
+                        i = core
+                            .iter()
+                            .position(|item| !prev_before.contains(item))
+                            .unwrap_or(core.len());
+                    }
+                    prove::IncrementalAnswer::Unknown(Unknown::TooLarge { .. }) => {
+                        let all = conjunction(cx, &rest)?;
+                        if matches!(prove::satisfy(cx, all, &quick)?, Ok(None)) {
+                            core.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
         }
@@ -1089,14 +1116,48 @@ impl Solver {
     }
 }
 
-/// `model` over exactly the symbols `es` read: one it does not list is zero.
+/// Default value of a symbol not listed in a model: its declared known-one bits (zero when none).
+fn default_for_symbol(cx: &Context, key: &crate::SymbolKey, w: Width) -> BitVec {
+    cx.find_symbol(key)
+        .and_then(|s| cx.declared_known(s).ok().flatten())
+        .map_or_else(|| BitVec::zero(w), |kb| kb.known_one())
+}
+
+/// Projects `v` onto the bits declared for `key` (`(v & !known_zero) | known_one`).
+fn fit_declared(cx: &Context, key: &crate::SymbolKey, v: BitVec) -> BitVec {
+    let Some(kb) = cx
+        .find_symbol(key)
+        .and_then(|s| cx.declared_known(s).ok().flatten())
+    else {
+        return v;
+    };
+    let keep = crate::facts::known::bv_not(&kb.known_zero());
+    crate::facts::known::bv_or(&crate::facts::known::bv_and(&v, &keep), &kb.known_one())
+}
+
+/// Whether `v` satisfies the bits declared for `key`.
+fn satisfies_declared(cx: &Context, key: &crate::SymbolKey, v: &BitVec) -> bool {
+    let Some(kb) = cx
+        .find_symbol(key)
+        .and_then(|s| cx.declared_known(s).ok().flatten())
+    else {
+        return true;
+    };
+    crate::facts::known::bv_and(v, &kb.known()) == kb.known_one()
+}
+
+/// `model` over exactly the symbols `es` read: one it does not list takes its declared known-one
+/// bits (zero when unconstrained).
 fn complete(cx: &mut Context, es: &[Expr], model: &Model) -> Result<Model, Error> {
     let mut m = Vec::new();
     for sym in cx.symbols_in(es)? {
         let (Some(k), Some(w)) = (cx.symbol_key(sym).cloned(), cx.symbol_width(sym)) else {
             continue;
         };
-        let v = (model.iter().find(|(f, _)| *f == k)).map_or_else(|| BitVec::zero(w), |&(_, v)| v);
+        let v = (model.iter().find(|(f, _)| *f == k)).map_or_else(
+            || default_for_symbol(cx, &k, w),
+            |&(_, v)| fit_declared(cx, &k, v),
+        );
         m.push((k, v));
     }
     Ok(m)
@@ -1189,12 +1250,35 @@ impl Answers {
         }
     }
 
-    /// The names of a slice: its assertions' hashes, and its shape.
+    /// The names of a slice: its assertions' hashes (plus any declared known-bit axioms on its
+    /// symbols), and its shape.
     fn key(cx: &mut Context, es: &[Expr]) -> Result<(Vec<(u64, u64)>, u64), Error> {
         let shapes = cx.shape_hashes(es)?;
         let mut name = Vec::with_capacity(es.len());
         for (&e, &shape) in es.iter().zip(&shapes) {
             name.push((cx.structural_hash(e)?, shape));
+        }
+        for sym in cx.symbols_in(es)? {
+            let Some(key) = cx.symbol_key(sym).cloned() else {
+                continue;
+            };
+            let Some(s_expr) = cx.find_symbol(&key) else {
+                continue;
+            };
+            let Some(kb) = cx.declared_known(s_expr)? else {
+                continue;
+            };
+            let mut dh = crate::hash::combine(0x6465_636c_6b6e_776e, key.structural_hash());
+            let mut ds = crate::hash::combine(0x6465_636c_7368_6170, u64::from(kb.width().bits()));
+            for &l in kb.known_zero().limbs() {
+                dh = crate::hash::combine(dh, l);
+                ds = crate::hash::combine(ds, u64::from(l.count_ones()));
+            }
+            for &l in kb.known_one().limbs() {
+                dh = crate::hash::combine(dh, l);
+                ds = crate::hash::combine(ds, u64::from(l.count_ones()));
+            }
+            name.push((dh, ds));
         }
         name.sort_unstable();
         name.dedup();
@@ -1210,7 +1294,7 @@ impl Answers {
         (name, shape): (Vec<(u64, u64)>, u64),
         answer: &Option<Model>,
         by: DecidedBy,
-        conflicts: u64,
+        conflicts: Option<u64>,
     ) {
         // (An assignment that happened to satisfy says nothing of the searches.)
         if by != DecidedBy::Probe {
@@ -1218,7 +1302,9 @@ impl Answers {
             match by {
                 DecidedBy::Incremental => {
                     d.kept = d.kept.saturating_add(1);
-                    d.conflicts = d.conflicts.max(conflicts);
+                    if let Some(c) = conflicts {
+                        d.conflicts = d.conflicts.max(c);
+                    }
                 }
                 _ => d.later = d.later.saturating_add(1),
             }
@@ -1649,17 +1735,36 @@ fn conjunction(cx: &mut Context, ps: &[Expr]) -> Result<Expr, Error> {
     Ok(all)
 }
 
-/// The expressions at `model`, a symbol it does not list as zero.
+/// The expressions at `model`, a symbol it does not list at its declared known-one bits (zero
+/// when unconstrained).
 fn eval_in(cx: &mut Context, es: &[Expr], model: &Model) -> Result<Vec<BitVec>, Error> {
+    let mut defaults: Vec<(crate::SymbolKey, BitVec)> = Vec::new();
+    // (With nothing declared every default is zero: the symbols are not looked up.)
+    let symbols = match cx.any_declared() {
+        true => cx.symbols_in(es)?,
+        false => Vec::new(),
+    };
+    for sym in symbols {
+        let (Some(k), Some(w)) = (cx.symbol_key(sym).cloned(), cx.symbol_width(sym)) else {
+            continue;
+        };
+        if !model.iter().any(|(mk, _)| *mk == k) {
+            defaults.push((k.clone(), default_for_symbol(cx, &k, w)));
+        }
+    }
     let env = FnEnv(|key: &crate::SymbolKey, w: Width| {
-        Some((model.iter().find(|(k, _)| k == key)).map_or_else(|| BitVec::zero(w), |&(_, v)| v))
+        Some(
+            (model.iter().find(|(k, _)| k == key))
+                .or_else(|| defaults.iter().find(|(k, _)| k == key))
+                .map_or_else(|| BitVec::zero(w), |&(_, v)| v),
+        )
     });
     cx.eval(es, &env)
 }
 
 /// A model of `es` among `tries` assignments: every symbol all ones, then each symbol a
 /// value drawn from its name's place and the try's number (zero, all ones, one, a small
-/// number or any value), the same for the same question.
+/// number or any value), projected onto any declared known bits, the same for the same question.
 fn probe(cx: &mut Context, es: &[Expr], tries: u32) -> Result<Option<Model>, Error> {
     let mut symbols = Vec::new();
     for sym in cx.symbols_in(es)? {
@@ -1684,9 +1789,12 @@ fn probe(cx: &mut Context, es: &[Expr], tries: u32) -> Result<Option<Model>, Err
                     1 => BitVec::ones(*w),
                     2 => BitVec::wrapping_from_u64(*w, 1),
                     3 => BitVec::wrapping_from_u64(*w, next() % 256),
-                    _ => BitVec::wrapping_from_u64(*w, next()),
+                    _ => {
+                        let limbs: [u64; 8] = core::array::from_fn(|_| next());
+                        BitVec::wrapping_from_limbs(*w, &limbs)
+                    }
                 };
-                (k.clone(), v)
+                (k.clone(), fit_declared(cx, k, v))
             })
             .collect();
         if holds(cx, es, &model)? {
@@ -1900,9 +2008,11 @@ fn local_search(
                     let by = BitVec::wrapping_from_u64(w, next() % u64::from(w.bits()));
                     BitVec::apply_bin(BinOp::Shl, &one, &by).unwrap_or(one)
                 } else {
-                    BitVec::wrapping_from_limbs(w, &[next(), next(), next(), next()])
+                    let limbs: [u64; 8] = core::array::from_fn(|_| next());
+                    BitVec::wrapping_from_limbs(w, &limbs)
                 };
-                slot.1 = BitVec::apply_bin(BinOp::Xor, &slot.1, &change).unwrap_or(slot.1);
+                let xored = BitVec::apply_bin(BinOp::Xor, &slot.1, &change).unwrap_or(slot.1);
+                slot.1 = fit_declared(cx, &key, xored);
             }
         }
         let after = falses(cx, &candidate)?;
@@ -2037,6 +2147,9 @@ impl Repair {
                 let Some(key) = cx.symbol_key(id).cloned() else {
                     return Ok(false);
                 };
+                if !satisfies_declared(cx, &key, &target) {
+                    return Ok(false);
+                }
                 let Some(slot) = self.model.iter_mut().find(|(k, _)| *k == key) else {
                     return Ok(false);
                 };
@@ -2199,8 +2312,22 @@ impl Repair {
     }
 }
 
-/// Whether every 1-bit expression is true at `model`.
+/// Whether `model` respects declared known bits on every symbol of `ps` and makes every 1-bit
+/// expression of `ps` true.
 fn holds(cx: &mut Context, ps: &[Expr], model: &Model) -> Result<bool, Error> {
+    if !cx.any_declared() {
+        return Ok(eval_in(cx, ps, model)?.iter().all(|v| !v.is_zero()));
+    }
+    for sym in cx.symbols_in(ps)? {
+        let (Some(k), Some(w)) = (cx.symbol_key(sym).cloned(), cx.symbol_width(sym)) else {
+            continue;
+        };
+        let v = (model.iter().find(|(mk, _)| *mk == k))
+            .map_or_else(|| default_for_symbol(cx, &k, w), |&(_, v)| v);
+        if !satisfies_declared(cx, &k, &v) {
+            return Ok(false);
+        }
+    }
     Ok(eval_in(cx, ps, model)?.iter().all(|v| !v.is_zero()))
 }
 

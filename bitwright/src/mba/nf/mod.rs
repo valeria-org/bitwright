@@ -420,7 +420,122 @@ fn add_synth(s: &mut NfStats, t: &render::SynthTally) {
 #[derive(Debug)]
 enum Decline {
     Unsupported(&'static str),
+    SplitClass(BitVec),
     Exhausted,
+}
+
+/// Lazy linear / semi-linear combination `konst + Σ c_i·B_i + rest` accumulated across additive
+/// cones before a single flat bit-parallel evaluation and SOS Möbius transform.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Lin {
+    konst: BitVec,
+    bits: Vec<(Bits, BitVec)>,
+    rest: Poly,
+}
+
+impl Lin {
+    fn zero(w: Width) -> Self {
+        Self {
+            konst: BitVec::zero(w),
+            bits: Vec::new(),
+            rest: Poly::zero(w),
+        }
+    }
+
+    fn constant(w: Width, v: BitVec) -> Self {
+        Self {
+            konst: v,
+            bits: Vec::new(),
+            rest: Poly::zero(w),
+        }
+    }
+
+    fn from_bits(w: Width, b: Bits, coeff: BitVec) -> Self {
+        let mut out = Self::zero(w);
+        out.push_bits(b, coeff);
+        out
+    }
+
+    fn from_poly(p: Poly) -> Self {
+        let w = p.width();
+        Self {
+            konst: BitVec::zero(w),
+            bits: Vec::new(),
+            rest: p,
+        }
+    }
+
+    fn push_bits(&mut self, b: Bits, coeff: BitVec) {
+        if coeff.is_zero() {
+            return;
+        }
+        if let Some((_, c)) = self.bits.iter_mut().find(|(eb, _)| *eb == b) {
+            *c = self::word::bin(crate::ops::BinOp::Add, c, &coeff);
+            if c.is_zero() {
+                self.bits.retain(|(_, w)| !w.is_zero());
+            }
+            return;
+        }
+        self.bits.push((b, coeff));
+    }
+
+    fn neg(&self) -> Self {
+        let neg_bv = |v: &BitVec| self::word::un(crate::ops::UnOp::Neg, v);
+        Self {
+            konst: neg_bv(&self.konst),
+            bits: self
+                .bits
+                .iter()
+                .filter_map(|(b, c)| {
+                    let nc = neg_bv(c);
+                    (!nc.is_zero()).then(|| (b.clone(), nc))
+                })
+                .collect(),
+            rest: self.rest.neg(),
+        }
+    }
+
+    fn scale(&self, k: &BitVec) -> Self {
+        let w = self.rest.width();
+        if k.is_zero() {
+            return Self::zero(w);
+        }
+        let mul_bv = |v: &BitVec| self::word::bin(crate::ops::BinOp::Mul, v, k);
+        Self {
+            konst: mul_bv(&self.konst),
+            bits: self
+                .bits
+                .iter()
+                .filter_map(|(b, c)| {
+                    let sc = mul_bv(c);
+                    (!sc.is_zero()).then(|| (b.clone(), sc))
+                })
+                .collect(),
+            rest: self.rest.scale(k),
+        }
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        let mut out = Self {
+            konst: self::word::bin(crate::ops::BinOp::Add, &self.konst, &other.konst),
+            bits: self.bits.clone(),
+            rest: if self.rest.len() == 0 {
+                other.rest.clone()
+            } else if other.rest.len() == 0 {
+                self.rest.clone()
+            } else {
+                self.rest.add(&other.rest)
+            },
+        };
+        for (b, c) in &other.bits {
+            out.push_bits(b.clone(), *c);
+        }
+        out
+    }
+
+    fn sub(&self, other: &Self) -> Self {
+        self.add(&other.neg())
+    }
 }
 
 /// A node's normal form.
@@ -428,6 +543,7 @@ enum Decline {
 enum Form {
     Const(BitVec),
     Bits(Bits),
+    Lin(Lin),
     Poly(Poly),
 }
 
@@ -508,6 +624,9 @@ fn solve(
     let answer = match run(p, opts, budget, tally, &used) {
         Ok(a) => a,
         Err(Decline::Exhausted) => MbaAnswer::Exhausted,
+        Err(Decline::SplitClass(_)) => {
+            MbaAnswer::Unsupported("a constant splits a bit class".into())
+        }
         Err(Decline::Unsupported(why)) => MbaAnswer::Unsupported(why.into()),
     };
     (answer, used.get())
@@ -828,19 +947,28 @@ impl Pass<'_> {
 
     /// Node `i` read by a bitwise operator: its bitwise function (an atom when it is not one).
     fn bitwise(&mut self, i: u32, tally: &mut NfStats) -> Result<Bits, Decline> {
+        self.ensure_poly_if_lin(i, tally)?;
         let n = self.classes.len();
         match self.forms[i as usize].clone() {
             Some(Form::Const(v)) => {
                 let bits: Option<Vec<bool>> = (0..n).map(|c| self.classes.bit(&v, c)).collect();
                 bits.map(|b| Bits::constant(&b))
-                    .ok_or(Decline::Unsupported("a constant splits a bit class"))
+                    .ok_or(Decline::SplitClass(v))
             }
             Some(Form::Bits(f)) => Ok(f),
+            Some(Form::Lin(_)) => unreachable!(),
             Some(Form::Poly(p)) => {
                 // Arithmetic that is secretly a bitwise function is read as one, also once
                 // other atoms stand for their definitions (`(~a & d) − e` with `a` the atom
                 // `−e` is `d | a`); otherwise it is an atom, identified by its normal form.
                 let key = self.key_form(&p);
+                if key.degree() == 0 && key.atoms() == 0 {
+                    let v = key.konst();
+                    let bits: Option<Vec<bool>> = (0..n).map(|c| self.classes.bit(&v, c)).collect();
+                    return bits
+                        .map(|b| Bits::constant(&b))
+                        .ok_or(Decline::SplitClass(v));
+                }
                 if key.degree() <= 1 {
                     self.charge((key.len() as u64) << key.atoms().count_ones().min(12))?;
                     if let Some(f) = Bits::from_linear(&key, &self.classes) {
@@ -875,8 +1003,251 @@ impl Pass<'_> {
         }
     }
 
+    /// Materializes `Lin` via flat bit-parallel corner evaluation and SOS Möbius inversion.
+    fn lin_to_poly(&mut self, lin: &Lin) -> Result<Poly, Decline> {
+        let w = self.w;
+        let nc = self.classes.len();
+        let mut out = lin.rest.clone();
+        if !lin.konst.is_zero() {
+            out.add_term(Mono::new(), &lin.konst);
+        }
+        if lin.bits.is_empty() {
+            return Ok(out);
+        }
+
+        // Pack `lin.bits` into support buckets of at most 10 atoms (single >10-atom `Bits`
+        // stand in their own bucket of up to `bits::MAX_SUPPORT` = 12 atoms).
+        let mut buckets: Vec<(u64, Vec<usize>)> = Vec::new();
+        for (idx, (b, _)) in lin.bits.iter().enumerate() {
+            let bmask = b.support.iter().fold(0u64, |m, &a| m | (1u64 << a));
+            if b.support.len() <= 10
+                && let Some(bucket) = buckets
+                    .iter_mut()
+                    .find(|(m, _)| (*m | bmask).count_ones() <= 10)
+            {
+                bucket.0 |= bmask;
+                bucket.1.push(idx);
+            } else {
+                buckets.push((bmask, vec![idx]));
+            }
+        }
+
+        let mut proj: Vec<u16> = Vec::new();
+        let mut set_of: Vec<u64> = Vec::new();
+        for (bmask, indices) in buckets {
+            let support: Vec<u32> = (0..64).filter(|&a| (bmask >> a) & 1 == 1).collect();
+            let s = support.len();
+            let corners = 1usize << s;
+            let work_est = ((nc * corners) as u64)
+                .saturating_add((indices.len() * nc) as u64 * (corners as u64).div_ceil(8));
+            self.charge(work_est.max(1))?;
+
+            set_of.clear();
+            set_of.resize(corners, 0);
+            let mut span = 1usize;
+            for &a in &support {
+                let bit = 1u64 << a;
+                for q in 0..span {
+                    set_of[span + q] = set_of[q] | bit;
+                }
+                span <<= 1;
+            }
+
+            proj.clear();
+            proj.resize(corners, 0);
+
+            if w.bits() <= 64 {
+                let wmask = if w.bits() == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << w.bits()) - 1
+                };
+                let mut vals = vec![0u64; nc * corners];
+                for &idx in &indices {
+                    let (b, coeff) = &lin.bits[idx];
+                    let c64 = coeff.limbs()[0];
+                    if b.support.is_empty() {
+                        for c in 0..nc {
+                            if bits::get(&b.tables[c], 0) {
+                                let row = &mut vals[c * corners..(c + 1) * corners];
+                                for slot in row {
+                                    *slot = slot.wrapping_add(c64);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    proj[0] = 0;
+                    let mut sp = 1usize;
+                    let mut sub_bit = 0usize;
+                    for &a in &support {
+                        if sub_bit < b.support.len() && b.support[sub_bit] == a {
+                            let flag = 1u16 << sub_bit;
+                            for q in 0..sp {
+                                proj[sp + q] = proj[q] | flag;
+                            }
+                            sub_bit += 1;
+                        } else {
+                            proj.copy_within(0..sp, sp);
+                        }
+                        sp <<= 1;
+                    }
+                    for c in 0..nc {
+                        let tbl = &b.tables[c];
+                        if tbl.iter().all(|&word| word == 0) {
+                            continue;
+                        }
+                        let row = &mut vals[c * corners..(c + 1) * corners];
+                        for (q, slot) in row.iter_mut().enumerate() {
+                            if bits::get(tbl, usize::from(proj[q])) {
+                                *slot = slot.wrapping_add(c64);
+                            }
+                        }
+                    }
+                }
+                for (c, row) in vals.chunks_exact_mut(corners).enumerate() {
+                    for bit in 0..s {
+                        let step = 1usize << bit;
+                        for q in 0..corners {
+                            if q & step != 0 {
+                                row[q] = row[q].wrapping_sub(row[q ^ step]);
+                            }
+                        }
+                    }
+                    let k0 = row[0] & wmask;
+                    if k0 != 0 {
+                        let kv = BitVec::wrapping_from_u64(w, k0);
+                        out.add_term(
+                            Mono::new(),
+                            &self::word::bin(crate::ops::BinOp::Mul, &kv, self.classes.mask(c)),
+                        );
+                    }
+                    for (q, &raw) in row.iter().enumerate().skip(1) {
+                        let v = raw & wmask;
+                        if v != 0 {
+                            out.add_term(
+                                Mono::of(
+                                    Sym {
+                                        set: set_of[q],
+                                        class: c as u16,
+                                    },
+                                    1,
+                                ),
+                                &BitVec::wrapping_from_u64(w, v),
+                            );
+                        }
+                    }
+                }
+            } else {
+                let mut vals = vec![BitVec::zero(w); nc * corners];
+                for &idx in &indices {
+                    let (b, coeff) = &lin.bits[idx];
+                    proj[0] = 0;
+                    let mut sp = 1usize;
+                    let mut sub_bit = 0usize;
+                    for &a in &support {
+                        if sub_bit < b.support.len() && b.support[sub_bit] == a {
+                            let flag = 1u16 << sub_bit;
+                            for q in 0..sp {
+                                proj[sp + q] = proj[q] | flag;
+                            }
+                            sub_bit += 1;
+                        } else {
+                            proj.copy_within(0..sp, sp);
+                        }
+                        sp <<= 1;
+                    }
+                    for c in 0..nc {
+                        let tbl = &b.tables[c];
+                        if tbl.iter().all(|&word| word == 0) {
+                            continue;
+                        }
+                        let row = &mut vals[c * corners..(c + 1) * corners];
+                        for (q, slot) in row.iter_mut().enumerate() {
+                            if bits::get(tbl, usize::from(proj[q])) {
+                                *slot = self::word::bin(crate::ops::BinOp::Add, slot, coeff);
+                            }
+                        }
+                    }
+                }
+                for (c, row) in vals.chunks_exact_mut(corners).enumerate() {
+                    for bit in 0..s {
+                        let step = 1usize << bit;
+                        for q in 0..corners {
+                            if q & step != 0 {
+                                row[q] = self::word::bin(
+                                    crate::ops::BinOp::Sub,
+                                    &row[q],
+                                    &row[q ^ step],
+                                );
+                            }
+                        }
+                    }
+                    if !row[0].is_zero() {
+                        out.add_term(
+                            Mono::new(),
+                            &self::word::bin(crate::ops::BinOp::Mul, &row[0], self.classes.mask(c)),
+                        );
+                    }
+                    for (q, v) in row.iter().enumerate().skip(1) {
+                        if !v.is_zero() {
+                            out.add_term(
+                                Mono::of(
+                                    Sym {
+                                        set: set_of[q],
+                                        class: c as u16,
+                                    },
+                                    1,
+                                ),
+                                v,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ensures `self.forms[i]` is materialized from `Form::Lin` into `Form::Poly` (or an opaque
+    /// `Form::Bits` atom if the cancelled polynomial still exceeds `opts.max_terms`).
+    fn ensure_poly_if_lin(&mut self, i: u32, tally: &mut NfStats) -> Result<(), Decline> {
+        let Some(Form::Lin(lin)) = self.forms[i as usize].clone() else {
+            return Ok(());
+        };
+        let p = self.lin_to_poly(&lin)?;
+        if p.len() > self.opts.max_terms as usize {
+            tally.declined_terms += 1;
+            let at = self.verbatim_atom(i, tally)?;
+            self.forms[i as usize] = Some(Form::Bits(Bits::atom(self.classes.len(), at)));
+        } else {
+            self.forms[i as usize] = Some(Form::Poly(p));
+        }
+        Ok(())
+    }
+
+    /// Node `i` read lazily in an additive/constant-scale cone.
+    fn lin(&mut self, i: u32, tally: &mut NfStats) -> Result<Lin, Decline> {
+        let w = self.w;
+        match self.forms[i as usize].clone() {
+            Some(Form::Const(v)) => Ok(Lin::constant(w, v)),
+            Some(Form::Bits(b)) => Ok(Lin::from_bits(w, b, self::word::one(w))),
+            Some(Form::Lin(l)) => Ok(l),
+            Some(Form::Poly(p)) => Ok(Lin::from_poly(p)),
+            None => {
+                let a = self.verbatim_atom(i, tally)?;
+                Ok(Lin::from_bits(
+                    w,
+                    Bits::atom(self.classes.len(), a),
+                    self::word::one(w),
+                ))
+            }
+        }
+    }
+
     /// Node `i` read arithmetically: its polynomial.
     fn poly(&mut self, i: u32, tally: &mut NfStats) -> Result<Poly, Decline> {
+        self.ensure_poly_if_lin(i, tally)?;
         let f = match self.forms[i as usize].clone() {
             Some(f) => f,
             None => {
@@ -898,6 +1269,7 @@ impl Pass<'_> {
                     p
                 }
             }
+            Form::Lin(_) => unreachable!(),
             Form::Poly(p) => p,
         };
         Ok(p)
@@ -976,15 +1348,15 @@ impl Pass<'_> {
             for (m, c) in p.terms() {
                 q.add_term(
                     m.clone(),
-                    &self::word::bin(crate::ops::BinOp::AShr, c, &amount),
+                    &self::word::bin(crate::ops::BinOp::LShr, c, &amount),
                 );
             }
             q
         };
         let (ha, hb) = (half(&pa), half(&pb));
         let (Some(x), Some(y)) = (
-            Bits::from_linear(&ha.expand_full(&self.classes), &self.classes),
-            Bits::from_linear(&hb.expand_full(&self.classes), &self.classes),
+            Bits::from_linear_shifted(&ha.expand_full(&self.classes), &self.classes, k),
+            Bits::from_linear_shifted(&hb.expand_full(&self.classes), &self.classes, k),
         ) else {
             return Ok(None);
         };
@@ -1099,6 +1471,8 @@ impl Pass<'_> {
                 Form::Bits(Bits::atom(self.classes.len(), v))
             }
             MOp::And | MOp::Or | MOp::Xor => {
+                self.ensure_poly_if_lin(a, tally)?;
+                self.ensure_poly_if_lin(b, tally)?;
                 if let Some(f) = self.known_bits(n.op, a, b)? {
                     tally.known_bits += 1;
                     return Ok(Some(f));
@@ -1149,32 +1523,39 @@ impl Pass<'_> {
             MOp::Not => match self.forms[a as usize].clone() {
                 Some(Form::Bits(f)) => Form::Bits(f.not()),
                 _ => {
-                    let x = self.poly(a, tally)?;
-                    Form::Poly(Poly::constant(BitVec::ones(w)).sub(&x))
+                    let x = self.lin(a, tally)?;
+                    Form::Lin(Lin::constant(w, BitVec::ones(w)).sub(&x))
                 }
             },
             MOp::Add | MOp::Sub => {
-                let (x, y) = (self.poly(a, tally)?, self.poly(b, tally)?);
-                self.charge((x.len() + y.len()) as u64)?;
-                let r = if n.op == MOp::Add {
+                let (x, y) = (self.lin(a, tally)?, self.lin(b, tally)?);
+                self.charge((x.bits.len() + y.bits.len() + x.rest.len() + y.rest.len()) as u64)?;
+                let mut r = if n.op == MOp::Add {
                     x.add(&y)
                 } else {
                     x.sub(&y)
                 };
-                if r.len() > self.opts.max_terms as usize {
+                if r.rest.len() > self.opts.max_terms as usize {
                     return self.opaque(i, tally);
                 }
-                Form::Poly(r)
+                if r.bits.len() > 256 {
+                    let p = self.lin_to_poly(&r)?;
+                    if p.len() > self.opts.max_terms as usize {
+                        return self.opaque(i, tally);
+                    }
+                    r = Lin::from_poly(p);
+                }
+                Form::Lin(r)
             }
-            MOp::Neg => Form::Poly(self.poly(a, tally)?.neg()),
+            MOp::Neg => Form::Lin(self.lin(a, tally)?.neg()),
             MOp::Shl(k) => {
-                let x = self.poly(a, tally)?;
+                let x = self.lin(a, tally)?;
                 let s = self::word::bv_shl(&self::word::one(w), u32::from(k));
-                Form::Poly(x.scale(&s))
+                Form::Lin(x.scale(&s))
             }
             MOp::Mul => match (self.cst[a as usize], self.cst[b as usize]) {
-                (Some(k), _) => Form::Poly(self.poly(b, tally)?.scale(&k)),
-                (_, Some(k)) => Form::Poly(self.poly(a, tally)?.scale(&k)),
+                (Some(k), _) => Form::Lin(self.lin(b, tally)?.scale(&k)),
+                (_, Some(k)) => Form::Lin(self.lin(a, tally)?.scale(&k)),
                 _ => {
                     let (mut x, mut y) = (self.poly(a, tally)?, self.poly(b, tally)?);
                     let cap = self.opts.max_degree;
@@ -1666,6 +2047,9 @@ fn normalize(
         tally.declined_atoms += 1;
         return Err(Decline::Unsupported("too many variables"));
     }
+    // `used` counts the whole question (a fixed-point pass in `run` comes after others): this
+    // call's own budget is `budget.steps` from here.
+    let used_before = used.get();
     let mut work = Steps::counted(budget.steps, used);
     {
         use certify::Meter;
@@ -1679,44 +2063,92 @@ fn normalize(
         work.charge(nodes.len() as u64 + facts)
             .map_err(|()| Decline::Exhausted)?;
     }
-    let consts = class_constants(p, &live, &cst, w);
-    let Some(classes) = Classes::new(w, &consts, opts.max_classes as usize) else {
-        tally.declined_classes += 1;
-        return Err(Decline::Unsupported("too many bit classes"));
-    };
+    let mut consts = class_constants(p, &live, &cst, w);
     let (canon, cost) = canonical(p, &live);
     // Answers are measured against the question as asked.
     let input_cost = match lowered {
         Some(_) => canonical(input, &self::live(input)).1,
         None => cost,
     };
-    let mut pass = Pass {
-        p,
-        w,
-        opts: *opts,
-        classes,
-        work,
-        cst,
-        canon,
-        forms: vec![None; nodes.len()],
-        atoms: (0..p.vars().len() as u32).map(Def::Var).collect(),
-        atom_nf: vec![None; p.vars().len()],
-        atom_of: HashMap::new(),
-        factors: Vec::new(),
-        sample: None,
-        discoveries: 0,
-        halved: false,
-    };
-    for (i, &is_live) in live.iter().enumerate() {
-        if !is_live {
+    let mut refinements = 0usize;
+    let (mut pass, mut nf) = loop {
+        let Some(classes) = Classes::new(w, &consts, opts.max_classes as usize) else {
+            tally.declined_classes += 1;
+            return Err(Decline::Unsupported("too many bit classes"));
+        };
+        // What this call left after its earlier passes (each refinement starts afresh).
+        let spent = used.get().saturating_sub(used_before);
+        let step_work = Steps::counted(budget.steps.saturating_sub(spent), used);
+        let mut pass = Pass {
+            p,
+            w,
+            opts: *opts,
+            classes,
+            work: step_work,
+            cst: cst.clone(),
+            canon: canon.clone(),
+            forms: vec![None; nodes.len()],
+            atoms: (0..p.vars().len() as u32).map(Def::Var).collect(),
+            atom_nf: vec![None; p.vars().len()],
+            atom_of: HashMap::new(),
+            factors: Vec::new(),
+            sample: None,
+            discoveries: 0,
+            halved: false,
+        };
+        let mut pass_tally = NfStats::default();
+        let mut split = None;
+        for (i, &is_live) in live.iter().enumerate() {
+            if !is_live {
+                continue;
+            }
+            // (What the pass found so far is counted however it ends, but by a refinement:
+            // that pass starts again.)
+            if let Err(e) = pass.charge(1) {
+                add_stats(tally, &pass_tally);
+                return Err(e);
+            }
+            match pass.visit(i as u32, &mut pass_tally) {
+                Ok(f) => pass.forms[i] = f,
+                Err(Decline::SplitClass(v)) => {
+                    split = Some(v);
+                    break;
+                }
+                Err(e) => {
+                    add_stats(tally, &pass_tally);
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(v) = split {
+            if refinements >= 8 || consts.contains(&v) {
+                add_stats(tally, &pass_tally);
+                return Err(Decline::Unsupported("a constant splits a bit class"));
+            }
+            consts.push(v);
+            refinements += 1;
             continue;
         }
-        pass.charge(1)?;
-        let f = pass.visit(i as u32, tally)?;
-        pass.forms[i] = f;
-    }
-    let root = nodes.len() as u32 - 1;
-    let mut nf = pass.poly(root, tally)?;
+        let root = nodes.len() as u32 - 1;
+        match pass.poly(root, &mut pass_tally) {
+            Ok(nf) => {
+                add_stats(tally, &pass_tally);
+                break (pass, nf);
+            }
+            Err(Decline::SplitClass(v)) => {
+                if refinements >= 8 || consts.contains(&v) {
+                    add_stats(tally, &pass_tally);
+                    return Err(Decline::Unsupported("a constant splits a bit class"));
+                }
+                consts.push(v);
+                refinements += 1;
+            }
+            Err(e) => {
+                add_stats(tally, &pass_tally);
+                return Err(e);
+            }
+        }
+    };
     pass.charge(nf.len() as u64 * u64::from(nf.degree() + 1))?;
     // The exact reductions; the one-position rule comes after unmasking (below), which it
     // would otherwise hide from.
@@ -2749,6 +3181,7 @@ fn run(
         // Solving the answer again then finds nothing smaller either.
         for _ in 0..3 {
             let mut scratch = NfStats::default();
+            let before_used = used.get();
             let again = normalize(
                 &answer,
                 opts,
@@ -2760,10 +3193,10 @@ fn run(
                 let mut w2 = Steps::counted(m.work.left, used);
                 // Ties in nodes may still weigh less.
                 let r = best_rendering(&answer, &m, cost.0 + 1, &mut w2, &mut scratch);
-                let spent = work.left - w2.left.min(work.left);
-                work = Steps::counted(work.left - spent, used);
                 r.map(|r| (m.halved, r))
             });
+            let spent = used.get().saturating_sub(before_used);
+            work = Steps::counted(work.left.saturating_sub(spent), used);
             tally.candidates += scratch.candidates;
             // Running short only ends the search.
             match again.map(|(halved, r)| (halved, r.exact)) {

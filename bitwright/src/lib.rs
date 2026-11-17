@@ -90,6 +90,7 @@ macro_rules! setters {
 pub mod batch;
 #[cfg(feature = "check")]
 pub mod check;
+mod cobra;
 pub mod engine;
 #[cfg(feature = "eqsat")]
 pub mod eqsat;

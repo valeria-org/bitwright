@@ -24,9 +24,11 @@ pub(crate) struct State {
     /// `pass::mba::ask`).
     pub(crate) exhausted: crate::hash::IdMap<crate::mba::CacheKey, u64>,
     /// The roots of fragments the MBA phase asked about in this call and kept as they are:
-    /// declined by the solver for their size, answered with nothing that would make the DAG
-    /// smaller, or with an answer the gate could not prove (see `pass::mba::holds_kept`).
-    pub(crate) kept: crate::hash::IdMap<u32, ()>,
+    /// `true` when declined by a monotonic size cap, step exhaustion, or `NoSimpler` past
+    /// `KEPT_STEPS` (a larger question would pay for that normal form again), `false` when kept
+    /// locally (`not_smaller` or `proof_unknown`), which only blocks ancestors that do not
+    /// combine the kept core with another branch sharing its atoms.
+    pub(crate) kept: crate::hash::IdMap<u32, bool>,
     /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
     /// rounds ask within a few steps each until one changes nothing, and only then deeper.
     pub(crate) depth: u8,
@@ -543,9 +545,10 @@ fn sweep_inner(
             count(r).opaque_skipped += 1;
             continue;
         }
+        let mut budget_starved = false;
         if !decided && !refuted && mixed {
             let seen;
-            (decided, refuted, seen) =
+            (decided, refuted, seen, budget_starved) =
                 asked!('nodes, readings_prove(r, cx, cfg, subject, &k, SWEEP_SHARE));
             // The candidate as it is written, where the reduced one was not decided: taking
             // each operand on the bits its user reads writes one value read under several
@@ -554,6 +557,7 @@ fn sweep_inner(
             if !decided && !refuted && subject != cur {
                 let again = asked!('nodes, readings_prove(r, cx, cfg, cur, &k, SWEEP_SHARE));
                 decided = again.0;
+                budget_starved |= again.3;
             }
             // the root, a constant some reading's free atoms refute, one case of
             // the condition it tests at a time (see `cases_prove`). The root only: inner
@@ -568,6 +572,7 @@ fn sweep_inner(
         }
         if mixed
             && !all_constant
+            && (decided || !budget_starved)
             && let Some(s) = shape
         {
             cx.sweep.note(s, decided);
@@ -784,13 +789,13 @@ fn related(
     // difference took a thousand steps for half of them and the whole share for the ones
     // they could not prove.
     if subject != diff {
-        let (first, _, _) = readings_prove(r, cx, cfg, diff, &zero, RELATED_FIRST_SHARE)?;
+        let (first, _, _, _) = readings_prove(r, cx, cfg, diff, &zero, RELATED_FIRST_SHARE)?;
         if first {
             count(r).opaque_proved += 1;
             return Ok(Related::Proved(e));
         }
     }
-    let (decided, _, _) = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE)?;
+    let (decided, _, _, _) = readings_prove(r, cx, cfg, subject, &zero, SWEEP_SHARE)?;
     if decided {
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
@@ -2563,13 +2568,13 @@ fn readings_prove(
     subject: u32,
     k: &crate::BitVec,
     share: u64,
-) -> Result<(bool, bool, bool), Stop> {
-    let (mut decided, mut refuted, mut seen) = (false, false, false);
+) -> Result<(bool, bool, bool, bool), Stop> {
+    let (mut decided, mut refuted, mut seen, mut budget_starved) = (false, false, false, false);
     // Each reading with its cost, and whether a refutation of it is one of `subject` (the
     // whole fragment, no open candidate cut out of it).
     let mut readings: Vec<(u64, bool, MbaExpr, Bindings)> = Vec::new();
     if r.mba.undecided.contains_key(&subject) {
-        return Ok((false, false, false));
+        return Ok((false, false, false, false));
     }
     let cuts = match r.mba.undecided.is_empty() {
         true => shared(r, cx, cfg, subject, SWEEP_CUTS, false),
@@ -2640,6 +2645,7 @@ fn readings_prove(
             // the gate's are, within a small share and a part of the call's pass work in
             // all (see `BORROW_SHARE`): what decides a sum over one value under masks is a
             // comparison of two forms, a few hundred evaluations.
+            let requested_share = share;
             let steps = r.meter.left_in(|b| b.mba_steps);
             let (report, rest, share) = if steps.saturating_mul(EVALS_PER_STEP) < BORROW_SHARE {
                 let room =
@@ -2653,9 +2659,13 @@ fn readings_prove(
                 (report?, rest, share)
             } else {
                 let mut meter = Steps::new(r, share);
+                let effective = meter.share;
                 let report = certify::prove(&m, &c, &mut meter)?;
-                (report, meter.share, share)
+                (report, meter.share, effective)
             };
+            if report.over_budget && share < requested_share {
+                budget_starved = true;
+            }
             // The certificate took most of its share and left the question open: the readings
             // not yet asked are larger, and theirs would too. (Not the same reading asked
             // again through its atoms' known bits: that is one more question of this
@@ -2699,10 +2709,10 @@ fn readings_prove(
             }
         }
     }
-    if !decided && !refuted && open_asked {
+    if !decided && !refuted && open_asked && !budget_starved {
         r.mba.undecided.insert(subject, ());
     }
-    Ok((decided, refuted, seen))
+    Ok((decided, refuted, seen, budget_starved))
 }
 
 /// Whether `values` contains exactly two distinct values.
@@ -3721,8 +3731,11 @@ fn sliced_itself(
 
 /// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
 /// this call and kept as it is (`Runner::mba_kept`): the solver declined it for its size (too
-/// many atoms, variables or bit classes), or its answer would not have made the DAG smaller,
-/// or the gate could not prove it. The larger fragment is then not asked. It has as many
+/// many atoms, variables or bit classes), ran out of steps on it, or spent `KEPT_STEPS` or more
+/// finding it had no simpler form, which keeps every larger fragment back; or its answer would
+/// not have made the DAG smaller, or the gate could not prove it, which keeps back only a
+/// `root` that wraps it alone (no other branch of `root` reads one of its atoms, where the two
+/// could cancel when solved whole: `core − core'`). The larger fragment is then not asked. It has as many
 /// atoms as the one inside it; the solver would pay for the inner fragment's normal form
 /// again, at a cost that grows with the fragment; and what kept the inner answer back (its
 /// nodes are shared, its normal form is as large, no certificate decides it) keeps back an
@@ -3741,6 +3754,7 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
         return None;
     }
     let mut found = None;
+    let mut local_kept: Vec<u32> = Vec::new();
     let mut seen = super::Lease::new(cx.len());
     for &a in &bindings.atoms {
         seen.insert(a, 0);
@@ -3750,13 +3764,96 @@ fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) 
         if seen.insert(i, 0) {
             continue;
         }
-        if r.mba.kept.contains_key(&i) {
-            return Some(Kept::Whole);
+        if let Some(&hard) = r.mba.kept.get(&i) {
+            if hard {
+                return Some(Kept::Whole);
+            }
+            local_kept.push(i);
         }
         if r.mba.shallow.contains_key(&i) {
             found = Some(Kept::Shallow);
         }
         stack.extend(cx.node(i).children());
+    }
+    if !local_kept.is_empty() {
+        // A locally kept sub-fragment (`not_smaller`, `proof_unknown`) only keeps `root` back
+        // when `root` is an isolated wrapper over it: no atom of `i` is reachable from `root`
+        // bypassing `i`. Where another branch of `root` reads one, the two branches can cancel
+        // or shrink together when solved whole.
+        //
+        // One walk gives every interior node a slot: the atoms below it (bit `k` for
+        // `bindings.atoms[k]`, the first 64) and its users here. The atoms reachable bypassing
+        // `i` are those below the operands of `i`'s users (up to `root`) that do not lead to
+        // `i`, so each kept fragment reads its users, not the whole fragment again.
+        let mut atom_idx = super::Lease::new(cx.len());
+        for (idx, &a) in bindings.atoms.iter().enumerate() {
+            atom_idx.insert(a, idx as u32);
+        }
+        let mut slot = super::Lease::new(cx.len());
+        let (mut nodes, mut below) = (Vec::<u32>::new(), Vec::<u64>::new());
+        let atoms_of = |c: u32, slot: &super::Lease, below: &[u64]| match atom_idx.get(c) {
+            Some(k) if k < 64 => 1u64 << k,
+            Some(_) => 0,
+            None => slot.get(c).map_or(0, |s| below[s as usize]),
+        };
+        // (In post-order: a node is left once every operand has been.)
+        let mut walk = vec![(root, false)];
+        while let Some((x, left)) = walk.pop() {
+            if left {
+                let m = (cx.node(x).children()).fold(0, |m, c| m | atoms_of(c, &slot, &below));
+                if let Some(s) = slot.get(x) {
+                    below[s as usize] = m;
+                }
+                continue;
+            }
+            if slot.get(x).is_some() {
+                continue;
+            }
+            slot.insert(x, nodes.len() as u32);
+            nodes.push(x);
+            below.push(0);
+            walk.push((x, true));
+            let operands = cx.node(x).children().filter(|&c| atom_idx.get(c).is_none());
+            walk.extend(operands.map(|c| (c, false)));
+        }
+        let mut users: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
+        for &x in &nodes {
+            for c in cx.node(x).children() {
+                if let Some(s) = slot.get(c) {
+                    users[s as usize].push(x);
+                }
+            }
+        }
+        for i in local_kept {
+            let Some(si) = slot.get(i) else {
+                continue;
+            };
+            let inner = below[si as usize];
+            // `i`'s users up to `root`, each once.
+            let mut up = super::Lease::new(cx.len());
+            let (mut todo, mut ancestors) = (vec![si], Vec::new());
+            while let Some(s) = todo.pop() {
+                for &u in &users[s as usize] {
+                    if !up.insert(u, 0)
+                        && let Some(su) = slot.get(u)
+                    {
+                        ancestors.push(u);
+                        todo.push(su);
+                    }
+                }
+            }
+            let mut outer = 0u64;
+            for &u in &ancestors {
+                for c in cx.node(u).children() {
+                    if c != i && up.get(c).is_none() {
+                        outer |= atoms_of(c, &slot, &below);
+                    }
+                }
+            }
+            if outer & inner == 0 {
+                return Some(Kept::Whole);
+            }
+        }
     }
     found
 }
@@ -3787,9 +3884,9 @@ const SOLVE_SHARE_MIN: u64 = 1 << 16;
 /// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
 const SWEEP_RESERVE: u64 = 16;
 
-/// The solver steps from which a fragment with no simpler form is kept from the questions
-/// above it (see [`holds_kept`]).
-const KEPT_STEPS: u64 = 1 << 12;
+/// The solver steps from which a fragment with no simpler form is kept from isolated wrapper
+/// questions above it (see [`holds_kept`]).
+const KEPT_STEPS: u64 = 1 << 16;
 
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
 /// the answer replaces `n`.
@@ -3959,7 +4056,7 @@ fn ask(
                             return Ok(Step::Normal(Fin::PROVISIONAL));
                         }
                         // A fragment that holds this one is no smaller a question.
-                        r.mba.kept.insert(root, ());
+                        r.mba.kept.insert(root, true);
                     }
                     if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
                         // Run short within what the account left it: more budget might
@@ -3971,12 +4068,12 @@ fn ask(
                         r.mba.answers.insert(key, a.clone());
                     }
                     let kept = match &a {
-                        MbaAnswer::Unsupported(why) => why.starts_with("too many"),
-                        MbaAnswer::NoSimpler => spent >= KEPT_STEPS,
-                        _ => false,
+                        MbaAnswer::Unsupported(why) => why.starts_with("too many").then_some(true),
+                        MbaAnswer::NoSimpler => (spent >= KEPT_STEPS).then_some(true),
+                        _ => None,
                     };
-                    if kept {
-                        r.mba.kept.insert(root, ());
+                    if let Some(hard) = kept {
+                        r.mba.kept.insert(root, hard);
                     }
                     a
                 }
@@ -4000,7 +4097,7 @@ fn ask(
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
-                        r.mba.kept.insert(root, ());
+                        r.mba.kept.insert(root, false);
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
                         discard(r, cx, before);
@@ -4051,7 +4148,7 @@ fn ask(
                             Fin::capped(Exhausted::PassWork)
                         } else {
                             r.mba.unproved.insert(key, ());
-                            r.mba.kept.insert(root, ());
+                            r.mba.kept.insert(root, false);
                             Fin::FINAL
                         };
                         return Ok(Step::Normal(fin));
@@ -4116,7 +4213,7 @@ fn ask(
         count(r).simplified += 1;
     } else if e != n {
         count(r).not_smaller += 1;
-        r.mba.kept.insert(root, ());
+        r.mba.kept.insert(root, false);
     }
     Ok(out)
 }

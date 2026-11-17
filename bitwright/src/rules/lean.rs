@@ -30,7 +30,7 @@ use super::ir::{
 use crate::ops::{BinOp, CmpOpExt, UnOp};
 
 /// Words Lean reserves, which an identifier must quote as `«…»`.
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "at",
     "by",
     "do",
@@ -41,6 +41,7 @@ const KEYWORDS: &[&str] = &[
     "have",
     "if",
     "in",
+    "lemma",
     "let",
     "match",
     "mut",
@@ -102,7 +103,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// A Lean identifier for a name (one component).
-fn ident(name: &str) -> String {
+pub(crate) fn ident(name: &str) -> String {
     let plain = name
         .chars()
         .next()
@@ -140,6 +141,63 @@ impl Out<'_> {
             self.unsupported = Some(what.to_string());
         }
         "sorry".into()
+    }
+
+    /// Positive and negative parts of a width expression as sums of `Nat` terms (`"0"` when empty).
+    fn wexpr_parts(&self, w: &WExpr) -> (String, String) {
+        let (mut pos, mut neg) = (Vec::new(), Vec::new());
+        for &(v, c) in &w.terms {
+            let name = self
+                .rule
+                .width_vars
+                .get(v as usize)
+                .map_or_else(|| format!("V{v}"), |s| ident(s));
+            let t = match c.unsigned_abs() {
+                1 => name,
+                a => format!("{a} * {name}"),
+            };
+            if c > 0 {
+                pos.push(t);
+            } else if c < 0 {
+                neg.push(t);
+            }
+        }
+        match w.konst {
+            k if k > 0 => pos.push(k.to_string()),
+            k if k < 0 => neg.push(k.unsigned_abs().to_string()),
+            _ => {}
+        }
+        let join = |parts: Vec<String>| {
+            if parts.is_empty() {
+                "0".to_string()
+            } else {
+                parts.join(" + ")
+            }
+        };
+        (join(pos), join(neg))
+    }
+
+    /// Two width expressions transposed so neither side uses truncating `Nat` subtraction:
+    /// `(a_pos - a_neg) op (b_pos - b_neg)` in `ℤ` is `(a_pos + b_neg) op (b_pos + a_neg)` in `ℕ`.
+    fn wcmp_sides(&self, a: &WExpr, b: &WExpr) -> (String, String) {
+        let mut d = WExpr {
+            konst: a.konst - b.konst,
+            terms: a.terms.clone(),
+        };
+        for &(v, c) in &b.terms {
+            if let Some(slot) = d.terms.iter_mut().find(|(u, _)| *u == v) {
+                slot.1 -= c;
+            } else {
+                d.terms.push((v, -c));
+            }
+        }
+        d.terms.retain(|&(_, c)| c != 0);
+        // If `a` and `b` already have no negative terms or constants, keep them as written.
+        let nonneg = |w: &WExpr| w.konst >= 0 && w.terms.iter().all(|&(_, c)| c >= 0);
+        if nonneg(a) && nonneg(b) {
+            return (self.wexpr(a), self.wexpr(b));
+        }
+        self.wexpr_parts(&d)
     }
 
     /// A width expression: a natural number (`b - c` truncates in Lean, and every width a rule
@@ -420,7 +478,7 @@ fn statement(rule: &Rule, vals: Option<&[u16]>, proof: &str) -> Result<String, S
         for (k, c) in rule.constraints.iter().enumerate() {
             let text = match c {
                 WCons::Cmp(a, op, b) => {
-                    let (a, b) = (o.wexpr(a), o.wexpr(b));
+                    let (a, b) = o.wcmp_sides(a, b);
                     let op = match op {
                         WCmp::Eq => "=",
                         WCmp::Ne => "≠",
@@ -431,7 +489,15 @@ fn statement(rule: &Rule, vals: Option<&[u16]>, proof: &str) -> Result<String, S
                     };
                     format!("{a} {op} {b}")
                 }
-                WCons::Mod(a, m, r) => format!("({}) % {m} = {r}", o.wexpr(a)),
+                WCons::Mod(a, m, r) => {
+                    let nonneg = a.konst >= 0 && a.terms.iter().all(|&(_, c)| c >= 0);
+                    if nonneg {
+                        format!("({}) % {m} = {r}", o.wexpr(a))
+                    } else {
+                        let (pos, neg) = o.wexpr_parts(a);
+                        format!("((({pos} : Int) - ({neg} : Int)) % {m} = {r})")
+                    }
+                }
             };
             let _ = write!(s, " (hw{k} : {text})");
         }

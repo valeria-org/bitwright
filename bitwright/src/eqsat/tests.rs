@@ -357,7 +357,7 @@ fn applied_matches_do_not_starve_later_ones() {
 #[test]
 fn congruence_and_extraction_ties() {
     let mut meter = Meter::new(Budget::UNLIMITED, None);
-    let mut eg = EGraph::new();
+    let mut eg = EGraph::new(Width::W8);
     let leaf = |eg: &mut EGraph, i: u32, m: &mut Meter<'_>| {
         eg.add(
             ENode {
@@ -405,28 +405,10 @@ fn congruence_and_extraction_ties() {
     let chosen = best[&c].1;
     assert!(eg.imported[chosen as usize]);
     // A union of two different constants is a contract violation.
-    let one = eg
-        .add(
-            ENode {
-                op: EOp::Const(BitVec::one(Width::W8)),
-                kids: [0, 0],
-            },
-            true,
-            &mut meter,
-        )
-        .ok()
-        .unwrap();
-    let two = eg
-        .add(
-            ENode {
-                op: EOp::Const(BitVec::from_u64(Width::W8, 2).unwrap()),
-                kids: [0, 0],
-            },
-            true,
-            &mut meter,
-        )
-        .ok()
-        .unwrap();
+    let one_node = eg.const_node(BitVec::one(Width::W8));
+    let one = eg.add(one_node, true, &mut meter).ok().unwrap();
+    let two_node = eg.const_node(BitVec::from_u64(Width::W8, 2).unwrap());
+    let two = eg.add(two_node, true, &mut meter).ok().unwrap();
     assert!(matches!(
         eg.union(one, two, &mut meter),
         Err(Halt::Contract)
@@ -436,7 +418,7 @@ fn congruence_and_extraction_ties() {
 #[test]
 fn extraction_propagates_costs_without_changing_selected_nodes() {
     let mut meter = Meter::new(Budget::UNLIMITED, None);
-    let mut eg = EGraph::new();
+    let mut eg = EGraph::new(Width::W8);
     let add = |eg: &mut EGraph, op, kid, meter: &mut Meter<'_>| {
         eg.add(ENode { op, kids: [kid, 0] }, true, meter)
             .ok()
@@ -620,7 +602,7 @@ fn matching_stops_at_its_limit() {
     // A class holding every sum `a_i + a_j` of 10 leaves (one class: all united), and a root
     // `X + X`: the pattern `(x + y) + (z + t)` has 200 × 200 matches at the root.
     let mut m = Meter::new(Budget::UNLIMITED, None);
-    let mut eg = EGraph::new();
+    let mut eg = EGraph::new(Width::W32);
     let leaf = |eg: &mut EGraph, m: &mut Meter<'_>, k: u32| {
         let n = ENode {
             op: EOp::Leaf(k),

@@ -207,10 +207,43 @@ fn candidate(
             stack.extend(cx.children(e)?);
         }
     }
+    // An atom cannot be an independent parameter when `after` also reads a proper subexpression
+    // of it: split any outer atom that strictly contains another until parameters are disjoint.
+    loop {
+        let mut split_idx = None;
+        for (i, &outer) in atoms.iter().enumerate() {
+            let sub = cx.post_order(&[outer])?;
+            if atoms
+                .iter()
+                .any(|&inner| inner != outer && sub.contains(&inner))
+            {
+                split_idx = Some(i);
+                break;
+            }
+        }
+        let Some(i) = split_idx else {
+            break;
+        };
+        let outer = atoms.swap_remove(i);
+        let mut sub_stack: Vec<Expr> = cx.children(outer)?.collect();
+        while let Some(c) = sub_stack.pop() {
+            if cx.as_const(c)?.is_some() {
+                continue;
+            }
+            if in_before.contains(&c) {
+                if !atoms.contains(&c) {
+                    atoms.push(c);
+                }
+            } else {
+                sub_stack.extend(cx.children(c)?);
+            }
+        }
+    }
     // Under an atom nothing is a parameter of its own: what is left of the left side.
+    let mut seen_before = HashSet::new();
     let mut stack = vec![before];
     while let Some(e) = stack.pop() {
-        if !seen.insert(e) || atoms.contains(&e) {
+        if !seen_before.insert(e) || atoms.contains(&e) {
             continue;
         }
         if matches!(cx.view(e)?, View::Sym(_)) {

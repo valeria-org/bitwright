@@ -705,6 +705,8 @@ pub(crate) struct Blaster<'c> {
     input_cancellation: bool,
     join_factoring: bool,
     carry_save_multiplication: bool,
+    hardwire_declared: bool,
+    udivrem_cache: IdMap<(u32, u32), (Bits, Bits)>,
     max_nodes: usize,
     /// Blasting stopped at `max_nodes`.
     too_large: bool,
@@ -722,13 +724,16 @@ impl<'c> Blaster<'c> {
             input_cancellation: false,
             join_factoring: false,
             carry_save_multiplication: false,
+            hardwire_declared: true,
+            udivrem_cache: IdMap::default(),
             max_nodes,
             too_large: false,
         }
     }
 
     /// A blaster that goes on from a circuit built before: its graph, the bits of the nodes
-    /// blasted and the symbols met ([`into_parts`](Self::into_parts)).
+    /// blasted and the symbols met ([`into_parts`](Self::into_parts)). Symbol bits stay free
+    /// inputs so [`Incremental`] can assume whatever known bits are declared at each check.
     pub(crate) fn resume(
         cx: &'c mut Context,
         g: Aig,
@@ -740,6 +745,7 @@ impl<'c> Blaster<'c> {
             g,
             bits,
             symbols,
+            hardwire_declared: false,
             ..Blaster::new(cx, max_nodes)
         }
     }
@@ -779,8 +785,13 @@ impl<'c> Blaster<'c> {
             OpCode::Const => konst(&self.cx.const_val(i).unwrap_or(BitVec::zero(Width::W1))),
             OpCode::Sym => {
                 // Declarations are part of a symbol's meaning, including in certificate
-                // mode. Only its unknown bits are inputs of the circuit.
-                let known = self.cx.declared_at(i);
+                // mode. Only its unknown bits are inputs of the circuit, unless the circuit
+                // is kept across checks (`Incremental`), where declarations are assumed per
+                // solve so changes or withdrawals stay sound.
+                let known = self
+                    .hardwire_declared
+                    .then(|| self.cx.declared_at(i))
+                    .flatten();
                 let b: Bits = (0..w)
                     .map(|j| match known {
                         Some(k) if k.known_one().bit(j as u16) == Some(true) => aig::TRUE,
@@ -860,10 +871,25 @@ impl<'c> Blaster<'c> {
                     OpCode::Sub => sub(g, &a, &b),
                     OpCode::Mul if self.carry_save_multiplication => mul_carry_save(g, &a, &b),
                     OpCode::Mul => mul(g, &a, &b),
+                    OpCode::UMulHi if self.carry_save_multiplication => {
+                        mulhi_carry_save(g, &a, &b, false)
+                    }
                     OpCode::UMulHi => mulhi(g, &a, &b, false),
+                    OpCode::SMulHi if self.carry_save_multiplication => {
+                        mulhi_carry_save(g, &a, &b, true)
+                    }
                     OpCode::SMulHi => mulhi(g, &a, &b, true),
-                    OpCode::UDiv => udivrem(g, &a, &b).0,
-                    OpCode::URem => udivrem(g, &a, &b).1,
+                    OpCode::UDiv | OpCode::URem => {
+                        let qr = match self.udivrem_cache.get(&(n.a, n.b)) {
+                            Some(qr) => qr.clone(),
+                            None => {
+                                let qr = udivrem(g, &a, &b);
+                                self.udivrem_cache.insert((n.a, n.b), qr.clone());
+                                qr
+                            }
+                        };
+                        if op == OpCode::UDiv { qr.0 } else { qr.1 }
+                    }
                     OpCode::SDiv => sdiv(g, &a, &b),
                     OpCode::SRem => srem(g, &a, &b),
                     OpCode::And => and(g, &a, &b),

@@ -16,7 +16,7 @@ let run = Run::default().with_per_call(Budget::default().with_rewrites(1_000));
 ```
 
 `cargo-semver-checks` runs against the last release in continuous integration. The minimum
-supported Rust version is 1.88; raising it is a minor-version change.
+supported Rust version is 1.100; raising it is a minor-version change.
 
 **Results.** Users snapshot printed output, so simplification results have their own contract:
 a patch release never changes a result except to fix unsoundness (named in the changelog by rule

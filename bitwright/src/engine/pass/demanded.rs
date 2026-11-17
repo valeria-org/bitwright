@@ -497,6 +497,9 @@ fn simplify(
     // Demanded bits among the lowest few: the residues of `x` decide them (a constant, or a
     // leaf equal to `x` there).
     if let Some(v) = by_residues(r, cx, x, m)? {
+        if !cx.is_const(v) {
+            stop_at(cx, st, v);
+        }
         st.note(Key(x, *m), v);
         return Ok(v);
     }

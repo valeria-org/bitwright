@@ -10,10 +10,11 @@ use crate::ops::{BinOp, UnOp};
 
 pub(crate) type ClassId = u32;
 
-/// An e-node operator.
+/// An e-node operator (compact: wide constants are pooled on [`EGraph`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EOp {
-    Const(BitVec),
+    ConstSmall(u64),
+    ConstWide(u32),
     /// A leaf: a node of the arena (a symbol, or an opaque atom).
     Leaf(u32),
     Un(UnOp),
@@ -23,19 +24,21 @@ pub(crate) enum EOp {
 impl EOp {
     pub(crate) fn arity(&self) -> usize {
         match self {
-            EOp::Const(_) | EOp::Leaf(_) => 0,
+            EOp::ConstSmall(_) | EOp::ConstWide(_) | EOp::Leaf(_) => 0,
             EOp::Un(_) => 1,
             EOp::Bin(_) => 2,
         }
     }
 }
 
-/// An e-node: an operator over classes.
+/// An e-node: an operator over classes (24 bytes instead of 88).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ENode {
     pub(crate) op: EOp,
     pub(crate) kids: [ClassId; 2],
 }
+
+const _: () = assert!(core::mem::size_of::<ENode>() <= 24);
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Class {
@@ -60,6 +63,7 @@ impl From<Exhausted> for Halt {
 
 #[derive(Clone)]
 pub(crate) struct EGraph {
+    pub(crate) width: crate::Width,
     pub(crate) nodes: Vec<ENode>,
     pub(crate) node_class: Vec<ClassId>,
     /// Whether each e-node came from the original expression.
@@ -67,6 +71,8 @@ pub(crate) struct EGraph {
     uf: Vec<ClassId>,
     pub(crate) classes: Vec<Class>,
     memo: IdMap<ENode, u32>,
+    wide_consts: Vec<BitVec>,
+    wide_memo: IdMap<BitVec, u32>,
     pending: Vec<ClassId>,
     pub(crate) unions: u64,
 }
@@ -78,26 +84,56 @@ fn commutative(op: EOp) -> bool {
     )
 }
 
-fn fold(op: EOp, k: [Option<BitVec>; 2]) -> Option<BitVec> {
-    match op {
-        EOp::Const(v) => Some(v),
-        EOp::Leaf(_) => None,
-        EOp::Un(u) => Some(BitVec::un_unchecked(u, &k[0]?)),
-        EOp::Bin(b) => Some(BitVec::bin_unchecked(b, &k[0]?, &k[1]?)),
-    }
-}
-
 impl EGraph {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(width: crate::Width) -> Self {
         EGraph {
+            width,
             nodes: Vec::new(),
             node_class: Vec::new(),
             imported: Vec::new(),
             uf: Vec::new(),
             classes: Vec::new(),
             memo: IdMap::default(),
+            wide_consts: Vec::new(),
+            wide_memo: IdMap::default(),
             pending: Vec::new(),
             unions: 0,
+        }
+    }
+
+    pub(crate) fn const_node(&mut self, v: BitVec) -> ENode {
+        let op = match v.to_u64() {
+            Some(x) => EOp::ConstSmall(x),
+            None => {
+                let idx = match self.wide_memo.get(&v) {
+                    Some(&i) => i,
+                    None => {
+                        let i = self.wide_consts.len() as u32;
+                        self.wide_consts.push(v);
+                        self.wide_memo.insert(v, i);
+                        i
+                    }
+                };
+                EOp::ConstWide(idx)
+            }
+        };
+        ENode { op, kids: [0, 0] }
+    }
+
+    pub(crate) fn const_val(&self, op: EOp) -> Option<BitVec> {
+        match op {
+            EOp::ConstSmall(x) => Some(BitVec::wrapping_from_u64(self.width, x)),
+            EOp::ConstWide(i) => self.wide_consts.get(i as usize).copied(),
+            _ => None,
+        }
+    }
+
+    fn fold(&self, op: EOp, k: [Option<BitVec>; 2]) -> Option<BitVec> {
+        match op {
+            EOp::ConstSmall(_) | EOp::ConstWide(_) => self.const_val(op),
+            EOp::Leaf(_) => None,
+            EOp::Un(u) => Some(BitVec::un_unchecked(u, &k[0]?)),
+            EOp::Bin(b) => Some(BitVec::bin_unchecked(b, &k[0]?, &k[1]?)),
         }
     }
 
@@ -153,7 +189,7 @@ impl EGraph {
         let id = self.classes.len() as ClassId;
         let konst = {
             let k = self.konst_of(&n);
-            fold(n.op, k)
+            self.fold(n.op, k)
         };
         self.nodes.push(n);
         self.node_class.push(id);
@@ -225,7 +261,7 @@ impl EGraph {
                 }
                 // Constant folding through the new operand classes.
                 let k = self.konst_of(&n);
-                if let Some(v) = fold(n.op, k) {
+                if let Some(v) = self.fold(n.op, k) {
                     let pcr = self.find(pc);
                     match self.classes[pcr as usize].konst {
                         Some(x) if x != v => return Err(Halt::Contract),

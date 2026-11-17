@@ -1275,6 +1275,12 @@ impl Context {
         Ok(self.declared_at(i))
     }
 
+    /// Whether some symbol has known bits declared (at once where none ever was).
+    #[cfg_attr(not(feature = "prove"), allow(dead_code))]
+    pub(crate) fn any_declared(&self) -> bool {
+        self.declaration_revision != 0 && self.symbols.entries.iter().any(|e| e.known.is_some())
+    }
+
     /// The known bits declared for node `i`, if it is a symbol with a declaration.
     pub(crate) fn declared_at(&self, i: u32) -> Option<crate::KnownBits> {
         let n = self.node(i);

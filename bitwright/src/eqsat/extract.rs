@@ -86,7 +86,10 @@ pub(crate) fn build(
         }
         let at = |k: ClassId| built[&k];
         let id = match n.op {
-            EOp::Const(v) => cx.mk_const(&v)?,
+            EOp::ConstSmall(_) | EOp::ConstWide(_) => {
+                let v = eg.const_val(n.op).unwrap_or_else(|| crate::BitVec::zero(w));
+                cx.mk_const(&v)?
+            }
             EOp::Leaf(a) => a,
             EOp::Un(op) => cx.c_un(op, at(kids[0]))?,
             EOp::Bin(op) => cx.c_bin(op, at(kids[0]), at(kids[1]))?,

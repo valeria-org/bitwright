@@ -271,11 +271,17 @@ fn same(a: &T, b: &T) -> bool {
             oa == ob
                 && pa == pb
                 && ka.len() == kb.len()
-                && (ka.iter().zip(kb).all(|(x, y)| same(x, y))
-                    || (op_commutative(*oa)
-                        && ka.len() == 2
-                        && same(&ka[0], &kb[1])
-                        && same(&ka[1], &kb[0])))
+                && if *oa == OpCode::FFma && ka.len() == 3 {
+                    ((same(&ka[0], &kb[0]) && same(&ka[1], &kb[1]))
+                        || (same(&ka[0], &kb[1]) && same(&ka[1], &kb[0])))
+                        && same(&ka[2], &kb[2])
+                } else {
+                    ka.iter().zip(kb).all(|(x, y)| same(x, y))
+                        || (op_commutative(*oa)
+                            && ka.len() == 2
+                            && same(&ka[0], &kb[1])
+                            && same(&ka[1], &kb[0]))
+                }
         }
         _ => false,
     }
@@ -324,6 +330,14 @@ fn greater(s: &T, t: &T) -> bool {
     }
     if op_commutative(*os) {
         multiset_greater(ks, kt, &same, &greater)
+    } else if *os == OpCode::FFma && ks.len() == 3 && kt.len() == 3 {
+        let pair_same = (same(&ks[0], &kt[0]) && same(&ks[1], &kt[1]))
+            || (same(&ks[0], &kt[1]) && same(&ks[1], &kt[0]));
+        if pair_same {
+            greater(&ks[2], &kt[2])
+        } else {
+            multiset_greater(&ks[..2], &kt[..2], &same, &greater)
+        }
     } else {
         for (a, b) in ks.iter().zip(kt) {
             if !same(a, b) {
@@ -421,7 +435,16 @@ fn ground(cx: &Context, mut s: u32, mut t: u32, steps: &mut u32) -> Option<bool>
             [ns.a, ns.b, ns.c][..ns.op.arity()].to_vec(),
             [nt.a, nt.b, nt.c][..nt.op.arity()].to_vec(),
         );
-        if op_commutative(ns.op) {
+        let ext_comm = ns.op.as_ext().is_some_and(|(arity, _)| {
+            arity == 2
+                && cx.wid(ns.a) == cx.wid(ns.b)
+                && cx
+                    .registry
+                    .as_deref()
+                    .and_then(|r| r.op_at(ns.aux))
+                    .is_some_and(|o| o.traits().commutative)
+        });
+        if op_commutative(ns.op) || ext_comm {
             let budget = core::cell::Cell::new(*steps);
             let undecided = core::cell::Cell::new(false);
             let gt = |a: &u32, b: &u32| {
@@ -434,6 +457,35 @@ fn ground(cx: &Context, mut s: u32, mut t: u32, steps: &mut u32) -> Option<bool>
                 r == Some(true)
             };
             let r = multiset_greater(&ks, &kt, &|a, b| a == b, &gt);
+            *steps = budget.get();
+            return if r {
+                Some(true)
+            } else if undecided.get() {
+                None
+            } else {
+                Some(false)
+            };
+        }
+        if ns.op == OpCode::FFma && ks.len() == 3 && kt.len() == 3 {
+            let pair_same =
+                (ks[0] == kt[0] && ks[1] == kt[1]) || (ks[0] == kt[1] && ks[1] == kt[0]);
+            if pair_same {
+                s = ks[2];
+                t = kt[2];
+                continue;
+            }
+            let budget = core::cell::Cell::new(*steps);
+            let undecided = core::cell::Cell::new(false);
+            let gt = |a: &u32, b: &u32| {
+                let mut st = budget.get();
+                let r = ground(cx, *a, *b, &mut st);
+                budget.set(st);
+                if r.is_none() {
+                    undecided.set(true);
+                }
+                r == Some(true)
+            };
+            let r = multiset_greater(&ks[..2], &kt[..2], &|a, b| a == b, &gt);
             *steps = budget.get();
             return if r {
                 Some(true)

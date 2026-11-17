@@ -222,24 +222,42 @@ impl Bits {
     /// be 0 or all-ones in each class) and `Δ_c(p) = Σ_{∅≠S⊆p} γ_{c,S}`, `k_c + Δ_c(p)` must be 0
     /// or 1 modulo `2^(W − τ_c)` at every class corner `p`; it is the table's entry.
     pub(crate) fn from_linear(p: &Poly, classes: &Classes) -> Option<Bits> {
-        if classes.width().bits() <= 64 {
-            return Self::from_linear_64(p, classes);
+        Self::from_linear_shifted(p, classes, 0)
+    }
+
+    /// [`from_linear`](Self::from_linear) modulo `2^(W − shift)` (`0 <= shift < W`), for a
+    /// polynomial whose terms were logically shifted right by `shift` (`Pass::halves`).
+    pub(crate) fn from_linear_shifted(p: &Poly, classes: &Classes, shift: u32) -> Option<Bits> {
+        let w = classes.width();
+        let bits = u32::from(w.bits());
+        if shift >= bits {
+            return None;
+        }
+        if bits <= 64 {
+            return Self::from_linear_64_shifted(p, classes, shift);
         }
         let (support, deltas) = corner_sums(p, classes)?;
-        let w = classes.width();
         let s = support.len();
         let konst = p.konst();
+        let eff_bits = bits - shift;
+        let eff_low = low_mask(w, eff_bits);
         let mut tables = Vec::with_capacity(deltas.len());
         for (c, g) in deltas.iter().enumerate() {
-            let inside = bv_and(&konst, classes.mask(c));
+            let low_c = u32::from(classes.low(c));
+            if low_c >= eff_bits {
+                tables.push(vec![0u64; words(s)]);
+                continue;
+            }
+            let eff_mask = bv_and(classes.mask(c), &eff_low);
+            let inside = bv_and(&konst, &eff_mask);
             let k = if inside.is_zero() {
                 BitVec::zero(w)
-            } else if inside == *classes.mask(c) {
+            } else if inside == eff_mask {
                 super::word::one(w)
             } else {
                 return None;
             };
-            let prec = u32::from(w.bits()) - u32::from(classes.low(c));
+            let prec = eff_bits - low_c;
             let lm = low_mask(w, prec);
             let mut t = vec![0u64; words(s)];
             for (q, d) in g.iter().enumerate() {
@@ -286,22 +304,29 @@ impl Bits {
         Some(out)
     }
 
-    /// [`from_linear`](Self::from_linear) at widths up to 64: the same test in one word.
-    fn from_linear_64(p: &Poly, classes: &Classes) -> Option<Bits> {
+    /// [`from_linear_shifted`](Self::from_linear_shifted) at widths up to 64: the same test in one word.
+    fn from_linear_64_shifted(p: &Poly, classes: &Classes, shift: u32) -> Option<Bits> {
         let (support, deltas) = corner_sums_64(p, classes)?;
         let bits = u32::from(classes.width().bits());
+        let eff_bits = bits - shift;
+        let eff_low = u64::MAX >> (64 - eff_bits);
         let s = support.len();
         let konst = p.konst().limbs()[0];
         let mut tables = Vec::with_capacity(classes.len());
         for (c, g) in deltas.chunks_exact(1 << s).enumerate() {
-            let mask = classes.mask(c).limbs()[0];
+            let low_c = u32::from(classes.low(c));
+            if low_c >= eff_bits {
+                tables.push(vec![0u64; words(s)]);
+                continue;
+            }
+            let mask = classes.mask(c).limbs()[0] & eff_low;
             let k = match konst & mask {
                 0 => 0u64,
                 inside if inside == mask => 1,
                 _ => return None,
             };
-            // The low `W − τ_c` bits.
-            let lm = u64::MAX >> (64 - (bits - u32::from(classes.low(c))));
+            // The low `(W − shift) − τ_c` bits.
+            let lm = u64::MAX >> (64 - (eff_bits - low_c));
             let mut t = vec![0u64; words(s)];
             for (q, d) in g.iter().enumerate() {
                 match k.wrapping_add(*d) & lm {

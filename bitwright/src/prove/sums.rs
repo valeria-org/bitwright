@@ -1113,8 +1113,12 @@ impl Norm<'_> {
             // digits, and the words they are the digits of.
             let ((p, kp), (q, kq)) = (self.low_of(node.a), self.low_of(node.b));
             let (cp, cq) = (self.cx.is_const(p), self.cx.is_const(q));
-            // (A constant side is its own digit.)
-            let fits = |s: &Self, c: u32, k: u16| s.low(c).is_some_and(|v| k >= 64 || v >> k == 0);
+            // (A constant side is its own digit: every bit at or above `k`, upper limbs included, must be 0.)
+            let fits = |s: &Self, c: u32, k: u16| {
+                s.cx.const_val(c)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|v| k >= 64 || v >> k == 0)
+            };
             let read = match (cp, cq) {
                 (true, true) => None,
                 (true, false) => fits(self, p, kq).then_some(kq),

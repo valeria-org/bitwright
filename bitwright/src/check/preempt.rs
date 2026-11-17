@@ -243,16 +243,18 @@ pub fn preempted(engine: &Engine, program: &RuleProgram) -> Vec<Preemption> {
     let chunk = rules.len().div_ceil(threads.max(1)).max(1);
     let mut out = Vec::new();
     std::thread::scope(|s| {
-        let handles: Vec<_> = rules
-            .chunks(chunk)
-            .map(|part| {
-                s.spawn(move || {
-                    part.iter()
-                        .filter_map(|r| preempted_rule(engine, r))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
+        let mut handles = Vec::new();
+        for part in rules.chunks(chunk) {
+            let work = move || {
+                part.iter()
+                    .filter_map(|r| preempted_rule(engine, r))
+                    .collect::<Vec<_>>()
+            };
+            match crate::threads::builder().spawn_scoped(s, work) {
+                Ok(h) => handles.push(h),
+                Err(_) => out.extend(part.iter().filter_map(|r| preempted_rule(engine, r))),
+            }
+        }
         for h in handles {
             match h.join() {
                 Ok(v) => out.extend(v),

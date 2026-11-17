@@ -69,7 +69,10 @@ fn question(cx: &mut Context, file: &str) -> (Expr, Expr) {
         .find_map(|l| l.strip_prefix("# sampled: 0x"))
         .map(|v| u64::from_str_radix(v, 16).expect("a sampled value"))
         .expect("a `# sampled:` line");
-    let (_, root) = file.split_once("## root 0\n").expect("a root");
+    let (_, root) = file
+        .split_once("## root 0\n")
+        .or_else(|| file.split_once("## root 0\r\n"))
+        .expect("a root");
     assert!(
         !root.contains("## assume"),
         "a question without assumptions"

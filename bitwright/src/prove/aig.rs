@@ -902,6 +902,8 @@ impl Cnf {
                         if uses[(operand >> 1) as usize] == 2
                             && let Node::And(p, q) = aig.nodes[(operand >> 1) as usize]
                             && let Some(Gate::Xor(u, v)) = gate2(p, q)
+                            && (u >> 1) != (other >> 1)
+                            && (v >> 1) != (other >> 1)
                         {
                             triple = Some(Gate::Xor3(u, v ^ (operand & 1), other));
                             break;
