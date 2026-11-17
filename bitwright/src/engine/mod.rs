@@ -254,6 +254,9 @@ pub struct Strategy {
     pub kept_steps: u64,
 }
 
+/// The default of [`Strategy::kept_steps`].
+pub(crate) const KEPT_STEPS: u64 = pass::mba::KEPT_STEPS;
+
 impl Strategy {
     /// A strategy with the given phases and at most 4 rounds.
     pub fn new(name: impl Into<Cow<'static, str>>, phases: Vec<Phase>) -> Strategy {
@@ -267,7 +270,7 @@ impl Strategy {
             words_proved: false,
             whole_first: true,
             basis_sums: true,
-            kept_steps: pass::mba::KEPT_STEPS,
+            kept_steps: KEPT_STEPS,
         }
     }
 

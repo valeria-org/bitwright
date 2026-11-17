@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.32.3
+
+- **`Simplifiers::with_kept_steps`.** The engines a [`Simplifiers`] builds (the prover's, a
+  batch session's) keep a fragment with no simpler form from the questions above it from the
+  given solver steps ([`Strategy::kept_steps`]) instead of 2^16. A devirtualizer that set
+  2^12 only on the engines it builds itself still lost the path 0.31.7 walked: its prover and
+  sessions asked at 2^16. With its sessions and searches at 2^12 as well, its walk is as
+  0.31.7's (lighthouse.sys `0x1401a5060`: 65 nodes, the same document).
+
 ## 0.32.2
 
 - **What 0.32 left unfolded, at the host's choice.** A devirtualizer's engine (lighthouse.sys's
