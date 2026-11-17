@@ -211,10 +211,11 @@ fn a_constant_through_one_condition_is_proved_on_either_side_of_it() {
                 let %11 = ~(%7 & 255) & ~%5; \
                 ~(%9 * 0xaa9198db70383e98 + %10 * 0xaa9198db70383e98 + %11 * 0x556e67248fc7c168 & (%9 * 0xd2fe010764f7e887 + %10 * 0xd2fe010764f7e887 + %11 * 0x2d01fef89b081779 ^ (#6 & 255 | #12 & -256) + 0x4bc330b0be287ad4)) & (%4 + (~%4 & %7 & 255) | %3) * 0x556e67248fc7c169 + %10 * 0x556e67248fc7c169 - (%7 & %6 ^ (%8 | %7)) * 0x556e67248fc7c169";
     let cfg = ::bitwright::mba::MbaConfig::default();
-    let (out, agrees) = with_mba(text, cfg.with_known_atoms(true));
-    assert!(agrees, "{out}");
-    assert_eq!(out, "0xaa9198db70383e97:64");
-    assert_ne!(with_mba(text, cfg).0, "0xaa9198db70383e97:64");
+    for known in [true, false] {
+        let (out, agrees) = with_mba(text, cfg.with_known_atoms(known));
+        assert!(agrees, "{out}");
+        assert_eq!(out, "0xaa9198db70383e97:64");
+    }
 }
 
 #[test]

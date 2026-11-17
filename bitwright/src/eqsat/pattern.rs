@@ -274,14 +274,8 @@ pub(crate) fn instantiate(
                 let Some(v) = lit(l, w) else {
                     return Ok(None);
                 };
-                eg.add(
-                    ENode {
-                        op: EOp::Const(v),
-                        kids: [0, 0],
-                    },
-                    false,
-                    m,
-                )?
+                let node = eg.const_node(v);
+                eg.add(node, false, m)?
             }
             PNode::Un(op, a) => eg.add(
                 ENode {

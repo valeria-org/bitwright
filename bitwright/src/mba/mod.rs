@@ -169,7 +169,19 @@ pub fn decide(
     limits: &MbaLimits,
     budget: &MbaBudget,
 ) -> Result<Decided, crate::Error> {
-    if a == b {
+    let (ia, ib) = (cx.id(a)?, cx.id(b)?);
+    for &z in zeros {
+        cx.id(z)?;
+    }
+    let (wa, wb) = (cx.width_of(ia), cx.width_of(ib));
+    if wa != wb {
+        return Err(crate::WidthError::Mismatch {
+            left: wa.bits(),
+            right: wb.bits(),
+        }
+        .into());
+    }
+    if ia == ib {
         return Ok(Decided::Equal);
     }
     // For every value: the procedures, when the difference is in their fragment.
@@ -180,34 +192,45 @@ pub fn decide(
     if !zeros.is_empty() && crate::engine::corners_equal_given(cx, a, b, zeros)? {
         return Ok(Decided::Equal);
     }
-    // A witness: values of the symbols, at which the facts hold and the sides differ.
+    // A witness: values of the symbols (agreeing with any declared known bits), at which the
+    // facts hold and the sides differ.
     let mut roots = vec![a, b];
     roots.extend_from_slice(zeros);
     let mut symbols = Vec::new();
     for id in cx.symbols_in(&roots)? {
         if let (Some(k), Some(w)) = (cx.symbol_key(id).cloned(), cx.symbol_width(id)) {
-            symbols.push((k, w));
+            let known = cx
+                .find_symbol(&k)
+                .and_then(|s| cx.declared_known(s).ok().flatten());
+            symbols.push((k, w, known));
         }
     }
     let corners = 1u64 << symbols.len().min(10);
     for point in 0..corners + WITNESS_SAMPLES {
         let model: Vec<(crate::SymbolKey, crate::BitVec)> = (symbols.iter().enumerate())
-            .map(|(j, (k, w))| {
-                let v = if point < corners {
+            .map(|(j, (k, w, known))| {
+                let mut v = if point < corners {
                     if point >> (j % 10) & 1 == 1 {
                         crate::BitVec::ones(*w)
                     } else {
                         crate::BitVec::zero(*w)
                     }
                 } else {
-                    let h = crate::hash::mix64(
-                        k.structural_hash() ^ point.wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                    );
-                    crate::BitVec::wrapping_from_limbs(
-                        *w,
-                        &[h, h.rotate_left(17), !h, h.rotate_left(41)],
-                    )
+                    let seed = k.structural_hash() ^ point.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let limbs: [u64; 8] = core::array::from_fn(|limb| {
+                        crate::hash::mix64(
+                            seed ^ (limb as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9),
+                        )
+                    });
+                    crate::BitVec::wrapping_from_limbs(*w, &limbs)
                 };
+                if let Some(kb) = known {
+                    let keep = crate::facts::known::bv_not(&kb.known_zero());
+                    v = crate::facts::known::bv_or(
+                        &crate::facts::known::bv_and(&v, &keep),
+                        &kb.known_one(),
+                    );
+                }
                 (k.clone(), v)
             })
             .collect();

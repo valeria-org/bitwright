@@ -1867,6 +1867,7 @@ impl Runner<'_, '_> {
             // changed: start afresh (final results stay memoized).
             self.partial[phase].clear();
             self.chain_parent.clear();
+            self.linear_mba.begin();
             self.asks.clear();
             self.first.clear();
             self.demanded.same.clear();
@@ -2000,9 +2001,13 @@ impl Runner<'_, '_> {
                         }
                         continue;
                     }
+                    let linear_mba = matches!(
+                        self.inner.phases[phase],
+                        PhaseImpl::Pass(pass::PassKind::LinearMba)
+                    );
                     let mut waiting = false;
                     for c in node.children() {
-                        if mba {
+                        if mba || linear_mba {
                             self.chain_parent.entry(c).or_insert(n);
                         }
                         if self.lookup(cx, phase, c).is_none() {

@@ -131,8 +131,8 @@ impl<B: Backend> Incremental<B> {
     }
 
     /// Whether the 1-bit `predicates` hold together, within `limits` of search (counted from
-    /// this call). A symbol's declared bits ([`Context::declare_known`]) are read when the
-    /// symbol is first met.
+    /// this call). A symbol's declared bits ([`Context::declare_known`]) are assumed as they
+    /// stand in `cx` at this call, so changing or withdrawing a declaration stays sound.
     pub fn solve(
         &mut self,
         cx: &mut Context,
@@ -180,7 +180,23 @@ impl<B: Backend> Incremental<B> {
             }
         }
         self.cnf.extend(&self.g, &roots, &mut self.solver, false);
-        let lits: Vec<Lit> = roots.iter().map(|&r| self.cnf.lit(r)).collect();
+        let pred_count = roots.len();
+        let mut lits: Vec<Lit> = roots.iter().map(|&r| self.cnf.lit(r)).collect();
+        for (node, bits) in &self.symbols {
+            let Some(kb) = cx.declared_at(*node) else {
+                continue;
+            };
+            for (j, &b) in bits.iter().enumerate() {
+                let Some(lit) = self.cnf.mapped_lit(b) else {
+                    continue;
+                };
+                if kb.known_one().bit(j as u16) == Some(true) {
+                    lits.push(lit);
+                } else if kb.known_zero().bit(j as u16) == Some(true) {
+                    lits.push(!lit);
+                }
+            }
+        }
         Ok(match self.solver.solve_assuming(&lits, limits) {
             sat::Answer::Sat(model) => {
                 let mut out = Vec::with_capacity(self.symbols.len());
@@ -197,23 +213,38 @@ impl<B: Backend> Incremental<B> {
                             limbs[j / 64] |= 1 << (j % 64);
                         }
                     }
-                    out.push((key, BitVec::wrapping_from_limbs(w, &limbs)));
+                    let mut v = BitVec::wrapping_from_limbs(w, &limbs);
+                    if let Some(kb) = cx.declared_at(*node) {
+                        let keep = crate::facts::known::bv_not(&kb.known_zero());
+                        v = crate::facts::known::bv_or(
+                            &crate::facts::known::bv_and(&v, &keep),
+                            &kb.known_one(),
+                        );
+                    }
+                    out.push((key, v));
                 }
                 Answer::Sat(out)
             }
             sat::Answer::Unsat => {
                 let failed = self.solver.failed_assumptions();
-                Answer::Unsat(
-                    (0..lits.len())
-                        .filter(|&k| failed.contains(&lits[k]))
-                        .collect(),
-                )
+                let mut core: Vec<usize> = (0..pred_count)
+                    .filter(|&k| failed.contains(&lits[k]))
+                    .collect();
+                if core.is_empty() && pred_count > 0 {
+                    core = (0..pred_count).collect();
+                }
+                Answer::Unsat(core)
             }
             sat::Answer::Unknown => Answer::Unknown(Unknown::Budget {
                 conflicts: self.solver.conflicts(),
                 propagations: self.solver.propagations(),
             }),
         })
+    }
+
+    /// Does this backend report exact conflict counts (see [`Backend::exact_conflicts`])?
+    pub(crate) fn exact_conflicts(&self) -> bool {
+        self.solver.exact_conflicts()
     }
 
     /// Makes it safe across a [`Context::rollback`] to `at`, to be called before it: forgets
@@ -223,6 +254,7 @@ impl<B: Backend> Incremental<B> {
     pub fn forget_since(&mut self, at: Checkpoint) {
         self.bits.retain(|&i, _| i < at.nodes());
         self.symbols.retain(|&(i, _)| i < at.nodes());
+        self.added.retain(|&i, _| i < at.nodes());
     }
 }
 

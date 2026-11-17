@@ -2004,6 +2004,7 @@ fn rule_id(rule: &Rule) -> RuleId {
     };
     let wexpr = |feed: &mut dyn FnMut(u64), w: &WExpr| {
         feed(w.konst as u64);
+        feed(w.terms.len() as u64);
         for &(v, c) in &w.terms {
             feed(u64::from(v));
             feed(c as u64);
@@ -2018,6 +2019,7 @@ fn rule_id(rule: &Rule) -> RuleId {
     if !rule.modes.is_empty() {
         feed(0x6d6f_6465 + rule.modes.len() as u64);
     }
+    feed(rule.constraints.len() as u64);
     for c in &rule.constraints {
         match c {
             WCons::Cmp(a, op, b) => {
@@ -2034,6 +2036,7 @@ fn rule_id(rule: &Rule) -> RuleId {
             }
         }
     }
+    feed(order.len() as u64);
     for &i in &order {
         let p = &rule.params[i as usize];
         feed(p.kind as u64);
@@ -2047,12 +2050,18 @@ fn rule_id(rule: &Rule) -> RuleId {
         }
         Sort::Bool => feed(0xb0),
     };
-    // Structure of every part, in a fixed traversal.
-    let mut roots = vec![rule.lhs, rule.rhs];
-    roots.extend(rule.guard);
-    roots.extend(rule.lets.iter().map(|l| l.value));
-    for r in roots {
-        feed(0xfeed);
+    // Structure of every part, with explicit domain tags separating `guard` and `lets`.
+    feed(u64::from(rule.guard.is_some()));
+    feed(rule.lets.len() as u64);
+    let mut roots = vec![(0xfeed_0001u64, rule.lhs), (0xfeed_0002, rule.rhs)];
+    if let Some(g) = rule.guard {
+        roots.push((0xfeed_0003, g));
+    }
+    for (idx, l) in rule.lets.iter().enumerate() {
+        roots.push((0xfeed_1000 + idx as u64, l.value));
+    }
+    for (tag, r) in roots {
+        feed(tag);
         let mut stack = vec![r];
         while let Some(n) = stack.pop() {
             let node = &rule.nodes[n as usize];

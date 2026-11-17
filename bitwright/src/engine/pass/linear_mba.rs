@@ -37,7 +37,7 @@ use crate::hash::IdMap;
 use crate::ops::{BinOp, UnOp};
 
 /// The most atoms (the signature has 2^t entries).
-pub(crate) const MAX_ATOMS: usize = 6;
+pub(crate) const MAX_ATOMS: usize = 8;
 
 /// The most fragment nodes examined per candidate.
 const MAX_REGION: usize = 2048;
@@ -166,6 +166,16 @@ pub(crate) struct Scratch {
     /// cast. A node reached under casts of two kinds would be two functions of the lifted
     /// atoms: the second cast is an atom.
     under: IdMap<u32, (OpCode, u32)>,
+    /// In a phase run, per link of an additive chain that left its solve to its user: that
+    /// user (see [`step`]).
+    deferred: IdMap<u32, u32>,
+}
+
+impl Scratch {
+    /// A phase run begins: what the chains deferred was of the one before.
+    pub(crate) fn begin(&mut self) {
+        self.deferred.clear();
+    }
 }
 
 /// The `seen` bit of a node in the post-order.
@@ -494,8 +504,84 @@ enum Candidate {
     Affine(BitVec, Vec<(usize, BitVec)>),
     /// `u0 + Σ (u0 − uk)·gk`: the base value, and per other value its coefficient and table.
     Indicators(BitVec, Vec<(BitVec, u8)>),
+    /// CoBRA change-of-basis decomposition `konst + Σ k·B` over compact Boolean basis ops.
+    Cobra(BitVec, Vec<(crate::cobra::BasisOp, BitVec)>),
     /// `konst + Σ k·AND_S`: per nonempty atom set (a bit mask over positions), its coefficient.
     Conjunctions(BitVec, Vec<(usize, BitVec)>),
+}
+
+fn emit_basis_op(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    op: &crate::cobra::BasisOp,
+    atoms: &[u32],
+) -> Result<u32, Stop> {
+    use crate::cobra::BasisOp;
+    match op {
+        BasisOp::Var(i) => Ok(atoms[*i]),
+        BasisOp::Table2 { vars, tt8 } => {
+            let a0 = atoms[vars[0]];
+            let a1 = atoms[vars[1]];
+            bitwise::emit(r, cx, *tt8, &[a0, a1, a0])
+        }
+        BasisOp::Table3 { vars, tt8 } => {
+            bitwise::emit(r, cx, *tt8, &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]])
+        }
+        BasisOp::ClauseAnd { vars, neg_mask } => {
+            let mut pos_acc: Option<u32> = None;
+            let mut neg_or: Option<u32> = None;
+            for (bit, &v) in vars.iter().enumerate() {
+                let a = atoms[v];
+                if (*neg_mask >> bit) & 1 == 1 {
+                    neg_or = Some(match neg_or {
+                        None => a,
+                        Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::Or, x, a))?,
+                    });
+                } else {
+                    pos_acc = Some(match pos_acc {
+                        None => a,
+                        Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::And, x, a))?,
+                    });
+                }
+            }
+            let neg_part = match neg_or {
+                Some(o) => Some(r.build(cx, |cx| cx.c_un(UnOp::Not, o))?),
+                None => None,
+            };
+            match (pos_acc, neg_part) {
+                (Some(p), Some(ng)) => r.build(cx, |cx| cx.c_bin(BinOp::And, p, ng)),
+                (Some(p), None) => Ok(p),
+                (None, Some(ng)) => Ok(ng),
+                // The empty conjunction (no pivot has fewer than two atoms).
+                (None, None) => {
+                    let ones = BitVec::ones(cx.width_of(atoms[0]));
+                    r.build(cx, |cx| cx.mk_const(&ones))
+                }
+            }
+        }
+        BasisOp::OrAll { vars } => {
+            let mut acc = atoms[vars[0]];
+            for &v in &vars[1..] {
+                let a = atoms[v];
+                acc = r.build(cx, |cx| cx.c_bin(BinOp::Or, acc, a))?;
+            }
+            Ok(acc)
+        }
+        BasisOp::Not(inner) => match inner.as_ref() {
+            BasisOp::Table2 { vars, tt8 } => {
+                let a0 = atoms[vars[0]];
+                let a1 = atoms[vars[1]];
+                bitwise::emit(r, cx, !*tt8, &[a0, a1, a0])
+            }
+            BasisOp::Table3 { vars, tt8 } => {
+                bitwise::emit(r, cx, !*tt8, &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]])
+            }
+            other => {
+                let x = emit_basis_op(r, cx, other, atoms)?;
+                r.build(cx, |cx| cx.c_un(UnOp::Not, x))
+            }
+        },
+    }
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
@@ -503,8 +589,114 @@ fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::PassCounts {
 }
 
 /// The linear-MBA pass at `n`.
+///
+/// An interior link of an additive chain whose user is itself a fitting linear-MBA region is
+/// left to that user: the whole sum is solved once instead of at every partial prefix. The
+/// user's solve can still decline (the lifted atoms are too many, the form is no smaller),
+/// and the walk does not come back to the link: the user then solves the links it held back
+/// (see [`held_back`]).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
-    Ok(solve(r, cx, n, true)?.0)
+    if let Some(p) = defers(r, cx, n) {
+        r.linear_mba.deferred.insert(n, p);
+        return Ok(Step::Normal(Fin::PROVISIONAL));
+    }
+    r.linear_mba.deferred.remove(&n);
+    match solve(r, cx, n, true)?.0 {
+        Step::Normal(fin) => held_back(r, cx, n, fin),
+        step => Ok(step),
+    }
+}
+
+/// The user in the chain that the link `n` leaves its solve to, if any (see [`step`]).
+fn defers(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> Option<u32> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return None;
+    }
+    let p = *r.chain_parent.get(&n)?;
+    (matches!(cx.node(p).op, OpCode::Add | OpCode::Sub | OpCode::Neg)
+        && interior(cx, p, Mode::Linear)
+        && region(cx, p, &mut r.linear_mba)
+            .is_some_and(|pr| pr.mixed && !pr.bounds.is_empty() && pr.bounds.len() <= MAX_ATOMS))
+    .then_some(p)
+}
+
+/// Once `n`'s own solve declined (with `fin`): the links of its chain that left their solve to
+/// it, each solved alone, down the chain (a link that declines in turn hands on to those that
+/// left theirs to it). The first that is rewritten is rebuilt into `n`, as the walk would have
+/// rebuilt `n` over it, and `n` is rewritten to that where it makes the DAG smaller (a link on
+/// the way that something else reads stays for that reader).
+fn held_back(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, mut fin: Fin) -> Result<Step, Stop> {
+    let before = cx.len() as u32;
+    // The links solved, each with the index of its user here (`n` has none).
+    let mut links: Vec<(u32, usize)> = vec![(n, usize::MAX)];
+    let mut at = 0;
+    while at < links.len() {
+        let u = links[at].0;
+        let node = cx.node(u);
+        let kids = [node.a, node.b, node.c];
+        for &c in &kids[..node.op.arity()] {
+            // (Removed once solved: an operand read twice is solved once.)
+            if r.linear_mba.deferred.get(&c) != Some(&u) {
+                continue;
+            }
+            r.linear_mba.deferred.remove(&c);
+            match solve(r, cx, c, true)?.0 {
+                Step::Normal(f) => {
+                    fin = fin.and(f);
+                    links.push((c, at));
+                }
+                Step::To(e, _) => {
+                    // `c` is `e`: so is every user up the chain, rebuilt over it.
+                    let (mut old, mut new, mut i) = (c, e, at);
+                    loop {
+                        let (v, up) = links[i];
+                        let node = cx.node(v);
+                        let mut kids = [node.a, node.b, node.c];
+                        for k in kids.iter_mut().take(node.op.arity()) {
+                            if *k == old {
+                                *k = new;
+                            }
+                        }
+                        new = r.build(cx, |cx| cx.rebuild(v, kids))?;
+                        if up == usize::MAX {
+                            break;
+                        }
+                        (old, i) = (v, up);
+                    }
+                    if new == n {
+                        super::discard(r, cx, before);
+                        return Ok(Step::Normal(fin));
+                    }
+                    // What `new` reads that was there before: where the count of its nodes
+                    // stops.
+                    let mut stops = Vec::new();
+                    let mut seen: IdMap<u32, ()> = IdMap::default();
+                    let mut todo = vec![new];
+                    while let Some(i) = todo.pop() {
+                        if seen.insert(i, ()).is_some() {
+                            continue;
+                        }
+                        if i < before {
+                            stops.push(i);
+                        } else {
+                            todo.extend(cx.node(i).children());
+                        }
+                    }
+                    let tree = |i: u32| cx.meta[i as usize].tree;
+                    let tie = tree(n) != u32::MAX && tree(new) < tree(n);
+                    let kind = PassKind::LinearMba;
+                    return Ok(
+                        match finish_with(r, cx, kind, n, new, before, &stops, Fin::FINAL, tie)? {
+                            Step::Normal(f) => Step::Normal(fin.and(f)),
+                            step => step,
+                        },
+                    );
+                }
+            }
+        }
+        at += 1;
+    }
+    Ok(Step::Normal(fin))
 }
 
 /// The cheapest form of the linear MBA at `n`, built whatever it costs and committed nowhere:
@@ -634,6 +826,39 @@ fn solve(
             .collect();
         let est = ands + linear::estimate(&linear::Form::of(konst, &placeholder));
         cands.push((est, Candidate::Conjunctions(konst, terms)));
+
+        // (What the decomposition reads is pass work, within what is left of it.)
+        let cobra = if t >= 3 {
+            let allow = r.meter.left_in(|b| b.pass_work);
+            let mut left = allow;
+            let terms = crate::cobra::decompose(t, w, u32::from(w.bits()), &d, &mut left);
+            r.meter.charge(Counter::PassWork, allow - left)?;
+            terms
+        } else {
+            None
+        };
+        if let Some(cobra_terms) = cobra {
+            let push_cobra =
+                |cands: &mut Vec<(u32, Candidate)>, k0: BitVec, ts: Vec<(crate::cobra::BasisOp, BitVec)>| {
+                    let gates: u32 = ts.iter().map(|(op, _)| op.gate_cost()).sum();
+                    let ph: Vec<(u32, BitVec)> = ts
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, (_, c))| (u32::MAX - idx as u32, *c))
+                        .collect();
+                    let est = gates + linear::estimate(&linear::Form::of(k0, &ph));
+                    cands.push((est, Candidate::Cobra(k0, ts)));
+                };
+            if !konst.is_zero() {
+                let mut k_traded = konst;
+                let mut t_traded = cobra_terms.clone();
+                crate::cobra::trade_unmasked_constant(&mut k_traded, &mut t_traded);
+                if k_traded.is_zero() {
+                    push_cobra(&mut cands, k_traded, t_traded);
+                }
+            }
+            push_cobra(&mut cands, konst, cobra_terms);
+        }
     }
     if t <= 3 {
         // Distinct values, in order of first appearance; each as the base in turn.
@@ -694,6 +919,7 @@ fn solve(
     let kind = match &cand {
         Candidate::Affine(..) => "affine",
         Candidate::Indicators(..) => "indicators",
+        Candidate::Cobra(..) => "cobra",
         Candidate::Conjunctions(..) => "conjunctions",
     };
     let form = match cand {
@@ -709,6 +935,14 @@ fn solve(
                 terms.push((g, k));
             }
             linear::Form::of(u0, &terms)
+        }
+        Candidate::Cobra(konst, ops) => {
+            let mut terms = Vec::with_capacity(ops.len());
+            for (op, k) in ops {
+                let g = emit_basis_op(r, cx, &op, &reg.atoms)?;
+                terms.push((g, k));
+            }
+            linear::Form::of(konst, &terms)
         }
         Candidate::Conjunctions(konst, sets) => {
             let mut terms = Vec::new();

@@ -65,10 +65,12 @@ pub fn lean_theorem(
     for line in comment.lines() {
         let _ = writeln!(out, "-- {line}");
     }
-    let _ = write!(out, "theorem {name}");
-    for (_, ident, w) in &names {
+    let thm_name = crate::rules::lean::ident(name);
+    let _ = write!(out, "theorem {thm_name}");
+    for (_, ident, w, _) in &names {
         let _ = write!(out, " ({ident} : BitVec {w})");
     }
+    write_declared_hypotheses(&mut out, &names);
     out.push_str(" :\n    ¬ (");
     for (k, &p) in predicates.iter().enumerate() {
         if k > 0 {
@@ -94,22 +96,70 @@ pub(crate) fn lean_equation(
         return Err(unsupported("the statement is too large to write out"));
     }
     let names = symbol_names(cx, &[a, b])?;
-    let mut out = format!("theorem {name}");
-    for (_, ident, w) in &names {
+    let thm_name = crate::rules::lean::ident(name);
+    let mut out = format!("theorem {thm_name}");
+    for (_, ident, w, _) in &names {
         let _ = write!(out, " ({ident} : BitVec {w})");
     }
+    write_declared_hypotheses(&mut out, &names);
     let (x, y) = (term(cx, a, &names)?, term(cx, b, &names)?);
     let _ = write!(out, " :\n    {x} = {y} := by\n  bv_decide\n");
     Ok(out)
 }
 
-/// The symbols of `es`, each with a Lean identifier that is its alone, and its width.
-fn symbol_names(cx: &mut Context, es: &[Expr]) -> Result<Vec<(SymbolKey, String, u16)>, Error> {
-    let mut names: Vec<(SymbolKey, String, u16)> = Vec::new();
+type NamedSym = (SymbolKey, String, u16, Option<crate::KnownBits>);
+
+/// Writes `(h_known_k : (x &&& mask#w) = ones#w)` hypotheses for symbols with declared bits,
+/// each named apart from the symbols (a symbol `h_known_0` would be shadowed by its binder).
+fn write_declared_hypotheses(out: &mut String, names: &[NamedSym]) {
+    let mut idx = 0usize;
+    for (_, ident, _, known) in names {
+        let Some(kb) = known else {
+            continue;
+        };
+        let mask = bv_decimal(&kb.known());
+        let ones = bv_decimal(&kb.known_one());
+        let mut h = format!("h_known_{idx}");
+        while names.iter().any(|(_, n, _, _)| *n == h) {
+            h.push('\'');
+        }
+        let _ = write!(out, " ({h} : ({ident} &&& {mask}) = {ones})");
+        idx += 1;
+    }
+}
+
+/// `v` as a Lean decimal `BitVec` literal `{n}#{w}`.
+fn bv_decimal(v: &crate::BitVec) -> String {
+    let w = v.width().bits();
+    let mut digits = vec![0u8];
+    for limb in v.limbs().iter().rev() {
+        for bit in (0..64).rev() {
+            let mut carry = (limb >> bit & 1) as u8;
+            for d in digits.iter_mut() {
+                let x = *d * 2 + carry;
+                *d = x % 10;
+                carry = x / 10;
+            }
+            if carry > 0 {
+                digits.push(carry);
+            }
+        }
+    }
+    let s: String = digits.iter().rev().map(|d| char::from(b'0' + d)).collect();
+    format!("{s}#{w}")
+}
+
+/// The symbols of `es`, each with a Lean identifier that is its alone, its width, and any
+/// declared known bits.
+fn symbol_names(cx: &mut Context, es: &[Expr]) -> Result<Vec<NamedSym>, Error> {
+    let mut names: Vec<NamedSym> = Vec::new();
     for id in cx.symbols_in(es)? {
         let (Some(key), Some(w)) = (cx.symbol_key(id).cloned(), cx.symbol_width(id)) else {
             continue;
         };
+        let known = cx
+            .find_symbol(&key)
+            .and_then(|s| cx.declared_known(s).ok().flatten());
         let mut ident: String = match &key {
             SymbolKey::Str(s) => (s.chars())
                 .map(|c| {
@@ -126,50 +176,29 @@ fn symbol_names(cx: &mut Context, es: &[Expr]) -> Result<Vec<(SymbolKey, String,
         if !ident.starts_with(|c: char| c.is_ascii_alphabetic()) {
             ident.insert(0, 'v');
         }
-        while names.iter().any(|(_, n, _)| *n == ident) || RESERVED.contains(&ident.as_str()) {
+        while names.iter().any(|(_, n, _, _)| *n == ident)
+            || crate::rules::lean::KEYWORDS.contains(&ident.as_str())
+        {
             ident.push('\'');
         }
-        names.push((key, ident, w.bits()));
+        names.push((key, ident, w.bits(), known));
     }
     Ok(names)
 }
 
-/// Identifiers a symbol must not be written as.
-const RESERVED: [&str; 12] = [
-    "if", "then", "else", "let", "fun", "by", "theorem", "import", "at", "do", "in", "have",
-];
-
 /// `e` as a Lean term of type `BitVec w`, fully parenthesized where it is not atomic.
-fn term(cx: &Context, e: Expr, names: &[(SymbolKey, String, u16)]) -> Result<String, Error> {
+fn term(cx: &Context, e: Expr, names: &[NamedSym]) -> Result<String, Error> {
     let unsupported = |what: &str| Error::Unsupported(format!("no Lean theorem: {what}"));
     let w = cx.width(e)?.bits();
     let t = |x: Expr| term(cx, x, names);
     Ok(match cx.view(e)? {
-        View::Const(v) => {
-            // Decimal: any width, no leading zeros to count.
-            let mut digits = vec![0u8];
-            for limb in v.limbs().iter().rev() {
-                for bit in (0..64).rev() {
-                    let mut carry = (limb >> bit & 1) as u8;
-                    for d in digits.iter_mut() {
-                        let x = *d * 2 + carry;
-                        *d = x % 10;
-                        carry = x / 10;
-                    }
-                    if carry > 0 {
-                        digits.push(carry);
-                    }
-                }
-            }
-            let s: String = digits.iter().rev().map(|d| char::from(b'0' + d)).collect();
-            format!("{s}#{w}")
-        }
+        View::Const(v) => bv_decimal(&v),
         View::Sym(id) => {
             let key = cx
                 .symbol_key(id)
                 .ok_or_else(|| unsupported("a symbol without a key"))?;
-            (names.iter().find(|(k, _, _)| k == key))
-                .map(|(_, n, _)| n.clone())
+            (names.iter().find(|(k, _, _, _)| k == key))
+                .map(|(_, n, _, _)| n.clone())
                 .ok_or_else(|| unsupported("a symbol not listed"))?
         }
         View::Un(op, a) => match op {

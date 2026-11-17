@@ -516,7 +516,7 @@ impl Saturator {
                 return Ok((None, end));
             }
         };
-        let mut eg = EGraph::new();
+        let mut eg = EGraph::new(w);
         let rootc = match self.import(cx, &mut eg, &order, meter) {
             Ok(c) => c,
             Err(Halt::Budget(e)) => {
@@ -653,10 +653,7 @@ impl Saturator {
                 || n.op.as_bin().is_some_and(pattern::admitted_bin)
                 || n.op.as_un().is_some_and(pattern::admitted_un);
             let e = if let Some(v) = cx.const_val(i) {
-                ENode {
-                    op: EOp::Const(v),
-                    kids: [0, 0],
-                }
+                eg.const_node(v)
             } else if !inside || n.op == OpCode::Sym || !n.children().all(|c| at.contains_key(&c)) {
                 ENode {
                     op: EOp::Leaf(i),

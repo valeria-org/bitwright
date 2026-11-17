@@ -118,11 +118,28 @@ fn lex(src: &str) -> Vec<Tok> {
     out
 }
 
-/// A translated term: its `.bwr` text, and whether it is a Boolean (1-bit) value.
+/// A translated term: its `.bwr` text, whether it is a Boolean (1-bit) value, its known width
+/// text when obvious, its raw numeric value while untyped (before `#w` is attached), and
+/// whether it is a `Nat` read off a vector (`x.toNat`, written as the vector itself).
 #[derive(Clone, Debug)]
 struct T {
     text: String,
     boolean: bool,
+    width: Option<String>,
+    raw_num: Option<u128>,
+    nat: bool,
+}
+
+impl T {
+    fn bool_val(text: String) -> Self {
+        T {
+            text,
+            boolean: true,
+            width: None,
+            raw_num: None,
+            nat: false,
+        }
+    }
 }
 
 struct Parser<'a> {
@@ -132,6 +149,10 @@ struct Parser<'a> {
     widths: Vec<(String, String)>,
     /// Parameters, with their width text (`W` or `32`).
     params: Vec<(String, String)>,
+    /// Minimum bitwidth required for each `.bwr` width variable by typed literals (`5#w`).
+    width_bounds: Vec<(String, u32)>,
+    /// Minimum bitwidth required by untyped literals (`x + 5`).
+    untyped_literal_bits: u32,
 }
 
 type R<T> = Result<T, String>;
@@ -209,8 +230,73 @@ impl Parser<'_> {
             .map(|(_, w)| w.as_str())
     }
 
-    // Lean's precedences, lowest first: ∧ (35), = ≠ == != < ≤ (50), ||| (65), ^^^ (58? in
-    // Lean `^^^` is 58, `&&&` 60, `|||` 55), <<< >>> (75), + - (65), * / % (70), ++ (65).
+    /// A literal's value; an error past 128 bits (its value modulo `2^w` would be lost).
+    fn parse_num(s: &str) -> R<u128> {
+        let v = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(h) => u128::from_str_radix(h, 16),
+            None => s.parse::<u128>(),
+        };
+        v.map_err(|_| format!("the literal `{s}` (more than 128 bits)"))
+    }
+
+    /// The literal `v` at the fixed width `wb`, where it does not fit: modulo `2^wb`, as Lean
+    /// reads it (`300#8` is 44).
+    fn wrapped(v: u128, wb: u32) -> Option<u128> {
+        if !(1..=128).contains(&wb) {
+            return None;
+        }
+        let mask = u128::MAX >> (128 - wb);
+        (v > mask).then_some(v & mask)
+    }
+
+    fn note_width_bits(&mut self, bwr_width: &str, bits: u32) {
+        if bits <= 1 || !self.widths.iter().any(|(_, b)| b == bwr_width) {
+            return;
+        }
+        if let Some(slot) = self.width_bounds.iter_mut().find(|(b, _)| b == bwr_width) {
+            slot.1 = slot.1.max(bits);
+        } else {
+            self.width_bounds.push((bwr_width.to_string(), bits));
+        }
+    }
+
+    fn resize_cast(kind: &str, a: T, w: String) -> T {
+        if a.width.as_deref() == Some(w.as_str()) {
+            return T {
+                width: Some(w),
+                ..a
+            };
+        }
+        if let (Some(Ok(aw)), Ok(tw)) = (a.width.as_deref().map(str::parse::<u32>), w.parse::<u32>())
+        {
+            let text = if tw < aw {
+                format!("trunc<{w}>({})", a.text)
+            } else if tw > aw {
+                format!("zext<{w}>({})", a.text)
+            } else {
+                a.text
+            };
+            return T {
+                text,
+                boolean: false,
+                width: Some(w),
+                raw_num: None,
+                nat: false,
+            };
+        }
+        let op = if kind == "truncate" { "trunc" } else { "zext" };
+        T {
+            text: format!("{op}<{w}>({})", a.text),
+            boolean: false,
+            width: Some(w),
+            raw_num: None,
+            nat: false,
+        }
+    }
+
+    // Lean's precedences, lowest first: ∧ (35), = ≠ == != < ≤ > ≥ (50), ||| (55), ^^^ (58),
+    // &&& (60), + - ++ (65), * / % (70), <<< >>> (75). All associate to the left but `∧`
+    // (`infixr:35`): `a ++ b + c` is `(a ++ b) + c`.
     fn term(&mut self) -> R<T> {
         self.binary(0)
     }
@@ -218,18 +304,28 @@ impl Parser<'_> {
     fn binary(&mut self, min: u8) -> R<T> {
         let mut lhs = self.unary()?;
         while let Some(Tok::Sym(op)) = self.peek().cloned() {
+            if op == "/" && 8 >= min {
+                return Err(
+                    "`/` defines division by zero as 0 in Lean (use `BitVec.smtUDiv`)".into(),
+                );
+            }
             let (prec, bwr, boolean) = match op.as_str() {
+                // The 1-bit `&`, not the guard's `&&`: a conjunction can be a value (an `if`
+                // condition, `BitVec.ofBool`). Hypotheses are split at it (`split_conjuncts`).
                 "∧" => (1, "&", true),
                 "=" | "==" => (2, "==", true),
                 "≠" | "!=" => (2, "!=", true),
+                "<" => (2, "<u", true),
+                "≤" | "<=" => (2, "<=u", true),
+                ">" => (2, ">u", true),
+                "≥" | ">=" => (2, ">=u", true),
                 "|||" => (3, "|", false),
                 "^^^" => (4, "^", false),
                 "&&&" => (5, "&", false),
-                "++" => (6, "concat", false),
+                "++" => (7, "concat", false),
                 "+" => (7, "+", false),
                 "-" => (7, "-", false),
                 "*" => (8, "*", false),
-                "/" => (8, "udiv", false),
                 "%" => (8, "urem", false),
                 "<<<" => (9, "<<", false),
                 ">>>" => (9, ">>u", false),
@@ -239,19 +335,56 @@ impl Parser<'_> {
                 break;
             }
             self.at += 1;
-            let rhs = self.binary(prec + 1)?;
+            let next_min = if op == "∧" { prec } else { prec + 1 };
+            let rhs = self.binary(next_min)?;
+            // A `toNat` is written as its vector: comparisons read the same (unsigned, below
+            // `2^w`), arithmetic does not (`Nat` neither wraps nor truncates the same way).
+            if (lhs.nat || rhs.nat) && !boolean {
+                return Err(format!("`{op}` on a `toNat` (Nat arithmetic does not wrap)"));
+            }
+            // A `toNat` against a `Nat` literal: the literal is written at the vector's width,
+            // where it wraps; so it must be below `2^w` (a width variable is bounded to that).
+            if boolean && op != "∧" && lhs.nat != rhs.nat {
+                let (v, k) = if lhs.nat { (&lhs, &rhs) } else { (&rhs, &lhs) };
+                if k.width.is_none() && k.text.starts_with(|c: char| c.is_ascii_digit()) {
+                    let bits = 128 - Self::parse_num(&k.text)?.leading_zeros();
+                    match v.width.clone() {
+                        Some(w) => match w.parse::<u32>() {
+                            Ok(wb) if bits > wb => {
+                                return Err(format!(
+                                    "`{}` compared with a `toNat` of {wb} bits",
+                                    k.text
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(_) => self.note_width_bits(&w, bits),
+                        },
+                        None => {
+                            return Err("a `toNat` of unknown width against a literal".into());
+                        }
+                    }
+                }
+            }
             // `t = true` and `t == true` are the Boolean `t` itself.
             if boolean && op != "∧" && (rhs.text == "true" || lhs.text == "true") {
                 lhs = if rhs.text == "true" { lhs } else { rhs };
                 lhs.boolean = true;
                 continue;
             }
+            let out_width = if boolean || bwr == "concat" {
+                None
+            } else {
+                lhs.width.clone().or_else(|| rhs.width.clone())
+            };
             lhs = T {
                 text: match bwr {
                     "concat" | "udiv" | "urem" => format!("{bwr}({}, {})", lhs.text, rhs.text),
                     _ => format!("({} {bwr} {})", lhs.text, rhs.text),
                 },
                 boolean,
+                width: out_width,
+                raw_num: None,
+                nat: false,
             };
         }
         Ok(lhs)
@@ -263,6 +396,9 @@ impl Parser<'_> {
             return Ok(T {
                 text: format!("~{}", a.text),
                 boolean: false,
+                width: a.width,
+                raw_num: None,
+                nat: false,
             });
         }
         if self.eat_sym("-") {
@@ -270,6 +406,9 @@ impl Parser<'_> {
             return Ok(T {
                 text: format!("-{}", a.text),
                 boolean: false,
+                width: a.width,
+                raw_num: None,
+                nat: false,
             });
         }
         if self.eat_sym("¬") {
@@ -288,34 +427,53 @@ impl Parser<'_> {
                     self.at = save;
                     break;
                 };
+                if let Some(v) = t.raw_num.take() {
+                    self.untyped_literal_bits =
+                        self.untyped_literal_bits.max(128 - v.leading_zeros());
+                }
                 t = self.method(t, &m)?;
             } else if self.peek_sym("#") {
-                // `5#w`: a literal with its width.
+                // `5#w`: a literal with its width (wrapped modulo `2^w` at fixed widths).
                 self.at += 1;
-                let _w = self.width()?;
+                let w = self.width()?;
+                if let Some(v) = t.raw_num.take() {
+                    match w.parse::<u32>() {
+                        Ok(wb) => {
+                            if let Some(k) = Self::wrapped(v, wb) {
+                                t.text = k.to_string();
+                            }
+                        }
+                        Err(_) => self.note_width_bits(&w, 128 - v.leading_zeros()),
+                    }
+                }
+                t.width = Some(w);
             } else {
                 break;
             }
+        }
+        if let Some(v) = t.raw_num.take() {
+            self.untyped_literal_bits = self.untyped_literal_bits.max(128 - v.leading_zeros());
         }
         Ok(t)
     }
 
     fn method(&mut self, t: T, m: &str) -> R<T> {
-        let a = t.text;
+        let a = t.text.clone();
+        let aw = t.width.clone();
         let arg = |p: &mut Self| p.arg();
         Ok(match m {
             "zeroExtend" | "setWidth" | "truncate" => {
                 let w = self.width()?;
-                T {
-                    text: format!("zext<{w}>({a})"),
-                    boolean: false,
-                }
+                Self::resize_cast(m, t, w)
             }
             "signExtend" => {
                 let w = self.width()?;
                 T {
                     text: format!("sext<{w}>({a})"),
                     boolean: false,
+                    width: Some(w),
+                    raw_num: None,
+                    nat: false,
                 }
             }
             "extractLsb'" => {
@@ -328,6 +486,9 @@ impl Parser<'_> {
                         format!("extract<{lo}, {len}>({a})")
                     },
                     boolean: false,
+                    width: Some(len.to_string()),
+                    raw_num: None,
+                    nat: false,
                 }
             }
             "extractLsb" => {
@@ -341,6 +502,9 @@ impl Parser<'_> {
                         format!("extract<{lo}, {len}>({a})")
                     },
                     boolean: false,
+                    width: Some(len.to_string()),
+                    raw_num: None,
+                    nat: false,
                 }
             }
             "rotateLeft" | "rotateRight" => {
@@ -352,6 +516,9 @@ impl Parser<'_> {
                         n.text
                     ),
                     boolean: false,
+                    width: aw,
+                    raw_num: None,
+                    nat: false,
                 }
             }
             "sshiftRight'" | "sshiftRight" => {
@@ -359,23 +526,43 @@ impl Parser<'_> {
                 T {
                     text: format!("({a} >>s {})", n.text),
                     boolean: false,
+                    width: aw,
+                    raw_num: None,
+                    nat: false,
                 }
             }
-            "smtUDiv" | "udiv" => T {
+            "smtUDiv" => T {
                 text: format!("udiv({a}, {})", arg(self)?.text),
                 boolean: false,
+                width: aw,
+                raw_num: None,
+                nat: false,
             },
-            "smtSDiv" | "sdiv" => T {
+            "smtSDiv" => T {
                 text: format!("sdiv({a}, {})", arg(self)?.text),
                 boolean: false,
+                width: aw,
+                raw_num: None,
+                nat: false,
             },
+            "udiv" | "sdiv" => {
+                return Err(format!(
+                    "`{m}` defines division by zero as 0 in Lean (use `smtUDiv` or `smtSDiv`)"
+                ));
+            }
             "umod" | "urem" => T {
                 text: format!("urem({a}, {})", arg(self)?.text),
                 boolean: false,
+                width: aw,
+                raw_num: None,
+                nat: false,
             },
             "srem" => T {
                 text: format!("srem({a}, {})", arg(self)?.text),
                 boolean: false,
+                width: aw,
+                raw_num: None,
+                nat: false,
             },
             "ult" | "ule" | "slt" | "sle" => {
                 let op = match m {
@@ -384,14 +571,14 @@ impl Parser<'_> {
                     "slt" => "<s",
                     _ => "<=s",
                 };
-                T {
-                    text: format!("({a} {op} {})", arg(self)?.text),
-                    boolean: true,
-                }
+                T::bool_val(format!("({a} {op} {})", arg(self)?.text))
             }
             "toNat" => T {
                 text: a,
                 boolean: false,
+                width: aw,
+                raw_num: None,
+                nat: true,
             },
             other => return Err(format!("the method `{other}`")),
         })
@@ -437,18 +624,19 @@ impl Parser<'_> {
             }
             Some(Tok::Num(n)) => {
                 self.at += 1;
+                let v = Self::parse_num(&n)?;
                 Ok(T {
                     text: n,
                     boolean: false,
+                    width: None,
+                    raw_num: Some(v),
+                    nat: false,
                 })
             }
             Some(Tok::Ident(name)) => {
                 self.at += 1;
                 match name.as_str() {
-                    "true" | "false" => Ok(T {
-                        text: name,
-                        boolean: true,
-                    }),
+                    "true" | "false" => Ok(T::bool_val(name)),
                     "if" | "bif" => {
                         let c = self.term()?;
                         if !self.peek_ident("then") {
@@ -464,6 +652,9 @@ impl Parser<'_> {
                         Ok(T {
                             text: format!("select({}, {}, {})", c.text, t.text, e.text),
                             boolean: false,
+                            width: t.width.or(e.width),
+                            raw_num: None,
+                            nat: t.nat || e.nat,
                         })
                     }
                     "decide" => {
@@ -472,53 +663,106 @@ impl Parser<'_> {
                     }
                     "BitVec.ofBool" => {
                         let c = self.arg()?;
-                        Ok(T {
-                            text: c.text,
-                            boolean: true,
-                        })
+                        Ok(T::bool_val(c.text))
                     }
                     "BitVec.ofNat" => {
-                        let _w = self.width()?;
-                        let n = self.arg()?;
-                        Ok(T {
-                            text: n.text,
-                            boolean: false,
-                        })
+                        let w = self.width()?;
+                        if let Some(Tok::Num(ns)) = self.peek().cloned() {
+                            self.at += 1;
+                            let v = Self::parse_num(&ns)?;
+                            let text = match w.parse::<u32>() {
+                                Ok(wb) => Self::wrapped(v, wb).map_or(ns, |k| k.to_string()),
+                                Err(_) => {
+                                    self.note_width_bits(&w, 128 - v.leading_zeros());
+                                    ns
+                                }
+                            };
+                            Ok(T {
+                                text,
+                                boolean: false,
+                                width: Some(w),
+                                raw_num: None,
+                                nat: false,
+                            })
+                        } else {
+                            let n = self.arg()?;
+                            Ok(T {
+                                text: n.text,
+                                boolean: false,
+                                width: Some(w),
+                                raw_num: None,
+                                nat: false,
+                            })
+                        }
                     }
                     "BitVec.allOnes" => {
-                        let _w = self.width()?;
+                        let w = self.width()?;
                         Ok(T {
                             text: "ones".into(),
                             boolean: false,
+                            width: Some(w),
+                            raw_num: None,
+                            nat: false,
                         })
                     }
                     "BitVec.intMin" => {
-                        let _w = self.width()?;
+                        let w = self.width()?;
                         Ok(T {
                             text: "smin_lit".into(),
                             boolean: false,
+                            width: Some(w),
+                            raw_num: None,
+                            nat: false,
                         })
                     }
                     "BitVec.intMax" => {
-                        let _w = self.width()?;
+                        let w = self.width()?;
                         Ok(T {
                             text: "smax_lit".into(),
                             boolean: false,
+                            width: Some(w),
+                            raw_num: None,
+                            nat: false,
                         })
                     }
-                    "BitVec.zeroExtend" | "BitVec.setWidth" | "BitVec.signExtend" => {
+                    "BitVec.zeroExtend"
+                    | "BitVec.setWidth"
+                    | "BitVec.truncate"
+                    | "BitVec.signExtend" => {
                         let w = self.width()?;
                         let a = self.arg()?;
-                        let f = if name.ends_with("signExtend") {
-                            "sext"
+                        if name.ends_with("signExtend") {
+                            Ok(T {
+                                text: format!("sext<{w}>({})", a.text),
+                                boolean: false,
+                                width: Some(w),
+                                raw_num: None,
+                                nat: false,
+                            })
                         } else {
-                            "zext"
+                            let kind = name.rsplit('.').next().unwrap_or("zext");
+                            Ok(Self::resize_cast(kind, a, w))
+                        }
+                    }
+                    "BitVec.smtUDiv" | "BitVec.smtSDiv" | "BitVec.srem" => {
+                        let a = self.arg()?;
+                        let b = self.arg()?;
+                        let f = match name.as_str() {
+                            "BitVec.smtUDiv" => "udiv",
+                            "BitVec.smtSDiv" => "sdiv",
+                            _ => "srem",
                         };
                         Ok(T {
-                            text: format!("{f}<{w}>({})", a.text),
+                            text: format!("{f}({}, {})", a.text, b.text),
                             boolean: false,
+                            width: a.width.or(b.width),
+                            raw_num: None,
+                            nat: false,
                         })
                     }
+                    "BitVec.udiv" | "BitVec.sdiv" => Err(format!(
+                        "`{name}` defines division by zero as 0 in Lean (use `BitVec.smtUDiv` or `BitVec.smtSDiv`)"
+                    )),
                     "BitVec.rotateLeft" | "BitVec.rotateRight" => {
                         let a = self.arg()?;
                         let n = self.arg()?;
@@ -530,12 +774,21 @@ impl Parser<'_> {
                         Ok(T {
                             text: format!("{f}({}, {})", a.text, n.text),
                             boolean: false,
+                            width: a.width,
+                            raw_num: None,
+                            nat: false,
                         })
                     }
-                    _ if self.param_width(&name).is_some() => Ok(T {
-                        text: name,
-                        boolean: false,
-                    }),
+                    _ if self.param_width(&name).is_some() => {
+                        let w = self.param_width(&name).map(str::to_string);
+                        Ok(T {
+                            text: name,
+                            boolean: false,
+                            width: w,
+                            raw_num: None,
+                            nat: false,
+                        })
+                    }
                     _ => Err(format!("`{name}`")),
                 }
             }
@@ -569,12 +822,36 @@ struct Decl {
     text: Result<String, String>,
 }
 
+/// The conjuncts of a Boolean hypothesis's text, each its own `proves(...)`. Every binary
+/// operation is written parenthesized, so the only `&` outside parentheses is the root's: of
+/// two 1-bit values (the hypothesis is Boolean), true exactly when both are.
+fn split_conjuncts(s: &str, out: &mut Vec<String>) {
+    let s = strip_outer(s.trim());
+    let mut depth = 0usize;
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 && s[i..].starts_with(" & ") => {
+                split_conjuncts(&s[..i], out);
+                split_conjuncts(&s[i + 3..], out);
+                return;
+            }
+            _ => {}
+        }
+    }
+    out.push(s);
+}
+
 fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
     let mut p = Parser {
         toks,
         at: *at,
         widths: Vec::new(),
         params: Vec::new(),
+        width_bounds: Vec::new(),
+        untyped_literal_bits: 0,
     };
     // The keyword and the name first, so a failure can be reported by name.
     let kw = p.ident().unwrap_or_default();
@@ -586,7 +863,6 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
     let r = (|| -> R<String> {
         let name = decl_name.clone();
         let mut hyps: Vec<String> = Vec::new();
-        let mut literal_bits = 0u32;
         // Binders.
         loop {
             if p.eat_sym("{") {
@@ -643,7 +919,11 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
                     if !prop.boolean {
                         return Err("a hypothesis that is not a comparison".into());
                     }
-                    hyps.push(format!("proves({})", strip_outer(&prop.text)));
+                    let mut parts = Vec::new();
+                    split_conjuncts(&prop.text, &mut parts);
+                    for part in parts {
+                        hyps.push(format!("proves({part})"));
+                    }
                 }
                 p.expect_sym(")")?;
             } else {
@@ -669,10 +949,7 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
             _ => None,
         };
         let rhs = match &truth {
-            Some(t) => T {
-                text: t.clone(),
-                boolean: true,
-            },
+            Some(t) => T::bool_val(t.clone()),
             None => p.binary(3)?,
         };
         if truth.is_none() && (lhs.boolean || rhs.boolean) {
@@ -684,15 +961,15 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
                 p.describe()
             ));
         }
-        // Literals need enough width: the widest literal in the text bounds the width variable.
-        for tok in &toks[*at..p.at] {
-            if let Tok::Num(s) = tok {
-                let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                    u128::from_str_radix(h, 16).unwrap_or(u128::MAX)
-                } else {
-                    s.parse::<u128>().unwrap_or(u128::MAX)
-                };
-                literal_bits = literal_bits.max(128 - v.leading_zeros());
+        // Untyped literals bound the statement's width variable (or the first width variable).
+        if p.untyped_literal_bits > 1 {
+            let target = lhs
+                .width
+                .clone()
+                .or_else(|| rhs.width.clone())
+                .or_else(|| p.widths.first().map(|(_, b)| b.clone()));
+            if let Some(w) = target {
+                p.note_width_bits(&w, p.untyped_literal_bits);
             }
         }
         let params: Vec<String> = p.params.iter().map(|(n, w)| format!("{n}: {w}")).collect();
@@ -709,10 +986,13 @@ fn declaration(toks: &[Tok], at: &mut usize, n: usize) -> Decl {
             )
         };
         let mut wher = String::new();
-        if let Some((_, w)) = p.widths.first()
-            && literal_bits > 1
-        {
-            let _ = write!(wher, " where {w} >= {literal_bits}");
+        if !p.width_bounds.is_empty() {
+            let clauses: Vec<String> = p
+                .width_bounds
+                .iter()
+                .map(|(w, b)| format!("{w} >= {b}"))
+                .collect();
+            let _ = write!(wher, " where {}", clauses.join(", "));
         }
         let guard = if hyps.is_empty() {
             String::new()

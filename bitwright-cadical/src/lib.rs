@@ -85,9 +85,6 @@ impl Backend for Cadical {
         if self.solver.set_limit("conflicts", cap).is_err() {
             return Answer::Unknown;
         }
-        self.conflicts = self
-            .conflicts
-            .saturating_add(limits.conflicts.min(cap as u64));
         match self.solver.solve_with(assumptions.iter().map(|&l| lit(l))) {
             Some(true) => Answer::Sat(
                 (1..=self.vars as i32)
@@ -100,7 +97,12 @@ impl Backend for Cadical {
                     .collect();
                 Answer::Unsat
             }
-            None => Answer::Unknown,
+            None => {
+                self.conflicts = self
+                    .conflicts
+                    .saturating_add(limits.conflicts.min(cap as u64));
+                Answer::Unknown
+            }
         }
     }
 
@@ -114,6 +116,10 @@ impl Backend for Cadical {
 
     fn propagations(&self) -> u64 {
         0
+    }
+
+    fn exact_conflicts(&self) -> bool {
+        false
     }
 }
 

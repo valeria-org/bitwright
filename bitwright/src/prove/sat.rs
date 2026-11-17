@@ -103,6 +103,12 @@ pub trait Backend: core::fmt::Debug + Send {
 
     /// Propagations of every search so far (0 from a search that does not count them).
     fn propagations(&self) -> u64;
+
+    /// Whether [`conflicts`](Self::conflicts) is an exact count of search conflicts (`false`
+    /// for a backend that does not expose its conflict counter).
+    fn exact_conflicts(&self) -> bool {
+        true
+    }
 }
 
 impl Backend for Solver {
@@ -162,6 +168,10 @@ impl<B: Backend + ?Sized> Backend for Box<B> {
 
     fn propagations(&self) -> u64 {
         (**self).propagations()
+    }
+
+    fn exact_conflicts(&self) -> bool {
+        (**self).exact_conflicts()
     }
 }
 
@@ -254,6 +264,14 @@ pub struct Solver {
     next_reduce: u64,
     /// Learned clauses not deleted.
     learnts: usize,
+    /// Indices of live learned clauses in `clauses` (so `reduce` and rescaling skip problem CNF).
+    learnt_ids: Vec<u32>,
+    /// Reusable scratch for conflict analysis and LBD stamping.
+    analyze_learnt: Vec<Lit>,
+    analyze_clear: Vec<Lit>,
+    analyze_stack: Vec<Lit>,
+    lbd_seen: Vec<u32>,
+    lbd_stamp: u32,
     /// Lemmas offered by preprocessing as RUP consequences that unit propagation did not
     /// confirm, so they were not added.
     pub(super) rejected_lemmas: u64,
@@ -313,6 +331,12 @@ impl Solver {
             here: 0,
             next_reduce: 2000,
             learnts: 0,
+            learnt_ids: Vec::new(),
+            analyze_learnt: Vec::new(),
+            analyze_clear: Vec::new(),
+            analyze_stack: Vec::new(),
+            lbd_seen: Vec::new(),
+            lbd_stamp: 0,
             rejected_lemmas: 0,
             lemmas: 0,
             conflicts: 0,
@@ -524,7 +548,7 @@ impl Solver {
         }
         let original_len = c.len();
         c.retain(|&l| self.value(l) != Value::False);
-        if c.len() != original_len
+        if (c.len() != original_len || original_len == 0)
             && let Some(p) = &mut self.proof
         {
             p.push(Step::Add(c.clone()));
@@ -585,7 +609,10 @@ impl Solver {
             deleted: false,
         });
         self.arena.extend_from_slice(lits);
-        self.learnts += usize::from(learnt);
+        if learnt {
+            self.learnts += 1;
+            self.learnt_ids.push(idx);
+        }
         idx
     }
 
@@ -715,8 +742,8 @@ impl Solver {
         let cl = &mut self.clauses[c as usize];
         cl.activity += self.cla_inc;
         if cl.activity > 1e20 {
-            for x in &mut self.clauses {
-                x.activity *= 1e-20;
+            for &i in &self.learnt_ids {
+                self.clauses[i as usize].activity *= 1e-20;
             }
             self.cla_inc *= 1e-20;
         }
@@ -739,7 +766,9 @@ impl Solver {
     /// First-UIP conflict analysis: the learned clause (asserting literal first), the level to
     /// go back to, and its literal block distance.
     fn analyze(&mut self, confl: u32) -> (Vec<Lit>, u32, u32) {
-        let mut learnt: Vec<Lit> = vec![Lit(0)];
+        let mut learnt = core::mem::take(&mut self.analyze_learnt);
+        learnt.clear();
+        learnt.push(Lit(0));
         let mut path = 0;
         let mut p: Option<Lit> = None;
         let mut idx = self.trail.len();
@@ -789,8 +818,11 @@ impl Solver {
         let abstract_levels = learnt[1..].iter().fold(0u32, |acc, l| {
             acc | (1 << (self.level[l.var() as usize] & 31))
         });
-        let mut kept = vec![learnt[0]];
-        let mut to_clear: Vec<Lit> = learnt.clone();
+        let mut kept = Vec::with_capacity(learnt.len());
+        kept.push(learnt[0]);
+        let mut to_clear = core::mem::take(&mut self.analyze_clear);
+        to_clear.clear();
+        to_clear.extend_from_slice(&learnt);
         for &l in &learnt[1..] {
             if self.reason[l.var() as usize].is_none()
                 || !self.redundant(l, abstract_levels, &mut to_clear)
@@ -798,9 +830,11 @@ impl Solver {
                 kept.push(l);
             }
         }
-        for l in to_clear {
+        for &l in &to_clear {
             self.seen[l.var() as usize] = 0;
         }
+        self.analyze_learnt = learnt;
+        self.analyze_clear = to_clear;
         // The backtrack level: the highest level among the rest, that literal second.
         let mut bt = 0;
         if kept.len() > 1 {
@@ -813,22 +847,37 @@ impl Solver {
             kept.swap(1, max_i);
             bt = self.level[kept[1].var() as usize];
         }
-        let lbd = {
-            let mut levels: Vec<u32> = kept.iter().map(|l| self.level[l.var() as usize]).collect();
-            levels.sort_unstable();
-            levels.dedup();
-            levels.len() as u32
-        };
+        let need_levels = self.decision_level() as usize + 1;
+        if self.lbd_seen.len() < need_levels {
+            self.lbd_seen.resize(need_levels, 0);
+        }
+        self.lbd_stamp = self.lbd_stamp.wrapping_add(1);
+        if self.lbd_stamp == 0 {
+            self.lbd_seen.fill(0);
+            self.lbd_stamp = 1;
+        }
+        let stamp = self.lbd_stamp;
+        let mut lbd = 0u32;
+        for &l in &kept {
+            let lv = self.level[l.var() as usize] as usize;
+            if self.lbd_seen[lv] != stamp {
+                self.lbd_seen[lv] = stamp;
+                lbd += 1;
+            }
+        }
         (kept, bt, lbd)
     }
 
     /// Whether `l` (in the learned clause) is implied by the clause's other literals, through
     /// the reasons of the literals it depends on.
     fn redundant(&mut self, l: Lit, abstract_levels: u32, to_clear: &mut Vec<Lit>) -> bool {
-        let mut stack = vec![l];
+        let mut stack = core::mem::take(&mut self.analyze_stack);
+        stack.clear();
+        stack.push(l);
         let top = to_clear.len();
         while let Some(p) = stack.pop() {
             let Some(c) = self.reason[p.var() as usize] else {
+                self.analyze_stack = stack;
                 return false;
             };
             let cl = self.clauses[c as usize];
@@ -846,10 +895,12 @@ impl Solver {
                     for x in to_clear.drain(top..) {
                         self.seen[x.var() as usize] = 0;
                     }
+                    self.analyze_stack = stack;
                     return false;
                 }
             }
         }
+        self.analyze_stack = stack;
         true
     }
 
@@ -924,10 +975,13 @@ impl Solver {
 
     /// Halves the learned clauses, keeping the glue clauses (LBD ≤ 2) and reasons.
     fn reduce(&mut self) {
-        let mut idx: Vec<u32> = (0..self.clauses.len() as u32)
+        let mut idx: Vec<u32> = self
+            .learnt_ids
+            .iter()
+            .copied()
             .filter(|&i| {
                 let c = &self.clauses[i as usize];
-                c.learnt && !c.deleted && c.lbd > 2 && c.len > 2
+                !c.deleted && c.lbd > 2 && c.len > 2
             })
             .collect();
         idx.sort_by(|&a, &b| {
@@ -956,6 +1010,7 @@ impl Solver {
                 }
             }
         }
+        self.learnt_ids.retain(|&i| !self.clauses[i as usize].deleted);
         if self.wasted * 4 > self.arena.len() {
             self.collect();
         }
@@ -981,6 +1036,10 @@ impl Solver {
         self.clauses.truncate(kept);
         self.arena = arena;
         self.wasted = 0;
+        self.learnt_ids.retain_mut(|i| {
+            *i = map[*i as usize];
+            *i != u32::MAX
+        });
         for ws in self.watches.iter_mut().chain(self.bins.iter_mut()) {
             ws.retain_mut(|w| {
                 w.clause = map[w.clause as usize];
