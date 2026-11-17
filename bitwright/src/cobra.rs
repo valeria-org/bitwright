@@ -61,6 +61,96 @@ impl BasisOp {
             },
         }
     }
+
+    /// The function written with `g`'s gates: the one lowering the engine's linear-MBA pass
+    /// and the normal-form renderer share, each over its own nodes.
+    pub(crate) fn lower<G: Gates>(&self, g: &mut G) -> Result<u32, G::Err> {
+        match self {
+            BasisOp::Var(i) => g.input(*i),
+            BasisOp::Table2 { vars, tt8 } => table2(g, vars, *tt8),
+            BasisOp::Table3 { vars, tt8 } => table3(g, vars, *tt8),
+            BasisOp::ClauseAnd { vars, neg_mask } => {
+                // The positive literals and-ed, the negated ones or-ed under one `~`.
+                let (mut pos, mut neg) = (None, None);
+                for (bit, &v) in vars.iter().enumerate() {
+                    let a = g.input(v)?;
+                    if (*neg_mask >> bit) & 1 == 1 {
+                        neg = Some(match neg {
+                            None => a,
+                            Some(x) => g.or(x, a)?,
+                        });
+                    } else {
+                        pos = Some(match pos {
+                            None => a,
+                            Some(x) => g.and(x, a)?,
+                        });
+                    }
+                }
+                let neg = match neg {
+                    Some(o) => Some(g.not(o)?),
+                    None => None,
+                };
+                match (pos, neg) {
+                    (Some(p), Some(n)) => g.and(p, n),
+                    (Some(x), None) | (None, Some(x)) => Ok(x),
+                    // (No pivot has fewer than two atoms.)
+                    (None, None) => g.ones(),
+                }
+            }
+            BasisOp::OrAll { vars } => {
+                let Some((&v0, rest)) = vars.split_first() else {
+                    // The empty disjunction (never built: an `OrAll` has four inputs or more).
+                    let ones = g.ones()?;
+                    return g.not(ones);
+                };
+                let mut acc = g.input(v0)?;
+                for &v in rest {
+                    let a = g.input(v)?;
+                    acc = g.or(acc, a)?;
+                }
+                Ok(acc)
+            }
+            BasisOp::Not(inner) => match inner.as_ref() {
+                // A table's complement is the complemented table, at its own minimal size.
+                BasisOp::Table2 { vars, tt8 } => table2(g, vars, !*tt8),
+                BasisOp::Table3 { vars, tt8 } => table3(g, vars, !*tt8),
+                other => {
+                    let x = other.lower(g)?;
+                    g.complement(x)
+                }
+            },
+        }
+    }
+}
+
+/// The gates a basis function is written with (see [`BasisOp::lower`]); `Err` declines.
+pub(crate) trait Gates {
+    type Err;
+    /// Input `i` of the decomposition.
+    fn input(&mut self, i: usize) -> Result<u32, Self::Err>;
+    /// The minimal form of the 3-input truth table `tt8` over `args`.
+    fn table(&mut self, tt8: u8, args: [u32; 3]) -> Result<u32, Self::Err>;
+    fn and(&mut self, a: u32, b: u32) -> Result<u32, Self::Err>;
+    fn or(&mut self, a: u32, b: u32) -> Result<u32, Self::Err>;
+    fn not(&mut self, a: u32) -> Result<u32, Self::Err>;
+    /// All ones (the empty conjunction).
+    fn ones(&mut self) -> Result<u32, Self::Err>;
+    /// The complement of a basis function that is no table: `~a` unless the builder knows a
+    /// cheaper form of it.
+    fn complement(&mut self, a: u32) -> Result<u32, Self::Err> {
+        self.not(a)
+    }
+}
+
+/// A 2-input table, its first input in the unused third place.
+fn table2<G: Gates>(g: &mut G, vars: &[usize; 2], tt8: u8) -> Result<u32, G::Err> {
+    let (a0, a1) = (g.input(vars[0])?, g.input(vars[1])?);
+    g.table(tt8, [a0, a1, a0])
+}
+
+fn table3<G: Gates>(g: &mut G, vars: &[usize; 3], tt8: u8) -> Result<u32, G::Err> {
+    let args = [g.input(vars[0])?, g.input(vars[1])?, g.input(vars[2])?];
+    g.table(tt8, args)
 }
 
 /// Precomputed 2-var and 3-var Boolean basis templates with `f(0) = 0` and non-zero top Möbius.

@@ -2897,72 +2897,7 @@ impl<'a> Render<'a> {
 
     /// Renders one CoBRA [`BasisOp`](crate::cobra::BasisOp) over `support` atom indices.
     fn cobra_basis_op(&mut self, op: &crate::cobra::BasisOp, support: &[u32]) -> Option<u32> {
-        use crate::cobra::BasisOp;
-        match op {
-            BasisOp::Var(i) => self.atom(*support.get(*i)?),
-            BasisOp::Table2 { vars, tt8 } => {
-                let a0 = self.atom(*support.get(vars[0])?)?;
-                let a1 = self.atom(*support.get(vars[1])?)?;
-                self.min_form(*tt8, &[a0, a1, a0])
-            }
-            BasisOp::Table3 { vars, tt8 } => {
-                let a0 = self.atom(*support.get(vars[0])?)?;
-                let a1 = self.atom(*support.get(vars[1])?)?;
-                let a2 = self.atom(*support.get(vars[2])?)?;
-                self.min_form(*tt8, &[a0, a1, a2])
-            }
-            BasisOp::ClauseAnd { vars, neg_mask } => {
-                let mut pos_acc: Option<u32> = None;
-                let mut neg_or: Option<u32> = None;
-                for (bit, &v) in vars.iter().enumerate() {
-                    let a = self.atom(*support.get(v)?)?;
-                    if (*neg_mask >> bit) & 1 == 1 {
-                        neg_or = Some(match neg_or {
-                            None => a,
-                            Some(x) => self.b.bin(MOp::Or, x, a),
-                        });
-                    } else {
-                        pos_acc = Some(match pos_acc {
-                            None => a,
-                            Some(x) => self.b.bin(MOp::And, x, a),
-                        });
-                    }
-                }
-                let neg_part = neg_or.map(|o| self.b.un(MOp::Not, o));
-                match (pos_acc, neg_part) {
-                    (Some(p), Some(ng)) => Some(self.b.bin(MOp::And, p, ng)),
-                    (Some(p), None) => Some(p),
-                    (None, Some(ng)) => Some(ng),
-                    (None, None) => None,
-                }
-            }
-            BasisOp::OrAll { vars } => {
-                let mut acc = self.atom(*support.get(*vars.first()?)?)?;
-                for &v in &vars[1..] {
-                    let a = self.atom(*support.get(v)?)?;
-                    acc = self.b.bin(MOp::Or, acc, a);
-                }
-                Some(acc)
-            }
-            BasisOp::Not(inner) => match inner.as_ref() {
-                BasisOp::Table2 { vars, tt8 } => {
-                    let a0 = self.atom(*support.get(vars[0])?)?;
-                    let a1 = self.atom(*support.get(vars[1])?)?;
-                    self.min_form(!*tt8, &[a0, a1, a0])
-                }
-                BasisOp::Table3 { vars, tt8 } => {
-                    let a0 = self.atom(*support.get(vars[0])?)?;
-                    let a1 = self.atom(*support.get(vars[1])?)?;
-                    let a2 = self.atom(*support.get(vars[2])?)?;
-                    self.min_form(!*tt8, &[a0, a1, a2])
-                }
-                other => {
-                    let x = self.cobra_basis_op(other, support)?;
-                    let comps = self.complement(x);
-                    self.best(&comps)
-                }
-            },
-        }
+        op.lower(&mut CobraGates { r: self, support }).ok()
     }
 
     /// CoBRA change-of-basis decompositions for arbitrary-coefficient multi-term linear and
@@ -4709,4 +4644,39 @@ fn common_symbols(p: &Poly) -> Vec<Sym> {
         common.retain(|s| m.iter().any(|&(t, _)| t == *s));
     }
     common
+}
+
+/// The renderer's nodes as the gates of a CoBRA basis function over `support` (see
+/// `BasisOp::lower`): an atom outside the support and the empty clause are declined, and the
+/// complement of a function that is no table is the cheapest of its complements.
+struct CobraGates<'g, 'a> {
+    r: &'g mut Render<'a>,
+    support: &'g [u32],
+}
+
+impl crate::cobra::Gates for CobraGates<'_, '_> {
+    type Err = ();
+    fn input(&mut self, i: usize) -> Result<u32, ()> {
+        let a = *self.support.get(i).ok_or(())?;
+        self.r.atom(a).ok_or(())
+    }
+    fn table(&mut self, tt8: u8, args: [u32; 3]) -> Result<u32, ()> {
+        self.r.min_form(tt8, &args).ok_or(())
+    }
+    fn and(&mut self, a: u32, b: u32) -> Result<u32, ()> {
+        Ok(self.r.b.bin(MOp::And, a, b))
+    }
+    fn or(&mut self, a: u32, b: u32) -> Result<u32, ()> {
+        Ok(self.r.b.bin(MOp::Or, a, b))
+    }
+    fn not(&mut self, a: u32) -> Result<u32, ()> {
+        Ok(self.r.b.un(MOp::Not, a))
+    }
+    fn ones(&mut self) -> Result<u32, ()> {
+        Err(())
+    }
+    fn complement(&mut self, a: u32) -> Result<u32, ()> {
+        let comps = self.r.complement(a);
+        self.r.best(&comps).ok_or(())
+    }
 }

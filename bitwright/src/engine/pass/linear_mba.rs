@@ -510,83 +510,43 @@ enum Candidate {
     Conjunctions(BitVec, Vec<(usize, BitVec)>),
 }
 
+/// A basis function over the region's atoms, as the pass's nodes (see `BasisOp::lower`).
 fn emit_basis_op(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     op: &crate::cobra::BasisOp,
     atoms: &[u32],
 ) -> Result<u32, Stop> {
-    use crate::cobra::BasisOp;
-    match op {
-        BasisOp::Var(i) => Ok(atoms[*i]),
-        BasisOp::Table2 { vars, tt8 } => {
-            let a0 = atoms[vars[0]];
-            let a1 = atoms[vars[1]];
-            bitwise::emit(r, cx, *tt8, &[a0, a1, a0])
-        }
-        BasisOp::Table3 { vars, tt8 } => bitwise::emit(
-            r,
-            cx,
-            *tt8,
-            &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]],
-        ),
-        BasisOp::ClauseAnd { vars, neg_mask } => {
-            let mut pos_acc: Option<u32> = None;
-            let mut neg_or: Option<u32> = None;
-            for (bit, &v) in vars.iter().enumerate() {
-                let a = atoms[v];
-                if (*neg_mask >> bit) & 1 == 1 {
-                    neg_or = Some(match neg_or {
-                        None => a,
-                        Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::Or, x, a))?,
-                    });
-                } else {
-                    pos_acc = Some(match pos_acc {
-                        None => a,
-                        Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::And, x, a))?,
-                    });
-                }
-            }
-            let neg_part = match neg_or {
-                Some(o) => Some(r.build(cx, |cx| cx.c_un(UnOp::Not, o))?),
-                None => None,
-            };
-            match (pos_acc, neg_part) {
-                (Some(p), Some(ng)) => r.build(cx, |cx| cx.c_bin(BinOp::And, p, ng)),
-                (Some(p), None) => Ok(p),
-                (None, Some(ng)) => Ok(ng),
-                // The empty conjunction (no pivot has fewer than two atoms).
-                (None, None) => {
-                    let ones = BitVec::ones(cx.width_of(atoms[0]));
-                    r.build(cx, |cx| cx.mk_const(&ones))
-                }
-            }
-        }
-        BasisOp::OrAll { vars } => {
-            let mut acc = atoms[vars[0]];
-            for &v in &vars[1..] {
-                let a = atoms[v];
-                acc = r.build(cx, |cx| cx.c_bin(BinOp::Or, acc, a))?;
-            }
-            Ok(acc)
-        }
-        BasisOp::Not(inner) => match inner.as_ref() {
-            BasisOp::Table2 { vars, tt8 } => {
-                let a0 = atoms[vars[0]];
-                let a1 = atoms[vars[1]];
-                bitwise::emit(r, cx, !*tt8, &[a0, a1, a0])
-            }
-            BasisOp::Table3 { vars, tt8 } => bitwise::emit(
-                r,
-                cx,
-                !*tt8,
-                &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]],
-            ),
-            other => {
-                let x = emit_basis_op(r, cx, other, atoms)?;
-                r.build(cx, |cx| cx.c_un(UnOp::Not, x))
-            }
-        },
+    op.lower(&mut Gates { r, cx, atoms })
+}
+
+/// The engine's nodes as the gates of a basis function.
+struct Gates<'g, 'r, 'i> {
+    r: &'g mut Runner<'r, 'i>,
+    cx: &'g mut Context,
+    atoms: &'g [u32],
+}
+
+impl crate::cobra::Gates for Gates<'_, '_, '_> {
+    type Err = Stop;
+    fn input(&mut self, i: usize) -> Result<u32, Stop> {
+        Ok(self.atoms[i])
+    }
+    fn table(&mut self, tt8: u8, args: [u32; 3]) -> Result<u32, Stop> {
+        bitwise::emit(self.r, self.cx, tt8, &args)
+    }
+    fn and(&mut self, a: u32, b: u32) -> Result<u32, Stop> {
+        self.r.build(self.cx, |cx| cx.c_bin(BinOp::And, a, b))
+    }
+    fn or(&mut self, a: u32, b: u32) -> Result<u32, Stop> {
+        self.r.build(self.cx, |cx| cx.c_bin(BinOp::Or, a, b))
+    }
+    fn not(&mut self, a: u32) -> Result<u32, Stop> {
+        self.r.build(self.cx, |cx| cx.c_un(UnOp::Not, a))
+    }
+    fn ones(&mut self) -> Result<u32, Stop> {
+        let ones = BitVec::ones(self.cx.width_of(self.atoms[0]));
+        self.r.build(self.cx, |cx| cx.mk_const(&ones))
     }
 }
 
