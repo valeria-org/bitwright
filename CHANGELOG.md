@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.32.1
 
 - **Out of MBA calls, a call goes on.** The MBA phase's question past
   [`Budget::mba_calls`] is not asked, as one past its steps is not, and the passes after the
