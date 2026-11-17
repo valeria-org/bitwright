@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.32.4
+
+- **The prover's engines write basis sums again by default, as in 0.32.1;
+  [`Simplifiers::with_basis_sums`] turns them off.** 0.32.2 turned them off in the prover's
+  own engines for every host. A devirtualizer's questions on one protector (lighthouse.sys)
+  prove at the smallest limits only without them; on another (vgk.sys) a document grew by
+  a sixth without them (721 to 854 NIR instructions). The host chooses, for the engines of
+  the [`Simplifiers`] it asks through (a batch session's included).
+
 ## 0.32.3
 
 - **`Simplifiers::with_kept_steps`.** The engines a [`Simplifiers`] builds (the prover's, a

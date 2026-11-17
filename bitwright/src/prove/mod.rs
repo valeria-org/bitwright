@@ -306,6 +306,9 @@ pub struct Simplifiers {
     solver: Option<std::sync::Arc<dyn crate::mba::MbaSolver>>,
     /// [`Strategy::kept_steps`](crate::engine::Strategy::kept_steps) of the engines.
     kept_steps: u64,
+    /// [`Strategy::basis_sums`](crate::engine::Strategy::basis_sums) of the engines, and of
+    /// their solver where it is their own ([`NfOptions::basis_sums`](crate::mba::NfOptions)).
+    basis_sums: bool,
 }
 
 impl core::fmt::Debug for Simplifiers {
@@ -336,7 +339,20 @@ impl Simplifiers {
             #[cfg(feature = "mba")]
             solver: None,
             kept_steps: crate::engine::KEPT_STEPS,
+            basis_sums: true,
         }
+    }
+
+    /// Without sums over the basis of small bitwise functions in the engines' linear-MBA
+    /// pass and, where the solver is their own, in its answers. A question built of one gives
+    /// the search xors and ors where the conjunction form gives it ands: one of a
+    /// devirtualizer's, proved in 0.13 s from the conjunction form at 20,000 propagations,
+    /// was not proved at 10,000,000 from the basis form. Another host's questions (the
+    /// same devirtualizer on another protector) prove as well with them: it is the host's
+    /// choice, as in 0.32.1 they are on.
+    pub fn with_basis_sums(mut self, on: bool) -> Self {
+        self.basis_sums = on;
+        self
     }
 
     /// With the MBA phase keeping a fragment with no simpler form from the questions above it
@@ -384,21 +400,20 @@ impl Simplifiers {
                 (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
             }
             strategy.words_proved = proved;
-            // The circuit is what the search proves: the conjunction form's ands, not a basis
-            // sum's xors and ors ([`Strategy::basis_sums`](crate::engine::Strategy)).
-            strategy.basis_sums = false;
+            strategy.basis_sums = self.basis_sums;
             strategy.kept_steps = self.kept_steps;
             let builder = crate::engine::Engine::builder()
                 .builtin()
                 .strategy(strategy);
             #[cfg(feature = "mba")]
-            // The default solver with no basis sums: a question built of one folds and proves
-            // less ([`NfOptions::basis_sums`](crate::mba::NfOptions)).
             let builder = match &self.solver {
                 Some(s) => builder.mba_solver(s.clone()),
-                None => builder.mba_solver(std::sync::Arc::new(crate::mba::NormalFormSolver::new(
-                    crate::mba::NfOptions::default().with_basis_sums(false),
-                ))),
+                None if !self.basis_sums => {
+                    builder.mba_solver(std::sync::Arc::new(crate::mba::NormalFormSolver::new(
+                        crate::mba::NfOptions::default().with_basis_sums(false),
+                    )))
+                }
+                None => builder,
             };
             builder
                 .build()
