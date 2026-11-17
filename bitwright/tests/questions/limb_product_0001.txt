@@ -1,0 +1,15 @@
+let %0 = (#0:64 & 0x3ffffff) * 0x6dd0294305707;
+let %1 = extract<26, 32>(#0) & 0x3ffffff;
+let %2 = zext<64>(%1) * 0x305707;
+let %3 = %0 + (%2 << 26);
+let %4 = %3 & 0xfffffffffffff;
+let %5 = trunc<32>(#0) & 0x3ffffff;
+let %6 = zext<64>(%5);
+let %7 = %0 & 0xfffffffffffff;
+let %8 = zext<64>(%5 * 0x3fffcfd + %1 * 0x1b740a5 + extract<26, 32>(%6 * 0x1b740a5) + trunc<32>(#0 >>u 52) * 0x305707 + extract<26, 32>(%2) + zext<32>(%7 <u %6 * 0x305707) + zext<32>(%4 <u %7));
+let %9 = trunc<32>(%3 + 0xdba9c8) & 0x1ffffff;
+let %10 = zext<32>(%9 <u 0xdba9c8);
+let %11 = %4 >>u 25;
+let %12 = trunc<32>(%11);
+let %13 = %10 + %12 + 0x17b9c3d & 0x1ffffff;
+(%4 ^ 0xf7387adba9c8) + 0x2000000000000 & 0x3ffffffffffff | zext<64>(trunc<32>((%8 << 2) + (%4 >>u 50)) - (trunc<32>((%8 << 3) + (%4 >>u 49)) & 3787) + sext<32>(%13 <u %12 - (extract<24, 32>(%3) & 0xf7387a) + %10 + sext<32>(%9 <u trunc<32>(%3 + zext<64>((trunc<32>(%3) & 0xdba9c8) * -2)) + 0xdba9c8 & 0x1ffffff) + 0x17b9c3d & 0x1ffffff) + (%10 & zext<32>(trunc<32>(%11 + 1) & 0x1ffffff == 0) | zext<32>(%13 <u 0x17b9c3d)) + 10085) << 50

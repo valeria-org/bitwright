@@ -24,7 +24,8 @@ pub struct Budget {
     /// certificates: a node evaluation each, and 256 per monomial operation of their symbolic
     /// comparison (what one costs in evaluations).
     pub pass_work: u64,
-    /// Calls to the MBA solver.
+    /// Calls to the MBA solver. A question past the last is not asked (its root ends
+    /// [`Exhausted::MbaCalls`]); the other passes go on within their own limits.
     pub mba_calls: u64,
     /// The MBA solver's steps, its own unit of work, summed over its calls: each call runs
     /// within the least of its own limit (`MbaBudget::steps`) and what is left here, and is
