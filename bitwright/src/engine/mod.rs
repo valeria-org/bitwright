@@ -238,6 +238,20 @@ pub struct Strategy {
     /// signature in place of one of every sum below it. On by default; off, the pass finds
     /// the same forms from the operands up, in its phase.
     pub whole_first: bool,
+    /// Whether the linear-MBA pass may write a sum over the basis of small bitwise
+    /// functions (CoBRA, `src/cobra.rs`) where that is the smallest form. On by default.
+    /// The prover's engine turns it off: a basis sum is smaller to read, and its xors and ors
+    /// make a circuit the search proves far more slowly than the conjunction form's ands
+    /// (a devirtualizer's 784-node question, proved in 0.13 s from the conjunction form, was
+    /// not proved in 10,000,000 propagations from the basis form).
+    pub basis_sums: bool,
+    /// The solver steps from which the MBA phase keeps a fragment with no simpler form from
+    /// the questions above it. 2^16 by default: a larger sum is then asked whole and solved,
+    /// where a lower bound keeps it as its parts. A host whose phase budget is small next to
+    /// its questions sets it lower: a devirtualizer's engine left six of eight constants it
+    /// had folded as sums at 2^16 (the larger questions asked spent the budget before the
+    /// ones that fold), and folded them all at 2^12.
+    pub kept_steps: u64,
 }
 
 impl Strategy {
@@ -252,7 +266,21 @@ impl Strategy {
             max_region: pass::REGION_CAP,
             words_proved: false,
             whole_first: true,
+            basis_sums: true,
+            kept_steps: pass::mba::KEPT_STEPS,
         }
+    }
+
+    /// Sets [`kept_steps`](Self::kept_steps).
+    pub fn with_kept_steps(mut self, steps: u64) -> Strategy {
+        self.kept_steps = steps;
+        self
+    }
+
+    /// Sets [`basis_sums`](Self::basis_sums).
+    pub fn with_basis_sums(mut self, yes: bool) -> Strategy {
+        self.basis_sums = yes;
+        self
     }
 
     /// Sets [`whole_first`](Self::whole_first).

@@ -3884,9 +3884,10 @@ const SOLVE_SHARE_MIN: u64 = 1 << 16;
 /// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
 const SWEEP_RESERVE: u64 = 16;
 
-/// The solver steps from which a fragment with no simpler form is kept from isolated wrapper
-/// questions above it (see [`holds_kept`]).
-const KEPT_STEPS: u64 = 1 << 16;
+/// The default of [`Strategy::kept_steps`](crate::engine::Strategy::kept_steps): the solver
+/// steps from which a fragment with no simpler form is kept from isolated wrapper questions
+/// above it (see [`holds_kept`]).
+pub(crate) const KEPT_STEPS: u64 = 1 << 16;
 
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
 /// the answer replaces `n`.
@@ -4078,7 +4079,9 @@ fn ask(
                     }
                     let kept = match &a {
                         MbaAnswer::Unsupported(why) => why.starts_with("too many").then_some(true),
-                        MbaAnswer::NoSimpler => (spent >= KEPT_STEPS).then_some(true),
+                        MbaAnswer::NoSimpler => {
+                            (spent >= r.inner.strategy.kept_steps).then_some(true)
+                        }
                         _ => None,
                     };
                     if let Some(hard) = kept {

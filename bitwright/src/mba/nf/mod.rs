@@ -70,6 +70,12 @@ pub struct NfOptions {
     /// points. A hit is a candidate once a certificate proves it equal; one no certificate can
     /// decide is at most a sampled answer (`Claim::Sampled`).
     pub synthesis: bool,
+    /// Whether an answer may be a sum over the basis of small bitwise functions (CoBRA,
+    /// `src/cobra.rs`) where that renders smallest. On by default. Off, the conjunction and
+    /// the other forms are the candidates, as before 0.32: a basis sum is smaller to read,
+    /// and a question built of it folds and proves less (eight of a devirtualizer's
+    /// constants were left unfolded with it).
+    pub basis_sums: bool,
 }
 
 impl Default for NfOptions {
@@ -82,6 +88,7 @@ impl Default for NfOptions {
             max_degree: 32,
             memo: 1024,
             synthesis: true,
+            basis_sums: true,
         }
     }
 }
@@ -93,6 +100,7 @@ setters!(NfOptions {
     with_max_degree: max_degree: u32,
     with_memo: memo: u32,
     with_synthesis: synthesis: bool,
+    with_basis_sums: basis_sums: bool,
 });
 
 /// What the normal-form solver has done (telemetry; never affects answers).
@@ -2206,7 +2214,8 @@ fn normalize(
                     &atom_exprs[..a],
                     work.left,
                 )
-                .for_atom();
+                .for_atom()
+                .with_basis(opts.basis_sums);
                 if let Def::Low(k, _) = *def {
                     r = r.read_below(k);
                 }
@@ -3066,7 +3075,7 @@ struct Rendered {
 fn best_rendering(
     p: &MbaExpr,
     n: &Normal,
-    bar: u32,
+    (bar, basis): (u32, bool),
     work: &mut Steps,
     tally: &mut NfStats,
 ) -> Result<Rendered, Decline> {
@@ -3079,8 +3088,9 @@ fn best_rendering(
     let more = more_forms(n, work)?;
     tally.reused += u64::from(n.alts.is_empty() && !more.is_empty());
     for round in 0..3 {
-        let mut r =
-            Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left).with_bar(bar);
+        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left)
+            .with_bar(bar)
+            .with_basis(basis);
         let mut cands = candidates(&mut r, &n.nf, &factors);
         // The normal form renders within the budget or not at all (nothing would say the best
         // was seen); what comes after only adds candidates, so running short there only stops
@@ -3173,7 +3183,7 @@ fn run(
     };
     let mut work = Steps::counted(n.work.left, used);
     // Only renderings smaller than the question can be answers.
-    let rendered = best_rendering(p, &n, input_cost, &mut work, tally)?;
+    let rendered = best_rendering(p, &n, (input_cost, opts.basis_sums), &mut work, tally)?;
     let mut exact = rendered.exact.filter(|(c, _)| c.0 < input_cost);
     if let Some((mut cost, mut answer)) = exact.take() {
         // A fixed point: the answer, normalized again (its own constants may give coarser bit
@@ -3192,7 +3202,13 @@ fn run(
             .and_then(|m| {
                 let mut w2 = Steps::counted(m.work.left, used);
                 // Ties in nodes may still weigh less.
-                let r = best_rendering(&answer, &m, cost.0 + 1, &mut w2, &mut scratch);
+                let r = best_rendering(
+                    &answer,
+                    &m,
+                    (cost.0 + 1, opts.basis_sums),
+                    &mut w2,
+                    &mut scratch,
+                );
                 r.map(|r| (m.halved, r))
             });
             let spent = used.get().saturating_sub(before_used);

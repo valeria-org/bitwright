@@ -711,6 +711,9 @@ pub(crate) struct Render<'a> {
     top: bool,
     /// The node count a rendering must stay under to be of use (see [`Render::hopeless`]).
     bar: Option<u32>,
+    /// Whether sums over the basis of small bitwise functions are candidates
+    /// ([`NfOptions::basis_sums`](super::NfOptions)).
+    basis: bool,
     /// Per atom set, the fewest nodes a rendering over it has.
     floors: HashMap<u64, u32>,
     /// Conjunctions built so far, by atom set (see [`Render::conj`]).
@@ -826,6 +829,7 @@ impl<'a> Render<'a> {
             peeling: 0,
             top: false,
             bar: None,
+            basis: true,
             floors: HashMap::new(),
             conjs: HashMap::new(),
             wide: HashMap::new(),
@@ -877,6 +881,12 @@ impl<'a> Render<'a> {
     /// question): forms whose atoms alone reach it are not rendered at all.
     pub(crate) fn with_bar(mut self, bar: u32) -> Self {
         self.bar = Some(bar);
+        self
+    }
+
+    /// Whether sums over the basis of small bitwise functions are candidates.
+    pub(crate) fn with_basis(mut self, on: bool) -> Self {
+        self.basis = on;
         self
     }
 
@@ -1956,7 +1966,9 @@ impl<'a> Render<'a> {
             }
             if q != *p {
                 out.extend(self.grouped(&q));
-                out.extend(self.cobra_sums(&q));
+                if self.basis {
+                    out.extend(self.cobra_sums(&q));
+                }
             }
         }
         if n > 1
@@ -1966,7 +1978,9 @@ impl<'a> Render<'a> {
         }
         out.extend(self.scaled_bits(&expanded, plain.is_some()));
         out.extend(self.two_terms(p));
-        out.extend(self.cobra_sums(p));
+        if self.basis {
+            out.extend(self.cobra_sums(p));
+        }
         out.extend(self.sign_extensions(p, &expanded));
         if top && self.peeling == 0 {
             out.extend(self.split_off(p));

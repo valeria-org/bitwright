@@ -371,13 +371,20 @@ impl Simplifiers {
                 (strategy.phases).retain(|p| !matches!(p, crate::engine::Phase::Words));
             }
             strategy.words_proved = proved;
+            // The circuit is what the search proves: the conjunction form's ands, not a basis
+            // sum's xors and ors ([`Strategy::basis_sums`](crate::engine::Strategy)).
+            strategy.basis_sums = false;
             let builder = crate::engine::Engine::builder()
                 .builtin()
                 .strategy(strategy);
             #[cfg(feature = "mba")]
+            // The default solver with no basis sums: a question built of one folds and proves
+            // less ([`NfOptions::basis_sums`](crate::mba::NfOptions)).
             let builder = match &self.solver {
                 Some(s) => builder.mba_solver(s.clone()),
-                None => builder,
+                None => builder.mba_solver(std::sync::Arc::new(crate::mba::NormalFormSolver::new(
+                    crate::mba::NfOptions::default().with_basis_sums(false),
+                ))),
             };
             builder
                 .build()

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.32.2
+
+- **What 0.32 left unfolded, at the host's choice.** A devirtualizer's engine (lighthouse.sys's
+  `0x1401a5060`, 6,462 of its simplifier questions) folded eight constants with 0.31.7 that
+  0.32.1 left as sums, and its prover could not prove questions 0.31.7 proved at its smallest
+  limits:
+  - [`Strategy::kept_steps`] sets the solver steps from which the MBA phase keeps a fragment
+    with no simpler form from the questions above it (2^16 by default, as in 0.32; 2^12 before
+    it). The larger questions asked past 2^12 spent that engine's budget before the ones that
+    fold: six of the eight fold again at 2^12.
+  - [`Strategy::basis_sums`] and [`NfOptions::basis_sums`] turn off sums over the basis of small
+    bitwise functions in the linear-MBA pass and in the normal form's answers (on by default).
+    The other two fold again without them.
+  - The prover's own simplifier writes no basis sums: a question built of one gives the search
+    xors and ors where the conjunction form gives it ands (one of that devirtualizer's
+    questions, proved in 0.13 s by 0.31.7 at 20,000 propagations, was not proved by 0.32.1 at
+    10,000,000).
+- `examples/engine_corpus.rs` runs a directory of simplifier inputs through such an engine and
+  prints each one's time and result, to measure a change against a host's questions.
+
 ## 0.32.1
 
 - **Out of MBA calls, a call goes on.** The MBA phase's question past
