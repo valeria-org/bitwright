@@ -8,11 +8,14 @@
   `BudgetTerminated(MbaCalls)`. The call used to end at that question: with fuel `1 << 14`
   (sixteen calls) the prover's simplifier left a limb product as it was after one round,
   where the word pass of a later round folds it.
-- **The linear-MBA pass's decomposition costs what it reads.** It reads the coefficients that
-  are not zero where it looks for one a residual lines up with (it charged all `2^t` of them
-  per residual: 27,296 units of pass work for a sum over seven atoms, 2,268 now), and is not
-  looked for where replacing the node frees fewer nodes than any form over the atoms the sum
-  depends on has. Its results are the same.
+- **The linear-MBA pass's decomposition costs what it reads, within a share.** What a
+  residual could line up with is read once per pivot, and only the coefficients that are not
+  zero (it charged all `2^t` of them per residual, entry and weight: 93,745 units of pass
+  work for one sum over five atoms, 12,148 now). One
+  decomposition reads at most 1/256 of the call's pass work (1,024 units with fuel `1 << 14`,
+  262,144 at the default) and is no candidate past that; one that ran out used to end the
+  call. It is not looked for where replacing the node frees fewer nodes than any form over
+  the atoms the sum depends on has. Within its share its results are the same.
 
 ## 0.32.0
 

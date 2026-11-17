@@ -12,6 +12,9 @@
 //!   seven atoms with a handful of coefficients, and the call ran out of pass work;
 //! - the MBA phase's seventeenth question ended the whole call, in its first round.
 //!
+//! `questions/chained_sum_0001.txt` is a sum the simplifier alone folds, once the passes
+//! before the MBA phase leave it the work to.
+//!
 //! `questions/linear_sum_000*.txt` are sums the same release learned to solve, kept so: a
 //! chain of sixteen products that are each as small as they get, and a masked sum over bit
 //! tests.
@@ -23,6 +26,7 @@ use bitwright::prove::{Config, Outcome, Question};
 use bitwright::{Bounded, CmpOp, Context, Expr, ParseOptions, Width};
 
 const LIMB_PRODUCT: &str = include_str!("questions/limb_product_0001.txt");
+const CHAINED_SUM: &str = include_str!("questions/chained_sum_0001.txt");
 const LINEAR_SUMS: [(&str, u32); 2] = [
     (include_str!("questions/linear_sum_0001.txt"), 26),
     (include_str!("questions/linear_sum_0002.txt"), 24),
@@ -63,6 +67,31 @@ fn a_limb_product_is_proved_with_small_fuel() {
     // The simplifier did run out of MBA calls: that no longer ends its call.
     let stats = q.stats();
     assert_eq!(stats.simplification.stopped, Some(Exhausted::MbaCalls));
+}
+
+/// A sum of sixteen products over a rotation that is itself written as a sum, against the
+/// three nodes it is: the simplifier alone decides it (the search is given 250 conflicts,
+/// which do not). The linear-MBA pass asked the basis decomposition of thirty sums on the
+/// way, 236,070 units of pass work, and the call ran out before the MBA phase asked anything;
+/// each decomposition now has a share of the call's pass work, 1,024 units here.
+#[test]
+fn a_chained_sum_is_decided_by_the_simplifier() {
+    let mut cx = Context::new();
+    let sum = parse(&mut cx, CHAINED_SUM);
+    let folded = parse(
+        &mut cx,
+        "~(#4294967296:64 * 0x9a1fdb2e10a33ae) ^ (#4294967299:64 | #4294967300:64) \
+         + #4294967298:64 & (#4294967296 * 0xf61c5f965bbdef1b ^ #4294967296 * 0x9a1fdb2e10a33ae)",
+    );
+    let cfg = Config::default()
+        .with_simplify_fuel(1 << 14)
+        .with_sweeping(false)
+        .with_max_conflicts(250)
+        .with_max_propagations(50_000);
+    let mut q = Question::equal(&mut cx, sum, folded, &cfg).expect("a question");
+    let out = q.solve(&mut cx, cfg.limits()).expect("an answer");
+    assert!(matches!(out, Outcome::Proved(_)), "{out:?}");
+    assert!(q.stats().simplification.decided);
 }
 
 /// Out of MBA calls, the engine goes on with what the other passes can still pay for: the

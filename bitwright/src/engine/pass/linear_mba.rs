@@ -39,6 +39,12 @@ use crate::ops::{BinOp, UnOp};
 /// The most atoms (the signature has 2^t entries).
 pub(crate) const MAX_ATOMS: usize = 8;
 
+/// The part of a call's pass work one decomposition over the basis of small bitwise
+/// functions may read (see [`solve`]): 1,024 units with fuel `1 << 14`, where a sum over
+/// five or six atoms reads up to 13,000 and the forty-three sums of one question read more
+/// than the call's other passes had left; 262,144 at the default.
+const COBRA_SHARE: u64 = 256;
+
 /// The most fragment nodes examined per candidate.
 const MAX_REGION: usize = 2048;
 
@@ -800,9 +806,13 @@ fn solve(
             .filter(|&j| (1..d.len()).any(|s| s >> j & 1 == 1 && !d[s].is_zero()))
             .count() as u32;
         let least = (depends.saturating_sub(1) + lifted).saturating_sub(1);
-        // (What the decomposition reads is pass work, within what is left of it.)
+        // (What the decomposition reads is pass work, within a share of the call's and what
+        // is left of it: one that runs out of its share is no candidate, and the call goes
+        // on. A chain's top that declines hands every link below it a decomposition of its
+        // own.)
         let cobra = if t >= 3 && (!commit || super::can_pay(r, cx, n, &reg.bounds, least)?) {
-            let allow = r.meter.left_in(|b| b.pass_work);
+            let share = (r.meter.limit.pass_work / COBRA_SHARE).max(1);
+            let allow = r.meter.left_in(|b| b.pass_work).min(share);
             let mut left = allow;
             let terms = crate::cobra::decompose(t, w, u32::from(w.bits()), &d, &mut left);
             r.meter.charge(Counter::PassWork, allow - left)?;

@@ -385,21 +385,36 @@ fn spend(work: &mut u64, n: u64) -> Option<()> {
     }
 }
 
-/// Checks whether a residual coefficient `rem` at subset `sub_q` aligns with any active higher
-/// monomial `q2` (`q2` not inside `pivot_q`, `q2 ⊃ sub_q`) so a later CoBRA step will absorb it.
-/// `live` lists the subsets whose coefficient is not zero, in order: only those are read.
-/// Spends a unit of `work` per coefficient it reads; `None` where that runs out.
-fn aligns_with_other(
+/// The coefficients a residual at subset `sub_q` could line up with: those of the active
+/// higher monomials `q2` (`q2 ⊃ sub_q`, `q2` not inside `pivot_q`), in order. `live` lists the
+/// subsets whose coefficient is not zero: only those are read, a unit of `work` each (`None`
+/// where that runs out).
+fn others(
     alpha: &[BitVec],
     live: &[u32],
     pivot_q: usize,
     sub_q: usize,
-    rem: &BitVec,
-    pmask: &BitVec,
     work: &mut u64,
-) -> Option<bool> {
+) -> Option<Vec<BitVec>> {
     let above = &live[live.partition_point(|&q| q as usize <= sub_q)..];
     spend(work, above.len().max(1) as u64)?;
+    let mut found: Vec<BitVec> = above
+        .iter()
+        .map(|&q2| q2 as usize)
+        .filter(|&q2| (q2 & !pivot_q) != 0 && (q2 & sub_q) == sub_q)
+        .map(|q2| alpha[q2])
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    Some(found)
+}
+
+/// Whether a residual coefficient `rem` lines up with one of `others` (see [`others`]), so
+/// that a later step absorbs it: it is one of them, its negation, or twice either.
+fn aligns_with_other(others: &[BitVec], rem: &BitVec, pmask: &BitVec) -> bool {
+    if others.is_empty() {
+        return false;
+    }
     let w = rem.width();
     let neg_rem = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, rem), pmask);
     let two = BitVec::wrapping_from_u64(w, 2);
@@ -409,16 +424,9 @@ fn aligns_with_other(
         pmask,
     );
     let neg_dbl = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, &dbl), pmask);
-    for &q2 in above {
-        let (q2, a2) = (q2 as usize, &alpha[q2 as usize]);
-        if (q2 & !pivot_q) == 0 || (q2 & sub_q) != sub_q {
-            continue;
-        }
-        if *a2 == *rem || *a2 == neg_rem || *a2 == dbl || *a2 == neg_dbl {
-            return Some(true);
-        }
-    }
-    Some(false)
+    [*rem, neg_rem, dbl, neg_dbl]
+        .iter()
+        .any(|v| others.binary_search(v).is_ok())
 }
 
 /// Decomposes conjunction coefficients `alpha[0 .. 1 << s]` (`alpha[0]` ignored; pass `konst`
@@ -514,6 +522,12 @@ pub(crate) fn decompose(
                 *slot = gq;
             }
 
+            // What a residual at each proper subset could line up with, read once for the
+            // pivot (every entry and weight below asks).
+            let mut beside: [Vec<BitVec>; 8] = Default::default();
+            for u in 1..sub_len - 1 {
+                beside[u] = others(&alpha, &live, q_star, idx[u], work)?;
+            }
             let entries = if d_usize == 2 { &lib.two } else { &lib.three };
             let target = alpha[q_star];
             let full_u = sub_len - 1;
@@ -541,11 +555,7 @@ pub(crate) fn decompose(
                                 &pmask,
                             )
                         };
-                        if !rem.is_zero()
-                            && !aligns_with_other(
-                                &alpha, &live, q_star, idx[u], &rem, &pmask, work,
-                            )?
-                        {
+                        if !rem.is_zero() && !aligns_with_other(&beside[u], &rem, &pmask) {
                             rem_cost += 2 + ((u as u32).count_ones() - 1);
                         }
                     }
