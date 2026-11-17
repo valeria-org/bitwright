@@ -11,15 +11,15 @@
 //! two). With both as the devirtualizer sets them, each folds.
 //!
 //! `questions/lighthouse_proved_0001.txt` is a question the prover proves under its facts at
-//! its smallest limits once its simplifier writes no basis sums ([`Strategy::basis_sums`]):
-//! 0.32.1 left it unknown at 10,000,000 propagations.
+//! its smallest limits on simplifiers that write no basis sums
+//! ([`Simplifiers::with_basis_sums`]): 0.32.1 left it unknown at 10,000,000 propagations.
 #![cfg(all(feature = "mba", feature = "prove"))]
 
 use std::sync::Arc;
 
 use bitwright::engine::{Budget, Engine, Run, Strategy};
 use bitwright::mba::{MbaConfig, MbaSolver, NfOptions, NormalFormSolver};
-use bitwright::prove::{Config, Outcome};
+use bitwright::prove::{Config, Outcome, Simplifiers};
 use bitwright::{Assumptions, BitVec, Context, ParseOptions, View, Width};
 
 const FOLDS: [&str; 8] = [
@@ -115,6 +115,10 @@ fn the_prover_proves_its_question_at_small_limits() {
     let mut cfg = Config::default();
     cfg.max_conflicts = 2_000;
     cfg.max_propagations = 20_000;
-    let out = bitwright::prove::valid_under(&mut cx, p, Some(&a), &cfg).expect("an answer");
+    let simplifiers = Simplifiers::new()
+        .with_basis_sums(false)
+        .with_kept_steps(1 << 12);
+    let out = bitwright::prove::valid_under_with(&mut cx, p, Some(&a), &cfg, &simplifiers)
+        .expect("an answer");
     assert!(matches!(out, Outcome::Proved(_)), "{out:?}");
 }
