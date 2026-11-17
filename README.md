@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/bitwright.svg)](https://crates.io/crates/bitwright)
 [![docs.rs](https://img.shields.io/docsrs/bitwright)](https://docs.rs/bitwright)
 [![book](https://img.shields.io/badge/book-read%20online-blue)](https://valeria-org.github.io/bitwright/)
-[![MSRV](https://img.shields.io/badge/rustc-1.88+-orange.svg)](#stability)
+[![MSRV](https://img.shields.io/badge/rustc-1.100+-orange.svg)](#stability)
 
 A solver and simplifier for fixed-width bit-vector expressions, in Rust.
 
@@ -241,7 +241,7 @@ CoBRA's row is from an earlier measurement on another machine, not from this run
 cargo add bitwright
 ```
 
-bitwright needs Rust 1.88 or later. Its only required dependency is `hashbrown`. Every
+bitwright needs Rust 1.100 or later. Its only required dependency is `hashbrown`. Every
 feature is on by default; `default-features = false` leaves the core (expressions, facts,
 the engine and its rules).
 
@@ -330,7 +330,7 @@ in it is compiled and run as a test. It reads fine on GitHub too:
 
 bitwright is 0.x. A minor release may change the API and simplification results, and lists
 every change of results under *Behavior changes* in the [changelog](CHANGELOG.md); a patch
-release changes results only to fix unsoundness. The minimum supported Rust version is 1.88.
+release changes results only to fix unsoundness. The minimum supported Rust version is 1.100.
 See the [stability chapter](book/src/stability.md) for the full contract.
 
 ## Development
