@@ -304,6 +304,8 @@ pub struct Simplifiers {
     mba: Option<crate::mba::MbaConfig>,
     #[cfg(feature = "mba")]
     solver: Option<std::sync::Arc<dyn crate::mba::MbaSolver>>,
+    /// [`Strategy::kept_steps`](crate::engine::Strategy::kept_steps) of the engines.
+    kept_steps: u64,
 }
 
 impl core::fmt::Debug for Simplifiers {
@@ -333,7 +335,18 @@ impl Simplifiers {
             mba: None,
             #[cfg(feature = "mba")]
             solver: None,
+            kept_steps: crate::engine::KEPT_STEPS,
         }
+    }
+
+    /// With the MBA phase keeping a fragment with no simpler form from the questions above it
+    /// from these solver steps ([`Strategy::kept_steps`](crate::engine::Strategy::kept_steps)),
+    /// not the default 2^16. A host whose questions are large next to its fuel sets it lower:
+    /// a devirtualizer's walk asked a third of its questions in the same time at 2^16, and as
+    /// many as with 0.31 (and fewer that ran slow) at 2^12.
+    pub fn with_kept_steps(mut self, steps: u64) -> Self {
+        self.kept_steps = steps;
+        self
     }
 
     /// With this configuration of the MBA phase instead of the prover's own (the default
@@ -374,6 +387,7 @@ impl Simplifiers {
             // The circuit is what the search proves: the conjunction form's ands, not a basis
             // sum's xors and ors ([`Strategy::basis_sums`](crate::engine::Strategy)).
             strategy.basis_sums = false;
+            strategy.kept_steps = self.kept_steps;
             let builder = crate::engine::Engine::builder()
                 .builtin()
                 .strategy(strategy);
