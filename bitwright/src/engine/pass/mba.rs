@@ -4036,6 +4036,15 @@ fn ask(
                         }
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
                     }
+                    // Out of calls, as out of steps: the question is not asked, and the rest of
+                    // the call (the passes after this phase, the later rounds) goes on within
+                    // its own limits. Stopping the call here left a question the prover
+                    // simplifies as it was after one round, where the word pass of the next
+                    // round finishes it.
+                    if r.meter.left_in(|b| b.mba_calls) == 0 {
+                        count(r).exhausted += 1;
+                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
+                    }
                     r.meter.charge(Counter::MbaCalls, 1)?;
                     count(r).calls += 1;
                     // The solver's own evidence counts only where backend certificates are

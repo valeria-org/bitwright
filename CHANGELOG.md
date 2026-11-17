@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Out of MBA calls, a call goes on.** The MBA phase's question past
+  [`Budget::mba_calls`] is not asked, as one past its steps is not, and the passes after the
+  phase and the later rounds run within their own limits; the root still ends
+  `BudgetTerminated(MbaCalls)`. The call used to end at that question: with fuel `1 << 14`
+  (sixteen calls) the prover's simplifier left a limb product as it was after one round,
+  where the word pass of a later round folds it.
+- **The linear-MBA pass's decomposition costs what it reads.** It reads the coefficients that
+  are not zero where it looks for one a residual lines up with (it charged all `2^t` of them
+  per residual: 27,296 units of pass work for a sum over seven atoms, 2,268 now), and is not
+  looked for where replacing the node frees fewer nodes than any form over the atoms the sum
+  depends on has. Its results are the same.
+
 ## 0.32.0
 
 - **Linear MBA over a basis of small bitwise functions.** The linear-MBA pass and the normal

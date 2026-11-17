@@ -1405,6 +1405,21 @@ pub(super) fn worth_building(
     }))
 }
 
+/// Whether a candidate of more than `floor` nodes can pay at `n` at all (see
+/// [`worth_building`], which this answers for every such candidate at once and records
+/// nothing): for a pass whose candidate is expensive to find, asked before it looks.
+pub(super) fn can_pay(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    n: u32,
+    atoms: &[u32],
+    floor: u32,
+) -> Result<bool, Stop> {
+    region(r, cx, n, atoms)?;
+    let shared = !alone(r);
+    Ok(dying_in(r, cx, n, false, floor.saturating_add(1), shared)? > floor)
+}
+
 /// Whether replacing `n` by `e` (already built) makes the DAG strictly smaller: `e` needs fewer
 /// nodes than replacing `n` frees. `Err(fin)` when it does not, with what that contributes to
 /// the node's finality: a rejection that only sharing caused may flip once other users of the

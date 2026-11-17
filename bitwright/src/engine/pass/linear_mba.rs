@@ -793,8 +793,15 @@ fn solve(
         let est = ands + linear::estimate(&linear::Form::of(konst, &placeholder));
         cands.push((est, Candidate::Conjunctions(konst, terms)));
 
+        // A form over the atoms the sum depends on has an operator fewer than there are of
+        // them, at least: where replacing `n` frees no more than that, no form over the basis
+        // commits, and the decomposition (the most this pass reads) is not looked for.
+        let depends = (0..t)
+            .filter(|&j| (1..d.len()).any(|s| s >> j & 1 == 1 && !d[s].is_zero()))
+            .count() as u32;
+        let least = (depends.saturating_sub(1) + lifted).saturating_sub(1);
         // (What the decomposition reads is pass work, within what is left of it.)
-        let cobra = if t >= 3 {
+        let cobra = if t >= 3 && (!commit || super::can_pay(r, cx, n, &reg.bounds, least)?) {
             let allow = r.meter.left_in(|b| b.pass_work);
             let mut left = allow;
             let terms = crate::cobra::decompose(t, w, u32::from(w.bits()), &d, &mut left);

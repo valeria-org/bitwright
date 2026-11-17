@@ -387,16 +387,19 @@ fn spend(work: &mut u64, n: u64) -> Option<()> {
 
 /// Checks whether a residual coefficient `rem` at subset `sub_q` aligns with any active higher
 /// monomial `q2` (`q2` not inside `pivot_q`, `q2 ⊃ sub_q`) so a later CoBRA step will absorb it.
+/// `live` lists the subsets whose coefficient is not zero, in order: only those are read.
 /// Spends a unit of `work` per coefficient it reads; `None` where that runs out.
 fn aligns_with_other(
     alpha: &[BitVec],
+    live: &[u32],
     pivot_q: usize,
     sub_q: usize,
     rem: &BitVec,
     pmask: &BitVec,
     work: &mut u64,
 ) -> Option<bool> {
-    spend(work, (alpha.len() - sub_q) as u64)?;
+    let above = &live[live.partition_point(|&q| q as usize <= sub_q)..];
+    spend(work, above.len().max(1) as u64)?;
     let w = rem.width();
     let neg_rem = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, rem), pmask);
     let two = BitVec::wrapping_from_u64(w, 2);
@@ -406,8 +409,9 @@ fn aligns_with_other(
         pmask,
     );
     let neg_dbl = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, &dbl), pmask);
-    for (q2, a2) in alpha.iter().enumerate().skip(sub_q + 1) {
-        if a2.is_zero() || (q2 & !pivot_q) == 0 || (q2 & sub_q) != sub_q {
+    for &q2 in above {
+        let (q2, a2) = (q2 as usize, &alpha[q2 as usize]);
+        if (q2 & !pivot_q) == 0 || (q2 & sub_q) != sub_q {
             continue;
         }
         if *a2 == *rem || *a2 == neg_rem || *a2 == dbl || *a2 == neg_dbl {
@@ -452,16 +456,20 @@ pub(crate) fn decompose(
 
     let mut terms: Vec<(BasisOp, BitVec)> = Vec::new();
     let lib = library();
+    // The subsets whose coefficient is not zero, as each pivot finds them.
+    let mut live: Vec<u32> = Vec::new();
 
     loop {
         spend(work, 1 << s)?;
         // Find maximum cardinality among remaining nonzero subsets, breaking ties by fewest
         // trailing zeros (odd coefficients first: unique modular lifts).
         let mut pivot: Option<(u32, u32, usize)> = None;
+        live.clear();
         for (q, c) in alpha.iter().enumerate().skip(1) {
             if c.is_zero() {
                 continue;
             }
+            live.push(q as u32);
             let d = (q as u32).count_ones();
             let tz = trailing_zeros(c);
             let key = (d, u32::MAX - tz, usize::MAX - q);
@@ -534,7 +542,9 @@ pub(crate) fn decompose(
                             )
                         };
                         if !rem.is_zero()
-                            && !aligns_with_other(&alpha, q_star, idx[u], &rem, &pmask, work)?
+                            && !aligns_with_other(
+                                &alpha, &live, q_star, idx[u], &rem, &pmask, work,
+                            )?
                         {
                             rem_cost += 2 + ((u as u32).count_ones() - 1);
                         }
