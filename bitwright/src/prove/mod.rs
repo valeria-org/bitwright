@@ -788,7 +788,10 @@ impl<'c> Blaster<'c> {
                 // mode. Only its unknown bits are inputs of the circuit, unless the circuit
                 // is kept across checks (`Incremental`), where declarations are assumed per
                 // solve so changes or withdrawals stay sound.
-                let known = self.hardwire_declared.then(|| self.cx.declared_at(i)).flatten();
+                let known = self
+                    .hardwire_declared
+                    .then(|| self.cx.declared_at(i))
+                    .flatten();
                 let b: Bits = (0..w)
                     .map(|j| match known {
                         Some(k) if k.known_one().bit(j as u16) == Some(true) => aig::TRUE,

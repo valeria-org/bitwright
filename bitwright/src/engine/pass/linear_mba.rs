@@ -524,9 +524,12 @@ fn emit_basis_op(
             let a1 = atoms[vars[1]];
             bitwise::emit(r, cx, *tt8, &[a0, a1, a0])
         }
-        BasisOp::Table3 { vars, tt8 } => {
-            bitwise::emit(r, cx, *tt8, &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]])
-        }
+        BasisOp::Table3 { vars, tt8 } => bitwise::emit(
+            r,
+            cx,
+            *tt8,
+            &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]],
+        ),
         BasisOp::ClauseAnd { vars, neg_mask } => {
             let mut pos_acc: Option<u32> = None;
             let mut neg_or: Option<u32> = None;
@@ -573,9 +576,12 @@ fn emit_basis_op(
                 let a1 = atoms[vars[1]];
                 bitwise::emit(r, cx, !*tt8, &[a0, a1, a0])
             }
-            BasisOp::Table3 { vars, tt8 } => {
-                bitwise::emit(r, cx, !*tt8, &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]])
-            }
+            BasisOp::Table3 { vars, tt8 } => bitwise::emit(
+                r,
+                cx,
+                !*tt8,
+                &[atoms[vars[0]], atoms[vars[1]], atoms[vars[2]]],
+            ),
             other => {
                 let x = emit_basis_op(r, cx, other, atoms)?;
                 r.build(cx, |cx| cx.c_un(UnOp::Not, x))
@@ -839,7 +845,9 @@ fn solve(
         };
         if let Some(cobra_terms) = cobra {
             let push_cobra =
-                |cands: &mut Vec<(u32, Candidate)>, k0: BitVec, ts: Vec<(crate::cobra::BasisOp, BitVec)>| {
+                |cands: &mut Vec<(u32, Candidate)>,
+                 k0: BitVec,
+                 ts: Vec<(crate::cobra::BasisOp, BitVec)>| {
                     let gates: u32 = ts.iter().map(|(op, _)| op.gate_cost()).sum();
                     let ph: Vec<(u32, BitVec)> = ts
                         .iter()

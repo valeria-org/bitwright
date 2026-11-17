@@ -218,9 +218,7 @@ pub fn decide(
                 } else {
                     let seed = k.structural_hash() ^ point.wrapping_mul(0x9e37_79b9_7f4a_7c15);
                     let limbs: [u64; 8] = core::array::from_fn(|limb| {
-                        crate::hash::mix64(
-                            seed ^ (limb as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9),
-                        )
+                        crate::hash::mix64(seed ^ (limb as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9))
                     });
                     crate::BitVec::wrapping_from_limbs(*w, &limbs)
                 };

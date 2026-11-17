@@ -267,7 +267,8 @@ impl Parser<'_> {
                 ..a
             };
         }
-        if let (Some(Ok(aw)), Ok(tw)) = (a.width.as_deref().map(str::parse::<u32>), w.parse::<u32>())
+        if let (Some(Ok(aw)), Ok(tw)) =
+            (a.width.as_deref().map(str::parse::<u32>), w.parse::<u32>())
         {
             let text = if tw < aw {
                 format!("trunc<{w}>({})", a.text)
@@ -340,7 +341,9 @@ impl Parser<'_> {
             // A `toNat` is written as its vector: comparisons read the same (unsigned, below
             // `2^w`), arithmetic does not (`Nat` neither wraps nor truncates the same way).
             if (lhs.nat || rhs.nat) && !boolean {
-                return Err(format!("`{op}` on a `toNat` (Nat arithmetic does not wrap)"));
+                return Err(format!(
+                    "`{op}` on a `toNat` (Nat arithmetic does not wrap)"
+                ));
             }
             // A `toNat` against a `Nat` literal: the literal is written at the vector's width,
             // where it wraps; so it must be below `2^w` (a width variable is bounded to that).
@@ -725,9 +728,7 @@ impl Parser<'_> {
                             nat: false,
                         })
                     }
-                    "BitVec.zeroExtend"
-                    | "BitVec.setWidth"
-                    | "BitVec.truncate"
+                    "BitVec.zeroExtend" | "BitVec.setWidth" | "BitVec.truncate"
                     | "BitVec.signExtend" => {
                         let w = self.width()?;
                         let a = self.arg()?;

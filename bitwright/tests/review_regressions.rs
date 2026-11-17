@@ -1,6 +1,11 @@
 //! Regression tests for all solver soundness, performance, Lean import/export, and CoBRA MBA
 //! fixes from the full solver review.
-#![cfg(all(feature = "check", feature = "mba", feature = "smtlib", feature = "eqsat"))]
+#![cfg(all(
+    feature = "check",
+    feature = "mba",
+    feature = "smtlib",
+    feature = "eqsat"
+))]
 
 mod common;
 
@@ -56,7 +61,10 @@ fn bug_s1_solver_honors_declare_known_and_invalidates_on_change() {
     cx.declare_known(x, KnownBits::unknown(Width::W32)).unwrap();
     solver.assert(&cx, x_eq_zero).unwrap();
     assert_eq!(solver.check(&mut cx).unwrap(), Status::Sat);
-    assert_eq!(solver.value(&mut cx, x).unwrap().unwrap(), BitVec::zero(Width::W32));
+    assert_eq!(
+        solver.value(&mut cx, x).unwrap().unwrap(),
+        BitVec::zero(Width::W32)
+    );
 }
 
 #[test]
@@ -94,17 +102,26 @@ fn bug_s1_incremental_tracks_dynamic_declare_known_and_withdrawal() {
 
     let mut inc = Incremental::new(1 << 16);
     let lim = Limits::conflicts(10_000);
-    assert!(matches!(inc.solve(&mut cx, &[p], lim).unwrap(), IncrementalAnswer::Sat(_)));
+    assert!(matches!(
+        inc.solve(&mut cx, &[p], lim).unwrap(),
+        IncrementalAnswer::Sat(_)
+    ));
 
     // Fix bit 4 of `x` to 1 (`x >= 16`), contradicting `x <u 4` without rebuilding the circuit.
     let hi = BitVec::from_u64(Width::W8, 16).unwrap();
     cx.declare_known(x, KnownBits::new(BitVec::zero(Width::W8), hi).unwrap())
         .unwrap();
-    assert!(matches!(inc.solve(&mut cx, &[p], lim).unwrap(), IncrementalAnswer::Unsat(_)));
+    assert!(matches!(
+        inc.solve(&mut cx, &[p], lim).unwrap(),
+        IncrementalAnswer::Unsat(_)
+    ));
 
     // Withdraw declaration: `x <u 4` becomes Sat again.
     cx.declare_known(x, KnownBits::unknown(Width::W8)).unwrap();
-    assert!(matches!(inc.solve(&mut cx, &[p], lim).unwrap(), IncrementalAnswer::Sat(_)));
+    assert!(matches!(
+        inc.solve(&mut cx, &[p], lim).unwrap(),
+        IncrementalAnswer::Sat(_)
+    ));
 }
 
 #[test]
@@ -123,11 +140,18 @@ fn incremental_unsat_core_minimization_shrinks_redundant_assumptions() {
     let conflict = cx.parse("x != 3", &o).unwrap();
     assumptions.push(conflict);
 
-    assert_eq!(s.check_assuming(&mut cx, &assumptions).unwrap(), Status::Unsat);
+    assert_eq!(
+        s.check_assuming(&mut cx, &assumptions).unwrap(),
+        Status::Unsat
+    );
     let core = s.unsat_core(&mut cx).unwrap().unwrap();
     assert!(core.contains(&CoreItem::Assertion(0)));
     assert!(core.contains(&CoreItem::Assumption(16)));
-    assert_eq!(core.len(), 2, "core should drop all 16 irrelevant assumptions: {core:?}");
+    assert_eq!(
+        core.len(),
+        2,
+        "core should drop all 16 irrelevant assumptions: {core:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +162,9 @@ fn incremental_unsat_core_minimization_shrinks_redundant_assumptions() {
 fn bug_s2_mba_decide_validates_foreign_handles_and_wide_witnesses() {
     let mut cx1 = Context::new();
     let mut cx2 = Context::new();
-    let foreign = cx1.parse("x + 1", &ParseOptions::width(Width::W32)).unwrap();
+    let foreign = cx1
+        .parse("x + 1", &ParseOptions::width(Width::W32))
+        .unwrap();
     let (limits, budget) = (MbaLimits::default(), MbaBudget::default());
 
     // Passing `foreign == foreign` into `cx2` must error, never `Ok(Decided::Equal)`.
@@ -366,7 +392,14 @@ fn verify_mba_simplifies_to(src: &str, max_nodes: u32, width: Width) {
     let out = eng.run(&mut cx, &[orig], Run::default()).unwrap();
     let simp = out.roots[0].expr;
     assert_eq!(
-        mba::equal(&mut cx, orig, simp, &MbaLimits::default(), &MbaBudget::default()).unwrap(),
+        mba::equal(
+            &mut cx,
+            orig,
+            simp,
+            &MbaLimits::default(),
+            &MbaBudget::default()
+        )
+        .unwrap(),
         Verdict::Proved,
         "`{src}` -> `{}` failed exact MBA proof",
         cx.display(simp)
@@ -428,7 +461,11 @@ fn bug_m2_cancelled_derived_constant_refines_bit_classes() {
     let (m, _) = mba::lower(&cx, e, &MbaLimits::default()).unwrap();
     match solver.solve(&m, &MbaBudget::default()) {
         MbaAnswer::Simplified { expr, .. } => {
-            assert_eq!(expr.nodes().len(), 1, "expected single variable `z`, got {expr:?}");
+            assert_eq!(
+                expr.nodes().len(),
+                1,
+                "expected single variable `z`, got {expr:?}"
+            );
         }
         other => panic!("expected simplification to `z`, got {other:?}"),
     }
@@ -542,12 +579,17 @@ fn bug_m3_parent_cancels_previously_kept_sub_mbas() {
     // simpler form and was visited earlier in the same context/engine!
     let eng = Engine::builder()
         .builtin()
-        .strategy(Strategy::new("mba_only", vec![Phase::Mba(MbaConfig::default())]))
+        .strategy(Strategy::new(
+            "mba_only",
+            vec![Phase::Mba(MbaConfig::default())],
+        ))
         .build()
         .unwrap();
     let mut cx = Context::new();
     let o = ParseOptions::width(Width::W64);
-    let core_a = cx.parse("5 * (x ^ y) + 3 * (y & z) + 7 * (x | z)", &o).unwrap();
+    let core_a = cx
+        .parse("5 * (x ^ y) + 3 * (y & z) + 7 * (x | z)", &o)
+        .unwrap();
     let core_b = cx
         .parse(
             "5 * ((x | y) - (x & y)) + 3 * (y & z) + 7 * ((x ^ z) + (x & z))",
@@ -594,7 +636,10 @@ fn lean_import_reads_to_nat_only_where_it_does_not_wrap() {
     // 300 is no 8-bit value: `x <u 300` at 8 bits would be `x <u 44`.
     assert!(bwr.contains("nat_big: not translated"), "{bwr}");
     // At a width variable the literal bounds it instead: 300 needs 9 bits.
-    assert!(bwr.contains("rule nat_bound<W>(x: W) where W >= 9"), "{bwr}");
+    assert!(
+        bwr.contains("rule nat_bound<W>(x: W) where W >= 9"),
+        "{bwr}"
+    );
 }
 
 #[test]
@@ -623,7 +668,14 @@ fn linear_mba_link_left_to_a_declining_chain_top_is_solved() {
                 "whole_first={whole}: `{src}` -> `{shown}`"
             );
             assert_eq!(
-                mba::equal(&mut cx, e, out, &MbaLimits::default(), &MbaBudget::default()).unwrap(),
+                mba::equal(
+                    &mut cx,
+                    e,
+                    out,
+                    &MbaLimits::default(),
+                    &MbaBudget::default()
+                )
+                .unwrap(),
                 Verdict::Proved,
                 "`{src}` -> `{shown}`"
             );
@@ -638,7 +690,10 @@ fn lean_import_concat_associates_left_with_addition() {
         "theorem cat_add (a b : BitVec 4) (c : BitVec 8) :
             a ++ b + c = c + (a ++ b) := by sorry_free",
     );
-    assert!(bwr.contains("concat(a, b) + c => c + concat(a, b)"), "{bwr}");
+    assert!(
+        bwr.contains("concat(a, b) + c => c + concat(a, b)"),
+        "{bwr}"
+    );
 }
 
 #[test]
@@ -651,7 +706,10 @@ fn lean_import_rejects_literals_past_128_bits() {
     );
     assert!(bwr.contains("huge: not translated"), "{bwr}");
     assert!(!bwr.contains("255"), "{bwr}");
-    assert!(bwr.contains("(x + 44) => (x + 44)") || bwr.contains("x + 44 => x + 44"), "{bwr}");
+    assert!(
+        bwr.contains("(x + 44) => (x + 44)") || bwr.contains("x + 44 => x + 44"),
+        "{bwr}"
+    );
 }
 
 #[test]

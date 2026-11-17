@@ -213,7 +213,10 @@ fn candidate(
         let mut split_idx = None;
         for (i, &outer) in atoms.iter().enumerate() {
             let sub = cx.post_order(&[outer])?;
-            if atoms.iter().any(|&inner| inner != outer && sub.contains(&inner)) {
+            if atoms
+                .iter()
+                .any(|&inner| inner != outer && sub.contains(&inner))
+            {
                 split_idx = Some(i);
                 break;
             }

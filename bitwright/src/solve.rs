@@ -1154,8 +1154,10 @@ fn complete(cx: &mut Context, es: &[Expr], model: &Model) -> Result<Model, Error
         let (Some(k), Some(w)) = (cx.symbol_key(sym).cloned(), cx.symbol_width(sym)) else {
             continue;
         };
-        let v = (model.iter().find(|(f, _)| *f == k))
-            .map_or_else(|| default_for_symbol(cx, &k, w), |&(_, v)| fit_declared(cx, &k, v));
+        let v = (model.iter().find(|(f, _)| *f == k)).map_or_else(
+            || default_for_symbol(cx, &k, w),
+            |&(_, v)| fit_declared(cx, &k, v),
+        );
         m.push((k, v));
     }
     Ok(m)

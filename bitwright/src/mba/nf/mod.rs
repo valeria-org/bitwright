@@ -1175,19 +1175,18 @@ impl Pass<'_> {
                         let step = 1usize << bit;
                         for q in 0..corners {
                             if q & step != 0 {
-                                row[q] =
-                                    self::word::bin(crate::ops::BinOp::Sub, &row[q], &row[q ^ step]);
+                                row[q] = self::word::bin(
+                                    crate::ops::BinOp::Sub,
+                                    &row[q],
+                                    &row[q ^ step],
+                                );
                             }
                         }
                     }
                     if !row[0].is_zero() {
                         out.add_term(
                             Mono::new(),
-                            &self::word::bin(
-                                crate::ops::BinOp::Mul,
-                                &row[0],
-                                self.classes.mask(c),
-                            ),
+                            &self::word::bin(crate::ops::BinOp::Mul, &row[0], self.classes.mask(c)),
                         );
                     }
                     for (q, v) in row.iter().enumerate().skip(1) {

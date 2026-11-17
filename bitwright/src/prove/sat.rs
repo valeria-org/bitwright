@@ -1010,7 +1010,8 @@ impl Solver {
                 }
             }
         }
-        self.learnt_ids.retain(|&i| !self.clauses[i as usize].deleted);
+        self.learnt_ids
+            .retain(|&i| !self.clauses[i as usize].deleted);
         if self.wasted * 4 > self.arena.len() {
             self.collect();
         }

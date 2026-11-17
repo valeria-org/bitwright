@@ -310,7 +310,11 @@ fn aligns_with_other(
     let w = rem.width();
     let neg_rem = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, rem), pmask);
     let two = BitVec::wrapping_from_u64(w, 2);
-    let dbl = BitVec::bin_unchecked(BinOp::And, &BitVec::bin_unchecked(BinOp::Mul, rem, &two), pmask);
+    let dbl = BitVec::bin_unchecked(
+        BinOp::And,
+        &BitVec::bin_unchecked(BinOp::Mul, rem, &two),
+        pmask,
+    );
     let neg_dbl = BitVec::bin_unchecked(BinOp::And, &BitVec::un_unchecked(UnOp::Neg, &dbl), pmask);
     for (q2, a2) in alpha.iter().enumerate().skip(sub_q + 1) {
         if a2.is_zero() || (q2 & !pivot_q) == 0 || (q2 & sub_q) != sub_q {
@@ -431,11 +435,8 @@ pub(crate) fn decompose(
                         let rem = if mu == 0 {
                             cur
                         } else {
-                            let delta = BitVec::bin_unchecked(
-                                BinOp::Mul,
-                                &weight,
-                                &signed_bv(w, mu),
-                            );
+                            let delta =
+                                BitVec::bin_unchecked(BinOp::Mul, &weight, &signed_bv(w, mu));
                             BitVec::bin_unchecked(
                                 BinOp::And,
                                 &BitVec::bin_unchecked(BinOp::Sub, &cur, &delta),
