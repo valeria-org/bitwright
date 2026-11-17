@@ -810,7 +810,10 @@ fn solve(
         // is left of it: one that runs out of its share is no candidate, and the call goes
         // on. A chain's top that declines hands every link below it a decomposition of its
         // own.)
-        let cobra = if t >= 3 && (!commit || super::can_pay(r, cx, n, &reg.bounds, least)?) {
+        let cobra = if r.inner.strategy.basis_sums
+            && t >= 3
+            && (!commit || super::can_pay(r, cx, n, &reg.bounds, least)?)
+        {
             let share = (r.meter.limit.pass_work / COBRA_SHARE).max(1);
             let allow = r.meter.left_in(|b| b.pass_work).min(share);
             let mut left = allow;
