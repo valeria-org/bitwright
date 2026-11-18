@@ -41,6 +41,12 @@ assert_eq!(s.check(&mut cx)?, Status::Sat);
 # Ok::<(), bitwright::Error>(())
 ```
 
+A SAT model reflects the declarations **at the check**. For example, if a declared bit
+made `x == 1` satisfiable, withdrawing that declaration does not change the old model's
+value of `x`. A core or Lean statement depends on the declarations too: after they
+change, check again before requesting one. A core under `x == 0` is not necessarily a
+conflict when `x` is free.
+
 ## What a check does
 
 A check stops at the first of these that decides, and

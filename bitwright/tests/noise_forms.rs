@@ -11,6 +11,14 @@ fn noise_forms(text: &str, on: bool) -> (String, bool) {
 
 /// [`noise_forms`] with the MBA phase configured by `cfg`.
 fn with_mba(text: &str, cfg: ::bitwright::mba::MbaConfig) -> (String, bool) {
+    with_budget(text, cfg, ::bitwright::engine::Budget::default())
+}
+
+fn with_budget(
+    text: &str,
+    cfg: ::bitwright::mba::MbaConfig,
+    budget: ::bitwright::engine::Budget,
+) -> (String, bool) {
     use ::bitwright::engine::{Engine, Run, Strategy};
     use ::bitwright::{BitVec, Context, FnEnv, ParseOptions, SymbolKey, Width};
     let engine = Engine::builder()
@@ -23,7 +31,7 @@ fn with_mba(text: &str, cfg: ::bitwright::mba::MbaConfig) -> (String, bool) {
         .parse(text, &ParseOptions::width(Width::W64))
         .unwrap_or_else(|err| panic!("{text}: {err}"));
     let r = engine
-        .run(&mut cx, &[e], Run::default())
+        .run(&mut cx, &[e], Run::default().with_per_call(budget))
         .expect("a run")
         .roots[0]
         .expr;
@@ -173,9 +181,9 @@ fn bits_that_conditions_place_keep_their_spelling() {
 
 #[test]
 fn an_opaque_constant_through_its_atoms_known_bits_is_proved_one() {
-    // `%0` has its low byte 0 and `%2` its low byte 0x52 (the 82 the noise ORs in); under the
-    // bitwise operators those bytes make the sums cancel. Read as free atoms they do not, and
-    // the engine leaves all 66 nodes at any budget.
+    // `%0` has its low byte 0 and `%2` its low byte 0x52 (the 82 the noise ORs in); under
+    // the bitwise operators those bytes make the sums cancel. The sweep can prove this
+    // without a solver call when it uses those facts about its atoms.
     let text = "let %0 = (x & 0xffffffff00000000) * 0x8000001 + 0xc00081fe00001000; \
                 let %1 = %0 ^ -256; \
                 let %2 = rotl((rotl(y, 5) & 0x1070a8a3c0) + 0x31d3e17cbbc89d2e, 2) * 0x20000001 + 0x315e13f6658a519a; \
@@ -188,7 +196,13 @@ fn an_opaque_constant_through_its_atoms_known_bits_is_proved_one() {
     let (out, agrees) = with_mba(text, cfg.with_known_atoms(true));
     assert!(agrees, "{out}");
     assert!(out.starts_with("0xaa9198db70383e97"), "{out}");
-    assert!(!with_mba(text, cfg).0.starts_with("0xaa9198db70383e97"));
+    // Isolate the sweep. With a solver budget, the regular phase can now also
+    // discover this constant by solving shared-atom questions together.
+    let sweep_only = ::bitwright::engine::Budget::default().with_mba_calls(0);
+    let (on, agrees) = with_budget(text, cfg.with_known_atoms(true), sweep_only);
+    assert!(agrees && on.starts_with("0xaa9198db70383e97"), "{on}");
+    let (off, agrees) = with_budget(text, cfg, sweep_only);
+    assert!(agrees && !off.starts_with("0xaa9198db70383e97"), "{off}");
 }
 
 #[test]

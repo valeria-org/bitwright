@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- Linear MBA no longer treats a narrow zero extension as bitwise-linear when an opaque
+  atom inside it makes the modeled high bits differ from the word's actual high bits.
+- Solver circuits cannot reuse node numbers from a cleared or different arena. A SAT
+  model keeps the assignment it was checked against. After declarations change, request
+  a new check before asking for an unsatisfiable core or exporting its Lean theorem.
+- One question's symbol count or chain shape no longer changes how a batch regroups
+  another question. A session can also answer questions from contexts that use the same
+  symbol name at different widths.
+- An MBA retry that runs out of calls or steps leaves the root non-final. Rendering
+  charges work even on exhaustion. Changing simplification policy no longer reuses
+  answers or engines built for the old policy.
+- An expensive `NoSimpler` answer suppresses an enclosing MBA question only when the
+  inner fragment's atoms are isolated there. Containment follows what was actually
+  lowered, including rebased cuts and atom indices above 63, without walking ancestors
+  once per mark. Hosts implementing `MbaCacheStore` must store the measured `steps`
+  in `CacheEntry::NoSimpler { steps }`; discard old entries that have no count.
+
 ## 0.32.4
 
 - **The prover's engines write basis sums again by default, as in 0.32.1;

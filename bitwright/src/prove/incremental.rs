@@ -1,5 +1,7 @@
 //! One circuit and one search for many questions.
 
+use core::num::NonZeroU64;
+
 use super::aig::{Aig, Cnf};
 use super::blast::Bits;
 use super::sat::{self, Backend, Limits, Lit, Solver};
@@ -29,6 +31,10 @@ pub enum Answer {
 ///
 /// Predicates are assumed for the question that names them, never asserted for good: the
 /// same `Incremental` answers any subset of what it has seen, in any order.
+/// A circuit belongs to the context generation first given to [`solve`](Self::solve).
+/// After [`Context::clear`], or in another context (including a fork), start a new
+/// circuit: [`solve`](Self::solve) and [`nodes_of`](Self::nodes_of) return
+/// [`Error::ForeignExpr`] rather than reuse gates for unrelated nodes.
 ///
 /// ```
 /// use bitwright::prove::{Incremental, IncrementalAnswer as Answer, Limits};
@@ -60,6 +66,7 @@ pub enum Answer {
 /// ([`Incremental::on`]).
 #[derive(Debug)]
 pub struct Incremental<B = Solver> {
+    arena: Option<NonZeroU64>,
     g: Aig,
     bits: IdMap<u32, Bits>,
     symbols: Vec<(u32, Bits)>,
@@ -83,6 +90,7 @@ impl<B: Backend> Incremental<B> {
     /// An empty one searched by `backend` (which must be empty too).
     pub fn on(backend: B, max_nodes: usize) -> Self {
         Incremental {
+            arena: None,
             g: Aig::new(),
             bits: IdMap::default(),
             symbols: Vec::new(),
@@ -115,6 +123,7 @@ impl<B: Backend> Incremental<B> {
     /// [`nodes`](Self::nodes) was added for predicates that are not among these: a circuit
     /// that is mostly that is better started again.
     pub fn nodes_of(&self, cx: &Context, predicates: &[Expr]) -> Result<usize, Error> {
+        self.check_arena(cx)?;
         let mut n = 0usize;
         let mut ids = cx.ids(predicates)?;
         ids.sort_unstable();
@@ -123,6 +132,13 @@ impl<B: Backend> Incremental<B> {
             n += self.added.get(&i).map_or(0, |&a| a as usize);
         }
         Ok(n)
+    }
+
+    fn check_arena(&self, cx: &Context) -> Result<(), Error> {
+        if self.arena.is_some_and(|arena| arena != cx.arena) {
+            return Err(Error::ForeignExpr);
+        }
+        Ok(())
     }
 
     /// The conflicts of every search so far.
@@ -139,7 +155,9 @@ impl<B: Backend> Incremental<B> {
         predicates: &[Expr],
         limits: Limits,
     ) -> Result<Answer, Error> {
+        self.check_arena(cx)?;
         let ids = cx.ids(predicates)?;
+        self.arena = Some(cx.arena);
         let mut roots = Vec::with_capacity(ids.len());
         let unseen = ids.iter().filter(|i| !self.bits.contains_key(i)).count();
         let growth = self.question_nodes.saturating_mul(unseen.max(1));
@@ -263,6 +281,39 @@ mod tests {
     use super::*;
     use crate::testutil::Rng;
     use crate::{ParseOptions, Width};
+
+    #[test]
+    fn cached_indices_belong_to_one_arena_but_not_one_declaration_revision() {
+        let mut cx = Context::new();
+        let x = cx.symbol("x", Width::W1).unwrap();
+        let limits = Limits::conflicts(1000);
+        let mut inc = Incremental::new(4096);
+        for bit in [false, true, false] {
+            let v = BitVec::wrapping_from_u64(Width::W1, u64::from(bit));
+            cx.declare_known(x, crate::KnownBits::constant(&v)).unwrap();
+            if bit {
+                let Answer::Sat(model) = inc.solve(&mut cx, &[x], limits).unwrap() else {
+                    panic!("x is declared true");
+                };
+                assert_eq!(cx.eval(&[x], &model[..]).unwrap(), [v]);
+            } else {
+                assert_eq!(
+                    inc.solve(&mut cx, &[x], limits).unwrap(),
+                    Answer::Unsat(vec![0])
+                );
+            }
+        }
+        for mut other in [Context::new(), cx.fork()] {
+            let y = other.symbol("y", Width::W1).unwrap();
+            assert_eq!(inc.nodes_of(&other, &[y]), Err(Error::ForeignExpr));
+            assert_eq!(inc.solve(&mut other, &[y], limits), Err(Error::ForeignExpr));
+        }
+        cx.clear();
+        let y = cx.symbol("y", Width::W1).unwrap();
+        assert_eq!(y.index(), x.index());
+        assert_eq!(inc.nodes_of(&cx, &[y]), Err(Error::ForeignExpr));
+        assert_eq!(inc.solve(&mut cx, &[y], limits), Err(Error::ForeignExpr));
+    }
 
     /// A circuit that grows by related predicates (sums, products, selections sharing
     /// operands, so that a later predicate's gates look into an earlier one's) answers each

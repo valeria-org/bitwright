@@ -45,6 +45,7 @@
 //! unsatisfiable together: the slice that is, less each member the quick attempt shows is
 //! not needed ([`Config::minimize_cores`]). A core is sound, not minimal.
 
+use core::num::NonZeroU64;
 use std::collections::HashMap;
 
 use crate::engine::Deadline;
@@ -347,8 +348,10 @@ struct Checked {
 
 /// An assertion stack and its checks. See the [module](self).
 ///
-/// A solver holds expressions of one [`Context`], the one every method is given; it is
-/// independent of the context otherwise, so several solvers may share one.
+/// Assertions belong to one generation of one [`Context`]. A different context (including a
+/// fork or a context after [`Context::clear`]) is accepted only when the stack has no
+/// assertions, e.g. after [`reset`](Self::reset); its first use drops arena-local answers
+/// and starts a fresh circuit, without dropping portable [`Answers`].
 #[derive(Debug, Default)]
 pub struct Solver {
     cfg: Config,
@@ -365,6 +368,7 @@ pub struct Solver {
     circuit: Option<prove::Incremental<Box<dyn prove::Backend>>>,
     /// The conflicts of the last quick attempt on it, when the backend counts them.
     kept_conflicts: Option<u64>,
+    arena: Option<NonZeroU64>,
     /// The context's `declaration_revision` when `model` and `cache` were recorded.
     declaration_revision: u64,
 }
@@ -401,6 +405,7 @@ impl Solver {
         if cx.width(p)? != Width::W1 {
             return Err(Error::Unsupported("an assertion must be 1 bit".into()));
         }
+        self.bind(cx)?;
         self.assertions.push(p);
         self.last = None;
         Ok(self.assertions.len() - 1)
@@ -447,10 +452,30 @@ impl Solver {
         self.last = None;
     }
 
+    /// Bind index-keyed state to its arena and declaration-dependent answers to their domain.
+    fn bind(&mut self, cx: &Context) -> Result<(), Error> {
+        let changed = self.arena != Some(cx.arena);
+        if changed {
+            if !self.assertions.is_empty() {
+                return Err(Error::ForeignExpr);
+            }
+            self.arena = Some(cx.arena);
+            self.circuit = None;
+            self.kept_conflicts = None;
+        }
+        if changed || self.declaration_revision != cx.declaration_revision {
+            self.declaration_revision = cx.declaration_revision;
+            self.model = None;
+            self.cache = Cache::default();
+            self.last = None;
+        }
+        Ok(())
+    }
+
     /// After a check answered [`Status::Unsat`]: its core as a Lean 4 theorem named `name`
     /// ([`prove::lean_theorem`]), which `lean` proves again by itself or does not, with a
-    /// comment saying which stage decided it here. `None` after any other answer; an error
-    /// when the core has an operation Lean's `BitVec` lacks.
+    /// comment saying which stage decided it here. `None` after any other answer or if the
+    /// context generation or declarations differ; an error for an operation Lean lacks.
     pub fn lean_theorem(&mut self, cx: &mut Context, name: &str) -> Result<Option<String>, Error> {
         let Some(core) = self.unsat_core(cx)? else {
             return Ok(None);
@@ -509,6 +534,8 @@ impl Solver {
             ));
         }
         self.last = None;
+        // A removed symbol's key may be reused at a different width.
+        self.model = None;
         self.cache.exact.retain(|key, _| !key.iter().any(since));
         self.cache.unsat.retain(|key| !key.iter().any(since));
         if let Some(c) = &mut self.circuit {
@@ -548,6 +575,7 @@ impl Solver {
                 return Err(Error::Unsupported("an assumption must be 1 bit".into()));
             }
         }
+        self.bind(cx)?;
         let asked: Vec<(CoreItem, Expr)> = (self.assertions.iter().copied().enumerate())
             .map(|(i, e)| (CoreItem::Assertion(i), e))
             .chain(
@@ -571,11 +599,6 @@ impl Solver {
         asked: &[(CoreItem, Expr)],
         deadline: Option<Deadline<'_>>,
     ) -> Result<Decision, Error> {
-        if self.declaration_revision != cx.declaration_revision {
-            self.declaration_revision = cx.declaration_revision;
-            self.model = None;
-            self.cache = Cache::default();
-        }
         // Constants: one false assertion is a core by itself.
         let mut open: Vec<(CoreItem, Expr)> = Vec::with_capacity(asked.len());
         for &(item, e) in asked {
@@ -598,13 +621,26 @@ impl Solver {
                 self.circuit = None;
             }
         }
-        let old = self.model.clone().unwrap_or_default();
-        let mut model = old.clone();
+        // A historical model must not rely on looking up declarations at read time.
+        // Seed a fresh assignment with exactly the defaults that would not be zero.
+        let mut model = match &self.model {
+            Some(old) => old.clone(),
+            None if cx.declaration_revision != 0 => cx
+                .symbols
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let v = entry.known?.known_one();
+                    (!v.is_zero()).then(|| (entry.key.clone(), v))
+                })
+                .collect(),
+            None => Model::new(),
+        };
         let mut by = DecidedBy::Constants;
         let mut unknown = None;
         for part in self.slices(cx, &open)? {
             let es: Vec<Expr> = part.iter().map(|&i| open[i].1).collect();
-            let (answer, how, conflicting) = self.answer(cx, &es, &old, deadline)?;
+            let (answer, how, conflicting) = self.answer(cx, &es, &model, deadline)?;
             by = by.max(how);
             match answer {
                 Ok(Some(m)) => {
@@ -1026,9 +1062,8 @@ impl Solver {
         })
     }
 
-    /// After a check answered [`Status::Sat`]: values of the symbols at which the assertions
-    /// hold. A symbol it does not list may take any value ([`value`](Self::value) reads it as
-    /// zero).
+    /// After [`Status::Sat`]: the historical assignment, independent of later declarations.
+    /// An unlisted symbol takes zero, including when evaluating [`value`](Self::value).
     pub fn model(&self) -> Option<&Model> {
         match self.last.as_ref()?.status {
             Status::Sat => self.model.as_ref(),
@@ -1036,22 +1071,36 @@ impl Solver {
         }
     }
 
-    /// After [`Status::Sat`]: the value of `e` in the model (`None` otherwise).
+    /// After [`Status::Sat`]: `e` in the checked assignment, even if declarations have since
+    /// changed. `None` without a satisfying check or in a different context generation.
     pub fn value(&self, cx: &mut Context, e: Expr) -> Result<Option<BitVec>, Error> {
+        if self.arena != Some(cx.arena) {
+            return Ok(None);
+        }
         let Some(m) = self.model() else {
             return Ok(None);
         };
-        Ok(Some(eval_in(cx, &[e], m)?.remove(0)))
+        let env = FnEnv(|key: &crate::SymbolKey, w| {
+            Some(
+                m.iter()
+                    .find(|(k, _)| k == key)
+                    .map_or_else(|| BitVec::zero(w), |&(_, v)| v),
+            )
+        });
+        Ok(Some(cx.eval(&[e], &env)?.remove(0)))
     }
 
     /// After a check answered [`Status::Unsat`]: assertions and assumptions of that check that
-    /// are unsatisfiable together, in order (`None` otherwise). See the [module](self) on how
-    /// small.
+    /// are unsatisfiable together, in order. `None` otherwise, or if the context generation
+    /// or declarations differ from the check's. See the [module](self) on how small.
     pub fn unsat_core(&mut self, cx: &mut Context) -> Result<Option<Vec<CoreItem>>, Error> {
         let Some(last) = &self.last else {
             return Ok(None);
         };
-        if last.status != Status::Unsat {
+        if last.status != Status::Unsat
+            || self.arena != Some(cx.arena)
+            || self.declaration_revision != cx.declaration_revision
+        {
             return Ok(None);
         }
         if let Some(core) = &last.core {
@@ -2335,6 +2384,137 @@ fn holds(cx: &mut Context, ps: &[Expr], model: &Model) -> Result<bool, Error> {
 mod tests {
     use super::*;
     use crate::ParseOptions;
+
+    #[test]
+    fn cleared_arena_starts_a_fresh_search_with_the_configured_backend() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let searches = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&searches);
+        let backend = Backend::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            Box::new(prove::sat::Solver::new())
+        });
+        let mut cx = Context::new();
+        let mut s = Solver::new(Config::default().with_probes(0).with_backend(Some(backend)));
+        let w = Width::W8;
+        let odd = crate::KnownBits::new(BitVec::zero(w), BitVec::one(w)).unwrap();
+        let mut previous = None;
+        for (n, status) in [(2, Status::Unsat), (3, Status::Sat)] {
+            let x = cx.symbol("x", w).unwrap();
+            let c = cx.constant(&BitVec::wrapping_from_u64(w, n)).unwrap();
+            let predicate = cx.cmp(crate::CmpOp::Eq, x, c).unwrap();
+            if let Some(index) = previous {
+                assert_eq!(index, predicate.index());
+            }
+            previous = Some(predicate.index());
+            cx.declare_known(x, odd).unwrap();
+            s.assert(&cx, predicate).unwrap();
+            assert_eq!(s.check(&mut cx).unwrap(), status);
+            assert_eq!(s.decided_by(), Some(DecidedBy::Incremental));
+            if status == Status::Sat {
+                assert_eq!(s.value(&mut cx, x).unwrap().unwrap().to_u64(), Some(n));
+            }
+            s.reset();
+            cx.clear();
+        }
+        assert_eq!(searches.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn assertions_do_not_cross_arena_branches() {
+        let mut cx = Context::new();
+        let mut branch = cx.fork();
+        let yes = cx.bool(true).unwrap();
+        let no = branch.bool(false).unwrap();
+        assert_eq!(yes.index(), no.index());
+        let mut s = Solver::default();
+        s.assert(&cx, yes).unwrap();
+        assert_eq!(s.check(&mut branch), Err(Error::ForeignExpr));
+        assert_eq!(s.assert(&branch, no), Err(Error::ForeignExpr));
+        assert_eq!(s.check(&mut cx).unwrap(), Status::Sat);
+        assert_eq!(s.value(&mut branch, no).unwrap(), None);
+        s.reset();
+        s.assert(&branch, no).unwrap();
+        assert_eq!(s.check(&mut branch).unwrap(), Status::Unsat);
+    }
+
+    #[test]
+    fn model_and_value_keep_the_checked_assignment() {
+        let mut cx = Context::new();
+        let x = cx.symbol("x", Width::W1).unwrap();
+        let y = cx.symbol("unasked", Width::W1).unwrap();
+        let one = BitVec::one(Width::W1);
+        for e in [x, y] {
+            cx.declare_known(e, crate::KnownBits::constant(&one))
+                .unwrap();
+        }
+        let mut s = Solver::default();
+        s.assert(&cx, x).unwrap();
+        assert_eq!(s.check(&mut cx).unwrap(), Status::Sat);
+        cx.declare_known(x, crate::KnownBits::unknown(Width::W1))
+            .unwrap();
+        cx.declare_known(y, crate::KnownBits::constant(&BitVec::zero(Width::W1)))
+            .unwrap();
+        assert_eq!(
+            cx.eval(&[x, y], &s.model().unwrap()[..]).unwrap(),
+            [one, one]
+        );
+        for e in [x, y] {
+            assert_eq!(s.value(&mut cx, e).unwrap(), Some(one));
+        }
+        assert_eq!(s.check(&mut cx).unwrap(), Status::Sat);
+        assert_eq!(s.value(&mut cx, y).unwrap(), Some(BitVec::zero(Width::W1)));
+    }
+
+    #[test]
+    fn core_and_lean_require_the_checked_declarations() {
+        let mut cx = Context::new();
+        let x = cx.symbol("x", Width::W16).unwrap();
+        let y = cx.symbol("y", Width::W16).unwrap();
+        let a = p(&mut cx, "x != y");
+        let b = p(&mut cx, "y == 0");
+        let zero = crate::KnownBits::constant(&BitVec::zero(Width::W16));
+        cx.declare_known(x, zero).unwrap();
+        let mut s = Solver::default();
+        s.assert(&cx, a).unwrap();
+        assert_eq!(s.check_assuming(&mut cx, &[b]).unwrap(), Status::Unsat);
+        // Under the stronger declarations b alone is inconsistent. Do not
+        // minimize a historical core as if those declarations held at check time.
+        cx.declare_known(y, crate::KnownBits::constant(&BitVec::one(Width::W16)))
+            .unwrap();
+        assert_eq!(s.unsat_core(&mut cx).unwrap(), None);
+        assert_eq!(s.check_assuming(&mut cx, &[b]).unwrap(), Status::Unsat);
+        assert_eq!(
+            s.unsat_core(&mut cx).unwrap(),
+            Some(vec![CoreItem::Assumption(0)])
+        );
+        assert!(s.lean_theorem(&mut cx, "current").unwrap().is_some());
+        // Even an already cached core cannot be exported without its hypotheses.
+        cx.declare_known(y, crate::KnownBits::unknown(Width::W16))
+            .unwrap();
+        assert_eq!(s.lean_theorem(&mut cx, "stale").unwrap(), None);
+        assert_eq!(s.unsat_core(&mut cx).unwrap(), None);
+    }
+
+    #[test]
+    fn assumption_only_checks_do_not_replay_a_sibling_arenas_cache() {
+        let mut cx = Context::new();
+        let x = cx.symbol("x", Width::W16).unwrap();
+        let mask =
+            crate::KnownBits::new(BitVec::zero(Width::W16), BitVec::one(Width::W16)).unwrap();
+        let mut fork = cx.fork();
+        let even = p(&mut cx, "x == 2");
+        let odd = p(&mut fork, "x == 3");
+        assert_eq!(even.index(), odd.index());
+        cx.declare_known(x, mask).unwrap();
+        fork.declare_known(x, mask).unwrap();
+        let mut s = Solver::new(Config::default().with_incremental(false).with_probes(0));
+        assert_eq!(s.check_assuming(&mut cx, &[even]).unwrap(), Status::Unsat);
+        assert_eq!(s.check_assuming(&mut fork, &[odd]).unwrap(), Status::Sat);
+        assert_eq!(s.value(&mut fork, x).unwrap().unwrap().to_u64(), Some(3));
+    }
 
     fn p(cx: &mut Context, s: &str) -> Expr {
         cx.parse(s, &ParseOptions::width(Width::W16)).unwrap()

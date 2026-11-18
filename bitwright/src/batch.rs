@@ -1019,31 +1019,32 @@ fn chain(cx: &Context, i: u32, op: OpCode, terms: &mut Vec<u32>) {
     }
 }
 
-/// `roots` with their chains of `+` and of `^` regrouped: the terms that read a symbol in
-/// common are summed together where that sum is constant at the samples (then a hub) and
-/// the chain as written is not. Associativity and commutativity only, through the
-/// constructors: each result equals its root at every value. Returns how many chains changed.
+/// Regroups one root's chains of `+` and `^`. Terms reading a common symbol are summed
+/// together when their sum is constant at the samples and the chain as written is not.
+/// Both the symbol limit and which chains are maximal belong to this question alone.
+/// Associativity and commutativity preserve its value. Returns how many chains changed.
 fn regroup(
     cx: &mut Context,
     known: &mut Sampled,
-    roots: &mut [u32],
+    root: &mut u32,
     points: u32,
     min_terms: usize,
 ) -> Result<u64, Error> {
-    // The symbols each node reads, as a small set; a question over more symbols than fit
-    // is left as it is.
-    let order = cx.post_order_ids(roots);
-    let mut slot: HashMap<u32, u32> = HashMap::new();
+    if cx.node(*root).children().next().is_none() {
+        return Ok(0);
+    }
+    let order = cx.post_order_ids(&[*root]);
+    let mut symbols = 0;
     let mut reads: IdMap<u32, u128> = IdMap::default();
     for &i in &order {
         let n = cx.node(i);
         let set = match n.op {
             OpCode::Sym => {
-                let next = slot.len() as u32;
-                let k = *slot.entry(i).or_insert(next);
-                if k >= 128 {
+                let k = symbols;
+                if k == 128 {
                     return Ok(0);
                 }
+                symbols += 1;
                 1u128 << k
             }
             _ => n.children().fold(0, |acc, c| acc | reads[&c]),
@@ -1133,9 +1134,8 @@ fn regroup(
         }
         sums.push(row);
     }
-    let mut all: Vec<u32> = roots.to_vec();
-    all.extend_from_slice(&probe);
-    sample(cx, known, &all, &[], points)?;
+    probe.push(*root);
+    sample(cx, known, &probe, &[], points)?;
     let konst = |i: u32| known.get(&i).is_some_and(|x| x.0);
     let mut map: Vec<(Expr, Expr)> = Vec::new();
     for ((i, op, groups), row) in candidates.iter().zip(&sums) {
@@ -1170,11 +1170,8 @@ fn regroup(
     if map.is_empty() {
         return Ok(0);
     }
-    let handles: Vec<Expr> = roots.iter().map(|&i| cx.handle(i)).collect();
-    let new = cx.substitute(&handles, &map)?;
-    for (r, e) in roots.iter_mut().zip(new) {
-        *r = cx.id(e)?;
-    }
+    let result = cx.substitute(&[cx.handle(*root)], &map)?;
+    *root = cx.id(result[0])?;
     Ok(map.len() as u64)
 }
 
@@ -1567,7 +1564,8 @@ impl Session {
                 let key = &src.symbols.entries[n.a as usize].key;
                 // (A symbol the store has not met is declared as it arrives.)
                 if let Some(theirs) = st.cx.find_symbol(key)
-                    && st.cx.declared_at(theirs.index()) != src.declared_at(i)
+                    && (st.cx.wid(theirs.index()) != src.wid(i)
+                        || st.cx.declared_at(theirs.index()) != src.declared_at(i))
                 {
                     return Ok(false);
                 }
@@ -1742,15 +1740,9 @@ impl Session {
             return Ok(());
         }
         if split.hubs && split.terms {
-            let store = &mut *st;
-            let n = regroup(
-                &mut store.cx,
-                &mut store.sampled,
-                &mut roots,
-                split.points,
-                3,
-            )?;
-            st.stats.regrouped += n;
+            for root in &mut roots {
+                st.stats.regrouped += regroup(&mut st.cx, &mut st.sampled, root, split.points, 3)?;
+            }
         }
         for (k, &j) in asks.iter().enumerate() {
             if let Plan::Ask { root, .. } = &mut st.graph.jobs[j].plan {

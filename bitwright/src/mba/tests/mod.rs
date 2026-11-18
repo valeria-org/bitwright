@@ -173,11 +173,11 @@ fn signature_solver_is_correct_and_complete_on_linear_mba() {
 fn memory_cache_is_bounded() {
     let c = MemoryCache::new(2);
     for k in 0..5u64 {
-        c.put(&CacheKey([k, k]), &CacheEntry::NoSimpler);
+        c.put(&CacheKey([k, k]), &CacheEntry::NoSimpler { steps: k });
     }
     assert_eq!(c.len(), 2);
     assert!(c.get(&CacheKey([0, 0])).is_none());
-    assert_eq!(c.get(&CacheKey([4, 4])), Some(CacheEntry::NoSimpler));
+    assert_eq!(c.get(&CacheKey([4, 4])), Some(CacheEntry::NoSimpler { steps: 4 }));
     let _ = (Context::new(), ParseOptions::default(), BinOp::Add);
 }
 

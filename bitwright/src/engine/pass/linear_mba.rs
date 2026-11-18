@@ -24,7 +24,7 @@
 //! values (a lifter's `sext<64>(a & b)` over 32-bit `a`, `b`): the function is read over the
 //! narrow atoms lifted to the root's width by the same cast, since `sext(f(a, b))` is
 //! `f(sext a, sext b)` for every bitwise `f`, and `zext(f(a, b))` is `f(zext a, zext b)` when
-//! `f` is 0 at 0, else that plus `2^W` (see [`interior`]). The emission is over the lifted
+//! `f` is 0 at 0, else that plus `2^W` (see [`walk`]). The emission is over the lifted
 //! atoms, which it builds; the commit rule's boundary stays at the narrow atoms, so they count.
 
 use super::{
@@ -83,7 +83,7 @@ enum Mode {
     Bitwise,
 }
 
-/// Whether node `i` is interior when read in `mode` (otherwise it is an atom).
+/// Whether node `i` may be interior when read in `mode` (otherwise it is an atom).
 ///
 /// A cast is interior too (see the module notes on extensions): its operand is read as a
 /// bitwise function at the narrower width, over narrow atoms the emission lifts. A sign
@@ -91,7 +91,8 @@ enum Mode {
 /// commutes with every bitwise operator); a zero extension of one is the function of the zero
 /// extensions when the function is 0 at 0 (above the operand's width every lifted atom is 0),
 /// and that plus `2^W` when it is all ones there (`zext(~a)` is `~zext(a) + 2^W`, i.e.
-/// `lowmask(W) − zext(a)`), which is a term but no operand of a bitwise function.
+/// `lowmask(W) − zext(a)`), which is a term but no operand of a bitwise function. [`walk`]
+/// checks that last condition once it knows which nodes the function treats as atoms.
 fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
     let n = cx.node(i);
     if let Some(v) = cx.const_val(i) {
@@ -99,8 +100,7 @@ fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
         return mode == Mode::Linear || v.is_zero() || v.is_ones();
     }
     match n.op {
-        OpCode::Sext => true,
-        OpCode::Zext => mode == Mode::Linear || !at_zero(cx, n.a),
+        OpCode::Sext | OpCode::Zext => true,
         // Linear operators are terms, never operands of a bitwise function.
         OpCode::Mul => {
             mode == Mode::Linear && (cx.const_val(n.a).is_some() || cx.const_val(n.b).is_some())
@@ -113,28 +113,6 @@ fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
             .all(|c| cx.const_val(c).is_none_or(|v| v.is_zero() || v.is_ones())),
         _ => false,
     }
-}
-
-/// Whether the bitwise function at `i` (over 0/all-ones constants and atoms) is all ones when
-/// every atom is 0: its value above the operand's width once zero-extended.
-fn at_zero(cx: &Context, i: u32) -> bool {
-    fn go(cx: &Context, i: u32, depth: u32) -> bool {
-        let n = cx.node(i);
-        if let Some(v) = cx.const_val(i) {
-            return v.is_ones();
-        }
-        if depth > 64 {
-            return false;
-        }
-        match n.op {
-            OpCode::Not => !go(cx, n.a, depth + 1),
-            OpCode::And => go(cx, n.a, depth + 1) && go(cx, n.b, depth + 1),
-            OpCode::Or => go(cx, n.a, depth + 1) || go(cx, n.b, depth + 1),
-            OpCode::Xor => go(cx, n.a, depth + 1) ^ go(cx, n.b, depth + 1),
-            _ => false,
-        }
-    }
-    go(cx, i, 0)
 }
 
 /// The mode in which node `i`'s operands are read, when `i` is read in `mode`.
@@ -161,8 +139,8 @@ type Frame = (u32, Mode, bool, Option<(OpCode, u32)>);
 #[derive(Default)]
 pub(crate) struct Scratch {
     /// In a walk, per node reached: bit 0 whether it is interior, bit 1 + mode the readings
-    /// seen, bit 3 whether it is in the post-order. In a signature, per region node: its row
-    /// of corner values in `words`.
+    /// seen, bit 3 whether a function under a zero extension is all ones at the zero corner.
+    /// In a signature, per region node: its row of corner values in `words`.
     seen: Counts,
     /// Nodes that must be atoms.
     forced: Marks,
@@ -184,8 +162,9 @@ impl Scratch {
     }
 }
 
-/// The `seen` bit of a node in the post-order.
-const LISTED: u32 = 8;
+/// Only interior narrow nodes can set this bit: a boundary atom is zero at the zero corner,
+/// irrespective of its defining expression.
+const ONES_AT_ZERO: u32 = 8;
 
 fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
     s.seen.begin(cx.len());
@@ -198,8 +177,24 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
     let (mut lin, mut bit) = (false, false);
     s.stack.clear();
     s.stack.push((root, Mode::Linear, false, None));
+    let mut bitwise_zext = false;
     while let Some((i, mode, expanded, lift)) = s.stack.pop() {
         if expanded {
+            if matches!(lift, Some((OpCode::Zext, _))) {
+                let n = cx.node(i);
+                let one = |c| s.seen.get(c).unwrap() & ONES_AT_ZERO != 0;
+                let ones = match n.op {
+                    OpCode::Const => cx.const_val(i).unwrap().is_ones(),
+                    OpCode::Not => !one(n.a),
+                    OpCode::And => one(n.a) && one(n.b),
+                    OpCode::Or => one(n.a) || one(n.b),
+                    OpCode::Xor => one(n.a) ^ one(n.b),
+                    _ => unreachable!("only bitwise functions are interior under casts"),
+                };
+                if ones {
+                    s.seen.set(i, s.seen.get(i).unwrap() | ONES_AT_ZERO);
+                }
+            }
             order.push(i);
             continue;
         }
@@ -243,7 +238,9 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
                         Some((kind, _)) => narrow.push((i, kind)),
                         None => atoms.push(i),
                     }
-                    if atoms.len() + narrow.len() > MAX_ATOMS {
+                    // A tentative cast may become a single atom on retry, hiding its narrow
+                    // operands. Bound the whole walk by MAX_REGION until casts are settled.
+                    if atoms.len() > MAX_ATOMS {
                         return Err(Walk::Over);
                     }
                     continue;
@@ -251,6 +248,7 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
                 s.stack.push((i, mode, true, lift));
             }
         }
+        bitwise_zext |= op == OpCode::Zext && mode == Mode::Bitwise;
         lin |= is_linear(op);
         // (A complement under a cast counts: `zext(~a)` is a term the linear pass cannot read
         // without the extension of `a`.)
@@ -265,12 +263,23 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
             s.stack.push((c, m, false, under));
         }
     }
-    // Keep each interior node once, operands first (a node read in both modes was pushed twice).
-    order.retain(|&i| {
-        let state = s.seen.get(i).unwrap_or(0);
-        s.seen.set(i, state | LISTED);
-        state & LISTED == 0
-    });
+    // `order` contains each interior node once (the first reading scheduled its expanded
+    // frame). Check *all* readings: a cast may have been seen as a term before a bitwise
+    // operand. A cast needing an additive correction cannot be used as the latter.
+    if bitwise_zext {
+        for &i in &order {
+            let n = cx.node(i);
+            if n.op == OpCode::Zext
+                && s.seen.get(i).unwrap() & (2 << Mode::Bitwise as u32) != 0
+                && s.seen.get(n.a).unwrap() & ONES_AT_ZERO != 0
+            {
+                return Err(Walk::Conflict(i));
+            }
+        }
+    }
+    if atoms.len() + narrow.len() > MAX_ATOMS {
+        return Err(Walk::Over);
+    }
     // The canonical order of the atoms, independent of node indices.
     atoms.sort_by(|a, b| cx.order(*a, *b));
     Ok(Region {
@@ -445,7 +454,7 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
         vals.insert(a, v);
     }
     for &(a, l) in &reg.lifts {
-        let v = vals.get(&l).cloned().unwrap_or_default();
+        let v = vals[&l].clone();
         vals.insert(a, v);
     }
     for &i in &reg.order {
@@ -454,7 +463,8 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
             let c = if c.is_ones() {
                 BitVec::ones(w)
             } else {
-                c.zext(w).unwrap_or(c)
+                c.zext(w)
+                    .expect("a region constant is no wider than its root")
             };
             vec![c; corners]
         } else {
@@ -473,7 +483,7 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
                         OpCode::Not => BitVec::un_unchecked(UnOp::Not, &get(n.a)),
                         OpCode::Neg => BitVec::un_unchecked(UnOp::Neg, &get(n.a)),
                         op => {
-                            let b = op.as_bin().unwrap_or(BinOp::Add);
+                            let b = op.as_bin().expect("binary linear-MBA operator");
                             BitVec::bin_unchecked(b, &get(n.a), &get(n.b))
                         }
                     }
@@ -482,7 +492,7 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
         };
         vals.insert(i, v);
     }
-    vals.remove(&root).unwrap_or_default()
+    vals.remove(&root).expect("the root has a signature row")
 }
 
 /// The conjunction coefficients `d_S` from the signature: `−E(p) = Σ_{S ⊆ p} d_S`.
@@ -979,4 +989,68 @@ fn solve(
         tie,
     )?;
     Ok((step, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Expr, Width};
+
+    /// Whether the walk admits the cast as a bitwise operand, before retrying with it opaque.
+    fn admits(cx: &mut Context, s: &mut Scratch, f: Expr, forced: Option<Expr>) -> bool {
+        let cast = cx.zext(f, Width::W16).unwrap();
+        let y = cx.symbol("y", Width::W16).unwrap();
+        let masked = cx.bin(BinOp::And, cast, y).unwrap();
+        s.forced.begin(cx.len());
+        if let Some(atom) = forced {
+            s.forced.insert(cx.id(atom).unwrap());
+        }
+        match walk(cx, cx.id(masked).unwrap(), s) {
+            Ok(region) => region.order.contains(&cx.id(cast).unwrap()),
+            Err(Walk::Conflict(i)) if i == cx.id(cast).unwrap() => false,
+            Err(_) => panic!("unexpected boundary"),
+        }
+    }
+
+    #[test]
+    fn zero_corner_stops_at_forced_atoms() {
+        let mut cx = Context::new();
+        let mut s = Scratch::default();
+        let x = cx.symbol("x", Width::W8).unwrap();
+        let b = cx.symbol("b", Width::W8).unwrap();
+        let atom = cx.un(UnOp::Not, x).unwrap();
+        let f = cx.bin(BinOp::Xor, atom, b).unwrap();
+        let not_f = cx.un(UnOp::Not, f).unwrap();
+        assert!(admits(&mut cx, &mut s, f, Some(atom)));
+        assert!(!admits(&mut cx, &mut s, not_f, Some(atom)));
+    }
+
+    #[test]
+    fn rejected_cast_hides_its_atoms_from_the_limit() {
+        let mut cx = Context::new();
+        let mut s = Scratch::default();
+        let mut f = cx.symbol("x", Width::W8).unwrap();
+        for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            let atom = cx.symbol(name, Width::W8).unwrap();
+            f = cx.bin(BinOp::Or, f, atom).unwrap();
+        }
+        let not_f = cx.un(UnOp::Not, f).unwrap();
+        assert!(!admits(&mut cx, &mut s, not_f, None));
+    }
+
+    #[test]
+    fn zero_corner_observes_deep_complements() {
+        let mut cx = Context::new();
+        let mut s = Scratch::default();
+        let x = cx.symbol("x", Width::W8).unwrap();
+        let b = cx.symbol("b", Width::W8).unwrap();
+        let mut f = cx.un(UnOp::Not, x).unwrap();
+        for i in 0..80 {
+            let op = if i % 2 == 0 { BinOp::Xor } else { BinOp::Or };
+            f = cx.bin(op, f, b).unwrap();
+        }
+        let not_f = cx.un(UnOp::Not, f).unwrap();
+        assert!(!admits(&mut cx, &mut s, f, None));
+        assert!(admits(&mut cx, &mut s, not_f, None));
+    }
 }

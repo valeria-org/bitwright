@@ -125,8 +125,9 @@ pub struct CacheKey(pub [u64; 2]);
 pub enum CacheEntry {
     /// A verified simpler expression.
     Simplified(MbaExpr),
-    /// The solver answered, completely, that nothing is simpler.
-    NoSimpler,
+    /// A complete "no simpler" answer and the cost of finding it. The phase uses this
+    /// cost for its containment policy on a hit, without charging for work not repeated.
+    NoSimpler { steps: u64 },
 }
 
 /// Where the MBA service keeps answers across calls. bitwright performs no IO: persistent

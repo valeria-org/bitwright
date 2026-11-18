@@ -18,8 +18,8 @@ mod tests;
 
 use core::cmp::Ordering;
 use core::fmt;
-use core::num::NonZeroU32;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use core::num::{NonZeroU32, NonZeroU64};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use hashbrown::HashTable;
 
@@ -263,16 +263,18 @@ impl Marks {
     }
 }
 
-/// The only process-wide state in bitwright: a counter that gives every context generation
-/// (each new context, and each `clear()`) a distinct handle tag. Tags repeat only after 2^32
-/// generations have been created in the process. It never influences any result or output.
-static TAGS: AtomicU32 = AtomicU32::new(0);
-
-fn fresh_tag() -> NonZeroU32 {
+/// A compact handle tag and a full identity for caches that must never alias.
+/// Forks keep their parent's handle tag but receive their own cache identity.
+fn fresh_arena() -> (NonZeroU32, NonZeroU64) {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
     loop {
-        let t = TAGS.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1);
-        if let Some(nz) = NonZeroU32::new(t) {
-            return nz;
+        let n = NEXT
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+                n.checked_add(1)
+            })
+            .expect("exhausted arena identities");
+        if let Some(tag) = NonZeroU32::new(n as u32) {
+            return (tag, NonZeroU64::new(n).unwrap());
         }
     }
 }
@@ -312,6 +314,10 @@ pub struct Context {
     generation: u32,
     pub(crate) declaration_revision: u64,
     tag: NonZeroU32,
+    /// Identity for caches keyed by node index. Forks share a handle tag for
+    /// their common prefix, but may assign the same next index to different nodes.
+    #[cfg(feature = "prove")]
+    pub(crate) arena: NonZeroU64,
     retired: [u32; RETIRED],
     counters: ArenaCounters,
     engine_mode: bool,
@@ -370,6 +376,8 @@ impl Context {
             generation: self.generation,
             declaration_revision: self.declaration_revision,
             tag: self.tag,
+            #[cfg(feature = "prove")]
+            arena: fresh_arena().1,
             retired: self.retired,
             counters: self.counters,
             engine_mode: self.engine_mode,
@@ -394,6 +402,7 @@ impl Context {
 
     /// An empty context.
     pub fn with_config(config: ContextConfig) -> Self {
+        let identity = fresh_arena();
         Context {
             nodes: Vec::new(),
             meta: Vec::new(),
@@ -403,7 +412,9 @@ impl Context {
             config,
             generation: 0,
             declaration_revision: 0,
-            tag: fresh_tag(),
+            tag: identity.0,
+            #[cfg(feature = "prove")]
+            arena: identity.1,
             retired: [0; RETIRED],
             counters: ArenaCounters::default(),
             engine_mode: false,
@@ -508,7 +519,12 @@ impl Context {
         self.generation = self.generation.wrapping_add(1);
         self.retired.rotate_right(1);
         self.retired[0] = self.tag.get();
-        self.tag = fresh_tag();
+        let identity = fresh_arena();
+        self.tag = identity.0;
+        #[cfg(feature = "prove")]
+        {
+            self.arena = identity.1;
+        }
     }
 
     /// The state to come back to with [`rollback`](Self::rollback): what the context holds

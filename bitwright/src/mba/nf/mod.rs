@@ -12,6 +12,8 @@ mod index;
 mod poly;
 mod render;
 mod synth;
+#[cfg(test)]
+mod tests;
 mod word;
 
 use std::collections::{HashMap, VecDeque};
@@ -278,12 +280,13 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v3;atoms={};classes={};terms={};degree={};synth={}",
+            "bitwright.nf.v3;atoms={};classes={};terms={};degree={};basis_sums={};synth={}",
             opts.max_atoms,
             opts.max_classes,
             opts.max_terms,
             opts.max_degree,
-            if opts.synthesis { synth::MAX_SIZE } else { 0 }
+            opts.basis_sums,
+            if opts.synthesis { synth::MAX_SIZE } else { 0 },
         );
         NormalFormSolver {
             opts,
@@ -3070,8 +3073,8 @@ struct Rendered {
 
 /// The cheapest rendering of `n`: rendered, then again with the factors the best candidate
 /// multiplies, until none is new (a few rounds), so the answer is as good as the factors its
-/// own products offer. Rendering cut short by the budget is [`Decline::Exhausted`]: what it
-/// found need not be the cheapest, and nothing is left to certify it.
+/// own products offer. An unfinished first round gives no answer; an unfinished later round
+/// keeps the best completed one. Both spend their remaining allowance.
 fn best_rendering(
     p: &MbaExpr,
     n: &Normal,
@@ -3096,13 +3099,7 @@ fn best_rendering(
         // was seen); what comes after only adds candidates, so running short there only stops
         // it: the other forms each take at most half of what is left while a quarter is, and a
         // later round cut short is dropped.
-        if r.exhausted() {
-            if round == 0 {
-                return Err(Decline::Exhausted);
-            }
-            break;
-        }
-        if round == 0 {
+        if round == 0 && !r.exhausted() {
             let cap = r.limit();
             for alt in n.alts.iter().chain(&more) {
                 let left = cap.saturating_sub(r.work);
@@ -3111,31 +3108,33 @@ fn best_rendering(
                 }
                 r.set_limit(r.work + left / 2);
                 cands.extend(candidates(&mut r, alt, &factors));
+                // A failed charge may exceed the alternative's allowance; it does not
+                // spend steps reserved for the other candidates.
+                r.work = r.work.min(r.limit());
                 r.set_limit(cap);
-                r.work = r.work.min(cap);
             }
-        }
-        // Synthesis does not depend on the factors: the first round is enough.
-        if round == 0 && n.synthesis && !r.hopeless(n.nf.atoms()) {
-            let bar = r.best(&cands).map(|b| r.b.cost(b));
-            match r.synthesize(&n.nf, bar) {
-                Some(render::Hit::Exact(x)) => cands.push(x),
-                Some(render::Hit::Unproved(x)) => {
-                    unproved = r.b.finish(x).map(|e| (r.b.cost(x), e));
+            // Synthesis does not depend on the factors: the first round is enough.
+            if n.synthesis && !r.hopeless(n.nf.atoms()) {
+                let bar = r.best(&cands).map(|b| r.b.cost(b));
+                match r.synthesize(&n.nf, bar) {
+                    Some(render::Hit::Exact(x)) => cands.push(x),
+                    Some(render::Hit::Unproved(x)) => {
+                        unproved = r.b.finish(x).map(|e| (r.b.cost(x), e));
+                    }
+                    None => {}
                 }
-                None => {}
+                add_synth(tally, &r.synth);
             }
-            add_synth(tally, &r.synth);
         }
         tally.candidates += r.built;
-        if r.exhausted() {
+        // Steps charges at most what remains, even when the renderer's last
+        // request exceeded its limit. Debit it before either exhaustion exit.
+        if work.charge(r.work.max(1)).is_err() {
             if round == 0 {
                 return Err(Decline::Exhausted);
             }
             break;
         }
-        work.charge(r.work.max(1))
-            .map_err(|()| Decline::Exhausted)?;
         let Some(b) = r.best(&cands) else {
             break;
         };

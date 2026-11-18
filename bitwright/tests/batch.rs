@@ -279,6 +279,40 @@ fn terms_that_cancel_across_a_chain_are_brought_together() {
 }
 
 #[test]
+fn unrelated_batch_symbols_do_not_consume_a_questions_regrouping_slots() {
+    let mut cx = Context::new();
+    let o = w64();
+    let root = cx
+        .parse(
+            "(x ^ y) + z * w + 2 * (x & y) + udiv(z, w | 1) + (x + y) * -1",
+            &o,
+        )
+        .unwrap();
+    let want = cx.parse("z * w + udiv(z, w | 1)", &o).unwrap();
+    let cfg = Config::default()
+        .with_threads(1)
+        .with_split(Split::eager())
+        .with_prove(prove::Config::default().with_simplify_fuel(0));
+    let mut asks = vec![Ask::simplify(root)];
+    let alone = Session::new(cfg).run(&mut cx, &asks).unwrap().remove(0);
+    assert!(matches!(alone.answer, Answer::Simplified { expr, .. } if expr == want));
+    // The same chain also remains maximal for this question when it is an inner
+    // chain of a different question.
+    let z = cx.parse("z", &o).unwrap();
+    let parent = cx.bin(bitwright::BinOp::Add, root, z).unwrap();
+    let nested = Session::new(cfg)
+        .run(&mut cx, &[Ask::simplify(parent), Ask::simplify(root)])
+        .unwrap()
+        .remove(1);
+    assert_eq!((&nested.answer, nested.cost), (&alone.answer, alone.cost));
+    for k in 0..125 {
+        asks.push(Ask::simplify(cx.parse(&format!("v{k}"), &o).unwrap()));
+    }
+    let together = Session::new(cfg).run(&mut cx, &asks).unwrap().remove(0);
+    assert_eq!((together.answer, together.cost), (alone.answer, alone.cost));
+}
+
+#[test]
 fn an_undecided_question_is_split_on_the_condition_its_selects_test() {
     let mut cx = Context::new();
     // Either way the condition falls, both sides are one product; a search over the
@@ -493,6 +527,27 @@ fn a_symbol_declared_otherwise_is_another_question() {
     assert_eq!(narrow.answer, Answer::Constant(BitVec::zero(Width::W64)));
     assert_eq!(narrow.source, Source::Solved);
     assert_eq!(session.stats().flushes, 1);
+}
+
+#[test]
+fn symbol_width_in_an_earlier_context_does_not_constrain_a_question() {
+    let session = Session::new(Config::default().with_threads(1));
+    let mut cx = Context::new();
+    let narrow = cx.symbol("x", Width::W8).unwrap();
+    session.run(&mut cx, &[Ask::constant(narrow)]).unwrap();
+    let mut cx = Context::new();
+    let wide = cx.symbol("x", Width::W16).unwrap();
+    let reply = session
+        .run(&mut cx, &[Ask::constant(wide)])
+        .unwrap()
+        .remove(0);
+    let Answer::Varies(models) = reply.answer else {
+        panic!("expected two values for unconstrained x");
+    };
+    assert_ne!(
+        value_at(&mut cx, wide, &models.0),
+        value_at(&mut cx, wide, &models.1)
+    );
 }
 
 /// `r <u 2` as the borrow of `r - 2`, in arithmetic: 0 wherever `r` is at least 2.

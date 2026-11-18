@@ -3459,6 +3459,11 @@ mod mba_service {
                 None => MbaAnswer::NoSimpler,
             }
         }
+        // Each scripted lookup is cheap. This test exercises a memoized rewrite
+        // cycle, not the scheduling policy for expensive NoSimpler answers.
+        fn solve_counted(&self, p: &MbaExpr, budget: &MbaBudget) -> (MbaAnswer, u64) {
+            (self.solve(p, budget), 1)
+        }
     }
 
     #[test]
@@ -3722,23 +3727,20 @@ mod mba_service {
         assert_eq!(out.roots[0].expr, want);
     }
 
-    /// Counts calls and answers "no simpler".
+    /// Records the steps offered without overriding the default accounting.
     struct Counting(AtomicU64);
     impl MbaSolver for Counting {
         fn id(&self) -> &str {
             "test.counting"
         }
-        fn solve(&self, _: &MbaExpr, _: &MbaBudget) -> MbaAnswer {
-            self.0.fetch_add(1, Ordering::Relaxed);
+        fn solve(&self, _: &MbaExpr, budget: &MbaBudget) -> MbaAnswer {
+            self.0.fetch_add(budget.steps, Ordering::Relaxed);
             MbaAnswer::NoSimpler
         }
     }
 
     #[test]
     fn answers_are_cached_and_calls_budgeted() {
-        // (A solver that counts its steps: one charged its whole limit has its fragments kept
-        // from the questions above them in the run that asked, which a cached answer does
-        // not say.)
         let solver = Arc::new(Steady(1000, AtomicU64::new(0)));
         let cache = Arc::new(MemoryCache::new(1024));
         let eng = Engine::builder()
@@ -3887,14 +3889,14 @@ mod mba_service {
         let s = Arc::new(Steady(1000, AtomicU64::new(0)));
         let out = ask(s.clone(), 1000 * calls - 1);
         assert_eq!(out.stats.mba.steps, 1000 * calls - 1);
-        // A solver that does not count is charged its whole limit: what a question takes
-        // while the rounds have others to ask (65,536 steps).
+        // A solver that does not count is charged its entire offer, including
+        // the smaller offers for probes of parents that share expensive atoms.
         let limit = MbaConfig::default().budget.steps;
         let c = Arc::new(Counting(AtomicU64::new(0)));
         let out = ask(c.clone(), 2 * limit);
-        let asked = c.0.load(Ordering::Relaxed);
-        assert!(asked >= 3 && asked << 16 < 2 * limit, "{asked}");
-        assert_eq!(out.stats.mba.steps, asked << 16);
+        let offered = c.0.load(Ordering::Relaxed);
+        assert!(out.stats.mba.calls >= 3 && (0..2 * limit).contains(&offered));
+        assert_eq!(out.stats.mba.steps, offered);
         // A question that ran out of those is asked again once a round changes nothing, and
         // its limit then is a quarter of the account where that is less than the solver's
         // own.

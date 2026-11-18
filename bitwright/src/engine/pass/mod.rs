@@ -597,61 +597,40 @@ pub(super) fn mba_step(
         Step::Normal(f) => f,
         step => return Ok(step),
     };
-    // a sum whose groups of terms share no leaf, each asked alone.
-    let mut part =
-        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
-            Ok(match mba::step(r, cx, cfg, s)? {
-                Step::To(e, _) => Some(e),
-                Step::Normal(_) => None,
-            })
+    // Splitters take only an optional replacement from their callback. Accumulate
+    // its finality separately, including when the split produced no replacement.
+    macro_rules! split {
+        ($split:path, $ask:path) => {
+            let out = $split(r, cx, n, &mut |r, cx, s| {
+                Ok(match $ask(r, cx, cfg, s)? {
+                    Step::To(e, f) => {
+                        declined = declined.and(f);
+                        Some(e)
+                    }
+                    Step::Normal(f) => {
+                        declined = declined.and(f);
+                        None
+                    }
+                })
+            })?;
+            match out {
+                Some(Step::Normal(f)) => declined = declined.and(f),
+                Some(step) => return Ok(step.after(declined)),
+                None => {}
+            }
         };
-    match linear::by_sums(r, cx, n, &mut part)? {
-        Some(Step::Normal(f)) => declined = declined.and(f),
-        Some(step) => return Ok(step),
-        None => {}
     }
-    let mut small =
-        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
-            Ok(match mba::step_part(r, cx, cfg, s)? {
-                Step::To(e, _) => Some(e),
-                Step::Normal(_) => None,
-            })
-        };
-    match linear::by_factor(r, cx, n, &mut small)? {
-        Some(Step::Normal(f)) => declined = declined.and(f),
-        Some(step) => return Ok(step),
-        None => {}
+    split!(linear::by_sums, mba::step);
+    split!(linear::by_factor, mba::step_part);
+    split!(linear::by_multiplicand, mba::step_cofactor);
+    split!(cases::by_cases, mba::step_side);
+    split!(linear::by_groups, mba::step);
+    // An unchanged result that installed a containment marker is not a complete
+    // phase memo entry: replaying just its node would lose that effect on parents.
+    if r.mba.kept.contains_key(&n) {
+        declined = declined.and(Fin::PROVISIONAL);
     }
-    // a sum of products with factors affine in one value, multiplied out over them.
-    let mut cofactor =
-        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
-            Ok(match mba::step_cofactor(r, cx, cfg, s)? {
-                Step::To(e, _) => Some(e),
-                Step::Normal(_) => None,
-            })
-        };
-    match linear::by_multiplicand(r, cx, n, &mut cofactor)? {
-        Some(Step::Normal(f)) => declined = declined.and(f),
-        Some(step) => return Ok(step),
-        None => {}
-    }
-    let mut side =
-        |r: &mut Runner<'_, '_>, cx: &mut Context, s: u32| -> Result<Option<u32>, Stop> {
-            Ok(match mba::step_side(r, cx, cfg, s)? {
-                Step::To(e, _) => Some(e),
-                Step::Normal(_) => None,
-            })
-        };
-    match cases::by_cases(r, cx, n, &mut side)? {
-        Some(Step::Normal(f)) => declined = declined.and(f),
-        Some(step) => return Ok(step),
-        None => {}
-    }
-    Ok(match linear::by_groups(r, cx, n, &mut part)? {
-        Some(Step::Normal(f)) => Step::Normal(declined.and(f)),
-        Some(step) => step,
-        None => Step::Normal(declined),
-    })
+    Ok(Step::Normal(declined))
 }
 
 /// The question at the top of a fragment (a node whose user in the walk is not asked, or a

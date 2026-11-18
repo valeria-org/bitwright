@@ -62,6 +62,9 @@ pub enum Refusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bindings {
     pub(crate) atoms: Vec<u32>,
+    /// Interior of this reading, operands first. A rebased operand (`t` read as `a - k`)
+    /// is neither an interior node nor a variable; its original children are not read.
+    pub(crate) interior: Vec<u32>,
 }
 
 impl Bindings {
@@ -103,11 +106,9 @@ fn in_fragment(cx: &Context, i: u32) -> bool {
     }
 }
 
-/// Whether a narrower reading's atoms `bindings` include a node the whole fragment reads
-/// through (arithmetic under a bitwise operator, a value cut off): otherwise the reading is
-/// the whole fragment's.
-pub(crate) fn cuts(cx: &Context, bindings: &Bindings) -> bool {
-    bindings.atoms.iter().any(|&a| in_fragment(cx, a))
+/// Whether using `atom` as a leaf cuts off part of the whole fragment.
+pub(crate) fn cuts(cx: &Context, atom: u32) -> bool {
+    in_fragment(cx, atom)
 }
 
 /// Whether the fragment rooted at `root` is one [`lower_id`] takes (rooted at a fragment
@@ -569,7 +570,7 @@ fn build_in(
         let v = m.push(MOp::Sub, &args).map_err(bad)?;
         at.insert(s.operand, v);
     }
-    for i in order {
+    for &i in &order {
         let n = cx.node(i);
         let arg = |k: u32| at.get(k).unwrap_or(u32::MAX);
         let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
@@ -629,7 +630,13 @@ fn build_in(
         .map_err(bad)?;
         at.insert(i, v);
     }
-    Ok((m, Bindings { atoms }))
+    Ok((
+        m,
+        Bindings {
+            atoms,
+            interior: order,
+        },
+    ))
 }
 
 /// Lowers the fragment rooted at `e` into an [`MbaExpr`]: `+ − * neg & | ^ ~`, shifts by

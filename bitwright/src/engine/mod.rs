@@ -245,12 +245,9 @@ pub struct Strategy {
     /// (a devirtualizer's 784-node question, proved in 0.13 s from the conjunction form, was
     /// not proved in 10,000,000 propagations from the basis form).
     pub basis_sums: bool,
-    /// The solver steps from which the MBA phase keeps a fragment with no simpler form from
-    /// the questions above it. 2^16 by default: a larger sum is then asked whole and solved,
-    /// where a lower bound keeps it as its parts. A host whose phase budget is small next to
-    /// its questions sets it lower: a devirtualizer's engine left six of eight constants it
-    /// had folded as sums at 2^16 (the larger questions asked spent the budget before the
-    /// ones that fold), and folded them all at 2^12.
+    /// The solver steps from which the MBA phase skips isolated wrappers around a fragment
+    /// with no simpler form (2^16 by default). A lower threshold leaves more of a small
+    /// phase budget for other questions. A branch sharing its atoms can still cancel it.
     pub kept_steps: u64,
 }
 
@@ -258,6 +255,40 @@ pub struct Strategy {
 pub(crate) const KEPT_STEPS: u64 = pass::mba::KEPT_STEPS;
 
 impl Strategy {
+    /// The strategy's part of the context memo epoch. The name is diagnostic and the
+    /// builder adds each resolved phase below. Keep this match exhaustive so a new
+    /// policy cannot accidentally reuse another policy's answers.
+    fn policy_id(&self) -> u64 {
+        let Strategy {
+            name: _,
+            phases: _,
+            max_rounds,
+            float_values,
+            sharing,
+            max_region,
+            words_proved,
+            whole_first,
+            basis_sums,
+            kept_steps,
+        } = self;
+        let sharing = match sharing {
+            Sharing::Roots => 0,
+            Sharing::Ignored => 1,
+        };
+        [
+            u64::from(*max_rounds),
+            u64::from(*float_values),
+            sharing,
+            u64::from(*max_region),
+            u64::from(*words_proved),
+            u64::from(*whole_first),
+            u64::from(*basis_sums),
+            *kept_steps,
+        ]
+        .into_iter()
+        .fold(0x656e_6769_6e65, combine)
+    }
+
     /// A strategy with the given phases and at most 4 rounds.
     pub fn new(name: impl Into<Cow<'static, str>>, phases: Vec<Phase>) -> Strategy {
         Strategy {
@@ -485,6 +516,23 @@ impl Strategy {
     pub fn with_max_rounds(mut self, n: u8) -> Strategy {
         self.max_rounds = n.max(1);
         self
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn phase_memo_epochs_distinguish_strategy_policies() {
+    let epoch = |s| Engine::builder().strategy(s).build().unwrap().inner.id;
+    let base = Strategy::new("policy", vec![Phase::LinearMba, Phase::Words]);
+    let original = epoch(base.clone());
+    for changed in [
+        base.clone().with_basis_sums(false),
+        base.clone().with_kept_steps(1),
+        base.clone().with_words_proved(true),
+        base.clone().with_whole_first(false),
+        base.with_float_values(true),
+    ] {
+        assert_ne!(epoch(changed), original);
     }
 }
 
@@ -875,19 +923,7 @@ impl EngineBuilder {
             )
         });
         let mut phases = Vec::new();
-        let mut id = combine(0x656e_6769_6e65, u64::from(strategy.max_rounds));
-        // The commit policy enters only when it is not the default, so engines that keep it
-        // keep their ids (and contexts their memos).
-        if strategy.sharing != Sharing::Roots || strategy.max_region != pass::REGION_CAP {
-            let sharing = match strategy.sharing {
-                Sharing::Roots => 0,
-                Sharing::Ignored => 1,
-            };
-            id = combine(
-                combine(combine(id, 0x7368_6172), sharing),
-                u64::from(strategy.max_region),
-            );
-        }
+        let mut id = strategy.policy_id();
         for phase in &strategy.phases {
             match phase {
                 Phase::Local { groups: names } => {
@@ -1411,7 +1447,12 @@ impl Fin {
     fn and(self, o: Fin) -> Fin {
         Fin {
             done: self.done && o.done,
-            why: self.why.or(o.why),
+            // A question that used up its step allocation doesn't explain a subsequent
+            // refusal to start *any* solver call. Report the exhausted calls account.
+            why: match (self.why, o.why) {
+                (Some(Exhausted::MbaSteps), Some(Exhausted::MbaCalls)) => o.why,
+                _ => self.why.or(o.why),
+            },
             rel: self.rel | o.rel,
         }
     }
@@ -1439,6 +1480,17 @@ enum Accept {
 enum Step {
     To(u32, Fin),
     Normal(Fin),
+}
+
+impl Step {
+    /// Keep a proven rewrite even when another part or reading was incomplete, but
+    /// don't memoize it as the answer to the complete set of questions.
+    fn after(self, prior: Fin) -> Self {
+        match self {
+            Self::Normal(f) => Self::Normal(prior.and(f)),
+            Self::To(e, f) => Self::To(e, prior.and(f)),
+        }
+    }
 }
 
 /// The state of one call.
@@ -2140,10 +2192,7 @@ impl Runner<'_, '_> {
         self.cands = cands;
         // The host rewrites, where no rule applied.
         match r? {
-            Step::Normal(fin) if !host.is_empty() => Ok(match self.try_host(cx, n, host)? {
-                Step::To(t, f) => Step::To(t, fin.and(f)),
-                Step::Normal(f) => Step::Normal(fin.and(f)),
-            }),
+            Step::Normal(fin) if !host.is_empty() => Ok(self.try_host(cx, n, host)?.after(fin)),
             step => Ok(step),
         }
     }
@@ -2554,8 +2603,9 @@ impl Engine {
     ///
     /// A root's work does not depend on the other roots or on the number of threads, so neither
     /// do the results. Unlike [`run`](Self::run) over several roots, sharing between roots is not
-    /// weighed: a node two roots share counts as used by each alone. Observers, allowances and
-    /// deadlines are [`run`](Self::run)'s.
+    /// weighed: a node two roots share counts as used by each alone. Each root also starts
+    /// with a cold MBA answer cache; shared hits must not change which work fits its budget.
+    /// Observers, allowances and deadlines are [`run`](Self::run)'s.
     pub fn run_each(
         &self,
         cx: &mut Context,
@@ -2661,7 +2711,7 @@ impl Engine {
         if let Some(h) = each.hooks {
             run = run.with_hooks(h);
         }
-        let out = self.run(&mut cx, &[x], run)?;
+        let out = self.run_inner(&mut cx, &[x], run, true)?;
         let mut small = fresh();
         let mut root_out = out.roots[0];
         root_out.expr = small.import(&cx, &[root_out.expr])?[0];
@@ -2671,6 +2721,16 @@ impl Engine {
     /// Simplifies `roots` under `run`. Each distinct root is processed once; `roots[i]` of the
     /// outcome answers `roots[i]` of the input.
     pub fn run(&self, cx: &mut Context, roots: &[Expr], run: Run<'_>) -> Result<Outcome, Error> {
+        self.run_inner(cx, roots, run, false)
+    }
+
+    fn run_inner(
+        &self,
+        cx: &mut Context,
+        roots: &[Expr],
+        run: Run<'_>,
+        _independent: bool,
+    ) -> Result<Outcome, Error> {
         let ids = cx.ids(roots)?;
         let inner = &*self.inner;
         let Run {
@@ -2704,6 +2764,10 @@ impl Engine {
             assumptions,
             &ids,
         );
+        #[cfg(feature = "mba")]
+        {
+            runner.mba.independent = _independent;
+        }
         if let Some(o) = runner.observer.as_deref() {
             runner.detail = o.detail();
         }

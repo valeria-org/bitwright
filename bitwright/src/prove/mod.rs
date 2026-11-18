@@ -343,6 +343,12 @@ impl Simplifiers {
         }
     }
 
+    /// Rebuild the configured engines on their next use. The divisions-only engine
+    /// does not read any of these settings and can keep its memo.
+    fn reset_engines(&mut self) {
+        self.engines = Default::default();
+    }
+
     /// Without sums over the basis of small bitwise functions in the engines' linear-MBA
     /// pass and, where the solver is their own, in its answers. A question built of one gives
     /// the search xors and ors where the conjunction form gives it ands: one of a
@@ -351,7 +357,10 @@ impl Simplifiers {
     /// same devirtualizer on another protector) prove as well with them: it is the host's
     /// choice, as in 0.32.1 they are on.
     pub fn with_basis_sums(mut self, on: bool) -> Self {
-        self.basis_sums = on;
+        if self.basis_sums != on {
+            self.basis_sums = on;
+            self.reset_engines();
+        }
         self
     }
 
@@ -361,7 +370,10 @@ impl Simplifiers {
     /// a devirtualizer's walk asked a third of its questions in the same time at 2^16, and as
     /// many as with 0.31 (and fewer that ran slow) at 2^12.
     pub fn with_kept_steps(mut self, steps: u64) -> Self {
-        self.kept_steps = steps;
+        if self.kept_steps != steps {
+            self.kept_steps = steps;
+            self.reset_engines();
+        }
         self
     }
 
@@ -370,7 +382,10 @@ impl Simplifiers {
     /// so which questions are decided before the search.
     #[cfg(feature = "mba")]
     pub fn with_mba(mut self, mba: crate::mba::MbaConfig) -> Self {
-        self.mba = Some(mba);
+        if self.mba != Some(mba) {
+            self.mba = Some(mba);
+            self.reset_engines();
+        }
         self
     }
 
@@ -378,7 +393,14 @@ impl Simplifiers {
     /// of their own.
     #[cfg(feature = "mba")]
     pub fn with_mba_solver(mut self, solver: std::sync::Arc<dyn crate::mba::MbaSolver>) -> Self {
-        self.solver = Some(solver);
+        if self
+            .solver
+            .as_ref()
+            .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &solver))
+        {
+            self.solver = Some(solver);
+            self.reset_engines();
+        }
         self
     }
 
@@ -432,6 +454,36 @@ impl Simplifiers {
                 .build()
                 .unwrap_or_else(|_| crate::engine::Engine::standard())
         })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn reconfiguring_initialized_simplifiers_rebuilds_each_variant() {
+    let variants = [(false, false), (true, false), (false, true)];
+    let engines = Simplifiers::new();
+    for (strict, proved) in variants {
+        assert!(engines.engine(strict, proved).strategy().basis_sums);
+    }
+    let engines = engines.with_basis_sums(false);
+    for (strict, proved) in variants {
+        assert!(!engines.engine(strict, proved).strategy().basis_sums);
+    }
+    let engines = engines.with_kept_steps(42);
+    for (strict, proved) in variants {
+        assert_eq!(engines.engine(strict, proved).strategy().kept_steps, 42);
+    }
+
+    #[cfg(feature = "mba")]
+    {
+        let config = crate::mba::MbaConfig::default().with_noise_forms(true);
+        let engines = engines.with_mba(config);
+        for (strict, proved) in variants {
+            let strategy = engines.engine(strict, proved).strategy();
+            assert!(strategy.phases.contains(&crate::engine::Phase::Mba(config)));
+        }
+        let engines = engines.with_mba_solver(std::sync::Arc::new(crate::mba::SignatureSolver));
+        assert!(engines.engines.iter().all(|slot| slot.get().is_none()));
     }
 }
 

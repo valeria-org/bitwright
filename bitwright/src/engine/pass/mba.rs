@@ -16,19 +16,18 @@ use crate::{BinOp, UnOp};
 /// The MBA phase's state for a call: what it asked, and how deep it goes.
 #[derive(Default)]
 pub(crate) struct State {
-    /// The MBA solver's answers in this call, by question.
-    pub(crate) answers: crate::hash::IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
+    /// Independent roots use private answers: durable hits could change which questions
+    /// fit in another root's budget.
+    pub(crate) independent: bool,
+    /// Complete solver answers and the steps originally spent, by question.
+    answers: crate::hash::IdMap<CacheKey, (MbaAnswer, u64)>,
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     pub(crate) unproved: crate::hash::IdMap<crate::mba::CacheKey, ()>,
     /// Questions the solver ran out of steps on in this call, each with the steps it had (see
     /// `pass::mba::ask`).
     pub(crate) exhausted: crate::hash::IdMap<crate::mba::CacheKey, u64>,
-    /// The roots of fragments the MBA phase asked about in this call and kept as they are:
-    /// `true` when declined by a monotonic size cap, step exhaustion, or `NoSimpler` past
-    /// `KEPT_STEPS` (a larger question would pay for that normal form again), `false` when kept
-    /// locally (`not_smaller` or `proof_unknown`), which only blocks ancestors that do not
-    /// combine the kept core with another branch sharing its atoms.
-    pub(crate) kept: crate::hash::IdMap<u32, bool>,
+    /// Declines of whole (not cut) questions for the current root.
+    pub(crate) kept: crate::hash::IdMap<u32, Hold>,
     /// How deep the MBA phase's own questions go in this round (see `pass::mba::depth`): the
     /// rounds ask within a few steps each until one changes nothing, and only then deeper.
     pub(crate) depth: u8,
@@ -190,20 +189,24 @@ impl certify::Meter for Gate<'_, '_, '_> {
 /// grid, exhaustive evaluation; equal polynomials over symbols first where that test would
 /// take far longer), over abstracted atoms when a side leaves the polynomial fragment. Charged
 /// as pass work, a block at a time, so a budget or deadline can stop it; a certificate larger
-/// than what is left is not started (reported as over budget).
+/// than what is left is not started (reported as over budget). The flag says whether the
+/// gate's private share, rather than the remaining call-wide work, limited this attempt.
 fn exact(
     r: &mut Runner<'_, '_>,
     a: &MbaExpr,
     b: &MbaExpr,
     part: u64,
-) -> Result<certify::Report, Stop> {
+) -> Result<(certify::Report, bool), Stop> {
     let before = r.meter.spent.pass_work;
-    let report = certify::prove(a, b, &mut Gate::new(r, a, b, part))?;
+    let left = r.meter.left_in(|b| b.pass_work);
+    let mut gate = Gate::new(r, a, b, part);
+    let limited_by_share = gate.share < left;
+    let report = certify::prove(a, b, &mut gate)?;
     if report.verdict != crate::mba::Verdict::Proved {
         r.mba.missed += r.meter.spent.pass_work - before;
     }
     count(r).certificates.record(&report);
-    Ok(report)
+    Ok((report, limited_by_share))
 }
 
 fn count<'x>(r: &'x mut Runner<'_, '_>) -> &'x mut crate::engine::MbaStats {
@@ -3085,16 +3088,13 @@ fn step_with(
         return Ok(Step::Normal(Fin::FINAL));
     }
     let unshrunk = count(r).not_smaller;
-    let held = count(r).unsupported;
-    let out = ask(r, cx, cfg, n, n, None, depth(r))?;
-    // Whether the question was not one the solver answers whole: it holds a fragment kept
-    // as it is (see `holds_kept`), or the solver declined it for its size.
-    let held = count(r).unsupported != held;
+    let mut held = false;
+    let out = ask_with(r, cx, cfg, n, n, None, depth(r), &mut held)?;
     // An answer that was not smaller for what the fragment shares with others is no answer
     // either: the readings below keep a shared value as it is.
     let unshrunk = count(r).not_smaller != unshrunk;
     if let Step::Normal(fin) = out
-        && (fin.done || unshrunk)
+        && (fin.done || unshrunk || held)
     {
         // a fragment that reads slices of one rotated value, asked again with them
         // written as masks of that rotation (see [`sliced`]), within the steps of a retried
@@ -3102,14 +3102,8 @@ fn step_with(
         // without the limit thirteen that took the node's own share left eleven of those
         // questions out of steps.
         let before = cx.len() as u32;
-        // What a question asked another way declines for what the fragment shares
-        // contributes to the result (see the linear pass's `step`). Not where it ran out of
-        // the steps or the certificate share it is given: those are its own by design (see
-        // [`Cap::Steps`]), and its answer within them is what it is.
-        let kept = |fin: Fin, f: Fin| match f.why {
-            None => fin.and(f),
-            Some(_) => fin,
-        };
+        // `ask` distinguishes a retry's fixed step limit from a shortfall in
+        // the call. Keep all call-wide caps, including ones from alternate readings.
         let mut fin = fin;
         let asked = (n, cfg.limits.max_nodes);
         let mut slices = match r.mba.sliced.get(&asked).copied() {
@@ -3123,8 +3117,8 @@ fn step_with(
         };
         if let Some(root) = slices {
             match ask(r, cx, cfg, n, root, None, Cap::Steps(CUT_STEPS))? {
-                Step::Normal(f) => fin = kept(fin, f),
-                again => return Ok(again),
+                Step::Normal(f) => fin = fin.and(f),
+                again => return Ok(again.after(fin)),
             }
             // The fragment over that rotation is the answer where writing it made it smaller
             // and left the solver no question: `(x >>u 57 & 0x74) - (rotl(x, 7) & 0x74)` is
@@ -3132,10 +3126,10 @@ fn step_with(
             // fragment to ask about.
             match sliced_itself(r, cx, cfg, n, root, before)? {
                 Some(Step::Normal(f)) => {
-                    fin = kept(fin, f);
+                    fin = fin.and(f);
                     slices = None;
                 }
-                Some(to) => return Ok(to),
+                Some(to) => return Ok(to.after(fin)),
                 None => {}
             }
         }
@@ -3158,8 +3152,8 @@ fn step_with(
                 Some(Reading::Shallow),
                 Cap::Steps(CUT_STEPS),
             )? {
-                Step::Normal(f) => fin = kept(fin, f),
-                again => return Ok(again),
+                Step::Normal(f) => fin = fin.and(f),
+                again => return Ok(again.after(fin)),
             }
         }
         // And with a value most of its terms read cut off as one atom: an obfuscator writes
@@ -3177,8 +3171,8 @@ fn step_with(
                     Some(Reading::Cut(c)),
                     Cap::Steps(CUT_STEPS),
                 )? {
-                    Step::Normal(f) => fin = kept(fin, f),
-                    again => return Ok(again),
+                    Step::Normal(f) => fin = fin.and(f),
+                    again => return Ok(again.after(fin)),
                 }
             }
         }
@@ -3198,8 +3192,8 @@ fn step_with(
                     Some(Reading::CutWhole(c)),
                     Cap::Steps(CUT_STEPS),
                 )? {
-                    Step::Normal(f) => fin = kept(fin, f),
-                    again => return Ok(again),
+                    Step::Normal(f) => fin = fin.and(f),
+                    again => return Ok(again.after(fin)),
                 }
             }
         }
@@ -3249,10 +3243,7 @@ pub(super) fn step_cofactor(
         Step::Normal(f) => f,
         to => return Ok(to),
     };
-    Ok(match ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))? {
-        Step::Normal(f) => Step::Normal(fin.and(f)),
-        to => to,
-    })
+    Ok(ask(r, cx, cfg, n, n, None, Cap::Steps(CUT_STEPS))?.after(fin))
 }
 
 /// The steps a question takes at most, besides the call's share (see [`SOLVE_SHARE`]).
@@ -3729,140 +3720,130 @@ fn sliced_itself(
     Ok(Some(out))
 }
 
-/// Whether the fragment under `root` holds, below `root`, one the MBA phase asked about in
-/// this call and kept as it is (`Runner::mba_kept`): the solver declined it for its size (too
-/// many atoms, variables or bit classes), ran out of steps on it, or spent `KEPT_STEPS` or more
-/// finding it had no simpler form, which keeps every larger fragment back; or its answer would
-/// not have made the DAG smaller, or the gate could not prove it, which keeps back only a
-/// `root` that wraps it alone (no other branch of `root` reads one of its atoms, where the two
-/// could cancel when solved whole: `core − core'`). The larger fragment is then not asked. It has as many
-/// atoms as the one inside it; the solver would pay for the inner fragment's normal form
-/// again, at a cost that grows with the fragment; and what kept the inner answer back (its
-/// nodes are shared, its normal form is as large, no certificate decides it) keeps back an
-/// answer that holds it. An obfuscated value read by a chain of operations asks once at the
-/// first of them where it asked at every one (27 questions of 820 nodes in one measured
-/// question, 310,000 steps each, half the run's steps), and so do fragments that share a core
-/// whose answer was no smaller (five of 110 to 197 nodes in another, 2.5 million steps and no
-/// rewrite). `root` itself is asked again: the call remembers its answer, and what kept it
-/// back may be gone in a later round.
-///
-/// One whose question ran out of steps at this round's depth (`Runner::mba_shallow`) keeps the
-/// larger fragment back for the round only: [`Kept::Shallow`], where nothing below is kept
-/// for the call.
-fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, bindings: &Bindings) -> Option<Kept> {
-    if r.mba.kept.is_empty() && r.mba.shallow.is_empty() {
+/// What kind of larger question an earlier decline suppresses.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum Hold {
+    /// An unproved answer or cost rejection; only suppress isolated wrappers.
+    Isolated,
+    /// An expensive complete "no simpler". Probe a shared-atom parent cheaply;
+    /// don't spend the full price of the normal form again before trying cuts.
+    Expensive,
+    /// A whole reading exhausted a retry's private allocation, not the call's.
+    RetryLimit,
+    /// Size limits grow monotonically with the whole fragment.
+    Size,
+    /// The solver needed more steps. Propagate the reason rather than memoizing the parent.
+    Steps,
+}
+
+fn hold(r: &mut Runner<'_, '_>, root: u32, whole: bool, why: Hold) {
+    if whole {
+        let h = r.mba.kept.entry(root).or_insert(why);
+        *h = (*h).max(why);
+    }
+}
+
+/// Only interior nodes of the *actual reading* count. In particular `a = t+k` can
+/// replace `t` by `a-k`: a former descendant of `t` is not thereby inside this question.
+fn holds_kept(r: &Runner<'_, '_>, cx: &Context, root: u32, b: &Bindings) -> Option<Kept> {
+    let candidates = &b.interior[..b.interior.len() - 1];
+    debug_assert_eq!(b.interior.last(), Some(&root));
+    if (r.mba.kept.is_empty() && r.mba.shallow.is_empty())
+        || !candidates
+            .iter()
+            .any(|i| r.mba.kept.contains_key(i) || r.mba.shallow.contains_key(i))
+    {
         return None;
     }
+    #[derive(Copy, Clone, Default)]
+    struct Region {
+        below: u64,
+        outside: u64,
+        cut: bool,
+    }
+    // A bit fingerprints an atom. Collisions (more than 64 atoms), reconvergent
+    // paths and rebased operands may cause an extra question, never a false hold.
+    // Each edge is examined a bounded number of times regardless of the number
+    // of kept cores. `outside` includes every atom reachable on a bypass path.
+    let mut slot = super::Lease::new(cx.len());
+    let mut regions = Vec::with_capacity(b.atoms.len() + b.interior.len());
+    for (k, &a) in b.atoms.iter().enumerate() {
+        slot.insert(a, k as u32);
+        regions.push(Region {
+            below: 1 << (k % 64),
+            outside: 0,
+            cut: crate::mba::cuts(cx, a),
+        });
+    }
+    // A missing operand is the offset of a cut atom. Its old inputs are not
+    // visited. Conservatively assume it might use any atom of this reading.
+    let rebased = Region {
+        below: u64::MAX,
+        outside: 0,
+        cut: true,
+    };
     let mut found = None;
-    let mut local_kept: Vec<u32> = Vec::new();
-    let mut seen = super::Lease::new(cx.len());
-    for &a in &bindings.atoms {
-        seen.insert(a, 0);
+    let mut local = false;
+    let mut expensive = false;
+    for &i in &b.interior {
+        let mut here = Region::default();
+        for c in cx.node(i).children() {
+            let child = slot.get(c).map_or(rebased, |s| regions[s as usize]);
+            here.below |= child.below;
+            here.cut |= child.cut;
+        }
+        if i != root && !here.cut {
+            match r.mba.kept.get(&i) {
+                Some(Hold::Steps) => return Some(Kept::Whole(Hold::Steps)),
+                Some(Hold::Size) => found = Some(Kept::Whole(Hold::Size)),
+                Some(Hold::RetryLimit) => found = Some(Kept::Whole(Hold::RetryLimit)),
+                Some(Hold::Expensive) => {
+                    local = true;
+                    expensive = true;
+                }
+                Some(Hold::Isolated) => local = true,
+                None if found.is_none() && r.mba.shallow.contains_key(&i) => {
+                    found = Some(Kept::Shallow);
+                }
+                None => {}
+            }
+        }
+        slot.insert(i, regions.len() as u32);
+        regions.push(here);
     }
-    let mut stack: Vec<u32> = cx.node(root).children().collect();
-    while let Some(i) = stack.pop() {
-        if seen.insert(i, 0) {
-            continue;
-        }
-        if let Some(&hard) = r.mba.kept.get(&i) {
-            if hard {
-                return Some(Kept::Whole);
-            }
-            local_kept.push(i);
-        }
-        if r.mba.shallow.contains_key(&i) {
-            found = Some(Kept::Shallow);
-        }
-        stack.extend(cx.node(i).children());
+    if !local || matches!(found, Some(Kept::Whole(_))) {
+        return found;
     }
-    if !local_kept.is_empty() {
-        // A locally kept sub-fragment (`not_smaller`, `proof_unknown`) only keeps `root` back
-        // when `root` is an isolated wrapper over it: no atom of `i` is reachable from `root`
-        // bypassing `i`. Where another branch of `root` reads one, the two branches can cancel
-        // or shrink together when solved whole.
-        //
-        // One walk gives every interior node a slot: the atoms below it (bit `k` for
-        // `bindings.atoms[k]`, the first 64) and its users here. The atoms reachable bypassing
-        // `i` are those below the operands of `i`'s users (up to `root`) that do not lead to
-        // `i`, so each kept fragment reads its users, not the whole fragment again.
-        let mut atom_idx = super::Lease::new(cx.len());
-        for (idx, &a) in bindings.atoms.iter().enumerate() {
-            atom_idx.insert(a, idx as u32);
+    for (s, &i) in b.interior.iter().enumerate().rev() {
+        let here = regions[b.atoms.len() + s];
+        if i != root
+            && !here.cut
+            && here.below & here.outside == 0
+            && matches!(r.mba.kept.get(&i), Some(Hold::Isolated | Hold::Expensive))
+        {
+            return Some(Kept::Whole(Hold::Isolated));
         }
-        let mut slot = super::Lease::new(cx.len());
-        let (mut nodes, mut below) = (Vec::<u32>::new(), Vec::<u64>::new());
-        let atoms_of = |c: u32, slot: &super::Lease, below: &[u64]| match atom_idx.get(c) {
-            Some(k) if k < 64 => 1u64 << k,
-            Some(_) => 0,
-            None => slot.get(c).map_or(0, |s| below[s as usize]),
-        };
-        // (In post-order: a node is left once every operand has been.)
-        let mut walk = vec![(root, false)];
-        while let Some((x, left)) = walk.pop() {
-            if left {
-                let m = (cx.node(x).children()).fold(0, |m, c| m | atoms_of(c, &slot, &below));
-                if let Some(s) = slot.get(x) {
-                    below[s as usize] = m;
+        for c in cx.node(i).children() {
+            if let Some(s) = slot.get(c) {
+                let mut outside = here.outside;
+                for other in cx.node(i).children().filter(|&other| other != c) {
+                    outside |= slot
+                        .get(other)
+                        .map_or(rebased.below, |s| regions[s as usize].below);
                 }
-                continue;
-            }
-            if slot.get(x).is_some() {
-                continue;
-            }
-            slot.insert(x, nodes.len() as u32);
-            nodes.push(x);
-            below.push(0);
-            walk.push((x, true));
-            let operands = cx.node(x).children().filter(|&c| atom_idx.get(c).is_none());
-            walk.extend(operands.map(|c| (c, false)));
-        }
-        let mut users: Vec<Vec<u32>> = vec![Vec::new(); nodes.len()];
-        for &x in &nodes {
-            for c in cx.node(x).children() {
-                if let Some(s) = slot.get(c) {
-                    users[s as usize].push(x);
-                }
-            }
-        }
-        for i in local_kept {
-            let Some(si) = slot.get(i) else {
-                continue;
-            };
-            let inner = below[si as usize];
-            // `i`'s users up to `root`, each once.
-            let mut up = super::Lease::new(cx.len());
-            let (mut todo, mut ancestors) = (vec![si], Vec::new());
-            while let Some(s) = todo.pop() {
-                for &u in &users[s as usize] {
-                    if !up.insert(u, 0)
-                        && let Some(su) = slot.get(u)
-                    {
-                        ancestors.push(u);
-                        todo.push(su);
-                    }
-                }
-            }
-            let mut outer = 0u64;
-            for &u in &ancestors {
-                for c in cx.node(u).children() {
-                    if c != i && up.get(c).is_none() {
-                        outer |= atoms_of(c, &slot, &below);
-                    }
-                }
-            }
-            if outer & inner == 0 {
-                return Some(Kept::Whole);
+                regions[s as usize].outside |= outside;
             }
         }
     }
-    found
+    found.or_else(|| expensive.then_some(Kept::Probe))
 }
 
 /// What [`holds_kept`] found below a fragment's root.
 enum Kept {
-    /// A fragment kept as it is for the call.
-    Whole,
-    /// One whose question a deeper round asks again.
+    Whole(Hold),
+    /// Another branch shares atoms with a costly core: it may cancel cheaply.
+    Probe,
+    /// A question a deeper round asks again.
     Shallow,
 }
 
@@ -3899,6 +3880,22 @@ fn ask(
     root: u32,
     reading: Option<Reading>,
     cap: Cap,
+) -> Result<Step, Stop> {
+    ask_with(r, cx, cfg, n, root, reading, cap, &mut false)
+}
+
+/// `retry_as_atoms` tells the primary question's caller to keep the alternate
+/// readings eligible even when a shared-core probe, not a hard hold, was tried.
+#[allow(clippy::too_many_arguments)]
+fn ask_with(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    root: u32,
+    reading: Option<Reading>,
+    cap: Cap,
+    retry_as_atoms: &mut bool,
 ) -> Result<Step, Stop> {
     let poly = r.inner.mba.solver.polynomial_fragments();
     // The whole fragment, or a narrower reading of it: semi-linear with a node cut off as
@@ -3939,17 +3936,33 @@ fn ask(
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, u64::from(shape.nodes))?;
-    // (Not the reading over atoms where it is another question than the whole fragment's: it
-    // is asked where that one is not, within the steps of a retried question, and what made
-    // the fragment it holds costly is arithmetic this reading does not look into.)
-    let kept = match reading {
-        Some(Reading::Shallow) if crate::mba::cuts(cx, &bindings) => None,
-        _ => holds_kept(r, cx, root, &bindings),
+    let whole = reading.is_none() || !bindings.atoms.iter().any(|&a| crate::mba::cuts(cx, a));
+    let kept = if reading == Some(Reading::Shallow) && !whole {
+        None // The alternate question deliberately skips the costly arithmetic.
+    } else {
+        holds_kept(r, cx, root, &bindings)
     };
-    match kept {
-        Some(Kept::Whole) => {
+    let probe = matches!(kept, Some(Kept::Probe));
+    let cap = match kept {
+        Some(Kept::Probe) => {
+            *retry_as_atoms = true;
+            // Ask whether the shared atoms cancel without repeatedly buying
+            // the expensive inner normal form. Even the smallest threshold
+            // admits a small signature question. Keep cheap cut retries too.
+            let probe = r.inner.strategy.kept_steps.clamp(32, CUT_STEPS);
+            Cap::Steps(match cap {
+                Cap::Depth(s) | Cap::Steps(s) => probe.min(s),
+            })
+        }
+        Some(Kept::Whole(why)) => {
+            *retry_as_atoms = true;
             count(r).unsupported += 1;
-            return Ok(Step::Normal(Fin::FINAL));
+            return Ok(Step::Normal(if why == Hold::Steps {
+                Fin::capped(Exhausted::MbaSteps)
+            } else {
+                // Depends on what this root asked first; not a durable answer.
+                Fin::PROVISIONAL
+            }));
         }
         // No smaller a question than the one inside it that ran out of steps at this round's
         // depth: asked when that one has been.
@@ -3957,8 +3970,8 @@ fn ask(
             r.mba.deeper = true;
             return Ok(Step::Normal(Fin::PROVISIONAL));
         }
-        None => {}
-    }
+        None => cap,
+    };
     let inner = r.inner;
     let prover_id = inner.mba.prover.as_ref().map_or("", |p| p.id());
     // The question's content hash, once (it hashes every node).
@@ -3980,15 +3993,20 @@ fn ask(
     // An answer the gate could not prove earlier in this call (not for lack of budget): the
     // same question would get the same answer and the same verdict.
     if r.mba.unproved.contains_key(&key) {
+        hold(r, root, whole, Hold::Isolated);
         return Ok(Step::Normal(Fin::FINAL));
     }
     // What vouched for the answer (for an explanation): an answer from the cache was proved
     // when it was found.
     let mut evidence: (&'static str, Option<&'static str>, u64) = ("cache", None, 0);
     // The answer, and where it was lifted if it already was.
-    let (cand, lifted) = match inner.mba.cache.get(&key) {
-        Some(CacheEntry::NoSimpler) => {
+    let cache = (!r.mba.independent).then_some(&*inner.mba.cache);
+    let (cand, lifted) = match cache.and_then(|c| c.get(&key)) {
+        Some(CacheEntry::NoSimpler { steps }) => {
             count(r).cache_hits += 1;
+            if steps >= inner.strategy.kept_steps {
+                hold(r, root, whole, Hold::Expensive);
+            }
             return Ok(Step::Normal(Fin::FINAL));
         }
         Some(CacheEntry::Simplified(e)) if e.vars() == m.vars() => {
@@ -3998,7 +4016,7 @@ fn ask(
         _ => {
             // A question asked earlier in this call whose answer was not committed then (not
             // smaller, say): the same answer (every answer but running short is complete).
-            let answer = match r.mba.answers.get(&key).cloned() {
+            let (answer, spent) = match r.mba.answers.get(&key).cloned() {
                 Some(a) => {
                     count(r).cache_hits += 1;
                     a
@@ -4028,15 +4046,28 @@ fn ask(
                     // Whether a deeper round asks this question with more steps than it has
                     // here: running out of these is not the call's budget running out.
                     let shallow = deepens && limit == steps;
-                    if limit == 0 || r.mba.exhausted.get(&key).is_some_and(|&l| limit <= l) {
+                    let local = matches!(cap, Cap::Steps(_)) && limit == steps;
+                    let exhausted = |r: &mut Runner<'_, '_>| {
                         count(r).exhausted += 1;
                         if shallow {
-                            r.mba.shallow.insert(root, ());
+                            if whole {
+                                r.mba.shallow.insert(root, ());
+                            }
                             r.mba.deeper = true;
-                            return Ok(Step::Normal(Fin::PROVISIONAL));
+                            Fin::PROVISIONAL
+                        } else if local {
+                            // Fixed retry cap, not a shortfall in the call.
+                            if !probe && !r.mba.shallow.contains_key(&root) {
+                                hold(r, root, whole, Hold::RetryLimit);
+                            }
+                            Fin::PROVISIONAL
+                        } else {
+                            if limit != 0 {
+                                hold(r, root, whole, Hold::Steps);
+                            }
+                            Fin::capped(Exhausted::MbaSteps)
                         }
-                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
-                    }
+                    };
                     // Out of calls, as out of steps: the question is not asked, and the rest of
                     // the call (the passes after this phase, the later rounds) goes on within
                     // its own limits. Stopping the call here left a question the prover
@@ -4045,6 +4076,9 @@ fn ask(
                     if r.meter.left_in(|b| b.mba_calls) == 0 {
                         count(r).exhausted += 1;
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
+                    }
+                    if limit == 0 || r.mba.exhausted.get(&key).is_some_and(|&l| limit <= l) {
+                        return Ok(Step::Normal(exhausted(r)));
                     }
                     r.meter.charge(Counter::MbaCalls, 1)?;
                     count(r).calls += 1;
@@ -4059,35 +4093,10 @@ fn ask(
                     r.meter.charge(Counter::MbaSteps, spent)?;
                     if a == MbaAnswer::Exhausted {
                         r.mba.exhausted.insert(key, limit);
-                        if shallow {
-                            count(r).exhausted += 1;
-                            r.mba.shallow.insert(root, ());
-                            r.mba.deeper = true;
-                            return Ok(Step::Normal(Fin::PROVISIONAL));
-                        }
-                        // A fragment that holds this one is no smaller a question.
-                        r.mba.kept.insert(root, true);
+                        return Ok(Step::Normal(exhausted(r)));
                     }
-                    if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
-                        // Run short within what the account left it: more budget might
-                        // decide.
-                        count(r).exhausted += 1;
-                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
-                    }
-                    if a != MbaAnswer::Exhausted {
-                        r.mba.answers.insert(key, a.clone());
-                    }
-                    let kept = match &a {
-                        MbaAnswer::Unsupported(why) => why.starts_with("too many").then_some(true),
-                        MbaAnswer::NoSimpler => {
-                            (spent >= r.inner.strategy.kept_steps).then_some(true)
-                        }
-                        _ => None,
-                    };
-                    if let Some(hard) = kept {
-                        r.mba.kept.insert(root, hard);
-                    }
-                    a
+                    r.mba.answers.insert(key, (a.clone(), spent));
+                    (a, spent)
                 }
             };
             match answer {
@@ -4109,7 +4118,7 @@ fn ask(
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
-                        r.mba.kept.insert(root, false);
+                        hold(r, root, whole, Hold::Isolated);
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
                         discard(r, cx, before);
@@ -4123,7 +4132,7 @@ fn ask(
                         true => RETRY_GATE_SHARE,
                         false => GATE_SHARE,
                     };
-                    let own = exact(r, &m, &expr, part)?;
+                    let (own, limited_by_share) = exact(r, &m, &expr, part)?;
                     if own.verdict == Verdict::Refuted {
                         count(r).refuted += 1;
                         discard(r, cx, before);
@@ -4157,34 +4166,42 @@ fn ask(
                         // A certificate skipped for lack of budget might decide with more:
                         // not final.
                         let fin = if own.over_budget {
-                            Fin::capped(Exhausted::PassWork)
+                            if limited_by_share && matches!(cap, Cap::Steps(_)) {
+                                Fin::PROVISIONAL
+                            } else {
+                                Fin::capped(Exhausted::PassWork)
+                            }
                         } else {
                             r.mba.unproved.insert(key, ());
-                            r.mba.kept.insert(root, false);
+                            hold(r, root, whole, Hold::Isolated);
                             Fin::FINAL
                         };
                         return Ok(Step::Normal(fin));
                     }
-                    inner
-                        .mba
-                        .cache
-                        .put(&key, &CacheEntry::Simplified(expr.clone()));
+                    if let Some(cache) = cache {
+                        cache.put(&key, &CacheEntry::Simplified(expr.clone()));
+                    }
                     (expr, Some((e, before)))
                 }
                 MbaAnswer::NoSimpler => {
                     count(r).no_simpler += 1;
-                    inner.mba.cache.put(&key, &CacheEntry::NoSimpler);
+                    if spent >= inner.strategy.kept_steps {
+                        hold(r, root, whole, Hold::Expensive);
+                    }
+                    if let Some(cache) = cache {
+                        cache.put(&key, &CacheEntry::NoSimpler { steps: spent });
+                    }
                     return Ok(Step::Normal(Fin::FINAL));
                 }
-                MbaAnswer::Unsupported(_) => {
+                MbaAnswer::Unsupported(why) => {
+                    *retry_as_atoms = true;
+                    if why.starts_with("too many") {
+                        hold(r, root, whole, Hold::Size);
+                    }
                     count(r).unsupported += 1;
                     return Ok(Step::Normal(Fin::FINAL));
                 }
-                MbaAnswer::Exhausted => {
-                    count(r).exhausted += 1;
-                    // More budget might succeed: not final.
-                    return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
-                }
+                MbaAnswer::Exhausted => unreachable!("exhausted answers are never cached"),
             }
         }
     };
@@ -4225,7 +4242,126 @@ fn ask(
         count(r).simplified += 1;
     } else if e != n {
         count(r).not_smaller += 1;
-        r.mba.kept.insert(root, false);
+        hold(r, root, whole, Hold::Isolated);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+    use crate::engine::budget::Meter;
+    use crate::engine::{Budget, Engine, Phase, Strategy};
+    use crate::mba::{MbaLimits, MemoryCache, SignatureSolver};
+    use crate::{ParseOptions, Width};
+    use std::sync::Arc;
+
+    fn engine(steps: u64, cache: Arc<MemoryCache>) -> Engine {
+        Engine::builder()
+            .strategy(
+                Strategy::new("containment", vec![Phase::Mba(MbaConfig::default())])
+                    .with_kept_steps(steps),
+            )
+            .mba_solver(Arc::new(SignatureSolver))
+            .mba_cache(cache)
+            .build()
+            .unwrap()
+    }
+
+    fn runner(e: &Engine, root: u32) -> Runner<'_, 'static> {
+        Runner::new(
+            &e.inner,
+            Meter::new(Budget::default(), None),
+            None,
+            None,
+            None,
+            &[root],
+        )
+    }
+
+    fn parse(cx: &mut Context, text: &str) -> u32 {
+        let e = cx.parse(text, &ParseOptions::width(Width::W32)).unwrap();
+        cx.id(e).unwrap()
+    }
+
+    #[test]
+    fn cached_cost_uses_the_current_threshold_and_only_skips_isolated_wrappers() {
+        let cache = Arc::new(MemoryCache::new(64));
+        let mut cx = Context::new();
+        let inner = parse(&mut cx, "(x ^ y) + (x & y)");
+        let isolated = parse(&mut cx, "((x ^ y) + (x & y)) - z");
+        let shared = parse(&mut cx, "((x ^ y) + (x & y)) - (x | y)");
+        let zero = parse(&mut cx, "0");
+        let cfg = MbaConfig::default();
+        let (_, b) = lower_id(&cx, isolated, &cfg.limits).unwrap();
+        let cap = Cap::Depth(4096);
+        // SignatureSolver needs one step for the inner question. Reuse its complete
+        // answer across engines with different host thresholds, without re-solving it.
+        for (steps, hits) in [(1, 0), (1, 1), (2, 1)] {
+            let eng = engine(steps, cache.clone());
+            let mut r = runner(&eng, shared);
+            assert!(matches!(
+                ask(&mut r, &mut cx, &cfg, inner, inner, None, cap),
+                Ok(Step::Normal(_))
+            ));
+            assert_eq!(r.stats.mba.cache_hits, hits);
+            assert_eq!(holds_kept(&r, &cx, isolated, &b).is_some(), steps == 1);
+            assert!(
+                matches!(ask(&mut r, &mut cx, &cfg, shared, shared, None, cap), Ok(Step::To(i, _)) if i == zero)
+            );
+        }
+    }
+
+    #[test]
+    fn sixty_fifth_atom_shared_with_a_kept_core_is_not_isolated() {
+        let mut cx = Context::new();
+        let core = parse(&mut cx, "3 * (s ^ 23)");
+        let s = parse(&mut cx, "s");
+        let others = (0..64)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let root = parse(&mut cx, &format!("3 * (s ^ 23) - (s - ({others}))"));
+        let (_, b) = lower_id(&cx, root, &MbaLimits::default().with_max_vars(65)).unwrap();
+        assert_eq!(b.atoms[64], s);
+        let eng = engine(1, Arc::new(MemoryCache::new(64)));
+        let mut r = runner(&eng, root);
+        r.mba.kept.insert(core, Hold::Isolated);
+        assert!(holds_kept(&r, &cx, root, &b).is_none());
+        r.mba.kept.insert(core, Hold::Size);
+        assert!(matches!(
+            holds_kept(&r, &cx, root, &b),
+            Some(Kept::Whole(Hold::Size))
+        ));
+    }
+
+    #[test]
+    fn rebased_cut_does_not_contain_the_old_operands_descendants() {
+        let mut cx = Context::new();
+        let inner = parse(&mut cx, "(x ^ y) + z");
+        let a = parse(&mut cx, "3 * ((x ^ y) + z) + 1");
+        let core = parse(&mut cx, "~(3 * ((x ^ y) + z) + 1) + 3 * ((x ^ y) + z)");
+        let b = parse(&mut cx, "b");
+        let p = cx.c_bin(BinOp::Xor, a, b).unwrap();
+        let left = cx.c_bin(BinOp::Add, core, p).unwrap();
+        let root = cx.c_bin(BinOp::Sub, left, p).unwrap();
+        let minus_two = parse(&mut cx, "-2");
+        let cfg = MbaConfig::default();
+        assert!(shared_nodes(&cx, root, &cfg.limits, CUTS, &Default::default()).contains(&a));
+        let eng = engine(1, Arc::new(MemoryCache::new(64)));
+        let mut r = runner(&eng, root);
+        r.mba.kept.insert(inner, Hold::Steps);
+        // In this reading, 3*inner is a-1. SignatureSolver and the evidence gate agree
+        // that ~a + (a-1) = -2. The old hard decline is not part of this question.
+        let out = ask(
+            &mut r,
+            &mut cx,
+            &cfg,
+            root,
+            root,
+            Some(Reading::Cut(a)),
+            Cap::Steps(4096),
+        );
+        assert!(matches!(out, Ok(Step::To(i, _)) if i == minus_two));
+    }
 }
