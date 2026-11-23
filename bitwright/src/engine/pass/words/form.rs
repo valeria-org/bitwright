@@ -10,8 +10,10 @@
 
 use super::int::Int;
 use core::cmp::Ordering;
+use core::hash::BuildHasher;
+use hashbrown::HashTable;
 
-use crate::hash::{IdMap, combine};
+use crate::hash::{IdBuild, IdMap, combine};
 
 pub(super) type AtomId = u32;
 pub(super) type FormId = u32;
@@ -295,7 +297,9 @@ pub(super) struct Algebra {
     ids: IdMap<Atom, AtomId>,
     forms: Vec<Form>,
     hashes: Vec<u64>,
-    form_ids: IdMap<Form, FormId>,
+    /// The lookup hash is independent of the structural order. Keep the only copy of the
+    /// terms in `forms`; growing the table moves just a hash and an index.
+    form_ids: HashTable<(u64, FormId)>,
     /// Bounds of forms found, with the depth of the search they were found at.
     found: IdMap<Form, (Iv, u8)>,
     /// Bounds of forms given (see `bound`).
@@ -393,7 +397,11 @@ impl Algebra {
     }
 
     pub(super) fn intern(&mut self, f: &Form) -> R<FormId> {
-        if let Some(&i) = self.form_ids.get(f) {
+        let hash = IdBuild.hash_one(f);
+        if let Some(&(_, i)) = self
+            .form_ids
+            .find(hash, |&(_, i)| self.forms[i as usize] == *f)
+        {
             return Ok(i);
         }
         if self.forms.len() >= MAX_ATOMS {
@@ -402,7 +410,7 @@ impl Algebra {
         let i = self.forms.len() as FormId;
         self.hashes.push(self.hash_of(f));
         self.forms.push(f.clone());
-        self.form_ids.insert(f.clone(), i);
+        self.form_ids.insert_unique(hash, (hash, i), |&(h, _)| h);
         Ok(i)
     }
 

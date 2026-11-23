@@ -359,6 +359,100 @@ pub(in crate::engine) fn form_of(
         .expect("the root's form was just computed"))
 }
 
+/// Low `bits` of `x`, when fixed, including any reliance on scoped facts.
+fn fixed_low(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    bits: u16,
+) -> Result<Option<(BitVec, Fin)>, Stop> {
+    let (facts, fin) = super::known(r, cx, x)?;
+    let Some(facts) = facts else { return Ok(None) };
+    let mask = crate::facts::known::low_mask(cx.width_of(x), u32::from(bits));
+    Ok((crate::facts::known::bv_and(&facts.known(), &mask) == mask)
+        .then(|| (crate::facts::known::bv_and(&facts.known_one(), &mask), fin)))
+}
+
+/// Scaling a right shift by a multiple of 2^j discards the same wrapped
+/// bits as scaling a right rotation. Both are `(k >> j) * (x - low_j(x))`.
+fn scaled_high(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    atom: u32,
+    k: &BitVec,
+) -> Result<Option<Form>, Stop> {
+    use crate::facts::known::{bv_lshr, trailing_zeros};
+    let n = cx.node(atom);
+    let w = u64::from(n.width);
+    let (x, shift) = match n.op {
+        OpCode::RotL | OpCode::RotR | OpCode::LShr => {
+            let Some(j) = cx.const_val(n.b).and_then(|x| x.to_u64()) else {
+                return Ok(None);
+            };
+            let shift = match n.op {
+                OpCode::RotL => (w - j % w) % w,
+                OpCode::RotR => j % w,
+                _ => j,
+            };
+            (n.a, shift)
+        }
+        OpCode::Zext => {
+            let field = cx.node(n.a);
+            if field.op != OpCode::Extract || cx.wid(field.a) != n.width
+                || field.b + u32::from(field.width) != u32::from(n.width)
+            {
+                return Ok(None);
+            }
+            (field.a, u64::from(field.b))
+        }
+        _ => return Ok(None),
+    };
+    if shift == 0 || shift >= w || k.is_zero() || shift > u64::from(trailing_zeros(k)) {
+        return Ok(None);
+    }
+    let Some((lo, fin)) = fixed_low(r, cx, x, shift as u16)? else {
+        return Ok(None);
+    };
+    let q = bv_lshr(k, shift as u32);
+    let bias = BitVec::un_unchecked(UnOp::Neg, &BitVec::bin_unchecked(BinOp::Mul, &lo, &q));
+    Ok(Some(Form { konst: bias, terms: vec![(x, q)], fin }))
+}
+
+/// In `concat(h + Σ c_i·high(x_i), low)`, the implicit left shift cancels
+/// each extraction. Narrow additions and products may wrap: that wrap
+/// becomes a multiple of 2^W in the result.
+fn aligned_concat(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    mut hi: Form,
+    low: &BitVec,
+    w: crate::Width,
+) -> Result<Option<Form>, Stop> {
+    let j = low.width().bits();
+    if hi.terms.is_empty() || hi.terms.iter().any(|&(i, _)| {
+        let n = cx.node(i);
+        n.op != OpCode::Extract || n.b != u32::from(j) || cx.width_of(n.a) != w
+    }) {
+        return Ok(None);
+    }
+    hi.konst = BitVec::concat(&hi.konst, low).expect("original concat width");
+    for (atom, coeff) in &mut hi.terms {
+        let x = cx.node(*atom).a;
+        let Some((lo, fin)) = fixed_low(r, cx, x, j)? else {
+            return Ok(None);
+        };
+        hi.fin = hi.fin.and(fin);
+        *atom = x;
+        *coeff = coeff.sext(w).expect("wider concat");
+        let correction = BitVec::bin_unchecked(BinOp::Mul, &lo, coeff);
+        hi.konst = BitVec::bin_unchecked(BinOp::Sub, &hi.konst, &correction);
+    }
+    // Different high fields with the same width and offset have different
+    // sources (the context interns extracts). Only the ordering changes.
+    hi.terms.sort_unstable_by_key(|t| t.0);
+    Ok(Some(hi))
+}
+
 /// The form of `i` from its operands' (cached) forms, and whether terms met in it (see
 /// [`sum_of`]).
 fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bool), Stop> {
@@ -385,8 +479,8 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
             f
         }
         OpCode::Mul => match (cx.const_val(node.a), cx.const_val(node.b)) {
-            (Some(k), _) => get(r, node.b).scale(&k),
-            (_, Some(k)) => get(r, node.a).scale(&k),
+            (Some(k), _) => scaled_high(r, cx, node.b, &k)?.unwrap_or_else(|| get(r, node.b).scale(&k)),
+            (_, Some(k)) => scaled_high(r, cx, node.a, &k)?.unwrap_or_else(|| get(r, node.a).scale(&k)),
             _ => Form::atom(i, w),
         },
         OpCode::Shl => match cx.const_val(node.b) {
@@ -394,7 +488,7 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
                 let one = BitVec::one(w);
                 // A count of W or more gives 0, and so does the scaling (2^k mod 2^W).
                 let scale = BitVec::bin_unchecked(BinOp::Shl, &one, &k);
-                get(r, node.a).scale(&scale)
+                scaled_high(r, cx, node.a, &scale)?.unwrap_or_else(|| get(r, node.a).scale(&scale))
             }
             None => Form::atom(i, w),
         },
@@ -411,6 +505,7 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
                     f.konst = BitVec::bin_unchecked(BinOp::Add, &f.konst, &lo);
                     f
                 }
+                Some(c) => aligned_concat(r, cx, get(r, node.a), &c, w)?.unwrap_or_else(|| Form::atom(i, w)),
                 _ => Form::atom(i, w),
             }
         }

@@ -462,6 +462,52 @@ schedule that leaves more requests open is not the same result.
 For simplification requests rather than constant proofs, `--example engine_corpus` in
 the `bitwright` crate replays the exported `engine/` inputs. It measures `Engine::run`
 and reports the reachable DAG nodes and constant value of each result outside that timer.
+The default replay strategy is the inline profile; pass `DIR --default-strategy` for the
+ordinary deobfuscation profile. Use the export's declared symbol widths: defaulting a
+missing `:1` or `:8` to `:64` can change the problem even if it still parses. If an
+engine header says `# assumptions: true` but omits the assumptions themselves, the
+unconstrained timing is a proxy, not a replay of the original scoped request.
+In the 720-input window the engine files omitted every symbol width. We collected
+`#N:W` declarations from the typed expressions elsewhere in the same export, required
+exactly one width per key, and annotated the engine expressions before replay. All 21
+keys resolved; 256 requests still lacked their actual assumption blocks. The 427
+unscoped deep requests are the cleanest timing comparison, not a whole-host latency.
+Release-build wall times on a shared host varied enough to reverse one paired result
+(54.9 → 47.9 s and 34.2 → 38.8 s for the window, alternating the run order). Compare
+on-CPU work separately before projecting any change onto host wall-clock latency.
+Timing just `Engine::run` with `CLOCK_THREAD_CPUTIME_ID`, both release builds sharing
+the same logical CPU, gave 36.57 → 33.24 CPU-s for all 720, 32.81 → 30.36 for the
+648 deep requests, and 23.00 → 22.74 for the 427 unscoped deep requests. With the
+same fuel and one shared normal-form solver per process, 223 output DAGs shrank, two
+grew, and all 122 previously constant roots kept the same value. Eight deterministic
+evaluations per input agreed between original and output; these checks are not proofs.
+
+For **sampled word claims**, point the benchmark at the directory containing the
+`deep_*.txt` files, not the engine inputs:
+
+```sh
+cargo run --release -p bitwright-bench -- --sampled "$export/all" > decisions.tsv
+```
+
+The output columns are filename, verdict and last stage. A `# sampled:` word is only
+a candidate. Check its equality under all `## assume ==` facts at the recorded fuel,
+then retry an unknown with `# deep fuel:`. Only if both are unknown, run the forms
+engine on the **word**, then prove the residual equal to the candidate under the same
+facts. If the residual proof hits its size or search limit, `Split::none().with_cases(1)`
+allows one binary split. Both branches must prove the claim for a proof; one
+counterexample suffices only if it fails the **original** equality and satisfies
+all original assumptions. The forms engine, residual proof, and any branch proofs
+are extra calls. The recorded node, conflict and propagation caps apply **per proof**,
+not to the sum of those calls.
+
+Of the 267 claims, 52 were still open after the selector-cube change. Reading aligned
+high fields as modular linear terms proved 45 of them at stock fuel and four at deep
+fuel. The other three words actually vary: in each file an independent evaluation
+attained the sampled value, and a case split supplied a different value on the
+original question. All 215 previous proofs were retained. The totals were 65 stock
+proofs, 20 deep proofs, 179 forms proofs and three refutations. In one comparison,
+release replay of the 267 claims used 32.0 CPU-s before and 30.2 CPU-s after.
+These are standalone expression replays, not host latency.
 
 ## Comparing with other engines
 

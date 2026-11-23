@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.32.6
+
+- The opaque MBA sweep can replace a weighted selector test with a masked
+  equality or a conjunction of predicates. It checks the complete table over
+  at most nine input bits and keeps the rewrite only if the root DAG shrinks.
+  On apparently constant roots the stock strategy still runs its existing
+  proof schedule; the noise-forms profile can try the alternative.
+- Word-form interning keeps one copy of each form's terms. Native SAT
+  propagation now reads the watched literal's value directly.
+- The linear pass cancels scaled right shifts and rotations, and arithmetic
+  on concatenated high fields, when the discarded low bits are fixed. It
+  accounts for nonzero low bits and wraparound in the narrow field.
+- `bitwright-bench --sampled DIR` checks exported candidate constants with
+  their recorded facts and limits, reporting which proof stage decided each.
+  An unresolved forms proof can now split once on a condition; a model from
+  either case must refute the original claim under its original assumptions.
+  `engine_corpus DIR --default-strategy` measures the non-inline engine profile.
+
 ## 0.32.5
 
 **Behavior changes**

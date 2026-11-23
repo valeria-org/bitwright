@@ -5,10 +5,9 @@
 //!
 //! Each file holds `# engine: deep|forms|...` and `# fuel: N` lines and, after `## root 0`, the
 //! expression in Bitwright's text form (as a devirtualizer's `--export-questions` writes them
-//! under `engine/`). The engine is the one that devirtualizer builds: the deobfuscation
-//! strategy with the stock MBA phase (the opaque sweep on), or the noise forms and known atoms
-//! as well for `forms`, on one normal-form solver, with no basis sums and fragments kept back
-//! from 2^12 steps.
+//! under `engine/`). Supply width-annotated symbols for mixed-width inputs. The default
+//! is the host's inline profile (no basis sums, kept steps 2^12); `DIR --default-strategy`
+//! uses the ordinary deobfuscation profile. Neither reconstructs omitted assumptions.
 use std::sync::Arc;
 
 use bitwright::engine::{Budget, Engine, Run, Strategy};
@@ -24,7 +23,13 @@ fn forms() -> MbaConfig {
 }
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("directory");
+    let mut args = std::env::args_os().skip(1);
+    let dir = args.next().expect("directory [--default-strategy]");
+    let default_strategy = match args.next() {
+        None => false,
+        Some(arg) if arg == "--default-strategy" && args.next().is_none() => true,
+        _ => panic!("usage: engine_corpus DIR [--default-strategy]"),
+    };
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .expect("read dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -33,25 +38,30 @@ fn main() {
     let solver: Arc<dyn MbaSolver> = Arc::new(NormalFormSolver::new(
         NfOptions::default()
             .with_memo(1 << 14)
-            .with_basis_sums(false),
+            .with_basis_sums(default_strategy),
     ));
     let build = |m| {
+        let strategy = Strategy::deobfuscate().with_mba(m);
+        let strategy = if default_strategy {
+            strategy
+        } else {
+            strategy.with_basis_sums(false).with_kept_steps(1 << 12)
+        };
         Engine::builder()
             .builtin()
-            .strategy(
-                Strategy::deobfuscate()
-                    .with_mba(m)
-                    .with_basis_sums(false)
-                    .with_kept_steps(1 << 12),
-            )
+            .strategy(strategy)
             .mba_solver(Arc::clone(&solver))
             .build()
             .unwrap()
     };
     let (stock_engine, forms_engine) = (build(stock()), build(forms()));
+    let mut missing_assumptions = 0usize;
     for f in files {
         let mut cx = Context::new();
         let text = std::fs::read_to_string(&f).unwrap();
+        if text.lines().any(|line| line == "# assumptions: true") {
+            missing_assumptions += 1;
+        }
         let what = text
             .lines()
             .find_map(|l| l.strip_prefix("# engine: "))
@@ -100,5 +110,8 @@ fn main() {
             View::Const(v) => println!("{name} {what} {ms:.2} nodes={nodes} constant={v}"),
             _ => println!("{name} {what} {ms:.2} nodes={nodes} constant=-"),
         }
+    }
+    if missing_assumptions > 0 {
+        eprintln!("{missing_assumptions} inputs marked as assumed were replayed unconstrained");
     }
 }

@@ -17,6 +17,9 @@ use bitwright::mba::{MbaConfig, NfOptions, NormalFormSolver};
 use bitwright::prove;
 use bitwright::{Assumptions, BitVec, CmpOp, Context, Expr, Facts, ParseOptions, UnOp, Width};
 
+mod sampled;
+pub(super) use sampled::sampled;
+
 #[derive(Debug)]
 struct Dump {
     name: String,

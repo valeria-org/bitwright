@@ -198,6 +198,33 @@ fn linear_cancels_additive_masking() {
     assert!(!eng.simplify(&mut cx, e).unwrap().changed);
 }
 
+#[test]
+fn linear_preserves_wrap_and_fixed_residue_of_high_fields() {
+    let eng = engine(vec![Phase::Linear, Phase::Bitwise, Phase::Linear]);
+    // The low bits are fixed, but nonzero; dropping their correction would
+    // turn both identities into an off-by-three result.
+    for body in [
+        "rotl(a, 6) * 12 - a * 3 + 9",
+        "concat(7:6 - extract<2, 6>(a), 1:2) + a - 32",
+    ] {
+        assert_eq!(simplify(&eng, &format!("let a = x:8 * 4 + 3; {body}"), 8), "0:8");
+    }
+    // Neither unrestricted low bits nor an odd scaling coefficient admits
+    // the cancellation. Check all assignments, not just the extremal words.
+    for src in ["rotl(x:8, 6) * 12 - x * 3", "let a = x:8 & 252; rotl(a, 6) * 3 - a"] {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W8)).unwrap();
+        let r = eng.simplify(&mut cx, e).unwrap().expr;
+        let mut seen = [false; 256];
+        for x in 0..=255 {
+            let vals = cx.eval(&[e, r], &crate::FnEnv(|_: &crate::SymbolKey, w| BitVec::from_u64(w, x).ok())).unwrap();
+            assert_eq!(vals[0], vals[1]);
+            seen[vals[1].to_u64().unwrap() as usize] = true;
+        }
+        assert!(seen.iter().filter(|&&s| s).count() > 1);
+    }
+}
+
 #[cfg(feature = "prove")]
 #[test]
 fn linear_cancels_sums_of_shifted_selects() {

@@ -4,6 +4,7 @@ mod field_guard;
 mod guard_domain;
 mod opaque_predicate;
 mod output_set;
+mod selector_cube;
 
 use super::{Fin, PassKind, Runner, Step, Stop, discard, finish, shrinks};
 use crate::engine::Exhausted;
@@ -418,6 +419,20 @@ fn sweep_inner(
             return Ok(e);
         }
     }
+    // Preserve the stock constant-proof schedule on an apparently uniform output.
+    // The optional noise-forms profile is an alternative reading of that same goal;
+    // there it can expose guards even when all the samples happened to agree.
+    let root = if fold_cases && (!uniform || cfg.noise_forms)
+        && let Some(e) = selector_cube::reduce(r, cx, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        order = cx.post_order_ids(&[e]);
+        r.meter.charge(Counter::PassWork, order.len() as u64)?;
+        r.sample(cx, e)?;
+        e
+    } else {
+        root
+    };
     // links of a chain of sums, every user of which is a sum too: a noise block is
     // asked about only at the top of its chain (see `sweep_cut`).
     let mut links: crate::hash::IdMap<u32, bool> = crate::hash::IdMap::default();

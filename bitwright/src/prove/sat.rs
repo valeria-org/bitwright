@@ -239,7 +239,9 @@ pub struct Solver {
     watches: Vec<Vec<Watch>>,
     /// Binary clauses, likewise (the other literal as the blocker).
     bins: Vec<Vec<Watch>>,
-    values: Vec<Value>,
+    /// Positive and negative literal values, updated together on assignment/backtrack.
+    /// Propagation can read its watch's literal directly without decoding polarity.
+    values: Vec<[Value; 2]>,
     level: Vec<u32>,
     reason: Vec<Option<u32>>,
     trail: Vec<Lit>,
@@ -381,7 +383,7 @@ impl Solver {
     /// A new variable.
     pub fn new_var(&mut self) -> Var {
         let v = self.values.len() as u32;
-        self.values.push(Value::Unset);
+        self.values.push([Value::Unset; 2]);
         self.level.push(0);
         self.reason.push(None);
         self.activity.push(0.0);
@@ -396,16 +398,7 @@ impl Solver {
     }
 
     fn value(&self, l: Lit) -> Value {
-        match self.values[l.var() as usize] {
-            Value::Unset => Value::Unset,
-            v => {
-                if (v == Value::True) != l.is_neg() {
-                    Value::True
-                } else {
-                    Value::False
-                }
-            }
-        }
+        self.values.as_flattened()[l.0 as usize]
     }
 
     pub(super) fn prefer_selector(&mut self, l: Lit) {
@@ -638,9 +631,9 @@ impl Solver {
     fn assign(&mut self, l: Lit, reason: Option<u32>) {
         let v = l.var() as usize;
         self.values[v] = if l.is_neg() {
-            Value::False
+            [Value::False, Value::True]
         } else {
-            Value::True
+            [Value::True, Value::False]
         };
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
@@ -928,7 +921,7 @@ impl Solver {
             let l = self.trail[i];
             let v = l.var() as usize;
             self.phase[v] = !l.is_neg();
-            self.values[v] = Value::Unset;
+            self.values[v] = [Value::Unset; 2];
             self.reason[v] = None;
             if !self.heap.contains(l.var()) {
                 self.heap.insert(l.var(), &self.activity);
@@ -953,7 +946,7 @@ impl Solver {
                 // Propagation has completed and every variable is assigned: keep the
                 // completed model instead of undoing and rebuilding it at a restart.
                 None => return self.decision_level(),
-                Some(v) if self.values[v as usize] == Value::Unset => break v,
+                Some(v) if self.values[v as usize][0] == Value::Unset => break v,
                 Some(_) => {
                     self.heap.pop(&self.activity);
                 }
@@ -981,7 +974,7 @@ impl Solver {
 
     fn pick(&mut self) -> Option<Lit> {
         while let Some(v) = self.heap.pop(&self.activity) {
-            if self.values[v as usize] == Value::Unset {
+            if self.values[v as usize][0] == Value::Unset {
                 return Some(Lit::new(v, self.phase[v as usize]));
             }
         }
@@ -1106,7 +1099,7 @@ impl Solver {
                     continue;
                 }
                 let Some(d) = self.pick() else {
-                    let model = self.values.iter().map(|&v| v == Value::True).collect();
+                    let model = self.values.iter().map(|v| v[0] == Value::True).collect();
                     self.cancel_until(0);
                     return Answer::Sat(model);
                 };
@@ -1217,7 +1210,7 @@ impl Solver {
                 match self.pick() {
                     Some(d) => d,
                     None => {
-                        break Answer::Sat(self.values.iter().map(|&v| v == Value::True).collect());
+                        break Answer::Sat(self.values.iter().map(|v| v[0] == Value::True).collect());
                     }
                 }
             };
@@ -1477,12 +1470,12 @@ mod restart_tests {
             priority(&mut s, v, p);
         }
         decide(&mut s, decision);
-        assert_eq!(s.values[implied as usize], Value::True);
+        assert_eq!(s.values[implied as usize][0], Value::True);
         let keep = s.reusable_levels();
         assert_eq!(keep, 0);
         s.cancel_until(keep);
         assert_eq!(s.pick().unwrap().var(), implied);
-        assert_eq!(s.values[root as usize], Value::True);
+        assert_eq!(s.values[root as usize][0], Value::True);
     }
 
     #[test]
@@ -1501,8 +1494,8 @@ mod restart_tests {
         let keep = s.reusable_levels();
         assert_eq!(keep, 1);
         s.cancel_until(keep);
-        assert_eq!(s.values[first as usize], Value::True);
-        assert_eq!(s.values[second as usize], Value::Unset);
+        assert_eq!(s.values[first as usize][0], Value::True);
+        assert_eq!(s.values[second as usize][0], Value::Unset);
         assert_eq!(s.pick().unwrap().var(), implied);
     }
 
