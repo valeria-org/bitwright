@@ -493,6 +493,27 @@ fn bug_m4_solve_counted_never_exceeds_step_budget() {
     }
 }
 
+const FOUR_VARIABLE_MBA: &str = "4 * x + 18 * y + 16 * z - 6 * w \
+     - 26 * (x & y) - 26 * (x & z) - 31 * (y & z) \
+     + 9 * (w & x) - 6 * (w & z) + 52 * (x & y & z)";
+
+#[test]
+fn exhausted_render_is_charged_before_returning() {
+    let solver = NormalFormSolver::new(NfOptions::default().with_memo(0));
+    let mut cx = Context::new();
+    let e = cx
+        .parse(FOUR_VARIABLE_MBA, &ParseOptions::width(Width::W64))
+        .unwrap();
+    let (m, _) = mba::lower(&cx, e, &MbaLimits::default()).unwrap();
+    for steps in [512, 1024, 2048] {
+        let budget = MbaBudget::default().with_steps(steps).with_evidence(false);
+        let (answer, spent) = solver.solve_counted(&m, &budget);
+        assert!(matches!(answer, MbaAnswer::Exhausted));
+        // Previously all three attempts reported only the 248 steps before rendering.
+        assert!((249..=steps).contains(&spent), "{spent} spent at {steps}");
+    }
+}
+
 #[test]
 fn cobra_multi_term_arbitrary_coefficients_and_degree1_cancellation() {
     // 1. 3-term overlapping arbitrary coefficients: `5*(x ^ y) + 3*(y & z) + 7*(x | z)`
@@ -513,13 +534,7 @@ fn cobra_multi_term_arbitrary_coefficients_and_degree1_cancellation() {
 
     // 3. 4-variable 4-term MBA with 3-input XOR (`x ^ y ^ z`), OR, negated AND, and 2-input XOR:
     //    `13 * (x ^ y ^ z) - 9 * (w | x) + 5 * (y & ~z) + 3 * (w ^ z)` expanded into conjunctions!
-    verify_mba_simplifies_to(
-        "4 * x + 18 * y + 16 * z - 6 * w \
-         - 26 * (x & y) - 26 * (x & z) - 31 * (y & z) \
-         + 9 * (w & x) - 6 * (w & z) + 52 * (x & y & z)",
-        22,
-        Width::W64,
-    );
+    verify_mba_simplifies_to(FOUR_VARIABLE_MBA, 22, Width::W64);
 }
 
 #[test]

@@ -278,12 +278,13 @@ impl NormalFormSolver {
     /// A solver with these options.
     pub fn new(opts: NfOptions) -> NormalFormSolver {
         let id = format!(
-            "bitwright.nf.v3;atoms={};classes={};terms={};degree={};synth={}",
+            "bitwright.nf.v4;atoms={};classes={};terms={};degree={};basis={};synth={}",
             opts.max_atoms,
             opts.max_classes,
             opts.max_terms,
             opts.max_degree,
-            if opts.synthesis { synth::MAX_SIZE } else { 0 }
+            u8::from(opts.basis_sums),
+            if opts.synthesis { synth::MAX_SIZE } else { 0 },
         );
         NormalFormSolver {
             opts,
@@ -2212,7 +2213,7 @@ fn normalize(
                     w,
                     &pass.classes,
                     &atom_exprs[..a],
-                    work.left,
+                    &mut work,
                 )
                 .for_atom()
                 .with_basis(opts.basis_sums);
@@ -2233,19 +2234,17 @@ fn normalize(
                 }
                 let mut cands = candidates(&mut r, &form, &factors);
                 cands.extend(as_is);
-                if opts.synthesis && !r.hopeless(form.atoms()) {
+                if !r.exhausted() && opts.synthesis && !r.hopeless(form.atoms()) {
                     let bar = r.best(&cands).map(|b| r.b.cost(b));
                     if let Some(render::Hit::Exact(x)) = r.synthesize(&form, bar) {
                         cands.push(x);
                     }
                     add_synth(tally, &r.synth);
                 }
-                {
-                    use certify::Meter;
-                    work.charge(r.work.max(1))
-                        .map_err(|()| Decline::Exhausted)?;
-                }
                 tally.candidates += r.built;
+                if r.exhausted() {
+                    return Err(Decline::Exhausted);
+                }
                 let best = r.best(&cands).ok_or_else(internal)?;
                 let body = r.b.finish(best).ok_or_else(internal)?;
                 match *def {
@@ -2849,21 +2848,24 @@ fn drop_dependent_atoms(
         return Ok(());
     }
     // The proof: both as expressions over the atoms' renderings.
-    let render = |f: &Poly| -> Option<MbaExpr> {
-        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
+    let mut render = |f: &Poly| -> Result<Option<MbaExpr>, Decline> {
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, work);
         let mut sum = render::Sum {
             terms: Vec::new(),
             konst: Some(f.konst()),
         };
         for (m, c) in f.terms() {
             if !m.is_empty() {
-                sum.terms.push((r.mono(m)?, *c));
+                let Some(t) = r.mono(m) else {
+                    return Ok(None);
+                };
+                sum.terms.push((t, *c));
             }
         }
-        let root = r.sum(&sum);
-        r.b.finish(root)
+        let root = r.sum(&sum).ok_or(Decline::Exhausted)?;
+        Ok(r.b.finish(root))
     };
-    let (Some(old), Some(new)) = (render(nf), render(&fresh)) else {
+    let (Some(old), Some(new)) = (render(nf)?, render(&fresh)?) else {
         return Ok(());
     };
     let report = certify_within(&old, &new, work);
@@ -2969,7 +2971,7 @@ fn prune_null_conjunctions(
         if !vals.is_some_and(|v| v.iter().all(|x| masked(x) == 0)) {
             continue;
         }
-        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, work);
         let Some(root) = r.mono(&m) else {
             continue;
         };
@@ -3032,7 +3034,7 @@ fn prune_null(
         if !present || !g.iter().any(|(m, _)| poly::degree(m) >= 2) {
             continue;
         }
-        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, u64::MAX);
+        let mut r = Render::new(p.vars().to_vec(), w, classes, atom_exprs, work);
         let mut sum = render::Sum::default();
         for (m, c) in &g {
             let Some(t) = r.mono(m) else {
@@ -3040,7 +3042,7 @@ fn prune_null(
             };
             sum.terms.push((t, *c));
         }
-        let root = r.sum(&sum);
+        let root = r.sum(&sum).ok_or(Decline::Exhausted)?;
         let Some(e) = r.b.finish(root) else {
             return Ok(());
         };
@@ -3070,8 +3072,8 @@ struct Rendered {
 
 /// The cheapest rendering of `n`: rendered, then again with the factors the best candidate
 /// multiplies, until none is new (a few rounds), so the answer is as good as the factors its
-/// own products offer. Rendering cut short by the budget is [`Decline::Exhausted`]: what it
-/// found need not be the cheapest, and nothing is left to certify it.
+/// own products offer. If the first round runs short, it may have missed the cheapest
+/// candidate; later, optional rounds can fall back on the best complete round.
 fn best_rendering(
     p: &MbaExpr,
     n: &Normal,
@@ -3079,7 +3081,6 @@ fn best_rendering(
     work: &mut Steps,
     tally: &mut NfStats,
 ) -> Result<Rendered, Decline> {
-    use certify::Meter;
     let mut factors = n.factors.clone();
     let mut best: Option<(render::Cost, MbaExpr)> = None;
     let mut unproved = None;
@@ -3088,7 +3089,8 @@ fn best_rendering(
     let more = more_forms(n, work)?;
     tally.reused += u64::from(n.alts.is_empty() && !more.is_empty());
     for round in 0..3 {
-        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work.left)
+        let cap = work.left;
+        let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, work)
             .with_bar(bar)
             .with_basis(basis);
         let mut cands = candidates(&mut r, &n.nf, &factors);
@@ -3096,27 +3098,16 @@ fn best_rendering(
         // was seen); what comes after only adds candidates, so running short there only stops
         // it: the other forms each take at most half of what is left while a quarter is, and a
         // later round cut short is dropped.
-        if r.exhausted() {
-            if round == 0 {
-                return Err(Decline::Exhausted);
-            }
-            break;
-        }
-        if round == 0 {
-            let cap = r.limit();
+        if round == 0 && !r.exhausted() {
             for alt in n.alts.iter().chain(&more) {
-                let left = cap.saturating_sub(r.work);
-                if left < cap / 4 {
+                if r.left() < cap / 4 {
                     break;
                 }
-                r.set_limit(r.work + left / 2);
-                cands.extend(candidates(&mut r, alt, &factors));
-                r.set_limit(cap);
-                r.work = r.work.min(cap);
+                cands.extend(r.alternate(alt, &factors));
             }
         }
         // Synthesis does not depend on the factors: the first round is enough.
-        if round == 0 && n.synthesis && !r.hopeless(n.nf.atoms()) {
+        if round == 0 && !r.exhausted() && n.synthesis && !r.hopeless(n.nf.atoms()) {
             let bar = r.best(&cands).map(|b| r.b.cost(b));
             match r.synthesize(&n.nf, bar) {
                 Some(render::Hit::Exact(x)) => cands.push(x),
@@ -3134,8 +3125,6 @@ fn best_rendering(
             }
             break;
         }
-        work.charge(r.work.max(1))
-            .map_err(|()| Decline::Exhausted)?;
         let Some(b) = r.best(&cands) else {
             break;
         };
@@ -3316,7 +3305,8 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
         &Used::default(),
     )
     .ok()?;
-    let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, u64::MAX);
+    let mut work = Steps::new(u64::MAX);
+    let mut r = Render::new(p.vars().to_vec(), n.w, &n.classes, &n.atom_exprs, &mut work);
     let mut sum = render::Sum {
         terms: Vec::new(),
         konst: Some(n.nf.konst()),
@@ -3327,7 +3317,7 @@ pub(crate) fn inspect(p: &MbaExpr, opts: &NfOptions) -> Option<(MbaExpr, Vec<Mba
             sum.terms.push((t, *c));
         }
     }
-    let naive = r.sum(&sum);
+    let naive = r.sum(&sum)?;
     let naive = r.b.finish(naive)?;
     let mut cands = candidates(&mut r, &n.nf, &n.factors);
     for alt in &n.alts {

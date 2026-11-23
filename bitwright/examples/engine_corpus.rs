@@ -1,5 +1,5 @@
-//! Runs a directory of simplifier inputs through an engine and prints, for each, its time, the
-//! lines of its result and whether that is a constant: a corpus to measure a change against.
+//! Runs a directory of simplifier inputs through an engine and prints, for each, its time in
+//! milliseconds, the result's reachable DAG nodes and its constant value, if any.
 //!
 //! `cargo run --release --example engine_corpus --no-default-features --features mba,prove -- DIR`
 //!
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use bitwright::engine::{Budget, Engine, Run, Strategy};
 use bitwright::mba::{MbaConfig, MbaSolver, NfOptions, NormalFormSolver};
-use bitwright::{Context, ParseOptions, View, Width};
+use bitwright::{Bounded, Context, ParseOptions, View, Width};
 
 fn stock() -> MbaConfig {
     MbaConfig::default().with_opaque_sweep(true)
@@ -84,19 +84,21 @@ fn main() {
             Run::default().with_per_call(Budget::fuel(fuel)),
         );
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        let (size, konst) = match out {
-            Ok(o) => {
-                let r = o.roots[0].expr;
-                (
-                    cx.display(r).to_string().lines().count(),
-                    matches!(cx.view(r), Ok(View::Const(_))),
-                )
+        let name = f.file_name().unwrap().to_string_lossy();
+        let o = match out {
+            Ok(o) => o,
+            Err(err) => {
+                println!("{name} {what} {ms:.2} error={err}");
+                continue;
             }
-            Err(_) => (0, false),
         };
-        println!(
-            "{} {what} {ms:.2} {size} {konst}",
-            f.file_name().unwrap().to_string_lossy()
-        );
+        let r = o.roots[0].expr;
+        let Bounded::Exact(nodes) = cx.dag_size(&[r], u32::MAX).expect("a result") else {
+            unreachable!("the arena's node indices fit in u32")
+        };
+        match cx.view(r).expect("a result") {
+            View::Const(v) => println!("{name} {what} {ms:.2} nodes={nodes} constant={v}"),
+            _ => println!("{name} {what} {ms:.2} nodes={nodes} constant=-"),
+        }
     }
 }

@@ -226,6 +226,7 @@ struct Watch {
 /// on its limits keeps the search where it stopped, so the next call goes on from there, and
 /// calls of `a` then `b` conflicts do exactly what one call of `a + b` would. Adding a clause
 /// after a call starts the search again from the top level, keeping what was learned.
+#[derive(Clone)]
 pub struct Solver {
     clauses: Vec<Clause>,
     /// Every clause's literals, one after another.
@@ -416,6 +417,20 @@ impl Solver {
     fn lits(&self, c: u32) -> &[Lit] {
         let c = self.clauses[c as usize];
         &self.arena[c.start as usize..(c.start + c.len) as usize]
+    }
+
+    /// Bind a literal on a private unsearched template. Leave propagation on the
+    /// trail for `solve_within`, so it is subject to the target's propagation limit.
+    pub(super) fn bind_root(&mut self, l: Lit) -> bool {
+        debug_assert_eq!(self.decision_level(), 0);
+        match self.value(l) {
+            Value::False => false,
+            Value::True => true,
+            Value::Unset => {
+                self.assign(l, None);
+                true
+            }
+        }
     }
 
     /// Adds a clause (the search goes back to the top level first). Returns `false` when the
@@ -1304,7 +1319,7 @@ fn luby(i: u32) -> u64 {
 }
 
 /// A binary max-heap of variables by activity.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Heap {
     heap: Vec<Var>,
     index: Vec<i64>,

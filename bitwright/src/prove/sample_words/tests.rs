@@ -12,6 +12,133 @@ fn ordered_config(mode: SampleMode, samples: u32) -> Config {
         .with_max_nodes(0)
 }
 
+#[test]
+fn rare_guard_witness_respects_scoped_facts_before_building_the_circuit() {
+    let mut cx = Context::new();
+    let x = cx.symbol("tag", Width::W64).unwrap();
+    let y = cx.symbol("payload", Width::W64).unwrap();
+    let label = cx.constant_u64(Width::W64, 0xa283_fc03_19b7_6d11).unwrap();
+    let guard = cx.eq(x, label).unwrap();
+    let mut mixed = y;
+    for i in 1..80 {
+        let k = cx.constant_u64(Width::W64, i).unwrap();
+        mixed = cx.xor(mixed, k).unwrap();
+        mixed = cx.add(mixed, x).unwrap();
+    }
+    let zero = cx.zero(Width::W64).unwrap();
+    let claim = cx.eq(mixed, zero).unwrap();
+    let mut facts = Assumptions::new();
+    facts.assume_true(&mut cx, guard).unwrap();
+    let cfg = Config::default().with_samples(128).with_max_nodes(0);
+    let q = Question::valid_under(&mut cx, claim, Some(&facts), &cfg).unwrap();
+    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("no guarded witness") };
+    assert_eq!(cx.eval(&[guard, claim], &model[..]).unwrap(), [BitVec::from_bool(true), BitVec::from_bool(false)]);
+    assert!(!q.stats().simplification.ran);
+    assert!(q.stats().samples <= 64);
+}
+
+#[test]
+fn small_selected_word_has_a_witness_away_from_its_fallback() {
+    let mut cx = Context::new();
+    let claim = cx.parse(
+        "select((a:64 == 0x1234567000) & (b:64 == 0x7654321000), data:64, fallback:64) == fallback",
+        &crate::ParseOptions::default(),
+    ).unwrap();
+    let cfg = Config::default().with_samples(128).with_max_nodes(0);
+    let q = Question::valid(&mut cx, claim, &cfg).unwrap();
+    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("lost rare select arm") };
+    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+}
+
+fn large_selector(cx: &mut Context, tag: crate::Expr) -> crate::Expr {
+    let mut hash = tag;
+    for i in 1..80 {
+        let k = cx.constant_u64(Width::W64, i).unwrap();
+        hash = cx.xor(hash, k).unwrap();
+        hash = cx.add(hash, tag).unwrap();
+    }
+    cx.bit(hash, 13).unwrap()
+}
+
+#[test]
+fn masked_offset_guard_repairs_the_selected_word_in_the_existing_batch() {
+    let mut cx = Context::new();
+    let tag = cx.symbol("tag", Width::W64).unwrap();
+    let left = cx.symbol("left", Width::W64).unwrap();
+    let right = cx.symbol("right", Width::W64).unwrap();
+    // Forcing an input of the selector instead of the selected word cannot solve
+    // the masked comparison.
+    let selector = large_selector(&mut cx, tag);
+    let word = cx.select(selector, left, right).unwrap();
+    let offset = cx.constant_u64(Width::W64, 0x7ab3_0239_ffff_ef11).unwrap();
+    let biased = cx.add(word, offset).unwrap();
+    let slice = cx.extract(biased, 17, Width::W32).unwrap();
+    let extended = cx.zext(slice, Width::W64).unwrap();
+    let mask = cx.constant_u64(Width::W64, 0xebf5_bdbf).unwrap();
+    let masked = cx.and(extended, mask).unwrap();
+    let label = cx.constant_u64(Width::W64, 0x8351_319a).unwrap();
+    let claim = cx.ne(masked, label).unwrap();
+
+    let (lanes, Some(model)) = guard_samples(&mut cx, claim.index()).unwrap() else {
+        panic!("masked selector lost its witness");
+    };
+    assert!(lanes <= 9);
+    assert_eq!(cx.eval(&[masked], &model[..]).unwrap()[0].to_u64(), Some(0x8351_319a));
+}
+
+#[test]
+fn interval_witness_can_repair_an_addend_hidden_by_boolean_arithmetic() {
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W64).unwrap();
+    let y = cx.symbol("y", Width::W64).unwrap();
+    let sel = large_selector(&mut cx, x);
+    let part = cx.select(sel, x, y).unwrap();
+    let shared = cx.and(x, part).unwrap();
+    let either = cx.or(x, part).unwrap();
+    let sum = cx.add(shared, either).unwrap();
+    let k = cx.constant_u64(Width::W64, 0x8254_ab92_9324_5011).unwrap();
+    let end = cx.constant_u64(Width::W64, 0x8254_ab92_9324_5015).unwrap();
+    let lower = cx.cmp(CmpOp::Ule, k, sum).unwrap();
+    let upper = cx.cmp(CmpOp::Ult, sum, end).unwrap();
+    let inside = cx.and(lower, upper).unwrap();
+    let claim = cx.not(inside).unwrap();
+    let cfg = Config::default().with_samples(128).with_max_nodes(0);
+    let q = Question::valid(&mut cx, claim, &cfg).unwrap();
+    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("no range witness") };
+    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+    assert!(!q.stats().simplification.ran);
+}
+
+#[test]
+fn signed_interval_uses_a_reachable_interior_word() {
+    let mut cx = Context::new();
+    let tag = cx.symbol("tag", Width::W64).unwrap();
+    let left = cx.symbol("left", Width::W64).unwrap();
+    let right = cx.symbol("right", Width::W64).unwrap();
+    let selector = large_selector(&mut cx, tag);
+    let word = cx.select(selector, left, right).unwrap();
+    let offset = cx.constant_u64(Width::W64, 0x6d3b_bae7).unwrap();
+    let word = cx.add(word, offset).unwrap();
+    let mask = cx.constant_u64(Width::W64, !15).unwrap();
+    let word = cx.and(word, mask).unwrap();
+    // Both boundary literals are impossible. The single aligned word strictly
+    // between them can be reached from either side of this signed interval.
+    let interior = 0xeb38_0000_0000_2370;
+    let lo = cx.constant_u64(Width::W64, interior - 7).unwrap();
+    let hi = cx.constant_u64(Width::W64, interior + 5).unwrap();
+    let below = cx.cmp(CmpOp::Sle, word, lo).unwrap();
+    let above = cx.cmp(CmpOp::Sle, hi, word).unwrap();
+    let claim = cx.or(below, above).unwrap();
+
+    let (lanes, Some(model)) = guard_samples(&mut cx, claim.index()).unwrap() else {
+        panic!("no signed interval witness");
+    };
+    assert!(lanes <= 9);
+    let replay = cx.eval(&[word, claim], &model[..]).unwrap();
+    assert_eq!(replay[0].to_u64(), Some(interior));
+    assert_eq!(replay[1], BitVec::from_bool(false));
+}
+
 fn division_recomposition(cx: &mut Context, x: crate::Expr, y: crate::Expr) -> crate::Expr {
     let quotient = cx.bin(BinOp::UDiv, x, y).unwrap();
     let product = cx.mul(quotient, y).unwrap();

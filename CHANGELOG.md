@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.32.5
+
+**Behavior changes**
+
+- The MBA sweep uses required field equalities to resolve select arms and masked
+  weights, keeping the original guard on the result. It can prove a product
+  zero from the trailing zeros of its sparse factors without expanding the
+  dense factors. Counterexample sampling can vary free bits inside a masked
+  equality or move a single addend into a required interval.
+- The opaque MBA sweep can reduce weighted Boolean terms by checking their
+  coefficients one bit position at a time, including sums with a shared factor.
+  It can prove `word == k1 || word == k2 || …` when the labels cover a bounded
+  superset of the word's possible values. Partial coverage never establishes validity.
+- The opaque MBA sweep can prove a guarded conjunction impossible by checking at
+  most four pairs of case labels. It can also reduce a nested weighted sum to a
+  masked XOR before bit-blasting a product, when the per-bit coefficients match
+  exactly. Ordered comparisons of selected words can keep range facts separate
+  across closed guard cases; a constant result must hold in every case.
+- Native validity questions can spend one existing random-sample batch on comparison
+  literals and signed or unsigned ranges before simplification. Short comparisons
+  of selected words can use the same batch to reach rare labeled arms.
+  For weighted sums, the sampler can keep one weight inside the requested interval
+  and clear the other terms using compatible bit assignments. Only a counterexample
+  replayed on the original constrained question decides a query.
+- The linear pass cancels weighted sums across aligned selects. The opaque sweep can
+  specialize a negated conjunction on a provably finite guard and leaves room for the
+  demanded-bits pass on large masked equalities under tight fuel.
+- `prove::Prepared` simplifies and encodes a fixed catalog of shared facts and observed
+  words once. Binding observations checks feasibility with independent search limits;
+  `Unknown` is distinct from unsatisfiable.
+- The normal-form solver bills accepted rendering work even when the rendering is abandoned;
+  it does not bill operations refused before they run. Under a tight budget, a later
+  question can therefore get a different share of the run's steps.
+- The native solver ID is `bitwright.nf.v4`, including the basis-sums setting. A shared
+  `MbaCacheStore` no longer returns basis-on renderings to a basis-off engine or vice versa.
+  Entries written under v3 are not reused.
+- The casts pass recognizes sign extension when a sign comparison selects the high-bit
+  mask and the low word is zero-extended. The opaque MBA sweep can also recover shifted
+  fields by enumerating their demanded input bits, and prove product-bit predicates
+  whose masked or rotated terms cancel per bit. With `prove` enabled, a bounded circuit
+  check can discharge a remaining one-bit root. None of these folds trusts sampled values.
+  [Residue replay and counterexamples](docs/benchmarking.md#replaying-the-easys-residue-handoff).
+
+**Performance and measurement**
+
+- Constant multiplication reuses repeated signed-digit pairs and folds sparse operands'
+  fixed bias before constructing adders. The integer blaster now borrows cached operands.
+  [Captured query results and remaining limits](docs/benchmarking.md#replaying-the-21-question-solver-handoff).
+- The MBA gate reuses the refutation sample for the same lowered input and cached answer
+  within a run. A hit still pays the same logical pass work and cannot bypass size, proof
+  or lifted-result checks. `Run::with_mba_rejections` profiles candidates rejected by the
+  pre-proof size check without enabling timing for ordinary runs.
+- `bitwright-bench --walk` reports decisions, tasks, retries and latency per nonempty
+  boundary, and p95 across those boundaries. `engine_corpus` reports reachable DAG nodes
+  instead of lines of printed IR, and the constant value rather than a yes/no flag.
+- The strategy's `kept_steps` default is available in builds without the `mba` feature.
+
 ## 0.32.4
 
 - **The prover's engines write basis sums again by default, as in 0.32.1;

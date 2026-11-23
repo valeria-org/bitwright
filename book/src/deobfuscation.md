@@ -247,9 +247,10 @@ over the fragment as it is, and only when that answer is not taken are the piece
 ones first, and the top again over them. A piece's answer can hide what only the whole shows (a
 relation between two atoms that rewrites one factor of a product identity).
 
-Answers are cached (keyed by the lowered input, the solver's and prover's ids, the trust
-setting and the lowering version) in an `MbaCacheStore` you provide; `MemoryCache` is a bounded
-in-memory one.
+You can supply an `MbaCacheStore` to share answers across calls; `MemoryCache` is a
+bounded in-memory implementation. The keys include the lowered input, solver and prover
+IDs, trust settings and lowering version. Native solvers with and without basis sums use
+different IDs, so a shared store cannot substitute one profile’s rendering for the other.
 
 ```rust
 use std::sync::Arc;
@@ -303,10 +304,12 @@ A normal form over at most three atoms is also looked up in a precomputed table 
 smallest expressions, so products the input has multiplied out come back: `x·y + x + y + 1` is
 `~x·~y`, and `x² + 2·x·y + y²` is `(x + y)²`. A form from the table is used only when a
 certificate proves it; one that no certificate can decide is returned, if at all, as a
-sampled answer (`NfOptions::synthesis` turns the table off). Every answer is certified against
-its input before it is returned, and the evidence gate checks it again. Its work is bounded by `MbaConfig::budget` (in steps: normal forms, renderings and
-certificate evaluations); a question that needs more is answered `Exhausted`, counted, and left
-for a later call with more budget. It remembers its recent answers (`NfOptions::memo`), which
+sampled answer (`NfOptions::synthesis` turns the table off). With the default trust settings
+the engine requests no redundant backend proof of an exact rendering; the gate checks it.
+`MbaConfig::budget` bounds the solver's work in steps for normalization, rendering and
+certificate evaluation. An exhausted rendering still costs the work it did. A question
+the engine could not settle within budget can be retried later. The solver remembers its
+recent answers (`NfOptions::memo`), which
 saves time when the engine asks again and never changes an answer. It is the default solver
 (the command line's `simplify` uses it too); `SignatureSolver` answers linear MBA only, at a
 fraction of the cost on code that is not obfuscated. Of the 76,080 expressions of CoBRA's MBA datasets, 75,737 have a ground

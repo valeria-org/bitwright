@@ -608,14 +608,57 @@ fn pushed(
     Ok(out)
 }
 
+/// `zext(x) | select(sign(x), high_mask, 0)` is `sext(x)`: the low bits are
+/// exactly `x`, and every bit above them is the same copy of its top bit.
+/// Read only these nodes (no search into `x`); `select` can swap its arms
+/// when the condition is complemented.
+fn selected_sext(cx: &Context, a: u32, b: u32) -> Option<(u16, u32)> {
+    let (a, b) = (cx.node(a), cx.node(b));
+    let (x, sel) = match (a.op, b.op) {
+        (OpCode::Zext, OpCode::Select) => (a.a, b),
+        (OpCode::Select, OpCode::Zext) => (b.a, a),
+        _ => return None,
+    };
+    let w = cx.width_of(x);
+    let cond = cx.node(sel.a);
+    // Whether the condition means "negative". The compares pass can spell
+    // the unsigned threshold `smin <=u x` as the signed `x <=s -1`.
+    let negative = match cond.op {
+        _ if w.bits() == 1 && sel.a == x => true,
+        OpCode::Extract if cond.a == x && cond.b == u32::from(w.bits() - 1) => true,
+        OpCode::Slt if cond.a == x && cx.const_val(cond.b)?.is_zero() => true,
+        OpCode::Sle if cond.a == x && cx.const_val(cond.b)?.is_ones() => true,
+        OpCode::Sle if cond.b == x && cx.const_val(cond.a)?.is_zero() => false,
+        OpCode::Slt if cond.b == x && cx.const_val(cond.a)?.is_ones() => false,
+        OpCode::Ule if cond.b == x && cx.const_val(cond.a)? == BitVec::smin(w) => true,
+        OpCode::Ult if cond.b == x && cx.const_val(cond.a)? == BitVec::smax(w) => true,
+        OpCode::Ult if cond.a == x && cx.const_val(cond.b)? == BitVec::smin(w) => false,
+        OpCode::Ule if cond.a == x && cx.const_val(cond.b)? == BitVec::smax(w) => false,
+        _ => return None,
+    };
+    let (set, clear) = if negative {
+        (sel.b, sel.c)
+    } else {
+        (sel.c, sel.b)
+    };
+    if !cx.const_val(clear)?.is_zero() {
+        return None;
+    }
+    let mask = cx.const_val(set)?;
+    (mask == crate::facts::known::high_mask(mask.width(), u32::from(sel.width - w.bits())))
+        .then_some((w.bits(), x))
+}
+
 /// The width `k` and operand `x` when `n` sign-extends the low `k` bits of `x` spelled with
-/// shifts or arithmetic: `(x << c) >>s c` (`k = W − c`), or `((x & (2^k − 1)) ^ 2^(k−1)) −
-/// 2^(k−1)` (the builder's `+ −2^(k−1)`; the masked value may also be `zext(trunc<k>(x))`).
+/// a selected high mask (above), shifts or arithmetic: `(x << c) >>s c` (`k = W − c`), or
+/// `((x & (2^k − 1)) ^ 2^(k−1)) − 2^(k−1)` (the builder's `+ −2^(k−1)`;
+/// the masked value may also be `zext(trunc<k>(x))`).
 fn sext_idiom(cx: &Context, n: u32) -> Option<(u16, u32)> {
     let node = cx.node(n);
     let w = node.width;
     let small = |i: u32| cx.const_val(i).and_then(|v| v.to_u64());
     match node.op {
+        OpCode::Or => selected_sext(cx, node.a, node.b),
         OpCode::AShr => {
             let c = small(node.b)?;
             let inner = cx.node(node.a);
@@ -640,7 +683,11 @@ fn sext_idiom(cx: &Context, n: u32) -> Option<(u16, u32)> {
             }
             let t = cx.node(xor.a);
             match t.op {
-                OpCode::And if small(t.b) == Some((1u64 << kk) - 1) => Some((kk, t.a)),
+                OpCode::And => {
+                    let mask = cx.const_val(t.b)?;
+                    (mask == crate::facts::known::low_mask(k.width(), u32::from(kk)))
+                        .then_some((kk, t.a))
+                }
                 OpCode::Zext => {
                     let e = cx.node(t.a);
                     (e.op == OpCode::Extract && e.b == 0 && e.width == kk).then_some((kk, e.a))

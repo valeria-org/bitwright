@@ -688,6 +688,39 @@ fn results_are_deterministic_and_independent_of_construction_order() {
     }
 }
 
+#[test]
+fn shared_cache_respects_basis_profile() {
+    use bitwright::engine::Phase;
+    use bitwright::mba::MemoryCache;
+
+    // Four overlapping Boolean functions expanded into conjunctions. The basis solver can
+    // recover their short sum; the other rendering is intentional, e.g. for a downstream proof.
+    let src = "4*x + 18*y + 16*z - 6*w - 26*(x&y) - 26*(x&z) - 31*(y&z) \
+               + 9*(w&x) - 6*(w&z) + 52*(x&y&z)";
+    let run = |basis, cache: Arc<MemoryCache>| {
+        let solver = NormalFormSolver::new(NfOptions::default().with_basis_sums(basis));
+        let eng = Engine::builder()
+            .builtin()
+            .strategy(Strategy::new("mba", vec![Phase::Mba(trust_off())]))
+            .mba_solver(Arc::new(solver))
+            .mba_cache(cache)
+            .build()
+            .unwrap();
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+        let r = eng.simplify(&mut cx, e).unwrap();
+        cx.display(r.expr).to_string()
+    };
+    let cache = || Arc::new(MemoryCache::new(1024));
+    let first = cache();
+    let on = run(true, Arc::clone(&first));
+    let second = cache();
+    let off = run(false, Arc::clone(&second));
+    assert_ne!(on, off, "fixture must distinguish the two renderers");
+    assert_eq!(run(false, first), off);
+    assert_eq!(run(true, second), on);
+}
+
 /// A solver that records every question and its answer.
 struct Recording {
     inner: NormalFormSolver,

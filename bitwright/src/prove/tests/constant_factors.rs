@@ -64,6 +64,76 @@ fn parallel_signed_digit_cost_matches_serial_carries() {
     }
 }
 
+fn lane_word(values: &[u64], bits: &[L], lane: u32) -> u64 {
+    bits.iter().enumerate().fold(0u64, |v, (i, &bit)| {
+        v | (Aig::word(values, bit) >> lane & 1) << i
+    })
+}
+
+#[test]
+fn repeated_digit_pairs_share_a_truncated_multiple() {
+    // Ordinary pairs, opposite-sign pairs, and negative repeated rows, at
+    // widths both on and off machine-word boundaries. Every key is even so
+    // this measures row sharing independently of modular factor search.
+    for (w, key) in [
+        (32, 0x5555_5554u64),
+        (29, 0x1c71_c71c),
+        (48, 0x7777_7777_7776),
+        (64, 0x1eec_cc64_ec3e_2da6),
+    ] {
+        let mut graph = Aig::new();
+        let input: Bits = (0..w).map(|_| graph.input()).collect();
+        let constant = small(w, key);
+        let product = mul(&mut graph, &input, &constant);
+        if key == 0x5555_5554 {
+            // Isolated positive digits: the independent baseline is the
+            // ordinary shift/add circuit, not a denser binary representation.
+            let mut ordinary = Aig::new();
+            let data: Bits = (0..w).map(|_| ordinary.input()).collect();
+            mul_rows(&mut ordinary, &data, &constant);
+            assert!(graph.len() * 5 < ordinary.len() * 4);
+        }
+        let values = graph.eval_words(|i| {
+            0x9e37_79b9_7f4a_7c15u64
+                .wrapping_mul(u64::from(i) + 1)
+                .rotate_left(i)
+        });
+        for lane in 0..64 {
+            assert_eq!(
+                lane_word(&values, &product, lane),
+                lane_word(&values, &input, lane).wrapping_mul(key) & (u64::MAX >> (64 - w))
+            );
+        }
+    }
+}
+
+#[test]
+fn biased_sparse_products_match_every_assignment() {
+    for w in [29, 63, 64] {
+        let mut graph = Aig::new();
+        let mut data = vec![TRUE; w];
+        data[0] = FALSE;
+        for (j, i) in [1, 4, 8, 12, 17, 23, w - 1].into_iter().enumerate() {
+            data[i] = graph.input() ^ (j as L & 1);
+        }
+        let k = 0xac71_c71c_5555_5555;
+        let product = mul(&mut graph, &data, &small(w, k));
+        for base in [0u32, 64] {
+            let values = graph.eval_words(|i| {
+                (0..64).fold(0, |v, lane| {
+                    v | (u64::from((base + lane) >> i & 1) << lane)
+                })
+            });
+            for lane in 0..64 {
+                assert_eq!(
+                    lane_word(&values, &product, lane),
+                    lane_word(&values, &data, lane).wrapping_mul(k) & (u64::MAX >> (64 - w))
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn factor_plans_are_exact_modular_identities_and_bounded() {
     let mut selected = 0;

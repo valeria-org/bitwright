@@ -49,8 +49,8 @@ pub use learn::{LearnConfig, Learned, learn};
 pub use remember::Remembered;
 pub(crate) use remember::SweepNotes;
 pub use stats::{
-    By, CertStats, Detail, Event, Hooks, MbaStats, Observer, PassCounts, Reject, RuleCensus,
-    RuleCounts, Stage, Stats,
+    By, CertStats, Detail, Event, Hooks, MbaRejections, MbaStats, Observer, PassCounts, Reject,
+    RejectionCost, RuleCensus, RuleCounts, Stage, Stats,
 };
 pub use trace::Trace;
 
@@ -255,7 +255,7 @@ pub struct Strategy {
 }
 
 /// The default of [`Strategy::kept_steps`].
-pub(crate) const KEPT_STEPS: u64 = pass::mba::KEPT_STEPS;
+pub(crate) const KEPT_STEPS: u64 = 1 << 16;
 
 impl Strategy {
     /// A strategy with the given phases and at most 4 rounds.
@@ -1048,6 +1048,8 @@ pub struct Run<'a> {
     pub admission: Admission,
     /// Receives per-rule events.
     pub observer: Option<&'a mut dyn Observer>,
+    /// Collect costs of size-rejected MBA candidates, measured by this host clock.
+    pub mba_rejections: Option<(&'a dyn Clock, &'a mut MbaRejections)>,
     /// Host policy.
     pub hooks: Option<&'a dyn Hooks>,
     /// Facts in guards are read under these assumptions (part of the memo key).
@@ -1065,6 +1067,18 @@ setters!(Run<'a> {
     with_assumptions: assumptions ? &'a Assumptions,
     with_deadline: deadline ? Deadline<'a>,
 });
+
+impl<'a> Run<'a> {
+    /// Accumulate costs of size-rejected MBA candidates in `profile`, in `clock` ticks.
+    pub fn with_mba_rejections(
+        mut self,
+        clock: &'a dyn Clock,
+        profile: &'a mut MbaRejections,
+    ) -> Self {
+        self.mba_rejections = Some((clock, profile));
+        self
+    }
+}
 
 impl fmt::Debug for Run<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1285,6 +1299,8 @@ impl<'r, 'a> Runner<'r, 'a> {
             meter,
             stats: Stats::default(),
             observer,
+            #[cfg(feature = "mba")]
+            mba_rejections: None,
             hooks,
             assumptions,
             quarantined: Vec::new(),
@@ -1447,6 +1463,8 @@ struct Runner<'r, 'a> {
     meter: Meter<'a>,
     stats: Stats,
     observer: Option<&'a mut dyn Observer>,
+    #[cfg(feature = "mba")]
+    mba_rejections: Option<(&'a dyn Clock, &'a mut MbaRejections)>,
     hooks: Option<&'a dyn Hooks>,
     assumptions: Option<&'r Assumptions>,
     /// Rules quarantined for the call, by index (sized on the first quarantine).
@@ -2678,6 +2696,7 @@ impl Engine {
             per_call,
             admission,
             observer,
+            mba_rejections,
             hooks,
             assumptions,
             deadline,
@@ -2704,6 +2723,12 @@ impl Engine {
             assumptions,
             &ids,
         );
+        #[cfg(feature = "mba")]
+        {
+            runner.mba_rejections = mba_rejections;
+        }
+        #[cfg(not(feature = "mba"))]
+        let _ = mba_rejections;
         if let Some(o) = runner.observer.as_deref() {
             runner.detail = o.detail();
         }

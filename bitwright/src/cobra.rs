@@ -371,31 +371,22 @@ fn scale_cost(c: &BitVec, prec: u32, pmask: &BitVec) -> u32 {
     2
 }
 
-/// Spends `n` units of `work`; `None` (and nothing left) where it does not cover them.
-fn spend(work: &mut u64, n: u64) -> Option<()> {
-    match work.checked_sub(n) {
-        Some(left) => {
-            *work = left;
-            Some(())
-        }
-        None => {
-            *work = 0;
-            None
-        }
-    }
+/// Preflights a batch without charging anything for a refused read.
+fn spend(work: &mut u64, n: u64) -> Result<(), ()> {
+    *work = work.checked_sub(n).ok_or(())?;
+    Ok(())
 }
 
 /// The coefficients a residual at subset `sub_q` could line up with: those of the active
 /// higher monomials `q2` (`q2 ⊃ sub_q`, `q2` not inside `pivot_q`), in order. `live` lists the
-/// subsets whose coefficient is not zero: only those are read, a unit of `work` each (`None`
-/// where that runs out).
+/// subsets whose coefficient is not zero: only those are read, a unit of `work` each.
 fn others(
     alpha: &[BitVec],
     live: &[u32],
     pivot_q: usize,
     sub_q: usize,
     work: &mut u64,
-) -> Option<Vec<BitVec>> {
+) -> Result<Vec<BitVec>, ()> {
     let above = &live[live.partition_point(|&q| q as usize <= sub_q)..];
     spend(work, above.len().max(1) as u64)?;
     let mut found: Vec<BitVec> = above
@@ -406,7 +397,7 @@ fn others(
         .collect();
     found.sort_unstable();
     found.dedup();
-    Some(found)
+    Ok(found)
 }
 
 /// Whether a residual coefficient `rem` lines up with one of `others` (see [`others`]), so
@@ -432,10 +423,10 @@ fn aligns_with_other(others: &[BitVec], rem: &BitVec, pmask: &BitVec) -> bool {
 /// Decomposes conjunction coefficients `alpha[0 .. 1 << s]` (`alpha[0]` ignored; pass `konst`
 /// separately) over `s` atoms (`1 <= s <= MAX_COBRA_ATOMS`) modulo `2^prec`.
 ///
-/// Returns `Some(terms)` with `Σ_k weight_k · op_k ≡ Σ_{q>0} alpha[q] · AND_q (mod 2^prec)`.
+/// Returns `Ok(Some(terms))` with `Σ_k weight_k · op_k ≡ Σ_{q>0} alpha[q] · AND_q (mod 2^prec)`.
 ///
 /// `work` is what it may spend, a unit per coefficient it reads, and is left with what it did
-/// not (the caller charges the difference): `None` where it runs out. A pivot over three
+/// not (the caller charges the difference): `Err(())` where a batch does not fit. A pivot over three
 /// atoms tries every library entry and weight against the others' coefficients, so a
 /// decomposition over ten atoms can read millions of them.
 pub(crate) fn decompose(
@@ -444,9 +435,9 @@ pub(crate) fn decompose(
     prec: u32,
     alpha_in: &[BitVec],
     work: &mut u64,
-) -> Option<Vec<(BasisOp, BitVec)>> {
+) -> Result<Option<Vec<(BasisOp, BitVec)>>, ()> {
     if s == 0 || s > MAX_COBRA_ATOMS || prec == 0 || alpha_in.len() != (1usize << s) {
-        return None;
+        return Ok(None);
     }
     spend(work, 1 << s)?;
     let pmask = low_mask(w, prec);
@@ -489,7 +480,7 @@ pub(crate) fn decompose(
             break;
         };
         if terms.len() >= MAX_BASIS_TERMS {
-            return None;
+            return Ok(None);
         }
         let q_star = usize::MAX - inv_q;
         let d_usize = d as usize;
@@ -744,7 +735,7 @@ pub(crate) fn decompose(
         );
     }
 
-    Some(terms)
+    Ok(Some(terms))
 }
 
 fn push_term(terms: &mut Vec<(BasisOp, BitVec)>, op: BasisOp, weight: BitVec, pmask: &BitVec) {

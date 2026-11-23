@@ -9,6 +9,8 @@ use crate::{
 const MAX_NODES: usize = 4096;
 
 mod exhaust;
+mod guard;
+mod weighted;
 pub(super) use exhaust::stripes;
 
 pub(super) struct Trial {
@@ -40,6 +42,7 @@ struct Symbol {
     key: SymbolKey,
     width: Width,
     ones: u64,
+    free: u64,
     unknown: Vec<(u16, u32)>,
 }
 
@@ -71,6 +74,29 @@ impl Program {
         constraints: &[u32],
         assumptions: Option<&Assumptions>,
     ) -> Option<Self> {
+        let (mut program, slots) = Self::lower(cx, goal, constraints)?;
+        if let Some(assumptions) = assumptions {
+            program.fix_scoped_bits(assumptions, &slots)?;
+        }
+        // Coordinate streams are used by ordered and bit-sliced sampling, never by
+        // guard sampling, which supplies one complete word per symbol.
+        for symbol in &mut program.symbols {
+            let mut free = symbol.free;
+            symbol.unknown.reserve_exact(free.count_ones() as usize);
+            while free != 0 {
+                symbol.unknown.push((free.trailing_zeros() as u16, program.inputs));
+                program.inputs += 1;
+                free &= free - 1;
+            }
+        }
+        Some(program)
+    }
+
+    fn lower(
+        cx: &mut Context,
+        goal: u32,
+        constraints: &[u32],
+    ) -> Option<(Self, IdMap<u32, usize>)> {
         let mut roots = vec![goal];
         roots.extend_from_slice(constraints);
         let remaining = std::cell::Cell::new(MAX_NODES);
@@ -90,7 +116,6 @@ impl Program {
         let mut slots = IdMap::default();
         let mut ops = Vec::with_capacity(order.len());
         let mut symbols = Vec::new();
-        let mut inputs = 0;
         for id in order {
             let node = cx.node(id);
             let width = node.width;
@@ -108,19 +133,13 @@ impl Program {
                             k.known_zero().to_u64().unwrap(),
                         )
                     });
-                    let mut unknown = Vec::new();
-                    for bit in 0..width {
-                        if (ones | zeros) >> bit & 1 == 0 {
-                            unknown.push((bit, inputs));
-                            inputs += 1;
-                        }
-                    }
                     let slot = symbols.len();
                     symbols.push(Symbol {
                         key,
                         width: cx.width_of(id),
                         ones,
-                        unknown,
+                        free: mask(width) & !(ones | zeros),
+                        unknown: Vec::new(),
                     });
                     Op::Symbol(slot)
                 }
@@ -151,18 +170,15 @@ impl Program {
                 mask: mask(width),
             });
         }
-        let mut program = Self {
+        let program = Self {
             ops,
             symbols,
-            inputs,
+            inputs: 0,
             goal: slots[&goal],
             constraints: constraints.iter().map(|id| slots[id]).collect(),
             word_groups: Vec::new(),
         };
-        if let Some(assumptions) = assumptions {
-            program.fix_scoped_bits(assumptions, &slots)?;
-        }
-        Some(program)
+        Some((program, slots))
     }
 
     // Use only exact original seed masks through pure wiring. In particular, do not read
@@ -261,24 +277,14 @@ impl Program {
                 _ => {}
             }
         }
-        let mut inputs = 0;
         for (symbol, &(known, ones)) in self.symbols.iter_mut().zip(&fixed) {
-            let unknown = symbol
-                .unknown
-                .iter()
-                .fold(0u64, |m, &(bit, _)| m | (1u64 << bit));
-            let global = mask(symbol.width.bits()) & !unknown;
+            let global = mask(symbol.width.bits()) & !symbol.free;
             if global & known & (symbol.ones ^ ones) != 0 {
                 return None;
             }
             symbol.ones |= ones;
-            symbol.unknown.retain(|&(bit, _)| known >> bit & 1 == 0);
-            for (_, coordinate) in &mut symbol.unknown {
-                *coordinate = inputs;
-                inputs += 1;
-            }
+            symbol.free &= !known;
         }
-        self.inputs = inputs;
         Some(())
     }
 
@@ -424,11 +430,15 @@ impl Program {
     }
 
     fn evaluate(&self, inputs: &[u64], lane: u32, values: &mut [u64]) {
+        self.evaluate_with(|s| Self::symbol_value(&self.symbols[s], inputs, lane), values);
+    }
+
+    fn evaluate_with(&self, symbol: impl Fn(usize) -> u64, values: &mut [u64]) {
         for (i, instruction) in self.ops.iter().enumerate() {
             let width = instruction.width;
             values[i] = match instruction.op {
                 Op::Constant(value) => value,
-                Op::Symbol(slot) => Self::symbol_value(&self.symbols[slot], inputs, lane),
+                Op::Symbol(slot) => symbol(slot),
                 Op::Unary(op, a) => {
                     let a = values[a];
                     match op {
@@ -613,6 +623,159 @@ pub(super) fn try_sample(
         model: None,
         complete: false,
     })
+}
+
+/// A uniform random word essentially never equals a specific 64-bit case label.
+/// Spend one sample batch on the original DAG, biasing each symbol toward its own
+/// comparison literals. This is witness search only: a miss says nothing.
+pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<Model>)> {
+    // A short select chain can return its fallback on almost every random input,
+    // even when a few simultaneous tag equalities reach a different word.
+    let n = cx.node(root);
+    let selected_equality = n.op == OpCode::Eq
+        && [n.a, n.b].iter().any(|&i| cx.node(i).op == OpCode::Select);
+    if !selected_equality && cx.height(cx.handle(root)).ok()? < 32 {
+        return None;
+    }
+    let (p, slots) = Program::lower(cx, root, &[])?;
+    if !selected_equality && p.ops.len() < 128 {
+        return None;
+    }
+    let mut labels = vec![Vec::new(); p.symbols.len()];
+    let mut cases = Vec::new();
+    for ins in &p.ops {
+        let Op::Compare(op, a, b, _) = ins.op else { continue };
+        let Some(target) = guard::Target::literal(&p, a, b) else { continue };
+        if let Op::Symbol(s) = p.ops[target.slot].op {
+            if labels[s].len() < 8 && !labels[s].contains(&target.value) {
+                labels[s].push(target.value);
+            }
+        } else if matches!(op, CmpOp::Eq | CmpOp::Ne) && cases.len() < 64 {
+            cases.push(target);
+        }
+    }
+    if selected_equality && p.ops.len() < 128 && labels.iter().all(Vec::is_empty) {
+        return None;
+    }
+    let mut values = vec![0; p.ops.len()];
+    let mut assignment = vec![0; p.symbols.len()];
+    // If the original question is an implication, keep assignments close to
+    // satisfying its counterexample conjuncts. Ranking never decides the result.
+    let mut terms = Vec::new();
+    let mut fields = Vec::new();
+    let mut stack = vec![(root, false)];
+    for _ in 0..128 {
+        let Some((i, want)) = stack.pop() else { break };
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Not => stack.push((n.a, !want)),
+            OpCode::And if want => stack.extend([(n.a, true), (n.b, true)]),
+            OpCode::Or if !want => stack.extend([(n.a, false), (n.b, false)]),
+            _ => {
+                terms.push((slots[&i], want));
+                if want && n.op == OpCode::Eq && fields.len() < 4
+                    && let Some(f) = crate::expr::field::field(cx, i)
+                    && (1..=16).contains(&f.mask.count_ones())
+                    && let Op::Symbol(s) = p.ops[slots[&f.base]].op
+                {
+                    fields.push((s, f));
+                }
+            }
+        }
+    }
+    let required: Vec<_> = terms.iter().filter_map(|&(i, want)| {
+        match p.ops[i].op {
+            Op::Compare(op @ (CmpOp::Eq | CmpOp::Ne), a, b, _) if (op == CmpOp::Eq) == want => {
+                guard::Target::literal(&p, a, b)
+            }
+            _ => None,
+        }
+    }).collect();
+    let ranges = guard::intervals(&p, &terms);
+    let mut best = assignment.clone();
+    let mut distance = u32::MAX;
+    let mut offset = None;
+    for lane in 0..64 {
+        // A known field has a constructive inverse. Vary its free bits on
+        // fresh lanes instead of repairing unrelated internal case labels.
+        let field_lane = !fields.is_empty() && terms.len() > 1 && (8..48).contains(&lane);
+        // Try the structural inverse and weighted terms first. Later lanes
+        // can repair one hidden addend, each from the same legal zero seed.
+        let coordinate = (lane >= 32).then(|| (lane - 32) as usize)
+            .filter(|&s| s < p.symbols.len()).zip(offset);
+        let patch = if let Some((s, delta)) = coordinate {
+            for (v, sym) in assignment.iter_mut().zip(&p.symbols) { *v = sym.ones; }
+            let sym = &p.symbols[s];
+            Some((s, sym.ones | (sym.ones.wrapping_add(delta) & sym.free)))
+        } else if !field_lane && lane >= 8 && lane & 3 < 2 && (!cases.is_empty() || !ranges.is_empty()) {
+            let round = (lane / 4 * 2 + lane % 4) as usize;
+            guard::propose(&p, &values, &required, &ranges, &cases, round)
+        } else {
+            None
+        };
+        if let Some((s, v)) = patch {
+            assignment[s] = v;
+        } else {
+            for (i, val) in assignment.iter_mut().enumerate() {
+                let rand = sample(lane + 1, i as u32);
+                if !field_lane && lane >= 32 && lane % 4 == 3 && terms.len() > 1 && rand & 3 != 0 {
+                    *val = best[i];
+                    continue;
+                }
+                let v = match lane {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ if !labels[i].is_empty() && rand & 7 != 0 => {
+                        labels[i][(rand >> 32) as usize % labels[i].len()]
+                    }
+                    _ if field_lane => rand,
+                    _ if lane & 3 == 0 => 0,
+                    _ if lane & 3 == 1 => u64::MAX,
+                    _ => rand,
+                };
+                *val = p.symbols[i].ones | (v & p.symbols[i].free);
+            }
+        }
+        // Stay inside mandatory masked equalities while varying their free
+        // bits. Do not override declarations or overwrite the extremal seeds.
+        if lane >= 2 {
+            for &(s, field) in &fields {
+                let sym = &p.symbols[s];
+                let v = field.seed(assignment[s]) & mask(sym.width.bits());
+                if v & !sym.free == sym.ones { assignment[s] = v; }
+            }
+        }
+        p.evaluate_with(|s| assignment[s], &mut values);
+        if lane == 0 && terms.len() == 2 && let [interval] = ranges.as_slice() {
+            offset = interval.offset(&values);
+        }
+        if values[p.goal] == 0 {
+            let model = p.symbols.iter().zip(assignment).map(|(s, v)| {
+                (s.key.clone(), BitVec::from_u64(s.width, v).unwrap())
+            }).collect();
+            return Some((u64::from(lane) + 1, Some(model)));
+        }
+        if terms.len() > 1 {
+            let rank = terms.iter().map(|&(i, want)| {
+                if (values[i] != 0) == want { return 0; }
+                64 + match p.ops[i].op {
+                    Op::Compare(CmpOp::Eq | CmpOp::Ne, a, b, _) => (values[a] ^ values[b]).count_ones(),
+                    Op::Compare(CmpOp::Ult | CmpOp::Ule, a, b, _) => {
+                        1 + values[a].abs_diff(values[b]).checked_ilog2().unwrap_or(0)
+                    }
+                    Op::Compare(CmpOp::Slt | CmpOp::Sle, a, b, w) => {
+                        1 + signed(values[a], w).abs_diff(signed(values[b], w)).checked_ilog2().unwrap_or(0)
+                    }
+                    _ => 1,
+                }
+            }).sum();
+            if rank <= distance {
+                distance = rank;
+                best.copy_from_slice(&assignment);
+            }
+        }
+    }
+    Some((64, None))
 }
 
 /// Decides the goal under the constraints by evaluating every legal assignment, when the word

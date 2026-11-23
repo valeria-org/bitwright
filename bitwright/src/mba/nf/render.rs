@@ -13,7 +13,7 @@ use super::poly::{Mono, Poly, Sym};
 use super::synth;
 use super::word::{bv_and, bv_not, bv_or, bv_xor, count_ones, low_mask, trailing_zeros};
 use crate::engine::pass::bitwise::{T, min_forms, subtables};
-use crate::mba::certify;
+use crate::mba::certify::{self, Meter, Steps};
 use crate::mba::expr::{MNode, MOp, MbaExpr};
 use crate::mba::solve::Verdict;
 use crate::ops::{BinOp, UnOp};
@@ -692,10 +692,7 @@ pub(crate) struct Render<'a> {
     pub(crate) built: u64,
     /// Per product node built from normal forms: the factor and quotient it multiplies.
     products: HashMap<u32, (Poly, Poly)>,
-    /// Work spent, in the solver's steps (terms and table entries visited, division term
-    /// operations), and the most it may spend: past it, no more candidates are generated.
-    pub(crate) work: u64,
-    limit: u64,
+    budget: RenderBudget<'a>,
     /// [`poly`](Self::poly)'s renderings by form and depth, and the factors they were rendered
     /// with. A reuse costs the lookup: products render their factors for every quotient, and
     /// charging each reuse the rendering's work spent most of a budget on nothing.
@@ -732,6 +729,28 @@ pub(crate) struct Render<'a> {
     below: Option<u16>,
     /// What [`Render::sum`] reuses from one sum to the next.
     sum_scratch: SumScratch,
+}
+
+/// The question's meter, shared even by renderings that are abandoned. Trying an alternative
+/// temporarily sets some steps aside; refusing a batch never spends those or its unspent share.
+struct RenderBudget<'a> {
+    steps: &'a mut Steps,
+    reserved: u64,
+    exhausted: bool,
+}
+
+impl RenderBudget<'_> {
+    fn left(&self) -> u64 {
+        self.steps.left - self.reserved
+    }
+
+    fn spend(&mut self, n: u64) -> bool {
+        if self.exhausted || n > self.left() {
+            self.exhausted = true;
+            return false;
+        }
+        self.steps.charge(n).is_ok()
+    }
 }
 
 /// The vectors of [`Render::sum`]: the terms merged by node, those with positive and with
@@ -811,7 +830,7 @@ impl<'a> Render<'a> {
         w: Width,
         classes: &'a Classes,
         atom_exprs: &'a [MbaExpr],
-        limit: u64,
+        steps: &'a mut Steps,
     ) -> Render<'a> {
         Render {
             b: Builder::new(vars),
@@ -821,8 +840,11 @@ impl<'a> Render<'a> {
             w,
             built: 0,
             products: HashMap::new(),
-            work: 0,
-            limit,
+            budget: RenderBudget {
+                steps,
+                reserved: 0,
+                exhausted: false,
+            },
             memo: HashMap::new(),
             memo_factors: Vec::new(),
             synth: SynthTally::default(),
@@ -933,64 +955,58 @@ impl<'a> Render<'a> {
         Some(floor)
     }
 
-    /// Spends `n` steps; false once past the limit (then callers stop generating candidates).
+    /// Preflights a batch. Only admitted work is charged.
     fn spend(&mut self, n: u64) -> bool {
-        self.work = self.work.saturating_add(n);
-        self.work <= self.limit
+        self.budget.spend(n)
     }
 
     /// Whether candidate generation was cut short by the limit.
     pub(crate) fn exhausted(&self) -> bool {
-        self.work > self.limit
+        self.budget.exhausted
     }
 
-    /// The most work candidate generation may spend.
-    pub(crate) fn limit(&self) -> u64 {
-        self.limit
+    pub(crate) fn left(&self) -> u64 {
+        self.budget.left()
     }
 
-    /// Sets the most work candidate generation may spend (from here on).
-    pub(crate) fn set_limit(&mut self, limit: u64) {
-        self.limit = limit;
+    /// Try an optional alternative with half the remaining budget. Its refusal stops only
+    /// that search; work it did before the refusal stays charged to the question.
+    pub(crate) fn alternate(&mut self, p: &Poly, factors: &[Poly]) -> Vec<u32> {
+        debug_assert!(!self.exhausted() && self.budget.reserved == 0);
+        self.budget.reserved = self.left().div_ceil(2);
+        let out = self.poly(p, factors, 0);
+        self.budget.reserved = 0;
+        self.budget.exhausted = false;
+        out
     }
 
-    /// `p / f` if exact, charged to the meter; at most `(4·|p| + 16)·|f|` term operations.
-    fn divide(&mut self, p: &Poly, f: &Poly) -> Option<Poly> {
-        let cap = (4 * p.len() as u64 + 16) * f.len() as u64 + p.len() as u64;
-        let room = self.limit.saturating_sub(self.work) / DIVISION_STEP;
-        let start = cap.min(room);
-        let mut left = start;
-        let q = p.div_exact(f, &mut left);
-        self.spend((start - left) * DIVISION_STEP + 1);
-        match q {
-            Ok(q) => q,
-            Err(()) => {
-                if room < cap {
-                    // Stopped by the limit rather than by the division's own bound.
-                    self.work = self.limit.saturating_add(1);
-                }
-                None
-            }
+    /// Meter either form of polynomial division: one step to try, then `DIVISION_STEP` per
+    /// accepted term operation. Hitting division's own cap is not question exhaustion.
+    fn division<T>(
+        &mut self,
+        p: &Poly,
+        f: &Poly,
+        divide: impl FnOnce(&Poly, &Poly, &mut u64) -> Result<Option<T>, ()>,
+    ) -> Option<T> {
+        if !self.spend(1) {
+            return None;
         }
+        let cap = (4 * p.len() as u64 + 16) * f.len() as u64 + p.len() as u64;
+        let start = cap.min(self.left() / DIVISION_STEP);
+        let mut left = start;
+        let q = divide(p, f, &mut left);
+        self.spend((start - left) * DIVISION_STEP);
+        self.budget.exhausted |= q.is_err() && start < cap;
+        q.ok().flatten()
+    }
+
+    fn divide(&mut self, p: &Poly, f: &Poly) -> Option<Poly> {
+        self.division(p, f, Poly::div_exact)
     }
 
     /// `p = f·q + r` (see [`Poly::div_rem`]), charged to the meter like [`Render::divide`].
     fn divide_rem(&mut self, p: &Poly, f: &Poly) -> Option<(Poly, Poly)> {
-        let cap = (4 * p.len() as u64 + 16) * f.len() as u64 + p.len() as u64;
-        let room = self.limit.saturating_sub(self.work) / DIVISION_STEP;
-        let start = cap.min(room);
-        let mut left = start;
-        let q = p.div_rem(f, &mut left);
-        self.spend((start - left) * DIVISION_STEP + 1);
-        match q {
-            Ok(q) => q,
-            Err(()) => {
-                if room < cap {
-                    self.work = self.limit.saturating_add(1);
-                }
-                None
-            }
-        }
+        self.division(p, f, Poly::div_rem)
     }
 
     /// The factors and quotients of the products the candidate at `root` uses (to try as
@@ -1090,9 +1106,11 @@ impl<'a> Render<'a> {
     /// `a·t + b·t`), positive coefficients first, then the others, subtracted (or added with
     /// their negative coefficient when that constant is needed anyway), powers of two as shifts,
     /// the constant last.
-    pub(crate) fn sum(&mut self, s: &Sum) -> u32 {
+    pub(crate) fn sum(&mut self, s: &Sum) -> Option<u32> {
+        if !self.spend(4 * s.terms.len() as u64 + 1) {
+            return None;
+        }
         let w = self.w;
-        self.spend(4 * s.terms.len() as u64 + 1);
         let mut acc: Option<u32> = None;
         // The vectors of the last sum, emptied: sums are emitted by the thousand.
         let SumScratch {
@@ -1221,14 +1239,14 @@ impl<'a> Render<'a> {
             neg,
             needed,
         };
-        match acc {
+        Some(match acc {
             None => self.b.konst(&k),
             Some(a) if k.is_zero() => a,
             Some(a) => {
                 let c = self.b.konst(&k);
                 self.b.bin(MOp::Add, a, c)
             }
-        }
+        })
     }
 
     /// The cheapest of `cands` (node count, weight, structure).
@@ -1338,7 +1356,7 @@ impl<'a> Render<'a> {
                 sum.terms.push((c, super::word::signed(w, i128::from(k))));
             }
         }
-        out.push(self.sum(&sum));
+        out.extend(self.sum(&sum));
         self.built += out.len() as u64;
         out
     }
@@ -1547,8 +1565,7 @@ impl<'a> Render<'a> {
         // Splits and decompositions meet the same tables again: each once.
         let key = (t, atoms.to_vec());
         if let Some(&x) = self.wide.get(&key) {
-            self.spend(s as u64);
-            return x;
+            return self.spend(s as u64).then_some(x).flatten();
         }
         let c = self.wide_forms(t, atoms);
         let x = self.best(&c);
@@ -1657,7 +1674,9 @@ impl<'a> Render<'a> {
         let (t, h) = (low?.clone(), high?);
         let tt = table8(&t, s)?;
         let tt = if h { !tt } else { tt };
-        self.spend(4u64 << s);
+        if !self.spend(4u64 << s) {
+            return None;
+        }
         let atoms: Vec<u32> = vars.iter().map(|&v| self.b.var(v)).collect();
         let g = self.min_form_at(tt, &atoms, n)?;
         let z = self.b.cast(MOp::Zext, g, w);
@@ -1874,7 +1893,7 @@ impl<'a> Render<'a> {
     /// Renderings of `konst + Σ γ·m` (degree at most 1).
     pub(crate) fn linear(&mut self, p: &Poly) -> Vec<u32> {
         let sums = self.linear_sums(p);
-        sums.iter().map(|s| self.sum(s)).collect()
+        sums.iter().map_while(|s| self.sum(s)).collect()
     }
 
     /// Decompositions of `konst + Σ γ·m` (degree at most 1) into sums: as a bitwise function
@@ -2992,16 +3011,12 @@ impl<'a> Render<'a> {
                         .fold(0usize, |q, (j, _)| q | (1 << j));
                     alpha[q] = super::word::bin(BinOp::Add, &alpha[q], c);
                 }
-                // What the decomposition reads is charged as it goes, within what is left (one
-                // past the limit where that runs out, so the rendering reports it).
-                let allow = this.limit.saturating_sub(this.work);
+                let allow = this.left();
                 let mut left = allow;
                 let terms = crate::cobra::decompose(s, w, prec, &alpha, &mut left);
-                let short = u64::from(terms.is_none() && left == 0);
-                if !this.spend(allow - left + short) {
-                    return None;
-                }
-                Some((support, terms?))
+                this.spend(allow - left);
+                this.budget.exhausted |= terms.is_err();
+                Some((support, terms.ok().flatten()?))
             };
 
         let mut rem_konst = p.konst();
@@ -3626,7 +3641,9 @@ impl<'a> Render<'a> {
             let Some(best) = self.cheapest(inner_sums) else {
                 return out;
             };
-            let inner = self.sum(&best);
+            let Some(inner) = self.sum(&best) else {
+                return out;
+            };
             let n = self.b.un(MOp::Not, inner);
             out.push(Sum {
                 terms: vec![(n, super::word::one(w))],
@@ -3688,10 +3705,12 @@ impl<'a> Render<'a> {
                 .filter(|(_, d)| rep(d) != rep(&r))
                 .copied()
                 .collect();
-            let inner = self.sum(&Sum {
+            let Some(inner) = self.sum(&Sum {
                 terms: group.clone(),
                 konst: None,
-            });
+            }) else {
+                break;
+            };
             let mut terms = rest.clone();
             terms.push((inner, r));
             out.push(Sum {
@@ -3719,7 +3738,9 @@ impl<'a> Render<'a> {
             let Some(best) = self.cheapest(variants) else {
                 continue;
             };
-            let inner = self.sum(&best);
+            let Some(inner) = self.sum(&best) else {
+                break;
+            };
             let mut terms = rest;
             terms.push((inner, r));
             out.push(Sum { terms, konst: None });
@@ -3817,7 +3838,7 @@ impl<'a> Render<'a> {
             match inner.terms[..] {
                 [(x, _)] => out.terms.push((x, *k)),
                 _ => {
-                    let x = self.sum(&inner);
+                    let x = self.sum(&inner)?;
                     out.terms.push((x, *k));
                 }
             }
@@ -3934,7 +3955,9 @@ impl<'a> Render<'a> {
                     let mut best: Option<(Cost, usize)> = None;
                     for k in 0..options[g].len() {
                         choice[g] = k;
-                        let root = self.sum(&total(&options, &choice));
+                        let Some(root) = self.sum(&total(&options, &choice)) else {
+                            return Vec::new();
+                        };
                         let cost = self.b.cost(root);
                         if best.is_none_or(|(c, _)| cost < c) {
                             best = Some((cost, k));
@@ -3953,9 +3976,9 @@ impl<'a> Render<'a> {
         let mut costed: Vec<(Cost, usize, Sum)> = sums
             .into_iter()
             .enumerate()
-            .map(|(i, s)| {
-                let root = self.sum(&s);
-                (self.b.cost(root), i, s)
+            .map_while(|(i, s)| {
+                let root = self.sum(&s)?;
+                Some((self.b.cost(root), i, s))
             })
             .collect();
         costed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -3965,7 +3988,9 @@ impl<'a> Render<'a> {
     fn cheapest(&mut self, sums: Vec<Sum>) -> Option<Sum> {
         let mut best: Option<(Cost, Sum)> = None;
         for s in sums {
-            let root = self.sum(&s);
+            let Some(root) = self.sum(&s) else {
+                break;
+            };
             let cost = self.b.cost(root);
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {
                 best = Some((cost, s));
@@ -3981,15 +4006,19 @@ impl<'a> Render<'a> {
     pub(crate) fn poly(&mut self, p: &Poly, factors: &[Poly], depth: u32) -> Vec<u32> {
         // Products render their factor for every quotient: each form once per depth. Deeper
         // calls pass the factors they were given.
+        if self.exhausted() {
+            return Vec::new();
+        }
         if depth == 0 && self.memo_factors.as_slice() != factors {
             self.memo.clear();
             self.memo_factors = factors.to_vec();
         }
         let key = (p.clone(), depth);
         if let Some(out) = self.memo.get(&key) {
-            let out = out.clone();
-            self.spend(p.len() as u64 + out.len() as u64);
-            return out;
+            if !self.budget.spend(p.len() as u64 + out.len() as u64) {
+                return Vec::new();
+            }
+            return out.clone();
         }
         let out = self.render_poly(p, factors, depth);
         if !self.exhausted() {
@@ -4125,7 +4154,7 @@ impl<'a> Render<'a> {
                 })
                 .collect();
             if let Some(s) = self.cheapest(joined) {
-                out.push(self.sum(&s));
+                out.extend(self.sum(&s));
             }
         }
         if depth == 0
@@ -4190,12 +4219,11 @@ impl<'a> Render<'a> {
         self.synth.hits += 1;
         let skeleton = self.skeleton(nf, &ids)?;
         let hit = table.expr(i, w, k)?;
-        let effort = self
-            .limit
-            .saturating_sub(self.work)
-            .saturating_mul(super::EVALS_PER_STEP);
+        let effort = self.left().saturating_mul(super::EVALS_PER_STEP);
         let report = certify::check(&skeleton, &hit, effort);
-        self.spend(report.work.div_ceil(super::EVALS_PER_STEP).max(1));
+        if !self.spend(report.work.div_ceil(super::EVALS_PER_STEP)) {
+            return None;
+        }
         match report.verdict {
             Verdict::Proved => {
                 self.synth.proved += 1;
@@ -4235,7 +4263,10 @@ impl<'a> Render<'a> {
 
     /// `nf` over `ids.len()` fresh variables, variable `j` standing for atom `ids[j]`, as the
     /// sum of its monomials.
-    fn skeleton(&self, nf: &Poly, ids: &[u32]) -> Option<MbaExpr> {
+    fn skeleton(&mut self, nf: &Poly, ids: &[u32]) -> Option<MbaExpr> {
+        if self.exhausted() {
+            return None;
+        }
         let w = self.w;
         let k = ids.len();
         let mut map: Vec<u32> = (0..64).collect();
@@ -4251,7 +4282,8 @@ impl<'a> Render<'a> {
             })
             .collect();
         let vars = vars?;
-        let mut r = Render::new(vec![w; k], w, self.classes, &vars, u64::MAX);
+        let mut r = Render::new(vec![w; k], w, self.classes, &vars, self.budget.steps);
+        r.budget.reserved = self.budget.reserved;
         let mut sum = Sum {
             terms: Vec::new(),
             konst: Some(nf.konst()),
@@ -4263,7 +4295,8 @@ impl<'a> Render<'a> {
             }
         }
         let root = r.sum(&sum);
-        r.b.finish(root)
+        self.budget.exhausted |= r.exhausted();
+        r.b.finish(root?)
     }
 
     /// `f·q`, each rendered at its cheapest.
@@ -4588,14 +4621,14 @@ impl<'a> Render<'a> {
                 self.sum(&Sum {
                     terms: vec![(x, super::word::one(w))],
                     konst: Some(super::word::small(w, s)),
-                })
+                })?
             };
             let y = self.power(base, k);
             let b = super::word::small(w, b);
-            return Some(self.sum(&Sum {
+            return self.sum(&Sum {
                 terms: vec![(y, super::word::small(w, a))],
                 konst: (!b.is_zero()).then_some(b),
-            }));
+            });
         }
         None
     }
@@ -4692,5 +4725,40 @@ impl crate::cobra::Gates for CobraGates<'_, '_> {
     fn complement(&mut self, a: u32) -> Result<u32, ()> {
         let comps = self.r.complement(a);
         self.r.best(&comps).ok_or(())
+    }
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+
+    #[test]
+    fn alternate_refusal_releases_its_reserve() {
+        let w = Width::W8;
+        let classes = Classes::new(w, &[], 1).unwrap();
+        let p = Poly::constant(BitVec::one(w));
+        // Half of three steps admits the first one-step batch; half of one admits none.
+        for (limit, left) in [(3, 2), (1, 1)] {
+            let mut steps = Steps::new(limit);
+            let mut r = Render::new(Vec::new(), w, &classes, &[], &mut steps);
+            assert!(r.alternate(&p, &[]).is_empty());
+            assert_eq!(r.left(), left);
+            assert!(!r.exhausted());
+            assert!(r.sum(&Sum::default()).is_some());
+        }
+    }
+
+    #[test]
+    fn partial_division_charges_only_accepted_term_operations() {
+        let w = Width::W8;
+        let classes = Classes::new(w, &[], 1).unwrap();
+        let p = Poly::constant(BitVec::one(w));
+        // The attempt and its first term fit; the next term (four steps) does not.
+        let mut steps = Steps::new(7);
+        let mut r = Render::new(Vec::new(), w, &classes, &[], &mut steps);
+        assert!(r.divide(&p, &p).is_none());
+        assert!(r.exhausted());
+        assert_eq!(steps.spent, 1 + DIVISION_STEP);
+        assert_eq!(steps.left, 2);
     }
 }

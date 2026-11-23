@@ -3,11 +3,11 @@
 use super::aig::{Aig, Cnf};
 use super::blast::Bits;
 use super::sat::{self, Backend, Limits, Lit, Solver};
-use super::{Blaster, Model, Unknown};
+use super::{Blaster, Config, Model, Question, SampleMode, Simplifiers, Unknown};
 use crate::error::Error;
 use crate::expr::{Context, Expr};
 use crate::hash::IdMap;
-use crate::{BitVec, Checkpoint};
+use crate::{BitVec, Checkpoint, SymbolKey, Width};
 
 /// What an [`Incremental`] answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,6 +255,267 @@ impl<B: Backend> Incremental<B> {
         self.bits.retain(|&i, _| i < at.nodes());
         self.symbols.retain(|&(i, _)| i < at.nodes());
         self.added.retain(|&i, _| i < at.nodes());
+    }
+}
+
+/// A fixed family of feasibility questions. Every check requires the same Boolean `facts`
+/// and binds any subset of the `observations` (words or predicates) to concrete values.
+/// The family is simplified without target assumptions, blasted and encoded **once**.
+/// The mutable context borrow freezes declarations and prevents rollback until the family
+/// is dropped. A returned model is checked on the original facts and requested observations.
+///
+/// Unlike [`Incremental`], each search starts with a private copy of the unsearched SAT
+/// state: no learned clause, phase or spent budget leaks from another target. This trades
+/// copying the clause database for target-order independent answers, even at small limits.
+/// Preparation uses one simplify budget and one circuit cap for the **whole catalog**;
+/// each target gets the configured search limits. This is not the same circuit or search
+/// as a standalone question. If preparation returns [`Unknown::TooLarge`], prepare a smaller
+/// family or ask each original question separately: it says nothing about feasibility.
+///
+/// ```
+/// use bitwright::{BitVec, Context, ParseOptions, Width};
+/// use bitwright::prove::{Config, Prepared, Simplifiers};
+///
+/// let mut cx = Context::new();
+/// let o = ParseOptions::width(Width::W8);
+/// let fact = cx.parse("x + y == 7", &o)?;
+/// let x = cx.parse("x", &o)?;
+/// let goal = cx.parse("y == 4", &o)?;
+/// let cfg = Config::default().with_sweeping(false);
+/// let mut family = Prepared::new(&mut cx, &[fact], &[x, goal], &cfg, &Simplifiers::new())?
+///     .expect("supported family within its circuit cap");
+/// let three = BitVec::from_u64(Width::W8, 3).unwrap();
+/// // Is there a counterexample to `goal` under `fact` and `x == 3`?
+/// assert_eq!(family.check(&[(0, three), (1, BitVec::from_bool(false))])?, Ok(None));
+/// assert!(family.check(&[(0, three)])?.unwrap().is_some());
+/// # Ok::<(), bitwright::Error>(())
+/// ```
+#[derive(Debug)]
+pub struct Prepared<'c> {
+    cx: &'c mut Context,
+    original: Vec<Expr>,
+    facts: usize,
+    outputs: Vec<Bits>,
+    symbols: Vec<(SymbolKey, Width, Bits)>,
+    sampling: Option<(Aig, SampleMode, u32)>,
+    cnf: Cnf,
+    template: Solver,
+    limits: Limits,
+}
+
+impl<'c> Prepared<'c> {
+    /// Prepare exact shared predicates (use `Assumptions::predicates` for scoped facts)
+    /// and observed outputs, in the order used by [`check`](Self::check). Sampling, if
+    /// enabled, only finds witnesses. Certificate requests, sweeping, word sampling,
+    /// exhaustive enumeration, shared-sum rewriting and root-conditioned relational lemmas
+    /// require the ordinary [`Question`] pipeline and return [`Unknown::Unsupported`] here.
+    pub fn new(
+        cx: &'c mut Context,
+        facts: &[Expr],
+        observations: &[Expr],
+        cfg: &Config,
+        simplifiers: &Simplifiers,
+    ) -> Result<Result<Self, Unknown>, Error> {
+        if cfg.certificate
+            || cfg.sweeping
+            || cfg.word_sampling
+            || cfg.sample_mode == SampleMode::Words
+            || cfg.exhaustive_inputs != 0
+            || cfg.shared_sums
+            || cfg.relational_lemmas
+        {
+            return Ok(Err(Unknown::Unsupported(
+                "requested proof mode needs a standalone Question".into(),
+            )));
+        }
+        for &fact in facts {
+            let w = cx.width(fact)?;
+            if w != Width::W1 {
+                return Err(crate::WidthError::Mismatch {
+                    left: 1,
+                    right: w.bits(),
+                }
+                .into());
+            }
+        }
+        let original: Vec<_> = facts.iter().chain(observations).copied().collect();
+        let roots = if cfg.simplify || cfg.divisions {
+            let engine = if cfg.simplify {
+                simplifiers.engine(cfg.strict, cfg.proved_words)
+            } else {
+                simplifiers.divisions_only()
+            };
+            let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
+            engine
+                .run(cx, &original, run)?
+                .roots
+                .iter()
+                .map(|out| cx.id(out.expr))
+                .collect::<Result<_, _>>()?
+        } else {
+            cx.ids(&original)?
+        };
+        let mut b = Blaster::new(cx, cfg.max_nodes);
+        b.selector_hints = cfg.selector_branching;
+        b.join_factoring = cfg.join_factoring;
+        b.input_cancellation = cfg.input_cancellation;
+        b.carry_save_multiplication = cfg.carry_save_multiplication;
+        let mut outputs = Vec::with_capacity(roots.len());
+        for root in roots {
+            match b.blast(root) {
+                Ok(bits) => outputs.push(bits),
+                Err(e) => return Ok(Err(b.unknown(e)?)),
+            }
+        }
+        if b.g.len() > cfg.max_nodes {
+            return Ok(Err(Unknown::TooLarge { nodes: b.g.len() }));
+        }
+        // Include symbols erased by simplification, with their declared bits (or zero).
+        let ids = b.cx.symbols_in(&original)?;
+        let mut symbols = Vec::with_capacity(ids.len());
+        for id in ids {
+            let key = b.cx.symbol_key(id).unwrap();
+            let node = b.cx.find_symbol(key).unwrap().index();
+            let bits = b.bits.remove(&node).unwrap_or_else(|| {
+                b.cx.declared_at(node)
+                    .map(|known| super::blast::konst(&known.known_one()))
+                    .unwrap_or_default()
+            });
+            symbols.push((key.clone(), b.cx.width_of(node), bits));
+        }
+        symbols.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut template = Solver::new();
+        let all: Vec<_> = outputs.iter().flatten().copied().collect();
+        let cnf = Cnf::encode_with_xor3(&b.g, &all, &mut template, false, cfg.xor3_encoding);
+        for selector in b.selectors {
+            if let Some(l) = cnf.mapped_lit(selector) {
+                template.prefer_selector(l);
+            }
+        }
+        Ok(Ok(Self {
+            cx: b.cx,
+            original,
+            facts: facts.len(),
+            outputs,
+            symbols,
+            sampling: (cfg.samples != 0).then_some((b.g, cfg.sample_mode, cfg.samples.div_ceil(64))),
+            cnf,
+            template,
+            limits: cfg.limits(),
+        }))
+    }
+
+    /// Whether the facts hold with `observations[i] == value` for every `(i, value)`.
+    /// `Ok(Some(model))` is a replayed witness; `Ok(None)` is unsatisfiable. An unknown
+    /// (including budget exhaustion) is not a negative answer. Indices and widths are
+    /// checked even if another binding is contradictory.
+    pub fn check(
+        &mut self,
+        bindings: &[(usize, BitVec)],
+    ) -> Result<Result<Option<Model>, Unknown>, Error> {
+        let mut required: Vec<_> = self.outputs[..self.facts]
+            .iter()
+            .map(|bits| bits[0])
+            .collect();
+        for &(i, value) in bindings {
+            let bits = self.outputs[self.facts..]
+                .get(i)
+                .ok_or_else(|| Error::Unsupported("unknown observation index".into()))?;
+            if usize::from(value.width().bits()) != bits.len() {
+                return Err(crate::WidthError::Mismatch {
+                    left: bits.len() as u16,
+                    right: value.width().bits(),
+                }
+                .into());
+            }
+            for (j, &bit) in bits.iter().enumerate() {
+                required.push(bit ^ u32::from(value.bit(j as u16) != Some(true)));
+            }
+        }
+        required.sort_unstable();
+        required.dedup();
+        if required.first() == Some(&super::aig::FALSE)
+            || required.windows(2).any(|p| p[0] ^ 1 == p[1])
+        {
+            return Ok(Ok(None));
+        }
+        let required = required
+            .strip_prefix(&[super::aig::TRUE])
+            .unwrap_or(&required);
+        if required.is_empty() {
+            let model = Question::counterexample(&self.symbols, |l| l == super::aig::TRUE);
+            return self.replay(bindings, model);
+        }
+        if let Some((g, mode, batches)) = &self.sampling {
+            for batch in 0..*batches {
+                let vals = g.eval_words(|k| match mode {
+                    SampleMode::Random => super::sample(batch, k),
+                    _ => super::small_sample(batch, k),
+                });
+                let lanes = required
+                    .iter()
+                    .fold(u64::MAX, |a, &l| a & Aig::word(&vals, l));
+                if lanes != 0 {
+                    let lane = lanes.trailing_zeros();
+                    let model = Question::counterexample(&self.symbols, |l| {
+                        Aig::word(&vals, l) >> lane & 1 != 0
+                    });
+                    return self.replay(bindings, model);
+                }
+            }
+        }
+        if self.limits.conflicts == 0 || self.limits.propagations == 0 {
+            return Ok(Err(Unknown::Budget {
+                conflicts: 0,
+                propagations: 0,
+            }));
+        }
+        // This search is disposable. Bind all selected bits at level zero, before
+        // propagation, rather than paying a separate assumption level per output bit.
+        let mut solver = self.template.clone();
+        for &l in required {
+            if !solver.bind_root(self.cnf.lit(l)) {
+                return Ok(Ok(None));
+            }
+        }
+        match solver.solve_within(self.limits) {
+            sat::Answer::Unsat => Ok(Ok(None)),
+            sat::Answer::Unknown => Ok(Err(Unknown::Budget {
+                conflicts: solver.conflicts - self.template.conflicts,
+                propagations: solver.propagations - self.template.propagations,
+            })),
+            sat::Answer::Sat(values) => {
+                let model = Question::counterexample(&self.symbols, |l| self.cnf.value(l, &values));
+                self.replay(bindings, model)
+            }
+        }
+    }
+
+    fn replay(
+        &mut self,
+        bindings: &[(usize, BitVec)],
+        model: Model,
+    ) -> Result<Result<Option<Model>, Unknown>, Error> {
+        let roots: Vec<_> = self.original[..self.facts]
+            .iter()
+            .copied()
+            .chain(bindings.iter().map(|&(i, _)| self.original[self.facts + i]))
+            .collect();
+        let env = crate::FnEnv(|key: &SymbolKey, _| {
+            model.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| model[i].1)
+        });
+        let values = self.cx.eval(&roots, &env)?;
+        if values[..self.facts].iter().any(BitVec::is_zero)
+            || bindings
+                .iter()
+                .zip(&values[self.facts..])
+                .any(|((_, want), got)| want != got)
+        {
+            return Err(Error::Contract(
+                "prepared model fails the original constraints".into(),
+            ));
+        }
+        Ok(Ok(Some(model)))
     }
 }
 

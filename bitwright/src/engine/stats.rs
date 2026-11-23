@@ -143,6 +143,37 @@ impl Stats {
     }
 }
 
+/// Optional host-clock profile of solver candidates rejected by the MBA phase's pre-proof
+/// host-DAG size check. Costs accumulate across runs in the supplied clock's ticks.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct MbaRejections {
+    /// The node's own fragment, answered by a solver call.
+    pub fresh_whole: RejectionCost,
+    /// The node's own fragment, answered by the per-run answer cache.
+    pub cached_whole: RejectionCost,
+    /// An alternative reading or subquestion, answered by a solver call.
+    pub fresh_retry: RejectionCost,
+    /// An alternative reading or subquestion, answered by the per-run answer cache.
+    pub cached_retry: RejectionCost,
+}
+
+/// Work spent on MBA candidates in one bucket of [`MbaRejections`].
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct RejectionCost {
+    /// Candidates that reached and failed the size check.
+    pub count: u64,
+    /// Of these, candidates for which the refutation sample result was reused.
+    pub sample_hits: u64,
+    /// Ticks inside the solver call (including rendering); zero for a cached answer.
+    pub solve: u64,
+    /// Ticks checking the refutation sample, including comparison and charge on a hit.
+    pub sample: u64,
+    /// Ticks inside the host-DAG size check; excludes lifting.
+    pub shrink: u64,
+}
+
 /// Counters for the MBA service: calls, outcomes, and the refusal taxonomy.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]

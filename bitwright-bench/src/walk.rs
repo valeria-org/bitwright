@@ -9,8 +9,9 @@
 //! at the exporter's samples: it is then compared as `Constant(0x…)`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitwright::batch::{Answer, Ask, Config, Session, Split, Stats};
 use bitwright::prove;
@@ -134,6 +135,23 @@ fn add(total: &mut Stats, s: &Stats) {
     total.flushes += s.flushes;
 }
 
+struct Boundary<'a> {
+    name: &'a str,
+    questions: usize,
+    decided: usize,
+    tasks: u64,
+    retried: usize,
+    latency: Duration,
+}
+
+fn p95(boundaries: &mut [Boundary<'_>]) -> Option<Duration> {
+    let n = boundaries.len();
+    // ceil(0.95 * n) = n - floor(n / 20), without floating point.
+    let rank = (n - n / 20).checked_sub(1)?;
+    let (_, boundary, _) = boundaries.select_nth_unstable_by_key(rank, |b| b.latency);
+    Some(boundary.latency)
+}
+
 /// `bitwright-bench --walk DIR [--mode whole|split|eager|shared] [--threads N] [--cases N]
 /// [--no-deep] [--answers FILE]`.
 pub fn main(args: &[String]) -> ExitCode {
@@ -232,11 +250,14 @@ pub fn main(args: &[String]) -> ExitCode {
     };
     let (stock, retry) = (session_of(fuel), session_of(deep_fuel));
     let started = Instant::now();
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = String::new();
+    let mut measured = Vec::with_capacity(walk.len());
+    let mut previous_tasks = 0;
     let mut tally: BTreeMap<String, u64> = BTreeMap::new();
     let mut against: BTreeMap<String, u64> = BTreeMap::new();
     let (mut asked, mut retried, mut walk_ms) = (0u64, 0u64, 0u64);
     for (boundary, qs) in &walk {
+        let boundary_started = Instant::now();
         // One context per boundary: what its questions share is built once.
         let mut cx = Context::new();
         let o = ParseOptions::width(Width::W64);
@@ -267,24 +288,45 @@ pub fn main(args: &[String]) -> ExitCode {
                 }
             }
         }
+        if roots.is_empty() {
+            continue;
+        }
         let ask = |k: usize| match facts[k].is_empty() {
             true => Ask::constant(roots[k]),
             false => Ask::constant(roots[k]).under(&facts[k]),
         };
         let asks: Vec<Ask<'_>> = (0..roots.len()).map(ask).collect();
         let mut replies = stock.run(&mut cx, &asks).expect("the batch runs");
+        let mut boundary_retried = 0;
         if deep {
             // What stays open is asked again with the walk's larger budget.
             let open: Vec<usize> = (0..replies.len())
                 .filter(|&k| matches!(replies[k].answer, Answer::Unknown(_)))
                 .collect();
-            let again: Vec<Ask<'_>> = open.iter().map(|&k| ask(k)).collect();
-            retried += open.len() as u64;
-            let deeper = retry.run(&mut cx, &again).expect("the batch runs");
-            for (k, r) in open.into_iter().zip(deeper) {
-                replies[k] = r;
+            boundary_retried = open.len();
+            if !open.is_empty() {
+                let again: Vec<Ask<'_>> = open.iter().map(|&k| ask(k)).collect();
+                let deeper = retry.run(&mut cx, &again).expect("the batch runs");
+                for (k, r) in open.into_iter().zip(deeper) {
+                    replies[k] = r;
+                }
             }
         }
+        let latency = boundary_started.elapsed();
+        let tasks = stock.stats().tasks_solved + retry.stats().tasks_solved;
+        measured.push(Boundary {
+            name: boundary,
+            questions: replies.len(),
+            decided: replies
+                .iter()
+                .filter(|r| !matches!(r.answer, Answer::Unknown(_)))
+                .count(),
+            tasks: tasks - previous_tasks,
+            retried: boundary_retried,
+            latency,
+        });
+        previous_tasks = tasks;
+        retried += boundary_retried as u64;
         for (q, r) in kept.iter().zip(&replies) {
             asked += 1;
             walk_ms += q.ms;
@@ -301,17 +343,21 @@ pub fn main(args: &[String]) -> ExitCode {
                 false => format!("walk {} / batch {}", kind(&theirs), kind(&mine)),
             };
             *against.entry(verdict).or_default() += 1;
-            let c = &r.cost;
-            lines.push(format!(
-                "{boundary}/{} {mine} visits={} pass={} mba={} conflicts={} tasks={} | walk: {}",
-                q.name,
-                c.simplify.node_visits,
-                c.simplify.pass_work,
-                c.simplify.mba_steps,
-                c.conflicts,
-                c.tasks,
-                q.result
-            ));
+            if answers_file.is_some() {
+                let c = &r.cost;
+                writeln!(
+                    lines,
+                    "{boundary}/{} {mine} visits={} pass={} mba={} conflicts={} tasks={} | walk: {}",
+                    q.name,
+                    c.simplify.node_visits,
+                    c.simplify.pass_work,
+                    c.simplify.mba_steps,
+                    c.conflicts,
+                    c.tasks,
+                    q.result
+                )
+                .expect("writing to a String");
+            }
         }
     }
     let wall = started.elapsed().as_secs_f64();
@@ -325,6 +371,17 @@ pub fn main(args: &[String]) -> ExitCode {
         walk.len(),
         walk_ms as f64 / 1e3
     );
+    for b in &measured {
+        println!(
+            "boundary={} questions={} decided={} tasks={} retried={} latency_ms={:.3}",
+            b.name, b.questions, b.decided, b.tasks, b.retried, b.latency.as_secs_f64() * 1e3,
+        );
+    }
+    print!("nonempty_boundaries={} boundary_p95_ms=", measured.len());
+    match p95(&mut measured) {
+        Some(d) => println!("{:.3}", d.as_secs_f64() * 1e3),
+        None => println!("n/a"),
+    }
     println!("answers: {tally:?}");
     println!("against the walk: {against:?}");
     let held = 100.0 * (1.0 - stats.nodes_new as f64 / stats.nodes_asked.max(1) as f64);
@@ -348,7 +405,39 @@ pub fn main(args: &[String]) -> ExitCode {
         stats.flushes
     );
     if let Some(f) = answers_file {
-        let _ = std::fs::write(f, lines.join("\n") + "\n");
+        if let Err(e) = std::fs::write(&f, lines) {
+            eprintln!("{f}: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_rank_counts_boundaries_not_questions() {
+        for (n, expected) in [
+            (0, None),
+            (1, Some(1)),
+            (19, Some(19)),
+            (20, Some(19)),
+            (21, Some(20)),
+        ] {
+            let mut boundaries: Vec<_> = (1..=n)
+                .rev()
+                .map(|i| Boundary {
+                    name: "",
+                    questions: i as usize,
+                    decided: 0,
+                    tasks: 0,
+                    retried: 0,
+                    latency: Duration::from_millis(i),
+                })
+                .collect();
+            assert_eq!(p95(&mut boundaries), expected.map(Duration::from_millis));
+        }
+    }
 }

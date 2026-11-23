@@ -59,7 +59,7 @@ use crate::{BitVec, SymbolKey, Width};
 pub use exhaustion::Exhaustion;
 /// What an [`Incremental`] answers.
 pub use incremental::Answer as IncrementalAnswer;
-pub use incremental::Incremental;
+pub use incremental::{Incremental, Prepared};
 pub(crate) use lean::lean_equation;
 pub use lean::lean_theorem;
 pub use rule::{RuleOutcome, WidthReport, rule, rule_all_widths};
@@ -134,8 +134,9 @@ pub struct Config {
     /// Assignments of the symbols to evaluate before the search, 64 at a time
     /// (in batches of 64, selected by [`sample_mode`](Self::sample_mode)): a refutation that a fraction of
     /// the values give is found without the search, which needs many conflicts for it on a
-    /// large circuit. With [`word_sampling`](Self::word_sampling), supported samples precede
-    /// bit-blasting. 0: none.
+    /// large circuit. For deep integer questions with simplification and random sampling,
+    /// one batch can probe comparison literals before simplifying; a miss is not a proof.
+    /// With [`word_sampling`](Self::word_sampling), supported samples precede bit-blasting. 0: none.
     pub samples: u32,
     /// Assignment selection for [`samples`](Self::samples). Default: [`SampleMode::Random`].
     pub sample_mode: SampleMode,
@@ -815,7 +816,6 @@ impl<'c> Blaster<'c> {
         use blast::*;
         let n = self.cx.node(i);
         let w = usize::from(n.width);
-        let get = |s: &Self, j: u32| s.bits[&j].clone();
         let g = &mut self.g;
         Ok(match n.op {
             OpCode::Const => konst(&self.cx.const_val(i).unwrap_or(BitVec::zero(Width::W1))),
@@ -839,57 +839,48 @@ impl<'c> Blaster<'c> {
                 b
             }
             OpCode::Not => not(g, &self.bits[&n.a]),
-            OpCode::Neg => {
-                let a = get(self, n.a);
-                neg(&mut self.g, &a)
-            }
+            OpCode::Neg => neg(g, &self.bits[&n.a]),
             OpCode::Popcnt => popcnt(g, &self.bits[&n.a]),
             OpCode::Clz => clz(g, &self.bits[&n.a]),
             OpCode::Ctz => ctz(g, &self.bits[&n.a]),
             OpCode::Bswap => bswap(&self.bits[&n.a]),
             OpCode::BitRev => bitrev(&self.bits[&n.a]),
-            OpCode::Zext => {
-                let mut a = get(self, n.a);
-                a.resize(w, aig::FALSE);
-                a
-            }
-            OpCode::Sext => {
-                let mut a = get(self, n.a);
-                let top = *a.last().unwrap_or(&aig::FALSE);
-                a.resize(w, top);
-                a
+            OpCode::Zext | OpCode::Sext => {
+                let low = &self.bits[&n.a];
+                let fill = if n.op == OpCode::Sext { low[low.len() - 1] } else { aig::FALSE };
+                let mut out = Vec::with_capacity(w);
+                out.extend_from_slice(low);
+                out.resize(w, fill);
+                out
             }
             OpCode::Extract => {
-                let a = get(self, n.a);
+                let a = &self.bits[&n.a];
                 let lo = n.b as usize;
                 a[lo..lo + w].to_vec()
             }
             OpCode::Concat => {
-                let (hi, mut lo) = (get(self, n.a), get(self, n.b));
-                lo.extend(hi);
-                lo
+                let mut out = Vec::with_capacity(w);
+                out.extend_from_slice(&self.bits[&n.b]);
+                out.extend_from_slice(&self.bits[&n.a]);
+                out
             }
-            OpCode::Select => {
-                let (c, t, e) = (get(self, n.a)[0], get(self, n.b), get(self, n.c));
-                mux(&mut self.g, c, &t, &e)
-            }
+            OpCode::Select => mux(g, self.bits[&n.a][0], &self.bits[&n.b], &self.bits[&n.c]),
             OpCode::Eq | OpCode::Ne | OpCode::Ult | OpCode::Ule | OpCode::Slt | OpCode::Sle => {
-                let (a, b) = (get(self, n.a), get(self, n.b));
-                let g = &mut self.g;
+                let (a, b) = (&self.bits[&n.a], &self.bits[&n.b]);
                 let r = match n.op {
-                    OpCode::Eq if self.join_factoring => eq_factored(g, &a, &b),
-                    OpCode::Ne if self.join_factoring => eq_factored(g, &a, &b) ^ 1,
-                    OpCode::Eq => eq(g, &a, &b),
-                    OpCode::Ne => eq(g, &a, &b) ^ 1,
-                    OpCode::Ult => ult(g, &a, &b),
-                    OpCode::Ule => ule(g, &a, &b),
-                    OpCode::Slt => slt(g, &a, &b),
-                    _ => sle(g, &a, &b),
+                    OpCode::Eq if self.join_factoring => eq_factored(g, a, b),
+                    OpCode::Ne if self.join_factoring => eq_factored(g, a, b) ^ 1,
+                    OpCode::Eq => eq(g, a, b),
+                    OpCode::Ne => eq(g, a, b) ^ 1,
+                    OpCode::Ult => ult(g, a, b),
+                    OpCode::Ule => ule(g, a, b),
+                    OpCode::Slt => slt(g, a, b),
+                    _ => sle(g, a, b),
                 };
                 vec![r]
             }
             op if op.as_bin().is_some() => {
-                let (a, b) = (get(self, n.a), get(self, n.b));
+                let (a, b) = (&self.bits[&n.a], &self.bits[&n.b]);
                 if self.selector_hints && matches!(op, OpCode::Shl | OpCode::LShr | OpCode::AShr) {
                     let unknown: Vec<_> = b
                         .iter()
@@ -901,47 +892,32 @@ impl<'c> Blaster<'c> {
                         self.selectors.extend(unknown);
                     }
                 }
-                let g = &mut self.g;
                 match op {
-                    OpCode::Add => add(g, &a, &b),
-                    OpCode::Sub => sub(g, &a, &b),
-                    OpCode::Mul if self.carry_save_multiplication => mul_carry_save(g, &a, &b),
-                    OpCode::Mul => mul(g, &a, &b),
-                    OpCode::UMulHi if self.carry_save_multiplication => {
-                        mulhi_carry_save(g, &a, &b, false)
-                    }
-                    OpCode::UMulHi => mulhi(g, &a, &b, false),
-                    OpCode::SMulHi if self.carry_save_multiplication => {
-                        mulhi_carry_save(g, &a, &b, true)
-                    }
-                    OpCode::SMulHi => mulhi(g, &a, &b, true),
+                    OpCode::Add => add(g, a, b),
+                    OpCode::Sub => sub(g, a, b),
+                    OpCode::Mul if self.carry_save_multiplication => mul_carry_save(g, a, b),
+                    OpCode::Mul => mul(g, a, b),
+                    OpCode::UMulHi if self.carry_save_multiplication => mulhi_carry_save(g, a, b, false),
+                    OpCode::UMulHi => mulhi(g, a, b, false),
+                    OpCode::SMulHi if self.carry_save_multiplication => mulhi_carry_save(g, a, b, true),
+                    OpCode::SMulHi => mulhi(g, a, b, true),
                     OpCode::UDiv | OpCode::URem => {
-                        let qr = match self.udivrem_cache.get(&(n.a, n.b)) {
-                            Some(qr) => qr.clone(),
-                            None => {
-                                let qr = udivrem(g, &a, &b);
-                                self.udivrem_cache.insert((n.a, n.b), qr.clone());
-                                qr
-                            }
-                        };
-                        if op == OpCode::UDiv { qr.0 } else { qr.1 }
+                        let qr = self.udivrem_cache.entry((n.a, n.b)).or_insert_with(|| udivrem(g, a, b));
+                        if op == OpCode::UDiv { qr.0.clone() } else { qr.1.clone() }
                     }
-                    OpCode::SDiv => sdiv(g, &a, &b),
-                    OpCode::SRem => srem(g, &a, &b),
-                    OpCode::And => and(g, &a, &b),
-                    OpCode::Or => or(g, &a, &b),
-                    OpCode::Xor if self.input_cancellation => xor_cancel_input(g, &a, &b),
-                    OpCode::Xor => xor(g, &a, &b),
-                    OpCode::Shl => shift(g, &a, &b, true, aig::FALSE),
-                    OpCode::LShr => shift(g, &a, &b, false, aig::FALSE),
-                    OpCode::AShr => {
-                        let s = *a.last().unwrap_or(&aig::FALSE);
-                        shift(g, &a, &b, false, s)
-                    }
-                    OpCode::RotL => rotate(g, &a, &b, true),
-                    OpCode::RotR => rotate(g, &a, &b, false),
-                    OpCode::Pdep => pdep(g, &a, &b),
-                    _ => pext(g, &a, &b),
+                    OpCode::SDiv => sdiv(g, a, b),
+                    OpCode::SRem => srem(g, a, b),
+                    OpCode::And => and(g, a, b),
+                    OpCode::Or => or(g, a, b),
+                    OpCode::Xor if self.input_cancellation => xor_cancel_input(g, a, b),
+                    OpCode::Xor => xor(g, a, b),
+                    OpCode::Shl => shift(g, a, b, true, aig::FALSE),
+                    OpCode::LShr => shift(g, a, b, false, aig::FALSE),
+                    OpCode::AShr => shift(g, a, b, false, a[a.len() - 1]),
+                    OpCode::RotL => rotate(g, a, b, true),
+                    OpCode::RotR => rotate(g, a, b, false),
+                    OpCode::Pdep => pdep(g, a, b),
+                    _ => pext(g, a, b),
                 }
             }
             op if op.as_ext().is_some() => self.ext(i)?,
@@ -1176,6 +1152,20 @@ impl Question {
                 return decided(q, Outcome::Proved(None));
             }
         }
+        // Reserve at least one ordinary circuit batch. Sample the *original implication*
+        // so even constraints hidden inside the predicate participate in witness validation.
+        if cfg.simplify && !cfg.certificate && !cfg.word_sampling
+            && cfg.sample_mode == SampleMode::Random && cfg.samples >= 128
+            && env.deadline.is_none()
+            && let Some((tested, model)) = sample_words::guard_samples(cx, root)
+        {
+            q.stats.samples = tested;
+            if let Some(model) = model {
+                let outcome = q.refuted(cx, model)?;
+                return decided(q, outcome);
+            }
+        }
+        let remaining_batches = cfg.samples.div_ceil(64) - (q.stats.samples / 64) as u32;
         if cfg.simplify && !cfg.certificate {
             let mut spent = crate::engine::Allowance::new(crate::engine::Budget::UNLIMITED);
             let run = crate::engine::Run::default()
@@ -1358,7 +1348,7 @@ impl Question {
         let batches = if word_sampled {
             0
         } else {
-            cfg.samples.div_ceil(64)
+            remaining_batches
         };
         for batch in 0..batches {
             let vals = b.g.eval_words(|k| match cfg.sample_mode {

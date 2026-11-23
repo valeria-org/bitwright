@@ -12,6 +12,170 @@ cargo run --release -p bitwright-bench -- --corpus-diff     # MBA defaults again
 cargo run --release -p bitwright-bench -- --prover-budgets  # the prover's simplification under budgets
 ```
 
+## Replaying the 21-question solver handoff
+
+`bw-handoff.tgz` SHA-256: `7785d29959cfd66c1bdf4a0c2f07d76651309a57924569e488ad6579f680ed26`.
+In the extracted `replay/Cargo.toml`, point the `bitwright` dependency at the local
+crate; retain `default-features = false` and `features = ["mba", "prove"]`. From the
+extracted handoff:
+
+```sh
+cat questions/*.txt > all.q
+cargo +1.100.0 build --release --manifest-path replay/Cargo.toml
+BWQ_WALKSOLVER=1 replay/target/release/bwreplay all.q outcomes.tsv 100 1 asked
+```
+
+Each comparison below measures one solver change against the immediately preceding
+checkout, not against archived host timings. Each question used a fresh context and
+simplifier; all captured `#CFG` values matched. Times are median sums of query build
+and solve time across three paired single-thread runs, excluding parsing. The two
+log samples are stratified by config and historical outcome, not a random walk-time
+estimate, and may overlap the supplied fixtures.
+
+| Questions | Decided before | Decided after | Before | After |
+|---|---:|---:|---:|---:|
+| 21 handoff fixtures | 0 | 11 | 706 ms | 373 ms |
+| 118 distinct historically unknown log questions | 4 | 62 | 4,553 ms | 1,830 ms |
+| 99 distinct historically decided log controls | 96 | 97 | 3,668 ms | 1,909 ms |
+
+No baseline decision was lost on these sets. Outcomes, gate counts and propagation
+counts repeated in all three runs. A refutation checks the original constrained
+predicate. Proofs used the host's non-certificate configuration.
+
+**Guard-pair, masked product and witness changes.** Same captured configs and selection;
+the prior checkout was rebuilt and retimed alongside the new one. Times from different
+comparisons should not be subtracted.
+
+| Questions | Decided before | Decided after | Before | After |
+|---|---:|---:|---:|---:|
+| 21 handoff fixtures | 11 | 19 | 364 ms | 306 ms |
+| 118 distinct historically unknown log questions | 62 | 92 | 1,981 ms | 1,641 ms |
+| 99 distinct historically decided log controls | 97 | 97 | 1,594 ms | 1,539 ms |
+
+No previously decided result changed or became unknown in this comparison. Of the
+eight newly decided fixtures, six had two closed label domains: each pair ruled out
+at least one conjunct without building a circuit for the whole predicate. `q01586`
+proved after reducing weighted sums in a product. `q06753` refuted with a witness
+from the original 64-assignment sample budget.
+
+**Range proofs and range-directed witnesses.** All 21 fixtures now decide with their
+original `#CFG`. No retry or larger simplify, circuit, sampling or search allowance
+is needed. For `q04935`, the range of a selected word was too wide when both branches
+were joined. Propagating facts separately on the guard's false branch and every
+possible label on its true branch proved the comparison. `q06604` was refuted by a
+model checked on the original expression: the sampler combined compatible bit
+requirements so one weight landed in the interval and the other terms vanished.
+Neither result needed a SAT propagation.
+
+| Questions | Decided before | Decided after | Before | After |
+|---|---:|---:|---:|---:|
+| 21 handoff fixtures | 19 | 21 | 200 ms | 140 ms |
+| 118 distinct historically unknown log questions | 92 | 93 | 1,271 ms | 1,157 ms |
+| 99 distinct historically decided log controls | 97 | 97 | 1,484 ms | 1,409 ms |
+
+Across the three paired runs, no baseline decision changed or became unknown.
+`q04935` went from a median 116 ms without a decision to 82 ms proved; `q06604`
+went from 23 ms without a decision to 0.09 ms refuted. These isolated query
+measurements do not include a binary-analysis host's walk time.
+
+**Broader sample: weighted sums and finite word images.** Weighted sums of
+bitwise terms are checked column by column, including after removing a common
+product factor. For a disjunction of labels, the sweep can enumerate a bounded
+superset of the low word and require every member to be covered. A missing
+label in this superset is not a counterexample. Guard cofactors now run their
+local proof rather than deferring to a later phase that only sees the outer root.
+
+| Questions | Decided before | Decided after | Before | After |
+|---|---:|---:|---:|---:|
+| 21 handoff fixtures | 21 | 21 | 141 ms | 140 ms |
+| 118 distinct historically unknown log questions | 93 | 111 | 1,163 ms | 873 ms |
+| 99 distinct historically decided log controls | 97 | 99 | 1,420 ms | 758 ms |
+
+The 18 new decisions on the historically unknown sample were 16 proofs and two
+refutations. All 99 controls matched their recorded outcomes, and no baseline
+decision was lost or reversed on any set. At the captured limits, `q01504` and
+`q02189` still exceed the circuit-size cap; `q18008`, `q03700`, `q06224`,
+`q06500` and `q06620` stop on search budget.
+
+**Closing the seven remaining queries.** Same inputs, captured configs, and
+three paired runs. Times are median summed build-and-solve time, not host walk
+time.
+
+| Questions | Decided before | Decided after | Before | After |
+|---|---:|---:|---:|---:|
+| 21 handoff fixtures | 21 | 21 | 148 ms | 145 ms |
+| 118 distinct historically unknown log questions | 111 | 118 | 936 ms | 641 ms |
+| 99 distinct historically decided log controls | 99 | 99 | 806 ms | 767 ms |
+
+`q01504` and `q02189` proved after the sweep used a required guard to resolve
+select arms and checked the weighted sums only at the bits their users read.
+`q18008` proved from sparse factors of a product. For `q06500` and `q06620`,
+a masked equality fixed tags and bits of the weights even across different
+extractions of a biased word. The equality remains on the rewritten branch.
+`q03700` and `q06224` were refuted: the existing sample batch reached a hidden
+addend or varied free inputs inside a required field. Both models were checked
+on the original query. No baseline decision changed, and every control agreed
+with its historical result. This closes the selected sample, not the full log.
+
+**Repeated checks.** Use `prove::Prepared` when the expensive work is a stable set of
+facts or observed words, not just because a family has many queries. In a 40-target
+probe using `q10409` as the shared fact and binding `x + 31`, preparation plus all
+checks took 32 ms versus 512 ms asking separately. Using its expression as the
+*observed word* instead took 51 ms versus 3 ms: the target-specific equality often
+folds before a standalone circuit is needed. Both probes checked the targets in
+reverse order too. These are constructed families, not a measurement of a live host.
+
+## Replaying the EA.sys residue handoff
+
+The `mba-residues.zip` capture (`04d257bc6b848856c2c3ddc7137dc409e1af4363abeba44536ced5454389e48a`,
+SHA-256) contains 35 priority expectations in p0–p2. Replay the original `.bw`, not
+the previously simplified `.alone.bw`. With the supplied `mba_residues.rs`, the host
+strategy and 2,000,000 visits per isolated root:
+
+| Class | Expected form justified | Expectation disproved |
+|---|---:|---:|
+| p0 sign extension and its difference | 2 | 0 |
+| p1 constants | 10 | 17 |
+| p2 affine or XOR-affine | 3 | 3 |
+
+The ten constants are `r0062`, `r0109`–`r0114`, `r0329`, `r0536` (one), and `r0747`
+(zero). `r0680` and `r0696` copy input bit 3 to output bits 4 and 0 respectively;
+`r0764` is `(zext<64>($1311:8) ^ 48) << 3`. The single-symbol field proof checks
+all assignments to the demanded input bits, not just single-bit probes.
+All ten constants also completed from the original inputs with `with_words_proved(true)`
+and 50,000,000 visits: a word-level rewrite could not be accepted merely because its
+samples agreed.
+
+The [20 counterexamples](ea-residue-counterexamples.tsv) use the original `$N`
+symbol numbers, hexadecimal inputs and all unlisted inputs zero. The original **and**
+rewritten DAG were evaluated at each witness. One assignment refutes both largest
+“constants” and all three claimed whole-word identities. These are not missing
+constant folds. Of the 102 p3 inputs, 73 got smaller, 22 stayed the same size and
+7 grew under the isolated budget; no constant or affine form is asserted for them.
+
+**Function-wide result.** Supplied `tool/mba_residues.rs`, Amethyst `0f0b08020`,
+`--release`, `--steps 4000000`, `ea_sys_181963f43.nir.vir`, no known-bit facts.
+The times below are single driver runs, excluding per-residue replay. The probe
+classes are still samples; they count remaining expressions, not proved identities.
+
+| | Archived report | Published 0.32.4 replay | Changed solver |
+|---|---:|---:|---:|
+| Maximal residues | 944 | 793 | 802 |
+| Sampled constant | 100 | 91 | 89 |
+| Sampled affine | 6 | 6 | 6 |
+| Sampled XOR-affine | 3 | 4 | 6 |
+| Sampled nonlinear | 813 | 670 | 679 |
+| Unclassified | 22 | 22 | 22 |
+| Regions skipping opaque sweep, of 57 | 20 | 57 | 57 |
+| Roots never reached, of 14,539 | 9,419 | 0 | 0 |
+| Driver wall time (s) | 50.9 | 12.2 | 9.0 |
+
+The published-crate replay did **not** reproduce the archived budget distribution.
+The local comparison is nine **more** maximal residues, not 142 fewer. Of the 802,
+441 shrink when replayed alone at two million visits. The opt-in sweep proves the
+isolated predicates, but cannot do so for a region on which the host disables it.
+These timings do not measure the separate unbounded `words` pipeline.
+
 ## What is measured, and why instructions
 
 Each benchmark reports its cost **per iteration**. The `per` column says what one iteration
@@ -186,6 +350,13 @@ exhausted, unproved, refuted, refused as too small or with too many variables), 
 bitwright ran itself, by test, with the points they evaluated. Declines are reported next to
 successes: a faster row that simplifies less is not an improvement.
 
+For candidates rejected by the pre-proof DAG size check, the note also breaks out fresh
+solver answers versus answers reused within the call, and whole-fragment questions versus
+retries. Each group reports its count, refutation samples reused, and time spent in the
+solver (rendering included), the sample and the shrink check. These are not timings for
+the entire phase. Only the separate diagnostic run installs `Run::with_mba_rejections`;
+the timed benchmark iterations do not read a clock for these stages.
+
 Setup that is not part of what a benchmark measures is excluded, for example building the DAG
 whose facts are measured. It runs with the counters paused.
 
@@ -271,8 +442,26 @@ with `# result:` what the exporter decided, or `# sampled:` the value it saw at 
 `# deep fuel: N`, `# result`, `# ms`, symbols with one key in every file): each boundary is
 one batch of `Ask::constant` in a context of its own, one session lasts the walk, and what
 stays open is asked again of a second session with the deep fuel (`--no-deep`: not).
-`--mode whole|split|eager` and `--threads N` are as above; the report compares each answer
-with the walk's own.
+`--mode whole|split|eager|shared` selects the proof schedule. Run the same export in a
+separate process for each mode, holding threads, budgets and retries fixed, for example:
+
+```bash
+for mode in whole shared; do
+    bitwright-bench --walk "$walk" --mode "$mode" --threads 1 --answers "$mode.answers"
+done
+diff <(sed 's/ visits=.*//' whole.answers) <(sed 's/ visits=.*//' shared.answers)
+```
+
+This compares each request and its answer, ignoring the work counters, which can
+legitimately differ between schedules.
+The boundary rows report final decisions, tasks solved, retries and latency. The reported
+p95 is the nearest-rank percentile of nonempty boundaries, including parsing, the first
+solve and deep retries, but not reading files. Keep `Unknown` in the comparison: a cheaper
+schedule that leaves more requests open is not the same result.
+
+For simplification requests rather than constant proofs, `--example engine_corpus` in
+the `bitwright` crate replays the exported `engine/` inputs. It measures `Engine::run`
+and reports the reachable DAG nodes and constant value of each result outside that timer.
 
 ## Comparing with other engines
 

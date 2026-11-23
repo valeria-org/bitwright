@@ -198,6 +198,38 @@ fn linear_cancels_additive_masking() {
     assert!(!eng.simplify(&mut cx, e).unwrap().changed);
 }
 
+#[cfg(feature = "prove")]
+#[test]
+fn linear_cancels_sums_of_shifted_selects() {
+    use crate::prove::{self, Config, Outcome};
+
+    let eng = engine(vec![Phase::Linear]);
+    for (last, identity) in [("y << 5", true), ("y << 4", false)] {
+        // Independent guards: even the inner false arm must agree.
+        let sum = format!(
+            "let %0 = select(p:1, 0xffffcffe00000fd8, select(q:1, x:64, y:64)); \
+             ~%0 * 223 + %0 * 259 \
+             - select(p, 0xffff3ff800003f60, select(q, x << 2, y << 2)) \
+             - select(p, 0xfff9ffc00001fb00, select(q, x << 5, {last}))"
+        );
+        if identity {
+            check_to(&eng, &sum, "-223:64", 64);
+        }
+        let mut cx = Context::new();
+        let p = cx
+            .parse(&format!("{sum} == -223"), &ParseOptions::width(Width::W64))
+            .unwrap();
+        let cfg = Config::default().with_samples(0);
+        match prove::valid(&mut cx, p, &cfg).unwrap() {
+            Outcome::Proved(_) if identity => {}
+            Outcome::Refuted(model) if !identity => {
+                assert!(cx.eval(&[p], &model[..]).unwrap()[0].is_zero());
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+}
+
 /// `n` symbols `s0`, `s1`, … of width `w`.
 fn symbols(cx: &mut Context, n: usize, w: Width) -> Vec<Expr> {
     (0..n)
@@ -3459,6 +3491,69 @@ mod mba_service {
                 None => MbaAnswer::NoSimpler,
             }
         }
+    }
+
+    #[test]
+    fn repeated_candidate_reuses_only_the_charged_refutation_sample() {
+        struct Ticks(std::cell::Cell<u64>);
+        impl crate::engine::Clock for Ticks {
+            fn now_ticks(&self) -> u64 {
+                let t = self.0.get();
+                self.0.set(t + 1);
+                t
+            }
+        }
+
+        let options = ParseOptions::width(Width::W32);
+        let roots = |cx: &mut Context| {
+            ["(x - 3) ^ 17", "(y - 3) ^ 17"].map(|text| cx.parse(text, &options).unwrap())
+        };
+        let mut cx = Context::new();
+        let inputs = roots(&mut cx);
+        // (p | x) + (p & x) - x is p, but still needs p and extra nodes.
+        let big = cx
+            .parse("((((x - 3) ^ 17) | x) + (((x - 3) ^ 17) & x)) - x", &options)
+            .unwrap();
+        let lower = |e| crate::mba::lower(&cx, e, &Default::default()).unwrap().0;
+        let q = lower(inputs[0]);
+        assert_eq!(q, lower(inputs[1]));
+        let answer = lower(big);
+        let nodes = q.nodes().len() + answer.nodes().len();
+        let sample_work = nodes as u64 * crate::mba::certify::SAMPLE_POINTS as u64;
+        let eng = mba_engine(Arc::new(Scripted(vec![(q, answer)])), MbaTrust::default());
+        let clock = Ticks(std::cell::Cell::new(0));
+        let mut profile = crate::engine::MbaRejections::default();
+        let out = eng
+            .run(
+                &mut cx,
+                &inputs,
+                Run::default().with_mba_rejections(&clock, &mut profile),
+            )
+            .unwrap();
+        assert!(out.roots.iter().all(|r| !r.changed));
+        assert_eq!(profile.fresh_whole.count, 1);
+        assert_eq!(profile.fresh_whole.sample_hits, 0);
+        assert!(profile.fresh_whole.solve > 0);
+        assert!(profile.cached_whole.count > 0);
+        assert_eq!(profile.cached_whole.count, profile.cached_whole.sample_hits);
+        assert_eq!(profile.cached_whole.solve, 0);
+        assert!(profile.cached_whole.sample > 0 && profile.cached_whole.shrink > 0);
+
+        // Insufficient pass work for two samples, including one answered from memory.
+        let mut cx = Context::new();
+        let inputs = roots(&mut cx);
+        let out = eng
+            .run(
+                &mut cx,
+                &inputs,
+                Run::default().with_per_call(Budget::UNLIMITED.with_pass_work(2 * sample_work - 1)),
+            )
+            .unwrap();
+        assert_eq!(out.stats.mba.not_smaller, 1);
+        assert_eq!(
+            out.roots[1].end,
+            End::BudgetTerminated(crate::engine::Exhausted::PassWork)
+        );
     }
 
     #[test]
@@ -9347,6 +9442,39 @@ mod opaque_constants {
             )
             .unwrap();
         (cx, out)
+    }
+
+    #[test]
+    fn selected_word_bounds_use_only_closed_guard_domains() {
+        for (guard, bias, counterexample) in [
+            ("(a == 4) | (a == 12)", "0xffffffffffffffe0", None),
+            // The first two equalities are not a closed domain any more.
+            ("(a == 4) | (a == 12) | (a == 0)", "0xffffffffffffffe0", Some((0, 0))),
+            // Same closed guard, but the selected unsigned sum can wrap below its bias.
+            ("(a == 4) | (a == 12)", "0xfffffffffffffff8", Some((12, 15))),
+        ] {
+            let src = format!(
+                "let w = select({guard}, a * a + 4, b & 3); \
+                 let x = {bias} + (z & 15); \
+                 0xffffffffffffffdf <=u select(extract<2, 1>(w), x * zext<64>(extract<4, 1>(w)), x)"
+            );
+            let (mut cx, out) = simplified(&src, 1 << 14);
+            let result = out.roots[0].expr;
+            if let Some((a, z)) = counterexample {
+                let env = FnEnv(|key: &crate::SymbolKey, w| {
+                    let v = match key.to_string().as_str() {
+                        "a" => a,
+                        "z" => z,
+                        _ => 0,
+                    };
+                    Some(BitVec::wrapping_from_u64(w, v))
+                });
+                assert!(cx.eval(&[result], &env).unwrap()[0].is_zero(), "{src}");
+            } else {
+                assert_eq!(cx.as_const(result).unwrap(), Some(BitVec::from_bool(true)));
+                assert!(out.stats.mba.opaque_proved > 0);
+            }
+        }
     }
 
     /// A constant hidden over three values that cancel (the FNV-1a prime), then read as a hash

@@ -818,8 +818,10 @@ fn solve(
             let allow = r.meter.left_in(|b| b.pass_work).min(share);
             let mut left = allow;
             let terms = crate::cobra::decompose(t, w, u32::from(w.bits()), &d, &mut left);
-            r.meter.charge(Counter::PassWork, allow - left)?;
-            terms
+            // An attempt cut short costs this pass its whole share.
+            let spent = if terms.is_err() { allow } else { allow - left };
+            r.meter.charge(Counter::PassWork, spent)?;
+            terms.ok().flatten()
         } else {
             None
         };

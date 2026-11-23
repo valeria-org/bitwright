@@ -187,6 +187,7 @@ impl Engine {
         let run = Run {
             observer: Some(&mut seen),
             assumptions: None,
+            mba_rejections: run.mba_rejections,
             allowance: run.allowance,
             per_call: run.per_call,
             admission: run.admission,

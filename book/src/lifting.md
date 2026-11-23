@@ -70,3 +70,18 @@ for Ghidra (p-code), Binary Ninja (its low-level IL) and IDA Pro with Hex-Rays (
 hand the code at the cursor to the Python package. They are written against each tool's
 documented API and are not tested, as none of the tools is available where bitwright is
 developed.
+
+## Choosing the host request
+
+For smaller IR, pass the block's live outputs to `Engine::run`. For “is this address a
+constant on this path?”, ask `batch::Ask::constant(address).under(&facts)`: a nonconstant
+result from the simplifier alone doesn't answer that question. Build the expressions for
+one analysis boundary in one `Context`, preserving symbol identities, and keep a `Session`
+per proof configuration across boundaries.
+
+Compare `Split::none()` (prove the whole expression) with `Split::shared()` (prove common
+subexpressions first) on the host's exported requests. High node overlap alone is not
+enough: if the whole expressions fold cheaply, discovering and proving shared parts can
+take longer without deciding another address. Compare answers, tasks solved and boundary
+p95 at the same budgets, with deep retries included. See the
+[walk replay](https://github.com/valeria-org/bitwright/blob/main/docs/benchmarking.md#exported-questions-one-by-one-and-in-a-batch).

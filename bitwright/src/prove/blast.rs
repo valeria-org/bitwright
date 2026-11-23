@@ -166,9 +166,9 @@ fn eq_bits(g: &mut Aig, a: &[L], b: &[L], factor_joins: bool) -> L {
     g.and_all(&bits)
 }
 
-/// The product modulo `2^w`. Constant multipliers use signed digits when that requires
-/// fewer additions. Eligible 64-bit odd constants may first split into two cheaper modular
-/// factors with an optional source correction; other products use shift and add.
+/// The product modulo `2^w`. Constant multipliers use shift/add rows, recoding
+/// signed digits and sharing recurring pairs on dense words. Eligible 64-bit odd
+/// constants may first split into cheaper modular factors with a source correction.
 pub fn mul(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
     if let Some((bit, data)) = binary_factor(a, b) {
         return data.iter().map(|&value| g.and(bit, value)).collect();
@@ -207,7 +207,7 @@ fn mul_constant(g: &mut Aig, a: &[L], constant: &[L]) -> Bits {
     mul_constant_unfactored(g, a, constant)
 }
 
-// Estimate active carry columns using exactly the signed-digit choice below.
+// Estimate active carry columns before any data-dependent row sharing.
 fn constant_work(value: u64, width: usize) -> usize {
     if value == 0 {
         return 0;
@@ -373,23 +373,166 @@ fn mul_constant_unfactored(g: &mut Aig, a: &[L], constant: &[L]) -> Bits {
     }
     // A carry out of the word vanishes modulo 2^w. The initial negative row needs a
     // negation, whereas the initial positive row is free.
-    let cost = digits.len() + usize::from(digits.last().is_some_and(|&(_, neg)| neg));
-    let ordinary = constant.iter().filter(|&&bit| bit == TRUE).count();
-    if cost >= ordinary {
-        return mul_rows(g, a, constant);
+    let signed = digits.len() + usize::from(digits.last().is_some_and(|&(_, neg)| neg))
+        < constant.iter().filter(|&&bit| bit == TRUE).count();
+    if (16..=64).contains(&a.len()) && digits.len() >= 6 {
+        let variables = a.iter().filter(|&&bit| bit > TRUE).count();
+        // A masked word with a dense fixed bias and just a few variable bits
+        // needs only one conditional constant row per such bit, not one
+        // symbolic row per coefficient digit.
+        if (1..=8).contains(&variables)
+            && 2 * variables <= digits.len()
+            && a.iter().filter(|&&bit| bit == TRUE).count() * 2 >= a.len()
+        {
+            return mul_sparse_biased(g, a, constant);
+        }
+        // Group pairs only in the representation we would actually emit.
+        if variables * 4 >= a.len() * 3 {
+            if !signed {
+                digits.clear();
+                digits.extend(
+                    constant
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &bit)| (bit == TRUE).then_some((i, false))),
+                );
+            }
+            if let Some(product) = mul_repeated_pair(g, a, &digits) {
+                return product;
+            }
+        }
     }
-    let mut acc: Option<Bits> = None;
-    for (shift, negative) in digits.into_iter().rev() {
-        let mut part = vec![FALSE; a.len()];
-        part[shift..].copy_from_slice(&a[..a.len() - shift]);
-        acc = Some(match acc {
-            None if negative => neg(g, &part),
-            None => part,
-            Some(sum) if negative => sub(g, &sum, &part),
-            Some(sum) => add(g, &sum, &part),
+    let mut acc = vec![FALSE; a.len()];
+    if signed {
+        for (shift, negative) in digits.into_iter().rev() {
+            accumulate_product_row(g, &mut acc[shift..], a.iter().copied(), negative);
+        }
+    } else {
+        let mut shifts = constant.iter().enumerate().filter_map(|(i, &bit)| {
+            (bit == TRUE).then_some(i)
         });
+        if let Some(first) = shifts.next() {
+            acc[first..].copy_from_slice(&a[..a.len() - first]);
+        }
+        for shift in shifts {
+            accumulate_product_row(g, &mut acc[shift..], a.iter().copied(), false);
+        }
     }
-    acc.unwrap_or_else(|| vec![FALSE; a.len()])
+    acc
+}
+
+// Write D = fixed + Σ bit[i]·2^i. The first variable selects between
+// two constant products, so no adder is needed for either it or the bias.
+// Native wrapping arithmetic also gives the right low bits for widths < 64.
+fn mul_sparse_biased(g: &mut Aig, data: &[L], constant: &[L]) -> Bits {
+    let fixed_word = |bits: &[L]| {
+        bits.iter()
+            .enumerate()
+            .fold(0u64, |v, (i, &bit)| v | (u64::from(bit == TRUE) << i))
+    };
+    let k = fixed_word(constant);
+    let bias = fixed_word(data).wrapping_mul(k);
+    let mut rows = data.iter().enumerate().filter(|&(_, &bit)| bit > TRUE);
+    let (first, &selector) = rows.next().expect("nonempty sparse source");
+    let alternate = bias.wrapping_add(k << first);
+    let mut acc: Bits = (0..data.len())
+        .map(|i| {
+            let low = (bias >> i & 1) as L;
+            if (alternate ^ bias) >> i & 1 == 0 {
+                low
+            } else {
+                selector ^ low
+            }
+        })
+        .collect();
+    for (shift, &selector) in rows {
+        let row = constant
+            .iter()
+            .map(|&k| if k == TRUE { selector } else { FALSE });
+        accumulate_product_row(g, &mut acc[shift..], row, false);
+    }
+    acc
+}
+
+// Add or subtract the row at this shift modulo the active suffix width. Bits
+// below the shift stay untouched, and the carry out of its top bit is dead.
+fn accumulate_product_row(
+    g: &mut Aig,
+    acc: &mut [L],
+    row: impl Iterator<Item = L>,
+    negative: bool,
+) {
+    let n = acc.len();
+    let mask = u32::from(negative);
+    let mut carry = mask;
+    for (j, (sum, bit)) in acc.iter_mut().zip(row).enumerate() {
+        let prev = *sum;
+        let bit = bit ^ mask;
+        if j + 1 == n {
+            let parity = g.xor_phase(prev, bit);
+            *sum = g.xor_phase(parity, carry);
+        } else {
+            let parity = g.xor(prev, bit);
+            *sum = g.xor(parity, carry);
+            carry = g.maj(prev, bit, carry);
+        }
+    }
+}
+
+// For a fixed gap d, adjacent digits ±2^i and ±2^(i+d) are a
+// shifted copy of (2^d ± 1), with the sign of the higher digit. Find
+// non-overlapping occurrences of each small pair in one pass. Its first
+// use pays for forming that multiple; only later uses count as savings.
+fn mul_repeated_pair(g: &mut Aig, a: &[L], digits: &[(usize, bool)]) -> Option<Bits> {
+    const GAPS: usize = 8;
+    let w = a.len();
+    let mut pairs = [0u64; GAPS * 2];
+    let mut saved = [0usize; GAPS * 2];
+    for pair in digits.windows(2) {
+        let (lo, neg_lo) = pair[0];
+        let (hi, neg_hi) = pair[1];
+        let gap = hi - lo;
+        if gap > GAPS {
+            continue;
+        }
+        let key = 2 * (gap - 1) + usize::from(neg_lo != neg_hi);
+        let ends = &mut pairs[key];
+        if *ends & (1 << lo) == 0 {
+            if *ends != 0 {
+                saved[key] += w - hi;
+            }
+            *ends |= 1 << hi;
+        }
+    }
+    let (key, &savings) = saved.iter().enumerate().max_by_key(|&(_, n)| n)?;
+    // Don't trade a tiny top-bit row for a change in carry topology.
+    if savings < w / 2 {
+        return None;
+    }
+    let ends = pairs[key];
+    let gap = key / 2 + 1;
+    let first_lo = ends.trailing_zeros() as usize - gap;
+    let n = w - first_lo;
+    let mut multiple = vec![FALSE; n];
+    multiple[gap..].copy_from_slice(&a[..n - gap]);
+    accumulate_product_row(g, &mut multiple, a.iter().copied(), key % 2 != 0);
+
+    // Accumulate from the highest term. Only write the active suffix of a
+    // row; no padded copies, and no gates for discarded high output bits.
+    let mut acc = vec![FALSE; w];
+    let mut i = digits.len();
+    while i != 0 {
+        i -= 1;
+        let (hi, negative) = digits[i];
+        let (shift, row) = if ends & (1 << hi) != 0 {
+            i -= 1;
+            (hi - gap, multiple.as_slice())
+        } else {
+            (hi, a)
+        };
+        accumulate_product_row(g, &mut acc[shift..], row.iter().copied(), negative);
+    }
+    Some(acc)
 }
 
 fn mul_rows(g: &mut Aig, a: &[L], b: &[L]) -> Bits {

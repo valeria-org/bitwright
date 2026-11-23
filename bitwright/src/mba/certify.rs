@@ -236,6 +236,7 @@ pub(crate) trait Meter {
 #[derive(Debug)]
 pub(crate) struct Steps {
     pub(crate) left: u64,
+    /// Units admitted; a certificate reports these, not the price of a batch it skipped.
     pub(crate) spent: u64,
     /// Where the units this meter consumed are added up, if anywhere: the meters of one
     /// question of the normal-form solver share one, which says what the question spent.
@@ -270,7 +271,6 @@ impl Meter for Steps {
         self.left
     }
     fn charge(&mut self, units: u64) -> Result<(), ()> {
-        self.spent = self.spent.saturating_add(units);
         if let Some(u) = &self.used {
             u.set(u.get().saturating_add(units.min(self.left)));
         }
@@ -278,6 +278,7 @@ impl Meter for Steps {
             self.left = 0;
             return Err(());
         }
+        self.spent = self.spent.saturating_add(units);
         self.left -= units;
         Ok(())
     }
@@ -6098,6 +6099,16 @@ pub(crate) fn check(a: &MbaExpr, b: &MbaExpr, steps: u64) -> Report {
     };
     r.work = meter.spent;
     r
+}
+
+#[cfg(test)]
+#[test]
+fn refused_certificate_batch_is_not_reported_as_work() {
+    let mut meter = Steps::new(10);
+    assert_eq!(meter.charge(7), Ok(()));
+    assert_eq!(meter.charge(5), Err(()));
+    assert_eq!(meter.left, 0);
+    assert_eq!(meter.spent, 7);
 }
 
 #[cfg(test)]

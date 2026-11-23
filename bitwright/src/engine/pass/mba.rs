@@ -1,5 +1,10 @@
 //! The MBA phase: lowering, the solver, the evidence gate, lifting (see [`crate::mba`]).
 
+mod field_guard;
+mod guard_domain;
+mod opaque_predicate;
+mod output_set;
+
 use super::{Fin, PassKind, Runner, Step, Stop, discard, finish, shrinks};
 use crate::engine::Exhausted;
 use crate::engine::budget::Counter;
@@ -13,11 +18,18 @@ use crate::mba::{
 };
 use crate::{BinOp, UnOp};
 
+/// An answer owned by this call. A sample result belongs to this exact answer and the
+/// structurally equal lowered input (hence the same point seed), never just their cache key.
+struct CachedAnswer {
+    answer: MbaAnswer,
+    sample: Option<(MbaExpr, bool)>,
+}
+
 /// The MBA phase's state for a call: what it asked, and how deep it goes.
 #[derive(Default)]
 pub(crate) struct State {
     /// The MBA solver's answers in this call, by question.
-    pub(crate) answers: crate::hash::IdMap<crate::mba::CacheKey, crate::mba::MbaAnswer>,
+    answers: crate::hash::IdMap<CacheKey, CachedAnswer>,
     /// Questions whose answers the evidence gate could not prove in this call (see `pass::mba::ask`).
     pub(crate) unproved: crate::hash::IdMap<crate::mba::CacheKey, ()>,
     /// Questions the solver ran out of steps on in this call, each with the steps it had (see
@@ -122,8 +134,12 @@ fn charge(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, evals: u64) -> Resul
 /// random points (see [`certify::sample_points`]). A filter, never evidence on its own.
 fn sampled(r: &mut Runner<'_, '_>, a: &MbaExpr, b: &MbaExpr, seed: u64) -> Result<bool, Stop> {
     charge(r, a, b, u64::from(SAMPLE_POINTS))?;
+    Ok(agrees_at_sample(a, b, seed))
+}
+
+fn agrees_at_sample(a: &MbaExpr, b: &MbaExpr, seed: u64) -> bool {
     let points = certify::sample_points(a.vars(), &[a, b], seed);
-    Ok(certify::refute(a, b, &points).is_none())
+    certify::refute(a, b, &points).is_none()
 }
 
 /// Pass work as a certificate's meter, at most `share` of it.
@@ -305,7 +321,103 @@ fn sweep_inner(
         }
     }
     r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    if fold_cases && output_set::covered(r, cx, root)? {
+        let e = r.build(cx, |cx| cx.mk_const_u64(1, 1))?;
+        count(r).opaque_proved += 1;
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
+    if fold_cases && (128..=4096).contains(&order.len())
+        && let Some(e) = guard_domain::specialize(r, cx, cfg, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
+    if fold_cases && (128..=4096).contains(&order.len())
+        && let Some(e) = field_guard::specialize(r, cx, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
+    if fold_cases && let Some(e) = opaque_predicate::reduce_columns(r, cx, root, &order)? {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
+    // On a large equality, inspecting every apparently constant subexpression first can
+    // consume the whole call before the linear and demanded-bit passes get a turn.
+    // Skip the speculative scan when there is less than one modest certificate per node.
+    // A later round can sweep the smaller expression; no search or rewrite is accepted
+    // merely because this estimate declined the scan.
+    // A cofactor is temporary: the demanded-bits phase will never see its root.
+    if fold_cases && cfg.opaque_sweep && !cfg.known_atoms && !cfg.noise_forms
+        && matches!(cx.node(root).op, OpCode::Eq | OpCode::Ne)
+        && matches!(cx.node(cx.node(root).a).op,
+            OpCode::And | OpCode::Or | OpCode::Not | OpCode::Extract | OpCode::RotL | OpCode::RotR)
+        && cx.const_val(cx.node(root).b).is_some()
+        && order.len() > 192
+        && r.inner.strategy.phases.iter().any(|p| matches!(p, crate::engine::Phase::Demanded))
+        && r.meter.left_in(|b| b.pass_work) / (order.len() as u64) < 1024
+    {
+        return Ok(root);
+    }
+    if fold_cases && let Some(e) = opaque_predicate::reduce_product(r, cx, root, &order)? {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
+    if fold_cases && order.len() <= 1024
+        && let Some(k) = guard_domain::comparison(r, cx, root, &order)?
+    {
+        let e = r.build(cx, |cx| cx.mk_const(&k))?;
+        count(r).opaque_proved += 1;
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
     r.sample(cx, root)?;
+    // A small varying root can be a field of one symbol hidden by arithmetic. Read the
+    // whole field before the questions on its parts consume the solver budget.
+    let samples = &r.samples[&root];
+    let k = samples[0];
+    let uniform = samples.iter().all(|v| *v == k);
+    // A masked input can feed a long straight-line encoding. Try its Boolean
+    // output once, rather than enumerating the same inputs at every inner node.
+    if fold_cases && uniform && cx.node(root).width == 1
+        && (96..=1024).contains(&order.len())
+        && !r.mba.swept.contains_key(&root)
+        && order.iter().filter(|&&i| cx.node(i).op == OpCode::Sym).take(2).count() == 1
+        && exhaustive(r, cx, root, &k)? == Some(true)
+    {
+        let e = r.build(cx, |cx| cx.mk_const(&k))?;
+        count(r).opaque_exhausted += 1;
+        count(r).opaque_proved += 1;
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        r.mba.swept.insert(root, e);
+        return Ok(e);
+    }
+    if (12..=96).contains(&order.len())
+        && !r.mba.swept.contains_key(&root)
+        && !uniform
+        && let Some(e) = narrow_field(r, cx, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        r.mba.swept.insert(root, e);
+        return Ok(e);
+    }
+    if cx.node(root).width == 1
+        && (8..=256).contains(&order.len())
+        && !r.mba.swept.contains_key(&root)
+        && uniform
+    {
+        let proved = opaque_predicate::folded(r, cx, root, &k)?;
+        #[cfg(feature = "prove")]
+        let proved = proved || (order.len() <= 192 && opaque_predicate::circuit(r, cx, root, &k)?);
+        if proved {
+            let e = r.build(cx, |cx| cx.mk_const(&k))?;
+            count(r).opaque_proved += 1;
+            r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+            r.mba.swept.insert(root, e);
+            return Ok(e);
+        }
+    }
     // links of a chain of sums, every user of which is a sum too: a noise block is
     // asked about only at the top of its chain (see `sweep_cut`).
     let mut links: crate::hash::IdMap<u32, bool> = crate::hash::IdMap::default();
@@ -820,6 +932,109 @@ const SWEEP_CLASS: usize = 16;
 
 /// The narrowest node a sweep relates to another by its samples.
 const SWEEP_RELATED_BITS: u16 = 8;
+
+/// Recognize `zext(extract(x, lo, len)) << shift ^ k` in a small arithmetic block. The
+/// demanded-bit transfer proves independence of the bits omitted from the enumeration;
+/// every assignment of the remaining bits is checked, including mixed assignments. The
+/// candidate may not read any omitted bits either.
+fn narrow_field(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
+) -> Result<Option<u32>, Stop> {
+    let mut sym = None;
+    let (mut arithmetic, mut bitwise) = (false, false);
+    for &i in order {
+        let n = cx.node(i);
+        if n.width > 64 {
+            return Ok(None);
+        }
+        if n.op == OpCode::Sym && sym.replace(i).is_some() {
+            return Ok(None);
+        }
+        arithmetic |= matches!(n.op, OpCode::Mul | OpCode::Add | OpCode::Sub);
+        bitwise |= matches!(n.op, OpCode::Xor | OpCode::Or | OpCode::And);
+    }
+    let Some(x) = sym.filter(|_| arithmetic && bitwise) else {
+        return Ok(None);
+    };
+    r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    let sc = &mut r.mba.exhaust;
+    if sc.sweep(cx, root) != Swept::Whole {
+        return Ok(None);
+    }
+    let support = sc.demand[sc.place[x as usize] as usize];
+    let bits = support.count_ones();
+    if !(1..=8).contains(&bits) {
+        return Ok(None);
+    }
+    let points = 1usize << bits;
+    let steps = (points as u64 * (1 + order.len() as u64))
+        .div_ceil(WORD_EVALS * EVALS_PER_STEP);
+    if steps > r.meter.left_in(|b| b.mba_steps) {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::MbaSteps, steps)?;
+    sc.bases.clear();
+    sc.above(None);
+    if !sc.program(cx) {
+        return Ok(None);
+    }
+    sc.lanes_for(points as u64);
+    debug_assert_eq!(sc.most, points);
+    sc.pass_of(points);
+    let slot = sc.inputs[0].0 as usize * points;
+    sc.lanes[slot..slot + points].copy_from_slice(&sc.spreads[..points]);
+    run_lanes(&sc.prog, &mut sc.lanes, points);
+    let row = &sc.lanes[sc.root * points..][..points];
+    let k = row[0];
+    // The nonzero basis columns of a copied field mark its source positions and its
+    // lowest destination position. They only propose a field, never prove one.
+    let mut mask = 0u64;
+    let mut dst = 64;
+    for j in 0..bits {
+        let p = 1usize << j;
+        let column = row[p] ^ k;
+        if column != 0 {
+            mask |= sc.spreads[p];
+            dst = dst.min(column.trailing_zeros());
+        }
+    }
+    if mask == 0 {
+        return Ok(None);
+    }
+    let lo = mask.trailing_zeros();
+    let len = mask.count_ones();
+    if mask >> lo != (1u64 << len) - 1 || dst + len > u32::from(cx.wid(root)) {
+        return Ok(None);
+    }
+    if row.iter().zip(&sc.spreads).any(|(&out, &v)| {
+        out != ((((v & mask) >> lo) << dst) ^ k)
+    }) {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let w = cx.width_of(root);
+    let e = r.build(cx, |cx| {
+        let field = cx.c_extract(x, lo as u16, len as u16)?;
+        let mut v = cx.c_zext(field, w.bits())?;
+        if dst != 0 {
+            let s = cx.mk_const(&crate::BitVec::wrapping_from_u64(w, u64::from(dst)))?;
+            v = cx.c_bin(BinOp::Shl, v, s)?;
+        }
+        if k != 0 {
+            let c = cx.mk_const(&crate::BitVec::wrapping_from_u64(w, k))?;
+            v = cx.c_bin(BinOp::Xor, v, c)?;
+        }
+        Ok(v)
+    })?;
+    if shrinks(r, cx, root, e, &[x])?.is_err() {
+        discard(r, cx, before);
+        return Ok(None);
+    }
+    Ok(Some(e))
+}
 
 /// whether `root` is `k` at every point, decided by evaluating it at every value of
 /// the bits of its symbols that reach it, when those number at most [`EXHAUSTIVE_BITS`]: a byte
@@ -3884,11 +4099,6 @@ const SOLVE_SHARE_MIN: u64 = 1 << 16;
 /// with an eighth of the usual fuel stopped at 80 nodes, and at 42 with the part kept.
 const SWEEP_RESERVE: u64 = 16;
 
-/// The default of [`Strategy::kept_steps`](crate::engine::Strategy::kept_steps): the solver
-/// steps from which a fragment with no simpler form is kept from isolated wrapper questions
-/// above it (see [`holds_kept`]).
-pub(crate) const KEPT_STEPS: u64 = 1 << 16;
-
 /// [`step`]'s question at node `n`, lowered from `root` (`n` itself, or an equal rewrite of it):
 /// the answer replaces `n`.
 fn ask(
@@ -3900,6 +4110,28 @@ fn ask(
     reading: Option<Reading>,
     cap: Cap,
 ) -> Result<Step, Stop> {
+    // Lease the per-call table so that the gate can borrow its stored input and answer
+    // while charging the runner and checking the live host DAG. Neither the solver nor
+    // the gate recursively asks the MBA phase.
+    let mut answers = std::mem::take(&mut r.mba.answers);
+    let result = ask_with_answers(r, cx, cfg, n, root, reading, cap, &mut answers);
+    r.mba.answers = answers;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ask_with_answers(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &MbaConfig,
+    n: u32,
+    root: u32,
+    reading: Option<Reading>,
+    cap: Cap,
+    answers: &mut crate::hash::IdMap<CacheKey, CachedAnswer>,
+) -> Result<Step, Stop> {
+    use std::collections::hash_map::Entry;
+
     let poly = r.inner.mba.solver.polynomial_fragments();
     // The whole fragment, or a narrower reading of it: semi-linear with a node cut off as
     // an atom (and an operand that is the atom less a constant written over it, see
@@ -3985,25 +4217,29 @@ fn ask(
     // What vouched for the answer (for an explanation): an answer from the cache was proved
     // when it was found.
     let mut evidence: (&'static str, Option<&'static str>, u64) = ("cache", None, 0);
-    // The answer, and where it was lifted if it already was.
-    let (cand, lifted) = match inner.mba.cache.get(&key) {
+    let (e, before) = match inner.mba.cache.get(&key) {
         Some(CacheEntry::NoSimpler) => {
             count(r).cache_hits += 1;
             return Ok(Step::Normal(Fin::FINAL));
         }
         Some(CacheEntry::Simplified(e)) if e.vars() == m.vars() => {
             count(r).cache_hits += 1;
-            (e, None)
+            let before = cx.len() as u32;
+            (r.build(cx, |cx| lift_id(cx, &e, &bindings))?, before)
         }
         _ => {
             // A question asked earlier in this call whose answer was not committed then (not
             // smaller, say): the same answer (every answer but running short is complete).
-            let answer = match r.mba.answers.get(&key).cloned() {
-                Some(a) => {
+            let clock = r.mba_rejections.as_ref().map(|(c, _)| *c);
+            let start = || clock.map(|c| c.now_ticks());
+            let elapsed = |t| clock.zip(t).map(|(c, t)| c.now_ticks().saturating_sub(t));
+            let mut solve = None;
+            let cached = match answers.entry(key) {
+                Entry::Occupied(hit) => {
                     count(r).cache_hits += 1;
-                    a
+                    hit.into_mut()
                 }
-                None => {
+                Entry::Vacant(slot) => {
                     // The solver works within its own limit and what is left of the run's
                     // account of its steps, and is charged the steps it spent. With nothing
                     // left the question is not asked: over budget, so not final.
@@ -4054,28 +4290,27 @@ fn ask(
                         .budget
                         .with_evidence(cfg.budget.evidence && cfg.trust.backend_certificates)
                         .with_steps(limit);
+                    let began = start();
                     let (a, spent) = inner.mba.solver.solve_counted(&m, &budget);
+                    solve = elapsed(began);
                     let spent = spent.min(r.meter.left_in(|b| b.mba_steps));
                     r.meter.charge(Counter::MbaSteps, spent)?;
                     if a == MbaAnswer::Exhausted {
                         r.mba.exhausted.insert(key, limit);
+                        count(r).exhausted += 1;
                         if shallow {
-                            count(r).exhausted += 1;
                             r.mba.shallow.insert(root, ());
                             r.mba.deeper = true;
                             return Ok(Step::Normal(Fin::PROVISIONAL));
                         }
                         // A fragment that holds this one is no smaller a question.
                         r.mba.kept.insert(root, true);
-                    }
-                    if a == MbaAnswer::Exhausted && limit < cfg.budget.steps {
-                        // Run short within what the account left it: more budget might
-                        // decide.
-                        count(r).exhausted += 1;
-                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
-                    }
-                    if a != MbaAnswer::Exhausted {
-                        r.mba.answers.insert(key, a.clone());
+                        let reason = if limit < cfg.budget.steps {
+                            Exhausted::MbaSteps
+                        } else {
+                            Exhausted::MbaCalls
+                        };
+                        return Ok(Step::Normal(Fin::capped(reason)));
                     }
                     let kept = match &a {
                         MbaAnswer::Unsupported(why) => why.starts_with("too many").then_some(true),
@@ -4087,28 +4322,58 @@ fn ask(
                     if let Some(hard) = kept {
                         r.mba.kept.insert(root, hard);
                     }
-                    a
+                    slot.insert(CachedAnswer {
+                        answer: a,
+                        sample: None,
+                    })
                 }
             };
-            match answer {
+            match &cached.answer {
                 MbaAnswer::Simplified { expr, claim } => {
                     if expr.vars() != m.vars() || expr.width() != m.width() {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    // Always: a cheap refutation check.
-                    if !sampled(r, &m, &expr, mk[0])? {
+                    // Charge the same pass work on a hit, including the deadline check.
+                    // Only the deterministic point evaluation is reused, never a proof,
+                    // a lifted node, or its sharing-sensitive cost.
+                    let began = start();
+                    charge(r, &m, expr, u64::from(SAMPLE_POINTS))?;
+                    let reused = cached.sample.as_ref().is_some_and(|(input, _)| input == &m);
+                    if !reused {
+                        let agrees = agrees_at_sample(&m, expr, mk[0]);
+                        cached.sample = Some((m, agrees));
+                    }
+                    let (m, agrees) = cached.sample.as_ref().expect("sample checked");
+                    let sample = elapsed(began);
+                    if !agrees {
                         count(r).refuted += 1;
                         return Ok(Step::Normal(Fin::FINAL));
                     }
                     // Cheap before expensive: an answer that would not make the DAG smaller is
                     // not worth proving (every check is still required to commit one).
                     let before = cx.len() as u32;
-                    let e = r.build(cx, |cx| lift_id(cx, &expr, &bindings))?;
+                    let e = r.build(cx, |cx| lift_id(cx, expr, &bindings))?;
                     if e == n {
                         return Ok(Step::Normal(Fin::FINAL));
                     }
+                    let began = start();
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {
+                        if let (Some((_, p)), Some(sample), Some(shrink)) =
+                            (r.mba_rejections.as_mut(), sample, elapsed(began))
+                        {
+                            let cost = match (solve.is_some(), cap) {
+                                (true, Cap::Depth(_)) => &mut p.fresh_whole,
+                                (false, Cap::Depth(_)) => &mut p.cached_whole,
+                                (true, Cap::Steps(_)) => &mut p.fresh_retry,
+                                (false, Cap::Steps(_)) => &mut p.cached_retry,
+                            };
+                            cost.shrink += shrink;
+                            cost.sample += sample;
+                            cost.solve += solve.unwrap_or(0);
+                            cost.count += 1;
+                            cost.sample_hits += u64::from(reused);
+                        }
                         r.mba.kept.insert(root, false);
                         count(r).not_smaller += 1;
                         r.stats.passes.entry("mba").or_default().rejected_cost += 1;
@@ -4123,7 +4388,7 @@ fn ask(
                         true => RETRY_GATE_SHARE,
                         false => GATE_SHARE,
                     };
-                    let own = exact(r, &m, &expr, part)?;
+                    let own = exact(r, m, expr, part)?;
                     if own.verdict == Verdict::Refuted {
                         count(r).refuted += 1;
                         discard(r, cx, before);
@@ -4133,10 +4398,10 @@ fn ask(
                         if own.verdict == Verdict::Proved {
                             Some("certificate")
                         } else if inner.mba.prover.as_ref().is_some_and(|p| {
-                            p.prove_equal(&m, &expr, &cfg.budget) == Verdict::Proved
+                            p.prove_equal(m, expr, &cfg.budget) == Verdict::Proved
                         }) {
                             Some("prover")
-                        } else if cfg.trust.backend_certificates && claim >= Claim::Proved {
+                        } else if cfg.trust.backend_certificates && *claim >= Claim::Proved {
                             Some("backend")
                         } else if cfg.trust.sampled {
                             Some("sampled")
@@ -4169,7 +4434,7 @@ fn ask(
                         .mba
                         .cache
                         .put(&key, &CacheEntry::Simplified(expr.clone()));
-                    (expr, Some((e, before)))
+                    (e, before)
                 }
                 MbaAnswer::NoSimpler => {
                     count(r).no_simpler += 1;
@@ -4181,18 +4446,9 @@ fn ask(
                     return Ok(Step::Normal(Fin::FINAL));
                 }
                 MbaAnswer::Exhausted => {
-                    count(r).exhausted += 1;
-                    // More budget might succeed: not final.
-                    return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
+                    unreachable!("exhausted answers are never cached")
                 }
             }
-        }
-    };
-    let (e, before) = match lifted {
-        Some(x) => x,
-        None => {
-            let before = cx.len() as u32;
-            (r.build(cx, |cx| lift_id(cx, &cand, &bindings))?, before)
         }
     };
     // The lifted result must agree with the original term (checks lowering and lifting).

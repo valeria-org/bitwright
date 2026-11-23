@@ -1,10 +1,12 @@
 //! The benchmarks. Names are `group/case/width`; every workload is deterministic.
 
 use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::hint::black_box;
 use std::sync::Arc;
+use std::time::Instant;
 
-use bitwright::engine::{Engine, Phase, Strategy};
+use bitwright::engine::{Clock, Engine, MbaRejections, Phase, Run, Strategy};
 use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
 use bitwright::fp::{FpFormat, FpOp, RoundingMode};
 use bitwright::mba::{MbaConfig, MbaSolver, MbaTrust, NormalFormSolver, SignatureSolver};
@@ -572,6 +574,15 @@ fn constraints(v: &mut Vec<Bench>) {
     ));
 }
 
+/// Nanosecond ticks for the separate, untimed rejection-profile run.
+struct Nanos(Instant);
+
+impl Clock for Nanos {
+    fn now_ticks(&self) -> u64 {
+        self.0.elapsed().as_nanos() as u64
+    }
+}
+
 /// The simplifier: the standard strategy on random DAGs, the deobfuscation strategy with the MBA
 /// service (the signature and the normal-form solvers, on linear and nonlinear MBA), and a
 /// fresh tiny context per call.
@@ -676,14 +687,20 @@ fn simplify(v: &mut Vec<Bench>) {
                         _ => 0,
                     };
                     let before = size(&mut cx, &roots);
+                    let clock = Nanos(Instant::now());
+                    let mut rejected = MbaRejections::default();
                     let out = engine
-                        .run(&mut cx, &roots, Default::default())
+                        .run(
+                            &mut cx,
+                            &roots,
+                            Run::default().with_mba_rejections(&clock, &mut rejected),
+                        )
                         .expect("simplify");
                     let after: Vec<Expr> = out.roots.iter().map(|r| r.expr).collect();
                     let after = size(&mut cx, &after);
                     let m = &out.stats.mba;
                     let c = &m.certificates;
-                    format!(
+                    let mut note = format!(
                         "nodes {before} -> {after}; mba: {} simplified, {} not smaller, {} no \
                          simpler, {} unsupported, {} exhausted, {} unproved, {} refuted, {} too \
                          small, {} too many vars; proofs {} ({} signature, {} single-bit, {} \
@@ -708,7 +725,22 @@ fn simplify(v: &mut Vec<Bench>) {
                         c.compositional,
                         c.split,
                         c.points
-                    )
+                    );
+                    for (kind, cost) in [
+                        ("fresh/whole", &rejected.fresh_whole),
+                        ("cached/whole", &rejected.cached_whole),
+                        ("fresh/retry", &rejected.fresh_retry),
+                        ("cached/retry", &rejected.cached_retry),
+                    ] {
+                        write!(
+                            note,
+                            "; size gate {kind}: {} rejected, {} reused samples, \
+                             solve+render/sample/shrink {}/{}/{} ns",
+                            cost.count, cost.sample_hits, cost.solve, cost.sample, cost.shrink,
+                        )
+                        .unwrap();
+                    }
+                    note
                 }),
             );
         }

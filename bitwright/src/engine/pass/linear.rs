@@ -1161,6 +1161,84 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
     ))
 }
 
+/// Evaluate the sum down matching arms of its selects. A shift inside an arm scales
+/// its coefficient just as it would outside the select. Thus a select of `4*x` and
+/// `4*y` cancels four times the select of `x` and `y`, even with nested choices or
+/// pre-folded constant arms. Only walk choices already present in *every* remaining
+/// term; never specialize an expression on an unrelated guard.
+fn selected_constant(
+    cx: &Context,
+    terms: &[(u32, BitVec)],
+    konst: BitVec,
+    fuel: &mut u32,
+) -> Option<BitVec> {
+    let guard = cx.node(terms.first()?.0).a;
+    if !terms.iter().all(|&(a, _)| {
+        let n = cx.node(a);
+        n.op == OpCode::Select && n.a == guard
+    }) {
+        return None;
+    }
+    let mut answer = None;
+    for truth in [true, false] {
+        let mut offset = konst;
+        let mut out = [(0, BitVec::zero(konst.width())); SELECT_TERMS];
+        let mut len = 0;
+        for &(a, mut k) in terms {
+            let s = cx.node(a);
+            let mut v = if truth { s.b } else { s.c };
+            loop {
+                *fuel = fuel.checked_sub(1)?;
+                let n = cx.node(v);
+                if n.op == OpCode::Shl
+                    && let Some(j) = cx.const_val(n.b)
+                {
+                    k = BitVec::bin_unchecked(BinOp::Shl, &k, &j);
+                    v = n.a;
+                } else if n.op == OpCode::Mul
+                    && let Some((x, c)) = with_const(cx, v)
+                {
+                    k = BitVec::bin_unchecked(BinOp::Mul, &k, &cx.const_val(c)?);
+                    v = x;
+                } else {
+                    break;
+                }
+            }
+            if k.is_zero() {
+                continue;
+            }
+            if let Some(c) = cx.const_val(v) {
+                let d = BitVec::bin_unchecked(BinOp::Mul, &k, &c);
+                offset = BitVec::bin_unchecked(BinOp::Add, &offset, &d);
+            } else if let Some(i) = out[..len].iter().position(|(x, _)| *x == v) {
+                let coef = BitVec::bin_unchecked(BinOp::Add, &out[i].1, &k);
+                if coef.is_zero() {
+                    len -= 1;
+                    out[i] = out[len];
+                } else {
+                    out[i].1 = coef;
+                }
+            } else {
+                out[len] = (v, k);
+                len += 1;
+            }
+        }
+        let value = if len == 0 {
+            offset
+        } else {
+            selected_constant(cx, &out[..len], offset, fuel)?
+        };
+        if answer.is_some_and(|v| v != value) {
+            return None;
+        }
+        answer = Some(value);
+    }
+    answer
+}
+
+const SELECT_TERMS: usize = 8;
+const SELECT_WORK: u32 = 48;
+
 /// The linear pass at `n`. It tries several candidates in turn, and what each one it declines
 /// contributes stays in the result: a candidate rejected only because a part of the node has
 /// another user is not rejected for good (the user may go), whichever candidate it was. Kept
@@ -1192,6 +1270,22 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     }
     let form = form_of(r, cx, n)?;
+    if matches!(op, OpCode::Add | OpCode::Sub)
+        && (2..=SELECT_TERMS).contains(&form.terms.len())
+        && cx.node(form.terms[0].0).op == OpCode::Select
+    {
+        let mut fuel = SELECT_WORK;
+        let value = selected_constant(cx, &form.terms, form.konst, &mut fuel);
+        r.meter.charge(Counter::PassWork, u64::from(1 + SELECT_WORK - fuel))?;
+        if let Some(value) = value {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.mk_const(&value))?;
+            match finish(r, cx, PassKind::Linear, n, e, before, &[], form.fin)? {
+                Step::Normal(f) => declined = declined.and(f),
+                step => return Ok(step),
+            }
+        }
+    }
     let last = if form.is_atom_of(n) {
         // A sum over the cap in which terms met is written out again, from its whole form.
         match r.linear.whole.met(n) {
@@ -1546,7 +1640,7 @@ const FACTOR_LEAVES: usize = 8;
 /// products, negations and left shifts by a constant, shared or not; `None` past
 /// [`FACTOR_LEAVES`] factors.
 #[cfg(feature = "mba")]
-fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
+pub(super) fn scaled_factors(cx: &Context, t: u32) -> Option<(BitVec, Vec<u32>)> {
     let w = cx.width_of(t);
     let mut k = BitVec::one(w);
     let mut out: Vec<u32> = Vec::new();

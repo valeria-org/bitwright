@@ -1476,7 +1476,8 @@ pub mod mba {
   `W ≤ 6` in both directions, with every test also run on its own; planted wrong answers
   (corner-invisible products, terms nonzero only when three different positions are set,
   point functions) are never proved at any width.
-- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v3;…` with its options).
+- **The normal-form solver** (`NormalFormSolver`, id `bitwright.nf.v4;…` with its
+  answer-affecting options, including whether it renders basis sums).
   One pass over the question, operands first, gives every node the normal form of the smallest
   fragment containing it; *atoms* are the variables and every subterm the fragments cannot see
   through. The first version takes one width (nodes of other widths only below casts, which are
