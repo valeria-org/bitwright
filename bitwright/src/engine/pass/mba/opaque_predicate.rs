@@ -412,6 +412,7 @@ impl Rows {
 enum ColumnSource {
     Word(u32),
     Pair(u32, BinOp, u32),
+    Rotated(u32, u32),
 }
 
 impl ColumnSource {
@@ -419,6 +420,10 @@ impl ColumnSource {
         match self {
             Self::Word(x) => Ok(x),
             Self::Pair(a, op, b) => cx.c_bin(op, a, b),
+            Self::Rotated(x, k) => {
+                let k = cx.mk_const_u64(cx.wid(x), u64::from(k))?;
+                cx.c_bin(BinOp::RotL, x, k)
+            }
         }
     }
 }
@@ -665,6 +670,9 @@ pub(super) fn reduce_columns(
     if equality && cx.node(n.a).op == OpCode::Not && zero_product(cx, root).is_some() {
         return reduce_product(r, cx, root, order);
     }
+    if equality && let Some(v) = rotated_layers(r, cx, root, order)? {
+        return Ok(Some(v));
+    }
     let compared = equality && is_sum(cx, n.a);
     let field = matches!(n.op, OpCode::Extract | OpCode::Not)
         || (equality && matches!(cx.node(n.a).op, OpCode::Extract | OpCode::And));
@@ -708,11 +716,22 @@ pub(super) fn reduce_columns(
     Ok(result.get(root))
 }
 
-fn rewrite_sums(
+pub(super) fn rewrite_sums(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     order: &[u32],
     mut decode: impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
+) -> Result<super::super::Lease, Stop> {
+    rewrite_nodes(r, cx, order, |r, cx, cur, top| {
+        if top { decode(r, cx, cur) } else { Ok(None) }
+    })
+}
+
+fn rewrite_nodes(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    order: &[u32],
+    mut decode: impl FnMut(&mut Runner<'_, '_>, &mut Context, u32, bool) -> Result<Option<u32>, Stop>,
 ) -> Result<super::super::Lease, Stop> {
     let mut tops = super::super::Lease::new(cx.len());
     for &i in order {
@@ -733,7 +752,7 @@ fn rewrite_sums(
             changed |= kids[k] != c;
         }
         let mut cur = if changed { r.build(cx, |cx| cx.rebuild(i, kids))? } else { i };
-        if tops.contains(i) && is_sum(cx, cur) && let Some(v) = decode(r, cx, cur)? {
+        if let Some(v) = decode(r, cx, cur, tops.contains(i) && is_sum(cx, cur))? {
             cur = v;
         }
         if cur != i {
@@ -743,18 +762,18 @@ fn rewrite_sums(
     Ok(rewrites)
 }
 
-/// Recognize a whole sum as `(x & mask) ^ flip`. Each term must be a bitwise
-/// function of one word: its value with every bit of `x` clear is `s.flip`,
-/// and setting bit `j` changes that value by ±2^j (or zero). Multiplication by
-/// the term's scalar and addition preserve this affine expansion over input
-/// *bits*, even when carries would make the individual output bits nonlocal.
+/// Recognize `bias + ((rotl(x,r) & mask) ^ flip)` in an additive layer.
+/// Accumulate coefficients by *source* bit, not term bit: a left shift
+/// spelled as a scalar multiple and a right-shifted slice can read different
+/// positions of one word. Every nonzero coefficient must be ±2^j for the
+/// output bit j of one common rotation. The baseline is the all-clear word.
 fn sum_slice(
     cx: &Context,
     i: u32,
     memo: &mut super::SliceMemo,
     parts: &mut Vec<(u32, u64)>,
     work: &mut Work,
-) -> Option<super::Slice> {
+) -> Option<ColumnSum> {
     let w = cx.node(i).width;
     if w > 64 {
         return None;
@@ -763,14 +782,14 @@ fn sum_slice(
     let mut bias = 0u64;
     parts.clear();
     terms(cx, i, 1, &mut bias, parts, 96, false, work)?;
-    if parts.len() < 3 {
+    if parts.len() < 2 {
         return None;
     }
     let mut weights = [0u64; 64];
     let mut source = None;
     for &(t, k) in parts.iter() {
         let s = super::slice_of(cx, t, memo, 0);
-        if s.rot != 0 || source.replace(s.base).is_some_and(|b| b != s.base) {
+        if s.mask != 0 && source.replace(s.base).is_some_and(|b| b != s.base) {
             return None;
         }
         bias = bias.wrapping_add(k.wrapping_mul(s.flip));
@@ -780,25 +799,38 @@ fn sum_slice(
             let j = m.trailing_zeros();
             let bit = 1 << j;
             let delta = if s.flip & bit == 0 { k } else { k.wrapping_neg() };
-            weights[j as usize] = weights[j as usize].wrapping_add(delta << j);
+            let b = if j >= s.rot { j - s.rot } else { j + u32::from(w) - s.rot };
+            weights[b as usize] = weights[b as usize].wrapping_add(delta << j);
             m &= m - 1;
         }
     }
     work.take(u64::from(w))?;
     let mut mask = 0;
+    let mut flip = 0;
+    let mut rotation = None;
     for (j, &coeff) in weights[..usize::from(w)].iter().enumerate() {
-        let bit = 1u64 << j;
         let c = coeff & ones;
         if c == 0 {
             continue;
         }
-        // A wire can only toggle the matching bit of the all-clear result.
-        if c != (if bias & bit == 0 { bit } else { bit.wrapping_neg() } & ones) {
+        let dest = c.trailing_zeros();
+        let bit = 1u64 << dest;
+        let j = j as u32;
+        let rot = if dest >= j { dest - j } else { dest + u32::from(w) - j };
+        if rotation.replace(rot).is_some_and(|r| r != rot) { return None; }
+        if c == (bit.wrapping_neg() & ones) && (c != bit || bias & bit != 0) {
+            flip |= bit;
+        } else if c != bit {
             return None;
         }
         mask |= bit;
     }
-    Some(super::Slice { base: source?, rot: 0, mask, flip: bias & ones })
+    let base = source.unwrap_or(i); // unused for a constant
+    let rot = rotation.unwrap_or(0);
+    // If no addition is needed, keep constant lanes in the Boolean mask.
+    if (bias ^ flip) & mask == 0 { flip = bias & ones; }
+    let source = if rot == 0 { ColumnSource::Word(base) } else { ColumnSource::Rotated(base, rot) };
+    Some(ColumnSum { source, mask, flip, bias: bias.wrapping_sub(flip) & ones })
 }
 
 // Both p == 0 and ~p == all-ones test the same word. The polarity belongs
@@ -865,6 +897,81 @@ fn joined_offset(cx: &Context, i: u32, memo: &mut super::SliceMemo) -> Option<(u
     Some((a.a, k.wrapping_add(scalar(cx, a.b)?) & s.mask))
 }
 
+/// A sequence of split rotations can hide inverse constant additions on
+/// either end. Decode the arithmetic on its halves *before* treating the
+/// intermediate rotated words as independent inputs to the following sum.
+/// Commit only a smaller DAG. Sparse masks at the end often leave no bit of
+/// the original word; don't enumerate the irrelevant shifts or input bits.
+fn rotated_layers(
+    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32],
+) -> Result<Option<u32>, Stop> {
+    let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
+    let scan = order.len() as u64;
+    if budget < 9 * scan { return Ok(None); }
+    r.meter.charge(Counter::PassWork, scan)?;
+    let mut shifts = super::super::Lease::new(cx.len());
+    let mut paired = false;
+    for &i in order {
+        let n = cx.node(i);
+        if matches!(n.op, OpCode::Shl | OpCode::LShr) && n.width <= 64 && scalar(cx, n.b).is_some() {
+            let flag = if n.op == OpCode::Shl { 1 } else { 2 };
+            let flags = shifts.get(n.a).unwrap_or(0) | flag;
+            if flags == 3 { paired = true; break; }
+            shifts.insert(n.a, flags);
+        }
+    }
+    if !paired { return Ok(None); }
+    // Memoized slice reads, rebuilding and the final size check are linear
+    // in the DAG. Charge coefficient accumulation by the live columns.
+    let mut work = Work::new(budget - 9 * scan);
+    let mut memo = super::SliceMemo::new(cx);
+    let mut parts = Vec::new();
+    let out = rewrite_nodes(r, cx, order, |r, cx, i, sum| {
+        let n = cx.node(i);
+        if n.width > 64 || work.left == 0 { return Ok(None); }
+        if sum {
+            if let Some((x, k)) = joined_offset(cx, i, &mut memo) {
+                return r.build(cx, |cx| {
+                    let k = cx.mk_const_u64(n.width, k)?;
+                    cx.c_bin(BinOp::Add, x, k)
+                }).map(Some);
+            }
+            if let Some(s) = sum_slice(cx, i, &mut memo, &mut parts, &mut work) {
+                return s.build(r, cx, n.width).map(Some);
+            }
+        } else if matches!(n.op, OpCode::And | OpCode::Or) && scalar(cx, n.b).is_some() {
+            let s = super::slice_of(cx, i, &mut memo, 0);
+            let ones = u64::MAX >> (64 - n.width);
+            let constant = if s.mask == 0 {
+                Some(s.flip)
+            } else if s.rot != 0 && s.mask.count_ones() <= super::EXHAUSTIVE_BITS {
+                // Only query the base, before the rotations, for these few
+                // surviving bits. A scoped fact must not escape in a rewrite.
+                let (kb, fin) = super::super::known_words(r, cx, s.base)?;
+                kb.and_then(|[z, o]| {
+                    let rot = |x: u64|
+                        ((x << s.rot) | ((x & ones) >> (u32::from(n.width) - s.rot))) & ones;
+                    (fin == super::Fin::FINAL && s.mask & !rot(z | o) == 0)
+                        .then(|| (rot(o) & s.mask) ^ s.flip)
+                })
+            } else {
+                None
+            };
+            if let Some(v) = constant {
+                return r.build(cx, |cx| cx.mk_const_u64(n.width, v)).map(Some);
+            }
+        }
+        Ok(None)
+    })?;
+    r.meter.charge(Counter::PassWork, budget - scan - work.left)?;
+    let Some(out) = out.get(root) else { return Ok(None) };
+    let smaller = matches!(
+        cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1).map_err(Stop::Error)?,
+        crate::expr::Bounded::Exact(_)
+    );
+    Ok(smaller.then_some(out))
+}
+
 /// A product's few visible bits may read an entire chain of encoded words.
 /// Collapse the maximal sums in that chain *before* asking about unrelated
 /// subexpressions. The other phases handle the resulting small product.
@@ -916,8 +1023,7 @@ pub(super) fn reduce_product(
     let mut memo = super::SliceMemo::new(cx);
     let mut parts = Vec::new();
     let rewrites = rewrite_sums(r, cx, order, |r, cx, cur| {
-        if let Some(s) = sum_slice(cx, cur, &mut memo, &mut parts, &mut work) {
-            let sum = ColumnSum { source: ColumnSource::Word(s.base), mask: s.mask, flip: s.flip, bias: 0 };
+        if let Some(sum) = sum_slice(cx, cur, &mut memo, &mut parts, &mut work) {
             return sum.build(r, cx, cx.node(cur).width).map(Some);
         }
         if let Some((x, k)) = joined_offset(cx, cur, &mut memo) {
@@ -1161,21 +1267,28 @@ mod tests {
         let w = Width::new(4).unwrap();
         let mut parts = Vec::new();
         let mut work = Work { left: 4096, projections: Default::default() };
-        for (text, wire) in [
-            ("(x & 3)*3 - (x & 3)*2 + (~x & 12)", true),
-            // Same factors, but the carry from the added bit is not a wire.
-            ("(x & 3)*3 - (x & 3)*2 + (~x & 12) + 1", false),
-            ("(x & 3)*3 - (x & 3)*2 + (~y & 12)", false),
+        for (text, bias) in [
+            ("(x & 3)*3 - (x & 3)*2 + (~x & 12)", Some(0)),
+            // The carry is not a wire: the offset must remain an addition.
+            ("(x & 3)*3 - (x & 3)*2 + (~x & 12) + 1", Some(1)),
+            ("(x & 3)*3 - (x & 3)*2 + (~y & 12)", None),
+            ("(x & 3)*5 - (x & 3)*2 + (~x & 12)", None),
+            // Both shift halves and their masks read one rotated word.
+            ("let h = x << 1; let l = x >>u 3; (h | l) + (h & l)*5 + (~h & ~l)*2", Some(15)),
+            ("(x << 1) + (x >>u 3)", Some(0)),
+            ("(x << 1) + (x >>u 2)", None),
         ] {
             let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
             let mut memo = super::super::SliceMemo::new(&cx);
             let slice = sum_slice(&cx, cx.id(e).unwrap(), &mut memo, &mut parts, &mut work);
-            assert_eq!(slice.is_some(), wire, "{text}");
+            assert_eq!(slice.as_ref().map(|s| s.bias), bias, "{text}");
             if let Some(s) = slice {
+                let source = s.source.build(&mut cx).unwrap();
                 for x in 0..16 {
                     let env = FnEnv(|_: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, x)));
-                    let v = cx.eval(&[e], &env).unwrap()[0].to_u64().unwrap();
-                    assert_eq!(v, (x & s.mask) ^ s.flip);
+                    let v = cx.eval(&[e, cx.handle(source)], &env).unwrap();
+                    let word = (v[1].to_u64().unwrap() & s.mask) ^ s.flip;
+                    assert_eq!(v[0].to_u64(), Some((word + s.bias) & 15));
                 }
             }
         }

@@ -12,6 +12,38 @@ cargo run --release -p bitwright-bench -- --corpus-diff     # MBA defaults again
 cargo run --release -p bitwright-bench -- --prover-budgets  # the prover's simplification under budgets
 ```
 
+## Round-two validity handoff
+
+For `bw-handoff-2.tgz` (SHA-256 `d03efb85109af88dac711d7caaf3ad72533eaa0e23031143e01c249e9013c9e3`):
+
+```sh
+cargo run --release -p bitwright-bench -- --validity-records bw-handoff-2/questions > decisions.tsv
+```
+
+Each row is `file`, `verdict`, `stage` (tab-separated). `asked` uses a fresh
+context and solver, the complete recorded `#CFG`, and each `#A` predicate.
+The reader rejects an unsupported config or a missing assumption rather than
+silently asking an easier question.
+
+Only a size or search-budget stop enters recovery. The forms engine simplifies
+`!root & assumption₁ & …` with known atoms and basis sums, for up to three
+passes at `1 << 19` fuel each, stopping at a constant or an unchanged root.
+A zero counterexample predicate proves validity (`forms`). Otherwise the native
+prover tries the residual with the original circuit and search limits
+(`residual`). On search exhaustion it resumes the same SAT instance once, with
+up to 100,000 additional conflicts and 20 million propagations (`search`).
+Every countermodel must make the original predicate false with every original
+assumption true. No external SMT solver or binary-analysis host is needed.
+The recovery budgets are specific to this command, not new prover defaults.
+
+All 50 supplied records decided in one cold, sequential replay (5.42 seconds
+wall on the development host, excluding compilation). At the recorded limits
+30 proved and five refuted. Of the remaining 15, the forms pass proved 13;
+`q04869` and `q06447` needed resumed SAT. All 35 `hard` and `hard-old` records
+proved. The previous 21-record handoff still decided entirely at its recorded
+limits (12 proved, nine refuted). These counts describe the supplied samples,
+not the full walk logs.
+
 ## Replaying the 21-question solver handoff
 
 `bw-handoff.tgz` SHA-256: `7785d29959cfd66c1bdf4a0c2f07d76651309a57924569e488ad6579f680ed26`.

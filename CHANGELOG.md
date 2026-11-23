@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.32.7
+
+- The opaque MBA sweep can cancel a constant weighted cofactor without
+  expanding its shared multiplier, and simplify sums of masked rotations
+  when their bit coefficients describe exact wires.
+- Guard sampling can repair computed equalities and modular products. A
+  successful repair still has to refute the original predicate.
+- `bitwright-bench --validity-records DIR` replays captured validity queries
+  at their recorded limits and reports separately when a bounded forms or SAT
+  retry was needed. It exits nonzero if any record remains undecided.
+
 ## 0.32.6
 
 - The opaque MBA sweep can replace a weighted selector test with a masked

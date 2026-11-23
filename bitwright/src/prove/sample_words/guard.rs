@@ -18,6 +18,44 @@ impl Target {
         }
     }
 
+    // Invert a chain of literal products modulo the width actually observed.
+    // A low extraction between two products is immaterial to their low bits.
+    // Combine the factors before solving: the high input bits lost to an even
+    // factor should remain free, rather than becoming targets of the next inverse.
+    fn product(self, p: &Program, values: &[u64], fuel: &mut u8) -> Option<Self> {
+        let mut slot = self.slot;
+        let mask = p.ops[slot].mask;
+        let mut factor = 1u64;
+        loop {
+            match p.ops[slot].op {
+                Op::Binary(BinOp::Mul, a, b) => {
+                    let t = Self::literal(p, a, b)?;
+                    factor = factor.wrapping_mul(t.value);
+                    slot = t.slot;
+                }
+                Op::Extract(a, 0) if p.ops[slot].mask >= mask => slot = a,
+                _ => break,
+            }
+            *fuel = fuel.checked_sub(1)?;
+        }
+        factor &= mask;
+        if factor == 0 { return None; }
+        let shift = factor.trailing_zeros();
+        if self.value >> shift << shift != self.value { return None; }
+        let odd = factor >> shift;
+        // Every odd number is its own inverse modulo 8. Each Newton step
+        // doubles the precision until all the observed bits are correct.
+        let fixed = mask >> shift;
+        let mut bits = 3;
+        let mut inverse = odd;
+        while bits < 64 - fixed.leading_zeros() {
+            inverse = inverse.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inverse)));
+            bits *= 2;
+        }
+        let low = (self.value >> shift).wrapping_mul(inverse) & fixed;
+        Some(Self { slot, value: (values[slot] & !fixed) | low })
+    }
+
     pub(super) fn invert(self, p: &Program, values: &[u64], fuel: &mut u8) -> Option<(usize, u64)> {
         let Self { slot, value } = self;
         let ins = &p.ops[slot];
@@ -40,8 +78,21 @@ impl Target {
             Op::Unary(UnOp::Not, a) | Op::Zext(a) => flip(a, delta),
             Op::Extract(a, lo) => flip(a, delta << lo),
             Op::Select(c, t, e) => flip(if values[c] != 0 { t } else { e }, delta),
-            Op::Binary(BinOp::Add, a, b) if matches!(p.ops[b].op, Op::Constant(_)) => {
-                Self { slot: a, value: value.wrapping_sub(values[b]) & ins.mask }
+            Op::Binary(BinOp::Mul, ..) => self.product(p, values, fuel)?,
+            Op::Binary(BinOp::Xor | BinOp::Add, a, b) => {
+                let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) { (b, a) } else { (a, b) };
+                for (child, other) in [(a, b), (b, a)] {
+                    if matches!(p.ops[child].op, Op::Constant(_)) { continue; }
+                    let target = if matches!(ins.op, Op::Binary(BinOp::Xor, ..)) {
+                        value ^ values[other]
+                    } else {
+                        value.wrapping_sub(values[other]) & ins.mask
+                    };
+                    if let Some(patch) = (Self { slot: child, value: target }).invert(p, values, fuel) {
+                        return Some(patch);
+                    }
+                }
+                return None;
             }
             Op::Binary(BinOp::Shl | BinOp::LShr, a, b)
                 if matches!(p.ops[b].op, Op::Constant(_)) && values[b] < u64::from(ins.width) =>
@@ -179,10 +230,29 @@ impl Interval {
     }
 }
 
+pub(super) enum Requirement {
+    Value(Target),
+    Equal(usize, usize),
+}
+
+impl Requirement {
+    fn repair(&self, p: &Program, values: &[u64], fuel: &mut u8) -> Option<(usize, u64)> {
+        match *self {
+            Self::Value(t) => t.invert(p, values, fuel),
+            Self::Equal(a, b) => {
+                // Prefer a directly writable word to the inverse of a derived one.
+                let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) { (b, a) } else { (a, b) };
+                Target { slot: a, value: values[b] }.invert(p, values, fuel)
+                    .or_else(|| Target { slot: b, value: values[a] }.invert(p, values, fuel))
+            }
+        }
+    }
+}
+
 pub(super) fn propose(
     p: &Program,
     values: &[u64],
-    required: &[Target],
+    required: &[Requirement],
     ranges: &[Interval],
     cases: &[Target],
     round: usize,
@@ -193,7 +263,7 @@ pub(super) fn propose(
     fn candidates<T>(pool: &[T], round: usize) -> impl Iterator<Item = &T> {
         (0..pool.len().min(4)).map(move |off| &pool[(round + off) % pool.len()])
     }
-    if let Some(patch) = candidates(required, round).find_map(|&t| t.invert(p, values, &mut fuel)) {
+    if let Some(patch) = candidates(required, round).find_map(|t| t.repair(p, values, &mut fuel)) {
         return Some(patch);
     }
     let mut weighted = None;

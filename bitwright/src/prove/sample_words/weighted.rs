@@ -231,7 +231,7 @@ mod tests {
                 &ParseOptions::width(Width::W16),
             )
             .unwrap();
-        let (p, _) = Program::lower(&mut cx, expr.index(), &[]).unwrap();
+        let (p, _) = Program::lower(&mut cx, expr.index(), &[], super::super::MAX_NODES).unwrap();
         let Op::Compare(_, lhs, _, _) = p.ops[p.goal].op else {
             panic!()
         };

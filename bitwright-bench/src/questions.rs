@@ -19,6 +19,59 @@ use bitwright::{Assumptions, BitVec, CmpOp, Context, Expr, Facts, ParseOptions, 
 
 mod sampled;
 pub(super) use sampled::sampled;
+mod validity;
+pub(super) use validity::validity;
+
+/// Both replay formats use the same stock and noise-forms engines.
+struct Retry {
+    stock: prove::Simplifiers,
+    forms: MbaConfig,
+    solver: Arc<NormalFormSolver>,
+    word: Engine,
+}
+
+impl Retry {
+    fn new() -> Result<Self, bitwright::engine::BuildError> {
+        let solver = Arc::new(NormalFormSolver::new(
+            NfOptions::default()
+                .with_memo(1 << 14)
+                .with_basis_sums(true),
+        ));
+        let stock = MbaConfig::default().with_opaque_sweep(true);
+        let forms = stock.clone().with_noise_forms(true).with_known_atoms(true);
+        let word = Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate().with_mba(forms.clone()))
+            .mba_solver(solver.clone())
+            .build()?;
+        Ok(Self {
+            stock: prove::Simplifiers::new()
+                .with_mba(stock)
+                .with_mba_solver(solver.clone()),
+            forms,
+            solver,
+            word,
+        })
+    }
+}
+
+/// A model of a smaller residual is not a result until the original predicate is
+/// false and every original assumption true. Erased symbols get a concrete zero.
+fn check_witness(cx: &mut Context, checks: &[Expr], model: &prove::Model) -> Result<(), String> {
+    let env = bitwright::FnEnv(|s: &bitwright::SymbolKey, w: Width| {
+        Some(
+            model
+                .iter()
+                .find(|(k, _)| k == s)
+                .map_or_else(|| BitVec::zero(w), |(_, v)| *v),
+        )
+    });
+    let values = cx.eval(checks, &env).map_err(|e| e.to_string())?;
+    if !values[0].is_zero() || values[1..].iter().any(BitVec::is_zero) {
+        return Err("counterexample failed original question replay".into());
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct Dump {

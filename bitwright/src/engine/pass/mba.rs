@@ -1,5 +1,6 @@
 //! The MBA phase: lowering, the solver, the evidence gate, lifting (see [`crate::mba`]).
 
+mod cofactors;
 mod field_guard;
 mod guard_domain;
 mod opaque_predicate;
@@ -295,6 +296,85 @@ pub(super) fn sweep(
     sweep_inner(r, cx, cfg, root, true)
 }
 
+/// Give the cheap linear signatures one operands-first walk before the sweep spends
+/// visits sampling and reducing the cones of individual candidates. For a large DAG
+/// with many scalar-weighted sums, folding one varying sum to its sole surviving
+/// word can expose two inverse rotations and fixed fields in *later* sums. In this
+/// walk a rotation is taken only when every bit is a wire (or its complement).
+fn large_affine(
+    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32],
+) -> Result<Option<u32>, Stop> {
+    let scan = order.len() as u64;
+    let budget = (r.meter.left_in(|b| b.pass_work) / 2).min(1 << 18);
+    if order.len() <= 4096 || 8 * scan >= budget || cx.wid(root) != 1 {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, scan)?;
+    let add = |op| matches!(op, OpCode::Add | OpCode::Sub);
+    let mut tops = super::Lease::new(cx.len());
+    let mut weighted = 0;
+    for &i in order {
+        let n = cx.node(i);
+        if add(n.op) {
+            if n.children().any(|c| {
+                let t = cx.node(c);
+                t.op == OpCode::Mul && cx.node(t.b).op == OpCode::Const
+            }) { weighted += 1; }
+        } else {
+            for c in n.children().filter(|&c| add(cx.node(c).op)) { tops.insert(c, 0); }
+        }
+    }
+    if weighted < order.len() / 64 { return Ok(None); }
+    // Includes rebuilding, the memoized slice reads, and the final bounded size
+    // check. Candidate walks and every row of their signatures are charged below.
+    r.meter.charge(Counter::PassWork, 7 * scan)?;
+    let available = budget - 8 * scan;
+    let mut left = available;
+    let mut subs = super::Lease::new(cx.len());
+    let mut slices = SliceMemo::new(cx);
+    for &i in order {
+        let mut kids = [0; 3];
+        let mut changed = false;
+        for (j, c) in cx.node(i).children().enumerate() {
+            kids[j] = subs.get(c).unwrap_or(c);
+            changed |= kids[j] != c;
+        }
+        let mut cur = if changed { r.build(cx, |cx| cx.rebuild(i, kids))? } else { i };
+        if tops.contains(i) && let Some(e) = super::linear_mba::one_word(r, cx, cur, &mut left)? {
+            cur = e;
+        }
+        let n = cx.node(cur);
+        if n.width <= 64 && matches!(n.op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::RotL | OpCode::Not) {
+            let ones = u64::MAX >> (64 - n.width);
+            let s = slice_of(cx, cur, &mut slices, 0);
+            if s.base != cur && s.mask == 0 {
+                cur = r.build(cx, |cx| cx.mk_const_u64(n.width, s.flip))?;
+            } else if s.base != cur && s.mask == ones && (s.flip == 0 || s.flip == ones) {
+                cur = r.build(cx, |cx| {
+                    let x = if s.rot == 0 { s.base } else {
+                        let k = cx.mk_const_u64(n.width, u64::from(s.rot))?;
+                        cx.c_bin(BinOp::RotL, s.base, k)?
+                    };
+                    if s.flip == 0 { Ok(x) } else { cx.c_un(UnOp::Not, x) }
+                })?;
+            }
+        }
+        let n = cx.node(cur);
+        if r.assumptions.is_none() && n.width <= 64
+            && (n.op == OpCode::Extract || (n.op == OpCode::And && cx.node(n.b).op == OpCode::Const))
+            && let (Some([z, o]), _) = super::known_words(r, cx, cur)?
+            && (z | o) == u64::MAX >> (64 - n.width)
+        {
+            cur = r.build(cx, |cx| cx.mk_const_u64(n.width, o))?;
+        }
+        if cur != i { subs.insert(i, cur); }
+    }
+    r.meter.charge(Counter::PassWork, available - left)?;
+    let Some(out) = subs.get(root) else { return Ok(None) };
+    Ok(matches!(cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1).map_err(Stop::Error)?,
+        crate::expr::Bounded::Exact(_)).then_some(out))
+}
+
 /// [`sweep`], optionally reconstructing piecewise constants. A case side disables that recursion:
 /// the selected condition is gone, and its ordinary opaque-constant sweep is the useful part.
 fn sweep_inner(
@@ -322,6 +402,12 @@ fn sweep_inner(
         }
     }
     r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    if fold_cases && cfg.opaque_sweep
+        && let Some(e) = large_affine(r, cx, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        return Ok(e);
+    }
     if fold_cases && output_set::covered(r, cx, root)? {
         let e = r.build(cx, |cx| cx.mk_const_u64(1, 1))?;
         count(r).opaque_proved += 1;
@@ -340,6 +426,16 @@ fn sweep_inner(
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
+    let root = if fold_cases && cfg.opaque_sweep
+        && let Some(e) = cofactors::reduce(r, cx, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        order = cx.post_order_ids(&[e]);
+        r.meter.charge(Counter::PassWork, order.len() as u64)?;
+        e
+    } else {
+        root
+    };
     if fold_cases && let Some(e) = opaque_predicate::reduce_columns(r, cx, root, &order)? {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);

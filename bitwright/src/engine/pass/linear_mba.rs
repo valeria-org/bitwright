@@ -187,7 +187,9 @@ impl Scratch {
 /// The `seen` bit of a node in the post-order.
 const LISTED: u32 = 8;
 
-fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
+fn walk<const QUICK: bool>(
+    cx: &Context, root: u32, s: &mut Scratch, visits: &mut usize,
+) -> Result<Region, Walk> {
     s.seen.begin(cx.len());
     s.under.clear();
     let mut reached = 0usize;
@@ -206,7 +208,8 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
         let op = cx.node(i).op;
         // Under a cast: bitwise operators over uniform constants, nothing else (a cast there
         // is an atom too, lifted by the outer one).
-        let inner = !s.forced.contains(i)
+        let inner = (!QUICK || !matches!(op, OpCode::Sext | OpCode::Zext))
+            && !s.forced.contains(i)
             && interior(cx, i, mode)
             && (lift.is_none() || is_bitwise(op) || cx.const_val(i).is_some());
         if let Some((kind, cast)) = lift {
@@ -235,7 +238,8 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
             None => {
                 s.seen.set(i, u32::from(inner) | read);
                 reached += 1;
-                if reached > MAX_REGION {
+                if QUICK { *visits += 1; }
+                if reached > if QUICK { 160 } else { MAX_REGION } {
                     return Err(Walk::Over);
                 }
                 if !inner {
@@ -243,7 +247,7 @@ fn walk(cx: &Context, root: u32, s: &mut Scratch) -> Result<Region, Walk> {
                         Some((kind, _)) => narrow.push((i, kind)),
                         None => atoms.push(i),
                     }
-                    if atoms.len() + narrow.len() > MAX_ATOMS {
+                    if atoms.len() + narrow.len() > if QUICK { 5 } else { MAX_ATOMS } {
                         return Err(Walk::Over);
                     }
                     continue;
@@ -313,7 +317,7 @@ fn lift(r: &mut Runner<'_, '_>, cx: &mut Context, reg: &mut Region, w: u16) -> R
 fn region(cx: &Context, root: u32, s: &mut Scratch) -> Option<Region> {
     s.forced.begin(cx.len());
     for _ in 0..32 {
-        match walk(cx, root, s) {
+        match walk::<false>(cx, root, s, &mut 0) {
             Ok(r) => return Some(r),
             Err(Walk::Conflict(i)) if i != root => {
                 s.forced.insert(i);
@@ -328,9 +332,18 @@ fn region(cx: &Context, root: u32, s: &mut Scratch) -> Option<Region> {
 /// `p` is set).
 fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitVec> {
     let w = cx.width_of(root);
-    let bits = u64::from(w.bits());
+    match signature_words(cx, reg, root, s) {
+        Some(row) => row.iter().map(|&v| BitVec::wrapping_from_u64(w, v)).collect(),
+        None => signature_wide(cx, reg, root),
+    }
+}
+
+fn signature_words<'a>(
+    cx: &Context, reg: &Region, root: u32, s: &'a mut Scratch,
+) -> Option<&'a [u64]> {
+    let bits = u64::from(cx.wid(root));
     if bits > 64 {
-        return signature_wide(cx, reg, root);
+        return None;
     }
     // Every region node has the root's width: a row of words per node, masked to it.
     let mask = u64::MAX >> (64 - bits);
@@ -355,7 +368,7 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
     for &(a, l) in &reg.lifts {
         match s.seen.get(l) {
             Some(j) => s.seen.set(a, j),
-            None => return signature_wide(cx, reg, root),
+            None => return None,
         }
     }
     for (k, &i) in reg.order.iter().enumerate() {
@@ -375,7 +388,7 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
                 .map(|r| &done[r as usize * corners..(r as usize + 1) * corners])
         };
         let Some(a) = operand(n.a) else {
-            return signature_wide(cx, reg, root);
+            return None;
         };
         match n.op {
             OpCode::Sext => out.copy_from_slice(a),
@@ -398,7 +411,7 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
                 .for_each(|(o, &x)| *o = x.wrapping_neg() & mask),
             op => {
                 let Some(b) = operand(n.b) else {
-                    return signature_wide(cx, reg, root);
+                    return None;
                 };
                 let f: fn(u64, u64, u64) -> u64 = match op {
                     OpCode::Add => |x, y, _| x.wrapping_add(y),
@@ -408,7 +421,7 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
                     OpCode::And => |x, y, _| x & y,
                     OpCode::Or => |x, y, _| x | y,
                     OpCode::Xor => |x, y, _| x ^ y,
-                    _ => return signature_wide(cx, reg, root),
+                    _ => return None,
                 };
                 for (o, (&x, &y)) in out.iter_mut().zip(a.iter().zip(b)) {
                     *o = f(x, y, bits) & mask;
@@ -417,12 +430,97 @@ fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitV
         }
     }
     let r = (t + reg.order.len() - 1) * corners;
-    match s.seen.get(root) {
-        Some(k) if k as usize * corners == r => s.words[r..r + corners]
-            .iter()
-            .map(|&v| BitVec::wrapping_from_u64(w, v))
-            .collect(),
-        _ => signature_wide(cx, reg, root),
+    (s.seen.get(root)? as usize * corners == r).then_some(&s.words[r..r + corners])
+}
+
+/// Endpoints of a constant or one-variable signature. In particular, agreement
+/// at zero and at each singleton is insufficient: a joint corner can differ.
+#[cfg(feature = "mba")]
+fn one_axis(sig: &[u64], vars: usize) -> Option<(u64, Option<usize>, u64)> {
+    let bias = sig[0];
+    let axis = (0..vars).find(|&j| sig[1 << j] != bias);
+    let other = axis.map_or(bias, |j| sig[1 << j]);
+    sig.iter().enumerate().all(|(p, &v)| {
+        v == if axis.is_some_and(|j| p & (1 << j) != 0) { other } else { bias }
+    }).then_some((bias, axis, other))
+}
+
+/// A cheap exact reading for the large-expression sweep. A linear MBA that agrees
+/// with `k + c*x` on every corner *is* `k + c*x` for arbitrary word inputs. Only
+/// that one-word form (or a constant) is interesting here: no basis search, no
+/// lifting through casts, and no dynamic enumeration of the word inputs.
+#[cfg(feature = "mba")]
+pub(super) fn one_word(
+    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, left: &mut u64,
+) -> Result<Option<u32>, Stop> {
+    let w = cx.wid(root);
+    if w > 64 || !matches!(cx.node(root).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let s = &mut r.linear_mba;
+    s.forced.begin(cx.len());
+    for _ in 0..3 {
+        // walk::<true> stops at the 161st distinct node. A conflict can only
+        // add another walk after the node has been fixed as a common cut.
+        if *left < 161 { break; }
+        let mut visits = 0;
+        let region = walk::<true>(cx, root, s, &mut visits);
+        *left -= visits as u64;
+        let reg = match region {
+            Ok(reg) => reg,
+            Err(Walk::Conflict(i)) if i != root => {
+                s.forced.insert(i);
+                continue;
+            }
+            Err(_) => break,
+        };
+        if reg.order.len() < 2 { break; }
+        let rows = 1usize << reg.atoms.len();
+        let cost = ((reg.order.len() + reg.atoms.len() + 2) * rows) as u64;
+        if cost > *left { break; }
+        *left -= cost;
+        let Some(sig) = signature_words(cx, &reg, root, s) else { break };
+        let Some((bias, axis, other)) = one_axis(sig, reg.atoms.len()) else { break };
+        let mask = u64::MAX >> (64 - w);
+        let atom = axis.map(|j| reg.atoms[j]);
+        return r.build(cx, |cx| {
+            let k = cx.mk_const_u64(w, bias)?;
+            let Some(x) = atom else { return Ok(Some(k)) };
+            let coeff = bias.wrapping_sub(other) & mask;
+            let out = if coeff == mask {
+                cx.c_bin(BinOp::Sub, k, x)?
+            } else {
+                let c = cx.mk_const_u64(w, coeff)?;
+                let term = cx.c_bin(BinOp::Mul, x, c)?;
+                cx.c_bin(BinOp::Add, term, k)?
+            };
+            Ok((out != root).then_some(out))
+        });
+    }
+    Ok(None)
+}
+
+#[cfg(all(test, feature = "mba"))]
+#[test]
+fn one_word_keeps_mixed_corners_in_its_proof() {
+    let mut cx = Context::new();
+    let opts = crate::ParseOptions::width(crate::Width::W8);
+    let mut s = Scratch::default();
+    for (text, fits) in [
+        ("3 * (a & b) + 3 * (a & ~b) + 7", true),
+        ("3 * (a & b) + 3 * (a & ~b) + (a & b) + 7", false),
+    ] {
+        let root = cx.parse(text, &opts).unwrap().index();
+        s.forced.begin(cx.len());
+        let reg = walk::<true>(&cx, root, &mut s, &mut 0).ok().unwrap();
+        let row = signature_words(&cx, &reg, root, &mut s).unwrap();
+        let answer = one_axis(row, reg.atoms.len());
+        assert_eq!(answer.is_some(), fits);
+        if let Some((bias, Some(axis), other)) = answer {
+            assert_eq!(bias, 7);
+            assert_eq!(bias.wrapping_sub(other) & 255, 3);
+            assert_eq!(reg.atoms[axis], cx.parse("a", &opts).unwrap().index());
+        }
     }
 }
 

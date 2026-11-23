@@ -1,11 +1,10 @@
 //! Check a sampled word, not the claim that the exporter's samples were exhaustive.
-use super::{Dump, read};
+use super::{Dump, Retry, check_witness, read};
 use bitwright::batch::{self, Answer, Ask, Session, Split};
-use bitwright::engine::{Budget, Engine, Run, Strategy};
-use bitwright::mba::{MbaConfig, NfOptions, NormalFormSolver};
+use bitwright::engine::{Budget, Run};
 use bitwright::prove::{self, Config, Outcome, Simplifiers};
-use bitwright::{Assumptions, BitVec, Context, Facts, FnEnv, ParseOptions, SymbolKey, Width};
-use std::{collections::BTreeMap, error::Error, fs, sync::Arc};
+use bitwright::{Assumptions, BitVec, Context, Facts, ParseOptions, Width};
+use std::{collections::BTreeMap, error::Error, fs};
 
 type Result<T, E = Box<dyn Error>> = std::result::Result<T, E>;
 
@@ -16,36 +15,7 @@ fn word(s: &str, width: Width) -> Result<BitVec> {
     )?)
 }
 
-struct Retry {
-    stock: Simplifiers,
-    forms: MbaConfig,
-    solver: Arc<NormalFormSolver>,
-    word: Engine,
-}
-
 impl Retry {
-    fn new() -> Result<Self> {
-        let solver = Arc::new(NormalFormSolver::new(
-            NfOptions::default()
-                .with_memo(1 << 14)
-                .with_basis_sums(true),
-        ));
-        let stock = MbaConfig::default().with_opaque_sweep(true);
-        let forms = stock.clone().with_noise_forms(true).with_known_atoms(true);
-        Ok(Self {
-            stock: Simplifiers::new()
-                .with_mba(stock)
-                .with_mba_solver(solver.clone()),
-            forms: forms.clone(),
-            solver: Arc::clone(&solver),
-            word: Engine::builder()
-                .builtin()
-                .strategy(Strategy::deobfuscate().with_mba(forms))
-                .mba_solver(solver)
-                .build()?,
-        })
-    }
-
     fn check(&self, dump: &Dump, sample: &str, deep: u64) -> Result<(&'static str, &'static str)> {
         let [root] = dump.roots.as_slice() else {
             return Err("expected one root".into());
@@ -137,20 +107,7 @@ impl Retry {
             match outcome {
                 Outcome::Proved(_) => return Ok(("proved", stage)),
                 Outcome::Refuted(model) => {
-                    // A rewrite may erase a symbol. Complete it before evaluating the
-                    // original, never report a witness of just the residual.
-                    let env = FnEnv(|s: &SymbolKey, w: Width| {
-                        Some(
-                            model
-                                .iter()
-                                .find(|(k, _)| k == s)
-                                .map_or_else(|| BitVec::zero(w), |(_, v)| *v),
-                        )
-                    });
-                    let vals = cx.eval(&checks, &env)?;
-                    if !vals[0].is_zero() || vals[1..].iter().any(BitVec::is_zero) {
-                        return Err("counterexample failed original question replay".into());
-                    }
+                    check_witness(&mut cx, &checks, &model)?;
                     return Ok(("refuted", stage));
                 }
                 Outcome::Unknown(_) if matches!(stage, "cases" | "forms") => {

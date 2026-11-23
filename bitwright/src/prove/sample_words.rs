@@ -74,7 +74,7 @@ impl Program {
         constraints: &[u32],
         assumptions: Option<&Assumptions>,
     ) -> Option<Self> {
-        let (mut program, slots) = Self::lower(cx, goal, constraints)?;
+        let (mut program, slots) = Self::lower(cx, goal, constraints, MAX_NODES)?;
         if let Some(assumptions) = assumptions {
             program.fix_scoped_bits(assumptions, &slots)?;
         }
@@ -96,10 +96,11 @@ impl Program {
         cx: &mut Context,
         goal: u32,
         constraints: &[u32],
+        limit: usize,
     ) -> Option<(Self, IdMap<u32, usize>)> {
         let mut roots = vec![goal];
         roots.extend_from_slice(constraints);
-        let remaining = std::cell::Cell::new(MAX_NODES);
+        let remaining = std::cell::Cell::new(limit);
         let truncated = std::cell::Cell::new(false);
         let order = cx.post_order_ids_pruned(&roots, |_| {
             if remaining.get() == 0 {
@@ -634,11 +635,39 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     let n = cx.node(root);
     let selected_equality = n.op == OpCode::Eq
         && [n.a, n.b].iter().any(|&i| cx.node(i).op == OpCode::Select);
-    if !selected_equality && cx.height(cx.handle(root)).ok()? < 32 {
+    let conjunctive = n.op == OpCode::Or || (n.op == OpCode::Not && cx.node(n.a).op == OpCode::And);
+    let tall = cx.height(cx.handle(root)).ok()? >= 32;
+    if !selected_equality && !conjunctive && !tall {
         return None;
     }
-    let (p, slots) = Program::lower(cx, root, &[])?;
-    if !selected_equality && p.ops.len() < 128 {
+    // A short implication can contain a full-width equality whose required
+    // value is another lane word, not a constant label. Inspect its Boolean
+    // spine before deciding whether to compile the word program.
+    let mut terms = Vec::new();
+    let mut stack = vec![(root, false)];
+    let mut word_guard = false;
+    for _ in 0..128 {
+        let Some((i, want)) = stack.pop() else { break };
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Not => stack.push((n.a, !want)),
+            OpCode::And if want => stack.extend([(n.a, true), (n.b, true)]),
+            OpCode::Or if !want => stack.extend([(n.a, false), (n.b, false)]),
+            _ => {
+                word_guard |= matches!(n.op, OpCode::Eq | OpCode::Ne)
+                    && (n.op == OpCode::Eq) == want && cx.wid(n.a) >= 8;
+                terms.push((i as usize, want));
+            }
+        }
+    }
+    let guarded = word_guard && terms.len() > 1;
+    if !selected_equality && !guarded && !tall {
+        return None;
+    }
+    let limit = if tall || selected_equality { MAX_NODES } else { 127 };
+    let (p, slots) = Program::lower(cx, root, &[], limit)?;
+    let compact_guard = guarded && p.ops.len() < 128;
+    if !selected_equality && !compact_guard && p.ops.len() < 128 {
         return None;
     }
     let mut labels = vec![Vec::new(); p.symbols.len()];
@@ -661,33 +690,27 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     let mut assignment = vec![0; p.symbols.len()];
     // If the original question is an implication, keep assignments close to
     // satisfying its counterexample conjuncts. Ranking never decides the result.
-    let mut terms = Vec::new();
     let mut fields = Vec::new();
-    let mut stack = vec![(root, false)];
-    for _ in 0..128 {
-        let Some((i, want)) = stack.pop() else { break };
-        let n = cx.node(i);
-        match n.op {
-            OpCode::Not => stack.push((n.a, !want)),
-            OpCode::And if want => stack.extend([(n.a, true), (n.b, true)]),
-            OpCode::Or if !want => stack.extend([(n.a, false), (n.b, false)]),
-            _ => {
-                terms.push((slots[&i], want));
-                if want && n.op == OpCode::Eq && fields.len() < 4
-                    && let Some(f) = crate::expr::field::field(cx, i)
-                    && (1..=16).contains(&f.mask.count_ones())
-                    && let Op::Symbol(s) = p.ops[slots[&f.base]].op
-                {
-                    fields.push((s, f));
-                }
-            }
+    for (i, want) in &mut terms {
+        let node = *i as u32;
+        *i = slots[&node];
+        if *want && cx.node(node).op == OpCode::Eq && fields.len() < 4
+            && let Some(f) = crate::expr::field::field(cx, node)
+            && (1..=16).contains(&f.mask.count_ones())
+            && let Op::Symbol(s) = p.ops[slots[&f.base]].op
+        {
+            fields.push((s, f));
         }
     }
     let required: Vec<_> = terms.iter().filter_map(|&(i, want)| {
         match p.ops[i].op {
             Op::Compare(op @ (CmpOp::Eq | CmpOp::Ne), a, b, _) if (op == CmpOp::Eq) == want => {
-                guard::Target::literal(&p, a, b)
+                Some(guard::Target::literal(&p, a, b).map_or(
+                    guard::Requirement::Equal(a, b), guard::Requirement::Value))
             }
+            Op::Compare(..) => None,
+            _ if compact_guard => Some(guard::Requirement::Value(
+                guard::Target { slot: i, value: u64::from(want) })),
             _ => None,
         }
     }).collect();
@@ -707,7 +730,12 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             for (v, sym) in assignment.iter_mut().zip(&p.symbols) { *v = sym.ones; }
             let sym = &p.symbols[s];
             Some((s, sym.ones | (sym.ones.wrapping_add(delta) & sym.free)))
-        } else if !field_lane && lane >= 8 && lane & 3 < 2 && (!cases.is_empty() || !ranges.is_empty()) {
+        } else if compact_guard && lane >= 2 && lane % 8 != 0 {
+            // Keep a repaired conjunct when repairing the next one; independent
+            // wide constraints are unlikely to hold on the same fresh random lane.
+            guard::propose(&p, &values, &required, &ranges, &cases, lane as usize)
+        } else if !compact_guard && !field_lane && lane >= 8 && lane & 3 < 2
+            && (!required.is_empty() || !cases.is_empty() || !ranges.is_empty()) {
             let round = (lane / 4 * 2 + lane % 4) as usize;
             guard::propose(&p, &values, &required, &ranges, &cases, round)
         } else {
@@ -728,7 +756,7 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
                     _ if !labels[i].is_empty() && rand & 7 != 0 => {
                         labels[i][(rand >> 32) as usize % labels[i].len()]
                     }
-                    _ if field_lane => rand,
+                    _ if field_lane || compact_guard => rand,
                     _ if lane & 3 == 0 => 0,
                     _ if lane & 3 == 1 => u64::MAX,
                     _ => rand,

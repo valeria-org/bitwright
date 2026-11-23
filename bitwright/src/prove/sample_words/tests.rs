@@ -50,6 +50,48 @@ fn small_selected_word_has_a_witness_away_from_its_fallback() {
     assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
 }
 
+#[test]
+fn compact_guard_repairs_an_equality_to_a_computed_word() {
+    let mut cx = Context::new();
+    let claim = cx.parse(
+        "~((tag:64 == ((data:64 ^ 0x91e2f01084dd938b) + 17)) & extract<20, 1>(data))",
+        &crate::ParseOptions::default(),
+    ).unwrap();
+    let (tested, Some(model)) = guard_samples(&mut cx, claim.index()).unwrap() else {
+        panic!("could not match the computed word");
+    };
+    assert!(tested <= 64);
+    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+}
+
+#[test]
+fn low_even_product_repair_does_not_constrain_the_free_high_bits() {
+    let mut cx = Context::new();
+    // The mask forces ones above the 24 bits observed by the product.
+    // Multiplication on either side of a truncation still acts modulo 2^24.
+    let claim = cx.parse(
+        "~((trunc<32>((x:64 | 0xff000000) * 0xadf30371a575ff37) * 0x371b5100 == 0x53a28700) & (key:64 == 0x9f7b3571))",
+        &crate::ParseOptions::default(),
+    ).unwrap();
+    let (tested, Some(model)) = guard_samples(&mut cx, claim.index()).unwrap() else {
+        panic!("could not match the product residue");
+    };
+    assert!(tested <= 64);
+    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+}
+
+#[test]
+fn unreachable_product_residue_is_only_a_sampling_miss() {
+    let mut cx = Context::new();
+    let claim = cx.parse(
+        "~((x:32 * 12 == 2) & (key:32 == 7321))",
+        &crate::ParseOptions::default(),
+    ).unwrap();
+    let (tested, model) = guard_samples(&mut cx, claim.index()).unwrap();
+    assert_eq!(tested, 64);
+    assert!(model.is_none());
+}
+
 fn large_selector(cx: &mut Context, tag: crate::Expr) -> crate::Expr {
     let mut hash = tag;
     for i in 1..80 {
