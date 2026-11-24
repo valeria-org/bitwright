@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.11
+
+- The bitwise pass simplifies `(x | (y & m)) ^ (x & y)` to `x ^ (y & m)`
+  when known bits prove `x` fits inside the constant mask `m`.
+- A guarded bitwise rule reduces `~(x & (s | y)) & (s | ((x | y) & m))`
+  to `(x ^ (s | y)) & m` when `s` has no set bits outside `m`. This lets
+  byte-sized fields simplify before zero-extension.
+
 ## 0.32.10
 
 - The words pass's cross-call store also keeps the questions that found an answer: the
