@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.32.10
 
 - The words pass's cross-call store also keeps the questions that found an answer: the
   scratch nodes the answer's root reaches, with each context node named by its place in the
