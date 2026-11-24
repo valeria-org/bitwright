@@ -27,6 +27,7 @@ core.bitwise::and_mask_disjoint f71e12dbc6616de50b72034728074ab3 rule exhaustive
 core.bitwise::and_mask_redundant 1110acc306fee3af33aaa441301d597b rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=926)
 core.bitwise::and_not_disjoint db91079333f6bc9b9fea9508a7c95f19 rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=977)
 core.bitwise::and_not_self 8111a5616a6fba6358e814e1bc9d27f2 rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)
+core.bitwise::masked_union_minus_overlap c5920ee7cab5854e2384dc180a74e97f rule exhaustive(inst=4,maxw=4,cases=69904,fired=22620) sampled(inst=22,cases=1408,fired=918)
 core.bitwise::or_absorb_and 8fc98cffb0c1a10599481f7c715805a7 rule exhaustive(inst=6,maxw=6,cases=5460,fired=5460) sampled(inst=22,cases=1408,fired=1408)
 core.bitwise::or_known_ones ce017b127dfb648c0d690b26fe5e12be rule exhaustive(inst=6,maxw=6,cases=5460,fired=1092) sampled(inst=22,cases=1408,fired=919)
 core.bitwise::or_not_self f792579981e1b7ff2a28db2e91426adf rule exhaustive(inst=6,maxw=6,cases=126,fired=126) sampled(inst=22,cases=1408,fired=1408)

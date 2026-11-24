@@ -1326,6 +1326,40 @@ fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
     finish(r, cx, PassKind::Bitwise, n, e, before, &narrow, Fin::FINAL)
 }
 
+/// `(x | (y & m)) ^ (x & y)` is `x ^ (y & m)` if `x` has no bit
+/// outside `m`: the second arm then cancels exactly the overlapping ones.
+/// A truth table treating `x` as a free word cannot drop that arm.
+fn masked_overlap(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let (join, meet) = match (cx.node(node.a), cx.node(node.b)) {
+        (j, m) if j.op == OpCode::Or && m.op == OpCode::And => (j, m),
+        (m, j) if j.op == OpCode::Or && m.op == OpCode::And => (j, m),
+        _ => return Ok(Step::Normal(Fin::FINAL)),
+    };
+    for (x, masked) in [(join.a, join.b), (join.b, join.a)] {
+        let y = if meet.a == x {
+            meet.b
+        } else if meet.b == x {
+            meet.a
+        } else {
+            continue;
+        };
+        let field = cx.node(masked);
+        if field.op != OpCode::And || field.a != y || cx.node(field.b).op != OpCode::Const {
+            continue;
+        }
+        let (fits, fm, fx) = super::within(r, cx, field.b, x)?;
+        let fin = fm.and(fx);
+        if !fits {
+            return Ok(Step::Normal(fin));
+        }
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| cx.c_bin(BinOp::Xor, x, masked))?;
+        return finish(r, cx, PassKind::Bitwise, n, e, before, &[x, masked, y], fin);
+    }
+    Ok(Step::Normal(Fin::FINAL))
+}
+
 /// The bitwise pass at `n`. What a candidate it declines contributes stays in the result (see
 /// the linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
@@ -1339,6 +1373,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let hoisted = match rotation(r, cx, n)? {
         Step::Normal(f) => hoisted.and(f),
         done => return Ok(done),
+    };
+    let hoisted = if cx.node(n).op == OpCode::Xor {
+        match masked_overlap(r, cx, n)? {
+            Step::Normal(f) => hoisted.and(f),
+            done => return Ok(done),
+        }
+    } else {
+        hoisted
     };
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
         return Ok(Step::Normal(hoisted));

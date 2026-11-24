@@ -883,6 +883,22 @@ fn bitwise_fixtures() {
     same("(d & ~b & ~a & ((b & c) | b)) | ~(d | a)", "~(a | d)");
     // Atoms may be arbitrary subterms.
     same("((p + q) & r) | ((p + q) & ~r)", "p + q");
+    same(
+        "((x >>u 5) | (y & 7)) ^ ((x >>u 5) & y)",
+        "(x >>u 5) ^ (y & 7)",
+    );
+    // x >> 4 can set bit 3. At x=128, y=8 the overlap cancels it.
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W8);
+    let near = cx
+        .parse("((x >>u 4) | (y & 7)) ^ ((x >>u 4) & y)", &o)
+        .unwrap();
+    let result = eng.simplify(&mut cx, near).unwrap().expr;
+    let x = crate::SymbolKey::from("x");
+    let env = crate::FnEnv(|s: &crate::SymbolKey, w: Width| {
+        Some(BitVec::wrapping_from_u64(w, if *s == x { 128 } else { 8 }))
+    });
+    assert!(cx.eval(&[result], &env).unwrap()[0].is_zero());
 }
 
 #[test]
