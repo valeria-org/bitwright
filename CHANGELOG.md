@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.32.8
+
+- An engine keeps the words pass's questions that found nothing across its calls, keyed by
+  the question's cone (operands by place, constants by value, symbols by key), the facts the
+  pass read of each node, its kind of forms and its limit. A call that meets one again is
+  charged the pass work the question charged and builds the constants it built, so answers,
+  budgets and the context are as before. On a devirtualizer's batch questions (EA.sys's
+  DriverEntry) a cone was asked about three times per distinct root, and the batch replay
+  takes 15–18% fewer instructions and 32–39% less time; the answers are the same.
+- Word forms are hashed with one mix per form instead of one per word.
+
 ## 0.32.7
 
 - The opaque MBA sweep can cancel a constant weighted cofactor without

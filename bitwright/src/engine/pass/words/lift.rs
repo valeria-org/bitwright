@@ -57,6 +57,21 @@ impl Lift {
         lift
     }
 
+    /// What [`learn`](Self::learn) read of node `n`, as words (see `quiet`): its bounds and
+    /// known-zero bits, or nothing.
+    pub(super) fn learned(&self, n: u32, out: &mut Vec<u64>) {
+        match self.known.get(&n) {
+            Some(k) => {
+                out.push(1);
+                out.extend(k.lo.limbs());
+                out.extend(k.hi.limbs());
+                out.push(k.zero as u64);
+                out.push((k.zero >> 64) as u64);
+            }
+            None => out.push(0),
+        }
+    }
+
     /// Reads the facts of node `n` (of at most 64 bits), once.
     pub(super) fn learn(
         &mut self,

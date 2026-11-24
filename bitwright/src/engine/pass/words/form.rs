@@ -128,10 +128,27 @@ pub(super) fn bit_len(v: Int) -> u32 {
 }
 
 /// `c + Σ kᵢ·aᵢ`: the terms in the atoms' order, no coefficient zero.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(super) struct Form {
     pub(super) c: Int,
     pub(super) t: Vec<(AtomId, Int)>,
+}
+
+// One word for the whole form, folded with a multiply per word and mixed once by the
+// hasher: a form is hashed at every lookup of one (its interning and the bounds found of
+// it), and a mix per word of a form of a hundred terms was a tenth of what a large
+// question's words pass cost. Forms are only looked up by it, never ordered.
+impl core::hash::Hash for Form {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut h = (self.t.len() as u64 ^ self.c.fold64()).wrapping_mul(K);
+        for &(a, k) in &self.t {
+            h = (h.rotate_left(26) ^ u64::from(a)).wrapping_mul(K);
+            h = (h.rotate_left(26) ^ k.fold64()).wrapping_mul(K);
+        }
+        state.write_u64(h);
+    }
 }
 
 impl Form {

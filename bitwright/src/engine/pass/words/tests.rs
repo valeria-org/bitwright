@@ -1111,3 +1111,55 @@ fn a_word_made_in_limbs_of_many_operands_is_the_word() {
     let src = format!("{lets}trunc<20>({high}) - extract<12, 20>({word})");
     assert_eq!(simplify(&eng, &src, 20), "0:20");
 }
+
+/// The questions the search found nothing for are kept by the engine across its calls and
+/// answered by what they did (see `Quiet`): a call that meets one again, in any context,
+/// ends as it would have, with the same result, the same counters (the budget it spent) and
+/// the same context, under the deobfuscating strategy as with the pass alone.
+#[test]
+fn words_kept_questions_answer_as_asked() {
+    use std::sync::atomic::Ordering;
+    let strategies = [
+        Strategy::new("t", vec![Phase::Words]),
+        Strategy::deobfuscate(),
+    ];
+    for strategy in strategies {
+        let build = || {
+            Engine::builder()
+                .builtin()
+                .strategy(strategy.clone())
+                .build()
+                .unwrap()
+        };
+        let warm = build();
+        let mut g = generator(0x5157_0001);
+        let mut hits = 0;
+        for i in 0..400 {
+            let (src, w) = match i % 3 {
+                0 => chain_text(&mut g.rng),
+                1 => bitwise_text(&mut g.rng),
+                _ => limb_text(&mut g.rng),
+            };
+            let run = |eng: &Engine| {
+                let mut cx = Context::new();
+                let e = cx
+                    .parse(&src, &ParseOptions::width(Width::new(w).unwrap()))
+                    .unwrap();
+                let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+                (
+                    cx.display(out.roots[0].expr).to_string(),
+                    format!("{:?}", out.stats),
+                    cx.len(),
+                )
+            };
+            let first = run(&warm);
+            let before = warm.inner.words_quiet.hits.load(Ordering::Relaxed);
+            let again = run(&warm);
+            let cold = run(&build());
+            assert_eq!(first, cold, "{src}");
+            assert_eq!(again, cold, "{src}");
+            hits += usize::from(warm.inner.words_quiet.hits.load(Ordering::Relaxed) > before);
+        }
+        assert!(hits > 100, "{hits}");
+    }
+}
