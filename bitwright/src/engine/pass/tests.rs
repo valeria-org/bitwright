@@ -6257,6 +6257,53 @@ fn limb_slice_proofs_take_products_for_symbols() {
     );
 }
 
+/// The slice proofs are kept by the engine across its calls and answered by what they did
+/// (see `slices::Proofs`): a call that meets one again, in any context, ends as it would
+/// have, with the same result, the same counters (the budget it spent) and the same context.
+#[cfg(feature = "prove")]
+#[test]
+fn limb_slice_proofs_kept_answer_as_asked() {
+    use std::sync::atomic::Ordering;
+    let (k1, k2, m) = ("0x511bff07", "0x2c51a7e3", "0x3ffff");
+    let products = format!(
+        "let %0 = a:32 * {k1}; let %1 = b:32 * {k2}; let %2 = %0 + %1; let %3 = %2 + c:32; \
+         let %4 = extract<18, 14>((a & {m}) * {k1}) + trunc<14>((a >>u 18) * {k1}); \
+         let %5 = extract<18, 14>((b & {m}) * {k2}) + trunc<14>((b >>u 18) * {k2}); \
+         let %6 = %4 + %5 + zext<14>((%2 & {m}) <u (%0 & {m})) + extract<18, 14>(c) \
+         + zext<14>((%3 & {m}) <u (c & {m})); \
+         concat(%6, trunc<18>(%3))"
+    );
+    let sources: Vec<(String, Width)> = vec![
+        (three_limbs("w:32"), Width::W8),
+        (three_limbs("(a:32 * b:32)"), Width::W8),
+        (three_limbs("(a:32 + b:32 * c:32)"), Width::W8),
+        (three_limbs("(a:32 ^ (b:32 * 0x9e3779b9))"), Width::W8),
+        (products, Width::W32),
+    ];
+    let warm = deobfuscator();
+    let mut hits = 0;
+    for (src, w) in &sources {
+        let run = |eng: &Engine| {
+            let mut cx = Context::new();
+            let e = cx.parse(src, &ParseOptions::width(*w)).unwrap();
+            let out = eng.run(&mut cx, &[e], Run::default()).unwrap();
+            (
+                cx.display(out.roots[0].expr).to_string(),
+                format!("{:?}", out.stats),
+                cx.len(),
+            )
+        };
+        let first = run(&warm);
+        let before = warm.inner.slice_proofs.hits.load(Ordering::Relaxed);
+        let again = run(&warm);
+        let cold = run(&deobfuscator());
+        assert_eq!(first, cold, "{src}");
+        assert_eq!(again, cold, "{src}");
+        hits += warm.inner.slice_proofs.hits.load(Ordering::Relaxed) - before;
+    }
+    assert!(hits > 0, "{hits}");
+}
+
 /// A limb of two products by constants written digit by digit, joined to its word's low
 /// limb: the proof's two sides are one sum over the slices of the operands once their sums
 /// are written one way (the search alone does not decide it within the caps), and the limbs

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- The words pass's cross-call store also keeps the questions that found an answer: the
+  scratch nodes the answer's root reaches, with each context node named by its place in the
+  cone or as a constant the question made, are built again over the cone of the question
+  met again, so the call writes back what it would have. On the deep simplifications of
+  EA.sys's DriverEntry hash-guard handler a cone that found an answer was asked about twice
+  per distinct question, and those replay in 37% less time; the results are the same. The
+  store also starts afresh past 2^21 kept scratch nodes.
+- An engine keeps the carries pass's slice proofs across its calls: a proof is of a scratch
+  context made for it alone, so its answer and what it charges are a function of that
+  context and of its propagation cap, and a proof met again is answered by what it did. On
+  the deep simplifications of DriverEntry's dispatch handler 58% of the proof time was
+  proofs asked before, and those replay in 21% less time with the same results.
+
 ## 0.32.9
 
 - The MBA sweep's exhaustive enumeration keeps its arena-sized buffers (a mark, a demand and

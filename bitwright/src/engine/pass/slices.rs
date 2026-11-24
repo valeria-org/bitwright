@@ -350,7 +350,95 @@ type Asked = (Outcome, u64, u64, Vec<u32>);
 /// [`opaque`] nodes below the two but those of `uncut`; none without it). `None` for what a
 /// fresh context cannot hold (an extension operation: it has no registry): the prover is
 /// not asked, under any budget.
+/// The proofs the pass asked, kept by an engine across its calls: a limb's question comes
+/// again in each call over the same handler's state (the parts of a split question, a
+/// session's rounds, a value asked at every arrival). A proof is of a scratch context made
+/// for it alone, so what it answers and what it charges are a function of that context (its
+/// nodes in order, constants by value, symbols by key with what was declared of them) and of
+/// the propagations it may take. A proof kept is answered by what it did: the call goes on
+/// as it would have.
+#[derive(Default)]
+pub(crate) struct Proofs {
+    /// The answers, and the words of their keys ([`KEPT_WORDS`]).
+    kept: std::sync::Mutex<(IdMap<Box<[u64]>, Kept>, usize)>,
+    /// The proofs answered from `kept` (tests).
+    #[cfg(test)]
+    pub(crate) hits: std::sync::atomic::AtomicU64,
+}
+
+impl core::fmt::Debug for Proofs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Proofs").finish_non_exhaustive()
+    }
+}
+
+/// What a kept proof answered, and the nodes and propagations it charged.
+#[derive(Clone)]
+struct Kept {
+    said: Option<Result<(), Unknown>>,
+    nodes: u64,
+    taken: u64,
+}
+
+/// The words of the keys an engine keeps (8 bytes each); past it the store starts afresh.
+const KEPT_WORDS: usize = 1 << 22;
+
+/// The key of the proof of `roots` in the scratch context `scx` within `propagations` (see
+/// [`Proofs`]), or `None` where a node is one the key does not spell (an extension or
+/// floating-point operation).
+fn proof_key(scx: &Context, roots: [u32; 2], propagations: u64) -> Option<Box<[u64]>> {
+    let mut out: Vec<u64> = Vec::with_capacity(scx.len() * 4 + 4);
+    out.extend([
+        propagations,
+        u64::from(roots[0]),
+        u64::from(roots[1]),
+        scx.len() as u64,
+    ]);
+    for i in 0..scx.len() as u32 {
+        let n = scx.node(i);
+        out.push(u64::from(n.op as u8) | u64::from(n.width) << 8 | u64::from(n.aux) << 24);
+        match n.op {
+            OpCode::Const => {
+                let v = scx.const_val(i)?;
+                out.push(v.limbs().len() as u64);
+                out.extend_from_slice(v.limbs());
+            }
+            OpCode::Sym => {
+                match scx.symbol_key(crate::expr::SymbolId(n.a))? {
+                    SymbolKey::U64(k) => out.extend([1, *k]),
+                    SymbolKey::Fresh(k) => out.extend([2, *k]),
+                    SymbolKey::Str(s) => {
+                        out.extend([3, s.len() as u64]);
+                        for c in s.as_bytes().chunks(8) {
+                            let mut w = [0u8; 8];
+                            w[..c.len()].copy_from_slice(c);
+                            out.push(u64::from_le_bytes(w));
+                        }
+                    }
+                }
+                match scx.declared_at(i) {
+                    Some(k) => {
+                        out.push(1);
+                        out.extend_from_slice(k.known_zero().limbs());
+                        out.extend_from_slice(k.known_one().limbs());
+                    }
+                    None => out.push(0),
+                }
+            }
+            op => {
+                if op.as_ext().is_some() || scx.fp_desc(i).is_some() {
+                    return None;
+                }
+                out.extend([u64::from(n.a), u64::from(n.b), u64::from(n.c)]);
+            }
+        }
+    }
+    Some(out.into_boxed_slice())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn asked(
+    kept: &Proofs,
     cx: &Context,
     (s, lo): (u32, u16),
     (word, o): (&Word, u16),
@@ -402,6 +490,24 @@ fn asked(
     );
     let made = word.build(&mut scx, a, b)?;
     let rhs = scx.extract(scx.handle(made), o, jw)?;
+    let fresh: Vec<u32> = pre.into_iter().map(|(i, _)| i).collect();
+    let key = proof_key(&scx, [scx.id(lhs)?, scx.id(rhs)?], propagations);
+    if let Some(key) = &key {
+        let g = kept
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(k) = g.0.get(key) {
+            #[cfg(test)]
+            kept.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let out = match &k.said {
+                Some(Ok(())) => Outcome::Proved(None),
+                None => Outcome::Refuted(Vec::new()),
+                Some(Err(why)) => Outcome::Unknown(why.clone()),
+            };
+            return Ok(Some((out, k.nodes, k.taken, fresh)));
+        }
+    }
     let cfg = prove::Config::default()
         .with_simplify(false)
         .with_certificate(false)
@@ -451,12 +557,31 @@ fn asked(
         nodes += n;
         stats.propagations += p;
     }
-    Ok(Some((
-        out,
-        nodes as u64,
-        stats.propagations,
-        pre.into_iter().map(|(i, _)| i).collect(),
-    )))
+    if let Some(key) = key {
+        let said = match &out {
+            Outcome::Proved(_) => Some(Ok(())),
+            Outcome::Refuted(_) => None,
+            Outcome::Unknown(why) => Some(Err(why.clone())),
+        };
+        let mut g = kept
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.1 + key.len() > KEPT_WORDS {
+            g.0.clear();
+            g.1 = 0;
+        }
+        g.1 += key.len();
+        g.0.insert(
+            key,
+            Kept {
+                said,
+                nodes: nodes as u64,
+                taken: stats.propagations,
+            },
+        );
+    }
+    Ok(Some((out, nodes as u64, stats.propagations, fresh)))
 }
 
 /// What a question came to.
@@ -544,6 +669,7 @@ fn proved(
             return Ok(Err(Fin::capped(crate::engine::Exhausted::PassWork)));
         }
         let Some((out, nodes, taken, fresh)) = asked(
+            &r.inner.slice_proofs,
             cx,
             (s, lo),
             (word, o),

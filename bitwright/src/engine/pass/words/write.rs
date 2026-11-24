@@ -63,6 +63,41 @@ struct SNode {
 
 type Key = (u8, u8, u16, [u32; 3]);
 
+/// A context node a kept answer names (see [`KeptBuild`]): by its place in the question's
+/// cone, or as a constant the question made.
+#[derive(Clone, Copy)]
+enum Named {
+    None,
+    Place(u32),
+    Const(u16, u128),
+}
+
+/// A scratch node of a kept answer, its operands kept nodes before it.
+#[derive(Clone, Copy)]
+struct KeptNode {
+    op: OpCode,
+    aux: u8,
+    width: u16,
+    kids: [u32; 3],
+    of: Named,
+    leaf: bool,
+}
+
+/// An answer a question found, kept to be given again where the same question is asked over
+/// another cone (`super::Kept`): the scratch nodes its root reaches, operands first, with the
+/// context's nodes named by place, so that it is built again as the search built it.
+pub(super) struct KeptBuild {
+    nodes: Box<[KeptNode]>,
+    root: u32,
+}
+
+impl KeptBuild {
+    /// Its scratch nodes.
+    pub(super) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Build {
     nodes: Vec<SNode>,
@@ -99,6 +134,114 @@ impl Build {
         self.nodes.push(n);
         self.index.insert(key, i);
         i
+    }
+
+    /// What `root` reaches, kept over `cone` ([`KeptBuild`]); `None` where a node of it is
+    /// a context node that is neither in `cone` nor a constant of `consts` (the constants the
+    /// question made).
+    pub(super) fn keep(
+        &self,
+        cx: &Context,
+        cone: &[u32],
+        root: u32,
+        consts: &[(u16, u128)],
+    ) -> Option<KeptBuild> {
+        let place: IdMap<u32, u32> = cone
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, i as u32))
+            .collect();
+        let named = |id: u32| -> Option<Named> {
+            if id == NONE {
+                return Some(Named::None);
+            }
+            if let Some(&p) = place.get(&id) {
+                return Some(Named::Place(p));
+            }
+            let v = cx.const_val(id)?;
+            let limbs = v.limbs();
+            let value = u128::from(limbs[0]) | limbs.get(1).map_or(0, |&h| u128::from(h) << 64);
+            let w = v.width().bits();
+            consts
+                .contains(&(w, value))
+                .then_some(Named::Const(w, value))
+        };
+        let mut index: IdMap<u32, u32> = IdMap::default();
+        let mut out: Vec<KeptNode> = Vec::new();
+        let mut stack = vec![(root, false)];
+        while let Some((i, done)) = stack.pop() {
+            if index.contains_key(&i) {
+                continue;
+            }
+            if !done {
+                stack.push((i, true));
+                for &k in self.operands(i) {
+                    if !index.contains_key(&k) {
+                        stack.push((k, false));
+                    }
+                }
+                continue;
+            }
+            let n = self.nodes[i as usize];
+            let mut kids = if n.leaf { [0; 3] } else { n.kids };
+            let arity = if n.leaf { 0 } else { n.op.arity() };
+            for kid in kids.iter_mut().take(arity) {
+                *kid = *index.get(kid)?;
+            }
+            out.push(KeptNode {
+                op: n.op,
+                aux: n.aux,
+                width: n.width,
+                kids,
+                of: named(n.of)?,
+                leaf: n.leaf,
+            });
+            index.insert(i, out.len() as u32 - 1);
+        }
+        Some(KeptBuild {
+            root: *index.get(&root)?,
+            nodes: out.into_boxed_slice(),
+        })
+    }
+
+    /// Builds `kept` again over `cone` (a cone of the question it was kept from, in the same
+    /// order) and returns its root: the scratch nodes the search made, under the same keys.
+    /// The constants it names are made already (the question's own are made first).
+    pub(super) fn restore(
+        &mut self,
+        cx: &mut Context,
+        cone: &[u32],
+        kept: &KeptBuild,
+    ) -> Result<u32, crate::Error> {
+        self.clear();
+        let mut ids: Vec<u32> = Vec::with_capacity(kept.nodes.len());
+        for k in kept.nodes.iter() {
+            let of = match k.of {
+                Named::None => NONE,
+                Named::Place(p) => cone[p as usize],
+                Named::Const(w, v) => {
+                    cx.mk_const(&BitVec::wrapping_from_u128(Width::new(w)?, v))?
+                }
+            };
+            let i = if k.leaf {
+                self.leaf(cx, of)
+            } else {
+                let mut kids = k.kids;
+                for kid in kids.iter_mut().take(k.op.arity()) {
+                    *kid = ids[*kid as usize];
+                }
+                self.push(SNode {
+                    op: k.op,
+                    aux: k.aux,
+                    width: k.width,
+                    kids,
+                    of,
+                    leaf: false,
+                })
+            };
+            ids.push(i);
+        }
+        Ok(ids[kept.root as usize])
     }
 
     /// Forgets the nodes made since there were `len`.
