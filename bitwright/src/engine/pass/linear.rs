@@ -1365,6 +1365,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     }
     let form = form_of(r, cx, n)?;
+    #[cfg(feature = "mba")]
+    if matches!(op, OpCode::Add | OpCode::Sub)
+        && let Some(value) = super::mba::truncated_constant(r, cx, &form.terms, &form.konst)?
+    {
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| cx.mk_const(&value))?;
+        match finish(r, cx, PassKind::Linear, n, e, before, &[], form.fin)? {
+            Step::Normal(f) => declined = declined.and(f),
+            step => return Ok(step),
+        }
+    }
     if matches!(op, OpCode::Add | OpCode::Sub)
         && (2..=SELECT_TERMS).contains(&form.terms.len())
         && cx.node(form.terms[0].0).op == OpCode::Select

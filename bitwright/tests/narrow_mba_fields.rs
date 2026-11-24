@@ -72,3 +72,28 @@ fn singleton_columns_do_not_prove_a_field() {
     let src = format!("{BYTE} ^ zext<64>($1311 == 253)");
     check(&src, 8, None, |x| ((x ^ 48) << 3) ^ u64::from(x == 253));
 }
+
+#[test]
+fn weighted_truncations_cancel_only_at_the_observed_width() {
+    let src = "\
+let %0 = x:64 >>u 3;
+let %1 = %0 * -8;
+let %2 = %1 | %0;
+let %3 = trunc<32>((%1 | %0 ^ 0x3001ffe53ab1) * 0xafe94f8e811fb0f5);
+let %4 = trunc<32>(-(%2 & 0xffffcffe001ac54e) + (~(%0 * 8 - 1 ^ %0) & 0x3001ffe53ab1) + 0xffffcffe001ac54d);
+let %5 = trunc<32>((%1 & 0x3001ffe53ab1 ^ %0) + (~%0 & %1 ^ 0xffffcffe001ac54e));
+let %6 = trunc<32>(~(%0 - (%2 & 0x3001ffe53ab1)));
+%3 * 0x156d1858 + %4 * 0x666665a0 + %5 * 0x66666698 + %6 * 0xcccccd30";
+    let eng = Engine::standard();
+    let mut cx = Context::new();
+    let input = cx.parse(src, &ParseOptions::default()).unwrap();
+    let out = eng.simplify(&mut cx, input).unwrap().expr;
+    assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(248));
+
+    // Raising just the last slice by one bit invalidates the low-word identity.
+    let shifted = src.replace("%6 = trunc<32>", "%6 = extract<1, 32>");
+    let input = cx.parse(&shifted, &ParseOptions::default()).unwrap();
+    let out = eng.simplify(&mut cx, input).unwrap().expr;
+    let env = FnEnv(|_: &SymbolKey, w: Width| Some(BitVec::wrapping_from_u64(w, 16)));
+    assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(0x052f_d5a8));
+}

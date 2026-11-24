@@ -6,6 +6,7 @@ mod guard_domain;
 mod opaque_predicate;
 mod output_set;
 mod selector_cube;
+pub(super) use opaque_predicate::truncated_constant;
 
 use super::{Fin, PassKind, Runner, Step, Stop, discard, finish, shrinks};
 use crate::engine::Exhausted;

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.32.12
+
+- The linear pass (with `mba` enabled) can prove constants in weighted sums of
+  low-word truncations. It checks cancellation at the width of the sum, without
+  assuming that higher slices or the original wide values would cancel too.
+
 ## 0.32.11
 
 - The bitwise pass simplifies `(x | (y & m)) ^ (x & y)` to `x ^ (y & m)`

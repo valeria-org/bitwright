@@ -315,6 +315,46 @@ pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left
     result
 }
 
+/// Truncation is a ring homomorphism: the outer weights can be applied to the
+/// wide additive terms, provided we check every column modulo the *narrow*
+/// width. High slices, unlike low slices, can observe carries from below.
+pub(in crate::engine::pass) fn truncated_constant(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    terms_in: &[(u32, BitVec)],
+    bias: &BitVec,
+) -> Result<Option<BitVec>, Stop> {
+    let bits = bias.width().bits();
+    if bits > 64 || !(2..=8).contains(&terms_in.len()) {
+        return Ok(None);
+    }
+    let mut crosses_sum = false;
+    for &(i, _) in terms_in {
+        let n = cx.node(i);
+        if n.op != OpCode::Extract || n.b != 0 || cx.node(n.a).width > 64 {
+            return Ok(None);
+        }
+        crosses_sum |= matches!(cx.node(n.a).op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not);
+    }
+    // Direct truncations of registers have no hidden sum to flatten.
+    if !crosses_sum {
+        return Ok(None);
+    }
+    const LIMIT: u64 = 8192;
+    let mut work = Work::new(LIMIT);
+    let value = (|| {
+        let mut sum = bias.to_u64()?;
+        let mut parts = Vec::new();
+        for &(i, k) in terms_in {
+            terms(cx, cx.node(i).a, k.to_u64()?, &mut sum, &mut parts, 64, false, &mut work)?;
+        }
+        let k = constant_lanes(cx, &parts, bits, &mut work)?;
+        Some(BitVec::wrapping_from_u64(bias.width(), sum.wrapping_add(k)))
+    })();
+    r.meter.charge(Counter::PassWork, LIMIT - work.left)?;
+    Ok(value)
+}
+
 fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work) -> Option<u64> {
     let mut sum = 0u64;
     let mask = u64::MAX >> (64 - bits);
