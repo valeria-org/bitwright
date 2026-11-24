@@ -1271,42 +1271,141 @@ fn exhaustive_mask_cases(
     Ok(None)
 }
 
-/// Prove the differing argument of two applications equal, rather than bit-blasting the
-/// common operations above it. This is forward congruence only: equal products need not
-/// imply equal factors, but equal factors under the same multiplier suffice. In particular
-/// a shared comparison or mask need not be injective.
-#[cfg(feature = "mba")]
-fn congruent_sums(
-    r: &mut Runner<'_, '_>, cx: &Context, mut a: u32, mut b: u32,
-) -> Result<bool, Stop> {
+/// Peel identical enclosing operations from `a` and `b` while tracking the surviving low
+/// bit prefix `bits` such that `pa ≡ pb (mod 2^bits)` implies `a == b`. Forward congruence
+/// only: equal arguments under a shared operation imply equal outputs, never the converse.
+fn peel_congruence(cx: &Context, mut a: u32, mut b: u32) -> (u32, u32, u16) {
+    let mut bits = cx.wid(a);
+    let mask = |k: u16| {
+        if k == 0 {
+            0
+        } else if k >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << k) - 1
+        }
+    };
     for _ in 0..MAX_PEEL {
+        if a == b || bits == 0 {
+            break;
+        }
         let (x, y) = (cx.node(a), cx.node(b));
         if x.width != y.width || x.op != y.op || matches!(x.op, OpCode::Add | OpCode::Sub) {
             break;
         }
-        if matches!(x.op, OpCode::Zext | OpCode::Sext | OpCode::Not | OpCode::Neg)
-            || (x.op == OpCode::Extract && x.b == y.b)
-        {
-            (a, b) = (x.a, y.a);
-        } else if x.op.as_cmp().is_some() || x.op.as_bin().is_some() {
-            let swapped = x.op.as_bin().is_some_and(BinOp::is_commutative)
-                || x.op.as_cmp().is_some_and(CmpOp::is_commutative);
-            (a, b) = if x.a == y.a {
-                (x.b, y.b)
-            } else if x.b == y.b {
-                (x.a, y.a)
-            } else if swapped && x.a == y.b {
-                (x.b, y.a)
-            } else if swapped && x.b == y.a {
-                (x.a, y.b)
-            } else {
-                break;
-            };
-        } else {
-            break;
+        match x.op {
+            OpCode::Not | OpCode::Neg => (a, b) = (x.a, y.a),
+            OpCode::Zext | OpCode::Sext => {
+                let wa = cx.wid(x.a);
+                if wa != cx.wid(y.a) {
+                    break;
+                }
+                bits = bits.min(wa);
+                (a, b) = (x.a, y.a);
+            }
+            OpCode::Extract if x.b == y.b => {
+                let wa = cx.wid(x.a);
+                let Some(need) = u16::try_from(x.b).ok().and_then(|lo| lo.checked_add(bits)) else {
+                    break;
+                };
+                if wa != cx.wid(y.a) || need > wa {
+                    break;
+                }
+                bits = need;
+                (a, b) = (x.a, y.a);
+            }
+            OpCode::Concat => {
+                if cx.wid(x.a) != cx.wid(y.a) || cx.wid(x.b) != cx.wid(y.b) {
+                    break;
+                }
+                let w_lo = cx.wid(x.b);
+                if x.a == y.a {
+                    bits = bits.min(w_lo);
+                    (a, b) = (x.b, y.b);
+                } else if x.b == y.b {
+                    bits = bits.saturating_sub(w_lo);
+                    (a, b) = (x.a, y.a);
+                } else {
+                    break;
+                }
+            }
+            OpCode::Select => {
+                if x.a == y.a && x.b == y.b {
+                    (a, b) = (x.c, y.c);
+                } else if x.a == y.a && x.c == y.c {
+                    (a, b) = (x.b, y.b);
+                } else if x.b == y.b && x.c == y.c {
+                    bits = 1;
+                    (a, b) = (x.a, y.a);
+                } else {
+                    break;
+                }
+            }
+            _ if x.op.as_cmp().is_some() || x.op.as_bin().is_some() => {
+                let swapped = x.op.as_bin().is_some_and(BinOp::is_commutative)
+                    || x.op.as_cmp().is_some_and(CmpOp::is_commutative);
+                let (next_a, next_b, shared, is_lhs) = if x.a == y.a {
+                    (x.b, y.b, x.a, false)
+                } else if x.b == y.b {
+                    (x.a, y.a, x.b, true)
+                } else if swapped && x.a == y.b {
+                    (x.b, y.a, x.a, false)
+                } else if swapped && x.b == y.a {
+                    (x.a, y.b, x.b, true)
+                } else {
+                    break;
+                };
+                if cx.wid(next_a) != cx.wid(next_b) {
+                    break;
+                }
+                bits = match x.op {
+                    OpCode::Mul if bits <= 64 => {
+                        if let Some(k) = cx.const_val(shared).and_then(|v| v.to_u64()) {
+                            bits.saturating_sub(k.trailing_zeros().min(64) as u16)
+                        } else {
+                            bits
+                        }
+                    }
+                    OpCode::And if bits <= 64 => {
+                        if let Some(m) = cx.const_val(shared).and_then(|v| v.to_u64()) {
+                            (64 - (m & mask(bits)).leading_zeros()) as u16
+                        } else {
+                            bits
+                        }
+                    }
+                    OpCode::Or if bits <= 64 => {
+                        if let Some(m) = cx.const_val(shared).and_then(|v| v.to_u64()) {
+                            (64 - (!m & mask(bits)).leading_zeros()) as u16
+                        } else {
+                            bits
+                        }
+                    }
+                    OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor => bits,
+                    OpCode::Shl if is_lhs => {
+                        if bits <= 64
+                            && let Some(c) = cx.const_val(shared).and_then(|v| v.to_u64())
+                        {
+                            bits.saturating_sub(c.min(64) as u16)
+                        } else {
+                            bits
+                        }
+                    }
+                    OpCode::LShr if is_lhs => {
+                        if let Some(c) = cx.const_val(shared).and_then(|v| v.to_u64()) {
+                            bits.saturating_add(c.min(u64::from(u16::MAX)) as u16)
+                                .min(cx.wid(next_a))
+                        } else {
+                            cx.wid(next_a)
+                        }
+                    }
+                    _ => cx.wid(next_a),
+                };
+                (a, b) = (next_a, next_b);
+            }
+            _ => break,
         }
     }
-    super::mba::equal_sums(r, cx, a, b)
+    (a, b, bits)
 }
 
 /// The compares pass at `n`.
@@ -1404,11 +1503,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
             if matches!(node.op, OpCode::Eq | OpCode::Ne)
                 && cx.wid(node.a) > 1
-                && let Some(same) = super::bitwise::equal(r, cx, node.a, node.b)?
+                && let (Some(same), fin) = super::bitwise::equal(r, cx, node.a, node.b)?
             {
                 let before = cx.len() as u32;
                 let c = bool_const(r, cx, same == (node.op == OpCode::Eq))?;
-                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], fin);
             }
             if matches!(node.op, OpCode::Eq | OpCode::Ne)
                 && cx.wid(node.a) > 1
@@ -1418,13 +1517,31 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 let c = bool_const(r, cx, node.op == OpCode::Eq)?;
                 return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
             }
-            #[cfg(feature = "mba")]
-            if matches!(node.op, OpCode::Eq | OpCode::Ne)
-                && congruent_sums(r, cx, node.a, node.b)?
-            {
-                let before = cx.len() as u32;
-                let c = bool_const(r, cx, node.op == OpCode::Eq)?;
-                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            if matches!(node.op, OpCode::Eq | OpCode::Ne) {
+                let (pa, pb, bits) = peel_congruence(cx, node.a, node.b);
+                let mut fin = Fin::FINAL;
+                let mut proved = pa == pb || bits == 0;
+                if !proved && (pa != node.a || pb != node.b) && bits == cx.wid(pa) && bits > 1 {
+                    proved = super::poly::equal(r, cx, pa, pb)?;
+                    if !proved
+                        && let (Some(true), f) = super::bitwise::equal(r, cx, pa, pb)?
+                    {
+                        proved = true;
+                        fin = f;
+                    }
+                    if !proved {
+                        proved = super::linear_mba::equal(r, cx, pa, pb)?;
+                    }
+                }
+                #[cfg(feature = "mba")]
+                if !proved {
+                    proved = super::mba::equal_sums(r, cx, pa, pb, bits)?;
+                }
+                if proved {
+                    let before = cx.len() as u32;
+                    let c = bool_const(r, cx, node.op == OpCode::Eq)?;
+                    return finish(r, cx, PassKind::Compares, n, c, before, &[], fin);
+                }
             }
             if let Some(b) = residue_decide(r, cx, n)? {
                 let before = cx.len() as u32;

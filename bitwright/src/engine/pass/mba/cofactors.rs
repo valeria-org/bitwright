@@ -2,7 +2,7 @@
 //! bitwise functions is constant. The proof is local: no fact about a multiplicand,
 //! or the arithmetic hidden underneath a bitwise function, is needed.
 
-use super::opaque_predicate::{Work, rewrite_sums, terms};
+use super::opaque_predicate::{Work, cancel_parts, rewrite_sums, terms};
 use super::{Counter, Runner, Stop};
 use crate::expr::{Context, Node, OpCode};
 use crate::hash::IdMap;
@@ -122,10 +122,12 @@ struct Kernel {
 }
 
 #[derive(Default)]
-struct Sums {
+pub(super) struct Sums {
     parts: Vec<(u32, u64)>,
     products: Vec<Option<([u32; 2], u64)>>,
     group: Vec<(u32, u64)>,
+    scaled: Vec<(u32, u64)>,
+    rest: Vec<(u32, u64)>,
     known: Vec<Kernel>,
     table: Table,
 }
@@ -155,26 +157,45 @@ impl Sums {
         for _ in 0..5 { inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))); }
         let low = mask >> shift;
         for (_, c) in &mut self.group { *c = (*c >> shift).wrapping_mul(inv) & low; }
-        let value = self.table.constant(cx, &self.group, bits, work)?;
+        let value = match self.table.constant(cx, &self.group, bits, work) {
+            Some(v) => v,
+            None => {
+                let budget = work.left.min(4096);
+                let mut left = budget;
+                let v = super::opaque_predicate::constant_parts(cx, &self.group, bits, &mut left);
+                work.left -= budget - left;
+                v?
+            }
+        };
         if self.known.len() < 32 {
             self.known.push(Kernel { terms: self.group.clone(), pivot, bits, value });
         }
         Some(value.wrapping_mul(k) & mask)
     }
 
-    fn collapse(&mut self, cx: &mut Context, i: u32, terminal: bool, work: &mut Work) -> Result<Option<u32>, Error> {
+    pub(super) fn collapse(&mut self, cx: &mut Context, i: u32, _terminal: bool, work: &mut Work) -> Result<Option<u32>, Error> {
         let w = cx.wid(i);
         if w > 64 { return Ok(None); }
+        let mask = u64::MAX >> (64 - w);
         let mut bias = 0;
         self.parts.clear();
         if terms(cx, i, 1, &mut bias, &mut self.parts, 64, true, work).is_none()
-            || !(2..=MAX_TERMS).contains(&self.parts.len()) { return Ok(None); }
-        let mask = u64::MAX >> (64 - w);
+            || self.parts.len() < 2
+        {
+            return Ok(None);
+        }
+        let raw_len = self.parts.len();
+        if cancel_parts(&mut self.parts, mask, work).is_none() || self.parts.len() > MAX_TERMS {
+            return Ok(None);
+        }
+        let mut changed = self.parts.len() + 1 < raw_len || self.parts.len() <= 1;
+        if self.parts.is_empty() {
+            return cx.mk_const_u64(w, bias & mask).map(Some);
+        }
         let magnitude = |k: u64| (k & mask).min(k.wrapping_neg() & mask);
-        // First try a genuine common multiplicand. Keep unrelated summands: they
-        // neither constrain the cofactor nor need to be bitwise themselves.
+        // First try genuine common multiplicands (all of them, not just the largest).
+        // Keep unrelated summands: they neither constrain a cofactor nor need to be bitwise.
         self.products.clear();
-        let mut best = (0usize, 0u32);
         for &(t, k) in &self.parts {
             let p = if cx.node(t).op == OpCode::Mul {
                 if work.take(32).is_none() { return Ok(None); }
@@ -185,58 +206,79 @@ impl Sums {
             } else { None };
             self.products.push(p);
         }
-        // At a compared bitwise gate the *entire* operand may be constant.
-        // Its weights need not be equal in magnitude: grouping them first
-        // would split a single Boolean identity into nonconstant pieces.
-        if terminal && self.products.iter().all(Option::is_none)
-            && let Some(k) = self.table.constant(cx, &self.parts, w, work)
-        {
-            return cx.mk_const_u64(w, k.wrapping_add(bias) & mask).map(Some);
-        }
-        for &(pair, _) in self.products.iter().flatten() {
-            for f in pair {
-                if work.take(self.products.len() as u64).is_none() { return Ok(None); }
-                let n = self.products.iter().flatten().filter(|(p, _)| p.contains(&f)).count();
-                if n > best.0 { best = (n, f); }
+        self.scaled.clear();
+        for _ in 0..8 {
+            let mut best = (0usize, 0u32);
+            for &(pair, _) in self.products.iter().flatten() {
+                for f in pair {
+                    if work.take(self.products.len() as u64).is_none() { return Ok(None); }
+                    let n = self.products.iter().flatten().filter(|(p, _)| p.contains(&f)).count();
+                    if n > best.0 { best = (n, f); }
+                }
             }
-        }
-        let mut scaled = None;
-        if best.0 >= 2 {
+            if best.0 < 2 { break; }
             let f = best.1;
             self.group.clear();
             for &([a, b], k) in self.products.iter().flatten() {
                 if a == f || b == f { self.group.push((if a == f { b } else { a }, k)); }
             }
-            if let Some(k) = self.value(cx, w, work) {
-                for ((_, c), p) in self.parts.iter_mut().zip(&self.products) {
-                    if p.is_some_and(|(pair, _)| pair.contains(&f)) { *c = 0; }
+            let Some(k) = self.value(cx, w, work) else { break };
+            for ((_, c), p) in self.parts.iter_mut().zip(&mut self.products) {
+                if p.is_some_and(|(pair, _)| pair.contains(&f)) {
+                    *c = 0;
+                    *p = None;
                 }
-                scaled = Some((f, k));
             }
+            self.scaled.push((f, k));
+            changed = true;
         }
-        // The scalar alone may be what a class shares. Sorting groups k and -k
-        // together, independently of association and of any intervening summands.
+        // First check equal-magnitude groups through the normalized `Kernel` cache:
+        // repeated sums with different scalars reuse one exact proof in O(terms).
         if work.take((6 * self.parts.len()) as u64).is_none() { return Ok(None); }
         self.parts.sort_unstable_by_key(|&(t, k)| (magnitude(k), t));
-        let mut changed = scaled.is_some();
         let mut lo = 0;
+        let mut distinct_mags = 0usize;
         while lo < self.parts.len() {
             let k = magnitude(self.parts[lo].1);
             let hi = lo + self.parts[lo..].partition_point(|&(_, c)| magnitude(c) == k);
-            if k != 0 && hi - lo > 1 {
-                self.group.clear();
-                self.group.extend_from_slice(&self.parts[lo..hi]);
-                if let Some(v) = self.value(cx, w, work) {
-                    bias = bias.wrapping_add(v);
-                    self.parts[lo..hi].fill((0, 0));
-                    changed = true;
+            if k != 0 {
+                if hi - lo > 1 {
+                    self.group.clear();
+                    self.group.extend_from_slice(&self.parts[lo..hi]);
+                    if let Some(v) = self.value(cx, w, work) {
+                        bias = bias.wrapping_add(v);
+                        self.parts[lo..hi].fill((0, 0));
+                        changed = true;
+                        lo = hi;
+                        continue;
+                    }
                 }
+                distinct_mags += 1;
             }
             lo = hi;
         }
+        // Only if mixed-magnitude non-product terms remain (e.g. a partition alongside an
+        // OR-AND-XNOR, or an irreducible mixed-weight Boolean identity), check them jointly.
+        if distinct_mags >= 2 {
+            self.rest.clear();
+            for &(t, k) in &self.parts {
+                if k & mask != 0 && cx.node(t).op != OpCode::Mul {
+                    self.rest.push((t, k));
+                }
+            }
+            if self.rest.len() >= 2
+                && let Some(k) = self.table.constant(cx, &self.rest, w, work)
+            {
+                bias = bias.wrapping_add(k);
+                for (t, c) in &mut self.parts {
+                    if cx.node(*t).op != OpCode::Mul { *c = 0; }
+                }
+                changed = true;
+            }
+        }
         if !changed { return Ok(None); }
         let mut out = cx.mk_const_u64(w, bias & mask)?;
-        for (t, k) in self.parts.iter().copied().chain(scaled) {
+        for &(t, k) in self.parts.iter().chain(&self.scaled) {
             if k & mask == 0 { continue; }
             let c = cx.mk_const_u64(w, k & mask)?;
             let term = cx.c_bin(BinOp::Mul, t, c)?;
@@ -265,10 +307,34 @@ impl Sums {
             _ => Ok(i),
         }
     }
+
+    /// Descend through a shallow Boolean shell (`Not`/`And`/`Or`) to simplify terminal
+    /// bitwise comparisons, including queries wrapped in conjunctions with assumptions.
+    fn terminal_root(&mut self, cx: &mut Context, i: u32, depth: u8, work: &mut Work) -> Result<u32, Error> {
+        if work.take(1).is_none() { return Ok(i); }
+        let n = cx.node(i);
+        if matches!(n.op, OpCode::Eq | OpCode::Ne)
+            && cx.is_const(n.b)
+            && matches!(cx.node(n.a).op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor)
+        {
+            let out = self.terminal(cx, n.a, 4, work)?;
+            return if out != n.a { cx.rebuild(i, [out, n.b, 0]) } else { Ok(i) };
+        }
+        if depth > 0 && n.width == 1 && matches!(n.op, OpCode::Not | OpCode::And | OpCode::Or) {
+            let mut kids = [0; 3];
+            let mut changed = false;
+            for (k, x) in n.children().enumerate() {
+                kids[k] = self.terminal_root(cx, x, depth - 1, work)?;
+                changed |= kids[k] != x;
+            }
+            if changed { return cx.rebuild(i, kids); }
+        }
+        Ok(i)
+    }
 }
 
 pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32]) -> Result<Option<u32>, Stop> {
-    if !(96..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
+    if !(16..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
     // When several product sums are present, simplify them together. Reducing
     // just a compared arm can leave other multiples of the same sum hidden
     // inside shifts and truncations (including the shift amount itself).
@@ -277,10 +343,14 @@ pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order:
     if budget <= 4 * scan { return Ok(None); }
     r.meter.charge(Counter::PassWork, scan)?;
     let mut left = budget - scan;
-    if order.iter().filter(|&&i| {
+    if order.iter().any(|&i| {
         let n = cx.node(i);
-        matches!(n.op, OpCode::Add | OpCode::Sub) && cx.node(n.a).op == OpCode::Mul && cx.node(n.b).op == OpCode::Mul
-    }).take(4).count() == 4 {
+        let prod = |id| {
+            let m = cx.node(id);
+            m.op == OpCode::Mul && !cx.is_const(m.a) && !cx.is_const(m.b)
+        };
+        matches!(n.op, OpCode::Add | OpCode::Sub) && prod(n.a) && prod(n.b)
+    }) {
         r.meter.charge(Counter::PassWork, 3 * scan)?;
         left -= 3 * scan;
         let mut work = Work::new(left);
@@ -298,20 +368,18 @@ pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order:
                 crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
         }
     }
-    // Without a whole-DAG reduction, read just the comparison's additive
-    // operands. Each can be constant even with entirely unrelated weights.
+    // Without a whole-DAG reduction, read the terminal bitwise comparisons (including
+    // under shallow `Not`/`And`/`Or` wrappers). Each operand can be constant even with
+    // entirely unrelated weights.
     let n = cx.node(root);
-    if matches!(n.op, OpCode::Eq | OpCode::Ne) && cx.is_const(n.b)
-        && matches!(cx.node(n.a).op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor)
-    {
+    if n.width == 1 && matches!(n.op, OpCode::Eq | OpCode::Ne | OpCode::Not | OpCode::And | OpCode::Or) {
         let allowance = (left / 4).min(8192);
         let mut work = Work::new(allowance);
-        let out = r.build(cx, |cx| Sums::default().terminal(cx, n.a, 4, &mut work))?;
+        let e = r.build(cx, |cx| Sums::default().terminal_root(cx, root, 4, &mut work))?;
         let used = allowance - work.left;
         r.meter.charge(Counter::PassWork, used)?;
         left -= used;
-        if out != n.a && left >= scan {
-            let e = r.build(cx, |cx| cx.rebuild(root, [out, n.b, 0]))?;
+        if e != root && left >= scan {
             r.meter.charge(Counter::PassWork, scan)?;
             if matches!(cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1).map_err(Stop::Error)?,
                 crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
@@ -371,5 +439,54 @@ mod tests {
         // 2*(x&1) - (x&2) agrees at both uniform-word corners.
         let mut table = Table::default();
         assert_eq!(table.constant(&cx, &[(ids[0], 2), (ids[1], u64::MAX)], 8, &mut Work::new(1024)), None);
+    }
+
+    #[test]
+    fn collapses_multiple_shared_factors_and_mixed_weight_remainder() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W16);
+        let mut sums = Sums::default();
+        // Two independent shared product factors (f and g) plus a mixed-weight Boolean
+        // remainder (weights 5 and 3) alongside an unrelated summand `h`.
+        let src = "f*(x & y)*3 + f*(x & ~y)*3 - f*x*3 \
+                 + g*(a | b)*2 - g*(a & b)*2 - g*(a ^ b)*2 \
+                 + (x | y)*5 - (x & y)*5 + ~(x ^ y)*5 \
+                 + (x & 0x53)*3 + (x & ~0x53)*3 - x*3 + h";
+        let e = cx.parse(src, &opt).unwrap();
+        let want = cx.parse("h - 5", &opt).unwrap();
+        let eid = cx.id(e).unwrap();
+        let got = sums.collapse(&mut cx, eid, false, &mut Work::new(16384)).unwrap();
+        assert_eq!(got, Some(cx.id(want).unwrap()));
+
+        // Irreducible mixed weights ({3, -2, -1, -1, -3}) alongside a shared factor `f`:
+        // no equal-magnitude subset is constant on its own; only `table.constant` on the
+        // non-product remainder proves it zero.
+        let mixed = "f*(x | y)*3 - f*(x & y)*3 + f*~(x ^ y)*3 \
+                   + (x | y)*3 - (x ^ y)*2 - (x & ~y) - (~x & y) - (x & y)*3";
+        let e2 = cx.parse(mixed, &opt).unwrap();
+        let want2 = cx.parse("f * 65533", &opt).unwrap();
+        let e2id = cx.id(e2).unwrap();
+        let got2 = sums.collapse(&mut cx, e2id, false, &mut Work::new(16384)).unwrap();
+        assert_eq!(got2, Some(cx.id(want2).unwrap()));
+    }
+
+    #[test]
+    fn conjunction_wrapped_terminal_gate_simplifies_under_96_nodes() {
+        use crate::engine::{Budget, Engine, Run, Strategy};
+        use crate::mba::MbaConfig;
+
+        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
+        // Wrapped in `!(eq & guard)` with fewer than 96 nodes: terminal_root descends
+        // through the Not/And shell to prove the masked cofactor gate constant.
+        let src = "let a = x:16 * x + 3; let b = y:16 ^ 0x1234; \
+                   let s = (a | b)*7 - (a & b)*7 + ~(a ^ b)*7 + (a & 0x53)*11 + (a & ~0x53)*11 - a*11; \
+                   ~((~s == 6) & (z:16 == 9))";
+        let mut cx = Context::new();
+        let root = cx.parse(src, &ParseOptions::width(Width::W16)).unwrap();
+        let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+        // `s = -7`, so `~s = 6`, so `~s == 6` is true, leaving `z != 9`.
+        let want = cx.parse("z:16 != 9", &ParseOptions::width(Width::W16)).unwrap();
+        assert_eq!(out.roots[0].expr, want);
     }
 }

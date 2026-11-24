@@ -24,40 +24,8 @@ fn walk(cx: &Context, i: u32, left: &mut u32, atom: &mut impl FnMut(u32, u32) ->
 
 const LIMIT: u32 = 128;
 
-/// A Boolean node, or the single bit it tests. The polarity is the value of
-/// that bit which makes the predicate true. In particular, `0 <=s x` and
-/// `(x & sign) != 0` test the same bit with opposite polarities.
 fn literal(cx: &Context, i: u32) -> (u32, u16, bool) {
-    let n = cx.node(i);
-    let scalar = |i| cx.const_val(i).and_then(|k| k.to_u64());
-    let bit = |x, j, on| {
-        let src = cx.node(x);
-        if src.op == OpCode::Extract {
-            (src.a, src.b as u16 + j, on)
-        } else {
-            (x, j, on)
-        }
-    };
-    match n.op {
-        OpCode::Slt if cx.const_val(n.b).is_some_and(|v| v.is_zero()) => bit(n.a, cx.wid(n.a) - 1, true),
-        OpCode::Sle if cx.const_val(n.a).is_some_and(|v| v.is_zero()) => bit(n.b, cx.wid(n.b) - 1, false),
-        OpCode::Eq | OpCode::Ne => {
-            let a = cx.node(n.a);
-            if a.op == OpCode::And && let Some(m) = scalar(a.b)
-                && m.is_power_of_two() && let Some(k) = scalar(n.b)
-                && (k == m || k == 0)
-            {
-                return bit(a.a, m.trailing_zeros() as u16, (k == m) == (n.op == OpCode::Eq));
-            }
-            (i, 0, true)
-        }
-        OpCode::Not => {
-            // The builder collapses double negation and complements compares.
-            let (x, j, on) = literal(cx, n.a);
-            (x, j, !on)
-        }
-        _ => bit(i, 0, true),
-    }
+    crate::expr::field::bit_literal(cx, i)
 }
 
 /// Read only mandatory conjuncts. A cap misses available assumptions; it
@@ -81,116 +49,6 @@ fn select_guard(cx: &Context, body: u32, order: &[u32]) -> Option<(u32, (u32, u1
         let (x, bit, _) = literal(cx, n.a);
         guards.iter().copied().find(|&(_, (y, j, _))| (x, bit) == (y, j))
     })
-}
-
-/// Resolve a linear sum's repeated signed coefficient class even when an
-/// unrelated summand stops the whole sum from being a two-word fragment.
-/// Normalize the common scalar: later sums over the same columns often have
-/// completely different scalars and can use the same exact constant proof.
-#[derive(Default)]
-struct Kernels {
-    parts: Vec<(u32, u64)>,
-    key: Vec<(u32, u64)>,
-    known: crate::hash::IdMap<Vec<(u32, u64)>, (u16, Option<u64>)>,
-}
-
-/// The signed column count for each assignment of the two opaque words'
-/// bits. Bit-sliced addition counts all word positions independently:
-/// equal *word sums* at the four corners would not suffice, since different
-/// positions need not use the same row. Only bits surviving the subsequent
-/// scalar multiplication need agree. A negative term is `!t + 1`.
-fn unit_sum(
-    cx: &Context, terms: &[(u32, u64)], bits: u16, work: &mut super::opaque_predicate::Work,
-) -> Option<u64> {
-    use super::opaque_predicate::Rows;
-    let planes = terms.len().ilog2() as usize + 1;
-    let mut counts = [[0u64; 5]; 4]; // at most 24 terms below
-    let mut rows = Rows::default();
-    let mut bias = 0u64;
-    for &(term, sign) in terms {
-        work.take(4 * planes as u64)?;
-        let values = rows.read(cx, term, 48, work)?;
-        for (count, value) in counts.iter_mut().zip(values) {
-            let mut carry = if sign == 1 { value } else { !value };
-            for c in &mut count[..planes] {
-                let next = *c & carry;
-                *c ^= carry;
-                carry = next;
-            }
-        }
-        bias += u64::from(sign != 1);
-    }
-    let mask = u64::MAX >> (64 - bits);
-    for p in 0..planes {
-        let v = counts[0][p];
-        if counts[1..].iter().any(|r| (r[p] ^ v) & (mask >> p) != 0) { return None; }
-        bias = bias.wrapping_add(v << p);
-    }
-    Some(bias & mask)
-}
-
-impl Kernels {
-    fn collapse(&mut self, cx: &mut Context, i: u32, work: &mut super::opaque_predicate::Work)
-        -> Result<Option<u32>, crate::Error>
-    {
-        use super::opaque_predicate::terms;
-        let w = cx.wid(i);
-        if w > 64 { return Ok(None); }
-        let mask = u64::MAX >> (64 - w);
-        let mut bias = 0;
-        self.parts.clear();
-        if terms(cx, i, 1, &mut bias, &mut self.parts, 48, true, work).is_none()
-            || !(2..=24).contains(&self.parts.len())
-        {
-            return Ok(None);
-        }
-        let magnitude = |k: u64| (k & mask).min(k.wrapping_neg() & mask);
-        // Most sums have no repeated coefficient. Sorting also puts the keys
-        // in node order independently of how the two additions associated.
-        if work.take(self.parts.len() as u64 * 6).is_none() { return Ok(None); }
-        self.parts.sort_unstable_by_key(|&(t, k)| (magnitude(k), t));
-        let mut start = 0;
-        let mut changed = false;
-        while start < self.parts.len() {
-            let k = magnitude(self.parts[start].1);
-            let end = start + self.parts[start..].partition_point(|&(_, c)| magnitude(c) == k);
-            if k != 0 && end - start >= 2 {
-                // Either global sign gives the same normalized question.
-                let base = self.parts[start].1 & mask;
-                self.key.clear();
-                self.key.extend(self.parts[start..end].iter().map(|&(t, c)|
-                    (t, if c & mask == base { 1 } else { u64::MAX })
-                ));
-                let bits = w - base.trailing_zeros() as u16;
-                let value = if let Some(&(b, v)) = self.known.get(&self.key)
-                    && (b == bits || (v.is_some() && b >= bits))
-                {
-                    v
-                } else {
-                    let v = unit_sum(cx, &self.key, bits, work);
-                    if self.known.len() < 64 {
-                        self.known.insert(self.key.clone(), (bits, v));
-                    }
-                    v
-                };
-                if let Some(v) = value {
-                    bias = bias.wrapping_add(base.wrapping_mul(v));
-                    self.parts[start..end].fill((0, 0));
-                    changed = true;
-                }
-            }
-            start = end;
-        }
-        if !changed { return Ok(None); }
-        let mut sum = cx.mk_const_u64(w, bias & mask)?;
-        for &(t, k) in &self.parts {
-            if k & mask == 0 { continue; }
-            let k = cx.mk_const_u64(w, k & mask)?;
-            let t = cx.c_bin(BinOp::Mul, t, k)?;
-            sum = cx.c_bin(BinOp::Add, sum, t)?;
-        }
-        Ok(Some(sum))
-    }
 }
 
 /// For a value used by both logical shifts, read a surviving constant shift
@@ -224,16 +82,20 @@ fn joined_shift(cx: &mut Context, i: u32) -> Result<u32, crate::Error> {
             (cx.node(n.a).a, cx.node(n.b).a, true),
         _ => return Ok(i),
     };
-    let (a, b) = (cx.node(a), cx.node(b));
-    if n.width <= 64 && a.op == OpCode::And && b.op == OpCode::And && a.a == b.a
-        && let (Some(l), Some(r)) = (cx.const_val(a.b), cx.const_val(b.b))
+    let (na, nb) = (cx.node(a), cx.node(b));
+    if n.width <= 64 && na.op == OpCode::And && nb.op == OpCode::And && na.a == nb.a
+        && let (Some(l), Some(r)) = (cx.const_val(na.b), cx.const_val(nb.b))
         && (l.limbs()[0] ^ r.limbs()[0]) == (u64::MAX >> (64 - n.width))
     {
-        return if neg { cx.c_un(UnOp::Not, a.a) } else { Ok(a.a) };
+        return if neg { cx.c_un(UnOp::Not, na.a) } else { Ok(na.a) };
     }
-    let (l, r) = match (a.op, b.op) {
-        (OpCode::Shl, OpCode::LShr) => (a, b),
-        (OpCode::LShr, OpCode::Shl) => (b, a),
+    if !neg && let Some((base, left)) = crate::expr::field::rotation_of(cx, i) {
+        let k = cx.mk_const_u64(n.width, u64::from(left))?;
+        return cx.c_bin(BinOp::RotL, base, k);
+    }
+    let (l, r) = match (na.op, nb.op) {
+        (OpCode::Shl, OpCode::LShr) => (na, nb),
+        (OpCode::LShr, OpCode::Shl) => (nb, na),
         _ => return Ok(i),
     };
     let k = |i| cx.const_val(i).and_then(|v| v.to_u64());
@@ -338,7 +200,7 @@ fn select_cofactor(
         }
     }
     let mut rewrites = super::super::Lease::new(cx.len());
-    let mut kernels = Kernels::default();
+    let mut kernels = super::cofactors::Sums::default();
     let mut parts = Vec::new();
     for &i in order {
         if i == guard { continue; }
@@ -371,7 +233,7 @@ fn select_cofactor(
         if sums.contains(i) && matches!(cx.node(cur).op, OpCode::Add | OpCode::Sub)
             && cx.wid(cur) <= 64 && work.left != 0
         {
-            if let Some(v) = r.build(cx, |cx| kernels.collapse(cx, cur, &mut work))? {
+            if let Some(v) = r.build(cx, |cx| kernels.collapse(cx, cur, false, &mut work))? {
                 cur = v;
             }
             if matches!(cx.node(cur).op, OpCode::Add | OpCode::Sub) {
@@ -629,22 +491,22 @@ mod tests {
     fn normalized_signed_kernel_keeps_unrelated_terms() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W8);
-        let mut kernels = Kernels::default();
+        let mut kernels = super::super::cofactors::Sums::default();
         for k in [5u8, 39, 128, 211] {
             let text = format!("(x & y)*{k} + (x & ~y)*{k} + z*7 - x*{k}");
             let e = cx.parse(&text, &opt).unwrap();
             let e = cx.id(e).unwrap();
             let mut work = super::super::opaque_predicate::Work::new(1 << 14);
-            let v = kernels.collapse(&mut cx, e, &mut work).unwrap().unwrap();
+            let v = kernels.collapse(&mut cx, e, false, &mut work).unwrap().unwrap();
             let want = cx.parse("z * 7", &opt).unwrap();
             assert_eq!(v, cx.id(want).unwrap());
         }
         let e = cx.parse("(x & y)*5 + (x & ~z)*5 - x*5 + z*7", &opt).unwrap();
         let e = cx.id(e).unwrap();
         let mut work = super::super::opaque_predicate::Work::new(1 << 14);
-        assert!(kernels.collapse(&mut cx, e, &mut work).unwrap().is_none());
+        assert!(kernels.collapse(&mut cx, e, false, &mut work).unwrap().is_none());
         let mut work = super::super::opaque_predicate::Work::new(1);
-        assert!(kernels.collapse(&mut cx, e, &mut work).unwrap().is_none());
+        assert!(kernels.collapse(&mut cx, e, false, &mut work).unwrap().is_none());
     }
 
     #[test]

@@ -219,6 +219,18 @@ fn scaling_discards_the_remaining_difference_between_selected_masks() {
         Some(BitVec::wrapping_from_u64(w, 0xc000000000000000))
     });
     assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(1 << 63));
+    // Shift/mask/truncation wrappers and opposite-polarity select conditions cancel too.
+    let opposite = "let c = x <s 0; let a = select(c, ~x & 0x140000000, 0); \
+                    let b = select(~c, 0, ~x & 0xe000000140000000);";
+    for expr in [
+        format!("{opposite} (a - b) << 3"),
+        format!("{opposite} (a - b) & 0x1fffffffffffffff"),
+        format!("{opposite} trunc<32>(a - b)"),
+    ] {
+        let input = cx.parse(&expr, &parse).unwrap();
+        let out = engine.simplify(&mut cx, input).unwrap().expr;
+        assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(0), "{expr}");
+    }
 }
 
 #[test]

@@ -887,18 +887,31 @@ fn bitwise_fixtures() {
         "((x >>u 5) | (y & 7)) ^ ((x >>u 5) & y)",
         "(x >>u 5) ^ (y & 7)",
     );
+    // Known-bit-aware `bitwise::masked` handles masked union/overlap and disjoint-bit
+    // simplifications without dedicated syntactic rules.
+    same(
+        "~(p & ((r >>u 5) | q)) & ((r >>u 5) | ((p | q) & 7))",
+        "(p ^ ((r >>u 5) | q)) & 7",
+    );
+    same(
+        "((x >>u 5) | (y << 3)) ^ (y << 3)",
+        "x >>u 5",
+    );
     // x >> 4 can set bit 3. At x=128, y=8 the overlap cancels it.
     let mut cx = Context::new();
     let o = ParseOptions::width(Width::W8);
-    let near = cx
-        .parse("((x >>u 4) | (y & 7)) ^ ((x >>u 4) & y)", &o)
-        .unwrap();
-    let result = eng.simplify(&mut cx, near).unwrap().expr;
-    let x = crate::SymbolKey::from("x");
-    let env = crate::FnEnv(|s: &crate::SymbolKey, w: Width| {
-        Some(BitVec::wrapping_from_u64(w, if *s == x { 128 } else { 8 }))
-    });
-    assert!(cx.eval(&[result], &env).unwrap()[0].is_zero());
+    for near_src in [
+        "((x >>u 4) | (y & 7)) ^ ((x >>u 4) & y)",
+        "((x >>u 4) | (y & 7)) & ~((x >>u 4) & y)",
+    ] {
+        let near = cx.parse(near_src, &o).unwrap();
+        let result = eng.simplify(&mut cx, near).unwrap().expr;
+        let x = crate::SymbolKey::from("x");
+        let env = crate::FnEnv(|s: &crate::SymbolKey, w: Width| {
+            Some(BitVec::wrapping_from_u64(w, if *s == x { 128 } else { 8 }))
+        });
+        assert!(cx.eval(&[result], &env).unwrap()[0].is_zero(), "{near_src}");
+    }
 }
 
 #[test]

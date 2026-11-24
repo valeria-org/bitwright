@@ -1166,11 +1166,13 @@ impl Question {
             }
         }
         let remaining_batches = cfg.samples.div_ceil(64) - (q.stats.samples / 64) as u32;
+        let mut joint_fallback: Option<u32> = None;
         if cfg.simplify && !cfg.certificate {
-            let mut spent = crate::engine::Allowance::new(crate::engine::Budget::UNLIMITED);
+            let mut allowance = crate::engine::Allowance::new(cfg.simplify_budget);
+            let engine = (env.simplifiers).engine(cfg.strict, cfg.proved_words);
             let run = crate::engine::Run::default()
                 .with_per_call(cfg.simplify_budget)
-                .with_allowance(&mut spent);
+                .with_allowance(&mut allowance);
             let run = match assumptions {
                 Some(a) => run.with_assumptions(a),
                 None => run,
@@ -1180,18 +1182,155 @@ impl Question {
                 None => run,
             };
             let goal = cx.handle(goal_node);
-            let out = (env.simplifiers)
-                .engine(cfg.strict, cfg.proved_words)
-                .run(cx, &[goal], run)?
-                .roots[0];
-            let s = cx.id(out.expr)?;
-            let proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+            let mut out = engine.run(cx, &[goal], run)?.roots[0];
+            let mut s = cx.id(out.expr)?;
+            let mut proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+            // When assumptions are present and simplifying the goal alone did not decide it,
+            // simplify the joint counterexample `!goal & c1 & c2 & ...` within the remaining
+            // allowance so guard/field specialization and cross-conjunct MBA cancellation see
+            // both the goal and its assumptions together.
+            if !proved
+                && !cons.is_empty()
+                && out.end == crate::engine::End::Completed
+            {
+                let mut bad = cx.c_un(crate::UnOp::Not, s)?;
+                for &c in &cons {
+                    bad = cx.c_bin(crate::BinOp::And, bad, c)?;
+                }
+                let run = crate::engine::Run::default()
+                    .with_per_call(cfg.simplify_budget)
+                    .with_allowance(&mut allowance);
+                let run = match env.deadline {
+                    Some(d) => run.with_deadline(d),
+                    None => run,
+                };
+                let joint = engine.run(cx, &[cx.handle(bad)], run)?.roots[0];
+                let reduced = cx.id(joint.expr)?;
+                if cx.const_val(reduced).is_some_and(|v| v.is_zero()) {
+                    proved = true;
+                    s = cx.mk_const_u64(1, 1)?;
+                    out = joint;
+                } else {
+                    if joint.end != crate::engine::End::Completed {
+                        out.end = joint.end;
+                    }
+                    // Keep separate `cons` as unit assertions when they fit the circuit cap,
+                    // reserving `!reduced` for when raw assumptions would exceed `max_nodes`.
+                    if reduced != bad {
+                        joint_fallback = Some(cx.c_un(crate::UnOp::Not, reduced)?);
+                    }
+                }
+            }
+            // For a compound word equality `a == b` left open after separate simplification,
+            // simplify `a - b` in the remaining allowance so MBA normal forms see both sides
+            // together. Only when both sides are non-leaf operations.
+            if !proved
+                && cons.is_empty()
+                && out.end == crate::engine::End::Completed
+                && cx.node(s).op == OpCode::Eq
+            {
+                let eq = cx.node(s);
+                if cx.wid(eq.a) > 1
+                    && cx.node(eq.a).op.arity() > 0
+                    && cx.node(eq.b).op.arity() > 0
+                {
+                    let diff = cx.c_bin(crate::BinOp::Sub, eq.a, eq.b)?;
+                    let run = crate::engine::Run::default()
+                        .with_per_call(cfg.simplify_budget)
+                        .with_allowance(&mut allowance);
+                    let run = match env.deadline {
+                        Some(d) => run.with_deadline(d),
+                        None => run,
+                    };
+                    let res = engine.run(cx, &[cx.handle(diff)], run)?.roots[0];
+                    let reduced = cx.id(res.expr)?;
+                    if let Some(v) = cx.const_val(reduced) {
+                        if v.is_zero() {
+                            proved = true;
+                            s = cx.mk_const_u64(1, 1)?;
+                            out = res;
+                        } else {
+                            s = cx.mk_const_u64(1, 0)?;
+                        }
+                    } else if res.end != crate::engine::End::Completed {
+                        out.end = res.end;
+                    } else if matches!(
+                        cx.dag_size(&[cx.handle(s)], 256)?,
+                        crate::expr::Bounded::Exact(_)
+                    ) {
+                        // Sound proof-only affine rebasing: rewrite `(x << k) + c` as `y << k`
+                        // with `x = y - (c >> k)` when `c` has at least `k` trailing zeros.
+                        // Proving the rebased difference zero proves the original equality;
+                        // a nonzero result is ignored since `x` may be a constrained subterm.
+                        let nodes = cx.post_order_ids(&[s]);
+                        let mut attempts = 0usize;
+                        for sum in nodes {
+                            let sn = cx.node(sum);
+                            if sn.op != OpCode::Add || sn.width > 64 {
+                                continue;
+                            }
+                            let shifted = cx.node(sn.a);
+                            if shifted.op != OpCode::Shl {
+                                continue;
+                            }
+                            let Some(k) = cx.const_val(shifted.b).and_then(|v| v.to_u64()) else {
+                                continue;
+                            };
+                            let Some(c) = cx.const_val(sn.b).and_then(|v| v.to_u64()) else {
+                                continue;
+                            };
+                            if k == 0 || k >= u64::from(sn.width) || c.trailing_zeros() < k as u32 {
+                                continue;
+                            }
+                            let w = cx.width_of(shifted.a);
+                            let fresh = cx.fresh_symbol(w)?;
+                            let y = cx.id(fresh)?;
+                            let bias = cx.mk_const_u64(sn.width, c >> k)?;
+                            let original = cx.c_bin(crate::BinOp::Sub, y, bias)?;
+                            let rebased = cx.c_bin(crate::BinOp::Shl, y, shifted.b)?;
+                            let unshifted = cx.c_bin(crate::BinOp::Sub, rebased, sn.b)?;
+                            let mut repl = IdMap::default();
+                            repl.insert(sum, rebased);
+                            repl.insert(sn.a, unshifted);
+                            repl.insert(shifted.a, original);
+                            let cand = cx.substitute_ids(&[diff], &repl)?[0];
+                            let run = crate::engine::Run::default()
+                                .with_per_call(cfg.simplify_budget)
+                                .with_allowance(&mut allowance);
+                            let run = match env.deadline {
+                                Some(d) => run.with_deadline(d),
+                                None => run,
+                            };
+                            let r = engine.run(cx, &[cx.handle(cand)], run)?.roots[0];
+                            let rv = cx.id(r.expr)?;
+                            if cx.const_val(rv).is_some_and(|v| v.is_zero()) {
+                                proved = true;
+                                s = cx.mk_const_u64(1, 1)?;
+                                out = r;
+                                break;
+                            }
+                            if r.end != crate::engine::End::Completed {
+                                out.end = r.end;
+                                break;
+                            }
+                            attempts += 1;
+                            if attempts == 4 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             q.stats.simplification = Simplification {
                 ran: true,
-                spent: spent.spent(),
-                stopped: match out.end {
-                    crate::engine::End::BudgetTerminated(why) => Some(why),
-                    _ => None,
+                spent: allowance.spent(),
+                stopped: if proved {
+                    None
+                } else {
+                    match out.end {
+                        crate::engine::End::BudgetTerminated(why) => Some(why),
+                        _ => None,
+                    }
                 },
                 decided: proved,
             };
@@ -1290,6 +1429,12 @@ impl Question {
             };
             match blasted() {
                 Ok((goal, extra)) if b.g.len() <= cfg.max_nodes => break (b, goal, extra),
+                // If raw assumptions pushed the circuit past `max_nodes`, try the simplified
+                // joint implication instead of failing with `TooLarge`.
+                _ if joint_fallback.is_some() => {
+                    goal_node = joint_fallback.take().unwrap();
+                    cons.clear();
+                }
                 // (Written again the circuit is too large: the question as asked, then.)
                 _ if goal_node != asked => goal_node = asked,
                 Ok(_) => {

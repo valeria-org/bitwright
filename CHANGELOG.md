@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.32.14
+
+- The bitwise pass folds atoms with known-zero or known-one bit classes directly
+  in masked truth tables (and in `bitwise::equal`), handles mask-free direct
+  simplifications and partial known-bit splits, and subsumes the ad-hoc
+  `masked_union_minus_overlap` rule.
+- Unified additive-Boolean cancellation and column analysis across the MBA sweep:
+  added shared term cancellation, memoized `Lane::bit` and `Rows::read` walks,
+  constant-multiplier trailing-zero and one-constant-arm `select` bit tracing,
+  column-level constant folding in `mba::sweep` and cofactor reduction, multi-factor
+  and mixed-weight cofactor collapsing, and lowered sweep size floors while
+  deduplicating `guard_domain` onto `cofactors::Sums` and shared `expr::field`
+  matchers.
+- Generalized congruence peeling in `compares` to track surviving low-bit prefixes
+  across shifts, masks, casts, `concat`, and `select`, feeding peeled pairs into
+  `poly`, `bitwise`, `linear_mba`, and prefix-aware `mba::equal_sums`.
+- Extended `cases::by_cases` to pair opposite-polarity select conditions via shared
+  bit-literal matching, support bit-discarding outer wrappers (`Shl`, `And`, even
+  `Mul`, low `Extract`), and short-circuit on the first unsimplified branch.
+- The prover (`bitwright::prove`) now shares a single simplification allowance across
+  stages, simplifies joint counterexamples (`!goal & assumptions`) with an automatic
+  fallback when raw assumption circuits exceed `max_nodes`, and tries modular
+  difference simplification plus bounded proof-only affine rebasing for unresolved
+  compound word equalities.
+
 ## 0.32.13
 
 - A mask on a `select` can discard an arm whose selected bits are known zero.

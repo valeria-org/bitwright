@@ -1,5 +1,6 @@
 //! A masked comparison on a word plus a modular offset.
 use super::{Context, OpCode};
+#[cfg(any(feature = "mba", feature = "prove"))]
 #[derive(Clone, Copy)]
 pub(crate) struct Field {
     pub(crate) base: u32,
@@ -11,6 +12,7 @@ pub(crate) struct Field {
 // Read an equality as `(base + bias) & mask == bits`, at most 64 bits.
 // A truncation only drops high bits. Crossing an addition is sound even for a
 // sparse mask: record the offset, don't subtract it independently in each field.
+#[cfg(any(feature = "mba", feature = "prove"))]
 pub(crate) fn field(cx: &Context, eq: u32) -> Option<Field> {
     let n = cx.node(eq);
     if n.op != OpCode::Eq {
@@ -23,20 +25,25 @@ pub(crate) fn field(cx: &Context, eq: u32) -> Option<Field> {
     project(cx, n.a, u64::MAX >> (64 - w), cx.const_val(n.b)?.to_u64()?)
 }
 
-// A rotate's low, non-wrapping field can be read as a right shift.
-fn right_field(cx: &Context, x: u32) -> Option<(u32, u32)> {
+/// Recognize a rotation by a constant, whether spelled `rotl`/`rotr` or as
+/// complementary shifts `(x << l) | (x >>u r)`, `(x << l) ^ (x >>u r)`, or
+/// De Morgan `~(~(x << l) & ~(x >>u r))`. Returns `(base, left_rot)` with
+/// `left_rot < width`.
+#[cfg(any(feature = "mba", feature = "prove"))]
+pub(crate) fn rotation_of(cx: &Context, x: u32) -> Option<(u32, u32)> {
     let n = cx.node(x);
     let w = u64::from(n.width);
+    if w == 0 || w > 64 {
+        return None;
+    }
     let k = |i| cx.const_val(i)?.to_u64();
     if matches!(n.op, OpCode::RotL | OpCode::RotR) {
         let s = k(n.b)? % w;
-        return Some((
-            n.a,
-            (if n.op == OpCode::RotL { (w - s) % w } else { s }) as u32,
-        ));
+        let left = if n.op == OpCode::RotL { s } else { (w - s) % w };
+        return Some((n.a, left as u32));
     }
     let (a, b) = match n.op {
-        OpCode::Or => (n.a, n.b),
+        OpCode::Or | OpCode::Xor => (n.a, n.b),
         OpCode::Not => {
             let and = cx.node(n.a);
             if and.op != OpCode::And {
@@ -59,9 +66,98 @@ fn right_field(cx: &Context, x: u32) -> Option<(u32, u32)> {
         return None;
     }
     let (left, right) = (k(l.b)?, k(r.b)?);
-    (left < w && right < w && left + right == w).then_some((l.a, right as u32))
+    (left < w && right < w && left + right == w).then_some((l.a, left as u32))
 }
 
+/// A Boolean node, or the single bit it tests: `(word, bit_index, polarity)` where
+/// `polarity` is the value of that bit making the predicate true. Recognizes all
+/// common sign-bit spellings (`x <s 0`, `0 <=s x`, `x <=s -1`, `-1 <s x`,
+/// `smin <=u x`, `x <u smin`, `smax <u x`, `x <=u smax`), single-bit mask tests
+/// `(x & 2^k) == 2^k` / `!= 0`, `extract<k, 1>(x)`, and negations thereof.
+pub(crate) fn bit_literal(cx: &Context, i: u32) -> (u32, u16, bool) {
+    use crate::BitVec;
+    let n = cx.node(i);
+    let scalar = |i| cx.const_val(i).and_then(|k| k.to_u64());
+    let bit = |x, j, on| {
+        let src = cx.node(x);
+        if src.op == OpCode::Extract {
+            (src.a, src.b as u16 + j, on)
+        } else {
+            (x, j, on)
+        }
+    };
+    match n.op {
+        OpCode::Slt => {
+            if cx.const_val(n.b).is_some_and(|v| v.is_zero()) {
+                return bit(n.a, cx.wid(n.a) - 1, true);
+            }
+            if cx.const_val(n.a).is_some_and(|v| v.is_ones()) {
+                return bit(n.b, cx.wid(n.b) - 1, false);
+            }
+            (i, 0, true)
+        }
+        OpCode::Sle => {
+            if cx.const_val(n.a).is_some_and(|v| v.is_zero()) {
+                return bit(n.b, cx.wid(n.b) - 1, false);
+            }
+            if cx.const_val(n.b).is_some_and(|v| v.is_ones()) {
+                return bit(n.a, cx.wid(n.a) - 1, true);
+            }
+            (i, 0, true)
+        }
+        OpCode::Ult => {
+            let w = cx.width_of(n.a);
+            if cx.const_val(n.b) == Some(BitVec::smin(w)) {
+                return bit(n.a, w.bits() - 1, false);
+            }
+            if cx.const_val(n.a) == Some(BitVec::smax(w)) {
+                return bit(n.b, w.bits() - 1, true);
+            }
+            (i, 0, true)
+        }
+        OpCode::Ule => {
+            let w = cx.width_of(n.a);
+            if cx.const_val(n.a) == Some(BitVec::smin(w)) {
+                return bit(n.b, w.bits() - 1, true);
+            }
+            if cx.const_val(n.b) == Some(BitVec::smax(w)) {
+                return bit(n.a, w.bits() - 1, false);
+            }
+            (i, 0, true)
+        }
+        OpCode::Eq | OpCode::Ne => {
+            let a = cx.node(n.a);
+            if a.op == OpCode::And
+                && let Some(m) = scalar(a.b)
+                && m.is_power_of_two()
+                && let Some(k) = scalar(n.b)
+                && (k == m || k == 0)
+            {
+                return bit(
+                    a.a,
+                    m.trailing_zeros() as u16,
+                    (k == m) == (n.op == OpCode::Eq),
+                );
+            }
+            (i, 0, true)
+        }
+        OpCode::Not => {
+            let (x, j, on) = bit_literal(cx, n.a);
+            (x, j, !on)
+        }
+        _ => bit(i, 0, true),
+    }
+}
+
+// A rotate's low, non-wrapping field can be read as a right shift.
+#[cfg(any(feature = "mba", feature = "prove"))]
+fn right_field(cx: &Context, x: u32) -> Option<(u32, u32)> {
+    let w = u32::from(cx.wid(x));
+    let (base, left) = rotation_of(cx, x)?;
+    Some((base, (w - left) % w))
+}
+
+#[cfg(any(feature = "mba", feature = "prove"))]
 pub(crate) fn project(cx: &Context, mut x: u32, mut mask: u64, mut bits: u64) -> Option<Field> {
     let mut bias = 0u64;
     let mut biased = false;
@@ -118,6 +214,7 @@ pub(crate) fn project(cx: &Context, mut x: u32, mut mask: u64, mut bits: u64) ->
     None
 }
 
+#[cfg(any(feature = "mba", feature = "prove"))]
 impl Field {
     #[cfg(feature = "prove")]
     pub(crate) fn seed(self, input: u64) -> u64 {

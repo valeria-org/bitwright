@@ -620,22 +620,20 @@ fn selected_sext(cx: &Context, a: u32, b: u32) -> Option<(u16, u32)> {
         _ => return None,
     };
     let w = cx.width_of(x);
-    let cond = cx.node(sel.a);
-    // Whether the condition means "negative". The compares pass can spell
-    // the unsigned threshold `smin <=u x` as the signed `x <=s -1`.
-    let negative = match cond.op {
-        _ if w.bits() == 1 && sel.a == x => true,
-        OpCode::Extract if cond.a == x && cond.b == u32::from(w.bits() - 1) => true,
-        OpCode::Slt if cond.a == x && cx.const_val(cond.b)?.is_zero() => true,
-        OpCode::Sle if cond.a == x && cx.const_val(cond.b)?.is_ones() => true,
-        OpCode::Sle if cond.b == x && cx.const_val(cond.a)?.is_zero() => false,
-        OpCode::Slt if cond.b == x && cx.const_val(cond.a)?.is_ones() => false,
-        OpCode::Ule if cond.b == x && cx.const_val(cond.a)? == BitVec::smin(w) => true,
-        OpCode::Ult if cond.b == x && cx.const_val(cond.a)? == BitVec::smax(w) => true,
-        OpCode::Ult if cond.a == x && cx.const_val(cond.b)? == BitVec::smin(w) => false,
-        OpCode::Ule if cond.a == x && cx.const_val(cond.b)? == BitVec::smax(w) => false,
-        _ => return None,
+    let (sign_word, sign_bit) = {
+        let xn = cx.node(x);
+        if xn.op == OpCode::Extract {
+            (xn.a, xn.b as u16 + w.bits() - 1)
+        } else {
+            (x, w.bits() - 1)
+        }
     };
+    // Whether the condition means "negative". Shared `bit_literal` recognizes all signed,
+    // unsigned-threshold, mask-bit, extract, and negated spellings of the sign bit.
+    let (word, bit, negative) = crate::expr::field::bit_literal(cx, sel.a);
+    if word != sign_word || bit != sign_bit {
+        return None;
+    }
     let (set, clear) = if negative {
         (sel.b, sel.c)
     } else {

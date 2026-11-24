@@ -146,16 +146,25 @@ pub(super) fn by_cases(
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
 ) -> Result<Option<super::Step>, Stop> {
     let node = cx.node(n);
-    // Scaling a difference can discard high columns that differ before scaling.
-    let scaled_sum = node.op == OpCode::Mul
-        && cx.node(node.b).op == OpCode::Const
-        && matches!(cx.node(node.a).op, OpCode::Add | OpCode::Sub);
-    if node.width < 2
-        || !(scaled_sum || matches!(
-            node.op,
+    let inner_op = |id: u32| {
+        matches!(
+            cx.node(id).op,
             OpCode::Add | OpCode::Sub | OpCode::Xor | OpCode::Or | OpCode::And
-        ))
-    {
+        )
+    };
+    // Scaling by an even factor, shifting, masking, or truncating a difference can discard
+    // high columns that differ before the outer wrapper.
+    let wrapped = match node.op {
+        OpCode::Mul => {
+            cx.const_val(node.b)
+                .is_some_and(|v| v.bit(0) == Some(false))
+                && inner_op(node.a)
+        }
+        OpCode::Shl | OpCode::And => cx.node(node.b).op == OpCode::Const && inner_op(node.a),
+        OpCode::Extract => node.b == 0 && inner_op(node.a),
+        _ => false,
+    };
+    if node.width < 2 || !(wrapped || inner_op(n)) {
         return Ok(None);
     }
     // The selects below `n`, through the operators of a fragment and casts.
@@ -190,21 +199,32 @@ pub(super) fn by_cases(
     // A condition two of them read, with sides that read one value: the same value written
     // two ways is what an identity over it reads (selects between unrelated values, or
     // between constants, are left to the passes that merge those).
+    // Whether two select conditions are equal (`Some(false)`) or logical complements (`Some(true)`),
+    // including canonicalized comparison complements like `x <s 0` vs `0 <=s x`.
+    fn cond_rel(cx: &Context, ca: u32, cb: u32) -> Option<bool> {
+        if ca == cb {
+            return Some(false);
+        }
+        let (wa, ba, oa) = crate::expr::field::bit_literal(cx, ca);
+        let (wb, bb, ob) = crate::expr::field::bit_literal(cx, cb);
+        ((wa, ba) == (wb, bb)).then_some(oa != ob)
+    }
     let mut found = None;
     'pairs: for (i, &s) in selects.iter().enumerate() {
         let a = cx.node(s);
         for &t in &selects[i + 1..] {
             let b = cx.node(t);
-            if a.a != b.a {
+            let Some(flipped) = cond_rel(cx, a.a, b.a) else {
                 continue;
-            }
+            };
+            let (bt, be) = if flipped { (b.c, b.b) } else { (b.b, b.c) };
             // A projection of a bounded choice may already be constant on
             // one side. The other side must still share a nonconstant input.
-            let fixed_then = cx.node(a.b).op == OpCode::Const && cx.node(b.b).op == OpCode::Const;
-            let fixed_else = cx.node(a.c).op == OpCode::Const && cx.node(b.c).op == OpCode::Const;
+            let fixed_then = cx.node(a.b).op == OpCode::Const && cx.node(bt).op == OpCode::Const;
+            let fixed_else = cx.node(a.c).op == OpCode::Const && cx.node(be).op == OpCode::Const;
             if !(fixed_then && fixed_else)
-                && (fixed_then || related(cx, a.b, b.b))
-                && (fixed_else || related(cx, a.c, b.c))
+                && (fixed_then || related(cx, a.b, bt))
+                && (fixed_else || related(cx, a.c, be))
             {
                 found = Some(a.a);
                 break 'pairs;
@@ -222,8 +242,8 @@ pub(super) fn by_cases(
             let mut repl: IdMap<u32, u32> = IdMap::default();
             for &s in &selects {
                 let m = cx.node(s);
-                if m.a == c {
-                    repl.insert(s, if then { m.b } else { m.c });
+                if let Some(flipped) = cond_rel(cx, m.a, c) {
+                    repl.insert(s, if then ^ flipped { m.b } else { m.c });
                 }
             }
             let e = r.build(cx, |cx| Ok(cx.substitute_ids(&[n], &repl)?[0]))?;
@@ -235,7 +255,11 @@ pub(super) fn by_cases(
     // Only where each side is an identity the MBA phase reads: a split of any operation
     // over two selects, taken where it was smaller, left 38 of 140 measured questions larger
     // (the selects' sides are shared with what the rounds after would have folded).
-    let (Some(e1), Some(e0)) = (side(r, cx, true)?, side(r, cx, false)?) else {
+    let Some(e1) = side(r, cx, true)? else {
+        super::discard(r, cx, before);
+        return Ok(None);
+    };
+    let Some(e0) = side(r, cx, false)? else {
         super::discard(r, cx, before);
         return Ok(None);
     };

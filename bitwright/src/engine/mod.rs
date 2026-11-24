@@ -619,6 +619,7 @@ struct Inner {
     /// The words pass's questions that found nothing (see `pass::words::Quiet`).
     words_quiet: pass::words::Quiet,
     /// The carries pass's slice proofs (see `pass::slices::Proofs`).
+    #[cfg(feature = "prove")]
     slice_proofs: pass::slices::Proofs,
 }
 
@@ -1036,6 +1037,7 @@ impl EngineBuilder {
                 verify: self.verify,
                 id: (u128::from(id) << 64) | u128::from(combine(id, 0x9e37)),
                 words_quiet: pass::words::Quiet::default(),
+                #[cfg(feature = "prove")]
                 slice_proofs: pass::slices::Proofs::default(),
             }),
         })

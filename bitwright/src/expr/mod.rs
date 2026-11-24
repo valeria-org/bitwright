@@ -10,7 +10,6 @@ mod build;
 pub(crate) use build::count_mod;
 pub use build::traps;
 mod eval;
-#[cfg(any(feature = "mba", feature = "prove"))]
 pub(crate) mod field;
 mod fp;
 mod node;

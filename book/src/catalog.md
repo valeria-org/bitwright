@@ -1239,6 +1239,29 @@ rule lshr_add_shl<W>(x: W, c: const W, k: const W) {
 
 - `((p << 3) + 0x1d) >>u 3` → `(p + 3) & 0x1f`
 
+#### `disjoint_shift_left` — rule
+
+The low s bits of the left shift are zero; the other shift can only put bits
+there. At and beyond the width at least one operand is zero.
+
+```text
+rule disjoint_shift_left<W>(x: W, y: W, s: W) {
+        (x << s) & (y >>u (W - s)) => 0
+    }
+```
+
+- `(p << q) & (r >>u (8 - q))` → `0`
+
+#### `disjoint_shift_right` — rule
+
+```text
+rule disjoint_shift_right<W>(x: W, y: W, s: W) {
+        (x >>u s) & (y << (W - s)) => 0
+    }
+```
+
+- `(p >>u q) & (r << (8 - q))` → `0`
+
 #### `rotl_rotl` — rule
 
 Two rotations by constants.
@@ -3060,6 +3083,28 @@ rule select_zero_sum<W>(x: W, y: W) { select(x == 0, x + y, y) => y }
 ```
 
 - `select(p == 0, p + q, q)` → `q`
+
+#### `mask_select_zero_else` — rule
+
+Project a mask into a choice when one arm contributes no selected bits.
+
+```text
+rule mask_select_zero_else<W>(c: 1, x: W, y: W, m: const W) {
+        select(c, x, y) & m => select(c, x & m, 0) if zero_bits(y, m)
+    }
+```
+
+- `select(r:1, p, q >>u 4) & 0xf0` → `select(r:1, p & 0xf0, 0)`
+
+#### `mask_select_zero_then` — rule
+
+```text
+rule mask_select_zero_then<W>(c: 1, x: W, y: W, m: const W) {
+        select(c, x, y) & m => select(c, 0, y & m) if zero_bits(x, m)
+    }
+```
+
+- `select(r:1, q >>u 4, p) & 0xf0` → `select(r:1, 0, p & 0xf0)`
 
 #### `select_by_mask` — rule
 

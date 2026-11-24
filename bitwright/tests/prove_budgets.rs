@@ -224,3 +224,60 @@ fn weighted_byte_sums_under_shared_operations() {
         assert_eq!(label(&out), "refuted");
     }
 }
+
+#[cfg(feature = "mba")]
+#[test]
+fn prefix_narrowed_congruence_and_joint_assumptions_decide_without_sat() {
+    let cfg = Config::default()
+        .with_max_conflicts(200)
+        .with_max_propagations(10_000)
+        .with_sweeping(false);
+    // Top 2 bits of `lhs` and `rhs` differ, so full-width equality is false,
+    // yet `* 4`, `<< 2`, `trunc<62>`, and `& 0x3fffffffffffffff` all prove equal.
+    let setup = "\
+        let lhs = (x:64 & y:64)*3 + (x & ~y)*3 + (z:64 & 3) * 0x4000000000000000 + w:64; \
+        let rhs = x*3 + w;";
+    for valid_cmp in [
+        "lhs * 4 == rhs * 4",
+        "(lhs << 2) == (rhs << 2)",
+        "trunc<62>(lhs) == trunc<62>(rhs)",
+        "(lhs & 0x3fffffffffffffff) == (rhs & 0x3fffffffffffffff)",
+        "(((lhs * 4) | 0x11) <=u k) == (((rhs * 4) | 0x11) <=u k)",
+    ] {
+        let (out, stats) = ask(&format!("{setup}{valid_cmp}"), Width::W64, &cfg);
+        assert_eq!(label(&out), "proved", "{valid_cmp}");
+        assert!(stats.simplification.decided && stats.nodes == 0, "{valid_cmp}: {stats:?}");
+    }
+    // One bit narrower shift leaves bit 63 observable: must refute.
+    let (out, _) = ask(&format!("{setup}(lhs << 1) == (rhs << 1)"), Width::W64, &cfg);
+    assert_eq!(label(&out), "refuted");
+
+    // Joint simplification under explicit `Assumptions` exposes a guard controlling a select
+    // whose dead branch contains an expensive expression.
+    let mut cx = Context::new();
+    let parse = ParseOptions::width(Width::W64);
+    let assume_expr = cx.parse("0 <=s x:64", &parse).unwrap();
+    let mut assumptions = bitwright::Assumptions::new();
+    assumptions.assume_true(&mut cx, assume_expr).unwrap();
+    let goal = cx
+        .parse(
+            "let dead = (x*x + y*y) * (z*z + 1); \
+             let v = select((x & 0x8000000000000000) != 0, dead, \
+                            (x & y)*5 + (x & ~y)*5 - x*5); \
+             v == 0",
+            &parse,
+        )
+        .unwrap();
+    let mut q = Question::valid_under(&mut cx, goal, Some(&assumptions), &cfg).unwrap();
+    let out = q.solve(&mut cx, cfg.limits()).unwrap();
+    assert_eq!(label(&Some(out)), "proved");
+    assert!(q.stats().simplification.decided && q.stats().nodes == 0, "{:?}", q.stats());
+
+    // Bounded affine rebasing proves an equality over `(x << 3) + 0x18` without SAT.
+    let rebased = "let p = (x:64 << 3) + 0x18; \
+                   let q = ((x + 3) << 3); \
+                   ((p & 0xff) ^ (p & ~0xff)) + (x * 7) == ((q | 0xff) & (q | ~0xff)) + (x * 7)";
+    let (out, stats) = ask(rebased, Width::W64, &cfg);
+    assert_eq!(label(&out), "proved");
+    assert!(stats.simplification.decided && stats.nodes == 0, "{stats:?}");
+}

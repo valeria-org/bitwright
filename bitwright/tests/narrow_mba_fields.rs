@@ -97,3 +97,17 @@ let %6 = trunc<32>(~(%0 - (%2 & 0x3001ffe53ab1)));
     let env = FnEnv(|_: &SymbolKey, w: Width| Some(BitVec::wrapping_from_u64(w, 16)));
     assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(0x052f_d5a8));
 }
+
+#[test]
+fn truncated_constant_handles_mixed_narrow_terms_and_cancelling_atoms() {
+    let eng = Engine::standard();
+    let mut cx = Context::new();
+    // Mixes a wide truncated sum with a plain narrow term and a shared unrestricted word
+    // `w = a*a + b` that cancels algebraically before column evaluation.
+    let src = "let w = a:64 * a + b:64; \
+               let s = (x:64 & y:64)*3 + (x & ~y)*3 + w; \
+               trunc<32>(s) - trunc<32>(w) - trunc<32>(x)*3 + z:32 - z";
+    let input = cx.parse(src, &ParseOptions::default()).unwrap();
+    let out = eng.simplify(&mut cx, input).unwrap().expr;
+    assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(0));
+}

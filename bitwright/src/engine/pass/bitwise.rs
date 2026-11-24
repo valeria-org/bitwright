@@ -580,6 +580,12 @@ pub(crate) struct Masked {
     classes: Vec<(BitVec, Vec<u8>)>,
     /// The region's operators.
     ops: u32,
+    /// Finality of any known-bit facts read on the atoms.
+    fin: Fin,
+    /// Whether any atom's known bits folded a class.
+    used_known: bool,
+    /// Known bits of each atom in `atoms` order (populated when `use_known` is set).
+    atom_known: [Option<(crate::facts::KnownBits, Fin)>; 3],
 }
 
 impl Masked {
@@ -593,8 +599,17 @@ impl Masked {
 /// three atoms and [`MAX_MASKS`] constants.
 pub(in crate::engine) fn masked(
     r: &mut Runner<'_, '_>,
-    cx: &Context,
+    cx: &mut Context,
     roots: &[u32],
+) -> Result<Option<Masked>, Stop> {
+    masked_with(r, cx, roots, false)
+}
+
+fn masked_with(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    roots: &[u32],
+    use_known: bool,
 ) -> Result<Option<Masked>, Stop> {
     /// A region node: an atom (its index), a constant (its index), or an operator over slots.
     #[derive(Clone, Copy)]
@@ -687,7 +702,6 @@ pub(in crate::engine) fn masked(
     for (v, &k) in by_index.iter().enumerate() {
         var[k] = VARS[v];
     }
-    atoms.sort_unstable();
     let w = cx.width_of(roots[0]);
     let values: Vec<BitVec> = consts
         .iter()
@@ -706,6 +720,40 @@ pub(in crate::engine) fn masked(
         }
         return Ok(None);
     }
+    let mut atom_known: [Option<(crate::facts::KnownBits, Fin)>; 3] = [None, None, None];
+    if use_known {
+        for (k, &a) in atoms.iter().enumerate() {
+            if r.assumptions.is_none() && cx.node(a).op == OpCode::Sym {
+                continue;
+            }
+            let (kb, f) = super::known(r, cx, a)?;
+            if let Some(kb) = kb
+                && !kb.known().is_zero()
+            {
+                atom_known[k] = Some((kb, f));
+            }
+        }
+    }
+    let mut sorted_known: [Option<(crate::facts::KnownBits, Fin)>; 3] = [None, None, None];
+    for (v, &k) in by_index.iter().enumerate() {
+        sorted_known[v] = atom_known[k];
+    }
+    atoms.sort_unstable();
+    // Without constant masks, split on partial known-bit masks of up to two atoms so
+    // disjoint-bit combinations (e.g. `(x >>u 5) | (y << 3)`) can still collapse.
+    if use_known && splits.is_empty() {
+        for (kb, _) in atom_known.iter().flatten() {
+            let m = kb.known();
+            if !m.is_zero() && !m.is_ones() && !splits.contains(&m) {
+                splits.push(m);
+                if splits.len() == 2 {
+                    break;
+                }
+            }
+        }
+    }
+    let mut fin = Fin::FINAL;
+    let mut used_known = false;
     let mut classes: Vec<(BitVec, Vec<u8>)> = Vec::new();
     let mut vals: Vec<u8> = vec![0; slots.len()];
     for pattern in 0..1usize << splits.len() {
@@ -725,10 +773,27 @@ pub(in crate::engine) fn masked(
         r.meter
             .charge(Counter::PassWork, slots.len() as u64 / 4 + 1)?;
         // Every slot's table in this class (a constant is all-ones on a class exactly when its
-        // bits there are set: the class lies within it or outside it).
+        // bits there are set: the class lies within it or outside it). An atom whose known
+        // bits fix every position of this class folds to 0x00 or 0xFF here.
         for (k, slot) in slots.iter().enumerate() {
             vals[k] = match *slot {
-                Slot::Atom(a) => var[a],
+                Slot::Atom(a) => match &atom_known[a] {
+                    Some((kb, f))
+                        if BitVec::bin_unchecked(BinOp::And, &kb.known_zero(), &mask) == mask =>
+                    {
+                        fin = fin.and(*f);
+                        used_known = true;
+                        0x00
+                    }
+                    Some((kb, f))
+                        if BitVec::bin_unchecked(BinOp::And, &kb.known_one(), &mask) == mask =>
+                    {
+                        fin = fin.and(*f);
+                        used_known = true;
+                        0xFF
+                    }
+                    _ => var[a],
+                },
                 Slot::Const(c) => {
                     if BitVec::bin_unchecked(BinOp::And, &values[c], &mask) == mask {
                         0xFF
@@ -757,6 +822,9 @@ pub(in crate::engine) fn masked(
         consts,
         classes,
         ops,
+        fin,
+        used_known,
+        atom_known: sorted_known,
     }))
 }
 
@@ -764,23 +832,23 @@ pub(in crate::engine) fn masked(
 /// their masked descriptions: equal tables in every class, or complementary ones in a class.
 pub(super) fn equal(
     r: &mut Runner<'_, '_>,
-    cx: &Context,
+    cx: &mut Context,
     a: u32,
     b: u32,
-) -> Result<Option<bool>, Stop> {
+) -> Result<(Option<bool>, Fin), Stop> {
     if !bitwise_op(cx.node(a).op) && !bitwise_op(cx.node(b).op) {
-        return Ok(None);
+        return Ok((None, Fin::FINAL));
     }
-    let Some(m) = masked(r, cx, &[a, b])? else {
-        return Ok(None);
+    let Some(m) = masked_with(r, cx, &[a, b], true)? else {
+        return Ok((None, Fin::FINAL));
     };
     if m.classes.iter().all(|(_, t)| t[0] == t[1]) {
-        return Ok(Some(true));
+        return Ok((Some(true), m.fin));
     }
     if m.classes.iter().any(|(_, t)| t[0] == !t[1]) {
-        return Ok(Some(false));
+        return Ok((Some(false), m.fin));
     }
-    Ok(None)
+    Ok((None, m.fin.unchanged()))
 }
 
 /// The operators and constants a template adds.
@@ -796,6 +864,8 @@ fn cost(tt: u8) -> u32 {
 /// `u` elsewhere.
 #[derive(Clone, Copy)]
 enum Split {
+    /// A single form valid on every bit position (no mask needed).
+    Direct(u8),
     /// `f_t & mask`.
     And(u8),
     /// `f_t | mask` (the mask's bits all-ones).
@@ -808,27 +878,39 @@ enum Split {
 
 /// The bitwise pass at `n` for a function with constants: its masked description written
 /// as the module notes say, when that is smaller.
-fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
-    let Some(m) = masked(r, cx, &[n])? else {
+fn masked_step(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    require_known: bool,
+) -> Result<Step, Stop> {
+    let Some(m) = masked_with(r, cx, &[n], true)? else {
         return Ok(Step::Normal(Fin::FINAL));
     };
-    if m.consts.is_empty() || m.classes.len() > 2 {
-        return Ok(Step::Normal(Fin::FINAL));
+    if (require_known && !m.used_known) || m.classes.len() > 2 {
+        return Ok(Step::Normal(m.fin.unchanged()));
     }
     // A rewrite frees at most the region's operators: a form needing as many is not smaller.
-    let cheapest = |t: u8| cost(t) + 1;
     let floor = match &m.classes[..] {
         [(_, t)] => cost(t[0]),
-        [(_, t), (_, u)] => cheapest(t[0]).min(cheapest(u[0])),
+        [(_, t), (_, u)] => cost(t[0]).min(cost(u[0])),
         _ => u32::MAX,
     };
     if floor >= m.ops {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(m.fin.unchanged()));
     }
     let mut canon = m.atoms.clone();
     canon.sort_by(|a, b| cx.order(*a, *b));
     let tt = |t: u8| remap(t, &m.atoms, &canon);
     let w = cx.width_of(n);
+    let mut canon_known: [Option<(crate::facts::KnownBits, Fin)>; 3] = [None, None, None];
+    if m.classes.len() == 2 {
+        for (k, &a) in canon.iter().enumerate() {
+            if let Some(p) = m.atoms.iter().position(|&b| b == a) {
+                canon_known[k] = m.atom_known[p];
+            }
+        }
+    }
     // Each candidate: the function, its mask, and the nodes it adds (a mask that is not one of
     // the constants already there is one more).
     let is_old = |v: &BitVec| {
@@ -842,12 +924,34 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
             best = Some((c, s));
         }
     };
+    let mut fin = m.fin;
     if let [(_, t)] = &m.classes[..] {
         offer(cost(tt(t[0])), None);
     } else {
         for (x, y) in [(0, 1), (1, 0)] {
             let (mask, t) = (m.classes[x].0, tt(m.classes[x].1[0]));
-            let u = tt(m.classes[y].1[0]);
+            let (other, u) = (m.classes[y].0, tt(m.classes[y].1[0]));
+            // If an atom is already known zero on `other` (or known one on `mask`), it agrees
+            // with the constant class without needing an explicit `& mask` / `| mask`.
+            if u == 0x00
+                && let Some(v) = VARS[..canon.len()].iter().position(|&b| b == t)
+                && let Some((kb, f)) = &canon_known[v]
+                && BitVec::bin_unchecked(BinOp::And, &kb.known_zero(), &other) == other
+            {
+                fin = fin.and(*f);
+                offer(0, Some((Split::Direct(t), mask)));
+            }
+            if t == 0xFF
+                && let Some(v) = VARS[..canon.len()].iter().position(|&b| b == u)
+                && let Some((kb, f)) = &canon_known[v]
+                && BitVec::bin_unchecked(BinOp::And, &kb.known_one(), &mask) == mask
+            {
+                fin = fin.and(*f);
+                offer(0, Some((Split::Direct(u), mask)));
+            }
+            if m.consts.is_empty() {
+                continue;
+            }
             let extra = 1 + u32::from(!is_old(&mask));
             if u == 0x00 {
                 offer(cost(t) + extra, Some((Split::And(t), mask)));
@@ -865,16 +969,16 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
         }
     }
     let Some((estimate, split)) = best else {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(fin.unchanged()));
     };
     if estimate >= m.ops {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(fin.unchanged()));
     }
     let mut bounds = m.atoms.clone();
     bounds.extend(&m.consts);
     if let Some(f) = worth_building(r, cx, n, &bounds, estimate)? {
         r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
-        return Ok(Step::Normal(Fin::FINAL.and(f)));
+        return Ok(Step::Normal(fin.unchanged().and(f)));
     }
     let before = cx.len() as u32;
     let form = |r: &mut Runner<'_, '_>, cx: &mut Context, t: u8| -> Result<u32, Stop> {
@@ -891,9 +995,11 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
     };
     let e = match split {
         None => form(r, cx, tt(m.classes[0].1[0]))?,
+        Some((Split::Direct(t), _)) => form(r, cx, t)?,
         Some((split, mask)) => {
             let k = r.build(cx, |cx| cx.mk_const(&mask))?;
             match split {
+                Split::Direct(_) => unreachable!(),
                 Split::And(t) => {
                     let f = form(r, cx, t)?;
                     r.build(cx, |cx| cx.c_bin(BinOp::And, f, k))?
@@ -914,7 +1020,7 @@ fn masked_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step,
             }
         }
     };
-    finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, Fin::FINAL)
+    finish(r, cx, PassKind::Bitwise, n, e, before, &bounds, fin)
 }
 
 /// The most nodes a one-atom region walks.
@@ -1388,7 +1494,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     // More than three atoms (constants included): `n` is an atom itself, read first by classes
     // of bit positions, where the constants are not atoms.
     let first = if atoms == [n] {
-        match masked_step(r, cx, n)? {
+        match masked_step(r, cx, n, false)? {
             Step::Normal(f) => match one_atom_step(r, cx, n)? {
                 Step::Normal(g) => Step::Normal(f.and(g)),
                 done => done,
@@ -1396,7 +1502,22 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             done => done,
         }
     } else {
-        write(r, cx, n, &atoms, tt, Fin::FINAL)?
+        match write(r, cx, n, &atoms, tt, Fin::FINAL)? {
+            Step::Normal(f)
+                if cx.node(n).children().any(|c| bitwise_op(cx.node(c).op))
+                    && (cx.node(n).op == OpCode::Xor
+                        || atoms.iter().any(|&a| {
+                            cx.const_val(a)
+                                .is_some_and(|v| !v.is_zero() && !v.is_ones())
+                        })) =>
+            {
+                match masked_step(r, cx, n, true)? {
+                    Step::Normal(g) => Step::Normal(f.and(g)),
+                    done => done,
+                }
+            }
+            done => done,
+        }
     };
     let mut fin = match first {
         Step::Normal(f) => f.and(hoisted),

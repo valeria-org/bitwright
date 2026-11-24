@@ -118,6 +118,27 @@ fn push_term(out: &mut Vec<(u32, u64)>, i: u32, k: u64) -> Option<()> {
     Some(())
 }
 
+/// Merge identical additive terms and drop any whose combined coefficient vanishes
+/// modulo `2^bits` (`mask = (1 << bits) - 1`). Cancelling equal terms up front avoids
+/// spending lane/table atom slots on unrestricted words that disappear algebraically.
+pub(super) fn cancel_parts(parts: &mut Vec<(u32, u64)>, mask: u64, work: &mut Work) -> Option<()> {
+    if parts.len() <= 1 {
+        parts.retain(|&(_, k)| k & mask != 0);
+        return Some(());
+    }
+    work.take((parts.len() * 6) as u64)?;
+    parts.sort_unstable_by_key(|&(id, _)| id);
+    parts.dedup_by(|next, prev| {
+        if next.0 != prev.0 {
+            return false;
+        }
+        prev.1 = prev.1.wrapping_add(next.1);
+        true
+    });
+    parts.retain(|&(_, k)| k & mask != 0);
+    Some(())
+}
+
 /// `bias + Σ c_t·bit(x,t)` for a sum of masked multiples of one word. A coefficient
 /// `-2^b` is `+2^b` on the complemented source bit, minus `2^b` in the bias. Wherever
 /// the resulting fields don't overlap there's no carry: those output bits are wires.
@@ -203,10 +224,38 @@ fn projection(cx: &Context, i: u32, work: &mut Work) -> Option<Projection> {
 struct Lane {
     keys: [(u32, u16); 4],
     len: usize,
+    memo: crate::hash::IdMap<(u32, u16), u16>,
 }
 impl Lane {
+    fn clear(&mut self) {
+        self.len = 0;
+        self.memo.clear();
+    }
+
+    fn sym(&mut self, i: u32, j: u16) -> Option<u16> {
+        let key = (i, j);
+        let at = match self.keys[..self.len].iter().position(|k| *k == key) {
+            Some(at) => at,
+            None => {
+                *self.keys.get_mut(self.len)? = key;
+                self.len += 1;
+                self.len - 1
+            }
+        };
+        Some(VAR[at])
+    }
+
     fn bit(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u16> {
         work.take(1)?;
+        if let Some(&v) = self.memo.get(&(i, j)) {
+            return Some(v);
+        }
+        let x = self.bit_uncached(cx, i, j, depth, work)?;
+        self.memo.insert((i, j), x);
+        Some(x)
+    }
+
+    fn bit_uncached(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u16> {
         let d = depth.checked_sub(1)?;
         let n = cx.node(i);
         let w = n.width;
@@ -239,21 +288,42 @@ impl Lane {
             OpCode::And | OpCode::Or | OpCode::Xor => {
                 // The constructors put constant masks on the right. A masked-out bit
                 // has no source: don't spend a free column (or fuel) tracing it.
-                if matches!(n.op, OpCode::And | OpCode::Or)
-                    && let Some(k) = scalar(cx, n.b)
-                {
+                if let Some(k) = scalar(cx, n.b) {
                     let set = j < 64 && k & (1u64 << j) != 0;
+                    if n.op == OpCode::Xor {
+                        let a = self.bit(cx, n.a, j, d, work)?;
+                        return Some(if set { !a } else { a });
+                    }
                     if (n.op == OpCode::Or) == set {
                         return Some(if set { u16::MAX } else { 0 });
                     }
                     return self.bit(cx, n.a, j, d, work);
                 }
                 let a = self.bit(cx, n.a, j, d, work)?;
+                if (n.op == OpCode::Or && a == u16::MAX) || (n.op == OpCode::And && a == 0) {
+                    return Some(a);
+                }
                 let b = self.bit(cx, n.b, j, d, work)?;
                 match n.op {
                     OpCode::And => a & b,
                     OpCode::Or => a | b,
                     _ => a ^ b,
+                }
+            }
+            OpCode::Select if scalar(cx, n.b).is_some() || scalar(cx, n.c).is_some() => {
+                let a = self.bit(cx, n.b, j, d, work)?;
+                let b = self.bit(cx, n.c, j, d, work)?;
+                if a == b {
+                    a
+                } else {
+                    let (cond, flip) = if cx.node(n.a).op == OpCode::Not {
+                        (cx.node(n.a).a, true)
+                    } else {
+                        (n.a, false)
+                    };
+                    let c = self.sym(cond, 0)?;
+                    let c = if flip { !c } else { c };
+                    (c & a) | (!c & b)
                 }
             }
             OpCode::Zext | OpCode::Sext => {
@@ -288,18 +358,21 @@ impl Lane {
                 };
                 self.bit(cx, n.a, src as u16, d, work)?
             }
-            _ => {
-                let key = (i, j);
-                let at = match self.keys[..self.len].iter().position(|k| *k == key) {
-                    Some(at) => at,
-                    None => {
-                        *self.keys.get_mut(self.len)? = key;
-                        self.len += 1;
-                        self.len - 1
-                    }
+            OpCode::Mul if scalar(cx, n.b).is_some() || scalar(cx, n.a).is_some() => {
+                let (x, k) = match scalar(cx, n.b) {
+                    Some(k) => (n.a, k),
+                    None => (n.b, scalar(cx, n.a)?),
                 };
-                VAR[at]
+                let tz = k.trailing_zeros() as u16;
+                if j < tz {
+                    0
+                } else if j == tz && k != 0 {
+                    self.bit(cx, x, 0, d, work)?
+                } else {
+                    return self.sym(i, j);
+                }
             }
+            _ => return self.sym(i, j),
         };
         Some(x)
     }
@@ -315,6 +388,7 @@ fn constant(
     let mut sum = 0u64;
     parts.clear();
     terms(cx, x, 1, &mut sum, parts, 96, false, work)?;
+    cancel_parts(parts, mask, work)?;
     Some(sum.wrapping_add(constant_lanes(cx, parts, bits, work)?) & mask)
 }
 
@@ -328,14 +402,49 @@ pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left
     result
 }
 
-/// Compare two additive layers jointly. The unrestricted words that occur on both sides
-/// cancel before tracing bits; the remaining weighted Boolean terms need at most four
-/// independent source bits per column, not four bits across the whole word.
-pub(in crate::engine::pass) fn equal_sums(
-    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32,
+/// Prove that a width-`<= 64` node `root` equals constant `expected` by flattening its
+/// additive layer and checking each bit column independently.
+pub(super) fn constant_word(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    root: u32,
+    expected: &BitVec,
 ) -> Result<bool, Stop> {
-    let bits = cx.wid(a);
-    if bits != cx.wid(b) || bits > 64 || !is_sum(cx, a) || !is_sum(cx, b) {
+    let w = cx.wid(root);
+    let Some(want) = expected.to_u64() else {
+        return Ok(false);
+    };
+    if w == 0 || w > 64 {
+        return Ok(false);
+    }
+    const LIMIT: u64 = 4096;
+    let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(LIMIT);
+    let mut work = Work::new(budget);
+    let proved = (|| {
+        let mask = u64::MAX >> (64 - w);
+        let mut parts = Vec::new();
+        let mut bias = 0u64;
+        terms(cx, root, 1, &mut bias, &mut parts, 64, false, &mut work)?;
+        cancel_parts(&mut parts, mask, &mut work)?;
+        let value = constant_lanes(cx, &parts, w, &mut work)?;
+        Some(bias.wrapping_add(value) & mask == want & mask)
+    })();
+    r.meter.charge(Counter::PassWork, budget - work.left)?;
+    Ok(proved == Some(true))
+}
+
+/// Compare two additive layers jointly modulo `2^bits`. The unrestricted words that occur
+/// on both sides cancel before tracing bits; the remaining weighted Boolean terms need at
+/// most four independent source bits per column, not four bits across the whole word.
+pub(in crate::engine::pass) fn equal_sums(
+    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32, bits: u16,
+) -> Result<bool, Stop> {
+    if bits == 0 {
+        return Ok(true);
+    }
+    let wa = cx.wid(a);
+    let has_sum = |i| matches!(cx.node(i).op, OpCode::Add | OpCode::Sub | OpCode::Neg);
+    if wa != cx.wid(b) || wa > 64 || bits > wa || !(has_sum(a) || has_sum(b)) {
         return Ok(false);
     }
     let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
@@ -346,16 +455,7 @@ pub(in crate::engine::pass) fn equal_sums(
         let mut bias = 0;
         terms(cx, a, 1, &mut bias, &mut parts, 64, false, &mut work)?;
         terms(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, &mut work)?;
-        work.take((parts.len() * 8) as u64)?; // sorting at most 96 terms
-        parts.sort_unstable_by_key(|&(id, _)| id);
-        parts.dedup_by(|next, prev| {
-            if next.0 != prev.0 {
-                return false;
-            }
-            prev.1 = prev.1.wrapping_add(next.1);
-            true
-        });
-        parts.retain(|&(_, k)| k & mask != 0);
+        cancel_parts(&mut parts, mask, &mut work)?;
         let value = constant_lanes(cx, &parts, bits, &mut work)?;
         Some(bias.wrapping_add(value) & mask == 0)
     })();
@@ -366,6 +466,7 @@ pub(in crate::engine::pass) fn equal_sums(
 /// Truncation is a ring homomorphism: the outer weights can be applied to the
 /// wide additive terms, provided we check every column modulo the *narrow*
 /// width. High slices, unlike low slices, can observe carries from below.
+/// Plain width-`bits` terms may mix with low truncations in the same sum.
 pub(in crate::engine::pass) fn truncated_constant(
     r: &mut Runner<'_, '_>,
     cx: &Context,
@@ -373,16 +474,19 @@ pub(in crate::engine::pass) fn truncated_constant(
     bias: &BitVec,
 ) -> Result<Option<BitVec>, Stop> {
     let bits = bias.width().bits();
-    if bits > 64 || !(2..=8).contains(&terms_in.len()) {
+    if bits > 64 || !(1..=32).contains(&terms_in.len()) {
         return Ok(None);
     }
     let mut crosses_sum = false;
     for &(i, _) in terms_in {
         let n = cx.node(i);
-        if n.op != OpCode::Extract || n.b != 0 || cx.node(n.a).width > 64 {
+        if n.op == OpCode::Extract && n.b == 0 && cx.node(n.a).width <= 64 {
+            let src = cx.node(n.a);
+            crosses_sum |= matches!(src.op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not)
+                || (src.op == OpCode::Mul && (cx.is_const(src.a) || cx.is_const(src.b)));
+        } else if n.width != bits {
             return Ok(None);
         }
-        crosses_sum |= matches!(cx.node(n.a).op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not);
     }
     // Direct truncations of registers have no hidden sum to flatten.
     if !crosses_sum {
@@ -391,11 +495,19 @@ pub(in crate::engine::pass) fn truncated_constant(
     const LIMIT: u64 = 8192;
     let mut work = Work::new(LIMIT);
     let value = (|| {
+        let mask = u64::MAX >> (64 - bits);
         let mut sum = bias.to_u64()?;
         let mut parts = Vec::new();
         for &(i, k) in terms_in {
-            terms(cx, cx.node(i).a, k.to_u64()?, &mut sum, &mut parts, 64, false, &mut work)?;
+            let n = cx.node(i);
+            let src = if n.op == OpCode::Extract && n.b == 0 && cx.node(n.a).width <= 64 {
+                n.a
+            } else {
+                i
+            };
+            terms(cx, src, k.to_u64()?, &mut sum, &mut parts, 64, false, &mut work)?;
         }
+        cancel_parts(&mut parts, mask, &mut work)?;
         let k = constant_lanes(cx, &parts, bits, &mut work)?;
         Some(BitVec::wrapping_from_u64(bias.width(), sum.wrapping_add(k)))
     })();
@@ -406,8 +518,9 @@ pub(in crate::engine::pass) fn truncated_constant(
 fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work) -> Option<u64> {
     let mut sum = 0u64;
     let mask = u64::MAX >> (64 - bits);
+    let mut lane = Lane::default();
     for j in 0..bits {
-        let mut lane = Lane::default();
+        lane.clear();
         let mut values = [0u64; 16];
         for &(t, k) in parts {
             let coeff = (k << j) & mask;
@@ -443,6 +556,7 @@ pub(super) struct Rows {
     atoms: [((u32, u64), bool, u32); 2],
     len: usize,
     cut: Option<u32>,
+    memo: crate::hash::IdMap<u32, [u64; 4]>,
 }
 
 impl Rows {
@@ -471,28 +585,33 @@ impl Rows {
 
     pub(super) fn read(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<[u64; 4]> {
         work.take(1)?;
+        if let Some(&v) = self.memo.get(&i) {
+            return Some(v);
+        }
         let d = depth.checked_sub(1)?;
         let n = cx.node(i);
-        match n.op {
-            _ if self.cut == Some(i) => self.atom(cx, i),
-            OpCode::Const => Some([scalar(cx, i)?; 4]),
-            OpCode::Not => Some(self.read(cx, n.a, d, work)?.map(|x| !x)),
+        let v = match n.op {
+            _ if self.cut == Some(i) => self.atom(cx, i)?,
+            OpCode::Const => [scalar(cx, i)?; 4],
+            OpCode::Not => self.read(cx, n.a, d, work)?.map(|x| !x),
             OpCode::And | OpCode::Or | OpCode::Xor => {
                 let a = self.read(cx, n.a, d, work)?;
                 let b = self.read(cx, n.b, d, work)?;
-                Some(std::array::from_fn(|r| match n.op {
+                std::array::from_fn(|r| match n.op {
                     OpCode::And => a[r] & b[r],
                     OpCode::Or => a[r] | b[r],
                     _ => a[r] ^ b[r],
-                }))
+                })
             }
             OpCode::Select if scalar(cx, n.b).is_some() && scalar(cx, n.c).is_some() => {
                 let yes = scalar(cx, n.b)?;
                 let no = scalar(cx, n.c)?;
-                Some(self.atom(cx, n.a)?.map(|c| (yes & c) | (no & !c)))
+                self.atom(cx, n.a)?.map(|c| (yes & c) | (no & !c))
             }
-            _ => self.atom(cx, i),
-        }
+            _ => self.atom(cx, i)?,
+        };
+        self.memo.insert(i, v);
+        Some(v)
     }
 }
 
@@ -762,17 +881,16 @@ pub(super) fn reduce_columns(
         return Ok(Some(v));
     }
     let compared = equality && is_sum(cx, n.a);
-    // `zext(low) | tag` also compares a field: the tag fixes some bits,
-    // including, commonly, all the high ones. Decode the sums feeding the
-    // low word as for an AND-mask, before a general MBA search spends fuel
-    // on their unrelated inputs. A complemented tag reads the same field.
+    // `zext(low) | tag`, `zext(low) ^ tag`, `concat(tag, low)` and complemented masks all
+    // compare a field: decode the sums feeding the field before a general MBA search spends
+    // fuel on their unrelated inputs.
     let field = matches!(n.op, OpCode::Extract | OpCode::Not) || (equality && {
         let lhs = cx.node(n.a);
         let value = if lhs.op == OpCode::Not { cx.node(lhs.a) } else { lhs };
-        matches!(lhs.op, OpCode::Extract | OpCode::And)
-            || (value.op == OpCode::Or
-                && cx.node(value.a).op == OpCode::Zext
-                && cx.const_val(value.b).is_some())
+        matches!(value.op, OpCode::Extract | OpCode::And | OpCode::Concat)
+            || (matches!(value.op, OpCode::Or | OpCode::Xor)
+                && cx.const_val(value.b).is_some()
+                && matches!(cx.node(value.a).op, OpCode::Zext | OpCode::And | OpCode::Extract))
     });
     if !compared && !field {
         return Ok(None);

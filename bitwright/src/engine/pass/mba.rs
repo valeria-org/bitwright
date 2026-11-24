@@ -423,13 +423,13 @@ fn sweep_inner(
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
-    if fold_cases && (128..=4096).contains(&order.len())
+    if fold_cases && (32..=4096).contains(&order.len())
         && let Some(e) = guard_domain::specialize(r, cx, cfg, root, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
-    if fold_cases && (128..=4096).contains(&order.len())
+    if fold_cases && (32..=4096).contains(&order.len())
         && let Some(e) = field_guard::specialize(r, cx, root, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
@@ -778,6 +778,16 @@ fn sweep_inner(
             continue;
         }
         let mut budget_starved = false;
+        if !decided
+            && !refuted
+            && mixed
+            && (asked!('nodes, opaque_predicate::constant_word(r, cx, subject, &k))
+                || (subject != cur
+                    && asked!('nodes, opaque_predicate::constant_word(r, cx, cur, &k))))
+        {
+            count(r).opaque_asked += 1;
+            decided = true;
+        }
         if !decided && !refuted && mixed {
             let seen;
             (decided, refuted, seen, budget_starved) =

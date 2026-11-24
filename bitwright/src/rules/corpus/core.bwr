@@ -33,14 +33,6 @@ group core.bitwise {
     #[example("(q & 15) & 0x3f" => "q & 15")]
     rule and_mask_redundant<W>(x: W, c: const W) { x & c => x if zero_bits(x, ~c) }
 
-    /// Inside m the union minus the overlap is the xor of x and (s | y).
-    /// Outside m the union is zero only because s fits inside m.
-    #[example("~(p & ((r >>u 5) | q)) & ((r >>u 5) | ((p | q) & 7))" => "(p ^ ((r >>u 5) | q)) & 7")]
-    rule masked_union_minus_overlap<W>(x: W, y: W, s: W, m: const W) {
-        ~(x & (s | y)) & (s | ((x | y) & m)) => (x ^ (s | y)) & m
-        if zero_bits(s, ~m)
-    }
-
     /// A mask that keeps none of the bits the value may have set.
     #[example("(q & 0xf0) & 15" => "0:8")]
     rule and_mask_disjoint<W>(x: W, c: const W) { x & c => 0 if zero_bits(x, c) }
