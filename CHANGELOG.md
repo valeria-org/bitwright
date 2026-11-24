@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.9
+
+- The MBA sweep's exhaustive enumeration keeps its arena-sized buffers (a mark, a demand and
+  a place per node, all zero between sweeps) for the next call on the same thread instead of
+  making them anew per call. In a context kept across calls (a devirtualizer's prover) that
+  was a fill of the whole arena per call: replayed validity questions from EA.sys's
+  DriverEntry take 5% fewer cycles, with the same answers.
+
 ## 0.32.8
 
 - An engine keeps the words pass's questions that found nothing across its calls, keyed by

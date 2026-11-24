@@ -86,6 +86,14 @@ pub(crate) struct State {
     pub(crate) shared: crate::hash::IdMap<(u32, u32, u32, bool), Vec<u32>>,
 }
 
+impl Drop for State {
+    /// The call's enumeration buffers outlive it, for the next call on this thread (see
+    /// [`Exhaust::ready`]).
+    fn drop(&mut self) {
+        Exhaust::keep(std::mem::take(&mut self.exhaust));
+    }
+}
+
 /// [`shared_nodes`] of `root` (with `whole`, [`shared_nodes_whole`]), read once per call: the
 /// list is a function of the nodes below `root`, which do not change.
 fn shared(
@@ -1071,6 +1079,7 @@ fn narrow_field(
         return Ok(None);
     };
     r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    r.mba.exhaust.ready();
     let sc = &mut r.mba.exhaust;
     if sc.sweep(cx, root) != Swept::Whole {
         return Ok(None);
@@ -1163,6 +1172,7 @@ fn exhaustive(
     k: &crate::BitVec,
 ) -> Result<Option<bool>, Stop> {
     // The call's buffers, taken for the decision (nothing below asks another).
+    r.mba.exhaust.ready();
     let mut sc = std::mem::take(&mut r.mba.exhaust);
     let out = exhaustive_in(r, cx, &mut sc, root, k);
     r.mba.exhaust = sc;
@@ -1710,7 +1720,42 @@ fn word_of(cx: &Context, i: u32, n: &crate::expr::Node) -> Option<u64> {
     Some(u64::from(n.a) | (u64::from(n.b) << 32))
 }
 
+std::thread_local! {
+    /// The arena-sized buffers of the last call on this thread that used them (see
+    /// [`Exhaust::ready`]).
+    static EXHAUST_FREE: core::cell::RefCell<Option<Exhaust>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 impl Exhaust {
+    /// Takes this thread's kept buffers when these have none yet. They are sized to the
+    /// arena (a mark, a demand and a place per node) and are all zero between sweeps, which a
+    /// sweep restores before it returns; in a context kept across calls, making them anew
+    /// was a fill of the whole arena per call.
+    fn ready(&mut self) {
+        if self.reach.is_empty()
+            && self.met.is_empty()
+            && let Ok(Some(kept)) = EXHAUST_FREE.try_with(|f| f.borrow_mut().take())
+        {
+            *self = kept;
+        }
+    }
+
+    /// Keeps `ex`'s buffers for the next call on this thread (the larger of two).
+    fn keep(ex: Exhaust) {
+        if ex.reach.is_empty() && ex.met.is_empty() {
+            return;
+        }
+        let _ = EXHAUST_FREE.try_with(|f| {
+            let mut g = f.borrow_mut();
+            if g.as_ref()
+                .is_none_or(|o| o.reach.len() + o.met.len() <= ex.reach.len() + ex.met.len())
+            {
+                *g = Some(ex);
+            }
+        });
+    }
+
     /// The DAG below `root` into `order` and `below`, operands first, with the bits of each
     /// node that reach the root in `demand`, and the symbols with theirs. A node is numbered
     /// after its operands, so from the highest number down every node comes after its users,
