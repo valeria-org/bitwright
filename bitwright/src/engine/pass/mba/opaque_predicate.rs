@@ -237,6 +237,17 @@ impl Lane {
             }
             OpCode::Not => !self.bit(cx, n.a, j, d, work)?,
             OpCode::And | OpCode::Or | OpCode::Xor => {
+                // The constructors put constant masks on the right. A masked-out bit
+                // has no source: don't spend a free column (or fuel) tracing it.
+                if matches!(n.op, OpCode::And | OpCode::Or)
+                    && let Some(k) = scalar(cx, n.b)
+                {
+                    let set = j < 64 && k & (1u64 << j) != 0;
+                    if (n.op == OpCode::Or) == set {
+                        return Some(if set { u16::MAX } else { 0 });
+                    }
+                    return self.bit(cx, n.a, j, d, work);
+                }
                 let a = self.bit(cx, n.a, j, d, work)?;
                 let b = self.bit(cx, n.b, j, d, work)?;
                 match n.op {
@@ -294,15 +305,17 @@ impl Lane {
     }
 }
 
-fn constant(cx: &Context, x: u32, bits: u16, work: &mut Work) -> Option<u64> {
+fn constant(
+    cx: &Context, x: u32, bits: u16, parts: &mut Vec<(u32, u64)>, work: &mut Work,
+) -> Option<u64> {
     if !matches!(cx.node(x).op, OpCode::Add | OpCode::Sub | OpCode::Neg) {
         return None;
     }
     let mask = u64::MAX >> (64 - bits);
     let mut sum = 0u64;
-    let mut parts = Vec::new();
-    terms(cx, x, 1, &mut sum, &mut parts, 96, false, work)?;
-    Some(sum.wrapping_add(constant_lanes(cx, &parts, bits, work)?) & mask)
+    parts.clear();
+    terms(cx, x, 1, &mut sum, parts, 96, false, work)?;
+    Some(sum.wrapping_add(constant_lanes(cx, parts, bits, work)?) & mask)
 }
 
 pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left: &mut u64) -> Option<u64> {
@@ -313,6 +326,41 @@ pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left
     let result = constant_lanes(cx, parts, bits, &mut work);
     *left = work.left;
     result
+}
+
+/// Compare two additive layers jointly. The unrestricted words that occur on both sides
+/// cancel before tracing bits; the remaining weighted Boolean terms need at most four
+/// independent source bits per column, not four bits across the whole word.
+pub(in crate::engine::pass) fn equal_sums(
+    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32,
+) -> Result<bool, Stop> {
+    let bits = cx.wid(a);
+    if bits != cx.wid(b) || bits > 64 || !is_sum(cx, a) || !is_sum(cx, b) {
+        return Ok(false);
+    }
+    let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
+    let mut work = Work::new(budget);
+    let equal = (|| {
+        let mask = u64::MAX >> (64 - bits);
+        let mut parts = Vec::new();
+        let mut bias = 0;
+        terms(cx, a, 1, &mut bias, &mut parts, 64, false, &mut work)?;
+        terms(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, &mut work)?;
+        work.take((parts.len() * 8) as u64)?; // sorting at most 96 terms
+        parts.sort_unstable_by_key(|&(id, _)| id);
+        parts.dedup_by(|next, prev| {
+            if next.0 != prev.0 {
+                return false;
+            }
+            prev.1 = prev.1.wrapping_add(next.1);
+            true
+        });
+        parts.retain(|&(_, k)| k & mask != 0);
+        let value = constant_lanes(cx, &parts, bits, &mut work)?;
+        Some(bias.wrapping_add(value) & mask == 0)
+    })();
+    r.meter.charge(Counter::PassWork, budget - work.left)?;
+    Ok(equal == Some(true))
 }
 
 /// Truncation is a ring homomorphism: the outer weights can be applied to the
@@ -714,8 +762,18 @@ pub(super) fn reduce_columns(
         return Ok(Some(v));
     }
     let compared = equality && is_sum(cx, n.a);
-    let field = matches!(n.op, OpCode::Extract | OpCode::Not)
-        || (equality && matches!(cx.node(n.a).op, OpCode::Extract | OpCode::And));
+    // `zext(low) | tag` also compares a field: the tag fixes some bits,
+    // including, commonly, all the high ones. Decode the sums feeding the
+    // low word as for an AND-mask, before a general MBA search spends fuel
+    // on their unrelated inputs. A complemented tag reads the same field.
+    let field = matches!(n.op, OpCode::Extract | OpCode::Not) || (equality && {
+        let lhs = cx.node(n.a);
+        let value = if lhs.op == OpCode::Not { cx.node(lhs.a) } else { lhs };
+        matches!(lhs.op, OpCode::Extract | OpCode::And)
+            || (value.op == OpCode::Or
+                && cx.node(value.a).op == OpCode::Zext
+                && cx.const_val(value.b).is_some())
+    });
     if !compared && !field {
         return Ok(None);
     }
@@ -734,6 +792,16 @@ pub(super) fn reduce_columns(
         let out = r.build(cx, |cx| cx.rebuild(root, [x, n.b, 0]))?;
         r.meter.charge(Counter::PassWork, budget - work.left)?;
         return Ok((out != root).then_some(out));
+    }
+    // Distinct slices of one computed word look like unrelated atoms to `columns`.
+    // For a literal comparison only constancy matters. Trace each term's bits back
+    // through those slices and check all assignments in each column independently.
+    if compared && parts.len() >= 3 && cx.wid(n.a) <= 64
+        && let Some(k) = constant(cx, n.a, cx.wid(n.a), &mut parts, &mut work)
+    {
+        r.meter.charge(Counter::PassWork, budget - work.left)?;
+        let equal = Some(k) == scalar(cx, n.b);
+        return r.build(cx, |cx| cx.mk_const_u64(1, u64::from(equal == (n.op == OpCode::Eq)))).map(Some);
     }
     if work.take(3 * order.len() as u64).is_none() {
         r.meter.charge(Counter::PassWork, budget - work.left)?;
@@ -1112,8 +1180,9 @@ pub(super) fn folded(
         left: budget,
         projections: Default::default(),
     };
+    let mut parts = Vec::new();
     for (x, y) in [(p.a, p.b), (p.b, p.a)] {
-        if let Some(c) = constant(cx, x, bits, &mut work) {
+        if let Some(c) = constant(cx, x, bits, &mut parts, &mut work) {
             r.meter.charge(Counter::MbaSteps, budget - work.left)?;
             let w = cx.width_of(y);
             let c = r.build(cx, |cx| cx.mk_const(&BitVec::wrapping_from_u64(w, c)))?;
@@ -1165,6 +1234,53 @@ pub(super) fn circuit(
 mod tests {
     use super::*;
     use crate::{FnEnv, ParseOptions, SymbolKey, Width};
+
+    #[test]
+    fn compared_sum_of_four_projected_bits() {
+        use crate::engine::{Budget, Engine, Run, Strategy};
+        use crate::mba::MbaConfig;
+
+        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
+        for (coefficient, op, expected) in [(7, "==", Some(true)), (7, "!=", Some(false)), (8, "==", None)] {
+            let text = format!("let h = x:64 * x + y:64; \
+                let p = extract<0,8>(h) ^ extract<16,8>(h); \
+                let q = extract<8,8>(h) ^ extract<24,8>(h); \
+                zext<64>(p & q)*{coefficient} + zext<64>(~p & q)*7 + \
+                zext<64>(p & ~q)*7 + zext<64>(~p & ~q)*7 {op} 1785");
+            let mut cx = Context::new();
+            let root = cx.parse(&text, &ParseOptions::width(Width::W64)).unwrap();
+            let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+            assert_eq!(cx.as_const(out.roots[0].expr).unwrap(), expected.map(BitVec::from_bool));
+        }
+    }
+
+    #[test]
+    fn tagged_low_word_of_scaled_partition() {
+        use crate::engine::{Budget, Engine, Run, Strategy};
+        use crate::mba::MbaConfig;
+
+        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
+        // The three masks partition the word, giving s = -k if they have
+        // equal weights. The complementary multipliers leave only -s.
+        for (weight, k, tag, lhs, rhs, expected) in [
+            (5, 5, 0x9300, "tagged", 0x9305, Some(true)),
+            (19, 19, 0xa084, "~tagged", 0x5f68, Some(true)),
+            (6, 5, 0x9300, "tagged", 0x9305, None),
+        ] {
+            let text = format!(
+                "let a = x:16 * x + 7; let b = z:16 ^ 0x69ac; \
+                 let s = (a & b)*{weight} + (a & ~b)*{k} + ~a*{k}; \
+                 let low = trunc<8>(s*y:16 + ~y*s); \
+                 let tagged = zext<16>(low) | {tag}; {lhs} == {rhs}"
+            );
+            let mut cx = Context::new();
+            let root = cx.parse(&text, &ParseOptions::width(Width::W16)).unwrap();
+            let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+            assert_eq!(cx.as_const(out.roots[0].expr).unwrap(), expected.map(BitVec::from_bool));
+        }
+    }
 
     #[test]
     fn sparse_zero_product_through_an_encoded_offset() {

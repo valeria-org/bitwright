@@ -192,6 +192,36 @@ fn an_opaque_constant_through_its_atoms_known_bits_is_proved_one() {
 }
 
 #[test]
+fn scaling_discards_the_remaining_difference_between_selected_masks() {
+    use ::bitwright::engine::{Engine, Strategy};
+    use ::bitwright::mba::{MbaConfig, NormalFormSolver};
+    use ::bitwright::{BitVec, Context, FnEnv, ParseOptions, SymbolKey, Width};
+    use std::sync::Arc;
+
+    let arms = "let c = x <s 0; let a = select(c, ~x & 0x140000000, 0); \
+                let b = select(c, ~x & 0xe000000140000000, 0);";
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(Strategy::deobfuscate().with_mba(MbaConfig::default()))
+        .mba_solver(Arc::new(NormalFormSolver::default()))
+        .build()
+        .unwrap();
+    let mut cx = Context::new();
+    let parse = ParseOptions::width(Width::W64);
+    let input = cx.parse(&format!("{arms} (a - b) * 0x1cee87728"), &parse).unwrap();
+    let out = engine.simplify(&mut cx, input).unwrap().expr;
+    assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(0));
+    // One fewer trailing zero lets bit 61 survive. x = 0xc000000000000000
+    // selects the masked arm with that bit set in ~x.
+    let input = cx.parse(&format!("{arms} (a - b) * 4"), &parse).unwrap();
+    let out = engine.simplify(&mut cx, input).unwrap().expr;
+    let env = FnEnv(|_: &SymbolKey, w| {
+        Some(BitVec::wrapping_from_u64(w, 0xc000000000000000))
+    });
+    assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(1 << 63));
+}
+
+#[test]
 fn a_constant_through_one_condition_is_proved_on_either_side_of_it() {
     // What the engine leaves of a difficult case-split question: every select tests
     // `trunc<32>(x) == 0`. On one side the selects pick constants and the value is

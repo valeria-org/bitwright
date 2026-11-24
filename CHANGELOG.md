@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.32.13
+
+- A mask on a `select` can discard an arm whose selected bits are known zero.
+  The MBA pass can then cancel related choices with constant arms, including
+  scaled differences whose only differing bits shift out of the result.
+- The prover can establish equality of differently spelled weighted bit sums
+  beneath a common operation, and check tagged low words and masked cofactor
+  sums without expanding the arithmetic that produced their inputs.
+- Simplify intersections of complementary left and logical right shifts to
+  zero, including for symbolic counts and different source words.
+- `bitwright-bench --validity-records` accepts both document and walk profiles.
+  `--asked-only` isolates the captured budgets from the replay tool's recovery
+  passes. Neither recovery nor a captured counterexample changes solver defaults.
+- Validity replay now retries oversized residual circuits and can prove small
+  word equalities by affine rebasing or modular cancellation after ordinary
+  search exhausts its budget. Refutations still require an original-query model.
+
 ## 0.32.12
 
 - The linear pass (with `mba` enabled) can prove constants in weighted sums of

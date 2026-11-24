@@ -177,3 +177,50 @@ fn hidden_constants_fold_before_the_circuit() {
     assert_eq!(label(&out), "proved");
     assert!(s.simplification.decided && s.nodes == 0, "{s:?}");
 }
+
+/// The same byte function under a narrow cast or a full-word mask. Each bit needs four
+/// source bits, even though the address and the common terms are unrestricted 64-bit words.
+#[cfg(feature = "mba")]
+#[test]
+fn weighted_byte_sums_under_shared_operations() {
+    let terms = |offset: u64, coefficient: u64| format!("\
+        let p = x:64 + {offset};
+        let a = trunc<8>(p);
+        let b = extract<8, 8>(x);
+        let c = extract<16, 8>(p);
+        let d = extract<24, 8>(p);
+        let lhs = (zext<64>((a | b) & (c ^ d)) * {coefficient} + y + z) * m;
+        let ab = ((p & ~(p >>u 8)) ^ (x >>u 8));
+        let rhs = (z + (ab & (p >>u 16 ^ p >>u 24) & 255) * {coefficient} + y) * m;
+    ");
+    let cfg = Config::default()
+        .with_max_conflicts(2_000)
+        .with_max_propagations(400_000)
+        .with_sweeping(false);
+    // The offset leaves the low two byte lanes intact. Its other bits, the
+    // coefficient (even or odd) and the mask shared by the readers can change.
+    for (offset, weight, mask) in [
+        (0xff000000, 0xe1827345, 17_u64),
+        (0x8b6d000000, 0x70298a, 0x4071),
+        (0xf917c8000000, u64::MAX - 2, 0xf0020101),
+    ] {
+        let terms = terms(offset, weight);
+        for cmp in [String::from("lhs == rhs"), format!("((lhs | {mask}) <=u k) == ((rhs | {mask}) <=u k)")] {
+            let (out, stats) = ask(&format!("{terms}{cmp}"), Width::W64, &cfg);
+            assert_eq!(label(&out), "proved");
+            assert!(stats.simplification.decided, "{stats:?}");
+        }
+    }
+    // Changing the second byte of the offset invalidates the projection;
+    // so does reading the wrong lane or reversing only one comparison.
+    let misaligned = format!("{}lhs == rhs", terms(0xff001900, 0xe1827345));
+    let terms = terms(0xff000000, 0xe1827345);
+    for src in [
+        misaligned,
+        format!("{}lhs == rhs", terms.replace("p >>u 16 ^", "p >>u 8 ^")),
+        format!("{terms}((lhs | 17) <=u k) == (k <=u (rhs | 17))"),
+    ] {
+        let (out, _) = ask(&src, Width::W64, &cfg);
+        assert_eq!(label(&out), "refuted");
+    }
+}

@@ -555,6 +555,17 @@ group core.shift {
         let m: W = ones >>u c
     }
 
+    /// The low s bits of the left shift are zero; the other shift can only put bits
+    /// there. At and beyond the width at least one operand is zero.
+    #[example("(p << q) & (r >>u (8 - q))" => "0")]
+    rule disjoint_shift_left<W>(x: W, y: W, s: W) {
+        (x << s) & (y >>u (W - s)) => 0
+    }
+    #[example("(p >>u q) & (r << (8 - q))" => "0")]
+    rule disjoint_shift_right<W>(x: W, y: W, s: W) {
+        (x >>u s) & (y << (W - s)) => 0
+    }
+
     /// Two rotations by constants.
     #[example("rotl(rotl(p, 3), 7)" => "rotl(p, 2)")]
     rule rotl_rotl<W>(x: W, a: const W, b: const W) {
@@ -1255,6 +1266,15 @@ group core.select_idioms {
     /// When `x == 0`, `x + y` is `y`.
     #[example("select(p == 0, p + q, q)" => "q")]
     rule select_zero_sum<W>(x: W, y: W) { select(x == 0, x + y, y) => y }
+    /// Project a mask into a choice when one arm contributes no selected bits.
+    #[example("select(r:1, p, q >>u 4) & 0xf0" => "select(r:1, p & 0xf0, 0)")]
+    rule mask_select_zero_else<W>(c: 1, x: W, y: W, m: const W) {
+        select(c, x, y) & m => select(c, x & m, 0) if zero_bits(y, m)
+    }
+    #[example("select(r:1, q >>u 4, p) & 0xf0" => "select(r:1, 0, p & 0xf0)")]
+    rule mask_select_zero_then<W>(c: 1, x: W, y: W, m: const W) {
+        select(c, x, y) & m => select(c, 0, y & m) if zero_bits(x, m)
+    }
     /// Choosing by a mask: `m` all ones takes `x`, all zeros `y`.
     #[example("(p & sext<8>(r:1)) | (q & ~sext<8>(r:1))" => "select(r:1, p, q)")]
     rule select_by_mask<W>(c: 1, x: W, y: W) where 1 < W {

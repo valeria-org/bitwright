@@ -22,16 +22,25 @@ cargo run --release -p bitwright-bench -- --validity-records bw-handoff-2/questi
 
 Each row is `file`, `verdict`, `stage` (tab-separated). `asked` uses a fresh
 context and solver, the complete recorded `#CFG`, and each `#A` predicate.
-The reader rejects an unsupported config or a missing assumption rather than
-silently asking an easier question.
+`walk_simplifiers=true` uses the walk's MBA profile; `false` uses the document
+prover's defaults. Add `--asked-only` after the directory to measure those
+limits without invoking recovery. Unsupported profiles, configurations and
+assumption-count mismatches are errors, not a different query.
 
 Only a size or search-budget stop enters recovery. The forms engine simplifies
 `!root & assumption₁ & …` with known atoms and basis sums, for up to three
 passes at `1 << 19` fuel each, stopping at a constant or an unchanged root.
 A zero counterexample predicate proves validity (`forms`). Otherwise the native
 prover tries the residual with the original circuit and search limits
-(`residual`). On search exhaustion it resumes the same SAT instance once, with
-up to 100,000 additional conflicts and 20 million propagations (`search`).
+(`residual`). If the circuit does not fit, at most two more forms passes at
+`1 << 22` fuel can prove it (`deep-forms`) or produce a different residual
+to try under the same node limit (`deep-residual`). On search exhaustion it
+resumes the same SAT instance once, with up to 100,000 additional conflicts
+and 20 million propagations (`search`).
+If that search exhausts its budget, `split` asks the original question with
+`Split::shared()`: it proves candidate constant subexpressions and splits on
+at most two levels of conditions. Each subquestion gets `1 << 17` simplify
+fuel and at most 2,000 conflicts, 20,000 propagations and 200,000 nodes.
 Every countermodel must make the original predicate false with every original
 assumption true. No external SMT solver or binary-analysis host is needed.
 The recovery budgets are specific to this command, not new prover defaults.
@@ -43,6 +52,32 @@ wall on the development host, excluding compilation). At the recorded limits
 proved. The previous 21-record handoff still decided entirely at its recorded
 limits (12 proved, nine refuted). These counts describe the supplied samples,
 not the full walk logs.
+
+### Large validity sample (`bw_samples.tgz`)
+
+The same command accepts the `undecided` and `answered` directories separately.
+The final 34 open records were replayed cold: 32 proved and two refuted.
+Records `0716` and `0769` have concrete countermodels checked against their
+original `#ROOT` and every `#A`. Combined with the previously decided rows,
+the corpus contains 1,801 proofs and 296 refutations (2,097 records, including
+230 answered controls).
+
+The last recovery stages run only after the earlier budgets fail:
+
+- `word-equality` tries affine rebasing, proven select-arm equalities, and a
+  modular difference on disequalities of at most 256 DAG nodes. For extracted
+  slices it can also ask the native shared-sum prover.
+- `wide-residual` retries a circuit that exceeded the recorded size cap with
+  at most 524,288 nodes. The native search gets 2,000 conflicts and 200,000
+  propagations, then at most 20,000 and 4,000,000 more on the same instance.
+- `large-split` treats assumptions as part of the implication so the splitter
+  can choose conditions from either side. `large-forms` retries the original
+  counterexample in a fresh arena and forms engine, with a final pass at
+  `1 << 24` fuel.
+
+These stages use expression structure and proof outcomes, not record names,
+addresses, historical outcomes, or sampled values. Changing a literal can
+change the verdict; exhausting recovery still returns `unknown`.
 
 ## Replaying the 21-question solver handoff
 

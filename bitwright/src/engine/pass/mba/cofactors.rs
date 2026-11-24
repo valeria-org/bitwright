@@ -162,7 +162,7 @@ impl Sums {
         Some(value.wrapping_mul(k) & mask)
     }
 
-    fn collapse(&mut self, cx: &mut Context, i: u32, work: &mut Work) -> Result<Option<u32>, Error> {
+    fn collapse(&mut self, cx: &mut Context, i: u32, terminal: bool, work: &mut Work) -> Result<Option<u32>, Error> {
         let w = cx.wid(i);
         if w > 64 { return Ok(None); }
         let mut bias = 0;
@@ -184,6 +184,14 @@ impl Sums {
                 })
             } else { None };
             self.products.push(p);
+        }
+        // At a compared bitwise gate the *entire* operand may be constant.
+        // Its weights need not be equal in magnitude: grouping them first
+        // would split a single Boolean identity into nonconstant pieces.
+        if terminal && self.products.iter().all(Option::is_none)
+            && let Some(k) = self.table.constant(cx, &self.parts, w, work)
+        {
+            return cx.mk_const_u64(w, k.wrapping_add(bias) & mask).map(Some);
         }
         for &(pair, _) in self.products.iter().flatten() {
             for f in pair {
@@ -236,34 +244,80 @@ impl Sums {
         }
         Ok(Some(out))
     }
+
+    /// Simplify the first additive layer below a compared bitwise expression,
+    /// stopping there even when its operands hide a much larger arithmetic DAG.
+    /// Only the shallow shell is rebuilt; its original gates retain their polarity.
+    fn terminal(&mut self, cx: &mut Context, i: u32, depth: u8, work: &mut Work) -> Result<u32, Error> {
+        if work.take(1).is_none() { return Ok(i); }
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Add | OpCode::Sub => Ok(self.collapse(cx, i, true, work)?.unwrap_or(i)),
+            OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor if depth > 0 => {
+                let mut kids = [0; 3];
+                let mut changed = false;
+                for (k, x) in n.children().enumerate() {
+                    kids[k] = self.terminal(cx, x, depth - 1, work)?;
+                    changed |= kids[k] != x;
+                }
+                if changed { cx.rebuild(i, kids) } else { Ok(i) }
+            }
+            _ => Ok(i),
+        }
+    }
 }
 
 pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32]) -> Result<Option<u32>, Stop> {
     if !(96..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
-    // One isolated sum is already handled by the normal-form passes. Look for
-    // several sums of products before paying for a whole-DAG traversal and memo.
+    // When several product sums are present, simplify them together. Reducing
+    // just a compared arm can leave other multiples of the same sum hidden
+    // inside shifts and truncations (including the shift amount itself).
     let scan = order.len() as u64;
     let budget = (r.meter.left_in(|b| b.pass_work) / 4).min(1 << 17);
     if budget <= 4 * scan { return Ok(None); }
     r.meter.charge(Counter::PassWork, scan)?;
+    let mut left = budget - scan;
     if order.iter().filter(|&&i| {
         let n = cx.node(i);
         matches!(n.op, OpCode::Add | OpCode::Sub) && cx.node(n.a).op == OpCode::Mul && cx.node(n.b).op == OpCode::Mul
-    }).take(4).count() < 4 { return Ok(None); }
-    r.meter.charge(Counter::PassWork, 3 * scan)?;
-    let budget = budget - 4 * scan;
-    let mut work = Work::new(budget);
-    let mut sums = Sums::default();
-    let out = rewrite_sums(r, cx, order, |r, cx, i| {
-        if work.left == 0 { return Ok(None); }
-        r.build(cx, |cx| sums.collapse(cx, i, &mut work))
-    })?;
-    r.meter.charge(Counter::PassWork, budget - work.left)?;
-    let Some(out) = out.get(root) else { return Ok(None) };
-    let cap = order.len() as u32 - 1;
-    r.meter.charge(Counter::PassWork, scan)?;
-    Ok(matches!(cx.dag_size(&[cx.handle(out)], cap).map_err(Stop::Error)?, crate::expr::Bounded::Exact(_))
-        .then_some(out))
+    }).take(4).count() == 4 {
+        r.meter.charge(Counter::PassWork, 3 * scan)?;
+        left -= 3 * scan;
+        let mut work = Work::new(left);
+        let mut sums = Sums::default();
+        let out = rewrite_sums(r, cx, order, |r, cx, i| {
+            if work.left == 0 { return Ok(None); }
+            r.build(cx, |cx| sums.collapse(cx, i, false, &mut work))
+        })?;
+        r.meter.charge(Counter::PassWork, left - work.left)?;
+        left = work.left;
+        if let Some(e) = out.get(root) {
+            r.meter.charge(Counter::PassWork, scan)?;
+            left = left.saturating_sub(scan);
+            if matches!(cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1).map_err(Stop::Error)?,
+                crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
+        }
+    }
+    // Without a whole-DAG reduction, read just the comparison's additive
+    // operands. Each can be constant even with entirely unrelated weights.
+    let n = cx.node(root);
+    if matches!(n.op, OpCode::Eq | OpCode::Ne) && cx.is_const(n.b)
+        && matches!(cx.node(n.a).op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor)
+    {
+        let allowance = (left / 4).min(8192);
+        let mut work = Work::new(allowance);
+        let out = r.build(cx, |cx| Sums::default().terminal(cx, n.a, 4, &mut work))?;
+        let used = allowance - work.left;
+        r.meter.charge(Counter::PassWork, used)?;
+        left -= used;
+        if out != n.a && left >= scan {
+            let e = r.build(cx, |cx| cx.rebuild(root, [out, n.b, 0]))?;
+            r.meter.charge(Counter::PassWork, scan)?;
+            if matches!(cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1).map_err(Stop::Error)?,
+                crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -281,7 +335,31 @@ mod tests {
             let e = cx.parse(&s, &opt).unwrap();
             let g = cx.parse("g", &opt).unwrap();
             let i = cx.id(e).unwrap();
-            assert_eq!(sums.collapse(&mut cx, i, &mut Work::new(4096)).unwrap(), Some(cx.id(g).unwrap()));
+            assert_eq!(sums.collapse(&mut cx, i, false, &mut Work::new(4096)).unwrap(), Some(cx.id(g).unwrap()));
+        }
+    }
+
+    #[test]
+    fn terminal_gate_retains_polarity_and_shared_factor() {
+        for (w, a, b, k, mask) in [
+            (Width::W8, 3u64, 7, 2, 0x53),
+            (Width::W16, 22, 18, 11, 0x9441),
+            (Width::W32, 219, 99, 17, 0x8ff14),
+        ] {
+            let mut cx = Context::new();
+            let opt = ParseOptions::width(w);
+            // OR - AND + XNOR = -1. The partition of x at `mask` adds
+            // zero, but its unrelated weight prevents single-scale grouping.
+            let e = cx.parse(&format!(
+                "~((x | y)*(t*{a}) - (x & y)*{a}*t + (~(x ^ y)*t)*{a}) & \
+                 ~((x | y)*{b} - (x & y)*{b} + ~(x ^ y)*{b} + \
+                   (x & {mask})*{k} + (x & ~{mask})*{k} - x*{k})"
+            ), &opt).unwrap();
+            let minus_a = a.wrapping_neg() & ((1 << w.bits()) - 1);
+            let expected = cx.parse(&format!("~(t*{minus_a}) & {}", b - 1), &opt).unwrap();
+            let i = cx.id(e).unwrap();
+            let got = Sums::default().terminal(&mut cx, i, 4, &mut Work::new(4096)).unwrap();
+            assert_eq!(got, cx.id(expected).unwrap());
         }
     }
 

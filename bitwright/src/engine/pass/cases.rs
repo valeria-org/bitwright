@@ -137,7 +137,7 @@ fn related(cx: &Context, a: u32, b: u32) -> bool {
 /// (`(v | k) + (v & k)`, which is `v + k`) holds on each side, and is hidden once a pass has
 /// written one of its terms into the select's sides (`select(c, a & k, b & k)`): the terms then
 /// read two selects no test relates. The select replaces the node only when it is smaller;
-/// `None` when no two selects of `n` share a condition and read one value on each side.
+/// `None` when no pair has related arms (both arms on one side may be constants).
 #[cfg(feature = "mba")]
 pub(super) fn by_cases(
     r: &mut Runner<'_, '_>,
@@ -146,11 +146,15 @@ pub(super) fn by_cases(
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
 ) -> Result<Option<super::Step>, Stop> {
     let node = cx.node(n);
+    // Scaling a difference can discard high columns that differ before scaling.
+    let scaled_sum = node.op == OpCode::Mul
+        && cx.node(node.b).op == OpCode::Const
+        && matches!(cx.node(node.a).op, OpCode::Add | OpCode::Sub);
     if node.width < 2
-        || !matches!(
+        || !(scaled_sum || matches!(
             node.op,
             OpCode::Add | OpCode::Sub | OpCode::Xor | OpCode::Or | OpCode::And
-        )
+        ))
     {
         return Ok(None);
     }
@@ -191,7 +195,17 @@ pub(super) fn by_cases(
         let a = cx.node(s);
         for &t in &selects[i + 1..] {
             let b = cx.node(t);
-            if a.a == b.a && related(cx, a.b, b.b) && related(cx, a.c, b.c) {
+            if a.a != b.a {
+                continue;
+            }
+            // A projection of a bounded choice may already be constant on
+            // one side. The other side must still share a nonconstant input.
+            let fixed_then = cx.node(a.b).op == OpCode::Const && cx.node(b.b).op == OpCode::Const;
+            let fixed_else = cx.node(a.c).op == OpCode::Const && cx.node(b.c).op == OpCode::Const;
+            if !(fixed_then && fixed_else)
+                && (fixed_then || related(cx, a.b, b.b))
+                && (fixed_else || related(cx, a.c, b.c))
+            {
                 found = Some(a.a);
                 break 'pairs;
             }
@@ -213,6 +227,9 @@ pub(super) fn by_cases(
                 }
             }
             let e = r.build(cx, |cx| Ok(cx.substitute_ids(&[n], &repl)?[0]))?;
+            if cx.node(e).op == OpCode::Const {
+                return Ok(Some(e));
+            }
             part(r, cx, e)
         };
     // Only where each side is an identity the MBA phase reads: a split of any operation

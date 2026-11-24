@@ -1271,6 +1271,44 @@ fn exhaustive_mask_cases(
     Ok(None)
 }
 
+/// Prove the differing argument of two applications equal, rather than bit-blasting the
+/// common operations above it. This is forward congruence only: equal products need not
+/// imply equal factors, but equal factors under the same multiplier suffice. In particular
+/// a shared comparison or mask need not be injective.
+#[cfg(feature = "mba")]
+fn congruent_sums(
+    r: &mut Runner<'_, '_>, cx: &Context, mut a: u32, mut b: u32,
+) -> Result<bool, Stop> {
+    for _ in 0..MAX_PEEL {
+        let (x, y) = (cx.node(a), cx.node(b));
+        if x.width != y.width || x.op != y.op || matches!(x.op, OpCode::Add | OpCode::Sub) {
+            break;
+        }
+        if matches!(x.op, OpCode::Zext | OpCode::Sext | OpCode::Not | OpCode::Neg)
+            || (x.op == OpCode::Extract && x.b == y.b)
+        {
+            (a, b) = (x.a, y.a);
+        } else if x.op.as_cmp().is_some() || x.op.as_bin().is_some() {
+            let swapped = x.op.as_bin().is_some_and(BinOp::is_commutative)
+                || x.op.as_cmp().is_some_and(CmpOp::is_commutative);
+            (a, b) = if x.a == y.a {
+                (x.b, y.b)
+            } else if x.b == y.b {
+                (x.a, y.a)
+            } else if swapped && x.a == y.b {
+                (x.b, y.a)
+            } else if swapped && x.b == y.a {
+                (x.a, y.b)
+            } else {
+                break;
+            };
+        } else {
+            break;
+        }
+    }
+    super::mba::equal_sums(r, cx, a, b)
+}
+
 /// The compares pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
@@ -1375,6 +1413,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             if matches!(node.op, OpCode::Eq | OpCode::Ne)
                 && cx.wid(node.a) > 1
                 && super::linear_mba::equal(r, cx, node.a, node.b)?
+            {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, node.op == OpCode::Eq)?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
+            #[cfg(feature = "mba")]
+            if matches!(node.op, OpCode::Eq | OpCode::Ne)
+                && congruent_sums(r, cx, node.a, node.b)?
             {
                 let before = cx.len() as u32;
                 let c = bool_const(r, cx, node.op == OpCode::Eq)?;

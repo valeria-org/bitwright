@@ -17,7 +17,7 @@
 //!   --batch DIR       a consumer's exported questions, one by one and through `bitwright::batch`
 //!                     (`--mode before|whole|split`, `--threads N`, `--shared-symbols`, `--warm`)
 //!   --sampled DIR     check exported sampled constants, with a forms retry only after Unknown
-//!   --validity-records DIR  replay captured validity queries, then retry only budget/size stops
+//!   --validity-records DIR [--asked-only]  replay validity queries, optionally omitting recovery
 //!   --walk DIR        a walk's exported questions, a directory per boundary, each a batch
 //!                     (`--mode whole|split|eager|shared`, `--threads N`, `--no-deep`, `--answers FILE`)
 //!   --prover-budgets  what budgeted word-level simplification settles and saves the prover
@@ -188,14 +188,16 @@ fn main() -> ExitCode {
     // Internal workers are separate processes for a meaningful per-fixture memory peak.
     let worker: Vec<String> = std::env::args().skip(1).collect();
     if worker.first().is_some_and(|a| matches!(a.as_str(), "--sampled" | "--validity-records")) {
-        if worker.len() != 2 {
-            eprintln!("usage: bitwright-bench {} DIR", worker[0]);
+        let asked_only = worker[0] == "--validity-records" && worker.len() == 3 && worker[2] == "--asked-only";
+        if worker.len() != 2 && !asked_only {
+            let options = if worker[0] == "--validity-records" { " [--asked-only]" } else { "" };
+            eprintln!("usage: bitwright-bench {} DIR{options}", worker[0]);
             return ExitCode::from(2);
         }
         let result = if worker[0] == "--sampled" {
             questions::sampled(&worker[1])
         } else {
-            questions::validity(&worker[1])
+            questions::validity(&worker[1], !asked_only)
         };
         return match result {
             Ok(()) => ExitCode::SUCCESS,
