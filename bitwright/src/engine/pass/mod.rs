@@ -28,7 +28,7 @@ pub(crate) mod predicate;
 pub(super) mod residue;
 pub(super) mod shuffle;
 #[cfg(feature = "prove")]
-mod slices;
+pub(super) mod slices;
 #[cfg(test)]
 mod tests;
 pub(super) mod words;

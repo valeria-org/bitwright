@@ -198,20 +198,25 @@ struct Leg {
     wordy: bool,
 }
 
-/// The questions the search found nothing for, kept by an engine across its calls (see
-/// `leg`): an expression asked in many calls (the parts of a split question, a session's
-/// rounds, a word asked at every arrival) has the same cones asked again, and most find
-/// nothing. A question is a function of its cone (its nodes, operands by place, constants by
-/// value, symbols by key), the facts read of each node, its kind of forms and its limit; and
-/// what it does to the call is the pass work it charges and the constants it builds, in
-/// order. A question kept is answered by doing just that, so the call goes on as it would
-/// have: the same answers, budgets and context.
+/// The questions kept by an engine across its calls (see `leg`): an expression asked in many
+/// calls (the parts of a split question, a session's rounds, a word asked at every arrival)
+/// has the same cones asked again. A question is a function of its cone (its nodes, operands
+/// by place, constants by value, symbols by key), the facts read of each node, its kind of
+/// forms and its limit; and what it does to the call is the pass work it charges, the
+/// constants it builds, in order, and the answer it finds: scratch nodes over the cone's
+/// nodes and those constants ([`write::KeptBuild`]). A question kept is answered by doing
+/// just that, so the call goes on as it would have: the same answers, budgets and context.
 #[derive(Default)]
 pub(crate) struct Quiet {
     kept: std::sync::Mutex<IdMap<Box<[u64]>, std::sync::Arc<Kept>>>,
+    /// The scratch nodes of the answers in `kept` ([`QUIET_NODES`]).
+    nodes: std::sync::atomic::AtomicUsize,
     /// The questions answered from `kept` (tests).
     #[cfg(test)]
     hits: std::sync::atomic::AtomicU64,
+    /// ... of them, those answered with what they found (tests).
+    #[cfg(test)]
+    found_hits: std::sync::atomic::AtomicU64,
 }
 
 impl core::fmt::Debug for Quiet {
@@ -220,17 +225,24 @@ impl core::fmt::Debug for Quiet {
     }
 }
 
-/// What a question that found nothing did (see [`Quiet`]).
+/// What a question did (see [`Quiet`]).
 struct Kept {
     paid: u64,
     consts: Box<[(u16, u128)]>,
     work: u64,
     forked: bool,
     wordy: bool,
+    /// The answer it found, the size of its DAG, and the finality the search left; `None`
+    /// where it found nothing.
+    found: Option<(write::KeptBuild, u32, Fin)>,
 }
 
 /// The questions an engine keeps; past it the store starts afresh.
 const QUIET_KEPT: usize = 1 << 15;
+
+/// The scratch nodes of the answers an engine keeps (about 28 bytes each); past it the store
+/// starts afresh.
+const QUIET_NODES: usize = 1 << 21;
 
 /// The key of a question over `nodes` with `lift`'s forms and facts (see [`Quiet`]), or
 /// `None` where a node is not read whole by it.
@@ -329,15 +341,31 @@ fn leg(
             .words_quiet
             .hits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if q.found.is_some() {
+            r.inner
+                .words_quiet
+                .found_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (found, fin) = match &q.found {
+            Some((kept, size, fin)) => {
+                let root = build.restore(cx, &nodes, kept).map_err(Stop::Error)?;
+                (Some((root, *size)), *fin)
+            }
+            None => (None, lift.fin.unwrap_or(Fin::FINAL)),
+        };
         return Ok(Leg {
             build,
-            found: None,
+            found,
             work: q.work,
-            fin: lift.fin.unwrap_or(Fin::FINAL),
+            fin,
             forked: q.forked,
             wordy: q.wordy,
         });
     }
+    // (The cone, for an answer kept: the search takes it.)
+    let cone = key.as_ref().map(|_| nodes.clone());
     let mut search = write::Search::new(&mut lift, &mut build, nodes);
     if let Some(limit) = limit {
         search.limit(limit);
@@ -347,7 +375,17 @@ fn leg(
     let (paid, consts) = search.charged();
     r.words.work += work;
     let found = found?;
-    if found.is_none()
+    let fin = lift.fin.unwrap_or(Fin::FINAL);
+    // What a found answer is over: nothing where it names a node it cannot be built again
+    // from (not kept).
+    let kept_found = match (found, &cone) {
+        (None, _) => Some(None),
+        (Some((root, size)), Some(cone)) => build
+            .keep(cx, cone, root, &consts)
+            .map(|kb| Some((kb, size, fin))),
+        (Some(_), None) => None,
+    };
+    if let Some(kept_found) = kept_found
         && let Some(key) = key
     {
         let mut g = r
@@ -356,9 +394,14 @@ fn leg(
             .kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if g.len() >= QUIET_KEPT {
+        use std::sync::atomic::Ordering::Relaxed;
+        let held = &r.inner.words_quiet.nodes;
+        let size = kept_found.as_ref().map_or(0, |(kb, _, _)| kb.len());
+        if g.len() >= QUIET_KEPT || held.load(Relaxed) + size > QUIET_NODES {
             g.clear();
+            held.store(0, Relaxed);
         }
+        held.fetch_add(size, Relaxed);
         g.insert(
             key,
             std::sync::Arc::new(Kept {
@@ -367,6 +410,7 @@ fn leg(
                 work,
                 forked: lift.alg.forked(),
                 wordy: lift.alg.wordy(),
+                found: kept_found,
             }),
         );
     }
@@ -374,7 +418,7 @@ fn leg(
         build,
         found,
         work,
-        fin: lift.fin.unwrap_or(Fin::FINAL),
+        fin,
         forked: lift.alg.forked(),
         wordy: lift.alg.wordy(),
     })

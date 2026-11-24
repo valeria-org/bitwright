@@ -1112,10 +1112,11 @@ fn a_word_made_in_limbs_of_many_operands_is_the_word() {
     assert_eq!(simplify(&eng, &src, 20), "0:20");
 }
 
-/// The questions the search found nothing for are kept by the engine across its calls and
-/// answered by what they did (see `Quiet`): a call that meets one again, in any context,
-/// ends as it would have, with the same result, the same counters (the budget it spent) and
-/// the same context, under the deobfuscating strategy as with the pass alone.
+/// The questions are kept by the engine across its calls and answered by what they did (see
+/// `Quiet`), those that found an answer with that answer built again: a call that meets one
+/// again, in any context, ends as it would have, with the same result, the same counters (the
+/// budget it spent) and the same context, under the deobfuscating strategy as with the pass
+/// alone.
 #[test]
 fn words_kept_questions_answer_as_asked() {
     use std::sync::atomic::Ordering;
@@ -1134,6 +1135,7 @@ fn words_kept_questions_answer_as_asked() {
         let warm = build();
         let mut g = generator(0x5157_0001);
         let mut hits = 0;
+        let found_before = warm.inner.words_quiet.found_hits.load(Ordering::Relaxed);
         for i in 0..400 {
             let (src, w) = match i % 3 {
                 0 => chain_text(&mut g.rng),
@@ -1161,5 +1163,7 @@ fn words_kept_questions_answer_as_asked() {
             hits += usize::from(warm.inner.words_quiet.hits.load(Ordering::Relaxed) > before);
         }
         assert!(hits > 100, "{hits}");
+        let found = warm.inner.words_quiet.found_hits.load(Ordering::Relaxed) - found_before;
+        assert!(found > 20, "{found}");
     }
 }
