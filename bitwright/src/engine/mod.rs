@@ -616,6 +616,8 @@ struct Inner {
     mba: MbaService,
     verify: Verify,
     id: u128,
+    /// The words pass's questions that found nothing (see `pass::words::Quiet`).
+    words_quiet: pass::words::Quiet,
 }
 
 /// Linked rule programs, a strategy and verification settings. Cheap to clone; `Send + Sync`.
@@ -1031,6 +1033,7 @@ impl EngineBuilder {
                 mba: self.mba.clone(),
                 verify: self.verify,
                 id: (u128::from(id) << 64) | u128::from(combine(id, 0x9e37)),
+                words_quiet: pass::words::Quiet::default(),
             }),
         })
     }

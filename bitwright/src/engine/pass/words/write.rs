@@ -15,6 +15,7 @@ use crate::{BitVec, Width};
 
 /// No node of the context.
 const NONE: u32 = u32::MAX;
+
 /// The widest value written.
 const MAX_WIDTH: u32 = 128;
 /// How deep a form's parts nest when written.
@@ -490,6 +491,10 @@ pub(super) struct Search<'a> {
     /// Scratch nodes made and terms handled, charged to the meter as they come; and how
     /// many the question may take.
     charged: u64,
+    /// The pass work charged, and the constants built in the context, in order: what a
+    /// question that found nothing did to the call (see `quiet`).
+    paid: u64,
+    consts: Vec<(u16, u128)>,
     spent: u64,
     total: u64,
     allow: u64,
@@ -527,6 +532,8 @@ impl<'a> Search<'a> {
             nest: 0,
             variant: VARIANTS[0],
             charged: 0,
+            paid: 0,
+            consts: Vec::new(),
             spent: 0,
             total: 0,
             allow: MAX_WORK,
@@ -542,12 +549,18 @@ impl<'a> Search<'a> {
         self.charged = now;
         self.total += due;
         r.meter.charge(Counter::PassWork, due.div_ceil(PER_UNIT))?;
+        self.paid += due.div_ceil(PER_UNIT);
         Ok(self.total < self.allow)
     }
 
     /// The work of the question so far.
     pub(super) fn work(&self) -> u64 {
         self.total
+    }
+
+    /// The pass work charged and the constants built (see `paid`).
+    pub(super) fn charged(&mut self) -> (u64, Vec<(u16, u128)>) {
+        (self.paid, core::mem::take(&mut self.consts))
     }
 
     /// The question is given up at `allow` work, where that is less than a question's own.
@@ -692,6 +705,7 @@ impl<'a> Search<'a> {
         let c = r.build(cx, |cx| {
             cx.mk_const(&BitVec::wrapping_from_u128(width, v & low(w)))
         })?;
+        self.consts.push((w as u16, v & low(w)));
         Ok(self.b.leaf(cx, c))
     }
 

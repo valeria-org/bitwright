@@ -26,6 +26,21 @@ impl core::hash::Hash for Int {
 #[allow(dead_code, clippy::needless_range_loop)]
 impl Int {
     pub(crate) const ZERO: Int = Int([0; 4]);
+
+    /// The limbs, low first.
+    #[inline]
+    pub(crate) fn limbs(self) -> [u64; 4] {
+        self.0
+    }
+
+    /// The limbs folded into one word, for hashing (equal values fold equally).
+    #[inline]
+    pub(crate) fn fold64(self) -> u64 {
+        self.0[0]
+            ^ self.0[1].rotate_left(29)
+            ^ self.0[2].rotate_left(17)
+            ^ self.0[3].rotate_left(47)
+    }
     pub(crate) const ONE: Int = Int([1, 0, 0, 0]);
     pub(crate) const MAX: Int = Int([u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 1]);
     pub(crate) const MIN: Int = Int([0, 0, 0, 1 << 63]);

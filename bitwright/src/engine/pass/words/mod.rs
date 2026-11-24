@@ -198,6 +198,94 @@ struct Leg {
     wordy: bool,
 }
 
+/// The questions the search found nothing for, kept by an engine across its calls (see
+/// `leg`): an expression asked in many calls (the parts of a split question, a session's
+/// rounds, a word asked at every arrival) has the same cones asked again, and most find
+/// nothing. A question is a function of its cone (its nodes, operands by place, constants by
+/// value, symbols by key), the facts read of each node, its kind of forms and its limit; and
+/// what it does to the call is the pass work it charges and the constants it builds, in
+/// order. A question kept is answered by doing just that, so the call goes on as it would
+/// have: the same answers, budgets and context.
+#[derive(Default)]
+pub(crate) struct Quiet {
+    kept: std::sync::Mutex<IdMap<Box<[u64]>, std::sync::Arc<Kept>>>,
+    /// The questions answered from `kept` (tests).
+    #[cfg(test)]
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl core::fmt::Debug for Quiet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Quiet").finish_non_exhaustive()
+    }
+}
+
+/// What a question that found nothing did (see [`Quiet`]).
+struct Kept {
+    paid: u64,
+    consts: Box<[(u16, u128)]>,
+    work: u64,
+    forked: bool,
+    wordy: bool,
+}
+
+/// The questions an engine keeps; past it the store starts afresh.
+const QUIET_KEPT: usize = 1 << 15;
+
+/// The key of a question over `nodes` with `lift`'s forms and facts (see [`Quiet`]), or
+/// `None` where a node is not read whole by it.
+fn quiet_key(
+    cx: &Context,
+    lift: &lift::Lift,
+    nodes: &[u32],
+    limit: Option<u64>,
+) -> Option<Box<[u64]>> {
+    let mut out: Vec<u64> = Vec::with_capacity(nodes.len() * 6 + 4);
+    out.push(u64::from(lift.alg.plain) | u64::from(lift.alg.values) << 1);
+    out.push(limit.unwrap_or(u64::MAX));
+    out.push(nodes.len() as u64);
+    let place: IdMap<u32, u32> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i as u32))
+        .collect();
+    for &n in nodes {
+        let node = cx.node(n);
+        out.push(u64::from(node.op as u8) | u64::from(node.width) << 16);
+        match node.op {
+            OpCode::Const => {
+                let v = cx.const_val(n)?;
+                out.push(v.limbs().len() as u64);
+                out.extend_from_slice(v.limbs());
+            }
+            OpCode::Sym => match cx.symbol_key(crate::expr::SymbolId(node.a))? {
+                crate::SymbolKey::U64(k) => out.extend([1, *k]),
+                crate::SymbolKey::Fresh(k) => out.extend([2, *k]),
+                crate::SymbolKey::Str(s) => {
+                    out.extend([3, s.len() as u64]);
+                    for c in s.as_bytes().chunks(8) {
+                        let mut w = [0u8; 8];
+                        w[..c.len()].copy_from_slice(c);
+                        out.push(u64::from_le_bytes(w));
+                    }
+                }
+            },
+            _ => {
+                out.push(u64::from(node.aux));
+                let arity = node.op.arity();
+                for (j, x) in [node.a, node.b, node.c].into_iter().enumerate() {
+                    out.push(match j < arity {
+                        true => u64::from(*place.get(&x)?),
+                        false => u64::from(x) | 1 << 40,
+                    });
+                }
+            }
+        }
+        lift.learned(n, &mut out);
+    }
+    Some(out.into_boxed_slice())
+}
+
 /// One question: the search over `nodes` with the forms of `lift`, in `build`, within
 /// `limit` of work when one is given.
 fn leg(
@@ -208,14 +296,80 @@ fn leg(
     nodes: Vec<u32>,
     limit: Option<u64>,
 ) -> Result<Leg, Stop> {
+    // The facts first, as the search reads them first: they are part of the question.
+    for &n in &nodes {
+        lift.learn(r, cx, n)?;
+    }
+    let key = quiet_key(cx, &lift, &nodes, limit);
+    let kept = key.as_ref().and_then(|k| {
+        let g = r
+            .inner
+            .words_quiet
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.get(k).cloned()
+    });
+    // (Where the call's budget could not cover what the question did, the question is asked,
+    // and stops where it would have.)
+    if let Some(q) = kept
+        && r.meter.left_in(|b| b.pass_work) >= q.paid
+        && r.meter.left_in(|b| b.new_nodes) >= q.consts.len() as u64
+    {
+        for &(w, v) in q.consts.iter() {
+            let width = crate::Width::new(w).map_err(|e| Stop::Error(e.into()))?;
+            r.build(cx, |cx| {
+                cx.mk_const(&crate::BitVec::wrapping_from_u128(width, v))
+            })?;
+        }
+        r.meter.charge(Counter::PassWork, q.paid)?;
+        r.words.work += q.work;
+        #[cfg(test)]
+        r.inner
+            .words_quiet
+            .hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Leg {
+            build,
+            found: None,
+            work: q.work,
+            fin: lift.fin.unwrap_or(Fin::FINAL),
+            forked: q.forked,
+            wordy: q.wordy,
+        });
+    }
     let mut search = write::Search::new(&mut lift, &mut build, nodes);
     if let Some(limit) = limit {
         search.limit(limit);
     }
     let found = search.run(r, cx);
     let work = search.work();
+    let (paid, consts) = search.charged();
     r.words.work += work;
     let found = found?;
+    if found.is_none()
+        && let Some(key) = key
+    {
+        let mut g = r
+            .inner
+            .words_quiet
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.len() >= QUIET_KEPT {
+            g.clear();
+        }
+        g.insert(
+            key,
+            std::sync::Arc::new(Kept {
+                paid,
+                consts: consts.into_boxed_slice(),
+                work,
+                forked: lift.alg.forked(),
+                wordy: lift.alg.wordy(),
+            }),
+        );
+    }
     Ok(Leg {
         build,
         found,
