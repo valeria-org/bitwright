@@ -329,7 +329,19 @@ impl Table {
             }
         }
         for &(i, k) in parts {
-            let p = self.place(cx, i, 48, work)?;
+            let mut p = self.place(cx, i, 48, work)?;
+            let iw = cx.wid(i);
+            if iw < w {
+                let mask_node = self.push_node(Self::const_node(w, u64::MAX >> (64 - iw)))?;
+                p = self.push_node(Node {
+                    op: OpCode::And,
+                    width: w,
+                    a: p,
+                    b: mask_node,
+                    c: 0,
+                    aux: 0,
+                })?;
+            }
             self.terms.push((p, k));
         }
         let rows = 1usize << self.atoms;
@@ -624,7 +636,7 @@ impl Sums {
                     };
                     let Some((g, fa, fb)) = shared else { continue };
                     let target_k = factor_set.iter().copied().find(|&kf| {
-                        if kf == g || kf == fa || kf == fb {
+                        if kf == g || kf == fa || kf == fb || cx.wid(kf) != cx.wid(g) {
                             return false;
                         }
                         let kn = cx.node(kf);
@@ -795,9 +807,23 @@ impl Sums {
         if cancel_parts(&mut self.parts, mask, work).is_none() { return Ok(None); }
         let mut out = cx.mk_const_u64(w, bias & mask)?;
         for &(t, k) in &self.parts {
-            if k & mask == 0 { continue; }
-            let c = cx.mk_const_u64(w, k & mask)?;
-            let term = cx.c_bin(BinOp::Mul, t, c)?;
+            let km = k & mask;
+            if km == 0 { continue; }
+            let tw = cx.wid(t);
+            let tw_node = match tw.cmp(&w) {
+                core::cmp::Ordering::Less => cx.c_zext(t, w)?,
+                core::cmp::Ordering::Greater => cx.c_extract(t, 0, w)?,
+                core::cmp::Ordering::Equal => t,
+            };
+            let term = if km == 1 {
+                tw_node
+            } else if km.is_power_of_two() {
+                let sc = cx.mk_const_u64(w, u64::from(km.trailing_zeros()))?;
+                cx.c_bin(BinOp::Shl, tw_node, sc)?
+            } else {
+                let c = cx.mk_const_u64(w, km)?;
+                cx.c_bin(BinOp::Mul, tw_node, c)?
+            };
             out = cx.c_bin(BinOp::Add, out, term)?;
         }
         Ok(Some(out))

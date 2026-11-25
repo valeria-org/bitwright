@@ -1076,8 +1076,11 @@ fn narrow_causal(
     depth: u8,
 ) -> Result<u32, Stop> {
     let w = cx.wid(id);
-    if w <= bits {
+    if w == bits {
         return Ok(id);
+    }
+    if w < bits {
+        return r.build(cx, |cx| cx.c_zext(id, bits));
     }
     if let Some(&cached) = memo.get(&id) {
         return Ok(cached);
@@ -1110,23 +1113,32 @@ fn narrow_causal(
                 let b = narrow_causal(r, cx, n.b, bits, memo, depth - 1)?;
                 r.build(cx, |cx| cx.c_bin(bin, a, b))?
             }
-            OpCode::Shl
-                if cx
-                    .const_val(n.b)
-                    .and_then(|v| v.to_u64())
-                    .is_some_and(|s| s < u64::from(bits)) =>
-            {
+            OpCode::Shl if cx.const_val(n.b).and_then(|v| v.to_u64()).is_some() => {
                 let s = cx.const_val(n.b).unwrap().to_u64().unwrap();
-                let a = narrow_causal(r, cx, n.a, bits, memo, depth - 1)?;
-                let sc = r.build(cx, |cx| cx.mk_const_u64(bits, s))?;
-                r.build(cx, |cx| cx.c_bin(BinOp::Shl, a, sc))?
+                if s >= u64::from(bits) {
+                    r.build(cx, |cx| cx.mk_const_u64(bits, 0))?
+                } else {
+                    let a = narrow_causal(r, cx, n.a, bits, memo, depth - 1)?;
+                    let sc = r.build(cx, |cx| cx.mk_const_u64(bits, s))?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::Shl, a, sc))?
+                }
             }
             OpCode::Zext => {
                 let iw = cx.wid(n.a);
                 if iw == bits {
                     n.a
                 } else if iw < bits {
-                    r.build(cx, |cx| cx.c_zext(n.a, bits - iw))?
+                    r.build(cx, |cx| cx.c_zext(n.a, bits))?
+                } else {
+                    narrow_causal(r, cx, n.a, bits, memo, depth - 1)?
+                }
+            }
+            OpCode::Sext => {
+                let iw = cx.wid(n.a);
+                if iw == bits {
+                    n.a
+                } else if iw < bits {
+                    r.build(cx, |cx| cx.c_sext(n.a, bits))?
                 } else {
                     narrow_causal(r, cx, n.a, bits, memo, depth - 1)?
                 }
@@ -4668,6 +4680,62 @@ fn ask(
     result
 }
 
+/// Whether `m` is an un-offset additive chain (`+` / `-` / `neg`, width `>= 2`) of at least two
+/// non-constant summands whose variable sets are pairwise disjoint. Each proper summand has
+/// already been simplified bottom-up on its own, and independent summands over `Z/2^w` (`w >= 2`)
+/// have identically zero cross-derivatives and cannot cancel or merge across disjoint variables.
+fn is_separable_sum(m: &crate::mba::MbaExpr) -> bool {
+    use crate::mba::MOp;
+    let nvars = m.vars().len();
+    if !(3..=64).contains(&nvars) || !m.width().is_some_and(|w| w.bits() >= 2) {
+        return false;
+    }
+    let nodes = m.nodes();
+    let Some(root_idx) = nodes.len().checked_sub(1) else {
+        return false;
+    };
+    if !matches!(nodes[root_idx].op, MOp::Add | MOp::Sub) {
+        return false;
+    }
+    let mut var_mask = vec![0u64; nodes.len()];
+    for (i, nd) in nodes.iter().enumerate() {
+        var_mask[i] = match nd.op {
+            MOp::Const(_) => 0,
+            MOp::Var(v) => 1u64 << v,
+            MOp::Neg | MOp::Not | MOp::Shl(_) | MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc => {
+                var_mask[nd.args[0] as usize]
+            }
+            MOp::Add | MOp::Sub | MOp::Mul | MOp::And | MOp::Or | MOp::Xor => {
+                var_mask[nd.args[0] as usize] | var_mask[nd.args[1] as usize]
+            }
+        };
+    }
+    let mut stack = vec![root_idx];
+    let mut seen_vars = 0u64;
+    let mut summands = 0usize;
+    while let Some(idx) = stack.pop() {
+        let nd = nodes[idx];
+        match nd.op {
+            MOp::Add | MOp::Sub => {
+                stack.push(nd.args[0] as usize);
+                stack.push(nd.args[1] as usize);
+            }
+            MOp::Neg => stack.push(nd.args[0] as usize),
+            MOp::Const(c) if c.is_zero() => {}
+            MOp::Const(_) => return false,
+            _ => {
+                let vm = var_mask[idx];
+                if vm == 0 || (seen_vars & vm) != 0 {
+                    return false;
+                }
+                seen_vars |= vm;
+                summands += 1;
+            }
+        }
+    }
+    summands >= 2
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ask_with_answers(
     r: &mut Runner<'_, '_>,
@@ -4703,6 +4771,9 @@ fn ask_with_answers(
         }
     };
     let shape = m.shape();
+    if reading.is_none() && shape.degree >= 2 && is_separable_sum(&m) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
     // Mixed fragments, and polynomials (a product of two non-constants) for a solver that asks
     // for them. A fragment whose casts hide the mix (`sext(a) + sext(~a)` is a xor, a
     // subtraction and a mask once its sign extensions are written out) is judged without them

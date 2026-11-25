@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.32.19
+
+- Fixed width-mismatch errors when simplifying shifted narrow extracts in `mba::cofactors`
+  (`Sums::collapse`, `Table`, and `target_k`) and `mba::opaque_predicate` (`terms_at`, `projection`,
+  `Lane::bit_uncached`, `constant_parts`, `equal_lanes`, `sum_slice`), and fixed `NotWider` width
+  errors in `mba::narrow_causal` when widening narrow `zext`/`sext` inputs to a wider mask width.
+- Added 1-atom multi-constant bitwise reductions, complementary zero-extended condition arm merging
+  to `select`, and 1-bit masked boolean tree hoisting in `bitwise`.
+- Extended `linear::additive_select` across all zero-corner selector tables, 1-bit scaled arms, and
+  disjoint bitwise offsets; added carry-free `(x ^ c1) + c2` canonicalization and width-bounded
+  `LShr` peeling in `linear::counted`.
+- Added `popcnt` cast/mask canonicalizations in `casts` (`popcnt(zext(x))`, `zext(popcnt(trunc(x)))`,
+  and shifted masked field `popcnt`) and a separable nonlinear sum fast path in `mba`.
+
 ## 0.32.18
 
 - Added `bitwright::prove::mixer`: structural recognition, `@mixer.round` / `@mixer.unround`

@@ -39,6 +39,7 @@ fn scalar(cx: &Context, n: u32) -> Option<u64> {
 
 // Flatten the additive layer in Z/2^64. It is used only at widths <= 64 and ultimately
 // reduced modulo the requested power of two. No arithmetic is pushed through a bitwise op.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn terms(
     cx: &Context,
     i: u32,
@@ -49,9 +50,14 @@ pub(super) fn terms(
     keep_not: bool,
     work: &mut Work,
 ) -> Option<()> {
+    let w = cx.wid(i);
+    if w == 0 || w > 64 {
+        return None;
+    }
     terms_at(cx, i, k, bias, out, depth, keep_not, None, 64, work)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn terms_at(
     cx: &Context, i: u32, k: u64, bias: &mut u64, out: &mut Vec<(u32, u64)>,
     depth: u8, keep_not: bool, cut: Option<u32>, mod_bits: u16, work: &mut Work,
@@ -132,9 +138,11 @@ fn terms_at(
         }
         OpCode::Shl if scalar(cx, n.b).is_some() => {
             let count = scalar(cx, n.b)?;
-            let next_mod = mod_bits.saturating_sub(count.min(64) as u16);
-            if count < 64 && next_mod > 0 {
-                terms_at(cx, n.a, k << count, bias, out, d, keep_not, cut, next_mod, work)?;
+            if count < u64::from(n.width) {
+                let next_mod = mod_bits.saturating_sub(count as u16);
+                if next_mod > 0 {
+                    terms_at(cx, n.a, k << count, bias, out, d, keep_not, cut, next_mod, work)?;
+                }
             }
         }
         OpCode::Extract if mod_bits <= n.width && n.b == 0 && cx.node(n.a).width <= 64 => {
@@ -215,6 +223,9 @@ fn projection(cx: &Context, i: u32, work: &mut Work) -> Option<Projection> {
     let mut weights = [0u64; 64];
     for (part, k) in parts {
         let n = cx.node(part);
+        if n.width != w {
+            return None;
+        }
         let (x, mut m) = if n.op == OpCode::And {
             if let Some(m) = scalar(cx, n.b) {
                 (n.a, m)
@@ -366,6 +377,9 @@ impl Lane {
         let d = depth.checked_sub(1)?;
         let n = cx.node(i);
         let w = n.width;
+        if j >= w {
+            return Some(0);
+        }
         if matches!(n.op, OpCode::Add | OpCode::Sub | OpCode::Neg) && w <= 64 {
             if !work.projections.contains_key(&i) {
                 let p = projection(cx, i, work);
@@ -571,7 +585,14 @@ fn constant(
 }
 
 pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left: &mut u64) -> Option<u64> {
-    if !(1..=64).contains(&bits) || parts.len() > 96 || parts.iter().any(|&(i, _)| cx.node(i).width < bits) {
+    if !(1..=64).contains(&bits) || parts.len() > 96 {
+        return None;
+    }
+    let mask = u64::MAX >> (64 - bits);
+    if parts.iter().any(|&(i, k)| {
+        let km = k & mask;
+        km != 0 && u32::from(cx.node(i).width) + km.trailing_zeros() < u32::from(bits)
+    }) {
         return None;
     }
     let mut work = Work { left: *left, projections: Default::default() };
@@ -1139,6 +1160,7 @@ pub(in crate::engine::pass) fn equal_lanes(
                     if removed[j]
                         || (parts[j].1 & mask) != neg_ki
                         || cx.node(parts[j].0).op != OpCode::Mul
+                        || cx.wid(parts[i].0) != cx.wid(parts[j].0)
                     {
                         continue;
                     }
@@ -2022,6 +2044,9 @@ fn sum_slice(
     let mut weights = [0u64; 64];
     let mut source = None;
     for &(t, k) in parts.iter() {
+        if cx.wid(t) != w {
+            return None;
+        }
         let s = super::slice_of(cx, t, memo, 0);
         if s.mask != 0 && source.replace(s.base).is_some_and(|b| b != s.base) {
             return None;

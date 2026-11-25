@@ -1291,6 +1291,126 @@ fn rotation(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
 /// constant it absorbs.
 fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let u = cx.width_of(n);
+    let node = cx.node(n);
+    // A bitwise tree masked by `1` (`tree & 1`) observes only bit 0 of each leaf: hoist
+    // `zext`/`sext` of 1-bit conditions and constant right shifts (`x >>u k` -> `extract<k, 1>(x)`)
+    // into a 1-bit bitwise tree under a single `zext`, so majority/carry expressions unify.
+    let is_one_const = |id: u32| cx.const_val(id).and_then(|v| v.to_u64()) == Some(1);
+    if node.op == OpCode::And && u.bits() > 1 && (is_one_const(node.a) || is_one_const(node.b)) {
+        let inner = if is_one_const(node.b) { node.a } else { node.b };
+        if bitwise_op(cx.node(inner).op) {
+            let mut b_order: Vec<u32> = Vec::new();
+            let mut b_seen: Vec<u32> = Vec::new();
+            let mut b_stack: Vec<(u32, bool)> = vec![(inner, false)];
+            let mut b_casts = 0usize;
+            let mut b_shifts = 0usize;
+            let mut b_stops: Vec<u32> = Vec::new();
+            let mut ok = true;
+            while let Some((i, expanded)) = b_stack.pop() {
+                if expanded {
+                    b_order.push(i);
+                    continue;
+                }
+                if b_seen.contains(&i) {
+                    continue;
+                }
+                b_seen.push(i);
+                if b_seen.len() > HOIST_NODES {
+                    ok = false;
+                    break;
+                }
+                let li = cx.node(i);
+                if cx.const_val(i).is_some() {
+                    continue;
+                }
+                match li.op {
+                    OpCode::Zext | OpCode::Sext if cx.wid(li.a) == 1 => {
+                        b_casts += 1;
+                        b_stops.push(li.a);
+                    }
+                    OpCode::LShr
+                        if cx
+                            .const_val(li.b)
+                            .and_then(|v| v.to_u64())
+                            .is_some_and(|s| s < u64::from(cx.wid(li.a))) =>
+                    {
+                        b_shifts += 1;
+                        b_stops.push(li.a);
+                    }
+                    op if bitwise_op(op) => {
+                        b_stack.push((i, true));
+                        for c in li.children() {
+                            b_stack.push((c, false));
+                        }
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && b_casts >= 1 && b_casts + b_shifts >= 2 {
+                r.meter.charge(Counter::PassWork, b_order.len() as u64)?;
+                let before = cx.len() as u32;
+                let mut bit_map: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+                for &i in &b_seen {
+                    let li = cx.node(i);
+                    if let Some(c) = cx.const_val(i) {
+                        let t = c.trunc(crate::Width::W1).map_err(|e| Stop::Error(e.into()))?;
+                        bit_map.insert(i, r.build(cx, |cx| cx.mk_const(&t))?);
+                    } else if matches!(li.op, OpCode::Zext | OpCode::Sext) && cx.wid(li.a) == 1 {
+                        bit_map.insert(i, li.a);
+                    } else if li.op == OpCode::LShr {
+                        let s = cx.const_val(li.b).unwrap().to_u64().unwrap() as u16;
+                        let ex = r.build(cx, |cx| cx.c_extract(li.a, s, 1))?;
+                        bit_map.insert(i, ex);
+                    }
+                }
+                for &i in &b_order {
+                    let li = cx.node(i);
+                    let a = bit_map[&li.a];
+                    let bit = if li.op == OpCode::Not {
+                        r.build(cx, |cx| cx.c_un(UnOp::Not, a))?
+                    } else {
+                        let bin = li.op.as_bin().unwrap_or(BinOp::And);
+                        let b = bit_map[&li.b];
+                        r.build(cx, |cx| cx.c_bin(bin, a, b))?
+                    };
+                    bit_map.insert(i, bit);
+                }
+                let mut f = bit_map[&inner];
+                if bitwise_op(cx.node(f).op)
+                    && let Some(m) = masked_with(r, cx, &[f], false)?
+                    && !m.atoms.is_empty()
+                    && let Some((_, tables)) = m.classes.first()
+                {
+                    for &a in &m.atoms {
+                        if a < before {
+                            b_stops.push(a);
+                        }
+                    }
+                    f = emit(r, cx, tables[0], &m.atoms)?;
+                }
+                let e = r.build(cx, |cx| cx.c_zext(f, u.bits()))?;
+                b_stops.sort_unstable();
+                b_stops.dedup();
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &b_stops,
+                    Fin::FINAL,
+                    true,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
+    }
     // The tree, operands first; its leaves.
     let mut order: Vec<u32> = Vec::new();
     let mut seen: Vec<u32> = Vec::new();
@@ -1466,11 +1586,113 @@ fn masked_overlap(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<St
     Ok(Step::Normal(Fin::FINAL))
 }
 
+/// Whether 1-bit conditions `x` and `y` are exact logical complements (`~`, `==`/`!=`, `<`/`>=`).
+pub(super) fn complementary_conds(cx: &Context, x: u32, y: u32) -> bool {
+    let (nx, ny) = (cx.node(x), cx.node(y));
+    if (nx.op == OpCode::Not && nx.a == y) || (ny.op == OpCode::Not && ny.a == x) {
+        return true;
+    }
+    match (nx.op, ny.op) {
+        (OpCode::Eq, OpCode::Ne) | (OpCode::Ne, OpCode::Eq) => {
+            (nx.a == ny.a && nx.b == ny.b) || (nx.a == ny.b && nx.b == ny.a)
+        }
+        (OpCode::Ult, OpCode::Ule)
+        | (OpCode::Ule, OpCode::Ult)
+        | (OpCode::Slt, OpCode::Sle)
+        | (OpCode::Sle, OpCode::Slt) => nx.a == ny.b && nx.b == ny.a,
+        _ => false,
+    }
+}
+
+/// Extract `(cond, true_is_val, val)` from a branchless gated arm (`select(c, v, 0)`,
+/// `select(c, 0, v)`, `v * zext(c)`, or `v & sext(c)`).
+fn gated_arm(cx: &Context, id: u32) -> Option<(u32, bool, u32)> {
+    let n = cx.node(id);
+    let is_zero = |x: u32| cx.const_val(x).is_some_and(|v| v.is_zero());
+    match n.op {
+        OpCode::Select if is_zero(n.c) => Some((n.a, true, n.b)),
+        OpCode::Select if is_zero(n.b) => Some((n.a, false, n.c)),
+        OpCode::Mul => {
+            let (na, nb) = (cx.node(n.a), cx.node(n.b));
+            if nb.op == OpCode::Zext && cx.wid(nb.a) == 1 {
+                Some((nb.a, true, n.a))
+            } else if na.op == OpCode::Zext && cx.wid(na.a) == 1 {
+                Some((na.a, true, n.b))
+            } else {
+                None
+            }
+        }
+        OpCode::And => {
+            let (na, nb) = (cx.node(n.a), cx.node(n.b));
+            if nb.op == OpCode::Sext && cx.wid(nb.a) == 1 {
+                Some((nb.a, true, n.a))
+            } else if na.op == OpCode::Sext && cx.wid(na.a) == 1 {
+                Some((na.a, true, n.b))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Merge `a | b`, `a ^ b`, or `a + b` when `a` and `b` are complementary gated arms
+/// (`select(c, x, 0) | select(!c, y, 0)` or `x * zext(u == k) | y * zext(u != k)`) into `select(c, x, y)`.
+pub(super) fn merge_complementary_arms(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    kind: PassKind,
+    n: u32,
+    lhs: u32,
+    rhs: u32,
+) -> Result<Option<Step>, Stop> {
+    let (Some((c1, p1, v1)), Some((c2, p2, v2))) = (gated_arm(cx, lhs), gated_arm(cx, rhs)) else {
+        return Ok(None);
+    };
+    let choice = if c1 == c2 && p1 != p2 {
+        let (t, f) = if p1 { (v1, v2) } else { (v2, v1) };
+        Some((c1, t, f))
+    } else if complementary_conds(cx, c1, c2) && p1 == p2 {
+        let prefer_second = matches!(cx.node(c1).op, OpCode::Not | OpCode::Ne)
+            && !matches!(cx.node(c2).op, OpCode::Not | OpCode::Ne);
+        if prefer_second {
+            let (t, f) = if p2 { (v2, v1) } else { (v1, v2) };
+            Some((c2, t, f))
+        } else {
+            let (t, f) = if p1 { (v1, v2) } else { (v2, v1) };
+            Some((c1, t, f))
+        }
+    } else {
+        None
+    };
+    let Some((cond, t, f)) = choice else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| cx.c_select(cond, t, f))?;
+    let mut stops = vec![cond, t, f];
+    stops.sort_unstable();
+    stops.dedup();
+    finish(r, cx, kind, n, e, before, &stops, Fin::FINAL).map(Some)
+}
+
 /// The bitwise pass at `n`. What a candidate it declines contributes stays in the result (see
 /// the linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
-    if !bitwise_op(cx.node(n).op) {
+    let op = cx.node(n).op;
+    if !bitwise_op(op) {
         return Ok(Step::Normal(Fin::FINAL));
+    }
+    if matches!(op, OpCode::Or | OpCode::Xor) {
+        let node = cx.node(n);
+        if let Some(step) =
+            merge_complementary_arms(r, cx, PassKind::Bitwise, n, node.a, node.b)?
+        {
+            match step {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        }
     }
     let hoisted = match hoist_cast(r, cx, n)? {
         Step::Normal(f) => f,
@@ -1512,7 +1734,20 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                         })) =>
             {
                 match masked_step(r, cx, n, true)? {
-                    Step::Normal(g) => Step::Normal(f.and(g)),
+                    Step::Normal(g) => {
+                        let nonconst = atoms
+                            .iter()
+                            .filter(|&&a| !bitwise_op(cx.node(a).op) && cx.const_val(a).is_none())
+                            .count();
+                        if nonconst <= 1 && atoms.len() >= 3 {
+                            match one_atom_step(r, cx, n)? {
+                                Step::Normal(h) => Step::Normal(f.and(g).and(h)),
+                                done => done,
+                            }
+                        } else {
+                            Step::Normal(f.and(g))
+                        }
+                    }
                     done => done,
                 }
             }

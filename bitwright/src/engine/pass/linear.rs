@@ -1419,12 +1419,75 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
     let zero = BitVec::zero(w);
     let (cond, t, f) = (node.a, node.b, node.c);
 
-    // Pattern 1: `select(a, s + k, s)` or `select(a, s, s + k)` where `s` is a constant-armed select.
-    let const_select = |id: u32| -> bool {
-        let sn = cx.node(id);
-        sn.op == OpCode::Select && cx.const_val(sn.b).is_some() && cx.const_val(sn.c).is_some()
+    let bit_key = |id: u32| -> (u32, u16) {
+        let bn = cx.node(id);
+        if bn.op == OpCode::Extract && bn.width == 1 {
+            if bn.b == 0 && cx.node(bn.a).op == OpCode::LShr {
+                let sn = cx.node(bn.a);
+                if let Some(s) = cx.const_val(sn.b).and_then(|v| v.to_u64())
+                    && s < u64::from(cx.wid(sn.a))
+                {
+                    return (sn.a, s as u16);
+                }
+            }
+            return (bn.a, bn.b as u16);
+        }
+        (id, 0)
     };
-    let add_const_of = |sum_id: u32, base_id: u32| -> Option<BitVec> {
+    let scaled_bit_arm = |arm: u32| -> Option<((u32, u16), BitVec)> {
+        let an = cx.node(arm);
+        let one = BitVec::from_u64(w, 1).ok()?;
+        let (unit, scale) = match an.op {
+            OpCode::Sext if cx.wid(an.a) == 1 => return Some((bit_key(an.a), BitVec::ones(w))),
+            OpCode::Mul => {
+                if let Some(k) = cx.const_val(an.b) {
+                    (an.a, k)
+                } else {
+                    (an.b, cx.const_val(an.a)?)
+                }
+            }
+            OpCode::Shl => {
+                let s = cx.const_val(an.b)?.to_u64()?;
+                if s >= u64::from(w.bits()) {
+                    return None;
+                }
+                (an.a, crate::facts::known::bv_shl(&one, s as u32))
+            }
+            _ => (arm, one),
+        };
+        let un = cx.node(unit);
+        let is_one_const = |id: u32| cx.const_val(id).and_then(|v| v.to_u64()) == Some(1);
+        let key = if un.op == OpCode::Zext && cx.wid(un.a) == 1 {
+            bit_key(un.a)
+        } else if un.op == OpCode::And && (is_one_const(un.a) || is_one_const(un.b)) {
+            let v = if is_one_const(un.b) { un.a } else { un.b };
+            let vn = cx.node(v);
+            if vn.op == OpCode::LShr
+                && let Some(s) = cx.const_val(vn.b).and_then(|v| v.to_u64())
+                && s < u64::from(cx.wid(vn.a))
+            {
+                (vn.a, s as u16)
+            } else {
+                (v, 0)
+            }
+        } else {
+            return None;
+        };
+        Some((key, scale))
+    };
+
+    // Pattern 1: `select(a, s + k, s)` or `select(a, s, s + k)` where `s` is a constant-armed
+    // select or a 1-bit scaled arm (also matching disjoint `s | k` / `s ^ k`).
+    let base_known_mask = |id: u32| -> Option<BitVec> {
+        let sn = cx.node(id);
+        if sn.op == OpCode::Select
+            && let (Some(c1), Some(c0)) = (cx.const_val(sn.b), cx.const_val(sn.c))
+        {
+            return Some(BitVec::bin_unchecked(BinOp::Or, &c1, &c0));
+        }
+        scaled_bit_arm(id).map(|(_, scale)| scale)
+    };
+    let add_const_of = |sum_id: u32, base_id: u32, base_mask: &BitVec| -> Option<BitVec> {
         let sn = cx.node(sum_id);
         match sn.op {
             OpCode::Add if sn.a == base_id => cx.const_val(sn.b),
@@ -1432,11 +1495,17 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
             OpCode::Sub if sn.a == base_id => {
                 cx.const_val(sn.b).map(|k| BitVec::un_unchecked(UnOp::Neg, &k))
             }
+            OpCode::Or | OpCode::Xor if sn.a == base_id => cx
+                .const_val(sn.b)
+                .filter(|k| BitVec::bin_unchecked(BinOp::And, k, base_mask).is_zero()),
+            OpCode::Or | OpCode::Xor if sn.b == base_id => cx
+                .const_val(sn.a)
+                .filter(|k| BitVec::bin_unchecked(BinOp::And, k, base_mask).is_zero()),
             _ => None,
         }
     };
-    if const_select(f)
-        && let Some(k) = add_const_of(t, f)
+    if let Some(mask) = base_known_mask(f)
+        && let Some(k) = add_const_of(t, f, &mask)
     {
         let before = cx.len() as u32;
         let kv = r.build(cx, |cx| cx.mk_const(&k))?;
@@ -1455,8 +1524,8 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
             .map(Some);
     }
-    if const_select(t)
-        && let Some(k) = add_const_of(f, t)
+    if let Some(mask) = base_known_mask(t)
+        && let Some(k) = add_const_of(f, t, &mask)
     {
         let before = cx.len() as u32;
         let kv = r.build(cx, |cx| cx.mk_const(&k))?;
@@ -1476,7 +1545,7 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
             .map(Some);
     }
 
-    // Pattern 2: `select(a, select(b, c11, c10), select(b', c01, c00))` where `b' == b` or `~b`
+    // Pattern 2: `select(a, select(b, c11, c10), select(b', f1, f0))` where `b' == b` or `~b`
     // and `c11 + c00 == c10 + c01 (mod 2^w)`.
     let (tn, fn_) = (cx.node(t), cx.node(f));
     if tn.op == OpCode::Select && fn_.op == OpCode::Select {
@@ -1489,67 +1558,106 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
             return Ok(None);
         };
         let b = tn.a;
-        let is_comp_cond = |x: u32, y: u32| -> bool {
-            let (nx, ny) = (cx.node(x), cx.node(y));
-            if (nx.op == OpCode::Not && nx.a == y) || (ny.op == OpCode::Not && ny.a == x) {
-                return true;
-            }
-            match (nx.op, ny.op) {
-                (OpCode::Eq, OpCode::Ne) | (OpCode::Ne, OpCode::Eq) => {
-                    (nx.a == ny.a && nx.b == ny.b) || (nx.a == ny.b && nx.b == ny.a)
-                }
-                // `t <s 0` vs `0 <=s t` (complementary sign tests).
-                (OpCode::Slt, OpCode::Sle) => {
-                    cx.const_val(nx.b).is_some_and(|v| v.is_zero())
-                        && cx.const_val(ny.a).is_some_and(|v| v.is_zero())
-                        && nx.a == ny.b
-                }
-                (OpCode::Sle, OpCode::Slt) => {
-                    cx.const_val(ny.b).is_some_and(|v| v.is_zero())
-                        && cx.const_val(nx.a).is_some_and(|v| v.is_zero())
-                        && ny.a == nx.b
-                }
-                _ => false,
-            }
-        };
         let (c01, c00) = if fn_.a == b {
             (f1, f0)
-        } else if is_comp_cond(fn_.a, b) {
+        } else if super::bitwise::complementary_conds(cx, fn_.a, b) {
             (f0, f1)
         } else {
             return Ok(None);
         };
         let lhs = BitVec::bin_unchecked(BinOp::Add, &c11, &c00);
         let rhs = BitVec::bin_unchecked(BinOp::Add, &c10, &c01);
-        if lhs == rhs && c00.is_zero() {
-            let before = cx.len() as u32;
-            let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
-            let k1 = r.build(cx, |cx| cx.mk_const(&c10))?;
-            let k2 = r.build(cx, |cx| cx.mk_const(&c01))?;
-            let e = r.build(cx, |cx| {
-                let s1 = cx.c_select(cond, k1, zv)?;
-                let s2 = cx.c_select(b, k2, zv)?;
-                cx.c_bin(BinOp::Add, s1, s2)
-            })?;
-            let mut stops = vec![cond, b];
-            for c in [zv, k1, k2] {
-                if c < before && !stops.contains(&c) {
-                    stops.push(c);
+        if lhs == rhs {
+            let split_consts = if c00.is_zero() {
+                Some(((c10, zero), (c01, zero)))
+            } else if c01.is_zero() {
+                Some(((c11, zero), (zero, c00)))
+            } else if c10.is_zero() {
+                Some(((zero, c00), (c11, zero)))
+            } else if c11.is_zero() {
+                Some(((zero, c01), (zero, c10)))
+            } else {
+                None
+            };
+            if let Some(((a_t, a_f), (b_t, b_f))) = split_consts {
+                let before = cx.len() as u32;
+                let ka_t = r.build(cx, |cx| cx.mk_const(&a_t))?;
+                let ka_f = r.build(cx, |cx| cx.mk_const(&a_f))?;
+                let kb_t = r.build(cx, |cx| cx.mk_const(&b_t))?;
+                let kb_f = r.build(cx, |cx| cx.mk_const(&b_f))?;
+                let e = r.build(cx, |cx| {
+                    let s1 = cx.c_select(cond, ka_t, ka_f)?;
+                    let s2 = cx.c_select(b, kb_t, kb_f)?;
+                    cx.c_bin(BinOp::Add, s1, s2)
+                })?;
+                let mut stops = vec![cond, b];
+                for c in [ka_t, ka_f, kb_t, kb_f] {
+                    if c < before && !stops.contains(&c) {
+                        stops.push(c);
+                    }
                 }
+                return super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Linear,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )
+                .map(Some);
             }
-            return super::finish_with(
-                r,
-                cx,
-                PassKind::Linear,
-                n,
-                e,
-                before,
-                &stops,
-                Fin::FINAL,
-                true,
-            )
-            .map(Some);
         }
+    }
+
+    // Pattern 2b: `select(a, select(b, c11, c10), f)` (or symmetric) where `f` is already a
+    // canonical 1-bit scaled value of `b` equal to `c11 - c10` (e.g. `zext(b) * d`, `zext(b) << k`,
+    // or `(x >>u lo & 1) * d` when `b` is `extract<lo, 1>(x)`), rewriting to `select(a, c10, 0) + f`.
+    if tn.op == OpCode::Select
+        && let (Some(c11), Some(c10)) = (cx.const_val(tn.b), cx.const_val(tn.c))
+        && let Some((fkey, fscale)) = scaled_bit_arm(f)
+        && fkey == bit_key(tn.a)
+        && fscale == BitVec::bin_unchecked(BinOp::Sub, &c11, &c10)
+    {
+        let before = cx.len() as u32;
+        let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
+        let k1 = r.build(cx, |cx| cx.mk_const(&c10))?;
+        let e = r.build(cx, |cx| {
+            let s1 = cx.c_select(cond, k1, zv)?;
+            cx.c_bin(BinOp::Add, s1, f)
+        })?;
+        let mut stops = vec![cond, f];
+        for c in [zv, k1] {
+            if c < before && !stops.contains(&c) {
+                stops.push(c);
+            }
+        }
+        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
+            .map(Some);
+    }
+    if fn_.op == OpCode::Select
+        && let (Some(c01), Some(c00)) = (cx.const_val(fn_.b), cx.const_val(fn_.c))
+        && let Some((tkey, tscale)) = scaled_bit_arm(t)
+        && tkey == bit_key(fn_.a)
+        && tscale == BitVec::bin_unchecked(BinOp::Sub, &c01, &c00)
+    {
+        let before = cx.len() as u32;
+        let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
+        let k0 = r.build(cx, |cx| cx.mk_const(&c00))?;
+        let e = r.build(cx, |cx| {
+            let s1 = cx.c_select(cond, zv, k0)?;
+            cx.c_bin(BinOp::Add, s1, t)
+        })?;
+        let mut stops = vec![cond, t];
+        for c in [zv, k0] {
+            if c < before && !stops.contains(&c) {
+                stops.push(c);
+            }
+        }
+        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
+            .map(Some);
     }
     // Pattern 3: `select(c, k1 * base, k2 * base)` -> `base * select(c, k1, k2)`.
     // Works even when one arm's multiplier is even (where `scaled_base` shifts out trailing zeros
@@ -1691,6 +1799,85 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         && let Some(step) = additive_select(r, cx, n)?
     {
         return Ok(step);
+    }
+    if op == OpCode::Add {
+        if let Some(step) =
+            super::bitwise::merge_complementary_arms(r, cx, PassKind::Linear, n, node.a, node.b)?
+        {
+            match step {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        }
+        // Carry-free `(x ^ c1) + c2 -> x ^ k` (and `(x ^ c1) + select(cond, ct, cf) -> x ^ select(...)`)
+        // when the added constant carries nowhere into the possible ones `u` of `x`.
+        if node.width <= 64 {
+            let mask = u64::MAX >> (64 - node.width);
+            for (xor_id, other_id) in [(node.a, node.b), (node.b, node.a)] {
+                let xn = cx.node(xor_id);
+                if xn.op != OpCode::Xor {
+                    continue;
+                }
+                let Some((x, c1)) = (match (cx.const_val(xn.a), cx.const_val(xn.b)) {
+                    (None, Some(k)) => k.to_u64().map(|c| (xn.a, c & mask)),
+                    (Some(k), None) => k.to_u64().map(|c| (xn.b, c & mask)),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let (kb_opt, kfin) = super::known(r, cx, x)?;
+                let Some(kb) = kb_opt else { continue };
+                let Some(kz) = kb.known_zero().to_u64() else {
+                    continue;
+                };
+                let u = (!kz) & mask;
+                if u == mask {
+                    continue;
+                }
+                if let Some(c2) = cx.const_val(other_id).and_then(|v| v.to_u64()) {
+                    let k_hi = (c1 & !u).wrapping_add(c2) & mask;
+                    if (k_hi & u) == 0 {
+                        let before = cx.len() as u32;
+                        let kv = (c1 & u) | k_hi;
+                        let e = r.build(cx, |cx| {
+                            let kc = cx.mk_const_u64(node.width, kv)?;
+                            cx.c_bin(BinOp::Xor, x, kc)
+                        })?;
+                        match finish(r, cx, PassKind::Linear, n, e, before, &[x], kfin)? {
+                            Step::Normal(_) => {}
+                            done => return Ok(done),
+                        }
+                    }
+                } else if cx.node(other_id).op == OpCode::Select {
+                    let sn = cx.node(other_id);
+                    if let (Some(tv), Some(fv)) = (
+                        cx.const_val(sn.b).and_then(|v| v.to_u64()),
+                        cx.const_val(sn.c).and_then(|v| v.to_u64()),
+                    ) {
+                        let kt_hi = (c1 & !u).wrapping_add(tv) & mask;
+                        let kf_hi = (c1 & !u).wrapping_add(fv) & mask;
+                        if (kt_hi & u) == 0 && (kf_hi & u) == 0 {
+                            let before = cx.len() as u32;
+                            let kt = (c1 & u) | kt_hi;
+                            let kf = (c1 & u) | kf_hi;
+                            let e = r.build(cx, |cx| {
+                                let ct = cx.mk_const_u64(node.width, kt)?;
+                                let cf = cx.mk_const_u64(node.width, kf)?;
+                                let sel = cx.c_select(sn.a, ct, cf)?;
+                                cx.c_bin(BinOp::Xor, x, sel)
+                            })?;
+                            let mut stops = vec![x, sn.a];
+                            stops.sort_unstable();
+                            stops.dedup();
+                            match finish(r, cx, PassKind::Linear, n, e, before, &stops, kfin)? {
+                                Step::Normal(_) => {}
+                                done => return Ok(done),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     // `-((-x) * y) -> x * y` and `-(x * (-y)) -> x * y`.
     if op == OpCode::Neg {
@@ -1902,6 +2089,16 @@ fn counted(cx: &Context, t: u32) -> Option<(u32, u128)> {
             // The extension's high bits are zero: they count nothing.
             OpCode::Zext => {
                 m &= u128::MAX >> (128 - u32::from(cx.wid(s.a)).min(128));
+                y = s.a;
+            }
+            OpCode::LShr => {
+                let Some(k) = shift(s.b) else { break };
+                let wa = u64::from(cx.wid(s.a)).min(128);
+                let top_plus_1 = u64::from(128 - m.leading_zeros());
+                if k >= wa || top_plus_1 + k > wa {
+                    return None;
+                }
+                m <<= k;
                 y = s.a;
             }
             _ => break,

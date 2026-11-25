@@ -1529,7 +1529,124 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if node.op == OpCode::Select {
         return hoisted(r, cx, n);
     }
+    if node.op == OpCode::Popcnt {
+        let arg = cx.node(node.a);
+        if arg.op == OpCode::Zext {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let p = cx.c_un(UnOp::Popcnt, arg.a)?;
+                cx.c_zext(p, node.width)
+            })?;
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Casts,
+                n,
+                e,
+                before,
+                &[arg.a],
+                Fin::FINAL,
+                true,
+            );
+        }
+        if node.width <= 64 && arg.op == OpCode::And {
+            let pair = match (cx.const_val(arg.a), cx.const_val(arg.b)) {
+                (None, Some(k)) => k.to_u64().map(|m| (arg.a, m)),
+                (Some(k), None) => k.to_u64().map(|m| (arg.b, m)),
+                _ => None,
+            };
+            if let Some((shifted, mask)) = pair
+                && mask != 0
+                && cx.node(shifted).op == OpCode::LShr
+            {
+                let sn = cx.node(shifted);
+                if let Some(sh) = cx.const_val(sn.b).and_then(|v| v.to_u64())
+                    && sh < 64
+                {
+                    let tz = mask.trailing_zeros();
+                    let lo = sh as u32 + tz;
+                    let m_shifted = mask >> tz;
+                    let span = 64 - m_shifted.leading_zeros();
+                    if lo > 0
+                        && span > 0
+                        && span < u32::from(node.width)
+                        && lo + span <= u32::from(cx.wid(sn.a))
+                    {
+                        let run = m_shifted == (u64::MAX >> (64 - span));
+                        let before = cx.len() as u32;
+                        let e = r.build(cx, |cx| {
+                            let mut field = cx.c_extract(sn.a, lo as u16, span as u16)?;
+                            if !run {
+                                let mc = cx.mk_const_u64(span as u16, m_shifted)?;
+                                field = cx.c_bin(BinOp::And, field, mc)?;
+                            }
+                            let p = cx.c_un(UnOp::Popcnt, field)?;
+                            cx.c_zext(p, node.width)
+                        })?;
+                        return super::finish_with(
+                            r,
+                            cx,
+                            PassKind::Casts,
+                            n,
+                            e,
+                            before,
+                            &[sn.a],
+                            Fin::FINAL,
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+        return Ok(Step::Normal(Fin::FINAL));
+    }
     if node.op == OpCode::Zext {
+        let p = cx.node(node.a);
+        if p.op == OpCode::Popcnt {
+            let ex = cx.node(p.a);
+            if ex.op == OpCode::Extract && ex.b == 0 && cx.wid(ex.a) == node.width {
+                let (kb_opt, kfin) = super::known(r, cx, ex.a)?;
+                if let Some(kb) = kb_opt {
+                    let high = BitVec::un_unchecked(
+                        UnOp::Not,
+                        &crate::facts::known::low_mask(cx.width_of(n), u32::from(ex.width)),
+                    );
+                    if BitVec::bin_unchecked(BinOp::And, &kb.known_zero(), &high) == high {
+                        let before = cx.len() as u32;
+                        let e = r.build(cx, |cx| cx.c_un(UnOp::Popcnt, ex.a))?;
+                        match finish(r, cx, PassKind::Casts, n, e, before, &[ex.a], kfin)? {
+                            Step::Normal(_) => {}
+                            done => return Ok(done),
+                        }
+                    }
+                }
+                let mask_bv = crate::facts::known::low_mask(cx.width_of(n), u32::from(ex.width));
+                let before = cx.len() as u32;
+                let mc = r.build(cx, |cx| cx.mk_const(&mask_bv))?;
+                let e = r.build(cx, |cx| {
+                    let masked = cx.c_bin(BinOp::And, ex.a, mc)?;
+                    cx.c_un(UnOp::Popcnt, masked)
+                })?;
+                let mut stops = vec![ex.a];
+                if mc < before {
+                    stops.push(mc);
+                }
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Casts,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
         return zext_to_live_wide(r, cx, n);
     }
     if node.op != OpCode::Extract {
