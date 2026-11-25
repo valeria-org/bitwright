@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "bitwright"
-version = "0.32.16"
+version = "0.32.17"
 dependencies = [
  "hashbrown",
 ]
 
 [[package]]
 name = "bitwright-py"
-version = "0.32.16"
+version = "0.32.17"
 dependencies = [
  "bitwright",
  "pyo3",

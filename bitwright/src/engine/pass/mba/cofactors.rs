@@ -29,6 +29,9 @@ struct Table {
     code: Vec<Node>,
     places: IdMap<u32, u32>,
     affines: Vec<AffineLeaf>,
+    /// Pre-scanned constant shifts `(base, shift_amount, is_lshr) -> node_id` in the current group
+    /// so `rotl(x, k)` decomposes into `(x << k) | (x >>u (w - k))` without allocating a 3rd atom.
+    shifts: Vec<(u32, u16, bool, u32)>,
     terms: Vec<(u32, u64)>,
     atoms: usize,
     /// Per atom slot (`0..6`): exact known-zero bitmask (`1` where the atom is always 0).
@@ -238,6 +241,46 @@ impl Table {
                     aux: 0,
                 })?
             }
+            OpCode::RotL | OpCode::RotR
+                if n.width <= 64 && cx.const_val(n.b).and_then(|v| v.to_u64()).is_some() =>
+            {
+                let w = n.width;
+                let raw = (cx.const_val(n.b)?.to_u64()? % u64::from(w)) as u16;
+                let lsh = if n.op == OpCode::RotL {
+                    raw
+                } else {
+                    (w - raw) % w
+                };
+                if lsh == 0 {
+                    self.place(cx, n.a, depth - 1, work)?
+                } else {
+                    let rsh = w - lsh;
+                    let shl_id = self
+                        .shifts
+                        .iter()
+                        .find(|&&(b, s, r, _)| b == n.a && s == lsh && !r)
+                        .map(|&(_, _, _, id)| id);
+                    let lshr_id = self
+                        .shifts
+                        .iter()
+                        .find(|&&(b, s, r, _)| b == n.a && s == rsh && r)
+                        .map(|&(_, _, _, id)| id);
+                    if let (Some(hi), Some(lo)) = (shl_id, lshr_id) {
+                        let pa = self.place(cx, hi, depth - 1, work)?;
+                        let pb = self.place(cx, lo, depth - 1, work)?;
+                        self.push_node(Node {
+                            op: OpCode::Or,
+                            width: w,
+                            a: pa,
+                            b: pb,
+                            c: 0,
+                            aux: 0,
+                        })?
+                    } else {
+                        self.place_atom(cx, i, depth, work)?
+                    }
+                }
+            }
             _ => self.place_atom(cx, i, depth, work)?,
         };
         self.places.insert(i, p);
@@ -253,8 +296,38 @@ impl Table {
         self.code.clear();
         self.places.clear();
         self.affines.clear();
+        self.shifts.clear();
         self.terms.clear();
         self.atoms = 0;
+        let mut scan_stack: Vec<(u32, u8)> = parts.iter().map(|&(i, _)| (i, 12)).collect();
+        let mut scanned = 0u32;
+        while let Some((cur, d)) = scan_stack.pop() {
+            scanned += 1;
+            if scanned > 192 {
+                break;
+            }
+            let m = cx.node(cur);
+            if matches!(m.op, OpCode::Shl | OpCode::LShr)
+                && m.width == w
+                && let Some(s) = cx.const_val(m.b).and_then(|v| v.to_u64())
+                && s > 0
+                && s < u64::from(w)
+            {
+                let key = (m.a, s as u16, m.op == OpCode::LShr, cur);
+                if !self.shifts.contains(&key) && self.shifts.len() < 16 {
+                    self.shifts.push(key);
+                }
+            } else if d > 0
+                && matches!(
+                    m.op,
+                    OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Extract | OpCode::Zext
+                )
+            {
+                for c in m.children() {
+                    scan_stack.push((c, d - 1));
+                }
+            }
+        }
         for &(i, k) in parts {
             let p = self.place(cx, i, 48, work)?;
             self.terms.push((p, k));
@@ -511,6 +584,66 @@ impl Sums {
                         // Rebuild canonical product coefficient only if needed on emit.
                         let prod_id = cx.c_bin(BinOp::Mul, p1[0], p1[1])?;
                         self.parts[idx] = (prod_id, c1);
+                    }
+                }
+            }
+            // Reunite distributed factor pairs `k * (g * A) + k * (g * B) == k * (g * K)` when
+            // an existing factor `K` in `self.products` equals `A + B` (or `A - B`).
+            let mut factor_set: Vec<u32> = Vec::new();
+            for &(pair, _) in self.products.iter().flatten() {
+                for f in pair {
+                    if !factor_set.contains(&f) && factor_set.len() < 32 {
+                        factor_set.push(f);
+                    }
+                }
+            }
+            for idx in 0..self.products.len() {
+                let Some((p1, c1)) = self.products[idx] else { continue };
+                for j in (idx + 1)..self.products.len() {
+                    let Some((p2, c2)) = self.products[j] else { continue };
+                    let (same_sign, neg_b) = if c1 == c2 {
+                        (true, false)
+                    } else if c1.wrapping_add(c2) & mask == 0 {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    };
+                    if !same_sign {
+                        continue;
+                    }
+                    let shared = if p1[0] == p2[0] {
+                        Some((p1[0], p1[1], p2[1]))
+                    } else if p1[0] == p2[1] {
+                        Some((p1[0], p1[1], p2[0]))
+                    } else if p1[1] == p2[0] {
+                        Some((p1[1], p1[0], p2[1]))
+                    } else if p1[1] == p2[1] {
+                        Some((p1[1], p1[0], p2[0]))
+                    } else {
+                        None
+                    };
+                    let Some((g, fa, fb)) = shared else { continue };
+                    let target_k = factor_set.iter().copied().find(|&kf| {
+                        if kf == g || kf == fa || kf == fb {
+                            return false;
+                        }
+                        let kn = cx.node(kf);
+                        if !neg_b && kn.op == OpCode::Add {
+                            (kn.a == fa && kn.b == fb) || (kn.a == fb && kn.b == fa)
+                        } else if neg_b && kn.op == OpCode::Sub {
+                            kn.a == fa && kn.b == fb
+                        } else {
+                            false
+                        }
+                    });
+                    if let Some(kf) = target_k {
+                        let prod_id = cx.c_bin(BinOp::Mul, g, kf)?;
+                        self.products[idx] = Some(([g, kf], c1));
+                        self.parts[idx] = (prod_id, c1);
+                        self.products[j] = None;
+                        self.parts[j].1 = 0;
+                        changed = true;
+                        break;
                     }
                 }
             }

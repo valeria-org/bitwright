@@ -7,11 +7,11 @@ use crate::rules::matcher::closed as is_closed;
 use crate::rules::{NodeId, ParamKind, RNode, Rule};
 
 /// Operators as a bit set.
-type Mask = u128;
+pub(crate) type Mask = u128;
 
-const ALL: Mask = !0;
+pub(crate) const ALL: Mask = !0;
 
-const fn bit(op: OpCode) -> Mask {
+pub(crate) const fn bit(op: OpCode) -> Mask {
     1 << (op as u8)
 }
 
@@ -30,6 +30,7 @@ struct Entry {
 /// Candidate lists per operator, in priority order.
 pub(crate) struct DispatchNet {
     by_op: Vec<Vec<Entry>>,
+    pub(crate) ops: Mask,
 }
 
 /// The operators a pattern node can match.
@@ -62,6 +63,7 @@ impl DispatchNet {
     /// A net over `rules[i]` for the given indices, in that (priority) order.
     pub(crate) fn new(rules: &[Rule], order: &[u32]) -> DispatchNet {
         let mut by_op: Vec<Vec<Entry>> = (0..OpCode::ALL.len()).map(|_| Vec::new()).collect();
+        let mut ops: Mask = 0;
         for &ri in order {
             let rule = &rules[ri as usize];
             let root = rule.lhs;
@@ -91,6 +93,7 @@ impl DispatchNet {
             for (k, &c) in kids.iter().enumerate() {
                 masks[k] = mask(rule, c);
             }
+            ops |= bit(op);
             by_op[op as usize].push(Entry {
                 rule: ri,
                 masks,
@@ -98,7 +101,7 @@ impl DispatchNet {
                 either,
             });
         }
-        DispatchNet { by_op }
+        DispatchNet { by_op, ops }
     }
 
     /// The candidate rules for node `n`, in priority order.

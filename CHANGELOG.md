@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.32.17
+
+- Added subtree opcode bitmasks (`Meta::ops`) and `DispatchNet` target opcode tracking to prune
+  entire DAG subtrees in `Runner::walk` when no target opcode is present, plus zero-allocation
+  `Context::find_const_u64`.
+- Enabled guard-driven case splitting (`Runner::split`) for 1-bit `opaque_sweep` predicates over
+  multi-bit symbol conditions (`has_sym_select_guard`), prioritized conditions fixing `>= 2` symbol
+  bits in `most_tested`, deferred unsplit `Phase::Words`, ran a follow-up sweep on specialized
+  1-bit branch roots, capped expensive refuted slice SAT checks (`slices::fitted`), and extended
+  `bitwright::prove`'s difference pass (`eq.a - eq.b`) past fuel/step limits.
+- Added zero-allocation narrow-to-wide `zext` unification (`casts::find_wide_masked` /
+  `zext_to_live_wide` and `Shl` in `narrow_to_live_wide`), DAG polynomial/complement subterm
+  canonicalization (`poly::canonicalize_dag` in `mba::sweep`), constant-sum cofactor folding in
+  `linear::factor_sum`, and `RotL`/`RotR` + distributed bilinear factor reunion in
+  `mba::cofactors`.
+- Added peeled non-constant masked congruence (`peeled_masked_equal` / `narrow_causal` in `mba`),
+  shared non-uniform constant mask atoms (`equal_const_atoms`) and constant-complement atom merging
+  in `linear_mba`, `AlignMode::ShiftWords` and `equal_low_cone_zero` in `mba::opaque_predicate`,
+  and complemented `Ult`/`Ule`, `select` zero-arm/base-offset canonicalization, partial-arm
+  `select` congruence, `packed_zero_or`, 2-bit masked `single_bit_cube`, and large-DAG `sext` vs
+  `0` stripping in `compares`.
+- Generalized `mba::bit_table` to 3-bit `SmallTable` entries with deduplicating bit unification,
+  atomic `<= 2`-bit `Add` leaf preservation (`stop_leaves`), provably zero-overflow carry-operand
+  cluster merging, and arbitrary `1 <= nw < w <= 64` (`nw <= 32`) `solve_carry_split` MITM.
+
 ## 0.32.16
 
 - Extended `linear_mba` with orthogonal linear-term splitting (`solve_split_orthogonal` /

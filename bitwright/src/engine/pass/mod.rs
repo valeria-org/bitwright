@@ -519,6 +519,11 @@ pub(super) fn split_cases(
     Ok((e != root).then_some(e))
 }
 
+#[cfg(feature = "mba")]
+pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
+    context::has_sym_select_guard(cx, root)
+}
+
 /// A root that is a select, with the choice written as far down as its arms agree (see
 /// `context::join`): `None` when it is no select, or that is the root itself.
 #[cfg(feature = "mba")]

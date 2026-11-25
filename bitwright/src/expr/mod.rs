@@ -233,6 +233,7 @@ pub(crate) struct Meta {
     pub(crate) shash: u64,
     pub(crate) height: u32,
     pub(crate) tree: u32,
+    pub(crate) ops: u128,
 }
 
 /// Generation-stamped marks, reused across traversals without clearing.
@@ -759,10 +760,12 @@ impl Context {
         self.room()?;
         let idx = self.nodes.len() as u32;
         let (mut height, mut tree) = (0u32, 1u32);
+        let mut ops = 1u128 << (n.op as u8);
         for c in n.children() {
             let m = self.meta[c as usize];
             height = height.max(m.height);
             tree = tree.saturating_add(m.tree);
+            ops |= m.ops;
         }
         let height = if n.op.arity() == 0 {
             0
@@ -774,6 +777,7 @@ impl Context {
             shash,
             height,
             tree,
+            ops,
         });
         let seed = self.config.hash_seed;
         let meta = &self.meta;
@@ -811,6 +815,24 @@ impl Context {
         self.interner
             .find(self.table_hash(self.node_hash(n)), |&i| {
                 nodes[i as usize] == *n
+            })
+            .copied()
+    }
+
+    /// The interned constant `v` of width `w <= 64`, without creating it.
+    pub(crate) fn find_const_u64(&self, w: u16, v: u64) -> Option<u32> {
+        if w == 0 || w > 64 {
+            return None;
+        }
+        let v = if w == 64 { v } else { v & ((1u64 << w) - 1) };
+        let shash = combine(combine(u64::from(OpCode::Const as u8), u64::from(w)), v);
+        let nodes = &self.nodes;
+        self.interner
+            .find(self.table_hash(shash), |&i| {
+                let n = &nodes[i as usize];
+                n.op == OpCode::Const
+                    && n.width == w
+                    && (u64::from(n.a) | (u64::from(n.b) << 32)) == v
             })
             .copied()
     }

@@ -600,6 +600,10 @@ mod extra_tests {
             "rotl(rotr(x, k & 63), k & 63) == x",
             // Redundant low-bit mask on power-of-two rotate count
             "rotr(x, k & 63) == rotr(x, k)",
+            // Causal low-6-bit MBA rotate count equivalence (0x14022a990-style)
+            "let %36 = a ^ b; let %37 = (b + 2) ^ a; let %38 = %36 & 61; \
+             let %39 = (%38 - (%37 & 61)) * 310 + 0xffffb14a & 62; \
+             (x << (10 - ((%36 & 2) + %37 - %38) * 10 & 62) | x >>u %39) == rotr(x, %39)",
         ] {
             let e = cx.parse(text, &opt).unwrap();
             let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();

@@ -472,6 +472,30 @@ fn sweep_inner(
     } else {
         root
     };
+    let root = if fold_cases
+        && cfg.opaque_sweep
+        && r.assumptions.is_none()
+        && order.iter().any(|&i| {
+            let m = cx.node(i);
+            m.op == OpCode::Mul && !cx.is_const(m.a) && !cx.is_const(m.b)
+        })
+        && let Some(e) = super::poly::canonicalize_dag(r, cx, root, &order)?
+    {
+        r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+        order = cx.post_order_ids(&[e]);
+        r.meter.charge(Counter::PassWork, order.len() as u64)?;
+        if let Some(e2) = cofactors::reduce(r, cx, e, &order)? {
+            count(r).opaque_proved += 1;
+            r.emit_part(cx, crate::engine::Stage::Sweep, e, e2);
+            order = cx.post_order_ids(&[e2]);
+            r.meter.charge(Counter::PassWork, order.len() as u64)?;
+            e2
+        } else {
+            e
+        }
+    } else {
+        root
+    };
     if fold_cases && let Some(e) = opaque_predicate::reduce_columns(r, cx, root, &order)? {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
@@ -792,7 +816,12 @@ fn sweep_inner(
         // the whole no longer applies (six of 47 measured constants were lost that way).
         let predicate =
             cx.width_of(cur).bits() == 1 || (op == OpCode::Extract && cx.node(cur).b == 0);
-        if !all_constant && (!(mixed || predicate) || failures >= SWEEP_FAILURES) {
+        let max_failures = if r.meter.left_in(|b| b.pass_work) < 524_288 {
+            16
+        } else {
+            SWEEP_FAILURES
+        };
+        if !all_constant && (!(mixed || predicate) || failures >= max_failures) {
             continue;
         }
         // Not `k` at an input an earlier candidate differed at: no constant.
@@ -850,6 +879,7 @@ fn sweep_inner(
             count(r).opaque_skipped += 1;
             continue;
         }
+        let wit0 = r.mba.witnesses.len();
         let mut budget_starved = false;
         if !decided
             && !refuted
@@ -872,6 +902,7 @@ fn sweep_inner(
             if !decided && !refuted && subject != cur {
                 let again = asked!('nodes, readings_prove(r, cx, cfg, cur, &k, SWEEP_SHARE));
                 decided = again.0;
+                refuted |= again.1;
                 budget_starved |= again.3;
             }
             // the root, a constant some reading's free atoms refute, one case of
@@ -901,7 +932,7 @@ fn sweep_inner(
             // proved, and what a replay of the parts in order comes to.)
             r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
             to.insert(i, e);
-        } else if !refuted {
+        } else if !refuted || r.mba.witnesses.len() == wit0 {
             failures += 1;
         }
     }
@@ -1036,6 +1067,217 @@ enum Related {
 /// sums above then read one atom, and the linear passes collect its terms.
 /// Cheap exact algebraic portion of [`related`]: constant folding, lane cancellation, and
 /// polynomial equality without demanded-bit splitting or heavy certificate searches.
+fn narrow_causal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    id: u32,
+    bits: u16,
+    memo: &mut crate::hash::IdMap<u32, u32>,
+    depth: u8,
+) -> Result<u32, Stop> {
+    let w = cx.wid(id);
+    if w <= bits {
+        return Ok(id);
+    }
+    if let Some(&cached) = memo.get(&id) {
+        return Ok(cached);
+    }
+    let out = if depth == 0 {
+        r.build(cx, |cx| cx.c_extract(id, 0, bits))?
+    } else if let Some(cv) = cx.const_val(id) {
+        if let Ok(wt) = crate::Width::new(bits)
+            && let Ok(tc) = cv.trunc(wt)
+        {
+            r.build(cx, |cx| cx.mk_const(&tc))?
+        } else {
+            r.build(cx, |cx| cx.c_extract(id, 0, bits))?
+        }
+    } else {
+        let n = cx.node(id);
+        match n.op {
+            OpCode::Not | OpCode::Neg => {
+                let op = if n.op == OpCode::Not {
+                    UnOp::Not
+                } else {
+                    UnOp::Neg
+                };
+                let a = narrow_causal(r, cx, n.a, bits, memo, depth - 1)?;
+                r.build(cx, |cx| cx.c_un(op, a))?
+            }
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor => {
+                let bin = n.op.as_bin().unwrap();
+                let a = narrow_causal(r, cx, n.a, bits, memo, depth - 1)?;
+                let b = narrow_causal(r, cx, n.b, bits, memo, depth - 1)?;
+                r.build(cx, |cx| cx.c_bin(bin, a, b))?
+            }
+            OpCode::Shl
+                if cx
+                    .const_val(n.b)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|s| s < u64::from(bits)) =>
+            {
+                let s = cx.const_val(n.b).unwrap().to_u64().unwrap();
+                let a = narrow_causal(r, cx, n.a, bits, memo, depth - 1)?;
+                let sc = r.build(cx, |cx| cx.mk_const_u64(bits, s))?;
+                r.build(cx, |cx| cx.c_bin(BinOp::Shl, a, sc))?
+            }
+            OpCode::Zext => {
+                let iw = cx.wid(n.a);
+                if iw == bits {
+                    n.a
+                } else if iw < bits {
+                    r.build(cx, |cx| cx.c_zext(n.a, bits - iw))?
+                } else {
+                    narrow_causal(r, cx, n.a, bits, memo, depth - 1)?
+                }
+            }
+            OpCode::Extract if n.b == 0 && n.width >= bits => {
+                narrow_causal(r, cx, n.a, bits, memo, depth - 1)?
+            }
+            _ => r.build(cx, |cx| cx.c_extract(id, 0, bits))?,
+        }
+    };
+    memo.insert(id, out);
+    Ok(out)
+}
+
+/// Peel shared masked bitwise context (`(a ^ u) & m == (a ^ v) & m`, `(a | u) & m == (a | v) & m`,
+/// `(a & u) & m == (a & v) & m`) to expose inner low-cone arithmetic/MBA equivalence `u ≡ v`.
+fn peeled_masked_equal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cur: u32,
+    rep: u32,
+) -> Result<bool, Stop> {
+    let w = cx.wid(cur);
+    if !(2..=64).contains(&w) || cx.wid(rep) != w {
+        return Ok(false);
+    }
+    let full = u64::MAX >> (64 - w);
+    let mut u = cur;
+    let mut v = rep;
+    let mut mask = full;
+    let mut shared_nonconst = false;
+    let samples_agree_on = |r: &mut Runner<'_, '_>,
+                            cx: &mut Context,
+                            x: u32,
+                            y: u32,
+                            m: u64|
+     -> Result<bool, Stop> {
+        r.sample(cx, x)?;
+        r.sample(cx, y)?;
+        Ok(r.samples[&x]
+            .iter()
+            .zip(&r.samples[&y])
+            .all(|(vx, vy)| ((vx.limbs()[0] ^ vy.limbs()[0]) & m) == 0))
+    };
+    for _ in 0..8 {
+        let mut progressed = false;
+        // Strip constant masks whose cleared bits are already outside `mask`, or intersect matching masks.
+        let and_const = |cx: &Context, id: u32| -> Option<(u32, u64)> {
+            let n = cx.node(id);
+            if n.op != OpCode::And {
+                return None;
+            }
+            if let Some(c) = cx.const_val(n.b).and_then(|val| val.to_u64()) {
+                Some((n.a, c & full))
+            } else {
+                cx.const_val(n.a)
+                    .and_then(|val| val.to_u64())
+                    .map(|c| (n.b, c & full))
+            }
+        };
+        match (and_const(cx, u), and_const(cx, v)) {
+            (Some((ua, cu)), Some((va, cv))) if (cu & mask) == (cv & mask) => {
+                mask &= cu;
+                u = ua;
+                v = va;
+                progressed = true;
+            }
+            (Some((ua, cu)), _) if (cu & mask) == mask => {
+                u = ua;
+                progressed = true;
+            }
+            (_, Some((va, cv))) if (cv & mask) == mask => {
+                v = va;
+                progressed = true;
+            }
+            _ => {}
+        }
+        if mask == 0 {
+            return Ok(true);
+        }
+        let (nu, nv) = (cx.node(u), cx.node(v));
+        if nu.op == nv.op && matches!(nu.op, OpCode::Xor | OpCode::Or | OpCode::And) {
+            let pair = if nu.a == nv.a {
+                Some((nu.a, nu.b, nv.b))
+            } else if nu.b == nv.b {
+                Some((nu.b, nu.a, nv.a))
+            } else if nu.a == nv.b {
+                Some((nu.a, nu.b, nv.a))
+            } else if nu.b == nv.a {
+                Some((nu.b, nu.a, nv.b))
+            } else {
+                None
+            };
+            if let Some((shared, cand_u, cand_v)) = pair
+                && (nu.op == OpCode::Xor || samples_agree_on(r, cx, cand_u, cand_v, mask)?)
+            {
+                if !cx.is_const(shared) {
+                    shared_nonconst = true;
+                }
+                u = cand_u;
+                v = cand_v;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    if !shared_nonconst {
+        return Ok(false);
+    }
+    if u == v {
+        return Ok(true);
+    }
+    if !samples_agree_on(r, cx, u, v, mask)? {
+        return Ok(false);
+    }
+    let bits = (64 - mask.leading_zeros()) as u16;
+    if bits == 0 || bits > w {
+        return Ok(false);
+    }
+    let low_bits = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let mut memo = crate::hash::IdMap::default();
+    let tu = narrow_causal(r, cx, u, bits, &mut memo, 10)?;
+    let tv = narrow_causal(r, cx, v, bits, &mut memo, 10)?;
+    if tu == tv {
+        return Ok(true);
+    }
+    if samples_agree_on(r, cx, u, v, low_bits)?
+        && (opaque_predicate::equal_lanes(r, cx, tu, tv, bits)?
+            || super::poly::equal(r, cx, tu, tv)?
+            || super::linear_mba::equal_bounded(r, cx, tu, tv, 6)?
+            || super::linear_mba::equal_const_atoms(r, cx, tu, tv)?)
+    {
+        return Ok(true);
+    }
+    if (mask & low_bits) != low_bits {
+        let m_const = r.build(cx, |cx| cx.mk_const_u64(bits, mask & low_bits))?;
+        let mu = r.build(cx, |cx| cx.c_bin(BinOp::And, tu, m_const))?;
+        let mv = r.build(cx, |cx| cx.c_bin(BinOp::And, tv, m_const))?;
+        if mu == mv || opaque_predicate::equal_lanes(r, cx, mu, mv, bits)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn related_cheap(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1082,6 +1324,7 @@ fn related_cheap(
     if opaque_predicate::equal_lanes(r, cx, cur, e, cx.wid(cur))?
         || super::poly::equal(r, cx, cur, e)?
         || super::linear_mba::equal_bounded(r, cx, cur, e, 6)?
+        || (relation == Relation::Sum && d.is_zero() && peeled_masked_equal(r, cx, cur, rep)?)
     {
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
@@ -1144,6 +1387,7 @@ fn related(
     if opaque_predicate::equal_lanes(r, cx, cur, e, cx.wid(cur))?
         || super::poly::equal(r, cx, cur, e)?
         || super::linear_mba::equal_bounded(r, cx, cur, e, 6)?
+        || (relation == Relation::Sum && d.is_zero() && peeled_masked_equal(r, cx, cur, rep)?)
     {
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));
@@ -1526,7 +1770,7 @@ fn spread(left: &mut u64, m: u64) -> u64 {
     let (mut v, mut mm) = (0u64, m);
     while mm != 0 {
         if *left & 1 == 1 {
-            v |= mm & mm.wrapping_neg();
+            v |= mm.isolate_lowest_one();
         }
         *left >>= 1;
         mm &= mm - 1;

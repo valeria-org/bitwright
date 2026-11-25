@@ -1287,13 +1287,10 @@ impl Question {
             // together. Only when both sides are non-leaf operations.
             if !proved
                 && cons.is_empty()
-                && matches!(
+                && !matches!(
                     out.end,
-                    crate::engine::End::Completed
-                        | crate::engine::End::BudgetTerminated(
-                            crate::engine::Exhausted::MbaSteps
-                                | crate::engine::Exhausted::MbaCalls
-                        )
+                    crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
+                        | crate::engine::End::Declined(_)
                 )
                 && cx.node(s).op == OpCode::Eq
             {
@@ -1321,13 +1318,28 @@ impl Question {
                             s = cx.mk_const_u64(1, 0)?;
                         }
                     } else if res.end != crate::engine::End::Completed {
-                        if out.end == crate::engine::End::Completed {
-                            out.end = res.end;
+                        out.end = res.end;
+                    } else {
+                        if out.end != crate::engine::End::Completed {
+                            let run = crate::engine::Run::default()
+                                .with_per_call(cfg.simplify_budget)
+                                .with_allowance(&mut allowance);
+                            let run = match env.deadline {
+                                Some(d) => run.with_deadline(d),
+                                None => run,
+                            };
+                            let top = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
+                            s = cx.id(top.expr)?;
+                            out.end = top.end;
+                            if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
+                                proved = true;
+                                out = top;
+                            }
                         }
-                    } else if matches!(
-                        cx.dag_size(&[cx.handle(s)], 256)?,
-                        crate::expr::Bounded::Exact(_)
-                    ) {
+                        if !proved && matches!(
+                            cx.dag_size(&[cx.handle(s)], 256)?,
+                            crate::expr::Bounded::Exact(_)
+                        ) {
                         // Sound proof-only affine rebasing: rewrite `(x << k) + c` as `y << k`
                         // with `x = y - (c >> k)` when `c` has at least `k` trailing zeros.
                         // Proving the rebased difference zero proves the original equality;
@@ -1387,6 +1399,7 @@ impl Question {
                             if attempts == 4 {
                                 break;
                             }
+                        }
                         }
                     }
                 }

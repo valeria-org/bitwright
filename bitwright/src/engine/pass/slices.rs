@@ -706,6 +706,9 @@ fn proved(
             }
             Outcome::Refuted(_) => {
                 c.refuted += 1;
+                if taken >= 512 {
+                    r.carries.fits[class].1 += 1;
+                }
                 Ok(Said::Refuted)
             }
             // Stopped short of the pass's own cap: more pass work may decide it.
@@ -1021,6 +1024,11 @@ pub(super) fn fitted(
     r.sample(cx, s)?;
     let mask = ones(len);
     let own: Vec<u64> = r.samples[&s].iter().map(|v| low(v) >> lo & mask).collect();
+    if r.carries.fits[usize::from(apart)].1
+        >= MAX_UNDECIDED + r.carries.fits[usize::from(apart)].0
+    {
+        return Ok(Err(Fin::PROVISIONAL));
+    }
     // A slice that is the value read as it already is says nothing: `s` itself under a read
     // of it, an operand of `s` where `s` is what is replaced.
     let direct = if n == s {

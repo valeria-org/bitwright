@@ -1201,7 +1201,7 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
     Ok(Step::Normal(fin))
 }
 
-/// Rewrite `trunc<nw>(X) op C` (for `op ∈ {Add, Sub, Mul, And, Or, Xor}`) to `trunc<nw>(wide)`
+/// Rewrite `trunc<nw>(X) op C` (for `op ∈ {Add, Sub, Mul, And, Or, Xor, Shl}`) to `trunc<nw>(wide)`
 /// whenever a live `wide = X op C_w` (with `trunc<nw>(C_w) == C`) already exists in `cx`.
 fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
@@ -1209,7 +1209,13 @@ fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Resu
     if nw >= 64
         || !matches!(
             node.op,
-            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor
+            OpCode::Add
+                | OpCode::Sub
+                | OpCode::Mul
+                | OpCode::And
+                | OpCode::Or
+                | OpCode::Xor
+                | OpCode::Shl
         )
     {
         return Ok(Step::Normal(Fin::FINAL));
@@ -1217,11 +1223,14 @@ fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Resu
     let comm = node.op.as_bin().is_some_and(BinOp::is_commutative);
     let (tr, cval, tr_is_lhs) = if let Some(cv) = cx.const_val(node.b) {
         (node.a, cv, true)
-    } else if let Some(cv) = cx.const_val(node.a) {
+    } else if node.op != OpCode::Shl && let Some(cv) = cx.const_val(node.a) {
         (node.b, cv, false)
     } else {
         return Ok(Step::Normal(Fin::FINAL));
     };
+    if node.op == OpCode::Shl && !cval.to_u64().is_some_and(|s| s < u64::from(nw)) {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
     let tn = cx.node(tr);
     if tn.op != OpCode::Extract || tn.b != 0 {
         return Ok(Step::Normal(Fin::FINAL));
@@ -1242,7 +1251,7 @@ fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Resu
     };
     let before = cx.len() as u32;
     let mut cands = vec![zc];
-    if sc != zc {
+    if node.op != OpCode::Shl && sc != zc {
         cands.push(sc);
     }
     for cw in cands {
@@ -1278,11 +1287,221 @@ fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Resu
     Ok(Step::Normal(Fin::FINAL))
 }
 
+/// Find existing `w`-bit nodes `id` in `cx` (`cx.find` only, zero allocations) that satisfy
+/// `(id & req_mask) == (zext<w>(u) & req_mask)` for every input (`1 <= nw < w <= 64`).
+pub(super) fn find_wide_masked(cx: &Context, u: u32, w: u16, req_mask: u64, depth: u8) -> Vec<u32> {
+    let mut out = Vec::new();
+    let nw = cx.wid(u);
+    if nw == 0 || nw >= w || w > 64 || depth == 0 {
+        return out;
+    }
+    let low_nw = (1u64 << nw) - 1;
+    let full_w = u64::MAX >> (64 - w);
+    let req_mask = req_mask & full_w;
+    let Ok(wt) = crate::Width::new(w) else {
+        return out;
+    };
+    let push = |out: &mut Vec<u32>, id: u32| {
+        if !out.contains(&id) && out.len() < 4 {
+            out.push(id);
+        }
+    };
+    let find_bin = |op: OpCode, a: u32, b: u32| -> Option<u32> {
+        cx.find(&crate::expr::Node::new(op, w, a, b, 0)).or_else(|| {
+            op.as_bin()
+                .is_some_and(BinOp::is_commutative)
+                .then(|| cx.find(&crate::expr::Node::new(op, w, b, a, 0)))
+                .flatten()
+        })
+    };
+    let find_const = |val: u64| -> Option<u32> { cx.find_const_u64(w, val & full_w) };
+
+    if let Some(cv) = cx.const_val(u).and_then(|v| v.to_u64()) {
+        if let Some(cid) = find_const(cv & low_nw) {
+            push(&mut out, cid);
+        }
+        if (req_mask & !low_nw) == 0
+            && let Ok(sc) = cx.const_val(u).unwrap().sext(wt)
+            && let Some(sc_u) = sc.to_u64()
+            && let Some(cid) = find_const(sc_u)
+        {
+            push(&mut out, cid);
+        }
+        return out;
+    }
+
+    let n = cx.node(u);
+    let needs_zero_above = (req_mask & !low_nw) != 0;
+
+    // If caller requires bits `>= nw` to be zero, any `raw` matching `u` on `low_nw` masked by
+    // `& low_nw` in `cx` is exact on all `w` bits.
+    if needs_zero_above
+        && let Some(m_id) = find_const(low_nw)
+    {
+        for raw in find_wide_masked(cx, u, w, req_mask & low_nw, depth) {
+            if let Some(masked) = find_bin(OpCode::And, raw, m_id) {
+                push(&mut out, masked);
+            }
+        }
+    }
+
+    match n.op {
+        OpCode::Extract if cx.wid(n.a) == w => {
+            let lo = n.b as u16;
+            if lo == 0 {
+                if !needs_zero_above {
+                    push(&mut out, n.a);
+                }
+                if let Some(m_id) = find_const(low_nw)
+                    && let Some(masked) = find_bin(OpCode::And, n.a, m_id)
+                {
+                    push(&mut out, masked);
+                }
+            } else if u32::from(lo) + u32::from(nw) <= u32::from(w)
+                && (u32::from(lo) + u32::from(nw) == u32::from(w) || !needs_zero_above)
+                && let Some(sh_c) = find_const(u64::from(lo))
+                && let Some(shifted) = cx.find(&crate::expr::Node::new(OpCode::LShr, w, n.a, sh_c, 0))
+            {
+                push(&mut out, shifted);
+            }
+        }
+        OpCode::And => {
+            let const_side = if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                Some((n.a, c & low_nw))
+            } else {
+                cx.const_val(n.a)
+                    .and_then(|v| v.to_u64())
+                    .map(|c| (n.b, c & low_nw))
+            };
+            if let Some((arg, cmask)) = const_side {
+                if let Some(cid) = find_const(cmask) {
+                    for wa in find_wide_masked(cx, arg, w, req_mask & cmask, depth - 1) {
+                        if let Some(id) = find_bin(OpCode::And, wa, cid) {
+                            push(&mut out, id);
+                        }
+                    }
+                }
+            } else {
+                for wa in find_wide_masked(cx, n.a, w, req_mask, depth - 1) {
+                    for wb in find_wide_masked(cx, n.b, w, req_mask, depth - 1) {
+                        if let Some(id) = find_bin(OpCode::And, wa, wb) {
+                            push(&mut out, id);
+                        }
+                    }
+                }
+            }
+        }
+        OpCode::Not if !needs_zero_above => {
+            for wa in find_wide_masked(cx, n.a, w, req_mask, depth - 1) {
+                if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::Not, w, wa, 0, 0)) {
+                    push(&mut out, id);
+                }
+            }
+        }
+        OpCode::LShr => {
+            if let Some(s) = cx.const_val(n.b).and_then(|v| v.to_u64())
+                && s > 0
+                && s < u64::from(nw)
+                && let Some(sh_c) = find_const(s)
+            {
+                // Exact `w`-bit operand (bits `>= nw` already zero) shifted right is exact on all `w` bits.
+                for wa in find_wide_masked(cx, n.a, w, full_w, depth - 1) {
+                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::LShr, w, wa, sh_c, 0)) {
+                        push(&mut out, id);
+                    }
+                }
+                // Unmasked operand works when `req_mask` only reads bits `< nw - s`.
+                let valid_shifted = (1u64 << (u64::from(nw) - s)) - 1;
+                if (req_mask & !valid_shifted) == 0 {
+                    for wa in find_wide_masked(cx, n.a, w, (req_mask << s) & low_nw, depth - 1) {
+                        if let Some(id) =
+                            cx.find(&crate::expr::Node::new(OpCode::LShr, w, wa, sh_c, 0))
+                        {
+                            push(&mut out, id);
+                        }
+                    }
+                }
+            }
+        }
+        OpCode::Add | OpCode::Sub | OpCode::Mul if !needs_zero_above => {
+            for wa in find_wide_masked(cx, n.a, w, low_nw, depth - 1) {
+                for wb in find_wide_masked(cx, n.b, w, low_nw, depth - 1) {
+                    if let Some(id) = find_bin(n.op, wa, wb) {
+                        push(&mut out, id);
+                    }
+                }
+            }
+        }
+        OpCode::Neg if !needs_zero_above => {
+            for wa in find_wide_masked(cx, n.a, w, low_nw, depth - 1) {
+                if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::Neg, w, wa, 0, 0)) {
+                    push(&mut out, id);
+                }
+            }
+        }
+        OpCode::Shl if !needs_zero_above => {
+            if let Some(s) = cx.const_val(n.b).and_then(|v| v.to_u64())
+                && s < u64::from(nw)
+                && let Some(sh_c) = find_const(s)
+            {
+                for wa in find_wide_masked(cx, n.a, w, low_nw >> s, depth - 1) {
+                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::Shl, w, wa, sh_c, 0)) {
+                        push(&mut out, id);
+                    }
+                }
+            }
+        }
+        OpCode::Or | OpCode::Xor => {
+            let sub_mask = if needs_zero_above { full_w } else { req_mask };
+            for wa in find_wide_masked(cx, n.a, w, sub_mask, depth - 1) {
+                for wb in find_wide_masked(cx, n.b, w, sub_mask, depth - 1) {
+                    if let Some(id) = find_bin(n.op, wa, wb) {
+                        push(&mut out, id);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Replace `zext<w>(narrow)` with an already-live `w`-bit equivalent node in `cx` (`added = 0`).
+fn zext_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let w = node.width;
+    let nw = cx.wid(node.a);
+    if node.op != OpCode::Zext || w > 64 || nw >= w {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let full_w = u64::MAX >> (64 - w);
+    let cands = find_wide_masked(cx, node.a, w, full_w, 5);
+    if !cands.is_empty() {
+        super::refresh_uses(r, cx)?;
+        let before = cx.len() as u32;
+        for wide in cands {
+            if wide != n && r.life.live.uses(wide).is_some_and(|u| u > 0) {
+                match finish(r, cx, PassKind::Casts, n, wide, before, &[wide], Fin::FINAL)? {
+                    Step::Normal(_) => {}
+                    step => return Ok(step),
+                }
+            }
+        }
+    }
+    Ok(Step::Normal(Fin::FINAL))
+}
+
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
     if matches!(
         node.op,
-        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor
+        OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Xor
+            | OpCode::Shl
     ) {
         match narrow_to_live_wide(r, cx, n)? {
             Step::Normal(_) => {}
@@ -1309,6 +1528,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     if node.op == OpCode::Select {
         return hoisted(r, cx, n);
+    }
+    if node.op == OpCode::Zext {
+        return zext_to_live_wide(r, cx, n);
     }
     if node.op != OpCode::Extract {
         return Ok(Step::Normal(Fin::FINAL));
@@ -1356,6 +1578,9 @@ mod extra_tests {
             // narrow_to_live_wide unifies trunc<32>(x) + C with trunc<32>(x + zext<64>(C))
             "let w = x + 0xba7ea0cf; let n = trunc<32>(x) + 0xba7ea0cf; \
              (extract<16, 1>(n) == extract<16, 1>(w)) & (extract<0, 1>(w) == extract<0, 1>(w))",
+            // zext_to_live_wide unifies zext<64>(trunc<32>(x)) and shifted narrow ops with live masked wide terms
+            "let m = x & 0xffffffff; (zext<64>(trunc<32>(x)) ^ m) + m == m",
+            "let s = (x & 0xffffffff) >>u 5; (zext<64>(trunc<32>(x) >>u 5) ^ s) + s == s",
         ] {
             let e = cx.parse(text, &opt).unwrap();
             let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
@@ -1378,6 +1603,8 @@ mod extra_tests {
              select(c, a ^ b, 0x1234:64) == (s1 ^ s2)",
             // Different low 32-bit constants
             "trunc<32>(x) + 0x1234 == trunc<32>(x + 0x1235)",
+            // Unmasked wide right-shift leaks bits >= 32, so zext<64>(trunc<32>(x) >>u 5) != x >>u 5
+            "zext<64>(trunc<32>(x) >>u 5) == (x >>u 5)",
         ] {
             let e = cx.parse(text, &opt).unwrap();
             let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();

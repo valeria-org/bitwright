@@ -304,11 +304,64 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
         };
         *uses.entry(c).or_default() += 1;
     }
+    let sym_bits = |cx: &Context, c: u32| -> u32 {
+        let mut ft = Vec::new();
+        fixes(cx, c, true, &mut ft, 0);
+        if ft.iter().all(|f| cx.node(f.x).op != OpCode::Sym || f.mask.count_ones() < 2) {
+            ft.clear();
+            fixes(cx, c, false, &mut ft, 0);
+        }
+        ft.into_iter()
+            .filter(|f| cx.node(f.x).op == OpCode::Sym && f.mask.count_ones() >= 2)
+            .map(|f| f.mask.count_ones())
+            .max()
+            .unwrap_or(0)
+    };
     Ok(uses
         .into_iter()
         .filter(|&(_, k)| k >= 2)
-        .max_by_key(|&(c, k)| (k, std::cmp::Reverse(c)))
+        .max_by_key(|&(c, k)| (sym_bits(cx, c) >= 2, k, std::cmp::Reverse(c)))
         .map(|(c, _)| c))
+}
+
+/// Whether `root` has at least two `select` nodes sharing a condition (or its complement) that
+/// fixes at least 2 bits of an input symbol (`OpCode::Sym`).
+pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
+    let order = cx.post_order_ids(&[root]);
+    let mut conds: Vec<(u32, u32)> = Vec::new();
+    for &i in &order {
+        let n = cx.node(i);
+        if n.op != OpCode::Select || cx.is_const(n.a) {
+            continue;
+        }
+        let c = n.a;
+        let key = if cx.node(c).op == OpCode::Not {
+            cx.node(c).a
+        } else {
+            c
+        };
+        if let Some(slot) = conds.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 += 1;
+        } else {
+            conds.push((key, 1));
+        }
+    }
+    conds.into_iter().any(|(c, count)| {
+        if count < 2 {
+            return false;
+        }
+        let mut f = Vec::new();
+        fixes(cx, c, true, &mut f, 0);
+        if f.iter()
+            .any(|fx| cx.node(fx.x).op == OpCode::Sym && fx.mask.count_ones() >= 2)
+        {
+            return true;
+        }
+        f.clear();
+        fixes(cx, c, false, &mut f, 0);
+        f.iter()
+            .any(|fx| cx.node(fx.x).op == OpCode::Sym && fx.mask.count_ones() >= 2)
+    })
 }
 
 /// `root` on either side of the condition [`most_tested`] picks: the condition, `root` with what

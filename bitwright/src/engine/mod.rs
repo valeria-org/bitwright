@@ -1937,6 +1937,22 @@ impl Runner<'_, '_> {
         }
     }
 
+    fn phase_ops(&self, phase: usize) -> dispatch::Mask {
+        use crate::expr::OpCode;
+        match &self.inner.phases[phase] {
+            PhaseImpl::Local(net, host) if host.is_empty() => net.ops,
+            PhaseImpl::Pass(pass::PassKind::Invert) => {
+                dispatch::bit(OpCode::Eq)
+                    | dispatch::bit(OpCode::Ne)
+                    | dispatch::bit(OpCode::Ult)
+                    | dispatch::bit(OpCode::Ule)
+                    | dispatch::bit(OpCode::Slt)
+                    | dispatch::bit(OpCode::Sle)
+            }
+            _ => dispatch::ALL,
+        }
+    }
+
     /// [`local`](Self::local)'s walk of `root`, prepared.
     fn walked(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
         // A root with a final result: what the walk would find at its first step, without
@@ -1994,6 +2010,12 @@ impl Runner<'_, '_> {
                             self.stats.memo_hits += 1;
                         }
                         stack.pop();
+                        continue;
+                    }
+                    let req = self.phase_ops(phase);
+                    if req != dispatch::ALL && (cx.meta[n as usize].ops & req) == 0 {
+                        stack.pop();
+                        self.set(cx, phase, n, n, Fin::FINAL);
                         continue;
                     }
                     self.meter.visit()?;
@@ -3034,10 +3056,17 @@ impl Runner<'_, '_> {
         let settled = self.rounds(cx, cur, fin);
         #[cfg(feature = "mba")]
         if let Ok((u, ufin)) = settled
-            && inner
-                .phases
-                .iter()
-                .any(|p| matches!(p, PhaseImpl::Mba(c) if c.noise_forms))
+            && inner.phases.iter().any(|p| {
+                matches!(
+                    p,
+                    PhaseImpl::Mba(c)
+                        if c.noise_forms
+                            || (c.opaque_sweep
+                                && cx.wid(u) == 1
+                                && !cx.is_const(u)
+                                && pass::has_sym_select_guard(cx, u))
+                )
+            })
         {
             return self.split(cx, u, ufin);
         }
@@ -3083,7 +3112,32 @@ impl Runner<'_, '_> {
                 cur = swept;
             }
             cur = me.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
-            me.rounds_within(cx, cur, fin, SIDE_ROUNDS, false)
+            let (r, mut f, held_stop) = match me.rounds_within(cx, cur, fin, SIDE_ROUNDS, false) {
+                Ok((r, f)) => (r, f, None),
+                Err((
+                    r,
+                    f,
+                    stop @ Stop::Exhausted(Exhausted::MbaSteps | Exhausted::MbaCalls),
+                )) => (r, f, Some(stop)),
+                Err(err) => return Err(err),
+            };
+            if r != cur && cx.wid(r) == 1 && !cx.is_const(r) {
+                let swept2 = me.sweep(cx, r).map_err(|stop| (r, f, stop))?;
+                if swept2 != r {
+                    f = f.and(Fin::relying(me.assumed()));
+                    return match me.rounds_within(cx, swept2, f, 1, false) {
+                        Ok((r2, f2)) => match held_stop {
+                            Some(stop) => Err((r2, f2, stop)),
+                            None => Ok((r2, f2)),
+                        },
+                        Err(err) => Err(err),
+                    };
+                }
+            }
+            match held_stop {
+                Some(stop) => Err((r, f, stop)),
+                None => Ok((r, f)),
+            }
         };
         let (s, sfin, stop) = match sides(self, cx) {
             Ok((s, f)) => (s, f, None),
@@ -3470,7 +3524,18 @@ impl Runner<'_, '_> {
                     (fin, again) = (before, true);
                     continue;
                 }
-                if words {
+                #[cfg(feature = "mba")]
+                let defer_words_to_split = late
+                    && cx.wid(cur) == 1
+                    && !cx.is_const(cur)
+                    && inner
+                        .phases
+                        .iter()
+                        .any(|p| matches!(p, PhaseImpl::Mba(c) if c.opaque_sweep && !c.noise_forms))
+                    && pass::has_sym_select_guard(cx, cur);
+                #[cfg(not(feature = "mba"))]
+                let defer_words_to_split = false;
+                if words && !defer_words_to_split {
                     self.words.turn = true;
                     (fin, again) = (before, true);
                     continue;

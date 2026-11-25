@@ -1162,8 +1162,7 @@ fn complementary_products(
     )?))
 }
 
-/// A product rebuilt without one of its factors. A caller supplies a product of at least two
-/// leaves, so one always remains.
+/// A product rebuilt without one of its factors.
 fn without_factor(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1217,19 +1216,82 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         return Ok(Some(Step::Normal(declined)));
     };
     let before = cx.len() as u32;
+    let mut extra_atoms: Vec<u32> = Vec::new();
     let mut rest = None;
     for (i, p) in products.iter().enumerate() {
         let q = without_factor(r, cx, p, positions[i])?;
         rest = Some(match rest {
             None => q,
-            Some(a) => r.build(cx, |cx| cx.c_bin(BinOp::Add, a, q))?,
+            Some(a) => {
+                // Fold `(c1 ± y) + c2` directly so `(-2 - y) * x + x` simplifies to `~y * x`
+                // instead of building an unsimplified `((-2 - y) + 1) * x`.
+                let fold_const_sum = |cx: &mut Context,
+                                      lhs: u32,
+                                      c2: BitVec|
+                 -> Result<Option<u32>, crate::Error> {
+                    let ln = cx.node(lhs);
+                    if ln.op == OpCode::Sub
+                        && let Some(c1) = cx.const_val(ln.a)
+                    {
+                        let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
+                        return Ok(Some(if c.is_zero() {
+                            cx.c_un(UnOp::Neg, ln.b)?
+                        } else if c.is_ones() {
+                            cx.c_un(UnOp::Not, ln.b)?
+                        } else {
+                            let ck = cx.mk_const(&c)?;
+                            cx.c_bin(BinOp::Sub, ck, ln.b)?
+                        }));
+                    }
+                    if ln.op == OpCode::Add
+                        && let Some(c1) = cx.const_val(ln.b)
+                    {
+                        let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
+                        return Ok(Some(if c.is_zero() {
+                            ln.a
+                        } else {
+                            let ck = cx.mk_const(&c)?;
+                            cx.c_bin(BinOp::Add, ln.a, ck)?
+                        }));
+                    }
+                    Ok(None)
+                };
+                let record_folded = |cx: &Context, id: u32, extra: &mut Vec<u32>| {
+                    if id < before {
+                        extra.push(id);
+                    } else {
+                        for c in cx.node(id).children() {
+                            if c < before {
+                                extra.push(c);
+                            }
+                        }
+                    }
+                };
+                if let Some(cq) = cx.const_val(q) {
+                    if let Some(folded) = r.build(cx, |cx| fold_const_sum(cx, a, cq))? {
+                        record_folded(cx, folded, &mut extra_atoms);
+                        folded
+                    } else {
+                        r.build(cx, |cx| cx.c_bin(BinOp::Add, a, q))?
+                    }
+                } else if let Some(ca) = cx.const_val(a) {
+                    if let Some(folded) = r.build(cx, |cx| fold_const_sum(cx, q, ca))? {
+                        record_folded(cx, folded, &mut extra_atoms);
+                        folded
+                    } else {
+                        r.build(cx, |cx| cx.c_bin(BinOp::Add, a, q))?
+                    }
+                } else {
+                    r.build(cx, |cx| cx.c_bin(BinOp::Add, a, q))?
+                }
+            }
         });
     }
     let Some(rest) = rest else {
         return Ok(Some(Step::Normal(declined)));
     };
     let factored = r.build(cx, |cx| cx.c_bin(BinOp::Mul, factor, rest))?;
-    let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS];
+    let mut atoms = [0; MAX_PRODUCT_FACTORS * MAX_SUM_TERMS + 8];
     let mut count = 0;
     for p in products {
         for a in &p.factors[..p.len] {
@@ -1237,6 +1299,12 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
                 atoms[count] = *a;
                 count += 1;
             }
+        }
+    }
+    for a in extra_atoms {
+        if a < before && count < atoms.len() && !atoms[..count].contains(&a) {
+            atoms[count] = a;
+            count += 1;
         }
     }
     Ok(Some(

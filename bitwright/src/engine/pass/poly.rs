@@ -155,6 +155,44 @@ fn possible_ones(cx: &Context, x: u32, depth: u8) -> u64 {
             Some(_) => 0,
             None => full,
         },
+        OpCode::Add => {
+            let ma = possible_ones(cx, n.a, depth - 1);
+            let mb = possible_ones(cx, n.b, depth - 1);
+            if ma & mb == 0 {
+                ma | mb
+            } else if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64())
+                && mb.is_power_of_two()
+            {
+                c | c.wrapping_add(mb)
+            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64())
+                && ma.is_power_of_two()
+            {
+                c | c.wrapping_add(ma)
+            } else {
+                full
+            }
+        }
+        OpCode::Sub => {
+            if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
+                let mb = possible_ones(cx, n.b, depth - 1);
+                if mb & !c == 0 {
+                    c
+                } else if mb.is_power_of_two() {
+                    c | c.wrapping_sub(mb)
+                } else {
+                    full
+                }
+            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                let ma = possible_ones(cx, n.a, depth - 1);
+                if ma.is_power_of_two() {
+                    c.wrapping_neg() | ma.wrapping_sub(c)
+                } else {
+                    full
+                }
+            } else {
+                full
+            }
+        }
         _ => full,
     };
     m & full
@@ -540,6 +578,180 @@ pub(super) fn equal(r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32) -> Res
     equal_mod(r, cx, a, b, cx.wid(a))
 }
 
+fn poly_hash(w: u16, p: &Poly) -> u64 {
+    let mut h = crate::hash::combine(0x706f_6c79, u64::from(w));
+    for (m, c) in p {
+        for &b in m {
+            h = crate::hash::combine(h, u64::from(b));
+        }
+        for &limb in c.limbs() {
+            h = crate::hash::combine(h, limb);
+        }
+    }
+    h
+}
+
+/// Bottom-up polynomial subterm canonicalization over `order`: unifies distinct sub-DAGs that
+/// expand to the same polynomial (or bitwise complement `-p - 1` when smaller) modulo `2^w`,
+/// exposing shared atoms to `cofactors`, `linear_mba`, and `mba`. Commits only when the whole
+/// DAG strictly shrinks.
+#[cfg(feature = "mba")]
+pub(super) fn canonicalize_dag(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
+) -> Result<Option<u32>, Stop> {
+    if !(16..=2048).contains(&order.len()) {
+        return Ok(None);
+    }
+    let budget = r.meter.left_in(|b| b.pass_work) / 8;
+    if budget < (order.len() as u64) * 8 {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    let mut tables = LeafTables::default();
+    let mut memo: IdMap<(u32, u16), Poly> = IdMap::default();
+    let mut buckets: IdMap<u64, Vec<(u16, Poly, u32)>> = IdMap::default();
+    let mut to: IdMap<u32, u32> = IdMap::default();
+    let mut has_poly_mul: IdMap<u32, ()> = IdMap::default();
+    let mut live_nodes: IdMap<u32, ()> = IdMap::default();
+    for &id in order {
+        live_nodes.insert(id, ());
+    }
+    let mut total_steps = 0u64;
+    let mut merged_any = false;
+
+    for &i in order {
+        let node = cx.node(i);
+        let mut kids = [0u32; 3];
+        let mut changed = false;
+        let mut child_mul = false;
+        for (k, c) in node.children().enumerate() {
+            let mapped = to.get(&c).copied().unwrap_or(c);
+            kids[k] = mapped;
+            changed |= mapped != c;
+            child_mul |= has_poly_mul.contains_key(&mapped);
+        }
+        let mut cur = if changed {
+            r.build(cx, |cx| cx.rebuild(i, kids))?
+        } else {
+            i
+        };
+        let mut cn = cx.node(cur);
+        if !r.mba.swept.is_empty()
+            && cn.op == OpCode::Zext
+            && cn.width <= 64
+            && cx.wid(cn.a) < cn.width
+        {
+            let full_w = u64::MAX >> (64 - cn.width);
+            for wide in super::casts::find_wide_masked(cx, cn.a, cn.width, full_w, 5) {
+                if wide != cur && live_nodes.contains_key(&wide) {
+                    cur = wide;
+                    cn = cx.node(cur);
+                    merged_any = true;
+                    break;
+                }
+            }
+        }
+        let w = cn.width;
+        let op = cn.op;
+        let own_mul = op == OpCode::Mul && !cx.is_const(cn.a) && !cx.is_const(cn.b);
+        let poly_cone = own_mul
+            || (child_mul
+                && matches!(
+                    op,
+                    OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not | OpCode::Mul | OpCode::Shl
+                ));
+        if poly_cone
+            && (2..=64).contains(&w)
+            && cx.const_val(cur).is_none()
+            && let Ok(wt) = Width::new(w)
+        {
+            let mut steps = 0u32;
+            let p_opt = poly_of(cx, cur, wt, &mut tables, &mut memo, &mut steps);
+            total_steps += u64::from(steps);
+            if total_steps > budget {
+                break;
+            }
+            if let Some(p) = p_opt {
+                if p.is_empty() {
+                    cur = r.build(cx, |cx| cx.mk_const_u64(w, 0))?;
+                    merged_any = true;
+                } else if p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
+                    let kv = p[0].1;
+                    cur = r.build(cx, |cx| cx.mk_const(&kv))?;
+                    merged_any = true;
+                } else {
+                    let h = poly_hash(w, &p);
+                    let found = buckets
+                        .get(&h)
+                        .and_then(|v| v.iter().find(|(bw, bp, _)| *bw == w && *bp == p))
+                        .map(|&(_, _, rep)| rep);
+                    if let Some(rep) = found {
+                        if rep != cur
+                            && cx.meta[rep as usize].tree
+                                <= cx.meta[cur as usize].tree.saturating_mul(2).saturating_add(4)
+                        {
+                            cur = rep;
+                            merged_any = true;
+                        }
+                    } else {
+                        // Also check bitwise complement `~p == -p - 1`: e.g. `C - a - 1 == ~rep`.
+                        let comp = if op != OpCode::Not {
+                            let neg_p = add(&Vec::new(), &p, true);
+                            let minus_one = vec![([0u8; MAX_LEAVES], BitVec::ones(wt))];
+                            let cp = add(&neg_p, &minus_one, false);
+                            let ch = poly_hash(w, &cp);
+                            buckets
+                                .get(&ch)
+                                .and_then(|v| v.iter().find(|(bw, bp, _)| *bw == w && *bp == cp))
+                                .map(|&(_, _, rep)| rep)
+                        } else {
+                            None
+                        };
+                        if let Some(rep) = comp
+                            && let Some(not_rep) =
+                                cx.find(&crate::expr::Node::new(OpCode::Not, w, rep, 0, 0))
+                            && cx.meta[not_rep as usize].tree
+                                <= cx.meta[cur as usize].tree.saturating_mul(2).saturating_add(4)
+                        {
+                            cur = not_rep;
+                            merged_any = true;
+                        }
+                        let entry = buckets.entry(h).or_default();
+                        if entry.len() < 8 {
+                            entry.push((w, p, cur));
+                        }
+                    }
+                }
+            }
+        }
+        if poly_cone && cx.const_val(cur).is_none() {
+            has_poly_mul.insert(cur, ());
+        }
+        live_nodes.insert(cur, ());
+        to.insert(i, cur);
+    }
+    r.meter.charge(Counter::PassWork, total_steps)?;
+    if !merged_any {
+        return Ok(None);
+    }
+    let Some(&out) = to.get(&root) else {
+        return Ok(None);
+    };
+    if out == root {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    Ok(matches!(
+        cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1)
+            .map_err(Stop::Error)?,
+        crate::expr::Bounded::Exact(_)
+    )
+    .then_some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::engine::{Engine, Run, Strategy};
@@ -576,6 +788,15 @@ mod tests {
         assert!(simplifies_to_true(
             "(~(x << 6) | (x >>u 58)) * y + (rotl(x, 6)) * y == ((x >>u 58) - 1) * y"
         ));
+        // DAG polynomial canonicalization unifies equivalent and complemented subterms across bitwise ops
+        assert!(simplifies_to_true(
+            "let p1 = (x + y) * (x + y); let p2 = x * x + 2 * x * y + y * y; \
+             ((p1 ^ z) & 0xff) == ((p2 ^ z) & 0xff)"
+        ));
+        assert!(simplifies_to_true(
+            "let p1 = x * y + z; let p2 = x * (-y) - z - 1; \
+             ((p1 & w) ^ p1) == ((~p2 & w) ^ ~p2)"
+        ));
     }
 
     #[test]
@@ -591,6 +812,11 @@ mod tests {
         // Wrong constant in Or decomposition
         assert!(!simplifies_to_true(
             "(x | 0x10) * y == ((x & ~0x10) + 0x20) * y"
+        ));
+        // Missing cross term 2*x*y in DAG polynomial subterm
+        assert!(!simplifies_to_true(
+            "let p1 = (x + y) * (x + y); let p2 = x * x + y * y; \
+             ((p1 ^ z) & 0xff) == ((p2 ^ z) & 0xff)"
         ));
     }
 }

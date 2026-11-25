@@ -33,12 +33,12 @@ struct BitKey {
     bit: u16,
 }
 
-/// A 64-bit lookup table depending on at most 2 bit keys (`n_bits <= 2`).
+/// A 64-bit lookup table depending on at most 3 raw bit keys (`n_bits <= 3`).
 #[derive(Copy, Clone, Debug)]
 struct SmallTable {
-    bits: [BitKey; 2],
+    bits: [BitKey; 3],
     n_bits: u8,
-    vals: [u64; 4],
+    vals: [u64; 8],
 }
 
 /// A 128-bit additive group depending on `n_bits <= MAX_GROUP_BITS` bit keys.
@@ -150,16 +150,16 @@ fn eq_const_64(cx: &Context, i: u32, is_eq: bool) -> Option<(u32, u64)> {
     if cx.wid(lhs) != 64 {
         return None;
     }
-    // Only bother if `lhs` is an Add (sum of tables/carries) or Xor/Sub/Not of one.
-    if cx.node(lhs).op == OpCode::Add {
-        return Some((lhs, k));
-    }
-    None
+    peel_const_target_64(cx, lhs, k)
 }
 
 /// Rewrite `x == 0` (64-bit) into `expr == target`, requiring `expr` to be an `Add`.
-fn zero_test_64(cx: &Context, mut x: u32) -> Option<(u32, u64)> {
-    let mut target = 0u64;
+fn zero_test_64(cx: &Context, x: u32) -> Option<(u32, u64)> {
+    peel_const_target_64(cx, x, 0)
+}
+
+/// Rewrite `x == target` (64-bit) into `sum_expr == adjusted_target`, requiring `sum_expr` to be `Add`.
+fn peel_const_target_64(cx: &Context, mut x: u32, mut target: u64) -> Option<(u32, u64)> {
     for _ in 0..6 {
         let n = cx.node(x);
         if n.width != 64 {
@@ -205,7 +205,12 @@ fn zero_test_64(cx: &Context, mut x: u32) -> Option<(u32, u64)> {
 
 /// Flatten a 64-bit sum tree of `Add`s into `(addends, const_bias)`.
 /// Only accepts pure `+` (no subtractions) for `LO`, where unsigned carries require `+`.
-fn flatten_add_only(cx: &Context, root: u32, max_terms: usize) -> Option<(Vec<u32>, u64)> {
+fn flatten_add_only(
+    cx: &Context,
+    root: u32,
+    max_terms: usize,
+    stop_leaves: Option<&[u32]>,
+) -> Option<(Vec<u32>, u64)> {
     let mut stack = vec![root];
     let mut out = Vec::new();
     let mut bias = 0u64;
@@ -215,12 +220,26 @@ fn flatten_add_only(cx: &Context, root: u32, max_terms: usize) -> Option<(Vec<u3
         if steps > max_terms * 4 {
             return None;
         }
+        if stop_leaves.is_some_and(|leaves| leaves.contains(&i)) {
+            if out.len() >= max_terms {
+                return None;
+            }
+            out.push(i);
+            continue;
+        }
         if let Some(k) = cx.const_val(i).and_then(|v| v.to_u64()) {
             bias = bias.wrapping_add(k);
             continue;
         }
         let n = cx.node(i);
-        if n.op == OpCode::Add && n.width == 64 {
+        let atomic_small_add = stop_leaves.is_none()
+            && i != root
+            && n.op == OpCode::Add
+            && n.width == 64
+            && cx.node(n.a).op != OpCode::Add
+            && cx.node(n.b).op != OpCode::Add
+            && eval_small_table(cx, i).is_some();
+        if n.op == OpCode::Add && n.width == 64 && !atomic_small_add {
             stack.push(n.b);
             stack.push(n.a);
         } else {
@@ -483,7 +502,7 @@ fn eval_small_table(cx: &Context, root: u32) -> Option<SmallTable> {
     if cx.wid(root) > 64 {
         return None;
     }
-    let mut bits = [BitKey { word: 0, bit: 0 }; 2];
+    let mut bits = [BitKey { word: 0, bit: 0 }; 3];
     let mut n_bits = 0usize;
     let mut visited = 0usize;
     let mut seen: Vec<u32> = Vec::new();
@@ -509,7 +528,7 @@ fn eval_small_table(cx: &Context, root: u32) -> Option<SmallTable> {
             if let Ok((bk, _)) = res
                 && !bits[..n_bits].contains(&bk)
             {
-                if n_bits == 2 {
+                if n_bits == 3 {
                     return None;
                 }
                 bits[n_bits] = bk;
@@ -547,11 +566,9 @@ fn eval_small_table(cx: &Context, root: u32) -> Option<SmallTable> {
             _ => return None,
         }
     }
-    if n_bits == 2 && bits[0] > bits[1] {
-        bits.swap(0, 1);
-    }
+    bits[..n_bits].sort();
     // Pass 2: evaluate `root` for every bit assignment `0..(1 << n_bits)`.
-    let mut vals = [0u64; 4];
+    let mut vals = [0u64; 8];
     let mut memo: Vec<(u32, u64)> = Vec::with_capacity(seen.len());
     for (assign, slot) in vals.iter_mut().enumerate().take(1usize << n_bits) {
         memo.clear();
@@ -748,7 +765,7 @@ fn expr_leaf_mask(
     absorbed_bias: Option<(usize, u64)>,
     const_leaf: Option<(usize, u64)>,
 ) -> Option<u64> {
-    let (terms, bias) = flatten_add_only(cx, x, leaf_ids.len() + 2)?;
+    let (terms, bias) = flatten_add_only(cx, x, leaf_ids.len() + 2, Some(leaf_ids))?;
     let mut mask = 0u64;
     let mut expected_bias = 0u64;
     for t in terms {
@@ -786,7 +803,7 @@ fn solve_pair(
     c_hi: u64,
 ) -> Result<Option<u32>, Stop> {
     // 1. Flatten LO into pure positive addends + constant bias.
-    let Some((lo_raw, lo_bias)) = flatten_add_only(cx, lo_expr, MAX_LEAVES) else {
+    let Some((lo_raw, lo_bias)) = flatten_add_only(cx, lo_expr, MAX_LEAVES, None) else {
         return Ok(None);
     };
     if lo_raw.len() < 4 || lo_raw.len() > MAX_LEAVES {
@@ -802,7 +819,9 @@ fn solve_pair(
     let Some((hi_raw, hi_bias)) = flatten_hi_sum(cx, hi_expr, MAX_LEAVES * 4) else {
         return Ok(None);
     };
-    // Quick check: HI must contain at least `lo_raw.len() - 1` positive `zext(ult)` terms.
+    // Quick check: HI must contain at least `lo_raw.len() - 2` positive `zext(ult)` terms
+    // (`lo_raw.len() - 1` for a full carry tree, or `lo_raw.len() - 2` when the final top-level
+    // carry against a single leaf table is folded into `HI` as `[c_lo <u leaf]`).
     let mut carry_candidates: Vec<(u32, CarryTerm)> = Vec::new();
     let mut hi_other: Vec<(u32, bool)> = Vec::new();
     for (t, neg) in hi_raw {
@@ -812,7 +831,7 @@ fn solve_pair(
             hi_other.push((t, neg));
         }
     }
-    if carry_candidates.len() + 1 < lo_raw.len() {
+    if carry_candidates.len() * 2 + 2 < lo_raw.len() {
         return Ok(None);
     }
     // 3. Evaluate every LO leaf as a small (`<= 2`-bit) table.
@@ -833,7 +852,7 @@ fn solve_pair(
                 CarryTerm::SumLt(a, b) | CarryTerm::NotLt(a, b) => [a, b],
             };
             for op in ops {
-                if let Some((ts, b)) = flatten_add_only(cx, op, 2)
+                if let Some((ts, b)) = flatten_add_only(cx, op, 2, Some(&lo_raw))
                     && ts.len() == 1
                     && b == lo_bias
                     && let Some(idx) = lo_raw.iter().position(|&id| id == ts[0])
@@ -853,9 +872,9 @@ fn solve_pair(
             }
             const_leaf = Some((lo_raw.len(), lo_bias));
             lo_tables.push(SmallTable {
-                bits: [BitKey { word: 0, bit: 0 }; 2],
+                bits: [BitKey { word: 0, bit: 0 }; 3],
                 n_bits: 0,
-                vals: [lo_bias, 0, 0, 0],
+                vals: [lo_bias, 0, 0, 0, 0, 0, 0, 0],
             });
         }
     }
@@ -863,8 +882,19 @@ fn solve_pair(
     let full_mask = (1u64 << m) - 1;
     // 5. Inductively verify the carry tree merges all `m` singleton clusters into `full_mask`.
     let mut active: Vec<u64> = (0..m).map(|i| 1u64 << i).collect();
+    let mut cluster_max: Vec<u64> = lo_tables
+        .iter()
+        .map(|t| {
+            t.vals[..1usize << t.n_bits]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
     let mut used = vec![false; carry_candidates.len()];
     let mut parsed_carries: Vec<Option<(u64, u64)>> = Vec::with_capacity(carry_candidates.len());
+    let mut carry_op_masks: Vec<u64> = Vec::new();
     // Helper: recognize `x` as `~lo_raw[k]` when `~` was pushed into a small `select` table.
     let complement_leaf = |cx: &Context, x: u32| -> Option<usize> {
         let xt = eval_small_table(cx, x)?;
@@ -885,6 +915,8 @@ fn solve_pair(
                     && (sm & pm) == pm
                     && sm != pm
                 {
+                    carry_op_masks.push(sm ^ pm);
+                    carry_op_masks.push(pm);
                     Some((sm ^ pm, pm))
                 } else if let (Some(k), Some(ym)) = (
                     complement_leaf(cx, sum),
@@ -892,6 +924,7 @@ fn solve_pair(
                 ) && ym != 0
                     && ((ym >> k) & 1) == 0
                 {
+                    carry_op_masks.push(ym);
                     Some((1u64 << k, ym))
                 } else {
                     None
@@ -905,6 +938,8 @@ fn solve_pair(
                     && ym != 0
                     && (xm & ym) == 0
                 {
+                    carry_op_masks.push(xm);
+                    carry_op_masks.push(ym);
                     Some((xm, ym))
                 } else {
                     None
@@ -931,20 +966,80 @@ fn solve_pair(
             }
             used[idx] = true;
             let combined = u | v;
+            let combined_max = cluster_max[pu].saturating_add(cluster_max[pv]);
             if pu > pv {
                 active.swap_remove(pu);
+                cluster_max.swap_remove(pu);
                 active[pv] = combined;
+                cluster_max[pv] = combined_max;
             } else {
                 active.swap_remove(pv);
+                cluster_max.swap_remove(pv);
                 active[pu] = combined;
+                cluster_max[pu] = combined_max;
             }
             merged_any = true;
+        }
+        // Any two active clusters inside the same carry operand mask whose maximum possible values
+        // satisfy `max_u + max_v <= u64::MAX` can never produce a 64-bit unsigned carry (`0`).
+        if !merged_any && active.len() > 1 {
+            'zero_carry: for &m_op in &carry_op_masks {
+                if m_op.count_ones() < 2 {
+                    continue;
+                }
+                for pu in 0..active.len() {
+                    let u = active[pu];
+                    if (m_op & u) != u {
+                        continue;
+                    }
+                    for pv in (pu + 1)..active.len() {
+                        let v = active[pv];
+                        if (m_op & v) != v {
+                            continue;
+                        }
+                        let Some(sum_max) = cluster_max[pu].checked_add(cluster_max[pv]) else {
+                            continue;
+                        };
+                        active.swap_remove(pv);
+                        cluster_max.swap_remove(pv);
+                        active[pu] = u | v;
+                        cluster_max[pu] = sum_max;
+                        merged_any = true;
+                        break 'zero_carry;
+                    }
+                }
+            }
         }
         if !merged_any {
             break;
         }
     }
-    if active.len() != 1 || active[0] != full_mask {
+    let mut implicit_top_carry: Option<SmallTable> = None;
+    if active.len() == 2 && (active[0] | active[1]) == full_mask && (active[0] & active[1]) == 0 {
+        // Under `LO == c_lo`, a missing top-level carry between `(full_mask ^ (1 << v))` and a
+        // single leaf `g_v` equals `[(L_rest + g_v) mod 2^64 <u g_v] == [c_lo <u g_v]`, which is
+        // an exact `<= 2`-bit table over `g_v`'s bits subtracted from the 128-bit sum's high word.
+        let single = if active[0].count_ones() == 1 {
+            Some(active[0].trailing_zeros() as usize)
+        } else if active[1].count_ones() == 1 {
+            Some(active[1].trailing_zeros() as usize)
+        } else {
+            None
+        };
+        let Some(v_idx) = single else {
+            return Ok(None);
+        };
+        let gv = lo_tables[v_idx];
+        let mut cvals = [0u64; 8];
+        for a in 0..(1usize << gv.n_bits) {
+            cvals[a] = u64::from(c_lo < gv.vals[a]);
+        }
+        implicit_top_carry = Some(SmallTable {
+            bits: gv.bits,
+            n_bits: gv.n_bits,
+            vals: cvals,
+        });
+    } else if active.len() != 1 || active[0] != full_mask {
         return Ok(None);
     }
     // 6. Any unused carry candidate (e.g., local constant-offset carries on 2 bits) and all
@@ -954,7 +1049,10 @@ fn solve_pair(
             hi_other.push((term, false));
         }
     }
-    let mut hi_tables: Vec<(SmallTable, bool)> = Vec::with_capacity(hi_other.len());
+    let mut hi_tables: Vec<(SmallTable, bool)> = Vec::with_capacity(hi_other.len() + 1);
+    if let Some(ctbl) = implicit_top_carry {
+        hi_tables.push((ctbl, true));
+    }
     for (term, neg) in hi_other {
         let Some(tbl) = eval_small_table(cx, term) else {
             return Ok(None);
@@ -1077,10 +1175,13 @@ fn solve_pair(
     let target128 = (((c_hi as u128) << 64) | (c_lo as u128)).wrapping_sub(base128);
     let total_bits: usize = groups.iter().map(|g| g.bits.len()).sum();
 
-    // 9. Check whether all bit keys belong to a single 64-bit word `W64 = zext32(y) + K64`
-    //    with some bits >= 32 (carry-coupled 2-case MITM).
+    // 9. Check whether all bit keys belong to a single word `W = zext<w>(y:nw) + K`
+    //    with some bits >= nw (carry-coupled 2-case MITM).
     if total_bits > MAX_FREE_BITS {
         return solve_carry_split(r, cx, &groups, target128);
+    }
+    if let Some(res) = solve_carry_split(r, cx, &groups, target128)? {
+        return Ok(Some(res));
     }
 
     let Some(sols) = run_mitm(r, &groups, target128)? else {
@@ -1147,15 +1248,38 @@ fn build_bit_unification(
         }
     };
     let mut add_words: Vec<(u32, u32, u64)> = Vec::new();
+    let add_const_form = |cx: &Context, id: u32| -> Option<(u32, u64)> {
+        let n = cx.node(id);
+        if n.width > 64 {
+            return None;
+        }
+        let mask = u64::MAX >> (64 - n.width);
+        match n.op {
+            OpCode::Add => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => Some((n.a, k.to_u64()? & mask)),
+                (Some(k), None) => Some((n.b, k.to_u64()? & mask)),
+                _ => None,
+            },
+            OpCode::Sub => {
+                if let Some(c1) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
+                    let inner = cx.node(n.b);
+                    if inner.op == OpCode::Sub
+                        && let Some(c2) = cx.const_val(inner.a).and_then(|v| v.to_u64())
+                    {
+                        return Some((inner.b, c1.wrapping_sub(c2) & mask));
+                    }
+                }
+                if let Some(c2) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                    return Some((n.a, c2.wrapping_neg() & mask));
+                }
+                None
+            }
+            _ => None,
+        }
+    };
     for &w in &words {
         let n = cx.node(w);
-        if n.op == OpCode::Add
-            && let Some((lhs, k)) = match (cx.const_val(n.a), cx.const_val(n.b)) {
-                (None, Some(k)) => Some((n.a, k.to_u64().unwrap_or(0))),
-                (Some(k), None) => Some((n.b, k.to_u64().unwrap_or(0))),
-                _ => None,
-            }
-        {
+        if let Some((lhs, k)) = add_const_form(cx, w) {
             if n.width == 64
                 && let Some(orig) = low32_origin(cx, lhs)
             {
@@ -1166,7 +1290,8 @@ fn build_bit_unification(
         }
     }
     // Map equivalent 32-bit `Add(y32, k32)` words onto their 64-bit `Add(zext32(y), k64)` word,
-    // and map low bits `b <= tz(k)` of `orig` onto `(w_add, b)`.
+    // map low bits `b <= tz(k)` of `orig` onto `(w_add, b)`, and unify `orig + k` with
+    // `orig + ok` on bits `0..=tz(ok - k)`.
     for &(w_add, orig, k) in &add_words {
         let nw = cx.wid(w_add);
         let tz = if k == 0 { nw } else { (k.trailing_zeros() as u16).min(nw) };
@@ -1175,6 +1300,29 @@ fn build_bit_unification(
                 continue;
             }
             let on = cx.node(other);
+            // Case 0: another `Add(orig, ok)` of the same width (`w_add < other` canonical).
+            if nw == on.width
+                && w_add < other
+                && let Some(&(_, o_orig, ok)) = add_words.iter().find(|&&(ow, _, _)| ow == other)
+                && o_orig == orig
+            {
+                let full = u64::MAX >> (64 - nw);
+                let delta = ok.wrapping_sub(k) & full;
+                let dtz = if delta == 0 {
+                    nw
+                } else {
+                    (delta.trailing_zeros() as u16).min(nw)
+                };
+                for b in 0..=dtz.min(nw.saturating_sub(1)) {
+                    if b < dtz {
+                        map.entry(BitKey { word: other, bit: b })
+                            .or_insert((BitKey { word: w_add, bit: b }, false));
+                    } else if b == dtz && delta != 0 {
+                        map.entry(BitKey { word: other, bit: b })
+                            .or_insert((BitKey { word: w_add, bit: b }, true));
+                    }
+                }
+            }
             // Case 1: 32-bit `Add(orig_32, k as u32)` matches 64-bit `w_add`.
             if nw == 64
                 && on.width == 32
@@ -1212,47 +1360,58 @@ fn build_bit_unification(
     map
 }
 
-fn apply_unification(mut t: SmallTable, map: &IdMap<BitKey, (BitKey, bool)>) -> SmallTable {
+fn apply_unification(t: SmallTable, map: &IdMap<BitKey, (BitKey, bool)>) -> SmallTable {
     if map.is_empty() || t.n_bits == 0 {
         return t;
     }
     let n = t.n_bits as usize;
-    let mut flip_mask = 0usize;
-    for (k, bit_slot) in t.bits.iter_mut().enumerate().take(n) {
-        if let Some(&(dst, flip)) = map.get(bit_slot) {
-            *bit_slot = dst;
-            if flip {
-                flip_mask |= 1 << k;
+    let mut mapped = [BitKey { word: 0, bit: 0 }; 3];
+    let mut flips = [false; 3];
+    for k in 0..n {
+        if let Some(&(dst, flip)) = map.get(&t.bits[k]) {
+            mapped[k] = dst;
+            flips[k] = flip;
+        } else {
+            mapped[k] = t.bits[k];
+        }
+    }
+    let mut uniq = [BitKey { word: 0, bit: 0 }; 3];
+    let mut u_len = 0usize;
+    for &b in &mapped[..n] {
+        if !uniq[..u_len].contains(&b) {
+            uniq[u_len] = b;
+            u_len += 1;
+        }
+    }
+    uniq[..u_len].sort();
+    let mut new_vals = [0u64; 8];
+    for (u_assign, slot) in new_vals.iter_mut().enumerate().take(1usize << u_len) {
+        let mut orig_assign = 0usize;
+        for k in 0..n {
+            let pos = uniq[..u_len].iter().position(|&x| x == mapped[k]).unwrap();
+            let bit_on = (((u_assign >> pos) & 1) != 0) ^ flips[k];
+            if bit_on {
+                orig_assign |= 1 << k;
             }
         }
+        *slot = t.vals[orig_assign];
     }
-    if flip_mask != 0 {
-        let old = t.vals;
-        for a in 0..(1usize << n) {
-            t.vals[a] = old[a ^ flip_mask];
-        }
+    SmallTable {
+        bits: uniq,
+        n_bits: u_len as u8,
+        vals: new_vals,
     }
-    // If both bits mapped to the same BitKey, collapse to a 1-bit table.
-    if n == 2 && t.bits[0] == t.bits[1] {
-        t.vals[1] = t.vals[3];
-        t.n_bits = 1;
-    } else if n == 2 && t.bits[0] > t.bits[1] {
-        t.bits.swap(0, 1);
-        t.vals.swap(1, 2);
-    }
-    t
 }
 
-/// Handle `W64 = (zext<64>(y:32) | (y64 & 0xffffffff)) + K64` where free bits exceed 32
-/// solely because of high bits `b >= 32` of `W64` determined by the 32-bit carry out of
-/// `y:32 + lo32(K64)`.
+/// Handle `W = (zext<w>(y:nw) | (yw & ((1 << nw) - 1))) + K` (`1 <= nw < w <= 64`, `nw <= 32`)
+/// when high bits `b >= nw` of `W` appear in `groups`: those bits are determined by the single
+/// carry out of `y:nw + (K & ((1 << nw) - 1))`.
 fn solve_carry_split(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     groups: &[Group128],
     target128: u128,
 ) -> Result<Option<u32>, Stop> {
-    // All bit keys must belong to a single 64-bit word `w64 = zext32(y) + k64`.
     let Some(first_word) = groups.first().and_then(|g| g.bits.first()).map(|b| b.word) else {
         return Ok(None);
     };
@@ -1263,42 +1422,61 @@ fn solve_carry_split(
         return Ok(None);
     }
     let wn = cx.node(first_word);
-    if wn.width != 64 || wn.op != OpCode::Add {
+    let w = wn.width;
+    if !(2..=64).contains(&w) || wn.op != OpCode::Add {
         return Ok(None);
     }
-    let Some((lhs, k64)) = (match (cx.const_val(wn.a), cx.const_val(wn.b)) {
-        (None, Some(k)) => k.to_u64().map(|v| (wn.a, v)),
-        (Some(k), None) => k.to_u64().map(|v| (wn.b, v)),
+    let full_w = u64::MAX >> (64 - w);
+    let Some((lhs, kw)) = (match (cx.const_val(wn.a), cx.const_val(wn.b)) {
+        (None, Some(k)) => k.to_u64().map(|v| (wn.a, v & full_w)),
+        (Some(k), None) => k.to_u64().map(|v| (wn.b, v & full_w)),
         _ => None,
     }) else {
         return Ok(None);
     };
     let ln = cx.node(lhs);
-    let is_low32 = (ln.op == OpCode::Zext && cx.wid(ln.a) == 32)
-        || (ln.op == OpCode::And
-            && cx
-                .const_val(ln.b)
-                .or_else(|| cx.const_val(ln.a))
-                .and_then(|v| v.to_u64())
-                == Some(0xffffffff));
-    if !is_low32 {
+    let nw_opt: Option<u16> = if ln.op == OpCode::Zext && cx.wid(ln.a) < w && cx.wid(ln.a) <= 32 {
+        Some(cx.wid(ln.a))
+    } else if ln.op == OpCode::And
+        && let Some(m) = cx
+            .const_val(ln.b)
+            .or_else(|| cx.const_val(ln.a))
+            .and_then(|v| v.to_u64())
+        && m != 0
+        && (m & (m + 1)) == 0
+    {
+        let nw = m.count_ones() as u16;
+        (nw < w && nw <= 32).then_some(nw)
+    } else {
+        None
+    };
+    let Some(nw) = nw_opt else {
+        return Ok(None);
+    };
+    if !groups.iter().any(|g| g.bits.iter().any(|b| b.bit >= nw)) {
         return Ok(None);
     }
-    let lo32 = k64 as u32;
-    let hi32 = k64 >> 32;
+    let low_nw_mask = if nw == 32 {
+        u64::from(u32::MAX)
+    } else {
+        (1u64 << nw) - 1
+    };
+    let lo_k = (kw & low_nw_mask) as u32;
+    let hi_k = kw >> nw;
+    let hi_mask = u64::MAX >> (64 - (w - nw));
     let mut all_valid: Vec<(u32, u64)> = Vec::new();
-    let carry_cases: &[u64] = if lo32 == 0 { &[0] } else { &[0, 1] };
+    let carry_cases: &[u64] = if lo_k == 0 { &[0] } else { &[0, 1] };
     for &carry in carry_cases {
-        let hi_val = hi32.wrapping_add(carry);
-        // Specialize every group by fixing all bits >= 32 to `bit(hi_val, b - 32)`.
+        let hi_val = hi_k.wrapping_add(carry) & hi_mask;
+        // Specialize every group by fixing all bits >= nw to `bit(hi_val, b - nw)`.
         let mut sub_groups: Vec<Group128> = Vec::new();
         let mut sub_base = 0u128;
         for g in groups {
             let mut free_idx = Vec::new();
             let mut fixed_mask = 0usize;
             for (k, b) in g.bits.iter().enumerate() {
-                if b.bit >= 32 {
-                    if ((hi_val >> (b.bit - 32)) & 1) != 0 {
+                if b.bit >= nw {
+                    if ((hi_val >> (b.bit - nw)) & 1) != 0 {
                         fixed_mask |= 1 << k;
                     }
                 } else {
@@ -1329,31 +1507,31 @@ fn solve_carry_split(
         if free_total > MAX_FREE_BITS {
             return Ok(None);
         }
-        // Only emit if all 32 low bits are present (so carry condition `w32 < lo32` is exact).
-        let mut low_mask = 0u32;
+        // Only emit if all `nw` low bits are present (so carry condition `w_low < lo_k` is exact).
+        let mut low_mask = 0u64;
         for g in &sub_groups {
             for b in &g.bits {
-                low_mask |= 1u32 << b.bit;
+                low_mask |= 1u64 << b.bit;
             }
         }
-        if low_mask != u32::MAX {
+        if low_mask != low_nw_mask {
             return Ok(None);
         }
         let Some(sols) = run_mitm(r, &sub_groups, target128.wrapping_sub(sub_base))? else {
             return Ok(None);
         };
         for sol in sols {
-            let mut w32 = 0u32;
+            let mut w_low = 0u32;
             for (g, &a) in sub_groups.iter().zip(&sol) {
                 for (k, b) in g.bits.iter().enumerate() {
                     if (a >> k) & 1 != 0 {
-                        w32 |= 1u32 << b.bit;
+                        w_low |= 1u32 << b.bit;
                     }
                 }
             }
-            let valid = if carry == 1 { w32 < lo32 } else { w32 >= lo32 };
+            let valid = if carry == 1 { w_low < lo_k } else { w_low >= lo_k };
             if valid {
-                all_valid.push((w32, (hi_val << 32) | u64::from(w32)));
+                all_valid.push((w_low, ((hi_val << nw) | u64::from(w_low)) & full_w));
                 if all_valid.len() > MAX_SOLUTIONS {
                     return Ok(None);
                 }
@@ -1363,17 +1541,34 @@ fn solve_carry_split(
     if all_valid.is_empty() {
         return Ok(Some(r.build(cx, |cx| cx.mk_const_u64(1, 0))?));
     }
+    let narrow_target: Option<u32> = if ln.op == OpCode::Zext && cx.wid(ln.a) == nw {
+        Some(ln.a)
+    } else if ln.op == OpCode::And {
+        let src = if cx.const_val(ln.b).and_then(|v| v.to_u64()) == Some(low_nw_mask) {
+            Some(ln.a)
+        } else if cx.const_val(ln.a).and_then(|v| v.to_u64()) == Some(low_nw_mask) {
+            Some(ln.b)
+        } else {
+            None
+        };
+        match src {
+            Some(s) => Some(r.build(cx, |cx| cx.c_extract(s, 0, nw))?),
+            None => None,
+        }
+    } else {
+        None
+    };
     let mut acc: Option<u32> = None;
-    for &(w32, full64) in &all_valid {
-        let eq = if ln.op == OpCode::Zext && cx.wid(ln.a) == 32 {
-            let y_val = u64::from(w32.wrapping_sub(lo32));
+    for &(w_low, full_val) in &all_valid {
+        let eq = if let Some(yn) = narrow_target {
+            let y_val = u64::from(w_low.wrapping_sub(lo_k)) & low_nw_mask;
             r.build(cx, |cx| {
-                let k = cx.mk_const_u64(32, y_val)?;
-                cx.c_cmp(CmpOp::Eq, ln.a, k)
+                let k = cx.mk_const_u64(nw, y_val)?;
+                cx.c_cmp(CmpOp::Eq, yn, k)
             })?
         } else {
             r.build(cx, |cx| {
-                let k = cx.mk_const_u64(64, full64)?;
+                let k = cx.mk_const_u64(w, full_val)?;
                 cx.c_cmp(CmpOp::Eq, first_word, k)
             })?
         };
@@ -1744,5 +1939,193 @@ mod tests {
             assert_eq!(!got.is_zero(), v == u64::from(x_sol), "mismatch at x={v}");
         }
         assert!(cx.dag_size(&[out], 10).is_ok());
+    }
+
+    #[test]
+    fn solves_implicit_top_carry_34bit_guard() {
+        let src = r#"
+let %0 = trunc<32>(#2:64);
+let %1 = %0 + 0xdd9eda58;
+let %2 = extract<30, 1>(%1);
+let %3 = %1 <s 0;
+let %4 = select(%3, 0x526dd042f4d1446a:64, 0xcdde0d0021c241cc);
+let %5 = select(%2, %4, %4 + 0x3221f2ffde3dbe34);
+let %6 = extract<28, 1>(%1);
+let %7 = #2 & 0xffffffff;
+let %8 = %7 + 0x5d4c0259dd9eda58;
+let %9 = extract<29, 1>(%8);
+let %10 = select(%9, 0xf837a932c5f7d65c:64, 0x8fb385729f4a1118);
+let %11 = select(%6, %10, %10 + 0x704c7a8d60b5eee8);
+let %12 = %5 + %11;
+let %13 = extract<26, 1>(%1);
+let %14 = extract<27, 1>(%1);
+let %15 = select(%14, 0x21687fbeaecd2d02:64, 0x3100cb0f2db87c1e);
+let %16 = select(%13, %15, %15 + 0xceff34f0d24783e2);
+let %17 = extract<24, 1>(%8);
+let %18 = select(extract<25, 1>(%1), 0xc21cb0d86c1d26d4:64, 0xa7439f6f4d829bac);
+let %19 = select(%17, %18, %18 + 0x58bc6090b27d6454);
+let %20 = %12 + %16 + %19;
+let %21 = extract<22, 1>(%8);
+let %22 = extract<23, 1>(%8);
+let %23 = select(%22, 0x7ac92728e3c3027e:64, 0xcf36604e9a9d32b0);
+let %24 = select(%21, %23, %23 + 0x30c99fb16562cd50);
+let %25 = extract<20, 1>(%8);
+let %26 = extract<21, 1>(%8);
+let %27 = select(%26, 0x391c6fc8318fa58:64, 0xec28555fc602146a);
+let %28 = select(%25, %27, %27 + 0x13d7aaa039fdeb96);
+let %29 = extract<18, 1>(%8);
+let %30 = extract<19, 1>(%8);
+let %31 = select(%30, 0x9f52c7d9b0b42bdc:64, 0x81692c94c97fbd86);
+let %32 = select(%29, %31, %31 + 0x7e96d36b3680427a);
+let %33 = %20 + %24 + %28 + %32;
+let %34 = extract<14, 1>(%8);
+let %35 = extract<15, 1>(%8);
+let %36 = select(%35, 0x73f1878434accafc:64, 0xe2714f5893413d40);
+let %37 = select(%34, %36, %36 + 0x1d8eb0a76cbec2c0);
+let %38 = extract<12, 1>(%8);
+let %39 = extract<13, 1>(%8);
+let %40 = select(%39, 0x1c34b2a88b544698:64, 0x3313b865a01daabe);
+let %41 = select(%38, %40, %40 + 0xccec479a5fe25542);
+let %42 = extract<10, 1>(%8);
+let %43 = extract<11, 1>(%8);
+let %44 = select(%43, 0x11a37f57bbefe77a:64, 0xa9f2638e1c106274);
+let %45 = select(%42, %44, %44 + 0x560d9c71e3ef9d8c);
+let %46 = extract<6, 1>(%8);
+let %47 = trunc<8>(%8) <s 0;
+let %48 = select(%47, 0x5092c6ff4a01a8a4:64, 0x7f87b2f16b5c52c2);
+let %49 = select(%46, %48, %48 + 0x80784d0e94a3ad3e);
+let %50 = trunc<1>(%8);
+let %51 = extract<1, 1>(#2);
+let %52 = select(%51, 0x2c7d6e88303b0275:64, 0xa09d2204f6bdd145);
+let %53 = select(%50, %52, %52 + 0x5f62ddfb09422ebb);
+let %54 = extract<2, 1>(#2);
+let %55 = extract<3, 1>(#2);
+let %56 = select(%55, 0x9a59a2110e9a1d60:64, 0xc71ef9b3aaf82b40);
+let %57 = select(%54, %56, %56 + 0x65a65deef165e2a0);
+let %58 = extract<4, 1>(%8);
+let %59 = extract<5, 1>(%8);
+let %60 = select(%59, 0x17e01e1e6024331c:64, 0xb74de02b410ab86a);
+let %61 = select(%58, %60, %60 + 0x48b21fd4bef54796);
+let %62 = extract<8, 1>(%8);
+let %63 = extract<9, 1>(%8);
+let %64 = select(%63, 0x7df8efd6f23fb130:64, 0x358f1c5a274837ea);
+let %65 = select(%62, %64, %64 + 0xca70e3a5d8b7c816);
+let %66 = extract<16, 1>(%8);
+let %67 = extract<17, 1>(%8);
+let %68 = select(%67, 0x73de706c3bbca9c:64, 0x3001002089328d1e);
+let %69 = select(%66, %68, %68 + 0xcffeffdf76cd72e2);
+let %70 = %33 + %37 + %41 + %45 + %49 + %53 + %57 + %61 + %65 + %69;
+let %71 = extract<32, 1>(%8);
+let %72 = extract<33, 1>(%8);
+let %73 = select(%72, 0xd75ddbfe6e679da0:64, 0x9d8d3f5639c65448);
+let %74 = zext<64>(%71);
+let %75 = zext<64>(~%71);
+let %76 = %33 + %69;
+let %77 = concat(zext<63>(%9), 0:1);
+let %78 = %28 + %24;
+let %79 = select(%30, 9:64, 2);
+let %80 = %37 + %41;
+let %81 = %80 + %45;
+let %82 = %81 + %65;
+let %83 = zext<64>(%43);
+let %84 = select(%63, 9:64, 3);
+(%70 + select(%71, %73, %73 + 0x6272c0a9c639abb8) == 0x9d40e5a6867a7e4c) & (%74 + select(%72, %74, 1) + select(%72, %75, %74) + select(%72, 1, %75) + zext<64>(%70 <u %76) + zext<64>(%76 <u %20) + zext<64>(%20 <u %12) + zext<64>(~%5 <u %11) + select(%2, select(%3, 10:64, 4), zext<64>(%3) * 5) + select(%6, %77 | 1, %77) + zext<64>(~%16 <u %19) + select(%13, concat(zext<61>(%14), -2:3), select(%14, 7:64, 0)) + select(%17, 7:64, 0) + zext<64>(%78 + %32 + %69 <u %78) + zext<64>(~%24 <u %28) + select(%22, select(%21, 13:64, 4), select(%21, 8:64, 0)) + select(%25, select(%26, 13:64, 7), zext<64>(%26) * 5) + zext<64>(~%32 <u %69) + select(%29, %79, %79 - 2) + zext<64>(%81 + %49 + %53 + %57 + %61 + %65 <u %82) + zext<64>(%82 <u %80) + zext<64>(~%37 <u %41) + select(%34, select(%35, 6:64, 0), zext<64>(%35) * 5) + select(%39, select(%38, 10:64, 2), select(%38, 7:64, 0)) + zext<64>(~%45 <u %65) + select(%42, (%83 << 1) + 6, %83) + zext<64>(%53 + %49 + %57 + %61 <u %61 + %49) + zext<64>(~%49 <u %61) + select(%47, select(%46, 10:64, 2), select(%46, 7:64, 0)) + zext<64>(~%57 <u %53) + select(%50, concat(zext<61>(%51), -1:3), select(%51, 7:64, 0)) + zext<64>(~%54) * -1 + select(%55, 1:64, 7) + select(%58, select(%59, 8:64, 1), select(%59, 6:64, 0)) + select(%62, %84, %84 - 3) + select(%67, select(%66, 15:64, 8), select(%66, 6:64, 0)) + concat(zext<63>(%71), 0:1) == 113)
+"#;
+        let (mut cx, out) = run_sweep(src.trim());
+        assert!(
+            cx.dag_size(&[out], 12).is_ok(),
+            "expected compact solved guard, got: {}",
+            cx.display(out)
+        );
+    }
+
+    #[test]
+    fn solves_narrow_carry_split_and_zero_overflow_cluster_merge() {
+        // Group 0 and Group 1 have 64-bit low parts whose maxima sum to < u64::MAX, so `%a = %0 + %1`
+        // needs no explicit carry term and merges via the zero-overflow carry-operand check.
+        // Word `%w = (y:16 & 0xff) + 0x34a1:16` exercises `solve_carry_split` for `nw = 8 < w = 16`.
+        let w: [u128; 10] = [
+            0x2_0123456789abcdefu128,
+            0x5_0fedcba987654321u128,
+            0x1_0111222233334445u128,
+            0x4_0555666677778889u128,
+            0x3_9abcdef012345678u128,
+            0x6_fedcba9876543211u128,
+            0x2_a1b2c3d4e5f60718u128,
+            0x7_9081726354453627u128,
+            0x5_deadbeefcafebabeu128,
+            0x3_8877665544332211u128,
+        ];
+        let sum_for_w = |w_val: u16| -> u128 {
+            let mut acc = 0u128;
+            for (b, &wb) in w.iter().enumerate() {
+                if (w_val >> b) & 1 != 0 {
+                    acc = acc.wrapping_add(wb);
+                }
+            }
+            acc
+        };
+        let mk_group = |k: usize| {
+            let w00 = 0u128;
+            let w01 = w[2 * k];
+            let w10 = w[2 * k + 1];
+            let w11 = w01.wrapping_add(w10);
+            let lo = format!(
+                "select(extract<{}, 1>(%90), select(extract<{}, 1>(%90), {:#x}:64, {:#x}), select(extract<{}, 1>(%90), {:#x}:64, {:#x}))",
+                2 * k, 2 * k + 1, w11 as u64, w01 as u64, 2 * k + 1, w10 as u64, w00 as u64
+            );
+            let hi = format!(
+                "select(extract<{}, 1>(%90), select(extract<{}, 1>(%90), {:#x}:64, {:#x}), select(extract<{}, 1>(%90), {:#x}:64, {:#x}))",
+                2 * k, 2 * k + 1, (w11 >> 64) as u64, (w01 >> 64) as u64, 2 * k + 1, (w10 >> 64) as u64, (w00 >> 64) as u64
+            );
+            (lo, hi)
+        };
+        let (l0, h0) = mk_group(0);
+        let (l1, h1) = mk_group(1);
+        let (l2, h2) = mk_group(2);
+        let (l3, h3) = mk_group(3);
+        let (l4, h4) = mk_group(4);
+
+        let y_sol: u16 = 0x70;
+        let w_sol = y_sol.wrapping_add(0x34a1); // 0x3511 (carry = 1 out of low 8 bits)
+        let target = sum_for_w(w_sol);
+        let src = format!(
+            "let %90 = (y:16 & 0xff) + 0x34a1:16; \
+             let %0 = {l0}; let %1 = {l1}; let %2 = {l2}; let %3 = {l3}; let %4 = {l4}; \
+             let %91 = %0 + %1; let %92 = %2 + %3; let %93 = %91 + %92; let %94 = %93 + %4; \
+             let %95 = ({h0}) + ({h1}) + ({h2}) + ({h3}) + ({h4}) \
+                       + zext<64>(%92 <u %2) + zext<64>(%93 <u %91) + zext<64>(%94 <u %93); \
+             ((%94 ^ {:#x}) | (%95 ^ {:#x})) == 0",
+            target as u64,
+            (target >> 64) as u64
+        );
+        let (mut cx, out) = run_sweep(&src);
+        for v in [0u64, 0x6f, 0x70, 0x71, 0xff, 0x1370, 0xff70, 0xff71] {
+            let got = cx
+                .eval(&[out], &[("y".into(), BitVec::from_u64(Width::W16, v).unwrap())][..])
+                .unwrap()[0];
+            assert_eq!(!got.is_zero(), (v & 0xff) == u64::from(y_sol), "mismatch at y={v:#x}");
+        }
+        assert!(
+            cx.dag_size(&[out], 10).is_ok(),
+            "expected compact carry-split guard, got: {}",
+            cx.display(out)
+        );
+
+        // Inconsistent carry combination (`hi = 0x34` requires `w_low >= 0xa1`, paired with `w_low = 0x11`)
+        // must be rejected as unsatisfiable (`0:1`).
+        let fake_target = sum_for_w(0x3411);
+        let src_fake = format!(
+            "let %90 = (y:16 & 0xff) + 0x34a1:16; \
+             let %0 = {l0}; let %1 = {l1}; let %2 = {l2}; let %3 = {l3}; let %4 = {l4}; \
+             let %91 = %0 + %1; let %92 = %2 + %3; let %93 = %91 + %92; let %94 = %93 + %4; \
+             let %95 = ({h0}) + ({h1}) + ({h2}) + ({h3}) + ({h4}) \
+                       + zext<64>(%92 <u %2) + zext<64>(%93 <u %91) + zext<64>(%94 <u %93); \
+             ((%94 ^ {:#x}) | (%95 ^ {:#x})) == 0",
+            fake_target as u64,
+            (fake_target >> 64) as u64
+        );
+        let (cx2, out2) = run_sweep(&src_fake);
+        assert!(matches!(cx2.view(out2).unwrap(), View::Const(v) if v.is_zero()));
     }
 }

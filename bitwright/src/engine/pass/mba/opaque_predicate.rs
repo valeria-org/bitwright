@@ -650,6 +650,14 @@ fn possible_ones(cx: &Context, i: u32, depth: u8) -> u64 {
             let b = possible_ones(cx, n.b, depth - 1);
             if a & b == 0 {
                 a | b
+            } else if let Some(c) = scalar(cx, n.a)
+                && b.is_power_of_two()
+            {
+                c | c.wrapping_add(b)
+            } else if let Some(c) = scalar(cx, n.b)
+                && a.is_power_of_two()
+            {
+                c | c.wrapping_add(a)
             } else {
                 let tz = a.trailing_zeros().min(b.trailing_zeros());
                 if tz >= 64 { 0 } else { full << tz }
@@ -662,6 +670,14 @@ fn possible_ones(cx: &Context, i: u32, depth: u8) -> u64 {
                 && b & !c == 0
             {
                 c
+            } else if let Some(c) = scalar(cx, n.a)
+                && b.is_power_of_two()
+            {
+                c | c.wrapping_sub(b)
+            } else if let Some(c) = scalar(cx, n.b)
+                && a.is_power_of_two()
+            {
+                c.wrapping_neg() | a.wrapping_sub(c)
             } else {
                 let tz = a.trailing_zeros().min(b.trailing_zeros());
                 if tz >= 64 { 0 } else { full << tz }
@@ -770,13 +786,22 @@ fn distribute_matching_prods(
         (1u64 << mod_bits) - 1
     };
     let mut prod_factors: Vec<(usize, u32, u32)> = Vec::new();
-    for (idx, &(id, k)) in parts.iter().enumerate() {
-        if k & mask == 0 {
+    for (idx, (id, k)) in parts.iter_mut().enumerate() {
+        if *k & mask == 0 {
             continue;
         }
-        let n = cx.node(id);
+        let n = cx.node(*id);
         if n.op == OpCode::Mul {
-            prod_factors.push((idx, n.a, n.b));
+            if let Some((v, fs)) = super::super::linear::scaled_factors(cx, *id)
+                && let &[fa, fb] = fs.as_slice()
+            {
+                *k = k.wrapping_mul(v.limbs()[0]) & mask;
+                if *k != 0 {
+                    prod_factors.push((idx, fa, fb));
+                }
+            } else {
+                prod_factors.push((idx, n.a, n.b));
+            }
         }
     }
     if prod_factors.len() >= 2 {
@@ -1169,23 +1194,25 @@ pub(in crate::engine::pass) fn equal_lanes(
             }
         }
         rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
-        let try_lanes = |parts: &[(u32, u64)], work: &mut Work| -> Option<u64> {
-            match constant_lanes(cx, parts, cur_bits, work) {
-                Some(v) => Some(v),
-                None if parts.iter().any(|&(_, k)| k != 0 && k.trailing_zeros() > 0) => {
-                    constant_lanes_aligned(cx, parts, cur_bits, work)
-                }
-                None => None,
-            }
-        };
-        let value = match try_lanes(&parts, &mut work) {
+        let value = match constant_lanes(cx, &parts, cur_bits, &mut work) {
             Some(v) => v,
             None => {
+                if cur_bits <= 8
+                    && let Some(eq) = equal_low_cone_zero(cx, &parts, bias, cur_bits, &mut work)
+                {
+                    return Some(eq);
+                }
                 if !collapse_affine_bitwise_groups(cx, &mut parts, &mut bias, cur_bits, &mut work)? {
                     return None;
                 }
                 rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
-                try_lanes(&parts, &mut work)?
+                match constant_lanes(cx, &parts, cur_bits, &mut work) {
+                    Some(v) => v,
+                    None if cur_bits <= 8 => {
+                        return equal_low_cone_zero(cx, &parts, bias, cur_bits, &mut work);
+                    }
+                    None => return None,
+                }
             }
         };
         Some(bias.wrapping_add(value) & mask == 0)
@@ -1263,24 +1290,197 @@ pub(in crate::engine::pass) fn truncated_constant(
     Ok(value)
 }
 
-fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work) -> Option<u64> {
-    constant_lanes_mode(cx, parts, bits, false, work)
-}
-
-fn constant_lanes_aligned(
+/// Exact exhaustive decision procedure for `bias + Σ k_i * t_i ≡ 0 (mod 2^bits)` when `bits <= 8`
+/// and the causal mod-`2^bits` cone has `<= 48` nodes and `<= 12` total input bits across its
+/// leaf variables. Evaluates inductively at `b = 2, 4, ..., bits` so unequal cones exit in `<= 16` steps.
+fn equal_low_cone_zero(
     cx: &Context,
     parts: &[(u32, u64)],
+    bias: u64,
     bits: u16,
     work: &mut Work,
-) -> Option<u64> {
-    constant_lanes_mode(cx, parts, bits, true, work)
+) -> Option<bool> {
+    if !(1..=8).contains(&bits) || parts.is_empty() || parts.len() > 24 {
+        return None;
+    }
+    let mut order: Vec<u32> = Vec::new();
+    let mut idx_map: crate::hash::IdMap<u32, usize> = crate::hash::IdMap::default();
+    let mut leaves: Vec<(u32, u16)> = Vec::new();
+    let mut stack: Vec<(u32, bool)> = parts.iter().map(|&(id, _)| (id, false)).collect();
+    while let Some((i, expanded)) = stack.pop() {
+        if idx_map.contains_key(&i) {
+            continue;
+        }
+        let n = cx.node(i);
+        if n.width > 64 {
+            return None;
+        }
+        let causal = cx.const_val(i).is_some()
+            || matches!(
+                n.op,
+                OpCode::Add
+                    | OpCode::Sub
+                    | OpCode::Neg
+                    | OpCode::Mul
+                    | OpCode::Not
+                    | OpCode::And
+                    | OpCode::Or
+                    | OpCode::Xor
+            )
+            || (n.op == OpCode::Shl && scalar(cx, n.b).is_some())
+            || (matches!(n.op, OpCode::Zext | OpCode::Sext) && cx.wid(n.a) <= 64)
+            || (n.op == OpCode::Extract && n.b == 0 && n.width >= bits && cx.wid(n.a) <= 64);
+        if !causal {
+            let vbits = n.width.min(bits);
+            leaves.push((i, vbits));
+            idx_map.insert(i, order.len());
+            order.push(i);
+            continue;
+        }
+        if !expanded {
+            if order.len() + stack.len() > 96 {
+                return None;
+            }
+            stack.push((i, true));
+            if n.op == OpCode::Shl {
+                stack.push((n.a, false));
+            } else {
+                for c in n.children() {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        if order.len() >= 48 {
+            return None;
+        }
+        idx_map.insert(i, order.len());
+        order.push(i);
+    }
+    let total_bits: u16 = leaves.iter().map(|&(_, b)| b).sum();
+    if total_bits > 12 {
+        return None;
+    }
+    let mut vals = [0u64; 48];
+    let term_idxs: Vec<(usize, u64)> = parts
+        .iter()
+        .map(|&(id, k)| (idx_map[&id], k))
+        .collect();
+    let mut b = 2u16.min(bits);
+    loop {
+        let bmask = (1u64 << b) - 1;
+        let mut var_shifts: Vec<(usize, u16, u64)> = Vec::with_capacity(leaves.len());
+        let mut shift = 0u16;
+        for &(lid, lbits) in &leaves {
+            let vb = lbits.min(b);
+            var_shifts.push((idx_map[&lid], shift, (1u64 << vb) - 1));
+            shift += vb;
+        }
+        let states = 1u64 << shift;
+        let charge = ((order.len() as u64) * states).div_ceil(32);
+        work.take(charge)?;
+        for st in 0..states {
+            for &(slot, sh, vm) in &var_shifts {
+                vals[slot] = (st >> sh) & vm;
+            }
+            for (pos, &id) in order.iter().enumerate() {
+                if leaves.iter().any(|&(lid, _)| lid == id) {
+                    continue;
+                }
+                if let Some(c) = scalar(cx, id) {
+                    vals[pos] = c & bmask;
+                    continue;
+                }
+                let n = cx.node(id);
+                vals[pos] = match n.op {
+                    OpCode::Add => vals[idx_map[&n.a]].wrapping_add(vals[idx_map[&n.b]]) & bmask,
+                    OpCode::Sub => vals[idx_map[&n.a]].wrapping_sub(vals[idx_map[&n.b]]) & bmask,
+                    OpCode::Neg => vals[idx_map[&n.a]].wrapping_neg() & bmask,
+                    OpCode::Mul => vals[idx_map[&n.a]].wrapping_mul(vals[idx_map[&n.b]]) & bmask,
+                    OpCode::Not => (!vals[idx_map[&n.a]]) & bmask,
+                    OpCode::And => vals[idx_map[&n.a]] & vals[idx_map[&n.b]],
+                    OpCode::Or => vals[idx_map[&n.a]] | vals[idx_map[&n.b]],
+                    OpCode::Xor => vals[idx_map[&n.a]] ^ vals[idx_map[&n.b]],
+                    OpCode::Shl => {
+                        let s = scalar(cx, n.b).unwrap_or(64);
+                        if s >= u64::from(b) {
+                            0
+                        } else {
+                            (vals[idx_map[&n.a]] << s) & bmask
+                        }
+                    }
+                    OpCode::Zext => {
+                        let sw = cx.wid(n.a);
+                        let v = vals[idx_map[&n.a]];
+                        if sw < b {
+                            v & ((1u64 << sw) - 1)
+                        } else {
+                            v & bmask
+                        }
+                    }
+                    OpCode::Sext => {
+                        let sw = cx.wid(n.a);
+                        let v = vals[idx_map[&n.a]];
+                        if sw < b {
+                            let sm = (1u64 << sw) - 1;
+                            let sign = (v >> (sw - 1)) & 1;
+                            if sign != 0 {
+                                ((v & sm) | !sm) & bmask
+                            } else {
+                                v & sm
+                            }
+                        } else {
+                            v & bmask
+                        }
+                    }
+                    OpCode::Extract => vals[idx_map[&n.a]] & bmask,
+                    _ => return None,
+                };
+            }
+            let mut acc = bias;
+            for &(slot, k) in &term_idxs {
+                acc = acc.wrapping_add(k.wrapping_mul(vals[slot]));
+            }
+            if acc & bmask != 0 {
+                return Some(false);
+            }
+        }
+        if b == bits {
+            return Some(true);
+        }
+        b = (b + 2).min(bits);
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum AlignMode {
+    Plain,
+    ShiftWords,
+    AllTz,
+}
+
+fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work) -> Option<u64> {
+    let mask = u64::MAX >> (64 - bits);
+    if let Some(v) = constant_lanes_mode(cx, parts, bits, AlignMode::Plain, work) {
+        return Some(v);
+    }
+    if parts
+        .iter()
+        .any(|&(_, k)| (k & mask) != 0 && k.trailing_zeros() > 0)
+    {
+        if let Some(v) = constant_lanes_mode(cx, parts, bits, AlignMode::ShiftWords, work) {
+            return Some(v);
+        }
+        return constant_lanes_mode(cx, parts, bits, AlignMode::AllTz, work);
+    }
+    None
 }
 
 fn constant_lanes_mode(
     cx: &Context,
     parts: &[(u32, u64)],
     bits: u16,
-    align_tz: bool,
+    mode: AlignMode,
     work: &mut Work,
 ) -> Option<u64> {
     let mut sum = 0u64;
@@ -1294,7 +1494,22 @@ fn constant_lanes_mode(
             if k == 0 {
                 continue;
             }
-            let b = if align_tz {
+            let use_tz = match mode {
+                AlignMode::Plain => false,
+                AlignMode::AllTz => true,
+                AlignMode::ShiftWords => !matches!(
+                    cx.node(t).op,
+                    OpCode::And
+                        | OpCode::Or
+                        | OpCode::Xor
+                        | OpCode::Not
+                        | OpCode::Zext
+                        | OpCode::Sext
+                        | OpCode::Extract
+                        | OpCode::Select
+                ),
+            };
+            let b = if use_tz {
                 let tz = k.trailing_zeros() as u16;
                 if j < tz {
                     continue;

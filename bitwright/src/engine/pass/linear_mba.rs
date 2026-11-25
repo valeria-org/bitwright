@@ -106,24 +106,37 @@ enum Mode {
 /// and that plus `2^W` when it is all ones there (`zext(~a)` is `~zext(a) + 2^W`, i.e.
 /// `lowmask(W) − zext(a)`), which is a term but no operand of a bitwise function.
 fn interior(cx: &Context, i: u32, mode: Mode) -> bool {
+    interior_ext(cx, i, mode, None, false)
+}
+
+fn interior_ext(
+    cx: &Context,
+    i: u32,
+    mode: Mode,
+    forced: Option<&Marks>,
+    allow_const_atoms: bool,
+) -> bool {
     let n = cx.node(i);
     if let Some(v) = cx.const_val(i) {
         // Inside bitwise functions only 0 and all-ones are uniform across bit positions.
         return mode == Mode::Linear || v.is_zero() || v.is_ones();
     }
+    let unforced_const =
+        |c: u32| cx.const_val(c).is_some() && !forced.is_some_and(|f| f.contains(c));
     match n.op {
         OpCode::Sext => true,
         OpCode::Zext => mode == Mode::Linear || !at_zero(cx, n.a),
         // Linear operators are terms, never operands of a bitwise function.
-        OpCode::Mul => {
-            mode == Mode::Linear && (cx.const_val(n.a).is_some() || cx.const_val(n.b).is_some())
-        }
-        OpCode::Shl => mode == Mode::Linear && cx.const_val(n.b).is_some(),
+        OpCode::Mul => mode == Mode::Linear && (unforced_const(n.a) || unforced_const(n.b)),
+        OpCode::Shl => mode == Mode::Linear && unforced_const(n.b),
         op if is_linear(op) => mode == Mode::Linear,
-        // A bitwise operator whose constant operands are all 0 or all-ones.
-        op if is_bitwise(op) => n
-            .children()
-            .all(|c| cx.const_val(c).is_none_or(|v| v.is_zero() || v.is_ones())),
+        // A bitwise operator whose constant operands are all 0 or all-ones (or treated as shared
+        // constant atoms in proof-only `difference_is_zero` checks).
+        op if is_bitwise(op) => {
+            allow_const_atoms
+                || n.children()
+                    .all(|c| cx.const_val(c).is_none_or(|v| v.is_zero() || v.is_ones()))
+        }
         _ => false,
     }
 }
@@ -206,7 +219,12 @@ impl Scratch {
 const LISTED: u32 = 8;
 
 fn walk<const QUICK: bool>(
-    cx: &Context, root: u32, s: &mut Scratch, visits: &mut usize, allow_slice_rot: bool,
+    cx: &Context,
+    root: u32,
+    s: &mut Scratch,
+    visits: &mut usize,
+    allow_slice_rot: bool,
+    allow_const_atoms: bool,
 ) -> Result<Region, Walk> {
     s.seen.begin(cx.len());
     s.under.clear();
@@ -228,7 +246,7 @@ fn walk<const QUICK: bool>(
         // is an atom too, lifted by the outer one).
         let inner = (!QUICK || !matches!(op, OpCode::Sext | OpCode::Zext))
             && !s.forced.contains(i)
-            && interior(cx, i, mode)
+            && interior_ext(cx, i, mode, Some(&s.forced), allow_const_atoms && lift.is_none())
             && (lift.is_none() || is_bitwise(op) || cx.const_val(i).is_some());
         if let Some((kind, cast)) = lift {
             match s.under.get(&i) {
@@ -448,7 +466,10 @@ fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
         return;
     }
     if !reg.atoms.iter().any(|&a| {
-        matches!(cx.node(a).op, OpCode::Add | OpCode::Sub | OpCode::Neg)
+        matches!(
+            cx.node(a).op,
+            OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Const
+        )
     }) {
         return;
     }
@@ -456,16 +477,11 @@ fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
     let forms: Vec<Option<AffineForm>> = reg
         .atoms
         .iter()
-        .map(|&a| {
-            (cx.wid(a) == w).then(|| flatten_affine(cx, a, w)).flatten()
-        })
+        .map(|&a| (cx.wid(a) == w).then(|| flatten_affine(cx, a, w)).flatten())
         .collect();
     let mut dropped = vec![false; reg.atoms.len()];
     for j in 1..reg.atoms.len() {
         let Some((pj, bj)) = &forms[j] else { continue };
-        if pj.is_empty() {
-            continue;
-        }
         for i in 0..j {
             if dropped[i] {
                 continue;
@@ -735,9 +751,19 @@ fn region(cx: &Context, root: u32, s: &mut Scratch) -> Option<Region> {
 }
 
 fn region_with(cx: &Context, root: u32, s: &mut Scratch, allow_slice_rot: bool) -> Option<Region> {
+    region_ext(cx, root, s, allow_slice_rot, false)
+}
+
+fn region_ext(
+    cx: &Context,
+    root: u32,
+    s: &mut Scratch,
+    allow_slice_rot: bool,
+    allow_const_atoms: bool,
+) -> Option<Region> {
     s.forced.begin(cx.len());
     for _ in 0..32 {
-        match walk::<false>(cx, root, s, &mut 0, allow_slice_rot) {
+        match walk::<false>(cx, root, s, &mut 0, allow_slice_rot, allow_const_atoms) {
             Ok(r) => return Some(r),
             Err(Walk::Conflict(i)) if i != root => {
                 s.forced.insert(i);
@@ -810,10 +836,7 @@ fn signature_words<'a>(
     // A narrow atom reads as its lifted atom: under its cast, the nodes are evaluated at the
     // root's width over the lifted atoms (bitwise operators act by position).
     for &(a, l) in &reg.lifts {
-        match s.seen.get(l) {
-            Some(j) => s.seen.set(a, j),
-            None => return None,
-        }
+        s.seen.set(a, s.seen.get(l)?);
     }
     for (k, &i) in reg.order.iter().enumerate() {
         let at = (t + nc + nr + k) * corners;
@@ -831,9 +854,7 @@ fn signature_words<'a>(
                 .get(x)
                 .map(|r| &done[r as usize * corners..(r as usize + 1) * corners])
         };
-        let Some(a) = operand(n.a) else {
-            return None;
-        };
+        let a = operand(n.a)?;
         match n.op {
             OpCode::Sext => out.copy_from_slice(a),
             // The function of the lifted atoms, plus `2^W` where it is all ones at 0 (above
@@ -854,9 +875,7 @@ fn signature_words<'a>(
                 .zip(a)
                 .for_each(|(o, &x)| *o = x.wrapping_neg() & mask),
             op => {
-                let Some(b) = operand(n.b) else {
-                    return None;
-                };
+                let b = operand(n.b)?;
                 let f: fn(u64, u64, u64) -> u64 = match op {
                     OpCode::Add => |x, y, _| x.wrapping_add(y),
                     OpCode::Sub => |x, y, _| x.wrapping_sub(y),
@@ -908,7 +927,7 @@ pub(super) fn one_word(
         // add another walk after the node has been fixed as a common cut.
         if *left < 161 { break; }
         let mut visits = 0;
-        let region = walk::<true>(cx, root, s, &mut visits, false);
+        let region = walk::<true>(cx, root, s, &mut visits, false, false);
         *left -= visits as u64;
         let reg = match region {
             Ok(reg) => reg,
@@ -956,7 +975,7 @@ fn one_word_keeps_mixed_corners_in_its_proof() {
     ] {
         let root = cx.parse(text, &opts).unwrap().index();
         s.forced.begin(cx.len());
-        let reg = walk::<true>(&cx, root, &mut s, &mut 0, false).ok().unwrap();
+        let reg = walk::<true>(&cx, root, &mut s, &mut 0, false, false).ok().unwrap();
         let row = signature_words(&cx, &reg, root, &mut s).unwrap();
         let answer = one_axis(row, reg.atoms.len());
         assert_eq!(answer.is_some(), fits);
@@ -1353,6 +1372,44 @@ fn atom_may_one(cx: &Context, i: u32, depth: u8) -> u64 {
         OpCode::Select => {
             (atom_may_one(cx, n.b, depth - 1) | atom_may_one(cx, n.c, depth - 1)) & mask
         }
+        OpCode::Add => {
+            let ma = atom_may_one(cx, n.a, depth - 1);
+            let mb = atom_may_one(cx, n.b, depth - 1);
+            if (ma & mb & mask) == 0 {
+                (ma | mb) & mask
+            } else if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64())
+                && mb.is_power_of_two()
+            {
+                (c | c.wrapping_add(mb)) & mask
+            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64())
+                && ma.is_power_of_two()
+            {
+                (c | c.wrapping_add(ma)) & mask
+            } else {
+                mask
+            }
+        }
+        OpCode::Sub => {
+            if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
+                let mb = atom_may_one(cx, n.b, depth - 1);
+                if (mb & !c & mask) == 0 {
+                    c & mask
+                } else if mb.is_power_of_two() {
+                    (c | c.wrapping_sub(mb)) & mask
+                } else {
+                    mask
+                }
+            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                let ma = atom_may_one(cx, n.a, depth - 1);
+                if ma.is_power_of_two() {
+                    (c.wrapping_neg() | ma.wrapping_sub(c)) & mask
+                } else {
+                    mask
+                }
+            } else {
+                mask
+            }
+        }
         OpCode::Mul => {
             let (x, k) = match (cx.const_val(n.a), cx.const_val(n.b)) {
                 (None, Some(k)) => (n.a, k.to_u64()),
@@ -1517,7 +1574,7 @@ fn difference_is_zero_split(
     }
     let w = cx.width_of(n);
     let m_only = linear::emit(r, cx, &linear::Form::of(BitVec::zero(w), &mixed))?;
-    let Some(reg) = region(cx, m_only, &mut r.linear_mba) else {
+    let Some(reg) = region_with(cx, m_only, &mut r.linear_mba, true) else {
         return Ok(false);
     };
     if !reg.mixed || reg.bounds.is_empty() || !reg.lifts.is_empty() || reg.atoms.len() > max_atoms.min(MAX_ATOMS) {
@@ -1578,7 +1635,7 @@ fn difference_is_zero_split(
     }
     mixed.extend(coupled);
     let m_full = linear::emit(r, cx, &linear::Form::of(bias, &mixed))?;
-    let Some(reg) = region(cx, m_full, &mut r.linear_mba) else {
+    let Some(reg) = region_with(cx, m_full, &mut r.linear_mba, true) else {
         return Ok(false);
     };
     let t = reg.atoms.len();
@@ -1586,7 +1643,7 @@ fn difference_is_zero_split(
         return Ok(false);
     }
     let sig_work = (reg.order.len() << t) as u64;
-    if max_atoms < MAX_ATOMS && sig_work > 8192 {
+    if max_atoms < MAX_ATOMS && sig_work > 16384 {
         return Ok(false);
     }
     r.meter.charge(Counter::PassWork, sig_work)?;
@@ -1616,6 +1673,75 @@ fn difference_is_zero_split(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn difference_is_zero_const_atoms(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<bool, Stop> {
+    let w = cx.width_of(n);
+    if w.bits() > 64 {
+        return Ok(false);
+    }
+    let Some(reg) = region_ext(cx, n, &mut r.linear_mba, true, true) else {
+        return Ok(false);
+    };
+    let t = reg.atoms.len();
+    if !reg.mixed || reg.bounds.is_empty() || !reg.lifts.is_empty() || t > 5 {
+        return Ok(false);
+    }
+    let sig_work = (reg.order.len() << t) as u64;
+    if sig_work > 2048 {
+        return Ok(false);
+    }
+    r.meter.charge(Counter::PassWork, sig_work)?;
+    let sig = signature(cx, &reg, n, &mut r.linear_mba);
+    if sig.iter().all(BitVec::is_zero) {
+        return Ok(true);
+    }
+    let mut d = mobius(&sig);
+    transfer_shifted_linear_atoms(cx, &reg.atoms, &mut d);
+    if d.iter().all(BitVec::is_zero) {
+        return Ok(true);
+    }
+    if (0..d.len()).all(|s| (s as u32).count_ones() < 2 || d[s].is_zero()) {
+        let konst = BitVec::un_unchecked(UnOp::Neg, &d[0]);
+        let terms: Vec<(u32, BitVec)> = (0..t)
+            .filter(|&j| !d[1 << j].is_zero())
+            .map(|j| (reg.atoms[j], d[1 << j]))
+            .collect();
+        let rem = linear::emit(r, cx, &linear::Form::of(konst, &terms))?;
+        if cx.const_val(rem).is_some_and(|v| v.is_zero()) {
+            return Ok(true);
+        }
+        let zero = r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)))?;
+        if super::poly::equal(r, cx, rem, zero)? {
+            return Ok(true);
+        }
+        #[cfg(feature = "mba")]
+        if super::mba::equal_lanes(r, cx, rem, zero, w.bits())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "mba")]
+pub(super) fn equal_const_atoms(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<bool, Stop> {
+    let before = cx.len() as u32;
+    let n = r.build(cx, |cx| cx.c_bin(crate::BinOp::Sub, a, b));
+    let zero = match n {
+        Ok(diff) => difference_is_zero_const_atoms(r, cx, diff),
+        Err(e) => Err(e),
+    };
+    super::discard(r, cx, before);
+    zero
 }
 
 fn difference_is_zero(
@@ -2112,7 +2238,7 @@ fn solve(
     // terms first avoids evaluating `2^t` corners (and running CoBRA over `t` atoms) when the
     // bitwise-mixed sub-sum lives over strictly fewer atoms.
     if commit
-        && t >= 6
+        && t >= 5
         && reg.lifts.is_empty()
         && let Some(step @ Step::To(..)) = solve_split_orthogonal(r, cx, n, max_sig_work, t - 1)?
     {
@@ -2481,8 +2607,31 @@ let %19 = %11 + (%8 | %10) - %9 - %0 * 0x223dab214e6d6bba - 3988;
         let out = engine
             .run(&mut cx, &[e], Run::default().with_per_call(Budget::fuel(1 << 14)))
             .unwrap();
-        eprintln!("OUT = {}", cx.display(out.roots[0].expr));
         assert!(matches!(cx.view(out.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
+    }
+
+    #[test]
+    fn proves_peeled_masked_congruence_and_nonuniform_mask_atoms() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 15);
+        for text in [
+            // Shared non-constant Xor/And wrapper over mod-2^32 equivalent MBA subterms
+            "let u1 = (a ^ b) + 2 * (a & b); let u2 = (a | b) + (a & b) + 0x100000000; \
+             ((w ^ u1) & 0xffffffff) == ((w ^ u2) & 0xffffffff)",
+            // Shared non-uniform sparse mask atom inside peeled non-constant wrapper
+            "let m1 = ((a ^ b) + 2 * (a & b)) & 0x8afbc799; \
+             let m2 = ((a | b) + (a & b)) & 0x8afbc799; \
+             ((w ^ (m1 + c)) & 0x8afbc799) == ((w ^ (m2 + c)) & 0x8afbc799)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(outcome, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {outcome:?}"
+            );
+        }
     }
 
     #[test]
@@ -2500,6 +2649,9 @@ let %19 = %11 + (%8 | %10) - %9 - %0 * 0x223dab214e6d6bba - 3988;
             "let r = rotl(x, 6); let s1 = x << 5; let s2 = x >>u 58; (r & y) + (r | y) == ((s1 | s2) & y) + ((s1 | s2) | y)",
             // Non-zero affine remainder after degree >= 2 cancellation
             "let a = x * 3; let b = x * 5; (a & y) + (a | y) + b == y + x * 9",
+            // Peeled masked congruence must reject difference inside the live mask (bit 31)
+            "let u1 = (a ^ b) + 2 * (a & b); let u2 = (a | b) + (a & b) + 0x80000000; \
+             ((w ^ u1) & 0xffffffff) == ((w ^ u2) & 0xffffffff)",
         ] {
             let e = cx.parse(text, &opt).unwrap();
             let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
