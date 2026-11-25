@@ -78,6 +78,14 @@ impl Target {
             Op::Unary(UnOp::Not, a) | Op::Zext(a) => flip(a, delta),
             Op::Extract(a, lo) => flip(a, delta << lo),
             Op::Select(c, t, e) => flip(if values[c] != 0 { t } else { e }, delta),
+            Op::MixerRound(a, key) => {
+                let pre = crate::prove::mixer::invert_round(value, key)?;
+                Self { slot: a, value: pre }
+            }
+            Op::MixerUnround(a, key) if key & 1 == 1 => Self {
+                slot: a,
+                value: crate::prove::mixer::eval_round(value, key),
+            },
             Op::Binary(BinOp::Mul, ..) => self.product(p, values, fuel)?,
             Op::Binary(BinOp::Xor | BinOp::Add, a, b) => {
                 let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) { (b, a) } else { (a, b) };

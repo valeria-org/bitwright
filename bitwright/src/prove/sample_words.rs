@@ -30,6 +30,8 @@ enum Op {
     Extract(usize, u16),
     Concat(usize, usize, u16),
     Select(usize, usize, usize),
+    MixerRound(usize, u64),
+    MixerUnround(usize, u64),
 }
 
 struct Instruction {
@@ -154,6 +156,21 @@ impl Program {
                         Op::Unary(op, slots[&node.a])
                     } else if let Some(op) = other.as_bin() {
                         Op::Binary(op, slots[&node.a], slots[&node.b])
+                    } else if let Some((_, 0)) = other.as_ext() {
+                        let ext_op = cx.registry.as_deref()?.op_at(node.aux)?;
+                        let mut kids = node.children();
+                        let arg_x = kids.next()?;
+                        let arg_k = kids.next()?;
+                        let key = (cx.wid(arg_k) == 64)
+                            .then(|| cx.const_val(arg_k)?.to_u64())
+                            .flatten()?;
+                        match ext_op.name() {
+                            super::mixer::ROUND_OP_NAME => Op::MixerRound(slots[&arg_x], key),
+                            super::mixer::UNROUND_OP_NAME if key & 1 == 1 => {
+                                Op::MixerUnround(slots[&arg_x], key)
+                            }
+                            _ => return None,
+                        }
                     } else {
                         Op::Compare(
                             other.as_cmp()?,
@@ -466,6 +483,10 @@ impl Program {
                 Op::Extract(a, lo) => values[a] >> lo,
                 Op::Concat(a, b, low) => (values[a] << low) | values[b],
                 Op::Select(c, t, e) => values[if values[c] != 0 { t } else { e }],
+                Op::MixerRound(a, key) => super::mixer::eval_round(values[a], key),
+                Op::MixerUnround(a, key) => {
+                    super::mixer::invert_round(values[a], key).unwrap_or(0)
+                }
             } & instruction.mask;
         }
     }
@@ -683,6 +704,21 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             cases.push(target);
         }
     }
+    let mut mixer_seed: Vec<(usize, u64)> = Vec::new();
+    if super::mixer::may_contain_mixer(cx, root) {
+        for (sym_key, bv) in super::mixer::candidate_symbol_patches(cx, root) {
+            if let Some(val) = bv.to_u64()
+                && let Some(slot) = p.symbols.iter().position(|s| s.key == sym_key)
+            {
+                if labels[slot].len() < 8 && !labels[slot].contains(&val) {
+                    labels[slot].push(val);
+                }
+                if !mixer_seed.iter().any(|&(s, _)| s == slot) {
+                    mixer_seed.push((slot, val));
+                }
+            }
+        }
+    }
     if selected_equality && p.ops.len() < 128 && labels.iter().all(Vec::is_empty) {
         return None;
     }
@@ -743,6 +779,15 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
         };
         if let Some((s, v)) = patch {
             assignment[s] = v;
+        } else if !mixer_seed.is_empty() && (lane == 2 || lane == 3) {
+            let fill = if lane == 2 { 0 } else { u64::MAX };
+            for (i, val) in assignment.iter_mut().enumerate() {
+                *val = p.symbols[i].ones | (fill & p.symbols[i].free);
+            }
+            for &(s, mv) in &mixer_seed {
+                let sym = &p.symbols[s];
+                assignment[s] = sym.ones | (mv & sym.free);
+            }
         } else {
             for (i, val) in assignment.iter_mut().enumerate() {
                 let rand = sample(lane + 1, i as u32);

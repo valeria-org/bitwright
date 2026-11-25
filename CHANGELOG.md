@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.32.18
+
+- Added `bitwright::prove::mixer`: structural recognition, `@mixer.round` / `@mixer.unround`
+  extension operators (`RoundOp`, `UnroundOp`, `registry`, `fold_rounds`, `expand_rounds`), GF(2)
+  RREF reduction with single-key closed-form odd pivot inversion (`System::reduce_gf2`,
+  `System::implied_rhs`), automatic `Facts`-derived and mapped domain construction (`Domain::derive`
+  over `KnownBits`, `URange`, `SRange`, and injective/shift wrappers), deterministic multi-threaded
+  complete bounded-domain solving (`solve_bounded`, `solve_derived`), best-effort 64-bit witness
+  proposals with inner-expression preimage recovery (`propose_witness`, `propose_expr_witness`), and
+  predicate-level mixer theory simplification (`simplify_predicate`).
+- Wired `prove::mixer` into `bitwright::prove` (`Question`, `sample_words`, `exhaust`, and `guard`)
+  for native `@mixer.round` / `@mixer.unround` word-level evaluation, deterministic guard witness
+  seeding, and budget-respecting post-engine bijection/GF(2)/congruence simplification.
+
 ## 0.32.17
 
 - Added subtree opcode bitmasks (`Meta::ops`) and `DispatchNet` target opcode tracking to prune

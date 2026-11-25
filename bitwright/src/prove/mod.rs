@@ -41,6 +41,7 @@ mod fp;
 mod incremental;
 mod lean;
 pub mod lrat;
+pub mod mixer;
 mod relations;
 mod rule;
 mod sample_words;
@@ -1417,6 +1418,31 @@ impl Question {
                 },
                 decided: proved,
             };
+            let can_run_mixer = out.end == crate::engine::End::Completed
+                || matches!(
+                    out.end,
+                    crate::engine::End::BudgetTerminated(
+                        crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
+                    )
+                );
+            if !proved && can_run_mixer && mixer::may_contain_mixer(cx, s) {
+                let domain_fuel = cfg
+                    .simplify_budget
+                    .pass_work
+                    .saturating_sub(allowance.spent().pass_work)
+                    .min(1 << 20);
+                let after = mixer::simplify_predicate(cx, cx.handle(s), assumptions, domain_fuel)?;
+                let after_id = cx.id(after)?;
+                if after_id != s {
+                    q.stats.rewritten = true;
+                    s = after_id;
+                }
+                proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+                if proved {
+                    q.stats.simplification.decided = true;
+                    q.stats.simplification.stopped = None;
+                }
+            }
             if proved {
                 return decided(q, Outcome::Proved(None));
             }

@@ -48,6 +48,8 @@ enum Step {
     Extract(Src, u16),
     Concat(Src, Src, u16),
     Select(Src, Src, Src),
+    MixerRound(Src, u64),
+    MixerUnround(Src, u64),
 }
 
 struct Plan {
@@ -100,6 +102,8 @@ impl Plan {
                     Op::Extract(a, lo) => Step::Extract(src(a), lo),
                     Op::Concat(a, b, low) => Step::Concat(src(a), src(b), low),
                     Op::Select(c, t, e) => Step::Select(src(c), src(t), src(e)),
+                    Op::MixerRound(a, key) => Step::MixerRound(src(a), key),
+                    Op::MixerUnround(a, key) => Step::MixerUnround(src(a), key),
                 };
                 (step, instruction.width, instruction.mask)
             })
@@ -202,6 +206,16 @@ impl Plan {
                         let pick = if get(done, *c, j) != 0 { *t } else { *e };
                         *o = get(done, pick, j) & m;
                     }
+                }
+                Step::MixerRound(a, key) => {
+                    let k = *key;
+                    unary(out, done, *a, m, |x| crate::prove::mixer::eval_round(x, k));
+                }
+                Step::MixerUnround(a, key) => {
+                    let k = *key;
+                    unary(out, done, *a, m, |x| {
+                        crate::prove::mixer::invert_round(x, k).unwrap_or(0)
+                    });
                 }
             }
         }
