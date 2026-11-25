@@ -581,12 +581,17 @@ fn simplify(
                     // stays one node for its other readers): the narrower mask is then a
                     // constant for a constant, smaller where the candidate has it already.
                     let narrow = bv_and(m, &k);
-                    let k = if a2 != a || (narrow != k && read_once(r, cx, x)?) {
+                    let narrowed_once = narrow != k && read_once(r, cx, x)?;
+                    let k_use = if a2 != a || narrowed_once {
                         narrow
                     } else {
                         k
                     };
-                    let kc = r.build(cx, |cx| cx.mk_const(&k))?;
+                    let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
+                    if narrowed_once && a2 == a {
+                        st.ties = true;
+                        st.stops.push(kc);
+                    }
                     bin(r, cx, BinOp::And, a2, kc)?
                 }
             }
@@ -618,7 +623,18 @@ fn simplify(
                     r.build(cx, |cx| cx.mk_const(&k))?
                 } else {
                     let a2 = simplify(r, cx, st, a, &bv_and(m, &bv_not(&k)))?;
-                    let kc = r.build(cx, |cx| cx.mk_const(&k))?;
+                    let narrow = bv_and(m, &k);
+                    let narrowed_once = narrow != k && read_once(r, cx, x)?;
+                    let k_use = if a2 != a || narrowed_once {
+                        narrow
+                    } else {
+                        k
+                    };
+                    let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
+                    if narrowed_once && a2 == a {
+                        st.ties = true;
+                        st.stops.push(kc);
+                    }
                     bin(r, cx, BinOp::Or, a2, kc)?
                 }
             }
@@ -663,20 +679,64 @@ fn simplify(
                 } else {
                     node.a
                 };
-                let twin = st.xors.iter().find(|(a1, k1, m1, _)| {
-                    *a1 == a && subset(m, m1) && subset(m, &bv_or(k1, &k)) && {
-                        let both = bv_and(k1, &k);
-                        bv_and(&both, m).is_zero()
-                    }
+                let same_twin = st.xors.iter().find(|(a1, k1, m1, _)| {
+                    *a1 == a
+                        && subset(m, m1)
+                        && bv_and(&BitVec::bin_unchecked(BinOp::Xor, k1, &k), m).is_zero()
                 });
-                if let Some(&(_, _, _, y)) = twin {
-                    r.build(cx, |cx| cx.c_un(UnOp::Not, y))?
-                } else {
-                    let a2 = simplify(r, cx, st, a, m)?;
-                    let kc = r.build(cx, |cx| cx.mk_const(&k))?;
-                    let y = bin(r, cx, BinOp::Xor, a2, kc)?;
-                    st.xors.push((a, k, *m, y));
+                if let Some(&(_, _, _, y)) = same_twin {
                     y
+                } else {
+                    let comp_twin = st.xors.iter().find(|(a1, k1, m1, _)| {
+                        *a1 == a && subset(m, m1) && subset(m, &bv_or(k1, &k)) && {
+                            let both = bv_and(k1, &k);
+                            bv_and(&both, m).is_zero()
+                        }
+                    });
+                    if let Some(&(_, _, _, y)) = comp_twin {
+                        r.build(cx, |cx| cx.c_un(UnOp::Not, y))?
+                    } else {
+                        let a2 = simplify(r, cx, st, a, m)?;
+                        let narrow = bv_and(m, &k);
+                        let existing_narrow = narrow != k
+                            && narrow
+                                .to_u64()
+                                .and_then(|v| cx.find_const_u64(w.bits(), v))
+                                .and_then(|kc| {
+                                    let (lo, hi) = if a2 <= kc { (a2, kc) } else { (kc, a2) };
+                                    cx.find(&crate::expr::Node::new(
+                                        OpCode::Xor,
+                                        w.bits(),
+                                        lo,
+                                        hi,
+                                        0,
+                                    ))
+                                    .or_else(|| {
+                                        cx.find(&crate::expr::Node::new(
+                                            OpCode::Xor,
+                                            w.bits(),
+                                            a2,
+                                            kc,
+                                            0,
+                                        ))
+                                    })
+                                })
+                                .is_some();
+                        let narrowed_once = narrow != k && read_once(r, cx, x)?;
+                        let k_use = if a2 != a || existing_narrow || narrowed_once {
+                            narrow
+                        } else {
+                            k
+                        };
+                        let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
+                        if (narrowed_once || existing_narrow) && a2 == a && k_use != k {
+                            st.ties = true;
+                            st.stops.push(kc);
+                        }
+                        let y = bin(r, cx, BinOp::Xor, a2, kc)?;
+                        st.xors.push((a, k_use, *m, y));
+                        y
+                    }
                 }
             }
             _ => {
@@ -1828,6 +1888,170 @@ pub(crate) fn late(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32) -> Resul
     Ok(matches!(read(r, cx, root, true, true)?, Step::To(..)))
 }
 
+/// Narrow bitwise constants `(x op k)` (`op ∈ {And, Or, Xor}`) across `root` where the union
+/// `read[&u]` of demanded bits over ALL users of `u` reaching `root` clears bits of `k`.
+#[cfg(feature = "prove")]
+fn narrow_constants(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
+    read: &IdMap<u32, BitVec>,
+) -> Result<Option<Step>, Stop> {
+    let const_bitwise = |cx: &Context, u: u32| -> Option<(OpCode, u32, BitVec)> {
+        let n = cx.node(u);
+        if !matches!(n.op, OpCode::And | OpCode::Or | OpCode::Xor) {
+            return None;
+        }
+        match (cx.const_val(n.a), cx.const_val(n.b)) {
+            (None, Some(k)) => Some((n.op, n.a, k)),
+            (Some(k), None) => Some((n.op, n.b, k)),
+            _ => None,
+        }
+    };
+    let needs_narrow = |m: &BitVec, op: OpCode, k: &BitVec| -> bool {
+        bv_and(m, k) != *k
+            || (op == OpCode::And && subset(m, k))
+            || (op == OpCode::Or && bv_and(m, k).is_zero())
+    };
+    let any_narrow = order.iter().any(|&u| {
+        read.get(&u).is_some_and(|m| {
+            !m.is_zero()
+                && const_bitwise(cx, u).is_some_and(|(op, _, k)| needs_narrow(m, op, &k))
+        })
+    });
+    if !any_narrow {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let mut done: IdMap<u32, u32> = IdMap::default();
+    let mut atoms: Vec<u32> = Vec::new();
+    r.meter.charge(Counter::PassWork, order.len() as u64)?;
+    for &u in order {
+        if let Some(m) = read.get(&u)
+            && !m.is_zero()
+            && let Some((op, arg_orig, k)) = const_bitwise(cx, u)
+        {
+            let arg = done.get(&arg_orig).copied().unwrap_or(arg_orig);
+            let narrow = bv_and(m, &k);
+            if needs_narrow(m, op, &k) {
+                if arg == arg_orig && arg < before {
+                    atoms.push(arg);
+                }
+                let v = match op {
+                    OpCode::Xor => {
+                        if narrow.is_zero() {
+                            arg
+                        } else if subset(m, &narrow) {
+                            r.build(cx, |cx| cx.c_un(UnOp::Not, arg))?
+                        } else {
+                            let kc = r.build(cx, |cx| cx.mk_const(&narrow))?;
+                            r.build(cx, |cx| cx.c_bin(BinOp::Xor, arg, kc))?
+                        }
+                    }
+                    OpCode::Or => {
+                        if narrow.is_zero() {
+                            arg
+                        } else if subset(m, &narrow) {
+                            r.build(cx, |cx| cx.mk_const(&narrow))?
+                        } else {
+                            let kc = r.build(cx, |cx| cx.mk_const(&narrow))?;
+                            r.build(cx, |cx| cx.c_bin(BinOp::Or, arg, kc))?
+                        }
+                    }
+                    _ => {
+                        if subset(m, &narrow) {
+                            arg
+                        } else if narrow.is_zero() {
+                            let z = BitVec::zero(m.width());
+                            r.build(cx, |cx| cx.mk_const(&z))?
+                        } else {
+                            let kc = r.build(cx, |cx| cx.mk_const(&narrow))?;
+                            r.build(cx, |cx| cx.c_bin(BinOp::And, arg, kc))?
+                        }
+                    }
+                };
+                if v != u {
+                    done.insert(u, v);
+                }
+                continue;
+            }
+        }
+        let node = cx.node(u);
+        let mut kids = [node.a, node.b, node.c];
+        let mut changed = false;
+        for k in kids.iter_mut().take(node.op.arity()) {
+            if let Some(&t) = done.get(k)
+                && t != *k
+            {
+                *k = t;
+                changed = true;
+            }
+        }
+        if changed {
+            for (k_new, c_orig) in kids.iter().zip(node.children()) {
+                if *k_new == c_orig && c_orig < before {
+                    atoms.push(c_orig);
+                }
+            }
+            let v = r.build(cx, |cx| cx.rebuild(u, kids))?;
+            if v != u {
+                done.insert(u, v);
+            }
+        }
+    }
+    let Some(&e) = done.get(&root) else {
+        super::discard(r, cx, before);
+        return Ok(None);
+    };
+    if e == root {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    atoms.sort_unstable();
+    atoms.dedup();
+    super::discard_but(r, cx, before, e);
+    r.explain_with(|| crate::engine::Explanation::Demanded {
+        operand: cx.handle(root),
+        mask: BitVec::ones(cx.width_of(root)),
+    });
+    Ok(
+        match super::finish_with(
+            r,
+            cx,
+            PassKind::Demanded,
+            root,
+            e,
+            before,
+            &atoms,
+            Fin::FINAL,
+            true,
+        )? {
+            Step::To(e, f) => Some(Step::To(e, f)),
+            Step::Normal(_) => None,
+        },
+    )
+}
+
+/// Narrow constants in `And`/`Or`/`Xor` across `root` whose bits outside `read[&u]` never reach `root`.
+#[cfg(feature = "prove")]
+pub(crate) fn narrow_root(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    if r.assumptions.is_some_and(|a| !a.store.seeds.is_empty()) || r.life.live_roots.len() > 1 {
+        return Ok(None);
+    }
+    let Some((order, read)) = demands(r, cx, root)? else {
+        return Ok(None);
+    };
+    Ok(match narrow_constants(r, cx, root, &order, &read)? {
+        Some(Step::To(e, f)) => Some((e, f)),
+        _ => None,
+    })
+}
+
 /// [`whole`]; with `dry`, only whether the readings of the late stage would rewrite the
 /// root (`Step::To` then, of a node that is taken back).
 #[cfg(feature = "prove")]
@@ -1843,6 +2067,9 @@ fn read(
     };
     // One word for the sums that are a word's low bits, first (see `words`).
     if !dry && let Some(step) = words(r, cx, root, &order, &read)? {
+        return Ok(step);
+    }
+    if !dry && let Some(step) = narrow_constants(r, cx, root, &order, &read)? {
         return Ok(step);
     }
     let mut fin = Fin::FINAL;

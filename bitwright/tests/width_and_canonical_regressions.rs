@@ -290,3 +290,162 @@ fn separable_sum_fast_path_skips_whole_sum_nonlinear_mba_and_simplifies_clusters
         .expect("mba::equal");
     assert_ne!(verdict, Verdict::Proved);
 }
+
+#[test]
+fn demanded_constant_narrowing_and_shared_bitwise_reassociation() {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let engine = build_engine(true, false);
+
+    // Shared `u = x ^ c_wide` alongside `u ^ -2` under 32-bit demanded mask unifies with `x ^ c_32`.
+    let src = "\
+        let u = (x & 7) ^ 0x19319e04478be8ac; \
+        let lhs = ((a + (~b & 0xfffa7b3b) + 0x8040) * (u ^ -2) + c * u) & 0xffffffff; \
+        let rhs = ((a - (b & 0xfffa7b3b) + 0xfffafb7b) * ((x & 7) ^ 0xb8741752) + c * ((x & 7) ^ 0x478be8ac)) & 0xffffffff; \
+        lhs == rhs";
+    let eq = cx.parse(src, &o).unwrap();
+    let out = simplify_fuel(&engine, &mut cx, eq, 1 << 18);
+    assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+    // Bit-blast verify on 16-bit analogue.
+    let mut cx16 = Context::new();
+    let o16 = ParseOptions::width(Width::W16);
+    let e16 = cx16
+        .parse(
+            "let u = (x & 7) ^ 0x9e04; ((a + (~b & 0x7b3b) + 0x0040) * (u ^ -2) + c * u) & 0x00ff",
+            &o16,
+        )
+        .unwrap();
+    let out16 = simplify_fuel(&engine, &mut cx16, e16, 1 << 16);
+    assert_bitblasted_equal(&mut cx16, e16, out16);
+}
+
+#[test]
+fn nearly_complementary_xor_pair_and_boolean_mul_idempotence() {
+    let mut cx = Context::new();
+    let o32 = ParseOptions::width(Width::W32);
+    let engine = build_engine(false, false);
+
+    // `0xb8741752 ^ 0x478be8ac == 0xfffffffe` (`-2`); when `x` is known except bit 0,
+    // `-(x ^ c1) - (x ^ c2) == 2 - 2 * (u & 1)`, and `(2 - 2 * b) * b == 0`.
+    let src = "\
+        let b = u & 1; \
+        let x = b | 0x2618a2aa; \
+        let p = x ^ 0xb8741752; \
+        let q = x ^ 0x478be8ac; \
+        (-p - q) * b";
+    let e = cx.parse(src, &o32).unwrap();
+    let out = simplify_fuel(&engine, &mut cx, e, 1 << 16);
+    assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::zero(Width::W32)));
+    assert_bitblasted_equal(&mut cx, e, out);
+}
+
+#[test]
+fn known_zero_complement_mask_and_not_trunc_zext() {
+    let mut cx = Context::new();
+    let o32 = ParseOptions::width(Width::W32);
+    let engine = build_engine(false, false);
+
+    let e1 = cx.parse("~(x & 7) & 0xeb348d1f", &o32).unwrap();
+    let exp1 = cx.parse("(x & 7) ^ 0xeb348d1f", &o32).unwrap();
+    let out1 = simplify_fuel(&engine, &mut cx, e1, 1 << 15);
+    assert_eq!(out1, exp1);
+    assert_bitblasted_equal(&mut cx, e1, out1);
+
+    let e2 = cx.parse("zext<32>(extract<0, 3>(~(x & 7)))", &o32).unwrap();
+    let exp2 = cx.parse("(x & 7) ^ 7", &o32).unwrap();
+    let out2 = simplify_fuel(&engine, &mut cx, e2, 1 << 15);
+    assert_eq!(out2, exp2);
+    assert_bitblasted_equal(&mut cx, e2, out2);
+}
+
+#[test]
+fn majority_select_and_rotated_bit_mask_unification() {
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let engine = build_engine(false, false);
+
+    let src = "\
+        let b1 = extract<23, 1>(x); \
+        let b2 = extract<21, 1>(x); \
+        let c = y == 0; \
+        let r1 = rotl(x, 41); \
+        let r2 = rotl(x, 43); \
+        let lhs = zext<64>((b1 & b2) | ((b1 | b2) & c)) + zext<64>(b1) * 5 + zext<64>(b2); \
+        let rhs = (((r1 ^ zext<64>(c)) & (r2 ^ r1) ^ r1) & 1) + (r1 & 1) * 5 + (r2 & 1); \
+        lhs == rhs";
+    let eq = cx.parse(src, &o).unwrap();
+    let out = simplify_fuel(&engine, &mut cx, eq, 1 << 16);
+    assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+    // Bit-blast verify on 16-bit analogue.
+    let mut cx16 = Context::new();
+    let o16 = ParseOptions::width(Width::W16);
+    let e16 = cx16
+        .parse(
+            "let b1 = extract<5, 1>(x); let b2 = extract<3, 1>(x); let c = y == 0; \
+             zext<16>((b1 & b2) | ((b1 | b2) & c))",
+            &o16,
+        )
+        .unwrap();
+    let out16 = simplify_fuel(&engine, &mut cx16, e16, 1 << 15);
+    assert_bitblasted_equal(&mut cx16, e16, out16);
+}
+
+#[test]
+fn multi_term_carry_cancel_and_concat_zext_condition() {
+    let mut cx = Context::new();
+    let o16 = ParseOptions::width(Width::W16);
+    let engine = build_engine(false, false);
+
+    let eq1 = cx
+        .parse("((a + b + c + d) <u (b + d)) == (~(b + d) <u (a + c))", &o16)
+        .unwrap();
+    let out1 = simplify_fuel(&engine, &mut cx, eq1, 1 << 15);
+    assert_eq!(cx.view(out1).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+    let e2 = cx.parse("concat(zext<13>(a == 0), 6:3)", &o16).unwrap();
+    let exp2 = cx.parse("select(a == 0, 14:16, 6:16)", &o16).unwrap();
+    let out2 = simplify_fuel(&engine, &mut cx, e2, 1 << 15);
+    assert_eq!(out2, exp2);
+    assert_bitblasted_equal(&mut cx, e2, out2);
+}
+
+#[test]
+fn mba_correlated_xor_and_nested_mask_peer_atoms() {
+    let mut cx = Context::new();
+    let o16 = ParseOptions::width(Width::W16);
+    let engine = build_engine(true, false);
+    // Under `Reading::Linear` (where non-uniform constant bitwise ops are atoms), 9 raw atoms
+    // (`x ^ 3`, `x ^ 5`, `y & 7`, `y & 5`, `y & 2`, plus `a`, `b`, `c`, `d`) exceed `max_vars = 8`,
+    // and `PeerSolved` deduplicates `(x ^ 3, x ^ 5)` and `(y & 7, y & 5, y & 2)` down to 6 atoms.
+    let eq_src = "\
+        let p = (x * z) ^ 3; \
+        let q = (x * z) ^ 5; \
+        let r = u * v; \
+        (p + q - 2 * (p & q) + (r & 7) - (r & 5) - (r & 2) + a + b + c + d) \
+        == (6 + a + b + c + d)";
+    let eq = cx.parse(eq_src, &o16).unwrap();
+    let out = simplify_fuel(&engine, &mut cx, eq, 1 << 18);
+    assert_eq!(
+        cx.view(out).unwrap(),
+        View::Const(BitVec::ones(Width::W1)),
+        "expected 1:1, got `{}`",
+        cx.display(out)
+    );
+
+    let mut cx_small = Context::new();
+    let core_e = cx_small
+        .parse(
+            "let p = (x * y) ^ 3; let q = (x * y) ^ 5; let r = u * v; \
+             p + q - 2 * (p & q) + (r & 7) - (r & 5) - (r & 2)",
+            &o16,
+        )
+        .unwrap();
+    let core_out = simplify_fuel(&engine, &mut cx_small, core_e, 1 << 16);
+    assert_eq!(
+        cx_small.view(core_out).unwrap(),
+        View::Const(BitVec::from_u64(Width::W16, 6).unwrap())
+    );
+    assert_bitblasted_equal(&mut cx_small, core_e, core_out);
+}

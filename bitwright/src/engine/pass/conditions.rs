@@ -266,7 +266,19 @@ fn reading(cx: &Context, a: u32, w: crate::Width) -> Option<Reading> {
             let d = BitVec::bin_unchecked(BinOp::Sub, &t, &f);
             Some(cond(n.a, f, d, false))
         }
-        OpCode::Concat => carry_of_field(cx, n.b, w, Shape::Concat(n.a)),
+        OpCode::Concat => {
+            let hi = cx.node(n.a);
+            if hi.op == OpCode::Zext
+                && cx.wid(hi.a) == 1
+                && let Some(lo_bv) = cx.const_val(n.b)
+                && let Ok(f) = lo_bv.zext(w)
+            {
+                let sh = u32::from(cx.wid(n.b));
+                let d = crate::facts::known::bv_shl(&BitVec::one(w), sh);
+                return Some(cond(hi.a, f, d, false));
+            }
+            carry_of_field(cx, n.b, w, Shape::Concat(n.a))
+        }
         OpCode::Zext => carry_of_field(cx, n.a, w, Shape::Zext),
         OpCode::And => {
             let (s, j) = low_field(cx, n.a, n.b)?;
@@ -290,7 +302,10 @@ fn candidate(cx: &Context, a: u32) -> bool {
     match n.op {
         OpCode::Zext | OpCode::Sext if cx.wid(n.a) == 1 => true,
         OpCode::Select => cx.is_const(n.b) && cx.is_const(n.c),
-        OpCode::Concat => field(n.b),
+        OpCode::Concat => {
+            (cx.node(n.a).op == OpCode::Zext && cx.wid(cx.node(n.a).a) == 1 && cx.is_const(n.b))
+                || field(n.b)
+        }
         OpCode::Zext => field(n.a),
         OpCode::And => (cx.is_const(n.a) && sum(n.b)) || (cx.is_const(n.b) && sum(n.a)),
         _ => false,

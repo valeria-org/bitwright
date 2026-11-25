@@ -1842,6 +1842,23 @@ impl Runner<'_, '_> {
     /// Normalizes `root` under a `Local` phase.
     fn local(&mut self, cx: &mut Context, phase: usize, root: u32) -> Result<(u32, Fin), Stop> {
         let out = self.walked(cx, phase, root)?;
+        #[cfg(feature = "prove")]
+        let out = if matches!(
+            self.inner.phases[phase],
+            PhaseImpl::Pass(pass::PassKind::Demanded)
+        ) {
+            self.begin(cx, phase, out.0);
+            match pass::demanded::narrow_root(self, cx, out.0)? {
+                Some((e, f)) => {
+                    self.rewritten.insert((out.0, e), ());
+                    let (r, f2) = self.walked(cx, phase, e)?;
+                    (r, out.1.and(f).and(f2))
+                }
+                None => out,
+            }
+        } else {
+            out
+        };
         // The step at the root, once the phases before this one and its own walk leave the
         // root as the round found it: what the step reads (a limb's carries as the high
         // digit of its word) the passes may still be about to read otherwise, or to show

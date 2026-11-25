@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.32.20
+
+- Added demanded-mask constant narrowing and twin deduplication in `demanded`: equal-twin `Xor` reuse
+  (`(k1 ^ k2) & m == 0`), tie-preserving local `And`/`Or`/`Xor` constant residue narrowing, and
+  single-root whole-DAG `narrow_root` / `narrow_constants` elimination of un-demanded constant bits
+  and globally redundant masks.
+- Added associative constant reassociation `(x op c1) op c2 -> x op (c1 op c2)` across shared
+  `And`/`Or`/`Xor` nodes, known-zero complement-mask canonicalization `~x & c -> x ^ c`, 1-bit
+  `Select` evaluation in `wide_of`, and 1-bit Majority normalization `(u & v) | ((u | v) & w)` in
+  `bitwise`, paired with symmetric 1-bit `select(a ^ b, t, a)` Majority sorting and multi-term
+  unsigned carry cancellation `(B + R) <u B -> ~B <u R` in `compares`.
+- Extended `casts` with non-straddling `RotL`/`RotR` slice narrowing in `narrow`, `RotL`/`RotR`
+  live wide-mask matching in `find_wide_masked`, compound `& 1` 1-bit narrowing, negated low-slice
+  `zext(trunc(~x))` / `zext(~trunc(x))` canonicalization, `zext(extract<K, N>(x) & M)` shift-mask
+  hoisting, single-use `(x & m) >>u k` distribution, and `concat(zext(b), c)` to `select`; added
+  `concat(zext(b), c)` condition merging in `conditions`.
+- Extended `linear` with nearly-complementary constant-XOR sum folding `(x ^ c1) + (x ^ c2)` when at
+  most one shared bit is unknown (`merge_xor_pairs`), multi-term complement-mask merging
+  `k * (~x & M) -> k * M - k * (x & M)` (`merge_not_masks`), `0/1` boolean multiplication
+  idempotence `(c0 + c1 * b) * b -> (c0 + c1) * b`, tie-safe carry-free `(x ^ c1) + c2` folding,
+  and disjoint `Or` flattening inside 3+-term sums.
+- Extended `mba::lower` (`lower_id_over`) with `SolvedKind::Xor` (`a = t ^ k`) and `PeerSolved`
+  deduplication of correlated `t ^ c1` / `t ^ c2`, `t + c1` / `t + c2`, and nested `x & m_sub`
+  atoms before applying `MbaLimits::max_vars`.
+
 ## 0.32.19
 
 - Fixed width-mismatch errors when simplifying shifted narrow extracts in `mba::cofactors`

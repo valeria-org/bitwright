@@ -1843,7 +1843,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             let kc = cx.mk_const_u64(node.width, kv)?;
                             cx.c_bin(BinOp::Xor, x, kc)
                         })?;
-                        match finish(r, cx, PassKind::Linear, n, e, before, &[x], kfin)? {
+                        match super::finish_with(
+                            r,
+                            cx,
+                            PassKind::Linear,
+                            n,
+                            e,
+                            before,
+                            &[x],
+                            kfin,
+                            true,
+                        )? {
                             Step::Normal(_) => {}
                             done => return Ok(done),
                         }
@@ -1869,7 +1879,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             let mut stops = vec![x, sn.a];
                             stops.sort_unstable();
                             stops.dedup();
-                            match finish(r, cx, PassKind::Linear, n, e, before, &stops, kfin)? {
+                            match super::finish_with(
+                                r,
+                                cx,
+                                PassKind::Linear,
+                                n,
+                                e,
+                                before,
+                                &stops,
+                                kfin,
+                                true,
+                            )? {
                                 Step::Normal(_) => {}
                                 done => return Ok(done),
                             }
@@ -1918,6 +1938,49 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     // A product of values, its factors in order (see `sort_chain`).
     if op == OpCode::Mul {
+        // 0/1 boolean idempotence (`b * b == b` and `(c0 + c1 * b) * b == (c0 + c1) * b`) when
+        // `b` is known to be 0 or 1 (`zero_bits(b, ~1)`).
+        if node.width <= 64 && node.width > 1 {
+            let high_mask = (u64::MAX >> (64 - node.width)) & !1u64;
+            for (b_id, other_id) in [(node.a, node.b), (node.b, node.a)] {
+                if cx.const_val(b_id).is_some() {
+                    continue;
+                }
+                let (kw, bfin) = super::known_words(r, cx, b_id)?;
+                if kw.is_some_and(|[z, _]| (z & high_mask) == high_mask) {
+                    if other_id == b_id {
+                        let before = cx.len() as u32;
+                        match finish(r, cx, PassKind::Linear, n, b_id, before, &[b_id], bfin)? {
+                            Step::Normal(f) => declined = declined.and(f),
+                            step => return Ok(step),
+                        }
+                    } else {
+                        let fo = form_of(r, cx, other_id)?;
+                        if fo.terms.len() == 1 && fo.terms[0].0 == b_id {
+                            let c_sum = BitVec::bin_unchecked(BinOp::Add, &fo.konst, &fo.terms[0].1);
+                            let before = cx.len() as u32;
+                            let e = r.build(cx, |cx| {
+                                let ck = cx.mk_const(&c_sum)?;
+                                cx.c_bin(BinOp::Mul, b_id, ck)
+                            })?;
+                            match finish(
+                                r,
+                                cx,
+                                PassKind::Linear,
+                                n,
+                                e,
+                                before,
+                                &[b_id],
+                                bfin.and(fo.fin),
+                            )? {
+                                Step::Normal(f) => declined = declined.and(f),
+                                step => return Ok(step),
+                            }
+                        }
+                    }
+                }
+            }
+        }
         match super::sort_chain(r, cx, PassKind::Linear, n)? {
             Step::Normal(f) => declined = declined.and(f),
             step => return Ok(step),
@@ -1979,6 +2042,21 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 match super::limbs::folded(r, cx, n, &form)? {
                     Ok(s) => return Ok(s),
                     Err(f) => declined = declined.and(f),
+                }
+                // Combine nearly-complementary constant-XOR pairs `k1 * (x ^ c1) + k2 * (x ^ c2)`
+                // using `(x ^ c1) + (x ^ c2) == (c1 ^ c2) + (((x ^ c1) & ~(c1 ^ c2)) << 1)` when
+                // `~(c1 ^ c2)` has at most 1 unknown bit in `x`.
+                if let Some(step) = merge_xor_pairs(r, cx, n, &form)? {
+                    match step {
+                        Step::To(x, fin) => return Ok(Step::To(x, fin)),
+                        Step::Normal(fin) => declined = declined.and(fin),
+                    }
+                }
+                if let Some(step) = merge_not_masks(r, cx, n, &form)? {
+                    match step {
+                        Step::To(x, fin) => return Ok(Step::To(x, fin)),
+                        Step::Normal(fin) => declined = declined.and(fin),
+                    }
                 }
                 // A sum that spells an XOR or an OR with a constant (see `masked`).
                 let before = cx.len() as u32;
@@ -2188,13 +2266,249 @@ fn bit_count(
     finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some)
 }
 
+/// Combine `k1 * (x ^ c1) + k2 * (x ^ c2)` in `form` when `~(c1 ^ c2)` has at most 1 unknown
+/// bit in `x`, eliminating at least one constant-XOR atom (both when `k1 == k2`).
+fn merge_xor_pairs(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    let w = form.konst.width();
+    if w.bits() == 0 || w.bits() > 64 || form.terms.len() < 2 || form.terms.len() > 16 {
+        return Ok(None);
+    }
+    let mask = u64::MAX >> (64 - w.bits());
+    let xor_const = |cx: &Context, id: u32| -> Option<(u32, u64)> {
+        let xn = cx.node(id);
+        if xn.op != OpCode::Xor {
+            return None;
+        }
+        match (cx.const_val(xn.a), cx.const_val(xn.b)) {
+            (None, Some(k)) => k.to_u64().map(|c| (xn.a, c & mask)),
+            (Some(k), None) => k.to_u64().map(|c| (xn.b, c & mask)),
+            _ => None,
+        }
+    };
+    for i in 0..form.terms.len() {
+        let Some((x, c1)) = xor_const(cx, form.terms[i].0) else {
+            continue;
+        };
+        for j in (i + 1)..form.terms.len() {
+            let Some((x2, c2)) = xor_const(cx, form.terms[j].0) else {
+                continue;
+            };
+            if x != x2 || c1 == c2 {
+                continue;
+            }
+            let diff = (c1 ^ c2) & mask;
+            let same = (!diff) & mask;
+            let (kw_opt, xfin) = super::known_words(r, cx, x)?;
+            let (kz, ko) = kw_opt.map_or((0, 0), |[z, o]| (z & mask, o & mask));
+            let known_mask = kz | ko;
+            let rem_same = same & !known_mask;
+            if rem_same.count_ones() > 1 {
+                continue;
+            }
+            let (t1, k1) = form.terms[i];
+            let (t2, k2) = form.terms[j];
+            // `(x ^ c1) + (x ^ c2)` = `pair_const + pair_var_coef * (x & rem_same)`.
+            let known_same_ones = (ko ^ c1) & same & known_mask;
+            let mut pair_const_u64 = diff.wrapping_add(known_same_ones.wrapping_shl(1)) & mask;
+            let mut bit_coef_i64 = 0i64;
+            if rem_same != 0 {
+                if (c1 & rem_same) == 0 {
+                    bit_coef_i64 = 2;
+                } else {
+                    pair_const_u64 = pair_const_u64.wrapping_add(rem_same.wrapping_shl(1)) & mask;
+                    bit_coef_i64 = -2;
+                }
+            }
+            let before = cx.len() as u32;
+            // Choose which of `(t1, k1)` / `(t2, k2)` to eliminate (`elim` has coeff `ke`, `keep` has `kk - ke`).
+            let both_gone = k1 == k2;
+            let (ke, kk_rem, keep_id) = if both_gone {
+                (k1, BitVec::zero(w), t2)
+            } else {
+                super::refresh_uses(r, cx)?;
+                let u1 = r.life.live.uses(t1).unwrap_or(1);
+                let u2 = r.life.live.uses(t2).unwrap_or(1);
+                if u1 <= u2 {
+                    (k1, BitVec::bin_unchecked(BinOp::Sub, &k2, &k1), t2)
+                } else {
+                    (k2, BitVec::bin_unchecked(BinOp::Sub, &k1, &k2), t1)
+                }
+            };
+            let pair_const_bv = BitVec::wrapping_from_u64(w, pair_const_u64);
+            let add_konst = BitVec::bin_unchecked(BinOp::Mul, &ke, &pair_const_bv);
+            let mut new_konst = BitVec::bin_unchecked(BinOp::Add, &form.konst, &add_konst);
+            let mut new_terms: Vec<(u32, BitVec)> = form
+                .terms
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &tk)| (idx != i && idx != j).then_some(tk))
+                .collect();
+            if !kk_rem.is_zero() {
+                new_terms.push((keep_id, kk_rem));
+            }
+            if rem_same != 0 && bit_coef_i64 != 0 {
+                let bit_node = r.build(cx, |cx| {
+                    let mc = cx.mk_const_u64(w.bits(), rem_same)?;
+                    cx.c_bin(BinOp::And, x, mc)
+                })?;
+                let two = BitVec::wrapping_from_u64(w, 2);
+                let scale = if bit_coef_i64 > 0 {
+                    BitVec::bin_unchecked(BinOp::Mul, &ke, &two)
+                } else {
+                    BitVec::un_unchecked(UnOp::Neg, &BitVec::bin_unchecked(BinOp::Mul, &ke, &two))
+                };
+                if !scale.is_zero() {
+                    if let Some( c_bit ) = cx.const_val(bit_node) {
+                        new_konst = BitVec::bin_unchecked(
+                            BinOp::Add,
+                            &new_konst,
+                            &BitVec::bin_unchecked(BinOp::Mul, &c_bit, &scale),
+                        );
+                    } else if let Some(slot) = new_terms.iter_mut().find(|(id, _)| *id == bit_node) {
+                        slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                    } else {
+                        new_terms.push((bit_node, scale));
+                    }
+                }
+            }
+            new_terms.retain(|(_, k)| !k.is_zero());
+            let mut f = Form::of(new_konst, &new_terms);
+            f.fin = form.fin.and(xfin);
+            let e = emit(r, cx, &f)?;
+            let mut stops: Vec<u32> = form
+                .terms
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &(id, _))| (idx != i && idx != j).then_some(id))
+                .collect();
+            stops.push(x);
+            if !both_gone {
+                stops.push(keep_id);
+            }
+            stops.sort_unstable();
+            stops.dedup();
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Linear,
+                n,
+                e,
+                before,
+                &stops,
+                f.fin,
+                both_gone,
+            )
+            .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Rewrite `k * (~x & M)` terms in `form` as `k * M - k * (x & M)` when `form` already carries a
+/// constant offset or `x & M`, eliminating `~x` and unifying `K + (~x & M)` with `(K + M) - (x & M)`.
+fn merge_not_masks(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    if form.terms.len() < 2 || form.terms.len() > 16 {
+        return Ok(None);
+    }
+    let not_mask_of = |cx: &Context, id: u32| -> Option<(u32, u32, BitVec)> {
+        let an = cx.node(id);
+        if an.op != OpCode::And {
+            return None;
+        }
+        let (not_id, m_id, m_bv) = match (cx.const_val(an.a), cx.const_val(an.b)) {
+            (None, Some(m)) if !m.is_zero() && !m.is_ones() => (an.a, an.b, m),
+            (Some(m), None) if !m.is_zero() && !m.is_ones() => (an.b, an.a, m),
+            _ => return None,
+        };
+        let nn = cx.node(not_id);
+        (nn.op == OpCode::Not).then_some((nn.a, m_id, m_bv))
+    };
+    let mut found: Vec<(usize, u32, u32, BitVec)> = Vec::new();
+    for (idx, &(tid, _)) in form.terms.iter().enumerate() {
+        if let Some((x, m_id, m_bv)) = not_mask_of(cx, tid) {
+            let w_bits = form.konst.width().bits();
+            let pos_exists = cx
+                .find(&Node::new(OpCode::And, w_bits, x, m_id, 0))
+                .or_else(|| cx.find(&Node::new(OpCode::And, w_bits, m_id, x, 0)))
+                .is_some_and(|pid| form.terms.binary_search_by_key(&pid, |t| t.0).is_ok());
+            if !form.konst.is_zero() || pos_exists {
+                found.push((idx, x, m_id, m_bv));
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let mut new_konst = form.konst;
+    let mut new_terms: Vec<(u32, BitVec)> = Vec::with_capacity(form.terms.len());
+    let mut stops: Vec<u32> = Vec::new();
+    for (idx, &(tid, k)) in form.terms.iter().enumerate() {
+        if let Some(&(_, x, m_id, ref m_bv)) = found.iter().find(|&&(i, ..)| i == idx) {
+            let add_k = BitVec::bin_unchecked(BinOp::Mul, &k, m_bv);
+            new_konst = BitVec::bin_unchecked(BinOp::Add, &new_konst, &add_k);
+            let pos_and = r.build(cx, |cx| cx.c_bin(BinOp::And, x, m_id))?;
+            let neg_k = BitVec::un_unchecked(UnOp::Neg, &k);
+            new_terms.push((pos_and, neg_k));
+            stops.push(x);
+            stops.push(m_id);
+        } else {
+            new_terms.push((tid, k));
+            stops.push(tid);
+        }
+    }
+    let mut f = Form::of(new_konst, &new_terms);
+    f.fin = form.fin;
+    let e = emit(r, cx, &f)?;
+    stops.sort_unstable();
+    stops.dedup();
+    finish(r, cx, PassKind::Linear, n, e, before, &stops, f.fin).map(Some)
+}
+
 /// The linear pass at `n` over its form as computed.
 fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result<Step, Stop> {
     let mut atoms: Vec<u32> = form.terms.iter().map(|t| t.0).collect();
     atoms.sort_unstable();
+    // Detect whether `n` is a 3+-term `Add`/`Sub` tree containing a single-use disjoint `Or`
+    // that `form_of` flattened into additive terms, so `... + (a | b) + ...` canonicalizes to
+    // the flat `Add` order even on an operator-count tie.
+    let mut flattened_disjoint_or = false;
+    if matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) && form.terms.len() >= 3 {
+        super::refresh_uses(r, cx)?;
+        let mut st = vec![n];
+        let mut seen = 0usize;
+        while let Some(cur) = st.pop() {
+            seen += 1;
+            if seen > 48 {
+                break;
+            }
+            let cn = cx.node(cur);
+            if matches!(cn.op, OpCode::Add | OpCode::Sub) {
+                st.push(cn.a);
+                st.push(cn.b);
+            } else if cn.op == OpCode::Or
+                && r.life.live.uses(cur) == Some(1)
+                && atoms.binary_search(&cur).is_err()
+            {
+                flattened_disjoint_or = true;
+                break;
+            }
+        }
+    }
     let estimate = estimate(&form);
     // A constant always commits (see `shrinks`).
     if !form.terms.is_empty()
+        && !flattened_disjoint_or
         && let Some(f) = worth_building(r, cx, n, &atoms, estimate)?
     {
         r.stats.passes.entry("linear").or_default().rejected_cost += 1;
@@ -2206,6 +2520,12 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
         konst: form.konst,
         terms: form.terms.iter().map(|&(a, k)| (cx.handle(a), k)).collect(),
     });
+    if flattened_disjoint_or && matches!(cx.node(e).op, OpCode::Add | OpCode::Sub) {
+        let en = cx.node(e);
+        if !disjoint(r, cx, en.a, en.b)?.0 {
+            return super::finish_with(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin, true);
+        }
+    }
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
 }
 

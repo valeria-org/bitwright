@@ -312,19 +312,20 @@ pub(crate) fn lower_id_over(
         Reading::Shallow => Some(under_bitwise(cx, root, lim, opaque)?),
         _ => None,
     };
-    let (atoms, order) = scan_in(cx, root, lim, &|cx, i| inside(cx, i, under.as_ref()))?;
-    // An atom that is its operand and a constant added (`a = t + k`, `a = k − t`), where the
-    // fragment reads `t` too: `t` is `a − k` (`k − a`), a sum over the atom, and nothing below
-    // `t` is read. The terms linear in `t` are then terms of `a`, which the bitwise operators
-    // read: one variable, where `t`'s own atoms beside `a` were two values no test relates.
-    let candidates: &[u32] = match reading {
-        Reading::Shallow => &atoms,
-        Reading::Cut(cut) | Reading::CutWhole(cut) if atoms.contains(&cut) => &[cut],
-        _ => &[],
+    let mut scan_lim = *lim;
+    scan_lim.max_vars = lim.max_vars.saturating_add(4);
+    let (mut atoms, order) = scan_in(cx, root, &scan_lim, &|cx, i| inside(cx, i, under.as_ref()))?;
+    // An atom that is its operand and a constant added (`a = t + k`, `a = k − t`) or xored
+    // (`a = t ^ k`), where the fragment reads `t` too: `t` is `a − k`, `k − a`, or `a ^ k` over
+    // the atom, and nothing below `t` is read.
+    let candidates: Vec<u32> = match reading {
+        Reading::Shallow => atoms.clone(),
+        Reading::Cut(cut) | Reading::CutWhole(cut) if atoms.contains(&cut) => vec![cut],
+        _ => Vec::new(),
     };
     let mut solved: Vec<Solved> = Vec::new();
-    for &a in candidates {
-        let Some((t, k, negated)) = offset(cx, a) else {
+    for &a in &candidates {
+        let Some((t, kind)) = offset_or_xor(cx, a) else {
             continue;
         };
         if t != root
@@ -336,22 +337,115 @@ pub(crate) fn lower_id_over(
             solved.push(Solved {
                 operand: t,
                 atom: a,
-                constant: k,
-                negated,
+                kind,
             });
         }
     }
-    if solved.is_empty() {
-        return build(cx, atoms, order, &[]);
+    let order = if !solved.is_empty() {
+        let (a2, o2) = scan_in(cx, root, &scan_lim, &|cx, i| {
+            solved.iter().all(|s| s.operand != i) && inside(cx, i, under.as_ref())
+        })?;
+        atoms = a2;
+        solved.retain(|s| atoms.contains(&s.operand) && atoms.contains(&s.atom));
+        atoms.retain(|a| solved.iter().all(|s| s.operand != *a));
+        o2
+    } else {
+        order
+    };
+    // Deduplicate peer correlated atoms (`t ^ c1` vs `t ^ c2`, `t + c1` vs `t + c2`, and
+    // nested bit-masks `x & m_sub` under `x & m_sup` or `x`).
+    let mut peers: Vec<PeerSolved> = Vec::new();
+    let mut keep = vec![true; atoms.len()];
+    for j in 0..atoms.len() {
+        if !keep[j] {
+            continue;
+        }
+        let aj = atoms[j];
+        let wj = cx.wid(aj);
+        // 1) Check if `aj` is `x & m_sub` covered by another kept atom `ai` (`x` or `x & m_sup`).
+        if let Some((xj, m_sub)) = const_and_of(cx, aj) {
+            let sup = (0..atoms.len()).find(|&i| {
+                i != j
+                    && keep[i]
+                    && cx.wid(atoms[i]) == wj
+                    && if atoms[i] == xj {
+                        true
+                    } else if let Some((xi, m_sup)) = const_and_of(cx, atoms[i]) {
+                        xi == xj
+                            && BitVec::bin_unchecked(
+                                BinOp::And,
+                                &m_sub,
+                                &BitVec::un_unchecked(UnOp::Not, &m_sup),
+                            )
+                            .is_zero()
+                            && (m_sub != m_sup || i < j)
+                    } else {
+                        false
+                    }
+            });
+            if let Some(i) = sup {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: atoms[i],
+                    op: PeerOp::And(m_sub),
+                });
+                continue;
+            }
+        }
+        // 2) Check if `aj` shares an affine/xor base with an earlier kept atom `ai` (`i < j`).
+        if let Some((tj, kj)) = offset_or_xor(cx, aj) {
+            let earlier = (0..j).find_map(|i| {
+                if !keep[i] || cx.wid(atoms[i]) != wj {
+                    return None;
+                }
+                let (ti, ki) = offset_or_xor(cx, atoms[i])?;
+                if ti != tj {
+                    return None;
+                }
+                match (ki, kj) {
+                    (SolvedKind::Xor(c1), SolvedKind::Xor(c2)) => Some((
+                        atoms[i],
+                        PeerOp::Xor(BitVec::bin_unchecked(BinOp::Xor, &c1, &c2)),
+                    )),
+                    (
+                        SolvedKind::Sub {
+                            constant: c1,
+                            negated: false,
+                        },
+                        SolvedKind::Sub {
+                            constant: c2,
+                            negated: false,
+                        },
+                    ) => Some((
+                        atoms[i],
+                        PeerOp::Add(BitVec::bin_unchecked(BinOp::Sub, &c2, &c1)),
+                    )),
+                    _ => None,
+                }
+            });
+            if let Some((src, op)) = earlier {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: src,
+                    op,
+                });
+            }
+        }
     }
-    let (mut atoms, order) = scan_in(cx, root, lim, &|cx, i| {
-        solved.iter().all(|s| s.operand != i) && inside(cx, i, under.as_ref())
-    })?;
-    // An operand read only below what another one cut off is not read; an atom it left
-    // unread is no variable.
-    solved.retain(|s| atoms.contains(&s.operand) && atoms.contains(&s.atom));
-    atoms.retain(|a| solved.iter().all(|s| s.operand != *a));
-    build(cx, atoms, order, &solved)
+    if !peers.is_empty() {
+        let mut idx = 0usize;
+        atoms.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+    }
+    if atoms.len() as u32 > lim.max_vars {
+        return Err(Refusal::TooManyVars);
+    }
+    build_with_peers(cx, atoms, order, &solved, &peers)
 }
 
 /// [`lower_id_over`] with no reading, and whether the fragment is semi-linear as it is (every
@@ -373,38 +467,89 @@ pub(crate) fn lower_id_whole(
     Ok((m, bindings, semi))
 }
 
-/// Node `a` as `t + k` or (`true`) `k − t`, `k` a constant: `t`, `k`, and which. The negated
-/// operand may be written `−t` or `t · −1`.
-fn offset(cx: &Context, a: u32) -> Option<(u32, BitVec, bool)> {
-    // Operands are read only once the operator says they are nodes.
+fn const_and_of(cx: &Context, a: u32) -> Option<(u32, BitVec)> {
     let n = cx.node(a);
+    if n.op != OpCode::And {
+        return None;
+    }
+    match (cx.const_val(n.a), cx.const_val(n.b)) {
+        (None, Some(m)) => Some((n.a, m)),
+        (Some(m), None) => Some((n.b, m)),
+        _ => None,
+    }
+}
+
+/// Node `a` as `t + k`, `k − t`, or `t ^ k` with `k` a constant.
+fn offset_or_xor(cx: &Context, a: u32) -> Option<(u32, SolvedKind)> {
+    let n = cx.node(a);
+    if n.op == OpCode::Xor {
+        return match (cx.const_val(n.a), cx.const_val(n.b)) {
+            (None, Some(k)) => Some((n.a, SolvedKind::Xor(k))),
+            (Some(k), None) => Some((n.b, SolvedKind::Xor(k))),
+            _ => None,
+        };
+    }
     if !matches!(n.op, OpCode::Add | OpCode::Sub) {
         return None;
     }
     let (t, k) = match (n.op, cx.const_val(n.a), cx.const_val(n.b)) {
         (OpCode::Add, None, Some(k)) => (n.a, k),
         (OpCode::Add, Some(k), None) => (n.b, k),
-        (OpCode::Sub, Some(k), None) => return Some((n.b, k, true)),
+        (OpCode::Sub, Some(k), None) => {
+            return Some((
+                n.b,
+                SolvedKind::Sub {
+                    constant: k,
+                    negated: true,
+                },
+            ))
+        }
+        (OpCode::Sub, None, Some(k)) => (n.a, BitVec::un_unchecked(UnOp::Neg, &k)),
         _ => return None,
     };
     let m = cx.node(t);
-    match m.op {
-        OpCode::Neg => Some((m.a, k, true)),
+    let (base, negated) = match m.op {
+        OpCode::Neg => (m.a, true),
         OpCode::Mul => match (cx.const_val(m.a), cx.const_val(m.b)) {
-            (None, Some(c)) if c.is_ones() => Some((m.a, k, true)),
-            (Some(c), None) if c.is_ones() => Some((m.b, k, true)),
-            _ => Some((t, k, false)),
+            (None, Some(c)) if c.is_ones() => (m.a, true),
+            (Some(c), None) if c.is_ones() => (m.b, true),
+            _ => (t, false),
         },
-        _ => Some((t, k, false)),
-    }
+        _ => (t, false),
+    };
+    Some((
+        base,
+        SolvedKind::Sub {
+            constant: k,
+            negated,
+        },
+    ))
 }
 
-/// An atom's operand written over the atom: `atom − constant`, or `constant − atom` (`negated`).
+#[derive(Clone, Copy)]
+enum SolvedKind {
+    Sub { constant: BitVec, negated: bool },
+    Xor(BitVec),
+}
+
+/// An atom's operand written over the atom.
 struct Solved {
     operand: u32,
     atom: u32,
-    constant: BitVec,
-    negated: bool,
+    kind: SolvedKind,
+}
+
+#[derive(Clone, Copy)]
+enum PeerOp {
+    Xor(BitVec),
+    Add(BitVec),
+    And(BitVec),
+}
+
+struct PeerSolved {
+    target: u32,
+    source: u32,
+    op: PeerOp,
 }
 
 /// the non-constant interior nodes of the semi-linear fragment below `root` that
@@ -539,7 +684,19 @@ fn build(
     order: Vec<u32>,
     solved: &[Solved],
 ) -> Result<(MbaExpr, Bindings), Refusal> {
-    Dense::with(&AT, cx.len(), |at| build_in(cx, atoms, order, solved, at))
+    build_with_peers(cx, atoms, order, solved, &[])
+}
+
+fn build_with_peers(
+    cx: &Context,
+    atoms: Vec<u32>,
+    order: Vec<u32>,
+    solved: &[Solved],
+    peers: &[PeerSolved],
+) -> Result<(MbaExpr, Bindings), Refusal> {
+    Dense::with(&AT, cx.len(), |at| {
+        build_in(cx, atoms, order, solved, peers, at)
+    })
 }
 
 fn build_in(
@@ -547,13 +704,14 @@ fn build_in(
     atoms: Vec<u32>,
     order: Vec<u32>,
     solved: &[Solved],
+    peers: &[PeerSolved],
     at: &mut Dense,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
     // An operand of a fragment's node is one of its atoms or an earlier node of it.
     let unmet = || Refusal::Unsupported("an operand outside the fragment".into());
     // (Room for a node per atom and per node of the fragment, two per operand written over an
     // atom, and the few a slice or a shift adds.)
-    let room = atoms.len() + 2 * solved.len() + order.len() + 8;
+    let room = atoms.len() + 2 * (solved.len() + peers.len()) + order.len() + 8;
     let mut m = MbaExpr::with_capacity(atoms.iter().map(|&a| cx.width_of(a)).collect(), room);
     for (&a, k) in atoms.iter().zip(0u32..) {
         let v = m
@@ -561,12 +719,38 @@ fn build_in(
             .map_err(|e| Refusal::Unsupported(e.to_string()))?;
         at.insert(a, v);
     }
+    let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
+    for p in peers {
+        let src = at.get(p.source).ok_or_else(unmet)?;
+        let v = match p.op {
+            PeerOp::Xor(c) => {
+                let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
+                m.push(MOp::Xor, &[src, k]).map_err(bad)?
+            }
+            PeerOp::Add(c) => {
+                let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
+                m.push(MOp::Add, &[src, k]).map_err(bad)?
+            }
+            PeerOp::And(c) => {
+                let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
+                m.push(MOp::And, &[src, k]).map_err(bad)?
+            }
+        };
+        at.insert(p.target, v);
+    }
     for s in solved {
-        let bad = |e: super::expr::MbaError| Refusal::Unsupported(e.to_string());
         let a = at.get(s.atom).ok_or_else(unmet)?;
-        let k = m.push(MOp::Const(s.constant), &[]).map_err(bad)?;
-        let args = if s.negated { [k, a] } else { [a, k] };
-        let v = m.push(MOp::Sub, &args).map_err(bad)?;
+        let v = match s.kind {
+            SolvedKind::Sub { constant, negated } => {
+                let k = m.push(MOp::Const(constant), &[]).map_err(bad)?;
+                let args = if negated { [k, a] } else { [a, k] };
+                m.push(MOp::Sub, &args).map_err(bad)?
+            }
+            SolvedKind::Xor(constant) => {
+                let k = m.push(MOp::Const(constant), &[]).map_err(bad)?;
+                m.push(MOp::Xor, &[a, k]).map_err(bad)?
+            }
+        };
         at.insert(s.operand, v);
     }
     for i in order {

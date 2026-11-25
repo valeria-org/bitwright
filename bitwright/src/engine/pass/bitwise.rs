@@ -474,11 +474,35 @@ fn wide_op(cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
     prune_wide(atoms, tt)
 }
 
+fn wide_select(cx: &Context, i: u32, c: Wide, t: Wide, f: Wide) -> Wide {
+    let mut atoms = [0u32; 3 * WIDE];
+    let mut vec_atoms = Vec::with_capacity(c.atoms().len() + t.atoms().len() + f.atoms().len());
+    vec_atoms.extend_from_slice(c.atoms());
+    vec_atoms.extend_from_slice(t.atoms());
+    vec_atoms.extend_from_slice(f.atoms());
+    vec_atoms.sort_unstable();
+    vec_atoms.dedup();
+    if vec_atoms.len() > WIDE {
+        return wide_leaf(cx, i);
+    }
+    atoms[..vec_atoms.len()].copy_from_slice(&vec_atoms);
+    let atoms = &atoms[..vec_atoms.len()];
+    let tc = remap_wide(c.tt, c.atoms(), atoms);
+    let tt = remap_wide(t.tt, t.atoms(), atoms);
+    let tf = remap_wide(f.tt, f.atoms(), atoms);
+    prune_wide(atoms, (tc & tt) | (!tc & tf))
+}
+
+fn wide_region_op(cx: &Context, i: u32) -> bool {
+    let n = cx.node(i);
+    bitwise_op(n.op) || (n.op == OpCode::Select && n.width == 1)
+}
+
 /// The wide description of `i` if it needs no computing: cached, an atom, or the three-atom
 /// reading's where that reads no region of more than three atoms (the same atoms and function,
 /// its table repeated).
 fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
-    if !bitwise_op(cx.node(i).op) {
+    if !wide_region_op(cx, i) {
         return Some(wide_leaf(cx, i));
     }
     if let Some(&w) = r.bitwise.wide.get(&i) {
@@ -486,7 +510,7 @@ fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
     }
     match r.bitwise.info.get(&i) {
         Some(Some((atoms, tt)))
-            if atoms[..] != [i] && atoms.iter().all(|&a| !bitwise_op(cx.node(a).op)) =>
+            if atoms[..] != [i] && atoms.iter().all(|&a| !wide_region_op(cx, a)) =>
         {
             let mut w = Wide {
                 atoms: [0; WIDE],
@@ -523,13 +547,18 @@ fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop
         }
         r.meter.charge(Counter::PassWork, 1)?;
         let known = |c: u32| known_wide(r, cx, c).expect("operands come first");
-        let a = known(node.a);
-        let b = if node.op == OpCode::Not {
-            a
+        let w = if node.op == OpCode::Select {
+            wide_select(cx, i, known(node.a), known(node.b), known(node.c))
         } else {
-            known(node.b)
+            let a = known(node.a);
+            let b = if node.op == OpCode::Not {
+                a
+            } else {
+                known(node.b)
+            };
+            wide_op(cx, i, a, b)
         };
-        r.bitwise.wide.insert(i, wide_op(cx, i, a, b));
+        r.bitwise.wide.insert(i, w);
     }
     Ok(r.bitwise.wide[&root])
 }
@@ -1682,6 +1711,161 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let op = cx.node(n).op;
     if !bitwise_op(op) {
         return Ok(Step::Normal(Fin::FINAL));
+    }
+    // Reassociate `(x op c1) op c2 -> x op (c1 op c2)` for `op ∈ {And, Or, Xor}` even when
+    // `x op c1` has other users (a 1-for-1 DAG size tie that strictly reduces tree depth and
+    // unifies constant masks/flips across shared subexpressions).
+    if let Some(bop) = match op {
+        OpCode::And => Some(BinOp::And),
+        OpCode::Or => Some(BinOp::Or),
+        OpCode::Xor => Some(BinOp::Xor),
+        _ => None,
+    } {
+        let node = cx.node(n);
+        let outer = match (cx.const_val(node.a), cx.const_val(node.b)) {
+            (None, Some(c2)) => Some((node.a, c2)),
+            (Some(c2), None) => Some((node.b, c2)),
+            _ => None,
+        };
+        if let Some((y, c2)) = outer {
+            let yn = cx.node(y);
+            if yn.op == op {
+                let inner = match (cx.const_val(yn.a), cx.const_val(yn.b)) {
+                    (None, Some(c1)) => Some((yn.a, c1)),
+                    (Some(c1), None) => Some((yn.b, c1)),
+                    _ => None,
+                };
+                if let Some((x, c1)) = inner {
+                    let c = BitVec::bin_unchecked(bop, &c1, &c2);
+                    let before = cx.len() as u32;
+                    let kc = r.build(cx, |cx| cx.mk_const(&c))?;
+                    let e = r.build(cx, |cx| cx.c_bin(bop, x, kc))?;
+                    let mut stops = vec![x, kc];
+                    stops.sort_unstable();
+                    stops.dedup();
+                    match super::finish_with(
+                        r,
+                        cx,
+                        PassKind::Bitwise,
+                        n,
+                        e,
+                        before,
+                        &stops,
+                        Fin::FINAL,
+                        true,
+                    )? {
+                        Step::Normal(_) => {}
+                        done => return Ok(done),
+                    }
+                }
+            }
+        }
+    }
+    if op == OpCode::And {
+        let node = cx.node(n);
+        let not_const = match (cx.node(node.a).op, cx.const_val(node.b)) {
+            (OpCode::Not, Some(c)) if !c.is_zero() && !c.is_ones() => Some((cx.node(node.a).a, c)),
+            _ => match (cx.node(node.b).op, cx.const_val(node.a)) {
+                (OpCode::Not, Some(c)) if !c.is_zero() && !c.is_ones() => {
+                    Some((cx.node(node.b).a, c))
+                }
+                _ => None,
+            },
+        };
+        if let Some((x, c)) = not_const {
+            let (kb_opt, kfin) = super::known(r, cx, x)?;
+            if let Some(kb) = kb_opt
+                && BitVec::bin_unchecked(BinOp::Or, &kb.known_zero(), &c).is_ones()
+            {
+                let before = cx.len() as u32;
+                let kc = r.build(cx, |cx| cx.mk_const(&c))?;
+                let e = r.build(cx, |cx| cx.c_bin(BinOp::Xor, x, kc))?;
+                let mut stops = vec![x];
+                if kc < before {
+                    stops.push(kc);
+                }
+                match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, kfin, true)?
+                {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
+    }
+    // Canonicalize 1-bit Majority `(u & v) | ((u | v) & w)` (even when `u & v` is flattened
+    // across `And` leaves, e.g. `(a & x & y) | (((x & y) | a) & c)`) to the 2-node canonical
+    // `select(tri[1] ^ tri[2], tri[0], tri[1])` matching `core.select_idioms::select_by_xor_bit`.
+    if op == OpCode::Or && cx.wid(n) == 1 {
+        let node = cx.node(n);
+        let and_leaves = |root: u32| -> Option<Vec<u32>> {
+            let mut out = Vec::with_capacity(4);
+            let mut st = vec![root];
+            while let Some(cur) = st.pop() {
+                if out.len() + st.len() > 8 {
+                    return None;
+                }
+                let cn = cx.node(cur);
+                if cn.op == OpCode::And {
+                    st.push(cn.b);
+                    st.push(cn.a);
+                } else {
+                    out.push(cur);
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            Some(out)
+        };
+        let mut maj_triple: Option<[u32; 3]> = None;
+        for (conj_side, prod_side) in [(node.a, node.b), (node.b, node.a)] {
+            let pn = cx.node(prod_side);
+            if cx.node(conj_side).op != OpCode::And || pn.op != OpCode::And {
+                continue;
+            }
+            for (or_child, w_child) in [(pn.a, pn.b), (pn.b, pn.a)] {
+                let on = cx.node(or_child);
+                if on.op != OpCode::Or {
+                    continue;
+                }
+                let (u, v) = (on.a, on.b);
+                if let (Some(cl), Some(mut ul), Some(vl)) =
+                    (and_leaves(conj_side), and_leaves(u), and_leaves(v))
+                {
+                    ul.extend(vl);
+                    ul.sort_unstable();
+                    ul.dedup();
+                    if cl == ul {
+                        maj_triple = Some([u, v, w_child]);
+                        break;
+                    }
+                }
+            }
+            if maj_triple.is_some() {
+                break;
+            }
+        }
+        if let Some(mut tri) = maj_triple {
+            tri.sort_by(|&a, &b| cx.order(a, b));
+            let before = cx.len() as u32;
+            let e = if tri[0] == tri[1] {
+                tri[0]
+            } else if tri[1] == tri[2] {
+                tri[1]
+            } else {
+                r.build(cx, |cx| {
+                    let x = cx.c_bin(BinOp::Xor, tri[1], tri[2])?;
+                    cx.c_select(x, tri[0], tri[1])
+                })?
+            };
+            let mut stops = tri.to_vec();
+            stops.sort_unstable();
+            stops.dedup();
+            match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, true)?
+            {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        }
     }
     if matches!(op, OpCode::Or | OpCode::Xor) {
         let node = cx.node(n);
