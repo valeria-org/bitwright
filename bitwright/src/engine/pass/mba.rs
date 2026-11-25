@@ -1,12 +1,14 @@
 //! The MBA phase: lowering, the solver, the evidence gate, lifting (see [`crate::mba`]).
 
+mod bit_table;
 mod cofactors;
 mod field_guard;
 mod guard_domain;
 mod opaque_predicate;
 mod output_set;
 mod selector_cube;
-pub(super) use opaque_predicate::{equal_sums, truncated_constant};
+pub(super) use bit_table::reduce as bit_table_reduce;
+pub(super) use opaque_predicate::{equal_lanes, equal_sums, truncated_constant};
 
 use super::{Fin, PassKind, Runner, Step, Stop, discard, finish, shrinks};
 use crate::engine::Exhausted;
@@ -85,6 +87,9 @@ pub(crate) struct State {
     /// The shared nodes of each fragment asked for in this call with no node kept out of it
     /// (see [`shared`]): by the root, the size limit, how many, and whether casts are read.
     pub(crate) shared: crate::hash::IdMap<(u32, u32, u32, bool), Vec<u32>>,
+    /// Cached 128-bit bit-table carry-tree equality solutions keyed by `(a, b, target128)`,
+    /// storing the 1-bit equality predicate node when solved.
+    pub(crate) bit_tables: crate::hash::IdMap<(u32, u32, u128), Option<u32>>,
 }
 
 impl Drop for State {
@@ -435,9 +440,28 @@ fn sweep_inner(
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
+    if fold_cases {
+        let mut bt_repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+        for &i in &order {
+            if cx.wid(i) == 1
+                && matches!(cx.node(i).op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
+                && let Some(e) = bit_table::reduce(r, cx, i)?
+                && e != i
+            {
+                r.emit_part(cx, crate::engine::Stage::Sweep, i, e);
+                bt_repl.insert(i, e);
+            }
+        }
+        if !bt_repl.is_empty() {
+            let e = r.build(cx, |cx| Ok(cx.substitute_ids(&[root], &bt_repl)?[0]))?;
+            r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
+            return Ok(e);
+        }
+    }
     let root = if fold_cases && cfg.opaque_sweep
         && let Some(e) = cofactors::reduce(r, cx, root, &order)?
     {
+        count(r).opaque_proved += 1;
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         order = cx.post_order_ids(&[e]);
         r.meter.charge(Counter::PassWork, order.len() as u64)?;
@@ -560,6 +584,10 @@ fn sweep_inner(
     // The varying nodes met so far by their samples, and the related pairs no proof was found
     // for (see `Classes`).
     let mut classes = Classes::default();
+    // Nodes newly added to `classes` in *this* sweep (not already in `r.mba.swept`): when a
+    // previously swept node later matches one of them in a subsequent round, we still check
+    // the pair once via the cheap algebraic provers so post-order changes don't hide equalities.
+    let mut newly_noted: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
     let mut unrelated = 0usize;
     // For each node, the nodes it or one below it was asked to be related to with no proof
     // found (see `related`).
@@ -567,6 +595,10 @@ fn sweep_inner(
     // the run's budget ending in a question keeps what the sweep proved before it;
     // the nodes left are rebuilt over those results, not asked about.
     let mut spent = false;
+    // Once a 128-bit bit-table guard collapses in this sweep, stop speculative
+    // sampling/proving on ancestor nodes so `linear`/`compares`/`push_context`
+    // can fold the collapsed guard's consequences before any further sweeping.
+    let mut bit_table_hit = false;
     // The node examined last, recorded in `r.mba.swept` once the next one begins (unless the
     // budget ended while it was asked about, which left it unexamined).
     let mut pending: Option<u32> = None;
@@ -596,7 +628,26 @@ fn sweep_inner(
         }
         // Examined by an earlier sweep of this call (of another root, or of a case's other
         // side): its result is equal to it, and asking again finds what that sweep found.
+        // If a newly created node from a later round shares its sample class, check that pair
+        // once so order swaps across rounds still expose the relation.
         if let Some(&done) = r.mba.swept.get(&i) {
+            if done == i && !newly_noted.is_empty() && !spent && unrelated < SWEEP_UNRELATED {
+                let found = classes.find(&r.samples[&i]);
+                for (rep, relation, d) in found {
+                    if !newly_noted.contains_key(&rep) {
+                        continue;
+                    }
+                    let rep = to.get(&rep).copied().unwrap_or(rep);
+                    if let Related::Proved(e) =
+                        asked!('nodes, related(r, cx, cfg, i, rep, relation, &d))
+                    {
+                        r.emit_part(cx, crate::engine::Stage::Sweep, i, e);
+                        to.insert(i, e);
+                        r.mba.swept.insert(i, e);
+                        continue 'nodes;
+                    }
+                }
+            }
             r.emit_part(cx, crate::engine::Stage::Sweep, i, done);
             to.insert(i, done);
             if done == i {
@@ -629,6 +680,19 @@ fn sweep_inner(
             continue;
         }
         pending = Some(i);
+        if cx.wid(cur) == 1
+            && matches!(cx.node(cur).op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
+            && let Some(e) = asked!('nodes, bit_table::reduce(r, cx, cur))
+        {
+            r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
+            to.insert(i, e);
+            bit_table_hit = true;
+            continue 'nodes;
+        }
+        if bit_table_hit {
+            pending = None;
+            continue;
+        }
         let vals = &r.samples[&i];
         let k = vals[0];
         if vals.iter().any(|v| *v != k) {
@@ -682,6 +746,7 @@ fn sweep_inner(
                 }
             }
             classes.note(&r.samples[&i], i);
+            newly_noted.insert(i, ());
             let vals = &r.samples[&i];
             let top = !links.get(&i).copied().unwrap_or(false);
             let mut rewritten = None;
@@ -1009,6 +1074,15 @@ fn related(
     }
     if witnessed(r, cx, diff, &zero)? {
         return Ok(Related::Open);
+    }
+    // Cheap exact algebraic checks before demanded-bit splitting and heavy certificates:
+    // lane-wise column cancellation (handles arbitrary per-bit constant masks, zext/trunc
+    // congruences, and rotated/shifted slices in microseconds) and polynomial expansion.
+    if opaque_predicate::equal_lanes(r, cx, cur, e, cx.wid(cur))?
+        || super::poly::equal(r, cx, cur, e)?
+    {
+        count(r).opaque_proved += 1;
+        return Ok(Related::Proved(e));
     }
     let whole_sums = relation != Relation::Xor;
     let subject = super::demanded::reduced(r, cx, diff, SWEEP_DEMAND_VISITS, whole_sums)?;

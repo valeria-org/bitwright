@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "bitwright"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright-ref",
  "hashbrown",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "bitwright-bench"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright",
  "libc",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "bitwright-cadical"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright",
  "cadical",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "bitwright-cli"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright",
  "bitwright-cadical",
@@ -36,18 +36,18 @@ dependencies = [
 
 [[package]]
 name = "bitwright-ffi"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright",
 ]
 
 [[package]]
 name = "bitwright-ref"
-version = "0.32.14"
+version = "0.32.15"
 
 [[package]]
 name = "bitwright-wasm"
-version = "0.32.14"
+version = "0.32.15"
 dependencies = [
  "bitwright",
 ]
@@ -114,9 +114,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "r-efi"

@@ -62,6 +62,10 @@ struct Region {
     bounds: Vec<u32>,
     /// Per narrow atom (under a cast): the lifted atom standing for it.
     lifts: Vec<(u32, u32)>,
+    /// Atoms proved to be the bitwise complement (`a + b == -1`) of an earlier atom:
+    /// `(complement_atom, base_atom)`. Evaluated as `!base_atom` in the signature without
+    /// spending a fresh variable column.
+    complements: Vec<(u32, u32)>,
 }
 
 fn is_linear(op: OpCode) -> bool {
@@ -247,7 +251,7 @@ fn walk<const QUICK: bool>(
                         Some((kind, _)) => narrow.push((i, kind)),
                         None => atoms.push(i),
                     }
-                    if atoms.len() + narrow.len() > if QUICK { 5 } else { MAX_ATOMS } {
+                    if atoms.len() + narrow.len() > if QUICK { 5 } else { MAX_ATOMS + 4 } {
                         return Err(Walk::Over);
                     }
                     continue;
@@ -277,7 +281,7 @@ fn walk<const QUICK: bool>(
     });
     // The canonical order of the atoms, independent of node indices.
     atoms.sort_by(|a, b| cx.order(*a, *b));
-    Ok(Region {
+    let mut reg = Region {
         bounds: atoms
             .iter()
             .copied()
@@ -288,7 +292,142 @@ fn walk<const QUICK: bool>(
         mixed: lin && bit,
         // The kinds, until the atoms are lifted (see `lift`).
         lifts: narrow.iter().map(|&(a, k)| (a, k as u32)).collect(),
-    })
+        complements: Vec::new(),
+    };
+    if !QUICK {
+        merge_complement_atoms(cx, &mut reg);
+    }
+    if reg.atoms.len() + reg.lifts.len() > if QUICK { 5 } else { MAX_ATOMS } {
+        return Err(Walk::Over);
+    }
+    Ok(reg)
+}
+
+/// Flatten a small additive node (`<= 64` bits) into `(sorted_terms, bias)` mod `2^w`.
+fn flatten_affine(cx: &Context, root: u32, w: u16) -> Option<(Vec<(u32, u64)>, u64)> {
+    let mask = u64::MAX >> (64 - w);
+    let mut bias = 0u64;
+    let mut parts: Vec<(u32, u64)> = Vec::new();
+    let mut stack: Vec<(u32, u64, u8)> = vec![(root, 1, 16)];
+    let mut steps = 0usize;
+    while let Some((i, k, depth)) = stack.pop() {
+        steps += 1;
+        if steps > 64 || parts.len() > 24 {
+            return None;
+        }
+        let n = cx.node(i);
+        if depth == 0 {
+            parts.push((i, k));
+            continue;
+        }
+        match n.op {
+            OpCode::Const => {
+                bias = bias.wrapping_add(k.wrapping_mul(cx.const_val(i)?.to_u64()?));
+            }
+            OpCode::Add => {
+                stack.push((n.a, k, depth - 1));
+                stack.push((n.b, k, depth - 1));
+            }
+            OpCode::Sub => {
+                stack.push((n.a, k, depth - 1));
+                stack.push((n.b, k.wrapping_neg(), depth - 1));
+            }
+            OpCode::Neg => {
+                stack.push((n.a, k.wrapping_neg(), depth - 1));
+            }
+            OpCode::Not => {
+                bias = bias.wrapping_sub(k);
+                stack.push((n.a, k.wrapping_neg(), depth - 1));
+            }
+            OpCode::Mul if cx.const_val(n.b).and_then(|v| v.to_u64()).is_some() => {
+                let c = cx.const_val(n.b)?.to_u64()?;
+                stack.push((n.a, k.wrapping_mul(c), depth - 1));
+            }
+            OpCode::Mul if cx.const_val(n.a).and_then(|v| v.to_u64()).is_some() => {
+                let c = cx.const_val(n.a)?.to_u64()?;
+                stack.push((n.b, k.wrapping_mul(c), depth - 1));
+            }
+            OpCode::Shl if cx.const_val(n.b).and_then(|v| v.to_u64()).is_some_and(|s| s < u64::from(w)) => {
+                let s = cx.const_val(n.b)?.to_u64()?;
+                stack.push((n.a, k << s, depth - 1));
+            }
+            _ => parts.push((i, k)),
+        }
+    }
+    parts.sort_unstable_by_key(|&(id, _)| id);
+    parts.dedup_by(|next, prev| {
+        if next.0 != prev.0 {
+            return false;
+        }
+        prev.1 = prev.1.wrapping_add(next.1);
+        true
+    });
+    parts.retain(|(_, c)| *c & mask != 0);
+    for (_, c) in &mut parts {
+        *c &= mask;
+    }
+    Some((parts, bias & mask))
+}
+
+type AffineForm = (Vec<(u32, u64)>, u64);
+
+/// Detect pairs of atoms `a, b` in `reg.atoms` satisfying `a + b == -1 (mod 2^w)`, i.e.
+/// `b == ~a` (for example `x * (-C) - 1` beside `x * C`, or `-S - 1` beside `S`).
+/// Removing `b` and evaluating it as `!a` shrinks the corner table and enables cancellation.
+fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
+    if reg.atoms.len() < 2 {
+        return;
+    }
+    let w = cx.wid(reg.atoms[0]);
+    if w == 0 || w > 64 {
+        return;
+    }
+    if !reg.atoms.iter().any(|&a| {
+        matches!(cx.node(a).op, OpCode::Add | OpCode::Sub | OpCode::Neg)
+    }) {
+        return;
+    }
+    let mask = u64::MAX >> (64 - w);
+    let forms: Vec<Option<AffineForm>> = reg
+        .atoms
+        .iter()
+        .map(|&a| {
+            (cx.wid(a) == w).then(|| flatten_affine(cx, a, w)).flatten()
+        })
+        .collect();
+    let mut dropped = vec![false; reg.atoms.len()];
+    for j in 1..reg.atoms.len() {
+        let Some((pj, bj)) = &forms[j] else { continue };
+        if pj.is_empty() {
+            continue;
+        }
+        for i in 0..j {
+            if dropped[i] {
+                continue;
+            }
+            let Some((pi, bi)) = &forms[i] else { continue };
+            if pi.len() != pj.len() {
+                continue;
+            }
+            if bi.wrapping_add(*bj) & mask == mask
+                && pi.iter().zip(pj).all(|(&(ta, ca), &(tb, cb))| {
+                    ta == tb && ca.wrapping_add(cb) & mask == 0
+                })
+            {
+                reg.complements.push((reg.atoms[j], reg.atoms[i]));
+                dropped[j] = true;
+                break;
+            }
+        }
+    }
+    if !reg.complements.is_empty() {
+        let mut idx = 0;
+        reg.atoms.retain(|_| {
+            let keep = !dropped[idx];
+            idx += 1;
+            keep
+        });
+    }
 }
 
 /// Lifts the region's narrow atoms: each becomes the cast of its kind to the root's width
@@ -348,10 +487,11 @@ fn signature_words<'a>(
     // Every region node has the root's width: a row of words per node, masked to it.
     let mask = u64::MAX >> (64 - bits);
     let t = reg.atoms.len();
+    let nc = reg.complements.len();
     let corners = 1usize << t;
     s.seen.begin(cx.len());
     s.words.clear();
-    s.words.resize((t + reg.order.len()) * corners, 0);
+    s.words.resize((t + nc + reg.order.len()) * corners, 0);
     for (j, &a) in reg.atoms.iter().enumerate() {
         s.seen.set(a, j as u32);
         for (p, v) in s.words[j * corners..(j + 1) * corners]
@@ -363,6 +503,16 @@ fn signature_words<'a>(
             }
         }
     }
+    for (ci, &(comp, base)) in reg.complements.iter().enumerate() {
+        let base_row = s.seen.get(base)?;
+        let row_idx = t + ci;
+        s.seen.set(comp, row_idx as u32);
+        let (done, rest) = s.words.split_at_mut(row_idx * corners);
+        let src = &done[base_row as usize * corners..(base_row as usize + 1) * corners];
+        for (o, &x) in rest[..corners].iter_mut().zip(src) {
+            *o = !x & mask;
+        }
+    }
     // A narrow atom reads as its lifted atom: under its cast, the nodes are evaluated at the
     // root's width over the lifted atoms (bitwise operators act by position).
     for &(a, l) in &reg.lifts {
@@ -372,8 +522,8 @@ fn signature_words<'a>(
         }
     }
     for (k, &i) in reg.order.iter().enumerate() {
-        let at = (t + k) * corners;
-        s.seen.set(i, (t + k) as u32);
+        let at = (t + nc + k) * corners;
+        s.seen.set(i, (t + nc + k) as u32);
         let (done, rest) = s.words.split_at_mut(at);
         let out = &mut rest[..corners];
         if let Some(c) = cx.const_val(i) {
@@ -429,7 +579,7 @@ fn signature_words<'a>(
             }
         }
     }
-    let r = (t + reg.order.len() - 1) * corners;
+    let r = (t + nc + reg.order.len() - 1) * corners;
     (s.seen.get(root)? as usize * corners == r).then_some(&s.words[r..r + corners])
 }
 
@@ -541,6 +691,13 @@ fn signature_wide(cx: &Context, reg: &Region, root: u32) -> Vec<BitVec> {
             })
             .collect();
         vals.insert(a, v);
+    }
+    for &(comp, base) in &reg.complements {
+        let v: Vec<BitVec> = vals
+            .get(&base)
+            .map(|row| row.iter().map(|x| BitVec::un_unchecked(UnOp::Not, x)).collect())
+            .unwrap_or_default();
+        vals.insert(comp, v);
     }
     for &(a, l) in &reg.lifts {
         let v = vals.get(&l).cloned().unwrap_or_default();
@@ -803,6 +960,168 @@ pub(super) fn equal(
     zero
 }
 
+/// Exact upper bound on which bits of `i` (`w <= 64`) can ever be 1 (0 bits are known zero).
+fn atom_may_one(cx: &Context, i: u32, depth: u8) -> u64 {
+    let n = cx.node(i);
+    let w = n.width;
+    if w == 0 || w > 64 {
+        return u64::MAX;
+    }
+    let mask = u64::MAX >> (64 - w);
+    if depth == 0 {
+        return mask;
+    }
+    match n.op {
+        OpCode::Const => cx.const_val(i).and_then(|v| v.to_u64()).unwrap_or(mask) & mask,
+        OpCode::Shl => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w) => 0,
+            Some(s) => (atom_may_one(cx, n.a, depth - 1) << s) & mask,
+            None => mask,
+        },
+        OpCode::LShr => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w) => 0,
+            Some(s) => atom_may_one(cx, n.a, depth - 1) >> s,
+            None => mask,
+        },
+        OpCode::And => atom_may_one(cx, n.a, depth - 1) & atom_may_one(cx, n.b, depth - 1) & mask,
+        OpCode::Or | OpCode::Xor => {
+            (atom_may_one(cx, n.a, depth - 1) | atom_may_one(cx, n.b, depth - 1)) & mask
+        }
+        OpCode::Zext => atom_may_one(cx, n.a, depth - 1) & mask,
+        OpCode::Extract if cx.wid(n.a) <= 64 => {
+            (atom_may_one(cx, n.a, depth - 1) >> n.b) & mask
+        }
+        OpCode::Select => {
+            (atom_may_one(cx, n.b, depth - 1) | atom_may_one(cx, n.c, depth - 1)) & mask
+        }
+        OpCode::Mul => {
+            let (x, k) = match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => (n.a, k.to_u64()),
+                (Some(k), None) => (n.b, k.to_u64()),
+                _ => return mask,
+            };
+            let Some(k) = k else { return mask };
+            if k == 0 {
+                return 0;
+            }
+            let mx = atom_may_one(cx, x, depth - 1);
+            if mx == 0 {
+                return 0;
+            }
+            let tz = k.trailing_zeros() + mx.trailing_zeros();
+            if tz >= u32::from(w) {
+                0
+            } else {
+                (mask << tz) & mask
+            }
+        }
+        _ => mask,
+    }
+}
+
+/// Drop conjunction terms `d[S] * AND_S` that vanish identically because the atoms in `S` have
+/// disjoint `may_one` masks (`AND_S == 0`) or trailing zeros annihilating `d[S]` (`d[S] << tz == 0`),
+/// and transfer a purely linear atom `x` scaled by `k` into an existing shifted atom `y = x << s`
+/// whenever `k` has at least `s` trailing zeros (`k * x == (k >> s) * (x << s)` mod `2^w`).
+/// Returns whether any coefficient changed.
+fn transfer_shifted_linear_atoms(cx: &Context, atoms: &[u32], d: &mut [BitVec]) -> bool {
+    let t = atoms.len();
+    if t == 0 {
+        return false;
+    }
+    let w = cx.width_of(atoms[0]);
+    let wb = u64::from(w.bits());
+    let mut moved = false;
+
+    // 1. Precompute sound `may_one` bitmasks (for `w <= 64`) and zero out any conjunction
+    //    `AND_S` that is identically 0 or whose trailing zeros annihilate `d[S]`.
+    let mut may_one = [u64::MAX; MAX_ATOMS];
+    let use_masks = w.bits() <= 64;
+    if use_masks {
+        let full = u64::MAX >> (64 - w.bits());
+        let mut any_restricted = false;
+        for (j, &a) in atoms.iter().enumerate().take(MAX_ATOMS) {
+            let m = atom_may_one(cx, a, 6);
+            may_one[j] = m;
+            any_restricted |= m != full;
+        }
+        if any_restricted {
+            for (s, coeff) in d.iter_mut().enumerate().skip(1) {
+                if coeff.is_zero() {
+                    continue;
+                }
+                let mut cm = full;
+                for (j, &mj) in may_one.iter().enumerate().take(t) {
+                    if (s >> j) & 1 != 0 {
+                        cm &= mj;
+                    }
+                }
+                if cm == 0 {
+                    *coeff = BitVec::zero(w);
+                    moved = true;
+                    continue;
+                }
+                let tz = cm.trailing_zeros();
+                if tz > 0
+                    && (u64::from(tz) >= wb
+                        || BitVec::bin_unchecked(
+                            BinOp::Shl,
+                            coeff,
+                            &BitVec::wrapping_from_u64(w, u64::from(tz)),
+                        )
+                        .is_zero())
+                {
+                    *coeff = BitVec::zero(w);
+                    moved = true;
+                }
+            }
+        }
+    }
+
+    // 2. Transfer purely linear `k * x` into an existing `y = x << s` atom when `2^s | k`.
+    for i in 0..t {
+        let bit_i = 1usize << i;
+        if d[bit_i].is_zero() {
+            continue;
+        }
+        // Only transfer when atom `i` has zero coefficients on all conjunctions of size >= 2.
+        if (0..d.len()).any(|s| s != bit_i && (s & bit_i) != 0 && !d[s].is_zero()) {
+            continue;
+        }
+        let x = atoms[i];
+        let k = d[bit_i];
+        for (j, &y) in atoms.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            let ny = cx.node(y);
+            if ny.op != OpCode::Shl || ny.a != x {
+                continue;
+            }
+            let Some(shift) = cx.const_val(ny.b).and_then(|v| v.to_u64()) else {
+                continue;
+            };
+            if shift == 0 || shift >= wb {
+                continue;
+            }
+            let sh = BitVec::wrapping_from_u64(w, shift);
+            let q = BitVec::bin_unchecked(BinOp::LShr, &k, &sh);
+            let back = BitVec::bin_unchecked(BinOp::Shl, &q, &sh);
+            if back == k {
+                let bit_j = 1usize << j;
+                d[bit_j] = BitVec::bin_unchecked(BinOp::Add, &d[bit_j], &q);
+                d[bit_i] = BitVec::zero(w);
+                if BitVec::bin_unchecked(BinOp::Shl, &d[bit_j], &sh).is_zero() {
+                    d[bit_j] = BitVec::zero(w);
+                }
+                moved = true;
+                break;
+            }
+        }
+    }
+    moved
+}
+
 fn difference_is_zero(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -828,7 +1147,11 @@ fn difference_is_zero(
     r.meter
         .charge(Counter::PassWork, (reg.order.len() << t) as u64)?;
     let sig = signature(cx, &reg, n, &mut r.linear_mba);
-    Ok(sig.iter().all(BitVec::is_zero))
+    if sig.iter().all(BitVec::is_zero) {
+        return Ok(true);
+    }
+    let mut d = mobius(&sig);
+    Ok(transfer_shifted_linear_atoms(cx, &reg.atoms, &mut d) && d.iter().all(BitVec::is_zero))
 }
 
 /// [`step`] when `commit`; else the form alone ([`normal`]).
@@ -863,7 +1186,8 @@ fn solve(
     r.meter
         .charge(Counter::PassWork, (reg.order.len() << t) as u64)?;
     let sig = signature(cx, &reg, n, &mut r.linear_mba);
-    let d = mobius(&sig);
+    let mut d = mobius(&sig);
+    let shifted_atoms = transfer_shifted_linear_atoms(cx, &reg.atoms, &mut d);
     // (The atoms, and so the corners, are already in the canonical order.)
     let canon = reg.atoms.clone();
     let mut cands: Vec<(u32, Candidate)> = Vec::new();
@@ -948,7 +1272,7 @@ fn solve(
             push_cobra(&mut cands, konst, cobra_terms);
         }
     }
-    if t <= 3 {
+    if t <= 3 && !shifted_atoms {
         // Distinct values, in order of first appearance; each as the base in turn.
         let mut distinct: Vec<BitVec> = Vec::new();
         for v in &sig {
@@ -1079,4 +1403,42 @@ fn solve(
         tie,
     )?;
     Ok((step, None))
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use crate::engine::{Budget, Engine, Run, Strategy};
+    use crate::{Context, ParseOptions, View, Width};
+
+    #[test]
+    fn proves_complement_atom_and_disjoint_shift_scale_equal() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate())
+            .build()
+            .unwrap();
+
+        // Expanded complement `a * (-C) - 1 == ~(a * C)` merges into a single atom column.
+        let comp = "let %0 = x * 0x123456789abcdef1; \
+                    let %1 = x * 0xedcba9876543210f - 1; \
+                    (%0 | y) + (%0 & y) + (~%1 ^ y) * 2 == (%0 + y) * 3 - (%0 & y) * 4";
+        let e1 = cx.parse(comp, &opt).unwrap();
+        let out1 = engine
+            .run(&mut cx, &[e1], Run::default().with_per_call(Budget::fuel(1 << 14)))
+            .unwrap();
+        assert!(matches!(cx.view(out1.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
+
+        // Disjoint shifted halves (`(x << 6) & (x >>u 58) == 0`) plus shift-scale transfer
+        // `x * (5 << 6) == (x << 6) * 5`, and `2^62 * ((x << 6) & y) == 0`.
+        let shift = "let %0 = x >>u 58; let %1 = x << 6; \
+                     (%1 & %0) * 0xdeadbeef + (%1 & y) * 0x400000000000000a \
+                     + (%1 & ~y) * 5 + (y & ~%1) * 5 == x * 0x140 + y * 5";
+        let e2 = cx.parse(shift, &opt).unwrap();
+        let out2 = engine
+            .run(&mut cx, &[e2], Run::default().with_per_call(Budget::fuel(1 << 14)))
+            .unwrap();
+        assert!(matches!(cx.view(out2.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
+    }
 }

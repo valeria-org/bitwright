@@ -6,10 +6,17 @@ use super::{Counter, Runner, Stop};
 use crate::expr::{Context, OpCode};
 use crate::{BinOp, BitVec};
 
-// A lane is a Boolean function of at most four distinct (node, bit) pairs. Treating a bit
+// A lane is a Boolean function of at most six distinct (node, bit) pairs. Treating a bit
 // we cannot trace as independent can only prevent a proof. The same source bit, including
 // through a rotate or a sign extension, must get the same truth-table column.
-const VAR: [u16; 4] = [0xaaaa, 0xcccc, 0xf0f0, 0xff00];
+const VAR: [u64; 6] = [
+    0xaaaa_aaaa_aaaa_aaaa,
+    0xcccc_cccc_cccc_cccc,
+    0xf0f0_f0f0_f0f0_f0f0,
+    0xff00_ff00_ff00_ff00,
+    0xffff_0000_ffff_0000,
+    0xffff_ffff_0000_0000,
+];
 
 pub(super) struct Work {
     pub(super) left: u64,
@@ -42,21 +49,28 @@ pub(super) fn terms(
     keep_not: bool,
     work: &mut Work,
 ) -> Option<()> {
-    terms_at(cx, i, k, bias, out, depth, keep_not, None, work)
+    terms_at(cx, i, k, bias, out, depth, keep_not, None, 64, work)
 }
 
 fn terms_at(
     cx: &Context, i: u32, k: u64, bias: &mut u64, out: &mut Vec<(u32, u64)>,
-    depth: u8, keep_not: bool, cut: Option<u32>, work: &mut Work,
+    depth: u8, keep_not: bool, cut: Option<u32>, mod_bits: u16, work: &mut Work,
 ) -> Option<()> {
     work.take(1)?;
     let d = depth.checked_sub(1)?;
     let n = cx.node(i);
+    let mod_mask = if mod_bits >= 64 {
+        u64::MAX
+    } else if mod_bits == 0 {
+        0
+    } else {
+        (1u64 << mod_bits) - 1
+    };
     match n.op {
         _ if Some(i) == cut => push_term(out, i, k)?,
         OpCode::Const => *bias = bias.wrapping_add(k.wrapping_mul(scalar(cx, i)?)),
         OpCode::Add | OpCode::Sub => {
-            terms_at(cx, n.a, k, bias, out, d, keep_not, cut, work)?;
+            terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
             terms_at(
                 cx,
                 n.b,
@@ -70,6 +84,7 @@ fn terms_at(
                 d,
                 keep_not,
                 cut,
+                mod_bits,
                 work,
             )?;
         }
@@ -77,35 +92,68 @@ fn terms_at(
             if n.op == OpCode::Not {
                 *bias = bias.wrapping_sub(k);
             }
-            terms_at(cx, n.a, k.wrapping_neg(), bias, out, d, keep_not, cut, work)?;
+            terms_at(cx, n.a, k.wrapping_neg(), bias, out, d, keep_not, cut, mod_bits, work)?;
         }
-        OpCode::Mul if scalar(cx, n.b).is_some() => terms_at(
-            cx,
-            n.a,
-            k.wrapping_mul(scalar(cx, n.b)?),
-            bias,
-            out,
-            d,
-            keep_not,
-            cut,
-            work,
-        )?,
-        OpCode::Mul if scalar(cx, n.a).is_some() => terms_at(
-            cx,
-            n.b,
-            k.wrapping_mul(scalar(cx, n.a)?),
-            bias,
-            out,
-            d,
-            keep_not,
-            cut,
-            work,
-        )?,
+        OpCode::Mul if scalar(cx, n.b).is_some() => {
+            let c = scalar(cx, n.b)?;
+            let next_mod = mod_bits.saturating_sub(c.trailing_zeros() as u16);
+            if next_mod > 0 {
+                terms_at(
+                    cx,
+                    n.a,
+                    k.wrapping_mul(c),
+                    bias,
+                    out,
+                    d,
+                    keep_not,
+                    cut,
+                    next_mod,
+                    work,
+                )?;
+            }
+        }
+        OpCode::Mul if scalar(cx, n.a).is_some() => {
+            let c = scalar(cx, n.a)?;
+            let next_mod = mod_bits.saturating_sub(c.trailing_zeros() as u16);
+            if next_mod > 0 {
+                terms_at(
+                    cx,
+                    n.b,
+                    k.wrapping_mul(c),
+                    bias,
+                    out,
+                    d,
+                    keep_not,
+                    cut,
+                    next_mod,
+                    work,
+                )?;
+            }
+        }
         OpCode::Shl if scalar(cx, n.b).is_some() => {
             let count = scalar(cx, n.b)?;
-            if count < 64 {
-                terms_at(cx, n.a, k << count, bias, out, d, keep_not, cut, work)?;
+            let next_mod = mod_bits.saturating_sub(count.min(64) as u16);
+            if count < 64 && next_mod > 0 {
+                terms_at(cx, n.a, k << count, bias, out, d, keep_not, cut, next_mod, work)?;
             }
+        }
+        OpCode::Extract if mod_bits <= n.width && n.b == 0 && cx.node(n.a).width <= 64 => {
+            terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
+        }
+        OpCode::Zext if mod_bits <= cx.node(n.a).width && cx.node(n.a).width <= 64 => {
+            terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
+        }
+        OpCode::And
+            if mod_bits < 64
+                && scalar(cx, n.b).is_some_and(|m| (m & mod_mask) == mod_mask) =>
+        {
+            terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
+        }
+        OpCode::And
+            if mod_bits < 64
+                && scalar(cx, n.a).is_some_and(|m| (m & mod_mask) == mod_mask) =>
+        {
+            terms_at(cx, n.b, k, bias, out, d, keep_not, cut, mod_bits, work)?;
         }
         _ => push_term(out, i, k)?,
     }
@@ -113,7 +161,7 @@ fn terms_at(
 }
 
 fn push_term(out: &mut Vec<(u32, u64)>, i: u32, k: u64) -> Option<()> {
-    if out.len() == 96 { return None; }
+    if out.len() == 192 { return None; }
     out.push((i, k));
     Some(())
 }
@@ -220,11 +268,58 @@ fn projection(cx: &Context, i: u32, work: &mut Work) -> Option<Projection> {
     })
 }
 
+fn affine_key(cx: &Context, mut i: u32) -> (u32, u64) {
+    let w = cx.node(i).width;
+    if w == 0 || w > 64 {
+        return (i, 0);
+    }
+    let mask = u64::MAX >> (64 - w);
+    let mut off = 0u64;
+    for _ in 0..8 {
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Add => {
+                if let Some(c) = scalar(cx, n.b) {
+                    off = off.wrapping_add(c);
+                    i = n.a;
+                } else if let Some(c) = scalar(cx, n.a) {
+                    off = off.wrapping_add(c);
+                    i = n.b;
+                } else {
+                    break;
+                }
+            }
+            OpCode::Sub => {
+                if let Some(c) = scalar(cx, n.b) {
+                    off = off.wrapping_sub(c);
+                    i = n.a;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    (i, off & mask)
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum LaneKey {
+    Bit(u32, u64, u16),
+    Eq((u32, u64), (u32, u64)),
+}
+
+impl Default for LaneKey {
+    fn default() -> Self {
+        Self::Bit(0, 0, 0)
+    }
+}
+
 #[derive(Default)]
 struct Lane {
-    keys: [(u32, u16); 4],
+    keys: [LaneKey; 6],
     len: usize,
-    memo: crate::hash::IdMap<(u32, u16), u16>,
+    memo: crate::hash::IdMap<(u32, u16), u64>,
 }
 impl Lane {
     fn clear(&mut self) {
@@ -232,8 +327,20 @@ impl Lane {
         self.memo.clear();
     }
 
-    fn sym(&mut self, i: u32, j: u16) -> Option<u16> {
-        let key = (i, j);
+    fn sym(&mut self, cx: &Context, i: u32, j: u16) -> Option<u64> {
+        let n = cx.node(i);
+        let key = if j == 0 && n.op == OpCode::Eq {
+            let ka = affine_key(cx, n.a);
+            let kb = affine_key(cx, n.b);
+            if ka <= kb {
+                LaneKey::Eq(ka, kb)
+            } else {
+                LaneKey::Eq(kb, ka)
+            }
+        } else {
+            let (base, off) = affine_key(cx, i);
+            LaneKey::Bit(base, off, j)
+        };
         let at = match self.keys[..self.len].iter().position(|k| *k == key) {
             Some(at) => at,
             None => {
@@ -245,7 +352,7 @@ impl Lane {
         Some(VAR[at])
     }
 
-    fn bit(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u16> {
+    fn bit(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u64> {
         work.take(1)?;
         if let Some(&v) = self.memo.get(&(i, j)) {
             return Some(v);
@@ -255,7 +362,7 @@ impl Lane {
         Some(x)
     }
 
-    fn bit_uncached(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u16> {
+    fn bit_uncached(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u64> {
         let d = depth.checked_sub(1)?;
         let n = cx.node(i);
         let w = n.width;
@@ -279,7 +386,7 @@ impl Lane {
         let x = match n.op {
             OpCode::Const => {
                 if cx.const_val(i)?.bit(j)? {
-                    u16::MAX
+                    u64::MAX
                 } else {
                     0
                 }
@@ -295,12 +402,12 @@ impl Lane {
                         return Some(if set { !a } else { a });
                     }
                     if (n.op == OpCode::Or) == set {
-                        return Some(if set { u16::MAX } else { 0 });
+                        return Some(if set { u64::MAX } else { 0 });
                     }
                     return self.bit(cx, n.a, j, d, work);
                 }
                 let a = self.bit(cx, n.a, j, d, work)?;
-                if (n.op == OpCode::Or && a == u16::MAX) || (n.op == OpCode::And && a == 0) {
+                if (n.op == OpCode::Or && a == u64::MAX) || (n.op == OpCode::And && a == 0) {
                     return Some(a);
                 }
                 let b = self.bit(cx, n.b, j, d, work)?;
@@ -321,7 +428,7 @@ impl Lane {
                     } else {
                         (n.a, false)
                     };
-                    let c = self.sym(cond, 0)?;
+                    let c = self.sym(cx, cond, 0)?;
                     let c = if flip { !c } else { c };
                     (c & a) | (!c & b)
                 }
@@ -369,10 +476,13 @@ impl Lane {
                 } else if j == tz && k != 0 {
                     self.bit(cx, x, 0, d, work)?
                 } else {
-                    return self.sym(i, j);
+                    return self.sym(cx, i, j);
                 }
             }
-            _ => return self.sym(i, j),
+            OpCode::Mul if j == 0 => {
+                self.bit(cx, n.a, 0, d, work)? & self.bit(cx, n.b, 0, d, work)?
+            }
+            _ => return self.sym(cx, i, j),
         };
         Some(x)
     }
@@ -433,6 +543,294 @@ pub(super) fn constant_word(
     Ok(proved == Some(true))
 }
 
+/// Sound over-approximation of the bits that can be 1 in `i` (any 0 bit in the result is
+/// guaranteed to be 0 for all inputs).
+fn possible_ones(cx: &Context, i: u32, depth: u8) -> u64 {
+    let w = cx.node(i).width;
+    if w == 0 || w > 64 {
+        return u64::MAX;
+    }
+    let full = u64::MAX >> (64 - w);
+    if depth == 0 {
+        return full;
+    }
+    let n = cx.node(i);
+    let m = match n.op {
+        OpCode::Const => scalar(cx, i).unwrap_or(full),
+        OpCode::Zext => possible_ones(cx, n.a, depth - 1),
+        OpCode::Extract if cx.node(n.a).width <= 64 => {
+            let lo = n.b;
+            let src = possible_ones(cx, n.a, depth - 1);
+            if lo < 64 { (src >> lo) & full } else { 0 }
+        }
+        OpCode::And => possible_ones(cx, n.a, depth - 1) & possible_ones(cx, n.b, depth - 1),
+        OpCode::Or | OpCode::Xor => {
+            possible_ones(cx, n.a, depth - 1) | possible_ones(cx, n.b, depth - 1)
+        }
+        OpCode::Shl => match scalar(cx, n.b) {
+            Some(s) if s < 64 => (possible_ones(cx, n.a, depth - 1) << s) & full,
+            Some(_) => 0,
+            None => full,
+        },
+        OpCode::LShr => match scalar(cx, n.b) {
+            Some(s) if s < 64 => possible_ones(cx, n.a, depth - 1) >> s,
+            Some(_) => 0,
+            None => full,
+        },
+        OpCode::Add => {
+            let a = possible_ones(cx, n.a, depth - 1);
+            let b = possible_ones(cx, n.b, depth - 1);
+            if a & b == 0 {
+                a | b
+            } else {
+                let tz = a.trailing_zeros().min(b.trailing_zeros());
+                if tz >= 64 { 0 } else { full << tz }
+            }
+        }
+        OpCode::Sub => {
+            let a = possible_ones(cx, n.a, depth - 1);
+            let b = possible_ones(cx, n.b, depth - 1);
+            if let Some(c) = scalar(cx, n.a)
+                && b & !c == 0
+            {
+                c
+            } else {
+                let tz = a.trailing_zeros().min(b.trailing_zeros());
+                if tz >= 64 { 0 } else { full << tz }
+            }
+        }
+        OpCode::Neg => {
+            let tz = possible_ones(cx, n.a, depth - 1).trailing_zeros();
+            if tz >= 64 { 0 } else { full << tz }
+        }
+        OpCode::Mul => {
+            let tz = possible_ones(cx, n.a, depth - 1)
+                .trailing_zeros()
+                .saturating_add(possible_ones(cx, n.b, depth - 1).trailing_zeros());
+            if tz >= 64 { 0 } else { full << tz }
+        }
+        OpCode::Select => possible_ones(cx, n.b, depth - 1) | possible_ones(cx, n.c, depth - 1),
+        _ => full,
+    };
+    m & full
+}
+
+/// Upper bound on the active bit width of `i` (all bits at positions `>= ret` are guaranteed 0).
+fn active_bits(cx: &Context, i: u32, depth: u8) -> u16 {
+    let w = cx.node(i).width;
+    if w > 64 {
+        return w;
+    }
+    (64 - possible_ones(cx, i, depth).leading_zeros()) as u16
+}
+
+/// Distribute `Mul(Add/Sub(u, Const(c)), v)` when `Mul(u, v)` (or `Mul(v, u)`) also appears
+/// in `parts`, rewriting the factored product into `(existing_mul, ±k)` plus `terms_at(v, k * c)`
+/// so `cancel_parts` cancels the shared product term.
+fn distribute_matching_prods(
+    cx: &Context,
+    parts: &mut Vec<(u32, u64)>,
+    bias: &mut u64,
+    mod_bits: u16,
+    work: &mut Work,
+) -> Option<()> {
+    let mut existing: Vec<(u32, u32, u32)> = Vec::new();
+    for &(id, _) in parts.iter() {
+        let n = cx.node(id);
+        if n.op == OpCode::Mul {
+            let (lo, hi) = if n.a <= n.b { (n.a, n.b) } else { (n.b, n.a) };
+            existing.push((lo, hi, id));
+        }
+    }
+    if existing.is_empty() {
+        return Some(());
+    }
+    let split_affine = |x: u32| -> Option<(u32, bool, u64)> {
+        let n = cx.node(x);
+        match n.op {
+            OpCode::Add => {
+                if let Some(c) = scalar(cx, n.b) {
+                    Some((n.a, false, c))
+                } else {
+                    scalar(cx, n.a).map(|c| (n.b, false, c))
+                }
+            }
+            OpCode::Sub => {
+                if let Some(c) = scalar(cx, n.b) {
+                    Some((n.a, false, c.wrapping_neg()))
+                } else {
+                    scalar(cx, n.a).map(|c| (n.b, true, c))
+                }
+            }
+            _ => None,
+        }
+    };
+    let mut extra: Vec<(u32, u64)> = Vec::new();
+    for slot in parts.iter_mut() {
+        let (id, k) = *slot;
+        let n = cx.node(id);
+        if n.op != OpCode::Mul {
+            continue;
+        }
+        let mut matched = None;
+        for (lhs, rhs) in [(n.a, n.b), (n.b, n.a)] {
+            if let Some((u, neg_u, c)) = split_affine(lhs) {
+                let key = if u <= rhs { (u, rhs) } else { (rhs, u) };
+                if let Some(&(_, _, prod_id)) =
+                    existing.iter().find(|&&(a, b, pid)| (a, b) == key && pid != id)
+                {
+                    matched = Some((prod_id, neg_u, rhs, c));
+                    break;
+                }
+            }
+        }
+        if let Some((prod_id, neg_u, v, c)) = matched {
+            *slot = (prod_id, if neg_u { k.wrapping_neg() } else { k });
+            terms_at(cx, v, k.wrapping_mul(c), bias, &mut extra, 32, false, None, mod_bits, work)?;
+        }
+    }
+    for (id, k) in extra {
+        push_term(parts, id, k)?;
+    }
+    Some(())
+}
+
+/// If a plain linear term `(base, k)` in `parts` also appears inside a bitwise operand of
+/// `parts` shifted by a unique constant offset (`shifted = base + off`), rewrite `k * base`
+/// as `k * shifted - k * off`. This is exact in Z/2^W and lets `Lane` share one bit column
+/// for `shifted` instead of treating `base` and `base + off` as unrelated variables.
+fn rebase_shifted_terms(
+    cx: &Context,
+    parts: &mut [(u32, u64)],
+    bias: &mut u64,
+    width: u16,
+    work: &mut Work,
+) -> Option<()> {
+    let mut shifted: Vec<(u32, u64, u32)> = Vec::new();
+    let mut stack: Vec<(u32, u8)> = Vec::new();
+    for &(id, _) in parts.iter() {
+        if !matches!(cx.node(id).op, OpCode::Sym) {
+            stack.push((id, 6));
+        }
+    }
+    let mut visited = 0u32;
+    while let Some((i, depth)) = stack.pop() {
+        visited += 1;
+        if visited > 64 {
+            break;
+        }
+        work.take(1)?;
+        let n = cx.node(i);
+        if n.width == width && matches!(n.op, OpCode::Add | OpCode::Sub) {
+            let (base, off) = affine_key(cx, i);
+            if base != i && off != 0 && !shifted.iter().any(|&(b, o, _)| b == base && o == off) {
+                shifted.push((base, off, i));
+            }
+            continue;
+        }
+        if depth > 0
+            && matches!(
+                n.op,
+                OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not | OpCode::Select
+            )
+        {
+            for c in n.children() {
+                stack.push((c, depth - 1));
+            }
+        }
+    }
+    if shifted.is_empty() {
+        return Some(());
+    }
+    for slot in parts.iter_mut() {
+        let (t, k) = *slot;
+        let mut found = None;
+        let mut unique = true;
+        for &(base, off, node_id) in &shifted {
+            if base == t && found.replace((off, node_id)).is_some() {
+                unique = false;
+                break;
+            }
+        }
+        if unique && let Some((off, node_id)) = found {
+            *slot = (node_id, k);
+            *bias = bias.wrapping_sub(k.wrapping_mul(off));
+        }
+    }
+    Some(())
+}
+
+/// Compare two nodes jointly modulo `2^bits` by flattening their additive layers and checking
+/// each bit column independently. When both sides are guaranteed zero above `k < bits`, equality
+/// modulo `2^k` implies equality modulo `2^bits`, letting `terms_at` see through `zext`/`trunc`/
+/// low masks modulo `2^k`.
+pub(in crate::engine::pass) fn equal_lanes(
+    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32, bits: u16,
+) -> Result<bool, Stop> {
+    if bits == 0 {
+        return Ok(true);
+    }
+    let wa = cx.wid(a);
+    if wa != cx.wid(b) || wa > 64 || bits > wa {
+        return Ok(false);
+    }
+    let check_bits = bits.min(active_bits(cx, a, 8).max(active_bits(cx, b, 8)));
+    if check_bits == 0 {
+        return Ok(true);
+    }
+    let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 13);
+    let mut work = Work::new(budget);
+    let equal = (|| {
+        let mut cur_bits = check_bits;
+        let mut mask = u64::MAX >> (64 - cur_bits);
+        let mut parts = Vec::new();
+        let mut bias = 0;
+        terms_at(cx, a, 1, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work)?;
+        terms_at(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work)?;
+        distribute_matching_prods(cx, &mut parts, &mut bias, cur_bits, &mut work)?;
+        cancel_parts(&mut parts, mask, &mut work)?;
+        // After outer shared terms cancel, two surviving terms with active width `lo < cur_bits`
+        // can be decided modulo `2^lo` in two exact cases:
+        //   1. `p1 - p2 == 0` (since `0 <= p1, p2 < 2^lo`), or
+        //   2. `p1 + p2 == 2^lo - 1` (since `0 <= p1 + p2 <= 2^(lo+1) - 2`, the only residue
+        //      congruent to `2^lo - 1` mod `2^lo` in range is `2^lo - 1` itself).
+        if parts.len() == 2 && cur_bits > 1 {
+            let ((p1, k1), (p2, k2)) = (parts[0], parts[1]);
+            let lo = active_bits(cx, p1, 8).max(active_bits(cx, p2, 8));
+            if lo > 0 && lo < cur_bits {
+                let lo_mask = u64::MAX >> (64 - lo);
+                let k1m = k1 & mask;
+                let k2m = k2 & mask;
+                let eq_case = (k1m == 1 && k2m == mask) || (k1m == mask && k2m == 1);
+                let comp_case = (k1m == 1 && k2m == 1 && bias.wrapping_add(lo_mask) & mask == 0)
+                    || (k1m == mask && k2m == mask && bias.wrapping_sub(lo_mask) & mask == 0);
+                if (eq_case && bias & mask == 0) || comp_case {
+                    cur_bits = lo;
+                    mask = lo_mask;
+                    let mut narrow_parts = Vec::new();
+                    let mut narrow_bias = bias;
+                    terms_at(cx, p1, k1, &mut narrow_bias, &mut narrow_parts, 64, false, None, cur_bits, &mut work)?;
+                    terms_at(cx, p2, k2, &mut narrow_bias, &mut narrow_parts, 64, false, None, cur_bits, &mut work)?;
+                    cancel_parts(&mut narrow_parts, mask, &mut work)?;
+                    parts = narrow_parts;
+                    bias = narrow_bias;
+                }
+            }
+        }
+        rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
+        let value = match constant_lanes(cx, &parts, cur_bits, &mut work) {
+            Some(v) => v,
+            None if parts.iter().any(|&(_, k)| k != 0 && k.trailing_zeros() > 0) => {
+                constant_lanes_aligned(cx, &parts, cur_bits, &mut work)?
+            }
+            None => return None,
+        };
+        Some(bias.wrapping_add(value) & mask == 0)
+    })();
+    r.meter.charge(Counter::PassWork, budget - work.left)?;
+    Ok(equal == Some(true))
+}
+
 /// Compare two additive layers jointly modulo `2^bits`. The unrestricted words that occur
 /// on both sides cancel before tracing bits; the remaining weighted Boolean terms need at
 /// most four independent source bits per column, not four bits across the whole word.
@@ -447,20 +845,7 @@ pub(in crate::engine::pass) fn equal_sums(
     if wa != cx.wid(b) || wa > 64 || bits > wa || !(has_sum(a) || has_sum(b)) {
         return Ok(false);
     }
-    let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
-    let mut work = Work::new(budget);
-    let equal = (|| {
-        let mask = u64::MAX >> (64 - bits);
-        let mut parts = Vec::new();
-        let mut bias = 0;
-        terms(cx, a, 1, &mut bias, &mut parts, 64, false, &mut work)?;
-        terms(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, &mut work)?;
-        cancel_parts(&mut parts, mask, &mut work)?;
-        let value = constant_lanes(cx, &parts, bits, &mut work)?;
-        Some(bias.wrapping_add(value) & mask == 0)
-    })();
-    r.meter.charge(Counter::PassWork, budget - work.left)?;
-    Ok(equal == Some(true))
+    equal_lanes(r, cx, a, b, bits)
 }
 
 /// Truncation is a ring homomorphism: the outer weights can be applied to the
@@ -516,18 +901,63 @@ pub(in crate::engine::pass) fn truncated_constant(
 }
 
 fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work) -> Option<u64> {
+    constant_lanes_mode(cx, parts, bits, false, work)
+}
+
+fn constant_lanes_aligned(
+    cx: &Context,
+    parts: &[(u32, u64)],
+    bits: u16,
+    work: &mut Work,
+) -> Option<u64> {
+    constant_lanes_mode(cx, parts, bits, true, work)
+}
+
+fn constant_lanes_mode(
+    cx: &Context,
+    parts: &[(u32, u64)],
+    bits: u16,
+    align_tz: bool,
+    work: &mut Work,
+) -> Option<u64> {
     let mut sum = 0u64;
     let mask = u64::MAX >> (64 - bits);
     let mut lane = Lane::default();
+    let mut col_terms: Vec<(u64, u64)> = Vec::with_capacity(parts.len());
     for j in 0..bits {
         lane.clear();
-        let mut values = [0u64; 16];
+        col_terms.clear();
         for &(t, k) in parts {
-            let coeff = (k << j) & mask;
+            if k == 0 {
+                continue;
+            }
+            let b = if align_tz {
+                let tz = k.trailing_zeros() as u16;
+                if j < tz {
+                    continue;
+                }
+                j - tz
+            } else {
+                j
+            };
+            let coeff = (k << b) & mask;
             if coeff == 0 {
                 continue;
             }
-            let mut rows = lane.bit(cx, t, j, 64, work)?;
+            let rows = lane.bit(cx, t, b, 64, work)?;
+            if rows != 0 {
+                col_terms.push((rows, coeff));
+            }
+        }
+        let n_rows = 1usize << lane.len;
+        let row_mask = if n_rows == 64 {
+            u64::MAX
+        } else {
+            (1u64 << n_rows) - 1
+        };
+        let mut values = [0u64; 64];
+        for &(raw_rows, coeff) in &col_terms {
+            let mut rows = raw_rows & row_mask;
             work.take(u64::from(rows.count_ones()))?;
             while rows != 0 {
                 let at = rows.trailing_zeros() as usize;
@@ -538,7 +968,7 @@ fn constant_lanes(cx: &Context, parts: &[(u32, u64)], bits: u16, work: &mut Work
         // Equality for every assignment in this column is sufficient even when columns
         // share a source bit. We never assume inaccessible rows are the only ones needed.
         let v = values[0];
-        if values[1..1 << lane.len]
+        if values[1..n_rows]
             .iter()
             .any(|&other| (other ^ v) & mask != 0)
         {
@@ -674,7 +1104,7 @@ fn columns_at(
     let ones = u64::MAX >> (64 - w);
     let mut bias = 0u64;
     parts.clear();
-    terms_at(cx, x, 1, &mut bias, parts, 96, true, cut, work)?;
+    terms_at(cx, x, 1, &mut bias, parts, 96, true, cut, 64, work)?;
     if parts.len() < 3 {
         return None;
     }
@@ -1596,6 +2026,64 @@ mod tests {
                     assert_eq!((bit ^ (p.invert >> j)) & 1, (result >> j) & 1);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn equal_lanes_proves_masked_shifted_and_narrow_identities() {
+        let mut cx = Context::new();
+        let w = Width::W64;
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Shift-aligned cancellation (0007-style)
+            "let a = x & 0x3c7300; let b = (y & 1) << 2; let c = zext<64>(z + 3872 == w) << 6; \
+             (a | (b ^ 6) | c) - (a | c) + b == 6",
+            // Unshifted linear MBA with mixed trailing zeros (2*(x & y) - x - y + (x ^ y) == 0)
+            "2 * (x & y) + (x ^ y) == x + y",
+            // Factored product cancellation + affine rebasing (0x14048ca15-style)
+            "let a = x + 1720; let m = ~(y & 0x3001fffff267); let p = ~y & a; \
+             ((-1721 - x + (y & 0xffffcffe00000d98)) * 0x3001fffff0b8 + (z + 0x3001ffffef08) * p) \
+             == (m * -432 + (m & ~p) * 0x3001fffff268 + (a ^ y) * 0x3001fffff0b8 + p * z)",
+            // Post-cancellation 32-bit complement sum (0x14048ba44-style)
+            "w + zext<64>(trunc<32>(x * 0x8790180abab6084b) * 0x55d87e9d) - 1 \
+             == w + 0xfffffffe - (x + 0xffffffff & 0xffffffff)",
+            // 5-variable bitwise equality inside Lane (0x14048ba44__5add92da-style)
+            "let s = ~(a & b) & (~c | a); let r = rotl(s, 24); \
+             ~(d & r) & (~e | (s << 24) | (s >>u 40)) == ~e ^ (e ^ d) & r",
+        ] {
+            let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
+            let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(outcome, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_lanes_rejects_unsound_narrow_complement_and_shifts() {
+        let mut cx = Context::new();
+        let w = Width::W64;
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Sum of two 32-bit values equals 2^32 (not 2^32 - 1): wraps when x == 0
+            "zext<64>(trunc<32>(-x)) + (x & 0xffffffff) == 0x100000000",
+            // Off-by-one in shift-aligned sum
+            "let a = x & 0x3c7300; let b = (y & 1) << 2; (a | (b ^ 6)) - a + b == 7",
+            // Wrong affine offset in rebasing
+            "let a = x + 1720; (-1720 - x) + (a ^ y) == ~(a & ~y) + (a & y) - 1",
+            // High 64-bit extract of a 128-bit value is NOT zero (must not under-approximate wide extracts)
+            "extract<64, 64>(#0:128) == 0:64",
+            "extract<32, 64>(#0:128) == (extract<32, 64>(#0:128) & 0xffffffff)",
+        ] {
+            let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
+            let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(outcome, crate::prove::Outcome::Refuted(_)),
+                "expected Refuted for {text}, got {outcome:?}"
+            );
         }
     }
 }

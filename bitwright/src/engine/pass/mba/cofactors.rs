@@ -8,45 +8,238 @@ use crate::expr::{Context, Node, OpCode};
 use crate::hash::IdMap;
 use crate::{BinOp, Error};
 
-const MAX_TERMS: usize = 48;
+const MAX_TERMS: usize = 96;
+const MAX_CODE: usize = 512;
 const ATOMS: [u64; 6] = [
     0xaaaaaaaaaaaaaaaa, 0xcccccccccccccccc, 0xf0f0f0f0f0f0f0f0,
     0xff00ff00ff00ff00, 0xffff0000ffff0000, 0xffffffff00000000,
 ];
 
+/// Canonicalized affine form of a non-bitwise leaf (`bias + sum c_i * t_i` mod `2^w`),
+/// so that an expanded bitwise complement `-X - 1` shares `X`'s column as `~X`.
+struct AffineLeaf {
+    width: u16,
+    bias: u64,
+    parts: Vec<(u32, u64)>,
+    slot: u32,
+}
+
 #[derive(Default)]
 struct Table {
     code: Vec<Node>,
     places: IdMap<u32, u32>,
+    affines: Vec<AffineLeaf>,
     terms: Vec<(u32, u64)>,
     atoms: usize,
+    /// Per atom slot (`0..6`): exact known-zero bitmask (`1` where the atom is always 0).
+    atom_zeros: [u64; 6],
+    /// Per atom slot (`0..6`): exact known-one bitmask (`1` where the atom is always 1).
+    atom_ones: [u64; 6],
+}
+
+/// Cheap sound `(known_zeros, known_ones)` bitmasks for a node `i` (`<= 64` bits).
+fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
+    let n = cx.node(i);
+    let w = n.width;
+    if w == 0 || w > 64 {
+        return (0, 0);
+    }
+    let mask = u64::MAX >> (64 - w);
+    if depth == 0 {
+        return (0, 0);
+    }
+    let (z, o) = match n.op {
+        OpCode::Const => {
+            let v = cx.const_val(i).and_then(|k| k.to_u64()).unwrap_or(0) & mask;
+            ((!v) & mask, v)
+        }
+        OpCode::Shl => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w) => (mask, 0),
+            Some(s) => {
+                let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+                let low = (1u64 << s) - 1;
+                (((az << s) | low) & mask, (ao << s) & mask)
+            }
+            None => (0, 0),
+        },
+        OpCode::LShr => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w) => (mask, 0),
+            Some(s) => {
+                let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+                let hi = mask & !(mask >> s);
+                (((az >> s) | hi) & mask, (ao >> s) & mask)
+            }
+            None => (0, 0),
+        },
+        OpCode::And => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
+            ((az | bz) & mask, (ao & bo) & mask)
+        }
+        OpCode::Or => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
+            ((az & bz) & mask, (ao | bo) & mask)
+        }
+        OpCode::Xor => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
+            (((az & bz) | (ao & bo)) & mask, ((az & bo) | (ao & bz)) & mask)
+        }
+        OpCode::Not => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            (ao & mask, az & mask)
+        }
+        OpCode::Zext => {
+            let sw = cx.wid(n.a);
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let hi = if sw < 64 { mask & !((1u64 << sw) - 1) } else { 0 };
+            ((az | hi) & mask, ao & mask)
+        }
+        OpCode::Extract if cx.wid(n.a) <= 64 => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            ((az >> n.b) & mask, (ao >> n.b) & mask)
+        }
+        OpCode::Select => {
+            let (tz, to) = node_known_bits(cx, n.b, depth - 1);
+            let (fz, fo) = node_known_bits(cx, n.c, depth - 1);
+            ((tz & fz) & mask, (to & fo) & mask)
+        }
+        _ => (0, 0),
+    };
+    (z & mask, o & mask)
 }
 
 impl Table {
-    // Read just the bitwise DAG. A non-bitwise node is one free word, however
-    // many inputs it really has. Hash-consing gives all its occurrences one column.
-    fn place(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<u32> {
-        work.take(1)?;
-        if let Some(&p) = self.places.get(&i) { return Some(p); }
-        if depth == 0 || self.code.len() >= 256 { return None; }
+    fn push_node(&mut self, n: Node) -> Option<u32> {
+        if self.code.len() >= MAX_CODE { return None; }
+        let p = self.code.len() as u32;
+        self.code.push(n);
+        Some(p)
+    }
+
+    fn const_node(w: u16, k: u64) -> Node {
+        Node {
+            op: OpCode::Const,
+            width: w,
+            a: k as u32,
+            b: (k >> 32) as u32,
+            c: 0,
+            aux: 0,
+        }
+    }
+
+    fn place_atom(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<u32> {
         let mut n = cx.node(i);
-        match n.op {
-            OpCode::Const => (),
-            OpCode::Not => n.a = self.place(cx, n.a, depth - 1, work)?,
-            OpCode::And | OpCode::Or | OpCode::Xor => {
-                n.a = self.place(cx, n.a, depth - 1, work)?;
-                n.b = self.place(cx, n.b, depth - 1, work)?;
-            }
-            _ => {
+        let w = n.width;
+        // An expanded bitwise complement `-X - 1` (e.g. `a * -1 + b * (-C) - 1`) is `~X`:
+        // canonicalize small affine sums so `X` and `~X` share one atom column.
+        if w <= 64
+            && depth > 1
+            && matches!(n.op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul)
+        {
+            let mask = u64::MAX >> (64 - w);
+            let mut bias = 0u64;
+            let mut parts = Vec::new();
+            if terms(cx, i, 1, &mut bias, &mut parts, 16, false, work).is_some()
+                && parts.len() <= 16
+                && cancel_parts(&mut parts, mask, work).is_some()
+            {
+                let bias = bias & mask;
+                for (_, c) in &mut parts {
+                    *c &= mask;
+                }
+                if parts.is_empty() {
+                    return self.push_node(Self::const_node(w, bias));
+                }
+                if parts.len() == 1 && parts[0].1 == 1 && bias == 0 && parts[0].0 != i {
+                    return self.place(cx, parts[0].0, depth - 1, work);
+                }
+                if parts.len() == 1 && parts[0].1 == mask && bias == mask && parts[0].0 != i {
+                    let inner = self.place(cx, parts[0].0, depth - 1, work)?;
+                    return self.push_node(Node { op: OpCode::Not, width: w, a: inner, b: 0, c: 0, aux: 0 });
+                }
+                for leaf in &self.affines {
+                    if leaf.width != w || leaf.parts.len() != parts.len() {
+                        continue;
+                    }
+                    if leaf.bias == bias && leaf.parts == parts {
+                        return Some(leaf.slot);
+                    }
+                    if leaf.bias.wrapping_add(bias) & mask == mask
+                        && leaf.parts.iter().zip(&parts).all(|(&(a, ca), &(b, cb))| {
+                            a == b && ca.wrapping_add(cb) & mask == 0
+                        })
+                    {
+                        return self.push_node(Node {
+                            op: OpCode::Not,
+                            width: w,
+                            a: leaf.slot,
+                            b: 0,
+                            c: 0,
+                            aux: 0,
+                        });
+                    }
+                }
                 if self.atoms == ATOMS.len() { return None; }
+                let (az, ao) = node_known_bits(cx, i, 6);
+                self.atom_zeros[self.atoms] = az;
+                self.atom_ones[self.atoms] = ao;
                 n.op = OpCode::Sym;
                 n.a = self.atoms as u32;
                 self.atoms += 1;
+                let p = self.push_node(n)?;
+                self.affines.push(AffineLeaf { width: w, bias, parts, slot: p });
+                return Some(p);
             }
         }
-        if self.code.len() == 256 { return None; }
-        let p = self.code.len() as u32;
-        self.code.push(n);
+        if self.atoms == ATOMS.len() { return None; }
+        let (az, ao) = node_known_bits(cx, i, 6);
+        self.atom_zeros[self.atoms] = az;
+        self.atom_ones[self.atoms] = ao;
+        n.op = OpCode::Sym;
+        n.a = self.atoms as u32;
+        self.atoms += 1;
+        self.push_node(n)
+    }
+
+    // Read the bitwise DAG, maintaining the invariant that `place(i)` agrees with `i` on
+    // bits `0..wid(i)`. Truncation (`extract<0, w>`) preserves low bits and `zext` clears
+    // high bits with a constant mask, so mixed-width masked bitwise terms share atoms.
+    fn place(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<u32> {
+        work.take(1)?;
+        if let Some(&p) = self.places.get(&i) { return Some(p); }
+        if depth == 0 || self.code.len() >= MAX_CODE { return None; }
+        let mut n = cx.node(i);
+        let p = match n.op {
+            OpCode::Const => self.push_node(n)?,
+            OpCode::Not => {
+                n.a = self.place(cx, n.a, depth - 1, work)?;
+                self.push_node(n)?
+            }
+            OpCode::And | OpCode::Or | OpCode::Xor => {
+                n.a = self.place(cx, n.a, depth - 1, work)?;
+                n.b = self.place(cx, n.b, depth - 1, work)?;
+                self.push_node(n)?
+            }
+            OpCode::Extract if n.b == 0 && cx.wid(n.a) <= 64 => {
+                self.place(cx, n.a, depth - 1, work)?
+            }
+            OpCode::Zext if n.width <= 64 && cx.wid(n.a) < n.width => {
+                let sw = cx.wid(n.a);
+                let inner = self.place(cx, n.a, depth - 1, work)?;
+                let mask_node = self.push_node(Self::const_node(n.width, u64::MAX >> (64 - sw)))?;
+                self.push_node(Node {
+                    op: OpCode::And,
+                    width: n.width,
+                    a: inner,
+                    b: mask_node,
+                    c: 0,
+                    aux: 0,
+                })?
+            }
+            _ => self.place_atom(cx, i, depth, work)?,
+        };
         self.places.insert(i, p);
         Some(p)
     }
@@ -59,6 +252,7 @@ impl Table {
     fn constant(&mut self, cx: &Context, parts: &[(u32, u64)], w: u16, work: &mut Work) -> Option<u64> {
         self.code.clear();
         self.places.clear();
+        self.affines.clear();
         self.terms.clear();
         self.atoms = 0;
         for &(i, k) in parts {
@@ -70,7 +264,7 @@ impl Table {
         let mask = u64::MAX >> (64 - w);
         let mut remaining = mask;
         let mut result = 0u64;
-        let mut values = [0u64; 256];
+        let mut values = [0u64; MAX_CODE];
         while remaining != 0 {
             work.take(self.code.len() as u64)?;
             let j = remaining.trailing_zeros();
@@ -81,7 +275,21 @@ impl Table {
                         let k = u64::from(n.a) | (u64::from(n.b) << 32);
                         if k & (1 << j) == 0 { class &= !k; 0 } else { class &= k; all }
                     }
-                    OpCode::Sym => ATOMS[n.a as usize],
+                    OpCode::Sym => {
+                        let a = n.a as usize;
+                        let z = self.atom_zeros[a];
+                        let o = self.atom_ones[a];
+                        if z & (1 << j) != 0 {
+                            class &= z;
+                            0
+                        } else if o & (1 << j) != 0 {
+                            class &= o;
+                            all
+                        } else {
+                            class &= !(z | o);
+                            ATOMS[a]
+                        }
+                    }
                     OpCode::Not => !values[n.a as usize],
                     OpCode::And => values[n.a as usize] & values[n.b as usize],
                     OpCode::Or => values[n.a as usize] | values[n.b as usize],
@@ -130,6 +338,81 @@ pub(super) struct Sums {
     rest: Vec<(u32, u64)>,
     known: Vec<Kernel>,
     table: Table,
+}
+
+/// Split a single-variable affine factor `c1 * x + c2` (with constant `c2 != 0`)
+/// out of a product `(c1 * x + c2) * y` so the linear term `c1 * x * y` and the
+/// unmultiplied term `c2 * y` can each join their own cofactor groups.
+fn affine_factor(cx: &Context, id: u32, w: u16) -> Option<(u32, u64, u64)> {
+    let n = cx.node(id);
+    if !matches!(n.op, OpCode::Add | OpCode::Sub) || n.width != w {
+        return None;
+    }
+    let mask = u64::MAX >> (64 - w);
+    let (var, bias, sign) = match (cx.const_val(n.a), cx.const_val(n.b)) {
+        (None, Some(k)) => {
+            let c = k.to_u64()?;
+            (n.a, if n.op == OpCode::Add { c } else { c.wrapping_neg() } & mask, 1u64)
+        }
+        (Some(k), None) => {
+            let c = k.to_u64()? & mask;
+            (n.b, c, if n.op == OpCode::Add { 1u64 } else { mask })
+        }
+        _ => return None,
+    };
+    if bias == 0 {
+        return None;
+    }
+    let vn = cx.node(var);
+    let (base, scale) = match vn.op {
+        OpCode::Mul => match (cx.const_val(vn.a), cx.const_val(vn.b)) {
+            (None, Some(k)) => (vn.a, k.to_u64()?),
+            (Some(k), None) => (vn.b, k.to_u64()?),
+            _ => (var, 1),
+        },
+        OpCode::Shl if cx.const_val(vn.b).and_then(|v| v.to_u64()).is_some_and(|s| s < u64::from(w)) => {
+            (vn.a, 1u64 << cx.const_val(vn.b)?.to_u64()?)
+        }
+        OpCode::Neg => (vn.a, mask),
+        _ => (var, 1),
+    };
+    Some((base, scale.wrapping_mul(sign) & mask, bias))
+}
+
+/// Decompose a product node `t` (with outer coefficient `k`) into `(pair_of_factors, combined_scalar)`.
+/// Handles nested scalar multipliers, 2-factor products via `scaled_factors`, and 3+-factor
+/// products by stripping outer scalar factors to expose the immediate `(lhs, rhs)` pair.
+fn product_pair(cx: &Context, t: u32, k: u64, w: u16, work: &mut Work) -> Option<([u32; 2], u64)> {
+    if cx.node(t).op != OpCode::Mul {
+        return None;
+    }
+    work.take(32)?;
+    if let Some((v, fs)) = super::super::linear::scaled_factors(cx, t) {
+        let coeff = k.wrapping_mul(v.limbs()[0]);
+        if let &[a, b] = fs.as_slice() {
+            return Some(([a, b], coeff));
+        }
+    }
+    // Strip outer constant multiplications to find the top non-constant `a * b`.
+    let mut cur = t;
+    let mut coeff = k;
+    for _ in 0..8 {
+        let n = cx.node(cur);
+        if n.op != OpCode::Mul {
+            return None;
+        }
+        if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            coeff = coeff.wrapping_mul(c);
+            cur = n.a;
+        } else if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
+            coeff = coeff.wrapping_mul(c);
+            cur = n.b;
+        } else {
+            let mask = u64::MAX >> (64 - w);
+            return Some(([n.a, n.b], coeff & mask));
+        }
+    }
+    None
 }
 
 impl Sums {
@@ -184,6 +467,8 @@ impl Sums {
         {
             return Ok(None);
         }
+        // Canonicalize nested scalar-product pairs (e.g. `x * (x * C1) + x * (x * C2)`) and
+        // distribute affine-shifted factors `(c1 * x + c2) * y` when a product has an affine side.
         let raw_len = self.parts.len();
         if cancel_parts(&mut self.parts, mask, work).is_none() || self.parts.len() > MAX_TERMS {
             return Ok(None);
@@ -197,20 +482,85 @@ impl Sums {
         // Keep unrelated summands: they neither constrain a cofactor nor need to be bitwise.
         self.products.clear();
         for &(t, k) in &self.parts {
-            let p = if cx.node(t).op == OpCode::Mul {
-                if work.take(32).is_none() { return Ok(None); }
-                super::super::linear::scaled_factors(cx, t).and_then(|(v, fs)| match fs.as_slice() {
-                    &[a, b] => Some(([a, b], k.wrapping_mul(v.limbs()[0]))),
-                    _ => None,
-                })
-            } else { None };
+            let p = product_pair(cx, t, k, w, work);
             self.products.push(p);
         }
+        // Cancel identical factor pairs with opposite/combining scalars (e.g. `a * (b * C1) + a * (b * C2)`).
+        if self.products.iter().flatten().count() >= 2 {
+            for idx in 0..self.products.len() {
+                let Some((mut p1, mut c1)) = self.products[idx] else { continue };
+                if p1[0] > p1[1] { p1.swap(0, 1); }
+                let mut merged = false;
+                for j in (idx + 1)..self.products.len() {
+                    let Some((mut p2, c2)) = self.products[j] else { continue };
+                    if p2[0] > p2[1] { p2.swap(0, 1); }
+                    if p1 == p2 {
+                        c1 = c1.wrapping_add(c2) & mask;
+                        self.products[j] = None;
+                        self.parts[j].1 = 0;
+                        merged = true;
+                    }
+                }
+                if merged {
+                    changed = true;
+                    if c1 == 0 {
+                        self.products[idx] = None;
+                        self.parts[idx].1 = 0;
+                    } else {
+                        self.products[idx] = Some((p1, c1));
+                        // Rebuild canonical product coefficient only if needed on emit.
+                        let prod_id = cx.c_bin(BinOp::Mul, p1[0], p1[1])?;
+                        self.parts[idx] = (prod_id, c1);
+                    }
+                }
+            }
+        }
+        // If any product has an affine factor `(c1 * x + c2) * y` where `x` appears in another
+        // product or `y` is bitwise, expand it into `c1 * (x * y) + c2 * y` so `x` groups cleanly.
+        let has_affine_prod = self.products.iter().flatten().any(|&([a, b], _)| {
+            affine_factor(cx, a, w).is_some() || affine_factor(cx, b, w).is_some()
+        });
+        let saved_parts = if has_affine_prod { Some(self.parts.clone()) } else { None };
+        let mut expanded_any = false;
+        if has_affine_prod && self.parts.len() <= MAX_TERMS - 8 {
+            let mut extra_parts: Vec<(u32, u64)> = Vec::new();
+            let mut extra_prods: Vec<Option<([u32; 2], u64)>> = Vec::new();
+            for idx in 0..self.products.len() {
+                let Some(([a, b], coeff)) = self.products[idx] else { continue };
+                let split = if let Some((x, s, c)) = affine_factor(cx, a, w) {
+                    Some((x, s, c, b))
+                } else if let Some((x, s, c)) = affine_factor(cx, b, w) {
+                    Some((x, s, c, a))
+                } else {
+                    None
+                };
+                let Some((x, s, c, other)) = split else { continue };
+                if self.parts.len() + extra_parts.len() >= MAX_TERMS {
+                    break;
+                }
+                let lin_coeff = coeff.wrapping_mul(s) & mask;
+                let const_coeff = coeff.wrapping_mul(c) & mask;
+                let xy = cx.c_bin(BinOp::Mul, x, other)?;
+                self.parts[idx] = (xy, lin_coeff);
+                self.products[idx] = Some(([x, other], lin_coeff));
+                if const_coeff != 0 {
+                    extra_parts.push((other, const_coeff));
+                    extra_prods.push(None);
+                }
+                expanded_any = true;
+            }
+            if expanded_any {
+                self.parts.extend(extra_parts);
+                self.products.extend(extra_prods);
+            }
+        }
         self.scaled.clear();
-        for _ in 0..8 {
+        let mut tried: Vec<u32> = Vec::new();
+        for _ in 0..16 {
             let mut best = (0usize, 0u32);
             for &(pair, _) in self.products.iter().flatten() {
                 for f in pair {
+                    if tried.contains(&f) { continue; }
                     if work.take(self.products.len() as u64).is_none() { return Ok(None); }
                     let n = self.products.iter().flatten().filter(|(p, _)| p.contains(&f)).count();
                     if n > best.0 { best = (n, f); }
@@ -218,19 +568,39 @@ impl Sums {
             }
             if best.0 < 2 { break; }
             let f = best.1;
+            tried.push(f);
             self.group.clear();
             for &([a, b], k) in self.products.iter().flatten() {
                 if a == f || b == f { self.group.push((if a == f { b } else { a }, k)); }
             }
-            let Some(k) = self.value(cx, w, work) else { break };
+            if cancel_parts(&mut self.group, mask, work).is_none() { continue; }
+            let k = if self.group.is_empty() {
+                0
+            } else {
+                let Some(k) = self.value(cx, w, work) else { continue };
+                k
+            };
             for ((_, c), p) in self.parts.iter_mut().zip(&mut self.products) {
                 if p.is_some_and(|(pair, _)| pair.contains(&f)) {
                     *c = 0;
                     *p = None;
                 }
             }
-            self.scaled.push((f, k));
+            if k & mask != 0 {
+                self.scaled.push((f, k));
+            }
             changed = true;
+        }
+        // If affine expansion did not collapse any product group, restore the original
+        // unexpanded terms so we never return a larger distributed form.
+        if expanded_any && self.scaled.is_empty() && !changed {
+            if let Some(orig) = saved_parts {
+                self.parts = orig;
+            }
+        } else if expanded_any {
+            // Merge any non-product terms that now share a node ID (e.g. `other` from expansion
+            // matching an existing summand).
+            if cancel_parts(&mut self.parts, mask, work).is_none() { return Ok(None); }
         }
         // First check equal-magnitude groups through the normalized `Kernel` cache:
         // repeated sums with different scalars reuse one exact proof in O(terms).
@@ -277,8 +647,11 @@ impl Sums {
             }
         }
         if !changed { return Ok(None); }
+        self.parts.extend_from_slice(&self.scaled);
+        self.scaled.clear();
+        if cancel_parts(&mut self.parts, mask, work).is_none() { return Ok(None); }
         let mut out = cx.mk_const_u64(w, bias & mask)?;
-        for &(t, k) in self.parts.iter().chain(&self.scaled) {
+        for &(t, k) in &self.parts {
             if k & mask == 0 { continue; }
             let c = cx.mk_const_u64(w, k & mask)?;
             let term = cx.c_bin(BinOp::Mul, t, c)?;
@@ -334,23 +707,20 @@ impl Sums {
 }
 
 pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32]) -> Result<Option<u32>, Stop> {
-    if !(16..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
+    if !(16..=32768).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
     // When several product sums are present, simplify them together. Reducing
     // just a compared arm can leave other multiples of the same sum hidden
     // inside shifts and truncations (including the shift amount itself).
     let scan = order.len() as u64;
-    let budget = (r.meter.left_in(|b| b.pass_work) / 4).min(1 << 17);
+    let budget = (r.meter.left_in(|b| b.pass_work) / 4).min(1 << 18);
     if budget <= 4 * scan { return Ok(None); }
     r.meter.charge(Counter::PassWork, scan)?;
     let mut left = budget - scan;
-    if order.iter().any(|&i| {
-        let n = cx.node(i);
-        let prod = |id| {
-            let m = cx.node(id);
-            m.op == OpCode::Mul && !cx.is_const(m.a) && !cx.is_const(m.b)
-        };
-        matches!(n.op, OpCode::Add | OpCode::Sub) && prod(n.a) && prod(n.b)
-    }) {
+    let prod = |id| {
+        let m = cx.node(id);
+        m.op == OpCode::Mul && !cx.is_const(m.a) && !cx.is_const(m.b)
+    };
+    if order.iter().filter(|&&i| prod(i)).take(2).count() == 2 {
         r.meter.charge(Counter::PassWork, 3 * scan)?;
         left -= 3 * scan;
         let mut work = Work::new(left);
@@ -488,5 +858,41 @@ mod tests {
         // `s = -7`, so `~s = 6`, so `~s == 6` is true, leaving `z != 9`.
         let want = cx.parse("z:16 != 9", &ParseOptions::width(Width::W16)).unwrap();
         assert_eq!(out.roots[0].expr, want);
+    }
+
+    #[test]
+    fn collapses_expanded_complements_affine_factors_and_disjoint_shifts() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W16);
+        let mut sums = Sums::default();
+
+        // Expanded bitwise complement `x * (-C) - 1 == ~(x * C)` alongside affine-shifted
+        // factor `(f + 5)` and 3-factor products.
+        let src = "let %0 = x * 7; let %1 = x * 65529 - 1; \
+                   (f + 5) * (%0 | y) * 3 - (f + 5) * (%0 & y) * 3 + (f + 5) * ~(%1 ^ ~y) * 3";
+        let e = cx.parse(src, &opt).unwrap();
+        let want = cx.parse("f * 65533 + 65521", &opt).unwrap();
+        let eid = cx.id(e).unwrap();
+        let got = sums.collapse(&mut cx, eid, false, &mut Work::new(16384)).unwrap();
+        assert!(got.is_some());
+        let got_expr = cx.handle(got.unwrap());
+        for (xv, yv, fv) in [(0u64, 0u64, 0u64), (17, 42, 9), (0xffff, 0x1234, 0x7777)] {
+            let env = [
+                ("x".into(), crate::BitVec::from_u64(Width::W16, xv).unwrap()),
+                ("y".into(), crate::BitVec::from_u64(Width::W16, yv).unwrap()),
+                ("f".into(), crate::BitVec::from_u64(Width::W16, fv).unwrap()),
+            ];
+            let vals = cx.eval(&[got_expr, want], &env[..]).unwrap();
+            assert_eq!(vals[0], vals[1]);
+        }
+
+        // Known-zero disjoint shifted halves (`(x << 6) & (x >>u 10) == 0`) inside a cofactor.
+        let disjoint = "let %0 = x << 6; let %1 = x >>u 10; \
+                        f * (%0 | %1) * 5 - f * (%0 ^ %1) * 5 + g";
+        let e2 = cx.parse(disjoint, &opt).unwrap();
+        let want2 = cx.parse("g", &opt).unwrap();
+        let e2id = cx.id(e2).unwrap();
+        let got2 = sums.collapse(&mut cx, e2id, false, &mut Work::new(16384)).unwrap();
+        assert_eq!(got2, Some(cx.id(want2).unwrap()));
     }
 }

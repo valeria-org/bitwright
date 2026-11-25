@@ -1170,8 +1170,26 @@ impl Question {
         if cfg.simplify && !cfg.certificate {
             let mut allowance = crate::engine::Allowance::new(cfg.simplify_budget);
             let engine = (env.simplifiers).engine(cfg.strict, cfg.proved_words);
+            let first_budget = if !cons.is_empty() && cfg.simplify_budget.node_visits >= 65536 {
+                let b = cfg.simplify_budget;
+                crate::engine::Budget {
+                    node_visits: (b.node_visits / 2).max(1),
+                    candidates: (b.candidates / 2).max(1),
+                    match_steps: (b.match_steps / 2).max(1),
+                    rewrites: (b.rewrites / 2).max(1),
+                    new_nodes: (b.new_nodes / 2).max(1),
+                    fact_work: (b.fact_work / 2).max(1),
+                    pass_work: (b.pass_work / 2).max(1),
+                    mba_calls: (b.mba_calls / 2).max(1),
+                    mba_steps: (b.mba_steps / 2).max(1),
+                    eqsat_nodes: (b.eqsat_nodes / 2).max(1),
+                    eqsat_work: (b.eqsat_work / 2).max(1),
+                }
+            } else {
+                cfg.simplify_budget
+            };
             let run = crate::engine::Run::default()
-                .with_per_call(cfg.simplify_budget)
+                .with_per_call(first_budget)
                 .with_allowance(&mut allowance);
             let run = match assumptions {
                 Some(a) => run.with_assumptions(a),
@@ -1185,13 +1203,54 @@ impl Question {
             let mut out = engine.run(cx, &[goal], run)?.roots[0];
             let mut s = cx.id(out.expr)?;
             let mut proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+            // When MBA solver calls/steps stop round 0 early while the cheap algebraic passes
+            // still have budget, give `s` follow-up pass(es) within the same allowance so
+            // sweep/linear/compares/poly/linear_mba can finish simplifying what was exposed.
+            if !proved
+                && s != goal_node
+                && matches!(
+                    out.end,
+                    crate::engine::End::BudgetTerminated(
+                        crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
+                    )
+                )
+            {
+                for _ in 0..2 {
+                    let prev = s;
+                    let run = crate::engine::Run::default()
+                        .with_per_call(cfg.simplify_budget)
+                        .with_allowance(&mut allowance);
+                    let run = match env.deadline {
+                        Some(d) => run.with_deadline(d),
+                        None => run,
+                    };
+                    let run = match assumptions {
+                        Some(a) => run.with_assumptions(a),
+                        None => run,
+                    };
+                    let next = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
+                    s = cx.id(next.expr)?;
+                    if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
+                        proved = true;
+                        out = next;
+                        break;
+                    }
+                    if s == prev {
+                        break;
+                    }
+                }
+            }
             // When assumptions are present and simplifying the goal alone did not decide it,
             // simplify the joint counterexample `!goal & c1 & c2 & ...` within the remaining
             // allowance so guard/field specialization and cross-conjunct MBA cancellation see
             // both the goal and its assumptions together.
             if !proved
                 && !cons.is_empty()
-                && out.end == crate::engine::End::Completed
+                && !matches!(
+                    out.end,
+                    crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
+                        | crate::engine::End::Declined(_)
+                )
             {
                 let mut bad = cx.c_un(crate::UnOp::Not, s)?;
                 for &c in &cons {
@@ -1211,7 +1270,9 @@ impl Question {
                     s = cx.mk_const_u64(1, 1)?;
                     out = joint;
                 } else {
-                    if joint.end != crate::engine::End::Completed {
+                    if out.end == crate::engine::End::Completed
+                        && joint.end != crate::engine::End::Completed
+                    {
                         out.end = joint.end;
                     }
                     // Keep separate `cons` as unit assertions when they fit the circuit cap,
@@ -1226,7 +1287,14 @@ impl Question {
             // together. Only when both sides are non-leaf operations.
             if !proved
                 && cons.is_empty()
-                && out.end == crate::engine::End::Completed
+                && matches!(
+                    out.end,
+                    crate::engine::End::Completed
+                        | crate::engine::End::BudgetTerminated(
+                            crate::engine::Exhausted::MbaSteps
+                                | crate::engine::Exhausted::MbaCalls
+                        )
+                )
                 && cx.node(s).op == OpCode::Eq
             {
                 let eq = cx.node(s);
@@ -1253,7 +1321,9 @@ impl Question {
                             s = cx.mk_const_u64(1, 0)?;
                         }
                     } else if res.end != crate::engine::End::Completed {
-                        out.end = res.end;
+                        if out.end == crate::engine::End::Completed {
+                            out.end = res.end;
+                        }
                     } else if matches!(
                         cx.dag_size(&[cx.handle(s)], 256)?,
                         crate::expr::Bounded::Exact(_)
@@ -1409,6 +1479,8 @@ impl Question {
                 return decided(q, Outcome::Proved(None));
             }
         }
+        let mut use_cons = true;
+        let mut tried_asked = false;
         let (mut b, goal, extra) = loop {
             let constant_goal = cuts::constant_true(cx, goal_node);
             let mut b = Blaster::new(cx, cfg.max_nodes);
@@ -1422,21 +1494,29 @@ impl Question {
             let mut blasted = || -> Result<(L, Vec<L>), Error> {
                 let goal = b.blast(goal_node)?[0];
                 let mut extra = Vec::new();
-                for &c in &cons {
-                    extra.push(b.blast(c)?[0]);
+                if use_cons {
+                    for &c in &cons {
+                        extra.push(b.blast(c)?[0]);
+                    }
                 }
                 Ok((goal, extra))
             };
             match blasted() {
                 Ok((goal, extra)) if b.g.len() <= cfg.max_nodes => break (b, goal, extra),
+                // (Written again by shared_sums the circuit is too large: try the question as
+                // asked with its original constraints before falling back to the joint form.)
+                _ if goal_node != asked && !tried_asked && use_cons => {
+                    goal_node = asked;
+                    tried_asked = true;
+                }
                 // If raw assumptions pushed the circuit past `max_nodes`, try the simplified
-                // joint implication instead of failing with `TooLarge`.
+                // joint implication instead of failing with `TooLarge`. Never fall back from
+                // the joint form to `asked` with dropped constraints.
                 _ if joint_fallback.is_some() => {
                     goal_node = joint_fallback.take().unwrap();
-                    cons.clear();
+                    use_cons = false;
+                    tried_asked = true;
                 }
-                // (Written again the circuit is too large: the question as asked, then.)
-                _ if goal_node != asked => goal_node = asked,
                 Ok(_) => {
                     let why = Unknown::TooLarge { nodes: b.g.len() };
                     return decided(q, Outcome::Unknown(why));

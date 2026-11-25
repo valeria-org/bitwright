@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.32.15
+
+- Added exact 128-bit bit-table carry-tree equality reduction (`mba::bit_table`)
+  for selector-table sums (including pushed-complement carries and 2-case carry
+  splitting for `zext<64>(y:32) + K64`), wired into `mba::sweep` and `compares`.
+- Extended `mba::cofactors` and `linear_mba` to handle expanded complement sums,
+  `zext`/`extract(0, _)` cofactors, per-atom known-bit class partitioning,
+  multi-candidate 3+-factor products, affine factor distribution, and disjoint
+  shifted linear atoms.
+- Added modulus-aware `opaque_predicate::equal_lanes` with 6-variable (`u64`)
+  truth tables, LSB product tracing, affine/`Eq` atom canonicalization, factored
+  product cancellation, shifted-term rebasing, post-cancellation narrow equality
+  and complement-sum reduction, and unshifted/shift-aligned column fallback; wired
+  `equal_lanes` and `poly::equal` into `mba::related` and cross-round sweep checks.
+- Extended `poly::equal` into `poly::equal_mod` with `~x == -x - 1`,
+  `x | c == (x & ~c) + c`, disjoint/subsumed `Or`, `rotl`/`rotr` decomposition,
+  and nested narrow polynomial canonicalization; extended `compares::peel_congruence`
+  to peel shared `Add`/`Sub` summands and dispatch `poly::equal_mod` and 1-bit
+  `equal_lanes`.
+- Improved `bitwright::prove` budget utilization (half-budget split for assumption
+  queries, follow-up algebraic passes after early `MbaSteps`/`MbaCalls` stop, and
+  shrinking context pushes before MBA phases) and fixed a blast fallback bug where
+  falling back from `joint_fallback` to `asked` could drop assumptions.
+
 ## 0.32.14
 
 - The bitwise pass folds atoms with known-zero or known-one bit classes directly

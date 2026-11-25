@@ -2985,6 +2985,14 @@ impl Runner<'_, '_> {
                 Ok(None) | Err(Stop::Exhausted(_)) => {}
                 Err(stop) => return Err((cur, fin, stop)),
             }
+        } else if inner
+            .phases
+            .iter()
+            .any(|p| matches!(p, PhaseImpl::Mba(c) if c.opaque_sweep))
+        {
+            cur = self
+                .push_shrinking_context(cx, cur)
+                .map_err(|stop| (cur, fin, stop))?;
         }
         let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
         if swept != cur {
@@ -3117,6 +3125,37 @@ impl Runner<'_, '_> {
             a.constraints()
                 .fold(Reliance::NONE, |r, (id, _, _)| r | Reliance::of(id))
         })
+    }
+
+    /// Specializes guarded branches (`select`, 1-bit `and`, `zext(c) * t`) via
+    /// [`pass::push_context`], committing only when the DAG strictly shrinks.
+    #[cfg(feature = "mba")]
+    fn push_shrinking_context(&mut self, cx: &mut Context, cur: u32) -> Result<u32, Stop> {
+        let own = match cx.dag_size(&[cx.handle(cur)], 1 << 16) {
+            Ok(crate::expr::Bounded::Exact(n)) if n > 1 => n,
+            _ => return Ok(cur),
+        };
+        let before = cx.len() as u32;
+        match pass::push_context(self, cx, cur, own) {
+            Ok(Some(p)) if p != cur => {
+                let shrunk = matches!(
+                    cx.dag_size(&[cx.handle(p)], own - 1).map_err(Stop::Error)?,
+                    crate::expr::Bounded::Exact(_)
+                );
+                if shrunk {
+                    self.emit_stage(cx, Stage::Context, cur, p);
+                    Ok(p)
+                } else {
+                    pass::discard(self, cx, before);
+                    Ok(cur)
+                }
+            }
+            Ok(_) | Err(Stop::Exhausted(_)) => {
+                pass::discard(self, cx, before);
+                Ok(cur)
+            }
+            Err(stop) => Err(stop),
+        }
     }
 
     /// `cur` after the opaque-constant sweep (see `pass::mba::sweep`), where the MBA phase asks
@@ -3303,6 +3342,16 @@ impl Runner<'_, '_> {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             self.held = false;
             if round > 0 && !again {
+                #[cfg(feature = "mba")]
+                if inner
+                    .phases
+                    .iter()
+                    .any(|p| matches!(p, PhaseImpl::Mba(c) if c.opaque_sweep || c.noise_forms))
+                {
+                    cur = self
+                        .push_shrinking_context(cx, cur)
+                        .map_err(|stop| (cur, fin, stop))?;
+                }
                 let swept = self.sweep(cx, cur).map_err(|stop| (cur, fin, stop))?;
                 if swept != cur {
                     fin = fin.and(Fin::relying(self.assumed()));
@@ -3312,6 +3361,24 @@ impl Runner<'_, '_> {
             }
             let (start, before) = (cur, fin);
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
+                #[cfg(feature = "mba")]
+                if !again
+                    && (round == 0 || cur != start)
+                    && matches!(
+                        inner.phases[phase],
+                        PhaseImpl::Mba(ref c) if c.opaque_sweep || c.noise_forms
+                    )
+                {
+                    let shrunk = self
+                        .push_shrinking_context(cx, cur)
+                        .map_err(|stop| (cur, fin, stop))?;
+                    if shrunk != cur {
+                        cur = shrunk;
+                        // Newly exposed constants/branches should be folded by the cheap
+                        // passes on the next round before spending MBA solver steps.
+                        break;
+                    }
+                }
                 let spent0 = self.meter.spent;
                 self.settled = cur == start;
                 self.phase_name = p.name();

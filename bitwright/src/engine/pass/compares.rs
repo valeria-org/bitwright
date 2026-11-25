@@ -39,7 +39,7 @@ use crate::{BitVec, Width};
 const MAX_INTERVALS: usize = 8;
 
 /// The longest chain of terms `peel` follows.
-const MAX_PEEL: usize = 6;
+const MAX_PEEL: usize = 10;
 
 // ----- relation sets ------------------------------------------------------------------------------
 
@@ -1290,10 +1290,32 @@ fn peel_congruence(cx: &Context, mut a: u32, mut b: u32) -> (u32, u32, u16) {
             break;
         }
         let (x, y) = (cx.node(a), cx.node(b));
-        if x.width != y.width || x.op != y.op || matches!(x.op, OpCode::Add | OpCode::Sub) {
+        if x.width != y.width || x.op != y.op {
             break;
         }
         match x.op {
+            OpCode::Add => {
+                if x.a == y.a {
+                    (a, b) = (x.b, y.b);
+                } else if x.b == y.b {
+                    (a, b) = (x.a, y.a);
+                } else if x.a == y.b {
+                    (a, b) = (x.b, y.a);
+                } else if x.b == y.a {
+                    (a, b) = (x.a, y.b);
+                } else {
+                    break;
+                }
+            }
+            OpCode::Sub => {
+                if x.a == y.a {
+                    (a, b) = (x.b, y.b);
+                } else if x.b == y.b {
+                    (a, b) = (x.a, y.a);
+                } else {
+                    break;
+                }
+            }
             OpCode::Not | OpCode::Neg => (a, b) = (x.a, y.a),
             OpCode::Zext | OpCode::Sext => {
                 let wa = cx.wid(x.a);
@@ -1521,26 +1543,54 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 let (pa, pb, bits) = peel_congruence(cx, node.a, node.b);
                 let mut fin = Fin::FINAL;
                 let mut proved = pa == pb || bits == 0;
-                if !proved && (pa != node.a || pb != node.b) && bits == cx.wid(pa) && bits > 1 {
-                    proved = super::poly::equal(r, cx, pa, pb)?;
-                    if !proved
-                        && let (Some(true), f) = super::bitwise::equal(r, cx, pa, pb)?
-                    {
-                        proved = true;
-                        fin = f;
-                    }
-                    if !proved {
-                        proved = super::linear_mba::equal(r, cx, pa, pb)?;
+                if !proved && (pa != node.a || pb != node.b) && bits > 1 {
+                    proved = super::poly::equal_mod(r, cx, pa, pb, bits)?;
+                    if !proved && bits == cx.wid(pa) {
+                        if let (Some(true), f) = super::bitwise::equal(r, cx, pa, pb)? {
+                            proved = true;
+                            fin = f;
+                        }
+                        if !proved {
+                            proved = super::linear_mba::equal(r, cx, pa, pb)?;
+                        }
                     }
                 }
                 #[cfg(feature = "mba")]
                 if !proved {
-                    proved = super::mba::equal_sums(r, cx, pa, pb, bits)?;
+                    if bits == 1 {
+                        proved = super::mba::equal_lanes(r, cx, pa, pb, 1)?;
+                    } else {
+                        proved = super::mba::equal_sums(r, cx, pa, pb, bits)?;
+                    }
                 }
                 if proved {
                     let before = cx.len() as u32;
                     let c = bool_const(r, cx, node.op == OpCode::Eq)?;
                     return finish(r, cx, PassKind::Compares, n, c, before, &[], fin);
+                }
+            }
+            #[cfg(feature = "mba")]
+            if matches!(node.op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
+                && cx.wid(n) == 1
+            {
+                let before = cx.len() as u32;
+                if let Some(e) = super::mba::bit_table_reduce(r, cx, n)?
+                    && e != n
+                {
+                    let mut stops = Vec::new();
+                    let mut seen = crate::hash::IdMap::default();
+                    let mut todo = vec![e];
+                    while let Some(i) = todo.pop() {
+                        if seen.insert(i, ()).is_some() {
+                            continue;
+                        }
+                        if i < before {
+                            stops.push(i);
+                        } else {
+                            todo.extend(cx.node(i).children());
+                        }
+                    }
+                    return finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL);
                 }
             }
             if let Some(b) = residue_decide(r, cx, n)? {
