@@ -172,9 +172,12 @@ impl<'x, 'r, 'a> Gate<'x, 'r, 'a> {
     fn new(r: &'x mut Runner<'r, 'a>, a: &MbaExpr, b: &MbaExpr, part: u64) -> Self {
         let limit = r.meter.limit.pass_work;
         let direct = certify::direct_cost(a, b).unwrap_or(0).saturating_mul(2);
-        let mut share = (limit / part).max(GATE_SHARE_MIN / (part / GATE_SHARE));
-        if r.mba.missed >= GATE_MISSED {
-            share = share.min(GATE_MISSED_SHARE);
+        let floor = (GATE_SHARE_MIN / (part / GATE_SHARE)).min(limit / part);
+        let mut share = (limit / part).max(floor).max(1);
+        let missed_cap = GATE_MISSED.min(limit / 4);
+        let missed_share = GATE_MISSED_SHARE.min(limit / 8).max(1);
+        if r.mba.missed >= missed_cap {
+            share = share.min(missed_share);
         }
         Gate {
             r,
@@ -638,13 +641,18 @@ fn sweep_inner(
                         continue;
                     }
                     let rep = to.get(&rep).copied().unwrap_or(rep);
-                    if let Related::Proved(e) =
-                        asked!('nodes, related(r, cx, cfg, i, rep, relation, &d))
-                    {
-                        r.emit_part(cx, crate::engine::Stage::Sweep, i, e);
-                        to.insert(i, e);
-                        r.mba.swept.insert(i, e);
-                        continue 'nodes;
+                    match asked!('nodes, related_cheap(r, cx, i, rep, relation, &d)) {
+                        Related::Proved(e) => {
+                            r.emit_part(cx, crate::engine::Stage::Sweep, i, e);
+                            to.insert(i, e);
+                            r.mba.swept.insert(i, e);
+                            continue 'nodes;
+                        }
+                        Related::Written => {}
+                        Related::Open => {
+                            unrelated += 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -1026,6 +1034,61 @@ enum Related {
 /// `d − rep` or `rep ^ d` for a node `rep` met before it, is asked about as an opaque constant
 /// is (the difference of the two, whether it is zero), and written that way once proved. The
 /// sums above then read one atom, and the linear passes collect its terms.
+/// Cheap exact algebraic portion of [`related`]: constant folding, lane cancellation, and
+/// polynomial equality without demanded-bit splitting or heavy certificate searches.
+fn related_cheap(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cur: u32,
+    rep: u32,
+    relation: Relation,
+    d: &crate::BitVec,
+) -> Result<Related, Stop> {
+    let node = cx.node(cur);
+    if cur == rep
+        || (node.children().any(|c| c == rep)
+            && node
+                .children()
+                .all(|c| c == rep || cx.const_val(c).is_some()))
+    {
+        return Ok(Related::Written);
+    }
+    let zero = crate::BitVec::zero(d.width());
+    let e = r.build(cx, |cx| {
+        let k = cx.mk_const(d)?;
+        match relation {
+            Relation::Sum if d.is_zero() => Ok(rep),
+            Relation::Sum => cx.c_bin(BinOp::Add, rep, k),
+            Relation::Difference if d.is_zero() => cx.c_un(UnOp::Neg, rep),
+            Relation::Difference if d.is_ones() => cx.c_un(UnOp::Not, rep),
+            Relation::Difference => cx.c_bin(BinOp::Sub, k, rep),
+            Relation::Xor => cx.c_bin(BinOp::Xor, rep, k),
+        }
+    })?;
+    if e == cur {
+        return Ok(Related::Written);
+    }
+    let op = match relation {
+        Relation::Xor => BinOp::Xor,
+        _ => BinOp::Sub,
+    };
+    let diff = r.build(cx, |cx| cx.c_bin(op, cur, e))?;
+    if let Some(v) = cx.const_val(diff) {
+        return Ok(if v.is_zero() { Related::Proved(e) } else { Related::Open });
+    }
+    if witnessed(r, cx, diff, &zero)? {
+        return Ok(Related::Open);
+    }
+    if opaque_predicate::equal_lanes(r, cx, cur, e, cx.wid(cur))?
+        || super::poly::equal(r, cx, cur, e)?
+        || super::linear_mba::equal_bounded(r, cx, cur, e, 6)?
+    {
+        count(r).opaque_proved += 1;
+        return Ok(Related::Proved(e));
+    }
+    Ok(Related::Open)
+}
+
 fn related(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1080,6 +1143,7 @@ fn related(
     // congruences, and rotated/shifted slices in microseconds) and polynomial expansion.
     if opaque_predicate::equal_lanes(r, cx, cur, e, cx.wid(cur))?
         || super::poly::equal(r, cx, cur, e)?
+        || super::linear_mba::equal_bounded(r, cx, cur, e, 6)?
     {
         count(r).opaque_proved += 1;
         return Ok(Related::Proved(e));

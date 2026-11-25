@@ -391,6 +391,41 @@ impl Lane {
                     0
                 }
             }
+            // Adding or subtracting a constant `c` has zero carry into every bit `j <= tz(c)`:
+            // bits below `tz(c)` pass through unchanged, and bit `tz(c)` flips.
+            OpCode::Add if scalar(cx, n.b).is_some() || scalar(cx, n.a).is_some() => {
+                let (other, c) = match scalar(cx, n.b) {
+                    Some(c) => (n.a, c),
+                    None => (n.b, scalar(cx, n.a)?),
+                };
+                if c == 0 {
+                    self.bit(cx, other, j, d, work)?
+                } else {
+                    let tz = c.trailing_zeros() as u16;
+                    if j < tz {
+                        self.bit(cx, other, j, d, work)?
+                    } else if j == tz {
+                        !self.bit(cx, other, j, d, work)?
+                    } else {
+                        self.sym(cx, i, j)?
+                    }
+                }
+            }
+            OpCode::Sub if scalar(cx, n.b).is_some() => {
+                let c = scalar(cx, n.b)?;
+                if c == 0 {
+                    self.bit(cx, n.a, j, d, work)?
+                } else {
+                    let tz = c.trailing_zeros() as u16;
+                    if j < tz {
+                        self.bit(cx, n.a, j, d, work)?
+                    } else if j == tz {
+                        !self.bit(cx, n.a, j, d, work)?
+                    } else {
+                        self.sym(cx, i, j)?
+                    }
+                }
+            }
             OpCode::Not => !self.bit(cx, n.a, j, d, work)?,
             OpCode::And | OpCode::Or | OpCode::Xor => {
                 // The constructors put constant masks on the right. A masked-out bit
@@ -417,20 +452,53 @@ impl Lane {
                     _ => a ^ b,
                 }
             }
-            OpCode::Select if scalar(cx, n.b).is_some() || scalar(cx, n.c).is_some() => {
-                let a = self.bit(cx, n.b, j, d, work)?;
-                let b = self.bit(cx, n.c, j, d, work)?;
-                if a == b {
-                    a
-                } else {
-                    let (cond, flip) = if cx.node(n.a).op == OpCode::Not {
-                        (cx.node(n.a).a, true)
+            OpCode::Select => {
+                let const_arm = scalar(cx, n.b).is_some() || scalar(cx, n.c).is_some();
+                if const_arm {
+                    let a = self.bit(cx, n.b, j, d, work)?;
+                    let b = self.bit(cx, n.c, j, d, work)?;
+                    if a == b {
+                        a
                     } else {
-                        (n.a, false)
-                    };
-                    let c = self.sym(cx, cond, 0)?;
-                    let c = if flip { !c } else { c };
-                    (c & a) | (!c & b)
+                        let (cond, flip) = if cx.node(n.a).op == OpCode::Not {
+                            (cx.node(n.a).a, true)
+                        } else {
+                            (n.a, false)
+                        };
+                        let c = self.sym(cx, cond, 0)?;
+                        let c = if flip { !c } else { c };
+                        (c & a) | (!c & b)
+                    }
+                } else {
+                    // For non-constant `select` arms, try a shallow bit-trace on a saved
+                    // snapshot of `self.vars`; if the arms pull in too many variables or
+                    // run out of shallow depth, fall back to treating `select` as one atom
+                    // instead of aborting the whole lane proof.
+                    let (saved_keys, saved_len) = (self.keys, self.len);
+                    let sub_d = d.min(4);
+                    let traced = (|| -> Option<u64> {
+                        let a = self.bit(cx, n.b, j, sub_d, work)?;
+                        let b = self.bit(cx, n.c, j, sub_d, work)?;
+                        if a == b {
+                            return Some(a);
+                        }
+                        let (cond, flip) = if cx.node(n.a).op == OpCode::Not {
+                            (cx.node(n.a).a, true)
+                        } else {
+                            (n.a, false)
+                        };
+                        let c = self.sym(cx, cond, 0)?;
+                        let c = if flip { !c } else { c };
+                        Some((c & a) | (!c & b))
+                    })();
+                    match traced {
+                        Some(v) => v,
+                        None => {
+                            self.keys = saved_keys;
+                            self.len = saved_len;
+                            self.sym(cx, i, j)?
+                        }
+                    }
                 }
             }
             OpCode::Zext | OpCode::Sext => {
@@ -692,6 +760,93 @@ fn distribute_matching_prods(
     for (id, k) in extra {
         push_term(parts, id, k)?;
     }
+    // Also collapse groups of products `k_i * (A_i * v)` sharing a common factor `v` when
+    // `Σ k_i * A_i` reduces to a constant `c` via `constant_lanes`, replacing the group with `c * v`.
+    let mask = if mod_bits >= 64 {
+        u64::MAX
+    } else if mod_bits == 0 {
+        0
+    } else {
+        (1u64 << mod_bits) - 1
+    };
+    let mut prod_factors: Vec<(usize, u32, u32)> = Vec::new();
+    for (idx, &(id, k)) in parts.iter().enumerate() {
+        if k & mask == 0 {
+            continue;
+        }
+        let n = cx.node(id);
+        if n.op == OpCode::Mul {
+            prod_factors.push((idx, n.a, n.b));
+        }
+    }
+    if prod_factors.len() >= 2 {
+        let mut seen_v: Vec<u32> = Vec::new();
+        let mut extra_v: Vec<(u32, u64)> = Vec::new();
+        for &(_, fa, fb) in &prod_factors {
+            for v in [fa, fb] {
+                if seen_v.contains(&v) {
+                    continue;
+                }
+                seen_v.push(v);
+                let members: Vec<(usize, u32)> = prod_factors
+                    .iter()
+                    .filter_map(|&(idx, a, b)| {
+                        if parts[idx].1 & mask == 0 {
+                            return None;
+                        }
+                        if a == v {
+                            Some((idx, b))
+                        } else if b == v {
+                            Some((idx, a))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if members.len() < 2 {
+                    continue;
+                }
+                let mut cbias = 0u64;
+                let mut cparts: Vec<(u32, u64)> = Vec::new();
+                let mut ok = true;
+                for &(idx, other) in &members {
+                    if terms_at(
+                        cx,
+                        other,
+                        parts[idx].1,
+                        &mut cbias,
+                        &mut cparts,
+                        32,
+                        false,
+                        None,
+                        mod_bits,
+                        work,
+                    )
+                    .is_none()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok || cancel_parts(&mut cparts, mask, work).is_none() {
+                    continue;
+                }
+                let Some(val) = constant_lanes(cx, &cparts, mod_bits, work) else {
+                    continue;
+                };
+                let c = cbias.wrapping_add(val) & mask;
+                for &(idx, _) in &members {
+                    parts[idx].1 = 0;
+                }
+                if c != 0 {
+                    terms_at(cx, v, c, bias, &mut extra_v, 32, false, None, mod_bits, work)?;
+                }
+            }
+        }
+        for (id, k) in extra_v {
+            push_term(parts, id, k)?;
+        }
+    }
     Some(())
 }
 
@@ -760,6 +915,160 @@ fn rebase_shifted_terms(
     Some(())
 }
 
+/// Collect pure-bitwise DAG atoms (up to 5) of `root` (with only uniform 0/-1 constants
+/// allowed inside bitwise ops) and evaluate it at all `2^t` corners `{0, mask}^t`.
+fn eval_pure_bitwise_corners(
+    cx: &Context,
+    root: u32,
+    atoms: &mut Vec<u32>,
+    mask: u64,
+    depth: u8,
+    work: &mut Work,
+) -> Option<[u64; 32]> {
+    work.take(1)?;
+    if depth == 0 {
+        return None;
+    }
+    let n = cx.node(root);
+    if let Some(c) = scalar(cx, root) {
+        let cm = c & mask;
+        if cm == 0 {
+            return Some([0u64; 32]);
+        }
+        if cm == mask {
+            return Some([mask; 32]);
+        }
+        return None;
+    }
+    match n.op {
+        OpCode::Not => {
+            let mut v = eval_pure_bitwise_corners(cx, n.a, atoms, mask, depth - 1, work)?;
+            for x in &mut v {
+                *x = !*x & mask;
+            }
+            Some(v)
+        }
+        OpCode::And | OpCode::Or | OpCode::Xor => {
+            let a = eval_pure_bitwise_corners(cx, n.a, atoms, mask, depth - 1, work)?;
+            let b = eval_pure_bitwise_corners(cx, n.b, atoms, mask, depth - 1, work)?;
+            let mut out = [0u64; 32];
+            for i in 0..32 {
+                out[i] = match n.op {
+                    OpCode::And => a[i] & b[i],
+                    OpCode::Or => a[i] | b[i],
+                    _ => a[i] ^ b[i],
+                };
+            }
+            Some(out)
+        }
+        _ => {
+            let pos = if let Some(p) = atoms.iter().position(|&x| x == root) {
+                p
+            } else {
+                if atoms.len() >= 5 {
+                    return None;
+                }
+                let p = atoms.len();
+                atoms.push(root);
+                p
+            };
+            let mut out = [0u64; 32];
+            for (p, slot) in out.iter_mut().enumerate() {
+                if (p >> pos) & 1 != 0 {
+                    *slot = mask;
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// Collapse equal-magnitude pure-bitwise sub-groups in `parts` (e.g. `(a ^ (a ^ b) & c) + (a & c) - (b & c) == a`)
+/// whose exact `2^t` (`t <= 5`) signature is purely affine, then re-expand the exposed atoms via
+/// `terms_at` so hidden linear/product terms inside `a` can cancel against the rest of `parts`.
+fn collapse_affine_bitwise_groups(
+    cx: &Context,
+    parts: &mut Vec<(u32, u64)>,
+    bias: &mut u64,
+    cur_bits: u16,
+    work: &mut Work,
+) -> Option<bool> {
+    let mask = u64::MAX >> (64 - cur_bits);
+    let is_bw = |id: u32| matches!(cx.node(id).op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
+    let mag = |k: u64| {
+        let km = k & mask;
+        km.min(km.wrapping_neg() & mask)
+    };
+    let mut mags: Vec<u64> = Vec::new();
+    for &(t, k) in parts.iter() {
+        let m = mag(k);
+        if m != 0 && is_bw(t) && !mags.contains(&m) {
+            mags.push(m);
+        }
+    }
+    let mut changed = false;
+    for m in mags {
+        let idxs: Vec<usize> = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &(t, k))| (is_bw(t) && mag(k) == m).then_some(idx))
+            .collect();
+        if idxs.len() < 2 {
+            continue;
+        }
+        let mut atoms: Vec<u32> = Vec::new();
+        let mut sig = [0u64; 32];
+        let mut ok = true;
+        for &idx in &idxs {
+            let (t, k) = parts[idx];
+            let Some(vals) = eval_pure_bitwise_corners(cx, t, &mut atoms, mask, 16, work) else {
+                ok = false;
+                break;
+            };
+            for i in 0..32 {
+                sig[i] = sig[i].wrapping_add(k.wrapping_mul(vals[i])) & mask;
+            }
+        }
+        if !ok || atoms.is_empty() {
+            continue;
+        }
+        let t = atoms.len();
+        let corners = 1usize << t;
+        work.take(corners as u64)?;
+        // Möbius transform: `-sig[p] = sum_{S <= p} d[S]`, so affine iff `d[S] == 0` for `|S| >= 2`.
+        let mut d = [0u64; 32];
+        for i in 0..corners {
+            d[i] = sig[i].wrapping_neg() & mask;
+        }
+        let mut bit = 1;
+        while bit < corners {
+            for p in 0..corners {
+                if p & bit != 0 {
+                    d[p] = d[p].wrapping_sub(d[p ^ bit]) & mask;
+                }
+            }
+            bit <<= 1;
+        }
+        if (0..corners).any(|s| s.count_ones() >= 2 && d[s] != 0) {
+            continue;
+        }
+        for &idx in &idxs {
+            parts[idx].1 = 0;
+        }
+        *bias = bias.wrapping_sub(d[0]) & mask;
+        for (j, &a) in atoms.iter().enumerate() {
+            let c = d[1 << j];
+            if c != 0 {
+                terms_at(cx, a, c, bias, parts, 64, false, None, cur_bits, work)?;
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        cancel_parts(parts, mask, work)?;
+    }
+    Some(changed)
+}
 /// Compare two nodes jointly modulo `2^bits` by flattening their additive layers and checking
 /// each bit column independently. When both sides are guaranteed zero above `k < bits`, equality
 /// modulo `2^k` implies equality modulo `2^bits`, letting `terms_at` see through `zext`/`trunc`/
@@ -789,6 +1098,48 @@ pub(in crate::engine::pass) fn equal_lanes(
         terms_at(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work)?;
         distribute_matching_prods(cx, &mut parts, &mut bias, cur_bits, &mut work)?;
         cancel_parts(&mut parts, mask, &mut work)?;
+        // Cancel opposite-signed product terms `k * A + (-k) * B` when `A ≡ B (mod 2^cur_bits)`
+        // polynomially (e.g. quadratic/polynomial terms mixed into a masked linear MBA).
+        if parts.len() >= 2 {
+            let mut poly_checks = 0usize;
+            let mut removed = vec![false; parts.len()];
+            let mut any_removed = false;
+            for i in 0..parts.len() {
+                if removed[i] || cx.node(parts[i].0).op != OpCode::Mul {
+                    continue;
+                }
+                let ki = parts[i].1 & mask;
+                let neg_ki = ki.wrapping_neg() & mask;
+                for j in (i + 1)..parts.len() {
+                    if removed[j]
+                        || (parts[j].1 & mask) != neg_ki
+                        || cx.node(parts[j].0).op != OpCode::Mul
+                    {
+                        continue;
+                    }
+                    if poly_checks >= 12 {
+                        break;
+                    }
+                    poly_checks += 1;
+                    if super::super::poly::equal_mod(r, cx, parts[i].0, parts[j].0, cur_bits)
+                        .unwrap_or(false)
+                    {
+                        removed[i] = true;
+                        removed[j] = true;
+                        any_removed = true;
+                        break;
+                    }
+                }
+            }
+            if any_removed {
+                let mut idx = 0;
+                parts.retain(|_| {
+                    let keep = !removed[idx];
+                    idx += 1;
+                    keep
+                });
+            }
+        }
         // After outer shared terms cancel, two surviving terms with active width `lo < cur_bits`
         // can be decided modulo `2^lo` in two exact cases:
         //   1. `p1 - p2 == 0` (since `0 <= p1, p2 < 2^lo`), or
@@ -818,12 +1169,24 @@ pub(in crate::engine::pass) fn equal_lanes(
             }
         }
         rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
-        let value = match constant_lanes(cx, &parts, cur_bits, &mut work) {
-            Some(v) => v,
-            None if parts.iter().any(|&(_, k)| k != 0 && k.trailing_zeros() > 0) => {
-                constant_lanes_aligned(cx, &parts, cur_bits, &mut work)?
+        let try_lanes = |parts: &[(u32, u64)], work: &mut Work| -> Option<u64> {
+            match constant_lanes(cx, parts, cur_bits, work) {
+                Some(v) => Some(v),
+                None if parts.iter().any(|&(_, k)| k != 0 && k.trailing_zeros() > 0) => {
+                    constant_lanes_aligned(cx, parts, cur_bits, work)
+                }
+                None => None,
             }
-            None => return None,
+        };
+        let value = match try_lanes(&parts, &mut work) {
+            Some(v) => v,
+            None => {
+                if !collapse_affine_bitwise_groups(cx, &mut parts, &mut bias, cur_bits, &mut work)? {
+                    return None;
+                }
+                rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
+                try_lanes(&parts, &mut work)?
+            }
         };
         Some(bias.wrapping_add(value) & mask == 0)
     })();
@@ -2051,6 +2414,14 @@ mod tests {
             // 5-variable bitwise equality inside Lane (0x14048ba44__5add92da-style)
             "let s = ~(a & b) & (~c | a); let r = rotl(s, 24); \
              ~(d & r) & (~e | (s << 24) | (s >>u 40)) == ~e ^ (e ^ d) & r",
+            // Non-constant Select traced bit-by-bit in Lane::bit
+            "let c = k == 0; select(c, a ^ b, d ^ b) == (select(c, a, d) ^ b)",
+            // Carry-free low bits of Add/Sub with constant (j <= tz(c))
+            "(((x ^ y) & 2) + (((x + 2) ^ y) & 2)) == 2",
+            "(((x ^ y) & 2) + (((x - 2) ^ y) & 2)) == 2",
+            // Quadratic polynomial cancellation mixed with masked linear MBA
+            "let p = a + (b | 1); let q = a + (b & ~1) + 1; \
+             (p * ~p) * 5 + (x & 34) + (~(x & 34)) == (q * ~q) * 5 - 1",
         ] {
             let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
             let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
@@ -2077,6 +2448,9 @@ mod tests {
             // High 64-bit extract of a 128-bit value is NOT zero (must not under-approximate wide extracts)
             "extract<64, 64>(#0:128) == 0:64",
             "extract<32, 64>(#0:128) == (extract<32, 64>(#0:128) & 0xffffffff)",
+            // Bit above tz(c) DOES see carry from adding/subtracting c (j = 2 > tz(2) = 1)
+            "(((x ^ y) & 4) + (((x + 2) ^ y) & 4)) == 4",
+            "((x + 2) & 4) == (x & 4)",
         ] {
             let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
             let outcome = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();

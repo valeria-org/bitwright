@@ -1339,8 +1339,312 @@ const SELECT_WORK: u32 = 48;
 /// another user is not rejected for good (the user may go), whichever candidate it was. Kept
 /// of the last candidate alone, the node was remembered as final in a form the next call, in a
 /// context without that memory, rewrote.
+/// Canonicalize additive 2-bit selector tables into flat sums of 1-bit selects:
+/// - `select(a, select(b, c10 + c01, c10), select(b, c01, 0))` -> `select(a, c10, 0) + select(b, c01, 0)`
+/// - `select(a, s + k, s)` (where `s` is a constant-armed `select`) -> `s + select(a, k, 0)`
+fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let node = cx.node(n);
+    if node.op != OpCode::Select {
+        return Ok(None);
+    }
+    let w = cx.width_of(n);
+    let zero = BitVec::zero(w);
+    let (cond, t, f) = (node.a, node.b, node.c);
+
+    // Pattern 1: `select(a, s + k, s)` or `select(a, s, s + k)` where `s` is a constant-armed select.
+    let const_select = |id: u32| -> bool {
+        let sn = cx.node(id);
+        sn.op == OpCode::Select && cx.const_val(sn.b).is_some() && cx.const_val(sn.c).is_some()
+    };
+    let add_const_of = |sum_id: u32, base_id: u32| -> Option<BitVec> {
+        let sn = cx.node(sum_id);
+        match sn.op {
+            OpCode::Add if sn.a == base_id => cx.const_val(sn.b),
+            OpCode::Add if sn.b == base_id => cx.const_val(sn.a),
+            OpCode::Sub if sn.a == base_id => {
+                cx.const_val(sn.b).map(|k| BitVec::un_unchecked(UnOp::Neg, &k))
+            }
+            _ => None,
+        }
+    };
+    if const_select(f)
+        && let Some(k) = add_const_of(t, f)
+    {
+        let before = cx.len() as u32;
+        let kv = r.build(cx, |cx| cx.mk_const(&k))?;
+        let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
+        let e = r.build(cx, |cx| {
+            let sel = cx.c_select(cond, kv, zv)?;
+            cx.c_bin(BinOp::Add, f, sel)
+        })?;
+        let mut stops = vec![cond, f];
+        if kv < before {
+            stops.push(kv);
+        }
+        if zv < before {
+            stops.push(zv);
+        }
+        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
+            .map(Some);
+    }
+    if const_select(t)
+        && let Some(k) = add_const_of(f, t)
+    {
+        let before = cx.len() as u32;
+        let kv = r.build(cx, |cx| cx.mk_const(&k))?;
+        let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
+        let e = r.build(cx, |cx| {
+            let sel = cx.c_select(cond, zv, kv)?;
+            cx.c_bin(BinOp::Add, t, sel)
+        })?;
+        let mut stops = vec![cond, t];
+        if kv < before {
+            stops.push(kv);
+        }
+        if zv < before {
+            stops.push(zv);
+        }
+        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
+            .map(Some);
+    }
+
+    // Pattern 2: `select(a, select(b, c11, c10), select(b', c01, c00))` where `b' == b` or `~b`
+    // and `c11 + c00 == c10 + c01 (mod 2^w)`.
+    let (tn, fn_) = (cx.node(t), cx.node(f));
+    if tn.op == OpCode::Select && fn_.op == OpCode::Select {
+        let (Some(c11), Some(c10), Some(f1), Some(f0)) = (
+            cx.const_val(tn.b),
+            cx.const_val(tn.c),
+            cx.const_val(fn_.b),
+            cx.const_val(fn_.c),
+        ) else {
+            return Ok(None);
+        };
+        let b = tn.a;
+        let is_comp_cond = |x: u32, y: u32| -> bool {
+            let (nx, ny) = (cx.node(x), cx.node(y));
+            if (nx.op == OpCode::Not && nx.a == y) || (ny.op == OpCode::Not && ny.a == x) {
+                return true;
+            }
+            match (nx.op, ny.op) {
+                (OpCode::Eq, OpCode::Ne) | (OpCode::Ne, OpCode::Eq) => {
+                    (nx.a == ny.a && nx.b == ny.b) || (nx.a == ny.b && nx.b == ny.a)
+                }
+                // `t <s 0` vs `0 <=s t` (complementary sign tests).
+                (OpCode::Slt, OpCode::Sle) => {
+                    cx.const_val(nx.b).is_some_and(|v| v.is_zero())
+                        && cx.const_val(ny.a).is_some_and(|v| v.is_zero())
+                        && nx.a == ny.b
+                }
+                (OpCode::Sle, OpCode::Slt) => {
+                    cx.const_val(ny.b).is_some_and(|v| v.is_zero())
+                        && cx.const_val(nx.a).is_some_and(|v| v.is_zero())
+                        && ny.a == nx.b
+                }
+                _ => false,
+            }
+        };
+        let (c01, c00) = if fn_.a == b {
+            (f1, f0)
+        } else if is_comp_cond(fn_.a, b) {
+            (f0, f1)
+        } else {
+            return Ok(None);
+        };
+        let lhs = BitVec::bin_unchecked(BinOp::Add, &c11, &c00);
+        let rhs = BitVec::bin_unchecked(BinOp::Add, &c10, &c01);
+        if lhs == rhs && c00.is_zero() {
+            let before = cx.len() as u32;
+            let zv = r.build(cx, |cx| cx.mk_const(&zero))?;
+            let k1 = r.build(cx, |cx| cx.mk_const(&c10))?;
+            let k2 = r.build(cx, |cx| cx.mk_const(&c01))?;
+            let e = r.build(cx, |cx| {
+                let s1 = cx.c_select(cond, k1, zv)?;
+                let s2 = cx.c_select(b, k2, zv)?;
+                cx.c_bin(BinOp::Add, s1, s2)
+            })?;
+            let mut stops = vec![cond, b];
+            for c in [zv, k1, k2] {
+                if c < before && !stops.contains(&c) {
+                    stops.push(c);
+                }
+            }
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Linear,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )
+            .map(Some);
+        }
+    }
+    // Pattern 3: `select(c, k1 * base, k2 * base)` -> `base * select(c, k1, k2)`.
+    // Works even when one arm's multiplier is even (where `scaled_base` shifts out trailing zeros
+    // and halves the modulus) by dividing by the odd arm's pivot coefficient and verifying exact
+    // equality modulo `2^w` on the other arm.
+    #[cfg(feature = "mba")]
+    if cx.const_val(t).is_none()
+        && cx.const_val(f).is_none()
+        && (linear_op(cx.node(t).op) || linear_op(cx.node(f).op))
+    {
+        let ft = form_of(r, cx, t)?;
+        let ff = form_of(r, cx, f)?;
+        if !ft.terms.is_empty()
+            && ft.terms.len() <= BASE_TERMS
+            && ft.terms.len() == ff.terms.len()
+            && ft.terms.iter().zip(&ff.terms).all(|(&(a, _), &(b, _))| a == b)
+        {
+            type ScaledSelectMatch = (BitVec, BitVec, BitVec, Vec<(u32, BitVec)>);
+            let matched = (|| -> Option<ScaledSelectMatch> {
+                let (k0_t, k0_f) = (ft.terms[0].1, ff.terms[0].1);
+                if k0_t == k0_f {
+                    return None;
+                }
+                if let Some(inv) = crate::invert::mul_inverse(&k0_t) {
+                    let base_k = BitVec::bin_unchecked(BinOp::Mul, &ft.konst, &inv);
+                    let base: Vec<(u32, BitVec)> = ft
+                        .terms
+                        .iter()
+                        .map(|&(a, k)| (a, BitVec::bin_unchecked(BinOp::Mul, &k, &inv)))
+                        .collect();
+                    if BitVec::bin_unchecked(BinOp::Mul, &base_k, &k0_f) == ff.konst
+                        && base
+                            .iter()
+                            .zip(&ff.terms)
+                            .all(|(&(_, bk), &(_, fk))| {
+                                BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_f) == fk
+                            })
+                    {
+                        return Some((k0_t, k0_f, base_k, base));
+                    }
+                }
+                if let Some(inv) = crate::invert::mul_inverse(&k0_f) {
+                    let base_k = BitVec::bin_unchecked(BinOp::Mul, &ff.konst, &inv);
+                    let base: Vec<(u32, BitVec)> = ff
+                        .terms
+                        .iter()
+                        .map(|&(a, k)| (a, BitVec::bin_unchecked(BinOp::Mul, &k, &inv)))
+                        .collect();
+                    if BitVec::bin_unchecked(BinOp::Mul, &base_k, &k0_t) == ft.konst
+                        && base
+                            .iter()
+                            .zip(&ft.terms)
+                            .all(|(&(_, bk), &(_, tk))| {
+                                BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_t) == tk
+                            })
+                    {
+                        return Some((k0_t, k0_f, base_k, base));
+                    }
+                }
+                if ft.konst.is_zero()
+                    && ff.konst.is_zero()
+                    && let (Some((kt, bt)), Some((kf, bf))) = (scaled_base(&ft), scaled_base(&ff))
+                    && bt == bf
+                    && kt != kf
+                {
+                    return Some((kt, kf, zero, bt));
+                }
+                None
+            })();
+            if let Some((kt, kf, bk, bt)) = matched {
+                let before = cx.len() as u32;
+                let base = emit(r, cx, &Form::of(bk, &bt))?;
+                let sel = r.build(cx, |cx| {
+                    let c1 = cx.mk_const(&kt)?;
+                    let c2 = cx.mk_const(&kf)?;
+                    cx.c_select(cond, c1, c2)
+                })?;
+                let e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, base, sel))?;
+                let mut stops: Vec<u32> = bt.iter().map(|&(a, _)| a).collect();
+                stops.push(cond);
+                return finish(
+                    r,
+                    cx,
+                    PassKind::Linear,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    ft.fin.and(ff.fin),
+                )
+                .map(Some);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Whether `part` is syntactically a bitwise subset of `whole` (`part & ~whole == 0`),
+/// detected by checking if any `And`-conjunct of `part` is an `Or`-disjunct of `whole`.
+fn syntactic_bitwise_subset(cx: &Context, part: u32, whole: u32) -> bool {
+    let mut disjuncts = Vec::with_capacity(8);
+    let mut stack = vec![whole];
+    while let Some(i) = stack.pop() {
+        if disjuncts.len() >= 16 {
+            break;
+        }
+        let n = cx.node(i);
+        if n.op == OpCode::Or {
+            stack.push(n.a);
+            stack.push(n.b);
+        } else {
+            disjuncts.push(i);
+        }
+    }
+    let mut cstack = vec![part];
+    let mut seen = 0usize;
+    while let Some(i) = cstack.pop() {
+        if disjuncts.contains(&i) {
+            return true;
+        }
+        seen += 1;
+        if seen >= 16 {
+            break;
+        }
+        let n = cx.node(i);
+        if n.op == OpCode::And {
+            cstack.push(n.a);
+            cstack.push(n.b);
+        }
+    }
+    false
+}
+
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
-    let op = cx.node(n).op;
+    let node = cx.node(n);
+    let op = node.op;
+    if op == OpCode::Select
+        && let Some(step) = additive_select(r, cx, n)?
+    {
+        return Ok(step);
+    }
+    // `-((-x) * y) -> x * y` and `-(x * (-y)) -> x * y`.
+    if op == OpCode::Neg {
+        let inner = cx.node(node.a);
+        if inner.op == OpCode::Mul {
+            let pair = if cx.node(inner.a).op == OpCode::Neg {
+                Some((cx.node(inner.a).a, inner.b))
+            } else if cx.node(inner.b).op == OpCode::Neg {
+                Some((inner.a, cx.node(inner.b).a))
+            } else {
+                None
+            };
+            if let Some((x, y)) = pair {
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| cx.c_bin(BinOp::Mul, x, y))?;
+                match finish(r, cx, PassKind::Linear, n, e, before, &[x, y], Fin::FINAL)? {
+                    Step::Normal(_) => {}
+                    step => return Ok(step),
+                }
+            }
+        }
+    }
     let mut declined = match factor_sum(r, cx, n)? {
         Some(Step::Normal(f)) => f,
         Some(step) => return Ok(step),
@@ -1434,6 +1738,23 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     };
+    // Fallback when linear cancellation declined: `a - b -> a ^ b` when `b` is syntactically
+    // a bitwise subset of `a` (zero borrows; `Xor` ranks strictly below `Sub` in the termination
+    // order). Running after `plain` ensures disjoint `(a | b) - b` still cancels to `a` first.
+    if matches!(last, Step::Normal(_))
+        && op == OpCode::Sub
+        && cx.node(node.b).op == OpCode::And
+        && syntactic_bitwise_subset(cx, node.b, node.a)
+    {
+        let (a, b) = (node.a, node.b);
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| cx.c_bin(BinOp::Xor, a, b))?;
+        match super::finish_with(r, cx, PassKind::Linear, n, e, before, &[a, b], Fin::FINAL, true)?
+        {
+            Step::Normal(_) => {}
+            step => return Ok(step),
+        }
+    }
     Ok(match last {
         Step::Normal(f) => Step::Normal(f.and(declined)),
         step => step,
@@ -2335,4 +2656,59 @@ pub(super) fn by_sums(
         }
     }
     finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use crate::{Context, ParseOptions, Width};
+
+    #[test]
+    fn linear_additive_select_neg_mul_and_subset_sub() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Pattern 1: select(a, s + k, s) == s + select(a, k, 0)
+            "let s = select(b == 0, 100:64, 0); select(a == 0, s + 42, s) == s + select(a == 0, 42:64, 0)",
+            // Pattern 2 with complementary sign comparisons (<s 0 vs 0 <=s)
+            "select(a == 0, select(x <s 0, 15:64, 10), select(0 <=s x, 0:64, 5)) == select(a == 0, 10:64, 0) + select(x <s 0, 5:64, 0)",
+            // Pattern 3 with non-zero konst (~x) and an even multiplier on one arm
+            "select(c == 0, ~x * 7 + y * 7, ~x * 4 + y * 4) == (~x + y) * select(c == 0, 7:64, 4)",
+            // Neg(Mul(Neg(x), y)) -> x * y
+            "-((-x) * y) == x * y",
+            // Syntactic bitwise subset subtraction: (a | b) - (c & b) == (a | b) ^ (c & b)
+            "(a | b) - (c & b) == (a | b) ^ (c & b)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_rejects_unsound_select_and_subset_sub() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Pattern 2 with non-additive table (c11 != c10 + c01)
+            "select(a == 0, select(b == 0, 16:64, 10), select(b == 0, 5:64, 0)) == select(a == 0, 10:64, 0) + select(b == 0, 5:64, 0)",
+            // Pattern 3 with mismatched constant term
+            "select(c == 0, ~x * 7 + y * 7 + 1, ~x * 4 + y * 4) == (~x + y) * select(c == 0, 7:64, 4)",
+            // Non-subset subtraction is NOT xor
+            "(a | b) - (c & d) == (a | b) ^ (c & d)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Refuted(_)),
+                "expected Refuted for {text}, got {out:?}"
+            );
+        }
+    }
 }

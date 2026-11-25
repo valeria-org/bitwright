@@ -556,15 +556,25 @@ impl Sums {
         }
         self.scaled.clear();
         let mut tried: Vec<u32> = Vec::new();
+        let mut counts: Vec<u32> = Vec::with_capacity(self.products.len() * 2);
         for _ in 0..16 {
-            let mut best = (0usize, 0u32);
+            counts.clear();
             for &(pair, _) in self.products.iter().flatten() {
-                for f in pair {
-                    if tried.contains(&f) { continue; }
-                    if work.take(self.products.len() as u64).is_none() { return Ok(None); }
-                    let n = self.products.iter().flatten().filter(|(p, _)| p.contains(&f)).count();
-                    if n > best.0 { best = (n, f); }
+                if !tried.contains(&pair[0]) { counts.push(pair[0]); }
+                if pair[1] != pair[0] && !tried.contains(&pair[1]) { counts.push(pair[1]); }
+            }
+            if counts.len() < 2 { break; }
+            if work.take(counts.len() as u64).is_none() { return Ok(None); }
+            counts.sort_unstable();
+            let mut best = (0usize, 0u32);
+            let mut run = 0;
+            while run < counts.len() {
+                let f = counts[run];
+                let end = run + counts[run..].partition_point(|&x| x == f);
+                if end - run > best.0 {
+                    best = (end - run, f);
                 }
+                run = end;
             }
             if best.0 < 2 { break; }
             let f = best.1;

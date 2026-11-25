@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.32.16
+
+- Extended `linear_mba` with orthogonal linear-term splitting (`solve_split_orthogonal` /
+  `difference_is_zero_split`) for wide mixed sums, deferred chain-top solving with bounded
+  `held_back` work, per-call cost-decline caching, `equal_bounded`, affine remainder checking,
+  `rot_unions` with symmetric conjunction recombination, and `flatten_affine` seeing through
+  disjoint `|`, subset `^`, and `zext(trunc)` vs `& lowmask` with equal/complement atom merging.
+- Improved `mba` sweep and cofactor performance: replaced `O(P^2)` factor frequency counting in
+  `cofactors::Sums::collapse` with `O(P log P)` sorting, switched Round-1+ `newly_noted` re-checks
+  to `related_cheap`, wired `linear_mba::equal_bounded` into `related_cheap`/`related`, and fixed
+  `Gate::new` small-budget floor/missed-cap scaling.
+- Extended `mba::opaque_predicate` with shallow snapshot/fallback bit-tracing through non-constant
+  `Select` arms, carry-free low-bit tracing for `Add`/`Sub` with constants, affine bitwise group
+  collapse, common-factor cofactor collapse, and `poly::equal_mod` pair cancellation in
+  `equal_lanes`.
+- Extended `linear` with `additive_select` canonicalization, `-((-x) * y) -> x * y`, and
+  post-`plain` syntactic bitwise subset `Sub -> Xor` for `And` operands; extended `compares` with
+  `known_words` mask case splitting, `sign_extend_sign_test`, and binary congruence fallback.
+- Extended `casts` with shallow 1-level `select` hoisting, live-select binary decomposition, and
+  `narrow_to_live_wide`; extended `shuffle` with variable-count rotate recognition, chained variable
+  rotate folding, and redundant power-of-two rotate-count mask stripping; skipped the `Phase::Words`
+  DAG walk when `!self.words.turn` while preserving phase events.
+
 ## 0.32.15
 
 - Added exact 128-bit bit-table carry-tree equality reduction (`mba::bit_table`)

@@ -3389,6 +3389,13 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
+                if matches!(inner.phases[phase], PhaseImpl::Pass(pass::PassKind::Words))
+                    && !self.words.turn
+                {
+                    fin = fin.and(Fin::PROVISIONAL);
+                    self.emit_phase_end(cx, round, phase, cur, spent0, None);
+                    continue;
+                }
                 match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
                         // The demanded-bits pass commits a reader at a time, each counted

@@ -1082,12 +1082,213 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
         }
         first = Some(h);
     }
+    // Shallow 1-level hoist: when deep pairing hit `MAX_BASES` because the differing operands
+    // themselves share an outer opcode, hoisting just the matching top-level op (`a >>u k` /
+    // `b >>u k`, `rotl(a, k)` / `rotl(b, k)`, etc.) over a single `select` can still strictly
+    // shrink the DAG.
+    {
+        let (na, nb) = (cx.node(a), cx.node(b));
+        let (ka, kb) = ([na.a, na.b, na.c], [nb.a, nb.b, nb.c]);
+        let arity = na.op.arity();
+        let same_top = na.op == nb.op
+            && pairable(na.op)
+            && na.width == nb.width
+            && (0..3).all(|s| {
+                if s < arity {
+                    cx.wid(ka[s]) == cx.wid(kb[s])
+                } else {
+                    ka[s] == kb[s]
+                }
+            });
+        if same_top {
+            let mut diff_slot = None;
+            let mut multi_diff = false;
+            for s in 0..arity {
+                if ka[s] != kb[s] {
+                    if diff_slot.is_some() {
+                        multi_diff = true;
+                        break;
+                    }
+                    diff_slot = Some(s);
+                }
+            }
+            if !multi_diff && let Some(s) = diff_slot {
+                let (x, y) = (ka[s], kb[s]);
+                let sel_node = crate::expr::Node::new(OpCode::Select, cx.wid(x), c, x, y);
+                let there = cx.find(&sel_node).is_some_and(|sid| {
+                    sid != n && {
+                        super::refresh_uses(r, cx).is_ok()
+                            && r.life.live.uses(sid).is_some_and(|u| u > 0)
+                    }
+                });
+                let sel = r.build(cx, |cx| cx.c_select(c, x, y))?;
+                let mut kids = ka;
+                kids[s] = sel;
+                let e = r.build(cx, |cx| cx.rebuild(a, kids))?;
+                let mut atoms = vec![c];
+                for (t, &child) in ka.iter().enumerate().take(arity) {
+                    if t != s {
+                        atoms.push(child);
+                    }
+                }
+                if there {
+                    atoms.push(sel);
+                } else {
+                    atoms.extend([x, y]);
+                }
+                match finish(r, cx, PassKind::Casts, n, e, start, &atoms, fin)? {
+                    Step::Normal(f) => fin = f,
+                    step => return Ok(step),
+                }
+            }
+        }
+    }
+    // Live-select binary decomposition: for `op ∈ {Add, Sub, Or, Xor}` (where `k op 0 == k`),
+    // rewrite `select(c, u op v, k)` to `select(c, u, k) op select(c, v, 0)` (and symmetrically
+    // when the op is on the false arm) whenever both sub-selects already exist and are live.
+    let w = cx.wid(n);
+    if w <= 64 {
+        let zero_mark = cx.len() as u32;
+        let zv = r.build(cx, |cx| cx.mk_const_u64(w, 0))?;
+        if zv < zero_mark {
+            let find_live_sel = |r: &mut Runner<'_, '_>, cx: &Context, p: u32, q: u32| -> Result<Option<u32>, Stop> {
+                let Some(sid) = cx.find(&crate::expr::Node::new(OpCode::Select, w, c, p, q)) else {
+                    return Ok(None);
+                };
+                if sid == n {
+                    return Ok(None);
+                }
+                super::refresh_uses(r, cx)?;
+                Ok(r.life.live.uses(sid).is_some_and(|u| u > 0).then_some(sid))
+            };
+            for (op_arm, k_arm, on_true) in [(a, b, true), (b, a, false)] {
+                let on = cx.node(op_arm);
+                let bop = match on.op {
+                    OpCode::Add => BinOp::Add,
+                    OpCode::Sub => BinOp::Sub,
+                    OpCode::Or => BinOp::Or,
+                    OpCode::Xor => BinOp::Xor,
+                    _ => continue,
+                };
+                let (u, v) = (on.a, on.b);
+                let mut candidates = Vec::with_capacity(2);
+                if on_true {
+                    candidates.push(((u, k_arm), (v, zv)));
+                    if bop.is_commutative() {
+                        candidates.push(((u, zv), (v, k_arm)));
+                    }
+                } else {
+                    candidates.push(((k_arm, u), (zv, v)));
+                    if bop.is_commutative() {
+                        candidates.push(((zv, u), (k_arm, v)));
+                    }
+                }
+                for ((p1, q1), (p2, q2)) in candidates {
+                    if let Some(s1) = find_live_sel(r, cx, p1, q1)?
+                        && let Some(s2) = find_live_sel(r, cx, p2, q2)?
+                    {
+                        let e = r.build(cx, |cx| cx.c_bin(bop, s1, s2))?;
+                        match finish(r, cx, PassKind::Casts, n, e, start, &[s1, s2], fin)? {
+                            Step::Normal(f) => fin = f,
+                            step => return Ok(step),
+                        }
+                    }
+                }
+            }
+        }
+    }
     super::discard(r, cx, start);
     Ok(Step::Normal(fin))
 }
 
+/// Rewrite `trunc<nw>(X) op C` (for `op ∈ {Add, Sub, Mul, And, Or, Xor}`) to `trunc<nw>(wide)`
+/// whenever a live `wide = X op C_w` (with `trunc<nw>(C_w) == C`) already exists in `cx`.
+fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    let node = cx.node(n);
+    let nw = node.width;
+    if nw >= 64
+        || !matches!(
+            node.op,
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor
+        )
+    {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let comm = node.op.as_bin().is_some_and(BinOp::is_commutative);
+    let (tr, cval, tr_is_lhs) = if let Some(cv) = cx.const_val(node.b) {
+        (node.a, cv, true)
+    } else if let Some(cv) = cx.const_val(node.a) {
+        (node.b, cv, false)
+    } else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    let tn = cx.node(tr);
+    if tn.op != OpCode::Extract || tn.b != 0 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let x = tn.a;
+    let w = cx.wid(x);
+    if w <= nw || w > 64 {
+        return Ok(Step::Normal(Fin::FINAL));
+    }
+    let Ok(wt) = crate::Width::new(w) else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    let Ok(zc) = cval.zext(wt) else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    let Ok(sc) = cval.sext(wt) else {
+        return Ok(Step::Normal(Fin::FINAL));
+    };
+    let before = cx.len() as u32;
+    let mut cands = vec![zc];
+    if sc != zc {
+        cands.push(sc);
+    }
+    for cw in cands {
+        let mark = cx.len() as u32;
+        let k = r.build(cx, |cx| cx.mk_const(&cw))?;
+        if k >= mark {
+            super::discard(r, cx, mark);
+            continue;
+        }
+        let (a1, b1) = if tr_is_lhs { (x, k) } else { (k, x) };
+        let wide = cx
+            .find(&crate::expr::Node::new(node.op, w, a1, b1, 0))
+            .or_else(|| {
+                comm.then(|| cx.find(&crate::expr::Node::new(node.op, w, b1, a1, 0)))
+                    .flatten()
+            });
+        if let Some(wide) = wide {
+            super::refresh_uses(r, cx)?;
+            if r.life.live.uses(wide).is_some_and(|u| u > 0) {
+                let e = r.build(cx, |cx| cx.c_extract(wide, 0, nw))?;
+                let mut stops = vec![wide];
+                if e < before {
+                    stops.push(e);
+                }
+                match finish(r, cx, PassKind::Casts, n, e, before, &stops, Fin::FINAL)? {
+                    Step::Normal(_) => {}
+                    step => return Ok(step),
+                }
+            }
+        }
+    }
+    super::discard(r, cx, before);
+    Ok(Step::Normal(Fin::FINAL))
+}
+
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
+    if matches!(
+        node.op,
+        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor
+    ) {
+        match narrow_to_live_wide(r, cx, n)? {
+            Step::Normal(_) => {}
+            step => return Ok(step),
+        }
+    }
     if let Some((k, x)) = sext_idiom(cx, n) {
         let before = cx.len() as u32;
         let w = node.width;
@@ -1134,4 +1335,56 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         sign_extended: false,
     });
     finish(r, cx, PassKind::Casts, n, e, before, &st.stops, fin)
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use crate::{Context, ParseOptions, Width};
+
+    #[test]
+    fn casts_hoists_select_and_narrows_live_wide() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Shallow 1-level hoist through shared-op arms
+            "let c = k == 0; select(c, (a & b) >>u 10, (d & e) >>u 10) == (select(c, a & b, d & e) >>u 10)",
+            // Live-select binary decomposition: select(c, a ^ b, K) == select(c, a, K) ^ select(c, b, 0)
+            "let c = k == 0; let s1 = select(c, a, 0x123456789abcdef0:64); let s2 = select(c, b, 0:64); \
+             (select(c, a ^ b, 0x123456789abcdef0:64) + s1 + s2) == ((s1 ^ s2) + s1 + s2)",
+            // narrow_to_live_wide unifies trunc<32>(x) + C with trunc<32>(x + zext<64>(C))
+            "let w = x + 0xba7ea0cf; let n = trunc<32>(x) + 0xba7ea0cf; \
+             (extract<16, 1>(n) == extract<16, 1>(w)) & (extract<0, 1>(w) == extract<0, 1>(w))",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn casts_rejects_unsound_select_and_trunc_identities() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Non-zero false arm does NOT satisfy K ^ 1 == K
+            "let c = k == 0; let s1 = select(c, a, 0x1234:64); let s2 = select(c, b, 1:64); \
+             select(c, a ^ b, 0x1234:64) == (s1 ^ s2)",
+            // Different low 32-bit constants
+            "trunc<32>(x) + 0x1234 == trunc<32>(x + 0x1235)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Refuted(_)),
+                "expected Refuted for {text}, got {out:?}"
+            );
+        }
+    }
 }

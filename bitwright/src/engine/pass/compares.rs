@@ -1164,14 +1164,20 @@ fn emit_values(
     .map(Some)
 }
 
-/// An OR of every value a masked word can take is true; when every test is
-/// conjoined with the same condition, it is that condition. VM case tables
-/// spell `c` as `(x & m == k0) & c | …` for every submask `k` of `m`.
+enum MaskCase {
+    Const(bool),
+    Expr(u32),
+    Bit { expr: u32, bit: u16, set: bool },
+}
+
+/// An OR of every value a bounded word can take is true (or the common conjunct); an OR of
+/// every value with one unknown bit set (or clear) is that single bit test. VM case tables
+/// spell `c` as `(x & m == k0) & c | …` or `extract<b, 1>(x)` as `(x == 1) | (x == 3) | …`.
 fn exhaustive_mask_cases(
     r: &mut Runner<'_, '_>,
-    cx: &Context,
+    cx: &mut Context,
     root: u32,
-) -> Result<Option<Option<u32>>, Stop> {
+) -> Result<Option<(MaskCase, Fin)>, Stop> {
     const MAX_TERMS: usize = 32;
 
     let mut terms = Vec::new();
@@ -1247,26 +1253,114 @@ fn exhaustive_mask_cases(
         let Some(e) = expr.filter(|_| valid) else {
             continue;
         };
-        let n = cx.node(e);
-        if n.op != OpCode::And {
+        let ew = cx.wid(e);
+        if ew == 0 || ew > 64 {
             continue;
         }
-        let mask = match (cx.const_val(n.a), cx.const_val(n.b)) {
-            (Some(k), None) | (None, Some(k)) => k,
-            _ => continue,
+        let full_mask = u64::MAX >> (64 - ew);
+        let (kb, fin) = super::known_words(r, cx, e)?;
+        let (kz, ko) = match kb {
+            Some([z, o]) => (z & full_mask, o & full_mask),
+            None => continue,
         };
-        let Some(mask) = mask.to_u64() else {
-            continue;
-        };
-        let bits = mask.count_ones();
-        if bits > 5 || values.iter().any(|v| v & !mask != 0) {
+        let unk = full_mask & !(kz | ko);
+        let bits = unk.count_ones();
+        if bits > 5 {
             continue;
         }
+        values.retain(|&v| (v & kz) == 0 && (v & ko) == ko);
         values.sort_unstable();
         values.dedup();
-        if values.len() == 1usize << bits {
-            return Ok(Some(common));
+        if values.is_empty() {
+            return Ok(Some((MaskCase::Const(false), fin)));
         }
+        if values.len() == 1usize << bits {
+            return Ok(Some((
+                common.map_or(MaskCase::Const(true), MaskCase::Expr),
+                fin,
+            )));
+        }
+        if common.is_none() && bits >= 1 && values.len() == (1usize << (bits - 1)) {
+            let mut rem = unk;
+            while rem != 0 {
+                let b = rem.trailing_zeros() as u16;
+                rem &= rem - 1;
+                if values.iter().all(|&v| (v >> b) & 1 == 1) {
+                    return Ok(Some((MaskCase::Bit { expr: e, bit: b, set: true }, fin)));
+                }
+                if values.iter().all(|&v| (v >> b) & 1 == 0) {
+                    return Ok(Some((MaskCase::Bit { expr: e, bit: b, set: false }, fin)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Sign test on a sign-extension bit hack `((y ^ 2^(k-1)) - 2^(k-1)) <s 0` (or `0 <=s ...`)
+/// where bits `k..w` of `y` are known zero: this is exact `extract<k-1, 1>(y)` (or its negation).
+fn sign_extend_sign_test(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<(u32, u16, bool, Fin)>, Stop> {
+    let node = cx.node(n);
+    let (arg, is_neg) = match node.op {
+        OpCode::Slt if cx.const_val(node.b).is_some_and(|v| v.is_zero()) => (node.a, true),
+        OpCode::Sle if cx.const_val(node.a).is_some_and(|v| v.is_zero()) => (node.b, false),
+        _ => return Ok(None),
+    };
+    let w = cx.wid(arg);
+    if !(2..=64).contains(&w) {
+        return Ok(None);
+    }
+    let mask = u64::MAX >> (64 - w);
+    let an = cx.node(arg);
+    let (lhs, sub_val) = match an.op {
+        OpCode::Sub => match cx.const_val(an.b).and_then(|v| v.to_u64()) {
+            Some(c) => (an.a, c & mask),
+            None => return Ok(None),
+        },
+        OpCode::Add => match (
+            cx.const_val(an.a).and_then(|v| v.to_u64()),
+            cx.const_val(an.b).and_then(|v| v.to_u64()),
+        ) {
+            (None, Some(c)) => (an.a, c.wrapping_neg() & mask),
+            (Some(c), None) => (an.b, c.wrapping_neg() & mask),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if sub_val == 0 || !sub_val.is_power_of_two() {
+        return Ok(None);
+    }
+    let bit = sub_val.trailing_zeros() as u16;
+    let xn = cx.node(lhs);
+    if xn.op != OpCode::Xor {
+        return Ok(None);
+    }
+    let y = match (
+        cx.const_val(xn.a).and_then(|v| v.to_u64()),
+        cx.const_val(xn.b).and_then(|v| v.to_u64()),
+    ) {
+        (None, Some(c)) if (c & mask) == sub_val => xn.a,
+        (Some(c), None) if (c & mask) == sub_val => xn.b,
+        _ => return Ok(None),
+    };
+    let k = u32::from(bit) + 1;
+    let hi_mask = if k >= u32::from(w) {
+        0
+    } else {
+        mask & !((1u64 << k) - 1)
+    };
+    if hi_mask == 0 {
+        return Ok(Some((y, bit, is_neg, Fin::FINAL)));
+    }
+    let (kb, fin) = super::known_words(r, cx, y)?;
+    if let Some([kz, _]) = kb
+        && (kz & hi_mask) == hi_mask
+    {
+        return Ok(Some((y, bit, is_neg, fin)));
     }
     Ok(None)
 }
@@ -1449,13 +1543,20 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     {
         return Ok(Step::Normal(Fin::FINAL));
     }
-    if let Some(common) = exhaustive_mask_cases(r, cx, n)? {
+    if let Some((mc, fin)) = exhaustive_mask_cases(r, cx, n)? {
         let before = cx.len() as u32;
-        let (e, atoms) = match common {
-            Some(c) => (c, vec![c]),
-            None => (bool_const(r, cx, true)?, Vec::new()),
+        let (e, atoms) = match mc {
+            MaskCase::Expr(c) => (c, vec![c]),
+            MaskCase::Const(b) => (bool_const(r, cx, b)?, Vec::new()),
+            MaskCase::Bit { expr, bit, set } => {
+                let e = r.build(cx, |cx| {
+                    let b = cx.c_extract(expr, bit, 1)?;
+                    if set { Ok(b) } else { cx.c_un(UnOp::Not, b) }
+                })?;
+                (e, vec![expr])
+            }
         };
-        return finish(r, cx, PassKind::Compares, n, e, before, &atoms, Fin::FINAL);
+        return finish(r, cx, PassKind::Compares, n, e, before, &atoms, fin);
     }
     // A test of one bit through a mask: `(x & 2^k) != 0` is bit k of x.
     if let Some((x, k, set)) = bit_test(cx, n) {
@@ -1465,6 +1566,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             if set { Ok(b) } else { cx.c_un(UnOp::Not, b) }
         })?;
         return finish(r, cx, PassKind::Compares, n, e, before, &[x], Fin::FINAL);
+    }
+    if let Some((x, k, set, fin)) = sign_extend_sign_test(r, cx, n)? {
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| {
+            let b = cx.c_extract(x, k, 1)?;
+            if set { Ok(b) } else { cx.c_un(UnOp::Not, b) }
+        })?;
+        return finish(r, cx, PassKind::Compares, n, e, before, &[x], fin);
     }
     let info = info_of(r, cx, n)?;
     let before = cx.len() as u32;
@@ -1561,6 +1670,72 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                         proved = super::mba::equal_lanes(r, cx, pa, pb, 1)?;
                     } else {
                         proved = super::mba::equal_sums(r, cx, pa, pb, bits)?;
+                    }
+                }
+                // Binary congruence fallback: if `pa` and `pb` share a binary opcode at full width
+                // and both operand pairs are independently provably equal (e.g. `(A1 | B1) == (A2 | B2)`
+                // where neither half is syntactically identical yet), then `pa == pb`.
+                if !proved && bits == cx.wid(pa) {
+                    let (nx, ny) = (cx.node(pa), cx.node(pb));
+                    if nx.op == ny.op
+                        && matches!(
+                            nx.op,
+                            OpCode::Or
+                                | OpCode::And
+                                | OpCode::Xor
+                                | OpCode::Add
+                                | OpCode::Sub
+                                | OpCode::Mul
+                        )
+                        && cx.wid(nx.a) == cx.wid(ny.a)
+                    {
+                        let pair_eq = |r: &mut Runner<'_, '_>,
+                                       cx: &mut Context,
+                                       x: u32,
+                                       y: u32|
+                         -> Result<(bool, Fin), Stop> {
+                            if x == y {
+                                return Ok((true, Fin::FINAL));
+                            }
+                            let (qa, qb, qbits) = peel_congruence(cx, x, y);
+                            if qa == qb || qbits == 0 {
+                                return Ok((true, Fin::FINAL));
+                            }
+                            if qbits > 1 && super::poly::equal_mod(r, cx, qa, qb, qbits)? {
+                                return Ok((true, Fin::FINAL));
+                            }
+                            if qbits == cx.wid(qa) {
+                                if let (Some(true), f) = super::bitwise::equal(r, cx, qa, qb)? {
+                                    return Ok((true, f));
+                                }
+                                if super::linear_mba::equal(r, cx, qa, qb)? {
+                                    return Ok((true, Fin::FINAL));
+                                }
+                            }
+                            #[cfg(feature = "mba")]
+                            if qbits <= 64 && super::mba::equal_lanes(r, cx, qa, qb, qbits)? {
+                                return Ok((true, Fin::FINAL));
+                            }
+                            Ok((false, Fin::FINAL))
+                        };
+                        let comm = nx.op.as_bin().is_some_and(BinOp::is_commutative);
+                        let (eq_aa, f1) = pair_eq(r, cx, nx.a, ny.a)?;
+                        if eq_aa {
+                            let (eq_bb, f2) = pair_eq(r, cx, nx.b, ny.b)?;
+                            if eq_bb {
+                                proved = true;
+                                fin = fin.and(f1).and(f2);
+                            }
+                        } else if comm {
+                            let (eq_ab, f1) = pair_eq(r, cx, nx.a, ny.b)?;
+                            if eq_ab {
+                                let (eq_ba, f2) = pair_eq(r, cx, nx.b, ny.a)?;
+                                if eq_ba {
+                                    proved = true;
+                                    fin = fin.and(f1).and(f2);
+                                }
+                            }
+                        }
                     }
                 }
                 if proved {
@@ -1865,5 +2040,59 @@ fn order_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
     match super::order::decide(r, cx, n)? {
         Some((e, atoms, fin)) => finish(r, cx, PassKind::Compares, n, e, before, &atoms, fin),
         None => Ok(Step::Normal(Fin::FINAL)),
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use crate::{Context, ParseOptions, Width};
+
+    #[test]
+    fn compares_handles_bit_tables_sign_extend_tests_and_binary_congruence() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Exhaustive mask cases -> single-bit extract
+            "let y = (x & 255) >>u 5; ((y == 1) | (y == 3) | (y == 5) | (y == 7)) == extract<5, 1>(x)",
+            "let y = (x & 255) >>u 5; ((y == 0) | (y == 2) | (y == 4) | (y == 6)) == ~extract<5, 1>(x)",
+            // Sign-extend sign test when high bits are known zero
+            "let y = x & 255; (((y ^ 128) - 128) <s 0) == extract<7, 1>(x)",
+            "let y = x & 255; (0 <=s ((y ^ 128) - 128)) == ~extract<7, 1>(x)",
+            // Binary congruence fallback on Or of two independently equal operands
+            "let l1 = (a ^ (b ^ a) & c) * 33 + d; let l2 = ((b & c) | (~c & a)) * 33 + d; \
+             let r1 = (e ^ (f ^ e) & g) * 65 + h; let r2 = ((f & g) | (~g & e)) * 65 + h; \
+             (l1 | r1) == (l2 | r2)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compares_rejects_unsound_sign_extend_when_high_bits_unknown() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Without `& 255`, high bits of `x` are unknown: `((x ^ 128) - 128) <s 0` != bit 7 of x
+            "(((x ^ 128) - 128) <s 0) == extract<7, 1>(x)",
+            "(((x & 511 ^ 128) - 128) <s 0) == extract<7, 1>(x)",
+            // Binary congruence must reject unequal operands
+            "((a * 33 + d) | (e * 65 + h)) == ((a * 33 + d) | (e * 65 + h + 1))",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Refuted(_)),
+                "expected Refuted for {text}, got {out:?}"
+            );
+        }
     }
 }

@@ -365,8 +365,156 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Optio
     Ok(acc)
 }
 
+/// Strip a redundant `& (w - 1)` mask from a rotation count at a power-of-two width `w`.
+fn strip_rot_mask(cx: &Context, s: u32, w: u16) -> u32 {
+    let n = cx.node(s);
+    if n.op == OpCode::And && w.is_power_of_two() {
+        let want = u64::from(w - 1);
+        if cx.const_val(n.b).and_then(|v| v.to_u64()) == Some(want) {
+            return n.a;
+        }
+        if cx.const_val(n.a).and_then(|v| v.to_u64()) == Some(want) {
+            return n.b;
+        }
+    }
+    s
+}
+
+/// Recognize variable-count rotations:
+/// - `(x << s1) | (x >>u s2)` (or their shared low truncation) where `0 <= s1, s2 < w` and
+///   `(s1 + s2) ≡ 0 (mod w)` at power-of-two width `w <= 64` -> `rotr(x, s2)` or `rotl(x, s1)`;
+/// - chained rotations `rot(rot(x, s1), s2)` at power-of-two width `w` -> `rot(x, s1 ± s2)`;
+/// - redundant `& (w - 1)` mask on a rotation count at power-of-two width `w`.
+fn var_rotate(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let node = cx.node(n);
+    let w = node.width;
+    if matches!(node.op, OpCode::RotL | OpCode::RotR) && w.is_power_of_two() && w >= 8 {
+        let s = strip_rot_mask(cx, node.b, w);
+        let inner = cx.node(node.a);
+        if matches!(inner.op, OpCode::RotL | OpCode::RotR)
+            && (cx.const_val(node.b).is_none() || cx.const_val(inner.b).is_none())
+        {
+            let before = cx.len() as u32;
+            let s1 = strip_rot_mask(cx, inner.b, w);
+            let same_dir = node.op == inner.op;
+            let combined = r.build(cx, |cx| {
+                if same_dir {
+                    cx.c_bin(BinOp::Add, s1, s)
+                } else {
+                    cx.c_bin(BinOp::Sub, s, s1)
+                }
+            })?;
+            let rop = if node.op == OpCode::RotL {
+                BinOp::RotL
+            } else {
+                BinOp::RotR
+            };
+            let e = r.build(cx, |cx| cx.c_bin(rop, inner.a, combined))?;
+            // Combining two nested rotates into one with summed count breaks the chain cleanly.
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Shuffle,
+                n,
+                e,
+                before,
+                &[inner.a, s1, s],
+                Fin::FINAL,
+                true,
+            )
+            .map(Some);
+        }
+        if s != node.b {
+            let before = cx.len() as u32;
+            let rop = if node.op == OpCode::RotL {
+                BinOp::RotL
+            } else {
+                BinOp::RotR
+            };
+            let e = r.build(cx, |cx| cx.c_bin(rop, node.a, s))?;
+            return super::finish(
+                r,
+                cx,
+                PassKind::Shuffle,
+                n,
+                e,
+                before,
+                &[node.a, s],
+                Fin::FINAL,
+            )
+            .map(Some);
+        }
+        return Ok(None);
+    }
+    if node.op != OpCode::Or {
+        return Ok(None);
+    }
+    let unwrap_low = |id: u32| -> (u32, bool) {
+        let m = cx.node(id);
+        if m.op == OpCode::Extract && m.b == 0 {
+            (m.a, true)
+        } else {
+            (id, false)
+        }
+    };
+    let (la, ta) = unwrap_low(node.a);
+    let (lb, tb) = unwrap_low(node.b);
+    if ta != tb {
+        return Ok(None);
+    }
+    let (na, nb) = (cx.node(la), cx.node(lb));
+    let (x, s1, s2) = match (na.op, nb.op) {
+        (OpCode::Shl, OpCode::LShr) if na.a == nb.a => (na.a, na.b, nb.b),
+        (OpCode::LShr, OpCode::Shl) if na.a == nb.a => (na.a, nb.b, na.b),
+        _ => return Ok(None),
+    };
+    if cx.const_val(s1).is_some() && cx.const_val(s2).is_some() {
+        return Ok(None);
+    }
+    let wx = cx.wid(x);
+    if !wx.is_power_of_two() || !(8..=64).contains(&wx) {
+        return Ok(None);
+    }
+    let logw = wx.trailing_zeros() as u16;
+    let hi_mask = (u64::MAX >> (64 - wx)) & !u64::from(wx - 1);
+    let (k1, f1) = super::known_words(r, cx, s1)?;
+    let (k2, f2) = super::known_words(r, cx, s2)?;
+    let bounded = |k: Option<[u64; 2]>| k.is_some_and(|[kz, _]| (kz & hi_mask) == hi_mask);
+    if !(bounded(k1) && bounded(k2)) {
+        return Ok(None);
+    }
+    let fin = f1.and(f2);
+    let before = cx.len() as u32;
+    let neg_s2 = r.build(cx, |cx| cx.c_un(UnOp::Neg, s2))?;
+    let mut complementary = super::poly::equal_mod(r, cx, s1, neg_s2, logw)?;
+    #[cfg(feature = "mba")]
+    if !complementary {
+        complementary = super::mba::equal_lanes(r, cx, s1, neg_s2, logw)?;
+    }
+    if !complementary {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    let (rop, chosen_s) = if tree(s2) <= tree(s1) {
+        (BinOp::RotR, strip_rot_mask(cx, s2, wx))
+    } else {
+        (BinOp::RotL, strip_rot_mask(cx, s1, wx))
+    };
+    let rot = r.build(cx, |cx| cx.c_bin(rop, x, chosen_s))?;
+    let e = if ta {
+        r.build(cx, |cx| cx.c_extract(rot, 0, w))?
+    } else {
+        rot
+    };
+    super::finish(r, cx, PassKind::Shuffle, n, e, before, &[x, chosen_s], fin).map(Some)
+}
+
 /// The shuffle pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
+    if let Some(step) = var_rotate(r, cx, n)? {
+        return Ok(step);
+    }
     let node = cx.node(n);
     if node.width > MAX_WIDTH || !traced_op(node.op) || node.op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
@@ -433,4 +581,48 @@ fn zext_slice(cx: &Context, e: u32) -> bool {
     }
     let s = cx.node(z.a);
     s.op == OpCode::Extract && cx.wid(s.a) != z.width
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use crate::{Context, ParseOptions, Width};
+
+    #[test]
+    fn var_rotate_recognizes_complementary_bounded_shifts_and_folds_chains() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        for text in [
+            // Complementary bounded shifts mod 64
+            "let s = k & 63; let c = (0 - s) & 63; (x << c) | (x >>u s) == rotr(x, k)",
+            // Chained variable rotates cancel
+            "rotl(rotr(x, k & 63), k & 63) == x",
+            // Redundant low-bit mask on power-of-two rotate count
+            "rotr(x, k & 63) == rotr(x, k)",
+        ] {
+            let e = cx.parse(text, &opt).unwrap();
+            let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+            assert!(
+                matches!(out, crate::prove::Outcome::Proved(_)),
+                "expected Proved for {text}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn var_rotate_rejects_unbounded_shift_count_above_width() {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        let prover = crate::prove::Simplifiers::new();
+        let cfg = crate::prove::Config::default().with_simplify_fuel(1 << 14);
+        // At s == 65, `c = (64 - s) & 127 = 127`: both shifts are >= 64, so LHS == 0 while RHS == rotr(x, 1).
+        let text = "let s = k & 127; let c = (64 - s) & 127; ((x << c) | (x >>u s)) == rotr(x, s)";
+        let e = cx.parse(text, &opt).unwrap();
+        let out = crate::prove::valid_under_with(&mut cx, e, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(out, crate::prove::Outcome::Refuted(_)),
+            "expected Refuted for {text}, got {out:?}"
+        );
+    }
 }
