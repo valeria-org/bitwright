@@ -1157,7 +1157,7 @@ impl Question {
         // so even constraints hidden inside the predicate participate in witness validation.
         if cfg.simplify && !cfg.certificate && !cfg.word_sampling
             && cfg.sample_mode == SampleMode::Random && cfg.samples >= 128
-            && env.deadline.is_none_or(|d| d.clock.now_ticks() < d.at)
+            && env.deadline.is_none()
             && let Some((tested, model)) = sample_words::guard_samples(cx, root)
         {
             q.stats.samples = tested;
@@ -1520,13 +1520,14 @@ impl Question {
         }
         let mut use_cons = true;
         let mut tried_asked = false;
+        let mut compact_retry = false;
         let (mut b, goal, extra) = loop {
             let constant_goal = cuts::constant_true(cx, goal_node);
             let mut b = Blaster::new(cx, cfg.max_nodes);
             b.selector_hints = cfg.selector_branching;
-            b.input_cancellation = cfg.input_cancellation;
-            b.join_factoring = cfg.join_factoring;
-            b.carry_save_multiplication = cfg.carry_save_multiplication;
+            b.input_cancellation = cfg.input_cancellation || compact_retry;
+            b.join_factoring = cfg.join_factoring || compact_retry;
+            b.carry_save_multiplication = cfg.carry_save_multiplication || compact_retry;
             if constant_goal {
                 b.bits.insert(goal_node, vec![aig::TRUE]);
             }
@@ -1544,7 +1545,7 @@ impl Question {
                 Ok((goal, extra)) if b.g.len() <= cfg.max_nodes => break (b, goal, extra),
                 // (Written again by shared_sums the circuit is too large: try the question as
                 // asked with its original constraints before falling back to the joint form.)
-                _ if goal_node != asked && !tried_asked && use_cons => {
+                _ if !compact_retry && goal_node != asked && !tried_asked && use_cons => {
                     goal_node = asked;
                     tried_asked = true;
                 }
@@ -1555,6 +1556,29 @@ impl Question {
                     goal_node = joint_fallback.take().unwrap();
                     use_cons = false;
                     tried_asked = true;
+                }
+                // Before giving up with `TooLarge`, retry circuit construction once with
+                // shared sum prefixes, carry-save multiplication, and join factoring when
+                // certificates are not requested and any of those compacting modes were off.
+                ref res
+                    if !compact_retry
+                        && !cfg.certificate
+                        && (!cfg.shared_sums
+                            || !cfg.carry_save_multiplication
+                            || !cfg.join_factoring)
+                        && (b.too_large || matches!(res, Ok(_))) =>
+                {
+                    compact_retry = true;
+                    if !cfg.shared_sums {
+                        goal_node = sums::shared(cx, goal_node)?;
+                        if cx
+                            .const_val(goal_node)
+                            .is_some_and(|value| !value.is_zero())
+                        {
+                            q.stats.rewritten = true;
+                            return decided(q, Outcome::Proved(None));
+                        }
+                    }
                 }
                 Ok(_) => {
                     let why = Unknown::TooLarge { nodes: b.g.len() };

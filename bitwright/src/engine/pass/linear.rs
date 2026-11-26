@@ -636,7 +636,9 @@ fn strip_annihilated_terms(
             kept.push((atom, *coef));
         }
     }
-    f.terms = kept;
+    if kept.len() != f.terms.len() {
+        f.terms = kept;
+    }
     Ok(f)
 }
 

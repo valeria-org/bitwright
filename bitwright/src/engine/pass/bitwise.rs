@@ -1709,6 +1709,61 @@ pub(super) fn merge_complementary_arms(
 /// the linear pass's `step`).
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
+    // Collapse diamond nested selects (`select(a, select(b, x, y), x) -> select(a & ~b, y, x)`
+    // and symmetric arm matches) into a single `select` over a combined 1-bit guard.
+    if op == OpCode::Select {
+        let node = cx.node(n);
+        let (a, t, f) = (node.a, node.b, node.c);
+        let tn = cx.node(t);
+        let fn_ = cx.node(f);
+        let diamond = if tn.op == OpCode::Select && tn.b == f {
+            Some((0u8, t, tn.a, tn.c, f))
+        } else if tn.op == OpCode::Select && tn.c == f {
+            Some((1u8, t, tn.a, tn.b, f))
+        } else if fn_.op == OpCode::Select && fn_.c == t {
+            Some((2u8, f, fn_.a, fn_.b, t))
+        } else if fn_.op == OpCode::Select && fn_.b == t {
+            Some((3u8, f, fn_.a, t, fn_.c))
+        } else {
+            None
+        };
+        if let Some((mode, inner_sel, b, arm1, arm2)) = diamond {
+            let inner_once = if super::alone(r) {
+                true
+            } else {
+                super::refresh_uses(r, cx)?;
+                !r.life.dead.contains(inner_sel)
+                    && r.life.live.uses(inner_sel) == Some(1)
+                    && !r.life.live_roots.contains(&inner_sel)
+            };
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let g = match mode {
+                    0 => {
+                        let nb = cx.c_un(UnOp::Not, b)?;
+                        cx.c_bin(BinOp::And, a, nb)?
+                    }
+                    1 => cx.c_bin(BinOp::And, a, b)?,
+                    2 => {
+                        let na = cx.c_un(UnOp::Not, a)?;
+                        cx.c_bin(BinOp::And, na, b)?
+                    }
+                    _ => cx.c_bin(BinOp::Or, a, b)?,
+                };
+                cx.c_select(g, arm1, arm2)
+            })?;
+            let mut stops = Vec::with_capacity(4);
+            for id in [a, b, arm1, arm2] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            let tie = cx.meta[n as usize].tree != u32::MAX
+                && cx.meta[e as usize].tree < cx.meta[n as usize].tree;
+            let slack = if tie && inner_once { 2 } else { u32::from(tie) };
+            return super::finish_within(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, slack);
+        }
+    }
     if !bitwise_op(op) {
         return Ok(Step::Normal(Fin::FINAL));
     }

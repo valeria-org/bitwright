@@ -1353,6 +1353,9 @@ fn equal_low_cone_zero(
             || (matches!(n.op, OpCode::Zext | OpCode::Sext) && cx.wid(n.a) <= 64)
             || (n.op == OpCode::Extract && n.b == 0 && n.width >= bits && cx.wid(n.a) <= 64);
         if !causal {
+            if order.len() >= 48 {
+                return None;
+            }
             let vbits = n.width.min(bits);
             leaves.push((i, vbits));
             idx_map.insert(i, order.len());
@@ -1380,7 +1383,7 @@ fn equal_low_cone_zero(
         order.push(i);
     }
     let total_bits: u16 = leaves.iter().map(|&(_, b)| b).sum();
-    if total_bits > 12 {
+    if total_bits > 12 || order.len() > 48 {
         return None;
     }
     let mut vals = [0u64; 48];

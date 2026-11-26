@@ -192,6 +192,7 @@ impl Answers {
 struct Leg {
     build: write::Build,
     found: Option<(u32, u32)>,
+    kept_ref: Option<std::sync::Arc<Kept>>,
     work: u64,
     fin: Fin,
     forked: bool,
@@ -232,6 +233,8 @@ struct Kept {
     work: u64,
     forked: bool,
     wordy: bool,
+    /// Cached `words_proved` verdict (`0` = unasked, `1` = proved, `2` = unproved).
+    verdict: std::sync::atomic::AtomicU8,
     /// The answer it found, the size of its DAG, and the finality the search left; `None`
     /// where it found nothing.
     found: Option<(write::KeptBuild, u32, Fin)>,
@@ -348,16 +351,17 @@ fn leg(
                 .found_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let (found, fin) = match &q.found {
+        let (found, fin, kept_ref) = match &q.found {
             Some((kept, size, fin)) => {
                 let root = build.restore(cx, &nodes, kept).map_err(Stop::Error)?;
-                (Some((root, *size)), *fin)
+                (Some((root, *size)), *fin, Some(q.clone()))
             }
-            None => (None, lift.fin.unwrap_or(Fin::FINAL)),
+            None => (None, lift.fin.unwrap_or(Fin::FINAL), None),
         };
         return Ok(Leg {
             build,
             found,
+            kept_ref,
             work: q.work,
             fin,
             forked: q.forked,
@@ -385,6 +389,7 @@ fn leg(
             .map(|kb| Some((kb, size, fin))),
         (Some(_), None) => None,
     };
+    let mut kept_ref = None;
     if let Some(kept_found) = kept_found
         && let Some(key) = key
     {
@@ -402,21 +407,24 @@ fn leg(
             held.store(0, Relaxed);
         }
         held.fetch_add(size, Relaxed);
-        g.insert(
-            key,
-            std::sync::Arc::new(Kept {
-                paid,
-                consts: consts.into_boxed_slice(),
-                work,
-                forked: lift.alg.forked(),
-                wordy: lift.alg.wordy(),
-                found: kept_found,
-            }),
-        );
+        let arc_kept = std::sync::Arc::new(Kept {
+            paid,
+            consts: consts.into_boxed_slice(),
+            work,
+            forked: lift.alg.forked(),
+            wordy: lift.alg.wordy(),
+            verdict: std::sync::atomic::AtomicU8::new(0),
+            found: kept_found,
+        });
+        if arc_kept.found.is_some() {
+            kept_ref = Some(arc_kept.clone());
+        }
+        g.insert(key, arc_kept);
     }
     Ok(Leg {
         build,
         found,
+        kept_ref,
         work,
         fin,
         forked: lift.alg.forked(),
@@ -684,14 +692,41 @@ fn committed(
     e: u32,
     before: u32,
     fin: Fin,
+    kept_ref: Option<&std::sync::Arc<Kept>>,
 ) -> Result<(Step, bool), Stop> {
-    if r.inner.strategy.words_proved && e != n && !proved(r, cx, n, e)? {
-        r.stats
-            .passes
-            .entry(PassKind::Words.name())
-            .or_default()
-            .noop += 1;
-        return Ok((Step::Normal(fin), false));
+    if r.inner.strategy.words_proved && e != n {
+        if let Err(more) = super::shrinks(r, cx, n, e, &[])? {
+            r.explain = None;
+            r.stats
+                .passes
+                .entry(PassKind::Words.name())
+                .or_default()
+                .rejected_cost += 1;
+            super::discard(r, cx, before);
+            return Ok((Step::Normal(fin.and(more)), true));
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let cached = kept_ref.map_or(0, |k| k.verdict.load(Relaxed));
+        let is_proved = match cached {
+            1 => true,
+            2 => false,
+            _ => {
+                let ok = proved(r, cx, n, e)?;
+                if let Some(k) = kept_ref {
+                    k.verdict.store(if ok { 1 } else { 2 }, Relaxed);
+                }
+                ok
+            }
+        };
+        if !is_proved {
+            r.stats
+                .passes
+                .entry(PassKind::Words.name())
+                .or_default()
+                .noop += 1;
+            super::discard(r, cx, before);
+            return Ok((Step::Normal(fin), false));
+        }
     }
     Ok((
         finish(r, cx, PassKind::Words, n, e, before, &[], fin)?,
@@ -747,12 +782,12 @@ fn ask(
                 ea
             };
             unused(r, cx, before, e)?;
-            committed(r, cx, n, e, before, fin)?
+            committed(r, cx, n, e, before, fin, None)?
         }
         _ => match a.least() {
             Some((l, root, _)) => {
                 let e = l.build.write(r, cx, root)?;
-                let (step, found) = committed(r, cx, n, e, before, fin)?;
+                let (step, found) = committed(r, cx, n, e, before, fin, l.kept_ref.as_ref())?;
                 if let Step::To(e, _) = step
                     && a.of_sums(l)
                 {
@@ -780,7 +815,7 @@ fn ask(
 const PROOF_NODES: usize = 1 << 18;
 /// See [`PROOF_NODES`].
 #[cfg(feature = "prove")]
-const PROOF_PROPAGATIONS: u64 = 1 << 23;
+const PROOF_PROPAGATIONS: u64 = 1 << 18;
 
 /// Whether what the pass made of `n` is proved equal to it, by a prover that knows nothing
 /// of the pass: a circuit of both and a search, over a scratch copy.
@@ -802,8 +837,8 @@ fn proved(r: &mut Runner<'_, '_>, cx: &Context, n: u32, e: u32) -> Result<bool, 
     let out =
         (crate::circuit_equality())(&mut scx, both[0], both[1], &caps).map_err(Stop::Error)?;
     let left = r.meter.left_in(|b| b.pass_work);
-    r.meter
-        .charge(Counter::PassWork, (out.nodes as u64).min(left))?;
+    let cost = (out.nodes as u64).saturating_add(out.propagations / 4);
+    r.meter.charge(Counter::PassWork, cost.min(left))?;
     Ok(out.verdict == EqualityVerdict::Proved)
 }
 

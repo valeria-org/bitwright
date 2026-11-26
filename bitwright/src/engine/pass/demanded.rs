@@ -174,6 +174,10 @@ struct Demand {
     whole_sums: bool,
     /// The most nodes one simplification visits (the strategy may lower [`MAX_VISITS`]).
     cap: u32,
+    /// Whether this simplification records region-boundary `stops` and `identities` (`true` for
+    /// `demanded::step`; `false` for `reduced`, `under_mask`, and `prove_masked_equal`, which
+    /// discard `stops`).
+    track_stops: bool,
     stops: Vec<u32>,
     visits: u32,
     fin: Fin,
@@ -455,9 +459,11 @@ fn simplify(
     // Found nothing to simplify under this mask in an earlier step of the phase run: the same
     // leaves as then.
     if let Some(&(from, len)) = r.demanded.same.map.get(&Key(x, *m)) {
-        let (from, len) = (from as usize, len as usize);
-        st.stops
-            .extend_from_slice(&r.demanded.same.leaves[from..from + len]);
+        if st.track_stops {
+            let (from, len) = (from as usize, len as usize);
+            st.stops
+                .extend_from_slice(&r.demanded.same.leaves[from..from + len]);
+        }
         st.note(Key(x, *m), x);
         return Ok(x);
     }
@@ -929,7 +935,8 @@ fn simplify(
     };
     st.note(Key(x, *m), v);
     // (Not above a sum with carries: what it is read as depends on its other users.)
-    if !skip_same_cache
+    if st.track_stops
+        && !skip_same_cache
         && v == x
         && x < st.before
         && r.demanded.same.carried.get(&x) != Some(&true)
@@ -949,12 +956,19 @@ fn read_once(r: &mut Runner<'_, '_>, cx: &Context, x: u32) -> Result<bool, Stop>
 /// Records `x` as a node the simplification stops at: a node it built itself is no leaf of the
 /// region (the commit rule counts it), so the nodes below it that existed are.
 fn stop_at(cx: &Context, st: &mut Demand, x: u32) {
+    if !st.track_stops {
+        return;
+    }
     if x < st.before {
         st.stops.push(x);
         return;
     }
+    let mut seen: IdMap<u32, ()> = IdMap::default();
     let mut stack = vec![x];
     while let Some(i) = stack.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
         if i < st.before {
             st.stops.push(i);
         } else {
@@ -1180,6 +1194,7 @@ pub(super) fn reduced(
         whole: Some(Vec::new()),
         whole_sums,
         cap,
+        track_stops: false,
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
@@ -2566,6 +2581,7 @@ fn prove_masked_equal(
         whole: None,
         whole_sums: false,
         cap: 64,
+        track_stops: false,
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
@@ -2854,6 +2870,7 @@ pub(in crate::engine) fn under_mask(
         whole: None,
         whole_sums: false,
         cap: MAX_VISITS,
+        track_stops: false,
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
@@ -2889,6 +2906,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         whole_sums: false,
         memo: std::mem::take(&mut r.demanded.memo),
         cap: MAX_VISITS.min(super::region_cap(r)),
+        track_stops: true,
         stops: Vec::new(),
         visits: 0,
         fin: Fin::FINAL,
@@ -2961,6 +2979,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             whole_sums: false,
             memo: std::mem::take(&mut st.memo),
             cap: st.cap,
+            track_stops: true,
             stops: Vec::new(),
             visits: 0,
             fin: Fin::FINAL,
@@ -2991,6 +3010,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         count(r).noop += 1;
         return Ok(Step::Normal(fin));
     }
+    let kept = sorted_distinct(&mut stops);
+    stops.truncate(kept);
     let e = rebuilt(r, cx, x2)?;
     r.explain_with(|| crate::engine::Explanation::Demanded {
         operand: cx.handle(operand),

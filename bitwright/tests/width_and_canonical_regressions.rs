@@ -1094,3 +1094,414 @@ fn xor_complement_zext_peers_nonzero_select_facts_and_bit_table_multi_carry() {
         }
     }
 }
+
+#[test]
+fn opaque_predicate_48_leaf_low_cone_boundary_no_panic() {
+    // Regression test for `equal_low_cone_zero` 48-input boundary when `!causal` leaf nodes
+    // reach index 48 during low-cone collection.
+    let src = "\
+        let %0 = ~#337011:64; \
+        let %1 = %0 & (#336973:64 | 0xffffcffe2160fe4d); \
+        let %2 = ~#336973; \
+        let %3 = %2 ^ #337011 ^ 0xffffcffe2160fe4d; \
+        let %4 = %0 & #336973; \
+        let %5 = ~%4 & 0x3001de9f01b2; \
+        let %6 = ~(#336973 & 0x3001de9f01b2) & #337011; \
+        let %7 = %2 & ~(%0 & 0xffffcffe2160fe4d); \
+        let %8 = #337011 | 0xffffcffe2160fe4d; \
+        let %9 = %8 & #336973; \
+        let %10 = ~(%2 & %8) & ~(%4 & 0x3001de9f01b2); \
+        let %11 = %3 * 0x40f7ccfc84b18b4b + #337089:64 + %1 * 0x40f7ccfc84b18b4b + %5 * 0x40f7ccfc84b18b4b + %6 * 0x81ef99f909631696 + %7 * 0x7e106606f69ce96a + %9 * 0x7e106606f69ce96a + %10 * 0x40f7ccfc84b18b4b; \
+        let %12 = trunc<32>(%6 * 0xff7fff7dd7ef6fff); \
+        let %13 = trunc<32>(%9 * 0xff7fff7dd7ef6fff + %7 * 0xff7fff7dd7ef6fff); \
+        let %14 = trunc<32>(%1 * 0xff7fff7dd7ef6fff + %3 * 0xff7fff7dd7ef6fff + %5 * 0xff7fff7dd7ef6fff + %10 * 0xff7fff7dd7ef6fff); \
+        let %15 = zext<64>(trunc<32>(zext<64>(%12 * 0xceb1181e + %13 * 0x314ee7e2 + %14 * 0x67588c0f) << 2)); \
+        let %16 = %11 << (zext<64>(trunc<8>((%15 << 2) + %15)) & 63) | %11 >>u (zext<64>(trunc<8>(%12 * 0x2de41628 + %13 * 0xd21be9d8 + %14 * 0x16f20b14)) & 63); \
+        let %17 = %1 * 0x421332d0572007b7 + %3 * 0x421332d0572007b7 + %5 * 0x421332d0572007b7 + %6 * 0x842665a0ae400f6e + %7 * 0x7bd99a5f51bff092 + %9 * 0x7bd99a5f51bff092 + %10 * 0x421332d0572007b7 + (%16 << zext<64>(%13 * 0x73813f8c + %12 * 0x8c7ec074 + %14 * 0x463f603a & 62) | %16 >>u zext<64>(%13 * 0x14c6bff4 + %12 * 0xeb39400c + %14 * 0xf59ca006 & 62)); \
+        let %18 = (%17 << (zext<64>(trunc<8>(%13 * 0xee7c539a + %12 * 0x1183ac66 + %14 * 0x8c1d633)) & 63) | %17 >>u (zext<64>(trunc<8>(%12 * 0x42364c1a + %13 * 0xbdc9b3e6 + %14 * 0x211b260d)) & 63)) + zext<64>(%12 * 0x51dee002 + %13 * 0xae211ffe + %14 * 0x28ef7001) <u #337011; \
+        let %19 = %1 * 61 + %3 * 61 + %5 * 61 + %6 * 122 + %7 * -122 + %9 * -122 + %10 * 61; \
+        let %20 = zext<64>(%12 * 0xd6728018 + %13 * 0x298d7fe8 + %14 * 0xeb39400c); \
+        let %21 = select(%18, %19, %20); \
+        let %22 = ~(%1 * 0xf8bb06422beb8150 + %3 * 0xf8bb06422beb8150 + %5 * 0xf8bb06422beb8150 + %6 * 0xf1760c8457d702a0 + %7 * 0xe89f37ba828fd60 + %9 * 0xe89f37ba828fd60 + %10 * 0xf8bb06422beb8150 + %21 + 0xf8bb06436bfddd80); \
+        let %23 = ~select(%18, %19 & 0x744f9bc9402227f, %20 & 0x744f9bc9402227f) & ~(~%21 & 0xf8bb06436bfddd80); \
+        let %24 = select(%18, %19 ^ 0xf8bb06436bfddd80, %20 ^ 0xf8bb06436bfddd80); \
+        let %25 = select(%18, ~(%22 & %1 * 0x85c83c0482a04423 + %3 * 0x85c83c0482a04423 + %5 * 0x85c83c0482a04423 + %6 * 0xb90780905408846 + %7 * 0xf46f87f6fabf77ba + %9 * 0xf46f87f6fabf77ba + %10 * 0x85c83c0482a04423) & %23 * 0x37013168419011 + %24 * 0x37013168419011, ~(%22 & %3 * 0x4068d0404630c3 + %1 * 0x4068d0404630c3 + %5 * 0x4068d0404630c3 + %6 * 0x80d1a0808c6186 + %7 * 0xff7f2e5f7f739e7a + %9 * 0xff7f2e5f7f739e7a + %10 * 0x4068d0404630c3) & %24 * 0x910503210b80c401 + %23 * 0x910503210b80c401); \
+        let %26 = %25 << zext<64>(%13 * 0xbafcbf94 + %12 * 0x4503406c + %14 * 0xa281a036 & 62); \
+        let %27 = ~%26; \
+        let %28 = %25 >>u zext<64>(%13 * 0xcd4b3fec + %12 * 0x32b4c014 + %14 * 0x995a600a & 62); \
+        let %29 = ~%28; \
+        let %30 = %1 * 0x7982f07c89f7ad6 + %3 * 0x7982f07c89f7ad6 + %5 * 0x7982f07c89f7ad6 + %6 * 0xf305e0f913ef5ac + %7 * 0xf0cfa1f06ec10a54 + %9 * 0xf0cfa1f06ec10a54 + %10 * 0x7982f07c89f7ad6 & (%27 & %29); \
+        let %31 = %3 * 0xf867d0f83760852b + %1 * 0xf867d0f83760852b + %5 * 0xf867d0f83760852b + %6 * 0xf0cfa1f06ec10a56 + %7 * 0xf305e0f913ef5aa + %9 * 0xf305e0f913ef5aa + %10 * 0xf867d0f83760852b & (%26 | %28); \
+        let %32 = ~(~%30 & (~%31 & %1 * 0xc65041ee97643995 + %3 * 0xc65041ee97643995 + %5 * 0xc65041ee97643995 + %6 * 0x8ca083dd2ec8732a + %7 * 0x735f7c22d1378cd6 + %9 * 0x735f7c22d1378cd6 + %10 * 0xc65041ee97643995)) & ~(%1 * 0x39afbe11689bc66c + %3 * 0x39afbe11689bc66c + %5 * 0x39afbe11689bc66c + %6 * 0x735f7c22d1378cd8 + %7 * 0x8ca083dd2ec87328 + %9 * 0x8ca083dd2ec87328 + %10 * 0x39afbe11689bc66c & (%31 | %30)); \
+        let %33 = %28 ^ #337060:64; \
+        let %34 = ~#337060; \
+        let %35 = %26 ^ %28; \
+        let %36 = ~(%27 & %28) & ~(%29 & %26); \
+        let %37 = ~(%32 * (%33 ^ %26) + %32 * (~(%34 & %35) & ~(%36 & #337060))) + ((%34 & %36 | %35 & #337060) * 0x44a5e8672092f88c + ((%27 ^ %26) & %33 ^ %26) * 0x44a5e8672092f88c) + 1; \
+        let %38 = ~(%37 * (%37 ^ #337011) + %37 * (~(~%37 & #337011) & ~(%0 & %37))) + zext<64>(trunc<32>(%1 * 0x9ef1bd12b0ef03f1 + %3 * 0x9ef1bd12b0ef03f1 + %5 * 0x9ef1bd12b0ef03f1 + %6 * 0x3de37a2561de07e2 + %7 * 0xc21c85da9e21f81e + %9 * 0xc21c85da9e21f81e + %10 * 0x9ef1bd12b0ef03f1) * 0xc4ba72ef); \
+        let %39 = %38 + 0x44a5e8672092f88c; \
+        let %40 = %39 & 0x39afbe11689bc66b; \
+        let %41 = ~%39 & 0xc65041ee97643994; \
+        let %42 = (~(~%40 & ~%41) | 0xf867d0f83760852a) & (~(%40 + %41) | 0x7982f07c89f7ad5); \
+        let %43 = ~(~(%42 << 10) & ~(%42 >>u 54)) | 0x7fe3ceffffdf3bfd; \
+        let %44 = zext<64>((trunc<32>(rotl(%39, 10) ^ 0xde445a8012f2f8f8) | 0xffdf3bfd) * 0xe7fe30) + 0xffffcffe00000d88; \
+        let %45 = %43 * 0xf862f5bf5bb30774 + select(%44 == 0xffffcffe00000f58, %38, select(%44 == 0xffffcffe00740f58, #396171:64, select(%44 == 0xffffcffe374812f8, #396169:64, select(%44 == 0xffffcffe37bc12f8, #396167:64, select(%44 == 0xffffcffe383012f8, #396165:64, select(%44 == 0xffffcffe38a412f8, #396163:64, select(%44 == 0xffffcffe39180f58, #396161:64, select(%44 == 0xffffcffe398c0f58, #396159:64, select(%44 == 0xffffcffe3a000f58, #396157:64, select(%44 == 0xffffcffe3a740f58, #396155:64, select(%44 == 0xffffcffe5d4f52f8, #396153:64, select(%44 == 0xffffcffe5dc352f8, #396151:64, select(%44 == 0xffffcffe5e3752f8, #396149:64, select(%44 == 0xffffcffe5eab52f8, #396147:64, select(%44 == 0xffffcffe5f1f4f58, #396145:64, select(%44 == 0xffffcffe5f934f58, #396143:64, select(%44 == 0xffffcffe60074f58, #396141:64, select(%44 == 0xffffcffe607b4f58, #396139:64, select(%44 == 0xffffcffe974f52f8, #396137:64, select(%44 == 0xffffcffe97c352f8, #396135:64, select(%44 == 0xffffcffe983752f8, #396133:64, select(%44 == 0xffffcffe98ab52f8, #396131:64, select(%44 == 0xffffcffe991f4f58, #396129:64, select(%44 == 0xffffcffe99934f58, #396127:64, select(%44 == 0xffffcffe9a074f58, #396125:64, select(%44 == 0xffffcffe9a7b4f58, #396123:64, select(%44 == 0xffffcffefd4812f8, #396121:64, select(%44 == 0xffffcffefdbc12f8, #396119:64, select(%44 == 0xffffcffefe3012f8, #396117:64, select(%44 == 0xffffcffefea412f8, #396115:64, select(%44 == 0xffffcffeff180f58, #396113:64, #396112:64))))))))))))))))))))))))))))))); \
+        let %46 = ~%45 & %43 * 0x4bca0f5e8565c66c; \
+        let %47 = %45 & %43 * 0xc521cfa1ba99b995; \
+        let %48 = ~(~%46 & (~%47 & %43 * 0x203d4b92b4cb052b)) & ~(%43 * 0xf0ae936d8b347ad6 & (%46 | %47)); \
+        let %49 = trunc<32>(%43 * 0x7e069afa45762d39); \
+        let %50 = ~(%48 >>u zext<64>(%49 * 0x64d5a81a & 62)) & ~(%48 << zext<64>(%49 * 0x2f1e15a6 & 62)); \
+        let %51 = zext<64>(%49 * 0x1e4fcef7); \
+        let %52 = %50 >>u 50 & 1 == 0; \
+        let %53 = ~zext<64>(%52); \
+        let %54 = %50 >>u 44 & 1 == 0; \
+        let %55 = ~zext<64>(%54); \
+        let %56 = trunc<32>(%50); \
+        let %57 = %51 * 2 + (zext<64>(trunc<8>(zext<64>(%56 >>u 3 & 1 != 0) - 2)) | -256) + (zext<64>(trunc<8>(zext<64>(%50 >>u 33 & 1 != 0) - 2)) | -256) + zext<64>(zext<32>(%50 >>u 52 & 1 == 0) + zext<32>(%56 >>u 21 & 1 == 0) & zext<32>(%56 >>u 25 & 1 == 0)) + zext<64>(~extract<16, 8>(%50) & 7); \
+        let %58 = %55 & %57; \
+        let %59 = zext<32>(%54); \
+        let %60 = ~%57; \
+        let %61 = trunc<32>(%60); \
+        let %62 = %59 & %61; \
+        let %63 = %56 >>u 29 & 1 == 0; \
+        let %64 = ~zext<64>(%63); \
+        let %65 = zext<64>(trunc<8>(%64)) | -256; \
+        let %66 = (%58 | zext<64>(%62)) & %65; \
+        let %67 = ~%62; \
+        let %68 = zext<32>(%63); \
+        let %69 = %67 & (~trunc<32>(%58) & %68); \
+        let %70 = zext<32>(%52); \
+        let %71 = %70 & %61; \
+        let %72 = ~%71 & %59; \
+        let %73 = trunc<32>(%53); \
+        let %74 = %68 & %73; \
+        let %75 = ~zext<64>(%74); \
+        let %76 = trunc<32>(%55); \
+        let %77 = trunc<32>(%57); \
+        let %78 = %70 & %76; \
+        let %79 = (%59 ^ %77) & %68; \
+        let %80 = %57 & (%53 & %64); \
+        let %81 = %74 & %61; \
+        let %82 = %75 & %57; \
+        (%43 * 0xebdf003fff80010 | zext<64>(%50 >>u 38 & 1 == 0)) * -1 + %51 + (~(%53 & (%66 | zext<64>(%69))) & ~zext<64>(~trunc<32>(%66) & ~%69 & %70)) * 0x97b425ed097b427 + (~zext<64>(~%72 & %68) & ~zext<64>(%72 & trunc<32>(%65))) * 0x2f684bda12f684bf + ~(~zext<64>(%59 & trunc<32>(%75)) & %57) * 0x5555555555555559 + (~zext<64>((%68 | %59) & %73) & %60) * 0x2f684bda12f684bb + zext<64>(%68 & %70 & (%59 ^ %76) & %77 ^ %59) * 0x5555555555555557 + zext<64>(~(%68 & %77) & %78) * 0x8e38e38e38e38e38 + ~zext<64>(%74 & %59 & %61) * 0x684bda12f684bda3 + zext<64>((%67 ^ %68) & %70) * 0xe38e38e38e38e391 + ~zext<64>(%59 & %73 & (%68 | %77)) * 0xf684bda12f684bdc + ~zext<64>(~(~%78 & %77) & %68) * 0x12f684bda12f684c + (~zext<64>(%79 & %73) & ~zext<64>(~%79 & %70)) * 0x684bda12f684bda3 + (%55 & %80 | zext<64>(~trunc<32>(%80) & %59)) * 0x97b425ed097b425d + (~(~zext<64>(%81) & (%55 & ~%82)) & ~zext<64>((%81 | trunc<32>(%82)) & %59)) * 0x7b425ed097b425ee + zext<64>(((%68 ^ %77) & (%70 ^ %73) ^ %70) & %59) + ~zext<64>(((%59 | %77) & %73 | %71 & %76) & %68) * 0xe38e38e38e38e38a + ~(%57 & (%65 & (zext<64>(trunc<8>(%53 & %55)) | -256))) * 0x84bda12f684bda0f == 0";
+    let mut cx = Context::new();
+    let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+    let solver: Arc<dyn MbaSolver> = Arc::new(NormalFormSolver::new(
+        NfOptions::default().with_memo(1 << 14).with_basis_sums(true),
+    ));
+    let strat = Strategy::deobfuscate().with_mba(
+        MbaConfig::default()
+            .with_opaque_sweep(true)
+            .with_noise_forms(true)
+            .with_known_atoms(true),
+    );
+    let engine = Engine::builder()
+        .builtin()
+        .strategy(strat)
+        .mba_solver(solver)
+        .build()
+        .unwrap();
+    let out = simplify_fuel(&engine, &mut cx, e, 524_288);
+    assert_eq!(cx.width(out).unwrap(), Width::W1);
+}
+
+#[test]
+fn demanded_stop_at_shared_multistage_dag_linear_traversal() {
+    // Regression test for exponential re-traversal / 4 GiB Vec growth in `demanded::stop_at`
+    // when a newly-built (`>= st.before`) multi-stage shared byte-chain DAG is walked without
+    // a visited set.
+    let src = "\
+        let %0 = ~#73699:64; \
+        let %1 = ~#65004:64; \
+        let %2 = trunc<32>(zext<64>(trunc<16>(zext<64>(trunc<16>(#68930:64 & 65523 | 0x14041000c)) | 0x140410000)) | 0x140410000) & 0xbfffffff; \
+        let %3 = ~%2; \
+        let %4 = trunc<32>((zext<64>(%3) << 1) + zext<64>(%2)); \
+        let %5 = extract<16, 8>(%4); \
+        let %6 = zext<32>(%5); \
+        let %7 = trunc<32>(#68386:64); \
+        let %8 = ~zext<64>(%5); \
+        let %9 = ~#68386; \
+        let %11 = trunc<32>(%9); \
+        let %12 = ~(%9 & 0x1b43b026dad416b0); \
+        let %13 = %8 & #68386; \
+        let %14 = %6 & 0xdad416b0; \
+        let %15 = ~zext<64>(%14); \
+        let %16 = ~(%8 & 0xe4bc4fd9252be94f) & %15; \
+        let %17 = zext<64>(%4 >>u 16 & %11 & 0x252be94f) * 0x100000001b3 + ~(%12 & %8) * 0xfffffdfffffffc9a + ~(~(~%13 & 0xe4bc4fd9252be94f) & ~(%13 & 0x1b43b026dad416b0)) * 0xfffffdfffffffc9a + ~zext<64>(%6 & trunc<32>(%12)) * 0xfffffefffffffe4d + (~(%16 & #68386) & ~(~%16 & %9)) * 0x20000000366 + (~zext<64>(%14 & %11) & ~(%15 & #68386)) * 0x100000001b3 + zext<64>(~(%7 & 0xdad416b0) & (~(%11 & 0x252be94f) & %6)) * 0x100000001b3; \
+        let %19 = ~%17; \
+        let %20 = ~#68388:64; \
+        let %22 = extract<8, 8>(%4); \
+        let %23 = ~zext<64>(%22); \
+        let %28 = %20 & %23; \
+        let %29 = (~(%19 & %28) & ~(~%28 & %17)) * 0xfffffefffffffe4d; \
+        let %32 = zext<64>(~%4) | -256; \
+        let %36 = %29 & #11:64; \
+        let %37 = ~%36; \
+        let %39 = ~(~zext<64>(trunc<8>(%4 & trunc<32>(%37))) & ~(%36 & %32)) * 0xfffffefffffffe4d; \
+        let %40 = trunc<32>(%39); \
+        let %41 = extract<8, 8>(%39); \
+        let %42 = extract<16, 8>(%39); \
+        let %43 = %40 >>u 24; \
+        let %44 = %39 >>u 56; \
+        let %45 = (~(~%44 & 0x340d631b7bdddcda) & ~zext<64>(trunc<32>(%44) & 0x84222325)) * 0x100000001b3; \
+        let %46 = trunc<32>(%39 >>u 48); \
+        let %47 = (~(~%45 & (zext<64>(~%46) | -256)) & ~zext<64>(trunc<8>(trunc<32>(%45) & %46))) * 0x100000001b3; \
+        let %48 = trunc<32>(%39 >>u 40); \
+        let %49 = (~(~%47 & (zext<64>(~%48) | -256)) & ~zext<64>(trunc<8>(trunc<32>(%47) & %48))) * 0x100000001b3; \
+        let %50 = extract<32, 32>(%39); \
+        let %51 = (~zext<64>(trunc<8>(trunc<32>(%49) & %50)) & ~(~%49 & (zext<64>(~%50) | -256))) * 0x100000001b3; \
+        let %52 = (~zext<64>(%43 & trunc<32>(%51)) & ~(~zext<64>(%43) & ~%51)) * 0x100000001b3; \
+        let %53 = (~zext<64>(zext<32>(%42) & trunc<32>(%52)) & ~(~%52 & ~zext<64>(%42))) * 0x100000001b3; \
+        let %54 = (~zext<64>(zext<32>(%41) & trunc<32>(%53)) & ~(~zext<64>(%41) & ~%53)) * 0x100000001b3; \
+        let %56 = ~%54; \
+        let %57 = (zext<64>(~%40) | -256) & #68592:64; \
+        let %58 = ~zext<64>(trunc<8>(trunc<32>(~#68592) & %40)) & ~%57; \
+        let %59 = ~(~(%56 & %58) & ~(~%58 & %54)) * 0xfffffefffffffe4d; \
+        let %60 = extract<8, 8>(%59); \
+        let %61 = %59 >>u 56; \
+        let %62 = (~zext<64>(trunc<32>(%61) & 0x84222325) & ~(~%61 & 0x340d631b7bdddcda)) * 0x100000001b3; \
+        let %63 = trunc<32>(%59 >>u 48); \
+        let %64 = (~zext<64>(trunc<8>(trunc<32>(%62) & %63)) & ~(~%62 & (zext<64>(~%63) | -256))) * 0x100000001b3; \
+        let %65 = trunc<32>(%59 >>u 40); \
+        let %66 = (~(~%64 & (zext<64>(~%65) | -256)) & ~zext<64>(trunc<8>(%65 & trunc<32>(%64)))) * 0x100000001b3; \
+        let %67 = extract<32, 32>(%59); \
+        let %68 = (~(~%66 & (zext<64>(~%67) | -256)) & ~zext<64>(trunc<8>(%67 & trunc<32>(%66)))) * 0x100000001b3; \
+        let %69 = trunc<32>(%59); \
+        let %70 = %69 >>u 24; \
+        let %71 = (~(~%68 & ~zext<64>(%70)) & ~zext<64>(%70 & trunc<32>(%68))) * 0x100000001b3; \
+        let %72 = extract<16, 8>(%59); \
+        let %73 = (~(~%71 & ~zext<64>(%72)) & ~zext<64>(zext<32>(%72) & trunc<32>(%71))) * 0x100000001b3; \
+        let %74 = (~(~zext<64>(%60) & ~%73) & ~zext<64>(zext<32>(%60) & trunc<32>(%73))) * 0x100000001b3; \
+        let %75 = ~%74; \
+        let %76 = zext<64>(~%69) | -256; \
+        let %77 = ~(~#68211:64 & ~(~(%75 & %76) & ~zext<64>(trunc<8>(%69 & trunc<32>(%74))))) * 0x100000001b3; \
+        let %78 = trunc<32>(%77); \
+        let %79 = zext<64>(~%78) | -256; \
+        let %81 = extract<8, 8>(%77); \
+        let %82 = %78 >>u 24; \
+        let %83 = trunc<32>(%77 >>u 40); \
+        let %84 = %77 >>u 56; \
+        let %85 = (~(~%84 & 0x340d631b7bdddcda) & ~zext<64>(trunc<32>(%84) & 0x84222325)) * 0x100000001b3; \
+        let %86 = trunc<32>(%77 >>u 48); \
+        let %87 = (~zext<64>(trunc<8>(trunc<32>(%85) & %86)) & ~(~%85 & (zext<64>(~%86) | -256))) * 0x100000001b3; \
+        let %88 = (~zext<64>(trunc<8>(%83 & trunc<32>(%87))) & ~(~%87 & (zext<64>(~%83) | -256))) * 0x100000001b3; \
+        let %89 = extract<32, 32>(%77); \
+        let %90 = (~zext<64>(trunc<8>(trunc<32>(%88) & %89)) & ~(~%88 & (zext<64>(~%89) | -256))) * 0x100000001b3; \
+        let %91 = (~zext<64>(%82 & trunc<32>(%90)) & ~(~zext<64>(%82) & ~%90)) * 0x100000001b3; \
+        let %92 = extract<16, 8>(%77); \
+        let %93 = (~(~%91 & ~zext<64>(%92)) & ~zext<64>(zext<32>(%92) & trunc<32>(%91))) * 0x100000001b3; \
+        let %94 = (~zext<64>(zext<32>(%81) & trunc<32>(%93)) & ~(~%93 & ~zext<64>(%81))) * 0x100000001b3; \
+        let %95 = ~%94; \
+        let %97 = ~(~(%95 & #65004) & (~(%1 & %94) & %79)) * 0x100000001b3; \
+        let %98 = extract<8, 8>(%97); \
+        let %99 = trunc<32>(%97); \
+        let %100 = %99 >>u 24; \
+        let %101 = %97 >>u 56; \
+        let %102 = (~zext<64>(trunc<32>(%101) & 0x84222325) & ~(~%101 & 0x340d631b7bdddcda)) * 0x100000001b3; \
+        let %103 = trunc<32>(%97 >>u 48); \
+        let %104 = (~(~%102 & (zext<64>(~%103) | -256)) & ~zext<64>(trunc<8>(%103 & trunc<32>(%102)))) * 0x100000001b3; \
+        let %105 = trunc<32>(%97 >>u 40); \
+        let %106 = (~(~%104 & (zext<64>(~%105) | -256)) & ~zext<64>(trunc<8>(trunc<32>(%104) & %105))) * 0x100000001b3; \
+        let %107 = extract<32, 32>(%97); \
+        let %108 = (~(~%106 & (zext<64>(~%107) | -256)) & ~zext<64>(trunc<8>(%107 & trunc<32>(%106)))) * 0x100000001b3; \
+        let %109 = (~(~zext<64>(%100) & ~%108) & ~zext<64>(%100 & trunc<32>(%108))) * 0x100000001b3; \
+        let %110 = extract<16, 8>(%97); \
+        let %111 = (~(~%109 & ~zext<64>(%110)) & ~zext<64>(zext<32>(%110) & trunc<32>(%109))) * 0x100000001b3; \
+        let %112 = (~zext<64>(zext<32>(%98) & trunc<32>(%111)) & ~(~zext<64>(%98) & ~%111)) * 0x100000001b3; \
+        let %113 = ~%112; \
+        let %114 = zext<64>(~%99) | -256; \
+        let %116 = zext<64>(#68636:8) << 8 | zext<64>(#68633:8) | zext<64>(#68639:8) << 16 | zext<64>(#68642:8) << 24 | zext<64>(#68645:8) << 32 | zext<64>(#68648:8) << 40 | zext<64>(#68651:8) << 48 | zext<64>(#68654:8) << 56; \
+        let %118 = %116 & %114; \
+        let %119 = ~(%113 & ~%118); \
+        let %123 = (%119 & ~(%112 & %118)) * 0x100000001b3; \
+        let %124 = ~%123; \
+        let %125 = zext<64>(#68524:8) << 8 | zext<64>(#68521:8) | zext<64>(#68527:8) << 16 | zext<64>(#68530:8) << 24 | zext<64>(#68533:8) << 32 | zext<64>(#68536:8) << 40 | zext<64>(#68539:8) << 48 | zext<64>(#68542:8) << 56; \
+        let %126 = ~%125; \
+        let %127 = ~(%124 & %125) & ~(%126 & %123); \
+        let %128 = %0 & %127; \
+        let %129 = #73699 & 0x140000000; \
+        let %130 = %123 & %129; \
+        let %131 = zext<64>(extract<24, 16>(%125 & 0x140000000)) << 24; \
+        let %132 = %0 & %131; \
+        let %133 = ~%132; \
+        let %134 = %0 & ~%127; \
+        let %135 = %0 & %124; \
+        let %136 = ~(%123 & #73699) & ~%135; \
+        let %137 = ~(%136 & %125) & ~(~%136 & %126); \
+        let %138 = %125 & #73699; \
+        let %139 = ~%138; \
+        let %140 = ~(%0 & %126) & %139; \
+        let %141 = %124 & %131; \
+        let %142 = %135 & %125; \
+        let %143 = %123 & 0xfffffffebfffffff; \
+        ~(~(%128 & 0x140000000) & ~(~%128 & 0xfffffffebfffffff)) + (~(~(~%129 & %124) & (%126 & ~%130)) + (%123 & (%133 & ~((zext<64>(extract<24, 16>(~%131)) << 24 | 0xffffff | 0xffffff0000000000) & #73699)))) + ~(%124 & (~(%125 & 0xfffffffebfffffff) & ~(zext<64>(extract<24, 16>(%126 & 0x140000000)) << 24) & #73699)) * 0xaaaaaaaaaaaaaaa7 + ~(~(%134 & 0xfffffffebfffffff) & ~(~%134 & 0x140000000)) * 0x5555555555555556 + (~(~%137 & 0x140000000) & ~(%137 & 0xfffffffebfffffff)) * 0xaaaaaaaaaaaaaaac + (~(%124 & ~(~(~%140 & 0x140000000) & ~(%140 & 0xfffffffebfffffff))) << 1) + (%124 & (~(%138 & 0x140000000) & ~(%139 & 0xfffffffebfffffff))) + (~(%133 & %123) & ~(%124 & zext<64>(extract<24, 16>(%132)) << 24)) * 0x5555555555555555 + ~(~(~%141 & %0) & ~(%141 & #73699)) * 0xaaaaaaaaaaaaaaab + ~(~(%142 & 0xfffffffebfffffff) & ~(~%142 & 0x140000000)) * 0x5555555555555557 + ~(~(~%143 & %0) & (~(%143 & #73699) & %125)) * 0x5555555555555556 + (%125 & zext<64>(extract<24, 16>(%130)) << 24) * 0xaaaaaaaaaaaaaaa9 + ~(~(%126 & #73699) & %143) * 0x5555555555555555 + 1";
+    let mut cx = Context::new();
+    let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+    let sz_before = match cx.dag_size(&[e], 1 << 20).unwrap() {
+        Bounded::Exact(n) | Bounded::AtLeast(n) => n,
+        _ => panic!("unexpected Bounded"),
+    };
+    let engine = build_engine(true, false);
+    let out = simplify_fuel(&engine, &mut cx, e, 1 << 21);
+    let sz_after = match cx.dag_size(&[out], 1 << 20).unwrap() {
+        Bounded::Exact(n) | Bounded::AtLeast(n) => n,
+        _ => panic!("unexpected Bounded"),
+    };
+    assert!(
+        sz_after < sz_before,
+        "expected shared byte-chain expression to shrink cleanly ({sz_before} -> {sz_after})"
+    );
+}
+
+#[test]
+fn popcnt_boundary_comparisons_and_carry_out_canonicalization() {
+    let engine = build_engine(true, false);
+
+    // 1) Width-polymorphic popcnt(x) zero / all-ones boundary canonicalization.
+    for bits in [8u16, 16, 32, 64, 128] {
+        let mut cx = Context::new();
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let cases = [
+            (format!("popcnt(x) == 0"), "x == 0"),
+            (format!("popcnt(x) != 0"), "x != 0"),
+            (format!("popcnt(x) <=u 0"), "x == 0"),
+            (format!("0 <u popcnt(x)"), "x != 0"),
+            (format!("popcnt(x) == {bits}"), "x == -1"),
+            (format!("popcnt(x) != {bits}"), "x != -1"),
+            (format!("{bits} <=u popcnt(x)"), "x == -1"),
+            (format!("popcnt(x) <u {bits}"), "x != -1"),
+            (format!("zext<256>(popcnt(x)) == 0"), "x == 0"),
+            (format!("zext<256>(popcnt(x)) == {bits}"), "x == -1"),
+        ];
+        for (lhs_s, rhs_s) in &cases {
+            let lhs = cx.parse(lhs_s, &opt).unwrap();
+            let rhs = cx.parse(rhs_s, &opt).unwrap();
+            let lhs_out = simplify_fuel(&engine, &mut cx, lhs, 1 << 14);
+            let rhs_out = simplify_fuel(&engine, &mut cx, rhs, 1 << 14);
+            assert_eq!(
+                lhs_out,
+                rhs_out,
+                "width {bits}: expected `{lhs_s}` and `{rhs_s}` to canonicalize identically (`{}` vs `{}`)",
+                cx.display(lhs_out),
+                cx.display(rhs_out)
+            );
+            if bits <= 32 {
+                assert_bitblasted_equal(&mut cx, lhs, lhs_out);
+            }
+        }
+    }
+
+    // 2) `extract<W, 1>(zext<W2>(x:W) + K)` carry-out comparison canonicalization & shifted-atom
+    //    multiply high-bit noise reduction modulo `2^(W - ctz(a))`.
+    for bits in [8u16, 16, 32, 64] {
+        let mut cx = Context::new();
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let w1 = bits + 1;
+        let ones = (1u128 << bits) - 1;
+        let carry_nz = cx
+            .parse(
+                &format!("extract<{bits}, 1>(zext<{w1}>(x) + 0x{ones:x})"),
+                &opt,
+            )
+            .unwrap();
+        let expect_nz = cx.parse("x != 0", &opt).unwrap();
+        let out_nz = simplify_fuel(&engine, &mut cx, carry_nz, 1 << 14);
+        assert_eq!(out_nz, simplify_fuel(&engine, &mut cx, expect_nz, 1 << 14));
+        if bits <= 32 {
+            assert_bitblasted_equal(&mut cx, carry_nz, out_nz);
+        }
+
+        // Annihilated 2-adic scaled term stripping (`(x & 48) * (1 << (bits - 4)) == 0`).
+        let shift_annih = 1u128 << (bits - 4);
+        let mul_zero = cx
+            .parse(&format!("(x & 48) * 0x{shift_annih:x}"), &opt)
+            .unwrap();
+        let out_zero = simplify_fuel(&engine, &mut cx, mul_zero, 1 << 14);
+        assert_eq!(cx.as_const(out_zero).unwrap(), Some(BitVec::zero(w)));
+        if bits <= 32 {
+            assert_bitblasted_equal(&mut cx, mul_zero, out_zero);
+        }
+
+        // Diamond nested `select` collapse across all 4 symmetric arm shapes.
+        for s in [
+            "select(a:1, select(b:1, x, y), x)",
+            "select(a:1, select(b:1, y, x), x)",
+            "select(a:1, x, select(b:1, y, x))",
+            "select(a:1, x, select(b:1, x, y))",
+        ] {
+            let e = cx.parse(s, &opt).unwrap();
+            let out = simplify_fuel(&engine, &mut cx, e, 1 << 14);
+            if bits <= 32 {
+                assert_bitblasted_equal(&mut cx, e, out);
+            }
+        }
+    }
+
+    // 3) Flags-driven `popcnt` + carry-out constant-folding regression (`0x70:32`).
+    let src_const = "\
+        let %0 = extract<64, 1>(zext<65>(#28126:64) + 0xffffffffffffffff); \
+        let %1 = #35753:64 * -1 + #28126 == -16; \
+        let %2 = trunc<8>(#9994:32) & 8; \
+        let %3 = trunc<8>(#16640:64 & 0x3c7300 | (zext<64>(popcnt(%2) == 0) << 2 | 2 | zext<64>(%2 == 0) << 6)); \
+        let %4 = %3 == 70; \
+        let %5 = zext<64>(#9994); \
+        let %6 = %5 ^ 4384; \
+        let %7 = %3 >>u 6; \
+        let %8 = %3 == 2; \
+        let %9 = (~select(%7 == 0, 272:64, 192) & 0xffffcffe00000d18 == 0xffffcffe00000c08) & %8; \
+        let %10 = %7 != 0; \
+        let %11 = select(%4, %6, select(%9, select(%10, 0x5db2585140c78218:64, 0xb64318a03ca5b395), #2:64 ^ 4384)); \
+        let %12 = %5 & 0x3001fffff127; \
+        let %13 = select(%4, %12, select(%9, select(%10, 0x100140c79120:64, 0x10003ca5a025), #2 & 0x3001fffff127)); \
+        let %14 = ~select(%0, select(%1, select(%0, %13, select(%8, %12, #13:64 & 0x3001fffff127)), 0x2001bd891001), select(%0, 0x300016c69120, %13)); \
+        let %15 = select(%4, %5, select(%9, select(%10, 0x5db2585140c79338:64, 0xb64318a03ca5a2b5), #2)); \
+        let %16 = ~select(%0, select(%1, select(%0, %15, select(%8, %5, #13)), 0xbe72ae97bd891211), select(%0, 0xff87711c16c697b0, %15)); \
+        let %17 = ~(%16 & 0xffffcffe00000ed8) & %14; \
+        let %18 = %5 & 0x3001ffffecdf; \
+        let %19 = select(%4, %18, select(%9, select(%10, 0x100140c78018:64, 0x10003ca5a095), #2 & 0x3001ffffecdf)); \
+        let %20 = (%5 ^ 0xffffcffe00001320) & 0x3001fffff127; \
+        let %21 = select(%4, %20, select(%9, select(%10, 0x100140c78000:64, 0x10003ca5b105), (#2 ^ 0xffffcffe00001320) & 0x3001fffff127)); \
+        trunc<32>(select(%0, select(%1, select(%0, %11, select(%8, %6, #13 ^ 4384)), 0xbe72ae97bd890331), select(%0, 0xff87711c16c68690, %11)) * 0x891d0a3f15ef3bdb + (%14 & 0xffffcffe00001320) * 0x76e2f5c0ea10c425 + (%17 & 0xffffcffe00001320) * 0x891d0a3f15ef3bdb + ~(%17 & 0x3001ffffecdf) * 0x891d0a3f15ef3bdb + (~(%16 & 0xffffcffe00001320) & (~select(%0, select(%1, select(%0, %19, select(%8, %18, #13 & 0x3001ffffecdf)), 0x2001bd890011), select(%0, 0x300016c68490, %19)) & 0xffffcffe00000ed8) | select(%0, select(%1, select(%0, %21, select(%8, %20, (#13 ^ 0xffffcffe00001320) & 0x3001fffff127)), 0x2001bd890121), select(%0, 0x300016c68000, %21))) * 0x76e2f5c0ea10c425 + (%16 & -4385) * 0x891d0a3f15ef3bdb) * 0x7c05bb0";
+    let mut cx = Context::new();
+    let e_const = cx.parse(src_const, &ParseOptions::width(Width::W64)).unwrap();
+    let out_const = simplify_fuel(&engine, &mut cx, e_const, 524_288);
+    assert_eq!(
+        cx.as_const(out_const).unwrap(),
+        Some(BitVec::from_u64(Width::W32, 0x70).unwrap())
+    );
+}
+
+#[test]
+fn prove_too_large_compact_retry_shares_sums() {
+    // Build a predicate with two differently associated 16-term 64-bit sums that exceeds a tight
+    // `max_nodes` cap when blasted naively (`shared_sums = false`), and verify the compact-circuit
+    // retry (`sums::shared` + `carry_save_multiplication` + `join_factoring`) fits the cap and
+    // proves equivalence.
+    let mut cx = Context::new();
+    let opt = ParseOptions::width(Width::W64);
+    let lhs = cx
+        .parse(
+            "(((((((((((((((x0 + x1) + x2) + x3) + x4) + x5) + x6) + x7) + x8) + x9) + x10) + x11) + x12) + x13) + x14) + x15)",
+            &opt,
+        )
+        .unwrap();
+    let rhs = cx
+        .parse(
+            "(x15 + (x14 + (x13 + (x12 + (x11 + (x10 + (x9 + (x8 + (x7 + (x6 + (x5 + (x4 + (x3 + (x2 + (x1 + x0)))))))))))))))",
+            &opt,
+        )
+        .unwrap();
+    let eq = cx.cmp(bitwright::CmpOp::Eq, lhs, rhs).unwrap();
+    let cfg = ProveConfig::default()
+        .with_simplify(false)
+        .with_certificate(false)
+        .with_shared_sums(false)
+        .with_max_nodes(6_000);
+    let out = prove::valid(&mut cx, eq, &cfg).unwrap();
+    assert!(
+        matches!(out, Outcome::Proved(_)),
+        "expected compact retry to share sum prefixes under tight max_nodes and prove equality, got {out:?}"
+    );
+}

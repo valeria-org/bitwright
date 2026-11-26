@@ -2342,6 +2342,12 @@ impl Runner<'_, '_> {
                 self.emit(Event::NoChange { rule });
                 continue;
             }
+            if !pass::alone(self) && self.rewritten.contains_key(&(r, n)) {
+                fin = fin.and(Fin::PROVISIONAL);
+                self.stats.cycles_cut += 1;
+                self.emit(Event::NoChange { rule });
+                continue;
+            }
             match self.accept(cx, By::Rule(rule), inner.proven[ri as usize], n, r, env.rel)? {
                 Accept::Yes => return Ok(Step::To(r, fin.and(Fin::relying(env.rel)))),
                 Accept::Vetoed => continue,
@@ -3092,7 +3098,7 @@ impl Runner<'_, '_> {
         }
         let settled = self.rounds(cx, cur, fin);
         #[cfg(feature = "mba")]
-        if let Ok((u, ufin)) = settled
+        let settled = if let Ok((u, ufin)) = settled
             && inner.phases.iter().any(|p| {
                 matches!(
                     p,
@@ -3105,7 +3111,32 @@ impl Runner<'_, '_> {
                 )
             })
         {
-            return self.split(cx, u, ufin);
+            self.split(cx, u, ufin)
+        } else {
+            settled
+        };
+        #[cfg(feature = "mba")]
+        if inner.strategy.kept_steps >= KEPT_STEPS
+            && inner.phases.iter().any(|p| matches!(p, PhaseImpl::Mba(_)))
+        {
+            match settled {
+                Ok((u, _))
+                    if u != root
+                        && !cx.is_const(u)
+                        && census(cx, u).0 > census(cx, root).0 =>
+                {
+                    return Ok((root, Fin::PROVISIONAL));
+                }
+                Err((u, _, stop))
+                    if !matches!(stop, Stop::Exhausted(Exhausted::Deadline))
+                        && u != root
+                        && !cx.is_const(u)
+                        && census(cx, u).0 > census(cx, root).0 =>
+                {
+                    return Err((root, Fin::PROVISIONAL, stop));
+                }
+                _ => {}
+            }
         }
         settled
     }
@@ -3432,6 +3463,24 @@ impl Runner<'_, '_> {
         // deepest (see below).
         let (mut again, mut extra) = (false, false);
         let (mut words_runs, mut post_words) = (0u8, false);
+        #[cfg(feature = "mba")]
+        let mut pre_mba: Option<(u32, Fin)> = None;
+        let finish_rounds = |cx: &Context,
+                             cur: u32,
+                             fin: Fin,
+                             #[cfg(feature = "mba")] pre_mba: Option<(u32, Fin)>|
+         -> (u32, Fin) {
+            #[cfg(feature = "mba")]
+            if inner.strategy.kept_steps >= KEPT_STEPS
+                && let Some((pm_cur, pm_fin)) = pre_mba
+                && cur != pm_cur
+                && !cx.is_const(cur)
+                && census(cx, cur).0 > census(cx, pm_cur).0
+            {
+                return (pm_cur, pm_fin.and(Fin::PROVISIONAL));
+            }
+            (cur, fin)
+        };
         loop {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             self.held = false;
@@ -3492,6 +3541,10 @@ impl Runner<'_, '_> {
                 }
                 if is_words {
                     words_runs = words_runs.saturating_add(1);
+                }
+                #[cfg(feature = "mba")]
+                if pre_mba.is_none() && matches!(inner.phases[phase], PhaseImpl::Mba(_)) {
+                    pre_mba = Some((cur, fin));
                 }
                 match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
@@ -3602,7 +3655,10 @@ impl Runner<'_, '_> {
                     again = true;
                     continue;
                 }
-                return Ok((cur, fin));
+                #[cfg(feature = "mba")]
+                return Ok(finish_rounds(cx, cur, fin, pre_mba));
+                #[cfg(not(feature = "mba"))]
+                return Ok(finish_rounds(cx, cur, fin));
             }
             if cx.is_const(cur) {
                 return Ok((cur, fin));
@@ -3632,7 +3688,10 @@ impl Runner<'_, '_> {
             again = false;
         }
         self.stats.rounds_capped += 1;
-        Ok((cur, fin))
+        #[cfg(feature = "mba")]
+        return Ok(finish_rounds(cx, cur, fin, pre_mba));
+        #[cfg(not(feature = "mba"))]
+        Ok(finish_rounds(cx, cur, fin))
     }
 }
 

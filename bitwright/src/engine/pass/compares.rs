@@ -1983,6 +1983,76 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         let e = r.build(cx, |cx| cx.mk_const_u64(1, u64::from(val)))?;
         return finish(r, cx, PassKind::Compares, n, e, before, &[], fin);
     }
+    // Population-count boundary comparisons (`popcnt(x) == 0 -> x == 0`, `popcnt(x) != 0 ->
+    // x != 0`, `popcnt(x) <=u 0 -> x == 0`, `0 <u popcnt(x) -> x != 0`, and all-ones counterparts
+    // `popcnt(x) == W -> x == -1`, `popcnt(x) != W -> x != -1` across casts of `popcnt(x)`).
+    if let Some(cmp) = node.op.as_cmp() {
+        let popcnt_arg = |cx: &Context, id: u32| -> Option<u32> {
+            let mut cur = id;
+            for _ in 0..3 {
+                let pn = cx.node(cur);
+                if pn.op == OpCode::Popcnt {
+                    return Some(pn.a);
+                }
+                if pn.op == OpCode::Zext
+                    || (pn.op == OpCode::Sext && cx.wid(pn.a) > 1)
+                {
+                    cur = pn.a;
+                } else {
+                    break;
+                }
+            }
+            None
+        };
+        let pop_cmp = if let (Some(x), Some(c)) = (popcnt_arg(cx, node.a), cx.const_val(node.b)) {
+            Some((x, c, false))
+        } else if let (Some(c), Some(x)) = (cx.const_val(node.a), popcnt_arg(cx, node.b)) {
+            Some((x, c, true))
+        } else {
+            None
+        };
+        if let Some((x, c, const_lhs)) = pop_cmp {
+            let wx = cx.width_of(x);
+            let wc = c.width();
+            let is_zero = c.is_zero();
+            let is_all_bits = (wc.bits() >= 10 || u32::from(wx.bits()) < (1u32 << wc.bits()))
+                && c == BitVec::wrapping_from_u64(wc, u64::from(wx.bits()));
+            let target = match (cmp, const_lhs) {
+                (CmpOp::Eq, _) if is_zero => Some((CmpOp::Eq, BitVec::zero(wx))),
+                (CmpOp::Ne, _) if is_zero => Some((CmpOp::Ne, BitVec::zero(wx))),
+                (CmpOp::Ule, false) if is_zero => Some((CmpOp::Eq, BitVec::zero(wx))),
+                (CmpOp::Ult, true) if is_zero => Some((CmpOp::Ne, BitVec::zero(wx))),
+                (CmpOp::Eq, _) if is_all_bits => Some((CmpOp::Eq, BitVec::ones(wx))),
+                (CmpOp::Ne, _) if is_all_bits => Some((CmpOp::Ne, BitVec::ones(wx))),
+                (CmpOp::Ule, true) if is_all_bits => Some((CmpOp::Eq, BitVec::ones(wx))),
+                (CmpOp::Ult, false) if is_all_bits => Some((CmpOp::Ne, BitVec::ones(wx))),
+                _ => None,
+            };
+            if let Some((eq_op, target_bv)) = target {
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| {
+                    let kc = cx.mk_const(&target_bv)?;
+                    cx.c_cmp(eq_op, x, kc)
+                })?;
+                let tie = cx.meta[n as usize].tree != u32::MAX
+                    && cx.meta[e as usize].tree < cx.meta[n as usize].tree;
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Compares,
+                    n,
+                    e,
+                    before,
+                    &[x],
+                    Fin::FINAL,
+                    tie,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
+    }
     // Canonicalize complemented unsigned comparisons (`~X <u ~Y -> Y <u X`, `(C - U) <u ~Y ->
     // Y <u U + ~C`, and `<=u` counterparts), strictly shrinking by stripping `Not`.
     if matches!(node.op, OpCode::Ult | OpCode::Ule) && cx.wid(node.a) <= 64 {

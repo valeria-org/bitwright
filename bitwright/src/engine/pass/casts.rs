@@ -2123,6 +2123,59 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if node.op != OpCode::Extract {
         return Ok(Step::Normal(declined));
     }
+    // Carry-out bit of zero-extended addition (`extract<W, 1>(zext<W2>(x:W) + K)` -> comparison on `x`).
+    if node.width == 1 && node.b > 0 {
+        let an = cx.node(node.a);
+        if an.op == OpCode::Add {
+            let zext_const = match (cx.node(an.a).op == OpCode::Zext, cx.const_val(an.b)) {
+                (true, Some(k)) if cx.wid(cx.node(an.a).a) == node.b as u16 => {
+                    Some((cx.node(an.a).a, k))
+                }
+                _ => match (cx.const_val(an.a), cx.node(an.b).op == OpCode::Zext) {
+                    (Some(k), true) if cx.wid(cx.node(an.b).a) == node.b as u16 => {
+                        Some((cx.node(an.b).a, k))
+                    }
+                    _ => None,
+                },
+            };
+            if let Some((x, k_bv)) = zext_const {
+                let wx = cx.width_of(x);
+                if let (Ok(k_lo), Ok(k_hi)) =
+                    (k_bv.trunc(wx), k_bv.extract(wx.bits(), crate::Width::W1))
+                {
+                    let k_bit = !k_hi.is_zero();
+                    let before = cx.len() as u32;
+                    let e = r.build(cx, |cx| {
+                        if k_lo.is_zero() {
+                            cx.mk_const_u64(1, u64::from(k_bit))
+                        } else if k_lo.is_ones() {
+                            let z = cx.mk_const(&BitVec::zero(wx))?;
+                            cx.c_cmp(
+                                if k_bit {
+                                    crate::CmpOp::Eq
+                                } else {
+                                    crate::CmpOp::Ne
+                                },
+                                x,
+                                z,
+                            )
+                        } else {
+                            let nk = cx.mk_const(&BitVec::un_unchecked(UnOp::Not, &k_lo))?;
+                            if k_bit {
+                                cx.c_cmp(crate::CmpOp::Ule, x, nk)
+                            } else {
+                                cx.c_cmp(crate::CmpOp::Ult, nk, x)
+                            }
+                        }
+                    })?;
+                    match finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL)? {
+                        Step::Normal(f) => declined = declined.and(f),
+                        done => return Ok(done),
+                    }
+                }
+            }
+        }
+    }
     let before = cx.len() as u32;
     let mut st = Narrow {
         memo: IdMap::default(),
@@ -2137,7 +2190,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if st.pushes > MAX_PUSHES {
         count(r).atomized += 1;
     }
-    let fin = st.fin;
+    let fin = declined.and(st.fin);
     r.explain_with(|| crate::engine::Explanation::Casts {
         source: cx.handle(node.a),
         lo: node.b as u16,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.32.23
+
+- Fixed an out-of-bounds panic at the 48-leaf low-cone boundary in `mba::opaque_predicate::equal_low_cone_zero` when `!causal` leaf nodes reached index 48 during low-cone collection.
+- Eliminated exponential DAG re-traversal and 4 GiB `stops` vector allocations in `demanded::stop_at` on shared newly-constructed multi-stage DAGs (`i >= st.before`) by adding an `IdMap` visited set, skipping `stops` collection in `reduced`, `under_mask`, and `prove_masked_equal` where region-boundary stops are unused, and deduplicating `stops` in `demanded::step`.
+- Eliminated engine and prover budget regressions: skipped pre-simplification `sample_words::guard_samples` under active caller deadlines in `prove::Question::build`, added a zero-overhead compact-circuit retry (`sums::shared`, `carry_save_multiplication`, `join_factoring`, and `input_cancellation`) before returning `Unknown::TooLarge` when proof certificates are not requested, checked `shrinks` before circuit proof in `words::committed` (`words_proved`) while caching lossless proof verdicts in `words_quiet` and bounding `PROOF_PROPAGATIONS`, prevented `Local` rules and `mba_sweep` from reversing committed pass rewrites in `Runner::rewritten`, and guarded stock-`kept_steps` MBA runs against returning settled DAGs larger than `pre_mba` or `root`.
+- Extended `compares` with width-polymorphic (`1..=512`) `popcnt(x)` zero and all-ones boundary comparison canonicalization (`== 0`, `!= 0`, `<=u 0`, `0 <u`, `== W`, `!= W`, `W <=u`, `<u W` across `zext`/`sext`), `casts` with zero-extended addition carry-out comparison folding (`extract<W, 1>(zext<W2>(x:W) + K)`), and `bitwise` with diamond nested-`select` collapsing across all four symmetric arm shapes.
+
 ## 0.32.22
 
 - Generalized syntactic bitwise complement and parity recognition on `Context`

@@ -775,6 +775,7 @@ fn sweep_inner(
                 let rep = to.get(&rep).copied().unwrap_or(rep);
                 match asked!('nodes, related(r, cx, cfg, cur, rep, relation, &d)) {
                     Related::Proved(e) => {
+                        r.rewritten.insert((cur, e), ());
                         r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
                         to.insert(i, e);
                         continue 'nodes;
@@ -1305,6 +1306,28 @@ fn peeled_masked_equal(
     Ok(false)
 }
 
+fn same_trivial_offset(cx: &Context, cur: u32, rep: u32, relation: Relation) -> bool {
+    let (nc, nr) = (cx.node(cur), cx.node(rep));
+    let const_partner = |n: crate::expr::Node| -> Option<u32> {
+        if cx.is_const(n.b) && !cx.is_const(n.a) {
+            Some(n.a)
+        } else if cx.is_const(n.a) && !cx.is_const(n.b) {
+            Some(n.b)
+        } else {
+            None
+        }
+    };
+    match relation {
+        Relation::Sum if nc.op == OpCode::Add && nr.op == OpCode::Add => {
+            matches!((const_partner(nc), const_partner(nr)), (Some(a), Some(b)) if a == b)
+        }
+        Relation::Xor if nc.op == OpCode::Xor && nr.op == OpCode::Xor => {
+            matches!((const_partner(nc), const_partner(nr)), (Some(a), Some(b)) if a == b)
+        }
+        _ => false,
+    }
+}
+
 fn related_cheap(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -1323,18 +1346,25 @@ fn related_cheap(
         return Ok(Related::Written);
     }
     let zero = crate::BitVec::zero(d.width());
+    let before = cx.len() as u32;
     let e = r.build(cx, |cx| {
         let k = cx.mk_const(d)?;
         match relation {
             Relation::Sum if d.is_zero() => Ok(rep),
             Relation::Sum => cx.c_bin(BinOp::Add, rep, k),
-            Relation::Difference if d.is_zero() => cx.c_un(UnOp::Neg, rep),
-            Relation::Difference if d.is_ones() => cx.c_un(UnOp::Not, rep),
+            Relation::Difference if d.is_zero() => Ok(cx.c_un(UnOp::Neg, rep)?),
+            Relation::Difference if d.is_ones() => Ok(cx.c_un(UnOp::Not, rep)?),
             Relation::Difference => cx.c_bin(BinOp::Sub, k, rep),
+            Relation::Xor if d.is_zero() => Ok(rep),
             Relation::Xor => cx.c_bin(BinOp::Xor, rep, k),
         }
     })?;
-    if e == cur {
+    if e == cur
+        || (e != rep
+            && (r.rewritten.contains_key(&(e, cur))
+                || same_trivial_offset(cx, cur, rep, relation)))
+    {
+        discard(r, cx, before);
         return Ok(Related::Written);
     }
     let op = match relation {
@@ -1379,6 +1409,7 @@ fn related(
         return Ok(Related::Written);
     }
     let zero = crate::BitVec::zero(d.width());
+    let before = cx.len() as u32;
     let e = r.build(cx, |cx| {
         let k = cx.mk_const(d)?;
         match relation {
@@ -1387,10 +1418,16 @@ fn related(
             Relation::Difference if d.is_zero() => cx.c_un(UnOp::Neg, rep),
             Relation::Difference if d.is_ones() => cx.c_un(UnOp::Not, rep),
             Relation::Difference => cx.c_bin(BinOp::Sub, k, rep),
+            Relation::Xor if d.is_zero() => Ok(rep),
             Relation::Xor => cx.c_bin(BinOp::Xor, rep, k),
         }
     })?;
-    if e == cur {
+    if e == cur
+        || (e != rep
+            && (r.rewritten.contains_key(&(e, cur))
+                || same_trivial_offset(cx, cur, rep, relation)))
+    {
+        discard(r, cx, before);
         return Ok(Related::Written);
     }
     let op = match relation {
