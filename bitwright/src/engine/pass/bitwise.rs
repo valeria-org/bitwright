@@ -1761,6 +1761,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     }
+    let mut pre_fin = Fin::FINAL;
     if op == OpCode::And {
         let node = cx.node(n);
         let not_const = match (cx.node(node.a).op, cx.const_val(node.b)) {
@@ -1786,9 +1787,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 }
                 match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, kfin, true)?
                 {
-                    Step::Normal(_) => {}
+                    Step::Normal(f) => pre_fin = pre_fin.and(f),
                     done => return Ok(done),
                 }
+            } else {
+                pre_fin = pre_fin.and(kfin.unchanged());
             }
         }
     }
@@ -1867,19 +1870,43 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     }
+    if matches!(op, OpCode::And | OpCode::Or | OpCode::Xor) {
+        let node = cx.node(n);
+        let (na, nb) = (cx.node(node.a), cx.node(node.b));
+        if na.op == OpCode::Select && nb.op == OpCode::Select && na.a == nb.a {
+            let bin_op = op.as_bin().unwrap_or(BinOp::Or);
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let t = cx.c_bin(bin_op, na.b, nb.b)?;
+                let f = cx.c_bin(bin_op, na.c, nb.c)?;
+                cx.c_select(na.a, t, f)
+            })?;
+            let mut stops = Vec::with_capacity(5);
+            for id in [na.a, na.b, na.c, nb.b, nb.c] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, true)?
+            {
+                Step::Normal(f) => pre_fin = pre_fin.and(f),
+                done => return Ok(done),
+            }
+        }
+    }
     if matches!(op, OpCode::Or | OpCode::Xor) {
         let node = cx.node(n);
         if let Some(step) =
             merge_complementary_arms(r, cx, PassKind::Bitwise, n, node.a, node.b)?
         {
             match step {
-                Step::Normal(_) => {}
+                Step::Normal(f) => pre_fin = pre_fin.and(f),
                 done => return Ok(done),
             }
         }
     }
     let hoisted = match hoist_cast(r, cx, n)? {
-        Step::Normal(f) => f,
+        Step::Normal(f) => pre_fin.and(f),
         done => return Ok(done),
     };
     let hoisted = match rotation(r, cx, n)? {
@@ -1944,7 +1971,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     };
     // An atom that is a bitwise region of its own may hide that `n` reads three atoms or fewer
     // below it (see the module notes); read over more than six, `n` is an atom again.
-    if atoms.iter().any(|&a| bitwise_op(cx.node(a).op)) {
+    if atoms.iter().any(|&a| wide_region_op(cx, a)) {
         let wide = wide_of(r, cx, n)?;
         if wide.atoms().len() <= 3 && wide.atoms() != atoms && wide.atoms() != [n] {
             match write(r, cx, n, wide.atoms(), wide.tt as u8, fin)? {

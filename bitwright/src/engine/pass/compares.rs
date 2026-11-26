@@ -2040,34 +2040,36 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     }
                 }
             }
-            // Multi-term unsigned carry cancellation: `(B + R) <u B => ~B <u R` and
-            // `B <=u (B + R) => R <=u ~B` when `B`'s additive leaves are a sub-multiset of `B + R`.
+            // Multi-term unsigned carry cancellation:
+            // `(B + R) <u B => ~B <u R`, `B <=u (B + R) => R <=u ~B`,
+            // `B <u (B + R) => B <u -R`, and `(B + R) <=u B => -R <=u B`
+            // when `B`'s additive leaves are a sub-multiset of `B + R`.
             if matches!(node.op, OpCode::Ult | OpCode::Ule) {
-                let (sum_id, sub_id, is_ult) = if node.op == OpCode::Ult {
-                    (node.a, node.b, true)
-                } else {
-                    (node.b, node.a, false)
-                };
-                if cx.node(sum_id).op == OpCode::Add {
-                    let collect_add = |root: u32| -> Option<Vec<u32>> {
-                        let mut out = Vec::with_capacity(8);
-                        let mut st = vec![root];
-                        while let Some(cur) = st.pop() {
-                            if out.len() + st.len() > 16 {
-                                return None;
-                            }
-                            let cn = cx.node(cur);
-                            if cn.op == OpCode::Add {
-                                st.push(cn.b);
-                                st.push(cn.a);
-                            } else {
-                                out.push(cur);
-                            }
+                let collect_add = |cx: &Context, root: u32| -> Option<Vec<u32>> {
+                    let mut out = Vec::with_capacity(8);
+                    let mut st = vec![root];
+                    while let Some(cur) = st.pop() {
+                        if out.len() + st.len() > 16 {
+                            return None;
                         }
-                        Some(out)
-                    };
+                        let cn = cx.node(cur);
+                        if cn.op == OpCode::Add {
+                            st.push(cn.b);
+                            st.push(cn.a);
+                        } else {
+                            out.push(cur);
+                        }
+                    }
+                    Some(out)
+                };
+                for (sum_id, sub_id, sum_is_lhs) in
+                    [(node.a, node.b, true), (node.b, node.a, false)]
+                {
+                    if cx.node(sum_id).op != OpCode::Add {
+                        continue;
+                    }
                     if let (Some(mut s_leaves), Some(b_leaves)) =
-                        (collect_add(sum_id), collect_add(sub_id))
+                        (collect_add(cx, sum_id), collect_add(cx, sub_id))
                         && b_leaves.len() < s_leaves.len()
                         && (b_leaves.len() >= 2 || s_leaves.len() >= 3)
                     {
@@ -2087,14 +2089,28 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             for &t in &s_leaves[1..] {
                                 rem = r.build(cx, |cx| cx.c_bin(BinOp::Add, rem, t))?;
                             }
-                            let not_b = r.build(cx, |cx| cx.c_un(UnOp::Not, sub_id))?;
-                            let e2 = r.build(cx, |cx| {
-                                if is_ult {
-                                    cx.c_cmp(CmpOp::Ult, not_b, rem)
-                                } else {
-                                    cx.c_cmp(CmpOp::Ule, rem, not_b)
-                                }
-                            })?;
+                            let is_ult = node.op == OpCode::Ult;
+                            let e2 = if (is_ult && sum_is_lhs) || (!is_ult && !sum_is_lhs) {
+                                // `(B + R) <u B => ~B <u R` and `B <=u (B + R) => R <=u ~B`
+                                let not_b = r.build(cx, |cx| cx.c_un(UnOp::Not, sub_id))?;
+                                r.build(cx, |cx| {
+                                    if is_ult {
+                                        cx.c_cmp(CmpOp::Ult, not_b, rem)
+                                    } else {
+                                        cx.c_cmp(CmpOp::Ule, rem, not_b)
+                                    }
+                                })?
+                            } else {
+                                // `B <u (B + R) => B <u -R` and `(B + R) <=u B => -R <=u B`
+                                let neg_r = r.build(cx, |cx| cx.c_un(UnOp::Neg, rem))?;
+                                r.build(cx, |cx| {
+                                    if is_ult {
+                                        cx.c_cmp(CmpOp::Ult, sub_id, neg_r)
+                                    } else {
+                                        cx.c_cmp(CmpOp::Ule, neg_r, sub_id)
+                                    }
+                                })?
+                            };
                             let mut stops = s_leaves;
                             if !stops.contains(&sub_id) {
                                 stops.push(sub_id);
@@ -2105,6 +2121,70 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                                 PassKind::Compares,
                                 n,
                                 e2,
+                                before,
+                                &stops,
+                                Fin::FINAL,
+                                true,
+                            )? {
+                                Step::Normal(_) => {}
+                                step => return Ok(step),
+                            }
+                        }
+                    }
+                }
+            }
+            // `(A * select(c, 0, k)) ==/!= (B * select(c, 0, k))` (or `select(c, k, 0)`):
+            // hoist the zero-annihilating `select` factor out of `Eq`/`Ne` into `select(c, ...)`
+            // so `arms_read` can specialize `c` inside `A` and `B`.
+            if matches!(node.op, OpCode::Eq | OpCode::Ne) && cx.wid(node.a) > 1 {
+                let (la, lb) = (cx.node(node.a), cx.node(node.b));
+                if la.op == OpCode::Mul && lb.op == OpCode::Mul {
+                    let shared_sel = [
+                        (la.a, la.b, lb.a, lb.b),
+                        (la.a, la.b, lb.b, lb.a),
+                        (la.b, la.a, lb.a, lb.b),
+                        (la.b, la.a, lb.b, lb.a),
+                    ]
+                    .into_iter()
+                    .find_map(|(sa, xa, sb, xb)| {
+                        (sa == sb && cx.node(sa).op == OpCode::Select).then_some((sa, xa, xb))
+                    });
+                    if let Some((sel_id, xa, xb)) = shared_sel {
+                        let sn = cx.node(sel_id);
+                        let zero_arm = if cx.const_val(sn.b).is_some_and(|v| v.is_zero()) {
+                            Some((true, sn.c))
+                        } else if cx.const_val(sn.c).is_some_and(|v| v.is_zero()) {
+                            Some((false, sn.b))
+                        } else {
+                            None
+                        };
+                        if let Some((true_is_zero, k_other)) = zero_arm {
+                            let is_eq = node.op == OpCode::Eq;
+                            let cmp_op = if is_eq { CmpOp::Eq } else { CmpOp::Ne };
+                            let before = cx.len() as u32;
+                            let zero_val = bool_const(r, cx, is_eq)?;
+                            let e_sel = r.build(cx, |cx| {
+                                let ma = cx.c_bin(BinOp::Mul, xa, k_other)?;
+                                let mb = cx.c_bin(BinOp::Mul, xb, k_other)?;
+                                let cmp = cx.c_cmp(cmp_op, ma, mb)?;
+                                if true_is_zero {
+                                    cx.c_select(sn.a, zero_val, cmp)
+                                } else {
+                                    cx.c_select(sn.a, cmp, zero_val)
+                                }
+                            })?;
+                            let mut stops = Vec::with_capacity(4);
+                            for id in [sn.a, xa, xb, k_other] {
+                                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                                    stops.push(id);
+                                }
+                            }
+                            match super::finish_with(
+                                r,
+                                cx,
+                                PassKind::Compares,
+                                n,
+                                e_sel,
                                 before,
                                 &stops,
                                 Fin::FINAL,
@@ -2140,6 +2220,60 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 let before = cx.len() as u32;
                 let c = bool_const(r, cx, node.op == OpCode::Eq)?;
                 return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+            }
+            if matches!(node.op, OpCode::Eq | OpCode::Ne)
+                && cx.wid(node.a) > 1
+                && !cx.is_const(node.a)
+                && !cx.is_const(node.b)
+                && (matches!(
+                    cx.node(node.a).op,
+                    OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul
+                ) || matches!(
+                    cx.node(node.b).op,
+                    OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul
+                ))
+            {
+                let fa = super::linear::form_of(r, cx, node.a)?;
+                let fb = super::linear::form_of(r, cx, node.b)?;
+                let (ka, ta, fin_a) = super::forms::Parts::parts(&fa);
+                let (kb, tb, fin_b) = super::forms::Parts::parts(&fb);
+                let shares_atom = !ta.is_empty()
+                    && !tb.is_empty()
+                    && ta
+                        .iter()
+                        .any(|&(a, _)| tb.binary_search_by_key(&a, |t| t.0).is_ok());
+                if shares_atom {
+                    let mut merged = ta.to_vec();
+                    for &(b_id, b_k) in tb {
+                        let neg_bk = BitVec::un_unchecked(UnOp::Neg, &b_k);
+                        match merged.binary_search_by_key(&b_id, |t| t.0) {
+                            Ok(pos) => {
+                                merged[pos].1 =
+                                    BitVec::bin_unchecked(BinOp::Add, &merged[pos].1, &neg_bk);
+                            }
+                            Err(pos) => merged.insert(pos, (b_id, neg_bk)),
+                        }
+                    }
+                    merged.retain(|(_, k)| !k.is_zero());
+                    let stops: Vec<u32> = merged.iter().map(|&(a, _)| a).collect();
+                    let dk = BitVec::bin_unchecked(BinOp::Sub, ka, kb);
+                    let df_fin = fin_a.and(fin_b);
+                    let df: super::linear::Form =
+                        super::forms::Parts::from_parts(dk, merged, df_fin);
+                    let before = cx.len() as u32;
+                    let d_node = super::linear::emit(r, cx, &df)?;
+                    let z_node = r.build(cx, |cx| cx.mk_const(&BitVec::zero(dk.width())))?;
+                    let cmp_op = if node.op == OpCode::Eq {
+                        CmpOp::Eq
+                    } else {
+                        CmpOp::Ne
+                    };
+                    let e_cmp = r.build(cx, |cx| cx.c_cmp(cmp_op, d_node, z_node))?;
+                    match finish(r, cx, PassKind::Compares, n, e_cmp, before, &stops, df_fin)? {
+                        Step::Normal(_) => {}
+                        step => return Ok(step),
+                    }
+                }
             }
             if matches!(node.op, OpCode::Eq | OpCode::Ne) {
                 let (pa, pb, bits) = peel_congruence(cx, node.a, node.b);
@@ -2569,6 +2703,7 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
     }
     // Canonicalize 1-bit Majority `select(a ^ b, t, a)` / `select(a ^ b, t, b)` by sorting its
     // 3 symmetric arguments `[t, a, b]` into `select(tri[1] ^ tri[2], tri[0], tri[1])`.
+    let mut maj_fin = Fin::FINAL;
     if cx.wid(n) == 1 && cx.node(c).op == OpCode::Xor {
         let xn = cx.node(c);
         if f == xn.a || f == xn.b {
@@ -2589,7 +2724,7 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
                 let mut stops = tri.to_vec();
                 stops.sort_unstable();
                 stops.dedup();
-                return super::finish_with(
+                match super::finish_with(
                     r,
                     cx,
                     PassKind::Compares,
@@ -2599,31 +2734,92 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
                     &stops,
                     Fin::FINAL,
                     true,
-                )
-                .map(Some);
+                )? {
+                    Step::Normal(df) => maj_fin = maj_fin.and(df),
+                    done => return Ok(Some(done)),
+                }
             }
         }
     }
     let before = cx.len() as u32;
-    let Some(e) = one_value(r, cx, c, t, f)? else {
-        super::discard(r, cx, before);
-        return Ok(None);
-    };
-    // The nodes from before the rewrite that it reads.
-    let mut stops = Vec::new();
-    let mut todo = vec![e];
-    let mut seen = crate::hash::IdMap::<u32, ()>::default();
-    while let Some(i) = todo.pop() {
-        if seen.insert(i, ()).is_some() {
-            continue;
+    let collect_stops = |cx: &Context, root_e: u32, mark: u32| -> Vec<u32> {
+        let mut stops = Vec::new();
+        let mut todo = vec![root_e];
+        let mut seen = crate::hash::IdMap::<u32, ()>::default();
+        while let Some(i) = todo.pop() {
+            if seen.insert(i, ()).is_some() {
+                continue;
+            }
+            if i < mark {
+                stops.push(i);
+            } else {
+                todo.extend(cx.node(i).children());
+            }
         }
-        if i < before {
-            stops.push(i);
+        stops
+    };
+    if let Some(e) = one_value(r, cx, c, t, f)? {
+        let stops = collect_stops(cx, e, before);
+        return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
+    }
+    super::discard(r, cx, before);
+    // Specialize `t` (`c = true`) and `f` (`c = false`) when `c` or its direct negation (`!c` /
+    // `Eq` <-> `Ne`) appears inside an arm and substitution strictly shrinks the DAG.
+    let cn = cx.node(c);
+    let mut neg_cands: Vec<u32> = Vec::with_capacity(3);
+    if cn.op == OpCode::Not {
+        neg_cands.push(cn.a);
+    } else if let Some(nc) = cx.find(&crate::expr::Node::new(OpCode::Not, 1, c, 0, 0)) {
+        neg_cands.push(nc);
+    }
+    if matches!(cn.op, OpCode::Eq | OpCode::Ne) {
+        let flip = if cn.op == OpCode::Eq {
+            OpCode::Ne
         } else {
-            todo.extend(cx.node(i).children());
+            OpCode::Eq
+        };
+        for (x, y) in [(cn.a, cn.b), (cn.b, cn.a)] {
+            if let Some(id) = cx.find(&crate::expr::Node::new(flip, 1, x, y, 0))
+                && !neg_cands.contains(&id)
+            {
+                neg_cands.push(id);
+            }
         }
     }
-    finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL).map(Some)
+    let t_reads = reads(cx, t, c) || neg_cands.iter().any(|&nc| reads(cx, t, nc));
+    let f_reads = reads(cx, f, c) || neg_cands.iter().any(|&nc| reads(cx, f, nc));
+    if t_reads || f_reads {
+        let before = cx.len() as u32;
+        let one = bool_const(r, cx, true)?;
+        let zero = bool_const(r, cx, false)?;
+        let t2 = if t_reads {
+            let mut repl = crate::hash::IdMap::default();
+            repl.insert(c, one);
+            for &nc in &neg_cands {
+                repl.insert(nc, zero);
+            }
+            r.build(cx, |cx| Ok(cx.substitute_ids(&[t], &repl)?[0]))?
+        } else {
+            t
+        };
+        let f2 = if f_reads {
+            let mut repl = crate::hash::IdMap::default();
+            repl.insert(c, zero);
+            for &nc in &neg_cands {
+                repl.insert(nc, one);
+            }
+            r.build(cx, |cx| Ok(cx.substitute_ids(&[f], &repl)?[0]))?
+        } else {
+            f
+        };
+        if t2 != t || f2 != f {
+            let e = r.build(cx, |cx| cx.c_select(c, t2, f2))?;
+            let stops = collect_stops(cx, e, before);
+            return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
+        }
+        super::discard(r, cx, before);
+    }
+    Ok((maj_fin != Fin::FINAL).then_some(Step::Normal(maj_fin)))
 }
 
 /// The one value `select(c, t, f)` takes, when it is one:
@@ -2702,7 +2898,8 @@ fn one_value(
             todo.extend(vn.children());
         }
         for m in masks {
-            let to = r.build(cx, |cx| cx.mk_const_u64(cx.wid(m), kv))?;
+            let w_m = cx.width_of(m);
+            let to = r.build(cx, |cx| cx.mk_const(&BitVec::wrapping_from_u64(w_m, kv)))?;
             repl.insert(m, to);
         }
     }

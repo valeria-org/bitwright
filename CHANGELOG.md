@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.32.21
+
+- Fixed >64-bit constant construction (`BitVec::wrapping_from_u64` instead of `mk_const_u64`) in
+  `casts` (`zext<W>(extract<K, N>(x) & M)`) and `compares` (`one_value` low-mask substitution), and
+  enabled 1-bit `Select` atoms in `bitwise::wide_region_op` wide truth-table minimization.
+- Eliminated intra-run pass rewrite cycles and cross-pass oscillations: guarded `pass::finish_within`
+  against reversing any committed rewrite in `Runner::rewritten`, filtered retired `r.life.dead`
+  nodes in all `casts` live-node lookups (`live_slice`, `live_word`, `narrow_to_live_wide`,
+  `zext_to_live_wide`), canonicalized single-bit-run `zext(extract<K, N>(x) & M)` and `Extract`
+  masks in `casts` to align with `shuffle`, checked all newly built additive spine nodes for
+  disjointness in `linear::plain`, and granted bounded post-`Words` cleanup rounds in `Engine::rounds`.
+- Fixed persistent `cx.memo` finality (`Fin::PROVISIONAL`) and cost-stop accounting when sharing-
+  gated or cost-declined rewrites are skipped across `casts`, `demanded`, `linear`, `bitwise`, and
+  `compares`, and honored `quarantined_passes` in `demanded::narrow_root` and `at_root`.
+- Extended `mba::lower` with topologically ordered `PeerSolved` chains across all lowering entry
+  points (`lower_id`, `lower_id_over`, `lower_id_whole`), covering bare-base offsets/XORs, negated
+  affine peers (`c - t`), and opposite-sign nonlinear product atoms `(K - X) * M` vs `(X - K) * M`;
+  added exact `Add`/`Sub`/`Neg`/`Mul` known-bit propagation in `mba::cofactors`.
+- Added 1-bit `x & zext(b)` narrowing, live-stop `zext(~trunc(x))` cost accounting, high-bit
+  constant matching in `narrow_to_live_wide`, and `Zext` / flattened-`Add` traversal in
+  `casts::find_wide_masked`; extended `demanded` with `Select` and `RotL`/`RotR` propagation and
+  multi-use `Add`/`Sub`/`Mul` constant prefix narrowing.
+- Added De Morgan `(~u) & (~v)`, 1-bit `b ^ C`, and masked-XOR `(v & m) ^ c` complementary factor
+  pairing in `linear::by_multiplicand`, borrow-free constant subtraction `c - z -> z ^ c` and
+  `c2 - (x ^ c1) -> x ^ k`, bare-base `x + (x ^ c)` merging in `merge_xor_pairs`, 1-bit `Mul` and
+  boolean `b * (b ^ c)` reductions in `linear`, same-guard `select` merging in `bitwise`, `concat(b, c)`
+  conditions in `conditions`, and 4-way unsigned carry cancellation, shared-term linear `Eq`/`Ne`
+  cancellation, zero-annihilating shared `select` factor hoisting, and `select` arm guard
+  specialization in `compares`.
+
 ## 0.32.20
 
 - Added demanded-mask constant narrowing and twin deduplication in `demanded`: equal-twin `Xor` reuse

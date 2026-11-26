@@ -108,6 +108,78 @@ fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
             let (fz, fo) = node_known_bits(cx, n.c, depth - 1);
             ((tz & fz) & mask, (to & fo) & mask)
         }
+        OpCode::Add | OpCode::Sub => {
+            let known_add = |az: u64, ao: u64, bz: u64, bo: u64| -> (u64, u64) {
+                let min_a = u128::from(ao & mask);
+                let max_a = u128::from((!az) & mask);
+                let min_b = u128::from(bo & mask);
+                let max_b = u128::from((!bz) & mask);
+                let sum_min = min_a + min_b;
+                let sum_max = max_a + max_b;
+                let c_min = (sum_min ^ min_a ^ min_b) as u64;
+                let c_max = (sum_max ^ max_a ^ max_b) as u64;
+                let ua = (!az & !ao) & mask;
+                let ub = (!bz & !bo) & mask;
+                let uncertain = (ua | ub | (c_min ^ c_max)) & mask;
+                let known = (!uncertain) & mask;
+                let s = (sum_min as u64) & mask;
+                ((!s) & known, s & known)
+            };
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
+            if n.op == OpCode::Add {
+                known_add(az, ao, bz, bo)
+            } else {
+                let (nb_z, nb_o) = known_add(bo & mask, bz & mask, (!1u64) & mask, 1 & mask);
+                known_add(az, ao, nb_z, nb_o)
+            }
+        }
+        OpCode::Neg => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let min_a = u128::from(az & mask);
+            let max_a = u128::from((!ao) & mask);
+            let sum_min = min_a + 1;
+            let sum_max = max_a + 1;
+            let c_min = (sum_min ^ min_a ^ 1) as u64;
+            let c_max = (sum_max ^ max_a ^ 1) as u64;
+            let ua = (!az & !ao) & mask;
+            let uncertain = (ua | (c_min ^ c_max)) & mask;
+            let known = (!uncertain) & mask;
+            let s = (sum_min as u64) & mask;
+            ((!s) & known, s & known)
+        }
+        OpCode::Mul => {
+            let (az, ao) = node_known_bits(cx, n.a, depth - 1);
+            let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
+            if ((az | ao) & mask) == mask && ((bz | bo) & mask) == mask {
+                let p = ao.wrapping_mul(bo) & mask;
+                ((!p) & mask, p)
+            } else {
+                let tz_a = if ((!az) & mask) == 0 {
+                    u32::from(w)
+                } else {
+                    ((!az) & mask).trailing_zeros()
+                };
+                let tz_b = if ((!bz) & mask) == 0 {
+                    u32::from(w)
+                } else {
+                    ((!bz) & mask).trailing_zeros()
+                };
+                let tz = tz_a.saturating_add(tz_b).min(u32::from(w));
+                let z_low = if tz >= 64 { mask } else { ((1u64 << tz) - 1) & mask };
+                let o_bit = if tz < u32::from(w)
+                    && tz_a < 64
+                    && tz_b < 64
+                    && (ao & (1u64 << tz_a)) != 0
+                    && (bo & (1u64 << tz_b)) != 0
+                {
+                    (1u64 << tz) & mask
+                } else {
+                    0
+                };
+                (z_low, o_bit)
+            }
+        }
         _ => (0, 0),
     };
     (z & mask, o & mask)

@@ -1551,9 +1551,17 @@ pub(super) fn finish_within(
     slack: u32,
 ) -> Result<Step, Stop> {
     let name = kind.name();
-    if e == n {
+    if e == n || r.rewritten.contains_key(&(e, n)) {
+        if e != n {
+            discard(r, cx, before);
+        }
         r.explain = None;
         r.stats.passes.entry(name).or_default().noop += 1;
+        let fin = if e != n {
+            fin.and(Fin::PROVISIONAL)
+        } else {
+            fin
+        };
         return Ok(Step::Normal(fin));
     }
     let pays = if slack == 0 {

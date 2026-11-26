@@ -1846,7 +1846,8 @@ impl Runner<'_, '_> {
         let out = if matches!(
             self.inner.phases[phase],
             PhaseImpl::Pass(pass::PassKind::Demanded)
-        ) {
+        ) && !self.quarantined_passes.contains(&pass::PassKind::Demanded)
+        {
             self.begin(cx, phase, out.0);
             match pass::demanded::narrow_root(self, cx, out.0)? {
                 Some((e, f)) => {
@@ -1867,7 +1868,8 @@ impl Runner<'_, '_> {
         if matches!(
             self.inner.phases[phase],
             PhaseImpl::Pass(pass::PassKind::Demanded)
-        ) && self.settled
+        ) && !self.quarantined_passes.contains(&pass::PassKind::Demanded)
+            && self.settled
             && out.0 == root
         {
             return self.at_root(cx, phase, out);
@@ -3409,6 +3411,7 @@ impl Runner<'_, '_> {
         // questions; and whether it is the one round past the strategy's last, with the
         // deepest (see below).
         let (mut again, mut extra) = (false, false);
+        let (mut words_runs, mut post_words) = (0u8, false);
         loop {
             self.stats.rounds = self.stats.rounds.max(u32::from(round) + 1);
             self.held = false;
@@ -3431,6 +3434,7 @@ impl Runner<'_, '_> {
                 cur = self.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             }
             let (start, before) = (cur, fin);
+            let mut ran_words_change = false;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 #[cfg(feature = "mba")]
                 if !again
@@ -3460,12 +3464,14 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
-                if matches!(inner.phases[phase], PhaseImpl::Pass(pass::PassKind::Words))
-                    && !self.words.turn
-                {
+                let is_words = matches!(inner.phases[phase], PhaseImpl::Pass(pass::PassKind::Words));
+                if is_words && !self.words.turn {
                     fin = fin.and(Fin::PROVISIONAL);
                     self.emit_phase_end(cx, round, phase, cur, spent0, None);
                     continue;
+                }
+                if is_words {
+                    words_runs = words_runs.saturating_add(1);
                 }
                 match self.local(cx, phase, cur) {
                     Ok((r, f)) => {
@@ -3485,6 +3491,9 @@ impl Runner<'_, '_> {
                         if grew {
                             fin = fin.and(Fin::PROVISIONAL);
                         } else {
+                            if is_words && r != cur {
+                                ran_words_change = true;
+                            }
                             cur = r;
                             fin = fin.and(f);
                         }
@@ -3531,6 +3540,7 @@ impl Runner<'_, '_> {
             // phases left as it was (see `pass::words::State::turn`), and in that one round
             // past the last.
             let words = !self.words.turn
+                && words_runs < 2
                 && inner
                     .phases
                     .iter()
@@ -3574,6 +3584,9 @@ impl Runner<'_, '_> {
                 }
                 return Ok((cur, fin));
             }
+            if cx.is_const(cur) {
+                return Ok((cur, fin));
+            }
             if last {
                 // (Both are asked for: neither short-circuits the other.)
                 let deeper = !extra && self.deepen(true);
@@ -3582,8 +3595,20 @@ impl Runner<'_, '_> {
                     (extra, again) = (true, false);
                     continue;
                 }
+                if ran_words_change {
+                    post_words = true;
+                    again = false;
+                    continue;
+                }
+                if post_words && words {
+                    self.words.turn = true;
+                    post_words = false;
+                    again = false;
+                    continue;
+                }
                 break;
             }
+            post_words = false;
             again = false;
         }
         self.stats.rounds_capped += 1;

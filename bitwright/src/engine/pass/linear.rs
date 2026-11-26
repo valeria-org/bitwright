@@ -1800,20 +1800,53 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     {
         return Ok(step);
     }
-    if op == OpCode::Add {
-        if let Some(step) =
-            super::bitwise::merge_complementary_arms(r, cx, PassKind::Linear, n, node.a, node.b)?
+    let mut pre_declined = Fin::FINAL;
+    // Borrow-free subtraction from a constant superset: whenever `z <=_bitwise c` at every bit
+    // (`known_zero(z) | c == all_ones`), `c - z == z ^ c` at any width with zero borrows.
+    if op == OpCode::Sub
+        && let Some(c_bv) = cx.const_val(node.a)
+        && cx.const_val(node.b).is_none()
+    {
+        let (kb_opt, kfin) = super::known(r, cx, node.b)?;
+        if let Some(kb) = kb_opt
+            && BitVec::bin_unchecked(BinOp::Or, &kb.known_zero(), &c_bv).is_ones()
+        {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_bin(BinOp::Xor, node.b, node.a))?;
+            let mut stops = vec![node.b];
+            if node.a < before {
+                stops.push(node.a);
+            }
+            match super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, kfin, true)? {
+                Step::Normal(f) => pre_declined = pre_declined.and(f),
+                done => return Ok(done),
+            }
+        } else {
+            pre_declined = pre_declined.and(kfin.unchanged());
+        }
+    }
+    if matches!(op, OpCode::Add | OpCode::Sub) {
+        if op == OpCode::Add
+            && let Some(step) =
+                super::bitwise::merge_complementary_arms(r, cx, PassKind::Linear, n, node.a, node.b)?
         {
             match step {
-                Step::Normal(_) => {}
+                Step::Normal(f) => pre_declined = pre_declined.and(f),
                 done => return Ok(done),
             }
         }
-        // Carry-free `(x ^ c1) + c2 -> x ^ k` (and `(x ^ c1) + select(cond, ct, cf) -> x ^ select(...)`)
-        // when the added constant carries nowhere into the possible ones `u` of `x`.
+        // Carry/borrow-free `(x ^ c1) ± c2 -> x ^ k` and `c2 - (x ^ c1) -> x ^ k` (plus `select`
+        // constants) when the constant offset carries nowhere into the possible ones `u` of `x`
+        // (for `c2 - y`, via `c2 - y == ~((~c2) + y)`).
         if node.width <= 64 {
             let mask = u64::MAX >> (64 - node.width);
-            for (xor_id, other_id) in [(node.a, node.b), (node.b, node.a)] {
+            let pairs: [(u32, u32, bool); 2] = if op == OpCode::Add {
+                [(node.a, node.b, false), (node.b, node.a, false)]
+            } else {
+                // `(x ^ c1) - c2` (`neg_xor = false`, `c2` negated) and `c2 - (x ^ c1)` (`neg_xor = true`).
+                [(node.a, node.b, false), (node.b, node.a, true)]
+            };
+            for (xor_id, other_id, neg_xor) in pairs {
                 let xn = cx.node(xor_id);
                 if xn.op != OpCode::Xor {
                     continue;
@@ -1826,19 +1859,31 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     continue;
                 };
                 let (kb_opt, kfin) = super::known(r, cx, x)?;
-                let Some(kb) = kb_opt else { continue };
-                let Some(kz) = kb.known_zero().to_u64() else {
-                    continue;
-                };
+                let kz = kb_opt
+                    .and_then(|kb| kb.known_zero().to_u64())
+                    .unwrap_or(0);
                 let u = (!kz) & mask;
-                if u == mask {
+                if u == mask && !neg_xor {
+                    pre_declined = pre_declined.and(kfin.unchanged());
                     continue;
                 }
-                if let Some(c2) = cx.const_val(other_id).and_then(|v| v.to_u64()) {
-                    let k_hi = (c1 & !u).wrapping_add(c2) & mask;
+                if let Some(c2_raw) = cx.const_val(other_id).and_then(|v| v.to_u64()) {
+                    let add_c = if neg_xor {
+                        (!c2_raw) & mask
+                    } else if op == OpCode::Sub {
+                        c2_raw.wrapping_neg() & mask
+                    } else {
+                        c2_raw & mask
+                    };
+                    let k_hi = (c1 & !u).wrapping_add(add_c) & mask;
                     if (k_hi & u) == 0 {
                         let before = cx.len() as u32;
-                        let kv = (c1 & u) | k_hi;
+                        let kv_inner = (c1 & u) | k_hi;
+                        let kv = if neg_xor {
+                            (!kv_inner) & mask
+                        } else {
+                            kv_inner
+                        };
                         let e = r.build(cx, |cx| {
                             let kc = cx.mk_const_u64(node.width, kv)?;
                             cx.c_bin(BinOp::Xor, x, kc)
@@ -1854,22 +1899,37 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             kfin,
                             true,
                         )? {
-                            Step::Normal(_) => {}
+                            Step::Normal(f) => pre_declined = pre_declined.and(f),
                             done => return Ok(done),
                         }
+                    } else {
+                        pre_declined = pre_declined.and(kfin.unchanged());
                     }
                 } else if cx.node(other_id).op == OpCode::Select {
                     let sn = cx.node(other_id);
-                    if let (Some(tv), Some(fv)) = (
+                    if let (Some(tv_raw), Some(fv_raw)) = (
                         cx.const_val(sn.b).and_then(|v| v.to_u64()),
                         cx.const_val(sn.c).and_then(|v| v.to_u64()),
                     ) {
-                        let kt_hi = (c1 & !u).wrapping_add(tv) & mask;
-                        let kf_hi = (c1 & !u).wrapping_add(fv) & mask;
+                        let map_c = |v: u64| {
+                            if neg_xor {
+                                (!v) & mask
+                            } else if op == OpCode::Sub {
+                                v.wrapping_neg() & mask
+                            } else {
+                                v & mask
+                            }
+                        };
+                        let kt_hi = (c1 & !u).wrapping_add(map_c(tv_raw)) & mask;
+                        let kf_hi = (c1 & !u).wrapping_add(map_c(fv_raw)) & mask;
                         if (kt_hi & u) == 0 && (kf_hi & u) == 0 {
                             let before = cx.len() as u32;
-                            let kt = (c1 & u) | kt_hi;
-                            let kf = (c1 & u) | kf_hi;
+                            let mut kt = (c1 & u) | kt_hi;
+                            let mut kf = (c1 & u) | kf_hi;
+                            if neg_xor {
+                                kt = (!kt) & mask;
+                                kf = (!kf) & mask;
+                            }
                             let e = r.build(cx, |cx| {
                                 let ct = cx.mk_const_u64(node.width, kt)?;
                                 let cf = cx.mk_const_u64(node.width, kf)?;
@@ -1890,11 +1950,15 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                                 kfin,
                                 true,
                             )? {
-                                Step::Normal(_) => {}
+                                Step::Normal(f) => pre_declined = pre_declined.and(f),
                                 done => return Ok(done),
                             }
+                        } else {
+                            pre_declined = pre_declined.and(kfin.unchanged());
                         }
                     }
+                } else {
+                    pre_declined = pre_declined.and(kfin.unchanged());
                 }
             }
         }
@@ -1921,9 +1985,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         }
     }
     let mut declined = match factor_sum(r, cx, n)? {
-        Some(Step::Normal(f)) => f,
+        Some(Step::Normal(f)) => pre_declined.and(f),
         Some(step) => return Ok(step),
-        None => Fin::FINAL,
+        None => pre_declined,
     };
     // A case split on a condition mask the node reads, first (see `cases`).
     let before = cx.len() as u32;
@@ -1938,8 +2002,29 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     // A product of values, its factors in order (see `sort_chain`).
     if op == OpCode::Mul {
-        // 0/1 boolean idempotence (`b * b == b` and `(c0 + c1 * b) * b == (c0 + c1) * b`) when
-        // `b` is known to be 0 or 1 (`zero_bits(b, ~1)`).
+        if node.width == 1 {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_bin(BinOp::And, node.a, node.b))?;
+            let mut stops = vec![node.a, node.b];
+            stops.sort_unstable();
+            stops.dedup();
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Linear,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )? {
+                Step::Normal(f) => declined = declined.and(f),
+                step => return Ok(step),
+            }
+        }
+        // 0/1 boolean idempotence (`b * b == b`, `(x * b) * b == x * b`, `b * (b ^ c) == b * (c ^ 1)`,
+        // and `(c0 + c1 * b) * b == (c0 + c1) * b`) when `b` is known to be 0 or 1 (`zero_bits(b, ~1)`).
         if node.width <= 64 && node.width > 1 {
             let high_mask = (u64::MAX >> (64 - node.width)) & !1u64;
             for (b_id, other_id) in [(node.a, node.b), (node.b, node.a)] {
@@ -1955,6 +2040,57 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             step => return Ok(step),
                         }
                     } else {
+                        let on = cx.node(other_id);
+                        if on.op == OpCode::Mul && (on.a == b_id || on.b == b_id) {
+                            let before = cx.len() as u32;
+                            match finish(
+                                r,
+                                cx,
+                                PassKind::Linear,
+                                n,
+                                other_id,
+                                before,
+                                &[other_id],
+                                bfin,
+                            )? {
+                                Step::Normal(f) => declined = declined.and(f),
+                                step => return Ok(step),
+                            }
+                        }
+                        if on.op == OpCode::Xor {
+                            let xor_c = if on.a == b_id {
+                                cx.const_val(on.b)
+                            } else if on.b == b_id {
+                                cx.const_val(on.a)
+                            } else {
+                                None
+                            };
+                            if let Some(c_bv) = xor_c {
+                                let c_flip = BitVec::bin_unchecked(
+                                    BinOp::Xor,
+                                    &c_bv,
+                                    &BitVec::one(c_bv.width()),
+                                );
+                                let before = cx.len() as u32;
+                                let e = r.build(cx, |cx| {
+                                    let ck = cx.mk_const(&c_flip)?;
+                                    cx.c_bin(BinOp::Mul, b_id, ck)
+                                })?;
+                                match finish(
+                                    r,
+                                    cx,
+                                    PassKind::Linear,
+                                    n,
+                                    e,
+                                    before,
+                                    &[b_id],
+                                    bfin,
+                                )? {
+                                    Step::Normal(f) => declined = declined.and(f),
+                                    step => return Ok(step),
+                                }
+                            }
+                        }
                         let fo = form_of(r, cx, other_id)?;
                         if fo.terms.len() == 1 && fo.terms[0].0 == b_id {
                             let c_sum = BitVec::bin_unchecked(BinOp::Add, &fo.konst, &fo.terms[0].1);
@@ -1978,6 +2114,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                             }
                         }
                     }
+                } else {
+                    declined = declined.and(bfin.unchanged());
                 }
             }
         }
@@ -2279,26 +2417,23 @@ fn merge_xor_pairs(
         return Ok(None);
     }
     let mask = u64::MAX >> (64 - w.bits());
-    let xor_const = |cx: &Context, id: u32| -> Option<(u32, u64)> {
+    let xor_or_base = |cx: &Context, id: u32| -> (u32, u64, bool) {
         let xn = cx.node(id);
-        if xn.op != OpCode::Xor {
-            return None;
+        if xn.op == OpCode::Xor {
+            match (cx.const_val(xn.a), cx.const_val(xn.b)) {
+                (None, Some(k)) if let Some(c) = k.to_u64() => return (xn.a, c & mask, true),
+                (Some(k), None) if let Some(c) = k.to_u64() => return (xn.b, c & mask, true),
+                _ => {}
+            }
         }
-        match (cx.const_val(xn.a), cx.const_val(xn.b)) {
-            (None, Some(k)) => k.to_u64().map(|c| (xn.a, c & mask)),
-            (Some(k), None) => k.to_u64().map(|c| (xn.b, c & mask)),
-            _ => None,
-        }
+        (id, 0, false)
     };
+    let mut declined = Fin::FINAL;
     for i in 0..form.terms.len() {
-        let Some((x, c1)) = xor_const(cx, form.terms[i].0) else {
-            continue;
-        };
+        let (x, c1, is_x1) = xor_or_base(cx, form.terms[i].0);
         for j in (i + 1)..form.terms.len() {
-            let Some((x2, c2)) = xor_const(cx, form.terms[j].0) else {
-                continue;
-            };
-            if x != x2 || c1 == c2 {
+            let (x2, c2, is_x2) = xor_or_base(cx, form.terms[j].0);
+            if (!is_x1 && !is_x2) || x != x2 || c1 == c2 {
                 continue;
             }
             let diff = (c1 ^ c2) & mask;
@@ -2308,6 +2443,7 @@ fn merge_xor_pairs(
             let known_mask = kz | ko;
             let rem_same = same & !known_mask;
             if rem_same.count_ones() > 1 {
+                declined = declined.and(xfin.unchanged());
                 continue;
             }
             let (t1, k1) = form.terms[i];
@@ -2325,10 +2461,15 @@ fn merge_xor_pairs(
                 }
             }
             let before = cx.len() as u32;
-            // Choose which of `(t1, k1)` / `(t2, k2)` to eliminate (`elim` has coeff `ke`, `keep` has `kk - ke`).
+            // Choose which of `(t1, k1)` / `(t2, k2)` to eliminate (`elim` has coeff `ke`, `keep` has `kk - ke`);
+            // always prefer keeping a bare `x` over `x ^ c`.
             let both_gone = k1 == k2;
             let (ke, kk_rem, keep_id) = if both_gone {
                 (k1, BitVec::zero(w), t2)
+            } else if !is_x1 {
+                (k2, BitVec::bin_unchecked(BinOp::Sub, &k1, &k2), t1)
+            } else if !is_x2 {
+                (k1, BitVec::bin_unchecked(BinOp::Sub, &k2, &k1), t2)
             } else {
                 super::refresh_uses(r, cx)?;
                 let u1 = r.life.live.uses(t1).unwrap_or(1);
@@ -2351,6 +2492,7 @@ fn merge_xor_pairs(
             if !kk_rem.is_zero() {
                 new_terms.push((keep_id, kk_rem));
             }
+            let mut used_x = false;
             if rem_same != 0 && bit_coef_i64 != 0 {
                 let bit_node = r.build(cx, |cx| {
                     let mc = cx.mk_const_u64(w.bits(), rem_same)?;
@@ -2363,7 +2505,7 @@ fn merge_xor_pairs(
                     BitVec::un_unchecked(UnOp::Neg, &BitVec::bin_unchecked(BinOp::Mul, &ke, &two))
                 };
                 if !scale.is_zero() {
-                    if let Some( c_bit ) = cx.const_val(bit_node) {
+                    if let Some(c_bit) = cx.const_val(bit_node) {
                         new_konst = BitVec::bin_unchecked(
                             BinOp::Add,
                             &new_konst,
@@ -2371,8 +2513,10 @@ fn merge_xor_pairs(
                         );
                     } else if let Some(slot) = new_terms.iter_mut().find(|(id, _)| *id == bit_node) {
                         slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                        used_x = true;
                     } else {
                         new_terms.push((bit_node, scale));
+                        used_x = true;
                     }
                 }
             }
@@ -2386,13 +2530,15 @@ fn merge_xor_pairs(
                 .enumerate()
                 .filter_map(|(idx, &(id, _))| (idx != i && idx != j).then_some(id))
                 .collect();
-            stops.push(x);
+            if used_x {
+                stops.push(x);
+            }
             if !both_gone {
                 stops.push(keep_id);
             }
             stops.sort_unstable();
             stops.dedup();
-            return super::finish_with(
+            match super::finish_with(
                 r,
                 cx,
                 PassKind::Linear,
@@ -2401,12 +2547,14 @@ fn merge_xor_pairs(
                 before,
                 &stops,
                 f.fin,
-                both_gone,
-            )
-            .map(Some);
+                both_gone || !is_x1 || !is_x2,
+            )? {
+                Step::Normal(df) => declined = declined.and(df),
+                done => return Ok(Some(done)),
+            }
         }
     }
-    Ok(None)
+    Ok((declined != Fin::FINAL).then_some(Step::Normal(declined)))
 }
 
 /// Rewrite `k * (~x & M)` terms in `form` as `k * M - k * (x & M)` when `form` already carries a
@@ -2483,6 +2631,7 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
     // that `form_of` flattened into additive terms, so `... + (a | b) + ...` canonicalizes to
     // the flat `Add` order even on an operator-count tie.
     let mut flattened_disjoint_or = false;
+    let mut shared_disjoint_or = false;
     if matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) && form.terms.len() >= 3 {
         super::refresh_uses(r, cx)?;
         let mut st = vec![n];
@@ -2496,15 +2645,23 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
             if matches!(cn.op, OpCode::Add | OpCode::Sub) {
                 st.push(cn.a);
                 st.push(cn.b);
-            } else if cn.op == OpCode::Or
-                && r.life.live.uses(cur) == Some(1)
-                && atoms.binary_search(&cur).is_err()
-            {
-                flattened_disjoint_or = true;
-                break;
+            } else if cn.op == OpCode::Or && atoms.binary_search(&cur).is_err() {
+                if super::alone(r)
+                    || (!r.life.dead.contains(cur) && r.life.live.uses(cur) == Some(1))
+                {
+                    flattened_disjoint_or = true;
+                    break;
+                } else {
+                    shared_disjoint_or = true;
+                }
             }
         }
     }
+    let fin = if shared_disjoint_or {
+        form.fin.and(Fin::PROVISIONAL)
+    } else {
+        form.fin
+    };
     let estimate = estimate(&form);
     // A constant always commits (see `shrinks`).
     if !form.terms.is_empty()
@@ -2512,7 +2669,7 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
         && let Some(f) = worth_building(r, cx, n, &atoms, estimate)?
     {
         r.stats.passes.entry("linear").or_default().rejected_cost += 1;
-        return Ok(Step::Normal(form.fin.and(f)));
+        return Ok(Step::Normal(fin.and(f)));
     }
     let before = cx.len() as u32;
     let e = emit(r, cx, &form)?;
@@ -2521,12 +2678,32 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
         terms: form.terms.iter().map(|&(a, k)| (cx.handle(a), k)).collect(),
     });
     if flattened_disjoint_or && matches!(cx.node(e).op, OpCode::Add | OpCode::Sub) {
-        let en = cx.node(e);
-        if !disjoint(r, cx, en.a, en.b)?.0 {
-            return super::finish_with(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin, true);
+        let mut any_disjoint_add = false;
+        let mut fin_disj = fin;
+        let mut st = vec![e];
+        while let Some(cur) = st.pop() {
+            if cur < before {
+                continue;
+            }
+            let cn = cx.node(cur);
+            if cn.op == OpCode::Add {
+                let (d, dfa, dfb) = disjoint(r, cx, cn.a, cn.b)?;
+                fin_disj = fin_disj.and(dfa).and(dfb);
+                if d {
+                    any_disjoint_add = true;
+                    break;
+                }
+            }
+            if matches!(cn.op, OpCode::Add | OpCode::Sub) {
+                st.push(cn.a);
+                st.push(cn.b);
+            }
+        }
+        if !any_disjoint_add {
+            return super::finish_with(r, cx, PassKind::Linear, n, e, before, &atoms, fin_disj, true);
         }
     }
-    finish(r, cx, PassKind::Linear, n, e, before, &atoms, form.fin)
+    finish(r, cx, PassKind::Linear, n, e, before, &atoms, fin)
 }
 
 /// The sum `konst + Σ coeff·term` taken apart into groups of terms whose bitwise parts share
@@ -2978,6 +3155,78 @@ pub(super) fn by_multiplicand(
     r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
     let w = form.konst.width();
     let one = BitVec::one(w);
+    let is_comp_node = |cx: &Context, a: u32, b: u32| -> bool {
+        let (na, nb) = (cx.node(a), cx.node(b));
+        if (na.op == OpCode::Not && na.a == b) || (nb.op == OpCode::Not && nb.a == a) {
+            return true;
+        }
+        if na.op == OpCode::Xor && nb.op == OpCode::Xor {
+            let xa = match (cx.const_val(na.a), cx.const_val(na.b)) {
+                (None, Some(k)) => Some((na.a, k)),
+                (Some(k), None) => Some((na.b, k)),
+                _ => None,
+            };
+            let xb = match (cx.const_val(nb.a), cx.const_val(nb.b)) {
+                (None, Some(k)) => Some((nb.a, k)),
+                (Some(k), None) => Some((nb.b, k)),
+                _ => None,
+            };
+            if let (Some((va, ca)), Some((vb, cb))) = (xa, xb) {
+                return va == vb && BitVec::bin_unchecked(BinOp::Xor, &ca, &cb).is_ones();
+            }
+        }
+        false
+    };
+    let unwrap_masked_xor = |cx: &Context, aid: u32, mask_w: u64| -> Option<(u32, u64, u64)> {
+        let an = cx.node(aid);
+        if an.op != OpCode::Xor {
+            return None;
+        }
+        let (inner, c) = match (cx.const_val(an.a), cx.const_val(an.b)) {
+            (None, Some(k)) => (an.a, k.to_u64()? & mask_w),
+            (Some(k), None) => (an.b, k.to_u64()? & mask_w),
+            _ => return None,
+        };
+        let in_node = cx.node(inner);
+        if in_node.op == OpCode::And {
+            match (cx.const_val(in_node.a), cx.const_val(in_node.b)) {
+                (None, Some(m)) if let Some(mv) = m.to_u64() => {
+                    return Some((in_node.a, mv & mask_w, c));
+                }
+                (Some(m), None) if let Some(mv) = m.to_u64() => {
+                    return Some((in_node.b, mv & mask_w, c));
+                }
+                _ => {}
+            }
+        }
+        Some((inner, mask_w, c))
+    };
+    let mask_w = if w.bits() <= 64 {
+        u64::MAX >> (64 - w.bits())
+    } else {
+        0
+    };
+    let mut all_or_atoms: Vec<u32> = Vec::new();
+    let mut all_xor_atoms: Vec<(u32, u32, u64, u64)> = Vec::new();
+    for &(t, _) in &form.terms {
+        if let Some((_, factors)) = scaled_factors(cx, t).filter(|(_, f)| f.len() >= 2) {
+            for f in factors {
+                let ff = form_of(r, cx, f)?;
+                for &(aid, _) in &ff.terms {
+                    let an = cx.node(aid);
+                    if an.op == OpCode::Or && !all_or_atoms.contains(&aid) {
+                        all_or_atoms.push(aid);
+                    } else if w.bits() <= 64
+                        && an.op == OpCode::Xor
+                        && !all_xor_atoms.iter().any(|x| x.0 == aid)
+                        && let Some((v_id, m_v, c_v)) = unwrap_masked_xor(cx, aid, mask_w)
+                    {
+                        all_xor_atoms.push((aid, v_id, m_v, c_v));
+                    }
+                }
+            }
+        }
+    }
     // The values the factors are read over.
     let mut bases: Vec<Base> = Vec::new();
     let mut products: Vec<Option<Multiplied>> = Vec::with_capacity(form.terms.len());
@@ -2989,8 +3238,85 @@ pub(super) fn by_multiplicand(
         };
         let mut affine: Vec<Option<(usize, BitVec, BitVec)>> = Vec::with_capacity(factors.len());
         for &f in &factors {
-            let ff = form_of(r, cx, f)?;
+            let mut ff = form_of(r, cx, f)?;
             r.meter.charge(Counter::PassWork, ff.terms.len() as u64)?;
+            // Recognize De Morgan `(~u) & (~v) == -1 - (u | v)`, 1-bit `b ^ C == C ± b`, and
+            // complementary constant-XOR pairs `(x ^ c2) == K - (x ^ c1)` when `~(c1 ^ c2)` is
+            // covered by `known(x)`.
+            if ff.terms.len() == 1 && ff.terms[0].0 == f && ff.terms[0].1 == one {
+                let fn_node = cx.node(f);
+                if fn_node.op == OpCode::And
+                    && let Some(&or_id) = all_or_atoms.iter().find(|&&oid| {
+                        let on = cx.node(oid);
+                        (is_comp_node(cx, fn_node.a, on.a) && is_comp_node(cx, fn_node.b, on.b))
+                            || (is_comp_node(cx, fn_node.a, on.b)
+                                && is_comp_node(cx, fn_node.b, on.a))
+                    })
+                {
+                    let neg_one = BitVec::ones(w);
+                    let mut dm = Form::of(
+                        BitVec::bin_unchecked(BinOp::Sub, &ff.konst, &one),
+                        &[(or_id, neg_one)],
+                    );
+                    dm.fin = ff.fin;
+                    ff = dm;
+                } else if fn_node.op == OpCode::Xor && w.bits() <= 64 && w.bits() > 1 {
+                    let xor_pair = match (cx.const_val(fn_node.a), cx.const_val(fn_node.b)) {
+                        (None, Some(k)) => Some((fn_node.a, k)),
+                        (Some(k), None) => Some((fn_node.b, k)),
+                        _ => None,
+                    };
+                    if let Some((b_id, k_bv)) = xor_pair {
+                        let mask = u64::MAX >> (64 - w.bits());
+                        let high_mask = mask & !1u64;
+                        let (kw, bfin) = super::known_words(r, cx, b_id)?;
+                        if kw.is_some_and(|[z, _]| (z & high_mask) == high_mask) {
+                            let coef = if k_bv.bit(0) == Some(true) {
+                                BitVec::ones(w)
+                            } else {
+                                one
+                            };
+                            let mut xb = Form::of(
+                                BitVec::bin_unchecked(BinOp::Add, &ff.konst, &k_bv),
+                                &[(b_id, coef)],
+                            );
+                            xb.fin = ff.fin.and(bfin);
+                            ff = xb;
+                        } else if let Some((v_id, m2, c2)) = unwrap_masked_xor(cx, f, mask) {
+                            let (vkw, vfin) = if v_id == b_id {
+                                (kw, bfin)
+                            } else {
+                                super::known_words(r, cx, v_id)?
+                            };
+                            let (kz, ko) = vkw.map_or((0, 0), |[z, o]| (z & mask, o & mask));
+                            let known_mask = kz | ko;
+                            if let Some(&(canon_id, _, m1, c1)) =
+                                all_xor_atoms.iter().find(|&&(aid, vid, m1, c1)| {
+                                    if aid >= f || vid != v_id {
+                                        return false;
+                                    }
+                                    let varying =
+                                        (!known_mask) & ((m1 ^ m2) | (m1 & m2 & !(c1 ^ c2))) & mask;
+                                    varying == 0
+                                })
+                            {
+                                let val1 = ((ko & m1) ^ c1) & mask;
+                                let val2 = ((ko & m2) ^ c2) & mask;
+                                let sum_u64 = val1.wrapping_add(val2) & mask;
+                                let sum_bv = BitVec::wrapping_from_u64(w, sum_u64);
+                                let mut xp = Form::of(
+                                    BitVec::bin_unchecked(BinOp::Add, &ff.konst, &sum_bv),
+                                    &[(canon_id, BitVec::ones(w))],
+                                );
+                                xp.fin = ff.fin.and(vfin);
+                                ff = xp;
+                            } else {
+                                fin = fin.and(vfin.unchanged());
+                            }
+                        }
+                    }
+                }
+            }
             let Some((alpha, base)) = scaled_base(&ff) else {
                 affine.push(None);
                 continue;

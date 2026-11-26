@@ -264,8 +264,14 @@ pub(crate) fn lower_id(
     root: u32,
     lim: &MbaLimits,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
-    let (atoms, order) = scan(cx, root, lim)?;
-    build(cx, atoms, order, &[])
+    let mut scan_lim = *lim;
+    scan_lim.max_vars = lim.max_vars.saturating_add(4);
+    let (mut atoms, order) = scan(cx, root, &scan_lim)?;
+    let peers = deduplicate_peers(cx, &mut atoms);
+    if atoms.len() as u32 > lim.max_vars {
+        return Err(Refusal::TooManyVars);
+    }
+    build_with_peers(cx, atoms, order, &[], &peers)
 }
 
 /// [`lower_id`] over `reading`'s narrower fragment: every other subterm (a cast,
@@ -292,9 +298,16 @@ pub(crate) fn lower_id_over(
     opaque: &IdMap<u32, ()>,
 ) -> Result<(MbaExpr, Bindings), Refusal> {
     let free = |i: u32| i == root || !opaque.contains_key(&i);
+    let mut scan_lim = *lim;
+    scan_lim.max_vars = lim.max_vars.saturating_add(4);
     let Some(reading) = reading else {
-        let (atoms, order) = scan_in(cx, root, lim, &|cx, i| free(i) && in_fragment(cx, i))?;
-        return build(cx, atoms, order, &[]);
+        let (mut atoms, order) =
+            scan_in(cx, root, &scan_lim, &|cx, i| free(i) && in_fragment(cx, i))?;
+        let peers = deduplicate_peers(cx, &mut atoms);
+        if atoms.len() as u32 > lim.max_vars {
+            return Err(Refusal::TooManyVars);
+        }
+        return build_with_peers(cx, atoms, order, &[], &peers);
     };
     let inside = |cx: &Context, i: u32, under: Option<&Lease>| {
         free(i)
@@ -312,8 +325,6 @@ pub(crate) fn lower_id_over(
         Reading::Shallow => Some(under_bitwise(cx, root, lim, opaque)?),
         _ => None,
     };
-    let mut scan_lim = *lim;
-    scan_lim.max_vars = lim.max_vars.saturating_add(4);
     let (mut atoms, order) = scan_in(cx, root, &scan_lim, &|cx, i| inside(cx, i, under.as_ref()))?;
     // An atom that is its operand and a constant added (`a = t + k`, `a = k − t`) or xored
     // (`a = t ^ k`), where the fragment reads `t` too: `t` is `a − k`, `k − a`, or `a ^ k` over
@@ -352,8 +363,75 @@ pub(crate) fn lower_id_over(
     } else {
         order
     };
-    // Deduplicate peer correlated atoms (`t ^ c1` vs `t ^ c2`, `t + c1` vs `t + c2`, and
-    // nested bit-masks `x & m_sub` under `x & m_sup` or `x`).
+    let peers = deduplicate_peers(cx, &mut atoms);
+    if atoms.len() as u32 > lim.max_vars {
+        return Err(Refusal::TooManyVars);
+    }
+    build_with_peers(cx, atoms, order, &solved, &peers)
+}
+
+/// [`lower_id_over`] with no reading, and whether the fragment is semi-linear as it is (every
+/// node of it one [`Reading::SemiLinear`] takes): the semi-linear reading is then this one, and
+/// each cut of the whole fragment is the semi-linear cut at the same node, so a caller that
+/// has this need not lower those.
+pub(crate) fn lower_id_whole(
+    cx: &Context,
+    root: u32,
+    lim: &MbaLimits,
+    opaque: &IdMap<u32, ()>,
+) -> Result<(MbaExpr, Bindings, bool), Refusal> {
+    let free = |i: u32| i == root || !opaque.contains_key(&i);
+    let mut scan_lim = *lim;
+    scan_lim.max_vars = lim.max_vars.saturating_add(4);
+    let (mut atoms, order) =
+        scan_in(cx, root, &scan_lim, &|cx, i| free(i) && in_fragment(cx, i))?;
+    let semi = order
+        .iter()
+        .all(|&i| in_reading(cx, i, Reading::SemiLinear));
+    let peers = deduplicate_peers(cx, &mut atoms);
+    if atoms.len() as u32 > lim.max_vars {
+        return Err(Refusal::TooManyVars);
+    }
+    let (m, bindings) = build_with_peers(cx, atoms, order, &[], &peers)?;
+    Ok((m, bindings, semi))
+}
+
+fn is_negated_pair(cx: &Context, a: u32, b: u32) -> bool {
+    let na = cx.node(a);
+    let nb = cx.node(b);
+    if (na.op == OpCode::Neg && na.a == b) || (nb.op == OpCode::Neg && nb.a == a) {
+        return true;
+    }
+    if let (
+        Some((
+            ta,
+            SolvedKind::Sub {
+                constant: ca,
+                negated: nega,
+            },
+        )),
+        Some((
+            tb,
+            SolvedKind::Sub {
+                constant: cb,
+                negated: negb,
+            },
+        )),
+    ) = (offset_or_xor(cx, a), offset_or_xor(cx, b))
+    {
+        return ta == tb && nega != negb && BitVec::bin_unchecked(BinOp::Add, &ca, &cb).is_zero();
+    }
+    false
+}
+
+/// Deduplicate peer correlated atoms (`t` vs `t ^ c` / `t + c` / `c - t`, `t ^ c1` vs `t ^ c2`,
+/// `t + c1` vs `t + c2` / `c2 - t`, nested bit-masks `x & m_sub` under `x & m_sup` or `x`, and
+/// opposite-sign products `(K - X) * M` vs `(X - K) * M`), returning `PeerSolved` entries in
+/// valid topological order so chained peers never reference an unbuilt source.
+fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
+    if atoms.len() < 2 {
+        return Vec::new();
+    }
     let mut peers: Vec<PeerSolved> = Vec::new();
     let mut keep = vec![true; atoms.len()];
     for j in 0..atoms.len() {
@@ -393,8 +471,29 @@ pub(crate) fn lower_id_over(
                 continue;
             }
         }
-        // 2) Check if `aj` shares an affine/xor base with an earlier kept atom `ai` (`i < j`).
+        // 2) Check if `aj` is `t ^ c` / `t + c` / `c - t` over another kept bare atom `t` (any
+        // index `i != j`), or shares an affine/xor base with an earlier kept atom `ai` (`i < j`).
         if let Some((tj, kj)) = offset_or_xor(cx, aj) {
+            if let Some(i) = (0..atoms.len()).find(|&i| i != j && keep[i] && atoms[i] == tj) {
+                let op = match kj {
+                    SolvedKind::Xor(c) => PeerOp::Xor(c),
+                    SolvedKind::Sub {
+                        constant: c,
+                        negated: false,
+                    } => PeerOp::Add(c),
+                    SolvedKind::Sub {
+                        constant: c,
+                        negated: true,
+                    } => PeerOp::SubFrom(c),
+                };
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: atoms[i],
+                    op,
+                });
+                continue;
+            }
             let earlier = (0..j).find_map(|i| {
                 if !keep[i] || cx.wid(atoms[i]) != wj {
                     return None;
@@ -417,9 +516,42 @@ pub(crate) fn lower_id_over(
                             constant: c2,
                             negated: false,
                         },
+                    )
+                    | (
+                        SolvedKind::Sub {
+                            constant: c1,
+                            negated: true,
+                        },
+                        SolvedKind::Sub {
+                            constant: c2,
+                            negated: true,
+                        },
                     ) => Some((
                         atoms[i],
                         PeerOp::Add(BitVec::bin_unchecked(BinOp::Sub, &c2, &c1)),
+                    )),
+                    (
+                        SolvedKind::Sub {
+                            constant: c1,
+                            negated: false,
+                        },
+                        SolvedKind::Sub {
+                            constant: c2,
+                            negated: true,
+                        },
+                    )
+                    | (
+                        SolvedKind::Sub {
+                            constant: c1,
+                            negated: true,
+                        },
+                        SolvedKind::Sub {
+                            constant: c2,
+                            negated: false,
+                        },
+                    ) => Some((
+                        atoms[i],
+                        PeerOp::SubFrom(BitVec::bin_unchecked(BinOp::Add, &c1, &c2)),
                     )),
                     _ => None,
                 }
@@ -431,40 +563,66 @@ pub(crate) fn lower_id_over(
                     source: src,
                     op,
                 });
+                continue;
+            }
+        }
+        // 3) Check if `aj` is negated relative to an earlier kept product atom `(K - X) * M` vs
+        // `(X - K) * M` (`aj == 0 - ai`).
+        let nj = cx.node(aj);
+        if nj.op == OpCode::Mul {
+            let neg_src = (0..j).find(|&i| {
+                if !keep[i] || cx.wid(atoms[i]) != wj {
+                    return false;
+                }
+                let ni = cx.node(atoms[i]);
+                ni.op == OpCode::Mul
+                    && ((nj.a == ni.a && is_negated_pair(cx, nj.b, ni.b))
+                        || (nj.b == ni.b && is_negated_pair(cx, nj.a, ni.a))
+                        || (nj.a == ni.b && is_negated_pair(cx, nj.b, ni.a))
+                        || (nj.b == ni.a && is_negated_pair(cx, nj.a, ni.b)))
+            });
+            if let Some(i) = neg_src {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: atoms[i],
+                    op: PeerOp::SubFrom(BitVec::zero(cx.width_of(aj))),
+                });
             }
         }
     }
-    if !peers.is_empty() {
-        let mut idx = 0usize;
-        atoms.retain(|_| {
-            let k = keep[idx];
-            idx += 1;
-            k
-        });
+    if peers.is_empty() {
+        return peers;
     }
-    if atoms.len() as u32 > lim.max_vars {
-        return Err(Refusal::TooManyVars);
+    let mut idx = 0usize;
+    atoms.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+    let mut ready: IdMap<u32, ()> = atoms.iter().map(|&a| (a, ())).collect();
+    let mut ordered = Vec::with_capacity(peers.len());
+    let mut rem = peers;
+    while !rem.is_empty() {
+        let prev = rem.len();
+        let mut next = Vec::new();
+        for p in rem {
+            if ready.contains_key(&p.source) {
+                ready.insert(p.target, ());
+                ordered.push(p);
+            } else {
+                next.push(p);
+            }
+        }
+        if next.len() == prev {
+            for p in next {
+                atoms.push(p.target);
+            }
+            break;
+        }
+        rem = next;
     }
-    build_with_peers(cx, atoms, order, &solved, &peers)
-}
-
-/// [`lower_id_over`] with no reading, and whether the fragment is semi-linear as it is (every
-/// node of it one [`Reading::SemiLinear`] takes): the semi-linear reading is then this one, and
-/// each cut of the whole fragment is the semi-linear cut at the same node, so a caller that
-/// has this need not lower those.
-pub(crate) fn lower_id_whole(
-    cx: &Context,
-    root: u32,
-    lim: &MbaLimits,
-    opaque: &IdMap<u32, ()>,
-) -> Result<(MbaExpr, Bindings, bool), Refusal> {
-    let free = |i: u32| i == root || !opaque.contains_key(&i);
-    let (atoms, order) = scan_in(cx, root, lim, &|cx, i| free(i) && in_fragment(cx, i))?;
-    let semi = order
-        .iter()
-        .all(|&i| in_reading(cx, i, Reading::SemiLinear));
-    let (m, bindings) = build(cx, atoms, order, &[])?;
-    Ok((m, bindings, semi))
+    ordered
 }
 
 fn const_and_of(cx: &Context, a: u32) -> Option<(u32, BitVec)> {
@@ -543,6 +701,7 @@ struct Solved {
 enum PeerOp {
     Xor(BitVec),
     Add(BitVec),
+    SubFrom(BitVec),
     And(BitVec),
 }
 
@@ -677,16 +836,7 @@ fn is_under(under: &Lease, i: u32) -> bool {
 }
 
 /// The expression over `atoms` that the fragment's nodes `order` (operands first) compute,
-/// each operand in `solved` written over its atom.
-fn build(
-    cx: &Context,
-    atoms: Vec<u32>,
-    order: Vec<u32>,
-    solved: &[Solved],
-) -> Result<(MbaExpr, Bindings), Refusal> {
-    build_with_peers(cx, atoms, order, solved, &[])
-}
-
+/// each operand in `solved` / `peers` written over its atom.
 fn build_with_peers(
     cx: &Context,
     atoms: Vec<u32>,
@@ -730,6 +880,10 @@ fn build_in(
             PeerOp::Add(c) => {
                 let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
                 m.push(MOp::Add, &[src, k]).map_err(bad)?
+            }
+            PeerOp::SubFrom(c) => {
+                let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
+                m.push(MOp::Sub, &[k, src]).map_err(bad)?
             }
             PeerOp::And(c) => {
                 let k = m.push(MOp::Const(c), &[]).map_err(bad)?;

@@ -449,3 +449,299 @@ fn mba_correlated_xor_and_nested_mask_peer_atoms() {
     );
     assert_bitblasted_equal(&mut cx_small, core_e, core_out);
 }
+
+#[test]
+fn width_128_casts_and_compares_consts_never_panic() {
+    let mut cx = Context::new();
+    let w128 = Width::new(128).unwrap();
+    let o128 = ParseOptions::width(w128);
+    let engine = build_engine(false, false);
+
+    // Non-contiguous mask in `zext<128>(extract<8, 16>(x) & 0x55aa)` and inverted variant:
+    // exercises >64-bit `BitVec::wrapping_from_u64` instead of `mk_const_u64`.
+    let e1 = cx
+        .parse("zext<128>(extract<8, 16>(x) & 0x55aa:16)", &o128)
+        .unwrap();
+    let r1 = simplify_fuel(&engine, &mut cx, e1, 1 << 15);
+    let exp1 = cx.parse("(x >>u 8) & 0x55aa", &o128).unwrap();
+    assert_eq!(r1, exp1);
+    assert_bitblasted_equal(&mut cx, e1, r1);
+
+    let e2 = cx
+        .parse("zext<128>(~extract<8, 16>(x) & 0x55aa:16)", &o128)
+        .unwrap();
+    let r2 = simplify_fuel(&engine, &mut cx, e2, 1 << 15);
+    assert_bitblasted_equal(&mut cx, e2, r2);
+
+    // `one_value` substituting `x & 255` at width 128 when `extract<0, 8>(x) == 5` (`5 + 10 == 5 * 3`).
+    let e3 = cx
+        .parse(
+            "select(extract<0, 8>(x) == 5:8, 15, (x & 255) * 3)",
+            &o128,
+        )
+        .unwrap();
+    let r3 = simplify_fuel(&engine, &mut cx, e3, 1 << 15);
+    let exp3 = cx.parse("(x & 255) * 3", &o128).unwrap();
+    assert_eq!(r3, exp3);
+    assert_bitblasted_equal(&mut cx, e3, r3);
+}
+
+#[test]
+fn mba_chained_peer_solved_and_opposite_sign_product_atoms() {
+    let mut cx = Context::new();
+    let o8 = ParseOptions::width(Width::W8);
+    let engine = build_engine(true, false);
+
+    // Chained nested masks `[r & 2, r & 7, r]` where `r & 2` first targets `r & 7` and `r & 7`
+    // then targets `r`, plus chained xor+mask `[(t ^ 5) & 7, t ^ 3, t ^ 5]`.
+    let src1 = "\
+        let r = u * v; \
+        let t = x * y; \
+        ((r & 2) + (r & 5) - (r & 7) + (r ^ r)) \
+        + (((t ^ 5) & 7) - ((t ^ 5) & 5) - ((t ^ 5) & 2)) \
+        + ((t ^ 3) + (t ^ 5) - 2 * ((t ^ 3) & (t ^ 5))) \
+        + a + b + c";
+    let e1 = cx.parse(src1, &o8).unwrap();
+    let r1 = simplify_fuel(&engine, &mut cx, e1, 1 << 18);
+    let exp1 = cx.parse("6 + a + b + c", &o8).unwrap();
+    let r1_exp = simplify_fuel(&engine, &mut cx, exp1, 1 << 15);
+    assert_eq!(r1, r1_exp);
+
+    // Opposite-sign nonlinear product atoms `((x - 2) * m) + ((2 - x) * m)` with 7 extra variables.
+    let src2 = "\
+        let m = (u ^ 3) | 1; \
+        let p = (x + 0xfe) * m; \
+        let q = (2 - x) * m; \
+        p + q + a + b + c + d + e + f + g";
+    let e2 = cx.parse(src2, &o8).unwrap();
+    let r2 = simplify_fuel(&engine, &mut cx, e2, 1 << 18);
+    let exp2 = cx.parse("a + b + c + d + e + f + g", &o8).unwrap();
+    let r2_exp = simplify_fuel(&engine, &mut cx, exp2, 1 << 15);
+    assert_eq!(r2, r2_exp);
+
+    let mut cx_small = Context::new();
+    let e_core = cx_small
+        .parse(
+            "let m = (u ^ 3) | 1; ((x + 0xfe) * m) + ((2 - x) * m)",
+            &o8,
+        )
+        .unwrap();
+    let r_core = simplify_fuel(&engine, &mut cx_small, e_core, 1 << 16);
+    assert_eq!(
+        cx_small.view(r_core).unwrap(),
+        View::Const(BitVec::zero(Width::W8))
+    );
+    assert_bitblasted_equal(&mut cx_small, e_core, r_core);
+}
+
+#[test]
+fn memo_provisionality_when_shared_node_becomes_single_use() {
+    let mut cx = Context::new();
+    let o32 = ParseOptions::width(Width::W32);
+    let engine = build_engine(false, false);
+
+    // Run 1: `m = x & 0xff0f` has two live users (`m >>u 4` and `m * 3`), so `(x & 0xff0f) >>u 4`
+    // declines on sharing (`Fin::PROVISIONAL`, NOT `Fin::FINAL`).
+    let shared_root = cx
+        .parse("let m = x & 0xff0f; (m >>u 4) + m * 3", &o32)
+        .unwrap();
+    let out1 = simplify_fuel(&engine, &mut cx, shared_root, 1 << 15);
+    assert_bitblasted_equal(&mut cx, shared_root, out1);
+
+    // Run 2 in the SAME `Context`: `m >>u 4` is now the sole user of `m = x & 0xff0f` and must
+    // simplify to `(x >>u 4) & 0x0ff0` rather than returning a stale memoized `m >>u 4`.
+    let solo = cx.parse("(x & 0xff0f) >>u 4", &o32).unwrap();
+    let out2 = simplify_fuel(&engine, &mut cx, solo, 1 << 15);
+    let expected = cx.parse("(x >>u 4) & 0x0ff0", &o32).unwrap();
+    assert_eq!(out2, expected);
+    assert_bitblasted_equal(&mut cx, solo, out2);
+}
+
+#[test]
+fn zero_cycles_cut_invariant_across_casts_shuffle_linear_mba() {
+    let engine = build_engine(true, true);
+    for src in [
+        // `zext(extract<23, 1>(x))` alongside `rotl(x, 41) & 1` and `(x >>u 23) & 1`.
+        "zext<64>(extract<23, 1>(x)) + (rotl(x, 41) & 1) * 3 + ((x >>u 23) & 1) * 5",
+        // Multiple disjoint `Or` subtrees flattened into an additive spine.
+        "let p = (a & 4) | 1; let q = (b & 8) | 2; c + p + q + (d & 16)",
+        // `zext(extract<8, 16>(x) & 7)` single-bit-run mask vs `Shuffle`.
+        "zext<64>(extract<8, 16>(x) & 7:16) + ((x >>u 8) & 7)",
+        // Majority `& 1` narrowing alongside live slices.
+        "let r1 = rotl(x, 41); let r2 = rotl(x, 43); let c = y == 0; \
+         (((r1 ^ zext<64>(c)) & (r2 ^ r1) ^ r1) & 1) + zext<64>(extract<23, 1>(x))",
+    ] {
+        let mut cx = Context::new();
+        let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+        let run_out = engine
+            .run(
+                &mut cx,
+                &[e],
+                Run::default().with_per_call(Budget::fuel(1 << 17)),
+            )
+            .expect("engine run");
+        assert_eq!(
+            run_out.stats.cycles_cut, 0,
+            "expected 0 cycles_cut on `{src}`, got {}",
+            run_out.stats.cycles_cut
+        );
+    }
+}
+
+#[test]
+fn p1_and_p2_identities_demorgan_cofactor_borrow_free_sub_demanded_and_compares() {
+    let engine = build_engine(true, true);
+    let o16 = ParseOptions::width(Width::W16);
+
+    // 1) `other & zext<16>(bit)` 1-bit narrowing (Cluster V2a).
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let b = c == 0; \
+            let lhs = ((x >>u 2) ^ (y >>u 3)) & zext<16>(b); \
+            let rhs = zext<16>((extract<2, 1>(x) ^ extract<3, 1>(y)) & b); \
+            lhs == rhs";
+        let eq = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 16);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+    }
+
+    // 2) De Morgan `(~u) & (~v)` in `by_multiplicand` + 1-bit `(b ^ C)` factor + cofactor known bits (V2c).
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let m = (0x1063 - a * 4) | (b * 8); \
+            let g1 = (x ^ 0x000a) | (y ^ 0x000a); \
+            let g2 = (x ^ 0xfff5) & (y ^ 0xfff5); \
+            let b0 = u & 1; \
+            (g1 * (m & 3) + g2 * 3 + 3) + ((0x8040 - b0) * v + (b0 ^ 0x8041) * v - 0x8041 * v)";
+        let e = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, e, 1 << 18);
+        assert_bitblasted_equal(&mut cx, e, out);
+
+        // Exact identity where both halves cancel to 0:
+        let zero_src = "\
+            let m = (0x1063 - a * 4) | (b * 8); \
+            let g1 = (x ^ 0x000a) | (y ^ 0x000a); \
+            let g2 = (x ^ 0xfff5) & (y ^ 0xfff5); \
+            let b0 = u & 1; \
+            (g1 * (m & 3) + g2 * 3 + 3) + ((b0 ^ 0x8041) * v - (0x8041 - b0) * v)";
+        let ez = cx.parse(zero_src, &o16).unwrap();
+        let out_z = simplify_fuel(&engine, &mut cx, ez, 1 << 18);
+        assert_eq!(cx.view(out_z).unwrap(), View::Const(BitVec::zero(Width::W16)));
+        assert_bitblasted_equal(&mut cx, ez, out_z);
+    }
+
+    // 3) Borrow-free `c2 - (x ^ c1) -> x ^ k` and `-1 - (x ^ c1) -> x ^ ~c1` (Cluster V2d).
+    {
+        let mut cx = Context::new();
+        let e1 = cx.parse("0xffba - ((x & 0xffba) ^ 0x0012)", &o16).unwrap();
+        let r1 = simplify_fuel(&engine, &mut cx, e1, 1 << 15);
+        let exp1 = cx.parse("(x & 0xffba) ^ 0xffa8", &o16).unwrap();
+        assert_eq!(r1, exp1);
+        assert_bitblasted_equal(&mut cx, e1, r1);
+
+        let e2 = cx.parse("0xffff - (x ^ 0x1234)", &o16).unwrap();
+        let r2 = simplify_fuel(&engine, &mut cx, e2, 1 << 15);
+        let exp2 = cx.parse("x ^ 0xedcb", &o16).unwrap();
+        assert_eq!(r2, exp2);
+        assert_bitblasted_equal(&mut cx, e2, r2);
+    }
+
+    // 4) Demanded `Select` + `RotL` + multi-use `Add`/`Sub` constant narrowing + `narrow_to_live_wide` high-bit const.
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let s = x + 0xfe05; \
+            let mux = select(c == 0, rotl(s, 8), rotl(x + 5, 8)); \
+            (rotr(mux, 8) + s) & 0x00ff";
+        let e = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, e, 1 << 16);
+        assert_bitblasted_equal(&mut cx, e, out);
+
+        let mut cx2 = Context::new();
+        let src2 = "\
+            let w16 = x | 0xfe6f; \
+            let n8 = extract<0, 8>(x) | 0x6f:8; \
+            zext<16>(n8) + (w16 & 0x00ff)";
+        let e2 = cx2.parse(src2, &o16).unwrap();
+        let out2 = simplify_fuel(&engine, &mut cx2, e2, 1 << 16);
+        assert_bitblasted_equal(&mut cx2, e2, out2);
+    }
+
+    // 5) Bare-base `x + (x ^ -2)`, 1-bit `Mul`, boolean `b * (b ^ c)`, 4-way carry cancel,
+    //    linear `Eq` term cancellation, and `select` arm guard specialization.
+    {
+        let mut cx = Context::new();
+        let e_xor = cx.parse("x + (x ^ 0xfffe)", &o16).unwrap();
+        let r_xor = simplify_fuel(&engine, &mut cx, e_xor, 1 << 15);
+        assert_bitblasted_equal(&mut cx, e_xor, r_xor);
+
+        let e_mul1 = cx.parse("(a == 0) * (b == 0)", &o16).unwrap();
+        let r_mul1 = simplify_fuel(&engine, &mut cx, e_mul1, 1 << 15);
+        assert_bitblasted_equal(&mut cx, e_mul1, r_mul1);
+
+        let e_bmul = cx.parse("(x & 1) * ((x & 1) ^ 0x1235)", &o16).unwrap();
+        let r_bmul = simplify_fuel(&engine, &mut cx, e_bmul, 1 << 15);
+        let exp_bmul = cx.parse("(x & 1) * 0x1234", &o16).unwrap();
+        assert_eq!(r_bmul, exp_bmul);
+        assert_bitblasted_equal(&mut cx, e_bmul, r_bmul);
+
+        let eq_ult = cx
+            .parse("((b + d) <u (a + b + c + d)) == ((b + d) <u -(a + c))", &o16)
+            .unwrap();
+        let r_ult = simplify_fuel(&engine, &mut cx, eq_ult, 1 << 15);
+        assert_eq!(cx.view(r_ult).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+        let eq_ule = cx
+            .parse("((a + b + c + d) <=u (b + d)) == (-(a + c) <=u (b + d))", &o16)
+            .unwrap();
+        let r_ule = simplify_fuel(&engine, &mut cx, eq_ule, 1 << 15);
+        assert_eq!(cx.view(r_ule).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+        let e_lin_eq = cx.parse("(x * 3 + 5) == (x + 9)", &o16).unwrap();
+        let r_lin_eq = simplify_fuel(&engine, &mut cx, e_lin_eq, 1 << 15);
+        assert_bitblasted_equal(&mut cx, e_lin_eq, r_lin_eq);
+
+        let e_sel = cx
+            .parse("select(x == 5, y, y + (zext<16>(x != 5) - 1) * z)", &o16)
+            .unwrap();
+        let r_sel = simplify_fuel(&engine, &mut cx, e_sel, 1 << 15);
+        let exp_sel = cx.parse("y", &o16).unwrap();
+        assert_eq!(r_sel, exp_sel);
+        assert_bitblasted_equal(&mut cx, e_sel, r_sel);
+
+        // Same-guard bitwise select merge + zero-annihilating shared select factor on `Eq`.
+        let e_rot_sel = cx
+            .parse(
+                "let c = u == 0; let s = select(c, 0:16, 3); \
+                 ((select(c, x >>u 4, 0x0123) | select(c, x << 12, 0x4000)) * s) \
+                 == (select(c, rotl(x, 12), 0x4123) * s)",
+                &o16,
+            )
+            .unwrap();
+        let r_rot_sel = simplify_fuel(&engine, &mut cx, e_rot_sel, 1 << 16);
+        assert_eq!(
+            cx.view(r_rot_sel).unwrap(),
+            View::Const(BitVec::ones(Width::W1))
+        );
+        assert_bitblasted_equal(&mut cx, e_rot_sel, r_rot_sel);
+
+        // Masked-XOR complementary factor pairing `((v & 5) ^ c1)` vs `((v & 4) ^ c2)` when bit 0 of `v` is known.
+        let e_mxor = cx
+            .parse(
+                "let v = (a << 2) | 3; \
+                 let f1 = (v & 5) ^ 0x1750; \
+                 let f2 = (v & 4) ^ 0xe8af; \
+                 f1 * y + f2 * y",
+                &o16,
+            )
+            .unwrap();
+        let r_mxor = simplify_fuel(&engine, &mut cx, e_mxor, 1 << 16);
+        assert_eq!(
+            cx.view(r_mxor).unwrap(),
+            View::Const(BitVec::zero(Width::W16))
+        );
+        assert_bitblasted_equal(&mut cx, e_mxor, r_mxor);
+    }
+}

@@ -240,7 +240,7 @@ mod tests {
         let value = cx.mul(byte, factor).unwrap();
         let mut values: Vec<_> = [0xf6, 0xf7, 0xfe, 0xff]
             .into_iter()
-            .flat_map(|x| [x * 3 & 255, x * 5 & 255])
+            .flat_map(|x| [(x * 3) & 255, (x * 5) & 255])
             .collect();
         values.sort_unstable();
         values.dedup();

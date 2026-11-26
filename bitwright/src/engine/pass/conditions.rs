@@ -268,14 +268,20 @@ fn reading(cx: &Context, a: u32, w: crate::Width) -> Option<Reading> {
         }
         OpCode::Concat => {
             let hi = cx.node(n.a);
-            if hi.op == OpCode::Zext
-                && cx.wid(hi.a) == 1
+            let hi_bit = if cx.wid(n.a) == 1 {
+                Some(n.a)
+            } else if hi.op == OpCode::Zext && cx.wid(hi.a) == 1 {
+                Some(hi.a)
+            } else {
+                None
+            };
+            if let Some(cb) = hi_bit
                 && let Some(lo_bv) = cx.const_val(n.b)
                 && let Ok(f) = lo_bv.zext(w)
             {
                 let sh = u32::from(cx.wid(n.b));
                 let d = crate::facts::known::bv_shl(&BitVec::one(w), sh);
-                return Some(cond(hi.a, f, d, false));
+                return Some(cond(cb, f, d, false));
             }
             carry_of_field(cx, n.b, w, Shape::Concat(n.a))
         }
