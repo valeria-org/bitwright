@@ -374,7 +374,12 @@ pub fn main(args: &[String]) -> ExitCode {
     for b in &measured {
         println!(
             "boundary={} questions={} decided={} tasks={} retried={} latency_ms={:.3}",
-            b.name, b.questions, b.decided, b.tasks, b.retried, b.latency.as_secs_f64() * 1e3,
+            b.name,
+            b.questions,
+            b.decided,
+            b.tasks,
+            b.retried,
+            b.latency.as_secs_f64() * 1e3,
         );
     }
     print!("nonempty_boundaries={} boundary_p95_ms=", measured.len());
@@ -404,11 +409,11 @@ pub fn main(args: &[String]) -> ExitCode {
         stats.store_answers,
         stats.flushes
     );
-    if let Some(f) = answers_file {
-        if let Err(e) = std::fs::write(&f, lines) {
-            eprintln!("{f}: {e}");
-            return ExitCode::FAILURE;
-        }
+    if let Some(f) = answers_file
+        && let Err(e) = std::fs::write(&f, lines)
+    {
+        eprintln!("{f}: {e}");
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }

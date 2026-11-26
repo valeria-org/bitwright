@@ -1210,7 +1210,9 @@ impl Solver {
                 match self.pick() {
                     Some(d) => d,
                     None => {
-                        break Answer::Sat(self.values.iter().map(|v| v[0] == Value::True).collect());
+                        break Answer::Sat(
+                            self.values.iter().map(|v| v[0] == Value::True).collect(),
+                        );
                     }
                 }
             };

@@ -11,8 +11,12 @@ use crate::{BinOp, Error};
 const MAX_TERMS: usize = 96;
 const MAX_CODE: usize = 512;
 const ATOMS: [u64; 6] = [
-    0xaaaaaaaaaaaaaaaa, 0xcccccccccccccccc, 0xf0f0f0f0f0f0f0f0,
-    0xff00ff00ff00ff00, 0xffff0000ffff0000, 0xffffffff00000000,
+    0xaaaaaaaaaaaaaaaa,
+    0xcccccccccccccccc,
+    0xf0f0f0f0f0f0f0f0,
+    0xff00ff00ff00ff00,
+    0xffff0000ffff0000,
+    0xffffffff00000000,
 ];
 
 /// Canonicalized affine form of a non-bitwise leaf (`bias + sum c_i * t_i` mod `2^w`),
@@ -87,7 +91,10 @@ fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
         OpCode::Xor => {
             let (az, ao) = node_known_bits(cx, n.a, depth - 1);
             let (bz, bo) = node_known_bits(cx, n.b, depth - 1);
-            (((az & bz) | (ao & bo)) & mask, ((az & bo) | (ao & bz)) & mask)
+            (
+                ((az & bz) | (ao & bo)) & mask,
+                ((az & bo) | (ao & bz)) & mask,
+            )
         }
         OpCode::Not => {
             let (az, ao) = node_known_bits(cx, n.a, depth - 1);
@@ -96,7 +103,11 @@ fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
         OpCode::Zext => {
             let sw = cx.wid(n.a);
             let (az, ao) = node_known_bits(cx, n.a, depth - 1);
-            let hi = if sw < 64 { mask & !((1u64 << sw) - 1) } else { 0 };
+            let hi = if sw < 64 {
+                mask & !((1u64 << sw) - 1)
+            } else {
+                0
+            };
             ((az | hi) & mask, ao & mask)
         }
         OpCode::Extract if cx.wid(n.a) <= 64 => {
@@ -166,7 +177,11 @@ fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
                     ((!bz) & mask).trailing_zeros()
                 };
                 let tz = tz_a.saturating_add(tz_b).min(u32::from(w));
-                let z_low = if tz >= 64 { mask } else { ((1u64 << tz) - 1) & mask };
+                let z_low = if tz >= 64 {
+                    mask
+                } else {
+                    ((1u64 << tz) - 1) & mask
+                };
                 let o_bit = if tz < u32::from(w)
                     && tz_a < 64
                     && tz_b < 64
@@ -187,7 +202,9 @@ fn node_known_bits(cx: &Context, i: u32, depth: u8) -> (u64, u64) {
 
 impl Table {
     fn push_node(&mut self, n: Node) -> Option<u32> {
-        if self.code.len() >= MAX_CODE { return None; }
+        if self.code.len() >= MAX_CODE {
+            return None;
+        }
         let p = self.code.len() as u32;
         self.code.push(n);
         Some(p)
@@ -232,7 +249,14 @@ impl Table {
                 }
                 if parts.len() == 1 && parts[0].1 == mask && bias == mask && parts[0].0 != i {
                     let inner = self.place(cx, parts[0].0, depth - 1, work)?;
-                    return self.push_node(Node { op: OpCode::Not, width: w, a: inner, b: 0, c: 0, aux: 0 });
+                    return self.push_node(Node {
+                        op: OpCode::Not,
+                        width: w,
+                        a: inner,
+                        b: 0,
+                        c: 0,
+                        aux: 0,
+                    });
                 }
                 for leaf in &self.affines {
                     if leaf.width != w || leaf.parts.len() != parts.len() {
@@ -242,9 +266,11 @@ impl Table {
                         return Some(leaf.slot);
                     }
                     if leaf.bias.wrapping_add(bias) & mask == mask
-                        && leaf.parts.iter().zip(&parts).all(|(&(a, ca), &(b, cb))| {
-                            a == b && ca.wrapping_add(cb) & mask == 0
-                        })
+                        && leaf
+                            .parts
+                            .iter()
+                            .zip(&parts)
+                            .all(|(&(a, ca), &(b, cb))| a == b && ca.wrapping_add(cb) & mask == 0)
                     {
                         return self.push_node(Node {
                             op: OpCode::Not,
@@ -256,7 +282,9 @@ impl Table {
                         });
                     }
                 }
-                if self.atoms == ATOMS.len() { return None; }
+                if self.atoms == ATOMS.len() {
+                    return None;
+                }
                 let (az, ao) = node_known_bits(cx, i, 6);
                 self.atom_zeros[self.atoms] = az;
                 self.atom_ones[self.atoms] = ao;
@@ -264,11 +292,18 @@ impl Table {
                 n.a = self.atoms as u32;
                 self.atoms += 1;
                 let p = self.push_node(n)?;
-                self.affines.push(AffineLeaf { width: w, bias, parts, slot: p });
+                self.affines.push(AffineLeaf {
+                    width: w,
+                    bias,
+                    parts,
+                    slot: p,
+                });
                 return Some(p);
             }
         }
-        if self.atoms == ATOMS.len() { return None; }
+        if self.atoms == ATOMS.len() {
+            return None;
+        }
         let (az, ao) = node_known_bits(cx, i, 6);
         self.atom_zeros[self.atoms] = az;
         self.atom_ones[self.atoms] = ao;
@@ -283,8 +318,12 @@ impl Table {
     // high bits with a constant mask, so mixed-width masked bitwise terms share atoms.
     fn place(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<u32> {
         work.take(1)?;
-        if let Some(&p) = self.places.get(&i) { return Some(p); }
-        if depth == 0 || self.code.len() >= MAX_CODE { return None; }
+        if let Some(&p) = self.places.get(&i) {
+            return Some(p);
+        }
+        if depth == 0 || self.code.len() >= MAX_CODE {
+            return None;
+        }
         let mut n = cx.node(i);
         let p = match n.op {
             OpCode::Const => self.push_node(n)?,
@@ -364,7 +403,13 @@ impl Table {
     /// Positions where all bitwise constants have identical bits share a table;
     /// checking its lowest j implies equality at all the others. Testing aggregate
     /// all-zero/all-ones words instead would unsoundly cancel across positions.
-    fn constant(&mut self, cx: &Context, parts: &[(u32, u64)], w: u16, work: &mut Work) -> Option<u64> {
+    fn constant(
+        &mut self,
+        cx: &Context,
+        parts: &[(u32, u64)],
+        w: u16,
+        work: &mut Work,
+    ) -> Option<u64> {
         self.code.clear();
         self.places.clear();
         self.affines.clear();
@@ -392,7 +437,12 @@ impl Table {
             } else if d > 0
                 && matches!(
                     m.op,
-                    OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Extract | OpCode::Zext
+                    OpCode::Not
+                        | OpCode::And
+                        | OpCode::Or
+                        | OpCode::Xor
+                        | OpCode::Extract
+                        | OpCode::Zext
                 )
             {
                 for c in m.children() {
@@ -430,7 +480,13 @@ impl Table {
                 values[p] = match n.op {
                     OpCode::Const => {
                         let k = u64::from(n.a) | (u64::from(n.b) << 32);
-                        if k & (1 << j) == 0 { class &= !k; 0 } else { class &= k; all }
+                        if k & (1 << j) == 0 {
+                            class &= !k;
+                            0
+                        } else {
+                            class &= k;
+                            all
+                        }
                     }
                     OpCode::Sym => {
                         let a = n.a as usize;
@@ -465,7 +521,10 @@ impl Table {
                 }
             }
             work.take(rows as u64)?;
-            if counts[1..rows].iter().any(|&v| (v ^ counts[0]) & (mask >> j) != 0) {
+            if counts[1..rows]
+                .iter()
+                .any(|&v| (v ^ counts[0]) & (mask >> j) != 0)
+            {
                 return None;
             }
             result = result.wrapping_add(class.wrapping_mul(counts[0]));
@@ -509,7 +568,15 @@ fn affine_factor(cx: &Context, id: u32, w: u16) -> Option<(u32, u64, u64)> {
     let (var, bias, sign) = match (cx.const_val(n.a), cx.const_val(n.b)) {
         (None, Some(k)) => {
             let c = k.to_u64()?;
-            (n.a, if n.op == OpCode::Add { c } else { c.wrapping_neg() } & mask, 1u64)
+            (
+                n.a,
+                if n.op == OpCode::Add {
+                    c
+                } else {
+                    c.wrapping_neg()
+                } & mask,
+                1u64,
+            )
         }
         (Some(k), None) => {
             let c = k.to_u64()? & mask;
@@ -527,7 +594,12 @@ fn affine_factor(cx: &Context, id: u32, w: u16) -> Option<(u32, u64, u64)> {
             (Some(k), None) => (vn.b, k.to_u64()?),
             _ => (var, 1),
         },
-        OpCode::Shl if cx.const_val(vn.b).and_then(|v| v.to_u64()).is_some_and(|s| s < u64::from(w)) => {
+        OpCode::Shl
+            if cx
+                .const_val(vn.b)
+                .and_then(|v| v.to_u64())
+                .is_some_and(|s| s < u64::from(w)) =>
+        {
             (vn.a, 1u64 << cx.const_val(vn.b)?.to_u64()?)
         }
         OpCode::Neg => (vn.a, mask),
@@ -578,25 +650,41 @@ impl Sums {
         work.take((self.group.len() * 6) as u64)?;
         self.group.sort_unstable();
         for known in &self.known {
-            if known.terms.len() != self.group.len() { continue; }
+            if known.terms.len() != self.group.len() {
+                continue;
+            }
             let k = self.group[known.pivot].1 & mask;
             if u32::from(known.bits) + k.trailing_zeros() >= u32::from(w) {
                 work.take(self.group.len() as u64)?;
-                if known.terms.iter().zip(&self.group).all(|(&(a, v), &(b, t))|
-                    a == b && (v.wrapping_mul(k) ^ t) & mask == 0) {
+                if known
+                    .terms
+                    .iter()
+                    .zip(&self.group)
+                    .all(|(&(a, v), &(b, t))| a == b && (v.wrapping_mul(k) ^ t) & mask == 0)
+                {
                     return Some(k.wrapping_mul(known.value) & mask);
                 }
             }
         }
-        let (pivot, &(_, k)) = self.group.iter().enumerate().min_by_key(|(_, p)| (p.1 & mask).trailing_zeros())?;
+        let (pivot, &(_, k)) = self
+            .group
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, p)| (p.1 & mask).trailing_zeros())?;
         let shift = (k & mask).trailing_zeros();
-        if shift >= u32::from(w) { return Some(0); }
+        if shift >= u32::from(w) {
+            return Some(0);
+        }
         let bits = w - shift as u16;
         let odd = k >> shift;
         let mut inv = odd; // inverse mod 8; Newton doubles correct bits each iteration.
-        for _ in 0..5 { inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))); }
+        for _ in 0..5 {
+            inv = inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv)));
+        }
         let low = mask >> shift;
-        for (_, c) in &mut self.group { *c = (*c >> shift).wrapping_mul(inv) & low; }
+        for (_, c) in &mut self.group {
+            *c = (*c >> shift).wrapping_mul(inv) & low;
+        }
         let value = match self.table.constant(cx, &self.group, bits, work) {
             Some(v) => v,
             None => {
@@ -608,14 +696,27 @@ impl Sums {
             }
         };
         if self.known.len() < 32 {
-            self.known.push(Kernel { terms: self.group.clone(), pivot, bits, value });
+            self.known.push(Kernel {
+                terms: self.group.clone(),
+                pivot,
+                bits,
+                value,
+            });
         }
         Some(value.wrapping_mul(k) & mask)
     }
 
-    pub(super) fn collapse(&mut self, cx: &mut Context, i: u32, _terminal: bool, work: &mut Work) -> Result<Option<u32>, Error> {
+    pub(super) fn collapse(
+        &mut self,
+        cx: &mut Context,
+        i: u32,
+        _terminal: bool,
+        work: &mut Work,
+    ) -> Result<Option<u32>, Error> {
         let w = cx.wid(i);
-        if w > 64 { return Ok(None); }
+        if w > 64 {
+            return Ok(None);
+        }
         let mask = u64::MAX >> (64 - w);
         let mut bias = 0;
         self.parts.clear();
@@ -645,12 +746,20 @@ impl Sums {
         // Cancel identical factor pairs with opposite/combining scalars (e.g. `a * (b * C1) + a * (b * C2)`).
         if self.products.iter().flatten().count() >= 2 {
             for idx in 0..self.products.len() {
-                let Some((mut p1, mut c1)) = self.products[idx] else { continue };
-                if p1[0] > p1[1] { p1.swap(0, 1); }
+                let Some((mut p1, mut c1)) = self.products[idx] else {
+                    continue;
+                };
+                if p1[0] > p1[1] {
+                    p1.swap(0, 1);
+                }
                 let mut merged = false;
                 for j in (idx + 1)..self.products.len() {
-                    let Some((mut p2, c2)) = self.products[j] else { continue };
-                    if p2[0] > p2[1] { p2.swap(0, 1); }
+                    let Some((mut p2, c2)) = self.products[j] else {
+                        continue;
+                    };
+                    if p2[0] > p2[1] {
+                        p2.swap(0, 1);
+                    }
                     if p1 == p2 {
                         c1 = c1.wrapping_add(c2) & mask;
                         self.products[j] = None;
@@ -682,9 +791,13 @@ impl Sums {
                 }
             }
             for idx in 0..self.products.len() {
-                let Some((p1, c1)) = self.products[idx] else { continue };
+                let Some((p1, c1)) = self.products[idx] else {
+                    continue;
+                };
                 for j in (idx + 1)..self.products.len() {
-                    let Some((p2, c2)) = self.products[j] else { continue };
+                    let Some((p2, c2)) = self.products[j] else {
+                        continue;
+                    };
                     let (same_sign, neg_b) = if c1 == c2 {
                         (true, false)
                     } else if c1.wrapping_add(c2) & mask == 0 {
@@ -737,13 +850,19 @@ impl Sums {
         let has_affine_prod = self.products.iter().flatten().any(|&([a, b], _)| {
             affine_factor(cx, a, w).is_some() || affine_factor(cx, b, w).is_some()
         });
-        let saved_parts = if has_affine_prod { Some(self.parts.clone()) } else { None };
+        let saved_parts = if has_affine_prod {
+            Some(self.parts.clone())
+        } else {
+            None
+        };
         let mut expanded_any = false;
         if has_affine_prod && self.parts.len() <= MAX_TERMS - 8 {
             let mut extra_parts: Vec<(u32, u64)> = Vec::new();
             let mut extra_prods: Vec<Option<([u32; 2], u64)>> = Vec::new();
             for idx in 0..self.products.len() {
-                let Some(([a, b], coeff)) = self.products[idx] else { continue };
+                let Some(([a, b], coeff)) = self.products[idx] else {
+                    continue;
+                };
                 let split = if let Some((x, s, c)) = affine_factor(cx, a, w) {
                     Some((x, s, c, b))
                 } else if let Some((x, s, c)) = affine_factor(cx, b, w) {
@@ -751,7 +870,9 @@ impl Sums {
                 } else {
                     None
                 };
-                let Some((x, s, c, other)) = split else { continue };
+                let Some((x, s, c, other)) = split else {
+                    continue;
+                };
                 if self.parts.len() + extra_parts.len() >= MAX_TERMS {
                     break;
                 }
@@ -777,11 +898,19 @@ impl Sums {
         for _ in 0..16 {
             counts.clear();
             for &(pair, _) in self.products.iter().flatten() {
-                if !tried.contains(&pair[0]) { counts.push(pair[0]); }
-                if pair[1] != pair[0] && !tried.contains(&pair[1]) { counts.push(pair[1]); }
+                if !tried.contains(&pair[0]) {
+                    counts.push(pair[0]);
+                }
+                if pair[1] != pair[0] && !tried.contains(&pair[1]) {
+                    counts.push(pair[1]);
+                }
             }
-            if counts.len() < 2 { break; }
-            if work.take(counts.len() as u64).is_none() { return Ok(None); }
+            if counts.len() < 2 {
+                break;
+            }
+            if work.take(counts.len() as u64).is_none() {
+                return Ok(None);
+            }
             counts.sort_unstable();
             let mut best = (0usize, 0u32);
             let mut run = 0;
@@ -793,18 +922,26 @@ impl Sums {
                 }
                 run = end;
             }
-            if best.0 < 2 { break; }
+            if best.0 < 2 {
+                break;
+            }
             let f = best.1;
             tried.push(f);
             self.group.clear();
             for &([a, b], k) in self.products.iter().flatten() {
-                if a == f || b == f { self.group.push((if a == f { b } else { a }, k)); }
+                if a == f || b == f {
+                    self.group.push((if a == f { b } else { a }, k));
+                }
             }
-            if cancel_parts(&mut self.group, mask, work).is_none() { continue; }
+            if cancel_parts(&mut self.group, mask, work).is_none() {
+                continue;
+            }
             let k = if self.group.is_empty() {
                 0
             } else {
-                let Some(k) = self.value(cx, w, work) else { continue };
+                let Some(k) = self.value(cx, w, work) else {
+                    continue;
+                };
                 k
             };
             for ((_, c), p) in self.parts.iter_mut().zip(&mut self.products) {
@@ -827,11 +964,15 @@ impl Sums {
         } else if expanded_any {
             // Merge any non-product terms that now share a node ID (e.g. `other` from expansion
             // matching an existing summand).
-            if cancel_parts(&mut self.parts, mask, work).is_none() { return Ok(None); }
+            if cancel_parts(&mut self.parts, mask, work).is_none() {
+                return Ok(None);
+            }
         }
         // First check equal-magnitude groups through the normalized `Kernel` cache:
         // repeated sums with different scalars reuse one exact proof in O(terms).
-        if work.take((6 * self.parts.len()) as u64).is_none() { return Ok(None); }
+        if work.take((6 * self.parts.len()) as u64).is_none() {
+            return Ok(None);
+        }
         self.parts.sort_unstable_by_key(|&(t, k)| (magnitude(k), t));
         let mut lo = 0;
         let mut distinct_mags = 0usize;
@@ -868,19 +1009,27 @@ impl Sums {
             {
                 bias = bias.wrapping_add(k);
                 for (t, c) in &mut self.parts {
-                    if cx.node(*t).op != OpCode::Mul { *c = 0; }
+                    if cx.node(*t).op != OpCode::Mul {
+                        *c = 0;
+                    }
                 }
                 changed = true;
             }
         }
-        if !changed { return Ok(None); }
+        if !changed {
+            return Ok(None);
+        }
         self.parts.extend_from_slice(&self.scaled);
         self.scaled.clear();
-        if cancel_parts(&mut self.parts, mask, work).is_none() { return Ok(None); }
+        if cancel_parts(&mut self.parts, mask, work).is_none() {
+            return Ok(None);
+        }
         let mut out = cx.mk_const_u64(w, bias & mask)?;
         for &(t, k) in &self.parts {
             let km = k & mask;
-            if km == 0 { continue; }
+            if km == 0 {
+                continue;
+            }
             let tw = cx.wid(t);
             let tw_node = match tw.cmp(&w) {
                 core::cmp::Ordering::Less => cx.c_zext(t, w)?,
@@ -904,8 +1053,16 @@ impl Sums {
     /// Simplify the first additive layer below a compared bitwise expression,
     /// stopping there even when its operands hide a much larger arithmetic DAG.
     /// Only the shallow shell is rebuilt; its original gates retain their polarity.
-    fn terminal(&mut self, cx: &mut Context, i: u32, depth: u8, work: &mut Work) -> Result<u32, Error> {
-        if work.take(1).is_none() { return Ok(i); }
+    fn terminal(
+        &mut self,
+        cx: &mut Context,
+        i: u32,
+        depth: u8,
+        work: &mut Work,
+    ) -> Result<u32, Error> {
+        if work.take(1).is_none() {
+            return Ok(i);
+        }
         let n = cx.node(i);
         match n.op {
             OpCode::Add | OpCode::Sub => Ok(self.collapse(cx, i, true, work)?.unwrap_or(i)),
@@ -924,15 +1081,30 @@ impl Sums {
 
     /// Descend through a shallow Boolean shell (`Not`/`And`/`Or`) to simplify terminal
     /// bitwise comparisons, including queries wrapped in conjunctions with assumptions.
-    fn terminal_root(&mut self, cx: &mut Context, i: u32, depth: u8, work: &mut Work) -> Result<u32, Error> {
-        if work.take(1).is_none() { return Ok(i); }
+    fn terminal_root(
+        &mut self,
+        cx: &mut Context,
+        i: u32,
+        depth: u8,
+        work: &mut Work,
+    ) -> Result<u32, Error> {
+        if work.take(1).is_none() {
+            return Ok(i);
+        }
         let n = cx.node(i);
         if matches!(n.op, OpCode::Eq | OpCode::Ne)
             && cx.is_const(n.b)
-            && matches!(cx.node(n.a).op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor)
+            && matches!(
+                cx.node(n.a).op,
+                OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor
+            )
         {
             let out = self.terminal(cx, n.a, 4, work)?;
-            return if out != n.a { cx.rebuild(i, [out, n.b, 0]) } else { Ok(i) };
+            return if out != n.a {
+                cx.rebuild(i, [out, n.b, 0])
+            } else {
+                Ok(i)
+            };
         }
         if depth > 0 && n.width == 1 && matches!(n.op, OpCode::Not | OpCode::And | OpCode::Or) {
             let mut kids = [0; 3];
@@ -941,20 +1113,31 @@ impl Sums {
                 kids[k] = self.terminal_root(cx, x, depth - 1, work)?;
                 changed |= kids[k] != x;
             }
-            if changed { return cx.rebuild(i, kids); }
+            if changed {
+                return cx.rebuild(i, kids);
+            }
         }
         Ok(i)
     }
 }
 
-pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32]) -> Result<Option<u32>, Stop> {
-    if !(16..=32768).contains(&order.len()) || r.mba.swept.contains_key(&root) { return Ok(None); }
+pub(super) fn reduce(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
+) -> Result<Option<u32>, Stop> {
+    if !(16..=32768).contains(&order.len()) || r.mba.swept.contains_key(&root) {
+        return Ok(None);
+    }
     // When several product sums are present, simplify them together. Reducing
     // just a compared arm can leave other multiples of the same sum hidden
     // inside shifts and truncations (including the shift amount itself).
     let scan = order.len() as u64;
     let budget = (r.meter.left_in(|b| b.pass_work) / 4).min(1 << 18);
-    if budget <= 4 * scan { return Ok(None); }
+    if budget <= 4 * scan {
+        return Ok(None);
+    }
     r.meter.charge(Counter::PassWork, scan)?;
     let mut left = budget - scan;
     let prod = |id| {
@@ -967,7 +1150,9 @@ pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order:
         let mut work = Work::new(left);
         let mut sums = Sums::default();
         let out = rewrite_sums(r, cx, order, |r, cx, i| {
-            if work.left == 0 { return Ok(None); }
+            if work.left == 0 {
+                return Ok(None);
+            }
             r.build(cx, |cx| sums.collapse(cx, i, false, &mut work))
         })?;
         r.meter.charge(Counter::PassWork, left - work.left)?;
@@ -975,25 +1160,42 @@ pub(super) fn reduce(r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order:
         if let Some(e) = out.get(root) {
             r.meter.charge(Counter::PassWork, scan)?;
             left = left.saturating_sub(scan);
-            if matches!(cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1).map_err(Stop::Error)?,
-                crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
+            if matches!(
+                cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1)
+                    .map_err(Stop::Error)?,
+                crate::expr::Bounded::Exact(_)
+            ) {
+                return Ok(Some(e));
+            }
         }
     }
     // Without a whole-DAG reduction, read the terminal bitwise comparisons (including
     // under shallow `Not`/`And`/`Or` wrappers). Each operand can be constant even with
     // entirely unrelated weights.
     let n = cx.node(root);
-    if n.width == 1 && matches!(n.op, OpCode::Eq | OpCode::Ne | OpCode::Not | OpCode::And | OpCode::Or) {
+    if n.width == 1
+        && matches!(
+            n.op,
+            OpCode::Eq | OpCode::Ne | OpCode::Not | OpCode::And | OpCode::Or
+        )
+    {
         let allowance = (left / 4).min(8192);
         let mut work = Work::new(allowance);
-        let e = r.build(cx, |cx| Sums::default().terminal_root(cx, root, 4, &mut work))?;
+        let e = r.build(cx, |cx| {
+            Sums::default().terminal_root(cx, root, 4, &mut work)
+        })?;
         let used = allowance - work.left;
         r.meter.charge(Counter::PassWork, used)?;
         left -= used;
         if e != root && left >= scan {
             r.meter.charge(Counter::PassWork, scan)?;
-            if matches!(cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1).map_err(Stop::Error)?,
-                crate::expr::Bounded::Exact(_)) { return Ok(Some(e)); }
+            if matches!(
+                cx.dag_size(&[cx.handle(e)], order.len() as u32 - 1)
+                    .map_err(Stop::Error)?,
+                crate::expr::Bounded::Exact(_)
+            ) {
+                return Ok(Some(e));
+            }
         }
     }
     Ok(None)
@@ -1014,7 +1216,11 @@ mod tests {
             let e = cx.parse(&s, &opt).unwrap();
             let g = cx.parse("g", &opt).unwrap();
             let i = cx.id(e).unwrap();
-            assert_eq!(sums.collapse(&mut cx, i, false, &mut Work::new(4096)).unwrap(), Some(cx.id(g).unwrap()));
+            assert_eq!(
+                sums.collapse(&mut cx, i, false, &mut Work::new(4096))
+                    .unwrap(),
+                Some(cx.id(g).unwrap())
+            );
         }
     }
 
@@ -1029,15 +1235,24 @@ mod tests {
             let opt = ParseOptions::width(w);
             // OR - AND + XNOR = -1. The partition of x at `mask` adds
             // zero, but its unrelated weight prevents single-scale grouping.
-            let e = cx.parse(&format!(
-                "~((x | y)*(t*{a}) - (x & y)*{a}*t + (~(x ^ y)*t)*{a}) & \
+            let e = cx
+                .parse(
+                    &format!(
+                        "~((x | y)*(t*{a}) - (x & y)*{a}*t + (~(x ^ y)*t)*{a}) & \
                  ~((x | y)*{b} - (x & y)*{b} + ~(x ^ y)*{b} + \
                    (x & {mask})*{k} + (x & ~{mask})*{k} - x*{k})"
-            ), &opt).unwrap();
+                    ),
+                    &opt,
+                )
+                .unwrap();
             let minus_a = a.wrapping_neg() & ((1 << w.bits()) - 1);
-            let expected = cx.parse(&format!("~(t*{minus_a}) & {}", b - 1), &opt).unwrap();
+            let expected = cx
+                .parse(&format!("~(t*{minus_a}) & {}", b - 1), &opt)
+                .unwrap();
             let i = cx.id(e).unwrap();
-            let got = Sums::default().terminal(&mut cx, i, 4, &mut Work::new(4096)).unwrap();
+            let got = Sums::default()
+                .terminal(&mut cx, i, 4, &mut Work::new(4096))
+                .unwrap();
             assert_eq!(got, cx.id(expected).unwrap());
         }
     }
@@ -1046,10 +1261,21 @@ mod tests {
     fn mask_classes_cannot_cancel_across_positions() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W8);
-        let ids = ["x & 1", "x & 2"].map(|s| { let x = cx.parse(s, &opt).unwrap(); cx.id(x).unwrap() });
+        let ids = ["x & 1", "x & 2"].map(|s| {
+            let x = cx.parse(s, &opt).unwrap();
+            cx.id(x).unwrap()
+        });
         // 2*(x&1) - (x&2) agrees at both uniform-word corners.
         let mut table = Table::default();
-        assert_eq!(table.constant(&cx, &[(ids[0], 2), (ids[1], u64::MAX)], 8, &mut Work::new(1024)), None);
+        assert_eq!(
+            table.constant(
+                &cx,
+                &[(ids[0], 2), (ids[1], u64::MAX)],
+                8,
+                &mut Work::new(1024)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1066,7 +1292,9 @@ mod tests {
         let e = cx.parse(src, &opt).unwrap();
         let want = cx.parse("h - 5", &opt).unwrap();
         let eid = cx.id(e).unwrap();
-        let got = sums.collapse(&mut cx, eid, false, &mut Work::new(16384)).unwrap();
+        let got = sums
+            .collapse(&mut cx, eid, false, &mut Work::new(16384))
+            .unwrap();
         assert_eq!(got, Some(cx.id(want).unwrap()));
 
         // Irreducible mixed weights ({3, -2, -1, -1, -3}) alongside a shared factor `f`:
@@ -1077,7 +1305,9 @@ mod tests {
         let e2 = cx.parse(mixed, &opt).unwrap();
         let want2 = cx.parse("f * 65533", &opt).unwrap();
         let e2id = cx.id(e2).unwrap();
-        let got2 = sums.collapse(&mut cx, e2id, false, &mut Work::new(16384)).unwrap();
+        let got2 = sums
+            .collapse(&mut cx, e2id, false, &mut Work::new(16384))
+            .unwrap();
         assert_eq!(got2, Some(cx.id(want2).unwrap()));
     }
 
@@ -1086,8 +1316,13 @@ mod tests {
         use crate::engine::{Budget, Engine, Run, Strategy};
         use crate::mba::MbaConfig;
 
-        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
-        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
+        let strategy =
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
         // Wrapped in `!(eq & guard)` with fewer than 96 nodes: terminal_root descends
         // through the Not/And shell to prove the masked cofactor gate constant.
         let src = "let a = x:16 * x + 3; let b = y:16 ^ 0x1234; \
@@ -1095,9 +1330,17 @@ mod tests {
                    ~((~s == 6) & (z:16 == 9))";
         let mut cx = Context::new();
         let root = cx.parse(src, &ParseOptions::width(Width::W16)).unwrap();
-        let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+        let out = engine
+            .run(
+                &mut cx,
+                &[root],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
+            .unwrap();
         // `s = -7`, so `~s = 6`, so `~s == 6` is true, leaving `z != 9`.
-        let want = cx.parse("z:16 != 9", &ParseOptions::width(Width::W16)).unwrap();
+        let want = cx
+            .parse("z:16 != 9", &ParseOptions::width(Width::W16))
+            .unwrap();
         assert_eq!(out.roots[0].expr, want);
     }
 
@@ -1114,7 +1357,9 @@ mod tests {
         let e = cx.parse(src, &opt).unwrap();
         let want = cx.parse("f * 65533 + 65521", &opt).unwrap();
         let eid = cx.id(e).unwrap();
-        let got = sums.collapse(&mut cx, eid, false, &mut Work::new(16384)).unwrap();
+        let got = sums
+            .collapse(&mut cx, eid, false, &mut Work::new(16384))
+            .unwrap();
         assert!(got.is_some());
         let got_expr = cx.handle(got.unwrap());
         for (xv, yv, fv) in [(0u64, 0u64, 0u64), (17, 42, 9), (0xffff, 0x1234, 0x7777)] {
@@ -1133,7 +1378,9 @@ mod tests {
         let e2 = cx.parse(disjoint, &opt).unwrap();
         let want2 = cx.parse("g", &opt).unwrap();
         let e2id = cx.id(e2).unwrap();
-        let got2 = sums.collapse(&mut cx, e2id, false, &mut Work::new(16384)).unwrap();
+        let got2 = sums
+            .collapse(&mut cx, e2id, false, &mut Work::new(16384))
+            .unwrap();
         assert_eq!(got2, Some(cx.id(want2).unwrap()));
     }
 }

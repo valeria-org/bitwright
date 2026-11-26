@@ -31,8 +31,13 @@ fn rare_guard_witness_respects_scoped_facts_before_building_the_circuit() {
     facts.assume_true(&mut cx, guard).unwrap();
     let cfg = Config::default().with_samples(128).with_max_nodes(0);
     let q = Question::valid_under(&mut cx, claim, Some(&facts), &cfg).unwrap();
-    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("no guarded witness") };
-    assert_eq!(cx.eval(&[guard, claim], &model[..]).unwrap(), [BitVec::from_bool(true), BitVec::from_bool(false)]);
+    let Some(Outcome::Refuted(model)) = q.outcome() else {
+        panic!("no guarded witness")
+    };
+    assert_eq!(
+        cx.eval(&[guard, claim], &model[..]).unwrap(),
+        [BitVec::from_bool(true), BitVec::from_bool(false)]
+    );
     assert!(!q.stats().simplification.ran);
     assert!(q.stats().samples <= 64);
 }
@@ -46,22 +51,32 @@ fn small_selected_word_has_a_witness_away_from_its_fallback() {
     ).unwrap();
     let cfg = Config::default().with_samples(128).with_max_nodes(0);
     let q = Question::valid(&mut cx, claim, &cfg).unwrap();
-    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("lost rare select arm") };
-    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+    let Some(Outcome::Refuted(model)) = q.outcome() else {
+        panic!("lost rare select arm")
+    };
+    assert_eq!(
+        cx.eval(&[claim], &model[..]).unwrap(),
+        [BitVec::from_bool(false)]
+    );
 }
 
 #[test]
 fn compact_guard_repairs_an_equality_to_a_computed_word() {
     let mut cx = Context::new();
-    let claim = cx.parse(
-        "~((tag:64 == ((data:64 ^ 0x91e2f01084dd938b) + 17)) & extract<20, 1>(data))",
-        &crate::ParseOptions::default(),
-    ).unwrap();
+    let claim = cx
+        .parse(
+            "~((tag:64 == ((data:64 ^ 0x91e2f01084dd938b) + 17)) & extract<20, 1>(data))",
+            &crate::ParseOptions::default(),
+        )
+        .unwrap();
     let (tested, Some(model)) = guard_samples(&mut cx, claim.index()).unwrap() else {
         panic!("could not match the computed word");
     };
     assert!(tested <= 64);
-    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+    assert_eq!(
+        cx.eval(&[claim], &model[..]).unwrap(),
+        [BitVec::from_bool(false)]
+    );
 }
 
 #[test]
@@ -77,16 +92,21 @@ fn low_even_product_repair_does_not_constrain_the_free_high_bits() {
         panic!("could not match the product residue");
     };
     assert!(tested <= 64);
-    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+    assert_eq!(
+        cx.eval(&[claim], &model[..]).unwrap(),
+        [BitVec::from_bool(false)]
+    );
 }
 
 #[test]
 fn unreachable_product_residue_is_only_a_sampling_miss() {
     let mut cx = Context::new();
-    let claim = cx.parse(
-        "~((x:32 * 12 == 2) & (key:32 == 7321))",
-        &crate::ParseOptions::default(),
-    ).unwrap();
+    let claim = cx
+        .parse(
+            "~((x:32 * 12 == 2) & (key:32 == 7321))",
+            &crate::ParseOptions::default(),
+        )
+        .unwrap();
     let (tested, model) = guard_samples(&mut cx, claim.index()).unwrap();
     assert_eq!(tested, 64);
     assert!(model.is_none());
@@ -125,7 +145,10 @@ fn masked_offset_guard_repairs_the_selected_word_in_the_existing_batch() {
         panic!("masked selector lost its witness");
     };
     assert!(lanes <= 9);
-    assert_eq!(cx.eval(&[masked], &model[..]).unwrap()[0].to_u64(), Some(0x8351_319a));
+    assert_eq!(
+        cx.eval(&[masked], &model[..]).unwrap()[0].to_u64(),
+        Some(0x8351_319a)
+    );
 }
 
 #[test]
@@ -146,8 +169,13 @@ fn interval_witness_can_repair_an_addend_hidden_by_boolean_arithmetic() {
     let claim = cx.not(inside).unwrap();
     let cfg = Config::default().with_samples(128).with_max_nodes(0);
     let q = Question::valid(&mut cx, claim, &cfg).unwrap();
-    let Some(Outcome::Refuted(model)) = q.outcome() else { panic!("no range witness") };
-    assert_eq!(cx.eval(&[claim], &model[..]).unwrap(), [BitVec::from_bool(false)]);
+    let Some(Outcome::Refuted(model)) = q.outcome() else {
+        panic!("no range witness")
+    };
+    assert_eq!(
+        cx.eval(&[claim], &model[..]).unwrap(),
+        [BitVec::from_bool(false)]
+    );
     assert!(!q.stats().simplification.ran);
 }
 

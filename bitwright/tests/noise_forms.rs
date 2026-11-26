@@ -208,16 +208,16 @@ fn scaling_discards_the_remaining_difference_between_selected_masks() {
         .unwrap();
     let mut cx = Context::new();
     let parse = ParseOptions::width(Width::W64);
-    let input = cx.parse(&format!("{arms} (a - b) * 0x1cee87728"), &parse).unwrap();
+    let input = cx
+        .parse(&format!("{arms} (a - b) * 0x1cee87728"), &parse)
+        .unwrap();
     let out = engine.simplify(&mut cx, input).unwrap().expr;
     assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(0));
     // One fewer trailing zero lets bit 61 survive. x = 0xc000000000000000
     // selects the masked arm with that bit set in ~x.
     let input = cx.parse(&format!("{arms} (a - b) * 4"), &parse).unwrap();
     let out = engine.simplify(&mut cx, input).unwrap().expr;
-    let env = FnEnv(|_: &SymbolKey, w| {
-        Some(BitVec::wrapping_from_u64(w, 0xc000000000000000))
-    });
+    let env = FnEnv(|_: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, 0xc000000000000000)));
     assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(1 << 63));
     // Shift/mask/truncation wrappers and opposite-polarity select conditions cancel too.
     let opposite = "let c = x <s 0; let a = select(c, ~x & 0x140000000, 0); \
@@ -229,7 +229,11 @@ fn scaling_discards_the_remaining_difference_between_selected_masks() {
     ] {
         let input = cx.parse(&expr, &parse).unwrap();
         let out = engine.simplify(&mut cx, input).unwrap().expr;
-        assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(0), "{expr}");
+        assert_eq!(
+            cx.as_const(out).unwrap().and_then(|k| k.to_u64()),
+            Some(0),
+            "{expr}"
+        );
     }
 }
 

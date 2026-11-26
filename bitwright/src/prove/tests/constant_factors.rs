@@ -120,9 +120,7 @@ fn biased_sparse_products_match_every_assignment() {
         let product = mul(&mut graph, &data, &small(w, k));
         for base in [0u32, 64] {
             let values = graph.eval_words(|i| {
-                (0..64).fold(0, |v, lane| {
-                    v | (u64::from((base + lane) >> i & 1) << lane)
-                })
+                (0..64).fold(0, |v, lane| v | (u64::from((base + lane) >> i & 1) << lane))
             });
             for lane in 0..64 {
                 assert_eq!(

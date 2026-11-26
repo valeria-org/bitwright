@@ -207,17 +207,28 @@ fn linear_preserves_wrap_and_fixed_residue_of_high_fields() {
         "rotl(a, 6) * 12 - a * 3 + 9",
         "concat(7:6 - extract<2, 6>(a), 1:2) + a - 32",
     ] {
-        assert_eq!(simplify(&eng, &format!("let a = x:8 * 4 + 3; {body}"), 8), "0:8");
+        assert_eq!(
+            simplify(&eng, &format!("let a = x:8 * 4 + 3; {body}"), 8),
+            "0:8"
+        );
     }
     // Neither unrestricted low bits nor an odd scaling coefficient admits
     // the cancellation. Check all assignments, not just the extremal words.
-    for src in ["rotl(x:8, 6) * 12 - x * 3", "let a = x:8 & 252; rotl(a, 6) * 3 - a"] {
+    for src in [
+        "rotl(x:8, 6) * 12 - x * 3",
+        "let a = x:8 & 252; rotl(a, 6) * 3 - a",
+    ] {
         let mut cx = Context::new();
         let e = cx.parse(src, &ParseOptions::width(Width::W8)).unwrap();
         let r = eng.simplify(&mut cx, e).unwrap().expr;
         let mut seen = [false; 256];
         for x in 0..=255 {
-            let vals = cx.eval(&[e, r], &crate::FnEnv(|_: &crate::SymbolKey, w| BitVec::from_u64(w, x).ok())).unwrap();
+            let vals = cx
+                .eval(
+                    &[e, r],
+                    &crate::FnEnv(|_: &crate::SymbolKey, w| BitVec::from_u64(w, x).ok()),
+                )
+                .unwrap();
             assert_eq!(vals[0], vals[1]);
             seen[vals[1].to_u64().unwrap() as usize] = true;
         }
@@ -893,10 +904,7 @@ fn bitwise_fixtures() {
         "~(p & ((r >>u 5) | q)) & ((r >>u 5) | ((p | q) & 7))",
         "(p ^ ((r >>u 5) | q)) & 7",
     );
-    same(
-        "((x >>u 5) | (y << 3)) ^ (y << 3)",
-        "x >>u 5",
-    );
+    same("((x >>u 5) | (y << 3)) ^ (y << 3)", "x >>u 5");
     // x >> 4 can set bit 3. At x=128, y=8 the overlap cancels it.
     let mut cx = Context::new();
     let o = ParseOptions::width(Width::W8);
@@ -3568,7 +3576,10 @@ mod mba_service {
         let inputs = roots(&mut cx);
         // (p | x) + (p & x) - x is p, but still needs p and extra nodes.
         let big = cx
-            .parse("((((x - 3) ^ 17) | x) + (((x - 3) ^ 17) & x)) - x", &options)
+            .parse(
+                "((((x - 3) ^ 17) | x) + (((x - 3) ^ 17) & x)) - x",
+                &options,
+            )
             .unwrap();
         let lower = |e| crate::mba::lower(&cx, e, &Default::default()).unwrap().0;
         let q = lower(inputs[0]);
@@ -9552,7 +9563,11 @@ mod opaque_constants {
         for (guard, bias, counterexample) in [
             ("(a == 4) | (a == 12)", "0xffffffffffffffe0", None),
             // The first two equalities are not a closed domain any more.
-            ("(a == 4) | (a == 12) | (a == 0)", "0xffffffffffffffe0", Some((0, 0))),
+            (
+                "(a == 4) | (a == 12) | (a == 0)",
+                "0xffffffffffffffe0",
+                Some((0, 0)),
+            ),
             // Same closed guard, but the selected unsigned sum can wrap below its bias.
             ("(a == 4) | (a == 12)", "0xfffffffffffffff8", Some((12, 15))),
         ] {

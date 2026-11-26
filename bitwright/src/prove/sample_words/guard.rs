@@ -39,9 +39,13 @@ impl Target {
             *fuel = fuel.checked_sub(1)?;
         }
         factor &= mask;
-        if factor == 0 { return None; }
+        if factor == 0 {
+            return None;
+        }
         let shift = factor.trailing_zeros();
-        if self.value >> shift << shift != self.value { return None; }
+        if self.value >> shift << shift != self.value {
+            return None;
+        }
         let odd = factor >> shift;
         // Every odd number is its own inverse modulo 8. Each Newton step
         // doubles the precision until all the observed bits are correct.
@@ -53,7 +57,10 @@ impl Target {
             bits *= 2;
         }
         let low = (self.value >> shift).wrapping_mul(inverse) & fixed;
-        Some(Self { slot, value: (values[slot] & !fixed) | low })
+        Some(Self {
+            slot,
+            value: (values[slot] & !fixed) | low,
+        })
     }
 
     pub(super) fn invert(self, p: &Program, values: &[u64], fuel: &mut u8) -> Option<(usize, u64)> {
@@ -66,7 +73,10 @@ impl Target {
         *fuel = fuel.checked_sub(1)?;
         // Change only bits that differ. In particular, reclaim all unobserved bits
         // from this lane before subtracting an offset; carries then need no guessing.
-        let flip = |a: usize, bits| Self { slot: a, value: values[a] ^ bits };
+        let flip = |a: usize, bits| Self {
+            slot: a,
+            value: values[a] ^ bits,
+        };
         if matches!(ins.op, Op::Unary(UnOp::Not, _) | Op::Binary(BinOp::Or, ..))
             && let Some((a, n)) = super::weighted::rotation(p, slot)
         {
@@ -77,10 +87,28 @@ impl Target {
             Op::Symbol(s) => return (delta & !p.symbols[s].free == 0).then_some((s, value)),
             Op::Unary(UnOp::Not, a) | Op::Zext(a) => flip(a, delta),
             Op::Extract(a, lo) => flip(a, delta << lo),
+            Op::Concat(hi, lo, lo_bits) => {
+                let delta_lo = delta & p.ops[lo].mask;
+                let delta_hi = delta >> lo_bits;
+                if delta_lo != 0
+                    && let Some(patch) = flip(lo, delta_lo).invert(p, values, fuel)
+                {
+                    return Some(patch);
+                }
+                if delta_hi != 0
+                    && let Some(patch) = flip(hi, delta_hi).invert(p, values, fuel)
+                {
+                    return Some(patch);
+                }
+                return None;
+            }
             Op::Select(c, t, e) => flip(if values[c] != 0 { t } else { e }, delta),
             Op::MixerRound(a, key) => {
                 let pre = crate::prove::mixer::invert_round(value, key)?;
-                Self { slot: a, value: pre }
+                Self {
+                    slot: a,
+                    value: pre,
+                }
             }
             Op::MixerUnround(a, key) if key & 1 == 1 => Self {
                 slot: a,
@@ -94,15 +122,24 @@ impl Target {
                     (orig_a, orig_b)
                 };
                 for (child, other) in [(a, b), (b, a)] {
-                    if matches!(p.ops[child].op, Op::Constant(_)) { continue; }
+                    if matches!(p.ops[child].op, Op::Constant(_)) {
+                        continue;
+                    }
                     let target = match op {
                         BinOp::Xor => value ^ values[other],
                         BinOp::Add => value.wrapping_sub(values[other]) & ins.mask,
-                        BinOp::Sub if child == orig_a => value.wrapping_add(values[orig_b]) & ins.mask,
+                        BinOp::Sub if child == orig_a => {
+                            value.wrapping_add(values[orig_b]) & ins.mask
+                        }
                         BinOp::Sub => values[orig_a].wrapping_sub(value) & ins.mask,
                         _ => unreachable!(),
                     };
-                    if let Some(patch) = (Self { slot: child, value: target }).invert(p, values, fuel) {
+                    if let Some(patch) = (Self {
+                        slot: child,
+                        value: target,
+                    })
+                    .invert(p, values, fuel)
+                    {
                         return Some(patch);
                     }
                 }
@@ -113,25 +150,37 @@ impl Target {
             {
                 let shift = values[b];
                 if matches!(ins.op, Op::Binary(BinOp::Shl, ..)) {
-                    if delta >> shift << shift != delta { return None; }
+                    if delta >> shift << shift != delta {
+                        return None;
+                    }
                     flip(a, delta >> shift)
                 } else {
                     let bits = (delta << shift) & ins.mask;
-                    if bits >> shift != delta { return None; }
+                    if bits >> shift != delta {
+                        return None;
+                    }
                     flip(a, bits)
                 }
             }
             Op::Binary(op @ (BinOp::RotL | BinOp::RotR), a, b)
                 if matches!(p.ops[b].op, Op::Constant(_)) =>
             {
-                let inverse = if op == BinOp::RotL { BinOp::RotR } else { BinOp::RotL };
+                let inverse = if op == BinOp::RotL {
+                    BinOp::RotR
+                } else {
+                    BinOp::RotL
+                };
                 flip(a, binary(inverse, delta, values[b], ins.width) & ins.mask)
             }
             Op::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
                 // Only flip bits that reach the output with the sibling held fixed.
                 // This also follows a shift/OR rotation when the changed bits lie in one arm.
                 for (child, other) in [(a, b), (b, a)] {
-                    let blocked = if op == BinOp::And { !values[other] } else { values[other] };
+                    let blocked = if op == BinOp::And {
+                        !values[other]
+                    } else {
+                        values[other]
+                    };
                     if delta & blocked == 0
                         && !matches!(p.ops[child].op, Op::Constant(_))
                         && let Some(patch) = flip(child, delta).invert(p, values, fuel)
@@ -161,23 +210,31 @@ pub(super) struct Interval {
 pub(super) fn intervals(p: &Program, terms: &[(usize, bool)]) -> Vec<Interval> {
     let mut result: Vec<Interval> = Vec::new();
     for &(i, want) in terms {
-        let Op::Compare(op, a, b, width) = p.ops[i].op else { continue };
+        let Op::Compare(op, a, b, width) = p.ops[i].op else {
+            continue;
+        };
         let sign = match op {
             CmpOp::Ult | CmpOp::Ule => 0,
             CmpOp::Slt | CmpOp::Sle => 1 << (width - 1),
             _ => continue,
         };
-        let Some(Target { slot, value }) = Target::literal(p, a, b) else { continue };
+        let Some(Target { slot, value }) = Target::literal(p, a, b) else {
+            continue;
+        };
         let edge = value ^ sign;
         // x < c and !(c <= x) both impose a strict upper bound.
         let upper = (slot == a) == want;
         let strict = matches!(op, CmpOp::Ult | CmpOp::Slt) == want;
         let mask = p.ops[slot].mask;
         let (low, high) = if upper {
-            let Some(high) = edge.checked_sub(u64::from(strict)) else { continue };
+            let Some(high) = edge.checked_sub(u64::from(strict)) else {
+                continue;
+            };
             (0, high)
         } else {
-            let Some(low) = edge.checked_add(u64::from(strict)) else { continue };
+            let Some(low) = edge.checked_add(u64::from(strict)) else {
+                continue;
+            };
             (low, mask)
         };
         if let Some(prev) = result.iter_mut().find(|r| r.slot == slot && r.sign == sign) {
@@ -188,13 +245,23 @@ pub(super) fn intervals(p: &Program, terms: &[(usize, bool)]) -> Vec<Interval> {
                 Op::Symbol(s) => p.symbols[s].free,
                 Op::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
                     Target::literal(p, a, b).map_or(mask, |t| {
-                        if op == BinOp::And { t.value } else { !t.value & mask }
+                        if op == BinOp::And {
+                            t.value
+                        } else {
+                            !t.value & mask
+                        }
                     })
                 }
                 Op::Zext(a) => p.ops[a].mask,
                 _ => mask,
             };
-            result.push(Interval { slot, sign, low, high, free });
+            result.push(Interval {
+                slot,
+                sign,
+                low,
+                high,
+                free,
+            });
         }
     }
     result.retain(|r| r.low <= r.high);
@@ -215,8 +282,10 @@ fn ceil_masked(bound: u64, lane: u64, free: u64) -> Option<u64> {
         Some((bound & free & !through) | fixed)
     } else {
         let higher = free & !bound & !through;
-        if higher == 0 { return None; }
-        let bump = higher & higher.wrapping_neg();
+        if higher == 0 {
+            return None;
+        }
+        let bump = higher.isolate_lowest_one();
         Some((bound & free & !(bump - 1)) | bump | fixed)
     }
 }
@@ -255,9 +324,23 @@ impl Requirement {
             Self::Value(t) => t.invert(p, values, fuel),
             Self::Equal(a, b) => {
                 // Prefer a directly writable word to the inverse of a derived one.
-                let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) { (b, a) } else { (a, b) };
-                Target { slot: a, value: values[b] }.invert(p, values, fuel)
-                    .or_else(|| Target { slot: b, value: values[a] }.invert(p, values, fuel))
+                let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) {
+                    (b, a)
+                } else {
+                    (a, b)
+                };
+                Target {
+                    slot: a,
+                    value: values[b],
+                }
+                .invert(p, values, fuel)
+                .or_else(|| {
+                    Target {
+                        slot: b,
+                        value: values[a],
+                    }
+                    .invert(p, values, fuel)
+                })
             }
         }
     }
@@ -275,7 +358,7 @@ pub(super) fn propose(
     // Equality first, then a required interval. Internal case labels are a fallback:
     // they may select a different branch without improving the required conjuncts.
     fn candidates<T>(pool: &[T], round: usize) -> impl Iterator<Item = &T> {
-        (0..pool.len().min(4)).map(move |off| &pool[(round + off) % pool.len()])
+        (0..pool.len().min(8)).map(move |off| &pool[(round + off) % pool.len()])
     }
     if let Some(patch) = candidates(required, round).find_map(|t| t.repair(p, values, &mut fuel)) {
         return Some(patch);
@@ -291,7 +374,8 @@ pub(super) fn propose(
             }
         }
     }
-    weighted.and_then(|r| super::weighted::propose(p, values, r.slot, r.low, r.high, round))
+    weighted
+        .and_then(|r| super::weighted::propose(p, values, r.slot, r.low, r.high, round))
         .or_else(|| candidates(cases, round).find_map(|&t| t.invert(p, values, &mut fuel)))
 }
 

@@ -1201,7 +1201,11 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
         let zero_mark = cx.len() as u32;
         let zv = r.build(cx, |cx| cx.mk_const_u64(w, 0))?;
         if zv < zero_mark {
-            let find_live_sel = |r: &mut Runner<'_, '_>, cx: &Context, p: u32, q: u32| -> Result<Option<u32>, Stop> {
+            let find_live_sel = |r: &mut Runner<'_, '_>,
+                                 cx: &Context,
+                                 p: u32,
+                                 q: u32|
+             -> Result<Option<u32>, Stop> {
                 let Some(sid) = cx.find(&crate::expr::Node::new(OpCode::Select, w, c, p, q)) else {
                     return Ok(None);
                 };
@@ -1273,7 +1277,9 @@ fn narrow_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Resu
     let comm = node.op.as_bin().is_some_and(BinOp::is_commutative);
     let (tr, cval, tr_is_lhs) = if let Some(cv) = cx.const_val(node.b) {
         (node.a, cv, true)
-    } else if node.op != OpCode::Shl && let Some(cv) = cx.const_val(node.a) {
+    } else if node.op != OpCode::Shl
+        && let Some(cv) = cx.const_val(node.a)
+    {
         (node.b, cv, false)
     } else {
         return Ok(Step::Normal(Fin::FINAL));
@@ -1403,12 +1409,13 @@ pub(super) fn find_wide_masked(cx: &Context, u: u32, w: u16, req_mask: u64, dept
         }
     };
     let find_bin = |op: OpCode, a: u32, b: u32| -> Option<u32> {
-        cx.find(&crate::expr::Node::new(op, w, a, b, 0)).or_else(|| {
-            op.as_bin()
-                .is_some_and(BinOp::is_commutative)
-                .then(|| cx.find(&crate::expr::Node::new(op, w, b, a, 0)))
-                .flatten()
-        })
+        cx.find(&crate::expr::Node::new(op, w, a, b, 0))
+            .or_else(|| {
+                op.as_bin()
+                    .is_some_and(BinOp::is_commutative)
+                    .then(|| cx.find(&crate::expr::Node::new(op, w, b, a, 0)))
+                    .flatten()
+            })
     };
     let find_const = |val: u64| -> Option<u32> { cx.find_const_u64(w, val & full_w) };
 
@@ -1523,7 +1530,8 @@ pub(super) fn find_wide_masked(cx: &Context, u: u32, w: u16, req_mask: u64, dept
             {
                 // Exact `w`-bit operand (bits `>= nw` already zero) shifted right is exact on all `w` bits.
                 for wa in find_wide_masked(cx, n.a, w, full_w, depth - 1) {
-                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::LShr, w, wa, sh_c, 0)) {
+                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::LShr, w, wa, sh_c, 0))
+                    {
                         push(&mut out, id);
                     }
                 }
@@ -1569,8 +1577,7 @@ pub(super) fn find_wide_masked(cx: &Context, u: u32, w: u16, req_mask: u64, dept
                     let mut w_vars = Vec::with_capacity(leaves.len());
                     let mut w_consts = Vec::new();
                     for l in leaves {
-                        let Some(&wl) =
-                            find_wide_masked(cx, l, w, low_nw, depth - 1).first()
+                        let Some(&wl) = find_wide_masked(cx, l, w, low_nw, depth - 1).first()
                         else {
                             ok = false;
                             break;
@@ -1609,7 +1616,8 @@ pub(super) fn find_wide_masked(cx: &Context, u: u32, w: u16, req_mask: u64, dept
                 && let Some(sh_c) = find_const(s)
             {
                 for wa in find_wide_masked(cx, n.a, w, low_nw >> s, depth - 1) {
-                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::Shl, w, wa, sh_c, 0)) {
+                    if let Some(id) = cx.find(&crate::expr::Node::new(OpCode::Shl, w, wa, sh_c, 0))
+                    {
                         push(&mut out, id);
                     }
                 }
@@ -2072,59 +2080,119 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             };
             if let Some(mask_bv) = mask_bv {
                 let in_node = cx.node(inner);
-                let (ex_id, inverted) = if in_node.op == OpCode::Not {
-                    (in_node.a, true)
+                // Also match `(trunc<N>(x) ^ C) & M` and `(~trunc<N>(x) ^ C) & M` at `lo == 0`
+                // when `wid(x) == W`, widening back to `W` so shared-width linear/MBA passes
+                // unify `(x ^ wide_C) & wide_M` with `x` and `~x`.
+                let (core_id, xor_bv) = if in_node.op == OpCode::Xor {
+                    match (cx.const_val(in_node.a), cx.const_val(in_node.b)) {
+                        (None, Some(c)) => (in_node.a, Some(c)),
+                        (Some(c), None) => (in_node.b, Some(c)),
+                        _ => (inner, None),
+                    }
                 } else {
-                    (inner, false)
+                    (inner, None)
                 };
-                let ex = cx.node(ex_id);
-                if ex.op == OpCode::Extract
-                    && ex.b > 0
-                    && cx.wid(ex.a) == node.width
+                let core_node = cx.node(core_id);
+                let (ex_id, inverted) = if core_node.op == OpCode::Not {
+                    (core_node.a, true)
+                } else if core_node.op == OpCode::Extract
+                    && cx.node(core_node.a).op == OpCode::Not
+                    && core_node.width < cx.wid(cx.node(core_node.a).a)
+                {
+                    // `extract<K, N>(~x)`: handle as inverted extract of `x`.
+                    (u32::MAX, true)
+                } else {
+                    (core_id, false)
+                };
+                let (ex_ok, ex_src, ex_lo, ex_wid) = if ex_id == u32::MAX {
+                    let src = cx.node(core_node.a).a;
+                    (true, src, core_node.b, core_node.width)
+                } else {
+                    let ex = cx.node(ex_id);
+                    (ex.op == OpCode::Extract, ex.a, ex.b, ex.width)
+                };
+                if ex_ok
+                    && cx.wid(ex_src) == node.width
                     && let Ok(wide_m) = mask_bv.zext(cx.width_of(n))
                 {
-                    let x = ex.a;
+                    let x = ex_src;
                     let ones = crate::facts::known::count_ones(&mask_bv);
                     let tz = crate::facts::known::trailing_zeros(&mask_bv);
                     let is_single_run = ones > 0
                         && crate::facts::known::bv_lshr(&mask_bv, tz)
                             == crate::facts::known::low_mask(mask_bv.width(), ones);
-                    if !inverted && is_single_run && tz == 0 && ones < u32::from(ex.width) {
-                        let before = cx.len() as u32;
-                        let e = r.build(cx, |cx| {
-                            let s = cx.c_extract(x, ex.b as u16, ones as u16)?;
-                            cx.c_zext(s, node.width)
-                        })?;
-                        match finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL)? {
-                            Step::Normal(f) => declined = declined.and(f),
-                            done => return Ok(done),
-                        }
-                    } else if inverted || !is_single_run {
-                        let k_sh = u64::from(ex.b);
-                        let w_n = cx.width_of(n);
-                        let before = cx.len() as u32;
-                        let e = r.build(cx, |cx| {
-                            let sh = cx.mk_const(&BitVec::wrapping_from_u64(w_n, k_sh))?;
-                            let mut s = cx.c_bin(BinOp::LShr, x, sh)?;
-                            if inverted {
-                                s = cx.c_un(UnOp::Not, s)?;
+                    if ex_lo == 0
+                        && !matches!(cx.node(x).op, OpCode::Zext | OpCode::Sext)
+                        && (inverted || xor_bv.is_some() || !is_single_run || tz > 0)
+                    {
+                        let single_use_arith = if matches!(
+                            cx.node(x).op,
+                            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Neg
+                        ) {
+                            super::refresh_uses(r, cx)?;
+                            r.life.live.uses(x).unwrap_or(0) <= 1
+                        } else {
+                            false
+                        };
+                        if !single_use_arith {
+                            let wide_xor = xor_bv
+                                .and_then(|c| c.zext(cx.width_of(n)).ok())
+                                .map(|wc| BitVec::bin_unchecked(BinOp::And, &wc, &wide_m));
+                            let before = cx.len() as u32;
+                            let e = r.build(cx, |cx| {
+                                let mut s = if inverted { cx.c_un(UnOp::Not, x)? } else { x };
+                                if let Some(ref wx) = wide_xor
+                                    && !wx.is_zero()
+                                {
+                                    let xc = cx.mk_const(wx)?;
+                                    s = cx.c_bin(BinOp::Xor, s, xc)?;
+                                }
+                                let mc = cx.mk_const(&wide_m)?;
+                                cx.c_bin(BinOp::And, s, mc)
+                            })?;
+                            match finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL)? {
+                                Step::Normal(f) => declined = declined.and(f),
+                                done => return Ok(done),
                             }
-                            let mc = cx.mk_const(&wide_m)?;
-                            cx.c_bin(BinOp::And, s, mc)
-                        })?;
-                        match super::finish_with(
-                            r,
-                            cx,
-                            PassKind::Casts,
-                            n,
-                            e,
-                            before,
-                            &[x],
-                            Fin::FINAL,
-                            true,
-                        )? {
-                            Step::Normal(f) => declined = declined.and(f),
-                            done => return Ok(done),
+                        }
+                    } else if ex_lo > 0 && xor_bv.is_none() {
+                        if !inverted && is_single_run && tz == 0 && ones < u32::from(ex_wid) {
+                            let before = cx.len() as u32;
+                            let e = r.build(cx, |cx| {
+                                let s = cx.c_extract(x, ex_lo as u16, ones as u16)?;
+                                cx.c_zext(s, node.width)
+                            })?;
+                            match finish(r, cx, PassKind::Casts, n, e, before, &[x], Fin::FINAL)? {
+                                Step::Normal(f) => declined = declined.and(f),
+                                done => return Ok(done),
+                            }
+                        } else if inverted || !is_single_run {
+                            let k_sh = u64::from(ex_lo);
+                            let w_n = cx.width_of(n);
+                            let before = cx.len() as u32;
+                            let e = r.build(cx, |cx| {
+                                let sh = cx.mk_const(&BitVec::wrapping_from_u64(w_n, k_sh))?;
+                                let mut s = cx.c_bin(BinOp::LShr, x, sh)?;
+                                if inverted {
+                                    s = cx.c_un(UnOp::Not, s)?;
+                                }
+                                let mc = cx.mk_const(&wide_m)?;
+                                cx.c_bin(BinOp::And, s, mc)
+                            })?;
+                            match super::finish_with(
+                                r,
+                                cx,
+                                PassKind::Casts,
+                                n,
+                                e,
+                                before,
+                                &[x],
+                                Fin::FINAL,
+                                true,
+                            )? {
+                                Step::Normal(f) => declined = declined.and(f),
+                                done => return Ok(done),
+                            }
                         }
                     }
                 }
@@ -2257,7 +2325,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     finish(r, cx, PassKind::Casts, n, e, before, &st.stops, fin)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove"))]
 mod extra_tests {
     use crate::{Context, ParseOptions, Width};
 

@@ -396,8 +396,7 @@ pub(crate) fn lower_id_whole(
     let free = |i: u32| i == root || !opaque.contains_key(&i);
     let mut scan_lim = *lim;
     scan_lim.max_vars = lim.max_vars.saturating_add(4);
-    let (mut atoms, order) =
-        scan_in(cx, root, &scan_lim, &|cx, i| free(i) && in_fragment(cx, i))?;
+    let (mut atoms, order) = scan_in(cx, root, &scan_lim, &|cx, i| free(i) && in_fragment(cx, i))?;
     let semi = order
         .iter()
         .all(|&i| in_reading(cx, i, Reading::SemiLinear));
@@ -742,7 +741,7 @@ fn offset_or_xor(cx: &Context, a: u32) -> Option<(u32, SolvedKind)> {
                     constant: k,
                     negated: true,
                 },
-            ))
+            ));
         }
         (OpCode::Sub, None, Some(k)) => (n.a, BitVec::un_unchecked(UnOp::Neg, &k)),
         _ => return None,

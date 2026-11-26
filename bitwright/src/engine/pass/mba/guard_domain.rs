@@ -8,7 +8,9 @@ use crate::{BinOp, Context, UnOp, expr::Bounded, expr::OpCode};
 // Read only the positive Boolean skeleton. Everything else, including a subtree
 // beyond the cap, may be true: a dropped branch must never narrow the domain.
 fn walk(cx: &Context, i: u32, left: &mut u32, atom: &mut impl FnMut(u32, u32) -> bool) -> bool {
-    if *left == 0 { return true; }
+    if *left == 0 {
+        return true;
+    }
     *left -= 1;
     let n = cx.node(i);
     match n.op {
@@ -17,7 +19,9 @@ fn walk(cx: &Context, i: u32, left: &mut u32, atom: &mut impl FnMut(u32, u32) ->
             let b = walk(cx, n.b, left, atom);
             if n.op == OpCode::And { a && b } else { a || b }
         }
-        OpCode::Eq if cx.node(n.a).op == OpCode::Sym && cx.node(n.b).op == OpCode::Const => atom(n.a, n.b),
+        OpCode::Eq if cx.node(n.a).op == OpCode::Sym && cx.node(n.b).op == OpCode::Const => {
+            atom(n.a, n.b)
+        }
         _ => true,
     }
 }
@@ -45,9 +49,14 @@ fn select_guard(cx: &Context, body: u32, order: &[u32]) -> Option<(u32, (u32, u1
     }
     order.iter().find_map(|&i| {
         let n = cx.node(i);
-        if n.op != OpCode::Select { return None; }
+        if n.op != OpCode::Select {
+            return None;
+        }
         let (x, bit, _) = literal(cx, n.a);
-        guards.iter().copied().find(|&(_, (y, j, _))| (x, bit) == (y, j))
+        guards
+            .iter()
+            .copied()
+            .find(|&(_, (y, j, _))| (x, bit) == (y, j))
     })
 }
 
@@ -57,8 +66,12 @@ fn select_guard(cx: &Context, body: u32, order: &[u32]) -> Option<(u32, (u32, u1
 fn shift_slice(cx: &mut Context, i: u32) -> Result<u32, crate::Error> {
     let n = cx.node(i);
     let w = n.width;
-    let Some(k) = cx.const_val(n.b).and_then(|v| v.to_u64()) else { return Ok(i) };
-    if w > 64 || k == 0 || k >= u64::from(w) { return Ok(i); }
+    let Some(k) = cx.const_val(n.b).and_then(|v| v.to_u64()) else {
+        return Ok(i);
+    };
+    if w > 64 || k == 0 || k >= u64::from(w) {
+        return Ok(i);
+    }
     let ones = u64::MAX >> (64 - w);
     let (rot, bits) = if n.op == OpCode::Shl {
         (k, (ones << k) & ones)
@@ -78,16 +91,24 @@ fn joined_shift(cx: &mut Context, i: u32) -> Result<u32, crate::Error> {
     let n = cx.node(i);
     let (a, b, neg) = match n.op {
         OpCode::Or | OpCode::Xor => (n.a, n.b, false),
-        OpCode::And if cx.node(n.a).op == OpCode::Not && cx.node(n.b).op == OpCode::Not =>
-            (cx.node(n.a).a, cx.node(n.b).a, true),
+        OpCode::And if cx.node(n.a).op == OpCode::Not && cx.node(n.b).op == OpCode::Not => {
+            (cx.node(n.a).a, cx.node(n.b).a, true)
+        }
         _ => return Ok(i),
     };
     let (na, nb) = (cx.node(a), cx.node(b));
-    if n.width <= 64 && na.op == OpCode::And && nb.op == OpCode::And && na.a == nb.a
+    if n.width <= 64
+        && na.op == OpCode::And
+        && nb.op == OpCode::And
+        && na.a == nb.a
         && let (Some(l), Some(r)) = (cx.const_val(na.b), cx.const_val(nb.b))
         && (l.limbs()[0] ^ r.limbs()[0]) == (u64::MAX >> (64 - n.width))
     {
-        return if neg { cx.c_un(UnOp::Not, na.a) } else { Ok(na.a) };
+        return if neg {
+            cx.c_un(UnOp::Not, na.a)
+        } else {
+            Ok(na.a)
+        };
     }
     if !neg && let Some((base, left)) = crate::expr::field::rotation_of(cx, i) {
         let k = cx.mk_const_u64(n.width, u64::from(left))?;
@@ -99,30 +120,44 @@ fn joined_shift(cx: &mut Context, i: u32) -> Result<u32, crate::Error> {
         _ => return Ok(i),
     };
     let k = |i| cx.const_val(i).and_then(|v| v.to_u64());
-    if l.a != r.a || !k(l.b).and_then(|a| a.checked_add(k(r.b)?)).is_some_and(|s| s == u64::from(n.width)) {
+    if l.a != r.a
+        || !k(l.b)
+            .and_then(|a| a.checked_add(k(r.b)?))
+            .is_some_and(|s| s == u64::from(n.width))
+    {
         return Ok(i);
     }
     let rotation = cx.c_bin(BinOp::RotL, l.a, l.b)?;
-    if neg { cx.c_un(UnOp::Not, rotation) } else { Ok(rotation) }
+    if neg {
+        cx.c_un(UnOp::Not, rotation)
+    } else {
+        Ok(rotation)
+    }
 }
 
 /// Column proofs can ignore high carries when only a low field is read. A
 /// shared node needs the union of *every* user's demands, including guards.
 /// The word transfer models up to 64 bits; use full-width proofs otherwise.
 fn sum_demands(cx: &Context, order: &[u32]) -> Option<crate::hash::IdMap<u32, u64>> {
-    if order.iter().any(|&i| cx.wid(i) > 64) { return None; }
+    if order.iter().any(|&i| cx.wid(i) > 64) {
+        return None;
+    }
     let mut masks = crate::hash::IdMap::default();
     masks.insert(*order.last()?, 1);
     for &i in order.iter().rev() {
         let Some(&mask) = masks.get(&i) else { continue };
         let n = cx.node(i);
         let kids = [n.a, n.b, n.c];
-        super::demanded(&n, mask,
+        super::demanded(
+            &n,
+            mask,
             |j| super::word_of(cx, kids[j], &cx.node(kids[j])),
             |j| cx.wid(kids[j]),
             |j, m| {
                 let m = m & (u64::MAX >> (64 - cx.wid(kids[j])));
-                if m != 0 { *masks.entry(kids[j]).or_default() |= m; }
+                if m != 0 {
+                    *masks.entry(kids[j]).or_default() |= m;
+                }
             },
         );
     }
@@ -134,16 +169,23 @@ fn sum_demands(cx: &Context, order: &[u32]) -> Option<crate::hash::IdMap<u32, u6
 /// it as one atom under masks loses the identity. Try the most-used interior
 /// words of the sum, with each word kept intact in *both* readers.
 fn cut_candidates(
-    cx: &Context, root: u32, uses: &super::super::Lease, work: &mut super::opaque_predicate::Work,
+    cx: &Context,
+    root: u32,
+    uses: &super::super::Lease,
+    work: &mut super::opaque_predicate::Work,
 ) -> [(u32, u32); 2] {
     let mut best = [(0, 0); 2];
     let mut stack = vec![(root, 0u8)];
     for _ in 0..384 {
         let Some((i, depth)) = stack.pop() else { break };
-        if work.take(1).is_none() { break; }
+        if work.take(1).is_none() {
+            break;
+        }
         let n = cx.node(i);
-        if i != root && !matches!(n.op, OpCode::Sym | OpCode::Const)
-            && let Some(count) = uses.get(i) && count >= 2
+        if i != root
+            && !matches!(n.op, OpCode::Sym | OpCode::Const)
+            && let Some(count) = uses.get(i)
+            && count >= 2
             && !best.iter().any(|&(k, seen)| k != 0 && seen == i)
         {
             if count > best[0].0 {
@@ -158,7 +200,11 @@ fn cut_candidates(
             OpCode::Mul | OpCode::Shl if depth == 0 && cx.is_const(n.b) => stack.push((n.a, 0)),
             OpCode::Neg if depth == 0 => stack.push((n.a, 0)),
             OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor if depth < 2 => {
-                stack.extend(n.children().filter(|&c| !cx.is_const(c)).map(|c| (c, depth + 1)));
+                stack.extend(
+                    n.children()
+                        .filter(|&c| !cx.is_const(c))
+                        .map(|c| (c, depth + 1)),
+                );
             }
             _ => (),
         }
@@ -170,15 +216,23 @@ fn cut_candidates(
 /// small Boolean bases before it is buried under other operators. No case
 /// fact leaves the conjunction; a changed result must also be smaller.
 fn select_cofactor(
-    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, body: u32, order: &[u32],
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    body: u32,
+    order: &[u32],
 ) -> Result<Option<u32>, Stop> {
     use super::opaque_predicate::{Work, columns_cut, columns_low};
     let scan = 8 * order.len() as u64 + u64::from(LIMIT);
     let budget = (r.meter.left_in(|b| b.pass_work) / 3).min(1 << 16);
-    if budget <= scan { return Ok(None); }
+    if budget <= scan {
+        return Ok(None);
+    }
     let finding = order.len() as u64 + u64::from(LIMIT);
     r.meter.charge(Counter::PassWork, finding)?;
-    let Some((guard, (x, bit, on))) = select_guard(cx, body, order) else { return Ok(None) };
+    let Some((guard, (x, bit, on))) = select_guard(cx, body, order) else {
+        return Ok(None);
+    };
     r.meter.charge(Counter::PassWork, scan - finding)?;
     let budget = budget - scan;
     let mut work = Work::new(budget);
@@ -188,14 +242,18 @@ fn select_cofactor(
     let mut shifted = super::super::Lease::new(cx.len());
     for &i in order {
         let n = cx.node(i);
-        for c in n.children() { uses.bump(c); }
+        for c in n.children() {
+            uses.bump(c);
+        }
         if matches!(n.op, OpCode::Shl | OpCode::LShr) {
             let flag = if n.op == OpCode::Shl { 1 } else { 2 };
             shifted.insert(n.a, shifted.get(n.a).unwrap_or(0) | flag);
         }
         if !matches!(n.op, OpCode::Add | OpCode::Sub) {
             for c in n.children() {
-                if matches!(cx.node(c).op, OpCode::Add | OpCode::Sub) { sums.insert(c, 0); }
+                if matches!(cx.node(c).op, OpCode::Add | OpCode::Sub) {
+                    sums.insert(c, 0);
+                }
             }
         }
     }
@@ -203,7 +261,9 @@ fn select_cofactor(
     let mut kernels = super::cofactors::Sums::default();
     let mut parts = Vec::new();
     for &i in order {
-        if i == guard { continue; }
+        if i == guard {
+            continue;
+        }
         let n = cx.node(i);
         if n.op == OpCode::Select {
             let (y, j, value) = literal(cx, n.a);
@@ -219,8 +279,13 @@ fn select_cofactor(
             kids[j] = rewrites.get(c).unwrap_or(c);
             changed |= kids[j] != c;
         }
-        let mut cur = if changed { r.build(cx, |cx| cx.rebuild(i, kids))? } else { i };
-        if matches!(n.op, OpCode::Shl | OpCode::LShr) && shifted.get(n.a) == Some(3)
+        let mut cur = if changed {
+            r.build(cx, |cx| cx.rebuild(i, kids))?
+        } else {
+            i
+        };
+        if matches!(n.op, OpCode::Shl | OpCode::LShr)
+            && shifted.get(n.a) == Some(3)
             && matches!(cx.node(cur).op, OpCode::Shl | OpCode::LShr)
         {
             cur = r.build(cx, |cx| shift_slice(cx, cur))?;
@@ -228,10 +293,14 @@ fn select_cofactor(
         if matches!(cx.node(cur).op, OpCode::And | OpCode::Or | OpCode::Xor) {
             cur = r.build(cx, |cx| joined_shift(cx, cur))?;
         }
-        let bits = demands.as_ref().and_then(|m| m.get(&i))
+        let bits = demands
+            .as_ref()
+            .and_then(|m| m.get(&i))
             .map_or(cx.wid(cur), |m| 64 - m.leading_zeros() as u16);
-        if sums.contains(i) && matches!(cx.node(cur).op, OpCode::Add | OpCode::Sub)
-            && cx.wid(cur) <= 64 && work.left != 0
+        if sums.contains(i)
+            && matches!(cx.node(cur).op, OpCode::Add | OpCode::Sub)
+            && cx.wid(cur) <= 64
+            && work.left != 0
         {
             if let Some(v) = r.build(cx, |cx| kernels.collapse(cx, cur, false, &mut work))? {
                 cur = v;
@@ -240,25 +309,39 @@ fn select_cofactor(
                 let mut sum = columns_low(cx, cur, bits, &mut parts, &mut work);
                 if sum.is_none() && parts.len() >= 3 {
                     for (count, cut) in cut_candidates(cx, cur, &uses, &mut work) {
-                        if count == 0 { break; }
+                        if count == 0 {
+                            break;
+                        }
                         sum = columns_cut(cx, cur, bits, cut, &mut parts, &mut work);
-                        if sum.is_some() { break; }
+                        if sum.is_some() {
+                            break;
+                        }
                     }
                 }
-                if let Some(s) = sum { cur = s.build(r, cx, cx.wid(cur))?; }
+                if let Some(s) = sum {
+                    cur = s.build(r, cx, cx.wid(cur))?;
+                }
             }
         }
         if cur != i {
             rewrites.insert(i, cur);
-            if let Some(count) = uses.get(i) && count > uses.get(cur).unwrap_or(0) {
+            if let Some(count) = uses.get(i)
+                && count > uses.get(cur).unwrap_or(0)
+            {
                 uses.insert(cur, count);
             }
         }
     }
     r.meter.charge(Counter::PassWork, budget - work.left)?;
-    let Some(out) = rewrites.get(root) else { return Ok(None) };
+    let Some(out) = rewrites.get(root) else {
+        return Ok(None);
+    };
     let cap = order.len() as u32 - 1;
-    Ok(matches!(cx.dag_size(&[cx.handle(out)], cap).map_err(Stop::Error)?, Bounded::Exact(_)).then_some(out))
+    Ok(matches!(
+        cx.dag_size(&[cx.handle(out)], cap).map_err(Stop::Error)?,
+        Bounded::Exact(_)
+    )
+    .then_some(out))
 }
 
 fn candidates(
@@ -270,7 +353,9 @@ fn candidates(
     let mut left = LIMIT;
     walk(cx, body, &mut left, &mut |sym, k| {
         if let Some((_, ks)) = domains.iter_mut().find(|(s, _)| *s == sym) {
-            if ks.len() < 2 && !ks.contains(&k) { ks.push(k); }
+            if ks.len() < 2 && !ks.contains(&k) {
+                ks.push(k);
+            }
         } else if domains.len() < 4 {
             domains.push((sym, vec![k]));
         }
@@ -291,22 +376,37 @@ fn closed(
     ks: &[u32],
 ) -> Result<bool, Stop> {
     let mut left = LIMIT;
-    let outside = walk(cx, guard, &mut left, &mut |s, k| s != sym || !ks.contains(&k));
+    let outside = walk(cx, guard, &mut left, &mut |s, k| {
+        s != sym || !ks.contains(&k)
+    });
     r.meter.charge(Counter::PassWork, u64::from(LIMIT - left))?;
     Ok(!outside)
 }
 
-pub(super) fn specialize(r: &mut Runner<'_, '_>, cx: &mut Context, cfg: &super::MbaConfig, root: u32, order: &[u32]) -> Result<Option<u32>, Stop> {
+pub(super) fn specialize(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &super::MbaConfig,
+    root: u32,
+    order: &[u32],
+) -> Result<Option<u32>, Stop> {
     let node = cx.node(root);
-    if node.op != OpCode::Not || node.width != 1 || cx.node(node.a).op != OpCode::And { return Ok(None); }
+    if node.op != OpCode::Not || node.width != 1 || cx.node(node.a).op != OpCode::And {
+        return Ok(None);
+    }
     let body = node.a;
     let size = order.len() as u32;
-    if let Some(e) = select_cofactor(r, cx, root, body, order)? { return Ok(Some(e)); }
+    if let Some(e) = select_cofactor(r, cx, root, body, order)? {
+        return Ok(Some(e));
+    }
     let domains = candidates(r, cx, body)?;
     let mut paired = Vec::new();
     for (sym, ks) in domains {
-        if !closed(r, cx, body, sym, &ks)? { continue; }
-        r.meter.charge(Counter::PassWork, u64::from(size) * (1 + ks.len() as u64))?;
+        if !closed(r, cx, body, sym, &ks)? {
+            continue;
+        }
+        r.meter
+            .charge(Counter::PassWork, u64::from(size) * (1 + ks.len() as u64))?;
         let e = r.build(cx, |cx| {
             let mut branches = None;
             let mut replacements = crate::hash::IdMap::default();
@@ -324,11 +424,16 @@ pub(super) fn specialize(r: &mut Runner<'_, '_>, cx: &mut Context, cfg: &super::
         })?;
         // Don't expand into a tree of cases on later rounds.
         let cap = size * 3 / 4;
-        if matches!(cx.dag_size(&[cx.handle(e)], cap).map_err(Stop::Error)?, Bounded::Exact(_)) {
+        if matches!(
+            cx.dag_size(&[cx.handle(e)], cap).map_err(Stop::Error)?,
+            Bounded::Exact(_)
+        ) {
             return Ok(Some(e));
         }
         paired.push((sym, ks));
-        if paired.len() == 2 { break; }
+        if paired.len() == 2 {
+            break;
+        }
     }
     if let [(x, xs), (y, ys)] = paired.as_slice() {
         let mut repl = crate::hash::IdMap::default();
@@ -338,7 +443,9 @@ pub(super) fn specialize(r: &mut Runner<'_, '_>, cx: &mut Context, cfg: &super::
                 repl.insert(*y, b);
                 r.meter.charge(Counter::PassWork, u64::from(size))?;
                 let body = r.build(cx, |cx| Ok(cx.substitute_ids(&[body], &repl)?[0]))?;
-                if !contradiction(r, cx, cfg, body)? { return Ok(None); }
+                if !contradiction(r, cx, cfg, body)? {
+                    return Ok(None);
+                }
             }
         }
         return Ok(Some(r.build(cx, |cx| cx.mk_const_u64(1, 1))?));
@@ -362,17 +469,27 @@ pub(super) fn comparison(
     if !matches!(n.op, OpCode::Ult | OpCode::Ule | OpCode::Slt | OpCode::Sle) {
         return Ok(None);
     }
-    let selected = if cx.is_const(n.a) { n.b } else if cx.is_const(n.b) { n.a } else {
+    let selected = if cx.is_const(n.a) {
+        n.b
+    } else if cx.is_const(n.b) {
+        n.a
+    } else {
         return Ok(None);
     };
     let selected = cx.node(selected);
-    if selected.op != OpCode::Select { return Ok(None); }
+    if selected.op != OpCode::Select {
+        return Ok(None);
+    }
     // One bounded look through the discriminator, not a search over DAG splits.
     fn first_guard(cx: &Context, i: u32, left: &mut u32) -> Option<u32> {
-        if *left == 0 { return None; }
+        if *left == 0 {
+            return None;
+        }
         *left -= 1;
         let n = cx.node(i);
-        if n.op == OpCode::Select { return Some(n.a); }
+        if n.op == OpCode::Select {
+            return Some(n.a);
+        }
         n.children().find_map(|c| first_guard(cx, c, left))
     }
     let mut left = 32;
@@ -387,7 +504,9 @@ pub(super) fn comparison(
             keep += 1;
         }
     }
-    if keep == 0 { return Ok(None); }
+    if keep == 0 {
+        return Ok(None);
+    }
 
     use crate::{BitVec, Facts, Width};
     let mut places = super::super::Lease::new(cx.len());
@@ -397,7 +516,9 @@ pub(super) fn comparison(
     let mut facts = Vec::with_capacity(order.len());
     let mut case = |r: &mut Runner<'_, '_>, on: bool, label: Option<(u32, BitVec)>| {
         let cost = order.len() as u64;
-        if r.meter.left_in(|b| b.fact_work) < cost { return Ok(None); }
+        if r.meter.left_in(|b| b.fact_work) < cost {
+            return Ok(None);
+        }
         r.meter.charge(Counter::PassWork, cost)?;
         r.meter.spent.fact_work += cost;
         facts.clear();
@@ -405,7 +526,9 @@ pub(super) fn comparison(
         for &i in order {
             let f = if i == guard {
                 Facts::constant(&BitVec::from_bool(on))
-            } else if let Some((s, k)) = label && i == s {
+            } else if let Some((s, k)) = label
+                && i == s
+            {
                 Facts::constant(&k)
             } else {
                 let n = cx.node(i);
@@ -419,7 +542,9 @@ pub(super) fn comparison(
         }
         Ok::<_, Stop>(facts.last().and_then(Facts::as_constant))
     };
-    let Some(want) = case(r, false, None)? else { return Ok(None) };
+    let Some(want) = case(r, false, None)? else {
+        return Ok(None);
+    };
     for (s, ks) in &domains[..keep] {
         let mut all = true;
         for &k in ks {
@@ -429,23 +554,36 @@ pub(super) fn comparison(
                 break;
             }
         }
-        if all { return Ok(Some(want)); }
+        if all {
+            return Ok(Some(want));
+        }
     }
     Ok(None)
 }
 
 // A single false conjunct suffices. Samples rank candidates only: the ordinary
 // exact opaque sweep must actually produce zero, separately in every cofactor.
-fn contradiction(r: &mut Runner<'_, '_>, cx: &mut Context, cfg: &super::MbaConfig, body: u32) -> Result<bool, Stop> {
-    if let Some(v) = cx.const_val(body) { return Ok(v.is_zero()); }
+fn contradiction(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    cfg: &super::MbaConfig,
+    body: u32,
+) -> Result<bool, Stop> {
+    if let Some(v) = cx.const_val(body) {
+        return Ok(v.is_zero());
+    }
     r.sample(cx, body)?;
-    if !r.samples[&body].iter().all(|v| v.is_zero()) { return Ok(false); }
+    if !r.samples[&body].iter().all(|v| v.is_zero()) {
+        return Ok(false);
+    }
     let mut stack = vec![body];
     let mut candidates = Vec::new();
     for _ in 0..128 {
         let Some(i) = stack.pop() else { break };
         r.meter.charge(Counter::PassWork, 1)?;
-        if !r.samples[&i].iter().all(|v| v.is_zero()) { continue; }
+        if !r.samples[&i].iter().all(|v| v.is_zero()) {
+            continue;
+        }
         let n = cx.node(i);
         if n.op == OpCode::And {
             stack.extend([n.a, n.b]);
@@ -456,9 +594,16 @@ fn contradiction(r: &mut Runner<'_, '_>, cx: &mut Context, cfg: &super::MbaConfi
     candidates.sort_by_key(|&i| cx.meta[i as usize].height);
     for &i in candidates.iter().take(2) {
         r.meter.charge(Counter::PassWork, 768)?;
-        if !matches!(cx.dag_size(&[cx.handle(i)], 768).map_err(Stop::Error)?, Bounded::Exact(_)) { continue; }
+        if !matches!(
+            cx.dag_size(&[cx.handle(i)], 768).map_err(Stop::Error)?,
+            Bounded::Exact(_)
+        ) {
+            continue;
+        }
         let e = super::sweep_inner(r, cx, cfg, i, false)?;
-        if cx.const_val(e).is_some_and(|v| v.is_zero()) { return Ok(true); }
+        if cx.const_val(e).is_some_and(|v| v.is_zero()) {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -472,7 +617,9 @@ mod tests {
     fn only_mandatory_guard_controls_select() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W8);
-        let branch = cx.parse("select((trunc<4>(x) & 8) != 0, y, z)", &opt).unwrap();
+        let branch = cx
+            .parse("select((trunc<4>(x) & 8) != 0, y, z)", &opt)
+            .unwrap();
         let branch = cx.id(branch).unwrap();
         let condition = literal(&cx, cx.node(branch).a);
         for (s, expected) in [
@@ -497,16 +644,31 @@ mod tests {
             let e = cx.parse(&text, &opt).unwrap();
             let e = cx.id(e).unwrap();
             let mut work = super::super::opaque_predicate::Work::new(1 << 14);
-            let v = kernels.collapse(&mut cx, e, false, &mut work).unwrap().unwrap();
+            let v = kernels
+                .collapse(&mut cx, e, false, &mut work)
+                .unwrap()
+                .unwrap();
             let want = cx.parse("z * 7", &opt).unwrap();
             assert_eq!(v, cx.id(want).unwrap());
         }
-        let e = cx.parse("(x & y)*5 + (x & ~z)*5 - x*5 + z*7", &opt).unwrap();
+        let e = cx
+            .parse("(x & y)*5 + (x & ~z)*5 - x*5 + z*7", &opt)
+            .unwrap();
         let e = cx.id(e).unwrap();
         let mut work = super::super::opaque_predicate::Work::new(1 << 14);
-        assert!(kernels.collapse(&mut cx, e, false, &mut work).unwrap().is_none());
+        assert!(
+            kernels
+                .collapse(&mut cx, e, false, &mut work)
+                .unwrap()
+                .is_none()
+        );
         let mut work = super::super::opaque_predicate::Work::new(1);
-        assert!(kernels.collapse(&mut cx, e, false, &mut work).unwrap().is_none());
+        assert!(
+            kernels
+                .collapse(&mut cx, e, false, &mut work)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -555,9 +717,14 @@ mod tests {
         use crate::{BitVec, FnEnv, SymbolKey};
         use core::fmt::Write;
 
-        let engine = Engine::builder().builtin()
-            .strategy(Strategy::deobfuscate().with_mba(super::super::MbaConfig::default().with_opaque_sweep(true)))
-            .build().unwrap();
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate()
+                    .with_mba(super::super::MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
         // An inactive word with plenty of internal sharing. Its value
         // must not matter, nor may the specialized value escape its guard.
         let mut program = String::from("let h0 = x ^ y; ");
@@ -567,10 +734,20 @@ mod tests {
         for near_miss in [false, true] {
             let mut cx = Context::new();
             let tail = if near_miss { "+ (x & 1)" } else { "" };
-            let text = format!("{program} let v = select((x & 8) != 0, h69, \
-                (x & y)*5 + (x & ~y)*5 - x*5 {tail}); ~((0 <=s x) & (v == 1))");
-            let root = cx.parse(&text, &ParseOptions::width(Width::new(4).unwrap())).unwrap();
-            let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+            let text = format!(
+                "{program} let v = select((x & 8) != 0, h69, \
+                (x & y)*5 + (x & ~y)*5 - x*5 {tail}); ~((0 <=s x) & (v == 1))"
+            );
+            let root = cx
+                .parse(&text, &ParseOptions::width(Width::new(4).unwrap()))
+                .unwrap();
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[root],
+                    Run::default().with_per_call(Budget::fuel(1 << 14)),
+                )
+                .unwrap();
             let result = out.roots[0].expr;
             if !near_miss {
                 assert_eq!(cx.as_const(result).unwrap(), Some(BitVec::from_bool(true)));
@@ -578,7 +755,11 @@ mod tests {
                 for x in 0..16 {
                     for y in 0..16 {
                         let env = FnEnv(|key: &SymbolKey, w| {
-                            let v = if matches!(key, SymbolKey::Str(s) if s.as_ref() == "x") { x } else { y };
+                            let v = if matches!(key, SymbolKey::Str(s) if s.as_ref() == "x") {
+                                x
+                            } else {
+                                y
+                            };
                             Some(BitVec::wrapping_from_u64(w, v))
                         });
                         let values = cx.eval(&[root, result], &env).unwrap();

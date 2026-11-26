@@ -3098,22 +3098,56 @@ impl Runner<'_, '_> {
         }
         let settled = self.rounds(cx, cur, fin);
         #[cfg(feature = "mba")]
-        let settled = if let Ok((u, ufin)) = settled
-            && inner.phases.iter().any(|p| {
-                matches!(
-                    p,
-                    PhaseImpl::Mba(c)
-                        if c.noise_forms
-                            || (c.opaque_sweep
+        let settled = match settled {
+            Ok((u, ufin))
+                if inner.phases.iter().any(|p| {
+                    matches!(
+                        p,
+                        PhaseImpl::Mba(c)
+                            if c.noise_forms
+                                || (c.opaque_sweep
+                                    && cx.wid(u) == 1
+                                    && !cx.is_const(u)
+                                    && pass::has_sym_select_guard(cx, u))
+                    )
+                }) =>
+            {
+                self.split(cx, u, ufin)
+            }
+            Err((u, ufin, held @ Stop::Exhausted(Exhausted::MbaCalls | Exhausted::MbaSteps)))
+                if inner.phases.iter().any(|p| {
+                    matches!(
+                        p,
+                        PhaseImpl::Mba(c)
+                            if c.opaque_sweep
                                 && cx.wid(u) == 1
                                 && !cx.is_const(u)
-                                && pass::has_sym_select_guard(cx, u))
-                )
-            })
-        {
-            self.split(cx, u, ufin)
-        } else {
-            settled
+                                && pass::has_sym_select_guard(cx, u)
+                    )
+                }) =>
+            {
+                // When MBA calls/steps ran out on a multi-guard 1-bit root while non-MBA pass
+                // budget remains, still split on the shared symbol guard so cheap passes can
+                // fold each specialized branch.
+                match self.split(cx, u, ufin) {
+                    Ok((best, bfin)) if cx.is_const(best) => Ok((best, bfin)),
+                    Ok((best, bfin)) => Err((best, bfin, held)),
+                    Err((best, bfin, _)) if cx.is_const(best) => Ok((best, bfin)),
+                    Err((best, bfin, stop)) => Err((
+                        best,
+                        bfin,
+                        if matches!(
+                            stop,
+                            Stop::Exhausted(Exhausted::MbaCalls | Exhausted::MbaSteps)
+                        ) {
+                            held
+                        } else {
+                            stop
+                        },
+                    )),
+                }
+            }
+            other => other,
         };
         #[cfg(feature = "mba")]
         if inner.strategy.kept_steps >= KEPT_STEPS
@@ -3121,9 +3155,7 @@ impl Runner<'_, '_> {
         {
             match settled {
                 Ok((u, _))
-                    if u != root
-                        && !cx.is_const(u)
-                        && census(cx, u).0 > census(cx, root).0 =>
+                    if u != root && !cx.is_const(u) && census(cx, u).0 > census(cx, root).0 =>
                 {
                     return Ok((root, Fin::PROVISIONAL));
                 }
@@ -3182,11 +3214,9 @@ impl Runner<'_, '_> {
             cur = me.cases(cx, cur).map_err(|stop| (cur, fin, stop))?;
             let (r, mut f, held_stop) = match me.rounds_within(cx, cur, fin, SIDE_ROUNDS, false) {
                 Ok((r, f)) => (r, f, None),
-                Err((
-                    r,
-                    f,
-                    stop @ Stop::Exhausted(Exhausted::MbaSteps | Exhausted::MbaCalls),
-                )) => (r, f, Some(stop)),
+                Err((r, f, stop @ Stop::Exhausted(Exhausted::MbaSteps | Exhausted::MbaCalls))) => {
+                    (r, f, Some(stop))
+                }
                 Err(err) => return Err(err),
             };
             if r != cur && cx.wid(r) == 1 && !cx.is_const(r) {
@@ -3464,8 +3494,11 @@ impl Runner<'_, '_> {
         let (mut again, mut extra) = (false, false);
         let (mut words_runs, mut post_words) = (0u8, false);
         #[cfg(feature = "mba")]
+        let mut context_deferred = false;
+        #[cfg(feature = "mba")]
         let mut pre_mba: Option<(u32, Fin)> = None;
-        let finish_rounds = |cx: &Context,
+        let finish_rounds = |#[cfg_attr(not(feature = "mba"), allow(unused_variables))]
+                             cx: &Context,
                              cur: u32,
                              fin: Fin,
                              #[cfg(feature = "mba")] pre_mba: Option<(u32, Fin)>|
@@ -3504,9 +3537,12 @@ impl Runner<'_, '_> {
             }
             let (start, before) = (cur, fin);
             let mut ran_words_change = false;
+            #[cfg(feature = "mba")]
+            let mut broke_for_context = false;
             for (phase, p) in inner.strategy.phases.iter().enumerate() {
                 #[cfg(feature = "mba")]
                 if !again
+                    && !context_deferred
                     && (round == 0 || cur != start)
                     && matches!(
                         inner.phases[phase],
@@ -3518,6 +3554,8 @@ impl Runner<'_, '_> {
                         .map_err(|stop| (cur, fin, stop))?;
                     if shrunk != cur {
                         cur = shrunk;
+                        context_deferred = true;
+                        broke_for_context = true;
                         // Newly exposed constants/branches should be folded by the cheap
                         // passes on the next round before spending MBA solver steps.
                         break;
@@ -3533,7 +3571,8 @@ impl Runner<'_, '_> {
                         root: cx.handle(cur),
                     });
                 }
-                let is_words = matches!(inner.phases[phase], PhaseImpl::Pass(pass::PassKind::Words));
+                let is_words =
+                    matches!(inner.phases[phase], PhaseImpl::Pass(pass::PassKind::Words));
                 if is_words && !self.words.turn {
                     fin = fin.and(Fin::PROVISIONAL);
                     self.emit_phase_end(cx, round, phase, cur, spent0, None);
@@ -3600,7 +3639,15 @@ impl Runner<'_, '_> {
             }
             round = round.saturating_add(1);
             let same = cur == start;
-            changed += u8::from(!same);
+            #[cfg(feature = "mba")]
+            if !broke_for_context {
+                context_deferred = false;
+                changed += u8::from(!same);
+            }
+            #[cfg(not(feature = "mba"))]
+            {
+                changed += u8::from(!same);
+            }
             let last = extra || changed >= max;
             // The MBA phase's questions that ran out of steps at the depth this round asked
             // them (see `pass::mba::depth`) are asked deeper once the rounds have nothing left
@@ -3628,10 +3675,9 @@ impl Runner<'_, '_> {
                 let defer_words_to_split = late
                     && cx.wid(cur) == 1
                     && !cx.is_const(cur)
-                    && inner
-                        .phases
-                        .iter()
-                        .any(|p| matches!(p, PhaseImpl::Mba(c) if c.opaque_sweep && !c.noise_forms))
+                    && inner.phases.iter().any(
+                        |p| matches!(p, PhaseImpl::Mba(c) if c.opaque_sweep && !c.noise_forms),
+                    )
                     && pass::has_sym_select_guard(cx, cur);
                 #[cfg(not(feature = "mba"))]
                 let defer_words_to_split = false;

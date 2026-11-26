@@ -24,7 +24,10 @@ pub(super) struct Work {
 }
 impl Work {
     pub(super) fn new(left: u64) -> Self {
-        Self { left, projections: Default::default() }
+        Self {
+            left,
+            projections: Default::default(),
+        }
     }
 
     pub(super) fn take(&mut self, n: u64) -> Option<()> {
@@ -59,8 +62,16 @@ pub(super) fn terms(
 
 #[allow(clippy::too_many_arguments)]
 fn terms_at(
-    cx: &Context, i: u32, k: u64, bias: &mut u64, out: &mut Vec<(u32, u64)>,
-    depth: u8, keep_not: bool, cut: Option<u32>, mod_bits: u16, work: &mut Work,
+    cx: &Context,
+    i: u32,
+    k: u64,
+    bias: &mut u64,
+    out: &mut Vec<(u32, u64)>,
+    depth: u8,
+    keep_not: bool,
+    cut: Option<u32>,
+    mod_bits: u16,
+    work: &mut Work,
 ) -> Option<()> {
     work.take(1)?;
     let d = depth.checked_sub(1)?;
@@ -98,7 +109,18 @@ fn terms_at(
             if n.op == OpCode::Not {
                 *bias = bias.wrapping_sub(k);
             }
-            terms_at(cx, n.a, k.wrapping_neg(), bias, out, d, keep_not, cut, mod_bits, work)?;
+            terms_at(
+                cx,
+                n.a,
+                k.wrapping_neg(),
+                bias,
+                out,
+                d,
+                keep_not,
+                cut,
+                mod_bits,
+                work,
+            )?;
         }
         OpCode::Mul if scalar(cx, n.b).is_some() => {
             let c = scalar(cx, n.b)?;
@@ -141,7 +163,18 @@ fn terms_at(
             if count < u64::from(n.width) {
                 let next_mod = mod_bits.saturating_sub(count as u16);
                 if next_mod > 0 {
-                    terms_at(cx, n.a, k << count, bias, out, d, keep_not, cut, next_mod, work)?;
+                    terms_at(
+                        cx,
+                        n.a,
+                        k << count,
+                        bias,
+                        out,
+                        d,
+                        keep_not,
+                        cut,
+                        next_mod,
+                        work,
+                    )?;
                 }
             }
         }
@@ -152,14 +185,12 @@ fn terms_at(
             terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
         }
         OpCode::And
-            if mod_bits < 64
-                && scalar(cx, n.b).is_some_and(|m| (m & mod_mask) == mod_mask) =>
+            if mod_bits < 64 && scalar(cx, n.b).is_some_and(|m| (m & mod_mask) == mod_mask) =>
         {
             terms_at(cx, n.a, k, bias, out, d, keep_not, cut, mod_bits, work)?;
         }
         OpCode::And
-            if mod_bits < 64
-                && scalar(cx, n.a).is_some_and(|m| (m & mod_mask) == mod_mask) =>
+            if mod_bits < 64 && scalar(cx, n.a).is_some_and(|m| (m & mod_mask) == mod_mask) =>
         {
             terms_at(cx, n.b, k, bias, out, d, keep_not, cut, mod_bits, work)?;
         }
@@ -169,7 +200,9 @@ fn terms_at(
 }
 
 fn push_term(out: &mut Vec<(u32, u64)>, i: u32, k: u64) -> Option<()> {
-    if out.len() == 192 { return None; }
+    if out.len() == 192 {
+        return None;
+    }
     out.push((i, k));
     Some(())
 }
@@ -373,7 +406,14 @@ impl Lane {
         Some(x)
     }
 
-    fn bit_uncached(&mut self, cx: &Context, i: u32, j: u16, depth: u8, work: &mut Work) -> Option<u64> {
+    fn bit_uncached(
+        &mut self,
+        cx: &Context,
+        i: u32,
+        j: u16,
+        depth: u8,
+        work: &mut Work,
+    ) -> Option<u64> {
         let d = depth.checked_sub(1)?;
         let n = cx.node(i);
         let w = n.width;
@@ -571,7 +611,11 @@ impl Lane {
 }
 
 fn constant(
-    cx: &Context, x: u32, bits: u16, parts: &mut Vec<(u32, u64)>, work: &mut Work,
+    cx: &Context,
+    x: u32,
+    bits: u16,
+    parts: &mut Vec<(u32, u64)>,
+    work: &mut Work,
 ) -> Option<u64> {
     if !matches!(cx.node(x).op, OpCode::Add | OpCode::Sub | OpCode::Neg) {
         return None;
@@ -584,7 +628,12 @@ fn constant(
     Some(sum.wrapping_add(constant_lanes(cx, parts, bits, work)?) & mask)
 }
 
-pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left: &mut u64) -> Option<u64> {
+pub(super) fn constant_parts(
+    cx: &Context,
+    parts: &[(u32, u64)],
+    bits: u16,
+    left: &mut u64,
+) -> Option<u64> {
     if !(1..=64).contains(&bits) || parts.len() > 96 {
         return None;
     }
@@ -595,7 +644,10 @@ pub(super) fn constant_parts(cx: &Context, parts: &[(u32, u64)], bits: u16, left
     }) {
         return None;
     }
-    let mut work = Work { left: *left, projections: Default::default() };
+    let mut work = Work {
+        left: *left,
+        projections: Default::default(),
+    };
     let result = constant_lanes(cx, parts, bits, &mut work);
     *left = work.left;
     result
@@ -781,8 +833,9 @@ fn distribute_matching_prods(
         for (lhs, rhs) in [(n.a, n.b), (n.b, n.a)] {
             if let Some((u, neg_u, c)) = split_affine(lhs) {
                 let key = if u <= rhs { (u, rhs) } else { (rhs, u) };
-                if let Some(&(_, _, prod_id)) =
-                    existing.iter().find(|&&(a, b, pid)| (a, b) == key && pid != id)
+                if let Some(&(_, _, prod_id)) = existing
+                    .iter()
+                    .find(|&&(a, b, pid)| (a, b) == key && pid != id)
                 {
                     matched = Some((prod_id, neg_u, rhs, c));
                     break;
@@ -791,7 +844,18 @@ fn distribute_matching_prods(
         }
         if let Some((prod_id, neg_u, v, c)) = matched {
             *slot = (prod_id, if neg_u { k.wrapping_neg() } else { k });
-            terms_at(cx, v, k.wrapping_mul(c), bias, &mut extra, 32, false, None, mod_bits, work)?;
+            terms_at(
+                cx,
+                v,
+                k.wrapping_mul(c),
+                bias,
+                &mut extra,
+                32,
+                false,
+                None,
+                mod_bits,
+                work,
+            )?;
         }
     }
     for (id, k) in extra {
@@ -885,7 +949,18 @@ fn distribute_matching_prods(
                     parts[idx].1 = 0;
                 }
                 if c != 0 {
-                    terms_at(cx, v, c, bias, &mut extra_v, 32, false, None, mod_bits, work)?;
+                    terms_at(
+                        cx,
+                        v,
+                        c,
+                        bias,
+                        &mut extra_v,
+                        32,
+                        false,
+                        None,
+                        mod_bits,
+                        work,
+                    )?;
                 }
             }
         }
@@ -1040,7 +1115,12 @@ fn collapse_affine_bitwise_groups(
     work: &mut Work,
 ) -> Option<bool> {
     let mask = u64::MAX >> (64 - cur_bits);
-    let is_bw = |id: u32| matches!(cx.node(id).op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
+    let is_bw = |id: u32| {
+        matches!(
+            cx.node(id).op,
+            OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not
+        )
+    };
     let mag = |k: u64| {
         let km = k & mask;
         km.min(km.wrapping_neg() & mask)
@@ -1120,7 +1200,11 @@ fn collapse_affine_bitwise_groups(
 /// modulo `2^k` implies equality modulo `2^bits`, letting `terms_at` see through `zext`/`trunc`/
 /// low masks modulo `2^k`.
 pub(in crate::engine::pass) fn equal_lanes(
-    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32, bits: u16,
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    a: u32,
+    b: u32,
+    bits: u16,
 ) -> Result<bool, Stop> {
     if bits == 0 {
         return Ok(true);
@@ -1140,8 +1224,21 @@ pub(in crate::engine::pass) fn equal_lanes(
         let mut mask = u64::MAX >> (64 - cur_bits);
         let mut parts = Vec::new();
         let mut bias = 0;
-        terms_at(cx, a, 1, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work)?;
-        terms_at(cx, b, u64::MAX, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work)?;
+        terms_at(
+            cx, a, 1, &mut bias, &mut parts, 64, false, None, cur_bits, &mut work,
+        )?;
+        terms_at(
+            cx,
+            b,
+            u64::MAX,
+            &mut bias,
+            &mut parts,
+            64,
+            false,
+            None,
+            cur_bits,
+            &mut work,
+        )?;
         distribute_matching_prods(cx, &mut parts, &mut bias, cur_bits, &mut work)?;
         cancel_parts(&mut parts, mask, &mut work)?;
         // Cancel opposite-signed product terms `k * A + (-k) * B` when `A ≡ B (mod 2^cur_bits)`
@@ -1207,8 +1304,30 @@ pub(in crate::engine::pass) fn equal_lanes(
                     mask = lo_mask;
                     let mut narrow_parts = Vec::new();
                     let mut narrow_bias = bias;
-                    terms_at(cx, p1, k1, &mut narrow_bias, &mut narrow_parts, 64, false, None, cur_bits, &mut work)?;
-                    terms_at(cx, p2, k2, &mut narrow_bias, &mut narrow_parts, 64, false, None, cur_bits, &mut work)?;
+                    terms_at(
+                        cx,
+                        p1,
+                        k1,
+                        &mut narrow_bias,
+                        &mut narrow_parts,
+                        64,
+                        false,
+                        None,
+                        cur_bits,
+                        &mut work,
+                    )?;
+                    terms_at(
+                        cx,
+                        p2,
+                        k2,
+                        &mut narrow_bias,
+                        &mut narrow_parts,
+                        64,
+                        false,
+                        None,
+                        cur_bits,
+                        &mut work,
+                    )?;
                     cancel_parts(&mut narrow_parts, mask, &mut work)?;
                     parts = narrow_parts;
                     bias = narrow_bias;
@@ -1224,7 +1343,8 @@ pub(in crate::engine::pass) fn equal_lanes(
                 {
                     return Some(eq);
                 }
-                if !collapse_affine_bitwise_groups(cx, &mut parts, &mut bias, cur_bits, &mut work)? {
+                if !collapse_affine_bitwise_groups(cx, &mut parts, &mut bias, cur_bits, &mut work)?
+                {
                     return None;
                 }
                 rebase_shifted_terms(cx, &mut parts, &mut bias, wa, &mut work)?;
@@ -1247,7 +1367,11 @@ pub(in crate::engine::pass) fn equal_lanes(
 /// on both sides cancel before tracing bits; the remaining weighted Boolean terms need at
 /// most four independent source bits per column, not four bits across the whole word.
 pub(in crate::engine::pass) fn equal_sums(
-    r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32, bits: u16,
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    a: u32,
+    b: u32,
+    bits: u16,
 ) -> Result<bool, Stop> {
     if bits == 0 {
         return Ok(true);
@@ -1279,8 +1403,11 @@ pub(in crate::engine::pass) fn truncated_constant(
         let n = cx.node(i);
         if n.op == OpCode::Extract && n.b == 0 && cx.node(n.a).width <= 64 {
             let src = cx.node(n.a);
-            crosses_sum |= matches!(src.op, OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not)
-                || (src.op == OpCode::Mul && (cx.is_const(src.a) || cx.is_const(src.b)));
+            crosses_sum |= matches!(
+                src.op,
+                OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not
+            ) || (src.op == OpCode::Mul
+                && (cx.is_const(src.a) || cx.is_const(src.b)));
         } else if n.width != bits {
             return Ok(None);
         }
@@ -1302,7 +1429,16 @@ pub(in crate::engine::pass) fn truncated_constant(
             } else {
                 i
             };
-            terms(cx, src, k.to_u64()?, &mut sum, &mut parts, 64, false, &mut work)?;
+            terms(
+                cx,
+                src,
+                k.to_u64()?,
+                &mut sum,
+                &mut parts,
+                64,
+                false,
+                &mut work,
+            )?;
         }
         cancel_parts(&mut parts, mask, &mut work)?;
         let k = constant_lanes(cx, &parts, bits, &mut work)?;
@@ -1387,10 +1523,7 @@ fn equal_low_cone_zero(
         return None;
     }
     let mut vals = [0u64; 48];
-    let term_idxs: Vec<(usize, u64)> = parts
-        .iter()
-        .map(|&(id, k)| (idx_map[&id], k))
-        .collect();
+    let term_idxs: Vec<(usize, u64)> = parts.iter().map(|&(id, k)| (idx_map[&id], k)).collect();
     let mut b = 2u16.min(bits);
     loop {
         let bmask = (1u64 << b) - 1;
@@ -1599,7 +1732,9 @@ impl Rows {
         // c-x = ~(x+!c), so both spellings can share a column.
         let (key, neg) = match n.op {
             OpCode::Sub if scalar(cx, n.a).is_some() => ((n.b, !scalar(cx, n.a)? & mask), true),
-            OpCode::Sub if scalar(cx, n.b).is_some() => ((n.a, scalar(cx, n.b)?.wrapping_neg() & mask), false),
+            OpCode::Sub if scalar(cx, n.b).is_some() => {
+                ((n.a, scalar(cx, n.b)?.wrapping_neg() & mask), false)
+            }
             OpCode::Add if scalar(cx, n.b).is_some() => ((n.a, scalar(cx, n.b)?), false),
             OpCode::Add if scalar(cx, n.a).is_some() => ((n.b, scalar(cx, n.a)?), false),
             _ => ((i, 0), false),
@@ -1613,10 +1748,22 @@ impl Rows {
             }
         };
         let invert = neg != self.atoms[at].1;
-        Some(std::array::from_fn(|r| if (r & (1 << at) != 0) ^ invert { u64::MAX } else { 0 }))
+        Some(std::array::from_fn(|r| {
+            if (r & (1 << at) != 0) ^ invert {
+                u64::MAX
+            } else {
+                0
+            }
+        }))
     }
 
-    pub(super) fn read(&mut self, cx: &Context, i: u32, depth: u8, work: &mut Work) -> Option<[u64; 4]> {
+    pub(super) fn read(
+        &mut self,
+        cx: &Context,
+        i: u32,
+        depth: u8,
+        work: &mut Work,
+    ) -> Option<[u64; 4]> {
         work.take(1)?;
         if let Some(&v) = self.memo.get(&i) {
             return Some(v);
@@ -1676,14 +1823,23 @@ pub(super) struct ColumnSum {
     bias: u64,
 }
 
-pub(super) fn columns(cx: &Context, x: u32, parts: &mut Vec<(u32, u64)>, work: &mut Work) -> Option<ColumnSum> {
+pub(super) fn columns(
+    cx: &Context,
+    x: u32,
+    parts: &mut Vec<(u32, u64)>,
+    work: &mut Work,
+) -> Option<ColumnSum> {
     columns_low(cx, x, cx.node(x).width, parts, work)
 }
 
 /// Decode a sum modulo `2^w`. When `w` is smaller than the node's width,
 /// the returned word may replace it only where its upper bits are dead.
 pub(super) fn columns_low(
-    cx: &Context, x: u32, w: u16, parts: &mut Vec<(u32, u64)>, work: &mut Work,
+    cx: &Context,
+    x: u32,
+    w: u16,
+    parts: &mut Vec<(u32, u64)>,
+    work: &mut Work,
 ) -> Option<ColumnSum> {
     columns_at(cx, x, w, None, parts, work)
 }
@@ -1692,13 +1848,23 @@ pub(super) fn columns_low(
 /// In particular, the unmasked occurrence in `s + k*(s & m)` must not be
 /// expanded through `s` while its masked occurrence reads `s` as an atom.
 pub(super) fn columns_cut(
-    cx: &Context, x: u32, w: u16, cut: u32, parts: &mut Vec<(u32, u64)>, work: &mut Work,
+    cx: &Context,
+    x: u32,
+    w: u16,
+    cut: u32,
+    parts: &mut Vec<(u32, u64)>,
+    work: &mut Work,
 ) -> Option<ColumnSum> {
     columns_at(cx, x, w, Some(cut), parts, work)
 }
 
 fn columns_at(
-    cx: &Context, x: u32, w: u16, cut: Option<u32>, parts: &mut Vec<(u32, u64)>, work: &mut Work,
+    cx: &Context,
+    x: u32,
+    w: u16,
+    cut: Option<u32>,
+    parts: &mut Vec<(u32, u64)>,
+    work: &mut Work,
 ) -> Option<ColumnSum> {
     let width = cx.node(x).width;
     if width > 64 || !(1..=width).contains(&w) {
@@ -1711,7 +1877,10 @@ fn columns_at(
     if parts.len() < 3 {
         return None;
     }
-    let mut rows = Rows { cut, ..Default::default() };
+    let mut rows = Rows {
+        cut,
+        ..Default::default()
+    };
     let mut deltas = [[0u64; 64]; 3];
     for &(i, k) in parts.iter() {
         // ((v << s) ^ m) has constant low bits and scaled, possibly
@@ -1719,7 +1888,8 @@ fn columns_at(
         // not at its shifted position, so it can cancel unshifted terms.
         let n = cx.node(i);
         let shifted = if n.op == OpCode::Xor && cut != Some(i) {
-            scalar(cx, n.b).map(|m| (n.a, m))
+            scalar(cx, n.b)
+                .map(|m| (n.a, m))
                 .or_else(|| scalar(cx, n.a).map(|m| (n.b, m)))
                 .filter(|&(s, _)| cut != Some(s))
                 .map(|(s, m)| (cx.node(s), m))
@@ -1732,7 +1902,10 @@ fn columns_at(
             && s < u64::from(w)
         {
             bias = bias.wrapping_add(k.wrapping_mul(m & ((1u64 << s) - 1)));
-            (rows.read(cx, shift.a, 64, work)?.map(|v| v ^ (m >> s)), k << s)
+            (
+                rows.read(cx, shift.a, 64, work)?.map(|v| v ^ (m >> s)),
+                k << s,
+            )
         } else {
             (rows.read(cx, i, 64, work)?, k)
         };
@@ -1742,7 +1915,11 @@ fn columns_at(
             work.take(u64::from(changed.count_ones()))?;
             while changed != 0 {
                 let j = changed.trailing_zeros();
-                let k = if f[0] & (1 << j) == 0 { k } else { k.wrapping_neg() };
+                let k = if f[0] & (1 << j) == 0 {
+                    k
+                } else {
+                    k.wrapping_neg()
+                };
                 delta[j as usize] = delta[j as usize].wrapping_add(k << j);
                 changed &= changed - 1;
             }
@@ -1761,18 +1938,28 @@ fn columns_at(
         let mut coeff = 0;
         for (r, delta) in deltas.iter().enumerate() {
             let d = delta[j] & ones;
-            if d == 0 { continue; }
-            if coeff != 0 && coeff != d { return None; }
+            if d == 0 {
+                continue;
+            }
+            if coeff != 0 && coeff != d {
+                return None;
+            }
             coeff = d;
             active |= 1 << r;
         }
-        if active == 0 { continue; }
-        if gate != 0 && gate != active { return None; }
+        if active == 0 {
+            continue;
+        }
+        if gate != 0 && gate != active {
+            return None;
+        }
         gate = active;
         let bit = 1u64 << j;
         mask |= bit;
         if coeff != bit {
-            if coeff != bit.wrapping_neg() & ones { return None; }
+            if coeff != bit.wrapping_neg() & ones {
+                return None;
+            }
             flip |= bit;
         }
     }
@@ -1784,13 +1971,24 @@ fn columns_at(
         0b110 if cx.node(atoms.get(1)?.2).width == width => ColumnSource::Word(atoms[1].2),
         0b100 | 0b111 | 0b011 => {
             let b = atoms.get(1)?.2;
-            if cx.node(a).width != width || cx.node(b).width != width { return None; }
-            let op = match gate { 0b100 => BinOp::And, 0b111 => BinOp::Or, _ => BinOp::Xor };
+            if cx.node(a).width != width || cx.node(b).width != width {
+                return None;
+            }
+            let op = match gate {
+                0b100 => BinOp::And,
+                0b111 => BinOp::Or,
+                _ => BinOp::Xor,
+            };
             ColumnSource::Pair(a, op, b)
         }
         _ => return None,
     };
-    Some(ColumnSum { source, mask, flip, bias: bias.wrapping_sub(flip) & ones })
+    Some(ColumnSum {
+        source,
+        mask,
+        flip,
+        bias: bias.wrapping_sub(flip) & ones,
+    })
 }
 
 impl ColumnSum {
@@ -1805,7 +2003,12 @@ impl ColumnSum {
         }
     }
 
-    pub(super) fn build(self, r: &mut Runner<'_, '_>, cx: &mut Context, w: u16) -> Result<u32, Stop> {
+    pub(super) fn build(
+        self,
+        r: &mut Runner<'_, '_>,
+        cx: &mut Context,
+        w: u16,
+    ) -> Result<u32, Stop> {
         r.build(cx, |cx| {
             if self.mask == 0 {
                 return cx.mk_const_u64(w, self.bias.wrapping_add(self.flip));
@@ -1849,7 +2052,14 @@ pub(super) fn scaled_sum(cx: &Context, root: u32, bits: u16, left: &mut u64) -> 
                     return None;
                 }
                 todo[pending] = (n.a, k);
-                todo[pending + 1] = (n.b, if n.op == OpCode::Add { k } else { k.wrapping_neg() });
+                todo[pending + 1] = (
+                    n.b,
+                    if n.op == OpCode::Add {
+                        k
+                    } else {
+                        k.wrapping_neg()
+                    },
+                );
                 pending += 2;
             }
             OpCode::Mul | OpCode::Neg => {
@@ -1865,7 +2075,9 @@ pub(super) fn scaled_sum(cx: &Context, root: u32, bits: u16, left: &mut u64) -> 
     }
     let products = &products[..len];
     let &(candidates, _) = products.first()?;
-    let factor = candidates.into_iter().find(|f| products.iter().all(|(pair, _)| pair.contains(f)))?;
+    let factor = candidates
+        .into_iter()
+        .find(|f| products.iter().all(|(pair, _)| pair.contains(f)))?;
     let mut cofactors = [(0u32, 0u64); 16];
     for (out, &([a, b], k)) in cofactors.iter_mut().zip(products) {
         *out = (if a == factor { b } else { a }, k);
@@ -1878,7 +2090,9 @@ pub(super) fn scaled_sum(cx: &Context, root: u32, bits: u16, left: &mut u64) -> 
 // it exposes common factors across terms. Rewriting its inner column sums
 // separately can hide that factorization from the product-bit certificate.
 fn product_terms(cx: &Context, i: u32, left: &mut u8) -> bool {
-    if *left == 0 { return true; }
+    if *left == 0 {
+        return true;
+    }
     *left -= 1;
     let n = cx.node(i);
     match n.op {
@@ -1898,9 +2112,15 @@ fn is_sum(cx: &Context, i: u32) -> bool {
 /// when the enclosing Boolean combination cancels for every word. For a
 /// sampled bit, also decode maximal inner sums bottom up.
 pub(super) fn reduce_columns(
-    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32],
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
 ) -> Result<Option<u32>, Stop> {
-    if !(12..=4096).contains(&order.len()) || cx.node(root).width != 1 || r.mba.swept.contains_key(&root) {
+    if !(12..=4096).contains(&order.len())
+        || cx.node(root).width != 1
+        || r.mba.swept.contains_key(&root)
+    {
         return Ok(None);
     }
     let n = cx.node(root);
@@ -1917,14 +2137,22 @@ pub(super) fn reduce_columns(
     // `zext(low) | tag`, `zext(low) ^ tag`, `concat(tag, low)` and complemented masks all
     // compare a field: decode the sums feeding the field before a general MBA search spends
     // fuel on their unrelated inputs.
-    let field = matches!(n.op, OpCode::Extract | OpCode::Not) || (equality && {
-        let lhs = cx.node(n.a);
-        let value = if lhs.op == OpCode::Not { cx.node(lhs.a) } else { lhs };
-        matches!(value.op, OpCode::Extract | OpCode::And | OpCode::Concat)
-            || (matches!(value.op, OpCode::Or | OpCode::Xor)
-                && cx.const_val(value.b).is_some()
-                && matches!(cx.node(value.a).op, OpCode::Zext | OpCode::And | OpCode::Extract))
-    });
+    let field = matches!(n.op, OpCode::Extract | OpCode::Not)
+        || (equality && {
+            let lhs = cx.node(n.a);
+            let value = if lhs.op == OpCode::Not {
+                cx.node(lhs.a)
+            } else {
+                lhs
+            };
+            matches!(value.op, OpCode::Extract | OpCode::And | OpCode::Concat)
+                || (matches!(value.op, OpCode::Or | OpCode::Xor)
+                    && cx.const_val(value.b).is_some()
+                    && matches!(
+                        cx.node(value.a).op,
+                        OpCode::Zext | OpCode::And | OpCode::Extract
+                    ))
+        });
     if !compared && !field {
         return Ok(None);
     }
@@ -1932,10 +2160,15 @@ pub(super) fn reduce_columns(
         let mut left = 32;
         let nonlinear = product_terms(cx, n.a, &mut left);
         r.meter.charge(Counter::PassWork, u64::from(32 - left))?;
-        if nonlinear { return Ok(None); }
+        if nonlinear {
+            return Ok(None);
+        }
     }
     let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
-    let mut work = Work { left: budget, projections: Default::default() };
+    let mut work = Work {
+        left: budget,
+        projections: Default::default(),
+    };
     let mut parts = Vec::new();
     if compared && let Some(s) = columns(cx, n.a, &mut parts, &mut work) {
         let w = cx.node(n.a).width;
@@ -1947,12 +2180,18 @@ pub(super) fn reduce_columns(
     // Distinct slices of one computed word look like unrelated atoms to `columns`.
     // For a literal comparison only constancy matters. Trace each term's bits back
     // through those slices and check all assignments in each column independently.
-    if compared && parts.len() >= 3 && cx.wid(n.a) <= 64
+    if compared
+        && parts.len() >= 3
+        && cx.wid(n.a) <= 64
         && let Some(k) = constant(cx, n.a, cx.wid(n.a), &mut parts, &mut work)
     {
         r.meter.charge(Counter::PassWork, budget - work.left)?;
         let equal = Some(k) == scalar(cx, n.b);
-        return r.build(cx, |cx| cx.mk_const_u64(1, u64::from(equal == (n.op == OpCode::Eq)))).map(Some);
+        return r
+            .build(cx, |cx| {
+                cx.mk_const_u64(1, u64::from(equal == (n.op == OpCode::Eq)))
+            })
+            .map(Some);
     }
     if work.take(3 * order.len() as u64).is_none() {
         r.meter.charge(Counter::PassWork, budget - work.left)?;
@@ -1963,11 +2202,15 @@ pub(super) fn reduce_columns(
         if let Some(s) = columns(cx, cur, &mut parts, &mut work) {
             return s.build(r, cx, w).map(Some);
         }
-        if w <= 64 && let Some((f, k)) = scaled_sum(cx, cur, w, &mut work.left) {
-            return r.build(cx, |cx| {
-                let k = cx.mk_const_u64(w, k)?;
-                cx.c_bin(BinOp::Mul, f, k)
-            }).map(Some);
+        if w <= 64
+            && let Some((f, k)) = scaled_sum(cx, cur, w, &mut work.left)
+        {
+            return r
+                .build(cx, |cx| {
+                    let k = cx.mk_const_u64(w, k)?;
+                    cx.c_bin(BinOp::Mul, f, k)
+                })
+                .map(Some);
         }
         Ok(None)
     })?;
@@ -2010,7 +2253,11 @@ fn rewrite_nodes(
             kids[k] = rewrites.get(c).unwrap_or(c);
             changed |= kids[k] != c;
         }
-        let mut cur = if changed { r.build(cx, |cx| cx.rebuild(i, kids))? } else { i };
+        let mut cur = if changed {
+            r.build(cx, |cx| cx.rebuild(i, kids))?
+        } else {
+            i
+        };
         if let Some(v) = decode(r, cx, cur, tops.contains(i) && is_sum(cx, cur))? {
             cur = v;
         }
@@ -2060,8 +2307,16 @@ fn sum_slice(
         while m != 0 {
             let j = m.trailing_zeros();
             let bit = 1 << j;
-            let delta = if s.flip & bit == 0 { k } else { k.wrapping_neg() };
-            let b = if j >= s.rot { j - s.rot } else { j + u32::from(w) - s.rot };
+            let delta = if s.flip & bit == 0 {
+                k
+            } else {
+                k.wrapping_neg()
+            };
+            let b = if j >= s.rot {
+                j - s.rot
+            } else {
+                j + u32::from(w) - s.rot
+            };
             weights[b as usize] = weights[b as usize].wrapping_add(delta << j);
             m &= m - 1;
         }
@@ -2078,8 +2333,14 @@ fn sum_slice(
         let dest = c.trailing_zeros();
         let bit = 1u64 << dest;
         let j = j as u32;
-        let rot = if dest >= j { dest - j } else { dest + u32::from(w) - j };
-        if rotation.replace(rot).is_some_and(|r| r != rot) { return None; }
+        let rot = if dest >= j {
+            dest - j
+        } else {
+            dest + u32::from(w) - j
+        };
+        if rotation.replace(rot).is_some_and(|r| r != rot) {
+            return None;
+        }
         if c == (bit.wrapping_neg() & ones) && (c != bit || bias & bit != 0) {
             flip |= bit;
         } else if c != bit {
@@ -2090,21 +2351,36 @@ fn sum_slice(
     let base = source.unwrap_or(i); // unused for a constant
     let rot = rotation.unwrap_or(0);
     // If no addition is needed, keep constant lanes in the Boolean mask.
-    if (bias ^ flip) & mask == 0 { flip = bias & ones; }
-    let source = if rot == 0 { ColumnSource::Word(base) } else { ColumnSource::Rotated(base, rot) };
-    Some(ColumnSum { source, mask, flip, bias: bias.wrapping_sub(flip) & ones })
+    if (bias ^ flip) & mask == 0 {
+        flip = bias & ones;
+    }
+    let source = if rot == 0 {
+        ColumnSource::Word(base)
+    } else {
+        ColumnSource::Rotated(base, rot)
+    };
+    Some(ColumnSum {
+        source,
+        mask,
+        flip,
+        bias: bias.wrapping_sub(flip) & ones,
+    })
 }
 
 // Both p == 0 and ~p == all-ones test the same word. The polarity belongs
 // to the comparison, not to the complement on its operand.
 fn zero_product(cx: &Context, root: u32) -> Option<(u32, bool)> {
     let n = cx.node(root);
-    if !matches!(n.op, OpCode::Eq | OpCode::Ne) { return None; }
+    if !matches!(n.op, OpCode::Eq | OpCode::Ne) {
+        return None;
+    }
     let lhs = cx.node(n.a);
     let k = scalar(cx, n.b)?;
     if lhs.op == OpCode::Mul && k == 0 {
         Some((n.a, false))
-    } else if lhs.op == OpCode::Not && lhs.width <= 64 && k == u64::MAX >> (64 - lhs.width)
+    } else if lhs.op == OpCode::Not
+        && lhs.width <= 64
+        && k == u64::MAX >> (64 - lhs.width)
         && cx.node(lhs.a).op == OpCode::Mul
     {
         Some((lhs.a, true))
@@ -2126,7 +2402,8 @@ fn field_factors(cx: &Context, i: u32, depth: u8, emit: &mut impl FnMut(u32, u64
     let n = cx.node(i);
     if n.op == OpCode::Extract && n.width <= 8 {
         emit(i, (1 << n.width) - 1);
-    } else if n.op == OpCode::And && let Some(mask) = scalar(cx, n.b)
+    } else if n.op == OpCode::And
+        && let Some(mask) = scalar(cx, n.b)
         && mask.count_ones() <= 8
     {
         emit(i, mask);
@@ -2139,7 +2416,9 @@ fn field_factors(cx: &Context, i: u32, depth: u8, emit: &mut impl FnMut(u32, u64
 fn field_zeros(cx: &Context, x: u32, mut mask: u64, work: &mut Work) -> u16 {
     while mask != 0 {
         let j = mask.trailing_zeros() as u16;
-        if Lane::default().bit(cx, x, j, 64, work) != Some(0) { return j; }
+        if Lane::default().bit(cx, x, j, 64, work) != Some(0) {
+            return j;
+        }
         mask &= mask - 1;
     }
     64
@@ -2150,12 +2429,18 @@ fn field_zeros(cx: &Context, x: u32, mut mask: u64, work: &mut Work) -> u16 {
 // the presence of even one mask/flip would invalidate cancellation of carries.
 fn joined_offset(cx: &Context, i: u32, memo: &mut super::SliceMemo) -> Option<(u32, u64)> {
     let n = cx.node(i);
-    if n.width > 64 || n.op != OpCode::Add { return None; }
+    if n.width > 64 || n.op != OpCode::Add {
+        return None;
+    }
     let k = scalar(cx, n.b)?;
     let s = super::slice_of(cx, n.a, memo, 0);
-    if s.rot != 0 || s.mask != u64::MAX >> (64 - n.width) || s.flip != 0 { return None; }
+    if s.rot != 0 || s.mask != u64::MAX >> (64 - n.width) || s.flip != 0 {
+        return None;
+    }
     let a = cx.node(s.base);
-    if a.op != OpCode::Add { return None; }
+    if a.op != OpCode::Add {
+        return None;
+    }
     Some((a.a, k.wrapping_add(scalar(cx, a.b)?) & s.mask))
 }
 
@@ -2165,24 +2450,35 @@ fn joined_offset(cx: &Context, i: u32, memo: &mut super::SliceMemo) -> Option<(u
 /// Commit only a smaller DAG. Sparse masks at the end often leave no bit of
 /// the original word; don't enumerate the irrelevant shifts or input bits.
 fn rotated_layers(
-    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32],
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
 ) -> Result<Option<u32>, Stop> {
     let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
     let scan = order.len() as u64;
-    if budget < 9 * scan { return Ok(None); }
+    if budget < 9 * scan {
+        return Ok(None);
+    }
     r.meter.charge(Counter::PassWork, scan)?;
     let mut shifts = super::super::Lease::new(cx.len());
     let mut paired = false;
     for &i in order {
         let n = cx.node(i);
-        if matches!(n.op, OpCode::Shl | OpCode::LShr) && n.width <= 64 && scalar(cx, n.b).is_some() {
+        if matches!(n.op, OpCode::Shl | OpCode::LShr) && n.width <= 64 && scalar(cx, n.b).is_some()
+        {
             let flag = if n.op == OpCode::Shl { 1 } else { 2 };
             let flags = shifts.get(n.a).unwrap_or(0) | flag;
-            if flags == 3 { paired = true; break; }
+            if flags == 3 {
+                paired = true;
+                break;
+            }
             shifts.insert(n.a, flags);
         }
     }
-    if !paired { return Ok(None); }
+    if !paired {
+        return Ok(None);
+    }
     // Memoized slice reads, rebuilding and the final size check are linear
     // in the DAG. Charge coefficient accumulation by the live columns.
     let mut work = Work::new(budget - 9 * scan);
@@ -2190,13 +2486,17 @@ fn rotated_layers(
     let mut parts = Vec::new();
     let out = rewrite_nodes(r, cx, order, |r, cx, i, sum| {
         let n = cx.node(i);
-        if n.width > 64 || work.left == 0 { return Ok(None); }
+        if n.width > 64 || work.left == 0 {
+            return Ok(None);
+        }
         if sum {
             if let Some((x, k)) = joined_offset(cx, i, &mut memo) {
-                return r.build(cx, |cx| {
-                    let k = cx.mk_const_u64(n.width, k)?;
-                    cx.c_bin(BinOp::Add, x, k)
-                }).map(Some);
+                return r
+                    .build(cx, |cx| {
+                        let k = cx.mk_const_u64(n.width, k)?;
+                        cx.c_bin(BinOp::Add, x, k)
+                    })
+                    .map(Some);
             }
             if let Some(s) = sum_slice(cx, i, &mut memo, &mut parts, &mut work) {
                 return s.build(r, cx, n.width).map(Some);
@@ -2211,8 +2511,9 @@ fn rotated_layers(
                 // surviving bits. A scoped fact must not escape in a rewrite.
                 let (kb, fin) = super::super::known_words(r, cx, s.base)?;
                 kb.and_then(|[z, o]| {
-                    let rot = |x: u64|
-                        ((x << s.rot) | ((x & ones) >> (u32::from(n.width) - s.rot))) & ones;
+                    let rot = |x: u64| {
+                        ((x << s.rot) | ((x & ones) >> (u32::from(n.width) - s.rot))) & ones
+                    };
                     (fin == super::Fin::FINAL && s.mask & !rot(z | o) == 0)
                         .then(|| (rot(o) & s.mask) ^ s.flip)
                 })
@@ -2225,10 +2526,14 @@ fn rotated_layers(
         }
         Ok(None)
     })?;
-    r.meter.charge(Counter::PassWork, budget - scan - work.left)?;
-    let Some(out) = out.get(root) else { return Ok(None) };
+    r.meter
+        .charge(Counter::PassWork, budget - scan - work.left)?;
+    let Some(out) = out.get(root) else {
+        return Ok(None);
+    };
     let smaller = matches!(
-        cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1).map_err(Stop::Error)?,
+        cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1)
+            .map_err(Stop::Error)?,
         crate::expr::Bounded::Exact(_)
     );
     Ok(smaller.then_some(out))
@@ -2243,9 +2548,10 @@ pub(super) fn reduce_product(
     root: u32,
     order: &[u32],
 ) -> Result<Option<u32>, Stop> {
-    let Some((product, complemented)) = zero_product(cx, root) else { return Ok(None) };
-    if !(32..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root)
-    {
+    let Some((product, complemented)) = zero_product(cx, root) else {
+        return Ok(None);
+    };
+    if !(32..=4096).contains(&order.len()) || r.mba.swept.contains_key(&root) {
         return Ok(None);
     }
     const DEPTH: u8 = 3;
@@ -2256,7 +2562,9 @@ pub(super) fn reduce_product(
         len += 1;
     });
     let fields = &fields[..len];
-    if fields.is_empty() { return Ok(None); }
+    if fields.is_empty() {
+        return Ok(None);
+    }
     let budget = (r.meter.left_in(|b| b.pass_work) / 8).min(1 << 15);
     let mut work = Work::new(budget);
     // Marking tops, rebuilding, and memoized slice reads of original and
@@ -2270,11 +2578,15 @@ pub(super) fn reduce_product(
     let mut cone = Vec::new();
     let order = if complemented {
         let mut wanted = super::super::Lease::new(cx.len());
-        for &(x, _) in fields { wanted.insert(x, 0); }
+        for &(x, _) in fields {
+            wanted.insert(x, 0);
+        }
         for &i in order.iter().rev() {
             if wanted.contains(i) {
                 cone.push(i);
-                for c in cx.node(i).children() { wanted.insert(c, 0); }
+                for c in cx.node(i).children() {
+                    wanted.insert(c, 0);
+                }
             }
         }
         cone.reverse();
@@ -2289,10 +2601,12 @@ pub(super) fn reduce_product(
             return sum.build(r, cx, cx.node(cur).width).map(Some);
         }
         if let Some((x, k)) = joined_offset(cx, cur, &mut memo) {
-            return r.build(cx, |cx| {
-                let k = cx.mk_const_u64(cx.node(cur).width, k)?;
-                cx.c_bin(BinOp::Add, x, k)
-            }).map(Some);
+            return r
+                .build(cx, |cx| {
+                    let k = cx.mk_const_u64(cx.node(cur).width, k)?;
+                    cx.c_bin(BinOp::Add, x, k)
+                })
+                .map(Some);
         }
         Ok(None)
     })?;
@@ -2300,7 +2614,9 @@ pub(super) fn reduce_product(
     let mut zeros = 0;
     for &(x, mask) in fields {
         zeros += field_zeros(cx, rewrites.get(x).unwrap_or(x), mask, &mut work);
-        if zeros >= width { break; }
+        if zeros >= width {
+            break;
+        }
     }
     r.meter.charge(Counter::PassWork, budget - work.left)?;
     if zeros >= width {
@@ -2397,18 +2713,38 @@ mod tests {
         use crate::engine::{Budget, Engine, Run, Strategy};
         use crate::mba::MbaConfig;
 
-        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
-        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
-        for (coefficient, op, expected) in [(7, "==", Some(true)), (7, "!=", Some(false)), (8, "==", None)] {
-            let text = format!("let h = x:64 * x + y:64; \
+        let strategy =
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (coefficient, op, expected) in [
+            (7, "==", Some(true)),
+            (7, "!=", Some(false)),
+            (8, "==", None),
+        ] {
+            let text = format!(
+                "let h = x:64 * x + y:64; \
                 let p = extract<0,8>(h) ^ extract<16,8>(h); \
                 let q = extract<8,8>(h) ^ extract<24,8>(h); \
                 zext<64>(p & q)*{coefficient} + zext<64>(~p & q)*7 + \
-                zext<64>(p & ~q)*7 + zext<64>(~p & ~q)*7 {op} 1785");
+                zext<64>(p & ~q)*7 + zext<64>(~p & ~q)*7 {op} 1785"
+            );
             let mut cx = Context::new();
             let root = cx.parse(&text, &ParseOptions::width(Width::W64)).unwrap();
-            let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
-            assert_eq!(cx.as_const(out.roots[0].expr).unwrap(), expected.map(BitVec::from_bool));
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[root],
+                    Run::default().with_per_call(Budget::fuel(1 << 14)),
+                )
+                .unwrap();
+            assert_eq!(
+                cx.as_const(out.roots[0].expr).unwrap(),
+                expected.map(BitVec::from_bool)
+            );
         }
     }
 
@@ -2417,8 +2753,13 @@ mod tests {
         use crate::engine::{Budget, Engine, Run, Strategy};
         use crate::mba::MbaConfig;
 
-        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
-        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
+        let strategy =
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
         // The three masks partition the word, giving s = -k if they have
         // equal weights. The complementary multipliers leave only -s.
         for (weight, k, tag, lhs, rhs, expected) in [
@@ -2434,8 +2775,17 @@ mod tests {
             );
             let mut cx = Context::new();
             let root = cx.parse(&text, &ParseOptions::width(Width::W16)).unwrap();
-            let out = engine.run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
-            assert_eq!(cx.as_const(out.roots[0].expr).unwrap(), expected.map(BitVec::from_bool));
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[root],
+                    Run::default().with_per_call(Budget::fuel(1 << 14)),
+                )
+                .unwrap();
+            assert_eq!(
+                cx.as_const(out.roots[0].expr).unwrap(),
+                expected.map(BitVec::from_bool)
+            );
         }
     }
 
@@ -2444,9 +2794,18 @@ mod tests {
         use crate::engine::{Budget, Engine, Run, Strategy};
         use crate::mba::MbaConfig;
 
-        let strategy = Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
-        let engine = Engine::builder().builtin().strategy(strategy).build().unwrap();
-        for (mask, cmp, value) in [(132, "==", Some(true)), (132, "!=", Some(false)), (4, "==", None)] {
+        let strategy =
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(strategy)
+            .build()
+            .unwrap();
+        for (mask, cmp, value) in [
+            (132, "==", Some(true)),
+            (132, "!=", Some(false)),
+            (4, "==", None),
+        ] {
             let text = format!(
                 "let a = (x | {mask}) + 27; \
                  let b = (a & 51)*3 - (a & 51)*2 + (a & 204); \
@@ -2457,19 +2816,35 @@ mod tests {
             );
             let mut cx = Context::new();
             let before = cx.parse(&text, &ParseOptions::width(Width::W8)).unwrap();
-            let out = engine.run(&mut cx, &[before], Run::default().with_per_call(Budget::fuel(1 << 14))).unwrap();
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[before],
+                    Run::default().with_per_call(Budget::fuel(1 << 14)),
+                )
+                .unwrap();
             let after = out.roots[0].expr;
-            assert_eq!(cx.as_const(after).unwrap(), value.map(BitVec::from_bool), "{text}");
+            assert_eq!(
+                cx.as_const(after).unwrap(),
+                value.map(BitVec::from_bool),
+                "{text}"
+            );
             // With bit 7 unrestricted, the odd multipliers leave a real
             // nonzero word at x=0, whereas x=128 kills the same product.
             for x in [0, 128] {
                 let env = FnEnv(|key: &SymbolKey, w| {
-                    let v = if matches!(key, SymbolKey::Str(s) if s.as_ref() == "x") { x } else { 3 };
+                    let v = if matches!(key, SymbolKey::Str(s) if s.as_ref() == "x") {
+                        x
+                    } else {
+                        3
+                    };
                     Some(BitVec::wrapping_from_u64(w, v))
                 });
                 let v = cx.eval(&[before, after], &env).unwrap();
                 assert_eq!(v[0], v[1]);
-                if value.is_none() { assert_eq!(v[0], BitVec::from_bool(x != 0)); }
+                if value.is_none() {
+                    assert_eq!(v[0], BitVec::from_bool(x != 0));
+                }
             }
         }
     }
@@ -2477,7 +2852,9 @@ mod tests {
     #[test]
     fn sparse_valuation_never_drops_an_unproved_lane() {
         let mut cx = Context::new();
-        let x = cx.parse("~(x | 5)", &ParseOptions::width(Width::W8)).unwrap();
+        let x = cx
+            .parse("~(x | 5)", &ParseOptions::width(Width::W8))
+            .unwrap();
         let x = cx.id(x).unwrap();
         let mut work = Work::new(128);
         assert_eq!(field_zeros(&cx, x, 0b0101, &mut work), 64);
@@ -2495,7 +2872,10 @@ mod tests {
             ("(x & y) + (x & ~y) + (~x & 3) - (x & 3) + 5", Some(false)),
             ("((x+3) & 12) + ((12-x) & 12) + (x & 1)", Some(false)),
             ("((x << 1) ^ 7) - (x ^ 3)*2 + (y & 1)", Some(false)),
-            ("select(x <s 0, 3, 0) + select(x <s 0, 4, 0) - select(x <s 0, 7, 0)", Some(true)),
+            (
+                "select(x <s 0, 3, 0) + select(x <s 0, 4, 0) - select(x <s 0, 7, 0)",
+                Some(true),
+            ),
             ("(x & y)*2 + (x ^ y) - (x | y)", Some(false)),
             ("x + y - (x & y)", Some(false)),
             ("x + y - (x & y)*2", Some(false)),
@@ -2506,7 +2886,10 @@ mod tests {
         ] {
             let e = cx.parse(text, &ParseOptions::width(w)).unwrap();
             let i = cx.id(e).unwrap();
-            let mut work = Work { left: 4096, projections: Default::default() };
+            let mut work = Work {
+                left: 4096,
+                projections: Default::default(),
+            };
             let s = columns(&cx, i, &mut parts, &mut work);
             assert_eq!(s.as_ref().map(|s| s.mask == 0), constant, "{text}");
             if let Some(s) = s {
@@ -2514,12 +2897,19 @@ mod tests {
                 for x in 0..16 {
                     for y in 0..16 {
                         let env = FnEnv(|key: &SymbolKey, w| {
-                            let v = if matches!(key, SymbolKey::Str(name) if name.as_ref() == "x") { x } else { y };
+                            let v = if matches!(key, SymbolKey::Str(name) if name.as_ref() == "x") {
+                                x
+                            } else {
+                                y
+                            };
                             Some(BitVec::wrapping_from_u64(w, v))
                         });
                         let v = cx.eval(&[e, cx.handle(source)], &env).unwrap();
                         let word = v[1].to_u64().unwrap();
-                        assert_eq!(v[0].to_u64(), Some((s.bias + ((word ^ s.flip) & s.mask)) & 15));
+                        assert_eq!(
+                            v[0].to_u64(),
+                            Some((s.bias + ((word ^ s.flip) & s.mask)) & 15)
+                        );
                     }
                 }
             }
@@ -2531,14 +2921,22 @@ mod tests {
     #[test]
     fn column_wire_may_hold_only_in_a_prefix() {
         let mut cx = Context::new();
-        let e = cx.parse("(x & 3)*3 - (x & 3)*2 + (y & 1)*16", &ParseOptions::width(Width::W8)).unwrap();
+        let e = cx
+            .parse(
+                "(x & 3)*3 - (x & 3)*2 + (y & 1)*16",
+                &ParseOptions::width(Width::W8),
+            )
+            .unwrap();
         let i = cx.id(e).unwrap();
         let mut parts = Vec::new();
         let mut work = Work::new(4096);
         let low = columns_low(&cx, i, 4, &mut parts, &mut work).unwrap();
         assert_eq!((low.mask, low.flip, low.bias), (3, 0, 0));
         for bits in [0, 5, 8, 9] {
-            assert!(columns_low(&cx, i, bits, &mut parts, &mut work).is_none(), "{bits}");
+            assert!(
+                columns_low(&cx, i, bits, &mut parts, &mut work).is_none(),
+                "{bits}"
+            );
         }
     }
 
@@ -2546,14 +2944,19 @@ mod tests {
     fn shared_cut_survives_arithmetic_and_boolean_readers() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W8);
-        let e = cx.parse("let s = x + 7; s - (s & 45)*3 + (s & 45) + 45", &opt).unwrap();
+        let e = cx
+            .parse("let s = x + 7; s - (s & 45)*3 + (s & 45) + 45", &opt)
+            .unwrap();
         let s = cx.parse("x + 7", &opt).unwrap();
         let (i, s) = (cx.id(e).unwrap(), cx.id(s).unwrap());
         let mut parts = Vec::new();
         let mut work = Work::new(4096);
         assert!(columns_low(&cx, i, 8, &mut parts, &mut work).is_none());
         let wire = columns_cut(&cx, i, 8, s, &mut parts, &mut work).unwrap();
-        assert_eq!((wire.source, wire.mask, wire.flip, wire.bias), (ColumnSource::Word(s), 255, 45, 0));
+        assert_eq!(
+            (wire.source, wire.mask, wire.flip, wire.bias),
+            (ColumnSource::Word(s), 255, 45, 0)
+        );
     }
 
     #[test]
@@ -2564,12 +2967,19 @@ mod tests {
             (0b0101, 0b0001, 0b0100, (0b0001, 0b0100)),
             (0b0101, 0b0011, 0b0010, (0b0011, 0b0010)),
         ] {
-            let word = ColumnSum { source: ColumnSource::Word(0), mask, flip, bias };
+            let word = ColumnSum {
+                source: ColumnSource::Word(0),
+                mask,
+                flip,
+                bias,
+            };
             let offsets = word.offsets(15);
             assert_eq!(offsets, expected);
             for x in 0..16 {
-                assert_eq!((bias + ((x & mask) ^ flip)) & 15,
-                           (offsets.1 + ((x & mask) ^ offsets.0)) & 15);
+                assert_eq!(
+                    (bias + ((x & mask) ^ flip)) & 15,
+                    (offsets.1 + ((x & mask) ^ offsets.0)) & 15
+                );
             }
         }
     }
@@ -2579,7 +2989,10 @@ mod tests {
         let mut cx = Context::new();
         let w = Width::new(4).unwrap();
         let mut parts = Vec::new();
-        let mut work = Work { left: 4096, projections: Default::default() };
+        let mut work = Work {
+            left: 4096,
+            projections: Default::default(),
+        };
         for (text, bias) in [
             ("(x & 3)*3 - (x & 3)*2 + (~x & 12)", Some(0)),
             // The carry is not a wire: the offset must remain an addition.
@@ -2587,7 +3000,10 @@ mod tests {
             ("(x & 3)*3 - (x & 3)*2 + (~y & 12)", None),
             ("(x & 3)*5 - (x & 3)*2 + (~x & 12)", None),
             // Both shift halves and their masks read one rotated word.
-            ("let h = x << 1; let l = x >>u 3; (h | l) + (h & l)*5 + (~h & ~l)*2", Some(15)),
+            (
+                "let h = x << 1; let l = x >>u 3; (h | l) + (h & l)*5 + (~h & ~l)*2",
+                Some(15),
+            ),
             ("(x << 1) + (x >>u 3)", Some(0)),
             ("(x << 1) + (x >>u 2)", None),
         ] {

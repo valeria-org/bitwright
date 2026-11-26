@@ -408,9 +408,10 @@ fn mul_constant_unfactored(g: &mut Aig, a: &[L], constant: &[L]) -> Bits {
             accumulate_product_row(g, &mut acc[shift..], a.iter().copied(), negative);
         }
     } else {
-        let mut shifts = constant.iter().enumerate().filter_map(|(i, &bit)| {
-            (bit == TRUE).then_some(i)
-        });
+        let mut shifts = constant
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &bit)| (bit == TRUE).then_some(i));
         if let Some(first) = shifts.next() {
             acc[first..].copy_from_slice(&a[..a.len() - first]);
         }

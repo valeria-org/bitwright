@@ -269,12 +269,17 @@ fn runs(bits: &[Prov]) -> Vec<Run> {
     out
 }
 
-fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Option<u32>, Stop> {
+fn emit(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    owner: u32,
+    bits: &[Prov],
+) -> Result<(Option<u32>, Fin), Stop> {
     let w = bits.len() as u16;
     let width = crate::Width::new(w).map_err(|e| Stop::Error(e.into()))?;
     let rs = runs(bits);
     if rs.len() > MAX_PIECES {
-        return Ok(None);
+        return Ok((None, Fin::FINAL));
     }
     // A whole source, possibly rotated or byte-swapped.
     if let Some(Prov::Bit(s, _)) = bits.first()
@@ -290,22 +295,24 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Optio
         let k = (wu - j(0)) % wu;
         if (0..wu).all(|i| j(i) == (i + wu - k) % wu) {
             if k == 0 {
-                return Ok(Some(s));
+                return Ok((Some(s), Fin::FINAL));
             }
             let kv = BitVec::wrapping_from_u64(width, k as u64);
-            return r
-                .build(cx, |cx| {
-                    let kc = cx.mk_const(&kv)?;
-                    cx.c_bin(BinOp::RotL, s, kc)
-                })
-                .map(Some);
+            let rot = r.build(cx, |cx| {
+                let kc = cx.mk_const(&kv)?;
+                cx.c_bin(BinOp::RotL, s, kc)
+            })?;
+            return Ok((Some(rot), Fin::FINAL));
         }
         if w.is_multiple_of(8) && (0..wu).all(|i| j(i) == (wu / 8 - 1 - i / 8) * 8 + i % 8) {
-            return r.build(cx, |cx| cx.c_un(UnOp::Bswap, s)).map(Some);
+            let bs = r.build(cx, |cx| cx.c_un(UnOp::Bswap, s))?;
+            return Ok((Some(bs), Fin::FINAL));
         }
     }
     // One source in place with some bits constant: `(s & ~zeros) | ones`, smaller than any
-    // concat of its runs.
+    // concat of its runs. Strip any constant bit masks already implied by `known(s)` so nested
+    // aligned slice-and-shift idioms (`zext<W>(extract<k, W - k>(x)) << k`) collapse directly
+    // to `x` in one bottom-up pass when `x`'s low `k` bits are already known zero.
     if let Some(Prov::Bit(s, _)) = bits.iter().find(|p| matches!(p, Prov::Bit(..)))
         && cx.node(*s).width == w
         && bits
@@ -323,22 +330,38 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Optio
                 },
             )
         };
-        let (zeros, ones) = (mask(Prov::Zero), mask(Prov::One));
+        let (mut zeros, mut ones) = (mask(Prov::Zero), mask(Prov::One));
+        let mut fin = Fin::FINAL;
+        if (!zeros.is_zero() || !ones.is_zero())
+            && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(owner)))
+            && let (Some(kb), kfin) = super::known(r, cx, s)?
+        {
+            let next_zeros =
+                crate::facts::known::bv_and(&zeros, &crate::facts::known::bv_not(&kb.known_zero()));
+            let next_ones =
+                crate::facts::known::bv_and(&ones, &crate::facts::known::bv_not(&kb.known_one()));
+            if next_zeros != zeros || next_ones != ones {
+                zeros = next_zeros;
+                ones = next_ones;
+                fin = fin.and(kfin);
+            } else {
+                fin = fin.and(kfin.unchanged());
+            }
+        }
         r.meter.charge(Counter::PassWork, u64::from(w))?;
-        return r
-            .build(cx, |cx| {
-                let mut x = s;
-                if !zeros.is_zero() {
-                    let c = cx.mk_const(&crate::facts::known::bv_not(&zeros))?;
-                    x = cx.c_bin(BinOp::And, x, c)?;
-                }
-                if !ones.is_zero() {
-                    let c = cx.mk_const(&ones)?;
-                    x = cx.c_bin(BinOp::Or, x, c)?;
-                }
-                Ok(x)
-            })
-            .map(Some);
+        let built = r.build(cx, |cx| {
+            let mut x = s;
+            if !zeros.is_zero() {
+                let c = cx.mk_const(&crate::facts::known::bv_not(&zeros))?;
+                x = cx.c_bin(BinOp::And, x, c)?;
+            }
+            if !ones.is_zero() {
+                let c = cx.mk_const(&ones)?;
+                x = cx.c_bin(BinOp::Or, x, c)?;
+            }
+            Ok(x)
+        })?;
+        return Ok((Some(built), fin));
     }
     // A concat of the runs, high first.
     let mut acc: Option<u32> = None;
@@ -362,7 +385,7 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, bits: &[Prov]) -> Result<Optio
         });
     }
     r.meter.check()?;
-    Ok(acc)
+    Ok((acc, Fin::FINAL))
 }
 
 /// Strip a redundant `& (w - 1)` mask from a rotation count at a power-of-two width `w`.
@@ -486,6 +509,7 @@ fn var_rotate(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
     let fin = f1.and(f2);
     let before = cx.len() as u32;
     let neg_s2 = r.build(cx, |cx| cx.c_un(UnOp::Neg, s2))?;
+    #[cfg_attr(not(feature = "mba"), allow(unused_mut))]
     let mut complementary = super::poly::equal_mod(r, cx, s1, neg_s2, logw)?;
     #[cfg(feature = "mba")]
     if !complementary {
@@ -589,7 +613,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         return Ok(Step::Normal(Fin::FINAL));
     }
     let before = cx.len() as u32;
-    let Some(e) = emit(r, cx, &bits)? else {
+    let (Some(e), emit_fin) = emit(r, cx, n, &bits)? else {
         return Ok(Step::Normal(Fin::FINAL));
     };
     r.explain_with(|| crate::engine::Explanation::Shuffle {
@@ -617,7 +641,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         e,
         before,
         &atoms,
-        Fin::FINAL,
+        emit_fin,
         tie,
     )
 }
@@ -637,7 +661,7 @@ fn zext_slice(cx: &Context, e: u32) -> bool {
     s.op == OpCode::Extract && cx.wid(s.a) != z.width
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove"))]
 mod extra_tests {
     use crate::{Context, ParseOptions, Width};
 

@@ -1285,6 +1285,28 @@ fn rotation(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, St
         return Ok(Step::Normal(Fin::FINAL));
     }
     r.meter.charge(Counter::PassWork, 1)?;
+    // Exact integer-complement shifts `a + b == W` (mod `2^W`, with `W >= 2` power-of-two):
+    // whenever `a <=_u W` (including `a == 0, b == W` where `x >>u W == 0`), both `(x << a) |
+    // (x >>u b)` and `(x << a) ^ (x >>u b)` equal `rotl(x, a)` identically; and symmetrically
+    // `rotr(x, b)` when `b <=_u W`.
+    let width = cx.width_of(n);
+    let w_bv = BitVec::wrapping_from_u64(width, u64::from(w));
+    if super::shift_count_sum(cx, a, b, width) == Some(w_bv) {
+        let (fa, ga) = super::facts(r, cx, a)?;
+        if fa.is_some_and(|f| !BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &w_bv, &f.urange.hi()))
+        {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_bin(BinOp::RotL, x, a))?;
+            return finish(r, cx, PassKind::Bitwise, n, e, before, &[x, a], ga);
+        }
+        let (fb, gb) = super::facts(r, cx, b)?;
+        if fb.is_some_and(|f| !BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &w_bv, &f.urange.hi()))
+        {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_bin(BinOp::RotR, x, b))?;
+            return finish(r, cx, PassKind::Bitwise, n, e, before, &[x, b], gb);
+        }
+    }
     // Both counts below the width.
     let bits = w.trailing_zeros() as u16;
     let mut fin = Fin::FINAL;
@@ -1385,7 +1407,9 @@ fn hoist_cast(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
                 for &i in &b_seen {
                     let li = cx.node(i);
                     if let Some(c) = cx.const_val(i) {
-                        let t = c.trunc(crate::Width::W1).map_err(|e| Stop::Error(e.into()))?;
+                        let t = c
+                            .trunc(crate::Width::W1)
+                            .map_err(|e| Stop::Error(e.into()))?;
                         bit_map.insert(i, r.build(cx, |cx| cx.mk_const(&t))?);
                     } else if matches!(li.op, OpCode::Zext | OpCode::Sext) && cx.wid(li.a) == 1 {
                         bit_map.insert(i, li.a);
@@ -1714,8 +1738,201 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     if op == OpCode::Select {
         let node = cx.node(n);
         let (a, t, f) = (node.a, node.b, node.c);
+        let an = cx.node(a);
+        // Guard-implied constant arm: `select(x == k, x, f) -> select(x == k, k, f)` and
+        // `select(x != k, t, x) -> select(x != k, t, k)` for constant `k`.
+        if an.op == OpCode::Eq && !cx.is_const(t) {
+            let k_opt = if an.a == t && cx.is_const(an.b) {
+                Some(an.b)
+            } else if an.b == t && cx.is_const(an.a) {
+                Some(an.a)
+            } else {
+                None
+            };
+            if let Some(k) = k_opt {
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| cx.c_select(a, k, f))?;
+                let mut stops = Vec::with_capacity(2);
+                for id in [a, f] {
+                    if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        } else if an.op == OpCode::Ne && !cx.is_const(f) {
+            let k_opt = if an.a == f && cx.is_const(an.b) {
+                Some(an.b)
+            } else if an.b == f && cx.is_const(an.a) {
+                Some(an.a)
+            } else {
+                None
+            };
+            if let Some(k) = k_opt {
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| cx.c_select(a, t, k))?;
+                let mut stops = Vec::with_capacity(2);
+                for id in [a, t] {
+                    if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
         let tn = cx.node(t);
         let fn_ = cx.node(f);
+        // Nested identical or complementary guard subsumption:
+        // `select(a, select(a, tb, fb), f) -> select(a, tb, f)`,
+        // `select(a, select(~a, tb, fb), f) -> select(a, fb, f)`,
+        // `select(a, t, select(a, tb, fb)) -> select(a, t, fb)`,
+        // `select(a, t, select(~a, tb, fb)) -> select(a, t, tb)`.
+        let subsumed = if tn.op == OpCode::Select && tn.a == a {
+            Some((tn.b, f))
+        } else if tn.op == OpCode::Select && complementary_conds(cx, a, tn.a) {
+            Some((tn.c, f))
+        } else if fn_.op == OpCode::Select && fn_.a == a {
+            Some((t, fn_.c))
+        } else if fn_.op == OpCode::Select && complementary_conds(cx, a, fn_.a) {
+            Some((t, fn_.b))
+        } else {
+            None
+        };
+        if let Some((nt, nf)) = subsumed {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_select(a, nt, nf))?;
+            let mut stops = Vec::with_capacity(3);
+            for id in [a, nt, nf] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )? {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        }
+        // Hoist shared bitwise operations out of `Select` arms:
+        // - `select(a, ~x, ~y) -> ~select(a, x, y)`
+        // - `select(a, x bop z, y bop z) -> select(a, x, y) bop z` for `bop ∈ {And, Or, Xor}`
+        // Strict reduction in tree size (`>= 2`), unifying split-guard `Select` cones with
+        // an existing `select(a, x, y)` node.
+        if tn.op == OpCode::Not && fn_.op == OpCode::Not {
+            let (x, y) = (tn.a, fn_.a);
+            let sel_exists = cx
+                .find(&crate::expr::Node::new(OpCode::Select, node.width, a, x, y))
+                .is_some();
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let s = cx.c_select(a, x, y)?;
+                cx.c_un(UnOp::Not, s)
+            })?;
+            let mut stops = Vec::with_capacity(3);
+            for id in [a, x, y] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                sel_exists,
+            )? {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        } else if tn.op == fn_.op
+            && let Some(bop) = match tn.op {
+                OpCode::And => Some(BinOp::And),
+                OpCode::Or => Some(BinOp::Or),
+                OpCode::Xor => Some(BinOp::Xor),
+                _ => None,
+            }
+        {
+            let shared = if tn.b == fn_.b {
+                Some((tn.a, fn_.a, tn.b))
+            } else if tn.a == fn_.a {
+                Some((tn.b, fn_.b, tn.a))
+            } else if tn.a == fn_.b {
+                Some((tn.b, fn_.a, tn.a))
+            } else if tn.b == fn_.a {
+                Some((tn.a, fn_.b, tn.b))
+            } else {
+                None
+            };
+            if let Some((x, y, z)) = shared {
+                let sel_exists = cx
+                    .find(&crate::expr::Node::new(OpCode::Select, node.width, a, x, y))
+                    .is_some();
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| {
+                    let s = cx.c_select(a, x, y)?;
+                    cx.c_bin(bop, s, z)
+                })?;
+                let mut stops = Vec::with_capacity(4);
+                for id in [a, x, y, z] {
+                    if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    sel_exists,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
         let diamond = if tn.op == OpCode::Select && tn.b == f {
             Some((0u8, t, tn.a, tn.c, f))
         } else if tn.op == OpCode::Select && tn.c == f {
@@ -1761,7 +1978,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             let tie = cx.meta[n as usize].tree != u32::MAX
                 && cx.meta[e as usize].tree < cx.meta[n as usize].tree;
             let slack = if tie && inner_once { 2 } else { u32::from(tie) };
-            return super::finish_within(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, slack);
+            return super::finish_within(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                slack,
+            );
         }
     }
     if !bitwise_op(op) {
@@ -1927,6 +2154,43 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
         }
     }
+    if matches!(op, OpCode::And | OpCode::Or) {
+        let node = cx.node(n);
+        let (na, nb) = (cx.node(node.a), cx.node(node.b));
+        let shift_simp = if op == OpCode::And {
+            if super::complementary_shift_disjoint(cx, node.a, node.b) {
+                Some(None)
+            } else if na.op == OpCode::Not && super::complementary_shift_disjoint(cx, na.a, node.b)
+            {
+                Some(Some(node.b))
+            } else if nb.op == OpCode::Not && super::complementary_shift_disjoint(cx, node.a, nb.a)
+            {
+                Some(Some(node.a))
+            } else {
+                None
+            }
+        } else if na.op == OpCode::Not && super::complementary_shift_disjoint(cx, na.a, node.b) {
+            Some(Some(node.a))
+        } else if nb.op == OpCode::Not && super::complementary_shift_disjoint(cx, node.a, nb.a) {
+            Some(Some(node.b))
+        } else {
+            None
+        };
+        if let Some(target) = shift_simp {
+            let before = cx.len() as u32;
+            let (e, stops): (u32, Vec<u32>) = match target {
+                None => {
+                    let z = BitVec::zero(cx.width_of(n));
+                    (r.build(cx, |cx| cx.mk_const(&z))?, Vec::new())
+                }
+                Some(keep) => (keep, vec![keep]),
+            };
+            match finish(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL)? {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        }
+    }
     if op == OpCode::And {
         let node = cx.node(n);
         // `(x | c_or) & c_and -> (x & (c_and & ~c_or)) | (c_or & c_and)` when `c_or & c_and != 0`.
@@ -2002,8 +2266,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 if kc < before {
                     stops.push(kc);
                 }
-                match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, kfin, true)?
-                {
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    kfin,
+                    true,
+                )? {
                     Step::Normal(f) => pre_fin = pre_fin.and(f),
                     done => return Ok(done),
                 }
@@ -2080,8 +2353,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             let mut stops = tri.to_vec();
             stops.sort_unstable();
             stops.dedup();
-            match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, true)?
-            {
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )? {
                 Step::Normal(_) => {}
                 done => return Ok(done),
             }
@@ -2104,8 +2386,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     stops.push(id);
                 }
             }
-            match super::finish_with(r, cx, PassKind::Bitwise, n, e, before, &stops, Fin::FINAL, true)?
-            {
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )? {
                 Step::Normal(f) => pre_fin = pre_fin.and(f),
                 done => return Ok(done),
             }
@@ -2113,9 +2404,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     if matches!(op, OpCode::Or | OpCode::Xor) {
         let node = cx.node(n);
-        if let Some(step) =
-            merge_complementary_arms(r, cx, PassKind::Bitwise, n, node.a, node.b)?
-        {
+        if let Some(step) = merge_complementary_arms(r, cx, PassKind::Bitwise, n, node.a, node.b)? {
             match step {
                 Step::Normal(f) => pre_fin = pre_fin.and(f),
                 done => return Ok(done),

@@ -143,9 +143,7 @@ fn one_atom_multi_constant_bitwise_reduction() {
         .parse(&format!("(x | {c:#x}) & ((x & {c:#x}) ^ {m:#x})"), &o)
         .unwrap();
     // When `c & !m == 0`, `(x | c) & ((x & c) ^ m) == (x & m) ^ c` (shrinks 7 nodes -> 5 nodes).
-    let expected_raw = cx
-        .parse(&format!("(x & {m:#x}) ^ {c:#x}"), &o)
-        .unwrap();
+    let expected_raw = cx.parse(&format!("(x & {m:#x}) ^ {c:#x}"), &o).unwrap();
     let engine = build_engine(false, false);
     let out = simplify_fuel(&engine, &mut cx, e, 1 << 15);
     let expected = simplify_fuel(&engine, &mut cx, expected_raw, 1 << 15);
@@ -286,8 +284,14 @@ fn separable_sum_fast_path_skips_whole_sum_nonlinear_mba_and_simplifies_clusters
     assert_bitblasted_equal(&mut cx, e, out);
 
     let plus_one = cx.parse(&format!("({src}) + 1"), &o).unwrap();
-    let verdict = mba::equal(&mut cx, out, plus_one, &MbaLimits::default(), &MbaBudget::default())
-        .expect("mba::equal");
+    let verdict = mba::equal(
+        &mut cx,
+        out,
+        plus_one,
+        &MbaLimits::default(),
+        &MbaBudget::default(),
+    )
+    .expect("mba::equal");
     assert_ne!(verdict, Verdict::Proved);
 }
 
@@ -399,7 +403,10 @@ fn multi_term_carry_cancel_and_concat_zext_condition() {
     let engine = build_engine(false, false);
 
     let eq1 = cx
-        .parse("((a + b + c + d) <u (b + d)) == (~(b + d) <u (a + c))", &o16)
+        .parse(
+            "((a + b + c + d) <u (b + d)) == (~(b + d) <u (a + c))",
+            &o16,
+        )
         .unwrap();
     let out1 = simplify_fuel(&engine, &mut cx, eq1, 1 << 15);
     assert_eq!(cx.view(out1).unwrap(), View::Const(BitVec::ones(Width::W1)));
@@ -475,10 +482,7 @@ fn width_128_casts_and_compares_consts_never_panic() {
 
     // `one_value` substituting `x & 255` at width 128 when `extract<0, 8>(x) == 5` (`5 + 10 == 5 * 3`).
     let e3 = cx
-        .parse(
-            "select(extract<0, 8>(x) == 5:8, 15, (x & 255) * 3)",
-            &o128,
-        )
+        .parse("select(extract<0, 8>(x) == 5:8, 15, (x & 255) * 3)", &o128)
         .unwrap();
     let r3 = simplify_fuel(&engine, &mut cx, e3, 1 << 15);
     let exp3 = cx.parse("(x & 255) * 3", &o128).unwrap();
@@ -521,10 +525,7 @@ fn mba_chained_peer_solved_and_opposite_sign_product_atoms() {
 
     let mut cx_small = Context::new();
     let e_core = cx_small
-        .parse(
-            "let m = (u ^ 3) | 1; ((x + 0xfe) * m) + ((2 - x) * m)",
-            &o8,
-        )
+        .parse("let m = (u ^ 3) | 1; ((x + 0xfe) * m) + ((2 - x) * m)", &o8)
         .unwrap();
     let r_core = simplify_fuel(&engine, &mut cx_small, e_core, 1 << 16);
     assert_eq!(
@@ -628,7 +629,10 @@ fn p1_and_p2_identities_demorgan_cofactor_borrow_free_sub_demanded_and_compares(
             (g1 * (m & 3) + g2 * 3 + 3) + ((b0 ^ 0x8041) * v - (0x8041 - b0) * v)";
         let ez = cx.parse(zero_src, &o16).unwrap();
         let out_z = simplify_fuel(&engine, &mut cx, ez, 1 << 18);
-        assert_eq!(cx.view(out_z).unwrap(), View::Const(BitVec::zero(Width::W16)));
+        assert_eq!(
+            cx.view(out_z).unwrap(),
+            View::Const(BitVec::zero(Width::W16))
+        );
         assert_bitblasted_equal(&mut cx, ez, out_z);
     }
 
@@ -688,16 +692,28 @@ fn p1_and_p2_identities_demorgan_cofactor_borrow_free_sub_demanded_and_compares(
         assert_bitblasted_equal(&mut cx, e_bmul, r_bmul);
 
         let eq_ult = cx
-            .parse("((b + d) <u (a + b + c + d)) == ((b + d) <u -(a + c))", &o16)
+            .parse(
+                "((b + d) <u (a + b + c + d)) == ((b + d) <u -(a + c))",
+                &o16,
+            )
             .unwrap();
         let r_ult = simplify_fuel(&engine, &mut cx, eq_ult, 1 << 15);
-        assert_eq!(cx.view(r_ult).unwrap(), View::Const(BitVec::ones(Width::W1)));
+        assert_eq!(
+            cx.view(r_ult).unwrap(),
+            View::Const(BitVec::ones(Width::W1))
+        );
 
         let eq_ule = cx
-            .parse("((a + b + c + d) <=u (b + d)) == (-(a + c) <=u (b + d))", &o16)
+            .parse(
+                "((a + b + c + d) <=u (b + d)) == (-(a + c) <=u (b + d))",
+                &o16,
+            )
             .unwrap();
         let r_ule = simplify_fuel(&engine, &mut cx, eq_ule, 1 << 15);
-        assert_eq!(cx.view(r_ule).unwrap(), View::Const(BitVec::ones(Width::W1)));
+        assert_eq!(
+            cx.view(r_ule).unwrap(),
+            View::Const(BitVec::ones(Width::W1))
+        );
 
         let e_lin_eq = cx.parse("(x * 3 + 5) == (x + 9)", &o16).unwrap();
         let r_lin_eq = simplify_fuel(&engine, &mut cx, e_lin_eq, 1 << 15);
@@ -930,13 +946,13 @@ fn xor_complement_zext_peers_nonzero_select_facts_and_bit_table_multi_carry() {
     {
         let mut cx = Context::new();
         let o8 = ParseOptions::width(Width::W8);
-        let e_mask = cx
-            .parse("(x & 18) * 12 + (y - x) * 6 + 0x90", &o8)
-            .unwrap();
+        let e_mask = cx.parse("(x & 18) * 12 + (y - x) * 6 + 0x90", &o8).unwrap();
         let r_mask = simplify_fuel(&engine, &mut cx, e_mask, 1 << 15);
         assert_bitblasted_equal(&mut cx, e_mask, r_mask);
 
-        let e_disj = cx.parse("(x & 0x50) * 3 - (x & 0x0a) * 3 + 7", &o8).unwrap();
+        let e_disj = cx
+            .parse("(x & 0x50) * 3 - (x & 0x0a) * 3 + 7", &o8)
+            .unwrap();
         let r_disj = simplify_fuel(&engine, &mut cx, e_disj, 1 << 15);
         assert_bitblasted_equal(&mut cx, e_disj, r_disj);
 
@@ -1187,7 +1203,9 @@ fn opaque_predicate_48_leaf_low_cone_boundary_no_panic() {
     let mut cx = Context::new();
     let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
     let solver: Arc<dyn MbaSolver> = Arc::new(NormalFormSolver::new(
-        NfOptions::default().with_memo(1 << 14).with_basis_sums(true),
+        NfOptions::default()
+            .with_memo(1 << 14)
+            .with_basis_sums(true),
     ));
     let strat = Strategy::deobfuscate().with_mba(
         MbaConfig::default()
@@ -1363,15 +1381,15 @@ fn popcnt_boundary_comparisons_and_carry_out_canonicalization() {
         let w = Width::new(bits).unwrap();
         let opt = ParseOptions::width(w);
         let cases = [
-            (format!("popcnt(x) == 0"), "x == 0"),
-            (format!("popcnt(x) != 0"), "x != 0"),
-            (format!("popcnt(x) <=u 0"), "x == 0"),
-            (format!("0 <u popcnt(x)"), "x != 0"),
+            ("popcnt(x) == 0".to_string(), "x == 0"),
+            ("popcnt(x) != 0".to_string(), "x != 0"),
+            ("popcnt(x) <=u 0".to_string(), "x == 0"),
+            ("0 <u popcnt(x)".to_string(), "x != 0"),
             (format!("popcnt(x) == {bits}"), "x == -1"),
             (format!("popcnt(x) != {bits}"), "x != -1"),
             (format!("{bits} <=u popcnt(x)"), "x == -1"),
             (format!("popcnt(x) <u {bits}"), "x != -1"),
-            (format!("zext<256>(popcnt(x)) == 0"), "x == 0"),
+            ("zext<256>(popcnt(x)) == 0".to_string(), "x == 0"),
             (format!("zext<256>(popcnt(x)) == {bits}"), "x == -1"),
         ];
         for (lhs_s, rhs_s) in &cases {
@@ -1465,7 +1483,9 @@ fn popcnt_boundary_comparisons_and_carry_out_canonicalization() {
         let %21 = select(%4, %20, select(%9, select(%10, 0x100140c78000:64, 0x10003ca5b105), (#2 ^ 0xffffcffe00001320) & 0x3001fffff127)); \
         trunc<32>(select(%0, select(%1, select(%0, %11, select(%8, %6, #13 ^ 4384)), 0xbe72ae97bd890331), select(%0, 0xff87711c16c68690, %11)) * 0x891d0a3f15ef3bdb + (%14 & 0xffffcffe00001320) * 0x76e2f5c0ea10c425 + (%17 & 0xffffcffe00001320) * 0x891d0a3f15ef3bdb + ~(%17 & 0x3001ffffecdf) * 0x891d0a3f15ef3bdb + (~(%16 & 0xffffcffe00001320) & (~select(%0, select(%1, select(%0, %19, select(%8, %18, #13 & 0x3001ffffecdf)), 0x2001bd890011), select(%0, 0x300016c68490, %19)) & 0xffffcffe00000ed8) | select(%0, select(%1, select(%0, %21, select(%8, %20, (#13 ^ 0xffffcffe00001320) & 0x3001fffff127)), 0x2001bd890121), select(%0, 0x300016c68000, %21))) * 0x76e2f5c0ea10c425 + (%16 & -4385) * 0x891d0a3f15ef3bdb) * 0x7c05bb0";
     let mut cx = Context::new();
-    let e_const = cx.parse(src_const, &ParseOptions::width(Width::W64)).unwrap();
+    let e_const = cx
+        .parse(src_const, &ParseOptions::width(Width::W64))
+        .unwrap();
     let out_const = simplify_fuel(&engine, &mut cx, e_const, 524_288);
     assert_eq!(
         cx.as_const(out_const).unwrap(),
@@ -1504,4 +1524,330 @@ fn prove_too_large_compact_retry_shares_sums() {
         matches!(out, Outcome::Proved(_)),
         "expected compact retry to share sum prefixes under tight max_nodes and prove equality, got {out:?}"
     );
+}
+
+#[test]
+fn cse_share_sums_compresses_multi_round_overlapping_add_chains() {
+    // Multi-round iterative state words sharing a 24-term common sub-sum with distinct front
+    // summands (`front_r + t0 + ... + t23`) across 12 rounds (`288 >= 128` `Add` nodes):
+    // pre-blasting `cse::share_sums` must compress the AIG by >4x while proving exact equivalence
+    // against an explicitly factored reference across narrow, 64-bit, and wide widths.
+    for bits in [8u16, 16, 64, 128] {
+        let mut cx = Context::new();
+        let w = Width::new(bits).unwrap();
+        let terms: Vec<_> = (0..24)
+            .map(|i| cx.symbol(format!("t{i}"), w).unwrap())
+            .collect();
+        let mut shared_tail = terms[0];
+        for &t in &terms[1..] {
+            shared_tail = cx.bin(bitwright::BinOp::Add, shared_tail, t).unwrap();
+        }
+        let mut unshared_rounds = Vec::new();
+        let mut shared_rounds = Vec::new();
+        for r in 0..12 {
+            let front = cx.symbol(format!("f{r}"), w).unwrap();
+            let mut acc = front;
+            for &t in &terms {
+                acc = cx.bin(bitwright::BinOp::Add, acc, t).unwrap();
+            }
+            unshared_rounds.push(cx.bin(bitwright::BinOp::Xor, acc, front).unwrap());
+            let ref_acc = cx.bin(bitwright::BinOp::Add, front, shared_tail).unwrap();
+            shared_rounds.push(cx.bin(bitwright::BinOp::Xor, ref_acc, front).unwrap());
+        }
+        let mut lhs = unshared_rounds[0];
+        let mut rhs = shared_rounds[0];
+        for r in 1..12 {
+            lhs = cx
+                .bin(bitwright::BinOp::Xor, lhs, unshared_rounds[r])
+                .unwrap();
+            rhs = cx
+                .bin(bitwright::BinOp::Xor, rhs, shared_rounds[r])
+                .unwrap();
+        }
+        let zero = cx.constant(&BitVec::zero(w)).unwrap();
+        let nz = cx.cmp(bitwright::CmpOp::Ne, lhs, zero).unwrap();
+
+        let cfg_unshared = ProveConfig::default()
+            .with_simplify(false)
+            .with_shared_sums(false)
+            .with_certificate(true)
+            .with_samples(0)
+            .with_max_conflicts(0);
+        let q_unshared = prove::Question::valid(&mut cx, nz, &cfg_unshared).unwrap();
+
+        let cfg_shared = ProveConfig::default()
+            .with_simplify(false)
+            .with_shared_sums(false)
+            .with_certificate(false)
+            .with_samples(0)
+            .with_max_conflicts(0);
+        let q_shared = prove::Question::valid(&mut cx, nz, &cfg_shared).unwrap();
+
+        assert!(
+            q_shared.stats().nodes * 4 < q_unshared.stats().nodes,
+            "width {bits}: expected >4x AIG compression on overlapping sums, got {} -> {}",
+            q_unshared.stats().nodes,
+            q_shared.stats().nodes
+        );
+
+        let cfg_eq = ProveConfig::default()
+            .with_simplify(false)
+            .with_shared_sums(false)
+            .with_certificate(false);
+        let out_eq = prove::equal(&mut cx, lhs, rhs, &cfg_eq).unwrap();
+        assert!(
+            matches!(out_eq, Outcome::Proved(_)),
+            "width {bits}: expected Proved for shared-sum equivalence, got {out_eq:?}"
+        );
+    }
+}
+
+#[test]
+fn complementary_shift_disjoint_and_rotation_across_widths() {
+    let engine = build_engine(true, true);
+    for bits in [8u16, 16, 32, 64, 128] {
+        let mut cx = Context::new();
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let mask = bits - 2;
+
+        // `~(x << s) & (x >>u (W - s)) == x >>u (W - s)` and `~(x << s) | (x >>u (W - s)) == ~(x << s)`
+        // hold for every `s` (even unrestricted `s`, since `(s + (W - s)) mod 2^W == W >= W`).
+        let e_and = cx
+            .parse(
+                &format!("(~(x << s) & (x >>u ({bits} - s))) == (x >>u ({bits} - s))"),
+                &opt,
+            )
+            .unwrap();
+        let r_and = simplify_fuel(&engine, &mut cx, e_and, 1 << 14);
+        assert_eq!(
+            cx.view(r_and).unwrap(),
+            View::Const(BitVec::ones(Width::W1)),
+            "width {bits}: ~(x << s) & (x >>u (W - s)) should simplify to x >>u (W - s)"
+        );
+
+        let e_or = cx
+            .parse(
+                &format!("(~(x << s) | (x >>u ({bits} - s))) == ~(x << s)"),
+                &opt,
+            )
+            .unwrap();
+        let r_or = simplify_fuel(&engine, &mut cx, e_or, 1 << 14);
+        assert_eq!(
+            cx.view(r_or).unwrap(),
+            View::Const(BitVec::ones(Width::W1)),
+            "width {bits}: ~(x << s) | (x >>u (W - s)) should simplify to ~(x << s)"
+        );
+
+        // Bounded `0 <= s <= W` (`s = u & (W - 2)`): `(x << s) ^ (x >>u (W - s)) == rotl(x, s)`.
+        let e_rot = cx
+            .parse(
+                &format!("let s = u & {mask}; ((x << s) ^ (x >>u ({bits} - s))) == rotl(x, s)"),
+                &opt,
+            )
+            .unwrap();
+        let r_rot = simplify_fuel(&engine, &mut cx, e_rot, 1 << 14);
+        assert_eq!(
+            cx.view(r_rot).unwrap(),
+            View::Const(BitVec::ones(Width::W1)),
+            "width {bits}: (x << s) ^ (x >>u (W - s)) for s <= W should canonicalize to rotl(x, s)"
+        );
+        if bits <= 16 {
+            assert_bitblasted_equal(&mut cx, e_and, r_and);
+            assert_bitblasted_equal(&mut cx, e_or, r_or);
+            assert_bitblasted_equal(&mut cx, e_rot, r_rot);
+        }
+    }
+}
+
+#[test]
+fn guard_select_canonicalizations_and_inlined_conjunction_lifting() {
+    let engine = build_engine(true, true);
+    let prover = bitwright::prove::Simplifiers::new();
+    let o64 = ParseOptions::width(Width::W64);
+
+    // 1) Guard-implied zero arm (`select(z == 0, z, K)`) enabling 2-bit radix-4 `additive_select`
+    //    decomposition, plus nested complementary-guard select subsumption (`select(c, a, select(~c, b, d))`).
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let b0 = trunc<8>(x >>u 62) & 1 != 0; \
+            let z = x >>u 63; \
+            let s = select(b0, select(z != 0, 0xee9161f691b4787c:64, 0x4be34700aaec4856), select(z == 0, z, 0xa2ae1af5e6c83026)); \
+            s == select(b0, 0x4be34700aaec4856:64, 0) + select(z != 0, 0xa2ae1af5e6c83026:64, 0)";
+        let eq = cx.parse(src, &o64).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 14);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+        let src_comp = "\
+            let c1 = k == 0x85a4079a6c9c4636; \
+            let c2 = k != 0x85a4079a6c9c4636; \
+            select(c1, a, select(c2, b, select(c1, a, 0x12345678))) == select(c1, a, b)";
+        let eq_comp = cx.parse(src_comp, &o64).unwrap();
+        let out_comp = simplify_fuel(&engine, &mut cx, eq_comp, 1 << 14);
+        assert_eq!(
+            cx.view(out_comp).unwrap(),
+            View::Const(BitVec::ones(Width::W1))
+        );
+    }
+
+    // 2) Root negated-conjunction lifting (`preds = 0`) propagates `k == const` across sibling
+    //    nonlinear conjuncts without external `Assumptions`.
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let h0 = rotl(k ^ 0x9e3779b97f4a7c15, 17) * 0xbf58476d1ce4e5b9; \
+            let h1 = rotl(h0 + 0x94d049bb133111eb, 31) * 0x94d049bb133111eb; \
+            ~((y <u 100) & (k == 0x85a4079a6c9c4636) & (z != 0) & (h1 == 0xdeadbeefcafebabe))";
+        let goal = cx.parse(src, &o64).unwrap();
+        let cfg = ProveConfig::default()
+            .with_max_conflicts(50)
+            .with_max_propagations(500);
+        let res = bitwright::prove::valid_under_with(&mut cx, goal, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(res, Outcome::Proved(_)),
+            "expected Proved via root negated-conjunction guard lifting, got {res:?}"
+        );
+    }
+}
+
+#[test]
+fn wide_concat_slice_sampling_and_shared_sum_factoring() {
+    let engine = build_engine(true, true);
+    let prover = bitwright::prove::Simplifiers::new();
+    let o64 = ParseOptions::width(Width::W64);
+
+    // 1) Guarded counterexample witness search through 128-bit `extract<32, 64>(concat(hi:64, lo:64)) == K`
+    //    plus 64-bit tag equality `k == C`, refuting before bit-blasting even at tiny node caps.
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let tag_ok = k == 0x85a4079a6c9c4636; \
+            let derived_ok = (k ^ 0x85a4079a6c9c4600) == 0x36; \
+            let pair_ok = extract<32, 64>(concat(hi:64, lo:64)) == 0x0000000056474853; \
+            ~((a != 0) & tag_ok & derived_ok & pair_ok & ((u & 3) != 3))";
+        let goal = cx.parse(src, &o64).unwrap();
+        let cfg = ProveConfig::default()
+            .with_max_nodes(64)
+            .with_max_conflicts(10);
+        let res = bitwright::prove::valid_under_with(&mut cx, goal, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(res, Outcome::Refuted(_)),
+            "expected Refuted via wide-concat slice projection in word sampling, got {res:?}"
+        );
+    }
+
+    // 2) Shuffle in-place emission strips redundant known-zero low bits through products (`kb_mul`),
+    //    collapsing nested aligned `zext<W>(extract<8, W - 8>(...)) << 8` chains in one pass.
+    for bits in [16u16, 32, 64] {
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let hi_bits = bits - 8;
+        let mut cx = Context::new();
+        let src = format!(
+            "let m = ~x & 0x3400; \
+             let nested = zext<{bits}>(extract<8, {hi_bits}>((zext<{bits}>(extract<8, {hi_bits}>(y * m)) << 8) * 0x924d)) << 8; \
+             nested == y * m * 0x924d"
+        );
+        let eq = cx.parse(&src, &opt).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 14);
+        assert_eq!(
+            cx.view(out).unwrap(),
+            View::Const(BitVec::ones(Width::W1)),
+            "width {bits}: nested aligned extract-zext-shl over multiple of 256 should collapse"
+        );
+    }
+
+    // 3) Pre-blasting sub-sum & shared-constant multiplier factoring shrinks multi-use round
+    //    chains into smaller AIGs across widths while preserving exact bit-blasted equivalence.
+    for bits in [8u16, 16, 32, 64] {
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let mut prog_unfactored = String::new();
+        let mut prog_factored = String::new();
+        for i in 0..16 {
+            let decl = format!("let t{i} = rotl(x{i}, {}); ", (i % 7) + 1);
+            prog_unfactored.push_str(&decl);
+            prog_factored.push_str(&decl);
+        }
+        prog_unfactored.push_str(
+            "let s_mul = t0 * 55 + t1 * 55 + t2 * 55 + t3 * 55; \
+             let s_plain = t0 + t1 + t2 + t3; ",
+        );
+        prog_factored.push_str(
+            "let s_plain = t0 + t1 + t2 + t3; \
+             let s_mul = s_plain * 55; ",
+        );
+        let base_sum = (0..16)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        for r in 0..10 {
+            let front = r + 1;
+            let line = format!(
+                "let u{r} = rotl({front} + {base_sum} + s_mul + s_plain, {}); ",
+                (r % 5) + 1
+            );
+            prog_unfactored.push_str(&line);
+            prog_factored.push_str(&line);
+        }
+        let combine = (0..10)
+            .map(|r| format!("u{r}"))
+            .collect::<Vec<_>>()
+            .join(" ^ ");
+        prog_unfactored.push_str(&combine);
+        prog_factored.push_str(&combine);
+
+        let lhs = cx.parse(&prog_unfactored, &opt).unwrap();
+        let rhs = cx.parse(&prog_factored, &opt).unwrap();
+        let zero = cx.constant(&BitVec::zero(w)).unwrap();
+        let nz = cx.cmp(bitwright::CmpOp::Ne, lhs, zero).unwrap();
+
+        let q_raw = prove::Question::valid(
+            &mut cx,
+            nz,
+            &ProveConfig::default()
+                .with_simplify(false)
+                .with_shared_sums(false)
+                .with_certificate(true)
+                .with_samples(0)
+                .with_max_conflicts(0),
+        )
+        .unwrap();
+        let q_cse = prove::Question::valid(
+            &mut cx,
+            nz,
+            &ProveConfig::default()
+                .with_simplify(false)
+                .with_shared_sums(false)
+                .with_certificate(false)
+                .with_samples(0)
+                .with_max_conflicts(0),
+        )
+        .unwrap();
+        assert!(
+            q_cse.stats().nodes * 2 < q_raw.stats().nodes,
+            "width {bits}: expected >2x AIG compression from sub-sum + const-mul factoring, got {} -> {}",
+            q_raw.stats().nodes,
+            q_cse.stats().nodes
+        );
+
+        if bits == 8 {
+            let out_eq = prove::equal(
+                &mut cx,
+                lhs,
+                rhs,
+                &ProveConfig::default()
+                    .with_simplify(false)
+                    .with_shared_sums(false)
+                    .with_certificate(false),
+            )
+            .unwrap();
+            assert!(
+                matches!(out_eq, Outcome::Proved(_)),
+                "width {bits}: expected Proved for const-mul factoring equivalence, got {out_eq:?}"
+            );
+        }
+    }
 }

@@ -335,7 +335,10 @@ pub(super) fn sweep(
 /// word can expose two inverse rotations and fixed fields in *later* sums. In this
 /// walk a rotation is taken only when every bit is a wire (or its complement).
 fn large_affine(
-    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, order: &[u32],
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    order: &[u32],
 ) -> Result<Option<u32>, Stop> {
     let scan = order.len() as u64;
     let budget = (r.meter.left_in(|b| b.pass_work) / 2).min(1 << 18);
@@ -352,12 +355,18 @@ fn large_affine(
             if n.children().any(|c| {
                 let t = cx.node(c);
                 t.op == OpCode::Mul && cx.node(t.b).op == OpCode::Const
-            }) { weighted += 1; }
+            }) {
+                weighted += 1;
+            }
         } else {
-            for c in n.children().filter(|&c| add(cx.node(c).op)) { tops.insert(c, 0); }
+            for c in n.children().filter(|&c| add(cx.node(c).op)) {
+                tops.insert(c, 0);
+            }
         }
     }
-    if weighted < order.len() / 64 { return Ok(None); }
+    if weighted < order.len() / 64 {
+        return Ok(None);
+    }
     // Includes rebuilding, the memoized slice reads, and the final bounded size
     // check. Candidate walks and every row of their signatures are charged below.
     r.meter.charge(Counter::PassWork, 7 * scan)?;
@@ -372,40 +381,67 @@ fn large_affine(
             kids[j] = subs.get(c).unwrap_or(c);
             changed |= kids[j] != c;
         }
-        let mut cur = if changed { r.build(cx, |cx| cx.rebuild(i, kids))? } else { i };
-        if tops.contains(i) && let Some(e) = super::linear_mba::one_word(r, cx, cur, &mut left)? {
+        let mut cur = if changed {
+            r.build(cx, |cx| cx.rebuild(i, kids))?
+        } else {
+            i
+        };
+        if tops.contains(i)
+            && let Some(e) = super::linear_mba::one_word(r, cx, cur, &mut left)?
+        {
             cur = e;
         }
         let n = cx.node(cur);
-        if n.width <= 64 && matches!(n.op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::RotL | OpCode::Not) {
+        if n.width <= 64
+            && matches!(
+                n.op,
+                OpCode::And | OpCode::Or | OpCode::Xor | OpCode::RotL | OpCode::Not
+            )
+        {
             let ones = u64::MAX >> (64 - n.width);
             let s = slice_of(cx, cur, &mut slices, 0);
             if s.base != cur && s.mask == 0 {
                 cur = r.build(cx, |cx| cx.mk_const_u64(n.width, s.flip))?;
             } else if s.base != cur && s.mask == ones && (s.flip == 0 || s.flip == ones) {
                 cur = r.build(cx, |cx| {
-                    let x = if s.rot == 0 { s.base } else {
+                    let x = if s.rot == 0 {
+                        s.base
+                    } else {
                         let k = cx.mk_const_u64(n.width, u64::from(s.rot))?;
                         cx.c_bin(BinOp::RotL, s.base, k)?
                     };
-                    if s.flip == 0 { Ok(x) } else { cx.c_un(UnOp::Not, x) }
+                    if s.flip == 0 {
+                        Ok(x)
+                    } else {
+                        cx.c_un(UnOp::Not, x)
+                    }
                 })?;
             }
         }
         let n = cx.node(cur);
-        if r.assumptions.is_none() && n.width <= 64
-            && (n.op == OpCode::Extract || (n.op == OpCode::And && cx.node(n.b).op == OpCode::Const))
+        if r.assumptions.is_none()
+            && n.width <= 64
+            && (n.op == OpCode::Extract
+                || (n.op == OpCode::And && cx.node(n.b).op == OpCode::Const))
             && let (Some([z, o]), _) = super::known_words(r, cx, cur)?
             && (z | o) == u64::MAX >> (64 - n.width)
         {
             cur = r.build(cx, |cx| cx.mk_const_u64(n.width, o))?;
         }
-        if cur != i { subs.insert(i, cur); }
+        if cur != i {
+            subs.insert(i, cur);
+        }
     }
     r.meter.charge(Counter::PassWork, available - left)?;
-    let Some(out) = subs.get(root) else { return Ok(None) };
-    Ok(matches!(cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1).map_err(Stop::Error)?,
-        crate::expr::Bounded::Exact(_)).then_some(out))
+    let Some(out) = subs.get(root) else {
+        return Ok(None);
+    };
+    Ok(matches!(
+        cx.dag_size(&[cx.handle(out)], order.len() as u32 - 1)
+            .map_err(Stop::Error)?,
+        crate::expr::Bounded::Exact(_)
+    )
+    .then_some(out))
 }
 
 /// [`sweep`], optionally reconstructing piecewise constants. A case side disables that recursion:
@@ -435,7 +471,8 @@ fn sweep_inner(
         }
     }
     r.meter.charge(Counter::PassWork, order.len() as u64)?;
-    if fold_cases && cfg.opaque_sweep
+    if fold_cases
+        && cfg.opaque_sweep
         && let Some(e) = large_affine(r, cx, root, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
@@ -447,13 +484,15 @@ fn sweep_inner(
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
-    if fold_cases && (32..=4096).contains(&order.len())
+    if fold_cases
+        && (32..=4096).contains(&order.len())
         && let Some(e) = guard_domain::specialize(r, cx, cfg, root, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
-    if fold_cases && (32..=4096).contains(&order.len())
+    if fold_cases
+        && (32..=4096).contains(&order.len())
         && let Some(e) = field_guard::specialize(r, cx, root, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
@@ -463,7 +502,10 @@ fn sweep_inner(
         let mut bt_repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
         for &i in &order {
             if cx.wid(i) == 1
-                && matches!(cx.node(i).op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
+                && matches!(
+                    cx.node(i).op,
+                    OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or
+                )
                 && let Some(e) = bit_table::reduce(r, cx, i)?
                 && e != i
             {
@@ -477,7 +519,8 @@ fn sweep_inner(
             return Ok(e);
         }
     }
-    let root = if fold_cases && cfg.opaque_sweep
+    let root = if fold_cases
+        && cfg.opaque_sweep
         && let Some(e) = cofactors::reduce(r, cx, root, &order)?
     {
         count(r).opaque_proved += 1;
@@ -521,13 +564,22 @@ fn sweep_inner(
     // A later round can sweep the smaller expression; no search or rewrite is accepted
     // merely because this estimate declined the scan.
     // A cofactor is temporary: the demanded-bits phase will never see its root.
-    if fold_cases && cfg.opaque_sweep && !cfg.known_atoms && !cfg.noise_forms
+    if fold_cases
+        && cfg.opaque_sweep
+        && !cfg.known_atoms
+        && !cfg.noise_forms
         && matches!(cx.node(root).op, OpCode::Eq | OpCode::Ne)
-        && matches!(cx.node(cx.node(root).a).op,
-            OpCode::And | OpCode::Or | OpCode::Not | OpCode::Extract | OpCode::RotL | OpCode::RotR)
+        && matches!(
+            cx.node(cx.node(root).a).op,
+            OpCode::And | OpCode::Or | OpCode::Not | OpCode::Extract | OpCode::RotL | OpCode::RotR
+        )
         && cx.const_val(cx.node(root).b).is_some()
         && order.len() > 192
-        && r.inner.strategy.phases.iter().any(|p| matches!(p, crate::engine::Phase::Demanded))
+        && r.inner
+            .strategy
+            .phases
+            .iter()
+            .any(|p| matches!(p, crate::engine::Phase::Demanded))
         && r.meter.left_in(|b| b.pass_work) / (order.len() as u64) < 1024
     {
         return Ok(root);
@@ -536,7 +588,8 @@ fn sweep_inner(
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
         return Ok(e);
     }
-    if fold_cases && order.len() <= 1024
+    if fold_cases
+        && order.len() <= 1024
         && let Some(k) = guard_domain::comparison(r, cx, root, &order)?
     {
         let e = r.build(cx, |cx| cx.mk_const(&k))?;
@@ -552,10 +605,17 @@ fn sweep_inner(
     let uniform = samples.iter().all(|v| *v == k);
     // A masked input can feed a long straight-line encoding. Try its Boolean
     // output once, rather than enumerating the same inputs at every inner node.
-    if fold_cases && uniform && cx.node(root).width == 1
+    if fold_cases
+        && uniform
+        && cx.node(root).width == 1
         && (96..=1024).contains(&order.len())
         && !r.mba.swept.contains_key(&root)
-        && order.iter().filter(|&&i| cx.node(i).op == OpCode::Sym).take(2).count() == 1
+        && order
+            .iter()
+            .filter(|&&i| cx.node(i).op == OpCode::Sym)
+            .take(2)
+            .count()
+            == 1
         && exhaustive(r, cx, root, &k)? == Some(true)
     {
         let e = r.build(cx, |cx| cx.mk_const(&k))?;
@@ -593,7 +653,8 @@ fn sweep_inner(
     // Preserve the stock constant-proof schedule on an apparently uniform output.
     // The optional noise-forms profile is an alternative reading of that same goal;
     // there it can expose guards even when all the samples happened to agree.
-    let root = if fold_cases && (!uniform || cfg.noise_forms)
+    let root = if fold_cases
+        && (!uniform || cfg.noise_forms)
         && let Some(e) = selector_cube::reduce(r, cx, &order)?
     {
         r.emit_part(cx, crate::engine::Stage::Sweep, root, e);
@@ -728,7 +789,10 @@ fn sweep_inner(
         }
         pending = Some(i);
         if cx.wid(cur) == 1
-            && matches!(cx.node(cur).op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
+            && matches!(
+                cx.node(cur).op,
+                OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or
+            )
             && let Some(e) = asked!('nodes, bit_table::reduce(r, cx, cur))
         {
             r.emit_part(cx, crate::engine::Stage::Sweep, cur, e);
@@ -1186,19 +1250,15 @@ fn peeled_masked_equal(
     let mut v = rep;
     let mut mask = full;
     let mut shared_nonconst = false;
-    let samples_agree_on = |r: &mut Runner<'_, '_>,
-                            cx: &mut Context,
-                            x: u32,
-                            y: u32,
-                            m: u64|
-     -> Result<bool, Stop> {
-        r.sample(cx, x)?;
-        r.sample(cx, y)?;
-        Ok(r.samples[&x]
-            .iter()
-            .zip(&r.samples[&y])
-            .all(|(vx, vy)| ((vx.limbs()[0] ^ vy.limbs()[0]) & m) == 0))
-    };
+    let samples_agree_on =
+        |r: &mut Runner<'_, '_>, cx: &mut Context, x: u32, y: u32, m: u64| -> Result<bool, Stop> {
+            r.sample(cx, x)?;
+            r.sample(cx, y)?;
+            Ok(r.samples[&x]
+                .iter()
+                .zip(&r.samples[&y])
+                .all(|(vx, vy)| ((vx.limbs()[0] ^ vy.limbs()[0]) & m) == 0))
+        };
     for _ in 0..8 {
         let mut progressed = false;
         // Strip constant masks whose cleared bits are already outside `mask`, or intersect matching masks.
@@ -1361,8 +1421,7 @@ fn related_cheap(
     })?;
     if e == cur
         || (e != rep
-            && (r.rewritten.contains_key(&(e, cur))
-                || same_trivial_offset(cx, cur, rep, relation)))
+            && (r.rewritten.contains_key(&(e, cur)) || same_trivial_offset(cx, cur, rep, relation)))
     {
         discard(r, cx, before);
         return Ok(Related::Written);
@@ -1373,7 +1432,11 @@ fn related_cheap(
     };
     let diff = r.build(cx, |cx| cx.c_bin(op, cur, e))?;
     if let Some(v) = cx.const_val(diff) {
-        return Ok(if v.is_zero() { Related::Proved(e) } else { Related::Open });
+        return Ok(if v.is_zero() {
+            Related::Proved(e)
+        } else {
+            Related::Open
+        });
     }
     if witnessed(r, cx, diff, &zero)? {
         return Ok(Related::Open);
@@ -1424,8 +1487,7 @@ fn related(
     })?;
     if e == cur
         || (e != rep
-            && (r.rewritten.contains_key(&(e, cur))
-                || same_trivial_offset(cx, cur, rep, relation)))
+            && (r.rewritten.contains_key(&(e, cur)) || same_trivial_offset(cx, cur, rep, relation)))
     {
         discard(r, cx, before);
         return Ok(Related::Written);
@@ -1547,8 +1609,7 @@ fn narrow_field(
         return Ok(None);
     }
     let points = 1usize << bits;
-    let steps = (points as u64 * (1 + order.len() as u64))
-        .div_ceil(WORD_EVALS * EVALS_PER_STEP);
+    let steps = (points as u64 * (1 + order.len() as u64)).div_ceil(WORD_EVALS * EVALS_PER_STEP);
     if steps > r.meter.left_in(|b| b.mba_steps) {
         return Ok(None);
     }
@@ -1586,9 +1647,11 @@ fn narrow_field(
     if mask >> lo != (1u64 << len) - 1 || dst + len > u32::from(cx.wid(root)) {
         return Ok(None);
     }
-    if row.iter().zip(&sc.spreads).any(|(&out, &v)| {
-        out != ((((v & mask) >> lo) << dst) ^ k)
-    }) {
+    if row
+        .iter()
+        .zip(&sc.spreads)
+        .any(|(&out, &v)| out != ((((v & mask) >> lo) << dst) ^ k))
+    {
         return Ok(None);
     }
     let before = cx.len() as u32;
@@ -4774,9 +4837,13 @@ fn is_separable_sum(m: &crate::mba::MbaExpr) -> bool {
         var_mask[i] = match nd.op {
             MOp::Const(_) => 0,
             MOp::Var(v) => 1u64 << v,
-            MOp::Neg | MOp::Not | MOp::Shl(_) | MOp::LShr(_) | MOp::Zext | MOp::Sext | MOp::Trunc => {
-                var_mask[nd.args[0] as usize]
-            }
+            MOp::Neg
+            | MOp::Not
+            | MOp::Shl(_)
+            | MOp::LShr(_)
+            | MOp::Zext
+            | MOp::Sext
+            | MOp::Trunc => var_mask[nd.args[0] as usize],
             MOp::Add | MOp::Sub | MOp::Mul | MOp::And | MOp::Or | MOp::Xor => {
                 var_mask[nd.args[0] as usize] | var_mask[nd.args[1] as usize]
             }
@@ -5104,20 +5171,22 @@ fn ask_with_answers(
                         discard(r, cx, before);
                         return Ok(Step::Normal(Fin::FINAL));
                     }
-                    let by =
-                        if own.verdict == Verdict::Proved {
-                            Some("certificate")
-                        } else if inner.mba.prover.as_ref().is_some_and(|p| {
-                            p.prove_equal(m, expr, &cfg.budget) == Verdict::Proved
-                        }) {
-                            Some("prover")
-                        } else if cfg.trust.backend_certificates && *claim >= Claim::Proved {
-                            Some("backend")
-                        } else if cfg.trust.sampled {
-                            Some("sampled")
-                        } else {
-                            None
-                        };
+                    let by = if own.verdict == Verdict::Proved {
+                        Some("certificate")
+                    } else if inner
+                        .mba
+                        .prover
+                        .as_ref()
+                        .is_some_and(|p| p.prove_equal(m, expr, &cfg.budget) == Verdict::Proved)
+                    {
+                        Some("prover")
+                    } else if cfg.trust.backend_certificates && *claim >= Claim::Proved {
+                        Some("backend")
+                    } else if cfg.trust.sampled {
+                        Some("sampled")
+                    } else {
+                        None
+                    };
                     let proved = by.is_some();
                     if let Some(by) = by {
                         let test = own

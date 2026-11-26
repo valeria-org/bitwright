@@ -194,13 +194,38 @@ fn put(cx: &mut Context, e: u32, facts: &[Fact]) -> Result<u32, Error> {
 /// `root` with what each condition fixes put into the operands it guards (see the module),
 /// or `None` when no condition fixes anything, or the root would grow past `max_new` nodes.
 pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u32>, Error> {
+    const MAX_SPINE: usize = 128;
     let start = cx.len() as u32;
     let order = cx.post_order_ids(&[root]);
+    let mut and_uses: IdMap<u32, u32> = IdMap::default();
+    let mut and_child_of_and: IdMap<u32, ()> = IdMap::default();
+    if cx.node(root).op == OpCode::And && cx.wid(root) == 1 {
+        *and_uses.entry(root).or_default() += 1;
+    }
+    for &id in &order {
+        let nd = cx.node(id);
+        let parent_is_and1 = nd.op == OpCode::And && nd.width == 1;
+        for c in nd.children() {
+            if cx.node(c).op == OpCode::And && cx.wid(c) == 1 {
+                *and_uses.entry(c).or_default() += 1;
+                if parent_is_and1 {
+                    and_child_of_and.insert(c, ());
+                }
+            }
+        }
+    }
+    let is_interior_and1 = |id: u32| -> bool {
+        and_uses.get(&id).copied() == Some(1) && and_child_of_and.contains_key(&id)
+    };
+
     let mut pushed: IdMap<u32, u32> = IdMap::default();
     let mut sites = 0usize;
     for i in order {
         if cx.len() as u32 - start > max_new {
             return Ok(None);
+        }
+        if is_interior_and1(i) {
+            continue;
         }
         let n = cx.node(i);
         let now = |cx: &mut Context, pushed: &IdMap<u32, u32>, e: u32| -> Result<u32, Error> {
@@ -208,24 +233,156 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
         };
         let new = match n.op {
             OpCode::And if n.width == 1 => {
-                let (mut fa, mut fb) = (Vec::new(), Vec::new());
-                fixes(cx, n.a, true, &mut fa, 0);
-                fixes(cx, n.b, true, &mut fb, 0);
-                if fa.is_empty() && fb.is_empty() {
-                    continue;
+                // Flatten single-use 1-bit `And` spines so all sibling guards are merged once
+                // and applied in a single substitution pass over heavy conjuncts instead of
+                // re-substituting the sibling DAG at every binary `&` along the spine.
+                let mut raw_leaves = Vec::new();
+                let mut st = vec![n.b, n.a];
+                while let Some(cur) = st.pop() {
+                    if is_interior_and1(cur) && raw_leaves.len() + st.len() + 2 <= MAX_SPINE {
+                        let cn = cx.node(cur);
+                        st.push(cn.b);
+                        st.push(cn.a);
+                    } else {
+                        raw_leaves.push(cur);
+                    }
                 }
-                // One side only: `a & b[a's facts]` is `a & b` (where `a` is 0 both are), but
-                // with both sides rewritten, an input where both are 0 can make both 1.
-                let (a, b) = (now(cx, &pushed, n.a)?, now(cx, &pushed, n.b)?);
-                let b2 = put(cx, b, &fa)?;
-                if b2 != b {
-                    cx.c_bin(BinOp::And, a, b2)?
-                } else {
-                    let a2 = put(cx, a, &fb)?;
-                    if a2 == a {
+                let mut leaves = Vec::with_capacity(raw_leaves.len());
+                let mut folded_zero = false;
+                for raw in raw_leaves {
+                    let cur = now(cx, &pushed, raw)?;
+                    if let Some(cv) = cx.const_val(cur) {
+                        if cv.is_zero() {
+                            folded_zero = true;
+                            break;
+                        }
                         continue;
                     }
-                    cx.c_bin(BinOp::And, a2, b)?
+                    if !leaves.contains(&cur) {
+                        leaves.push(cur);
+                    }
+                }
+                if folded_zero {
+                    cx.mk_const_u64(1, 0)?
+                } else if leaves.is_empty() {
+                    cx.mk_const_u64(1, 1)?
+                } else if leaves.len() == 1 {
+                    leaves[0]
+                } else {
+                    let mut leaf_facts: Vec<Vec<Fact>> = Vec::with_capacity(leaves.len());
+                    let mut any_facts = false;
+                    for &l in &leaves {
+                        let mut lf = Vec::new();
+                        fixes(cx, l, true, &mut lf, 0);
+                        any_facts |= !lf.is_empty();
+                        leaf_facts.push(lf);
+                    }
+                    if !any_facts {
+                        let mut iter = leaves.iter().copied();
+                        let mut acc = iter.next().unwrap();
+                        for l in iter {
+                            acc = cx.c_bin(BinOp::And, acc, l)?;
+                        }
+                        if acc == i {
+                            continue;
+                        }
+                        acc
+                    } else {
+                        // Every fact emitted by `fixes(.., true)` is a necessary consequence of
+                        // its conjunct holding: conflicting bit assignments across sibling
+                        // conjuncts prove the conjunction unsatisfiable (`0`).
+                        let mut check_merged: Vec<Fact> = Vec::new();
+                        let mut conflict = false;
+                        'conflict_scan: for lf in &leaf_facts {
+                            for f in lf {
+                                match check_merged.iter_mut().find(|m| m.x == f.x) {
+                                    Some(m) if (m.value ^ f.value) & m.mask & f.mask != 0 => {
+                                        conflict = true;
+                                        break 'conflict_scan;
+                                    }
+                                    Some(m) => {
+                                        m.value |= f.value;
+                                        m.mask |= f.mask;
+                                    }
+                                    None => check_merged.push(*f),
+                                }
+                            }
+                        }
+                        if conflict {
+                            cx.mk_const_u64(1, 0)?
+                        } else {
+                            // Propagate asymmetrically along a deterministic priority order
+                            // (guards fixing symbols first, then guards fixing other nodes,
+                            // smallest height first; heavy non-guard subgraphs last):
+                            // `L_p0 & L_p1[F_0] & ... & L_pk[F_0 ∪ ... ∪ F_{k-1}]` is sound at
+                            // every input and substitutes each heavy conjunct at most once.
+                            let tier = |idx: usize| -> u8 {
+                                let l = leaves[idx];
+                                let lf = &leaf_facts[idx];
+                                if lf
+                                    .iter()
+                                    .any(|f| f.x != l && cx.node(f.x).op == OpCode::Sym)
+                                {
+                                    0
+                                } else if lf.iter().any(|f| f.x != l) {
+                                    1
+                                } else {
+                                    2
+                                }
+                            };
+                            let mut perm: Vec<usize> = (0..leaves.len()).collect();
+                            perm.sort_by_key(|&idx| {
+                                let l = leaves[idx] as usize;
+                                (tier(idx), cx.meta[l].height, cx.meta[l].tree, idx)
+                            });
+                            let mut rewritten = leaves.clone();
+                            let mut prefix_facts: Vec<Fact> = Vec::new();
+                            let mut any_changed = false;
+                            for &idx in &perm {
+                                if cx.len() as u32 - start > max_new {
+                                    return Ok(None);
+                                }
+                                if !prefix_facts.is_empty() {
+                                    let l2 = put(cx, leaves[idx], &prefix_facts)?;
+                                    if l2 != leaves[idx] {
+                                        rewritten[idx] = l2;
+                                        any_changed = true;
+                                    }
+                                }
+                                prefix_facts.extend_from_slice(&leaf_facts[idx]);
+                            }
+                            // If forward propagation changed nothing, `perm[1..]` are untouched,
+                            // so rewriting `perm[0]` alone under `perm[1..]`'s facts is also sound.
+                            if !any_changed && perm.len() >= 2 {
+                                let mut suffix_facts = Vec::new();
+                                for &idx in &perm[1..] {
+                                    suffix_facts.extend_from_slice(&leaf_facts[idx]);
+                                }
+                                let first = perm[0];
+                                let l2 = put(cx, leaves[first], &suffix_facts)?;
+                                if l2 != leaves[first] {
+                                    rewritten[first] = l2;
+                                    any_changed = true;
+                                }
+                            }
+                            if !any_changed
+                                && leaves.len() == 2
+                                && leaves[0] == n.a
+                                && leaves[1] == n.b
+                            {
+                                continue;
+                            }
+                            let mut iter = rewritten.into_iter();
+                            let mut acc = iter.next().unwrap();
+                            for l in iter {
+                                acc = cx.c_bin(BinOp::And, acc, l)?;
+                            }
+                            if acc == i {
+                                continue;
+                            }
+                            acc
+                        }
+                    }
                 }
             }
             OpCode::Select => {
@@ -307,7 +464,10 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
     let sym_bits = |cx: &Context, c: u32| -> u32 {
         let mut ft = Vec::new();
         fixes(cx, c, true, &mut ft, 0);
-        if ft.iter().all(|f| cx.node(f.x).op != OpCode::Sym || f.mask.count_ones() < 2) {
+        if ft
+            .iter()
+            .all(|f| cx.node(f.x).op != OpCode::Sym || f.mask.count_ones() < 2)
+        {
             ft.clear();
             fixes(cx, c, false, &mut ft, 0);
         }

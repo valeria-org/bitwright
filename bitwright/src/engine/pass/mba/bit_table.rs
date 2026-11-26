@@ -524,7 +524,9 @@ fn eval_small_table(cx: &Context, root: u32) -> Option<SmallTable> {
         if cx.const_val(i).is_some() {
             continue;
         }
-        if n.width == 1 && let Some(res) = peel_bit(cx, i) {
+        if n.width == 1
+            && let Some(res) = peel_bit(cx, i)
+        {
             if let Ok((bk, _)) = res
                 && !bits[..n_bits].contains(&bk)
             {
@@ -604,7 +606,9 @@ fn eval_node(
     let mask = u64::MAX >> (64 - w);
     let val = if let Some(k) = cx.const_val(i) {
         k.to_u64()? & mask
-    } else if w == 1 && let Some(res) = peel_bit(cx, i) {
+    } else if w == 1
+        && let Some(res) = peel_bit(cx, i)
+    {
         match res {
             Err(c) => u64::from(c),
             Ok((bk, pol)) => {
@@ -641,12 +645,20 @@ fn eval_node(
             OpCode::Shl => {
                 let a = eval_node(cx, n.a, bits, assign, memo, depth + 1)?;
                 let b = eval_node(cx, n.b, bits, assign, memo, depth + 1)?;
-                if b >= u64::from(w) { 0 } else { (a << b) & mask }
+                if b >= u64::from(w) {
+                    0
+                } else {
+                    (a << b) & mask
+                }
             }
             OpCode::LShr => {
                 let a = eval_node(cx, n.a, bits, assign, memo, depth + 1)?;
                 let b = eval_node(cx, n.b, bits, assign, memo, depth + 1)?;
-                if b >= u64::from(w) { 0 } else { (a >> b) & mask }
+                if b >= u64::from(w) {
+                    0
+                } else {
+                    (a >> b) & mask
+                }
             }
             OpCode::And => {
                 let a = eval_node(cx, n.a, bits, assign, memo, depth + 1)?;
@@ -676,11 +688,7 @@ fn eval_node(
                 let sw = cx.wid(n.a);
                 let a = eval_node(cx, n.a, bits, assign, memo, depth + 1)?;
                 let sign = (a >> (sw - 1)) & 1;
-                let ext = if sign != 0 {
-                    a | (!0u64 << sw)
-                } else {
-                    a
-                };
+                let ext = if sign != 0 { a | (!0u64 << sw) } else { a };
                 ext & mask
             }
             OpCode::Extract => {
@@ -1399,7 +1407,11 @@ fn build_bit_unification(
     // `orig + ok` on bits `0..=tz(ok - k)`.
     for &(w_add, orig, k) in &add_words {
         let nw = cx.wid(w_add);
-        let tz = if k == 0 { nw } else { (k.trailing_zeros() as u16).min(nw) };
+        let tz = if k == 0 {
+            nw
+        } else {
+            (k.trailing_zeros() as u16).min(nw)
+        };
         for &other in &words {
             if other == w_add {
                 continue;
@@ -1420,11 +1432,29 @@ fn build_bit_unification(
                 };
                 for b in 0..=dtz.min(nw.saturating_sub(1)) {
                     if b < dtz {
-                        map.entry(BitKey { word: other, bit: b })
-                            .or_insert((BitKey { word: w_add, bit: b }, false));
+                        map.entry(BitKey {
+                            word: other,
+                            bit: b,
+                        })
+                        .or_insert((
+                            BitKey {
+                                word: w_add,
+                                bit: b,
+                            },
+                            false,
+                        ));
                     } else if b == dtz && delta != 0 {
-                        map.entry(BitKey { word: other, bit: b })
-                            .or_insert((BitKey { word: w_add, bit: b }, true));
+                        map.entry(BitKey {
+                            word: other,
+                            bit: b,
+                        })
+                        .or_insert((
+                            BitKey {
+                                word: w_add,
+                                bit: b,
+                            },
+                            true,
+                        ));
                     }
                 }
             }
@@ -1441,22 +1471,50 @@ fn build_bit_unification(
                 && (ok as u32) == (k as u32)
             {
                 for b in 0..32u16 {
-                    map.entry(BitKey { word: other, bit: b })
-                        .or_insert((BitKey { word: w_add, bit: b }, false));
+                    map.entry(BitKey {
+                        word: other,
+                        bit: b,
+                    })
+                    .or_insert((
+                        BitKey {
+                            word: w_add,
+                            bit: b,
+                        },
+                        false,
+                    ));
                 }
             }
             // Case 2: `other` is `orig` (or `trunc<32>(orig)`): bits `0..=tz` agree with `w_add`
             // (with bit `tz` inverted).
-            let same_base = other == orig || (nw == 64 && on.width == 32 && word32_origin(cx, other) == orig);
+            let same_base =
+                other == orig || (nw == 64 && on.width == 32 && word32_origin(cx, other) == orig);
             if same_base {
                 let lim = tz.min(on.width.saturating_sub(1));
                 for b in 0..=lim {
                     if b < tz {
-                        map.entry(BitKey { word: other, bit: b })
-                            .or_insert((BitKey { word: w_add, bit: b }, false));
+                        map.entry(BitKey {
+                            word: other,
+                            bit: b,
+                        })
+                        .or_insert((
+                            BitKey {
+                                word: w_add,
+                                bit: b,
+                            },
+                            false,
+                        ));
                     } else if b == tz && b < on.width && k != 0 {
-                        map.entry(BitKey { word: other, bit: b })
-                            .or_insert((BitKey { word: w_add, bit: b }, true));
+                        map.entry(BitKey {
+                            word: other,
+                            bit: b,
+                        })
+                        .or_insert((
+                            BitKey {
+                                word: w_add,
+                                bit: b,
+                            },
+                            true,
+                        ));
                     }
                 }
             }
@@ -1635,13 +1693,13 @@ fn solve_carry_split(
                 }
             }
             if missing == 0 {
-                let valid = if carry == 1 { w_low < lo_k } else { w_low >= lo_k };
+                let valid = if carry == 1 {
+                    w_low < lo_k
+                } else {
+                    w_low >= lo_k
+                };
                 if valid {
-                    all_valid.push((
-                        w_low,
-                        ((hi_val << nw) | u64::from(w_low)) & full_w,
-                        full_w,
-                    ));
+                    all_valid.push((w_low, ((hi_val << nw) | u64::from(w_low)) & full_w, full_w));
                     if all_valid.len() > MAX_SOLUTIONS {
                         return Ok(None);
                     }
@@ -1941,15 +1999,19 @@ mod tests {
     fn run_sweep(expr: &str) -> (Context, crate::Expr) {
         let mut cx = Context::new();
         let e = cx.parse(expr, &ParseOptions::width(Width::W64)).unwrap();
-        let strategy = Strategy::deobfuscate()
-            .with_mba(MbaConfig::default().with_opaque_sweep(true));
+        let strategy =
+            Strategy::deobfuscate().with_mba(MbaConfig::default().with_opaque_sweep(true));
         let engine = Engine::builder()
             .builtin()
             .strategy(strategy)
             .build()
             .unwrap();
         let out = engine
-            .run(&mut cx, &[e], Run::default().with_per_call(Budget::fuel(1 << 18)))
+            .run(
+                &mut cx,
+                &[e],
+                Run::default().with_per_call(Budget::fuel(1 << 18)),
+            )
             .unwrap();
         (cx, out.roots[0].expr)
     }
@@ -2018,7 +2080,10 @@ mod tests {
         let (mut cx, out) = run_sweep(&src_unique);
         for v in 0..=255u64 {
             let got = cx
-                .eval(&[out], &[("x".into(), BitVec::from_u64(Width::W8, v).unwrap())][..])
+                .eval(
+                    &[out],
+                    &[("x".into(), BitVec::from_u64(Width::W8, v).unwrap())][..],
+                )
                 .unwrap()[0];
             assert_eq!(!got.is_zero(), v == u64::from(x_sol), "mismatch at x={v}");
         }
@@ -2048,7 +2113,9 @@ mod tests {
             (target >> 64) as u64
         );
         let (mut cx3, out3) = run_sweep(&src_missing_carry);
-        let orig3 = cx3.parse(&src_missing_carry, &ParseOptions::width(Width::W64)).unwrap();
+        let orig3 = cx3
+            .parse(&src_missing_carry, &ParseOptions::width(Width::W64))
+            .unwrap();
         for v in 0..=255u64 {
             let env = [("x".into(), BitVec::from_u64(Width::W8, v).unwrap())];
             let vals = cx3.eval(&[orig3, out3], &env[..]).unwrap();
@@ -2083,15 +2150,33 @@ mod tests {
             let w11 = w01.wrapping_add(w10);
             let lo = format!(
                 "select(extract<{}, 1>(x:8), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}))",
-                2 * k, 2 * k + 1, w11 as u64, w01 as u64, 2 * k + 1, w10 as u64, w00 as u64
+                2 * k,
+                2 * k + 1,
+                w11 as u64,
+                w01 as u64,
+                2 * k + 1,
+                w10 as u64,
+                w00 as u64
             );
             let lo_not = format!(
                 "select(extract<{}, 1>(x:8), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}))",
-                2 * k, 2 * k + 1, !(w11 as u64), !(w01 as u64), 2 * k + 1, !(w10 as u64), !(w00 as u64)
+                2 * k,
+                2 * k + 1,
+                !(w11 as u64),
+                !(w01 as u64),
+                2 * k + 1,
+                !(w10 as u64),
+                !(w00 as u64)
             );
             let hi = format!(
                 "select(extract<{}, 1>(x:8), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}), select(extract<{}, 1>(x:8), {:#x}:64, {:#x}))",
-                2 * k, 2 * k + 1, (w11 >> 64) as u64, (w01 >> 64) as u64, 2 * k + 1, (w10 >> 64) as u64, (w00 >> 64) as u64
+                2 * k,
+                2 * k + 1,
+                (w11 >> 64) as u64,
+                (w01 >> 64) as u64,
+                2 * k + 1,
+                (w10 >> 64) as u64,
+                (w00 >> 64) as u64
             );
             (lo, lo_not, hi)
         };
@@ -2110,7 +2195,10 @@ mod tests {
         let (mut cx, out) = run_sweep(&src);
         for v in 0..=255u64 {
             let got = cx
-                .eval(&[out], &[("x".into(), BitVec::from_u64(Width::W8, v).unwrap())][..])
+                .eval(
+                    &[out],
+                    &[("x".into(), BitVec::from_u64(Width::W8, v).unwrap())][..],
+                )
                 .unwrap()[0];
             assert_eq!(!got.is_zero(), v == u64::from(x_sol), "mismatch at x={v}");
         }
@@ -2248,11 +2336,23 @@ let %84 = select(%63, 9:64, 3);
             let w11 = w01.wrapping_add(w10);
             let lo = format!(
                 "select(extract<{}, 1>(%90), select(extract<{}, 1>(%90), {:#x}:64, {:#x}), select(extract<{}, 1>(%90), {:#x}:64, {:#x}))",
-                2 * k, 2 * k + 1, w11 as u64, w01 as u64, 2 * k + 1, w10 as u64, w00 as u64
+                2 * k,
+                2 * k + 1,
+                w11 as u64,
+                w01 as u64,
+                2 * k + 1,
+                w10 as u64,
+                w00 as u64
             );
             let hi = format!(
                 "select(extract<{}, 1>(%90), select(extract<{}, 1>(%90), {:#x}:64, {:#x}), select(extract<{}, 1>(%90), {:#x}:64, {:#x}))",
-                2 * k, 2 * k + 1, (w11 >> 64) as u64, (w01 >> 64) as u64, 2 * k + 1, (w10 >> 64) as u64, (w00 >> 64) as u64
+                2 * k,
+                2 * k + 1,
+                (w11 >> 64) as u64,
+                (w01 >> 64) as u64,
+                2 * k + 1,
+                (w10 >> 64) as u64,
+                (w00 >> 64) as u64
             );
             (lo, hi)
         };
@@ -2278,9 +2378,16 @@ let %84 = select(%63, 9:64, 3);
         let (mut cx, out) = run_sweep(&src);
         for v in [0u64, 0x6f, 0x70, 0x71, 0xff, 0x1370, 0xff70, 0xff71] {
             let got = cx
-                .eval(&[out], &[("y".into(), BitVec::from_u64(Width::W16, v).unwrap())][..])
+                .eval(
+                    &[out],
+                    &[("y".into(), BitVec::from_u64(Width::W16, v).unwrap())][..],
+                )
                 .unwrap()[0];
-            assert_eq!(!got.is_zero(), (v & 0xff) == u64::from(y_sol), "mismatch at y={v:#x}");
+            assert_eq!(
+                !got.is_zero(),
+                (v & 0xff) == u64::from(y_sol),
+                "mismatch at y={v:#x}"
+            );
         }
         assert!(
             cx.dag_size(&[out], 10).is_ok(),

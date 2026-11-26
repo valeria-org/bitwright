@@ -1347,7 +1347,11 @@ fn emit_values(
                     return r
                         .build(cx, |cx| {
                             let b = cx.c_extract(src, bit, 1)?;
-                            if want_one { Ok(b) } else { cx.c_un(UnOp::Not, b) }
+                            if want_one {
+                                Ok(b)
+                            } else {
+                                cx.c_un(UnOp::Not, b)
+                            }
                         })
                         .map(Some);
                 }
@@ -1356,7 +1360,11 @@ fn emit_values(
                     return r
                         .build(cx, |cx| {
                             let b = cx.c_extract(src, bit, 1)?;
-                            if !want_one { Ok(b) } else { cx.c_un(UnOp::Not, b) }
+                            if !want_one {
+                                Ok(b)
+                            } else {
+                                cx.c_un(UnOp::Not, b)
+                            }
                         })
                         .map(Some);
                 }
@@ -1497,10 +1505,24 @@ fn exhaustive_mask_cases(
                 let b = rem.trailing_zeros() as u16;
                 rem &= rem - 1;
                 if values.iter().all(|&v| (v >> b) & 1 == 1) {
-                    return Ok(Some((MaskCase::Bit { expr: e, bit: b, set: true }, fin)));
+                    return Ok(Some((
+                        MaskCase::Bit {
+                            expr: e,
+                            bit: b,
+                            set: true,
+                        },
+                        fin,
+                    )));
                 }
                 if values.iter().all(|&v| (v >> b) & 1 == 0) {
-                    return Ok(Some((MaskCase::Bit { expr: e, bit: b, set: false }, fin)));
+                    return Ok(Some((
+                        MaskCase::Bit {
+                            expr: e,
+                            bit: b,
+                            set: false,
+                        },
+                        fin,
+                    )));
                 }
             }
         }
@@ -1581,6 +1603,7 @@ fn sign_extend_sign_test(
 /// - `((x ^ y) & ((x - y) ^ x)) <s 0`       (`ssub.overflow(x, y)`)
 /// - `((a ^ b) & ((~a + b) ^ b)) <s 0`      (`ssub.overflow(b, a + 1)`)
 /// - `((~(x ^ y)) & ((x + y) ^ x)) <s 0`    (`sadd.overflow(x, y)`)
+///
 /// and their `0 <=s ...` complements.
 fn signed_overflow_sign_test(
     r: &mut Runner<'_, '_>,
@@ -1885,7 +1908,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 stops.retain(|&id| id < before);
                 stops.sort_unstable();
                 stops.dedup();
-                match super::finish_with(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL, true)? {
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Compares,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
                     Step::Normal(_) => {}
                     step => return Ok(step),
                 }
@@ -1907,7 +1940,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             stops.retain(|&id| id < before);
             stops.sort_unstable();
             stops.dedup();
-            match super::finish_with(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL, true)? {
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Compares,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                true,
+            )? {
                 Step::Normal(_) => {}
                 step => return Ok(step),
             }
@@ -1934,7 +1977,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 }
                 stops.sort_unstable();
                 stops.dedup();
-                match super::finish_with(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL, true)? {
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Compares,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
                     Step::Normal(_) => {}
                     step => return Ok(step),
                 }
@@ -2003,9 +2056,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 if pn.op == OpCode::Popcnt {
                     return Some(pn.a);
                 }
-                if pn.op == OpCode::Zext
-                    || (pn.op == OpCode::Sext && cx.wid(pn.a) > 1)
-                {
+                if pn.op == OpCode::Zext || (pn.op == OpCode::Sext && cx.wid(pn.a) > 1) {
                     cur = pn.a;
                 } else {
                     break;
@@ -2846,7 +2897,17 @@ fn packed_zero_or(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Op
         super::discard(r, cx, before);
         return Ok(None);
     };
-    match super::finish_with(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL, true)? {
+    match super::finish_with(
+        r,
+        cx,
+        PassKind::Compares,
+        n,
+        e,
+        before,
+        &stops,
+        Fin::FINAL,
+        true,
+    )? {
         Step::Normal(_) => Ok(None),
         step => Ok(Some(step)),
     }
@@ -3177,7 +3238,7 @@ fn order_step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove"))]
 mod extra_tests {
     use crate::{Context, ParseOptions, Width};
 

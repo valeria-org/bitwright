@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.32.24
 
 - The deobfuscation strategy can reuse circuit-proved equalities between differently written
   mixed-width subexpressions. Comparisons and arithmetic parents can consume the same proof,
@@ -11,6 +11,23 @@
   simplifies through rotations, byte swaps and bit reversal.
 - Named AArch64 W and X register views now share storage in the p-code and VEX readers. The
   Ghidra adapter serializes register-space offsets and uses register names for output labels.
+- Added width-polymorphic (`1..=512`) associative-commutative common sub-sum and single-use
+  constant-multiplier factoring (`cse::share_sums`) at the circuit-lowering boundary in `prove`,
+  compressing multi-round state AIGs without creating premature multi-use `Add` spines during
+  `Engine` simplification.
+- Added single-root top-level negated-conjunction guard lifting in `prove`, batched single-pass
+  flat `And`-spine specialization and pairwise bit-conflict contradiction folding in
+  `context::push`, and preserved `SIDE_ROUNDS` across pre-MBA shrinking context passes in `Engine`.
+- Extended `prove::sample_words` (`Program::lower`, `fix_scoped_bits`, and `guard`) with
+  `<= 64`-bit `Extract` projection through wide (`> 64`-bit) `Concat`/`Zext`/`Extract` chains,
+  `Concat` target witness inversion, constraint-seeded backward bit pinning, and post-simplification
+  word sampling (`POST_SIMP_MAX_NODES = 16_384`).
+- Added syntactic modular shift-count sum cancellation and width-polymorphic complementary-shift
+  disjointness (`(sa + sb) mod 2^W >=_u W`) across `disjoint`, `within`, and `bitwise` absorptions
+  and bounded `rotl`/`rotr` canonicalization; extended `bitwise` with guard-implied constant
+  `select` arm folding, nested complementary-guard `select` subsumption, and homomorphic bitwise
+  hoisting, `casts` with `zext<W>((trunc<N>(x) ^ C) & M)` narrowing, and `shuffle` with known-bit
+  mask stripping during single-source in-place emission.
 
 ## 0.32.23
 

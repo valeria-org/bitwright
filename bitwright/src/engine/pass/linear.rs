@@ -398,7 +398,8 @@ fn scaled_high(
         }
         OpCode::Zext => {
             let field = cx.node(n.a);
-            if field.op != OpCode::Extract || cx.wid(field.a) != n.width
+            if field.op != OpCode::Extract
+                || cx.wid(field.a) != n.width
                 || field.b + u32::from(field.width) != u32::from(n.width)
             {
                 return Ok(None);
@@ -415,7 +416,11 @@ fn scaled_high(
     };
     let q = bv_lshr(k, shift as u32);
     let bias = BitVec::un_unchecked(UnOp::Neg, &BitVec::bin_unchecked(BinOp::Mul, &lo, &q));
-    Ok(Some(Form { konst: bias, terms: vec![(x, q)], fin }))
+    Ok(Some(Form {
+        konst: bias,
+        terms: vec![(x, q)],
+        fin,
+    }))
 }
 
 /// In `concat(h + Σ c_i·high(x_i), low)`, the implicit left shift cancels
@@ -429,10 +434,12 @@ fn aligned_concat(
     w: crate::Width,
 ) -> Result<Option<Form>, Stop> {
     let j = low.width().bits();
-    if hi.terms.is_empty() || hi.terms.iter().any(|&(i, _)| {
-        let n = cx.node(i);
-        n.op != OpCode::Extract || n.b != u32::from(j) || cx.width_of(n.a) != w
-    }) {
+    if hi.terms.is_empty()
+        || hi.terms.iter().any(|&(i, _)| {
+            let n = cx.node(i);
+            n.op != OpCode::Extract || n.b != u32::from(j) || cx.width_of(n.a) != w
+        })
+    {
         return Ok(None);
     }
     hi.konst = BitVec::concat(&hi.konst, low).expect("original concat width");
@@ -511,7 +518,8 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
                     f.konst = BitVec::bin_unchecked(BinOp::Add, &f.konst, &lo);
                     f
                 }
-                Some(c) => aligned_concat(r, cx, get(r, node.a), &c, w)?.unwrap_or_else(|| Form::atom(i, w)),
+                Some(c) => aligned_concat(r, cx, get(r, node.a), &c, w)?
+                    .unwrap_or_else(|| Form::atom(i, w)),
                 _ => Form::atom(i, w),
             }
         }
@@ -779,17 +787,14 @@ fn merge_complements(cx: &Context, form: Form) -> Form {
             && cv.msb()
         {
             let pos_c = crate::facts::known::bv_not(&cv);
-            form.terms
-                .iter()
-                .map(|&(z, _)| z)
-                .find(|&z| {
-                    let zn = cx.node(z);
-                    z != a
-                        && zn.op == n.op
-                        && cx.node(zn.a).op == OpCode::Xor
-                        && with_const(cx, zn.a)
-                            .is_some_and(|(zb, zc)| zb == base && cx.const_val(zc) == Some(pos_c))
-                })
+            form.terms.iter().map(|&(z, _)| z).find(|&z| {
+                let zn = cx.node(z);
+                z != a
+                    && zn.op == n.op
+                    && cx.node(zn.a).op == OpCode::Xor
+                    && with_const(cx, zn.a)
+                        .is_some_and(|(zb, zc)| zb == base && cx.const_val(zc) == Some(pos_c))
+            })
         } else {
             None
         };
@@ -1425,37 +1430,35 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
             Some(a) => {
                 // Fold `(c1 ± y) + c2` directly so `(-2 - y) * x + x` simplifies to `~y * x`
                 // instead of building an unsimplified `((-2 - y) + 1) * x`.
-                let fold_const_sum = |cx: &mut Context,
-                                      lhs: u32,
-                                      c2: BitVec|
-                 -> Result<Option<u32>, crate::Error> {
-                    let ln = cx.node(lhs);
-                    if ln.op == OpCode::Sub
-                        && let Some(c1) = cx.const_val(ln.a)
-                    {
-                        let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
-                        return Ok(Some(if c.is_zero() {
-                            cx.c_un(UnOp::Neg, ln.b)?
-                        } else if c.is_ones() {
-                            cx.c_un(UnOp::Not, ln.b)?
-                        } else {
-                            let ck = cx.mk_const(&c)?;
-                            cx.c_bin(BinOp::Sub, ck, ln.b)?
-                        }));
-                    }
-                    if ln.op == OpCode::Add
-                        && let Some(c1) = cx.const_val(ln.b)
-                    {
-                        let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
-                        return Ok(Some(if c.is_zero() {
-                            ln.a
-                        } else {
-                            let ck = cx.mk_const(&c)?;
-                            cx.c_bin(BinOp::Add, ln.a, ck)?
-                        }));
-                    }
-                    Ok(None)
-                };
+                let fold_const_sum =
+                    |cx: &mut Context, lhs: u32, c2: BitVec| -> Result<Option<u32>, crate::Error> {
+                        let ln = cx.node(lhs);
+                        if ln.op == OpCode::Sub
+                            && let Some(c1) = cx.const_val(ln.a)
+                        {
+                            let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
+                            return Ok(Some(if c.is_zero() {
+                                cx.c_un(UnOp::Neg, ln.b)?
+                            } else if c.is_ones() {
+                                cx.c_un(UnOp::Not, ln.b)?
+                            } else {
+                                let ck = cx.mk_const(&c)?;
+                                cx.c_bin(BinOp::Sub, ck, ln.b)?
+                            }));
+                        }
+                        if ln.op == OpCode::Add
+                            && let Some(c1) = cx.const_val(ln.b)
+                        {
+                            let c = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
+                            return Ok(Some(if c.is_zero() {
+                                ln.a
+                            } else {
+                                let ck = cx.mk_const(&c)?;
+                                cx.c_bin(BinOp::Add, ln.a, ck)?
+                            }));
+                        }
+                        Ok(None)
+                    };
                 let record_folded = |cx: &Context, id: u32, extra: &mut Vec<u32>| {
                     if id < before {
                         extra.push(id);
@@ -1692,9 +1695,9 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         match sn.op {
             OpCode::Add if sn.a == base_id => cx.const_val(sn.b),
             OpCode::Add if sn.b == base_id => cx.const_val(sn.a),
-            OpCode::Sub if sn.a == base_id => {
-                cx.const_val(sn.b).map(|k| BitVec::un_unchecked(UnOp::Neg, &k))
-            }
+            OpCode::Sub if sn.a == base_id => cx
+                .const_val(sn.b)
+                .map(|k| BitVec::un_unchecked(UnOp::Neg, &k)),
             OpCode::Or | OpCode::Xor if sn.a == base_id => cx
                 .const_val(sn.b)
                 .filter(|k| BitVec::bin_unchecked(BinOp::And, k, base_mask).is_zero()),
@@ -1721,8 +1724,18 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         if zv < before {
             stops.push(zv);
         }
-        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
-            .map(Some);
+        return super::finish_with(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            e,
+            before,
+            &stops,
+            Fin::FINAL,
+            true,
+        )
+        .map(Some);
     }
     if let Some(mask) = base_known_mask(t)
         && let Some(k) = add_const_of(f, t, &mask)
@@ -1741,8 +1754,18 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         if zv < before {
             stops.push(zv);
         }
-        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
-            .map(Some);
+        return super::finish_with(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            e,
+            before,
+            &stops,
+            Fin::FINAL,
+            true,
+        )
+        .map(Some);
     }
 
     // Pattern 2: `select(a, select(b, c11, c10), select(b', f1, f0))` where `b' == b` or `~b`
@@ -1834,8 +1857,18 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
                 stops.push(c);
             }
         }
-        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
-            .map(Some);
+        return super::finish_with(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            e,
+            before,
+            &stops,
+            Fin::FINAL,
+            true,
+        )
+        .map(Some);
     }
     if fn_.op == OpCode::Select
         && let (Some(c01), Some(c00)) = (cx.const_val(fn_.b), cx.const_val(fn_.c))
@@ -1856,8 +1889,18 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
                 stops.push(c);
             }
         }
-        return super::finish_with(r, cx, PassKind::Linear, n, e, before, &stops, Fin::FINAL, true)
-            .map(Some);
+        return super::finish_with(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            e,
+            before,
+            &stops,
+            Fin::FINAL,
+            true,
+        )
+        .map(Some);
     }
     // Pattern 3: `select(c, k1 * base, k2 * base)` -> `base * select(c, k1, k2)`.
     // Works even when one arm's multiplier is even (where `scaled_base` shifts out trailing zeros
@@ -1873,7 +1916,11 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         if !ft.terms.is_empty()
             && ft.terms.len() <= BASE_TERMS
             && ft.terms.len() == ff.terms.len()
-            && ft.terms.iter().zip(&ff.terms).all(|(&(a, _), &(b, _))| a == b)
+            && ft
+                .terms
+                .iter()
+                .zip(&ff.terms)
+                .all(|(&(a, _), &(b, _))| a == b)
         {
             type ScaledSelectMatch = (BitVec, BitVec, BitVec, Vec<(u32, BitVec)>);
             let matched = (|| -> Option<ScaledSelectMatch> {
@@ -1889,12 +1936,9 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
                         .map(|&(a, k)| (a, BitVec::bin_unchecked(BinOp::Mul, &k, &inv)))
                         .collect();
                     if BitVec::bin_unchecked(BinOp::Mul, &base_k, &k0_f) == ff.konst
-                        && base
-                            .iter()
-                            .zip(&ff.terms)
-                            .all(|(&(_, bk), &(_, fk))| {
-                                BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_f) == fk
-                            })
+                        && base.iter().zip(&ff.terms).all(|(&(_, bk), &(_, fk))| {
+                            BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_f) == fk
+                        })
                     {
                         return Some((k0_t, k0_f, base_k, base));
                     }
@@ -1907,12 +1951,9 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
                         .map(|&(a, k)| (a, BitVec::bin_unchecked(BinOp::Mul, &k, &inv)))
                         .collect();
                     if BitVec::bin_unchecked(BinOp::Mul, &base_k, &k0_t) == ft.konst
-                        && base
-                            .iter()
-                            .zip(&ft.terms)
-                            .all(|(&(_, bk), &(_, tk))| {
-                                BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_t) == tk
-                            })
+                        && base.iter().zip(&ft.terms).all(|(&(_, bk), &(_, tk))| {
+                            BitVec::bin_unchecked(BinOp::Mul, &bk, &k0_t) == tk
+                        })
                     {
                         return Some((k0_t, k0_f, base_k, base));
                     }
@@ -2027,8 +2068,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     if matches!(op, OpCode::Add | OpCode::Sub) {
         if op == OpCode::Add
-            && let Some(step) =
-                super::bitwise::merge_complementary_arms(r, cx, PassKind::Linear, n, node.a, node.b)?
+            && let Some(step) = super::bitwise::merge_complementary_arms(
+                r,
+                cx,
+                PassKind::Linear,
+                n,
+                node.a,
+                node.b,
+            )?
         {
             match step {
                 Step::Normal(f) => pre_declined = pre_declined.and(f),
@@ -2059,9 +2106,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     continue;
                 };
                 let (kb_opt, kfin) = super::known(r, cx, x)?;
-                let kz = kb_opt
-                    .and_then(|kb| kb.known_zero().to_u64())
-                    .unwrap_or(0);
+                let kz = kb_opt.and_then(|kb| kb.known_zero().to_u64()).unwrap_or(0);
                 let u = (!kz) & mask;
                 if u == mask && !neg_xor {
                     pre_declined = pre_declined.and(kfin.unchanged());
@@ -2276,16 +2321,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                                     let ck = cx.mk_const(&c_flip)?;
                                     cx.c_bin(BinOp::Mul, b_id, ck)
                                 })?;
-                                match finish(
-                                    r,
-                                    cx,
-                                    PassKind::Linear,
-                                    n,
-                                    e,
-                                    before,
-                                    &[b_id],
-                                    bfin,
-                                )? {
+                                match finish(r, cx, PassKind::Linear, n, e, before, &[b_id], bfin)?
+                                {
                                     Step::Normal(f) => declined = declined.and(f),
                                     step => return Ok(step),
                                 }
@@ -2293,7 +2330,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                         }
                         let fo = form_of(r, cx, other_id)?;
                         if fo.terms.len() == 1 && fo.terms[0].0 == b_id {
-                            let c_sum = BitVec::bin_unchecked(BinOp::Add, &fo.konst, &fo.terms[0].1);
+                            let c_sum =
+                                BitVec::bin_unchecked(BinOp::Add, &fo.konst, &fo.terms[0].1);
                             let before = cx.len() as u32;
                             let e = r.build(cx, |cx| {
                                 let ck = cx.mk_const(&c_sum)?;
@@ -2342,7 +2380,8 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     {
         let mut fuel = SELECT_WORK;
         let value = selected_constant(cx, &form.terms, form.konst, &mut fuel);
-        r.meter.charge(Counter::PassWork, u64::from(1 + SELECT_WORK - fuel))?;
+        r.meter
+            .charge(Counter::PassWork, u64::from(1 + SELECT_WORK - fuel))?;
         if let Some(value) = value {
             let before = cx.len() as u32;
             let e = r.build(cx, |cx| cx.mk_const(&value))?;
@@ -2420,8 +2459,17 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         let (a, b) = (node.a, node.b);
         let before = cx.len() as u32;
         let e = r.build(cx, |cx| cx.c_bin(BinOp::Xor, a, b))?;
-        match super::finish_with(r, cx, PassKind::Linear, n, e, before, &[a, b], Fin::FINAL, true)?
-        {
+        match super::finish_with(
+            r,
+            cx,
+            PassKind::Linear,
+            n,
+            e,
+            before,
+            &[a, b],
+            Fin::FINAL,
+            true,
+        )? {
             Step::Normal(_) => {}
             step => return Ok(step),
         }
@@ -2711,7 +2759,8 @@ fn merge_xor_pairs(
                             &new_konst,
                             &BitVec::bin_unchecked(BinOp::Mul, &c_bit, &scale),
                         );
-                    } else if let Some(slot) = new_terms.iter_mut().find(|(id, _)| *id == bit_node) {
+                    } else if let Some(slot) = new_terms.iter_mut().find(|(id, _)| *id == bit_node)
+                    {
                         slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
                         used_x = true;
                     } else {
@@ -2900,7 +2949,17 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
             }
         }
         if !any_disjoint_add {
-            return super::finish_with(r, cx, PassKind::Linear, n, e, before, &atoms, fin_disj, true);
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Linear,
+                n,
+                e,
+                before,
+                &atoms,
+                fin_disj,
+                true,
+            );
         }
     }
     finish(r, cx, PassKind::Linear, n, e, before, &atoms, fin)
@@ -3453,7 +3512,9 @@ pub(super) fn by_multiplicand(
             if ff.terms.len() == 1 {
                 let (atom0, coef0) = ff.terms[0];
                 let fn_node = cx.node(atom0);
-                if atom0 == f && coef0 == one && fn_node.op == OpCode::And
+                if atom0 == f
+                    && coef0 == one
+                    && fn_node.op == OpCode::And
                     && let Some(&or_id) = all_or_atoms.iter().find(|&&oid| {
                         let on = cx.node(oid);
                         (is_comp_node(cx, fn_node.a, on.a) && is_comp_node(cx, fn_node.b, on.b))
@@ -3473,9 +3534,8 @@ pub(super) fn by_multiplicand(
                     && let Some((v_id, iw, c2)) = unwrap_zext_xor(cx, atom0)
                 {
                     let imask = u64::MAX >> (64 - iw);
-                    if let Some(&(canon_id, _, _, _)) = all_zext_xor_atoms
-                        .iter()
-                        .find(|&&(aid, vid, aiw, c1)| {
+                    if let Some(&(canon_id, _, _, _)) =
+                        all_zext_xor_atoms.iter().find(|&&(aid, vid, aiw, c1)| {
                             aid < atom0 && vid == v_id && aiw == iw && (c1 ^ c2) == imask
                         })
                     {
@@ -3499,7 +3559,10 @@ pub(super) fn by_multiplicand(
                         let mask = u64::MAX >> (64 - w.bits());
                         let high_mask = mask & !1u64;
                         let (kw, bfin) = super::known_words(r, cx, b_id)?;
-                        if atom0 == f && coef0 == one && kw.is_some_and(|[z, _]| (z & high_mask) == high_mask) {
+                        if atom0 == f
+                            && coef0 == one
+                            && kw.is_some_and(|[z, _]| (z & high_mask) == high_mask)
+                        {
                             let coef = if k_bv.bit(0) == Some(true) {
                                 BitVec::ones(w)
                             } else {
@@ -3800,7 +3863,7 @@ pub(super) fn by_sums(
     finish(r, cx, PassKind::Mba, n, e, before, &stops, form.fin).map(Some)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prove"))]
 mod extra_tests {
     use crate::{Context, ParseOptions, Width};
 

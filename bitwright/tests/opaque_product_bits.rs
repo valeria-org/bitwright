@@ -3,9 +3,9 @@
 
 use bitwright::engine::{Budget, Engine, Run, Sharing, Strategy};
 use bitwright::mba::MbaConfig;
-use bitwright::{Context, ParseOptions, View};
 #[cfg(feature = "prove")]
 use bitwright::{BitVec, FnEnv, SymbolKey, Width};
+use bitwright::{Context, ParseOptions, View};
 
 fn engine() -> Engine {
     Engine::builder()
@@ -70,12 +70,16 @@ fn projected_input_can_exclude_a_word_without_excluding_its_neighbor() {
     let mut mixed = cx.and(x, mask).unwrap();
     // A bijection of the masked inputs. One label below is reachable, one is not.
     let encode = |mut v: u8| {
-        for i in 1..=55u8 { v = v.wrapping_add(i) ^ i.wrapping_mul(13); }
+        for i in 1..=55u8 {
+            v = v.wrapping_add(i) ^ i.wrapping_mul(13);
+        }
         v
     };
     for i in 1..=55u8 {
         let a = cx.constant_u64(Width::W8, i.into()).unwrap();
-        let b = cx.constant_u64(Width::W8, i.wrapping_mul(13).into()).unwrap();
+        let b = cx
+            .constant_u64(Width::W8, i.wrapping_mul(13).into())
+            .unwrap();
         mixed = cx.add(mixed, a).unwrap();
         mixed = cx.xor(mixed, b).unwrap();
     }
@@ -83,13 +87,24 @@ fn projected_input_can_exclude_a_word_without_excluding_its_neighbor() {
     for seed in [0x54, 0x56] {
         let label = cx.constant_u64(Width::W8, encode(seed).into()).unwrap();
         let cmp = cx.ne(mixed, label).unwrap();
-        let out = eng.run(&mut cx, &[cmp], Run::default().with_per_call(Budget::fuel(4096))).unwrap().roots[0].expr;
+        let out = eng
+            .run(
+                &mut cx,
+                &[cmp],
+                Run::default().with_per_call(Budget::fuel(4096)),
+            )
+            .unwrap()
+            .roots[0]
+            .expr;
         if seed == 0x56 {
             assert!(matches!(cx.view(out).unwrap(), View::Const(v) if !v.is_zero()));
         }
         for v in 0..=255 {
             let env = FnEnv(|_: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, v)));
-            assert_eq!(cx.eval(&[out], &env).unwrap()[0].is_zero(), v as u8 & 0x55 == seed);
+            assert_eq!(
+                cx.eval(&[out], &env).unwrap()[0].is_zero(),
+                v as u8 & 0x55 == seed
+            );
         }
     }
 }
@@ -115,9 +130,22 @@ fn projected_select_tags_do_not_escape_their_guard() {
     let choice = cx.select(b, arm, noise).unwrap();
     let body = cx.and(tag, choice).unwrap();
     let root = cx.not(body).unwrap();
-    let out = engine().run(&mut cx, &[root], Run::default().with_per_call(Budget::fuel(4096))).unwrap().roots[0].expr;
+    let out = engine()
+        .run(
+            &mut cx,
+            &[root],
+            Run::default().with_per_call(Budget::fuel(4096)),
+        )
+        .unwrap()
+        .roots[0]
+        .expr;
     for x in 0u64..256 {
-        let got = cx.eval(&[out], &[("x".into(), BitVec::from_u64(Width::W8, x).unwrap())][..]).unwrap();
+        let got = cx
+            .eval(
+                &[out],
+                &[("x".into(), BitVec::from_u64(Width::W8, x).unwrap())][..],
+            )
+            .unwrap();
         assert_eq!(!got[0].is_zero(), (x + 23) & 40 != 8 || x & 1 == 0);
     }
 }
@@ -160,9 +188,12 @@ fn specializing_a_guard_does_not_drop_unlisted_labels() {
     for label in [3, 17, 5] {
         let word = cx.constant_u64(Width::W8, label).unwrap();
         guards.push(cx.eq(x, word).unwrap());
-        let value = cx.eval(&[mixed], &FnEnv(|_: &SymbolKey, w| {
-            Some(BitVec::wrapping_from_u64(w, label))
-        })).unwrap()[0];
+        let value = cx
+            .eval(
+                &[mixed],
+                &FnEnv(|_: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, label))),
+            )
+            .unwrap()[0];
         let value = cx.constant_u64(Width::W8, value.to_u64().unwrap()).unwrap();
         excludes.push(cx.ne(mixed, value).unwrap());
     }
@@ -180,7 +211,10 @@ fn specializing_a_guard_does_not_drop_unlisted_labels() {
         }
         for i in 0..=255 {
             let env = FnEnv(|_: &SymbolKey, w| Some(BitVec::wrapping_from_u64(w, i)));
-            assert_eq!(cx.eval(&[out], &env).unwrap()[0].is_zero(), has_third && i == 5);
+            assert_eq!(
+                cx.eval(&[out], &env).unwrap()[0].is_zero(),
+                has_third && i == 5
+            );
         }
     }
 }
@@ -199,10 +233,14 @@ fn guarded_pairs_need_a_contradiction_in_every_case() {
         let c = cx.constant_u64(Width::W8, u64::from(k)).unwrap();
         value = cx.add(value, c).unwrap();
         value = cx.xor(value, c).unwrap();
-        for v in &mut outputs { *v = v.wrapping_add(k) ^ k; }
+        for v in &mut outputs {
+            *v = v.wrapping_add(k) ^ k;
+        }
     }
     let po = ParseOptions::default();
-    let guards = cx.parse("((x:8 == 3) | (x == 17)) & ((y:8 == 5) | (y == 29))", &po).unwrap();
+    let guards = cx
+        .parse("((x:8 == 3) | (x == 17)) & ((y:8 == 5) | (y == 29))", &po)
+        .unwrap();
     let exception = cx.parse("z:8 == 223", &po).unwrap();
     let eng = engine();
     for open in [false, true] {
@@ -210,7 +248,9 @@ fn guarded_pairs_need_a_contradiction_in_every_case() {
         for (j, &v) in outputs.iter().enumerate() {
             let c = cx.constant_u64(Width::W8, u64::from(v)).unwrap();
             let mut clause = cx.ne(value, c).unwrap();
-            if open && j == 3 { clause = cx.or(clause, exception).unwrap(); }
+            if open && j == 3 {
+                clause = cx.or(clause, exception).unwrap();
+            }
             body = cx.and(body, clause).unwrap();
         }
         let root = cx.not(body).unwrap();
@@ -219,14 +259,30 @@ fn guarded_pairs_need_a_contradiction_in_every_case() {
         if !open {
             assert!(matches!(cx.view(out).unwrap(), View::Const(v) if !v.is_zero()));
         }
-        for (x, y, z) in [(3, 5, 223), (3, 29, 223), (17, 5, 223), (17, 29, 223), (17, 29, 224), (0, 29, 223)] {
+        for (x, y, z) in [
+            (3, 5, 223),
+            (3, 29, 223),
+            (17, 5, 223),
+            (17, 29, 223),
+            (17, 29, 224),
+            (0, 29, 223),
+        ] {
             let env = FnEnv(|s: &SymbolKey, w| match s {
-                SymbolKey::Str(s) => Some(BitVec::wrapping_from_u64(w, match s.as_ref() {
-                    "x" => x, "y" => y, "z" => z, _ => unreachable!(),
-                })),
+                SymbolKey::Str(s) => Some(BitVec::wrapping_from_u64(
+                    w,
+                    match s.as_ref() {
+                        "x" => x,
+                        "y" => y,
+                        "z" => z,
+                        _ => unreachable!(),
+                    },
+                )),
                 _ => None,
             });
-            assert_eq!(cx.eval(&[out], &env).unwrap()[0].is_zero(), open && (x, y, z) == (17, 29, 223));
+            assert_eq!(
+                cx.eval(&[out], &env).unwrap()[0].is_zero(),
+                open && (x, y, z) == (17, 29, 223)
+            );
         }
     }
 }

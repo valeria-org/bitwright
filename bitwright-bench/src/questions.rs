@@ -38,10 +38,10 @@ impl Retry {
                 .with_basis_sums(true),
         ));
         let stock = MbaConfig::default().with_opaque_sweep(true);
-        let forms = stock.clone().with_noise_forms(true).with_known_atoms(true);
+        let forms = stock.with_noise_forms(true).with_known_atoms(true);
         let word = Engine::builder()
             .builtin()
-            .strategy(Strategy::deobfuscate().with_mba(forms.clone()))
+            .strategy(Strategy::deobfuscate().with_mba(forms))
             .mba_solver(solver.clone())
             .build()?;
         Ok(Self {

@@ -44,10 +44,10 @@ use crate::{BinOp, BitVec, CmpOp, UnOp, Width};
 const MAX_TERMS: usize = 96;
 
 /// The most steps one question's forms may take; beyond, it is blasted as asked.
-const MAX_WORK: u32 = 1 << 15;
+const MAX_WORK: u32 = 1 << 17;
 
 /// The deepest the forms nest (a value below is taken as it is).
-const MAX_DEPTH: u32 = 120;
+const MAX_DEPTH: u32 = 512;
 
 fn ones(n: u16) -> u64 {
     if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }

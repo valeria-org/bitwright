@@ -848,7 +848,11 @@ impl<'c> Blaster<'c> {
             OpCode::BitRev => bitrev(&self.bits[&n.a]),
             OpCode::Zext | OpCode::Sext => {
                 let low = &self.bits[&n.a];
-                let fill = if n.op == OpCode::Sext { low[low.len() - 1] } else { aig::FALSE };
+                let fill = if n.op == OpCode::Sext {
+                    low[low.len() - 1]
+                } else {
+                    aig::FALSE
+                };
                 let mut out = Vec::with_capacity(w);
                 out.extend_from_slice(low);
                 out.resize(w, fill);
@@ -898,13 +902,24 @@ impl<'c> Blaster<'c> {
                     OpCode::Sub => sub(g, a, b),
                     OpCode::Mul if self.carry_save_multiplication => mul_carry_save(g, a, b),
                     OpCode::Mul => mul(g, a, b),
-                    OpCode::UMulHi if self.carry_save_multiplication => mulhi_carry_save(g, a, b, false),
+                    OpCode::UMulHi if self.carry_save_multiplication => {
+                        mulhi_carry_save(g, a, b, false)
+                    }
                     OpCode::UMulHi => mulhi(g, a, b, false),
-                    OpCode::SMulHi if self.carry_save_multiplication => mulhi_carry_save(g, a, b, true),
+                    OpCode::SMulHi if self.carry_save_multiplication => {
+                        mulhi_carry_save(g, a, b, true)
+                    }
                     OpCode::SMulHi => mulhi(g, a, b, true),
                     OpCode::UDiv | OpCode::URem => {
-                        let qr = self.udivrem_cache.entry((n.a, n.b)).or_insert_with(|| udivrem(g, a, b));
-                        if op == OpCode::UDiv { qr.0.clone() } else { qr.1.clone() }
+                        let qr = self
+                            .udivrem_cache
+                            .entry((n.a, n.b))
+                            .or_insert_with(|| udivrem(g, a, b));
+                        if op == OpCode::UDiv {
+                            qr.0.clone()
+                        } else {
+                            qr.1.clone()
+                        }
                     }
                     OpCode::SDiv => sdiv(g, a, b),
                     OpCode::SRem => srem(g, a, b),
@@ -1155,8 +1170,11 @@ impl Question {
         }
         // Reserve at least one ordinary circuit batch. Sample the *original implication*
         // so even constraints hidden inside the predicate participate in witness validation.
-        if cfg.simplify && !cfg.certificate && !cfg.word_sampling
-            && cfg.sample_mode == SampleMode::Random && cfg.samples >= 128
+        if cfg.simplify
+            && !cfg.certificate
+            && !cfg.word_sampling
+            && cfg.sample_mode == SampleMode::Random
+            && cfg.samples >= 128
             && env.deadline.is_none()
             && let Some((tested, model)) = sample_words::guard_samples(cx, root)
         {
@@ -1168,139 +1186,405 @@ impl Question {
         }
         let remaining_batches = cfg.samples.div_ceil(64) - (q.stats.samples / 64) as u32;
         let mut joint_fallback: Option<u32> = None;
+        let mut owned_assumptions: Option<Assumptions> = None;
         if cfg.simplify && !cfg.certificate {
             let mut allowance = crate::engine::Allowance::new(cfg.simplify_budget);
             let engine = (env.simplifiers).engine(cfg.strict, cfg.proved_words);
-            let first_budget = if !cons.is_empty() && cfg.simplify_budget.node_visits >= 65536 {
-                let b = cfg.simplify_budget;
-                crate::engine::Budget {
-                    node_visits: (b.node_visits / 2).max(1),
-                    candidates: (b.candidates / 2).max(1),
-                    match_steps: (b.match_steps / 2).max(1),
-                    rewrites: (b.rewrites / 2).max(1),
-                    new_nodes: (b.new_nodes / 2).max(1),
-                    fact_work: (b.fact_work / 2).max(1),
-                    pass_work: (b.pass_work / 2).max(1),
-                    mba_calls: (b.mba_calls / 2).max(1),
-                    mba_steps: (b.mba_steps / 2).max(1),
-                    eqsat_nodes: (b.eqsat_nodes / 2).max(1),
-                    eqsat_work: (b.eqsat_work / 2).max(1),
+
+            // Decompose top-level negated conjunctions `~(c1 & ... & ck)` and disjunctions
+            // `d1 | ... | dk` into counterexample conjuncts `u1 & ... & uk` (`!goal <=> /\ ui`).
+            // Lifting simple guard conjuncts (`#sym == K`, `trunc<1>(#sym)`, constant bounds)
+            // into a scoped `Assumptions` overlay lets `Engine` specialize heavy sibling
+            // subgraphs (such as multi-round hashes or subset-sum guards) in one pass while
+            // retaining every guard in `cons` as a level-0 unit clause for sampling and SAT.
+            let initial_units = extract_counterexample_conjuncts(cx, goal_node, 128)?;
+            let mut handled_by_clause_lift = false;
+            if initial_units.len() >= 2 {
+                let mut deduped = Vec::with_capacity(initial_units.len());
+                let mut contradicted = false;
+                for u in initial_units {
+                    if let Some(cv) = cx.const_val(u) {
+                        if cv.is_zero() {
+                            contradicted = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if deduped
+                        .iter()
+                        .any(|&prev| cx.are_bitwise_complements(prev, u))
+                    {
+                        contradicted = true;
+                        break;
+                    }
+                    if !deduped.contains(&u) {
+                        deduped.push(u);
+                    }
                 }
-            } else {
-                cfg.simplify_budget
-            };
-            let run = crate::engine::Run::default()
-                .with_per_call(first_budget)
-                .with_allowance(&mut allowance);
-            let run = match assumptions {
-                Some(a) => run.with_assumptions(a),
-                None => run,
-            };
-            let run = match env.deadline {
-                Some(d) => run.with_deadline(d),
-                None => run,
-            };
-            let goal = cx.handle(goal_node);
-            let mut out = engine.run(cx, &[goal], run)?.roots[0];
-            let mut s = cx.id(out.expr)?;
-            let mut proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
-            // When MBA solver calls/steps stop round 0 early while the cheap algebraic passes
-            // still have budget, give `s` follow-up pass(es) within the same allowance so
-            // sweep/linear/compares/poly/linear_mba can finish simplifying what was exposed.
-            if !proved
-                && s != goal_node
-                && matches!(
-                    out.end,
-                    crate::engine::End::BudgetTerminated(
-                        crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
-                    )
-                )
-            {
-                for _ in 0..2 {
-                    let prev = s;
-                    let run = crate::engine::Run::default()
-                        .with_per_call(cfg.simplify_budget)
-                        .with_allowance(&mut allowance);
-                    let run = match env.deadline {
-                        Some(d) => run.with_deadline(d),
-                        None => run,
+                if contradicted {
+                    q.stats.simplification = Simplification {
+                        ran: true,
+                        spent: allowance.spent(),
+                        stopped: None,
+                        decided: true,
                     };
-                    let run = match assumptions {
-                        Some(a) => run.with_assumptions(a),
-                        None => run,
+                    return decided(q, Outcome::Proved(None));
+                }
+                let mut guard_idxs: Vec<usize> = (0..deduped.len())
+                    .filter(|&idx| is_liftable_guard(cx, deduped[idx]))
+                    .collect();
+                guard_idxs.sort_by_key(|&idx| (cx.meta[deduped[idx] as usize].tree, idx));
+                if guard_idxs.len() > 48 {
+                    guard_idxs.truncate(48);
+                }
+                if !guard_idxs.is_empty() {
+                    handled_by_clause_lift = true;
+                    // Keep at least one conjunct outside `f_units` when all conjuncts matched
+                    // `is_liftable_guard`, unless `Assumptions` itself detects infeasibility.
+                    let mut in_f = vec![false; deduped.len()];
+                    for &idx in &guard_idxs {
+                        in_f[idx] = true;
+                    }
+                    let mut check_all_f = assumptions.cloned().unwrap_or_default();
+                    for &idx in &guard_idxs {
+                        check_all_f.assume_true(cx, cx.handle(deduped[idx]))?;
+                        if check_all_f.is_infeasible() {
+                            q.stats.simplification = Simplification {
+                                ran: true,
+                                spent: allowance.spent(),
+                                stopped: None,
+                                decided: true,
+                            };
+                            return decided(q, Outcome::Proved(None));
+                        }
+                    }
+                    if in_f.iter().all(|&b| b)
+                        && let Some(&drop_idx) = guard_idxs.last()
+                    {
+                        in_f[drop_idx] = false;
+                    }
+                    let mut f_units: Vec<u32> = (0..deduped.len())
+                        .filter(|&i| in_f[i])
+                        .map(|i| deduped[i])
+                        .collect();
+                    let r_units: Vec<u32> = (0..deduped.len())
+                        .filter(|&i| !in_f[i])
+                        .map(|i| deduped[i])
+                        .collect();
+
+                    // Simplify lifted small guards in `f_units` as a single conjunction under
+                    // external `assumptions` only (without spending MBA solver calls) before
+                    // seeding `eff`, so declared-bit / constant facts fold away trivial guards.
+                    if !f_units.is_empty() {
+                        let mut f_conj = f_units[0];
+                        for &u in &f_units[1..] {
+                            f_conj = cx.c_bin(crate::BinOp::And, f_conj, u)?;
+                        }
+                        let f_budget = crate::engine::Budget::fuel(2048)
+                            .with_mba_calls(0)
+                            .with_mba_steps(0)
+                            .min(&cfg.simplify_budget);
+                        let run = crate::engine::Run::default()
+                            .with_per_call(f_budget)
+                            .with_allowance(&mut allowance);
+                        let run = match assumptions {
+                            Some(a) => run.with_assumptions(a),
+                            None => run,
+                        };
+                        let run = match env.deadline {
+                            Some(d) => run.with_deadline(d),
+                            None => run,
+                        };
+                        let f_ro = engine.run(cx, &[cx.handle(f_conj)], run)?.roots[0];
+                        if f_ro.end
+                            == crate::engine::End::BudgetTerminated(
+                                crate::engine::Exhausted::Deadline,
+                            )
+                        {
+                            q.stats.simplification = Simplification {
+                                ran: true,
+                                spent: allowance.spent(),
+                                stopped: Some(crate::engine::Exhausted::Deadline),
+                                decided: false,
+                            };
+                            return decided(q, Outcome::Unknown(Unknown::Deadline));
+                        }
+                        let f_id = cx.id(f_ro.expr)?;
+                        let mut next_f = Vec::with_capacity(f_units.len());
+                        let mut f_stack = vec![f_id];
+                        while let Some(cur) = f_stack.pop() {
+                            if cx.node(cur).op == OpCode::And && next_f.len() < 64 {
+                                let cn = cx.node(cur);
+                                f_stack.push(cn.b);
+                                f_stack.push(cn.a);
+                                continue;
+                            }
+                            if let Some(cv) = cx.const_val(cur) {
+                                if cv.is_zero() {
+                                    q.stats.simplification = Simplification {
+                                        ran: true,
+                                        spent: allowance.spent(),
+                                        stopped: None,
+                                        decided: true,
+                                    };
+                                    return decided(q, Outcome::Proved(None));
+                                }
+                                continue;
+                            }
+                            if !next_f.contains(&cur) {
+                                next_f.push(cur);
+                            }
+                        }
+                        f_units = next_f;
+                    }
+
+                    let mut eff = assumptions.cloned().unwrap_or_default();
+                    for &f in &f_units {
+                        eff.assume_true(cx, cx.handle(f))?;
+                        if eff.is_infeasible() {
+                            q.stats.simplification = Simplification {
+                                ran: true,
+                                spent: allowance.spent(),
+                                stopped: None,
+                                decided: true,
+                            };
+                            return decided(q, Outcome::Proved(None));
+                        }
+                    }
+
+                    // Simplify the remaining counterexample conjuncts as ONE single negated
+                    // conjunction `~(r_1 & ... & r_k)` under `eff` so `Engine` owns shared
+                    // sub-DAGs without multi-root `Others` pinning and traverses them once.
+                    let mut last_end = crate::engine::End::Completed;
+                    let mut r_goal_opt: Option<u32> = None;
+                    if !r_units.is_empty() {
+                        let mut r_conj = r_units[0];
+                        for &u in &r_units[1..] {
+                            r_conj = cx.c_bin(crate::BinOp::And, r_conj, u)?;
+                        }
+                        let mut s = cx.c_un(crate::UnOp::Not, r_conj)?;
+                        for pass_round in 0..3u8 {
+                            let prev = s;
+                            let run = crate::engine::Run::default()
+                                .with_per_call(cfg.simplify_budget)
+                                .with_allowance(&mut allowance)
+                                .with_assumptions(&eff);
+                            let run = match env.deadline {
+                                Some(d) => run.with_deadline(d),
+                                None => run,
+                            };
+                            let ro = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
+                            s = cx.id(ro.expr)?;
+                            last_end = ro.end;
+                            if last_end
+                                == crate::engine::End::BudgetTerminated(
+                                    crate::engine::Exhausted::Deadline,
+                                )
+                            {
+                                q.stats.simplification = Simplification {
+                                    ran: true,
+                                    spent: allowance.spent(),
+                                    stopped: Some(crate::engine::Exhausted::Deadline),
+                                    decided: false,
+                                };
+                                return decided(q, Outcome::Unknown(Unknown::Deadline));
+                            }
+                            if let Some(cv) = cx.const_val(s) {
+                                if !cv.is_zero() {
+                                    q.stats.simplification = Simplification {
+                                        ran: true,
+                                        spent: allowance.spent(),
+                                        stopped: None,
+                                        decided: true,
+                                    };
+                                    return decided(q, Outcome::Proved(None));
+                                }
+                                // `s == 0`: `r_conj` simplified to `true` under `eff`, so only
+                                // `f_units` remain in the counterexample conjunction.
+                                break;
+                            }
+                            let hit_mba_cap = matches!(
+                                last_end,
+                                crate::engine::End::BudgetTerminated(
+                                    crate::engine::Exhausted::MbaSteps
+                                        | crate::engine::Exhausted::MbaCalls
+                                )
+                            );
+                            if s == prev || !hit_mba_cap || pass_round == 2 {
+                                break;
+                            }
+                        }
+                        if cx.const_val(s).is_none() {
+                            r_goal_opt = Some(s);
+                        }
+                    }
+
+                    // Re-extract any conjuncts from `r_goal_opt` to expose unit constraints and
+                    // check pairwise complements with `f_units`.
+                    let mut all_units = f_units;
+                    if let Some(s) = r_goal_opt {
+                        let mut flat_stack = extract_counterexample_conjuncts(cx, s, 128)?;
+                        flat_stack.reverse();
+                        while let Some(cur) = flat_stack.pop() {
+                            if cx.node(cur).op == OpCode::And && all_units.len() < 192 {
+                                let cn = cx.node(cur);
+                                flat_stack.push(cn.b);
+                                flat_stack.push(cn.a);
+                                continue;
+                            }
+                            if let Some(cv) = cx.const_val(cur) {
+                                if cv.is_zero() {
+                                    q.stats.simplification = Simplification {
+                                        ran: true,
+                                        spent: allowance.spent(),
+                                        stopped: None,
+                                        decided: true,
+                                    };
+                                    return decided(q, Outcome::Proved(None));
+                                }
+                                continue;
+                            }
+                            if all_units
+                                .iter()
+                                .any(|&prev| cx.are_bitwise_complements(prev, cur))
+                            {
+                                q.stats.simplification = Simplification {
+                                    ran: true,
+                                    spent: allowance.spent(),
+                                    stopped: None,
+                                    decided: true,
+                                };
+                                return decided(q, Outcome::Proved(None));
+                            }
+                            if !all_units.contains(&cur) {
+                                if is_liftable_guard(cx, cur) {
+                                    eff.assume_true(cx, cx.handle(cur))?;
+                                    if eff.is_infeasible() {
+                                        q.stats.simplification = Simplification {
+                                            ran: true,
+                                            spent: allowance.spent(),
+                                            stopped: None,
+                                            decided: true,
+                                        };
+                                        return decided(q, Outcome::Proved(None));
+                                    }
+                                }
+                                all_units.push(cur);
+                            }
+                        }
+                    }
+
+                    q.stats.simplification = Simplification {
+                        ran: true,
+                        spent: allowance.spent(),
+                        stopped: match last_end {
+                            crate::engine::End::BudgetTerminated(why) => Some(why),
+                            _ => None,
+                        },
+                        decided: false,
                     };
-                    let next = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
-                    s = cx.id(next.expr)?;
-                    if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
-                        proved = true;
-                        out = next;
-                        break;
+                    if let Some(last_u) = all_units.pop() {
+                        for u in all_units {
+                            if !cons.contains(&u) {
+                                cons.push(u);
+                            }
+                        }
+                        goal_node = cx.c_un(crate::UnOp::Not, last_u)?;
+                    } else {
+                        // Every conjunct simplified to `true`, so `!goal` reduces to `cons`.
+                        goal_node = cx.mk_const_u64(1, 0)?;
                     }
-                    if s == prev {
-                        break;
-                    }
+                    owned_assumptions = Some(eff);
                 }
             }
-            // When assumptions are present and simplifying the goal alone did not decide it,
-            // simplify the joint counterexample `!goal & c1 & c2 & ...` within the remaining
-            // allowance so guard/field specialization and cross-conjunct MBA cancellation see
-            // both the goal and its assumptions together.
-            if !proved
-                && !cons.is_empty()
-                && !matches!(
-                    out.end,
-                    crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
-                        | crate::engine::End::Declined(_)
-                )
-            {
-                let mut bad = cx.c_un(crate::UnOp::Not, s)?;
-                for &c in &cons {
-                    bad = cx.c_bin(crate::BinOp::And, bad, c)?;
-                }
+
+            if !handled_by_clause_lift {
+                let first_budget = if !cons.is_empty() && cfg.simplify_budget.node_visits >= 65536 {
+                    let b = cfg.simplify_budget;
+                    crate::engine::Budget {
+                        node_visits: (b.node_visits / 2).max(1),
+                        candidates: (b.candidates / 2).max(1),
+                        match_steps: (b.match_steps / 2).max(1),
+                        rewrites: (b.rewrites / 2).max(1),
+                        new_nodes: (b.new_nodes / 2).max(1),
+                        fact_work: (b.fact_work / 2).max(1),
+                        pass_work: (b.pass_work / 2).max(1),
+                        mba_calls: (b.mba_calls / 2).max(1),
+                        mba_steps: (b.mba_steps / 2).max(1),
+                        eqsat_nodes: (b.eqsat_nodes / 2).max(1),
+                        eqsat_work: (b.eqsat_work / 2).max(1),
+                    }
+                } else {
+                    cfg.simplify_budget
+                };
                 let run = crate::engine::Run::default()
-                    .with_per_call(cfg.simplify_budget)
+                    .with_per_call(first_budget)
                     .with_allowance(&mut allowance);
+                let run = match assumptions {
+                    Some(a) => run.with_assumptions(a),
+                    None => run,
+                };
                 let run = match env.deadline {
                     Some(d) => run.with_deadline(d),
                     None => run,
                 };
-                let joint = engine.run(cx, &[cx.handle(bad)], run)?.roots[0];
-                let reduced = cx.id(joint.expr)?;
-                if cx.const_val(reduced).is_some_and(|v| v.is_zero()) {
-                    proved = true;
-                    s = cx.mk_const_u64(1, 1)?;
-                    out = joint;
-                } else {
-                    if out.end == crate::engine::End::Completed
-                        && joint.end != crate::engine::End::Completed
-                    {
-                        out.end = joint.end;
-                    }
-                    // Keep separate `cons` as unit assertions when they fit the circuit cap,
-                    // reserving `!reduced` for when raw assumptions would exceed `max_nodes`.
-                    if reduced != bad {
-                        joint_fallback = Some(cx.c_un(crate::UnOp::Not, reduced)?);
+                let goal = cx.handle(goal_node);
+                let mut out = engine.run(cx, &[goal], run)?.roots[0];
+                let mut s = cx.id(out.expr)?;
+                let mut proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+                // When MBA solver calls/steps stop round 0 early while the cheap algebraic passes
+                // still have budget, give `s` follow-up pass(es) within the same allowance so
+                // sweep/linear/compares/poly/linear_mba can finish simplifying what was exposed.
+                if !proved
+                    && s != goal_node
+                    && matches!(
+                        out.end,
+                        crate::engine::End::BudgetTerminated(
+                            crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
+                        )
+                    )
+                {
+                    for _ in 0..2 {
+                        let prev = s;
+                        let run = crate::engine::Run::default()
+                            .with_per_call(cfg.simplify_budget)
+                            .with_allowance(&mut allowance);
+                        let run = match env.deadline {
+                            Some(d) => run.with_deadline(d),
+                            None => run,
+                        };
+                        let run = match assumptions {
+                            Some(a) => run.with_assumptions(a),
+                            None => run,
+                        };
+                        let next = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
+                        s = cx.id(next.expr)?;
+                        if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
+                            proved = true;
+                            out = next;
+                            break;
+                        }
+                        if s == prev {
+                            break;
+                        }
                     }
                 }
-            }
-            // For a compound word equality `a == b` left open after separate simplification,
-            // simplify `a - b` in the remaining allowance so MBA normal forms see both sides
-            // together. Only when both sides are non-leaf operations.
-            if !proved
-                && cons.is_empty()
-                && !matches!(
-                    out.end,
-                    crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
-                        | crate::engine::End::Declined(_)
-                )
-                && cx.node(s).op == OpCode::Eq
-            {
-                let eq = cx.node(s);
-                if cx.wid(eq.a) > 1
-                    && cx.node(eq.a).op.arity() > 0
-                    && cx.node(eq.b).op.arity() > 0
+                // When assumptions are present and simplifying the goal alone did not decide it,
+                // simplify the joint counterexample `!goal & c1 & c2 & ...` within the remaining
+                // allowance so guard/field specialization and cross-conjunct MBA cancellation see
+                // both the goal and its assumptions together.
+                if !proved
+                    && !cons.is_empty()
+                    && !matches!(
+                        out.end,
+                        crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
+                            | crate::engine::End::Declined(_)
+                    )
                 {
-                    let diff = cx.c_bin(crate::BinOp::Sub, eq.a, eq.b)?;
+                    let mut bad = cx.c_un(crate::UnOp::Not, s)?;
+                    for &c in &cons {
+                        bad = cx.c_bin(crate::BinOp::And, bad, c)?;
+                    }
                     let run = crate::engine::Run::default()
                         .with_per_call(cfg.simplify_budget)
                         .with_allowance(&mut allowance);
@@ -1308,152 +1592,208 @@ impl Question {
                         Some(d) => run.with_deadline(d),
                         None => run,
                     };
-                    let res = engine.run(cx, &[cx.handle(diff)], run)?.roots[0];
-                    let reduced = cx.id(res.expr)?;
-                    if let Some(v) = cx.const_val(reduced) {
-                        if v.is_zero() {
-                            proved = true;
-                            s = cx.mk_const_u64(1, 1)?;
-                            out = res;
-                        } else {
-                            s = cx.mk_const_u64(1, 0)?;
-                        }
-                    } else if res.end != crate::engine::End::Completed {
-                        out.end = res.end;
+                    let joint = engine.run(cx, &[cx.handle(bad)], run)?.roots[0];
+                    let reduced = cx.id(joint.expr)?;
+                    if cx.const_val(reduced).is_some_and(|v| v.is_zero()) {
+                        proved = true;
+                        s = cx.mk_const_u64(1, 1)?;
+                        out = joint;
                     } else {
-                        if out.end != crate::engine::End::Completed {
-                            let run = crate::engine::Run::default()
-                                .with_per_call(cfg.simplify_budget)
-                                .with_allowance(&mut allowance);
-                            let run = match env.deadline {
-                                Some(d) => run.with_deadline(d),
-                                None => run,
-                            };
-                            let top = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
-                            s = cx.id(top.expr)?;
-                            out.end = top.end;
-                            if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
-                                proved = true;
-                                out = top;
-                            }
+                        if out.end == crate::engine::End::Completed
+                            && joint.end != crate::engine::End::Completed
+                        {
+                            out.end = joint.end;
                         }
-                        if !proved && matches!(
-                            cx.dag_size(&[cx.handle(s)], 256)?,
-                            crate::expr::Bounded::Exact(_)
-                        ) {
-                        // Sound proof-only affine rebasing: rewrite `(x << k) + c` as `y << k`
-                        // with `x = y - (c >> k)` when `c` has at least `k` trailing zeros.
-                        // Proving the rebased difference zero proves the original equality;
-                        // a nonzero result is ignored since `x` may be a constrained subterm.
-                        let nodes = cx.post_order_ids(&[s]);
-                        let mut attempts = 0usize;
-                        for sum in nodes {
-                            let sn = cx.node(sum);
-                            if sn.op != OpCode::Add || sn.width > 64 {
-                                continue;
-                            }
-                            let shifted = cx.node(sn.a);
-                            if shifted.op != OpCode::Shl {
-                                continue;
-                            }
-                            let Some(k) = cx.const_val(shifted.b).and_then(|v| v.to_u64()) else {
-                                continue;
-                            };
-                            let Some(c) = cx.const_val(sn.b).and_then(|v| v.to_u64()) else {
-                                continue;
-                            };
-                            if k == 0 || k >= u64::from(sn.width) || c.trailing_zeros() < k as u32 {
-                                continue;
-                            }
-                            let w = cx.width_of(shifted.a);
-                            let fresh = cx.fresh_symbol(w)?;
-                            let y = cx.id(fresh)?;
-                            let bias = cx.mk_const_u64(sn.width, c >> k)?;
-                            let original = cx.c_bin(crate::BinOp::Sub, y, bias)?;
-                            let rebased = cx.c_bin(crate::BinOp::Shl, y, shifted.b)?;
-                            let unshifted = cx.c_bin(crate::BinOp::Sub, rebased, sn.b)?;
-                            let mut repl = IdMap::default();
-                            repl.insert(sum, rebased);
-                            repl.insert(sn.a, unshifted);
-                            repl.insert(shifted.a, original);
-                            let cand = cx.substitute_ids(&[diff], &repl)?[0];
-                            let run = crate::engine::Run::default()
-                                .with_per_call(cfg.simplify_budget)
-                                .with_allowance(&mut allowance);
-                            let run = match env.deadline {
-                                Some(d) => run.with_deadline(d),
-                                None => run,
-                            };
-                            let r = engine.run(cx, &[cx.handle(cand)], run)?.roots[0];
-                            let rv = cx.id(r.expr)?;
-                            if cx.const_val(rv).is_some_and(|v| v.is_zero()) {
+                        // Keep separate `cons` as unit assertions when they fit the circuit cap,
+                        // reserving `!reduced` for when raw assumptions would exceed `max_nodes`.
+                        if reduced != bad {
+                            joint_fallback = Some(cx.c_un(crate::UnOp::Not, reduced)?);
+                        }
+                    }
+                }
+                // For a compound word equality `a == b` left open after separate simplification,
+                // simplify `a - b` in the remaining allowance so MBA normal forms see both sides
+                // together. Only when both sides are non-leaf operations.
+                if !proved
+                    && cons.is_empty()
+                    && !matches!(
+                        out.end,
+                        crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
+                            | crate::engine::End::Declined(_)
+                    )
+                    && cx.node(s).op == OpCode::Eq
+                {
+                    let eq = cx.node(s);
+                    if cx.wid(eq.a) > 1
+                        && cx.node(eq.a).op.arity() > 0
+                        && cx.node(eq.b).op.arity() > 0
+                    {
+                        let diff = cx.c_bin(crate::BinOp::Sub, eq.a, eq.b)?;
+                        let run = crate::engine::Run::default()
+                            .with_per_call(cfg.simplify_budget)
+                            .with_allowance(&mut allowance);
+                        let run = match env.deadline {
+                            Some(d) => run.with_deadline(d),
+                            None => run,
+                        };
+                        let res = engine.run(cx, &[cx.handle(diff)], run)?.roots[0];
+                        let reduced = cx.id(res.expr)?;
+                        if let Some(v) = cx.const_val(reduced) {
+                            if v.is_zero() {
                                 proved = true;
                                 s = cx.mk_const_u64(1, 1)?;
-                                out = r;
-                                break;
+                                out = res;
+                            } else {
+                                s = cx.mk_const_u64(1, 0)?;
                             }
-                            if r.end != crate::engine::End::Completed {
-                                out.end = r.end;
-                                break;
+                        } else if res.end != crate::engine::End::Completed {
+                            out.end = res.end;
+                        } else {
+                            if out.end != crate::engine::End::Completed {
+                                let run = crate::engine::Run::default()
+                                    .with_per_call(cfg.simplify_budget)
+                                    .with_allowance(&mut allowance);
+                                let run = match env.deadline {
+                                    Some(d) => run.with_deadline(d),
+                                    None => run,
+                                };
+                                let top = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
+                                s = cx.id(top.expr)?;
+                                out.end = top.end;
+                                if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
+                                    proved = true;
+                                    out = top;
+                                }
                             }
-                            attempts += 1;
-                            if attempts == 4 {
-                                break;
+                            if !proved
+                                && matches!(
+                                    cx.dag_size(&[cx.handle(s)], 256)?,
+                                    crate::expr::Bounded::Exact(_)
+                                )
+                            {
+                                // Sound proof-only affine rebasing: rewrite `(x << k) + c` as `y << k`
+                                // with `x = y - (c >> k)` when `c` has at least `k` trailing zeros.
+                                // Proving the rebased difference zero proves the original equality;
+                                // a nonzero result is ignored since `x` may be a constrained subterm.
+                                let nodes = cx.post_order_ids(&[s]);
+                                let mut attempts = 0usize;
+                                for sum in nodes {
+                                    let sn = cx.node(sum);
+                                    if sn.op != OpCode::Add || sn.width > 64 {
+                                        continue;
+                                    }
+                                    let shifted = cx.node(sn.a);
+                                    if shifted.op != OpCode::Shl {
+                                        continue;
+                                    }
+                                    let Some(k) = cx.const_val(shifted.b).and_then(|v| v.to_u64())
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(c) = cx.const_val(sn.b).and_then(|v| v.to_u64())
+                                    else {
+                                        continue;
+                                    };
+                                    if k == 0
+                                        || k >= u64::from(sn.width)
+                                        || c.trailing_zeros() < k as u32
+                                    {
+                                        continue;
+                                    }
+                                    let w = cx.width_of(shifted.a);
+                                    let fresh = cx.fresh_symbol(w)?;
+                                    let y = cx.id(fresh)?;
+                                    let bias = cx.mk_const_u64(sn.width, c >> k)?;
+                                    let original = cx.c_bin(crate::BinOp::Sub, y, bias)?;
+                                    let rebased = cx.c_bin(crate::BinOp::Shl, y, shifted.b)?;
+                                    let unshifted = cx.c_bin(crate::BinOp::Sub, rebased, sn.b)?;
+                                    let mut repl = IdMap::default();
+                                    repl.insert(sum, rebased);
+                                    repl.insert(sn.a, unshifted);
+                                    repl.insert(shifted.a, original);
+                                    let cand = cx.substitute_ids(&[diff], &repl)?[0];
+                                    let run = crate::engine::Run::default()
+                                        .with_per_call(cfg.simplify_budget)
+                                        .with_allowance(&mut allowance);
+                                    let run = match env.deadline {
+                                        Some(d) => run.with_deadline(d),
+                                        None => run,
+                                    };
+                                    let r = engine.run(cx, &[cx.handle(cand)], run)?.roots[0];
+                                    let rv = cx.id(r.expr)?;
+                                    if cx.const_val(rv).is_some_and(|v| v.is_zero()) {
+                                        proved = true;
+                                        s = cx.mk_const_u64(1, 1)?;
+                                        out = r;
+                                        break;
+                                    }
+                                    if r.end != crate::engine::End::Completed {
+                                        out.end = r.end;
+                                        break;
+                                    }
+                                    attempts += 1;
+                                    if attempts == 4 {
+                                        break;
+                                    }
+                                }
                             }
-                        }
                         }
                     }
                 }
-            }
-            q.stats.simplification = Simplification {
-                ran: true,
-                spent: allowance.spent(),
-                stopped: if proved {
-                    None
-                } else {
-                    match out.end {
-                        crate::engine::End::BudgetTerminated(why) => Some(why),
-                        _ => None,
+                q.stats.simplification = Simplification {
+                    ran: true,
+                    spent: allowance.spent(),
+                    stopped: if proved {
+                        None
+                    } else {
+                        match out.end {
+                            crate::engine::End::BudgetTerminated(why) => Some(why),
+                            _ => None,
+                        }
+                    },
+                    decided: proved,
+                };
+                let can_run_mixer = out.end == crate::engine::End::Completed
+                    || matches!(
+                        out.end,
+                        crate::engine::End::BudgetTerminated(
+                            crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
+                        )
+                    );
+                if !proved && can_run_mixer && mixer::may_contain_mixer(cx, s) {
+                    let domain_fuel = cfg
+                        .simplify_budget
+                        .pass_work
+                        .saturating_sub(allowance.spent().pass_work)
+                        .min(1 << 20);
+                    let after =
+                        mixer::simplify_predicate(cx, cx.handle(s), assumptions, domain_fuel)?;
+                    let after_id = cx.id(after)?;
+                    if after_id != s {
+                        q.stats.rewritten = true;
+                        s = after_id;
                     }
-                },
-                decided: proved,
-            };
-            let can_run_mixer = out.end == crate::engine::End::Completed
-                || matches!(
-                    out.end,
-                    crate::engine::End::BudgetTerminated(
-                        crate::engine::Exhausted::MbaSteps | crate::engine::Exhausted::MbaCalls
-                    )
-                );
-            if !proved && can_run_mixer && mixer::may_contain_mixer(cx, s) {
-                let domain_fuel = cfg
-                    .simplify_budget
-                    .pass_work
-                    .saturating_sub(allowance.spent().pass_work)
-                    .min(1 << 20);
-                let after = mixer::simplify_predicate(cx, cx.handle(s), assumptions, domain_fuel)?;
-                let after_id = cx.id(after)?;
-                if after_id != s {
-                    q.stats.rewritten = true;
-                    s = after_id;
+                    proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
+                    if proved {
+                        q.stats.simplification.decided = true;
+                        q.stats.simplification.stopped = None;
+                    }
                 }
-                proved = cx.const_val(s).is_some_and(|v| !v.is_zero());
                 if proved {
-                    q.stats.simplification.decided = true;
-                    q.stats.simplification.stopped = None;
+                    return decided(q, Outcome::Proved(None));
                 }
+                // Stopped by its caller: what is left would be built and searched for nobody.
+                if out.end
+                    == crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline)
+                {
+                    return decided(q, Outcome::Unknown(Unknown::Deadline));
+                }
+                // A result that relies on constraints holds where they do, which is all a proof
+                // under them needs.
+                goal_node = s;
             }
-            if proved {
-                return decided(q, Outcome::Proved(None));
-            }
-            // Stopped by its caller: what is left would be built and searched for nobody.
-            if out.end == crate::engine::End::BudgetTerminated(crate::engine::Exhausted::Deadline) {
-                return decided(q, Outcome::Unknown(Unknown::Deadline));
-            }
-            // A result that relies on constraints holds where they do, which is all a proof
-            // under them needs.
-            goal_node = s;
         }
+        let eff_assumptions: Option<&Assumptions> = owned_assumptions.as_ref().or(assumptions);
         if cfg.divisions && !cfg.simplify && !cfg.certificate {
             let run = crate::engine::Run::default().with_per_call(cfg.simplify_budget);
             let run = match assumptions {
@@ -1473,27 +1813,43 @@ impl Question {
             }
         }
         let mut word_sampled = false;
-        if (cfg.word_sampling || cfg.sample_mode == SampleMode::Words)
-            && cfg.samples != 0
-            && let Some(trial) = sample_words::try_sample(cx, goal_node, &cons, assumptions, cfg)
-        {
-            q.stats.samples = trial.samples;
-            word_sampled = true;
-            if let Some(mut model) = trial.model {
-                complete_model(cx, q.root, &mut model)?;
-                let outcome = q.refuted(cx, model)?;
-                return decided(q, outcome);
-            }
-            if trial.complete && !cfg.certificate {
-                return decided(q, Outcome::Proved(None));
+        let explicit_word_sample = cfg.word_sampling || cfg.sample_mode == SampleMode::Words;
+        let run_post_simp_word_sample = explicit_word_sample
+            || (cfg.simplify
+                && !cfg.certificate
+                && cfg.samples >= 128
+                && env.deadline.is_none()
+                && (q.stats.samples == 0 || owned_assumptions.is_some()));
+        if run_post_simp_word_sample && cfg.samples != 0 {
+            let trial_opt = if explicit_word_sample {
+                sample_words::try_sample(cx, goal_node, &cons, eff_assumptions, cfg)
+            } else {
+                sample_words::try_sample_post_simplify(cx, goal_node, &cons, eff_assumptions, cfg)
+            };
+            if let Some(trial) = trial_opt {
+                q.stats.samples += trial.samples;
+                word_sampled = true;
+                if let Some(mut model) = trial.model {
+                    complete_model(cx, q.root, &mut model)?;
+                    let outcome = q.refuted(cx, model)?;
+                    return decided(q, outcome);
+                }
+                if trial.complete && !cfg.certificate {
+                    return decided(q, Outcome::Proved(None));
+                }
             }
         }
         // Every legal assignment, when there are few enough. A proof that asks for a
         // certificate takes it from the circuit below, which is checked independently.
         let mut exhausted = false;
         if cfg.exhaustive_inputs != 0
-            && let Some((failure, evaluated)) =
-                sample_words::try_exhaust(cx, goal_node, &cons, assumptions, cfg.exhaustive_inputs)
+            && let Some((failure, evaluated)) = sample_words::try_exhaust(
+                cx,
+                goal_node,
+                &cons,
+                eff_assumptions,
+                cfg.exhaustive_inputs,
+            )
         {
             q.stats.samples += evaluated;
             match failure {
@@ -1504,6 +1860,26 @@ impl Question {
                 }
                 None if !cfg.certificate => return decided(q, Outcome::Proved(None)),
                 None => exhausted = true,
+            }
+        }
+        if !cfg.certificate {
+            // Factor common sub-sums across single-use `Add` chains before bit-blasting so
+            // multi-round state words share one ripple/carry circuit instead of duplicating it.
+            let mut sum_roots = Vec::with_capacity(2 + cons.len());
+            sum_roots.push(goal_node);
+            sum_roots.extend_from_slice(&cons);
+            if let Some(jf) = joint_fallback {
+                sum_roots.push(jf);
+            }
+            if let Some((factored, _)) =
+                crate::engine::pass::cse::share_sums(cx, &sum_roots, 1 << 19)?
+            {
+                goal_node = factored[0];
+                let cons_end = 1 + cons.len();
+                cons.copy_from_slice(&factored[1..cons_end]);
+                if joint_fallback.is_some() {
+                    joint_fallback = Some(factored[cons_end]);
+                }
             }
         }
         // The question as asked, where writing its sums again changes it.
@@ -1566,7 +1942,7 @@ impl Question {
                         && (!cfg.shared_sums
                             || !cfg.carry_save_multiplication
                             || !cfg.join_factoring)
-                        && (b.too_large || matches!(res, Ok(_))) =>
+                        && (b.too_large || res.is_ok()) =>
                 {
                     compact_retry = true;
                     if !cfg.shared_sums {
@@ -1577,6 +1953,19 @@ impl Question {
                         {
                             q.stats.rewritten = true;
                             return decided(q, Outcome::Proved(None));
+                        }
+                        let mut retry_roots = Vec::with_capacity(1 + cons.len());
+                        retry_roots.push(goal_node);
+                        if use_cons {
+                            retry_roots.extend_from_slice(&cons);
+                        }
+                        if let Some((factored, _)) =
+                            crate::engine::pass::cse::share_sums(cx, &retry_roots, 1 << 19)?
+                        {
+                            goal_node = factored[0];
+                            if use_cons {
+                                cons.copy_from_slice(&factored[1..]);
+                            }
                         }
                     }
                 }
@@ -1633,15 +2022,41 @@ impl Question {
             }
         }
         // Sampled: a lane where the constraints hold and the goal does not refutes it.
-        let batches = if word_sampled {
-            0
+        let batches = if word_sampled { 0 } else { remaining_batches };
+        let pinned_inputs: Vec<Option<bool>> = if batches > 0
+            && let Some(eff) = eff_assumptions
+            && !eff.is_empty()
+        {
+            let mut pins = Vec::new();
+            let mut any_pin = false;
+            for &(sym_id, ref bits) in &b.symbols {
+                let sym_h = b.cx.handle(sym_id);
+                let known =
+                    b.cx.facts_under(sym_h, eff)
+                        .ok()
+                        .flatten()
+                        .map(|(f, _)| f.known());
+                for (j, &lit) in bits.iter().enumerate() {
+                    if lit > aig::TRUE {
+                        let pinned = known.as_ref().and_then(|kb| kb.bit(j as u16));
+                        any_pin |= pinned.is_some();
+                        pins.push(pinned);
+                    }
+                }
+            }
+            if any_pin { pins } else { Vec::new() }
         } else {
-            remaining_batches
+            Vec::new()
         };
         for batch in 0..batches {
-            let vals = b.g.eval_words(|k| match cfg.sample_mode {
-                SampleMode::Random => sample(batch, k),
-                SampleMode::Small | SampleMode::Words => small_sample(batch, k),
+            let vals = b.g.eval_words(|k| {
+                if let Some(&Some(bit_val)) = pinned_inputs.get(k as usize) {
+                    return if bit_val { u64::MAX } else { 0 };
+                }
+                match cfg.sample_mode {
+                    SampleMode::Random => sample(batch, k),
+                    SampleMode::Small | SampleMode::Words => small_sample(batch, k),
+                }
             });
             q.stats.samples += 64;
             let mut bad = !Aig::word(&vals, goal);
@@ -1980,4 +2395,50 @@ pub(crate) fn circuit_equality(
         nodes,
         propagations: stats.propagations,
     })
+}
+
+/// Decomposes a 1-bit `goal` into conjuncts `u1, ..., uk` of `!goal` (`!goal <=> /\ ui`) by
+/// iteratively peeling `Or(a, b)` under negative polarity and `And(a, b)` under positive polarity
+/// across `Not` inversions, up to `max_clauses`.
+fn extract_counterexample_conjuncts(
+    cx: &mut Context,
+    goal: u32,
+    max_clauses: usize,
+) -> Result<Vec<u32>, Error> {
+    let mut out = Vec::new();
+    let mut stack = vec![(goal, false)];
+    while let Some((cur, want_true)) = stack.pop() {
+        let n = cx.node(cur);
+        if n.op == OpCode::Not {
+            stack.push((n.a, !want_true));
+            continue;
+        }
+        if want_true && n.op == OpCode::And && out.len() + stack.len() + 2 <= max_clauses {
+            stack.push((n.b, true));
+            stack.push((n.a, true));
+            continue;
+        }
+        if !want_true && n.op == OpCode::Or && out.len() + stack.len() + 2 <= max_clauses {
+            stack.push((n.b, false));
+            stack.push((n.a, false));
+            continue;
+        }
+        let lit = if want_true {
+            cur
+        } else {
+            cx.c_un(crate::UnOp::Not, cur)?
+        };
+        out.push(lit);
+    }
+    Ok(out)
+}
+
+/// Whether 1-bit conjunct `u` is a concise atomic guard suitable for seeding an internal
+/// `Assumptions` overlay (`Sym`, 1-bit `Extract`, or small constant/mask/slice comparison).
+/// Compound circuit checks (`tree > 16`) stay in `r_units` so they specialize under `eff`.
+fn is_liftable_guard(cx: &Context, mut u: u32) -> bool {
+    while cx.node(u).op == OpCode::Not {
+        u = cx.node(u).a;
+    }
+    cx.meta[u as usize].tree <= 16
 }

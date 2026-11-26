@@ -183,7 +183,9 @@ fn hidden_constants_fold_before_the_circuit() {
 #[cfg(feature = "mba")]
 #[test]
 fn weighted_byte_sums_under_shared_operations() {
-    let terms = |offset: u64, coefficient: u64| format!("\
+    let terms = |offset: u64, coefficient: u64| {
+        format!(
+            "\
         let p = x:64 + {offset};
         let a = trunc<8>(p);
         let b = extract<8, 8>(x);
@@ -192,7 +194,9 @@ fn weighted_byte_sums_under_shared_operations() {
         let lhs = (zext<64>((a | b) & (c ^ d)) * {coefficient} + y + z) * m;
         let ab = ((p & ~(p >>u 8)) ^ (x >>u 8));
         let rhs = (z + (ab & (p >>u 16 ^ p >>u 24) & 255) * {coefficient} + y) * m;
-    ");
+    "
+        )
+    };
     let cfg = Config::default()
         .with_max_conflicts(2_000)
         .with_max_propagations(400_000)
@@ -205,7 +209,10 @@ fn weighted_byte_sums_under_shared_operations() {
         (0xf917c8000000, u64::MAX - 2, 0xf0020101),
     ] {
         let terms = terms(offset, weight);
-        for cmp in [String::from("lhs == rhs"), format!("((lhs | {mask}) <=u k) == ((rhs | {mask}) <=u k)")] {
+        for cmp in [
+            String::from("lhs == rhs"),
+            format!("((lhs | {mask}) <=u k) == ((rhs | {mask}) <=u k)"),
+        ] {
             let (out, stats) = ask(&format!("{terms}{cmp}"), Width::W64, &cfg);
             assert_eq!(label(&out), "proved");
             assert!(stats.simplification.decided, "{stats:?}");
@@ -246,10 +253,17 @@ fn prefix_narrowed_congruence_and_joint_assumptions_decide_without_sat() {
     ] {
         let (out, stats) = ask(&format!("{setup}{valid_cmp}"), Width::W64, &cfg);
         assert_eq!(label(&out), "proved", "{valid_cmp}");
-        assert!(stats.simplification.decided && stats.nodes == 0, "{valid_cmp}: {stats:?}");
+        assert!(
+            stats.simplification.decided && stats.nodes == 0,
+            "{valid_cmp}: {stats:?}"
+        );
     }
     // One bit narrower shift leaves bit 63 observable: must refute.
-    let (out, _) = ask(&format!("{setup}(lhs << 1) == (rhs << 1)"), Width::W64, &cfg);
+    let (out, _) = ask(
+        &format!("{setup}(lhs << 1) == (rhs << 1)"),
+        Width::W64,
+        &cfg,
+    );
     assert_eq!(label(&out), "refuted");
 
     // Joint simplification under explicit `Assumptions` exposes a guard controlling a select
@@ -271,7 +285,11 @@ fn prefix_narrowed_congruence_and_joint_assumptions_decide_without_sat() {
     let mut q = Question::valid_under(&mut cx, goal, Some(&assumptions), &cfg).unwrap();
     let out = q.solve(&mut cx, cfg.limits()).unwrap();
     assert_eq!(label(&Some(out)), "proved");
-    assert!(q.stats().simplification.decided && q.stats().nodes == 0, "{:?}", q.stats());
+    assert!(
+        q.stats().simplification.decided && q.stats().nodes == 0,
+        "{:?}",
+        q.stats()
+    );
 
     // Bounded affine rebasing proves an equality over `(x << 3) + 0x18` without SAT.
     let rebased = "let p = (x:64 << 3) + 0x18; \
@@ -279,5 +297,8 @@ fn prefix_narrowed_congruence_and_joint_assumptions_decide_without_sat() {
                    ((p & 0xff) ^ (p & ~0xff)) + (x * 7) == ((q | 0xff) & (q | ~0xff)) + (x * 7)";
     let (out, stats) = ask(rebased, Width::W64, &cfg);
     assert_eq!(label(&out), "proved");
-    assert!(stats.simplification.decided && stats.nodes == 0, "{stats:?}");
+    assert!(
+        stats.simplification.decided && stats.nodes == 0,
+        "{stats:?}"
+    );
 }

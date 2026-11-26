@@ -1029,8 +1029,8 @@ impl Context {
             CmpOp::Ne => (args[2], n.b, args[1]),
             _ => return None,
         };
-        let matches_u = nz_node == u
-            || (self.node(nz_node).op == OpCode::Zext && self.node(nz_node).a == u);
+        let matches_u =
+            nz_node == u || (self.node(nz_node).op == OpCode::Zext && self.node(nz_node).a == u);
         if !matches_u {
             return None;
         }

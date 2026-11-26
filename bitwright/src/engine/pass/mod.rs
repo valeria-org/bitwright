@@ -12,6 +12,8 @@ pub(super) mod compares;
 mod conditions;
 #[cfg(feature = "mba")]
 mod context;
+#[cfg(feature = "prove")]
+pub(crate) mod cse;
 pub(super) mod demanded;
 mod division;
 pub(super) mod forms;
@@ -747,6 +749,107 @@ pub(super) fn known_words(
     )
 }
 
+/// Syntactic modular sum `(sa + sb) mod 2^W` when all symbolic terms cancel within a bounded
+/// linear cone (`Add`, `Sub`, `Neg`, `Not`, constant `Mul`/`Shl`). Width-polymorphic (`1..=512`),
+/// non-recursive, and `Context`-only (`Fin::FINAL`).
+pub(super) fn shift_count_sum(
+    cx: &Context,
+    sa: u32,
+    sb: u32,
+    w: crate::Width,
+) -> Option<crate::BitVec> {
+    use crate::BitVec;
+    use crate::ops::{BinOp, UnOp};
+    let one = BitVec::one(w);
+    let minus_one = BitVec::ones(w);
+    let mut konst = BitVec::zero(w);
+    let mut terms: Vec<(u32, BitVec)> = Vec::new();
+    let mut todo: Vec<(u32, BitVec)> = vec![(sb, one), (sa, one)];
+    let mut steps = 0usize;
+    while let Some((id, scale)) = todo.pop() {
+        if scale.is_zero() {
+            continue;
+        }
+        steps += 1;
+        if steps > 24 {
+            return None;
+        }
+        if let Some(cv) = cx.const_val(id) {
+            let prod = BitVec::bin_unchecked(BinOp::Mul, &cv, &scale);
+            konst = BitVec::bin_unchecked(BinOp::Add, &konst, &prod);
+            continue;
+        }
+        let n = cx.node(id);
+        match n.op {
+            OpCode::Add => {
+                todo.push((n.b, scale));
+                todo.push((n.a, scale));
+            }
+            OpCode::Sub => {
+                todo.push((n.b, BitVec::un_unchecked(UnOp::Neg, &scale)));
+                todo.push((n.a, scale));
+            }
+            OpCode::Neg => {
+                todo.push((n.a, BitVec::un_unchecked(UnOp::Neg, &scale)));
+            }
+            OpCode::Not => {
+                // `~x == -x - 1`
+                konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scale);
+                todo.push((n.a, BitVec::un_unchecked(UnOp::Neg, &scale)));
+            }
+            OpCode::Mul if cx.is_const(n.a) || cx.is_const(n.b) => {
+                let (x, c_id) = if cx.is_const(n.b) {
+                    (n.a, n.b)
+                } else {
+                    (n.b, n.a)
+                };
+                let cv = cx.const_val(c_id)?;
+                todo.push((x, BitVec::bin_unchecked(BinOp::Mul, &scale, &cv)));
+            }
+            OpCode::Shl if cx.is_const(n.b) => {
+                let sv = cx.const_val(n.b)?;
+                let factor = BitVec::bin_unchecked(BinOp::Shl, &one, &sv);
+                if !factor.is_zero() {
+                    todo.push((n.a, BitVec::bin_unchecked(BinOp::Mul, &scale, &factor)));
+                }
+            }
+            _ => match terms.iter_mut().find(|t| t.0 == id) {
+                Some(slot) => slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale),
+                None => {
+                    if terms.len() >= 8 {
+                        return None;
+                    }
+                    terms.push((id, scale));
+                }
+            },
+        }
+    }
+    let _ = minus_one;
+    if terms.iter().any(|(_, k)| !k.is_zero()) {
+        return None;
+    }
+    Some(konst)
+}
+
+/// Whether `a` and `b` are `(u << sa)` and `(v >>u sb)` (in either order) whose shift counts sum
+/// modulo `2^W` to a constant `c >=_u W`. Since `2^W > W` for every width `W >= 1`, `(sa + sb) mod
+/// 2^W = c >= W` forces the true integer sum `sa + sb >= c >= W`, so the shifted supports
+/// `[sa, W)` and `[0, W - sb)` are unconditionally disjoint at every input (`Fin::FINAL`).
+pub(super) fn complementary_shift_disjoint(cx: &Context, a: u32, b: u32) -> bool {
+    let (na, nb) = (cx.node(a), cx.node(b));
+    let (sa, sb) = match (na.op, nb.op) {
+        (OpCode::Shl, OpCode::LShr) => (na.b, nb.b),
+        (OpCode::LShr, OpCode::Shl) => (nb.b, na.b),
+        _ => return false,
+    };
+    let w = cx.width_of(a);
+    let Some(c) = shift_count_sum(cx, sa, sb, w) else {
+        return false;
+    };
+    let w_bv = crate::BitVec::wrapping_from_u64(w, u64::from(w.bits()));
+    !crate::BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &c, &w_bv)
+}
+
 /// Whether the facts prove that `a` and `b` (of one width) never have a bit set in both, with
 /// what the facts of each relied on.
 pub(super) fn disjoint(
@@ -755,6 +858,9 @@ pub(super) fn disjoint(
     a: u32,
     b: u32,
 ) -> Result<(bool, Fin, Fin), Stop> {
+    if complementary_shift_disjoint(cx, a, b) {
+        return Ok((true, Fin::FINAL, Fin::FINAL));
+    }
     let bits = cx.width_of(a).bits();
     if bits <= 64 {
         let (ka, fa) = known_words(r, cx, a)?;
@@ -783,6 +889,9 @@ pub(super) fn within(
     a: u32,
     b: u32,
 ) -> Result<(bool, Fin, Fin), Stop> {
+    if cx.node(a).op == OpCode::Not && complementary_shift_disjoint(cx, cx.node(a).a, b) {
+        return Ok((true, Fin::FINAL, Fin::FINAL));
+    }
     let bits = cx.width_of(a).bits();
     if bits <= 64 {
         let (ka, fa) = known_words(r, cx, a)?;

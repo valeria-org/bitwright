@@ -187,10 +187,18 @@ fn parse_args() -> Result<Options, String> {
 fn main() -> ExitCode {
     // Internal workers are separate processes for a meaningful per-fixture memory peak.
     let worker: Vec<String> = std::env::args().skip(1).collect();
-    if worker.first().is_some_and(|a| matches!(a.as_str(), "--sampled" | "--validity-records")) {
-        let asked_only = worker[0] == "--validity-records" && worker.len() == 3 && worker[2] == "--asked-only";
+    if worker
+        .first()
+        .is_some_and(|a| matches!(a.as_str(), "--sampled" | "--validity-records"))
+    {
+        let asked_only =
+            worker[0] == "--validity-records" && worker.len() == 3 && worker[2] == "--asked-only";
         if worker.len() != 2 && !asked_only {
-            let options = if worker[0] == "--validity-records" { " [--asked-only]" } else { "" };
+            let options = if worker[0] == "--validity-records" {
+                " [--asked-only]"
+            } else {
+                ""
+            };
             eprintln!("usage: bitwright-bench {} DIR{options}", worker[0]);
             return ExitCode::from(2);
         }

@@ -357,10 +357,12 @@ type Asked = (Outcome, u64, u64, Vec<u32>);
 /// nodes in order, constants by value, symbols by key with what was declared of them) and of
 /// the propagations it may take. A proof kept is answered by what it did: the call goes on
 /// as it would have.
+type KeptMap = IdMap<Box<[u64]>, Kept>;
+
 #[derive(Default)]
 pub(crate) struct Proofs {
     /// The answers, and the words of their keys ([`KEPT_WORDS`]).
-    kept: std::sync::Mutex<(IdMap<Box<[u64]>, Kept>, usize)>,
+    kept: std::sync::Mutex<(KeptMap, usize)>,
     /// The proofs answered from `kept` (tests).
     #[cfg(test)]
     pub(crate) hits: std::sync::atomic::AtomicU64,
@@ -1024,8 +1026,7 @@ pub(super) fn fitted(
     r.sample(cx, s)?;
     let mask = ones(len);
     let own: Vec<u64> = r.samples[&s].iter().map(|v| low(v) >> lo & mask).collect();
-    if r.carries.fits[usize::from(apart)].1
-        >= MAX_UNDECIDED + r.carries.fits[usize::from(apart)].0
+    if r.carries.fits[usize::from(apart)].1 >= MAX_UNDECIDED + r.carries.fits[usize::from(apart)].0
     {
         return Ok(Err(Fin::PROVISIONAL));
     }

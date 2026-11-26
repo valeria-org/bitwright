@@ -1,7 +1,14 @@
 //! Last resort for a counterexample whose bit blast still exceeds the node cap.
-use super::{Answer, Ask, Config, Context, Expr, Outcome, Result, Retry, Session, Split, batch, prove, reduce};
+use super::{
+    Answer, Ask, Config, Context, Expr, Outcome, Result, Retry, Session, Split, batch, prove,
+    reduce,
+};
 
-pub(super) fn recover(cx: &mut Context, checks: &[Expr], engines: &Retry) -> Result<Option<(Outcome, &'static str)>> {
+pub(super) fn recover(
+    cx: &mut Context,
+    checks: &[Expr],
+    engines: &Retry,
+) -> Result<Option<(Outcome, &'static str)>> {
     // Give the splitter the entire implication: selectors in assumptions can
     // participate in cuts just like selectors in the conclusion.
     let mut goal = checks[0];
@@ -9,13 +16,25 @@ pub(super) fn recover(cx: &mut Context, checks: &[Expr], engines: &Retry) -> Res
         let unless = cx.not(pred)?;
         goal = cx.or(goal, unless)?;
     }
-    let cfg = Config::default().with_word_sampling(true).with_simplify_fuel(1 << 17)
-        .with_max_nodes(200_000).with_max_conflicts(2_000).with_max_propagations(20_000);
+    let cfg = Config::default()
+        .with_word_sampling(true)
+        .with_simplify_fuel(1 << 17)
+        .with_max_nodes(200_000)
+        .with_max_conflicts(2_000)
+        .with_max_propagations(20_000);
     let session = Session::with_simplifiers(
-        batch::Config::default().with_threads(1).with_prove(cfg).with_split(Split::shared()),
+        batch::Config::default()
+            .with_threads(1)
+            .with_prove(cfg)
+            .with_split(Split::shared()),
         prove::Simplifiers::new().with_mba(engines.forms),
     );
-    match session.run(cx, &[Ask::valid(goal)])?.pop().ok_or("missing split answer")?.answer {
+    match session
+        .run(cx, &[Ask::valid(goal)])?
+        .pop()
+        .ok_or("missing split answer")?
+        .answer
+    {
         Answer::Proved => return Ok(Some((Outcome::Proved(None), "large-split"))),
         Answer::Refuted(model) => return Ok(Some((Outcome::Refuted(model), "large-split"))),
         Answer::Unknown(_) => {}
@@ -32,7 +51,9 @@ pub(super) fn recover(cx: &mut Context, checks: &[Expr], engines: &Retry) -> Res
     let imported = fresh.import(cx, &nodes)?;
     let roots = &imported[offset..];
     let mut bad = fresh.not(roots[0])?;
-    for &p in &roots[1..] { bad = fresh.and(bad, p)?; }
+    for &p in &roots[1..] {
+        bad = fresh.and(bad, p)?;
+    }
     let cold = Retry::new()?;
     for (fuel, rounds) in [(1 << 19, 3), (1 << 22, 2), (1 << 24, 1)] {
         bad = reduce(&mut fresh, &cold.word, bad, fuel, rounds)?;

@@ -398,7 +398,11 @@ impl<'c> Prepared<'c> {
             facts: facts.len(),
             outputs,
             symbols,
-            sampling: (cfg.samples != 0).then_some((b.g, cfg.sample_mode, cfg.samples.div_ceil(64))),
+            sampling: (cfg.samples != 0).then_some((
+                b.g,
+                cfg.sample_mode,
+                cfg.samples.div_ceil(64),
+            )),
             cnf,
             template,
             limits: cfg.limits(),
@@ -502,7 +506,10 @@ impl<'c> Prepared<'c> {
             .chain(bindings.iter().map(|&(i, _)| self.original[self.facts + i]))
             .collect();
         let env = crate::FnEnv(|key: &SymbolKey, _| {
-            model.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| model[i].1)
+            model
+                .binary_search_by(|(k, _)| k.cmp(key))
+                .ok()
+                .map(|i| model[i].1)
         });
         let values = self.cx.eval(&roots, &env)?;
         if values[..self.facts].iter().any(BitVec::is_zero)

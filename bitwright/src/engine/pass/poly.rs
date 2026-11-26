@@ -466,7 +466,8 @@ fn poly_of(
                 };
                 if let Some(mut pos_sub) = comp_sub {
                     reduce_2adic(cx, tables, sub_w, &mut pos_sub);
-                    let max_val = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, sub_mm))];
+                    let max_val =
+                        vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, sub_mm))];
                     if pos_sub.is_empty() {
                         max_val
                     } else if pos_sub.len() == 1 && pos_sub[0].0 == [0u8; MAX_LEAVES] {
@@ -667,14 +668,16 @@ fn poly_of(
             }
             OpCode::LShr
                 if w.bits() <= 64
-                    && cx.const_val(node.b).and_then(|v| v.to_u64()).is_some_and(|s| s > 0 && s < u64::from(w.bits())) =>
+                    && cx
+                        .const_val(node.b)
+                        .and_then(|v| v.to_u64())
+                        .is_some_and(|s| s > 0 && s < u64::from(w.bits())) =>
             {
                 let s = cx.const_val(node.b)?.to_u64()? as u16;
                 leaf_poly(tables, mod_w, LeafKey::LShr(node.a, s))?
             }
             OpCode::RotL | OpCode::RotR
-                if w.bits() <= 64
-                    && cx.const_val(node.b).and_then(|v| v.to_u64()).is_some() =>
+                if w.bits() <= 64 && cx.const_val(node.b).and_then(|v| v.to_u64()).is_some() =>
             {
                 // rotl(a, lsh) == (a << lsh) + (a >>u (W - lsh)) (mod 2^W, hence mod 2^mod_w).
                 let ow = w.bits();
@@ -852,6 +855,7 @@ pub(super) fn equal(r: &mut Runner<'_, '_>, cx: &Context, a: u32, b: u32) -> Res
     equal_mod(r, cx, a, b, cx.wid(a))
 }
 
+#[cfg(feature = "mba")]
 fn poly_hash(w: u16, p: &Poly) -> u64 {
     let mut h = crate::hash::combine(0x706f_6c79, u64::from(w));
     for (m, c) in p {
@@ -935,7 +939,12 @@ pub(super) fn canonicalize_dag(
             || (child_mul
                 && matches!(
                     op,
-                    OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not | OpCode::Mul | OpCode::Shl
+                    OpCode::Add
+                        | OpCode::Sub
+                        | OpCode::Neg
+                        | OpCode::Not
+                        | OpCode::Mul
+                        | OpCode::Shl
                 ));
         let indexable = poly_cone
             || matches!(
@@ -978,7 +987,10 @@ pub(super) fn canonicalize_dag(
                         if poly_cone
                             && rep != cur
                             && cx.meta[rep as usize].tree
-                                <= cx.meta[cur as usize].tree.saturating_mul(2).saturating_add(4)
+                                <= cx.meta[cur as usize]
+                                    .tree
+                                    .saturating_mul(2)
+                                    .saturating_add(4)
                         {
                             cur = rep;
                             merged_any = true;
@@ -1002,7 +1014,10 @@ pub(super) fn canonicalize_dag(
                             && let Some(not_rep) =
                                 cx.find(&crate::expr::Node::new(OpCode::Not, w, rep, 0, 0))
                             && cx.meta[not_rep as usize].tree
-                                <= cx.meta[cur as usize].tree.saturating_mul(2).saturating_add(4)
+                                <= cx.meta[cur as usize]
+                                    .tree
+                                    .saturating_mul(2)
+                                    .saturating_add(4)
                         {
                             cur = not_rep;
                             merged_any = true;
@@ -1105,9 +1120,7 @@ mod tests {
     #[test]
     fn poly_rejects_unequal_narrow_and_or_expressions() {
         // Differs in bit 32 (overflows low 32 bits)
-        assert!(!simplifies_to_true(
-            "zext<64>(trunc<32>(x * y)) == x * y"
-        ));
+        assert!(!simplifies_to_true("zext<64>(trunc<32>(x * y)) == x * y"));
         // Non-disjoint Or is not equal to Add
         assert!(!simplifies_to_true(
             "((x << 5) | (x >>u 58)) * y == ((x << 5) + (x >>u 58)) * y"

@@ -269,11 +269,7 @@ fn reads(cx: &Context, x: u32, m: &BitVec, out: &mut Vec<(u32, BitVec)>) {
             }
         }
         OpCode::Select => {
-            out.extend([
-                (node.b, *m),
-                (node.c, *m),
-                (node.a, BitVec::one(Width::W1)),
-            ]);
+            out.extend([(node.b, *m), (node.c, *m), (node.a, BitVec::one(Width::W1))]);
         }
         OpCode::Zext => {
             if let Ok(ml) = m.trunc(cx.width_of(node.a)) {
@@ -1991,38 +1987,49 @@ fn narrow_constants(
     let allow_fold = |cx: &Context, r: &Runner<'_, '_>, u: u32| -> bool {
         r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(u)))
     };
-    let arith_narrow =
-        |cx: &Context, r: &Runner<'_, '_>, u: u32, m: &BitVec, k_id: u32, k: &BitVec| -> Option<BitVec> {
-            let p = low_prefix(m);
-            if p.is_ones() {
-                return None;
-            }
-            if bv_and(&p, k).is_zero() && !k.is_zero() {
-                return allow_fold(cx, r, u).then(|| BitVec::zero(m.width()));
-            }
-            let k2 = prefix_residue(k, &p)?;
-            let k2_exists = k2
-                .to_u64()
-                .and_then(|v| cx.find_const_u64(m.width().bits(), v))
-                .is_some();
-            let k_single = !r.life.dead.contains(k_id) && r.life.live.uses(k_id) == Some(1);
-            (k2_exists || k_single).then_some(k2)
-        };
-    let needs_narrow =
-        |cx: &Context, r: &Runner<'_, '_>, u: u32, m: &BitVec, op: OpCode, k_id: u32, k: &BitVec| -> bool {
-            if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) {
-                return arith_narrow(cx, r, u, m, k_id, k).is_some();
-            }
-            let folds_to_const = (op == OpCode::And && bv_and(m, k).is_zero())
-                || (op == OpCode::Or && subset(m, &bv_and(m, k)));
-            if folds_to_const && !allow_fold(cx, r, u) {
-                return false;
-            }
-            bv_and(m, k) != *k
-                || (op == OpCode::And && (subset(m, k) || bv_and(m, k).is_zero()))
-                || (op == OpCode::Or && (bv_and(m, k).is_zero() || subset(m, k)))
-                || (op == OpCode::Xor && (bv_and(m, k).is_zero() || subset(m, k)))
-        };
+    let arith_narrow = |cx: &Context,
+                        r: &Runner<'_, '_>,
+                        u: u32,
+                        m: &BitVec,
+                        k_id: u32,
+                        k: &BitVec|
+     -> Option<BitVec> {
+        let p = low_prefix(m);
+        if p.is_ones() {
+            return None;
+        }
+        if bv_and(&p, k).is_zero() && !k.is_zero() {
+            return allow_fold(cx, r, u).then(|| BitVec::zero(m.width()));
+        }
+        let k2 = prefix_residue(k, &p)?;
+        let k2_exists = k2
+            .to_u64()
+            .and_then(|v| cx.find_const_u64(m.width().bits(), v))
+            .is_some();
+        let k_single = !r.life.dead.contains(k_id) && r.life.live.uses(k_id) == Some(1);
+        (k2_exists || k_single).then_some(k2)
+    };
+    let needs_narrow = |cx: &Context,
+                        r: &Runner<'_, '_>,
+                        u: u32,
+                        m: &BitVec,
+                        op: OpCode,
+                        k_id: u32,
+                        k: &BitVec|
+     -> bool {
+        if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) {
+            return arith_narrow(cx, r, u, m, k_id, k).is_some();
+        }
+        let folds_to_const = (op == OpCode::And && bv_and(m, k).is_zero())
+            || (op == OpCode::Or && subset(m, &bv_and(m, k)));
+        if folds_to_const && !allow_fold(cx, r, u) {
+            return false;
+        }
+        bv_and(m, k) != *k
+            || (op == OpCode::And && (subset(m, k) || bv_and(m, k).is_zero()))
+            || (op == OpCode::Or && (bv_and(m, k).is_zero() || subset(m, k)))
+            || (op == OpCode::Xor && (bv_and(m, k).is_zero() || subset(m, k)))
+    };
     let any_narrow = order.iter().any(|&u| {
         read.get(&u).is_some_and(|m| {
             !m.is_zero()
@@ -2288,11 +2295,7 @@ pub(crate) fn dedup_root(
                 }
                 OpCode::AShr => {
                     let sign_bit = 1u64 << (w - 1);
-                    let sext_a = if (a & sign_bit) != 0 {
-                        a | !mask
-                    } else {
-                        a
-                    };
+                    let sext_a = if (a & sign_bit) != 0 { a | !mask } else { a };
                     if b >= u64::from(w) {
                         if (a & sign_bit) != 0 { mask } else { 0 }
                     } else {
@@ -2533,7 +2536,10 @@ pub(crate) fn dedup_root(
         return Ok(None);
     }
     super::discard_but(r, cx, before, new_root);
-    let old_sz = match cx.dag_size(&[cx.handle(root)], 1 << 20).map_err(Stop::Error)? {
+    let old_sz = match cx
+        .dag_size(&[cx.handle(root)], 1 << 20)
+        .map_err(Stop::Error)?
+    {
         crate::expr::Bounded::Exact(n) => n,
         _ => {
             super::discard(r, cx, before);

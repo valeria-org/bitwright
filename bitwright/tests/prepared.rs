@@ -50,7 +50,9 @@ fn targets_are_independent_including_when_the_budget_runs_out() {
         assert_eq!(forward, reverse);
         if budget == 1 {
             assert!(
-                forward.iter().any(|a| matches!(a, Err(Unknown::Budget { .. })))
+                forward
+                    .iter()
+                    .any(|a| matches!(a, Err(Unknown::Budget { .. })))
             );
         } else {
             assert!(matches!(

@@ -138,10 +138,8 @@ impl ExtOp for RoundOp {
         if let (Some(x), Some(key)) = (args[0].as_constant(), args[1].as_constant())
             && let (Some(xv), Some(kv)) = (x.to_u64(), key.to_u64())
         {
-            out[0] = KnownBits::constant(&BitVec::wrapping_from_u64(
-                Width::W64,
-                eval_round(xv, kv),
-            ));
+            out[0] =
+                KnownBits::constant(&BitVec::wrapping_from_u64(Width::W64, eval_round(xv, kv)));
         } else if args[1].as_constant().is_some_and(|v| v.is_zero()) {
             out[0] = KnownBits::constant(&BitVec::zero(Width::W64));
         }
@@ -312,11 +310,7 @@ fn is_shift_count_of(cx: &Context, mut id: u32, t: u32) -> bool {
             .const_val(n.b)
             .and_then(|v| v.to_u64())
             .map(|m| (n.a, m))
-            .or_else(|| {
-                cx.const_val(n.a)
-                    .and_then(|v| v.to_u64())
-                    .map(|m| (n.b, m))
-            })
+            .or_else(|| cx.const_val(n.a).and_then(|v| v.to_u64()).map(|m| (n.b, m)))
     {
         if (m & 15) != 15 {
             return false;
@@ -327,9 +321,7 @@ fn is_shift_count_of(cx: &Context, mut id: u32, t: u32) -> bool {
     if n.op == OpCode::Extract && n.a == t && n.b == 60 && n.width >= 4 {
         return true;
     }
-    n.op == OpCode::LShr
-        && n.a == t
-        && cx.const_val(n.b).and_then(|v| v.to_u64()) == Some(60)
+    n.op == OpCode::LShr && n.a == t && cx.const_val(n.b).and_then(|v| v.to_u64()) == Some(60)
 }
 
 fn is_shifted_term_of(cx: &Context, mut shifted: u32, t: u32) -> bool {
@@ -814,7 +806,12 @@ fn implied_rhs_from_rref(rref: &[Equation], target_keys: &[u64]) -> Option<u64> 
 
 /// Parses a single 64-bit zero-equality term `term & mask == target & mask` into `(input_id, Equation)`.
 /// Handles `H(x,a) ^ H(x,b) ^ K`, `(H(x,a) ^ H(x,b)) + K`, `K - (H(x,a) ^ H(x,b))`, and `H(x,a) == K`.
-fn parse_xor_term(cx: &Context, mut term: u32, mut target: u64, mask: u64) -> Option<(u32, Equation)> {
+fn parse_xor_term(
+    cx: &Context,
+    mut term: u32,
+    mut target: u64,
+    mask: u64,
+) -> Option<(u32, Equation)> {
     if cx.wid(term) != 64 || mask == 0 {
         return None;
     }
@@ -900,12 +897,7 @@ fn parse_xor_term(cx: &Context, mut term: u32, mut target: u64, mask: u64) -> Op
 }
 
 /// Extracts `(input_id, Equation)` atoms implied when `id` evaluates to `want` (`true` or `false`).
-fn collect_implied_equations(
-    cx: &Context,
-    root: u32,
-    want: bool,
-    out: &mut Vec<(u32, Equation)>,
-) {
+fn collect_implied_equations(cx: &Context, root: u32, want: bool, out: &mut Vec<(u32, Equation)>) {
     let mut stack = vec![(root, want)];
     let mut seen: IdMap<(u32, bool), ()> = IdMap::default();
     while let Some((id, w)) = stack.pop() {
@@ -966,7 +958,10 @@ fn collect_implied_equations(
                         stack.push((cx.node(subject).a, false));
                         continue;
                     }
-                    if target == 1 && cx.node(subject).op == OpCode::Zext && cx.wid(cx.node(subject).a) == 1 {
+                    if target == 1
+                        && cx.node(subject).op == OpCode::Zext
+                        && cx.wid(cx.node(subject).a) == 1
+                    {
                         stack.push((cx.node(subject).a, true));
                         continue;
                     }
@@ -987,7 +982,8 @@ fn collect_implied_equations(
                                     } else {
                                         (leaf, u64::MAX)
                                     };
-                                    if let Some(item) = parse_xor_term(cx, term, 0, obs & clear_mask)
+                                    if let Some(item) =
+                                        parse_xor_term(cx, term, 0, obs & clear_mask)
                                     {
                                         out.push(item);
                                     }
@@ -1046,9 +1042,7 @@ fn collect_implied_equations(
                             break;
                         }
                     }
-                    if ok
-                        && let Some(src) = source
-                    {
+                    if ok && let Some(src) = source {
                         let eq = Equation::new(keys, salt);
                         if !eq.keys.is_empty() {
                             out.push((src, eq));
@@ -2009,19 +2003,15 @@ pub fn solve_bounded(system: &System, domain: &Domain, limits: &Limits) -> Solve
     let total = total_128 as u64;
     let reduced_eqs = match system.reduce_gf2() {
         ReducedSystem::Open(eqs) => eqs,
-        ReducedSystem::Unique(x0) => vec![Equation::new(
-            vec![1],
-            eval_round(x0, 1),
-        )],
+        ReducedSystem::Unique(x0) => vec![Equation::new(vec![1], eval_round(x0, 1))],
         _ => unreachable!(),
     };
     let fast = FastEvaluator::new(&reduced_eqs);
 
     const STRIPE: u64 = 1 << 16;
     let num_stripes = total.div_ceil(STRIPE) as usize;
-    let stripe_hits: Vec<Mutex<Vec<u64>>> = (0..num_stripes)
-        .map(|_| Mutex::new(Vec::new()))
-        .collect();
+    let stripe_hits: Vec<Mutex<Vec<u64>>> =
+        (0..num_stripes).map(|_| Mutex::new(Vec::new())).collect();
     let overflow = AtomicBool::new(false);
     let cap = limits.max_solutions;
 
@@ -2455,44 +2445,42 @@ pub fn propose_expr_witness(
     };
 
     let mut resolved: Option<(Expr, BitVec)> = None;
-    let direct = if !has_wrapper
-        && cx.node(id).op == OpCode::Sym
-        && top_facts == Facts::top(Width::W64)
-    {
-        let w = propose_witness(
-            system,
-            &WitnessLimits {
-                max_inputs: direct_budget,
-            },
-        );
-        if let WitnessOutcome::Found { value, .. } = w {
-            resolved = Some((input, BitVec::wrapping_from_u64(Width::W64, value)));
-        }
-        w
-    } else {
-        propose_witness_filtered(
-            system,
-            &WitnessLimits {
-                max_inputs: direct_budget,
-            },
-            |v| {
-                let bv = BitVec::wrapping_from_u64(Width::W64, v);
-                if !top_facts.contains(&bv) {
-                    return false;
-                }
-                if let Ok(Some(pair)) = invert_input(cx, input, v, assumptions) {
-                    resolved = Some(pair);
-                    true
-                } else {
-                    false
-                }
-            },
-        )
-    };
+    let direct =
+        if !has_wrapper && cx.node(id).op == OpCode::Sym && top_facts == Facts::top(Width::W64) {
+            let w = propose_witness(
+                system,
+                &WitnessLimits {
+                    max_inputs: direct_budget,
+                },
+            );
+            if let WitnessOutcome::Found { value, .. } = w {
+                resolved = Some((input, BitVec::wrapping_from_u64(Width::W64, value)));
+            }
+            w
+        } else {
+            propose_witness_filtered(
+                system,
+                &WitnessLimits {
+                    max_inputs: direct_budget,
+                },
+                |v| {
+                    let bv = BitVec::wrapping_from_u64(Width::W64, v);
+                    if !top_facts.contains(&bv) {
+                        return false;
+                    }
+                    if let Ok(Some(pair)) = invert_input(cx, input, v, assumptions) {
+                        resolved = Some(pair);
+                        true
+                    } else {
+                        false
+                    }
+                },
+            )
+        };
     match direct {
         WitnessOutcome::Found { value, checked } => {
-            let (inner, inner_value) = resolved
-                .unwrap_or_else(|| (input, BitVec::wrapping_from_u64(Width::W64, value)));
+            let (inner, inner_value) =
+                resolved.unwrap_or_else(|| (input, BitVec::wrapping_from_u64(Width::W64, value)));
             Ok(ExprWitness::Found {
                 input_value: value,
                 inner,
@@ -2954,9 +2942,7 @@ fn collect_implied_inequalities(
                             break;
                         }
                     }
-                    if ok
-                        && let Some(src) = source
-                    {
+                    if ok && let Some(src) = source {
                         let eq = Equation::new(keys, salt);
                         if !eq.keys.is_empty() {
                             out.push((src, eq));
@@ -3133,7 +3119,10 @@ fn reduce_bounded_subguards(
 
 /// Proposes `(SymbolKey, BitVec)` candidate symbol assignments from any mixer equation systems
 /// embedded inside `root`, for use by `sample_words::guard_samples`.
-pub(super) fn candidate_symbol_patches(cx: &mut Context, root: u32) -> Vec<(crate::SymbolKey, BitVec)> {
+pub(super) fn candidate_symbol_patches(
+    cx: &mut Context,
+    root: u32,
+) -> Vec<(crate::SymbolKey, BitVec)> {
     if !may_contain_mixer(cx, root) {
         return Vec::new();
     }

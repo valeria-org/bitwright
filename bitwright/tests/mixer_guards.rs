@@ -1,5 +1,6 @@
 //! Integration tests for 64-bit invertible mixer equation solving, bounded-domain completeness,
 //! best-effort 64-bit witnesses, and the mixer bijection theory vs. free-symbol abstraction.
+#![cfg(feature = "prove")]
 
 use std::sync::Arc;
 
@@ -270,7 +271,10 @@ fn measured_groups_match_best_effort_witness_and_fail_closed_on_64bit_secrets() 
                     assert_eq!(value, expected, "group {} witness mismatch", g.id);
                     assert!(sys.holds(value));
                 }
-                other => panic!("group {} expected Found({expected:#x}), got {other:?}", g.id),
+                other => panic!(
+                    "group {} expected Found({expected:#x}), got {other:?}",
+                    g.id
+                ),
             },
             None => {
                 assert!(
@@ -288,11 +292,13 @@ fn expression_witness_inverts_odd_multiplier_and_narrow_cast_inputs() {
     let mut cx = Context::with_registry(ContextConfig::default(), Arc::new(registry()));
     // D2n: input is `counter * 0x5f4fe830eff60791`, where mixer input == 0xe!
     let counter = cx.symbol("counter", Width::W64).unwrap();
-    let mult = cx
-        .constant_u64(Width::W64, 0x5f4f_e830_eff6_0791)
-        .unwrap();
+    let mult = cx.constant_u64(Width::W64, 0x5f4f_e830_eff6_0791).unwrap();
     let scaled = cx.mul(counter, mult).unwrap();
-    let d2n_pairs = MEASURED_GROUPS.iter().find(|g| g.id == "D2n").unwrap().pairs;
+    let d2n_pairs = MEASURED_GROUPS
+        .iter()
+        .find(|g| g.id == "D2n")
+        .unwrap()
+        .pairs;
     let mut guard = cx.constant_u64(Width::W1, 1).unwrap();
     for &(a, b, k) in d2n_pairs {
         let ha = mk_round(&mut cx, scaled, a).unwrap();
@@ -322,10 +328,7 @@ fn expression_witness_inverts_odd_multiplier_and_narrow_cast_inputs() {
             assert_eq!(input_value, 0xe);
             assert_eq!(inner, counter);
             assert_eq!(inner_value.to_u64(), Some(expected_counter));
-            assert_eq!(
-                expected_counter.wrapping_mul(0x5f4f_e830_eff6_0791),
-                0xe
-            );
+            assert_eq!(expected_counter.wrapping_mul(0x5f4f_e830_eff6_0791), 0xe);
         }
         other => panic!("expected ExprWitness::Found for D2n, got {other:?}"),
     }
@@ -346,7 +349,13 @@ fn expression_witness_inverts_odd_multiplier_and_narrow_cast_inputs() {
 
 #[test]
 fn complete_bounded_solving_is_deterministic_across_threads_and_domains() {
-    let s1b = system_from_pairs(MEASURED_GROUPS.iter().find(|g| g.id == "S1b").unwrap().pairs);
+    let s1b = system_from_pairs(
+        MEASURED_GROUPS
+            .iter()
+            .find(|g| g.id == "S1b")
+            .unwrap()
+            .pairs,
+    );
     let dom_u16 = Domain::low_bits(16);
     let out_t1 = solve_bounded(
         &s1b,
@@ -420,7 +429,9 @@ fn derive_domain_handles_zext_sext_masks_shifts_and_assumptions() {
     assert_eq!(d_zext.len(), 1u128 << 16);
 
     // 3. Right-shifted 64-bit word (`call_res >>u 48`), mirrored after D3c (`>>u 37`):
-    let shifted = cx.parse("(raw:64 >>u 48) * 0x6c9a72db55850a43", &opts64).unwrap();
+    let shifted = cx
+        .parse("(raw:64 >>u 48) * 0x6c9a72db55850a43", &opts64)
+        .unwrap();
     let d_shifted = Domain::derive(&mut cx, shifted, None).unwrap();
     assert_eq!(d_shifted.len(), 1u128 << 16);
 
@@ -431,8 +442,14 @@ fn derive_domain_handles_zext_sext_masks_shifts_and_assumptions() {
     let sys = System::for_input(
         shifted,
         vec![
-            Equation::new(vec![k1, k2], eval_round(x_true, k1) ^ eval_round(x_true, k2)),
-            Equation::new(vec![k2, k3], eval_round(x_true, k2) ^ eval_round(x_true, k3)),
+            Equation::new(
+                vec![k1, k2],
+                eval_round(x_true, k1) ^ eval_round(x_true, k2),
+            ),
+            Equation::new(
+                vec![k2, k3],
+                eval_round(x_true, k2) ^ eval_round(x_true, k3),
+            ),
         ],
     );
     let (derived, solved) = solve_derived(
@@ -548,7 +565,9 @@ fn mixer_theory_decides_guard_combinations_that_free_symbols_leave_open() {
 
     // Case 4: Mixed 1-hash + pair `(H(x, a) == H(x0, a)) => ((H(x, a) ^ H(x, b)) == (H(x0, a) ^ H(x0, b)))`
     // over unrestricted 64-bit `x`! Free symbols leave `H(x, b)` completely unconstrained!
-    let ha_val = cx.constant_u64(Width::W64, eval_round(0xdead_beef_cafe_1234, a)).unwrap();
+    let ha_val = cx
+        .constant_u64(Width::W64, eval_round(0xdead_beef_cafe_1234, a))
+        .unwrap();
     let hab_val = cx
         .constant_u64(
             Width::W64,
@@ -708,7 +727,13 @@ fn complete_u32_domains_and_faithful_replay_measurements() {
         .unwrap_or(4);
 
     // 1. Complete 2^32 zext(u32) solve on S1b (unique solution 0x33f8) and D1 (empty in u32).
-    let s1b = system_from_pairs(MEASURED_GROUPS.iter().find(|g| g.id == "S1b").unwrap().pairs);
+    let s1b = system_from_pairs(
+        MEASURED_GROUPS
+            .iter()
+            .find(|g| g.id == "S1b")
+            .unwrap()
+            .pairs,
+    );
     let t0 = Instant::now();
     let s1b_u32 = solve_bounded(
         &s1b,
@@ -770,7 +795,8 @@ fn complete_u32_domains_and_faithful_replay_measurements() {
             let systems = extract_all_systems(&cx, root).unwrap();
             let mut summaries = Vec::new();
             for sys in &systems {
-                let w = propose_expr_witness(&mut cx, sys, None, &WitnessLimits::default()).unwrap();
+                let w =
+                    propose_expr_witness(&mut cx, sys, None, &WitnessLimits::default()).unwrap();
                 let (dom, bounded) = solve_derived(
                     &mut cx,
                     sys,

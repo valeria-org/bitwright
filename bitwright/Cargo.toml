@@ -36,5 +36,9 @@ smtlib = []
 [dev-dependencies]
 bitwright-ref = { path = "../bitwright-ref" }
 
+[[example]]
+name = "engine_corpus"
+required-features = ["mba"]
+
 [lints]
 workspace = true

@@ -7,6 +7,67 @@ use crate::{
 };
 
 const MAX_NODES: usize = 4096;
+const POST_SIMP_MAX_NODES: usize = 16_384;
+
+#[derive(Clone, Copy)]
+enum SlicePiece {
+    Zero(u16),
+    Slice(u32, u16, u16),
+}
+
+fn collect_wide_slice(
+    cx: &Context,
+    src: u32,
+    lo: u32,
+    len: u16,
+    depth: u8,
+    pieces: &mut Vec<SlicePiece>,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if depth == 0 || pieces.len() >= 16 {
+        return false;
+    }
+    let sn = cx.node(src);
+    match sn.op {
+        OpCode::Concat => {
+            let w_lo = u32::from(cx.wid(sn.b));
+            if lo >= w_lo {
+                collect_wide_slice(cx, sn.a, lo - w_lo, len, depth - 1, pieces)
+            } else if lo + u32::from(len) <= w_lo {
+                collect_wide_slice(cx, sn.b, lo, len, depth - 1, pieces)
+            } else {
+                let len_lo = (w_lo - lo) as u16;
+                let len_hi = len - len_lo;
+                collect_wide_slice(cx, sn.b, lo, len_lo, depth - 1, pieces)
+                    && collect_wide_slice(cx, sn.a, 0, len_hi, depth - 1, pieces)
+            }
+        }
+        OpCode::Extract => collect_wide_slice(cx, sn.a, sn.b + lo, len, depth - 1, pieces),
+        OpCode::Zext => {
+            let w_in = u32::from(cx.wid(sn.a));
+            if lo >= w_in {
+                pieces.push(SlicePiece::Zero(len));
+                true
+            } else if lo + u32::from(len) <= w_in {
+                collect_wide_slice(cx, sn.a, lo, len, depth - 1, pieces)
+            } else {
+                let len_lo = (w_in - lo) as u16;
+                let ok = collect_wide_slice(cx, sn.a, lo, len_lo, depth - 1, pieces);
+                pieces.push(SlicePiece::Zero(len - len_lo));
+                ok
+            }
+        }
+        _ => {
+            if sn.width > 64 || lo + u32::from(len) > u32::from(sn.width) {
+                return false;
+            }
+            pieces.push(SlicePiece::Slice(src, lo as u16, len));
+            true
+        }
+    }
+}
 
 mod exhaust;
 mod guard;
@@ -76,9 +137,19 @@ impl Program {
         constraints: &[u32],
         assumptions: Option<&Assumptions>,
     ) -> Option<Self> {
-        let (mut program, slots) = Self::lower(cx, goal, constraints, MAX_NODES)?;
-        if let Some(assumptions) = assumptions {
-            program.fix_scoped_bits(assumptions, &slots)?;
+        Self::compile_with_limit(cx, goal, constraints, assumptions, MAX_NODES)
+    }
+
+    fn compile_with_limit(
+        cx: &mut Context,
+        goal: u32,
+        constraints: &[u32],
+        assumptions: Option<&Assumptions>,
+        limit: usize,
+    ) -> Option<Self> {
+        let (mut program, slots) = Self::lower(cx, goal, constraints, limit)?;
+        if assumptions.is_some() || !program.constraints.is_empty() {
+            program.fix_scoped_bits(assumptions, &slots, limit)?;
         }
         // Coordinate streams are used by ordered and bit-sliced sampling, never by
         // guard sampling, which supplies one complete word per symbol.
@@ -86,7 +157,9 @@ impl Program {
             let mut free = symbol.free;
             symbol.unknown.reserve_exact(free.count_ones() as usize);
             while free != 0 {
-                symbol.unknown.push((free.trailing_zeros() as u16, program.inputs));
+                symbol
+                    .unknown
+                    .push((free.trailing_zeros() as u16, program.inputs));
                 program.inputs += 1;
                 free &= free - 1;
             }
@@ -100,21 +173,61 @@ impl Program {
         constraints: &[u32],
         limit: usize,
     ) -> Option<(Self, IdMap<u32, usize>)> {
-        let mut roots = vec![goal];
-        roots.extend_from_slice(constraints);
-        let remaining = std::cell::Cell::new(limit);
-        let truncated = std::cell::Cell::new(false);
-        let order = cx.post_order_ids_pruned(&roots, |_| {
-            if remaining.get() == 0 {
-                truncated.set(true);
-                true
-            } else {
-                remaining.set(remaining.get() - 1);
-                false
+        let mut visited = 0usize;
+        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut wide_extracts: IdMap<u32, Vec<SlicePiece>> = IdMap::default();
+        let mut order: Vec<u32> = Vec::new();
+        let mut stack: Vec<(u32, bool)> = Vec::new();
+        for &c in constraints.iter().rev() {
+            stack.push((c, false));
+        }
+        stack.push((goal, false));
+        while let Some((id, expanded)) = stack.pop() {
+            if expanded {
+                order.push(id);
+                continue;
             }
-        });
-        if truncated.get() {
-            return None;
+            if seen.contains_key(&id) {
+                continue;
+            }
+            if visited >= limit {
+                return None;
+            }
+            visited += 1;
+            let node = cx.node(id);
+            if node.width > 64 {
+                return None;
+            }
+            seen.insert(id, ());
+            stack.push((id, true));
+            if node.op == OpCode::Extract && cx.wid(node.a) > 64 {
+                let mut pieces = Vec::new();
+                if !collect_wide_slice(cx, node.a, node.b, node.width, 16, &mut pieces)
+                    || pieces.is_empty()
+                {
+                    return None;
+                }
+                for p in pieces.iter().rev() {
+                    if let SlicePiece::Slice(leaf, _, _) = *p
+                        && !seen.contains_key(&leaf)
+                    {
+                        stack.push((leaf, false));
+                    }
+                }
+                wide_extracts.insert(id, pieces);
+                continue;
+            }
+            let mut kids = [0u32; 3];
+            let mut klen = 0usize;
+            for c in node.children() {
+                kids[klen] = c;
+                klen += 1;
+            }
+            for &c in kids[..klen].iter().rev() {
+                if !seen.contains_key(&c) {
+                    stack.push((c, false));
+                }
+            }
         }
         let mut slots = IdMap::default();
         let mut ops = Vec::with_capacity(order.len());
@@ -124,6 +237,52 @@ impl Program {
             let width = node.width;
             if width > 64 {
                 return None;
+            }
+            if let Some(pieces) = wide_extracts.get(&id) {
+                let mut acc: Option<(usize, u16)> = None;
+                for &piece in pieces {
+                    let (part_slot, part_w) = match piece {
+                        SlicePiece::Zero(pw) => {
+                            let s = ops.len();
+                            ops.push(Instruction {
+                                op: Op::Constant(0),
+                                width: pw,
+                                mask: mask(pw),
+                            });
+                            (s, pw)
+                        }
+                        SlicePiece::Slice(leaf, sub_lo, sub_len) => {
+                            let leaf_slot = slots[&leaf];
+                            if sub_lo == 0 && sub_len == cx.wid(leaf) {
+                                (leaf_slot, sub_len)
+                            } else {
+                                let s = ops.len();
+                                ops.push(Instruction {
+                                    op: Op::Extract(leaf_slot, sub_lo),
+                                    width: sub_len,
+                                    mask: mask(sub_len),
+                                });
+                                (s, sub_len)
+                            }
+                        }
+                    };
+                    acc = Some(match acc {
+                        None => (part_slot, part_w),
+                        Some((lo_slot, lo_w)) => {
+                            let cw = lo_w + part_w;
+                            let s = ops.len();
+                            ops.push(Instruction {
+                                op: Op::Concat(part_slot, lo_slot, lo_w),
+                                width: cw,
+                                mask: mask(cw),
+                            });
+                            (s, cw)
+                        }
+                    });
+                }
+                let (final_slot, _) = acc?;
+                slots.insert(id, final_slot);
+                continue;
             }
             let op = match node.op {
                 OpCode::Const => Op::Constant(cx.const_val(id)?.to_u64()?),
@@ -204,25 +363,32 @@ impl Program {
     // All original constraints still filter assignments and participate in model replay.
     fn fix_scoped_bits(
         &mut self,
-        assumptions: &Assumptions,
+        assumptions: Option<&Assumptions>,
         slots: &IdMap<u32, usize>,
+        limit: usize,
     ) -> Option<()> {
-        if assumptions.len() > MAX_NODES {
+        if assumptions.is_some_and(|a| a.len() > limit) {
             return None;
         }
-        let mut pending = Vec::new();
-        for (_, expression, facts) in assumptions.constraints() {
-            let known = facts.known();
-            if known.width().bits() <= 64
-                && !known.known().is_zero()
-                && let Some(&slot) = slots.get(&expression.index())
-            {
-                pending.push((slot, known.known().to_u64()?, known.known_one().to_u64()?));
+        let mut pending: Vec<(usize, u64, u64)> = self
+            .constraints
+            .iter()
+            .map(|&slot| (slot, 1u64, 1u64))
+            .collect();
+        if let Some(assumptions) = assumptions {
+            for (_, expression, facts) in assumptions.constraints() {
+                let known = facts.known();
+                if known.width().bits() <= 64
+                    && !known.known().is_zero()
+                    && let Some(&slot) = slots.get(&expression.index())
+                {
+                    pending.push((slot, known.known().to_u64()?, known.known_one().to_u64()?));
+                }
             }
         }
         let mut fixed = vec![(0u64, 0u64); self.symbols.len()];
         let mut seen = IdMap::<usize, (u64, u64)>::default();
-        let mut remaining = MAX_NODES;
+        let mut remaining = limit;
         while let Some((slot, mut known, mut ones)) = pending.pop() {
             if remaining == 0 {
                 return None;
@@ -290,6 +456,71 @@ impl Program {
                     pending.push((high, known >> bits, ones >> bits));
                 }
                 Op::Unary(UnOp::Not, child) => pending.push((child, known, known ^ ones)),
+                Op::Compare(op @ (CmpOp::Eq | CmpOp::Ne), a, b, _)
+                    if known == 1 && ((op == CmpOp::Eq) == (ones == 1)) =>
+                {
+                    if let Op::Constant(val) = self.ops[b].op {
+                        let m = self.ops[a].mask;
+                        pending.push((a, m, val & m));
+                    } else if let Op::Constant(val) = self.ops[a].op {
+                        let m = self.ops[b].mask;
+                        pending.push((b, m, val & m));
+                    }
+                }
+                Op::Binary(BinOp::And, a, b) => {
+                    if ones != 0 {
+                        pending.push((a, ones, ones));
+                        pending.push((b, ones, ones));
+                    }
+                    if let Op::Constant(c) = self.ops[b].op {
+                        if (known & !c & ones) != 0 {
+                            return None;
+                        }
+                        let m = known & c;
+                        if m != 0 {
+                            pending.push((a, m, ones & m));
+                        }
+                    } else if let Op::Constant(c) = self.ops[a].op {
+                        if (known & !c & ones) != 0 {
+                            return None;
+                        }
+                        let m = known & c;
+                        if m != 0 {
+                            pending.push((b, m, ones & m));
+                        }
+                    }
+                }
+                Op::Binary(BinOp::Or, a, b) => {
+                    let zeros = known & !ones;
+                    if zeros != 0 {
+                        pending.push((a, zeros, 0));
+                        pending.push((b, zeros, 0));
+                    }
+                    if let Op::Constant(c) = self.ops[b].op {
+                        if (known & c & !ones) != 0 {
+                            return None;
+                        }
+                        let m = known & !c;
+                        if m != 0 {
+                            pending.push((a, m, ones & m));
+                        }
+                    } else if let Op::Constant(c) = self.ops[a].op {
+                        if (known & c & !ones) != 0 {
+                            return None;
+                        }
+                        let m = known & !c;
+                        if m != 0 {
+                            pending.push((b, m, ones & m));
+                        }
+                    }
+                }
+                Op::Binary(BinOp::Xor, a, b) => {
+                    if let Op::Constant(c) = self.ops[b].op {
+                        pending.push((a, known, (ones ^ c) & known));
+                    } else if let Op::Constant(c) = self.ops[a].op {
+                        pending.push((b, known, (ones ^ c) & known));
+                    }
+                }
                 // Other operations can lose the source-bit relationship. Ignoring their
                 // known bits overapproximates legal inputs, never omits one.
                 _ => {}
@@ -448,7 +679,10 @@ impl Program {
     }
 
     fn evaluate(&self, inputs: &[u64], lane: u32, values: &mut [u64]) {
-        self.evaluate_with(|s| Self::symbol_value(&self.symbols[s], inputs, lane), values);
+        self.evaluate_with(
+            |s| Self::symbol_value(&self.symbols[s], inputs, lane),
+            values,
+        );
     }
 
     fn evaluate_with(&self, symbol: impl Fn(usize) -> u64, values: &mut [u64]) {
@@ -484,9 +718,7 @@ impl Program {
                 Op::Concat(a, b, low) => (values[a] << low) | values[b],
                 Op::Select(c, t, e) => values[if values[c] != 0 { t } else { e }],
                 Op::MixerRound(a, key) => super::mixer::eval_round(values[a], key),
-                Op::MixerUnround(a, key) => {
-                    super::mixer::invert_round(values[a], key).unwrap_or(0)
-                }
+                Op::MixerUnround(a, key) => super::mixer::invert_round(values[a], key).unwrap_or(0),
             } & instruction.mask;
         }
     }
@@ -548,7 +780,7 @@ fn binary(op: BinOp, a: u64, b: u64, w: u16) -> u64 {
             let mut out = 0;
             let mut bit = 0;
             while m != 0 {
-                let low = m & m.wrapping_neg();
+                let low = m.isolate_lowest_one();
                 if op == BinOp::Pdep {
                     if a >> bit & 1 != 0 {
                         out |= low;
@@ -571,7 +803,28 @@ pub(super) fn try_sample(
     assumptions: Option<&Assumptions>,
     cfg: &Config,
 ) -> Option<Trial> {
-    let mut program = Program::compile(cx, goal, constraints, assumptions)?;
+    try_sample_with_limit(cx, goal, constraints, assumptions, cfg, MAX_NODES)
+}
+
+pub(super) fn try_sample_post_simplify(
+    cx: &mut Context,
+    goal: u32,
+    constraints: &[u32],
+    assumptions: Option<&Assumptions>,
+    cfg: &Config,
+) -> Option<Trial> {
+    try_sample_with_limit(cx, goal, constraints, assumptions, cfg, POST_SIMP_MAX_NODES)
+}
+
+fn try_sample_with_limit(
+    cx: &mut Context,
+    goal: u32,
+    constraints: &[u32],
+    assumptions: Option<&Assumptions>,
+    cfg: &Config,
+    limit: usize,
+) -> Option<Trial> {
+    let mut program = Program::compile_with_limit(cx, goal, constraints, assumptions, limit)?;
     if cfg.sample_mode == SampleMode::Words {
         program.prioritize_words();
     }
@@ -654,11 +907,10 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     // A short select chain can return its fallback on almost every random input,
     // even when a few simultaneous tag equalities reach a different word.
     let n = cx.node(root);
-    let mut selected_equality = n.op == OpCode::Eq
-        && [n.a, n.b].iter().any(|&i| cx.node(i).op == OpCode::Select);
-    let single_word_target = matches!(n.op, OpCode::Eq | OpCode::Ne)
-        && n.op == OpCode::Ne
-        && cx.wid(n.a) >= 8;
+    let mut selected_equality =
+        n.op == OpCode::Eq && [n.a, n.b].iter().any(|&i| cx.node(i).op == OpCode::Select);
+    let single_word_target =
+        matches!(n.op, OpCode::Eq | OpCode::Ne) && n.op == OpCode::Ne && cx.wid(n.a) >= 8;
     let conjunctive = n.op == OpCode::Or || (n.op == OpCode::Not && cx.node(n.a).op == OpCode::And);
     let tall = cx.height(cx.handle(root)).ok()? >= 32;
     if !selected_equality && !single_word_target && !conjunctive && !tall {
@@ -682,7 +934,8 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
                     && n.op == OpCode::Eq
                     && [n.a, n.b].iter().any(|&k| cx.node(k).op == OpCode::Select);
                 word_guard |= matches!(n.op, OpCode::Eq | OpCode::Ne)
-                    && (n.op == OpCode::Eq) == want && cx.wid(n.a) >= 8;
+                    && (n.op == OpCode::Eq) == want
+                    && cx.wid(n.a) >= 8;
                 terms.push((i as usize, want));
             }
         }
@@ -691,7 +944,11 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     if !selected_equality && !guarded && !tall {
         return None;
     }
-    let limit = if tall || selected_equality { MAX_NODES } else { 127 };
+    let limit = if tall || selected_equality {
+        32_768
+    } else {
+        127
+    };
     let (p, slots) = Program::lower(cx, root, &[], limit)?;
     let compact_guard = guarded && p.ops.len() < 128 && (terms.len() > 1 || p.ops.len() >= 12);
     if !selected_equality && !compact_guard && p.ops.len() < 128 {
@@ -700,8 +957,12 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     let mut labels = vec![Vec::new(); p.symbols.len()];
     let mut cases = Vec::new();
     for ins in &p.ops {
-        let Op::Compare(op, a, b, _) = ins.op else { continue };
-        let Some(target) = guard::Target::literal(&p, a, b) else { continue };
+        let Op::Compare(op, a, b, _) = ins.op else {
+            continue;
+        };
+        let Some(target) = guard::Target::literal(&p, a, b) else {
+            continue;
+        };
         if let Op::Symbol(s) = p.ops[target.slot].op {
             if labels[s].len() < 8 && !labels[s].contains(&target.value) {
                 labels[s].push(target.value);
@@ -725,7 +986,11 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             }
         }
     }
-    if selected_equality && p.ops.len() < 128 && labels.iter().all(Vec::is_empty) && cases.is_empty() {
+    if selected_equality
+        && p.ops.len() < 128
+        && labels.iter().all(Vec::is_empty)
+        && cases.is_empty()
+    {
         return None;
     }
     let mut values = vec![0; p.ops.len()];
@@ -733,51 +998,107 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     // If the original question is an implication, keep assignments close to
     // satisfying its counterexample conjuncts. Ranking never decides the result.
     let mut fields = Vec::new();
+    let mut bit_pins: Vec<(usize, u64, u64)> = Vec::new();
     for (i, want) in &mut terms {
         let node = *i as u32;
         *i = slots[&node];
-        if *want && cx.node(node).op == OpCode::Eq && fields.len() < 4
+        if *want
+            && cx.node(node).op == OpCode::Eq
+            && fields.len() < 8
             && let Some(f) = crate::expr::field::field(cx, node)
-            && (1..=16).contains(&f.mask.count_ones())
+            && (1..=64).contains(&f.mask.count_ones())
             && let Op::Symbol(s) = p.ops[slots[&f.base]].op
         {
             fields.push((s, f));
+        } else if bit_pins.len() < 16 {
+            let nd = cx.node(node);
+            if nd.op == OpCode::Sym
+                && nd.width == 1
+                && let Op::Symbol(s) = p.ops[*i].op
+            {
+                bit_pins.push((s, 1, u64::from(*want)));
+            } else if nd.op == OpCode::Extract
+                && nd.width == 1
+                && nd.b < 64
+                && let Some(&base_slot) = slots.get(&nd.a)
+                && let Op::Symbol(s) = p.ops[base_slot].op
+            {
+                let bit = nd.b;
+                bit_pins.push((s, 1u64 << bit, u64::from(*want) << bit));
+            } else if let Op::Compare(op @ (CmpOp::Eq | CmpOp::Ne), a, b, _) = p.ops[*i].op
+                && (op == CmpOp::Eq) == *want
+                && let Some(target) = guard::Target::literal(&p, a, b)
+                && let Op::Concat(hi, lo, lo_bits) = p.ops[target.slot].op
+            {
+                let sym_slice = |slot: usize| -> Option<(usize, u16)> {
+                    match p.ops[slot].op {
+                        Op::Symbol(s) => Some((s, 0)),
+                        Op::Extract(base, off) => match p.ops[base].op {
+                            Op::Symbol(s) => Some((s, off)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                };
+                if let Some((s_lo, off_lo)) = sym_slice(lo) {
+                    let m = p.ops[lo].mask;
+                    bit_pins.push((s_lo, m << off_lo, (target.value & m) << off_lo));
+                }
+                if let Some((s_hi, off_hi)) = sym_slice(hi) {
+                    let m = p.ops[hi].mask;
+                    bit_pins.push((s_hi, m << off_hi, ((target.value >> lo_bits) & m) << off_hi));
+                }
+            }
         }
     }
-    let required: Vec<_> = terms.iter().filter_map(|&(i, want)| {
-        match p.ops[i].op {
+    let required: Vec<_> = terms
+        .iter()
+        .filter_map(|&(i, want)| match p.ops[i].op {
             Op::Compare(op @ (CmpOp::Eq | CmpOp::Ne), a, b, _) if (op == CmpOp::Eq) == want => {
-                Some(guard::Target::literal(&p, a, b).map_or(
-                    guard::Requirement::Equal(a, b), guard::Requirement::Value))
+                Some(
+                    guard::Target::literal(&p, a, b)
+                        .map_or(guard::Requirement::Equal(a, b), guard::Requirement::Value),
+                )
             }
             Op::Compare(..) => None,
-            _ if compact_guard => Some(guard::Requirement::Value(
-                guard::Target { slot: i, value: u64::from(want) })),
+            _ if compact_guard => Some(guard::Requirement::Value(guard::Target {
+                slot: i,
+                value: u64::from(want),
+            })),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     let ranges = guard::intervals(&p, &terms);
     let mut best = assignment.clone();
     let mut distance = u32::MAX;
     let mut offset = None;
+    let field_constrained = !fields.is_empty() || !bit_pins.is_empty();
     for lane in 0..64 {
         // A known field has a constructive inverse. Vary its free bits on
         // fresh lanes instead of repairing unrelated internal case labels.
-        let field_lane = !fields.is_empty() && terms.len() > 1 && (8..48).contains(&lane);
+        let field_lane = field_constrained && terms.len() > 1 && (8..48).contains(&lane);
         // Try the structural inverse and weighted terms first. Later lanes
         // can repair one hidden addend, each from the same legal zero seed.
-        let coordinate = (lane >= 32).then(|| (lane - 32) as usize)
-            .filter(|&s| s < p.symbols.len()).zip(offset);
+        let coordinate = (lane >= 32)
+            .then(|| (lane - 32) as usize)
+            .filter(|&s| s < p.symbols.len())
+            .zip(offset);
         let patch = if let Some((s, delta)) = coordinate {
-            for (v, sym) in assignment.iter_mut().zip(&p.symbols) { *v = sym.ones; }
+            for (v, sym) in assignment.iter_mut().zip(&p.symbols) {
+                *v = sym.ones;
+            }
             let sym = &p.symbols[s];
             Some((s, sym.ones | (sym.ones.wrapping_add(delta) & sym.free)))
         } else if compact_guard && lane >= 2 && lane % 8 != 0 {
             // Keep a repaired conjunct when repairing the next one; independent
             // wide constraints are unlikely to hold on the same fresh random lane.
             guard::propose(&p, &values, &required, &ranges, &cases, lane as usize)
-        } else if !compact_guard && !field_lane && lane >= 8 && lane & 3 < 2
-            && (!required.is_empty() || !cases.is_empty() || !ranges.is_empty()) {
+        } else if !compact_guard
+            && !field_lane
+            && lane >= 8
+            && lane & 3 < 2
+            && (!required.is_empty() || !cases.is_empty() || !ranges.is_empty())
+        {
             let round = (lane / 4 * 2 + lane % 4) as usize;
             guard::propose(&p, &values, &required, &ranges, &cases, round)
         } else {
@@ -821,33 +1142,58 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             for &(s, field) in &fields {
                 let sym = &p.symbols[s];
                 let v = field.seed(assignment[s]) & mask(sym.width.bits());
-                if v & !sym.free == sym.ones { assignment[s] = v; }
+                if v & !sym.free == sym.ones {
+                    assignment[s] = v;
+                }
+            }
+            for &(s, m, val) in &bit_pins {
+                let sym = &p.symbols[s];
+                let v = ((assignment[s] & !m) | val) & mask(sym.width.bits());
+                if v & !sym.free == sym.ones {
+                    assignment[s] = v;
+                }
             }
         }
         p.evaluate_with(|s| assignment[s], &mut values);
-        if lane == 0 && terms.len() == 2 && let [interval] = ranges.as_slice() {
+        if lane == 0
+            && terms.len() == 2
+            && let [interval] = ranges.as_slice()
+        {
             offset = interval.offset(&values);
         }
         if values[p.goal] == 0 {
-            let model = p.symbols.iter().zip(assignment).map(|(s, v)| {
-                (s.key.clone(), BitVec::from_u64(s.width, v).unwrap())
-            }).collect();
+            let model = p
+                .symbols
+                .iter()
+                .zip(assignment)
+                .map(|(s, v)| (s.key.clone(), BitVec::from_u64(s.width, v).unwrap()))
+                .collect();
             return Some((u64::from(lane) + 1, Some(model)));
         }
         if terms.len() > 1 {
-            let rank = terms.iter().map(|&(i, want)| {
-                if (values[i] != 0) == want { return 0; }
-                64 + match p.ops[i].op {
-                    Op::Compare(CmpOp::Eq | CmpOp::Ne, a, b, _) => (values[a] ^ values[b]).count_ones(),
-                    Op::Compare(CmpOp::Ult | CmpOp::Ule, a, b, _) => {
-                        1 + values[a].abs_diff(values[b]).checked_ilog2().unwrap_or(0)
+            let rank = terms
+                .iter()
+                .map(|&(i, want)| {
+                    if (values[i] != 0) == want {
+                        return 0;
                     }
-                    Op::Compare(CmpOp::Slt | CmpOp::Sle, a, b, w) => {
-                        1 + signed(values[a], w).abs_diff(signed(values[b], w)).checked_ilog2().unwrap_or(0)
+                    64 + match p.ops[i].op {
+                        Op::Compare(CmpOp::Eq | CmpOp::Ne, a, b, _) => {
+                            (values[a] ^ values[b]).count_ones()
+                        }
+                        Op::Compare(CmpOp::Ult | CmpOp::Ule, a, b, _) => {
+                            1 + values[a].abs_diff(values[b]).checked_ilog2().unwrap_or(0)
+                        }
+                        Op::Compare(CmpOp::Slt | CmpOp::Sle, a, b, w) => {
+                            1 + signed(values[a], w)
+                                .abs_diff(signed(values[b], w))
+                                .checked_ilog2()
+                                .unwrap_or(0)
+                        }
+                        _ => 1,
                     }
-                    _ => 1,
-                }
-            }).sum();
+                })
+                .sum();
             if rank <= distance {
                 distance = rank;
                 best.copy_from_slice(&assignment);

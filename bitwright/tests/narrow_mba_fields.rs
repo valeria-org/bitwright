@@ -88,14 +88,20 @@ let %6 = trunc<32>(~(%0 - (%2 & 0x3001ffe53ab1)));
     let mut cx = Context::new();
     let input = cx.parse(src, &ParseOptions::default()).unwrap();
     let out = eng.simplify(&mut cx, input).unwrap().expr;
-    assert_eq!(cx.as_const(out).unwrap().and_then(|k| k.to_u64()), Some(248));
+    assert_eq!(
+        cx.as_const(out).unwrap().and_then(|k| k.to_u64()),
+        Some(248)
+    );
 
     // Raising just the last slice by one bit invalidates the low-word identity.
     let shifted = src.replace("%6 = trunc<32>", "%6 = extract<1, 32>");
     let input = cx.parse(&shifted, &ParseOptions::default()).unwrap();
     let out = eng.simplify(&mut cx, input).unwrap().expr;
     let env = FnEnv(|_: &SymbolKey, w: Width| Some(BitVec::wrapping_from_u64(w, 16)));
-    assert_eq!(cx.eval(&[out], &env).unwrap()[0].to_u64(), Some(0x052f_d5a8));
+    assert_eq!(
+        cx.eval(&[out], &env).unwrap()[0].to_u64(),
+        Some(0x052f_d5a8)
+    );
 }
 
 #[test]

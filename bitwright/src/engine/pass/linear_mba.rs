@@ -246,7 +246,13 @@ fn walk<const QUICK: bool>(
         // is an atom too, lifted by the outer one).
         let inner = (!QUICK || !matches!(op, OpCode::Sext | OpCode::Zext))
             && !s.forced.contains(i)
-            && interior_ext(cx, i, mode, Some(&s.forced), allow_const_atoms && lift.is_none())
+            && interior_ext(
+                cx,
+                i,
+                mode,
+                Some(&s.forced),
+                allow_const_atoms && lift.is_none(),
+            )
             && (lift.is_none() || is_bitwise(op) || cx.const_val(i).is_some());
         if let Some((kind, cast)) = lift {
             match s.under.get(&i) {
@@ -274,7 +280,9 @@ fn walk<const QUICK: bool>(
             None => {
                 s.seen.set(i, u32::from(inner) | read);
                 reached += 1;
-                if QUICK { *visits += 1; }
+                if QUICK {
+                    *visits += 1;
+                }
                 if reached > if QUICK { 160 } else { MAX_REGION } {
                     return Err(Walk::Over);
                 }
@@ -344,7 +352,11 @@ fn affine_leaf(cx: &Context, i: u32, w: u16, full: u64) -> (u32, u64) {
     match n.op {
         OpCode::Zext if n.width == w => {
             let inner = cx.node(n.a);
-            if inner.op == OpCode::Extract && inner.b == 0 && cx.wid(inner.a) == w && inner.width < w {
+            if inner.op == OpCode::Extract
+                && inner.b == 0
+                && cx.wid(inner.a) == w
+                && inner.width < w
+            {
                 let m = (1u64 << inner.width) - 1;
                 return (inner.a, m);
             }
@@ -407,7 +419,12 @@ fn flatten_affine(cx: &Context, root: u32, w: u16) -> Option<AffineForm> {
                 let c = cx.const_val(n.a)?.to_u64()?;
                 stack.push((n.b, k.wrapping_mul(c), depth - 1));
             }
-            OpCode::Shl if cx.const_val(n.b).and_then(|v| v.to_u64()).is_some_and(|s| s < u64::from(w)) => {
+            OpCode::Shl
+                if cx
+                    .const_val(n.b)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|s| s < u64::from(w)) =>
+            {
                 let s = cx.const_val(n.b)?.to_u64()?;
                 stack.push((n.a, k << s, depth - 1));
             }
@@ -492,9 +509,10 @@ fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
             }
             let same = *bi == *bj && pi == pj;
             let comp = bi.wrapping_add(*bj) & mask == mask
-                && pi.iter().zip(pj).all(|(&(ta, ca), &(tb, cb))| {
-                    ta == tb && ca.wrapping_add(cb) & mask == 0
-                });
+                && pi
+                    .iter()
+                    .zip(pj)
+                    .all(|(&(ta, ca), &(tb, cb))| ta == tb && ca.wrapping_add(cb) & mask == 0);
             if same || comp {
                 reg.complements.push((reg.atoms[j], reg.atoms[i], comp));
                 dropped[j] = true;
@@ -708,7 +726,8 @@ fn merge_rot_union_atoms(cx: &Context, reg: &mut Region, allow_slice_rot: bool) 
             };
             let matches = direct || target.is_some_and(|t| slices[idx] == t);
             if matches {
-                reg.rot_unions.push((a, reg.atoms[shl_idx], reg.atoms[lshr_idx]));
+                reg.rot_unions
+                    .push((a, reg.atoms[shl_idx], reg.atoms[lshr_idx]));
                 dropped[idx] = true;
             }
         }
@@ -779,13 +798,19 @@ fn region_ext(
 fn signature(cx: &Context, reg: &Region, root: u32, s: &mut Scratch) -> Vec<BitVec> {
     let w = cx.width_of(root);
     match signature_words(cx, reg, root, s) {
-        Some(row) => row.iter().map(|&v| BitVec::wrapping_from_u64(w, v)).collect(),
+        Some(row) => row
+            .iter()
+            .map(|&v| BitVec::wrapping_from_u64(w, v))
+            .collect(),
         None => signature_wide(cx, reg, root),
     }
 }
 
 fn signature_words<'a>(
-    cx: &Context, reg: &Region, root: u32, s: &'a mut Scratch,
+    cx: &Context,
+    reg: &Region,
+    root: u32,
+    s: &'a mut Scratch,
 ) -> Option<&'a [u64]> {
     let bits = u64::from(cx.wid(root));
     if bits > 64 {
@@ -903,9 +928,16 @@ fn one_axis(sig: &[u64], vars: usize) -> Option<(u64, Option<usize>, u64)> {
     let bias = sig[0];
     let axis = (0..vars).find(|&j| sig[1 << j] != bias);
     let other = axis.map_or(bias, |j| sig[1 << j]);
-    sig.iter().enumerate().all(|(p, &v)| {
-        v == if axis.is_some_and(|j| p & (1 << j) != 0) { other } else { bias }
-    }).then_some((bias, axis, other))
+    sig.iter()
+        .enumerate()
+        .all(|(p, &v)| {
+            v == if axis.is_some_and(|j| p & (1 << j) != 0) {
+                other
+            } else {
+                bias
+            }
+        })
+        .then_some((bias, axis, other))
 }
 
 /// A cheap exact reading for the large-expression sweep. A linear MBA that agrees
@@ -914,7 +946,10 @@ fn one_axis(sig: &[u64], vars: usize) -> Option<(u64, Option<usize>, u64)> {
 /// lifting through casts, and no dynamic enumeration of the word inputs.
 #[cfg(feature = "mba")]
 pub(super) fn one_word(
-    r: &mut Runner<'_, '_>, cx: &mut Context, root: u32, left: &mut u64,
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+    left: &mut u64,
 ) -> Result<Option<u32>, Stop> {
     let w = cx.wid(root);
     if w > 64 || !matches!(cx.node(root).op, OpCode::Add | OpCode::Sub) {
@@ -925,7 +960,9 @@ pub(super) fn one_word(
     for _ in 0..3 {
         // walk::<true> stops at the 161st distinct node. A conflict can only
         // add another walk after the node has been fixed as a common cut.
-        if *left < 161 { break; }
+        if *left < 161 {
+            break;
+        }
         let mut visits = 0;
         let region = walk::<true>(cx, root, s, &mut visits, false, false);
         *left -= visits as u64;
@@ -937,13 +974,21 @@ pub(super) fn one_word(
             }
             Err(_) => break,
         };
-        if reg.order.len() < 2 { break; }
+        if reg.order.len() < 2 {
+            break;
+        }
         let rows = 1usize << reg.atoms.len();
         let cost = ((reg.order.len() + reg.atoms.len() + 2) * rows) as u64;
-        if cost > *left { break; }
+        if cost > *left {
+            break;
+        }
         *left -= cost;
-        let Some(sig) = signature_words(cx, &reg, root, s) else { break };
-        let Some((bias, axis, other)) = one_axis(sig, reg.atoms.len()) else { break };
+        let Some(sig) = signature_words(cx, &reg, root, s) else {
+            break;
+        };
+        let Some((bias, axis, other)) = one_axis(sig, reg.atoms.len()) else {
+            break;
+        };
         let mask = u64::MAX >> (64 - w);
         let atom = axis.map(|j| reg.atoms[j]);
         return r.build(cx, |cx| {
@@ -975,7 +1020,9 @@ fn one_word_keeps_mixed_corners_in_its_proof() {
     ] {
         let root = cx.parse(text, &opts).unwrap().index();
         s.forced.begin(cx.len());
-        let reg = walk::<true>(&cx, root, &mut s, &mut 0, false, false).ok().unwrap();
+        let reg = walk::<true>(&cx, root, &mut s, &mut 0, false, false)
+            .ok()
+            .unwrap();
         let row = signature_words(&cx, &reg, root, &mut s).unwrap();
         let answer = one_axis(row, reg.atoms.len());
         assert_eq!(answer.is_some(), fits);
@@ -1366,9 +1413,7 @@ fn atom_may_one(cx: &Context, i: u32, depth: u8) -> u64 {
             (atom_may_one(cx, n.a, depth - 1) | atom_may_one(cx, n.b, depth - 1)) & mask
         }
         OpCode::Zext => atom_may_one(cx, n.a, depth - 1) & mask,
-        OpCode::Extract if cx.wid(n.a) <= 64 => {
-            (atom_may_one(cx, n.a, depth - 1) >> n.b) & mask
-        }
+        OpCode::Extract if cx.wid(n.a) <= 64 => (atom_may_one(cx, n.a, depth - 1) >> n.b) & mask,
         OpCode::Select => {
             (atom_may_one(cx, n.b, depth - 1) | atom_may_one(cx, n.c, depth - 1)) & mask
         }
@@ -1577,7 +1622,11 @@ fn difference_is_zero_split(
     let Some(reg) = region_with(cx, m_only, &mut r.linear_mba, true) else {
         return Ok(false);
     };
-    if !reg.mixed || reg.bounds.is_empty() || !reg.lifts.is_empty() || reg.atoms.len() > max_atoms.min(MAX_ATOMS) {
+    if !reg.mixed
+        || reg.bounds.is_empty()
+        || !reg.lifts.is_empty()
+        || reg.atoms.len() > max_atoms.min(MAX_ATOMS)
+    {
         return Ok(false);
     }
     let atom_affines: Vec<Option<AffineForm>> = if w.bits() <= 64 {
@@ -1610,10 +1659,11 @@ fn difference_is_zero_split(
                     continue;
                 }
                 let same = af.1 == ba && af.0 == pa;
-                let comp = af.1.wrapping_add(ba) & mask == mask
-                    && af.0.iter().zip(&pa).all(|(&(ta, ca), &(tb, cb))| {
-                        ta == tb && ca.wrapping_add(cb) & mask == 0
-                    });
+                let comp =
+                    af.1.wrapping_add(ba) & mask == mask
+                        && af.0.iter().zip(&pa).all(|(&(ta, ca), &(tb, cb))| {
+                            ta == tb && ca.wrapping_add(cb) & mask == 0
+                        });
                 if same || comp {
                     return true;
                 }
@@ -1639,7 +1689,8 @@ fn difference_is_zero_split(
         return Ok(false);
     };
     let t = reg.atoms.len();
-    if !reg.mixed || reg.bounds.is_empty() || !reg.lifts.is_empty() || t > max_atoms.min(MAX_ATOMS) {
+    if !reg.mixed || reg.bounds.is_empty() || !reg.lifts.is_empty() || t > max_atoms.min(MAX_ATOMS)
+    {
         return Ok(false);
     }
     let sig_work = (reg.order.len() << t) as u64;
@@ -1665,16 +1716,16 @@ fn difference_is_zero_split(
         return Ok(true);
     }
     let zero = r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)))?;
-    if super::poly::equal(r, cx, rem, zero)? {
-        return Ok(true);
-    }
+    #[cfg_attr(not(feature = "mba"), allow(unused_mut))]
+    let mut eq = super::poly::equal(r, cx, rem, zero)?;
     #[cfg(feature = "mba")]
-    if w.bits() <= 64 && super::mba::equal_lanes(r, cx, rem, zero, w.bits())? {
-        return Ok(true);
+    if !eq && w.bits() <= 64 {
+        eq = super::mba::equal_lanes(r, cx, rem, zero, w.bits())?;
     }
-    Ok(false)
+    Ok(eq)
 }
 
+#[cfg(feature = "mba")]
 fn difference_is_zero_const_atoms(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
@@ -2135,10 +2186,11 @@ fn solve_split_orthogonal(
                     continue;
                 }
                 let same = af.1 == ba && af.0 == pa;
-                let comp = af.1.wrapping_add(ba) & mask == mask
-                    && af.0.iter().zip(&pa).all(|(&(ta, ca), &(tb, cb))| {
-                        ta == tb && ca.wrapping_add(cb) & mask == 0
-                    });
+                let comp =
+                    af.1.wrapping_add(ba) & mask == mask
+                        && af.0.iter().zip(&pa).all(|(&(ta, ca), &(tb, cb))| {
+                            ta == tb && ca.wrapping_add(cb) & mask == 0
+                        });
                 if same || comp {
                     return true;
                 }
@@ -2464,10 +2516,9 @@ fn solve(
                         None
                     };
                     if let Some((base, partner)) = partner_opt
-                        && let Some(j) = sets
-                            .iter()
-                            .enumerate()
-                            .position(|(j, &(s2, k2))| j > idx && !used[j] && s2 == partner && k2 == k)
+                        && let Some(j) = sets.iter().enumerate().position(|(j, &(s2, k2))| {
+                            j > idx && !used[j] && s2 == partner && k2 == k
+                        })
                     {
                         used[j] = true;
                         recombined = Some((base, rot));
@@ -2555,7 +2606,11 @@ mod extra_tests {
                     (%0 | y) + (%0 & y) + (~%1 ^ y) * 2 == (%0 + y) * 3 - (%0 & y) * 4";
         let e1 = cx.parse(comp, &opt).unwrap();
         let out1 = engine
-            .run(&mut cx, &[e1], Run::default().with_per_call(Budget::fuel(1 << 14)))
+            .run(
+                &mut cx,
+                &[e1],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
             .unwrap();
         assert!(matches!(cx.view(out1.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
 
@@ -2566,7 +2621,11 @@ mod extra_tests {
                      + (%1 & ~y) * 5 + (y & ~%1) * 5 == x * 0x140 + y * 5";
         let e2 = cx.parse(shift, &opt).unwrap();
         let out2 = engine
-            .run(&mut cx, &[e2], Run::default().with_per_call(Budget::fuel(1 << 14)))
+            .run(
+                &mut cx,
+                &[e2],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
             .unwrap();
         assert!(matches!(cx.view(out2.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
     }
@@ -2605,12 +2664,17 @@ let %19 = %11 + (%8 | %10) - %9 - %0 * 0x223dab214e6d6bba - 3988;
             .build()
             .unwrap();
         let out = engine
-            .run(&mut cx, &[e], Run::default().with_per_call(Budget::fuel(1 << 14)))
+            .run(
+                &mut cx,
+                &[e],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
             .unwrap();
         assert!(matches!(cx.view(out.roots[0].expr).unwrap(), View::Const(v) if !v.is_zero()));
     }
 
     #[test]
+    #[cfg(feature = "prove")]
     fn proves_peeled_masked_congruence_and_nonuniform_mask_atoms() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W64);
@@ -2635,6 +2699,7 @@ let %19 = %11 + (%8 | %10) - %9 - %0 * 0x223dab214e6d6bba - 3988;
     }
 
     #[test]
+    #[cfg(feature = "prove")]
     fn rejects_unsound_affine_atoms_and_non_complementary_rot_unions() {
         let mut cx = Context::new();
         let opt = ParseOptions::width(Width::W64);
