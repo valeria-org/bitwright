@@ -2359,25 +2359,28 @@ pub(super) fn circuit(
     k: &BitVec,
 ) -> Result<bool, Stop> {
     use crate::engine::oracle::{EqualityCaps, EqualityVerdict};
-    let cap = (r.meter.left_in(|b| b.mba_steps) / 32).min(1 << 17);
+    let left = r.meter.left_in(|b| b.pass_work);
+    let cap = (left / 24).min(1 << 16);
     if cap < 256 {
         return Ok(false);
     }
     let mut scx = Context::new();
-    let left = match scx.import(cx, &[cx.handle(root)]) {
+    let lhs = match scx.import(cx, &[cx.handle(root)]) {
         Ok(roots) => roots[0],
         Err(crate::Error::Unsupported(_)) => return Ok(false),
         Err(e) => return Err(Stop::Error(e)),
     };
-    let right = scx.constant(k).map_err(Stop::Error)?;
+    let rhs = scx.constant(k).map_err(Stop::Error)?;
     let caps = EqualityCaps {
         samples: 0,
         max_nodes: cap as usize,
         max_propagations: cap,
     };
-    let answer = crate::circuit_equality()(&mut scx, left, right, &caps).map_err(Stop::Error)?;
-    r.meter
-        .charge(Counter::MbaSteps, answer.nodes as u64 + answer.propagations)?;
+    let answer = crate::circuit_equality()(&mut scx, lhs, rhs, &caps).map_err(Stop::Error)?;
+    let cost = (answer.nodes as u64)
+        .saturating_add(answer.propagations)
+        .min(left);
+    r.meter.charge(Counter::PassWork, cost)?;
     Ok(answer.verdict == EqualityVerdict::Proved)
 }
 

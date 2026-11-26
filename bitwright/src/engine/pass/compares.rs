@@ -1576,6 +1576,122 @@ fn sign_extend_sign_test(
     Ok(None)
 }
 
+/// Decides Hacker's Delight signed addition/subtraction overflow sign-bit idioms when operand
+/// signed intervals prove overflow impossible (or unconditional):
+/// - `((x ^ y) & ((x - y) ^ x)) <s 0`       (`ssub.overflow(x, y)`)
+/// - `((a ^ b) & ((~a + b) ^ b)) <s 0`      (`ssub.overflow(b, a + 1)`)
+/// - `((~(x ^ y)) & ((x + y) ^ x)) <s 0`    (`sadd.overflow(x, y)`)
+/// and their `0 <=s ...` complements.
+fn signed_overflow_sign_test(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<(bool, Fin)>, Stop> {
+    let node = cx.node(n);
+    let (arg, want_overflow) = match node.op {
+        OpCode::Slt if cx.const_val(node.b).is_some_and(|v| v.is_zero()) => (node.a, true),
+        OpCode::Sle if cx.const_val(node.a).is_some_and(|v| v.is_zero()) => (node.b, false),
+        _ => return Ok(None),
+    };
+    let w = cx.wid(arg);
+    if !(2..=64).contains(&w) {
+        return Ok(None);
+    }
+    let an = cx.node(arg);
+    if an.op != OpCode::And {
+        return Ok(None);
+    }
+    #[derive(Copy, Clone)]
+    enum Kind {
+        Add(u32, u32),
+        Sub(u32, u32),
+        SubInc(u32, u32), // b - a - 1  (via ~a + b)
+    }
+    let match_pair = |p: u32, q: u32| -> Option<Kind> {
+        let pn = cx.node(p);
+        let qn = cx.node(q);
+        if qn.op != OpCode::Xor {
+            return None;
+        }
+        if pn.op == OpCode::Xor {
+            let (u, v) = (pn.a, pn.b);
+            for (sum_or_diff, partner) in [(qn.a, qn.b), (qn.b, qn.a)] {
+                let other = if partner == u {
+                    v
+                } else if partner == v {
+                    u
+                } else {
+                    continue;
+                };
+                let sn = cx.node(sum_or_diff);
+                if sn.op == OpCode::Sub && sn.a == partner && sn.b == other {
+                    return Some(Kind::Sub(partner, other));
+                }
+                if sn.op == OpCode::Add {
+                    for (na, nb) in [(sn.a, sn.b), (sn.b, sn.a)] {
+                        if nb == partner && cx.node(na).op == OpCode::Not && cx.node(na).a == other
+                        {
+                            return Some(Kind::SubInc(partner, other));
+                        }
+                    }
+                }
+            }
+        } else if pn.op == OpCode::Not && cx.node(pn.a).op == OpCode::Xor {
+            let xn = cx.node(pn.a);
+            let (u, v) = (xn.a, xn.b);
+            for (sum, partner) in [(qn.a, qn.b), (qn.b, qn.a)] {
+                if partner != u && partner != v {
+                    continue;
+                }
+                let sn = cx.node(sum);
+                if sn.op == OpCode::Add && ((sn.a == u && sn.b == v) || (sn.a == v && sn.b == u)) {
+                    return Some(Kind::Add(u, v));
+                }
+            }
+        }
+        None
+    };
+    let Some(kind) = match_pair(an.a, an.b).or_else(|| match_pair(an.b, an.a)) else {
+        return Ok(None);
+    };
+    let (lhs, rhs) = match kind {
+        Kind::Add(x, y) | Kind::Sub(x, y) | Kind::SubInc(x, y) => (x, y),
+    };
+    let (fl, fin_l) = super::facts(r, cx, lhs)?;
+    let (fr, fin_r) = super::facts(r, cx, rhs)?;
+    let (Some(fl), Some(fr)) = (fl, fr) else {
+        return Ok(None);
+    };
+    let to_i128 = |v: &BitVec| -> Option<i128> {
+        let u = v.to_u64()?;
+        let sh = 64 - u32::from(w);
+        Some(i128::from(((u << sh) as i64) >> sh))
+    };
+    let (Some(ll), Some(lh), Some(rl), Some(rh)) = (
+        to_i128(&fl.srange().lo()),
+        to_i128(&fl.srange().hi()),
+        to_i128(&fr.srange().lo()),
+        to_i128(&fr.srange().hi()),
+    ) else {
+        return Ok(None);
+    };
+    let (lo, hi) = match kind {
+        Kind::Add(..) => (ll + rl, lh + rh),
+        Kind::Sub(..) => (ll - rh, lh - rl),
+        Kind::SubInc(..) => (ll - rh - 1, lh - rl - 1),
+    };
+    let smin_w = -(1i128 << (w - 1));
+    let smax_w = (1i128 << (w - 1)) - 1;
+    let fin = fin_l.and(fin_r);
+    if lo >= smin_w && hi <= smax_w {
+        Ok(Some((!want_overflow, fin)))
+    } else if lo > smax_w || hi < smin_w {
+        Ok(Some((want_overflow, fin)))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Peel identical enclosing operations from `a` and `b` while tracking the surviving low
 /// bit prefix `bits` such that `pa ≡ pb (mod 2^bits)` implies `a == b`. Forward congruence
 /// only: equal arguments under a shared operation imply equal outputs, never the converse.
@@ -1861,6 +1977,11 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             if set { Ok(b) } else { cx.c_un(UnOp::Not, b) }
         })?;
         return finish(r, cx, PassKind::Compares, n, e, before, &[x], fin);
+    }
+    if let Some((val, fin)) = signed_overflow_sign_test(r, cx, n)? {
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| cx.mk_const_u64(1, u64::from(val)))?;
+        return finish(r, cx, PassKind::Compares, n, e, before, &[], fin);
     }
     // Canonicalize complemented unsigned comparisons (`~X <u ~Y -> Y <u X`, `(C - U) <u ~Y ->
     // Y <u U + ~C`, and `<=u` counterparts), strictly shrinking by stripping `Not`.
@@ -2411,6 +2532,66 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                         }
                     }
                 }
+                // Single-side `select` equality: `select(c, X, A) == X` is `c | (A == X)` and
+                // `select(c, A, X) == X` is `!c | (A == X)` (and `!=` is `!c & (A != X)` /
+                // `c & (A != X)`), dropping the wide mux and exposing the active branch condition.
+                let one_side = if la.op == OpCode::Select {
+                    if la.b == node.b {
+                        Some((la.a, false, la.c, node.b))
+                    } else if la.c == node.b {
+                        Some((la.a, true, la.b, node.b))
+                    } else {
+                        None
+                    }
+                } else if rb.op == OpCode::Select {
+                    if rb.b == node.a {
+                        Some((rb.a, false, rb.c, node.a))
+                    } else if rb.c == node.a {
+                        Some((rb.a, true, rb.b, node.a))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((cond, neg_cond, other_arm, target)) = one_side {
+                    let before = cx.len() as u32;
+                    let is_eq = node.op == OpCode::Eq;
+                    let cmp_op = if is_eq { CmpOp::Eq } else { CmpOp::Ne };
+                    let inner_cmp = r.build(cx, |cx| cx.c_cmp(cmp_op, other_arm, target))?;
+                    let e = if is_eq {
+                        let guard = if neg_cond {
+                            r.build(cx, |cx| cx.c_un(UnOp::Not, cond))?
+                        } else {
+                            cond
+                        };
+                        r.build(cx, |cx| cx.c_bin(BinOp::Or, guard, inner_cmp))?
+                    } else {
+                        let guard = if neg_cond {
+                            cond
+                        } else {
+                            r.build(cx, |cx| cx.c_un(UnOp::Not, cond))?
+                        };
+                        r.build(cx, |cx| cx.c_bin(BinOp::And, guard, inner_cmp))?
+                    };
+                    let mut stops = vec![cond, other_arm, target];
+                    stops.sort_unstable();
+                    stops.dedup();
+                    match super::finish_with(
+                        r,
+                        cx,
+                        PassKind::Compares,
+                        n,
+                        e,
+                        before,
+                        &stops,
+                        Fin::FINAL,
+                        true,
+                    )? {
+                        Step::Normal(_) => {}
+                        step => return Ok(step),
+                    }
+                }
             }
             #[cfg(feature = "mba")]
             if matches!(node.op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
@@ -2420,19 +2601,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 if let Some(e) = super::mba::bit_table_reduce(r, cx, n)?
                     && e != n
                 {
-                    let mut stops = Vec::new();
-                    let mut seen = crate::hash::IdMap::default();
-                    let mut todo = vec![e];
-                    while let Some(i) = todo.pop() {
-                        if seen.insert(i, ()).is_some() {
-                            continue;
-                        }
-                        if i < before {
-                            stops.push(i);
-                        } else {
-                            todo.extend(cx.node(i).children());
-                        }
-                    }
+                    let stops = stops_below(cx, n, e);
                     return finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL);
                 }
             }
@@ -2742,24 +2911,8 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
         }
     }
     let before = cx.len() as u32;
-    let collect_stops = |cx: &Context, root_e: u32, mark: u32| -> Vec<u32> {
-        let mut stops = Vec::new();
-        let mut todo = vec![root_e];
-        let mut seen = crate::hash::IdMap::<u32, ()>::default();
-        while let Some(i) = todo.pop() {
-            if seen.insert(i, ()).is_some() {
-                continue;
-            }
-            if i < mark {
-                stops.push(i);
-            } else {
-                todo.extend(cx.node(i).children());
-            }
-        }
-        stops
-    };
     if let Some(e) = one_value(r, cx, c, t, f)? {
-        let stops = collect_stops(cx, e, before);
+        let stops = stops_below(cx, n, e);
         return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
     }
     super::discard(r, cx, before);
@@ -2814,12 +2967,39 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
         };
         if t2 != t || f2 != f {
             let e = r.build(cx, |cx| cx.c_select(c, t2, f2))?;
-            let stops = collect_stops(cx, e, before);
+            let stops = stops_below(cx, n, e);
             return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
         }
         super::discard(r, cx, before);
     }
     Ok((maj_fin != Fin::FINAL).then_some(Step::Normal(maj_fin)))
+}
+
+/// The nodes strictly below `n` that `e` reaches first, independent of arena capacity or
+/// nodes left behind in `cx` by earlier rejected candidates.
+fn stops_below(cx: &Context, n: u32, e: u32) -> Vec<u32> {
+    let mut below = crate::hash::IdMap::<u32, ()>::default();
+    let mut stack: Vec<u32> = cx.node(n).children().collect();
+    while let Some(i) = stack.pop() {
+        if below.len() >= 1024 || below.insert(i, ()).is_some() {
+            continue;
+        }
+        stack.extend(cx.node(i).children());
+    }
+    let mut stops = Vec::new();
+    let mut seen = crate::hash::IdMap::<u32, ()>::default();
+    let mut todo = vec![e];
+    while let Some(i) = todo.pop() {
+        if seen.insert(i, ()).is_some() {
+            continue;
+        }
+        if below.contains_key(&i) {
+            stops.push(i);
+        } else {
+            todo.extend(cx.node(i).children());
+        }
+    }
+    stops
 }
 
 /// The one value `select(c, t, f)` takes, when it is one:

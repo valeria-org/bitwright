@@ -1737,14 +1737,9 @@ pub(super) fn sort_chain(
     atoms.dedup();
     let before = cx.len() as u32;
     let w = cx.width_of(n);
-    let decided = op != OpCode::Mul && {
-        let mut ids = atoms.clone();
-        ids.sort_unstable();
-        atoms.iter().any(|&a| {
-            let node = cx.node(a);
-            node.op == OpCode::Not && ids.binary_search(&node.a).is_ok()
-        })
-    };
+    let decided = op != OpCode::Mul
+        && (0..atoms.len())
+            .any(|i| (i + 1..atoms.len()).any(|j| cx.are_bitwise_complements(atoms[i], atoms[j])));
     let mut links = Vec::new();
     let e = r.build(cx, |cx| {
         if decided {

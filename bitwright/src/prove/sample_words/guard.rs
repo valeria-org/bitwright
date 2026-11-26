@@ -87,14 +87,20 @@ impl Target {
                 value: crate::prove::mixer::eval_round(value, key),
             },
             Op::Binary(BinOp::Mul, ..) => self.product(p, values, fuel)?,
-            Op::Binary(BinOp::Xor | BinOp::Add, a, b) => {
-                let (a, b) = if matches!(p.ops[b].op, Op::Symbol(_)) { (b, a) } else { (a, b) };
+            Op::Binary(op @ (BinOp::Xor | BinOp::Add | BinOp::Sub), orig_a, orig_b) => {
+                let (a, b) = if matches!(p.ops[orig_b].op, Op::Symbol(_)) {
+                    (orig_b, orig_a)
+                } else {
+                    (orig_a, orig_b)
+                };
                 for (child, other) in [(a, b), (b, a)] {
                     if matches!(p.ops[child].op, Op::Constant(_)) { continue; }
-                    let target = if matches!(ins.op, Op::Binary(BinOp::Xor, ..)) {
-                        value ^ values[other]
-                    } else {
-                        value.wrapping_sub(values[other]) & ins.mask
+                    let target = match op {
+                        BinOp::Xor => value ^ values[other],
+                        BinOp::Add => value.wrapping_sub(values[other]) & ins.mask,
+                        BinOp::Sub if child == orig_a => value.wrapping_add(values[orig_b]) & ins.mask,
+                        BinOp::Sub => values[orig_a].wrapping_sub(value) & ins.mask,
+                        _ => unreachable!(),
                     };
                     if let Some(patch) = (Self { slot: child, value: target }).invert(p, values, fuel) {
                         return Some(patch);

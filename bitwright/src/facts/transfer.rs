@@ -205,7 +205,44 @@ fn kb_mul(a: &KnownBits, b: &KnownBits) -> KnownBits {
     let zero = bv_or(&low_mask(w, tz), &bv_and(&bv_not(&p), &low));
     let one = bv_and(&p, &low);
     // Bits below `tz` are zero in both descriptions, so they agree.
-    KnownBits::from_masks(bv_and(&zero, &bv_not(&one)), one)
+    let base = KnownBits::from_masks(bv_and(&zero, &bv_not(&one)), one);
+
+    // Sparse shift-and-add refinement: when either factor has at most 8 possible-one bits
+    // (`may_rhs = ~rhs.known_zero()`), `lhs * rhs = sum_{j in may_rhs} (rhs[j] ? lhs << j : 0)`.
+    // Summing those partial products via `kb_add_carry` preserves interior known-zero gaps and
+    // non-overlapping partial-product bits across all widths.
+    let may_a = a.maybe_one();
+    let may_b = b.maybe_one();
+    let ca = count_ones(&may_a);
+    let cb = count_ones(&may_b);
+    let (lhs, rhs, may_rhs, cnt) = if cb <= ca {
+        (a, b, may_b, cb)
+    } else {
+        (b, a, may_a, ca)
+    };
+    if (1..=8).contains(&cnt) {
+        let mut acc = KnownBits::constant(&BitVec::zero(w));
+        for (li, &limb) in may_rhs.limbs().iter().enumerate() {
+            let mut m = limb;
+            while m != 0 {
+                let bit = m.trailing_zeros();
+                m &= m - 1;
+                let shift = (li as u32) * 64 + bit;
+                if shift >= wb {
+                    break;
+                }
+                let shifted = kb_shift_const(BinOp::Shl, lhs, shift);
+                let term = if rhs.known_one().bit(shift as u16) == Some(true) {
+                    shifted
+                } else {
+                    KnownBits::from_masks(shifted.known_zero(), BitVec::zero(w))
+                };
+                acc = kb_add_carry(&acc, &term, false);
+            }
+        }
+        return base.meet(&acc).unwrap_or(base);
+    }
+    base
 }
 
 fn kb_shift_const(op: BinOp, a: &KnownBits, c: u32) -> KnownBits {

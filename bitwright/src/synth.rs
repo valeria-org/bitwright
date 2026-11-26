@@ -290,7 +290,7 @@ impl Search<'_> {
     ) -> Result<Step, Error> {
         let n = self.n();
         let count = self.terms.len() as u32;
-        let mut found: Vec<(u8, Term)> = Vec::new();
+        let mut found: Vec<(u8, u8, Term)> = Vec::new();
         let mut row = vec![0u64; n];
         for t in 0..count {
             for op in [BinOp::Add, BinOp::Sub, BinOp::Xor] {
@@ -318,20 +318,20 @@ impl Search<'_> {
                     if op != BinOp::Sub && c < t {
                         continue;
                     }
-                    let size = self.sizes[t as usize]
-                        .saturating_add(self.sizes[c as usize])
-                        .saturating_add(1);
+                    let st = self.sizes[t as usize];
+                    let sc = self.sizes[c as usize];
+                    let size = st.saturating_add(sc).saturating_add(1);
                     let term = if flip {
                         Term::Bin(op, c, t)
                     } else {
                         Term::Bin(op, t, c)
                     };
-                    found.push((size, term));
+                    found.push((size, st.max(sc), term));
                 }
             }
         }
-        found.sort_by_key(|f| f.0);
-        for (size, term) in found.into_iter().take(MAX_PAIRS) {
+        found.sort_by_key(|f| (f.0, f.1));
+        for (size, _, term) in found.into_iter().take(MAX_PAIRS) {
             // (Not among the terms of the enumeration: nothing is built over it.)
             let k = self.terms.len() as u32;
             self.terms.push(term);

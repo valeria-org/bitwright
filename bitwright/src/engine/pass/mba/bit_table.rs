@@ -23,7 +23,7 @@ const MAX_LEAVES: usize = 32;
 const MAX_FREE_BITS: usize = 32;
 const MAX_HALF_BITS: usize = 16;
 const MAX_SOLUTIONS: usize = 4;
-const MAX_GROUP_BITS: usize = 4;
+const MAX_GROUP_BITS: usize = 6;
 const MAX_SMALL_NODES: usize = 48;
 
 /// A canonicalized single bit of a word node.
@@ -948,6 +948,20 @@ fn solve_pair(
         };
         parsed_carries.push(pair);
     }
+    let mut multi_carry_comps: Vec<Vec<u64>> = Vec::new();
+    let mask_distinct_bits = |mask: u64, tables: &[SmallTable]| -> usize {
+        let mut seen: Vec<BitKey> = Vec::with_capacity(8);
+        for (i, t) in tables.iter().enumerate() {
+            if (mask >> i) & 1 != 0 {
+                for &bk in &t.bits[..t.n_bits as usize] {
+                    if !seen.contains(&bk) {
+                        seen.push(bk);
+                    }
+                }
+            }
+        }
+        seen.len()
+    };
     loop {
         let mut merged_any = false;
         for (idx, pair) in parsed_carries.iter().enumerate() {
@@ -1010,35 +1024,62 @@ fn solve_pair(
                 }
             }
         }
+        // When `active` partitions a `carry_op_mask` `m_op` of `<= MAX_GROUP_BITS` bit keys whose
+        // internal carries were folded into `hi_other` by earlier passes, merge those clusters into
+        // `m_op` and record exact 128-bit multi-cluster carry compensation `-2^64 * floor(sum S_j / 2^64)`.
+        if !merged_any && active.len() > 1 {
+            for &m_op in &carry_op_masks {
+                if m_op.count_ones() < 2 {
+                    continue;
+                }
+                let mut parts: Vec<usize> = Vec::new();
+                let mut union_m = 0u64;
+                for (pi, &c) in active.iter().enumerate() {
+                    if (m_op & c) == c {
+                        parts.push(pi);
+                        union_m |= c;
+                    }
+                }
+                if parts.len() >= 2
+                    && union_m == m_op
+                    && mask_distinct_bits(m_op, &lo_tables) <= MAX_GROUP_BITS
+                {
+                    let sub_masks: Vec<u64> = parts.iter().map(|&pi| active[pi]).collect();
+                    multi_carry_comps.push(sub_masks);
+                    let keep = parts[0];
+                    active[keep] = m_op;
+                    cluster_max[keep] = u64::MAX;
+                    for &pi in parts[1..].iter().rev() {
+                        active.swap_remove(pi);
+                        cluster_max.swap_remove(pi);
+                    }
+                    merged_any = true;
+                    break;
+                }
+            }
+        }
         if !merged_any {
             break;
         }
     }
-    let mut implicit_top_carry: Option<SmallTable> = None;
+    let mut implicit_top_mask: Option<u64> = None;
     if active.len() == 2 && (active[0] | active[1]) == full_mask && (active[0] & active[1]) == 0 {
-        // Under `LO == c_lo`, a missing top-level carry between `(full_mask ^ (1 << v))` and a
-        // single leaf `g_v` equals `[(L_rest + g_v) mod 2^64 <u g_v] == [c_lo <u g_v]`, which is
-        // an exact `<= 2`-bit table over `g_v`'s bits subtracted from the 128-bit sum's high word.
-        let single = if active[0].count_ones() == 1 {
-            Some(active[0].trailing_zeros() as usize)
-        } else if active[1].count_ones() == 1 {
-            Some(active[1].trailing_zeros() as usize)
+        // Under `LO == c_lo`, a missing top-level carry between `A` and `B` (`A | B == full_mask`)
+        // equals `[(S_A + S_B) mod 2^64 <u S_B] == [c_lo <u S_B]`, an exact table over `B`'s bits
+        // whenever `B` has `<= MAX_GROUP_BITS` bit keys.
+        let b0 = mask_distinct_bits(active[0], &lo_tables);
+        let b1 = mask_distinct_bits(active[1], &lo_tables);
+        let pick = if b0 <= b1 && b0 <= MAX_GROUP_BITS {
+            Some(active[0])
+        } else if b1 <= MAX_GROUP_BITS {
+            Some(active[1])
         } else {
             None
         };
-        let Some(v_idx) = single else {
+        let Some(pmask) = pick else {
             return Ok(None);
         };
-        let gv = lo_tables[v_idx];
-        let mut cvals = [0u64; 8];
-        for a in 0..(1usize << gv.n_bits) {
-            cvals[a] = u64::from(c_lo < gv.vals[a]);
-        }
-        implicit_top_carry = Some(SmallTable {
-            bits: gv.bits,
-            n_bits: gv.n_bits,
-            vals: cvals,
-        });
+        implicit_top_mask = Some(pmask);
     } else if active.len() != 1 || active[0] != full_mask {
         return Ok(None);
     }
@@ -1049,10 +1090,7 @@ fn solve_pair(
             hi_other.push((term, false));
         }
     }
-    let mut hi_tables: Vec<(SmallTable, bool)> = Vec::with_capacity(hi_other.len() + 1);
-    if let Some(ctbl) = implicit_top_carry {
-        hi_tables.push((ctbl, true));
-    }
+    let mut hi_tables: Vec<(SmallTable, bool)> = Vec::with_capacity(hi_other.len());
     for (term, neg) in hi_other {
         let Some(tbl) = eval_small_table(cx, term) else {
             return Ok(None);
@@ -1062,10 +1100,11 @@ fn solve_pair(
 
     // 7. Unify bit keys across equivalent 32-bit/64-bit offsets and low-bit `Add(y, K)` words.
     let unify = build_bit_unification(cx, &lo_tables, &hi_tables);
-    let mut lo_128: Vec<(SmallTable, bool)> = lo_tables
+    let lo_unified: Vec<SmallTable> = lo_tables
         .into_iter()
-        .map(|t| (apply_unification(t, &unify), false))
+        .map(|t| apply_unification(t, &unify))
         .collect();
+    let mut lo_128: Vec<(SmallTable, bool)> = lo_unified.iter().map(|&t| (t, false)).collect();
     let hi_128: Vec<(SmallTable, bool)> = hi_tables
         .into_iter()
         .map(|(t, neg)| (apply_unification(t, &unify), neg))
@@ -1074,19 +1113,73 @@ fn solve_pair(
     // 8. Build combined 128-bit additive groups by merging tables that share bit keys.
     let mut base128: u128 = (hi_bias as u128) << 64;
     let mut groups: Vec<Group128> = Vec::new();
+    let merge_group_into =
+        |groups: &mut Vec<Group128>, base128: &mut u128, grp: Group128| -> bool {
+            if grp.bits.is_empty() {
+                *base128 = base128.wrapping_add(grp.vals[0]);
+                return true;
+            }
+            let mut hits: Vec<usize> = Vec::new();
+            for (gi, g) in groups.iter().enumerate() {
+                if grp.bits.iter().any(|b| g.bits.contains(b)) {
+                    hits.push(gi);
+                }
+            }
+            if hits.is_empty() {
+                groups.push(grp);
+                return true;
+            }
+            let mut merged_bits: Vec<BitKey> = grp.bits.clone();
+            for &gi in &hits {
+                for &b in &groups[gi].bits {
+                    if !merged_bits.contains(&b) {
+                        merged_bits.push(b);
+                    }
+                }
+            }
+            if merged_bits.len() > MAX_GROUP_BITS {
+                return false;
+            }
+            merged_bits.sort();
+            let mut merged_vals = vec![0u128; 1 << merged_bits.len()];
+            let map_tbl: Vec<usize> = grp
+                .bits
+                .iter()
+                .map(|b| merged_bits.iter().position(|x| x == b).unwrap_or(0))
+                .collect();
+            for (a, slot) in merged_vals.iter_mut().enumerate() {
+                let mut ta = 0usize;
+                for (k, &pos) in map_tbl.iter().enumerate() {
+                    ta |= ((a >> pos) & 1) << k;
+                }
+                *slot = slot.wrapping_add(grp.vals[ta]);
+            }
+            for &gi in &hits {
+                let g = &groups[gi];
+                let map_g: Vec<usize> = g
+                    .bits
+                    .iter()
+                    .map(|b| merged_bits.iter().position(|x| x == b).unwrap_or(0))
+                    .collect();
+                for (a, slot) in merged_vals.iter_mut().enumerate() {
+                    let mut ga = 0usize;
+                    for (k, &pos) in map_g.iter().enumerate() {
+                        ga |= ((a >> pos) & 1) << k;
+                    }
+                    *slot = slot.wrapping_add(g.vals[ga]);
+                }
+            }
+            for &gi in hits.iter().rev() {
+                groups.swap_remove(gi);
+            }
+            groups.push(Group128 {
+                bits: merged_bits,
+                vals: merged_vals,
+            });
+            true
+        };
     let mut add_table = |tbl: SmallTable, is_hi: bool, neg: bool| -> bool {
         let n = tbl.n_bits as usize;
-        if n == 0 {
-            let v = if is_hi {
-                let h = if neg { tbl.vals[0].wrapping_neg() } else { tbl.vals[0] };
-                (h as u128) << 64
-            } else {
-                tbl.vals[0] as u128
-            };
-            base128 = base128.wrapping_add(v);
-            return true;
-        }
-        let tbl_bits = &tbl.bits[..n];
         let mut vals = Vec::with_capacity(1 << n);
         for &raw in &tbl.vals[..(1usize << n)] {
             let v = if is_hi {
@@ -1097,69 +1190,14 @@ fn solve_pair(
             };
             vals.push(v);
         }
-        // Find all existing groups overlapping `tbl_bits`.
-        let mut hits: Vec<usize> = Vec::new();
-        for (gi, g) in groups.iter().enumerate() {
-            if tbl_bits.iter().any(|b| g.bits.contains(b)) {
-                hits.push(gi);
-            }
-        }
-        if hits.is_empty() {
-            groups.push(Group128 {
-                bits: tbl_bits.to_vec(),
+        merge_group_into(
+            &mut groups,
+            &mut base128,
+            Group128 {
+                bits: tbl.bits[..n].to_vec(),
                 vals,
-            });
-            return true;
-        }
-        // Merge `tbl` and all overlapping groups into one group (capped at MAX_GROUP_BITS).
-        let mut merged_bits: Vec<BitKey> = tbl_bits.to_vec();
-        for &gi in &hits {
-            for &b in &groups[gi].bits {
-                if !merged_bits.contains(&b) {
-                    merged_bits.push(b);
-                }
-            }
-        }
-        if merged_bits.len() > MAX_GROUP_BITS {
-            return false;
-        }
-        merged_bits.sort();
-        let mut merged_vals = vec![0u128; 1 << merged_bits.len()];
-        let map_tbl: Vec<usize> = tbl_bits
-            .iter()
-            .map(|b| merged_bits.iter().position(|x| x == b).unwrap_or(0))
-            .collect();
-        for (a, slot) in merged_vals.iter_mut().enumerate() {
-            let mut ta = 0usize;
-            for (k, &pos) in map_tbl.iter().enumerate() {
-                ta |= ((a >> pos) & 1) << k;
-            }
-            *slot = slot.wrapping_add(vals[ta]);
-        }
-        for &gi in &hits {
-            let g = &groups[gi];
-            let map_g: Vec<usize> = g
-                .bits
-                .iter()
-                .map(|b| merged_bits.iter().position(|x| x == b).unwrap_or(0))
-                .collect();
-            for (a, slot) in merged_vals.iter_mut().enumerate() {
-                let mut ga = 0usize;
-                for (k, &pos) in map_g.iter().enumerate() {
-                    ga |= ((a >> pos) & 1) << k;
-                }
-                *slot = slot.wrapping_add(g.vals[ga]);
-            }
-        }
-        // Remove merged groups from back to front and push the new combined group.
-        for &gi in hits.iter().rev() {
-            groups.swap_remove(gi);
-        }
-        groups.push(Group128 {
-            bits: merged_bits,
-            vals: merged_vals,
-        });
-        true
+            },
+        )
     };
     for (t, _) in lo_128.drain(..) {
         if !add_table(t, false, false) {
@@ -1168,6 +1206,73 @@ fn solve_pair(
     }
     for (t, neg) in hi_128 {
         if !add_table(t, true, neg) {
+            return Ok(None);
+        }
+    }
+    let eval_unified_leaf = |t: &SmallTable, all_bits: &[BitKey], assign: usize| -> u64 {
+        let mut ta = 0usize;
+        for (k, bk) in t.bits[..t.n_bits as usize].iter().enumerate() {
+            let pos = all_bits.iter().position(|x| x == bk).unwrap_or(0);
+            ta |= ((assign >> pos) & 1) << k;
+        }
+        t.vals[ta]
+    };
+    let collect_mask_bits = |mask: u64| -> Vec<BitKey> {
+        let mut bits: Vec<BitKey> = Vec::new();
+        for (i, t) in lo_unified.iter().enumerate() {
+            if (mask >> i) & 1 != 0 {
+                for &bk in &t.bits[..t.n_bits as usize] {
+                    if !bits.contains(&bk) {
+                        bits.push(bk);
+                    }
+                }
+            }
+        }
+        bits.sort();
+        bits
+    };
+    for sub_masks in multi_carry_comps {
+        let union_m = sub_masks.iter().fold(0u64, |acc, &m| acc | m);
+        let bits = collect_mask_bits(union_m);
+        if bits.len() > MAX_GROUP_BITS {
+            return Ok(None);
+        }
+        let mut vals = vec![0u128; 1 << bits.len()];
+        for (a, slot) in vals.iter_mut().enumerate() {
+            let mut sum128 = 0u128;
+            for &sm in &sub_masks {
+                let mut sj = 0u64;
+                for (i, t) in lo_unified.iter().enumerate() {
+                    if (sm >> i) & 1 != 0 {
+                        sj = sj.wrapping_add(eval_unified_leaf(t, &bits, a));
+                    }
+                }
+                sum128 += u128::from(sj);
+            }
+            let carry = (sum128 >> 64) as u64;
+            *slot = (carry.wrapping_neg() as u128) << 64;
+        }
+        if !merge_group_into(&mut groups, &mut base128, Group128 { bits, vals }) {
+            return Ok(None);
+        }
+    }
+    if let Some(pmask) = implicit_top_mask {
+        let bits = collect_mask_bits(pmask);
+        if bits.len() > MAX_GROUP_BITS {
+            return Ok(None);
+        }
+        let mut vals = vec![0u128; 1 << bits.len()];
+        for (a, slot) in vals.iter_mut().enumerate() {
+            let mut sb = 0u64;
+            for (i, t) in lo_unified.iter().enumerate() {
+                if (pmask >> i) & 1 != 0 {
+                    sb = sb.wrapping_add(eval_unified_leaf(t, &bits, a));
+                }
+            }
+            let c = u64::from(c_lo < sb);
+            *slot = (c.wrapping_neg() as u128) << 64;
+        }
+        if !merge_group_into(&mut groups, &mut base128, Group128 { bits, vals }) {
             return Ok(None);
         }
     }
@@ -1464,7 +1569,7 @@ fn solve_carry_split(
     let lo_k = (kw & low_nw_mask) as u32;
     let hi_k = kw >> nw;
     let hi_mask = u64::MAX >> (64 - (w - nw));
-    let mut all_valid: Vec<(u32, u64)> = Vec::new();
+    let mut all_valid: Vec<(u32, u64, u64)> = Vec::new();
     let carry_cases: &[u64] = if lo_k == 0 { &[0] } else { &[0, 1] };
     for &carry in carry_cases {
         let hi_val = hi_k.wrapping_add(carry) & hi_mask;
@@ -1507,19 +1612,19 @@ fn solve_carry_split(
         if free_total > MAX_FREE_BITS {
             return Ok(None);
         }
-        // Only emit if all `nw` low bits are present (so carry condition `w_low < lo_k` is exact).
         let mut low_mask = 0u64;
         for g in &sub_groups {
             for b in &g.bits {
                 low_mask |= 1u64 << b.bit;
             }
         }
-        if low_mask != low_nw_mask {
-            return Ok(None);
-        }
         let Some(sols) = run_mitm(r, &sub_groups, target128.wrapping_sub(sub_base))? else {
             return Ok(None);
         };
+        if sols.is_empty() {
+            continue;
+        }
+        let missing = (low_nw_mask & !low_mask) as u32;
         for sol in sols {
             let mut w_low = 0u32;
             for (g, &a) in sub_groups.iter().zip(&sol) {
@@ -1529,10 +1634,73 @@ fn solve_carry_split(
                     }
                 }
             }
-            let valid = if carry == 1 { w_low < lo_k } else { w_low >= lo_k };
-            if valid {
-                all_valid.push((w_low, ((hi_val << nw) | u64::from(w_low)) & full_w));
-                if all_valid.len() > MAX_SOLUTIONS {
+            if missing == 0 {
+                let valid = if carry == 1 { w_low < lo_k } else { w_low >= lo_k };
+                if valid {
+                    all_valid.push((
+                        w_low,
+                        ((hi_val << nw) | u64::from(w_low)) & full_w,
+                        full_w,
+                    ));
+                    if all_valid.len() > MAX_SOLUTIONS {
+                        return Ok(None);
+                    }
+                }
+            } else {
+                let all_match = if carry == 1 {
+                    (w_low | missing) < lo_k
+                } else {
+                    w_low >= lo_k
+                };
+                let none_match = if carry == 1 {
+                    w_low >= lo_k
+                } else {
+                    (w_low | missing) < lo_k
+                };
+                if none_match {
+                    continue;
+                }
+                if all_match {
+                    let word_mask = ((hi_mask << nw) | low_mask) & full_w;
+                    let word_val = ((hi_val << nw) | u64::from(w_low)) & word_mask;
+                    all_valid.push((w_low, word_val, word_mask));
+                    if all_valid.len() > MAX_SOLUTIONS {
+                        return Ok(None);
+                    }
+                } else if missing.count_ones() <= 3 {
+                    let mut m_bits = [0u32; 3];
+                    let mut m_cnt = 0usize;
+                    let mut rem = missing;
+                    while rem != 0 {
+                        let b = rem.trailing_zeros();
+                        m_bits[m_cnt] = 1u32 << b;
+                        m_cnt += 1;
+                        rem &= rem - 1;
+                    }
+                    for sub in 0..(1usize << m_cnt) {
+                        let mut full_low = w_low;
+                        for (j, &bit_val) in m_bits[..m_cnt].iter().enumerate() {
+                            if (sub >> j) & 1 != 0 {
+                                full_low |= bit_val;
+                            }
+                        }
+                        let valid = if carry == 1 {
+                            full_low < lo_k
+                        } else {
+                            full_low >= lo_k
+                        };
+                        if valid {
+                            all_valid.push((
+                                full_low,
+                                ((hi_val << nw) | u64::from(full_low)) & full_w,
+                                full_w,
+                            ));
+                            if all_valid.len() > MAX_SOLUTIONS {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                } else {
                     return Ok(None);
                 }
             }
@@ -1559,8 +1727,10 @@ fn solve_carry_split(
         None
     };
     let mut acc: Option<u32> = None;
-    for &(w_low, full_val) in &all_valid {
-        let eq = if let Some(yn) = narrow_target {
+    for &(w_low, full_val, word_mask) in &all_valid {
+        let eq = if word_mask == full_w
+            && let Some(yn) = narrow_target
+        {
             let y_val = u64::from(w_low.wrapping_sub(lo_k)) & low_nw_mask;
             r.build(cx, |cx| {
                 let k = cx.mk_const_u64(nw, y_val)?;
@@ -1568,8 +1738,14 @@ fn solve_carry_split(
             })?
         } else {
             r.build(cx, |cx| {
+                let lhs = if word_mask == full_w {
+                    first_word
+                } else {
+                    let m = cx.mk_const_u64(w, word_mask)?;
+                    cx.c_bin(BinOp::And, first_word, m)?
+                };
                 let k = cx.mk_const_u64(w, full_val)?;
-                cx.c_cmp(CmpOp::Eq, first_word, k)
+                cx.c_cmp(CmpOp::Eq, lhs, k)
             })?
         };
         acc = Some(match acc {

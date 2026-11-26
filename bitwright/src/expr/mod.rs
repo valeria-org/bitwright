@@ -983,6 +983,73 @@ impl Context {
             .then(x.cmp(&y))
     }
 
+    /// Whether arena nodes `a` and `b` are syntactic bitwise complements (`a == ~b`) at their
+    /// shared width, including complements absorbed by canonicalization (`x ^ c` vs `x ^ ~c`,
+    /// `c1 - x` vs `x + c2` with `c1 + c2 == -1`, and 1-bit complementary comparisons).
+    pub(crate) fn are_bitwise_complements(&self, a: u32, b: u32) -> bool {
+        if a == b || self.wid(a) != self.wid(b) {
+            return false;
+        }
+        let (na, nb) = (self.node(a), self.node(b));
+        if (na.op == OpCode::Not && na.a == b) || (nb.op == OpCode::Not && nb.a == a) {
+            return true;
+        }
+        if na.op == OpCode::Xor && nb.op == OpCode::Xor {
+            let xa = match (self.const_val(na.a), self.const_val(na.b)) {
+                (None, Some(k)) => Some((na.a, k)),
+                (Some(k), None) => Some((na.b, k)),
+                _ => None,
+            };
+            let xb = match (self.const_val(nb.a), self.const_val(nb.b)) {
+                (None, Some(k)) => Some((nb.a, k)),
+                (Some(k), None) => Some((nb.b, k)),
+                _ => None,
+            };
+            if let (Some((va, ca)), Some((vb, cb))) = (xa, xb) {
+                return va == vb && BitVec::bin_unchecked(BinOp::Xor, &ca, &cb).is_ones();
+            }
+        }
+        let sub_from_const = |id: u32| -> Option<(u32, BitVec)> {
+            let n = self.node(id);
+            (n.op == OpCode::Sub && !self.is_const(n.b))
+                .then(|| self.const_val(n.a).map(|c| (n.b, c)))
+                .flatten()
+        };
+        let add_const = |id: u32| -> Option<(u32, BitVec)> {
+            let n = self.node(id);
+            match n.op {
+                OpCode::Add => match (self.const_val(n.a), self.const_val(n.b)) {
+                    (None, Some(c)) => Some((n.a, c)),
+                    (Some(c), None) => Some((n.b, c)),
+                    _ => None,
+                },
+                OpCode::Sub if !self.is_const(n.a) => self
+                    .const_val(n.b)
+                    .map(|c| (n.a, BitVec::un_unchecked(UnOp::Neg, &c))),
+                _ => None,
+            }
+        };
+        for (p, q) in [(a, b), (b, a)] {
+            if let (Some((vp, cp)), Some((vq, cq))) = (sub_from_const(p), add_const(q))
+                && vp == vq
+                && BitVec::bin_unchecked(BinOp::Add, &cp, &cq).is_ones()
+            {
+                return true;
+            }
+        }
+        if na.width == 1 {
+            return matches!(
+                (na.op, nb.op),
+                (OpCode::Eq, OpCode::Ne) | (OpCode::Ne, OpCode::Eq)
+            ) && ((na.a == nb.a && na.b == nb.b) || (na.a == nb.b && na.b == nb.a))
+                || (na.op == OpCode::Ult && nb.op == OpCode::Ule && na.a == nb.b && na.b == nb.a)
+                || (na.op == OpCode::Ule && nb.op == OpCode::Ult && na.a == nb.b && na.b == nb.a)
+                || (na.op == OpCode::Slt && nb.op == OpCode::Sle && na.a == nb.b && na.b == nb.a)
+                || (na.op == OpCode::Sle && nb.op == OpCode::Slt && na.a == nb.b && na.b == nb.a);
+        }
+        false
+    }
+
     // ----- inspection -----------------------------------------------------------------------
 
     /// The width of an expression.

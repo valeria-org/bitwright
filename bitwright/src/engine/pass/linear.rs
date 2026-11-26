@@ -479,8 +479,14 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
             f
         }
         OpCode::Mul => match (cx.const_val(node.a), cx.const_val(node.b)) {
-            (Some(k), _) => scaled_high(r, cx, node.b, &k)?.unwrap_or_else(|| get(r, node.b).scale(&k)),
-            (_, Some(k)) => scaled_high(r, cx, node.a, &k)?.unwrap_or_else(|| get(r, node.a).scale(&k)),
+            (Some(k), _) => {
+                let f = scaled_high(r, cx, node.b, &k)?.unwrap_or_else(|| get(r, node.b).scale(&k));
+                strip_annihilated_terms(r, cx, i, f)?
+            }
+            (_, Some(k)) => {
+                let f = scaled_high(r, cx, node.a, &k)?.unwrap_or_else(|| get(r, node.a).scale(&k));
+                strip_annihilated_terms(r, cx, i, f)?
+            }
             _ => Form::atom(i, w),
         },
         OpCode::Shl => match cx.const_val(node.b) {
@@ -510,12 +516,74 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
             }
         }
         OpCode::Or | OpCode::Xor => {
+            if node.op == OpCode::Xor && w.bits() > 1 {
+                let smin = BitVec::smin(w);
+                if cx.const_val(node.a) == Some(smin) || cx.const_val(node.b) == Some(smin) {
+                    let (f, met) = sum_of(r, cx, &get(r, node.a), &get(r, node.b))?;
+                    return Ok((f, met));
+                }
+            }
             let (disjoint, fina, finb) = disjoint(r, cx, node.a, node.b)?;
             if disjoint {
                 // The sum relies on what proved the operands disjoint.
                 let (mut f, met) = sum_of(r, cx, &get(r, node.a), &get(r, node.b))?;
                 f.fin = f.fin.and(fina).and(finb);
                 return Ok((f, met));
+            }
+            // Constant OR / XOR over bits whose values are completely known in the variable
+            // operand (`(c & !known(x)) == 0`, or `((~c) & !known(x)) == 0` for XOR):
+            // - `x | c == x + (c & kz_x)`
+            // - `x ^ c == x + (c & kz_x) - (c & ko_x)`
+            // - `x ^ c == (~x) ^ (~c) == (-1 + (~c & ko_x) - (~c & kz_x)) - x`
+            let const_pair = match (cx.const_val(node.a), cx.const_val(node.b)) {
+                (None, Some(c)) => Some((node.a, c)),
+                (Some(c), None) => Some((node.b, c)),
+                _ => None,
+            };
+            if let Some((x_id, c_bv)) = const_pair {
+                let (kb_opt, xfin) = super::known(r, cx, x_id)?;
+                if let Some(kb) = kb_opt {
+                    let unk = kb.unknown_mask();
+                    let kz = kb.known_zero();
+                    let ko = kb.known_one();
+                    if crate::facts::known::bv_and(&c_bv, &unk).is_zero() {
+                        let add_part = crate::facts::known::bv_and(&c_bv, &kz);
+                        let delta = if node.op == OpCode::Or {
+                            add_part
+                        } else {
+                            let sub_part = crate::facts::known::bv_and(&c_bv, &ko);
+                            BitVec::bin_unchecked(BinOp::Sub, &add_part, &sub_part)
+                        };
+                        let c_form = Form {
+                            konst: delta,
+                            terms: Vec::new(),
+                            fin: xfin,
+                        };
+                        let (mut f, met) = sum_of(r, cx, &get(r, x_id), &c_form)?;
+                        f.fin = f.fin.and(xfin);
+                        return Ok((f, met));
+                    }
+                    if node.op == OpCode::Xor {
+                        let nc = crate::facts::known::bv_not(&c_bv);
+                        if crate::facts::known::bv_and(&nc, &unk).is_zero() {
+                            let add_part = crate::facts::known::bv_and(&nc, &ko);
+                            let sub_part = crate::facts::known::bv_and(&nc, &kz);
+                            let bias = BitVec::bin_unchecked(
+                                BinOp::Sub,
+                                &BitVec::bin_unchecked(BinOp::Add, &BitVec::ones(w), &add_part),
+                                &sub_part,
+                            );
+                            let c_form = Form {
+                                konst: bias,
+                                terms: Vec::new(),
+                                fin: xfin,
+                            };
+                            let (mut f, met) = sum_of(r, cx, &c_form, &get(r, x_id).neg())?;
+                            f.fin = f.fin.and(xfin);
+                            return Ok((f, met));
+                        }
+                    }
+                }
             }
             // A xor that only clears bits its other operand has set is their difference
             // (`c ^ t` with `t ⊆ c` is `c − t`: no borrow), so a sum cancels through it as it
@@ -538,6 +606,38 @@ fn compute(r: &mut Runner<'_, '_>, cx: &mut Context, i: u32) -> Result<(Form, bo
         _ => Form::atom(i, w),
     };
     Ok((form, false))
+}
+
+/// Drop scaled linear terms `(atom, coef)` whose 2-adic valuation `ctz(coef) + ctz(atom) >= W`
+/// makes `coef * atom ≡ 0 (mod 2^W)` for every input.
+fn strip_annihilated_terms(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    owner: u32,
+    mut f: Form,
+) -> Result<Form, Stop> {
+    if f.terms.is_empty() || !r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(owner))) {
+        return Ok(f);
+    }
+    let wb = u32::from(f.konst.width().bits());
+    let mut kept = Vec::with_capacity(f.terms.len());
+    for &(atom, ref coef) in &f.terms {
+        let tz_c = crate::facts::known::trailing_zeros(coef);
+        if tz_c == 0 {
+            kept.push((atom, *coef));
+            continue;
+        }
+        let (kb_opt, kfin) = super::known(r, cx, atom)?;
+        let tz_a = kb_opt.map_or(0, |kb| kb.trailing_known_zeros());
+        if tz_c.saturating_add(tz_a) >= wb {
+            f.fin = f.fin.and(kfin);
+        } else {
+            f.fin = f.fin.and(kfin.unchanged());
+            kept.push((atom, *coef));
+        }
+    }
+    f.terms = kept;
+    Ok(f)
 }
 
 /// The sum of the forms `a` and `b` of a node's operands, and whether terms met in it: two
@@ -648,14 +748,50 @@ fn merge_complements(cx: &Context, form: Form) -> Form {
     let mut moves = Vec::new();
     for &(a, k) in &form.terms {
         let n = cx.node(a);
+        if n.op == OpCode::Xor
+            && let Some((base, c_id)) = with_const(cx, a)
+            && let Some(cv) = cx.const_val(c_id)
+            && cv.msb()
+        {
+            let pos_c = crate::facts::known::bv_not(&cv);
+            if let Some(&(z, _)) = form.terms.iter().find(|&&(z, _)| {
+                z != a
+                    && cx.node(z).op == OpCode::Xor
+                    && with_const(cx, z)
+                        .is_some_and(|(zb, zc)| zb == base && cx.const_val(zc) == Some(pos_c))
+            }) {
+                moves.push((a, z, k, BitVec::ones(w)));
+            }
+            continue;
+        }
         if !matches!(n.op, OpCode::Zext | OpCode::Sext) {
             continue;
         }
         let inner = cx.node(n.a);
-        if inner.op == OpCode::Not
-            && let Some(z) = cx.find(&Node::new(n.op, w.bits(), inner.a, 0, 0))
-            && form.terms.binary_search_by_key(&z, |t| t.0).is_ok()
+        let z_match = if inner.op == OpCode::Not {
+            cx.find(&Node::new(n.op, w.bits(), inner.a, 0, 0))
+                .filter(|z| form.terms.binary_search_by_key(z, |t| t.0).is_ok())
+        } else if inner.op == OpCode::Xor
+            && let Some((base, c_id)) = with_const(cx, n.a)
+            && let Some(cv) = cx.const_val(c_id)
+            && cv.msb()
         {
+            let pos_c = crate::facts::known::bv_not(&cv);
+            form.terms
+                .iter()
+                .map(|&(z, _)| z)
+                .find(|&z| {
+                    let zn = cx.node(z);
+                    z != a
+                        && zn.op == n.op
+                        && cx.node(zn.a).op == OpCode::Xor
+                        && with_const(cx, zn.a)
+                            .is_some_and(|(zb, zc)| zb == base && cx.const_val(zc) == Some(pos_c))
+                })
+        } else {
+            None
+        };
+        if let Some(z) = z_match {
             let c = if n.op == OpCode::Zext {
                 crate::facts::known::low_mask(w, u32::from(cx.width_of(n.a).bits()))
             } else {
@@ -838,6 +974,70 @@ fn masked(
     let mut f = form.clone();
     let mut leaves: Vec<u32> = Vec::new();
     let mut taken: Vec<u32> = Vec::new();
+    // Collapse pairs of disjoint constant-mask terms on the same base `a` (`cv1 & cv2 == 0`):
+    // - `k · (a & cv1) + k · (a & cv2) == k · (a & (cv1 | cv2))`
+    // - `k · (a & cv1) - k · (a & cv2) == k · ((a & (cv1 | cv2)) ^ cv2) - k · cv2`
+    for i in 0..ands.len() {
+        let m1 = ands[i];
+        let Ok(at1) = f.terms.binary_search_by_key(&m1, |t| t.0) else {
+            continue;
+        };
+        let k1 = f.terms[at1].1;
+        let Some((a1, c1_id)) = with_const(cx, m1) else {
+            continue;
+        };
+        let Some(cv1) = cx.const_val(c1_id) else {
+            continue;
+        };
+        for &m2 in &ands[i + 1..] {
+            let Ok(at2) = f.terms.binary_search_by_key(&m2, |t| t.0) else {
+                continue;
+            };
+            let k2 = f.terms[at2].1;
+            let Some((a2, c2_id)) = with_const(cx, m2) else {
+                continue;
+            };
+            if a1 != a2 {
+                continue;
+            }
+            let Some(cv2) = cx.const_val(c2_id) else {
+                continue;
+            };
+            if !crate::facts::known::bv_and(&cv1, &cv2).is_zero() {
+                continue;
+            }
+            let same_sign = k1 == k2;
+            let opp_sign = !same_sign && BitVec::bin_unchecked(BinOp::Add, &k1, &k2).is_zero();
+            if !same_sign && !opp_sign {
+                continue;
+            }
+            let cv_union = crate::facts::known::bv_or(&cv1, &cv2);
+            let atom = r.build(cx, |cx| {
+                let cu = cx.mk_const(&cv_union)?;
+                let masked_u = cx.c_bin(BinOp::And, a1, cu)?;
+                if same_sign {
+                    Ok(masked_u)
+                } else {
+                    cx.c_bin(BinOp::Xor, masked_u, c2_id)
+                }
+            })?;
+            let minus_k1 = BitVec::un_unchecked(UnOp::Neg, &k1);
+            let minus_k2 = BitVec::un_unchecked(UnOp::Neg, &k2);
+            let bias = if same_sign {
+                BitVec::zero(w)
+            } else {
+                BitVec::bin_unchecked(BinOp::Mul, &minus_k1, &cv2)
+            };
+            f = f.add(&Form::of(
+                bias,
+                &[(m1, minus_k1), (m2, minus_k2), (atom, k1)],
+            ));
+            leaves.push(a1);
+            taken.push(m1);
+            taken.push(m2);
+            break;
+        }
+    }
     for m in ands {
         let Ok(at) = f.terms.binary_search_by_key(&m, |t| t.0) else {
             continue;
@@ -1119,9 +1319,7 @@ fn complementary_products(
     let Some((a, b)) = left_only.zip(right_only) else {
         return Ok(None);
     };
-    let complements = (cx.node(a).op == OpCode::Not && cx.node(a).a == b)
-        || (cx.node(b).op == OpCode::Not && cx.node(b).a == a);
-    if !complements {
+    if !cx.are_bitwise_complements(a, b) {
         return Ok(None);
     }
 
@@ -2682,7 +2880,7 @@ fn plain(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32, form: Form) -> Result
         let mut fin_disj = fin;
         let mut st = vec![e];
         while let Some(cur) = st.pop() {
-            if cur < before {
+            if atoms.binary_search(&cur).is_ok() {
                 continue;
             }
             let cn = cx.node(cur);
@@ -3155,28 +3353,7 @@ pub(super) fn by_multiplicand(
     r.meter.charge(Counter::PassWork, form.terms.len() as u64)?;
     let w = form.konst.width();
     let one = BitVec::one(w);
-    let is_comp_node = |cx: &Context, a: u32, b: u32| -> bool {
-        let (na, nb) = (cx.node(a), cx.node(b));
-        if (na.op == OpCode::Not && na.a == b) || (nb.op == OpCode::Not && nb.a == a) {
-            return true;
-        }
-        if na.op == OpCode::Xor && nb.op == OpCode::Xor {
-            let xa = match (cx.const_val(na.a), cx.const_val(na.b)) {
-                (None, Some(k)) => Some((na.a, k)),
-                (Some(k), None) => Some((na.b, k)),
-                _ => None,
-            };
-            let xb = match (cx.const_val(nb.a), cx.const_val(nb.b)) {
-                (None, Some(k)) => Some((nb.a, k)),
-                (Some(k), None) => Some((nb.b, k)),
-                _ => None,
-            };
-            if let (Some((va, ca)), Some((vb, cb))) = (xa, xb) {
-                return va == vb && BitVec::bin_unchecked(BinOp::Xor, &ca, &cb).is_ones();
-            }
-        }
-        false
-    };
+    let is_comp_node = |cx: &Context, a: u32, b: u32| cx.are_bitwise_complements(a, b);
     let unwrap_masked_xor = |cx: &Context, aid: u32, mask_w: u64| -> Option<(u32, u64, u64)> {
         let an = cx.node(aid);
         if an.op != OpCode::Xor {
@@ -3208,6 +3385,28 @@ pub(super) fn by_multiplicand(
     };
     let mut all_or_atoms: Vec<u32> = Vec::new();
     let mut all_xor_atoms: Vec<(u32, u32, u64, u64)> = Vec::new();
+    let mut all_zext_xor_atoms: Vec<(u32, u32, u16, u64)> = Vec::new();
+    let unwrap_zext_xor = |cx: &Context, aid: u32| -> Option<(u32, u16, u64)> {
+        let an = cx.node(aid);
+        if an.op != OpCode::Zext {
+            return None;
+        }
+        let iw = cx.wid(an.a);
+        if iw == 0 || iw >= an.width || an.width > 64 {
+            return None;
+        }
+        let imask = u64::MAX >> (64 - iw);
+        let inner = cx.node(an.a);
+        match inner.op {
+            OpCode::Xor => match (cx.const_val(inner.a), cx.const_val(inner.b)) {
+                (None, Some(k)) => Some((inner.a, iw, k.to_u64()? & imask)),
+                (Some(k), None) => Some((inner.b, iw, k.to_u64()? & imask)),
+                _ => None,
+            },
+            OpCode::Not => Some((inner.a, iw, imask)),
+            _ => Some((an.a, iw, 0)),
+        }
+    };
     for &(t, _) in &form.terms {
         if let Some((_, factors)) = scaled_factors(cx, t).filter(|(_, f)| f.len() >= 2) {
             for f in factors {
@@ -3222,6 +3421,12 @@ pub(super) fn by_multiplicand(
                         && let Some((v_id, m_v, c_v)) = unwrap_masked_xor(cx, aid, mask_w)
                     {
                         all_xor_atoms.push((aid, v_id, m_v, c_v));
+                    } else if w.bits() <= 64
+                        && an.op == OpCode::Zext
+                        && !all_zext_xor_atoms.iter().any(|x| x.0 == aid)
+                        && let Some((v_id, iw, c_v)) = unwrap_zext_xor(cx, aid)
+                    {
+                        all_zext_xor_atoms.push((aid, v_id, iw, c_v));
                     }
                 }
             }
@@ -3240,12 +3445,13 @@ pub(super) fn by_multiplicand(
         for &f in &factors {
             let mut ff = form_of(r, cx, f)?;
             r.meter.charge(Counter::PassWork, ff.terms.len() as u64)?;
-            // Recognize De Morgan `(~u) & (~v) == -1 - (u | v)`, 1-bit `b ^ C == C ± b`, and
+            // Recognize De Morgan `(~u) & (~v) == -1 - (u | v)`, 1-bit `b ^ C == C ± b`,
             // complementary constant-XOR pairs `(x ^ c2) == K - (x ^ c1)` when `~(c1 ^ c2)` is
-            // covered by `known(x)`.
-            if ff.terms.len() == 1 && ff.terms[0].0 == f && ff.terms[0].1 == one {
-                let fn_node = cx.node(f);
-                if fn_node.op == OpCode::And
+            // covered by `known(x)`, and narrow `zext(x ^ ~c) == (2^iw - 1) - zext(x ^ c)`.
+            if ff.terms.len() == 1 {
+                let (atom0, coef0) = ff.terms[0];
+                let fn_node = cx.node(atom0);
+                if atom0 == f && coef0 == one && fn_node.op == OpCode::And
                     && let Some(&or_id) = all_or_atoms.iter().find(|&&oid| {
                         let on = cx.node(oid);
                         (is_comp_node(cx, fn_node.a, on.a) && is_comp_node(cx, fn_node.b, on.b))
@@ -3260,6 +3466,27 @@ pub(super) fn by_multiplicand(
                     );
                     dm.fin = ff.fin;
                     ff = dm;
+                } else if fn_node.op == OpCode::Zext
+                    && w.bits() <= 64
+                    && let Some((v_id, iw, c2)) = unwrap_zext_xor(cx, atom0)
+                {
+                    let imask = u64::MAX >> (64 - iw);
+                    if let Some(&(canon_id, _, _, _)) = all_zext_xor_atoms
+                        .iter()
+                        .find(|&&(aid, vid, aiw, c1)| {
+                            aid < atom0 && vid == v_id && aiw == iw && (c1 ^ c2) == imask
+                        })
+                    {
+                        let sum_bv = BitVec::wrapping_from_u64(w, imask);
+                        let delta = BitVec::bin_unchecked(BinOp::Mul, &coef0, &sum_bv);
+                        let neg_coef = BitVec::un_unchecked(UnOp::Neg, &coef0);
+                        let mut zp = Form::of(
+                            BitVec::bin_unchecked(BinOp::Add, &ff.konst, &delta),
+                            &[(canon_id, neg_coef)],
+                        );
+                        zp.fin = ff.fin;
+                        ff = zp;
+                    }
                 } else if fn_node.op == OpCode::Xor && w.bits() <= 64 && w.bits() > 1 {
                     let xor_pair = match (cx.const_val(fn_node.a), cx.const_val(fn_node.b)) {
                         (None, Some(k)) => Some((fn_node.a, k)),
@@ -3270,7 +3497,7 @@ pub(super) fn by_multiplicand(
                         let mask = u64::MAX >> (64 - w.bits());
                         let high_mask = mask & !1u64;
                         let (kw, bfin) = super::known_words(r, cx, b_id)?;
-                        if kw.is_some_and(|[z, _]| (z & high_mask) == high_mask) {
+                        if atom0 == f && coef0 == one && kw.is_some_and(|[z, _]| (z & high_mask) == high_mask) {
                             let coef = if k_bv.bit(0) == Some(true) {
                                 BitVec::ones(w)
                             } else {
@@ -3282,7 +3509,7 @@ pub(super) fn by_multiplicand(
                             );
                             xb.fin = ff.fin.and(bfin);
                             ff = xb;
-                        } else if let Some((v_id, m2, c2)) = unwrap_masked_xor(cx, f, mask) {
+                        } else if let Some((v_id, m2, c2)) = unwrap_masked_xor(cx, atom0, mask) {
                             let (vkw, vfin) = if v_id == b_id {
                                 (kw, bfin)
                             } else {
@@ -3292,7 +3519,7 @@ pub(super) fn by_multiplicand(
                             let known_mask = kz | ko;
                             if let Some(&(canon_id, _, m1, c1)) =
                                 all_xor_atoms.iter().find(|&&(aid, vid, m1, c1)| {
-                                    if aid >= f || vid != v_id {
+                                    if aid >= atom0 || vid != v_id {
                                         return false;
                                     }
                                     let varying =
@@ -3304,9 +3531,11 @@ pub(super) fn by_multiplicand(
                                 let val2 = ((ko & m2) ^ c2) & mask;
                                 let sum_u64 = val1.wrapping_add(val2) & mask;
                                 let sum_bv = BitVec::wrapping_from_u64(w, sum_u64);
+                                let delta = BitVec::bin_unchecked(BinOp::Mul, &coef0, &sum_bv);
+                                let neg_coef = BitVec::un_unchecked(UnOp::Neg, &coef0);
                                 let mut xp = Form::of(
-                                    BitVec::bin_unchecked(BinOp::Add, &ff.konst, &sum_bv),
-                                    &[(canon_id, BitVec::ones(w))],
+                                    BitVec::bin_unchecked(BinOp::Add, &ff.konst, &delta),
+                                    &[(canon_id, neg_coef)],
                                 );
                                 xp.fin = ff.fin.and(vfin);
                                 ff = xp;

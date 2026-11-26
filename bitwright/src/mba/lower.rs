@@ -172,6 +172,7 @@ fn scan_in(
         let mut atoms: Vec<u32> = Vec::with_capacity(16);
         let mut order: Vec<u32> = Vec::with_capacity(64);
         let mut met = 0u32;
+        let record = |m: u32| SCAN_VISITS.with(|c| c.set(c.get().saturating_add(u64::from(m))));
         let mut stack: Vec<(u32, bool)> = Vec::with_capacity(64);
         stack.push((root, false));
         while let Some((i, expanded)) = stack.pop() {
@@ -184,17 +185,21 @@ fn scan_in(
             }
             met += 1;
             if cx.node(i).width > lim.max_width {
+                record(met);
                 return Err(Refusal::TooWide);
             }
             if met > lim.max_nodes {
+                record(met);
                 return Err(Refusal::TooLarge);
             }
             if !in_fragment(cx, i) {
                 if i == root {
+                    record(met);
                     return Err(Refusal::Unsupported("not an MBA operator".into()));
                 }
                 atoms.push(i);
                 if atoms.len() as u32 > lim.max_vars {
+                    record(met);
                     return Err(Refusal::TooManyVars);
                 }
                 continue;
@@ -204,6 +209,7 @@ fn scan_in(
                 stack.push((c, false));
             }
         }
+        record(met);
         Ok((atoms, order))
     })
 }
@@ -221,6 +227,13 @@ struct Dense {
 thread_local! {
     static SEEN: std::cell::RefCell<Dense> = std::cell::RefCell::new(Dense::default());
     static AT: std::cell::RefCell<Dense> = std::cell::RefCell::new(Dense::default());
+    static SCAN_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns and resets the number of DAG nodes visited by `scan_in` / `under_bitwise` /
+/// `shared_in` on this thread since the previous call.
+pub(crate) fn take_scan_visits() -> u64 {
+    SCAN_VISITS.with(|c| c.replace(0))
 }
 
 impl Dense {
@@ -566,7 +579,50 @@ fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
                 continue;
             }
         }
-        // 3) Check if `aj` is negated relative to an earlier kept product atom `(K - X) * M` vs
+        // 3) Unify narrow zero-extended XOR/complement peers (`zext<w>(t:iw ^ c2)` vs
+        // `zext<w>(t:iw)` or `zext<w>(t:iw ^ c1)` or `zext<w>(~t:iw)`): exact at all bits via
+        // `zext<w>(t ^ c2) == zext<w>(t ^ c1) ^ zext<w>(c1 ^ c2)`.
+        if let Some(((tj, iwj), cj)) = zext_xor_of(cx, aj) {
+            if !cj.is_zero()
+                && let Some(i) = (0..atoms.len()).find(|&i| {
+                    i != j
+                        && keep[i]
+                        && cx.wid(atoms[i]) == wj
+                        && zext_xor_of(cx, atoms[i])
+                            .is_some_and(|(key_i, ci)| key_i == (tj, iwj) && ci.is_zero())
+                })
+            {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: atoms[i],
+                    op: PeerOp::Xor(cj),
+                });
+                continue;
+            }
+            let earlier_zext = (0..j).find_map(|i| {
+                if !keep[i] || cx.wid(atoms[i]) != wj {
+                    return None;
+                }
+                let (key_i, ci) = zext_xor_of(cx, atoms[i])?;
+                (key_i == (tj, iwj)).then(|| {
+                    (
+                        atoms[i],
+                        PeerOp::Xor(BitVec::bin_unchecked(BinOp::Xor, &ci, &cj)),
+                    )
+                })
+            });
+            if let Some((src, op)) = earlier_zext {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: src,
+                    op,
+                });
+                continue;
+            }
+        }
+        // 4) Check if `aj` is negated relative to an earlier kept product atom `(K - X) * M` vs
         // `(X - K) * M` (`aj == 0 - ai`).
         let nj = cx.node(aj);
         if nj.op == OpCode::Mul {
@@ -623,6 +679,32 @@ fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
         rem = next;
     }
     ordered
+}
+
+fn zext_xor_of(cx: &Context, a: u32) -> Option<((u32, u16), BitVec)> {
+    let n = cx.node(a);
+    if n.op != OpCode::Zext {
+        return None;
+    }
+    let w = cx.width_of(a);
+    let inner = n.a;
+    let iw = cx.wid(inner);
+    if iw >= w.bits() {
+        return None;
+    }
+    let in_node = cx.node(inner);
+    match in_node.op {
+        OpCode::Xor => match (cx.const_val(in_node.a), cx.const_val(in_node.b)) {
+            (None, Some(k)) => Some(((in_node.a, iw), k.zext(w).ok()?)),
+            (Some(k), None) => Some(((in_node.b, iw), k.zext(w).ok()?)),
+            _ => Some(((inner, iw), BitVec::zero(w))),
+        },
+        OpCode::Not => Some((
+            (in_node.a, iw),
+            crate::facts::known::low_mask(w, u32::from(iw)),
+        )),
+        _ => Some(((inner, iw), BitVec::zero(w))),
+    }
 }
 
 fn const_and_of(cx: &Context, a: u32) -> Option<(u32, BitVec)> {
@@ -772,6 +854,7 @@ fn shared_in(
             stack.push(c);
         }
     }
+    SCAN_VISITS.with(|c| c.set(c.get().saturating_add(u64::from(met))));
     let mut v: Vec<(u32, u32)> = used
         .into_iter()
         .map(|i| (i, users.get(i).unwrap_or(0)))
@@ -813,6 +896,7 @@ fn under_bitwise(
         seen.insert(i, was | way);
         met += 1;
         if met > lim.max_nodes.saturating_mul(2) {
+            SCAN_VISITS.with(|c| c.set(c.get().saturating_add(u64::from(met))));
             return Err(Refusal::TooLarge);
         }
         let bitwise = bitwise_or_const(cx, i);
@@ -827,6 +911,7 @@ fn under_bitwise(
             stack.push((c, bitwise));
         }
     }
+    SCAN_VISITS.with(|c| c.set(c.get().saturating_add(u64::from(met))));
     Ok(seen)
 }
 

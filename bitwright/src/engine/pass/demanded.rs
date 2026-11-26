@@ -610,9 +610,6 @@ fn simplify(
                         k
                     };
                     let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
-                    if narrowed_once && a2 == a {
-                        st.ties = true;
-                    }
                     bin(r, cx, BinOp::And, a2, kc)?
                 }
             }
@@ -656,9 +653,6 @@ fn simplify(
                         k
                     };
                     let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
-                    if narrowed_once && a2 == a {
-                        st.ties = true;
-                    }
                     bin(r, cx, BinOp::Or, a2, kc)?
                 }
             }
@@ -773,9 +767,6 @@ fn simplify(
                                 k
                             };
                             let kc = r.build(cx, |cx| cx.mk_const(&k_use))?;
-                            if narrowed_once && a2 == a {
-                                st.ties = true;
-                            }
                             let y = bin(r, cx, BinOp::Xor, a2, kc)?;
                             st.xors.push((a, k_use, *m, y));
                             y
@@ -1982,36 +1973,46 @@ fn narrow_constants(
             _ => None,
         }
     };
-    let arith_narrow = |cx: &Context, r: &Runner<'_, '_>, m: &BitVec, k_id: u32, k: &BitVec| -> Option<BitVec> {
-        let p = low_prefix(m);
-        if p.is_ones() {
-            return None;
-        }
-        if bv_and(&p, k).is_zero() && !k.is_zero() {
-            return Some(BitVec::zero(m.width()));
-        }
-        let k2 = prefix_residue(k, &p)?;
-        let k2_exists = k2
-            .to_u64()
-            .and_then(|v| cx.find_const_u64(m.width().bits(), v))
-            .is_some();
-        let k_single = !r.life.dead.contains(k_id) && r.life.live.uses(k_id) == Some(1);
-        (k2_exists || k_single).then_some(k2)
+    let allow_fold = |cx: &Context, r: &Runner<'_, '_>, u: u32| -> bool {
+        r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(u)))
     };
-    let needs_narrow = |cx: &Context, r: &Runner<'_, '_>, m: &BitVec, op: OpCode, k_id: u32, k: &BitVec| -> bool {
-        if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) {
-            return arith_narrow(cx, r, m, k_id, k).is_some();
-        }
-        bv_and(m, k) != *k
-            || (op == OpCode::And && (subset(m, k) || bv_and(m, k).is_zero()))
-            || (op == OpCode::Or && (bv_and(m, k).is_zero() || subset(m, k)))
-            || (op == OpCode::Xor && (bv_and(m, k).is_zero() || subset(m, k)))
-    };
+    let arith_narrow =
+        |cx: &Context, r: &Runner<'_, '_>, u: u32, m: &BitVec, k_id: u32, k: &BitVec| -> Option<BitVec> {
+            let p = low_prefix(m);
+            if p.is_ones() {
+                return None;
+            }
+            if bv_and(&p, k).is_zero() && !k.is_zero() {
+                return allow_fold(cx, r, u).then(|| BitVec::zero(m.width()));
+            }
+            let k2 = prefix_residue(k, &p)?;
+            let k2_exists = k2
+                .to_u64()
+                .and_then(|v| cx.find_const_u64(m.width().bits(), v))
+                .is_some();
+            let k_single = !r.life.dead.contains(k_id) && r.life.live.uses(k_id) == Some(1);
+            (k2_exists || k_single).then_some(k2)
+        };
+    let needs_narrow =
+        |cx: &Context, r: &Runner<'_, '_>, u: u32, m: &BitVec, op: OpCode, k_id: u32, k: &BitVec| -> bool {
+            if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) {
+                return arith_narrow(cx, r, u, m, k_id, k).is_some();
+            }
+            let folds_to_const = (op == OpCode::And && bv_and(m, k).is_zero())
+                || (op == OpCode::Or && subset(m, &bv_and(m, k)));
+            if folds_to_const && !allow_fold(cx, r, u) {
+                return false;
+            }
+            bv_and(m, k) != *k
+                || (op == OpCode::And && (subset(m, k) || bv_and(m, k).is_zero()))
+                || (op == OpCode::Or && (bv_and(m, k).is_zero() || subset(m, k)))
+                || (op == OpCode::Xor && (bv_and(m, k).is_zero() || subset(m, k)))
+        };
     let any_narrow = order.iter().any(|&u| {
         read.get(&u).is_some_and(|m| {
             !m.is_zero()
                 && const_op(cx, u)
-                    .is_some_and(|(op, _, k_id, k, _)| needs_narrow(cx, r, m, op, k_id, &k))
+                    .is_some_and(|(op, _, k_id, k, _)| needs_narrow(cx, r, u, m, op, k_id, &k))
         })
     });
     if !any_narrow {
@@ -2027,10 +2028,10 @@ fn narrow_constants(
             && let Some((op, arg_orig, k_id, k, k_first)) = const_op(cx, u)
         {
             let arg = done.get(&arg_orig).copied().unwrap_or(arg_orig);
-            if needs_narrow(cx, r, m, op, k_id, &k) {
+            if needs_narrow(cx, r, u, m, op, k_id, &k) {
                 let mut reads_arg = true;
                 let v = if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) {
-                    let k2 = arith_narrow(cx, r, m, k_id, &k).unwrap_or(k);
+                    let k2 = arith_narrow(cx, r, u, m, k_id, &k).unwrap_or(k);
                     if k2.is_zero() {
                         match op {
                             OpCode::Mul => {
@@ -2131,6 +2132,8 @@ fn narrow_constants(
         operand: cx.handle(root),
         mask: BitVec::ones(cx.width_of(root)),
     });
+    let tree = |i: u32| cx.meta[i as usize].tree;
+    let tie = tree(root) != u32::MAX && tree(e) < tree(root);
     Ok(
         match super::finish_with(
             r,
@@ -2141,12 +2144,18 @@ fn narrow_constants(
             before,
             &atoms,
             Fin::FINAL,
-            true,
+            tie,
         )? {
             Step::To(e, f) => Some(Step::To(e, f)),
             Step::Normal(_) => None,
         },
     )
+}
+
+/// Fast structural gate for whether `root` is non-trivial enough to consider `dedup_root`.
+#[cfg(feature = "prove")]
+pub(crate) fn worth_dedup(cx: &Context, root: u32) -> bool {
+    !cx.is_const(root) && cx.meta[root as usize].height >= 3 && cx.meta[root as usize].tree >= 6
 }
 
 /// Narrow constants in `And`/`Or`/`Xor` across `root` whose bits outside `read[&u]` never reach `root`.
@@ -2166,6 +2175,435 @@ pub(crate) fn narrow_root(
         Some(Step::To(e, f)) => Some((e, f)),
         _ => None,
     })
+}
+
+/// Deterministic 4-lane simulation signature + algebraic equivalence sweep over `root`:
+/// merges interior nodes `(u, v)` (`u` earlier than `v` in topological `order`) that agree on
+/// all demanded bits `read[&v]` (including across `32`-bit / `64`-bit prefix widths) whenever
+/// proven equal by `demanded::simplify`, `poly::equal_mod`, `bitwise::equal`, `linear_mba::equal`,
+/// or `mba::equal_sums`, strictly shrinking the whole DAG.
+#[cfg(feature = "prove")]
+pub(crate) fn dedup_root(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    root: u32,
+) -> Result<Option<(u32, Fin)>, Stop> {
+    if cx.is_const(root)
+        || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty())
+        || r.life.live_roots.len() > 1
+    {
+        return Ok(None);
+    }
+    let Some((order, read)) = demands(r, cx, root)? else {
+        return Ok(None);
+    };
+    if order.len() < 4 || order.len() > 2048 {
+        return Ok(None);
+    }
+    r.meter
+        .charge(Counter::PassWork, (order.len() as u64) * 2)?;
+
+    const LANES: usize = 16;
+    let splitmix = |mut z: u64| -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut sigs: IdMap<u32, [u64; LANES]> = IdMap::default();
+    for &u in &order {
+        let nd = cx.node(u);
+        let w = nd.width;
+        if w == 0 || w > 64 {
+            let base = (u64::from(u) << 8) ^ 0x517c_c1b7_2722_0a95;
+            let mut arr = [0u64; LANES];
+            for (k, slot) in arr.iter_mut().enumerate() {
+                *slot = splitmix(base.wrapping_add(k as u64));
+            }
+            sigs.insert(u, arr);
+            continue;
+        }
+        let mask = u64::MAX >> (64 - w);
+        if let Some(cv) = cx.const_val(u).and_then(|v| v.to_u64()) {
+            let c = cv & mask;
+            sigs.insert(u, [c; LANES]);
+            continue;
+        }
+        let get_s = |id: u32| sigs.get(&id).copied().unwrap_or([0; LANES]);
+        let sa = get_s(nd.a);
+        let sb = if nd.op.arity() >= 2 {
+            get_s(nd.b)
+        } else {
+            [0; LANES]
+        };
+        let sc = if nd.op.arity() >= 3 {
+            get_s(nd.c)
+        } else {
+            [0; LANES]
+        };
+        let mut out = [0u64; LANES];
+        let wa = if nd.op.arity() >= 1 { cx.wid(nd.a) } else { w };
+        let wb = if nd.op.arity() >= 2 { cx.wid(nd.b) } else { w };
+        let mut opaque = false;
+        for lane in 0..LANES {
+            let (a, b, c) = (sa[lane], sb[lane], sc[lane]);
+            out[lane] = match nd.op {
+                OpCode::Add => a.wrapping_add(b) & mask,
+                OpCode::Sub => a.wrapping_sub(b) & mask,
+                OpCode::Mul => a.wrapping_mul(b) & mask,
+                OpCode::Neg => a.wrapping_neg() & mask,
+                OpCode::Not => (!a) & mask,
+                OpCode::And => (a & b) & mask,
+                OpCode::Or => (a | b) & mask,
+                OpCode::Xor => (a ^ b) & mask,
+                OpCode::Shl => {
+                    if b >= u64::from(w) {
+                        0
+                    } else {
+                        (a << b) & mask
+                    }
+                }
+                OpCode::LShr => {
+                    if b >= u64::from(w) {
+                        0
+                    } else {
+                        (a >> b) & mask
+                    }
+                }
+                OpCode::AShr => {
+                    let sign_bit = 1u64 << (w - 1);
+                    let sext_a = if (a & sign_bit) != 0 {
+                        a | !mask
+                    } else {
+                        a
+                    };
+                    if b >= u64::from(w) {
+                        if (a & sign_bit) != 0 { mask } else { 0 }
+                    } else {
+                        ((sext_a as i64 >> b) as u64) & mask
+                    }
+                }
+                OpCode::RotL => {
+                    let r_amt = (b % u64::from(w)) as u32;
+                    if r_amt == 0 {
+                        a & mask
+                    } else {
+                        ((a << r_amt) | (a >> (u32::from(w) - r_amt))) & mask
+                    }
+                }
+                OpCode::RotR => {
+                    let r_amt = (b % u64::from(w)) as u32;
+                    if r_amt == 0 {
+                        a & mask
+                    } else {
+                        ((a >> r_amt) | (a << (u32::from(w) - r_amt))) & mask
+                    }
+                }
+                OpCode::Zext => a & mask,
+                OpCode::Sext => {
+                    if wa == 0 || wa > 64 {
+                        opaque = true;
+                        0
+                    } else {
+                        let sb_in = 1u64 << (wa - 1);
+                        let low_in = u64::MAX >> (64 - wa);
+                        if (a & sb_in) != 0 {
+                            (a | !low_in) & mask
+                        } else {
+                            a & low_in & mask
+                        }
+                    }
+                }
+                OpCode::Extract => {
+                    if wa > 64 {
+                        opaque = true;
+                        0
+                    } else {
+                        (a >> nd.b) & mask
+                    }
+                }
+                OpCode::Concat => {
+                    if wa > 64 || wb >= 64 {
+                        opaque = true;
+                        0
+                    } else {
+                        ((a << wb) | (b & (u64::MAX >> (64 - wb)))) & mask
+                    }
+                }
+                OpCode::Select => {
+                    if (a & 1) != 0 {
+                        b & mask
+                    } else {
+                        c & mask
+                    }
+                }
+                OpCode::Eq if wa <= 64 => u64::from(a == b),
+                OpCode::Ne if wa <= 64 => u64::from(a != b),
+                OpCode::Ult if wa <= 64 => u64::from(a < b),
+                OpCode::Ule if wa <= 64 => u64::from(a <= b),
+                OpCode::Slt | OpCode::Sle if wa > 0 && wa <= 64 => {
+                    let sb_in = 1u64 << (wa - 1);
+                    let sa_i = (a ^ sb_in) & (u64::MAX >> (64 - wa));
+                    let sb_i = (b ^ sb_in) & (u64::MAX >> (64 - wa));
+                    u64::from(if nd.op == OpCode::Slt {
+                        sa_i < sb_i
+                    } else {
+                        sa_i <= sb_i
+                    })
+                }
+                OpCode::Popcnt => u64::from((a & mask).count_ones()) & mask,
+                _ => {
+                    opaque = true;
+                    0
+                }
+            };
+        }
+        // For rare point-equality guards (`Eq`/`Ne` at width >= 4) that never hit on random
+        // samples, derive a deterministic mixed 0/1 truth vector from the commutative XOR
+        // difference `sa ^ sb` so downstream `Select(guard, T, F)` exercises both `T` and `F`.
+        if !opaque && matches!(nd.op, OpCode::Eq | OpCode::Ne) && wa >= 4 {
+            let first = out[0];
+            let all_same = out.iter().all(|&x| x == first);
+            let diff_varies = (1..LANES).any(|k| (sa[k] ^ sb[k]) != (sa[0] ^ sb[0]));
+            if all_same && diff_varies {
+                let mut h = 0x243f_6a88_85a3_08d3u64;
+                for k in 0..LANES {
+                    h = splitmix(h ^ (sa[k] ^ sb[k]));
+                }
+                let mut bits = (h as u16 | 1) & !2u16;
+                if nd.op == OpCode::Ne {
+                    bits = !bits;
+                }
+                for (k, slot) in out.iter_mut().enumerate() {
+                    *slot = u64::from((bits >> k) & 1);
+                }
+            }
+        }
+        if opaque {
+            let base = (u64::from(u) << 8) ^ 0x9e37_79b9_7f4a_7c15;
+            let (kz, ko) = if nd.op == OpCode::Sym {
+                super::known_words(r, cx, u)?
+                    .0
+                    .map_or((0, 0), |[z, o]| (z & mask, o & mask))
+            } else {
+                (0, 0)
+            };
+            for (k, slot) in out.iter_mut().enumerate() {
+                let raw = splitmix(base.wrapping_add(k as u64)) & mask;
+                *slot = (raw & !kz) | ko;
+            }
+        }
+        sigs.insert(u, out);
+    }
+
+    let before = cx.len() as u32;
+    let mut buckets: std::collections::HashMap<(u16, u64, [u64; LANES]), Vec<u32>> =
+        std::collections::HashMap::new();
+    let mut done: IdMap<u32, u32> = IdMap::default();
+    let mut fin = Fin::FINAL;
+    let mut proofs_tried = 0u32;
+    const MAX_DEDUP_PROOFS: u32 = 48;
+
+    for &v in &order {
+        let node = cx.node(v);
+        let mut kids = [node.a, node.b, node.c];
+        let mut kids_changed = false;
+        for k in kids.iter_mut().take(node.op.arity()) {
+            if let Some(&t) = done.get(k)
+                && t != *k
+            {
+                *k = t;
+                kids_changed = true;
+            }
+        }
+        let v_cur = if kids_changed {
+            r.build(cx, |cx| cx.rebuild(v, kids))?
+        } else {
+            v
+        };
+        if v_cur != v {
+            done.insert(v, v_cur);
+        }
+        if v == root || cx.is_const(v_cur) {
+            continue;
+        }
+        let w_v = cx.wid(v_cur);
+        if w_v == 0 || w_v > 64 {
+            continue;
+        }
+        let Some(m_v) = read.get(&v).copied().filter(|m| !m.is_zero()) else {
+            continue;
+        };
+        let Some(mw) = m_v.to_u64() else {
+            continue;
+        };
+        let Some(&sv) = sigs.get(&v) else {
+            continue;
+        };
+        let mut masked_sig = [0u64; LANES];
+        for (dst, &src) in masked_sig.iter_mut().zip(sv.iter()) {
+            *dst = src & mw;
+        }
+        // Constant signature check: skip all-identical-lane constants (already handled by sweeps).
+        if masked_sig.iter().all(|&x| x == masked_sig[0]) {
+            continue;
+        }
+        let ones = mw.count_ones();
+        let is_prefix = ones > 0 && ones == 64 - mw.leading_zeros();
+        let key = if is_prefix {
+            (ones as u16, 0u64, masked_sig)
+        } else {
+            (w_v, mw, masked_sig)
+        };
+        let mut matched: Option<(u32, Fin)> = None;
+        if proofs_tried < MAX_DEDUP_PROOFS
+            && let Some(cands) = buckets.get(&key)
+        {
+            for &u_orig in cands.iter().take(3) {
+                let u_cur = done.get(&u_orig).copied().unwrap_or(u_orig);
+                if u_cur == v_cur {
+                    matched = Some((u_cur, Fin::FINAL));
+                    break;
+                }
+                let w_u = cx.wid(u_cur);
+                if w_u != w_v && !is_prefix {
+                    continue;
+                }
+                proofs_tried += 1;
+                let mark = cx.len() as u32;
+                let u_at_v = match w_u.cmp(&w_v) {
+                    core::cmp::Ordering::Equal => u_cur,
+                    core::cmp::Ordering::Less => r.build(cx, |cx| cx.c_zext(u_cur, w_v))?,
+                    core::cmp::Ordering::Greater => {
+                        r.build(cx, |cx| cx.c_extract(u_cur, 0, w_v))?
+                    }
+                };
+                if let Some(pf) = prove_masked_equal(r, cx, u_at_v, v_cur, &m_v, is_prefix, ones as u16)?
+                {
+                    super::discard_but(r, cx, mark, u_at_v);
+                    matched = Some((u_at_v, pf));
+                    break;
+                }
+                super::discard(r, cx, mark);
+                if proofs_tried >= MAX_DEDUP_PROOFS {
+                    break;
+                }
+            }
+        }
+        if let Some((rep, pf)) = matched {
+            fin = fin.and(pf);
+            done.insert(v, rep);
+        } else {
+            buckets.entry(key).or_default().push(v);
+        }
+    }
+
+    let Some(&new_root) = done.get(&root) else {
+        super::discard(r, cx, before);
+        return Ok(None);
+    };
+    if new_root == root {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    super::discard_but(r, cx, before, new_root);
+    let old_sz = match cx.dag_size(&[cx.handle(root)], 1 << 20).map_err(Stop::Error)? {
+        crate::expr::Bounded::Exact(n) => n,
+        _ => {
+            super::discard(r, cx, before);
+            return Ok(None);
+        }
+    };
+    let shrunk = matches!(
+        cx.dag_size(&[cx.handle(new_root)], old_sz - 1)
+            .map_err(Stop::Error)?,
+        crate::expr::Bounded::Exact(_)
+    );
+    if !shrunk {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    match r.accept(
+        cx,
+        crate::engine::By::Pass("demanded"),
+        true,
+        root,
+        new_root,
+        fin.rel,
+    )? {
+        crate::engine::Accept::Yes => {
+            r.stats.passes.entry("demanded").or_default().changed += 1;
+            Ok(Some((new_root, fin)))
+        }
+        _ => {
+            super::discard(r, cx, before);
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "prove")]
+fn prove_masked_equal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+    m: &BitVec,
+    is_prefix: bool,
+    prefix_bits: u16,
+) -> Result<Option<Fin>, Stop> {
+    if a == b {
+        return Ok(Some(Fin::FINAL));
+    }
+    if is_prefix && prefix_bits > 1 && super::poly::equal_mod(r, cx, a, b, prefix_bits)? {
+        return Ok(Some(Fin::FINAL));
+    }
+    // Simplify both sides under `m` via `demanded::simplify` (exposes high-bit constant noise
+    // differences like `0x63007002b3 - x` vs `0x7002b3 - x` inside `Select`/`And`/`Or`).
+    let mk_demand = |root: u32, before: u32| Demand {
+        memo: Memo::default(),
+        base: Memo::default(),
+        whole: None,
+        whole_sums: false,
+        cap: 64,
+        stops: Vec::new(),
+        visits: 0,
+        fin: Fin::FINAL,
+        before,
+        root,
+        xors: Vec::new(),
+        identities: Vec::new(),
+        union: IdMap::default(),
+        ties: false,
+    };
+    let mut fin = Fin::FINAL;
+    let mut st_a = mk_demand(a, cx.len() as u32);
+    let sa = simplify(r, cx, &mut st_a, a, m)?;
+    let mut st_b = mk_demand(b, cx.len() as u32);
+    let sb = simplify(r, cx, &mut st_b, b, m)?;
+    fin = fin.and(st_a.fin).and(st_b.fin);
+    if sa == sb {
+        return Ok(Some(fin));
+    }
+    let (am, bm) = if m.is_ones() {
+        (sa, sb)
+    } else {
+        let mc = r.build(cx, |cx| cx.mk_const(m))?;
+        (
+            r.build(cx, |cx| cx.c_bin(BinOp::And, sa, mc))?,
+            r.build(cx, |cx| cx.c_bin(BinOp::And, sb, mc))?,
+        )
+    };
+    if am == bm {
+        return Ok(Some(fin));
+    }
+    if let (Some(true), bf) = super::bitwise::equal(r, cx, am, bm)? {
+        return Ok(Some(fin.and(bf)));
+    }
+    if super::poly::equal(r, cx, am, bm)? || super::linear_mba::equal(r, cx, am, bm)? {
+        return Ok(Some(fin));
+    }
+    Ok(None)
 }
 
 /// [`whole`]; with `dry`, only whether the readings of the late stage would rewrite the
@@ -2575,4 +3013,8 @@ pub(crate) struct State {
     pub(crate) reduced: [Memo; 2],
     /// The constants those reductions added to each operand (see `pass::demanded::same_on`).
     pub(crate) sum_constants: IdMap<(u32, u8), Vec<u32>>,
+    /// Number of `dedup_root` sweeps attempted on the current call's root.
+    pub(crate) dedup_runs: u8,
+    /// Last root on which `dedup_root` found nothing to merge.
+    pub(crate) dedup_tried: Option<u32>,
 }

@@ -14,7 +14,7 @@ use crate::ops::BinOp;
 use crate::{BitVec, Width};
 
 /// The most leaves per polynomial width.
-const MAX_LEAVES: usize = 12;
+const MAX_LEAVES: usize = 24;
 
 /// The most monomials a polynomial keeps.
 const MAX_TERMS: usize = 128;
@@ -39,6 +39,10 @@ enum LeafKey {
     /// `base & mask` (mod `2^mod_w`), with `0 < mask < (1 << mod_w) - 1`, unifying `x | c`
     /// (`(x & ~c) + c`) with `x & ~c`.
     Masked(u32, u64),
+    /// `(base & mask) ^ c_canon` (mod `2^mod_w`), with `0 < c_canon < mask` and the top set bit
+    /// of `mask` cleared in `c_canon` so complementary masked constant XORs (`(x & m) ^ c` vs
+    /// `(x & m) ^ (m ^ c)`) canonicalize to `leaf` and `m - leaf`.
+    XorConst(u32, u64, u64),
     /// `base >>u shift` (at full width), unifying `rotl(x, s) = (x << s) + (x >>u (W - s))`
     /// with explicit logical right shifts `x >>u (W - s)`.
     LShr(u32, u16),
@@ -88,6 +92,86 @@ fn leaf_poly(tables: &mut LeafTables, mod_w: Width, key: LeafKey) -> Option<Poly
     let mut m = [0u8; MAX_LEAVES];
     m[i] = 1;
     Some(vec![(m, BitVec::one(mod_w))])
+}
+
+/// Guaranteed 2-adic valuation (trailing zero bits) of every value represented by `key`.
+fn leaf_tz(cx: &Context, mod_w: Width, key: &LeafKey) -> u32 {
+    let bits = mod_w.bits();
+    match key {
+        LeafKey::Masked(_, mask) | LeafKey::XorConst(_, mask, _) => {
+            if *mask == 0 {
+                u32::from(bits)
+            } else {
+                mask.trailing_zeros()
+            }
+        }
+        LeafKey::LowPoly(_, sub) => sub
+            .iter()
+            .map(|(_, c)| crate::facts::known::trailing_zeros(c))
+            .min()
+            .unwrap_or(u32::from(bits)),
+        LeafKey::Node(id) => {
+            if bits <= 64 {
+                let m = possible_ones(cx, *id, 3) & mod_mask_u64(bits);
+                if m == 0 {
+                    u32::from(bits)
+                } else {
+                    m.trailing_zeros()
+                }
+            } else {
+                0
+            }
+        }
+        LeafKey::LShr(base, s) => {
+            if bits <= 64 {
+                let m = (possible_ones(cx, *base, 3) >> s) & mod_mask_u64(bits);
+                if m == 0 {
+                    u32::from(bits)
+                } else {
+                    m.trailing_zeros()
+                }
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Canonical 2-adic quotient: when monomial `M = prod_i leaf_i^{e_i}` has guaranteed valuation
+/// `V = sum_i e_i * tz(leaf_i) > 0`, only `coef mod 2^{max(0, bits - V)}` affects `coef * M (mod 2^bits)`.
+fn reduce_2adic(cx: &Context, tables: &LeafTables, mod_w: Width, p: &mut Poly) {
+    if p.is_empty() {
+        return;
+    }
+    let bits = u32::from(mod_w.bits());
+    let Some((_, keys)) = tables.by_width.iter().find(|(w, _)| *w == mod_w.bits()) else {
+        return;
+    };
+    let mut tzs = [0u32; MAX_LEAVES];
+    let mut any_tz = false;
+    for (i, k) in keys.iter().enumerate() {
+        let tz = leaf_tz(cx, mod_w, k);
+        tzs[i] = tz;
+        any_tz |= tz > 0;
+    }
+    if !any_tz {
+        return;
+    }
+    for (m, c) in p.iter_mut() {
+        let mut v = 0u32;
+        for (i, &e) in m.iter().enumerate() {
+            if e != 0 {
+                v = v.saturating_add(u32::from(e).saturating_mul(tzs[i]));
+            }
+        }
+        if v >= bits {
+            *c = BitVec::zero(mod_w);
+        } else if v > 0 {
+            let keep = crate::facts::known::low_mask(mod_w, bits - v);
+            *c = crate::facts::known::bv_and(c, &keep);
+        }
+    }
+    p.retain(|(_, c)| !c.is_zero());
 }
 
 fn add(a: &Poly, b: &Poly, sub: bool) -> Poly {
@@ -141,6 +225,22 @@ fn possible_ones(cx: &Context, x: u32, depth: u8) -> u64 {
     let m = match n.op {
         OpCode::Const => cx.const_val(x).and_then(|v| v.to_u64()).unwrap_or(full),
         OpCode::Zext => possible_ones(cx, n.a, depth - 1),
+        OpCode::Extract if cx.wid(n.a) <= 64 => {
+            if n.b < 64 {
+                possible_ones(cx, n.a, depth - 1) >> n.b
+            } else {
+                0
+            }
+        }
+        OpCode::Concat => {
+            let lo_w = cx.wid(n.b);
+            let hi = if lo_w < 64 {
+                (possible_ones(cx, n.a, depth - 1) << lo_w) & full
+            } else {
+                0
+            };
+            hi | possible_ones(cx, n.b, depth - 1)
+        }
         OpCode::And => possible_ones(cx, n.a, depth - 1) & possible_ones(cx, n.b, depth - 1),
         OpCode::Or | OpCode::Xor => {
             possible_ones(cx, n.a, depth - 1) | possible_ones(cx, n.b, depth - 1)
@@ -209,6 +309,23 @@ fn guaranteed_ones(cx: &Context, x: u32, depth: u8) -> u64 {
     let m = match n.op {
         OpCode::Const => cx.const_val(x).and_then(|v| v.to_u64()).unwrap_or(0),
         OpCode::Not => !possible_ones(cx, n.a, depth - 1) & full,
+        OpCode::Zext => guaranteed_ones(cx, n.a, depth - 1),
+        OpCode::Extract if cx.wid(n.a) <= 64 => {
+            if n.b < 64 {
+                guaranteed_ones(cx, n.a, depth - 1) >> n.b
+            } else {
+                0
+            }
+        }
+        OpCode::Concat => {
+            let lo_w = cx.wid(n.b);
+            let hi = if lo_w < 64 {
+                (guaranteed_ones(cx, n.a, depth - 1) << lo_w) & full
+            } else {
+                0
+            };
+            hi | guaranteed_ones(cx, n.b, depth - 1)
+        }
         OpCode::Or => guaranteed_ones(cx, n.a, depth - 1) | guaranteed_ones(cx, n.b, depth - 1),
         OpCode::And => guaranteed_ones(cx, n.a, depth - 1) & guaranteed_ones(cx, n.b, depth - 1),
         _ => 0,
@@ -324,7 +441,42 @@ fn poly_of(
             OpCode::Zext if bits <= 64 && cx.wid(node.a) < bits => {
                 let sub_w = cx.width_of(node.a);
                 let sub_bits = sub_w.bits();
-                if let Some(sub) = poly_of(cx, node.a, sub_w, tables, memo, steps) {
+                let sub_mm = mod_mask_u64(sub_bits);
+                let inner = cx.node(node.a);
+                // When `node.a` is a bitwise complement (`~u` or `u ^ c` with top bit set at
+                // `sub_bits`), `zext<mod_w>(~u) == ((1 << sub_bits) - 1) - zext<mod_w>(u)` with
+                // zero borrow, unifying `zext(u ^ c)` and `zext(u ^ ~c)` on the same `LowPoly`.
+                let comp_sub: Option<Poly> = if inner.op == OpCode::Not {
+                    poly_of(cx, inner.a, sub_w, tables, memo, steps)
+                } else if inner.op == OpCode::Xor && sub_bits >= 1 {
+                    let xor_const = match (cx.const_val(inner.a), cx.const_val(inner.b)) {
+                        (None, Some(k)) => k.to_u64().map(|c| (inner.a, c & sub_mm)),
+                        (Some(k), None) => k.to_u64().map(|c| (inner.b, c & sub_mm)),
+                        _ => None,
+                    };
+                    if let Some((base, cv)) = xor_const
+                        && (cv & (1u64 << (sub_bits - 1))) != 0
+                    {
+                        xor_const_poly(cx, base, (!cv) & sub_mm, sub_w, tables, memo, steps)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(mut pos_sub) = comp_sub {
+                    reduce_2adic(cx, tables, sub_w, &mut pos_sub);
+                    let max_val = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, sub_mm))];
+                    if pos_sub.is_empty() {
+                        max_val
+                    } else if pos_sub.len() == 1 && pos_sub[0].0 == [0u8; MAX_LEAVES] {
+                        let c = pos_sub[0].1.zext(mod_w).ok()?;
+                        add(&max_val, &vec![([0u8; MAX_LEAVES], c)], true)
+                    } else {
+                        let lp = leaf_poly(tables, mod_w, LeafKey::LowPoly(sub_bits, pos_sub))?;
+                        add(&max_val, &lp, true)
+                    }
+                } else if let Some(sub) = poly_of(cx, node.a, sub_w, tables, memo, steps) {
                     if sub.is_empty() {
                         Vec::new()
                     } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
@@ -336,6 +488,57 @@ fn poly_of(
                 } else {
                     leaf_poly(tables, mod_w, LeafKey::Node(x))?
                 }
+            }
+            OpCode::Concat if bits <= 64 => {
+                let lo_bits = cx.wid(node.b);
+                if lo_bits >= bits {
+                    poly_of(cx, node.b, mod_w, tables, memo, steps)?
+                } else {
+                    let hi_bits = bits - lo_bits;
+                    let hi_w = Width::new(hi_bits).ok()?;
+                    let lo_w = Width::new(lo_bits).ok()?;
+                    let lift = |sub: Poly, sb: u16, tables: &mut LeafTables| -> Option<Poly> {
+                        if sub.is_empty() {
+                            Some(Vec::new())
+                        } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
+                            let c = sub[0].1.zext(mod_w).ok()?;
+                            Some(vec![([0u8; MAX_LEAVES], c)])
+                        } else {
+                            leaf_poly(tables, mod_w, LeafKey::LowPoly(sb, sub))
+                        }
+                    };
+                    if let (Some(hi_sub), Some(lo_sub)) = (
+                        poly_of(cx, node.a, hi_w, tables, memo, steps),
+                        poly_of(cx, node.b, lo_w, tables, memo, steps),
+                    ) && let (Some(hi_lifted), Some(lo_lifted)) =
+                        (lift(hi_sub, hi_bits, tables), lift(lo_sub, lo_bits, tables))
+                        && let Ok(scale) = BitVec::apply_bin(
+                            BinOp::Shl,
+                            &BitVec::one(mod_w),
+                            &BitVec::wrapping_from_u64(mod_w, u64::from(lo_bits)),
+                        )
+                        && let Some(hi_scaled) = mul(&hi_lifted, &vec![([0u8; MAX_LEAVES], scale)])
+                    {
+                        let p = add(&hi_scaled, &lo_lifted, false);
+                        if p.len() <= MAX_TERMS {
+                            p
+                        } else {
+                            leaf_poly(tables, mod_w, LeafKey::Node(x))?
+                        }
+                    } else {
+                        leaf_poly(tables, mod_w, LeafKey::Node(x))?
+                    }
+                }
+            }
+            OpCode::Xor
+                if (1..=64).contains(&bits)
+                    && (cx.const_val(node.b).is_some() || cx.const_val(node.a).is_some()) =>
+            {
+                let (other, cv) = match cx.const_val(node.b).and_then(|v| v.to_u64()) {
+                    Some(c) => (node.a, c),
+                    None => (node.b, cx.const_val(node.a).and_then(|v| v.to_u64())?),
+                };
+                xor_const_poly(cx, other, cv, mod_w, tables, memo, steps)?
             }
             OpCode::Or
                 if bits <= 64
@@ -507,8 +710,77 @@ fn poly_of(
             _ => leaf_poly(tables, mod_w, LeafKey::Node(x))?,
         }
     };
+    let mut p = p;
+    reduce_2adic(cx, tables, mod_w, &mut p);
     memo.insert((x, bits), p.clone());
     Some(p)
+}
+
+/// Polynomial of `other ^ cv` modulo `2^mod_w`, exploiting known-zero/subset structure and
+/// canonicalizing complementary masked constant XORs `(x & m) ^ c` vs `(x & m) ^ (m ^ c)`.
+fn xor_const_poly(
+    cx: &Context,
+    other: u32,
+    cv: u64,
+    mod_w: Width,
+    tables: &mut LeafTables,
+    memo: &mut IdMap<(u32, u16), Poly>,
+    steps: &mut u32,
+) -> Option<Poly> {
+    let bits = mod_w.bits();
+    let mm = mod_mask_u64(bits);
+    let c_mod = cv & mm;
+    if c_mod == 0 {
+        return poly_of(cx, other, mod_w, tables, memo, steps);
+    }
+    let p_may = possible_ones(cx, other, 4) & mm;
+    if (p_may & c_mod) == 0 {
+        // Disjoint bits: `other ^ c_mod == other + c_mod`.
+        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
+        let p = add(&base_p, &c_term, false);
+        return (p.len() <= MAX_TERMS).then_some(p);
+    }
+    if (p_may & !c_mod) == 0 {
+        // Every possible 1-bit of `other` is set in `c_mod`: `other ^ c_mod == c_mod - other`.
+        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
+        let p = add(&c_term, &base_p, true);
+        return (p.len() <= MAX_TERMS).then_some(p);
+    }
+    let (b_peeled, m) = peel_masked(cx, other, mm, bits);
+    let c_out = c_mod & !m;
+    let c_in = c_mod & m;
+    if c_in == 0 {
+        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_out))];
+        let p = add(&base_p, &c_term, false);
+        return (p.len() <= MAX_TERMS).then_some(p);
+    }
+    if c_in == m {
+        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
+        let p = add(&c_term, &base_p, true);
+        return (p.len() <= MAX_TERMS).then_some(p);
+    }
+    let top_bit = 1u64 << (63 - m.leading_zeros());
+    let neg_comp = (c_in & top_bit) != 0;
+    let c_canon = if neg_comp { m ^ c_in } else { c_in };
+    let leaf = leaf_poly(tables, mod_w, LeafKey::XorConst(b_peeled, m, c_canon))?;
+    if neg_comp {
+        let bias = vec![(
+            [0u8; MAX_LEAVES],
+            BitVec::wrapping_from_u64(mod_w, c_out | m),
+        )];
+        let p = add(&bias, &leaf, true);
+        (p.len() <= MAX_TERMS).then_some(p)
+    } else if c_out == 0 {
+        Some(leaf)
+    } else {
+        let bias = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_out))];
+        let p = add(&bias, &leaf, false);
+        (p.len() <= MAX_TERMS).then_some(p)
+    }
 }
 
 /// Whether `a` and `b` expand to the same polynomial modulo `2^bits` (and at least one has a
@@ -549,7 +821,9 @@ pub(super) fn equal_mod(
                     | OpCode::RotR
                     | OpCode::Zext
                     | OpCode::Extract
-            ) || (matches!(n.op, OpCode::And | OpCode::Or)
+                    | OpCode::Concat
+                    | OpCode::Or
+            ) || (matches!(n.op, OpCode::And | OpCode::Xor)
                 && (cx.const_val(n.a).is_some() || cx.const_val(n.b).is_some()))
             {
                 stack.extend(n.children());
@@ -663,7 +937,19 @@ pub(super) fn canonicalize_dag(
                     op,
                     OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not | OpCode::Mul | OpCode::Shl
                 ));
-        if poly_cone
+        let indexable = poly_cone
+            || matches!(
+                op,
+                OpCode::Add
+                    | OpCode::Sub
+                    | OpCode::Neg
+                    | OpCode::Not
+                    | OpCode::Shl
+                    | OpCode::LShr
+                    | OpCode::RotL
+                    | OpCode::RotR
+            );
+        if indexable
             && (2..=64).contains(&w)
             && cx.const_val(cur).is_none()
             && let Ok(wt) = Width::new(w)
@@ -675,10 +961,10 @@ pub(super) fn canonicalize_dag(
                 break;
             }
             if let Some(p) = p_opt {
-                if p.is_empty() {
+                if poly_cone && p.is_empty() {
                     cur = r.build(cx, |cx| cx.mk_const_u64(w, 0))?;
                     merged_any = true;
-                } else if p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
+                } else if poly_cone && p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
                     let kv = p[0].1;
                     cur = r.build(cx, |cx| cx.mk_const(&kv))?;
                     merged_any = true;
@@ -689,7 +975,8 @@ pub(super) fn canonicalize_dag(
                         .and_then(|v| v.iter().find(|(bw, bp, _)| *bw == w && *bp == p))
                         .map(|&(_, _, rep)| rep);
                     if let Some(rep) = found {
-                        if rep != cur
+                        if poly_cone
+                            && rep != cur
                             && cx.meta[rep as usize].tree
                                 <= cx.meta[cur as usize].tree.saturating_mul(2).saturating_add(4)
                         {
@@ -698,10 +985,11 @@ pub(super) fn canonicalize_dag(
                         }
                     } else {
                         // Also check bitwise complement `~p == -p - 1`: e.g. `C - a - 1 == ~rep`.
-                        let comp = if op != OpCode::Not {
+                        let comp = if poly_cone && op != OpCode::Not {
                             let neg_p = add(&Vec::new(), &p, true);
                             let minus_one = vec![([0u8; MAX_LEAVES], BitVec::ones(wt))];
-                            let cp = add(&neg_p, &minus_one, false);
+                            let mut cp = add(&neg_p, &minus_one, false);
+                            reduce_2adic(cx, &tables, wt, &mut cp);
                             let ch = poly_hash(w, &cp);
                             buckets
                                 .get(&ch)
@@ -796,6 +1084,21 @@ mod tests {
         assert!(simplifies_to_true(
             "let p1 = x * y + z; let p2 = x * (-y) - z - 1; \
              ((p1 & w) ^ p1) == ((~p2 & w) ^ ~p2)"
+        ));
+        assert!(simplifies_to_true(
+            "let v0 = zext<64>(d:32) & 0xc4ca4796; \
+             let v1 = concat(zext<62>(~(trunc<1>(a:64) ^ extract<3, 1>(a))), 0:2); \
+             let v2 = (a & 128 | b:64 & 0x3c7300 | v1) + 0x5e124156224aa1e7; \
+             let v3 = v2 >>u 4; \
+             let v4 = v1 * 0x3000000000000000; \
+             let v5 = rotl(v2, 60); \
+             let v6 = v4 + 0x8fffffffffffffff; \
+             let v7 = v5 * 0x110a53cdc4dd8bdd; \
+             ((v0 + v3) * 0x110a53cdc4dd8bdd + 0x37309649008bcd8 - v4 + 0x5f27cce5e9fd7e9c) * v5 \
+             + v6 * (v7 + v0 * 0x40e947a1b54bcc4d + 0x1eede61ec3450e29) \
+             + (v6 + v5) * 0x40e947a1b54bcc4d * (v0 ^ 0xfffd7d57e6caf79e) \
+             + v4 + 0x9c1d50602ced70af \
+             + (v0 * 0x2fdef3d3f06e4070 - v7 + 0x31401341e12eede4) * v3 == v5"
         ));
     }
 

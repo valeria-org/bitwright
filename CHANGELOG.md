@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.32.22
+
+- Generalized syntactic bitwise complement and parity recognition on `Context`
+  (`are_bitwise_complements`, `opposite_bit0`): unified `~x`, `x ^ c` vs `x ^ ~c`, `c1 - x` vs
+  `x + c2` (`c1 + c2 == -1`), and 1-bit complementary comparisons across `bitwise`, `linear`, and
+  `facts`, and refined `Facts` on opposite-parity products (even bit 0), division-guard `select`
+  nodes (`nonzero_select_bound`), and sparse small-popcount `Mul` factors via shift-and-add
+  `KnownBits` accumulation at all widths `1..=512`.
+- Strengthened canonical polynomial ring equivalence (`poly`): added 2-adic monomial coefficient
+  quotienting modulo `2^{max(0, bits - sum e_i * tz(leaf_i))}`, exact `Concat` and `Extract`
+  polynomial lowering, masked `LeafKey::XorConst(base, mask, c)` soundness and subset/complement
+  constant-XOR expansion, and arithmetic/shift/rotate DAG equivalence bucketing up to 24 leaves.
+- Integrated signature-guided whole-DAG demanded-mask subtree deduplication (`demanded::dedup_root`)
+  directly inside `Runner::at_root` under `Phase::Demanded`, enforced `(DAG size, tree size)`
+  strict decrease and `Hooks::fold_known` in `demanded::narrow_constants` without tie-mutating
+  single-use word constants, and made `compares::stops_below` and `linear::plain` spine checks
+  strictly structural and arena-independent.
+- Extended `bitwise` with homomorphic shift/rotate constant reassociation
+  `sh(x bop c1, s) bop c2 -> sh(x, s) bop (sh(c1, s) bop c2)`, known-bit field-splice elimination
+  `(x & m) | c -> x`, and `Concat` structural masks; extended `linear` with annihilated 2-adic
+  scaled term stripping, sign-bit `Xor` linearization, known-bit constant `Or`/`Xor` offsets,
+  disjoint constant-mask pair merging `k*(a & m1) ± k*(a & m2)`, and narrow `zext(x ^ ~c)` factor
+  pairing.
+- Extended `compares` with signed addition/subtraction overflow sign-bit interval elimination
+  (`signed_overflow_sign_test`) and single-side `select` equality decomposition; extended `mba`
+  with narrow `zext(t ^ c)` / `zext(~t)` peer atom unification, multi-carry and implicit top-carry
+  bit-table solving up to 128 bits, `PassWork`-budgeted scan/circuit accounting and `step_done`
+  memoization, `Runner::rewritten` pre-certification checks, `BinOp::Sub` guard witness inversion
+  under active deadlines in `prove`, and balanced tie-breaking in `synth::Search::pairs`.
+
 ## 0.32.21
 
 - Fixed >64-bit constant construction (`BitVec::wrapping_from_u64` instead of `mk_const_u64`) in

@@ -654,11 +654,14 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
     // A short select chain can return its fallback on almost every random input,
     // even when a few simultaneous tag equalities reach a different word.
     let n = cx.node(root);
-    let selected_equality = n.op == OpCode::Eq
+    let mut selected_equality = n.op == OpCode::Eq
         && [n.a, n.b].iter().any(|&i| cx.node(i).op == OpCode::Select);
+    let single_word_target = matches!(n.op, OpCode::Eq | OpCode::Ne)
+        && n.op == OpCode::Ne
+        && cx.wid(n.a) >= 8;
     let conjunctive = n.op == OpCode::Or || (n.op == OpCode::Not && cx.node(n.a).op == OpCode::And);
     let tall = cx.height(cx.handle(root)).ok()? >= 32;
-    if !selected_equality && !conjunctive && !tall {
+    if !selected_equality && !single_word_target && !conjunctive && !tall {
         return None;
     }
     // A short implication can contain a full-width equality whose required
@@ -675,19 +678,22 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             OpCode::And if want => stack.extend([(n.a, true), (n.b, true)]),
             OpCode::Or if !want => stack.extend([(n.a, false), (n.b, false)]),
             _ => {
+                selected_equality |= !want
+                    && n.op == OpCode::Eq
+                    && [n.a, n.b].iter().any(|&k| cx.node(k).op == OpCode::Select);
                 word_guard |= matches!(n.op, OpCode::Eq | OpCode::Ne)
                     && (n.op == OpCode::Eq) == want && cx.wid(n.a) >= 8;
                 terms.push((i as usize, want));
             }
         }
     }
-    let guarded = word_guard && terms.len() > 1;
+    let guarded = word_guard && (terms.len() > 1 || single_word_target);
     if !selected_equality && !guarded && !tall {
         return None;
     }
     let limit = if tall || selected_equality { MAX_NODES } else { 127 };
     let (p, slots) = Program::lower(cx, root, &[], limit)?;
-    let compact_guard = guarded && p.ops.len() < 128;
+    let compact_guard = guarded && p.ops.len() < 128 && (terms.len() > 1 || p.ops.len() >= 12);
     if !selected_equality && !compact_guard && p.ops.len() < 128 {
         return None;
     }
@@ -719,7 +725,7 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             }
         }
     }
-    if selected_equality && p.ops.len() < 128 && labels.iter().all(Vec::is_empty) {
+    if selected_equality && p.ops.len() < 128 && labels.iter().all(Vec::is_empty) && cases.is_empty() {
         return None;
     }
     let mut values = vec![0; p.ops.len()];

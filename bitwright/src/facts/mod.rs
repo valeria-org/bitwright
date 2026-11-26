@@ -827,19 +827,32 @@ impl Context {
             let one = Facts::constant(&BitVec::one(args[0].width()));
             return transfer(&TOp::Bin(crate::ops::BinOp::Shl), &[args[0], &one]);
         }
-        if n.op == OpCode::Mul && n.a == n.b && args.len() == 2 {
-            // A square: its low bits follow from its operand's, and where it cannot wrap it is
-            // at least 0 (a product's transfer does not know the operands are one value).
-            let f = transfer(op, args);
-            let f = f.meet(&square_known(args[0])).unwrap_or(f);
-            return square_range(args[0]).and_then(|g| f.meet(&g)).unwrap_or(f);
+        if n.op == OpCode::Mul && args.len() == 2 {
+            let mut f = transfer(op, args);
+            if n.a == n.b {
+                // A square: its low bits follow from its operand's, and where it cannot wrap it is
+                // at least 0 (a product's transfer does not know the operands are one value).
+                f = f.meet(&square_known(args[0])).unwrap_or(f);
+                return square_range(args[0]).and_then(|g| f.meet(&g)).unwrap_or(f);
+            }
+            if args[0].width().bits() > 1 && self.opposite_bit0(n.a, n.b) {
+                // A product of opposite-parity values (`u * (u + 1)`, `u * ~u`, `(x ^ 2) * (x ^ 5)`)
+                // always has an even result (bit 0 == 0).
+                let w = args[0].width();
+                let even = KnownBits::from_masks(BitVec::one(w), BitVec::zero(w));
+                f = f.meet_known(&even).unwrap_or(f);
+            }
+            return f;
         }
         if n.op == OpCode::Select {
-            let f = transfer(op, args);
-            return self
-                .min_max_bound(i, args)
-                .and_then(|g| f.meet(&g))
-                .unwrap_or(f);
+            let mut f = transfer(op, args);
+            if let Some(g) = self.min_max_bound(i, args) {
+                f = f.meet(&g).unwrap_or(f);
+            }
+            if let Some(g) = self.nonzero_select_bound(i, args) {
+                f = f.meet(&g).unwrap_or(f);
+            }
+            return f;
         }
         if n.op == OpCode::Concat {
             let f = transfer(op, args);
@@ -991,6 +1004,92 @@ impl Context {
             }
             _ => None,
         }
+    }
+
+    /// A select guarding against zero (`select(u == 0, k, u)` or `select(u == 0, k, zext(u))`,
+    /// and `!=` swapped) excludes `0` from the `u != 0` arm before joining the two arms, so
+    /// division-by-zero guards like `select(x == 0, 1, x)` get unsigned lower bound `>= 1`.
+    fn nonzero_select_bound(&self, i: u32, args: &[&Facts]) -> Option<Facts> {
+        if args.len() != 3 {
+            return None;
+        }
+        let n = self.node(i);
+        let c = self.node(n.a);
+        let op = c.op.as_cmp()?;
+        let is_zero_node = |id: u32| self.const_val(id).is_some_and(|v| v.is_zero());
+        let u = if is_zero_node(c.b) {
+            c.a
+        } else if is_zero_node(c.a) {
+            c.b
+        } else {
+            return None;
+        };
+        let (zero_arg, nz_node, nz_arg) = match op {
+            CmpOp::Eq => (args[1], n.c, args[2]),
+            CmpOp::Ne => (args[2], n.b, args[1]),
+            _ => return None,
+        };
+        let matches_u = nz_node == u
+            || (self.node(nz_node).op == OpCode::Zext && self.node(nz_node).a == u);
+        if !matches_u {
+            return None;
+        }
+        let w = nz_arg.width();
+        let nz_range = URange::new(BitVec::one(w), BitVec::ones(w))?;
+        Some(match nz_arg.meet_urange(&nz_range) {
+            Some(refined_nz) => zero_arg.hull(&refined_nz),
+            None => *zero_arg,
+        })
+    }
+
+    /// Canonical `(base_node, bit0_flipped)` parity of `x`'s least significant bit, peeling
+    /// parity-preserving/flipping unary, constant-offset, odd-mask, odd-multiply, and cast layers.
+    fn bit0_parity(&self, mut x: u32) -> (u32, bool) {
+        let mut flip = false;
+        for _ in 0..8 {
+            let n = self.node(x);
+            match n.op {
+                OpCode::Not => {
+                    flip = !flip;
+                    x = n.a;
+                }
+                OpCode::Neg | OpCode::Zext | OpCode::Sext => {
+                    x = n.a;
+                }
+                OpCode::Extract if n.b == 0 && n.width >= 1 => {
+                    x = n.a;
+                }
+                OpCode::Add | OpCode::Sub | OpCode::Xor => {
+                    let pair = match (self.const_val(n.a), self.const_val(n.b)) {
+                        (None, Some(c)) => Some((n.a, c)),
+                        (Some(c), None) => Some((n.b, c)),
+                        _ => None,
+                    };
+                    let Some((inner, c)) = pair else { break };
+                    if c.bit(0) == Some(true) {
+                        flip = !flip;
+                    }
+                    x = inner;
+                }
+                OpCode::And | OpCode::Mul => {
+                    let pair = match (self.const_val(n.a), self.const_val(n.b)) {
+                        (None, Some(c)) if c.bit(0) == Some(true) => Some(n.a),
+                        (Some(c), None) if c.bit(0) == Some(true) => Some(n.b),
+                        _ => None,
+                    };
+                    let Some(inner) = pair else { break };
+                    x = inner;
+                }
+                _ => break,
+            }
+        }
+        (x, flip)
+    }
+
+    fn opposite_bit0(&self, a: u32, b: u32) -> bool {
+        let (ba, fa) = self.bit0_parity(a);
+        let (bb, fb) = self.bit0_parity(b);
+        ba == bb && fa != fb
     }
 
     /// A right shift of a value by its own top bits, `a >>u (a >>u k)` (the count spelled

@@ -1913,6 +1913,24 @@ impl Runner<'_, '_> {
                             self.latent.insert(cur, ());
                         }
                     }
+                    if !self.held
+                        && !self.latent.contains_key(&cur)
+                        && self.demanded.dedup_runs < 2
+                        && self.demanded.dedup_tried != Some(cur)
+                        && pass::demanded::worth_dedup(cx, cur)
+                    {
+                        self.demanded.dedup_runs = self.demanded.dedup_runs.saturating_add(1);
+                        self.begin(cx, phase, cur);
+                        if let Some((e, df)) = pass::demanded::dedup_root(self, cx, cur)? {
+                            self.demanded.dedup_tried = None;
+                            self.rewritten.insert((cur, e), ());
+                            let (r, f2) = self.walked(cx, phase, e)?;
+                            fin = fin.and(f).and(df).and(f2);
+                            cur = r;
+                            continue;
+                        }
+                        self.demanded.dedup_tried = Some(cur);
+                    }
                     return Ok((cur, fin.and(f)));
                 }
                 Step::To(e, f) => {
@@ -3405,6 +3423,8 @@ impl Runner<'_, '_> {
             self.mba.shallow.clear();
         }
         self.words.turn = false;
+        self.demanded.dedup_runs = 0;
+        self.demanded.dedup_tried = None;
         // The rounds that changed the root, and every round (the number an observer sees).
         let (mut changed, mut round) = (0u8, 0u8);
         // Whether this round is over the root the one before it left as it was, with deeper

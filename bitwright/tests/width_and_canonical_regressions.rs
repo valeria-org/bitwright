@@ -745,3 +745,352 @@ fn p1_and_p2_identities_demorgan_cofactor_borrow_free_sub_demanded_and_compares(
         assert_bitblasted_equal(&mut cx, e_mxor, r_mxor);
     }
 }
+
+#[test]
+fn signature_guided_dag_dedup_merges_nested_equivalent_subtrees() {
+    let engine = build_engine(true, true);
+    let o16 = ParseOptions::width(Width::W16);
+
+    // 1) Size-tied interior subtrees `p = (a | b) & 7` vs `q = b | (a & 7)` (`b = ~rotl(u, 15) & 4`)
+    //    nested inside an identical degree-3 nonlinear polynomial `F(p) == F(q)`.
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let b = ~rotl(u, 15) & 4; \
+            let p = (a | b) & 7; \
+            let q = b | (a & 7); \
+            (((c + (p ^ 204)) & (c + (p ^ 130) ^ 59) & 255 | 0x8200) * (p ^ 0x3d4f) * (p ^ 0xe8ac)) \
+            == (((c + (q ^ 204)) & (c + (q ^ 130) ^ 59) & 255 | 0x8200) * (q ^ 0xe8ac) * (q ^ 0x3d4f))";
+        let eq = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 17);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+        assert_bitblasted_equal(&mut cx, eq, out);
+    }
+
+    // 2) Non-prefix demanded mask over `select` subtrees differing only on un-demanded high bits.
+    {
+        let mut cx = Context::new();
+        let src = "\
+            let lo = x & 0x00ff; \
+            let d = (0x6323 - lo) + 0x1111; \
+            let s1 = select(c == 0, d & ((0x0023 - lo) | 0xc004), 0x4806); \
+            let s2 = select(c == 0, d & ((0x6323 - lo) | 0xc004), 0x4806); \
+            (k1 * (~s1 >>u 14) ^ k2 * ((s1 >>u 2) & 0x0031)) \
+            == (k1 * (~s2 >>u 14) ^ k2 * ((s2 >>u 2) & 0x0031))";
+        let eq = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 17);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+        assert_bitblasted_equal(&mut cx, eq, out);
+    }
+}
+
+#[test]
+fn small_support_known_bits_and_modular_bridge_constant_round_trips() {
+    let engine = build_engine(true, true);
+    let o16 = ParseOptions::width(Width::W16);
+
+    // 1) Disguised `mult + add/sub` round-trip recovering passed-in constant `0x4242` via
+    //    2-adic zero-divisor + `u * (u + 1)` parity noise annihilation (`0x4242 * 0x6000 + 0x8242 == 0x4242`).
+    {
+        let mut cx = Context::new();
+        let src = "(0x4242 + (y << 3) + (u * (u + 1)) * 4) * 0x6000 + 0x8242";
+        let e = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, e, 1 << 15);
+        assert_eq!(
+            cx.view(out).unwrap(),
+            View::Const(BitVec::from_u64(Width::W16, 0x4242).unwrap())
+        );
+        assert_bitblasted_equal(&mut cx, e, out);
+    }
+
+    // 2) Affine inverse round-trip through MSB sign-bit XOR `^ 0x8000` (`0x3335 * 0xf33d == 1 mod 2^16`):
+    //    `(((0x1337 + x * 0x3335) ^ 0x8000) * 0xf33d) - x - ((0x1337 + 0x8000) * 0xf33d) + 0x1337 == 0x1337`.
+    {
+        let mut cx = Context::new();
+        // Verify modular inverse: `5 * 0xcd == 0x401`; at 16 bits, `5 * 0xcccd == 0x40001 == 1 (mod 2^16)`!
+        // With `K = 0x1337`: `((0x1337 + x * 5) ^ 0x8000) * 0xcccd - x + 0x1ff4 == 0x1337`? Compute constant directly:
+        let src = "(((0x1337 + x * 5) ^ 0x8000) * 0xcccd) - x - ((0x9337 * 0xcccd) - 0x1337)";
+        let e = cx.parse(src, &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, e, 1 << 15);
+        assert_eq!(
+            cx.view(out).unwrap(),
+            View::Const(BitVec::from_u64(Width::W16, 0x1337).unwrap())
+        );
+        assert_bitblasted_equal(&mut cx, e, out);
+    }
+
+    // 3) Small-support (<= 3 unknown bits) nonlinear mult+add round-trip recovering constant `0x5a5a`,
+    //    plus 1-unknown-bit canonicalization unifying `v + C1`, `w | C2`, `-(y ^ C3)`, and `(z | C4) & C5`.
+    {
+        let mut cx = Context::new();
+        // For `t = x & 3` (`t in 0..4`), `t * (t - 1) * (t - 2) * (t - 3)` is divisible by `4! = 24` (multiple of 8),
+        // so multiplying by `0x2000` (`8192`, `8 * 8192 = 65536 = 0 mod 2^16`) annihilates it on all 4 states!
+        let src_const = "\
+            let t = x & 3; \
+            0x5a5a + (t * (t + 0xffff) * (t + 0xfffe) * (t + 0xfffd)) * 0x2000";
+        let ec = cx.parse(src_const, &o16).unwrap();
+        let rc = simplify_fuel(&engine, &mut cx, ec, 1 << 16);
+        assert_eq!(
+            cx.view(rc).unwrap(),
+            View::Const(BitVec::from_u64(Width::W16, 0x5a5a).unwrap())
+        );
+        assert_bitblasted_equal(&mut cx, ec, rc);
+
+        let src_1bit = "\
+            let v = (x & 4) | 3; \
+            let w = x & 4; \
+            let lhs = (v + 0x174e) + (-(((x & 4) | 1) ^ 0xe8ae)); \
+            let rhs = (w | 0x1751) * 2; \
+            lhs == rhs";
+        let e1b = cx.parse(src_1bit, &o16).unwrap();
+        let r1b = simplify_fuel(&engine, &mut cx, e1b, 1 << 16);
+        assert_eq!(cx.view(r1b).unwrap(), View::Const(BitVec::ones(Width::W1)));
+        assert_bitblasted_equal(&mut cx, e1b, r1b);
+    }
+}
+
+#[test]
+fn xor_complement_zext_peers_nonzero_select_facts_and_bit_table_multi_carry() {
+    let engine = build_engine(true, true);
+    let prover = bitwright::prove::Simplifiers::new();
+
+    // 1) `Facts::nonzero_select_bound`: 128-bit `udiv(zext<128>(a + 1), select(z == 0, 1, z))`
+    //    where `z = zext<128>(b:64)` fits in 64 bits (`%1 == zext<128>(trunc<64>(%1))` -> true).
+    {
+        let mut cx = Context::new();
+        let w128 = Width::new(128).unwrap();
+        let src = "\
+            let z = zext<128>(b:64); \
+            let q = udiv(zext<128>(a:64 + 1), select(z == 0, 1, z)); \
+            q == zext<128>(trunc<64>(q))";
+        let eq = cx.parse(src, &ParseOptions::width(w128)).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, eq, 1 << 15);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::ones(Width::W1)));
+
+        // Also `select(b == 0, 3:128, zext<128>(b))` (cross-width zero check against `Zext(b)`):
+        let src2 = "\
+            let q = udiv(zext<128>(a:64), select(b:64 == 0, 3:128, zext<128>(b))); \
+            q == zext<128>(trunc<64>(q))";
+        let eq2 = cx.parse(src2, &ParseOptions::width(w128)).unwrap();
+        let out2 = simplify_fuel(&engine, &mut cx, eq2, 1 << 15);
+        assert_eq!(cx.view(out2).unwrap(), View::Const(BitVec::ones(Width::W1)));
+    }
+
+    // 2) `Facts::opposite_bit0`: generalized opposite-parity products (`(x ^ 2) * (x ^ 5)`) get
+    //    `trailing_known_zeros >= 1` directly in `Facts`, folding `* 0x8000` to `0` at 16 bits.
+    {
+        let mut cx = Context::new();
+        let o16 = ParseOptions::width(Width::W16);
+        let e = cx.parse("((x ^ 2) * (x ^ 5)) * 0x8000", &o16).unwrap();
+        let out = simplify_fuel(&engine, &mut cx, e, 1 << 15);
+        assert_eq!(cx.view(out).unwrap(), View::Const(BitVec::zero(Width::W16)));
+        assert_bitblasted_equal(&mut cx, e, out);
+    }
+
+    // 3) Complementary XORs (`x ^ c` vs `x ^ ~c`), narrow `zext(u ^ c)` vs `zext(u ^ ~c)` vs `zext(u)`
+    //    peer unification + `by_multiplicand` + `poly::XorConst`: proves the 64-bit identity from
+    //    `0004-2183ms` (`-(%3 * (%2 ^ K)) - %3 * (%2 ^ ~K)` AND `zext<64>(%0 ^ K32)` vs `zext<64>(%0 ^ ~K32)`).
+    {
+        let mut cx = Context::new();
+        let o64 = ParseOptions::width(Width::W64);
+        let src = "\
+            let %0 = trunc<32>(x:64); \
+            let %1 = zext<64>(%0); \
+            let %2 = (%1 | 0x410340d08025a990) & 0x7cf89367efbd | 0x4103000000000000; \
+            let %3 = %2 & 0xffffffffffff | 0x4103000000000000; \
+            let %4 = -(%3 * (%2 ^ 0xd2d1c1970a4543b5)) - %3 * (%2 ^ 0x2d2e3e68f5babc4a) | 0xff6ffffb3f7efe6d; \
+            let %5 = %4 * 0xeaf80aa55c637369; \
+            let %6 = %5 * 0x2d2f8e790a59cec9; \
+            let %7 = %4 * 0xd5f0154ab8c6e6d2; \
+            let %8 = %7 * 0x180110a414281; \
+            let %9 = %5 * 0x3000f5a23002; \
+            let %10 = %5 * 0xffffcfff0a5dcffd; \
+            let %11 = %4 * 0xd5da5854a0a0adad; \
+            let %12 = %4 * 0xa14583511aa2a9e2; \
+            let %13 = -%7; \
+            let %14 = (zext<64>(%0 ^ 0x821f580f) << 11) + 0xefef1800000003e1; \
+            let %15 = -(%14 * ((%1 << 26 ^ 0x8e087d603df0f7f7) >>u 15 ^ 0xefee000000000000) + (%14 * ((zext<64>(%0 ^ 0x7de0a7f0) << 11) + 0x1010e0000000041e) & -256 | 94) & -256 | 31) & -256 | 225; \
+            let %16 = trunc<32>(%6 + %8 + %9 + %10 + %11 + %12 - %7); \
+            let %17 = %15 << (zext<64>(trunc<8>(%16 * 61)) & 63) | %15 >>u (zext<64>(trunc<8>(%16 * -125)) & 63); \
+            ~(%6 * 0x6a95e63ebafa8175 + %8 * 0x6a95e63ebafa8175 + %9 * 0x6a95e63ebafa8175 + %10 * 0x6a95e63ebafa8175 + %11 * 0x6a95e63ebafa8175 + %12 * 0x6a95e63ebafa8175 + %13 * 0x6a95e63ebafa8175 & %17) & (~(%8 * 0xc9c68196e2e00f98 + %6 * 0xc9c68196e2e00f98 + %9 * 0xc9c68196e2e00f98 + %10 * 0xc9c68196e2e00f98 + %11 * 0xc9c68196e2e00f98 + %12 * 0xc9c68196e2e00f98 + %13 * 0xc9c68196e2e00f98) | %17) == rotl(((x & 0x7de0a7f0) - (x & 0x821f580f) << 11) + 0xefef1c10fac07be0, 15) ^ 0x8e087d603df077f7";
+        let eq = cx.parse(src, &o64).unwrap();
+        let cfg = bitwright::prove::Config::default()
+            .with_simplify_fuel(1 << 18)
+            .with_max_conflicts(2_000)
+            .with_max_propagations(20_000);
+        let res = bitwright::prove::valid_under_with(&mut cx, eq, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(res, bitwright::prove::Outcome::Proved(_)),
+            "expected Proved on zext-xor complement identity, got {res:?}"
+        );
+    }
+
+    // 4) Multi-bit constant mask collapse + disjoint mask pair in `linear::masked` with non-zero
+    //    residual constant, plus single-side `select` equality + `guard_samples` `Sub` inversion.
+    {
+        let mut cx = Context::new();
+        let o8 = ParseOptions::width(Width::W8);
+        let e_mask = cx
+            .parse("(x & 18) * 12 + (y - x) * 6 + 0x90", &o8)
+            .unwrap();
+        let r_mask = simplify_fuel(&engine, &mut cx, e_mask, 1 << 15);
+        assert_bitblasted_equal(&mut cx, e_mask, r_mask);
+
+        let e_disj = cx.parse("(x & 0x50) * 3 - (x & 0x0a) * 3 + 7", &o8).unwrap();
+        let r_disj = simplify_fuel(&engine, &mut cx, e_disj, 1 << 15);
+        assert_bitblasted_equal(&mut cx, e_disj, r_disj);
+
+        let mut cx64 = Context::new();
+        let o64 = ParseOptions::width(Width::W64);
+        let src_ref = "\
+            let u = a ^ 0xe7262998390b56c8; \
+            select((b - 5) >>u 3 == 1, (~(~a & 0xe7262998390b56c8) & ~(a & 0x18d9d667c6f4a937)) * u * 0x61c8864680b583ab + u * u * 0x61c8864680b583ab, c) == c";
+        let eq_ref = cx64.parse(src_ref, &o64).unwrap();
+        let cfg = bitwright::prove::Config::default()
+            .with_max_conflicts(200)
+            .with_max_propagations(2000);
+        let res_ref =
+            bitwright::prove::valid_under_with(&mut cx64, eq_ref, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(res_ref, bitwright::prove::Outcome::Refuted(_)),
+            "expected fast Refuted via guard_samples + single-side select eq, got {res_ref:?}"
+        );
+    }
+
+    // 5) `bit_table` multi-cluster carry compensation (`MultiCarryComp`) on folded 6-bit sub-cluster
+    //    carries (`0371-124ms` structure over 16-bit input).
+    {
+        let mut cx = Context::new();
+        let o64 = ParseOptions::width(Width::W64);
+        let src_bt = "\
+            let %0 = trunc<32>(~(zext<64>(zext<32>(x16:16) - 4) * -1) + 1); \
+            let %1 = %0 + 0x2f9f8590; \
+            let %2 = extract<18, 8>(%1) & 1 != 0; \
+            let %3 = extract<19, 8>(%1) & 1; \
+            let %4 = %3 != 0; \
+            let %5 = %3 == 0; \
+            let %6 = select(%2, select(%4, 0x37d9c5f60c0b80cd:64, 0xe3eed707db2d95e2), select(%5, 0:64, 0x53eaeeee30ddeaeb)); \
+            let %7 = extract<10, 8>(%1) & 1 != 0; \
+            let %8 = extract<11, 8>(%1) & 1; \
+            let %9 = %8 != 0; \
+            let %10 = select(%7, select(%9, 0xf7a992e3ade7ebe6:64, 0x23f98183526cab00), select(%8 == 0, 0:64, 0xd3b011605b7b40e6)); \
+            let %11 = trunc<8>(%1); \
+            let %12 = %11 >>u 6 & 1; \
+            let %13 = %11 & -128; \
+            let %14 = %13 != 0; \
+            let %15 = select(%12 != 0, select(%14, 0xc1d215293480d126:64, 0x38014d7accb533c5), select(%13 == 0, 0:64, 0x89d0c7ae67cb9d61)); \
+            let %16 = %11 & 1 != 0; \
+            let %17 = %11 >>u 1 & 1; \
+            let %18 = %17 != 0; \
+            let %19 = %17 == 0; \
+            let %20 = select(%16, select(%18, 0x656969889870bfcb:64, 0x58934d6791b5f96e), select(%19, 0:64, 0xcd61c2106bac65d)); \
+            let %21 = %11 >>u 2 & 1 != 0; \
+            let %22 = %11 >>u 3 & 1; \
+            let %23 = %22 != 0; \
+            let %24 = %22 == 0; \
+            let %25 = select(%21, select(%23, 0xd0d8639095ceabe1:64, 0x5a96ba7c39a02804), select(%24, 0:64, 0x7641a9145c2e83dd)); \
+            let %26 = %11 >>u 4 & 1; \
+            let %27 = %11 >>u 5 & 1; \
+            let %28 = %27 != 0; \
+            let %29 = select(%26 != 0, select(%28, 0x8c746ecb98d4f493:64, 0xfb30ecbeb5a3e728), select(%27 == 0, 0:64, 0x9143820ce3310d6b)); \
+            let %30 = extract<8, 8>(%1) & 1 != 0; \
+            let %31 = extract<9, 8>(%1) & 1; \
+            let %32 = %31 != 0; \
+            let %33 = select(%30, select(%32, 0x249c6c4ee4c31a5:64, 0x71364f203014c64), select(%31 == 0, 0:64, 0xfb3661d2eb4ae541)); \
+            let %34 = extract<14, 8>(%1) & 1; \
+            let %35 = extract<15, 8>(%1) & 1; \
+            let %36 = %35 != 0; \
+            let %37 = select(%34 != 0, select(%36, 0xd81b5d1bfb3743eb:64, 0x3b1964d6ab81f814), select(%35 == 0, 0:64, 0x9d01f8454fb54bd7)); \
+            let %38 = extract<12, 8>(%1) & 1 != 0; \
+            let %39 = extract<13, 8>(%1) & 1; \
+            let %40 = %39 != 0; \
+            let %41 = select(%38, select(%40, 0x72bd05afdd29f57:64, 0xa34e974776e37c92), select(%39 == 0, 0:64, 0x63dd391386ef22c5)); \
+            let %42 = extract<16, 8>(%1) & 1; \
+            let %43 = extract<17, 8>(%1) & 1; \
+            let %44 = %43 != 0; \
+            let %45 = select(%42 != 0, select(%44, 0x4c910d0e0c30e3da:64, 0x22a495383978d81e), select(%43 == 0, 0:64, 0x29ec77d5d2b80bbc)); \
+            let %46 = extract<20, 8>(%1) & 1; \
+            let %47 = extract<21, 8>(%1) & 1; \
+            let %48 = %47 != 0; \
+            let %49 = select(%46 != 0, select(%48, 0xa367a59637babe9b:64, 0xcbfdcd6be0dd22a5), select(%47 == 0, 0:64, 0xd769d82a56dd9bf6)); \
+            let %50 = %6 + %10 + %15 + %20 + %25 + %29 + %33 + %37 + %41 + %45 + %49 + 0x913d8ee744f703bc; \
+            let %51 = zext<64>(%32); \
+            let %52 = zext<64>(zext<32>(%44) << 2); \
+            let %53 = zext<64>(zext<32>(%14) * 2); \
+            let %54 = %15 + %29; \
+            let %55 = zext<64>(%9); \
+            let %56 = (%55 << 1) + %55; \
+            let %57 = %33 + %10; \
+            let %58 = zext<64>(%40); \
+            let %59 = zext<64>(%36); \
+            let %60 = %37 + %41; \
+            let %61 = %57 + %37 + %41; \
+            let %62 = %50 ^ 0x874a0fe692594c3a | select(%2, (zext<64>(%4) << 3) + 1, select(%5, 0:64, 7)) + select(%46 == 0, 0, zext<64>(%48) + 5) + select(%30, %51 * 2, %51) + select(%42 == 0, %52, %52 + 5) + select(%26 == 0, 0, zext<64>(%28) | 4) + select(%21, select(%23, 11:64, 5), select(%24, 0:64, 6)) + select(%16, select(%19, 7:64, 14), select(%18, 7:64, 0)) + zext<64>(%25 + %20 <u %25) + select(%12 == 0, %53, %53 + 4) + zext<64>(%54 <u %15) + zext<64>(%15 + %20 + %25 + %29 <u %54) + select(%7, %56 + 6, %56) + zext<64>(%57 <u %10) + select(%38, (%58 << 1) + %58 + 1, zext<64>(zext<32>(%40) * 2)) + select(%34 == 0, %59, %59 + 7) + zext<64>(%60 <u %37) + zext<64>(%61 <u %60) + zext<64>(%15 + %10 + %20 + %25 + %29 + %33 + %37 + %41 <u %61) + zext<64>(%50 <u %45 + %6 + %49 + 0x913d8ee744f703bc) + 24 ^ 70 == 0; \
+            let %63 = zext<64>(trunc<32>(zext<64>(~%0) | 0xffffffff00000000)) | 0xffffffff00000000; \
+            let %64 = select(%62, (%63 + 0x5b639bfff5fe3eb1 & (select(%62, 9:64, 251) + 0x1400ef08c | %63 + 0x2210ba5e064080f)) >>u 10, 0x30aae08169b88); \
+            ((~%64 ^ %64) & 0x610010680043894 ^ %64) & 0xf867d0f83760852a == 0x300a800008108";
+        let eq_bt = cx.parse(src_bt, &o64).unwrap();
+        let out_bt = simplify_fuel(&engine, &mut cx, eq_bt, 1 << 17);
+        assert!(
+            matches!(cx.view(out_bt).unwrap(), View::Const(_) | View::Cmp(..)),
+            "expected bit_table multi-carry to collapse 328-node guard to a direct comparison or constant, got {:?}",
+            cx.view(out_bt).unwrap()
+        );
+        assert_bitblasted_equal(&mut cx, eq_bt, out_bt);
+        let cfg_bt = bitwright::prove::Config::default()
+            .with_simplify_fuel(1 << 17)
+            .with_max_conflicts(200)
+            .with_max_propagations(2000);
+        let res_bt =
+            bitwright::prove::valid_under_with(&mut cx, eq_bt, None, &cfg_bt, &prover).unwrap();
+        assert!(
+            matches!(
+                res_bt,
+                bitwright::prove::Outcome::Proved(_) | bitwright::prove::Outcome::Refuted(_)
+            ),
+            "expected decided outcome on 0371-124ms bit_table query, got {res_bt:?}"
+        );
+    }
+
+    // 6) Sparse `kb_mul` non-overlapping partial-product known bits + Hacker's Delight signed
+    //    overflow sign-test elimination (`ssub.overflow`, `sadd.overflow`, `~a + b` borrow).
+    {
+        for bits in [8u16, 16, 32, 64] {
+            let mut cx = Context::new();
+            let w = Width::new(bits).unwrap();
+            let opt = ParseOptions::width(w);
+            // Sparse `kb_mul`: `(x & 5) * (y & 16)` only touches bits `{4, 6}` when `bits >= 8`.
+            let prod = cx.parse("(x & 5) * (y & 16)", &opt).unwrap();
+            let kb = cx.facts(prod).unwrap().known();
+            assert_eq!(kb.bit(0), Some(false));
+            assert_eq!(kb.bit(5), Some(false));
+            assert_eq!(kb.bit(7), Some(false));
+
+            // Bounded signed overflow sign-bit tests fold to false (`0:1`), while overflowing
+            // operands are NOT falsely folded to `0:1`.
+            let half = bits / 2;
+            let src_no_ovf = format!(
+                "let a = (sext<{bits}>(extract<0, 1>(x)) - (x & 3)) * (y & 3); \
+                 let b = zext<{bits}>(trunc<{half}>(z)); \
+                 ((a ^ b) & ((~a + b) ^ b)) <s 0"
+            );
+            let e_no_ovf = cx.parse(&src_no_ovf, &opt).unwrap();
+            let r_no_ovf = simplify_fuel(&engine, &mut cx, e_no_ovf, 1 << 15);
+            assert_eq!(
+                cx.as_const(r_no_ovf).unwrap(),
+                Some(bitwright::BitVec::zero(Width::W1)),
+                "width {bits}: bounded (~a + b) overflow test should fold to 0"
+            );
+            if bits <= 16 {
+                assert_bitblasted_equal(&mut cx, e_no_ovf, r_no_ovf);
+            }
+
+            let e_may_ovf = cx.parse("((x ^ y) & ((~x + y) ^ y)) <s 0", &opt).unwrap();
+            let r_may_ovf = simplify_fuel(&engine, &mut cx, e_may_ovf, 1 << 15);
+            assert!(
+                cx.as_const(r_may_ovf).unwrap().is_none(),
+                "width {bits}: unrestricted signed overflow test must not fold to constant"
+            );
+        }
+    }
+}

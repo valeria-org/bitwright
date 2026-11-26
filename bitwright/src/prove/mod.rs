@@ -1157,7 +1157,7 @@ impl Question {
         // so even constraints hidden inside the predicate participate in witness validation.
         if cfg.simplify && !cfg.certificate && !cfg.word_sampling
             && cfg.sample_mode == SampleMode::Random && cfg.samples >= 128
-            && env.deadline.is_none()
+            && env.deadline.is_none_or(|d| d.clock.now_ticks() < d.at)
             && let Some((tested, model)) = sample_words::guard_samples(cx, root)
         {
             q.stats.samples = tested;

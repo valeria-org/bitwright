@@ -90,6 +90,10 @@ pub(crate) struct State {
     /// Cached 128-bit bit-table carry-tree equality solutions keyed by `(a, b, target128)`,
     /// storing the 1-bit equality predicate node when solved.
     pub(crate) bit_tables: crate::hash::IdMap<(u32, u32, u128), Option<u32>>,
+    /// Immutable arena nodes `(n, side)` whose `step_with` finished completely (`fin.done &&
+    /// fin.why.is_none() && !unshrunk`), avoiding redundant `sliced`/`Shallow`/`Cut` re-scans
+    /// across later rounds and depth escalations.
+    pub(crate) step_done: crate::hash::IdMap<(u32, bool), Fin>,
 }
 
 impl Drop for State {
@@ -261,8 +265,10 @@ pub(super) fn asks(
     let op = cx.node(n).op;
     let qualifies = |op: OpCode| mixed_op(op) || (poly && op == OpCode::Shl);
     let a = if qualifies(op) {
+        let _ = crate::mba::take_scan_visits();
         match crate::mba::fits_nodes(cx, n, &cfg.limits) {
             Ok(order) => {
+                let _ = crate::mba::take_scan_visits();
                 r.meter.charge(Counter::PassWork, order.len() as u64)?;
                 // A fragment within the limits: so is the fragment of every node inside it
                 // (a part of it), which is not scanned again when the walk reaches it (along
@@ -274,7 +280,17 @@ pub(super) fn asks(
                 }
                 true
             }
-            Err(_) => false,
+            Err(why) => {
+                let visits = crate::mba::take_scan_visits();
+                r.meter.charge(Counter::PassWork, visits)?;
+                if matches!(
+                    why,
+                    Refusal::TooManyVars | Refusal::TooLarge | Refusal::TooWide
+                ) {
+                    r.mba.kept.insert(n, true);
+                }
+                false
+            }
         }
     } else {
         false
@@ -474,7 +490,6 @@ fn sweep_inner(
     };
     let root = if fold_cases
         && cfg.opaque_sweep
-        && r.assumptions.is_none()
         && order.iter().any(|&i| {
             let m = cx.node(i);
             m.op == OpCode::Mul && !cx.is_const(m.a) && !cx.is_const(m.b)
@@ -3860,6 +3875,9 @@ fn step_with(
     if !(mixed_op(op) || (poly && op == OpCode::Shl)) {
         return Ok(Step::Normal(Fin::FINAL));
     }
+    if let Some(&fin) = r.mba.step_done.get(&(n, side)) {
+        return Ok(Step::Normal(fin));
+    }
     let unshrunk = count(r).not_smaller;
     let held = count(r).unsupported;
     let out = ask(r, cx, cfg, n, n, None, depth(r))?;
@@ -3942,7 +3960,10 @@ fn step_with(
         // `Σ cᵢ·fᵢ(t)` over a `t` that is a fragment of its own, and the whole question is
         // then over what `t` is made of, where the cut one is over `t` alone.
         for root in slices.into_iter().chain([n]) {
+            let _ = crate::mba::take_scan_visits();
             let cuts = shared(r, cx, cfg, root, CUTS, false);
+            r.meter
+                .charge(Counter::PassWork, crate::mba::take_scan_visits())?;
             for c in cuts {
                 match ask(
                     r,
@@ -3964,7 +3985,11 @@ fn step_with(
         // for a fragment whose answer did that, or a side of a case split: asked of every
         // fragment kept from its question, 140 measured calls took 15% longer.
         if unshrunk || side {
-            for c in shared(r, cx, cfg, n, CUTS, true) {
+            let _ = crate::mba::take_scan_visits();
+            let whole_cuts = shared(r, cx, cfg, n, CUTS, true);
+            r.meter
+                .charge(Counter::PassWork, crate::mba::take_scan_visits())?;
+            for c in whole_cuts {
                 match ask(
                     r,
                     cx,
@@ -3980,7 +4005,17 @@ fn step_with(
             }
         }
         discard(r, cx, before);
+        if !unshrunk && fin.done && fin.why.is_none() {
+            r.mba.step_done.insert((n, side), fin);
+        }
         return Ok(Step::Normal(fin));
+    }
+    if let Step::Normal(fin) = out
+        && !unshrunk
+        && fin.done
+        && fin.why.is_none()
+    {
+        r.mba.step_done.insert((n, side), fin);
     }
     Ok(out)
 }
@@ -4753,6 +4788,7 @@ fn ask_with_answers(
     // The whole fragment, or a narrower reading of it: semi-linear with a node cut off as
     // an atom (and an operand that is the atom less a constant written over it, see
     // `lower_id_over`), or with the arithmetic under its bitwise operators atoms.
+    let _ = crate::mba::take_scan_visits();
     let lowered = match reading {
         None => lower_id(cx, root, &cfg.limits),
         Some(_) => lower_id_over(
@@ -4764,8 +4800,21 @@ fn ask_with_answers(
         ),
     };
     let (m, bindings) = match lowered {
-        Ok(x) => x,
+        Ok(x) => {
+            let _ = crate::mba::take_scan_visits();
+            x
+        }
         Err(why) => {
+            let visits = crate::mba::take_scan_visits();
+            r.meter.charge(Counter::PassWork, visits)?;
+            if reading.is_none()
+                && matches!(
+                    why,
+                    Refusal::TooManyVars | Refusal::TooLarge | Refusal::TooWide
+                )
+            {
+                r.mba.kept.insert(root, true);
+            }
             count(r).refused(&why);
             return Ok(Step::Normal(Fin::FINAL));
         }
@@ -4976,6 +5025,10 @@ fn ask_with_answers(
                     let e = r.build(cx, |cx| lift_id(cx, expr, &bindings))?;
                     if e == n {
                         return Ok(Step::Normal(Fin::FINAL));
+                    }
+                    if r.rewritten.contains_key(&(e, n)) {
+                        discard(r, cx, before);
+                        return Ok(Step::Normal(Fin::PROVISIONAL));
                     }
                     let began = start();
                     if let Err(fin) = shrinks(r, cx, n, e, &bindings.atoms)? {

@@ -1759,11 +1759,173 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     }
                 }
             }
+            // Homomorphic shift/rotate reassociation:
+            // `sh(x bop c1, s) bop c2 -> sh(x, s) bop (sh(c1, s) bop c2)` for constant `s` and
+            // `sh ∈ {Shl, LShr, RotL, RotR}`, folding the two constants across the shift/rotate.
+            if let Some(sh_op) = match yn.op {
+                OpCode::Shl => Some(BinOp::Shl),
+                OpCode::LShr => Some(BinOp::LShr),
+                OpCode::RotL => Some(BinOp::RotL),
+                OpCode::RotR => Some(BinOp::RotR),
+                _ => None,
+            } && let Some(s_bv) = cx.const_val(yn.b)
+            {
+                let inner_n = cx.node(yn.a);
+                if inner_n.op == op {
+                    let inner_pair = match (cx.const_val(inner_n.a), cx.const_val(inner_n.b)) {
+                        (None, Some(c1)) => Some((inner_n.a, c1)),
+                        (Some(c1), None) => Some((inner_n.b, c1)),
+                        _ => None,
+                    };
+                    if let Some((x, c1)) = inner_pair {
+                        let sh_c1 = BitVec::bin_unchecked(sh_op, &c1, &s_bv);
+                        let c_merged = BitVec::bin_unchecked(bop, &sh_c1, &c2);
+                        let before = cx.len() as u32;
+                        let e = r.build(cx, |cx| {
+                            let sh_x = cx.c_bin(sh_op, x, yn.b)?;
+                            let kc = cx.mk_const(&c_merged)?;
+                            cx.c_bin(bop, sh_x, kc)
+                        })?;
+                        let mut stops = vec![x, yn.b];
+                        stops.sort_unstable();
+                        stops.dedup();
+                        match super::finish_with(
+                            r,
+                            cx,
+                            PassKind::Bitwise,
+                            n,
+                            e,
+                            before,
+                            &stops,
+                            Fin::FINAL,
+                            true,
+                        )? {
+                            Step::Normal(_) => {}
+                            done => return Ok(done),
+                        }
+                    }
+                }
+            }
         }
     }
     let mut pre_fin = Fin::FINAL;
+    // Redundant known-bit field splice: `(x & m) | c -> x` (and `(x & m) ^ c -> x` when `c & m == 0`,
+    // including `zext<w>(trunc<k>(x)) | c -> x`) whenever `KnownBits(x)` proves every 1-bit of `c`
+    // is already 1 in `x` and every cleared bit `~m & ~c` is already 0 in `x`.
+    if matches!(op, OpCode::Or | OpCode::Xor)
+        && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+    {
+        let node = cx.node(n);
+        let const_side = match (cx.const_val(node.a), cx.const_val(node.b)) {
+            (None, Some(c)) if !c.is_zero() => Some((node.a, c)),
+            (Some(c), None) if !c.is_zero() => Some((node.b, c)),
+            _ => None,
+        };
+        if let Some((masked_id, c)) = const_side {
+            let mn = cx.node(masked_id);
+            let w = cx.width_of(n);
+            let xm = if mn.op == OpCode::And {
+                match (cx.const_val(mn.a), cx.const_val(mn.b)) {
+                    (None, Some(m)) => Some((mn.a, m)),
+                    (Some(m), None) => Some((mn.b, m)),
+                    _ => None,
+                }
+            } else if mn.op == OpCode::Zext {
+                let en = cx.node(mn.a);
+                if en.op == OpCode::Extract && en.b == 0 && cx.wid(en.a) == w.bits() {
+                    Some((en.a, crate::facts::known::low_mask(w, u32::from(en.width))))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((x, m)) = xm
+                && (op == OpCode::Or || crate::facts::known::bv_and(&c, &m).is_zero())
+            {
+                let (kb_opt, kfin) = super::known(r, cx, x)?;
+                if let Some(kb) = kb_opt {
+                    let ko_ok = crate::facts::known::bv_and(
+                        &c,
+                        &crate::facts::known::bv_not(&kb.known_one()),
+                    )
+                    .is_zero();
+                    let cleared_zeros = crate::facts::known::bv_and(
+                        &crate::facts::known::bv_not(&m),
+                        &crate::facts::known::bv_not(&c),
+                    );
+                    let kz_ok = crate::facts::known::bv_and(
+                        &cleared_zeros,
+                        &crate::facts::known::bv_not(&kb.known_zero()),
+                    )
+                    .is_zero();
+                    if ko_ok && kz_ok {
+                        let before = cx.len() as u32;
+                        match finish(r, cx, PassKind::Bitwise, n, x, before, &[x], kfin)? {
+                            Step::Normal(f) => pre_fin = pre_fin.and(f),
+                            done => return Ok(done),
+                        }
+                    } else {
+                        pre_fin = pre_fin.and(kfin.unchanged());
+                    }
+                }
+            }
+        }
+    }
     if op == OpCode::And {
         let node = cx.node(n);
+        // `(x | c_or) & c_and -> (x & (c_and & ~c_or)) | (c_or & c_and)` when `c_or & c_and != 0`.
+        let or_and = match (cx.node(node.a).op, cx.const_val(node.b)) {
+            (OpCode::Or, Some(c_and)) => Some((node.a, c_and)),
+            _ => match (cx.node(node.b).op, cx.const_val(node.a)) {
+                (OpCode::Or, Some(c_and)) => Some((node.b, c_and)),
+                _ => None,
+            },
+        };
+        if let Some((or_id, c_and)) = or_and {
+            let on = cx.node(or_id);
+            let or_pair = match (cx.const_val(on.a), cx.const_val(on.b)) {
+                (None, Some(c_or)) => Some((on.a, c_or)),
+                (Some(c_or), None) => Some((on.b, c_or)),
+                _ => None,
+            };
+            if let Some((x, c_or)) = or_pair {
+                let c_keep = BitVec::bin_unchecked(BinOp::And, &c_or, &c_and);
+                let c_rem = BitVec::bin_unchecked(
+                    BinOp::And,
+                    &c_and,
+                    &BitVec::un_unchecked(UnOp::Not, &c_or),
+                );
+                if !c_keep.is_zero() {
+                    let before = cx.len() as u32;
+                    let e = r.build(cx, |cx| {
+                        let kc = cx.mk_const(&c_keep)?;
+                        if c_rem.is_zero() {
+                            Ok(kc)
+                        } else {
+                            let rc = cx.mk_const(&c_rem)?;
+                            let xm = cx.c_bin(BinOp::And, x, rc)?;
+                            cx.c_bin(BinOp::Or, xm, kc)
+                        }
+                    })?;
+                    let stops = if c_rem.is_zero() { vec![] } else { vec![x] };
+                    match super::finish_with(
+                        r,
+                        cx,
+                        PassKind::Bitwise,
+                        n,
+                        e,
+                        before,
+                        &stops,
+                        Fin::FINAL,
+                        true,
+                    )? {
+                        Step::Normal(f) => pre_fin = pre_fin.and(f),
+                        done => return Ok(done),
+                    }
+                }
+            }
+        }
         let not_const = match (cx.node(node.a).op, cx.const_val(node.b)) {
             (OpCode::Not, Some(c)) if !c.is_zero() && !c.is_ones() => Some((cx.node(node.a).a, c)),
             _ => match (cx.node(node.b).op, cx.const_val(node.a)) {
