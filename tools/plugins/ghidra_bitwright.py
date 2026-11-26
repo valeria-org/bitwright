@@ -11,13 +11,13 @@ import bitwright
 from ghidra.program.model.block import BasicBlockModel
 
 
-def varnode(vn):
-    """A varnode as bitwright's p-code front end reads it, registers by name."""
+def varnode(vn, register_names):
+    """Identify register storage by byte range and remember names for display."""
     size = vn.getSize()
     if vn.isRegister():
         reg = currentProgram.getRegister(vn.getAddress(), size)  # noqa: F821 (Ghidra global)
         if reg is not None:
-            return "(register, %s, %d)" % (reg.getName(), size)
+            register_names[("reg_0x%x" % vn.getOffset(), size * 8)] = reg.getName()
         return "(register, 0x%x, %d)" % (vn.getOffset(), size)
     if vn.isUnique():
         return "(unique, 0x%x, %d)" % (vn.getOffset(), size)
@@ -29,13 +29,14 @@ def varnode(vn):
 
 def pcode_text(block):
     lines = []
+    register_names = {}
     for instr in currentProgram.getListing().getInstructions(block, True):  # noqa: F821
         for op in instr.getPcode():
             out = op.getOutput()
-            ins = ", ".join(varnode(v) for v in op.getInputs())
-            head = (varnode(out) + " = ") if out is not None else ""
+            ins = ", ".join(varnode(v, register_names) for v in op.getInputs())
+            head = (varnode(out, register_names) + " = ") if out is not None else ""
             lines.append("%s%s %s" % (head, op.getMnemonic(), ins))
-    return "\n".join(lines)
+    return "\n".join(lines), register_names
 
 
 def main():
@@ -44,7 +45,7 @@ def main():
     if not blocks:
         print("no basic block at the cursor")
         return
-    text = pcode_text(blocks[0])
+    text, register_names = pcode_text(blocks[0])
     print("p-code:\n" + text)
     cx = bitwright.Context()
     try:
@@ -54,7 +55,7 @@ def main():
         return
     engine = bitwright.Engine.deobfuscate()
     for name, e in block.outputs:
-        print("%s = %s" % (name, engine.simplify(e)))
+        print("%s = %s" % (register_names.get((name, e.width), name), engine.simplify(e)))
     for addr, value in block.stores:
         print("store [%s] = %s" % (engine.simplify(addr), engine.simplify(value)))
     for cond, target in block.exits:

@@ -11,8 +11,11 @@ into expressions, so that what a block computes can be simplified, compared or p
 
 A block becomes a `Block`: the registers it reads before writing them (symbols named after
 them), the final value of each register it writes, its stores, its conditional exits, and
-where it continues. Registers are read and written by byte range, so x86-64's `eax`, `ax`,
-`al` and `ah` are parts of `rax`; memory is a [memory](memory.md), so a value stored and loaded
+where it continues. Registers are read and written by byte range. On x86-64, `eax`, `ax`,
+`al` and `ah` are parts of `rax`. On AArch64, `w0` through `w30` and `wsp` name the low
+four bytes of their respective X register or stack pointer. A raw four-byte write preserves the
+other bytes. A lifted instruction that clears them expresses the full-width write in its IR.
+Memory is a [memory](memory.md), so a value stored and loaded
 back is the value. One block is read straight through: an exit is recorded, and the code after
 it runs as if the exit was not taken.
 

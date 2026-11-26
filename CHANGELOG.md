@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- The deobfuscation strategy can reuse circuit-proved equalities between differently written
+  mixed-width subexpressions. Comparisons and arithmetic parents can consume the same proof,
+  including when another output keeps one of the operands live.
+- Narrowed masked left shifts with representable counts and zero-extended unsigned remainder.
+  Unsigned division narrows when a known set bit guarantees a nonzero divisor. Same-direction
+  variable shifts and rotations recognize reordered counts, including at odd widths. Popcount
+  simplifies through rotations, byte swaps and bit reversal.
+- Named AArch64 W and X register views now share storage in the p-code and VEX readers. The
+  Ghidra adapter serializes register-space offsets and uses register names for output labels.
+
 ## 0.32.23
 
 - Fixed an out-of-bounds panic at the 48-leaf low-cone boundary in `mba::opaque_predicate::equal_low_cone_zero` when `!causal` leaf nodes reached index 48 during low-cone collection.
