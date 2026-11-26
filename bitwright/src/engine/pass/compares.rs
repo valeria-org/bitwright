@@ -1854,6 +1854,15 @@ fn peel_congruence(cx: &Context, mut a: u32, mut b: u32) -> (u32, u32, u16) {
 /// The compares pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
+    #[cfg(feature = "prove")]
+    if matches!(node.op, OpCode::Eq | OpCode::Ne)
+        && super::views::known(r, node.a, node.b)
+        && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+    {
+        let before = cx.len() as u32;
+        let c = bool_const(r, cx, node.op == OpCode::Eq)?;
+        return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+    }
     if node.op == OpCode::Select {
         let (c, t, f) = (node.a, node.b, node.c);
         // Canonicalize `select(a <=s b, 0, K) -> select(b <s a, K, 0)` (and `<=u`, `!=`),

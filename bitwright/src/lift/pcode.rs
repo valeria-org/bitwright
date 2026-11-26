@@ -156,12 +156,9 @@ struct State<'a> {
 
 impl State<'_> {
     /// The register a register varnode names, and the byte offset into it.
-    fn register(&self, v: &Varnode) -> (String, u16) {
+    fn register(&self, v: &Varnode) -> (String, u16, Option<u16>) {
         match &v.offset {
-            Offset::Name(n) => {
-                let (base, off, _) = alias(n);
-                (base, off)
-            }
+            Offset::Name(n) => alias(n, v.size),
             Offset::Num(o) => {
                 let (start, _) = self
                     .ranges
@@ -169,7 +166,7 @@ impl State<'_> {
                     .copied()
                     .find(|&(s, n)| *o >= s && *o < s + n)
                     .unwrap_or((*o, u64::from(v.size)));
-                (format!("reg_{start:#x}"), (*o - start) as u16)
+                (format!("reg_{start:#x}"), (*o - start) as u16, None)
             }
         }
     }
@@ -184,7 +181,7 @@ impl State<'_> {
         match (v.space.as_str(), &v.offset) {
             ("const", Offset::Num(k)) => self.constant(*k, v.size),
             ("register", _) => {
-                let (base, off) = self.register(v);
+                let (base, off, _) = self.register(v);
                 self.regs.read(self.cx, &base, off, v.size)
             }
             ("unique", Offset::Num(k)) => {
@@ -236,7 +233,7 @@ impl State<'_> {
         };
         match (v.space.as_str(), &v.offset) {
             ("register", _) => {
-                let (base, off) = self.register(v);
+                let (base, off, _) = self.register(v);
                 self.regs.write(self.cx, &base, off, value)
             }
             ("unique", Offset::Num(k)) => {
@@ -529,20 +526,10 @@ pub fn pcode(cx: &mut Context, text: &str) -> Result<Block, Error> {
     for op in &ops {
         for v in op.out.iter().chain(&op.ins) {
             if v.space == "register" {
-                let (base, off) = st.register(v);
-                let full = match &v.offset {
-                    Offset::Name(n) => alias(n).2.map(|_| {
-                        // A known register's full size.
-                        super::X86_64
-                            .iter()
-                            .find(|(name, ..)| name.eq_ignore_ascii_case(&base))
-                            .map_or(8, |&(.., s)| s)
-                    }),
-                    Offset::Num(_) => None,
-                };
+                let (base, off, view) = st.register(v);
                 st.regs.note(&base, off, v.size);
-                if let Some(f) = full {
-                    st.regs.note(&base, 0, f);
+                if view.is_some() {
+                    st.regs.note(&base, 0, 8);
                 }
             }
         }

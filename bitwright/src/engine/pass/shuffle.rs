@@ -516,6 +516,60 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         return Ok(step);
     }
     let node = cx.node(n);
+    if node.op == OpCode::Popcnt {
+        let mut word = node.a;
+        while matches!(
+            cx.node(word).op,
+            OpCode::RotL | OpCode::RotR | OpCode::BitRev | OpCode::Bswap
+        ) {
+            r.meter.charge(Counter::PassWork, 1)?;
+            word = cx.node(word).a;
+        }
+        if word != node.a {
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| cx.c_un(UnOp::Popcnt, word))?;
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Shuffle,
+                n,
+                e,
+                before,
+                &[word],
+                Fin::FINAL,
+                true,
+            );
+        }
+    }
+    // Reordering the counts preserves saturating shifts and modular rotations even
+    // at widths where adding the counts in their own bit width would wrap.
+    if matches!(
+        node.op,
+        OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
+    ) {
+        let inner = cx.node(node.a);
+        if inner.op == node.op
+            && cx.order(inner.b, node.b).is_gt()
+            && !cx.is_const(node.b)
+            && !cx.is_const(inner.b)
+        {
+            let before = cx.len() as u32;
+            let op = node.op.as_bin().unwrap();
+            let first = r.build(cx, |cx| cx.c_bin(op, inner.a, node.b))?;
+            let e = r.build(cx, |cx| cx.c_bin(op, first, inner.b))?;
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Shuffle,
+                n,
+                e,
+                before,
+                &[inner.a, inner.b, node.b],
+                Fin::FINAL,
+                true,
+            );
+        }
+    }
     if node.width > MAX_WIDTH || !traced_op(node.op) || node.op == OpCode::Const {
         return Ok(Step::Normal(Fin::FINAL));
     }

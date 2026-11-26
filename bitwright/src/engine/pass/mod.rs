@@ -31,6 +31,8 @@ pub(super) mod shuffle;
 pub(super) mod slices;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "prove")]
+mod views;
 pub(super) mod words;
 pub(super) mod xor;
 

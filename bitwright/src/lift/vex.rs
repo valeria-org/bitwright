@@ -30,13 +30,12 @@ fn type_bits(t: &str) -> Option<u16> {
 }
 
 /// A register argument: `rdi`, or `offset=16`, with its base and byte offset.
-fn register(arg: &str) -> (String, u16) {
+fn register(arg: &str, bytes: u16) -> (String, u16, Option<u16>) {
     let arg = arg.trim();
     if let Some(o) = arg.strip_prefix("offset=") {
-        return (format!("offset_{o}"), 0);
+        return (format!("offset_{o}"), 0, None);
     }
-    let (base, off, _) = alias(arg);
-    (base, off)
+    alias(arg, bytes)
 }
 
 /// Splits the arguments of `name(a,b,c)` (no nesting in flat VEX).
@@ -116,7 +115,7 @@ impl State<'_> {
         if let Some(rest) = rhs.strip_prefix("GET:") {
             let (ty, a) = args(rest).ok_or_else(|| at_line(line, "GET(…)"))?;
             let bits = type_bits(ty).ok_or_else(|| at_line(line, format!("type {ty}")))?;
-            let (base, off) = register(a.first().copied().unwrap_or(""));
+            let (base, off, _) = register(a.first().copied().unwrap_or(""), bits / 8);
             return self.regs.read(self.cx, &base, off, bits / 8);
         }
         // LDle:I32(addr)
@@ -331,8 +330,11 @@ impl State<'_> {
         }
         if let Some(r) = lhs.strip_prefix("PUT(") {
             let reg = r.trim_end_matches(')');
-            let (base, off) = register(reg);
             let v = self.atom(line, rhs, None)?;
+            let (base, off, view) = register(reg, self.cx.width(v)?.bits().div_ceil(8));
+            if view.is_some() {
+                self.regs.note(&base, 0, 8);
+            }
             self.regs.write(self.cx, &base, off, v)?;
             return Ok(true);
         }
@@ -392,36 +394,16 @@ pub fn vex(cx: &mut Context, text: &str) -> Result<Block, Error> {
         }
         lines.push((k + 1, l.to_string()));
     }
-    // Registers' full sizes: each access (a GET's type; a PUT's value, unknown here: 8 bytes
-    // for the names x86-64 has).
+    // Size each register before its first read. Known GPR views have an eight-byte base.
     for (_, l) in &lines {
         for part in l.split("GET:").skip(1) {
             if let Some((ty, a)) = args(part)
                 && let Some(b) = type_bits(ty)
             {
-                let (base, off) = register(a.first().copied().unwrap_or(""));
-                st.regs.note(&base, off, b.div_ceil(8));
-            }
-        }
-        if let Some(r) = l.strip_prefix("PUT(").and_then(|r| r.split(')').next()) {
-            let (base, off) = register(r);
-            if super::X86_64
-                .iter()
-                .any(|(n, ..)| n.eq_ignore_ascii_case(&base))
-            {
-                st.regs.note(&base, 0, 8);
-            }
-            let _ = off;
-        }
-    }
-    for (_, l) in &lines {
-        for part in l.split("GET:").skip(1) {
-            if let Some((_, a)) = args(part) {
-                let (base, _) = register(a.first().copied().unwrap_or(""));
-                if super::X86_64
-                    .iter()
-                    .any(|(n, ..)| n.eq_ignore_ascii_case(&base))
-                {
+                let bytes = b.div_ceil(8);
+                let (base, off, view) = register(a.first().copied().unwrap_or(""), bytes);
+                st.regs.note(&base, off, bytes);
+                if view.is_some() {
                     st.regs.note(&base, 0, 8);
                 }
             }

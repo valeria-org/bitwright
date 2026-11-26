@@ -432,6 +432,26 @@ fn narrow(
                     stop(r, cx, st)?
                 }
             }
+            OpCode::Shl if lo == 0 => {
+                // Narrowing the value preserves the low bits. Narrowing the count
+                // also has to preserve its unsigned value, including overshifts.
+                let (bits, f) = super::known(r, cx, node.b)?;
+                let high = crate::facts::known::bv_not(&crate::facts::known::low_mask(
+                    cx.width_of(x),
+                    u32::from(n),
+                ));
+                if bits.is_some_and(|bits| {
+                    crate::facts::known::bv_and(&bits.known_zero(), &high) == high
+                }) {
+                    st.fin = st.fin.and(f);
+                    let a = narrow(r, cx, st, node.a, 0, n)?;
+                    let b = narrow(r, cx, st, node.b, 0, n)?;
+                    r.build(cx, |cx| cx.c_bin(BinOp::Shl, a, b))?
+                } else {
+                    st.fin = st.fin.and(f.unchanged());
+                    stop(r, cx, st)?
+                }
+            }
             // An arithmetic shift: the operand's bits from `lo + k`, the sign bit above them.
             OpCode::AShr if cx.const_val(node.b).is_some() => {
                 let k = cx
@@ -1639,6 +1659,43 @@ fn zext_to_live_wide(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let node = cx.node(n);
     let mut declined = Fin::FINAL;
+    if let Some((shift, bits)) = low_mask_of(cx, n)
+        && cx.node(shift).op == OpCode::Shl
+        && !cx.is_const(cx.node(shift).b)
+    {
+        let before = cx.len() as u32;
+        if let Some((low, fin, stops)) = narrowed_from(r, cx, shift, 0, bits)? {
+            let e = r.build(cx, |cx| cx.c_zext(low, node.width))?;
+            match finish(r, cx, PassKind::Casts, n, e, before, &stops, fin)? {
+                Step::Normal(f) => declined = declined.and(f),
+                step => return Ok(step),
+            }
+        }
+    }
+    if matches!(node.op, OpCode::UDiv | OpCode::URem) {
+        let (a, b) = (cx.node(node.a), cx.node(node.b));
+        if a.op == OpCode::Zext && b.op == OpCode::Zext && cx.wid(a.a) == cx.wid(b.a) {
+            // At zero, remainder returns its dividend. The all-ones quotient,
+            // however, depends on the width at which division takes place.
+            let (safe, fin) = if node.op == OpCode::URem {
+                (true, Fin::FINAL)
+            } else {
+                let (bits, f) = super::known(r, cx, b.a)?;
+                (bits.is_some_and(|bits| !bits.known_one().is_zero()), f)
+            };
+            if safe {
+                let before = cx.len() as u32;
+                let low = r.build(cx, |cx| cx.c_bin(node.op.as_bin().unwrap(), a.a, b.a))?;
+                let e = r.build(cx, |cx| cx.c_zext(low, node.width))?;
+                match finish(r, cx, PassKind::Casts, n, e, before, &[a.a, b.a], fin)? {
+                    Step::Normal(f) => declined = declined.and(f),
+                    step => return Ok(step),
+                }
+            } else {
+                declined = declined.and(fin.unchanged());
+            }
+        }
+    }
     if matches!(
         node.op,
         OpCode::Add

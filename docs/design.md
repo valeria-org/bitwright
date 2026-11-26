@@ -66,6 +66,9 @@ by sampling is a candidate the question that uses it must prove.
 "does not decide satisfiability" no longer hold. The 512-bit ceiling, the absence of Boolean
 and array sorts, and the engine's size-only commit rule are limits to lift, not decisions.
 
+The [subexpression relations proposal](proposals/subexpression-relations.md) examines how MBA,
+bit-field and predicate reasoning could share proved facts about differently spelled terms.
+
 ---
 
 ## 1. Principles and key decisions

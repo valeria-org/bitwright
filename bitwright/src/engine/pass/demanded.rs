@@ -2192,21 +2192,22 @@ pub(crate) fn narrow_root(
     })
 }
 
-/// Deterministic 4-lane simulation signature + algebraic equivalence sweep over `root`:
-/// merges interior nodes `(u, v)` (`u` earlier than `v` in topological `order`) that agree on
-/// all demanded bits `read[&v]` (including across `32`-bit / `64`-bit prefix widths) whenever
-/// proven equal by `demanded::simplify`, `poly::equal_mod`, `bitwise::equal`, `linear_mba::equal`,
-/// or `mba::equal_sums`, strictly shrinking the whole DAG.
+/// Merge proved full-width peers, then try interior peers that agree on all
+/// demanded bits. For low prefixes the two words can have different widths.
 #[cfg(feature = "prove")]
 pub(crate) fn dedup_root(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     root: u32,
 ) -> Result<Option<(u32, Fin)>, Stop> {
-    if cx.is_const(root)
-        || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty())
-        || r.life.live_roots.len() > 1
-    {
+    if cx.is_const(root) || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty()) {
+        return Ok(None);
+    }
+    let mut circuit_questions = 8;
+    if let Some(result) = super::views::merge(r, cx, root, &mut circuit_questions)? {
+        return Ok(Some(result));
+    }
+    if r.life.live_roots.len() > 1 {
         return Ok(None);
     }
     let Some((order, read)) = demands(r, cx, root)? else {
@@ -2367,6 +2368,9 @@ pub(crate) fn dedup_root(
                     })
                 }
                 OpCode::Popcnt => u64::from((a & mask).count_ones()) & mask,
+                OpCode::Clz => u64::from((a & mask).leading_zeros() - u32::from(64 - w)),
+                OpCode::UDiv => a.checked_div(b).unwrap_or(mask),
+                OpCode::URem => a.checked_rem(b).unwrap_or(a),
                 _ => {
                     opaque = true;
                     0
@@ -2493,8 +2497,15 @@ pub(crate) fn dedup_root(
                         r.build(cx, |cx| cx.c_extract(u_cur, 0, w_v))?
                     }
                 };
-                if let Some(pf) = prove_masked_equal(r, cx, u_at_v, v_cur, &m_v, is_prefix, ones as u16)?
-                {
+                if let Some(pf) = prove_masked_equal(
+                    r,
+                    cx,
+                    u_at_v,
+                    v_cur,
+                    &m_v,
+                    is_prefix.then_some(ones as u16),
+                    &mut circuit_questions,
+                )? {
                     super::discard_but(r, cx, mark, u_at_v);
                     matched = Some((u_at_v, pf));
                     break;
@@ -2564,13 +2575,16 @@ fn prove_masked_equal(
     a: u32,
     b: u32,
     m: &BitVec,
-    is_prefix: bool,
-    prefix_bits: u16,
+    prefix_bits: Option<u16>,
+    circuit_questions: &mut u8,
 ) -> Result<Option<Fin>, Stop> {
-    if a == b {
+    if a == b || super::views::known(r, a, b) {
         return Ok(Some(Fin::FINAL));
     }
-    if is_prefix && prefix_bits > 1 && super::poly::equal_mod(r, cx, a, b, prefix_bits)? {
+    if let Some(bits) = prefix_bits
+        && bits > 1
+        && super::poly::equal_mod(r, cx, a, b, bits)?
+    {
         return Ok(Some(Fin::FINAL));
     }
     // Simplify both sides under `m` via `demanded::simplify` (exposes high-bit constant noise
@@ -2617,6 +2631,9 @@ fn prove_masked_equal(
         return Ok(Some(fin.and(bf)));
     }
     if super::poly::equal(r, cx, am, bm)? || super::linear_mba::equal(r, cx, am, bm)? {
+        return Ok(Some(fin));
+    }
+    if super::views::prove_pair(r, cx, am, bm, circuit_questions)? {
         return Ok(Some(fin));
     }
     Ok(None)
@@ -3023,6 +3040,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
 /// The pass's state for a call.
 #[derive(Default)]
 pub(crate) struct State {
+    /// Full-width equalities proved over the original words during this call.
+    #[cfg(feature = "prove")]
+    pub(crate) view_equal: IdMap<(u32, u32), ()>,
+    /// Gates and propagations spent on speculative view equalities in this call.
+    #[cfg(feature = "prove")]
+    pub(crate) view_work: u64,
     /// The demanded-bits pass's memo, empty between calls.
     pub(crate) memo: Memo,
     /// The operands the demanded-bits pass found nothing to simplify under a mask, for the

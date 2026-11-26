@@ -120,10 +120,25 @@ const X86_64: &[(&str, &str, u16, u16)] = &[
     ("spl", "rsp", 0, 1),
 ];
 
-/// The base register and byte range a register name stands for (x86-64's parts, and
-/// `r8`…`r15` with their `d`, `w`, `b` parts), else the name itself from byte 0.
-pub(crate) fn alias(name: &str) -> (String, u16, Option<u16>) {
+/// Base and byte range of a named x86-64 or AArch64 general-purpose register view.
+pub(crate) fn alias(name: &str, bytes: u16) -> (String, u16, Option<u16>) {
     let lower = name.to_ascii_lowercase();
+    // The 16-bit x86 SP and the 64-bit AArch64 SP have the same spelling.
+    if lower == "wsp" || (lower == "sp" && bytes == 8) {
+        return (
+            keep_case(name, "sp"),
+            0,
+            Some(if lower == "wsp" { 4 } else { 8 }),
+        );
+    }
+    if let Some(digits) = lower.strip_prefix('w').or_else(|| lower.strip_prefix('x'))
+        && let Ok(index) = digits.parse::<u8>()
+        && index <= 30
+        && digits == index.to_string()
+    {
+        let bytes = if lower.starts_with('w') { 4 } else { 8 };
+        return (keep_case(name, &format!("x{index}")), 0, Some(bytes));
+    }
     if let Some(&(_, base, off, size)) = X86_64.iter().find(|(n, ..)| *n == lower) {
         return (keep_case(name, base), off, Some(size));
     }
