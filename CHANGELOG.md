@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.31
+
+- Added partition-masked linear MBA folding in `linear_mba`: a top-level sum of bitwise functions of up to 4 atoms and arbitrary constant masks is split into at most 16 bit classes on which every mask is uniform, and folds to a constant or affine form when its per-class Möbius coefficients agree, exactly at full width or on the low `k` bits the demanded pass reads (`simplify_prefix`), without calling the MBA solver.
+- Extended `linear`'s complementary-product fold to signed pairs: `-(a·x) - a·~x`, `a·x·-1 + ~x·a·-1` and `-(a·x) + -(a·~x)` are `a`, and `a·x - -(a·~x)` is `-a`.
+
 ## 0.32.30
 
 - Added optimization modulo bit-vectors (`Solver::minimize`, `Solver::maximize`, `Solver::minimize_signed`, `Solver::maximize_signed`, plus `*_within` variants) with MSB-to-LSB bit-binary search and model-guided fast-forwarding, exact solver-tightened abstract-domain facts (`Solver::tighten_facts` / `tighten_facts_within`), and SMT-LIB `(minimize …)`, `(maximize …)`, and `(get-objectives)` support in `smtlib::Session`.

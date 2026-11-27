@@ -1358,7 +1358,8 @@ fn common_factor(cx: &Context, products: &[Product]) -> Option<(u32, [usize; MAX
     None
 }
 
-/// `a·x + a·~x`, including extra factors shared by both products, is `-a`.
+/// `a·x + a·~x`, including extra factors shared by both products, is `-a` (and `-(a·x) - a·~x`
+/// is `+a` when `negated` is `true`).
 ///
 /// Do this directly rather than through [`factor_sum`]'s one-factor-at-a-time rewrite. When
 /// both products are also used elsewhere, the intermediate factored form does not shrink the
@@ -1368,6 +1369,7 @@ fn complementary_products(
     cx: &mut Context,
     n: u32,
     products: &[Product],
+    negated: bool,
 ) -> Result<Option<Step>, Stop> {
     let [left, right] = products else {
         return Ok(None);
@@ -1416,7 +1418,9 @@ fn complementary_products(
             r.build(cx, |cx| cx.mk_const(&one))?
         }
     };
-    shared = r.build(cx, |cx| cx.c_un(UnOp::Neg, shared))?;
+    if !negated {
+        shared = r.build(cx, |cx| cx.c_un(UnOp::Neg, shared))?;
+    }
     let mut atoms = [0; MAX_PRODUCT_FACTORS * 2];
     let mut count = 0;
     for product in products {
@@ -1467,6 +1471,25 @@ fn without_factor(
 /// `None` when `n` is no such sum; a `Normal` step is what the candidates it declined
 /// contribute.
 fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let un = cx.node(n);
+    // Handle signed two-product complementary pairs:
+    //   `-(a·x) - a·~x == a` (`Sub(Neg(p1), p2)`),
+    //   `a·x - -(a·~x) == -a` (`Sub(p1, Neg(p2))`),
+    //   `-(a·x) + -(a·~x) == a` (`Add(Neg(p1), Neg(p2))`).
+    let signed_pair = match un.op {
+        OpCode::Sub if cx.node(un.a).op == OpCode::Neg => Some((cx.node(un.a).a, un.b, true)),
+        OpCode::Sub if cx.node(un.b).op == OpCode::Neg => Some((un.a, cx.node(un.b).a, false)),
+        OpCode::Add if cx.node(un.a).op == OpCode::Neg && cx.node(un.b).op == OpCode::Neg => {
+            Some((cx.node(un.a).a, cx.node(un.b).a, true))
+        }
+        _ => None,
+    };
+    if let Some((lhs, rhs, negated)) = signed_pair
+        && let (Some(p1), Some(p2)) = (product(cx, lhs), product(cx, rhs))
+        && let Some(step) = complementary_products(r, cx, n, &[p1, p2], negated)?
+    {
+        return Ok(Some(step));
+    }
     let Some(sum) = sum(cx, n) else {
         return Ok(None);
     };
@@ -1484,7 +1507,7 @@ fn factor_sum(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option
         *slot = p;
     }
     let products = &products[..sum.len];
-    let declined = match complementary_products(r, cx, n, products)? {
+    let declined = match complementary_products(r, cx, n, products, false)? {
         Some(Step::Normal(f)) => f,
         Some(step) => return Ok(Some(step)),
         None => Fin::FINAL,

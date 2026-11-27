@@ -2186,6 +2186,299 @@ fn solve_split_orthogonal(
     Ok(Some(step))
 }
 
+/// Exact partition-masked linear MBA solver over `1..=512`-bit words.
+///
+/// For a top-level linear combination `bias + Σ a_j · f_j(x_1, …, x_t; m_1, …, m_r)` where
+/// `1 <= t <= 4` non-constant atoms and arbitrary constant masks `m_k` appear inside bitwise
+/// terms `f_j`, refine the bit positions into pairwise disjoint partition masks `P_1, …, P_q`
+/// (`q <= 16`) on which every `m_k` is uniform. On each `P_p`, every `f_j & P_p` has an exact
+/// Möbius expansion `Σ_S β_{j,p,S} · (AND_S(x) & P_p)`. When all degree `>= 2` coefficients
+/// vanish modulo `2^(W - tz(P_p))` and each variable's degree-1 coefficient agrees across every
+/// partition modulo `2^(W - tz(P_p))`, the entire sum collapses exactly to a constant or affine
+/// form without calling the heavier `Phase::Mba` solver.
+fn solve_masked_linear_mba(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<Step>, Stop> {
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    if r.chain_parent
+        .get(&n)
+        .is_some_and(|&p| matches!(cx.node(p).op, OpCode::Add | OpCode::Sub | OpCode::Neg))
+    {
+        return Ok(None);
+    }
+    let Some((const_part, affine_terms, vars, _)) = masked_linear_form(r, cx, n, cx.wid(n))? else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let e = linear::emit(r, cx, &linear::Form::of(const_part, &affine_terms))?;
+    if e == n {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    let step = finish_with(
+        r,
+        cx,
+        PassKind::LinearMba,
+        n,
+        e,
+        before,
+        &vars,
+        Fin::FINAL,
+        false,
+    )?;
+    Ok(Some(step))
+}
+
+/// [`masked_linear_form`]'s answer: the constant, the affine terms, the atoms, and how many
+/// terms the sum had.
+type MaskedForm = (BitVec, Vec<(u32, BitVec)>, Vec<u32>, usize);
+
+/// The constant-or-affine form [`solve_masked_linear_mba`] reads off the sum `n`, valid on its
+/// low `k` bits (`k == width` for exact equality): `(constant, [(atom, coefficient)], atoms)`.
+/// Constant masks are read on their low `k` bits only, so a sum whose constants the demanded
+/// pass narrowed to a prefix still partitions into a few uniform classes there.
+fn masked_linear_form(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    k: u16,
+) -> Result<Option<MaskedForm>, Stop> {
+    const MAX_MASKED_VARS: usize = 4;
+    const MAX_MASKED_PARTS: usize = 16;
+    const MAX_MASKED_NODES: usize = 256;
+
+    if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) || k == 0 || k > cx.wid(n) {
+        return Ok(None);
+    }
+    let Some((bias, terms)) = flatten_top_linear(cx, n) else {
+        return Ok(None);
+    };
+    if terms.len() < 2 {
+        return Ok(None);
+    }
+
+    let w = cx.width_of(n);
+    let wb = w.bits();
+    let low = if k >= wb {
+        BitVec::ones(w)
+    } else {
+        let sh = BitVec::wrapping_from_u64(w, u64::from(wb - k));
+        BitVec::bin_unchecked(BinOp::LShr, &BitVec::ones(w), &sh)
+    };
+    let mut order: Vec<u32> = Vec::new();
+    let mut slot_of: IdMap<u32, usize> = IdMap::default();
+    let mut vars: Vec<u32> = Vec::new();
+    let mut masks: Vec<BitVec> = Vec::new();
+    let mut stack: Vec<(u32, bool)> = Vec::new();
+    for &(t_id, _) in &terms {
+        stack.push((t_id, false));
+    }
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            let idx = order.len();
+            if let std::collections::hash_map::Entry::Vacant(slot) = slot_of.entry(id) {
+                slot.insert(idx);
+                order.push(id);
+            }
+            continue;
+        }
+        if slot_of.contains_key(&id) {
+            continue;
+        }
+        if order.len() + stack.len() > MAX_MASKED_NODES {
+            return Ok(None);
+        }
+        if let Some(v) = cx.const_val(id) {
+            let v = BitVec::bin_unchecked(BinOp::And, &v, &low);
+            if !v.is_zero() && v != low && !masks.contains(&v) {
+                if masks.len() >= MAX_MASKED_PARTS {
+                    return Ok(None);
+                }
+                masks.push(v);
+            }
+            let idx = order.len();
+            slot_of.insert(id, idx);
+            order.push(id);
+            continue;
+        }
+        let node = cx.node(id);
+        if is_bitwise(node.op) {
+            stack.push((id, true));
+            for c in node.children() {
+                stack.push((c, false));
+            }
+        } else {
+            if !vars.contains(&id) {
+                if vars.len() >= MAX_MASKED_VARS {
+                    return Ok(None);
+                }
+                vars.push(id);
+            }
+            let idx = order.len();
+            slot_of.insert(id, idx);
+            order.push(id);
+        }
+    }
+    if vars.is_empty() || masks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut parts: Vec<BitVec> = vec![BitVec::ones(w)];
+    for m in &masks {
+        let nm = BitVec::un_unchecked(UnOp::Not, m);
+        let mut next = Vec::with_capacity(parts.len() * 2);
+        for p in &parts {
+            let lo = BitVec::bin_unchecked(BinOp::And, p, m);
+            if !lo.is_zero() {
+                next.push(lo);
+            }
+            let hi = BitVec::bin_unchecked(BinOp::And, p, &nm);
+            if !hi.is_zero() {
+                next.push(hi);
+            }
+            if next.len() > MAX_MASKED_PARTS {
+                return Ok(None);
+            }
+        }
+        parts = next;
+    }
+    let rep_bits: Vec<u16> = parts
+        .iter()
+        .map(|p| (0..wb).find(|&b| p.bit(b) == Some(true)).unwrap_or(0))
+        .collect();
+
+    let t = vars.len();
+    let corners = 1usize << t;
+    let work = ((order.len() + terms.len() + parts.len()) << t) as u64;
+    r.meter.charge(Counter::PassWork, work)?;
+
+    let zero = BitVec::zero(w);
+    let ones = BitVec::ones(w);
+    let mut vals: Vec<BitVec> = vec![zero; order.len() * corners];
+    for (idx, &id) in order.iter().enumerate() {
+        let base = idx * corners;
+        if let Some(v) = cx.const_val(id) {
+            vals[base..base + corners].fill(v);
+            continue;
+        }
+        let node = cx.node(id);
+        if is_bitwise(node.op) {
+            let a_base = slot_of[&node.a] * corners;
+            match node.op {
+                OpCode::Not => {
+                    for c in 0..corners {
+                        vals[base + c] = BitVec::un_unchecked(UnOp::Not, &vals[a_base + c]);
+                    }
+                }
+                OpCode::And | OpCode::Or | OpCode::Xor => {
+                    let bin = match node.op {
+                        OpCode::And => BinOp::And,
+                        OpCode::Or => BinOp::Or,
+                        _ => BinOp::Xor,
+                    };
+                    let b_base = slot_of[&node.b] * corners;
+                    for c in 0..corners {
+                        vals[base + c] =
+                            BitVec::bin_unchecked(bin, &vals[a_base + c], &vals[b_base + c]);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let j = vars.iter().position(|&v| v == id).unwrap();
+            for c in 0..corners {
+                vals[base + c] = if (c >> j) & 1 == 1 { ones } else { zero };
+            }
+        }
+    }
+
+    let mut acc: Vec<BitVec> = vec![zero; parts.len() * corners];
+    for &(t_id, coeff) in &terms {
+        let t_base = slot_of[&t_id] * corners;
+        for (p, &rep_bit) in rep_bits.iter().enumerate() {
+            let mut mu = [0i32; 16];
+            for c in 0..corners {
+                mu[c] = i32::from(vals[t_base + c].bit(rep_bit) == Some(true));
+            }
+            for bit in 0..t {
+                let step = 1usize << bit;
+                for s in 0..corners {
+                    if s & step != 0 {
+                        mu[s] -= mu[s ^ step];
+                    }
+                }
+            }
+            let p_base = p * corners;
+            for (s, &m_i) in mu.iter().enumerate().take(corners) {
+                if m_i == 0 {
+                    continue;
+                }
+                let m_bv = if m_i > 0 {
+                    BitVec::wrapping_from_u64(w, m_i as u64)
+                } else {
+                    let pos = BitVec::wrapping_from_u64(w, (-m_i) as u64);
+                    BitVec::un_unchecked(UnOp::Neg, &pos)
+                };
+                let delta = BitVec::bin_unchecked(BinOp::Mul, &coeff, &m_bv);
+                acc[p_base + s] = BitVec::bin_unchecked(BinOp::Add, &acc[p_base + s], &delta);
+            }
+        }
+    }
+
+    // `c · 2^tz ≡ 0 (mod 2^k)`.
+    let vanishes = |c: &BitVec, tz: u16| -> bool {
+        let shift = u32::from(tz) + u32::from(wb - k);
+        if shift >= u32::from(wb) {
+            true
+        } else if shift == 0 {
+            c.is_zero()
+        } else {
+            let sh = BitVec::wrapping_from_u64(w, u64::from(shift));
+            BitVec::bin_unchecked(BinOp::Shl, c, &sh).is_zero()
+        }
+    };
+    for (p, &tz) in rep_bits.iter().enumerate() {
+        let p_base = p * corners;
+        for s in 1..corners {
+            if (s as u32).count_ones() >= 2 && !vanishes(&acc[p_base + s], tz) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Partition covering bit 0 has `rep_bits[p0] == 0` (exact mod 2^W).
+    let p0 = rep_bits.iter().position(|&b| b == 0).unwrap_or(0);
+    let mut affine_terms: Vec<(u32, BitVec)> = Vec::new();
+    for (j, &var) in vars.iter().enumerate() {
+        let s = 1usize << j;
+        let k_j = acc[p0 * corners + s];
+        for (p, &tz) in rep_bits.iter().enumerate() {
+            let diff = BitVec::bin_unchecked(BinOp::Sub, &acc[p * corners + s], &k_j);
+            if !vanishes(&diff, tz) {
+                return Ok(None);
+            }
+        }
+        if !k_j.is_zero() {
+            affine_terms.push((var, k_j));
+        }
+    }
+
+    let mut const_part = bias;
+    for (p, mask) in parts.iter().enumerate() {
+        let c0 = &acc[p * corners];
+        if !c0.is_zero() {
+            let term = BitVec::bin_unchecked(BinOp::Mul, c0, mask);
+            const_part = BitVec::bin_unchecked(BinOp::Add, &const_part, &term);
+        }
+    }
+
+    Ok(Some((const_part, affine_terms, vars, terms.len())))
+}
+
 /// [`step`] when `commit`; else the form alone ([`normal`]).
 /// When `max_sig_work` is `Some(cap)`, skip evaluating signatures whose cost exceeds `cap`.
 fn solve(
@@ -2207,14 +2500,21 @@ fn solve(
         r.linear_mba.declined.remove(&n);
     }
     let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
+        if commit && let Some(step @ Step::To(..)) = solve_masked_linear_mba(r, cx, n)? {
+            return Ok((step, None));
+        }
         if commit && let Some(step) = solve_split_orthogonal(r, cx, n, max_sig_work, MAX_ATOMS)? {
             return Ok((step, None));
         }
         count(r).atomized += 1;
         return Ok((Step::Normal(Fin::FINAL), None));
     };
-    // Pure linear or pure bitwise regions belong to those passes.
+    // Pure linear or pure bitwise regions belong to those passes (unless a top-level sum hides
+    // constant-masked bitwise terms that `region` stopped at).
     if !reg.mixed || reg.bounds.is_empty() {
+        if commit && let Some(step @ Step::To(..)) = solve_masked_linear_mba(r, cx, n)? {
+            return Ok((step, None));
+        }
         return Ok((Step::Normal(Fin::FINAL), None));
     }
     let w = cx.width_of(n);
@@ -2546,6 +2846,15 @@ pub(super) fn simplify_prefix(
         return Ok(None);
     }
     let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
+        // Too many atoms for a signature: constant masks the demanded pass narrowed to the
+        // prefix may still split the bits into a few uniform classes (see
+        // [`masked_linear_form`]), where the sum is a constant or affine form on the prefix.
+        if let Some((konst, terms, _, original)) = masked_linear_form(r, cx, n, k)?
+            && terms.len() < original
+        {
+            let e = linear::emit(r, cx, &linear::Form::of(konst, &terms))?;
+            return Ok((e != n).then_some(e));
+        }
         return Ok(None);
     };
     if !reg.mixed || !reg.lifts.is_empty() || reg.atoms.is_empty() || reg.order.len() < 3 {
@@ -2919,5 +3228,157 @@ let %19 = %11 + (%8 | %10) - %9 - %0 * 0x223dab214e6d6bba - 3988;
                 "expected Refuted for {text}, got {outcome:?}"
             );
         }
+    }
+
+    /// A lifted handler's 201-node selector: masked MBA over two words whose constants the
+    /// demanded pass narrows to the low 32 bits, read through `trunc<32>(…) >>u 13 & 0x60201`.
+    /// Its value is 1 for every input. With the walk's engine (deobfuscate, opaque sweep) at
+    /// `fuel(1 << 14)` it was left at 83 nodes; the prefix-masked linear form folds it there.
+    #[test]
+    #[cfg(feature = "mba")]
+    fn narrowed_masked_selector_folds_at_small_fuel() {
+        let src = "\
+            let %0 = a:64 ^ b:64;
+            let %1 = (%0 | 0x70900289080063f8) & 0x7fd237dd3e3ee7fb;
+            let %2 = zext<64>(p1:8 & 102) << 8 | zext<64>(p0:8 & -71) | zext<64>(p2:8 & 63) << 16 | zext<64>(p3:8 & -111) << 24 | zext<64>(p4:8 & -3 & 3) << 32 | zext<64>(p5:8 & -118) << 48 | zext<64>(p6:8 & 96) << 56;
+            let %3 = zext<64>(trunc<32>((zext<64>(extract<48, 16>(%2)) << 48 | zext<64>(trunc<40>(%2))) >>u 55) & 1);
+            let %4 = %1 * %3;
+            let %5 = ~b;
+            let %6 = ~a;
+            let %7 = %6 & 0xe228580b1603ac80;
+            let %8 = ~(a & 0x1dd7a7f4e9fc537f) & ~%7;
+            let %9 = (a | b) & 0x1dd7a7f4e9fc537f;
+            let %10 = %5 & 0x1dd7a7f4e9fc5379;
+            let %11 = (b | 6) & 0xe228580b1603ac80;
+            let %12 = b & -7;
+            let %13 = %4 * 0x6db6db6db6db6db7 + %1 * (~(%5 & 6) & %7) * (%3 * 0xb6db6db6db6db6dc) + %4 * 0xdb6db6db6db6db6e * (~(~(%5 & a) & ~(%6 & b) & -7) & (zext<64>(trunc<8>(~(%0 & 6) & 0x1dd7a7f4e9fc537f)) | 0x1dd7a7f4e9fc5300)) + %4 * (%8 & 6 ^ b) * 0x2492492492492492 + %1 * (%9 ^ -7) * %3 * 0x9249249249249249 + %4 * (b & 0xe228580b1603ac86 & (%6 ^ a) ^ a) * 0x6db6db6db6db6db7 + %4 * b * 0x6db6db6db6db6db7 + %1 * (~%10 & ~%11 & a | %6 & (%11 | %10)) * %3 * 0x6db6db6db6db6db7 + ~(%12 & %8) * %4 * 0xb6db6db6db6db6db + ~((%9 | %5 & %7) & 6) * %4 * 0xb6db6db6db6db6db + %4 * (~((%12 | 0xe228580b1603ac80) & a) & ~(%6 & (~%12 & 0x1dd7a7f4e9fc537f))) * 0xb6db6db6db6db6db + (a & 0xe228580b1603ac86 | b) * %3 * %1 * 0x9249249249249249 + (%6 & ((b ^ 0xe228580b1603ac80) & 6)) * %3 * %1 * 0xb6db6db6db6db6db;
+            let %14 = %13 | 0xa2002003001a722c;
+            let %15 = %13 ^ 0xa2002003001a722c;
+            trunc<32>(%14 * %15 * -1 + ~%15 * %14 * -1) >>u 13 & 0x60201";
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(
+                Strategy::deobfuscate()
+                    .with_mba(crate::mba::MbaConfig::default().with_opaque_sweep(true)),
+            )
+            .build()
+            .unwrap();
+        for fuel in [1u64 << 14, 1 << 19] {
+            let mut cx = Context::new();
+            let e = cx.parse(src, &ParseOptions::width(Width::W64)).unwrap();
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[e],
+                    Run::default().with_per_call(Budget::fuel(fuel)),
+                )
+                .unwrap();
+            assert_eq!(
+                cx.view(out.roots[0].expr).unwrap(),
+                View::Const(crate::BitVec::one(Width::W32)),
+                "fuel {fuel}"
+            );
+            assert_eq!(out.stats.mba.calls, 0, "folded before the MBA phase");
+        }
+    }
+
+    #[test]
+    fn signed_complementary_products_and_partition_masked_linear_mba() {
+        let mut cx = Context::new();
+        let o64 = ParseOptions::width(Width::W64);
+        let engine = Engine::builder()
+            .builtin()
+            .strategy(Strategy::deobfuscate())
+            .build()
+            .unwrap();
+
+        // 1. Signed complementary products: `-(a * b) - (~b * a) == a`,
+        //    `a * b * -1 + ~b * a * -1 == a`, `-(a * b) + -(~b * a) == a`.
+        for (src, want) in [
+            ("-(a * b) - (~b * a)", "a"),
+            ("a * b * -1 + ~b * a * -1", "a"),
+            ("-(a * b) + -(~b * a)", "a"),
+            ("(a * b) - -(~b * a)", "-a"),
+        ] {
+            let e = cx.parse(src, &o64).unwrap();
+            let expected = cx.parse(want, &o64).unwrap();
+            let out = engine
+                .run(
+                    &mut cx,
+                    &[e],
+                    Run::default().with_per_call(Budget::fuel(1 << 14)),
+                )
+                .unwrap();
+            assert_eq!(out.roots[0].expr, expected, "failed on {src}");
+        }
+
+        // 2. Partition-masked 2-variable linear MBA collapsing to a constant and to an affine form
+        //    at 64-bit and 128-bit widths within `fuel(16384)` and without `Phase::Mba`.
+        let masked_const = "\
+            let m0 = 0x1dd7a7f4e9fc5379; \
+            let m1 = 0xe228580b1603ac80; \
+            let m2 = 6; \
+            let a = (x & m0) + (~x & m0) + (y & m1) + (~y & m1) + ((x ^ y) & m2) + (~(x ^ y) & m2) + 2; \
+            a";
+        let e_mc = cx.parse(masked_const, &o64).unwrap();
+        let out_mc = engine
+            .run(
+                &mut cx,
+                &[e_mc],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
+            .unwrap();
+        assert_eq!(
+            cx.view(out_mc.roots[0].expr).unwrap(),
+            View::Const(crate::BitVec::one(Width::W64))
+        );
+
+        let masked_affine = "\
+            let m0 = 0x0f0f0f0f0f0f0f0f; \
+            let m1 = 0xf0f0f0f0f0f0f0f0; \
+            ((x & m0) | (y & m0)) + ((x & m0) & (y & m0)) \
+            + ((x & m1) ^ (y & m1)) + 2 * ((x & m1) & (y & m1))";
+        let e_ma = cx.parse(masked_affine, &o64).unwrap();
+        let want_ma = cx.parse("x + y", &o64).unwrap();
+        let out_ma = engine
+            .run(
+                &mut cx,
+                &[e_ma],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
+            .unwrap();
+        assert_eq!(out_ma.roots[0].expr, want_ma);
+
+        // 128-bit masked constant.
+        let o128 = ParseOptions::width(Width::W128);
+        let masked_128 = "((p & 0x00ff00ff00ff00ff00ff00ff00ff00ff) + (~p & 0x00ff00ff00ff00ff00ff00ff00ff00ff)) \
+                        + ((q & 0xff00ff00ff00ff00ff00ff00ff00ff00) + (~q & 0xff00ff00ff00ff00ff00ff00ff00ff00)) + 1";
+        let e_128 = cx.parse(masked_128, &o128).unwrap();
+        let out_128 = engine
+            .run(
+                &mut cx,
+                &[e_128],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
+            .unwrap();
+        assert_eq!(
+            cx.view(out_128.roots[0].expr).unwrap(),
+            View::Const(crate::BitVec::zero(Width::W128))
+        );
+
+        // 3. Soundness guard: `(x & 1) * 2 - (x & 2)` vanishes at `x = 0` and `x = -1`,
+        //    but NOT at `x = 1` (equals 2); must NOT fold to 0.
+        let non_const = cx.parse("(x & 1) * 2 - (x & 2)", &o64).unwrap();
+        let out_nc = engine
+            .run(
+                &mut cx,
+                &[non_const],
+                Run::default().with_per_call(Budget::fuel(1 << 14)),
+            )
+            .unwrap();
+        assert!(
+            !matches!(cx.view(out_nc.roots[0].expr).unwrap(), View::Const(_)),
+            "must not mis-fold non-constant masked expression"
+        );
     }
 }
