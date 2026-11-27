@@ -4079,6 +4079,34 @@ fn step_with(
                 }
             }
         }
+        // Affine-shifted `(x << k) + c` (`tz(c) >= k`) and odd-affine `a·x + c` basis alignment
+        // onto `y = x + (c >>u k)` / `u = a·x + c` via `Reading::CutWhole(y)`.
+        let rebases = r.build(cx, |cx| rebased(cx, n, cfg.limits.max_nodes))?;
+        for (reb_root, cut_y) in rebases {
+            if cx.is_const(reb_root) {
+                r.sample(cx, n)?;
+                r.sample(cx, reb_root)?;
+                if r.samples[&n] == r.samples[&reb_root] {
+                    let out = finish(r, cx, PassKind::Mba, n, reb_root, before, &[], Fin::FINAL)?;
+                    if matches!(out, Step::To(..)) {
+                        count(r).simplified += 1;
+                        return Ok(out);
+                    }
+                }
+            }
+            match ask(
+                r,
+                cx,
+                cfg,
+                n,
+                reb_root,
+                Some(Reading::CutWhole(cut_y)),
+                Cap::Steps(CUT_STEPS),
+            )? {
+                Step::Normal(f) => fin = kept(fin, f),
+                again => return Ok(again),
+            }
+        }
         // And with a value several of its nodes read through casts too cut off, the casts
         // kept: `(zext(t) | k) + zext(t & k)` is `zext(t) + k` over `t`, where the whole
         // question is over what `t` is made of and its answer writes `t` another way. Only
@@ -4587,6 +4615,170 @@ fn sliced(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Option<u32>, crate
     }
     let root = cx.substitute_ids(&[n], &repl)?[0];
     Ok((root != n).then_some(root))
+}
+
+/// Rebase shifted-affine sums `sum = (x << k) ± c` (`0 < k < W`, `tz(c) >= k`) onto the
+/// carry-free basis `y = x + (c >>u k)` (`sum = y << k`, `x = y - (c >>u k)`), and odd-affine
+/// bitwise atoms `u = a·x + c` (`a` odd) onto `u` (`x = a⁻¹·(u - c)`), returning up to 2
+/// `(rebased_root, cut_atom_y)` pairs for `Reading::CutWhole(y)`.
+fn rebased(cx: &mut Context, n: u32, max_nodes: u32) -> Result<Vec<(u32, u32)>, crate::Error> {
+    use crate::facts::known::{bv_lshr, trailing_zeros};
+    let mut order: Vec<u32> = Vec::new();
+    let mut uses: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+    let mut non_add_use: crate::hash::IdMap<u32, ()> = crate::hash::IdMap::default();
+    let mut seen: crate::hash::IdMap<u32, u8> = crate::hash::IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(n, false)];
+    while let Some((i, done)) = stack.pop() {
+        if done {
+            if seen.get(&i) == Some(&1) {
+                seen.insert(i, 2);
+                order.push(i);
+            }
+            continue;
+        }
+        if seen.contains_key(&i) || cx.is_const(i) {
+            continue;
+        }
+        if seen.len() as u32 >= max_nodes.min(256) {
+            return Ok(Vec::new());
+        }
+        seen.insert(i, 1);
+        let nd = cx.node(i);
+        let non_add = !matches!(nd.op, OpCode::Add | OpCode::Sub | OpCode::Neg);
+        if matches!(
+            nd.op,
+            OpCode::Add
+                | OpCode::Sub
+                | OpCode::Mul
+                | OpCode::Neg
+                | OpCode::And
+                | OpCode::Or
+                | OpCode::Xor
+                | OpCode::Not
+                | OpCode::Shl
+                | OpCode::LShr
+                | OpCode::RotL
+                | OpCode::RotR
+                | OpCode::Zext
+                | OpCode::Sext
+                | OpCode::Extract
+                | OpCode::Concat
+        ) {
+            stack.push((i, true));
+            for c in nd.children() {
+                *uses.entry(c).or_default() += 1;
+                if non_add {
+                    non_add_use.insert(c, ());
+                }
+                stack.push((c, false));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for &sum in &order {
+        if out.len() >= 2 || !non_add_use.contains_key(&sum) {
+            continue;
+        }
+        let sn = cx.node(sum);
+        if !matches!(sn.op, OpCode::Add | OpCode::Sub) {
+            continue;
+        }
+        let w = cx.width_of(sum);
+        let wb = u32::from(w.bits());
+        let (term, eff_c) = match (cx.const_val(sn.a), cx.const_val(sn.b)) {
+            (None, Some(k)) if !k.is_zero() => (
+                sn.a,
+                if sn.op == OpCode::Add {
+                    k
+                } else {
+                    crate::BitVec::un_unchecked(UnOp::Neg, &k)
+                },
+            ),
+            (Some(k), None) if !k.is_zero() && sn.op == OpCode::Add => (sn.b, k),
+            _ => continue,
+        };
+        let tn = cx.node(term);
+        // Case 1: `sum = (x << k) + eff_c` with `0 < k < W` and `tz(eff_c) >= k`.
+        if tn.op == OpCode::Shl
+            && let Some(kv) = cx.const_val(tn.b).and_then(|v| v.to_u64())
+            && kv > 0
+            && kv < u64::from(wb)
+            && trailing_zeros(&eff_c) >= kv as u32
+        {
+            let x = tn.a;
+            let x_uses = uses.get(&x).copied().unwrap_or(0);
+            let sh_uses = uses.get(&term).copied().unwrap_or(0);
+            if x_uses <= 1 && sh_uses <= 1 {
+                continue;
+            }
+            let d_bv = bv_lshr(&eff_c, kv as u32);
+            let bias = cx.mk_const(&d_bv)?;
+            let y = cx.c_bin(BinOp::Add, x, bias)?;
+            let rebased_sum = cx.c_bin(BinOp::Shl, y, tn.b)?;
+            let orig_x = cx.c_bin(BinOp::Sub, y, bias)?;
+            let c_node = cx.mk_const(&eff_c)?;
+            let unshifted = cx.c_bin(BinOp::Sub, rebased_sum, c_node)?;
+            let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+            repl.insert(y, y);
+            repl.insert(sum, rebased_sum);
+            repl.insert(term, unshifted);
+            repl.insert(x, orig_x);
+            let mut cand = cx.substitute_ids(&[n], &repl)?[0];
+            if cand != n {
+                if let Some(s) = sliced(cx, cand, max_nodes)? {
+                    cand = s;
+                }
+                out.push((cand, y));
+            }
+            continue;
+        }
+        // Case 2: `sum = a·x + eff_c` with non-unit odd `a` (`x` also used outside `sum`).
+        let odd_mul = match tn.op {
+            OpCode::Mul => match (cx.const_val(tn.a), cx.const_val(tn.b)) {
+                (None, Some(a)) if a.bit(0) == Some(true) => Some((tn.a, a)),
+                (Some(a), None) if a.bit(0) == Some(true) => Some((tn.b, a)),
+                _ => None,
+            },
+            OpCode::Neg => Some((tn.a, crate::BitVec::ones(w))),
+            _ => None,
+        };
+        if let Some((x, a_bv)) = odd_mul {
+            let x_uses = uses.get(&x).copied().unwrap_or(0);
+            let t_uses = if term == x {
+                0
+            } else {
+                uses.get(&term).copied().unwrap_or(0)
+            };
+            if x_uses + t_uses.saturating_sub(1) <= 1 {
+                continue;
+            }
+            let Some(a_inv) = crate::invert::mul_inverse(&a_bv) else {
+                continue;
+            };
+            let c_node = cx.mk_const(&eff_c)?;
+            let diff = cx.c_bin(BinOp::Sub, sum, c_node)?;
+            let orig_x = if a_inv == crate::BitVec::one(w) {
+                diff
+            } else {
+                let inv_c = cx.mk_const(&a_inv)?;
+                cx.c_bin(BinOp::Mul, diff, inv_c)?
+            };
+            let mut repl: crate::hash::IdMap<u32, u32> = crate::hash::IdMap::default();
+            repl.insert(sum, sum);
+            if term != x {
+                repl.insert(term, diff);
+            }
+            repl.insert(x, orig_x);
+            let mut cand = cx.substitute_ids(&[n], &repl)?[0];
+            if cand != n {
+                if let Some(s) = sliced(cx, cand, max_nodes)? {
+                    cand = s;
+                }
+                out.push((cand, sum));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Commits `root`, node `n`'s fragment as [`sliced`] wrote it (built from arena index

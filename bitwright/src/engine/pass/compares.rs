@@ -3473,7 +3473,9 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
     super::discard(r, cx, before);
     // Specialize `t` (`c = true`) and `f` (`c = false`) under `c`'s bit-mask and relational
     // guard facts (including `trunc<k>(x) == trunc<k>(y)`, `(x & m) == (y & m)`, `x == y + k`,
-    // and `c` / `!c` occurrences) when the resulting `select` strictly shrinks the DAG.
+    // and `c` / `!c` occurrences), collapsing `select(c, t, f)` unconditionally to `f` when `t`
+    // and `f` agree on `c = true` (or to `t` when they agree on `c = false`), and otherwise
+    // keeping the specialized `select` when it strictly shrinks the DAG.
     if r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
         && (cx.meta[t as usize].tree <= 128 || cx.meta[f as usize].tree <= 128)
     {
@@ -3488,6 +3490,42 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
         } else {
             f
         };
+        if cx.meta[t as usize].tree <= 128 && cx.meta[f as usize].tree <= 128 {
+            let probe_before = cx.len() as u32;
+            let agree_true = if let Some((tc, fc)) = r.build(cx, |cx| {
+                super::context::specialize_pair_under(cx, t, f, c, true)
+            })? {
+                specialized_arms_agree(r, cx, tc, fc)?
+            } else {
+                false
+            };
+            super::discard(r, cx, probe_before);
+            if agree_true {
+                super::discard(r, cx, before);
+                let stops = stops_below(cx, n, f);
+                match finish(r, cx, PassKind::Compares, n, f, before, &stops, maj_fin)? {
+                    Step::Normal(df) => maj_fin = maj_fin.and(df),
+                    step => return Ok(Some(step)),
+                }
+            }
+            let probe_before = cx.len() as u32;
+            let agree_false = if let Some((tn, fn_)) = r.build(cx, |cx| {
+                super::context::specialize_pair_under(cx, t, f, c, false)
+            })? {
+                specialized_arms_agree(r, cx, tn, fn_)?
+            } else {
+                false
+            };
+            super::discard(r, cx, probe_before);
+            if agree_false {
+                super::discard(r, cx, before);
+                let stops = stops_below(cx, n, t);
+                match finish(r, cx, PassKind::Compares, n, t, before, &stops, maj_fin)? {
+                    Step::Normal(df) => maj_fin = maj_fin.and(df),
+                    step => return Ok(Some(step)),
+                }
+            }
+        }
         if t2 != t || f2 != f {
             let e = r.build(cx, |cx| cx.c_select(c, t2, f2))?;
             let stops = stops_below(cx, n, e);
@@ -3512,6 +3550,273 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
         }
     }
     Ok((maj_fin != Fin::FINAL).then_some(Step::Normal(maj_fin)))
+}
+
+const ARM_ATOMS: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
+
+fn flatten_arm_sum(
+    cx: &Context,
+    id: u32,
+    coeff: BitVec,
+    depth: u8,
+    bias: &mut BitVec,
+    parts: &mut Vec<(u32, BitVec)>,
+) -> bool {
+    if coeff.is_zero() {
+        return true;
+    }
+    if let Some(c) = cx.const_val(id) {
+        let prod = BitVec::bin_unchecked(BinOp::Mul, &c, &coeff);
+        *bias = BitVec::bin_unchecked(BinOp::Add, bias, &prod);
+        return true;
+    }
+    if parts.len() >= 24 {
+        return false;
+    }
+    let n = cx.node(id);
+    if depth > 0 {
+        match n.op {
+            OpCode::Add => {
+                return flatten_arm_sum(cx, n.a, coeff, depth - 1, bias, parts)
+                    && flatten_arm_sum(cx, n.b, coeff, depth - 1, bias, parts);
+            }
+            OpCode::Sub => {
+                let neg = BitVec::un_unchecked(UnOp::Neg, &coeff);
+                return flatten_arm_sum(cx, n.a, coeff, depth - 1, bias, parts)
+                    && flatten_arm_sum(cx, n.b, neg, depth - 1, bias, parts);
+            }
+            OpCode::Neg => {
+                let neg = BitVec::un_unchecked(UnOp::Neg, &coeff);
+                return flatten_arm_sum(cx, n.a, neg, depth - 1, bias, parts);
+            }
+            OpCode::Not => {
+                // `~u == -1 - u`
+                *bias = BitVec::bin_unchecked(BinOp::Sub, bias, &coeff);
+                let neg = BitVec::un_unchecked(UnOp::Neg, &coeff);
+                return flatten_arm_sum(cx, n.a, neg, depth - 1, bias, parts);
+            }
+            OpCode::Mul => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    let c2 = BitVec::bin_unchecked(BinOp::Mul, &coeff, &k);
+                    return flatten_arm_sum(cx, n.a, c2, depth - 1, bias, parts);
+                }
+                (Some(k), None) => {
+                    let c2 = BitVec::bin_unchecked(BinOp::Mul, &coeff, &k);
+                    return flatten_arm_sum(cx, n.b, c2, depth - 1, bias, parts);
+                }
+                _ => {}
+            },
+            OpCode::Shl => {
+                if let Some(s) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                    let w = coeff.width().bits();
+                    if s < u64::from(w) {
+                        let c2 = crate::facts::known::bv_shl(&coeff, s as u32);
+                        return flatten_arm_sum(cx, n.a, c2, depth - 1, bias, parts);
+                    }
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((_, existing)) = parts.iter_mut().find(|(t, _)| *t == id) {
+        *existing = BitVec::bin_unchecked(BinOp::Add, existing, &coeff);
+    } else {
+        parts.push((id, coeff));
+    }
+    true
+}
+
+fn collect_arm_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &mut Vec<u32>,
+    consts: &mut Vec<BitVec>,
+) -> bool {
+    if let Some(c) = cx.const_val(id) {
+        if !c.is_zero() && !c.is_ones() && !consts.contains(&c) {
+            if consts.len() >= 8 {
+                return false;
+            }
+            consts.push(c);
+        }
+        return true;
+    }
+    let n = cx.node(id);
+    if depth > 0 && matches!(n.op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor) {
+        for ch in n.children() {
+            if !collect_arm_bitwise(cx, ch, depth - 1, atoms, consts) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if !atoms.contains(&id) {
+        if atoms.len() >= 6 {
+            return false;
+        }
+        atoms.push(id);
+    }
+    true
+}
+
+fn eval_arm_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &[u32],
+    cm: &BitVec,
+    all_rows: u64,
+) -> u64 {
+    if let Some(c) = cx.const_val(id) {
+        return if crate::facts::known::bv_and(&c, cm).is_zero() {
+            0
+        } else {
+            all_rows
+        };
+    }
+    let n = cx.node(id);
+    if depth > 0 {
+        match n.op {
+            OpCode::Not => {
+                return (!eval_arm_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)) & all_rows;
+            }
+            OpCode::And => {
+                return eval_arm_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    & eval_arm_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            OpCode::Or => {
+                return eval_arm_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    | eval_arm_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            OpCode::Xor => {
+                return eval_arm_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    ^ eval_arm_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            _ => {}
+        }
+    }
+    let idx = atoms.iter().position(|&a| a == id).unwrap_or(0);
+    ARM_ATOMS[idx] & all_rows
+}
+
+/// Exact `1..=512`-bit weighted bitwise Venn-class check for `a == b` (e.g. `(x & ~1) + 1 == (x & ~1) | 1`).
+fn weighted_bitwise_equal(cx: &Context, a: u32, b: u32) -> bool {
+    let w = cx.width_of(a);
+    let mut bias = BitVec::zero(w);
+    let mut parts: Vec<(u32, BitVec)> = Vec::new();
+    let one = BitVec::one(w);
+    let minus_one = BitVec::ones(w);
+    if !flatten_arm_sum(cx, a, one, 8, &mut bias, &mut parts)
+        || !flatten_arm_sum(cx, b, minus_one, 8, &mut bias, &mut parts)
+    {
+        return false;
+    }
+    parts.retain(|(_, k)| !k.is_zero());
+    if parts.is_empty() {
+        return bias.is_zero();
+    }
+    let mut atoms: Vec<u32> = Vec::new();
+    let mut consts: Vec<BitVec> = Vec::new();
+    for &(t, _) in &parts {
+        if !collect_arm_bitwise(cx, t, 8, &mut atoms, &mut consts) {
+            return false;
+        }
+    }
+    let mut classes: Vec<BitVec> = vec![BitVec::ones(w)];
+    for c in &consts {
+        let nc = crate::facts::known::bv_not(c);
+        let mut next = Vec::with_capacity(classes.len() * 2);
+        for cm in classes {
+            let p1 = crate::facts::known::bv_and(&cm, c);
+            if !p1.is_zero() {
+                next.push(p1);
+            }
+            let p2 = crate::facts::known::bv_and(&cm, &nc);
+            if !p2.is_zero() {
+                next.push(p2);
+            }
+        }
+        if next.len() > 16 {
+            return false;
+        }
+        classes = next;
+    }
+    let rows = 1usize << atoms.len();
+    let all_rows = if rows == 64 {
+        u64::MAX
+    } else {
+        (1u64 << rows) - 1
+    };
+    let mut total = bias;
+    for cm in &classes {
+        let j = crate::facts::known::trailing_zeros(cm);
+        let mut counts = vec![BitVec::zero(w); rows];
+        for &(t, ref k) in &parts {
+            let mut active = eval_arm_bitwise(cx, t, 8, &atoms, cm, all_rows);
+            while active != 0 {
+                let r_idx = active.trailing_zeros() as usize;
+                counts[r_idx] = BitVec::bin_unchecked(BinOp::Add, &counts[r_idx], k);
+                active &= active - 1;
+            }
+        }
+        let c0 = counts[0];
+        if counts[1..].iter().any(|v| {
+            !crate::facts::known::bv_shl(&crate::facts::known::bv_xor(v, &c0), j).is_zero()
+        }) {
+            return false;
+        }
+        let contrib = BitVec::bin_unchecked(BinOp::Mul, cm, &c0);
+        total = BitVec::bin_unchecked(BinOp::Add, &total, &contrib);
+    }
+    total.is_zero()
+}
+
+/// Tests whether specialized arms `a` and `b` are unconditionally equivalent across `1..=512` bits.
+fn specialized_arms_agree(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+) -> Result<bool, Stop> {
+    if a == b {
+        return Ok(true);
+    }
+    if super::poly::equal(r, cx, a, b)? {
+        return Ok(true);
+    }
+    let op_a = cx.node(a).op;
+    let op_b = cx.node(b).op;
+    if matches!(op_a, OpCode::Xor | OpCode::Not) || matches!(op_b, OpCode::Xor | OpCode::Not) {
+        let xa = super::xor::form_of(r, cx, a)?;
+        let xb = super::xor::form_of(r, cx, b)?;
+        let (ka, ta, _) = super::forms::Parts::parts(&xa);
+        let (kb, tb, _) = super::forms::Parts::parts(&xb);
+        if ka == kb && ta == tb {
+            return Ok(true);
+        }
+    }
+    if matches!(
+        op_a,
+        OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul | OpCode::Or | OpCode::Xor
+    ) || matches!(
+        op_b,
+        OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul | OpCode::Or | OpCode::Xor
+    ) {
+        r.meter.charge(Counter::PassWork, 8)?;
+        if weighted_bitwise_equal(cx, a, b) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The nodes strictly below `n` that `e` reaches first, independent of arena capacity or

@@ -59,9 +59,13 @@ fn interior_op(cx: &Context, node: &Node) -> bool {
         | OpCode::Concat => true,
         OpCode::Add | OpCode::Sub | OpCode::Neg => node.width == 1,
         OpCode::And | OpCode::Or => cx.is_const(node.a) || cx.is_const(node.b),
-        OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR => {
-            cx.is_const(node.b)
-        }
+        OpCode::Shl
+        | OpCode::LShr
+        | OpCode::AShr
+        | OpCode::RotL
+        | OpCode::RotR
+        | OpCode::Pdep
+        | OpCode::Pext => cx.is_const(node.b),
         _ => false,
     }
 }
@@ -75,6 +79,8 @@ fn moves_bits(op: OpCode) -> bool {
             | OpCode::AShr
             | OpCode::RotL
             | OpCode::RotR
+            | OpCode::Pdep
+            | OpCode::Pext
             | OpCode::Bswap
             | OpCode::BitRev
             | OpCode::Extract
@@ -88,7 +94,13 @@ fn moves_bits(op: OpCode) -> bool {
 fn varying_children<'a>(cx: &'a Context, node: &'a Node) -> impl Iterator<Item = u32> + 'a {
     let counted = matches!(
         node.op,
-        OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR
+        OpCode::Shl
+            | OpCode::LShr
+            | OpCode::AShr
+            | OpCode::RotL
+            | OpCode::RotR
+            | OpCode::Pdep
+            | OpCode::Pext
     );
     node.children()
         .filter(move |&c| !(counted && c == node.b) && !cx.is_const(c))
@@ -241,6 +253,8 @@ enum SquarePlan {
     Identity,
     /// Arithmetic right shift `base >>s s` (`s > 0`, 2 new nodes).
     AShr(u32),
+    /// Multi-run parallel bit deposit/extract `pdep(base, mask)` / `pext(base, mask)` (2 new nodes).
+    BitPerm { op: BinOp, mask: BitVec },
     /// Cyclic diagonals over `base`, `bswap(base)`, or `bitrev(base)`.
     Diags {
         pre: Option<UnOp>,
@@ -307,7 +321,7 @@ impl SquarePlan {
     fn cost(&self) -> u32 {
         match self {
             SquarePlan::Identity => 0,
-            SquarePlan::AShr(_) => 2,
+            SquarePlan::AShr(_) | SquarePlan::BitPerm { .. } => 2,
             SquarePlan::Diags { pre, terms } => {
                 let pre_cost = u32::from(pre.is_some());
                 let body: u32 = terms.iter().map(DiagTerm::cost).sum();
@@ -323,6 +337,10 @@ impl SquarePlan {
             SquarePlan::AShr(s) => {
                 let c = cx.mk_const(&BitVec::wrapping_from_u64(w, u64::from(*s)))?;
                 cx.c_bin(BinOp::AShr, base, c)
+            }
+            SquarePlan::BitPerm { op, mask } => {
+                let m = cx.mk_const(mask)?;
+                cx.c_bin(*op, base, m)
             }
             SquarePlan::Diags { pre, terms } => {
                 let src = match pre {
@@ -492,7 +510,83 @@ fn plan_square(rows: &[Row], w: Width, valid_bits: usize) -> SquarePlan {
             }
         }
     }
+    if best.cost() > 2
+        && let Some(bp) = detect_bit_perm(rows, w, valid_bits)
+    {
+        best = bp;
+    }
     best
+}
+
+fn is_single_run(m: &BitVec) -> bool {
+    if m.is_zero() {
+        return true;
+    }
+    let tz = crate::facts::known::trailing_zeros(m);
+    let ones = crate::facts::known::count_ones(m);
+    let run = crate::facts::known::bv_shl(&crate::facts::known::low_mask(m.width(), ones), tz);
+    *m == run
+}
+
+fn detect_bit_perm(rows: &[Row], w: Width, valid_bits: usize) -> Option<SquarePlan> {
+    let wb = usize::from(w.bits());
+    // Check `pdep(base, mask)`: non-zero rows `i` are unit rows at columns `0, 1, ..., k - 1`.
+    {
+        let mut mask_limbs = [0u64; 8];
+        let mut src_k = 0usize;
+        let mut ok = true;
+        for (i, r) in rows.iter().enumerate().take(wb) {
+            if row_is_zero(r) {
+                continue;
+            }
+            if src_k >= valid_bits || !is_unit_row(r, src_k) {
+                ok = false;
+                break;
+            }
+            mask_limbs[i >> 6] |= 1u64 << (i & 63);
+            src_k += 1;
+        }
+        if ok && src_k >= 2 {
+            let mask = BitVec::wrapping_from_limbs(w, &mask_limbs);
+            if !is_single_run(&mask) {
+                return Some(SquarePlan::BitPerm {
+                    op: BinOp::Pdep,
+                    mask,
+                });
+            }
+        }
+    }
+    // Check `pext(base, mask)`: rows `0..k` are unit rows at strictly increasing columns `< valid_bits`.
+    {
+        let k = rows.iter().take_while(|r| !row_is_zero(r)).count();
+        if k >= 2 && rows[k..wb].iter().all(row_is_zero) {
+            let mut mask_limbs = [0u64; 8];
+            let mut prev_col: Option<usize> = None;
+            let mut ok = true;
+            for r in rows.iter().take(k) {
+                let Some(col) = (0..valid_bits).find(|&c| row_bit(r, c)) else {
+                    ok = false;
+                    break;
+                };
+                if !is_unit_row(r, col) || prev_col.is_some_and(|p| col <= p) {
+                    ok = false;
+                    break;
+                }
+                mask_limbs[col >> 6] |= 1u64 << (col & 63);
+                prev_col = Some(col);
+            }
+            if ok {
+                let mask = BitVec::wrapping_from_limbs(w, &mask_limbs);
+                if !is_single_run(&mask) {
+                    return Some(SquarePlan::BitPerm {
+                        op: BinOp::Pext,
+                        mask,
+                    });
+                }
+            }
+        }
+    }
+    None
 }
 
 enum AtomPlan {

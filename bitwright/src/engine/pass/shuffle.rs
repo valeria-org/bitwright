@@ -99,6 +99,8 @@ fn traced_op_emit(op: OpCode) -> bool {
             | OpCode::AShr
             | OpCode::RotL
             | OpCode::RotR
+            | OpCode::Pdep
+            | OpCode::Pext
             | OpCode::Zext
             | OpCode::Sext
             | OpCode::Extract
@@ -348,6 +350,35 @@ fn trace(cx: &Context, bits: &crate::hash::IdMap<u32, Bits>, i: u32, full: bool)
             let a = get(n.a);
             let wu = w as usize;
             (0..wu).map(|i| a[wu - 1 - i]).collect()
+        }
+        OpCode::Pdep => {
+            let m = cx.const_val(n.b)?;
+            let a = get(n.a);
+            let mut k = 0usize;
+            (0..w as usize)
+                .map(|i| {
+                    if m.bit(i as u16) == Some(true) {
+                        let v = a[k];
+                        k += 1;
+                        v
+                    } else {
+                        Prov::Zero
+                    }
+                })
+                .collect()
+        }
+        OpCode::Pext => {
+            let m = cx.const_val(n.b)?;
+            let a = get(n.a);
+            let mut out = vec![Prov::Zero; w as usize];
+            let mut k = 0usize;
+            for i in 0..w as usize {
+                if m.bit(i as u16) == Some(true) {
+                    out[k] = a[i];
+                    k += 1;
+                }
+            }
+            out
         }
         _ => return None,
     })
@@ -1299,6 +1330,25 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             r.meter.charge(Counter::PassWork, 1)?;
             word = cx.node(word).a;
         }
+        if cx.node(word).op == OpCode::Pext {
+            let pn = cx.node(word);
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let masked = cx.c_bin(BinOp::And, pn.a, pn.b)?;
+                cx.c_un(UnOp::Popcnt, masked)
+            })?;
+            return super::finish_with(
+                r,
+                cx,
+                PassKind::Shuffle,
+                n,
+                e,
+                before,
+                &[pn.a, pn.b],
+                Fin::FINAL,
+                true,
+            );
+        }
         if word != node.a {
             let before = cx.len() as u32;
             let e = r.build(cx, |cx| cx.c_un(UnOp::Popcnt, word))?;
@@ -1314,6 +1364,27 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 true,
             );
         }
+    }
+    if matches!(node.op, OpCode::Clz | OpCode::Ctz) && cx.node(node.a).op == OpCode::BitRev {
+        let src = cx.node(node.a).a;
+        let flip = if node.op == OpCode::Clz {
+            UnOp::Ctz
+        } else {
+            UnOp::Clz
+        };
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| cx.c_un(flip, src))?;
+        return super::finish_with(
+            r,
+            cx,
+            PassKind::Shuffle,
+            n,
+            e,
+            before,
+            &[src],
+            Fin::FINAL,
+            true,
+        );
     }
     // Reordering the counts preserves saturating shifts and modular rotations even
     // at widths where adding the counts in their own bit width would wrap.

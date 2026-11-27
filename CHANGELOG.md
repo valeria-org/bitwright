@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.28
+
+- Added falling-factorial Stirling and 2-adic vanishing-ideal polynomial canonicalization (`reduce_2adic`, `fold_vanishing`, `slice_poly`) in `poly`, Euler–Fermat power-tower exponent reduction (`squaring_chain`) across `linear` and `demanded`, value-level $2^k$-adic Hensel constant-residue search (`constant_masked`, `compile_value`) in `predicate`, and `1..=512`-bit `x^2` and `x^4` known-bit transfers (`square_known`) in `facts`.
+- Added 6-atom Venn-class `popcnt` valuation reduction (`popcnt_algebra`), `BLSR` lowest-set-bit cancellation (`popcnt(x) - popcnt(x & (x - 1)) -> zext(x != 0)`), and mod-2 `popcnt` parity homomorphism (`popcnt_parity_fold`) across `linear` and `demanded`; generalized `linear::by_sums` to non-unit modular quotients and narrowed even-constant `Mul` operand masks (`0 < tz < b`) in `demanded`.
+- Extended `mba` with shifted-translate (`(x << k) ± c`) and non-unit odd-affine (`a·x + c`) basis alignment (`rebased`), and lifted product-cofactor and weighted-bitwise constant cancellation (`collapse_wide`) in `mba::cofactors` across widths `65..=512`.
+- Extended `invert::gf2`, `pass::gf2`, `shuffle`, and `facts::backward` with constant-mask BMI2 `Pdep`/`Pext` GF(2) matrices, `SquarePlan::BitPerm`, disjoint `Or`/`Add` GF(2) linearity, Morton bit-provenance tracing, `clz(bitrev(x)) <-> ctz(x)` and `popcnt(pext(x, m)) -> popcnt(x & m)` identities, and backward `Facts` propagation through `Pdep`/`Pext`.
+- Added symmetric branch-invariant `select` elimination (`poly::equal`, `xor::form_of`, and `1..=512`-bit `weighted_bitwise_equal`), odd-affine relational guard solving (`peel_affine_side`, `solve_affine_eq`), 1-bit `Extract` guard extraction, and `Pdep`/`Pext` guard-fact pullback across `compares` and `context`.
+
 ## 0.32.27
 
 - Generalized `invert::gf2` and `pass::gf2` across widths `1..=512` (`[u64; 8]` rows) and up to 8 mixed-width atoms (`gf2::affine`), canonicalizing multi-atom and cast-crossing (`Extract`, `Zext`, `Sext`, `Concat`, `Bswap`, `BitRev`, `AShr`) GF(2)-affine expressions with `O(1)` per-node Bloom/movement prefiltering and zero-extended upper-bit mask elision, and lifting `Query::Injective`, `Query::Bijective`, and GF(2) preimage solving to `512` bits.

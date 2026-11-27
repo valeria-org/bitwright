@@ -833,6 +833,15 @@ impl Context {
                 // A square: its low bits follow from its operand's, and where it cannot wrap it is
                 // at least 0 (a product's transfer does not know the operands are one value).
                 f = f.meet(&square_known(args[0])).unwrap_or(f);
+                let inner = self.node(n.a);
+                if inner.op == OpCode::Mul && inner.a == inner.b && args[0].width().bits() >= 4 {
+                    // Any fourth power `u^4` is `0` (even `u`) or `1` (odd `u`) modulo 16, so
+                    // bits 1, 2, and 3 are all zero regardless of `u`.
+                    let w = args[0].width();
+                    let z = known::bv_and(&known::low_mask(w, 4), &known::bv_not(&BitVec::one(w)));
+                    let q4 = KnownBits::from_masks(z, BitVec::zero(w));
+                    f = f.meet_known(&q4).unwrap_or(f);
+                }
                 return square_range(args[0]).and_then(|g| f.meet(&g)).unwrap_or(f);
             }
             if args[0].width().bits() > 1 && self.opposite_bit0(n.a, n.b) {
@@ -1983,46 +1992,60 @@ pub(crate) fn square_range(x: &Facts) -> Option<Facts> {
     Facts::new(KnownBits::unknown(w), u, sr)
 }
 
-/// The known low bits of `x·x` from those of `x`. Bit 1 of a square is 0 (squares are 0 or 1
-/// modulo 4). When the low `L` bits of `x` are known: all zero, `x = 2^L·z` and `x·x = 4^L·z²`
-/// has `2L` low zeros and bit `2L + 1` clear; otherwise `x = 2^t·y` with `y` odd and its low
-/// `L − t` bits known, so `y²` is known modulo `2^(L − t + 1)` (`(y + 2^j·u)² ≡ y² mod 2^(j+1)`),
-/// or modulo 8 when only its low bit is (an odd square is 1 modulo 8), and `x·x = 4^t·y²`.
+/// The known low bits of `x·x` from those of `x` across all widths `1..=512`:
+/// - Bit 1 of a square is always 0 (`x² ≡ 0, 1 (mod 4)`), and when bits `1..=z₁` of `x` are 0
+///   (`x = b₀ + 2^{z₁+1}·q` with `b₀ ∈ {0, 1}`), `x² = b₀ + 2^{z₁+2}·b₀·q + 2^{2z₁+2}·q²` has
+///   bits `1..=z₁+1` all zero.
+/// - When the low `L ≥ 1` bits of `x` are known: if all zero (`x = 2^L·z`), `x² = 4^L·z²` has
+///   `2L` low zeros and bit `2L + 1` clear; otherwise `x = 2^t·y` with `y` odd and its low
+///   `j = L − t` bits known, so `y²` is known modulo `2^(j + 1)` (or modulo 8 when `j = 1`, since
+///   every odd square is `1 (mod 8)`), determining `x² = 4^t·y²` modulo `2^(2t + n)`.
 pub(crate) fn square_known(x: &Facts) -> Facts {
     let w = x.width();
     let wb = u32::from(w.bits());
-    let top = wb.min(64);
-    let low = |n: u32| if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    if wb <= 1 {
+        return Facts::top(w);
+    }
     let kn = x.known;
-    let known = kn.known().limbs()[0];
-    let l = (!known).trailing_zeros().min(top).min(62);
-    let (mut zeros, mut ones) = (if wb >= 2 { 2u64 } else { 0 }, 0u64);
-    if l >= 1 {
-        let v = kn.known_one().limbs()[0] & low(l);
-        if v == 0 {
-            zeros |= low((2 * l).min(top));
-            if 2 * l + 1 < top {
-                zeros |= 1u64 << (2 * l + 1);
+    let l = kn.known_low_prefix().min(wb);
+    let mut ones = BitVec::zero(w);
+    let mut zeros;
+    if l == 0 {
+        let shifted_z = known::bv_lshr(&kn.known_zero(), 1);
+        let z1 = known::trailing_zeros(&known::bv_not(&shifted_z)).min(wb - 1);
+        let top_z = (z1 + 2).min(wb);
+        zeros = known::bv_and(&known::low_mask(w, top_z), &known::bv_not(&BitVec::one(w)));
+    } else {
+        let low_l = known::low_mask(w, l);
+        let v = known::bv_and(&kn.known_one(), &low_l);
+        if v.is_zero() {
+            let z_len = l.saturating_mul(2).min(wb);
+            zeros = known::low_mask(w, z_len);
+            let extra = l.saturating_mul(2).saturating_add(1);
+            if extra < wb {
+                zeros = known::bv_or(&zeros, &known::bv_shl(&BitVec::one(w), extra));
             }
         } else {
-            let t = v.trailing_zeros();
+            let t = known::trailing_zeros(&v);
             let j = l - t;
-            let n = if j == 1 { 3 } else { j + 1 };
-            let y = v >> t;
-            let ysq = y.wrapping_mul(y) & low(n);
-            let bits = (2 * t + n).min(top);
-            let value = if 2 * t >= 64 {
-                0
+            let n = if j == 1 { 3 } else { j.saturating_add(1) };
+            let n_clamped = n.min(wb);
+            let y = known::bv_lshr(&v, t);
+            let ysq = known::bv_and(
+                &BitVec::bin_unchecked(crate::ops::BinOp::Mul, &y, &y),
+                &known::low_mask(w, n_clamped),
+            );
+            let shift = t.saturating_mul(2);
+            let bits = shift.saturating_add(n).min(wb);
+            let mask_bits = known::low_mask(w, bits);
+            let value = if shift >= wb {
+                BitVec::zero(w)
             } else {
-                (ysq << (2 * t)) & low(bits)
+                known::bv_and(&known::bv_shl(&ysq, shift), &mask_bits)
             };
             ones = value;
-            zeros = (zeros | low(bits)) & !value;
+            zeros = known::bv_and(&mask_bits, &known::bv_not(&value));
         }
     }
-    let zeros = zeros & !ones & low(top);
-    Facts::from_known(KnownBits::from_masks(
-        BitVec::wrapping_from_u64(w, zeros),
-        BitVec::wrapping_from_u64(w, ones & low(top)),
-    ))
+    Facts::from_known(KnownBits::from_masks(zeros, ones))
 }

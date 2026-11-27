@@ -1213,6 +1213,278 @@ pub(crate) fn residue_test(cx: &Context, n: u32) -> (Option<(u32, u16, Vec<bool>
     (Some((p.leaf_ids[0], j as u16, table)), work)
 }
 
+/// Whether `root`'s low-bit-closed or interpreted cone (within [`MAX_OPS`] nodes) has a
+/// non-constant product, across all widths `1..=512`.
+fn has_product_value(cx: &Context, root: u32) -> bool {
+    let mut seen = [0u32; MAX_OPS];
+    let mut stack = [0u32; MAX_OPS];
+    seen[0] = root;
+    stack[0] = root;
+    let (mut n, mut top) = (1, 1);
+    let wide = cx.wid(root) > 128;
+    let closed_wide = |cx: &Context, i: u32| {
+        let nd = cx.node(i);
+        match nd.op {
+            OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Neg
+            | OpCode::Not
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Xor => true,
+            OpCode::Shl => cx.is_const(nd.b),
+            _ => false,
+        }
+    };
+    while top > 0 {
+        top -= 1;
+        let i = stack[top];
+        let ok = if wide {
+            cx.const_val(i).is_none() && closed_wide(cx, i)
+        } else {
+            cx.const_val(i).is_none() && interpreted(cx, i)
+        };
+        if !ok {
+            continue;
+        }
+        let node = cx.node(i);
+        if node.op == OpCode::Mul
+            && cx.const_val(node.a).is_none()
+            && cx.const_val(node.b).is_none()
+        {
+            return true;
+        }
+        for c in node.children() {
+            if seen[..n].contains(&c) {
+                continue;
+            }
+            if n == MAX_OPS {
+                return false;
+            }
+            (seen[n], stack[top]) = (c, c);
+            n += 1;
+            top += 1;
+        }
+    }
+    false
+}
+
+/// Compiles a value node `root` for low-bit `2^k`-adic Hensel search (up to 128 low bits,
+/// including low-bit-closed cones of wider `129..=512`-bit words).
+fn compile_value(cx: &Context, root: u32) -> Option<Prog> {
+    let mut p = Prog {
+        ops: Vec::new(),
+        widths: Vec::new(),
+        leaves: Vec::new(),
+        leaf_ids: Vec::new(),
+        deps: Vec::new(),
+        closed: Vec::new(),
+        fixed: Vec::new(),
+        square: false,
+    };
+    let wide = cx.wid(root) > 128;
+    let mut at: IdMap<u32, usize> = IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+    while let Some((i, done)) = stack.pop() {
+        if at.contains_key(&i) {
+            continue;
+        }
+        let node = cx.node(i);
+        let konst = cx.const_val(i);
+        let interp = if wide {
+            konst.is_none()
+                && node.width == cx.wid(root)
+                && match node.op {
+                    OpCode::Add
+                    | OpCode::Sub
+                    | OpCode::Mul
+                    | OpCode::Neg
+                    | OpCode::Not
+                    | OpCode::And
+                    | OpCode::Or
+                    | OpCode::Xor => true,
+                    OpCode::Shl => cx.is_const(node.b),
+                    _ => false,
+                }
+        } else {
+            konst.is_none() && interpreted(cx, i)
+        };
+        if interp && !done {
+            stack.push((i, true));
+            for c in node.children() {
+                if !(wide && node.op == OpCode::Shl && c == node.b) {
+                    stack.push((c, false));
+                }
+            }
+            continue;
+        }
+        let eff_w = node.width.min(128);
+        let op = if let Some(v) = konst {
+            let low128 = if v.width().bits() <= 128 {
+                v.to_u128()?
+            } else {
+                let ls = v.limbs();
+                if node.op == OpCode::Const && wide {
+                    u128::from(ls[0]) | (u128::from(ls[1]) << 64)
+                } else {
+                    return None;
+                }
+            };
+            // Note: if this constant is a shift count on a wide `Shl` and >= 128, clamp to 128.
+            let c_val = if wide && v.limbs()[2..].iter().any(|&x| x != 0) {
+                // Only safe as modulo-2^128 ring value; for `Shl` counts >= 128 clamp below.
+                low128
+            } else {
+                low128
+            };
+            Op::Const(c_val)
+        } else if interp {
+            let a = at[&node.a];
+            match node.op {
+                OpCode::Zext => Op::Zext(a),
+                OpCode::Sext => Op::Sext(a),
+                OpCode::Extract => Op::Extract(a, node.b as u16),
+                OpCode::Concat => Op::Concat(a, at[&node.b]),
+                OpCode::Select => Op::Select(a, at[&node.b], at[&node.c]),
+                OpCode::Shl if wide => {
+                    let sv = cx.const_val(node.b)?;
+                    let sh = if sv.limbs()[1..].iter().any(|&x| x != 0) || sv.limbs()[0] >= 128 {
+                        128u128
+                    } else {
+                        u128::from(sv.limbs()[0])
+                    };
+                    p.push(Op::Const(sh), 128);
+                    let sh_idx = p.ops.len() - 1;
+                    Op::Bin(BinOp::Shl, a, sh_idx)
+                }
+                op => {
+                    if let Some(u) = op.as_un() {
+                        Op::Un(u, a)
+                    } else if let Some(c) = op.as_cmp() {
+                        Op::Cmp(c, a, at[&node.b])
+                    } else {
+                        Op::Bin(op.as_bin()?, a, at[&node.b])
+                    }
+                }
+            }
+        } else {
+            if p.leaves.len() >= MAX_LEAVES {
+                return None;
+            }
+            p.leaves.push(eff_w);
+            p.leaf_ids.push(i);
+            Op::Leaf(p.leaves.len() - 1)
+        };
+        p.push(op, eff_w);
+        at.insert(i, p.ops.len() - 1);
+        if p.ops.len() > MAX_OPS {
+            return None;
+        }
+    }
+    (at.get(&root).copied() == Some(p.ops.len() - 1)).then_some(p)
+}
+
+/// Adaptive `2^k`-adic Hensel search proving `(root & mask_val) == seen` for every leaf tuple.
+fn search_low_masked(p: &Prog, mask_val: u128, seen: u128, work: &mut u64) -> Option<u128> {
+    let n = p.leaves.len();
+    if n == 0 {
+        return Some(seen);
+    }
+    let limit = *work + MAX_WORK / p.ops.len() as u64;
+    let mut vals = vec![V::Unknown; p.ops.len()];
+    let mut live: Vec<u128> = vec![0; n];
+    let mut next: Vec<u128> = Vec::new();
+    let mut class = vec![0u128; n];
+    let top = p.leaves.iter().copied().max().unwrap_or(0);
+    for k in 1..=u32::from(top) {
+        let grow: Vec<usize> = (0..n).filter(|&i| u32::from(p.leaves[i]) >= k).collect();
+        let classes = live.len() / n;
+        let children = classes << grow.len();
+        if children > MAX_CLASSES || *work + children as u64 + 1 > limit {
+            return None;
+        }
+        *work += children as u64 + 1;
+        next.clear();
+        let bit = 1u128 << (k - 1);
+        for c in 0..classes {
+            for pick in 0..1usize << grow.len() {
+                class.copy_from_slice(&live[c * n..(c + 1) * n]);
+                for (j, &i) in grow.iter().enumerate() {
+                    if pick >> j & 1 == 1 {
+                        class[i] |= bit;
+                    }
+                }
+                match eval_low(p, k, &class, &mut vals) {
+                    V::Exact(v) if (v & mask_val) == seen => {}
+                    V::Exact(_) => return None,
+                    V::Low(r, kb) if below(mask_val, kb) => {
+                        if (r & mask_val) != seen {
+                            return None;
+                        }
+                    }
+                    _ => next.extend_from_slice(&class),
+                }
+            }
+        }
+        if next.is_empty() {
+            return Some(seen);
+        }
+        class.copy_slice_head(&next, n);
+        match eval_low(p, 128, &class, &mut vals) {
+            V::Exact(v) if (v & mask_val) == seen => {}
+            _ => return None,
+        }
+        core::mem::swap(&mut live, &mut next);
+    }
+    None
+}
+
+trait CopyHead {
+    fn copy_slice_head(&mut self, src: &[u128], n: usize);
+}
+
+impl CopyHead for [u128] {
+    #[inline]
+    fn copy_slice_head(&mut self, src: &[u128], n: usize) {
+        self[..n].copy_from_slice(&src[..n]);
+    }
+}
+
+/// Proves `(root & mask_val)` constant across all inputs via `2^k`-adic Hensel lifting
+/// (`mask_val != 0`, covering up to 128 low bits), returning `(Some(constant), ops_evaluated)`.
+pub(crate) fn constant_masked(cx: &Context, root: u32, mask_val: u128) -> (Option<u128>, u64) {
+    if mask_val == 0 || cx.const_val(root).is_some() || !has_product_value(cx, root) {
+        return (None, MAX_OPS as u64);
+    }
+    let Some(p) = compile_value(cx, root).filter(|p| p.square) else {
+        return (None, 2 * MAX_OPS as u64);
+    };
+    let len = p.ops.len() as u64;
+    let mut vals = vec![V::Unknown; p.ops.len()];
+    let mut seen: Option<u128> = None;
+    let mut leaf = vec![0u128; p.leaves.len()];
+    for s in 0..SAMPLES {
+        for (i, l) in leaf.iter_mut().enumerate() {
+            *l = sample(s, i);
+        }
+        let v = match eval_low(&p, 128, &leaf, &mut vals) {
+            V::Exact(v) => Some(v & mask_val),
+            _ => None,
+        };
+        if v.is_none() || (seen.is_some() && v != seen) {
+            return (None, (s + 3) * len);
+        }
+        seen = v;
+    }
+    let Some(seen_val) = seen else {
+        return (None, (SAMPLES + 2) * len);
+    };
+    let mut work = SAMPLES + 2;
+    let out = search_low_masked(&p, mask_val, seen_val, &mut work);
+    (out, work * len)
+}
+
 /// [`constant`] of a 1-bit node for the compares pass, charged to the call's pass work.
 pub(super) fn decide(r: &mut Runner<'_, '_>, cx: &Context, n: u32) -> Result<Option<bool>, Stop> {
     if cx.wid(n) != 1 || cx.const_val(n).is_some() {

@@ -270,6 +270,31 @@ fn binary_left(op: BinOp, r: &Facts, x: &Facts, y: &Facts) -> Option<Option<Fact
             }
             None => None,
         },
+        BinOp::Pdep => {
+            if !bv_and(&r.known.known_one(), &y.known.known_zero()).is_zero() {
+                return None;
+            }
+            match y.as_constant() {
+                Some(m) => from_masks(
+                    BitVec::bin_unchecked(BinOp::Pext, &r.known.known_zero(), &m),
+                    BitVec::bin_unchecked(BinOp::Pext, &r.known.known_one(), &m),
+                ),
+                None => None,
+            }
+        }
+        BinOp::Pext => {
+            let max_ones = super::known::count_ones(&bv_not(&y.known.known_zero()));
+            if !bv_and(&r.known.known_one(), &bv_not(&low_mask(w, max_ones))).is_zero() {
+                return None;
+            }
+            match y.as_constant() {
+                Some(m) => from_masks(
+                    BitVec::bin_unchecked(BinOp::Pdep, &r.known.known_zero(), &m),
+                    BitVec::bin_unchecked(BinOp::Pdep, &r.known.known_one(), &m),
+                ),
+                None => None,
+            }
+        }
         _ => None,
     })
 }
@@ -293,6 +318,7 @@ fn binary(op: BinOp, r: &Facts, x: &Facts, y: &Facts) -> Operands {
             Some(c) => const_minus(&c, r),
             None => low_bits_of(r, x, |a, b| sub(b, a)),
         }),
+        BinOp::Pdep => Some(from_masks(BitVec::zero(x.width()), r.known.known_one())?),
         _ => None,
     };
     Some([left, right, None])

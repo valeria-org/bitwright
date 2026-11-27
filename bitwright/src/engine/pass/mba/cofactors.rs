@@ -5,8 +5,10 @@
 use super::opaque_predicate::{Work, cancel_parts, rewrite_sums, terms};
 use super::{Counter, Runner, Stop};
 use crate::expr::{Context, Node, OpCode};
+use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_shl, bv_xor, trailing_zeros};
 use crate::hash::IdMap;
-use crate::{BinOp, Error};
+use crate::ops::UnOp;
+use crate::{BinOp, BitVec, Error, Width};
 
 const MAX_TERMS: usize = 96;
 const MAX_CODE: usize = 512;
@@ -715,7 +717,7 @@ impl Sums {
     ) -> Result<Option<u32>, Error> {
         let w = cx.wid(i);
         if w > 64 {
-            return Ok(None);
+            return collapse_wide(cx, i, work);
         }
         let mask = u64::MAX >> (64 - w);
         let mut bias = 0;
@@ -1199,6 +1201,497 @@ pub(super) fn reduce(
         }
     }
     Ok(None)
+}
+
+fn wide_odd_inv(a: &BitVec) -> BitVec {
+    let w = a.width();
+    let two = BitVec::wrapping_from_u64(w, 2);
+    let mut inv = *a;
+    for _ in 0..8 {
+        let prod = BitVec::bin_unchecked(BinOp::Mul, a, &inv);
+        let factor = BitVec::bin_unchecked(BinOp::Sub, &two, &prod);
+        inv = BitVec::bin_unchecked(BinOp::Mul, &inv, &factor);
+    }
+    inv
+}
+
+fn terms_wide(
+    cx: &Context,
+    i: u32,
+    scale: BitVec,
+    bias: &mut BitVec,
+    parts: &mut Vec<(u32, BitVec)>,
+    depth: u8,
+    work: &mut Work,
+) -> Option<()> {
+    work.take(1)?;
+    if scale.is_zero() {
+        return Some(());
+    }
+    if let Some(c) = cx.const_val(i) {
+        let prod = BitVec::bin_unchecked(BinOp::Mul, &c, &scale);
+        *bias = BitVec::bin_unchecked(BinOp::Add, bias, &prod);
+        return Some(());
+    }
+    if parts.len() >= MAX_TERMS {
+        return None;
+    }
+    let n = cx.node(i);
+    if depth > 0 {
+        match n.op {
+            OpCode::Add => {
+                terms_wide(cx, n.a, scale, bias, parts, depth - 1, work)?;
+                return terms_wide(cx, n.b, scale, bias, parts, depth - 1, work);
+            }
+            OpCode::Sub => {
+                let neg = BitVec::un_unchecked(UnOp::Neg, &scale);
+                terms_wide(cx, n.a, scale, bias, parts, depth - 1, work)?;
+                return terms_wide(cx, n.b, neg, bias, parts, depth - 1, work);
+            }
+            OpCode::Neg => {
+                let neg = BitVec::un_unchecked(UnOp::Neg, &scale);
+                return terms_wide(cx, n.a, neg, bias, parts, depth - 1, work);
+            }
+            OpCode::Not => {
+                *bias = BitVec::bin_unchecked(BinOp::Sub, bias, &scale);
+                let neg = BitVec::un_unchecked(UnOp::Neg, &scale);
+                return terms_wide(cx, n.a, neg, bias, parts, depth - 1, work);
+            }
+            OpCode::Mul => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    let s2 = BitVec::bin_unchecked(BinOp::Mul, &scale, &k);
+                    return terms_wide(cx, n.a, s2, bias, parts, depth - 1, work);
+                }
+                (Some(k), None) => {
+                    let s2 = BitVec::bin_unchecked(BinOp::Mul, &scale, &k);
+                    return terms_wide(cx, n.b, s2, bias, parts, depth - 1, work);
+                }
+                _ => {}
+            },
+            OpCode::Shl => {
+                if let Some(sh) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
+                    let wb = scale.width().bits();
+                    if sh < u64::from(wb) {
+                        let s2 = bv_shl(&scale, sh as u32);
+                        return terms_wide(cx, n.a, s2, bias, parts, depth - 1, work);
+                    }
+                    return Some(());
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.push((i, scale));
+    Some(())
+}
+
+fn cancel_parts_wide(parts: &mut Vec<(u32, BitVec)>, work: &mut Work) -> Option<()> {
+    work.take(parts.len() as u64 + 1)?;
+    parts.sort_unstable_by_key(|&(t, _)| t);
+    let mut out = 0usize;
+    let mut i = 0usize;
+    while i < parts.len() {
+        let t = parts[i].0;
+        let mut acc = parts[i].1;
+        i += 1;
+        while i < parts.len() && parts[i].0 == t {
+            acc = BitVec::bin_unchecked(BinOp::Add, &acc, &parts[i].1);
+            i += 1;
+        }
+        if !acc.is_zero() {
+            parts[out] = (t, acc);
+            out += 1;
+        }
+    }
+    parts.truncate(out);
+    Some(())
+}
+
+fn product_pair_wide(
+    cx: &Context,
+    t: u32,
+    k: &BitVec,
+    work: &mut Work,
+) -> Option<([u32; 2], BitVec)> {
+    if cx.node(t).op != OpCode::Mul {
+        return None;
+    }
+    work.take(16)?;
+    if let Some((v, fs)) = super::super::linear::scaled_factors(cx, t) {
+        let coeff = BitVec::bin_unchecked(BinOp::Mul, k, &v);
+        if let &[a, b] = fs.as_slice() {
+            return Some(([a, b], coeff));
+        }
+    }
+    let mut cur = t;
+    let mut coeff = *k;
+    for _ in 0..8 {
+        let n = cx.node(cur);
+        if n.op != OpCode::Mul {
+            return None;
+        }
+        if let Some(c) = cx.const_val(n.b) {
+            coeff = BitVec::bin_unchecked(BinOp::Mul, &coeff, &c);
+            cur = n.a;
+        } else if let Some(c) = cx.const_val(n.a) {
+            coeff = BitVec::bin_unchecked(BinOp::Mul, &coeff, &c);
+            cur = n.b;
+        } else {
+            return Some(([n.a, n.b], coeff));
+        }
+    }
+    None
+}
+
+fn collect_wide_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &mut Vec<u32>,
+    consts: &mut Vec<BitVec>,
+    work: &mut Work,
+) -> Option<()> {
+    work.take(1)?;
+    if let Some(c) = cx.const_val(id) {
+        if !c.is_zero() && !c.is_ones() && !consts.contains(&c) {
+            if consts.len() >= 8 {
+                return None;
+            }
+            consts.push(c);
+        }
+        return Some(());
+    }
+    let n = cx.node(id);
+    if depth > 0 && matches!(n.op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor) {
+        for ch in n.children() {
+            collect_wide_bitwise(cx, ch, depth - 1, atoms, consts, work)?;
+        }
+        return Some(());
+    }
+    if !atoms.contains(&id) {
+        if atoms.len() >= ATOMS.len() {
+            return None;
+        }
+        atoms.push(id);
+    }
+    Some(())
+}
+
+fn eval_wide_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &[u32],
+    cm: &BitVec,
+    all_rows: u64,
+) -> u64 {
+    if let Some(c) = cx.const_val(id) {
+        return if bv_and(&c, cm).is_zero() {
+            0
+        } else {
+            all_rows
+        };
+    }
+    let n = cx.node(id);
+    if depth > 0 {
+        match n.op {
+            OpCode::Not => {
+                return (!eval_wide_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)) & all_rows;
+            }
+            OpCode::And => {
+                return eval_wide_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    & eval_wide_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            OpCode::Or => {
+                return eval_wide_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    | eval_wide_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            OpCode::Xor => {
+                return eval_wide_bitwise(cx, n.a, depth - 1, atoms, cm, all_rows)
+                    ^ eval_wide_bitwise(cx, n.b, depth - 1, atoms, cm, all_rows);
+            }
+            _ => {}
+        }
+    }
+    let idx = atoms.iter().position(|&a| a == id).unwrap_or(0);
+    ATOMS[idx] & all_rows
+}
+
+fn constant_wide(
+    cx: &Context,
+    group: &[(u32, BitVec)],
+    w: Width,
+    sig_bits: u16,
+    work: &mut Work,
+) -> Option<BitVec> {
+    if group.is_empty() {
+        return Some(BitVec::zero(w));
+    }
+    let mut atoms: Vec<u32> = Vec::new();
+    let mut consts: Vec<BitVec> = Vec::new();
+    for &(t, _) in group {
+        if cx.width_of(t) != w {
+            return None;
+        }
+        collect_wide_bitwise(cx, t, 24, &mut atoms, &mut consts, work)?;
+    }
+    let mut classes: Vec<BitVec> = vec![BitVec::ones(w)];
+    for c in &consts {
+        let nc = bv_not(c);
+        let mut next = Vec::with_capacity(classes.len() * 2);
+        for cm in classes {
+            let a = bv_and(&cm, c);
+            if !a.is_zero() {
+                next.push(a);
+            }
+            let b = bv_and(&cm, &nc);
+            if !b.is_zero() {
+                next.push(b);
+            }
+        }
+        if next.len() > 16 {
+            return None;
+        }
+        classes = next;
+    }
+    let rows = 1usize << atoms.len();
+    let all_rows = if rows == 64 {
+        u64::MAX
+    } else {
+        (1u64 << rows) - 1
+    };
+    let drop_top = u32::from(w.bits() - sig_bits);
+    let mut result = BitVec::zero(w);
+    for cm in &classes {
+        work.take((group.len() + rows) as u64)?;
+        let j = trailing_zeros(cm);
+        if j >= u32::from(sig_bits) {
+            continue;
+        }
+        let sh = drop_top + j;
+        let mut counts = vec![BitVec::zero(w); rows];
+        for &(t, ref k) in group {
+            let mut active = eval_wide_bitwise(cx, t, 24, &atoms, cm, all_rows);
+            while active != 0 {
+                let r_idx = active.trailing_zeros() as usize;
+                counts[r_idx] = BitVec::bin_unchecked(BinOp::Add, &counts[r_idx], k);
+                active &= active - 1;
+            }
+        }
+        let c0 = counts[0];
+        if counts[1..]
+            .iter()
+            .any(|v| !bv_shl(&bv_xor(v, &c0), sh).is_zero())
+        {
+            return None;
+        }
+        let contrib = BitVec::bin_unchecked(BinOp::Mul, cm, &c0);
+        result = BitVec::bin_unchecked(BinOp::Add, &result, &contrib);
+    }
+    Some(result)
+}
+
+fn value_wide(
+    cx: &Context,
+    group: &mut [(u32, BitVec)],
+    w: Width,
+    work: &mut Work,
+) -> Option<BitVec> {
+    if group.is_empty() {
+        return Some(BitVec::zero(w));
+    }
+    let (_, pivot_k) = group
+        .iter()
+        .min_by_key(|(_, k)| {
+            if k.is_zero() {
+                u32::from(w.bits())
+            } else {
+                trailing_zeros(k)
+            }
+        })
+        .cloned()?;
+    if pivot_k.is_zero() {
+        return Some(BitVec::zero(w));
+    }
+    let shift = trailing_zeros(&pivot_k);
+    let sig_bits = w.bits() - shift as u16;
+    let odd = bv_lshr(&pivot_k, shift);
+    let inv = wide_odd_inv(&odd);
+    for (_, c) in group.iter_mut() {
+        let shifted = bv_lshr(c, shift);
+        *c = BitVec::bin_unchecked(BinOp::Mul, &shifted, &inv);
+    }
+    let val = constant_wide(cx, group, w, sig_bits, work)?;
+    Some(BitVec::bin_unchecked(BinOp::Mul, &val, &pivot_k))
+}
+
+/// Wide (`65..=512`-bit) cofactor and weighted-bitwise constant cancellation.
+fn collapse_wide(cx: &mut Context, i: u32, work: &mut Work) -> Result<Option<u32>, Error> {
+    let w = cx.width_of(i);
+    let mut bias = BitVec::zero(w);
+    let mut parts: Vec<(u32, BitVec)> = Vec::new();
+    if terms_wide(cx, i, BitVec::one(w), &mut bias, &mut parts, 48, work).is_none()
+        || parts.len() < 2
+    {
+        return Ok(None);
+    }
+    let raw_len = parts.len();
+    if cancel_parts_wide(&mut parts, work).is_none() || parts.len() > MAX_TERMS {
+        return Ok(None);
+    }
+    let mut changed = parts.len() + 1 < raw_len || parts.len() <= 1;
+    if parts.is_empty() {
+        return cx.mk_const(&bias).map(Some);
+    }
+
+    let mut products: Vec<Option<([u32; 2], BitVec)>> = parts
+        .iter()
+        .map(|&(t, ref k)| product_pair_wide(cx, t, k, work))
+        .collect();
+
+    // Merge identical factor pairs (`a * (b * C1) + a * (b * C2)`).
+    if products.iter().flatten().count() >= 2 {
+        for idx in 0..products.len() {
+            let Some((mut p1, mut c1)) = products[idx] else {
+                continue;
+            };
+            if p1[0] > p1[1] {
+                p1.swap(0, 1);
+            }
+            let mut merged = false;
+            for j in (idx + 1)..products.len() {
+                let Some((mut p2, c2)) = products[j] else {
+                    continue;
+                };
+                if p2[0] > p2[1] {
+                    p2.swap(0, 1);
+                }
+                if p1 == p2 {
+                    c1 = BitVec::bin_unchecked(BinOp::Add, &c1, &c2);
+                    products[j] = None;
+                    parts[j].1 = BitVec::zero(w);
+                    merged = true;
+                }
+            }
+            if merged {
+                changed = true;
+                if c1.is_zero() {
+                    products[idx] = None;
+                    parts[idx].1 = BitVec::zero(w);
+                } else {
+                    products[idx] = Some((p1, c1));
+                    let prod_id = cx.c_bin(BinOp::Mul, p1[0], p1[1])?;
+                    parts[idx] = (prod_id, c1);
+                }
+            }
+        }
+    }
+
+    // Group common multiplicands and prove weighted-bitwise cofactors constant modulo `2^w`.
+    let mut scaled: Vec<(u32, BitVec)> = Vec::new();
+    let mut tried: Vec<u32> = Vec::new();
+    for _ in 0..16 {
+        let mut counts: Vec<u32> = Vec::new();
+        for &(pair, _) in products.iter().flatten() {
+            if !tried.contains(&pair[0]) {
+                counts.push(pair[0]);
+            }
+            if pair[1] != pair[0] && !tried.contains(&pair[1]) {
+                counts.push(pair[1]);
+            }
+        }
+        if counts.len() < 2 {
+            break;
+        }
+        counts.sort_unstable();
+        let mut best = (0usize, 0u32);
+        let mut run = 0;
+        while run < counts.len() {
+            let f = counts[run];
+            let end = run + counts[run..].partition_point(|&x| x == f);
+            if end - run > best.0 {
+                best = (end - run, f);
+            }
+            run = end;
+        }
+        if best.0 < 2 {
+            break;
+        }
+        let f = best.1;
+        tried.push(f);
+        let mut group: Vec<(u32, BitVec)> = Vec::new();
+        for &(pair, ref k) in products.iter().flatten() {
+            if pair[0] == f || pair[1] == f {
+                group.push((if pair[0] == f { pair[1] } else { pair[0] }, *k));
+            }
+        }
+        if cancel_parts_wide(&mut group, work).is_none() {
+            continue;
+        }
+        let k_val = if group.is_empty() {
+            BitVec::zero(w)
+        } else {
+            let Some(kv) = value_wide(cx, &mut group, w, work) else {
+                continue;
+            };
+            kv
+        };
+        for ((_, c), p) in parts.iter_mut().zip(&mut products) {
+            if p.as_ref().is_some_and(|(pair, _)| pair.contains(&f)) {
+                *c = BitVec::zero(w);
+                *p = None;
+            }
+        }
+        if !k_val.is_zero() {
+            scaled.push((f, k_val));
+        }
+        changed = true;
+    }
+
+    // Also collapse remaining non-product weighted bitwise sums.
+    let mut rest: Vec<(u32, BitVec)> = parts
+        .iter()
+        .filter(|&&(t, ref k)| !k.is_zero() && cx.node(t).op != OpCode::Mul)
+        .cloned()
+        .collect();
+    if rest.len() >= 2
+        && let Some(kv) = value_wide(cx, &mut rest, w, work)
+    {
+        bias = BitVec::bin_unchecked(BinOp::Add, &bias, &kv);
+        for (t, c) in &mut parts {
+            if cx.node(*t).op != OpCode::Mul {
+                *c = BitVec::zero(w);
+            }
+        }
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    parts.extend(scaled);
+    if cancel_parts_wide(&mut parts, work).is_none() {
+        return Ok(None);
+    }
+    let mut out = cx.mk_const(&bias)?;
+    for (t, km) in parts {
+        if km.is_zero() {
+            continue;
+        }
+        let term = if km == BitVec::one(w) {
+            t
+        } else if crate::facts::known::count_ones(&km) == 1 {
+            let sc = cx.mk_const_u64(w.bits(), u64::from(trailing_zeros(&km)))?;
+            cx.c_bin(BinOp::Shl, t, sc)?
+        } else if km.is_ones() {
+            cx.c_un(UnOp::Neg, t)?
+        } else {
+            let c = cx.mk_const(&km)?;
+            cx.c_bin(BinOp::Mul, t, c)?
+        };
+        out = cx.c_bin(BinOp::Add, out, term)?;
+    }
+    Ok(Some(out))
 }
 
 #[cfg(test)]

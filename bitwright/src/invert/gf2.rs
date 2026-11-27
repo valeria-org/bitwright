@@ -132,6 +132,103 @@ fn mask_rows(a: &[Row], mask: &BitVec, clear_on_one: bool) -> Rows {
         .collect()
 }
 
+fn apply_pdep_pext_rows(op: OpCode, a: &[Row], mask: &BitVec, w: usize) -> Option<Rows> {
+    let mut out = vec![ZERO_ROW; w];
+    match op {
+        OpCode::Pdep => {
+            let mut src_k = 0usize;
+            for (i, slot) in out.iter_mut().enumerate() {
+                if mask.bit(i as u16) == Some(true) {
+                    *slot = *a.get(src_k)?;
+                    src_k += 1;
+                }
+            }
+            Some(out)
+        }
+        OpCode::Pext => {
+            let mut dst_k = 0usize;
+            for (i, row) in a.iter().enumerate().take(w) {
+                if mask.bit(i as u16) == Some(true) {
+                    *out.get_mut(dst_k)? = *row;
+                    dst_k += 1;
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Sound structural known-zero bitmask (`1` where bit `k` is guaranteed `0` for every input of
+/// the region's atoms/hole) across `1..=512` bits, used to recognize disjoint `Or` / `Add`.
+fn must_zero(cx: &Context, id: u32, depth: u8, is_atom: &dyn Fn(u32) -> bool) -> BitVec {
+    use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_or, bv_shl, count_ones, low_mask};
+    let w = cx.width_of(id);
+    if let Some(c) = cx.const_val(id) {
+        return bv_not(&c);
+    }
+    if is_atom(id) || depth == 0 {
+        return BitVec::zero(w);
+    }
+    let n = cx.node(id);
+    match n.op {
+        OpCode::And => bv_or(
+            &must_zero(cx, n.a, depth - 1, is_atom),
+            &must_zero(cx, n.b, depth - 1, is_atom),
+        ),
+        OpCode::Or | OpCode::Xor => bv_and(
+            &must_zero(cx, n.a, depth - 1, is_atom),
+            &must_zero(cx, n.b, depth - 1, is_atom),
+        ),
+        OpCode::Pdep => match cx.const_val(n.b) {
+            Some(m) => bv_not(&m),
+            None => BitVec::zero(w),
+        },
+        OpCode::Pext => match cx.const_val(n.b) {
+            Some(m) => bv_not(&low_mask(w, count_ones(&m))),
+            None => BitVec::zero(w),
+        },
+        OpCode::Shl => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w.bits()) => BitVec::ones(w),
+            Some(s) => bv_or(
+                &bv_shl(&must_zero(cx, n.a, depth - 1, is_atom), s as u32),
+                &low_mask(w, s as u32),
+            ),
+            None => BitVec::zero(w),
+        },
+        OpCode::LShr => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
+            Some(s) if s >= u64::from(w.bits()) => BitVec::ones(w),
+            Some(s) => {
+                let s32 = s as u32;
+                let hi = bv_not(&low_mask(w, u32::from(w.bits()) - s32));
+                bv_or(&bv_lshr(&must_zero(cx, n.a, depth - 1, is_atom), s32), &hi)
+            }
+            None => BitVec::zero(w),
+        },
+        OpCode::Zext => {
+            let sw = cx.wid(n.a);
+            let inner = must_zero(cx, n.a, depth - 1, is_atom)
+                .zext(w)
+                .unwrap_or_else(|_| BitVec::zero(w));
+            bv_or(&inner, &bv_not(&low_mask(w, u32::from(sw))))
+        }
+        OpCode::Extract => must_zero(cx, n.a, depth - 1, is_atom)
+            .extract(n.b as u16, w)
+            .unwrap_or_else(|_| BitVec::zero(w)),
+        OpCode::Concat => BitVec::concat(
+            &must_zero(cx, n.a, depth - 1, is_atom),
+            &must_zero(cx, n.b, depth - 1, is_atom),
+        )
+        .unwrap_or_else(|_| BitVec::zero(w)),
+        _ => BitVec::zero(w),
+    }
+}
+
+fn disjoint_operands(cx: &Context, a: u32, b: u32, is_atom: &dyn Fn(u32) -> bool) -> bool {
+    crate::facts::known::bv_or(&must_zero(cx, a, 6, is_atom), &must_zero(cx, b, 6, is_atom))
+        .is_ones()
+}
+
 /// For each node in `nodes` (between `hole` and some root, in topological order), the matrix of
 /// its output bits over the bits of `hole` (`1..=512` bits), or `None` if an operation is not
 /// affine over GF(2) in `hole` (given constant masks and shift counts).
@@ -164,6 +261,13 @@ pub(crate) fn rows(cx: &Context, hole: u32, nodes: &[u32]) -> Option<IdMap<u32, 
             OpCode::Xor => (0..w)
                 .map(|k| row_xor(&out[&n.a][k], &out[&n.b][k]))
                 .collect(),
+            OpCode::Or | OpCode::Add
+                if disjoint_operands(cx, n.a, n.b, &|id| id == hole || !nodes.contains(&id)) =>
+            {
+                (0..w)
+                    .map(|k| row_xor(&out[&n.a][k], &out[&n.b][k]))
+                    .collect()
+            }
             OpCode::Add | OpCode::Sub if w == 1 => vec![row_xor(&out[&n.a][0], &out[&n.b][0])],
             OpCode::Not | OpCode::Neg | OpCode::Bswap | OpCode::BitRev => {
                 apply_un_rows(n.op, &out[&n.a], w)?
@@ -185,6 +289,13 @@ pub(crate) fn rows(cx: &Context, hole: u32, nodes: &[u32]) -> Option<IdMap<u32, 
                 }
                 let cnt = cx.const_val(n.b)?;
                 apply_shift_rows(n.op, &out[&n.a], &cnt, w)?
+            }
+            OpCode::Pdep | OpCode::Pext => {
+                if dep(&out[&n.b]) {
+                    return None;
+                }
+                let mask = cx.const_val(n.b)?;
+                apply_pdep_pext_rows(n.op, &out[&n.a], &mask, w)?
             }
             OpCode::Extract => {
                 let lo = n.b as usize;
@@ -285,6 +396,22 @@ pub(crate) fn affine(cx: &Context, atoms: &[u32], nodes: &[u32]) -> Option<Affin
                     };
                 }
             }
+            OpCode::Or | OpCode::Add
+                if disjoint_operands(cx, n.a, n.b, &|id| atoms.contains(&id)) =>
+            {
+                let (ma, mb) = (&mats[&n.a], &mats[&n.b]);
+                for m in 0..k_atoms {
+                    cur[m] = match (&ma[m], &mb[m]) {
+                        (None, None) => None,
+                        (Some(ra), None) => Some(ra.clone()),
+                        (None, Some(rb)) => Some(rb.clone()),
+                        (Some(ra), Some(rb)) => {
+                            let xored: Rows = (0..w).map(|b| row_xor(&ra[b], &rb[b])).collect();
+                            xored.iter().any(|r| !row_is_zero(r)).then_some(xored)
+                        }
+                    };
+                }
+            }
             OpCode::Add | OpCode::Sub if w == 1 => {
                 let (ma, mb) = (&mats[&n.a], &mats[&n.b]);
                 for m in 0..k_atoms {
@@ -336,6 +463,21 @@ pub(crate) fn affine(cx: &Context, atoms: &[u32], nodes: &[u32]) -> Option<Affin
                         let shifted = apply_shift_rows(n.op, ra, &cnt, w)?;
                         if shifted.iter().any(|r| !row_is_zero(r)) {
                             cur[m] = Some(shifted);
+                        }
+                    }
+                }
+            }
+            OpCode::Pdep | OpCode::Pext => {
+                if has_dep(n.b) {
+                    return None;
+                }
+                let mask = cx.const_val(n.b)?;
+                let ma = &mats[&n.a];
+                for m in 0..k_atoms {
+                    if let Some(ra) = &ma[m] {
+                        let mapped = apply_pdep_pext_rows(n.op, ra, &mask, w)?;
+                        if mapped.iter().any(|r| !row_is_zero(r)) {
+                            cur[m] = Some(mapped);
                         }
                     }
                 }

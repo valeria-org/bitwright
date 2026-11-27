@@ -294,6 +294,21 @@ fn plan(form: &Form, order: &[(u32, BitVec)]) -> Plan {
     best
 }
 
+/// Unwraps a repeated-squaring chain `s_k = base^(2^k)` (`Mul(a, a)`), returning `(base, k)`.
+pub(super) fn squaring_chain(cx: &Context, mut id: u32) -> (u32, u32) {
+    let mut k = 0u32;
+    while k < 512 {
+        let m = cx.node(id);
+        if m.op == OpCode::Mul && m.a == m.b {
+            id = m.a;
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    (id, k)
+}
+
 /// Whether the node's operator can be part of a linear region.
 fn linear_op(op: OpCode) -> bool {
     matches!(
@@ -2415,6 +2430,32 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 }
             }
         }
+        if node.a == node.b && node.width >= 2 {
+            let (base, k) = squaring_chain(cx, n);
+            let valid_bits = if k == 1 { 2 } else { k.saturating_add(2) };
+            if u32::from(node.width) <= valid_bits {
+                let before = cx.len() as u32;
+                let w_n = cx.width_of(n);
+                let e = r.build(cx, |cx| {
+                    let one = cx.mk_const(&BitVec::one(w_n))?;
+                    cx.c_bin(BinOp::And, base, one)
+                })?;
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Linear,
+                    n,
+                    e,
+                    before,
+                    &[base],
+                    Fin::FINAL,
+                    k >= 2,
+                )? {
+                    Step::Normal(f) => declined = declined.and(f),
+                    step => return Ok(step),
+                }
+            }
+        }
         match super::sort_chain(r, cx, PassKind::Linear, n)? {
             Step::Normal(f) => declined = declined.and(f),
             step => return Ok(step),
@@ -2430,6 +2471,34 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         match finish(r, cx, PassKind::Linear, n, e, before, &[], form.fin)? {
             Step::Normal(f) => declined = declined.and(f),
             step => return Ok(step),
+        }
+    }
+    if matches!(op, OpCode::Add | OpCode::Sub)
+        && (2..=16).contains(&form.terms.len())
+        && form
+            .terms
+            .iter()
+            .any(|&(t, ref c)| cx.node(t).op == OpCode::Mul || !c.bit(0).unwrap_or(true))
+        && form.terms.iter().any(|&(t, _)| {
+            let tn = cx.node(t);
+            tn.op == OpCode::Mul
+                || (matches!(tn.op, OpCode::Add | OpCode::Sub | OpCode::Shl)
+                    && tn.children().any(|ch| cx.node(ch).op == OpCode::Mul))
+        })
+    {
+        let before = cx.len() as u32;
+        if let Some(e) = super::poly::fold_vanishing(r, cx, n, cx.wid(n))? {
+            let stops: &[u32] = if cx.is_const(e) {
+                &[]
+            } else {
+                core::slice::from_ref(&e)
+            };
+            match finish(r, cx, PassKind::Linear, n, e, before, stops, Fin::FINAL)? {
+                Step::Normal(f) => declined = declined.and(f),
+                step => return Ok(step),
+            }
+        } else {
+            super::discard(r, cx, before);
         }
     }
     if matches!(op, OpCode::Add | OpCode::Sub)
@@ -2458,6 +2527,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     } else {
         // Bits of one value counted, first (see `bit_count`).
         match bit_count(r, cx, n, &form)? {
+            Some(Step::Normal(f)) => declined = declined.and(f),
+            Some(step) => return Ok(step),
+            None => {}
+        }
+        // Multi-variable Hamming-weight (`popcnt`) valuation algebra & BLSR identity.
+        match popcnt_algebra(r, cx, n, &form)? {
             Some(Step::Normal(f)) => declined = declined.and(f),
             Some(step) => return Ok(step),
             None => {}
@@ -2714,6 +2789,555 @@ fn bit_count(
     leaves.sort_unstable();
     leaves.dedup();
     finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some)
+}
+
+const POP_ATOMS: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
+
+fn popcnt_arg(cx: &Context, t: u32) -> Option<u32> {
+    let n = cx.node(t);
+    let inner = match n.op {
+        OpCode::Popcnt => t,
+        OpCode::Zext => n.a,
+        OpCode::Extract if n.b == 0 => n.a,
+        _ => return None,
+    };
+    let pn = cx.node(inner);
+    (pn.op == OpCode::Popcnt).then_some(pn.a)
+}
+
+fn blsr_base(cx: &Context, g: u32) -> Option<u32> {
+    let n = cx.node(g);
+    if n.op != OpCode::And {
+        return None;
+    }
+    let is_minus_one_of = |cand: u32, x: u32| -> bool {
+        let cn = cx.node(cand);
+        match cn.op {
+            OpCode::Sub => {
+                cn.a == x
+                    && cx
+                        .const_val(cn.b)
+                        .is_some_and(|k| k == BitVec::one(k.width()))
+            }
+            OpCode::Add => {
+                (cn.a == x && cx.const_val(cn.b).is_some_and(|k| k.is_ones()))
+                    || (cn.b == x && cx.const_val(cn.a).is_some_and(|k| k.is_ones()))
+            }
+            _ => false,
+        }
+    };
+    if is_minus_one_of(n.b, n.a) {
+        Some(n.a)
+    } else if is_minus_one_of(n.a, n.b) {
+        Some(n.b)
+    } else {
+        None
+    }
+}
+
+fn collect_pop_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &mut Vec<u32>,
+    consts: &mut Vec<BitVec>,
+) -> bool {
+    if let Some(c) = cx.const_val(id) {
+        if !c.is_zero() && !c.is_ones() && !consts.contains(&c) {
+            if consts.len() >= 8 {
+                return false;
+            }
+            consts.push(c);
+        }
+        return true;
+    }
+    let n = cx.node(id);
+    if depth > 0 && matches!(n.op, OpCode::Not | OpCode::And | OpCode::Or | OpCode::Xor) {
+        for ch in n.children() {
+            if !collect_pop_bitwise(cx, ch, depth - 1, atoms, consts) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if !atoms.contains(&id) {
+        if atoms.len() >= 6 {
+            return false;
+        }
+        atoms.push(id);
+    }
+    true
+}
+
+fn eval_pop_bitwise(
+    cx: &Context,
+    id: u32,
+    depth: u8,
+    atoms: &[u32],
+    class_mask: &BitVec,
+    all_rows: u64,
+) -> u64 {
+    if let Some(c) = cx.const_val(id) {
+        return if crate::facts::known::bv_and(&c, class_mask).is_zero() {
+            0
+        } else {
+            all_rows
+        };
+    }
+    let n = cx.node(id);
+    if depth > 0 {
+        match n.op {
+            OpCode::Not => {
+                return (!eval_pop_bitwise(cx, n.a, depth - 1, atoms, class_mask, all_rows))
+                    & all_rows;
+            }
+            OpCode::And => {
+                return eval_pop_bitwise(cx, n.a, depth - 1, atoms, class_mask, all_rows)
+                    & eval_pop_bitwise(cx, n.b, depth - 1, atoms, class_mask, all_rows);
+            }
+            OpCode::Or => {
+                return eval_pop_bitwise(cx, n.a, depth - 1, atoms, class_mask, all_rows)
+                    | eval_pop_bitwise(cx, n.b, depth - 1, atoms, class_mask, all_rows);
+            }
+            OpCode::Xor => {
+                return eval_pop_bitwise(cx, n.a, depth - 1, atoms, class_mask, all_rows)
+                    ^ eval_pop_bitwise(cx, n.b, depth - 1, atoms, class_mask, all_rows);
+            }
+            _ => {}
+        }
+    }
+    let idx = atoms.iter().position(|&a| a == id).unwrap_or(0);
+    POP_ATOMS[idx] & all_rows
+}
+
+fn synth_pop_bool(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    tt: u64,
+    atoms: &[u32],
+    all_rows: u64,
+    used_atoms: &mut Vec<u32>,
+) -> Result<Option<u32>, Stop> {
+    let rows = 1usize << atoms.len();
+    for (k, &a) in atoms.iter().enumerate() {
+        let vk = POP_ATOMS[k] & all_rows;
+        if tt == vk {
+            used_atoms.push(a);
+            return Ok(Some(a));
+        }
+        if tt == ((!vk) & all_rows) {
+            used_atoms.push(a);
+            return r.build(cx, |cx| cx.c_un(UnOp::Not, a)).map(Some);
+        }
+    }
+    // Prune to active atoms (`<= 3` for `super::bitwise::emit`).
+    let mut active: Vec<(usize, u32)> = Vec::new();
+    for (k, &a) in atoms.iter().enumerate() {
+        let bit = 1usize << k;
+        if (0..rows).any(|i| ((tt >> i) & 1) != ((tt >> (i ^ bit)) & 1)) {
+            active.push((k, a));
+        }
+    }
+    if active.is_empty() || active.len() > 3 {
+        return Ok(None);
+    }
+    let mut tt8 = 0u8;
+    for i in 0..8usize {
+        let mut row = 0usize;
+        for (pos, &(orig_k, _)) in active.iter().enumerate() {
+            if ((i >> pos) & 1) != 0 {
+                row |= 1usize << orig_k;
+            }
+        }
+        if ((tt >> row) & 1) != 0 {
+            tt8 |= 1u8 << i;
+        }
+    }
+    let mut sub_atoms: Vec<u32> = active.into_iter().map(|(_, a)| a).collect();
+    // Sort `sub_atoms` cleanly; remap `tt8` if order changes isn't needed since `bitwise::emit`
+    // takes `atoms` in variable order (`0..sub_atoms.len()`).
+    used_atoms.extend_from_slice(&sub_atoms);
+    let e = super::bitwise::emit(r, cx, tt8, &sub_atoms)?;
+    sub_atoms.clear();
+    Ok(Some(e))
+}
+
+/// Multi-variable Hamming-weight (`popcnt`) valuation linear algebra (`1..=512` bits) and
+/// `BLSR` (`popcnt(x) - popcnt(x & (x - 1)) == zext(x != 0)`) reduction.
+fn popcnt_algebra(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    if form.terms.len() < 2 || form.terms.len() > 24 {
+        return Ok(None);
+    }
+    let w = form.konst.width();
+    let args: Vec<Option<u32>> = form.terms.iter().map(|&(t, _)| popcnt_arg(cx, t)).collect();
+    if args.iter().flatten().count() < 2 {
+        return Ok(None);
+    }
+
+    // 1. `BLSR` pairing: `popcnt(x & (x - 1)) == popcnt(x) - [x != 0]`.
+    for (i, &ga) in args.iter().enumerate() {
+        let Some(g_blsr) = ga else { continue };
+        let Some(x) = blsr_base(cx, g_blsr) else {
+            continue;
+        };
+        let Some(j) = args
+            .iter()
+            .enumerate()
+            .position(|(idx, &gb)| idx != i && gb == Some(x))
+        else {
+            continue;
+        };
+        r.meter.charge(Counter::PassWork, 8)?;
+        let (t_x, k_x) = form.terms[j];
+        let k_blsr = form.terms[i].1;
+        let k_sum = BitVec::bin_unchecked(BinOp::Add, &k_x, &k_blsr);
+        let neg_k_blsr = BitVec::un_unchecked(UnOp::Neg, &k_blsr);
+        let before = cx.len() as u32;
+        let nz_cast = r.build(cx, |cx| {
+            let xw = cx.width_of(x);
+            let z = cx.mk_const(&BitVec::zero(xw))?;
+            let ne = cx.c_cmp(crate::CmpOp::Ne, x, z)?;
+            if w.bits() == 1 {
+                Ok(ne)
+            } else {
+                cx.c_zext(ne, w.bits())
+            }
+        })?;
+        let mut new_terms: Vec<(u32, BitVec)> = Vec::with_capacity(form.terms.len());
+        let mut leaves: Vec<u32> = vec![x];
+        for (idx, &(t, ref k)) in form.terms.iter().enumerate() {
+            if idx == i {
+                continue;
+            }
+            if idx == j {
+                if !k_sum.is_zero() {
+                    new_terms.push((t_x, k_sum));
+                    leaves.push(t_x);
+                }
+            } else {
+                new_terms.push((t, *k));
+                leaves.push(t);
+            }
+        }
+        new_terms.push((nz_cast, neg_k_blsr));
+        let mut f = Form::of(form.konst, &new_terms);
+        f.fin = form.fin;
+        let e = emit(r, cx, &f)?;
+        leaves.sort_unstable();
+        leaves.dedup();
+        return finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some);
+    }
+
+    // 2. Boolean valuation truth-table reduction over equal-width `popcnt` arguments (`1..=512`).
+    let mut best_uw: Option<(usize, u16)> = None;
+    for g in args.iter().flatten() {
+        let uw = cx.wid(*g);
+        let cnt = args
+            .iter()
+            .flatten()
+            .filter(|&&g2| cx.wid(g2) == uw)
+            .count();
+        if cnt >= 2 && best_uw.is_none_or(|(bc, _)| cnt > bc) {
+            best_uw = Some((cnt, uw));
+        }
+    }
+    let Some((_, uw)) = best_uw else {
+        return Ok(None);
+    };
+    let uw_width = crate::Width::new(uw).map_err(|e| Stop::Error(e.into()))?;
+    let mut group_indices: Vec<usize> = Vec::new();
+    let mut group_gs: Vec<u32> = Vec::new();
+    let mut atoms: Vec<u32> = Vec::new();
+    let mut consts: Vec<BitVec> = Vec::new();
+    for (idx, &ga) in args.iter().enumerate() {
+        let Some(g) = ga.filter(|&g| cx.wid(g) == uw) else {
+            continue;
+        };
+        if group_indices.len() >= 16 {
+            break;
+        }
+        let mut cand_atoms = atoms.clone();
+        let mut cand_consts = consts.clone();
+        if collect_pop_bitwise(cx, g, 12, &mut cand_atoms, &mut cand_consts) {
+            atoms = cand_atoms;
+            consts = cand_consts;
+            group_indices.push(idx);
+            group_gs.push(g);
+        }
+    }
+    if group_indices.len() < 2 {
+        return Ok(None);
+    }
+    atoms.sort_by(|&a, &b| cx.order(a, b));
+
+    // Partition `BitVec::ones(uw_width)` by `consts` into at most 16 Venn bit-classes.
+    let mut classes: Vec<BitVec> = vec![BitVec::ones(uw_width)];
+    for c in &consts {
+        let nc = crate::facts::known::bv_not(c);
+        let mut next = Vec::with_capacity(classes.len() * 2);
+        for cm in classes {
+            let a = crate::facts::known::bv_and(&cm, c);
+            if !a.is_zero() {
+                next.push(a);
+            }
+            let b = crate::facts::known::bv_and(&cm, &nc);
+            if !b.is_zero() {
+                next.push(b);
+            }
+        }
+        if next.len() > 16 {
+            return Ok(None);
+        }
+        classes = next;
+    }
+    if classes.is_empty() {
+        return Ok(None);
+    }
+
+    let rows = 1usize << atoms.len();
+    let all_rows = if rows == 64 {
+        u64::MAX
+    } else {
+        (1u64 << rows) - 1
+    };
+    r.meter.charge(
+        Counter::PassWork,
+        (classes.len() * group_gs.len() * rows.max(4) / 4 + 4) as u64,
+    )?;
+
+    let mut g_tables: Vec<Vec<u64>> = vec![Vec::with_capacity(group_gs.len()); classes.len()];
+    let mut sigs: Vec<Vec<BitVec>> = Vec::with_capacity(classes.len());
+    let mut all_const = true;
+    let mut first_nonconst: Option<usize> = None;
+
+    for (q, cm) in classes.iter().enumerate() {
+        let mut row_vals = vec![BitVec::zero(w); rows];
+        for (r_idx, &g) in group_gs.iter().enumerate() {
+            let tt = eval_pop_bitwise(cx, g, 12, &atoms, cm, all_rows);
+            g_tables[q].push(tt);
+            let coeff = &form.terms[group_indices[r_idx]].1;
+            let mut active = tt;
+            while active != 0 {
+                let a = active.trailing_zeros() as usize;
+                row_vals[a] = BitVec::bin_unchecked(BinOp::Add, &row_vals[a], coeff);
+                active &= active - 1;
+            }
+        }
+        if row_vals[1..].iter().any(|v| *v != row_vals[0]) {
+            all_const = false;
+            if first_nonconst.is_none() {
+                first_nonconst = Some(q);
+            }
+        }
+        sigs.push(row_vals);
+    }
+
+    // Case 1: Every class is constant across all Boolean assignments -> fold entire group to a constant!
+    if all_const {
+        let mut c_add = form.konst;
+        for (q, cm) in classes.iter().enumerate() {
+            let card = BitVec::wrapping_from_u64(w, u64::from(crate::facts::known::count_ones(cm)));
+            let prod = BitVec::bin_unchecked(BinOp::Mul, &card, &sigs[q][0]);
+            c_add = BitVec::bin_unchecked(BinOp::Add, &c_add, &prod);
+        }
+        let mut rest: Vec<(u32, BitVec)> = Vec::new();
+        let mut leaves: Vec<u32> = Vec::new();
+        for (idx, &(t, ref k)) in form.terms.iter().enumerate() {
+            if !group_indices.contains(&idx) {
+                rest.push((t, *k));
+                leaves.push(t);
+            }
+        }
+        let before = cx.len() as u32;
+        let mut f = Form::of(c_add, &rest);
+        f.fin = form.fin;
+        let e = emit(r, cx, &f)?;
+        leaves.sort_unstable();
+        leaves.dedup();
+        return finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin).map(Some);
+    }
+
+    // Case 2: Check if all non-constant classes are 2-valued with a uniform step `d` so the
+    // group of >= 2 popcnts collapses to `C_total + d * popcnt(h)`.
+    let q0 = first_nonconst.unwrap();
+    let v0 = sigs[q0][0];
+    let Some(&v1) = sigs[q0][1..].iter().find(|&&v| v != v0) else {
+        return Ok(None);
+    };
+    if sigs[q0].iter().any(|&v| v != v0 && v != v1) {
+        return Ok(None);
+    }
+    let d_pos = BitVec::bin_unchecked(BinOp::Sub, &v1, &v0);
+    let d_neg = BitVec::un_unchecked(UnOp::Neg, &d_pos);
+    let mag = |v: &BitVec| {
+        let nv = BitVec::un_unchecked(UnOp::Neg, v);
+        if BitVec::cmp_unchecked(crate::CmpOp::Ult, &nv, v) {
+            nv
+        } else {
+            *v
+        }
+    };
+    let candidates = if d_pos == d_neg {
+        vec![d_pos]
+    } else if BitVec::cmp_unchecked(crate::CmpOp::Ule, &mag(&d_pos), &mag(&d_neg)) {
+        vec![d_pos, d_neg]
+    } else {
+        vec![d_neg, d_pos]
+    };
+
+    for d in candidates {
+        let mut class_tt: Vec<Option<u64>> = Vec::with_capacity(classes.len());
+        let mut class_base: Vec<BitVec> = Vec::with_capacity(classes.len());
+        let mut ok = true;
+        for sig_q in &sigs {
+            let s0 = sig_q[0];
+            if sig_q[1..].iter().all(|&v| v == s0) {
+                class_tt.push(None);
+                class_base.push(s0);
+                continue;
+            }
+            let base_opt = if sig_q
+                .iter()
+                .all(|&v| v == s0 || v == BitVec::bin_unchecked(BinOp::Add, &s0, &d))
+            {
+                Some(s0)
+            } else {
+                let b_alt = BitVec::bin_unchecked(BinOp::Sub, &s0, &d);
+                sig_q
+                    .iter()
+                    .all(|&v| v == b_alt || v == s0)
+                    .then_some(b_alt)
+            };
+            let Some(base) = base_opt else {
+                ok = false;
+                break;
+            };
+            let mut tt = 0u64;
+            for (a, &v) in sig_q.iter().enumerate() {
+                if v != base {
+                    tt |= 1u64 << a;
+                }
+            }
+            class_tt.push(Some(tt));
+            class_base.push(base);
+        }
+        if !ok {
+            continue;
+        }
+
+        let before = cx.len() as u32;
+        let mut used_stops: Vec<u32> = Vec::new();
+        let mut c_add = form.konst;
+
+        // First check if an existing `g_r` already matches `class_tt` on every non-constant
+        // class and is `0` or `all_rows` on every constant class!
+        let reused = (0..group_gs.len()).find(|&r_idx| {
+            (0..classes.len()).all(|q| match class_tt[q] {
+                Some(tt) => g_tables[q][r_idx] == tt,
+                None => g_tables[q][r_idx] == 0 || g_tables[q][r_idx] == all_rows,
+            })
+        });
+
+        let h_opt = if let Some(r_idx) = reused {
+            for (q, cm) in classes.iter().enumerate() {
+                let mut base = class_base[q];
+                if class_tt[q].is_none() && g_tables[q][r_idx] == all_rows {
+                    base = BitVec::bin_unchecked(BinOp::Sub, &base, &d);
+                }
+                let card =
+                    BitVec::wrapping_from_u64(w, u64::from(crate::facts::known::count_ones(cm)));
+                let prod = BitVec::bin_unchecked(BinOp::Mul, &card, &base);
+                c_add = BitVec::bin_unchecked(BinOp::Add, &c_add, &prod);
+            }
+            let g_keep = group_gs[r_idx];
+            used_stops.push(g_keep);
+            Some(g_keep)
+        } else {
+            // Check if all non-constant classes share a single `tt_main`.
+            let tt_main = class_tt.iter().flatten().copied().next().unwrap();
+            if class_tt.iter().flatten().all(|&tt| tt == tt_main) {
+                for (q, cm) in classes.iter().enumerate() {
+                    let card = BitVec::wrapping_from_u64(
+                        w,
+                        u64::from(crate::facts::known::count_ones(cm)),
+                    );
+                    let prod = BitVec::bin_unchecked(BinOp::Mul, &card, &class_base[q]);
+                    c_add = BitVec::bin_unchecked(BinOp::Add, &c_add, &prod);
+                }
+                if let Some(base_h) =
+                    synth_pop_bool(r, cx, tt_main, &atoms, all_rows, &mut used_stops)?
+                {
+                    let has_const_class = class_tt.iter().any(Option::is_none);
+                    if !has_const_class {
+                        Some(base_h)
+                    } else {
+                        let mut m_main = BitVec::zero(uw_width);
+                        for (q, cm) in classes.iter().enumerate() {
+                            if class_tt[q].is_some() {
+                                m_main = crate::facts::known::bv_or(&m_main, cm);
+                            }
+                        }
+                        let masked_h = r.build(cx, |cx| {
+                            let mc = cx.mk_const(&m_main)?;
+                            cx.c_bin(BinOp::And, base_h, mc)
+                        })?;
+                        Some(masked_h)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let Some(h) = h_opt else {
+            super::discard(r, cx, before);
+            continue;
+        };
+
+        let pop_h = r.build(cx, |cx| {
+            let p = cx.c_un(UnOp::Popcnt, h)?;
+            match cx.wid(p).cmp(&w.bits()) {
+                core::cmp::Ordering::Less => cx.c_zext(p, w.bits()),
+                core::cmp::Ordering::Equal => Ok(p),
+                core::cmp::Ordering::Greater => cx.c_extract(p, 0, w.bits()),
+            }
+        })?;
+        let mut rest: Vec<(u32, BitVec)> = Vec::new();
+        let mut leaves: Vec<u32> = used_stops;
+        for (idx, &(t, ref k)) in form.terms.iter().enumerate() {
+            if !group_indices.contains(&idx) {
+                rest.push((t, *k));
+                leaves.push(t);
+            }
+        }
+        rest.push((pop_h, d));
+        let mut f = Form::of(c_add, &rest);
+        f.fin = form.fin;
+        let e = emit(r, cx, &f)?;
+        leaves.sort_unstable();
+        leaves.dedup();
+        match finish(r, cx, PassKind::Linear, n, e, before, &leaves, f.fin)? {
+            Step::Normal(_) => {
+                super::discard(r, cx, before);
+            }
+            step => return Ok(Some(step)),
+        }
+    }
+    Ok(None)
 }
 
 /// Combine `k1 * (x ^ c1) + k2 * (x ^ c2)` in `form` when `~(c1 ^ c2)` has at most 1 unknown
@@ -4002,14 +4626,19 @@ pub(super) fn by_multiplicand(
     finish(r, cx, PassKind::Mba, n, e, before, &stops, fin).map(Some)
 }
 
-/// The atoms of `e`'s bitwise part, sorted: the operands under its `& | ^ ~` that are not
-/// themselves bitwise (constants aside), or `e` itself when it is not bitwise; `None` past a
-/// few hundred nodes.
+/// The atoms of `e`'s bitwise/shift/slice part, sorted: the operands under its `& | ^ ~`,
+/// constant shifts/rotations, and slices/extensions that are not themselves such wrappers
+/// (constants aside), or `e` itself when it is none of them; `None` past a few hundred nodes.
 #[cfg(feature = "mba")]
 fn bitwise_atoms(cx: &Context, e: u32) -> Option<Vec<u32>> {
     const MAX_SEEN: usize = 512;
-    let bitwise = |op: OpCode| matches!(op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
-    if !bitwise(cx.node(e).op) {
+    let wrapper = |cx: &Context, n: &Node| match n.op {
+        OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not => true,
+        OpCode::Extract | OpCode::Zext | OpCode::Sext => true,
+        OpCode::Shl | OpCode::LShr | OpCode::AShr | OpCode::RotL | OpCode::RotR => cx.is_const(n.b),
+        _ => false,
+    };
+    if !wrapper(cx, &cx.node(e)) {
         return Some(vec![e]);
     }
     let mut seen = super::Lease::new(cx.len());
@@ -4025,7 +4654,7 @@ fn bitwise_atoms(cx: &Context, e: u32) -> Option<Vec<u32>> {
             return None;
         }
         let node = cx.node(i);
-        if bitwise(node.op) {
+        if wrapper(cx, &node) {
             todo.extend(node.children());
         } else if node.op != OpCode::Const {
             out.push(i);
@@ -4036,8 +4665,9 @@ fn bitwise_atoms(cx: &Context, e: u32) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// the sum `n` with terms that spell a sum `A` its bitwise parts read as an atom
-/// (`2 (A & k) − x·x − y` where `A = x·x + y`) written as `A` itself, then simplified by `part`
+/// the sum `n` with terms that spell an affine/linear sum `A` its bitwise/shift parts read as
+/// an atom (`2 (A & k) − x·x − y` where `A = x·x + y`, or `(s & m) + ... − (x << k)` where
+/// `s = (x << k) + c` or `u = a·x + c`) written over `A` itself, then simplified by `part`
 /// (the MBA phase): an atom and its expansion are otherwise unrelated to the solver. `None`
 /// when no such sum is spelled out.
 #[cfg(feature = "mba")]
@@ -4047,30 +4677,54 @@ pub(super) fn by_sums(
     n: u32,
     part: &mut impl FnMut(&mut Runner<'_, '_>, &mut Context, u32) -> Result<Option<u32>, Stop>,
 ) -> Result<Option<Step>, Stop> {
+    use crate::facts::known::{bv_lshr, low_mask, trailing_zeros};
     if !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
         return Ok(None);
     }
     let form = form_of(r, cx, n)?;
     let mut sums: Vec<u32> = Vec::new();
     for &(t, _) in &form.terms {
-        if !matches!(cx.node(t).op, OpCode::And | OpCode::Or | OpCode::Xor) {
+        let tn = cx.node(t);
+        if !matches!(
+            tn.op,
+            OpCode::And
+                | OpCode::Or
+                | OpCode::Xor
+                | OpCode::LShr
+                | OpCode::AShr
+                | OpCode::RotL
+                | OpCode::RotR
+                | OpCode::Extract
+                | OpCode::Zext
+                | OpCode::Sext
+        ) {
             continue;
         }
         for a in bitwise_atoms(cx, t).unwrap_or_default() {
-            if matches!(cx.node(a).op, OpCode::Add | OpCode::Sub) && !sums.contains(&a) {
+            if matches!(
+                cx.node(a).op,
+                OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Shl
+            ) && !sums.contains(&a)
+            {
                 sums.push(a);
             }
         }
     }
     let w = form.konst.width();
+    let wb = u32::from(w.bits());
     let one = BitVec::one(w);
-    let minus_one = BitVec::ones(w);
     let mut konst = form.konst;
     let mut terms = form.terms.clone();
     let mut changed = false;
     for a in sums {
+        if cx.width_of(a) != w {
+            continue;
+        }
         let fa = form_of(r, cx, a)?;
-        if fa.terms.len() < 2 || fa.terms.iter().any(|(_, k)| *k != one && *k != minus_one) {
+        if fa.terms.is_empty()
+            || (fa.terms.len() == 1 && fa.terms[0].1 == one)
+            || (fa.terms.len() == 1 && fa.terms[0].0 == a)
+        {
             continue;
         }
         let coeff = |terms: &[(u32, BitVec)], atom: u32| {
@@ -4079,16 +4733,34 @@ pub(super) fn by_sums(
                 .ok()
                 .map(|i| terms[i].1)
         };
-        // The scale `c` with `c · fa`'s terms among the sum's.
-        let (t0, k0) = fa.terms[0];
+        // Pick the term of `fa` with the fewest trailing zeros to solve `c · k₀ ≡ c₀ (mod 2^W)`.
+        let Some(&(t0, ref k0)) = fa.terms.iter().min_by_key(|(_, k)| trailing_zeros(k)) else {
+            continue;
+        };
         let Some(c0) = coeff(&terms, t0) else {
             continue;
         };
-        let c = if k0 == one {
-            c0
-        } else {
-            BitVec::un_unchecked(UnOp::Neg, &c0)
+        let tz0 = trailing_zeros(k0);
+        if tz0 >= wb || trailing_zeros(&c0) < tz0 {
+            continue;
+        }
+        let odd0 = bv_lshr(k0, tz0);
+        let Some(inv0) = crate::invert::mul_inverse(&odd0) else {
+            continue;
         };
+        let mut c = BitVec::bin_unchecked(BinOp::Mul, &bv_lshr(&c0, tz0), &inv0);
+        let prec = wb - tz0;
+        if prec < wb {
+            let m = low_mask(w, prec);
+            c = crate::facts::known::bv_and(&c, &m);
+            if c.bit(prec as u16 - 1) == Some(true) {
+                let hi = crate::facts::known::bv_not(&m);
+                c = crate::facts::known::bv_or(&c, &hi);
+            }
+        }
+        if c.is_zero() {
+            continue;
+        }
         let scaled = |k: &BitVec| BitVec::bin_unchecked(BinOp::Mul, &c, k);
         if !fa
             .terms
@@ -4103,7 +4775,12 @@ pub(super) fn by_sums(
             .filter(|(t, _)| fa.terms.binary_search_by_key(t, |x| x.0).is_err())
             .copied()
             .collect();
-        rest.push((a, c));
+        if let Some(slot) = rest.iter_mut().find(|(t, _)| *t == a) {
+            slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &c);
+            rest.retain(|(_, k)| !k.is_zero());
+        } else {
+            rest.push((a, c));
+        }
         konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scaled(&fa.konst));
         let f = Form::of(konst, &rest);
         terms = f.terms.clone();

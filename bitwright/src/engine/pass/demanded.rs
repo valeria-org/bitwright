@@ -113,6 +113,35 @@ pub(super) fn observed(cx: &Context, n: u32) -> Option<(u32, BitVec)> {
             };
             (node.a, BitVec::bin_unchecked(back, &BitVec::ones(w), &k))
         }),
+        OpCode::Mul => match (cx.const_val(node.a), cx.const_val(node.b)) {
+            (Some(k), None) | (None, Some(k)) if !k.is_zero() => {
+                let tz = crate::facts::known::trailing_zeros(&k);
+                let wb = u32::from(w.bits());
+                if tz > 0 && tz < wb {
+                    let x = if cx.const_val(node.a).is_some() {
+                        node.b
+                    } else {
+                        node.a
+                    };
+                    matches!(
+                        cx.node(x).op,
+                        OpCode::Add
+                            | OpCode::Sub
+                            | OpCode::Neg
+                            | OpCode::Mul
+                            | OpCode::Or
+                            | OpCode::Xor
+                            | OpCode::Shl
+                            | OpCode::Concat
+                            | OpCode::Select
+                    )
+                    .then(|| (x, low_mask(w, wb - tz)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -243,9 +272,34 @@ fn reads(cx: &Context, x: u32, m: &BitVec, out: &mut Vec<(u32, BitVec)>) {
             _ => out.extend([(node.a, *m), (node.b, *m)]),
         },
         OpCode::Not => out.push((node.a, *m)),
-        OpCode::Add | OpCode::Sub | OpCode::Mul => {
+        OpCode::Add | OpCode::Sub => {
             let p = low_prefix(m);
             out.extend([(node.a, p), (node.b, p)]);
+        }
+        OpCode::Mul => {
+            let p = low_prefix(m);
+            let b = crate::facts::known::count_ones(&p);
+            match (konst(node.a), konst(node.b)) {
+                (Some(k), None) if !k.is_zero() => {
+                    let tz = crate::facts::known::trailing_zeros(&k);
+                    let pm = if tz > 0 && tz < b {
+                        low_mask(w, b - tz)
+                    } else {
+                        p
+                    };
+                    out.push((node.b, pm));
+                }
+                (None, Some(k)) if !k.is_zero() => {
+                    let tz = crate::facts::known::trailing_zeros(&k);
+                    let pm = if tz > 0 && tz < b {
+                        low_mask(w, b - tz)
+                    } else {
+                        p
+                    };
+                    out.push((node.a, pm));
+                }
+                _ => out.extend([(node.a, p), (node.b, p)]),
+            }
         }
         OpCode::Neg => out.push((node.a, low_prefix(m))),
         OpCode::Shl | OpCode::LShr => {
@@ -351,43 +405,88 @@ fn low_prefix(m: &BitVec) -> BitVec {
 }
 
 /// `x` on the bits of `m`, when they are among the lowest [`RESIDUE_BITS`] and `x`'s residues
-/// show them constant or equal to a leaf's.
+/// show them constant or equal to a leaf's, or when `2^k`-adic Hensel lifting / falling-factorial
+/// polynomial reduction proves `(x & m)` constant across all inputs.
 fn by_residues(
     r: &mut Runner<'_, '_>,
     cx: &mut Context,
     x: u32,
     m: &BitVec,
 ) -> Result<Option<u32>, Stop> {
-    let Some(mv) = m.to_u64() else {
-        return Ok(None);
-    };
-    let k = 64 - mv.leading_zeros();
-    if k == 0
-        || k > RESIDUE_BITS
-        || !matches!(cx.node(x).op, OpCode::Mul | OpCode::Add | OpCode::Sub)
-    {
-        return Ok(None);
-    }
-    if !super::residue::may_fold(r, cx, x, k, mv) {
-        return Ok(None);
-    }
-    let Some(t) = super::residue::residues(r, cx, x, k)? else {
-        return Ok(None);
-    };
-    let first = t.values[0] & mv;
+    let op = cx.node(x).op;
     let allowed = r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(x)));
-    if allowed && t.values.iter().all(|&v| v & mv == first) {
-        let c = BitVec::wrapping_from_u64(m.width(), first);
-        return Ok(Some(r.build(cx, |cx| cx.mk_const(&c))?));
+    if let Some(mv) = m.to_u64() {
+        let k = 64 - mv.leading_zeros();
+        if k > 0
+            && k <= RESIDUE_BITS
+            && matches!(op, OpCode::Mul | OpCode::Add | OpCode::Sub)
+            && super::residue::may_fold(r, cx, x, k, mv)
+            && let Some(t) = super::residue::residues(r, cx, x, k)?
+        {
+            let first = t.values[0] & mv;
+            if allowed && t.values.iter().all(|&v| v & mv == first) {
+                let c = BitVec::wrapping_from_u64(m.width(), first);
+                return Ok(Some(r.build(cx, |cx| cx.mk_const(&c))?));
+            }
+            if let Some(i) = (0..t.leaves.len()).find(|&i| {
+                t.values
+                    .iter()
+                    .enumerate()
+                    .all(|(c, &v)| v & mv == t.leaf(c, i) & mv)
+            }) {
+                return Ok(Some(t.leaves[i]));
+            }
+        }
     }
-    Ok((0..t.leaves.len())
-        .find(|&i| {
-            t.values
-                .iter()
-                .enumerate()
-                .all(|(c, &v)| v & mv == t.leaf(c, i) & mv)
-        })
-        .map(|i| t.leaves[i]))
+    if !allowed || m.is_ones() {
+        return Ok(None);
+    }
+    // Value-level 2^k-adic Hensel invariant check up to 128 low bits (strict sub-width masks).
+    if let Some(mv128) = m.to_u128().filter(|&v| v != 0)
+        && matches!(op, OpCode::Mul | OpCode::Add | OpCode::Sub)
+    {
+        let (c_opt, work) = super::predicate::constant_masked(cx, x, mv128);
+        if work > 0 {
+            r.meter.charge(Counter::PassWork, work / 64 + 1)?;
+        }
+        if let Some(cv) = c_opt {
+            let c = BitVec::wrapping_from_u128(m.width(), cv);
+            return Ok(Some(r.build(cx, |cx| cx.mk_const(&c))?));
+        }
+    }
+    // Multi-leaf falling-factorial polynomial vanishing on contiguous strict low prefixes (`1..512` bits).
+    if matches!(op, OpCode::Add | OpCode::Sub | OpCode::Mul) && low_prefix(m) == *m {
+        let b = crate::facts::known::count_ones(m) as u16;
+        if b > 0
+            && b < m.width().bits()
+            && has_var_product_near(cx, x, 24)
+            && let Some(c_id) = super::poly::fold_vanishing(r, cx, x, b)?
+            && cx.is_const(c_id)
+        {
+            return Ok(Some(c_id));
+        }
+    }
+    Ok(None)
+}
+
+fn has_var_product_near(cx: &Context, root: u32, limit: usize) -> bool {
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(i) = stack.pop() {
+        visited += 1;
+        if visited > limit {
+            break;
+        }
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Mul if !cx.is_const(n.a) && !cx.is_const(n.b) => return true,
+            OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Mul | OpCode::Shl => {
+                stack.extend(n.children());
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The most low bits read by residues.
@@ -524,6 +623,30 @@ fn simplify_in(
             return Ok(c);
         }
     }
+    // 2-adic Euler-Fermat squaring tower (`base^(2^k) ≡ base & 1 (mod 2^(k+2))` for `k >= 2`,
+    // and `base^2 ≡ base & 1 (mod 4)` for `k == 1`).
+    if node.op == OpCode::Mul && node.a == node.b {
+        let (base, k) = super::linear::squaring_chain(cx, x);
+        let valid_bits = if k == 1 { 2 } else { k.saturating_add(2) };
+        if subset(m, &low_mask(w, valid_bits)) {
+            if m.bit(0) != Some(true) {
+                let z = r.build(cx, |cx| cx.mk_const(&BitVec::zero(w)))?;
+                st.note(Key(x, *m), z);
+                return Ok(z);
+            }
+            stop_at(cx, st, base);
+            let v = if *m == BitVec::one(w) {
+                base
+            } else {
+                r.build(cx, |cx| {
+                    let one = cx.mk_const(&BitVec::one(w))?;
+                    cx.c_bin(BinOp::And, base, one)
+                })?
+            };
+            st.note(Key(x, *m), v);
+            return Ok(v);
+        }
+    }
     // Demanded bits among the lowest few: the residues of `x` decide them (a constant, or a
     // leaf equal to `x` there).
     if let Some(v) = by_residues(r, cx, x, m)? {
@@ -588,6 +711,16 @@ fn simplify_in(
     // coefficient that is 0 there reads nothing, and one with trailing zeros a narrower limb.
     if matches!(node.op, OpCode::Add | OpCode::Sub)
         && let Some(v) = joined(r, cx, st, x, m)?
+    {
+        st.note(Key(x, *m), v);
+        return Ok(v);
+    }
+    // `popcnt` mod-2 parity homomorphism: on bit 0 (`m == 1`), `popcnt(u) ≡ xor_j u_j (mod 2)`
+    // and `a ± b ≡ a ^ b (mod 2)`, so any `Xor`/`Add`/`Sub`/`Neg`/`Not` cone combining two or
+    // more equal-width `popcnt` leaves collapses to at most one `popcnt` over their XOR.
+    if *m == BitVec::one(w)
+        && matches!(node.op, OpCode::Xor | OpCode::Add | OpCode::Sub)
+        && let Some(v) = popcnt_parity_fold(r, cx, st, x, m)?
     {
         st.note(Key(x, *m), v);
         return Ok(v);
@@ -819,10 +952,38 @@ fn simplify_in(
                     let kind = if node.op == OpCode::Sub { 2 } else { 0 };
                     (same_on(r, cx, (b, kind), node.a, &k, &p), b)
                 }
-                _ => (
-                    simplify_in(r, cx, st, node.a, &p, child_in_add)?,
-                    simplify_in(r, cx, st, node.b, &p, child_in_add)?,
-                ),
+                _ => {
+                    let (pa, pb) = if node.op == OpCode::Mul {
+                        let b = crate::facts::known::count_ones(&p);
+                        match (&ka, &kb) {
+                            (Some(k), None) if !k.is_zero() => {
+                                let tz = crate::facts::known::trailing_zeros(k);
+                                let pm = if tz > 0 && tz < b {
+                                    low_mask(w, b - tz)
+                                } else {
+                                    p
+                                };
+                                (p, pm)
+                            }
+                            (None, Some(k)) if !k.is_zero() => {
+                                let tz = crate::facts::known::trailing_zeros(k);
+                                let pm = if tz > 0 && tz < b {
+                                    low_mask(w, b - tz)
+                                } else {
+                                    p
+                                };
+                                (pm, p)
+                            }
+                            _ => (p, p),
+                        }
+                    } else {
+                        (p, p)
+                    };
+                    (
+                        simplify_in(r, cx, st, node.a, &pa, child_in_add)?,
+                        simplify_in(r, cx, st, node.b, &pb, child_in_add)?,
+                    )
+                }
             };
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
             // a constant addend with none of the demanded bits goes (`63 - ~y`
@@ -995,6 +1156,177 @@ fn stop_at(cx: &Context, st: &mut Demand, x: u32) {
             stack.extend(cx.node(i).children());
         }
     }
+}
+
+/// Unwraps `popcnt(u)` (optionally zero-extended or low-truncated to width `w`), returning `(wid(u), u)`.
+fn popcnt_source_leaf(cx: &Context, t: u32) -> Option<(u16, u32)> {
+    let n = cx.node(t);
+    let inner = match n.op {
+        OpCode::Popcnt => t,
+        OpCode::Zext => n.a,
+        OpCode::Extract if n.b == 0 => n.a,
+        _ => return None,
+    };
+    let pn = cx.node(inner);
+    (pn.op == OpCode::Popcnt).then_some((cx.wid(pn.a), pn.a))
+}
+
+/// Flattens `Xor`/`Add`/`Sub`/`Neg`/`Not` under bit-0 demand (`m == 1`) and folds equal-width
+/// `popcnt` groups via `popcnt(u) + popcnt(v) ≡ popcnt(u ^ v) (mod 2)`.
+fn popcnt_parity_fold(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Demand,
+    x: u32,
+    m: &BitVec,
+) -> Result<Option<u32>, Stop> {
+    let w = m.width();
+    let mut flip = false;
+    let mut pops: Vec<(u16, u32)> = Vec::new();
+    let mut others: Vec<u32> = Vec::new();
+    let mut stack = vec![x];
+    let mut visited = 0usize;
+    while let Some(cur) = stack.pop() {
+        visited += 1;
+        if visited > 32 {
+            return Ok(None);
+        }
+        if let Some(c) = cx.const_val(cur) {
+            flip ^= c.bit(0) == Some(true);
+            continue;
+        }
+        if let Some(src) = popcnt_source_leaf(cx, cur) {
+            pops.push(src);
+            continue;
+        }
+        let cn = cx.node(cur);
+        match cn.op {
+            OpCode::Xor | OpCode::Add | OpCode::Sub => {
+                stack.push(cn.b);
+                stack.push(cn.a);
+            }
+            OpCode::Neg => stack.push(cn.a),
+            OpCode::Not => {
+                flip = !flip;
+                stack.push(cn.a);
+            }
+            _ => others.push(cur),
+        }
+    }
+    if pops.len() < 2 {
+        return Ok(None);
+    }
+    pops.sort_unstable_by_key(|&(uw, _)| uw);
+    // Require at least one source-width group with >= 2 popcnt leaves.
+    let mut any_pair = false;
+    let mut idx = 0;
+    while idx < pops.len() {
+        let uw = pops[idx].0;
+        let end = idx + pops[idx..].partition_point(|&(w2, _)| w2 == uw);
+        if end - idx >= 2 {
+            any_pair = true;
+            break;
+        }
+        idx = end;
+    }
+    if !any_pair {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, visited as u64)?;
+    let mut terms_w: Vec<u32> = Vec::new();
+    let mut idx = 0;
+    while idx < pops.len() {
+        let uw = pops[idx].0;
+        let end = idx + pops[idx..].partition_point(|&(w2, _)| w2 == uw);
+        if end - idx == 1 {
+            let u = pops[idx].1;
+            stop_at(cx, st, u);
+            let t = r.build(cx, |cx| {
+                let p = cx.c_un(UnOp::Popcnt, u)?;
+                match cx.wid(p).cmp(&w.bits()) {
+                    core::cmp::Ordering::Less => cx.c_zext(p, w.bits()),
+                    core::cmp::Ordering::Equal => Ok(p),
+                    core::cmp::Ordering::Greater => cx.c_extract(p, 0, w.bits()),
+                }
+            })?;
+            terms_w.push(t);
+        } else {
+            // Flatten `Xor`/`Not`/`Const` inside each `u` so `(x ^ y) ^ x ^ y` cancels immediately.
+            let mut xor_atoms: Vec<u32> = Vec::new();
+            for &(_, u) in &pops[idx..end] {
+                let mut u_stack = vec![(u, 0u8)];
+                while let Some((uc, d)) = u_stack.pop() {
+                    if let Some(kv) = cx.const_val(uc) {
+                        flip ^= (crate::facts::known::count_ones(&kv) & 1) != 0;
+                        continue;
+                    }
+                    let un = cx.node(uc);
+                    if d < 5 && un.op == OpCode::Xor {
+                        u_stack.push((un.b, d + 1));
+                        u_stack.push((un.a, d + 1));
+                    } else if d < 5 && un.op == OpCode::Not {
+                        flip ^= (uw & 1) != 0;
+                        u_stack.push((un.a, d + 1));
+                    } else {
+                        xor_atoms.push(uc);
+                    }
+                }
+            }
+            xor_atoms.sort_by(|&a, &b| cx.order(a, b));
+            let mut deduped: Vec<u32> = Vec::with_capacity(xor_atoms.len());
+            let mut j = 0;
+            while j < xor_atoms.len() {
+                if j + 1 < xor_atoms.len() && xor_atoms[j] == xor_atoms[j + 1] {
+                    j += 2;
+                } else {
+                    deduped.push(xor_atoms[j]);
+                    j += 1;
+                }
+            }
+            if !deduped.is_empty() {
+                for &a in &deduped {
+                    stop_at(cx, st, a);
+                }
+                let t = r.build(cx, |cx| {
+                    let mut u_acc = deduped[0];
+                    for &a in &deduped[1..] {
+                        u_acc = cx.c_bin(BinOp::Xor, u_acc, a)?;
+                    }
+                    let p = cx.c_un(UnOp::Popcnt, u_acc)?;
+                    match cx.wid(p).cmp(&w.bits()) {
+                        core::cmp::Ordering::Less => cx.c_zext(p, w.bits()),
+                        core::cmp::Ordering::Equal => Ok(p),
+                        core::cmp::Ordering::Greater => cx.c_extract(p, 0, w.bits()),
+                    }
+                })?;
+                terms_w.push(t);
+            }
+        }
+        idx = end;
+    }
+    for o in others {
+        terms_w.push(simplify(r, cx, st, o, m)?);
+    }
+    let out = r.build(cx, |cx| {
+        if terms_w.is_empty() {
+            let v = if flip {
+                BitVec::one(w)
+            } else {
+                BitVec::zero(w)
+            };
+            return cx.mk_const(&v);
+        }
+        let mut acc = terms_w[0];
+        for &t in &terms_w[1..] {
+            acc = cx.c_bin(BinOp::Xor, acc, t)?;
+        }
+        if flip {
+            let one = cx.mk_const(&BitVec::one(w))?;
+            acc = cx.c_bin(BinOp::Xor, acc, one)?;
+        }
+        Ok(acc)
+    })?;
+    Ok(Some(out))
 }
 
 /// `x` on the bits of `m` from its linear form with the conditions its terms read merged, the

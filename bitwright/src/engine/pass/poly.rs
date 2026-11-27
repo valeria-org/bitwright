@@ -1,10 +1,10 @@
-//! Polynomial equality (called by the compares pass and sweep relation checks): two sides built
-//! from `+ − * neg ~`, left shifts by constants, bitwise OR with constants (`x | c = (x & ~c) + c`),
-//! low truncations/zero-extensions, and constants over a few leaves are expanded into sums of
-//! monomials with coefficients modulo `2^W`; equal polynomials are equal functions, so `a == b` is
-//! true (and `a != b` false). `(x + y)·(x − y) == x·x − y·y` and the sum of cubes are decided this
-//! way. Different polynomials may still be equal functions (`2^(W−1)·(x² + x)` is 0), which this
-//! leaves undecided.
+//! Polynomial equality and vanishing-ideal canonicalization (called by the compares pass, sweep
+//! relation checks, and whole-DAG polynomial canonicalization): expressions built from `+ − * neg ~`,
+//! left shifts by constants, bitwise OR/XOR with constants, slices, extensions, and shuffles over a
+//! few leaves are expanded into sums of monomials modulo `2^W` and reduced modulo the 2-adic
+//! Smarandache–Kempner–Carlitz falling-factorial null ideal (`2^(W − Σ(eᵢ·tzᵢ + v₂(eᵢ!))) · Π (xᵢ)_{eᵢ,2^{tzᵢ}} ≡ 0`).
+//! Equal polynomial functions over `Z/2^W` (including vanishing polynomials such as `2^(W−1)·(x² + x)`
+//! and `2^(W−3)·x(x−1)(x−2)(x−3)`) reduce to identical normal forms across widths `1..=512`.
 
 use super::{Runner, Stop};
 use crate::engine::budget::Counter;
@@ -123,41 +123,161 @@ fn leaf_tz(cx: &Context, mod_w: Width, key: &LeafKey) -> u32 {
     }
 }
 
-/// Canonical 2-adic quotient: when monomial `M = prod_i leaf_i^{e_i}` has guaranteed valuation
-/// `V = sum_i e_i * tz(leaf_i) > 0`, only `coef mod 2^{max(0, bits - V)}` affects `coef * M (mod 2^bits)`.
+/// Signed Stirling numbers of the first kind `s(e, j)` for `0 <= e, j <= MAX_DEGREE` (`6`),
+/// satisfying `(u)_e = u(u - 1)...(u - e + 1) = Σ_{j=1}^e s(e, j) · u^j`.
+const STIRLING1: [[i64; 7]; 7] = [
+    [1, 0, 0, 0, 0, 0, 0],
+    [0, 1, 0, 0, 0, 0, 0],
+    [0, -1, 1, 0, 0, 0, 0],
+    [0, 2, -3, 1, 0, 0, 0],
+    [0, -6, 11, -6, 1, 0, 0],
+    [0, 24, -50, 35, -10, 1, 0],
+    [0, -120, 274, -225, 85, -15, 1],
+];
+
+/// 2-adic valuation `v_2(e!)` for `0 <= e <= MAX_DEGREE` (`6`).
+const V2_FACT: [u32; 7] = [0, 0, 1, 1, 3, 3, 4];
+
+/// Canonical 2-adic & falling-factorial null-ideal reduction over `Z/2^bits`:
+/// For each leaf `x_i = 2^{t_i} · u_i` (`t_i = tz(leaf_i)`), the `2^{t_i}`-stepped falling
+/// factorial `Π_{r=0}^{e_i - 1} (x_i - r·2^{t_i}) = 2^{e_i·t_i} · (u_i)_{e_i}` has guaranteed
+/// 2-adic valuation `e_i·t_i + v_2(e_i!)`. Reducing from highest total degree down brings every
+/// coefficient into `[0, 2^{max(0, bits - Σ_i (e_i·t_i + v_2(e_i!)))})`, pushing high-bit
+/// multiples into lower-degree monomials via `STIRLING1`.
 fn reduce_2adic(cx: &Context, tables: &LeafTables, mod_w: Width, p: &mut Poly) {
     if p.is_empty() {
         return;
     }
     let bits = u32::from(mod_w.bits());
-    let Some((_, keys)) = tables.by_width.iter().find(|(w, _)| *w == mod_w.bits()) else {
-        return;
-    };
     let mut tzs = [0u32; MAX_LEAVES];
     let mut any_tz = false;
-    for (i, k) in keys.iter().enumerate() {
-        let tz = leaf_tz(cx, mod_w, k);
-        tzs[i] = tz;
-        any_tz |= tz > 0;
+    if let Some((_, keys)) = tables.by_width.iter().find(|(w, _)| *w == mod_w.bits()) {
+        for (i, k) in keys.iter().enumerate() {
+            let tz = leaf_tz(cx, mod_w, k);
+            tzs[i] = tz;
+            any_tz |= tz > 0;
+        }
     }
-    if !any_tz {
+    let any_higher = p.iter().any(|(m, _)| m.iter().any(|&e| e >= 2));
+    if !any_tz && !any_higher {
         return;
     }
-    for (m, c) in p.iter_mut() {
-        let mut v = 0u32;
-        for (i, &e) in m.iter().enumerate() {
-            if e != 0 {
-                v = v.saturating_add(u32::from(e).saturating_mul(tzs[i]));
+    let mono_deg = |m: &Mono| -> u32 { m.iter().map(|&e| u32::from(e)).sum() };
+    let top_deg = p.iter().map(|(m, _)| mono_deg(m)).max().unwrap_or(0);
+    let mut moves: Vec<(Vec<(usize, u8)>, BitVec)> = Vec::new();
+
+    for d in (1..=top_deg).rev() {
+        let cur_len = p.len();
+        for (m, c) in p.iter_mut() {
+            if c.is_zero() || mono_deg(m) != d {
+                continue;
+            }
+            let mut tau = 0u32;
+            let mut v_fact = 0u32;
+            for (i, &e) in m.iter().enumerate() {
+                if e != 0 {
+                    tau = tau.saturating_add(u32::from(e).saturating_mul(tzs[i]));
+                    v_fact = v_fact.saturating_add(V2_FACT[usize::from(e)]);
+                }
+            }
+            if tau >= bits {
+                *c = BitVec::zero(mod_w);
+                continue;
+            }
+            let m1 = bits - tau;
+            let c1 = if m1 < bits {
+                crate::facts::known::bv_and(c, &crate::facts::known::low_mask(mod_w, m1))
+            } else {
+                *c
+            };
+            if v_fact == 0 || c1.is_zero() {
+                *c = c1;
+                continue;
+            }
+            let m2 = m1.saturating_sub(v_fact);
+            let r = if m2 == 0 {
+                BitVec::zero(mod_w)
+            } else {
+                crate::facts::known::bv_and(&c1, &crate::facts::known::low_mask(mod_w, m2))
+            };
+            let moved = BitVec::bin_unchecked(BinOp::Sub, &c1, &r);
+            if moved.is_zero() {
+                *c = r;
+                continue;
+            }
+            let active: Vec<(usize, u8)> = m
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|&(_, e)| e > 0)
+                .collect();
+            let combos = active
+                .iter()
+                .fold(1usize, |acc, &(_, e)| acc.saturating_mul(usize::from(e)));
+            if combos <= 64 && cur_len.saturating_add(combos) <= MAX_TERMS * 2 {
+                *c = r;
+                moves.push((active, moved));
+            } else {
+                *c = c1;
             }
         }
-        if v >= bits {
-            *c = BitVec::zero(mod_w);
-        } else if v > 0 {
-            let keep = crate::facts::known::low_mask(mod_w, bits - v);
-            *c = crate::facts::known::bv_and(c, &keep);
+        p.retain(|(_, c)| !c.is_zero());
+
+        for (active, moved) in moves.drain(..) {
+            let neg_moved = BitVec::un_unchecked(crate::UnOp::Neg, &moved);
+            let mut idx: Vec<u8> = vec![1; active.len()];
+            loop {
+                let is_top = idx.iter().zip(&active).all(|(&j, &(_, e))| j == e);
+                if !is_top {
+                    let mut coef = neg_moved;
+                    let mut mono = [0u8; MAX_LEAVES];
+                    let mut vanished = false;
+                    for (k, &(leaf_i, e_k)) in active.iter().enumerate() {
+                        let j_k = idx[k];
+                        mono[leaf_i] = j_k;
+                        let sh = u32::from(e_k - j_k).saturating_mul(tzs[leaf_i]);
+                        if sh >= bits {
+                            vanished = true;
+                            break;
+                        }
+                        let st_bv = BitVec::wrapping_from_i128(
+                            mod_w,
+                            i128::from(STIRLING1[usize::from(e_k)][usize::from(j_k)]),
+                        );
+                        coef = BitVec::bin_unchecked(BinOp::Mul, &coef, &st_bv);
+                        if sh > 0 {
+                            coef = crate::facts::known::bv_shl(&coef, sh);
+                        }
+                        if coef.is_zero() {
+                            vanished = true;
+                            break;
+                        }
+                    }
+                    if !vanished && !coef.is_zero() {
+                        match p.binary_search_by(|(k, _)| k.cmp(&mono)) {
+                            Ok(pos) => {
+                                p[pos].1 = BitVec::bin_unchecked(BinOp::Add, &p[pos].1, &coef);
+                            }
+                            Err(pos) => p.insert(pos, (mono, coef)),
+                        }
+                    }
+                }
+                let mut k = 0;
+                while k < idx.len() {
+                    if idx[k] < active[k].1 {
+                        idx[k] += 1;
+                        break;
+                    }
+                    idx[k] = 1;
+                    k += 1;
+                }
+                if k == idx.len() {
+                    break;
+                }
+            }
+            p.retain(|(_, c)| !c.is_zero());
         }
     }
-    p.retain(|(_, c)| !c.is_zero());
 }
 
 fn add(a: &Poly, b: &Poly, sub: bool) -> Poly {
@@ -322,24 +442,64 @@ fn guaranteed_ones_bv(cx: &Context, x: u32, depth: u8) -> BitVec {
     }
 }
 
-fn is_self_leaf(tables: &LeafTables, mod_bits: u16, p: &Poly, id: u32) -> bool {
+fn single_node_leaf(cx: &Context, tables: &LeafTables, mod_bits: u16, p: &Poly) -> Option<u32> {
     if p.len() != 1 || p[0].1 != BitVec::one(p[0].1.width()) {
-        return false;
+        return None;
     }
-    let Some((_, keys)) = tables.by_width.iter().find(|(w, _)| *w == mod_bits) else {
-        return false;
-    };
+    let (_, keys) = tables.by_width.iter().find(|(w, _)| *w == mod_bits)?;
     let mut active = None;
     for (idx, &exp) in p[0].0.iter().enumerate() {
         if exp == 1 && active.is_none() {
             active = Some(idx);
         } else if exp != 0 {
-            return false;
+            return None;
         }
     }
-    active
-        .and_then(|idx| keys.get(idx))
-        .is_some_and(|k| matches!(*k, LeafKey::Node(n) if n == id))
+    match keys.get(active?)? {
+        LeafKey::Node(id) if cx.wid(*id) == mod_bits => Some(*id),
+        _ => None,
+    }
+}
+
+/// Evaluates `x` modulo `2^bits` in the canonical falling-factorial polynomial ring when `x`
+/// collapses to a constant or to a single existing DAG node leaf (`2^63·(x² + x) + y -> y`).
+pub(super) fn fold_vanishing(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    x: u32,
+    bits: u16,
+) -> Result<Option<u32>, Stop> {
+    let w_full = cx.wid(x);
+    if bits == 0 || bits > w_full {
+        return Ok(None);
+    }
+    let Ok(mod_w) = Width::new(bits) else {
+        return Ok(None);
+    };
+    let mut tables = LeafTables::default();
+    let mut memo = IdMap::default();
+    let mut steps = 0u32;
+    let p_opt = poly_of(cx, x, mod_w, &mut tables, &mut memo, &mut steps);
+    r.meter.charge(Counter::PassWork, u64::from(steps))?;
+    let Some(p) = p_opt else {
+        return Ok(None);
+    };
+    let out_w = cx.width_of(x);
+    if p.is_empty() {
+        let zv = BitVec::zero(out_w);
+        return r.build(cx, |cx| cx.mk_const(&zv)).map(Some);
+    }
+    if p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
+        let kv = resize_bv(&p[0].1, out_w);
+        return r.build(cx, |cx| cx.mk_const(&kv)).map(Some);
+    }
+    if bits == w_full
+        && let Some(leaf_id) = single_node_leaf(cx, &tables, bits, &p)
+        && leaf_id != x
+    {
+        return Ok(Some(leaf_id));
+    }
+    Ok(None)
 }
 
 fn lift_sub_poly(sub: Poly, sub_bits: u16, mod_w: Width, tables: &mut LeafTables) -> Option<Poly> {
@@ -385,9 +545,42 @@ fn slice_poly(
         )
         && let Ok(sub_w) = Width::new(len)
         && let Some(sub) = poly_of(cx, src, sub_w, tables, memo, steps)
-        && !is_self_leaf(tables, len, &sub, src)
+        && single_node_leaf(cx, tables, len, &sub) != Some(src)
     {
         return lift_sub_poly(sub, len, mod_w, tables);
+    }
+    if lo > 0
+        && lo + len <= src_w
+        && matches!(cx.node(src).op, OpCode::Add | OpCode::Sub)
+        && let Ok(sub_w) = Width::new(len)
+    {
+        let sn = cx.node(src);
+        let src_wt = cx.width_of(src);
+        let low_lo = crate::facts::known::low_mask(src_wt, u32::from(lo));
+        let no_carry = if sn.op == OpCode::Add {
+            let ma = possible_ones_bv(cx, sn.a, 4);
+            let mb = possible_ones_bv(cx, sn.b, 4);
+            crate::facts::known::bv_and(&crate::facts::known::bv_and(&ma, &mb), &low_lo).is_zero()
+        } else {
+            let ga = guaranteed_ones_bv(cx, sn.a, 4);
+            let mb = possible_ones_bv(cx, sn.b, 4);
+            crate::facts::known::bv_and(
+                &crate::facts::known::bv_and(&mb, &crate::facts::known::bv_not(&ga)),
+                &low_lo,
+            )
+            .is_zero()
+        };
+        if no_carry
+            && let (Some(pa), Some(pb)) = (
+                slice_poly(cx, sn.a, lo, len, sub_w, tables, memo, steps),
+                slice_poly(cx, sn.b, lo, len, sub_w, tables, memo, steps),
+            )
+        {
+            let comb = add(&pa, &pb, sn.op == OpCode::Sub);
+            if comb.len() <= MAX_TERMS {
+                return lift_sub_poly(comb, len, mod_w, tables);
+            }
+        }
     }
     if lo == 0 && len == bits && src_w == bits {
         return leaf_poly(tables, mod_w, LeafKey::Node(src));
@@ -1206,7 +1399,7 @@ pub(super) fn canonicalize_dag(
     root: u32,
     order: &[u32],
 ) -> Result<Option<u32>, Stop> {
-    if !(16..=2048).contains(&order.len()) {
+    if !(4..=2048).contains(&order.len()) {
         return Ok(None);
     }
     let budget = r.meter.left_in(|b| b.pass_work) / 8;
@@ -1303,6 +1496,13 @@ pub(super) fn canonicalize_dag(
                 } else if poly_cone && p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
                     let kv = p[0].1;
                     cur = r.build(cx, |cx| cx.mk_const(&kv))?;
+                    merged_any = true;
+                } else if poly_cone
+                    && let Some(leaf_id) = single_node_leaf(cx, &tables, w, &p)
+                    && leaf_id != cur
+                    && live_nodes.contains_key(&leaf_id)
+                {
+                    cur = leaf_id;
                     merged_any = true;
                 } else {
                     let h = poly_hash(w, &p);

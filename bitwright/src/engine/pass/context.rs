@@ -45,6 +45,7 @@ enum RelOp {
     Xor(BitVec),
     Add(BitVec),
     SubFrom(BitVec),
+    Affine { mul: BitVec, add: BitVec },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,12 +265,25 @@ pub(crate) fn extract_slice_congruence(cx: &Context, lhs: u32, rhs: u32) -> Slic
     }
 }
 
-/// Unwrap simple full-width affine/complement wrappers around a single variable:
-/// `x == base * (±1) + offset` (`negated = true` means `offset - base`).
-fn peel_affine_side(cx: &Context, mut id: u32) -> (u32, bool, BitVec) {
+/// Exact modular inverse of an odd `BitVec` across `1..=512` bits via Newton-Raphson.
+fn odd_inv(a: &BitVec) -> BitVec {
+    let w = a.width();
+    let two = BitVec::wrapping_from_u64(w, 2);
+    let mut inv = *a;
+    for _ in 0..8 {
+        let prod = BitVec::bin_unchecked(BinOp::Mul, a, &inv);
+        let factor = BitVec::bin_unchecked(BinOp::Sub, &two, &prod);
+        inv = BitVec::bin_unchecked(BinOp::Mul, &inv, &factor);
+    }
+    inv
+}
+
+/// Unwrap full-width odd-affine/complement wrappers around a single variable:
+/// `orig == base * scale + bias (mod 2^W)` with `scale` odd.
+fn peel_affine_side(cx: &Context, mut id: u32) -> (u32, BitVec, BitVec) {
     let w = cx.width_of(id);
-    let mut neg = false;
-    let mut off = BitVec::zero(w);
+    let mut scale = BitVec::one(w);
+    let mut bias = BitVec::zero(w);
     for _ in 0..6 {
         if cx.is_const(id) {
             break;
@@ -278,62 +292,108 @@ fn peel_affine_side(cx: &Context, mut id: u32) -> (u32, bool, BitVec) {
         match n.op {
             OpCode::Add => match (cx.const_val(n.a), cx.const_val(n.b)) {
                 (None, Some(k)) => {
-                    off = if neg {
-                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
-                    } else {
-                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
-                    };
+                    let ks = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                    bias = BitVec::bin_unchecked(BinOp::Add, &bias, &ks);
                     id = n.a;
                 }
                 (Some(k), None) => {
-                    off = if neg {
-                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
-                    } else {
-                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
-                    };
+                    let ks = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                    bias = BitVec::bin_unchecked(BinOp::Add, &bias, &ks);
                     id = n.b;
                 }
                 _ => break,
             },
             OpCode::Sub => match (cx.const_val(n.a), cx.const_val(n.b)) {
                 (None, Some(k)) => {
-                    off = if neg {
-                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
-                    } else {
-                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
-                    };
+                    let ks = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                    bias = BitVec::bin_unchecked(BinOp::Sub, &bias, &ks);
                     id = n.a;
                 }
                 (Some(k), None) => {
-                    off = if neg {
-                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
-                    } else {
-                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
-                    };
-                    neg = !neg;
+                    let ks = BitVec::bin_unchecked(BinOp::Mul, &k, &scale);
+                    bias = BitVec::bin_unchecked(BinOp::Add, &bias, &ks);
+                    scale = BitVec::un_unchecked(UnOp::Neg, &scale);
                     id = n.b;
                 }
                 _ => break,
             },
             OpCode::Neg => {
-                neg = !neg;
+                scale = BitVec::un_unchecked(UnOp::Neg, &scale);
                 id = n.a;
             }
             OpCode::Not => {
-                // `~u == -1 - u`
-                let minus_one = BitVec::ones(w);
-                off = if neg {
-                    BitVec::bin_unchecked(BinOp::Sub, &off, &minus_one)
-                } else {
-                    BitVec::bin_unchecked(BinOp::Add, &off, &minus_one)
-                };
-                neg = !neg;
+                // `~u == -1 - u => (-1 - u) * scale + bias = u * (-scale) + (bias - scale)`
+                bias = BitVec::bin_unchecked(BinOp::Sub, &bias, &scale);
+                scale = BitVec::un_unchecked(UnOp::Neg, &scale);
                 id = n.a;
             }
+            OpCode::Mul => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) if k.bit(0) == Some(true) => {
+                    scale = BitVec::bin_unchecked(BinOp::Mul, &scale, &k);
+                    id = n.a;
+                }
+                (Some(k), None) if k.bit(0) == Some(true) => {
+                    scale = BitVec::bin_unchecked(BinOp::Mul, &scale, &k);
+                    id = n.b;
+                }
+                _ => break,
+            },
             _ => break,
         }
     }
-    (id, neg, off)
+    (id, scale, bias)
+}
+
+fn solve_affine_eq(
+    cx: &Context,
+    (bx, sx, ox): (u32, BitVec, BitVec),
+    (by, sy, oy): (u32, BitVec, BitVec),
+    out: &mut GuardFacts,
+) {
+    if cx.is_const(bx) || cx.is_const(by) {
+        return;
+    }
+    if bx == by {
+        let ds = BitVec::bin_unchecked(BinOp::Sub, &sx, &sy);
+        let doff = BitVec::bin_unchecked(BinOp::Sub, &oy, &ox);
+        if ds.is_zero() {
+            if !doff.is_zero() {
+                out.conflict = true;
+            }
+        } else {
+            let tz_s = crate::facts::known::trailing_zeros(&ds);
+            if !doff.is_zero() && crate::facts::known::trailing_zeros(&doff) < tz_s {
+                out.conflict = true;
+            } else if tz_s == 0 {
+                let w = ds.width();
+                let val = BitVec::bin_unchecked(BinOp::Mul, &doff, &odd_inv(&ds));
+                masked(cx, bx, BitVec::ones(w), val, out, 1);
+            }
+        }
+        return;
+    }
+    let (lo, hi) = orient_pair(cx, bx, by);
+    let (s_lo, o_lo, s_hi, o_hi) = if lo == bx {
+        (sx, ox, sy, oy)
+    } else {
+        (sy, oy, sx, ox)
+    };
+    let inv_hi = odd_inv(&s_hi);
+    let mul = BitVec::bin_unchecked(BinOp::Mul, &s_lo, &inv_hi);
+    let diff = BitVec::bin_unchecked(BinOp::Sub, &o_lo, &o_hi);
+    let add = BitVec::bin_unchecked(BinOp::Mul, &diff, &inv_hi);
+    let op = if mul == BitVec::one(mul.width()) {
+        if add.is_zero() {
+            RelOp::Equal
+        } else {
+            RelOp::Add(add)
+        }
+    } else if mul.width().bits() > 1 && mul.is_ones() {
+        RelOp::SubFrom(add)
+    } else {
+        RelOp::Affine { mul, add }
+    };
+    out.rels.push(RelFact::Full { hi, lo, op });
 }
 
 /// The most conditions [`push`] reads facts from in one root.
@@ -354,6 +414,19 @@ fn fixes(cx: &Context, c: u32, want: bool, out: &mut GuardFacts, depth: u32) {
         OpCode::Or if !want => {
             fixes(cx, n.a, false, out, depth + 1);
             fixes(cx, n.b, false, out, depth + 1);
+        }
+        OpCode::Extract => {
+            out.bits.push(Fact {
+                x: c,
+                mask: BitVec::one(Width::W1),
+                value: BitVec::from_bool(want),
+            });
+            let src_w = cx.width_of(n.a);
+            if n.b < u32::from(src_w.bits()) {
+                let m = bv_shl(&BitVec::one(src_w), n.b);
+                let v = if want { m } else { BitVec::zero(src_w) };
+                masked(cx, n.a, m, v, out, depth + 1);
+            }
         }
         OpCode::Eq | OpCode::Ne => {
             out.bits.push(Fact {
@@ -447,61 +520,14 @@ fn extract_relational_eq(cx: &Context, lhs: u32, rhs: u32, out: &mut GuardFacts)
         SliceCheck::None => {}
     }
 
-    // 2. Check full-width affine relation (`x + k1 == y + k2`, `x - y == k`, `x + y == k`).
-    let (bx, nx, ox) = peel_affine_side(cx, eq_pair.0);
-    let (by, ny, oy) = peel_affine_side(cx, eq_pair.1);
-    if (bx, by) == eq_pair && !nx && !ny && ox.is_zero() && oy.is_zero() {
+    // 2. Check full-width odd-affine relation (`a * x + k1 == b * y + k2`, `x - y == k`, `x + y == k`).
+    let (bx, sx, ox) = peel_affine_side(cx, eq_pair.0);
+    let (by, sy, oy) = peel_affine_side(cx, eq_pair.1);
+    let one_w = BitVec::one(sx.width());
+    if (bx, by) == eq_pair && sx == one_w && sy == one_w && ox.is_zero() && oy.is_zero() {
         return;
     }
-    if cx.is_const(bx) || cx.is_const(by) {
-        // E.g. `(x - y) == 0` peeled? No, `lhs` and `rhs` had no top-level const, unless `(x + k) == k2`.
-        return;
-    }
-    if bx == by {
-        if nx == ny && ox != oy {
-            out.conflict = true;
-        }
-        return;
-    }
-    let (lo, hi) = orient_pair(cx, bx, by);
-    let (n_lo, o_lo, n_hi, o_hi) = if lo == bx {
-        (nx, ox, ny, oy)
-    } else {
-        (ny, oy, nx, ox)
-    };
-    // Solve `(-1)^{n_hi} * hi + o_hi == (-1)^{n_lo} * lo + o_lo` for `hi`:
-    if n_hi == n_lo {
-        // If `n_hi == false`: `hi = lo + (o_lo - o_hi)`.
-        // If `n_hi == true`: `-hi + o_hi = -lo + o_lo => hi = lo + (o_hi - o_lo)`.
-        let delta = if !n_hi {
-            BitVec::bin_unchecked(BinOp::Sub, &o_lo, &o_hi)
-        } else {
-            BitVec::bin_unchecked(BinOp::Sub, &o_hi, &o_lo)
-        };
-        out.rels.push(RelFact::Full {
-            hi,
-            lo,
-            op: if delta.is_zero() {
-                RelOp::Equal
-            } else {
-                RelOp::Add(delta)
-            },
-        });
-    } else {
-        // Opposite signs:
-        // If `n_hi == false, n_lo == true`: `hi + o_hi = -lo + o_lo => hi = (o_lo - o_hi) - lo`.
-        // If `n_hi == true, n_lo == false`: `-hi + o_hi = lo + o_lo => hi = (o_hi - o_lo) - lo`.
-        let sum_k = if !n_hi {
-            BitVec::bin_unchecked(BinOp::Sub, &o_lo, &o_hi)
-        } else {
-            BitVec::bin_unchecked(BinOp::Sub, &o_hi, &o_lo)
-        };
-        out.rels.push(RelFact::Full {
-            hi,
-            lo,
-            op: RelOp::SubFrom(sum_k),
-        });
-    }
+    solve_affine_eq(cx, (bx, sx, ox), (by, sy, oy), out);
 
     // Also record direct equality of the raw comparison operands `(lhs, rhs)` when distinct from `(bx, by)`.
     if (lhs, rhs) != (bx, by) && (rhs, lhs) != (bx, by) {
@@ -659,7 +685,13 @@ fn masked(cx: &Context, x: u32, mask: BitVec, value: BitVec, out: &mut GuardFact
                         depth + 1,
                     );
                 }
-                // `(a - b) + k == value` when `value == k` means `a == b`!
+                (None, None) => {
+                    let (bx, sx, ox) = peel_affine_side(cx, n.a);
+                    let (by, sy, oy) = peel_affine_side(cx, n.b);
+                    let neg_sy = BitVec::un_unchecked(UnOp::Neg, &sy);
+                    let val_minus_oy = BitVec::bin_unchecked(BinOp::Sub, &value, &oy);
+                    solve_affine_eq(cx, (bx, sx, ox), (by, neg_sy, val_minus_oy), out);
+                }
                 _ => {}
             },
             OpCode::Sub if mask.is_ones() => match (cx.const_val(n.a), cx.const_val(n.b)) {
@@ -687,13 +719,75 @@ fn masked(cx: &Context, x: u32, mask: BitVec, value: BitVec, out: &mut GuardFact
                     extract_relational_eq(cx, n.a, n.b, out);
                     return;
                 }
+                (None, None) => {
+                    let (bx, sx, ox) = peel_affine_side(cx, n.a);
+                    let (by, sy, oy) = peel_affine_side(cx, n.b);
+                    let oy_plus_val = BitVec::bin_unchecked(BinOp::Add, &oy, &value);
+                    solve_affine_eq(cx, (bx, sx, ox), (by, sy, oy_plus_val), out);
+                }
                 _ => {}
             },
+            OpCode::Mul if mask.is_ones() => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) if k.bit(0) == Some(true) => {
+                    return masked(
+                        cx,
+                        n.a,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Mul, &value, &odd_inv(&k)),
+                        out,
+                        depth + 1,
+                    );
+                }
+                (Some(k), None) if k.bit(0) == Some(true) => {
+                    return masked(
+                        cx,
+                        n.b,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Mul, &value, &odd_inv(&k)),
+                        out,
+                        depth + 1,
+                    );
+                }
+                _ => {}
+            },
+            OpCode::Pdep => {
+                if let Some(m) = cx.const_val(n.b) {
+                    if !bv_and(&value, &bv_and(&mask, &bv_not(&m))).is_zero() {
+                        out.conflict = true;
+                        return;
+                    }
+                    let pm = BitVec::bin_unchecked(BinOp::Pext, &mask, &m);
+                    let pv = BitVec::bin_unchecked(BinOp::Pext, &value, &m);
+                    return masked(cx, n.a, pm, pv, out, depth + 1);
+                }
+            }
+            OpCode::Pext => {
+                if let Some(m) = cx.const_val(n.b) {
+                    let hi_zeros = bv_not(&low_mask(mask.width(), count_ones(&m)));
+                    if !bv_and(&value, &bv_and(&mask, &hi_zeros)).is_zero() {
+                        out.conflict = true;
+                        return;
+                    }
+                    let pm = BitVec::bin_unchecked(BinOp::Pdep, &mask, &m);
+                    let pv = BitVec::bin_unchecked(BinOp::Pdep, &value, &m);
+                    return masked(cx, n.a, pm, pv, out, depth + 1);
+                }
+            }
             _ => {}
         }
-        if mask.is_ones() && n.op == OpCode::Xor && value.is_zero() {
-            extract_relational_eq(cx, n.a, n.b, out);
-            return;
+        if mask.is_ones() && n.op == OpCode::Xor {
+            if value.is_zero() {
+                extract_relational_eq(cx, n.a, n.b, out);
+                return;
+            }
+            if !cx.is_const(n.a) && !cx.is_const(n.b) && n.a != n.b {
+                let (lo, hi) = orient_pair(cx, n.a, n.b);
+                out.rels.push(RelFact::Full {
+                    hi,
+                    lo,
+                    op: RelOp::Xor(value),
+                });
+            }
         }
     }
     out.bits.push(Fact { x, mask, value });
@@ -717,12 +811,12 @@ fn simplify_rebuilt(cx: &mut Context, id: u32) -> Result<u32, Error> {
     let nd = cx.node(id);
     match nd.op {
         OpCode::Add | OpCode::Sub => {
-            let (bx, nx, ox) = peel_affine_side(cx, nd.a);
-            let (by, ny, oy) = peel_affine_side(cx, nd.b);
+            let (bx, sx, ox) = peel_affine_side(cx, nd.a);
+            let (by, sy, oy) = peel_affine_side(cx, nd.b);
             let cancels = if nd.op == OpCode::Sub {
-                bx == by && nx == ny
+                bx == by && sx == sy
             } else {
-                bx == by && nx != ny
+                bx == by && BitVec::bin_unchecked(BinOp::Add, &sx, &sy).is_zero()
             };
             if cancels {
                 let val = if nd.op == OpCode::Sub {
@@ -732,22 +826,28 @@ fn simplify_rebuilt(cx: &mut Context, id: u32) -> Result<u32, Error> {
                 };
                 return cx.mk_const(&val);
             }
-            let (b, neg, off) = peel_affine_side(cx, id);
+            let (b, scale, off) = peel_affine_side(cx, id);
             if b != id && !cx.is_const(b) {
-                let cand = if !neg {
-                    if off.is_zero() {
+                let cand_opt = if scale == BitVec::one(scale.width()) {
+                    Some(if off.is_zero() {
                         b
                     } else {
                         let kc = cx.mk_const(&off)?;
                         cx.c_bin(BinOp::Add, b, kc)?
-                    }
-                } else if off.is_zero() {
-                    cx.c_un(UnOp::Neg, b)?
+                    })
+                } else if scale.width().bits() > 1 && scale.is_ones() {
+                    Some(if off.is_zero() {
+                        cx.c_un(UnOp::Neg, b)?
+                    } else {
+                        let kc = cx.mk_const(&off)?;
+                        cx.c_bin(BinOp::Sub, kc, b)?
+                    })
                 } else {
-                    let kc = cx.mk_const(&off)?;
-                    cx.c_bin(BinOp::Sub, kc, b)?
+                    None
                 };
-                if cx.meta[cand as usize].tree < cx.meta[id as usize].tree {
+                if let Some(cand) = cand_opt
+                    && cx.meta[cand as usize].tree < cx.meta[id as usize].tree
+                {
                     return Ok(cand);
                 }
             }
@@ -803,9 +903,9 @@ fn simplify_rebuilt(cx: &mut Context, id: u32) -> Result<u32, Error> {
             }
         }
         OpCode::Eq | OpCode::Ne => {
-            let (bx, nx, ox) = peel_affine_side(cx, nd.a);
-            let (by, ny, oy) = peel_affine_side(cx, nd.b);
-            if bx == by && nx == ny {
+            let (bx, sx, ox) = peel_affine_side(cx, nd.a);
+            let (by, sy, oy) = peel_affine_side(cx, nd.b);
+            if bx == by && sx == sy {
                 let eq = ox == oy;
                 let res = if nd.op == OpCode::Eq { eq } else { !eq };
                 return cx.mk_const_u64(1, u64::from(res));
@@ -837,6 +937,15 @@ fn merge_bit_facts(facts: &[Fact]) -> Result<Vec<Fact>, ()> {
 
 /// `e` with each node `gf` fixes bits or relations of specialized soundly.
 fn put(cx: &mut Context, e: u32, gf: &GuardFacts) -> Result<u32, Error> {
+    put_with(cx, e, gf, false)
+}
+
+fn put_with(
+    cx: &mut Context,
+    e: u32,
+    gf: &GuardFacts,
+    allow_unseen_lo: bool,
+) -> Result<u32, Error> {
     if gf.conflict || gf.is_empty() {
         return Ok(e);
     }
@@ -895,25 +1004,38 @@ fn put(cx: &mut Context, e: u32, gf: &GuardFacts) -> Result<u32, Error> {
                     RelOp::Equal => *lo,
                     RelOp::Xor(c) if c.is_ones() => cx.c_un(UnOp::Not, *lo)?,
                     RelOp::Xor(c) => {
-                        if !in_cone.contains_key(lo) {
+                        if !allow_unseen_lo && !in_cone.contains_key(lo) {
                             continue;
                         }
                         let kc = cx.mk_const(c)?;
                         cx.c_bin(BinOp::Xor, *lo, kc)?
                     }
                     RelOp::Add(c) => {
-                        if !in_cone.contains_key(lo) {
+                        if !allow_unseen_lo && !in_cone.contains_key(lo) {
                             continue;
                         }
                         let kc = cx.mk_const(c)?;
                         cx.c_bin(BinOp::Add, *lo, kc)?
                     }
                     RelOp::SubFrom(c) => {
-                        if !in_cone.contains_key(lo) {
+                        if !allow_unseen_lo && !in_cone.contains_key(lo) {
                             continue;
                         }
                         let kc = cx.mk_const(c)?;
                         cx.c_bin(BinOp::Sub, kc, *lo)?
+                    }
+                    RelOp::Affine { mul, add } => {
+                        if !allow_unseen_lo && !in_cone.contains_key(lo) {
+                            continue;
+                        }
+                        let mc = cx.mk_const(mul)?;
+                        let p = cx.c_bin(BinOp::Mul, *lo, mc)?;
+                        if add.is_zero() {
+                            p
+                        } else {
+                            let ac = cx.mk_const(add)?;
+                            cx.c_bin(BinOp::Add, p, ac)?
+                        }
                     }
                 };
                 repl.insert(*hi, r);
@@ -1012,6 +1134,28 @@ pub(super) fn specialize_arm(
         return Ok(arm);
     }
     put(cx, arm, &gf)
+}
+
+/// Specialize both `(t, f)` assuming `cond == want` (substituting relational representatives even
+/// when `lo` was absent from one arm) to test whether `t` and `f` agree on the guarded branch.
+pub(super) fn specialize_pair_under(
+    cx: &mut Context,
+    t: u32,
+    f: u32,
+    cond: u32,
+    want: bool,
+) -> Result<Option<(u32, u32)>, Error> {
+    let mut gf = GuardFacts::default();
+    fixes(cx, cond, want, &mut gf, 0);
+    if gf.conflict || gf.is_empty() {
+        return Ok(None);
+    }
+    if merge_bit_facts(&gf.bits).is_err() {
+        return Ok(None);
+    }
+    let t_s = put_with(cx, t, &gf, true)?;
+    let f_s = put_with(cx, f, &gf, true)?;
+    Ok(Some((t_s, f_s)))
 }
 
 /// Specialize a 1-bit `And` (`want = true`) or `Or` (`want = false`) binary node by propagating
@@ -1259,10 +1403,23 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                 let c = now(cx, &pushed, n.a)?;
                 let (t, f) = (now(cx, &pushed, n.b)?, now(cx, &pushed, n.c)?);
                 let (t2, f2) = (put(cx, t, &ft)?, put(cx, f, &ff)?);
-                if (t2, f2) == (t, f) {
+                if !ft.conflict
+                    && !ft.is_empty()
+                    && merge_bit_facts(&ft.bits).is_ok()
+                    && put_with(cx, t, &ft, true)? == put_with(cx, f, &ft, true)?
+                {
+                    f
+                } else if !ff.conflict
+                    && !ff.is_empty()
+                    && merge_bit_facts(&ff.bits).is_ok()
+                    && put_with(cx, t, &ff, true)? == put_with(cx, f, &ff, true)?
+                {
+                    t
+                } else if (t2, f2) == (t, f) {
                     continue;
+                } else {
+                    cx.c_select(c, t2, f2)?
                 }
-                cx.c_select(c, t2, f2)?
             }
             OpCode::Mul => {
                 let zext_of = |e: u32| {
