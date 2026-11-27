@@ -57,7 +57,7 @@ pub(super) fn specialize(
                     u64::from(todo.count_ones()) * (32 + guards.len() as u64),
                 )?;
                 while todo != 0 {
-                    let bit = todo & todo.wrapping_neg();
+                    let bit = todo.isolate_lowest_one();
                     todo ^= bit;
                     if let Some(test) = project(cx, n.a, bit, bit)
                         && let Some(value) = guards.iter().find_map(|&(_, g)| g.implies(test))

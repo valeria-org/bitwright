@@ -231,7 +231,7 @@ impl Field {
         let same = if delta == 0 {
             u64::MAX
         } else {
-            (delta & delta.wrapping_neg()) - 1
+            delta.isolate_lowest_one() - 1
         };
         let known = self.mask & same & test.mask;
         if (self.bits ^ test.bits) & known != 0 {

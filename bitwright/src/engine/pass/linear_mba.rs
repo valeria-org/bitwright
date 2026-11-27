@@ -482,6 +482,17 @@ fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
     if w == 0 || w > 64 {
         return;
     }
+    merge_complement_atoms_at(cx, reg, w);
+}
+
+fn merge_complement_atoms_at(cx: &Context, reg: &mut Region, eff_w: u16) {
+    if reg.atoms.len() < 2 || eff_w == 0 || eff_w > 64 {
+        return;
+    }
+    let full_w = cx.wid(reg.atoms[0]);
+    if full_w < eff_w || full_w > 64 {
+        return;
+    }
     if !reg.atoms.iter().any(|&a| {
         matches!(
             cx.node(a).op,
@@ -490,11 +501,15 @@ fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
     }) {
         return;
     }
-    let mask = u64::MAX >> (64 - w);
+    let mask = u64::MAX >> (64 - eff_w);
     let forms: Vec<Option<AffineForm>> = reg
         .atoms
         .iter()
-        .map(|&a| (cx.wid(a) == w).then(|| flatten_affine(cx, a, w)).flatten())
+        .map(|&a| {
+            (cx.wid(a) == full_w)
+                .then(|| flatten_affine(cx, a, eff_w))
+                .flatten()
+        })
         .collect();
     let mut dropped = vec![false; reg.atoms.len()];
     for j in 1..reg.atoms.len() {
@@ -2583,6 +2598,259 @@ fn solve(
         tie,
     )?;
     Ok((step, None))
+}
+
+/// Simplifies causal linear-MBA sum `n` (`width <= 64`) modulo `2^k` (`1 <= k < width`),
+/// returning an expression at `n`'s width that agrees identically with `n` on the low `k` bits
+/// whenever the modulo-`2^k` normal form strictly shrinks `n`'s interior operator count.
+pub(super) fn simplify_prefix(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    k: u16,
+    exact_prefix: bool,
+) -> Result<Option<u32>, Stop> {
+    let w_bits = cx.wid(n);
+    if k == 0
+        || k >= w_bits
+        || w_bits > 64
+        || !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub)
+        || !interior(cx, n, Mode::Linear)
+    {
+        return Ok(None);
+    }
+    let Some(mut reg) = region(cx, n, &mut r.linear_mba) else {
+        return Ok(None);
+    };
+    if !reg.mixed || !reg.lifts.is_empty() || reg.atoms.is_empty() || reg.order.len() < 3 {
+        return Ok(None);
+    }
+    // Also merge atoms that become equal or bitwise complements modulo `2^k` after `demanded`
+    // narrowed constants on the `k`-bit prefix.
+    merge_complement_atoms_at(cx, &mut reg, k);
+    let t = reg.atoms.len();
+    if t == 0 || t > MAX_ATOMS {
+        return Ok(None);
+    }
+    let kmask = u64::MAX >> (64 - k);
+    // When `n` is observed directly on its entire `k`-bit prefix (`exact_prefix`, e.g. `n & (2^k - 1)`
+    // or `trunc<k>(n)`) and `Phase::Mba` (`nf`'s multi-class `low_read`) is active, defer sums
+    // with >= 2 non-uniform constant-masked bitwise atoms so `nf` can unify bit classes across
+    // shared underlying variables instead of treating each masked term as an independent atom.
+    #[cfg(feature = "mba")]
+    if exact_prefix
+        && !r.quarantined_passes.contains(&PassKind::Mba)
+        && r.inner
+            .strategy
+            .phases
+            .iter()
+            .any(|ph| matches!(ph, crate::engine::Phase::Mba(_)))
+    {
+        let masked_atoms = reg
+            .atoms
+            .iter()
+            .filter(|&&a| {
+                let an = cx.node(a);
+                matches!(an.op, OpCode::And | OpCode::Or | OpCode::Xor)
+                    && cx
+                        .const_val(an.a)
+                        .or_else(|| cx.const_val(an.b))
+                        .and_then(|v| v.to_u64())
+                        .is_some_and(|cv| {
+                            let cm = cv & kmask;
+                            cm != 0 && cm != kmask
+                        })
+            })
+            .count();
+        if masked_atoms >= 1 {
+            return Ok(None);
+        }
+    }
+    #[cfg(not(feature = "mba"))]
+    let _ = exact_prefix;
+    let sig_work = (reg.order.len() << t) as u64;
+    if sig_work > 8192 {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, sig_work)?;
+    let kw = crate::Width::new(k).map_err(|e| Stop::Error(e.into()))?;
+    let w = cx.width_of(n);
+    let sig_k: Vec<BitVec> = {
+        let Some(row) = signature_words(cx, &reg, n, &mut r.linear_mba) else {
+            return Ok(None);
+        };
+        row.iter()
+            .map(|&v| BitVec::wrapping_from_u64(kw, v & kmask))
+            .collect()
+    };
+    let lift_coeff = |ck: &BitVec| -> BitVec {
+        if ck.is_zero() {
+            return BitVec::zero(w);
+        }
+        let neg_ck = BitVec::un_unchecked(UnOp::Neg, ck);
+        if crate::facts::known::count_ones(&neg_ck) < crate::facts::known::count_ones(ck)
+            && let Ok(zn) = neg_ck.zext(w)
+        {
+            return BitVec::un_unchecked(UnOp::Neg, &zn);
+        }
+        ck.zext(w).unwrap_or_else(|_| BitVec::zero(w))
+    };
+
+    let d = mobius(&sig_k);
+    let canon = reg.atoms.clone();
+    let mut cands: Vec<(u32, Candidate)> = Vec::new();
+    if (0..d.len()).all(|s| (s as u32).count_ones() < 2 || d[s].is_zero()) {
+        let konst = lift_coeff(&BitVec::un_unchecked(UnOp::Neg, &d[0]));
+        let terms: Vec<(usize, BitVec)> = (0..t)
+            .filter(|&j| !d[1 << j].is_zero())
+            .map(|j| (j, lift_coeff(&d[1 << j])))
+            .collect();
+        let placeholder: Vec<(u32, BitVec)> =
+            terms.iter().map(|(j, c)| (reg.atoms[*j], *c)).collect();
+        let est = linear::estimate(&linear::Form::of(konst, &placeholder));
+        cands.push((est, Candidate::Affine(konst, terms)));
+    } else {
+        let konst = lift_coeff(&BitVec::un_unchecked(UnOp::Neg, &d[0]));
+        let terms: Vec<(usize, BitVec)> = (1..d.len())
+            .filter(|&s| !d[s].is_zero())
+            .map(|s| (s, lift_coeff(&d[s])))
+            .collect();
+        let ands: u32 = terms
+            .iter()
+            .map(|&(s, _)| (s as u32).count_ones().saturating_sub(1))
+            .sum();
+        let placeholder: Vec<(u32, BitVec)> = terms
+            .iter()
+            .enumerate()
+            .map(|(idx, &(_, c))| (u32::MAX - idx as u32, c))
+            .collect();
+        let est = ands + linear::estimate(&linear::Form::of(konst, &placeholder));
+        cands.push((est, Candidate::Conjunctions(konst, terms)));
+
+        if r.inner.strategy.basis_sums && t >= 3 {
+            let share = (r.meter.limit.pass_work / COBRA_SHARE).max(1);
+            let allow = r.meter.left_in(|b| b.pass_work).min(share);
+            let mut left = allow;
+            let cobra_res = crate::cobra::decompose(t, kw, u32::from(k), &d, &mut left);
+            let spent = if cobra_res.is_err() {
+                allow
+            } else {
+                allow - left
+            };
+            r.meter.charge(Counter::PassWork, spent)?;
+            if let Ok(Some(cobra_terms)) = cobra_res {
+                let lifted_ts: Vec<(crate::cobra::BasisOp, BitVec)> = cobra_terms
+                    .into_iter()
+                    .map(|(op, c)| (op, lift_coeff(&c)))
+                    .collect();
+                let gates: u32 = lifted_ts.iter().map(|(op, _)| op.gate_cost()).sum();
+                let ph: Vec<(u32, BitVec)> = lifted_ts
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, c))| (u32::MAX - idx as u32, *c))
+                    .collect();
+                let est = gates + linear::estimate(&linear::Form::of(konst, &ph));
+                cands.push((est, Candidate::Cobra(konst, lifted_ts)));
+            }
+        }
+    }
+
+    if t <= 3 {
+        let mut distinct: Vec<BitVec> = Vec::new();
+        for v in &sig_k {
+            if !distinct.contains(v) {
+                distinct.push(*v);
+            }
+        }
+        let pos: Vec<usize> = canon
+            .iter()
+            .map(|a| reg.atoms.iter().position(|b| b == a).unwrap_or(0))
+            .collect();
+        for &u0 in &distinct {
+            let u0_w = lift_coeff(&u0);
+            let mut ind: Vec<(BitVec, u8)> = Vec::new();
+            let mut funcs = 0u32;
+            let mut placeholder: Vec<(u32, BitVec)> = Vec::new();
+            for &uk in distinct.iter().filter(|&&u| u != u0) {
+                let mut tt = 0u8;
+                for i in 0..8usize {
+                    let mut p = 0usize;
+                    for (ci, &j) in pos.iter().enumerate() {
+                        p |= ((i >> ci) & 1) << j;
+                    }
+                    if sig_k[p & ((1 << t) - 1)] == uk {
+                        tt |= 1 << i;
+                    }
+                }
+                funcs += bitwise::min_forms().forms[tt as usize]
+                    .0
+                    .iter()
+                    .filter(|tok| !matches!(tok, bitwise::T::Var(_)))
+                    .count() as u32;
+                let diff_w = lift_coeff(&BitVec::bin_unchecked(BinOp::Sub, &u0, &uk));
+                placeholder.push((u32::MAX - placeholder.len() as u32, diff_w));
+                ind.push((diff_w, tt));
+            }
+            let est = funcs + linear::estimate(&linear::Form::of(u0_w, &placeholder));
+            cands.push((est, Candidate::Indicators(u0_w, ind)));
+        }
+    }
+
+    cands.sort_by_key(|c| c.0);
+    let Some((est, cand)) = cands.into_iter().next() else {
+        return Ok(None);
+    };
+    if est.saturating_add(1) >= reg.order.len() as u32 {
+        return Ok(None);
+    }
+    let before = cx.len() as u32;
+    let form = match cand {
+        Candidate::Affine(konst, terms) => {
+            let terms: Vec<(u32, BitVec)> =
+                terms.iter().map(|(j, c)| (reg.atoms[*j], *c)).collect();
+            linear::Form::of(konst, &terms)
+        }
+        Candidate::Indicators(u0, ind) => {
+            let mut terms = Vec::new();
+            for (c, tt) in ind {
+                let g = bitwise::emit(r, cx, tt, &canon)?;
+                terms.push((g, c));
+            }
+            linear::Form::of(u0, &terms)
+        }
+        Candidate::Cobra(konst, ops) => {
+            let mut terms = Vec::with_capacity(ops.len());
+            for (op, c) in ops {
+                let g = emit_basis_op(r, cx, &op, &reg.atoms)?;
+                terms.push((g, c));
+            }
+            linear::Form::of(konst, &terms)
+        }
+        Candidate::Conjunctions(konst, sets) => {
+            let mut terms = Vec::new();
+            for (set, c) in sets {
+                let mut acc: Option<u32> = None;
+                for (j, &a) in reg.atoms.iter().enumerate() {
+                    if set & (1 << j) != 0 {
+                        acc = Some(match acc {
+                            None => a,
+                            Some(x) => r.build(cx, |cx| cx.c_bin(BinOp::And, x, a))?,
+                        });
+                    }
+                }
+                if let Some(g) = acc {
+                    terms.push((g, c));
+                }
+            }
+            linear::Form::of(konst, &terms)
+        }
+    };
+    let e = linear::emit(r, cx, &form)?;
+    if e == n {
+        super::discard(r, cx, before);
+        return Ok(None);
+    }
+    Ok(Some(e))
 }
 
 #[cfg(test)]

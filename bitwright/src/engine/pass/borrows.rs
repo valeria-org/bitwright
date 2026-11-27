@@ -63,7 +63,7 @@ use crate::ops::{BinOp, UnOp};
 use crate::{BitVec, Width};
 
 /// The most terms of a sum read.
-const MAX_TERMS: usize = 24;
+const MAX_TERMS: usize = 68;
 
 /// The readings of `x` as the low `k` bits of a value `P`, zero-extended, as `(P, k)`: `x`
 /// itself at its width, then each value under its truncations, masks of the low bits and zero

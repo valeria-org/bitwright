@@ -99,7 +99,7 @@ fn the_prover_proves_its_question_at_small_limits() {
     let e = cx.parse(&root, &opts).expect("the question");
     let w = cx.width(e).expect("a width");
     let k = cx
-        .constant(&BitVec::wrapping_from_u64(w, 0x69b8_404b_fa29_b60))
+        .constant(&BitVec::wrapping_from_u64(w, 0x069b_8404_bfa2_9b60))
         .expect("a constant");
     let p = cx.eq(e, k).expect("the equality");
     let mut a = Assumptions::default();

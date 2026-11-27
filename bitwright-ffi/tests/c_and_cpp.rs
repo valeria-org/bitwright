@@ -42,8 +42,15 @@ fn lib_dir() -> PathBuf {
     BUILT
         .get_or_init(|| {
             let exe = std::env::current_exe().unwrap();
-            let deps = exe.parent().unwrap();
-            let profile_dir = deps.parent().unwrap();
+            let parent = exe.parent().unwrap();
+            let profile_dir = if parent.file_name().and_then(|s| s.to_str()) == Some("deps") {
+                parent.parent().unwrap()
+            } else {
+                exe.ancestors()
+                    .find(|p| p.file_name().and_then(|s| s.to_str()) == Some("build"))
+                    .and_then(|b| b.parent())
+                    .unwrap_or_else(|| parent.parent().unwrap())
+            };
             let profile = match profile_dir.file_name().unwrap().to_str().unwrap() {
                 "debug" => "dev",
                 name => name,
@@ -60,9 +67,13 @@ fn lib_dir() -> PathBuf {
                 ])
                 .arg("--target-dir")
                 .arg(profile_dir.parent().unwrap()));
-            let lib = deps.join(format!("libbitwright{}", std::env::consts::DLL_SUFFIX));
-            assert!(lib.exists(), "no {}", lib.display());
-            deps.to_path_buf()
+            let lib_name = format!("libbitwright{}", std::env::consts::DLL_SUFFIX);
+            for cand in [profile_dir.to_path_buf(), profile_dir.join("deps")] {
+                if cand.join(&lib_name).exists() {
+                    return cand;
+                }
+            }
+            panic!("no {} under {}", lib_name, profile_dir.display());
         })
         .clone()
 }

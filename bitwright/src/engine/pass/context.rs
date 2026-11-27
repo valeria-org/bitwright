@@ -443,7 +443,17 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
 /// factors) test, a condition and its complement counted as one, when one is tested twice.
 pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
     let order = cx.post_order_ids(&[root]);
-    let mut uses: IdMap<u32, u32> = IdMap::default();
+    let is_bool_root = cx.wid(root) == 1;
+    let mut node_uses: IdMap<u32, u32> = IdMap::default();
+    if is_bool_root {
+        *node_uses.entry(root).or_default() += 1;
+        for &id in &order {
+            for ch in cx.node(id).children() {
+                *node_uses.entry(ch).or_default() += 1;
+            }
+        }
+    }
+    let mut uses: IdMap<u32, (u32, u32)> = IdMap::default();
     for &i in &order {
         let n = cx.node(i);
         let c = match n.op {
@@ -459,7 +469,14 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
             Some(_) => c.min(cx.c_un(UnOp::Not, c)?),
             None => c,
         };
-        *uses.entry(c).or_default() += 1;
+        let fan = if is_bool_root {
+            node_uses.get(&i).copied().unwrap_or(1).max(1)
+        } else {
+            1
+        };
+        let entry = uses.entry(c).or_default();
+        entry.0 += 1;
+        entry.1 += fan;
     }
     let sym_bits = |cx: &Context, c: u32| -> u32 {
         let mut ft = Vec::new();
@@ -479,15 +496,25 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
     };
     Ok(uses
         .into_iter()
-        .filter(|&(_, k)| k >= 2)
-        .max_by_key(|&(c, k)| (sym_bits(cx, c) >= 2, k, std::cmp::Reverse(c)))
+        .filter(|&(c, (sites, fan))| {
+            sites >= 2 || (is_bool_root && fan >= 2 && sym_bits(cx, c) >= 2)
+        })
+        .max_by_key(|&(c, (sites, fan))| (sym_bits(cx, c) >= 2, sites, fan, std::cmp::Reverse(c)))
         .map(|(c, _)| c))
 }
 
-/// Whether `root` has at least two `select` nodes sharing a condition (or its complement) that
-/// fixes at least 2 bits of an input symbol (`OpCode::Sym`).
+/// Whether `root` has at least two `select` sites — or a shared multi-reader `select` (`uses >= 2`)
+/// after hoisting — guarded by a condition (or its complement) that fixes at least 2 bits of an
+/// input symbol (`OpCode::Sym`).
 pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
     let order = cx.post_order_ids(&[root]);
+    let mut node_uses: IdMap<u32, u32> = IdMap::default();
+    *node_uses.entry(root).or_default() += 1;
+    for &id in &order {
+        for ch in cx.node(id).children() {
+            *node_uses.entry(ch).or_default() += 1;
+        }
+    }
     let mut conds: Vec<(u32, u32)> = Vec::new();
     for &i in &order {
         let n = cx.node(i);
@@ -500,10 +527,14 @@ pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
         } else {
             c
         };
-        if let Some(slot) = conds.iter_mut().find(|(k, _)| *k == key) {
-            slot.1 += 1;
+        let fan = node_uses.get(&i).copied().unwrap_or(1).max(1);
+        if let Some(slot) = conds
+            .iter_mut()
+            .find(|(k, _)| *k == key || super::bitwise::complementary_conds(cx, *k, key))
+        {
+            slot.1 += fan;
         } else {
-            conds.push((key, 1));
+            conds.push((key, fan));
         }
     }
     conds.into_iter().any(|(c, count)| {

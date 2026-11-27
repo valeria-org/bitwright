@@ -5026,6 +5026,15 @@ fn ask_with_answers(
                         Cap::Steps(s) => (s, false),
                         Cap::Depth(s) => (s, s < full),
                     };
+                    // Out of calls, as out of steps: the question is not asked, and the rest of
+                    // the call (the passes after this phase, the later rounds) goes on within
+                    // its own limits. Stopping the call here left a question the prover
+                    // simplifies as it was after one round, where the word pass of the next
+                    // round finishes it.
+                    if r.meter.left_in(|b| b.mba_calls) == 0 {
+                        count(r).exhausted += 1;
+                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
+                    }
                     // (Where a sweep runs after the round, the phase leaves it a part of
                     // the call's steps, see `SWEEP_RESERVE`.)
                     let reserve = match cfg.opaque_sweep || cfg.noise_forms || cfg.known_atoms {
@@ -5045,15 +5054,6 @@ fn ask_with_answers(
                             return Ok(Step::Normal(Fin::PROVISIONAL));
                         }
                         return Ok(Step::Normal(Fin::capped(Exhausted::MbaSteps)));
-                    }
-                    // Out of calls, as out of steps: the question is not asked, and the rest of
-                    // the call (the passes after this phase, the later rounds) goes on within
-                    // its own limits. Stopping the call here left a question the prover
-                    // simplifies as it was after one round, where the word pass of the next
-                    // round finishes it.
-                    if r.meter.left_in(|b| b.mba_calls) == 0 {
-                        count(r).exhausted += 1;
-                        return Ok(Step::Normal(Fin::capped(Exhausted::MbaCalls)));
                     }
                     r.meter.charge(Counter::MbaCalls, 1)?;
                     count(r).calls += 1;
@@ -5258,6 +5258,9 @@ fn ask_with_answers(
     )?;
     if matches!(out, Step::To(..)) {
         count(r).simplified += 1;
+        if reading.is_none() && bindings.atoms.len() <= 1 {
+            r.mba.step_done.insert((e, false), Fin::FINAL);
+        }
     } else if e != n {
         count(r).not_smaller += 1;
         r.mba.kept.insert(root, false);

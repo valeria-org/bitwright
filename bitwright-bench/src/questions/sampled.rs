@@ -73,7 +73,7 @@ impl Retry {
                         .with_prove(proof)
                         .with_split(Split::none().with_cases(1)),
                     Simplifiers::new()
-                        .with_mba(self.forms.clone())
+                        .with_mba(self.forms)
                         .with_mba_solver(self.solver.clone()),
                 );
                 let ask = match under {

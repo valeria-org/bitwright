@@ -1652,8 +1652,7 @@ impl<'a> Render<'a> {
         let below = low_mask(w, u32::from(nb));
         let mut low: Option<&Vec<u64>> = None;
         let mut high: Option<bool> = None;
-        for c in 0..self.classes.len() {
-            let t = &f.tables[c];
+        for (c, t) in f.tables.iter().enumerate().take(self.classes.len()) {
             if self.classes.low(c) < nb {
                 if !bv_and(self.classes.mask(c), &bv_not(&below)).is_zero() {
                     return None;
@@ -1711,9 +1710,8 @@ impl<'a> Render<'a> {
         let n = self.classes.len();
         // Positions grouped by table.
         let mut groups: Vec<(Vec<u64>, BitVec)> = Vec::new();
-        for c in 0..n {
+        for (c, t) in f.tables.iter().enumerate().take(n) {
             let mask = self.classes.mask(c);
-            let t = &f.tables[c];
             let mut nt: Vec<u64> = t.iter().map(|x| !x).collect();
             if s < 6 {
                 nt[0] &= (1u64 << (1usize << s)) - 1;
@@ -3816,15 +3814,45 @@ impl<'a> Render<'a> {
         let one = super::word::one(w);
         let minus = super::word::un(UnOp::Neg, &one);
         let ones = BitVec::ones(w);
+        let low_top = super::word::low_mask(w, top);
         // The positions that are not read (see `Render::read_below`).
-        let unread = super::word::bv_not(&super::word::low_mask(w, top));
+        let unread = super::word::bv_not(&low_top);
         let mut out = Sum {
             terms: Vec::with_capacity(products),
             konst: Some(p.konst()),
         };
+        let disjoint_pairs = |members: &Members, pol: bool| -> usize {
+            let mut cnt = 0usize;
+            for i in 0..members.len() {
+                if members[i].0.1 != pol {
+                    continue;
+                }
+                for j in (i + 1)..members.len() {
+                    if members[j].0.1 == pol && bv_and(&members[i].1, &members[j].1).is_zero() {
+                        cnt += 1;
+                    }
+                }
+            }
+            cnt
+        };
         for (k, members) in &groups {
+            let pos_cnt = members.iter().filter(|((_, sub), _)| !*sub).count();
+            let neg_cnt = members.len() - pos_cnt;
+            let flip_sign = if neg_cnt != pos_cnt {
+                neg_cnt > pos_cnt
+            } else if pos_cnt >= 2 {
+                disjoint_pairs(members, true) > disjoint_pairs(members, false)
+            } else {
+                false
+            };
+            let mult = if flip_sign {
+                bv_and(&super::word::un(UnOp::Neg, k), &low_top)
+            } else {
+                *k
+            };
             let mut inner = Sum::default();
             for &((set, sub), mask) in members {
+                let sub = sub ^ flip_sign;
                 let c = self.conj(set)?;
                 // (Every class that is read: no mask.)
                 let mask = if bv_or(&mask, &unread) == ones {
@@ -3836,10 +3864,10 @@ impl<'a> Render<'a> {
                 inner.terms.push((x, if sub { minus } else { one }));
             }
             match inner.terms[..] {
-                [(x, _)] => out.terms.push((x, *k)),
+                [(x, _)] => out.terms.push((x, mult)),
                 _ => {
                     let x = self.sum(&inner)?;
-                    out.terms.push((x, *k));
+                    out.terms.push((x, mult));
                 }
             }
         }

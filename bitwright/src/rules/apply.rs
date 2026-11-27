@@ -296,6 +296,9 @@ fn fact_holds(
         FactPred::Disjoint => {
             let fy = operand_facts(env, cx, rule, b, (*m)?, widths, consts, lets)?;
             bv_and(&fx.known().maybe_one(), &fy.known().maybe_one()).is_zero()
+                || bound(rule, b, *x)
+                    .zip(bound(rule, b, (*m)?))
+                    .is_some_and(|(bx, by)| crate::engine::pass::syntactic_disjoint(cx, bx, by))
         }
         FactPred::FpNotNan | FactPred::FpFinite | FactPred::FpNonZero => {
             // The format: the infinity literal's exponent width, and `x`'s width.

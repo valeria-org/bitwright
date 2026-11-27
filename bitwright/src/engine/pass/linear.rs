@@ -1790,7 +1790,7 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
         };
         let lhs = BitVec::bin_unchecked(BinOp::Add, &c11, &c00);
         let rhs = BitVec::bin_unchecked(BinOp::Add, &c10, &c01);
-        if lhs == rhs {
+        if lhs == rhs && cond != b && !super::bitwise::complementary_conds(cx, cond, b) {
             let split_consts = if c00.is_zero() {
                 Some(((c10, zero), (c01, zero)))
             } else if c01.is_zero() {
@@ -1800,7 +1800,8 @@ fn additive_select(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<O
             } else if c11.is_zero() {
                 Some(((zero, c01), (zero, c10)))
             } else {
-                None
+                let d = BitVec::bin_unchecked(BinOp::Sub, &c01, &c00);
+                Some(((c10, c00), (d, zero)))
             };
             if let Some(((a_t, a_f), (b_t, b_f))) = split_consts {
                 let before = cx.len() as u32;
@@ -2404,6 +2405,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             Some(step) => return Ok(step),
             None => {}
         }
+        // Telescoping N-ary `<u` carry trees (`Σ [S_{A∪B} <u S_B] == floor(Σ T_i / 2^W)`).
+        match fuse_carry_trees(r, cx, n, &form)? {
+            Some(Step::Normal(f)) => declined = declined.and(f),
+            Some(step) => return Ok(step),
+            None => {}
+        }
         // Terms reading one condition, merged first (see `conditions`).
         match super::conditions::step(r, cx, n, &form)? {
             Ok(step) => step,
@@ -2870,6 +2877,225 @@ fn merge_not_masks(
     stops.sort_unstable();
     stops.dedup();
     finish(r, cx, PassKind::Linear, n, e, before, &stops, f.fin).map(Some)
+}
+
+/// Fuses telescoping binary-partition carry trees `Σ_{v} c * zext<W'>(S_{L(v) ⊎ R(v)} <u S_{R(v)})`
+/// (`m - 1 >= 3` internal nodes over `m` leaves `T_0, ..., T_{m-1}` of width `W`) into a single
+/// widened high-slice `c * zext<W'>(extract<W, b>(Σ_{i=0}^{m-1} zext<W+b>(T_i)))` where
+/// `b = ceil(log2(m))` (`2^b >= m > m - 1`, `W + b <= 512`).
+fn fuse_carry_trees(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    form: &Form,
+) -> Result<Option<Step>, Stop> {
+    if form.terms.len() < 4 || form.terms.len() > 96 {
+        return Ok(None);
+    }
+    let w_out = form.konst.width();
+    // Quick scan: find `(term_idx, p_id, q_id, w_in, coeff)` for `zext(P <u Q)` terms.
+    let mut raw_carries: Vec<(usize, u32, u32, u16, BitVec)> = Vec::new();
+    for (idx, &(tid, coeff)) in form.terms.iter().enumerate() {
+        let tn = cx.node(tid);
+        if tn.op == OpCode::Zext && w_out.bits() >= 2 {
+            let un = cx.node(tn.a);
+            if un.op == OpCode::Ult {
+                let w_in = cx.wid(un.a);
+                if (1..=506).contains(&w_in) {
+                    raw_carries.push((idx, un.a, un.b, w_in, coeff));
+                }
+            }
+        } else if tn.op == OpCode::Ult && w_out.bits() == 1 {
+            let w_in = cx.wid(tn.a);
+            if (1..=506).contains(&w_in) {
+                raw_carries.push((idx, tn.a, tn.b, w_in, coeff));
+            }
+        }
+    }
+    if raw_carries.len() < 3 {
+        return Ok(None);
+    }
+    // Pick the `(w_in, coeff)` bucket with at least 3 carry terms.
+    type CarryGroup = (u16, BitVec, Vec<(usize, u32, u32)>);
+    let mut best_group: Option<CarryGroup> = None;
+    for &(_, _, _, w_in, coeff) in &raw_carries {
+        if best_group
+            .as_ref()
+            .is_some_and(|(bw, bc, _)| *bw == w_in && *bc == coeff)
+        {
+            continue;
+        }
+        let members: Vec<(usize, u32, u32)> = raw_carries
+            .iter()
+            .filter_map(|&(i2, p2, q2, w2, c2)| (w2 == w_in && c2 == coeff).then_some((i2, p2, q2)))
+            .collect();
+        if members.len() >= 3
+            && best_group
+                .as_ref()
+                .is_none_or(|(_, _, prev)| members.len() > prev.len())
+        {
+            best_group = Some((w_in, coeff, members));
+        }
+    }
+    let Some((w_in, coeff, members)) = best_group else {
+        return Ok(None);
+    };
+
+    let flatten_add_multiset = |cx: &Context, root: u32| -> Option<Vec<u32>> {
+        let mut leaves = Vec::with_capacity(8);
+        let mut st = vec![root];
+        while let Some(x) = st.pop() {
+            if leaves.len() + st.len() > 64 {
+                return None;
+            }
+            let xn = cx.node(x);
+            if xn.op == OpCode::Add {
+                st.push(xn.b);
+                st.push(xn.a);
+            } else {
+                leaves.push(x);
+            }
+        }
+        leaves.sort_unstable();
+        Some(leaves)
+    };
+
+    let multiset_diff = |sup: &[u32], sub: &[u32]| -> Option<Vec<u32>> {
+        if sub.is_empty() || sub.len() >= sup.len() {
+            return None;
+        }
+        let mut rem = Vec::with_capacity(sup.len() - sub.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < sup.len() && j < sub.len() {
+            match sup[i].cmp(&sub[j]) {
+                core::cmp::Ordering::Less => {
+                    rem.push(sup[i]);
+                    i += 1;
+                }
+                core::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                core::cmp::Ordering::Greater => return None,
+            }
+        }
+        if j < sub.len() {
+            return None;
+        }
+        rem.extend_from_slice(&sup[i..]);
+        Some(rem)
+    };
+
+    struct CarryEdge {
+        term_idx: usize,
+        left: Vec<u32>,
+        right: Vec<u32>,
+        union: Vec<u32>,
+    }
+
+    r.meter.charge(Counter::PassWork, members.len() as u64)?;
+    let mut edges: Vec<CarryEdge> = Vec::with_capacity(members.len());
+    for (term_idx, p, q) in members {
+        let (Some(mp), Some(mq)) = (flatten_add_multiset(cx, p), flatten_add_multiset(cx, q))
+        else {
+            continue;
+        };
+        let Some(ma) = multiset_diff(&mp, &mq) else {
+            continue;
+        };
+        edges.push(CarryEdge {
+            term_idx,
+            left: ma,
+            right: mq,
+            union: mp,
+        });
+    }
+    if edges.len() < 3 {
+        return Ok(None);
+    }
+    edges.sort_by_key(|e| e.union.len());
+
+    // Dynamic programming over multisets: singletons have `used = []`; each internal merge edge
+    // combines valid trees for `left` and `right` with disjoint `used` term indices.
+    let mut trees: Vec<(Vec<u32>, Vec<usize>)> = Vec::new();
+    let resolve_sub = |ms: &[u32], trees: &[(Vec<u32>, Vec<usize>)]| -> Option<Vec<usize>> {
+        if ms.len() == 1 {
+            return Some(Vec::new());
+        }
+        trees
+            .iter()
+            .find_map(|(k, u)| (k.as_slice() == ms).then(|| u.clone()))
+    };
+
+    for e in &edges {
+        if trees.iter().any(|(k, _)| k == &e.union) {
+            continue;
+        }
+        let (Some(mut ul), Some(ur)) =
+            (resolve_sub(&e.left, &trees), resolve_sub(&e.right, &trees))
+        else {
+            continue;
+        };
+        if ul.contains(&e.term_idx) || ur.contains(&e.term_idx) || ul.iter().any(|x| ur.contains(x))
+        {
+            continue;
+        }
+        ul.extend(ur);
+        ul.push(e.term_idx);
+        trees.push((e.union.clone(), ul));
+    }
+
+    let Some((leaf_ms, used_terms)) = trees
+        .into_iter()
+        .filter(|(ms, u)| u.len() >= 3 && ms.len() <= 64)
+        .max_by_key(|(_, u)| u.len())
+    else {
+        return Ok(None);
+    };
+
+    let m = leaf_ms.len();
+    let carry_bits = (usize::BITS - (m - 1).leading_zeros()) as u16;
+    if w_in + carry_bits > 512 {
+        return Ok(None);
+    }
+    let w_ext = crate::Width::new(w_in + carry_bits).map_err(|e| Stop::Error(e.into()))?;
+
+    let before = cx.len() as u32;
+    let one_ext = BitVec::one(w_ext);
+    let mut ext_terms: Vec<(u32, BitVec)> = Vec::with_capacity(m);
+    for &leaf in &leaf_ms {
+        let zleaf = r.build(cx, |cx| cx.c_zext(leaf, w_ext.bits()))?;
+        ext_terms.push((zleaf, one_ext));
+    }
+    let ext_form = Form::of(BitVec::zero(w_ext), &ext_terms);
+    let ext_sum = emit(r, cx, &ext_form)?;
+    let carry_total = r.build(cx, |cx| {
+        let hi = cx.c_extract(ext_sum, w_in, carry_bits)?;
+        match carry_bits.cmp(&w_out.bits()) {
+            core::cmp::Ordering::Less => cx.c_zext(hi, w_out.bits()),
+            core::cmp::Ordering::Equal => Ok(hi),
+            core::cmp::Ordering::Greater => cx.c_extract(hi, 0, w_out.bits()),
+        }
+    })?;
+
+    let mut new_terms: Vec<(u32, BitVec)> =
+        Vec::with_capacity(form.terms.len() - used_terms.len() + 1);
+    let mut stops: Vec<u32> = Vec::new();
+    for (idx, &(tid, k)) in form.terms.iter().enumerate() {
+        if !used_terms.contains(&idx) {
+            new_terms.push((tid, k));
+            stops.push(tid);
+        }
+    }
+    new_terms.push((carry_total, coeff));
+    stops.extend_from_slice(&leaf_ms);
+    stops.sort_unstable();
+    stops.dedup();
+
+    let mut new_form = Form::of(form.konst, &new_terms);
+    new_form.fin = form.fin;
+    let e = emit(r, cx, &new_form)?;
+    finish(r, cx, PassKind::Linear, n, e, before, &stops, new_form.fin).map(Some)
 }
 
 /// The linear pass at `n` over its form as computed.

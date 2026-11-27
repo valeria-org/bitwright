@@ -263,11 +263,11 @@ fn merge_extract_pair(
         if a.op != OpCode::Extract {
             continue;
         }
-        for j in i + 1..form.terms.len() {
-            if !form.terms[j].1.is_ones() {
+        for (j, &(tj, ref cj)) in form.terms.iter().enumerate().skip(i + 1) {
+            if !cj.is_ones() {
                 continue;
             }
-            let b = cx.node(form.terms[j].0);
+            let b = cx.node(tj);
             if b.op == OpCode::Extract
                 && a.b == b.b
                 && a.width == b.width

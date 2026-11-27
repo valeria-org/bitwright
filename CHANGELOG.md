@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.32.25
+
+- Extended `cse::share_sums` with width-polymorphic (`1..=512`) linear recurrence pivot recovery (`supp(piv) ⊆ supp(cur_terms)` with synthetic disjoint-`Or` mux remapping), disjoint-mux pair folding across linear forms and `Add` bags, compact linear form emission, and constant-multiplier factoring; added compact 9-gate/bit AIG ripple adders (`add_compact` / `sub_compact` via `maj_with_xor`) and compact majority clause emission in `prove`.
+- Added demanded-prefix linear-MBA simplification (`linear_mba::simplify_prefix` and `merge_complement_atoms_at`) at top-level `Add`/`Sub` chains in `demanded`, generalized `casts` to unwrap shifted zero-extended narrow products `shl(zext<W>(mul_nw(f_1, ..., f_m)), k)` (`nw = W - k`, widths `2..=512`) by absorbing `<< k` into `extract<k, nw>(s)` when `low_zero(s, k)` holds, and extended `mba::lower` and `mba::nf::render` with `PeerOp::NotAnd`, carry-free low-bit offset masked peers, multi-term linear sum peers, and variable-order-invariant multiplier sign canonicalization in `by_coefficient`.
+- Added 1-level `Zext`, `Sext`, and constant shift/rotate `Select` hoisting and live positive comparison guard unification (`Ne`/`Ule`/`Sle` to live `Eq`/`Ult`/`Slt` with swapped arms) in `bitwise`, hoisting-invariant multi-reader `Select` guard detection in `context::most_tested` and `context::has_sym_select_guard`, and width-polymorphic syntactic `And`-factor complement disjointness (`syntactic_disjoint`) across `engine::pass::disjoint` and DSL `FactPred::Disjoint`.
+- Made `prove::sample_words` check live caller deadlines (`now_ticks() >= at`) instead of skipping when any deadline is configured, raised `POST_SIMP_MAX_NODES` to `32_768`, and added small-support guard cone enumeration (`analyze_small_cones` up to 10 demanded free bits) for witness pinning and exact `Unsat` exhaustion.
+- Extended `linear` with non-zero-corner 2-bit multilinear `Select` tables in `additive_select` and telescoping $N$-ary carry-tree fusion (`fuse_carry_trees`) collapsing binary-partition `<u` carry trees into `extract<W, b>(Σ zext<W+b>(T_i))`, and raised `borrows::MAX_TERMS` to `68`.
+- Fixed live-DAG constant checks in `demanded::narrow_constants`, MBA call-quota ordering and single-atom normal-form `step_done` caching in `mba`, post-clause-lift mixer predicate simplification and speculative stop-reason preservation in `prove`, Cargo 1.100 test build-directory discovery in `bitwright-ffi`, and Rust 1.100 clippy lints across the workspace.
+
 ## 0.32.24
 
 - The deobfuscation strategy can reuse circuit-proved equalities between differently written

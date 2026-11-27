@@ -110,6 +110,48 @@ fn add_wrapping(g: &mut Aig, a: &[L], b: &[L], cin: L) -> Bits {
     out
 }
 
+#[inline]
+fn maj_with_xor(g: &mut Aig, x: L, y: L, c: L, xy_xor: L) -> L {
+    if x <= TRUE
+        || y <= TRUE
+        || c <= TRUE
+        || (x >> 1) == (y >> 1)
+        || (x >> 1) == (c >> 1)
+        || (y >> 1) == (c >> 1)
+    {
+        g.maj(x, y, c)
+    } else {
+        let xy = g.and(x, y);
+        let cs = g.and(c, xy_xor);
+        g.or(xy, cs)
+    }
+}
+
+pub(super) fn add_compact(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
+    add_wrapping_compact(g, a, b, FALSE)
+}
+
+pub(super) fn sub_compact(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
+    let nb = not(g, b);
+    add_wrapping_compact(g, a, &nb, TRUE)
+}
+
+fn add_wrapping_compact(g: &mut Aig, a: &[L], b: &[L], cin: L) -> Bits {
+    let mut carry = cin;
+    let mut out = Vec::with_capacity(a.len());
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        if i + 1 == a.len() {
+            let sum = g.xor_phase(x, y);
+            out.push(g.xor_phase(sum, carry));
+        } else {
+            let sum = g.xor(x, y);
+            out.push(g.xor(sum, carry));
+            carry = maj_with_xor(g, x, y, carry, sum);
+        }
+    }
+    out
+}
+
 pub fn neg(g: &mut Aig, a: &[L]) -> Bits {
     let z = vec![FALSE; a.len()];
     sub(g, &z, a)
@@ -643,18 +685,19 @@ fn mul_carry_save_unfactored(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
         while columns[i].len() - head > 2 {
             let (x, y, z) = (columns[i][head], columns[i][head + 1], columns[i][head + 2]);
             head += 3;
-            let sum = if i + 1 == w {
+            if i + 1 == w {
                 let xy = g.xor_phase(x, y);
-                g.xor_phase(xy, z)
+                let sum = g.xor_phase(xy, z);
+                if sum != FALSE {
+                    columns[i].push(sum);
+                }
             } else {
                 let xy = g.xor(x, y);
-                g.xor(xy, z)
-            };
-            if sum != FALSE {
-                columns[i].push(sum);
-            }
-            if i + 1 < w {
-                let carry = g.maj(x, y, z);
+                let sum = g.xor(xy, z);
+                if sum != FALSE {
+                    columns[i].push(sum);
+                }
+                let carry = maj_with_xor(g, x, y, z, xy);
                 if carry != FALSE {
                     columns[i + 1].push(carry);
                 }
@@ -667,7 +710,7 @@ fn mul_carry_save_unfactored(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
             second[i] = l;
         }
     }
-    add(g, &first, &second)
+    add_compact(g, &first, &second)
 }
 
 /// Quotient and remainder of unsigned division; by zero, all ones and `a` (restoring division

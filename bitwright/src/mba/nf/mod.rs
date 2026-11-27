@@ -1612,9 +1612,9 @@ impl Pass<'_> {
                 let nw = self.p.nodes()[a as usize].width.bits();
                 let n = self.classes.len();
                 let mut f = Bits::atom(n, at);
-                for c in 0..n {
+                for (c, tc) in f.tables.iter_mut().enumerate().take(n) {
                     if self.classes.low(c) >= nw {
-                        f.tables[c] = vec![0];
+                        *tc = vec![0];
                     }
                 }
                 Form::Bits(f)

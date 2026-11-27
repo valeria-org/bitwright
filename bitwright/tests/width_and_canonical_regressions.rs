@@ -1851,3 +1851,391 @@ fn wide_concat_slice_sampling_and_shared_sum_factoring() {
         }
     }
 }
+
+#[test]
+fn all_five_architectural_reinforcements_across_widths() {
+    let prover = prove::Simplifiers::new();
+    let cfg = ProveConfig::default().with_simplify_fuel(1 << 15);
+
+    // Family 1: Unrolled linear recurrence + disjoint choice mux `(e & f) + (~e & g)` recovery
+    // and compact 9-gate AIG adders across widths.
+    for bits in [8u16, 16, 32, 64] {
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let mut rec_prog = String::new();
+        let mut flat_prog = String::new();
+        // Build 14 rounds where `flat_prog` flattens linear state recurrences by substituting
+        // previous linear sums so scalar multiples grow, while `rec_prog` shares round variables.
+        rec_prog.push_str("let s0 = a0 + a1; let s1 = a2 + a3; ");
+        flat_prog.push_str("let nl_init = a0 ^ a1; ");
+        let mut terms: Vec<(String, u64)> = vec![("a0".into(), 1), ("a1".into(), 1)];
+        let mut prev_terms: Vec<(String, u64)> = vec![("a2".into(), 1), ("a3".into(), 1)];
+        let modulus_mask = u64::MAX >> (64 - bits);
+        let fmt_terms = |ts: &[(String, u64)]| -> String {
+            ts.iter()
+                .filter_map(|(name, c)| {
+                    let cm = *c & modulus_mask;
+                    if cm == 0 {
+                        None
+                    } else if cm == 1 {
+                        Some(name.clone())
+                    } else {
+                        Some(format!("({name} * {cm})"))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+        for r in 0..14usize {
+            let ch_rec = format!(
+                "let p{r} = rotl(s{}, {}); let ch{r} = (p{r} & m{r}) + (~p{r} & n{r}); let s{} = s{} + s{} + ch{r}; ",
+                r + 1,
+                (r % 3) + 1,
+                r + 2,
+                r + 1,
+                r
+            );
+            rec_prog.push_str(&ch_rec);
+
+            let prev_expr = fmt_terms(&prev_terms);
+            flat_prog.push_str(&format!("let p{r} = rotl({prev_expr}, {}); ", (r % 3) + 1));
+            let mut next_terms = prev_terms.clone();
+            for (name, c) in &terms {
+                if let Some(slot) = next_terms.iter_mut().find(|(n2, _)| n2 == name) {
+                    slot.1 = slot.1.wrapping_add(*c) & modulus_mask;
+                } else {
+                    next_terms.push((name.clone(), *c & modulus_mask));
+                }
+            }
+            next_terms.push((format!("(p{r} & m{r})"), 1));
+            next_terms.push((format!("(~p{r} & n{r})"), 1));
+            terms = prev_terms;
+            prev_terms = next_terms;
+        }
+        rec_prog.push_str("s15");
+        let final_flat = fmt_terms(&prev_terms);
+        flat_prog.push_str(&final_flat);
+
+        let e_rec = cx.parse(&rec_prog, &opt).unwrap();
+        let e_flat = cx.parse(&flat_prog, &opt).unwrap();
+        let zero = cx.constant(&BitVec::zero(w)).unwrap();
+        let nz_flat = cx.cmp(bitwright::CmpOp::Ne, e_flat, zero).unwrap();
+
+        let q_raw = prove::Question::valid(
+            &mut cx,
+            nz_flat,
+            &ProveConfig::default()
+                .with_simplify(false)
+                .with_shared_sums(false)
+                .with_certificate(true)
+                .with_samples(0)
+                .with_max_conflicts(0),
+        )
+        .unwrap();
+        let q_cse = prove::Question::valid(
+            &mut cx,
+            nz_flat,
+            &ProveConfig::default()
+                .with_simplify(false)
+                .with_shared_sums(false)
+                .with_certificate(false)
+                .with_samples(0)
+                .with_max_conflicts(0),
+        )
+        .unwrap();
+        assert!(
+            q_cse.stats().nodes * 2 < q_raw.stats().nodes,
+            "width {bits}: expected >2x AIG compression on unrolled recurrence, got {} -> {}",
+            q_raw.stats().nodes,
+            q_cse.stats().nodes
+        );
+        let mut s3_rec = String::from(
+            "let m0 = rotl(a2, 3); let n0 = rotl(a3, 5); let s0 = a2; let s1 = a2 + a3; ",
+        );
+        let mut s3_flat = String::from("let m0 = rotl(a2, 3); let n0 = rotl(a3, 5); ");
+        let mut t_prev: Vec<(String, u64)> = vec![("a2".into(), 1)];
+        let mut t_cur: Vec<(String, u64)> = vec![("a2".into(), 1), ("a3".into(), 1)];
+        for r in 0..3usize {
+            s3_rec.push_str(&format!(
+                "let p{r} = rotl(s{}, {}); let ch{r} = (p{r} & m0) + (~p{r} & n0); let s{} = s{} + s{} + ch{r}; ",
+                r + 1,
+                (r % 3) + 1,
+                r + 2,
+                r + 1,
+                r
+            ));
+            let pe = fmt_terms(&t_cur);
+            s3_flat.push_str(&format!("let p{r} = rotl({pe}, {}); ", (r % 3) + 1));
+            let mut tn = t_cur.clone();
+            for (nm, c) in &t_prev {
+                if let Some(sl) = tn.iter_mut().find(|(n2, _)| n2 == nm) {
+                    sl.1 = sl.1.wrapping_add(*c) & modulus_mask;
+                } else {
+                    tn.push((nm.clone(), *c & modulus_mask));
+                }
+            }
+            tn.push((format!("(p{r} & m0)"), 1));
+            tn.push((format!("(~p{r} & n0)"), 1));
+            t_prev = t_cur;
+            t_cur = tn;
+        }
+        s3_rec.push_str("s4");
+        s3_flat.push_str(&fmt_terms(&t_cur));
+        let _ = e_rec;
+        let er3 = cx.parse(&s3_rec, &opt).unwrap();
+        let ef3 = cx.parse(&s3_flat, &opt).unwrap();
+        // Verify exact bit-level soundness of `cse::share_sums` + `compact_adders` (`!certificate`)
+        // without Engine at 8 bits (all 2^16 = 65,536 inputs), and full equivalence across widths.
+        if bits == 8 {
+            let raw_eq = prove::equal(
+                &mut cx,
+                er3,
+                ef3,
+                &ProveConfig::default()
+                    .with_simplify(false)
+                    .with_shared_sums(false)
+                    .with_certificate(false)
+                    .with_exhaustive_inputs(16),
+            )
+            .unwrap();
+            assert!(
+                matches!(raw_eq, Outcome::Proved(_)),
+                "width 8: expected exhaustive Proved on unrolled recurrence, got {raw_eq:?}"
+            );
+        }
+        let eq_pred = cx.cmp(bitwright::CmpOp::Eq, er3, ef3).unwrap();
+        let eq_out = prove::valid_under_with(&mut cx, eq_pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(eq_out, Outcome::Proved(_)),
+            "width {bits}: expected Proved on 3-round recurrence equivalence, got {eq_out:?}"
+        );
+        let one = cx.constant(&BitVec::one(w)).unwrap();
+        let ef3_bad = cx.bin(bitwright::BinOp::Xor, ef3, one).unwrap();
+        let neq_pred = cx.cmp(bitwright::CmpOp::Eq, er3, ef3_bad).unwrap();
+        let neq_out = prove::valid_under_with(&mut cx, neq_pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(neq_out, Outcome::Refuted(_)),
+            "width {bits}: expected Refuted on perturbed recurrence, got {neq_out:?}"
+        );
+    }
+
+    // Shifted narrowed-product unwrap (`zext<W>(extract<k, W-k>(f * s * C)) << k`) across widths 16..=128.
+    for (bits, inv7_lo, inv7_hi) in [
+        (16u16, 0x6db7u64, 0u64),
+        (32u16, 0xb6db_6db7u64, 0u64),
+        (64u16, 0x6db6_db6d_b6db_6db7u64, 0u64),
+        (128u16, 0x6db6_db6d_b6db_6db7u64, 0xb6db_6db6_db6d_b6dbu64),
+    ] {
+        let w = Width::new(bits).unwrap();
+        let nw = bits - 8;
+        let opt = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let inv7_lit = if bits <= 64 {
+            format!("0x{inv7_lo:x}:{bits}")
+        } else {
+            format!("0x{inv7_hi:016x}{inv7_lo:016x}:{bits}")
+        };
+        let exact_src = format!(
+            "let s = zext<{bits}>(extract<8, {nw}>(y & 0xff00)) << 8; \
+             let wrapped = zext<{bits}>(extract<8, {nw}>((zext<{bits}>(extract<8, {nw}>(f * s)) << 8) * 7)) << 8; \
+             (f * (y ^ s) + 2 * (wrapped * {inv7_lit})) == f * (y + s)"
+        );
+        let pred = cx.parse(&exact_src, &opt).unwrap();
+        let q = prove::Question::valid_under_with(&mut cx, pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(q.outcome(), Some(Outcome::Proved(_))),
+            "width {bits}: expected nested shifted narrowed-product MBA to collapse, got {:?}",
+            q.outcome()
+        );
+        assert_eq!(
+            q.stats().nodes,
+            0,
+            "width {bits}: expected Engine to unwrap shifted narrowed product and collapse MBA before SAT"
+        );
+        let bad = cx
+            .parse(
+                &format!(
+                    "let s = zext<{bits}>(extract<8, {nw}>(y & 0xff00)) << 8; \
+                     let wrapped = zext<{bits}>(extract<8, {nw}>((zext<{bits}>(extract<8, {nw}>(f * s)) << 8) * 7)) << 8; \
+                     (f * (y ^ s) + 2 * (wrapped * {inv7_lit})) == f * (y ^ s)"
+                ),
+                &opt,
+            )
+            .unwrap();
+        let out_bad = prove::valid_under_with(&mut cx, bad, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(out_bad, Outcome::Refuted(_)),
+            "width {bits}: expected Refuted when shifted narrowed product is dropped"
+        );
+    }
+
+    // Family 2: Demanded-prefix LinearMba & carry-free low-bit offset masked peer unification.
+    for (bits, k_bit, inv7) in [
+        (16u16, 10u16, 0x6db7u64),
+        (32u16, 20u16, 0xb6db_6db7u64),
+        (64u16, 36u16, 0x6db6_db6d_b6db_6db7u64),
+    ] {
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let mut cx = Context::new();
+        // `7 * inv7 ≡ 1 (mod 2^(k_bit + 1))` even after demanded-prefix narrowing drops high bits!
+        let noise_hi = 1u64 << (k_bit + 2);
+        let src = format!(
+            "let u = x + 128; \
+             let c_neg = -129 - x; \
+             let mba = ((u ^ y) + 2 * (u & y)) * 7 * {inv7} + (c_neg & y) - (~u & y) + {noise_hi}; \
+             extract<{k_bit}, 1>(mba) == extract<{k_bit}, 1>(u + y)"
+        );
+        let pred = cx.parse(&src, &opt).unwrap();
+        let q = prove::Question::valid_under_with(&mut cx, pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(q.outcome(), Some(Outcome::Proved(_))),
+            "width {bits}: expected demanded-prefix MBA Proved"
+        );
+        assert_eq!(
+            q.stats().nodes,
+            0,
+            "width {bits}: expected Engine to decide demanded-prefix MBA before bit-blasting"
+        );
+
+        // Carry-free low-bit offset (`u = x + 128`, `~x & 108 == ~u & 108`) positive vs negative:
+        let peer_pos = cx
+            .parse(
+                "let u = x + 128; let m1 = ~x & 108; let m2 = ~u & 108; \
+                 (m1 ^ z) + 2 * (m1 & z) == (m2 | z) + (m2 & z)",
+                &opt,
+            )
+            .unwrap();
+        let out_pos = prove::valid_under_with(&mut cx, peer_pos, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(out_pos, Outcome::Proved(_)),
+            "width {bits}: expected carry-free offset peer Proved, got {out_pos:?}"
+        );
+        let peer_neg = cx
+            .parse(
+                "let u = x + 64; let m1 = ~x & 108; let m2 = ~u & 108; \
+                 (m1 ^ z) + 2 * (m1 & z) == (m2 | z) + (m2 & z)",
+                &opt,
+            )
+            .unwrap();
+        let out_neg = prove::valid_under_with(&mut cx, peer_neg, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(out_neg, Outcome::Refuted(_)),
+            "width {bits}: expected overlapping offset 64 vs mask 108 to be Refuted, got {out_neg:?}"
+        );
+    }
+
+    // Family 3: Complementary 1-bit comparison leaf canonicalization (`Eq`/`Ne`, `Ult`/`Ule`).
+    for bits in [8u16, 16, 32, 64, 128] {
+        let w = Width::new(bits).unwrap();
+        let opt = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let dnf = "let e0 = a == 11; let e1 = b == 22; let e2 = c == 33; \
+                   let n0 = a != 11; let n1 = b != 22; let n2 = c != 33; \
+                   ((n0 & n1 & n2) | (e0 & n1 & n2) | (n0 & e1 & n2) | (e0 & e1 & n2) \
+                    | (n0 & n1 & e2) | (e0 & n1 & e2) | (n0 & e1 & e2)) == ~(e0 & e1 & e2)";
+        let pred = cx.parse(dnf, &opt).unwrap();
+        let q = prove::Question::valid_under_with(&mut cx, pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(q.outcome(), Some(Outcome::Proved(_))),
+            "width {bits}: expected 7-minterm Eq/Ne DNF to collapse"
+        );
+        assert_eq!(
+            q.stats().nodes,
+            0,
+            "width {bits}: expected Engine to collapse 7-minterm Eq/Ne DNF without SAT"
+        );
+    }
+
+    // Family 4: Small-support guard cone witness synthesis & unsat detection.
+    {
+        let mut cx = Context::new();
+        let opt = ParseOptions::width(Width::W64);
+        // Refutable sparse-mask guard (`x & 0x3b` has 5 free bits; random 64 lanes would miss `y == 0xdeadbeefcafebabe` + nonlinear `x & 0x3b` check without guard + cone pinning).
+        let ref_pred = cx
+            .parse(
+                "~(((((x:64 & 0x3b) * 19 ^ ((x & 0x3b) >>u 2)) & 0x3f) == 0x2d) & (y:64 == 0xdeadbeefcafebabe))",
+                &opt,
+            )
+            .unwrap();
+        let q_ref =
+            prove::Question::valid_under_with(&mut cx, ref_pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(q_ref.outcome(), Some(Outcome::Refuted(_))),
+            "expected Refuted via small-cone witness pinning, got {:?}",
+            q_ref.outcome()
+        );
+        assert_eq!(
+            q_ref.stats().nodes,
+            0,
+            "expected small-cone witness to refute before bit-blasting"
+        );
+
+        // Unsatisfiable sparse-mask guard (`(((x & 0x14) * 3) & 1) == 1` is impossible on all 4 points).
+        let unsat_pred = cx
+            .parse(
+                "~(((((x:64 & 0x14) * 3) & 1) == 1) & ((y:64 * 0x9e3779b97f4a7c15 ^ z:64) == 0x123456789abcdef0))",
+                &opt,
+            )
+            .unwrap();
+        let q_unsat = prove::Question::valid_under_with(
+            &mut cx,
+            unsat_pred,
+            None,
+            &ProveConfig::default().with_simplify_fuel(4),
+            &prover,
+        )
+        .unwrap();
+        assert!(
+            matches!(q_unsat.outcome(), Some(Outcome::Proved(_))),
+            "expected Proved via small-cone exhaustion, got {:?}",
+            q_unsat.outcome()
+        );
+        assert_eq!(q_unsat.stats().nodes, 0);
+    }
+
+    // Family 5: Telescoping N-ary `<u` carry-tree fusion + non-zero-corner multilinear `Select`.
+    for limb_bits in [8u16, 16, 32, 64] {
+        let w2 = Width::new(limb_bits * 2).unwrap();
+        let opt = ParseOptions::width(w2);
+        let mut cx = Context::new();
+        let mut s = String::new();
+        for i in 0..8usize {
+            let b0 = format!("extract<{i}, 1>(k)");
+            let b1 = format!("extract<{}, 1>(k)", i + 8);
+            let c00 = (i + 3) as u64;
+            let c01 = (i + 10) as u64;
+            let c10 = (i + 21) as u64;
+            let c11 = c10 + c01 - c00;
+            s.push_str(&format!(
+                "let t{i} = select({b0}, select({b1}, {c11}:{limb_bits}, {c10}:{limb_bits}), select({b1}, {c01}:{limb_bits}, {c00}:{limb_bits})); "
+            ));
+        }
+        s.push_str(&format!(
+            "let p01 = t0 + t1; let c01 = zext<{w}>(p01 <u t1); \
+             let p23 = t2 + t3; let c23 = zext<{w}>(p23 <u t3); \
+             let p45 = t4 + t5; let c45 = zext<{w}>(p45 <u t5); \
+             let p67 = t6 + t7; let c67 = zext<{w}>(p67 <u t7); \
+             let p03 = p01 + p23; let c03 = zext<{w}>(p03 <u p23); \
+             let p47 = p45 + p67; let c47 = zext<{w}>(p47 <u p67); \
+             let p07 = p03 + p47; let c07 = zext<{w}>(p07 <u p47); \
+             let hi = c01 + c23 + c45 + c67 + c03 + c47 + c07; \
+             concat(hi, p07) == zext<{w2b}>(t0) + zext<{w2b}>(t1) + zext<{w2b}>(t2) + zext<{w2b}>(t3) \
+                              + zext<{w2b}>(t4) + zext<{w2b}>(t5) + zext<{w2b}>(t6) + zext<{w2b}>(t7)",
+            w = limb_bits,
+            w2b = limb_bits * 2
+        ));
+        let pred = cx.parse(&s, &opt).unwrap();
+        let q = prove::Question::valid_under_with(&mut cx, pred, None, &cfg, &prover).unwrap();
+        assert!(
+            matches!(q.outcome(), Some(Outcome::Proved(_))),
+            "limb width {limb_bits}: expected carry-tree + multilinear Select Proved"
+        );
+        assert_eq!(
+            q.stats().conflicts,
+            0,
+            "limb width {limb_bits}: expected zero SAT conflicts after telescoping carry fusion"
+        );
+    }
+}

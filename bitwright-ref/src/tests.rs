@@ -101,7 +101,7 @@ fn native_pdep(x: u128, mut m: u128) -> u128 {
     let mut r = 0;
     let mut k = 0;
     while m != 0 {
-        let low = m & m.wrapping_neg();
+        let low = m.isolate_lowest_one();
         if (x >> k) & 1 == 1 {
             r |= low;
         }
@@ -115,7 +115,7 @@ fn native_pext(x: u128, mut m: u128) -> u128 {
     let mut r = 0;
     let mut k = 0;
     while m != 0 {
-        let low = m & m.wrapping_neg();
+        let low = m.isolate_lowest_one();
         if x & low != 0 {
             r |= 1 << k;
         }

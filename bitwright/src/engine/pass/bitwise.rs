@@ -302,23 +302,78 @@ fn bitwise_op(op: OpCode) -> bool {
     matches!(op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not)
 }
 
+/// Maps a 1-bit comparison leaf to a live canonical counterpart `(id, inverted)` in the current
+/// active DAG (`Ne(a, b) -> !Eq(a, b)`, `Ule(a, b) -> !Ult(b, a)`, `Sle(a, b) -> !Slt(b, a)`),
+/// never consulting dead arena nodes or raw node-index ordering.
+fn canonical_cmp_leaf(r: &Runner<'_, '_>, cx: &Context, i: u32) -> (u32, bool) {
+    if super::alone(r) || !r.life.uses_on {
+        return (i, false);
+    }
+    let n = cx.node(i);
+    if n.width != 1 {
+        return (i, false);
+    }
+    let is_live = |id: u32| -> bool {
+        !r.life.dead.contains(id)
+            && (r.life.live.uses(id).is_some_and(|u| u > 0) || r.life.live_roots.contains(&id))
+    };
+    match n.op {
+        OpCode::Ne => {
+            if let Some(eq) = cx
+                .find(&crate::expr::Node::new(OpCode::Eq, 1, n.a, n.b, 0))
+                .or_else(|| cx.find(&crate::expr::Node::new(OpCode::Eq, 1, n.b, n.a, 0)))
+                .filter(|&id| is_live(id))
+            {
+                return (eq, true);
+            }
+            (i, false)
+        }
+        OpCode::Ule => {
+            if let Some(lt) = cx
+                .find(&crate::expr::Node::new(OpCode::Ult, 1, n.b, n.a, 0))
+                .filter(|&id| is_live(id))
+            {
+                return (lt, true);
+            }
+            (i, false)
+        }
+        OpCode::Sle => {
+            if let Some(lt) = cx
+                .find(&crate::expr::Node::new(OpCode::Slt, 1, n.b, n.a, 0))
+                .filter(|&id| is_live(id))
+            {
+                return (lt, true);
+            }
+            (i, false)
+        }
+        _ => (i, false),
+    }
+}
+
 /// The description of `root`, computing (iteratively) and caching those below it.
 fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop> {
+    if !super::alone(r) {
+        super::refresh_uses(r, cx)?;
+    }
     let mut stack: Vec<(u32, bool)> = vec![(root, false)];
     while let Some((i, expanded)) = stack.pop() {
         if r.bitwise.info.contains_key(&i) {
             continue;
         }
         let node = cx.node(i);
-        let leaf = |i: u32| -> Info {
+        let leaf = |r: &Runner<'_, '_>, i: u32| -> Info {
             match cx.const_val(i) {
                 Some(v) if v.is_zero() => Some((Vec::new(), 0x00)),
                 Some(v) if v.is_ones() => Some((Vec::new(), 0xFF)),
-                _ => Some((vec![i], VARS[0])),
+                _ => {
+                    let (canon, inv) = canonical_cmp_leaf(r, cx, i);
+                    Some((vec![canon], if inv { !VARS[0] } else { VARS[0] }))
+                }
             }
         };
         if !bitwise_op(node.op) {
-            r.bitwise.info.insert(i, leaf(i));
+            let l = leaf(r, i);
+            r.bitwise.info.insert(i, l);
             continue;
         }
         if !expanded {
@@ -365,7 +420,7 @@ fn info_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Info, Stop
         };
         let info = if info.is_none() {
             r.stats.passes.entry("bitwise").or_default().atomized += 1;
-            leaf(i)
+            leaf(r, i)
         } else {
             info
         };
@@ -425,7 +480,7 @@ fn prune_wide(atoms: &[u32], tt: u64) -> Wide {
 }
 
 /// The wide description of node `i` as an atom (or a constant).
-fn wide_leaf(cx: &Context, i: u32) -> Wide {
+fn wide_leaf(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Wide {
     let mut w = Wide {
         atoms: [0; WIDE],
         len: 0,
@@ -434,14 +489,17 @@ fn wide_leaf(cx: &Context, i: u32) -> Wide {
     match cx.const_val(i) {
         Some(v) if v.is_zero() => {}
         Some(v) if v.is_ones() => w.tt = u64::MAX,
-        _ => (w.atoms[0], w.len, w.tt) = (i, 1, WIDE_VARS[0]),
+        _ => {
+            let (canon, inv) = canonical_cmp_leaf(r, cx, i);
+            (w.atoms[0], w.len, w.tt) = (canon, 1, if inv { !WIDE_VARS[0] } else { WIDE_VARS[0] });
+        }
     }
     w
 }
 
 /// The wide description of bitwise node `i` from its operands' (`b` is `a` for `~`); over more
 /// than [`WIDE`] atoms, `i` is an atom.
-fn wide_op(cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
+fn wide_op(r: &Runner<'_, '_>, cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
     // The operands' atoms merged, in index order.
     let mut atoms = [0u32; 2 * WIDE];
     let (mut n, mut x, mut y) = (0, a.atoms().iter().peekable(), b.atoms().iter().peekable());
@@ -458,7 +516,7 @@ fn wide_op(cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
         n += 1;
     }
     if n > WIDE {
-        return wide_leaf(cx, i);
+        return wide_leaf(r, cx, i);
     }
     let atoms = &atoms[..n];
     let (ta, tb) = (
@@ -474,7 +532,7 @@ fn wide_op(cx: &Context, i: u32, a: Wide, b: Wide) -> Wide {
     prune_wide(atoms, tt)
 }
 
-fn wide_select(cx: &Context, i: u32, c: Wide, t: Wide, f: Wide) -> Wide {
+fn wide_select(r: &Runner<'_, '_>, cx: &Context, i: u32, c: Wide, t: Wide, f: Wide) -> Wide {
     let mut atoms = [0u32; 3 * WIDE];
     let mut vec_atoms = Vec::with_capacity(c.atoms().len() + t.atoms().len() + f.atoms().len());
     vec_atoms.extend_from_slice(c.atoms());
@@ -483,7 +541,7 @@ fn wide_select(cx: &Context, i: u32, c: Wide, t: Wide, f: Wide) -> Wide {
     vec_atoms.sort_unstable();
     vec_atoms.dedup();
     if vec_atoms.len() > WIDE {
-        return wide_leaf(cx, i);
+        return wide_leaf(r, cx, i);
     }
     atoms[..vec_atoms.len()].copy_from_slice(&vec_atoms);
     let atoms = &atoms[..vec_atoms.len()];
@@ -503,7 +561,7 @@ fn wide_region_op(cx: &Context, i: u32) -> bool {
 /// its table repeated).
 fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
     if !wide_region_op(cx, i) {
-        return Some(wide_leaf(cx, i));
+        return Some(wide_leaf(r, cx, i));
     }
     if let Some(&w) = r.bitwise.wide.get(&i) {
         return Some(w);
@@ -527,6 +585,9 @@ fn known_wide(r: &Runner<'_, '_>, cx: &Context, i: u32) -> Option<Wide> {
 /// The wide description of `root`, computing (iteratively) and caching those below it that
 /// [`known_wide`] does not give.
 fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop> {
+    if !super::alone(r) {
+        super::refresh_uses(r, cx)?;
+    }
     if let Some(w) = known_wide(r, cx, root) {
         return Ok(w);
     }
@@ -546,17 +607,18 @@ fn wide_of(r: &mut Runner<'_, '_>, cx: &Context, root: u32) -> Result<Wide, Stop
             continue;
         }
         r.meter.charge(Counter::PassWork, 1)?;
-        let known = |c: u32| known_wide(r, cx, c).expect("operands come first");
+        let known = |r: &Runner<'_, '_>, c: u32| known_wide(r, cx, c).expect("operands come first");
         let w = if node.op == OpCode::Select {
-            wide_select(cx, i, known(node.a), known(node.b), known(node.c))
+            let (ca, cb, cc) = (known(r, node.a), known(r, node.b), known(r, node.c));
+            wide_select(r, cx, i, ca, cb, cc)
         } else {
-            let a = known(node.a);
+            let a = known(r, node.a);
             let b = if node.op == OpCode::Not {
                 a
             } else {
-                known(node.b)
+                known(r, node.b)
             };
-            wide_op(cx, i, a, b)
+            wide_op(r, cx, i, a, b)
         };
         r.bitwise.wide.insert(i, w);
     }
@@ -1169,8 +1231,46 @@ fn write(
     let mut canon = atoms.to_vec();
     canon.sort_by(|a, b| cx.order(*a, *b));
     let tt_c = remap(tt, atoms, &canon);
+    // When 1-bit comparison atoms may stand for complementary `Ne`/`Ule`/`Sle` leaves inside `n`,
+    // include their comparands in `bounds` so region traversal stops at the comparands rather than
+    // walking below them, and only include the canonical comparison node itself in `bounds` when it
+    // is already live in the DAG.
+    let mut cmp_bounds: Option<Vec<u32>> = None;
+    if cx.wid(n) == 1
+        && atoms.iter().any(|&a| {
+            matches!(
+                cx.node(a).op,
+                OpCode::Eq | OpCode::Ne | OpCode::Ult | OpCode::Slt
+            )
+        })
+    {
+        if !super::alone(r) {
+            super::refresh_uses(r, cx)?;
+        }
+        let mut b = Vec::with_capacity(atoms.len() * 3);
+        for &a in atoms {
+            let an = cx.node(a);
+            if matches!(an.op, OpCode::Eq | OpCode::Ne | OpCode::Ult | OpCode::Slt) {
+                let a_live = !super::alone(r)
+                    && !r.life.dead.contains(a)
+                    && (r.life.live.uses(a).is_some_and(|u| u > 0)
+                        || r.life.live_roots.contains(&a));
+                if a_live {
+                    b.push(a);
+                }
+                b.push(an.a);
+                b.push(an.b);
+            } else {
+                b.push(a);
+            }
+        }
+        b.sort_unstable();
+        b.dedup();
+        cmp_bounds = Some(b);
+    }
+    let bounds: &[u32] = cmp_bounds.as_deref().unwrap_or(atoms);
     // Upper bound on new nodes: the template's operators and constants.
-    if let Some(f) = worth_building(r, cx, n, atoms, cost(tt_c))? {
+    if let Some(f) = worth_building(r, cx, n, bounds, cost(tt_c))? {
         r.stats.passes.entry("bitwise").or_default().rejected_cost += 1;
         return Ok(Step::Normal(fin.and(f)));
     }
@@ -1191,7 +1291,7 @@ fn write(
         atoms: atoms.iter().map(|&a| cx.handle(a)).collect(),
         table: u64::from(tt),
     });
-    finish(r, cx, PassKind::Bitwise, n, e, before, atoms, fin)
+    finish(r, cx, PassKind::Bitwise, n, e, before, bounds, fin)
 }
 
 /// The most nodes of a bitwise tree [`hoist_cast`] reads.
@@ -1739,6 +1839,47 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         let node = cx.node(n);
         let (a, t, f) = (node.a, node.b, node.c);
         let an = cx.node(a);
+        // Unify negative comparison guards (`!=`, `<=u`, `<=s`) with an already-live positive
+        // counterpart (`==`, `<u`, `<s`) by swapping the select arms:
+        // `select(x != y, t, f) -> select(x == y, f, t)` when `x == y` is live in the DAG.
+        let pos_cmp = match an.op {
+            OpCode::Ne => cx
+                .find(&crate::expr::Node::new(OpCode::Eq, 1, an.a, an.b, 0))
+                .or_else(|| cx.find(&crate::expr::Node::new(OpCode::Eq, 1, an.b, an.a, 0))),
+            OpCode::Ule => cx.find(&crate::expr::Node::new(OpCode::Ult, 1, an.b, an.a, 0)),
+            OpCode::Sle => cx.find(&crate::expr::Node::new(OpCode::Slt, 1, an.b, an.a, 0)),
+            _ => None,
+        };
+        if let Some(pos_id) = pos_cmp {
+            super::refresh_uses(r, cx)?;
+            let pos_live = !r.life.dead.contains(pos_id)
+                && (r.life.live.uses(pos_id).is_some_and(|u| u > 0)
+                    || r.life.live_roots.contains(&pos_id));
+            if pos_live {
+                let before = cx.len() as u32;
+                let e = r.build(cx, |cx| cx.c_select(pos_id, f, t))?;
+                let mut stops = Vec::with_capacity(3);
+                for id in [pos_id, f, t] {
+                    if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+                match super::finish_with(
+                    r,
+                    cx,
+                    PassKind::Bitwise,
+                    n,
+                    e,
+                    before,
+                    &stops,
+                    Fin::FINAL,
+                    true,
+                )? {
+                    Step::Normal(_) => {}
+                    done => return Ok(done),
+                }
+            }
+        }
         // Guard-implied constant arm: `select(x == k, x, f) -> select(x == k, k, f)` and
         // `select(x != k, t, x) -> select(x != k, t, k)` for constant `k`.
         if an.op == OpCode::Eq && !cx.is_const(t) {
@@ -1931,6 +2072,85 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     Step::Normal(_) => {}
                     done => return Ok(done),
                 }
+            }
+        } else if tn.op == fn_.op
+            && matches!(tn.op, OpCode::Zext | OpCode::Sext)
+            && cx.wid(tn.a) == cx.wid(fn_.a)
+        {
+            let (x, y) = (tn.a, fn_.a);
+            let sel_exists = cx
+                .find(&crate::expr::Node::new(OpCode::Select, cx.wid(x), a, x, y))
+                .is_some();
+            let is_zext = tn.op == OpCode::Zext;
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let s = cx.c_select(a, x, y)?;
+                if is_zext {
+                    cx.c_zext(s, node.width)
+                } else {
+                    cx.c_sext(s, node.width)
+                }
+            })?;
+            let mut stops = Vec::with_capacity(3);
+            for id in [a, x, y] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                sel_exists,
+            )? {
+                Step::Normal(_) => {}
+                done => return Ok(done),
+            }
+        } else if tn.op == fn_.op
+            && let Some(sh_op) = match tn.op {
+                OpCode::Shl => Some(BinOp::Shl),
+                OpCode::LShr => Some(BinOp::LShr),
+                OpCode::AShr => Some(BinOp::AShr),
+                OpCode::RotL => Some(BinOp::RotL),
+                OpCode::RotR => Some(BinOp::RotR),
+                _ => None,
+            }
+            && tn.b == fn_.b
+            && cx.is_const(tn.b)
+        {
+            let (x, y, sh) = (tn.a, fn_.a, tn.b);
+            let sel_exists = cx
+                .find(&crate::expr::Node::new(OpCode::Select, node.width, a, x, y))
+                .is_some();
+            let before = cx.len() as u32;
+            let e = r.build(cx, |cx| {
+                let s = cx.c_select(a, x, y)?;
+                cx.c_bin(sh_op, s, sh)
+            })?;
+            let mut stops = Vec::with_capacity(4);
+            for id in [a, x, y, sh] {
+                if id < before && !cx.is_const(id) && !stops.contains(&id) {
+                    stops.push(id);
+                }
+            }
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Bitwise,
+                n,
+                e,
+                before,
+                &stops,
+                Fin::FINAL,
+                sel_exists,
+            )? {
+                Step::Normal(_) => {}
+                done => return Ok(done),
             }
         }
         let diamond = if tn.op == OpCode::Select && tn.b == f {

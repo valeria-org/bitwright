@@ -493,8 +493,7 @@ impl Memory {
         }
         let mut pending: Vec<(Expr, Expr)> = Vec::new();
         let mut found = None;
-        for k in 0..self.reads.len() {
-            let (ra, rs) = self.reads[k];
+        for &(ra, rs) in &self.reads {
             match Self::same(cx, a, ra)? {
                 Ok(true) => {
                     found = Some(rs);

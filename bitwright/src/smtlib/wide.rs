@@ -261,16 +261,13 @@ impl<'a, 's> State<'a, 's> {
         let mut acc = self.wide_fill(false, a.bits)?;
         let zero = self.cx.bool(false)?;
         let double = width(2 * LIMB)?;
-        for i in 0..a.limbs.len() {
-            for j in 0..b.limbs.len() {
+        for (i, &al) in a.limbs.iter().enumerate() {
+            for (j, &bl) in b.limbs.iter().enumerate() {
                 let at = LIMB * (i + j) as u32;
                 if at >= a.bits {
                     break;
                 }
-                let (x, y) = (
-                    self.cx.zext(a.limbs[i], double)?,
-                    self.cx.zext(b.limbs[j], double)?,
-                );
+                let (x, y) = (self.cx.zext(al, double)?, self.cx.zext(bl, double)?);
                 let p = self.cx.bin(BinOp::Mul, x, y)?;
                 // The product at its place: zeros below it, what fits of it, zeros above.
                 let mut pieces = Vec::new();

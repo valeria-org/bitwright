@@ -280,7 +280,7 @@ pub(crate) fn lower_id(
     let mut scan_lim = *lim;
     scan_lim.max_vars = lim.max_vars.saturating_add(4);
     let (mut atoms, order) = scan(cx, root, &scan_lim)?;
-    let peers = deduplicate_peers(cx, &mut atoms);
+    let peers = deduplicate_peers(cx, &mut atoms, true);
     if atoms.len() as u32 > lim.max_vars {
         return Err(Refusal::TooManyVars);
     }
@@ -316,7 +316,7 @@ pub(crate) fn lower_id_over(
     let Some(reading) = reading else {
         let (mut atoms, order) =
             scan_in(cx, root, &scan_lim, &|cx, i| free(i) && in_fragment(cx, i))?;
-        let peers = deduplicate_peers(cx, &mut atoms);
+        let peers = deduplicate_peers(cx, &mut atoms, true);
         if atoms.len() as u32 > lim.max_vars {
             return Err(Refusal::TooManyVars);
         }
@@ -376,7 +376,7 @@ pub(crate) fn lower_id_over(
     } else {
         order
     };
-    let peers = deduplicate_peers(cx, &mut atoms);
+    let peers = deduplicate_peers(cx, &mut atoms, reading != Reading::Linear);
     if atoms.len() as u32 > lim.max_vars {
         return Err(Refusal::TooManyVars);
     }
@@ -400,7 +400,7 @@ pub(crate) fn lower_id_whole(
     let semi = order
         .iter()
         .all(|&i| in_reading(cx, i, Reading::SemiLinear));
-    let peers = deduplicate_peers(cx, &mut atoms);
+    let peers = deduplicate_peers(cx, &mut atoms, true);
     if atoms.len() as u32 > lim.max_vars {
         return Err(Refusal::TooManyVars);
     }
@@ -440,7 +440,11 @@ fn is_negated_pair(cx: &Context, a: u32, b: u32) -> bool {
 /// `t + c1` vs `t + c2` / `c2 - t`, nested bit-masks `x & m_sub` under `x & m_sup` or `x`, and
 /// opposite-sign products `(K - X) * M` vs `(X - K) * M`), returning `PeerSolved` entries in
 /// valid topological order so chained peers never reference an unbuilt source.
-fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
+fn deduplicate_peers(
+    cx: &Context,
+    atoms: &mut Vec<u32>,
+    allow_nonuniform: bool,
+) -> Vec<PeerSolved> {
     if atoms.len() < 2 {
         return Vec::new();
     }
@@ -452,40 +456,143 @@ fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
         }
         let aj = atoms[j];
         let wj = cx.wid(aj);
-        // 1) Check if `aj` is `x & m_sub` covered by another kept atom `ai` (`x` or `x & m_sup`).
-        if let Some((xj, m_sub)) = const_and_of(cx, aj) {
-            let sup = (0..atoms.len()).find(|&i| {
-                i != j
-                    && keep[i]
-                    && cx.wid(atoms[i]) == wj
-                    && if atoms[i] == xj {
-                        true
-                    } else if let Some((xi, m_sup)) = const_and_of(cx, atoms[i]) {
-                        xi == xj
-                            && BitVec::bin_unchecked(
-                                BinOp::And,
-                                &m_sub,
-                                &BitVec::un_unchecked(UnOp::Not, &m_sup),
-                            )
-                            .is_zero()
-                            && (m_sub != m_sup || i < j)
-                    } else {
-                        false
+        // 1) Check if `aj` is `x & m_sub` or `~x & m_sub` covered by another kept atom `ai`
+        // (`x`, `x & m_sup`, `~x & m_sup`, or a carry-free low-bit offset `x + c` / `c - x` /
+        // `x ^ c` whose carries/flips do not disturb `m_sub`). Never inject non-uniform bitwise
+        // masks into `Reading::Linear`, whose fragment intentionally stops at masked terms so
+        // `Reading::SemiLinear` can expand shared bitwise cores (`x0 & x1`) into base variables.
+        if allow_nonuniform && let Some((xj, m_sub, is_not)) = masked_atom_of(cx, aj) {
+            let cov = (0..atoms.len()).find_map(|i| {
+                if i == j || !keep[i] || cx.wid(atoms[i]) != wj {
+                    return None;
+                }
+                let ai = atoms[i];
+                if ai == xj {
+                    return Some((
+                        ai,
+                        if is_not {
+                            PeerOp::NotAnd(m_sub)
+                        } else {
+                            PeerOp::And(m_sub)
+                        },
+                    ));
+                }
+                if let Some((xi, m_sup, not_i)) = masked_atom_of(cx, ai)
+                    && xi == xj
+                    && not_i == is_not
+                    && BitVec::bin_unchecked(
+                        BinOp::And,
+                        &m_sub,
+                        &BitVec::un_unchecked(UnOp::Not, &m_sup),
+                    )
+                    .is_zero()
+                    && (m_sub != m_sup || i < j)
+                {
+                    return Some((ai, PeerOp::And(m_sub)));
+                }
+                if let Some((ti, ki)) = offset_or_xor(cx, ai)
+                    && ti == xj
+                {
+                    let w = cx.width_of(aj);
+                    match ki {
+                        SolvedKind::Sub {
+                            constant: c,
+                            negated: false,
+                        } if !c.is_zero() => {
+                            let tz = crate::facts::known::trailing_zeros(&c);
+                            if tz > 0 {
+                                let low = crate::facts::known::low_mask(w, tz);
+                                if BitVec::bin_unchecked(
+                                    BinOp::And,
+                                    &m_sub,
+                                    &BitVec::un_unchecked(UnOp::Not, &low),
+                                )
+                                .is_zero()
+                                {
+                                    return Some((
+                                        ai,
+                                        if is_not {
+                                            PeerOp::NotAnd(m_sub)
+                                        } else {
+                                            PeerOp::And(m_sub)
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        SolvedKind::Sub {
+                            constant: c,
+                            negated: true,
+                        } => {
+                            let c1 = BitVec::bin_unchecked(BinOp::Add, &c, &BitVec::one(w));
+                            let tz = if c1.is_zero() {
+                                u32::from(wj)
+                            } else {
+                                crate::facts::known::trailing_zeros(&c1)
+                            };
+                            if tz > 0 {
+                                let low = crate::facts::known::low_mask(w, tz);
+                                if BitVec::bin_unchecked(
+                                    BinOp::And,
+                                    &m_sub,
+                                    &BitVec::un_unchecked(UnOp::Not, &low),
+                                )
+                                .is_zero()
+                                {
+                                    return Some((
+                                        ai,
+                                        if is_not {
+                                            PeerOp::And(m_sub)
+                                        } else {
+                                            PeerOp::NotAnd(m_sub)
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        SolvedKind::Xor(c) => {
+                            let overlap = BitVec::bin_unchecked(BinOp::And, &c, &m_sub);
+                            if overlap.is_zero() {
+                                return Some((
+                                    ai,
+                                    if is_not {
+                                        PeerOp::NotAnd(m_sub)
+                                    } else {
+                                        PeerOp::And(m_sub)
+                                    },
+                                ));
+                            } else if overlap == m_sub {
+                                return Some((
+                                    ai,
+                                    if is_not {
+                                        PeerOp::And(m_sub)
+                                    } else {
+                                        PeerOp::NotAnd(m_sub)
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                None
             });
-            if let Some(i) = sup {
+            if let Some((src, op)) = cov {
                 keep[j] = false;
                 peers.push(PeerSolved {
                     target: aj,
-                    source: atoms[i],
-                    op: PeerOp::And(m_sub),
+                    source: src,
+                    op,
                 });
                 continue;
             }
         }
         // 2) Check if `aj` is `t ^ c` / `t + c` / `c - t` over another kept bare atom `t` (any
         // index `i != j`), or shares an affine/xor base with an earlier kept atom `ai` (`i < j`).
-        if let Some((tj, kj)) = offset_or_xor(cx, aj) {
+        if let Some((tj, kj)) = offset_or_xor(cx, aj)
+            && (allow_nonuniform
+                || !matches!(kj, SolvedKind::Xor(ref c) if !c.is_zero() && !c.is_ones()))
+        {
             if let Some(i) = (0..atoms.len()).find(|&i| i != j && keep[i] && atoms[i] == tj) {
                 let op = match kj {
                     SolvedKind::Xor(c) => PeerOp::Xor(c),
@@ -643,6 +750,57 @@ fn deduplicate_peers(cx: &Context, atoms: &mut Vec<u32>) -> Vec<PeerSolved> {
                     source: atoms[i],
                     op: PeerOp::SubFrom(BitVec::zero(cx.width_of(aj))),
                 });
+                continue;
+            }
+        }
+        // 5) Multi-term linear sum peers (`S_j == S_i + C` or `S_j == C - S_i`, including
+        // `S_j == ~S_i == -1 - S_i`).
+        if wj <= 64
+            && matches!(nj.op, OpCode::Add | OpCode::Sub | OpCode::Neg)
+            && let Some((tj, bj)) = flat_linear_u64(cx, aj, wj)
+            && !tj.is_empty()
+        {
+            let mask = u64::MAX >> (64 - wj);
+            let w = cx.width_of(aj);
+            let sum_peer = (0..j).find_map(|i| {
+                if !keep[i] || cx.wid(atoms[i]) != wj {
+                    return None;
+                }
+                let (ti, bi) = flat_linear_u64(cx, atoms[i], wj)?;
+                if ti.len() != tj.len() {
+                    return None;
+                }
+                if ti == tj {
+                    let diff = bj.wrapping_sub(bi) & mask;
+                    let op = if diff == 0 {
+                        PeerOp::Xor(BitVec::zero(w))
+                    } else {
+                        PeerOp::Add(BitVec::wrapping_from_u64(w, diff))
+                    };
+                    return Some((atoms[i], op));
+                }
+                if ti
+                    .iter()
+                    .zip(&tj)
+                    .all(|(&(a1, c1), &(a2, c2))| a1 == a2 && c1.wrapping_add(c2) & mask == 0)
+                {
+                    let sum_b = bi.wrapping_add(bj) & mask;
+                    let op = if sum_b == mask {
+                        PeerOp::Xor(BitVec::ones(w))
+                    } else {
+                        PeerOp::SubFrom(BitVec::wrapping_from_u64(w, sum_b))
+                    };
+                    return Some((atoms[i], op));
+                }
+                None
+            });
+            if let Some((src, op)) = sum_peer {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: src,
+                    op,
+                });
             }
         }
     }
@@ -706,16 +864,90 @@ fn zext_xor_of(cx: &Context, a: u32) -> Option<((u32, u16), BitVec)> {
     }
 }
 
-fn const_and_of(cx: &Context, a: u32) -> Option<(u32, BitVec)> {
+fn masked_atom_of(cx: &Context, a: u32) -> Option<(u32, BitVec, bool)> {
     let n = cx.node(a);
     if n.op != OpCode::And {
         return None;
     }
-    match (cx.const_val(n.a), cx.const_val(n.b)) {
-        (None, Some(m)) => Some((n.a, m)),
-        (Some(m), None) => Some((n.b, m)),
-        _ => None,
+    let (inner, m) = match (cx.const_val(n.a), cx.const_val(n.b)) {
+        (None, Some(m)) => (n.a, m),
+        (Some(m), None) => (n.b, m),
+        _ => return None,
+    };
+    let in_node = cx.node(inner);
+    if in_node.op == OpCode::Not {
+        Some((in_node.a, m, true))
+    } else {
+        Some((inner, m, false))
     }
+}
+
+fn flat_linear_u64(cx: &Context, root: u32, w: u16) -> Option<(Vec<(u32, u64)>, u64)> {
+    let mask = u64::MAX >> (64 - w);
+    let mut bias = 0u64;
+    let mut parts: Vec<(u32, u64)> = Vec::new();
+    let mut stack: Vec<(u32, u64, u8)> = vec![(root, 1, 14)];
+    let mut steps = 0usize;
+    while let Some((i, k, depth)) = stack.pop() {
+        steps += 1;
+        if steps > 48 || parts.len() > 24 {
+            return None;
+        }
+        if depth == 0 {
+            parts.push((i, k));
+            continue;
+        }
+        let n = cx.node(i);
+        match n.op {
+            OpCode::Const => {
+                bias = bias.wrapping_add(k.wrapping_mul(cx.const_val(i)?.to_u64()?));
+            }
+            OpCode::Add => {
+                stack.push((n.a, k, depth - 1));
+                stack.push((n.b, k, depth - 1));
+            }
+            OpCode::Sub => {
+                stack.push((n.a, k, depth - 1));
+                stack.push((n.b, k.wrapping_neg(), depth - 1));
+            }
+            OpCode::Neg => stack.push((n.a, k.wrapping_neg(), depth - 1)),
+            OpCode::Not => {
+                bias = bias.wrapping_sub(k);
+                stack.push((n.a, k.wrapping_neg(), depth - 1));
+            }
+            OpCode::Mul if cx.const_val(n.b).and_then(|v| v.to_u64()).is_some() => {
+                let c = cx.const_val(n.b)?.to_u64()?;
+                stack.push((n.a, k.wrapping_mul(c), depth - 1));
+            }
+            OpCode::Mul if cx.const_val(n.a).and_then(|v| v.to_u64()).is_some() => {
+                let c = cx.const_val(n.a)?.to_u64()?;
+                stack.push((n.b, k.wrapping_mul(c), depth - 1));
+            }
+            OpCode::Shl
+                if cx
+                    .const_val(n.b)
+                    .and_then(|v| v.to_u64())
+                    .is_some_and(|s| s < u64::from(w)) =>
+            {
+                let s = cx.const_val(n.b)?.to_u64()?;
+                stack.push((n.a, k << s, depth - 1));
+            }
+            _ => parts.push((i, k)),
+        }
+    }
+    parts.sort_unstable_by_key(|&(id, _)| id);
+    parts.dedup_by(|next, prev| {
+        if next.0 != prev.0 {
+            return false;
+        }
+        prev.1 = prev.1.wrapping_add(next.1);
+        true
+    });
+    parts.retain(|(_, c)| *c & mask != 0);
+    for (_, c) in &mut parts {
+        *c &= mask;
+    }
+    Some((parts, bias & mask))
 }
 
 /// Node `a` as `t + k`, `k − t`, or `t ^ k` with `k` a constant.
@@ -784,6 +1016,7 @@ enum PeerOp {
     Add(BitVec),
     SubFrom(BitVec),
     And(BitVec),
+    NotAnd(BitVec),
 }
 
 struct PeerSolved {
@@ -972,6 +1205,11 @@ fn build_in(
             PeerOp::And(c) => {
                 let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
                 m.push(MOp::And, &[src, k]).map_err(bad)?
+            }
+            PeerOp::NotAnd(c) => {
+                let ns = m.push(MOp::Not, &[src]).map_err(bad)?;
+                let k = m.push(MOp::Const(c), &[]).map_err(bad)?;
+                m.push(MOp::And, &[ns, k]).map_err(bad)?
             }
         };
         at.insert(p.target, v);

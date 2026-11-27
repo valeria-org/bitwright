@@ -1108,8 +1108,10 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
         // What the candidate is built over: the condition, the pairs, and a pair's `select`
         // itself where it exists and something live reads it (it is there either way).
         let mut atoms = vec![c];
+        let mut all_there = !bases.is_empty();
         for &(x, y) in &bases {
             let there = h.exists(r, cx, x, y)?;
+            all_there &= there;
             let s = r.build(cx, |cx| cx.c_select(c, x, y))?;
             of.insert((x, y), s);
             if there {
@@ -1126,7 +1128,8 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
         }
         atoms.extend(&h.found);
         let e = h.build(r, cx, &of, &mut IdMap::default(), a, b)?;
-        match finish(r, cx, PassKind::Casts, n, e, start, &atoms, fin)? {
+        let tie_ok = all_there && h.leaves.len() == bases.len() && cx.node(a).op != OpCode::Extract;
+        match super::finish_with(r, cx, PassKind::Casts, n, e, start, &atoms, fin, tie_ok)? {
             Step::Normal(f) => fin = f,
             step => return Ok(step),
         }
@@ -1186,7 +1189,9 @@ fn hoisted(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Sto
                 } else {
                     atoms.extend([x, y]);
                 }
-                match finish(r, cx, PassKind::Casts, n, e, start, &atoms, fin)? {
+                let tie_ok = there && na.op != OpCode::Extract;
+                match super::finish_with(r, cx, PassKind::Casts, n, e, start, &atoms, fin, tie_ok)?
+                {
                     Step::Normal(f) => fin = f,
                     step => return Ok(step),
                 }
@@ -1717,6 +1722,131 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         match narrow_to_live_wide(r, cx, n)? {
             Step::Normal(f) => declined = declined.and(f),
             step => return Ok(step),
+        }
+    }
+    // Unwrap shifted narrowed products `zext<W>(f_1 * ... * f_m) << k` (`1 <= k < W`, `nw = W - k`):
+    // modulo `2^W`, `2^k * ((f_1 * ... * f_m) mod 2^(W - k)) == (2^k * f_c) * prod_{j != c} f_j`
+    // for ANY lifts where `2^k * f_c` is evaluated mod `2^W` and every other factor agrees mod `2^nw`.
+    // In particular, `extract<k, nw>(s)` with `low_zero(s, k)` absorbs `<< k` to become `s`, and
+    // every `trunc<nw>(x)` factor (`cx.wid(x) == W`) lifts directly to `x`.
+    if node.op == OpCode::Shl
+        && node.width >= 2
+        && let Some(kv) = cx.const_val(node.b).and_then(|v| v.to_u64())
+        && kv >= 1
+        && kv < u64::from(node.width)
+    {
+        let w = node.width;
+        let k = kv as u16;
+        let nw = w - k;
+        let zn = cx.node(node.a);
+        if zn.op == OpCode::Zext && cx.wid(zn.a) == nw && cx.node(zn.a).op == OpCode::Mul {
+            let mut factors = vec![zn.a];
+            let mut idx = 0;
+            while idx < factors.len() && factors.len() < 8 {
+                let cur = cx.node(factors[idx]);
+                if cur.op == OpCode::Mul {
+                    let b = cur.b;
+                    factors[idx] = cur.a;
+                    factors.insert(idx + 1, b);
+                } else {
+                    idx += 1;
+                }
+            }
+            let mut carrier_idx: Option<(usize, u32)> = None;
+            let mut any_trunc = false;
+            let mut used_fin = Fin::FINAL;
+            let mut declined_lz = Fin::FINAL;
+            for (i, &f) in factors.iter().enumerate() {
+                let fn_ = cx.node(f);
+                if fn_.op == OpCode::Extract && fn_.width == nw && cx.wid(fn_.a) == w {
+                    if fn_.b == 0 {
+                        any_trunc = true;
+                    } else if fn_.b == u32::from(k) && carrier_idx.is_none() {
+                        let (lz, f_lz) = low_zero(r, cx, fn_.a, k)?;
+                        if lz {
+                            used_fin = used_fin.and(f_lz);
+                            carrier_idx = Some((i, fn_.a));
+                        } else {
+                            declined_lz = declined_lz.and(f_lz.unchanged());
+                        }
+                    }
+                }
+            }
+            if carrier_idx.is_some() || any_trunc {
+                let before = cx.len() as u32;
+                let mut stops: Vec<u32> = Vec::with_capacity(factors.len());
+                let mut wide_factors: Vec<u32> = Vec::with_capacity(factors.len());
+                if let Some((ci, s)) = carrier_idx {
+                    for (i, &f) in factors.iter().enumerate() {
+                        if i == ci {
+                            stops.push(s);
+                            wide_factors.push(s);
+                        } else {
+                            let fn_ = cx.node(f);
+                            if fn_.op == OpCode::Extract
+                                && fn_.b == 0
+                                && fn_.width == nw
+                                && cx.wid(fn_.a) == w
+                            {
+                                stops.push(fn_.a);
+                                wide_factors.push(fn_.a);
+                            } else if cx.is_const(f) {
+                                let wf = r.build(cx, |cx| cx.c_zext(f, w))?;
+                                wide_factors.push(wf);
+                            } else {
+                                stops.push(f);
+                                let wf = r.build(cx, |cx| cx.c_zext(f, w))?;
+                                wide_factors.push(wf);
+                            }
+                        }
+                    }
+                } else {
+                    let is_trunc_w = |f: u32| {
+                        let fn_ = cx.node(f);
+                        fn_.op == OpCode::Extract
+                            && fn_.b == 0
+                            && fn_.width == nw
+                            && cx.wid(fn_.a) == w
+                    };
+                    let shift_idx = factors
+                        .iter()
+                        .position(|&f| cx.is_const(f))
+                        .or_else(|| factors.iter().position(|&f| !is_trunc_w(f)))
+                        .unwrap_or(factors.len() - 1);
+                    for (i, &f) in factors.iter().enumerate() {
+                        let fn_ = cx.node(f);
+                        let base = if fn_.op == OpCode::Extract
+                            && fn_.b == 0
+                            && fn_.width == nw
+                            && cx.wid(fn_.a) == w
+                        {
+                            stops.push(fn_.a);
+                            fn_.a
+                        } else if cx.is_const(f) {
+                            r.build(cx, |cx| cx.c_zext(f, w))?
+                        } else {
+                            stops.push(f);
+                            r.build(cx, |cx| cx.c_zext(f, w))?
+                        };
+                        if i == shift_idx {
+                            let sh = r.build(cx, |cx| cx.c_bin(BinOp::Shl, base, node.b))?;
+                            wide_factors.push(sh);
+                        } else {
+                            wide_factors.push(base);
+                        }
+                    }
+                }
+                let mut prod = wide_factors[0];
+                for &wf in &wide_factors[1..] {
+                    prod = r.build(cx, |cx| cx.c_bin(BinOp::Mul, prod, wf))?;
+                }
+                match finish(r, cx, PassKind::Casts, n, prod, before, &stops, used_fin)? {
+                    Step::Normal(f) => declined = declined.and(f).and(declined_lz),
+                    step => return Ok(step),
+                }
+            } else {
+                declined = declined.and(declined_lz);
+            }
         }
     }
     // Narrow 1-bit masked wide expressions `x & 1` (`width > 1`) via `zext<W>(narrow(x, 0, 1))`

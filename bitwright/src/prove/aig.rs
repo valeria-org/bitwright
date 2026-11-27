@@ -802,8 +802,7 @@ impl Cnf {
                 uses[(b >> 1) as usize] += 1;
             }
         }
-        let uses = &*uses;
-        let private_inner = |l: L| -> Option<(L, L)> {
+        let private_inner = |l: L, uses: &[u32]| -> Option<(L, L)> {
             let at = (l >> 1) as usize;
             match aig.nodes[at] {
                 Node::And(a, b) if uses[at] == 1 && var[at] == NONE => Some((a, b)),
@@ -873,6 +872,46 @@ impl Cnf {
             }
             None
         };
+        let compact_majority = |a: L, b: L, uses: &[u32], need: &[bool]| -> Option<(Gate, usize)> {
+            // Compact full-adder carry `¬((x ∧ y) ∨ (c ∧ (x ⊕ y))) == ¬maj(x, y, c)`.
+            if a & 1 == 0 || b & 1 == 0 {
+                return None;
+            }
+            for (xy_neg, cs_neg) in [(a, b), (b, a)] {
+                let (Some((x, y)), Some((r0, r1))) = (inner(xy_neg), inner(cs_neg)) else {
+                    continue;
+                };
+                let cs_idx = (cs_neg >> 1) as usize;
+                for (c, s) in [(r0, r1), (r1, r0)] {
+                    let Some((ps, qs)) = inner(s & !1) else {
+                        continue;
+                    };
+                    if ps & 1 == 0 || qs & 1 == 0 {
+                        continue;
+                    }
+                    let (Some((u0, u1)), Some((v0, v1))) = (inner(ps), inner(qs)) else {
+                        continue;
+                    };
+                    if !((v0 == u0 ^ 1 && v1 == u1 ^ 1) || (v0 == u1 ^ 1 && v1 == u0 ^ 1)) {
+                        continue;
+                    }
+                    let (u, v) = (u0, u1 ^ (s & 1));
+                    if (u == x && v == y)
+                        || (u == y && v == x)
+                        || (u == x ^ 1 && v == y ^ 1)
+                        || (u == y ^ 1 && v == x ^ 1)
+                    {
+                        let dec = if uses[cs_idx] == 1 && !need[cs_idx] {
+                            (s >> 1) as usize
+                        } else {
+                            0
+                        };
+                        return Some((Gate::NotMaj(x, y, c), dec));
+                    }
+                }
+            }
+            None
+        };
         let special = |a, b| gate2(a, b).or_else(|| majority(a, b));
         // Which nodes get a variable, and how each is encoded: from the top down, a node's
         // users are decided before it.
@@ -890,7 +929,15 @@ impl Cnf {
             let Node::And(a, b) = aig.nodes[i] else {
                 continue;
             };
-            let detected = special(a, b);
+            let mut detected = special(a, b);
+            if detected.is_none()
+                && let Some((g, dec)) = compact_majority(a, b, uses, need)
+            {
+                if dec != 0 {
+                    uses[dec] = uses[dec].saturating_sub(1);
+                }
+                detected = Some(g);
+            }
             let detected = match detected {
                 Some(Gate::Xor(x, y)) if xor3 && uses[i] > 1 => {
                     let mut triple = None;
@@ -918,7 +965,7 @@ impl Cnf {
                 let start = leaves.len();
                 stack.extend([b, a]);
                 while let Some(l) = stack.pop() {
-                    match private_inner(l) {
+                    match private_inner(l, uses) {
                         Some((x, y)) if l & 1 == 0 && special(x, y).is_none() => {
                             stack.extend([y, x]);
                         }

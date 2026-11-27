@@ -850,6 +850,37 @@ pub(super) fn complementary_shift_disjoint(cx: &Context, a: u32, b: u32) -> bool
     !crate::BitVec::cmp_unchecked(crate::ops::CmpOp::Ult, &c, &w_bv)
 }
 
+/// Syntactic `And`-factor complement check across all widths `1..=512`: `a` and `b` share no set
+/// bit whenever any associative `And` factor of `a` and any `And` factor of `b` are bitwise
+/// complements (`x` vs `~x & y & z`).
+fn syntactic_and_disjoint(cx: &Context, a: u32, b: u32) -> bool {
+    fn collect_and_factors(cx: &Context, root: u32, out: &mut [u32; 8], len: &mut usize) {
+        let n = cx.node(root);
+        if n.op == OpCode::And && *len + 1 < 8 {
+            collect_and_factors(cx, n.a, out, len);
+            if *len < 8 {
+                collect_and_factors(cx, n.b, out, len);
+            }
+        } else if *len < 8 {
+            out[*len] = root;
+            *len += 1;
+        }
+    }
+    let (mut fa, mut la) = ([0u32; 8], 0usize);
+    let (mut fb, mut lb) = ([0u32; 8], 0usize);
+    collect_and_factors(cx, a, &mut fa, &mut la);
+    collect_and_factors(cx, b, &mut fb, &mut lb);
+    fa[..la]
+        .iter()
+        .any(|&x| fb[..lb].iter().any(|&y| cx.are_bitwise_complements(x, y)))
+}
+
+/// Pure syntactic disjointness check across all widths `1..=512` (complementary shifts with sum
+/// `>= W` or complementary `And`-factors `x` vs `~x & y & z`).
+pub(crate) fn syntactic_disjoint(cx: &Context, a: u32, b: u32) -> bool {
+    complementary_shift_disjoint(cx, a, b) || syntactic_and_disjoint(cx, a, b)
+}
+
 /// Whether the facts prove that `a` and `b` (of one width) never have a bit set in both, with
 /// what the facts of each relied on.
 pub(super) fn disjoint(
@@ -858,7 +889,7 @@ pub(super) fn disjoint(
     a: u32,
     b: u32,
 ) -> Result<(bool, Fin, Fin), Stop> {
-    if complementary_shift_disjoint(cx, a, b) {
+    if syntactic_disjoint(cx, a, b) {
         return Ok((true, Fin::FINAL, Fin::FINAL));
     }
     let bits = cx.width_of(a).bits();

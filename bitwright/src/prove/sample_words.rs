@@ -7,7 +7,7 @@ use crate::{
 };
 
 const MAX_NODES: usize = 4096;
-const POST_SIMP_MAX_NODES: usize = 16_384;
+const POST_SIMP_MAX_NODES: usize = 32_768;
 
 #[derive(Clone, Copy)]
 enum SlicePiece {
@@ -803,7 +803,7 @@ pub(super) fn try_sample(
     assumptions: Option<&Assumptions>,
     cfg: &Config,
 ) -> Option<Trial> {
-    try_sample_with_limit(cx, goal, constraints, assumptions, cfg, MAX_NODES)
+    try_sample_with_limit(cx, goal, constraints, assumptions, cfg, MAX_NODES, false)
 }
 
 pub(super) fn try_sample_post_simplify(
@@ -813,7 +813,317 @@ pub(super) fn try_sample_post_simplify(
     assumptions: Option<&Assumptions>,
     cfg: &Config,
 ) -> Option<Trial> {
-    try_sample_with_limit(cx, goal, constraints, assumptions, cfg, POST_SIMP_MAX_NODES)
+    let allow_cone_heuristics =
+        !cfg.word_sampling && cfg.sample_mode == SampleMode::Random && !cfg.certificate;
+    try_sample_with_limit(
+        cx,
+        goal,
+        constraints,
+        assumptions,
+        cfg,
+        POST_SIMP_MAX_NODES,
+        allow_cone_heuristics,
+    )
+}
+
+fn low_prefix_u64(m: u64) -> u64 {
+    if m == 0 {
+        0
+    } else {
+        u64::MAX >> m.leading_zeros()
+    }
+}
+
+enum SmallCone {
+    /// Conjunct `(slot, want)` has zero satisfying assignments across its entire exact support.
+    Unsat(u64),
+    /// Single-symbol exact satisfying bit-patterns `(sym_idx, eff_mask, patterns)`.
+    Witnesses(usize, u64, Vec<u64>),
+}
+
+type ConePin = (usize, u64, Vec<u64>);
+
+/// Evaluates any required conjunct `(slot, want)` whose demanded support inside `p` depends on at
+/// most 10 free bits of a single symbol (`<= 1024` points) and zero free bits of all other symbols.
+fn analyze_small_cones(p: &Program, terms: &[(usize, bool)]) -> (Option<u64>, Vec<ConePin>) {
+    let mut pins: Vec<ConePin> = Vec::new();
+    let mut dem: IdMap<usize, u64> = IdMap::default();
+    let mut cone: Vec<usize> = Vec::new();
+    let mut vals: Vec<u64> = Vec::new();
+
+    for &(slot, want) in terms.iter().take(24) {
+        dem.clear();
+        cone.clear();
+        let init_m = p.ops[slot].mask;
+        if init_m == 0 {
+            continue;
+        }
+        dem.insert(slot, init_m);
+        // Walk backwards through `slot`'s cone by Collecting reachable op indices (`child < parent`).
+        let mut stack = vec![slot];
+        let mut too_big = false;
+        while let Some(u) = stack.pop() {
+            if cone.contains(&u) {
+                continue;
+            }
+            if cone.len() >= 256 {
+                too_big = true;
+                break;
+            }
+            cone.push(u);
+            match p.ops[u].op {
+                Op::Constant(_) | Op::Symbol(_) => {}
+                Op::Unary(_, a)
+                | Op::Zext(a)
+                | Op::Sext(a, _)
+                | Op::Extract(a, _)
+                | Op::MixerRound(a, _)
+                | Op::MixerUnround(a, _) => stack.push(a),
+                Op::Binary(_, a, b) | Op::Compare(_, a, b, _) | Op::Concat(a, b, _) => {
+                    stack.extend([a, b]);
+                }
+                Op::Select(c, t, e) => stack.extend([c, t, e]),
+            }
+        }
+        if too_big {
+            continue;
+        }
+        cone.sort_unstable();
+        for &u in cone.iter().rev() {
+            let m = dem.get(&u).copied().unwrap_or(0) & p.ops[u].mask;
+            if m == 0 {
+                continue;
+            }
+            let mut add_dem = |ch: usize, cm: u64| {
+                let masked = cm & p.ops[ch].mask;
+                if masked != 0 {
+                    *dem.entry(ch).or_default() |= masked;
+                }
+            };
+            match p.ops[u].op {
+                Op::Constant(_) | Op::Symbol(_) => {}
+                Op::Unary(UnOp::Not, a) => add_dem(a, m),
+                Op::Unary(UnOp::Neg, a) => add_dem(a, low_prefix_u64(m)),
+                Op::Unary(_, a) | Op::MixerRound(a, _) | Op::MixerUnround(a, _) => {
+                    add_dem(a, p.ops[a].mask);
+                }
+                Op::Zext(a) => add_dem(a, m),
+                Op::Sext(a, w) => {
+                    let mut ma = m & p.ops[a].mask;
+                    if m & !p.ops[a].mask != 0 {
+                        ma |= 1u64 << (w - 1);
+                    }
+                    add_dem(a, ma);
+                }
+                Op::Extract(a, lo) => {
+                    if lo < 64 {
+                        add_dem(a, m << lo);
+                    } else {
+                        add_dem(a, p.ops[a].mask);
+                    }
+                }
+                Op::Concat(hi, lo, lb) => {
+                    add_dem(lo, m);
+                    if lb < 64 {
+                        add_dem(hi, m >> lb);
+                    }
+                }
+                Op::Binary(BinOp::And, a, b) => match (&p.ops[a].op, &p.ops[b].op) {
+                    (_, &Op::Constant(c)) => add_dem(a, m & c),
+                    (&Op::Constant(c), _) => add_dem(b, m & c),
+                    _ => {
+                        add_dem(a, m);
+                        add_dem(b, m);
+                    }
+                },
+                Op::Binary(BinOp::Or, a, b) => match (&p.ops[a].op, &p.ops[b].op) {
+                    (_, &Op::Constant(c)) => add_dem(a, m & !c),
+                    (&Op::Constant(c), _) => add_dem(b, m & !c),
+                    _ => {
+                        add_dem(a, m);
+                        add_dem(b, m);
+                    }
+                },
+                Op::Binary(BinOp::Xor, a, b) => {
+                    add_dem(a, m);
+                    add_dem(b, m);
+                }
+                Op::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul, a, b) => {
+                    let lp = low_prefix_u64(m);
+                    add_dem(a, lp);
+                    add_dem(b, lp);
+                }
+                Op::Binary(BinOp::Shl, a, b) => {
+                    if let Op::Constant(k) = p.ops[b].op {
+                        if k < 64 {
+                            add_dem(a, m >> k);
+                        }
+                    } else {
+                        add_dem(a, p.ops[a].mask);
+                        add_dem(b, p.ops[b].mask);
+                    }
+                }
+                Op::Binary(BinOp::LShr, a, b) => {
+                    if let Op::Constant(k) = p.ops[b].op {
+                        if k < 64 {
+                            add_dem(a, m << k);
+                        }
+                    } else {
+                        add_dem(a, p.ops[a].mask);
+                        add_dem(b, p.ops[b].mask);
+                    }
+                }
+                Op::Binary(_, a, b) | Op::Compare(_, a, b, _) => {
+                    add_dem(a, p.ops[a].mask);
+                    add_dem(b, p.ops[b].mask);
+                }
+                Op::Select(c, t, e) => {
+                    add_dem(c, 1);
+                    add_dem(t, m);
+                    add_dem(e, m);
+                }
+            }
+        }
+
+        let mut active_sym: Option<(usize, u64)> = None;
+        let mut multi_sym = false;
+        for &u in &cone {
+            if let Op::Symbol(s) = p.ops[u].op {
+                let eff = dem.get(&u).copied().unwrap_or(0) & p.symbols[s].free;
+                if eff != 0 {
+                    match active_sym {
+                        None => active_sym = Some((s, eff)),
+                        Some((prev_s, prev_eff)) if prev_s == s => {
+                            active_sym = Some((s, prev_eff | eff));
+                        }
+                        Some(_) => {
+                            multi_sym = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if multi_sym {
+            continue;
+        }
+        let Some((sym_idx, eff_free)) = active_sym else {
+            continue;
+        };
+        let k = eff_free.count_ones();
+        if !(1..=10).contains(&k) {
+            continue;
+        }
+        if pins
+            .iter()
+            .any(|&(s, m, _)| s == sym_idx && (m & eff_free) != 0)
+        {
+            continue;
+        }
+
+        let mut bit_positions = [0u16; 10];
+        let mut tmp = eff_free;
+        for bp in bit_positions.iter_mut().take(k as usize) {
+            *bp = tmp.trailing_zeros() as u16;
+            tmp &= tmp - 1;
+        }
+        if vals.len() < slot + 1 {
+            vals.resize(slot + 1, 0);
+        }
+        let total_pts = 1u64 << k;
+        let mut found = Vec::new();
+        let base_ones = p.symbols[sym_idx].ones;
+        for pt in 0..total_pts {
+            let mut patch = 0u64;
+            for (b, &pos) in bit_positions.iter().enumerate().take(k as usize) {
+                if (pt >> b) & 1 != 0 {
+                    patch |= 1u64 << pos;
+                }
+            }
+            let sym_val = base_ones | patch;
+            for &u in &cone {
+                let ins = &p.ops[u];
+                let w = ins.width;
+                vals[u] = match ins.op {
+                    Op::Constant(v) => v,
+                    Op::Symbol(s) => {
+                        if s == sym_idx {
+                            sym_val
+                        } else {
+                            p.symbols[s].ones
+                        }
+                    }
+                    Op::Unary(op, a) => match op {
+                        UnOp::Not => !vals[a],
+                        UnOp::Neg => vals[a].wrapping_neg(),
+                        UnOp::Popcnt => u64::from(vals[a].count_ones()),
+                        UnOp::Clz => u64::from(vals[a].leading_zeros() - (64 - u32::from(w))),
+                        UnOp::Ctz => u64::from(vals[a].trailing_zeros().min(u32::from(w))),
+                        UnOp::Bswap => vals[a].swap_bytes() >> (64 - w),
+                        UnOp::BitRev => vals[a].reverse_bits() >> (64 - w),
+                    },
+                    Op::Binary(op, a, b) => binary(op, vals[a], vals[b], w),
+                    Op::Compare(op, a, b, cw) => u64::from(match op {
+                        CmpOp::Eq => vals[a] == vals[b],
+                        CmpOp::Ne => vals[a] != vals[b],
+                        CmpOp::Ult => vals[a] < vals[b],
+                        CmpOp::Ule => vals[a] <= vals[b],
+                        CmpOp::Slt => signed(vals[a], cw) < signed(vals[b], cw),
+                        CmpOp::Sle => signed(vals[a], cw) <= signed(vals[b], cw),
+                    }),
+                    Op::Zext(a) => vals[a],
+                    Op::Sext(a, sw) => signed(vals[a], sw) as u64,
+                    Op::Extract(a, lo) => vals[a] >> lo,
+                    Op::Concat(a, b, low) => (vals[a] << low) | vals[b],
+                    Op::Select(c, t, e) => vals[if vals[c] != 0 { t } else { e }],
+                    Op::MixerRound(a, key) => super::mixer::eval_round(vals[a], key),
+                    Op::MixerUnround(a, key) => {
+                        super::mixer::invert_round(vals[a], key).unwrap_or(0)
+                    }
+                } & ins.mask;
+            }
+            if (vals[slot] != 0) == want {
+                found.push(patch);
+            }
+        }
+        let res = if found.is_empty() {
+            SmallCone::Unsat(total_pts)
+        } else {
+            SmallCone::Witnesses(sym_idx, eff_free, found)
+        };
+        match res {
+            SmallCone::Unsat(pts) => return (Some(pts), pins),
+            SmallCone::Witnesses(s, m, pats) => {
+                if pats.len() < (total_pts as usize) {
+                    pins.push((s, m, pats));
+                }
+            }
+        }
+    }
+    (None, pins)
+}
+
+fn collect_required_program_conjuncts(p: &Program) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(usize, bool)> = Vec::new();
+    for &c in &p.constraints {
+        stack.push((c, true));
+    }
+    stack.push((p.goal, false));
+    for _ in 0..128 {
+        let Some((u, want)) = stack.pop() else { break };
+        match p.ops[u].op {
+            Op::Unary(UnOp::Not, a) => stack.push((a, !want)),
+            Op::Binary(BinOp::And, a, b) if want => stack.extend([(a, true), (b, true)]),
+            Op::Binary(BinOp::Or, a, b) if !want => stack.extend([(a, false), (b, false)]),
+            _ => {
+                if !out.contains(&(u, want)) {
+                    out.push((u, want));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn try_sample_with_limit(
@@ -823,8 +1133,24 @@ fn try_sample_with_limit(
     assumptions: Option<&Assumptions>,
     cfg: &Config,
     limit: usize,
+    use_small_cones: bool,
 ) -> Option<Trial> {
     let mut program = Program::compile_with_limit(cx, goal, constraints, assumptions, limit)?;
+    let (unsat_pts, cone_pins) = if use_small_cones {
+        let req_terms = collect_required_program_conjuncts(&program);
+        analyze_small_cones(&program, &req_terms)
+    } else {
+        (None, Vec::new())
+    };
+    if let Some(pts) = unsat_pts
+        && pts <= u64::from(cfg.samples)
+    {
+        return Some(Trial {
+            samples: 64,
+            model: None,
+            complete: true,
+        });
+    }
     if cfg.sample_mode == SampleMode::Words {
         program.prioritize_words();
     }
@@ -850,7 +1176,23 @@ fn try_sample_with_limit(
         }
         let mut bad = 0u64;
         for lane in 0..64 {
-            program.evaluate(&inputs, lane, &mut values);
+            if !cone_pins.is_empty() && (batch > 0 || lane >= 2) {
+                program.evaluate_with(
+                    |s| {
+                        let mut v = Program::symbol_value(&program.symbols[s], &inputs, lane);
+                        for &(ps, pm, ref pats) in &cone_pins {
+                            if ps == s {
+                                let idx = (batch as usize * 64 + lane as usize) % pats.len();
+                                v = (v & !pm) | pats[idx];
+                            }
+                        }
+                        v
+                    },
+                    &mut values,
+                );
+            } else {
+                program.evaluate(&inputs, lane, &mut values);
+            }
             if values[program.goal] == 0 && program.constraints.iter().all(|&c| values[c] != 0) {
                 bad |= 1 << lane;
             }
@@ -861,11 +1203,18 @@ fn try_sample_with_limit(
             let model = program
                 .symbols
                 .iter()
-                .map(|s| {
-                    (
-                        s.key.clone(),
-                        BitVec::from_u64(s.width, Program::symbol_value(s, &inputs, lane)).unwrap(),
-                    )
+                .enumerate()
+                .map(|(si, s)| {
+                    let mut v = Program::symbol_value(s, &inputs, lane);
+                    if !cone_pins.is_empty() && (batch > 0 || lane >= 2) {
+                        for &(ps, pm, ref pats) in &cone_pins {
+                            if ps == si {
+                                let idx = (batch as usize * 64 + lane as usize) % pats.len();
+                                v = (v & !pm) | pats[idx];
+                            }
+                        }
+                    }
+                    (s.key.clone(), BitVec::from_u64(s.width, v).unwrap())
                 })
                 .collect();
             return Some(Trial {
@@ -1069,10 +1418,11 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
         })
         .collect();
     let ranges = guard::intervals(&p, &terms);
+    let (_, cone_pins) = analyze_small_cones(&p, &terms);
     let mut best = assignment.clone();
     let mut distance = u32::MAX;
     let mut offset = None;
-    let field_constrained = !fields.is_empty() || !bit_pins.is_empty();
+    let field_constrained = !fields.is_empty() || !bit_pins.is_empty() || !cone_pins.is_empty();
     for lane in 0..64 {
         // A known field has a constructive inverse. Vary its free bits on
         // fresh lanes instead of repairing unrelated internal case labels.
@@ -1149,6 +1499,14 @@ pub(super) fn guard_samples(cx: &mut Context, root: u32) -> Option<(u64, Option<
             for &(s, m, val) in &bit_pins {
                 let sym = &p.symbols[s];
                 let v = ((assignment[s] & !m) | val) & mask(sym.width.bits());
+                if v & !sym.free == sym.ones {
+                    assignment[s] = v;
+                }
+            }
+            for &(s, m, ref pats) in &cone_pins {
+                let sym = &p.symbols[s];
+                let pat = pats[lane as usize % pats.len()];
+                let v = ((assignment[s] & !m) | pat) & mask(sym.width.bits());
                 if v & !sym.free == sym.ones {
                     assignment[s] = v;
                 }

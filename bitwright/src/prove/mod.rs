@@ -743,6 +743,7 @@ pub(crate) struct Blaster<'c> {
     input_cancellation: bool,
     join_factoring: bool,
     carry_save_multiplication: bool,
+    compact_adders: bool,
     hardwire_declared: bool,
     udivrem_cache: IdMap<(u32, u32), (Bits, Bits)>,
     max_nodes: usize,
@@ -762,6 +763,7 @@ impl<'c> Blaster<'c> {
             input_cancellation: false,
             join_factoring: false,
             carry_save_multiplication: false,
+            compact_adders: false,
             hardwire_declared: true,
             udivrem_cache: IdMap::default(),
             max_nodes,
@@ -898,7 +900,9 @@ impl<'c> Blaster<'c> {
                     }
                 }
                 match op {
+                    OpCode::Add if self.compact_adders => add_compact(g, a, b),
                     OpCode::Add => add(g, a, b),
+                    OpCode::Sub if self.compact_adders => sub_compact(g, a, b),
                     OpCode::Sub => sub(g, a, b),
                     OpCode::Mul if self.carry_save_multiplication => mul_carry_save(g, a, b),
                     OpCode::Mul => mul(g, a, b),
@@ -1168,6 +1172,11 @@ impl Question {
                 return decided(q, Outcome::Proved(None));
             }
         }
+        if let Some(d) = env.deadline
+            && d.clock.now_ticks() >= d.at
+        {
+            return decided(q, Outcome::Unknown(Unknown::Deadline));
+        }
         // Reserve at least one ordinary circuit batch. Sample the *original implication*
         // so even constraints hidden inside the predicate participate in witness validation.
         if cfg.simplify
@@ -1175,7 +1184,6 @@ impl Question {
             && !cfg.word_sampling
             && cfg.sample_mode == SampleMode::Random
             && cfg.samples >= 128
-            && env.deadline.is_none()
             && let Some((tested, model)) = sample_words::guard_samples(cx, root)
         {
             q.stats.samples = tested;
@@ -1495,6 +1503,42 @@ impl Question {
                         goal_node = cx.mk_const_u64(1, 0)?;
                     }
                     owned_assumptions = Some(eff);
+                    let can_run_mixer = last_end == crate::engine::End::Completed
+                        || matches!(
+                            last_end,
+                            crate::engine::End::BudgetTerminated(
+                                crate::engine::Exhausted::MbaSteps
+                                    | crate::engine::Exhausted::MbaCalls
+                            )
+                        );
+                    if can_run_mixer
+                        && (mixer::may_contain_mixer(cx, goal_node)
+                            || cons.iter().any(|&c| mixer::may_contain_mixer(cx, c)))
+                    {
+                        let mut bad = cx.c_un(crate::UnOp::Not, goal_node)?;
+                        for &c in &cons {
+                            bad = cx.c_bin(crate::BinOp::And, bad, c)?;
+                        }
+                        let joint_imp = cx.c_un(crate::UnOp::Not, bad)?;
+                        let domain_fuel = cfg
+                            .simplify_budget
+                            .pass_work
+                            .saturating_sub(allowance.spent().pass_work)
+                            .min(1 << 20);
+                        let after = mixer::simplify_predicate(
+                            cx,
+                            cx.handle(joint_imp),
+                            assumptions,
+                            domain_fuel,
+                        )?;
+                        let after_id = cx.id(after)?;
+                        if cx.const_val(after_id).is_some_and(|v| !v.is_zero()) {
+                            q.stats.rewritten = true;
+                            q.stats.simplification.decided = true;
+                            q.stats.simplification.stopped = None;
+                            return decided(q, Outcome::Proved(None));
+                        }
+                    }
                 }
             }
 
@@ -1646,7 +1690,9 @@ impl Question {
                             } else {
                                 s = cx.mk_const_u64(1, 0)?;
                             }
-                        } else if res.end != crate::engine::End::Completed {
+                        } else if out.end == crate::engine::End::Completed
+                            && res.end != crate::engine::End::Completed
+                        {
                             out.end = res.end;
                         } else {
                             if out.end != crate::engine::End::Completed {
@@ -1659,7 +1705,9 @@ impl Question {
                                 };
                                 let top = engine.run(cx, &[cx.handle(s)], run)?.roots[0];
                                 s = cx.id(top.expr)?;
-                                out.end = top.end;
+                                if top.end == crate::engine::End::Completed {
+                                    out.end = top.end;
+                                }
                                 if cx.const_val(s).is_some_and(|v| !v.is_zero()) {
                                     proved = true;
                                     out = top;
@@ -1728,7 +1776,9 @@ impl Question {
                                         break;
                                     }
                                     if r.end != crate::engine::End::Completed {
-                                        out.end = r.end;
+                                        if out.end == crate::engine::End::Completed {
+                                            out.end = r.end;
+                                        }
                                         break;
                                     }
                                     attempts += 1;
@@ -1812,13 +1862,17 @@ impl Question {
                 return decided(q, Outcome::Proved(None));
             }
         }
+        if let Some(d) = env.deadline
+            && d.clock.now_ticks() >= d.at
+        {
+            return decided(q, Outcome::Unknown(Unknown::Deadline));
+        }
         let mut word_sampled = false;
         let explicit_word_sample = cfg.word_sampling || cfg.sample_mode == SampleMode::Words;
         let run_post_simp_word_sample = explicit_word_sample
             || (cfg.simplify
                 && !cfg.certificate
                 && cfg.samples >= 128
-                && env.deadline.is_none()
                 && (q.stats.samples == 0 || owned_assumptions.is_some()));
         if run_post_simp_word_sample && cfg.samples != 0 {
             let trial_opt = if explicit_word_sample {
@@ -1904,6 +1958,7 @@ impl Question {
             b.input_cancellation = cfg.input_cancellation || compact_retry;
             b.join_factoring = cfg.join_factoring || compact_retry;
             b.carry_save_multiplication = cfg.carry_save_multiplication || compact_retry;
+            b.compact_adders = !cfg.certificate;
             if constant_goal {
                 b.bits.insert(goal_node, vec![aig::TRUE]);
             }

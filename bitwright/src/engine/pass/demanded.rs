@@ -432,6 +432,17 @@ fn simplify(
     x: u32,
     m: &BitVec,
 ) -> Result<u32, Stop> {
+    simplify_in(r, cx, st, x, m, false)
+}
+
+fn simplify_in(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    st: &mut Demand,
+    x: u32,
+    m: &BitVec,
+    in_add_sub: bool,
+) -> Result<u32, Stop> {
     // A node with several users is read once, on the bits any of them reads (see `unions`).
     let wide;
     let m = match st.union.get(&x) {
@@ -783,11 +794,13 @@ fn simplify(
             }
         },
         OpCode::Not => {
-            let a = simplify(r, cx, st, node.a, m)?;
+            let a = simplify_in(r, cx, st, node.a, m, in_add_sub)?;
             r.build(cx, |cx| cx.c_un(UnOp::Not, a))?
         }
         OpCode::Add | OpCode::Sub | OpCode::Mul => {
             let p = low_prefix(m);
+            let is_chain_top = node.op != OpCode::Mul && !in_add_sub;
+            let child_in_add = node.op != OpCode::Mul;
             // One value read under several masks stays one value in the sweep's reductions:
             // a sum's constant is the first one added to that operand in this call that
             // agrees with it on the prefix, not its residue there, which differs from mask to
@@ -797,18 +810,18 @@ fn simplify(
             let (ka, kb) = (cx.const_val(node.a), cx.const_val(node.b));
             let (a, b) = match (whole_sum, ka, kb) {
                 (true, None, Some(k)) => {
-                    let a = simplify(r, cx, st, node.a, &p)?;
+                    let a = simplify_in(r, cx, st, node.a, &p, child_in_add)?;
                     let kind = u8::from(node.op == OpCode::Sub);
                     (a, same_on(r, cx, (a, kind), node.b, &k, &p))
                 }
                 (true, Some(k), None) => {
-                    let b = simplify(r, cx, st, node.b, &p)?;
+                    let b = simplify_in(r, cx, st, node.b, &p, child_in_add)?;
                     let kind = if node.op == OpCode::Sub { 2 } else { 0 };
                     (same_on(r, cx, (b, kind), node.a, &k, &p), b)
                 }
                 _ => (
-                    simplify(r, cx, st, node.a, &p)?,
-                    simplify(r, cx, st, node.b, &p)?,
+                    simplify_in(r, cx, st, node.a, &p, child_in_add)?,
+                    simplify_in(r, cx, st, node.b, &p, child_in_add)?,
                 ),
             };
             let op = node.op.as_bin().unwrap_or(BinOp::Add);
@@ -830,7 +843,7 @@ fn simplify(
                 }
             };
             let ones = |j: u32| cx.const_val(j).is_some_and(|k| k.is_ones());
-            match dropped_constant(cx, node.op, a, b, &p).or(flipped) {
+            let mut res = match dropped_constant(cx, node.op, a, b, &p).or(flipped) {
                 Some(t) => t,
                 // A factor that is −1 on the prefix (`0x3ffff` read by `& 0x1ffff`) negates.
                 None if node.op == OpCode::Mul && (ones(a) || ones(b)) => {
@@ -838,10 +851,21 @@ fn simplify(
                     r.build(cx, |cx| cx.c_un(UnOp::Neg, t))?
                 }
                 None => bin(r, cx, op, a, b)?,
+            };
+            if is_chain_top && w.bits() <= 64 {
+                let k = crate::facts::known::count_ones(&p);
+                if k >= 1
+                    && k < u32::from(w.bits())
+                    && let Some(mba_simp) =
+                        super::linear_mba::simplify_prefix(r, cx, res, k as u16, *m == p)?
+                {
+                    res = mba_simp;
+                }
             }
+            res
         }
         OpCode::Neg => {
-            let a = simplify(r, cx, st, node.a, &low_prefix(m))?;
+            let a = simplify_in(r, cx, st, node.a, &low_prefix(m), in_add_sub)?;
             r.build(cx, |cx| cx.c_un(UnOp::Neg, a))?
         }
         OpCode::Shl | OpCode::LShr if konst(cx, node.b).is_some() => {
@@ -2002,12 +2026,16 @@ fn narrow_constants(
             return allow_fold(cx, r, u).then(|| BitVec::zero(m.width()));
         }
         let k2 = prefix_residue(k, &p)?;
-        let k2_exists = k2
+        let k2_live = k2
             .to_u64()
             .and_then(|v| cx.find_const_u64(m.width().bits(), v))
-            .is_some();
-        let k_single = !r.life.dead.contains(k_id) && r.life.live.uses(k_id) == Some(1);
-        (k2_exists || k_single).then_some(k2)
+            .is_some_and(|cid| {
+                cid != k_id
+                    && !r.life.dead.contains(cid)
+                    && (r.life.live.uses(cid).is_some_and(|u| u > 0)
+                        || r.life.live_roots.contains(&cid))
+            });
+        k2_live.then_some(k2)
     };
     let needs_narrow = |cx: &Context,
                         r: &Runner<'_, '_>,

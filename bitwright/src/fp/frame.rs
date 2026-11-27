@@ -337,13 +337,13 @@ impl<const N: usize> Frame for Big<N> {
         if w >= N {
             return r;
         }
-        for i in 0..N - w {
+        for (i, dst) in r.limbs.iter_mut().enumerate().take(N - w) {
             let src = i + w;
             let mut v = self.limbs[src] >> b;
             if b != 0 && src + 1 < N {
                 v |= self.limbs[src + 1] << (64 - b);
             }
-            r.limbs[i] = v;
+            *dst = v;
         }
         r
     }
