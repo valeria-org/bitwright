@@ -736,6 +736,10 @@ size_t bw_smt_import_count(const bw_smt_import *imp, int part /* bw_smt_part */)
 bw_status bw_smt_import_get(const bw_smt_import *imp, int part, size_t i, bw_expr *e,
                             const char **name);
 
+/* Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) into `cx` and writes the
+ * standard responses (one per command) to `*out`. */
+bw_status bw_smtlib_run(bw_context *cx, const char *script, char **out);
+
 /* ----- solving ----------------------------------------------------------------------------- */
 
 /* A solver: 1-bit predicates asserted on a stack, and whether they hold together. It holds
@@ -775,6 +779,14 @@ bw_status bw_solver_value(bw_solver *s, bw_context *cx, bw_expr e, bw_value *out
 bw_status bw_solver_core(bw_solver *s, bw_context *cx, uint32_t *core, size_t capacity,
                          size_t *len);
 
+/* Enumerates up to `limit` distinct values `e` can take under the solver's assertions, in
+ * ascending unsigned order: `values` (valid for `limit` writes, or NULL when `limit == 0`)
+ * receives `*count` values, `*exact` is true when no further values exist, and `*answer` is
+ * BW_SAT (at least one value, or `limit == 0` when satisfiable), BW_UNSAT (zero values), or
+ * BW_UNKNOWN. */
+bw_status bw_solver_enumerate(bw_solver *s, bw_context *cx, bw_expr e, size_t limit,
+                              bw_value *values, size_t *count, bool *exact, int *answer);
+
 /* ----- proofs and synthesis ----------------------------------------------------------------- */
 
 typedef enum bw_equivalence {
@@ -792,6 +804,11 @@ bw_status bw_equivalent(bw_context *cx, bw_expr a, bw_expr b, uint64_t conflicts
  * `max_size` nodes: `*found` is false (and `*out` is `e`) when there is none. */
 bw_status bw_synthesize(bw_context *cx, bw_expr e, uint8_t max_size, bw_expr *out, bool *found);
 
+/* bw_synthesize with optional rotations (`rotl`, `rotr`) and bit operations (`popcnt`, `clz`,
+ * `ctz`, `bitrev`, `bswap`). */
+bw_status bw_synthesize_ext(bw_context *cx, bw_expr e, uint8_t max_size, bool rotations,
+                            bool bitops, bw_expr *out, bool *found);
+
 /* ----- memory ------------------------------------------------------------------------------ */
 
 typedef struct bw_memory bw_memory;
@@ -805,6 +822,24 @@ void bw_memory_free(bw_memory *m);
 
 /* Known contents of 8-bit cells from `start` on, before any load or store. */
 bw_status bw_memory_set_bytes(bw_memory *m, uint64_t start, const uint8_t *data, size_t n);
+
+/* Records the current version and writes its handle to `*out` (0 is the initial version). */
+bw_status bw_memory_snapshot(bw_memory *m, uint32_t *out);
+
+/* Restores the current version to a previously recorded snapshot. */
+bw_status bw_memory_restore(bw_memory *m, uint32_t version);
+
+/* Joins two branch snapshots under 1-bit condition `cond` (`cond ? v_then : v_else`) and moves
+ * the memory to the merged version. */
+bw_status bw_memory_merge(bw_memory *m, bw_context *cx, bw_expr cond, uint32_t v_then,
+                          uint32_t v_else);
+
+/* Fills `cells` consecutive cells starting at `addr` with `cell_value` (of cell width). */
+bw_status bw_memory_memset(bw_memory *m, bw_context *cx, bw_expr addr, bw_expr cell_value,
+                           uint16_t cells);
+
+/* Copies `cells` cells from `src` to `dst` (snapshot semantics: safe when ranges overlap). */
+bw_status bw_memory_memcpy(bw_memory *m, bw_context *cx, bw_expr dst, bw_expr src, uint16_t cells);
 
 /* Stores `value` (a whole number of cells) at `addr`: the memory moves to the new version. */
 bw_status bw_memory_store(bw_memory *m, bw_context *cx, bw_expr addr, bw_expr value);
@@ -934,6 +969,13 @@ bool bw_site_as_u64(bw_site *site, bw_expr e, uint64_t *out);
  * fact budget declined the query (the node's result is then not final). `relies_on` is 0: the
  * engine keeps track of what the result relies on. */
 bool bw_site_facts(bw_site *site, bw_expr e, bw_facts *out);
+
+/* Relational queries under the call's assumptions and declared known bits (the engine tracks
+ * what the result relies on): comparison truth (bw_truth), equality, and constant difference
+ * `a - b == k (mod 2^W)`. */
+int bw_site_prove_cmp(bw_site *site, int op /* bw_cmpop */, bw_expr a, bw_expr b);
+bool bw_site_prove_eq(bw_site *site, bw_expr a, bw_expr b);
+bool bw_site_const_diff(bw_site *site, bw_expr a, bw_expr b, bw_value *out);
 
 /* `e` in the text syntax (BW_PRINT_* flags), released with bw_string_free; NULL if `e` is not a
  * handle of the site's context. */

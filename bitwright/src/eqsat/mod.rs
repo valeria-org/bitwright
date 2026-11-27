@@ -31,6 +31,7 @@ mod pattern;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use egraph::{ClassId, EGraph, ENode, EOp, Halt};
@@ -42,8 +43,176 @@ use crate::error::Error;
 use crate::expr::{Context, Expr, FnEnv, OpCode};
 use crate::facts::Facts;
 use crate::hash::{IdMap, combine};
+use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::rules::{Ledger, RuleProgram};
 use crate::{BitVec, SymbolKey, Width};
+
+/// An operator shape scored by a [`CostModel`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CostOp {
+    /// A bit-vector constant.
+    Const,
+    /// A symbol (or an opaque atomized subterm).
+    Symbol,
+    /// A unary operator.
+    Un(UnOp),
+    /// A binary operator.
+    Bin(BinOp),
+    /// A 1-bit comparison.
+    Cmp(CmpOp),
+    /// Zero extension from `from` bits to `to` bits.
+    Zext {
+        /// Source width.
+        from: Width,
+        /// Target width.
+        to: Width,
+    },
+    /// Sign extension from `from` bits to `to` bits.
+    Sext {
+        /// Source width.
+        from: Width,
+        /// Target width.
+        to: Width,
+    },
+    /// Bit slice `[lo, lo + width)` extracted from a `from`-bit value.
+    Extract {
+        /// Source width.
+        from: Width,
+        /// Lowest extracted bit.
+        lo: u16,
+        /// Extracted slice width.
+        width: Width,
+    },
+    /// Concatenation of a `hi`-bit value above a `lo`-bit value.
+    Concat {
+        /// High operand width.
+        hi: Width,
+        /// Low operand width.
+        lo: Width,
+    },
+    /// Conditional `select(cond, then, els)` producing a `Width`-bit value.
+    Select(Width),
+}
+
+/// How extraction accounts for subterms used more than once.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtractionMode {
+    /// Sum every subterm occurrence independently (tree cost).
+    #[default]
+    Tree,
+    /// Count shared equivalence classes once across the extracted DAG (and across roots of the
+    /// search batch).
+    Dag,
+}
+
+type CustomCostFn = Arc<dyn Fn(CostOp, Width) -> u64 + Send + Sync>;
+
+#[derive(Clone)]
+enum CostKind {
+    AstSize,
+    Custom { id: u64, f: CustomCostFn },
+}
+
+/// Structural or host-supplied operator cost model and [`ExtractionMode`] for equality-saturation
+/// extraction.
+///
+/// Every operator weight is positive (`>= 1`; `0` returned by a custom callback is clamped to
+/// `1`), guaranteeing acyclic extraction even when the e-graph contains cyclic equivalences.
+#[derive(Clone)]
+pub struct CostModel {
+    kind: CostKind,
+    mode: ExtractionMode,
+}
+
+impl Default for CostModel {
+    fn default() -> Self {
+        Self::ast_size()
+    }
+}
+
+impl core::fmt::Debug for CostModel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let kind = match &self.kind {
+            CostKind::AstSize => "ast_size",
+            CostKind::Custom { .. } => "custom",
+        };
+        f.debug_struct("CostModel")
+            .field("kind", &kind)
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
+impl CostModel {
+    /// Unit node weight (`1` per node) under [`ExtractionMode::Tree`] (the default).
+    pub fn ast_size() -> CostModel {
+        CostModel {
+            kind: CostKind::AstSize,
+            mode: ExtractionMode::Tree,
+        }
+    }
+
+    /// Unit node weight (`1` per unique node) under [`ExtractionMode::Dag`].
+    pub fn dag_size() -> CostModel {
+        CostModel {
+            kind: CostKind::AstSize,
+            mode: ExtractionMode::Dag,
+        }
+    }
+
+    /// Host-supplied operator weights (`width` is the node's result width). Any weight of `0` is
+    /// clamped to `1` so cyclic equivalence classes always extract to acyclic expressions.
+    pub fn custom(f: impl Fn(CostOp, Width) -> u64 + Send + Sync + 'static) -> CostModel {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        CostModel {
+            kind: CostKind::Custom {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                f: Arc::new(f),
+            },
+            mode: ExtractionMode::Tree,
+        }
+    }
+
+    /// Sets the [`ExtractionMode`] (`Tree` or `Dag`).
+    #[must_use]
+    pub fn with_mode(mut self, mode: ExtractionMode) -> CostModel {
+        self.mode = mode;
+        self
+    }
+
+    /// The active [`ExtractionMode`].
+    pub fn mode(&self) -> ExtractionMode {
+        self.mode
+    }
+
+    /// The positive weight (`>= 1`) assigned to `(op, width)`.
+    pub fn cost(&self, op: CostOp, width: Width) -> u64 {
+        match &self.kind {
+            CostKind::AstSize => 1,
+            CostKind::Custom { f, .. } => f(op, width).max(1),
+        }
+    }
+
+    pub(crate) fn is_default_ast_tree(&self) -> bool {
+        matches!(self.kind, CostKind::AstSize) && self.mode == ExtractionMode::Tree
+    }
+
+    fn epoch_mix(&self, base: u64) -> u64 {
+        if self.is_default_ast_tree() {
+            return base;
+        }
+        let mode_tag = match self.mode {
+            ExtractionMode::Tree => 1u64,
+            ExtractionMode::Dag => 2u64,
+        };
+        let kind_tag = match &self.kind {
+            CostKind::AstSize => 0u64,
+            CostKind::Custom { id, .. } => *id,
+        };
+        combine(combine(base, mode_tag), kind_tag)
+    }
+}
 
 /// The operators and widths the search accepts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -196,12 +365,15 @@ pub struct SearchRun<'a> {
     pub per_call: Option<Budget>,
     /// Stop at a host-supplied time.
     pub deadline: Option<Deadline<'a>>,
+    /// Cost model and extraction mode for this search (overrides the saturator's model when set).
+    pub cost_model: Option<CostModel>,
 }
 
 setters!(SearchRun<'a> {
     with_allowance: allowance ? &'a mut Allowance,
     with_per_call: per_call ? Budget,
     with_deadline: deadline ? Deadline<'a>,
+    with_cost_model: cost_model ? CostModel,
 });
 
 impl SearchRun<'_> {
@@ -314,6 +486,7 @@ struct Inner {
     rules: Vec<Identity>,
     cfg: SaturateConfig,
     epoch: u64,
+    cost_model: CostModel,
 }
 
 /// A compiled set of admitted identities and a configuration. Cheap to clone; `Send + Sync`.
@@ -327,6 +500,7 @@ impl core::fmt::Debug for Saturator {
         f.debug_struct("Saturator")
             .field("identities", &self.inner.rules.len())
             .field("config", &self.inner.cfg)
+            .field("cost_model", &self.inner.cost_model)
             .finish()
     }
 }
@@ -420,10 +594,30 @@ impl Saturator {
         }
         Ok((
             Saturator {
-                inner: Arc::new(Inner { rules, cfg, epoch }),
+                inner: Arc::new(Inner {
+                    rules,
+                    cfg,
+                    epoch,
+                    cost_model: CostModel::ast_size(),
+                }),
             },
             report,
         ))
+    }
+
+    /// Returns a saturator sharing the compiled identities and configuration, with `model` as its
+    /// default [`CostModel`] (overridable per call via [`SearchRun::with_cost_model`]).
+    #[must_use]
+    pub fn with_cost_model(self, model: CostModel) -> Saturator {
+        let prev = &*self.inner;
+        Saturator {
+            inner: Arc::new(Inner {
+                rules: prev.rules.clone(),
+                cfg: prev.cfg,
+                epoch: prev.epoch,
+                cost_model: model,
+            }),
+        }
     }
 
     /// A saturator over every built-in group (`eqsat.*`). Associativity and each
@@ -457,7 +651,10 @@ impl Saturator {
             allowance,
             per_call,
             deadline,
+            cost_model,
         } = run;
+        let active_model = cost_model.unwrap_or_else(|| inner.cost_model.clone());
+        let effective_epoch = active_model.epoch_mix(inner.epoch);
         let per_call = per_call.unwrap_or(SearchRun::DEFAULT_BUDGET);
         let limit = match &allowance {
             Some(a) => per_call.min(&a.remaining()),
@@ -465,21 +662,31 @@ impl Saturator {
         };
         let mut meter = Meter::new(limit, deadline);
         let mut stats = EqsatStats::default();
-        if cx.eqsat_memo.epoch != inner.epoch {
-            cx.eqsat_memo.clear();
-            cx.eqsat_memo.epoch = inner.epoch;
+        let mut distinct_roots: Vec<u32> = Vec::with_capacity(ids.len());
+        for &r in &ids {
+            if !distinct_roots.contains(&r) {
+                distinct_roots.push(r);
+            }
         }
+        // In multi-root DAG mode, extraction and profitability weigh subterms shared across the
+        // batch's roots, so single-root context memoization is bypassed.
+        let use_memo = !(active_model.mode() == ExtractionMode::Dag && distinct_roots.len() > 1);
+        if use_memo && cx.eqsat_memo.epoch != effective_epoch {
+            cx.eqsat_memo.clear();
+            cx.eqsat_memo.epoch = effective_epoch;
+        }
+        let mut current_roots = distinct_roots.clone();
         let mut done: IdMap<u32, (Option<u32>, RootEnd)> = IdMap::default();
         // A deadline already passed withholds the batch, memo answers included.
         let mut cause: Option<RootEnd> = meter.deadline_now().err().map(RootEnd::Stopped);
         let mut failure: Option<Error> = None;
-        for &root in &ids {
-            if done.contains_key(&root) {
-                continue;
-            }
-            if let Some(&(c, _)) = cx.eqsat_memo.entries.get(&root) {
+        for (pos, &root) in distinct_roots.iter().enumerate() {
+            if use_memo && let Some(&(c, _)) = cx.eqsat_memo.entries.get(&root) {
                 stats.memo_hits += 1;
                 done.insert(root, (c, RootEnd::Memo));
+                if let Some(cand) = c {
+                    current_roots[pos] = cand;
+                }
                 continue;
             }
             match cause {
@@ -495,7 +702,25 @@ impl Saturator {
                 }
                 None => {}
             }
-            let (cand, end) = match self.search_root(cx, root, &mut meter, &mut stats) {
+            let other_roots: Vec<u32> =
+                if active_model.mode() == ExtractionMode::Dag && current_roots.len() > 1 {
+                    current_roots
+                        .iter()
+                        .enumerate()
+                        .filter(|&(k, _)| k != pos)
+                        .map(|(_, &r)| r)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            let (cand, end) = match self.search_root(
+                cx,
+                root,
+                &other_roots,
+                &active_model,
+                &mut meter,
+                &mut stats,
+            ) {
                 Ok(x) => x,
                 Err(e) => {
                     failure = Some(e);
@@ -515,8 +740,11 @@ impl Saturator {
                 end,
                 RootEnd::Saturated | RootEnd::DeclinedUnsupported | RootEnd::DeclinedAdmission(_)
             );
-            if stable {
+            if use_memo && stable {
                 cx.eqsat_memo.entries.insert(root, (cand, end));
+            }
+            if let Some(c) = cand {
+                current_roots[pos] = c;
             }
             done.insert(root, (cand, end));
         }
@@ -558,6 +786,8 @@ impl Saturator {
         &self,
         cx: &mut Context,
         root: u32,
+        other_roots: &[u32],
+        model: &CostModel,
         meter: &mut Meter<'_>,
         stats: &mut EqsatStats,
     ) -> Result<(Option<u32>, RootEnd), Error> {
@@ -611,7 +841,12 @@ impl Saturator {
             }
         };
         stats.unions += eg.unions;
-        let best = match extract::costs(&mut eg, meter) {
+        let external_shared = if model.mode() == ExtractionMode::Dag && !other_roots.is_empty() {
+            self.shared_classes(cx, &mut eg, other_roots, w)
+        } else {
+            IdMap::default()
+        };
+        let best = match extract::costs_for(&mut eg, rootc, model, &external_shared, meter) {
             Ok(b) => b,
             Err(e) => {
                 stats.budget_terminated += 1;
@@ -629,18 +864,22 @@ impl Saturator {
         if e == root {
             return Ok((None, end));
         }
-        // Strictly cheaper as a tree (and no larger as a DAG), or strictly smaller as a DAG (and
-        // no larger as a tree).
-        let (te, tr) = (cx.meta[e as usize].tree, cx.meta[root as usize].tree);
-        let dag = |cx: &mut Context, i: u32| match cx
-            .dag_size(&[cx.handle(i)], cfg.max_root_nodes.saturating_mul(4))
-        {
-            Ok(crate::Bounded::Exact(n)) => Some(n),
-            _ => None,
+        let cheaper = if model.is_default_ast_tree() {
+            // Strictly cheaper as a tree (and no larger as a DAG), or strictly smaller as a DAG
+            // (and no larger as a tree).
+            let (te, tr) = (cx.meta[e as usize].tree, cx.meta[root as usize].tree);
+            let dag = |cx: &mut Context, i: u32| match cx
+                .dag_size(&[cx.handle(i)], cfg.max_root_nodes.saturating_mul(4))
+            {
+                Ok(crate::Bounded::Exact(n)) => Some(n),
+                _ => None,
+            };
+            let (de, dr) = (dag(cx, e), dag(cx, root));
+            (te < tr && matches!((de, dr), (Some(a), Some(b)) if a <= b))
+                || (te <= tr && matches!((de, dr), (Some(a), Some(b)) if a < b))
+        } else {
+            self.is_cheaper_under(cx, root, e, other_roots, w, model)
         };
-        let (de, dr) = (dag(cx, e), dag(cx, root));
-        let cheaper = (te < tr && matches!((de, dr), (Some(a), Some(b)) if a <= b))
-            || (te <= tr && matches!((de, dr), (Some(a), Some(b)) if a < b));
         if !cheaper {
             return Ok((None, end));
         }
@@ -651,6 +890,309 @@ impl Saturator {
         }
         stats.changed += 1;
         Ok((Some(e), end))
+    }
+
+    /// Maps nodes already live in `other_roots` to canonical `ClassId`s present in `eg` without
+    /// inserting new e-nodes.
+    fn shared_classes(
+        &self,
+        cx: &Context,
+        eg: &mut EGraph,
+        other_roots: &[u32],
+        root_w: Width,
+    ) -> IdMap<ClassId, ()> {
+        let cfg = &self.inner.cfg;
+        let max_nodes = cfg.max_root_nodes.saturating_mul(4) as usize;
+        let extended = cfg.fragment.extended_ops;
+        let max_w = cfg.fragment.max_width.min(Width::MAX_BITS);
+        let mut order = Vec::new();
+        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut stack: Vec<(u32, bool)> = other_roots.iter().map(|&r| (r, false)).collect();
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                order.push(i);
+                continue;
+            }
+            if seen.insert(i, ()).is_some() {
+                continue;
+            }
+            if seen.len() > max_nodes {
+                return IdMap::default();
+            }
+            let n = cx.node(i);
+            let width_ok = if extended {
+                n.width <= max_w
+            } else {
+                n.width == root_w.bits()
+            };
+            if !width_ok || !node_in_fragment(n.op, extended) {
+                order.push(i);
+                continue;
+            }
+            stack.push((i, true));
+            for c in n.children() {
+                stack.push((c, false));
+            }
+        }
+        let mut node_to_class: IdMap<u32, ClassId> = IdMap::default();
+        let mut shared: IdMap<ClassId, ()> = IdMap::default();
+        for i in order {
+            let n = cx.node(i);
+            let inside = if extended {
+                n.width <= max_w && node_in_fragment(n.op, true)
+            } else {
+                n.width == root_w.bits() && node_in_fragment(n.op, false)
+            };
+            let enode = if let Some(v) = cx.const_val(i) {
+                eg.lookup_const_node(&v)
+            } else if !inside || n.op == OpCode::Sym {
+                Some(ENode {
+                    op: EOp::Leaf {
+                        node: i,
+                        width: n.width,
+                    },
+                    kids: [0, 0, 0],
+                })
+            } else if let Some(u) = n.op.as_un() {
+                node_to_class.get(&n.a).map(|&ca| ENode {
+                    op: EOp::Un(u),
+                    kids: [ca, 0, 0],
+                })
+            } else if let Some(b) = n.op.as_bin() {
+                match (node_to_class.get(&n.a), node_to_class.get(&n.b)) {
+                    (Some(&ca), Some(&cb)) => Some(ENode {
+                        op: EOp::Bin(b),
+                        kids: [ca, cb, 0],
+                    }),
+                    _ => None,
+                }
+            } else if let Some(c) = n.op.as_cmp() {
+                match (node_to_class.get(&n.a), node_to_class.get(&n.b)) {
+                    (Some(&ca), Some(&cb)) => Some(ENode {
+                        op: EOp::Cmp(c),
+                        kids: [ca, cb, 0],
+                    }),
+                    _ => None,
+                }
+            } else {
+                match n.op {
+                    OpCode::Zext => node_to_class.get(&n.a).map(|&ca| ENode {
+                        op: EOp::Zext(n.width),
+                        kids: [ca, 0, 0],
+                    }),
+                    OpCode::Sext => node_to_class.get(&n.a).map(|&ca| ENode {
+                        op: EOp::Sext(n.width),
+                        kids: [ca, 0, 0],
+                    }),
+                    OpCode::Extract => node_to_class.get(&n.a).map(|&ca| ENode {
+                        op: EOp::Extract {
+                            lo: n.b as u16,
+                            width: n.width,
+                        },
+                        kids: [ca, 0, 0],
+                    }),
+                    OpCode::Concat => match (node_to_class.get(&n.a), node_to_class.get(&n.b)) {
+                        (Some(&ca), Some(&cb)) => Some(ENode {
+                            op: EOp::Concat,
+                            kids: [ca, cb, 0],
+                        }),
+                        _ => None,
+                    },
+                    OpCode::Select => match (
+                        node_to_class.get(&n.a),
+                        node_to_class.get(&n.b),
+                        node_to_class.get(&n.c),
+                    ) {
+                        (Some(&ca), Some(&cb), Some(&cc)) => Some(ENode {
+                            op: EOp::Select,
+                            kids: [ca, cb, cc],
+                        }),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            if let Some(en) = enode
+                && let Some(cid) = eg.find_enode(en)
+            {
+                node_to_class.insert(i, cid);
+                shared.insert(cid, ());
+            }
+        }
+        shared
+    }
+
+    fn expr_node_cost(
+        &self,
+        cx: &Context,
+        i: u32,
+        root_w: Width,
+        model: &CostModel,
+    ) -> (u64, bool) {
+        let cfg = &self.inner.cfg;
+        let extended = cfg.fragment.extended_ops;
+        let max_w = cfg.fragment.max_width.min(Width::MAX_BITS);
+        let n = cx.node(i);
+        let w = cx.width_of(i);
+        let width_ok = if extended {
+            n.width <= max_w
+        } else {
+            n.width == root_w.bits()
+        };
+        if n.op == OpCode::Const {
+            return (model.cost(CostOp::Const, w), true);
+        }
+        if n.op == OpCode::Sym || !width_ok || !node_in_fragment(n.op, extended) {
+            return (model.cost(CostOp::Symbol, w), true);
+        }
+        let op = if let Some(u) = n.op.as_un() {
+            CostOp::Un(u)
+        } else if let Some(b) = n.op.as_bin() {
+            CostOp::Bin(b)
+        } else if let Some(c) = n.op.as_cmp() {
+            CostOp::Cmp(c)
+        } else {
+            match n.op {
+                OpCode::Zext => CostOp::Zext {
+                    from: cx.width_of(n.a),
+                    to: w,
+                },
+                OpCode::Sext => CostOp::Sext {
+                    from: cx.width_of(n.a),
+                    to: w,
+                },
+                OpCode::Extract => CostOp::Extract {
+                    from: cx.width_of(n.a),
+                    lo: n.b as u16,
+                    width: w,
+                },
+                OpCode::Concat => CostOp::Concat {
+                    hi: cx.width_of(n.a),
+                    lo: cx.width_of(n.b),
+                },
+                OpCode::Select => CostOp::Select(w),
+                _ => return (model.cost(CostOp::Symbol, w), true),
+            }
+        };
+        (model.cost(op, w), false)
+    }
+
+    fn eval_tree_cost(
+        &self,
+        cx: &Context,
+        root: u32,
+        root_w: Width,
+        model: &CostModel,
+    ) -> Option<u64> {
+        let cap = self.inner.cfg.max_root_nodes.saturating_mul(4) as usize;
+        let mut memo: IdMap<u32, u64> = IdMap::default();
+        let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if memo.contains_key(&i) {
+                continue;
+            }
+            if memo.len() > cap {
+                return None;
+            }
+            let (own, is_leaf) = self.expr_node_cost(cx, i, root_w, model);
+            if is_leaf {
+                memo.insert(i, own);
+                continue;
+            }
+            let n = cx.node(i);
+            if !expanded {
+                stack.push((i, true));
+                for c in n.children() {
+                    if !memo.contains_key(&c) {
+                        stack.push((c, false));
+                    }
+                }
+                continue;
+            }
+            let mut sum = own;
+            for c in n.children() {
+                sum = sum.saturating_add(*memo.get(&c)?);
+            }
+            memo.insert(i, sum);
+        }
+        memo.get(&root).copied()
+    }
+
+    fn eval_dag_cost(
+        &self,
+        cx: &Context,
+        roots: &[u32],
+        root_w: Width,
+        model: &CostModel,
+    ) -> Option<u64> {
+        let cap = self.inner.cfg.max_root_nodes.saturating_mul(8) as usize;
+        let mut seen: IdMap<u32, ()> = IdMap::default();
+        let mut stack: Vec<u32> = roots.to_vec();
+        let mut total = 0u64;
+        while let Some(i) = stack.pop() {
+            if seen.insert(i, ()).is_some() {
+                continue;
+            }
+            if seen.len() > cap {
+                return None;
+            }
+            let (own, is_leaf) = self.expr_node_cost(cx, i, root_w, model);
+            total = total.saturating_add(own);
+            if !is_leaf {
+                for c in cx.node(i).children() {
+                    if !seen.contains_key(&c) {
+                        stack.push(c);
+                    }
+                }
+            }
+        }
+        Some(total)
+    }
+
+    fn is_cheaper_under(
+        &self,
+        cx: &Context,
+        root: u32,
+        cand: u32,
+        other_roots: &[u32],
+        root_w: Width,
+        model: &CostModel,
+    ) -> bool {
+        match model.mode() {
+            ExtractionMode::Tree => {
+                let (Some(ce), Some(cr)) = (
+                    self.eval_tree_cost(cx, cand, root_w, model),
+                    self.eval_tree_cost(cx, root, root_w, model),
+                ) else {
+                    return false;
+                };
+                if ce != cr {
+                    return ce < cr;
+                }
+                matches!(
+                    (
+                        self.eval_dag_cost(cx, &[cand], root_w, model),
+                        self.eval_dag_cost(cx, &[root], root_w, model),
+                    ),
+                    (Some(de), Some(dr)) if de < dr
+                )
+            }
+            ExtractionMode::Dag => {
+                let mut before = Vec::with_capacity(other_roots.len() + 1);
+                before.extend_from_slice(other_roots);
+                before.push(root);
+                let mut after = Vec::with_capacity(other_roots.len() + 1);
+                after.extend_from_slice(other_roots);
+                after.push(cand);
+                matches!(
+                    (
+                        self.eval_dag_cost(cx, &after, root_w, model),
+                        self.eval_dag_cost(cx, &before, root_w, model),
+                    ),
+                    (Some(de), Some(dr)) if de < dr
+                )
+            }
+        }
     }
 
     /// The fragment nodes below `root` in post-order (atoms included as leaves), or why the

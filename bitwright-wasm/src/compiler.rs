@@ -193,6 +193,44 @@ pub extern "C" fn bw_site_facts(e: u64) -> *mut u8 {
     }))
 }
 
+/// Whether `a op b` holds under the call's assumptions: 1 true, 0 false, -1 unknown.
+#[unsafe(no_mangle)]
+pub extern "C" fn bw_site_prove_cmp(op: u32, a: u64, b: u64) -> i32 {
+    with_site(|s| {
+        let op = nth(&CmpOpExt::ALL, op)?;
+        Some(
+            match s.prove(bw::Query::Cmp(op, Expr::from_bits(a)?, Expr::from_bits(b)?)) {
+                bw::Truth::True => 1,
+                bw::Truth::False => 0,
+                bw::Truth::Unknown => -1,
+            },
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Whether `a == b` holds under the call's assumptions: 1 true, 0 false/unknown.
+#[unsafe(no_mangle)]
+pub extern "C" fn bw_site_prove_eq(a: u64, b: u64) -> i32 {
+    with_site(|s| {
+        Some(i32::from(
+            s.prove_eq(Expr::from_bits(a)?, Expr::from_bits(b)?),
+        ))
+    })
+    .unwrap_or(0)
+}
+
+/// Constant difference `a - b == k (mod 2^W)` in hexadecimal (status 1: none).
+#[unsafe(no_mangle)]
+pub extern "C" fn bw_site_const_diff(a: u64, b: u64) -> *mut u8 {
+    text_out(with_site(|s| {
+        Some(format!(
+            "{:x}",
+            s.const_diff(Expr::from_bits(a)?, Expr::from_bits(b)?)?
+        ))
+    }))
+}
+
 /// The node in the text syntax, without `let`s (status 1: not a handle).
 #[unsafe(no_mangle)]
 pub extern "C" fn bw_site_print(e: u64) -> *mut u8 {

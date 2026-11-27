@@ -1949,6 +1949,102 @@ fn isolate_from_eq(
                 rhs = lo;
                 lhs = u;
             }
+            View::Ext { op, output, args } => {
+                let Some(reg) = cx.registry.clone() else {
+                    return Ok(None);
+                };
+                let Some(ext_op) = reg.op_at(op.raw()) else {
+                    return Ok(None);
+                };
+                let slice = args.as_slice();
+                // Choose the single argument holding symbols (preferring a direct free symbol).
+                let mut target_arg: Option<usize> = None;
+                for (idx, &arg_e) in slice.iter().enumerate() {
+                    if free(cx, arg_e)?.is_some() {
+                        target_arg = Some(idx);
+                        break;
+                    }
+                }
+                if target_arg.is_none() {
+                    let non_const: Vec<usize> = (0..slice.len())
+                        .filter(|&idx| cx.symbols_in(&[slice[idx]]).is_ok_and(|s| !s.is_empty()))
+                        .collect();
+                    if let [only] = non_const[..] {
+                        target_arg = Some(only);
+                    }
+                }
+                let Some(arg_idx) = target_arg else {
+                    return Ok(None);
+                };
+                if let Some(inv_decl) = ext_op.inverse(output, arg_idx as u8)
+                    && let Some(inv_id) = reg.id(inv_decl.op.as_ref())
+                {
+                    let mut inv_args = Vec::with_capacity(inv_decl.args.len());
+                    let mut ok = true;
+                    for &ia in &inv_decl.args {
+                        match ia {
+                            crate::ext::InverseArg::Output => inv_args.push(rhs),
+                            crate::ext::InverseArg::Arg(pos) => {
+                                if let Some(&ae) = slice.get(usize::from(pos)) {
+                                    inv_args.push(ae);
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if ok
+                        && cx.width(slice[arg_idx])? == cx.width(lhs)?
+                        && let Ok(undone) =
+                            cx.ext_output(inv_id, usize::from(inv_decl.output), &inv_args)
+                    {
+                        rhs = undone;
+                        lhs = slice[arg_idx];
+                        continue;
+                    }
+                }
+                // Constant-RHS preimage via `ExtOp::invert` when `Bijective`.
+                if let Some(rhs_bv) = cx.as_const(rhs)? {
+                    let mut const_args = Vec::with_capacity(slice.len());
+                    let mut kbs = Vec::with_capacity(slice.len());
+                    let mut all_other_const = true;
+                    for (idx, &arg_e) in slice.iter().enumerate() {
+                        let aw = cx.width(arg_e)?;
+                        if idx == arg_idx {
+                            const_args.push(BitVec::zero(aw));
+                            kbs.push(crate::facts::KnownBits::unknown(aw));
+                        } else if let Some(cv) = cx.as_const(arg_e)? {
+                            const_args.push(cv);
+                            kbs.push(crate::facts::KnownBits::constant(&cv));
+                        } else {
+                            all_other_const = false;
+                            break;
+                        }
+                    }
+                    if all_other_const
+                        && ext_op.invertible(output, arg_idx as u8, &kbs)
+                            == crate::ext::Invertible::Bijective
+                        && let Some(pre) =
+                            ext_op.invert(output, arg_idx as u8, &const_args, &rhs_bv)
+                    {
+                        const_args[arg_idx] = pre;
+                        if let Ok(sig) = ext_op
+                            .signature(&const_args.iter().map(BitVec::width).collect::<Vec<_>>())
+                        {
+                            let mut check_out: Vec<BitVec> =
+                                sig.outputs().map(|(_, w)| BitVec::zero(w)).collect();
+                            ext_op.eval(&const_args, &mut check_out);
+                            if check_out.get(usize::from(output)) == Some(&rhs_bv) {
+                                rhs = cx.constant(&pre)?;
+                                lhs = slice[arg_idx];
+                                continue;
+                            }
+                        }
+                    }
+                }
+                return Ok(None);
+            }
             _ => return Ok(None),
         }
     }

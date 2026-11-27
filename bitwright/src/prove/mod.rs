@@ -12,7 +12,8 @@
 //! No other solver is involved. Bit-vector operators are blasted with bitwright's total
 //! semantics (SMT-LIB's); floating-point operators with IEEE 754's and bitwright's canonical
 //! NaN ([`crate::fp`]); extension operations through their [`expand`](crate::ext::ExtOp::expand)
-//! definition, if they have one (otherwise the question is not decided).
+//! definition when they have one, or through Ackermann functional-consistency, declared
+//! injectivity, and on-demand [`eval`](crate::ext::ExtOp::eval) refinement when they do not.
 //!
 //! ```
 //! use bitwright::prove::{Config, Outcome, equal};
@@ -731,6 +732,18 @@ impl Default for Simplification {
     }
 }
 
+/// An unexpanded extension output modeled in the circuit via Ackermann congruence and
+/// lazy point-evaluation refinement.
+#[derive(Clone, Debug)]
+pub(crate) struct ExtCall {
+    pub(crate) node: u32,
+    pub(crate) aux: u8,
+    pub(crate) output: u8,
+    pub(crate) args: Vec<u32>,
+    pub(crate) arg_bits: Vec<Bits>,
+    pub(crate) out_bits: Bits,
+}
+
 /// The bits of expressions, blasted on demand.
 pub(crate) struct Blaster<'c> {
     pub(crate) cx: &'c mut Context,
@@ -738,6 +751,10 @@ pub(crate) struct Blaster<'c> {
     bits: IdMap<u32, Bits>,
     /// Each symbol met, with its bits.
     pub(crate) symbols: Vec<(u32, Bits)>,
+    /// Unexpanded extension outputs abstracted as uninterpreted functions.
+    pub(crate) ext_calls: Vec<ExtCall>,
+    /// Functional-consistency and injectivity axioms (`1` = holds) over `ext_calls`.
+    pub(crate) ext_axioms: Vec<L>,
     selectors: Vec<L>,
     selector_hints: bool,
     input_cancellation: bool,
@@ -758,6 +775,8 @@ impl<'c> Blaster<'c> {
             g: Aig::new(),
             bits: IdMap::default(),
             symbols: Vec::new(),
+            ext_calls: Vec::new(),
+            ext_axioms: Vec::new(),
             selectors: Vec::new(),
             selector_hints: false,
             input_cancellation: false,
@@ -779,20 +798,37 @@ impl<'c> Blaster<'c> {
         g: Aig,
         bits: IdMap<u32, Bits>,
         symbols: Vec<(u32, Bits)>,
+        ext_calls: Vec<ExtCall>,
         max_nodes: usize,
     ) -> Blaster<'c> {
         Blaster {
             g,
             bits,
             symbols,
+            ext_calls,
             hardwire_declared: false,
             ..Blaster::new(cx, max_nodes)
         }
     }
 
     /// The circuit, to [`resume`](Self::resume) from.
-    pub(crate) fn into_parts(self) -> (Aig, IdMap<u32, Bits>, Vec<(u32, Bits)>) {
-        (self.g, self.bits, self.symbols)
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Aig,
+        IdMap<u32, Bits>,
+        Vec<(u32, Bits)>,
+        Vec<ExtCall>,
+        Vec<L>,
+    ) {
+        (
+            self.g,
+            self.bits,
+            self.symbols,
+            self.ext_calls,
+            self.ext_axioms,
+        )
     }
 
     /// The bits of node `root`.
@@ -948,13 +984,15 @@ impl<'c> Blaster<'c> {
         })
     }
 
-    /// An extension output, through the operation's expansion.
+    /// An extension output, through the operation's expansion when available, or via
+    /// Ackermann functional-consistency and declared injectivity axioms.
     fn ext(&mut self, i: u32) -> Result<Bits, Error> {
         let n = self.cx.node(i);
         let Some((_, k)) = n.op.as_ext() else {
             return Err(Error::Unsupported("not an extension output".into()));
         };
-        let args: Vec<Expr> = n.children().map(|c| self.cx.handle(c)).collect();
+        let arg_ids: Vec<u32> = n.children().collect();
+        let args: Vec<Expr> = arg_ids.iter().map(|&c| self.cx.handle(c)).collect();
         let reg = self
             .cx
             .registry
@@ -963,15 +1001,82 @@ impl<'c> Blaster<'c> {
         let op = reg
             .op_at(n.aux)
             .ok_or_else(|| Error::Unsupported("an extension without its operation".into()))?;
-        let Some(ex) = op.expand(self.cx, &args) else {
-            return Err(Error::Unsupported(format!(
-                "`{}` has no expansion to reason about",
-                op.name()
-            )));
-        };
-        let outs = ex?;
-        let e = self.cx.id(outs[k])?;
-        self.blast(e)
+        if let Some(ex) = op.expand(self.cx, &args) {
+            let outs = ex?;
+            let e = self.cx.id(outs[k])?;
+            return self.blast(e);
+        }
+        let w = usize::from(n.width);
+        let arg_bits: Vec<Bits> = arg_ids.iter().map(|&c| self.bits[&c].clone()).collect();
+        let out_bits: Bits = (0..w).map(|_| self.g.input()).collect();
+        for idx in 0..self.ext_calls.len() {
+            let same_sig = self.ext_calls[idx].aux == n.aux
+                && usize::from(self.ext_calls[idx].output) == k
+                && self.ext_calls[idx].arg_bits.len() == arg_bits.len()
+                && self.ext_calls[idx]
+                    .arg_bits
+                    .iter()
+                    .zip(&arg_bits)
+                    .all(|(a, b)| a.len() == b.len());
+            if !same_sig {
+                continue;
+            }
+            let prev_args = self.ext_calls[idx].args.clone();
+            let prev_arg_bits = self.ext_calls[idx].arg_bits.clone();
+            let prev_out_bits = self.ext_calls[idx].out_bits.clone();
+            // Ackermann functional consistency: `(/\_m prev_arg[m] == arg[m]) => prev_out == out`.
+            let mut same_args = aig::TRUE;
+            for (ab1, ab2) in prev_arg_bits.iter().zip(&arg_bits) {
+                let eq_m = blast::eq(&mut self.g, ab1, ab2);
+                same_args = self.g.and(same_args, eq_m);
+            }
+            let same_out = blast::eq(&mut self.g, &prev_out_bits, &out_bits);
+            let cong = self.g.or(same_args ^ 1, same_out);
+            if cong != aig::TRUE {
+                self.ext_axioms.push(cong);
+            }
+            // Declared injectivity: `(other_args_eq /\ prev_out == out) => prev_arg[m] == arg[m]`.
+            for m in 0..arg_ids.len() {
+                let mut kbs = Vec::with_capacity(arg_ids.len());
+                for j in 0..arg_ids.len() {
+                    let jw = self.cx.width_of(arg_ids[j]);
+                    if j == m || prev_args[j] != arg_ids[j] {
+                        kbs.push(crate::facts::KnownBits::unknown(jw));
+                    } else {
+                        let h = self.cx.handle(arg_ids[j]);
+                        let kb = self
+                            .cx
+                            .facts(h)
+                            .ok()
+                            .map_or_else(|| crate::facts::KnownBits::unknown(jw), |f| f.known());
+                        kbs.push(kb);
+                    }
+                }
+                if op.invertible(k as u8, m as u8, &kbs) != crate::ext::Invertible::No {
+                    let mut premise = same_out;
+                    for j in 0..arg_bits.len() {
+                        if j != m {
+                            let eq_j = blast::eq(&mut self.g, &prev_arg_bits[j], &arg_bits[j]);
+                            premise = self.g.and(premise, eq_j);
+                        }
+                    }
+                    let eq_m = blast::eq(&mut self.g, &prev_arg_bits[m], &arg_bits[m]);
+                    let inj = self.g.or(premise ^ 1, eq_m);
+                    if inj != aig::TRUE {
+                        self.ext_axioms.push(inj);
+                    }
+                }
+            }
+        }
+        self.ext_calls.push(ExtCall {
+            node: i,
+            aux: n.aux,
+            output: k as u8,
+            args: arg_ids,
+            arg_bits,
+            out_bits: out_bits.clone(),
+        });
+        Ok(out_bits)
     }
 
     /// Why blasting failed with `e`: [`Unknown::TooLarge`] past `max_nodes`, else the reason
@@ -993,6 +1098,9 @@ struct Search {
     cnf: Cnf,
     /// What the sweep cost ([`Config::sweeping`]), counted in the totals.
     swept: sweep::Work,
+    ext_calls: Vec<ExtCall>,
+    certificate: bool,
+    uf_refinements: u32,
 }
 
 /// A question, blasted and encoded once, then decided in as many steps as its caller likes: a
@@ -1970,6 +2078,7 @@ impl Question {
                         extra.push(b.blast(c)?[0]);
                     }
                 }
+                extra.extend_from_slice(&b.ext_axioms);
                 Ok((goal, extra))
             };
             match blasted() {
@@ -2064,7 +2173,7 @@ impl Question {
                 q.symbols.push((k, w, bits));
             }
         }
-        if exhausted {
+        if exhausted && b.ext_calls.is_empty() {
             let exhaustion = Exhaustion::of(&b.g, goal, &extra);
             if exhaustion.inputs() <= u32::from(cfg.exhaustive_inputs.min(63)) {
                 let cert = Certificate {
@@ -2103,6 +2212,7 @@ impl Question {
         } else {
             Vec::new()
         };
+        let has_uf = !b.ext_calls.is_empty();
         for batch in 0..batches {
             let vals = b.g.eval_words(|k| {
                 if let Some(&Some(bit_val)) = pinned_inputs.get(k as usize) {
@@ -2119,12 +2229,26 @@ impl Question {
                 bad &= Aig::word(&vals, e);
             }
             if bad != 0 {
-                let lane = bad.trailing_zeros();
-                let ce = Question::counterexample(&q.symbols, |l| {
-                    (Aig::word(&vals, l) >> lane) & 1 == 1
-                });
-                let o = q.refuted(b.cx, ce)?;
-                return decided(q, o);
+                if has_uf {
+                    let mut mask = bad;
+                    while mask != 0 {
+                        let lane = mask.trailing_zeros();
+                        mask &= mask - 1;
+                        let ce = Question::counterexample(&q.symbols, |l| {
+                            (Aig::word(&vals, l) >> lane) & 1 == 1
+                        });
+                        if let Some(o) = q.try_refuted(b.cx, ce)? {
+                            return decided(q, o);
+                        }
+                    }
+                } else {
+                    let lane = bad.trailing_zeros();
+                    let ce = Question::counterexample(&q.symbols, |l| {
+                        (Aig::word(&vals, l) >> lane) & 1 == 1
+                    });
+                    let o = q.refuted(b.cx, ce)?;
+                    return decided(q, o);
+                }
             }
         }
         let mut solver = Solver::new();
@@ -2133,6 +2257,22 @@ impl Question {
         }
         let mut roots = vec![goal];
         roots.extend_from_slice(&extra);
+        if has_uf && !cfg.certificate {
+            for call in &b.ext_calls {
+                for ab in &call.arg_bits {
+                    for &l in ab {
+                        if l > aig::TRUE {
+                            roots.push(l);
+                        }
+                    }
+                }
+                for &l in &call.out_bits {
+                    if l > aig::TRUE {
+                        roots.push(l);
+                    }
+                }
+            }
+        }
         let mut cnf = Cnf::encode_with_xor3(
             &b.g,
             &roots,
@@ -2199,7 +2339,14 @@ impl Question {
         q.stats.conflicts = swept.conflicts;
         q.stats.decisions = swept.decisions;
         q.stats.propagations = solver.propagations + swept.propagations;
-        q.search = Some(Box::new(Search { solver, cnf, swept }));
+        q.search = Some(Box::new(Search {
+            solver,
+            cnf,
+            swept,
+            ext_calls: b.ext_calls,
+            certificate: cfg.certificate,
+            uf_refinements: 0,
+        }));
         Ok(q)
     }
 
@@ -2211,11 +2358,11 @@ impl Question {
         if let Some(o) = &self.outcome {
             return Ok(o.clone());
         }
-        let Some(s) = self.search.as_mut() else {
+        if self.search.is_none() {
             return Err(Error::Contract(
                 "a question neither decided nor open".into(),
             ));
-        };
+        }
         // The question's totals: its solver's and its sweep's.
         let totals = |s: &Search| {
             (
@@ -2225,44 +2372,86 @@ impl Question {
                 s.solver.lemmas + s.swept.lemmas,
             )
         };
-        let before = totals(s);
+        let before = totals(self.search.as_ref().expect("checked"));
         // A zero allowance pauses the question without searching.
         let searching = limits.conflicts != 0 && limits.propagations != 0;
-        let answer = s.solver.solve_within(limits);
-        let after = totals(s);
-        self.stats.learned = s.solver.num_learnts();
-        self.stats.lemmas = after.3;
-        self.stats.fixed = s.solver.num_fixed();
-        self.stats.conflicts = after.0;
-        self.stats.decisions = after.1;
-        self.stats.propagations = after.2;
-        if searching {
-            self.stats.searches += 1;
-            self.stats.last_conflicts = after.0 - before.0;
-            self.stats.last_decisions = after.1 - before.1;
-            self.stats.last_propagations = after.2 - before.2;
-            self.stats.last_lemmas = after.3 - before.3;
-        }
-        let o = match answer {
-            Answer::Unknown => {
-                return Ok(Outcome::Unknown(Unknown::Budget {
-                    conflicts: after.0,
-                    propagations: after.2,
-                }));
+        let mut rem_limits = limits;
+        let o = loop {
+            let answer = {
+                let s = self.search.as_mut().expect("checked");
+                let step_before = (s.solver.conflicts, s.solver.propagations);
+                let ans = s.solver.solve_within(rem_limits);
+                let dc = s.solver.conflicts - step_before.0;
+                let dp = s.solver.propagations - step_before.1;
+                rem_limits.conflicts = rem_limits.conflicts.saturating_sub(dc);
+                rem_limits.propagations = rem_limits.propagations.saturating_sub(dp);
+                ans
+            };
+            let after = totals(self.search.as_ref().expect("checked"));
+            {
+                let s = self.search.as_ref().expect("checked");
+                self.stats.learned = s.solver.num_learnts();
+                self.stats.lemmas = after.3;
+                self.stats.fixed = s.solver.num_fixed();
             }
-            Answer::Unsat => {
-                let cert = s.solver.take_proof().map(|proof| Certificate {
-                    vars: s.solver.num_vars(),
-                    clauses: core::mem::take(&mut s.cnf.clauses),
-                    proof,
-                    exhaustion: None,
-                });
-                Outcome::Proved(cert)
+            self.stats.conflicts = after.0;
+            self.stats.decisions = after.1;
+            self.stats.propagations = after.2;
+            if searching {
+                self.stats.searches += 1;
+                self.stats.last_conflicts = after.0 - before.0;
+                self.stats.last_decisions = after.1 - before.1;
+                self.stats.last_propagations = after.2 - before.2;
+                self.stats.last_lemmas = after.3 - before.3;
             }
-            Answer::Sat(model) => {
-                let cnf = &s.cnf;
-                let ce = Question::counterexample(&self.symbols, |l| cnf.value(l, &model));
-                self.refuted(cx, ce)?
+            match answer {
+                Answer::Unknown => {
+                    return Ok(Outcome::Unknown(Unknown::Budget {
+                        conflicts: after.0,
+                        propagations: after.2,
+                    }));
+                }
+                Answer::Unsat => {
+                    let s = self.search.as_mut().expect("checked");
+                    let cert = s.solver.take_proof().map(|proof| Certificate {
+                        vars: s.solver.num_vars(),
+                        clauses: core::mem::take(&mut s.cnf.clauses),
+                        proof,
+                        exhaustion: None,
+                    });
+                    break Outcome::Proved(cert);
+                }
+                Answer::Sat(model) => {
+                    let has_uf = !self.search.as_ref().expect("checked").ext_calls.is_empty();
+                    let ce = {
+                        let cnf = &self.search.as_ref().expect("checked").cnf;
+                        Question::counterexample(&self.symbols, |l| cnf.value(l, &model))
+                    };
+                    if !has_uf {
+                        break self.refuted(cx, ce)?;
+                    }
+                    if let Some(refuted) = self.try_refuted(cx, ce.clone())? {
+                        break refuted;
+                    }
+                    let s = self.search.as_mut().expect("checked");
+                    if s.certificate || s.uf_refinements >= 256 {
+                        break Outcome::Unknown(Unknown::Unsupported(
+                            "an extension operation has no expansion to reason about".into(),
+                        ));
+                    }
+                    if !refine_ext_calls(&s.ext_calls, &s.cnf, &mut s.solver, cx, &ce, &model)? {
+                        break Outcome::Unknown(Unknown::Unsupported(
+                            "an extension operation has no expansion to reason about".into(),
+                        ));
+                    }
+                    s.uf_refinements += 1;
+                    if rem_limits.conflicts == 0 || rem_limits.propagations == 0 {
+                        return Ok(Outcome::Unknown(Unknown::Budget {
+                            conflicts: after.0,
+                            propagations: after.2,
+                        }));
+                    }
+                }
             }
         };
         self.search = None;
@@ -2296,33 +2485,118 @@ impl Question {
             .collect()
     }
 
-    /// `Refuted(ce)`, checked by bitwright's evaluator: a solver or blaster bug cannot produce a
-    /// false refutation unnoticed.
-    fn refuted(&self, cx: &mut Context, ce: Model) -> Result<Outcome, Error> {
-        // (By key, the first value given for one: a model lists every symbol of the question.)
+    /// `Some(Refuted(ce))` if `ce` refutes `self.root` under `cx.eval`, else `None`.
+    fn try_refuted(&self, cx: &mut Context, ce: Model) -> Result<Option<Outcome>, Error> {
         let mut env: std::collections::HashMap<SymbolKey, BitVec> =
             std::collections::HashMap::with_capacity(ce.len());
         for (k, v) in &ce {
             env.entry(k.clone()).or_insert(*v);
         }
         let v = cx.eval(&[self.root], &env)?[0];
-        if v.is_zero() {
-            Ok(Outcome::Refuted(ce))
-        } else {
-            Err(Error::Contract(format!(
+        Ok(v.is_zero().then_some(Outcome::Refuted(ce)))
+    }
+
+    /// `Refuted(ce)`, checked by bitwright's evaluator: a solver or blaster bug cannot produce a
+    /// false refutation unnoticed.
+    fn refuted(&self, cx: &mut Context, ce: Model) -> Result<Outcome, Error> {
+        match self.try_refuted(cx, ce)? {
+            Some(o) => Ok(o),
+            None => Err(Error::Contract(format!(
                 "the prover's counterexample does not refute {}",
                 cx.display(self.root)
-            )))
+            ))),
         }
     }
+}
+
+/// Adds universally valid point-evaluation clauses `(args == model_args) => (out == eval(model_args))`
+/// for every unexpanded extension output whose SAT assignment in `model` disagrees with `cx.eval`
+/// at `env_model`. Returns whether at least one refining clause was added.
+pub(crate) fn refine_ext_calls<S: Backend + ?Sized>(
+    calls: &[ExtCall],
+    cnf: &Cnf,
+    solver: &mut S,
+    cx: &mut Context,
+    env_model: &Model,
+    model: &[bool],
+) -> Result<bool, Error> {
+    let mut env: std::collections::HashMap<SymbolKey, BitVec> =
+        std::collections::HashMap::with_capacity(env_model.len());
+    for (k, v) in env_model {
+        env.entry(k.clone()).or_insert(*v);
+    }
+    let exprs: Vec<Expr> = calls.iter().map(|c| cx.handle(c.node)).collect();
+    let true_outs = cx.eval(&exprs, &env)?;
+    let mut added = false;
+    for (call, true_out) in calls.iter().zip(&true_outs) {
+        let mut differs = false;
+        for (j, &ol) in call.out_bits.iter().enumerate() {
+            let want = true_out.bit(j as u16) == Some(true);
+            if cnf.value(ol, model) != want {
+                differs = true;
+                break;
+            }
+        }
+        if !differs {
+            continue;
+        }
+        let mut clause_prefix: Vec<Lit> = Vec::new();
+        let mut unmapped = false;
+        for ab in &call.arg_bits {
+            for &al in ab {
+                if al <= aig::TRUE {
+                    continue;
+                }
+                let Some(lit) = cnf.mapped_lit(al) else {
+                    unmapped = true;
+                    break;
+                };
+                let neg_val = if cnf.value(al, model) { !lit } else { lit };
+                if !clause_prefix.contains(&neg_val) {
+                    clause_prefix.push(neg_val);
+                }
+            }
+            if unmapped {
+                break;
+            }
+        }
+        if unmapped {
+            continue;
+        }
+        for (j, &ol) in call.out_bits.iter().enumerate() {
+            if ol <= aig::TRUE {
+                continue;
+            }
+            let Some(olit) = cnf.mapped_lit(ol) else {
+                continue;
+            };
+            let want = true_out.bit(j as u16) == Some(true);
+            let concl = if want { olit } else { !olit };
+            let mut clause = clause_prefix.clone();
+            if !clause.contains(&concl) {
+                clause.push(concl);
+                solver.add_clause(&clause);
+                added = true;
+            }
+        }
+    }
+    Ok(added)
 }
 
 /// Simplification can omit original symbols: supply values consistent with their declarations
 /// before replaying the original constrained predicate.
 fn complete_model(cx: &mut Context, root: Expr, model: &mut Model) -> Result<(), Error> {
+    complete_model_for_slice(cx, &[root], model)
+}
+
+pub(crate) fn complete_model_for_slice(
+    cx: &mut Context,
+    roots: &[Expr],
+    model: &mut Model,
+) -> Result<(), Error> {
     let mut given: std::collections::HashSet<SymbolKey> =
         model.iter().map(|(k, _)| k.clone()).collect();
-    for id in cx.symbols_in(&[root])? {
+    for id in cx.symbols_in(roots)? {
         let key = cx.symbol_key(id).unwrap().clone();
         if given.insert(key.clone()) {
             let symbol = cx.find_symbol(&key).unwrap();

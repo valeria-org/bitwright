@@ -1,9 +1,11 @@
 //! One circuit and one search for many questions.
 
-use super::aig::{Aig, Cnf};
+use super::aig::{self, Aig, Cnf, L};
 use super::blast::Bits;
 use super::sat::{self, Backend, Limits, Lit, Solver};
-use super::{Blaster, Config, Model, Question, SampleMode, Simplifiers, Unknown};
+use super::{
+    Blaster, Config, ExtCall, Model, Question, SampleMode, Simplifiers, Unknown, refine_ext_calls,
+};
 use crate::error::Error;
 use crate::expr::{Context, Expr};
 use crate::hash::IdMap;
@@ -63,6 +65,7 @@ pub struct Incremental<B = Solver> {
     g: Aig,
     bits: IdMap<u32, Bits>,
     symbols: Vec<(u32, Bits)>,
+    ext_calls: Vec<ExtCall>,
     /// The gates each predicate added when it was first asked.
     added: IdMap<u32, u32>,
     cnf: Cnf,
@@ -86,6 +89,7 @@ impl<B: Backend> Incremental<B> {
             g: Aig::new(),
             bits: IdMap::default(),
             symbols: Vec::new(),
+            ext_calls: Vec::new(),
             added: IdMap::default(),
             cnf: Cnf::empty(false),
             solver: backend,
@@ -145,12 +149,15 @@ impl<B: Backend> Incremental<B> {
         let growth = self.question_nodes.saturating_mul(unseen.max(1));
         // (Read before the circuit is handed over: its size is part of the allowance.)
         let allowed = (self.max_nodes).min(self.g.len().saturating_add(growth));
+        let prev_ext_len = self.ext_calls.len();
+        let new_axioms: Vec<L>;
         {
             let mut b = Blaster::resume(
                 cx,
                 core::mem::take(&mut self.g),
                 core::mem::take(&mut self.bits),
                 core::mem::take(&mut self.symbols),
+                core::mem::take(&mut self.ext_calls),
                 allowed,
             );
             let mut failure = None;
@@ -174,13 +181,34 @@ impl<B: Backend> Incremental<B> {
                     }
                 }
             }
-            (self.g, self.bits, self.symbols) = b.into_parts();
+            (self.g, self.bits, self.symbols, self.ext_calls, new_axioms) = b.into_parts();
             if let Some(f) = failure {
                 return f;
             }
         }
-        self.cnf.extend(&self.g, &roots, &mut self.solver, false);
         let pred_count = roots.len();
+        let mut encode_roots = roots.clone();
+        encode_roots.extend_from_slice(&new_axioms);
+        for call in &self.ext_calls[prev_ext_len..] {
+            for ab in &call.arg_bits {
+                for &l in ab {
+                    if l > aig::TRUE {
+                        encode_roots.push(l);
+                    }
+                }
+            }
+            for &l in &call.out_bits {
+                if l > aig::TRUE {
+                    encode_roots.push(l);
+                }
+            }
+        }
+        self.cnf
+            .extend(&self.g, &encode_roots, &mut self.solver, false);
+        for &ax in &new_axioms {
+            let lit = self.cnf.lit(ax);
+            self.solver.add_clause(&[lit]);
+        }
         let mut lits: Vec<Lit> = roots.iter().map(|&r| self.cnf.lit(r)).collect();
         for (node, bits) in &self.symbols {
             let Some(kb) = cx.declared_at(*node) else {
@@ -197,49 +225,90 @@ impl<B: Backend> Incremental<B> {
                 }
             }
         }
-        Ok(match self.solver.solve_assuming(&lits, limits) {
-            sat::Answer::Sat(model) => {
-                let mut out = Vec::with_capacity(self.symbols.len());
-                for (node, bits) in &self.symbols {
-                    let e = cx.handle(*node);
-                    let Some(key) = cx.symbol_id(e)?.and_then(|id| cx.symbol_key(id)).cloned()
-                    else {
-                        continue;
-                    };
-                    let w = cx.width_of(*node);
-                    let mut limbs = vec![0u64; usize::from(w.bits()).div_ceil(64)];
-                    for (j, &b) in bits.iter().enumerate() {
-                        if self.cnf.value(b, &model) {
-                            limbs[j / 64] |= 1 << (j % 64);
+        let mut rem_limits = limits;
+        let mut uf_refinements = 0u32;
+        loop {
+            let step_before = (self.solver.conflicts(), self.solver.propagations());
+            let ans = self.solver.solve_assuming(&lits, rem_limits);
+            let dc = self.solver.conflicts().saturating_sub(step_before.0);
+            let dp = self.solver.propagations().saturating_sub(step_before.1);
+            rem_limits.conflicts = rem_limits.conflicts.saturating_sub(dc);
+            rem_limits.propagations = rem_limits.propagations.saturating_sub(dp);
+            match ans {
+                sat::Answer::Sat(model) => {
+                    let mut out = Vec::with_capacity(self.symbols.len());
+                    for (node, bits) in &self.symbols {
+                        let e = cx.handle(*node);
+                        let Some(key) = cx.symbol_id(e)?.and_then(|id| cx.symbol_key(id)).cloned()
+                        else {
+                            continue;
+                        };
+                        let w = cx.width_of(*node);
+                        let mut limbs = vec![0u64; usize::from(w.bits()).div_ceil(64)];
+                        for (j, &b) in bits.iter().enumerate() {
+                            if self.cnf.value(b, &model) {
+                                limbs[j / 64] |= 1 << (j % 64);
+                            }
                         }
+                        let mut v = BitVec::wrapping_from_limbs(w, &limbs);
+                        if let Some(kb) = cx.declared_at(*node) {
+                            let keep = crate::facts::known::bv_not(&kb.known_zero());
+                            v = crate::facts::known::bv_or(
+                                &crate::facts::known::bv_and(&v, &keep),
+                                &kb.known_one(),
+                            );
+                        }
+                        out.push((key, v));
                     }
-                    let mut v = BitVec::wrapping_from_limbs(w, &limbs);
-                    if let Some(kb) = cx.declared_at(*node) {
-                        let keep = crate::facts::known::bv_not(&kb.known_zero());
-                        v = crate::facts::known::bv_or(
-                            &crate::facts::known::bv_and(&v, &keep),
-                            &kb.known_one(),
-                        );
+                    if self.ext_calls.is_empty() {
+                        return Ok(Answer::Sat(out));
                     }
-                    out.push((key, v));
+                    let mut full_env = out.clone();
+                    super::complete_model_for_slice(cx, predicates, &mut full_env)?;
+                    let vals = cx.eval(predicates, &full_env[..])?;
+                    if vals.iter().all(|v| !v.is_zero()) {
+                        return Ok(Answer::Sat(full_env));
+                    }
+                    if uf_refinements >= 64
+                        || !refine_ext_calls(
+                            &self.ext_calls,
+                            &self.cnf,
+                            &mut self.solver,
+                            cx,
+                            &full_env,
+                            &model,
+                        )?
+                    {
+                        return Ok(Answer::Unknown(Unknown::Unsupported(
+                            "an extension operation has no expansion to reason about".into(),
+                        )));
+                    }
+                    uf_refinements += 1;
+                    if rem_limits.conflicts == 0 || rem_limits.propagations == 0 {
+                        return Ok(Answer::Unknown(Unknown::Budget {
+                            conflicts: self.solver.conflicts(),
+                            propagations: self.solver.propagations(),
+                        }));
+                    }
                 }
-                Answer::Sat(out)
-            }
-            sat::Answer::Unsat => {
-                let failed = self.solver.failed_assumptions();
-                let mut core: Vec<usize> = (0..pred_count)
-                    .filter(|&k| failed.contains(&lits[k]))
-                    .collect();
-                if core.is_empty() && pred_count > 0 {
-                    core = (0..pred_count).collect();
+                sat::Answer::Unsat => {
+                    let failed = self.solver.failed_assumptions();
+                    let mut core: Vec<usize> = (0..pred_count)
+                        .filter(|&k| failed.contains(&lits[k]))
+                        .collect();
+                    if core.is_empty() && pred_count > 0 {
+                        core = (0..pred_count).collect();
+                    }
+                    return Ok(Answer::Unsat(core));
                 }
-                Answer::Unsat(core)
+                sat::Answer::Unknown => {
+                    return Ok(Answer::Unknown(Unknown::Budget {
+                        conflicts: self.solver.conflicts(),
+                        propagations: self.solver.propagations(),
+                    }));
+                }
             }
-            sat::Answer::Unknown => Answer::Unknown(Unknown::Budget {
-                conflicts: self.solver.conflicts(),
-                propagations: self.solver.propagations(),
-            }),
-        })
+        }
     }
 
     /// Does this backend report exact conflict counts (see [`Backend::exact_conflicts`])?
@@ -254,6 +323,8 @@ impl<B: Backend> Incremental<B> {
     pub fn forget_since(&mut self, at: Checkpoint) {
         self.bits.retain(|&i, _| i < at.nodes());
         self.symbols.retain(|&(i, _)| i < at.nodes());
+        self.ext_calls
+            .retain(|c| c.node < at.nodes() && c.args.iter().all(|&a| a < at.nodes()));
         self.added.retain(|&i, _| i < at.nodes());
     }
 }
@@ -366,6 +437,11 @@ impl<'c> Prepared<'c> {
                 Ok(bits) => outputs.push(bits),
                 Err(e) => return Ok(Err(b.unknown(e)?)),
             }
+        }
+        if !b.ext_calls.is_empty() {
+            return Ok(Err(Unknown::Unsupported(
+                "unexpanded extension operations need a standalone Question".into(),
+            )));
         }
         if b.g.len() > cfg.max_nodes {
             return Ok(Err(Unknown::TooLarge { nodes: b.g.len() }));

@@ -2995,3 +2995,444 @@ fn square_known_bits_are_sound() {
         2
     );
 }
+
+#[test]
+fn floating_point_backward_transfers_are_sound_exhaustively() {
+    use crate::fp::node::Desc;
+    use crate::fp::{FpFormat, FpOp, RoundingMode};
+
+    let mut rng = Rng(0xf10a_bac4);
+    let f33 = FpFormat::new(3, 3).unwrap();
+    let f22 = FpFormat::new(2, 2).unwrap();
+    let w33 = f33.width();
+    let w22 = f22.width();
+
+    // Build rich 6-bit FP states covering singletons (all 64 bit patterns, including ±0, ±inf,
+    // subnormals, and every positive/negative quiet and signaling NaN payload), non-NaN intervals,
+    // NaN-only sets, mixed NaN + range sets, and random reduced `Facts`.
+    let mut st33 = vec![
+        Facts::top(w33),
+        Facts::constant(&f33.zero(false)),
+        Facts::constant(&f33.zero(true)),
+        Facts::constant(&f33.inf(false)),
+        Facts::constant(&f33.inf(true)),
+        Facts::constant(&f33.nan()),
+        // Negative signaling/quiet NaN payloads (e.g. 0x3d, 0x3f).
+        Facts::constant(&BitVec::wrapping_from_u64(w33, 0x3d)),
+        Facts::constant(&BitVec::wrapping_from_u64(w33, 0x3f)),
+        // Positive signaling NaN payload (0x1d).
+        Facts::constant(&BitVec::wrapping_from_u64(w33, 0x1d)),
+        // Both zeros `{-0.0, +0.0}`.
+        facts_of_set(&[f33.zero(false), f33.zero(true)]),
+        // Non-NaN finite + non-canonical negative NaN `0x3f`.
+        facts_of_set(&[
+            BitVec::wrapping_from_u64(w33, 0x08),
+            BitVec::wrapping_from_u64(w33, 0x3f),
+        ]),
+    ];
+    st33.extend(states(&mut rng, w33.bits(), 40));
+
+    let mut rs33: Vec<Facts> = all_values(w33.bits()).iter().map(Facts::constant).collect();
+    rs33.push(Facts::top(w33));
+    // Non-NaN result facts (`[0, sign | inf]` unsigned and `[smin, inf]` signed).
+    rs33.push(
+        Facts::new(
+            KnownBits::unknown(w33),
+            URange::new(BitVec::zero(w33), f33.inf(true)).unwrap(),
+            SRange::new(BitVec::smin(w33), f33.inf(false)).unwrap(),
+        )
+        .unwrap(),
+    );
+    rs33.extend(states(&mut rng, w33.bits(), 24));
+
+    let st22 = {
+        let mut v: Vec<Facts> = all_values(w22.bits()).iter().map(Facts::constant).collect();
+        v.push(Facts::top(w22));
+        v.extend(states(&mut rng, w22.bits(), 20));
+        v
+    };
+    let rs22 = st22.clone();
+    let bool_results = [
+        Facts::constant(&BitVec::from_bool(false)),
+        Facts::constant(&BitVec::from_bool(true)),
+        Facts::top(Width::W1),
+    ];
+
+    // 1. Exhaustive over all structured `(a, b, r)` for comparisons `FEq`, `FLt`, `FLe` on (3, 3).
+    for op in [FpOp::Eq, FpOp::Lt, FpOp::Le] {
+        let top = TOp::Fp(Desc { op, format: f33 });
+        for r in &bool_results {
+            for a in &st33 {
+                for b in &st33 {
+                    check_backward(&top, r, &[a, b]);
+                }
+            }
+        }
+    }
+
+    // 2. Unary FP ops on `(3, 3)` and conversions `(2, 2) <-> (3, 3)`.
+    for rm in [
+        RoundingMode::Rne,
+        RoundingMode::Rtp,
+        RoundingMode::Rtn,
+        RoundingMode::Rtz,
+    ] {
+        for op in [FpOp::Sqrt(rm), FpOp::RoundToIntegral(rm)] {
+            let top = TOp::Fp(Desc { op, format: f33 });
+            for r in &rs33 {
+                for a in &st33 {
+                    check_backward(&top, r, &[a]);
+                }
+            }
+        }
+        // Lossless widening `(2, 2) -> (3, 3)` across every `(a, r)` pair!
+        let widen = TOp::Fp(Desc {
+            op: FpOp::Convert { to: f33, rm },
+            format: f22,
+        });
+        for r in &rs33 {
+            for a in &st22 {
+                check_backward(&widen, r, &[a]);
+            }
+        }
+        // Narrowing `(3, 3) -> (2, 2)`.
+        let narrow = TOp::Fp(Desc {
+            op: FpOp::Convert { to: f22, rm },
+            format: f33,
+        });
+        for r in &rs22 {
+            for a in &st33 {
+                check_backward(&narrow, r, &[a]);
+            }
+        }
+        // Integer conversions `FromSInt`, `FromUInt`, `ToSInt`, `ToUInt`.
+        let int3 = results(&mut rng, 3, 8);
+        for op in [FpOp::ToSInt(rm, width(3)), FpOp::ToUInt(rm, width(3))] {
+            let top = TOp::Fp(Desc { op, format: f33 });
+            for r in &int3 {
+                for a in &st33 {
+                    check_backward(&top, r, &[a]);
+                }
+            }
+        }
+        for op in [FpOp::FromSInt(rm), FpOp::FromUInt(rm)] {
+            let top = TOp::Fp(Desc { op, format: f33 });
+            for r in rs33.iter().step_by(3) {
+                for a in &int3 {
+                    check_backward(&top, r, &[a]);
+                }
+            }
+        }
+    }
+
+    // 3. Binary FP ops `FAdd`, `FMul`, `FDiv`, `FRem`, `FMin`, `FMax`, `FFma` on `(3, 3)`.
+    for rm in [RoundingMode::Rne, RoundingMode::Rtp, RoundingMode::Rtn] {
+        for op in [
+            FpOp::Add(rm),
+            FpOp::Mul(rm),
+            FpOp::Div(rm),
+            FpOp::Rem,
+            FpOp::Min,
+            FpOp::Max,
+        ] {
+            let top = TOp::Fp(Desc { op, format: f33 });
+            // Explicitly check all 4,096 `(va, vb)` pairs (`top x top`) against key result sets.
+            for r in [
+                &Facts::constant(&f33.nan()),
+                &Facts::constant(&BitVec::wrapping_from_u64(w33, 0x3f)),
+                &rs33[65],
+                &Facts::constant(&f33.zero(false)),
+            ] {
+                check_backward(&top, r, &[&st33[0], &st33[0]]);
+            }
+            for _ in 0..400 {
+                let a = &st33[rng.below(st33.len() as u64) as usize];
+                let b = &st33[rng.below(st33.len() as u64) as usize];
+                let r = &rs33[rng.below(rs33.len() as u64) as usize];
+                check_backward(&top, r, &[a, b]);
+            }
+        }
+        let fma = TOp::Fp(Desc {
+            op: FpOp::Fma(rm),
+            format: f33,
+        });
+        for _ in 0..200 {
+            let a = &st33[rng.below(st33.len() as u64) as usize];
+            let b = &st33[rng.below(st33.len() as u64) as usize];
+            let c = &st33[rng.below(st33.len() as u64) as usize];
+            let r = &rs33[rng.below(rs33.len() as u64) as usize];
+            check_backward(&fma, r, &[a, b, c]);
+        }
+    }
+}
+
+#[test]
+fn floating_point_backward_refines_comparisons_nan_propagation_sqrt_and_widening() {
+    let mut cx = Context::new();
+    let o = crate::ParseOptions::default();
+
+    // 1. Assuming `fp.lt.f32(x, 1.0)` holds excludes NaNs and bounds `x < 1.0`.
+    let x = cx.symbol("x", Width::W32).unwrap();
+    let one = cx.constant(&BitVec::from_f32(1.0)).unwrap();
+    let lt = cx
+        .fp(crate::fp::FpOp::Lt, crate::fp::FpFormat::F32, &[x, one])
+        .unwrap();
+    let mut a = Assumptions::new();
+    a.assume_true(&mut cx, lt).unwrap();
+    let fx = cx.facts_with(x, &a).unwrap().unwrap();
+    assert!(!fx.contains(&crate::fp::FpFormat::F32.nan()));
+    assert!(!fx.contains(&BitVec::wrapping_from_u64(Width::W32, 0xffff_ffff)));
+    assert!(!fx.contains(&BitVec::from_f32(1.0)));
+    assert!(fx.contains(&BitVec::from_f32(f32::from_bits(1.0f32.to_bits() - 1))));
+    assert!(fx.contains(&BitVec::from_f32(-0.0)));
+    assert!(fx.contains(&BitVec::from_f32(0.0)));
+
+    // 2. Assuming `fp.lt.f32(x, 1.0)` is FALSE keeps every NaN payload (including `0xffff_ffff`)
+    //    while excluding non-NaN floats `< 1.0`!
+    let mut af = Assumptions::new();
+    af.assume_false(&mut cx, lt).unwrap();
+    let fxf = cx.facts_with(x, &af).unwrap().unwrap();
+    assert!(fxf.contains(&BitVec::wrapping_from_u64(Width::W32, 0xffff_ffff)));
+    assert!(fxf.contains(&BitVec::wrapping_from_u64(Width::W32, 0x7f80_0001)));
+    assert!(fxf.contains(&BitVec::from_f32(1.0)));
+    assert!(!fxf.contains(&BitVec::from_f32(0.5)));
+    assert!(!fxf.contains(&BitVec::from_f32(-1.0)));
+
+    // 3. `fp.eq.f32(x, +0.0)` holds iff `x` is `+0.0` or `-0.0`.
+    let pz = cx.constant(&BitVec::from_f32(0.0)).unwrap();
+    let eq0 = cx
+        .fp(crate::fp::FpOp::Eq, crate::fp::FpFormat::F32, &[x, pz])
+        .unwrap();
+    let mut az = Assumptions::new();
+    az.assume_true(&mut cx, eq0).unwrap();
+    let fxz = cx.facts_with(x, &az).unwrap().unwrap();
+    assert!(fxz.contains(&BitVec::from_f32(0.0)));
+    assert!(fxz.contains(&BitVec::from_f32(-0.0)));
+    assert!(!fxz.contains(&BitVec::from_f32(f32::from_bits(1))));
+
+    // 4. `fp.sqrt.rne.f32(y)` known non-NaN (via `fp.le.f32(sqrt(y), 4.0)`) proves `y >= -0.0` and non-NaN.
+    let y = cx.symbol("y", Width::W32).unwrap();
+    let sy = cx
+        .fp(
+            crate::fp::FpOp::Sqrt(crate::fp::RoundingMode::Rne),
+            crate::fp::FpFormat::F32,
+            &[y],
+        )
+        .unwrap();
+    let four = cx.constant(&BitVec::from_f32(4.0)).unwrap();
+    let le4 = cx
+        .fp(crate::fp::FpOp::Le, crate::fp::FpFormat::F32, &[sy, four])
+        .unwrap();
+    let mut asq = Assumptions::new();
+    asq.assume_true(&mut cx, le4).unwrap();
+    let fy = cx.facts_with(y, &asq).unwrap().unwrap();
+    assert!(!fy.contains(&crate::fp::FpFormat::F32.nan()));
+    assert!(!fy.contains(&BitVec::from_f32(-1.0)));
+    assert!(fy.contains(&BitVec::from_f32(-0.0)));
+    assert!(fy.contains(&BitVec::from_f32(0.0)));
+
+    // 5. Lossless widening `fp.convert.rne.f16.f32(h)` bounded in `[1.0, 2.0]` bounds `h` in `f16`!
+    let h = cx.symbol("h", Width::W16).unwrap();
+    let wide = cx.parse("fp.convert.rne.f16.f32(h:16)", &o).unwrap();
+    let two = cx.constant(&BitVec::from_f32(2.0)).unwrap();
+    let ge1 = cx
+        .fp(crate::fp::FpOp::Le, crate::fp::FpFormat::F32, &[one, wide])
+        .unwrap();
+    let le2 = cx
+        .fp(crate::fp::FpOp::Le, crate::fp::FpFormat::F32, &[wide, two])
+        .unwrap();
+    let mut aw = Assumptions::new();
+    aw.assume_true(&mut cx, ge1).unwrap();
+    aw.assume_true(&mut cx, le2).unwrap();
+    let fh = cx.facts_with(h, &aw).unwrap().unwrap();
+    let f16 = crate::fp::FpFormat::F16;
+    let h_one = crate::fp::FpFormat::F32
+        .convert(f16, crate::fp::RoundingMode::Rne, &BitVec::from_f32(1.0))
+        .unwrap();
+    let h_two = crate::fp::FpFormat::F32
+        .convert(f16, crate::fp::RoundingMode::Rne, &BitVec::from_f32(2.0))
+        .unwrap();
+    assert_eq!((fh.urange().lo(), fh.urange().hi()), (h_one, h_two));
+
+    // 6. Wide (`> 64`-bit) `f128` backward transfer preserves all positive and negative NaN
+    //    payloads when `fp.lt.f128(q, +0.0)` is false, and excludes NaNs when true.
+    let f128 = crate::fp::FpFormat::F128;
+    let w128 = f128.width();
+    let q = cx.symbol("q", w128).unwrap();
+    let z128 = cx.constant(&f128.zero(false)).unwrap();
+    let lt128 = cx.fp(crate::fp::FpOp::Lt, f128, &[q, z128]).unwrap();
+    let mut aq_true = Assumptions::new();
+    aq_true.assume_true(&mut cx, lt128).unwrap();
+    let fq_true = cx.facts_with(q, &aq_true).unwrap().unwrap();
+    assert!(!fq_true.contains(&f128.nan()));
+    assert!(!fq_true.contains(&BitVec::ones(w128)));
+
+    let mut aq_false = Assumptions::new();
+    aq_false.assume_false(&mut cx, lt128).unwrap();
+    let fq_false = cx.facts_with(q, &aq_false).unwrap().unwrap();
+    assert!(fq_false.contains(&f128.nan()));
+    assert!(fq_false.contains(&BitVec::ones(w128)));
+    assert!(fq_false.contains(&f128.zero(false)));
+    assert!(fq_false.contains(&f128.zero(true)));
+}
+
+#[test]
+fn narrow_word_transfers_match_wide_transfers_across_widths() {
+    use super::transfer::{
+        extract_wide, extract_word, mul_wide, mul_word, sext_wide, sext_word, shift_const_wide,
+        shift_const_word, zext_wide, zext_word,
+    };
+
+    let mut rng = Rng(0x64b1_7f57);
+    let widths = [1u16, 7, 8, 16, 32, 64];
+
+    let make_facts = |rng: &mut Rng, w: Width| -> Facts {
+        let wb = w.bits();
+        let m = if wb == 64 { u64::MAX } else { (1u64 << wb) - 1 };
+        let r = |rng: &mut Rng| rng.next() & m;
+        match rng.below(8) {
+            0 => return Facts::constant(&BitVec::from_canonical_u64(w, r(rng))),
+            1 => return Facts::top(w),
+            2 => {
+                // Sparse maybe-one mask (1..=8 bits) to exercise sparse shift-and-add in `Mul`.
+                let nbits = 1 + rng.below(8);
+                let mut may = 0u64;
+                for _ in 0..nbits {
+                    may |= 1u64 << rng.below(u64::from(wb));
+                }
+                let one = may & r(rng);
+                let zero = !may & m;
+                return Facts::from_known(KnownBits::from_masks(
+                    BitVec::from_canonical_u64(w, zero),
+                    BitVec::from_canonical_u64(w, one),
+                ));
+            }
+            _ => {}
+        }
+        loop {
+            let known = r(rng) & r(rng);
+            let one = r(rng) & known;
+            let k = KnownBits::from_masks(
+                BitVec::from_canonical_u64(w, known & !one),
+                BitVec::from_canonical_u64(w, one),
+            );
+            let (x, y) = (r(rng), r(rng));
+            let (lo, hi) = (x.min(y), x.max(y));
+            let stride = if hi > lo && rng.below(3) == 0 {
+                1 + rng.below(8)
+            } else {
+                1
+            };
+            let hi = if hi > lo {
+                lo + (hi - lo) / stride * stride
+            } else {
+                hi
+            };
+            let u = URange::strided(
+                BitVec::from_canonical_u64(w, lo),
+                BitVec::from_canonical_u64(w, hi),
+                stride,
+            )
+            .or_else(|| {
+                URange::new(
+                    BitVec::from_canonical_u64(w, lo),
+                    BitVec::from_canonical_u64(w, hi),
+                )
+            })
+            .unwrap_or(URange::full(w));
+            let s = if rng.below(2) == 0 {
+                SRange::full(w)
+            } else {
+                let (p, q) = (r(rng), r(rng));
+                let shift = 64 - u32::from(wb);
+                let signed = |v: u64| ((v << shift) as i64) >> shift;
+                let (p, q) = if signed(p) <= signed(q) {
+                    (p, q)
+                } else {
+                    (q, p)
+                };
+                SRange::new(
+                    BitVec::from_canonical_u64(w, p),
+                    BitVec::from_canonical_u64(w, q),
+                )
+                .unwrap_or(SRange::full(w))
+            };
+            if let Some(f) = Facts::reduce(k, u, s) {
+                return f;
+            }
+        }
+    };
+
+    for &src_bits in &widths {
+        let w = width(src_bits);
+        for _ in 0..1500 {
+            let a = make_facts(&mut rng, w);
+            let b = make_facts(&mut rng, w);
+
+            // 1. `Mul` word vs wide.
+            assert_eq!(
+                mul_word(&a, &b),
+                mul_wide(&a, &b),
+                "mul {src_bits}: {a:?} * {b:?}"
+            );
+
+            // 2. Constant shifts (`Shl`, `LShr`, `AShr`) word vs wide across boundary & random counts.
+            let counts = [
+                0,
+                1,
+                u32::from(src_bits) / 2,
+                u32::from(src_bits) - 1,
+                u32::from(src_bits),
+                u32::from(src_bits) + 1,
+                64,
+                u32::MAX,
+                rng.below(u64::from(src_bits) + 2) as u32,
+            ];
+            for c in counts {
+                for op in [BinOp::Shl, BinOp::LShr, BinOp::AShr] {
+                    assert_eq!(
+                        shift_const_word(op, &a, c),
+                        shift_const_wide(op, &a, c),
+                        "{op:?} {src_bits} by {c}: {a:?}"
+                    );
+                }
+            }
+
+            // 3. `Zext` and `Sext` to every target width in `widths` strictly above `src_bits`.
+            for &dst_bits in &widths {
+                if dst_bits > src_bits {
+                    let to = width(dst_bits);
+                    assert_eq!(
+                        zext_word(to, &a),
+                        zext_wide(to, &a),
+                        "zext {src_bits}->{dst_bits}: {a:?}"
+                    );
+                    assert_eq!(
+                        sext_word(to, &a),
+                        sext_wide(to, &a),
+                        "sext {src_bits}->{dst_bits}: {a:?}"
+                    );
+                }
+            }
+
+            // 4. `Extract` at `lo = 0`, high slices, and random interior slices.
+            let slices = [
+                (0u16, 1u16),
+                (0, (src_bits / 2).max(1)),
+                (0, src_bits),
+                (src_bits - 1, 1),
+                (rng.below(u64::from(src_bits)) as u16, 1),
+            ];
+            for (lo, len) in slices {
+                if lo + len <= src_bits {
+                    let ew = width(len);
+                    assert_eq!(
+                        extract_word(lo, ew, &a),
+                        extract_wide(lo, ew, &a),
+                        "extract [{lo}, +{len}) from {src_bits}: {a:?}"
+                    );
+                }
+            }
+        }
+    }
+}

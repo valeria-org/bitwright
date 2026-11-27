@@ -454,7 +454,7 @@ pub(super) enum Val {
 
 /// An array that is not a declared one at a version.
 #[derive(Copy, Clone)]
-enum Arr {
+pub(super) enum Arr {
     /// `(ite c a b)`.
     Ite(Expr, Val, Val),
     /// `((as const (Array I E)) v)`: the index width and the value.
@@ -533,17 +533,25 @@ pub(super) struct Env {
     fun_journal: Vec<String>,
     /// Declared functions with parameters (uninterpreted), their names in declaration order,
     /// and each application made so far: the symbol that stands for its result.
-    ufs: HashMap<String, Rc<Uf>>,
-    uf_journal: Vec<String>,
-    apps: Vec<App>,
+    pub(super) ufs: HashMap<String, Rc<Uf>>,
+    pub(super) uf_journal: Vec<String>,
+    pub(super) apps: Vec<App>,
     /// Arrays made from others, the equalities of arrays read so far (the Boolean that
     /// stands for each, and its sides), and every index an array was read or written at:
     /// an equality says its sides agree at each of them.
-    arrs: Vec<Arr>,
+    pub(super) arrs: Vec<Arr>,
+    /// Stores made on declared arrays `(array_index, new_ver, parent_ver, idx_expr, val_expr)`.
+    pub(super) array_stores: Vec<(
+        u32,
+        crate::memory::Version,
+        crate::memory::Version,
+        Expr,
+        Expr,
+    )>,
     /// The bit-vectors above 512 bits made so far, and the declared ones by name.
     pub(super) wides: Vec<Wide>,
     pub(super) wide_symbols: Vec<(String, u32)>,
-    array_eqs: Vec<(Expr, Val, Val)>,
+    pub(super) array_eqs: Vec<(Expr, Val, Val)>,
     indices: Vec<Expr>,
     index_set: HashSet<Expr>,
     /// Applications ever made: a result's symbol is numbered by it, so never reused.
@@ -572,6 +580,7 @@ impl Env {
             uf_journal: Vec::new(),
             apps: Vec::new(),
             arrs: Vec::new(),
+            array_stores: Vec::new(),
             wides: Vec::new(),
             wide_symbols: Vec::new(),
             array_eqs: Vec::new(),
@@ -657,16 +666,16 @@ pub(super) struct EnvMark {
 }
 
 /// An uninterpreted function: `declare-fun` with parameters.
-struct Uf {
-    params: Vec<Sort>,
-    result: Sort,
+pub(super) struct Uf {
+    pub(super) params: Vec<Sort>,
+    pub(super) result: Sort,
 }
 
 /// An application of an uninterpreted function: the symbol that stands for its result.
-struct App {
-    function: String,
-    args: Vec<Val>,
-    result: Val,
+pub(super) struct App {
+    pub(super) function: String,
+    pub(super) args: Vec<Val>,
+    pub(super) result: Val,
 }
 
 /// The reading of one piece of a script (a command, or a function's body) into [`Env`].
@@ -1850,7 +1859,9 @@ impl<'a, 's> State<'a, 's> {
             return Ok(match array {
                 Val::Array(m, at) => {
                     let mem = &mut self.env.out.arrays[m as usize].1;
-                    Val::Array(m, mem.store(self.cx, at, i, v)?)
+                    let next = mem.store(self.cx, at, i, v)?;
+                    self.env.array_stores.push((m, next, at, i, v));
+                    Val::Array(m, next)
                 }
                 _ => {
                     self.env.arrs.push(Arr::Store(array, i, v));

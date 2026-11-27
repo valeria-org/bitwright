@@ -1292,6 +1292,161 @@ impl Memo {
     }
 }
 
+fn empty_liveness() -> pass::Liveness {
+    pass::Liveness {
+        live: pass::Live::default(),
+        uses_on: false,
+        uses_upto: 0,
+        phase_start: 0,
+        dead: pass::Marks::default(),
+        dead_log: Vec::new(),
+        live_roots: Vec::new(),
+    }
+}
+
+/// Reusable per-call engine buffers for hosts (such as compilers) that simplify many small
+/// expressions across repeated calls without re-allocating runner tables each time.
+pub struct Scratch {
+    ids: Vec<u32>,
+    done: IdMap<u32, (u32, End, Reliance)>,
+    provisional: Vec<(u32, usize, u64)>,
+    quarantined: Vec<bool>,
+    host_quarantined: Vec<bool>,
+    quarantined_passes: Vec<pass::PassKind>,
+    partial: Vec<IdMap<u32, (u32, Fin)>>,
+    cands: Vec<u32>,
+    stack: Vec<Frame>,
+    pending: IdMap<u32, u32>,
+    samples: IdMap<u32, Box<[BitVec]>>,
+    compares: IdMap<u32, pass::compares::Info>,
+    shuffle: IdMap<u32, pass::shuffle::Bits>,
+    shuffle_full: IdMap<u32, pass::shuffle::Bits>,
+    chains: IdMap<u32, pass::Chain>,
+    rewritten: IdMap<(u32, u32), ()>,
+    #[cfg(feature = "prove")]
+    rooted: IdMap<u32, Fin>,
+    #[cfg(feature = "prove")]
+    latent: IdMap<u32, ()>,
+    narrows: IdMap<(u32, u16, u16, bool), Narrowing>,
+    chain_parent: IdMap<u32, u32>,
+    asks: IdMap<u32, bool>,
+    first: IdMap<u32, Option<Fin>>,
+    demanded: pass::demanded::State,
+    life: pass::Liveness,
+    seen_roots: IdMap<u32, ()>,
+}
+
+impl Default for Scratch {
+    fn default() -> Self {
+        Scratch {
+            ids: Vec::new(),
+            done: IdMap::default(),
+            provisional: Vec::new(),
+            quarantined: Vec::new(),
+            host_quarantined: Vec::new(),
+            quarantined_passes: Vec::new(),
+            partial: Vec::new(),
+            cands: Vec::new(),
+            stack: Vec::new(),
+            pending: IdMap::default(),
+            samples: IdMap::default(),
+            compares: IdMap::default(),
+            shuffle: IdMap::default(),
+            shuffle_full: IdMap::default(),
+            chains: IdMap::default(),
+            rewritten: IdMap::default(),
+            #[cfg(feature = "prove")]
+            rooted: IdMap::default(),
+            #[cfg(feature = "prove")]
+            latent: IdMap::default(),
+            narrows: IdMap::default(),
+            chain_parent: IdMap::default(),
+            asks: IdMap::default(),
+            first: IdMap::default(),
+            demanded: Default::default(),
+            life: empty_liveness(),
+            seen_roots: IdMap::default(),
+        }
+    }
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Scratch>();
+};
+
+impl fmt::Debug for Scratch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scratch")
+            .field("phases_cached", &self.partial.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Scratch {
+    /// Empty reusable scratch space (allocates nothing until first used).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears any residual per-call entries while retaining allocated buffer capacities.
+    pub fn clear(&mut self) {
+        self.ids.clear();
+        self.done.clear();
+        self.provisional.clear();
+        self.quarantined.clear();
+        self.host_quarantined.clear();
+        self.quarantined_passes.clear();
+        for m in &mut self.partial {
+            m.clear();
+        }
+        self.cands.clear();
+        self.stack.clear();
+        self.pending.clear();
+        self.samples.clear();
+        self.compares.clear();
+        self.shuffle.clear();
+        self.shuffle_full.clear();
+        self.chains.clear();
+        self.rewritten.clear();
+        #[cfg(feature = "prove")]
+        {
+            self.rooted.clear();
+            self.latent.clear();
+        }
+        self.narrows.clear();
+        self.chain_parent.clear();
+        self.asks.clear();
+        self.first.clear();
+        #[cfg(feature = "prove")]
+        {
+            self.demanded.view_equal.clear();
+            self.demanded.view_refuted.clear();
+            self.demanded.view_sigs.clear();
+            self.demanded.view_work = 0;
+        }
+        self.demanded.memo.clear();
+        self.demanded.same.clear();
+        #[cfg(feature = "mba")]
+        {
+            self.demanded.reduced[0].clear();
+            self.demanded.reduced[1].clear();
+        }
+        self.demanded.sum_constants.clear();
+        self.demanded.dedup_runs = 0;
+        self.demanded.dedup_tried = None;
+        self.life.live.forget_others();
+        self.life.live.begin();
+        self.life.uses_on = false;
+        self.life.uses_upto = 0;
+        self.life.phase_start = 0;
+        self.life.dead.clear();
+        self.life.dead_log.clear();
+        self.life.live_roots.clear();
+        self.seen_roots.clear();
+    }
+}
+
 impl<'r, 'a> Runner<'r, 'a> {
     /// A runner at the start of a call over the roots `ids`.
     fn new(
@@ -1302,6 +1457,52 @@ impl<'r, 'a> Runner<'r, 'a> {
         assumptions: Option<&'r Assumptions>,
         ids: &[u32],
     ) -> Self {
+        Self::with_scratch(
+            inner,
+            meter,
+            observer,
+            hooks,
+            assumptions,
+            ids,
+            &mut Scratch::new(),
+        )
+    }
+
+    /// A runner at the start of a call over the roots `ids`, taking pooled buffers from `scratch`.
+    fn with_scratch(
+        inner: &'r Inner,
+        meter: Meter<'a>,
+        observer: Option<&'a mut dyn Observer>,
+        hooks: Option<&'a dyn Hooks>,
+        assumptions: Option<&'r Assumptions>,
+        ids: &[u32],
+        scratch: &mut Scratch,
+    ) -> Self {
+        let mut partial = core::mem::take(&mut scratch.partial);
+        for m in &mut partial {
+            m.clear();
+        }
+        if partial.len() < inner.phases.len() {
+            partial.resize_with(inner.phases.len(), IdMap::default);
+        } else {
+            partial.truncate(inner.phases.len());
+        }
+        let mut life = core::mem::replace(&mut scratch.life, empty_liveness());
+        life.live.forget_others();
+        life.live.begin();
+        life.uses_on = false;
+        life.uses_upto = 0;
+        life.phase_start = 0;
+        life.dead.clear();
+        life.dead_log.clear();
+        life.live_roots.clear();
+        scratch.seen_roots.clear();
+        for &i in ids {
+            if scratch.seen_roots.insert(i, ()).is_none() {
+                life.live_roots.push(i);
+            }
+        }
+        scratch.seen_roots.clear();
         Runner {
             inner,
             meter,
@@ -1311,18 +1512,19 @@ impl<'r, 'a> Runner<'r, 'a> {
             mba_rejections: None,
             hooks,
             assumptions,
-            quarantined: Vec::new(),
-            host_quarantined: Vec::new(),
-            partial: (0..inner.phases.len()).map(|_| IdMap::default()).collect(),
-            cands: Vec::new(),
-            stack: Vec::new(),
-            samples: IdMap::default(),
-            compares: IdMap::default(),
-            shuffle: IdMap::default(),
-            shuffle_full: IdMap::default(),
+            quarantined: core::mem::take(&mut scratch.quarantined),
+            host_quarantined: core::mem::take(&mut scratch.host_quarantined),
+            partial,
+            cands: core::mem::take(&mut scratch.cands),
+            stack: core::mem::take(&mut scratch.stack),
+            pending: core::mem::take(&mut scratch.pending),
+            samples: core::mem::take(&mut scratch.samples),
+            compares: core::mem::take(&mut scratch.compares),
+            shuffle: core::mem::take(&mut scratch.shuffle),
+            shuffle_full: core::mem::take(&mut scratch.shuffle_full),
             residues: IdMap::default(),
-            chains: IdMap::default(),
-            quarantined_passes: Vec::new(),
+            chains: core::mem::take(&mut scratch.chains),
+            quarantined_passes: core::mem::take(&mut scratch.quarantined_passes),
             scratch: pass::Scratch::default(),
             linear_mba: Default::default(),
             #[cfg(feature = "prove")]
@@ -1331,19 +1533,19 @@ impl<'r, 'a> Runner<'r, 'a> {
             #[cfg(feature = "mba")]
             mba: Default::default(),
             active: 0,
-            rewritten: IdMap::default(),
+            rewritten: core::mem::take(&mut scratch.rewritten),
             #[cfg(feature = "prove")]
-            rooted: IdMap::default(),
+            rooted: core::mem::take(&mut scratch.rooted),
             late: false,
             held: false,
             turned: None,
             #[cfg(feature = "prove")]
-            latent: IdMap::default(),
-            narrows: IdMap::default(),
+            latent: core::mem::take(&mut scratch.latent),
+            narrows: core::mem::take(&mut scratch.narrows),
             settled: false,
-            chain_parent: IdMap::default(),
-            asks: IdMap::default(),
-            first: IdMap::default(),
+            chain_parent: core::mem::take(&mut scratch.chain_parent),
+            asks: core::mem::take(&mut scratch.asks),
+            first: core::mem::take(&mut scratch.first),
             detail: Detail::Events,
             phase_name: "",
             explain: None,
@@ -1351,23 +1553,49 @@ impl<'r, 'a> Runner<'r, 'a> {
             xor: Default::default(),
             bitwise: Default::default(),
             gf2: Default::default(),
-            demanded: Default::default(),
-            life: pass::Liveness {
+            demanded: core::mem::take(&mut scratch.demanded),
+            life,
+        }
+    }
+
+    /// Returns pooled buffers back to `scratch` and clears per-call entries.
+    fn reclaim_into(&mut self, scratch: &mut Scratch) {
+        scratch.quarantined = core::mem::take(&mut self.quarantined);
+        scratch.host_quarantined = core::mem::take(&mut self.host_quarantined);
+        scratch.quarantined_passes = core::mem::take(&mut self.quarantined_passes);
+        scratch.partial = core::mem::take(&mut self.partial);
+        scratch.cands = core::mem::take(&mut self.cands);
+        scratch.stack = core::mem::take(&mut self.stack);
+        scratch.pending = core::mem::take(&mut self.pending);
+        scratch.samples = core::mem::take(&mut self.samples);
+        scratch.compares = core::mem::take(&mut self.compares);
+        scratch.shuffle = core::mem::take(&mut self.shuffle);
+        scratch.shuffle_full = core::mem::take(&mut self.shuffle_full);
+        scratch.chains = core::mem::take(&mut self.chains);
+        scratch.rewritten = core::mem::take(&mut self.rewritten);
+        #[cfg(feature = "prove")]
+        {
+            scratch.rooted = core::mem::take(&mut self.rooted);
+            scratch.latent = core::mem::take(&mut self.latent);
+        }
+        scratch.narrows = core::mem::take(&mut self.narrows);
+        scratch.chain_parent = core::mem::take(&mut self.chain_parent);
+        scratch.asks = core::mem::take(&mut self.asks);
+        scratch.first = core::mem::take(&mut self.first);
+        scratch.demanded = core::mem::take(&mut self.demanded);
+        scratch.life = core::mem::replace(
+            &mut self.life,
+            pass::Liveness {
                 live: pass::Live::default(),
                 uses_on: false,
                 uses_upto: 0,
                 phase_start: 0,
                 dead: pass::Marks::default(),
                 dead_log: Vec::new(),
-                live_roots: {
-                    let mut seen: IdMap<u32, ()> = IdMap::default();
-                    ids.iter()
-                        .copied()
-                        .filter(|&i| seen.insert(i, ()).is_none())
-                        .collect()
-                },
+                live_roots: Vec::new(),
             },
-        }
+        );
+        scratch.clear();
     }
 }
 
@@ -1486,6 +1714,8 @@ struct Runner<'r, 'a> {
     cands: Vec<u32>,
     /// The walk's stack, reused across phases.
     stack: Vec<Frame>,
+    /// Nodes waiting on a pass rewrite in the active walk, reused across phases.
+    pending: IdMap<u32, u32>,
     /// Sampled verification: the values of every node evaluated so far at each point.
     samples: IdMap<u32, Box<[BitVec]>>,
     /// The compares pass's descriptions, per node.
@@ -2026,7 +2256,8 @@ impl Runner<'_, '_> {
         // result waits on it (`pending`: a `Finish` on the stack); a node rewritten into a
         // waiting one takes it. Rules strictly decrease an order, so their phases never cycle
         // and keep no such records.
-        let mut pending: IdMap<u32, u32> = IdMap::default();
+        let mut pending = core::mem::take(&mut self.pending);
+        pending.clear();
         let local = matches!(self.inner.phases[phase], PhaseImpl::Local(..));
         while let Some(top) = stack.last() {
             match *top {
@@ -2210,6 +2441,7 @@ impl Runner<'_, '_> {
             }
         }
         debug_assert!(pending.is_empty(), "a walk ended with results pending");
+        self.pending = pending;
         Ok(self
             .lookup(cx, phase, root)
             .unwrap_or((root, Fin::PROVISIONAL)))
@@ -2468,11 +2700,24 @@ impl Runner<'_, '_> {
             let cap = u32::try_from(self.meter.left_in(|b| b.fact_work)).unwrap_or(u32::MAX);
             let work0 = cx.facts.work;
             let (a, b) = (cx.handle(n), cx.handle(r));
-            let fa = cx.try_facts_cap(a, cap).map_err(Stop::Error)?;
-            let used = u32::try_from(cx.facts.work - work0).unwrap_or(u32::MAX);
-            let fb = cx
-                .try_facts_cap(b, cap.saturating_sub(used))
-                .map_err(Stop::Error)?;
+            let (fa, fb) = match self.assumptions.filter(|_| !rel.is_none()) {
+                Some(assump) => {
+                    let fa = cx.facts_with_cap(a, assump, cap).map_err(Stop::Error)?;
+                    let used = u32::try_from(cx.facts.work - work0).unwrap_or(u32::MAX);
+                    let fb = cx
+                        .facts_with_cap(b, assump, cap.saturating_sub(used))
+                        .map_err(Stop::Error)?;
+                    (fa, fb)
+                }
+                None => {
+                    let fa = cx.try_facts_cap(a, cap).map_err(Stop::Error)?;
+                    let used = u32::try_from(cx.facts.work - work0).unwrap_or(u32::MAX);
+                    let fb = cx
+                        .try_facts_cap(b, cap.saturating_sub(used))
+                        .map_err(Stop::Error)?;
+                    (fa, fb)
+                }
+            };
             self.meter.spent.fact_work += cx.facts.work - work0;
             match (fa, fb) {
                 (Some(fa), Some(fb)) => {
@@ -2765,7 +3010,44 @@ impl Engine {
     /// Simplifies `roots` under `run`. Each distinct root is processed once; `roots[i]` of the
     /// outcome answers `roots[i]` of the input.
     pub fn run(&self, cx: &mut Context, roots: &[Expr], run: Run<'_>) -> Result<Outcome, Error> {
-        let ids = cx.ids(roots)?;
+        self.simplify_with_scratch(cx, roots, run, &mut Scratch::new())
+    }
+
+    /// Simplifies `roots` under `run`, reusing internal runner tables from `scratch` across calls
+    /// to avoid repeated heap allocations on high-frequency simplification workloads.
+    pub fn run_with_scratch(
+        &self,
+        cx: &mut Context,
+        roots: &[Expr],
+        run: Run<'_>,
+        scratch: &mut Scratch,
+    ) -> Result<Outcome, Error> {
+        self.simplify_with_scratch(cx, roots, run, scratch)
+    }
+
+    /// Simplifies `roots` under `run`, reusing internal runner tables from `scratch` across calls
+    /// to avoid repeated heap allocations on high-frequency simplification workloads.
+    pub fn simplify_with_scratch(
+        &self,
+        cx: &mut Context,
+        roots: &[Expr],
+        run: Run<'_>,
+        scratch: &mut Scratch,
+    ) -> Result<Outcome, Error> {
+        scratch.clear();
+        let mut ids = core::mem::take(&mut scratch.ids);
+        ids.clear();
+        ids.reserve(roots.len());
+        for &e in roots {
+            match cx.id(e) {
+                Ok(id) => ids.push(id),
+                Err(err) => {
+                    ids.clear();
+                    scratch.ids = ids;
+                    return Err(err);
+                }
+            }
+        }
         let inner = &*self.inner;
         let Run {
             allowance,
@@ -2777,7 +3059,14 @@ impl Engine {
             assumptions,
             deadline,
         } = run;
-        let current = assumptions.map(|a| a.refreshed(cx)).transpose()?;
+        let current = match assumptions.map(|a| a.refreshed(cx)).transpose() {
+            Ok(c) => c,
+            Err(err) => {
+                ids.clear();
+                scratch.ids = ids;
+                return Err(err);
+            }
+        };
         let assumptions = current.as_deref();
         // Contradictory constraints prove anything, so the engine simplifies as without them
         // (they would justify any rewrite; none is made from them).
@@ -2791,13 +3080,14 @@ impl Engine {
             Some(a) => per_call.min(&a.remaining()),
             None => per_call,
         };
-        let mut runner = Runner::new(
+        let mut runner = Runner::with_scratch(
             inner,
             Meter::new(limit, deadline),
             observer,
             hooks,
             assumptions,
             &ids,
+            scratch,
         );
         #[cfg(feature = "mba")]
         {
@@ -2808,12 +3098,14 @@ impl Engine {
         if let Some(o) = runner.observer.as_deref() {
             runner.detail = o.detail();
         }
-        let mut done: IdMap<u32, (u32, End, Reliance)> = IdMap::default();
+        let mut done = core::mem::take(&mut scratch.done);
+        done.clear();
         let mut failure: Option<Error> = None;
         // Roots whose result is not final only because of what other roots share, with their
         // entry of `live_roots` and the version of the live roots their result was reached at
         // (the count of roots rewritten so far).
-        let mut provisional: Vec<(u32, usize, u64)> = Vec::new();
+        let mut provisional = core::mem::take(&mut scratch.provisional);
+        provisional.clear();
         let mut version = 0u64;
         for (index, &root) in ids.iter().enumerate() {
             if done.contains_key(&root) {
@@ -2899,7 +3191,8 @@ impl Engine {
                 }
                 runner.life.live.forget_others();
                 let mut changed = false;
-                for (root, k, seen) in std::mem::take(&mut provisional) {
+                let batch = core::mem::take(&mut provisional);
+                for (root, k, seen) in batch {
                     // Nothing rewritten since this root's result was reached: the live roots
                     // are as they were then, and the result a fixed point of them.
                     if seen == version {
@@ -2966,10 +3259,17 @@ impl Engine {
         if let Some(a) = allowance {
             a.spend(&spent);
         }
+        let mut stats = core::mem::take(&mut runner.stats);
+        runner.reclaim_into(scratch);
+        provisional.clear();
+        scratch.provisional = provisional;
         if let Some(e) = failure {
+            done.clear();
+            ids.clear();
+            scratch.done = done;
+            scratch.ids = ids;
             return Err(e);
         }
-        let mut stats = runner.stats;
         stats.node_visits = spent.node_visits;
         stats.candidates = spent.candidates;
         stats.match_steps = spent.match_steps;
@@ -2979,19 +3279,24 @@ impl Engine {
         stats.pass_work = spent.pass_work;
         stats.mba.calls = spent.mba_calls;
         stats.mba.steps = spent.mba_steps;
+        let roots_out = ids
+            .iter()
+            .map(|&i| {
+                let (r, end, rel) = done[&i];
+                RootOutcome {
+                    expr: cx.handle(r),
+                    changed: r != i,
+                    end,
+                    relies_on: if r == i { Reliance::NONE } else { rel },
+                }
+            })
+            .collect();
+        done.clear();
+        ids.clear();
+        scratch.done = done;
+        scratch.ids = ids;
         Ok(Outcome {
-            roots: ids
-                .iter()
-                .map(|&i| {
-                    let (r, end, rel) = done[&i];
-                    RootOutcome {
-                        expr: cx.handle(r),
-                        changed: r != i,
-                        end,
-                        relies_on: if r == i { Reliance::NONE } else { rel },
-                    }
-                })
-                .collect(),
+            roots: roots_out,
             stats,
         })
     }

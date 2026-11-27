@@ -104,6 +104,8 @@ impl core::fmt::Debug for Memory {
     }
 }
 
+const MAX_BULK_CELLS: u16 = 4096;
+
 impl Memory {
     /// A memory named `name` (its unknown cells use unused symbols `name.0`, `name.1`, …)
     /// from addresses of width `addr` to cells of width `cell`, all of it unknown.
@@ -275,6 +277,36 @@ impl Memory {
         Ok(out)
     }
 
+    fn push_cell(&mut self, parent: Version, addr: Expr, cell: Expr) -> Version {
+        let next = fresh_version(self.stores.len() as u32 + 1);
+        self.stores.push(Store {
+            version: next,
+            parent: Some(parent),
+            addr,
+            cell,
+        });
+        next
+    }
+
+    /// Drops stores in `newest_first` whose address is overwritten by a later store in the
+    /// same branch, returning the surviving stores oldest-to-newest.
+    fn dedup_branch(
+        cx: &mut Context,
+        newest_first: Vec<(Expr, Expr)>,
+    ) -> Result<Vec<(Expr, Expr)>, Error> {
+        let mut kept: Vec<(Expr, Expr)> = Vec::with_capacity(newest_first.len());
+        'scan: for (addr, cell) in newest_first {
+            for &(later_addr, _) in &kept {
+                if matches!(Self::same(cx, addr, later_addr)?, Ok(true)) {
+                    continue 'scan;
+                }
+            }
+            kept.push((addr, cell));
+        }
+        kept.reverse();
+        Ok(kept)
+    }
+
     /// Stores `value` (a whole number of cells) at `addr` in version `at`: the new version.
     pub fn store(
         &mut self,
@@ -289,15 +321,191 @@ impl Memory {
         let mut v = at;
         for (k, cell) in cells.into_iter().enumerate() {
             let a = self.offset(cx, addr, k as u64)?;
-            let next = fresh_version(self.stores.len() as u32 + 1);
-            self.stores.push(Store {
-                version: next,
-                parent: Some(v),
-                addr: a,
-                cell,
-            });
-            v = next;
+            v = self.push_cell(v, a, cell);
         }
+        Ok(v)
+    }
+
+    /// Stores `cell_value` (one cell) into `cells` consecutive cells starting at `addr` in
+    /// version `at`.
+    pub fn memset(
+        &mut self,
+        cx: &mut Context,
+        at: Version,
+        addr: Expr,
+        cell_value: Expr,
+        cells: u16,
+    ) -> Result<Version, Error> {
+        self.check_version(at)?;
+        self.check_addr(cx, addr)?;
+        let vw = cx.width(cell_value)?;
+        if vw != self.cell {
+            return Err(crate::WidthError::Mismatch {
+                left: self.cell.bits(),
+                right: vw.bits(),
+            }
+            .into());
+        }
+        if cells > MAX_BULK_CELLS {
+            return Err(Error::Unsupported(format!(
+                "a memset of {cells} cells (at most {MAX_BULK_CELLS})"
+            )));
+        }
+        let mut v = at;
+        for k in 0..cells {
+            let a = self.offset(cx, addr, u64::from(k))?;
+            v = self.push_cell(v, a, cell_value);
+        }
+        Ok(v)
+    }
+
+    /// Copies `cells` consecutive cells from `src` to `dst` in version `at`.
+    ///
+    /// Source cells are snapshotted from `at` before any destination cell is written, so
+    /// overlapping ranges behave like `memmove`.
+    pub fn memcpy(
+        &mut self,
+        cx: &mut Context,
+        at: Version,
+        dst: Expr,
+        src: Expr,
+        cells: u16,
+    ) -> Result<Version, Error> {
+        self.check_version(at)?;
+        self.check_addr(cx, dst)?;
+        self.check_addr(cx, src)?;
+        if cells > MAX_BULK_CELLS {
+            return Err(Error::Unsupported(format!(
+                "a memcpy of {cells} cells (at most {MAX_BULK_CELLS})"
+            )));
+        }
+        if cells == 0 || matches!(Self::same(cx, dst, src)?, Ok(true)) {
+            return Ok(at);
+        }
+        let mut snapshot = Vec::with_capacity(cells as usize);
+        for k in 0..cells {
+            let s = self.offset(cx, src, u64::from(k))?;
+            snapshot.push(self.cell_at(cx, at, s)?);
+        }
+        let mut v = at;
+        for (k, cell) in snapshot.into_iter().enumerate() {
+            let d = self.offset(cx, dst, k as u64)?;
+            v = self.push_cell(v, d, cell);
+        }
+        Ok(v)
+    }
+
+    /// Joins two versions of this memory under the 1-bit condition `cond`: a load from the
+    /// returned version reads `v_then` when `cond` is 1 and `v_else` when `cond` is 0.
+    pub fn merge(
+        &mut self,
+        cx: &mut Context,
+        cond: Expr,
+        v_then: Version,
+        v_else: Version,
+    ) -> Result<Version, Error> {
+        self.check_version(v_then)?;
+        self.check_version(v_else)?;
+        let cw = cx.width(cond)?;
+        if cw != Width::W1 {
+            return Err(crate::WidthError::Mismatch {
+                left: 1,
+                right: cw.bits(),
+            }
+            .into());
+        }
+        if v_then == v_else {
+            return Ok(v_then);
+        }
+        if let Some(c) = cx.as_const(cond)? {
+            return Ok(if !c.is_zero() { v_then } else { v_else });
+        }
+
+        let mut then_rev: Vec<(Expr, Expr)> = Vec::new();
+        let mut else_rev: Vec<(Expr, Expr)> = Vec::new();
+        let (mut a, mut b) = (v_then, v_else);
+        while a != b {
+            if a.0 >= b.0 {
+                let (p, s) = self.parent(a).expect("checked non-initial version");
+                then_rev.push((s.addr, s.cell));
+                a = p;
+            } else {
+                let (p, s) = self.parent(b).expect("checked non-initial version");
+                else_rev.push((s.addr, s.cell));
+                b = p;
+            }
+        }
+        let lca = a;
+
+        let then_stores = Self::dedup_branch(cx, then_rev)?;
+        let else_stores = Self::dedup_branch(cx, else_rev)?;
+
+        let mut paired_then = vec![false; then_stores.len()];
+        let mut has_then_match = vec![false; else_stores.len()];
+        let mut skip_else = vec![false; else_stores.len()];
+        let mut direct_else: Vec<Option<Expr>> = vec![None; then_stores.len()];
+
+        for (ei, &(ae, ce)) in else_stores.iter().enumerate() {
+            let mut matched_ti = None;
+            for (ti, &(at, _)) in then_stores.iter().enumerate() {
+                if !paired_then[ti] && matches!(Self::same(cx, ae, at)?, Ok(true)) {
+                    matched_ti = Some(ti);
+                    break;
+                }
+            }
+            if let Some(ti) = matched_ti {
+                paired_then[ti] = true;
+                has_then_match[ei] = true;
+                let at = then_stores[ti].0;
+                let mut can_fuse = true;
+                for &(ae_later, _) in &else_stores[ei + 1..] {
+                    if !matches!(Self::same(cx, ae, ae_later)?, Ok(false))
+                        || !matches!(Self::same(cx, at, ae_later)?, Ok(false))
+                    {
+                        can_fuse = false;
+                        break;
+                    }
+                }
+                if can_fuse {
+                    for &(at_earlier, _) in &then_stores[..ti] {
+                        if !matches!(Self::same(cx, ae, at_earlier)?, Ok(false))
+                            || !matches!(Self::same(cx, at, at_earlier)?, Ok(false))
+                        {
+                            can_fuse = false;
+                            break;
+                        }
+                    }
+                }
+                if can_fuse {
+                    skip_else[ei] = true;
+                    direct_else[ti] = Some(ce);
+                }
+            }
+        }
+
+        let mut v = lca;
+        for (ei, &(ae, ce)) in else_stores.iter().enumerate() {
+            if skip_else[ei] {
+                continue;
+            }
+            let cell = if has_then_match[ei] {
+                ce
+            } else {
+                let keep = self.cell_at(cx, v, ae)?;
+                cx.select(cond, keep, ce)?
+            };
+            v = self.push_cell(v, ae, cell);
+        }
+
+        for (ti, &(at, ct)) in then_stores.iter().enumerate() {
+            let else_val = match direct_else[ti] {
+                Some(ce) => ce,
+                None => self.cell_at(cx, v, at)?,
+            };
+            let cell = cx.select(cond, ct, else_val)?;
+            v = self.push_cell(v, at, cell);
+        }
+
         Ok(v)
     }
 
@@ -1222,5 +1430,211 @@ mod tests {
                 Some(0x55667788)
             );
         }
+    }
+
+    #[test]
+    fn merge_same_slot_has_no_spurious_reads_and_validates_inputs() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let mut m = Memory::new("mem", Width::W64, Width::W8, Endian::Little);
+        let slot = cx.parse("sp - 8", &o).unwrap();
+        let x = cx.parse("x", &o).unwrap();
+        let y = cx.parse("y", &o).unwrap();
+        let cond = cx.symbol("c", Width::W1).unwrap();
+
+        let vt = m.store(&mut cx, m.initial(), slot, x).unwrap();
+        let ve = m.store(&mut cx, m.initial(), slot, y).unwrap();
+        let vm = m.merge(&mut cx, cond, vt, ve).unwrap();
+        assert!(m.reads().is_empty());
+
+        let loaded = m.load(&mut cx, vm, slot, 8).unwrap();
+        assert!(m.reads().is_empty());
+        let simp = crate::engine::Engine::standard()
+            .simplify(&mut cx, loaded)
+            .unwrap()
+            .expr;
+        let want = cx.select(cond, x, y).unwrap();
+        assert_eq!(simp, want);
+
+        // Constant conditions and identical versions take fast paths.
+        assert_eq!(m.merge(&mut cx, cond, vt, vt).unwrap(), vt);
+        let one = cx.one(Width::W1).unwrap();
+        let zero = cx.zero(Width::W1).unwrap();
+        assert_eq!(m.merge(&mut cx, one, vt, ve).unwrap(), vt);
+        assert_eq!(m.merge(&mut cx, zero, vt, ve).unwrap(), ve);
+
+        // Non-1-bit condition and versions from other memories fail cleanly.
+        assert!(m.merge(&mut cx, x, vt, ve).is_err());
+        let other = Memory::new("other", Width::W64, Width::W8, Endian::Little);
+        let vo = other.initial();
+        assert!(m.merge(&mut cx, cond, vt, vo).is_err());
+        assert!(m.merge(&mut cx, cond, vo, ve).is_err());
+    }
+
+    #[test]
+    fn merge_exhaustive_symbolic_aliasing_and_nested_diamonds() {
+        let mut cx = Context::new();
+        let aw = Width::new(2).unwrap();
+        let cw = Width::new(4).unwrap();
+        let c0 = cx.constant_u64(aw, 0).unwrap();
+        let c1 = cx.constant_u64(aw, 1).unwrap();
+        let p = cx.symbol("p", aw).unwrap();
+        let q = cx.symbol("q", aw).unwrap();
+        let p_plus_1 = cx.add(p, c1).unwrap();
+        let p_xor_1 = cx.bin(BinOp::Xor, p, c1).unwrap();
+        let r = cx.symbol("r", aw).unwrap();
+        let cond1 = cx.symbol("c1", Width::W1).unwrap();
+        let cond2 = cx.symbol("c2", Width::W1).unwrap();
+
+        let v_pre = cx.symbol("vp", cw).unwrap();
+        let v_a = cx.symbol("va", cw).unwrap();
+        let v_b = cx.symbol("vb", cw).unwrap();
+        let v_c = cx.symbol("vc", cw).unwrap();
+        let v_d = cx.symbol("vd", cw).unwrap();
+
+        let addrs = [c0, p, q, p_plus_1, p_xor_1];
+        // Test crossed-order stores, duplicate stores within a branch, one-sided branches,
+        // shared non-initial LCA prefix, and nested merges.
+        let branch_plans: &[(&[usize], &[usize])] = &[
+            (&[1], &[]),
+            (&[], &[2]),
+            (&[1, 2], &[2, 1]),
+            (&[1, 3, 1], &[2, 1]),
+            (&[0, 4], &[4, 2]),
+            (&[1, 2], &[3, 2]),
+        ];
+
+        for &(t_plan, e_plan) in branch_plans {
+            let mut m = Memory::new("m", aw, cw, Endian::Little);
+            let lca = m.store(&mut cx, m.initial(), c0, v_pre).unwrap();
+            let mut vt = lca;
+            for (k, &ai) in t_plan.iter().enumerate() {
+                let val = if k % 2 == 0 { v_a } else { v_b };
+                vt = m.store(&mut cx, vt, addrs[ai], val).unwrap();
+            }
+            let mut ve = lca;
+            for (k, &ai) in e_plan.iter().enumerate() {
+                let val = if k % 2 == 0 { v_c } else { v_d };
+                ve = m.store(&mut cx, ve, addrs[ai], val).unwrap();
+            }
+            let vm1 = m.merge(&mut cx, cond1, vt, ve).unwrap();
+            // Nested merge on top of vm1 vs an extra store on lca.
+            let v_alt = m.store(&mut cx, lca, q, v_d).unwrap();
+            let vm2 = m.merge(&mut cx, cond2, vm1, v_alt).unwrap();
+
+            let load_t = m.load(&mut cx, vt, r, 1).unwrap();
+            let load_e = m.load(&mut cx, ve, r, 1).unwrap();
+            let load_alt = m.load(&mut cx, v_alt, r, 1).unwrap();
+            let load_m1 = m.load(&mut cx, vm1, r, 1).unwrap();
+            let load_m2 = m.load(&mut cx, vm2, r, 1).unwrap();
+
+            let image = |a: &BitVec| {
+                Some(BitVec::wrapping_from_u64(
+                    cw,
+                    (a.to_u64().unwrap() * 3 + 1) & 0xf,
+                ))
+            };
+
+            for pv in 0..4u64 {
+                for qv in 0..4u64 {
+                    for rv in 0..4u64 {
+                        for b1 in 0..2u64 {
+                            for b2 in 0..2u64 {
+                                let base_env = [
+                                    (SymbolKey::from("p"), BitVec::wrapping_from_u64(aw, pv)),
+                                    (SymbolKey::from("q"), BitVec::wrapping_from_u64(aw, qv)),
+                                    (SymbolKey::from("r"), BitVec::wrapping_from_u64(aw, rv)),
+                                    (
+                                        SymbolKey::from("c1"),
+                                        BitVec::wrapping_from_u64(Width::W1, b1),
+                                    ),
+                                    (
+                                        SymbolKey::from("c2"),
+                                        BitVec::wrapping_from_u64(Width::W1, b2),
+                                    ),
+                                    (SymbolKey::from("vp"), BitVec::wrapping_from_u64(cw, 2)),
+                                    (SymbolKey::from("va"), BitVec::wrapping_from_u64(cw, 5)),
+                                    (SymbolKey::from("vb"), BitVec::wrapping_from_u64(cw, 9)),
+                                    (SymbolKey::from("vc"), BitVec::wrapping_from_u64(cw, 12)),
+                                    (SymbolKey::from("vd"), BitVec::wrapping_from_u64(cw, 14)),
+                                ];
+                                let env = m.bind(&mut cx, &base_env, &image).unwrap();
+                                let out = cx
+                                    .eval(&[load_t, load_e, load_alt, load_m1, load_m2], &env[..])
+                                    .unwrap();
+                                let want_m1 = if b1 != 0 { out[0] } else { out[1] };
+                                let want_m2 = if b2 != 0 { want_m1 } else { out[2] };
+                                assert_eq!(
+                                    out[3], want_m1,
+                                    "plan={t_plan:?}/{e_plan:?} p={pv} q={qv} r={rv} c1={b1}"
+                                );
+                                assert_eq!(
+                                    out[4], want_m2,
+                                    "nested plan={t_plan:?}/{e_plan:?} p={pv} q={qv} r={rv} c1={b1} c2={b2}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn memset_and_memcpy_handle_overlap_and_bounds() {
+        let (mut cx, o) = setup();
+        let mut m = Memory::new("m", Width::W32, Width::W8, Endian::Little);
+        let p = cx.parse("p", &o).unwrap();
+        let p1 = cx.parse("p + 1", &o).unwrap();
+        let q = cx.parse("p + 16", &o).unwrap();
+        let x = cx
+            .constant(&BitVec::wrapping_from_u64(Width::W32, 0x04030201))
+            .unwrap();
+        let fill = cx.constant_u64(Width::W8, 0xaa).unwrap();
+
+        // Zero-length ops are identity.
+        let v0 = m.initial();
+        assert_eq!(m.memset(&mut cx, v0, p, fill, 0).unwrap(), v0);
+        assert_eq!(m.memcpy(&mut cx, v0, q, p, 0).unwrap(), v0);
+        assert_eq!(m.memcpy(&mut cx, v0, p, p, 8).unwrap(), v0);
+        assert!(m.reads().is_empty());
+
+        // Non-overlapping memcpy coalesces multi-byte symbols cleanly.
+        let sym32 = cx.symbol("val", Width::W32).unwrap();
+        let vs = m.store(&mut cx, v0, p, sym32).unwrap();
+        let vc = m.memcpy(&mut cx, vs, q, p, 4).unwrap();
+        assert_eq!(m.load(&mut cx, vc, q, 4).unwrap(), sym32);
+
+        // Forward overlap (`dst = p + 1`, `src = p`, 3 bytes) preserves `memmove` snapshot:
+        // `[01, 02, 03, 04]` -> `[01, 01, 02, 03]`.
+        let v1 = m.store(&mut cx, v0, p, x).unwrap();
+        let v_fwd = m.memcpy(&mut cx, v1, p1, p, 3).unwrap();
+        let got_fwd = m.load(&mut cx, v_fwd, p, 4).unwrap();
+        assert_eq!(
+            cx.as_const(got_fwd).unwrap().unwrap().to_u64(),
+            Some(0x03020101)
+        );
+
+        // Backward overlap (`dst = p`, `src = p + 1`, 3 bytes):
+        // `[01, 02, 03, 04]` -> `[02, 03, 04, 04]`.
+        let v_bwd = m.memcpy(&mut cx, v1, p, p1, 3).unwrap();
+        let got_bwd = m.load(&mut cx, v_bwd, p, 4).unwrap();
+        assert_eq!(
+            cx.as_const(got_bwd).unwrap().unwrap().to_u64(),
+            Some(0x04040302)
+        );
+
+        // memset fills consecutive bytes.
+        let v_set = m.memset(&mut cx, v1, p1, fill, 2).unwrap();
+        let got_set = m.load(&mut cx, v_set, p, 4).unwrap();
+        assert_eq!(
+            cx.as_const(got_set).unwrap().unwrap().to_u64(),
+            Some(0x04aaaa01)
+        );
+
+        // Bounds and width checks.
+        assert!(m.memset(&mut cx, v0, p, x, 2).is_err());
+        assert!(m.memset(&mut cx, v0, p, fill, 4097).is_err());
+        assert!(m.memcpy(&mut cx, v0, q, p, 4097).is_err());
     }
 }

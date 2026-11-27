@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use bitwright::solve::{CoreItem, Solver, Status};
+use bitwright::solve::{CoreItem, Solver, Status, Values};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -118,6 +118,38 @@ impl PySolver {
                 _ => ("other", 0),
             })
             .collect())
+    }
+
+    /// Enumerates up to `limit` distinct values `e` can take under the assertions, in ascending
+    /// unsigned order: `(values, exact)` where `exact` is True when no further values exist, or
+    /// None when a search stopped undecided.
+    #[pyo3(signature = (e, limit = 16))]
+    fn enumerate<'py>(
+        &self,
+        py: Python<'py>,
+        e: PyRef<'_, PyExpr>,
+        limit: usize,
+    ) -> PyResult<Option<(Vec<Bound<'py, PyAny>>, bool)>> {
+        self.context(py, Some(&e))?;
+        let mut s = lock(py, &self.s)?;
+        let mut c = e.cx.bind(py).get().lock(py)?;
+        match s.enumerate_values(&mut c, e.e, limit).or_raise()? {
+            Values::Exact(vs) => {
+                let ints = vs
+                    .iter()
+                    .map(|v| to_int(py, v))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(Some((ints, true)))
+            }
+            Values::AtLeast(vs) => {
+                let ints = vs
+                    .iter()
+                    .map(|v| to_int(py, v))
+                    .collect::<PyResult<Vec<_>>>()?;
+                Ok(Some((ints, false)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {

@@ -2,7 +2,7 @@
 
 use core::ffi::c_int;
 
-use bw::solve::{CoreItem, Solver, Status};
+use bw::solve::{CoreItem, Solver, Status, Values};
 
 use super::{BwContext, BwValue, Out, expr, exprs, get_mut, invalid, run, run_new, slice, value};
 
@@ -145,6 +145,62 @@ pub unsafe extern "C" fn bw_solver_core(
             unsafe { core.add(k).write(code) };
         }
         unsafe { len.set(items.len()) };
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `s` and `cx` are live, `values` is valid for `limit` writes (or NULL when `limit == 0`), and
+/// `count`, `exact` and `answer` are valid for writes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn bw_solver_enumerate(
+    s: *mut BwSolver,
+    cx: *mut BwContext,
+    e: u64,
+    limit: usize,
+    values: *mut BwValue,
+    count: *mut usize,
+    exact: *mut bool,
+    answer: *mut c_int,
+) -> c_int {
+    run(|| {
+        let s = &mut unsafe { get_mut(s, "s") }?.solver;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let count = Out::new(count, "count")?;
+        let exact = Out::new(exact, "exact")?;
+        let answer = Out::new(answer, "answer")?;
+        if limit > 0 && values.is_null() {
+            return Err(invalid("`values` is NULL"));
+        }
+        let e = expr(e)?;
+        match s.enumerate_values(cx, e, limit)? {
+            Values::Exact(vs) => {
+                for (k, v) in vs.iter().take(limit).enumerate() {
+                    unsafe { values.add(k).write(value(v)) };
+                }
+                unsafe {
+                    count.set(vs.len());
+                    exact.set(true);
+                    answer.set(if vs.is_empty() { BW_UNSAT } else { BW_SAT });
+                }
+            }
+            Values::AtLeast(vs) => {
+                for (k, v) in vs.iter().take(limit).enumerate() {
+                    unsafe { values.add(k).write(value(v)) };
+                }
+                unsafe {
+                    count.set(vs.len());
+                    exact.set(false);
+                    answer.set(BW_SAT);
+                }
+            }
+            _ => unsafe {
+                count.set(0);
+                exact.set(false);
+                answer.set(BW_UNKNOWN);
+            },
+        }
         Ok(())
     })
 }

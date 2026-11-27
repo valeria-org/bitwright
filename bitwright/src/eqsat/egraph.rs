@@ -181,6 +181,75 @@ impl EGraph {
         }
     }
 
+    pub(crate) fn lookup_const_node(&self, v: &BitVec) -> Option<ENode> {
+        let w = v.width().bits();
+        let op = match v.to_u64() {
+            Some(x) => EOp::ConstSmall {
+                width: w,
+                lo: x as u32,
+                hi: (x >> 32) as u32,
+            },
+            None => EOp::ConstWide(*self.wide_memo.get(v)?),
+        };
+        Some(ENode {
+            op,
+            kids: [0, 0, 0],
+        })
+    }
+
+    pub(crate) fn find_enode(&mut self, n: ENode) -> Option<ClassId> {
+        let n = self.canon(n);
+        let &idx = self.memo.get(&n)?;
+        let c = self.node_class[idx as usize];
+        Some(self.find(c))
+    }
+
+    pub(crate) fn cost_op(&mut self, idx: u32) -> (super::CostOp, Width) {
+        let n = self.nodes[idx as usize];
+        let c = self.node_class[idx as usize];
+        let cf = self.find(c);
+        let cw = self.classes[cf as usize].width;
+        let op = match n.op {
+            EOp::ConstSmall { .. } | EOp::ConstWide(_) => super::CostOp::Const,
+            EOp::Leaf { .. } => super::CostOp::Symbol,
+            EOp::Un(u) => super::CostOp::Un(u),
+            EOp::Bin(b) => super::CostOp::Bin(b),
+            EOp::Cmp(cmp) => super::CostOp::Cmp(cmp),
+            EOp::Zext(_) => {
+                let k0 = self.find(n.kids[0]);
+                super::CostOp::Zext {
+                    from: self.classes[k0 as usize].width,
+                    to: cw,
+                }
+            }
+            EOp::Sext(_) => {
+                let k0 = self.find(n.kids[0]);
+                super::CostOp::Sext {
+                    from: self.classes[k0 as usize].width,
+                    to: cw,
+                }
+            }
+            EOp::Extract { lo, .. } => {
+                let k0 = self.find(n.kids[0]);
+                super::CostOp::Extract {
+                    from: self.classes[k0 as usize].width,
+                    lo,
+                    width: cw,
+                }
+            }
+            EOp::Concat => {
+                let k0 = self.find(n.kids[0]);
+                let k1 = self.find(n.kids[1]);
+                super::CostOp::Concat {
+                    hi: self.classes[k0 as usize].width,
+                    lo: self.classes[k1 as usize].width,
+                }
+            }
+            EOp::Select => super::CostOp::Select(cw),
+        };
+        (op, cw)
+    }
+
     fn node_width(&mut self, n: &ENode) -> Option<Width> {
         match n.op {
             EOp::ConstSmall { width, .. }

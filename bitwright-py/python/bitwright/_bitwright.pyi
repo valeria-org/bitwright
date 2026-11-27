@@ -142,6 +142,9 @@ class Context:
     def from_smtlib(self, script: str) -> SmtScript:
         """Reads an SMT-LIB QF_BV script, floating-point (QF_BVFP) terms included, into this
         context."""
+    def run_smtlib(self, script: str) -> str:
+        """Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) into this context
+        and returns the standard responses."""
 
 @final
 class SmtScript:
@@ -322,9 +325,11 @@ class Expr:
     def simplify(self, engine: Engine | None = None) -> Expr: ...
     def equivalent(self, other: Expr, *, conflicts: int = 1000000) -> bool | dict[str, int] | None:
         """True (proved equal), a dict of symbol values where they differ, or None."""
-    def synthesize(self, *, max_size: int = 7) -> Expr | None:
+    def synthesize(
+        self, *, max_size: int = 7, rotations: bool = False, bitops: bool = False
+    ) -> Expr | None:
         """The smallest equal expression synthesis finds (proved), or None."""
-    def saturate(self, *, groups: Sequence[str] | None = None) -> Expr | None:
+    def saturate(self, *, groups: Sequence[str] | None = None, dag: bool = False) -> Expr | None:
         """The equality-saturation search's smaller candidate, or None."""
 
 @final
@@ -363,6 +368,7 @@ class Solver:
     def check(self, *assumptions: Expr) -> bool | None: ...
     def value(self, e: Expr) -> int: ...
     def core(self) -> list[tuple[str, int]]: ...
+    def enumerate(self, e: Expr, limit: int = 16) -> tuple[list[int], bool] | None: ...
     def __len__(self) -> int: ...
 
 @final
@@ -535,10 +541,14 @@ def simplify(
 def equivalent(a: Expr, b: Expr, *, conflicts: int = 1000000) -> bool | dict[str, int] | None:
     """Whether `a` equals `b` for every value of the symbols: True, a counterexample, or None."""
 
-def synthesize(e: Expr, *, max_size: int = 7) -> Expr | None:
+def synthesize(
+    e: Expr, *, max_size: int = 7, rotations: bool = False, bitops: bool = False
+) -> Expr | None:
     """The smallest expression equal to `e` that synthesis finds (proved), or None."""
 
-def saturate(e: Expr, *, groups: Sequence[str] | None = None) -> Expr | None:
+def saturate(
+    e: Expr, *, groups: Sequence[str] | None = None, dag: bool = False
+) -> Expr | None:
     """The equality-saturation search's candidate for `e`, or None."""
 
 @final
@@ -557,6 +567,16 @@ class Memory:
     ) -> Memory: ...
     def set_bytes(self, start: int, data: Sequence[int] | bytes) -> None:
         """Known contents from address `start` on (8-bit cells), before any load or store."""
+    def snapshot(self) -> int:
+        """Records the current version and returns its handle (0 is the initial version)."""
+    def restore(self, version: int) -> None:
+        """Restores the current version to a previously recorded snapshot."""
+    def merge(self, cond: Expr, v_then: int, v_else: int) -> None:
+        """Joins two branch snapshots under 1-bit condition `cond` (`cond ? v_then : v_else`)."""
+    def memset(self, addr: Expr, cell_value: Expr, cells: int) -> None:
+        """Fills `cells` consecutive cells starting at `addr` with `cell_value`."""
+    def memcpy(self, dst: Expr, src: Expr, cells: int) -> None:
+        """Copies `cells` cells from `src` to `dst` (snapshot semantics)."""
     def store(self, addr: Expr, value: Expr) -> None: ...
     def load(self, addr: Expr, cells: int = 1) -> Expr: ...
     def reads(self) -> list[tuple[Expr, Expr]]:
@@ -630,6 +650,9 @@ class Site:
     def width(self, e: int) -> int | None: ...
     def value(self, e: int) -> int | None: ...
     def facts(self, e: int) -> Facts | None: ...
+    def prove_cmp(self, op: _CmpOp, a: int, b: int) -> bool | None: ...
+    def prove_eq(self, a: int, b: int) -> bool: ...
+    def const_diff(self, a: int, b: int) -> int | None: ...
     def to_string(self, e: int, *, lets: bool = True) -> str | None: ...
     def constant(self, value: int, width: int) -> int | None: ...
     def un(self, op: _UnOp, a: int) -> int | None: ...

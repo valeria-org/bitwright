@@ -56,16 +56,21 @@ pub(super) fn equivalent<'py>(
 /// The smallest expression equal to `e` that synthesis finds over its variables and constants
 /// (proved equal), or None.
 #[pyfunction]
-#[pyo3(signature = (e, *, max_size = 7))]
+#[pyo3(signature = (e, *, max_size = 7, rotations = false, bitops = false))]
 pub(super) fn synthesize(
     py: Python<'_>,
     e: PyRef<'_, PyExpr>,
     max_size: u8,
+    rotations: bool,
+    bitops: bool,
 ) -> PyResult<Option<PyExpr>> {
     let cxb = e.cx.bind(py);
     let cx = cxb.get();
     let x = e.e;
-    let cfg = bitwright::synth::Config::default().with_max_size(max_size);
+    let cfg = bitwright::synth::Config::default()
+        .with_max_size(max_size)
+        .with_rotations(rotations)
+        .with_bitops(bitops);
     let out = py
         .detach(|| {
             let mut c = cx.cx.lock().unwrap_or_else(|p| p.into_inner());
@@ -79,13 +84,14 @@ pub(super) fn synthesize(
 /// The equality-saturation search's candidate for `e` over the built-in equations (every
 /// group of `eqsat.bwr`, or the ones named), or None when it finds nothing smaller.
 #[pyfunction]
-#[pyo3(signature = (e, *, groups = None))]
+#[pyo3(signature = (e, *, groups = None, dag = false))]
 pub(super) fn saturate(
     py: Python<'_>,
     e: PyRef<'_, PyExpr>,
     groups: Option<Vec<String>>,
+    dag: bool,
 ) -> PyResult<Option<PyExpr>> {
-    use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
+    use bitwright::eqsat::{CostModel, SaturateConfig, Saturator, SearchRun};
     let names: Vec<String> = groups.unwrap_or_else(|| {
         [
             "eqsat.assoc",
@@ -100,7 +106,10 @@ pub(super) fn saturate(
         .collect()
     });
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (sat, _) = Saturator::builtin_groups(&refs, SaturateConfig::default());
+    let (mut sat, _) = Saturator::builtin_groups(&refs, SaturateConfig::default());
+    if dag {
+        sat = sat.with_cost_model(CostModel::dag_size());
+    }
     let cxb = e.cx.bind(py);
     let cx = cxb.get();
     let x = e.e;
@@ -122,7 +131,7 @@ pub(super) fn saturate(
 #[derive(Debug)]
 pub(super) struct PyMemory {
     cx: Py<PyContext>,
-    m: Mutex<(Memory, Version)>,
+    m: Mutex<(Memory, Version, Vec<Version>)>,
 }
 
 #[pymethods]
@@ -151,7 +160,7 @@ impl PyMemory {
         let v = m.initial();
         Ok(PyMemory {
             cx: ctx,
-            m: Mutex::new((m, v)),
+            m: Mutex::new((m, v, vec![v])),
         })
     }
 
@@ -159,10 +168,104 @@ impl PyMemory {
     /// load or store.
     fn set_bytes(&self, py: Python<'_>, start: u128, data: Vec<u8>) -> PyResult<()> {
         let mut g = lock(py, &self.m)?;
-        let (m, v) = &mut *g;
+        let (m, v, versions) = &mut *g;
         let taken = std::mem::replace(m, Memory::new("tmp", Width::W8, Width::W8, Endian::Little));
         *m = taken.with_bytes(start, &data).or_raise()?;
         *v = m.initial();
+        versions.clear();
+        versions.push(*v);
+        Ok(())
+    }
+
+    /// Records the current version and returns its handle (0 is the initial version).
+    fn snapshot(&self, py: Python<'_>) -> PyResult<u32> {
+        let mut g = lock(py, &self.m)?;
+        let (_, v, versions) = &mut *g;
+        if let Some(pos) = versions.iter().position(|&x| x == *v) {
+            return Ok(pos as u32);
+        }
+        let pos = u32::try_from(versions.len())
+            .map_err(|_| PyValueError::new_err("too many memory snapshots"))?;
+        versions.push(*v);
+        Ok(pos)
+    }
+
+    /// Restores the current version to a previously recorded snapshot.
+    fn restore(&self, py: Python<'_>, version: u32) -> PyResult<()> {
+        let mut g = lock(py, &self.m)?;
+        let (_, v, versions) = &mut *g;
+        *v = versions
+            .get(version as usize)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err(format!("unknown memory snapshot {version}")))?;
+        Ok(())
+    }
+
+    /// Joins two branch snapshots under 1-bit condition `cond` (`cond ? v_then : v_else`).
+    fn merge(
+        &self,
+        py: Python<'_>,
+        cond: PyRef<'_, PyExpr>,
+        v_then: u32,
+        v_else: u32,
+    ) -> PyResult<()> {
+        if !self.cx.is(&cond.cx) {
+            return Err(PyValueError::new_err("an expression of another context"));
+        }
+        let ce = cond.e;
+        let cx = self.cx.bind(py).get();
+        let mut c = cx.lock(py)?;
+        let mut g = lock(py, &self.m)?;
+        let (m, v, versions) = &mut *g;
+        let vt = versions
+            .get(v_then as usize)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err(format!("unknown memory snapshot {v_then}")))?;
+        let ve = versions
+            .get(v_else as usize)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err(format!("unknown memory snapshot {v_else}")))?;
+        *v = m.merge(&mut c, ce, vt, ve).or_raise()?;
+        Ok(())
+    }
+
+    /// Fills `cells` consecutive cells starting at `addr` with `cell_value` (of cell width).
+    fn memset(
+        &self,
+        py: Python<'_>,
+        addr: PyRef<'_, PyExpr>,
+        cell_value: PyRef<'_, PyExpr>,
+        cells: u16,
+    ) -> PyResult<()> {
+        if !self.cx.is(&addr.cx) || !self.cx.is(&cell_value.cx) {
+            return Err(PyValueError::new_err("an expression of another context"));
+        }
+        let (a, cv) = (addr.e, cell_value.e);
+        let cx = self.cx.bind(py).get();
+        let mut c = cx.lock(py)?;
+        let mut g = lock(py, &self.m)?;
+        let (m, v, _) = &mut *g;
+        *v = m.memset(&mut c, *v, a, cv, cells).or_raise()?;
+        Ok(())
+    }
+
+    /// Copies `cells` cells from `src` to `dst` (snapshot semantics: safe when ranges overlap).
+    fn memcpy(
+        &self,
+        py: Python<'_>,
+        dst: PyRef<'_, PyExpr>,
+        src: PyRef<'_, PyExpr>,
+        cells: u16,
+    ) -> PyResult<()> {
+        if !self.cx.is(&dst.cx) || !self.cx.is(&src.cx) {
+            return Err(PyValueError::new_err("an expression of another context"));
+        }
+        let (d, s) = (dst.e, src.e);
+        let cx = self.cx.bind(py).get();
+        let mut c = cx.lock(py)?;
+        let mut g = lock(py, &self.m)?;
+        let (m, v, _) = &mut *g;
+        *v = m.memcpy(&mut c, *v, d, s, cells).or_raise()?;
         Ok(())
     }
 
@@ -173,11 +276,14 @@ impl PyMemory {
         addr: PyRef<'_, PyExpr>,
         value: PyRef<'_, PyExpr>,
     ) -> PyResult<()> {
+        if !self.cx.is(&addr.cx) || !self.cx.is(&value.cx) {
+            return Err(PyValueError::new_err("an expression of another context"));
+        }
         let (a, x) = (addr.e, value.e);
         let cx = self.cx.bind(py).get();
         let mut c = cx.lock(py)?;
         let mut g = lock(py, &self.m)?;
-        let (m, v) = &mut *g;
+        let (m, v, _) = &mut *g;
         *v = m.store(&mut c, *v, a, x).or_raise()?;
         Ok(())
     }
@@ -185,12 +291,15 @@ impl PyMemory {
     /// Loads `cells` cells at `addr`, as one value.
     #[pyo3(signature = (addr, cells = 1))]
     fn load(&self, py: Python<'_>, addr: PyRef<'_, PyExpr>, cells: u16) -> PyResult<PyExpr> {
+        if !self.cx.is(&addr.cx) {
+            return Err(PyValueError::new_err("an expression of another context"));
+        }
         let a = addr.e;
         let cxb = self.cx.bind(py);
         let e = {
             let mut c = cxb.get().lock(py)?;
             let mut g = lock(py, &self.m)?;
-            let (m, v) = &mut *g;
+            let (m, v, _) = &mut *g;
             m.load(&mut c, *v, a, cells).or_raise()?
         };
         let c = cxb.get().lock(py)?;

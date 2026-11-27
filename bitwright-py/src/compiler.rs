@@ -285,6 +285,39 @@ impl PySite {
             .transpose()
     }
 
+    /// Whether `a op b` holds under the run's assumptions and declared known bits: True, False,
+    /// or None when undecided or declined by the budget.
+    fn prove_cmp(&self, op: &str, a: u64, b: u64) -> PyResult<Option<bool>> {
+        let op = cmpop(op)?;
+        self.with(|s| {
+            let (a, b) = (handle(a)?, handle(b)?);
+            match s.prove(bitwright::Query::Cmp(op, a, b)) {
+                bitwright::Truth::True => Some(true),
+                bitwright::Truth::False => Some(false),
+                bitwright::Truth::Unknown => None,
+            }
+        })
+    }
+
+    /// Whether `a == b` holds under the run's assumptions and declared known bits.
+    fn prove_eq(&self, a: u64, b: u64) -> PyResult<bool> {
+        Ok(self
+            .with(|s| Some(s.prove_eq(handle(a)?, handle(b)?)))?
+            .unwrap_or(false))
+    }
+
+    /// Unsigned constant `k` such that `a - b == k (mod 2^W)` under the run's assumptions, or
+    /// None.
+    fn const_diff<'py>(
+        &self,
+        py: Python<'py>,
+        a: u64,
+        b: u64,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let d = self.with(|s| s.const_diff(handle(a)?, handle(b)?))?;
+        d.map(|v| to_int(py, &v)).transpose()
+    }
+
     /// `e` in the text syntax, None if it is not a handle of the site's context.
     #[pyo3(signature = (e, *, lets = true))]
     fn to_string(&self, e: u64, lets: bool) -> PyResult<Option<String>> {

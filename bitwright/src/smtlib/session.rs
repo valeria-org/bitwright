@@ -2,8 +2,9 @@
 //! [`Solver`](crate::solve::Solver), their responses written as the standard prescribes.
 
 use core::fmt::{self, Write};
+use std::collections::BTreeMap;
 
-use super::import::{Env, EnvMark, State, Sx, Tok, Val, check};
+use super::import::{Arr, Env, EnvMark, Sort, State, Sx, Tok, Val, check};
 use crate::engine::{Clock, Deadline};
 use crate::error::Error;
 use crate::expr::{Context, Expr};
@@ -42,8 +43,9 @@ pub struct Summary {
 /// runs) or `out` failing.
 ///
 /// A name declared in a scope is forgotten when the scope closes, its symbol is not: the
-/// context keeps it. `get-model` lists the declared bit-vector, Boolean and floating-point
-/// constants (an array's cells are not printed), a floating-point value as its `(fp …)` bits.
+/// context keeps it. `get-model` lists the declared bit-vector, Boolean, floating-point, and
+/// array constants along with declared uninterpreted functions (`define-fun`), a floating-point
+/// value as its `(fp …)` bits and an array as `((as const …) …)` wrapped in `(store …)`.
 ///
 /// ```
 /// let mut cx = bitwright::Context::new();
@@ -430,6 +432,31 @@ impl<'a> Session<'a> {
                         );
                     }
                 }
+                for name in self.env.journal.clone() {
+                    let Some(&(val @ Val::Array(idx, _), _)) = self.env.globals.get(name.as_str())
+                    else {
+                        continue;
+                    };
+                    let (idx_w, elem_w) = {
+                        let mem = &self.env.out.arrays[idx as usize].1;
+                        (mem.addr_width(), mem.cell_width())
+                    };
+                    if let Some(value) = self.array_text(val)? {
+                        let _ = write!(
+                            text,
+                            "\n  (define-fun {} () (Array (_ BitVec {}) (_ BitVec {})) {value})",
+                            Symbol(&name),
+                            idx_w.bits(),
+                            elem_w.bits()
+                        );
+                    }
+                }
+                for name in self.env.uf_journal.clone() {
+                    if let Some(defn) = self.uf_model_text(&name)? {
+                        text.push_str("\n  ");
+                        text.push_str(&defn);
+                    }
+                }
                 text.push_str("\n)");
                 Ok(Some(text))
             }
@@ -446,6 +473,11 @@ impl<'a> Session<'a> {
                     if let Val::Wide(at) = val {
                         // Its limbs are read when the others are.
                         wides.push((vals.len(), self.env.wides[at as usize].clone()));
+                        let zero = self.cx.bool(false)?;
+                        vals.push((t, val, zero));
+                        continue;
+                    }
+                    if matches!(val, Val::Array(..) | Val::Arr(_)) {
                         let zero = self.cx.bool(false)?;
                         vals.push((t, val, zero));
                         continue;
@@ -469,6 +501,13 @@ impl<'a> Session<'a> {
                     if let Some((_, wide)) = wides.iter().find(|(at, _)| *at == k) {
                         let wide = wide.clone();
                         let Some(value) = self.wide_text(&wide)? else {
+                            return Err(sx.err(t, "no model"));
+                        };
+                        parts.push(format!("({} {value})", sx.text(t)));
+                        continue;
+                    }
+                    if matches!(val, Val::Array(..) | Val::Arr(_)) {
+                        let Some(value) = self.array_text(val)? else {
                             return Err(sx.err(t, "no model"));
                         };
                         parts.push(format!("({} {value})", sx.text(t)));
@@ -689,6 +728,266 @@ impl<'a> Session<'a> {
     fn core(&mut self) -> Result<Vec<CoreItem>, Error> {
         self.need(Status::Unsat, "no core: the last check was not unsat")?;
         Ok(self.solver.unsat_core(self.cx)?.unwrap_or_default())
+    }
+
+    /// Evaluates an array value in the current model as `(index_width, elem_width, default, map)`.
+    #[allow(clippy::type_complexity)]
+    fn eval_array_model(
+        &mut self,
+        val: Val,
+        depth: u32,
+    ) -> Result<Option<(Width, Width, BitVec, BTreeMap<BitVec, BitVec>)>, Error> {
+        if depth > 64 {
+            return Ok(None);
+        }
+        match val {
+            Val::Array(m, ver) => {
+                let (idx_w, elem_w, init_ver, reads) = {
+                    let mem = &self.env.out.arrays[m as usize].1;
+                    (
+                        mem.addr_width(),
+                        mem.cell_width(),
+                        mem.initial(),
+                        mem.reads().to_vec(),
+                    )
+                };
+                // Infer default cell value if an asserted equality ties this base array to a
+                // constant array (or transitively through equal arrays).
+                let mut default_cell = BitVec::zero(elem_w);
+                let base_val = Val::Array(m, init_ver);
+                for &(eq_e, lhs, rhs) in &self.env.array_eqs.clone() {
+                    if self
+                        .solver
+                        .value(self.cx, eq_e)?
+                        .is_some_and(|v| !v.is_zero())
+                    {
+                        let other = if lhs == base_val {
+                            Some(rhs)
+                        } else if rhs == base_val {
+                            Some(lhs)
+                        } else {
+                            None
+                        };
+                        if let Some(other_arr) = other
+                            && let Some((_, _, d, other_map)) =
+                                self.eval_array_model(other_arr, depth + 1)?
+                        {
+                            default_cell = d;
+                            let mut map = other_map;
+                            for (ra, rs) in reads.clone() {
+                                let (Some(iv), Some(cv)) = (
+                                    self.solver.value(self.cx, ra)?,
+                                    self.solver.value(self.cx, rs)?,
+                                ) else {
+                                    return Ok(None);
+                                };
+                                map.entry(iv).or_insert(cv);
+                            }
+                            self.apply_array_stores(m, init_ver, ver, &mut map)?;
+                            return Ok(Some((idx_w, elem_w, default_cell, map)));
+                        }
+                    }
+                }
+                let mut map: BTreeMap<BitVec, BitVec> = BTreeMap::new();
+                for (ra, rs) in reads {
+                    let (Some(iv), Some(cv)) = (
+                        self.solver.value(self.cx, ra)?,
+                        self.solver.value(self.cx, rs)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    // Earlier reads first: the first read at an equal address answers.
+                    map.entry(iv).or_insert(cv);
+                }
+                self.apply_array_stores(m, init_ver, ver, &mut map)?;
+                Ok(Some((idx_w, elem_w, default_cell, map)))
+            }
+            Val::Arr(k) => match self.env.arrs[k as usize] {
+                Arr::Const(idx_w, elem_e) => {
+                    let elem_w = self.cx.width(elem_e)?;
+                    let Some(dv) = self.solver.value(self.cx, elem_e)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some((idx_w, elem_w, dv, BTreeMap::new())))
+                }
+                Arr::Ite(cond, t_arr, e_arr) => {
+                    let Some(cv) = self.solver.value(self.cx, cond)? else {
+                        return Ok(None);
+                    };
+                    let chosen = if !cv.is_zero() { t_arr } else { e_arr };
+                    self.eval_array_model(chosen, depth + 1)
+                }
+                Arr::Store(base, i_e, v_e) => {
+                    let Some((idx_w, elem_w, dv, mut map)) =
+                        self.eval_array_model(base, depth + 1)?
+                    else {
+                        return Ok(None);
+                    };
+                    let (Some(iv), Some(vv)) = (
+                        self.solver.value(self.cx, i_e)?,
+                        self.solver.value(self.cx, v_e)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    map.insert(iv, vv);
+                    Ok(Some((idx_w, elem_w, dv, map)))
+                }
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn apply_array_stores(
+        &mut self,
+        m: u32,
+        init_ver: crate::memory::Version,
+        mut cur: crate::memory::Version,
+        map: &mut BTreeMap<BitVec, BitVec>,
+    ) -> Result<(), Error> {
+        let mut chain: Vec<(Expr, Expr)> = Vec::new();
+        while cur != init_ver {
+            let Some(&(_, _, parent, i_e, v_e)) = self
+                .env
+                .array_stores
+                .iter()
+                .find(|&&(arr, v, ..)| arr == m && v == cur)
+            else {
+                break;
+            };
+            chain.push((i_e, v_e));
+            cur = parent;
+        }
+        for (i_e, v_e) in chain.into_iter().rev() {
+            if let (Some(iv), Some(vv)) = (
+                self.solver.value(self.cx, i_e)?,
+                self.solver.value(self.cx, v_e)?,
+            ) {
+                map.insert(iv, vv);
+            }
+        }
+        Ok(())
+    }
+
+    /// Formats an array term's value in the current model as SMT-LIB 2.6 syntax.
+    fn array_text(&mut self, val: Val) -> Result<Option<String>, Error> {
+        let Some((idx_w, elem_w, default_bv, map)) = self.eval_array_model(val, 0)? else {
+            return Ok(None);
+        };
+        let dummy = self.cx.bool(false)?;
+        let mut term = format!(
+            "((as const (Array (_ BitVec {}) (_ BitVec {}))) {})",
+            idx_w.bits(),
+            elem_w.bits(),
+            Value(Val::Bv(dummy), &default_bv)
+        );
+        for (k, v) in map {
+            if v != default_bv {
+                term = format!(
+                    "(store {term} {} {})",
+                    Value(Val::Bv(dummy), &k),
+                    Value(Val::Bv(dummy), &v)
+                );
+            }
+        }
+        Ok(Some(term))
+    }
+
+    /// Formats a `define-fun` table for a declared uninterpreted function in the current model.
+    fn uf_model_text(&mut self, name: &str) -> Result<Option<String>, Error> {
+        let Some(uf) = self.env.ufs.get(name).cloned() else {
+            return Ok(None);
+        };
+        let dummy = self.cx.bool(false)?;
+        let sort_text = |s: Sort| -> String {
+            match s {
+                Sort::Bool => "Bool".into(),
+                Sort::Bv(w) => format!("(_ BitVec {})", w.bits()),
+                Sort::Fp(f) => format!("(_ FloatingPoint {} {})", f.eb(), f.sb()),
+                _ => "Bool".into(),
+            }
+        };
+        let default_val = |s: Sort| -> (Val, BitVec) {
+            match s {
+                Sort::Bool => (Val::Bool(dummy), BitVec::zero(Width::W1)),
+                Sort::Bv(w) => (Val::Bv(dummy), BitVec::zero(w)),
+                Sort::Fp(f) => (Val::Fp(dummy, f), f.zero(false)),
+                _ => (Val::Bool(dummy), BitVec::zero(Width::W1)),
+            }
+        };
+        let mut params_str = String::new();
+        for (i, &ps) in uf.params.iter().enumerate() {
+            if i > 0 {
+                params_str.push(' ');
+            }
+            let _ = write!(params_str, "(x!{i} {})", sort_text(ps));
+        }
+        let ret_str = sort_text(uf.result);
+
+        // Collect distinct evaluated application rows `(arg_conds_key, cond_str, result_str)`.
+        let apps: Vec<(Vec<Val>, Val)> = self
+            .env
+            .apps
+            .iter()
+            .filter(|a| a.function == name)
+            .map(|a| (a.args.clone(), a.result))
+            .collect();
+        let mut rows: Vec<(Vec<u128>, String, String)> = Vec::new();
+        let mut seen_keys: Vec<Vec<(Sort, BitVec)>> = Vec::new();
+        for (args, res) in apps {
+            let Some(re) = res.expr() else { continue };
+            let Some(rv) = self.solver.value(self.cx, re)? else {
+                continue;
+            };
+            let mut key: Vec<(Sort, BitVec)> = Vec::with_capacity(args.len());
+            let mut conds: Vec<String> = Vec::with_capacity(args.len());
+            let mut ok = true;
+            for (i, (&av, &ps)) in args.iter().zip(&uf.params).enumerate() {
+                let Some(ae) = av.expr() else {
+                    ok = false;
+                    break;
+                };
+                let Some(mut bv) = self.solver.value(self.cx, ae)? else {
+                    ok = false;
+                    break;
+                };
+                if let Sort::Fp(f) = ps
+                    && f.test(crate::fp::FpTest::Nan, &bv).unwrap_or(false)
+                {
+                    bv = f.nan();
+                    conds.push(format!("(fp.isNaN x!{i})"));
+                } else {
+                    conds.push(format!("(= x!{i} {})", Value(av, &bv)));
+                }
+                key.push((ps, bv));
+            }
+            if !ok || seen_keys.contains(&key) {
+                continue;
+            }
+            seen_keys.push(key);
+            let cond = if conds.len() == 1 {
+                conds.remove(0)
+            } else {
+                format!("(and {})", conds.join(" "))
+            };
+            let res_str = Value(res, &rv).to_string();
+            rows.push((Vec::new(), cond, res_str));
+        }
+        let body = if let Some((_, _, last_res)) = rows.pop() {
+            let mut acc = last_res;
+            for (_, cond, res_str) in rows.into_iter().rev() {
+                if res_str != acc {
+                    acc = format!("(ite {cond} {res_str} {acc})");
+                }
+            }
+            acc
+        } else {
+            let (dv_kind, dv_bv) = default_val(uf.result);
+            Value(dv_kind, &dv_bv).to_string()
+        };
+        Ok(Some(format!(
+            "(define-fun {} ({params_str}) {ret_str} {body})",
+            Symbol(name)
+        )))
     }
 }
 

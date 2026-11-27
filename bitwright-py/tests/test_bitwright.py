@@ -958,6 +958,73 @@ def test_version():
     assert bw.__version__.count(".") == 2
 
 
+def test_solver_enumerate_memory_merge_site_queries_and_smtlib_run():
+    cx = bw.Context()
+    x = cx.symbol("x", 8)
+    s = bw.Solver(x.ult(4))
+    assert s.enumerate(x, 8) == ([0, 1, 2, 3], True)
+    assert s.enumerate(x, 2) == ([0, 1], False)
+
+    # Symbolic memory snapshot / restore / merge / memset / memcpy
+    mem = bw.Memory(cx, addr_width=64, cell_width=8)
+    sp = cx.symbol("sp", 64)
+    c = cx.symbol("c", 1)
+    entry = mem.snapshot()
+    mem.store(sp, cx.const(0x11223344, 32))
+    v_then = mem.snapshot()
+    mem.restore(entry)
+    mem.store(sp, cx.const(0x55667788, 32))
+    v_else = mem.snapshot()
+    mem.merge(c, v_then, v_else)
+    loaded = mem.load(sp, 4)
+    dst = sp + 16
+    mem.memcpy(dst, sp, 4)
+    assert bw.equivalent(loaded, mem.load(dst, 4)) is True
+    mem.memset(dst, cx.const(0xAA, 8), 2)
+    assert mem.load(dst, 2).value == 0xAAAA
+
+    # Extended & wide synthesis + DAG saturation + run_smtlib
+    rot = cx.parse("(r << 5) | (r >>u 27)", 32)
+    syn = rot.synthesize(max_size=5, rotations=True)
+    assert syn is not None and str(syn) == "rotl(r, 5)"
+    wide = cx.parse("(w ^ z) + 2 * (w & z)", 128)
+    wsyn = bw.synthesize(wide, max_size=5)
+    assert wsyn is not None and str(wsyn) == "w + z"
+    dag_cand = cx.parse("a * b + a * c", 32).saturate(dag=True)
+    assert dag_cand is not None
+
+    smt_out = cx.run_smtlib(
+        "(set-logic QF_UFBV)"
+        "(declare-fun f ((_ BitVec 8)) (_ BitVec 8))"
+        "(declare-const k (_ BitVec 8))"
+        "(assert (= (f k) #x2a))"
+        "(check-sat)"
+        "(get-model)"
+    )
+    assert smt_out.startswith("sat\n") and "(define-fun f " in smt_out
+
+    # Site relational queries (prove_cmp, prove_eq, const_diff)
+    def rel_rw(site: bw.Site, e: int) -> int | None:
+        if site.op(e) != "sub":
+            return None
+        a, b = site.children(e)
+        w = site.width(e)
+        assert w is not None
+        if site.prove_eq(a, b):
+            return site.constant(0, w)
+        diff = site.const_diff(a, b)
+        if diff is not None:
+            return site.constant(diff, w)
+        if site.prove_cmp("ult", a, b) is True:
+            return None
+        return None
+
+    eng = bw.Engine("compile", rewrites=[bw.Rewrite("t.rel", rel_rw)])
+    asmp = bw.Assumptions(cx.parse("p == q + 12", 32))
+    (out,) = eng.run([cx.parse("p - q", 32)], assumptions=asmp)
+    assert out.expr.value == 12 and out.relies_on == (0,)
+
+
 def test_the_book_examples():
     """Every Python example of the book's chapters on the bindings and their examples runs (its
     checks are asserts)."""

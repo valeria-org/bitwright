@@ -64,6 +64,7 @@ const TO_LEAN: u32 = 19;
 const EQUIVALENCE_QUERY: u32 = 20;
 const CHECK_RULES: u32 = 21;
 const LEAN_TO_RULES: u32 = 22;
+const RUN_SMTLIB: u32 = 23;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -369,6 +370,13 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
             let l = cx.parse(a, &o).map_err(|e| e.to_string())?;
             let r = cx.parse(b, &o).map_err(|e| e.to_string())?;
             text(bw::smtlib::equivalence_query(&mut cx, l, r))
+        }
+        RUN_SMTLIB => {
+            let mut cx = Context::new();
+            let mut out = String::new();
+            let cfg = bw::solve::Config::default();
+            bw::smtlib::run(&mut cx, a, &cfg, &mut out).map_err(|e| e.to_string())?;
+            Ok(out)
         }
         _ => Err(format!("unknown operation {op}")),
     }

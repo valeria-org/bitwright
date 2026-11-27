@@ -2340,3 +2340,179 @@ fn the_solver_checks_scopes_values_and_cores() {
         bw_solver_free(null_mut());
     }
 }
+
+#[test]
+fn solver_enumeration_memory_merge_site_queries_and_smtlib_session() {
+    use crate::compiler::*;
+    use crate::more::*;
+    use crate::solver::*;
+
+    let cx = Cx::new();
+    unsafe {
+        // 1. Solver::enumerate_values via bw_solver_enumerate
+        let s = bw_solver_new();
+        let p = cx.parse("x <u 4", 8);
+        let x = cx.sym("x", 8);
+        assert_eq!(bw_solver_assert(s, cx.0, p, null_mut()), BW_OK);
+        let mut vals = [val(8, 0); 8];
+        let (mut count, mut exact, mut answer) = (0usize, false, -1);
+        assert_eq!(
+            bw_solver_enumerate(
+                s,
+                cx.0,
+                x,
+                8,
+                vals.as_mut_ptr(),
+                &mut count,
+                &mut exact,
+                &mut answer
+            ),
+            BW_OK
+        );
+        assert_eq!((count, exact, answer), (4, true, 1));
+        assert_eq!(
+            [
+                vals[0].limbs[0],
+                vals[1].limbs[0],
+                vals[2].limbs[0],
+                vals[3].limbs[0]
+            ],
+            [0, 1, 2, 3]
+        );
+        assert_eq!(
+            bw_solver_enumerate(
+                s,
+                cx.0,
+                x,
+                2,
+                vals.as_mut_ptr(),
+                &mut count,
+                &mut exact,
+                &mut answer
+            ),
+            BW_OK
+        );
+        assert_eq!((count, exact, answer), (2, false, 1));
+        bw_solver_free(s);
+
+        // 2. Memory snapshot / restore / merge / memset / memcpy
+        let m = bw_memory_new(cstr("mem").as_ptr(), 64, 8, false);
+        let mut entry = 99;
+        assert_eq!(bw_memory_snapshot(m, &mut entry), BW_OK);
+        assert_eq!(entry, 0);
+        let slot = cx.parse("sp", 64);
+        let vt_expr = cx.konst(32, 0x11223344);
+        let ve_expr = cx.konst(32, 0x55667788);
+        assert_eq!(bw_memory_store(m, cx.0, slot, vt_expr), BW_OK);
+        let mut v_then = 0;
+        assert_eq!(bw_memory_snapshot(m, &mut v_then), BW_OK);
+        assert_eq!(bw_memory_restore(m, entry), BW_OK);
+        assert_eq!(bw_memory_store(m, cx.0, slot, ve_expr), BW_OK);
+        let mut v_else = 0;
+        assert_eq!(bw_memory_snapshot(m, &mut v_else), BW_OK);
+        let cond = cx.sym("c", 1);
+        assert_eq!(bw_memory_merge(m, cx.0, cond, v_then, v_else), BW_OK);
+        let mut loaded = 0;
+        assert_eq!(bw_memory_load(m, cx.0, slot, 4, &mut loaded), BW_OK);
+        let dst = cx.parse("sp + 16", 64);
+        assert_eq!(bw_memory_memcpy(m, cx.0, dst, slot, 4), BW_OK);
+        let mut copied = 0;
+        assert_eq!(bw_memory_load(m, cx.0, dst, 4, &mut copied), BW_OK);
+        let mut eq = -1;
+        assert_eq!(bw_equivalent(cx.0, loaded, copied, 10_000, &mut eq), BW_OK);
+        assert_eq!(eq, 1);
+        let zero_byte = cx.konst(8, 0xaa);
+        assert_eq!(bw_memory_memset(m, cx.0, dst, zero_byte, 2), BW_OK);
+        let mut filled = 0;
+        assert_eq!(bw_memory_load(m, cx.0, dst, 2, &mut filled), BW_OK);
+        let mut fv = val(16, 0);
+        assert_eq!(bw_const_value(cx.0, filled, &mut fv), BW_OK);
+        assert_eq!((fv.width, fv.limbs[0]), (16, 0xaaaa));
+        assert_eq!(bw_memory_restore(m, 999), BW_ERR_INVALID_ARGUMENT);
+        bw_memory_free(m);
+
+        // 3. Extended & wide synthesis + SMT-LIB session (QF_ABV & QF_UFBV)
+        let rot = cx.parse("(r << 5) | (r >>u 27)", 32);
+        let (mut syn, mut found) = (0u64, false);
+        assert_eq!(
+            bw_synthesize_ext(cx.0, rot, 5, true, false, &mut syn, &mut found),
+            BW_OK
+        );
+        assert!(found);
+        assert_eq!(cx.print(syn), "rotl(r, 5)");
+
+        let wide = cx.parse("(w ^ z) + 2 * (w & z)", 128);
+        assert_eq!(bw_synthesize(cx.0, wide, 5, &mut syn, &mut found), BW_OK);
+        assert!(found);
+        assert_eq!(cx.print(syn), "w + z");
+
+        let mut smt_out = null_mut();
+        let script = cstr(
+            "(set-logic QF_UFBV)\
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+             (declare-const a (_ BitVec 8))\
+             (assert (= (f a) #x2a))\
+             (check-sat)\
+             (get-model)",
+        );
+        assert_eq!(bw_smtlib_run(cx.0, script.as_ptr(), &mut smt_out), BW_OK);
+        let smt_text = take(smt_out);
+        assert!(smt_text.starts_with("sat\n"), "{smt_text}");
+        assert!(smt_text.contains("(define-fun f "), "{smt_text}");
+
+        // 4. Site relational queries (prove_cmp, prove_eq, const_diff)
+        unsafe extern "C" fn fold_rel(
+            _user: *mut core::ffi::c_void,
+            s: *mut BwSite,
+            e: u64,
+        ) -> u64 {
+            unsafe {
+                let mut n = core::mem::zeroed::<BwNode>();
+                if !bw_site_node(s, e, &mut n) || n.kind != 3 || n.op != 1 {
+                    return 0;
+                }
+                let [a, b, _] = n.children;
+                if bw_site_prove_eq(s, a, b) {
+                    return bw_site_const_u64(s, n.width, 0);
+                }
+                let mut d = val(1, 0);
+                if bw_site_const_diff(s, a, b, &mut d) {
+                    return bw_site_const(s, &d);
+                }
+                if bw_site_prove_cmp(s, 2, a, b) == 1 {
+                    return e;
+                }
+                0
+            }
+        }
+        let b = bw_engine_builder_new(2);
+        let rw_name = cstr("t.rel");
+        let rw = BwRewrite {
+            name: rw_name.as_ptr(),
+            group: null(),
+            revision: 1,
+            user: null_mut(),
+            rewrite: Some(fold_rel),
+            release: None,
+        };
+        assert_eq!(bw_engine_builder_add_rewrite(b, &rw, false), BW_OK);
+        let mut eng = null_mut();
+        assert_eq!(bw_engine_builder_build(b, &mut eng), BW_OK);
+        bw_engine_builder_free(b);
+        let asmp = bw_assumptions_new();
+        let eq_pred = cx.parse("p == q + 12", 32);
+        assert_eq!(bw_assume(asmp, cx.0, eq_pred, true, null_mut()), BW_OK);
+        let sub_expr = cx.parse("p - q", 32);
+        let mut out = core::mem::zeroed::<BwOutcome>();
+        assert_eq!(
+            bw_engine_run(eng, cx.0, &sub_expr, 1, null(), asmp, &mut out),
+            BW_OK
+        );
+        let mut ov = val(32, 0);
+        assert_eq!(bw_const_value(cx.0, out.expr, &mut ov), BW_OK);
+        assert_eq!((ov.width, ov.limbs[0]), (32, 12));
+        assert_eq!(out.relies_on, 1);
+        bw_assumptions_free(asmp);
+        bw_engine_free(eng);
+    }
+}

@@ -34,6 +34,7 @@ const OPS = {
   equivalenceQuery: 20,
   checkRules: 21,
   leanToRules: 22,
+  runSmtlib: 23,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -168,6 +169,15 @@ export async function instantiate(bytes) {
       const [knownZero, knownOne, umin, umax, ustride, smin, smax] = t.split(" ").map(unsigned);
       const signed = (v) => BigInt.asIntN(w, v);
       return { knownZero, knownOne, umin, umax, ustride, smin: signed(smin), smax: signed(smax) };
+    },
+    proveCmp: (op, a, b) => {
+      const r = ex.bw_site_prove_cmp(code(CMPOPS, op, "comparison"), handle(a), handle(b));
+      return r < 0 ? null : r === 1;
+    },
+    proveEq: (a, b) => ex.bw_site_prove_eq(handle(a), handle(b)) === 1,
+    constDiff: (a, b) => {
+      const t = take(ex.bw_site_const_diff(handle(a), handle(b)));
+      return t === null ? null : unsigned(t);
     },
     print: (e) => take(ex.bw_site_print(handle(e))),
     constant: (value, width) => {
@@ -305,6 +315,9 @@ export async function instantiate(bytes) {
     // Reads a QF_BV script: the named definition (or the last one, or the assertions
     // conjoined) as expression text, the symbols' widths written (`x:64`).
     fromSmtlib: (script, definition = "") => call(OPS.fromSmtlib, script, definition, 0),
+    // Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) and returns the
+    // standard responses.
+    runSmtlib: (script) => call(OPS.runSmtlib, script),
     // `lhs = rhs` as a Lean 4 `example` over their symbols, proved by `bv_decide`; without
     // `rhs`, the Lean term of `lhs` alone. Throws for what Lean's core BitVec cannot state.
     toLean: (lhs, rhs = "", width = 64) => call(OPS.toLean, lhs, rhs, width),

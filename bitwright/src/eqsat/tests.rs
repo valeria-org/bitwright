@@ -948,3 +948,119 @@ fn select_and_shift_detours_and_publish_policy() {
     assert!(matches!(out_late.publication, Publication::Withheld { .. }));
     assert_eq!(out_late.roots[0].candidate, None);
 }
+
+#[test]
+fn dag_extraction_exploits_intra_root_and_batch_sharing() {
+    // 1. Intra-root shared subterm: for `t = a + b + c` (5 DAG nodes), `t * (t + 1)` has tree size
+    //    13 and DAG size 8, whereas `(t * t) + t` has larger tree size (17) but smaller DAG size
+    //    (7, reusing `t` three times without `1` or `t + 1`).
+    let (s_dist, _) = Saturator::builtin_groups(
+        &["eqsat.distrib", "eqsat.cancel"],
+        SaturateConfig::default(),
+    );
+    let mut cx = Context::new();
+    let e = parse(&mut cx, "(a + b + c) * ((a + b + c) + 1)", 32);
+    let want_dag = parse(&mut cx, "(a + b + c) * (a + b + c) + (a + b + c)", 32);
+
+    // Tree mode keeps `t * (t + 1)`.
+    let out_tree = s_dist.search(&mut cx, &[e], SearchRun::default()).unwrap();
+    assert_eq!(out_tree.roots[0].candidate, None);
+
+    // DAG mode (on the same context — testing memo isolation across cost models too!) extracts
+    // `(t * t) + t`, shrinking the DAG from 8 to 7 nodes.
+    let out_dag = s_dist
+        .search(
+            &mut cx,
+            &[e],
+            SearchRun::default().with_cost_model(CostModel::dag_size()),
+        )
+        .unwrap();
+    assert_eq!(out_dag.publication, Publication::Published);
+    assert_eq!(out_dag.roots[0].candidate, Some(want_dag));
+    assert_eq!(
+        cx.dag_size(&[want_dag], 64).unwrap(),
+        crate::Bounded::Exact(7)
+    );
+    assert_eq!(cx.dag_size(&[e], 64).unwrap(), crate::Bounded::Exact(8));
+
+    // Re-running default tree mode does not read the DAG-mode memo entry.
+    let out_tree_again = s_dist.search(&mut cx, &[e], SearchRun::default()).unwrap();
+    assert_eq!(out_tree_again.roots[0].candidate, None);
+
+    // 2. Coordinate-descent reassociation within one root: `((x + y) + z) * (y + z)` (7 DAG nodes,
+    //    tree size 9) reassociates to `(x + (y + z)) * (y + z)` (6 DAG nodes, sharing `y + z`).
+    let (s_assoc, _) = Saturator::builtin_groups(&["eqsat.assoc"], SaturateConfig::default());
+    let mut cx = Context::new();
+    let e_reassoc = parse(&mut cx, "((x + y) + z) * (y + z)", 32);
+    let want_reassoc = parse(&mut cx, "(x + (y + z)) * (y + z)", 32);
+    assert_eq!(
+        s_assoc
+            .search(&mut cx, &[e_reassoc], SearchRun::default())
+            .unwrap()
+            .roots[0]
+            .candidate,
+        None
+    );
+    let out_reassoc = s_assoc
+        .search(
+            &mut cx,
+            &[e_reassoc],
+            SearchRun::default()
+                .with_cost_model(CostModel::ast_size().with_mode(ExtractionMode::Dag)),
+        )
+        .unwrap();
+    assert_eq!(out_reassoc.roots[0].candidate, Some(want_reassoc));
+
+    // 3. Multi-root batch sharing: `[(x + y) + z, y + z]` reassociates the first root to
+    //    `x + (y + z)` so `y + z` is shared across the batch (5 total DAG nodes instead of 6).
+    let mut cx = Context::new();
+    let r0 = parse(&mut cx, "(x + y) + z", 32);
+    let r1 = parse(&mut cx, "y + z", 32);
+    let want_r0 = parse(&mut cx, "x + (y + z)", 32);
+    let out_batch = s_assoc
+        .search(
+            &mut cx,
+            &[r0, r1],
+            SearchRun::default().with_cost_model(CostModel::dag_size()),
+        )
+        .unwrap();
+    assert_eq!(out_batch.publication, Publication::Published);
+    assert_eq!(out_batch.roots[0].candidate, Some(want_r0));
+    assert_eq!(out_batch.roots[1].candidate, None);
+}
+
+#[cfg(feature = "check")]
+#[test]
+fn custom_cost_model_guides_extraction_and_clamps_zero_weights() {
+    let (p, l) = program_with_ledger(
+        "bitwright 1;
+        group host_cost {
+            #[allow(BW0407)]
+            identity mul_nine<W>(x: W) where W >= 4 { x * 9 <=> (x << 3) + x }
+        }",
+    );
+    let (s, rep) = Saturator::new(&[(&p, &l)], &[], SaturateConfig::extended()).unwrap();
+    assert_eq!(rep.admitted, ["host_cost::mul_nine"]);
+
+    let mut cx = Context::new();
+    let e = parse(&mut cx, "x * 9", 32);
+    let shifted = parse(&mut cx, "(x << 3) + x", 32);
+
+    // Under default `ast_size`, `x * 9` (3 nodes) is smaller than `(x << 3) + x` (5 nodes).
+    let out_default = s.search(&mut cx, &[e], SearchRun::default()).unwrap();
+    assert_eq!(out_default.roots[0].candidate, None);
+
+    // Host-supplied custom cost model penalizing `Mul` (and returning 0 for constants/symbols to
+    // verify `0 -> 1` clamping keeps extraction cycle-safe) selects `(x << 3) + x`.
+    let custom = CostModel::custom(|op, _w| match op {
+        CostOp::Const | CostOp::Symbol => 0,
+        CostOp::Bin(BinOp::Mul) => 10,
+        _ => 1,
+    });
+    assert_eq!(custom.cost(CostOp::Const, Width::W32), 1);
+    let s_custom = s.clone().with_cost_model(custom);
+    let out_custom = s_custom
+        .search(&mut cx, &[e], SearchRun::default())
+        .unwrap();
+    assert_eq!(out_custom.roots[0].candidate, Some(shifted));
+}

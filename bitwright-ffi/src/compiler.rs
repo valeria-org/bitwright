@@ -348,6 +348,52 @@ pub unsafe extern "C" fn bw_site_facts(s: *mut BwSite, e: u64, out: *mut BwFacts
 /// # Safety
 /// `s` is a callback's site.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_site_prove_cmp(s: *mut BwSite, op: c_int, a: u64, b: u64) -> c_int {
+    quiet(|| {
+        let site = unsafe { site(s) }?;
+        let op = table(&CMPOPS, op, "").ok()?;
+        let t = site.prove(bw::Query::Cmp(op, Expr::from_bits(a)?, Expr::from_bits(b)?));
+        Some(match t {
+            bw::Truth::False => 0,
+            bw::Truth::True => 1,
+            bw::Truth::Unknown => 2,
+        })
+    })
+    .unwrap_or(2)
+}
+
+/// # Safety
+/// `s` is a callback's site.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_site_prove_eq(s: *mut BwSite, a: u64, b: u64) -> bool {
+    quiet(|| {
+        let site = unsafe { site(s) }?;
+        Some(site.prove_eq(Expr::from_bits(a)?, Expr::from_bits(b)?))
+    })
+    .unwrap_or(false)
+}
+
+/// # Safety
+/// `s` is a callback's site; `out` is valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_site_const_diff(
+    s: *mut BwSite,
+    a: u64,
+    b: u64,
+    out: *mut BwValue,
+) -> bool {
+    let v = quiet(|| {
+        let site = unsafe { site(s) }?;
+        Some(value(
+            &site.const_diff(Expr::from_bits(a)?, Expr::from_bits(b)?)?,
+        ))
+    });
+    unsafe { answer(v, out) }
+}
+
+/// # Safety
+/// `s` is a callback's site.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bw_site_print(s: *mut BwSite, e: u64, flags: u32) -> *mut c_char {
     quiet(|| {
         let site = unsafe { site(s) }?;

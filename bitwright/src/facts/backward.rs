@@ -411,8 +411,8 @@ fn excluding(f: &Facts, c: &BitVec) -> Option<Facts> {
 /// Operand facts of `op` given that its result lies in `r` and its operands in `args`.
 pub(crate) fn backward(op: &TOp, r: &Facts, args: &[&Facts]) -> Operands {
     match *op {
-        // Floating point: nothing is learned about the operands (yet).
-        TOp::Const(_) | TOp::Top(_) | TOp::Fp(_) => Some([None, None, None]),
+        TOp::Const(_) | TOp::Top(_) => Some([None, None, None]),
+        TOp::Fp(d) => super::fp::backward(d, r, args),
         TOp::Un(u) => unary(u, r, args[0]),
         TOp::Bin(b) => binary(b, r, args[0], args[1]),
         TOp::Cmp(c) => {

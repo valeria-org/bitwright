@@ -222,4 +222,28 @@ assert.throws(() => bw.template("a + a", ["a", "a"], ["x", "x"], 8), /repeated/)
 // Memory growth between calls keeps working.
 const big = Array.from({ length: 200 }, (_, i) => `(x${i % 7} ^ ${i})`).join(" + ");
 bw.simplify(big, 64);
+
+// SMT-LIB session (QF_UFBV / QF_ABV) and Site relational queries.
+const smtSession = bw.runSmtlib(
+  "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 8)) (_ BitVec 8))(declare-const a (_ BitVec 8))(assert (= (f a) #x2a))(check-sat)(get-model)",
+);
+assert.match(smtSession, /^sat\n/);
+assert.match(smtSession, /\(define-fun f /);
+
+const relCheck = {
+  name: "t.rel",
+  rewrite: (s, e) => {
+    if (s.op(e) !== "sub") return null;
+    const [a, b] = s.children(e);
+    if (s.proveEq(a, b)) return s.constant(0, s.width(e));
+    const d = s.constDiff(a, b);
+    if (d !== null) return s.constant(d, s.width(e));
+    assert.equal(s.proveCmp("ult", a, a), false);
+    return null;
+  },
+};
+assert.equal(
+  bw.simplify("(x + 9) - x", 32, { engine: "compile", rewrites: [relCheck] }),
+  "9:32",
+);
 console.log("ok");

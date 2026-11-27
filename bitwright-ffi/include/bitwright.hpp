@@ -810,6 +810,13 @@ class Context {
         return out;
     }
 
+    // Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) into this context.
+    std::string run_smtlib(const std::string &script) {
+        char *s = nullptr;
+        detail::check(bw_smtlib_run(cx_, script.c_str(), &s));
+        return detail::take(s);
+    }
+
   private:
     template <class F, class... A> Expr make(F f, A... args) {
         bw_expr out = BW_NULL_EXPR;
@@ -869,6 +876,17 @@ class Site {
         return Facts{Value(f.known_zero), Value(f.known_one), Value(f.umin),
                      Value(f.umax),       f.ustride,          Value(f.smin),
                      Value(f.smax),       f.relies_on};
+    }
+    // Whether `a op b` holds under the call's assumptions and declared bits.
+    Truth prove_cmp(CmpOp op, bw_expr a, bw_expr b) const {
+        return static_cast<Truth>(bw_site_prove_cmp(s_, static_cast<int>(op), a, b));
+    }
+    // Whether `a == b` holds under the call's assumptions and declared bits.
+    bool prove_eq(bw_expr a, bw_expr b) const { return bw_site_prove_eq(s_, a, b); }
+    // Constant `k` such that `a - b == k (mod 2^W)` under the call's assumptions, if known.
+    std::optional<Value> const_diff(bw_expr a, bw_expr b) const {
+        bw_value v;
+        return bw_site_const_diff(s_, a, b, &v) ? std::optional<Value>(Value(v)) : std::nullopt;
     }
     // `e` in the text syntax (empty if it is not a handle of the site's context).
     std::string str(bw_expr e, unsigned flags = 0) const {
@@ -1187,10 +1205,12 @@ inline std::optional<bool> equivalent(Expr a, Expr b, uint64_t conflicts = 10000
 }
 
 // The smallest expression equal to `e` that synthesis finds (proved), if any.
-inline std::optional<Expr> synthesize(Expr e, uint8_t max_size = 7) {
+inline std::optional<Expr> synthesize(Expr e, uint8_t max_size = 7, bool rotations = false,
+                                      bool bitops = false) {
     bw_expr out = BW_NULL_EXPR;
     bool found = false;
-    detail::check(bw_synthesize(e.context(), e.raw(), max_size, &out, &found));
+    detail::check(
+        bw_synthesize_ext(e.context(), e.raw(), max_size, rotations, bitops, &out, &found));
     if (!found) {
         return std::nullopt;
     }
@@ -1210,6 +1230,22 @@ class Memory {
     // Known contents of 8-bit cells from `start` on, before any load or store.
     void set_bytes(uint64_t start, const std::vector<uint8_t> &data) {
         detail::check(bw_memory_set_bytes(m_.get(), start, data.data(), data.size()));
+    }
+    uint32_t snapshot() {
+        uint32_t v = 0;
+        detail::check(bw_memory_snapshot(m_.get(), &v));
+        return v;
+    }
+    void restore(uint32_t version) { detail::check(bw_memory_restore(m_.get(), version)); }
+    void merge(Expr cond, uint32_t v_then, uint32_t v_else) {
+        detail::check(bw_memory_merge(m_.get(), cond.context(), cond.raw(), v_then, v_else));
+    }
+    void memset(Expr addr, Expr cell_value, uint16_t cells) {
+        detail::check(
+            bw_memory_memset(m_.get(), addr.context(), addr.raw(), cell_value.raw(), cells));
+    }
+    void memcpy(Expr dst, Expr src, uint16_t cells) {
+        detail::check(bw_memory_memcpy(m_.get(), dst.context(), dst.raw(), src.raw(), cells));
     }
     void store(Expr addr, Expr value) {
         detail::check(bw_memory_store(m_.get(), addr.context(), addr.raw(), value.raw()));

@@ -191,7 +191,85 @@ fn kb_not(a: &KnownBits) -> KnownBits {
     KnownBits::from_masks(a.known_one(), a.known_zero())
 }
 
-fn kb_mul(a: &KnownBits, b: &KnownBits) -> KnownBits {
+fn kb_mul_word(a: (u64, u64), b: (u64, u64), w: Width) -> (u64, u64) {
+    let ((az, ao), (bz, bo)) = (a, b);
+    let wb = u32::from(w.bits());
+    let m = wmask(w);
+    let may_a = !az & m;
+    let may_b = !bz & m;
+    let tza = if may_a == 0 {
+        wb
+    } else {
+        may_a.trailing_zeros()
+    };
+    let tzb = if may_b == 0 {
+        wb
+    } else {
+        may_b.trailing_zeros()
+    };
+    let tz = (tza + tzb).min(wb);
+    let unk_a = !(az | ao) & m;
+    let unk_b = !(bz | bo) & m;
+    let ka = if unk_a == 0 {
+        wb
+    } else {
+        unk_a.trailing_zeros()
+    };
+    let kb_len = if unk_b == 0 {
+        wb
+    } else {
+        unk_b.trailing_zeros()
+    };
+    let k = ka.min(kb_len);
+    let low = if k == 0 {
+        0
+    } else if k >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << k) - 1
+    };
+    let p = (ao & low).wrapping_mul(bo & low) & m;
+    let low_tz = if tz == 0 {
+        0
+    } else if tz >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << tz) - 1
+    };
+    let mut one = p & low;
+    let mut zero = (low_tz | (!p & low)) & !one & m;
+
+    let ca = may_a.count_ones();
+    let cb = may_b.count_ones();
+    let ((lz, lo_one), ro_one, mut may_rhs, cnt) = if cb <= ca {
+        ((az, ao), bo, may_b, cb)
+    } else {
+        ((bz, bo), ao, may_a, ca)
+    };
+    if (1..=8).contains(&cnt) {
+        let mut acc = (m, 0u64);
+        while may_rhs != 0 {
+            let shift = may_rhs.trailing_zeros();
+            may_rhs &= may_rhs - 1;
+            let low_s = if shift == 0 { 0 } else { (1u64 << shift) - 1 };
+            let sz = ((lz << shift) & m) | low_s;
+            let so = if (ro_one >> shift) & 1 != 0 {
+                (lo_one << shift) & m
+            } else {
+                0
+            };
+            acc = add_carry_words(acc, (sz, so), false, m);
+        }
+        let mz = zero | acc.0;
+        let mo = one | acc.1;
+        if mz & mo == 0 {
+            (zero, one) = (mz, mo);
+        }
+    }
+    (zero, one)
+}
+
+fn kb_mul_wide(a: &KnownBits, b: &KnownBits) -> KnownBits {
     let w = a.width();
     let wb = u32::from(w.bits());
     let tz = (a.trailing_known_zeros() + b.trailing_known_zeros()).min(wb);
@@ -231,13 +309,13 @@ fn kb_mul(a: &KnownBits, b: &KnownBits) -> KnownBits {
                 if shift >= wb {
                     break;
                 }
-                let shifted = kb_shift_const(BinOp::Shl, lhs, shift);
+                let shifted = kb_shift_const_wide(BinOp::Shl, lhs, shift);
                 let term = if rhs.known_one().bit(shift as u16) == Some(true) {
                     shifted
                 } else {
                     KnownBits::from_masks(shifted.known_zero(), BitVec::zero(w))
                 };
-                acc = kb_add_carry(&acc, &term, false);
+                acc = kb_add_carry_wide(&acc, &term, false);
             }
         }
         return base.meet(&acc).unwrap_or(base);
@@ -245,7 +323,60 @@ fn kb_mul(a: &KnownBits, b: &KnownBits) -> KnownBits {
     base
 }
 
+fn kb_shift_const_word(op: BinOp, (az, ao): (u64, u64), w: Width, c: u32) -> (u64, u64) {
+    let wb = u32::from(w.bits());
+    let m = wmask(w);
+    match op {
+        BinOp::Shl => {
+            if c >= wb {
+                return (m, 0);
+            }
+            let low_c = if c == 0 { 0 } else { (1u64 << c) - 1 };
+            (((az << c) & m) | low_c, (ao << c) & m)
+        }
+        BinOp::LShr => {
+            if c >= wb {
+                return (m, 0);
+            }
+            let high_c = if c == 0 { 0 } else { !(m >> c) & m };
+            ((az >> c) | high_c, ao >> c)
+        }
+        BinOp::AShr => {
+            let c = c.min(wb - 1);
+            let sign = 1u64 << (wb - 1);
+            let high_c = if c == 0 { 0 } else { !(m >> c) & m };
+            let (mut zero, mut one) = (az >> c, ao >> c);
+            if az & sign != 0 {
+                zero |= high_c;
+            } else if ao & sign != 0 {
+                one |= high_c;
+            }
+            (zero, one)
+        }
+        BinOp::RotL | BinOp::RotR => {
+            let r = c % wb;
+            let k = if op == BinOp::RotL { r } else { (wb - r) % wb };
+            if k == 0 {
+                (az, ao)
+            } else {
+                let rot = |v: u64| ((v << k) | (v >> (wb - k))) & m;
+                (rot(az), rot(ao))
+            }
+        }
+        _ => (0, 0),
+    }
+}
+
 fn kb_shift_const(op: BinOp, a: &KnownBits, c: u32) -> KnownBits {
+    let w = a.width();
+    if w.bits() <= 64 {
+        let (z, o) = kb_shift_const_word(op, (word(&a.known_zero()), word(&a.known_one())), w, c);
+        return kb(w, z, o);
+    }
+    kb_shift_const_wide(op, a, c)
+}
+
+fn kb_shift_const_wide(op: BinOp, a: &KnownBits, c: u32) -> KnownBits {
     let w = a.width();
     let wb = u32::from(w.bits());
     match op {
@@ -567,44 +698,8 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     match op {
         BinOp::Add | BinOp::Sub if w.bits() <= 64 => add_sub_word(op, a, b),
         BinOp::Add | BinOp::Sub => add_sub_wide(op, a, b),
-        BinOp::Mul => {
-            let known = kb_mul(&a.known, &b.known);
-            let (au, bu) = (a.urange, b.urange);
-            let mut u = if BitVec::bin_unchecked(BinOp::UMulHi, &au.hi(), &bu.hi()).is_zero() {
-                // (la + i·sa)(lb + j·sb) − la·lb is a multiple of gcd(la·sb, lb·sa, sa·sb).
-                let (sa, sb) = (u128::from(au.stride()), u128::from(bu.stride()));
-                let stride = match (au.lo().to_u64(), bu.lo().to_u64()) {
-                    (Some(la), Some(lb)) => fit(gcd128(
-                        gcd128(u128::from(la) * sb, u128::from(lb) * sa),
-                        sa * sb,
-                    )),
-                    _ => 1,
-                };
-                strided(
-                    bin(&au.lo(), &bu.lo()),
-                    bin(&au.hi(), &bu.hi()),
-                    stride,
-                    full_u,
-                )
-            } else {
-                full_u
-            };
-            let s = signed_corners(w, a, b, |x, y| x.checked_mul(y)).unwrap_or(full_s);
-            // An odd factor is a unit modulo 2^w, even when it is variable.
-            // Wrapping can lose interval bounds, but cannot map a nonzero
-            // operand to zero. Intersect rather than resetting the lower
-            // endpoint: an existing stride must retain its residue class.
-            if u.lo().is_zero()
-                && known.known_one().is_zero()
-                && ((a.known.known_one().bit(0) == Some(true) && !b.contains(&BitVec::zero(w)))
-                    || (b.known.known_one().bit(0) == Some(true) && !a.contains(&BitVec::zero(w))))
-            {
-                u = u
-                    .meet(&URange::new(BitVec::one(w), BitVec::ones(w)).unwrap())
-                    .unwrap_or(u);
-            }
-            reduce(known, u, s)
-        }
+        BinOp::Mul if w.bits() <= 64 => mul_word(a, b),
+        BinOp::Mul => mul_wide(a, b),
         BinOp::UMulHi => {
             let (au, bu) = (a.urange, b.urange);
             from_urange(bin(&au.lo(), &bu.lo()), bin(&au.hi(), &bu.hi()))
@@ -728,6 +823,9 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
         BinOp::Shl | BinOp::LShr | BinOp::AShr | BinOp::RotL | BinOp::RotR => {
             if let Some(c) = count {
                 let rotate = matches!(op, BinOp::RotL | BinOp::RotR);
+                if !rotate && w.bits() <= 64 {
+                    return shift_const_word(op, a, c);
+                }
                 let c = if rotate {
                     // The count's full value modulo W.
                     let cv = b.known.as_constant().unwrap_or(BitVec::zero(w));
@@ -736,9 +834,7 @@ fn binary(op: BinOp, a: &Facts, b: &Facts) -> Facts {
                 } else {
                     c
                 };
-                let known = kb_shift_const(op, &a.known, c);
-                let (u, s) = shift_ranges(op, a, c);
-                return reduce(known, u, s);
+                return shift_const_wide(op, a, c);
             }
             if let Some(f) = over_values(b, |cv| binary(op, a, &Facts::constant(cv))) {
                 return f;
@@ -1074,6 +1170,232 @@ fn shift_ranges(op: BinOp, a: &Facts, c: u32) -> (URange, SRange) {
     }
 }
 
+pub(super) fn shift_const_wide(op: BinOp, a: &Facts, c: u32) -> Facts {
+    let w = a.width();
+    let known = kb_shift_const_wide(op, &a.known, c);
+    let (u, s) = shift_ranges(op, a, c);
+    Facts::reduce(known, u, s).unwrap_or_else(|| Facts::top(w))
+}
+
+pub(super) fn shift_const_word(op: BinOp, a: &Facts, c: u32) -> Facts {
+    let w = a.width();
+    let wb = u32::from(w.bits());
+    let m = wmask(w);
+    if c >= wb && op != BinOp::AShr {
+        return Facts::constant(&bv(w, 0));
+    }
+    let [az, ao, alo, ahi, astride, aslo, ashi] = words(a);
+    let sign = 1u64 << (wb - 1);
+    let full_u = (0, m, 1);
+    let full_s = (sign, sign.wrapping_sub(1) & m);
+    let (kz, ko) = kb_shift_const_word(op, (az, ao), w, c);
+    match op {
+        BinOp::Shl => {
+            let hi = (ahi << c) & m;
+            let u = if (hi >> c) == ahi {
+                u_strided((alo << c) & m, hi, stride_shl(astride, c), m)
+            } else {
+                full_u
+            };
+            reduce_words(w, kz, ko, u, full_s)
+        }
+        BinOp::LShr => {
+            let stride = if astride != 0 && astride.trailing_zeros() >= c {
+                astride >> c
+            } else {
+                1
+            };
+            let u = u_strided(alo >> c, ahi >> c, stride, m);
+            reduce_words(w, kz, ko, u, full_s)
+        }
+        BinOp::AShr => {
+            let c = c.min(wb - 1);
+            let high_c = if c == 0 { 0 } else { !(m >> c) & m };
+            let ashr = |v: u64| {
+                if v & sign != 0 {
+                    (v >> c) | high_c
+                } else {
+                    v >> c
+                }
+            };
+            let s = s_new(ashr(aslo), ashr(ashi), w);
+            reduce_words(w, kz, ko, full_u, s)
+        }
+        _ => Facts::top(w),
+    }
+}
+
+pub(super) fn mul_wide(a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let full_u = URange::full(w);
+    let full_s = SRange::full(w);
+    let bin = |x: &BitVec, y: &BitVec| BitVec::bin_unchecked(BinOp::Mul, x, y);
+    let known = kb_mul_wide(&a.known, &b.known);
+    let (au, bu) = (a.urange, b.urange);
+    let mut u = if BitVec::bin_unchecked(BinOp::UMulHi, &au.hi(), &bu.hi()).is_zero() {
+        // (la + i·sa)(lb + j·sb) − la·lb is a multiple of gcd(la·sb, lb·sa, sa·sb).
+        let (sa, sb) = (u128::from(au.stride()), u128::from(bu.stride()));
+        let stride = match (au.lo().to_u64(), bu.lo().to_u64()) {
+            (Some(la), Some(lb)) => fit(gcd128(
+                gcd128(u128::from(la) * sb, u128::from(lb) * sa),
+                sa * sb,
+            )),
+            _ => 1,
+        };
+        strided(
+            bin(&au.lo(), &bu.lo()),
+            bin(&au.hi(), &bu.hi()),
+            stride,
+            full_u,
+        )
+    } else {
+        full_u
+    };
+    let s = signed_corners(w, a, b, |x, y| x.checked_mul(y)).unwrap_or(full_s);
+    // An odd factor is a unit modulo 2^w, even when it is variable.
+    // Wrapping can lose interval bounds, but cannot map a nonzero
+    // operand to zero. Intersect rather than resetting the lower
+    // endpoint: an existing stride must retain its residue class.
+    if u.lo().is_zero()
+        && known.known_one().is_zero()
+        && ((a.known.known_one().bit(0) == Some(true) && !b.contains(&BitVec::zero(w)))
+            || (b.known.known_one().bit(0) == Some(true) && !a.contains(&BitVec::zero(w))))
+    {
+        u = u
+            .meet(&URange::new(BitVec::one(w), BitVec::ones(w)).unwrap())
+            .unwrap_or(u);
+    }
+    Facts::reduce(known, u, s).unwrap_or_else(|| Facts::top(w))
+}
+
+pub(super) fn mul_word(a: &Facts, b: &Facts) -> Facts {
+    let w = a.width();
+    let wb = u32::from(w.bits());
+    let m = wmask(w);
+    let sign = 1u64 << (wb - 1);
+    let [az, ao, alo, ahi, astride, aslo, ashi] = words(a);
+    let [bz, bo, blo, bhi, bstride, bslo, bshi] = words(b);
+    let (kz, ko) = kb_mul_word((az, ao), (bz, bo), w);
+
+    let prod_hi = u128::from(ahi) * u128::from(bhi);
+    let mut u = if prod_hi <= u128::from(m) {
+        let prod_lo = (u128::from(alo) * u128::from(blo)) as u64;
+        let (sa, sb) = (u128::from(astride), u128::from(bstride));
+        let stride = fit(gcd128(
+            gcd128(u128::from(alo) * sb, u128::from(blo) * sa),
+            sa * sb,
+        ));
+        u_strided(prod_lo, prod_hi as u64, stride, m)
+    } else {
+        (0, m, 1)
+    };
+
+    let shift = 64 - wb;
+    let signed = |v: u64| i128::from(((v << shift) as i64) >> shift);
+    let (ax0, ax1) = (signed(aslo), signed(ashi));
+    let (by0, by1) = (signed(bslo), signed(bshi));
+    let corners = [ax0 * by0, ax0 * by1, ax1 * by0, ax1 * by1];
+    let slo_i = corners[0].min(corners[1]).min(corners[2]).min(corners[3]);
+    let shi_i = corners[0].max(corners[1]).max(corners[2]).max(corners[3]);
+    let (smin, smax) = (-(1i128 << (wb - 1)), (1i128 << (wb - 1)) - 1);
+    let full_s = (sign, sign.wrapping_sub(1) & m);
+    let s = if slo_i >= smin && shi_i <= smax {
+        s_new((slo_i as u64) & m, (shi_i as u64) & m, w)
+    } else {
+        full_s
+    };
+
+    let contains_zero = |fo: u64, fulo: u64, fslo: u64, fshi: u64| {
+        fo == 0 && fulo == 0 && (fslo ^ sign) <= sign && sign <= (fshi ^ sign)
+    };
+    if u.0 == 0
+        && ko == 0
+        && (((ao & 1) != 0 && !contains_zero(bo, blo, bslo, bshi))
+            || ((bo & 1) != 0 && !contains_zero(ao, alo, aslo, ashi)))
+    {
+        u = super::narrow::meet_interval(u, 1, m).unwrap_or(u);
+    }
+
+    reduce_words(w, kz, ko, u, s)
+}
+
+pub(super) fn zext_wide(to: Width, a: &Facts) -> Facts {
+    let z = |v: &BitVec| v.zext(to).unwrap_or(BitVec::zero(to));
+    let known = KnownBits::from_masks(
+        bv_or(
+            &z(&a.known.known_zero()),
+            &bv_not(&low_mask(to, u32::from(a.width().bits()))),
+        ),
+        z(&a.known.known_one()),
+    );
+    let u = strided(
+        z(&a.urange.lo()),
+        z(&a.urange.hi()),
+        a.urange.stride(),
+        URange::full(to),
+    );
+    let s = SRange::new(u.lo(), u.hi()).unwrap_or(SRange::full(to));
+    Facts::reduce(known, u, s).unwrap_or_else(|| Facts::top(to))
+}
+
+pub(super) fn zext_word(to: Width, a: &Facts) -> Facts {
+    let [az, ao, alo, ahi, astride, ..] = words(a);
+    let src_m = wmask(a.width());
+    let dst_m = wmask(to);
+    let kz = az | (!src_m & dst_m);
+    let u = u_strided(alo, ahi, astride, dst_m);
+    let s = s_new(u.0, u.1, to);
+    reduce_words(to, kz, ao, u, s)
+}
+
+pub(super) fn sext_wide(to: Width, a: &Facts) -> Facts {
+    let s = |v: &BitVec| v.sext(to).unwrap_or(BitVec::zero(to));
+    let known = KnownBits::from_masks(s(&a.known.known_zero()), s(&a.known.known_one()));
+    let sr = SRange::new(s(&a.srange.lo()), s(&a.srange.hi())).unwrap_or(SRange::full(to));
+    Facts::reduce(known, URange::full(to), sr).unwrap_or_else(|| Facts::top(to))
+}
+
+pub(super) fn sext_word(to: Width, a: &Facts) -> Facts {
+    let [az, ao, _, _, _, aslo, ashi] = words(a);
+    let aw = a.width().bits();
+    let dst_m = wmask(to);
+    let sign_bit = 1u64 << (aw - 1);
+    let hi_ext = !wmask(a.width()) & dst_m;
+    let sext = |v: u64| if v & sign_bit != 0 { v | hi_ext } else { v };
+    let u = (0, dst_m, 1);
+    let s = s_new(sext(aslo), sext(ashi), to);
+    reduce_words(to, sext(az), sext(ao), u, s)
+}
+
+pub(super) fn extract_wide(lo: u16, width: Width, a: &Facts) -> Facts {
+    let x = |v: &BitVec| v.extract(lo, width).unwrap_or(BitVec::zero(width));
+    let known = KnownBits::from_masks(x(&a.known.known_zero()), x(&a.known.known_one()));
+    let mut f = Facts::from_known(known);
+    // A low truncation of a value that already fits keeps its range.
+    if lo == 0
+        && bv_lshr(&a.urange.hi(), u32::from(width.bits())).is_zero()
+        && let Some(u) = URange::strided(x(&a.urange.lo()), x(&a.urange.hi()), a.urange.stride())
+    {
+        f = f.meet_urange(&u).unwrap_or(f);
+    }
+    f
+}
+
+pub(super) fn extract_word(lo: u16, width: Width, a: &Facts) -> Facts {
+    let [az, ao, alo, ahi, astride, ..] = words(a);
+    let dst_m = wmask(width);
+    let ext = |v: u64| if lo >= 64 { 0 } else { (v >> lo) & dst_m };
+    let (kz, ko) = (ext(az), ext(ao));
+    let sign = 1u64 << (width.bits() - 1);
+    let full_s = (sign, sign.wrapping_sub(1) & dst_m);
+    let u = if lo == 0 && (ahi & !dst_m) == 0 {
+        u_strided(alo, ahi, astride, dst_m)
+    } else {
+        (0, dst_m, 1)
+    };
+    reduce_words(width, kz, ko, u, full_s)
+}
+
 fn shift_symbolic(op: BinOp, a: &Facts, b: &Facts) -> Facts {
     let w = a.width();
     let wb = u32::from(w.bits());
@@ -1289,47 +1611,14 @@ pub(crate) fn transfer(op: &TOp, args: &[&Facts]) -> Facts {
             Some(v) => Facts::constant(&BitVec::from_bool(v)),
             None => Facts::top(Width::W1),
         },
-        TOp::Zext(to) => {
-            let a = args[0];
-            let z = |v: &BitVec| v.zext(to).unwrap_or(BitVec::zero(to));
-            let known = KnownBits::from_masks(
-                bv_or(
-                    &z(&a.known.known_zero()),
-                    &bv_not(&low_mask(to, u32::from(a.width().bits()))),
-                ),
-                z(&a.known.known_one()),
-            );
-            let u = strided(
-                z(&a.urange.lo()),
-                z(&a.urange.hi()),
-                a.urange.stride(),
-                URange::full(to),
-            );
-            let s = SRange::new(u.lo(), u.hi()).unwrap_or(SRange::full(to));
-            Facts::reduce(known, u, s).unwrap_or_else(|| Facts::top(to))
+        TOp::Zext(to) if to.bits() <= 64 => zext_word(to, args[0]),
+        TOp::Zext(to) => zext_wide(to, args[0]),
+        TOp::Sext(to) if to.bits() <= 64 => sext_word(to, args[0]),
+        TOp::Sext(to) => sext_wide(to, args[0]),
+        TOp::Extract { lo, width } if args[0].width().bits() <= 64 => {
+            extract_word(lo, width, args[0])
         }
-        TOp::Sext(to) => {
-            let a = args[0];
-            let s = |v: &BitVec| v.sext(to).unwrap_or(BitVec::zero(to));
-            let known = KnownBits::from_masks(s(&a.known.known_zero()), s(&a.known.known_one()));
-            let sr = SRange::new(s(&a.srange.lo()), s(&a.srange.hi())).unwrap_or(SRange::full(to));
-            Facts::reduce(known, URange::full(to), sr).unwrap_or_else(|| Facts::top(to))
-        }
-        TOp::Extract { lo, width } => {
-            let a = args[0];
-            let x = |v: &BitVec| v.extract(lo, width).unwrap_or(BitVec::zero(width));
-            let known = KnownBits::from_masks(x(&a.known.known_zero()), x(&a.known.known_one()));
-            let mut f = Facts::from_known(known);
-            // A low truncation of a value that already fits keeps its range.
-            if lo == 0
-                && bv_lshr(&a.urange.hi(), u32::from(width.bits())).is_zero()
-                && let Some(u) =
-                    URange::strided(x(&a.urange.lo()), x(&a.urange.hi()), a.urange.stride())
-            {
-                f = f.meet_urange(&u).unwrap_or(f);
-            }
-            f
-        }
+        TOp::Extract { lo, width } => extract_wide(lo, width, args[0]),
         TOp::Concat => {
             let (h, l) = (args[0], args[1]);
             let cat = |x: &BitVec, y: &BitVec| BitVec::concat(x, y).ok();

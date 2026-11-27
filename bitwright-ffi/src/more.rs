@@ -91,6 +91,55 @@ pub unsafe extern "C" fn bw_synthesize(
     })
 }
 
+/// # Safety
+/// `cx` is live; `out` and `found` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_synthesize_ext(
+    cx: *mut BwContext,
+    e: u64,
+    max_size: u8,
+    rotations: bool,
+    bitops: bool,
+    out: *mut u64,
+    found: *mut bool,
+) -> c_int {
+    run(|| {
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let (out, found) = (Out::new(out, "out")?, Out::new(found, "found")?);
+        let cfg = bw::synth::Config::default()
+            .with_max_size(max_size)
+            .with_rotations(rotations)
+            .with_bitops(bitops);
+        let x = expr(e)?;
+        let s = bw::synth::synthesize(cx, x, &cfg)?;
+        unsafe {
+            out.set(s.unwrap_or(x).to_bits());
+            found.set(s.is_some());
+        }
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `cx` is live, `script` is a string, `out` is valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_smtlib_run(
+    cx: *mut BwContext,
+    script: *const c_char,
+    out: *mut *mut c_char,
+) -> c_int {
+    run(|| {
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let script = unsafe { text(script, "script") }?;
+        let out = Out::new(out, "out")?;
+        let mut buf = String::new();
+        let cfg = bw::solve::Config::default();
+        bw::smtlib::run(cx, script, &cfg, &mut buf)?;
+        unsafe { out.set(give(buf)) };
+        Ok(())
+    })
+}
+
 // ----- memory -------------------------------------------------------------------------------
 
 /// `bw_memory`.
@@ -98,6 +147,7 @@ pub unsafe extern "C" fn bw_synthesize(
 pub struct BwMemory {
     m: Memory,
     v: Version,
+    versions: Vec<Version>,
 }
 
 /// # Safety
@@ -118,7 +168,11 @@ pub unsafe extern "C" fn bw_memory_new(
         };
         let m = Memory::new(name, width(addr_width)?, width(cell_width)?, endian);
         let v = m.initial();
-        Ok(BwMemory { m, v })
+        Ok(BwMemory {
+            m,
+            v,
+            versions: vec![v],
+        })
     })
 }
 
@@ -149,6 +203,108 @@ pub unsafe extern "C" fn bw_memory_set_bytes(
         );
         m.m = old.with_bytes(u128::from(start), data)?;
         m.v = m.m.initial();
+        m.versions.clear();
+        m.versions.push(m.v);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `m` is live and `out` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_memory_snapshot(m: *mut BwMemory, out: *mut u32) -> c_int {
+    run(|| {
+        let m = unsafe { get_mut(m, "m") }?;
+        let out = Out::new(out, "out")?;
+        let idx = if let Some(pos) = m.versions.iter().position(|&v| v == m.v) {
+            pos as u32
+        } else {
+            let pos = u32::try_from(m.versions.len())
+                .map_err(|_| invalid("too many memory snapshots"))?;
+            m.versions.push(m.v);
+            pos
+        };
+        unsafe { out.set(idx) };
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `m` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_memory_restore(m: *mut BwMemory, version: u32) -> c_int {
+    run(|| {
+        let m = unsafe { get_mut(m, "m") }?;
+        let v = m
+            .versions
+            .get(version as usize)
+            .copied()
+            .ok_or_else(|| invalid(format!("unknown memory snapshot {version}")))?;
+        m.v = v;
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `m` and `cx` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_memory_merge(
+    m: *mut BwMemory,
+    cx: *mut BwContext,
+    cond: u64,
+    v_then: u32,
+    v_else: u32,
+) -> c_int {
+    run(|| {
+        let m = unsafe { get_mut(m, "m") }?;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let vt = m
+            .versions
+            .get(v_then as usize)
+            .copied()
+            .ok_or_else(|| invalid(format!("unknown memory snapshot {v_then}")))?;
+        let ve = m
+            .versions
+            .get(v_else as usize)
+            .copied()
+            .ok_or_else(|| invalid(format!("unknown memory snapshot {v_else}")))?;
+        m.v = m.m.merge(cx, expr(cond)?, vt, ve)?;
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `m` and `cx` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_memory_memset(
+    m: *mut BwMemory,
+    cx: *mut BwContext,
+    addr: u64,
+    cell_value: u64,
+    cells: u16,
+) -> c_int {
+    run(|| {
+        let m = unsafe { get_mut(m, "m") }?;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        m.v = m.m.memset(cx, m.v, expr(addr)?, expr(cell_value)?, cells)?;
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `m` and `cx` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_memory_memcpy(
+    m: *mut BwMemory,
+    cx: *mut BwContext,
+    dst: u64,
+    src: u64,
+    cells: u16,
+) -> c_int {
+    run(|| {
+        let m = unsafe { get_mut(m, "m") }?;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        m.v = m.m.memcpy(cx, m.v, expr(dst)?, expr(src)?, cells)?;
         Ok(())
     })
 }

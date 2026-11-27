@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.29
+
+- Added native `QF_UFBV` and `QF_ABV` theory support across `prove`, `solve`, and `smtlib`: Ackermann functional-consistency axioms, declared `ExtOp::invertible` injectivity axioms, UF-consistent circuit sampling, and lazy `ExtOp::eval` CEGAR point-evaluation refinement in `prove` and `Incremental`; `ExtOp::inverse` and constant-RHS `ExtOp::invert` equation isolation in `Solver`; and `Array` (`(store ((as const …) …) …)`) and uninterpreted-function (`declare-fun`) reconstruction in `smtlib::Session` (`get-model` and `get-value`).
+- Added LCA-based conditional branch memory muxing (`Memory::merge`), `Memory::memset`, and overlap-safe snapshot `Memory::memcpy` in `memory`, avoiding duplicate shared-prefix stores and spurious dead base-cell reads across diamond spills.
+- Added IEEE floating-point backward `Facts` transfer refinement (`facts::fp::backward`) under `Assumptions` across `FEq`/`FLt`/`FLe`, NaN-propagating operations, `FSqrt`, `FMin`/`FMax`, and lossless widening `FConvert` (preserving full signed/quiet/signaling NaN payload hulls when `nan` remains possible), plus zero-`BitVec`-allocation `<= 64`-bit narrow fast paths for `Mul`, constant shifts, `Zext`, `Sext`, and `Extract` in `facts::transfer`.
+- Added assumption-aware relational queries (`Site::prove`, `Site::prove_eq`, `Site::const_diff`) with `Reliance` propagation and FP builders on `engine::Site`, pooled `Scratch` (`Engine::run_with_scratch` / `simplify_with_scratch`), structural `CostModel::ast_size()` / `CostModel::dag_size()` (`ExtractionMode::Dag`) and host-supplied `CostModel::custom` in `eqsat`, and `1..=512`-bit wide + opt-in `rotations`/`bitops` (`Config::extended()`) synthesis in `synth`.
+- Exposed `Solver` value enumeration, `Memory` snapshot/restore/merge/memset/memcpy, `Site` relational queries (`prove_cmp`, `prove_eq`, `const_diff`), SMT-LIB session execution (`run_smtlib`), extended/wide synthesis, and DAG saturation across C/C++ (`bitwright-ffi`), Python (`bitwright-py` and `_bitwright.pyi`), and WebAssembly (`bitwright-wasm`).
+
 ## 0.32.28
 
 - Added falling-factorial Stirling and 2-adic vanishing-ideal polynomial canonicalization (`reduce_2adic`, `fold_vanishing`, `slice_poly`) in `poly`, Euler–Fermat power-tower exponent reduction (`squaring_chain`) across `linear` and `demanded`, value-level $2^k$-adic Hensel constant-residue search (`constant_masked`, `compile_value`) in `predicate`, and `1..=512`-bit `x^2` and `x^4` known-bit transfers (`square_known`) in `facts`.

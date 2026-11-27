@@ -510,6 +510,24 @@ impl PyContext {
             assertions,
         })
     }
+
+    /// Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) into this context
+    /// and returns the standard responses.
+    fn run_smtlib(&self, py: Python<'_>, script: &str) -> PyResult<String> {
+        let s = script.to_string();
+        if compiler::in_rewrite() {
+            return Err(BitwrightError::new_err(
+                "cannot use Context inside a host rewrite running on it",
+            ));
+        }
+        py.detach(|| {
+            let mut c = self.cx.lock().unwrap_or_else(|p| p.into_inner());
+            let mut out = String::new();
+            let cfg = bitwright::solve::Config::default();
+            bitwright::smtlib::run(&mut c, &s, &cfg, &mut out).map(|_| out)
+        })
+        .or_raise()
+    }
 }
 
 /// A script read by `Context.from_smtlib`.
@@ -1416,17 +1434,26 @@ impl PyExpr {
     }
 
     /// The smallest equal expression synthesis finds (proved), or None.
-    #[pyo3(signature = (*, max_size = 7))]
-    fn synthesize(slf: PyRef<'_, Self>, max_size: u8) -> PyResult<Option<PyExpr>> {
+    #[pyo3(signature = (*, max_size = 7, rotations = false, bitops = false))]
+    fn synthesize(
+        slf: PyRef<'_, Self>,
+        max_size: u8,
+        rotations: bool,
+        bitops: bool,
+    ) -> PyResult<Option<PyExpr>> {
         let py = slf.py();
-        more::synthesize(py, slf, max_size)
+        more::synthesize(py, slf, max_size, rotations, bitops)
     }
 
     /// The equality-saturation search's smaller candidate, or None.
-    #[pyo3(signature = (*, groups = None))]
-    fn saturate(slf: PyRef<'_, Self>, groups: Option<Vec<String>>) -> PyResult<Option<PyExpr>> {
+    #[pyo3(signature = (*, groups = None, dag = false))]
+    fn saturate(
+        slf: PyRef<'_, Self>,
+        groups: Option<Vec<String>>,
+        dag: bool,
+    ) -> PyResult<Option<PyExpr>> {
         let py = slf.py();
-        more::saturate(py, slf, groups)
+        more::saturate(py, slf, groups, dag)
     }
 }
 

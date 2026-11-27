@@ -163,7 +163,7 @@ fn strided<T: Word>(lo: T, hi: T, stride: u64) -> U<T> {
 }
 
 /// `u` met with the plain interval `[a, b]` (`a <= b`).
-fn meet_interval<T: Word>(u: U<T>, a: T, b: T) -> Option<U<T>> {
+pub(super) fn meet_interval<T: Word>(u: U<T>, a: T, b: T) -> Option<U<T>> {
     let (ulo, uhi, s) = u;
     if s == 0 {
         return (a <= ulo && ulo <= b).then_some(u);
