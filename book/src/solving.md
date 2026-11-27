@@ -59,15 +59,80 @@ says which:
    the predicate with the fewest symbols still open first, so that a chain of definitions
    is followed like one. Then every symbol all ones, and values drawn from zero, one, small
    numbers and any number. What comes of it is evaluated: a hit is a model for microseconds.
-6. **A quick search** (1,000 conflicts by default) on a circuit the solver keeps: each
-   assertion is built once, and what one search learns the next ones use.
-7. **The prover**: definitions solved (`x == t` puts `t` for `x`), the simplifier with its
-   word-level procedures, then a circuit and a search of its own.
+6. **2-adic Hensel lifting** (`Config::hensel`, on by default). When a slice is a causal
+   T-function system over `1..=512`-bit words, bit-by-bit root lifting from the low bit up
+   either produces a model or proves unsatisfiability directly without bit-blasting
+   (`DecidedBy::Hensel`).
+7. **A quick search** (1,000 conflicts by default) on a circuit the solver keeps: each
+   assertion is built once, and what one search learns the next ones use. Uninterpreted
+   extension operations are handled natively through Ackermann functional-consistency axioms,
+   declared injectivity, and lazy point-evaluation (`ExtOp::eval`) CEGAR refinement.
+8. **The prover**: definitions solved (`x == t` puts `t` for `x`, including invertible
+   extensions and split-register `concat` equations), the simplifier with its word-level
+   procedures, then a circuit and a search of its own (with Wallace-tree 3:2 carry-save
+   blasting for multi-operand sums and products).
 
-Most satisfiable path conditions end at 3, 5 or 6, and most questions about obfuscated
-arithmetic at 7, in the simplifier. A check never runs longer than its budgets, and with a deadline
+Most satisfiable path conditions end at 3, 5, 6 or 7, and most questions about obfuscated
+arithmetic at 8, in the simplifier. A check never runs longer than its budgets, and with a deadline
 ([`check_within`](https://docs.rs/bitwright/latest/bitwright/solve/struct.Solver.html#method.check_within))
 not much longer than that.
+
+## Optimization, fact tightening, enumeration and functional witnesses
+
+Beyond satisfiability, `Solver` answers four queries directly against the current assertion stack
+(each with a `*_within` deadline form):
+
+- **Optimization modulo bit-vectors.** `minimize`, `maximize`, `minimize_signed` and
+  `maximize_signed` find the exact unsigned or signed extremum of a `1..=512`-bit term under the
+  asserted constraints by MSB-to-LSB bit-binary search with model-guided fast-forwarding.
+- **Solver-tightened facts.** `tighten_facts` starts from the sound abstract-domain `Facts` of a
+  term and tightens its exact unsigned range, signed range and known bits against the asserted
+  path conditions, returning `None` if the stack is unsatisfiable.
+- **Exact value enumeration.** `enumerate_values` enumerates every distinct value an expression
+  can take up to a caller-supplied cap (using Hensel root enumeration when applicable and
+  blocking-clause search otherwise), useful for jump-table targets and finite state machines.
+- **Functional dependency and closed-form witnesses.** `is_determined_by(y, inputs)` proves
+  whether `y` is uniquely determined by `inputs` under the assertions (via a prime-renamed
+  self-composition miter). `functional_def(y, inputs)` goes further and extracts or synthesizes
+  (by CEGIS) a closed-form expression `f(inputs)` proved equal to `y` on all satisfying
+  assignments.
+
+```rust
+use bitwright::solve::{Optimum, Solver, Status};
+use bitwright::{Context, ParseOptions, Truth, Width};
+
+let mut cx = Context::new();
+let o = ParseOptions::width(Width::W16);
+let mut s = Solver::default();
+let (x, y) = (cx.parse("x", &o)?, cx.parse("y", &o)?);
+let range = cx.parse("(x >=u 10) & (x <=u 20)", &o)?;
+let rel = cx.parse("y == (x ^ 5) + 1", &o)?;
+s.assert(&cx, range)?;
+s.assert(&cx, rel)?;
+
+// Exact unsigned minimum and maximum of `x`.
+let Optimum::Found(lo) = s.minimize(&mut cx, x)? else { panic!() };
+let Optimum::Found(hi) = s.maximize(&mut cx, x)? else { panic!() };
+assert_eq!((lo.to_u64(), hi.to_u64()), (Some(10), Some(20)));
+
+// Solver-tightened known bits and bounds of `x`.
+let f = s.tighten_facts(&mut cx, x)?.unwrap();
+assert_eq!((f.urange().lo().to_u64(), f.urange().hi().to_u64()), (Some(10), Some(20)));
+
+// `y` is uniquely determined by `x`, with a proved closed-form witness.
+assert_eq!(s.is_determined_by(&mut cx, y, &[x])?, Truth::True);
+let witness = s.functional_def(&mut cx, y, &[x])?.unwrap();
+let differs = cx.parse(&format!("y != ({})", cx.display(witness)), &o)?;
+s.push();
+s.assert(&cx, differs)?;
+assert_eq!(s.check(&mut cx)?, Status::Unsat);
+s.pop(1)?;
+# Ok::<(), bitwright::Error>(())
+```
+
+For large batches of candidate equivalences across a DAG, `bitwright::batch::Session` shares one
+incremental circuit across proofs, and `Split::with_equivalences` partitions candidate word
+equivalence and bitwise-complement classes by simulation before certifying star-to-hub pairs.
 
 ## A session that lasts
 

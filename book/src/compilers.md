@@ -9,10 +9,13 @@ rewrites of its own that the rule language cannot say. This chapter covers those
   - `Lowering` turns a function into expressions.
   - `Raise` turns results back into instructions.
   - `Template` gives semantics as text, read at run time.
-- **`Strategy::compile()`**: the simplifier tuned for every value of every function. See
-  [Simplifying](simplifying.md#inside-a-compiler).
+- **`Strategy::compile()`**: the simplifier tuned for every value of every function, with
+  pooled `Scratch` (`Engine::run_with_scratch`, `Engine::simplify_with_scratch`) to reuse
+  per-run buffers across functions. See [Simplifying](simplifying.md#inside-a-compiler).
 - **`Context::declare_known`**: what the compiler knows of values defined elsewhere.
-- **`engine::Rewrite`**: rewrites written in Rust, linked into an engine at run time.
+- **`engine::Rewrite`**: rewrites written in Rust, linked into an engine at run time. `Site`
+  exposes assumption-aware relational queries (`Site::prove`, `Site::prove_eq`,
+  `Site::const_diff`, automatically propagating `Reliance`) and floating-point builders.
   `check::rewrite` tests them before they are trusted.
 
 C, C++, Python and JavaScript have these pieces too, with host values as 64-bit integers and

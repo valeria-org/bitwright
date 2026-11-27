@@ -32,27 +32,36 @@ assert_eq!(out.roots[1].candidate, Some(cx.parse("x", &o)?));
 
 ## Equations
 
-Admitted equations are proven (by their ledger), unconditional, of one width, and in a
-conservative fragment: `+ − * & | ^`, negation and complement, constants and symbols, widths up
-to 128. Identities are used in both directions; guard-free rules (cancellations like
-`(x + y) − y → x`) in their authored direction only. Other inputs are declined, never
-approximated.
+With `SaturateConfig::default()`, admitted equations are proven (by their ledger), unconditional,
+of one width, and in a conservative fragment: `+ − * & | ^`, negation and complement, constants
+and symbols, widths up to 128. `SaturateConfig::extended()` (and `Fragment::extended`) opens
+mixed-width e-classes across `1..=512` bits with per-class reduced-product `Facts` analysis,
+adding casts, shifts, rotations, bit-ops, comparisons and `select`, along with the proven
+`eqsat.casts`, `eqsat.shifts`, `eqsat.select` and `eqsat.facts` rule groups. Identities are used
+in both directions; guard-free rules (cancellations like `(x + y) − y → x`) in their authored
+direction only. Other inputs are declined, never approximated.
 
 The built-in equations come in groups: `eqsat.assoc`, `eqsat.distrib` (`*` over `+`),
 `eqsat.distrib_and` (`&` over `|` and `^`), `eqsat.distrib_or` (`|` over `&`),
-`eqsat.negation` and `eqsat.cancel`. Choose the groups a search needs: some combinations never
-saturate (`distrib_and` with `distrib_or` rewrite each other's results without end), and a
-search that does not saturate publishes nothing.
+`eqsat.negation`, `eqsat.cancel`, plus the extended groups (`eqsat.casts`, `eqsat.shifts`,
+`eqsat.select`, `eqsat.facts`). Choose the groups a search needs: some combinations never
+saturate (`distrib_and` with `distrib_or` rewrite each other's results without end), and under
+the default publication policy a search that does not saturate publishes nothing.
 
-## Publication
+## Publication and extraction
 
-Each root is searched in its own e-graph, sharing only the allowance. A batch is published only
-if every root it searched saturated within its bounds: reaching the iteration cap, a budget or a
-deadline withholds the whole batch (`Publication::Withheld`), and the rest of the batch is not
-searched (those roots are reported as stopped, or as `Skipped`). A deadline already passed when
-the search starts withholds the batch even where the memo has the answer. Spent allowance stays
-spent. A candidate must be strictly smaller as a tree, no larger
-as a DAG, and agree with its input at sampled points.
+Each root is searched in its own e-graph, sharing only the allowance. By default a batch is
+published only if every root it searched saturated within its bounds (`PublishPolicy::AtIterationCap`
+allows extracting the best candidate found when the iteration cap is reached): reaching the
+iteration cap, a budget or a deadline otherwise withholds the whole batch (`Publication::Withheld`),
+and the rest of the batch is not searched (those roots are reported as stopped, or as `Skipped`).
+A deadline already passed when the search starts withholds the batch even where the memo has the
+answer. Spent allowance stays spent.
+
+Extraction chooses the lowest-cost equivalent term using a `CostModel`: `CostModel::ast_size()`
+(tree size, the default), `CostModel::dag_size()` (`ExtractionMode::Dag`, which accounts for
+shared subexpressions), or `CostModel::custom(...)` for a host-supplied per-operator cost
+function. A candidate must agree with its input at sampled points.
 
 Stable outcomes (saturated searches, admission declines) are memoized in the context, so asking
 again is free; incomplete searches are not, so more budget can succeed later.

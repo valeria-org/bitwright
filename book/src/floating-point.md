@@ -208,9 +208,13 @@ The [facts](facts.md) of a floating-point result come from its operands' facts, 
 floats: whether a NaN may occur, and an interval of values per sign. An operation is applied to
 the ends of those intervals in its own rounding mode (correct rounding is monotonic, so the ends
 bound every result), and falls back to every value where a special case may occur (`0 · ∞`,
-`∞ − ∞`, a divisor that may be 0). So facts show that an integer converted to a float is never a
-NaN, that the square root of a non-negative value is not either, or that a converted byte is
-below 256, and the simplifier folds such questions:
+`∞ − ∞`, a divisor that may be 0). Under [assumptions](constraints.md), backward floating-point
+transfers also pull bounds and non-NaN facts back through `fp.eq`, `fp.lt`, `fp.le`,
+NaN-propagating operations, `fp.sqrt`, `fp.min`/`fp.max` and lossless widening `fp.convert`
+(preserving signed/quiet/signaling NaN payload hulls whenever NaN remains possible). So facts
+show that an integer converted to a float is never a NaN, that the square root of a non-negative
+value is not either, or that a converted byte is below 256, and the simplifier folds such
+questions:
 
 ```rust
 use bitwright::engine::Engine;

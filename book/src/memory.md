@@ -10,15 +10,20 @@ big-endian for values wider than a cell. Stores make versions; a load reads a ve
 
 - each cell is read through the stores before it, newest first. A store at an equal address
   gives the cell; one at a different address is skipped; one whose address may be either
-  becomes a `select` on the equality. Addresses with one base and constant offsets (`sp - 8`,
-  `sp - 4`) are decided by their offsets, others by the builder or the facts;
+  becomes a `select` on the equality. Addresses are disambiguated by linear reassociation
+  (`sp - 8`, `sp - 4`), 2-adic stride GCDs, unsigned ranges, bit-provenance run alignment and
+  the facts;
 - what no store covers comes from the memory's base: known contents where the address is in a
   region of them (a constant, or a table selected by the offset when the address is not
   constant), and otherwise an unknown cell, the symbol `name.k`. A later read of unknown memory
   at an address that may equal an earlier one selects the earlier cell when they are equal, so
   equal addresses always read equal values however they are written;
 - the cells of a load are put together again, and pieces of one stored value become that
-  value: a spill reloaded is the spilled value.
+  value: a spill reloaded is the spilled value;
+- **Branch merges and bulk operations.** `Memory::merge(cx, cond, then_ver, else_ver)` merges
+  two versions from their lowest common ancestor so shared prefix stores are never duplicated
+  and dead base-cell reads are avoided; `Memory::memset` fills a constant-length byte range and
+  `Memory::memcpy` performs an overlap-safe snapshot copy.
 
 ```rust
 use bitwright::memory::{Endian, Memory};

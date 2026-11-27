@@ -245,10 +245,10 @@ simple witness (`e` does not depend on `of`, or is narrower than it). Under
 answer reports the constraints it relied on: `x * k` is a bijection of `x` wherever `k & 1 == 1`
 is assumed.
 
-The analysis looks at no more than 256 nodes at a time, and at inner values of at most 128
-bits; larger layers are simply not recognized. Maps that are bijective for reasons it does not
-model, such as a GF(2)-linear map with cyclic dependencies (`x ^ rotl(x, 5) ^ rotl(x, 9)` at
-32 bits), are not recognized either.
+The analysis looks at no more than 256 nodes at a time, across inner values of any width from 1
+to 512 bits; larger layers are simply not recognized. Composed bijections can also be collapsed
+directly, and causal T-function equations are solved bit by bit through 2-adic Hensel root
+lifting in [`Solver`](solving.md).
 
 ## Linear maps
 
@@ -256,9 +256,11 @@ A value mixed with rotations and shifts of itself by xor (`x ^ rotl(x, 3) ^ rotl
 every bit several times, so no bit can be recovered first. Such a map is linear over GF(2):
 every output bit is the xor of some input bits (and a constant), `M·x ⊕ c`. It is injective
 exactly when the matrix `M` has full rank, and then its inverse is found by elimination.
-bitwright reads any region built from `^`, `~`, masks, shifts and rotations by constants, byte
-swaps and bit reversals this way when the bit-by-bit recovery fails. `x ^ rotl(x, 3)` is not
-injective (it maps `x` and `~x` alike), and stays.
+bitwright reads any `1..=512`-bit region built from `^`, `~`, masks, shifts and rotations by
+constants, byte swaps, bit reversals, constant-mask `pdep`/`pext`, disjoint `|`/`+`, and casts
+(`extract`, `zext`, `sext`, `concat`) this way when bit-by-bit recovery fails, including
+multi-atom GF(2)-affine forms. `x ^ rotl(x, 3)` is not injective (it maps `x` and `~x` alike),
+and stays.
 
 ```rust
 use bitwright::engine::Engine;

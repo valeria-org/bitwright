@@ -12,10 +12,14 @@ cover what a host needs to hand its expressions to bitwright and read the result
 - simplification with the standard engine or the deobfuscation engine (the command line's
   `simplify`: the MBA service with the native solver, on bitwright's own evidence), with budgets,
   and with rule files of your own, linked with their proof ledgers;
-- SMT-LIB export and import;
-- proofs of equivalence by the native prover, synthesis, and (Python) equality saturation;
-- [memory](memory.md) (loads and stores as expressions) and [lifted code](lifting.md) (p-code,
-  VEX, LLVM IR);
+- SMT-LIB export, import and full script execution (`run_smtlib`), including `QF_UFBV`,
+  `QF_ABV` and optimization objectives;
+- proofs of equivalence by the native prover, incremental `Solver` sessions (with value
+  enumeration, unsigned/signed `minimize`/`maximize`, `tighten_facts`, `is_determined_by` and
+  `functional_def`), extended/wide `1..=512`-bit synthesis, and (C, C++, Python) equality
+  saturation including DAG-cost extraction;
+- [memory](memory.md) (loads, stores, snapshots, LCA branch `merge`, `memset` and `memcpy` as
+  expressions) and [lifted code](lifting.md) (p-code, VEX, LLVM IR);
 - [verifying compiler transformations](transformations.md): transformations in the Alive
   syntax, translation validation of LLVM IR, precondition inference;
 - engines that refuse rewrites by rule or pass name, and (Python) the trace of a run's
@@ -859,8 +863,8 @@ bw.prove("%r = select %c, %x, false\n=>\n%r = and %c, %x");   // "INVALID …" a
 bw.lift("vex", "t0 = GET:I64(rdi)\nt1 = Add64(t0,t0)\nPUT(rax) = t1"); // "rax = rdi << 1\n"
 ```
 
-`validate` (translation validation), `infer` (preconditions) and `toSmtlib` complete it;
-`bitwright-wasm/js/test.mjs` exercises each under Node.
+`validate` (translation validation), `infer` (preconditions), `toSmtlib`, `runSmtlib` and
+`functionalDef` complete it; `bitwright-wasm/js/test.mjs` exercises each under Node.
 
 For a compiler, `simplify` takes more options: `engine: "compile"`, a symbol's declared known
 bits (`known`), host rewrites as JavaScript functions (`rewrites`), `sharing`, `maxRegion`,

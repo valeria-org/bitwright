@@ -60,9 +60,10 @@ assert_eq!(script.assertions.len(), 1);
 With the `prove` feature, `smtlib::run` runs a script as a solver, on a
 [`solve::Solver`](https://docs.rs/bitwright/latest/bitwright/solve/struct.Solver.html): the
 importer's declarations, definitions and assertions, and `push`, `pop`, `check-sat`,
-`check-sat-assuming`, `get-model`, `get-value`, `get-unsat-core`, `get-unsat-assumptions`,
-`get-info`, `set-option`, `echo`, `reset`, `reset-assertions` and `exit`, each answered as the
-standard prescribes. `bitwright solve` is the same from the shell:
+`check-sat-assuming`, `minimize`, `maximize`, `get-objectives`, `get-model`, `get-value`,
+`get-unsat-core`, `get-unsat-assumptions`, `get-info`, `set-option`, `echo`, `reset`,
+`reset-assertions` and `exit`, each answered as the standard prescribes. `bitwright solve` is the
+same from the shell:
 
 ```text
 $ bitwright solve - <<'EOF'
@@ -85,12 +86,17 @@ A check answers by the stages the chapter [Solving](solving.md) describes, on a 
 session keeps from one check to the next, and a core is sound but not minimal. Beyond the
 quantifier-free theories the session reads:
 
-- **Uninterpreted functions and sorts** a script declares: a symbol for each application and
-  a constraint for each pair of them.
-- **Arrays that are compared, chosen and constant**: `(= a b)` and `distinct` over arrays,
-  `(ite c a b)`, `((as const (Array I E)) v)` and stores into any of them. An equality is a
-  Boolean with the constraints of extensionality: an index where the two differ when it is
+- **Uninterpreted functions and sorts** a script declares (`QF_UFBV`): native Ackermann
+  functional-consistency axioms in `prove`, with `define-fun` model reconstruction in `get-model`
+  and `get-value`.
+- **Arrays that are compared, chosen and constant** (`QF_ABV`): `(= a b)` and `distinct` over
+  arrays, `(ite c a b)`, `((as const (Array I E)) v)` and stores into any of them, with full
+  `(store ((as const …) …) …)` array reconstruction in `get-model` and `get-value`. An equality
+  is a Boolean with the constraints of extensionality: an index where the two differ when it is
   false, agreement at every index the script reads or writes when it is true.
+- **Optimization objectives**: `(minimize <term>)` and `(maximize <term>)` register unsigned
+  bit-vector objectives solved by `Solver::minimize` / `Solver::maximize` on `check-sat`, with
+  optimal values reported by `(get-objectives)` (and pushed/popped with the assertion stack).
 - **Quantifiers** where they can be decided by what is already there: an asserted `exists`
   and a denied `forall` take new symbols for their variables, at any width, and a quantifier
   anywhere else is read once for each value of its variables, up to 12 bits of them. A wider
